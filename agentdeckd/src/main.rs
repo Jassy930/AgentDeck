@@ -18,7 +18,9 @@
 //! ping/pong/shutdown round trip is retained.
 
 mod codex;
+mod diag;
 mod ipc;
+mod record;
 
 use std::io::{BufRead, Write};
 
@@ -37,23 +39,56 @@ fn write_msg(stdout: &mut impl Write, msg: &IpcMessage) -> std::io::Result<()> {
 /// Eng D9: the daemon is the sole state source. Every transition is emitted
 /// so the Swift app mirrors, never guesses. Eng premise 9: failures surface
 /// as a visible error + Failed state, never a silent hang.
+/// Append a line to the run record. Eng E2: a write failure does NOT block
+/// the session, but IS surfaced as a visible IPC warning — never silent.
+fn record_or_warn(stdout: &mut impl Write, run_id: &str, line: &str) -> std::io::Result<()> {
+    if let Err(reason) = record::try_append(run_id, line) {
+        diag::log("record_failed", &reason);
+        write_msg(
+            stdout,
+            &IpcMessage {
+                kind: "warning".into(),
+                id: None,
+                payload: Some(serde_json::json!({
+                    "message": format!("本次未留痕: {reason}")
+                })),
+            },
+        )?;
+    }
+    Ok(())
+}
+
 fn run_session(
     stdout: &mut impl Write,
     id: Option<u64>,
     cwd: &str,
     prompt: &str,
 ) -> std::io::Result<()> {
+    // run_id: AgentDeck-generated (premise 5), not user input, so it is a
+    // safe filename component (no path traversal).
+    let run_id = format!(
+        "run-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    diag::log("session_start", &format!("run={run_id} cwd={cwd}"));
     write_msg(stdout, &IpcMessage::session_state(SessionState::Starting))?;
+    record_or_warn(stdout, &run_id, &format!(r#"{{"event":"start","prompt":{}}}"#,
+        serde_json::to_string(prompt).unwrap_or_else(|_| "\"\"".into())))?;
 
     let mut adapter = match codex::CodexAdapter::spawn() {
         Ok(a) => a,
         Err(e) => {
+            diag::log("spawn_failed", &e.to_string());
             write_msg(stdout, &IpcMessage::error(id, &e.to_string()))?;
             return write_msg(stdout, &IpcMessage::session_state(SessionState::Failed));
         }
     };
 
     if let Err(e) = adapter.initialize() {
+        diag::log("handshake_failed", &e.to_string());
         write_msg(stdout, &IpcMessage::error(id, &e.to_string()))?;
         return write_msg(stdout, &IpcMessage::session_state(SessionState::Failed));
     }
@@ -61,6 +96,7 @@ fn run_session(
     let thread_id = match adapter.thread_start(cwd) {
         Ok(t) => t,
         Err(e) => {
+            diag::log("thread_start_failed", &e.to_string());
             write_msg(stdout, &IpcMessage::error(id, &e.to_string()))?;
             return write_msg(stdout, &IpcMessage::session_state(SessionState::Failed));
         }
@@ -89,14 +125,24 @@ fn run_session(
 
     for item in &out_items {
         write_msg(stdout, &IpcMessage::agent_item(item))?;
+        // Record each neutral item (redaction happens inside try_append).
+        if let Ok(j) = serde_json::to_string(item) {
+            record_or_warn(stdout, &run_id, &j)?;
+        }
     }
 
     match turn {
         Ok(()) => {
+            diag::log("session_complete", &format!("run={run_id} items={}", out_items.len()));
+            record_or_warn(stdout, &run_id, r#"{"event":"complete"}"#)?;
             write_msg(stdout, &IpcMessage::session_state(SessionState::Ready))?;
             write_msg(stdout, &IpcMessage { kind: "turnComplete".into(), id, payload: None })
         }
         Err(e) => {
+            diag::log("turn_failed", &format!("run={run_id} {e}"));
+            record_or_warn(stdout, &run_id,
+                &format!(r#"{{"event":"failed","error":{}}}"#,
+                    serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "\"\"".into())))?;
             write_msg(stdout, &IpcMessage::error(id, &e.to_string()))?;
             write_msg(stdout, &IpcMessage::session_state(SessionState::Failed))
         }

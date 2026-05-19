@@ -51,15 +51,50 @@ codex app-server  (子进程, JSON-RPC over stdio)
 
 ## 构建
 
-> 待补：Xcode 工程 + Cargo 工程就位后填写。
+前置：Rust（`cargo`）、Swift 6 / Xcode（macOS 14+）、`codex` CLI 已
+`codex login`（AgentDeck 不碰 / 不存 / 不转发任何 token —— 沿用 codex
+已有认证）。
 
-```
-# Swift app
-xcodebuild ...
-
+```bash
 # Rust daemon
-cargo build --release -p agentdeckd
+cargo build --release            # 产出 target/release/agentdeckd
+
+# Swift app
+swift build -c release           # 产出 .build/release/AgentDeck
 ```
+
+运行（Swift app 会自动 spawn 同目录或 PATH 上的 agentdeckd）：
+
+```bash
+swift run AgentDeck               # 打开原生窗口
+swift run AgentDeck -- --selfcheck  # 无窗口自检(CI: IPC+生命周期)
+```
+
+测试：
+
+```bash
+cargo test        # daemon: ipc/codex/record/diag(含 fixture 回放)
+swift test        # app: 中立协议 + 分行成帧
+```
+
+### 协议
+
+`protocol/` 是从官方 `codex app-server generate-json-schema` 生成的
+协议 schema（非逆向）。`protocol/SPIKE_FINDINGS.md` 记录实测的 wire
+framing（逐行 JSONL）。codex 版本固定在 `protocol/CODEX_VERSION.txt`。
+
+### 本地数据（AgentDeck 管理，绝不进你的 git）
+
+- run 记录：`~/Library/Application Support/AgentDeck/runs/*.jsonl`
+- 诊断日志：`~/Library/Application Support/AgentDeck/diagnostic.log`
+
+写入前做 best-effort 密钥脱敏。写失败不阻塞会话，但会在界面可见
+警告（绝不静默）。
+
+### 回滚
+
+未签名 `.app`：删除应用即可。GitHub Releases 保留旧版本 zip。无
+数据库迁移、无 feature flag。首次打开需在系统设置允许（Gatekeeper）。
 
 ## 贡献
 
