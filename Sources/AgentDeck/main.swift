@@ -1,35 +1,39 @@
-import Foundation
+import SwiftUI
 
-// AgentDeck — Step 1 entry point.
+// AgentDeck — Step 4: the SwiftUI app. Beat 1 (the only user-perceivable
+// wow in v0.1) lives in SessionView, built to the locked D3-D9 design specs.
 //
-// Step 1 proves three things before any UI exists:
-//   1. The Swift app can spawn agentdeckd as a child process.
-//   2. The neutral JSONL IPC round trip works (ping → pong).
-//   3. The A1 lifecycle contract holds: the daemon dies when the app exits.
-//
-// The SwiftUI window (Beat 1 — the only user-perceivable wow) lands in
-// Step 4. Keeping Step 1 headless makes the IPC + lifecycle contract
-// testable in CI without a windowing session.
+// A headless self-check mode is retained for CI: `AgentDeck --selfcheck`
+// runs the Step 1 IPC round trip + A1 lifecycle assertion without a
+// windowing session, so the IPC/lifecycle contract stays CI-testable.
 
-let client = DaemonClient()
-
-do {
-    try client.start()
-    print("agentdeckd spawned.")
-
-    let pong = try client.roundTrip(IpcMessage(kind: "ping", id: 1, payload: nil))
-    guard pong.kind == "pong", pong.id == 1 else {
-        FileHandle.standardError.write(Data("unexpected reply: \(pong)\n".utf8))
+if CommandLine.arguments.contains("--selfcheck") {
+    let client = DaemonClient()
+    do {
+        try client.start()
+        let pong = try client.roundTrip(IpcMessage(kind: "ping", id: 1, payload: nil))
+        guard pong.kind == "pong", pong.id == 1 else {
+            FileHandle.standardError.write(Data("selfcheck: unexpected reply\n".utf8))
+            client.shutdown()
+            exit(1)
+        }
+        client.shutdown()
+        print("selfcheck OK: IPC round trip + A1 lifecycle clean.")
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data("selfcheck FATAL: \(error)\n".utf8))
         client.shutdown()
         exit(1)
     }
-    print("IPC round trip OK: ping → pong (id 1).")
-
-    client.shutdown()
-    print("daemon shut down. A1 lifecycle: clean.")
-    exit(0)
-} catch {
-    FileHandle.standardError.write(Data("FATAL: \(error)\n".utf8))
-    client.shutdown()
-    exit(1)
 }
+
+struct AgentDeckApp: App {
+    var body: some Scene {
+        WindowGroup("AgentDeck") {     // D3: title bar reads "AgentDeck"
+            SessionView()
+        }
+        .windowResizability(.contentSize)
+    }
+}
+
+AgentDeckApp.main()

@@ -143,6 +143,60 @@ final class DaemonClient {
         }
     }
 
+    /// Start a streaming session. Sends `startSession {cwd, prompt}`, then
+    /// reads neutral IPC messages on a BACKGROUND thread and delivers each
+    /// one to `onMessage` ON THE MAIN THREAD.
+    ///
+    /// Eng C-uitest / D5: the background-reader → MainActor hop is exactly
+    /// the fragile seam in a streaming Swift↔Rust IPC. Delivering on
+    /// MainActor here means SwiftUI state mutation is always main-thread —
+    /// no out-of-order refresh, no UI crash. The stream ends when the daemon
+    /// emits `turnComplete` or an `error` (Eng premise 9: visible, never a
+    /// silent hang).
+    func startSession(
+        cwd: String,
+        prompt: String,
+        onLine: @escaping @MainActor (String) -> Void
+    ) {
+        let payload = AnyCodable(["cwd": cwd, "prompt": prompt])
+        let msg = IpcMessage(kind: "startSession", id: 1, payload: payload)
+        guard let data = try? JSONEncoder().encode(msg) else {
+            Task { @MainActor in
+                onLine(#"{"kind":"error","payload":{"message":"failed to encode startSession"}}"#)
+            }
+            return
+        }
+        var line = data
+        line.append(0x0A)
+        toDaemon.fileHandleForWriting.write(line)
+
+        // Cross the thread boundary with a plain String (Sendable). Decoding
+        // happens ON the main actor in onLine — so the IpcMessage (which
+        // holds non-Sendable AnyCodable) never crosses threads at all. This
+        // sidesteps the background→main data race entirely (Eng C-uitest):
+        // the safe fix is to not share a non-Sendable value, not to bolt
+        // Sendable onto it.
+        // Capture ONLY the reader, not self. The background thread must not
+        // reach back into DaemonClient (non-Sendable) — it owns nothing but
+        // the line stream. This is the minimal-sharing fix, not a Sendable
+        // bolt-on.
+        guard let reader else {
+            Task { @MainActor in
+                onLine(#"{"kind":"error","payload":{"message":"reader not initialized"}}"#)
+            }
+            return
+        }
+        Thread.detachNewThread {
+            while let raw = reader.nextLine() {
+                if raw.isEmpty { continue }
+                let terminal = raw.contains("\"turnComplete\"")
+                    || raw.contains("\"kind\":\"error\"")
+                DispatchQueue.main.async { onLine(raw) }
+                if terminal { break }
+            }
+        }
+    }
+
     /// Ask the daemon to shut down, then ensure it is gone (A1: app exit
     /// kills the daemon — request a clean shutdown, then hard-kill as backstop).
     func shutdown() {
@@ -166,7 +220,15 @@ final class DaemonClient {
 /// A single JSONL message can arrive split across multiple read() calls
 /// (Codex C-uitest / Eng D5: partial-line framing is exactly what breaks in
 /// IPC). This handles that; Step 1 unit tests cover the split case.
-final class BufferedLineReader {
+///
+/// `@unchecked Sendable` is sound here by ownership discipline, not by
+/// thread-safety primitives: exactly ONE consumer touches a reader at a
+/// time. Step 1's roundTrip reads it synchronously on the caller's thread;
+/// the streaming path moves it to a single dedicated background thread and
+/// the main thread never reads it concurrently. There is no overlap, so no
+/// lock is needed. (If a future change adds a second concurrent reader, this
+/// annotation is the thing to revisit.)
+final class BufferedLineReader: @unchecked Sendable {
     private let handle: FileHandle
     private var buffer = Data()
 
