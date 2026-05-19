@@ -1,0 +1,15 @@
+[package]
+name = "agentdeckd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AgentDeck daemon — agent-neutral adapter boundary, owns the Codex app-server child process"
+
+[[bin]]
+name = "agentdeckd"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
