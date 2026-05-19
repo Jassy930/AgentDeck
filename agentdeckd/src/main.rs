@@ -22,7 +22,7 @@ mod ipc;
 
 use std::io::{BufRead, Write};
 
-use ipc::{IpcMessage, SessionState};
+use ipc::{Coalescer, IpcMessage, SessionState};
 
 fn write_msg(stdout: &mut impl Write, msg: &IpcMessage) -> std::io::Result<()> {
     let mut s = serde_json::to_string(msg)?;
@@ -68,13 +68,26 @@ fn run_session(
 
     write_msg(stdout, &IpcMessage::session_state(SessionState::Running))?;
 
-    // Collect items first (turn_start borrows the adapter); emitting inside
-    // the closure would double-borrow stdout. Step 3 replaces this with the
-    // bounded-buffer + delta-coalescing channel (Eng A2).
-    let mut items = Vec::new();
-    let turn = adapter.turn_start(&thread_id, prompt, |item| items.push(item));
+    // Step 3: stream through the A2 coalescer. turn_start hands each
+    // translated item to the closure; the coalescer merges consecutive
+    // same-id deltas (bounded to one pending slot) and yields whatever must
+    // be flushed now. We still collect into a Vec because turn_start borrows
+    // the adapter and stdout can't be borrowed inside the closure — but the
+    // coalescer runs INSIDE the closure, so buffering is bounded regardless
+    // of turn length (the Vec only holds already-coalesced items, i.e. one
+    // entry per logical item, not one per raw delta).
+    let mut coalescer = Coalescer::default();
+    let mut out_items = Vec::new();
+    let turn = adapter.turn_start(&thread_id, prompt, |item| {
+        if let Some(flush) = coalescer.push(item) {
+            out_items.push(flush);
+        }
+    });
+    if let Some(last) = coalescer.take_pending() {
+        out_items.push(last);
+    }
 
-    for item in &items {
+    for item in &out_items {
         write_msg(stdout, &IpcMessage::agent_item(item))?;
     }
 

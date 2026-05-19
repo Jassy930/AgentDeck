@@ -271,13 +271,65 @@ unsafe extern "C" {
 
 /// Translate a Codex notification into a neutral AgentItem.
 ///
-/// This is the ENTIRE Codex→neutral mapping surface. Unknown item types are
+/// This is the ENTIRE Codex→neutral mapping surface — the whole vendor
+/// coupling of AgentDeck lives in this one function. Unknown item types are
 /// neutralized here (Eng E1 + Codex #19): they become `AgentItemKind::Raw`
-/// with a short description — vendor JSON never crosses to Swift.
+/// with a short description; vendor JSON never crosses to Swift.
 ///
-/// Step 2 maps the reasoning path (`item/agentMessage/delta`,
-/// `item/started`, `item/completed` for agentMessage). Shell / file-edit
-/// land in Step 3.
+/// Verified Codex semantics (Step 2 e2e, not assumed):
+/// - `agentMessage` = the user-facing answer → neutral `Reasoning` (this is
+///   what the design doc's "reasoning layer" actually renders).
+/// - `reasoning` = the model's internal chain-of-thought → neutralized to
+///   `Raw` (correct: internal thinking is NOT shown verbatim).
+/// - `commandExecution` → neutral `Shell` (command / aggregatedOutput /
+///   exitCode), per-kind structured (D4).
+/// - `fileChange` → neutral `FileEdit` (path + diff from changes[0]).
+fn item_to_kind(item: &Value) -> Option<AgentItemKind> {
+    match item.get("type").and_then(Value::as_str)? {
+        "agentMessage" => Some(AgentItemKind::Reasoning {
+            text: item.get("text").and_then(Value::as_str).unwrap_or("").to_string(),
+        }),
+        "commandExecution" => Some(AgentItemKind::Shell {
+            command: item
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            output: item
+                .get("aggregatedOutput")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            exit_code: item.get("exitCode").and_then(Value::as_i64),
+        }),
+        "fileChange" => {
+            // changes[] is an array of FileUpdateChange {path, diff, kind}.
+            // v0.1 surfaces the first change's path + diff; multi-file edits
+            // are a Step 5 refinement (the neutral shape already allows it).
+            let first = item
+                .get("changes")
+                .and_then(Value::as_array)
+                .and_then(|a| a.first());
+            Some(AgentItemKind::FileEdit {
+                path: first
+                    .and_then(|c| c.get("path"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                diff: first
+                    .and_then(|c| c.get("diff"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        }
+        // Internal chain-of-thought and every other vendor type: neutralized.
+        // No vendor JSON crosses (Codex #19); fails loud as a visible Raw
+        // item, never a silent drop (Eng E1 / premise 9).
+        other => Some(AgentItemKind::Raw {
+            description: format!("unsupported item type: {other}"),
+        }),
+    }
+}
+
 fn translate(method: &str, params: &Value) -> Option<AgentItem> {
     match method {
         "item/agentMessage/delta" => {
@@ -289,53 +341,76 @@ fn translate(method: &str, params: &Value) -> Option<AgentItem> {
                 kind: AgentItemKind::Reasoning { text: delta },
             })
         }
+        "item/commandExecution/outputDelta" => {
+            // Streaming shell output. base64-encoded chunk; we surface it as
+            // a Shell delta carrying the decoded chunk in `output`. The
+            // coalescer (below) merges consecutive deltas of the same item.
+            let id = params.get("itemId").and_then(Value::as_str)?.to_string();
+            let chunk = params
+                .get("deltaBase64")
+                .and_then(Value::as_str)
+                .and_then(decode_base64)
+                .unwrap_or_default();
+            Some(AgentItem {
+                id,
+                lifecycle: Lifecycle::Delta,
+                kind: AgentItemKind::Shell {
+                    command: String::new(),
+                    output: Some(chunk),
+                    exit_code: None,
+                },
+            })
+        }
         "item/started" => {
             let item = params.get("item")?;
             let id = item.get("id").and_then(Value::as_str)?.to_string();
-            match item.get("type").and_then(Value::as_str) {
-                Some("agentMessage") => Some(AgentItem {
-                    id,
-                    lifecycle: Lifecycle::Started,
-                    kind: AgentItemKind::Reasoning {
-                        text: item
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                    },
-                }),
-                // Unknown/other types neutralized (E1/#19): no vendor JSON
-                // crosses to Swift; only a short description.
-                Some(other) => Some(AgentItem {
-                    id,
-                    lifecycle: Lifecycle::Started,
-                    kind: AgentItemKind::Raw {
-                        description: format!("unsupported item type: {other}"),
-                    },
-                }),
-                None => None,
-            }
+            Some(AgentItem { id, lifecycle: Lifecycle::Started, kind: item_to_kind(item)? })
         }
         "item/completed" => {
             let item = params.get("item")?;
             let id = item.get("id").and_then(Value::as_str)?.to_string();
-            match item.get("type").and_then(Value::as_str) {
-                Some("agentMessage") => Some(AgentItem {
-                    id,
-                    lifecycle: Lifecycle::Completed,
-                    kind: AgentItemKind::Reasoning {
-                        text: item
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                    },
-                }),
-                _ => None,
-            }
+            Some(AgentItem { id, lifecycle: Lifecycle::Completed, kind: item_to_kind(item)? })
         }
         _ => None,
     }
+}
+
+/// Minimal standard-base64 decoder (no external crate — boring-by-default,
+/// one tiny function next to its sole caller). Returns the decoded UTF-8
+/// string, lossily; non-base64 input yields None so the caller falls back.
+fn decode_base64(s: &str) -> Option<String> {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut rev = [255u8; 256];
+    for (i, &c) in T.iter().enumerate() {
+        rev[c as usize] = i as u8;
+    }
+    let bytes: Vec<u8> = s.bytes().filter(|&b| b != b'\n' && b != b'\r').collect();
+    let mut out = Vec::new();
+    for chunk in bytes.chunks(4) {
+        let mut buf = [0u8; 4];
+        let mut n = 0;
+        for (i, &b) in chunk.iter().enumerate() {
+            if b == b'=' {
+                break;
+            }
+            let v = rev[b as usize];
+            if v == 255 {
+                return None;
+            }
+            buf[i] = v;
+            n += 1;
+        }
+        if n >= 2 {
+            out.push((buf[0] << 2) | (buf[1] >> 4));
+        }
+        if n >= 3 {
+            out.push((buf[1] << 4) | (buf[2] >> 2));
+        }
+        if n >= 4 {
+            out.push((buf[2] << 6) | buf[3]);
+        }
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
 }
 
 #[cfg(test)]
@@ -384,5 +459,130 @@ mod tests {
     fn unrelated_notification_yields_no_item() {
         assert!(translate("turn/started", &json!({})).is_none());
         assert!(translate("thread/tokenUsage/updated", &json!({})).is_none());
+    }
+
+    // --- Fixture replay (Eng T1) ---
+    //
+    // These drive translate() with notifications shaped exactly per the
+    // official app-server schema (fields verified from
+    // protocol/codex_app_server_protocol.v2.schemas.json and the Step 2
+    // e2e run — NOT invented). This is the regression net for the neutral
+    // boundary: it runs in CI with no real Codex call. If a future codex
+    // version changes a field, these fail and point at the exact mapping.
+
+    #[test]
+    fn fixture_agent_message_lifecycle_maps_to_reasoning() {
+        // item/started → item/agentMessage/delta* → item/completed
+        let started = translate(
+            "item/started",
+            &json!({"item":{"id":"msg1","type":"agentMessage","text":""},
+                    "startedAtMs":0,"threadId":"t","turnId":"u"}),
+        )
+        .unwrap();
+        assert!(matches!(started.lifecycle, Lifecycle::Started));
+        assert!(matches!(started.kind, AgentItemKind::Reasoning { .. }));
+
+        let delta = translate(
+            "item/agentMessage/delta",
+            &json!({"itemId":"msg1","delta":"Hello","threadId":"t","turnId":"u"}),
+        )
+        .unwrap();
+        match delta.kind {
+            AgentItemKind::Reasoning { text } => assert_eq!(text, "Hello"),
+            _ => panic!(),
+        }
+
+        let done = translate(
+            "item/completed",
+            &json!({"item":{"id":"msg1","type":"agentMessage","text":"Hello world"},
+                    "threadId":"t","turnId":"u"}),
+        )
+        .unwrap();
+        match done.kind {
+            AgentItemKind::Reasoning { text } => assert_eq!(text, "Hello world"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn fixture_command_execution_maps_to_shell_per_kind() {
+        // commandExecution item shape from the official schema:
+        // command / aggregatedOutput / exitCode / cwd / status.
+        let item = translate(
+            "item/completed",
+            &json!({"item":{
+                "id":"cmd1","type":"commandExecution","status":"completed",
+                "command":"echo hello","aggregatedOutput":"hello\n",
+                "exitCode":0,"cwd":"/tmp","commandActions":[]
+            },"threadId":"t","turnId":"u"}),
+        )
+        .unwrap();
+        match item.kind {
+            AgentItemKind::Shell { command, output, exit_code } => {
+                assert_eq!(command, "echo hello");
+                assert_eq!(output.as_deref(), Some("hello\n"));
+                assert_eq!(exit_code, Some(0));
+            }
+            _ => panic!("expected per-kind Shell"),
+        }
+    }
+
+    #[test]
+    fn fixture_file_change_maps_to_file_edit() {
+        // fileChange item: changes[] of FileUpdateChange {path,diff,kind}.
+        let item = translate(
+            "item/completed",
+            &json!({"item":{
+                "id":"fc1","type":"fileChange","status":"applied",
+                "changes":[{"path":"src/main.rs",
+                            "diff":"@@ -1 +1 @@\n-old\n+new","kind":"modified"}]
+            },"threadId":"t","turnId":"u"}),
+        )
+        .unwrap();
+        match item.kind {
+            AgentItemKind::FileEdit { path, diff } => {
+                assert_eq!(path, "src/main.rs");
+                assert!(diff.unwrap().contains("+new"));
+            }
+            _ => panic!("expected FileEdit"),
+        }
+    }
+
+    #[test]
+    fn fixture_internal_reasoning_is_neutralized_not_shown() {
+        // The model's internal chain-of-thought (type=reasoning) must NOT
+        // surface as user-visible content — it neutralizes to Raw (verified
+        // semantics from the Step 2 e2e run).
+        let item = translate(
+            "item/started",
+            &json!({"item":{"id":"rs1","type":"reasoning","text":"internal cot"},
+                    "startedAtMs":0,"threadId":"t","turnId":"u"}),
+        )
+        .unwrap();
+        match item.kind {
+            AgentItemKind::Raw { description } => {
+                assert!(description.contains("reasoning"));
+                assert!(!description.contains("internal cot"));
+            }
+            _ => panic!("internal reasoning must be neutralized to Raw"),
+        }
+    }
+
+    #[test]
+    fn base64_decoder_roundtrips_shell_output_delta() {
+        // item/commandExecution/outputDelta carries base64. "hello" =>
+        // "aGVsbG8=".
+        let item = translate(
+            "item/commandExecution/outputDelta",
+            &json!({"itemId":"cmd1","deltaBase64":"aGVsbG8=",
+                    "stream":"stdout","processId":1,"capReached":false}),
+        )
+        .unwrap();
+        match item.kind {
+            AgentItemKind::Shell { output, .. } => {
+                assert_eq!(output.as_deref(), Some("hello"));
+            }
+            _ => panic!("expected Shell delta"),
+        }
     }
 }
