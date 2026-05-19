@@ -1,0 +1,35 @@
+# macOS
+.DS_Store
+
+# Xcode
+*.xcuserstate
+*.xcscmblueprint
+xcuserdata/
+DerivedData/
+build/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+
+# Swift Package Manager
+.swiftpm/
+.build/
+Package.resolved
+
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# AgentDeck local data (never committed — managed by AgentDeck itself)
+# Run records / diagnostic logs live in ~/Library/Application Support/AgentDeck/
+# NOT in the repo. This entry is a guard in case of accidental local writes.
+.agentdeck/
+
+# Editor
+*.swp
+.idea/
+.vscode/
+
+# Env / secrets
+.env
+*.local
