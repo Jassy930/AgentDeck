@@ -89,13 +89,18 @@ struct AnyCodable: Codable {
 }
 
 final class DaemonMessageRouter: @unchecked Sendable {
+    private struct StreamLineSubscription {
+        let expectedSessionId: String?
+        let handler: (String) -> Void
+    }
+
     private let condition = NSCondition()
     private var pendingReplyIds: Set<UInt64> = []
     private var replies: [UInt64: IpcMessage] = [:]
     private var unmatched: [IpcMessage] = []
     private var isClosed = false
     private var sessionEventHandler: ((IpcMessage) -> Void)?
-    private var streamLineHandler: ((String) -> Void)?
+    private var streamLineSubscription: StreamLineSubscription?
     private var unmatchedMessageHandler: ((IpcMessage) -> Void)?
 
     var onSessionEvent: ((IpcMessage) -> Void)? {
@@ -115,13 +120,27 @@ final class DaemonMessageRouter: @unchecked Sendable {
         get {
             condition.lock()
             defer { condition.unlock() }
-            return streamLineHandler
+            return streamLineSubscription?.handler
         }
         set {
             condition.lock()
-            streamLineHandler = newValue
+            streamLineSubscription = newValue.map {
+                StreamLineSubscription(expectedSessionId: nil, handler: $0)
+            }
             condition.unlock()
         }
+    }
+
+    func setStreamLineHandler(
+        expectedSessionId: String?,
+        _ handler: @escaping (String) -> Void
+    ) {
+        condition.lock()
+        streamLineSubscription = StreamLineSubscription(
+            expectedSessionId: expectedSessionId,
+            handler: handler
+        )
+        condition.unlock()
     }
 
     var onUnmatchedMessage: ((IpcMessage) -> Void)? {
@@ -166,9 +185,13 @@ final class DaemonMessageRouter: @unchecked Sendable {
         if message.kind == "session/event" {
             sessionHandler = sessionEventHandler
             streamRawLine = Self.encodeLegacySessionEventRawLine(message)
-            streamHandler = streamRawLine == nil ? nil : streamLineHandler
-            if Self.isTerminalSessionEvent(message) && streamRawLine != nil {
-                streamLineHandler = nil
+            let streamSubscription = streamLineSubscription
+            let shouldRouteToStream = streamRawLine != nil
+                && streamSubscription != nil
+                && Self.sessionEvent(message, matches: streamSubscription?.expectedSessionId)
+            streamHandler = shouldRouteToStream ? streamSubscription?.handler : nil
+            if Self.isTerminalSessionEvent(message) && shouldRouteToStream {
+                streamLineSubscription = nil
             }
             if streamRawLine == nil || (sessionHandler == nil && streamHandler == nil) {
                 unmatched.append(message)
@@ -178,10 +201,10 @@ final class DaemonMessageRouter: @unchecked Sendable {
             }
         } else if Self.isLegacyStreamKind(message.kind) {
             sessionHandler = nil
-            streamHandler = streamLineHandler
+            streamHandler = streamLineSubscription?.handler
             streamRawLine = rawLine ?? Self.encodeRawLine(message)
             if Self.isTerminalStreamKind(message.kind) {
-                streamLineHandler = nil
+                streamLineSubscription = nil
             }
             if streamHandler == nil {
                 unmatched.append(message)
@@ -281,6 +304,11 @@ final class DaemonMessageRouter: @unchecked Sendable {
             return false
         }
         return isTerminalStreamKind(eventKind)
+    }
+
+    private static func sessionEvent(_ message: IpcMessage, matches expectedSessionId: String?) -> Bool {
+        guard let expectedSessionId else { return true }
+        return message.sessionId == expectedSessionId
     }
 
     private static func encodeLegacySessionEventRawLine(_ message: IpcMessage) -> String? {
@@ -429,6 +457,21 @@ final class DaemonClient {
 
     func prepareGeneratedIdRequest(_ msg: IpcMessage) throws -> IpcMessage {
         requestIdAllocator.assignUniqueId(to: msg)
+    }
+
+    func prepareRuntimeTurnRequest(
+        sessionId: String,
+        threadId: String?,
+        cwd: URL,
+        prompt: String
+    ) throws -> IpcMessage {
+        try prepareGeneratedIdRequest(Self.runtimeTurnRequest(
+            id: 0,
+            sessionId: sessionId,
+            threadId: threadId,
+            cwd: cwd,
+            prompt: prompt
+        ))
     }
 
     private func roundTripWithGeneratedId(_ msg: IpcMessage) throws -> IpcMessage {
@@ -635,7 +678,7 @@ final class DaemonClient {
             }
             return
         }
-        router.onStreamLine = { raw in
+        router.setStreamLineHandler(expectedSessionId: "session_1") { raw in
             DispatchQueue.main.async { onLine(raw) }
         }
         write(line)
@@ -662,7 +705,7 @@ final class DaemonClient {
             }
             return
         }
-        router.onStreamLine = { raw in
+        router.setStreamLineHandler(expectedSessionId: "session_\(threadId)") { raw in
             DispatchQueue.main.async { onLine(raw) }
         }
         write(line)
@@ -675,25 +718,32 @@ final class DaemonClient {
         prompt: String,
         onEvent: @escaping @MainActor (IpcMessage) -> Void
     ) {
-        let msg = Self.runtimeTurnRequest(
-            id: 4,
-            sessionId: sessionId,
-            threadId: threadId,
-            cwd: cwd,
-            prompt: prompt
-        )
-        guard let data = try? JSONEncoder().encode(msg) else {
+        let msg: IpcMessage
+        do {
+            msg = try prepareRuntimeTurnRequest(
+                sessionId: sessionId,
+                threadId: threadId,
+                cwd: cwd,
+                prompt: prompt
+            )
+        } catch {
             Task { @MainActor in
-                onEvent(IpcMessage(
-                    kind: "session/event",
+                onEvent(Self.syntheticSessionEvent(
                     sessionId: sessionId,
                     threadId: threadId,
-                    payload: AnyCodable([
-                        "event": [
-                            "kind": "error",
-                            "payload": ["message": "failed to encode runtime turn"],
-                        ],
-                    ])
+                    kind: "error",
+                    payload: ["message": "\(error)"]
+                ))
+            }
+            return
+        }
+        guard let data = try? JSONEncoder().encode(msg) else {
+            Task { @MainActor in
+                onEvent(Self.syntheticSessionEvent(
+                    sessionId: sessionId,
+                    threadId: threadId,
+                    kind: "error",
+                    payload: ["message": "failed to encode runtime turn"]
                 ))
             }
             return
@@ -707,16 +757,11 @@ final class DaemonClient {
             }
         } catch {
             Task { @MainActor in
-                onEvent(IpcMessage(
-                    kind: "session/event",
+                onEvent(Self.syntheticSessionEvent(
                     sessionId: sessionId,
                     threadId: threadId,
-                    payload: AnyCodable([
-                        "event": [
-                            "kind": "error",
-                            "payload": ["message": "\(error)"],
-                        ],
-                    ])
+                    kind: "error",
+                    payload: ["message": "\(error)"]
                 ))
             }
             return
@@ -734,7 +779,84 @@ final class DaemonClient {
                 onEvent(decoded)
             }
         }
+        if let id = msg.id {
+            guard router.registerPending(id: id) else {
+                Task { @MainActor in
+                    onEvent(Self.syntheticSessionEvent(
+                        sessionId: sessionId,
+                        threadId: threadId,
+                        kind: "error",
+                        payload: ["message": DaemonError.duplicateRequestId(id).description]
+                    ))
+                }
+                return
+            }
+            waitForTurnAccepted(
+                id: id,
+                sessionId: sessionId,
+                threadId: threadId,
+                onEvent: onEvent
+            )
+        }
         write(line)
+    }
+
+    private func waitForTurnAccepted(
+        id: UInt64,
+        sessionId: String,
+        threadId: String?,
+        onEvent: @escaping @MainActor (IpcMessage) -> Void
+    ) {
+        let router = router
+        DispatchQueue.global(qos: .utility).async {
+            guard let reply = router.waitForReply(id: id) else {
+                DispatchQueue.main.async {
+                    onEvent(Self.syntheticSessionEvent(
+                        sessionId: sessionId,
+                        threadId: threadId,
+                        kind: "error",
+                        payload: ["message": DaemonError.disconnected.description]
+                    ))
+                }
+                return
+            }
+            guard reply.kind != "turnAccepted" else { return }
+            let message: String
+            if reply.kind == "error",
+               let payload = reply.payload?.value as? [String: Any],
+               let errorMessage = payload["message"] as? String {
+                message = errorMessage
+            } else {
+                message = "expected turnAccepted, got \(reply.kind)"
+            }
+            DispatchQueue.main.async {
+                onEvent(Self.syntheticSessionEvent(
+                    sessionId: sessionId,
+                    threadId: threadId,
+                    kind: "error",
+                    payload: ["message": message]
+                ))
+            }
+        }
+    }
+
+    private static func syntheticSessionEvent(
+        sessionId: String,
+        threadId: String?,
+        kind: String,
+        payload: [String: Any]
+    ) -> IpcMessage {
+        IpcMessage(
+            kind: "session/event",
+            sessionId: sessionId,
+            threadId: threadId,
+            payload: AnyCodable([
+                "event": [
+                    "kind": kind,
+                    "payload": payload,
+                ],
+            ])
+        )
     }
 
     /// Ask the daemon to shut down, then ensure it is gone (A1: app exit

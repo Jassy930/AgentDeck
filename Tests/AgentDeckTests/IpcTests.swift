@@ -123,6 +123,37 @@ struct DaemonMessageRoutingTests {
         #expect((error.payload?.value as? [String: Any])?["message"] as? String == "boom")
     }
 
+    @Test("session events for other runtimes do not enter a bound legacy stream")
+    func otherRuntimeEventsDoNotEnterBoundLegacyStream() throws {
+        let router = DaemonMessageRouter()
+        var rawLines: [String] = []
+        router.setStreamLineHandler(expectedSessionId: "legacy") { rawLines.append($0) }
+
+        router.route(IpcMessage(kind: "session/event", sessionId: "runtime_b", payload: AnyCodable([
+            "event": ["kind": "turnComplete"]
+        ])))
+        router.route(IpcMessage(kind: "session/event", sessionId: "legacy", payload: AnyCodable([
+            "event": [
+                "kind": "agentItem",
+                "payload": [
+                    "id": "item1",
+                    "lifecycle": "completed",
+                    "kind": "message",
+                    "text": "legacy still connected",
+                ],
+            ]
+        ])))
+        router.route(IpcMessage(kind: "session/event", sessionId: "legacy", payload: AnyCodable([
+            "event": ["kind": "turnComplete"]
+        ])))
+
+        #expect(rawLines.count == 2)
+        let item = try JSONDecoder().decode(IpcMessage.self, from: Data(try #require(rawLines.first).utf8))
+        let complete = try JSONDecoder().decode(IpcMessage.self, from: Data(try #require(rawLines.last).utf8))
+        #expect(item.kind == "agentItem")
+        #expect(complete.kind == "turnComplete")
+    }
+
     @Test("rejects duplicate pending ids before a reply is routed")
     func rejectsDuplicatePendingIdsBeforeReplyIsRouted() {
         let router = DaemonMessageRouter()
@@ -165,6 +196,27 @@ struct DaemonMessageRoutingTests {
         #expect(first.kind == "history/listThreads")
         #expect(first.id != 2)
         #expect(second.id != 2)
+        #expect(first.id != second.id)
+    }
+
+    @Test("runtime turn requests use generated ids for ack correlation")
+    func runtimeTurnRequestsUseGeneratedIdsForAckCorrelation() throws {
+        let client = DaemonClient()
+        let first = try client.prepareRuntimeTurnRequest(
+            sessionId: "session_a",
+            threadId: "thread_a",
+            cwd: URL(fileURLWithPath: "/tmp/a"),
+            prompt: "first"
+        )
+        let second = try client.prepareRuntimeTurnRequest(
+            sessionId: "session_b",
+            threadId: "thread_b",
+            cwd: URL(fileURLWithPath: "/tmp/b"),
+            prompt: "second"
+        )
+
+        #expect(first.id != 4)
+        #expect(second.id != 4)
         #expect(first.id != second.id)
     }
 }
@@ -683,6 +735,25 @@ struct WorkbenchRuntimeModelTests {
         #expect(!model.selectedItems[0].hasDeferredOutputBuffer)
         #expect(model.selectedItems[1].diffBuffer.text == "+ selected small diff")
         #expect(!model.selectedItems[1].hasDeferredDiffBuffer)
+    }
+
+    @Test("selected runtime drives visible status and error facade")
+    func selectedRuntimeDrivesVisibleStatusAndErrorFacade() {
+        let model = SessionModel()
+        model.phase = .ready
+        model.errorMessage = "legacy error"
+        model.workbench.ensureRuntime(
+            sessionId: "selected",
+            threadId: "thread_selected",
+            cwd: URL(fileURLWithPath: "/tmp/selected")
+        )
+        model.workbench.runtime(sessionId: "selected")?.phase = .running
+        model.workbench.runtime(sessionId: "selected")?.errorMessage = "runtime error"
+
+        #expect(model.selectedPhase == .running)
+        #expect(model.statusText == "Codex is working…")
+        #expect(model.shouldShowReasoningExpanded)
+        #expect(model.selectedErrorMessage == "runtime error")
     }
 }
 

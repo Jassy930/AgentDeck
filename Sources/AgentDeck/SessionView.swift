@@ -92,7 +92,7 @@ struct SessionView: View {
     }
 
     private var statusColor: Color {
-        switch model.phase {
+        switch model.selectedPhase {
         case .running, .starting: return .accentColor
         case .failed: return .red                // D8 system warning
         case .waitingApproval: return .orange
@@ -251,7 +251,7 @@ struct SessionView: View {
                         Divider().opacity(0.4)  // D7: subtle divider, not card
                     }
                 }
-                if let err = model.errorMessage {
+                if let err = model.selectedErrorMessage {
                     errorRow(err)               // premise 9: visible failure
                 }
             }

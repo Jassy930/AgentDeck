@@ -868,6 +868,8 @@ git commit -m "feat: queue prompts per runtime"
 
 **实施记录（2026-05-20）：** 已完成 Swift 端 runtime 级 submit/queue。`WorkbenchModel.submit(_:)` 只对当前 selected runtime 生效；running/starting/waitingApproval 时仅写入该 runtime 的 `queuedPrompts`。`ThreadRuntimeModel.ingest(_:)` 在 `turnComplete` 后返回 `RuntimeAction.drainNextPrompt`，由 `WorkbenchModel` 用完成事件所属 runtime 继续发起下一次 turn，即使用户已切到其他 history/runtime 也不会串队列。`DaemonClient.runtimeTurnRequest(...)` 补上顶层 `sessionId`，按是否已有 `threadId` 选择 `startTurn` 或 `startSession`，未改 Task 8 的 daemon history action。
 
+**质量复核修正（2026-05-20）：** legacy raw stream 绑定预期 `sessionId`，避免其他 runtime 的 `session/event` 被解包投递到当前 legacy `SessionModel` 或提前清空 stream handler；runtime submit 改用 generated request id 并消费 `turnAccepted` ack，避免固定 `id: 4` 的 unmatched 噪声和潜在碰撞；`SessionModel` 增加 selected runtime 的 phase/error facade，确保历史/runtime 选中态下状态栏、错误行和 reasoning 展开读取当前 runtime。
+
 ---
 
 ### Task 8: daemon history 请求在 turn 运行中仍可响应

@@ -184,10 +184,13 @@ final class SessionModel {
     /// final answer (which Codex sends in one burst). When the turn ends,
     /// reasoning collapses back to its D3 secondary role.
     var shouldShowReasoningExpanded: Bool {
-        phase == .running || phase == .starting
+        selectedPhase == .running || selectedPhase == .starting
     }
     var items: [UIItem] = []
     var errorMessage: String?
+    var selectedErrorMessage: String? {
+        workbench.selectedRuntime?.errorMessage ?? errorMessage
+    }
     /// When the current turn began. `nil` outside a turn.
     var runStartedAt: Date?
     /// Driven by a tick timer; the status bar reads this so the elapsed
@@ -226,6 +229,10 @@ final class SessionModel {
         workbench.selectedRuntime?.items ?? items
     }
 
+    var selectedPhase: Phase {
+        workbench.selectedRuntime?.phase ?? phase
+    }
+
     let workbench: WorkbenchModel
 
     private let client: DaemonClient
@@ -259,7 +266,7 @@ final class SessionModel {
     /// time passing while Codex assembles the final answer.
     var statusText: String {
         let base: String
-        switch phase {
+        switch selectedPhase {
         case .idle: base = "Ready"
         case .starting: base = "Connecting to Codex…"
         case .ready: base = "Ready"
@@ -269,7 +276,9 @@ final class SessionModel {
         case .failed: base = "Failed"
         case .closed: base = "Closed"
         }
-        if let s = elapsedSeconds, phase == .running || phase == .starting {
+        if workbench.selectedRuntime == nil,
+           let s = elapsedSeconds,
+           phase == .running || phase == .starting {
             return "\(base)  \(s)s"
         }
         return base
