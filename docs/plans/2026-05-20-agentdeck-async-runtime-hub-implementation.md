@@ -564,6 +564,8 @@ git commit -m "feat: run turns as daemon hub workers"
 
 ### Task 5: Swift 引入 ThreadRuntimeModel 和 WorkbenchModel
 
+**实施记录（2026-05-20）：** 已完成 Swift 多 runtime 状态层的第一步。`WorkbenchModel` 负责按 `sessionId` 查找并路由到既有 `ThreadRuntimeModel`；`ThreadRuntimeModel` 暂时复制 `SessionModel` 的 item 合并逻辑，UI 和历史读取切换留给 Task 6。
+
 **Files:**
 - Create: `Sources/AgentDeck/ThreadRuntimeModel.swift`
 - Create: `Sources/AgentDeck/WorkbenchModel.swift`
@@ -773,6 +775,12 @@ git add Sources/AgentDeck/SessionModel.swift Sources/AgentDeck/SessionView.swift
 git commit -m "feat: open history threads without interrupting runtimes"
 ```
 
+**规格复核修正（2026-05-20）：** `SessionModel.applyHistoryThreadDetail(_:)` 只能同步当前选中的 history thread 元数据并委托 `WorkbenchModel.applyHistoryThreadDetail(_:)` 切换 selected runtime；不得 flush 或覆盖 legacy `items/itemIndexById/errorMessage/phase`。实际 `SessionModel` 路径新增回归测试：当 legacy `phase == .running` 时打开 history 后仍保持 `.running`，legacy `items` 保持当前 stream，`selectedItems` 切到 history replay。
+
+**第二次规格复核修正（2026-05-20）：** selected runtime 的 deferred output/diff materialize 只更新 runtime 自己，不回写 `SessionModel.items`。回归测试覆盖 legacy `phase == .running` 且 `items` 保留当前 stream 时，打开历史 replay 并展开 large output/diff 后，legacy `items` 仍保持 current item，`selectedItems` 中历史 item 完成 materialize。
+
+**第三次规格复核修正（2026-05-20）：** `SessionModel.materializeDeferredContent(...)` 只要存在 selected runtime，就只尝试 selected runtime 并直接返回；即使 selected runtime 未命中或目标不是 deferred，也不得 fallback 到 legacy/current `items`。回归测试覆盖 legacy/current `items` 存在同 id 或同 kind deferred item 时，selected runtime materialize 未命中/不是 deferred 后 legacy `items` 保持不变。
+
 ---
 
 ### Task 7: 多 runtime submit 和队列行为
@@ -857,6 +865,10 @@ Expected: PASS。
 git add Sources/AgentDeck/ThreadRuntimeModel.swift Sources/AgentDeck/WorkbenchModel.swift Sources/AgentDeck/DaemonClient.swift Tests/AgentDeckTests/IpcTests.swift
 git commit -m "feat: queue prompts per runtime"
 ```
+
+**实施记录（2026-05-20）：** 已完成 Swift 端 runtime 级 submit/queue。`WorkbenchModel.submit(_:)` 只对当前 selected runtime 生效；running/starting/waitingApproval 时仅写入该 runtime 的 `queuedPrompts`。`ThreadRuntimeModel.ingest(_:)` 在 `turnComplete` 后返回 `RuntimeAction.drainNextPrompt`，由 `WorkbenchModel` 用完成事件所属 runtime 继续发起下一次 turn，即使用户已切到其他 history/runtime 也不会串队列。`DaemonClient.runtimeTurnRequest(...)` 补上顶层 `sessionId`，按是否已有 `threadId` 选择 `startTurn` 或 `startSession`，未改 Task 8 的 daemon history action。
+
+**质量复核修正（2026-05-20）：** legacy raw stream 绑定预期 `sessionId`，避免其他 runtime 的 `session/event` 被解包投递到当前 legacy `SessionModel` 或提前清空 stream handler；runtime submit 改用 generated request id 并消费 `turnAccepted` ack，避免固定 `id: 4` 的 unmatched 噪声和潜在碰撞；`SessionModel` 增加 selected runtime 的 phase/error facade，确保历史/runtime 选中态下状态栏、错误行和 reasoning 展开读取当前 runtime。
 
 ---
 
@@ -1223,3 +1235,14 @@ git commit -m "chore: finish async runtime hub"
 
 不要提交无关用户改动。
 
+## Task 8 实施记录
+
+- `agentdeckd/src/main.rs` 已将 history list/read/archive/unarchive/rename 分类为 foreground history action，并由短 worker 执行，stdin 主循环不再同步等待历史请求完成。
+
+## Task 9 实施记录
+
+- 已新增 compact `RuntimeSelectorView` 并接入 History 面板顶部。`WorkbenchModel.runtimeList` 将当前 selected runtime 排在最前；后台 runtime 收到事件会增加 `unreadEventCount`，用户选中该 runtime 后清零。README 已同步 runtime selector 的状态点、队列数和未读事件语义。
+
+## Task 11 实施记录
+
+- 已新增 `docs/plans/2026-05-20-agentdeck-async-runtime-hub-design.md`，并同步 README 与历史设计文档。当前文档明确：一个 `agentdeckd` 作为 async runtime hub，history reply 按 request id 分发，streaming event 按 `sessionId/threadId` 路由，历史浏览不再和 streaming turn 抢 direct reader。

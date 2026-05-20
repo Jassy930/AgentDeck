@@ -7,6 +7,7 @@ enum DaemonError: Error, CustomStringConvertible {
     case spawnFailed(String)
     case disconnected
     case malformedReply(String)
+    case duplicateRequestId(UInt64)
 
     var description: String {
         switch self {
@@ -14,6 +15,7 @@ enum DaemonError: Error, CustomStringConvertible {
         case .spawnFailed(let m): return "failed to spawn agentdeckd: \(m)"
         case .disconnected: return "agentdeckd disconnected (EOF on its stdout)"
         case .malformedReply(let s): return "malformed reply from agentdeckd: \(s)"
+        case .duplicateRequestId(let id): return "duplicate pending request id: \(id)"
         }
     }
 }
@@ -27,7 +29,23 @@ enum DaemonError: Error, CustomStringConvertible {
 struct IpcMessage: Codable {
     let kind: String
     var id: UInt64?
+    var sessionId: String?
+    var threadId: String?
     var payload: AnyCodable?
+
+    init(
+        kind: String,
+        id: UInt64? = nil,
+        sessionId: String? = nil,
+        threadId: String? = nil,
+        payload: AnyCodable? = nil
+    ) {
+        self.kind = kind
+        self.id = id
+        self.sessionId = sessionId
+        self.threadId = threadId
+        self.payload = payload
+    }
 }
 
 /// Minimal type-erased JSON value so the neutral payload can carry any
@@ -70,6 +88,292 @@ struct AnyCodable: Codable {
     }
 }
 
+final class DaemonMessageRouter: @unchecked Sendable {
+    private struct StreamLineSubscription {
+        let expectedSessionId: String?
+        let handler: (String) -> Void
+    }
+
+    private let condition = NSCondition()
+    private var pendingReplyIds: Set<UInt64> = []
+    private var replies: [UInt64: IpcMessage] = [:]
+    private var unmatched: [IpcMessage] = []
+    private var isClosed = false
+    private var sessionEventHandler: ((IpcMessage) -> Void)?
+    private var streamLineSubscription: StreamLineSubscription?
+    private var unmatchedMessageHandler: ((IpcMessage) -> Void)?
+
+    var onSessionEvent: ((IpcMessage) -> Void)? {
+        get {
+            condition.lock()
+            defer { condition.unlock() }
+            return sessionEventHandler
+        }
+        set {
+            condition.lock()
+            sessionEventHandler = newValue
+            condition.unlock()
+        }
+    }
+
+    var onStreamLine: ((String) -> Void)? {
+        get {
+            condition.lock()
+            defer { condition.unlock() }
+            return streamLineSubscription?.handler
+        }
+        set {
+            condition.lock()
+            streamLineSubscription = newValue.map {
+                StreamLineSubscription(expectedSessionId: nil, handler: $0)
+            }
+            condition.unlock()
+        }
+    }
+
+    func setStreamLineHandler(
+        expectedSessionId: String?,
+        _ handler: @escaping (String) -> Void
+    ) {
+        condition.lock()
+        streamLineSubscription = StreamLineSubscription(
+            expectedSessionId: expectedSessionId,
+            handler: handler
+        )
+        condition.unlock()
+    }
+
+    var onUnmatchedMessage: ((IpcMessage) -> Void)? {
+        get {
+            condition.lock()
+            defer { condition.unlock() }
+            return unmatchedMessageHandler
+        }
+        set {
+            condition.lock()
+            unmatchedMessageHandler = newValue
+            condition.unlock()
+        }
+    }
+
+    @discardableResult
+    func registerPending(id: UInt64) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        guard !pendingReplyIds.contains(id), replies[id] == nil else {
+            return false
+        }
+        pendingReplyIds.insert(id)
+        return true
+    }
+
+    func route(_ message: IpcMessage, rawLine: String? = nil) {
+        let sessionHandler: ((IpcMessage) -> Void)?
+        let streamHandler: ((String) -> Void)?
+        let streamRawLine: String?
+        let unmatchedHandler: ((IpcMessage) -> Void)?
+
+        condition.lock()
+        if let id = message.id, pendingReplyIds.contains(id) {
+            replies[id] = message
+            pendingReplyIds.remove(id)
+            condition.broadcast()
+            condition.unlock()
+            return
+        }
+
+        if message.kind == "session/event" {
+            sessionHandler = sessionEventHandler
+            streamRawLine = Self.encodeLegacySessionEventRawLine(message)
+            let streamSubscription = streamLineSubscription
+            let shouldRouteToStream = streamRawLine != nil
+                && streamSubscription != nil
+                && Self.sessionEvent(message, matches: streamSubscription?.expectedSessionId)
+            streamHandler = shouldRouteToStream ? streamSubscription?.handler : nil
+            if Self.isTerminalSessionEvent(message) && shouldRouteToStream {
+                streamLineSubscription = nil
+            }
+            if streamRawLine == nil || (sessionHandler == nil && streamHandler == nil) {
+                unmatched.append(message)
+                unmatchedHandler = unmatchedMessageHandler
+            } else {
+                unmatchedHandler = nil
+            }
+        } else if Self.isLegacyStreamKind(message.kind) {
+            sessionHandler = nil
+            streamHandler = streamLineSubscription?.handler
+            streamRawLine = rawLine ?? Self.encodeRawLine(message)
+            if Self.isTerminalStreamKind(message.kind) {
+                streamLineSubscription = nil
+            }
+            if streamHandler == nil {
+                unmatched.append(message)
+                unmatchedHandler = unmatchedMessageHandler
+            } else {
+                unmatchedHandler = nil
+            }
+        } else {
+            sessionHandler = nil
+            streamHandler = nil
+            streamRawLine = nil
+            unmatched.append(message)
+            unmatchedHandler = unmatchedMessageHandler
+        }
+        condition.unlock()
+
+        if let sessionHandler {
+            sessionHandler(message)
+        }
+        if let streamHandler, let streamRawLine {
+            streamHandler(streamRawLine)
+        }
+        if let unmatchedHandler {
+            unmatchedHandler(message)
+        }
+    }
+
+    func routeMalformedLine(_ rawLine: String) {
+        let payload = AnyCodable(["message": "malformed reply from agentdeckd: \(rawLine)"])
+
+        condition.lock()
+        if !pendingReplyIds.isEmpty {
+            for id in pendingReplyIds {
+                replies[id] = IpcMessage(kind: "error", id: id, payload: payload)
+            }
+            pendingReplyIds.removeAll()
+            condition.broadcast()
+            condition.unlock()
+            return
+        }
+        condition.unlock()
+
+        route(IpcMessage(
+            kind: "error",
+            payload: payload
+        ))
+    }
+
+    func takeReply(id: UInt64) -> IpcMessage? {
+        condition.lock()
+        defer { condition.unlock() }
+        return replies.removeValue(forKey: id)
+    }
+
+    func waitForReply(id: UInt64) -> IpcMessage? {
+        condition.lock()
+        defer { condition.unlock() }
+        while true {
+            if let reply = replies.removeValue(forKey: id) {
+                return reply
+            }
+            if isClosed {
+                return nil
+            }
+            condition.wait()
+        }
+    }
+
+    func takeUnmatchedMessages() -> [IpcMessage] {
+        condition.lock()
+        defer { condition.unlock() }
+        let messages = unmatched
+        unmatched.removeAll()
+        return messages
+    }
+
+    func close() {
+        condition.lock()
+        isClosed = true
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    private static func isLegacyStreamKind(_ kind: String) -> Bool {
+        kind == "agentItem"
+            || kind == "sessionState"
+            || kind == "turnComplete"
+            || kind == "error"
+    }
+
+    private static func isTerminalStreamKind(_ kind: String) -> Bool {
+        kind == "turnComplete" || kind == "error"
+    }
+
+    private static func isTerminalSessionEvent(_ message: IpcMessage) -> Bool {
+        guard let eventKind = legacySessionEventMessage(from: message)?.kind else {
+            return false
+        }
+        return isTerminalStreamKind(eventKind)
+    }
+
+    private static func sessionEvent(_ message: IpcMessage, matches expectedSessionId: String?) -> Bool {
+        guard let expectedSessionId else { return true }
+        return message.sessionId == expectedSessionId
+    }
+
+    private static func encodeLegacySessionEventRawLine(_ message: IpcMessage) -> String? {
+        guard let legacy = legacySessionEventMessage(from: message) else {
+            return nil
+        }
+        return encodeRawLine(legacy)
+    }
+
+    private static func legacySessionEventMessage(from message: IpcMessage) -> IpcMessage? {
+        guard let payload = message.payload?.value as? [String: Any],
+              let event = payload["event"] as? [String: Any],
+              let kind = event["kind"] as? String else {
+            return nil
+        }
+        if let eventPayload = event["payload"] {
+            return IpcMessage(kind: kind, payload: AnyCodable(eventPayload))
+        }
+        var legacyPayload = event
+        legacyPayload.removeValue(forKey: "kind")
+        return IpcMessage(
+            kind: kind,
+            payload: legacyPayload.isEmpty ? nil : AnyCodable(legacyPayload)
+        )
+    }
+
+    private static func encodeRawLine(_ message: IpcMessage) -> String? {
+        guard let data = try? JSONEncoder().encode(message) else {
+            return nil
+        }
+        return String(data: data, encoding: .utf8)
+    }
+}
+
+final class DaemonRequestIdAllocator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var nextId: UInt64
+
+    init(startingAt: UInt64 = 1) {
+        nextId = startingAt
+    }
+
+    func assignUniqueId(to message: IpcMessage) -> IpcMessage {
+        lock.lock()
+        let id = nextId
+        nextId += 1
+        lock.unlock()
+
+        var message = message
+        message.id = id
+        return message
+    }
+}
+
+@MainActor
+protocol RuntimeTurnStarting: AnyObject {
+    func startTurn(
+        sessionId: String,
+        threadId: String?,
+        cwd: URL,
+        prompt: String,
+        onEvent: @escaping @MainActor (IpcMessage) -> Void
+    )
+}
+
 /// Owns the agentdeckd child process and the JSONL IPC channel to it.
 ///
 /// Process lifecycle (Eng A1, first layer): the Swift app spawns the daemon;
@@ -82,6 +386,11 @@ final class DaemonClient {
     private let toDaemon = Pipe()
     private let fromDaemon = Pipe()
     private var reader: BufferedLineReader?
+    private let router = DaemonMessageRouter()
+    private let requestIdAllocator = DaemonRequestIdAllocator(startingAt: 1_000)
+    private let lifecycleLock = NSLock()
+    private let writeLock = NSLock()
+    private var readerLoopStarted = false
 
     /// Locate the daemon binary. v0.1 uses PATH / dev-build lookup (Eng D-cwd
     /// scope: bundling is a later good-first-issue). GUI-launched apps have a
@@ -109,6 +418,11 @@ final class DaemonClient {
     }
 
     func start() throws {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        if readerLoopStarted {
+            return
+        }
         guard let path = Self.locateDaemon() else {
             throw DaemonError.binaryNotFound("target/{debug,release}/agentdeckd or PATH")
         }
@@ -121,26 +435,68 @@ final class DaemonClient {
         } catch {
             throw DaemonError.spawnFailed("\(error)")
         }
-        reader = BufferedLineReader(handle: fromDaemon.fileHandleForReading)
+        let lineReader = BufferedLineReader(handle: fromDaemon.fileHandleForReading)
+        reader = lineReader
+        router.onUnmatchedMessage = { message in
+            Self.writeDiagnostic("unmatched daemon message: \(message.kind)")
+        }
+        startReaderLoop(lineReader)
     }
 
     /// Send one neutral message and block for the correlated reply.
-    /// Step 1 is request/reply; the streaming item path (background reader →
-    /// MainActor, Eng D9 state machine) lands in Step 3+.
     func roundTrip(_ msg: IpcMessage) throws -> IpcMessage {
+        try sendRoundTrip(try prepareRoundTripRequest(msg))
+    }
+
+    func prepareRoundTripRequest(_ msg: IpcMessage) throws -> IpcMessage {
+        if msg.id != nil {
+            return msg
+        }
+        return requestIdAllocator.assignUniqueId(to: msg)
+    }
+
+    func prepareGeneratedIdRequest(_ msg: IpcMessage) throws -> IpcMessage {
+        requestIdAllocator.assignUniqueId(to: msg)
+    }
+
+    func prepareRuntimeTurnRequest(
+        sessionId: String,
+        threadId: String?,
+        cwd: URL,
+        prompt: String
+    ) throws -> IpcMessage {
+        try prepareGeneratedIdRequest(Self.runtimeTurnRequest(
+            id: 0,
+            sessionId: sessionId,
+            threadId: threadId,
+            cwd: cwd,
+            prompt: prompt
+        ))
+    }
+
+    private func roundTripWithGeneratedId(_ msg: IpcMessage) throws -> IpcMessage {
+        try sendRoundTrip(try prepareGeneratedIdRequest(msg))
+    }
+
+    private func sendRoundTrip(_ msg: IpcMessage) throws -> IpcMessage {
+        if reader == nil {
+            try start()
+        }
+        guard let id = msg.id else {
+            throw DaemonError.malformedReply("failed to assign id: \(msg.kind)")
+        }
         let enc = JSONEncoder()
         var data = try enc.encode(msg)
         data.append(0x0A) // newline-delimited JSON (D7-confirmed framing)
-        toDaemon.fileHandleForWriting.write(data)
+        guard router.registerPending(id: id) else {
+            throw DaemonError.duplicateRequestId(id)
+        }
+        write(data)
 
-        guard let line = reader?.nextLine() else {
+        guard let reply = router.waitForReply(id: id) else {
             throw DaemonError.disconnected
         }
-        do {
-            return try JSONDecoder().decode(IpcMessage.self, from: Data(line.utf8))
-        } catch {
-            throw DaemonError.malformedReply(line)
-        }
+        return reply
     }
 
     func loggingSelfcheck() throws -> [String: Any] {
@@ -208,7 +564,7 @@ final class DaemonClient {
         if reader == nil {
             try start()
         }
-        let reply = try roundTrip(Self.historyListRequest(
+        let reply = try roundTripWithGeneratedId(Self.historyListRequest(
             id: 2,
             cwd: cwd,
             searchTerm: searchTerm,
@@ -239,7 +595,7 @@ final class DaemonClient {
         if reader == nil {
             try start()
         }
-        let reply = try roundTrip(Self.historyReadRequest(id: 3, threadId: threadId))
+        let reply = try roundTripWithGeneratedId(Self.historyReadRequest(id: 3, threadId: threadId))
         guard reply.kind == "historyThread", let payload = reply.payload?.value else {
             if reply.kind == "error",
                let dict = reply.payload?.value as? [String: Any],
@@ -257,6 +613,30 @@ final class DaemonClient {
             kind: "startTurn",
             id: id,
             payload: AnyCodable(["threadId": threadId, "prompt": prompt])
+        )
+    }
+
+    static func runtimeTurnRequest(
+        id: UInt64,
+        sessionId: String,
+        threadId: String?,
+        cwd: URL,
+        prompt: String
+    ) -> IpcMessage {
+        if let threadId {
+            return IpcMessage(
+                kind: "startTurn",
+                id: id,
+                sessionId: sessionId,
+                payload: AnyCodable(["threadId": threadId, "prompt": prompt])
+            )
+        }
+
+        return IpcMessage(
+            kind: "startSession",
+            id: id,
+            sessionId: sessionId,
+            payload: AnyCodable(["cwd": cwd.path, "prompt": prompt])
         )
     }
 
@@ -292,7 +672,7 @@ final class DaemonClient {
         if reader == nil {
             try start()
         }
-        let reply = try roundTrip(request)
+        let reply = try roundTripWithGeneratedId(request)
         if reply.kind == "historyThreadUpdated" {
             return
         }
@@ -304,9 +684,8 @@ final class DaemonClient {
         throw DaemonError.malformedReply("expected historyThreadUpdated, got \(reply.kind)")
     }
 
-    /// Start a streaming session. Sends `startSession {cwd, prompt}`, then
-    /// reads neutral IPC messages on a BACKGROUND thread and delivers each
-    /// one to `onMessage` ON THE MAIN THREAD.
+    /// Start a streaming session. Sends `startSession {cwd, prompt}` and
+    /// lets the single daemon reader dispatch stream lines to the main thread.
     ///
     /// Eng C-uitest / D5: the background-reader → MainActor hop is exactly
     /// the fragile seam in a streaming Swift↔Rust IPC. Delivering on
@@ -329,33 +708,17 @@ final class DaemonClient {
         }
         var line = data
         line.append(0x0A)
-        toDaemon.fileHandleForWriting.write(line)
 
-        // Cross the thread boundary with a plain String (Sendable). Decoding
-        // happens ON the main actor in onLine — so the IpcMessage (which
-        // holds non-Sendable AnyCodable) never crosses threads at all. This
-        // sidesteps the background→main data race entirely (Eng C-uitest):
-        // the safe fix is to not share a non-Sendable value, not to bolt
-        // Sendable onto it.
-        // Capture ONLY the reader, not self. The background thread must not
-        // reach back into DaemonClient (non-Sendable) — it owns nothing but
-        // the line stream. This is the minimal-sharing fix, not a Sendable
-        // bolt-on.
-        guard let reader else {
+        if reader == nil {
             Task { @MainActor in
                 onLine(#"{"kind":"error","payload":{"message":"reader not initialized"}}"#)
             }
             return
         }
-        Thread.detachNewThread {
-            while let raw = reader.nextLine() {
-                if raw.isEmpty { continue }
-                let terminal = raw.contains("\"turnComplete\"")
-                    || raw.contains("\"kind\":\"error\"")
-                DispatchQueue.main.async { onLine(raw) }
-                if terminal { break }
-            }
+        router.setStreamLineHandler(expectedSessionId: "session_1") { raw in
+            DispatchQueue.main.async { onLine(raw) }
         }
+        write(line)
     }
 
     func startTurn(
@@ -372,23 +735,165 @@ final class DaemonClient {
         }
         var line = data
         line.append(0x0A)
-        toDaemon.fileHandleForWriting.write(line)
 
-        guard let reader else {
+        if reader == nil {
             Task { @MainActor in
                 onLine(#"{"kind":"error","payload":{"message":"reader not initialized"}}"#)
             }
             return
         }
-        Thread.detachNewThread {
-            while let raw = reader.nextLine() {
-                if raw.isEmpty { continue }
-                let terminal = raw.contains("\"turnComplete\"")
-                    || raw.contains("\"kind\":\"error\"")
-                DispatchQueue.main.async { onLine(raw) }
-                if terminal { break }
+        router.setStreamLineHandler(expectedSessionId: "session_\(threadId)") { raw in
+            DispatchQueue.main.async { onLine(raw) }
+        }
+        write(line)
+    }
+
+    func startTurn(
+        sessionId: String,
+        threadId: String?,
+        cwd: URL,
+        prompt: String,
+        onEvent: @escaping @MainActor (IpcMessage) -> Void
+    ) {
+        let msg: IpcMessage
+        do {
+            msg = try prepareRuntimeTurnRequest(
+                sessionId: sessionId,
+                threadId: threadId,
+                cwd: cwd,
+                prompt: prompt
+            )
+        } catch {
+            Task { @MainActor in
+                onEvent(Self.syntheticSessionEvent(
+                    sessionId: sessionId,
+                    threadId: threadId,
+                    kind: "error",
+                    payload: ["message": "\(error)"]
+                ))
+            }
+            return
+        }
+        guard let data = try? JSONEncoder().encode(msg) else {
+            Task { @MainActor in
+                onEvent(Self.syntheticSessionEvent(
+                    sessionId: sessionId,
+                    threadId: threadId,
+                    kind: "error",
+                    payload: ["message": "failed to encode runtime turn"]
+                ))
+            }
+            return
+        }
+        var line = data
+        line.append(0x0A)
+
+        do {
+            if reader == nil {
+                try start()
+            }
+        } catch {
+            Task { @MainActor in
+                onEvent(Self.syntheticSessionEvent(
+                    sessionId: sessionId,
+                    threadId: threadId,
+                    kind: "error",
+                    payload: ["message": "\(error)"]
+                ))
+            }
+            return
+        }
+
+        router.onSessionEvent = { message in
+            let encoded = (try? JSONEncoder().encode(message))
+                .flatMap { String(data: $0, encoding: .utf8) }
+            DispatchQueue.main.async {
+                guard let encoded,
+                      let decoded = try? JSONDecoder().decode(
+                        IpcMessage.self,
+                        from: Data(encoded.utf8)
+                      ) else { return }
+                onEvent(decoded)
             }
         }
+        if let id = msg.id {
+            guard router.registerPending(id: id) else {
+                Task { @MainActor in
+                    onEvent(Self.syntheticSessionEvent(
+                        sessionId: sessionId,
+                        threadId: threadId,
+                        kind: "error",
+                        payload: ["message": DaemonError.duplicateRequestId(id).description]
+                    ))
+                }
+                return
+            }
+            waitForTurnAccepted(
+                id: id,
+                sessionId: sessionId,
+                threadId: threadId,
+                onEvent: onEvent
+            )
+        }
+        write(line)
+    }
+
+    private func waitForTurnAccepted(
+        id: UInt64,
+        sessionId: String,
+        threadId: String?,
+        onEvent: @escaping @MainActor (IpcMessage) -> Void
+    ) {
+        let router = router
+        DispatchQueue.global(qos: .utility).async {
+            guard let reply = router.waitForReply(id: id) else {
+                DispatchQueue.main.async {
+                    onEvent(Self.syntheticSessionEvent(
+                        sessionId: sessionId,
+                        threadId: threadId,
+                        kind: "error",
+                        payload: ["message": DaemonError.disconnected.description]
+                    ))
+                }
+                return
+            }
+            guard reply.kind != "turnAccepted" else { return }
+            let message: String
+            if reply.kind == "error",
+               let payload = reply.payload?.value as? [String: Any],
+               let errorMessage = payload["message"] as? String {
+                message = errorMessage
+            } else {
+                message = "expected turnAccepted, got \(reply.kind)"
+            }
+            DispatchQueue.main.async {
+                onEvent(Self.syntheticSessionEvent(
+                    sessionId: sessionId,
+                    threadId: threadId,
+                    kind: "error",
+                    payload: ["message": message]
+                ))
+            }
+        }
+    }
+
+    private static func syntheticSessionEvent(
+        sessionId: String,
+        threadId: String?,
+        kind: String,
+        payload: [String: Any]
+    ) -> IpcMessage {
+        IpcMessage(
+            kind: "session/event",
+            sessionId: sessionId,
+            threadId: threadId,
+            payload: AnyCodable([
+                "event": [
+                    "kind": kind,
+                    "payload": payload,
+                ],
+            ])
+        )
     }
 
     /// Ask the daemon to shut down, then ensure it is gone (A1: app exit
@@ -407,6 +912,35 @@ final class DaemonClient {
         // Backstop: even if the app forgot to call shutdown(), the daemon
         // must not outlive its owner (A1 — no orphan daemon).
         if process.isRunning { process.terminate() }
+    }
+
+    private func startReaderLoop(_ reader: BufferedLineReader) {
+        readerLoopStarted = true
+        let router = router
+        Thread.detachNewThread {
+            while let raw = reader.nextLine() {
+                if raw.isEmpty { continue }
+                do {
+                    let message = try JSONDecoder().decode(IpcMessage.self, from: Data(raw.utf8))
+                    router.route(message, rawLine: raw)
+                } catch {
+                    router.routeMalformedLine(raw)
+                }
+            }
+            router.close()
+        }
+    }
+
+    private func write(_ data: Data) {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        toDaemon.fileHandleForWriting.write(data)
+    }
+
+    private static func writeDiagnostic(_ message: String) {
+        if let data = (message + "\n").data(using: .utf8) {
+            FileHandle.standardError.write(data)
+        }
     }
 }
 
@@ -443,6 +977,7 @@ extension HistoryDetailReading {
 
 extension DaemonClient: @unchecked Sendable {}
 extension DaemonClient: HistoryDetailReading {}
+extension DaemonClient: RuntimeTurnStarting {}
 extension DaemonClient: SessionClienting {}
 
 final class DaemonHistoryDetailReader: HistoryDetailReading, @unchecked Sendable {
@@ -468,12 +1003,10 @@ final class DaemonHistoryDetailReader: HistoryDetailReading, @unchecked Sendable
 /// IPC). This handles that; Step 1 unit tests cover the split case.
 ///
 /// `@unchecked Sendable` is sound here by ownership discipline, not by
-/// thread-safety primitives: exactly ONE consumer touches a reader at a
-/// time. Step 1's roundTrip reads it synchronously on the caller's thread;
-/// the streaming path moves it to a single dedicated background thread and
-/// the main thread never reads it concurrently. There is no overlap, so no
-/// lock is needed. (If a future change adds a second concurrent reader, this
-/// annotation is the thing to revisit.)
+/// thread-safety primitives: exactly ONE consumer touches a reader at a time.
+/// DaemonClient owns that consumer in its single reader loop. There is no
+/// overlap, so no lock is needed. (If a future change adds a second concurrent
+/// reader, this annotation is the thing to revisit.)
 final class BufferedLineReader: @unchecked Sendable {
     private let handle: FileHandle
     private var buffer = Data()

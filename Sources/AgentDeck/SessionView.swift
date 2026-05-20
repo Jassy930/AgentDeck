@@ -94,7 +94,7 @@ struct SessionView: View {
     }
 
     private var statusColor: Color {
-        switch model.phase {
+        switch model.selectedPhase {
         case .running, .starting: return .accentColor
         case .failed: return .red                // D8 system warning
         case .waitingApproval: return .orange
@@ -149,6 +149,12 @@ struct SessionView: View {
                 .padding(.horizontal, 12)
                 .padding(.bottom, 8)
                 .onSubmit { model.loadHistory() }
+
+            RuntimeSelectorView(workbench: model.workbench)
+            if !model.workbench.runtimeList.isEmpty {
+                Divider()
+                    .padding(.vertical, 6)
+            }
 
             if model.isLoadingHistory {
                 ProgressView()
@@ -350,7 +356,7 @@ struct SessionView: View {
     private let conversationScrollCoordinateSpace = "conversation-scroll-space"
 
     private var conversationStream: some View {
-        let turns = makeConversationTurns(from: model.items)
+        let turns = makeConversationTurns(from: model.selectedItems)
         let navigationItems = makeConversationTurnNavigationItems(from: turns)
         let navigableTurnIds = Set(navigationItems.map(\.turnId))
 
@@ -382,10 +388,10 @@ struct SessionView: View {
                                 Divider().opacity(0.4)  // D7: subtle divider, not card
                             }
                         }
-                        if let err = model.errorMessage {
+                        if let err = model.selectedErrorMessage {
                             errorRow(err)               // premise 9: visible failure
                         }
-                        if let warning = model.warningMessage {
+                        if let warning = model.selectedWarningMessage {
                             warningRow(warning)
                         }
                         Color.clear

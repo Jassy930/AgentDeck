@@ -39,8 +39,9 @@ AgentDeck.app  (macOS, SwiftUI + AppKit)
       │  stdio JSONL IPC（中立 AgentItem，无 Codex 字样）
       ▼
 agentdeckd  (Rust daemon)
+      │  ├── async runtime hub（stdin main loop + stdout writer）
+      │  ├── turn/history workers（带 sessionId/threadId 路由）
       │  ├── CodexAdapter（Codex item → 中立 AgentItem 翻译）
-      │  ├── Session 状态机（唯一状态源）
       │  └── 进程组拥有 app-server，退出连带 kill
       ▼
 codex app-server  (子进程, JSON-RPC over stdio)
@@ -48,6 +49,11 @@ codex app-server  (子进程, JSON-RPC over stdio)
 
 中立边界的物理位置 = IPC 协议本身。可验证事实：IPC schema 里不出现
 任何 Codex 字样。
+
+AgentDeck 使用一个 `agentdeckd` 作为 runtime hub。daemon 的 stdin 主循环不被
+单个 turn 阻塞；每个后台会话由独立 worker 持有 adapter，所有 worker 通过统一
+stdout writer 输出带 `sessionId/threadId` 的中立事件。历史请求按 request id
+分发 reply，不和 streaming `agentItem` 抢 reader。
 
 流式性能边界：daemon 不合并 Codex delta，而是忠实转发中立
 `agentItem`；Swift 端的 `SessionModel` 按约 30fps 合并待渲染 delta，并把
@@ -78,6 +84,16 @@ thread。历史详情读取在后台完成，点击后先标记正在打开，�
 diff 默认只保留摘要与原文，展开时才填充 TextKit buffer，避免大历史
 thread 阻塞主界面。AgentDeck 只做轻量索引、回放和管理入口；Codex
 持久化历史仍是上下文真相源。
+
+历史详情回放会进入 Swift 端 `WorkbenchModel` 中独立的 `ThreadRuntimeModel`。
+打开历史 thread 只切换当前选中的 runtime 和右侧视图，不会把其他正在运行的
+runtime 标记为 ready 或停止其后台事件处理。runtime 自身按约 30fps 刷新
+streaming delta，避免视图切到 runtime 后出现长时间不刷新的流式文本。
+提交 prompt 时，正在运行、启动中或等待 approval 的 runtime 只会排入自己的
+队列；对应 runtime 收到 `turnComplete` 后才 drain 自己的下一条 prompt，不会
+把队列发送到当前选中的其他 history/runtime。
+左侧 History 面板顶部会显示 compact runtime selector，用状态点、队列数和未读
+事件数标识后台 runtime；切换 selector 只切换右侧视图，不会中断对应后台会话。
 
 第一版管理动作保持低风险：刷新、搜索、重命名和归档。AgentDeck 不读取、
 保存或转发 Codex token。

@@ -29,6 +29,19 @@ struct IpcMessageTests {
         #expect(back.id == 42)
     }
 
+    @Test("IpcMessage decodes session and thread routing fields")
+    func decodesRoutingFields() throws {
+        let data = Data("""
+        {"kind":"session/event","sessionId":"session_1","threadId":"thread_1","payload":{"event":{"kind":"turnComplete"}}}
+        """.utf8)
+
+        let msg = try JSONDecoder().decode(IpcMessage.self, from: data)
+
+        #expect(msg.kind == "session/event")
+        #expect(msg.sessionId == "session_1")
+        #expect(msg.threadId == "thread_1")
+    }
+
     /// Eng D2: the neutral wire must never carry vendor vocabulary. Guard test
     /// — if a future change leaks a Codex-named field onto the Swift side,
     /// this fails. The neutral boundary is a verifiable fact, not a convention.
@@ -66,6 +79,209 @@ struct IpcMessageTests {
         #expect(decoded.kind == "diagnostics/report")
         #expect(!wire.contains("codex"))
         #expect(!wire.contains("openai"))
+    }
+}
+
+@Suite("Daemon message routing")
+struct DaemonMessageRoutingTests {
+    @Test("routes replies by id and session events by session id")
+    func routesRepliesAndSessionEventsSeparately() {
+        let router = DaemonMessageRouter()
+        var events: [IpcMessage] = []
+        router.onSessionEvent = { events.append($0) }
+
+        #expect(router.registerPending(id: 31))
+        router.route(IpcMessage(kind: "session/event", sessionId: "s1", payload: AnyCodable([
+            "event": ["kind": "agentItem"]
+        ])))
+        router.route(IpcMessage(kind: "historyThread", id: 31, payload: AnyCodable(["thread": [:], "items": []])))
+
+        #expect(events.count == 1)
+        #expect(router.takeReply(id: 31)?.kind == "historyThread")
+    }
+
+    @Test("history reply is not confused with streaming agent item")
+    func historyReplyIsNotConfusedWithAgentItem() {
+        let router = DaemonMessageRouter()
+        var events: [IpcMessage] = []
+        router.onSessionEvent = { events.append($0) }
+
+        #expect(router.registerPending(id: 99))
+        router.route(IpcMessage(kind: "session/event", sessionId: "s1", payload: AnyCodable([
+            "event": [
+                "kind": "agentItem",
+                "payload": [
+                    "id": "a1",
+                    "lifecycle": "delta",
+                    "kind": "message",
+                    "text": "hi",
+                ],
+            ],
+        ])))
+        router.route(IpcMessage(kind: "historyThread", id: 99, payload: AnyCodable([
+            "thread": [
+                "id": "thread_b",
+                "preview": "B",
+                "cwd": "/tmp/b",
+                "createdAt": 1,
+                "updatedAt": 2,
+                "status": "ready",
+                "modelProvider": "openai",
+                "source": "cli",
+            ],
+            "items": [],
+        ])))
+
+        #expect(events.count == 1)
+        #expect(events.first?.sessionId == "s1")
+        #expect(router.takeReply(id: 99)?.kind == "historyThread")
+    }
+
+    @Test("routes session events to the active raw stream as legacy events")
+    func routesSessionEventsToActiveRawStreamAsLegacyEvents() throws {
+        let router = DaemonMessageRouter()
+        var events: [IpcMessage] = []
+        var rawLines: [String] = []
+        router.onSessionEvent = { events.append($0) }
+        router.onStreamLine = { rawLines.append($0) }
+
+        router.route(IpcMessage(kind: "session/event", sessionId: "s1", payload: AnyCodable([
+            "event": ["kind": "turnComplete", "payload": ["ok": true]]
+        ])))
+
+        #expect(events.count == 1)
+        let rawLine = try #require(rawLines.first)
+        let legacy = try JSONDecoder().decode(IpcMessage.self, from: Data(rawLine.utf8))
+        #expect(legacy.kind == "turnComplete")
+        #expect(legacy.sessionId == nil)
+        #expect(legacy.payload?.value as? [String: Bool] == ["ok": true])
+    }
+
+    @Test("routes agent item and error session events as legacy stream events")
+    func routesAgentItemAndErrorSessionEventsAsLegacyStreamEvents() throws {
+        let router = DaemonMessageRouter()
+        var rawLines: [String] = []
+        router.onStreamLine = { rawLines.append($0) }
+
+        router.route(IpcMessage(kind: "session/event", sessionId: "s1", payload: AnyCodable([
+            "event": [
+                "kind": "agentItem",
+                "id": "item1",
+                "text": "hello"
+            ]
+        ])))
+        router.route(IpcMessage(kind: "session/event", sessionId: "s1", payload: AnyCodable([
+            "event": [
+                "kind": "error",
+                "payload": ["message": "boom"]
+            ]
+        ])))
+
+        let agentItem = try JSONDecoder().decode(IpcMessage.self, from: Data(try #require(rawLines.first).utf8))
+        let error = try JSONDecoder().decode(IpcMessage.self, from: Data(try #require(rawLines.last).utf8))
+        #expect(rawLines.count == 2)
+        #expect(agentItem.kind == "agentItem")
+        #expect((agentItem.payload?.value as? [String: Any])?["id"] as? String == "item1")
+        #expect((agentItem.payload?.value as? [String: Any])?["text"] as? String == "hello")
+        #expect(error.kind == "error")
+        #expect((error.payload?.value as? [String: Any])?["message"] as? String == "boom")
+    }
+
+    @Test("session events for other runtimes do not enter a bound legacy stream")
+    func otherRuntimeEventsDoNotEnterBoundLegacyStream() throws {
+        let router = DaemonMessageRouter()
+        var rawLines: [String] = []
+        router.setStreamLineHandler(expectedSessionId: "legacy") { rawLines.append($0) }
+
+        router.route(IpcMessage(kind: "session/event", sessionId: "runtime_b", payload: AnyCodable([
+            "event": ["kind": "turnComplete"]
+        ])))
+        router.route(IpcMessage(kind: "session/event", sessionId: "legacy", payload: AnyCodable([
+            "event": [
+                "kind": "agentItem",
+                "payload": [
+                    "id": "item1",
+                    "lifecycle": "completed",
+                    "kind": "message",
+                    "text": "legacy still connected",
+                ],
+            ]
+        ])))
+        router.route(IpcMessage(kind: "session/event", sessionId: "legacy", payload: AnyCodable([
+            "event": ["kind": "turnComplete"]
+        ])))
+
+        #expect(rawLines.count == 2)
+        let item = try JSONDecoder().decode(IpcMessage.self, from: Data(try #require(rawLines.first).utf8))
+        let complete = try JSONDecoder().decode(IpcMessage.self, from: Data(try #require(rawLines.last).utf8))
+        #expect(item.kind == "agentItem")
+        #expect(complete.kind == "turnComplete")
+    }
+
+    @Test("rejects duplicate pending ids before a reply is routed")
+    func rejectsDuplicatePendingIdsBeforeReplyIsRouted() {
+        let router = DaemonMessageRouter()
+
+        #expect(router.registerPending(id: 42))
+        #expect(!router.registerPending(id: 42))
+        router.route(IpcMessage(kind: "pong", id: 42, payload: nil))
+
+        #expect(router.takeReply(id: 42)?.kind == "pong")
+    }
+
+    @Test("keeps ids occupied while routed replies are buffered")
+    func keepsIdsOccupiedWhileRoutedRepliesAreBuffered() {
+        let router = DaemonMessageRouter()
+
+        #expect(router.registerPending(id: 43))
+        router.route(IpcMessage(kind: "pong", id: 43, payload: nil))
+
+        #expect(!router.registerPending(id: 43))
+        #expect(router.takeReply(id: 43)?.kind == "pong")
+        #expect(router.registerPending(id: 43))
+    }
+
+    @Test("preserves explicit ids but can generate ids for reused static factory ids")
+    func preservesExplicitIdsButCanGenerateIdsForReusedStaticFactoryIds() throws {
+        let client = DaemonClient()
+        let ping = try client.prepareRoundTripRequest(IpcMessage(kind: "ping", id: 1, payload: nil))
+        let first = try client.prepareGeneratedIdRequest(DaemonClient.historyListRequest(
+            id: 2,
+            cwd: "/tmp/project",
+            searchTerm: nil
+        ))
+        let second = try client.prepareGeneratedIdRequest(DaemonClient.historyListRequest(
+            id: 2,
+            cwd: "/tmp/project",
+            searchTerm: nil
+        ))
+
+        #expect(ping.id == 1)
+        #expect(first.kind == "history/listThreads")
+        #expect(first.id != 2)
+        #expect(second.id != 2)
+        #expect(first.id != second.id)
+    }
+
+    @Test("runtime turn requests use generated ids for ack correlation")
+    func runtimeTurnRequestsUseGeneratedIdsForAckCorrelation() throws {
+        let client = DaemonClient()
+        let first = try client.prepareRuntimeTurnRequest(
+            sessionId: "session_a",
+            threadId: "thread_a",
+            cwd: URL(fileURLWithPath: "/tmp/a"),
+            prompt: "first"
+        )
+        let second = try client.prepareRuntimeTurnRequest(
+            sessionId: "session_b",
+            threadId: "thread_b",
+            cwd: URL(fileURLWithPath: "/tmp/b"),
+            prompt: "second"
+        )
+
+        #expect(first.id != 4)
+        #expect(second.id != 4)
+        #expect(first.id != second.id)
     }
 }
 
@@ -201,6 +417,21 @@ struct SessionRenderThrottlingTests {
         #expect(client.startedSessionPrompt == "hello")
     }
 
+    @Test("runtime streaming deltas are flushed by timer")
+    func runtimeStreamingDeltasAreFlushedByTimer() async throws {
+        let runtime = ThreadRuntimeModel(id: "s1", threadId: "t1", cwd: URL(fileURLWithPath: "/tmp/project"))
+
+        runtime.ingest(agentItem(id: "msg1", text: "Hel"))
+        runtime.ingest(agentItem(id: "msg1", text: "lo"))
+
+        #expect(runtime.items.isEmpty)
+
+        try await Task.sleep(for: .milliseconds(80))
+
+        #expect(runtime.items.count == 1)
+        #expect(runtime.items[0].text == "Hello")
+    }
+
     @Test("loading history groups threads without clearing current stream")
     func loadingHistoryDoesNotClearCurrentStream() {
         let model = SessionModel()
@@ -225,9 +456,12 @@ struct SessionRenderThrottlingTests {
         #expect(!model.shouldAutoRefreshHistoryOnAppear())
     }
 
-    @Test("applying history detail replaces stream with replay items")
-    func applyingHistoryDetailReplaysItems() {
+    @Test("applying history detail selects replay without replacing legacy stream")
+    func applyingHistoryDetailSelectsReplayWithoutReplacingLegacyStream() {
         let model = SessionModel()
+        model.ingest(agentItem(id: "live1", lifecycle: "completed", text: "current answer"))
+        model.flushPendingAgentItems()
+        model.phase = .running
         let thread = HistoryThreadSummary(id: "h1", name: nil, preview: "old", cwd: "/tmp/project", createdAt: 1, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli")
         let detail = HistoryThreadDetail(
             thread: thread,
@@ -240,37 +474,11 @@ struct SessionRenderThrottlingTests {
         model.applyHistoryThreadDetail(detail)
 
         #expect(model.cwd?.path == "/tmp/project")
-        #expect(model.items.map(\.kind) == ["user", "message"])
-        #expect(model.items.map(\.text) == ["old prompt", "old answer"])
+        #expect(model.phase == .running)
+        #expect(model.items.map(\.text) == ["current answer"])
+        #expect(model.selectedItems.map(\.kind) == ["user", "message"])
+        #expect(model.selectedItems.map(\.text) == ["old prompt", "old answer"])
         #expect(model.selectedHistoryThreadId == "h1")
-    }
-
-    @Test("history replay ids are namespaced by thread to avoid stale view reuse")
-    func historyReplayIdsAreNamespacedByThread() {
-        let model = SessionModel()
-        let firstThread = HistoryThreadSummary(id: "thread_a", name: nil, preview: "old", cwd: "/tmp/project", createdAt: 1, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli")
-        let secondThread = HistoryThreadSummary(id: "thread_b", name: nil, preview: "new", cwd: "/tmp/project", createdAt: 3, updatedAt: 4, status: "ready", modelProvider: "openai", source: "cli")
-
-        model.applyHistoryThreadDetail(HistoryThreadDetail(
-            thread: firstThread,
-            items: [
-                HistoryReplayItem(id: "item-1", lifecycle: "completed", kind: "user", text: "old prompt"),
-                HistoryReplayItem(id: "item-2", lifecycle: "completed", kind: "message", text: "old answer"),
-            ]
-        ))
-        let firstIds = model.items.map(\.id)
-
-        model.applyHistoryThreadDetail(HistoryThreadDetail(
-            thread: secondThread,
-            items: [
-                HistoryReplayItem(id: "item-1", lifecycle: "completed", kind: "user", text: "new prompt"),
-                HistoryReplayItem(id: "item-2", lifecycle: "completed", kind: "message", text: "new answer"),
-            ]
-        ))
-
-        #expect(firstIds == ["thread_a:item-1", "thread_a:item-2"])
-        #expect(model.items.map(\.id) == ["thread_b:item-1", "thread_b:item-2"])
-        #expect(model.items.map(\.text) == ["new prompt", "new answer"])
     }
 
     @Test("applying history detail resets the conversation viewport identity")
@@ -296,6 +504,24 @@ struct SessionRenderThrottlingTests {
         #expect(model.conversationViewportIdentity.hasPrefix("history:thread_b:"))
     }
 
+    @Test("starting new session clears selected history runtime")
+    func startingNewSessionClearsSelectedHistoryRuntime() {
+        let model = SessionModel()
+        let thread = HistoryThreadSummary(id: "h1", name: nil, preview: "old", cwd: "/tmp/project", createdAt: 1, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli")
+        let detail = HistoryThreadDetail(
+            thread: thread,
+            items: [
+                HistoryReplayItem(id: "a1", lifecycle: "completed", kind: "message", text: "old answer"),
+            ]
+        )
+
+        model.applyHistoryThreadDetail(detail)
+        model.startNewSessionFromCurrentProject()
+
+        #expect(model.selectedItems.isEmpty)
+        #expect(model.workbench.selectedSessionId == nil)
+    }
+
     @Test("applying history detail preserves web search replay fields")
     func applyingHistoryDetailPreservesWebSearchFields() {
         let model = SessionModel()
@@ -319,14 +545,14 @@ struct SessionRenderThrottlingTests {
 
         model.applyHistoryThreadDetail(detail)
 
-        #expect(model.items.count == 1)
-        #expect(model.items[0].kind == "webSearch")
-        #expect(model.items[0].query == "AgentDeck history")
-        #expect(model.items[0].action == "findInPage")
-        #expect(model.items[0].actionQuery == "AgentDeck")
-        #expect(model.items[0].queries == ["AgentDeck", "history"])
-        #expect(model.items[0].url == "https://example.com")
-        #expect(model.items[0].pattern == "history")
+        #expect(model.selectedItems.count == 1)
+        #expect(model.selectedItems[0].kind == "webSearch")
+        #expect(model.selectedItems[0].query == "AgentDeck history")
+        #expect(model.selectedItems[0].action == "findInPage")
+        #expect(model.selectedItems[0].actionQuery == "AgentDeck")
+        #expect(model.selectedItems[0].queries == ["AgentDeck", "history"])
+        #expect(model.selectedItems[0].url == "https://example.com")
+        #expect(model.selectedItems[0].pattern == "history")
     }
 
     @Test("applying history detail preserves complete replay item fields")
@@ -366,16 +592,16 @@ struct SessionRenderThrottlingTests {
 
         model.applyHistoryThreadDetail(detail)
 
-        #expect(model.items[0].kind == "toolCall")
-        #expect(model.items[0].toolKind == "mcp")
-        #expect(model.items[0].server == "github")
-        #expect(model.items[0].tool == "list")
-        #expect(model.items[0].arguments == #"{"q":"x"}"#)
-        #expect(model.items[0].result == #"{"ok":true}"#)
-        #expect(model.items[0].durationMs == 42)
-        #expect(model.items[0].resourceUri == "app://github")
-        #expect(model.items[1].changes.count == 2)
-        #expect(model.items[1].changes[1].path == "b.txt")
+        #expect(model.selectedItems[0].kind == "toolCall")
+        #expect(model.selectedItems[0].toolKind == "mcp")
+        #expect(model.selectedItems[0].server == "github")
+        #expect(model.selectedItems[0].tool == "list")
+        #expect(model.selectedItems[0].arguments == #"{"q":"x"}"#)
+        #expect(model.selectedItems[0].result == #"{"ok":true}"#)
+        #expect(model.selectedItems[0].durationMs == 42)
+        #expect(model.selectedItems[0].resourceUri == "app://github")
+        #expect(model.selectedItems[1].changes.count == 2)
+        #expect(model.selectedItems[1].changes[1].path == "b.txt")
     }
 
     @Test("opening a history thread returns immediately while detail loads")
@@ -404,7 +630,7 @@ struct SessionRenderThrottlingTests {
 
         #expect(model.openingHistoryThreadId == nil)
         #expect(model.selectedHistoryThreadId == "h1")
-        #expect(model.items.map(\.text) == ["old prompt", "old answer"])
+        #expect(model.selectedItems.map(\.text) == ["old prompt", "old answer"])
     }
 
     @Test("opening history records read and apply timing")
@@ -449,20 +675,268 @@ struct SessionRenderThrottlingTests {
 
         model.applyHistoryThreadDetail(detail)
 
-        #expect(model.items[0].output == largeOutput)
-        #expect(model.items[0].outputBuffer.text.isEmpty)
-        #expect(model.items[0].hasDeferredOutputBuffer)
-        #expect(model.items[1].diff == largeDiff)
-        #expect(model.items[1].diffBuffer.text.isEmpty)
-        #expect(model.items[1].hasDeferredDiffBuffer)
+        #expect(model.selectedItems[0].output == largeOutput)
+        #expect(model.selectedItems[0].outputBuffer.text.isEmpty)
+        #expect(model.selectedItems[0].hasDeferredOutputBuffer)
+        #expect(model.selectedItems[1].diff == largeDiff)
+        #expect(model.selectedItems[1].diffBuffer.text.isEmpty)
+        #expect(model.selectedItems[1].hasDeferredDiffBuffer)
 
         model.materializeDeferredContent(itemId: "h1:shell1", content: .output)
         model.materializeDeferredContent(itemId: "h1:diff1", content: .diff)
 
-        #expect(model.items[0].outputBuffer.text == largeOutput)
-        #expect(!model.items[0].hasDeferredOutputBuffer)
-        #expect(model.items[1].diffBuffer.text == largeDiff)
-        #expect(!model.items[1].hasDeferredDiffBuffer)
+        #expect(model.selectedItems[0].outputBuffer.text == largeOutput)
+        #expect(!model.selectedItems[0].hasDeferredOutputBuffer)
+        #expect(model.selectedItems[1].diffBuffer.text == largeDiff)
+        #expect(!model.selectedItems[1].hasDeferredDiffBuffer)
+    }
+}
+
+@Suite("Workbench runtime model")
+@MainActor
+struct WorkbenchRuntimeModelTests {
+    @Test("submitting to running runtime queues only that runtime")
+    func submittingToRunningRuntimeQueuesOnlyThatRuntime() {
+        let workbench = WorkbenchModel()
+        workbench.ensureRuntime(sessionId: "a", threadId: "thread_a", cwd: URL(fileURLWithPath: "/tmp/a"))
+        workbench.ensureRuntime(sessionId: "b", threadId: "thread_b", cwd: URL(fileURLWithPath: "/tmp/b"))
+        workbench.runtime(sessionId: "a")?.phase = .running
+        workbench.selectedSessionId = "a"
+
+        workbench.submit("continue A")
+
+        #expect(workbench.runtime(sessionId: "a")?.queuedPrompts == ["continue A"])
+        #expect(workbench.runtime(sessionId: "b")?.queuedPrompts.isEmpty == true)
+    }
+
+    @Test("turn complete drains only the completed runtime queue")
+    func turnCompleteDrainsOnlyCompletedRuntimeQueue() {
+        let turnStarter = RecordingRuntimeTurnStarter()
+        let workbench = WorkbenchModel(turnStarter: turnStarter)
+        workbench.ensureRuntime(sessionId: "a", threadId: "thread_a", cwd: URL(fileURLWithPath: "/tmp/a"))
+        workbench.ensureRuntime(sessionId: "b", threadId: "thread_b", cwd: URL(fileURLWithPath: "/tmp/b"))
+        workbench.runtime(sessionId: "a")?.phase = .running
+        workbench.runtime(sessionId: "a")?.queuedPrompts = ["continue A"]
+        workbench.selectedSessionId = "b"
+
+        workbench.ingestSessionEvent(IpcMessage(
+            kind: "session/event",
+            sessionId: "a",
+            threadId: "thread_a",
+            payload: AnyCodable(["event": ["kind": "turnComplete"]])
+        ))
+
+        #expect(turnStarter.requests.map(\.sessionId) == ["a"])
+        #expect(turnStarter.requests.map(\.prompt) == ["continue A"])
+        #expect(workbench.runtime(sessionId: "a")?.queuedPrompts.isEmpty == true)
+        #expect(workbench.runtime(sessionId: "a")?.phase == .starting)
+        #expect(workbench.runtime(sessionId: "b")?.items.isEmpty == true)
+    }
+
+    @Test("routes session events to the matching runtime")
+    func routesEventsToMatchingRuntime() {
+        let workbench = WorkbenchModel()
+        workbench.ensureRuntime(sessionId: "s1", threadId: "t1", cwd: URL(fileURLWithPath: "/tmp/a"))
+        workbench.ensureRuntime(sessionId: "s2", threadId: "t2", cwd: URL(fileURLWithPath: "/tmp/b"))
+
+        workbench.ingestSessionEvent(IpcMessage(
+            kind: "session/event",
+            sessionId: "s2",
+            threadId: "t2",
+            payload: AnyCodable([
+                "event": [
+                    "kind": "agentItem",
+                    "payload": [
+                        "id": "m1",
+                        "lifecycle": "completed",
+                        "kind": "message",
+                        "text": "B done",
+                    ],
+                ],
+            ])
+        ))
+
+        #expect(workbench.runtime(sessionId: "s1")?.items.isEmpty == true)
+        #expect(workbench.runtime(sessionId: "s2")?.items.count == 1)
+    }
+
+    @Test("background runtime events increment unread until selected")
+    func backgroundRuntimeEventsIncrementUnreadUntilSelected() {
+        let workbench = WorkbenchModel()
+        workbench.ensureRuntime(sessionId: "s1", threadId: "t1", cwd: URL(fileURLWithPath: "/tmp/a"))
+        workbench.ensureRuntime(sessionId: "s2", threadId: "t2", cwd: URL(fileURLWithPath: "/tmp/b"))
+        workbench.selectRuntime(sessionId: "s1")
+
+        workbench.ingestSessionEvent(IpcMessage(
+            kind: "session/event",
+            sessionId: "s2",
+            threadId: "t2",
+            payload: AnyCodable([
+                "event": [
+                    "kind": "sessionState",
+                    "payload": ["state": "running"],
+                ],
+            ])
+        ))
+
+        #expect(workbench.runtime(sessionId: "s1")?.unreadEventCount == 0)
+        #expect(workbench.runtime(sessionId: "s2")?.unreadEventCount == 1)
+
+        workbench.selectRuntime(sessionId: "s2")
+
+        #expect(workbench.runtime(sessionId: "s2")?.unreadEventCount == 0)
+        #expect(workbench.runtimeList.first?.id == "s2")
+
+        workbench.selectRuntime(sessionId: "missing")
+
+        #expect(workbench.selectedSessionId == "s2")
+    }
+
+    @Test("opening history does not change an existing running runtime")
+    func openingHistoryDoesNotChangeRunningRuntime() {
+        let workbench = WorkbenchModel()
+        workbench.ensureRuntime(sessionId: "running", threadId: "thread_running", cwd: URL(fileURLWithPath: "/tmp/a"))
+        workbench.runtime(sessionId: "running")?.phase = .running
+
+        let detail = HistoryThreadDetail(
+            thread: HistoryThreadSummary(id: "thread_b", name: nil, preview: "B", cwd: "/tmp/b", createdAt: 1, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli"),
+            items: [HistoryReplayItem(id: "m1", lifecycle: "completed", kind: "message", text: "old")]
+        )
+
+        workbench.applyHistoryThreadDetail(detail)
+
+        #expect(workbench.runtime(sessionId: "running")?.phase == .running)
+        #expect(workbench.selectedSessionId == "thread_b")
+    }
+
+    @Test("materializing selected history deferred content does not replace legacy running items")
+    func materializingSelectedHistoryDeferredContentDoesNotReplaceLegacyRunningItems() {
+        let model = SessionModel()
+        model.phase = .running
+        model.items = [
+            UIItem(id: "current1", lifecycle: "delta", kind: "message", text: "current stream")
+        ]
+        let largeOutput = String(repeating: "output\n", count: 3_000)
+        let largeDiff = String(repeating: "+ changed line\n", count: 3_000)
+        let detail = HistoryThreadDetail(
+            thread: HistoryThreadSummary(id: "thread_b", name: nil, preview: "B", cwd: "/tmp/b", createdAt: 1, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli"),
+            items: [
+                HistoryReplayItem(id: "shell1", lifecycle: "completed", kind: "shell", command: "make test", output: largeOutput),
+                HistoryReplayItem(id: "diff1", lifecycle: "completed", kind: "fileEdit", path: "a.txt", diff: largeDiff),
+            ]
+        )
+
+        model.applyHistoryThreadDetail(detail)
+
+        #expect(model.items.map(\.id) == ["current1"])
+        #expect(model.selectedItems[0].hasDeferredOutputBuffer)
+        #expect(model.selectedItems[1].hasDeferredDiffBuffer)
+
+        model.materializeDeferredContent(itemId: "shell1", content: .output)
+        model.materializeDeferredContent(itemId: "diff1", content: .diff)
+
+        #expect(model.items.map(\.id) == ["current1"])
+        #expect(model.items[0].text == "current stream")
+        #expect(model.selectedItems[0].outputBuffer.text == largeOutput)
+        #expect(!model.selectedItems[0].hasDeferredOutputBuffer)
+        #expect(model.selectedItems[1].diffBuffer.text == largeDiff)
+        #expect(!model.selectedItems[1].hasDeferredDiffBuffer)
+    }
+
+    @Test("selected runtime materialize misses do not fall back to legacy deferred items")
+    func selectedRuntimeMaterializeMissesDoNotFallbackToLegacyDeferredItems() {
+        let model = SessionModel()
+        let legacyOutput = String(repeating: "legacy output\n", count: 2)
+        let legacyDiff = String(repeating: "+ legacy diff\n", count: 2)
+        model.ingest(IpcMessage(
+            kind: "agentItem",
+            payload: AnyCodable([
+                "id": "shell1",
+                "lifecycle": "completed",
+                "kind": "shell",
+                "output": legacyOutput,
+            ])
+        ))
+        model.ingest(IpcMessage(
+            kind: "agentItem",
+            payload: AnyCodable([
+                "id": "legacyDiff",
+                "lifecycle": "completed",
+                "kind": "fileEdit",
+                "diff": legacyDiff,
+            ])
+        ))
+        model.flushPendingAgentItems()
+        model.items[0].hasDeferredOutputBuffer = true
+        model.items[0].outputBuffer.replace(with: "")
+        model.items[1].hasDeferredDiffBuffer = true
+        model.items[1].diffBuffer.replace(with: "")
+
+        model.workbench.ensureRuntime(sessionId: "selected", threadId: "thread_selected", cwd: URL(fileURLWithPath: "/tmp/selected"))
+        model.workbench.runtime(sessionId: "selected")?.applyReplayItems([
+            HistoryReplayItem(id: "shell1", lifecycle: "completed", kind: "shell", output: "selected small output"),
+            HistoryReplayItem(id: "selectedDiff", lifecycle: "completed", kind: "fileEdit", diff: "+ selected small diff"),
+        ])
+
+        model.materializeDeferredContent(itemId: "shell1", content: .output)
+        model.materializeDeferredContent(itemId: "legacyDiff", content: .diff)
+
+        #expect(model.items[0].hasDeferredOutputBuffer)
+        #expect(model.items[0].outputBuffer.text.isEmpty)
+        #expect(model.items[0].output == legacyOutput)
+        #expect(model.items[1].hasDeferredDiffBuffer)
+        #expect(model.items[1].diffBuffer.text.isEmpty)
+        #expect(model.items[1].diff == legacyDiff)
+        #expect(model.selectedItems[0].outputBuffer.text == "selected small output")
+        #expect(!model.selectedItems[0].hasDeferredOutputBuffer)
+        #expect(model.selectedItems[1].diffBuffer.text == "+ selected small diff")
+        #expect(!model.selectedItems[1].hasDeferredDiffBuffer)
+    }
+
+    @Test("selected runtime drives visible status and error facade")
+    func selectedRuntimeDrivesVisibleStatusAndErrorFacade() {
+        let model = SessionModel()
+        model.phase = .ready
+        model.errorMessage = "legacy error"
+        model.workbench.ensureRuntime(
+            sessionId: "selected",
+            threadId: "thread_selected",
+            cwd: URL(fileURLWithPath: "/tmp/selected")
+        )
+        model.workbench.runtime(sessionId: "selected")?.phase = .running
+        model.workbench.runtime(sessionId: "selected")?.errorMessage = "runtime error"
+
+        #expect(model.selectedPhase == .running)
+        #expect(model.statusText == "Codex is working…")
+        #expect(model.shouldShowReasoningExpanded)
+        #expect(model.selectedErrorMessage == "runtime error")
+    }
+}
+
+@MainActor
+final class RecordingRuntimeTurnStarter: RuntimeTurnStarting {
+    struct Request {
+        let sessionId: String
+        let threadId: String?
+        let cwd: URL
+        let prompt: String
+    }
+
+    var requests: [Request] = []
+
+    func startTurn(
+        sessionId: String,
+        threadId: String?,
+        cwd: URL,
+        prompt: String,
+        onEvent: @escaping @MainActor (IpcMessage) -> Void
+    ) {
+        requests.append(Request(
+            sessionId: sessionId,
+            threadId: threadId,
+            cwd: cwd,
+            prompt: prompt
+        ))
     }
 }
 
@@ -541,6 +1015,17 @@ final class RecordingSessionClient: SessionClienting, @unchecked Sendable {
         threadId: String,
         prompt: String,
         onLine: @escaping @MainActor (String) -> Void
+    ) {
+        startedTurnThreadId = threadId
+        startedTurnPrompt = prompt
+    }
+
+    func startTurn(
+        sessionId: String,
+        threadId: String?,
+        cwd: URL,
+        prompt: String,
+        onEvent: @escaping @MainActor @Sendable (IpcMessage) -> Void
     ) {
         startedTurnThreadId = threadId
         startedTurnPrompt = prompt
@@ -715,6 +1200,42 @@ struct DaemonHistoryRequestTests {
         #expect(renameJSON["kind"] as? String == "history/renameThread")
         #expect(archiveJSON["kind"] as? String == "history/archiveThread")
         #expect(unarchiveJSON["kind"] as? String == "history/unarchiveThread")
+    }
+
+    @Test("runtime turn request encodes session routing")
+    func runtimeTurnRequestEncodesSessionRouting() throws {
+        let msg = DaemonClient.runtimeTurnRequest(
+            id: 13,
+            sessionId: "session_a",
+            threadId: "thread_a",
+            cwd: URL(fileURLWithPath: "/tmp/a"),
+            prompt: "continue"
+        )
+
+        let json = try #require(JSONSerialization.jsonObject(with: try JSONEncoder().encode(msg)) as? [String: Any])
+        let payload = try #require(json["payload"] as? [String: Any])
+        #expect(json["kind"] as? String == "startTurn")
+        #expect(json["sessionId"] as? String == "session_a")
+        #expect(payload["threadId"] as? String == "thread_a")
+        #expect(payload["prompt"] as? String == "continue")
+    }
+
+    @Test("runtime session request encodes session routing")
+    func runtimeSessionRequestEncodesSessionRouting() throws {
+        let msg = DaemonClient.runtimeTurnRequest(
+            id: 14,
+            sessionId: "session_a",
+            threadId: nil,
+            cwd: URL(fileURLWithPath: "/tmp/a"),
+            prompt: "start"
+        )
+
+        let json = try #require(JSONSerialization.jsonObject(with: try JSONEncoder().encode(msg)) as? [String: Any])
+        let payload = try #require(json["payload"] as? [String: Any])
+        #expect(json["kind"] as? String == "startSession")
+        #expect(json["sessionId"] as? String == "session_a")
+        #expect(payload["cwd"] as? String == "/tmp/a")
+        #expect(payload["prompt"] as? String == "start")
     }
 }
 

@@ -51,6 +51,11 @@ Swift 侧新增的是中立历史模型，例如 `HistoryThread`、`HistoryTurn`
 
 Rust 侧在 `codex.rs` 中新增 Codex app-server 方法，在 `ipc.rs` 中定义中立 wire shape，在 `main.rs` 中新增请求分发。
 
+当前实现已接入 async runtime hub：Swift 端只有一个 daemon stdout reader，历史
+reply 通过 request id 分发；streaming turn 事件统一包在 `session/event` 中并携带
+`sessionId/threadId`。因此历史读写不再和 streaming turn 共享直接 reader，也不会
+因为后台 `agentItem` 到达而把历史详情误判为 malformed reply。
+
 ## 数据流
 
 1. 用户打开历史入口。
@@ -59,7 +64,7 @@ Rust 侧在 `codex.rs` 中新增 Codex app-server 方法，在 `ipc.rs` 中定�
 4. Swift 按 `cwd` 分组展示。
 5. 用户点开 thread，Swift 立即标记该行正在打开，不阻塞主线程。
 6. Swift 在后台发送 `history/readThread { threadId, includeTurns: true }`。
-7. daemon 调用 Codex `thread/read`，把 turns/items 翻译成可回放的中立结构。
+7. daemon 用短 worker 调用 Codex `thread/read`，把 turns/items 翻译成可回放的中立结构。
 8. Swift 记录 read / apply timing，并在主线程应用详情。
 9. 大段 shell output 和 diff 先只保留原文与摘要，展开时再填充 TextKit buffer。
 10. 用户点击继续。

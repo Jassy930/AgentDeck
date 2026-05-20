@@ -62,6 +62,83 @@ struct UIItem: Identifiable {
     var diffBuffer = StreamingTextBuffer()
 }
 
+func agentDeckContainsNonWhitespace(_ text: String) -> Bool {
+    text.unicodeScalars.contains { scalar in
+        !CharacterSet.whitespacesAndNewlines.contains(scalar)
+    }
+}
+
+func agentDeckStringArray(from value: Any?) -> [String]? {
+    if let strings = value as? [String] {
+        return strings
+    }
+    if let values = value as? [Any] {
+        return values.compactMap { $0 as? String }
+    }
+    return nil
+}
+
+func agentDeckUIItem(from replay: HistoryReplayItem, largeHistoryTextThreshold: Int = 16 * 1024) -> UIItem {
+    var item = UIItem(id: replay.id, lifecycle: replay.lifecycle, kind: replay.kind)
+    item.text = replay.text
+    item.command = replay.command
+    item.output = replay.output ?? ""
+    item.exitCode = replay.exitCode
+    item.path = replay.path
+    item.diff = replay.diff ?? ""
+    item.descriptionText = replay.description ?? ""
+    item.query = replay.query
+    item.action = replay.action
+    item.actionQuery = replay.actionQuery ?? ""
+    item.queries = replay.queries
+    item.url = replay.url ?? ""
+    item.pattern = replay.pattern ?? ""
+    item.attachments = replay.attachments
+    item.phaseName = replay.phase ?? ""
+    item.memoryCitation = replay.memoryCitation ?? ""
+    item.cwdText = replay.cwd ?? ""
+    item.statusName = replay.status ?? ""
+    item.durationMs = replay.durationMs
+    item.sourceName = replay.source ?? ""
+    item.processId = replay.processId ?? ""
+    item.actions = replay.actions
+    item.changes = replay.changes
+    item.fragments = replay.fragments
+    item.toolKind = replay.toolKind
+    item.server = replay.server ?? ""
+    item.namespace = replay.namespace ?? ""
+    item.tool = replay.tool
+    item.arguments = replay.arguments
+    item.result = replay.result ?? ""
+    item.errorText = replay.error ?? ""
+    item.success = replay.success
+    item.resourceUri = replay.resourceUri ?? ""
+    item.contentItems = replay.contentItems
+    item.prompt = replay.prompt ?? ""
+    item.model = replay.model ?? ""
+    item.reasoningEffort = replay.reasoningEffort ?? ""
+    item.senderThreadId = replay.senderThreadId ?? ""
+    item.receiverThreadIds = replay.receiverThreadIds
+    item.agentsStates = replay.agentsStates ?? ""
+    item.mediaKind = replay.mediaKind
+    item.savedPath = replay.savedPath ?? ""
+    item.revisedPrompt = replay.revisedPrompt ?? ""
+    item.review = replay.review ?? ""
+    item.hasNonWhitespaceText = agentDeckContainsNonWhitespace(replay.text)
+    item.textBuffer.replace(with: replay.text)
+    if item.output.utf8.count > largeHistoryTextThreshold {
+        item.hasDeferredOutputBuffer = true
+    } else {
+        item.outputBuffer.replace(with: item.output)
+    }
+    if item.diff.utf8.count > largeHistoryTextThreshold {
+        item.hasDeferredDiffBuffer = true
+    } else {
+        item.diffBuffer.replace(with: item.diff)
+    }
+    return item
+}
+
 struct HistoryOpenTiming: Equatable {
     let threadId: String
     let itemCount: Int
@@ -107,11 +184,17 @@ final class SessionModel {
     /// final answer (which Codex sends in one burst). When the turn ends,
     /// reasoning collapses back to its D3 secondary role.
     var shouldShowReasoningExpanded: Bool {
-        phase == .running || phase == .starting
+        selectedPhase == .running || selectedPhase == .starting
     }
     var items: [UIItem] = []
     var errorMessage: String?
     var warningMessage: String?
+    var selectedErrorMessage: String? {
+        workbench.selectedRuntime?.errorMessage ?? errorMessage
+    }
+    var selectedWarningMessage: String? {
+        workbench.selectedRuntime == nil ? warningMessage : nil
+    }
     /// When the current turn began. `nil` outside a turn.
     var runStartedAt: Date?
     /// Driven by a tick timer; the status bar reads this so the elapsed
@@ -120,7 +203,19 @@ final class SessionModel {
     private var tickTimer: Timer?
     /// Prompts queued while a turn runs (Eng I1). v0.1: enqueue, auto-send
     /// on turn completion. Step 5 wires the auto-send; Step 4 shows the count.
-    var queuedPrompts: [String] = []
+    var queuedPrompts: [String] {
+        get {
+            workbench.selectedRuntime?.queuedPrompts ?? legacyQueuedPrompts
+        }
+        set {
+            if let runtime = workbench.selectedRuntime {
+                runtime.queuedPrompts = newValue
+            } else {
+                legacyQueuedPrompts = newValue
+            }
+        }
+    }
+    private var legacyQueuedPrompts: [String] = []
     var historyThreads: [HistoryThreadSummary] = []
     var historyErrorMessage: String?
     var isLoadingHistory = false
@@ -135,6 +230,16 @@ final class SessionModel {
     var historyGroups: [HistoryProjectGroup] {
         HistoryProjectGroup.group(historyThreads)
     }
+
+    var selectedItems: [UIItem] {
+        workbench.selectedRuntime?.items ?? items
+    }
+
+    var selectedPhase: Phase {
+        workbench.selectedRuntime?.phase ?? phase
+    }
+
+    let workbench: WorkbenchModel
 
     private let client: SessionClienting
     private let historyDetailClient: HistoryDetailReading
@@ -151,8 +256,17 @@ final class SessionModel {
         case diff
     }
 
-    init(client: SessionClienting = DaemonClient(), historyDetailClient: HistoryDetailReading? = nil) {
+    init(
+        client: SessionClienting = DaemonClient(),
+        historyDetailClient: HistoryDetailReading? = nil,
+        runtimeTurnStarter: RuntimeTurnStarting? = nil
+    ) {
         self.client = client
+        self.workbench = WorkbenchModel(
+            turnStarter: runtimeTurnStarter
+                ?? (client as? RuntimeTurnStarting)
+                ?? NoopRuntimeTurnStarter()
+        )
         self.historyDetailClient = historyDetailClient ?? DaemonHistoryDetailReader()
     }
 
@@ -168,7 +282,7 @@ final class SessionModel {
     /// time passing while Codex assembles the final answer.
     var statusText: String {
         let base: String
-        switch phase {
+        switch selectedPhase {
         case .idle: base = "Ready"
         case .starting: base = "Connecting to Codex…"
         case .ready: base = "Ready"
@@ -178,7 +292,9 @@ final class SessionModel {
         case .failed: base = "Failed"
         case .closed: base = "Closed"
         }
-        if let s = elapsedSeconds, phase == .running || phase == .starting {
+        if workbench.selectedRuntime == nil,
+           let s = elapsedSeconds,
+           phase == .running || phase == .starting {
             return "\(base)  \(s)s"
         }
         return base
@@ -221,12 +337,17 @@ final class SessionModel {
     }
 
     func submit(_ prompt: String) {
+        if workbench.selectedRuntime != nil {
+            workbench.submit(prompt)
+            return
+        }
+
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let cwd else { return }
 
         // Eng I1: a turn in flight → enqueue, don't drop, don't interrupt.
         if phase == .running || phase == .starting || phase == .waitingApproval {
-            queuedPrompts.append(trimmed)
+            legacyQueuedPrompts.append(trimmed)
             return
         }
 
@@ -340,22 +461,15 @@ final class SessionModel {
     }
 
     func applyHistoryThreadDetail(_ detail: HistoryThreadDetail) {
-        flushPendingAgentItems()
         cwd = URL(fileURLWithPath: detail.thread.cwd)
         selectedHistoryThreadId = detail.thread.id
         resetConversationViewport(prefix: "history:\(detail.thread.id)")
-        itemIndexById.removeAll(keepingCapacity: true)
-        items = detail.items.map { uiItem(from: $0, threadId: detail.thread.id) }
-        for (index, item) in items.enumerated() {
-            itemIndexById[item.id] = index
-        }
-        errorMessage = nil
-        warningMessage = nil
-        phase = .ready
+        workbench.applyHistoryThreadDetail(detail)
     }
 
     func startNewSessionFromCurrentProject() {
         selectedHistoryThreadId = nil
+        workbench.selectedSessionId = nil
         openingHistoryThreadId = nil
         resetConversationViewport(prefix: "live")
         items.removeAll()
@@ -394,76 +508,11 @@ final class SessionModel {
         }
     }
 
-    private func uiItem(from replay: HistoryReplayItem, threadId: String) -> UIItem {
-        var item = UIItem(
-            id: historyScopedItemId(threadId: threadId, itemId: replay.id),
-            lifecycle: replay.lifecycle,
-            kind: replay.kind
-        )
-        item.text = replay.text
-        item.command = replay.command
-        item.output = replay.output ?? ""
-        item.exitCode = replay.exitCode
-        item.path = replay.path
-        item.diff = replay.diff ?? ""
-        item.descriptionText = replay.description ?? ""
-        item.query = replay.query
-        item.action = replay.action
-        item.actionQuery = replay.actionQuery ?? ""
-        item.queries = replay.queries
-        item.url = replay.url ?? ""
-        item.pattern = replay.pattern ?? ""
-        item.attachments = replay.attachments
-        item.phaseName = replay.phase ?? ""
-        item.memoryCitation = replay.memoryCitation ?? ""
-        item.cwdText = replay.cwd ?? ""
-        item.statusName = replay.status ?? ""
-        item.durationMs = replay.durationMs
-        item.sourceName = replay.source ?? ""
-        item.processId = replay.processId ?? ""
-        item.actions = replay.actions
-        item.changes = replay.changes
-        item.fragments = replay.fragments
-        item.toolKind = replay.toolKind
-        item.server = replay.server ?? ""
-        item.namespace = replay.namespace ?? ""
-        item.tool = replay.tool
-        item.arguments = replay.arguments
-        item.result = replay.result ?? ""
-        item.errorText = replay.error ?? ""
-        item.success = replay.success
-        item.resourceUri = replay.resourceUri ?? ""
-        item.contentItems = replay.contentItems
-        item.prompt = replay.prompt ?? ""
-        item.model = replay.model ?? ""
-        item.reasoningEffort = replay.reasoningEffort ?? ""
-        item.senderThreadId = replay.senderThreadId ?? ""
-        item.receiverThreadIds = replay.receiverThreadIds
-        item.agentsStates = replay.agentsStates ?? ""
-        item.mediaKind = replay.mediaKind
-        item.savedPath = replay.savedPath ?? ""
-        item.revisedPrompt = replay.revisedPrompt ?? ""
-        item.review = replay.review ?? ""
-        item.hasNonWhitespaceText = containsNonWhitespace(replay.text)
-        item.textBuffer.replace(with: replay.text)
-        if shouldDeferHistoryText(item.output) {
-            item.hasDeferredOutputBuffer = true
-        } else {
-            item.outputBuffer.replace(with: item.output)
-        }
-        if shouldDeferHistoryText(item.diff) {
-            item.hasDeferredDiffBuffer = true
-        } else {
-            item.diffBuffer.replace(with: item.diff)
-        }
-        return item
-    }
-
-    private func historyScopedItemId(threadId: String, itemId: String) -> String {
-        "\(threadId):\(itemId)"
-    }
-
     func materializeDeferredContent(itemId: String, content: DeferredContent) {
+        if let runtime = workbench.selectedRuntime {
+            runtime.materializeDeferredContent(itemId: itemId, content: content)
+            return
+        }
         guard let idx = itemIndexById[itemId], items.indices.contains(idx) else { return }
         switch content {
         case .output:
@@ -572,11 +621,11 @@ final class SessionModel {
             if life == "delta" {
                 item.text.append(contentsOf: t)
                 item.textBuffer.append(t)
-                item.hasNonWhitespaceText = item.hasNonWhitespaceText || containsNonWhitespace(t)
+                item.hasNonWhitespaceText = item.hasNonWhitespaceText || agentDeckContainsNonWhitespace(t)
             } else if !t.isEmpty {
                 item.text = t
                 item.textBuffer.replace(with: t)
-                item.hasNonWhitespaceText = containsNonWhitespace(t)
+                item.hasNonWhitespaceText = agentDeckContainsNonWhitespace(t)
             }
         case "shell":
             item.command = d["command"] as? String ?? item.command
@@ -606,7 +655,7 @@ final class SessionModel {
             item.query = d["query"] as? String ?? item.query
             item.action = d["action"] as? String ?? item.action
             item.actionQuery = d["actionQuery"] as? String ?? item.actionQuery
-            item.queries = stringArray(from: d["queries"]) ?? item.queries
+            item.queries = agentDeckStringArray(from: d["queries"]) ?? item.queries
             item.url = d["url"] as? String ?? item.url
             item.pattern = d["pattern"] as? String ?? item.pattern
         case "plan", "reviewMode":
@@ -632,7 +681,7 @@ final class SessionModel {
             item.model = d["model"] as? String ?? item.model
             item.reasoningEffort = d["reasoningEffort"] as? String ?? item.reasoningEffort
             item.senderThreadId = d["senderThreadId"] as? String ?? item.senderThreadId
-            item.receiverThreadIds = stringArray(from: d["receiverThreadIds"]) ?? item.receiverThreadIds
+            item.receiverThreadIds = agentDeckStringArray(from: d["receiverThreadIds"]) ?? item.receiverThreadIds
             item.agentsStates = d["agentsStates"] as? String ?? item.agentsStates
         case "media":
             item.mediaKind = d["mediaKind"] as? String ?? item.mediaKind
@@ -656,33 +705,13 @@ final class SessionModel {
     }
 
     private func drainQueueIfPossible() {
-        guard !queuedPrompts.isEmpty, phase == .ready else { return }
-        let next = queuedPrompts.removeFirst()
+        guard !legacyQueuedPrompts.isEmpty, phase == .ready else { return }
+        let next = legacyQueuedPrompts.removeFirst()
         submit(next)
-    }
-
-    private func containsNonWhitespace(_ text: String) -> Bool {
-        text.unicodeScalars.contains { scalar in
-            !CharacterSet.whitespacesAndNewlines.contains(scalar)
-        }
-    }
-
-    private func shouldDeferHistoryText(_ text: String) -> Bool {
-        text.utf8.count > largeHistoryTextThreshold
     }
 
     private static func milliseconds(from start: Date, to end: Date) -> Int {
         max(0, Int((end.timeIntervalSince(start) * 1000).rounded()))
-    }
-
-    private func stringArray(from value: Any?) -> [String]? {
-        if let strings = value as? [String] {
-            return strings
-        }
-        if let values = value as? [Any] {
-            return values.compactMap { $0 as? String }
-        }
-        return nil
     }
 
     func teardown() {
