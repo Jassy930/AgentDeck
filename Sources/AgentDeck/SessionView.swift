@@ -21,6 +21,8 @@ import UniformTypeIdentifiers
 struct SessionView: View {
     @State private var model = SessionModel()
     @State private var input = ""
+    @State private var renameThread: HistoryThreadSummary?
+    @State private var renameText = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -42,6 +44,16 @@ struct SessionView: View {
         }
         .frame(minWidth: 760, minHeight: 420)   // D9: min window size
         .onDisappear { model.teardown() }       // A1: app exit kills daemon
+        .alert("Rename thread", isPresented: renameAlertBinding) {
+            TextField("Name", text: $renameText)
+            Button("Cancel", role: .cancel) { renameThread = nil }
+            Button("Rename") {
+                if let thread = renameThread {
+                    model.renameHistoryThread(thread, name: renameText)
+                }
+                renameThread = nil
+            }
+        }
     }
 
     // MARK: D3 — pinned status bar (D9 state mirror)
@@ -204,6 +216,15 @@ struct SessionView: View {
             .padding(.vertical, 7)
         }
         .buttonStyle(.plain)
+        .contextMenu {
+            Button("Rename") {
+                renameThread = thread
+                renameText = thread.displayTitle
+            }
+            Button("Archive", role: .destructive) {
+                model.archiveHistoryThread(thread)
+            }
+        }
     }
 
     // MARK: D3/D7 — single-column stream, NON-CARD
@@ -373,6 +394,13 @@ struct SessionView: View {
         model.selectedHistoryThreadId == nil
             ? "Ask Codex to…"
             : "Continue this historical thread…"
+    }
+
+    private var renameAlertBinding: Binding<Bool> {
+        Binding(
+            get: { renameThread != nil },
+            set: { if !$0 { renameThread = nil } }
+        )
     }
 
     /// Collapsed-output label: tells the user how much is hidden so they can

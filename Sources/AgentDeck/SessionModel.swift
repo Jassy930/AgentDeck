@@ -250,6 +250,30 @@ final class SessionModel {
         phase = cwd == nil ? .idle : .ready
     }
 
+    func archiveHistoryThread(_ thread: HistoryThreadSummary) {
+        guard ensureDaemonStarted() else { return }
+        do {
+            try client.archiveHistoryThread(threadId: thread.id)
+            if selectedHistoryThreadId == thread.id {
+                startNewSessionFromCurrentProject()
+            }
+            loadHistory()
+        } catch {
+            historyErrorMessage = "\(error)"
+        }
+    }
+
+    func renameHistoryThread(_ thread: HistoryThreadSummary, name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, ensureDaemonStarted() else { return }
+        do {
+            try client.renameHistoryThread(threadId: thread.id, name: trimmed)
+            loadHistory()
+        } catch {
+            historyErrorMessage = "\(error)"
+        }
+    }
+
     private func uiItem(from replay: HistoryReplayItem) -> UIItem {
         var item = UIItem(id: replay.id, lifecycle: replay.lifecycle, kind: replay.kind)
         item.text = replay.text

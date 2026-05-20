@@ -258,6 +258,27 @@ impl CodexAdapter {
         thread_resume_to_history_summary(&result)
     }
 
+    pub fn thread_archive(&mut self, thread_id: &str) -> Result<(), CodexError> {
+        let id = self.send_request("thread/archive", json!({ "threadId": thread_id }))?;
+        self.await_response(id, |_, _| {})?;
+        Ok(())
+    }
+
+    pub fn thread_unarchive(&mut self, thread_id: &str) -> Result<(), CodexError> {
+        let id = self.send_request("thread/unarchive", json!({ "threadId": thread_id }))?;
+        self.await_response(id, |_, _| {})?;
+        Ok(())
+    }
+
+    pub fn thread_set_name(&mut self, thread_id: &str, name: &str) -> Result<(), CodexError> {
+        let id = self.send_request(
+            "thread/name/set",
+            json!({ "threadId": thread_id, "name": name }),
+        )?;
+        self.await_response(id, |_, _| {})?;
+        Ok(())
+    }
+
     /// turn/start with a text prompt. Emits neutral AgentItems via `emit` as
     /// item notifications arrive. Step 2 returns once turn/completed is seen.
     pub fn turn_start(

@@ -223,6 +223,50 @@ final class DaemonClient {
         )
     }
 
+    static func archiveThreadRequest(id: UInt64, threadId: String) -> IpcMessage {
+        IpcMessage(kind: "history/archiveThread", id: id, payload: AnyCodable(["threadId": threadId]))
+    }
+
+    static func unarchiveThreadRequest(id: UInt64, threadId: String) -> IpcMessage {
+        IpcMessage(kind: "history/unarchiveThread", id: id, payload: AnyCodable(["threadId": threadId]))
+    }
+
+    static func renameThreadRequest(id: UInt64, threadId: String, name: String) -> IpcMessage {
+        IpcMessage(
+            kind: "history/renameThread",
+            id: id,
+            payload: AnyCodable(["threadId": threadId, "name": name])
+        )
+    }
+
+    func archiveHistoryThread(threadId: String) throws {
+        try manageHistoryThread(Self.archiveThreadRequest(id: 5, threadId: threadId))
+    }
+
+    func unarchiveHistoryThread(threadId: String) throws {
+        try manageHistoryThread(Self.unarchiveThreadRequest(id: 6, threadId: threadId))
+    }
+
+    func renameHistoryThread(threadId: String, name: String) throws {
+        try manageHistoryThread(Self.renameThreadRequest(id: 7, threadId: threadId, name: name))
+    }
+
+    private func manageHistoryThread(_ request: IpcMessage) throws {
+        if reader == nil {
+            try start()
+        }
+        let reply = try roundTrip(request)
+        if reply.kind == "historyThreadUpdated" {
+            return
+        }
+        if reply.kind == "error",
+           let dict = reply.payload?.value as? [String: Any],
+           let message = dict["message"] as? String {
+            throw DaemonError.malformedReply(message)
+        }
+        throw DaemonError.malformedReply("expected historyThreadUpdated, got \(reply.kind)")
+    }
+
     /// Start a streaming session. Sends `startSession {cwd, prompt}`, then
     /// reads neutral IPC messages on a BACKGROUND thread and delivers each
     /// one to `onMessage` ON THE MAIN THREAD.

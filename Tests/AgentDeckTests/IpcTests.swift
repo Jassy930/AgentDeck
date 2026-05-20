@@ -232,6 +232,21 @@ struct DaemonHistoryRequestTests {
         #expect(payload["threadId"] as? String == "thread_1")
         #expect(payload["prompt"] as? String == "continue")
     }
+
+    @Test("thread management requests encode intended action")
+    func threadManagementRequestsEncodeAction() throws {
+        let rename = DaemonClient.renameThreadRequest(id: 10, threadId: "thread_1", name: "New name")
+        let archive = DaemonClient.archiveThreadRequest(id: 11, threadId: "thread_1")
+        let unarchive = DaemonClient.unarchiveThreadRequest(id: 12, threadId: "thread_1")
+
+        let renameJSON = try #require(JSONSerialization.jsonObject(with: try JSONEncoder().encode(rename)) as? [String: Any])
+        let archiveJSON = try #require(JSONSerialization.jsonObject(with: try JSONEncoder().encode(archive)) as? [String: Any])
+        let unarchiveJSON = try #require(JSONSerialization.jsonObject(with: try JSONEncoder().encode(unarchive)) as? [String: Any])
+
+        #expect(renameJSON["kind"] as? String == "history/renameThread")
+        #expect(archiveJSON["kind"] as? String == "history/archiveThread")
+        #expect(unarchiveJSON["kind"] as? String == "history/unarchiveThread")
+    }
 }
 
 @Suite("Streaming TextKit renderer")

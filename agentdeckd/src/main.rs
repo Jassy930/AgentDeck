@@ -157,6 +157,39 @@ fn run_history_read(
     }
 }
 
+fn run_thread_management(
+    stdout: &mut impl Write,
+    id: Option<u64>,
+    action: &str,
+    thread_id: &str,
+    name: Option<&str>,
+) -> std::io::Result<()> {
+    let mut adapter = match codex::CodexAdapter::spawn() {
+        Ok(a) => a,
+        Err(e) => return write_msg(stdout, &IpcMessage::error(id, &e.to_string())),
+    };
+    if let Err(e) = adapter.initialize() {
+        return write_msg(stdout, &IpcMessage::error(id, &e.to_string()));
+    }
+    let result = match action {
+        "archive" => adapter.thread_archive(thread_id),
+        "unarchive" => adapter.thread_unarchive(thread_id),
+        "rename" => adapter.thread_set_name(thread_id, name.unwrap_or("")),
+        _ => Err(codex::CodexError::Protocol("unknown thread management action".into())),
+    };
+    match result {
+        Ok(()) => write_msg(
+            stdout,
+            &IpcMessage {
+                kind: "historyThreadUpdated".into(),
+                id,
+                payload: Some(serde_json::json!({ "threadId": thread_id })),
+            },
+        ),
+        Err(e) => write_msg(stdout, &IpcMessage::error(id, &e.to_string())),
+    }
+}
+
 /// Handle a `startSession` request: drive a full Codex turn, streaming
 /// neutral AgentItems and sessionState transitions over IPC.
 ///
@@ -443,6 +476,32 @@ fn main() -> std::io::Result<()> {
                         &mut stdout,
                         &IpcMessage::error(msg.id, "history/readThread requires threadId"),
                     )?;
+                }
+            }
+            "history/archiveThread" | "history/unarchiveThread" | "history/renameThread" => {
+                let thread_id = msg
+                    .payload
+                    .as_ref()
+                    .and_then(|p| p.get("threadId"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let name = msg
+                    .payload
+                    .as_ref()
+                    .and_then(|p| p.get("name"))
+                    .and_then(|v| v.as_str());
+                if thread_id.is_empty() || (msg.kind == "history/renameThread" && name.is_none()) {
+                    write_msg(
+                        &mut stdout,
+                        &IpcMessage::error(msg.id, "thread management requires threadId"),
+                    )?;
+                } else {
+                    let action = match msg.kind.as_str() {
+                        "history/archiveThread" => "archive",
+                        "history/unarchiveThread" => "unarchive",
+                        _ => "rename",
+                    };
+                    run_thread_management(&mut stdout, msg.id, action, thread_id, name)?;
                 }
             }
             "startSession" => {
