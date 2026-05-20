@@ -54,6 +54,39 @@ struct HistoryProjectGroup: Identifiable, Equatable {
     }
 }
 
+struct HistoryThreadRowPresentation: Equatable {
+    enum VisualState: Equatable {
+        case idle
+        case hovered
+        case selected
+        case opening
+    }
+
+    let visualState: VisualState
+    let usesFullRowHitTarget = true
+
+    init(
+        threadId: String,
+        selectedThreadId: String?,
+        openingThreadId: String?,
+        hoveredThreadId: String?
+    ) {
+        if openingThreadId == threadId {
+            visualState = .opening
+        } else if selectedThreadId == threadId {
+            visualState = .selected
+        } else if hoveredThreadId == threadId {
+            visualState = .hovered
+        } else {
+            visualState = .idle
+        }
+    }
+
+    var isEmphasized: Bool {
+        visualState == .selected || visualState == .opening
+    }
+}
+
 struct HistoryThreadListPayload: Codable, Equatable {
     var threads: [HistoryThreadSummary]
     var nextCursor: String?

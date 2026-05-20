@@ -23,6 +23,7 @@ struct SessionView: View {
     @State private var input = ""
     @State private var renameThread: HistoryThreadSummary?
     @State private var renameText = ""
+    @State private var hoveredHistoryThreadId: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -175,6 +176,7 @@ struct SessionView: View {
                             historyGroup(group)
                         }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.bottom, 12)
                 }
             }
@@ -200,34 +202,65 @@ struct SessionView: View {
     }
 
     private func historyThreadRow(_ thread: HistoryThreadSummary) -> some View {
-        Button {
+        let presentation = HistoryThreadRowPresentation(
+            threadId: thread.id,
+            selectedThreadId: model.selectedHistoryThreadId,
+            openingThreadId: model.openingHistoryThreadId,
+            hoveredThreadId: hoveredHistoryThreadId
+        )
+
+        return Button {
             model.openHistoryThread(thread)
         } label: {
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
-                    Text(thread.displayTitle)
-                        .font(.system(.callout))
-                        .foregroundStyle(.primary)
-                        .lineLimit(2)
-                    if model.openingHistoryThreadId == thread.id {
-                        ProgressView()
-                            .controlSize(.mini)
+            HStack(spacing: 8) {
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(historyThreadAccentColor(presentation))
+                    .frame(width: 3)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Text(thread.displayTitle)
+                            .font(.system(.callout, weight: presentation.isEmphasized ? .medium : .regular))
+                            .foregroundStyle(presentation.isEmphasized ? .primary : .secondary)
+                            .lineLimit(2)
+                        if model.openingHistoryThreadId == thread.id {
+                            ProgressView()
+                                .controlSize(.mini)
+                        }
                     }
+                    HStack(spacing: 6) {
+                        Text(thread.status)
+                        Text(thread.source)
+                        Text(updatedLabel(thread.updatedAt))
+                    }
+                    .font(.system(.caption))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
                 }
-                HStack(spacing: 6) {
-                    Text(thread.status)
-                    Text(thread.source)
-                    Text(updatedLabel(thread.updatedAt))
-                }
-                .font(.system(.caption))
-                .foregroundStyle(.tertiary)
-                .lineLimit(1)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 7)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
+            .background {
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(historyThreadBackgroundColor(presentation))
+            }
         }
         .buttonStyle(.plain)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .padding(.horizontal, 6)
+        .padding(.vertical, 1)
+        .onHover { hovering in
+            if hovering {
+                hoveredHistoryThreadId = thread.id
+            } else if hoveredHistoryThreadId == thread.id {
+                hoveredHistoryThreadId = nil
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Open \(thread.displayTitle)")
+        .accessibilityHint("Opens the saved thread in the conversation view")
         .contextMenu {
             Button("Rename") {
                 renameThread = thread
@@ -236,6 +269,28 @@ struct SessionView: View {
             Button("Archive", role: .destructive) {
                 model.archiveHistoryThread(thread)
             }
+        }
+    }
+
+    private func historyThreadBackgroundColor(_ presentation: HistoryThreadRowPresentation) -> Color {
+        switch presentation.visualState {
+        case .opening, .selected:
+            return Color.accentColor.opacity(0.16)
+        case .hovered:
+            return Color(nsColor: .separatorColor).opacity(0.28)
+        case .idle:
+            return .clear
+        }
+    }
+
+    private func historyThreadAccentColor(_ presentation: HistoryThreadRowPresentation) -> Color {
+        switch presentation.visualState {
+        case .opening, .selected:
+            return .accentColor
+        case .hovered:
+            return Color(nsColor: .tertiaryLabelColor)
+        case .idle:
+            return .clear
         }
     }
 

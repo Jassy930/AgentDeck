@@ -101,12 +101,15 @@ struct StreamingTextView: NSViewRepresentable {
 }
 
 final class StreamingTextContainerView: NSView {
-    private let textView = NSTextView(frame: .zero)
+    private let textView = CoordinatedStreamingTextView(frame: .zero)
     private var measuredHeight: CGFloat = 1
     private var lastFont: NSFont?
     private var lastTextColor: NSColor?
     private weak var observedBuffer: StreamingTextBuffer?
     private var observationToken: UUID?
+    private lazy var selectionOwner = SessionTextSelectionOwner { [weak self] in
+        self?.textView.clearSelection()
+    }
 
     override var isFlipped: Bool { true }
 
@@ -202,6 +205,7 @@ final class StreamingTextContainerView: NSView {
     }
 
     private func configureTextView() {
+        textView.selectionOwner = selectionOwner
         textView.drawsBackground = false
         textView.isEditable = false
         textView.isSelectable = true
@@ -239,5 +243,28 @@ final class StreamingTextContainerView: NSView {
             invalidateIntrinsicContentSize()
             needsLayout = true
         }
+    }
+}
+
+final class CoordinatedStreamingTextView: NSTextView {
+    weak var selectionOwner: SessionTextSelectionOwner?
+    var selectionCoordinator: SessionTextSelectionCoordinator = .shared
+
+    override func mouseDown(with event: NSEvent) {
+        if let selectionOwner {
+            selectionCoordinator.activate(selectionOwner)
+        }
+        super.mouseDown(with: event)
+    }
+
+    override func selectAll(_ sender: Any?) {
+        if let selectionOwner {
+            selectionCoordinator.activate(selectionOwner)
+        }
+        super.selectAll(sender)
+    }
+
+    func clearSelection() {
+        setSelectedRange(NSRange(location: 0, length: 0))
     }
 }

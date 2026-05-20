@@ -336,7 +336,7 @@ final class SessionModel {
         cwd = URL(fileURLWithPath: detail.thread.cwd)
         selectedHistoryThreadId = detail.thread.id
         itemIndexById.removeAll(keepingCapacity: true)
-        items = detail.items.map(uiItem)
+        items = detail.items.map { uiItem(from: $0, threadId: detail.thread.id) }
         for (index, item) in items.enumerated() {
             itemIndexById[item.id] = index
         }
@@ -377,8 +377,12 @@ final class SessionModel {
         }
     }
 
-    private func uiItem(from replay: HistoryReplayItem) -> UIItem {
-        var item = UIItem(id: replay.id, lifecycle: replay.lifecycle, kind: replay.kind)
+    private func uiItem(from replay: HistoryReplayItem, threadId: String) -> UIItem {
+        var item = UIItem(
+            id: historyScopedItemId(threadId: threadId, itemId: replay.id),
+            lifecycle: replay.lifecycle,
+            kind: replay.kind
+        )
         item.text = replay.text
         item.command = replay.command
         item.output = replay.output ?? ""
@@ -436,6 +440,10 @@ final class SessionModel {
             item.diffBuffer.replace(with: item.diff)
         }
         return item
+    }
+
+    private func historyScopedItemId(threadId: String, itemId: String) -> String {
+        "\(threadId):\(itemId)"
     }
 
     func materializeDeferredContent(itemId: String, content: DeferredContent) {

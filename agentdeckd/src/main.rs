@@ -596,4 +596,5 @@ mod tests {
         assert_eq!(params.thread_id, "thread_1");
         assert_eq!(params.prompt, "continue");
     }
+
 }

@@ -75,6 +75,8 @@ Rust 侧在 `codex.rs` 中新增 Codex app-server 方法，在 `ipc.rs` 中定�
 - 当前空状态增加“打开历史会话”入口。
 - 有项目时增加历史侧栏或历史面板，按项目路径分组。
 - Thread 行展示项目名、标题或 preview、更新时间、状态。
+- Thread 行必须是整行块级点击目标；hover、正在打开和已选中状态要有可见反馈，
+  不能只让标题文字成为有效热区。
 - Thread 打开时行内显示进度，状态栏显示最近一次历史打开的 read / apply 耗时。
 - Thread 详情复用现有单列 stream 样式，不做聊天气泡化。
 - 长 output / diff 保持折叠；未展开前不创建大 TextKit storage。

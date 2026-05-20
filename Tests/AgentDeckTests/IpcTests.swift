@@ -181,6 +181,34 @@ struct SessionRenderThrottlingTests {
         #expect(model.selectedHistoryThreadId == "h1")
     }
 
+    @Test("history replay ids are namespaced by thread to avoid stale view reuse")
+    func historyReplayIdsAreNamespacedByThread() {
+        let model = SessionModel()
+        let firstThread = HistoryThreadSummary(id: "thread_a", name: nil, preview: "old", cwd: "/tmp/project", createdAt: 1, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli")
+        let secondThread = HistoryThreadSummary(id: "thread_b", name: nil, preview: "new", cwd: "/tmp/project", createdAt: 3, updatedAt: 4, status: "ready", modelProvider: "openai", source: "cli")
+
+        model.applyHistoryThreadDetail(HistoryThreadDetail(
+            thread: firstThread,
+            items: [
+                HistoryReplayItem(id: "item-1", lifecycle: "completed", kind: "user", text: "old prompt"),
+                HistoryReplayItem(id: "item-2", lifecycle: "completed", kind: "message", text: "old answer"),
+            ]
+        ))
+        let firstIds = model.items.map(\.id)
+
+        model.applyHistoryThreadDetail(HistoryThreadDetail(
+            thread: secondThread,
+            items: [
+                HistoryReplayItem(id: "item-1", lifecycle: "completed", kind: "user", text: "new prompt"),
+                HistoryReplayItem(id: "item-2", lifecycle: "completed", kind: "message", text: "new answer"),
+            ]
+        ))
+
+        #expect(firstIds == ["thread_a:item-1", "thread_a:item-2"])
+        #expect(model.items.map(\.id) == ["thread_b:item-1", "thread_b:item-2"])
+        #expect(model.items.map(\.text) == ["new prompt", "new answer"])
+    }
+
     @Test("applying history detail preserves web search replay fields")
     func applyingHistoryDetailPreservesWebSearchFields() {
         let model = SessionModel()
@@ -341,8 +369,8 @@ struct SessionRenderThrottlingTests {
         #expect(model.items[1].diffBuffer.text.isEmpty)
         #expect(model.items[1].hasDeferredDiffBuffer)
 
-        model.materializeDeferredContent(itemId: "shell1", content: .output)
-        model.materializeDeferredContent(itemId: "diff1", content: .diff)
+        model.materializeDeferredContent(itemId: "h1:shell1", content: .output)
+        model.materializeDeferredContent(itemId: "h1:diff1", content: .diff)
 
         #expect(model.items[0].outputBuffer.text == largeOutput)
         #expect(!model.items[0].hasDeferredOutputBuffer)
@@ -410,6 +438,42 @@ struct HistoryModelTests {
 
         #expect(groups.map(\.cwd) == ["/tmp/a", "/tmp/b"])
         #expect(groups[0].threads.map(\.id) == ["new", "old"])
+    }
+
+    @Test("history row presentation uses full row target and visible states")
+    func historyRowPresentationUsesFullRowTargetAndVisibleStates() {
+        let idle = HistoryThreadRowPresentation(
+            threadId: "h1",
+            selectedThreadId: nil,
+            openingThreadId: nil,
+            hoveredThreadId: nil
+        )
+        let hovered = HistoryThreadRowPresentation(
+            threadId: "h1",
+            selectedThreadId: nil,
+            openingThreadId: nil,
+            hoveredThreadId: "h1"
+        )
+        let selected = HistoryThreadRowPresentation(
+            threadId: "h1",
+            selectedThreadId: "h1",
+            openingThreadId: nil,
+            hoveredThreadId: nil
+        )
+        let opening = HistoryThreadRowPresentation(
+            threadId: "h1",
+            selectedThreadId: nil,
+            openingThreadId: "h1",
+            hoveredThreadId: nil
+        )
+
+        #expect(idle.usesFullRowHitTarget)
+        #expect(idle.visualState == .idle)
+        #expect(hovered.visualState == .hovered)
+        #expect(selected.visualState == .selected)
+        #expect(opening.visualState == .opening)
+        #expect(selected.isEmphasized)
+        #expect(opening.isEmphasized)
     }
 
     @Test("history replay item tolerates per-kind missing fields")
@@ -514,6 +578,23 @@ struct DaemonHistoryRequestTests {
 @Suite("Streaming TextKit renderer")
 @MainActor
 struct StreamingTextKitRendererTests {
+    @MainActor
+    @Test("activating a different session text owner clears the previous selection")
+    func activatingDifferentSessionTextOwnerClearsPreviousSelection() {
+        let coordinator = SessionTextSelectionCoordinator()
+        var firstClearCount = 0
+        var secondClearCount = 0
+        let first = SessionTextSelectionOwner { firstClearCount += 1 }
+        let second = SessionTextSelectionOwner { secondClearCount += 1 }
+
+        coordinator.activate(first)
+        coordinator.activate(first)
+        coordinator.activate(second)
+
+        #expect(firstClearCount == 1)
+        #expect(secondClearCount == 0)
+    }
+
     @Test("growing text appends only the new suffix")
     func growingTextAppendsSuffix() {
         let storage = NSTextStorage(string: "")
