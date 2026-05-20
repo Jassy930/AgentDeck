@@ -65,6 +65,13 @@ fn history_list_params(payload: Option<&serde_json::Value>) -> HistoryListParams
     }
 }
 
+fn history_read_thread_id(payload: Option<&serde_json::Value>) -> Option<String> {
+    payload?
+        .get("threadId")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
 fn run_history_list(
     stdout: &mut impl Write,
     id: Option<u64>,
@@ -97,6 +104,38 @@ fn run_history_list(
         ),
         Err(e) => {
             diag::log("history_list_failed", &e.to_string());
+            write_msg(stdout, &IpcMessage::error(id, &e.to_string()))
+        }
+    }
+}
+
+fn run_history_read(
+    stdout: &mut impl Write,
+    id: Option<u64>,
+    thread_id: &str,
+) -> std::io::Result<()> {
+    let mut adapter = match codex::CodexAdapter::spawn() {
+        Ok(a) => a,
+        Err(e) => {
+            diag::log("history_read_spawn_failed", &e.to_string());
+            return write_msg(stdout, &IpcMessage::error(id, &e.to_string()));
+        }
+    };
+    if let Err(e) = adapter.initialize() {
+        diag::log("history_read_handshake_failed", &e.to_string());
+        return write_msg(stdout, &IpcMessage::error(id, &e.to_string()));
+    }
+    match adapter.thread_read(thread_id) {
+        Ok(detail) => write_msg(
+            stdout,
+            &IpcMessage {
+                kind: "historyThread".into(),
+                id,
+                payload: Some(serde_json::to_value(detail).expect("history detail serializes")),
+            },
+        ),
+        Err(e) => {
+            diag::log("history_read_failed", &e.to_string());
             write_msg(stdout, &IpcMessage::error(id, &e.to_string()))
         }
     }
@@ -283,6 +322,16 @@ fn main() -> std::io::Result<()> {
                 let params = history_list_params(msg.payload.as_ref());
                 run_history_list(&mut stdout, msg.id, params)?;
             }
+            "history/readThread" => {
+                if let Some(thread_id) = history_read_thread_id(msg.payload.as_ref()) {
+                    run_history_read(&mut stdout, msg.id, &thread_id)?;
+                } else {
+                    write_msg(
+                        &mut stdout,
+                        &IpcMessage::error(msg.id, "history/readThread requires threadId"),
+                    )?;
+                }
+            }
             "startSession" => {
                 let cwd = msg
                     .payload
@@ -334,5 +383,11 @@ mod tests {
         assert_eq!(params.search_term.as_deref(), Some("fix"));
         assert_eq!(params.cursor.as_deref(), Some("c2"));
         assert_eq!(params.limit, Some(20));
+    }
+
+    #[test]
+    fn history_read_thread_id_reads_required_id() {
+        let p = json!({"threadId": "thread_1"});
+        assert_eq!(history_read_thread_id(Some(&p)), Some("thread_1".to_string()));
     }
 }

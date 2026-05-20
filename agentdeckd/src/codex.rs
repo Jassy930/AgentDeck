@@ -27,7 +27,10 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use serde_json::{Value, json};
 
-use crate::ipc::{AgentItem, AgentItemKind, HistoryThreadList, HistoryThreadSummary, Lifecycle};
+use crate::ipc::{
+    AgentItem, AgentItemKind, HistoryThreadDetail, HistoryThreadList, HistoryThreadSummary,
+    Lifecycle,
+};
 
 #[derive(Debug)]
 pub enum CodexError {
@@ -233,6 +236,17 @@ impl CodexAdapter {
         thread_list_to_history(&result)
     }
 
+    /// Read a persisted thread with its turns/items for replay in AgentDeck's
+    /// neutral stream.
+    pub fn thread_read(&mut self, thread_id: &str) -> Result<HistoryThreadDetail, CodexError> {
+        let id = self.send_request(
+            "thread/read",
+            json!({ "threadId": thread_id, "includeTurns": true }),
+        )?;
+        let result = self.await_response(id, |_, _| {})?;
+        thread_read_to_history_detail(&result)
+    }
+
     /// turn/start with a text prompt. Emits neutral AgentItems via `emit` as
     /// item notifications arrive. Step 2 returns once turn/completed is seen.
     pub fn turn_start(
@@ -345,6 +359,63 @@ fn thread_list_to_history(value: &Value) -> Result<HistoryThreadList, CodexError
     })
 }
 
+fn user_message_text(item: &Value) -> String {
+    item.get("content")
+        .and_then(Value::as_array)
+        .map(|content| {
+            content
+                .iter()
+                .filter_map(|part| {
+                    if part.get("type").and_then(Value::as_str) == Some("text") {
+                        part.get("text").and_then(Value::as_str)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+        .unwrap_or_default()
+}
+
+fn thread_item_to_agent_item(item: &Value) -> Option<AgentItem> {
+    let id = item.get("id").and_then(Value::as_str)?.to_string();
+    let kind = if item.get("type").and_then(Value::as_str) == Some("userMessage") {
+        AgentItemKind::User {
+            text: user_message_text(item),
+        }
+    } else {
+        item_to_kind(item)?
+    };
+    Some(AgentItem {
+        id,
+        lifecycle: Lifecycle::Completed,
+        kind,
+    })
+}
+
+fn thread_read_to_history_detail(value: &Value) -> Result<HistoryThreadDetail, CodexError> {
+    let thread = value
+        .get("thread")
+        .ok_or_else(|| CodexError::Protocol("thread/read: result missing thread".into()))?;
+    let mut items = Vec::new();
+    if let Some(turns) = thread.get("turns").and_then(Value::as_array) {
+        for turn in turns {
+            if let Some(turn_items) = turn.get("items").and_then(Value::as_array) {
+                for item in turn_items {
+                    if let Some(agent_item) = thread_item_to_agent_item(item) {
+                        items.push(agent_item);
+                    }
+                }
+            }
+        }
+    }
+    Ok(HistoryThreadDetail {
+        thread: thread_summary_from_value(thread)?,
+        items,
+    })
+}
+
 impl Drop for CodexAdapter {
     /// A1 second layer (Codex #11): the app-server child — AND everything it
     /// forked (real app-server, MCP servers, sandbox helpers) — must not
@@ -415,7 +486,10 @@ fn reasoning_text(item: &Value) -> String {
 }
 
 fn item_to_kind(item: &Value) -> Option<AgentItemKind> {
-    match item.get("type").and_then(Value::as_str)? {
+        match item.get("type").and_then(Value::as_str)? {
+        "userMessage" => Some(AgentItemKind::User {
+            text: user_message_text(item),
+        }),
         // PRIMARY answer the user reads — NOT collapsed (the UX bug the user
         // hit: this was mis-named reasoning and the UI folded it away).
         "agentMessage" => Some(AgentItemKind::Message {
@@ -829,5 +903,45 @@ mod tests {
         assert_eq!(list.threads[0].cwd, "/tmp/project");
         assert_eq!(list.threads[0].source, "cli");
         assert_eq!(list.next_cursor.as_deref(), Some("cursor_2"));
+    }
+
+    #[test]
+    fn thread_read_response_maps_turn_items_to_history_detail() {
+        let value = json!({
+            "thread": {
+                "id": "thread_1",
+                "name": "Fix tests",
+                "preview": "please fix tests",
+                "cwd": "/tmp/project",
+                "createdAt": 10,
+                "updatedAt": 20,
+                "status": {"type": "idle"},
+                "modelProvider": "openai",
+                "source": "cli",
+                "cliVersion": "0.0.0",
+                "ephemeral": false,
+                "sessionId": "session_1",
+                "turns": [{
+                    "id": "turn_1",
+                    "status": "completed",
+                    "items": [
+                        {"id": "u1", "type": "userMessage", "content": [{"type": "text", "text": "please fix tests"}]},
+                        {"id": "a1", "type": "agentMessage", "text": "done"},
+                        {"id": "cmd1", "type": "commandExecution", "status": "completed", "command": "swift test", "aggregatedOutput": "ok\\n", "exitCode": 0, "cwd": "/tmp/project", "commandActions": []}
+                    ]
+                }]
+            }
+        });
+        let detail = thread_read_to_history_detail(&value).unwrap();
+        assert_eq!(detail.thread.id, "thread_1");
+        assert_eq!(detail.items.len(), 3);
+        match &detail.items[0].kind {
+            AgentItemKind::User { text } => assert_eq!(text, "please fix tests"),
+            _ => panic!("expected user item"),
+        }
+        match &detail.items[1].kind {
+            AgentItemKind::Message { text } => assert_eq!(text, "done"),
+            _ => panic!("expected message item"),
+        }
     }
 }

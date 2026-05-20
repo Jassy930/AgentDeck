@@ -152,6 +152,26 @@ struct SessionRenderThrottlingTests {
         #expect(model.historyGroups.count == 1)
         #expect(model.historyGroups[0].cwd == "/tmp/project")
     }
+
+    @Test("applying history detail replaces stream with replay items")
+    func applyingHistoryDetailReplaysItems() {
+        let model = SessionModel()
+        let thread = HistoryThreadSummary(id: "h1", name: nil, preview: "old", cwd: "/tmp/project", createdAt: 1, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli")
+        let detail = HistoryThreadDetail(
+            thread: thread,
+            items: [
+                HistoryReplayItem(id: "u1", lifecycle: "completed", kind: "user", text: "old prompt"),
+                HistoryReplayItem(id: "a1", lifecycle: "completed", kind: "message", text: "old answer"),
+            ]
+        )
+
+        model.applyHistoryThreadDetail(detail)
+
+        #expect(model.cwd?.path == "/tmp/project")
+        #expect(model.items.map(\.kind) == ["user", "message"])
+        #expect(model.items.map(\.text) == ["old prompt", "old answer"])
+        #expect(model.selectedHistoryThreadId == "h1")
+    }
 }
 
 @Suite("History model")

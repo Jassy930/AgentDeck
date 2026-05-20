@@ -175,9 +175,7 @@ struct SessionView: View {
 
     private func historyThreadRow(_ thread: HistoryThreadSummary) -> some View {
         Button {
-            // Reading/replay lands in the next implementation slice. The row
-            // is already shaped as a real selection target so the UI can grow
-            // without changing the information architecture.
+            model.openHistoryThread(thread)
         } label: {
             VStack(alignment: .leading, spacing: 3) {
                 Text(thread.displayTitle)

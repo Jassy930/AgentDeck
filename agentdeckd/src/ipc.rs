@@ -101,6 +101,8 @@ pub struct AgentItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum AgentItemKind {
+    /// A user prompt restored from historical thread turns.
+    User { text: String },
     /// The agent's PRIMARY user-facing answer (Codex `agentMessage`). This
     /// is the reply the user actually reads — it is NOT collapsed (corrects
     /// the D3 misread: D3's "reasoning default-collapsed" applies to the
@@ -158,6 +160,13 @@ pub struct HistoryThreadSummary {
 pub struct HistoryThreadList {
     pub threads: Vec<HistoryThreadSummary>,
     pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryThreadDetail {
+    pub thread: HistoryThreadSummary,
+    pub items: Vec<AgentItem>,
 }
 
 #[cfg(test)]

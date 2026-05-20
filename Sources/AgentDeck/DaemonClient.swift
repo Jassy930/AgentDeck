@@ -190,6 +190,31 @@ final class DaemonClient {
         return try JSONDecoder().decode(HistoryThreadListPayload.self, from: data)
     }
 
+    static func historyReadRequest(id: UInt64, threadId: String) -> IpcMessage {
+        IpcMessage(
+            kind: "history/readThread",
+            id: id,
+            payload: AnyCodable(["threadId": threadId])
+        )
+    }
+
+    func readHistoryThread(threadId: String) throws -> HistoryThreadDetail {
+        if reader == nil {
+            try start()
+        }
+        let reply = try roundTrip(Self.historyReadRequest(id: 3, threadId: threadId))
+        guard reply.kind == "historyThread", let payload = reply.payload?.value else {
+            if reply.kind == "error",
+               let dict = reply.payload?.value as? [String: Any],
+               let message = dict["message"] as? String {
+                throw DaemonError.malformedReply(message)
+            }
+            throw DaemonError.malformedReply("expected historyThread, got \(reply.kind)")
+        }
+        let data = try JSONSerialization.data(withJSONObject: payload)
+        return try JSONDecoder().decode(HistoryThreadDetail.self, from: data)
+    }
+
     /// Start a streaming session. Sends `startSession {cwd, prompt}`, then
     /// reads neutral IPC messages on a BACKGROUND thread and delivers each
     /// one to `onMessage` ON THE MAIN THREAD.

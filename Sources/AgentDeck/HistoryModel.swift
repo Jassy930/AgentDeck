@@ -58,3 +58,21 @@ struct HistoryThreadListPayload: Codable, Equatable {
     var threads: [HistoryThreadSummary]
     var nextCursor: String?
 }
+
+struct HistoryReplayItem: Codable, Equatable, Identifiable {
+    let id: String
+    var lifecycle: String
+    var kind: String
+    var text: String = ""
+    var command: String = ""
+    var output: String?
+    var exitCode: Int?
+    var path: String = ""
+    var diff: String?
+    var description: String?
+}
+
+struct HistoryThreadDetail: Codable, Equatable {
+    var thread: HistoryThreadSummary
+    var items: [HistoryReplayItem]
+}

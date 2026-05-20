@@ -77,6 +77,7 @@ final class SessionModel {
     var historyErrorMessage: String?
     var isLoadingHistory = false
     var historySearchTerm = ""
+    var selectedHistoryThreadId: String?
 
     var historyGroups: [HistoryProjectGroup] {
         HistoryProjectGroup.group(historyThreads)
@@ -215,6 +216,45 @@ final class SessionModel {
         isLoadingHistory = false
     }
 
+    func openHistoryThread(_ thread: HistoryThreadSummary) {
+        guard ensureDaemonStarted() else { return }
+        do {
+            let detail = try client.readHistoryThread(threadId: thread.id)
+            applyHistoryThreadDetail(detail)
+        } catch {
+            historyErrorMessage = "\(error)"
+        }
+    }
+
+    func applyHistoryThreadDetail(_ detail: HistoryThreadDetail) {
+        flushPendingAgentItems()
+        cwd = URL(fileURLWithPath: detail.thread.cwd)
+        selectedHistoryThreadId = detail.thread.id
+        itemIndexById.removeAll(keepingCapacity: true)
+        items = detail.items.map(uiItem)
+        for (index, item) in items.enumerated() {
+            itemIndexById[item.id] = index
+        }
+        errorMessage = nil
+        phase = .ready
+    }
+
+    private func uiItem(from replay: HistoryReplayItem) -> UIItem {
+        var item = UIItem(id: replay.id, lifecycle: replay.lifecycle, kind: replay.kind)
+        item.text = replay.text
+        item.command = replay.command
+        item.output = replay.output ?? ""
+        item.exitCode = replay.exitCode
+        item.path = replay.path
+        item.diff = replay.diff ?? ""
+        item.descriptionText = replay.description ?? ""
+        item.hasNonWhitespaceText = containsNonWhitespace(replay.text)
+        item.textBuffer.replace(with: replay.text)
+        item.outputBuffer.replace(with: item.output)
+        item.diffBuffer.replace(with: item.diff)
+        return item
+    }
+
     func ingest(rawLine raw: String) {
         let msg = (try? JSONDecoder().decode(
             IpcMessage.self, from: Data(raw.utf8)))
@@ -295,7 +335,7 @@ final class SessionModel {
         item.lifecycle = life
         item.kind = kind
         switch kind {
-        case "message", "reasoning":
+        case "user", "message", "reasoning":
             // message = primary answer; reasoning = collapsed chain-of-
             // thought. Both accumulate text the same way: delta appends.
             // started/completed REPLACE — UNLESS the incoming text is empty
