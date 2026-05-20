@@ -153,6 +153,14 @@ struct SessionRenderThrottlingTests {
         #expect(model.historyGroups[0].cwd == "/tmp/project")
     }
 
+    @Test("history auto refresh is requested only once")
+    func historyAutoRefreshIsRequestedOnlyOnce() {
+        let model = SessionModel()
+
+        #expect(model.shouldAutoRefreshHistoryOnAppear())
+        #expect(!model.shouldAutoRefreshHistoryOnAppear())
+    }
+
     @Test("applying history detail replaces stream with replay items")
     func applyingHistoryDetailReplaysItems() {
         let model = SessionModel()

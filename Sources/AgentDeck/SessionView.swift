@@ -43,6 +43,7 @@ struct SessionView: View {
             }
         }
         .frame(minWidth: 760, minHeight: 420)   // D9: min window size
+        .onAppear { model.loadHistoryOnAppear() }
         .onDisappear { model.teardown() }       // A1: app exit kills daemon
         .alert("Rename thread", isPresented: renameAlertBinding) {
             TextField("Name", text: $renameText)

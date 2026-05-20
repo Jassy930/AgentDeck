@@ -78,6 +78,7 @@ final class SessionModel {
     var isLoadingHistory = false
     var historySearchTerm = ""
     var selectedHistoryThreadId: String?
+    private var didRequestInitialHistoryRefresh = false
 
     var historyGroups: [HistoryProjectGroup] {
         HistoryProjectGroup.group(historyThreads)
@@ -198,6 +199,17 @@ final class SessionModel {
 
     func setHistoryThreads(_ threads: [HistoryThreadSummary]) {
         historyThreads = threads
+    }
+
+    func shouldAutoRefreshHistoryOnAppear() -> Bool {
+        guard !didRequestInitialHistoryRefresh else { return false }
+        didRequestInitialHistoryRefresh = true
+        return true
+    }
+
+    func loadHistoryOnAppear() {
+        guard shouldAutoRefreshHistoryOnAppear() else { return }
+        loadHistory()
     }
 
     func loadHistory(currentProjectOnly: Bool = false) {

@@ -69,6 +69,9 @@ thread。AgentDeck 只做轻量索引、回放和管理入口；Codex 持久化�
 第一版管理动作保持低风险：刷新、搜索、重命名和归档。AgentDeck 不读取、
 保存或转发 Codex token。
 
+应用窗口打开时会自动刷新一次历史列表；之后可以通过左侧 History 面板的刷新
+按钮手动重新扫描。
+
 ## 构建
 
 前置：Rust（`cargo`）、Swift 6 / Xcode（macOS 14+）、`codex` CLI 已
