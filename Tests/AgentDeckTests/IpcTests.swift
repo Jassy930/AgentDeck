@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import Testing
 @testable import AgentDeck
 
@@ -83,5 +84,118 @@ struct BufferedLineReaderTests {
         pipe.fileHandleForWriting.write(Data("lo\":true}\n".utf8))
         try? pipe.fileHandleForWriting.close()
         #expect(reader.nextLine() == "{\"hello\":true}")
+    }
+}
+
+@Suite("Session render throttling")
+@MainActor
+struct SessionRenderThrottlingTests {
+    private func agentItem(
+        id: String,
+        lifecycle: String = "delta",
+        kind: String = "message",
+        text: String
+    ) -> IpcMessage {
+        IpcMessage(
+            kind: "agentItem",
+            id: nil,
+            payload: AnyCodable([
+                "id": id,
+                "lifecycle": lifecycle,
+                "kind": kind,
+                "text": text,
+            ])
+        )
+    }
+
+    @Test("streaming deltas are buffered until the render flush")
+    func deltasAreBufferedUntilRenderFlush() {
+        let model = SessionModel()
+
+        model.ingest(agentItem(id: "msg1", text: "Hel"))
+        model.ingest(agentItem(id: "msg1", text: "lo"))
+
+        #expect(model.items.isEmpty)
+
+        model.flushPendingAgentItems()
+
+        #expect(model.items.count == 1)
+        #expect(model.items[0].id == "msg1")
+        #expect(model.items[0].text == "Hello")
+    }
+
+    @Test("turn completion flushes buffered deltas before marking ready")
+    func turnCompleteFlushesBufferedDeltas() {
+        let model = SessionModel()
+        model.phase = .running
+
+        model.ingest(agentItem(id: "msg1", text: "final"))
+        model.ingest(IpcMessage(kind: "turnComplete", id: nil, payload: nil))
+
+        #expect(model.phase == .ready)
+        #expect(model.items.count == 1)
+        #expect(model.items[0].text == "final")
+    }
+}
+
+@Suite("Streaming TextKit renderer")
+@MainActor
+struct StreamingTextKitRendererTests {
+    @Test("growing text appends only the new suffix")
+    func growingTextAppendsSuffix() {
+        let storage = NSTextStorage(string: "")
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13),
+            .foregroundColor: NSColor.labelColor,
+        ]
+
+        let first = StreamingTextStorageSynchronizer.sync(
+            storage,
+            to: "Hel",
+            attributes: attrs
+        )
+        let second = StreamingTextStorageSynchronizer.sync(
+            storage,
+            to: "Hello",
+            attributes: attrs
+        )
+
+        #expect(first == .appended(characterCount: 3))
+        #expect(second == .appended(characterCount: 2))
+        #expect(storage.string == "Hello")
+    }
+
+    @Test("non-prefix text replaces the storage")
+    func nonPrefixTextReplacesStorage() {
+        let storage = NSTextStorage(string: "Hello")
+        let result = StreamingTextStorageSynchronizer.sync(
+            storage,
+            to: "Reset",
+            attributes: [.font: NSFont.systemFont(ofSize: 13)]
+        )
+
+        #expect(result == .replaced)
+        #expect(storage.string == "Reset")
+    }
+
+    @Test("streaming buffer notifies incremental appends")
+    func streamingBufferNotifiesIncrementalAppends() {
+        let buffer = StreamingTextBuffer()
+        var changes: [StreamingTextBufferChange] = []
+        let token = buffer.observe { changes.append($0) }
+
+        buffer.append("Hel")
+        buffer.append("lo")
+        buffer.replace(with: "Reset")
+        buffer.removeObserver(token)
+        buffer.append(" ignored")
+
+        #expect(buffer.text == "Reset ignored")
+        #expect(changes == [
+            .replace(""),
+            .append("Hel"),
+            .append("lo"),
+            .replace("Reset"),
+        ])
     }
 }

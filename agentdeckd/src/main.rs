@@ -116,11 +116,10 @@ fn run_session(
     // deltas into one (the old A2 behavior) destroyed the stream — the whole
     // reply appeared in one jarring burst (the bad feel the user reported).
     //
-    // Backpressure is now the SwiftUI render layer's job: SwiftUI naturally
-    // batches state updates per frame, which is the right place to throttle
-    // for a native app. The daemon's job is to forward faithfully, not to
-    // buffer. (Design doc A2 is downgraded accordingly: daemon-side merge →
-    // render-layer throttling.)
+    // Backpressure is now the SwiftUI render layer's job: SessionModel
+    // buffers agentItem deltas and flushes them at frame-ish cadence. The
+    // daemon's job is to forward faithfully, not to buffer. (Design doc A2 is
+    // downgraded accordingly: daemon-side merge → render-layer throttling.)
     //
     // The callback can't use `?`, so it stashes the first write error into
     // `write_err`; surfaced after the turn. `stdout`/`write_err` are

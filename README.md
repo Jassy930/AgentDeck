@@ -49,6 +49,11 @@ codex app-server  (子进程, JSON-RPC over stdio)
 中立边界的物理位置 = IPC 协议本身。可验证事实：IPC schema 里不出现
 任何 Codex 字样。
 
+流式性能边界：daemon 不合并 Codex delta，而是忠实转发中立
+`agentItem`；Swift 端的 `SessionModel` 按约 30fps 合并待渲染 delta，并把
+message / reasoning / shell / diff 长文本交给 AppKit `NSTextView` +
+`NSTextStorage` 增量追加，避免 SwiftUI `Text` 在 token 流中反复测量整段文本。
+
 ## 构建
 
 前置：Rust（`cargo`）、Swift 6 / Xcode（macOS 14+）、`codex` CLI 已

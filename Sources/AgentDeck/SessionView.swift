@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import UniformTypeIdentifiers
 
 // Beat 1 — the only user-perceivable wow in v0.1.
@@ -137,9 +138,12 @@ struct SessionView: View {
                 Text("Codex")
                     .font(.system(.caption, weight: .medium))
                     .foregroundStyle(.tertiary)
-                Text(item.text)
-                    .font(.system(.body))
-                    .textSelection(.enabled)
+                StreamingTextView(
+                    buffer: item.textBuffer,
+                    font: .systemFont(ofSize: NSFont.systemFontSize),
+                    textColor: .labelColor
+                )
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .padding(.vertical, 10)
         case "reasoning":
@@ -153,8 +157,8 @@ struct SessionView: View {
             // populated — verified Step 4 UX debug). An empty "Reasoning"
             // disclosure is pure noise, so skip it: better to show nothing
             // than a disclosure that opens to a blank panel.
-            if !item.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                ReasoningRow(text: item.text, model: model)
+            if item.hasNonWhitespaceText {
+                ReasoningRow(buffer: item.textBuffer, model: model)
             }
         case "shell":
             // PRIMARY layer, but the command + exit code stay resident
@@ -166,11 +170,13 @@ struct SessionView: View {
                     .font(.system(.callout, design: .monospaced))
                 if !item.output.isEmpty {
                     DisclosureGroup {
-                        Text(item.output)
-                            .font(.system(.callout, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                            .padding(.top, 4)
+                        StreamingTextView(
+                            buffer: item.outputBuffer,
+                            font: .monospacedSystemFont(ofSize: 13, weight: .regular),
+                            textColor: .secondaryLabelColor
+                        )
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, 4)
                     } label: {
                         Text(outputLabel(item.output))
                             .font(.system(.caption, design: .monospaced))
@@ -191,10 +197,13 @@ struct SessionView: View {
                 if !item.diff.isEmpty {
                     // Diffs can be large too — same collapse treatment.
                     DisclosureGroup {
-                        Text(item.diff)
-                            .font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled)
-                            .padding(.top, 4)
+                        StreamingTextView(
+                            buffer: item.diffBuffer,
+                            font: .monospacedSystemFont(ofSize: 12, weight: .regular),
+                            textColor: .labelColor
+                        )
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, 4)
                     } label: {
                         Text(outputLabel(item.diff, noun: "diff"))
                             .font(.system(.caption, design: .monospaced))
@@ -249,7 +258,7 @@ struct SessionView: View {
     /// decide whether to expand (don't make them open it just to find out
     /// it's two lines).
     private struct ReasoningRow: View {
-        let text: String
+        let buffer: StreamingTextBuffer
         /// Observes the model so phase changes (.running → .ready) trigger
         /// this row's body. A snapshot `autoExpand: Bool` would freeze in
         /// SwiftUI's elision and miss the collapse signal.
@@ -259,11 +268,13 @@ struct SessionView: View {
         var body: some View {
             let auto = model.shouldShowReasoningExpanded
             DisclosureGroup(isExpanded: $expanded) {
-                Text(text)
-                    .font(.system(.callout))
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .padding(.top, 4)
+                StreamingTextView(
+                    buffer: buffer,
+                    font: .systemFont(ofSize: NSFont.systemFontSize(for: .small)),
+                    textColor: .secondaryLabelColor
+                )
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 4)
             } label: {
                 Text("Reasoning")
                     .font(.system(.callout))

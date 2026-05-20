@@ -18,7 +18,8 @@
 //!
 //! Step 2 scope: initialize → thread/start → turn/start → translate the first
 //! reasoning (`agentMessage`) item to a neutral AgentItem. Shell / file-edit
-//! / approval / backpressure-coalescing land in Step 3+.
+//! / approval land in Step 3+. Render backpressure is handled by the Swift UI
+//! layer so the daemon can forward Codex deltas faithfully.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
@@ -407,8 +408,8 @@ fn translate(method: &str, params: &Value) -> Option<AgentItem> {
         }
         "item/commandExecution/outputDelta" => {
             // Streaming shell output. base64-encoded chunk; we surface it as
-            // a Shell delta carrying the decoded chunk in `output`. The
-            // coalescer (below) merges consecutive deltas of the same item.
+            // a Shell delta carrying the decoded chunk in `output`. The Swift
+            // render layer batches consecutive deltas before invalidating UI.
             let id = params.get("itemId").and_then(Value::as_str)?.to_string();
             let chunk = params
                 .get("deltaBase64")

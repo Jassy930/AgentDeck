@@ -17,6 +17,10 @@ struct UIItem: Identifiable {
     var path: String = ""          // fileEdit
     var diff: String = ""          // fileEdit
     var descriptionText: String = "" // raw (neutralized unknown)
+    var hasNonWhitespaceText = false
+    var textBuffer = StreamingTextBuffer()
+    var outputBuffer = StreamingTextBuffer()
+    var diffBuffer = StreamingTextBuffer()
 }
 
 /// The session view model. `@MainActor` + `@Observable`: every mutation is
@@ -72,6 +76,10 @@ final class SessionModel {
 
     private let client = DaemonClient()
     private var daemonStarted = false
+    private var itemIndexById: [String: Int] = [:]
+    private var pendingAgentItems: [[String: Any]] = []
+    private var renderFlushTimer: Timer?
+    private let renderFlushInterval: TimeInterval = 1.0 / 30.0
 
     /// Elapsed seconds in the current turn (nil outside a turn). Driven by
     /// `tickNow` so SwiftUI re-renders every second.
@@ -153,8 +161,10 @@ final class SessionModel {
             }
         }
 
-        items.append(UIItem(id: "user-\(UUID().uuidString)",
-                             lifecycle: "completed", kind: "user", text: trimmed))
+        let userItem = UIItem(id: "user-\(UUID().uuidString)",
+                              lifecycle: "completed", kind: "user", text: trimmed)
+        itemIndexById[userItem.id] = items.count
+        items.append(userItem)
         errorMessage = nil
         phase = .starting
 
@@ -162,29 +172,36 @@ final class SessionModel {
             // Decode ON the main actor (the line crossed threads as a plain
             // String — Sendable). No non-Sendable value ever raced.
             guard let self else { return }
-            let msg = (try? JSONDecoder().decode(
-                IpcMessage.self, from: Data(raw.utf8)))
-                ?? IpcMessage(kind: "error", id: nil,
-                    payload: AnyCodable(["message": "malformed reply"]))
-            self.handle(msg)
+            self.ingest(rawLine: raw)
         }
     }
 
-    private func handle(_ msg: IpcMessage) {
+    func ingest(rawLine raw: String) {
+        let msg = (try? JSONDecoder().decode(
+            IpcMessage.self, from: Data(raw.utf8)))
+            ?? IpcMessage(kind: "error", id: nil,
+                payload: AnyCodable(["message": "malformed reply"]))
+        ingest(msg)
+    }
+
+    func ingest(_ msg: IpcMessage) {
         switch msg.kind {
+        case "agentItem":
+            if let dict = msg.payload?.value as? [String: Any] {
+                enqueueAgentItem(dict)
+            }
         case "sessionState":
+            flushPendingAgentItems()
             if let s = (msg.payload?.value as? [String: Any])?["state"] as? String,
                let p = Phase(rawValue: s) {
                 phase = p
             }
-        case "agentItem":
-            if let dict = msg.payload?.value as? [String: Any] {
-                upsert(dict)
-            }
         case "turnComplete":
+            flushPendingAgentItems()
             phase = .ready
             drainQueueIfPossible()
         case "error":
+            flushPendingAgentItems()
             let m = (msg.payload?.value as? [String: Any])?["message"] as? String
             errorMessage = m ?? "unknown error"
             phase = .failed
@@ -193,9 +210,33 @@ final class SessionModel {
         }
     }
 
+    private func enqueueAgentItem(_ item: [String: Any]) {
+        pendingAgentItems.append(item)
+        guard renderFlushTimer == nil else { return }
+        renderFlushTimer = Timer.scheduledTimer(
+            withTimeInterval: renderFlushInterval,
+            repeats: false
+        ) { [weak self] _ in
+            Task { @MainActor in self?.flushPendingAgentItems() }
+        }
+    }
+
+    /// Applies all pending stream deltas in one SwiftUI-observable mutation
+    /// window. This keeps the daemon faithful while preventing token-rate UI
+    /// invalidation from fighting ScrollView interaction.
+    func flushPendingAgentItems() {
+        renderFlushTimer?.invalidate()
+        renderFlushTimer = nil
+        guard !pendingAgentItems.isEmpty else { return }
+        let pending = pendingAgentItems
+        pendingAgentItems.removeAll(keepingCapacity: true)
+        for item in pending {
+            upsert(item)
+        }
+    }
+
     /// Merge a streamed item by id: started creates, delta appends, completed
-    /// finalizes. The daemon already coalesced deltas (Eng A2), so this stays
-    /// simple.
+    /// finalizes. Delta rate is throttled by `flushPendingAgentItems`.
     private func upsert(_ d: [String: Any]) {
         guard let id = d["id"] as? String,
               let kind = d["kind"] as? String,
@@ -209,8 +250,9 @@ final class SessionModel {
         // out of the UI data model entirely.
         if kind == "raw" { return }
 
-        var item = items.first(where: { $0.id == id })
-            ?? UIItem(id: id, lifecycle: life, kind: kind)
+        var item = itemIndexById[id].flatMap { idx in
+            items.indices.contains(idx) ? items[idx] : nil
+        } ?? UIItem(id: id, lifecycle: life, kind: kind)
         item.lifecycle = life
         item.kind = kind
         switch kind {
@@ -224,28 +266,42 @@ final class SessionModel {
             // Empty incoming → keep the accumulated text.
             let t = d["text"] as? String ?? ""
             if life == "delta" {
-                item.text = item.text + t
+                item.text.append(contentsOf: t)
+                item.textBuffer.append(t)
+                item.hasNonWhitespaceText = item.hasNonWhitespaceText || containsNonWhitespace(t)
             } else if !t.isEmpty {
                 item.text = t
+                item.textBuffer.replace(with: t)
+                item.hasNonWhitespaceText = containsNonWhitespace(t)
             }
         case "shell":
             item.command = d["command"] as? String ?? item.command
             if let o = d["output"] as? String {
-                item.output = (life == "delta") ? item.output + o : o
+                if life == "delta" {
+                    item.output.append(contentsOf: o)
+                    item.outputBuffer.append(o)
+                } else {
+                    item.output = o
+                    item.outputBuffer.replace(with: o)
+                }
             }
             item.exitCode = d["exitCode"] as? Int ?? item.exitCode
         case "fileEdit":
             item.path = d["path"] as? String ?? item.path
-            item.diff = d["diff"] as? String ?? item.diff
+            if let diff = d["diff"] as? String {
+                item.diff = diff
+                item.diffBuffer.replace(with: diff)
+            }
         case "raw":
             item.descriptionText = d["description"] as? String ?? ""
         default:
             break
         }
 
-        if let idx = items.firstIndex(where: { $0.id == id }) {
+        if let idx = itemIndexById[id], items.indices.contains(idx) {
             items[idx] = item
         } else {
+            itemIndexById[item.id] = items.count
             items.append(item)
         }
     }
@@ -256,7 +312,17 @@ final class SessionModel {
         submit(next)
     }
 
+    private func containsNonWhitespace(_ text: String) -> Bool {
+        text.unicodeScalars.contains { scalar in
+            !CharacterSet.whitespacesAndNewlines.contains(scalar)
+        }
+    }
+
     func teardown() {
+        flushPendingAgentItems()
+        renderFlushTimer?.invalidate()
+        tickTimer?.invalidate()
         client.shutdown()
     }
+
 }
