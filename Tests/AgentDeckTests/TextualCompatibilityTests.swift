@@ -69,4 +69,59 @@ struct TextualCompatibilityTests {
         #expect(turns[1].user?.id == "u2")
         #expect(turns[1].assistantItems.map(\.id) == ["m3"])
     }
+
+    @Test("conversation turn navigation items summarize user turns")
+    func conversationTurnNavigationItemsSummarizeUserTurns() {
+        let longPrompt = "  first line\n\nsecond line with    extra spaces and enough text to be truncated after the summary limit keeps the rail compact  "
+        let turns = makeConversationTurns(from: [
+            UIItem(id: "intro", lifecycle: "completed", kind: "message", text: "orphan assistant"),
+            UIItem(
+                id: "u1",
+                lifecycle: "completed",
+                kind: "user",
+                text: longPrompt,
+                attachments: [
+                    HistoryReference(kind: "file", text: nil, url: nil, path: "/tmp/a.swift", name: "a.swift"),
+                    HistoryReference(kind: "url", text: nil, url: "https://example.com", path: nil, name: nil),
+                ]
+            ),
+            UIItem(id: "m1", lifecycle: "completed", kind: "message", text: "answer"),
+            UIItem(id: "u2", lifecycle: "completed", kind: "user", text: "continue"),
+        ])
+
+        let items = makeConversationTurnNavigationItems(from: turns, summaryLimit: 40)
+
+        #expect(items.map(\.turnId) == ["u1", "u2"])
+        #expect(items.map(\.index) == [1, 2])
+        #expect(items[0].summary == "first line second line with extra spa...")
+        #expect(items[0].attachmentCount == 2)
+        #expect(items[1].summary == "continue")
+        #expect(items[1].attachmentCount == 0)
+    }
+
+    @Test("turn jump rail can be constructed")
+    @MainActor
+    func turnJumpRailCanBeConstructed() {
+        let item = ConversationTurnNavigationItem(
+            turnId: "u1",
+            index: 1,
+            summary: "find docs",
+            attachmentCount: 0
+        )
+
+        _ = TurnJumpRail(
+            items: [],
+            selectedTurnId: nil,
+            onJump: { _ in },
+            onJumpLatest: {},
+            onWheelStep: { _ in }
+        )
+        _ = TurnJumpRail(
+            items: [item],
+            selectedTurnId: item.turnId,
+            onJump: { _ in },
+            onJumpLatest: {},
+            onWheelStep: { _ in }
+        )
+    }
 }

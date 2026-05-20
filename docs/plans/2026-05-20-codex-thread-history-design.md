@@ -82,6 +82,8 @@ Rust 侧在 `codex.rs` 中新增 Codex app-server 方法，在 `ipc.rs` 中定�
 - Thread 详情复用现有单列 stream 样式，不做聊天气泡化。
 - Thread 详情每次应用新的历史内容时必须刷新右侧会话视口 identity，让滚动容器
   从顶部显示，不能复用上一个 thread 的滚动偏移。
+- Thread 详情右侧显示竖排轮次 rail：每个用户消息一枚小点，hover 展示摘要，
+  点击跳转到该轮；最底部固定“最新”点，点击跳到会话底部，rail 区域滚轮按轮次跳转。
 - 长 output / diff 保持折叠；未展开前不创建大 TextKit storage。
 - 已恢复的 thread 在输入框附近显示“继续历史会话”的短状态。
 

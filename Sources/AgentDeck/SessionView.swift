@@ -24,6 +24,7 @@ struct SessionView: View {
     @State private var renameThread: HistoryThreadSummary?
     @State private var renameText = ""
     @State private var hoveredHistoryThreadId: String?
+    @State private var selectedConversationTurnId: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -302,8 +303,10 @@ struct SessionView: View {
         if let image = historyThreadAgentImage(named: presentation.agentSourceImageName) {
             Image(nsImage: image)
                 .resizable()
+                .renderingMode(.template)
                 .scaledToFit()
                 .frame(width: 14, height: 14)
+                .foregroundStyle(historyThreadAgentIconColor(presentation))
                 .help(presentation.agentSourceLabel)
                 .accessibilityHidden(true)
         } else {
@@ -320,7 +323,7 @@ struct SessionView: View {
         let resource: (subdirectory: String, filename: String)
         switch name {
         case "CodexIcon":
-            resource = ("Assets.xcassets/CodexIcon.imageset", "codex-color")
+            resource = ("Assets.xcassets/CodexIcon.imageset", "codex")
         case "UnknownAgentIcon":
             resource = ("Assets.xcassets/UnknownAgentIcon.imageset", "unknown-agent")
         default:
@@ -337,29 +340,107 @@ struct SessionView: View {
         return NSImage(contentsOf: url)
     }
 
+    private func historyThreadAgentIconColor(_ presentation: HistoryThreadRowPresentation) -> Color {
+        presentation.isEmphasized ? .accentColor : Color(nsColor: .secondaryLabelColor)
+    }
+
     // MARK: D3/D7 — single-column stream, NON-CARD
 
+    private let conversationLatestAnchorId = "conversation-latest-anchor"
+
     private var conversationStream: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                let turns = makeConversationTurns(from: model.items)
-                ForEach(Array(turns.enumerated()), id: \.element.id) { index, turn in
-                    conversationTurn(turn)
-                    if index + 1 < turns.count {
-                        Divider().opacity(0.4)  // D7: subtle divider, not card
+        let turns = makeConversationTurns(from: model.items)
+        let navigationItems = makeConversationTurnNavigationItems(from: turns)
+
+        return ScrollViewReader { proxy in
+            ZStack(alignment: .trailing) {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(Array(turns.enumerated()), id: \.element.id) { index, turn in
+                            conversationTurn(turn)
+                                .id(turn.id)
+                            if index + 1 < turns.count {
+                                Divider().opacity(0.4)  // D7: subtle divider, not card
+                            }
+                        }
+                        if let err = model.errorMessage {
+                            errorRow(err)               // premise 9: visible failure
+                        }
+                        if let warning = model.warningMessage {
+                            warningRow(warning)
+                        }
+                        Color.clear
+                            .frame(height: 1)
+                            .id(conversationLatestAnchorId)
                     }
+                    .padding(.leading, 20)
+                    .padding(.trailing, navigationItems.isEmpty ? 20 : 52)
+                    .padding(.vertical, 12)
                 }
-                if let err = model.errorMessage {
-                    errorRow(err)               // premise 9: visible failure
-                }
-                if let warning = model.warningMessage {
-                    warningRow(warning)
+
+                if !navigationItems.isEmpty {
+                    TurnJumpRail(
+                        items: navigationItems,
+                        selectedTurnId: selectedConversationTurnId,
+                        onJump: { turnId in
+                            selectedConversationTurnId = turnId
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                proxy.scrollTo(turnId, anchor: .top)
+                            }
+                        },
+                        onJumpLatest: {
+                            selectedConversationTurnId = nil
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                proxy.scrollTo(conversationLatestAnchorId, anchor: .bottom)
+                            }
+                        },
+                        onWheelStep: { direction in
+                            scrollConversationRailStep(direction, items: navigationItems, proxy: proxy)
+                        }
+                    )
+                    .padding(.trailing, 8)
+                    .padding(.vertical, 12)
                 }
             }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 12)
+            .id(model.conversationViewportIdentity)
+            .onChange(of: model.conversationViewportIdentity) {
+                selectedConversationTurnId = navigationItems.first?.turnId
+            }
         }
-        .id(model.conversationViewportIdentity)
+    }
+
+    private func scrollConversationRailStep(
+        _ direction: Int,
+        items: [ConversationTurnNavigationItem],
+        proxy: ScrollViewProxy
+    ) {
+        guard !items.isEmpty else {
+            selectedConversationTurnId = nil
+            withAnimation(.easeInOut(duration: 0.18)) {
+                proxy.scrollTo(conversationLatestAnchorId, anchor: .bottom)
+            }
+            return
+        }
+
+        let selectedIndex = selectedConversationTurnId.flatMap { selected in
+            items.firstIndex { $0.turnId == selected }
+        }
+        let baseIndex = selectedIndex ?? (direction > 0 ? -1 : items.count)
+        let nextIndex = min(max(baseIndex + direction, 0), items.count)
+
+        if nextIndex == items.count {
+            selectedConversationTurnId = nil
+            withAnimation(.easeInOut(duration: 0.18)) {
+                proxy.scrollTo(conversationLatestAnchorId, anchor: .bottom)
+            }
+            return
+        }
+
+        let turnId = items[nextIndex].turnId
+        selectedConversationTurnId = turnId
+        withAnimation(.easeInOut(duration: 0.18)) {
+            proxy.scrollTo(turnId, anchor: .top)
+        }
     }
 
     @ViewBuilder
@@ -919,5 +1000,102 @@ struct SessionView: View {
                 model.errorMessage = err
             }
         }
+    }
+}
+
+struct TurnJumpRail: View {
+    let items: [ConversationTurnNavigationItem]
+    let selectedTurnId: String?
+    let onJump: (String) -> Void
+    let onJumpLatest: () -> Void
+    let onWheelStep: (Int) -> Void
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Spacer(minLength: 10)
+            ForEach(items) { item in
+                Button {
+                    onJump(item.turnId)
+                } label: {
+                    Circle()
+                        .fill(item.turnId == selectedTurnId ? Color.accentColor : Color(nsColor: .tertiaryLabelColor))
+                        .frame(
+                            width: item.turnId == selectedTurnId ? 8 : 6,
+                            height: item.turnId == selectedTurnId ? 8 : 6
+                        )
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(turnHelp(item))
+                .accessibilityLabel("Jump to turn \(item.index), \(item.summary)")
+            }
+            Spacer(minLength: 8)
+            Button {
+                onJumpLatest()
+            } label: {
+                Image(systemName: "arrow.down.to.line.compact")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .frame(width: 16, height: 16)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("跳到最新")
+            .accessibilityLabel("Jump to latest message")
+            Spacer(minLength: 10)
+        }
+        .frame(width: 28)
+        .frame(maxHeight: .infinity)
+        .background {
+            ZStack {
+                RailWheelCaptureView(onStep: onWheelStep)
+                Capsule()
+                    .fill(Color(nsColor: .controlBackgroundColor).opacity(0.72))
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+
+    private func turnHelp(_ item: ConversationTurnNavigationItem) -> String {
+        var parts = ["第 \(item.index) 轮", item.summary]
+        if item.attachmentCount > 0 {
+            parts.append("\(item.attachmentCount) 个附件")
+        }
+        return parts.joined(separator: "\n")
+    }
+}
+
+private struct RailWheelCaptureView: NSViewRepresentable {
+    let onStep: (Int) -> Void
+
+    func makeNSView(context: Context) -> WheelCaptureNSView {
+        WheelCaptureNSView(onStep: onStep)
+    }
+
+    func updateNSView(_ nsView: WheelCaptureNSView, context: Context) {
+        nsView.onStep = onStep
+    }
+}
+
+private final class WheelCaptureNSView: NSView {
+    var onStep: (Int) -> Void
+    private var lastStepAt = Date.distantPast
+
+    init(onStep: @escaping (Int) -> Void) {
+        self.onStep = onStep
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        let now = Date()
+        guard now.timeIntervalSince(lastStepAt) >= 0.12 else { return }
+        let delta = event.scrollingDeltaY
+        guard abs(delta) >= 0.1 else { return }
+        lastStepAt = now
+        onStep(delta < 0 ? 1 : -1)
     }
 }

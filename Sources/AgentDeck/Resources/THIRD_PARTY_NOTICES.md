@@ -2,8 +2,16 @@
 
 ## Codex icon
 
-- Source: LobeHub Icons `codex-color.svg`
-- URL: https://raw.githubusercontent.com/lobehub/lobe-icons/refs/heads/master/packages/static-svg/icons/codex-color.svg
+- Source: LobeHub Icons `codex.svg`
+- Package: `@lobehub/icons-static-svg`
+- URL: https://unpkg.com/@lobehub/icons-static-svg@1.90.0/icons/codex.svg
 - License: MIT
 - Project: https://github.com/lobehub/lobe-icons
-- Local change: removed the white rounded-square background so the icon fits dark sidebar rows.
+
+## Claude Code icon
+
+- Source: LobeHub Icons `claudecode.svg`
+- Package: `@lobehub/icons-static-svg`
+- URL: https://unpkg.com/@lobehub/icons-static-svg@1.90.0/icons/claudecode.svg
+- License: MIT
+- Project: https://github.com/lobehub/lobe-icons
