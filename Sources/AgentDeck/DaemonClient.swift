@@ -7,6 +7,7 @@ enum DaemonError: Error, CustomStringConvertible {
     case spawnFailed(String)
     case disconnected
     case malformedReply(String)
+    case duplicateRequestId(UInt64)
 
     var description: String {
         switch self {
@@ -14,6 +15,7 @@ enum DaemonError: Error, CustomStringConvertible {
         case .spawnFailed(let m): return "failed to spawn agentdeckd: \(m)"
         case .disconnected: return "agentdeckd disconnected (EOF on its stdout)"
         case .malformedReply(let s): return "malformed reply from agentdeckd: \(s)"
+        case .duplicateRequestId(let id): return "duplicate pending request id: \(id)"
         }
     }
 }
@@ -135,10 +137,15 @@ final class DaemonMessageRouter: @unchecked Sendable {
         }
     }
 
-    func registerPending(id: UInt64) {
+    @discardableResult
+    func registerPending(id: UInt64) -> Bool {
         condition.lock()
+        defer { condition.unlock() }
+        guard !pendingReplyIds.contains(id) else {
+            return false
+        }
         pendingReplyIds.insert(id)
-        condition.unlock()
+        return true
     }
 
     func route(_ message: IpcMessage, rawLine: String? = nil) {
@@ -427,7 +434,9 @@ final class DaemonClient {
         let enc = JSONEncoder()
         var data = try enc.encode(msg)
         data.append(0x0A) // newline-delimited JSON (D7-confirmed framing)
-        router.registerPending(id: id)
+        guard router.registerPending(id: id) else {
+            throw DaemonError.duplicateRequestId(id)
+        }
         write(data)
 
         guard let reply = router.waitForReply(id: id) else {

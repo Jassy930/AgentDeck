@@ -63,7 +63,7 @@ struct DaemonMessageRoutingTests {
         var events: [IpcMessage] = []
         router.onSessionEvent = { events.append($0) }
 
-        router.registerPending(id: 31)
+        #expect(router.registerPending(id: 31))
         router.route(IpcMessage(kind: "session/event", sessionId: "s1", payload: AnyCodable([
             "event": ["kind": "agentItem"]
         ])))
@@ -91,6 +91,47 @@ struct DaemonMessageRoutingTests {
         #expect(legacy.kind == "turnComplete")
         #expect(legacy.sessionId == nil)
         #expect(legacy.payload?.value as? [String: Bool] == ["ok": true])
+    }
+
+    @Test("routes agent item and error session events as legacy stream events")
+    func routesAgentItemAndErrorSessionEventsAsLegacyStreamEvents() throws {
+        let router = DaemonMessageRouter()
+        var rawLines: [String] = []
+        router.onStreamLine = { rawLines.append($0) }
+
+        router.route(IpcMessage(kind: "session/event", sessionId: "s1", payload: AnyCodable([
+            "event": [
+                "kind": "agentItem",
+                "id": "item1",
+                "text": "hello"
+            ]
+        ])))
+        router.route(IpcMessage(kind: "session/event", sessionId: "s1", payload: AnyCodable([
+            "event": [
+                "kind": "error",
+                "payload": ["message": "boom"]
+            ]
+        ])))
+
+        let agentItem = try JSONDecoder().decode(IpcMessage.self, from: Data(try #require(rawLines.first).utf8))
+        let error = try JSONDecoder().decode(IpcMessage.self, from: Data(try #require(rawLines.last).utf8))
+        #expect(rawLines.count == 2)
+        #expect(agentItem.kind == "agentItem")
+        #expect((agentItem.payload?.value as? [String: Any])?["id"] as? String == "item1")
+        #expect((agentItem.payload?.value as? [String: Any])?["text"] as? String == "hello")
+        #expect(error.kind == "error")
+        #expect((error.payload?.value as? [String: Any])?["message"] as? String == "boom")
+    }
+
+    @Test("rejects duplicate pending ids before a reply is routed")
+    func rejectsDuplicatePendingIdsBeforeReplyIsRouted() {
+        let router = DaemonMessageRouter()
+
+        #expect(router.registerPending(id: 42))
+        #expect(!router.registerPending(id: 42))
+        router.route(IpcMessage(kind: "pong", id: 42, payload: nil))
+
+        #expect(router.takeReply(id: 42)?.kind == "pong")
     }
 
     @Test("preserves explicit ids but can generate ids for reused static factory ids")
