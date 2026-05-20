@@ -733,6 +733,57 @@ struct SessionRenderThrottlingTests {
 @Suite("Workbench runtime model")
 @MainActor
 struct WorkbenchRuntimeModelTests {
+    @Test("agent item reducer merges message shell file edit and raw items")
+    func agentItemReducerMergesCoreItemKinds() {
+        var store = AgentItemStore()
+
+        AgentItemReducer.upsert([
+            "id": "msg1",
+            "lifecycle": "delta",
+            "kind": "message",
+            "text": "Hel",
+        ], into: &store)
+        AgentItemReducer.upsert([
+            "id": "msg1",
+            "lifecycle": "delta",
+            "kind": "message",
+            "text": "lo",
+        ], into: &store)
+        AgentItemReducer.upsert([
+            "id": "shell1",
+            "lifecycle": "delta",
+            "kind": "shell",
+            "output": "one\n",
+        ], into: &store)
+        AgentItemReducer.upsert([
+            "id": "shell1",
+            "lifecycle": "delta",
+            "kind": "shell",
+            "output": "two\n",
+        ], into: &store)
+        AgentItemReducer.upsert([
+            "id": "file1",
+            "lifecycle": "completed",
+            "kind": "fileEdit",
+            "path": "a.txt",
+            "diff": "+a",
+        ], into: &store)
+        AgentItemReducer.upsert([
+            "id": "raw1",
+            "lifecycle": "completed",
+            "kind": "raw",
+            "description": "unsupported item type: futureThing",
+        ], into: &store)
+
+        #expect(store.items.count == 4)
+        #expect(store.items[0].text == "Hello")
+        #expect(store.items[1].output == "one\ntwo\n")
+        #expect(store.items[2].path == "a.txt")
+        #expect(store.items[2].diff == "+a")
+        #expect(store.items[3].kind == "raw")
+        #expect(store.items[3].descriptionText == "unsupported item type: futureThing")
+    }
+
     @Test("submitting to running runtime queues only that runtime")
     func submittingToRunningRuntimeQueuesOnlyThatRuntime() {
         let workbench = WorkbenchModel()
