@@ -4,7 +4,7 @@
 
 **Goal:** 在右侧历史/当前会话流增加竖排轮次导航点，支持 hover 摘要、点击跳转、跳到最新和 rail 上滚轮按轮跳转。
 
-**Architecture:** 复用现有 `ConversationTurn` 分组作为导航数据源，新增纯 Swift presentation model 生成跳转项。`SessionView` 用 `ScrollViewReader` 包住会话流，为每个 turn 和底部 sentinel 设置稳定 id，并 overlay 一个轻量 `TurnJumpRail` 负责 hover、点击和滚轮事件。
+**Architecture:** 复用现有 `ConversationTurn` 分组作为导航数据源，新增纯 Swift presentation model 生成跳转项。`SessionView` 用 `ScrollViewReader` 包住会话流，为每个 turn 和底部 sentinel 设置稳定 id，并 overlay 一个无背板的轻量 `TurnJumpRail`。Rail 的视觉层只画固定间距、居中排列的点位和 hover 浮层，并用累计位移模拟 Dock 式整体拉伸；透明 AppKit 交互层统一负责 hover、点击和滚轮事件。点位溢出时 rail 跟随当前轮次自动揭示点位，但不单独消费滚轮，跳转边界不循环。
 
 **Tech Stack:** Swift 6、SwiftUI、AppKit `NSViewRepresentable` 捕获 rail 区域滚轮事件、Swift Testing。
 
@@ -68,6 +68,14 @@ withAnimation(.easeInOut(duration: 0.18)) {
 }
 ```
 
+**Step 3: Add submit-to-latest request**
+
+`SessionModel.submit(_:)` 在用户消息成功追加到 `items` 后递增 `scrollToLatestRequest`。
+`SessionView` 在 `ScrollViewReader` 内监听该请求，下一轮主线程滚到 `conversationLatestAnchorId`。
+这只处理用户主动发送后的定位，不用 `conversationViewportIdentity` 重建会话视图。
+
+测试：`submitting a user prompt requests scroll to latest`。
+
 ### Task 3: TurnJumpRail 视图
 
 **Files:**
@@ -90,7 +98,7 @@ Expected: FAIL，因为 `TurnJumpRail` 不存在。
 
 在 `SessionView.swift` 内新增私有/内部 SwiftUI view：
 - 竖排点位。
-- hover 使用 `.popover` 或 `.help`；第一版优先 `.help`，稳定且不打断阅读。
+- hover 使用自绘浮层，避免系统 `.help` 在小命中区上触发不稳定。
 - 普通点 button 调用 `onJump(item.turnId)`。
 - 最新点 button 调用 `onJumpLatest()`。
 - 支持空列表时只显示最新点。
@@ -108,7 +116,7 @@ Expected: PASS。
 
 **Step 1: Add wheel capture view**
 
-新增 `RailWheelCaptureView: NSViewRepresentable`，嵌入透明 AppKit view，覆盖 rail 可交互区域。
+新增透明 `RailInteractionView: NSViewRepresentable`，覆盖 rail 可交互区域，同时处理 hover、点击和滚轮。
 
 **Step 2: Implement wheel routing**
 

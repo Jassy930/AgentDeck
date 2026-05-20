@@ -410,6 +410,28 @@ final class DaemonClient {
     }
 }
 
+protocol SessionClienting: HistoryDetailReading {
+    func start() throws
+    func listHistoryThreads(
+        cwd: String?,
+        searchTerm: String?,
+        cursor: String?,
+        limit: Int?
+    ) throws -> HistoryThreadListPayload
+    func startSession(
+        cwd: String,
+        prompt: String,
+        onLine: @escaping @MainActor (String) -> Void
+    )
+    func startTurn(
+        threadId: String,
+        prompt: String,
+        onLine: @escaping @MainActor (String) -> Void
+    )
+    func archiveHistoryThread(threadId: String) throws
+    func renameHistoryThread(threadId: String, name: String) throws
+}
+
 protocol HistoryDetailReading: AnyObject, Sendable {
     func readHistoryThread(threadId: String) throws -> HistoryThreadDetail
     func shutdown()
@@ -421,6 +443,7 @@ extension HistoryDetailReading {
 
 extension DaemonClient: @unchecked Sendable {}
 extension DaemonClient: HistoryDetailReading {}
+extension DaemonClient: SessionClienting {}
 
 final class DaemonHistoryDetailReader: HistoryDetailReading, @unchecked Sendable {
     private let client = DaemonClient()

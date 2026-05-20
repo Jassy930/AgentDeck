@@ -406,6 +406,14 @@ struct SessionView: View {
             .onChange(of: model.conversationViewportIdentity) {
                 selectedConversationTurnId = navigationItems.first?.turnId
             }
+            .onChange(of: model.scrollToLatestRequest) {
+                selectedConversationTurnId = nil
+                DispatchQueue.main.async {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        proxy.scrollTo(conversationLatestAnchorId, anchor: .bottom)
+                    }
+                }
+            }
         }
     }
 
@@ -422,24 +430,28 @@ struct SessionView: View {
             return
         }
 
-        let selectedIndex = selectedConversationTurnId.flatMap { selected in
+        let currentIndex = selectedConversationTurnId.flatMap { selected in
             items.firstIndex { $0.turnId == selected }
         }
-        let baseIndex = selectedIndex ?? (direction > 0 ? -1 : items.count)
-        let nextIndex = min(max(baseIndex + direction, 0), items.count)
 
-        if nextIndex == items.count {
+        switch TurnJumpRailLayout.stepTarget(
+            selectedIndex: currentIndex,
+            direction: direction,
+            count: items.count
+        ) {
+        case .latest:
             selectedConversationTurnId = nil
             withAnimation(.easeInOut(duration: 0.18)) {
                 proxy.scrollTo(conversationLatestAnchorId, anchor: .bottom)
             }
-            return
-        }
-
-        let turnId = items[nextIndex].turnId
-        selectedConversationTurnId = turnId
-        withAnimation(.easeInOut(duration: 0.18)) {
-            proxy.scrollTo(turnId, anchor: .top)
+        case .turn(let nextIndex):
+            let turnId = items[nextIndex].turnId
+            selectedConversationTurnId = turnId
+            withAnimation(.easeInOut(duration: 0.18)) {
+                proxy.scrollTo(turnId, anchor: .top)
+            }
+        case nil:
+            break
         }
     }
 
@@ -1009,85 +1021,387 @@ struct TurnJumpRail: View {
     let onJump: (String) -> Void
     let onJumpLatest: () -> Void
     let onWheelStep: (Int) -> Void
+    @State private var hoveredTarget: TurnJumpRailHitTarget?
+    @State private var railScrollOffset: CGFloat = 0
 
     var body: some View {
-        VStack(spacing: 8) {
-            Spacer(minLength: 10)
-            ForEach(items) { item in
-                Button {
-                    onJump(item.turnId)
-                } label: {
-                    Circle()
-                        .fill(item.turnId == selectedTurnId ? Color.accentColor : Color(nsColor: .tertiaryLabelColor))
-                        .frame(
-                            width: item.turnId == selectedTurnId ? 8 : 6,
-                            height: item.turnId == selectedTurnId ? 8 : 6
-                        )
-                        .contentShape(Rectangle())
+        GeometryReader { geometry in
+            ZStack(alignment: .topLeading) {
+                ZStack(alignment: .topLeading) {
+                    ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                        Circle()
+                            .fill(item.turnId == selectedTurnId ? Color.accentColor : Color(nsColor: .tertiaryLabelColor))
+                            .frame(
+                                width: dotSize(for: index),
+                                height: dotSize(for: index)
+                            )
+                            .position(
+                                x: TurnJumpRailLayout.centerX,
+                                y: TurnJumpRailLayout.visualTurnY(
+                                    index: index,
+                                    count: items.count,
+                                    height: geometry.size.height,
+                                    scrollOffset: railScrollOffset,
+                                    hoveredIndex: hoveredTurnIndex
+                                )
+                            )
+                            .accessibilityLabel("Jump to turn \(item.index), \(item.summary)")
+                    }
                 }
-                .buttonStyle(.plain)
-                .help(turnHelp(item))
-                .accessibilityLabel("Jump to turn \(item.index), \(item.summary)")
-            }
-            Spacer(minLength: 8)
-            Button {
-                onJumpLatest()
-            } label: {
+                .frame(width: TurnJumpRailLayout.width, height: geometry.size.height)
+                .clipped()
+
                 Image(systemName: "arrow.down.to.line.compact")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(Color.accentColor)
-                    .frame(width: 16, height: 16)
-                    .contentShape(Rectangle())
+                    .font(.system(size: latestSize(), weight: .semibold))
+                    .foregroundStyle(selectedTurnId == nil ? Color.accentColor : Color(nsColor: .secondaryLabelColor))
+                    .frame(width: 22, height: 22)
+                    .position(
+                        x: TurnJumpRailLayout.centerX,
+                        y: TurnJumpRailLayout.latestY(height: geometry.size.height)
+                    )
+                    .accessibilityLabel("Jump to latest message")
+
+                if let tooltip = tooltipText(for: hoveredTarget) {
+                    Text(tooltip)
+                        .font(.system(.caption))
+                        .foregroundStyle(.primary)
+                        .lineLimit(4)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(width: 190, alignment: .leading)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background {
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(Color(nsColor: .windowBackgroundColor))
+                                .shadow(color: Color.black.opacity(0.18), radius: 8, x: 0, y: 3)
+                        }
+                        .position(
+                            x: -98,
+                            y: tooltipY(for: hoveredTarget, height: geometry.size.height)
+                        )
+                        .allowsHitTesting(false)
+                }
+
+                RailInteractionView(
+                    itemCount: items.count,
+                    railScrollOffset: railScrollOffset,
+                    onHoverTarget: { hoveredTarget = $0 },
+                    onClickTarget: { target in
+                        switch target {
+                        case .turn(let index):
+                            guard items.indices.contains(index) else { return }
+                            onJump(items[index].turnId)
+                        case .latest:
+                            onJumpLatest()
+                        }
+                    },
+                    onWheelStep: { direction in
+                        onWheelStep(direction)
+                    }
+                )
+                .frame(width: TurnJumpRailLayout.width, height: geometry.size.height)
             }
-            .buttonStyle(.plain)
-            .help("跳到最新")
-            .accessibilityLabel("Jump to latest message")
-            Spacer(minLength: 10)
+            .onChange(of: items.count) {
+                revealSelectedTurn(height: geometry.size.height)
+            }
+            .onChange(of: selectedTurnId) {
+                revealSelectedTurn(height: geometry.size.height)
+            }
         }
         .frame(width: 28)
         .frame(maxHeight: .infinity)
-        .background {
-            ZStack {
-                RailWheelCaptureView(onStep: onWheelStep)
-                Capsule()
-                    .fill(Color(nsColor: .controlBackgroundColor).opacity(0.72))
-                    .allowsHitTesting(false)
+        .animation(.spring(response: 0.18, dampingFraction: 0.68), value: hoveredTarget)
+        .animation(.easeInOut(duration: 0.12), value: railScrollOffset)
+    }
+
+    private var hoveredTurnIndex: Int? {
+        guard case .turn(let index) = hoveredTarget else { return nil }
+        return index
+    }
+
+    private func revealSelectedTurn(height: CGFloat) {
+        guard let selectedIndex = selectedTurnId.flatMap({ selected in
+            items.firstIndex { $0.turnId == selected }
+        }) else {
+            railScrollOffset = TurnJumpRailLayout.clampedScrollOffset(
+                railScrollOffset,
+                count: items.count,
+                height: height
+            )
+            return
+        }
+        railScrollOffset = TurnJumpRailLayout.scrollOffsetToReveal(
+            index: selectedIndex,
+            count: items.count,
+            height: height,
+            currentOffset: railScrollOffset
+        )
+    }
+
+    private func dotSize(for index: Int) -> CGFloat {
+        let selectedSize: CGFloat = items[index].turnId == selectedTurnId ? 8 : 6
+        guard case .turn(let hoveredIndex) = hoveredTarget else { return selectedSize }
+        if hoveredIndex == index { return 15 }
+        if abs(hoveredIndex - index) == 1 { return 10 }
+        return selectedSize
+    }
+
+    private func latestSize() -> CGFloat {
+        hoveredTarget == .latest ? 14 : 10
+    }
+
+    private func tooltipText(for target: TurnJumpRailHitTarget?) -> String? {
+        guard let target else { return nil }
+        switch target {
+        case .turn(let index):
+            guard items.indices.contains(index) else { return nil }
+            let item = items[index]
+            var parts = ["第 \(item.index) 轮", item.summary]
+            if item.attachmentCount > 0 {
+                parts.append("\(item.attachmentCount) 个附件")
             }
+            return parts.joined(separator: "\n")
+        case .latest:
+            return "跳到最新"
         }
     }
 
-    private func turnHelp(_ item: ConversationTurnNavigationItem) -> String {
-        var parts = ["第 \(item.index) 轮", item.summary]
-        if item.attachmentCount > 0 {
-            parts.append("\(item.attachmentCount) 个附件")
+    private func tooltipY(for target: TurnJumpRailHitTarget?, height: CGFloat) -> CGFloat {
+        guard let target else { return 0 }
+        switch target {
+        case .turn(let index):
+            return TurnJumpRailLayout.visualTurnY(
+                index: index,
+                count: items.count,
+                height: height,
+                scrollOffset: railScrollOffset,
+                hoveredIndex: hoveredTurnIndex
+            )
+        case .latest:
+            return TurnJumpRailLayout.latestY(height: height)
         }
-        return parts.joined(separator: "\n")
     }
 }
 
-private struct RailWheelCaptureView: NSViewRepresentable {
-    let onStep: (Int) -> Void
+enum TurnJumpRailHitTarget: Equatable {
+    case turn(Int)
+    case latest
+}
 
-    func makeNSView(context: Context) -> WheelCaptureNSView {
-        WheelCaptureNSView(onStep: onStep)
+struct TurnJumpRailLayout {
+    static let width: CGFloat = 28
+    static let centerX: CGFloat = 14
+    static let turnSpacing: CGFloat = 18
+    private static let topPadding: CGFloat = 14
+    private static let latestBottomPadding: CGFloat = 18
+    private static let latestGap: CGFloat = 32
+    private static let hitRadius: CGFloat = 12
+
+    static func turnY(
+        index: Int,
+        count: Int,
+        height: CGFloat,
+        scrollOffset: CGFloat = 0
+    ) -> CGFloat {
+        firstTurnY(count: count, height: height) + CGFloat(index) * turnSpacing - scrollOffset
     }
 
-    func updateNSView(_ nsView: WheelCaptureNSView, context: Context) {
-        nsView.onStep = onStep
+    static func visualTurnY(
+        index: Int,
+        count: Int,
+        height: CGFloat,
+        scrollOffset: CGFloat = 0,
+        hoveredIndex: Int? = nil
+    ) -> CGFloat {
+        let baseY = turnY(index: index, count: count, height: height, scrollOffset: scrollOffset)
+        guard let hoveredIndex else { return baseY }
+        let distance = index - hoveredIndex
+        guard distance != 0 else { return baseY }
+        return baseY + (distance > 0 ? 1 : -1) * cumulativeDockExpansion(stepsFromHover: abs(distance))
+    }
+
+    private static func cumulativeDockExpansion(stepsFromHover: Int) -> CGFloat {
+        guard stepsFromHover > 0 else { return 0 }
+        let perGapExpansion: [CGFloat] = [7, 3, 1.5]
+        return (0..<stepsFromHover).reduce(CGFloat(0)) { total, step in
+            total + (step < perGapExpansion.count ? perGapExpansion[step] : perGapExpansion.last ?? 0)
+        }
+    }
+
+    static func firstTurnY(count: Int, height: CGFloat) -> CGFloat {
+        guard count > 0 else { return height / 2 }
+        let latest = latestY(height: height)
+        let availableTop = topPadding
+        let availableBottom = max(availableTop, latest - latestGap)
+        let contentHeight = CGFloat(max(0, count - 1)) * turnSpacing
+        let centeredStart = (height - contentHeight) / 2
+        return min(max(centeredStart, availableTop), availableBottom)
+    }
+
+    static func latestY(height: CGFloat) -> CGFloat {
+        max(topPadding + latestGap, height - latestBottomPadding)
+    }
+
+    static func maxScrollOffset(count: Int, height: CGFloat) -> CGFloat {
+        guard count > 0 else { return 0 }
+        let latest = latestY(height: height)
+        let availableBottom = max(topPadding, latest - latestGap)
+        let lastYWithoutScroll = turnY(index: count - 1, count: count, height: height, scrollOffset: 0)
+        return max(0, lastYWithoutScroll - availableBottom)
+    }
+
+    static func clampedScrollOffset(_ offset: CGFloat, count: Int, height: CGFloat) -> CGFloat {
+        min(max(0, offset), maxScrollOffset(count: count, height: height))
+    }
+
+    static func scrollOffsetToReveal(
+        index: Int,
+        count: Int,
+        height: CGFloat,
+        currentOffset: CGFloat
+    ) -> CGFloat {
+        let currentY = turnY(index: index, count: count, height: height, scrollOffset: currentOffset)
+        let visibleTop = topPadding
+        let visibleBottom = max(visibleTop, latestY(height: height) - latestGap)
+        if currentY < visibleTop {
+            return clampedScrollOffset(
+                currentOffset - (visibleTop - currentY),
+                count: count,
+                height: height
+            )
+        }
+        if currentY > visibleBottom {
+            return clampedScrollOffset(
+                currentOffset + (currentY - visibleBottom),
+                count: count,
+                height: height
+            )
+        }
+        return clampedScrollOffset(currentOffset, count: count, height: height)
+    }
+
+    static func stepTarget(
+        selectedIndex: Int?,
+        direction: Int,
+        count: Int
+    ) -> TurnJumpRailHitTarget? {
+        guard count > 0 else { return nil }
+        if direction > 0 {
+            guard let selectedIndex else { return nil }
+            if selectedIndex >= count - 1 { return .latest }
+            return .turn(selectedIndex + 1)
+        }
+        if direction < 0 {
+            guard let selectedIndex else { return .turn(count - 1) }
+            if selectedIndex <= 0 { return .turn(0) }
+            return .turn(selectedIndex - 1)
+        }
+        return nil
+    }
+
+    static func hitTarget(
+        at point: CGPoint,
+        count: Int,
+        height: CGFloat,
+        scrollOffset: CGFloat = 0
+    ) -> TurnJumpRailHitTarget? {
+        guard point.x >= 0, point.x <= width else { return nil }
+        if abs(point.y - latestY(height: height)) <= hitRadius {
+            return .latest
+        }
+
+        guard count > 0 else { return nil }
+        let hits = (0..<count).map { index in
+            (index: index, distance: abs(point.y - turnY(
+                index: index,
+                count: count,
+                height: height,
+                scrollOffset: scrollOffset
+            )))
+        }
+        guard let nearest = hits.min(by: { $0.distance < $1.distance }),
+              nearest.distance <= hitRadius else {
+            return nil
+        }
+        return .turn(nearest.index)
     }
 }
 
-private final class WheelCaptureNSView: NSView {
-    var onStep: (Int) -> Void
+private struct RailInteractionView: NSViewRepresentable {
+    let itemCount: Int
+    let railScrollOffset: CGFloat
+    let onHoverTarget: (TurnJumpRailHitTarget?) -> Void
+    let onClickTarget: (TurnJumpRailHitTarget) -> Void
+    let onWheelStep: (Int) -> Void
+
+    func makeNSView(context: Context) -> RailInteractionNSView {
+        RailInteractionNSView(
+            itemCount: itemCount,
+            railScrollOffset: railScrollOffset,
+            onHoverTarget: onHoverTarget,
+            onClickTarget: onClickTarget,
+            onWheelStep: onWheelStep
+        )
+    }
+
+    func updateNSView(_ nsView: RailInteractionNSView, context: Context) {
+        nsView.itemCount = itemCount
+        nsView.railScrollOffset = railScrollOffset
+        nsView.onHoverTarget = onHoverTarget
+        nsView.onClickTarget = onClickTarget
+        nsView.onWheelStep = onWheelStep
+    }
+}
+
+private final class RailInteractionNSView: NSView {
+    var itemCount: Int
+    var railScrollOffset: CGFloat
+    var onHoverTarget: (TurnJumpRailHitTarget?) -> Void
+    var onClickTarget: (TurnJumpRailHitTarget) -> Void
+    var onWheelStep: (Int) -> Void
     private var lastStepAt = Date.distantPast
 
-    init(onStep: @escaping (Int) -> Void) {
-        self.onStep = onStep
+    init(
+        itemCount: Int,
+        railScrollOffset: CGFloat,
+        onHoverTarget: @escaping (TurnJumpRailHitTarget?) -> Void,
+        onClickTarget: @escaping (TurnJumpRailHitTarget) -> Void,
+        onWheelStep: @escaping (Int) -> Void
+    ) {
+        self.itemCount = itemCount
+        self.railScrollOffset = railScrollOffset
+        self.onHoverTarget = onHoverTarget
+        self.onClickTarget = onClickTarget
+        self.onWheelStep = onWheelStep
         super.init(frame: .zero)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
     }
 
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
+    required init?(coder: NSCoder) { nil }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.activeInKeyWindow, .mouseMoved, .mouseEnteredAndExited, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        ))
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        onHoverTarget(hitTarget(for: event))
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        onHoverTarget(nil)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let target = hitTarget(for: event) else { return }
+        onClickTarget(target)
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -1096,6 +1410,17 @@ private final class WheelCaptureNSView: NSView {
         let delta = event.scrollingDeltaY
         guard abs(delta) >= 0.1 else { return }
         lastStepAt = now
-        onStep(delta < 0 ? 1 : -1)
+        onWheelStep(delta < 0 ? 1 : -1)
+    }
+
+    private func hitTarget(for event: NSEvent) -> TurnJumpRailHitTarget? {
+        let local = convert(event.locationInWindow, from: nil)
+        let topOriginPoint = CGPoint(x: local.x, y: bounds.height - local.y)
+        return TurnJumpRailLayout.hitTarget(
+            at: topOriginPoint,
+            count: itemCount,
+            height: bounds.height,
+            scrollOffset: railScrollOffset
+        )
     }
 }

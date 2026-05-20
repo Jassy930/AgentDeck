@@ -180,6 +180,27 @@ struct SessionRenderThrottlingTests {
         #expect(model.phase == .running)
     }
 
+    @Test("submitting a user prompt requests scroll to latest")
+    func submittingUserPromptRequestsScrollToLatest() throws {
+        let client = RecordingSessionClient()
+        let model = SessionModel(
+            client: client,
+            historyDetailClient: NoopHistoryDetailClient()
+        )
+        let cwd = URL(fileURLWithPath: NSTemporaryDirectory())
+        let initialRequest = model.scrollToLatestRequest
+
+        #expect(model.chooseCwd(cwd) == nil)
+
+        model.submit("  hello  ")
+
+        #expect(model.items.count == 1)
+        #expect(model.items[0].kind == "user")
+        #expect(model.items[0].text == "hello")
+        #expect(model.scrollToLatestRequest != initialRequest)
+        #expect(client.startedSessionPrompt == "hello")
+    }
+
     @Test("loading history groups threads without clearing current stream")
     func loadingHistoryDoesNotClearCurrentStream() {
         let model = SessionModel()
@@ -479,6 +500,58 @@ final class BlockingHistoryDetailClient: HistoryDetailReading, @unchecked Sendab
         semaphore.wait()
         return detail
     }
+}
+
+final class NoopHistoryDetailClient: HistoryDetailReading, @unchecked Sendable {
+    func readHistoryThread(threadId: String) throws -> HistoryThreadDetail {
+        throw DaemonError.malformedReply("not implemented in test")
+    }
+}
+
+final class RecordingSessionClient: SessionClienting, @unchecked Sendable {
+    var didStart = false
+    var startedSessionPrompt: String?
+    var startedSessionCwd: String?
+    var startedTurnPrompt: String?
+    var startedTurnThreadId: String?
+
+    func start() throws {
+        didStart = true
+    }
+
+    func listHistoryThreads(
+        cwd: String?,
+        searchTerm: String?,
+        cursor: String?,
+        limit: Int?
+    ) throws -> HistoryThreadListPayload {
+        HistoryThreadListPayload(threads: [], nextCursor: nil)
+    }
+
+    func startSession(
+        cwd: String,
+        prompt: String,
+        onLine: @escaping @MainActor (String) -> Void
+    ) {
+        startedSessionCwd = cwd
+        startedSessionPrompt = prompt
+    }
+
+    func startTurn(
+        threadId: String,
+        prompt: String,
+        onLine: @escaping @MainActor (String) -> Void
+    ) {
+        startedTurnThreadId = threadId
+        startedTurnPrompt = prompt
+    }
+
+    func archiveHistoryThread(threadId: String) throws {}
+    func renameHistoryThread(threadId: String, name: String) throws {}
+    func readHistoryThread(threadId: String) throws -> HistoryThreadDetail {
+        throw DaemonError.malformedReply("not implemented in test")
+    }
+    func shutdown() {}
 }
 
 @Suite("History model")

@@ -1,5 +1,6 @@
 import Testing
 import Textual
+import CoreGraphics
 @testable import AgentDeck
 
 @Suite("Textual compatibility")
@@ -123,5 +124,92 @@ struct TextualCompatibilityTests {
             onJumpLatest: {},
             onWheelStep: { _ in }
         )
+    }
+
+    @Test("turn jump rail hit testing covers full rail positions")
+    func turnJumpRailHitTestingCoversFullRailPositions() {
+        let height: CGFloat = 200
+        let firstY = TurnJumpRailLayout.turnY(index: 0, count: 3, height: height)
+        let middleY = TurnJumpRailLayout.turnY(index: 1, count: 3, height: height)
+        let latestY = TurnJumpRailLayout.latestY(height: height)
+
+        #expect(TurnJumpRailLayout.hitTarget(at: CGPoint(x: 14, y: firstY), count: 3, height: height) == .turn(0))
+        #expect(TurnJumpRailLayout.hitTarget(at: CGPoint(x: 14, y: middleY + 9), count: 3, height: height) == .turn(1))
+        #expect(TurnJumpRailLayout.hitTarget(at: CGPoint(x: 14, y: latestY), count: 3, height: height) == .latest)
+        #expect(TurnJumpRailLayout.hitTarget(at: CGPoint(x: 14, y: height - 40), count: 3, height: height) == nil)
+    }
+
+    @Test("turn jump rail keeps fixed spacing centered when it fits")
+    func turnJumpRailKeepsFixedSpacingCenteredWhenItFits() {
+        let height: CGFloat = 240
+        let firstY = TurnJumpRailLayout.turnY(index: 0, count: 3, height: height, scrollOffset: 0)
+        let secondY = TurnJumpRailLayout.turnY(index: 1, count: 3, height: height, scrollOffset: 0)
+        let thirdY = TurnJumpRailLayout.turnY(index: 2, count: 3, height: height, scrollOffset: 0)
+
+        #expect(secondY - firstY == TurnJumpRailLayout.turnSpacing)
+        #expect(thirdY - secondY == TurnJumpRailLayout.turnSpacing)
+        #expect(secondY == height / 2)
+    }
+
+    @Test("turn jump rail content scrolls only when fixed spacing overflows")
+    func turnJumpRailContentScrollsOnlyWhenFixedSpacingOverflows() {
+        let height: CGFloat = 120
+        let maxOffset = TurnJumpRailLayout.maxScrollOffset(count: 8, height: height)
+        let clamped = TurnJumpRailLayout.clampedScrollOffset(10_000, count: 8, height: height)
+        let noOverflow = TurnJumpRailLayout.maxScrollOffset(count: 3, height: 240)
+
+        #expect(maxOffset > 0)
+        #expect(clamped == maxOffset)
+        #expect(noOverflow == 0)
+    }
+
+    @Test("turn jump rail reveals selected dots without consuming wheel steps")
+    func turnJumpRailRevealsSelectedDotsWithoutConsumingWheelSteps() {
+        let height: CGFloat = 120
+        let offset = TurnJumpRailLayout.scrollOffsetToReveal(index: 7, count: 8, height: height, currentOffset: 0)
+        let revealedY = TurnJumpRailLayout.turnY(index: 7, count: 8, height: height, scrollOffset: offset)
+
+        #expect(offset == TurnJumpRailLayout.maxScrollOffset(count: 8, height: height))
+        #expect(revealedY <= TurnJumpRailLayout.latestY(height: height) - 32)
+    }
+
+    @Test("turn jump rail dock magnification pushes neighboring dots away")
+    func turnJumpRailDockMagnificationPushesNeighboringDotsAway() {
+        let height: CGFloat = 240
+        let basePrevious = TurnJumpRailLayout.turnY(index: 0, count: 3, height: height)
+        let baseHovered = TurnJumpRailLayout.turnY(index: 1, count: 3, height: height)
+        let baseNext = TurnJumpRailLayout.turnY(index: 2, count: 3, height: height)
+
+        let previous = TurnJumpRailLayout.visualTurnY(index: 0, count: 3, height: height, hoveredIndex: 1)
+        let hovered = TurnJumpRailLayout.visualTurnY(index: 1, count: 3, height: height, hoveredIndex: 1)
+        let next = TurnJumpRailLayout.visualTurnY(index: 2, count: 3, height: height, hoveredIndex: 1)
+
+        #expect(previous < basePrevious)
+        #expect(hovered == baseHovered)
+        #expect(next > baseNext)
+        #expect(next - previous > baseNext - basePrevious)
+    }
+
+    @Test("turn jump rail dock magnification expands the whole visible rail")
+    func turnJumpRailDockMagnificationExpandsTheWholeVisibleRail() {
+        let height: CGFloat = 320
+        let count = 7
+        let baseFirst = TurnJumpRailLayout.turnY(index: 0, count: count, height: height)
+        let baseLast = TurnJumpRailLayout.turnY(index: count - 1, count: count, height: height)
+        let visualFirst = TurnJumpRailLayout.visualTurnY(index: 0, count: count, height: height, hoveredIndex: 3)
+        let visualLast = TurnJumpRailLayout.visualTurnY(index: count - 1, count: count, height: height, hoveredIndex: 3)
+
+        #expect(visualFirst < baseFirst)
+        #expect(visualLast > baseLast)
+        #expect(visualLast - visualFirst > baseLast - baseFirst)
+    }
+
+    @Test("turn jump rail step target clamps at edges")
+    func turnJumpRailStepTargetClampsAtEdges() {
+        #expect(TurnJumpRailLayout.stepTarget(selectedIndex: nil, direction: 1, count: 3) == nil)
+        #expect(TurnJumpRailLayout.stepTarget(selectedIndex: nil, direction: -1, count: 3) == .turn(2))
+        #expect(TurnJumpRailLayout.stepTarget(selectedIndex: 0, direction: -1, count: 3) == .turn(0))
+        #expect(TurnJumpRailLayout.stepTarget(selectedIndex: 2, direction: 1, count: 3) == .latest)
+        #expect(TurnJumpRailLayout.stepTarget(selectedIndex: 1, direction: 1, count: 3) == .turn(2))
     }
 }

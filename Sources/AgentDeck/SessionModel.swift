@@ -129,13 +129,14 @@ final class SessionModel {
     var historySearchTerm = ""
     var selectedHistoryThreadId: String?
     var conversationViewportIdentity = "live:0"
+    var scrollToLatestRequest = 0
     private var didRequestInitialHistoryRefresh = false
 
     var historyGroups: [HistoryProjectGroup] {
         HistoryProjectGroup.group(historyThreads)
     }
 
-    private let client: DaemonClient
+    private let client: SessionClienting
     private let historyDetailClient: HistoryDetailReading
     private var daemonStarted = false
     private var itemIndexById: [String: Int] = [:]
@@ -150,7 +151,7 @@ final class SessionModel {
         case diff
     }
 
-    init(client: DaemonClient = DaemonClient(), historyDetailClient: HistoryDetailReading? = nil) {
+    init(client: SessionClienting = DaemonClient(), historyDetailClient: HistoryDetailReading? = nil) {
         self.client = client
         self.historyDetailClient = historyDetailClient ?? DaemonHistoryDetailReader()
     }
@@ -237,6 +238,7 @@ final class SessionModel {
                               lifecycle: "completed", kind: "user", text: trimmed)
         itemIndexById[userItem.id] = items.count
         items.append(userItem)
+        scrollToLatestRequest += 1
         errorMessage = nil
         warningMessage = nil
         phase = .starting
@@ -292,7 +294,9 @@ final class SessionModel {
         do {
             let list = try client.listHistoryThreads(
                 cwd: cwdFilter,
-                searchTerm: search.isEmpty ? nil : search
+                searchTerm: search.isEmpty ? nil : search,
+                cursor: nil,
+                limit: 50
             )
             setHistoryThreads(list.threads)
         } catch {
