@@ -143,6 +143,130 @@ final class DaemonClient {
         }
     }
 
+    static func historyListRequest(
+        id: UInt64,
+        cwd: String?,
+        searchTerm: String?,
+        cursor: String? = nil,
+        limit: Int? = nil
+    ) -> IpcMessage {
+        var payload: [String: Any] = [:]
+        if let cwd { payload["cwd"] = cwd }
+        if let searchTerm { payload["searchTerm"] = searchTerm }
+        if let cursor { payload["cursor"] = cursor }
+        if let limit { payload["limit"] = limit }
+        return IpcMessage(
+            kind: "history/listThreads",
+            id: id,
+            payload: payload.isEmpty ? nil : AnyCodable(payload)
+        )
+    }
+
+    func listHistoryThreads(
+        cwd: String?,
+        searchTerm: String?,
+        cursor: String? = nil,
+        limit: Int? = 50
+    ) throws -> HistoryThreadListPayload {
+        if reader == nil {
+            try start()
+        }
+        let reply = try roundTrip(Self.historyListRequest(
+            id: 2,
+            cwd: cwd,
+            searchTerm: searchTerm,
+            cursor: cursor,
+            limit: limit
+        ))
+        guard reply.kind == "historyThreads", let payload = reply.payload?.value else {
+            if reply.kind == "error",
+               let dict = reply.payload?.value as? [String: Any],
+               let message = dict["message"] as? String {
+                throw DaemonError.malformedReply(message)
+            }
+            throw DaemonError.malformedReply("expected historyThreads, got \(reply.kind)")
+        }
+        let data = try JSONSerialization.data(withJSONObject: payload)
+        return try JSONDecoder().decode(HistoryThreadListPayload.self, from: data)
+    }
+
+    static func historyReadRequest(id: UInt64, threadId: String) -> IpcMessage {
+        IpcMessage(
+            kind: "history/readThread",
+            id: id,
+            payload: AnyCodable(["threadId": threadId])
+        )
+    }
+
+    func readHistoryThread(threadId: String) throws -> HistoryThreadDetail {
+        if reader == nil {
+            try start()
+        }
+        let reply = try roundTrip(Self.historyReadRequest(id: 3, threadId: threadId))
+        guard reply.kind == "historyThread", let payload = reply.payload?.value else {
+            if reply.kind == "error",
+               let dict = reply.payload?.value as? [String: Any],
+               let message = dict["message"] as? String {
+                throw DaemonError.malformedReply(message)
+            }
+            throw DaemonError.malformedReply("expected historyThread, got \(reply.kind)")
+        }
+        let data = try JSONSerialization.data(withJSONObject: payload)
+        return try JSONDecoder().decode(HistoryThreadDetail.self, from: data)
+    }
+
+    static func startTurnRequest(id: UInt64, threadId: String, prompt: String) -> IpcMessage {
+        IpcMessage(
+            kind: "startTurn",
+            id: id,
+            payload: AnyCodable(["threadId": threadId, "prompt": prompt])
+        )
+    }
+
+    static func archiveThreadRequest(id: UInt64, threadId: String) -> IpcMessage {
+        IpcMessage(kind: "history/archiveThread", id: id, payload: AnyCodable(["threadId": threadId]))
+    }
+
+    static func unarchiveThreadRequest(id: UInt64, threadId: String) -> IpcMessage {
+        IpcMessage(kind: "history/unarchiveThread", id: id, payload: AnyCodable(["threadId": threadId]))
+    }
+
+    static func renameThreadRequest(id: UInt64, threadId: String, name: String) -> IpcMessage {
+        IpcMessage(
+            kind: "history/renameThread",
+            id: id,
+            payload: AnyCodable(["threadId": threadId, "name": name])
+        )
+    }
+
+    func archiveHistoryThread(threadId: String) throws {
+        try manageHistoryThread(Self.archiveThreadRequest(id: 5, threadId: threadId))
+    }
+
+    func unarchiveHistoryThread(threadId: String) throws {
+        try manageHistoryThread(Self.unarchiveThreadRequest(id: 6, threadId: threadId))
+    }
+
+    func renameHistoryThread(threadId: String, name: String) throws {
+        try manageHistoryThread(Self.renameThreadRequest(id: 7, threadId: threadId, name: name))
+    }
+
+    private func manageHistoryThread(_ request: IpcMessage) throws {
+        if reader == nil {
+            try start()
+        }
+        let reply = try roundTrip(request)
+        if reply.kind == "historyThreadUpdated" {
+            return
+        }
+        if reply.kind == "error",
+           let dict = reply.payload?.value as? [String: Any],
+           let message = dict["message"] as? String {
+            throw DaemonError.malformedReply(message)
+        }
+        throw DaemonError.malformedReply("expected historyThreadUpdated, got \(reply.kind)")
+    }
+
     /// Start a streaming session. Sends `startSession {cwd, prompt}`, then
     /// reads neutral IPC messages on a BACKGROUND thread and delivers each
     /// one to `onMessage` ON THE MAIN THREAD.
@@ -180,6 +304,39 @@ final class DaemonClient {
         // reach back into DaemonClient (non-Sendable) — it owns nothing but
         // the line stream. This is the minimal-sharing fix, not a Sendable
         // bolt-on.
+        guard let reader else {
+            Task { @MainActor in
+                onLine(#"{"kind":"error","payload":{"message":"reader not initialized"}}"#)
+            }
+            return
+        }
+        Thread.detachNewThread {
+            while let raw = reader.nextLine() {
+                if raw.isEmpty { continue }
+                let terminal = raw.contains("\"turnComplete\"")
+                    || raw.contains("\"kind\":\"error\"")
+                DispatchQueue.main.async { onLine(raw) }
+                if terminal { break }
+            }
+        }
+    }
+
+    func startTurn(
+        threadId: String,
+        prompt: String,
+        onLine: @escaping @MainActor (String) -> Void
+    ) {
+        let msg = Self.startTurnRequest(id: 4, threadId: threadId, prompt: prompt)
+        guard let data = try? JSONEncoder().encode(msg) else {
+            Task { @MainActor in
+                onLine(#"{"kind":"error","payload":{"message":"failed to encode startTurn"}}"#)
+            }
+            return
+        }
+        var line = data
+        line.append(0x0A)
+        toDaemon.fileHandleForWriting.write(line)
+
         guard let reader else {
             Task { @MainActor in
                 onLine(#"{"kind":"error","payload":{"message":"reader not initialized"}}"#)

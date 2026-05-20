@@ -26,11 +26,168 @@ use std::io::{BufRead, Write};
 
 use ipc::{IpcMessage, SessionState};
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HistoryListParams {
+    cwd: Option<String>,
+    search_term: Option<String>,
+    cursor: Option<String>,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct StartTurnParams {
+    thread_id: String,
+    prompt: String,
+}
+
 fn write_msg(stdout: &mut impl Write, msg: &IpcMessage) -> std::io::Result<()> {
     let mut s = serde_json::to_string(msg)?;
     s.push('\n');
     stdout.write_all(s.as_bytes())?;
     stdout.flush()
+}
+
+fn history_list_params(payload: Option<&serde_json::Value>) -> HistoryListParams {
+    let Some(payload) = payload else {
+        return HistoryListParams::default();
+    };
+    HistoryListParams {
+        cwd: payload
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        search_term: payload
+            .get("searchTerm")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        cursor: payload
+            .get("cursor")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        limit: payload
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok()),
+    }
+}
+
+fn history_read_thread_id(payload: Option<&serde_json::Value>) -> Option<String> {
+    payload?
+        .get("threadId")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+fn start_turn_params(payload: Option<&serde_json::Value>) -> Option<StartTurnParams> {
+    let payload = payload?;
+    let thread_id = payload.get("threadId")?.as_str()?.to_string();
+    let prompt = payload.get("prompt")?.as_str()?.to_string();
+    if thread_id.is_empty() || prompt.is_empty() {
+        return None;
+    }
+    Some(StartTurnParams { thread_id, prompt })
+}
+
+fn run_history_list(
+    stdout: &mut impl Write,
+    id: Option<u64>,
+    params: HistoryListParams,
+) -> std::io::Result<()> {
+    let mut adapter = match codex::CodexAdapter::spawn() {
+        Ok(a) => a,
+        Err(e) => {
+            diag::log("history_list_spawn_failed", &e.to_string());
+            return write_msg(stdout, &IpcMessage::error(id, &e.to_string()));
+        }
+    };
+    if let Err(e) = adapter.initialize() {
+        diag::log("history_list_handshake_failed", &e.to_string());
+        return write_msg(stdout, &IpcMessage::error(id, &e.to_string()));
+    }
+    match adapter.thread_list(
+        params.cwd.as_deref(),
+        params.search_term.as_deref(),
+        params.cursor.as_deref(),
+        params.limit,
+    ) {
+        Ok(list) => write_msg(
+            stdout,
+            &IpcMessage {
+                kind: "historyThreads".into(),
+                id,
+                payload: Some(serde_json::to_value(list).expect("history list serializes")),
+            },
+        ),
+        Err(e) => {
+            diag::log("history_list_failed", &e.to_string());
+            write_msg(stdout, &IpcMessage::error(id, &e.to_string()))
+        }
+    }
+}
+
+fn run_history_read(
+    stdout: &mut impl Write,
+    id: Option<u64>,
+    thread_id: &str,
+) -> std::io::Result<()> {
+    let mut adapter = match codex::CodexAdapter::spawn() {
+        Ok(a) => a,
+        Err(e) => {
+            diag::log("history_read_spawn_failed", &e.to_string());
+            return write_msg(stdout, &IpcMessage::error(id, &e.to_string()));
+        }
+    };
+    if let Err(e) = adapter.initialize() {
+        diag::log("history_read_handshake_failed", &e.to_string());
+        return write_msg(stdout, &IpcMessage::error(id, &e.to_string()));
+    }
+    match adapter.thread_read(thread_id) {
+        Ok(detail) => write_msg(
+            stdout,
+            &IpcMessage {
+                kind: "historyThread".into(),
+                id,
+                payload: Some(serde_json::to_value(detail).expect("history detail serializes")),
+            },
+        ),
+        Err(e) => {
+            diag::log("history_read_failed", &e.to_string());
+            write_msg(stdout, &IpcMessage::error(id, &e.to_string()))
+        }
+    }
+}
+
+fn run_thread_management(
+    stdout: &mut impl Write,
+    id: Option<u64>,
+    action: &str,
+    thread_id: &str,
+    name: Option<&str>,
+) -> std::io::Result<()> {
+    let mut adapter = match codex::CodexAdapter::spawn() {
+        Ok(a) => a,
+        Err(e) => return write_msg(stdout, &IpcMessage::error(id, &e.to_string())),
+    };
+    if let Err(e) = adapter.initialize() {
+        return write_msg(stdout, &IpcMessage::error(id, &e.to_string()));
+    }
+    let result = match action {
+        "archive" => adapter.thread_archive(thread_id),
+        "unarchive" => adapter.thread_unarchive(thread_id),
+        "rename" => adapter.thread_set_name(thread_id, name.unwrap_or("")),
+        _ => Err(codex::CodexError::Protocol("unknown thread management action".into())),
+    };
+    match result {
+        Ok(()) => write_msg(
+            stdout,
+            &IpcMessage {
+                kind: "historyThreadUpdated".into(),
+                id,
+                payload: Some(serde_json::json!({ "threadId": thread_id })),
+            },
+        ),
+        Err(e) => write_msg(stdout, &IpcMessage::error(id, &e.to_string())),
+    }
 }
 
 /// Handle a `startSession` request: drive a full Codex turn, streaming
@@ -182,6 +339,103 @@ fn run_session(
     )
 }
 
+fn run_turn_on_existing_thread(
+    stdout: &mut impl Write,
+    id: Option<u64>,
+    thread_id: &str,
+    prompt: &str,
+) -> std::io::Result<()> {
+    let run_id = format!(
+        "run-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    diag::log("history_turn_start", &format!("run={run_id} thread={thread_id}"));
+    write_msg(stdout, &IpcMessage::session_state(SessionState::Starting))?;
+    record_or_warn(
+        stdout,
+        &run_id,
+        &format!(
+            r#"{{"event":"resume","threadId":{},"prompt":{}}}"#,
+            serde_json::to_string(thread_id).unwrap_or_else(|_| "\"\"".into()),
+            serde_json::to_string(prompt).unwrap_or_else(|_| "\"\"".into())
+        ),
+    )?;
+
+    let mut adapter = match codex::CodexAdapter::spawn() {
+        Ok(a) => a,
+        Err(e) => {
+            diag::log("history_turn_spawn_failed", &e.to_string());
+            write_msg(stdout, &IpcMessage::error(id, &e.to_string()))?;
+            return write_msg(stdout, &IpcMessage::session_state(SessionState::Failed));
+        }
+    };
+    if let Err(e) = adapter.initialize() {
+        diag::log("history_turn_handshake_failed", &e.to_string());
+        write_msg(stdout, &IpcMessage::error(id, &e.to_string()))?;
+        return write_msg(stdout, &IpcMessage::session_state(SessionState::Failed));
+    }
+    if let Err(e) = adapter.thread_resume(thread_id) {
+        diag::log("history_turn_resume_failed", &e.to_string());
+        write_msg(stdout, &IpcMessage::error(id, &e.to_string()))?;
+        return write_msg(stdout, &IpcMessage::session_state(SessionState::Failed));
+    }
+
+    write_msg(stdout, &IpcMessage::session_state(SessionState::Running))?;
+    let mut write_err: Option<std::io::Error> = None;
+    {
+        let stdout = &mut *stdout;
+        let run_id = &run_id;
+        let turn = adapter.turn_start(thread_id, prompt, |item| {
+            if write_err.is_some() {
+                return;
+            }
+            if let Err(e) = write_msg(stdout, &IpcMessage::agent_item(&item)) {
+                write_err = Some(e);
+                return;
+            }
+            if let Ok(j) = serde_json::to_string(&item)
+                && let Err(reason) = record::try_append(run_id, &j)
+            {
+                diag::log("record_failed", &reason);
+            }
+        });
+        if let Some(e) = write_err {
+            return Err(e);
+        }
+        match turn {
+            Ok(()) => {}
+            Err(e) => {
+                diag::log("history_turn_failed", &format!("run={run_id} {e}"));
+                record_or_warn(
+                    stdout,
+                    run_id,
+                    &format!(
+                        r#"{{"event":"failed","error":{}}}"#,
+                        serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "\"\"".into())
+                    ),
+                )?;
+                write_msg(stdout, &IpcMessage::error(id, &e.to_string()))?;
+                return write_msg(stdout, &IpcMessage::session_state(SessionState::Failed));
+            }
+        }
+    }
+
+    diag::log("history_turn_complete", &format!("run={run_id} thread={thread_id}"));
+    record_or_warn(stdout, &run_id, r#"{"event":"complete"}"#)?;
+    write_msg(stdout, &IpcMessage::session_state(SessionState::Ready))?;
+    write_msg(
+        stdout,
+        &IpcMessage {
+            kind: "turnComplete".into(),
+            id,
+            payload: None,
+        },
+    )
+}
+
 fn main() -> std::io::Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -210,6 +464,46 @@ fn main() -> std::io::Result<()> {
                 write_msg(&mut stdout, &IpcMessage::pong(msg.id))?;
                 break;
             }
+            "history/listThreads" => {
+                let params = history_list_params(msg.payload.as_ref());
+                run_history_list(&mut stdout, msg.id, params)?;
+            }
+            "history/readThread" => {
+                if let Some(thread_id) = history_read_thread_id(msg.payload.as_ref()) {
+                    run_history_read(&mut stdout, msg.id, &thread_id)?;
+                } else {
+                    write_msg(
+                        &mut stdout,
+                        &IpcMessage::error(msg.id, "history/readThread requires threadId"),
+                    )?;
+                }
+            }
+            "history/archiveThread" | "history/unarchiveThread" | "history/renameThread" => {
+                let thread_id = msg
+                    .payload
+                    .as_ref()
+                    .and_then(|p| p.get("threadId"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let name = msg
+                    .payload
+                    .as_ref()
+                    .and_then(|p| p.get("name"))
+                    .and_then(|v| v.as_str());
+                if thread_id.is_empty() || (msg.kind == "history/renameThread" && name.is_none()) {
+                    write_msg(
+                        &mut stdout,
+                        &IpcMessage::error(msg.id, "thread management requires threadId"),
+                    )?;
+                } else {
+                    let action = match msg.kind.as_str() {
+                        "history/archiveThread" => "archive",
+                        "history/unarchiveThread" => "unarchive",
+                        _ => "rename",
+                    };
+                    run_thread_management(&mut stdout, msg.id, action, thread_id, name)?;
+                }
+            }
             "startSession" => {
                 let cwd = msg
                     .payload
@@ -232,6 +526,21 @@ fn main() -> std::io::Result<()> {
                     run_session(&mut stdout, msg.id, cwd, prompt)?;
                 }
             }
+            "startTurn" => {
+                if let Some(params) = start_turn_params(msg.payload.as_ref()) {
+                    run_turn_on_existing_thread(
+                        &mut stdout,
+                        msg.id,
+                        &params.thread_id,
+                        &params.prompt,
+                    )?;
+                } else {
+                    write_msg(
+                        &mut stdout,
+                        &IpcMessage::error(msg.id, "startTurn requires threadId and prompt"),
+                    )?;
+                }
+            }
             other => write_msg(
                 &mut stdout,
                 &IpcMessage::error(msg.id, &format!("unknown kind: {other}")),
@@ -247,3 +556,33 @@ fn main() -> std::io::Result<()> {
 // Codex→neutral translation regression net in codex.rs. Dispatch behavior
 // (ping/pong/shutdown + startSession arg validation) is covered end-to-end
 // by the integration check below and in CI — no placeholder unit test here.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn history_list_params_reads_optional_filters() {
+        let p = json!({"cwd": "/tmp/project", "searchTerm": "fix", "cursor": "c2", "limit": 20});
+        let params = history_list_params(Some(&p));
+        assert_eq!(params.cwd.as_deref(), Some("/tmp/project"));
+        assert_eq!(params.search_term.as_deref(), Some("fix"));
+        assert_eq!(params.cursor.as_deref(), Some("c2"));
+        assert_eq!(params.limit, Some(20));
+    }
+
+    #[test]
+    fn history_read_thread_id_reads_required_id() {
+        let p = json!({"threadId": "thread_1"});
+        assert_eq!(history_read_thread_id(Some(&p)), Some("thread_1".to_string()));
+    }
+
+    #[test]
+    fn start_turn_params_reads_thread_and_prompt() {
+        let p = json!({"threadId": "thread_1", "prompt": "continue"});
+        let params = start_turn_params(Some(&p)).unwrap();
+        assert_eq!(params.thread_id, "thread_1");
+        assert_eq!(params.prompt, "continue");
+    }
+}

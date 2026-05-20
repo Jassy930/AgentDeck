@@ -27,7 +27,10 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use serde_json::{Value, json};
 
-use crate::ipc::{AgentItem, AgentItemKind, Lifecycle};
+use crate::ipc::{
+    AgentItem, AgentItemKind, HistoryThreadDetail, HistoryThreadList, HistoryThreadSummary,
+    Lifecycle,
+};
 
 #[derive(Debug)]
 pub enum CodexError {
@@ -201,6 +204,81 @@ impl CodexAdapter {
             .ok_or_else(|| CodexError::Protocol("thread/start: no thread.id in result".into()))
     }
 
+    /// List persisted historical threads through Codex app-server and map
+    /// them immediately into AgentDeck's neutral history shape.
+    pub fn thread_list(
+        &mut self,
+        cwd: Option<&str>,
+        search_term: Option<&str>,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<HistoryThreadList, CodexError> {
+        let mut params = serde_json::Map::new();
+        params.insert("archived".into(), Value::Bool(false));
+        if let Some(cwd) = cwd {
+            params.insert("cwd".into(), Value::String(cwd.to_string()));
+        }
+        if let Some(search_term) = search_term {
+            params.insert("searchTerm".into(), Value::String(search_term.to_string()));
+        }
+        if let Some(cursor) = cursor {
+            params.insert("cursor".into(), Value::String(cursor.to_string()));
+        }
+        if let Some(limit) = limit {
+            params.insert(
+                "limit".into(),
+                Value::Number(serde_json::Number::from(limit)),
+            );
+        }
+
+        let id = self.send_request("thread/list", Value::Object(params))?;
+        let result = self.await_response(id, |_, _| {})?;
+        thread_list_to_history(&result)
+    }
+
+    /// Read a persisted thread with its turns/items for replay in AgentDeck's
+    /// neutral stream.
+    pub fn thread_read(&mut self, thread_id: &str) -> Result<HistoryThreadDetail, CodexError> {
+        let id = self.send_request(
+            "thread/read",
+            json!({ "threadId": thread_id, "includeTurns": true }),
+        )?;
+        let result = self.await_response(id, |_, _| {})?;
+        thread_read_to_history_detail(&result)
+    }
+
+    /// Resume an existing persisted thread so the next turn uses its model-
+    /// visible history, not a newly-created thread.
+    pub fn thread_resume(
+        &mut self,
+        thread_id: &str,
+    ) -> Result<HistoryThreadSummary, CodexError> {
+        let id = self.send_request("thread/resume", json!({ "threadId": thread_id }))?;
+        let result = self.await_response(id, |_, _| {})?;
+        thread_resume_to_history_summary(&result)
+    }
+
+    pub fn thread_archive(&mut self, thread_id: &str) -> Result<(), CodexError> {
+        let id = self.send_request("thread/archive", json!({ "threadId": thread_id }))?;
+        self.await_response(id, |_, _| {})?;
+        Ok(())
+    }
+
+    pub fn thread_unarchive(&mut self, thread_id: &str) -> Result<(), CodexError> {
+        let id = self.send_request("thread/unarchive", json!({ "threadId": thread_id }))?;
+        self.await_response(id, |_, _| {})?;
+        Ok(())
+    }
+
+    pub fn thread_set_name(&mut self, thread_id: &str, name: &str) -> Result<(), CodexError> {
+        let id = self.send_request(
+            "thread/name/set",
+            json!({ "threadId": thread_id, "name": name }),
+        )?;
+        self.await_response(id, |_, _| {})?;
+        Ok(())
+    }
+
     /// turn/start with a text prompt. Emits neutral AgentItems via `emit` as
     /// item notifications arrive. Step 2 returns once turn/completed is seen.
     pub fn turn_start(
@@ -242,6 +320,139 @@ impl CodexAdapter {
         }
         Ok(())
     }
+}
+
+fn value_label(value: &Value) -> String {
+    if let Some(s) = value.as_str() {
+        return s.to_string();
+    }
+    if let Some(s) = value.get("type").and_then(Value::as_str) {
+        return s.to_string();
+    }
+    if let Some(s) = value.get("kind").and_then(Value::as_str) {
+        return s.to_string();
+    }
+    if let Some(s) = value.get("custom").and_then(Value::as_str) {
+        return s.to_string();
+    }
+    if value.is_null() {
+        return String::new();
+    }
+    serde_json::to_string(value).unwrap_or_default()
+}
+
+fn thread_summary_from_value(value: &Value) -> Result<HistoryThreadSummary, CodexError> {
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CodexError::Protocol("thread/list: thread missing id".into()))?
+        .to_string();
+    let cwd = value
+        .get("cwd")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Ok(HistoryThreadSummary {
+        id,
+        name: value.get("name").and_then(Value::as_str).map(str::to_string),
+        preview: value
+            .get("preview")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        cwd,
+        created_at: value.get("createdAt").and_then(Value::as_i64).unwrap_or(0),
+        updated_at: value.get("updatedAt").and_then(Value::as_i64).unwrap_or(0),
+        status: value.get("status").map(value_label).unwrap_or_default(),
+        model_provider: value
+            .get("modelProvider")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        source: value.get("source").map(value_label).unwrap_or_default(),
+    })
+}
+
+fn thread_list_to_history(value: &Value) -> Result<HistoryThreadList, CodexError> {
+    let data = value
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CodexError::Protocol("thread/list: result missing data[]".into()))?;
+    let mut threads = Vec::with_capacity(data.len());
+    for item in data {
+        threads.push(thread_summary_from_value(item)?);
+    }
+    Ok(HistoryThreadList {
+        threads,
+        next_cursor: value
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+fn user_message_text(item: &Value) -> String {
+    item.get("content")
+        .and_then(Value::as_array)
+        .map(|content| {
+            content
+                .iter()
+                .filter_map(|part| {
+                    if part.get("type").and_then(Value::as_str) == Some("text") {
+                        part.get("text").and_then(Value::as_str)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+        .unwrap_or_default()
+}
+
+fn thread_item_to_agent_item(item: &Value) -> Option<AgentItem> {
+    let id = item.get("id").and_then(Value::as_str)?.to_string();
+    let kind = if item.get("type").and_then(Value::as_str) == Some("userMessage") {
+        AgentItemKind::User {
+            text: user_message_text(item),
+        }
+    } else {
+        item_to_kind(item)?
+    };
+    Some(AgentItem {
+        id,
+        lifecycle: Lifecycle::Completed,
+        kind,
+    })
+}
+
+fn thread_read_to_history_detail(value: &Value) -> Result<HistoryThreadDetail, CodexError> {
+    let thread = value
+        .get("thread")
+        .ok_or_else(|| CodexError::Protocol("thread/read: result missing thread".into()))?;
+    let mut items = Vec::new();
+    if let Some(turns) = thread.get("turns").and_then(Value::as_array) {
+        for turn in turns {
+            if let Some(turn_items) = turn.get("items").and_then(Value::as_array) {
+                for item in turn_items {
+                    if let Some(agent_item) = thread_item_to_agent_item(item) {
+                        items.push(agent_item);
+                    }
+                }
+            }
+        }
+    }
+    Ok(HistoryThreadDetail {
+        thread: thread_summary_from_value(thread)?,
+        items,
+    })
+}
+
+fn thread_resume_to_history_summary(value: &Value) -> Result<HistoryThreadSummary, CodexError> {
+    let thread = value
+        .get("thread")
+        .ok_or_else(|| CodexError::Protocol("thread/resume: result missing thread".into()))?;
+    thread_summary_from_value(thread)
 }
 
 impl Drop for CodexAdapter {
@@ -314,7 +525,10 @@ fn reasoning_text(item: &Value) -> String {
 }
 
 fn item_to_kind(item: &Value) -> Option<AgentItemKind> {
-    match item.get("type").and_then(Value::as_str)? {
+        match item.get("type").and_then(Value::as_str)? {
+        "userMessage" => Some(AgentItemKind::User {
+            text: user_message_text(item),
+        }),
         // PRIMARY answer the user reads — NOT collapsed (the UX bug the user
         // hit: this was mis-named reasoning and the UI folded it away).
         "agentMessage" => Some(AgentItemKind::Message {
@@ -701,5 +915,102 @@ mod tests {
             }
             _ => panic!("expected Shell delta"),
         }
+    }
+
+    #[test]
+    fn thread_list_response_maps_to_history_summaries() {
+        let value = json!({
+            "data": [{
+                "id": "thread_1",
+                "name": "Fix tests",
+                "preview": "please fix tests",
+                "cwd": "/tmp/project",
+                "createdAt": 10,
+                "updatedAt": 20,
+                "status": "ready",
+                "modelProvider": "openai",
+                "source": {"kind": "cli"},
+                "cliVersion": "0.0.0",
+                "ephemeral": false,
+                "sessionId": "session_1",
+                "turns": []
+            }],
+            "nextCursor": "cursor_2"
+        });
+        let list = thread_list_to_history(&value).unwrap();
+        assert_eq!(list.threads[0].id, "thread_1");
+        assert_eq!(list.threads[0].cwd, "/tmp/project");
+        assert_eq!(list.threads[0].source, "cli");
+        assert_eq!(list.next_cursor.as_deref(), Some("cursor_2"));
+    }
+
+    #[test]
+    fn thread_read_response_maps_turn_items_to_history_detail() {
+        let value = json!({
+            "thread": {
+                "id": "thread_1",
+                "name": "Fix tests",
+                "preview": "please fix tests",
+                "cwd": "/tmp/project",
+                "createdAt": 10,
+                "updatedAt": 20,
+                "status": {"type": "idle"},
+                "modelProvider": "openai",
+                "source": "cli",
+                "cliVersion": "0.0.0",
+                "ephemeral": false,
+                "sessionId": "session_1",
+                "turns": [{
+                    "id": "turn_1",
+                    "status": "completed",
+                    "items": [
+                        {"id": "u1", "type": "userMessage", "content": [{"type": "text", "text": "please fix tests"}]},
+                        {"id": "a1", "type": "agentMessage", "text": "done"},
+                        {"id": "cmd1", "type": "commandExecution", "status": "completed", "command": "swift test", "aggregatedOutput": "ok\\n", "exitCode": 0, "cwd": "/tmp/project", "commandActions": []}
+                    ]
+                }]
+            }
+        });
+        let detail = thread_read_to_history_detail(&value).unwrap();
+        assert_eq!(detail.thread.id, "thread_1");
+        assert_eq!(detail.items.len(), 3);
+        match &detail.items[0].kind {
+            AgentItemKind::User { text } => assert_eq!(text, "please fix tests"),
+            _ => panic!("expected user item"),
+        }
+        match &detail.items[1].kind {
+            AgentItemKind::Message { text } => assert_eq!(text, "done"),
+            _ => panic!("expected message item"),
+        }
+    }
+
+    #[test]
+    fn thread_resume_response_maps_to_history_summary() {
+        let value = json!({
+            "cwd": "/tmp/project",
+            "model": "gpt",
+            "modelProvider": "openai",
+            "approvalPolicy": "never",
+            "approvalsReviewer": "auto",
+            "sandbox": {"mode": "workspace-write"},
+            "thread": {
+                "id": "thread_1",
+                "name": "Fix tests",
+                "preview": "please fix tests",
+                "cwd": "/tmp/project",
+                "createdAt": 10,
+                "updatedAt": 20,
+                "status": {"type": "idle"},
+                "modelProvider": "openai",
+                "source": "cli",
+                "cliVersion": "0.0.0",
+                "ephemeral": false,
+                "sessionId": "session_1",
+                "turns": []
+            }
+        });
+        let summary = thread_resume_to_history_summary(&value).unwrap();
+        assert_eq!(summary.id, "thread_1");
+        assert_eq!(summary.cwd, "/tmp/project");
     }
 }

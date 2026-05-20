@@ -21,21 +21,39 @@ import UniformTypeIdentifiers
 struct SessionView: View {
     @State private var model = SessionModel()
     @State private var input = ""
+    @State private var renameThread: HistoryThreadSummary?
+    @State private var renameText = ""
 
     var body: some View {
         VStack(spacing: 0) {
             statusBar                       // D3: pinned top, D9 mirror
             Divider()
-            if model.cwd == nil {
-                emptyState                  // D5
-            } else {
-                conversationStream          // D3 single column, D7 non-card
+            HStack(spacing: 0) {
+                historySidebar
                 Divider()
-                inputBar                    // D3 bottom
+                VStack(spacing: 0) {
+                    if model.cwd == nil {
+                        emptyState          // D5
+                    } else {
+                        conversationStream  // D3 single column, D7 non-card
+                        Divider()
+                        inputBar            // D3 bottom
+                    }
+                }
             }
         }
-        .frame(minWidth: 560, minHeight: 420)   // D9: min window size
+        .frame(minWidth: 760, minHeight: 420)   // D9: min window size
         .onDisappear { model.teardown() }       // A1: app exit kills daemon
+        .alert("Rename thread", isPresented: renameAlertBinding) {
+            TextField("Name", text: $renameText)
+            Button("Cancel", role: .cancel) { renameThread = nil }
+            Button("Rename") {
+                if let thread = renameThread {
+                    model.renameHistoryThread(thread, name: renameText)
+                }
+                renameThread = nil
+            }
+        }
     }
 
     // MARK: D3 — pinned status bar (D9 state mirror)
@@ -48,6 +66,14 @@ struct SessionView: View {
             Text(model.statusText)
                 .font(.system(.callout, design: .default))
                 .foregroundStyle(.secondary)
+            if model.selectedHistoryThreadId != nil {
+                Text("Restored history")
+                    .font(.system(.caption))
+                    .foregroundStyle(.secondary)
+                Button("New session") { model.startNewSessionFromCurrentProject() }
+                    .font(.system(.caption))
+                    .buttonStyle(.link)
+            }
             Spacer()
             if let cwd = model.cwd {
                 Text(cwd.lastPathComponent)     // project, subtle (D3)
@@ -81,6 +107,8 @@ struct SessionView: View {
             Button("Choose project directory…") { pickDirectory() }
                 .buttonStyle(.borderedProminent)
                 .padding(.top, 4)
+            Button("Refresh history") { model.loadHistory() }
+                .buttonStyle(.bordered)
             Text("e.g. “Fix the crash in the settings panel”")
                 .font(.system(.callout))
                 .foregroundStyle(.tertiary)
@@ -89,6 +117,114 @@ struct SessionView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(40)
+    }
+
+    private var historySidebar: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Text("History")
+                    .font(.system(.headline))
+                Spacer()
+                Button(action: { model.loadHistory() }) {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .disabled(model.isLoadingHistory)
+                .help("Refresh history")
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 12)
+            .padding(.bottom, 8)
+
+            TextField("Search threads", text: $model.historySearchTerm)
+                .textFieldStyle(.roundedBorder)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
+                .onSubmit { model.loadHistory() }
+
+            if model.isLoadingHistory {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.vertical, 12)
+            } else if let err = model.historyErrorMessage {
+                Text(err)
+                    .font(.system(.caption))
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+                    .padding(12)
+            } else if model.historyThreads.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("No history loaded")
+                        .font(.system(.callout))
+                    Text("Refresh to scan persisted agent threads.")
+                        .font(.system(.caption))
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(12)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(model.historyGroups) { group in
+                            historyGroup(group)
+                        }
+                    }
+                    .padding(.bottom, 12)
+                }
+            }
+        }
+        .frame(width: 260)
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    private func historyGroup(_ group: HistoryProjectGroup) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(group.projectName)
+                .font(.system(.caption, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .padding(.horizontal, 12)
+                .padding(.top, 10)
+                .padding(.bottom, 4)
+            ForEach(group.threads) { thread in
+                historyThreadRow(thread)
+            }
+        }
+    }
+
+    private func historyThreadRow(_ thread: HistoryThreadSummary) -> some View {
+        Button {
+            model.openHistoryThread(thread)
+        } label: {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(thread.displayTitle)
+                    .font(.system(.callout))
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                HStack(spacing: 6) {
+                    Text(thread.status)
+                    Text(thread.source)
+                    Text(updatedLabel(thread.updatedAt))
+                }
+                .font(.system(.caption))
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            Button("Rename") {
+                renameThread = thread
+                renameText = thread.displayTitle
+            }
+            Button("Archive", role: .destructive) {
+                model.archiveHistoryThread(thread)
+            }
+        }
     }
 
     // MARK: D3/D7 — single-column stream, NON-CARD
@@ -235,7 +371,7 @@ struct SessionView: View {
 
     private var inputBar: some View {
         HStack(spacing: 10) {
-            TextField("Ask Codex to…", text: $input, axis: .vertical)
+            TextField(inputPlaceholder, text: $input, axis: .vertical)
                 .textFieldStyle(.plain)
                 .lineLimit(1...4)
                 .onSubmit(send)
@@ -252,6 +388,19 @@ struct SessionView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+    }
+
+    private var inputPlaceholder: String {
+        model.selectedHistoryThreadId == nil
+            ? "Ask Codex to…"
+            : "Continue this historical thread…"
+    }
+
+    private var renameAlertBinding: Binding<Bool> {
+        Binding(
+            get: { renameThread != nil },
+            set: { if !$0 { renameThread = nil } }
+        )
     }
 
     /// Collapsed-output label: tells the user how much is hidden so they can
@@ -301,6 +450,12 @@ struct SessionView: View {
         return lines <= 1
             ? "Show \(noun)"
             : "Show \(noun) (\(lines) lines)"
+    }
+
+    private func updatedLabel(_ seconds: Int) -> String {
+        guard seconds > 0 else { return "" }
+        let date = Date(timeIntervalSince1970: TimeInterval(seconds))
+        return date.formatted(date: .abbreviated, time: .shortened)
     }
 
     private func send() {

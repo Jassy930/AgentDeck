@@ -46,9 +46,12 @@ AgentDeckRichBlock[]
 SwiftUI native block views
 ```
 
-第一轮默认采用 `swift-markdown` 解析 AST，再转成 `AgentDeckRichBlock`。
-这个路径实现成本高于直接接入 Markdown view，但它保留 AgentDeck 现有
-macOS 14+ 平台范围，并给代码块、diff 和表格组件留下完整控制权。
+第一轮默认采用 `swift-markdown` 建立 Markdown 解析边界，再转成
+`AgentDeckRichBlock`。完整回复完成后可以走 AST；流式中间态需要额外容忍未
+闭合代码 fence 和半截表格，因此第一版允许在这个边界内先实现小型高价值
+block splitter，只负责代码块、diff 和 GFM 表格，普通文本继续作为 Markdown
+片段传递。这个路径保留 AgentDeck 现有 macOS 14+ 平台范围，并给代码块、diff
+和表格组件留下完整控制权。
 
 Textual 是 MarkdownUI 的后续方向，定位是 SwiftUI rich text rendering
 engine，而不是单纯 Markdown view；但当前 Textual 包声明 macOS 15+，
