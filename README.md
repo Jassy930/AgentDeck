@@ -53,7 +53,9 @@ codex app-server  (子进程, JSON-RPC over stdio)
 AgentDeck 使用一个 `agentdeckd` 作为 runtime hub。daemon 的 stdin 主循环不被
 单个 turn 阻塞；每个后台会话由独立 worker 持有 adapter，所有 worker 通过统一
 stdout writer 输出带 `sessionId/threadId` 的中立事件。历史请求按 request id
-分发 reply，不和 streaming `agentItem` 抢 reader。
+分发 reply，不和 streaming `agentItem` 抢 reader。RuntimeHub 会阻止同一
+`sessionId` 同时启动多个 turn，并限制并发 history worker；超限时返回明确
+busy error，而不是继续无界创建线程。
 
 流式性能边界：daemon 不合并 Codex delta，而是忠实转发中立
 `agentItem`；Swift 端的 `SessionModel` 按约 30fps 合并待渲染 delta，并把

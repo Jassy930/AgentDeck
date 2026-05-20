@@ -18,7 +18,7 @@ AgentDeck.app  (macOS, SwiftUI + AppKit)
       │  stdio JSONL IPC，中立 AgentItem
       ▼
 agentdeckd  (Rust daemon)
-      │  ├── stdin main loop
+      │  ├── RuntimeHub（stdin main loop + stdout writer）
       │  ├── stdout writer
       │  ├── turn/history workers
       │  ├── run record / diagnostic log
@@ -42,6 +42,7 @@ codex app-server  (子进程, JSON-RPC over stdio)
 - Swift 层不得解析 Codex vendor JSON，也不得出现需要理解 Codex schema 才能工作的 UI 分支。
 - 中立 IPC 中面向 Swift 的核心事件使用 `AgentItem`，不要把供应商特定字段扩散到 UI。
 - daemon 的 stdin 主循环不得被单个 turn 阻塞；长时间工作放到 worker。
+- daemon 的 RuntimeHub 必须按 `sessionId` 阻止同一 runtime 并发 turn，并对 history worker 保持有界并发；超限时返回可诊断 busy error。
 - streaming event 必须携带 `sessionId/threadId`，避免历史读取和正在运行的 turn 串流互相抢 reader。
 - run record 与 diagnostic log 是 AgentDeck 管理的数据，写入 `~/Library/Application Support/AgentDeck/`，不得写入用户项目仓库。
 - 写入前必须做 best-effort 密钥脱敏；写失败不能静默，必须在可诊断位置暴露。

@@ -98,6 +98,87 @@ enum HistoryAction {
     },
 }
 
+impl HistoryAction {
+    fn id(&self) -> Option<u64> {
+        match self {
+            HistoryAction::ListThreads { id, .. }
+            | HistoryAction::ReadThread { id, .. }
+            | HistoryAction::ArchiveThread { id, .. }
+            | HistoryAction::UnarchiveThread { id, .. }
+            | HistoryAction::RenameThread { id, .. } => *id,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RuntimeHubDispatch {
+    StartTurn,
+    StartHistory,
+    Reply(IpcMessage),
+}
+
+#[derive(Debug)]
+enum RuntimeHubWorkerDone {
+    Turn(String),
+    History,
+}
+
+#[derive(Debug)]
+struct RuntimeHub {
+    running_sessions: std::collections::HashSet<String>,
+    active_history_workers: usize,
+    max_history_workers: usize,
+}
+
+impl RuntimeHub {
+    fn new(max_history_workers: usize) -> Self {
+        Self {
+            running_sessions: std::collections::HashSet::new(),
+            active_history_workers: 0,
+            max_history_workers: max_history_workers.max(1),
+        }
+    }
+
+    fn drain_finished(&mut self, done_rx: &Receiver<RuntimeHubWorkerDone>) {
+        while let Ok(done) = done_rx.try_recv() {
+            match done {
+                RuntimeHubWorkerDone::Turn(session_id) => self.finish_turn(&session_id),
+                RuntimeHubWorkerDone::History => self.finish_history(),
+            }
+        }
+    }
+
+    fn handle_spawn_turn(&mut self, id: Option<u64>, session_id: &str) -> RuntimeHubDispatch {
+        if self.running_sessions.contains(session_id) {
+            return RuntimeHubDispatch::Reply(IpcMessage::error(
+                id,
+                "runtime busy: turn already running for this session",
+            ));
+        }
+        self.running_sessions.insert(session_id.to_string());
+        RuntimeHubDispatch::StartTurn
+    }
+
+    fn finish_turn(&mut self, session_id: &str) {
+        self.running_sessions.remove(session_id);
+    }
+
+    fn handle_history_request(&mut self, id: Option<u64>) -> RuntimeHubDispatch {
+        if self.active_history_workers >= self.max_history_workers {
+            return RuntimeHubDispatch::Reply(IpcMessage::error(
+                id,
+                "history busy: too many concurrent history requests",
+            ));
+        }
+        self.active_history_workers += 1;
+        RuntimeHubDispatch::StartHistory
+    }
+
+    fn finish_history(&mut self) {
+        self.active_history_workers = self.active_history_workers.saturating_sub(1);
+    }
+}
+
 fn write_msg(stdout: &mut impl Write, msg: &IpcMessage) -> std::io::Result<()> {
     let mut s = serde_json::to_string(msg)?;
     s.push('\n');
@@ -1413,12 +1494,15 @@ fn run_turn_worker(
 fn main() -> std::io::Result<()> {
     let stdin = std::io::stdin();
     let (out_tx, out_rx) = mpsc::channel::<IpcMessage>();
+    let (worker_done_tx, worker_done_rx) = mpsc::channel::<RuntimeHubWorkerDone>();
+    let mut runtime_hub = RuntimeHub::new(4);
     let writer = std::thread::spawn(move || {
         let stdout = std::io::stdout();
         write_outbound_messages(stdout, out_rx)
     });
 
     for line in stdin.lock().lines() {
+        runtime_hub.drain_finished(&worker_done_rx);
         let line = line?;
         if line.trim().is_empty() {
             continue;
@@ -1450,12 +1534,22 @@ fn main() -> std::io::Result<()> {
                 run_diagnostics_report(&out_tx, id, payload.as_ref())?;
             }
             Ok(HubAction::History(action)) => {
-                let worker_tx = out_tx.clone();
-                std::thread::spawn(move || {
-                    if let Err(err) = run_history_worker(worker_tx.clone(), action) {
-                        let _ = worker_tx.send(IpcMessage::error(None, &err.to_string()));
+                match runtime_hub.handle_history_request(action.id()) {
+                    RuntimeHubDispatch::StartHistory => {
+                        let worker_tx = out_tx.clone();
+                        let done_tx = worker_done_tx.clone();
+                        std::thread::spawn(move || {
+                            if let Err(err) = run_history_worker(worker_tx.clone(), action) {
+                                let _ = worker_tx.send(IpcMessage::error(None, &err.to_string()));
+                            }
+                            let _ = done_tx.send(RuntimeHubWorkerDone::History);
+                        });
                     }
-                });
+                    RuntimeHubDispatch::Reply(reply) => send_msg(&out_tx, reply)?,
+                    RuntimeHubDispatch::StartTurn => {
+                        unreachable!("history dispatch cannot start turn")
+                    }
+                }
             }
             Ok(HubAction::SpawnTurn {
                 id,
@@ -1463,28 +1557,36 @@ fn main() -> std::io::Result<()> {
                 thread_id,
                 cwd,
                 prompt,
-            }) => {
-                let ack = turn_accepted(id, &session_id, thread_id.as_deref());
-                let _ = out_tx.send(ack);
+            }) => match runtime_hub.handle_spawn_turn(id, &session_id) {
+                RuntimeHubDispatch::StartTurn => {
+                    let ack = turn_accepted(id, &session_id, thread_id.as_deref());
+                    let _ = out_tx.send(ack);
 
-                let worker_tx = out_tx.clone();
-                std::thread::spawn(move || {
-                    if let Err(err) = run_turn_worker(
-                        worker_tx.clone(),
-                        id,
-                        &session_id,
-                        thread_id.as_deref(),
-                        cwd.as_deref(),
-                        &prompt,
-                    ) {
-                        let _ = worker_tx.send(IpcMessage::session_event(
+                    let worker_tx = out_tx.clone();
+                    let done_tx = worker_done_tx.clone();
+                    std::thread::spawn(move || {
+                        if let Err(err) = run_turn_worker(
+                            worker_tx.clone(),
+                            id,
                             &session_id,
                             thread_id.as_deref(),
-                            IpcMessage::error(None, &err.to_string()),
-                        ));
-                    }
-                });
-            }
+                            cwd.as_deref(),
+                            &prompt,
+                        ) {
+                            let _ = worker_tx.send(IpcMessage::session_event(
+                                &session_id,
+                                thread_id.as_deref(),
+                                IpcMessage::error(None, &err.to_string()),
+                            ));
+                        }
+                        let _ = done_tx.send(RuntimeHubWorkerDone::Turn(session_id));
+                    });
+                }
+                RuntimeHubDispatch::Reply(reply) => send_msg(&out_tx, reply)?,
+                RuntimeHubDispatch::StartHistory => {
+                    unreachable!("turn dispatch cannot start history")
+                }
+            },
             Err(e) => send_msg(&out_tx, IpcMessage::error(msg.id, &e))?,
         }
     }
@@ -1575,7 +1677,9 @@ mod tests {
             id: Some(1),
             session_id: "session_new",
             prompt: "hello",
-            start: TurnStart::NewSession { cwd: "/tmp/project" },
+            start: TurnStart::NewSession {
+                cwd: "/tmp/project",
+            },
         };
         let resumed_turn = TurnRunContext {
             id: Some(2),
@@ -1593,15 +1697,89 @@ mod tests {
 
         assert_eq!(resumed_turn.initial_thread_id(), Some("thread_1"));
         assert_eq!(resumed_turn.start_log_name(), "history_turn_start");
-        assert!(resumed_turn
-            .start_record_line()
-            .contains(r#""event":"resume""#));
-        assert!(resumed_turn
-            .start_record_line()
-            .contains(r#""threadId":"thread_1""#));
-        assert!(resumed_turn
-            .start_record_line()
-            .contains(r#""prompt":"continue""#));
+        assert!(
+            resumed_turn
+                .start_record_line()
+                .contains(r#""event":"resume""#)
+        );
+        assert!(
+            resumed_turn
+                .start_record_line()
+                .contains(r#""threadId":"thread_1""#)
+        );
+        assert!(
+            resumed_turn
+                .start_record_line()
+                .contains(r#""prompt":"continue""#)
+        );
+    }
+
+    #[test]
+    fn runtime_hub_rejects_concurrent_turn_for_same_session() {
+        let mut hub = RuntimeHub::new(2);
+
+        assert!(matches!(
+            hub.handle_spawn_turn(Some(1), "session_a"),
+            RuntimeHubDispatch::StartTurn
+        ));
+        let busy = hub.handle_spawn_turn(Some(2), "session_a");
+
+        assert!(matches!(
+            busy,
+            RuntimeHubDispatch::Reply(IpcMessage {
+                kind,
+                id: Some(2),
+                ..
+            }) if kind == "error"
+        ));
+    }
+
+    #[test]
+    fn runtime_hub_allows_different_sessions_and_clears_finished_turns() {
+        let mut hub = RuntimeHub::new(2);
+
+        assert!(matches!(
+            hub.handle_spawn_turn(Some(1), "session_a"),
+            RuntimeHubDispatch::StartTurn
+        ));
+        assert!(matches!(
+            hub.handle_spawn_turn(Some(2), "session_b"),
+            RuntimeHubDispatch::StartTurn
+        ));
+
+        hub.finish_turn("session_a");
+
+        assert!(matches!(
+            hub.handle_spawn_turn(Some(3), "session_a"),
+            RuntimeHubDispatch::StartTurn
+        ));
+    }
+
+    #[test]
+    fn runtime_hub_enforces_history_worker_limit() {
+        let mut hub = RuntimeHub::new(1);
+
+        assert!(matches!(
+            hub.handle_history_request(Some(10)),
+            RuntimeHubDispatch::StartHistory
+        ));
+        let busy = hub.handle_history_request(Some(11));
+
+        assert!(matches!(
+            busy,
+            RuntimeHubDispatch::Reply(IpcMessage {
+                kind,
+                id: Some(11),
+                ..
+            }) if kind == "error"
+        ));
+
+        hub.finish_history();
+
+        assert!(matches!(
+            hub.handle_history_request(Some(12)),
+            RuntimeHubDispatch::StartHistory
+        ));
     }
 
     #[test]
