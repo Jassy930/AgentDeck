@@ -26,15 +26,21 @@ struct SessionView: View {
         VStack(spacing: 0) {
             statusBar                       // D3: pinned top, D9 mirror
             Divider()
-            if model.cwd == nil {
-                emptyState                  // D5
-            } else {
-                conversationStream          // D3 single column, D7 non-card
+            HStack(spacing: 0) {
+                historySidebar
                 Divider()
-                inputBar                    // D3 bottom
+                VStack(spacing: 0) {
+                    if model.cwd == nil {
+                        emptyState          // D5
+                    } else {
+                        conversationStream  // D3 single column, D7 non-card
+                        Divider()
+                        inputBar            // D3 bottom
+                    }
+                }
             }
         }
-        .frame(minWidth: 560, minHeight: 420)   // D9: min window size
+        .frame(minWidth: 760, minHeight: 420)   // D9: min window size
         .onDisappear { model.teardown() }       // A1: app exit kills daemon
     }
 
@@ -81,6 +87,8 @@ struct SessionView: View {
             Button("Choose project directory…") { pickDirectory() }
                 .buttonStyle(.borderedProminent)
                 .padding(.top, 4)
+            Button("Refresh history") { model.loadHistory() }
+                .buttonStyle(.bordered)
             Text("e.g. “Fix the crash in the settings panel”")
                 .font(.system(.callout))
                 .foregroundStyle(.tertiary)
@@ -89,6 +97,107 @@ struct SessionView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(40)
+    }
+
+    private var historySidebar: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Text("History")
+                    .font(.system(.headline))
+                Spacer()
+                Button(action: { model.loadHistory() }) {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .disabled(model.isLoadingHistory)
+                .help("Refresh history")
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 12)
+            .padding(.bottom, 8)
+
+            TextField("Search threads", text: $model.historySearchTerm)
+                .textFieldStyle(.roundedBorder)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
+                .onSubmit { model.loadHistory() }
+
+            if model.isLoadingHistory {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.vertical, 12)
+            } else if let err = model.historyErrorMessage {
+                Text(err)
+                    .font(.system(.caption))
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+                    .padding(12)
+            } else if model.historyThreads.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("No history loaded")
+                        .font(.system(.callout))
+                    Text("Refresh to scan persisted agent threads.")
+                        .font(.system(.caption))
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(12)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(model.historyGroups) { group in
+                            historyGroup(group)
+                        }
+                    }
+                    .padding(.bottom, 12)
+                }
+            }
+        }
+        .frame(width: 260)
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    private func historyGroup(_ group: HistoryProjectGroup) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(group.projectName)
+                .font(.system(.caption, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .padding(.horizontal, 12)
+                .padding(.top, 10)
+                .padding(.bottom, 4)
+            ForEach(group.threads) { thread in
+                historyThreadRow(thread)
+            }
+        }
+    }
+
+    private func historyThreadRow(_ thread: HistoryThreadSummary) -> some View {
+        Button {
+            // Reading/replay lands in the next implementation slice. The row
+            // is already shaped as a real selection target so the UI can grow
+            // without changing the information architecture.
+        } label: {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(thread.displayTitle)
+                    .font(.system(.callout))
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                HStack(spacing: 6) {
+                    Text(thread.status)
+                    Text(thread.source)
+                    Text(updatedLabel(thread.updatedAt))
+                }
+                .font(.system(.caption))
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: D3/D7 — single-column stream, NON-CARD
@@ -301,6 +410,12 @@ struct SessionView: View {
         return lines <= 1
             ? "Show \(noun)"
             : "Show \(noun) (\(lines) lines)"
+    }
+
+    private func updatedLabel(_ seconds: Int) -> String {
+        guard seconds > 0 else { return "" }
+        let date = Date(timeIntervalSince1970: TimeInterval(seconds))
+        return date.formatted(date: .abbreviated, time: .shortened)
     }
 
     private func send() {

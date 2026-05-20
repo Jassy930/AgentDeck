@@ -73,6 +73,14 @@ final class SessionModel {
     /// Prompts queued while a turn runs (Eng I1). v0.1: enqueue, auto-send
     /// on turn completion. Step 5 wires the auto-send; Step 4 shows the count.
     var queuedPrompts: [String] = []
+    var historyThreads: [HistoryThreadSummary] = []
+    var historyErrorMessage: String?
+    var isLoadingHistory = false
+    var historySearchTerm = ""
+
+    var historyGroups: [HistoryProjectGroup] {
+        HistoryProjectGroup.group(historyThreads)
+    }
 
     private let client = DaemonClient()
     private var daemonStarted = false
@@ -150,15 +158,8 @@ final class SessionModel {
             return
         }
 
-        if !daemonStarted {
-            do {
-                try client.start()
-                daemonStarted = true
-            } catch {
-                phase = .failed
-                errorMessage = "\(error)"
-                return
-            }
+        if !ensureDaemonStarted() {
+            return
         }
 
         let userItem = UIItem(id: "user-\(UUID().uuidString)",
@@ -174,6 +175,44 @@ final class SessionModel {
             guard let self else { return }
             self.ingest(rawLine: raw)
         }
+    }
+
+    @discardableResult
+    private func ensureDaemonStarted() -> Bool {
+        if !daemonStarted {
+            do {
+                try client.start()
+                daemonStarted = true
+            } catch {
+                phase = .failed
+                errorMessage = "\(error)"
+                return false
+            }
+        }
+        return true
+    }
+
+    func setHistoryThreads(_ threads: [HistoryThreadSummary]) {
+        historyThreads = threads
+    }
+
+    func loadHistory(currentProjectOnly: Bool = false) {
+        guard !isLoadingHistory else { return }
+        guard ensureDaemonStarted() else { return }
+        isLoadingHistory = true
+        historyErrorMessage = nil
+        let cwdFilter = currentProjectOnly ? cwd?.path : nil
+        let search = historySearchTerm.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            let list = try client.listHistoryThreads(
+                cwd: cwdFilter,
+                searchTerm: search.isEmpty ? nil : search
+            )
+            setHistoryThreads(list.threads)
+        } catch {
+            historyErrorMessage = "\(error)"
+        }
+        isLoadingHistory = false
     }
 
     func ingest(rawLine raw: String) {

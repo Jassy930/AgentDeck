@@ -136,6 +136,22 @@ struct SessionRenderThrottlingTests {
         #expect(model.items.count == 1)
         #expect(model.items[0].text == "final")
     }
+
+    @Test("loading history groups threads without clearing current stream")
+    func loadingHistoryDoesNotClearCurrentStream() {
+        let model = SessionModel()
+
+        model.ingest(agentItem(id: "msg1", text: "current"))
+        model.flushPendingAgentItems()
+        model.setHistoryThreads([
+            HistoryThreadSummary(id: "h1", name: nil, preview: "old", cwd: "/tmp/project", createdAt: 1, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli")
+        ])
+
+        #expect(model.items.count == 1)
+        #expect(model.items[0].text == "current")
+        #expect(model.historyGroups.count == 1)
+        #expect(model.historyGroups[0].cwd == "/tmp/project")
+    }
 }
 
 @Suite("History model")
