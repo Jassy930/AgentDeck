@@ -170,11 +170,14 @@ final class SessionModel {
         errorMessage = nil
         phase = .starting
 
-        client.startSession(cwd: cwd.path, prompt: trimmed) { [weak self] raw in
-            // Decode ON the main actor (the line crossed threads as a plain
-            // String — Sendable). No non-Sendable value ever raced.
+        let onLine: @MainActor (String) -> Void = { [weak self] raw in
             guard let self else { return }
             self.ingest(rawLine: raw)
+        }
+        if let threadId = selectedHistoryThreadId {
+            client.startTurn(threadId: threadId, prompt: trimmed, onLine: onLine)
+        } else {
+            client.startSession(cwd: cwd.path, prompt: trimmed, onLine: onLine)
         }
     }
 
@@ -237,6 +240,14 @@ final class SessionModel {
         }
         errorMessage = nil
         phase = .ready
+    }
+
+    func startNewSessionFromCurrentProject() {
+        selectedHistoryThreadId = nil
+        items.removeAll()
+        itemIndexById.removeAll(keepingCapacity: true)
+        errorMessage = nil
+        phase = cwd == nil ? .idle : .ready
     }
 
     private func uiItem(from replay: HistoryReplayItem) -> UIItem {

@@ -34,6 +34,12 @@ struct HistoryListParams {
     limit: Option<u32>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct StartTurnParams {
+    thread_id: String,
+    prompt: String,
+}
+
 fn write_msg(stdout: &mut impl Write, msg: &IpcMessage) -> std::io::Result<()> {
     let mut s = serde_json::to_string(msg)?;
     s.push('\n');
@@ -70,6 +76,16 @@ fn history_read_thread_id(payload: Option<&serde_json::Value>) -> Option<String>
         .get("threadId")
         .and_then(|v| v.as_str())
         .map(str::to_string)
+}
+
+fn start_turn_params(payload: Option<&serde_json::Value>) -> Option<StartTurnParams> {
+    let payload = payload?;
+    let thread_id = payload.get("threadId")?.as_str()?.to_string();
+    let prompt = payload.get("prompt")?.as_str()?.to_string();
+    if thread_id.is_empty() || prompt.is_empty() {
+        return None;
+    }
+    Some(StartTurnParams { thread_id, prompt })
 }
 
 fn run_history_list(
@@ -290,6 +306,103 @@ fn run_session(
     )
 }
 
+fn run_turn_on_existing_thread(
+    stdout: &mut impl Write,
+    id: Option<u64>,
+    thread_id: &str,
+    prompt: &str,
+) -> std::io::Result<()> {
+    let run_id = format!(
+        "run-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    diag::log("history_turn_start", &format!("run={run_id} thread={thread_id}"));
+    write_msg(stdout, &IpcMessage::session_state(SessionState::Starting))?;
+    record_or_warn(
+        stdout,
+        &run_id,
+        &format!(
+            r#"{{"event":"resume","threadId":{},"prompt":{}}}"#,
+            serde_json::to_string(thread_id).unwrap_or_else(|_| "\"\"".into()),
+            serde_json::to_string(prompt).unwrap_or_else(|_| "\"\"".into())
+        ),
+    )?;
+
+    let mut adapter = match codex::CodexAdapter::spawn() {
+        Ok(a) => a,
+        Err(e) => {
+            diag::log("history_turn_spawn_failed", &e.to_string());
+            write_msg(stdout, &IpcMessage::error(id, &e.to_string()))?;
+            return write_msg(stdout, &IpcMessage::session_state(SessionState::Failed));
+        }
+    };
+    if let Err(e) = adapter.initialize() {
+        diag::log("history_turn_handshake_failed", &e.to_string());
+        write_msg(stdout, &IpcMessage::error(id, &e.to_string()))?;
+        return write_msg(stdout, &IpcMessage::session_state(SessionState::Failed));
+    }
+    if let Err(e) = adapter.thread_resume(thread_id) {
+        diag::log("history_turn_resume_failed", &e.to_string());
+        write_msg(stdout, &IpcMessage::error(id, &e.to_string()))?;
+        return write_msg(stdout, &IpcMessage::session_state(SessionState::Failed));
+    }
+
+    write_msg(stdout, &IpcMessage::session_state(SessionState::Running))?;
+    let mut write_err: Option<std::io::Error> = None;
+    {
+        let stdout = &mut *stdout;
+        let run_id = &run_id;
+        let turn = adapter.turn_start(thread_id, prompt, |item| {
+            if write_err.is_some() {
+                return;
+            }
+            if let Err(e) = write_msg(stdout, &IpcMessage::agent_item(&item)) {
+                write_err = Some(e);
+                return;
+            }
+            if let Ok(j) = serde_json::to_string(&item)
+                && let Err(reason) = record::try_append(run_id, &j)
+            {
+                diag::log("record_failed", &reason);
+            }
+        });
+        if let Some(e) = write_err {
+            return Err(e);
+        }
+        match turn {
+            Ok(()) => {}
+            Err(e) => {
+                diag::log("history_turn_failed", &format!("run={run_id} {e}"));
+                record_or_warn(
+                    stdout,
+                    run_id,
+                    &format!(
+                        r#"{{"event":"failed","error":{}}}"#,
+                        serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "\"\"".into())
+                    ),
+                )?;
+                write_msg(stdout, &IpcMessage::error(id, &e.to_string()))?;
+                return write_msg(stdout, &IpcMessage::session_state(SessionState::Failed));
+            }
+        }
+    }
+
+    diag::log("history_turn_complete", &format!("run={run_id} thread={thread_id}"));
+    record_or_warn(stdout, &run_id, r#"{"event":"complete"}"#)?;
+    write_msg(stdout, &IpcMessage::session_state(SessionState::Ready))?;
+    write_msg(
+        stdout,
+        &IpcMessage {
+            kind: "turnComplete".into(),
+            id,
+            payload: None,
+        },
+    )
+}
+
 fn main() -> std::io::Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -354,6 +467,21 @@ fn main() -> std::io::Result<()> {
                     run_session(&mut stdout, msg.id, cwd, prompt)?;
                 }
             }
+            "startTurn" => {
+                if let Some(params) = start_turn_params(msg.payload.as_ref()) {
+                    run_turn_on_existing_thread(
+                        &mut stdout,
+                        msg.id,
+                        &params.thread_id,
+                        &params.prompt,
+                    )?;
+                } else {
+                    write_msg(
+                        &mut stdout,
+                        &IpcMessage::error(msg.id, "startTurn requires threadId and prompt"),
+                    )?;
+                }
+            }
             other => write_msg(
                 &mut stdout,
                 &IpcMessage::error(msg.id, &format!("unknown kind: {other}")),
@@ -389,5 +517,13 @@ mod tests {
     fn history_read_thread_id_reads_required_id() {
         let p = json!({"threadId": "thread_1"});
         assert_eq!(history_read_thread_id(Some(&p)), Some("thread_1".to_string()));
+    }
+
+    #[test]
+    fn start_turn_params_reads_thread_and_prompt() {
+        let p = json!({"threadId": "thread_1", "prompt": "continue"});
+        let params = start_turn_params(Some(&p)).unwrap();
+        assert_eq!(params.thread_id, "thread_1");
+        assert_eq!(params.prompt, "continue");
     }
 }

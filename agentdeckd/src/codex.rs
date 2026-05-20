@@ -247,6 +247,17 @@ impl CodexAdapter {
         thread_read_to_history_detail(&result)
     }
 
+    /// Resume an existing persisted thread so the next turn uses its model-
+    /// visible history, not a newly-created thread.
+    pub fn thread_resume(
+        &mut self,
+        thread_id: &str,
+    ) -> Result<HistoryThreadSummary, CodexError> {
+        let id = self.send_request("thread/resume", json!({ "threadId": thread_id }))?;
+        let result = self.await_response(id, |_, _| {})?;
+        thread_resume_to_history_summary(&result)
+    }
+
     /// turn/start with a text prompt. Emits neutral AgentItems via `emit` as
     /// item notifications arrive. Step 2 returns once turn/completed is seen.
     pub fn turn_start(
@@ -414,6 +425,13 @@ fn thread_read_to_history_detail(value: &Value) -> Result<HistoryThreadDetail, C
         thread: thread_summary_from_value(thread)?,
         items,
     })
+}
+
+fn thread_resume_to_history_summary(value: &Value) -> Result<HistoryThreadSummary, CodexError> {
+    let thread = value
+        .get("thread")
+        .ok_or_else(|| CodexError::Protocol("thread/resume: result missing thread".into()))?;
+    thread_summary_from_value(thread)
 }
 
 impl Drop for CodexAdapter {
@@ -943,5 +961,35 @@ mod tests {
             AgentItemKind::Message { text } => assert_eq!(text, "done"),
             _ => panic!("expected message item"),
         }
+    }
+
+    #[test]
+    fn thread_resume_response_maps_to_history_summary() {
+        let value = json!({
+            "cwd": "/tmp/project",
+            "model": "gpt",
+            "modelProvider": "openai",
+            "approvalPolicy": "never",
+            "approvalsReviewer": "auto",
+            "sandbox": {"mode": "workspace-write"},
+            "thread": {
+                "id": "thread_1",
+                "name": "Fix tests",
+                "preview": "please fix tests",
+                "cwd": "/tmp/project",
+                "createdAt": 10,
+                "updatedAt": 20,
+                "status": {"type": "idle"},
+                "modelProvider": "openai",
+                "source": "cli",
+                "cliVersion": "0.0.0",
+                "ephemeral": false,
+                "sessionId": "session_1",
+                "turns": []
+            }
+        });
+        let summary = thread_resume_to_history_summary(&value).unwrap();
+        assert_eq!(summary.id, "thread_1");
+        assert_eq!(summary.cwd, "/tmp/project");
     }
 }

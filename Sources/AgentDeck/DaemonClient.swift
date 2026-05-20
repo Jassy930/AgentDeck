@@ -215,6 +215,14 @@ final class DaemonClient {
         return try JSONDecoder().decode(HistoryThreadDetail.self, from: data)
     }
 
+    static func startTurnRequest(id: UInt64, threadId: String, prompt: String) -> IpcMessage {
+        IpcMessage(
+            kind: "startTurn",
+            id: id,
+            payload: AnyCodable(["threadId": threadId, "prompt": prompt])
+        )
+    }
+
     /// Start a streaming session. Sends `startSession {cwd, prompt}`, then
     /// reads neutral IPC messages on a BACKGROUND thread and delivers each
     /// one to `onMessage` ON THE MAIN THREAD.
@@ -252,6 +260,39 @@ final class DaemonClient {
         // reach back into DaemonClient (non-Sendable) — it owns nothing but
         // the line stream. This is the minimal-sharing fix, not a Sendable
         // bolt-on.
+        guard let reader else {
+            Task { @MainActor in
+                onLine(#"{"kind":"error","payload":{"message":"reader not initialized"}}"#)
+            }
+            return
+        }
+        Thread.detachNewThread {
+            while let raw = reader.nextLine() {
+                if raw.isEmpty { continue }
+                let terminal = raw.contains("\"turnComplete\"")
+                    || raw.contains("\"kind\":\"error\"")
+                DispatchQueue.main.async { onLine(raw) }
+                if terminal { break }
+            }
+        }
+    }
+
+    func startTurn(
+        threadId: String,
+        prompt: String,
+        onLine: @escaping @MainActor (String) -> Void
+    ) {
+        let msg = Self.startTurnRequest(id: 4, threadId: threadId, prompt: prompt)
+        guard let data = try? JSONEncoder().encode(msg) else {
+            Task { @MainActor in
+                onLine(#"{"kind":"error","payload":{"message":"failed to encode startTurn"}}"#)
+            }
+            return
+        }
+        var line = data
+        line.append(0x0A)
+        toDaemon.fileHandleForWriting.write(line)
+
         guard let reader else {
             Task { @MainActor in
                 onLine(#"{"kind":"error","payload":{"message":"reader not initialized"}}"#)

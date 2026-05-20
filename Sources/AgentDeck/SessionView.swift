@@ -54,6 +54,14 @@ struct SessionView: View {
             Text(model.statusText)
                 .font(.system(.callout, design: .default))
                 .foregroundStyle(.secondary)
+            if model.selectedHistoryThreadId != nil {
+                Text("Restored history")
+                    .font(.system(.caption))
+                    .foregroundStyle(.secondary)
+                Button("New session") { model.startNewSessionFromCurrentProject() }
+                    .font(.system(.caption))
+                    .buttonStyle(.link)
+            }
             Spacer()
             if let cwd = model.cwd {
                 Text(cwd.lastPathComponent)     // project, subtle (D3)
@@ -342,7 +350,7 @@ struct SessionView: View {
 
     private var inputBar: some View {
         HStack(spacing: 10) {
-            TextField("Ask Codex to…", text: $input, axis: .vertical)
+            TextField(inputPlaceholder, text: $input, axis: .vertical)
                 .textFieldStyle(.plain)
                 .lineLimit(1...4)
                 .onSubmit(send)
@@ -359,6 +367,12 @@ struct SessionView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+    }
+
+    private var inputPlaceholder: String {
+        model.selectedHistoryThreadId == nil
+            ? "Ask Codex to…"
+            : "Continue this historical thread…"
     }
 
     /// Collapsed-output label: tells the user how much is hidden so they can

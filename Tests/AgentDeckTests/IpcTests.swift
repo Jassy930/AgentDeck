@@ -217,6 +217,21 @@ struct DaemonHistoryRequestTests {
         #expect(payload["searchTerm"] as? String == "fix")
         #expect(!String(data: data, encoding: .utf8)!.lowercased().contains("codex"))
     }
+
+    @Test("start turn request encodes restored thread id")
+    func startTurnRequestEncodesThreadId() throws {
+        let msg = DaemonClient.startTurnRequest(
+            id: 9,
+            threadId: "thread_1",
+            prompt: "continue"
+        )
+        let data = try JSONEncoder().encode(msg)
+        let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let payload = try #require(json["payload"] as? [String: Any])
+        #expect(json["kind"] as? String == "startTurn")
+        #expect(payload["threadId"] as? String == "thread_1")
+        #expect(payload["prompt"] as? String == "continue")
+    }
 }
 
 @Suite("Streaming TextKit renderer")
