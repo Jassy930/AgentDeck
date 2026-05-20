@@ -71,6 +71,11 @@ struct SessionView: View {
                 Text("Restored history")
                     .font(.system(.caption))
                     .foregroundStyle(.secondary)
+                if !model.historyTimingSummary.isEmpty {
+                    Text(model.historyTimingSummary)
+                        .font(.system(.caption))
+                        .foregroundStyle(.tertiary)
+                }
                 Button("New session") { model.startNewSessionFromCurrentProject() }
                     .font(.system(.caption))
                     .buttonStyle(.link)
@@ -199,10 +204,16 @@ struct SessionView: View {
             model.openHistoryThread(thread)
         } label: {
             VStack(alignment: .leading, spacing: 3) {
-                Text(thread.displayTitle)
-                    .font(.system(.callout))
-                    .foregroundStyle(.primary)
-                    .lineLimit(2)
+                HStack(spacing: 6) {
+                    Text(thread.displayTitle)
+                        .font(.system(.callout))
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                    if model.openingHistoryThreadId == thread.id {
+                        ProgressView()
+                            .controlSize(.mini)
+                    }
+                }
                 HStack(spacing: 6) {
                     Text(thread.status)
                     Text(thread.source)
@@ -233,9 +244,10 @@ struct SessionView: View {
     private var conversationStream: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(Array(model.items.enumerated()), id: \.element.id) { index, item in
-                    itemRow(item)
-                    if shouldShowDivider(after: index) {
+                let turns = makeConversationTurns(from: model.items)
+                ForEach(Array(turns.enumerated()), id: \.element.id) { index, turn in
+                    conversationTurn(turn)
+                    if index + 1 < turns.count {
                         Divider().opacity(0.4)  // D7: subtle divider, not card
                     }
                 }
@@ -249,16 +261,43 @@ struct SessionView: View {
     }
 
     @ViewBuilder
-    private func itemRow(_ item: UIItem) -> some View {
+    private func conversationTurn(_ turn: ConversationTurn) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if let user = turn.user {
+                userRow(user)
+            }
+            if !turn.assistantItems.isEmpty {
+                CodexTurnSection {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(Array(turn.assistantItems.enumerated()), id: \.element.id) { index, item in
+                            assistantItemRow(item)
+                            if index + 1 < turn.assistantItems.count {
+                                assistantDivider(between: item, and: turn.assistantItems[index + 1])
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func userRow(_ item: UIItem) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            UserPromptBlock(text: item.text)
+            referenceList(item.attachments)
+                .padding(.leading, 12)
+        }
+    }
+
+    @ViewBuilder
+    private func assistantItemRow(_ item: UIItem) -> some View {
         switch item.kind {
         case "user":
-            VStack(alignment: .leading, spacing: 6) {
-                UserPromptBlock(text: item.text)
-                referenceList(item.attachments)
-                    .padding(.leading, 12)
-            }
+            EmptyView()
         case "message":
-            CodexDocumentSection(buffer: item.textBuffer)
+            RichMessageView(buffer: item.textBuffer)
+                .frame(maxWidth: 920, alignment: .leading)
+                .padding(.vertical, 4)
         case "reasoning":
             // D3: chain-of-thought is SECONDARY — collapsed by default. The
             // row auto-expands during a running turn (Codex sends the
@@ -284,10 +323,14 @@ struct SessionView: View {
                 metadataLine(shellMetadata(item))
                 if !item.output.isEmpty {
                     DisclosureGroup {
-                        StreamingTextView(
+                        DeferredStreamingTextView(
+                            model: model,
+                            itemId: item.id,
+                            content: .output,
                             buffer: item.outputBuffer,
                             font: .monospacedSystemFont(ofSize: 13, weight: .regular),
-                            textColor: .secondaryLabelColor
+                            textColor: .secondaryLabelColor,
+                            isDeferred: item.hasDeferredOutputBuffer
                         )
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.top, 4)
@@ -326,10 +369,14 @@ struct SessionView: View {
                 if !item.diff.isEmpty {
                     // Diffs can be large too — same collapse treatment.
                     DisclosureGroup {
-                        StreamingTextView(
+                        DeferredStreamingTextView(
+                            model: model,
+                            itemId: item.id,
+                            content: .diff,
                             buffer: item.diffBuffer,
                             font: .monospacedSystemFont(ofSize: 12, weight: .regular),
-                            textColor: .labelColor
+                            textColor: .labelColor,
+                            isDeferred: item.hasDeferredDiffBuffer
                         )
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.top, 4)
@@ -435,11 +482,13 @@ struct SessionView: View {
         }
     }
 
-    private func shouldShowDivider(after index: Int) -> Bool {
-        guard index + 1 < model.items.count else { return false }
-        let current = model.items[index]
-        let next = model.items[index + 1]
-        return !(current.kind == "message" && next.kind == "message")
+    @ViewBuilder
+    private func assistantDivider(between current: UIItem, and next: UIItem) -> some View {
+        if current.kind != "message" || next.kind != "message" {
+            Divider()
+                .opacity(0.22)
+                .padding(.vertical, 2)
+        }
     }
 
     private func webSearchTitle(_ item: UIItem) -> String {
@@ -702,6 +751,29 @@ struct SessionView: View {
                 expanded = auto
                 lastAutoExpand = auto
             }
+        }
+    }
+
+    private struct DeferredStreamingTextView: View {
+        let model: SessionModel
+        let itemId: String
+        let content: SessionModel.DeferredContent
+        let buffer: StreamingTextBuffer
+        let font: NSFont
+        let textColor: NSColor
+        let isDeferred: Bool
+
+        var body: some View {
+            StreamingTextView(buffer: buffer, font: font, textColor: textColor)
+                .overlay(alignment: .topLeading) {
+                    if isDeferred {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                }
+                .onAppear {
+                    model.materializeDeferredContent(itemId: itemId, content: content)
+                }
         }
     }
 

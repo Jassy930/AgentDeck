@@ -70,8 +70,11 @@ prompt、shell（含 cwd、状态、耗时、来源、解析出的 command actio
 
 继续历史会话时，AgentDeck 走 `thread/resume(threadId)` 后再执行
 `turn/start`，因此新 prompt 会进入原有 Codex 上下文，而不是创建新
-thread。AgentDeck 只做轻量索引、回放和管理入口；Codex 持久化历史仍是
-上下文真相源。
+thread。历史详情读取在后台完成，点击后先标记正在打开，详情返回后再回放到
+右侧，并记录 read / apply 耗时，便于继续定位慢点。大段 shell output 和
+diff 默认只保留摘要与原文，展开时才填充 TextKit buffer，避免大历史
+thread 阻塞主界面。AgentDeck 只做轻量索引、回放和管理入口；Codex
+持久化历史仍是上下文真相源。
 
 第一版管理动作保持低风险：刷新、搜索、重命名和归档。AgentDeck 不读取、
 保存或转发 Codex token。

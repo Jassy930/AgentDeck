@@ -30,15 +30,15 @@ struct UserPromptBlock: View {
     }
 }
 
-struct CodexDocumentSection: View {
-    let buffer: StreamingTextBuffer
+struct CodexTurnSection<Content: View>: View {
+    @ViewBuilder var content: Content
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Codex")
                 .font(.system(.caption, weight: .semibold))
                 .foregroundStyle(.primary)
-            RichMessageView(buffer: buffer)
+            content
                 .frame(maxWidth: 920, alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -50,5 +50,15 @@ struct CodexDocumentSection: View {
                 .frame(width: 3)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+struct CodexDocumentSection: View {
+    let buffer: StreamingTextBuffer
+
+    var body: some View {
+        CodexTurnSection {
+            RichMessageView(buffer: buffer)
+        }
     }
 }

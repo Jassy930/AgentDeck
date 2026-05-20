@@ -55,9 +55,19 @@ struct UIItem: Identifiable {
     var review: String = ""
     var descriptionText: String = "" // raw (neutralized unknown)
     var hasNonWhitespaceText = false
+    var hasDeferredOutputBuffer = false
+    var hasDeferredDiffBuffer = false
     var textBuffer = StreamingTextBuffer()
     var outputBuffer = StreamingTextBuffer()
     var diffBuffer = StreamingTextBuffer()
+}
+
+struct HistoryOpenTiming: Equatable {
+    let threadId: String
+    let itemCount: Int
+    let readMilliseconds: Int
+    let applyMilliseconds: Int
+    let totalMilliseconds: Int
 }
 
 /// The session view model. `@MainActor` + `@Observable`: every mutation is
@@ -113,6 +123,8 @@ final class SessionModel {
     var historyThreads: [HistoryThreadSummary] = []
     var historyErrorMessage: String?
     var isLoadingHistory = false
+    var openingHistoryThreadId: String?
+    var lastHistoryOpenTiming: HistoryOpenTiming?
     var historySearchTerm = ""
     var selectedHistoryThreadId: String?
     private var didRequestInitialHistoryRefresh = false
@@ -121,12 +133,24 @@ final class SessionModel {
         HistoryProjectGroup.group(historyThreads)
     }
 
-    private let client = DaemonClient()
+    private let client: DaemonClient
+    private let historyDetailClient: HistoryDetailReading
     private var daemonStarted = false
     private var itemIndexById: [String: Int] = [:]
     private var pendingAgentItems: [[String: Any]] = []
     private var renderFlushTimer: Timer?
     private let renderFlushInterval: TimeInterval = 1.0 / 30.0
+    private let largeHistoryTextThreshold = 16 * 1024
+
+    enum DeferredContent {
+        case output
+        case diff
+    }
+
+    init(client: DaemonClient = DaemonClient(), historyDetailClient: HistoryDetailReading? = nil) {
+        self.client = client
+        self.historyDetailClient = historyDetailClient ?? DaemonHistoryDetailReader()
+    }
 
     /// Elapsed seconds in the current turn (nil outside a turn). Driven by
     /// `tickNow` so SwiftUI re-renders every second.
@@ -154,6 +178,11 @@ final class SessionModel {
             return "\(base)  \(s)s"
         }
         return base
+    }
+
+    var historyTimingSummary: String {
+        guard let timing = lastHistoryOpenTiming else { return "" }
+        return "history read \(timing.readMilliseconds)ms · apply \(timing.applyMilliseconds)ms · \(timing.itemCount) items"
     }
 
     /// Start/stop the 1Hz tick so `elapsedSeconds` updates while a turn
@@ -269,12 +298,36 @@ final class SessionModel {
     }
 
     func openHistoryThread(_ thread: HistoryThreadSummary) {
-        guard ensureDaemonStarted() else { return }
-        do {
-            let detail = try client.readHistoryThread(threadId: thread.id)
-            applyHistoryThreadDetail(detail)
-        } catch {
-            historyErrorMessage = "\(error)"
+        if historyDetailClient === client {
+            guard ensureDaemonStarted() else { return }
+        }
+        openingHistoryThreadId = thread.id
+        historyErrorMessage = nil
+        lastHistoryOpenTiming = nil
+        let reader = historyDetailClient
+        let startedAt = Date()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Result { try reader.readHistoryThread(threadId: thread.id) }
+            let readFinishedAt = Date()
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.openingHistoryThreadId == thread.id else { return }
+                self.openingHistoryThreadId = nil
+                switch result {
+                case .success(let detail):
+                    let applyStartedAt = Date()
+                    self.applyHistoryThreadDetail(detail)
+                    let appliedAt = Date()
+                    self.lastHistoryOpenTiming = HistoryOpenTiming(
+                        threadId: thread.id,
+                        itemCount: detail.items.count,
+                        readMilliseconds: Self.milliseconds(from: startedAt, to: readFinishedAt),
+                        applyMilliseconds: Self.milliseconds(from: applyStartedAt, to: appliedAt),
+                        totalMilliseconds: Self.milliseconds(from: startedAt, to: appliedAt)
+                    )
+                case .failure(let error):
+                    self.historyErrorMessage = "\(error)"
+                }
+            }
         }
     }
 
@@ -293,6 +346,7 @@ final class SessionModel {
 
     func startNewSessionFromCurrentProject() {
         selectedHistoryThreadId = nil
+        openingHistoryThreadId = nil
         items.removeAll()
         itemIndexById.removeAll(keepingCapacity: true)
         errorMessage = nil
@@ -371,9 +425,31 @@ final class SessionModel {
         item.review = replay.review ?? ""
         item.hasNonWhitespaceText = containsNonWhitespace(replay.text)
         item.textBuffer.replace(with: replay.text)
-        item.outputBuffer.replace(with: item.output)
-        item.diffBuffer.replace(with: item.diff)
+        if shouldDeferHistoryText(item.output) {
+            item.hasDeferredOutputBuffer = true
+        } else {
+            item.outputBuffer.replace(with: item.output)
+        }
+        if shouldDeferHistoryText(item.diff) {
+            item.hasDeferredDiffBuffer = true
+        } else {
+            item.diffBuffer.replace(with: item.diff)
+        }
         return item
+    }
+
+    func materializeDeferredContent(itemId: String, content: DeferredContent) {
+        guard let idx = itemIndexById[itemId], items.indices.contains(idx) else { return }
+        switch content {
+        case .output:
+            guard items[idx].hasDeferredOutputBuffer else { return }
+            items[idx].outputBuffer.replace(with: items[idx].output)
+            items[idx].hasDeferredOutputBuffer = false
+        case .diff:
+            guard items[idx].hasDeferredDiffBuffer else { return }
+            items[idx].diffBuffer.replace(with: items[idx].diff)
+            items[idx].hasDeferredDiffBuffer = false
+        }
     }
 
     func ingest(rawLine raw: String) {
@@ -563,6 +639,14 @@ final class SessionModel {
         }
     }
 
+    private func shouldDeferHistoryText(_ text: String) -> Bool {
+        text.utf8.count > largeHistoryTextThreshold
+    }
+
+    private static func milliseconds(from start: Date, to end: Date) -> Int {
+        max(0, Int((end.timeIntervalSince(start) * 1000).rounded()))
+    }
+
     private func stringArray(from value: Any?) -> [String]? {
         if let strings = value as? [String] {
             return strings
@@ -577,6 +661,7 @@ final class SessionModel {
         flushPendingAgentItems()
         renderFlushTimer?.invalidate()
         tickTimer?.invalidate()
+        historyDetailClient.shutdown()
         client.shutdown()
     }
 

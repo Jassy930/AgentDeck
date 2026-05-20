@@ -373,6 +373,35 @@ final class DaemonClient {
     }
 }
 
+protocol HistoryDetailReading: AnyObject, Sendable {
+    func readHistoryThread(threadId: String) throws -> HistoryThreadDetail
+    func shutdown()
+}
+
+extension HistoryDetailReading {
+    func shutdown() {}
+}
+
+extension DaemonClient: @unchecked Sendable {}
+extension DaemonClient: HistoryDetailReading {}
+
+final class DaemonHistoryDetailReader: HistoryDetailReading, @unchecked Sendable {
+    private let client = DaemonClient()
+    private let lock = NSLock()
+
+    func readHistoryThread(threadId: String) throws -> HistoryThreadDetail {
+        lock.lock()
+        defer { lock.unlock() }
+        return try client.readHistoryThread(threadId: threadId)
+    }
+
+    func shutdown() {
+        lock.lock()
+        defer { lock.unlock() }
+        client.shutdown()
+    }
+}
+
 /// Reads `\n`-delimited lines from a FileHandle, buffering partial reads.
 /// A single JSONL message can arrive split across multiple read() calls
 /// (Codex C-uitest / Eng D5: partial-line framing is exactly what breaks in

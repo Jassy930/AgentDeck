@@ -57,13 +57,15 @@ Rust 侧在 `codex.rs` 中新增 Codex app-server 方法，在 `ipc.rs` 中定�
 2. Swift 发送 `history/listThreads`，可带 `cwd`、`searchTerm`、`cursor`、`limit`。
 3. daemon 调用 Codex `thread/list`，返回中立 thread 摘要：`id`、`name`、`preview`、`cwd`、`createdAt`、`updatedAt`、`status`、`modelProvider`、`source`。
 4. Swift 按 `cwd` 分组展示。
-5. 用户点开 thread。
-6. Swift 发送 `history/readThread { threadId, includeTurns: true }`。
+5. 用户点开 thread，Swift 立即标记该行正在打开，不阻塞主线程。
+6. Swift 在后台发送 `history/readThread { threadId, includeTurns: true }`。
 7. daemon 调用 Codex `thread/read`，把 turns/items 翻译成可回放的中立结构。
-8. 用户点击继续。
-9. Swift 发送 `history/resumeThread { threadId }`。
-10. daemon 调用 `thread/resume`，保存 active thread id 并返回恢复后的 thread 摘要。
-11. 后续输入 prompt 时，Swift 发送现有 `startSession` 或新增 `startTurn`，daemon 对 active thread 执行 `turn/start`。
+8. Swift 记录 read / apply timing，并在主线程应用详情。
+9. 大段 shell output 和 diff 先只保留原文与摘要，展开时再填充 TextKit buffer。
+10. 用户点击继续。
+11. Swift 发送 `history/resumeThread { threadId }`。
+12. daemon 调用 `thread/resume`，保存 active thread id 并返回恢复后的 thread 摘要。
+13. 后续输入 prompt 时，Swift 发送现有 `startSession` 或新增 `startTurn`，daemon 对 active thread 执行 `turn/start`。
 
 ## UI 设计
 
@@ -73,7 +75,9 @@ Rust 侧在 `codex.rs` 中新增 Codex app-server 方法，在 `ipc.rs` 中定�
 - 当前空状态增加“打开历史会话”入口。
 - 有项目时增加历史侧栏或历史面板，按项目路径分组。
 - Thread 行展示项目名、标题或 preview、更新时间、状态。
+- Thread 打开时行内显示进度，状态栏显示最近一次历史打开的 read / apply 耗时。
 - Thread 详情复用现有单列 stream 样式，不做聊天气泡化。
+- 长 output / diff 保持折叠；未展开前不创建大 TextKit storage。
 - 已恢复的 thread 在输入框附近显示“继续历史会话”的短状态。
 
 管理动作第一版只做：
@@ -93,6 +97,16 @@ Rust 侧在 `codex.rs` 中新增 Codex app-server 方法，在 `ipc.rs` 中定�
 - Codex 历史 items 是 lossy 的事实必须在代码注释和文档里明确，不能暗示可完整还原每一次 shell/file-edit。
 
 ## 测试策略
+
+- 行为测试：点击历史 thread 后立即进入 opening 状态，详情返回后再回放。
+- Timing 测试：成功打开后记录 thread id、item count、read/apply/total ms。
+- Lazy 内容测试：大 output / diff 在回放时不填充 buffer，展开请求后再 materialize。
+
+## 后续 TODO
+
+- 支持分页 / 部分读取：优先只读取最近 N 个 turns，滚动到更早位置时再请求旧 turns。
+- 如果 Codex app-server 增加 `thread/read` 的 range/cursor 参数，优先用服务端分页，避免客户端拿完整历史后再截断。
+- 为 timing 增加 daemon 分段日志：spawn、initialize、thread/read、neutral mapping、IPC write。
 
 - Rust adapter fixture 测试：覆盖 `thread/list`、`thread/read`、`thread/resume` 返回结构解析。
 - Rust IPC 测试：中立历史响应不能包含 vendor vocabulary。

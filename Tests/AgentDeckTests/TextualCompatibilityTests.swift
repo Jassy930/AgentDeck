@@ -46,6 +46,26 @@ struct TextualCompatibilityTests {
         let buffer = StreamingTextBuffer()
 
         _ = UserPromptBlock(text: "Summarize the plan")
-        _ = CodexDocumentSection(buffer: buffer)
+        _ = CodexTurnSection {
+            RichMessageView(buffer: buffer)
+        }
+    }
+
+    @Test("conversation turns keep assistant tool activity under one Codex rail")
+    func conversationTurnsKeepAssistantActivityTogether() {
+        let turns = makeConversationTurns(from: [
+            UIItem(id: "u1", lifecycle: "completed", kind: "user", text: "find docs"),
+            UIItem(id: "m1", lifecycle: "completed", kind: "message", text: "I will search."),
+            UIItem(id: "w1", lifecycle: "completed", kind: "webSearch"),
+            UIItem(id: "m2", lifecycle: "completed", kind: "message", text: "Result."),
+            UIItem(id: "u2", lifecycle: "completed", kind: "user", text: "continue"),
+            UIItem(id: "m3", lifecycle: "completed", kind: "message", text: "Next."),
+        ])
+
+        #expect(turns.count == 2)
+        #expect(turns[0].user?.id == "u1")
+        #expect(turns[0].assistantItems.map(\.id) == ["m1", "w1", "m2"])
+        #expect(turns[1].user?.id == "u2")
+        #expect(turns[1].assistantItems.map(\.id) == ["m3"])
     }
 }

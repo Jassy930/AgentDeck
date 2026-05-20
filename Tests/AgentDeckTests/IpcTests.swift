@@ -262,6 +262,129 @@ struct SessionRenderThrottlingTests {
         #expect(model.items[1].changes.count == 2)
         #expect(model.items[1].changes[1].path == "b.txt")
     }
+
+    @Test("opening a history thread returns immediately while detail loads")
+    func openingHistoryThreadReturnsImmediatelyWhileDetailLoads() async throws {
+        let thread = HistoryThreadSummary(id: "h1", name: nil, preview: "old", cwd: "/tmp/project", createdAt: 1, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli")
+        let gate = BlockingHistoryDetailClient(
+            detail: HistoryThreadDetail(
+                thread: thread,
+                items: [
+                    HistoryReplayItem(id: "u1", lifecycle: "completed", kind: "user", text: "old prompt"),
+                    HistoryReplayItem(id: "a1", lifecycle: "completed", kind: "message", text: "old answer"),
+                ]
+            )
+        )
+        let model = SessionModel(historyDetailClient: gate)
+
+        model.openHistoryThread(thread)
+
+        #expect(model.openingHistoryThreadId == "h1")
+        #expect(model.items.isEmpty)
+
+        try await gate.waitUntilStarted()
+
+        gate.release()
+        try await Task.sleep(for: .milliseconds(50))
+
+        #expect(model.openingHistoryThreadId == nil)
+        #expect(model.selectedHistoryThreadId == "h1")
+        #expect(model.items.map(\.text) == ["old prompt", "old answer"])
+    }
+
+    @Test("opening history records read and apply timing")
+    func openingHistoryRecordsReadAndApplyTiming() async throws {
+        let thread = HistoryThreadSummary(id: "h1", name: nil, preview: "old", cwd: "/tmp/project", createdAt: 1, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli")
+        let gate = BlockingHistoryDetailClient(
+            detail: HistoryThreadDetail(
+                thread: thread,
+                items: [
+                    HistoryReplayItem(id: "u1", lifecycle: "completed", kind: "user", text: "old prompt")
+                ]
+            )
+        )
+        let model = SessionModel(historyDetailClient: gate)
+
+        model.openHistoryThread(thread)
+        try await gate.waitUntilStarted()
+        gate.release()
+        try await Task.sleep(for: .milliseconds(50))
+
+        let timing = try #require(model.lastHistoryOpenTiming)
+        #expect(timing.threadId == "h1")
+        #expect(timing.itemCount == 1)
+        #expect(timing.readMilliseconds >= 0)
+        #expect(timing.applyMilliseconds >= 0)
+        #expect(model.historyTimingSummary.contains("read"))
+    }
+
+    @Test("history replay defers large output and diff buffers until requested")
+    func historyReplayDefersLargeOutputAndDiffBuffersUntilRequested() {
+        let model = SessionModel()
+        let thread = HistoryThreadSummary(id: "h1", name: nil, preview: "old", cwd: "/tmp/project", createdAt: 1, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli")
+        let largeOutput = String(repeating: "output\n", count: 3_000)
+        let largeDiff = String(repeating: "+ changed line\n", count: 3_000)
+        let detail = HistoryThreadDetail(
+            thread: thread,
+            items: [
+                HistoryReplayItem(id: "shell1", lifecycle: "completed", kind: "shell", command: "make test", output: largeOutput),
+                HistoryReplayItem(id: "diff1", lifecycle: "completed", kind: "fileEdit", path: "a.txt", diff: largeDiff),
+            ]
+        )
+
+        model.applyHistoryThreadDetail(detail)
+
+        #expect(model.items[0].output == largeOutput)
+        #expect(model.items[0].outputBuffer.text.isEmpty)
+        #expect(model.items[0].hasDeferredOutputBuffer)
+        #expect(model.items[1].diff == largeDiff)
+        #expect(model.items[1].diffBuffer.text.isEmpty)
+        #expect(model.items[1].hasDeferredDiffBuffer)
+
+        model.materializeDeferredContent(itemId: "shell1", content: .output)
+        model.materializeDeferredContent(itemId: "diff1", content: .diff)
+
+        #expect(model.items[0].outputBuffer.text == largeOutput)
+        #expect(!model.items[0].hasDeferredOutputBuffer)
+        #expect(model.items[1].diffBuffer.text == largeDiff)
+        #expect(!model.items[1].hasDeferredDiffBuffer)
+    }
+}
+
+final class BlockingHistoryDetailClient: HistoryDetailReading, @unchecked Sendable {
+    private let lock = NSLock()
+    private let semaphore = DispatchSemaphore(value: 0)
+    private var _didStart = false
+    private let detail: HistoryThreadDetail
+
+    init(detail: HistoryThreadDetail) {
+        self.detail = detail
+    }
+
+    var didStart: Bool {
+        lock.withLock { _didStart }
+    }
+
+    func release() {
+        semaphore.signal()
+    }
+
+    func waitUntilStarted() async throws {
+        let deadline = Date().addingTimeInterval(1)
+        while !didStart {
+            if Date() > deadline {
+                Issue.record("history detail reader did not start")
+                return
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    func readHistoryThread(threadId: String) throws -> HistoryThreadDetail {
+        lock.withLock { _didStart = true }
+        semaphore.wait()
+        return detail
+    }
 }
 
 @Suite("History model")
