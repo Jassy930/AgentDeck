@@ -27,6 +27,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use ipc::{IpcMessage, SessionState};
 
+const WRITER_STOP_KIND: &str = "__agentdeckd/writerStop";
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct HistoryListParams {
     cwd: Option<String>,
@@ -41,10 +43,17 @@ struct StartTurnParams {
     prompt: String,
 }
 
-#[derive(Debug, Clone)]
-struct HubSession {
-    session_id: String,
-    thread_id: Option<String>,
+#[derive(Debug)]
+enum HubAction {
+    Reply(IpcMessage),
+    SpawnTurn {
+        id: Option<u64>,
+        session_id: String,
+        thread_id: Option<String>,
+        cwd: Option<String>,
+        prompt: String,
+    },
+    Shutdown,
 }
 
 fn write_msg(stdout: &mut impl Write, msg: &IpcMessage) -> std::io::Result<()> {
@@ -59,6 +68,9 @@ fn write_outbound_messages(
     out_rx: Receiver<IpcMessage>,
 ) -> std::io::Result<()> {
     for msg in out_rx {
+        if msg.kind == WRITER_STOP_KIND {
+            break;
+        }
         if let Err(e) = write_msg(&mut stdout, &msg) {
             diag::log("writer_failed", &e.to_string());
             return Err(e);
@@ -73,22 +85,88 @@ fn send_msg(out_tx: &Sender<IpcMessage>, msg: IpcMessage) -> std::io::Result<()>
         .map_err(|_| std::io::Error::new(ErrorKind::BrokenPipe, "stdout writer channel closed"))
 }
 
-fn start_turn_ack(msg: &IpcMessage) -> Result<IpcMessage, String> {
-    let session_id = msg
-        .session_id
-        .clone()
-        .ok_or_else(|| "startTurn requires sessionId".to_string())?;
-    let hub_session = HubSession {
-        session_id,
-        thread_id: msg.thread_id.clone(),
-    };
-    Ok(IpcMessage {
-        kind: "turnAccepted".into(),
-        id: msg.id,
-        session_id: Some(hub_session.session_id),
-        thread_id: hub_session.thread_id,
+fn writer_stop_msg() -> IpcMessage {
+    IpcMessage {
+        kind: WRITER_STOP_KIND.into(),
+        id: None,
+        session_id: None,
+        thread_id: None,
         payload: None,
-    })
+    }
+}
+
+fn turn_accepted(id: Option<u64>, session_id: &str, thread_id: Option<&str>) -> IpcMessage {
+    IpcMessage {
+        kind: "turnAccepted".into(),
+        id,
+        session_id: Some(session_id.to_string()),
+        thread_id: thread_id.map(str::to_string),
+        payload: None,
+    }
+}
+
+fn request_session_id(msg: &IpcMessage, fallback: String) -> String {
+    msg.session_id
+        .clone()
+        .or_else(|| {
+            msg.payload
+                .as_ref()
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or(fallback)
+}
+
+fn classify_request(msg: &IpcMessage) -> Result<HubAction, String> {
+    match msg.kind.as_str() {
+        "ping" => Ok(HubAction::Reply(IpcMessage::pong(msg.id))),
+        "shutdown" => Ok(HubAction::Shutdown),
+        "startSession" => {
+            let cwd = msg
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("cwd"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let prompt = msg
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("prompt"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if cwd.is_empty() || prompt.is_empty() {
+                return Err("startSession requires cwd and prompt".into());
+            }
+            let fallback_session_id = msg
+                .id
+                .map(|id| format!("session_{id}"))
+                .unwrap_or_else(|| "session".into());
+            Ok(HubAction::SpawnTurn {
+                id: msg.id,
+                session_id: request_session_id(msg, fallback_session_id),
+                thread_id: None,
+                cwd: Some(cwd.to_string()),
+                prompt: prompt.to_string(),
+            })
+        }
+        "startTurn" => {
+            let params = start_turn_params(msg.payload.as_ref())
+                .ok_or_else(|| "startTurn requires threadId and prompt".to_string())?;
+            let fallback_session_id = format!("session_{}", params.thread_id);
+            Ok(HubAction::SpawnTurn {
+                id: msg.id,
+                session_id: request_session_id(msg, fallback_session_id),
+                thread_id: Some(params.thread_id),
+                cwd: None,
+                prompt: params.prompt,
+            })
+        }
+        other => Ok(HubAction::Reply(IpcMessage::error(
+            msg.id,
+            &format!("unknown kind: {other}"),
+        ))),
+    }
 }
 
 fn history_list_params(payload: Option<&serde_json::Value>) -> HistoryListParams {
@@ -242,6 +320,15 @@ fn run_thread_management(
     }
 }
 
+fn emit_session_event(
+    tx: &Sender<IpcMessage>,
+    session_id: &str,
+    thread_id: Option<&str>,
+    event: IpcMessage,
+) -> std::io::Result<()> {
+    send_msg(tx, IpcMessage::session_event(session_id, thread_id, event))
+}
+
 /// Handle a `startSession` request: drive a full Codex turn, streaming
 /// neutral AgentItems and sessionState transitions over IPC.
 ///
@@ -250,11 +337,19 @@ fn run_thread_management(
 /// as a visible error + Failed state, never a silent hang.
 /// Append a line to the run record. Eng E2: a write failure does NOT block
 /// the session, but IS surfaced as a visible IPC warning — never silent.
-fn record_or_warn(out_tx: &Sender<IpcMessage>, run_id: &str, line: &str) -> std::io::Result<()> {
+fn record_or_warn(
+    out_tx: &Sender<IpcMessage>,
+    session_id: &str,
+    thread_id: Option<&str>,
+    run_id: &str,
+    line: &str,
+) -> std::io::Result<()> {
     if let Err(reason) = record::try_append(run_id, line) {
         diag::log("record_failed", &reason);
-        send_msg(
+        emit_session_event(
             out_tx,
+            session_id,
+            thread_id,
             IpcMessage {
                 kind: "warning".into(),
                 id: None,
@@ -272,6 +367,7 @@ fn record_or_warn(out_tx: &Sender<IpcMessage>, run_id: &str, line: &str) -> std:
 fn run_session(
     out_tx: &Sender<IpcMessage>,
     id: Option<u64>,
+    session_id: &str,
     cwd: &str,
     prompt: &str,
 ) -> std::io::Result<()> {
@@ -285,9 +381,16 @@ fn run_session(
             .unwrap_or(0)
     );
     diag::log("session_start", &format!("run={run_id} cwd={cwd}"));
-    send_msg(out_tx, IpcMessage::session_state(SessionState::Starting))?;
+    emit_session_event(
+        out_tx,
+        session_id,
+        None,
+        IpcMessage::session_state(SessionState::Starting),
+    )?;
     record_or_warn(
         out_tx,
+        session_id,
+        None,
         &run_id,
         &format!(
             r#"{{"event":"start","prompt":{}}}"#,
@@ -299,27 +402,62 @@ fn run_session(
         Ok(a) => a,
         Err(e) => {
             diag::log("spawn_failed", &e.to_string());
-            send_msg(out_tx, IpcMessage::error(id, &e.to_string()))?;
-            return send_msg(out_tx, IpcMessage::session_state(SessionState::Failed));
+            emit_session_event(
+                out_tx,
+                session_id,
+                None,
+                IpcMessage::error(id, &e.to_string()),
+            )?;
+            return emit_session_event(
+                out_tx,
+                session_id,
+                None,
+                IpcMessage::session_state(SessionState::Failed),
+            );
         }
     };
 
     if let Err(e) = adapter.initialize() {
         diag::log("handshake_failed", &e.to_string());
-        send_msg(out_tx, IpcMessage::error(id, &e.to_string()))?;
-        return send_msg(out_tx, IpcMessage::session_state(SessionState::Failed));
+        emit_session_event(
+            out_tx,
+            session_id,
+            None,
+            IpcMessage::error(id, &e.to_string()),
+        )?;
+        return emit_session_event(
+            out_tx,
+            session_id,
+            None,
+            IpcMessage::session_state(SessionState::Failed),
+        );
     }
 
     let thread_id = match adapter.thread_start(cwd) {
         Ok(t) => t,
         Err(e) => {
             diag::log("thread_start_failed", &e.to_string());
-            send_msg(out_tx, IpcMessage::error(id, &e.to_string()))?;
-            return send_msg(out_tx, IpcMessage::session_state(SessionState::Failed));
+            emit_session_event(
+                out_tx,
+                session_id,
+                None,
+                IpcMessage::error(id, &e.to_string()),
+            )?;
+            return emit_session_event(
+                out_tx,
+                session_id,
+                None,
+                IpcMessage::session_state(SessionState::Failed),
+            );
         }
     };
 
-    send_msg(out_tx, IpcMessage::session_state(SessionState::Running))?;
+    emit_session_event(
+        out_tx,
+        session_id,
+        Some(&thread_id),
+        IpcMessage::session_state(SessionState::Running),
+    )?;
 
     // TRUE streaming (the Beat 1 soul — "the native streaming session IS
     // the wow"). EVERY delta is written to IPC the moment it is translated,
@@ -340,11 +478,17 @@ fn run_session(
     {
         let run_id = &run_id;
         let out_tx = out_tx.clone();
+        let event_thread_id = thread_id.clone();
         let turn = adapter.turn_start(&thread_id, prompt, |item| {
             if write_err.is_some() {
                 return;
             }
-            if let Err(e) = send_msg(&out_tx, IpcMessage::agent_item(&item)) {
+            if let Err(e) = emit_session_event(
+                &out_tx,
+                session_id,
+                Some(&event_thread_id),
+                IpcMessage::agent_item(&item),
+            ) {
                 write_err = Some(e);
                 return;
             }
@@ -367,24 +511,49 @@ fn run_session(
                 diag::log("turn_failed", &format!("run={run_id} {e}"));
                 record_or_warn(
                     &out_tx,
+                    session_id,
+                    Some(&thread_id),
                     run_id,
                     &format!(
                         r#"{{"event":"failed","error":{}}}"#,
                         serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "\"\"".into())
                     ),
                 )?;
-                send_msg(&out_tx, IpcMessage::error(id, &e.to_string()))?;
-                return send_msg(&out_tx, IpcMessage::session_state(SessionState::Failed));
+                emit_session_event(
+                    &out_tx,
+                    session_id,
+                    Some(&thread_id),
+                    IpcMessage::error(id, &e.to_string()),
+                )?;
+                return emit_session_event(
+                    &out_tx,
+                    session_id,
+                    Some(&thread_id),
+                    IpcMessage::session_state(SessionState::Failed),
+                );
             }
         }
     }
 
     // Turn succeeded (failure already returned inside the streaming block).
     diag::log("session_complete", &format!("run={run_id}"));
-    record_or_warn(out_tx, &run_id, r#"{"event":"complete"}"#)?;
-    send_msg(out_tx, IpcMessage::session_state(SessionState::Ready))?;
-    send_msg(
+    record_or_warn(
         out_tx,
+        session_id,
+        Some(&thread_id),
+        &run_id,
+        r#"{"event":"complete"}"#,
+    )?;
+    emit_session_event(
+        out_tx,
+        session_id,
+        Some(&thread_id),
+        IpcMessage::session_state(SessionState::Ready),
+    )?;
+    emit_session_event(
+        out_tx,
+        session_id,
+        Some(&thread_id),
         IpcMessage {
             kind: "turnComplete".into(),
             id,
@@ -398,6 +567,7 @@ fn run_session(
 fn run_turn_on_existing_thread(
     out_tx: &Sender<IpcMessage>,
     id: Option<u64>,
+    session_id: &str,
     thread_id: &str,
     prompt: &str,
 ) -> std::io::Result<()> {
@@ -412,9 +582,16 @@ fn run_turn_on_existing_thread(
         "history_turn_start",
         &format!("run={run_id} thread={thread_id}"),
     );
-    send_msg(out_tx, IpcMessage::session_state(SessionState::Starting))?;
+    emit_session_event(
+        out_tx,
+        session_id,
+        Some(thread_id),
+        IpcMessage::session_state(SessionState::Starting),
+    )?;
     record_or_warn(
         out_tx,
+        session_id,
+        Some(thread_id),
         &run_id,
         &format!(
             r#"{{"event":"resume","threadId":{},"prompt":{}}}"#,
@@ -427,22 +604,57 @@ fn run_turn_on_existing_thread(
         Ok(a) => a,
         Err(e) => {
             diag::log("history_turn_spawn_failed", &e.to_string());
-            send_msg(out_tx, IpcMessage::error(id, &e.to_string()))?;
-            return send_msg(out_tx, IpcMessage::session_state(SessionState::Failed));
+            emit_session_event(
+                out_tx,
+                session_id,
+                Some(thread_id),
+                IpcMessage::error(id, &e.to_string()),
+            )?;
+            return emit_session_event(
+                out_tx,
+                session_id,
+                Some(thread_id),
+                IpcMessage::session_state(SessionState::Failed),
+            );
         }
     };
     if let Err(e) = adapter.initialize() {
         diag::log("history_turn_handshake_failed", &e.to_string());
-        send_msg(out_tx, IpcMessage::error(id, &e.to_string()))?;
-        return send_msg(out_tx, IpcMessage::session_state(SessionState::Failed));
+        emit_session_event(
+            out_tx,
+            session_id,
+            Some(thread_id),
+            IpcMessage::error(id, &e.to_string()),
+        )?;
+        return emit_session_event(
+            out_tx,
+            session_id,
+            Some(thread_id),
+            IpcMessage::session_state(SessionState::Failed),
+        );
     }
     if let Err(e) = adapter.thread_resume(thread_id) {
         diag::log("history_turn_resume_failed", &e.to_string());
-        send_msg(out_tx, IpcMessage::error(id, &e.to_string()))?;
-        return send_msg(out_tx, IpcMessage::session_state(SessionState::Failed));
+        emit_session_event(
+            out_tx,
+            session_id,
+            Some(thread_id),
+            IpcMessage::error(id, &e.to_string()),
+        )?;
+        return emit_session_event(
+            out_tx,
+            session_id,
+            Some(thread_id),
+            IpcMessage::session_state(SessionState::Failed),
+        );
     }
 
-    send_msg(out_tx, IpcMessage::session_state(SessionState::Running))?;
+    emit_session_event(
+        out_tx,
+        session_id,
+        Some(thread_id),
+        IpcMessage::session_state(SessionState::Running),
+    )?;
     let mut write_err: Option<std::io::Error> = None;
     {
         let run_id = &run_id;
@@ -451,7 +663,12 @@ fn run_turn_on_existing_thread(
             if write_err.is_some() {
                 return;
             }
-            if let Err(e) = send_msg(&out_tx, IpcMessage::agent_item(&item)) {
+            if let Err(e) = emit_session_event(
+                &out_tx,
+                session_id,
+                Some(thread_id),
+                IpcMessage::agent_item(&item),
+            ) {
                 write_err = Some(e);
                 return;
             }
@@ -470,14 +687,26 @@ fn run_turn_on_existing_thread(
                 diag::log("history_turn_failed", &format!("run={run_id} {e}"));
                 record_or_warn(
                     &out_tx,
+                    session_id,
+                    Some(thread_id),
                     run_id,
                     &format!(
                         r#"{{"event":"failed","error":{}}}"#,
                         serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "\"\"".into())
                     ),
                 )?;
-                send_msg(&out_tx, IpcMessage::error(id, &e.to_string()))?;
-                return send_msg(&out_tx, IpcMessage::session_state(SessionState::Failed));
+                emit_session_event(
+                    &out_tx,
+                    session_id,
+                    Some(thread_id),
+                    IpcMessage::error(id, &e.to_string()),
+                )?;
+                return emit_session_event(
+                    &out_tx,
+                    session_id,
+                    Some(thread_id),
+                    IpcMessage::session_state(SessionState::Failed),
+                );
             }
         }
     }
@@ -486,10 +715,23 @@ fn run_turn_on_existing_thread(
         "history_turn_complete",
         &format!("run={run_id} thread={thread_id}"),
     );
-    record_or_warn(out_tx, &run_id, r#"{"event":"complete"}"#)?;
-    send_msg(out_tx, IpcMessage::session_state(SessionState::Ready))?;
-    send_msg(
+    record_or_warn(
         out_tx,
+        session_id,
+        Some(thread_id),
+        &run_id,
+        r#"{"event":"complete"}"#,
+    )?;
+    emit_session_event(
+        out_tx,
+        session_id,
+        Some(thread_id),
+        IpcMessage::session_state(SessionState::Ready),
+    )?;
+    emit_session_event(
+        out_tx,
+        session_id,
+        Some(thread_id),
         IpcMessage {
             kind: "turnComplete".into(),
             id,
@@ -498,6 +740,26 @@ fn run_turn_on_existing_thread(
             payload: None,
         },
     )
+}
+
+fn run_turn_worker(
+    out_tx: Sender<IpcMessage>,
+    id: Option<u64>,
+    session_id: &str,
+    thread_id: Option<&str>,
+    cwd: Option<&str>,
+    prompt: &str,
+) -> std::io::Result<()> {
+    if let Some(thread_id) = thread_id {
+        return run_turn_on_existing_thread(&out_tx, id, session_id, thread_id, prompt);
+    }
+    if let Some(cwd) = cwd {
+        return run_session(&out_tx, id, session_id, cwd, prompt);
+    }
+    Err(std::io::Error::new(
+        ErrorKind::InvalidInput,
+        "turn worker requires either threadId or cwd",
+    ))
 }
 
 fn main() -> std::io::Result<()> {
@@ -527,11 +789,6 @@ fn main() -> std::io::Result<()> {
         };
 
         match msg.kind.as_str() {
-            "ping" => send_msg(&out_tx, IpcMessage::pong(msg.id))?,
-            "shutdown" => {
-                send_msg(&out_tx, IpcMessage::pong(msg.id))?;
-                break;
-            }
             "history/listThreads" => {
                 let params = history_list_params(msg.payload.as_ref());
                 run_history_list(&out_tx, msg.id, params)?;
@@ -572,56 +829,43 @@ fn main() -> std::io::Result<()> {
                     run_thread_management(&out_tx, msg.id, action, thread_id, name)?;
                 }
             }
-            "startSession" => {
-                let cwd = msg
-                    .payload
-                    .as_ref()
-                    .and_then(|p| p.get("cwd"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let prompt = msg
-                    .payload
-                    .as_ref()
-                    .and_then(|p| p.get("prompt"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if cwd.is_empty() || prompt.is_empty() {
-                    send_msg(
-                        &out_tx,
-                        IpcMessage::error(msg.id, "startSession requires cwd and prompt"),
-                    )?;
-                } else {
-                    run_session(&out_tx, msg.id, cwd, prompt)?;
+            _ => match classify_request(&msg) {
+                Ok(HubAction::Reply(reply)) => send_msg(&out_tx, reply)?,
+                Ok(HubAction::Shutdown) => {
+                    send_msg(&out_tx, IpcMessage::pong(msg.id))?;
+                    send_msg(&out_tx, writer_stop_msg())?;
+                    break;
                 }
-            }
-            "startTurn" => {
-                if let Some(params) = start_turn_params(msg.payload.as_ref()) {
-                    if msg.session_id.is_some() {
-                        match start_turn_ack(&msg) {
-                            Ok(ack) => send_msg(&out_tx, ack)?,
-                            Err(e) => {
-                                send_msg(&out_tx, IpcMessage::error(msg.id, &e))?;
-                                continue;
-                            }
+                Ok(HubAction::SpawnTurn {
+                    id,
+                    session_id,
+                    thread_id,
+                    cwd,
+                    prompt,
+                }) => {
+                    let ack = turn_accepted(id, &session_id, thread_id.as_deref());
+                    let _ = out_tx.send(ack);
+
+                    let worker_tx = out_tx.clone();
+                    std::thread::spawn(move || {
+                        if let Err(err) = run_turn_worker(
+                            worker_tx.clone(),
+                            id,
+                            &session_id,
+                            thread_id.as_deref(),
+                            cwd.as_deref(),
+                            &prompt,
+                        ) {
+                            let _ = worker_tx.send(IpcMessage::session_event(
+                                &session_id,
+                                thread_id.as_deref(),
+                                IpcMessage::error(None, &err.to_string()),
+                            ));
                         }
-                    }
-                    run_turn_on_existing_thread(
-                        &out_tx,
-                        msg.id,
-                        &params.thread_id,
-                        &params.prompt,
-                    )?;
-                } else {
-                    send_msg(
-                        &out_tx,
-                        IpcMessage::error(msg.id, "startTurn requires threadId and prompt"),
-                    )?;
+                    });
                 }
-            }
-            other => send_msg(
-                &out_tx,
-                IpcMessage::error(msg.id, &format!("unknown kind: {other}")),
-            )?,
+                Err(e) => send_msg(&out_tx, IpcMessage::error(msg.id, &e))?,
+            },
         }
     }
 
@@ -674,19 +918,26 @@ mod tests {
     }
 
     #[test]
-    fn start_turn_request_builds_session_started_ack() {
+    fn dispatch_start_turn_returns_ack_without_running_turn_inline() {
         let msg = IpcMessage {
             kind: "startTurn".into(),
-            id: Some(42),
-            session_id: Some("session_1".into()),
-            thread_id: Some("top_level_thread".into()),
+            id: Some(7),
+            session_id: Some("session_7".into()),
+            thread_id: Some("thread_7".into()),
             payload: Some(serde_json::json!({
-                "threadId": "payload_thread",
-                "prompt": "continue"
+                "threadId": "thread_7",
+                "prompt": "hello"
             })),
         };
 
-        let ack = start_turn_ack(&msg).unwrap();
+        let action = classify_request(&msg).unwrap();
+
+        assert!(matches!(action, HubAction::SpawnTurn { .. }));
+    }
+
+    #[test]
+    fn turn_accepted_builds_session_started_ack() {
+        let ack = turn_accepted(Some(42), "session_1", Some("top_level_thread"));
 
         assert_eq!(ack.kind, "turnAccepted");
         assert_eq!(ack.id, Some(42));

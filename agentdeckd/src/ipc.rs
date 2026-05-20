@@ -70,8 +70,6 @@ impl IpcMessage {
         }
     }
 
-    // Task 4 will route worker-owned session events through this envelope.
-    #[allow(dead_code)]
     pub fn session_event(session_id: &str, thread_id: Option<&str>, event: IpcMessage) -> Self {
         Self {
             kind: "session/event".into(),
