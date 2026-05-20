@@ -136,6 +136,117 @@ struct SessionRenderThrottlingTests {
         #expect(model.items.count == 1)
         #expect(model.items[0].text == "final")
     }
+
+    @Test("loading history groups threads without clearing current stream")
+    func loadingHistoryDoesNotClearCurrentStream() {
+        let model = SessionModel()
+
+        model.ingest(agentItem(id: "msg1", text: "current"))
+        model.flushPendingAgentItems()
+        model.setHistoryThreads([
+            HistoryThreadSummary(id: "h1", name: nil, preview: "old", cwd: "/tmp/project", createdAt: 1, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli")
+        ])
+
+        #expect(model.items.count == 1)
+        #expect(model.items[0].text == "current")
+        #expect(model.historyGroups.count == 1)
+        #expect(model.historyGroups[0].cwd == "/tmp/project")
+    }
+
+    @Test("applying history detail replaces stream with replay items")
+    func applyingHistoryDetailReplaysItems() {
+        let model = SessionModel()
+        let thread = HistoryThreadSummary(id: "h1", name: nil, preview: "old", cwd: "/tmp/project", createdAt: 1, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli")
+        let detail = HistoryThreadDetail(
+            thread: thread,
+            items: [
+                HistoryReplayItem(id: "u1", lifecycle: "completed", kind: "user", text: "old prompt"),
+                HistoryReplayItem(id: "a1", lifecycle: "completed", kind: "message", text: "old answer"),
+            ]
+        )
+
+        model.applyHistoryThreadDetail(detail)
+
+        #expect(model.cwd?.path == "/tmp/project")
+        #expect(model.items.map(\.kind) == ["user", "message"])
+        #expect(model.items.map(\.text) == ["old prompt", "old answer"])
+        #expect(model.selectedHistoryThreadId == "h1")
+    }
+}
+
+@Suite("History model")
+struct HistoryModelTests {
+    @Test("decodes neutral history thread summary")
+    func decodesSummary() throws {
+        let data = Data("""
+        {"id":"thread_1","name":"Fix tests","preview":"please fix tests","cwd":"/tmp/project","createdAt":10,"updatedAt":20,"status":"ready","modelProvider":"openai","source":"cli"}
+        """.utf8)
+        let item = try JSONDecoder().decode(HistoryThreadSummary.self, from: data)
+        #expect(item.id == "thread_1")
+        #expect(item.cwd == "/tmp/project")
+        #expect(item.displayTitle == "Fix tests")
+    }
+
+    @Test("groups threads by project cwd newest first")
+    func groupsByProject() {
+        let groups = HistoryProjectGroup.group([
+            HistoryThreadSummary(id: "old", name: nil, preview: "old", cwd: "/tmp/a", createdAt: 1, updatedAt: 1, status: "ready", modelProvider: "openai", source: "cli"),
+            HistoryThreadSummary(id: "new", name: "new", preview: "new", cwd: "/tmp/a", createdAt: 2, updatedAt: 3, status: "ready", modelProvider: "openai", source: "cli"),
+            HistoryThreadSummary(id: "other", name: nil, preview: "other", cwd: "/tmp/b", createdAt: 2, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli"),
+        ])
+
+        #expect(groups.map(\.cwd) == ["/tmp/a", "/tmp/b"])
+        #expect(groups[0].threads.map(\.id) == ["new", "old"])
+    }
+}
+
+@Suite("Daemon history requests")
+struct DaemonHistoryRequestTests {
+    @Test("history list request encodes neutral filters")
+    func historyListRequestEncodesFilters() throws {
+        let msg = DaemonClient.historyListRequest(
+            id: 7,
+            cwd: "/tmp/project",
+            searchTerm: "fix"
+        )
+        let data = try JSONEncoder().encode(msg)
+        let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let payload = try #require(json["payload"] as? [String: Any])
+        #expect(json["kind"] as? String == "history/listThreads")
+        #expect(payload["cwd"] as? String == "/tmp/project")
+        #expect(payload["searchTerm"] as? String == "fix")
+        #expect(!String(data: data, encoding: .utf8)!.lowercased().contains("codex"))
+    }
+
+    @Test("start turn request encodes restored thread id")
+    func startTurnRequestEncodesThreadId() throws {
+        let msg = DaemonClient.startTurnRequest(
+            id: 9,
+            threadId: "thread_1",
+            prompt: "continue"
+        )
+        let data = try JSONEncoder().encode(msg)
+        let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let payload = try #require(json["payload"] as? [String: Any])
+        #expect(json["kind"] as? String == "startTurn")
+        #expect(payload["threadId"] as? String == "thread_1")
+        #expect(payload["prompt"] as? String == "continue")
+    }
+
+    @Test("thread management requests encode intended action")
+    func threadManagementRequestsEncodeAction() throws {
+        let rename = DaemonClient.renameThreadRequest(id: 10, threadId: "thread_1", name: "New name")
+        let archive = DaemonClient.archiveThreadRequest(id: 11, threadId: "thread_1")
+        let unarchive = DaemonClient.unarchiveThreadRequest(id: 12, threadId: "thread_1")
+
+        let renameJSON = try #require(JSONSerialization.jsonObject(with: try JSONEncoder().encode(rename)) as? [String: Any])
+        let archiveJSON = try #require(JSONSerialization.jsonObject(with: try JSONEncoder().encode(archive)) as? [String: Any])
+        let unarchiveJSON = try #require(JSONSerialization.jsonObject(with: try JSONEncoder().encode(unarchive)) as? [String: Any])
+
+        #expect(renameJSON["kind"] as? String == "history/renameThread")
+        #expect(archiveJSON["kind"] as? String == "history/archiveThread")
+        #expect(unarchiveJSON["kind"] as? String == "history/unarchiveThread")
+    }
 }
 
 @Suite("Streaming TextKit renderer")

@@ -49,6 +49,7 @@ Project
 它统一呈现并管理：
 
 - 这个项目当前有哪些 agent 任务
+- Codex 本身已有的历史 thread 分布在哪些项目里
 - 哪些任务正在推进、等待 review 或被 blocked
 - 每次运行改了哪些文件
 - 测试有没有通过
@@ -77,8 +78,9 @@ Project
 
 ```text
 导入本地项目
-→ 创建 AgentDeck Task
-→ 通过 Codex app-server 启动 / 绑定 Codex Thread
+→ 扫描 / 导入 Codex 已有历史 Thread
+→ 创建 AgentDeck Task 或选择历史 Thread
+→ 通过 Codex app-server 启动 / 绑定 / 恢复 Codex Thread
 → 观察本次 Run
 → 结束后抓取 Diff / Log / Test Result
 → 生成 Run Summary
@@ -128,6 +130,12 @@ Today
   tests failed
   reason: missing xcodebuild scheme
   next: 补充 AGENTS.md 里的 test command
+
+Imported Codex History
+- thread_abc: 改善原生流式会话反馈
+  cwd: /Users/jassy/Documents/glm/AgentDeck
+  source: cli
+  next: 可通过 thread/resume 继续上下文
 
 Yesterday
 - AD-011: 重构 Rust daemon config loader
@@ -193,6 +201,7 @@ Blocked
 - project
 - task
 - thread id
+- thread 来源：AgentDeck 新建 / Codex 历史导入
 - prompt
 - start / end time
 - event log

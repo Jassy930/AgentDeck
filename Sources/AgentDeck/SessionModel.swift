@@ -73,6 +73,15 @@ final class SessionModel {
     /// Prompts queued while a turn runs (Eng I1). v0.1: enqueue, auto-send
     /// on turn completion. Step 5 wires the auto-send; Step 4 shows the count.
     var queuedPrompts: [String] = []
+    var historyThreads: [HistoryThreadSummary] = []
+    var historyErrorMessage: String?
+    var isLoadingHistory = false
+    var historySearchTerm = ""
+    var selectedHistoryThreadId: String?
+
+    var historyGroups: [HistoryProjectGroup] {
+        HistoryProjectGroup.group(historyThreads)
+    }
 
     private let client = DaemonClient()
     private var daemonStarted = false
@@ -150,15 +159,8 @@ final class SessionModel {
             return
         }
 
-        if !daemonStarted {
-            do {
-                try client.start()
-                daemonStarted = true
-            } catch {
-                phase = .failed
-                errorMessage = "\(error)"
-                return
-            }
+        if !ensureDaemonStarted() {
+            return
         }
 
         let userItem = UIItem(id: "user-\(UUID().uuidString)",
@@ -168,12 +170,124 @@ final class SessionModel {
         errorMessage = nil
         phase = .starting
 
-        client.startSession(cwd: cwd.path, prompt: trimmed) { [weak self] raw in
-            // Decode ON the main actor (the line crossed threads as a plain
-            // String — Sendable). No non-Sendable value ever raced.
+        let onLine: @MainActor (String) -> Void = { [weak self] raw in
             guard let self else { return }
             self.ingest(rawLine: raw)
         }
+        if let threadId = selectedHistoryThreadId {
+            client.startTurn(threadId: threadId, prompt: trimmed, onLine: onLine)
+        } else {
+            client.startSession(cwd: cwd.path, prompt: trimmed, onLine: onLine)
+        }
+    }
+
+    @discardableResult
+    private func ensureDaemonStarted() -> Bool {
+        if !daemonStarted {
+            do {
+                try client.start()
+                daemonStarted = true
+            } catch {
+                phase = .failed
+                errorMessage = "\(error)"
+                return false
+            }
+        }
+        return true
+    }
+
+    func setHistoryThreads(_ threads: [HistoryThreadSummary]) {
+        historyThreads = threads
+    }
+
+    func loadHistory(currentProjectOnly: Bool = false) {
+        guard !isLoadingHistory else { return }
+        guard ensureDaemonStarted() else { return }
+        isLoadingHistory = true
+        historyErrorMessage = nil
+        let cwdFilter = currentProjectOnly ? cwd?.path : nil
+        let search = historySearchTerm.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            let list = try client.listHistoryThreads(
+                cwd: cwdFilter,
+                searchTerm: search.isEmpty ? nil : search
+            )
+            setHistoryThreads(list.threads)
+        } catch {
+            historyErrorMessage = "\(error)"
+        }
+        isLoadingHistory = false
+    }
+
+    func openHistoryThread(_ thread: HistoryThreadSummary) {
+        guard ensureDaemonStarted() else { return }
+        do {
+            let detail = try client.readHistoryThread(threadId: thread.id)
+            applyHistoryThreadDetail(detail)
+        } catch {
+            historyErrorMessage = "\(error)"
+        }
+    }
+
+    func applyHistoryThreadDetail(_ detail: HistoryThreadDetail) {
+        flushPendingAgentItems()
+        cwd = URL(fileURLWithPath: detail.thread.cwd)
+        selectedHistoryThreadId = detail.thread.id
+        itemIndexById.removeAll(keepingCapacity: true)
+        items = detail.items.map(uiItem)
+        for (index, item) in items.enumerated() {
+            itemIndexById[item.id] = index
+        }
+        errorMessage = nil
+        phase = .ready
+    }
+
+    func startNewSessionFromCurrentProject() {
+        selectedHistoryThreadId = nil
+        items.removeAll()
+        itemIndexById.removeAll(keepingCapacity: true)
+        errorMessage = nil
+        phase = cwd == nil ? .idle : .ready
+    }
+
+    func archiveHistoryThread(_ thread: HistoryThreadSummary) {
+        guard ensureDaemonStarted() else { return }
+        do {
+            try client.archiveHistoryThread(threadId: thread.id)
+            if selectedHistoryThreadId == thread.id {
+                startNewSessionFromCurrentProject()
+            }
+            loadHistory()
+        } catch {
+            historyErrorMessage = "\(error)"
+        }
+    }
+
+    func renameHistoryThread(_ thread: HistoryThreadSummary, name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, ensureDaemonStarted() else { return }
+        do {
+            try client.renameHistoryThread(threadId: thread.id, name: trimmed)
+            loadHistory()
+        } catch {
+            historyErrorMessage = "\(error)"
+        }
+    }
+
+    private func uiItem(from replay: HistoryReplayItem) -> UIItem {
+        var item = UIItem(id: replay.id, lifecycle: replay.lifecycle, kind: replay.kind)
+        item.text = replay.text
+        item.command = replay.command
+        item.output = replay.output ?? ""
+        item.exitCode = replay.exitCode
+        item.path = replay.path
+        item.diff = replay.diff ?? ""
+        item.descriptionText = replay.description ?? ""
+        item.hasNonWhitespaceText = containsNonWhitespace(replay.text)
+        item.textBuffer.replace(with: replay.text)
+        item.outputBuffer.replace(with: item.output)
+        item.diffBuffer.replace(with: item.diff)
+        return item
     }
 
     func ingest(rawLine raw: String) {
@@ -256,7 +370,7 @@ final class SessionModel {
         item.lifecycle = life
         item.kind = kind
         switch kind {
-        case "message", "reasoning":
+        case "user", "message", "reasoning":
             // message = primary answer; reasoning = collapsed chain-of-
             // thought. Both accumulate text the same way: delta appends.
             // started/completed REPLACE — UNLESS the incoming text is empty
