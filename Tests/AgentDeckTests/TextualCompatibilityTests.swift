@@ -204,6 +204,26 @@ struct TextualCompatibilityTests {
         #expect(visualLast - visualFirst > baseLast - baseFirst)
     }
 
+    @Test("conversation scroll spy follows the turn nearest the viewport top")
+    func conversationScrollSpyFollowsTheTurnNearestTheViewportTop() {
+        #expect(ConversationScrollSpy.currentTurnId(from: [
+            ConversationTurnViewportPosition(turnId: "u1", minY: 18),
+            ConversationTurnViewportPosition(turnId: "u2", minY: 260),
+        ]) == "u1")
+
+        #expect(ConversationScrollSpy.currentTurnId(from: [
+            ConversationTurnViewportPosition(turnId: "u1", minY: -180),
+            ConversationTurnViewportPosition(turnId: "u2", minY: 20),
+            ConversationTurnViewportPosition(turnId: "u3", minY: 260),
+        ]) == "u2")
+
+        #expect(ConversationScrollSpy.currentTurnId(from: [
+            ConversationTurnViewportPosition(turnId: "u1", minY: -320),
+            ConversationTurnViewportPosition(turnId: "u2", minY: -80),
+            ConversationTurnViewportPosition(turnId: "u3", minY: 180),
+        ]) == "u2")
+    }
+
     @Test("turn jump rail step target clamps at edges")
     func turnJumpRailStepTargetClampsAtEdges() {
         #expect(TurnJumpRailLayout.stepTarget(selectedIndex: nil, direction: 1, count: 3) == nil)

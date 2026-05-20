@@ -35,6 +35,7 @@ AgentDeck 不做完整内容缩略图，而是做轻量的 conversation turn rai
   - 有附件时显示附件数量
 - 点击轮次点使用 `ScrollViewReader.scrollTo(turn.id, anchor: .top)`。
 - 点击最新点使用底部 sentinel，例如 `conversation-latest`，并 `anchor: .bottom`。
+- 主会话区手动滚动时，每个用户 turn 会上报相对滚动视口的位置；rail 高亮取最接近视口顶部且已进入顶部阈值的用户 turn，被动跟随当前阅读位置。
 - 用户主动发送新消息且消息成功进入本地流时，自动滚到底部 sentinel；这和“跳到最新”共用同一个 anchor，不重建会话视口。
 - 在 rail 上滚轮由透明 AppKit 交互层捕获，但每次滚轮都直接转换为会话轮次跳转，不先滚 rail 自己的列表：
   - 向下跳到下一轮。

@@ -347,10 +347,12 @@ struct SessionView: View {
     // MARK: D3/D7 — single-column stream, NON-CARD
 
     private let conversationLatestAnchorId = "conversation-latest-anchor"
+    private let conversationScrollCoordinateSpace = "conversation-scroll-space"
 
     private var conversationStream: some View {
         let turns = makeConversationTurns(from: model.items)
         let navigationItems = makeConversationTurnNavigationItems(from: turns)
+        let navigableTurnIds = Set(navigationItems.map(\.turnId))
 
         return ScrollViewReader { proxy in
             ZStack(alignment: .trailing) {
@@ -359,6 +361,23 @@ struct SessionView: View {
                         ForEach(Array(turns.enumerated()), id: \.element.id) { index, turn in
                             conversationTurn(turn)
                                 .id(turn.id)
+                                .background {
+                                    if turn.user != nil {
+                                        GeometryReader { geometry in
+                                            Color.clear.preference(
+                                                key: ConversationTurnPositionPreferenceKey.self,
+                                                value: [
+                                                    ConversationTurnViewportPosition(
+                                                        turnId: turn.id,
+                                                        minY: geometry.frame(
+                                                            in: .named(conversationScrollCoordinateSpace)
+                                                        ).minY
+                                                    )
+                                                ]
+                                            )
+                                        }
+                                    }
+                                }
                             if index + 1 < turns.count {
                                 Divider().opacity(0.4)  // D7: subtle divider, not card
                             }
@@ -376,6 +395,14 @@ struct SessionView: View {
                     .padding(.leading, 20)
                     .padding(.trailing, navigationItems.isEmpty ? 20 : 52)
                     .padding(.vertical, 12)
+                }
+                .coordinateSpace(name: conversationScrollCoordinateSpace)
+                .onPreferenceChange(ConversationTurnPositionPreferenceKey.self) { positions in
+                    guard let turnId = ConversationScrollSpy.currentTurnId(from: positions),
+                          navigableTurnIds.contains(turnId) else {
+                        return
+                    }
+                    selectedConversationTurnId = turnId
                 }
 
                 if !navigationItems.isEmpty {
@@ -1186,6 +1213,42 @@ struct TurnJumpRail: View {
 enum TurnJumpRailHitTarget: Equatable {
     case turn(Int)
     case latest
+}
+
+struct ConversationTurnViewportPosition: Equatable {
+    let turnId: String
+    let minY: CGFloat
+}
+
+struct ConversationScrollSpy {
+    static func currentTurnId(
+        from positions: [ConversationTurnViewportPosition],
+        topThreshold: CGFloat = 32
+    ) -> String? {
+        guard !positions.isEmpty else { return nil }
+        let sorted = positions.sorted { lhs, rhs in
+            if lhs.minY != rhs.minY {
+                return lhs.minY < rhs.minY
+            }
+            return lhs.turnId < rhs.turnId
+        }
+
+        if let reached = sorted.filter({ $0.minY <= topThreshold }).last {
+            return reached.turnId
+        }
+        return sorted.first?.turnId
+    }
+}
+
+private struct ConversationTurnPositionPreferenceKey: PreferenceKey {
+    static let defaultValue: [ConversationTurnViewportPosition] = []
+
+    static func reduce(
+        value: inout [ConversationTurnViewportPosition],
+        nextValue: () -> [ConversationTurnViewportPosition]
+    ) {
+        value.append(contentsOf: nextValue())
+    }
 }
 
 struct TurnJumpRailLayout {

@@ -4,7 +4,7 @@
 
 **Goal:** 在右侧历史/当前会话流增加竖排轮次导航点，支持 hover 摘要、点击跳转、跳到最新和 rail 上滚轮按轮跳转。
 
-**Architecture:** 复用现有 `ConversationTurn` 分组作为导航数据源，新增纯 Swift presentation model 生成跳转项。`SessionView` 用 `ScrollViewReader` 包住会话流，为每个 turn 和底部 sentinel 设置稳定 id，并 overlay 一个无背板的轻量 `TurnJumpRail`。Rail 的视觉层只画固定间距、居中排列的点位和 hover 浮层，并用累计位移模拟 Dock 式整体拉伸；透明 AppKit 交互层统一负责 hover、点击和滚轮事件。点位溢出时 rail 跟随当前轮次自动揭示点位，但不单独消费滚轮，跳转边界不循环。
+**Architecture:** 复用现有 `ConversationTurn` 分组作为导航数据源，新增纯 Swift presentation model 生成跳转项。`SessionView` 用 `ScrollViewReader` 包住会话流，为每个 turn 和底部 sentinel 设置稳定 id，并 overlay 一个无背板的轻量 `TurnJumpRail`。Rail 的视觉层只画固定间距、居中排列的点位和 hover 浮层，并用累计位移模拟 Dock 式整体拉伸；透明 AppKit 交互层统一负责 hover、点击和滚轮事件。点位溢出时 rail 跟随当前轮次自动揭示点位，但不单独消费滚轮，跳转边界不循环。主会话手动滚动时，每个 turn 通过 SwiftUI preference 上报视口位置，scroll spy 规则被动更新 rail 高亮。
 
 **Tech Stack:** Swift 6、SwiftUI、AppKit `NSViewRepresentable` 捕获 rail 区域滚轮事件、Swift Testing。
 
