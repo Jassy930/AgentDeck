@@ -158,9 +158,12 @@ final class DaemonMessageRouter: @unchecked Sendable {
 
         if message.kind == "session/event" {
             sessionHandler = sessionEventHandler
-            streamHandler = nil
-            streamRawLine = nil
-            if sessionHandler == nil {
+            streamHandler = streamLineHandler
+            streamRawLine = rawLine ?? Self.encodeRawLine(message)
+            if Self.isTerminalSessionEvent(message) {
+                streamLineHandler = nil
+            }
+            if sessionHandler == nil && streamHandler == nil {
                 unmatched.append(message)
                 unmatchedHandler = unmatchedMessageHandler
             } else {
@@ -266,11 +269,40 @@ final class DaemonMessageRouter: @unchecked Sendable {
         kind == "turnComplete" || kind == "error"
     }
 
+    private static func isTerminalSessionEvent(_ message: IpcMessage) -> Bool {
+        guard let payload = message.payload?.value as? [String: Any],
+              let event = payload["event"] as? [String: Any],
+              let eventKind = event["kind"] as? String else {
+            return false
+        }
+        return isTerminalStreamKind(eventKind)
+    }
+
     private static func encodeRawLine(_ message: IpcMessage) -> String? {
         guard let data = try? JSONEncoder().encode(message) else {
             return nil
         }
         return String(data: data, encoding: .utf8)
+    }
+}
+
+final class DaemonRequestIdAllocator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var nextId: UInt64
+
+    init(startingAt: UInt64 = 1) {
+        nextId = startingAt
+    }
+
+    func assignUniqueId(to message: IpcMessage) -> IpcMessage {
+        lock.lock()
+        let id = nextId
+        nextId += 1
+        lock.unlock()
+
+        var message = message
+        message.id = id
+        return message
     }
 }
 
@@ -287,6 +319,7 @@ final class DaemonClient {
     private let fromDaemon = Pipe()
     private var reader: BufferedLineReader?
     private let router = DaemonMessageRouter()
+    private let requestIdAllocator = DaemonRequestIdAllocator(startingAt: 1_000)
     private let lifecycleLock = NSLock()
     private let writeLock = NSLock()
     private var readerLoopStarted = false
@@ -347,11 +380,12 @@ final class DaemonClient {
         if reader == nil {
             try start()
         }
-        guard let id = msg.id else {
-            throw DaemonError.malformedReply("roundTrip request missing id: \(msg.kind)")
+        let outbound = requestIdAllocator.assignUniqueId(to: msg)
+        guard let id = outbound.id else {
+            throw DaemonError.malformedReply("failed to assign id: \(msg.kind)")
         }
         let enc = JSONEncoder()
-        var data = try enc.encode(msg)
+        var data = try enc.encode(outbound)
         data.append(0x0A) // newline-delimited JSON (D7-confirmed framing)
         router.registerPending(id: id)
         write(data)

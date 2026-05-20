@@ -72,6 +72,42 @@ struct DaemonMessageRoutingTests {
         #expect(events.count == 1)
         #expect(router.takeReply(id: 31)?.kind == "historyThread")
     }
+
+    @Test("routes session events to the active raw stream")
+    func routesSessionEventsToActiveRawStream() {
+        let router = DaemonMessageRouter()
+        let raw = #"{"kind":"session/event","sessionId":"s1","payload":{"event":{"kind":"agentItem"}}}"#
+        var events: [IpcMessage] = []
+        var rawLines: [String] = []
+        router.onSessionEvent = { events.append($0) }
+        router.onStreamLine = { rawLines.append($0) }
+
+        router.route(IpcMessage(kind: "session/event", sessionId: "s1", payload: AnyCodable([
+            "event": ["kind": "agentItem"]
+        ])), rawLine: raw)
+
+        #expect(events.count == 1)
+        #expect(rawLines == [raw])
+    }
+
+    @Test("assigns unique ids when request factories reuse static ids")
+    func assignsUniqueIdsWhenRequestFactoriesReuseStaticIds() {
+        let allocator = DaemonRequestIdAllocator(startingAt: 100)
+        let first = allocator.assignUniqueId(to: DaemonClient.historyListRequest(
+            id: 2,
+            cwd: "/tmp/project",
+            searchTerm: nil
+        ))
+        let second = allocator.assignUniqueId(to: DaemonClient.historyListRequest(
+            id: 2,
+            cwd: "/tmp/project",
+            searchTerm: nil
+        ))
+
+        #expect(first.kind == "history/listThreads")
+        #expect(first.id == 100)
+        #expect(second.id == 101)
+    }
 }
 
 @Suite("BufferedLineReader framing")
