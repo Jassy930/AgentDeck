@@ -164,6 +164,25 @@ struct HistoryModelTests {
     }
 }
 
+@Suite("Daemon history requests")
+struct DaemonHistoryRequestTests {
+    @Test("history list request encodes neutral filters")
+    func historyListRequestEncodesFilters() throws {
+        let msg = DaemonClient.historyListRequest(
+            id: 7,
+            cwd: "/tmp/project",
+            searchTerm: "fix"
+        )
+        let data = try JSONEncoder().encode(msg)
+        let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let payload = try #require(json["payload"] as? [String: Any])
+        #expect(json["kind"] as? String == "history/listThreads")
+        #expect(payload["cwd"] as? String == "/tmp/project")
+        #expect(payload["searchTerm"] as? String == "fix")
+        #expect(!String(data: data, encoding: .utf8)!.lowercased().contains("codex"))
+    }
+}
+
 @Suite("Streaming TextKit renderer")
 @MainActor
 struct StreamingTextKitRendererTests {

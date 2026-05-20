@@ -143,6 +143,53 @@ final class DaemonClient {
         }
     }
 
+    static func historyListRequest(
+        id: UInt64,
+        cwd: String?,
+        searchTerm: String?,
+        cursor: String? = nil,
+        limit: Int? = nil
+    ) -> IpcMessage {
+        var payload: [String: Any] = [:]
+        if let cwd { payload["cwd"] = cwd }
+        if let searchTerm { payload["searchTerm"] = searchTerm }
+        if let cursor { payload["cursor"] = cursor }
+        if let limit { payload["limit"] = limit }
+        return IpcMessage(
+            kind: "history/listThreads",
+            id: id,
+            payload: payload.isEmpty ? nil : AnyCodable(payload)
+        )
+    }
+
+    func listHistoryThreads(
+        cwd: String?,
+        searchTerm: String?,
+        cursor: String? = nil,
+        limit: Int? = 50
+    ) throws -> HistoryThreadListPayload {
+        if reader == nil {
+            try start()
+        }
+        let reply = try roundTrip(Self.historyListRequest(
+            id: 2,
+            cwd: cwd,
+            searchTerm: searchTerm,
+            cursor: cursor,
+            limit: limit
+        ))
+        guard reply.kind == "historyThreads", let payload = reply.payload?.value else {
+            if reply.kind == "error",
+               let dict = reply.payload?.value as? [String: Any],
+               let message = dict["message"] as? String {
+                throw DaemonError.malformedReply(message)
+            }
+            throw DaemonError.malformedReply("expected historyThreads, got \(reply.kind)")
+        }
+        let data = try JSONSerialization.data(withJSONObject: payload)
+        return try JSONDecoder().decode(HistoryThreadListPayload.self, from: data)
+    }
+
     /// Start a streaming session. Sends `startSession {cwd, prompt}`, then
     /// reads neutral IPC messages on a BACKGROUND thread and delivers each
     /// one to `onMessage` ON THE MAIN THREAD.

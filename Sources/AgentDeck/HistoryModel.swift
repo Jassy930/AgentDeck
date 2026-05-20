@@ -53,3 +53,8 @@ struct HistoryProjectGroup: Identifiable, Equatable {
         }
     }
 }
+
+struct HistoryThreadListPayload: Codable, Equatable {
+    var threads: [HistoryThreadSummary]
+    var nextCursor: String?
+}
