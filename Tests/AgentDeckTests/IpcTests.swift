@@ -562,6 +562,40 @@ struct WorkbenchRuntimeModelTests {
         #expect(workbench.runtime(sessionId: "running")?.phase == .running)
         #expect(workbench.selectedSessionId == "thread_b")
     }
+
+    @Test("materializing selected history deferred content does not replace legacy running items")
+    func materializingSelectedHistoryDeferredContentDoesNotReplaceLegacyRunningItems() {
+        let model = SessionModel()
+        model.phase = .running
+        model.items = [
+            UIItem(id: "current1", lifecycle: "delta", kind: "message", text: "current stream")
+        ]
+        let largeOutput = String(repeating: "output\n", count: 3_000)
+        let largeDiff = String(repeating: "+ changed line\n", count: 3_000)
+        let detail = HistoryThreadDetail(
+            thread: HistoryThreadSummary(id: "thread_b", name: nil, preview: "B", cwd: "/tmp/b", createdAt: 1, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli"),
+            items: [
+                HistoryReplayItem(id: "shell1", lifecycle: "completed", kind: "shell", command: "make test", output: largeOutput),
+                HistoryReplayItem(id: "diff1", lifecycle: "completed", kind: "fileEdit", path: "a.txt", diff: largeDiff),
+            ]
+        )
+
+        model.applyHistoryThreadDetail(detail)
+
+        #expect(model.items.map(\.id) == ["current1"])
+        #expect(model.selectedItems[0].hasDeferredOutputBuffer)
+        #expect(model.selectedItems[1].hasDeferredDiffBuffer)
+
+        model.materializeDeferredContent(itemId: "shell1", content: .output)
+        model.materializeDeferredContent(itemId: "diff1", content: .diff)
+
+        #expect(model.items.map(\.id) == ["current1"])
+        #expect(model.items[0].text == "current stream")
+        #expect(model.selectedItems[0].outputBuffer.text == largeOutput)
+        #expect(!model.selectedItems[0].hasDeferredOutputBuffer)
+        #expect(model.selectedItems[1].diffBuffer.text == largeDiff)
+        #expect(!model.selectedItems[1].hasDeferredDiffBuffer)
+    }
 }
 
 final class BlockingHistoryDetailClient: HistoryDetailReading, @unchecked Sendable {

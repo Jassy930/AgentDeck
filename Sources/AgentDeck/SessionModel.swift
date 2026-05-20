@@ -456,7 +456,6 @@ final class SessionModel {
     func materializeDeferredContent(itemId: String, content: DeferredContent) {
         if let runtime = workbench.selectedRuntime,
            runtime.materializeDeferredContent(itemId: itemId, content: content) {
-            items = runtime.items
             return
         }
         guard let idx = itemIndexById[itemId], items.indices.contains(idx) else { return }

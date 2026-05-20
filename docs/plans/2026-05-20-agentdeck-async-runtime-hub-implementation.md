@@ -777,6 +777,8 @@ git commit -m "feat: open history threads without interrupting runtimes"
 
 **规格复核修正（2026-05-20）：** `SessionModel.applyHistoryThreadDetail(_:)` 只能同步当前选中的 history thread 元数据并委托 `WorkbenchModel.applyHistoryThreadDetail(_:)` 切换 selected runtime；不得 flush 或覆盖 legacy `items/itemIndexById/errorMessage/phase`。实际 `SessionModel` 路径新增回归测试：当 legacy `phase == .running` 时打开 history 后仍保持 `.running`，legacy `items` 保持当前 stream，`selectedItems` 切到 history replay。
 
+**第二次规格复核修正（2026-05-20）：** selected runtime 的 deferred output/diff materialize 只更新 runtime 自己，不回写 `SessionModel.items`。回归测试覆盖 legacy `phase == .running` 且 `items` 保留当前 stream 时，打开历史 replay 并展开 large output/diff 后，legacy `items` 仍保持 current item，`selectedItems` 中历史 item 完成 materialize。
+
 ---
 
 ### Task 7: 多 runtime submit 和队列行为
