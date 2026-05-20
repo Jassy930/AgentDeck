@@ -64,7 +64,8 @@ fn record_dir_from(agentdeck_data_dir: Option<&OsStr>, home: Option<&OsStr>) -> 
 /// security guarantee — it catches the common shapes that must never sit in
 /// a plaintext run log.
 pub fn redact(s: &str) -> String {
-    let s = redact_bearer_values(s);
+    let s = redact_prefixed_secret_values(s);
+    let s = redact_bearer_values(&s);
     let mut out = String::with_capacity(s.len());
     for token in s.split_inclusive(|c: char| c.is_whitespace()) {
         let trimmed = token.trim();
@@ -91,6 +92,37 @@ pub fn redact(s: &str) -> String {
     out
 }
 
+fn redact_prefixed_secret_values(s: &str) -> String {
+    let prefixes = ["sk-", "ghp_", "github_pat_", "AKIA"];
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        let next = prefixes
+            .iter()
+            .filter_map(|prefix| rest.find(prefix).map(|idx| (idx, *prefix)))
+            .min_by_key(|(idx, _)| *idx);
+        let Some((idx, prefix)) = next else {
+            out.push_str(rest);
+            break;
+        };
+        let (before, after_start) = rest.split_at(idx);
+        out.push_str(before);
+        let token_end = after_start
+            .char_indices()
+            .find(|(_, c)| is_secret_delimiter(*c))
+            .map(|(i, _)| i)
+            .unwrap_or(after_start.len());
+        if token_end >= prefix.len() {
+            out.push_str("<REDACTED>");
+            rest = &after_start[token_end..];
+        } else {
+            out.push_str(prefix);
+            rest = &after_start[prefix.len()..];
+        }
+    }
+    out
+}
+
 fn redact_bearer_values(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -99,7 +131,7 @@ fn redact_bearer_values(s: &str) -> String {
         out.push_str(before);
         let token_end = after_marker
             .char_indices()
-            .find(|(_, c)| c.is_whitespace() || *c == '"' || *c == '\'' || *c == ',' || *c == '}')
+            .find(|(_, c)| is_secret_delimiter(*c))
             .map(|(i, _)| i)
             .unwrap_or(after_marker.len());
         if token_end > 0 {
@@ -111,6 +143,10 @@ fn redact_bearer_values(s: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+fn is_secret_delimiter(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '"' | '\'' | ',' | '}' | ']' | ')')
 }
 
 /// Append one redacted JSONL line to today's run log. Returns the reason on
@@ -173,6 +209,13 @@ mod tests {
     fn redact_masks_json_authorization_header() {
         let r = redact(r#"{"authorization":"Bearer xyzToken99"}"#);
         assert!(!r.contains("xyzToken99"));
+    }
+
+    #[test]
+    fn redact_masks_json_api_key_value() {
+        let r = redact(r#"{"token":"sk-agentdeck-selfcheck"}"#);
+        assert!(!r.contains("sk-agentdeck-selfcheck"));
+        assert!(r.contains("<REDACTED>"));
     }
 
     #[test]

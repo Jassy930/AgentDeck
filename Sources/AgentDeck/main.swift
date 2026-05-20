@@ -17,8 +17,18 @@ if CommandLine.arguments.contains("--selfcheck") {
             client.shutdown()
             exit(1)
         }
+        let logging = try client.loggingSelfcheck()
+        let recordOk = logging["recordOk"] as? Bool ?? false
+        let diagnosticOk = logging["diagnosticOk"] as? Bool ?? false
+        let redactionOk = logging["redactionOk"] as? Bool ?? false
+        guard recordOk, diagnosticOk, redactionOk else {
+            let failures = logging["failures"] ?? []
+            FileHandle.standardError.write(Data("selfcheck FATAL: logging selfcheck failed: \(failures)\n".utf8))
+            client.shutdown()
+            exit(1)
+        }
         client.shutdown()
-        print("selfcheck OK: IPC round trip + A1 lifecycle clean.")
+        print("selfcheck OK: IPC lifecycle + logging clean.")
         exit(0)
     } catch {
         FileHandle.standardError.write(Data("selfcheck FATAL: \(error)\n".utf8))

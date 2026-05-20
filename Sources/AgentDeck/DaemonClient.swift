@@ -143,6 +143,20 @@ final class DaemonClient {
         }
     }
 
+    func loggingSelfcheck() throws -> [String: Any] {
+        let reply = try roundTrip(IpcMessage(kind: "selfcheck/logging", id: 8, payload: nil))
+        guard reply.kind == "loggingSelfcheck",
+              let payload = reply.payload?.value as? [String: Any] else {
+            if reply.kind == "error",
+               let dict = reply.payload?.value as? [String: Any],
+               let message = dict["message"] as? String {
+                throw DaemonError.malformedReply(message)
+            }
+            throw DaemonError.malformedReply("expected loggingSelfcheck, got \(reply.kind)")
+        }
+        return payload
+    }
+
     static func historyListRequest(
         id: UInt64,
         cwd: String?,

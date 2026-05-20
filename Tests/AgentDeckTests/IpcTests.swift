@@ -40,6 +40,17 @@ struct IpcMessageTests {
         #expect(!s.contains("codex"))
         #expect(!s.contains("openai"))
     }
+
+    @Test("logging selfcheck request is neutral")
+    func loggingSelfcheckRequestIsNeutral() throws {
+        let msg = IpcMessage(kind: "selfcheck/logging", id: 8, payload: nil)
+        let data = try JSONEncoder().encode(msg)
+        let decoded = try JSONDecoder().decode(IpcMessage.self, from: data)
+        let wire = String(data: data, encoding: .utf8)!.lowercased()
+        #expect(decoded.kind == "selfcheck/logging")
+        #expect(!wire.contains("codex"))
+        #expect(!wire.contains("openai"))
+    }
 }
 
 @Suite("BufferedLineReader framing")

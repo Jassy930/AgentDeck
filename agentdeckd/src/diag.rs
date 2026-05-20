@@ -107,7 +107,7 @@ impl DiagnosticEvent {
     }
 }
 
-fn log_path() -> Option<PathBuf> {
+pub fn diagnostic_log_path() -> Option<PathBuf> {
     let mut p = app_data_dir()?;
     p.push("diagnostic.log");
     Some(p)
@@ -133,7 +133,7 @@ pub fn log(event: &str, detail: &str) {
 
 pub fn log_event(event: DiagnosticEvent) {
     let line = event.to_json_line();
-    if let Some(path) = log_path() {
+    if let Some(path) = diagnostic_log_path() {
         if let Some(dir) = path.parent() {
             let _ = create_dir_all(dir);
         }
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn log_path_is_app_support() {
-        let p = log_path().unwrap();
+        let p = diagnostic_log_path().unwrap();
         assert!(
             p.to_string_lossy()
                 .contains("Application Support/AgentDeck")

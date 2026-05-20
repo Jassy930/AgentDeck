@@ -592,6 +592,127 @@ fn run_turn_on_existing_thread(
     )
 }
 
+fn selfcheck_failure(
+    code: &str,
+    message: impl Into<String>,
+    path_hint: impl Into<String>,
+    suggested_next_check: impl Into<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "code": code,
+        "message": message.into(),
+        "pathHint": path_hint.into(),
+        "suggestedNextCheck": suggested_next_check.into(),
+    })
+}
+
+fn run_logging_selfcheck(stdout: &mut impl Write, id: Option<u64>) -> std::io::Result<()> {
+    let probe_id = format!("probe-{}", new_run_id());
+    let run_id = format!("selfcheck-{}", new_run_id());
+    let secret_key = "sk-agentdeck-selfcheck";
+    let secret_bearer = "Bearer agentdeck-selfcheck-token";
+
+    diag::log_event(
+        DiagnosticEvent::new("selfcheck_logging")
+            .level("info")
+            .code("selfcheck_logging")
+            .run_id(&run_id)
+            .event_seq(1)
+            .message(format!("logging selfcheck {probe_id}"))
+            .detail(format!("{probe_id} {secret_key} {secret_bearer}")),
+    );
+
+    let record_line = serde_json::json!({
+        "event": "selfcheck",
+        "probeId": probe_id,
+        "token": secret_key,
+        "authorization": secret_bearer,
+    })
+    .to_string();
+    let record_write = record::try_append(&run_id, &record_line);
+
+    let record_path = record::record_dir().map(|mut p| {
+        p.push(format!("{run_id}.jsonl"));
+        p
+    });
+    let diagnostic_path = diag::diagnostic_log_path();
+    let record_path_hint = record_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "record path unavailable".into());
+    let diagnostic_path_hint = diagnostic_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "diagnostic path unavailable".into());
+
+    let record_content = record_path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    let diagnostic_content = diagnostic_path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+
+    let record_ok = record_write.is_ok() && record_content.contains(&probe_id);
+    let diagnostic_ok = diagnostic_content.contains(&probe_id);
+    let redaction_ok = !record_content.contains(secret_key)
+        && !record_content.contains("agentdeck-selfcheck-token")
+        && !diagnostic_content.contains(secret_key)
+        && !diagnostic_content.contains("agentdeck-selfcheck-token");
+
+    let mut failures = Vec::new();
+    if let Err(reason) = record_write {
+        failures.push(selfcheck_failure(
+            "record_write_failed",
+            reason,
+            &record_path_hint,
+            "检查 AGENTDECK_DATA_DIR 或用户 Application Support 目录权限",
+        ));
+    } else if !record_ok {
+        failures.push(selfcheck_failure(
+            "record_probe_missing",
+            "run record probe was not readable after write",
+            &record_path_hint,
+            "检查 runs 目录是否可读且 runId 文件是否存在",
+        ));
+    }
+    if !diagnostic_ok {
+        failures.push(selfcheck_failure(
+            "diagnostic_probe_missing",
+            "diagnostic probe was not readable after write",
+            &diagnostic_path_hint,
+            "检查 diagnostic.log 是否可写可读",
+        ));
+    }
+    if !redaction_ok {
+        failures.push(selfcheck_failure(
+            "redaction_failed",
+            "selfcheck secret appeared in persisted logs",
+            format!("{record_path_hint}; {diagnostic_path_hint}"),
+            "停止分享日志并修复 record::redact",
+        ));
+    }
+
+    write_msg(
+        stdout,
+        &IpcMessage {
+            kind: "loggingSelfcheck".into(),
+            id,
+            payload: Some(serde_json::json!({
+                "recordOk": record_ok,
+                "diagnosticOk": diagnostic_ok,
+                "redactionOk": redaction_ok,
+                "probeId": probe_id,
+                "runId": run_id,
+                "recordPathHint": record_path_hint,
+                "diagnosticPathHint": diagnostic_path_hint,
+                "failures": failures,
+            })),
+        },
+    )
+}
+
 fn main() -> std::io::Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -619,6 +740,9 @@ fn main() -> std::io::Result<()> {
             "shutdown" => {
                 write_msg(&mut stdout, &IpcMessage::pong(msg.id))?;
                 break;
+            }
+            "selfcheck/logging" => {
+                run_logging_selfcheck(&mut stdout, msg.id)?;
             }
             "history/listThreads" => {
                 let params = history_list_params(msg.payload.as_ref());
