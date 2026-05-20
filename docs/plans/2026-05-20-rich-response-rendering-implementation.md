@@ -21,12 +21,11 @@
 Run:
 
 ```bash
-test -d ~/.claude/skills/gstack/bin && echo GSTACK_OK || echo GSTACK_MISSING
 swift --version
 git status --short --branch
 ```
 
-Expected: `GSTACK_OK`, Swift 6+, and a clean or understood working tree.
+Expected: Swift 6+ and a clean or understood working tree.
 
 **Step 2: Confirm Textual package requirements**
 

@@ -1,0 +1,34 @@
+# AgentDeck 文档索引
+
+本目录是 AgentDeck 的仓库内记录系统。`AGENTS.md` 只做入口导航；稳定知识必须落到这里或仓库根部的专门文档中。
+
+## 顶层文档
+
+- `../NORTH_STAR.md`：产品北极星、v0.1 双拍和不做什么。
+- `../README.md`：项目介绍、当前功能、构建运行和测试入口。
+- `../ARCHITECTURE.md`：稳定架构、分层边界、依赖方向和不变量。
+- `../AGENTS.md`：代理工作入口和仓库导航。
+
+## 运行与诊断
+
+- `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、failure code 和排查流程。
+- `QUALITY.md`：按变更范围选择验证命令，以及文档结构检查入口。
+
+## 计划与历史
+
+- `plans/README.md`：设计文档和实施计划的命名、内容和归档规则。
+- `plans/*-design.md`：功能设计、架构取舍和验收标准。
+- `plans/*-implementation.md`：可执行实施步骤、验证命令和收口记录。
+
+## 协议资料
+
+- `../protocol/SPIKE_FINDINGS.md`：Codex app-server wire framing、方法和 schema 事实源。
+- `../protocol/CODEX_VERSION.txt`：生成当前 schema 时使用的 Codex 版本。
+- `../protocol/*.json`：官方 schema 快照。
+
+## 更新规则
+
+- 代码行为变化时，同步更新对应产品、架构、诊断或计划文档。
+- 文档不要重复大段实现细节；稳定事实放专门文档，临时决策放计划文档。
+- 如果某条规则需要长期执行，优先补测试、脚本或 CI 检查，而不是只写自然语言。
+- 每次阶段性收口前运行 `scripts/verify-agent-docs.sh`，确认文档入口没有漂移。

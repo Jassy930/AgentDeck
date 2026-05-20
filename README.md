@@ -29,8 +29,8 @@ v0.1 验收两件事（"双拍"）：
    Claude Code / SSH / 云端 adapter 的地基 —— 官方产品结构上做不了
    agent 中立。
 
-完整设计与三层评审记录见设计文档（office-hours → CEO → Eng → Design
-review，七层可追溯）。
+稳定架构边界见 [ARCHITECTURE.md](ARCHITECTURE.md)。完整设计与三层评审记录见
+[docs/plans/](docs/plans/)；文档导航见 [docs/index.md](docs/index.md)。
 
 ## 架构
 
@@ -156,6 +156,7 @@ framing（逐行 JSONL）。codex 版本固定在 `protocol/CODEX_VERSION.txt`�
   - 结构化 JSONL，记录进程、IPC、adapter、run record 写入和自检异常。
 
 Agent 自查流程见 [docs/AGENT_DIAGNOSTICS.md](docs/AGENT_DIAGNOSTICS.md)。
+质量门禁和文档结构检查见 [docs/QUALITY.md](docs/QUALITY.md)。
 
 写入前做 best-effort 密钥脱敏。写失败不阻塞会话，但会在界面可见
 警告（绝不静默）。`AGENTDECK_DATA_DIR` 只用于测试/诊断时覆盖数据目录，
