@@ -256,37 +256,26 @@ CLI 可以作为 fallback，但产品定义上必须是：
 
 ### 本地数据
 
-两层存储：
+v0.1 当前实现采用 AgentDeck 管理的数据目录，绝不写入用户项目 git：
 
-#### 1. SQLite
-
-存结构化索引：
+#### 1. Run Records
 
 ```text
-projects
-tasks
-runs
-threads
-artifacts
-events
+~/Library/Application Support/AgentDeck/runs/*.jsonl
 ```
 
-#### 2. Repo Bridge Files
+每次 turn 写入中立 item 留痕，用 `runId` 与诊断日志关联。
 
-写入项目目录：
+#### 2. Diagnostic Log
 
 ```text
-.agentdeck/tasks/AD-0001.md
-.agentdeck/runs/AD-0001-R001.json
+~/Library/Application Support/AgentDeck/diagnostic.log
 ```
 
-意义：
+记录进程、IPC、adapter 和持久化异常；每行是结构化 JSONL，带 `runId` / `eventSeq` 等关联字段。
 
-- App 数据不锁死
-- agent 可以读
-- 人可以读
-- 可以进 git
-- 可以迁移到其他 agent
+`AGENTDECK_DATA_DIR` 只用于测试和诊断覆盖目录。早期草案里的 repo-native
+`.agentdeck/runs` bridge 不再是当前实现路径。
 
 ---
 

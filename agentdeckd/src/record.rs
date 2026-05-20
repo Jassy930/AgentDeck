@@ -17,17 +17,45 @@
 //! redaction, not a security boundary — but it stops the obvious leaks
 //! (sk-..., Bearer ..., AWS keys) from landing in a plaintext run log.
 
+use std::ffi::OsStr;
 use std::fs::{OpenOptions, create_dir_all};
 use std::io::Write;
 use std::path::PathBuf;
 
 /// AgentDeck's own data directory. Never the project tree (premise 5).
-pub fn record_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
+pub fn app_data_dir() -> Option<PathBuf> {
+    app_data_dir_from(
+        std::env::var_os("AGENTDECK_DATA_DIR").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+pub fn app_data_dir_from(
+    agentdeck_data_dir: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
+    if let Some(root) = agentdeck_data_dir
+        && !root.is_empty()
+    {
+        return Some(PathBuf::from(root));
+    }
+    let home = home?;
     let mut p = PathBuf::from(home);
     p.push("Library");
     p.push("Application Support");
     p.push("AgentDeck");
+    Some(p)
+}
+
+pub fn record_dir() -> Option<PathBuf> {
+    let mut p = app_data_dir()?;
+    p.push("runs");
+    Some(p)
+}
+
+#[cfg(test)]
+fn record_dir_from(agentdeck_data_dir: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    let mut p = app_data_dir_from(agentdeck_data_dir, home)?;
     p.push("runs");
     Some(p)
 }
@@ -36,6 +64,8 @@ pub fn record_dir() -> Option<PathBuf> {
 /// security guarantee — it catches the common shapes that must never sit in
 /// a plaintext run log.
 pub fn redact(s: &str) -> String {
+    let s = redact_prefixed_secret_values(s);
+    let s = redact_bearer_values(&s);
     let mut out = String::with_capacity(s.len());
     for token in s.split_inclusive(|c: char| c.is_whitespace()) {
         let trimmed = token.trim();
@@ -60,6 +90,63 @@ pub fn redact(s: &str) -> String {
         }
     }
     out
+}
+
+fn redact_prefixed_secret_values(s: &str) -> String {
+    let prefixes = ["sk-", "ghp_", "github_pat_", "AKIA"];
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        let next = prefixes
+            .iter()
+            .filter_map(|prefix| rest.find(prefix).map(|idx| (idx, *prefix)))
+            .min_by_key(|(idx, _)| *idx);
+        let Some((idx, prefix)) = next else {
+            out.push_str(rest);
+            break;
+        };
+        let (before, after_start) = rest.split_at(idx);
+        out.push_str(before);
+        let token_end = after_start
+            .char_indices()
+            .find(|(_, c)| is_secret_delimiter(*c))
+            .map(|(i, _)| i)
+            .unwrap_or(after_start.len());
+        if token_end >= prefix.len() {
+            out.push_str("<REDACTED>");
+            rest = &after_start[token_end..];
+        } else {
+            out.push_str(prefix);
+            rest = &after_start[prefix.len()..];
+        }
+    }
+    out
+}
+
+fn redact_bearer_values(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(idx) = rest.find("Bearer ") {
+        let (before, after_marker) = rest.split_at(idx + "Bearer ".len());
+        out.push_str(before);
+        let token_end = after_marker
+            .char_indices()
+            .find(|(_, c)| is_secret_delimiter(*c))
+            .map(|(i, _)| i)
+            .unwrap_or(after_marker.len());
+        if token_end > 0 {
+            out.push_str("<REDACTED>");
+            rest = &after_marker[token_end..];
+        } else {
+            rest = after_marker;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn is_secret_delimiter(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '"' | '\'' | ',' | '}' | ']' | ')')
 }
 
 /// Append one redacted JSONL line to today's run log. Returns the reason on
@@ -93,13 +180,42 @@ mod tests {
     }
 
     #[test]
+    fn record_dir_respects_agentdeck_data_dir_override() {
+        let root = std::env::temp_dir().join(format!("agentdeck-test-{}", std::process::id()));
+        let dir = record_dir_from(Some(root.as_os_str()), None).unwrap();
+
+        assert!(dir.starts_with(&root));
+        assert!(dir.ends_with("runs"));
+    }
+
+    #[test]
     fn redact_masks_api_keys_and_tokens() {
         let r = redact("running with sk-abc123DEF456ghi789jkl and Bearer xyzToken99");
         assert!(!r.contains("sk-abc123DEF456ghi789jkl"));
         assert!(r.contains("<REDACTED>"));
         // Bearer's value redacted; the word "Bearer" itself triggers on the
         // token start so the whole credential token is masked.
-        assert!(!r.contains("xyzToken99") || r.contains("<REDACTED>"));
+        assert!(!r.contains("xyzToken99"));
+    }
+
+    #[test]
+    fn redact_masks_bearer_value_after_space() {
+        let r = redact("Authorization: Bearer xyzToken99");
+        assert!(!r.contains("xyzToken99"));
+        assert!(r.contains("Bearer <REDACTED>") || r.contains("<REDACTED>"));
+    }
+
+    #[test]
+    fn redact_masks_json_authorization_header() {
+        let r = redact(r#"{"authorization":"Bearer xyzToken99"}"#);
+        assert!(!r.contains("xyzToken99"));
+    }
+
+    #[test]
+    fn redact_masks_json_api_key_value() {
+        let r = redact(r#"{"token":"sk-agentdeck-selfcheck"}"#);
+        assert!(!r.contains("sk-agentdeck-selfcheck"));
+        assert!(r.contains("<REDACTED>"));
     }
 
     #[test]

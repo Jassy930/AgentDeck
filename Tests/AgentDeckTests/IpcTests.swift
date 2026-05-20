@@ -40,6 +40,33 @@ struct IpcMessageTests {
         #expect(!s.contains("codex"))
         #expect(!s.contains("openai"))
     }
+
+    @Test("logging selfcheck request is neutral")
+    func loggingSelfcheckRequestIsNeutral() throws {
+        let msg = IpcMessage(kind: "selfcheck/logging", id: 8, payload: nil)
+        let data = try JSONEncoder().encode(msg)
+        let decoded = try JSONDecoder().decode(IpcMessage.self, from: data)
+        let wire = String(data: data, encoding: .utf8)!.lowercased()
+        #expect(decoded.kind == "selfcheck/logging")
+        #expect(!wire.contains("codex"))
+        #expect(!wire.contains("openai"))
+    }
+
+    @Test("diagnostics report request is neutral and machine readable")
+    func diagnosticsReportRequestIsNeutral() throws {
+        let msg = IpcMessage(
+            kind: "diagnostics/report",
+            id: 9,
+            payload: AnyCodable(["limit": 20, "sinceSeconds": 3600])
+        )
+
+        let data = try JSONEncoder().encode(msg)
+        let decoded = try JSONDecoder().decode(IpcMessage.self, from: data)
+        let wire = String(data: data, encoding: .utf8)!.lowercased()
+        #expect(decoded.kind == "diagnostics/report")
+        #expect(!wire.contains("codex"))
+        #expect(!wire.contains("openai"))
+    }
 }
 
 @Suite("BufferedLineReader framing")
@@ -135,6 +162,22 @@ struct SessionRenderThrottlingTests {
         #expect(model.phase == .ready)
         #expect(model.items.count == 1)
         #expect(model.items[0].text == "final")
+    }
+
+    @Test("daemon warning is visible without failing the turn")
+    func daemonWarningIsVisibleWithoutFailingTheTurn() {
+        let model = SessionModel()
+        model.phase = .running
+
+        model.ingest(IpcMessage(
+            kind: "warning",
+            id: nil,
+            payload: AnyCodable(["message": "本次未留痕: HOME not set"])
+        ))
+
+        #expect(model.warningMessage == "本次未留痕: HOME not set")
+        #expect(model.errorMessage == nil)
+        #expect(model.phase == .running)
     }
 
     @Test("loading history groups threads without clearing current stream")

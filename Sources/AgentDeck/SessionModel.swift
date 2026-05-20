@@ -111,6 +111,7 @@ final class SessionModel {
     }
     var items: [UIItem] = []
     var errorMessage: String?
+    var warningMessage: String?
     /// When the current turn began. `nil` outside a turn.
     var runStartedAt: Date?
     /// Driven by a tick timer; the status bar reads this so the elapsed
@@ -237,6 +238,7 @@ final class SessionModel {
         itemIndexById[userItem.id] = items.count
         items.append(userItem)
         errorMessage = nil
+        warningMessage = nil
         phase = .starting
 
         let onLine: @MainActor (String) -> Void = { [weak self] raw in
@@ -344,6 +346,7 @@ final class SessionModel {
             itemIndexById[item.id] = index
         }
         errorMessage = nil
+        warningMessage = nil
         phase = .ready
     }
 
@@ -354,6 +357,7 @@ final class SessionModel {
         items.removeAll()
         itemIndexById.removeAll(keepingCapacity: true)
         errorMessage = nil
+        warningMessage = nil
         phase = cwd == nil ? .idle : .ready
     }
 
@@ -498,6 +502,9 @@ final class SessionModel {
             let m = (msg.payload?.value as? [String: Any])?["message"] as? String
             errorMessage = m ?? "unknown error"
             phase = .failed
+        case "warning":
+            let m = (msg.payload?.value as? [String: Any])?["message"] as? String
+            warningMessage = m ?? "unknown warning"
         default:
             break
         }

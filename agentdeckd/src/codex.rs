@@ -1013,6 +1013,28 @@ fn translate(method: &str, params: &Value) -> Option<AgentItem> {
                 kind: item_to_kind(item)?,
             })
         }
+        other if other.starts_with("item/") => {
+            let item = params.get("item")?;
+            let id = item.get("id").and_then(Value::as_str)?.to_string();
+            let lifecycle = if other.ends_with("/completed") {
+                Lifecycle::Completed
+            } else if other.ends_with("/delta") {
+                Lifecycle::Delta
+            } else {
+                Lifecycle::Started
+            };
+            let item_type = item
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            Some(AgentItem {
+                id,
+                lifecycle,
+                kind: AgentItemKind::Raw {
+                    description: format!("unsupported item notification: {other} ({item_type})"),
+                },
+            })
+        }
         _ => None,
     }
 }
@@ -1097,6 +1119,23 @@ mod tests {
             }
             _ => panic!("expected Raw neutralization"),
         }
+    }
+
+    #[test]
+    fn unknown_notification_becomes_raw_agent_item() {
+        let params = json!({
+            "item": {
+                "id": "unknown_1",
+                "type": "newFutureItem",
+                "payload": {"x": 1}
+            }
+        });
+
+        let item = translate("item/newFutureItem/completed", &params).unwrap();
+
+        assert_eq!(item.id, "unknown_1");
+        assert_eq!(item.lifecycle, Lifecycle::Completed);
+        assert!(matches!(item.kind, AgentItemKind::Raw { .. }));
     }
 
     #[test]

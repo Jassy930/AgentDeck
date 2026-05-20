@@ -105,14 +105,15 @@ swift build -c release           # 产出 .build/release/AgentDeck
 
 ```bash
 swift run AgentDeck               # 打开原生窗口
-swift run AgentDeck -- --selfcheck  # 无窗口自检(CI: IPC+生命周期)
+swift run AgentDeck -- --selfcheck  # 无窗口自检: IPC lifecycle + logging/redaction probe
+swift run AgentDeck -- --diagnostics-report --json  # 输出机器可读诊断报告
 ```
 
 测试：
 
 ```bash
-cargo test        # daemon: ipc/codex/record/diag(含 fixture 回放)
-swift test        # app: 中立协议 + 分行成帧
+cargo test        # daemon: ipc/codex/record/diag/report(含 fixture 回放)
+swift test        # app: 中立协议 + 分行成帧 + headless 请求编码
 ```
 
 ### 协议
@@ -123,11 +124,16 @@ framing（逐行 JSONL）。codex 版本固定在 `protocol/CODEX_VERSION.txt`�
 
 ### 本地数据（AgentDeck 管理，绝不进你的 git）
 
-- run 记录：`~/Library/Application Support/AgentDeck/runs/*.jsonl`
-- 诊断日志：`~/Library/Application Support/AgentDeck/diagnostic.log`
+- run record：`~/Library/Application Support/AgentDeck/runs/*.jsonl`
+  - 每次 turn 的中立 `AgentItem` 留痕，可按 `runId` 回放和排查。
+- diagnostic log：`~/Library/Application Support/AgentDeck/diagnostic.log`
+  - 结构化 JSONL，记录进程、IPC、adapter、run record 写入和自检异常。
+
+Agent 自查流程见 [docs/AGENT_DIAGNOSTICS.md](docs/AGENT_DIAGNOSTICS.md)。
 
 写入前做 best-effort 密钥脱敏。写失败不阻塞会话，但会在界面可见
-警告（绝不静默）。
+警告（绝不静默）。`AGENTDECK_DATA_DIR` 只用于测试/诊断时覆盖数据目录，
+不是普通用户配置。
 
 ### 回滚
 
