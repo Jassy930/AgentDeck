@@ -223,7 +223,6 @@ final class SessionModel {
     private var pendingAgentItems: [[String: Any]] = []
     private var renderFlushTimer: Timer?
     private let renderFlushInterval: TimeInterval = 1.0 / 30.0
-    private let largeHistoryTextThreshold = 16 * 1024
 
     enum DeferredContent {
         case output
@@ -415,18 +414,9 @@ final class SessionModel {
     }
 
     func applyHistoryThreadDetail(_ detail: HistoryThreadDetail) {
-        flushPendingAgentItems()
         cwd = URL(fileURLWithPath: detail.thread.cwd)
         selectedHistoryThreadId = detail.thread.id
         workbench.applyHistoryThreadDetail(detail)
-        let replayedItems = workbench.selectedRuntime?.items ?? detail.items.map(uiItem)
-        itemIndexById.removeAll(keepingCapacity: true)
-        items = replayedItems
-        for (index, item) in items.enumerated() {
-            itemIndexById[item.id] = index
-        }
-        errorMessage = nil
-        phase = .ready
     }
 
     func startNewSessionFromCurrentProject() {
@@ -461,10 +451,6 @@ final class SessionModel {
         } catch {
             historyErrorMessage = "\(error)"
         }
-    }
-
-    private func uiItem(from replay: HistoryReplayItem) -> UIItem {
-        agentDeckUIItem(from: replay, largeHistoryTextThreshold: largeHistoryTextThreshold)
     }
 
     func materializeDeferredContent(itemId: String, content: DeferredContent) {

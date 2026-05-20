@@ -303,9 +303,12 @@ struct SessionRenderThrottlingTests {
         #expect(!model.shouldAutoRefreshHistoryOnAppear())
     }
 
-    @Test("applying history detail replaces stream with replay items")
-    func applyingHistoryDetailReplaysItems() {
+    @Test("applying history detail selects replay without replacing legacy stream")
+    func applyingHistoryDetailSelectsReplayWithoutReplacingLegacyStream() {
         let model = SessionModel()
+        model.ingest(agentItem(id: "live1", lifecycle: "completed", text: "current answer"))
+        model.flushPendingAgentItems()
+        model.phase = .running
         let thread = HistoryThreadSummary(id: "h1", name: nil, preview: "old", cwd: "/tmp/project", createdAt: 1, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli")
         let detail = HistoryThreadDetail(
             thread: thread,
@@ -318,8 +321,10 @@ struct SessionRenderThrottlingTests {
         model.applyHistoryThreadDetail(detail)
 
         #expect(model.cwd?.path == "/tmp/project")
-        #expect(model.items.map(\.kind) == ["user", "message"])
-        #expect(model.items.map(\.text) == ["old prompt", "old answer"])
+        #expect(model.phase == .running)
+        #expect(model.items.map(\.text) == ["current answer"])
+        #expect(model.selectedItems.map(\.kind) == ["user", "message"])
+        #expect(model.selectedItems.map(\.text) == ["old prompt", "old answer"])
         #expect(model.selectedHistoryThreadId == "h1")
     }
 
@@ -364,14 +369,14 @@ struct SessionRenderThrottlingTests {
 
         model.applyHistoryThreadDetail(detail)
 
-        #expect(model.items.count == 1)
-        #expect(model.items[0].kind == "webSearch")
-        #expect(model.items[0].query == "AgentDeck history")
-        #expect(model.items[0].action == "findInPage")
-        #expect(model.items[0].actionQuery == "AgentDeck")
-        #expect(model.items[0].queries == ["AgentDeck", "history"])
-        #expect(model.items[0].url == "https://example.com")
-        #expect(model.items[0].pattern == "history")
+        #expect(model.selectedItems.count == 1)
+        #expect(model.selectedItems[0].kind == "webSearch")
+        #expect(model.selectedItems[0].query == "AgentDeck history")
+        #expect(model.selectedItems[0].action == "findInPage")
+        #expect(model.selectedItems[0].actionQuery == "AgentDeck")
+        #expect(model.selectedItems[0].queries == ["AgentDeck", "history"])
+        #expect(model.selectedItems[0].url == "https://example.com")
+        #expect(model.selectedItems[0].pattern == "history")
     }
 
     @Test("applying history detail preserves complete replay item fields")
@@ -411,16 +416,16 @@ struct SessionRenderThrottlingTests {
 
         model.applyHistoryThreadDetail(detail)
 
-        #expect(model.items[0].kind == "toolCall")
-        #expect(model.items[0].toolKind == "mcp")
-        #expect(model.items[0].server == "github")
-        #expect(model.items[0].tool == "list")
-        #expect(model.items[0].arguments == #"{"q":"x"}"#)
-        #expect(model.items[0].result == #"{"ok":true}"#)
-        #expect(model.items[0].durationMs == 42)
-        #expect(model.items[0].resourceUri == "app://github")
-        #expect(model.items[1].changes.count == 2)
-        #expect(model.items[1].changes[1].path == "b.txt")
+        #expect(model.selectedItems[0].kind == "toolCall")
+        #expect(model.selectedItems[0].toolKind == "mcp")
+        #expect(model.selectedItems[0].server == "github")
+        #expect(model.selectedItems[0].tool == "list")
+        #expect(model.selectedItems[0].arguments == #"{"q":"x"}"#)
+        #expect(model.selectedItems[0].result == #"{"ok":true}"#)
+        #expect(model.selectedItems[0].durationMs == 42)
+        #expect(model.selectedItems[0].resourceUri == "app://github")
+        #expect(model.selectedItems[1].changes.count == 2)
+        #expect(model.selectedItems[1].changes[1].path == "b.txt")
     }
 
     @Test("opening a history thread returns immediately while detail loads")
@@ -449,7 +454,7 @@ struct SessionRenderThrottlingTests {
 
         #expect(model.openingHistoryThreadId == nil)
         #expect(model.selectedHistoryThreadId == "h1")
-        #expect(model.items.map(\.text) == ["old prompt", "old answer"])
+        #expect(model.selectedItems.map(\.text) == ["old prompt", "old answer"])
     }
 
     @Test("opening history records read and apply timing")
@@ -494,20 +499,20 @@ struct SessionRenderThrottlingTests {
 
         model.applyHistoryThreadDetail(detail)
 
-        #expect(model.items[0].output == largeOutput)
-        #expect(model.items[0].outputBuffer.text.isEmpty)
-        #expect(model.items[0].hasDeferredOutputBuffer)
-        #expect(model.items[1].diff == largeDiff)
-        #expect(model.items[1].diffBuffer.text.isEmpty)
-        #expect(model.items[1].hasDeferredDiffBuffer)
+        #expect(model.selectedItems[0].output == largeOutput)
+        #expect(model.selectedItems[0].outputBuffer.text.isEmpty)
+        #expect(model.selectedItems[0].hasDeferredOutputBuffer)
+        #expect(model.selectedItems[1].diff == largeDiff)
+        #expect(model.selectedItems[1].diffBuffer.text.isEmpty)
+        #expect(model.selectedItems[1].hasDeferredDiffBuffer)
 
         model.materializeDeferredContent(itemId: "shell1", content: .output)
         model.materializeDeferredContent(itemId: "diff1", content: .diff)
 
-        #expect(model.items[0].outputBuffer.text == largeOutput)
-        #expect(!model.items[0].hasDeferredOutputBuffer)
-        #expect(model.items[1].diffBuffer.text == largeDiff)
-        #expect(!model.items[1].hasDeferredDiffBuffer)
+        #expect(model.selectedItems[0].outputBuffer.text == largeOutput)
+        #expect(!model.selectedItems[0].hasDeferredOutputBuffer)
+        #expect(model.selectedItems[1].diffBuffer.text == largeDiff)
+        #expect(!model.selectedItems[1].hasDeferredDiffBuffer)
     }
 }
 
