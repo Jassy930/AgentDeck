@@ -76,6 +76,11 @@ diff 默认只保留摘要与原文，展开时才填充 TextKit buffer，避免
 thread 阻塞主界面。AgentDeck 只做轻量索引、回放和管理入口；Codex
 持久化历史仍是上下文真相源。
 
+历史详情回放会进入 Swift 端 `WorkbenchModel` 中独立的 `ThreadRuntimeModel`。
+打开历史 thread 只切换当前选中的 runtime 和右侧视图，不会把其他正在运行的
+runtime 标记为 ready 或停止其后台事件处理。runtime 自身按约 30fps 刷新
+streaming delta，避免视图切到 runtime 后出现长时间不刷新的流式文本。
+
 第一版管理动作保持低风险：刷新、搜索、重命名和归档。AgentDeck 不读取、
 保存或转发 Codex token。
 

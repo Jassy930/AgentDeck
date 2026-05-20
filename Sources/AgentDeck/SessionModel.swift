@@ -78,6 +78,67 @@ func agentDeckStringArray(from value: Any?) -> [String]? {
     return nil
 }
 
+func agentDeckUIItem(from replay: HistoryReplayItem, largeHistoryTextThreshold: Int = 16 * 1024) -> UIItem {
+    var item = UIItem(id: replay.id, lifecycle: replay.lifecycle, kind: replay.kind)
+    item.text = replay.text
+    item.command = replay.command
+    item.output = replay.output ?? ""
+    item.exitCode = replay.exitCode
+    item.path = replay.path
+    item.diff = replay.diff ?? ""
+    item.descriptionText = replay.description ?? ""
+    item.query = replay.query
+    item.action = replay.action
+    item.actionQuery = replay.actionQuery ?? ""
+    item.queries = replay.queries
+    item.url = replay.url ?? ""
+    item.pattern = replay.pattern ?? ""
+    item.attachments = replay.attachments
+    item.phaseName = replay.phase ?? ""
+    item.memoryCitation = replay.memoryCitation ?? ""
+    item.cwdText = replay.cwd ?? ""
+    item.statusName = replay.status ?? ""
+    item.durationMs = replay.durationMs
+    item.sourceName = replay.source ?? ""
+    item.processId = replay.processId ?? ""
+    item.actions = replay.actions
+    item.changes = replay.changes
+    item.fragments = replay.fragments
+    item.toolKind = replay.toolKind
+    item.server = replay.server ?? ""
+    item.namespace = replay.namespace ?? ""
+    item.tool = replay.tool
+    item.arguments = replay.arguments
+    item.result = replay.result ?? ""
+    item.errorText = replay.error ?? ""
+    item.success = replay.success
+    item.resourceUri = replay.resourceUri ?? ""
+    item.contentItems = replay.contentItems
+    item.prompt = replay.prompt ?? ""
+    item.model = replay.model ?? ""
+    item.reasoningEffort = replay.reasoningEffort ?? ""
+    item.senderThreadId = replay.senderThreadId ?? ""
+    item.receiverThreadIds = replay.receiverThreadIds
+    item.agentsStates = replay.agentsStates ?? ""
+    item.mediaKind = replay.mediaKind
+    item.savedPath = replay.savedPath ?? ""
+    item.revisedPrompt = replay.revisedPrompt ?? ""
+    item.review = replay.review ?? ""
+    item.hasNonWhitespaceText = agentDeckContainsNonWhitespace(replay.text)
+    item.textBuffer.replace(with: replay.text)
+    if item.output.utf8.count > largeHistoryTextThreshold {
+        item.hasDeferredOutputBuffer = true
+    } else {
+        item.outputBuffer.replace(with: item.output)
+    }
+    if item.diff.utf8.count > largeHistoryTextThreshold {
+        item.hasDeferredDiffBuffer = true
+    } else {
+        item.diffBuffer.replace(with: item.diff)
+    }
+    return item
+}
+
 struct HistoryOpenTiming: Equatable {
     let threadId: String
     let itemCount: Int
@@ -148,6 +209,12 @@ final class SessionModel {
     var historyGroups: [HistoryProjectGroup] {
         HistoryProjectGroup.group(historyThreads)
     }
+
+    var selectedItems: [UIItem] {
+        workbench.selectedRuntime?.items ?? items
+    }
+
+    let workbench = WorkbenchModel()
 
     private let client: DaemonClient
     private let historyDetailClient: HistoryDetailReading
@@ -351,8 +418,10 @@ final class SessionModel {
         flushPendingAgentItems()
         cwd = URL(fileURLWithPath: detail.thread.cwd)
         selectedHistoryThreadId = detail.thread.id
+        workbench.applyHistoryThreadDetail(detail)
+        let replayedItems = workbench.selectedRuntime?.items ?? detail.items.map(uiItem)
         itemIndexById.removeAll(keepingCapacity: true)
-        items = detail.items.map(uiItem)
+        items = replayedItems
         for (index, item) in items.enumerated() {
             itemIndexById[item.id] = index
         }
@@ -362,6 +431,7 @@ final class SessionModel {
 
     func startNewSessionFromCurrentProject() {
         selectedHistoryThreadId = nil
+        workbench.selectedSessionId = nil
         openingHistoryThreadId = nil
         items.removeAll()
         itemIndexById.removeAll(keepingCapacity: true)
@@ -394,67 +464,15 @@ final class SessionModel {
     }
 
     private func uiItem(from replay: HistoryReplayItem) -> UIItem {
-        var item = UIItem(id: replay.id, lifecycle: replay.lifecycle, kind: replay.kind)
-        item.text = replay.text
-        item.command = replay.command
-        item.output = replay.output ?? ""
-        item.exitCode = replay.exitCode
-        item.path = replay.path
-        item.diff = replay.diff ?? ""
-        item.descriptionText = replay.description ?? ""
-        item.query = replay.query
-        item.action = replay.action
-        item.actionQuery = replay.actionQuery ?? ""
-        item.queries = replay.queries
-        item.url = replay.url ?? ""
-        item.pattern = replay.pattern ?? ""
-        item.attachments = replay.attachments
-        item.phaseName = replay.phase ?? ""
-        item.memoryCitation = replay.memoryCitation ?? ""
-        item.cwdText = replay.cwd ?? ""
-        item.statusName = replay.status ?? ""
-        item.durationMs = replay.durationMs
-        item.sourceName = replay.source ?? ""
-        item.processId = replay.processId ?? ""
-        item.actions = replay.actions
-        item.changes = replay.changes
-        item.fragments = replay.fragments
-        item.toolKind = replay.toolKind
-        item.server = replay.server ?? ""
-        item.namespace = replay.namespace ?? ""
-        item.tool = replay.tool
-        item.arguments = replay.arguments
-        item.result = replay.result ?? ""
-        item.errorText = replay.error ?? ""
-        item.success = replay.success
-        item.resourceUri = replay.resourceUri ?? ""
-        item.contentItems = replay.contentItems
-        item.prompt = replay.prompt ?? ""
-        item.model = replay.model ?? ""
-        item.reasoningEffort = replay.reasoningEffort ?? ""
-        item.senderThreadId = replay.senderThreadId ?? ""
-        item.receiverThreadIds = replay.receiverThreadIds
-        item.agentsStates = replay.agentsStates ?? ""
-        item.mediaKind = replay.mediaKind
-        item.savedPath = replay.savedPath ?? ""
-        item.revisedPrompt = replay.revisedPrompt ?? ""
-        item.review = replay.review ?? ""
-        item.hasNonWhitespaceText = agentDeckContainsNonWhitespace(replay.text)
-        item.textBuffer.replace(with: replay.text)
-        if shouldDeferHistoryText(item.output) {
-            item.hasDeferredOutputBuffer = true
-        } else {
-            item.outputBuffer.replace(with: item.output)
-        }
-        if shouldDeferHistoryText(item.diff) {
-            item.hasDeferredDiffBuffer = true
-        } else {
-            item.diffBuffer.replace(with: item.diff)
-        }
-        return item
+        agentDeckUIItem(from: replay, largeHistoryTextThreshold: largeHistoryTextThreshold)
     }
 
     func materializeDeferredContent(itemId: String, content: DeferredContent) {
+        if let runtime = workbench.selectedRuntime,
+           runtime.materializeDeferredContent(itemId: itemId, content: content) {
+            items = runtime.items
+            return
+        }
         guard let idx = itemIndexById[itemId], items.indices.contains(idx) else { return }
         switch content {
         case .output:
@@ -647,10 +665,6 @@ final class SessionModel {
         guard !queuedPrompts.isEmpty, phase == .ready else { return }
         let next = queuedPrompts.removeFirst()
         submit(next)
-    }
-
-    private func shouldDeferHistoryText(_ text: String) -> Bool {
-        text.utf8.count > largeHistoryTextThreshold
     }
 
     private static func milliseconds(from start: Date, to end: Date) -> Int {

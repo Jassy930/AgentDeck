@@ -264,6 +264,21 @@ struct SessionRenderThrottlingTests {
         #expect(model.items[0].text == "final")
     }
 
+    @Test("runtime streaming deltas are flushed by timer")
+    func runtimeStreamingDeltasAreFlushedByTimer() async throws {
+        let runtime = ThreadRuntimeModel(id: "s1", threadId: "t1", cwd: URL(fileURLWithPath: "/tmp/project"))
+
+        runtime.ingest(agentItem(id: "msg1", text: "Hel"))
+        runtime.ingest(agentItem(id: "msg1", text: "lo"))
+
+        #expect(runtime.items.isEmpty)
+
+        try await Task.sleep(for: .milliseconds(80))
+
+        #expect(runtime.items.count == 1)
+        #expect(runtime.items[0].text == "Hello")
+    }
+
     @Test("loading history groups threads without clearing current stream")
     func loadingHistoryDoesNotClearCurrentStream() {
         let model = SessionModel()
@@ -306,6 +321,24 @@ struct SessionRenderThrottlingTests {
         #expect(model.items.map(\.kind) == ["user", "message"])
         #expect(model.items.map(\.text) == ["old prompt", "old answer"])
         #expect(model.selectedHistoryThreadId == "h1")
+    }
+
+    @Test("starting new session clears selected history runtime")
+    func startingNewSessionClearsSelectedHistoryRuntime() {
+        let model = SessionModel()
+        let thread = HistoryThreadSummary(id: "h1", name: nil, preview: "old", cwd: "/tmp/project", createdAt: 1, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli")
+        let detail = HistoryThreadDetail(
+            thread: thread,
+            items: [
+                HistoryReplayItem(id: "a1", lifecycle: "completed", kind: "message", text: "old answer"),
+            ]
+        )
+
+        model.applyHistoryThreadDetail(detail)
+        model.startNewSessionFromCurrentProject()
+
+        #expect(model.selectedItems.isEmpty)
+        #expect(model.workbench.selectedSessionId == nil)
     }
 
     @Test("applying history detail preserves web search replay fields")
@@ -506,6 +539,23 @@ struct WorkbenchRuntimeModelTests {
 
         #expect(workbench.runtime(sessionId: "s1")?.items.isEmpty == true)
         #expect(workbench.runtime(sessionId: "s2")?.items.count == 1)
+    }
+
+    @Test("opening history does not change an existing running runtime")
+    func openingHistoryDoesNotChangeRunningRuntime() {
+        let workbench = WorkbenchModel()
+        workbench.ensureRuntime(sessionId: "running", threadId: "thread_running", cwd: URL(fileURLWithPath: "/tmp/a"))
+        workbench.runtime(sessionId: "running")?.phase = .running
+
+        let detail = HistoryThreadDetail(
+            thread: HistoryThreadSummary(id: "thread_b", name: nil, preview: "B", cwd: "/tmp/b", createdAt: 1, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli"),
+            items: [HistoryReplayItem(id: "m1", lifecycle: "completed", kind: "message", text: "old")]
+        )
+
+        workbench.applyHistoryThreadDetail(detail)
+
+        #expect(workbench.runtime(sessionId: "running")?.phase == .running)
+        #expect(workbench.selectedSessionId == "thread_b")
     }
 }
 

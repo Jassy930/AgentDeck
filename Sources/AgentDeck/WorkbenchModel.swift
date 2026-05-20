@@ -7,6 +7,11 @@ final class WorkbenchModel {
     private(set) var runtimes: [String: ThreadRuntimeModel] = [:]
     var selectedSessionId: String?
 
+    var selectedRuntime: ThreadRuntimeModel? {
+        guard let selectedSessionId else { return nil }
+        return runtimes[selectedSessionId]
+    }
+
     func ensureRuntime(sessionId: String, threadId: String?, cwd: URL) {
         if let runtime = runtimes[sessionId] {
             if runtime.threadId == nil {
@@ -23,6 +28,18 @@ final class WorkbenchModel {
 
     func runtime(sessionId: String) -> ThreadRuntimeModel? {
         runtimes[sessionId]
+    }
+
+    func applyHistoryThreadDetail(_ detail: HistoryThreadDetail) {
+        let sessionId = detail.thread.id
+        let runtime = ThreadRuntimeModel(
+            id: sessionId,
+            threadId: detail.thread.id,
+            cwd: URL(fileURLWithPath: detail.thread.cwd)
+        )
+        runtime.applyReplayItems(detail.items)
+        runtimes[sessionId] = runtime
+        selectedSessionId = sessionId
     }
 
     func ingestSessionEvent(_ msg: IpcMessage) {

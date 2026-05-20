@@ -14,6 +14,8 @@ final class ThreadRuntimeModel: Identifiable {
     var unreadEventCount = 0
     var itemIndexById: [String: Int] = [:]
     var pendingAgentItems: [[String: Any]] = []
+    private var renderFlushTimer: Timer?
+    private let renderFlushInterval: TimeInterval = 1.0 / 30.0
 
     init(id: String, threadId: String?, cwd: URL) {
         self.id = id
@@ -52,16 +54,55 @@ final class ThreadRuntimeModel: Identifiable {
         pendingAgentItems.append(item)
         if item["lifecycle"] as? String != "delta" {
             flushPendingAgentItems()
+            return
+        }
+        guard renderFlushTimer == nil else {
+            return
+        }
+        renderFlushTimer = Timer.scheduledTimer(
+            withTimeInterval: renderFlushInterval,
+            repeats: false
+        ) { [weak self] _ in
+            Task { @MainActor in self?.flushPendingAgentItems() }
         }
     }
 
     func flushPendingAgentItems() {
+        renderFlushTimer?.invalidate()
+        renderFlushTimer = nil
         guard !pendingAgentItems.isEmpty else { return }
         let pending = pendingAgentItems
         pendingAgentItems.removeAll(keepingCapacity: true)
         for item in pending {
             upsert(item)
         }
+    }
+
+    func applyReplayItems(_ replayItems: [HistoryReplayItem]) {
+        flushPendingAgentItems()
+        itemIndexById.removeAll(keepingCapacity: true)
+        items = replayItems.map { agentDeckUIItem(from: $0) }
+        for (index, item) in items.enumerated() {
+            itemIndexById[item.id] = index
+        }
+        errorMessage = nil
+        phase = .ready
+    }
+
+    @discardableResult
+    func materializeDeferredContent(itemId: String, content: SessionModel.DeferredContent) -> Bool {
+        guard let idx = itemIndexById[itemId], items.indices.contains(idx) else { return false }
+        switch content {
+        case .output:
+            guard items[idx].hasDeferredOutputBuffer else { return false }
+            items[idx].outputBuffer.replace(with: items[idx].output)
+            items[idx].hasDeferredOutputBuffer = false
+        case .diff:
+            guard items[idx].hasDeferredDiffBuffer else { return false }
+            items[idx].diffBuffer.replace(with: items[idx].diff)
+            items[idx].hasDeferredDiffBuffer = false
+        }
+        return true
     }
 
     private func upsert(_ d: [String: Any]) {

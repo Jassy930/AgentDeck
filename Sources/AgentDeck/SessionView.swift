@@ -244,7 +244,7 @@ struct SessionView: View {
     private var conversationStream: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
-                let turns = makeConversationTurns(from: model.items)
+                let turns = makeConversationTurns(from: model.selectedItems)
                 ForEach(Array(turns.enumerated()), id: \.element.id) { index, turn in
                     conversationTurn(turn)
                     if index + 1 < turns.count {
