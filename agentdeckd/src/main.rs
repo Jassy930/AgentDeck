@@ -201,7 +201,16 @@ fn run_thread_management(
 /// Append a line to the run record. Eng E2: a write failure does NOT block
 /// the session, but IS surfaced as a visible IPC warning — never silent.
 fn record_or_warn(stdout: &mut impl Write, run_id: &str, line: &str) -> std::io::Result<()> {
-    if let Err(reason) = record::try_append(run_id, line) {
+    record_or_warn_with_writer(stdout, run_id, line, record::try_append)
+}
+
+fn record_or_warn_with_writer(
+    stdout: &mut impl Write,
+    run_id: &str,
+    line: &str,
+    append: impl Fn(&str, &str) -> Result<(), String>,
+) -> std::io::Result<()> {
+    if let Err(reason) = append(run_id, line) {
         diag::log("record_failed", &reason);
         write_msg(
             stdout,
@@ -213,6 +222,32 @@ fn record_or_warn(stdout: &mut impl Write, run_id: &str, line: &str) -> std::io:
                 })),
             },
         )?;
+    }
+    Ok(())
+}
+
+fn record_item_or_warn(
+    stdout: &mut impl Write,
+    run_id: &str,
+    line: &str,
+    warning_emitted: &mut bool,
+    append: impl Fn(&str, &str) -> Result<(), String>,
+) -> std::io::Result<()> {
+    if let Err(reason) = append(run_id, line) {
+        diag::log("record_failed", &reason);
+        if !*warning_emitted {
+            *warning_emitted = true;
+            write_msg(
+                stdout,
+                &IpcMessage {
+                    kind: "warning".into(),
+                    id: None,
+                    payload: Some(serde_json::json!({
+                        "message": format!("本次未留痕: {reason}")
+                    })),
+                },
+            )?;
+        }
     }
     Ok(())
 }
@@ -285,6 +320,7 @@ fn run_session(
     // independent of `adapter`, so the closure does not conflict with
     // `turn_start`'s `&mut self`.
     let mut write_err: Option<std::io::Error> = None;
+    let mut record_warning_emitted = false;
     {
         let stdout = &mut *stdout;
         let run_id = &run_id;
@@ -298,11 +334,15 @@ fn run_session(
             }
             // Record each neutral item as it streams (redaction inside).
             if let Ok(j) = serde_json::to_string(&item)
-                && let Err(reason) = record::try_append(run_id, &j)
+                && let Err(e) = record_item_or_warn(
+                    stdout,
+                    run_id,
+                    &j,
+                    &mut record_warning_emitted,
+                    record::try_append,
+                )
             {
-                diag::log("record_failed", &reason);
-                // Best-effort: a record failure must not abort the
-                // stream; the visible warning is emitted post-turn.
+                write_err = Some(e);
             }
         });
         if let Some(e) = write_err {
@@ -390,6 +430,7 @@ fn run_turn_on_existing_thread(
 
     write_msg(stdout, &IpcMessage::session_state(SessionState::Running))?;
     let mut write_err: Option<std::io::Error> = None;
+    let mut record_warning_emitted = false;
     {
         let stdout = &mut *stdout;
         let run_id = &run_id;
@@ -402,9 +443,15 @@ fn run_turn_on_existing_thread(
                 return;
             }
             if let Ok(j) = serde_json::to_string(&item)
-                && let Err(reason) = record::try_append(run_id, &j)
+                && let Err(e) = record_item_or_warn(
+                    stdout,
+                    run_id,
+                    &j,
+                    &mut record_warning_emitted,
+                    record::try_append,
+                )
             {
-                diag::log("record_failed", &reason);
+                write_err = Some(e);
             }
         });
         if let Some(e) = write_err {
@@ -595,5 +642,29 @@ mod tests {
         let params = start_turn_params(Some(&p)).unwrap();
         assert_eq!(params.thread_id, "thread_1");
         assert_eq!(params.prompt, "continue");
+    }
+
+    #[test]
+    fn streaming_record_failure_emits_warning() {
+        let mut out = Vec::new();
+        let append = |_run_id: &str, _line: &str| Err("HOME not set".to_string());
+        record_or_warn_with_writer(&mut out, "run-test", r#"{"event":"probe"}"#, append).unwrap();
+
+        let wire = String::from_utf8(out).unwrap();
+        assert!(wire.contains(r#""kind":"warning""#));
+        assert!(wire.contains("本次未留痕"));
+    }
+
+    #[test]
+    fn record_failure_warning_is_emitted_once_per_turn() {
+        let mut out = Vec::new();
+        let mut emitted = false;
+        let append = |_run_id: &str, _line: &str| Err("permission denied".to_string());
+
+        record_item_or_warn(&mut out, "run-test", "{}", &mut emitted, append).unwrap();
+        record_item_or_warn(&mut out, "run-test", "{}", &mut emitted, append).unwrap();
+
+        let wire = String::from_utf8(out).unwrap();
+        assert_eq!(wire.matches(r#""kind":"warning""#).count(), 1);
     }
 }
