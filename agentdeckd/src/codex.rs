@@ -27,7 +27,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use serde_json::{Value, json};
 
-use crate::ipc::{AgentItem, AgentItemKind, Lifecycle};
+use crate::ipc::{AgentItem, AgentItemKind, HistoryThreadList, HistoryThreadSummary, Lifecycle};
 
 #[derive(Debug)]
 pub enum CodexError {
@@ -201,6 +201,38 @@ impl CodexAdapter {
             .ok_or_else(|| CodexError::Protocol("thread/start: no thread.id in result".into()))
     }
 
+    /// List persisted historical threads through Codex app-server and map
+    /// them immediately into AgentDeck's neutral history shape.
+    pub fn thread_list(
+        &mut self,
+        cwd: Option<&str>,
+        search_term: Option<&str>,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<HistoryThreadList, CodexError> {
+        let mut params = serde_json::Map::new();
+        params.insert("archived".into(), Value::Bool(false));
+        if let Some(cwd) = cwd {
+            params.insert("cwd".into(), Value::String(cwd.to_string()));
+        }
+        if let Some(search_term) = search_term {
+            params.insert("searchTerm".into(), Value::String(search_term.to_string()));
+        }
+        if let Some(cursor) = cursor {
+            params.insert("cursor".into(), Value::String(cursor.to_string()));
+        }
+        if let Some(limit) = limit {
+            params.insert(
+                "limit".into(),
+                Value::Number(serde_json::Number::from(limit)),
+            );
+        }
+
+        let id = self.send_request("thread/list", Value::Object(params))?;
+        let result = self.await_response(id, |_, _| {})?;
+        thread_list_to_history(&result)
+    }
+
     /// turn/start with a text prompt. Emits neutral AgentItems via `emit` as
     /// item notifications arrive. Step 2 returns once turn/completed is seen.
     pub fn turn_start(
@@ -242,6 +274,75 @@ impl CodexAdapter {
         }
         Ok(())
     }
+}
+
+fn value_label(value: &Value) -> String {
+    if let Some(s) = value.as_str() {
+        return s.to_string();
+    }
+    if let Some(s) = value.get("type").and_then(Value::as_str) {
+        return s.to_string();
+    }
+    if let Some(s) = value.get("kind").and_then(Value::as_str) {
+        return s.to_string();
+    }
+    if let Some(s) = value.get("custom").and_then(Value::as_str) {
+        return s.to_string();
+    }
+    if value.is_null() {
+        return String::new();
+    }
+    serde_json::to_string(value).unwrap_or_default()
+}
+
+fn thread_summary_from_value(value: &Value) -> Result<HistoryThreadSummary, CodexError> {
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CodexError::Protocol("thread/list: thread missing id".into()))?
+        .to_string();
+    let cwd = value
+        .get("cwd")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Ok(HistoryThreadSummary {
+        id,
+        name: value.get("name").and_then(Value::as_str).map(str::to_string),
+        preview: value
+            .get("preview")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        cwd,
+        created_at: value.get("createdAt").and_then(Value::as_i64).unwrap_or(0),
+        updated_at: value.get("updatedAt").and_then(Value::as_i64).unwrap_or(0),
+        status: value.get("status").map(value_label).unwrap_or_default(),
+        model_provider: value
+            .get("modelProvider")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        source: value.get("source").map(value_label).unwrap_or_default(),
+    })
+}
+
+fn thread_list_to_history(value: &Value) -> Result<HistoryThreadList, CodexError> {
+    let data = value
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CodexError::Protocol("thread/list: result missing data[]".into()))?;
+    let mut threads = Vec::with_capacity(data.len());
+    for item in data {
+        threads.push(thread_summary_from_value(item)?);
+    }
+    Ok(HistoryThreadList {
+        threads,
+        next_cursor: value
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
 }
 
 impl Drop for CodexAdapter {
@@ -701,5 +802,32 @@ mod tests {
             }
             _ => panic!("expected Shell delta"),
         }
+    }
+
+    #[test]
+    fn thread_list_response_maps_to_history_summaries() {
+        let value = json!({
+            "data": [{
+                "id": "thread_1",
+                "name": "Fix tests",
+                "preview": "please fix tests",
+                "cwd": "/tmp/project",
+                "createdAt": 10,
+                "updatedAt": 20,
+                "status": "ready",
+                "modelProvider": "openai",
+                "source": {"kind": "cli"},
+                "cliVersion": "0.0.0",
+                "ephemeral": false,
+                "sessionId": "session_1",
+                "turns": []
+            }],
+            "nextCursor": "cursor_2"
+        });
+        let list = thread_list_to_history(&value).unwrap();
+        assert_eq!(list.threads[0].id, "thread_1");
+        assert_eq!(list.threads[0].cwd, "/tmp/project");
+        assert_eq!(list.threads[0].source, "cli");
+        assert_eq!(list.next_cursor.as_deref(), Some("cursor_2"));
     }
 }
