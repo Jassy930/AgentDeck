@@ -141,7 +141,7 @@ final class DaemonMessageRouter: @unchecked Sendable {
     func registerPending(id: UInt64) -> Bool {
         condition.lock()
         defer { condition.unlock() }
-        guard !pendingReplyIds.contains(id) else {
+        guard !pendingReplyIds.contains(id), replies[id] == nil else {
             return false
         }
         pendingReplyIds.insert(id)

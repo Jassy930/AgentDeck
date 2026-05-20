@@ -134,6 +134,18 @@ struct DaemonMessageRoutingTests {
         #expect(router.takeReply(id: 42)?.kind == "pong")
     }
 
+    @Test("keeps ids occupied while routed replies are buffered")
+    func keepsIdsOccupiedWhileRoutedRepliesAreBuffered() {
+        let router = DaemonMessageRouter()
+
+        #expect(router.registerPending(id: 43))
+        router.route(IpcMessage(kind: "pong", id: 43, payload: nil))
+
+        #expect(!router.registerPending(id: 43))
+        #expect(router.takeReply(id: 43)?.kind == "pong")
+        #expect(router.registerPending(id: 43))
+    }
+
     @Test("preserves explicit ids but can generate ids for reused static factory ids")
     func preservesExplicitIdsButCanGenerateIdsForReusedStaticFactoryIds() throws {
         let client = DaemonClient()
