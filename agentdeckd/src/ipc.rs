@@ -79,6 +79,16 @@ impl IpcMessage {
             payload: Some(serde_json::json!({ "event": event })),
         }
     }
+
+    pub fn action_request(request: &ActionRequest) -> Self {
+        Self {
+            kind: "actionRequest".into(),
+            id: None,
+            session_id: None,
+            thread_id: None,
+            payload: Some(serde_json::to_value(request).expect("ActionRequest serializes")),
+        }
+    }
 }
 
 /// The neutral session state machine (Eng D9). The daemon owns this; the
@@ -94,6 +104,27 @@ pub enum SessionState {
     Draining,
     Failed,
     Closed,
+}
+
+/// Neutral request for a user decision before the agent performs a risky
+/// action. Adapter-specific fields stay behind the daemon boundary; Swift only
+/// sees these stable routing and presentation fields.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionRequest {
+    pub request_id: u64,
+    pub item_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<String>,
+    pub action_kind: String,
+    pub title: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionDecision {
+    pub request_id: u64,
+    pub decision: String,
 }
 
 /// Lifecycle of a streaming item (Eng D4 / front-of-mind started→delta→
@@ -486,5 +517,28 @@ mod tests {
         };
         let wire = serde_json::to_string(&summary).unwrap().to_lowercase();
         assert!(!wire.contains("codex"));
+    }
+
+    #[test]
+    fn action_request_serializes_as_neutral_approval_prompt() {
+        let request = ActionRequest {
+            request_id: 42,
+            item_id: "cmd1".into(),
+            approval_id: Some("approval-1".into()),
+            action_kind: "runCommand".into(),
+            title: "Run command".into(),
+            detail: "make test".into(),
+        };
+
+        let wire = serde_json::to_value(IpcMessage::action_request(&request)).unwrap();
+
+        assert_eq!(wire["kind"], "actionRequest");
+        assert_eq!(wire["payload"]["requestId"], 42);
+        assert_eq!(wire["payload"]["itemId"], "cmd1");
+        assert_eq!(wire["payload"]["approvalId"], "approval-1");
+        assert_eq!(wire["payload"]["actionKind"], "runCommand");
+        assert_eq!(wire["payload"]["title"], "Run command");
+        assert_eq!(wire["payload"]["detail"], "make test");
+        assert!(!wire.to_string().to_lowercase().contains("codex"));
     }
 }

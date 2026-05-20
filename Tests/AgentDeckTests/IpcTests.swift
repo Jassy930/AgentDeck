@@ -1045,18 +1045,86 @@ struct WorkbenchRuntimeModelTests {
 
         #expect(model.selectedWarningMessage == "runtime warning")
     }
+
+    @Test("approval request moves runtime to waiting approval")
+    func approvalRequestMovesRuntimeToWaitingApproval() throws {
+        let runtime = ThreadRuntimeModel(id: "s1", threadId: "t1", cwd: URL(fileURLWithPath: "/tmp/project"))
+        runtime.phase = .running
+
+        runtime.ingest(IpcMessage(
+            kind: "actionRequest",
+            sessionId: "s1",
+            threadId: "t1",
+            payload: AnyCodable([
+                "requestId": 42,
+                "itemId": "cmd1",
+                "approvalId": "approval-1",
+                "actionKind": "runCommand",
+                "title": "Run command",
+                "detail": "make test",
+            ])
+        ))
+
+        let pending = try #require(runtime.pendingActionRequest)
+        #expect(runtime.phase == .waitingApproval)
+        #expect(pending.requestId == 42)
+        #expect(pending.itemId == "cmd1")
+        #expect(pending.approvalId == "approval-1")
+        #expect(pending.actionKind == "runCommand")
+        #expect(pending.title == "Run command")
+        #expect(pending.detail == "make test")
+    }
+
+    @Test("approval decision is sent for selected runtime")
+    func approvalDecisionIsSentForSelectedRuntime() throws {
+        let turnStarter = RecordingRuntimeTurnStarter()
+        let workbench = WorkbenchModel(turnStarter: turnStarter, actionDecider: turnStarter)
+        workbench.ensureRuntime(sessionId: "s1", threadId: "t1", cwd: URL(fileURLWithPath: "/tmp/project"))
+        workbench.ingestSessionEvent(IpcMessage(
+            kind: "session/event",
+            sessionId: "s1",
+            threadId: "t1",
+            payload: AnyCodable([
+                "event": [
+                    "kind": "actionRequest",
+                    "payload": [
+                        "requestId": 42,
+                        "itemId": "cmd1",
+                        "actionKind": "runCommand",
+                        "title": "Run command",
+                        "detail": "make test",
+                    ],
+                ],
+            ])
+        ))
+
+        workbench.decidePendingAction("approve")
+
+        #expect(turnStarter.decisions.count == 1)
+        #expect(turnStarter.decisions[0].sessionId == "s1")
+        #expect(turnStarter.decisions[0].requestId == 42)
+        #expect(turnStarter.decisions[0].decision == "approve")
+        #expect(workbench.runtime(sessionId: "s1")?.pendingActionRequest == nil)
+        #expect(workbench.runtime(sessionId: "s1")?.phase == .running)
+    }
 }
 
 @MainActor
-final class RecordingRuntimeTurnStarter: RuntimeTurnStarting {
+final class RecordingRuntimeTurnStarter: RuntimeTurnStarting, RuntimeActionDeciding {
     struct Request {
         let sessionId: String
         let threadId: String?
         let cwd: URL
         let prompt: String
     }
+    struct Decision {
+        let sessionId: String
+        let requestId: UInt64
+        let decision: String
+    }
 
     var requests: [Request] = []
+    var decisions: [Decision] = []
 
     func startTurn(
         sessionId: String,
@@ -1071,6 +1139,10 @@ final class RecordingRuntimeTurnStarter: RuntimeTurnStarting {
             cwd: cwd,
             prompt: prompt
         ))
+    }
+
+    func sendActionDecision(sessionId: String, requestId: UInt64, decision: String) {
+        decisions.append(Decision(sessionId: sessionId, requestId: requestId, decision: decision))
     }
 }
 
@@ -1370,6 +1442,23 @@ struct DaemonHistoryRequestTests {
         #expect(json["sessionId"] as? String == "session_a")
         #expect(payload["cwd"] as? String == "/tmp/a")
         #expect(payload["prompt"] as? String == "start")
+    }
+
+    @Test("approval decision request encodes session routing")
+    func approvalDecisionRequestEncodesSessionRouting() throws {
+        let msg = DaemonClient.actionDecisionRequest(
+            id: 15,
+            sessionId: "session_a",
+            requestId: 42,
+            decision: "deny"
+        )
+
+        let json = try #require(JSONSerialization.jsonObject(with: try JSONEncoder().encode(msg)) as? [String: Any])
+        let payload = try #require(json["payload"] as? [String: Any])
+        #expect(json["kind"] as? String == "actionDecision")
+        #expect(json["sessionId"] as? String == "session_a")
+        #expect(payload["requestId"] as? Int == 42)
+        #expect(payload["decision"] as? String == "deny")
     }
 }
 

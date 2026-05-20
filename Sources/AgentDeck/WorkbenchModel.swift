@@ -7,9 +7,14 @@ final class WorkbenchModel {
     private(set) var runtimes: [String: ThreadRuntimeModel] = [:]
     var selectedSessionId: String?
     private let turnStarter: RuntimeTurnStarting
+    private let actionDecider: RuntimeActionDeciding
 
-    init(turnStarter: RuntimeTurnStarting = DaemonClient()) {
+    init(
+        turnStarter: RuntimeTurnStarting = DaemonClient(),
+        actionDecider: RuntimeActionDeciding? = nil
+    ) {
         self.turnStarter = turnStarter
+        self.actionDecider = actionDecider ?? (turnStarter as? RuntimeActionDeciding) ?? NoopRuntimeActionDecider()
     }
 
     var selectedRuntime: ThreadRuntimeModel? {
@@ -64,6 +69,16 @@ final class WorkbenchModel {
     func submit(_ prompt: String) {
         guard let runtime = selectedRuntime else { return }
         submit(prompt, to: runtime)
+    }
+
+    func decidePendingAction(_ decision: String) {
+        guard let runtime = selectedRuntime,
+              let pending = runtime.resolvePendingAction() else { return }
+        actionDecider.sendActionDecision(
+            sessionId: runtime.id,
+            requestId: pending.requestId,
+            decision: decision
+        )
     }
 
     func ingestSessionEvent(_ msg: IpcMessage) {
@@ -140,4 +155,9 @@ final class NoopRuntimeTurnStarter: RuntimeTurnStarting {
         prompt: String,
         onEvent: @escaping @MainActor @Sendable (IpcMessage) -> Void
     ) {}
+}
+
+@MainActor
+final class NoopRuntimeActionDecider: RuntimeActionDeciding {
+    func sendActionDecision(sessionId: String, requestId: UInt64, decision: String) {}
 }

@@ -394,6 +394,9 @@ struct SessionView: View {
                         if let warning = model.selectedWarningMessage {
                             warningRow(warning)
                         }
+                        if let action = model.selectedActionRequest {
+                            approvalRow(action)
+                        }
                         Color.clear
                             .frame(height: 1)
                             .id(conversationLatestAnchorId)
@@ -926,6 +929,29 @@ struct SessionView: View {
             Text(msg)
                 .font(.system(.callout))
                 .foregroundStyle(.orange)
+        }
+        .padding(.vertical, 10)
+    }
+
+    private func approvalRow(_ action: ActionRequest) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "hand.raised.fill")
+                    .foregroundStyle(.orange)
+                Text(action.title)
+                    .font(.system(.callout, weight: .semibold))
+                Spacer()
+                Button("Deny") { model.decidePendingAction("deny") }
+                    .buttonStyle(.bordered)
+                Button("Approve") { model.decidePendingAction("approve") }
+                    .buttonStyle(.borderedProminent)
+            }
+            if !action.detail.isEmpty {
+                Text(action.detail)
+                    .font(.system(.callout, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
         }
         .padding(.vertical, 10)
     }

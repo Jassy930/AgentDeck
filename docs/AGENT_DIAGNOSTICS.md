@@ -41,6 +41,7 @@ swift run AgentDeck -- --diagnostics-report --json
 | `daemon_spawn_failed` | Swift 无法启动 daemon | 检查 `agentdeckd` 路径 |
 | `app_server_handshake_failed` | app-server 握手失败 | 检查 agent 登录和版本 |
 | `turn_failed` | turn 执行失败 | 按 runId 查看 run record |
+| `approval_wait_stalled` | turn 正在等待用户审批 | 查看当前 runtime 的 `actionRequest`，确认 UI 是否已回写 `actionDecision` |
 
 ## Raw / Warning 可见性
 
@@ -50,3 +51,15 @@ runtime UI。`raw` 只显示中立描述，不携带 vendor 原始 JSON；如果
 
 daemon 写入失败等非致命问题会发出 `warning` 事件。当前选中的 runtime 应显示
 自己的 warning；没有选中 runtime 时才回退显示 legacy session warning。
+
+## Approval 卡住排查
+
+Codex 的命令执行、文件变更和额外权限审批会先在 daemon adapter 层映射为中立
+`actionRequest`，再由 Swift 回写 `actionDecision`。如果 turn 停在
+`waitingApproval`：
+
+1. 先看当前 runtime 是否显示 approve / deny 控件。
+2. 如果没有控件，检查 `session/event` 中是否有 `kind=actionRequest`。
+3. 如果控件点击后没有继续，检查 Swift 是否发送 `kind=actionDecision` 且带
+   `sessionId`、`requestId` 和 `decision`。
+4. 如果 daemon 返回 error，按同一 `requestId` 查看 diagnostic log 和 run record。

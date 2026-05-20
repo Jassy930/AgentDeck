@@ -374,6 +374,11 @@ protocol RuntimeTurnStarting: AnyObject {
     )
 }
 
+@MainActor
+protocol RuntimeActionDeciding: AnyObject {
+    func sendActionDecision(sessionId: String, requestId: UInt64, decision: String)
+}
+
 /// Owns the agentdeckd child process and the JSONL IPC channel to it.
 ///
 /// Process lifecycle (Eng A1, first layer): the Swift app spawns the daemon;
@@ -640,6 +645,23 @@ final class DaemonClient {
         )
     }
 
+    static func actionDecisionRequest(
+        id: UInt64,
+        sessionId: String,
+        requestId: UInt64,
+        decision: String
+    ) -> IpcMessage {
+        IpcMessage(
+            kind: "actionDecision",
+            id: id,
+            sessionId: sessionId,
+            payload: AnyCodable([
+                "requestId": Int(requestId),
+                "decision": decision,
+            ])
+        )
+    }
+
     static func archiveThreadRequest(id: UInt64, threadId: String) -> IpcMessage {
         IpcMessage(kind: "history/archiveThread", id: id, payload: AnyCodable(["threadId": threadId]))
     }
@@ -840,6 +862,36 @@ final class DaemonClient {
                 threadId: threadId,
                 onEvent: onEvent
             )
+        }
+        write(line)
+    }
+
+    func sendActionDecision(sessionId: String, requestId: UInt64, decision: String) {
+        let msg = requestIdAllocator.assignUniqueId(to: Self.actionDecisionRequest(
+            id: 0,
+            sessionId: sessionId,
+            requestId: requestId,
+            decision: decision
+        ))
+        guard let data = try? JSONEncoder().encode(msg) else {
+            Self.writeDiagnostic("failed to encode actionDecision")
+            return
+        }
+        var line = data
+        line.append(0x0A)
+        do {
+            if reader == nil {
+                try start()
+            }
+        } catch {
+            Self.writeDiagnostic("failed to start daemon for actionDecision: \(error)")
+            return
+        }
+        if let id = msg.id {
+            _ = router.registerPending(id: id)
+            DispatchQueue.global(qos: .utility).async { [router] in
+                _ = router.waitForReply(id: id)
+            }
         }
         write(line)
     }

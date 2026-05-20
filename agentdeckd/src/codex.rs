@@ -28,8 +28,9 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use serde_json::{Value, json};
 
 use crate::ipc::{
-    AgentItem, AgentItemKind, AgentReference, FileEditChange, HistoryThreadDetail,
-    HistoryThreadList, HistoryThreadSummary, HookFragment, Lifecycle, ToolAction,
+    ActionDecision, ActionRequest, AgentItem, AgentItemKind, AgentReference, FileEditChange,
+    HistoryThreadDetail, HistoryThreadList, HistoryThreadSummary, HookFragment, Lifecycle,
+    ToolAction,
 };
 
 #[derive(Debug)]
@@ -136,6 +137,19 @@ impl CodexAdapter {
             .flush()
             .map_err(|e| CodexError::Protocol(e.to_string()))?;
         Ok(id)
+    }
+
+    fn send_response(&mut self, id: u64, result: Value) -> Result<(), CodexError> {
+        let response = json!({ "id": id, "result": result });
+        let mut line =
+            serde_json::to_string(&response).map_err(|e| CodexError::Protocol(e.to_string()))?;
+        line.push('\n');
+        self.stdin
+            .write_all(line.as_bytes())
+            .map_err(|e| CodexError::Protocol(e.to_string()))?;
+        self.stdin
+            .flush()
+            .map_err(|e| CodexError::Protocol(e.to_string()))
     }
 
     /// Read one newline-delimited JSON message (D7-confirmed framing).
@@ -283,6 +297,7 @@ impl CodexAdapter {
         thread_id: &str,
         prompt: &str,
         mut emit: impl FnMut(AgentItem),
+        mut request_decision: impl FnMut(ActionRequest) -> Result<ActionDecision, CodexError>,
     ) -> Result<(), CodexError> {
         let id = self.send_request(
             "turn/start",
@@ -306,6 +321,15 @@ impl CodexAdapter {
                 continue;
             };
             let params = msg.get("params").cloned().unwrap_or(Value::Null);
+            if let Some(request_id) = msg.get("id").and_then(Value::as_u64)
+                && let Some(action_request) =
+                    approval_request_to_action(request_id, method, &params)
+            {
+                let decision = request_decision(action_request)?;
+                let result = approval_response_for_decision(method, &params, &decision.decision)?;
+                self.send_response(request_id, result)?;
+                continue;
+            }
             match method {
                 "turn/completed" => done = true,
                 _ => {
@@ -316,6 +340,126 @@ impl CodexAdapter {
             }
         }
         Ok(())
+    }
+}
+
+fn approval_request_to_action(
+    request_id: u64,
+    method: &str,
+    params: &Value,
+) -> Option<ActionRequest> {
+    let item_id = params.get("itemId").and_then(Value::as_str)?.to_string();
+    let approval_id = params
+        .get("approvalId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let reason = params.get("reason").and_then(Value::as_str).unwrap_or("");
+    let cwd = params.get("cwd").and_then(Value::as_str).unwrap_or("");
+    match method {
+        "item/commandExecution/requestApproval" => {
+            let command = params.get("command").and_then(Value::as_str).unwrap_or("");
+            Some(ActionRequest {
+                request_id,
+                item_id,
+                approval_id,
+                action_kind: "runCommand".into(),
+                title: "Run command".into(),
+                detail: approval_detail([
+                    ("Command", command),
+                    ("Directory", cwd),
+                    ("Reason", reason),
+                ]),
+            })
+        }
+        "item/fileChange/requestApproval" => {
+            let grant_root = params
+                .get("grantRoot")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            Some(ActionRequest {
+                request_id,
+                item_id,
+                approval_id,
+                action_kind: "applyChanges".into(),
+                title: "Apply file changes".into(),
+                detail: approval_detail([
+                    ("Path", grant_root),
+                    ("Reason", reason),
+                    ("Directory", cwd),
+                ]),
+            })
+        }
+        "item/permissions/requestApproval" => {
+            let permissions = params
+                .get("permissions")
+                .and_then(|v| serde_json::to_string(v).ok())
+                .unwrap_or_default();
+            Some(ActionRequest {
+                request_id,
+                item_id,
+                approval_id,
+                action_kind: "grantPermissions".into(),
+                title: "Grant permissions".into(),
+                detail: approval_detail([
+                    ("Directory", cwd),
+                    ("Reason", reason),
+                    ("Permissions", permissions.as_str()),
+                ]),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn approval_detail<'a>(parts: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
+    parts
+        .into_iter()
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(label, value)| format!("{label}: {value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn approval_response_for_decision(
+    method: &str,
+    params: &Value,
+    decision: &str,
+) -> Result<Value, CodexError> {
+    let decision = match decision {
+        "approve" => "accept",
+        "deny" => "decline",
+        "cancel" => "cancel",
+        other => {
+            return Err(CodexError::Protocol(format!(
+                "unsupported action decision: {other}"
+            )));
+        }
+    };
+    match method {
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            Ok(json!({ "decision": decision }))
+        }
+        "item/permissions/requestApproval" => {
+            if decision == "accept" {
+                Ok(json!({
+                    "permissions": params.get("permissions").cloned().unwrap_or_else(|| json!({})),
+                    "scope": "turn",
+                    "strictAutoReview": Value::Null,
+                }))
+            } else {
+                Ok(json!({
+                    "permissions": {
+                        "fileSystem": Value::Null,
+                        "network": Value::Null,
+                    },
+                    "scope": "turn",
+                    "strictAutoReview": true,
+                }))
+            }
+        }
+        other => Err(CodexError::Protocol(format!(
+            "unsupported approval request method: {other}"
+        ))),
     }
 }
 
@@ -1511,5 +1655,99 @@ mod tests {
         let summary = thread_resume_to_history_summary(&value).unwrap();
         assert_eq!(summary.id, "thread_1");
         assert_eq!(summary.cwd, "/tmp/project");
+    }
+
+    #[test]
+    fn approval_command_request_maps_to_neutral_action_request() {
+        let request = approval_request_to_action(
+            42,
+            "item/commandExecution/requestApproval",
+            &json!({
+                "itemId": "cmd1",
+                "approvalId": "approval-1",
+                "threadId": "thread_1",
+                "turnId": "turn_1",
+                "command": "make test",
+                "cwd": "/tmp/project",
+                "reason": "needs to run tests",
+                "startedAtMs": 1
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(request.request_id, 42);
+        assert_eq!(request.item_id, "cmd1");
+        assert_eq!(request.approval_id.as_deref(), Some("approval-1"));
+        assert_eq!(request.action_kind, "runCommand");
+        assert!(request.detail.contains("make test"));
+        assert!(request.detail.contains("/tmp/project"));
+        assert!(request.detail.contains("needs to run tests"));
+    }
+
+    #[test]
+    fn approval_file_and_permission_requests_map_to_neutral_action_requests() {
+        let file = approval_request_to_action(
+            43,
+            "item/fileChange/requestApproval",
+            &json!({
+                "itemId": "file1",
+                "threadId": "thread_1",
+                "turnId": "turn_1",
+                "grantRoot": "/tmp/project",
+                "reason": "apply patch",
+                "startedAtMs": 1
+            }),
+        )
+        .unwrap();
+        let permissions = approval_request_to_action(
+            44,
+            "item/permissions/requestApproval",
+            &json!({
+                "itemId": "perm1",
+                "threadId": "thread_1",
+                "turnId": "turn_1",
+                "cwd": "/tmp/project",
+                "permissions": {"fileSystem": {"write": ["/tmp/project"]}},
+                "reason": "needs write access",
+                "startedAtMs": 1
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(file.action_kind, "applyChanges");
+        assert_eq!(file.item_id, "file1");
+        assert!(file.detail.contains("/tmp/project"));
+        assert_eq!(permissions.action_kind, "grantPermissions");
+        assert_eq!(permissions.item_id, "perm1");
+        assert!(permissions.detail.contains("needs write access"));
+    }
+
+    #[test]
+    fn approval_decision_builds_codex_response_result() {
+        let command = approval_response_for_decision(
+            "item/commandExecution/requestApproval",
+            &json!({}),
+            "approve",
+        )
+        .unwrap();
+        let file =
+            approval_response_for_decision("item/fileChange/requestApproval", &json!({}), "deny")
+                .unwrap();
+        let permissions = approval_response_for_decision(
+            "item/permissions/requestApproval",
+            &json!({
+                "permissions": {"fileSystem": {"write": ["/tmp/project"]}}
+            }),
+            "approve",
+        )
+        .unwrap();
+
+        assert_eq!(command, json!({"decision": "accept"}));
+        assert_eq!(file, json!({"decision": "decline"}));
+        assert_eq!(
+            permissions["permissions"]["fileSystem"]["write"][0],
+            "/tmp/project"
+        );
+        assert_eq!(permissions["scope"], "turn");
     }
 }

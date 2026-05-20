@@ -195,6 +195,9 @@ final class SessionModel {
     var selectedWarningMessage: String? {
         workbench.selectedRuntime?.warningMessage ?? warningMessage
     }
+    var selectedActionRequest: ActionRequest? {
+        workbench.selectedRuntime?.pendingActionRequest
+    }
     /// When the current turn began. `nil` outside a turn.
     var runStartedAt: Date?
     /// Driven by a tick timer; the status bar reads this so the elapsed
@@ -265,7 +268,8 @@ final class SessionModel {
         self.workbench = WorkbenchModel(
             turnStarter: runtimeTurnStarter
                 ?? (client as? RuntimeTurnStarting)
-                ?? NoopRuntimeTurnStarter()
+                ?? NoopRuntimeTurnStarter(),
+            actionDecider: client as? RuntimeActionDeciding
         )
         self.historyDetailClient = historyDetailClient ?? DaemonHistoryDetailReader()
     }
@@ -511,6 +515,10 @@ final class SessionModel {
             items[idx].diffBuffer.replace(with: items[idx].diff)
             items[idx].hasDeferredDiffBuffer = false
         }
+    }
+
+    func decidePendingAction(_ decision: String) {
+        workbench.decidePendingAction(decision)
     }
 
     func ingest(rawLine raw: String) {

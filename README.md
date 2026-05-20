@@ -55,7 +55,10 @@ AgentDeck 使用一个 `agentdeckd` 作为 runtime hub。daemon 的 stdin 主循
 stdout writer 输出带 `sessionId/threadId` 的中立事件。历史请求按 request id
 分发 reply，不和 streaming `agentItem` 抢 reader。RuntimeHub 会阻止同一
 `sessionId` 同时启动多个 turn，并限制并发 history worker；超限时返回明确
-busy error，而不是继续无界创建线程。
+busy error，而不是继续无界创建线程。需要用户确认的高风险动作会由 Codex
+app-server 的 server request 映射成中立 `actionRequest`，Swift 只显示
+`title/detail/actionKind` 并回写 `actionDecision`；daemon 再把 approve / deny
+翻译回 app-server response。
 
 流式性能边界：daemon 不合并 Codex delta，而是忠实转发中立
 `agentItem`；Swift 端的 `SessionModel` 按约 30fps 合并待渲染 delta，并把
@@ -96,6 +99,9 @@ runtime，后续 prompt 继续走同一个 thread，而不是在 UI 上伪装成
 提交 prompt 时，正在运行、启动中或等待 approval 的 runtime 只会排入自己的
 队列；对应 runtime 收到 `turnComplete` 后才 drain 自己的下一条 prompt，不会
 把队列发送到当前选中的其他 history/runtime。
+当 runtime 进入 `waitingApproval` 时，会话流里显示最小 approve / deny 控件。
+第一版支持命令执行、文件变更和额外权限三类请求；不暴露持久化策略按钮，
+也不让 Swift 解析 Codex 原始 JSON。
 左侧 History 面板顶部会显示 compact runtime selector，用状态点、队列数和未读
 事件数标识后台 runtime；切换 selector 只切换右侧视图，不会中断对应后台会话。
 

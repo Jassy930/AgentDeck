@@ -27,7 +27,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use diag::DiagnosticEvent;
-use ipc::{IpcMessage, SessionState};
+use ipc::{ActionDecision, IpcMessage, SessionState};
 
 const WRITER_STOP_KIND: &str = "__agentdeckd/writerStop";
 
@@ -69,6 +69,11 @@ enum HubAction {
         thread_id: Option<String>,
         cwd: Option<String>,
         prompt: String,
+    },
+    ActionDecision {
+        id: Option<u64>,
+        session_id: String,
+        decision: ActionDecision,
     },
     Shutdown,
 }
@@ -126,6 +131,7 @@ enum RuntimeHubWorkerDone {
 #[derive(Debug)]
 struct RuntimeHub {
     running_sessions: std::collections::HashSet<String>,
+    decision_senders: std::collections::HashMap<String, Sender<ActionDecision>>,
     active_history_workers: usize,
     max_history_workers: usize,
 }
@@ -134,6 +140,7 @@ impl RuntimeHub {
     fn new(max_history_workers: usize) -> Self {
         Self {
             running_sessions: std::collections::HashSet::new(),
+            decision_senders: std::collections::HashMap::new(),
             active_history_workers: 0,
             max_history_workers: max_history_workers.max(1),
         }
@@ -148,7 +155,12 @@ impl RuntimeHub {
         }
     }
 
-    fn handle_spawn_turn(&mut self, id: Option<u64>, session_id: &str) -> RuntimeHubDispatch {
+    fn handle_spawn_turn(
+        &mut self,
+        id: Option<u64>,
+        session_id: &str,
+        decision_tx: Sender<ActionDecision>,
+    ) -> RuntimeHubDispatch {
         if self.running_sessions.contains(session_id) {
             return RuntimeHubDispatch::Reply(IpcMessage::error(
                 id,
@@ -156,11 +168,35 @@ impl RuntimeHub {
             ));
         }
         self.running_sessions.insert(session_id.to_string());
+        self.decision_senders
+            .insert(session_id.to_string(), decision_tx);
         RuntimeHubDispatch::StartTurn
     }
 
     fn finish_turn(&mut self, session_id: &str) {
         self.running_sessions.remove(session_id);
+        self.decision_senders.remove(session_id);
+    }
+
+    fn handle_action_decision(
+        &self,
+        id: Option<u64>,
+        session_id: &str,
+        decision: ActionDecision,
+    ) -> RuntimeHubDispatch {
+        match self.decision_senders.get(session_id) {
+            Some(tx) => match tx.send(decision) {
+                Ok(()) => RuntimeHubDispatch::Reply(IpcMessage::pong(id)),
+                Err(_) => RuntimeHubDispatch::Reply(IpcMessage::error(
+                    id,
+                    "runtime approval channel closed",
+                )),
+            },
+            None => RuntimeHubDispatch::Reply(IpcMessage::error(
+                id,
+                "runtime has no pending turn for action decision",
+            )),
+        }
     }
 
     fn handle_history_request(&mut self, id: Option<u64>) -> RuntimeHubDispatch {
@@ -290,6 +326,19 @@ fn classify_request(msg: &IpcMessage) -> Result<HubAction, String> {
                 prompt: params.prompt,
             })
         }
+        "actionDecision" => {
+            let session_id = msg
+                .session_id
+                .clone()
+                .ok_or_else(|| "actionDecision requires sessionId".to_string())?;
+            let decision = action_decision_params(msg.payload.as_ref())
+                .ok_or_else(|| "actionDecision requires requestId and decision".to_string())?;
+            Ok(HubAction::ActionDecision {
+                id: msg.id,
+                session_id,
+                decision,
+            })
+        }
         "history/listThreads" => Ok(HubAction::History(HistoryAction::ListThreads {
             id: msg.id,
             params: history_list_params(msg.payload.as_ref()),
@@ -401,6 +450,20 @@ fn start_turn_params(payload: Option<&serde_json::Value>) -> Option<StartTurnPar
         return None;
     }
     Some(StartTurnParams { thread_id, prompt })
+}
+
+fn action_decision_params(payload: Option<&serde_json::Value>) -> Option<ActionDecision> {
+    let payload = payload?;
+    let request_id = payload.get("requestId")?.as_u64()?;
+    let decision = payload
+        .get("decision")?
+        .as_str()
+        .filter(|s| matches!(*s, "approve" | "deny" | "cancel"))?
+        .to_string();
+    Some(ActionDecision {
+        request_id,
+        decision,
+    })
 }
 
 fn diagnostics_report_params(payload: Option<&serde_json::Value>) -> DiagnosticsReportParams {
@@ -839,6 +902,7 @@ fn run_codex_turn(
     context: &TurnRunContext<'_>,
     run_id: &str,
     thread_id: &str,
+    decision_rx: &Receiver<ActionDecision>,
     event_seq: &mut u64,
 ) -> std::io::Result<()> {
     emit_session_event(
@@ -853,36 +917,72 @@ fn run_codex_turn(
     {
         let out_tx = out_tx.clone();
         let event_thread_id = thread_id.to_string();
-        let turn = adapter.turn_start(thread_id, context.prompt, |item| {
-            if write_err.is_some() {
-                return;
-            }
-            if let Err(e) = emit_session_event(
-                &out_tx,
-                context.session_id,
-                Some(&event_thread_id),
-                IpcMessage::agent_item(&item),
-            ) {
-                write_err = Some(e);
-                return;
-            }
-            if let Ok(j) = serde_json::to_string(&item)
-                && let Err(e) = record_item_or_warn_with_context(
-                    RecordWarningContext {
-                        out_tx: &out_tx,
-                        session_id: context.session_id,
-                        run_id,
-                        thread_id: Some(&event_thread_id),
-                        request_id: context.id,
-                    },
-                    event_seq,
-                    &j,
-                    &mut record_warning_emitted,
+        let turn = adapter.turn_start(
+            thread_id,
+            context.prompt,
+            |item| {
+                if write_err.is_some() {
+                    return;
+                }
+                if let Err(e) = emit_session_event(
+                    &out_tx,
+                    context.session_id,
+                    Some(&event_thread_id),
+                    IpcMessage::agent_item(&item),
+                ) {
+                    write_err = Some(e);
+                    return;
+                }
+                if let Ok(j) = serde_json::to_string(&item)
+                    && let Err(e) = record_item_or_warn_with_context(
+                        RecordWarningContext {
+                            out_tx: &out_tx,
+                            session_id: context.session_id,
+                            run_id,
+                            thread_id: Some(&event_thread_id),
+                            request_id: context.id,
+                        },
+                        event_seq,
+                        &j,
+                        &mut record_warning_emitted,
+                    )
+                {
+                    write_err = Some(e);
+                }
+            },
+            |request| {
+                emit_session_event(
+                    &out_tx,
+                    context.session_id,
+                    Some(&event_thread_id),
+                    IpcMessage::session_state(SessionState::WaitingApproval),
                 )
-            {
-                write_err = Some(e);
-            }
-        });
+                .map_err(|e| codex::CodexError::Protocol(e.to_string()))?;
+                emit_session_event(
+                    &out_tx,
+                    context.session_id,
+                    Some(&event_thread_id),
+                    IpcMessage::action_request(&request),
+                )
+                .map_err(|e| codex::CodexError::Protocol(e.to_string()))?;
+
+                loop {
+                    let decision = decision_rx.recv().map_err(|_| {
+                        codex::CodexError::Protocol("approval decision channel closed".into())
+                    })?;
+                    if decision.request_id == request.request_id {
+                        emit_session_event(
+                            &out_tx,
+                            context.session_id,
+                            Some(&event_thread_id),
+                            IpcMessage::session_state(SessionState::Running),
+                        )
+                        .map_err(|e| codex::CodexError::Protocol(e.to_string()))?;
+                        return Ok(decision);
+                    }
+                }
+            },
+        );
         if let Some(e) = write_err {
             return Err(e);
         }
@@ -965,6 +1065,7 @@ fn run_codex_turn(
 
 fn run_session(
     out_tx: &Sender<IpcMessage>,
+    decision_rx: &Receiver<ActionDecision>,
     id: Option<u64>,
     session_id: &str,
     cwd: &str,
@@ -1042,12 +1143,14 @@ fn run_session(
         &context,
         &run_id,
         &thread_id,
+        decision_rx,
         &mut event_seq,
     )
 }
 
 fn run_turn_on_existing_thread(
     out_tx: &Sender<IpcMessage>,
+    decision_rx: &Receiver<ActionDecision>,
     id: Option<u64>,
     session_id: &str,
     thread_id: &str,
@@ -1118,6 +1221,7 @@ fn run_turn_on_existing_thread(
         &context,
         &run_id,
         thread_id,
+        decision_rx,
         &mut event_seq,
     )
 }
@@ -1473,6 +1577,7 @@ fn run_diagnostics_report(
 
 fn run_turn_worker(
     out_tx: Sender<IpcMessage>,
+    decision_rx: Receiver<ActionDecision>,
     id: Option<u64>,
     session_id: &str,
     thread_id: Option<&str>,
@@ -1480,10 +1585,17 @@ fn run_turn_worker(
     prompt: &str,
 ) -> std::io::Result<()> {
     if let Some(thread_id) = thread_id {
-        return run_turn_on_existing_thread(&out_tx, id, session_id, thread_id, prompt);
+        return run_turn_on_existing_thread(
+            &out_tx,
+            &decision_rx,
+            id,
+            session_id,
+            thread_id,
+            prompt,
+        );
     }
     if let Some(cwd) = cwd {
-        return run_session(&out_tx, id, session_id, cwd, prompt);
+        return run_session(&out_tx, &decision_rx, id, session_id, cwd, prompt);
     }
     Err(std::io::Error::new(
         ErrorKind::InvalidInput,
@@ -1557,34 +1669,48 @@ fn main() -> std::io::Result<()> {
                 thread_id,
                 cwd,
                 prompt,
-            }) => match runtime_hub.handle_spawn_turn(id, &session_id) {
-                RuntimeHubDispatch::StartTurn => {
-                    let ack = turn_accepted(id, &session_id, thread_id.as_deref());
-                    let _ = out_tx.send(ack);
+            }) => {
+                let (decision_tx, decision_rx) = mpsc::channel::<ActionDecision>();
+                match runtime_hub.handle_spawn_turn(id, &session_id, decision_tx) {
+                    RuntimeHubDispatch::StartTurn => {
+                        let ack = turn_accepted(id, &session_id, thread_id.as_deref());
+                        let _ = out_tx.send(ack);
 
-                    let worker_tx = out_tx.clone();
-                    let done_tx = worker_done_tx.clone();
-                    std::thread::spawn(move || {
-                        if let Err(err) = run_turn_worker(
-                            worker_tx.clone(),
-                            id,
-                            &session_id,
-                            thread_id.as_deref(),
-                            cwd.as_deref(),
-                            &prompt,
-                        ) {
-                            let _ = worker_tx.send(IpcMessage::session_event(
+                        let worker_tx = out_tx.clone();
+                        let done_tx = worker_done_tx.clone();
+                        std::thread::spawn(move || {
+                            if let Err(err) = run_turn_worker(
+                                worker_tx.clone(),
+                                decision_rx,
+                                id,
                                 &session_id,
                                 thread_id.as_deref(),
-                                IpcMessage::error(None, &err.to_string()),
-                            ));
-                        }
-                        let _ = done_tx.send(RuntimeHubWorkerDone::Turn(session_id));
-                    });
+                                cwd.as_deref(),
+                                &prompt,
+                            ) {
+                                let _ = worker_tx.send(IpcMessage::session_event(
+                                    &session_id,
+                                    thread_id.as_deref(),
+                                    IpcMessage::error(None, &err.to_string()),
+                                ));
+                            }
+                            let _ = done_tx.send(RuntimeHubWorkerDone::Turn(session_id));
+                        });
+                    }
+                    RuntimeHubDispatch::Reply(reply) => send_msg(&out_tx, reply)?,
+                    RuntimeHubDispatch::StartHistory => {
+                        unreachable!("turn dispatch cannot start history")
+                    }
                 }
+            }
+            Ok(HubAction::ActionDecision {
+                id,
+                session_id,
+                decision,
+            }) => match runtime_hub.handle_action_decision(id, &session_id, decision) {
                 RuntimeHubDispatch::Reply(reply) => send_msg(&out_tx, reply)?,
-                RuntimeHubDispatch::StartHistory => {
-                    unreachable!("turn dispatch cannot start history")
+                RuntimeHubDispatch::StartTurn | RuntimeHubDispatch::StartHistory => {
+                    unreachable!("action decision dispatch cannot start workers")
                 }
             },
             Err(e) => send_msg(&out_tx, IpcMessage::error(msg.id, &e))?,
@@ -1719,10 +1845,10 @@ mod tests {
         let mut hub = RuntimeHub::new(2);
 
         assert!(matches!(
-            hub.handle_spawn_turn(Some(1), "session_a"),
+            hub.handle_spawn_turn(Some(1), "session_a", mpsc::channel().0),
             RuntimeHubDispatch::StartTurn
         ));
-        let busy = hub.handle_spawn_turn(Some(2), "session_a");
+        let busy = hub.handle_spawn_turn(Some(2), "session_a", mpsc::channel().0);
 
         assert!(matches!(
             busy,
@@ -1739,18 +1865,18 @@ mod tests {
         let mut hub = RuntimeHub::new(2);
 
         assert!(matches!(
-            hub.handle_spawn_turn(Some(1), "session_a"),
+            hub.handle_spawn_turn(Some(1), "session_a", mpsc::channel().0),
             RuntimeHubDispatch::StartTurn
         ));
         assert!(matches!(
-            hub.handle_spawn_turn(Some(2), "session_b"),
+            hub.handle_spawn_turn(Some(2), "session_b", mpsc::channel().0),
             RuntimeHubDispatch::StartTurn
         ));
 
         hub.finish_turn("session_a");
 
         assert!(matches!(
-            hub.handle_spawn_turn(Some(3), "session_a"),
+            hub.handle_spawn_turn(Some(3), "session_a", mpsc::channel().0),
             RuntimeHubDispatch::StartTurn
         ));
     }

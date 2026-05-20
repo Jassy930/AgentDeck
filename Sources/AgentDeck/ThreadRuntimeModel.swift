@@ -5,6 +5,15 @@ enum RuntimeAction: Equatable {
     case drainNextPrompt(String)
 }
 
+struct ActionRequest: Equatable {
+    let requestId: UInt64
+    let itemId: String
+    let approvalId: String?
+    let actionKind: String
+    let title: String
+    let detail: String
+}
+
 @MainActor
 @Observable
 final class ThreadRuntimeModel: Identifiable {
@@ -16,6 +25,7 @@ final class ThreadRuntimeModel: Identifiable {
     var queuedPrompts: [String] = []
     var errorMessage: String?
     var warningMessage: String?
+    var pendingActionRequest: ActionRequest?
     var unreadEventCount = 0
     var itemIndexById: [String: Int] = [:]
     var pendingAgentItems: [[String: Any]] = []
@@ -74,9 +84,25 @@ final class ThreadRuntimeModel: Identifiable {
             let m = (msg.payload?.value as? [String: Any])?["message"] as? String
             warningMessage = m ?? "unknown warning"
             return nil
+        case "actionRequest":
+            flushPendingAgentItems()
+            if let action = Self.actionRequest(from: msg.payload?.value as? [String: Any]) {
+                pendingActionRequest = action
+                phase = .waitingApproval
+            }
+            return nil
         default:
             return nil
         }
+    }
+
+    func resolvePendingAction() -> ActionRequest? {
+        let request = pendingActionRequest
+        pendingActionRequest = nil
+        if phase == .waitingApproval {
+            phase = .running
+        }
+        return request
     }
 
     func appendUserPrompt(_ prompt: String) {
@@ -160,5 +186,22 @@ final class ThreadRuntimeModel: Identifiable {
         AgentItemReducer.upsert(d, into: &store)
         items = store.items
         itemIndexById = store.itemIndexById
+    }
+
+    private static func actionRequest(from payload: [String: Any]?) -> ActionRequest? {
+        guard let payload,
+              let requestId = payload["requestId"] as? UInt64 ?? (payload["requestId"] as? Int).map(UInt64.init),
+              let itemId = payload["itemId"] as? String,
+              let actionKind = payload["actionKind"] as? String,
+              let title = payload["title"] as? String,
+              let detail = payload["detail"] as? String else { return nil }
+        return ActionRequest(
+            requestId: requestId,
+            itemId: itemId,
+            approvalId: payload["approvalId"] as? String,
+            actionKind: actionKind,
+            title: title,
+            detail: detail
+        )
     }
 }

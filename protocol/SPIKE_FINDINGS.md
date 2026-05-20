@@ -53,6 +53,16 @@ ServerRequest 里有具体 approval 类型，**带结构化元数据**（非字�
 是带类型的结构化对象，daemon 可据此映射中立 `AgentActionRequest` 并
 判定危险等级，无需字符串猜命令。
 
+`codex app-server generate-json-schema --experimental` 也生成了对应 response
+schema：
+- `CommandExecutionRequestApprovalResponse`：`{"decision":"accept|decline|cancel|acceptForSession|..."}`
+- `FileChangeRequestApprovalResponse`：`{"decision":"accept|decline|cancel|acceptForSession"}`
+- `PermissionsRequestApprovalResponse`：`{"permissions": GrantedPermissionProfile, "scope": "turn|session", "strictAutoReview": ...}`
+
+AgentDeck v0.1 只暴露一次性 approve / deny：命令和文件请求映射为
+`accept` / `decline`；额外权限 approve 回写请求里的 `permissions`，deny 回写空
+权限 profile。持久化策略类 decision 暂不进入 Swift UI。
+
 ## 对设计文档前提的影响
 
 - **D7 → 已验证**：framing = 逐行 JSONL，最简单分支。BufReader 按行读。

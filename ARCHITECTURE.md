@@ -15,7 +15,7 @@ v0.1 只验证两个核心能力：
 
 ```text
 AgentDeck.app  (macOS, SwiftUI + AppKit)
-      │  stdio JSONL IPC，中立 AgentItem
+      │  stdio JSONL IPC，中立 AgentItem / ActionRequest / ActionDecision
       ▼
 agentdeckd  (Rust daemon)
       │  ├── RuntimeHub（stdin main loop + stdout writer）
@@ -41,6 +41,7 @@ codex app-server  (子进程, JSON-RPC over stdio)
 
 - Swift 层不得解析 Codex vendor JSON，也不得出现需要理解 Codex schema 才能工作的 UI 分支。
 - 中立 IPC 中面向 Swift 的核心事件使用 `AgentItem`，不要把供应商特定字段扩散到 UI。
+- 高风险动作审批必须走中立 `ActionRequest` / `ActionDecision`；Codex server request、response shape 和持久化策略字段只能留在 daemon adapter 层。
 - daemon 的 stdin 主循环不得被单个 turn 阻塞；长时间工作放到 worker。
 - daemon 的 RuntimeHub 必须按 `sessionId` 阻止同一 runtime 并发 turn，并对 history worker 保持有界并发；超限时返回可诊断 busy error。
 - streaming event 必须携带 `sessionId/threadId`，避免历史读取和正在运行的 turn 串流互相抢 reader。
