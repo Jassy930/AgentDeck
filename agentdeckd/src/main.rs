@@ -294,6 +294,16 @@ fn record_item_or_warn_with_context(
     Ok(())
 }
 
+fn new_run_id() -> String {
+    static RUN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = RUN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("run-{}-{nanos}-{seq}", std::process::id())
+}
+
 fn run_session(
     stdout: &mut impl Write,
     id: Option<u64>,
@@ -302,13 +312,7 @@ fn run_session(
 ) -> std::io::Result<()> {
     // run_id: AgentDeck-generated (premise 5), not user input, so it is a
     // safe filename component (no path traversal).
-    let run_id = format!(
-        "run-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    );
+    let run_id = new_run_id();
     let mut event_seq = 1;
     diag::log_event(
         DiagnosticEvent::new("session_start")
@@ -463,13 +467,7 @@ fn run_turn_on_existing_thread(
     thread_id: &str,
     prompt: &str,
 ) -> std::io::Result<()> {
-    let run_id = format!(
-        "run-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    );
+    let run_id = new_run_id();
     let mut event_seq = 1;
     diag::log_event(
         DiagnosticEvent::new("history_turn_start")
@@ -769,5 +767,13 @@ mod tests {
 
         let wire = String::from_utf8(out).unwrap();
         assert_eq!(wire.matches(r#""kind":"warning""#).count(), 1);
+    }
+
+    #[test]
+    fn new_run_id_is_unique_for_rapid_calls() {
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            assert!(ids.insert(new_run_id()));
+        }
     }
 }
