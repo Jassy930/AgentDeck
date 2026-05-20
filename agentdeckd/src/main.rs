@@ -630,6 +630,258 @@ fn new_run_id() -> String {
     format!("run-{}-{nanos}-{seq}", std::process::id())
 }
 
+enum TurnStart<'a> {
+    NewSession { cwd: &'a str },
+    ResumedThread { thread_id: &'a str },
+}
+
+struct TurnRunContext<'a> {
+    id: Option<u64>,
+    session_id: &'a str,
+    prompt: &'a str,
+    start: TurnStart<'a>,
+}
+
+impl<'a> TurnRunContext<'a> {
+    fn initial_thread_id(&self) -> Option<&'a str> {
+        match self.start {
+            TurnStart::NewSession { .. } => None,
+            TurnStart::ResumedThread { thread_id } => Some(thread_id),
+        }
+    }
+
+    fn start_log_name(&self) -> &'static str {
+        match self.start {
+            TurnStart::NewSession { .. } => "session_start",
+            TurnStart::ResumedThread { .. } => "history_turn_start",
+        }
+    }
+
+    fn start_message(&self) -> &'static str {
+        match self.start {
+            TurnStart::NewSession { .. } => "session started",
+            TurnStart::ResumedThread { .. } => "history turn started",
+        }
+    }
+
+    fn start_detail(&self) -> Option<String> {
+        match self.start {
+            TurnStart::NewSession { cwd } => Some(format!("cwd={cwd}")),
+            TurnStart::ResumedThread { .. } => None,
+        }
+    }
+
+    fn start_record_line(&self) -> String {
+        match self.start {
+            TurnStart::NewSession { .. } => serde_json::json!({
+                "event": "start",
+                "prompt": self.prompt,
+            })
+            .to_string(),
+            TurnStart::ResumedThread { thread_id } => serde_json::json!({
+                "event": "resume",
+                "threadId": thread_id,
+                "prompt": self.prompt,
+            })
+            .to_string(),
+        }
+    }
+
+    fn turn_failed_log_name(&self) -> &'static str {
+        match self.start {
+            TurnStart::NewSession { .. } => "turn_failed",
+            TurnStart::ResumedThread { .. } => "history_turn_failed",
+        }
+    }
+
+    fn turn_failed_message(&self) -> &'static str {
+        match self.start {
+            TurnStart::NewSession { .. } => "turn failed",
+            TurnStart::ResumedThread { .. } => "history turn failed",
+        }
+    }
+
+    fn turn_complete_log_name(&self) -> &'static str {
+        match self.start {
+            TurnStart::NewSession { .. } => "session_complete",
+            TurnStart::ResumedThread { .. } => "history_turn_complete",
+        }
+    }
+
+    fn turn_complete_message(&self) -> &'static str {
+        match self.start {
+            TurnStart::NewSession { .. } => "session complete",
+            TurnStart::ResumedThread { .. } => "history turn complete",
+        }
+    }
+}
+
+fn begin_turn_run(
+    out_tx: &Sender<IpcMessage>,
+    context: &TurnRunContext<'_>,
+    run_id: &str,
+    event_seq: u64,
+) -> std::io::Result<()> {
+    let mut event = DiagnosticEvent::new(context.start_log_name())
+        .level("info")
+        .code(context.start_log_name())
+        .run_id(run_id)
+        .request_id_opt(context.id)
+        .event_seq(event_seq)
+        .message(context.start_message());
+    if let Some(thread_id) = context.initial_thread_id() {
+        event = event.thread_id(thread_id);
+    }
+    if let Some(detail) = context.start_detail() {
+        event = event.detail(detail);
+    }
+    diag::log_event(event);
+
+    emit_session_event(
+        out_tx,
+        context.session_id,
+        context.initial_thread_id(),
+        IpcMessage::session_state(SessionState::Starting),
+    )?;
+    record_or_warn(
+        out_tx,
+        context.session_id,
+        context.initial_thread_id(),
+        run_id,
+        &context.start_record_line(),
+    )
+}
+
+fn run_codex_turn(
+    out_tx: &Sender<IpcMessage>,
+    adapter: &mut codex::CodexAdapter,
+    context: &TurnRunContext<'_>,
+    run_id: &str,
+    thread_id: &str,
+    event_seq: &mut u64,
+) -> std::io::Result<()> {
+    emit_session_event(
+        out_tx,
+        context.session_id,
+        Some(thread_id),
+        IpcMessage::session_state(SessionState::Running),
+    )?;
+
+    let mut write_err: Option<std::io::Error> = None;
+    let mut record_warning_emitted = false;
+    {
+        let out_tx = out_tx.clone();
+        let event_thread_id = thread_id.to_string();
+        let turn = adapter.turn_start(thread_id, context.prompt, |item| {
+            if write_err.is_some() {
+                return;
+            }
+            if let Err(e) = emit_session_event(
+                &out_tx,
+                context.session_id,
+                Some(&event_thread_id),
+                IpcMessage::agent_item(&item),
+            ) {
+                write_err = Some(e);
+                return;
+            }
+            if let Ok(j) = serde_json::to_string(&item)
+                && let Err(e) = record_item_or_warn_with_context(
+                    RecordWarningContext {
+                        out_tx: &out_tx,
+                        session_id: context.session_id,
+                        run_id,
+                        thread_id: Some(&event_thread_id),
+                        request_id: context.id,
+                    },
+                    event_seq,
+                    &j,
+                    &mut record_warning_emitted,
+                )
+            {
+                write_err = Some(e);
+            }
+        });
+        if let Some(e) = write_err {
+            return Err(e);
+        }
+        if let Err(e) = turn {
+            *event_seq += 1;
+            diag::log_event(
+                DiagnosticEvent::new(context.turn_failed_log_name())
+                    .level("error")
+                    .code("turn_failed")
+                    .run_id(run_id)
+                    .thread_id(thread_id)
+                    .request_id_opt(context.id)
+                    .event_seq(*event_seq)
+                    .message(context.turn_failed_message())
+                    .detail(e.to_string()),
+            );
+            record_or_warn(
+                &out_tx,
+                context.session_id,
+                Some(thread_id),
+                run_id,
+                &serde_json::json!({
+                    "event": "failed",
+                    "error": e.to_string(),
+                })
+                .to_string(),
+            )?;
+            emit_session_event(
+                &out_tx,
+                context.session_id,
+                Some(thread_id),
+                IpcMessage::error(context.id, &e.to_string()),
+            )?;
+            return emit_session_event(
+                &out_tx,
+                context.session_id,
+                Some(thread_id),
+                IpcMessage::session_state(SessionState::Failed),
+            );
+        }
+    }
+
+    *event_seq += 1;
+    diag::log_event(
+        DiagnosticEvent::new(context.turn_complete_log_name())
+            .level("info")
+            .code(context.turn_complete_log_name())
+            .run_id(run_id)
+            .thread_id(thread_id)
+            .request_id_opt(context.id)
+            .event_seq(*event_seq)
+            .message(context.turn_complete_message()),
+    );
+    record_or_warn(
+        out_tx,
+        context.session_id,
+        Some(thread_id),
+        run_id,
+        r#"{"event":"complete"}"#,
+    )?;
+    emit_session_event(
+        out_tx,
+        context.session_id,
+        Some(thread_id),
+        IpcMessage::session_state(SessionState::Ready),
+    )?;
+    emit_session_event(
+        out_tx,
+        context.session_id,
+        Some(thread_id),
+        IpcMessage {
+            kind: "turnComplete".into(),
+            id: context.id,
+            session_id: None,
+            thread_id: None,
+            payload: None,
+        },
+    )
+}
+
 fn run_session(
     out_tx: &Sender<IpcMessage>,
     id: Option<u64>,
@@ -639,34 +891,15 @@ fn run_session(
 ) -> std::io::Result<()> {
     // run_id: AgentDeck-generated (premise 5), not user input, so it is a
     // safe filename component (no path traversal).
+    let context = TurnRunContext {
+        id,
+        session_id,
+        prompt,
+        start: TurnStart::NewSession { cwd },
+    };
     let run_id = new_run_id();
     let mut event_seq = 1;
-    diag::log_event(
-        DiagnosticEvent::new("session_start")
-            .level("info")
-            .code("session_start")
-            .run_id(&run_id)
-            .request_id_opt(id)
-            .event_seq(event_seq)
-            .message("session started")
-            .detail(format!("cwd={cwd}")),
-    );
-    emit_session_event(
-        out_tx,
-        session_id,
-        None,
-        IpcMessage::session_state(SessionState::Starting),
-    )?;
-    record_or_warn(
-        out_tx,
-        session_id,
-        None,
-        &run_id,
-        &format!(
-            r#"{{"event":"start","prompt":{}}}"#,
-            serde_json::to_string(prompt).unwrap_or_else(|_| "\"\"".into())
-        ),
-    )?;
+    begin_turn_run(out_tx, &context, &run_id, event_seq)?;
 
     let mut adapter = match codex::CodexAdapter::spawn() {
         Ok(a) => a,
@@ -722,146 +955,13 @@ fn run_session(
         }
     };
 
-    emit_session_event(
+    run_codex_turn(
         out_tx,
-        session_id,
-        Some(&thread_id),
-        IpcMessage::session_state(SessionState::Running),
-    )?;
-
-    // TRUE streaming (the Beat 1 soul — "the native streaming session IS
-    // the wow"). EVERY delta is written to IPC the moment it is translated,
-    // inside the turn_start callback. NO daemon-side coalescing: merging all
-    // deltas into one (the old A2 behavior) destroyed the stream — the whole
-    // reply appeared in one jarring burst (the bad feel the user reported).
-    //
-    // Backpressure is now the SwiftUI render layer's job: SessionModel
-    // buffers agentItem deltas and flushes them at frame-ish cadence. The
-    // daemon's job is to forward faithfully, not to buffer. (Design doc A2 is
-    // downgraded accordingly: daemon-side merge → render-layer throttling.)
-    //
-    // The callback can't use `?`, so it stashes the first send error into
-    // `write_err`; surfaced after the turn. `out_tx`/`write_err` are
-    // independent of `adapter`, so the closure does not conflict with
-    // `turn_start`'s `&mut self`.
-    let mut write_err: Option<std::io::Error> = None;
-    let mut record_warning_emitted = false;
-    {
-        let run_id = &run_id;
-        let out_tx = out_tx.clone();
-        let event_thread_id = thread_id.clone();
-        let turn = adapter.turn_start(&thread_id, prompt, |item| {
-            if write_err.is_some() {
-                return;
-            }
-            if let Err(e) = emit_session_event(
-                &out_tx,
-                session_id,
-                Some(&event_thread_id),
-                IpcMessage::agent_item(&item),
-            ) {
-                write_err = Some(e);
-                return;
-            }
-            // Record each neutral item as it streams (redaction inside).
-            if let Ok(j) = serde_json::to_string(&item)
-                && let Err(e) = record_item_or_warn_with_context(
-                    RecordWarningContext {
-                        out_tx: &out_tx,
-                        session_id,
-                        run_id,
-                        thread_id: Some(&event_thread_id),
-                        request_id: id,
-                    },
-                    &mut event_seq,
-                    &j,
-                    &mut record_warning_emitted,
-                )
-            {
-                write_err = Some(e);
-            }
-        });
-        if let Some(e) = write_err {
-            return Err(e);
-        }
-        // Re-bind `turn` result for the match below.
-        match turn {
-            Ok(()) => {}
-            Err(e) => {
-                event_seq += 1;
-                diag::log_event(
-                    DiagnosticEvent::new("turn_failed")
-                        .level("error")
-                        .code("turn_failed")
-                        .run_id(run_id)
-                        .thread_id(&thread_id)
-                        .request_id_opt(id)
-                        .event_seq(event_seq)
-                        .message("turn failed")
-                        .detail(e.to_string()),
-                );
-                record_or_warn(
-                    &out_tx,
-                    session_id,
-                    Some(&thread_id),
-                    run_id,
-                    &format!(
-                        r#"{{"event":"failed","error":{}}}"#,
-                        serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "\"\"".into())
-                    ),
-                )?;
-                emit_session_event(
-                    &out_tx,
-                    session_id,
-                    Some(&thread_id),
-                    IpcMessage::error(id, &e.to_string()),
-                )?;
-                return emit_session_event(
-                    &out_tx,
-                    session_id,
-                    Some(&thread_id),
-                    IpcMessage::session_state(SessionState::Failed),
-                );
-            }
-        }
-    }
-
-    // Turn succeeded (failure already returned inside the streaming block).
-    event_seq += 1;
-    diag::log_event(
-        DiagnosticEvent::new("session_complete")
-            .level("info")
-            .code("session_complete")
-            .run_id(&run_id)
-            .thread_id(&thread_id)
-            .request_id_opt(id)
-            .event_seq(event_seq)
-            .message("session complete"),
-    );
-    record_or_warn(
-        out_tx,
-        session_id,
-        Some(&thread_id),
+        &mut adapter,
+        &context,
         &run_id,
-        r#"{"event":"complete"}"#,
-    )?;
-    emit_session_event(
-        out_tx,
-        session_id,
-        Some(&thread_id),
-        IpcMessage::session_state(SessionState::Ready),
-    )?;
-    emit_session_event(
-        out_tx,
-        session_id,
-        Some(&thread_id),
-        IpcMessage {
-            kind: "turnComplete".into(),
-            id,
-            session_id: None,
-            thread_id: None,
-            payload: None,
-        },
+        &thread_id,
+        &mut event_seq,
     )
 }
 
@@ -872,35 +972,15 @@ fn run_turn_on_existing_thread(
     thread_id: &str,
     prompt: &str,
 ) -> std::io::Result<()> {
+    let context = TurnRunContext {
+        id,
+        session_id,
+        prompt,
+        start: TurnStart::ResumedThread { thread_id },
+    };
     let run_id = new_run_id();
     let mut event_seq = 1;
-    diag::log_event(
-        DiagnosticEvent::new("history_turn_start")
-            .level("info")
-            .code("history_turn_start")
-            .run_id(&run_id)
-            .thread_id(thread_id)
-            .request_id_opt(id)
-            .event_seq(event_seq)
-            .message("history turn started"),
-    );
-    emit_session_event(
-        out_tx,
-        session_id,
-        Some(thread_id),
-        IpcMessage::session_state(SessionState::Starting),
-    )?;
-    record_or_warn(
-        out_tx,
-        session_id,
-        Some(thread_id),
-        &run_id,
-        &format!(
-            r#"{{"event":"resume","threadId":{},"prompt":{}}}"#,
-            serde_json::to_string(thread_id).unwrap_or_else(|_| "\"\"".into()),
-            serde_json::to_string(prompt).unwrap_or_else(|_| "\"\"".into())
-        ),
-    )?;
+    begin_turn_run(out_tx, &context, &run_id, event_seq)?;
 
     let mut adapter = match codex::CodexAdapter::spawn() {
         Ok(a) => a,
@@ -951,126 +1031,13 @@ fn run_turn_on_existing_thread(
         );
     }
 
-    emit_session_event(
+    run_codex_turn(
         out_tx,
-        session_id,
-        Some(thread_id),
-        IpcMessage::session_state(SessionState::Running),
-    )?;
-    let mut write_err: Option<std::io::Error> = None;
-    let mut record_warning_emitted = false;
-    {
-        let run_id = &run_id;
-        let out_tx = out_tx.clone();
-        let turn = adapter.turn_start(thread_id, prompt, |item| {
-            if write_err.is_some() {
-                return;
-            }
-            if let Err(e) = emit_session_event(
-                &out_tx,
-                session_id,
-                Some(thread_id),
-                IpcMessage::agent_item(&item),
-            ) {
-                write_err = Some(e);
-                return;
-            }
-            if let Ok(j) = serde_json::to_string(&item)
-                && let Err(e) = record_item_or_warn_with_context(
-                    RecordWarningContext {
-                        out_tx: &out_tx,
-                        session_id,
-                        run_id,
-                        thread_id: Some(thread_id),
-                        request_id: id,
-                    },
-                    &mut event_seq,
-                    &j,
-                    &mut record_warning_emitted,
-                )
-            {
-                write_err = Some(e);
-            }
-        });
-        if let Some(e) = write_err {
-            return Err(e);
-        }
-        match turn {
-            Ok(()) => {}
-            Err(e) => {
-                event_seq += 1;
-                diag::log_event(
-                    DiagnosticEvent::new("history_turn_failed")
-                        .level("error")
-                        .code("turn_failed")
-                        .run_id(run_id)
-                        .thread_id(thread_id)
-                        .request_id_opt(id)
-                        .event_seq(event_seq)
-                        .message("history turn failed")
-                        .detail(e.to_string()),
-                );
-                record_or_warn(
-                    &out_tx,
-                    session_id,
-                    Some(thread_id),
-                    run_id,
-                    &format!(
-                        r#"{{"event":"failed","error":{}}}"#,
-                        serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "\"\"".into())
-                    ),
-                )?;
-                emit_session_event(
-                    &out_tx,
-                    session_id,
-                    Some(thread_id),
-                    IpcMessage::error(id, &e.to_string()),
-                )?;
-                return emit_session_event(
-                    &out_tx,
-                    session_id,
-                    Some(thread_id),
-                    IpcMessage::session_state(SessionState::Failed),
-                );
-            }
-        }
-    }
-
-    event_seq += 1;
-    diag::log_event(
-        DiagnosticEvent::new("history_turn_complete")
-            .level("info")
-            .code("history_turn_complete")
-            .run_id(&run_id)
-            .thread_id(thread_id)
-            .request_id_opt(id)
-            .event_seq(event_seq)
-            .message("history turn complete"),
-    );
-    record_or_warn(
-        out_tx,
-        session_id,
-        Some(thread_id),
+        &mut adapter,
+        &context,
         &run_id,
-        r#"{"event":"complete"}"#,
-    )?;
-    emit_session_event(
-        out_tx,
-        session_id,
-        Some(thread_id),
-        IpcMessage::session_state(SessionState::Ready),
-    )?;
-    emit_session_event(
-        out_tx,
-        session_id,
-        Some(thread_id),
-        IpcMessage {
-            kind: "turnComplete".into(),
-            id,
-            session_id: None,
-            thread_id: None,
-            payload: None,
-        },
+        thread_id,
+        &mut event_seq,
     )
 }
 
@@ -1600,6 +1567,41 @@ mod tests {
         for _ in 0..1000 {
             assert!(ids.insert(new_run_id()));
         }
+    }
+
+    #[test]
+    fn turn_runner_context_builds_start_records_for_new_and_resumed_turns() {
+        let new_turn = TurnRunContext {
+            id: Some(1),
+            session_id: "session_new",
+            prompt: "hello",
+            start: TurnStart::NewSession { cwd: "/tmp/project" },
+        };
+        let resumed_turn = TurnRunContext {
+            id: Some(2),
+            session_id: "session_existing",
+            prompt: "continue",
+            start: TurnStart::ResumedThread {
+                thread_id: "thread_1",
+            },
+        };
+
+        assert_eq!(new_turn.initial_thread_id(), None);
+        assert_eq!(new_turn.start_log_name(), "session_start");
+        assert!(new_turn.start_record_line().contains(r#""event":"start""#));
+        assert!(new_turn.start_record_line().contains(r#""prompt":"hello""#));
+
+        assert_eq!(resumed_turn.initial_thread_id(), Some("thread_1"));
+        assert_eq!(resumed_turn.start_log_name(), "history_turn_start");
+        assert!(resumed_turn
+            .start_record_line()
+            .contains(r#""event":"resume""#));
+        assert!(resumed_turn
+            .start_record_line()
+            .contains(r#""threadId":"thread_1""#));
+        assert!(resumed_turn
+            .start_record_line()
+            .contains(r#""prompt":"continue""#));
     }
 
     #[test]
