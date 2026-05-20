@@ -138,6 +138,32 @@ struct SessionRenderThrottlingTests {
     }
 }
 
+@Suite("History model")
+struct HistoryModelTests {
+    @Test("decodes neutral history thread summary")
+    func decodesSummary() throws {
+        let data = Data("""
+        {"id":"thread_1","name":"Fix tests","preview":"please fix tests","cwd":"/tmp/project","createdAt":10,"updatedAt":20,"status":"ready","modelProvider":"openai","source":"cli"}
+        """.utf8)
+        let item = try JSONDecoder().decode(HistoryThreadSummary.self, from: data)
+        #expect(item.id == "thread_1")
+        #expect(item.cwd == "/tmp/project")
+        #expect(item.displayTitle == "Fix tests")
+    }
+
+    @Test("groups threads by project cwd newest first")
+    func groupsByProject() {
+        let groups = HistoryProjectGroup.group([
+            HistoryThreadSummary(id: "old", name: nil, preview: "old", cwd: "/tmp/a", createdAt: 1, updatedAt: 1, status: "ready", modelProvider: "openai", source: "cli"),
+            HistoryThreadSummary(id: "new", name: "new", preview: "new", cwd: "/tmp/a", createdAt: 2, updatedAt: 3, status: "ready", modelProvider: "openai", source: "cli"),
+            HistoryThreadSummary(id: "other", name: nil, preview: "other", cwd: "/tmp/b", createdAt: 2, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli"),
+        ])
+
+        #expect(groups.map(\.cwd) == ["/tmp/a", "/tmp/b"])
+        #expect(groups[0].threads.map(\.id) == ["new", "old"])
+    }
+}
+
 @Suite("Streaming TextKit renderer")
 @MainActor
 struct StreamingTextKitRendererTests {
