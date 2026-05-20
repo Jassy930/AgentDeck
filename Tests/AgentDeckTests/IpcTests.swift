@@ -596,6 +596,56 @@ struct WorkbenchRuntimeModelTests {
         #expect(model.selectedItems[1].diffBuffer.text == largeDiff)
         #expect(!model.selectedItems[1].hasDeferredDiffBuffer)
     }
+
+    @Test("selected runtime materialize misses do not fall back to legacy deferred items")
+    func selectedRuntimeMaterializeMissesDoNotFallbackToLegacyDeferredItems() {
+        let model = SessionModel()
+        let legacyOutput = String(repeating: "legacy output\n", count: 2)
+        let legacyDiff = String(repeating: "+ legacy diff\n", count: 2)
+        model.ingest(IpcMessage(
+            kind: "agentItem",
+            payload: AnyCodable([
+                "id": "shell1",
+                "lifecycle": "completed",
+                "kind": "shell",
+                "output": legacyOutput,
+            ])
+        ))
+        model.ingest(IpcMessage(
+            kind: "agentItem",
+            payload: AnyCodable([
+                "id": "legacyDiff",
+                "lifecycle": "completed",
+                "kind": "fileEdit",
+                "diff": legacyDiff,
+            ])
+        ))
+        model.flushPendingAgentItems()
+        model.items[0].hasDeferredOutputBuffer = true
+        model.items[0].outputBuffer.replace(with: "")
+        model.items[1].hasDeferredDiffBuffer = true
+        model.items[1].diffBuffer.replace(with: "")
+
+        model.workbench.ensureRuntime(sessionId: "selected", threadId: "thread_selected", cwd: URL(fileURLWithPath: "/tmp/selected"))
+        model.workbench.runtime(sessionId: "selected")?.applyReplayItems([
+            HistoryReplayItem(id: "shell1", lifecycle: "completed", kind: "shell", output: "selected small output"),
+            HistoryReplayItem(id: "selectedDiff", lifecycle: "completed", kind: "fileEdit", diff: "+ selected small diff"),
+        ])
+
+        model.materializeDeferredContent(itemId: "shell1", content: .output)
+        model.materializeDeferredContent(itemId: "legacyDiff", content: .diff)
+
+        #expect(model.items[0].hasDeferredOutputBuffer)
+        #expect(model.items[0].outputBuffer.text.isEmpty)
+        #expect(model.items[0].output == legacyOutput)
+        #expect(model.items[1].hasDeferredDiffBuffer)
+        #expect(model.items[1].diffBuffer.text.isEmpty)
+        #expect(model.items[1].diff == legacyDiff)
+        #expect(model.selectedItems[0].outputBuffer.text == "selected small output")
+        #expect(!model.selectedItems[0].hasDeferredOutputBuffer)
+        #expect(model.selectedItems[1].diffBuffer.text == "+ selected small diff")
+        #expect(!model.selectedItems[1].hasDeferredDiffBuffer)
+    }
 }
 
 final class BlockingHistoryDetailClient: HistoryDetailReading, @unchecked Sendable {

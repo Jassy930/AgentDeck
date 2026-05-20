@@ -779,6 +779,8 @@ git commit -m "feat: open history threads without interrupting runtimes"
 
 **第二次规格复核修正（2026-05-20）：** selected runtime 的 deferred output/diff materialize 只更新 runtime 自己，不回写 `SessionModel.items`。回归测试覆盖 legacy `phase == .running` 且 `items` 保留当前 stream 时，打开历史 replay 并展开 large output/diff 后，legacy `items` 仍保持 current item，`selectedItems` 中历史 item 完成 materialize。
 
+**第三次规格复核修正（2026-05-20）：** `SessionModel.materializeDeferredContent(...)` 只要存在 selected runtime，就只尝试 selected runtime 并直接返回；即使 selected runtime 未命中或目标不是 deferred，也不得 fallback 到 legacy/current `items`。回归测试覆盖 legacy/current `items` 存在同 id 或同 kind deferred item 时，selected runtime materialize 未命中/不是 deferred 后 legacy `items` 保持不变。
+
 ---
 
 ### Task 7: 多 runtime submit 和队列行为
