@@ -12,10 +12,8 @@ struct UserPromptBlock: View {
                 Text("You")
                     .font(.system(.caption, weight: .semibold))
                     .foregroundStyle(.secondary)
-                Text(text)
-                    .font(.system(.callout, weight: .medium))
-                    .foregroundStyle(.primary)
-                    .textSelection(.enabled)
+                StaticRichMessageView(markdown: text)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(maxWidth: 760, alignment: .leading)
         }

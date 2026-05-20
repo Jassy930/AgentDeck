@@ -70,3 +70,18 @@ struct RichMessageView: View {
             .onDisappear { state.unbind() }
     }
 }
+
+struct StaticRichMessageView: View {
+    let markdown: String
+    @State private var buffer = StreamingTextBuffer()
+
+    var body: some View {
+        RichMessageView(buffer: buffer)
+            .onAppear {
+                buffer.replace(with: markdown)
+            }
+            .onChange(of: markdown) { _, newMarkdown in
+                buffer.replace(with: newMarkdown)
+            }
+    }
+}

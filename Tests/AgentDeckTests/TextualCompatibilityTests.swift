@@ -46,6 +46,7 @@ struct TextualCompatibilityTests {
         let buffer = StreamingTextBuffer()
 
         _ = UserPromptBlock(text: "Summarize the plan")
+        _ = StaticRichMessageView(markdown: "Summarize the plan")
         _ = CodexTurnSection {
             RichMessageView(buffer: buffer)
         }
