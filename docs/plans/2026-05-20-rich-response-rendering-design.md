@@ -34,38 +34,34 @@ AgentDeck 当前已经把 Codex 返回的 `message`、`reasoning`、`shell` 和
 StreamingTextBuffer(raw markdown)
       │
       ▼
-RichResponseParser
+Textual StructuredText(markdown:)
       │
       ▼
-AgentDeckRichBlock[]
+Textual block renderer
       ├── paragraph / heading / list / quote
-      ├── codeBlock / diffBlock
-      └── markdownTable
-      │
-      ▼
-SwiftUI native block views
+      ├── codeBlock / diffBlock styles
+      └── table styles
 ```
 
-第一轮默认采用 `swift-markdown` 建立 Markdown 解析边界，再转成
-`AgentDeckRichBlock`。完整回复完成后可以走 AST；流式中间态需要额外容忍未
-闭合代码 fence 和半截表格，因此第一版允许在这个边界内先实现小型高价值
-block splitter，只负责代码块、diff 和 GFM 表格，普通文本继续作为 Markdown
-片段传递。这个路径保留 AgentDeck 现有 macOS 14+ 平台范围，并给代码块、diff
-和表格组件留下完整控制权。
-
+第一轮采用 Textual-first 路线，并把 AgentDeck 平台下限提升到 macOS 15。
 Textual 是 MarkdownUI 的后续方向，定位是 SwiftUI rich text rendering
-engine，而不是单纯 Markdown view；但当前 Textual 包声明 macOS 15+，
-高于 AgentDeck 现有 `Package.swift` 的 macOS 14+。因此 Textual 不作为第一版
-默认依赖，只在未来明确接受平台升级时再做 spike。
+engine，而不是单纯 Markdown view；它提供 `StructuredText(markdown:)`、
+代码块、表格、文本选择、语法高亮和 block style 定制能力，和 AgentDeck 的
+原生工作台定位匹配。
+
+Textual 负责普通 Markdown、代码块和表格的基础结构化渲染；AgentDeck 在它之上
+定制工作台体验：代码块复制、wrap、长代码折叠、diff 专用样式，以及表格复制
+Markdown/TSV、宽表转置等操作能力。若 Textual 某个 block 的数据访问不足，
+再针对该 block 增加 `AgentDeckRichBlock` 预解析层，而不是回退整条渲染路径。
 
 ## 选型结论
 
 | 方案 | 结论 |
 | --- | --- |
 | SwiftUI `Text` / `AttributedString` | 只适合 inline Markdown，不适合代码块和表格主路径。 |
-| MarkdownUI | 支持 GFM、代码块、表格和 block style，但已进入维护模式，可作为保守参考。 |
-| Textual | 方向匹配，但当前 macOS 15+，不适合作为 macOS 14+ 第一版默认依赖。 |
-| `swift-markdown` AST + 自绘 | 长期确定性最高，作为第一版默认路径和结构化 block 抽象基础。 |
+| MarkdownUI | 支持 GFM、代码块、表格和 block style，但已进入维护模式，仅作为历史参考。 |
+| Textual | 第一版主路径；要求 macOS 15+，但带来原生选择、表格、代码块、高亮和样式扩展。 |
+| `swift-markdown` AST + 自绘 | 作为特定 block 数据访问不足时的 fallback，不再作为默认主路径。 |
 | WebView + Shiki | 视觉能力强，但破坏原生路线，安全、复制、选择和资源管理成本高，只作为后备。 |
 | Tree-sitter 编辑器组件 | 对只读回复渲染过重；后续若要代码语义交互再评估。 |
 
@@ -139,7 +135,8 @@ Markdown AST 重新渲染。
 
 ## 测试策略
 
-- Parser fixture：标题、列表、引用、代码块、diff、表格、未闭合 fence。
+- Textual compatibility：`StructuredText(markdown:)` 能编译并接受代码块和表格 fixture。
+- Parser / style fixture：标题、列表、引用、代码块、diff、表格、未闭合 fence。
 - Code block view model：语言识别、复制内容、折叠阈值、wrap 状态。
 - Table view model：列宽、对齐、Markdown/TSV 复制、宽表转置。
 - Swift 测试：`swift test`。

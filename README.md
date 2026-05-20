@@ -74,7 +74,7 @@ thread。AgentDeck 只做轻量索引、回放和管理入口；Codex 持久化�
 
 ## 构建
 
-前置：Rust（`cargo`）、Swift 6 / Xcode（macOS 14+）、`codex` CLI 已
+前置：Rust（`cargo`）、Swift 6 / Xcode（macOS 15+）、`codex` CLI 已
 `codex login`（AgentDeck 不碰 / 不存 / 不转发任何 token —— 沿用 codex
 已有认证）。
 
