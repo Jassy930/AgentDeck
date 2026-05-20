@@ -135,6 +135,31 @@ pub enum AgentItemKind {
     Raw { description: String },
 }
 
+/// A neutral summary for a historical agent thread. Values such as
+/// `model_provider` and `source` are metadata from the runtime; the wire shape
+/// stays agent-neutral so Swift can group and render history without parsing a
+/// vendor protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryThreadSummary {
+    pub id: String,
+    pub name: Option<String>,
+    pub preview: String,
+    pub cwd: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub status: String,
+    pub model_provider: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryThreadList {
+    pub threads: Vec<HistoryThreadSummary>,
+    pub next_cursor: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +230,22 @@ mod tests {
         assert_eq!(v["kind"], "shell");
         assert_eq!(v["command"], "echo hi");
         assert_eq!(v["exitCode"], 0);
+    }
+
+    #[test]
+    fn history_thread_summary_serializes_without_vendor_names() {
+        let summary = HistoryThreadSummary {
+            id: "thread_1".into(),
+            name: Some("Fix tests".into()),
+            preview: "please fix tests".into(),
+            cwd: "/tmp/project".into(),
+            created_at: 1,
+            updated_at: 2,
+            status: "completed".into(),
+            model_provider: "openai".into(),
+            source: "cli".into(),
+        };
+        let wire = serde_json::to_string(&summary).unwrap().to_lowercase();
+        assert!(!wire.contains("codex"));
     }
 }
