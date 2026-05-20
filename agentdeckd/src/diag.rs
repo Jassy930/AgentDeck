@@ -16,14 +16,20 @@ use std::fs::{OpenOptions, create_dir_all};
 use std::io::Write;
 use std::path::PathBuf;
 
-use crate::record::redact;
+use crate::record::{app_data_dir, redact};
 
 fn log_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let mut p = PathBuf::from(home);
-    p.push("Library");
-    p.push("Application Support");
-    p.push("AgentDeck");
+    let mut p = app_data_dir()?;
+    p.push("diagnostic.log");
+    Some(p)
+}
+
+#[cfg(test)]
+fn log_path_from(
+    agentdeck_data_dir: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let mut p = crate::record::app_data_dir_from(agentdeck_data_dir, home)?;
     p.push("diagnostic.log");
     Some(p)
 }
@@ -70,6 +76,15 @@ mod tests {
                 .contains("Application Support/AgentDeck")
         );
         assert!(p.to_string_lossy().ends_with("diagnostic.log"));
+    }
+
+    #[test]
+    fn log_path_respects_agentdeck_data_dir_override() {
+        let root = std::env::temp_dir().join(format!("agentdeck-test-{}", std::process::id()));
+        let path = log_path_from(Some(root.as_os_str()), None).unwrap();
+
+        assert!(path.starts_with(&root));
+        assert!(path.ends_with("diagnostic.log"));
     }
 
     #[test]

@@ -17,17 +17,45 @@
 //! redaction, not a security boundary — but it stops the obvious leaks
 //! (sk-..., Bearer ..., AWS keys) from landing in a plaintext run log.
 
+use std::ffi::OsStr;
 use std::fs::{OpenOptions, create_dir_all};
 use std::io::Write;
 use std::path::PathBuf;
 
 /// AgentDeck's own data directory. Never the project tree (premise 5).
-pub fn record_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
+pub fn app_data_dir() -> Option<PathBuf> {
+    app_data_dir_from(
+        std::env::var_os("AGENTDECK_DATA_DIR").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+pub fn app_data_dir_from(
+    agentdeck_data_dir: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
+    if let Some(root) = agentdeck_data_dir
+        && !root.is_empty()
+    {
+        return Some(PathBuf::from(root));
+    }
+    let home = home?;
     let mut p = PathBuf::from(home);
     p.push("Library");
     p.push("Application Support");
     p.push("AgentDeck");
+    Some(p)
+}
+
+pub fn record_dir() -> Option<PathBuf> {
+    let mut p = app_data_dir()?;
+    p.push("runs");
+    Some(p)
+}
+
+#[cfg(test)]
+fn record_dir_from(agentdeck_data_dir: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    let mut p = app_data_dir_from(agentdeck_data_dir, home)?;
     p.push("runs");
     Some(p)
 }
@@ -90,6 +118,15 @@ mod tests {
         let s = d.to_string_lossy();
         assert!(s.contains("Library/Application Support/AgentDeck"));
         assert!(!s.contains(".agentdeck")); // deprecated repo-native path
+    }
+
+    #[test]
+    fn record_dir_respects_agentdeck_data_dir_override() {
+        let root = std::env::temp_dir().join(format!("agentdeck-test-{}", std::process::id()));
+        let dir = record_dir_from(Some(root.as_os_str()), None).unwrap();
+
+        assert!(dir.starts_with(&root));
+        assert!(dir.ends_with("runs"));
     }
 
     #[test]
