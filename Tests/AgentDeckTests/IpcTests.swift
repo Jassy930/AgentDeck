@@ -478,6 +478,37 @@ struct SessionRenderThrottlingTests {
     }
 }
 
+@Suite("Workbench runtime model")
+@MainActor
+struct WorkbenchRuntimeModelTests {
+    @Test("routes session events to the matching runtime")
+    func routesEventsToMatchingRuntime() {
+        let workbench = WorkbenchModel()
+        workbench.ensureRuntime(sessionId: "s1", threadId: "t1", cwd: URL(fileURLWithPath: "/tmp/a"))
+        workbench.ensureRuntime(sessionId: "s2", threadId: "t2", cwd: URL(fileURLWithPath: "/tmp/b"))
+
+        workbench.ingestSessionEvent(IpcMessage(
+            kind: "session/event",
+            sessionId: "s2",
+            threadId: "t2",
+            payload: AnyCodable([
+                "event": [
+                    "kind": "agentItem",
+                    "payload": [
+                        "id": "m1",
+                        "lifecycle": "completed",
+                        "kind": "message",
+                        "text": "B done",
+                    ],
+                ],
+            ])
+        ))
+
+        #expect(workbench.runtime(sessionId: "s1")?.items.isEmpty == true)
+        #expect(workbench.runtime(sessionId: "s2")?.items.count == 1)
+    }
+}
+
 final class BlockingHistoryDetailClient: HistoryDetailReading, @unchecked Sendable {
     private let lock = NSLock()
     private let semaphore = DispatchSemaphore(value: 0)

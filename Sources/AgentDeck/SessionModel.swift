@@ -62,6 +62,22 @@ struct UIItem: Identifiable {
     var diffBuffer = StreamingTextBuffer()
 }
 
+func agentDeckContainsNonWhitespace(_ text: String) -> Bool {
+    text.unicodeScalars.contains { scalar in
+        !CharacterSet.whitespacesAndNewlines.contains(scalar)
+    }
+}
+
+func agentDeckStringArray(from value: Any?) -> [String]? {
+    if let strings = value as? [String] {
+        return strings
+    }
+    if let values = value as? [Any] {
+        return values.compactMap { $0 as? String }
+    }
+    return nil
+}
+
 struct HistoryOpenTiming: Equatable {
     let threadId: String
     let itemCount: Int
@@ -423,7 +439,7 @@ final class SessionModel {
         item.savedPath = replay.savedPath ?? ""
         item.revisedPrompt = replay.revisedPrompt ?? ""
         item.review = replay.review ?? ""
-        item.hasNonWhitespaceText = containsNonWhitespace(replay.text)
+        item.hasNonWhitespaceText = agentDeckContainsNonWhitespace(replay.text)
         item.textBuffer.replace(with: replay.text)
         if shouldDeferHistoryText(item.output) {
             item.hasDeferredOutputBuffer = true
@@ -544,11 +560,11 @@ final class SessionModel {
             if life == "delta" {
                 item.text.append(contentsOf: t)
                 item.textBuffer.append(t)
-                item.hasNonWhitespaceText = item.hasNonWhitespaceText || containsNonWhitespace(t)
+                item.hasNonWhitespaceText = item.hasNonWhitespaceText || agentDeckContainsNonWhitespace(t)
             } else if !t.isEmpty {
                 item.text = t
                 item.textBuffer.replace(with: t)
-                item.hasNonWhitespaceText = containsNonWhitespace(t)
+                item.hasNonWhitespaceText = agentDeckContainsNonWhitespace(t)
             }
         case "shell":
             item.command = d["command"] as? String ?? item.command
@@ -578,7 +594,7 @@ final class SessionModel {
             item.query = d["query"] as? String ?? item.query
             item.action = d["action"] as? String ?? item.action
             item.actionQuery = d["actionQuery"] as? String ?? item.actionQuery
-            item.queries = stringArray(from: d["queries"]) ?? item.queries
+            item.queries = agentDeckStringArray(from: d["queries"]) ?? item.queries
             item.url = d["url"] as? String ?? item.url
             item.pattern = d["pattern"] as? String ?? item.pattern
         case "plan", "reviewMode":
@@ -604,7 +620,7 @@ final class SessionModel {
             item.model = d["model"] as? String ?? item.model
             item.reasoningEffort = d["reasoningEffort"] as? String ?? item.reasoningEffort
             item.senderThreadId = d["senderThreadId"] as? String ?? item.senderThreadId
-            item.receiverThreadIds = stringArray(from: d["receiverThreadIds"]) ?? item.receiverThreadIds
+            item.receiverThreadIds = agentDeckStringArray(from: d["receiverThreadIds"]) ?? item.receiverThreadIds
             item.agentsStates = d["agentsStates"] as? String ?? item.agentsStates
         case "media":
             item.mediaKind = d["mediaKind"] as? String ?? item.mediaKind
@@ -633,28 +649,12 @@ final class SessionModel {
         submit(next)
     }
 
-    private func containsNonWhitespace(_ text: String) -> Bool {
-        text.unicodeScalars.contains { scalar in
-            !CharacterSet.whitespacesAndNewlines.contains(scalar)
-        }
-    }
-
     private func shouldDeferHistoryText(_ text: String) -> Bool {
         text.utf8.count > largeHistoryTextThreshold
     }
 
     private static func milliseconds(from start: Date, to end: Date) -> Int {
         max(0, Int((end.timeIntervalSince(start) * 1000).rounded()))
-    }
-
-    private func stringArray(from value: Any?) -> [String]? {
-        if let strings = value as? [String] {
-            return strings
-        }
-        if let values = value as? [Any] {
-            return values.compactMap { $0 as? String }
-        }
-        return nil
     }
 
     func teardown() {

@@ -564,6 +564,8 @@ git commit -m "feat: run turns as daemon hub workers"
 
 ### Task 5: Swift 引入 ThreadRuntimeModel 和 WorkbenchModel
 
+**实施记录（2026-05-20）：** 已完成 Swift 多 runtime 状态层的第一步。`WorkbenchModel` 负责按 `sessionId` 查找并路由到既有 `ThreadRuntimeModel`；`ThreadRuntimeModel` 暂时复制 `SessionModel` 的 item 合并逻辑，UI 和历史读取切换留给 Task 6。
+
 **Files:**
 - Create: `Sources/AgentDeck/ThreadRuntimeModel.swift`
 - Create: `Sources/AgentDeck/WorkbenchModel.swift`
@@ -1222,4 +1224,3 @@ git commit -m "chore: finish async runtime hub"
 ```
 
 不要提交无关用户改动。
-
