@@ -23,7 +23,7 @@ mod ipc;
 mod record;
 
 use std::io::{BufRead, ErrorKind, Write};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 
 use ipc::{IpcMessage, SessionState};
 
@@ -52,6 +52,19 @@ fn write_msg(stdout: &mut impl Write, msg: &IpcMessage) -> std::io::Result<()> {
     s.push('\n');
     stdout.write_all(s.as_bytes())?;
     stdout.flush()
+}
+
+fn write_outbound_messages(
+    mut stdout: impl Write,
+    out_rx: Receiver<IpcMessage>,
+) -> std::io::Result<()> {
+    for msg in out_rx {
+        if let Err(e) = write_msg(&mut stdout, &msg) {
+            diag::log("writer_failed", &e.to_string());
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 fn send_msg(out_tx: &Sender<IpcMessage>, msg: IpcMessage) -> std::io::Result<()> {
@@ -491,12 +504,8 @@ fn main() -> std::io::Result<()> {
     let stdin = std::io::stdin();
     let (out_tx, out_rx) = mpsc::channel::<IpcMessage>();
     let writer = std::thread::spawn(move || {
-        let mut stdout = std::io::stdout();
-        for msg in out_rx {
-            if write_msg(&mut stdout, &msg).is_err() {
-                break;
-            }
-        }
+        let stdout = std::io::stdout();
+        write_outbound_messages(stdout, out_rx)
     });
 
     for line in stdin.lock().lines() {
@@ -617,8 +626,11 @@ fn main() -> std::io::Result<()> {
     }
 
     drop(out_tx);
-    if writer.join().is_err() {
-        return Err(std::io::Error::other("stdout writer thread panicked"));
+    match writer.join() {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(std::io::Error::other("stdout writer thread panicked"));
+        }
     }
     Ok(())
 }
@@ -667,9 +679,9 @@ mod tests {
             kind: "startTurn".into(),
             id: Some(42),
             session_id: Some("session_1".into()),
-            thread_id: Some("thread_1".into()),
+            thread_id: Some("top_level_thread".into()),
             payload: Some(serde_json::json!({
-                "threadId": "thread_1",
+                "threadId": "payload_thread",
                 "prompt": "continue"
             })),
         };
@@ -679,5 +691,29 @@ mod tests {
         assert_eq!(ack.kind, "turnAccepted");
         assert_eq!(ack.id, Some(42));
         assert_eq!(ack.session_id.as_deref(), Some("session_1"));
+        assert_eq!(ack.thread_id.as_deref(), Some("top_level_thread"));
+    }
+
+    #[test]
+    fn writer_returns_write_errors() {
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(ErrorKind::BrokenPipe, "closed"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (out_tx, out_rx) = mpsc::channel::<IpcMessage>();
+        out_tx.send(IpcMessage::pong(Some(1))).unwrap();
+        drop(out_tx);
+
+        let err = write_outbound_messages(FailingWriter, out_rx).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::BrokenPipe);
     }
 }
