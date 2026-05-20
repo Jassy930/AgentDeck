@@ -1242,3 +1242,7 @@ git commit -m "chore: finish async runtime hub"
 ## Task 9 实施记录
 
 - 已新增 compact `RuntimeSelectorView` 并接入 History 面板顶部。`WorkbenchModel.runtimeList` 将当前 selected runtime 排在最前；后台 runtime 收到事件会增加 `unreadEventCount`，用户选中该 runtime 后清零。README 已同步 runtime selector 的状态点、队列数和未读事件语义。
+
+## Task 11 实施记录
+
+- 已新增 `docs/plans/2026-05-20-agentdeck-async-runtime-hub-design.md`，并同步 README 与历史设计文档。当前文档明确：一个 `agentdeckd` 作为 async runtime hub，history reply 按 request id 分发，streaming event 按 `sessionId/threadId` 路由，历史浏览不再和 streaming turn 抢 direct reader。

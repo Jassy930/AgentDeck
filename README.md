@@ -39,8 +39,9 @@ AgentDeck.app  (macOS, SwiftUI + AppKit)
       │  stdio JSONL IPC（中立 AgentItem，无 Codex 字样）
       ▼
 agentdeckd  (Rust daemon)
+      │  ├── async runtime hub（stdin main loop + stdout writer）
+      │  ├── turn/history workers（带 sessionId/threadId 路由）
       │  ├── CodexAdapter（Codex item → 中立 AgentItem 翻译）
-      │  ├── Session 状态机（唯一状态源）
       │  └── 进程组拥有 app-server，退出连带 kill
       ▼
 codex app-server  (子进程, JSON-RPC over stdio)
@@ -48,6 +49,11 @@ codex app-server  (子进程, JSON-RPC over stdio)
 
 中立边界的物理位置 = IPC 协议本身。可验证事实：IPC schema 里不出现
 任何 Codex 字样。
+
+AgentDeck 使用一个 `agentdeckd` 作为 runtime hub。daemon 的 stdin 主循环不被
+单个 turn 阻塞；每个后台会话由独立 worker 持有 adapter，所有 worker 通过统一
+stdout writer 输出带 `sessionId/threadId` 的中立事件。历史请求按 request id
+分发 reply，不和 streaming `agentItem` 抢 reader。
 
 流式性能边界：daemon 不合并 Codex delta，而是忠实转发中立
 `agentItem`；Swift 端的 `SessionModel` 按约 30fps 合并待渲染 delta，并把
