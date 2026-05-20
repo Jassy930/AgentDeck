@@ -121,6 +121,8 @@ framing（逐行 JSONL）。codex 版本固定在 `protocol/CODEX_VERSION.txt`�
 - run 记录：`~/Library/Application Support/AgentDeck/runs/*.jsonl`
 - 诊断日志：`~/Library/Application Support/AgentDeck/diagnostic.log`
 
+Agent 自查流程见 [docs/AGENT_DIAGNOSTICS.md](docs/AGENT_DIAGNOSTICS.md)。
+
 写入前做 best-effort 密钥脱敏。写失败不阻塞会话，但会在界面可见
 警告（绝不静默）。
 
