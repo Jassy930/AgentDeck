@@ -24,7 +24,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::ipc::{AgentItem, AgentItemKind, Lifecycle};
 
@@ -53,12 +53,12 @@ impl std::fmt::Display for CodexError {
 /// than the terminal (Codex C-path), so probe common install locations in
 /// addition to PATH.
 fn locate_codex() -> Option<String> {
-    if let Ok(out) = Command::new("/usr/bin/which").arg("codex").output() {
-        if out.status.success() {
-            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !p.is_empty() {
-                return Some(p);
-            }
+    if let Ok(out) = Command::new("/usr/bin/which").arg("codex").output()
+        && out.status.success()
+    {
+        let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !p.is_empty() {
+            return Some(p);
         }
     }
     for cand in [
@@ -100,12 +100,14 @@ impl CodexAdapter {
             .spawn()
             .map_err(|e| CodexError::SpawnFailed(e.to_string()))?;
 
-        let stdin = child.stdin.take().ok_or_else(|| {
-            CodexError::SpawnFailed("no stdin pipe".into())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            CodexError::SpawnFailed("no stdout pipe".into())
-        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| CodexError::SpawnFailed("no stdin pipe".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| CodexError::SpawnFailed("no stdout pipe".into()))?;
 
         Ok(Self {
             child,
@@ -120,8 +122,8 @@ impl CodexAdapter {
         self.next_id += 1;
         // Step 0 finding: jsonrpc field omitted on the wire; newline-framed.
         let req = json!({ "id": id, "method": method, "params": params });
-        let mut line = serde_json::to_string(&req)
-            .map_err(|e| CodexError::Protocol(e.to_string()))?;
+        let mut line =
+            serde_json::to_string(&req).map_err(|e| CodexError::Protocol(e.to_string()))?;
         line.push('\n');
         self.stdin
             .write_all(line.as_bytes())
@@ -284,10 +286,55 @@ unsafe extern "C" {
 /// - `commandExecution` → neutral `Shell` (command / aggregatedOutput /
 ///   exitCode), per-kind structured (D4).
 /// - `fileChange` → neutral `FileEdit` (path + diff from changes[0]).
+///
+/// Reasoning text from a ThreadItem of type=reasoning.
+/// Schema: `{ id, content: string[], summary: string[] }` (verified from
+/// official schema, not assumed — the empty-blank-row bug was caused by
+/// reading `.text` which doesn't exist on this item type).
+/// Prefer `summary` (user-readable digest); fall back to `content` (full
+/// chain-of-thought); double-newline between entries to preserve paragraph
+/// breaks the model emitted.
+fn reasoning_text(item: &Value) -> String {
+    fn join_strings(arr: Option<&Value>) -> String {
+        arr.and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            })
+            .unwrap_or_default()
+    }
+    let summary = join_strings(item.get("summary"));
+    if !summary.is_empty() {
+        return summary;
+    }
+    join_strings(item.get("content"))
+}
+
 fn item_to_kind(item: &Value) -> Option<AgentItemKind> {
     match item.get("type").and_then(Value::as_str)? {
-        "agentMessage" => Some(AgentItemKind::Reasoning {
-            text: item.get("text").and_then(Value::as_str).unwrap_or("").to_string(),
+        // PRIMARY answer the user reads — NOT collapsed (the UX bug the user
+        // hit: this was mis-named reasoning and the UI folded it away).
+        "agentMessage" => Some(AgentItemKind::Message {
+            text: item
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        }),
+        // The model's chain-of-thought — genuinely secondary, the UI
+        // collapses THIS (D3). No longer neutralized to Raw: it is a real,
+        // distinct neutral kind so the UI can offer it collapsed instead of
+        // showing meaningless "unsupported item type" noise.
+        //
+        // Wire shape verified (NOT assumed): the schema is
+        // `{id, content[], summary[]}`, NOT `{text}`. Taking `.text` gave an
+        // empty string — that's why the expanded Reasoning row was blank.
+        // Concatenate `summary` first (the user-readable digest), then
+        // `content` (the full chain-of-thought); both arrays of strings.
+        "reasoning" => Some(AgentItemKind::Reasoning {
+            text: reasoning_text(item),
         }),
         "commandExecution" => Some(AgentItemKind::Shell {
             command: item
@@ -335,6 +382,23 @@ fn translate(method: &str, params: &Value) -> Option<AgentItem> {
         "item/agentMessage/delta" => {
             let id = params.get("itemId").and_then(Value::as_str)?.to_string();
             let delta = params.get("delta").and_then(Value::as_str)?.to_string();
+            // agentMessage delta = the streaming primary answer → Message
+            // (not Reasoning — that was the mis-mapping behind the UX bug).
+            Some(AgentItem {
+                id,
+                lifecycle: Lifecycle::Delta,
+                kind: AgentItemKind::Message { text: delta },
+            })
+        }
+        // Reasoning streams via dedicated channels (NOT item/agentMessage/
+        // delta). Two notification methods cover it:
+        //   - item/reasoning/textDelta       → full chain-of-thought stream
+        //   - item/reasoning/summaryTextDelta → user-readable digest stream
+        // Both surface as Reasoning deltas; the UI renders them under the
+        // (auto-expanded during turn) "Reasoning" disclosure.
+        "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
+            let id = params.get("itemId").and_then(Value::as_str)?.to_string();
+            let delta = params.get("delta").and_then(Value::as_str)?.to_string();
             Some(AgentItem {
                 id,
                 lifecycle: Lifecycle::Delta,
@@ -364,12 +428,20 @@ fn translate(method: &str, params: &Value) -> Option<AgentItem> {
         "item/started" => {
             let item = params.get("item")?;
             let id = item.get("id").and_then(Value::as_str)?.to_string();
-            Some(AgentItem { id, lifecycle: Lifecycle::Started, kind: item_to_kind(item)? })
+            Some(AgentItem {
+                id,
+                lifecycle: Lifecycle::Started,
+                kind: item_to_kind(item)?,
+            })
         }
         "item/completed" => {
             let item = params.get("item")?;
             let id = item.get("id").and_then(Value::as_str)?.to_string();
-            Some(AgentItem { id, lifecycle: Lifecycle::Completed, kind: item_to_kind(item)? })
+            Some(AgentItem {
+                id,
+                lifecycle: Lifecycle::Completed,
+                kind: item_to_kind(item)?,
+            })
         }
         _ => None,
     }
@@ -422,17 +494,19 @@ mod tests {
     // the regression net for the neutral boundary.
 
     #[test]
-    fn agent_message_delta_becomes_neutral_reasoning_delta() {
+    fn agent_message_delta_becomes_neutral_message_delta() {
+        // agentMessage = the user-facing answer → Message (NOT Reasoning;
+        // that mis-mapping is what hid the reply behind a collapsed group).
         let params = json!({
-            "itemId": "item_1", "delta": "thinking...",
+            "itemId": "item_1", "delta": "the answer",
             "threadId": "t", "turnId": "u"
         });
         let item = translate("item/agentMessage/delta", &params).unwrap();
         assert_eq!(item.id, "item_1");
         assert!(matches!(item.lifecycle, Lifecycle::Delta));
         match item.kind {
-            AgentItemKind::Reasoning { text } => assert_eq!(text, "thinking..."),
-            _ => panic!("expected Reasoning"),
+            AgentItemKind::Message { text } => assert_eq!(text, "the answer"),
+            _ => panic!("expected Message"),
         }
     }
 
@@ -471,8 +545,9 @@ mod tests {
     // version changes a field, these fail and point at the exact mapping.
 
     #[test]
-    fn fixture_agent_message_lifecycle_maps_to_reasoning() {
-        // item/started → item/agentMessage/delta* → item/completed
+    fn fixture_agent_message_lifecycle_maps_to_message() {
+        // agentMessage is the user-facing answer → Message across the full
+        // started → delta* → completed lifecycle.
         let started = translate(
             "item/started",
             &json!({"item":{"id":"msg1","type":"agentMessage","text":""},
@@ -480,7 +555,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(started.lifecycle, Lifecycle::Started));
-        assert!(matches!(started.kind, AgentItemKind::Reasoning { .. }));
+        assert!(matches!(started.kind, AgentItemKind::Message { .. }));
 
         let delta = translate(
             "item/agentMessage/delta",
@@ -488,7 +563,7 @@ mod tests {
         )
         .unwrap();
         match delta.kind {
-            AgentItemKind::Reasoning { text } => assert_eq!(text, "Hello"),
+            AgentItemKind::Message { text } => assert_eq!(text, "Hello"),
             _ => panic!(),
         }
 
@@ -499,8 +574,60 @@ mod tests {
         )
         .unwrap();
         match done.kind {
-            AgentItemKind::Reasoning { text } => assert_eq!(text, "Hello world"),
+            AgentItemKind::Message { text } => assert_eq!(text, "Hello world"),
             _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn fixture_internal_reasoning_maps_to_reasoning_not_raw() {
+        // The chain-of-thought item is `{content[], summary[]}` (verified
+        // schema), not `{text}`. Prefer summary (digest) over content.
+        let item = translate(
+            "item/started",
+            &json!({"item":{"id":"rs1","type":"reasoning",
+                            "summary":["step 1: think"],
+                            "content":["full thought trace"]},
+                    "startedAtMs":0,"threadId":"t","turnId":"u"}),
+        )
+        .unwrap();
+        match item.kind {
+            AgentItemKind::Reasoning { text } => assert_eq!(text, "step 1: think"),
+            _ => panic!("internal reasoning must map to Reasoning, not Raw"),
+        }
+    }
+
+    #[test]
+    fn fixture_reasoning_text_delta_maps_to_reasoning_delta() {
+        // Reasoning streams via dedicated channels, NOT item/agentMessage/
+        // delta. textDelta is the full chain-of-thought stream.
+        let item = translate(
+            "item/reasoning/textDelta",
+            &json!({"itemId":"rs1","delta":"step 1","contentIndex":0,
+                    "threadId":"t","turnId":"u"}),
+        )
+        .unwrap();
+        assert_eq!(item.id, "rs1");
+        assert!(matches!(item.lifecycle, Lifecycle::Delta));
+        match item.kind {
+            AgentItemKind::Reasoning { text } => assert_eq!(text, "step 1"),
+            _ => panic!("expected Reasoning delta"),
+        }
+    }
+
+    #[test]
+    fn fixture_reasoning_summary_text_delta_maps_to_reasoning_delta() {
+        // summaryTextDelta is the user-readable digest stream — same neutral
+        // shape (Reasoning), the UI doesn't need to distinguish.
+        let item = translate(
+            "item/reasoning/summaryTextDelta",
+            &json!({"itemId":"rs2","delta":"digest","summaryIndex":0,
+                    "threadId":"t","turnId":"u"}),
+        )
+        .unwrap();
+        match item.kind {
+            AgentItemKind::Reasoning { text } => assert_eq!(text, "digest"),
+            _ => panic!("expected Reasoning delta"),
         }
     }
 
@@ -518,7 +645,11 @@ mod tests {
         )
         .unwrap();
         match item.kind {
-            AgentItemKind::Shell { command, output, exit_code } => {
+            AgentItemKind::Shell {
+                command,
+                output,
+                exit_code,
+            } => {
                 assert_eq!(command, "echo hello");
                 assert_eq!(output.as_deref(), Some("hello\n"));
                 assert_eq!(exit_code, Some(0));
@@ -548,25 +679,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fixture_internal_reasoning_is_neutralized_not_shown() {
-        // The model's internal chain-of-thought (type=reasoning) must NOT
-        // surface as user-visible content — it neutralizes to Raw (verified
-        // semantics from the Step 2 e2e run).
-        let item = translate(
-            "item/started",
-            &json!({"item":{"id":"rs1","type":"reasoning","text":"internal cot"},
-                    "startedAtMs":0,"threadId":"t","turnId":"u"}),
-        )
-        .unwrap();
-        match item.kind {
-            AgentItemKind::Raw { description } => {
-                assert!(description.contains("reasoning"));
-                assert!(!description.contains("internal cot"));
-            }
-            _ => panic!("internal reasoning must be neutralized to Raw"),
-        }
-    }
+    // (Superseded by fixture_internal_reasoning_maps_to_reasoning_not_raw:
+    // internal reasoning is now a real collapsed Reasoning kind, not Raw.
+    // Genuinely unknown types still neutralize to Raw — covered by
+    // unknown_item_type_is_neutralized_not_leaked.)
 
     #[test]
     fn base64_decoder_roundtrips_shell_output_delta() {

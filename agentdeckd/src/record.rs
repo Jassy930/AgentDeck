@@ -17,7 +17,7 @@
 //! redaction, not a security boundary — but it stops the obvious leaks
 //! (sk-..., Bearer ..., AWS keys) from landing in a plaintext run log.
 
-use std::fs::{create_dir_all, OpenOptions};
+use std::fs::{OpenOptions, create_dir_all};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -45,15 +45,14 @@ pub fn redact(s: &str) -> String {
             || trimmed.starts_with("github_pat_")
             || trimmed.starts_with("AKIA")
             || (trimmed.len() > 32
-                && trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                && trimmed
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
                 && trimmed.chars().any(|c| c.is_ascii_digit())
                 && trimmed.chars().any(|c| c.is_ascii_uppercase())
                 && trimmed.chars().any(|c| c.is_ascii_lowercase()));
         if looks_secret {
-            let ws: String = token
-                .chars()
-                .skip_while(|c| !c.is_whitespace())
-                .collect();
+            let ws: String = token.chars().skip_while(|c| !c.is_whitespace()).collect();
             out.push_str("<REDACTED>");
             out.push_str(&ws);
         } else {

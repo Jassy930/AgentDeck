@@ -112,33 +112,70 @@ struct SessionView: View {
     private func itemRow(_ item: UIItem) -> some View {
         switch item.kind {
         case "user":
+            // The user's prompt gets a subtle background block so "what I
+            // said" is instantly distinct from "what the agent said". Kept
+            // restrained (system fill, small radius, no border/shadow/left-
+            // bar) so it reads as typographic grouping, not an AI-slop chat
+            // bubble — the D7 line, walked deliberately.
             Text(item.text)
                 .font(.system(.body, weight: .medium))
-                .padding(.vertical, 10)
-        case "reasoning":
-            // D3: reasoning is SECONDARY — default-collapsed, muted.
-            DisclosureGroup {
-                Text(item.text)
-                    .font(.system(.callout))
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .padding(.top, 4)
-            } label: {
-                Text("Reasoning")
-                    .font(.system(.callout))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color(nsColor: .quaternarySystemFill))  // D8
+                )
+                .padding(.vertical, 8)
+        case "message":
+            // PRIMARY answer the user reads. NOT collapsed — this is the
+            // reply. A small "Codex" caption gives it an identity opposite
+            // the user's background block, so the two are unmistakable
+            // without making the reply a bubble too (asymmetry on purpose:
+            // user = block, agent = labelled prose).
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Codex")
+                    .font(.system(.caption, weight: .medium))
                     .foregroundStyle(.tertiary)
+                Text(item.text)
+                    .font(.system(.body))
+                    .textSelection(.enabled)
             }
-            .padding(.vertical, 8)
+            .padding(.vertical, 10)
+        case "reasoning":
+            // D3: chain-of-thought is SECONDARY — collapsed by default. The
+            // row auto-expands during a running turn (Codex sends the
+            // final agentMessage in a stream we can't speed up, so showing
+            // reasoning while we wait keeps the wait readable).
+            //
+            // Codex sometimes emits reasoning items with empty content
+            // (started+completed but no textDelta and no summary/content
+            // populated — verified Step 4 UX debug). An empty "Reasoning"
+            // disclosure is pure noise, so skip it: better to show nothing
+            // than a disclosure that opens to a blank panel.
+            if !item.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                ReasoningRow(text: item.text, model: model)
+            }
         case "shell":
-            // PRIMARY. SF Mono block (D8), no card (D7).
+            // PRIMARY layer, but the command + exit code stay resident
+            // while the (potentially huge) output collapses (D3: shell is
+            // primary, its output is a DETAIL). Default-collapsed; the label
+            // shows the line count so the user can judge whether to expand.
             VStack(alignment: .leading, spacing: 4) {
                 Text("$ \(item.command)")
                     .font(.system(.callout, design: .monospaced))
                 if !item.output.isEmpty {
-                    Text(item.output)
-                        .font(.system(.callout, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
+                    DisclosureGroup {
+                        Text(item.output)
+                            .font(.system(.callout, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .padding(.top, 4)
+                    } label: {
+                        Text(outputLabel(item.output))
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
                 }
                 if let code = item.exitCode, code != 0 {
                     Text("exit \(code)")
@@ -152,9 +189,17 @@ struct SessionView: View {
                 Text(item.path)
                     .font(.system(.callout, design: .monospaced, weight: .medium))
                 if !item.diff.isEmpty {
-                    Text(item.diff)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
+                    // Diffs can be large too — same collapse treatment.
+                    DisclosureGroup {
+                        Text(item.diff)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .padding(.top, 4)
+                    } label: {
+                        Text(outputLabel(item.diff, noun: "diff"))
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
                 }
             }
             .padding(.vertical, 10)
@@ -198,6 +243,53 @@ struct SessionView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+    }
+
+    /// Collapsed-output label: tells the user how much is hidden so they can
+    /// decide whether to expand (don't make them open it just to find out
+    /// it's two lines).
+    private struct ReasoningRow: View {
+        let text: String
+        /// Observes the model so phase changes (.running → .ready) trigger
+        /// this row's body. A snapshot `autoExpand: Bool` would freeze in
+        /// SwiftUI's elision and miss the collapse signal.
+        let model: SessionModel
+        @State private var expanded = false
+        @State private var lastAutoExpand = false
+        var body: some View {
+            let auto = model.shouldShowReasoningExpanded
+            DisclosureGroup(isExpanded: $expanded) {
+                Text(text)
+                    .font(.system(.callout))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .padding(.top, 4)
+            } label: {
+                Text("Reasoning")
+                    .font(.system(.callout))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.vertical, 8)
+            // Track auto-expand edges. When model flips, sync local state.
+            // Using onChange of the computed Bool — read above so the
+            // dependency is registered with Observable tracking. The body
+            // re-runs on every phase change because `auto` is read above.
+            .onChange(of: auto) { _, newValue in
+                expanded = newValue
+                lastAutoExpand = newValue
+            }
+            .onAppear {
+                expanded = auto
+                lastAutoExpand = auto
+            }
+        }
+    }
+
+    private func outputLabel(_ text: String, noun: String = "output") -> String {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).count
+        return lines <= 1
+            ? "Show \(noun)"
+            : "Show \(noun) (\(lines) lines)"
     }
 
     private func send() {

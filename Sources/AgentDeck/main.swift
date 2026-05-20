@@ -27,7 +27,23 @@ if CommandLine.arguments.contains("--selfcheck") {
     }
 }
 
+// A SwiftPM executable is a plain command-line binary, not a `.app`
+// bundle, so macOS treats it as a background tool by default — the
+// WindowGroup never shows (no Info.plist declaring it a GUI app). Force
+// regular activation policy and bring the app to the front so the window
+// appears even when launched from a terminal. (A real `.app` bundle with
+// Info.plist is the Step 5 README distribution path; this makes the dev
+// build runnable too.)
+final class AppActivator: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
 struct AgentDeckApp: App {
+    @NSApplicationDelegateAdaptor(AppActivator.self) var activator
+
     var body: some Scene {
         WindowGroup("AgentDeck") {     // D3: title bar reads "AgentDeck"
             SessionView()

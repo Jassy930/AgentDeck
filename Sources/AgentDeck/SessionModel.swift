@@ -36,9 +36,36 @@ final class SessionModel {
     /// The chosen project directory (Eng D3: Swift validates before the
     /// daemon's authoritative check). nil → show the empty state (D5).
     var cwd: URL?
-    var phase: Phase = .idle
+    var phase: Phase = .idle {
+        didSet {
+            switch phase {
+            case .starting, .running:
+                if oldValue != .starting && oldValue != .running {
+                    runStartedAt = Date()
+                }
+            case .ready, .failed, .closed, .idle:
+                runStartedAt = nil
+            default: break
+            }
+            tickIfNeeded()
+        }
+    }
+
+    /// True while a turn is in flight — the view auto-EXPANDS reasoning so
+    /// the user sees the chain-of-thought stream while waiting for the
+    /// final answer (which Codex sends in one burst). When the turn ends,
+    /// reasoning collapses back to its D3 secondary role.
+    var shouldShowReasoningExpanded: Bool {
+        phase == .running || phase == .starting
+    }
     var items: [UIItem] = []
     var errorMessage: String?
+    /// When the current turn began. `nil` outside a turn.
+    var runStartedAt: Date?
+    /// Driven by a tick timer; the status bar reads this so the elapsed
+    /// counter updates once per second while a turn is running.
+    var tickNow: Date = .now
+    private var tickTimer: Timer?
     /// Prompts queued while a turn runs (Eng I1). v0.1: enqueue, auto-send
     /// on turn completion. Step 5 wires the auto-send; Step 4 shows the count.
     var queuedPrompts: [String] = []
@@ -46,17 +73,45 @@ final class SessionModel {
     private let client = DaemonClient()
     private var daemonStarted = false
 
+    /// Elapsed seconds in the current turn (nil outside a turn). Driven by
+    /// `tickNow` so SwiftUI re-renders every second.
+    var elapsedSeconds: Int? {
+        guard let start = runStartedAt else { return nil }
+        return max(0, Int(tickNow.timeIntervalSince(start)))
+    }
+
     /// D6 transition copy: reuse the D9 state machine, not a generic spinner.
+    /// When a turn is running, append elapsed seconds so the user can SEE
+    /// time passing while Codex assembles the final answer.
     var statusText: String {
+        let base: String
         switch phase {
-        case .idle: return "Ready"
-        case .starting: return "Connecting to Codex…"
-        case .ready: return "Ready"
-        case .running: return "Codex is working…"
-        case .waitingApproval: return "Waiting for your approval"
-        case .draining: return "Finishing up…"
-        case .failed: return "Failed"
-        case .closed: return "Closed"
+        case .idle: base = "Ready"
+        case .starting: base = "Connecting to Codex…"
+        case .ready: base = "Ready"
+        case .running: base = "Codex is working…"
+        case .waitingApproval: base = "Waiting for your approval"
+        case .draining: base = "Finishing up…"
+        case .failed: base = "Failed"
+        case .closed: base = "Closed"
+        }
+        if let s = elapsedSeconds, phase == .running || phase == .starting {
+            return "\(base)  \(s)s"
+        }
+        return base
+    }
+
+    /// Start/stop the 1Hz tick so `elapsedSeconds` updates while a turn
+    /// runs and stays still otherwise (no idle CPU).
+    func tickIfNeeded() {
+        let needsTick = (phase == .running || phase == .starting)
+        if needsTick && tickTimer == nil {
+            tickTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.tickNow = .now }
+            }
+        } else if !needsTick {
+            tickTimer?.invalidate()
+            tickTimer = nil
         }
     }
 
@@ -146,14 +201,33 @@ final class SessionModel {
               let kind = d["kind"] as? String,
               let life = d["lifecycle"] as? String else { return }
 
+        // `raw` = a neutralized unknown vendor item (incl. the echoed
+        // userMessage). The daemon still records it for audit, but it is
+        // meaningless NOISE in the UI — this is exactly what the user saw
+        // ("unsupported item type: userMessage / reasoning"). Drop it from
+        // the UI stream. Filtering here (not in the view) keeps the noise
+        // out of the UI data model entirely.
+        if kind == "raw" { return }
+
         var item = items.first(where: { $0.id == id })
             ?? UIItem(id: id, lifecycle: life, kind: kind)
         item.lifecycle = life
         item.kind = kind
         switch kind {
-        case "reasoning":
+        case "message", "reasoning":
+            // message = primary answer; reasoning = collapsed chain-of-
+            // thought. Both accumulate text the same way: delta appends.
+            // started/completed REPLACE — UNLESS the incoming text is empty
+            // (Codex's reasoning `completed` sometimes ships with empty
+            // content/summary, which would wipe out the delta stream the
+            // user just watched arrive — the "blank when expanded" bug).
+            // Empty incoming → keep the accumulated text.
             let t = d["text"] as? String ?? ""
-            item.text = (life == "delta") ? item.text + t : t
+            if life == "delta" {
+                item.text = item.text + t
+            } else if !t.isEmpty {
+                item.text = t
+            }
         case "shell":
             item.command = d["command"] as? String ?? item.command
             if let o = d["output"] as? String {

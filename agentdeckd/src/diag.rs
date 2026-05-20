@@ -12,7 +12,7 @@
 //! Secrets pass through `record::redact` before write — a diagnostic log is
 //! still a plaintext file a user might paste into a bug report.
 
-use std::fs::{create_dir_all, OpenOptions};
+use std::fs::{OpenOptions, create_dir_all};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -33,12 +33,7 @@ fn log_path() -> Option<PathBuf> {
 /// run records (E2 surfaces those failures), a diagnostic-log write failure
 /// is itself logged to stderr and otherwise ignored.
 pub fn log(event: &str, detail: &str) {
-    let line = format!(
-        "{} {} {}",
-        chrono_now(),
-        event,
-        redact(detail)
-    );
+    let line = format!("{} {} {}", chrono_now(), event, redact(detail));
     if let Some(path) = log_path() {
         if let Some(dir) = path.parent() {
             let _ = create_dir_all(dir);
@@ -70,7 +65,10 @@ mod tests {
     #[test]
     fn log_path_is_app_support() {
         let p = log_path().unwrap();
-        assert!(p.to_string_lossy().contains("Application Support/AgentDeck"));
+        assert!(
+            p.to_string_lossy()
+                .contains("Application Support/AgentDeck")
+        );
         assert!(p.to_string_lossy().ends_with("diagnostic.log"));
     }
 

@@ -24,7 +24,7 @@ mod record;
 
 use std::io::{BufRead, Write};
 
-use ipc::{Coalescer, IpcMessage, SessionState};
+use ipc::{IpcMessage, SessionState};
 
 fn write_msg(stdout: &mut impl Write, msg: &IpcMessage) -> std::io::Result<()> {
     let mut s = serde_json::to_string(msg)?;
@@ -75,8 +75,14 @@ fn run_session(
     );
     diag::log("session_start", &format!("run={run_id} cwd={cwd}"));
     write_msg(stdout, &IpcMessage::session_state(SessionState::Starting))?;
-    record_or_warn(stdout, &run_id, &format!(r#"{{"event":"start","prompt":{}}}"#,
-        serde_json::to_string(prompt).unwrap_or_else(|_| "\"\"".into())))?;
+    record_or_warn(
+        stdout,
+        &run_id,
+        &format!(
+            r#"{{"event":"start","prompt":{}}}"#,
+            serde_json::to_string(prompt).unwrap_or_else(|_| "\"\"".into())
+        ),
+    )?;
 
     let mut adapter = match codex::CodexAdapter::spawn() {
         Ok(a) => a,
@@ -104,49 +110,77 @@ fn run_session(
 
     write_msg(stdout, &IpcMessage::session_state(SessionState::Running))?;
 
-    // Step 3: stream through the A2 coalescer. turn_start hands each
-    // translated item to the closure; the coalescer merges consecutive
-    // same-id deltas (bounded to one pending slot) and yields whatever must
-    // be flushed now. We still collect into a Vec because turn_start borrows
-    // the adapter and stdout can't be borrowed inside the closure — but the
-    // coalescer runs INSIDE the closure, so buffering is bounded regardless
-    // of turn length (the Vec only holds already-coalesced items, i.e. one
-    // entry per logical item, not one per raw delta).
-    let mut coalescer = Coalescer::default();
-    let mut out_items = Vec::new();
-    let turn = adapter.turn_start(&thread_id, prompt, |item| {
-        if let Some(flush) = coalescer.push(item) {
-            out_items.push(flush);
+    // TRUE streaming (the Beat 1 soul — "the native streaming session IS
+    // the wow"). EVERY delta is written to IPC the moment it is translated,
+    // inside the turn_start callback. NO daemon-side coalescing: merging all
+    // deltas into one (the old A2 behavior) destroyed the stream — the whole
+    // reply appeared in one jarring burst (the bad feel the user reported).
+    //
+    // Backpressure is now the SwiftUI render layer's job: SwiftUI naturally
+    // batches state updates per frame, which is the right place to throttle
+    // for a native app. The daemon's job is to forward faithfully, not to
+    // buffer. (Design doc A2 is downgraded accordingly: daemon-side merge →
+    // render-layer throttling.)
+    //
+    // The callback can't use `?`, so it stashes the first write error into
+    // `write_err`; surfaced after the turn. `stdout`/`write_err` are
+    // independent of `adapter`, so the closure does not conflict with
+    // `turn_start`'s `&mut self`.
+    let mut write_err: Option<std::io::Error> = None;
+    {
+        let stdout = &mut *stdout;
+        let run_id = &run_id;
+        let turn = adapter.turn_start(&thread_id, prompt, |item| {
+            if write_err.is_some() {
+                return;
+            }
+            if let Err(e) = write_msg(stdout, &IpcMessage::agent_item(&item)) {
+                write_err = Some(e);
+                return;
+            }
+            // Record each neutral item as it streams (redaction inside).
+            if let Ok(j) = serde_json::to_string(&item)
+                && let Err(reason) = record::try_append(run_id, &j)
+            {
+                diag::log("record_failed", &reason);
+                // Best-effort: a record failure must not abort the
+                // stream; the visible warning is emitted post-turn.
+            }
+        });
+        if let Some(e) = write_err {
+            return Err(e);
         }
-    });
-    if let Some(last) = coalescer.take_pending() {
-        out_items.push(last);
+        // Re-bind `turn` result for the match below.
+        match turn {
+            Ok(()) => {}
+            Err(e) => {
+                diag::log("turn_failed", &format!("run={run_id} {e}"));
+                record_or_warn(
+                    stdout,
+                    run_id,
+                    &format!(
+                        r#"{{"event":"failed","error":{}}}"#,
+                        serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "\"\"".into())
+                    ),
+                )?;
+                write_msg(stdout, &IpcMessage::error(id, &e.to_string()))?;
+                return write_msg(stdout, &IpcMessage::session_state(SessionState::Failed));
+            }
+        }
     }
 
-    for item in &out_items {
-        write_msg(stdout, &IpcMessage::agent_item(item))?;
-        // Record each neutral item (redaction happens inside try_append).
-        if let Ok(j) = serde_json::to_string(item) {
-            record_or_warn(stdout, &run_id, &j)?;
-        }
-    }
-
-    match turn {
-        Ok(()) => {
-            diag::log("session_complete", &format!("run={run_id} items={}", out_items.len()));
-            record_or_warn(stdout, &run_id, r#"{"event":"complete"}"#)?;
-            write_msg(stdout, &IpcMessage::session_state(SessionState::Ready))?;
-            write_msg(stdout, &IpcMessage { kind: "turnComplete".into(), id, payload: None })
-        }
-        Err(e) => {
-            diag::log("turn_failed", &format!("run={run_id} {e}"));
-            record_or_warn(stdout, &run_id,
-                &format!(r#"{{"event":"failed","error":{}}}"#,
-                    serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "\"\"".into())))?;
-            write_msg(stdout, &IpcMessage::error(id, &e.to_string()))?;
-            write_msg(stdout, &IpcMessage::session_state(SessionState::Failed))
-        }
-    }
+    // Turn succeeded (failure already returned inside the streaming block).
+    diag::log("session_complete", &format!("run={run_id}"));
+    record_or_warn(stdout, &run_id, r#"{"event":"complete"}"#)?;
+    write_msg(stdout, &IpcMessage::session_state(SessionState::Ready))?;
+    write_msg(
+        stdout,
+        &IpcMessage {
+            kind: "turnComplete".into(),
+            id,
+            payload: None,
+        },
+    )
 }
 
 fn main() -> std::io::Result<()> {
