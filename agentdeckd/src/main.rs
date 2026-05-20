@@ -115,6 +115,8 @@ fn run_history_list(
             &IpcMessage {
                 kind: "historyThreads".into(),
                 id,
+                session_id: None,
+                thread_id: None,
                 payload: Some(serde_json::to_value(list).expect("history list serializes")),
             },
         ),
@@ -147,6 +149,8 @@ fn run_history_read(
             &IpcMessage {
                 kind: "historyThread".into(),
                 id,
+                session_id: None,
+                thread_id: None,
                 payload: Some(serde_json::to_value(detail).expect("history detail serializes")),
             },
         ),
@@ -185,6 +189,8 @@ fn run_thread_management(
             &IpcMessage {
                 kind: "historyThreadUpdated".into(),
                 id,
+                session_id: None,
+                thread_id: None,
                 payload: Some(serde_json::json!({ "threadId": thread_id })),
             },
         ),
@@ -208,6 +214,8 @@ fn record_or_warn(stdout: &mut impl Write, run_id: &str, line: &str) -> std::io:
             &IpcMessage {
                 kind: "warning".into(),
                 id: None,
+                session_id: None,
+                thread_id: None,
                 payload: Some(serde_json::json!({
                     "message": format!("本次未留痕: {reason}")
                 })),
@@ -336,6 +344,8 @@ fn run_session(
         &IpcMessage {
             kind: "turnComplete".into(),
             id,
+            session_id: None,
+            thread_id: None,
             payload: None,
         },
     )
@@ -439,6 +449,8 @@ fn run_turn_on_existing_thread(
         &IpcMessage {
             kind: "turnComplete".into(),
             id,
+            session_id: None,
+            thread_id: None,
             payload: None,
         },
     )

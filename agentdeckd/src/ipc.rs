@@ -13,11 +13,15 @@
 use serde::{Deserialize, Serialize};
 
 /// A message on the neutral IPC wire (Swift ↔ daemon).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct IpcMessage {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
+    #[serde(rename = "sessionId", skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(rename = "threadId", skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
 }
@@ -27,6 +31,8 @@ impl IpcMessage {
         Self {
             kind: "pong".into(),
             id,
+            session_id: None,
+            thread_id: None,
             payload: None,
         }
     }
@@ -35,6 +41,8 @@ impl IpcMessage {
         Self {
             kind: "error".into(),
             id,
+            session_id: None,
+            thread_id: None,
             payload: Some(serde_json::json!({ "message": message })),
         }
     }
@@ -44,6 +52,8 @@ impl IpcMessage {
         Self {
             kind: "agentItem".into(),
             id: None,
+            session_id: None,
+            thread_id: None,
             payload: Some(serde_json::to_value(item).expect("AgentItem serializes")),
         }
     }
@@ -54,7 +64,19 @@ impl IpcMessage {
         Self {
             kind: "sessionState".into(),
             id: None,
+            session_id: None,
+            thread_id: None,
             payload: Some(serde_json::json!({ "state": state })),
+        }
+    }
+
+    pub fn session_event(session_id: &str, thread_id: Option<&str>, event: IpcMessage) -> Self {
+        Self {
+            kind: "session/event".into(),
+            id: None,
+            session_id: Some(session_id.to_string()),
+            thread_id: thread_id.map(str::to_string),
+            payload: Some(serde_json::json!({ "event": event })),
         }
     }
 }
@@ -326,6 +348,35 @@ pub struct HistoryThreadDetail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipc_message_can_carry_session_and_thread_routing() {
+        let msg = IpcMessage {
+            kind: "session/event".into(),
+            id: None,
+            session_id: Some("session_1".into()),
+            thread_id: Some("thread_1".into()),
+            payload: Some(serde_json::json!({
+                "event": { "kind": "turnComplete" }
+            })),
+        };
+
+        let wire = serde_json::to_string(&msg).unwrap();
+        assert!(wire.contains(r#""sessionId":"session_1""#));
+        assert!(wire.contains(r#""threadId":"thread_1""#));
+        assert!(!wire.to_lowercase().contains("codex"));
+
+        let wrapped = IpcMessage::session_event(
+            "session_1",
+            Some("thread_1"),
+            IpcMessage::session_state(SessionState::Ready),
+        );
+        let wrapped_wire = serde_json::to_string(&wrapped).unwrap();
+        assert!(wrapped_wire.contains(r#""kind":"session/event""#));
+        assert!(wrapped_wire.contains(r#""sessionId":"session_1""#));
+        assert!(wrapped_wire.contains(r#""threadId":"thread_1""#));
+        assert!(wrapped_wire.contains(r#""event""#));
+    }
 
     /// Eng D2, verifiable form: the neutral protocol module must not contain
     /// vendor vocabulary in anything it serializes. If a future change adds a

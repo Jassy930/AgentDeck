@@ -27,7 +27,23 @@ enum DaemonError: Error, CustomStringConvertible {
 struct IpcMessage: Codable {
     let kind: String
     var id: UInt64?
+    var sessionId: String?
+    var threadId: String?
     var payload: AnyCodable?
+
+    init(
+        kind: String,
+        id: UInt64? = nil,
+        sessionId: String? = nil,
+        threadId: String? = nil,
+        payload: AnyCodable? = nil
+    ) {
+        self.kind = kind
+        self.id = id
+        self.sessionId = sessionId
+        self.threadId = threadId
+        self.payload = payload
+    }
 }
 
 /// Minimal type-erased JSON value so the neutral payload can carry any

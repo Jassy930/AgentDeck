@@ -29,6 +29,19 @@ struct IpcMessageTests {
         #expect(back.id == 42)
     }
 
+    @Test("IpcMessage decodes session and thread routing fields")
+    func decodesRoutingFields() throws {
+        let data = Data("""
+        {"kind":"session/event","sessionId":"session_1","threadId":"thread_1","payload":{"event":{"kind":"turnComplete"}}}
+        """.utf8)
+
+        let msg = try JSONDecoder().decode(IpcMessage.self, from: data)
+
+        #expect(msg.kind == "session/event")
+        #expect(msg.sessionId == "session_1")
+        #expect(msg.threadId == "thread_1")
+    }
+
     /// Eng D2: the neutral wire must never carry vendor vocabulary. Guard test
     /// — if a future change leaks a Codex-named field onto the Swift side,
     /// this fails. The neutral boundary is a verifiable fact, not a convention.
