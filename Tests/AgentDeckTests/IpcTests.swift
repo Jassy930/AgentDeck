@@ -399,9 +399,11 @@ struct SessionRenderThrottlingTests {
     @Test("submitting a user prompt requests scroll to latest")
     func submittingUserPromptRequestsScrollToLatest() throws {
         let client = RecordingSessionClient()
+        let turnStarter = RecordingRuntimeTurnStarter()
         let model = SessionModel(
             client: client,
-            historyDetailClient: NoopHistoryDetailClient()
+            historyDetailClient: NoopHistoryDetailClient(),
+            runtimeTurnStarter: turnStarter
         )
         let cwd = URL(fileURLWithPath: NSTemporaryDirectory())
         let initialRequest = model.scrollToLatestRequest
@@ -410,11 +412,47 @@ struct SessionRenderThrottlingTests {
 
         model.submit("  hello  ")
 
-        #expect(model.items.count == 1)
-        #expect(model.items[0].kind == "user")
-        #expect(model.items[0].text == "hello")
+        #expect(model.selectedItems.count == 1)
+        #expect(model.selectedItems[0].kind == "user")
+        #expect(model.selectedItems[0].text == "hello")
         #expect(model.scrollToLatestRequest != initialRequest)
-        #expect(client.startedSessionPrompt == "hello")
+        #expect(turnStarter.requests.map(\.prompt) == ["hello"])
+    }
+
+    @Test("live session continues on returned thread id")
+    func liveSessionContinuesOnReturnedThreadId() throws {
+        let turnStarter = RecordingRuntimeTurnStarter()
+        let model = SessionModel(
+            client: RecordingSessionClient(),
+            historyDetailClient: NoopHistoryDetailClient(),
+            runtimeTurnStarter: turnStarter
+        )
+        let cwd = URL(fileURLWithPath: NSTemporaryDirectory())
+
+        #expect(model.chooseCwd(cwd) == nil)
+
+        model.submit("first")
+
+        let first = try #require(turnStarter.requests.first)
+        #expect(first.threadId == nil)
+        #expect(first.cwd == cwd)
+        #expect(model.workbench.selectedSessionId == first.sessionId)
+
+        model.workbench.ingestSessionEvent(IpcMessage(
+            kind: "session/event",
+            sessionId: first.sessionId,
+            threadId: "thread_live",
+            payload: AnyCodable(["event": ["kind": "turnComplete"]])
+        ))
+
+        #expect(model.workbench.selectedRuntime?.threadId == "thread_live")
+
+        model.submit("second")
+
+        #expect(turnStarter.requests.count == 2)
+        #expect(turnStarter.requests[1].sessionId == first.sessionId)
+        #expect(turnStarter.requests[1].threadId == "thread_live")
+        #expect(turnStarter.requests[1].prompt == "second")
     }
 
     @Test("runtime streaming deltas are flushed by timer")

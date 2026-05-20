@@ -89,6 +89,8 @@ thread 阻塞主界面。AgentDeck 只做轻量索引、回放和管理入口；
 打开历史 thread 只切换当前选中的 runtime 和右侧视图，不会把其他正在运行的
 runtime 标记为 ready 或停止其后台事件处理。runtime 自身按约 30fps 刷新
 streaming delta，避免视图切到 runtime 后出现长时间不刷新的流式文本。
+普通新会话也会先创建 live runtime；daemon 返回真实 `threadId` 后写回该
+runtime，后续 prompt 继续走同一个 thread，而不是在 UI 上伪装成连续对话。
 提交 prompt 时，正在运行、启动中或等待 approval 的 runtime 只会排入自己的
 队列；对应 runtime 收到 `turnComplete` 后才 drain 自己的下一条 prompt，不会
 把队列发送到当前选中的其他 history/runtime。

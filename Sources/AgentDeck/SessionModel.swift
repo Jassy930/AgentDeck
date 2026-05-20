@@ -337,41 +337,28 @@ final class SessionModel {
     }
 
     func submit(_ prompt: String) {
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
         if workbench.selectedRuntime != nil {
-            workbench.submit(prompt)
+            let oldCount = selectedItems.count
+            workbench.submit(trimmed)
+            if selectedItems.count > oldCount {
+                scrollToLatestRequest += 1
+            }
             return
         }
 
-        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let cwd else { return }
 
-        // Eng I1: a turn in flight → enqueue, don't drop, don't interrupt.
-        if phase == .running || phase == .starting || phase == .waitingApproval {
-            legacyQueuedPrompts.append(trimmed)
-            return
-        }
-
-        if !ensureDaemonStarted() {
-            return
-        }
-
-        let userItem = UIItem(id: "user-\(UUID().uuidString)",
-                              lifecycle: "completed", kind: "user", text: trimmed)
-        itemIndexById[userItem.id] = items.count
-        items.append(userItem)
-        scrollToLatestRequest += 1
-        errorMessage = nil
-        warningMessage = nil
-        phase = .starting
-
-        let onLine: @MainActor (String) -> Void = { [weak self] raw in
-            guard let self else { return }
-            self.ingest(rawLine: raw)
-        }
-        if let threadId = selectedHistoryThreadId {
-            client.startTurn(threadId: threadId, prompt: trimmed, onLine: onLine)
-        } else {
-            client.startSession(cwd: cwd.path, prompt: trimmed, onLine: onLine)
+        let sessionId = "live-\(UUID().uuidString)"
+        selectedHistoryThreadId = nil
+        workbench.ensureRuntime(sessionId: sessionId, threadId: nil, cwd: cwd)
+        workbench.selectRuntime(sessionId: sessionId)
+        let oldCount = selectedItems.count
+        workbench.submit(trimmed)
+        if selectedItems.count > oldCount {
+            scrollToLatestRequest += 1
         }
     }
 
