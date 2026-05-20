@@ -64,6 +64,7 @@ fn record_dir_from(agentdeck_data_dir: Option<&OsStr>, home: Option<&OsStr>) -> 
 /// security guarantee — it catches the common shapes that must never sit in
 /// a plaintext run log.
 pub fn redact(s: &str) -> String {
+    let s = redact_bearer_values(s);
     let mut out = String::with_capacity(s.len());
     for token in s.split_inclusive(|c: char| c.is_whitespace()) {
         let trimmed = token.trim();
@@ -87,6 +88,28 @@ pub fn redact(s: &str) -> String {
             out.push_str(token);
         }
     }
+    out
+}
+
+fn redact_bearer_values(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(idx) = rest.find("Bearer ") {
+        let (before, after_marker) = rest.split_at(idx + "Bearer ".len());
+        out.push_str(before);
+        let token_end = after_marker
+            .char_indices()
+            .find(|(_, c)| c.is_whitespace() || *c == '"' || *c == '\'' || *c == ',' || *c == '}')
+            .map(|(i, _)| i)
+            .unwrap_or(after_marker.len());
+        if token_end > 0 {
+            out.push_str("<REDACTED>");
+            rest = &after_marker[token_end..];
+        } else {
+            rest = after_marker;
+        }
+    }
+    out.push_str(rest);
     out
 }
 
@@ -136,7 +159,20 @@ mod tests {
         assert!(r.contains("<REDACTED>"));
         // Bearer's value redacted; the word "Bearer" itself triggers on the
         // token start so the whole credential token is masked.
-        assert!(!r.contains("xyzToken99") || r.contains("<REDACTED>"));
+        assert!(!r.contains("xyzToken99"));
+    }
+
+    #[test]
+    fn redact_masks_bearer_value_after_space() {
+        let r = redact("Authorization: Bearer xyzToken99");
+        assert!(!r.contains("xyzToken99"));
+        assert!(r.contains("Bearer <REDACTED>") || r.contains("<REDACTED>"));
+    }
+
+    #[test]
+    fn redact_masks_json_authorization_header() {
+        let r = redact(r#"{"authorization":"Bearer xyzToken99"}"#);
+        assert!(!r.contains("xyzToken99"));
     }
 
     #[test]
