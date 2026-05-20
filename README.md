@@ -68,6 +68,9 @@ prompt、shell（含 cwd、状态、耗时、来源、解析出的 command actio
 生成、review mode 事件和 context compaction。未知块仍以可见的 `raw` 记录
 出现，避免静默丢失。
 
+图片查看 / 生成事件会优先使用中立 `AgentItem` 的 `savedPath`，回退到 `path`，
+在会话流里直接显示本地图片预览，同时保留路径 metadata 便于定位原文件。
+
 继续历史会话时，AgentDeck 走 `thread/resume(threadId)` 后再执行
 `turn/start`，因此新 prompt 会进入原有 Codex 上下文，而不是创建新
 thread。历史详情读取在后台完成，点击后先标记正在打开，详情返回后再回放到

@@ -875,8 +875,23 @@ struct SessionView: View {
     }
 
     private func mediaBlock(_ item: UIItem) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
+        let presentation = MediaPreviewPresentation(item: item)
+
+        return VStack(alignment: .leading, spacing: 5) {
             toolHeader(item.mediaKind == "imageGeneration" ? "Image generation" : "Image", systemImage: "photo")
+            if let image = presentation.localImage {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+                    .frame(maxWidth: 420, maxHeight: 320, alignment: .leading)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+                    }
+                    .accessibilityLabel(item.mediaKind == "imageGeneration" ? "Generated image" : "Image")
+            }
             metadataLine([item.statusName, item.path, item.savedPath])
             toolPayload("result", item.result)
             if !item.revisedPrompt.isEmpty {
@@ -1039,6 +1054,21 @@ struct SessionView: View {
                 model.errorMessage = err
             }
         }
+    }
+}
+
+struct MediaPreviewPresentation: Equatable {
+    let previewPath: String
+
+    init(item: UIItem) {
+        let saved = item.savedPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let path = item.path.trimmingCharacters(in: .whitespacesAndNewlines)
+        previewPath = saved.isEmpty ? path : saved
+    }
+
+    var localImage: NSImage? {
+        guard !previewPath.isEmpty else { return nil }
+        return NSImage(contentsOfFile: previewPath)
     }
 }
 

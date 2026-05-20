@@ -53,6 +53,18 @@ struct TextualCompatibilityTests {
         }
     }
 
+    @Test("image generation media selects saved path for preview")
+    func imageGenerationMediaSelectsSavedPathForPreview() {
+        var item = UIItem(id: "ig1", lifecycle: "completed", kind: "media")
+        item.mediaKind = "imageGeneration"
+        item.path = "/tmp/intermediate.png"
+        item.savedPath = "/tmp/generated.png"
+
+        let presentation = MediaPreviewPresentation(item: item)
+
+        #expect(presentation.previewPath == "/tmp/generated.png")
+    }
+
     @Test("conversation turns keep assistant tool activity under one Codex rail")
     func conversationTurnsKeepAssistantActivityTogether() {
         let turns = makeConversationTurns(from: [
