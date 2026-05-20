@@ -86,6 +86,194 @@ struct AnyCodable: Codable {
     }
 }
 
+final class DaemonMessageRouter: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var pendingReplyIds: Set<UInt64> = []
+    private var replies: [UInt64: IpcMessage] = [:]
+    private var unmatched: [IpcMessage] = []
+    private var isClosed = false
+    private var sessionEventHandler: ((IpcMessage) -> Void)?
+    private var streamLineHandler: ((String) -> Void)?
+    private var unmatchedMessageHandler: ((IpcMessage) -> Void)?
+
+    var onSessionEvent: ((IpcMessage) -> Void)? {
+        get {
+            condition.lock()
+            defer { condition.unlock() }
+            return sessionEventHandler
+        }
+        set {
+            condition.lock()
+            sessionEventHandler = newValue
+            condition.unlock()
+        }
+    }
+
+    var onStreamLine: ((String) -> Void)? {
+        get {
+            condition.lock()
+            defer { condition.unlock() }
+            return streamLineHandler
+        }
+        set {
+            condition.lock()
+            streamLineHandler = newValue
+            condition.unlock()
+        }
+    }
+
+    var onUnmatchedMessage: ((IpcMessage) -> Void)? {
+        get {
+            condition.lock()
+            defer { condition.unlock() }
+            return unmatchedMessageHandler
+        }
+        set {
+            condition.lock()
+            unmatchedMessageHandler = newValue
+            condition.unlock()
+        }
+    }
+
+    func registerPending(id: UInt64) {
+        condition.lock()
+        pendingReplyIds.insert(id)
+        condition.unlock()
+    }
+
+    func route(_ message: IpcMessage, rawLine: String? = nil) {
+        let sessionHandler: ((IpcMessage) -> Void)?
+        let streamHandler: ((String) -> Void)?
+        let streamRawLine: String?
+        let unmatchedHandler: ((IpcMessage) -> Void)?
+
+        condition.lock()
+        if let id = message.id, pendingReplyIds.contains(id) {
+            replies[id] = message
+            pendingReplyIds.remove(id)
+            condition.broadcast()
+            condition.unlock()
+            return
+        }
+
+        if message.kind == "session/event" {
+            sessionHandler = sessionEventHandler
+            streamHandler = nil
+            streamRawLine = nil
+            if sessionHandler == nil {
+                unmatched.append(message)
+                unmatchedHandler = unmatchedMessageHandler
+            } else {
+                unmatchedHandler = nil
+            }
+        } else if Self.isLegacyStreamKind(message.kind) {
+            sessionHandler = nil
+            streamHandler = streamLineHandler
+            streamRawLine = rawLine ?? Self.encodeRawLine(message)
+            if Self.isTerminalStreamKind(message.kind) {
+                streamLineHandler = nil
+            }
+            if streamHandler == nil {
+                unmatched.append(message)
+                unmatchedHandler = unmatchedMessageHandler
+            } else {
+                unmatchedHandler = nil
+            }
+        } else {
+            sessionHandler = nil
+            streamHandler = nil
+            streamRawLine = nil
+            unmatched.append(message)
+            unmatchedHandler = unmatchedMessageHandler
+        }
+        condition.unlock()
+
+        if let sessionHandler {
+            sessionHandler(message)
+        }
+        if let streamHandler, let streamRawLine {
+            streamHandler(streamRawLine)
+        }
+        if let unmatchedHandler {
+            unmatchedHandler(message)
+        }
+    }
+
+    func routeMalformedLine(_ rawLine: String) {
+        let payload = AnyCodable(["message": "malformed reply from agentdeckd: \(rawLine)"])
+
+        condition.lock()
+        if !pendingReplyIds.isEmpty {
+            for id in pendingReplyIds {
+                replies[id] = IpcMessage(kind: "error", id: id, payload: payload)
+            }
+            pendingReplyIds.removeAll()
+            condition.broadcast()
+            condition.unlock()
+            return
+        }
+        condition.unlock()
+
+        route(IpcMessage(
+            kind: "error",
+            payload: payload
+        ))
+    }
+
+    func takeReply(id: UInt64) -> IpcMessage? {
+        condition.lock()
+        defer { condition.unlock() }
+        return replies.removeValue(forKey: id)
+    }
+
+    func waitForReply(id: UInt64) -> IpcMessage? {
+        condition.lock()
+        defer { condition.unlock() }
+        while true {
+            if let reply = replies.removeValue(forKey: id) {
+                return reply
+            }
+            if isClosed {
+                return nil
+            }
+            condition.wait()
+        }
+    }
+
+    func takeUnmatchedMessages() -> [IpcMessage] {
+        condition.lock()
+        defer { condition.unlock() }
+        let messages = unmatched
+        unmatched.removeAll()
+        return messages
+    }
+
+    func close() {
+        condition.lock()
+        isClosed = true
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    private static func isLegacyStreamKind(_ kind: String) -> Bool {
+        kind == "agentItem"
+            || kind == "sessionState"
+            || kind == "turnComplete"
+            || kind == "error"
+    }
+
+    private static func isTerminalStreamKind(_ kind: String) -> Bool {
+        kind == "turnComplete" || kind == "error"
+    }
+
+    private static func encodeRawLine(_ message: IpcMessage) -> String? {
+        guard let data = try? JSONEncoder().encode(message) else {
+            return nil
+        }
+        return String(data: data, encoding: .utf8)
+    }
+}
+
 /// Owns the agentdeckd child process and the JSONL IPC channel to it.
 ///
 /// Process lifecycle (Eng A1, first layer): the Swift app spawns the daemon;
@@ -98,6 +286,10 @@ final class DaemonClient {
     private let toDaemon = Pipe()
     private let fromDaemon = Pipe()
     private var reader: BufferedLineReader?
+    private let router = DaemonMessageRouter()
+    private let lifecycleLock = NSLock()
+    private let writeLock = NSLock()
+    private var readerLoopStarted = false
 
     /// Locate the daemon binary. v0.1 uses PATH / dev-build lookup (Eng D-cwd
     /// scope: bundling is a later good-first-issue). GUI-launched apps have a
@@ -125,6 +317,11 @@ final class DaemonClient {
     }
 
     func start() throws {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        if readerLoopStarted {
+            return
+        }
         guard let path = Self.locateDaemon() else {
             throw DaemonError.binaryNotFound("target/{debug,release}/agentdeckd or PATH")
         }
@@ -137,26 +334,32 @@ final class DaemonClient {
         } catch {
             throw DaemonError.spawnFailed("\(error)")
         }
-        reader = BufferedLineReader(handle: fromDaemon.fileHandleForReading)
+        let lineReader = BufferedLineReader(handle: fromDaemon.fileHandleForReading)
+        reader = lineReader
+        router.onUnmatchedMessage = { message in
+            Self.writeDiagnostic("unmatched daemon message: \(message.kind)")
+        }
+        startReaderLoop(lineReader)
     }
 
     /// Send one neutral message and block for the correlated reply.
-    /// Step 1 is request/reply; the streaming item path (background reader →
-    /// MainActor, Eng D9 state machine) lands in Step 3+.
     func roundTrip(_ msg: IpcMessage) throws -> IpcMessage {
+        if reader == nil {
+            try start()
+        }
+        guard let id = msg.id else {
+            throw DaemonError.malformedReply("roundTrip request missing id: \(msg.kind)")
+        }
         let enc = JSONEncoder()
         var data = try enc.encode(msg)
         data.append(0x0A) // newline-delimited JSON (D7-confirmed framing)
-        toDaemon.fileHandleForWriting.write(data)
+        router.registerPending(id: id)
+        write(data)
 
-        guard let line = reader?.nextLine() else {
+        guard let reply = router.waitForReply(id: id) else {
             throw DaemonError.disconnected
         }
-        do {
-            return try JSONDecoder().decode(IpcMessage.self, from: Data(line.utf8))
-        } catch {
-            throw DaemonError.malformedReply(line)
-        }
+        return reply
     }
 
     static func historyListRequest(
@@ -283,9 +486,8 @@ final class DaemonClient {
         throw DaemonError.malformedReply("expected historyThreadUpdated, got \(reply.kind)")
     }
 
-    /// Start a streaming session. Sends `startSession {cwd, prompt}`, then
-    /// reads neutral IPC messages on a BACKGROUND thread and delivers each
-    /// one to `onMessage` ON THE MAIN THREAD.
+    /// Start a streaming session. Sends `startSession {cwd, prompt}` and
+    /// lets the single daemon reader dispatch stream lines to the main thread.
     ///
     /// Eng C-uitest / D5: the background-reader → MainActor hop is exactly
     /// the fragile seam in a streaming Swift↔Rust IPC. Delivering on
@@ -308,33 +510,17 @@ final class DaemonClient {
         }
         var line = data
         line.append(0x0A)
-        toDaemon.fileHandleForWriting.write(line)
 
-        // Cross the thread boundary with a plain String (Sendable). Decoding
-        // happens ON the main actor in onLine — so the IpcMessage (which
-        // holds non-Sendable AnyCodable) never crosses threads at all. This
-        // sidesteps the background→main data race entirely (Eng C-uitest):
-        // the safe fix is to not share a non-Sendable value, not to bolt
-        // Sendable onto it.
-        // Capture ONLY the reader, not self. The background thread must not
-        // reach back into DaemonClient (non-Sendable) — it owns nothing but
-        // the line stream. This is the minimal-sharing fix, not a Sendable
-        // bolt-on.
-        guard let reader else {
+        if reader == nil {
             Task { @MainActor in
                 onLine(#"{"kind":"error","payload":{"message":"reader not initialized"}}"#)
             }
             return
         }
-        Thread.detachNewThread {
-            while let raw = reader.nextLine() {
-                if raw.isEmpty { continue }
-                let terminal = raw.contains("\"turnComplete\"")
-                    || raw.contains("\"kind\":\"error\"")
-                DispatchQueue.main.async { onLine(raw) }
-                if terminal { break }
-            }
+        router.onStreamLine = { raw in
+            DispatchQueue.main.async { onLine(raw) }
         }
+        write(line)
     }
 
     func startTurn(
@@ -351,23 +537,17 @@ final class DaemonClient {
         }
         var line = data
         line.append(0x0A)
-        toDaemon.fileHandleForWriting.write(line)
 
-        guard let reader else {
+        if reader == nil {
             Task { @MainActor in
                 onLine(#"{"kind":"error","payload":{"message":"reader not initialized"}}"#)
             }
             return
         }
-        Thread.detachNewThread {
-            while let raw = reader.nextLine() {
-                if raw.isEmpty { continue }
-                let terminal = raw.contains("\"turnComplete\"")
-                    || raw.contains("\"kind\":\"error\"")
-                DispatchQueue.main.async { onLine(raw) }
-                if terminal { break }
-            }
+        router.onStreamLine = { raw in
+            DispatchQueue.main.async { onLine(raw) }
         }
+        write(line)
     }
 
     /// Ask the daemon to shut down, then ensure it is gone (A1: app exit
@@ -386,6 +566,35 @@ final class DaemonClient {
         // Backstop: even if the app forgot to call shutdown(), the daemon
         // must not outlive its owner (A1 — no orphan daemon).
         if process.isRunning { process.terminate() }
+    }
+
+    private func startReaderLoop(_ reader: BufferedLineReader) {
+        readerLoopStarted = true
+        let router = router
+        Thread.detachNewThread {
+            while let raw = reader.nextLine() {
+                if raw.isEmpty { continue }
+                do {
+                    let message = try JSONDecoder().decode(IpcMessage.self, from: Data(raw.utf8))
+                    router.route(message, rawLine: raw)
+                } catch {
+                    router.routeMalformedLine(raw)
+                }
+            }
+            router.close()
+        }
+    }
+
+    private func write(_ data: Data) {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        toDaemon.fileHandleForWriting.write(data)
+    }
+
+    private static func writeDiagnostic(_ message: String) {
+        if let data = (message + "\n").data(using: .utf8) {
+            FileHandle.standardError.write(data)
+        }
     }
 }
 
@@ -424,12 +633,10 @@ final class DaemonHistoryDetailReader: HistoryDetailReading, @unchecked Sendable
 /// IPC). This handles that; Step 1 unit tests cover the split case.
 ///
 /// `@unchecked Sendable` is sound here by ownership discipline, not by
-/// thread-safety primitives: exactly ONE consumer touches a reader at a
-/// time. Step 1's roundTrip reads it synchronously on the caller's thread;
-/// the streaming path moves it to a single dedicated background thread and
-/// the main thread never reads it concurrently. There is no overlap, so no
-/// lock is needed. (If a future change adds a second concurrent reader, this
-/// annotation is the thing to revisit.)
+/// thread-safety primitives: exactly ONE consumer touches a reader at a time.
+/// DaemonClient owns that consumer in its single reader loop. There is no
+/// overlap, so no lock is needed. (If a future change adds a second concurrent
+/// reader, this annotation is the thing to revisit.)
 final class BufferedLineReader: @unchecked Sendable {
     private let handle: FileHandle
     private var buffer = Data()

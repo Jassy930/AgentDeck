@@ -55,6 +55,25 @@ struct IpcMessageTests {
     }
 }
 
+@Suite("Daemon message routing")
+struct DaemonMessageRoutingTests {
+    @Test("routes replies by id and session events by session id")
+    func routesRepliesAndSessionEventsSeparately() {
+        let router = DaemonMessageRouter()
+        var events: [IpcMessage] = []
+        router.onSessionEvent = { events.append($0) }
+
+        router.registerPending(id: 31)
+        router.route(IpcMessage(kind: "session/event", sessionId: "s1", payload: AnyCodable([
+            "event": ["kind": "agentItem"]
+        ])))
+        router.route(IpcMessage(kind: "historyThread", id: 31, payload: AnyCodable(["thread": [:], "items": []])))
+
+        #expect(events.count == 1)
+        #expect(router.takeReply(id: 31)?.kind == "historyThread")
+    }
+}
+
 @Suite("BufferedLineReader framing")
 struct BufferedLineReaderTests {
 
