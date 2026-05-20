@@ -158,12 +158,12 @@ final class DaemonMessageRouter: @unchecked Sendable {
 
         if message.kind == "session/event" {
             sessionHandler = sessionEventHandler
-            streamHandler = streamLineHandler
-            streamRawLine = rawLine ?? Self.encodeRawLine(message)
-            if Self.isTerminalSessionEvent(message) {
+            streamRawLine = Self.encodeLegacySessionEventRawLine(message)
+            streamHandler = streamRawLine == nil ? nil : streamLineHandler
+            if Self.isTerminalSessionEvent(message) && streamRawLine != nil {
                 streamLineHandler = nil
             }
-            if sessionHandler == nil && streamHandler == nil {
+            if streamRawLine == nil || (sessionHandler == nil && streamHandler == nil) {
                 unmatched.append(message)
                 unmatchedHandler = unmatchedMessageHandler
             } else {
@@ -270,12 +270,34 @@ final class DaemonMessageRouter: @unchecked Sendable {
     }
 
     private static func isTerminalSessionEvent(_ message: IpcMessage) -> Bool {
-        guard let payload = message.payload?.value as? [String: Any],
-              let event = payload["event"] as? [String: Any],
-              let eventKind = event["kind"] as? String else {
+        guard let eventKind = legacySessionEventMessage(from: message)?.kind else {
             return false
         }
         return isTerminalStreamKind(eventKind)
+    }
+
+    private static func encodeLegacySessionEventRawLine(_ message: IpcMessage) -> String? {
+        guard let legacy = legacySessionEventMessage(from: message) else {
+            return nil
+        }
+        return encodeRawLine(legacy)
+    }
+
+    private static func legacySessionEventMessage(from message: IpcMessage) -> IpcMessage? {
+        guard let payload = message.payload?.value as? [String: Any],
+              let event = payload["event"] as? [String: Any],
+              let kind = event["kind"] as? String else {
+            return nil
+        }
+        if let eventPayload = event["payload"] {
+            return IpcMessage(kind: kind, payload: AnyCodable(eventPayload))
+        }
+        var legacyPayload = event
+        legacyPayload.removeValue(forKey: "kind")
+        return IpcMessage(
+            kind: kind,
+            payload: legacyPayload.isEmpty ? nil : AnyCodable(legacyPayload)
+        )
     }
 
     private static func encodeRawLine(_ message: IpcMessage) -> String? {
@@ -377,15 +399,33 @@ final class DaemonClient {
 
     /// Send one neutral message and block for the correlated reply.
     func roundTrip(_ msg: IpcMessage) throws -> IpcMessage {
+        try sendRoundTrip(try prepareRoundTripRequest(msg))
+    }
+
+    func prepareRoundTripRequest(_ msg: IpcMessage) throws -> IpcMessage {
+        if msg.id != nil {
+            return msg
+        }
+        return requestIdAllocator.assignUniqueId(to: msg)
+    }
+
+    func prepareGeneratedIdRequest(_ msg: IpcMessage) throws -> IpcMessage {
+        requestIdAllocator.assignUniqueId(to: msg)
+    }
+
+    private func roundTripWithGeneratedId(_ msg: IpcMessage) throws -> IpcMessage {
+        try sendRoundTrip(try prepareGeneratedIdRequest(msg))
+    }
+
+    private func sendRoundTrip(_ msg: IpcMessage) throws -> IpcMessage {
         if reader == nil {
             try start()
         }
-        let outbound = requestIdAllocator.assignUniqueId(to: msg)
-        guard let id = outbound.id else {
+        guard let id = msg.id else {
             throw DaemonError.malformedReply("failed to assign id: \(msg.kind)")
         }
         let enc = JSONEncoder()
-        var data = try enc.encode(outbound)
+        var data = try enc.encode(msg)
         data.append(0x0A) // newline-delimited JSON (D7-confirmed framing)
         router.registerPending(id: id)
         write(data)
@@ -424,7 +464,7 @@ final class DaemonClient {
         if reader == nil {
             try start()
         }
-        let reply = try roundTrip(Self.historyListRequest(
+        let reply = try roundTripWithGeneratedId(Self.historyListRequest(
             id: 2,
             cwd: cwd,
             searchTerm: searchTerm,
@@ -455,7 +495,7 @@ final class DaemonClient {
         if reader == nil {
             try start()
         }
-        let reply = try roundTrip(Self.historyReadRequest(id: 3, threadId: threadId))
+        let reply = try roundTripWithGeneratedId(Self.historyReadRequest(id: 3, threadId: threadId))
         guard reply.kind == "historyThread", let payload = reply.payload?.value else {
             if reply.kind == "error",
                let dict = reply.payload?.value as? [String: Any],
@@ -508,7 +548,7 @@ final class DaemonClient {
         if reader == nil {
             try start()
         }
-        let reply = try roundTrip(request)
+        let reply = try roundTripWithGeneratedId(request)
         if reply.kind == "historyThreadUpdated" {
             return
         }

@@ -73,40 +73,46 @@ struct DaemonMessageRoutingTests {
         #expect(router.takeReply(id: 31)?.kind == "historyThread")
     }
 
-    @Test("routes session events to the active raw stream")
-    func routesSessionEventsToActiveRawStream() {
+    @Test("routes session events to the active raw stream as legacy events")
+    func routesSessionEventsToActiveRawStreamAsLegacyEvents() throws {
         let router = DaemonMessageRouter()
-        let raw = #"{"kind":"session/event","sessionId":"s1","payload":{"event":{"kind":"agentItem"}}}"#
         var events: [IpcMessage] = []
         var rawLines: [String] = []
         router.onSessionEvent = { events.append($0) }
         router.onStreamLine = { rawLines.append($0) }
 
         router.route(IpcMessage(kind: "session/event", sessionId: "s1", payload: AnyCodable([
-            "event": ["kind": "agentItem"]
-        ])), rawLine: raw)
+            "event": ["kind": "turnComplete", "payload": ["ok": true]]
+        ])))
 
         #expect(events.count == 1)
-        #expect(rawLines == [raw])
+        let rawLine = try #require(rawLines.first)
+        let legacy = try JSONDecoder().decode(IpcMessage.self, from: Data(rawLine.utf8))
+        #expect(legacy.kind == "turnComplete")
+        #expect(legacy.sessionId == nil)
+        #expect(legacy.payload?.value as? [String: Bool] == ["ok": true])
     }
 
-    @Test("assigns unique ids when request factories reuse static ids")
-    func assignsUniqueIdsWhenRequestFactoriesReuseStaticIds() {
-        let allocator = DaemonRequestIdAllocator(startingAt: 100)
-        let first = allocator.assignUniqueId(to: DaemonClient.historyListRequest(
+    @Test("preserves explicit ids but can generate ids for reused static factory ids")
+    func preservesExplicitIdsButCanGenerateIdsForReusedStaticFactoryIds() throws {
+        let client = DaemonClient()
+        let ping = try client.prepareRoundTripRequest(IpcMessage(kind: "ping", id: 1, payload: nil))
+        let first = try client.prepareGeneratedIdRequest(DaemonClient.historyListRequest(
             id: 2,
             cwd: "/tmp/project",
             searchTerm: nil
         ))
-        let second = allocator.assignUniqueId(to: DaemonClient.historyListRequest(
+        let second = try client.prepareGeneratedIdRequest(DaemonClient.historyListRequest(
             id: 2,
             cwd: "/tmp/project",
             searchTerm: nil
         ))
 
+        #expect(ping.id == 1)
         #expect(first.kind == "history/listThreads")
-        #expect(first.id == 100)
-        #expect(second.id == 101)
+        #expect(first.id != 2)
+        #expect(second.id != 2)
+        #expect(first.id != second.id)
     }
 }
 
