@@ -25,6 +25,9 @@ Cargo.lock
 # NOT in the repo. This entry is a guard in case of accidental local writes.
 .agentdeck/
 
+# Local git worktrees
+.worktrees/
+
 # Editor
 *.swp
 .idea/
