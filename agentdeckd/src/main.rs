@@ -26,11 +26,80 @@ use std::io::{BufRead, Write};
 
 use ipc::{IpcMessage, SessionState};
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HistoryListParams {
+    cwd: Option<String>,
+    search_term: Option<String>,
+    cursor: Option<String>,
+    limit: Option<u32>,
+}
+
 fn write_msg(stdout: &mut impl Write, msg: &IpcMessage) -> std::io::Result<()> {
     let mut s = serde_json::to_string(msg)?;
     s.push('\n');
     stdout.write_all(s.as_bytes())?;
     stdout.flush()
+}
+
+fn history_list_params(payload: Option<&serde_json::Value>) -> HistoryListParams {
+    let Some(payload) = payload else {
+        return HistoryListParams::default();
+    };
+    HistoryListParams {
+        cwd: payload
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        search_term: payload
+            .get("searchTerm")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        cursor: payload
+            .get("cursor")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        limit: payload
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok()),
+    }
+}
+
+fn run_history_list(
+    stdout: &mut impl Write,
+    id: Option<u64>,
+    params: HistoryListParams,
+) -> std::io::Result<()> {
+    let mut adapter = match codex::CodexAdapter::spawn() {
+        Ok(a) => a,
+        Err(e) => {
+            diag::log("history_list_spawn_failed", &e.to_string());
+            return write_msg(stdout, &IpcMessage::error(id, &e.to_string()));
+        }
+    };
+    if let Err(e) = adapter.initialize() {
+        diag::log("history_list_handshake_failed", &e.to_string());
+        return write_msg(stdout, &IpcMessage::error(id, &e.to_string()));
+    }
+    match adapter.thread_list(
+        params.cwd.as_deref(),
+        params.search_term.as_deref(),
+        params.cursor.as_deref(),
+        params.limit,
+    ) {
+        Ok(list) => write_msg(
+            stdout,
+            &IpcMessage {
+                kind: "historyThreads".into(),
+                id,
+                payload: Some(serde_json::to_value(list).expect("history list serializes")),
+            },
+        ),
+        Err(e) => {
+            diag::log("history_list_failed", &e.to_string());
+            write_msg(stdout, &IpcMessage::error(id, &e.to_string()))
+        }
+    }
 }
 
 /// Handle a `startSession` request: drive a full Codex turn, streaming
@@ -210,6 +279,10 @@ fn main() -> std::io::Result<()> {
                 write_msg(&mut stdout, &IpcMessage::pong(msg.id))?;
                 break;
             }
+            "history/listThreads" => {
+                let params = history_list_params(msg.payload.as_ref());
+                run_history_list(&mut stdout, msg.id, params)?;
+            }
             "startSession" => {
                 let cwd = msg
                     .payload
@@ -247,3 +320,19 @@ fn main() -> std::io::Result<()> {
 // Codex→neutral translation regression net in codex.rs. Dispatch behavior
 // (ping/pong/shutdown + startSession arg validation) is covered end-to-end
 // by the integration check below and in CI — no placeholder unit test here.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn history_list_params_reads_optional_filters() {
+        let p = json!({"cwd": "/tmp/project", "searchTerm": "fix", "cursor": "c2", "limit": 20});
+        let params = history_list_params(Some(&p));
+        assert_eq!(params.cwd.as_deref(), Some("/tmp/project"));
+        assert_eq!(params.search_term.as_deref(), Some("fix"));
+        assert_eq!(params.cursor.as_deref(), Some("c2"));
+        assert_eq!(params.limit, Some(20));
+    }
+}
