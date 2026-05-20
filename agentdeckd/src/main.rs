@@ -46,6 +46,7 @@ struct StartTurnParams {
 #[derive(Debug)]
 enum HubAction {
     Reply(IpcMessage),
+    History(HistoryAction),
     SpawnTurn {
         id: Option<u64>,
         session_id: String,
@@ -54,6 +55,31 @@ enum HubAction {
         prompt: String,
     },
     Shutdown,
+}
+
+#[derive(Debug)]
+enum HistoryAction {
+    ListThreads {
+        id: Option<u64>,
+        params: HistoryListParams,
+    },
+    ReadThread {
+        id: Option<u64>,
+        thread_id: String,
+    },
+    ArchiveThread {
+        id: Option<u64>,
+        thread_id: String,
+    },
+    UnarchiveThread {
+        id: Option<u64>,
+        thread_id: String,
+    },
+    RenameThread {
+        id: Option<u64>,
+        thread_id: String,
+        name: String,
+    },
 }
 
 fn write_msg(stdout: &mut impl Write, msg: &IpcMessage) -> std::io::Result<()> {
@@ -162,6 +188,51 @@ fn classify_request(msg: &IpcMessage) -> Result<HubAction, String> {
                 prompt: params.prompt,
             })
         }
+        "history/listThreads" => Ok(HubAction::History(HistoryAction::ListThreads {
+            id: msg.id,
+            params: history_list_params(msg.payload.as_ref()),
+        })),
+        "history/readThread" => match history_read_thread_id(msg.payload.as_ref()) {
+            Some(thread_id) => Ok(HubAction::History(HistoryAction::ReadThread {
+                id: msg.id,
+                thread_id,
+            })),
+            None => Ok(HubAction::Reply(IpcMessage::error(
+                msg.id,
+                "history/readThread requires threadId",
+            ))),
+        },
+        "history/archiveThread" => match history_management_thread_id(msg.payload.as_ref()) {
+            Some(thread_id) => Ok(HubAction::History(HistoryAction::ArchiveThread {
+                id: msg.id,
+                thread_id,
+            })),
+            None => Ok(HubAction::Reply(IpcMessage::error(
+                msg.id,
+                "thread management requires threadId",
+            ))),
+        },
+        "history/unarchiveThread" => match history_management_thread_id(msg.payload.as_ref()) {
+            Some(thread_id) => Ok(HubAction::History(HistoryAction::UnarchiveThread {
+                id: msg.id,
+                thread_id,
+            })),
+            None => Ok(HubAction::Reply(IpcMessage::error(
+                msg.id,
+                "thread management requires threadId",
+            ))),
+        },
+        "history/renameThread" => match history_rename_params(msg.payload.as_ref()) {
+            Some((thread_id, name)) => Ok(HubAction::History(HistoryAction::RenameThread {
+                id: msg.id,
+                thread_id,
+                name,
+            })),
+            None => Ok(HubAction::Reply(IpcMessage::error(
+                msg.id,
+                "thread management requires threadId",
+            ))),
+        },
         other => Ok(HubAction::Reply(IpcMessage::error(
             msg.id,
             &format!("unknown kind: {other}"),
@@ -197,7 +268,27 @@ fn history_read_thread_id(payload: Option<&serde_json::Value>) -> Option<String>
     payload?
         .get("threadId")
         .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+fn history_management_thread_id(payload: Option<&serde_json::Value>) -> Option<String> {
+    history_read_thread_id(payload)
+}
+
+fn history_rename_params(payload: Option<&serde_json::Value>) -> Option<(String, String)> {
+    let payload = payload?;
+    let thread_id = payload
+        .get("threadId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    Some((thread_id, name))
 }
 
 fn start_turn_params(payload: Option<&serde_json::Value>) -> Option<StartTurnParams> {
@@ -317,6 +408,24 @@ fn run_thread_management(
             },
         ),
         Err(e) => send_msg(out_tx, IpcMessage::error(id, &e.to_string())),
+    }
+}
+
+fn run_history_worker(out_tx: Sender<IpcMessage>, action: HistoryAction) -> std::io::Result<()> {
+    match action {
+        HistoryAction::ListThreads { id, params } => run_history_list(&out_tx, id, params),
+        HistoryAction::ReadThread { id, thread_id } => run_history_read(&out_tx, id, &thread_id),
+        HistoryAction::ArchiveThread { id, thread_id } => {
+            run_thread_management(&out_tx, id, "archive", &thread_id, None)
+        }
+        HistoryAction::UnarchiveThread { id, thread_id } => {
+            run_thread_management(&out_tx, id, "unarchive", &thread_id, None)
+        }
+        HistoryAction::RenameThread {
+            id,
+            thread_id,
+            name,
+        } => run_thread_management(&out_tx, id, "rename", &thread_id, Some(&name)),
     }
 }
 
@@ -788,84 +897,50 @@ fn main() -> std::io::Result<()> {
             }
         };
 
-        match msg.kind.as_str() {
-            "history/listThreads" => {
-                let params = history_list_params(msg.payload.as_ref());
-                run_history_list(&out_tx, msg.id, params)?;
+        match classify_request(&msg) {
+            Ok(HubAction::Reply(reply)) => send_msg(&out_tx, reply)?,
+            Ok(HubAction::Shutdown) => {
+                send_msg(&out_tx, IpcMessage::pong(msg.id))?;
+                send_msg(&out_tx, writer_stop_msg())?;
+                break;
             }
-            "history/readThread" => {
-                if let Some(thread_id) = history_read_thread_id(msg.payload.as_ref()) {
-                    run_history_read(&out_tx, msg.id, &thread_id)?;
-                } else {
-                    send_msg(
-                        &out_tx,
-                        IpcMessage::error(msg.id, "history/readThread requires threadId"),
-                    )?;
-                }
+            Ok(HubAction::History(action)) => {
+                let worker_tx = out_tx.clone();
+                std::thread::spawn(move || {
+                    if let Err(err) = run_history_worker(worker_tx.clone(), action) {
+                        let _ = worker_tx.send(IpcMessage::error(None, &err.to_string()));
+                    }
+                });
             }
-            "history/archiveThread" | "history/unarchiveThread" | "history/renameThread" => {
-                let thread_id = msg
-                    .payload
-                    .as_ref()
-                    .and_then(|p| p.get("threadId"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let name = msg
-                    .payload
-                    .as_ref()
-                    .and_then(|p| p.get("name"))
-                    .and_then(|v| v.as_str());
-                if thread_id.is_empty() || (msg.kind == "history/renameThread" && name.is_none()) {
-                    send_msg(
-                        &out_tx,
-                        IpcMessage::error(msg.id, "thread management requires threadId"),
-                    )?;
-                } else {
-                    let action = match msg.kind.as_str() {
-                        "history/archiveThread" => "archive",
-                        "history/unarchiveThread" => "unarchive",
-                        _ => "rename",
-                    };
-                    run_thread_management(&out_tx, msg.id, action, thread_id, name)?;
-                }
-            }
-            _ => match classify_request(&msg) {
-                Ok(HubAction::Reply(reply)) => send_msg(&out_tx, reply)?,
-                Ok(HubAction::Shutdown) => {
-                    send_msg(&out_tx, IpcMessage::pong(msg.id))?;
-                    send_msg(&out_tx, writer_stop_msg())?;
-                    break;
-                }
-                Ok(HubAction::SpawnTurn {
-                    id,
-                    session_id,
-                    thread_id,
-                    cwd,
-                    prompt,
-                }) => {
-                    let ack = turn_accepted(id, &session_id, thread_id.as_deref());
-                    let _ = out_tx.send(ack);
+            Ok(HubAction::SpawnTurn {
+                id,
+                session_id,
+                thread_id,
+                cwd,
+                prompt,
+            }) => {
+                let ack = turn_accepted(id, &session_id, thread_id.as_deref());
+                let _ = out_tx.send(ack);
 
-                    let worker_tx = out_tx.clone();
-                    std::thread::spawn(move || {
-                        if let Err(err) = run_turn_worker(
-                            worker_tx.clone(),
-                            id,
+                let worker_tx = out_tx.clone();
+                std::thread::spawn(move || {
+                    if let Err(err) = run_turn_worker(
+                        worker_tx.clone(),
+                        id,
+                        &session_id,
+                        thread_id.as_deref(),
+                        cwd.as_deref(),
+                        &prompt,
+                    ) {
+                        let _ = worker_tx.send(IpcMessage::session_event(
                             &session_id,
                             thread_id.as_deref(),
-                            cwd.as_deref(),
-                            &prompt,
-                        ) {
-                            let _ = worker_tx.send(IpcMessage::session_event(
-                                &session_id,
-                                thread_id.as_deref(),
-                                IpcMessage::error(None, &err.to_string()),
-                            ));
-                        }
-                    });
-                }
-                Err(e) => send_msg(&out_tx, IpcMessage::error(msg.id, &e))?,
-            },
+                            IpcMessage::error(None, &err.to_string()),
+                        ));
+                    }
+                });
+            }
+            Err(e) => send_msg(&out_tx, IpcMessage::error(msg.id, &e))?,
         }
     }
 
@@ -933,6 +1008,51 @@ mod tests {
         let action = classify_request(&msg).unwrap();
 
         assert!(matches!(action, HubAction::SpawnTurn { .. }));
+    }
+
+    #[test]
+    fn dispatch_history_read_thread_returns_foreground_history_action() {
+        let msg = IpcMessage {
+            kind: "history/readThread".into(),
+            id: Some(8),
+            session_id: None,
+            thread_id: None,
+            payload: Some(serde_json::json!({
+                "threadId": "thread_8"
+            })),
+        };
+
+        let action = classify_request(&msg).unwrap();
+
+        assert!(matches!(
+            action,
+            HubAction::History(HistoryAction::ReadThread {
+                id: Some(8),
+                ref thread_id,
+            }) if thread_id == "thread_8"
+        ));
+    }
+
+    #[test]
+    fn dispatch_history_read_thread_invalid_payload_returns_error_action() {
+        let msg = IpcMessage {
+            kind: "history/readThread".into(),
+            id: Some(9),
+            session_id: None,
+            thread_id: None,
+            payload: Some(serde_json::json!({})),
+        };
+
+        let action = classify_request(&msg).unwrap();
+
+        assert!(matches!(
+            action,
+            HubAction::Reply(IpcMessage {
+                kind,
+                id: Some(9),
+                ..
+            }) if kind == "error"
+        ));
     }
 
     #[test]

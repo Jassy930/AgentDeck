@@ -1234,3 +1234,7 @@ git commit -m "chore: finish async runtime hub"
 ```
 
 不要提交无关用户改动。
+
+## Task 8 实施记录
+
+- `agentdeckd/src/main.rs` 已将 history list/read/archive/unarchive/rename 分类为 foreground history action，并由短 worker 执行，stdin 主循环不再同步等待历史请求完成。
