@@ -193,7 +193,7 @@ final class SessionModel {
         workbench.selectedRuntime?.errorMessage ?? errorMessage
     }
     var selectedWarningMessage: String? {
-        workbench.selectedRuntime == nil ? warningMessage : nil
+        workbench.selectedRuntime?.warningMessage ?? warningMessage
     }
     /// When the current turn began. `nil` outside a turn.
     var runStartedAt: Date?

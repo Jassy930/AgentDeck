@@ -684,6 +684,10 @@ final class DaemonClient {
         throw DaemonError.malformedReply("expected historyThreadUpdated, got \(reply.kind)")
     }
 
+    /// Deprecated compatibility path for pre-runtime tests. Runtime-first UI
+    /// code should call `startTurn(sessionId:threadId:cwd:prompt:onEvent:)`
+    /// so `session/event` routing preserves the outer session/thread ids.
+    ///
     /// Start a streaming session. Sends `startSession {cwd, prompt}` and
     /// lets the single daemon reader dispatch stream lines to the main thread.
     ///
@@ -726,6 +730,8 @@ final class DaemonClient {
         prompt: String,
         onLine: @escaping @MainActor (String) -> Void
     ) {
+        // Deprecated compatibility path. Runtime-first callers must use the
+        // overload below so events stay wrapped in neutral `session/event`.
         let msg = Self.startTurnRequest(id: 4, threadId: threadId, prompt: prompt)
         guard let data = try? JSONEncoder().encode(msg) else {
             Task { @MainActor in

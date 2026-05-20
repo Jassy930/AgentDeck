@@ -15,6 +15,7 @@ final class ThreadRuntimeModel: Identifiable {
     var items: [UIItem] = []
     var queuedPrompts: [String] = []
     var errorMessage: String?
+    var warningMessage: String?
     var unreadEventCount = 0
     var itemIndexById: [String: Int] = [:]
     var pendingAgentItems: [[String: Any]] = []
@@ -68,6 +69,10 @@ final class ThreadRuntimeModel: Identifiable {
             let m = (msg.payload?.value as? [String: Any])?["message"] as? String
             errorMessage = m ?? "unknown error"
             phase = .failed
+            return nil
+        case "warning":
+            let m = (msg.payload?.value as? [String: Any])?["message"] as? String
+            warningMessage = m ?? "unknown warning"
             return nil
         default:
             return nil
@@ -154,8 +159,6 @@ final class ThreadRuntimeModel: Identifiable {
         guard let id = d["id"] as? String,
               let kind = d["kind"] as? String,
               let life = d["lifecycle"] as? String else { return }
-
-        if kind == "raw" { return }
 
         var item = itemIndexById[id].flatMap { idx in
             items.indices.contains(idx) ? items[idx] : nil

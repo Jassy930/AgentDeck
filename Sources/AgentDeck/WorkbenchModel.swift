@@ -101,6 +101,7 @@ final class WorkbenchModel {
 
         runtime.appendUserPrompt(trimmed)
         runtime.errorMessage = nil
+        runtime.warningMessage = nil
         runtime.phase = .starting
         turnStarter.startTurn(
             sessionId: runtime.id,

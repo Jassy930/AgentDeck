@@ -949,6 +949,51 @@ struct WorkbenchRuntimeModelTests {
         #expect(model.shouldShowReasoningExpanded)
         #expect(model.selectedErrorMessage == "runtime error")
     }
+
+    @Test("runtime preserves raw agent items")
+    func runtimePreservesRawAgentItems() {
+        let runtime = ThreadRuntimeModel(id: "s1", threadId: "t1", cwd: URL(fileURLWithPath: "/tmp/a"))
+
+        runtime.ingest(IpcMessage(
+            kind: "agentItem",
+            payload: AnyCodable([
+                "id": "raw1",
+                "lifecycle": "completed",
+                "kind": "raw",
+                "description": "unsupported item type: futureThing",
+            ])
+        ))
+
+        #expect(runtime.items.count == 1)
+        let item = runtime.items.first
+        #expect(item?.kind == "raw")
+        #expect(item?.descriptionText == "unsupported item type: futureThing")
+    }
+
+    @Test("selected runtime warning is visible")
+    func selectedRuntimeWarningIsVisible() {
+        let model = SessionModel()
+        model.warningMessage = "legacy warning"
+        model.workbench.ensureRuntime(
+            sessionId: "selected",
+            threadId: "thread_selected",
+            cwd: URL(fileURLWithPath: "/tmp/selected")
+        )
+
+        model.workbench.ingestSessionEvent(IpcMessage(
+            kind: "session/event",
+            sessionId: "selected",
+            threadId: "thread_selected",
+            payload: AnyCodable([
+                "event": [
+                    "kind": "warning",
+                    "payload": ["message": "runtime warning"],
+                ],
+            ])
+        ))
+
+        #expect(model.selectedWarningMessage == "runtime warning")
+    }
 }
 
 @MainActor

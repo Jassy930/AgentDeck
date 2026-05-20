@@ -41,3 +41,12 @@ swift run AgentDeck -- --diagnostics-report --json
 | `daemon_spawn_failed` | Swift 无法启动 daemon | 检查 `agentdeckd` 路径 |
 | `app_server_handshake_failed` | app-server 握手失败 | 检查 agent 登录和版本 |
 | `turn_failed` | turn 执行失败 | 按 runId 查看 run record |
+
+## Raw / Warning 可见性
+
+未知 adapter item 必须在 daemon 侧中立化为 `raw`，并继续进入 run record 与
+runtime UI。`raw` 只显示中立描述，不携带 vendor 原始 JSON；如果 UI 看不到
+`raw`，优先检查 `ThreadRuntimeModel` 的 agent item ingest 路径。
+
+daemon 写入失败等非致命问题会发出 `warning` 事件。当前选中的 runtime 应显示
+自己的 warning；没有选中 runtime 时才回退显示 legacy session warning。
