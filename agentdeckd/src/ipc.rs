@@ -131,6 +131,23 @@ pub enum AgentItemKind {
         #[serde(skip_serializing_if = "Option::is_none")]
         diff: Option<String>,
     },
+    /// A web search / page navigation action performed by the agent. The
+    /// shape keeps the useful action fields separate so the UI can render a
+    /// readable historical trace without parsing vendor JSON.
+    WebSearch {
+        #[serde(skip_serializing_if = "String::is_empty")]
+        query: String,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        action: String,
+        #[serde(rename = "actionQuery", skip_serializing_if = "Option::is_none")]
+        action_query: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        queries: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pattern: Option<String>,
+    },
     /// An unknown vendor item type, NEUTRALIZED in the daemon (Codex #19):
     /// only a short, size-limited description crosses to Swift, never raw
     /// vendor JSON. Fails loud, not silent (Eng E1 / premise 9).
@@ -205,6 +222,19 @@ mod tests {
                 lifecycle: Lifecycle::Completed,
                 kind: AgentItemKind::Raw {
                     description: "unknown item type x".into(),
+                },
+            }))
+            .unwrap(),
+            serde_json::to_string(&IpcMessage::agent_item(&AgentItem {
+                id: "i4".into(),
+                lifecycle: Lifecycle::Completed,
+                kind: AgentItemKind::WebSearch {
+                    query: "docs".into(),
+                    action: "search".into(),
+                    action_query: Some("docs".into()),
+                    queries: vec!["docs".into()],
+                    url: None,
+                    pattern: None,
                 },
             }))
             .unwrap(),

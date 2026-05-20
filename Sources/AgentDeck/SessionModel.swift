@@ -8,7 +8,7 @@ import Observation
 struct UIItem: Identifiable {
     let id: String
     var lifecycle: String          // started | delta | completed
-    var kind: String               // reasoning | shell | fileEdit | raw
+    var kind: String               // reasoning | shell | fileEdit | webSearch | raw
     // Per-kind fields (only the relevant ones are populated).
     var text: String = ""          // reasoning
     var command: String = ""       // shell
@@ -16,6 +16,12 @@ struct UIItem: Identifiable {
     var exitCode: Int?             // shell
     var path: String = ""          // fileEdit
     var diff: String = ""          // fileEdit
+    var query: String = ""         // webSearch
+    var action: String = ""        // webSearch
+    var actionQuery: String = ""   // webSearch
+    var queries: [String] = []     // webSearch
+    var url: String = ""           // webSearch
+    var pattern: String = ""       // webSearch
     var descriptionText: String = "" // raw (neutralized unknown)
     var hasNonWhitespaceText = false
     var textBuffer = StreamingTextBuffer()
@@ -295,6 +301,12 @@ final class SessionModel {
         item.path = replay.path
         item.diff = replay.diff ?? ""
         item.descriptionText = replay.description ?? ""
+        item.query = replay.query
+        item.action = replay.action
+        item.actionQuery = replay.actionQuery ?? ""
+        item.queries = replay.queries
+        item.url = replay.url ?? ""
+        item.pattern = replay.pattern ?? ""
         item.hasNonWhitespaceText = containsNonWhitespace(replay.text)
         item.textBuffer.replace(with: replay.text)
         item.outputBuffer.replace(with: item.output)
@@ -418,6 +430,13 @@ final class SessionModel {
                 item.diff = diff
                 item.diffBuffer.replace(with: diff)
             }
+        case "webSearch":
+            item.query = d["query"] as? String ?? item.query
+            item.action = d["action"] as? String ?? item.action
+            item.actionQuery = d["actionQuery"] as? String ?? item.actionQuery
+            item.queries = stringArray(from: d["queries"]) ?? item.queries
+            item.url = d["url"] as? String ?? item.url
+            item.pattern = d["pattern"] as? String ?? item.pattern
         case "raw":
             item.descriptionText = d["description"] as? String ?? ""
         default:
@@ -442,6 +461,16 @@ final class SessionModel {
         text.unicodeScalars.contains { scalar in
             !CharacterSet.whitespacesAndNewlines.contains(scalar)
         }
+    }
+
+    private func stringArray(from value: Any?) -> [String]? {
+        if let strings = value as? [String] {
+            return strings
+        }
+        if let values = value as? [Any] {
+            return values.compactMap { $0 as? String }
+        }
+        return nil
     }
 
     func teardown() {

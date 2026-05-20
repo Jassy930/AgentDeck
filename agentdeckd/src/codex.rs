@@ -249,10 +249,7 @@ impl CodexAdapter {
 
     /// Resume an existing persisted thread so the next turn uses its model-
     /// visible history, not a newly-created thread.
-    pub fn thread_resume(
-        &mut self,
-        thread_id: &str,
-    ) -> Result<HistoryThreadSummary, CodexError> {
+    pub fn thread_resume(&mut self, thread_id: &str) -> Result<HistoryThreadSummary, CodexError> {
         let id = self.send_request("thread/resume", json!({ "threadId": thread_id }))?;
         let result = self.await_response(id, |_, _| {})?;
         thread_resume_to_history_summary(&result)
@@ -354,7 +351,10 @@ fn thread_summary_from_value(value: &Value) -> Result<HistoryThreadSummary, Code
         .to_string();
     Ok(HistoryThreadSummary {
         id,
-        name: value.get("name").and_then(Value::as_str).map(str::to_string),
+        name: value
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         preview: value
             .get("preview")
             .and_then(Value::as_str)
@@ -524,8 +524,50 @@ fn reasoning_text(item: &Value) -> String {
     join_strings(item.get("content"))
 }
 
+fn string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn web_search_kind(item: &Value) -> AgentItemKind {
+    let action = item.get("action");
+    AgentItemKind::WebSearch {
+        query: item
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        action: action
+            .and_then(|a| a.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        action_query: action
+            .and_then(|a| a.get("query"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        queries: string_array(action.and_then(|a| a.get("queries"))),
+        url: action
+            .and_then(|a| a.get("url"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        pattern: action
+            .and_then(|a| a.get("pattern"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
+}
+
 fn item_to_kind(item: &Value) -> Option<AgentItemKind> {
-        match item.get("type").and_then(Value::as_str)? {
+    match item.get("type").and_then(Value::as_str)? {
         "userMessage" => Some(AgentItemKind::User {
             text: user_message_text(item),
         }),
@@ -583,6 +625,7 @@ fn item_to_kind(item: &Value) -> Option<AgentItemKind> {
                     .map(str::to_string),
             })
         }
+        "webSearch" => Some(web_search_kind(item)),
         // Internal chain-of-thought and every other vendor type: neutralized.
         // No vendor JSON crosses (Codex #19); fails loud as a visible Raw
         // item, never a silent drop (Eng E1 / premise 9).
@@ -892,6 +935,43 @@ mod tests {
             }
             _ => panic!("expected FileEdit"),
         }
+    }
+
+    #[test]
+    fn thread_read_web_search_item_maps_to_neutral_web_search() {
+        let detail = thread_read_to_history_detail(&json!({
+            "thread": {
+                "id": "thread_1",
+                "name": null,
+                "preview": "search latest docs",
+                "cwd": "/tmp/project",
+                "createdAt": 10,
+                "updatedAt": 20,
+                "status": "ready",
+                "modelProvider": "openai",
+                "source": "cli",
+                "turns": [{
+                    "items": [{
+                        "id": "ws1",
+                        "type": "webSearch",
+                        "query": "AgentDeck history web search",
+                        "action": {
+                            "type": "findInPage",
+                            "url": "https://example.com/docs",
+                            "pattern": "history"
+                        }
+                    }]
+                }]
+            }
+        }))
+        .unwrap();
+
+        let item = serde_json::to_value(&detail.items[0]).unwrap();
+        assert_eq!(item["kind"], "webSearch");
+        assert_eq!(item["query"], "AgentDeck history web search");
+        assert_eq!(item["action"], "findInPage");
+        assert_eq!(item["url"], "https://example.com/docs");
+        assert_eq!(item["pattern"], "history");
     }
 
     // (Superseded by fixture_internal_reasoning_maps_to_reasoning_not_raw:

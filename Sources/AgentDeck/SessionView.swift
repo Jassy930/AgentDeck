@@ -349,11 +349,62 @@ struct SessionView: View {
                 }
             }
             .padding(.vertical, 10)
+        case "webSearch":
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.tertiary)
+                    Text(webSearchTitle(item))
+                        .font(.system(.caption, weight: .medium))
+                        .foregroundStyle(.tertiary)
+                }
+                if !item.query.isEmpty {
+                    Text(item.query)
+                        .font(.system(.callout))
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    if !item.actionQuery.isEmpty {
+                        webSearchDetail("query", item.actionQuery)
+                    }
+                    if !item.queries.isEmpty {
+                        webSearchDetail("queries", item.queries.joined(separator: ", "))
+                    }
+                    if !item.url.isEmpty {
+                        webSearchDetail("url", item.url)
+                    }
+                    if !item.pattern.isEmpty {
+                        webSearchDetail("pattern", item.pattern)
+                    }
+                }
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 10)
         default: // raw — neutralized unknown (E1/#19), visible not silent
             Text(item.descriptionText)
                 .font(.system(.callout))
                 .foregroundStyle(.tertiary)
                 .padding(.vertical, 8)
+        }
+    }
+
+    private func webSearchTitle(_ item: UIItem) -> String {
+        switch item.action {
+        case "search": return "Web search"
+        case "openPage": return "Open web page"
+        case "findInPage": return "Find in web page"
+        case "other": return "Web search action"
+        case "": return "Web search"
+        default: return "Web search · \(item.action)"
+        }
+    }
+
+    private func webSearchDetail(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text(label)
+                .foregroundStyle(.tertiary)
+            Text(value)
+                .textSelection(.enabled)
         }
     }
 

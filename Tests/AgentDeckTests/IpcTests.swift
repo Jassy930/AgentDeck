@@ -180,6 +180,39 @@ struct SessionRenderThrottlingTests {
         #expect(model.items.map(\.text) == ["old prompt", "old answer"])
         #expect(model.selectedHistoryThreadId == "h1")
     }
+
+    @Test("applying history detail preserves web search replay fields")
+    func applyingHistoryDetailPreservesWebSearchFields() {
+        let model = SessionModel()
+        let thread = HistoryThreadSummary(id: "h1", name: nil, preview: "old", cwd: "/tmp/project", createdAt: 1, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli")
+        let detail = HistoryThreadDetail(
+            thread: thread,
+            items: [
+                HistoryReplayItem(
+                    id: "ws1",
+                    lifecycle: "completed",
+                    kind: "webSearch",
+                    query: "AgentDeck history",
+                    action: "findInPage",
+                    actionQuery: "AgentDeck",
+                    queries: ["AgentDeck", "history"],
+                    url: "https://example.com",
+                    pattern: "history"
+                ),
+            ]
+        )
+
+        model.applyHistoryThreadDetail(detail)
+
+        #expect(model.items.count == 1)
+        #expect(model.items[0].kind == "webSearch")
+        #expect(model.items[0].query == "AgentDeck history")
+        #expect(model.items[0].action == "findInPage")
+        #expect(model.items[0].actionQuery == "AgentDeck")
+        #expect(model.items[0].queries == ["AgentDeck", "history"])
+        #expect(model.items[0].url == "https://example.com")
+        #expect(model.items[0].pattern == "history")
+    }
 }
 
 @Suite("History model")
@@ -217,6 +250,21 @@ struct HistoryModelTests {
         #expect(item.text == "old prompt")
         #expect(item.command == "")
         #expect(item.path == "")
+    }
+
+    @Test("history replay item decodes web search fields")
+    func replayItemDecodesWebSearchFields() throws {
+        let data = Data("""
+        {"id":"ws1","lifecycle":"completed","kind":"webSearch","query":"AgentDeck history","action":"search","actionQuery":"AgentDeck","queries":["AgentDeck","history"],"url":"https://example.com","pattern":"history"}
+        """.utf8)
+        let item = try JSONDecoder().decode(HistoryReplayItem.self, from: data)
+        #expect(item.kind == "webSearch")
+        #expect(item.query == "AgentDeck history")
+        #expect(item.action == "search")
+        #expect(item.actionQuery == "AgentDeck")
+        #expect(item.queries == ["AgentDeck", "history"])
+        #expect(item.url == "https://example.com")
+        #expect(item.pattern == "history")
     }
 }
 

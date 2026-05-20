@@ -70,9 +70,16 @@ struct HistoryReplayItem: Codable, Equatable, Identifiable {
     var path: String = ""
     var diff: String?
     var description: String?
+    var query: String = ""
+    var action: String = ""
+    var actionQuery: String?
+    var queries: [String] = []
+    var url: String?
+    var pattern: String?
 
     enum CodingKeys: String, CodingKey {
         case id, lifecycle, kind, text, command, output, exitCode, path, diff, description
+        case query, action, actionQuery, queries, url, pattern
     }
 
     init(
@@ -85,7 +92,13 @@ struct HistoryReplayItem: Codable, Equatable, Identifiable {
         exitCode: Int? = nil,
         path: String = "",
         diff: String? = nil,
-        description: String? = nil
+        description: String? = nil,
+        query: String = "",
+        action: String = "",
+        actionQuery: String? = nil,
+        queries: [String] = [],
+        url: String? = nil,
+        pattern: String? = nil
     ) {
         self.id = id
         self.lifecycle = lifecycle
@@ -97,6 +110,12 @@ struct HistoryReplayItem: Codable, Equatable, Identifiable {
         self.path = path
         self.diff = diff
         self.description = description
+        self.query = query
+        self.action = action
+        self.actionQuery = actionQuery
+        self.queries = queries
+        self.url = url
+        self.pattern = pattern
     }
 
     init(from decoder: Decoder) throws {
@@ -111,6 +130,12 @@ struct HistoryReplayItem: Codable, Equatable, Identifiable {
         path = try c.decodeIfPresent(String.self, forKey: .path) ?? ""
         diff = try c.decodeIfPresent(String.self, forKey: .diff)
         description = try c.decodeIfPresent(String.self, forKey: .description)
+        query = try c.decodeIfPresent(String.self, forKey: .query) ?? ""
+        action = try c.decodeIfPresent(String.self, forKey: .action) ?? ""
+        actionQuery = try c.decodeIfPresent(String.self, forKey: .actionQuery)
+        queries = try c.decodeIfPresent([String].self, forKey: .queries) ?? []
+        url = try c.decodeIfPresent(String.self, forKey: .url)
+        pattern = try c.decodeIfPresent(String.self, forKey: .pattern)
     }
 }
 

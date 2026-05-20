@@ -61,6 +61,11 @@ thread，并按项目 `cwd` 分组显示。点击历史 thread 后，AgentDeck �
 `thread/read(includeTurns: true)` 返回的 turns/items，并用同一套中立
 `AgentItem` stream 回放到右侧。
 
+历史回放会保留 Codex 已持久化的主要块类型，包括用户消息、模型回复、
+reasoning 摘要、shell、文件变更和 web search。web search 会展示搜索
+query、action 类型、打开或查找的 URL、页面内 pattern，以及 action 附带的
+多 query 列表；未知块仍以可见的 `raw` 记录出现，避免静默丢失。
+
 继续历史会话时，AgentDeck 走 `thread/resume(threadId)` 后再执行
 `turn/start`，因此新 prompt 会进入原有 Codex 上下文，而不是创建新
 thread。AgentDeck 只做轻量索引、回放和管理入口；Codex 持久化历史仍是
