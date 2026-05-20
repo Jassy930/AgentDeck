@@ -1034,6 +1034,41 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_history_read_after_start_turn_does_not_wait_for_turn_completion() {
+        let turn_msg = IpcMessage {
+            kind: "startTurn".into(),
+            id: Some(7),
+            session_id: Some("session_7".into()),
+            thread_id: Some("thread_7".into()),
+            payload: Some(serde_json::json!({
+                "threadId": "thread_7",
+                "prompt": "hello"
+            })),
+        };
+        let history_msg = IpcMessage {
+            kind: "history/readThread".into(),
+            id: Some(8),
+            session_id: None,
+            thread_id: None,
+            payload: Some(serde_json::json!({
+                "threadId": "thread_8"
+            })),
+        };
+
+        let turn_action = classify_request(&turn_msg).unwrap();
+        let history_action = classify_request(&history_msg).unwrap();
+
+        assert!(matches!(turn_action, HubAction::SpawnTurn { .. }));
+        assert!(matches!(
+            history_action,
+            HubAction::History(HistoryAction::ReadThread {
+                id: Some(8),
+                ref thread_id,
+            }) if thread_id == "thread_8"
+        ));
+    }
+
+    #[test]
     fn dispatch_history_read_thread_invalid_payload_returns_error_action() {
         let msg = IpcMessage {
             kind: "history/readThread".into(),

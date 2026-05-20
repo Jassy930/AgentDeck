@@ -73,6 +73,43 @@ struct DaemonMessageRoutingTests {
         #expect(router.takeReply(id: 31)?.kind == "historyThread")
     }
 
+    @Test("history reply is not confused with streaming agent item")
+    func historyReplyIsNotConfusedWithAgentItem() {
+        let router = DaemonMessageRouter()
+        var events: [IpcMessage] = []
+        router.onSessionEvent = { events.append($0) }
+
+        #expect(router.registerPending(id: 99))
+        router.route(IpcMessage(kind: "session/event", sessionId: "s1", payload: AnyCodable([
+            "event": [
+                "kind": "agentItem",
+                "payload": [
+                    "id": "a1",
+                    "lifecycle": "delta",
+                    "kind": "message",
+                    "text": "hi",
+                ],
+            ],
+        ])))
+        router.route(IpcMessage(kind: "historyThread", id: 99, payload: AnyCodable([
+            "thread": [
+                "id": "thread_b",
+                "preview": "B",
+                "cwd": "/tmp/b",
+                "createdAt": 1,
+                "updatedAt": 2,
+                "status": "ready",
+                "modelProvider": "openai",
+                "source": "cli",
+            ],
+            "items": [],
+        ])))
+
+        #expect(events.count == 1)
+        #expect(events.first?.sessionId == "s1")
+        #expect(router.takeReply(id: 99)?.kind == "historyThread")
+    }
+
     @Test("routes session events to the active raw stream as legacy events")
     func routesSessionEventsToActiveRawStreamAsLegacyEvents() throws {
         let router = DaemonMessageRouter()
