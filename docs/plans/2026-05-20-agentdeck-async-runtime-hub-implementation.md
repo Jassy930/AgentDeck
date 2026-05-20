@@ -866,6 +866,8 @@ git add Sources/AgentDeck/ThreadRuntimeModel.swift Sources/AgentDeck/WorkbenchMo
 git commit -m "feat: queue prompts per runtime"
 ```
 
+**实施记录（2026-05-20）：** 已完成 Swift 端 runtime 级 submit/queue。`WorkbenchModel.submit(_:)` 只对当前 selected runtime 生效；running/starting/waitingApproval 时仅写入该 runtime 的 `queuedPrompts`。`ThreadRuntimeModel.ingest(_:)` 在 `turnComplete` 后返回 `RuntimeAction.drainNextPrompt`，由 `WorkbenchModel` 用完成事件所属 runtime 继续发起下一次 turn，即使用户已切到其他 history/runtime 也不会串队列。`DaemonClient.runtimeTurnRequest(...)` 补上顶层 `sessionId`，按是否已有 `threadId` 选择 `startTurn` 或 `startSession`，未改 Task 8 的 daemon history action。
+
 ---
 
 ### Task 8: daemon history 请求在 turn 运行中仍可响应

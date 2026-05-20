@@ -519,6 +519,44 @@ struct SessionRenderThrottlingTests {
 @Suite("Workbench runtime model")
 @MainActor
 struct WorkbenchRuntimeModelTests {
+    @Test("submitting to running runtime queues only that runtime")
+    func submittingToRunningRuntimeQueuesOnlyThatRuntime() {
+        let workbench = WorkbenchModel()
+        workbench.ensureRuntime(sessionId: "a", threadId: "thread_a", cwd: URL(fileURLWithPath: "/tmp/a"))
+        workbench.ensureRuntime(sessionId: "b", threadId: "thread_b", cwd: URL(fileURLWithPath: "/tmp/b"))
+        workbench.runtime(sessionId: "a")?.phase = .running
+        workbench.selectedSessionId = "a"
+
+        workbench.submit("continue A")
+
+        #expect(workbench.runtime(sessionId: "a")?.queuedPrompts == ["continue A"])
+        #expect(workbench.runtime(sessionId: "b")?.queuedPrompts.isEmpty == true)
+    }
+
+    @Test("turn complete drains only the completed runtime queue")
+    func turnCompleteDrainsOnlyCompletedRuntimeQueue() {
+        let turnStarter = RecordingRuntimeTurnStarter()
+        let workbench = WorkbenchModel(turnStarter: turnStarter)
+        workbench.ensureRuntime(sessionId: "a", threadId: "thread_a", cwd: URL(fileURLWithPath: "/tmp/a"))
+        workbench.ensureRuntime(sessionId: "b", threadId: "thread_b", cwd: URL(fileURLWithPath: "/tmp/b"))
+        workbench.runtime(sessionId: "a")?.phase = .running
+        workbench.runtime(sessionId: "a")?.queuedPrompts = ["continue A"]
+        workbench.selectedSessionId = "b"
+
+        workbench.ingestSessionEvent(IpcMessage(
+            kind: "session/event",
+            sessionId: "a",
+            threadId: "thread_a",
+            payload: AnyCodable(["event": ["kind": "turnComplete"]])
+        ))
+
+        #expect(turnStarter.requests.map(\.sessionId) == ["a"])
+        #expect(turnStarter.requests.map(\.prompt) == ["continue A"])
+        #expect(workbench.runtime(sessionId: "a")?.queuedPrompts.isEmpty == true)
+        #expect(workbench.runtime(sessionId: "a")?.phase == .starting)
+        #expect(workbench.runtime(sessionId: "b")?.items.isEmpty == true)
+    }
+
     @Test("routes session events to the matching runtime")
     func routesEventsToMatchingRuntime() {
         let workbench = WorkbenchModel()
@@ -645,6 +683,33 @@ struct WorkbenchRuntimeModelTests {
         #expect(!model.selectedItems[0].hasDeferredOutputBuffer)
         #expect(model.selectedItems[1].diffBuffer.text == "+ selected small diff")
         #expect(!model.selectedItems[1].hasDeferredDiffBuffer)
+    }
+}
+
+@MainActor
+final class RecordingRuntimeTurnStarter: RuntimeTurnStarting {
+    struct Request {
+        let sessionId: String
+        let threadId: String?
+        let cwd: URL
+        let prompt: String
+    }
+
+    var requests: [Request] = []
+
+    func startTurn(
+        sessionId: String,
+        threadId: String?,
+        cwd: URL,
+        prompt: String,
+        onEvent: @escaping @MainActor (IpcMessage) -> Void
+    ) {
+        requests.append(Request(
+            sessionId: sessionId,
+            threadId: threadId,
+            cwd: cwd,
+            prompt: prompt
+        ))
     }
 }
 
@@ -805,6 +870,42 @@ struct DaemonHistoryRequestTests {
         #expect(renameJSON["kind"] as? String == "history/renameThread")
         #expect(archiveJSON["kind"] as? String == "history/archiveThread")
         #expect(unarchiveJSON["kind"] as? String == "history/unarchiveThread")
+    }
+
+    @Test("runtime turn request encodes session routing")
+    func runtimeTurnRequestEncodesSessionRouting() throws {
+        let msg = DaemonClient.runtimeTurnRequest(
+            id: 13,
+            sessionId: "session_a",
+            threadId: "thread_a",
+            cwd: URL(fileURLWithPath: "/tmp/a"),
+            prompt: "continue"
+        )
+
+        let json = try #require(JSONSerialization.jsonObject(with: try JSONEncoder().encode(msg)) as? [String: Any])
+        let payload = try #require(json["payload"] as? [String: Any])
+        #expect(json["kind"] as? String == "startTurn")
+        #expect(json["sessionId"] as? String == "session_a")
+        #expect(payload["threadId"] as? String == "thread_a")
+        #expect(payload["prompt"] as? String == "continue")
+    }
+
+    @Test("runtime session request encodes session routing")
+    func runtimeSessionRequestEncodesSessionRouting() throws {
+        let msg = DaemonClient.runtimeTurnRequest(
+            id: 14,
+            sessionId: "session_a",
+            threadId: nil,
+            cwd: URL(fileURLWithPath: "/tmp/a"),
+            prompt: "start"
+        )
+
+        let json = try #require(JSONSerialization.jsonObject(with: try JSONEncoder().encode(msg)) as? [String: Any])
+        let payload = try #require(json["payload"] as? [String: Any])
+        #expect(json["kind"] as? String == "startSession")
+        #expect(json["sessionId"] as? String == "session_a")
+        #expect(payload["cwd"] as? String == "/tmp/a")
+        #expect(payload["prompt"] as? String == "start")
     }
 }
 

@@ -196,7 +196,19 @@ final class SessionModel {
     private var tickTimer: Timer?
     /// Prompts queued while a turn runs (Eng I1). v0.1: enqueue, auto-send
     /// on turn completion. Step 5 wires the auto-send; Step 4 shows the count.
-    var queuedPrompts: [String] = []
+    var queuedPrompts: [String] {
+        get {
+            workbench.selectedRuntime?.queuedPrompts ?? legacyQueuedPrompts
+        }
+        set {
+            if let runtime = workbench.selectedRuntime {
+                runtime.queuedPrompts = newValue
+            } else {
+                legacyQueuedPrompts = newValue
+            }
+        }
+    }
+    private var legacyQueuedPrompts: [String] = []
     var historyThreads: [HistoryThreadSummary] = []
     var historyErrorMessage: String?
     var isLoadingHistory = false
@@ -214,7 +226,7 @@ final class SessionModel {
         workbench.selectedRuntime?.items ?? items
     }
 
-    let workbench = WorkbenchModel()
+    let workbench: WorkbenchModel
 
     private let client: DaemonClient
     private let historyDetailClient: HistoryDetailReading
@@ -231,6 +243,7 @@ final class SessionModel {
 
     init(client: DaemonClient = DaemonClient(), historyDetailClient: HistoryDetailReading? = nil) {
         self.client = client
+        self.workbench = WorkbenchModel(turnStarter: client)
         self.historyDetailClient = historyDetailClient ?? DaemonHistoryDetailReader()
     }
 
@@ -299,12 +312,17 @@ final class SessionModel {
     }
 
     func submit(_ prompt: String) {
+        if workbench.selectedRuntime != nil {
+            workbench.submit(prompt)
+            return
+        }
+
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let cwd else { return }
 
         // Eng I1: a turn in flight → enqueue, don't drop, don't interrupt.
         if phase == .running || phase == .starting || phase == .waitingApproval {
-            queuedPrompts.append(trimmed)
+            legacyQueuedPrompts.append(trimmed)
             return
         }
 
@@ -647,8 +665,8 @@ final class SessionModel {
     }
 
     private func drainQueueIfPossible() {
-        guard !queuedPrompts.isEmpty, phase == .ready else { return }
-        let next = queuedPrompts.removeFirst()
+        guard !legacyQueuedPrompts.isEmpty, phase == .ready else { return }
+        let next = legacyQueuedPrompts.removeFirst()
         submit(next)
     }
 

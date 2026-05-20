@@ -1,6 +1,10 @@
 import Foundation
 import Observation
 
+enum RuntimeAction: Equatable {
+    case drainNextPrompt(String)
+}
+
 @MainActor
 @Observable
 final class ThreadRuntimeModel: Identifiable {
@@ -23,7 +27,8 @@ final class ThreadRuntimeModel: Identifiable {
         self.cwd = cwd
     }
 
-    func ingest(_ msg: IpcMessage) {
+    @discardableResult
+    func ingest(_ msg: IpcMessage) -> RuntimeAction? {
         unreadEventCount += 1
 
         switch msg.kind {
@@ -31,23 +36,43 @@ final class ThreadRuntimeModel: Identifiable {
             if let dict = msg.payload?.value as? [String: Any] {
                 enqueueAgentItem(dict)
             }
+            return nil
         case "sessionState":
             flushPendingAgentItems()
             if let s = (msg.payload?.value as? [String: Any])?["state"] as? String,
                let p = SessionModel.Phase(rawValue: s) {
                 phase = p
             }
+            return nil
         case "turnComplete":
             flushPendingAgentItems()
             phase = .ready
+            return drainQueueIfPossible()
         case "error":
             flushPendingAgentItems()
             let m = (msg.payload?.value as? [String: Any])?["message"] as? String
             errorMessage = m ?? "unknown error"
             phase = .failed
+            return nil
         default:
-            break
+            return nil
         }
+    }
+
+    func appendUserPrompt(_ prompt: String) {
+        let userItem = UIItem(
+            id: "user-\(UUID().uuidString)",
+            lifecycle: "completed",
+            kind: "user",
+            text: prompt
+        )
+        itemIndexById[userItem.id] = items.count
+        items.append(userItem)
+    }
+
+    private func drainQueueIfPossible() -> RuntimeAction? {
+        guard !queuedPrompts.isEmpty, phase == .ready else { return nil }
+        return .drainNextPrompt(queuedPrompts.removeFirst())
     }
 
     private func enqueueAgentItem(_ item: [String: Any]) {

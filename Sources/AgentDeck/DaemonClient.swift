@@ -335,6 +335,17 @@ final class DaemonRequestIdAllocator: @unchecked Sendable {
     }
 }
 
+@MainActor
+protocol RuntimeTurnStarting: AnyObject {
+    func startTurn(
+        sessionId: String,
+        threadId: String?,
+        cwd: URL,
+        prompt: String,
+        onEvent: @escaping @MainActor (IpcMessage) -> Void
+    )
+}
+
 /// Owns the agentdeckd child process and the JSONL IPC channel to it.
 ///
 /// Process lifecycle (Eng A1, first layer): the Swift app spawns the daemon;
@@ -525,6 +536,30 @@ final class DaemonClient {
         )
     }
 
+    static func runtimeTurnRequest(
+        id: UInt64,
+        sessionId: String,
+        threadId: String?,
+        cwd: URL,
+        prompt: String
+    ) -> IpcMessage {
+        if let threadId {
+            return IpcMessage(
+                kind: "startTurn",
+                id: id,
+                sessionId: sessionId,
+                payload: AnyCodable(["threadId": threadId, "prompt": prompt])
+            )
+        }
+
+        return IpcMessage(
+            kind: "startSession",
+            id: id,
+            sessionId: sessionId,
+            payload: AnyCodable(["cwd": cwd.path, "prompt": prompt])
+        )
+    }
+
     static func archiveThreadRequest(id: UInt64, threadId: String) -> IpcMessage {
         IpcMessage(kind: "history/archiveThread", id: id, payload: AnyCodable(["threadId": threadId]))
     }
@@ -633,6 +668,75 @@ final class DaemonClient {
         write(line)
     }
 
+    func startTurn(
+        sessionId: String,
+        threadId: String?,
+        cwd: URL,
+        prompt: String,
+        onEvent: @escaping @MainActor (IpcMessage) -> Void
+    ) {
+        let msg = Self.runtimeTurnRequest(
+            id: 4,
+            sessionId: sessionId,
+            threadId: threadId,
+            cwd: cwd,
+            prompt: prompt
+        )
+        guard let data = try? JSONEncoder().encode(msg) else {
+            Task { @MainActor in
+                onEvent(IpcMessage(
+                    kind: "session/event",
+                    sessionId: sessionId,
+                    threadId: threadId,
+                    payload: AnyCodable([
+                        "event": [
+                            "kind": "error",
+                            "payload": ["message": "failed to encode runtime turn"],
+                        ],
+                    ])
+                ))
+            }
+            return
+        }
+        var line = data
+        line.append(0x0A)
+
+        do {
+            if reader == nil {
+                try start()
+            }
+        } catch {
+            Task { @MainActor in
+                onEvent(IpcMessage(
+                    kind: "session/event",
+                    sessionId: sessionId,
+                    threadId: threadId,
+                    payload: AnyCodable([
+                        "event": [
+                            "kind": "error",
+                            "payload": ["message": "\(error)"],
+                        ],
+                    ])
+                ))
+            }
+            return
+        }
+
+        router.onSessionEvent = { message in
+            let encoded = (try? JSONEncoder().encode(message))
+                .flatMap { String(data: $0, encoding: .utf8) }
+            DispatchQueue.main.async {
+                guard let encoded,
+                      let decoded = try? JSONDecoder().decode(
+                        IpcMessage.self,
+                        from: Data(encoded.utf8)
+                      ) else { return }
+                onEvent(decoded)
+            }
+        }
+        write(line)
+    }
+
     /// Ask the daemon to shut down, then ensure it is gone (A1: app exit
     /// kills the daemon — request a clean shutdown, then hard-kill as backstop).
     func shutdown() {
@@ -692,6 +796,7 @@ extension HistoryDetailReading {
 
 extension DaemonClient: @unchecked Sendable {}
 extension DaemonClient: HistoryDetailReading {}
+extension DaemonClient: RuntimeTurnStarting {}
 
 final class DaemonHistoryDetailReader: HistoryDetailReading, @unchecked Sendable {
     private let client = DaemonClient()

@@ -6,6 +6,11 @@ import Observation
 final class WorkbenchModel {
     private(set) var runtimes: [String: ThreadRuntimeModel] = [:]
     var selectedSessionId: String?
+    private let turnStarter: RuntimeTurnStarting
+
+    init(turnStarter: RuntimeTurnStarting = DaemonClient()) {
+        self.turnStarter = turnStarter
+    }
 
     var selectedRuntime: ThreadRuntimeModel? {
         guard let selectedSessionId else { return nil }
@@ -42,6 +47,11 @@ final class WorkbenchModel {
         selectedSessionId = sessionId
     }
 
+    func submit(_ prompt: String) {
+        guard let runtime = selectedRuntime else { return }
+        submit(prompt, to: runtime)
+    }
+
     func ingestSessionEvent(_ msg: IpcMessage) {
         guard msg.kind == "session/event",
               let sessionId = msg.sessionId,
@@ -54,12 +64,43 @@ final class WorkbenchModel {
             runtime.threadId = msg.threadId
         }
 
-        runtime.ingest(IpcMessage(
+        let action = runtime.ingest(IpcMessage(
             kind: kind,
             sessionId: sessionId,
             threadId: msg.threadId,
             payload: legacyPayload(from: event)
         ))
+        handle(action, for: runtime)
+    }
+
+    private func submit(_ prompt: String, to runtime: ThreadRuntimeModel) {
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        if runtime.phase == .running || runtime.phase == .starting || runtime.phase == .waitingApproval {
+            runtime.queuedPrompts.append(trimmed)
+            return
+        }
+
+        runtime.appendUserPrompt(trimmed)
+        runtime.errorMessage = nil
+        runtime.phase = .starting
+        turnStarter.startTurn(
+            sessionId: runtime.id,
+            threadId: runtime.threadId,
+            cwd: runtime.cwd,
+            prompt: trimmed
+        ) { [weak self] msg in
+            self?.ingestSessionEvent(msg)
+        }
+    }
+
+    private func handle(_ action: RuntimeAction?, for runtime: ThreadRuntimeModel) {
+        guard let action else { return }
+        switch action {
+        case .drainNextPrompt(let prompt):
+            submit(prompt, to: runtime)
+        }
     }
 
     private func legacyPayload(from event: [String: Any]) -> AnyCodable? {
