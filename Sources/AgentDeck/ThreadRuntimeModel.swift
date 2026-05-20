@@ -27,6 +27,21 @@ final class ThreadRuntimeModel: Identifiable {
         self.cwd = cwd
     }
 
+    var displayTitle: String {
+        let project = cwd.lastPathComponent
+        if !project.isEmpty {
+            return project
+        }
+        return threadId ?? id
+    }
+
+    var statusLabel: String {
+        if !queuedPrompts.isEmpty {
+            return "\(phase.rawValue) +\(queuedPrompts.count)"
+        }
+        return phase.rawValue
+    }
+
     @discardableResult
     func ingest(_ msg: IpcMessage) -> RuntimeAction? {
         unreadEventCount += 1

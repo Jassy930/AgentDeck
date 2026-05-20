@@ -1,5 +1,6 @@
 import Testing
 import Textual
+import Foundation
 @testable import AgentDeck
 
 @Suite("Textual compatibility")
@@ -49,6 +50,15 @@ struct TextualCompatibilityTests {
         _ = CodexTurnSection {
             RichMessageView(buffer: buffer)
         }
+    }
+
+    @MainActor
+    @Test("runtime selector view can be created")
+    func runtimeSelectorViewCanBeCreated() {
+        let workbench = WorkbenchModel()
+        workbench.ensureRuntime(sessionId: "s1", threadId: "t1", cwd: URL(fileURLWithPath: "/tmp/a"))
+
+        _ = RuntimeSelectorView(workbench: workbench)
     }
 
     @Test("conversation turns keep assistant tool activity under one Codex rail")

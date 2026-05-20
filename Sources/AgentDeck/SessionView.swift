@@ -148,6 +148,12 @@ struct SessionView: View {
                 .padding(.bottom, 8)
                 .onSubmit { model.loadHistory() }
 
+            RuntimeSelectorView(workbench: model.workbench)
+            if !model.workbench.runtimeList.isEmpty {
+                Divider()
+                    .padding(.vertical, 6)
+            }
+
             if model.isLoadingHistory {
                 ProgressView()
                     .controlSize(.small)

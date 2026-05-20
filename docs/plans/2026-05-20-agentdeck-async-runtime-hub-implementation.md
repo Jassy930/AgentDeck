@@ -1238,3 +1238,7 @@ git commit -m "chore: finish async runtime hub"
 ## Task 8 实施记录
 
 - `agentdeckd/src/main.rs` 已将 history list/read/archive/unarchive/rename 分类为 foreground history action，并由短 worker 执行，stdin 主循环不再同步等待历史请求完成。
+
+## Task 9 实施记录
+
+- 已新增 compact `RuntimeSelectorView` 并接入 History 面板顶部。`WorkbenchModel.runtimeList` 将当前 selected runtime 排在最前；后台 runtime 收到事件会增加 `unreadEventCount`，用户选中该 runtime 后清零。README 已同步 runtime selector 的状态点、队列数和未读事件语义。

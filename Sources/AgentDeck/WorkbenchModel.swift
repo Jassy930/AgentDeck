@@ -17,6 +17,14 @@ final class WorkbenchModel {
         return runtimes[selectedSessionId]
     }
 
+    var runtimeList: [ThreadRuntimeModel] {
+        runtimes.values.sorted { lhs, rhs in
+            if lhs.id == selectedSessionId { return true }
+            if rhs.id == selectedSessionId { return false }
+            return lhs.displayTitle.localizedStandardCompare(rhs.displayTitle) == .orderedAscending
+        }
+    }
+
     func ensureRuntime(sessionId: String, threadId: String?, cwd: URL) {
         if let runtime = runtimes[sessionId] {
             if runtime.threadId == nil {
@@ -27,12 +35,18 @@ final class WorkbenchModel {
 
         runtimes[sessionId] = ThreadRuntimeModel(id: sessionId, threadId: threadId, cwd: cwd)
         if selectedSessionId == nil {
-            selectedSessionId = sessionId
+            selectRuntime(sessionId: sessionId)
         }
     }
 
     func runtime(sessionId: String) -> ThreadRuntimeModel? {
         runtimes[sessionId]
+    }
+
+    func selectRuntime(sessionId: String) {
+        guard runtimes[sessionId] != nil else { return }
+        selectedSessionId = sessionId
+        runtimes[sessionId]?.unreadEventCount = 0
     }
 
     func applyHistoryThreadDetail(_ detail: HistoryThreadDetail) {
@@ -70,6 +84,9 @@ final class WorkbenchModel {
             threadId: msg.threadId,
             payload: legacyPayload(from: event)
         ))
+        if selectedSessionId == sessionId {
+            runtime.unreadEventCount = 0
+        }
         handle(action, for: runtime)
     }
 

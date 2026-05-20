@@ -636,6 +636,38 @@ struct WorkbenchRuntimeModelTests {
         #expect(workbench.runtime(sessionId: "s2")?.items.count == 1)
     }
 
+    @Test("background runtime events increment unread until selected")
+    func backgroundRuntimeEventsIncrementUnreadUntilSelected() {
+        let workbench = WorkbenchModel()
+        workbench.ensureRuntime(sessionId: "s1", threadId: "t1", cwd: URL(fileURLWithPath: "/tmp/a"))
+        workbench.ensureRuntime(sessionId: "s2", threadId: "t2", cwd: URL(fileURLWithPath: "/tmp/b"))
+        workbench.selectRuntime(sessionId: "s1")
+
+        workbench.ingestSessionEvent(IpcMessage(
+            kind: "session/event",
+            sessionId: "s2",
+            threadId: "t2",
+            payload: AnyCodable([
+                "event": [
+                    "kind": "sessionState",
+                    "payload": ["state": "running"],
+                ],
+            ])
+        ))
+
+        #expect(workbench.runtime(sessionId: "s1")?.unreadEventCount == 0)
+        #expect(workbench.runtime(sessionId: "s2")?.unreadEventCount == 1)
+
+        workbench.selectRuntime(sessionId: "s2")
+
+        #expect(workbench.runtime(sessionId: "s2")?.unreadEventCount == 0)
+        #expect(workbench.runtimeList.first?.id == "s2")
+
+        workbench.selectRuntime(sessionId: "missing")
+
+        #expect(workbench.selectedSessionId == "s2")
+    }
+
     @Test("opening history does not change an existing running runtime")
     func openingHistoryDoesNotChangeRunningRuntime() {
         let workbench = WorkbenchModel()
