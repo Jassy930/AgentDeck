@@ -874,7 +874,7 @@ fn latest_run_records(params: &DiagnosticsReportParams) -> Vec<serde_json::Value
             }),
         ));
     }
-    records.sort_by(|a, b| b.0.cmp(&a.0));
+    records.sort_by_key(|record| std::cmp::Reverse(record.0));
     records
         .into_iter()
         .take(params.limit)
