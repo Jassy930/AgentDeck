@@ -24,6 +24,7 @@ mod record;
 
 use std::io::{BufRead, Write};
 
+use diag::DiagnosticEvent;
 use ipc::{IpcMessage, SessionState};
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -226,6 +227,7 @@ fn record_or_warn_with_writer(
     Ok(())
 }
 
+#[cfg(test)]
 fn record_item_or_warn(
     stdout: &mut impl Write,
     run_id: &str,
@@ -235,6 +237,46 @@ fn record_item_or_warn(
 ) -> std::io::Result<()> {
     if let Err(reason) = append(run_id, line) {
         diag::log("record_failed", &reason);
+        if !*warning_emitted {
+            *warning_emitted = true;
+            write_msg(
+                stdout,
+                &IpcMessage {
+                    kind: "warning".into(),
+                    id: None,
+                    payload: Some(serde_json::json!({
+                        "message": format!("本次未留痕: {reason}")
+                    })),
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn record_item_or_warn_with_context(
+    stdout: &mut impl Write,
+    run_id: &str,
+    thread_id: Option<&str>,
+    request_id: Option<u64>,
+    event_seq: &mut u64,
+    line: &str,
+    warning_emitted: &mut bool,
+) -> std::io::Result<()> {
+    if let Err(reason) = record::try_append(run_id, line) {
+        *event_seq += 1;
+        let mut event = DiagnosticEvent::new("record_failed")
+            .level("warning")
+            .code("record_write_failed")
+            .run_id(run_id)
+            .request_id_opt(request_id)
+            .event_seq(*event_seq)
+            .message("run record write failed")
+            .detail(&reason);
+        if let Some(thread_id) = thread_id {
+            event = event.thread_id(thread_id);
+        }
+        diag::log_event(event);
         if !*warning_emitted {
             *warning_emitted = true;
             write_msg(
@@ -267,7 +309,17 @@ fn run_session(
             .map(|d| d.as_secs())
             .unwrap_or(0)
     );
-    diag::log("session_start", &format!("run={run_id} cwd={cwd}"));
+    let mut event_seq = 1;
+    diag::log_event(
+        DiagnosticEvent::new("session_start")
+            .level("info")
+            .code("session_start")
+            .run_id(&run_id)
+            .request_id_opt(id)
+            .event_seq(event_seq)
+            .message("session started")
+            .detail(format!("cwd={cwd}")),
+    );
     write_msg(stdout, &IpcMessage::session_state(SessionState::Starting))?;
     record_or_warn(
         stdout,
@@ -324,7 +376,8 @@ fn run_session(
     {
         let stdout = &mut *stdout;
         let run_id = &run_id;
-        let turn = adapter.turn_start(&thread_id, prompt, |item| {
+        let thread_id_str = thread_id.as_str();
+        let turn = adapter.turn_start(thread_id_str, prompt, |item| {
             if write_err.is_some() {
                 return;
             }
@@ -334,12 +387,14 @@ fn run_session(
             }
             // Record each neutral item as it streams (redaction inside).
             if let Ok(j) = serde_json::to_string(&item)
-                && let Err(e) = record_item_or_warn(
+                && let Err(e) = record_item_or_warn_with_context(
                     stdout,
                     run_id,
+                    Some(thread_id_str),
+                    id,
+                    &mut event_seq,
                     &j,
                     &mut record_warning_emitted,
-                    record::try_append,
                 )
             {
                 write_err = Some(e);
@@ -352,7 +407,18 @@ fn run_session(
         match turn {
             Ok(()) => {}
             Err(e) => {
-                diag::log("turn_failed", &format!("run={run_id} {e}"));
+                event_seq += 1;
+                diag::log_event(
+                    DiagnosticEvent::new("turn_failed")
+                        .level("error")
+                        .code("turn_failed")
+                        .run_id(run_id)
+                        .thread_id(thread_id_str)
+                        .request_id_opt(id)
+                        .event_seq(event_seq)
+                        .message("turn failed")
+                        .detail(e.to_string()),
+                );
                 record_or_warn(
                     stdout,
                     run_id,
@@ -368,7 +434,17 @@ fn run_session(
     }
 
     // Turn succeeded (failure already returned inside the streaming block).
-    diag::log("session_complete", &format!("run={run_id}"));
+    event_seq += 1;
+    diag::log_event(
+        DiagnosticEvent::new("session_complete")
+            .level("info")
+            .code("session_complete")
+            .run_id(&run_id)
+            .thread_id(&thread_id)
+            .request_id_opt(id)
+            .event_seq(event_seq)
+            .message("session complete"),
+    );
     record_or_warn(stdout, &run_id, r#"{"event":"complete"}"#)?;
     write_msg(stdout, &IpcMessage::session_state(SessionState::Ready))?;
     write_msg(
@@ -394,9 +470,16 @@ fn run_turn_on_existing_thread(
             .map(|d| d.as_secs())
             .unwrap_or(0)
     );
-    diag::log(
-        "history_turn_start",
-        &format!("run={run_id} thread={thread_id}"),
+    let mut event_seq = 1;
+    diag::log_event(
+        DiagnosticEvent::new("history_turn_start")
+            .level("info")
+            .code("history_turn_start")
+            .run_id(&run_id)
+            .thread_id(thread_id)
+            .request_id_opt(id)
+            .event_seq(event_seq)
+            .message("history turn started"),
     );
     write_msg(stdout, &IpcMessage::session_state(SessionState::Starting))?;
     record_or_warn(
@@ -443,12 +526,14 @@ fn run_turn_on_existing_thread(
                 return;
             }
             if let Ok(j) = serde_json::to_string(&item)
-                && let Err(e) = record_item_or_warn(
+                && let Err(e) = record_item_or_warn_with_context(
                     stdout,
                     run_id,
+                    Some(thread_id),
+                    id,
+                    &mut event_seq,
                     &j,
                     &mut record_warning_emitted,
-                    record::try_append,
                 )
             {
                 write_err = Some(e);
@@ -460,7 +545,18 @@ fn run_turn_on_existing_thread(
         match turn {
             Ok(()) => {}
             Err(e) => {
-                diag::log("history_turn_failed", &format!("run={run_id} {e}"));
+                event_seq += 1;
+                diag::log_event(
+                    DiagnosticEvent::new("history_turn_failed")
+                        .level("error")
+                        .code("turn_failed")
+                        .run_id(run_id)
+                        .thread_id(thread_id)
+                        .request_id_opt(id)
+                        .event_seq(event_seq)
+                        .message("history turn failed")
+                        .detail(e.to_string()),
+                );
                 record_or_warn(
                     stdout,
                     run_id,
@@ -475,9 +571,16 @@ fn run_turn_on_existing_thread(
         }
     }
 
-    diag::log(
-        "history_turn_complete",
-        &format!("run={run_id} thread={thread_id}"),
+    event_seq += 1;
+    diag::log_event(
+        DiagnosticEvent::new("history_turn_complete")
+            .level("info")
+            .code("history_turn_complete")
+            .run_id(&run_id)
+            .thread_id(thread_id)
+            .request_id_opt(id)
+            .event_seq(event_seq)
+            .message("history turn complete"),
     );
     record_or_warn(stdout, &run_id, r#"{"event":"complete"}"#)?;
     write_msg(stdout, &IpcMessage::session_state(SessionState::Ready))?;
