@@ -233,9 +233,11 @@ struct SessionView: View {
     private var conversationStream: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(model.items) { item in
+                ForEach(Array(model.items.enumerated()), id: \.element.id) { index, item in
                     itemRow(item)
-                    Divider().opacity(0.4)      // D7: subtle divider, not card
+                    if shouldShowDivider(after: index) {
+                        Divider().opacity(0.4)  // D7: subtle divider, not card
+                    }
                 }
                 if let err = model.errorMessage {
                     errorRow(err)               // premise 9: visible failure
@@ -250,39 +252,13 @@ struct SessionView: View {
     private func itemRow(_ item: UIItem) -> some View {
         switch item.kind {
         case "user":
-            // The user's prompt gets a subtle background block so "what I
-            // said" is instantly distinct from "what the agent said". Kept
-            // restrained (system fill, small radius, no border/shadow/left-
-            // bar) so it reads as typographic grouping, not an AI-slop chat
-            // bubble — the D7 line, walked deliberately.
-            Text(item.text)
-                .font(.system(.body, weight: .medium))
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 9)
-                .background(
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(Color(nsColor: .quaternarySystemFill))  // D8
-                )
-                .padding(.vertical, 8)
-        case "message":
-            // PRIMARY answer the user reads. NOT collapsed — this is the
-            // reply. A small "Codex" caption gives it an identity opposite
-            // the user's background block, so the two are unmistakable
-            // without making the reply a bubble too (asymmetry on purpose:
-            // user = block, agent = labelled prose).
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Codex")
-                    .font(.system(.caption, weight: .medium))
-                    .foregroundStyle(.tertiary)
-                StreamingTextView(
-                    buffer: item.textBuffer,
-                    font: .systemFont(ofSize: NSFont.systemFontSize),
-                    textColor: .labelColor
-                )
-                .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 6) {
+                UserPromptBlock(text: item.text)
+                referenceList(item.attachments)
+                    .padding(.leading, 12)
             }
-            .padding(.vertical, 10)
+        case "message":
+            CodexDocumentSection(buffer: item.textBuffer)
         case "reasoning":
             // D3: chain-of-thought is SECONDARY — collapsed by default. The
             // row auto-expands during a running turn (Codex sends the
@@ -305,6 +281,7 @@ struct SessionView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("$ \(item.command)")
                     .font(.system(.callout, design: .monospaced))
+                metadataLine(shellMetadata(item))
                 if !item.output.isEmpty {
                     DisclosureGroup {
                         StreamingTextView(
@@ -325,12 +302,27 @@ struct SessionView: View {
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(.red)   // D8 system warning
                 }
+                if !item.actions.isEmpty {
+                    DisclosureGroup {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(Array(item.actions.enumerated()), id: \.offset) { _, action in
+                                toolActionRow(action)
+                            }
+                        }
+                        .padding(.top, 4)
+                    } label: {
+                        Text("\(item.actions.count) parsed actions")
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
             }
             .padding(.vertical, 10)
         case "fileEdit":
             VStack(alignment: .leading, spacing: 4) {
                 Text(item.path)
                     .font(.system(.callout, design: .monospaced, weight: .medium))
+                metadataLine([item.statusName].filter { !$0.isEmpty })
                 if !item.diff.isEmpty {
                     // Diffs can be large too — same collapse treatment.
                     DisclosureGroup {
@@ -343,6 +335,29 @@ struct SessionView: View {
                         .padding(.top, 4)
                     } label: {
                         Text(outputLabel(item.diff, noun: "diff"))
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                if item.changes.count > 1 {
+                    DisclosureGroup {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(Array(item.changes.enumerated()), id: \.offset) { _, change in
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("\(change.changeKind) \(change.path)")
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                    if !change.diff.isEmpty {
+                                        Text(change.diff)
+                                            .font(.system(.caption, design: .monospaced))
+                                            .textSelection(.enabled)
+                                    }
+                                }
+                            }
+                        }
+                        .padding(.top, 4)
+                    } label: {
+                        Text("\(item.changes.count) file changes")
                             .font(.system(.caption, design: .monospaced))
                             .foregroundStyle(.tertiary)
                     }
@@ -380,12 +395,51 @@ struct SessionView: View {
                 .foregroundStyle(.secondary)
             }
             .padding(.vertical, 10)
+        case "plan":
+            labelledBlock(title: "Plan", systemImage: "checklist", text: item.text)
+        case "hookPrompt":
+            VStack(alignment: .leading, spacing: 5) {
+                toolHeader("Hook prompt", systemImage: "curlybraces")
+                ForEach(Array(item.fragments.enumerated()), id: \.offset) { _, fragment in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(fragment.hookRunId)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                        Text(fragment.text)
+                            .font(.system(.callout))
+                            .textSelection(.enabled)
+                    }
+                }
+            }
+            .padding(.vertical, 10)
+        case "toolCall":
+            toolCallBlock(item)
+        case "collabAgentToolCall":
+            collabAgentBlock(item)
+        case "media":
+            mediaBlock(item)
+        case "reviewMode":
+            labelledBlock(
+                title: item.action == "entered" ? "Entered review mode" : "Exited review mode",
+                systemImage: item.action == "entered" ? "text.badge.checkmark" : "text.badge.xmark",
+                text: item.review
+            )
+        case "contextCompaction":
+            toolHeader("Context compacted", systemImage: "arrow.down.right.and.arrow.up.left")
+                .padding(.vertical, 10)
         default: // raw — neutralized unknown (E1/#19), visible not silent
             Text(item.descriptionText)
                 .font(.system(.callout))
                 .foregroundStyle(.tertiary)
                 .padding(.vertical, 8)
         }
+    }
+
+    private func shouldShowDivider(after index: Int) -> Bool {
+        guard index + 1 < model.items.count else { return false }
+        let current = model.items[index]
+        let next = model.items[index + 1]
+        return !(current.kind == "message" && next.kind == "message")
     }
 
     private func webSearchTitle(_ item: UIItem) -> String {
@@ -406,6 +460,160 @@ struct SessionView: View {
             Text(value)
                 .textSelection(.enabled)
         }
+    }
+
+    private func toolHeader(_ title: String, systemImage: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: systemImage)
+                .foregroundStyle(.tertiary)
+            Text(title)
+                .font(.system(.caption, weight: .medium))
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    private func labelledBlock(title: String, systemImage: String, text: String) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            toolHeader(title, systemImage: systemImage)
+            if !text.isEmpty {
+                Text(text)
+                    .font(.system(.callout))
+                    .textSelection(.enabled)
+            }
+        }
+        .padding(.vertical, 10)
+    }
+
+    private func metadataLine(_ parts: [String]) -> some View {
+        let values = parts.filter { !$0.isEmpty }
+        return Group {
+            if !values.isEmpty {
+                Text(values.joined(separator: " · "))
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+
+    private func shellMetadata(_ item: UIItem) -> [String] {
+        var parts: [String] = []
+        if !item.statusName.isEmpty { parts.append(item.statusName) }
+        if !item.cwdText.isEmpty { parts.append(item.cwdText) }
+        if let duration = item.durationMs { parts.append("\(duration)ms") }
+        if !item.sourceName.isEmpty { parts.append(item.sourceName) }
+        if !item.processId.isEmpty { parts.append("pid \(item.processId)") }
+        return parts
+    }
+
+    private func toolActionRow(_ action: HistoryToolAction) -> some View {
+        let detail = [action.name, action.path, action.query]
+            .compactMap { $0 }
+            .filter { !$0.isEmpty }
+            .joined(separator: " · ")
+        return HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text(action.kind)
+                .foregroundStyle(.tertiary)
+            Text(detail.isEmpty ? action.command : "\(detail) — \(action.command)")
+                .textSelection(.enabled)
+        }
+        .font(.system(.caption, design: .monospaced))
+    }
+
+    private func referenceList(_ refs: [HistoryReference]) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(Array(refs.enumerated()), id: \.offset) { _, ref in
+                let value = ref.text ?? ref.name ?? ref.path ?? ref.url ?? ""
+                if !value.isEmpty {
+                    HStack(spacing: 6) {
+                        Text(ref.kind)
+                            .foregroundStyle(.tertiary)
+                        Text(value)
+                            .textSelection(.enabled)
+                    }
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func toolCallBlock(_ item: UIItem) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            toolHeader(item.toolKind == "mcp" ? "MCP tool" : "Tool call", systemImage: "wrench.and.screwdriver")
+            Text(toolName(item))
+                .font(.system(.callout, design: .monospaced, weight: .medium))
+            metadataLine(toolMetadata(item))
+            toolPayload("arguments", item.arguments)
+            toolPayload("result", item.result)
+            toolPayload("error", item.errorText)
+            referenceList(item.contentItems)
+        }
+        .padding(.vertical, 10)
+    }
+
+    private func toolName(_ item: UIItem) -> String {
+        let prefix = [item.server, item.namespace].first { !$0.isEmpty }
+        if let prefix {
+            return "\(prefix)/\(item.tool)"
+        }
+        return item.tool
+    }
+
+    private func toolMetadata(_ item: UIItem) -> [String] {
+        var parts = [item.statusName].filter { !$0.isEmpty }
+        if let success = item.success { parts.append(success ? "success" : "failed") }
+        if let duration = item.durationMs { parts.append("\(duration)ms") }
+        if !item.resourceUri.isEmpty { parts.append(item.resourceUri) }
+        return parts
+    }
+
+    private func toolPayload(_ label: String, _ value: String) -> some View {
+        Group {
+            if !value.isEmpty {
+                DisclosureGroup {
+                    Text(value)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .padding(.top, 4)
+                } label: {
+                    Text(label)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+        }
+    }
+
+    private func collabAgentBlock(_ item: UIItem) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            toolHeader("Subagent", systemImage: "person.2")
+            metadataLine([item.tool, item.statusName, item.model, item.reasoningEffort])
+            if !item.prompt.isEmpty {
+                Text(item.prompt)
+                    .font(.system(.callout))
+                    .textSelection(.enabled)
+            }
+            if !item.receiverThreadIds.isEmpty {
+                webSearchDetail("receivers", item.receiverThreadIds.joined(separator: ", "))
+                    .font(.system(.caption, design: .monospaced))
+            }
+            toolPayload("agent states", item.agentsStates)
+        }
+        .padding(.vertical, 10)
+    }
+
+    private func mediaBlock(_ item: UIItem) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            toolHeader(item.mediaKind == "imageGeneration" ? "Image generation" : "Image", systemImage: "photo")
+            metadataLine([item.statusName, item.path, item.savedPath])
+            toolPayload("result", item.result)
+            if !item.revisedPrompt.isEmpty {
+                webSearchDetail("revised prompt", item.revisedPrompt)
+                    .font(.system(.caption, design: .monospaced))
+            }
+        }
+        .padding(.vertical, 10)
     }
 
     private func errorRow(_ msg: String) -> some View {

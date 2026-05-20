@@ -59,6 +59,33 @@ struct HistoryThreadListPayload: Codable, Equatable {
     var nextCursor: String?
 }
 
+struct HistoryReference: Codable, Equatable {
+    var kind: String
+    var text: String?
+    var url: String?
+    var path: String?
+    var name: String?
+}
+
+struct HistoryHookFragment: Codable, Equatable {
+    var hookRunId: String
+    var text: String
+}
+
+struct HistoryFileChange: Codable, Equatable {
+    var path: String
+    var diff: String
+    var changeKind: String
+}
+
+struct HistoryToolAction: Codable, Equatable {
+    var kind: String
+    var command: String
+    var path: String?
+    var name: String?
+    var query: String?
+}
+
 struct HistoryReplayItem: Codable, Equatable, Identifiable {
     let id: String
     var lifecycle: String
@@ -76,10 +103,45 @@ struct HistoryReplayItem: Codable, Equatable, Identifiable {
     var queries: [String] = []
     var url: String?
     var pattern: String?
+    var attachments: [HistoryReference] = []
+    var phase: String?
+    var memoryCitation: String?
+    var cwd: String?
+    var status: String?
+    var durationMs: Int?
+    var source: String?
+    var processId: String?
+    var actions: [HistoryToolAction] = []
+    var changes: [HistoryFileChange] = []
+    var fragments: [HistoryHookFragment] = []
+    var toolKind: String = ""
+    var server: String?
+    var namespace: String?
+    var tool: String = ""
+    var arguments: String = ""
+    var result: String?
+    var error: String?
+    var success: Bool?
+    var resourceUri: String?
+    var contentItems: [HistoryReference] = []
+    var prompt: String?
+    var model: String?
+    var reasoningEffort: String?
+    var senderThreadId: String?
+    var receiverThreadIds: [String] = []
+    var agentsStates: String?
+    var mediaKind: String = ""
+    var savedPath: String?
+    var revisedPrompt: String?
+    var review: String?
 
     enum CodingKeys: String, CodingKey {
         case id, lifecycle, kind, text, command, output, exitCode, path, diff, description
         case query, action, actionQuery, queries, url, pattern
+        case attachments, phase, memoryCitation, cwd, status, durationMs, source, processId, actions
+        case changes, fragments, toolKind, server, namespace, tool, arguments, result, error, success
+        case resourceUri, contentItems, prompt, model, reasoningEffort, senderThreadId
+        case receiverThreadIds, agentsStates, mediaKind, savedPath, revisedPrompt, review
     }
 
     init(
@@ -98,7 +160,38 @@ struct HistoryReplayItem: Codable, Equatable, Identifiable {
         actionQuery: String? = nil,
         queries: [String] = [],
         url: String? = nil,
-        pattern: String? = nil
+        pattern: String? = nil,
+        attachments: [HistoryReference] = [],
+        phase: String? = nil,
+        memoryCitation: String? = nil,
+        cwd: String? = nil,
+        status: String? = nil,
+        durationMs: Int? = nil,
+        source: String? = nil,
+        processId: String? = nil,
+        actions: [HistoryToolAction] = [],
+        changes: [HistoryFileChange] = [],
+        fragments: [HistoryHookFragment] = [],
+        toolKind: String = "",
+        server: String? = nil,
+        namespace: String? = nil,
+        tool: String = "",
+        arguments: String = "",
+        result: String? = nil,
+        error: String? = nil,
+        success: Bool? = nil,
+        resourceUri: String? = nil,
+        contentItems: [HistoryReference] = [],
+        prompt: String? = nil,
+        model: String? = nil,
+        reasoningEffort: String? = nil,
+        senderThreadId: String? = nil,
+        receiverThreadIds: [String] = [],
+        agentsStates: String? = nil,
+        mediaKind: String = "",
+        savedPath: String? = nil,
+        revisedPrompt: String? = nil,
+        review: String? = nil
     ) {
         self.id = id
         self.lifecycle = lifecycle
@@ -116,6 +209,37 @@ struct HistoryReplayItem: Codable, Equatable, Identifiable {
         self.queries = queries
         self.url = url
         self.pattern = pattern
+        self.attachments = attachments
+        self.phase = phase
+        self.memoryCitation = memoryCitation
+        self.cwd = cwd
+        self.status = status
+        self.durationMs = durationMs
+        self.source = source
+        self.processId = processId
+        self.actions = actions
+        self.changes = changes
+        self.fragments = fragments
+        self.toolKind = toolKind
+        self.server = server
+        self.namespace = namespace
+        self.tool = tool
+        self.arguments = arguments
+        self.result = result
+        self.error = error
+        self.success = success
+        self.resourceUri = resourceUri
+        self.contentItems = contentItems
+        self.prompt = prompt
+        self.model = model
+        self.reasoningEffort = reasoningEffort
+        self.senderThreadId = senderThreadId
+        self.receiverThreadIds = receiverThreadIds
+        self.agentsStates = agentsStates
+        self.mediaKind = mediaKind
+        self.savedPath = savedPath
+        self.revisedPrompt = revisedPrompt
+        self.review = review
     }
 
     init(from decoder: Decoder) throws {
@@ -136,6 +260,37 @@ struct HistoryReplayItem: Codable, Equatable, Identifiable {
         queries = try c.decodeIfPresent([String].self, forKey: .queries) ?? []
         url = try c.decodeIfPresent(String.self, forKey: .url)
         pattern = try c.decodeIfPresent(String.self, forKey: .pattern)
+        attachments = try c.decodeIfPresent([HistoryReference].self, forKey: .attachments) ?? []
+        phase = try c.decodeIfPresent(String.self, forKey: .phase)
+        memoryCitation = try c.decodeIfPresent(String.self, forKey: .memoryCitation)
+        cwd = try c.decodeIfPresent(String.self, forKey: .cwd)
+        status = try c.decodeIfPresent(String.self, forKey: .status)
+        durationMs = try c.decodeIfPresent(Int.self, forKey: .durationMs)
+        source = try c.decodeIfPresent(String.self, forKey: .source)
+        processId = try c.decodeIfPresent(String.self, forKey: .processId)
+        actions = try c.decodeIfPresent([HistoryToolAction].self, forKey: .actions) ?? []
+        changes = try c.decodeIfPresent([HistoryFileChange].self, forKey: .changes) ?? []
+        fragments = try c.decodeIfPresent([HistoryHookFragment].self, forKey: .fragments) ?? []
+        toolKind = try c.decodeIfPresent(String.self, forKey: .toolKind) ?? ""
+        server = try c.decodeIfPresent(String.self, forKey: .server)
+        namespace = try c.decodeIfPresent(String.self, forKey: .namespace)
+        tool = try c.decodeIfPresent(String.self, forKey: .tool) ?? ""
+        arguments = try c.decodeIfPresent(String.self, forKey: .arguments) ?? ""
+        result = try c.decodeIfPresent(String.self, forKey: .result)
+        error = try c.decodeIfPresent(String.self, forKey: .error)
+        success = try c.decodeIfPresent(Bool.self, forKey: .success)
+        resourceUri = try c.decodeIfPresent(String.self, forKey: .resourceUri)
+        contentItems = try c.decodeIfPresent([HistoryReference].self, forKey: .contentItems) ?? []
+        prompt = try c.decodeIfPresent(String.self, forKey: .prompt)
+        model = try c.decodeIfPresent(String.self, forKey: .model)
+        reasoningEffort = try c.decodeIfPresent(String.self, forKey: .reasoningEffort)
+        senderThreadId = try c.decodeIfPresent(String.self, forKey: .senderThreadId)
+        receiverThreadIds = try c.decodeIfPresent([String].self, forKey: .receiverThreadIds) ?? []
+        agentsStates = try c.decodeIfPresent(String.self, forKey: .agentsStates)
+        mediaKind = try c.decodeIfPresent(String.self, forKey: .mediaKind) ?? ""
+        savedPath = try c.decodeIfPresent(String.self, forKey: .savedPath)
+        revisedPrompt = try c.decodeIfPresent(String.self, forKey: .revisedPrompt)
+        review = try c.decodeIfPresent(String.self, forKey: .review)
     }
 }
 

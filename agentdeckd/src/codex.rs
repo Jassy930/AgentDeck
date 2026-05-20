@@ -28,8 +28,8 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use serde_json::{Value, json};
 
 use crate::ipc::{
-    AgentItem, AgentItemKind, HistoryThreadDetail, HistoryThreadList, HistoryThreadSummary,
-    Lifecycle,
+    AgentItem, AgentItemKind, AgentReference, FileEditChange, HistoryThreadDetail,
+    HistoryThreadList, HistoryThreadSummary, HookFragment, Lifecycle, ToolAction,
 };
 
 #[derive(Debug)]
@@ -410,11 +410,60 @@ fn user_message_text(item: &Value) -> String {
         .unwrap_or_default()
 }
 
+fn user_message_attachments(item: &Value) -> Vec<AgentReference> {
+    item.get("content")
+        .and_then(Value::as_array)
+        .map(|content| {
+            content
+                .iter()
+                .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+                    Some("image") => Some(AgentReference {
+                        kind: "image".into(),
+                        text: None,
+                        url: part.get("url").and_then(Value::as_str).map(str::to_string),
+                        path: None,
+                        name: None,
+                    }),
+                    Some("localImage") => Some(AgentReference {
+                        kind: "localImage".into(),
+                        text: None,
+                        url: None,
+                        path: part.get("path").and_then(Value::as_str).map(str::to_string),
+                        name: None,
+                    }),
+                    Some("skill") | Some("mention") => Some(AgentReference {
+                        kind: part
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        text: None,
+                        url: None,
+                        path: part.get("path").and_then(Value::as_str).map(str::to_string),
+                        name: part.get("name").and_then(Value::as_str).map(str::to_string),
+                    }),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn value_to_label(value: Option<&Value>) -> Option<String> {
+    value.map(value_label).filter(|s| !s.is_empty())
+}
+
+fn json_string(value: Option<&Value>) -> Option<String> {
+    value.and_then(|v| serde_json::to_string(v).ok())
+        .filter(|s| s != "null")
+}
+
 fn thread_item_to_agent_item(item: &Value) -> Option<AgentItem> {
     let id = item.get("id").and_then(Value::as_str)?.to_string();
     let kind = if item.get("type").and_then(Value::as_str) == Some("userMessage") {
         AgentItemKind::User {
             text: user_message_text(item),
+            attachments: user_message_attachments(item),
         }
     } else {
         item_to_kind(item)?
@@ -537,6 +586,113 @@ fn string_array(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn hook_fragments(item: &Value) -> Vec<HookFragment> {
+    item.get("fragments")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|fragment| HookFragment {
+                    hook_run_id: fragment
+                        .get("hookRunId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    text: fragment
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn tool_actions(item: &Value) -> Vec<ToolAction> {
+    item.get("commandActions")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|action| ToolAction {
+                    kind: action
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    command: action
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    path: action.get("path").and_then(Value::as_str).map(str::to_string),
+                    name: action.get("name").and_then(Value::as_str).map(str::to_string),
+                    query: action.get("query").and_then(Value::as_str).map(str::to_string),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn file_changes(item: &Value) -> Vec<FileEditChange> {
+    item.get("changes")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|change| FileEditChange {
+                    path: change
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    diff: change
+                        .get("diff")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    change_kind: change
+                        .get("kind")
+                        .map(value_label)
+                        .unwrap_or_default(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn content_references(item: &Value) -> Vec<AgentReference> {
+    item.get("contentItems")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|content| match content.get("type").and_then(Value::as_str) {
+                    Some("inputText") => Some(AgentReference {
+                        kind: "inputText".into(),
+                        text: content.get("text").and_then(Value::as_str).map(str::to_string),
+                        url: None,
+                        path: None,
+                        name: None,
+                    }),
+                    Some("inputImage") => Some(AgentReference {
+                        kind: "inputImage".into(),
+                        text: None,
+                        url: content
+                            .get("imageUrl")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        path: None,
+                        name: None,
+                    }),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn web_search_kind(item: &Value) -> AgentItemKind {
     let action = item.get("action");
     AgentItemKind::WebSearch {
@@ -570,6 +726,7 @@ fn item_to_kind(item: &Value) -> Option<AgentItemKind> {
     match item.get("type").and_then(Value::as_str)? {
         "userMessage" => Some(AgentItemKind::User {
             text: user_message_text(item),
+            attachments: user_message_attachments(item),
         }),
         // PRIMARY answer the user reads — NOT collapsed (the UX bug the user
         // hit: this was mis-named reasoning and the UI folded it away).
@@ -579,6 +736,8 @@ fn item_to_kind(item: &Value) -> Option<AgentItemKind> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
+            phase: value_to_label(item.get("phase")),
+            memory_citation: json_string(item.get("memoryCitation")),
         }),
         // The model's chain-of-thought — genuinely secondary, the UI
         // collapses THIS (D3). No longer neutralized to Raw: it is a real,
@@ -604,6 +763,15 @@ fn item_to_kind(item: &Value) -> Option<AgentItemKind> {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             exit_code: item.get("exitCode").and_then(Value::as_i64),
+            cwd: item.get("cwd").and_then(Value::as_str).map(str::to_string),
+            status: value_to_label(item.get("status")),
+            duration_ms: item.get("durationMs").and_then(Value::as_i64),
+            source: value_to_label(item.get("source")),
+            process_id: item
+                .get("processId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            actions: tool_actions(item),
         }),
         "fileChange" => {
             // changes[] is an array of FileUpdateChange {path, diff, kind}.
@@ -623,9 +791,116 @@ fn item_to_kind(item: &Value) -> Option<AgentItemKind> {
                     .and_then(|c| c.get("diff"))
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                status: value_to_label(item.get("status")),
+                changes: file_changes(item),
             })
         }
         "webSearch" => Some(web_search_kind(item)),
+        "plan" => Some(AgentItemKind::Plan {
+            text: item
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        }),
+        "hookPrompt" => Some(AgentItemKind::HookPrompt {
+            fragments: hook_fragments(item),
+        }),
+        "mcpToolCall" => Some(AgentItemKind::ToolCall {
+            tool_kind: "mcp".into(),
+            server: item.get("server").and_then(Value::as_str).map(str::to_string),
+            namespace: None,
+            tool: item
+                .get("tool")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            status: value_to_label(item.get("status")).unwrap_or_default(),
+            arguments: json_string(item.get("arguments")).unwrap_or_default(),
+            result: json_string(item.get("result")),
+            error: json_string(item.get("error")),
+            duration_ms: item.get("durationMs").and_then(Value::as_i64),
+            success: None,
+            resource_uri: item
+                .get("mcpAppResourceUri")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            content_items: Vec::new(),
+        }),
+        "dynamicToolCall" => Some(AgentItemKind::ToolCall {
+            tool_kind: "dynamic".into(),
+            server: None,
+            namespace: item
+                .get("namespace")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            tool: item
+                .get("tool")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            status: value_to_label(item.get("status")).unwrap_or_default(),
+            arguments: json_string(item.get("arguments")).unwrap_or_default(),
+            result: None,
+            error: None,
+            duration_ms: item.get("durationMs").and_then(Value::as_i64),
+            success: item.get("success").and_then(Value::as_bool),
+            resource_uri: None,
+            content_items: content_references(item),
+        }),
+        "collabAgentToolCall" => Some(AgentItemKind::CollabAgentToolCall {
+            tool: value_to_label(item.get("tool")).unwrap_or_default(),
+            status: value_to_label(item.get("status")).unwrap_or_default(),
+            prompt: item.get("prompt").and_then(Value::as_str).map(str::to_string),
+            model: item.get("model").and_then(Value::as_str).map(str::to_string),
+            reasoning_effort: value_to_label(item.get("reasoningEffort")),
+            sender_thread_id: item
+                .get("senderThreadId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            receiver_thread_ids: string_array(item.get("receiverThreadIds")),
+            agents_states: json_string(item.get("agentsStates")),
+        }),
+        "imageView" => Some(AgentItemKind::Media {
+            media_kind: "imageView".into(),
+            path: item.get("path").and_then(Value::as_str).map(str::to_string),
+            status: None,
+            result: None,
+            revised_prompt: None,
+            saved_path: None,
+        }),
+        "imageGeneration" => Some(AgentItemKind::Media {
+            media_kind: "imageGeneration".into(),
+            path: None,
+            status: item.get("status").and_then(Value::as_str).map(str::to_string),
+            result: item.get("result").and_then(Value::as_str).map(str::to_string),
+            revised_prompt: item
+                .get("revisedPrompt")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            saved_path: item
+                .get("savedPath")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }),
+        "enteredReviewMode" => Some(AgentItemKind::ReviewMode {
+            action: "entered".into(),
+            review: item
+                .get("review")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        }),
+        "exitedReviewMode" => Some(AgentItemKind::ReviewMode {
+            action: "exited".into(),
+            review: item
+                .get("review")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        }),
+        "contextCompaction" => Some(AgentItemKind::ContextCompaction),
         // Internal chain-of-thought and every other vendor type: neutralized.
         // No vendor JSON crosses (Codex #19); fails loud as a visible Raw
         // item, never a silent drop (Eng E1 / premise 9).
@@ -645,7 +920,11 @@ fn translate(method: &str, params: &Value) -> Option<AgentItem> {
             Some(AgentItem {
                 id,
                 lifecycle: Lifecycle::Delta,
-                kind: AgentItemKind::Message { text: delta },
+                kind: AgentItemKind::Message {
+                    text: delta,
+                    phase: None,
+                    memory_citation: None,
+                },
             })
         }
         // Reasoning streams via dedicated channels (NOT item/agentMessage/
@@ -680,6 +959,12 @@ fn translate(method: &str, params: &Value) -> Option<AgentItem> {
                     command: String::new(),
                     output: Some(chunk),
                     exit_code: None,
+                    cwd: None,
+                    status: None,
+                    duration_ms: None,
+                    source: None,
+                    process_id: None,
+                    actions: Vec::new(),
                 },
             })
         }
@@ -763,7 +1048,7 @@ mod tests {
         assert_eq!(item.id, "item_1");
         assert!(matches!(item.lifecycle, Lifecycle::Delta));
         match item.kind {
-            AgentItemKind::Message { text } => assert_eq!(text, "the answer"),
+            AgentItemKind::Message { text, .. } => assert_eq!(text, "the answer"),
             _ => panic!("expected Message"),
         }
     }
@@ -821,7 +1106,7 @@ mod tests {
         )
         .unwrap();
         match delta.kind {
-            AgentItemKind::Message { text } => assert_eq!(text, "Hello"),
+            AgentItemKind::Message { text, .. } => assert_eq!(text, "Hello"),
             _ => panic!(),
         }
 
@@ -832,7 +1117,7 @@ mod tests {
         )
         .unwrap();
         match done.kind {
-            AgentItemKind::Message { text } => assert_eq!(text, "Hello world"),
+            AgentItemKind::Message { text, .. } => assert_eq!(text, "Hello world"),
             _ => panic!(),
         }
     }
@@ -907,6 +1192,7 @@ mod tests {
                 command,
                 output,
                 exit_code,
+                ..
             } => {
                 assert_eq!(command, "echo hello");
                 assert_eq!(output.as_deref(), Some("hello\n"));
@@ -929,7 +1215,7 @@ mod tests {
         )
         .unwrap();
         match item.kind {
-            AgentItemKind::FileEdit { path, diff } => {
+            AgentItemKind::FileEdit { path, diff, .. } => {
                 assert_eq!(path, "src/main.rs");
                 assert!(diff.unwrap().contains("+new"));
             }
@@ -972,6 +1258,70 @@ mod tests {
         assert_eq!(item["action"], "findInPage");
         assert_eq!(item["url"], "https://example.com/docs");
         assert_eq!(item["pattern"], "history");
+    }
+
+    #[test]
+    fn thread_read_maps_all_known_thread_item_types_without_raw_fallback() {
+        let detail = thread_read_to_history_detail(&json!({
+            "thread": {
+                "id": "thread_1",
+                "name": null,
+                "preview": "all items",
+                "cwd": "/tmp/project",
+                "createdAt": 10,
+                "updatedAt": 20,
+                "status": "ready",
+                "modelProvider": "openai",
+                "source": "cli",
+                "turns": [{
+                    "items": [
+                        {"id":"u1","type":"userMessage","content":[
+                            {"type":"text","text":"prompt"},
+                            {"type":"localImage","path":"/tmp/a.png"},
+                            {"type":"skill","name":"browser","path":"/skills/browser"}
+                        ]},
+                        {"id":"a1","type":"agentMessage","text":"answer","phase":"final","memoryCitation":{"entries":[]}},
+                        {"id":"p1","type":"plan","text":"1. Do it"},
+                        {"id":"h1","type":"hookPrompt","fragments":[{"hookRunId":"hr1","text":"hook text"}]},
+                        {"id":"r1","type":"reasoning","summary":["summary"],"content":["full"]},
+                        {"id":"c1","type":"commandExecution","command":"rg foo","commandActions":[{"type":"search","command":"rg foo","path":"/tmp","query":"foo"}],"cwd":"/tmp","status":"completed","type":"commandExecution","aggregatedOutput":"out","exitCode":0,"durationMs":12,"processId":"p","source":"agent"},
+                        {"id":"f1","type":"fileChange","status":"applied","changes":[{"path":"a.txt","diff":"+a","kind":"add"},{"path":"b.txt","diff":"-b","kind":"delete"}]},
+                        {"id":"m1","type":"mcpToolCall","server":"github","tool":"list","arguments":{"q":"x"},"status":"completed","durationMs":3,"result":{"content":[{"type":"text","text":"ok"}]},"error":null,"mcpAppResourceUri":"app://github"},
+                        {"id":"d1","type":"dynamicToolCall","namespace":"web","tool":"search","arguments":{"q":"x"},"status":"completed","success":true,"durationMs":4,"contentItems":[{"type":"inputText","text":"hit"},{"type":"inputImage","imageUrl":"https://example.com/a.png"}]},
+                        {"id":"ca1","type":"collabAgentToolCall","tool":"spawn","status":"completed","prompt":"help","model":"gpt","reasoningEffort":"medium","senderThreadId":"s","receiverThreadIds":["r"],"agentsStates":{"r":{"status":"done"}}},
+                        {"id":"ws1","type":"webSearch","query":"docs","action":{"type":"search","query":"docs","queries":["docs"]}},
+                        {"id":"iv1","type":"imageView","path":"/tmp/a.png"},
+                        {"id":"ig1","type":"imageGeneration","status":"completed","result":"ok","revisedPrompt":"better","savedPath":"/tmp/out.png"},
+                        {"id":"er1","type":"enteredReviewMode","review":"review text"},
+                        {"id":"xr1","type":"exitedReviewMode","review":"review text"},
+                        {"id":"cc1","type":"contextCompaction"}
+                    ]
+                }]
+            }
+        }))
+        .unwrap();
+
+        let items = serde_json::to_value(&detail.items).unwrap();
+        let kinds: Vec<String> = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["kind"].as_str().unwrap().to_string())
+            .collect();
+        assert!(!kinds.iter().any(|kind| kind == "raw"), "{kinds:?}");
+        assert_eq!(items[0]["attachments"][0]["path"], "/tmp/a.png");
+        assert_eq!(items[1]["phase"], "final");
+        assert_eq!(items[3]["fragments"][0]["hookRunId"], "hr1");
+        assert_eq!(items[5]["cwd"], "/tmp");
+        assert_eq!(items[5]["actions"][0]["query"], "foo");
+        assert_eq!(items[6]["changes"][1]["path"], "b.txt");
+        assert_eq!(items[7]["toolKind"], "mcp");
+        assert_eq!(items[8]["contentItems"][1]["url"], "https://example.com/a.png");
+        assert_eq!(items[9]["receiverThreadIds"][0], "r");
+        assert_eq!(items[11]["mediaKind"], "imageView");
+        assert_eq!(items[12]["savedPath"], "/tmp/out.png");
+        assert_eq!(items[13]["action"], "entered");
+        assert_eq!(items[15]["kind"], "contextCompaction");
     }
 
     // (Superseded by fixture_internal_reasoning_maps_to_reasoning_not_raw:
@@ -1055,11 +1405,11 @@ mod tests {
         assert_eq!(detail.thread.id, "thread_1");
         assert_eq!(detail.items.len(), 3);
         match &detail.items[0].kind {
-            AgentItemKind::User { text } => assert_eq!(text, "please fix tests"),
+            AgentItemKind::User { text, .. } => assert_eq!(text, "please fix tests"),
             _ => panic!("expected user item"),
         }
         match &detail.items[1].kind {
-            AgentItemKind::Message { text } => assert_eq!(text, "done"),
+            AgentItemKind::Message { text, .. } => assert_eq!(text, "done"),
             _ => panic!("expected message item"),
         }
     }

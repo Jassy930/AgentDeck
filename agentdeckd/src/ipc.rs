@@ -99,16 +99,68 @@ pub struct AgentItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentReference {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookFragment {
+    pub hook_run_id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileEditChange {
+    pub path: String,
+    pub diff: String,
+    pub change_kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolAction {
+    pub kind: String,
+    pub command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum AgentItemKind {
     /// A user prompt restored from historical thread turns.
-    User { text: String },
+    User {
+        text: String,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<AgentReference>,
+    },
     /// The agent's PRIMARY user-facing answer (Codex `agentMessage`). This
     /// is the reply the user actually reads — it is NOT collapsed (corrects
     /// the D3 misread: D3's "reasoning default-collapsed" applies to the
     /// chain-of-thought below, not to the answer). `text` accumulates across
     /// deltas.
-    Message { text: String },
+    Message {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        phase: Option<String>,
+        #[serde(rename = "memoryCitation", skip_serializing_if = "Option::is_none")]
+        memory_citation: Option<String>,
+    },
     /// The agent's chain-of-thought (Codex internal `reasoning`). Genuinely
     /// secondary — default-collapsed in the UI per Eng D3. Distinct from
     /// `Message`: this is HOW it thought, not the answer.
@@ -124,12 +176,28 @@ pub enum AgentItemKind {
         // (this is the bug the per-kind test caught).
         #[serde(rename = "exitCode", skip_serializing_if = "Option::is_none")]
         exit_code: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(rename = "durationMs", skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        #[serde(rename = "processId", skip_serializing_if = "Option::is_none")]
+        process_id: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        actions: Vec<ToolAction>,
     },
     /// A file the agent edited. Per-kind structured (D4).
     FileEdit {
         path: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         diff: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        changes: Vec<FileEditChange>,
     },
     /// A web search / page navigation action performed by the agent. The
     /// shape keeps the useful action fields separate so the UI can render a
@@ -148,6 +216,71 @@ pub enum AgentItemKind {
         #[serde(skip_serializing_if = "Option::is_none")]
         pattern: Option<String>,
     },
+    Plan {
+        text: String,
+    },
+    HookPrompt {
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        fragments: Vec<HookFragment>,
+    },
+    ToolCall {
+        #[serde(rename = "toolKind")]
+        tool_kind: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        server: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+        tool: String,
+        status: String,
+        arguments: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        #[serde(rename = "durationMs", skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        success: Option<bool>,
+        #[serde(rename = "resourceUri", skip_serializing_if = "Option::is_none")]
+        resource_uri: Option<String>,
+        #[serde(rename = "contentItems", skip_serializing_if = "Vec::is_empty")]
+        content_items: Vec<AgentReference>,
+    },
+    CollabAgentToolCall {
+        tool: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(rename = "reasoningEffort", skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+        #[serde(rename = "senderThreadId")]
+        sender_thread_id: String,
+        #[serde(rename = "receiverThreadIds", skip_serializing_if = "Vec::is_empty")]
+        receiver_thread_ids: Vec<String>,
+        #[serde(rename = "agentsStates", skip_serializing_if = "Option::is_none")]
+        agents_states: Option<String>,
+    },
+    Media {
+        #[serde(rename = "mediaKind")]
+        media_kind: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+        #[serde(rename = "revisedPrompt", skip_serializing_if = "Option::is_none")]
+        revised_prompt: Option<String>,
+        #[serde(rename = "savedPath", skip_serializing_if = "Option::is_none")]
+        saved_path: Option<String>,
+    },
+    ReviewMode {
+        action: String,
+        review: String,
+    },
+    ContextCompaction,
     /// An unknown vendor item type, NEUTRALIZED in the daemon (Codex #19):
     /// only a short, size-limited description crosses to Swift, never raw
     /// vendor JSON. Fails loud, not silent (Eng E1 / premise 9).
@@ -214,6 +347,12 @@ mod tests {
                     command: "ls".into(),
                     output: Some("a\nb".into()),
                     exit_code: Some(0),
+                    cwd: None,
+                    status: None,
+                    duration_ms: None,
+                    source: None,
+                    process_id: None,
+                    actions: Vec::new(),
                 },
             }))
             .unwrap(),
@@ -263,6 +402,12 @@ mod tests {
                 command: "echo hi".into(),
                 output: Some("hi".into()),
                 exit_code: Some(0),
+                cwd: None,
+                status: None,
+                duration_ms: None,
+                source: None,
+                process_id: None,
+                actions: Vec::new(),
             },
         };
         let v = serde_json::to_value(&item).unwrap();
