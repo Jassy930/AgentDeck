@@ -175,7 +175,9 @@ fn run_thread_management(
         "archive" => adapter.thread_archive(thread_id),
         "unarchive" => adapter.thread_unarchive(thread_id),
         "rename" => adapter.thread_set_name(thread_id, name.unwrap_or("")),
-        _ => Err(codex::CodexError::Protocol("unknown thread management action".into())),
+        _ => Err(codex::CodexError::Protocol(
+            "unknown thread management action".into(),
+        )),
     };
     match result {
         Ok(()) => write_msg(
@@ -352,7 +354,10 @@ fn run_turn_on_existing_thread(
             .map(|d| d.as_secs())
             .unwrap_or(0)
     );
-    diag::log("history_turn_start", &format!("run={run_id} thread={thread_id}"));
+    diag::log(
+        "history_turn_start",
+        &format!("run={run_id} thread={thread_id}"),
+    );
     write_msg(stdout, &IpcMessage::session_state(SessionState::Starting))?;
     record_or_warn(
         stdout,
@@ -423,7 +428,10 @@ fn run_turn_on_existing_thread(
         }
     }
 
-    diag::log("history_turn_complete", &format!("run={run_id} thread={thread_id}"));
+    diag::log(
+        "history_turn_complete",
+        &format!("run={run_id} thread={thread_id}"),
+    );
     record_or_warn(stdout, &run_id, r#"{"event":"complete"}"#)?;
     write_msg(stdout, &IpcMessage::session_state(SessionState::Ready))?;
     write_msg(
@@ -575,7 +583,10 @@ mod tests {
     #[test]
     fn history_read_thread_id_reads_required_id() {
         let p = json!({"threadId": "thread_1"});
-        assert_eq!(history_read_thread_id(Some(&p)), Some("thread_1".to_string()));
+        assert_eq!(
+            history_read_thread_id(Some(&p)),
+            Some("thread_1".to_string())
+        );
     }
 
     #[test]

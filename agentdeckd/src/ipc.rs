@@ -164,7 +164,9 @@ pub enum AgentItemKind {
     /// The agent's chain-of-thought (Codex internal `reasoning`). Genuinely
     /// secondary — default-collapsed in the UI per Eng D3. Distinct from
     /// `Message`: this is HOW it thought, not the answer.
-    Reasoning { text: String },
+    Reasoning {
+        text: String,
+    },
     /// A shell command the agent ran. Per-kind structured (D4).
     Shell {
         command: String,
@@ -284,7 +286,9 @@ pub enum AgentItemKind {
     /// An unknown vendor item type, NEUTRALIZED in the daemon (Codex #19):
     /// only a short, size-limited description crosses to Swift, never raw
     /// vendor JSON. Fails loud, not silent (Eng E1 / premise 9).
-    Raw { description: String },
+    Raw {
+        description: String,
+    },
 }
 
 /// A neutral summary for a historical agent thread. Values such as

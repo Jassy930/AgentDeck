@@ -454,7 +454,8 @@ fn value_to_label(value: Option<&Value>) -> Option<String> {
 }
 
 fn json_string(value: Option<&Value>) -> Option<String> {
-    value.and_then(|v| serde_json::to_string(v).ok())
+    value
+        .and_then(|v| serde_json::to_string(v).ok())
         .filter(|s| s != "null")
 }
 
@@ -626,9 +627,18 @@ fn tool_actions(item: &Value) -> Vec<ToolAction> {
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string(),
-                    path: action.get("path").and_then(Value::as_str).map(str::to_string),
-                    name: action.get("name").and_then(Value::as_str).map(str::to_string),
-                    query: action.get("query").and_then(Value::as_str).map(str::to_string),
+                    path: action
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    name: action
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    query: action
+                        .get("query")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                 })
                 .collect()
         })
@@ -652,10 +662,7 @@ fn file_changes(item: &Value) -> Vec<FileEditChange> {
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string(),
-                    change_kind: change
-                        .get("kind")
-                        .map(value_label)
-                        .unwrap_or_default(),
+                    change_kind: change.get("kind").map(value_label).unwrap_or_default(),
                 })
                 .collect()
         })
@@ -668,26 +675,31 @@ fn content_references(item: &Value) -> Vec<AgentReference> {
         .map(|items| {
             items
                 .iter()
-                .filter_map(|content| match content.get("type").and_then(Value::as_str) {
-                    Some("inputText") => Some(AgentReference {
-                        kind: "inputText".into(),
-                        text: content.get("text").and_then(Value::as_str).map(str::to_string),
-                        url: None,
-                        path: None,
-                        name: None,
-                    }),
-                    Some("inputImage") => Some(AgentReference {
-                        kind: "inputImage".into(),
-                        text: None,
-                        url: content
-                            .get("imageUrl")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        path: None,
-                        name: None,
-                    }),
-                    _ => None,
-                })
+                .filter_map(
+                    |content| match content.get("type").and_then(Value::as_str) {
+                        Some("inputText") => Some(AgentReference {
+                            kind: "inputText".into(),
+                            text: content
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            url: None,
+                            path: None,
+                            name: None,
+                        }),
+                        Some("inputImage") => Some(AgentReference {
+                            kind: "inputImage".into(),
+                            text: None,
+                            url: content
+                                .get("imageUrl")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            path: None,
+                            name: None,
+                        }),
+                        _ => None,
+                    },
+                )
                 .collect()
         })
         .unwrap_or_default()
@@ -808,7 +820,10 @@ fn item_to_kind(item: &Value) -> Option<AgentItemKind> {
         }),
         "mcpToolCall" => Some(AgentItemKind::ToolCall {
             tool_kind: "mcp".into(),
-            server: item.get("server").and_then(Value::as_str).map(str::to_string),
+            server: item
+                .get("server")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             namespace: None,
             tool: item
                 .get("tool")
@@ -851,8 +866,14 @@ fn item_to_kind(item: &Value) -> Option<AgentItemKind> {
         "collabAgentToolCall" => Some(AgentItemKind::CollabAgentToolCall {
             tool: value_to_label(item.get("tool")).unwrap_or_default(),
             status: value_to_label(item.get("status")).unwrap_or_default(),
-            prompt: item.get("prompt").and_then(Value::as_str).map(str::to_string),
-            model: item.get("model").and_then(Value::as_str).map(str::to_string),
+            prompt: item
+                .get("prompt")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            model: item
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             reasoning_effort: value_to_label(item.get("reasoningEffort")),
             sender_thread_id: item
                 .get("senderThreadId")
@@ -873,8 +894,14 @@ fn item_to_kind(item: &Value) -> Option<AgentItemKind> {
         "imageGeneration" => Some(AgentItemKind::Media {
             media_kind: "imageGeneration".into(),
             path: None,
-            status: item.get("status").and_then(Value::as_str).map(str::to_string),
-            result: item.get("result").and_then(Value::as_str).map(str::to_string),
+            status: item
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            result: item
+                .get("result")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             revised_prompt: item
                 .get("revisedPrompt")
                 .and_then(Value::as_str)
@@ -1316,7 +1343,10 @@ mod tests {
         assert_eq!(items[5]["actions"][0]["query"], "foo");
         assert_eq!(items[6]["changes"][1]["path"], "b.txt");
         assert_eq!(items[7]["toolKind"], "mcp");
-        assert_eq!(items[8]["contentItems"][1]["url"], "https://example.com/a.png");
+        assert_eq!(
+            items[8]["contentItems"][1]["url"],
+            "https://example.com/a.png"
+        );
         assert_eq!(items[9]["receiverThreadIds"][0], "r");
         assert_eq!(items[11]["mediaKind"], "imageView");
         assert_eq!(items[12]["savedPath"], "/tmp/out.png");

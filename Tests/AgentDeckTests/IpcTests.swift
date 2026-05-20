@@ -213,6 +213,55 @@ struct SessionRenderThrottlingTests {
         #expect(model.items[0].url == "https://example.com")
         #expect(model.items[0].pattern == "history")
     }
+
+    @Test("applying history detail preserves complete replay item fields")
+    func applyingHistoryDetailPreservesCompleteReplayFields() {
+        let model = SessionModel()
+        let thread = HistoryThreadSummary(id: "h1", name: nil, preview: "old", cwd: "/tmp/project", createdAt: 1, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli")
+        let detail = HistoryThreadDetail(
+            thread: thread,
+            items: [
+                HistoryReplayItem(
+                    id: "tool1",
+                    lifecycle: "completed",
+                    kind: "toolCall",
+                    status: "completed",
+                    durationMs: 42,
+                    toolKind: "mcp",
+                    server: "github",
+                    tool: "list",
+                    arguments: #"{"q":"x"}"#,
+                    result: #"{"ok":true}"#,
+                    resourceUri: "app://github"
+                ),
+                HistoryReplayItem(
+                    id: "file1",
+                    lifecycle: "completed",
+                    kind: "fileEdit",
+                    path: "a.txt",
+                    diff: "+a",
+                    status: "applied",
+                    changes: [
+                        HistoryFileChange(path: "a.txt", diff: "+a", changeKind: "add"),
+                        HistoryFileChange(path: "b.txt", diff: "-b", changeKind: "delete"),
+                    ]
+                ),
+            ]
+        )
+
+        model.applyHistoryThreadDetail(detail)
+
+        #expect(model.items[0].kind == "toolCall")
+        #expect(model.items[0].toolKind == "mcp")
+        #expect(model.items[0].server == "github")
+        #expect(model.items[0].tool == "list")
+        #expect(model.items[0].arguments == #"{"q":"x"}"#)
+        #expect(model.items[0].result == #"{"ok":true}"#)
+        #expect(model.items[0].durationMs == 42)
+        #expect(model.items[0].resourceUri == "app://github")
+        #expect(model.items[1].changes.count == 2)
+        #expect(model.items[1].changes[1].path == "b.txt")
+    }
 }
 
 @Suite("History model")
@@ -265,6 +314,28 @@ struct HistoryModelTests {
         #expect(item.queries == ["AgentDeck", "history"])
         #expect(item.url == "https://example.com")
         #expect(item.pattern == "history")
+    }
+
+    @Test("history replay item decodes complete known item fields")
+    func replayItemDecodesCompleteKnownItemFields() throws {
+        let data = Data("""
+        {"id":"m1","lifecycle":"completed","kind":"toolCall","toolKind":"mcp","server":"github","tool":"list","status":"completed","arguments":"{\\"q\\":\\"x\\"}","result":"{\\"ok\\":true}","durationMs":12,"resourceUri":"app://github","contentItems":[{"kind":"inputText","text":"hit"}],"actions":[{"kind":"search","command":"rg x","path":"/tmp","query":"x"}],"changes":[{"path":"a.txt","diff":"+a","changeKind":"add"}],"attachments":[{"kind":"localImage","path":"/tmp/a.png"}],"fragments":[{"hookRunId":"hr1","text":"hook text"}],"receiverThreadIds":["r1"],"mediaKind":"imageGeneration","savedPath":"/tmp/out.png","review":"review text"}
+        """.utf8)
+        let item = try JSONDecoder().decode(HistoryReplayItem.self, from: data)
+        #expect(item.toolKind == "mcp")
+        #expect(item.server == "github")
+        #expect(item.arguments == #"{"q":"x"}"#)
+        #expect(item.result == #"{"ok":true}"#)
+        #expect(item.durationMs == 12)
+        #expect(item.contentItems[0].text == "hit")
+        #expect(item.actions[0].query == "x")
+        #expect(item.changes[0].changeKind == "add")
+        #expect(item.attachments[0].path == "/tmp/a.png")
+        #expect(item.fragments[0].hookRunId == "hr1")
+        #expect(item.receiverThreadIds == ["r1"])
+        #expect(item.mediaKind == "imageGeneration")
+        #expect(item.savedPath == "/tmp/out.png")
+        #expect(item.review == "review text")
     }
 }
 
