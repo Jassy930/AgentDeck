@@ -198,6 +198,18 @@ struct HistoryModelTests {
         #expect(groups.map(\.cwd) == ["/tmp/a", "/tmp/b"])
         #expect(groups[0].threads.map(\.id) == ["new", "old"])
     }
+
+    @Test("history replay item tolerates per-kind missing fields")
+    func replayItemToleratesMissingPerKindFields() throws {
+        let data = Data("""
+        {"id":"u1","lifecycle":"completed","kind":"user","text":"old prompt"}
+        """.utf8)
+        let item = try JSONDecoder().decode(HistoryReplayItem.self, from: data)
+        #expect(item.kind == "user")
+        #expect(item.text == "old prompt")
+        #expect(item.command == "")
+        #expect(item.path == "")
+    }
 }
 
 @Suite("Daemon history requests")
