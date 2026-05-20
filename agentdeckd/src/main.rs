@@ -23,6 +23,7 @@ mod ipc;
 mod record;
 
 use std::io::{BufRead, Write};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use diag::DiagnosticEvent;
 use ipc::{IpcMessage, SessionState};
@@ -39,6 +40,13 @@ struct HistoryListParams {
 struct StartTurnParams {
     thread_id: String,
     prompt: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DiagnosticsReportParams {
+    run_id: Option<String>,
+    limit: usize,
+    since_seconds: Option<u64>,
 }
 
 fn write_msg(stdout: &mut impl Write, msg: &IpcMessage) -> std::io::Result<()> {
@@ -87,6 +95,29 @@ fn start_turn_params(payload: Option<&serde_json::Value>) -> Option<StartTurnPar
         return None;
     }
     Some(StartTurnParams { thread_id, prompt })
+}
+
+fn diagnostics_report_params(payload: Option<&serde_json::Value>) -> DiagnosticsReportParams {
+    let limit = payload
+        .and_then(|p| p.get("limit"))
+        .and_then(|v| v.as_u64())
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(50)
+        .clamp(1, 500);
+    let since_seconds = payload
+        .and_then(|p| p.get("sinceSeconds"))
+        .and_then(|v| v.as_u64());
+    let run_id = payload
+        .and_then(|p| p.get("runId"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    DiagnosticsReportParams {
+        run_id,
+        limit,
+        since_seconds,
+    }
 }
 
 fn run_history_list(
@@ -713,6 +744,230 @@ fn run_logging_selfcheck(stdout: &mut impl Write, id: Option<u64>) -> std::io::R
     )
 }
 
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn system_time_epoch_secs(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn parse_diagnostic_ts(ts: &serde_json::Value) -> Option<u64> {
+    ts.as_str()
+        .and_then(|s| s.strip_prefix("t="))
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
+fn suggested_next_check_for_failure(code: &str) -> &'static str {
+    match code {
+        "record_write_failed" | "record_probe_missing" => {
+            "检查 runs 目录权限，必要时用 AGENTDECK_DATA_DIR 指向临时目录后重跑 --selfcheck"
+        }
+        "diagnostic_write_failed" | "diagnostic_probe_missing" | "diagnostic_parse_failed" => {
+            "检查 diagnostic.log 是否可写可读，并确认每行都是 JSON"
+        }
+        "redaction_failed" => "停止分享日志，修复 record::redact 后重跑 --selfcheck",
+        "turn_failed" => "按 runId 同时查看 diagnostic.log 与 runs/<runId>.jsonl 中的上下文",
+        "daemon_spawn_failed" | "app_server_handshake_failed" => {
+            "确认 agent 子进程可启动，并查看 diagnostic.log 中同一 requestId 的失败详情"
+        }
+        "adapter_unhandled_method" => {
+            "保留 raw record，并按 method 扩展 adapter 映射或降级展示策略"
+        }
+        "ipc_malformed_jsonl" => "检查调用方写入 daemon stdin 的 JSONL 是否一行一个完整 JSON",
+        _ => "按 runId、threadId、requestId 和 eventSeq 关联 diagnostic.log 与 runs/*.jsonl",
+    }
+}
+
+fn diagnostics_failure_from_event(
+    event: &serde_json::Value,
+    path_hint: &str,
+) -> Option<serde_json::Value> {
+    let code = event.get("code").and_then(|v| v.as_str())?;
+    let level = event
+        .get("level")
+        .and_then(|v| v.as_str())
+        .unwrap_or("warning");
+    let is_failure = matches!(level, "warning" | "error")
+        || code.ends_with("_failed")
+        || matches!(
+            code,
+            "record_probe_missing"
+                | "diagnostic_probe_missing"
+                | "redaction_failed"
+                | "adapter_unhandled_method"
+                | "ipc_malformed_jsonl"
+        );
+    if !is_failure {
+        return None;
+    }
+
+    Some(serde_json::json!({
+        "code": code,
+        "severity": level,
+        "message": event.get("message").and_then(|v| v.as_str()).unwrap_or(code),
+        "pathHint": path_hint,
+        "runId": event.get("runId").cloned().unwrap_or(serde_json::Value::Null),
+        "threadId": event.get("threadId").cloned().unwrap_or(serde_json::Value::Null),
+        "requestId": event.get("requestId").cloned().unwrap_or(serde_json::Value::Null),
+        "eventSeq": event.get("eventSeq").cloned().unwrap_or(serde_json::Value::Null),
+        "suggestedNextCheck": suggested_next_check_for_failure(code),
+    }))
+}
+
+fn latest_run_records(params: &DiagnosticsReportParams) -> Vec<serde_json::Value> {
+    let Some(dir) = record::record_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let cutoff = params
+        .since_seconds
+        .map(|seconds| now_epoch_secs().saturating_sub(seconds));
+
+    let mut records = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(run_id) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if let Some(filter) = params.run_id.as_deref()
+            && run_id != filter
+        {
+            continue;
+        }
+        let metadata = entry.metadata().ok();
+        let updated_at = metadata
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .map(system_time_epoch_secs)
+            .unwrap_or(0);
+        if let Some(cutoff) = cutoff
+            && updated_at > 0
+            && updated_at < cutoff
+        {
+            continue;
+        }
+        let line_count = std::fs::read_to_string(&path)
+            .map(|content| content.lines().count())
+            .unwrap_or(0);
+        records.push((
+            updated_at,
+            serde_json::json!({
+                "runId": run_id,
+                "path": path.display().to_string(),
+                "updatedAt": updated_at,
+                "lineCount": line_count,
+            }),
+        ));
+    }
+    records.sort_by(|a, b| b.0.cmp(&a.0));
+    records
+        .into_iter()
+        .take(params.limit)
+        .map(|(_, value)| value)
+        .collect()
+}
+
+fn diagnostic_failures(params: &DiagnosticsReportParams) -> Vec<serde_json::Value> {
+    let Some(path) = diag::diagnostic_log_path() else {
+        return Vec::new();
+    };
+    let path_hint = path.display().to_string();
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let cutoff = params
+        .since_seconds
+        .map(|seconds| now_epoch_secs().saturating_sub(seconds));
+
+    let mut failures = Vec::new();
+    for (idx, line) in content.lines().enumerate() {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            failures.push(serde_json::json!({
+                "code": "diagnostic_parse_failed",
+                "severity": "warning",
+                "message": format!("diagnostic log line {} is not valid JSON", idx + 1),
+                "pathHint": path_hint,
+                "runId": serde_json::Value::Null,
+                "threadId": serde_json::Value::Null,
+                "requestId": serde_json::Value::Null,
+                "eventSeq": serde_json::Value::Null,
+                "suggestedNextCheck": suggested_next_check_for_failure("diagnostic_parse_failed"),
+            }));
+            continue;
+        };
+        if let Some(cutoff) = cutoff
+            && let Some(ts) = parse_diagnostic_ts(&event["ts"])
+            && ts < cutoff
+        {
+            continue;
+        }
+        if let Some(filter) = params.run_id.as_deref()
+            && event.get("runId").and_then(|v| v.as_str()) != Some(filter)
+        {
+            continue;
+        }
+        if let Some(failure) = diagnostics_failure_from_event(&event, &path_hint) {
+            failures.push(failure);
+        }
+    }
+    failures.reverse();
+    failures.truncate(params.limit);
+    failures
+}
+
+fn run_diagnostics_report(
+    stdout: &mut impl Write,
+    id: Option<u64>,
+    payload: Option<&serde_json::Value>,
+) -> std::io::Result<()> {
+    let params = diagnostics_report_params(payload);
+    let data_dir = record::app_data_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "data dir unavailable".into());
+    let runs_dir = record::record_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "runs dir unavailable".into());
+    let diagnostic_log = diag::diagnostic_log_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "diagnostic log unavailable".into());
+
+    write_msg(
+        stdout,
+        &IpcMessage {
+            kind: "diagnosticsReport".into(),
+            id,
+            payload: Some(serde_json::json!({
+                "schemaVersion": 1,
+                "dataDir": data_dir,
+                "runsDir": runs_dir,
+                "diagnosticLog": diagnostic_log,
+                "latestRuns": latest_run_records(&params),
+                "failures": diagnostic_failures(&params),
+                "nextChecks": [
+                    "运行 swift run AgentDeck -- --selfcheck",
+                    "运行 swift run AgentDeck -- --diagnostics-report --json",
+                    "按 runId 同时过滤 diagnostic.log 与 runs/*.jsonl"
+                ],
+            })),
+        },
+    )
+}
+
 fn main() -> std::io::Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -743,6 +998,9 @@ fn main() -> std::io::Result<()> {
             }
             "selfcheck/logging" => {
                 run_logging_selfcheck(&mut stdout, msg.id)?;
+            }
+            "diagnostics/report" => {
+                run_diagnostics_report(&mut stdout, msg.id, msg.payload.as_ref())?;
             }
             "history/listThreads" => {
                 let params = history_list_params(msg.payload.as_ref());
@@ -899,5 +1157,26 @@ mod tests {
         for _ in 0..1000 {
             assert!(ids.insert(new_run_id()));
         }
+    }
+
+    #[test]
+    fn diagnostics_failure_from_event_uses_stable_code() {
+        let event = json!({
+            "level": "warning",
+            "code": "record_write_failed",
+            "message": "run record write failed",
+            "runId": "run_1",
+            "threadId": "thread_1",
+            "eventSeq": 12
+        });
+
+        let failure = diagnostics_failure_from_event(&event, "/tmp/run_1.jsonl").unwrap();
+
+        assert_eq!(failure["code"], "record_write_failed");
+        assert_eq!(failure["severity"], "warning");
+        assert_eq!(failure["runId"], "run_1");
+        assert_eq!(failure["threadId"], "thread_1");
+        assert_eq!(failure["eventSeq"], 12);
+        assert_eq!(failure["pathHint"], "/tmp/run_1.jsonl");
     }
 }

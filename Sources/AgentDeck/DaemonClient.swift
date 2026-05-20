@@ -157,6 +157,29 @@ final class DaemonClient {
         return payload
     }
 
+    func diagnosticsReport(limit: Int? = 50, sinceSeconds: Int? = 3600, runId: String? = nil) throws -> [String: Any] {
+        var requestPayload: [String: Any] = [:]
+        if let limit { requestPayload["limit"] = limit }
+        if let sinceSeconds { requestPayload["sinceSeconds"] = sinceSeconds }
+        if let runId, !runId.isEmpty { requestPayload["runId"] = runId }
+
+        let reply = try roundTrip(IpcMessage(
+            kind: "diagnostics/report",
+            id: 9,
+            payload: requestPayload.isEmpty ? nil : AnyCodable(requestPayload)
+        ))
+        guard reply.kind == "diagnosticsReport",
+              let payload = reply.payload?.value as? [String: Any] else {
+            if reply.kind == "error",
+               let dict = reply.payload?.value as? [String: Any],
+               let message = dict["message"] as? String {
+                throw DaemonError.malformedReply(message)
+            }
+            throw DaemonError.malformedReply("expected diagnosticsReport, got \(reply.kind)")
+        }
+        return payload
+    }
+
     static func historyListRequest(
         id: UInt64,
         cwd: String?,

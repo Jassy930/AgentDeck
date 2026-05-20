@@ -51,6 +51,22 @@ struct IpcMessageTests {
         #expect(!wire.contains("codex"))
         #expect(!wire.contains("openai"))
     }
+
+    @Test("diagnostics report request is neutral and machine readable")
+    func diagnosticsReportRequestIsNeutral() throws {
+        let msg = IpcMessage(
+            kind: "diagnostics/report",
+            id: 9,
+            payload: AnyCodable(["limit": 20, "sinceSeconds": 3600])
+        )
+
+        let data = try JSONEncoder().encode(msg)
+        let decoded = try JSONDecoder().decode(IpcMessage.self, from: data)
+        let wire = String(data: data, encoding: .utf8)!.lowercased()
+        #expect(decoded.kind == "diagnostics/report")
+        #expect(!wire.contains("codex"))
+        #expect(!wire.contains("openai"))
+    }
 }
 
 @Suite("BufferedLineReader framing")
