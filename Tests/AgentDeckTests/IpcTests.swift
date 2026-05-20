@@ -209,6 +209,29 @@ struct SessionRenderThrottlingTests {
         #expect(model.items.map(\.text) == ["new prompt", "new answer"])
     }
 
+    @Test("applying history detail resets the conversation viewport identity")
+    func applyingHistoryDetailResetsConversationViewportIdentity() {
+        let model = SessionModel()
+        let firstThread = HistoryThreadSummary(id: "thread_a", name: nil, preview: "old", cwd: "/tmp/project", createdAt: 1, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli")
+        let secondThread = HistoryThreadSummary(id: "thread_b", name: nil, preview: "new", cwd: "/tmp/project", createdAt: 3, updatedAt: 4, status: "ready", modelProvider: "openai", source: "cli")
+        let initialIdentity = model.conversationViewportIdentity
+
+        model.applyHistoryThreadDetail(HistoryThreadDetail(
+            thread: firstThread,
+            items: [HistoryReplayItem(id: "item-1", lifecycle: "completed", kind: "message", text: "old answer")]
+        ))
+        let firstIdentity = model.conversationViewportIdentity
+
+        model.applyHistoryThreadDetail(HistoryThreadDetail(
+            thread: secondThread,
+            items: [HistoryReplayItem(id: "item-1", lifecycle: "completed", kind: "message", text: "new answer")]
+        ))
+
+        #expect(firstIdentity != initialIdentity)
+        #expect(model.conversationViewportIdentity != firstIdentity)
+        #expect(model.conversationViewportIdentity.hasPrefix("history:thread_b:"))
+    }
+
     @Test("applying history detail preserves web search replay fields")
     func applyingHistoryDetailPreservesWebSearchFields() {
         let model = SessionModel()
@@ -464,7 +487,9 @@ struct HistoryModelTests {
             threadId: "h1",
             selectedThreadId: nil,
             openingThreadId: "h1",
-            hoveredThreadId: nil
+            hoveredThreadId: nil,
+            modelProvider: "openai",
+            source: "cli"
         )
 
         #expect(idle.usesFullRowHitTarget)
@@ -474,6 +499,8 @@ struct HistoryModelTests {
         #expect(opening.visualState == .opening)
         #expect(selected.isEmphasized)
         #expect(opening.isEmphasized)
+        #expect(opening.agentSourceLabel == "Codex")
+        #expect(opening.agentSourceImageName == "CodexIcon")
     }
 
     @Test("history replay item tolerates per-kind missing fields")

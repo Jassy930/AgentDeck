@@ -21,7 +21,10 @@ let package = Package(
             dependencies: [
                 .product(name: "Textual", package: "textual"),
             ],
-            path: "Sources/AgentDeck"
+            path: "Sources/AgentDeck",
+            resources: [
+                .process("Resources"),
+            ]
         ),
         .testTarget(
             name: "AgentDeckTests",

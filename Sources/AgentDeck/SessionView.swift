@@ -206,7 +206,9 @@ struct SessionView: View {
             threadId: thread.id,
             selectedThreadId: model.selectedHistoryThreadId,
             openingThreadId: model.openingHistoryThreadId,
-            hoveredThreadId: hoveredHistoryThreadId
+            hoveredThreadId: hoveredHistoryThreadId,
+            modelProvider: thread.modelProvider,
+            source: thread.source
         )
 
         return Button {
@@ -218,6 +220,7 @@ struct SessionView: View {
                     .frame(width: 3)
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
+                        historyThreadAgentIcon(presentation)
                         Text(thread.displayTitle)
                             .font(.system(.callout, weight: presentation.isEmphasized ? .medium : .regular))
                             .foregroundStyle(presentation.isEmphasized ? .primary : .secondary)
@@ -259,7 +262,7 @@ struct SessionView: View {
             }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Open \(thread.displayTitle)")
+        .accessibilityLabel("Open \(presentation.agentSourceLabel) thread, \(thread.displayTitle)")
         .accessibilityHint("Opens the saved thread in the conversation view")
         .contextMenu {
             Button("Rename") {
@@ -294,6 +297,46 @@ struct SessionView: View {
         }
     }
 
+    @ViewBuilder
+    private func historyThreadAgentIcon(_ presentation: HistoryThreadRowPresentation) -> some View {
+        if let image = historyThreadAgentImage(named: presentation.agentSourceImageName) {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 14, height: 14)
+                .help(presentation.agentSourceLabel)
+                .accessibilityHidden(true)
+        } else {
+            Image(systemName: "questionmark.circle")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Color(nsColor: .secondaryLabelColor))
+                .frame(width: 14, height: 14)
+                .help(presentation.agentSourceLabel)
+                .accessibilityHidden(true)
+        }
+    }
+
+    private func historyThreadAgentImage(named name: String) -> NSImage? {
+        let resource: (subdirectory: String, filename: String)
+        switch name {
+        case "CodexIcon":
+            resource = ("Assets.xcassets/CodexIcon.imageset", "codex-color")
+        case "UnknownAgentIcon":
+            resource = ("Assets.xcassets/UnknownAgentIcon.imageset", "unknown-agent")
+        default:
+            return nil
+        }
+
+        guard let url = Bundle.module.url(
+            forResource: resource.filename,
+            withExtension: "svg",
+            subdirectory: resource.subdirectory
+        ) else {
+            return nil
+        }
+        return NSImage(contentsOf: url)
+    }
+
     // MARK: D3/D7 — single-column stream, NON-CARD
 
     private var conversationStream: some View {
@@ -313,6 +356,7 @@ struct SessionView: View {
             .padding(.horizontal, 20)
             .padding(.vertical, 12)
         }
+        .id(model.conversationViewportIdentity)
     }
 
     @ViewBuilder

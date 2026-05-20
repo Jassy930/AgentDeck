@@ -64,12 +64,16 @@ struct HistoryThreadRowPresentation: Equatable {
 
     let visualState: VisualState
     let usesFullRowHitTarget = true
+    let agentSourceLabel: String
+    let agentSourceImageName: String
 
     init(
         threadId: String,
         selectedThreadId: String?,
         openingThreadId: String?,
-        hoveredThreadId: String?
+        hoveredThreadId: String?,
+        modelProvider: String = "",
+        source: String = ""
     ) {
         if openingThreadId == threadId {
             visualState = .opening
@@ -80,10 +84,34 @@ struct HistoryThreadRowPresentation: Equatable {
         } else {
             visualState = .idle
         }
+
+        let marker = HistoryAgentSourceMarker(modelProvider: modelProvider, source: source)
+        agentSourceLabel = marker.label
+        agentSourceImageName = marker.imageName
     }
 
     var isEmphasized: Bool {
         visualState == .selected || visualState == .opening
+    }
+}
+
+struct HistoryAgentSourceMarker: Equatable {
+    let label: String
+    let imageName: String
+
+    init(modelProvider: String, source: String) {
+        let normalizedProvider = modelProvider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let normalizedSource = source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+        if normalizedProvider.contains("openai")
+            || normalizedSource.contains("codex")
+            || normalizedSource == "cli" {
+            label = "Codex"
+            imageName = "CodexIcon"
+        } else {
+            label = normalizedSource.isEmpty ? "Unknown agent" : source
+            imageName = "UnknownAgentIcon"
+        }
     }
 }
 

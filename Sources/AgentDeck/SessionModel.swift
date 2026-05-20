@@ -127,6 +127,7 @@ final class SessionModel {
     var lastHistoryOpenTiming: HistoryOpenTiming?
     var historySearchTerm = ""
     var selectedHistoryThreadId: String?
+    var conversationViewportIdentity = "live:0"
     private var didRequestInitialHistoryRefresh = false
 
     var historyGroups: [HistoryProjectGroup] {
@@ -141,6 +142,7 @@ final class SessionModel {
     private var renderFlushTimer: Timer?
     private let renderFlushInterval: TimeInterval = 1.0 / 30.0
     private let largeHistoryTextThreshold = 16 * 1024
+    private var conversationViewportRevision = 0
 
     enum DeferredContent {
         case output
@@ -335,6 +337,7 @@ final class SessionModel {
         flushPendingAgentItems()
         cwd = URL(fileURLWithPath: detail.thread.cwd)
         selectedHistoryThreadId = detail.thread.id
+        resetConversationViewport(prefix: "history:\(detail.thread.id)")
         itemIndexById.removeAll(keepingCapacity: true)
         items = detail.items.map { uiItem(from: $0, threadId: detail.thread.id) }
         for (index, item) in items.enumerated() {
@@ -347,10 +350,16 @@ final class SessionModel {
     func startNewSessionFromCurrentProject() {
         selectedHistoryThreadId = nil
         openingHistoryThreadId = nil
+        resetConversationViewport(prefix: "live")
         items.removeAll()
         itemIndexById.removeAll(keepingCapacity: true)
         errorMessage = nil
         phase = cwd == nil ? .idle : .ready
+    }
+
+    private func resetConversationViewport(prefix: String) {
+        conversationViewportRevision += 1
+        conversationViewportIdentity = "\(prefix):\(conversationViewportRevision)"
     }
 
     func archiveHistoryThread(_ thread: HistoryThreadSummary) {
