@@ -137,6 +137,22 @@ struct SessionRenderThrottlingTests {
         #expect(model.items[0].text == "final")
     }
 
+    @Test("daemon warning is visible without failing the turn")
+    func daemonWarningIsVisibleWithoutFailingTheTurn() {
+        let model = SessionModel()
+        model.phase = .running
+
+        model.ingest(IpcMessage(
+            kind: "warning",
+            id: nil,
+            payload: AnyCodable(["message": "本次未留痕: HOME not set"])
+        ))
+
+        #expect(model.warningMessage == "本次未留痕: HOME not set")
+        #expect(model.errorMessage == nil)
+        #expect(model.phase == .running)
+    }
+
     @Test("loading history groups threads without clearing current stream")
     func loadingHistoryDoesNotClearCurrentStream() {
         let model = SessionModel()

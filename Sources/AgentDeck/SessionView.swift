@@ -254,6 +254,9 @@ struct SessionView: View {
                 if let err = model.errorMessage {
                     errorRow(err)               // premise 9: visible failure
                 }
+                if let warning = model.warningMessage {
+                    warningRow(warning)
+                }
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 12)
@@ -672,6 +675,17 @@ struct SessionView: View {
             Text(msg)
                 .font(.system(.callout))
                 .foregroundStyle(.red)
+        }
+        .padding(.vertical, 10)
+    }
+
+    private func warningRow(_ msg: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text(msg)
+                .font(.system(.callout))
+                .foregroundStyle(.orange)
         }
         .padding(.vertical, 10)
     }
