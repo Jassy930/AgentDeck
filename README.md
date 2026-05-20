@@ -54,6 +54,21 @@ codex app-server  (子进程, JSON-RPC over stdio)
 message / reasoning / shell / diff 长文本交给 AppKit `NSTextView` +
 `NSTextStorage` 增量追加，避免 SwiftUI `Text` 在 token 流中反复测量整段文本。
 
+## 历史会话
+
+AgentDeck 可以通过 Codex app-server 扫描 Codex 已持久化的历史
+thread，并按项目 `cwd` 分组显示。点击历史 thread 后，AgentDeck 会读取
+`thread/read(includeTurns: true)` 返回的 turns/items，并用同一套中立
+`AgentItem` stream 回放到右侧。
+
+继续历史会话时，AgentDeck 走 `thread/resume(threadId)` 后再执行
+`turn/start`，因此新 prompt 会进入原有 Codex 上下文，而不是创建新
+thread。AgentDeck 只做轻量索引、回放和管理入口；Codex 持久化历史仍是
+上下文真相源。
+
+第一版管理动作保持低风险：刷新、搜索、重命名和归档。AgentDeck 不读取、
+保存或转发 Codex token。
+
 ## 构建
 
 前置：Rust（`cargo`）、Swift 6 / Xcode（macOS 14+）、`codex` CLI 已
