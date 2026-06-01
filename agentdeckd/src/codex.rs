@@ -78,6 +78,28 @@ fn locate_codex() -> Option<String> {
     None
 }
 
+fn codex_child_path_env(base: Option<&str>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for path in [
+        "/usr/local/bin",
+        "/opt/homebrew/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ] {
+        parts.push(path.into());
+    }
+    if let Some(base) = base {
+        for path in base.split(':').filter(|p| !p.is_empty()) {
+            if !parts.iter().any(|existing| existing == path) {
+                parts.push(path.into());
+            }
+        }
+    }
+    parts.join(":")
+}
+
 pub struct CodexAdapter {
     child: Child,
     stdin: ChildStdin,
@@ -90,12 +112,14 @@ impl CodexAdapter {
     /// is in the daemon's process group; killed on daemon exit (Drop impl).
     pub fn spawn() -> Result<Self, CodexError> {
         let codex = locate_codex().ok_or(CodexError::NotFound)?;
+        let child_path = codex_child_path_env(std::env::var("PATH").ok().as_deref());
         let mut child = Command::new(codex)
             .arg("app-server")
             // stdio:// is the default transport (verified Step 0).
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .env("PATH", child_path)
             // A1 second layer + Codex #11: put the child in its OWN process
             // group. The `codex` CLI re-execs / forks the real app-server
             // (and MCP servers, sandbox helpers) as children; killing only
@@ -1749,5 +1773,16 @@ mod tests {
             "/tmp/project"
         );
         assert_eq!(permissions["scope"], "turn");
+    }
+
+    #[test]
+    fn codex_child_path_includes_common_gui_missing_tool_dirs() {
+        let path = codex_child_path_env(Some("/usr/bin:/bin"));
+        let parts: Vec<&str> = path.split(':').collect();
+
+        assert!(parts.contains(&"/usr/local/bin"));
+        assert!(parts.contains(&"/opt/homebrew/bin"));
+        assert!(parts.contains(&"/usr/bin"));
+        assert!(parts.contains(&"/bin"));
     }
 }

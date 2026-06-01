@@ -46,7 +46,7 @@ SwiftPM/debug 构建未显式传 `--profile` 时也会默认使用 dev profile�
 | `adapter_unhandled_method` | app-server 协议出现未识别事件 | 查看 raw record 和 schema |
 | `ipc_malformed_jsonl` | Swift/Rust IPC 收到坏 JSONL | 查看上一条 IPC line |
 | `daemon_spawn_failed` | Swift 无法启动 daemon | 检查 `agentdeckd` 路径 |
-| `app_server_handshake_failed` | app-server 握手失败 | 检查 agent 登录和版本 |
+| `app_server_handshake_failed` | app-server 握手失败 | 检查 agent 登录、版本和 GUI 启动环境里的 `PATH` / `node` |
 | `turn_failed` | turn 执行失败 | 按 runId 查看 run record |
 | `approval_wait_stalled` | turn 正在等待用户审批 | 查看当前 runtime 的 `actionRequest`，确认 UI 是否已回写 `actionDecision` |
 
