@@ -2412,4 +2412,167 @@ mod tests {
         assert_eq!(first["kind"], "message");
         assert_eq!(first["text"], "stale");
     }
+
+    // --- C4: session 边界 ---
+    //
+    // wire 协议里"session/connection 生命周期"事件是 `thread/started` 和
+    // `thread/closed`（SPIKE_FINDINGS.md + protocol/codex_app_server_protocol
+    // .v2.schemas.json）。codex.rs 本身无 session 状态，也不拥有 transport：
+    // `AgentItem` 没有 session_id/thread_id 字段（session_id 在 IPC envelope，
+    // 见 ipc.rs），`translate()` 是无状态 per-event 翻译。下面 3 个测试钉死
+    // 该层真正负责的契约——"生命周期事件不变成 AgentItem"、"无门禁/无缓冲、
+    // 无论顺序如何 item 事件都独立翻译"、"transport close 不归此层"——把
+    // session 状态机 / transport 关闭 / 缓冲的责任明确划到 main.rs 调用方。
+    // 见 docs/plans/.../design.md 风险与权衡 C4 小节的记录。
+
+    #[test]
+    fn translate_does_not_gate_item_events_on_thread_started_notification() {
+        // Reshape: 计划写"session.started 前事件被缓冲"。wire 协议里既没有
+        // `session.started` 也没有"缓冲"概念——连接生命周期通知是
+        // `thread/started`（params: {thread}），codex.rs 是无状态翻译层。
+        // 真实可测契约拆成两条：
+        //   (a) `thread/started` 通知本身不是 item 通知，translate 返回 None
+        //       （连接生命周期事件由 main.rs 边界消费，不变成 AgentItem）。
+        //   (b) translate 不做"必须先看到 thread/started"门禁：item 事件
+        //       即使在没有任何前导通知的情况下来到，依然被独立翻译输出。
+        //       这证明"缓冲 / 丢弃"责任不在 codex.rs。
+        assert!(
+            translate(
+                "thread/started",
+                &json!({
+                    "thread": {
+                        "id": "thread_c4",
+                        "sessionId": "session_c4",
+                        "cwd": "/tmp/project",
+                        "status": "ready",
+                        "preview": "",
+                        "createdAt": 0,
+                        "updatedAt": 0,
+                        "cliVersion": "0.0.0",
+                        "ephemeral": false,
+                        "modelProvider": "openai",
+                        "source": "cli",
+                        "turns": []
+                    }
+                }),
+            )
+            .is_none(),
+            "thread/started is a connection-lifecycle notification, not an AgentItem"
+        );
+
+        // 没有任何前导 thread/started，item 事件依然被翻译为 AgentItem。
+        let early = translate(
+            "item/agentMessage/delta",
+            &json!({
+                "itemId": "msg_early",
+                "delta": "arrived before any lifecycle event",
+                "threadId": "thread_c4",
+                "turnId": "turn_c4",
+            }),
+        )
+        .expect("translate is stateless: no session gating");
+        assert_eq!(early.id, "msg_early");
+        assert!(matches!(early.lifecycle, Lifecycle::Delta));
+        match early.kind {
+            AgentItemKind::Message { text, .. } => {
+                assert_eq!(text, "arrived before any lifecycle event");
+            }
+            other => panic!("expected Message delta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thread_closed_notification_does_not_translate_and_transport_close_is_not_this_layer() {
+        // Reshape: 计划写"session.ended 触发 transport close signal"。codex.rs
+        // 不拥有 transport（child / stdin / stdout / reader 都是 CodexAdapter
+        // 的私有字段，关闭由 `Drop for CodexAdapter` 在外部进程结束时执行）。
+        // wire 上的"session ended"等价物是 `thread/closed` 通知，schema 为
+        // `{threadId}`。真实可测契约：
+        //   (a) `thread/closed` 不变成 AgentItem（translate 返回 None）；
+        //   (b) `thread/closed` 之后到达的 item 事件仍被翻译——"close 之后
+        //       拒收"不是此层职责。
+        // 这把"transport close signal"明确推到 main.rs / CodexAdapter::Drop。
+        assert!(
+            translate(
+                "thread/closed",
+                &json!({"threadId": "thread_c4"}),
+            )
+            .is_none(),
+            "thread/closed is a lifecycle notification, not an AgentItem"
+        );
+
+        let after_close = translate(
+            "item/agentMessage/delta",
+            &json!({
+                "itemId": "msg_after_close",
+                "delta": "after thread/closed",
+                "threadId": "thread_c4",
+                "turnId": "turn_c4",
+            }),
+        )
+        .expect("translate has no close-gating: stale items still translate");
+        assert_eq!(after_close.id, "msg_after_close");
+        assert!(matches!(after_close.lifecycle, Lifecycle::Delta));
+    }
+
+    #[test]
+    fn repeated_thread_started_with_different_session_ids_do_not_contaminate_translate() {
+        // Reshape: 计划写"重复 session_started，以最新为准、旧 session 状态
+        // 被清理"。codex.rs 不持有 session 状态——`AgentItem` 没有 session_id
+        // 字段（session_id 只存在于 IPC envelope，由 main.rs 在写出时填充，
+        // 见 ipc.rs::IpcMessage）。可测的等价契约：translate 对多次
+        // `thread/started`（即便 sessionId 不同）一致返回 None，并且其间到达
+        // 的 item 事件的 AgentItem 输出与 sessionId 完全无关——序列化后不
+        // 包含任何 sessionId 字符串。这证明 codex.rs 没有"旧 session 状态
+        // 残留可被污染"的对象，"以最新 session 为准"的责任明确归 main.rs。
+        for session_id in ["session_old", "session_new"] {
+            assert!(
+                translate(
+                    "thread/started",
+                    &json!({
+                        "thread": {
+                            "id": "thread_c4",
+                            "sessionId": session_id,
+                            "cwd": "/tmp/project",
+                            "status": "ready",
+                            "preview": "",
+                            "createdAt": 0,
+                            "updatedAt": 0,
+                            "cliVersion": "0.0.0",
+                            "ephemeral": false,
+                            "modelProvider": "openai",
+                            "source": "cli",
+                            "turns": []
+                        }
+                    }),
+                )
+                .is_none(),
+                "thread/started must never surface as an AgentItem, regardless of sessionId"
+            );
+        }
+
+        // 同一 itemId 的 delta 在两次"重连"之间到达——AgentItem 输出与
+        // sessionId 解耦：sessionId 既不进 id，也不进任何序列化字段。
+        let between = translate(
+            "item/agentMessage/delta",
+            &json!({
+                "itemId": "msg_between",
+                "delta": "between reconnects",
+                "threadId": "thread_c4",
+                "turnId": "turn_c4",
+                "sessionId": "session_new",
+            }),
+        )
+        .expect("delta translates without referencing any session state");
+        assert_eq!(between.id, "msg_between");
+        let wire = serde_json::to_string(&between).unwrap();
+        assert!(
+            !wire.contains("session_old"),
+            "stale sessionId leaked into AgentItem wire: {wire}"
+        );
+        assert!(
+            !wire.contains("session_new"),
+            "sessionId must live in the IPC envelope, not the AgentItem: {wire}"
+        );
+    }
 }
