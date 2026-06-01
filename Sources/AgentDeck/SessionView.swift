@@ -188,14 +188,27 @@ struct SessionView: View {
 
     private func historyGroup(_ group: HistoryProjectGroup) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text(group.projectName)
-                .font(.system(.caption, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .padding(.horizontal, 12)
-                .padding(.top, 10)
-                .padding(.bottom, 4)
+            HStack(spacing: 6) {
+                Text(group.projectName)
+                    .font(.system(.caption, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 4)
+                Button {
+                    model.startNewSession(inProjectCwd: group.cwd)
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(width: 18, height: 18)
+                }
+                .buttonStyle(.borderless)
+                .help("New session in \(group.projectName)")
+                .accessibilityLabel("New session in \(group.projectName)")
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+            .padding(.bottom, 4)
             ForEach(group.threads) { thread in
                 historyThreadRow(thread)
             }

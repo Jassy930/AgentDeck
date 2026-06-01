@@ -618,6 +618,28 @@ struct SessionRenderThrottlingTests {
         #expect(model.workbench.selectedSessionId == nil)
     }
 
+    @Test("starting new session from history group switches project")
+    func startNewSessionFromHistoryGroupSwitchesProject() {
+        let model = SessionModel()
+        let thread = HistoryThreadSummary(id: "h1", name: nil, preview: "old", cwd: "/tmp/old-project", createdAt: 1, updatedAt: 2, status: "ready", modelProvider: "openai", source: "cli")
+        let detail = HistoryThreadDetail(
+            thread: thread,
+            items: [
+                HistoryReplayItem(id: "a1", lifecycle: "completed", kind: "message", text: "old answer"),
+            ]
+        )
+
+        model.applyHistoryThreadDetail(detail)
+        model.startNewSession(inProjectCwd: "/tmp/new-project")
+
+        #expect(model.cwd?.path == "/tmp/new-project")
+        #expect(model.selectedHistoryThreadId == nil)
+        #expect(model.selectedItems.isEmpty)
+        #expect(model.workbench.selectedSessionId == nil)
+        #expect(model.selectedPhase == .ready)
+        #expect(model.conversationViewportIdentity.hasPrefix("live:"))
+    }
+
     @Test("applying history detail preserves web search replay fields")
     func applyingHistoryDetailPreservesWebSearchFields() {
         let model = SessionModel()

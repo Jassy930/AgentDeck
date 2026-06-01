@@ -470,6 +470,11 @@ final class SessionModel {
         phase = cwd == nil ? .idle : .ready
     }
 
+    func startNewSession(inProjectCwd projectCwd: String) {
+        cwd = URL(fileURLWithPath: projectCwd)
+        startNewSessionFromCurrentProject()
+    }
+
     private func resetConversationViewport(prefix: String) {
         conversationViewportRevision += 1
         conversationViewportIdentity = "\(prefix):\(conversationViewportRevision)"
