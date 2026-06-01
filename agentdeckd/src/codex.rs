@@ -2064,7 +2064,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_pending_then_denied_blocks_action() {
+    fn approval_deny_to_decline_and_failed_completion_maps_to_shell() {
         // Reshape: codex.rs 没有"deny 后续 action_request 被拒绝"的逻辑
         // （这层不跟踪后续命令是否被尝试执行）。这里钉死适配器真正负责
         // 的两件事：(a) deny 决策翻译成 wire decline；(b) Codex 在收到
