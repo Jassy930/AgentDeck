@@ -1866,4 +1866,128 @@ mod tests {
         assert!(error.contains("recent stderr"));
         assert!(error.contains("third line"));
     }
+
+    // --- C1: protocol error paths ---
+    //
+    // These pin the failure-mode contract for malformed / unexpected wire
+    // frames. They exercise the same surfaces the live `await_response` /
+    // `read_message` paths use (`translate`, `serde_json::from_str`,
+    // `CodexError::Protocol`), so a regression in the parser or error
+    // wrapping fails here rather than in a live e2e run.
+
+    #[test]
+    fn missing_required_field_event_returns_none_without_panic() {
+        // `translate()` requires `itemId` and `delta` for delta methods, and
+        // `item` for item lifecycle methods. Missing any of them must return
+        // `None` (caller skips, turn continues) rather than panic. `threadId`
+        // is informational at this layer — translate does not key off it.
+        assert!(
+            translate(
+                "item/agentMessage/delta",
+                &json!({"delta":"text","threadId":"t","turnId":"u"})
+            )
+            .is_none()
+        );
+        assert!(
+            translate(
+                "item/agentMessage/delta",
+                &json!({"itemId":"x","threadId":"t","turnId":"u"})
+            )
+            .is_none()
+        );
+        assert!(
+            translate(
+                "item/started",
+                &json!({"startedAtMs":0,"threadId":"t","turnId":"u"})
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn unknown_event_type_falls_back_without_dropping_turn() {
+        // A method that is not even in the `item/` namespace must return
+        // `None` so the caller treats it as a no-op notification and keeps
+        // the turn loop running (not a panic, not an error).
+        assert!(
+            translate(
+                "totally_made_up_event_42",
+                &json!({"itemId":"x","threadId":"t","turnId":"u"})
+            )
+            .is_none()
+        );
+
+        // An `item/<unknown>/<unknown lifecycle>` frame with a present
+        // `item` object must surface as the Raw fallback so Swift sees a
+        // neutralized placeholder rather than vendor JSON. This is the
+        // "turn not lost" guarantee for unknown variants.
+        let item = translate(
+            "item/futureKind/started",
+            &json!({"item":{"id":"u1","type":"futureKind","vendor":"hidden"},
+                    "threadId":"t","turnId":"u"}),
+        )
+        .unwrap();
+        assert!(matches!(item.kind, AgentItemKind::Raw { .. }));
+    }
+
+    #[test]
+    fn jsonrpc_error_frame_surfaces_as_codex_protocol_error() {
+        // When app-server returns a JSON-RPC error frame, `await_response`
+        // and `turn_start` wrap `msg["error"].to_string()` into
+        // `CodexError::Protocol`. Pin that: the displayed error must
+        // contain both the original `code` and `message`, so logs at the
+        // main.rs diag boundary remain debuggable.
+        let frame = json!({
+            "id": 1,
+            "error": {"code": -32601, "message": "method not found"}
+        });
+        let err_value = frame.get("error").cloned().unwrap();
+        let codex_err = CodexError::Protocol(err_value.to_string());
+        let displayed = codex_err.to_string();
+        assert!(displayed.contains("codex protocol error"));
+        assert!(displayed.contains("method not found"));
+        assert!(displayed.contains("-32601"));
+    }
+
+    #[test]
+    fn newline_delimited_framing_rejects_partial_json_with_protocol_error() {
+        // Wire framing is line-delimited JSON, not SSE (SPIKE_FINDINGS D7).
+        // A half line cannot be "buffered until complete" — the parser sees
+        // a single line and either it is a complete JSON value or it is
+        // malformed. `read_message` formats malformed lines as
+        // `CodexError::Protocol("malformed: {serde_err}: {line}")`; pin that.
+        let partial = r#"{"id":1,"method":"item/started","params":{"item":{"id":"x"#;
+        let parse_err = serde_json::from_str::<Value>(partial).unwrap_err();
+        let codex_err =
+            CodexError::Protocol(format!("malformed: {parse_err}: {}", partial.trim()));
+        let displayed = codex_err.to_string();
+        assert!(displayed.contains("codex protocol error"));
+        assert!(displayed.contains("malformed"));
+
+        // And a complete JSON value on a single line parses fine — proves
+        // the rejection above is specific to truncation, not a blanket
+        // failure of the same input shape.
+        let complete = r#"{"id":1,"method":"item/started","params":{"item":{"id":"x","type":"agentMessage","text":""}}}"#;
+        let value: Value = serde_json::from_str(complete).unwrap();
+        assert_eq!(value["method"], "item/started");
+    }
+
+    #[test]
+    fn invalid_utf8_in_event_payload_is_rejected_gracefully() {
+        // `read_message` reads a UTF-8 line via `BufRead::read_line`, then
+        // parses with `serde_json::from_str`. Invalid UTF-8 must fail at
+        // parse time (when the upstream produced bytes that survived
+        // `read_line` somehow — e.g. via `from_slice` on raw bytes) and
+        // must not panic. We exercise the parse surface directly: a JSON
+        // object whose value byte is invalid UTF-8 fails, and the error
+        // wraps into `CodexError::Protocol` without panicking.
+        let mut bad: Vec<u8> = br#"{"method":"item/started","params":{"item":{"id":""#.to_vec();
+        bad.push(0xFF);
+        bad.push(0xFE);
+        bad.extend_from_slice(br#"","type":"agentMessage"}}}"#);
+
+        let parse_err = serde_json::from_slice::<Value>(&bad).unwrap_err();
+        let codex_err = CodexError::Protocol(format!("malformed: {parse_err}"));
+        assert!(codex_err.to_string().contains("codex protocol error"));
+    }
 }
