@@ -4,6 +4,15 @@ enum AgentDeckProfile: String, Equatable {
     case stable
     case dev
 
+    var windowTitle: String {
+        switch self {
+        case .stable:
+            "AgentDeck"
+        case .dev:
+            "AgentDeck Dev"
+        }
+    }
+
     static func parse(arguments: [String] = CommandLine.arguments) throws -> AgentDeckProfile {
         guard let raw = argumentValue(after: "--profile", in: arguments) else {
             return .stable
@@ -125,7 +134,7 @@ struct AgentDeckApp: App {
     @NSApplicationDelegateAdaptor(AppActivator.self) var activator
 
     var body: some Scene {
-        WindowGroup("AgentDeck") {     // D3: title bar reads "AgentDeck"
+        WindowGroup(launchProfile.windowTitle) {
             SessionView()
         }
         .windowResizability(.contentSize)

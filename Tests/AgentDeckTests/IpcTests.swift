@@ -110,6 +110,12 @@ struct AppLaunchProfileTests {
         #expect(env["PATH"] == "/bin")
         #expect(env["AGENTDECK_PROFILE"] == "dev")
     }
+
+    @Test("window title marks dev profile")
+    func windowTitleMarksDevProfile() {
+        #expect(AgentDeckProfile.stable.windowTitle == "AgentDeck")
+        #expect(AgentDeckProfile.dev.windowTitle == "AgentDeck Dev")
+    }
 }
 
 @Suite("Daemon message routing")
