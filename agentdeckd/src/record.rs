@@ -26,12 +26,14 @@ use std::path::PathBuf;
 pub fn app_data_dir() -> Option<PathBuf> {
     app_data_dir_from(
         std::env::var_os("AGENTDECK_DATA_DIR").as_deref(),
+        std::env::var_os("AGENTDECK_PROFILE").as_deref(),
         std::env::var_os("HOME").as_deref(),
     )
 }
 
 pub fn app_data_dir_from(
     agentdeck_data_dir: Option<&OsStr>,
+    agentdeck_profile: Option<&OsStr>,
     home: Option<&OsStr>,
 ) -> Option<PathBuf> {
     if let Some(root) = agentdeck_data_dir
@@ -39,11 +41,20 @@ pub fn app_data_dir_from(
     {
         return Some(PathBuf::from(root));
     }
+    let profile = agentdeck_profile
+        .and_then(|p| p.to_str())
+        .filter(|p| !p.is_empty())
+        .unwrap_or("stable");
+    let app_dir_name = match profile {
+        "stable" => "AgentDeck",
+        "dev" => "AgentDeck-Dev",
+        _ => return None,
+    };
     let home = home?;
     let mut p = PathBuf::from(home);
     p.push("Library");
     p.push("Application Support");
-    p.push("AgentDeck");
+    p.push(app_dir_name);
     Some(p)
 }
 
@@ -54,8 +65,12 @@ pub fn record_dir() -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-fn record_dir_from(agentdeck_data_dir: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
-    let mut p = app_data_dir_from(agentdeck_data_dir, home)?;
+fn record_dir_from(
+    agentdeck_data_dir: Option<&OsStr>,
+    agentdeck_profile: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
+    let mut p = app_data_dir_from(agentdeck_data_dir, agentdeck_profile, home)?;
     p.push("runs");
     Some(p)
 }
@@ -182,10 +197,46 @@ mod tests {
     #[test]
     fn record_dir_respects_agentdeck_data_dir_override() {
         let root = std::env::temp_dir().join(format!("agentdeck-test-{}", std::process::id()));
-        let dir = record_dir_from(Some(root.as_os_str()), None).unwrap();
+        let dir = record_dir_from(Some(root.as_os_str()), None, None).unwrap();
 
         assert!(dir.starts_with(&root));
         assert!(dir.ends_with("runs"));
+    }
+
+    #[test]
+    fn app_data_dir_uses_dev_profile() {
+        let home = std::ffi::OsStr::new("/Users/example");
+        let dir = app_data_dir_from(None, Some(std::ffi::OsStr::new("dev")), Some(home)).unwrap();
+
+        assert_eq!(
+            dir.to_string_lossy(),
+            "/Users/example/Library/Application Support/AgentDeck-Dev"
+        );
+    }
+
+    #[test]
+    fn app_data_dir_uses_stable_by_default() {
+        let home = std::ffi::OsStr::new("/Users/example");
+        let dir = app_data_dir_from(None, None, Some(home)).unwrap();
+
+        assert_eq!(
+            dir.to_string_lossy(),
+            "/Users/example/Library/Application Support/AgentDeck"
+        );
+    }
+
+    #[test]
+    fn app_data_dir_override_wins_over_profile() {
+        let override_dir = std::ffi::OsStr::new("/tmp/agentdeck-custom");
+        let home = std::ffi::OsStr::new("/Users/example");
+        let dir = app_data_dir_from(
+            Some(override_dir),
+            Some(std::ffi::OsStr::new("dev")),
+            Some(home),
+        )
+        .unwrap();
+
+        assert_eq!(dir.to_string_lossy(), "/tmp/agentdeck-custom");
     }
 
     #[test]

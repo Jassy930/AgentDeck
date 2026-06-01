@@ -116,9 +116,10 @@ pub fn diagnostic_log_path() -> Option<PathBuf> {
 #[cfg(test)]
 fn log_path_from(
     agentdeck_data_dir: Option<&std::ffi::OsStr>,
+    agentdeck_profile: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
 ) -> Option<PathBuf> {
-    let mut p = crate::record::app_data_dir_from(agentdeck_data_dir, home)?;
+    let mut p = crate::record::app_data_dir_from(agentdeck_data_dir, agentdeck_profile, home)?;
     p.push("diagnostic.log");
     Some(p)
 }
@@ -174,10 +175,21 @@ mod tests {
     #[test]
     fn log_path_respects_agentdeck_data_dir_override() {
         let root = std::env::temp_dir().join(format!("agentdeck-test-{}", std::process::id()));
-        let path = log_path_from(Some(root.as_os_str()), None).unwrap();
+        let path = log_path_from(Some(root.as_os_str()), None, None).unwrap();
 
         assert!(path.starts_with(&root));
         assert!(path.ends_with("diagnostic.log"));
+    }
+
+    #[test]
+    fn log_path_uses_dev_profile() {
+        let home = std::ffi::OsStr::new("/Users/example");
+        let path = log_path_from(None, Some(std::ffi::OsStr::new("dev")), Some(home)).unwrap();
+
+        assert_eq!(
+            path.to_string_lossy(),
+            "/Users/example/Library/Application Support/AgentDeck-Dev/diagnostic.log"
+        );
     }
 
     #[test]
