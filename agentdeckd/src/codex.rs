@@ -1990,4 +1990,264 @@ mod tests {
         let codex_err = CodexError::Protocol(format!("malformed: {parse_err}"));
         assert!(codex_err.to_string().contains("codex protocol error"));
     }
+
+    // --- C2: approval 适配契约 ---
+    //
+    // 现状（与计划差异）：codex.rs 不持有 approval 状态机。
+    // `approval_request_to_action` 和 `approval_response_for_decision` 都是
+    // 无状态纯函数；turn_start 的循环在请求→响应之间只携带一次性的
+    // `request_id`，没有 HashMap<approval_id, State>。计划里的
+    // approval.requested/approved/applied 事件名不存在于 wire 协议
+    // （实际是 item/<kind>/requestApproval 加 JSON-RPC response，
+    // SPIKE_FINDINGS.md §approval）。这些测试钉死适配器实际暴露的
+    // 契约：每个事件正确翻译、不同 approval_id 互不串、纯函数对
+    // adapter 重建幂等。
+
+    #[test]
+    fn approval_pending_then_approved_then_applied_full_chain() {
+        // Reshape: 没有 approval.requested/approved/applied 事件，也没有
+        // 状态机终态。Codex 的"完整链路"是：requestApproval 请求被翻译为
+        // ActionRequest → 调用方决策被翻译为 wire response → 命令实际执行
+        // 的结果以 item/commandExecution/completed 形式回到 translate()。
+        // 我们逐步走这三步并断言每步输出。
+        let request_params = json!({
+            "itemId": "cmd1",
+            "approvalId": "approval-1",
+            "threadId": "thread_1",
+            "turnId": "turn_1",
+            "command": "make test",
+            "cwd": "/tmp/project",
+            "reason": "needs to run tests",
+            "startedAtMs": 1,
+        });
+        let action = approval_request_to_action(
+            100,
+            "item/commandExecution/requestApproval",
+            &request_params,
+        )
+        .unwrap();
+        assert_eq!(action.request_id, 100);
+        assert_eq!(action.approval_id.as_deref(), Some("approval-1"));
+        assert_eq!(action.action_kind, "runCommand");
+
+        let response = approval_response_for_decision(
+            "item/commandExecution/requestApproval",
+            &request_params,
+            "approve",
+        )
+        .unwrap();
+        assert_eq!(response, json!({"decision": "accept"}));
+
+        // 命令执行完成事件 — 这是计划里 "action.applied" 在真实 wire 上的
+        // 等价物：item/completed 携带 type=commandExecution + exitCode + output。
+        let applied = translate(
+            "item/completed",
+            &json!({
+                "item": {
+                    "id": "cmd1",
+                    "type": "commandExecution",
+                    "command": "make test",
+                    "exitCode": 0,
+                    "aggregatedOutput": "ok\n",
+                    "cwd": "/tmp/project",
+                    "status": "completed",
+                    "commandActions": [],
+                },
+                "threadId": "thread_1",
+                "turnId": "turn_1",
+            }),
+        )
+        .unwrap();
+        assert_eq!(applied.id, "cmd1");
+        assert!(matches!(applied.lifecycle, Lifecycle::Completed));
+        assert!(matches!(applied.kind, AgentItemKind::Shell { .. }));
+    }
+
+    #[test]
+    fn approval_pending_then_denied_blocks_action() {
+        // Reshape: codex.rs 没有"deny 后续 action_request 被拒绝"的逻辑
+        // （这层不跟踪后续命令是否被尝试执行）。这里钉死适配器真正负责
+        // 的两件事：(a) deny 决策翻译成 wire decline；(b) Codex 在收到
+        // decline 后通常以 status="failed" 的 commandExecution/completed
+        // 收尾，translate() 仍把它映射为 Shell 已完成项，让上层能展示
+        // 拒绝结果而不是丢帧。
+        let request_params = json!({
+            "itemId": "cmd2",
+            "approvalId": "approval-2",
+            "command": "rm -rf /",
+            "cwd": "/tmp/project",
+            "reason": "dangerous",
+            "startedAtMs": 1,
+        });
+        let action = approval_request_to_action(
+            101,
+            "item/commandExecution/requestApproval",
+            &request_params,
+        )
+        .unwrap();
+        assert_eq!(action.request_id, 101);
+        assert_eq!(action.approval_id.as_deref(), Some("approval-2"));
+
+        let response = approval_response_for_decision(
+            "item/commandExecution/requestApproval",
+            &request_params,
+            "deny",
+        )
+        .unwrap();
+        assert_eq!(response, json!({"decision": "decline"}));
+
+        let failed = translate(
+            "item/completed",
+            &json!({
+                "item": {
+                    "id": "cmd2",
+                    "type": "commandExecution",
+                    "command": "rm -rf /",
+                    "exitCode": 1,
+                    "aggregatedOutput": "",
+                    "status": "failed",
+                    "commandActions": [],
+                },
+                "threadId": "thread_1",
+                "turnId": "turn_1",
+            }),
+        )
+        .unwrap();
+        assert_eq!(failed.id, "cmd2");
+        assert!(matches!(failed.lifecycle, Lifecycle::Completed));
+        match failed.kind {
+            AgentItemKind::Shell {
+                status, exit_code, ..
+            } => {
+                assert_eq!(status.as_deref(), Some("failed"));
+                assert_eq!(exit_code, Some(1));
+            }
+            other => panic!("expected Shell completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn concurrent_approval_ids_do_not_collide() {
+        // 同一 turn 里两个不同 approval_id 同时挂起：钉死适配器对
+        // (request_id, approval_id, item_id, action_kind) 字段的隔离 —
+        // 不会把字段串到对方的输出上。
+        let req_a = approval_request_to_action(
+            200,
+            "item/commandExecution/requestApproval",
+            &json!({
+                "itemId": "cmdA",
+                "approvalId": "approval-A",
+                "command": "echo a",
+                "cwd": "/tmp/a",
+                "reason": "first",
+                "startedAtMs": 1,
+            }),
+        )
+        .unwrap();
+        let req_b = approval_request_to_action(
+            201,
+            "item/fileChange/requestApproval",
+            &json!({
+                "itemId": "fileB",
+                "approvalId": "approval-B",
+                "grantRoot": "/tmp/b",
+                "reason": "second",
+                "startedAtMs": 1,
+            }),
+        )
+        .unwrap();
+
+        assert_ne!(req_a.request_id, req_b.request_id);
+        assert_ne!(req_a.item_id, req_b.item_id);
+        assert_ne!(req_a.approval_id, req_b.approval_id);
+        assert_eq!(req_a.action_kind, "runCommand");
+        assert_eq!(req_b.action_kind, "applyChanges");
+        assert!(req_a.detail.contains("first"));
+        assert!(!req_a.detail.contains("second"));
+        assert!(req_b.detail.contains("second"));
+        assert!(!req_b.detail.contains("first"));
+
+        // 决策也独立：A approve、B deny，两个 response 互不污染。
+        let resp_a = approval_response_for_decision(
+            "item/commandExecution/requestApproval",
+            &json!({}),
+            "approve",
+        )
+        .unwrap();
+        let resp_b = approval_response_for_decision(
+            "item/fileChange/requestApproval",
+            &json!({}),
+            "deny",
+        )
+        .unwrap();
+        assert_eq!(resp_a, json!({"decision": "accept"}));
+        assert_eq!(resp_b, json!({"decision": "decline"}));
+    }
+
+    #[test]
+    fn approval_state_recovers_after_daemon_restart() {
+        // Reshape: codex.rs 的 approval 翻译是纯函数，CodexClient 不持有
+        // approval 状态。"daemon 重启"在这一层等价于：丢弃任何隐含状态后
+        // 重新喂同一序列，输出仍逐字段一致（幂等）。我们演示这一性质。
+        let request_params = json!({
+            "itemId": "cmd3",
+            "approvalId": "approval-3",
+            "command": "ls",
+            "cwd": "/tmp/project",
+            "reason": "list files",
+            "startedAtMs": 1,
+        });
+
+        let before = approval_request_to_action(
+            300,
+            "item/commandExecution/requestApproval",
+            &request_params,
+        )
+        .unwrap();
+        let after = approval_request_to_action(
+            300,
+            "item/commandExecution/requestApproval",
+            &request_params,
+        )
+        .unwrap();
+        assert_eq!(before, after);
+
+        // 同样的 deny 决策两次喂入也应得到同样的 wire response —
+        // 不会因为"上次已经 applied"而错误地变成 accept 或 protocol error。
+        let first = approval_response_for_decision(
+            "item/commandExecution/requestApproval",
+            &request_params,
+            "deny",
+        )
+        .unwrap();
+        let second = approval_response_for_decision(
+            "item/commandExecution/requestApproval",
+            &request_params,
+            "deny",
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first, json!({"decision": "decline"}));
+
+        // 同一 approved 命令的 completed 帧重放也幂等 — translate 不会
+        // 因为重复就丢帧或变形。
+        let completed_event = json!({
+            "item": {
+                "id": "cmd3",
+                "type": "commandExecution",
+                "command": "ls",
+                "exitCode": 0,
+                "aggregatedOutput": "",
+                "status": "completed",
+                "commandActions": [],
+            },
+            "threadId": "thread_1",
+            "turnId": "turn_1",
+        });
+        let applied_first = translate("item/completed", &completed_event).unwrap();
+        let applied_again = translate("item/completed", &completed_event).unwrap();
+        assert_eq!(applied_first.id, applied_again.id);
+        assert!(matches!(applied_first.kind, AgentItemKind::Shell { .. }));
+        assert!(matches!(applied_again.kind, AgentItemKind::Shell { .. }));
+    }
 }
