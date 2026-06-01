@@ -66,6 +66,8 @@ struct HistoryThreadRowPresentation: Equatable {
     let usesFullRowHitTarget = true
     let agentSourceLabel: String
     let agentSourceImageName: String
+    let runtimePhase: SessionModel.Phase?
+    let unreadEventCount: Int
 
     init(
         threadId: String,
@@ -73,7 +75,9 @@ struct HistoryThreadRowPresentation: Equatable {
         openingThreadId: String?,
         hoveredThreadId: String?,
         modelProvider: String = "",
-        source: String = ""
+        source: String = "",
+        runtimePhase: SessionModel.Phase? = nil,
+        unreadEventCount: Int = 0
     ) {
         if openingThreadId == threadId {
             visualState = .opening
@@ -88,10 +92,24 @@ struct HistoryThreadRowPresentation: Equatable {
         let marker = HistoryAgentSourceMarker(modelProvider: modelProvider, source: source)
         agentSourceLabel = marker.label
         agentSourceImageName = marker.imageName
+        self.runtimePhase = runtimePhase
+        self.unreadEventCount = unreadEventCount
     }
 
     var isEmphasized: Bool {
         visualState == .selected || visualState == .opening
+    }
+
+    var hasRuntimeIndicator: Bool {
+        runtimePhase != nil
+    }
+
+    var hasUnreadIndicator: Bool {
+        unreadEventCount > 0
+    }
+
+    var runtimeStatusLabel: String? {
+        runtimePhase?.rawValue
     }
 }
 

@@ -1242,6 +1242,7 @@ git commit -m "chore: finish async runtime hub"
 ## Task 9 实施记录
 
 - 已新增 compact `RuntimeSelectorView` 并接入 History 面板顶部。`WorkbenchModel.runtimeList` 将当前 selected runtime 排在最前；后台 runtime 收到事件会增加 `unreadEventCount`，用户选中该 runtime 后清零。README 已同步 runtime selector 的状态点、队列数和未读事件语义。
+- 2026-06-01 更新：独立 `RuntimeSelectorView` 已被移除。当前 UI 改为在 History 会话行内显示缓存 runtime 状态点，未读事件用对应行上的小彩色点提示；底层 `WorkbenchModel` / `ThreadRuntimeModel` 语义不变。
 
 ## Task 11 实施记录
 

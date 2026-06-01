@@ -54,15 +54,6 @@ struct TextualCompatibilityTests {
         }
     }
 
-    @MainActor
-    @Test("runtime selector view can be created")
-    func runtimeSelectorViewCanBeCreated() {
-        let workbench = WorkbenchModel()
-        workbench.ensureRuntime(sessionId: "s1", threadId: "t1", cwd: URL(fileURLWithPath: "/tmp/a"))
-
-        _ = RuntimeSelectorView(workbench: workbench)
-    }
-
     @Test("image generation media selects saved path for preview")
     func imageGenerationMediaSelectsSavedPathForPreview() {
         var item = UIItem(id: "ig1", lifecycle: "completed", kind: "media")

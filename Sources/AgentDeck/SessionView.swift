@@ -150,12 +150,6 @@ struct SessionView: View {
                 .padding(.bottom, 8)
                 .onSubmit { model.loadHistory() }
 
-            RuntimeSelectorView(workbench: model.workbench)
-            if !model.workbench.runtimeList.isEmpty {
-                Divider()
-                    .padding(.vertical, 6)
-            }
-
             if model.isLoadingHistory {
                 ProgressView()
                     .controlSize(.small)
@@ -209,13 +203,16 @@ struct SessionView: View {
     }
 
     private func historyThreadRow(_ thread: HistoryThreadSummary) -> some View {
+        let runtime = model.workbench.runtime(sessionId: thread.id)
         let presentation = HistoryThreadRowPresentation(
             threadId: thread.id,
             selectedThreadId: model.selectedHistoryThreadId,
             openingThreadId: model.openingHistoryThreadId,
             hoveredThreadId: hoveredHistoryThreadId,
             modelProvider: thread.modelProvider,
-            source: thread.source
+            source: thread.source,
+            runtimePhase: runtime?.phase,
+            unreadEventCount: runtime?.unreadEventCount ?? 0
         )
 
         return Button {
@@ -228,6 +225,7 @@ struct SessionView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
                         historyThreadAgentIcon(presentation)
+                        historyThreadRuntimeDot(presentation)
                         Text(thread.displayTitle)
                             .font(.system(.callout, weight: presentation.isEmphasized ? .medium : .regular))
                             .foregroundStyle(presentation.isEmphasized ? .primary : .secondary)
@@ -239,6 +237,9 @@ struct SessionView: View {
                     }
                     HStack(spacing: 6) {
                         Text(thread.status)
+                        if let runtimeStatus = presentation.runtimeStatusLabel {
+                            Text(runtimeStatus)
+                        }
                         Text(thread.source)
                         Text(updatedLabel(thread.updatedAt))
                     }
@@ -348,6 +349,35 @@ struct SessionView: View {
 
     private func historyThreadAgentIconColor(_ presentation: HistoryThreadRowPresentation) -> Color {
         presentation.isEmphasized ? .accentColor : Color(nsColor: .secondaryLabelColor)
+    }
+
+    @ViewBuilder
+    private func historyThreadRuntimeDot(_ presentation: HistoryThreadRowPresentation) -> some View {
+        if presentation.hasRuntimeIndicator {
+            Circle()
+                .fill(historyThreadRuntimeDotColor(presentation))
+                .frame(width: presentation.hasUnreadIndicator ? 7 : 5, height: presentation.hasUnreadIndicator ? 7 : 5)
+                .help(presentation.hasUnreadIndicator ? "Unread runtime events" : "Cached runtime")
+                .accessibilityHidden(true)
+        }
+    }
+
+    private func historyThreadRuntimeDotColor(_ presentation: HistoryThreadRowPresentation) -> Color {
+        if presentation.hasUnreadIndicator {
+            return .accentColor
+        }
+        switch presentation.runtimePhase {
+        case .running, .starting:
+            return .accentColor
+        case .waitingApproval:
+            return .orange
+        case .failed:
+            return .red
+        case .some:
+            return Color(nsColor: .tertiaryLabelColor)
+        case .none:
+            return .clear
+        }
     }
 
     // MARK: D3/D7 — single-column stream, NON-CARD

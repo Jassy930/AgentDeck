@@ -102,8 +102,11 @@ runtime，后续 prompt 继续走同一个 thread，而不是在 UI 上伪装成
 当 runtime 进入 `waitingApproval` 时，会话流里显示最小 approve / deny 控件。
 第一版支持命令执行、文件变更和额外权限三类请求；不暴露持久化策略按钮，
 也不让 Swift 解析 Codex 原始 JSON。
-左侧 History 面板顶部会显示 compact runtime selector，用状态点、队列数和未读
-事件数标识后台 runtime；切换 selector 只切换右侧视图，不会中断对应后台会话。
+左侧 History 面板不再单独显示 runtime selector。已在当前窗口缓存的历史
+thread 会在对应历史行内显示小状态点：普通缓存态保持低调，运行中或启动中显示
+系统 accent，等待审批显示橙色，失败显示红色；如果后台 runtime 有未读事件，
+对应历史行上显示一个更醒目的小彩色点。点击历史行仍只切换右侧视图，不会中断
+对应后台会话。
 
 第一版管理动作保持低风险：刷新、搜索、重命名和归档。AgentDeck 不读取、
 保存或转发 Codex token。

@@ -69,7 +69,7 @@ turn worker 不直接输出 legacy `agentItem/sessionState/turnComplete` 到顶�
 - `WorkbenchModel` 管理多个 `ThreadRuntimeModel`，按 `sessionId` ingest event，并维护 selected runtime。
 - `ThreadRuntimeModel` 承载单个 runtime 的 phase、items、queued prompts、unread count 和 deferred content materialize。
 - `SessionModel` 保留旧 facade，同时把 selected runtime 的 items/phase/error/queue 暴露给 UI。
-- `RuntimeSelectorView` 只切换 selected runtime 并清 unread，不停止后台 worker。
+- History 列表行内显示已缓存 runtime 的状态点；未读事件用对应会话行上的小彩色点提示。UI 不再单独显示 runtime selector，但底层 runtime 仍不因切换历史而停止。
 
 ## Daemon 分工
 

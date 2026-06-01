@@ -464,10 +464,12 @@ struct SessionRenderThrottlingTests {
 
         #expect(runtime.items.isEmpty)
 
-        try await Task.sleep(for: .milliseconds(80))
+        for _ in 0..<20 where runtime.items.isEmpty {
+            try await Task.sleep(for: .milliseconds(20))
+        }
 
         #expect(runtime.items.count == 1)
-        #expect(runtime.items[0].text == "Hello")
+        #expect(runtime.items.first?.text == "Hello")
     }
 
     @Test("loading history groups threads without clearing current stream")
@@ -1308,6 +1310,49 @@ struct HistoryModelTests {
         #expect(opening.isEmphasized)
         #expect(opening.agentSourceLabel == "Codex")
         #expect(opening.agentSourceImageName == "CodexIcon")
+    }
+
+    @Test("history row presentation exposes cached runtime indicator")
+    func historyRowPresentationExposesCachedRuntimeIndicator() {
+        let idle = HistoryThreadRowPresentation(
+            threadId: "h1",
+            selectedThreadId: nil,
+            openingThreadId: nil,
+            hoveredThreadId: nil,
+            runtimePhase: nil,
+            unreadEventCount: 0
+        )
+        let cached = HistoryThreadRowPresentation(
+            threadId: "h1",
+            selectedThreadId: nil,
+            openingThreadId: nil,
+            hoveredThreadId: nil,
+            runtimePhase: .ready,
+            unreadEventCount: 0
+        )
+        let unread = HistoryThreadRowPresentation(
+            threadId: "h1",
+            selectedThreadId: nil,
+            openingThreadId: nil,
+            hoveredThreadId: nil,
+            runtimePhase: .ready,
+            unreadEventCount: 2
+        )
+        let waiting = HistoryThreadRowPresentation(
+            threadId: "h1",
+            selectedThreadId: nil,
+            openingThreadId: nil,
+            hoveredThreadId: nil,
+            runtimePhase: .waitingApproval,
+            unreadEventCount: 0
+        )
+
+        #expect(!idle.hasRuntimeIndicator)
+        #expect(cached.hasRuntimeIndicator)
+        #expect(!cached.hasUnreadIndicator)
+        #expect(unread.hasUnreadIndicator)
+        #expect(unread.runtimeStatusLabel == "ready")
+        #expect(waiting.runtimeStatusLabel == "waitingApproval")
     }
 
     @Test("history replay item tolerates per-kind missing fields")
