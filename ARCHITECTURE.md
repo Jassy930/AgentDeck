@@ -46,6 +46,7 @@ codex app-server  (子进程, JSON-RPC over stdio)
 - daemon 的 RuntimeHub 必须按 `sessionId` 阻止同一 runtime 并发 turn，并对 history worker 保持有界并发；超限时返回可诊断 busy error。
 - streaming event 必须携带 `sessionId/threadId`，避免历史读取和正在运行的 turn 串流互相抢 reader。
 - run record 与 diagnostic log 是 AgentDeck 管理的数据，stable profile 写入 `~/Library/Application Support/AgentDeck/`，dev profile 写入 `~/Library/Application Support/AgentDeck-Dev/`，不得写入用户项目仓库。
+- SwiftPM/debug 构建未显式传 `--profile` 时默认使用 dev profile；release 构建默认使用 stable profile。
 - profile 只影响 AgentDeck 管理的数据目录；不影响 Codex 登录状态、token 或 Codex app-server 历史。
 - 写入前必须做 best-effort 密钥脱敏；写失败不能静默，必须在可诊断位置暴露。
 - `protocol/` 里的 schema 必须来自官方 `codex app-server generate-json-schema`，不要手写或逆向猜测协议。

@@ -143,7 +143,7 @@ swift build -c release           # 产出 .build/release/AgentDeck
 运行（Swift app 会自动 spawn 同目录或 PATH 上的 agentdeckd）：
 
 ```bash
-swift run AgentDeck               # 打开原生窗口
+swift run AgentDeck               # 本地 debug 构建默认使用 dev profile
 swift run AgentDeck -- --selfcheck  # 无窗口自检: IPC lifecycle + logging/redaction probe
 swift run AgentDeck -- --diagnostics-report --json  # 输出机器可读诊断报告
 ```
@@ -157,7 +157,9 @@ swift run AgentDeck -- --selfcheck --profile dev
 swift run AgentDeck -- --diagnostics-report --json --profile dev
 ```
 
-- `stable` 是默认 profile，写入 `~/Library/Application Support/AgentDeck/`。
+- release 构建未显式传 `--profile` 时默认使用 `stable`，写入
+  `~/Library/Application Support/AgentDeck/`。
+- SwiftPM/debug 构建未显式传 `--profile` 时默认使用 `dev`，适合本地迭代。
 - `dev` 写入 `~/Library/Application Support/AgentDeck-Dev/`，窗口标题显示
   `AgentDeck Dev`。
 - profile 只隔离 AgentDeck 管理的数据，不隔离 Codex 登录状态或 Codex

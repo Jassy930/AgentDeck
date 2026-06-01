@@ -33,6 +33,7 @@ swift run AgentDeck -- --diagnostics-report --json --profile dev
 5. 按 `suggestedNextCheck` 继续执行只读检查。
 
 排查开发调试实例时，在 selfcheck 和 diagnostics report 后加 `--profile dev`。
+SwiftPM/debug 构建未显式传 `--profile` 时也会默认使用 dev profile。
 `AGENTDECK_DATA_DIR` 仍优先于 profile，主要用于一次性测试覆盖目录。
 
 ## Failure Codes

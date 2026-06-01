@@ -90,6 +90,11 @@ struct AppLaunchProfileTests {
         #expect(profile == .stable)
     }
 
+    @Test("debug build default profile is dev")
+    func debugBuildDefaultProfileIsDev() {
+        #expect(AgentDeckProfile.defaultForCurrentBuild == .dev)
+    }
+
     @Test("app launch profile parses dev")
     func appLaunchProfileParsesDev() throws {
         let profile = try AgentDeckProfile.parse(arguments: ["AgentDeck", "--profile", "dev"])

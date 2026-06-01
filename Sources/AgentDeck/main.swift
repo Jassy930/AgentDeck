@@ -4,6 +4,14 @@ enum AgentDeckProfile: String, Equatable {
     case stable
     case dev
 
+    static var defaultForCurrentBuild: AgentDeckProfile {
+        #if DEBUG
+        .dev
+        #else
+        .stable
+        #endif
+    }
+
     var windowTitle: String {
         switch self {
         case .stable:
@@ -13,9 +21,12 @@ enum AgentDeckProfile: String, Equatable {
         }
     }
 
-    static func parse(arguments: [String] = CommandLine.arguments) throws -> AgentDeckProfile {
+    static func parse(
+        arguments: [String] = CommandLine.arguments,
+        defaultProfile: AgentDeckProfile = .stable
+    ) throws -> AgentDeckProfile {
         guard let raw = argumentValue(after: "--profile", in: arguments) else {
-            return .stable
+            return defaultProfile
         }
         guard let profile = AgentDeckProfile(rawValue: raw) else {
             throw AgentDeckProfileError.unsupported(raw)
@@ -51,7 +62,7 @@ func argumentValue(after flag: String, in args: [String] = CommandLine.arguments
 
 let launchProfile: AgentDeckProfile
 do {
-    launchProfile = try AgentDeckProfile.parse()
+    launchProfile = try AgentDeckProfile.parse(defaultProfile: .defaultForCurrentBuild)
 } catch {
     FileHandle.standardError.write(Data("AgentDeck FATAL: \(error)\n".utf8))
     exit(1)
