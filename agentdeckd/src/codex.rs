@@ -21,9 +21,11 @@
 //! / approval land in Step 3+. Render backpressure is handled by the Swift UI
 //! layer so the daemon can forward Codex deltas faithfully.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
@@ -32,6 +34,9 @@ use crate::ipc::{
     HistoryThreadDetail, HistoryThreadList, HistoryThreadSummary, HookFragment, Lifecycle,
     ToolAction,
 };
+use crate::record::redact;
+
+const CODEX_STDERR_TAIL_LINES: usize = 40;
 
 #[derive(Debug)]
 pub enum CodexError {
@@ -39,7 +44,7 @@ pub enum CodexError {
     SpawnFailed(String),
     Handshake(String),
     Protocol(String),
-    Disconnected,
+    Disconnected(Option<String>),
 }
 
 impl std::fmt::Display for CodexError {
@@ -49,9 +54,60 @@ impl std::fmt::Display for CodexError {
             CodexError::SpawnFailed(m) => write!(f, "failed to spawn codex app-server: {m}"),
             CodexError::Handshake(m) => write!(f, "codex initialize handshake failed: {m}"),
             CodexError::Protocol(m) => write!(f, "codex protocol error: {m}"),
-            CodexError::Disconnected => write!(f, "codex app-server disconnected (EOF)"),
+            CodexError::Disconnected(Some(stderr)) if !stderr.is_empty() => write!(
+                f,
+                "codex app-server disconnected (EOF); recent stderr:\n{stderr}"
+            ),
+            CodexError::Disconnected(_) => write!(f, "codex app-server disconnected (EOF)"),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct StderrTail {
+    lines: Arc<Mutex<VecDeque<String>>>,
+    max_lines: usize,
+}
+
+impl StderrTail {
+    fn new(max_lines: usize) -> Self {
+        Self {
+            lines: Arc::new(Mutex::new(VecDeque::new())),
+            max_lines: max_lines.max(1),
+        }
+    }
+
+    fn push(&self, line: impl AsRef<str>) {
+        let Ok(mut lines) = self.lines.lock() else {
+            return;
+        };
+        while lines.len() >= self.max_lines {
+            lines.pop_front();
+        }
+        lines.push_back(redact(line.as_ref()));
+    }
+
+    fn summary(&self) -> Option<String> {
+        let Ok(lines) = self.lines.lock() else {
+            return None;
+        };
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.iter().cloned().collect::<Vec<_>>().join("\n"))
+        }
+    }
+}
+
+fn capture_stderr_tail(stderr: ChildStderr, tail: StderrTail) {
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            match line {
+                Ok(line) => tail.push(line),
+                Err(_) => break,
+            }
+        }
+    });
 }
 
 /// Locate the `codex` binary. GUI-launched macOS apps have a different PATH
@@ -104,6 +160,7 @@ pub struct CodexAdapter {
     child: Child,
     stdin: ChildStdin,
     reader: BufReader<ChildStdout>,
+    stderr_tail: StderrTail,
     next_id: u64,
 }
 
@@ -118,7 +175,7 @@ impl CodexAdapter {
             // stdio:// is the default transport (verified Step 0).
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .env("PATH", child_path)
             // A1 second layer + Codex #11: put the child in its OWN process
             // group. The `codex` CLI re-execs / forks the real app-server
@@ -137,11 +194,18 @@ impl CodexAdapter {
             .stdout
             .take()
             .ok_or_else(|| CodexError::SpawnFailed("no stdout pipe".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| CodexError::SpawnFailed("no stderr pipe".into()))?;
+        let stderr_tail = StderrTail::new(CODEX_STDERR_TAIL_LINES);
+        capture_stderr_tail(stderr, stderr_tail.clone());
 
         Ok(Self {
             child,
             stdin,
             reader: BufReader::new(stdout),
+            stderr_tail,
             next_id: 1,
         })
     }
@@ -184,7 +248,7 @@ impl CodexAdapter {
             .read_line(&mut line)
             .map_err(|e| CodexError::Protocol(e.to_string()))?;
         if n == 0 {
-            return Err(CodexError::Disconnected);
+            return Err(CodexError::Disconnected(self.stderr_tail.summary()));
         }
         serde_json::from_str(line.trim())
             .map_err(|e| CodexError::Protocol(format!("malformed: {e}: {}", line.trim())))
@@ -1784,5 +1848,22 @@ mod tests {
         assert!(parts.contains(&"/opt/homebrew/bin"));
         assert!(parts.contains(&"/usr/bin"));
         assert!(parts.contains(&"/bin"));
+    }
+
+    #[test]
+    fn stderr_tail_keeps_recent_lines_and_appears_in_disconnect_error() {
+        let tail = StderrTail::new(2);
+        tail.push("first line");
+        tail.push("second line");
+        tail.push("third line");
+
+        let summary = tail.summary().unwrap();
+        assert!(!summary.contains("first line"));
+        assert!(summary.contains("second line"));
+        assert!(summary.contains("third line"));
+
+        let error = CodexError::Disconnected(Some(summary)).to_string();
+        assert!(error.contains("recent stderr"));
+        assert!(error.contains("third line"));
     }
 }

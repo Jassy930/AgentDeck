@@ -50,6 +50,13 @@ SwiftPM/debug 构建未显式传 `--profile` 时也会默认使用 dev profile�
 | `turn_failed` | turn 执行失败 | 按 runId 查看 run record |
 | `approval_wait_stalled` | turn 正在等待用户审批 | 查看当前 runtime 的 `actionRequest`，确认 UI 是否已回写 `actionDecision` |
 
+## Codex app-server stderr
+
+daemon 会捕获 Codex app-server 子进程 stderr 的有限尾部摘要。若 app-server
+启动后立刻 EOF、握手失败或 turn 期间断连，错误详情会带上 `recent stderr`
+片段，并写入 `diagnostic.log` 的 `detail` 字段。该片段会经过 best-effort
+脱敏；它只用于诊断，不是长期原始日志。
+
 ## Raw / Warning 可见性
 
 未知 adapter item 必须在 daemon 侧中立化为 `raw`，并继续进入 run record 与

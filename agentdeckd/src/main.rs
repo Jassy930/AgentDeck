@@ -23,6 +23,8 @@ mod ipc;
 mod record;
 
 use std::io::{BufRead, ErrorKind, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -924,6 +926,7 @@ fn run_codex_turn(
     thread_id: &str,
     decision_rx: &Receiver<ActionDecision>,
     event_seq: &mut u64,
+    before_turn_complete: impl FnOnce(),
 ) -> std::io::Result<()> {
     emit_session_event(
         out_tx,
@@ -1053,6 +1056,24 @@ fn run_codex_turn(
         }
     }
 
+    complete_turn_run(
+        out_tx,
+        context,
+        run_id,
+        thread_id,
+        event_seq,
+        before_turn_complete,
+    )
+}
+
+fn complete_turn_run(
+    out_tx: &Sender<IpcMessage>,
+    context: &TurnRunContext<'_>,
+    run_id: &str,
+    thread_id: &str,
+    event_seq: &mut u64,
+    before_turn_complete: impl FnOnce(),
+) -> std::io::Result<()> {
     *event_seq += 1;
     diag::log_event(
         DiagnosticEvent::new(context.turn_complete_log_name())
@@ -1071,6 +1092,7 @@ fn run_codex_turn(
         run_id,
         r#"{"event":"complete"}"#,
     )?;
+    before_turn_complete();
     emit_session_event(
         out_tx,
         context.session_id,
@@ -1099,6 +1121,7 @@ fn run_session(
     cwd: &str,
     prompt: &str,
     optimistic_user_item_id: Option<&str>,
+    before_turn_complete: impl FnOnce(),
 ) -> std::io::Result<()> {
     // run_id: AgentDeck-generated (premise 5), not user input, so it is a
     // safe filename component (no path traversal).
@@ -1175,6 +1198,7 @@ fn run_session(
         &thread_id,
         decision_rx,
         &mut event_seq,
+        before_turn_complete,
     )
 }
 
@@ -1186,6 +1210,7 @@ fn run_turn_on_existing_thread(
     thread_id: &str,
     prompt: &str,
     optimistic_user_item_id: Option<&str>,
+    before_turn_complete: impl FnOnce(),
 ) -> std::io::Result<()> {
     let context = TurnRunContext {
         id,
@@ -1255,6 +1280,7 @@ fn run_turn_on_existing_thread(
         thread_id,
         decision_rx,
         &mut event_seq,
+        before_turn_complete,
     )
 }
 
@@ -1621,6 +1647,7 @@ fn run_turn_worker(
     cwd: Option<&str>,
     prompt: &str,
     optimistic_user_item_id: Option<&str>,
+    before_turn_complete: impl FnOnce(),
 ) -> std::io::Result<()> {
     if let Some(thread_id) = thread_id {
         return run_turn_on_existing_thread(
@@ -1631,6 +1658,7 @@ fn run_turn_worker(
             thread_id,
             prompt,
             optimistic_user_item_id,
+            before_turn_complete,
         );
     }
     if let Some(cwd) = cwd {
@@ -1642,12 +1670,26 @@ fn run_turn_worker(
             cwd,
             prompt,
             optimistic_user_item_id,
+            before_turn_complete,
         );
     }
     Err(std::io::Error::new(
         ErrorKind::InvalidInput,
         "turn worker requires either threadId or cwd",
     ))
+}
+
+fn send_turn_done_once(
+    done_tx: &Sender<RuntimeHubWorkerDone>,
+    session_id: &str,
+    sent: &AtomicBool,
+) {
+    if sent
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        let _ = done_tx.send(RuntimeHubWorkerDone::Turn(session_id.to_string()));
+    }
 }
 
 fn main() -> std::io::Result<()> {
@@ -1727,6 +1769,10 @@ fn main() -> std::io::Result<()> {
                         let worker_tx = out_tx.clone();
                         let done_tx = worker_done_tx.clone();
                         std::thread::spawn(move || {
+                            let done_sent = Arc::new(AtomicBool::new(false));
+                            let early_done_tx = done_tx.clone();
+                            let early_done_session_id = session_id.clone();
+                            let early_done_sent = done_sent.clone();
                             if let Err(err) = run_turn_worker(
                                 worker_tx.clone(),
                                 decision_rx,
@@ -1736,6 +1782,13 @@ fn main() -> std::io::Result<()> {
                                 cwd.as_deref(),
                                 &prompt,
                                 optimistic_user_item_id.as_deref(),
+                                || {
+                                    send_turn_done_once(
+                                        &early_done_tx,
+                                        &early_done_session_id,
+                                        &early_done_sent,
+                                    );
+                                },
                             ) {
                                 let _ = worker_tx.send(IpcMessage::session_event(
                                     &session_id,
@@ -1743,7 +1796,7 @@ fn main() -> std::io::Result<()> {
                                     IpcMessage::error(None, &err.to_string()),
                                 ));
                             }
-                            let _ = done_tx.send(RuntimeHubWorkerDone::Turn(session_id));
+                            send_turn_done_once(&done_tx, &session_id, &done_sent);
                         });
                     }
                     RuntimeHubDispatch::Reply(reply) => send_msg(&out_tx, reply)?,
@@ -1955,6 +2008,53 @@ mod tests {
             hub.handle_spawn_turn(Some(3), "session_a", mpsc::channel().0),
             RuntimeHubDispatch::StartTurn
         ));
+    }
+
+    #[test]
+    fn turn_complete_is_emitted_after_runtime_slot_release_callback() {
+        let (out_tx, out_rx) = mpsc::channel();
+        let context = TurnRunContext {
+            id: Some(42),
+            session_id: "session_a",
+            prompt: "hello",
+            optimistic_user_item_id: None,
+            start: TurnStart::ResumedThread {
+                thread_id: "thread_1",
+            },
+        };
+        let release_tx = out_tx.clone();
+
+        complete_turn_run(&out_tx, &context, "run_1", "thread_1", &mut 1, || {
+            release_tx
+                .send(IpcMessage {
+                    kind: "slotReleased".into(),
+                    id: None,
+                    session_id: None,
+                    thread_id: None,
+                    payload: None,
+                })
+                .unwrap();
+        })
+        .unwrap();
+
+        let mut saw_release = false;
+        for msg in out_rx.try_iter() {
+            let nested_kind = msg
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("event"))
+                .and_then(|event| event.get("kind"))
+                .and_then(serde_json::Value::as_str);
+            if msg.kind == "slotReleased" {
+                saw_release = true;
+            }
+            if msg.kind == "turnComplete" || nested_kind == Some("turnComplete") {
+                assert!(saw_release);
+                return;
+            }
+        }
+
+        panic!("turnComplete was not emitted");
     }
 
     #[test]

@@ -51,8 +51,8 @@ codex app-server  (子进程, JSON-RPC over stdio)
 任何 Codex 字样。
 
 AgentDeck 使用一个 `agentdeckd` 作为 runtime hub。daemon 的 stdin 主循环不被
-单个 turn 阻塞；每个后台会话由独立 worker 持有 adapter，所有 worker 通过统一
-stdout writer 输出带 `sessionId/threadId` 的中立事件。历史请求按 request id
+单个 turn 阻塞；每个后台 turn 由独立 worker 持有 turn 级 adapter，turn 结束即
+释放，所有 worker 通过统一 stdout writer 输出带 `sessionId/threadId` 的中立事件。历史请求按 request id
 分发 reply，不和 streaming `agentItem` 抢 reader。RuntimeHub 会阻止同一
 `sessionId` 同时启动多个 turn，并限制并发 history worker；超限时返回明确
 busy error，而不是继续无界创建线程。需要用户确认的高风险动作会由 Codex
@@ -184,6 +184,7 @@ framing（逐行 JSONL）。codex 版本固定在 `protocol/CODEX_VERSION.txt`�
   - 每次 turn 的中立 `AgentItem` 留痕，可按 `runId` 回放和排查。
 - diagnostic log：`~/Library/Application Support/AgentDeck/diagnostic.log`
   - 结构化 JSONL，记录进程、IPC、adapter、run record 写入和自检异常。
+  - Codex app-server 断连时会附带其 stderr 尾部摘要，便于定位启动失败或崩溃根因。
 - dev profile 数据：`~/Library/Application Support/AgentDeck-Dev/`
   - 用于快速迭代和调试，避免污染 stable 的工作记录。
 

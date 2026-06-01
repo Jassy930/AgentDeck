@@ -44,6 +44,7 @@ codex app-server  (子进程, JSON-RPC over stdio)
 - 高风险动作审批必须走中立 `ActionRequest` / `ActionDecision`；Codex server request、response shape 和持久化策略字段只能留在 daemon adapter 层。
 - daemon 的 stdin 主循环不得被单个 turn 阻塞；长时间工作放到 worker。
 - daemon 的 RuntimeHub 必须按 `sessionId` 阻止同一 runtime 并发 turn，并对 history worker 保持有界并发；超限时返回可诊断 busy error。
+- turn 成功完成时，worker 必须先释放 RuntimeHub 的 session 占用，再向 Swift 发出可触发下一条 prompt 的 ready / `turnComplete` 事件。
 - streaming event 必须携带 `sessionId/threadId`，避免历史读取和正在运行的 turn 串流互相抢 reader。
 - run record 与 diagnostic log 是 AgentDeck 管理的数据，stable profile 写入 `~/Library/Application Support/AgentDeck/`，dev profile 写入 `~/Library/Application Support/AgentDeck-Dev/`，不得写入用户项目仓库。
 - SwiftPM/debug 构建未显式传 `--profile` 时默认使用 dev profile；release 构建默认使用 stable profile。
@@ -51,6 +52,15 @@ codex app-server  (子进程, JSON-RPC over stdio)
 - 写入前必须做 best-effort 密钥脱敏；写失败不能静默，必须在可诊断位置暴露。
 - `protocol/` 里的 schema 必须来自官方 `codex app-server generate-json-schema`，不要手写或逆向猜测协议。
 - AgentDeck 不读取、不保存、不转发 Codex token，只沿用用户已有 `codex login` 状态。
+
+## 当前权衡
+
+- Codex adapter 是 turn 级生命周期：每次新会话或继续历史 thread 都会 spawn
+  `codex app-server`、initialize，并在 turn 结束时由 `Drop` kill 整个进程组。
+  v0.1 暂无 adapter 复用池或 session 级常驻 adapter；连续对话依靠
+  `thread/resume(threadId)` 保持 Codex 上下文。
+- Codex app-server 的 stderr 只保留 daemon 内存中的有限尾部摘要，并在断连错误进入
+  diagnostic log / UI error 时附带；它不是长期日志，也不写入用户项目仓库。
 
 ## 依赖方向
 
