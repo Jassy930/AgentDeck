@@ -82,6 +82,28 @@ struct IpcMessageTests {
     }
 }
 
+@Suite("App launch profiles")
+struct AppLaunchProfileTests {
+    @Test("app launch profile defaults to stable")
+    func appLaunchProfileDefaultsToStable() throws {
+        let profile = try AgentDeckProfile.parse(arguments: ["AgentDeck"])
+        #expect(profile == .stable)
+    }
+
+    @Test("app launch profile parses dev")
+    func appLaunchProfileParsesDev() throws {
+        let profile = try AgentDeckProfile.parse(arguments: ["AgentDeck", "--profile", "dev"])
+        #expect(profile == .dev)
+    }
+
+    @Test("app launch profile rejects unknown values")
+    func appLaunchProfileRejectsUnknownValues() throws {
+        #expect(throws: AgentDeckProfileError.self) {
+            _ = try AgentDeckProfile.parse(arguments: ["AgentDeck", "--profile", "prod"])
+        }
+    }
+}
+
 @Suite("Daemon message routing")
 struct DaemonMessageRoutingTests {
     @Test("routes replies by id and session events by session id")

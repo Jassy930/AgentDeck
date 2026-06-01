@@ -1,5 +1,31 @@
 import SwiftUI
 
+enum AgentDeckProfile: String, Equatable {
+    case stable
+    case dev
+
+    static func parse(arguments: [String] = CommandLine.arguments) throws -> AgentDeckProfile {
+        guard let raw = argumentValue(after: "--profile", in: arguments) else {
+            return .stable
+        }
+        guard let profile = AgentDeckProfile(rawValue: raw) else {
+            throw AgentDeckProfileError.unsupported(raw)
+        }
+        return profile
+    }
+}
+
+enum AgentDeckProfileError: Error, Equatable, CustomStringConvertible {
+    case unsupported(String)
+
+    var description: String {
+        switch self {
+        case .unsupported(let value):
+            return "unsupported --profile '\(value)'; expected stable or dev"
+        }
+    }
+}
+
 // AgentDeck — Step 4: the SwiftUI app. Beat 1 (the only user-perceivable
 // wow in v0.1) lives in SessionView, built to the locked D3-D9 design specs.
 //
@@ -7,8 +33,7 @@ import SwiftUI
 // runs the Step 1 IPC round trip + A1 lifecycle assertion without a
 // windowing session, so the IPC/lifecycle contract stays CI-testable.
 
-func argumentValue(after flag: String) -> String? {
-    let args = CommandLine.arguments
+func argumentValue(after flag: String, in args: [String] = CommandLine.arguments) -> String? {
     guard let idx = args.firstIndex(of: flag), args.indices.contains(idx + 1) else {
         return nil
     }
