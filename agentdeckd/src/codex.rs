@@ -2250,4 +2250,166 @@ mod tests {
         assert!(matches!(applied_first.kind, AgentItemKind::Shell { .. }));
         assert!(matches!(applied_again.kind, AgentItemKind::Shell { .. }));
     }
+
+    // --- C3: turn 边界 ---
+    //
+    // codex.rs 是无状态 per-event 翻译层：`AgentItem` 不携带 `turn_id`，
+    // `translate()` 不做 turn 聚合，也不发任何 diag。下面 4 个测试钉死
+    // 该层真正负责的契约（"不串字段、不丢帧、不泄漏 wire 元数据、幂等"），
+    // 把"turn 边界守卫 / once-per-turn 警告"的责任明确划到 main.rs 调用方
+    // ——见 docs/plans/.../design.md 风险与权衡 C3 小节的记录。
+
+    #[test]
+    fn translate_preserves_item_id_per_event_across_same_turn() {
+        // Reshape: 计划写的是"多 user_item 落到同 turn / turn 聚合正确"。
+        // 此层不做聚合，契约改为：同一 turnId 下连续多个 item 事件，每个
+        // 都独立翻译成 AgentItem 且 id 严格对齐 wire 的 itemId，turnId 本身
+        // 不泄漏进 AgentItem（既不进 id 也不进 Raw description）。
+        let turn_id = "turn_c3_1";
+        let evts: [(&str, &str); 3] = [
+            ("msg_a", "first"),
+            ("msg_b", "second"),
+            ("msg_c", "third"),
+        ];
+
+        let items: Vec<AgentItem> = evts
+            .iter()
+            .map(|(item_id, delta)| {
+                translate(
+                    "item/agentMessage/delta",
+                    &json!({
+                        "itemId": item_id,
+                        "delta": delta,
+                        "threadId": "thread_c3",
+                        "turnId": turn_id,
+                    }),
+                )
+                .expect("delta with required fields must translate")
+            })
+            .collect();
+
+        assert_eq!(items.len(), 3);
+        for (item, (expected_id, expected_text)) in items.iter().zip(evts.iter()) {
+            assert_eq!(item.id, *expected_id);
+            assert!(matches!(item.lifecycle, Lifecycle::Delta));
+            match &item.kind {
+                AgentItemKind::Message { text, .. } => assert_eq!(text, expected_text),
+                other => panic!("expected Message kind, got {other:?}"),
+            }
+            // turnId 不泄漏：item.id 不能等于 turnId，也不能出现在序列化输出里。
+            assert_ne!(item.id, turn_id);
+            let wire = serde_json::to_string(item).unwrap();
+            assert!(!wire.contains(turn_id), "turnId leaked into AgentItem wire: {wire}");
+        }
+    }
+
+    #[test]
+    fn turn_completed_method_is_not_an_agent_item_and_does_not_gate_translate() {
+        // Reshape: 计划写的是"turn.completed 之后的 delta 被丢弃 + diag 警告"。
+        // 此层无状态、无 diag，所以契约拆成两条可测断言：
+        //   (a) "turn/completed" 本身不是 item 通知，translate 返回 None；
+        //   (b) translate 不做"after completed"门禁——同一 turnId 后续 delta
+        //       仍然会被正常翻译。门禁（丢弃 stale）归 main.rs / 调用方。
+        let turn_id = "turn_c3_2";
+
+        assert!(
+            translate(
+                "turn/completed",
+                &json!({"threadId": "thread_c3", "turnId": turn_id}),
+            )
+            .is_none(),
+            "turn/completed must not surface as an AgentItem"
+        );
+
+        let stale = translate(
+            "item/agentMessage/delta",
+            &json!({
+                "itemId": "msg_late",
+                "delta": "arrived after turn/completed",
+                "threadId": "thread_c3",
+                "turnId": turn_id,
+            }),
+        )
+        .expect("translate is stateless: a late delta still produces an AgentItem");
+        assert_eq!(stale.id, "msg_late");
+        assert!(matches!(stale.lifecycle, Lifecycle::Delta));
+        match stale.kind {
+            AgentItemKind::Message { text, .. } => {
+                assert_eq!(text, "arrived after turn/completed");
+            }
+            other => panic!("expected Message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn item_ids_from_different_turns_translate_to_distinct_agent_items() {
+        // Reshape: 计划是"client_id 不在 turn 间串"，但此层不存在 clientItemId
+        // 字段，AgentItem 也无 client_id（见 ipc.rs）。可观测的等价契约：两个
+        // turnId 不同的 delta，itemId 也不同时，翻译后的 AgentItem.id 必须
+        // assert_ne!（即上一 turn 的 id 不会被下一 turn 改写或串入）。
+        let first = translate(
+            "item/agentMessage/delta",
+            &json!({
+                "itemId": "msg_turn1",
+                "delta": "from turn 1",
+                "threadId": "thread_c3",
+                "turnId": "turn_one",
+            }),
+        )
+        .unwrap();
+        let second = translate(
+            "item/agentMessage/delta",
+            &json!({
+                "itemId": "msg_turn2",
+                "delta": "from turn 2",
+                "threadId": "thread_c3",
+                "turnId": "turn_two",
+            }),
+        )
+        .unwrap();
+
+        assert_ne!(first.id, second.id);
+        match (&first.kind, &second.kind) {
+            (
+                AgentItemKind::Message { text: t1, .. },
+                AgentItemKind::Message { text: t2, .. },
+            ) => {
+                assert_eq!(t1, "from turn 1");
+                assert_eq!(t2, "from turn 2");
+                assert_ne!(t1, t2);
+            }
+            other => panic!("expected two Message kinds, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repeated_stale_deltas_translate_identically_without_hidden_state() {
+        // Reshape: 计划是"多次 stale delta 警告每 turn 只一次"。此层无 diag、
+        // 无 per-turn 状态，"once per turn" 不在这一层。可测的等价契约是
+        // 幂等性：连喂多次同 shape 的"stale"事件，translate 的输出每次都
+        // 全等（同 id、同 lifecycle、同 text），即没有累计状态偷偷改变结果。
+        let params = json!({
+            "itemId": "msg_repeat",
+            "delta": "stale",
+            "threadId": "thread_c3",
+            "turnId": "turn_c3_4",
+        });
+
+        let outputs: Vec<Value> = (0..4)
+            .map(|_| {
+                let item = translate("item/agentMessage/delta", &params).unwrap();
+                serde_json::to_value(&item).unwrap()
+            })
+            .collect();
+
+        let first = &outputs[0];
+        for (i, out) in outputs.iter().enumerate().skip(1) {
+            assert_eq!(out, first, "translate output drifted at call #{i}: {out}");
+        }
+        // 同时确认第一次的形状仍是预期的 Message delta（不是变成 Raw 或丢字段）。
+        assert_eq!(first["id"], "msg_repeat");
+        assert_eq!(first["lifecycle"], "delta");
+        assert_eq!(first["kind"], "message");
+        assert_eq!(first["text"], "stale");
+    }
 }
