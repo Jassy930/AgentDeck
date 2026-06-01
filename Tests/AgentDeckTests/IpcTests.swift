@@ -102,6 +102,14 @@ struct AppLaunchProfileTests {
             _ = try AgentDeckProfile.parse(arguments: ["AgentDeck", "--profile", "prod"])
         }
     }
+
+    @Test("daemon environment includes selected profile")
+    func daemonEnvironmentIncludesSelectedProfile() {
+        let env = DaemonClient.daemonEnvironment(profile: .dev, base: ["PATH": "/bin"])
+
+        #expect(env["PATH"] == "/bin")
+        #expect(env["AGENTDECK_PROFILE"] == "dev")
+    }
 }
 
 @Suite("Daemon message routing")

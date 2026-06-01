@@ -388,6 +388,7 @@ protocol RuntimeActionDeciding: AnyObject {
 /// this so the daemon process-group-owns the Codex app-server child, so
 /// killing the daemon cascades to the app-server too — A1's second layer.)
 final class DaemonClient {
+    private let profile: AgentDeckProfile
     private let process = Process()
     private let toDaemon = Pipe()
     private let fromDaemon = Pipe()
@@ -397,6 +398,10 @@ final class DaemonClient {
     private let lifecycleLock = NSLock()
     private let writeLock = NSLock()
     private var readerLoopStarted = false
+
+    init(profile: AgentDeckProfile = .stable) {
+        self.profile = profile
+    }
 
     /// Locate the daemon binary. v0.1 uses PATH / dev-build lookup (Eng D-cwd
     /// scope: bundling is a later good-first-issue). GUI-launched apps have a
@@ -423,6 +428,15 @@ final class DaemonClient {
         return nil
     }
 
+    static func daemonEnvironment(
+        profile: AgentDeckProfile,
+        base: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [String: String] {
+        var env = base
+        env["AGENTDECK_PROFILE"] = profile.rawValue
+        return env
+    }
+
     func start() throws {
         lifecycleLock.lock()
         defer { lifecycleLock.unlock() }
@@ -435,6 +449,7 @@ final class DaemonClient {
         process.executableURL = URL(fileURLWithPath: path)
         process.standardInput = toDaemon
         process.standardOutput = fromDaemon
+        process.environment = Self.daemonEnvironment(profile: profile)
         // stderr inherits — daemon diagnostic logging (Eng O1) lands in Step 5.
         do {
             try process.run()

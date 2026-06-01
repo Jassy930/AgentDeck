@@ -40,13 +40,21 @@ func argumentValue(after flag: String, in args: [String] = CommandLine.arguments
     return args[idx + 1]
 }
 
+let launchProfile: AgentDeckProfile
+do {
+    launchProfile = try AgentDeckProfile.parse()
+} catch {
+    FileHandle.standardError.write(Data("AgentDeck FATAL: \(error)\n".utf8))
+    exit(1)
+}
+
 if CommandLine.arguments.contains("--diagnostics-report") {
     guard CommandLine.arguments.contains("--json") else {
         FileHandle.standardError.write(Data("diagnostics-report FATAL: --json is required\n".utf8))
         exit(1)
     }
 
-    let client = DaemonClient()
+    let client = DaemonClient(profile: launchProfile)
     do {
         try client.start()
         let report = try client.diagnosticsReport(
@@ -70,7 +78,7 @@ if CommandLine.arguments.contains("--diagnostics-report") {
 }
 
 if CommandLine.arguments.contains("--selfcheck") {
-    let client = DaemonClient()
+    let client = DaemonClient(profile: launchProfile)
     do {
         try client.start()
         let pong = try client.roundTrip(IpcMessage(kind: "ping", id: 1, payload: nil))
