@@ -370,6 +370,7 @@ protocol RuntimeTurnStarting: AnyObject {
         threadId: String?,
         cwd: URL,
         prompt: String,
+        optimisticUserItemId: String,
         onEvent: @escaping @MainActor (IpcMessage) -> Void
     )
 }
@@ -468,14 +469,16 @@ final class DaemonClient {
         sessionId: String,
         threadId: String?,
         cwd: URL,
-        prompt: String
+        prompt: String,
+        optimisticUserItemId: String
     ) throws -> IpcMessage {
         try prepareGeneratedIdRequest(Self.runtimeTurnRequest(
             id: 0,
             sessionId: sessionId,
             threadId: threadId,
             cwd: cwd,
-            prompt: prompt
+            prompt: prompt,
+            optimisticUserItemId: optimisticUserItemId
         ))
     }
 
@@ -626,14 +629,19 @@ final class DaemonClient {
         sessionId: String,
         threadId: String?,
         cwd: URL,
-        prompt: String
+        prompt: String,
+        optimisticUserItemId: String
     ) -> IpcMessage {
         if let threadId {
             return IpcMessage(
                 kind: "startTurn",
                 id: id,
                 sessionId: sessionId,
-                payload: AnyCodable(["threadId": threadId, "prompt": prompt])
+                payload: AnyCodable([
+                    "threadId": threadId,
+                    "prompt": prompt,
+                    "optimisticUserItemId": optimisticUserItemId,
+                ])
             )
         }
 
@@ -641,7 +649,11 @@ final class DaemonClient {
             kind: "startSession",
             id: id,
             sessionId: sessionId,
-            payload: AnyCodable(["cwd": cwd.path, "prompt": prompt])
+            payload: AnyCodable([
+                "cwd": cwd.path,
+                "prompt": prompt,
+                "optimisticUserItemId": optimisticUserItemId,
+            ])
         )
     }
 
@@ -781,6 +793,7 @@ final class DaemonClient {
         threadId: String?,
         cwd: URL,
         prompt: String,
+        optimisticUserItemId: String,
         onEvent: @escaping @MainActor (IpcMessage) -> Void
     ) {
         let msg: IpcMessage
@@ -789,7 +802,8 @@ final class DaemonClient {
                 sessionId: sessionId,
                 threadId: threadId,
                 cwd: cwd,
-                prompt: prompt
+                prompt: prompt,
+                optimisticUserItemId: optimisticUserItemId
             )
         } catch {
             Task { @MainActor in

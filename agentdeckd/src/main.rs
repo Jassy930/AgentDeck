@@ -27,7 +27,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use diag::DiagnosticEvent;
-use ipc::{ActionDecision, IpcMessage, SessionState};
+use ipc::{ActionDecision, AgentItem, AgentItemKind, IpcMessage, SessionState};
 
 const WRITER_STOP_KIND: &str = "__agentdeckd/writerStop";
 
@@ -43,6 +43,7 @@ struct HistoryListParams {
 struct StartTurnParams {
     thread_id: String,
     prompt: String,
+    optimistic_user_item_id: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -69,6 +70,7 @@ enum HubAction {
         thread_id: Option<String>,
         cwd: Option<String>,
         prompt: String,
+        optimistic_user_item_id: Option<String>,
     },
     ActionDecision {
         id: Option<u64>,
@@ -312,6 +314,13 @@ fn classify_request(msg: &IpcMessage) -> Result<HubAction, String> {
                 thread_id: None,
                 cwd: Some(cwd.to_string()),
                 prompt: prompt.to_string(),
+                optimistic_user_item_id: msg
+                    .payload
+                    .as_ref()
+                    .and_then(|p| p.get("optimisticUserItemId"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
             })
         }
         "startTurn" => {
@@ -324,6 +333,7 @@ fn classify_request(msg: &IpcMessage) -> Result<HubAction, String> {
                 thread_id: Some(params.thread_id),
                 cwd: None,
                 prompt: params.prompt,
+                optimistic_user_item_id: params.optimistic_user_item_id,
             })
         }
         "actionDecision" => {
@@ -446,10 +456,19 @@ fn start_turn_params(payload: Option<&serde_json::Value>) -> Option<StartTurnPar
     let payload = payload?;
     let thread_id = payload.get("threadId")?.as_str()?.to_string();
     let prompt = payload.get("prompt")?.as_str()?.to_string();
+    let optimistic_user_item_id = payload
+        .get("optimisticUserItemId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     if thread_id.is_empty() || prompt.is_empty() {
         return None;
     }
-    Some(StartTurnParams { thread_id, prompt })
+    Some(StartTurnParams {
+        thread_id,
+        prompt,
+        optimistic_user_item_id,
+    })
 }
 
 fn action_decision_params(payload: Option<&serde_json::Value>) -> Option<ActionDecision> {
@@ -783,6 +802,7 @@ struct TurnRunContext<'a> {
     id: Option<u64>,
     session_id: &'a str,
     prompt: &'a str,
+    optimistic_user_item_id: Option<&'a str>,
     start: TurnStart<'a>,
 }
 
@@ -914,15 +934,23 @@ fn run_codex_turn(
 
     let mut write_err: Option<std::io::Error> = None;
     let mut record_warning_emitted = false;
+    let mut mapped_optimistic_user = false;
     {
         let out_tx = out_tx.clone();
         let event_thread_id = thread_id.to_string();
         let turn = adapter.turn_start(
             thread_id,
             context.prompt,
-            |item| {
+            |mut item| {
                 if write_err.is_some() {
                     return;
+                }
+                if !mapped_optimistic_user
+                    && let Some(optimistic_id) = context.optimistic_user_item_id
+                    && matches!(item.kind, AgentItemKind::User { .. })
+                {
+                    item = map_optimistic_user_item_id(item, optimistic_id);
+                    mapped_optimistic_user = true;
                 }
                 if let Err(e) = emit_session_event(
                     &out_tx,
@@ -1070,6 +1098,7 @@ fn run_session(
     session_id: &str,
     cwd: &str,
     prompt: &str,
+    optimistic_user_item_id: Option<&str>,
 ) -> std::io::Result<()> {
     // run_id: AgentDeck-generated (premise 5), not user input, so it is a
     // safe filename component (no path traversal).
@@ -1077,6 +1106,7 @@ fn run_session(
         id,
         session_id,
         prompt,
+        optimistic_user_item_id,
         start: TurnStart::NewSession { cwd },
     };
     let run_id = new_run_id();
@@ -1155,11 +1185,13 @@ fn run_turn_on_existing_thread(
     session_id: &str,
     thread_id: &str,
     prompt: &str,
+    optimistic_user_item_id: Option<&str>,
 ) -> std::io::Result<()> {
     let context = TurnRunContext {
         id,
         session_id,
         prompt,
+        optimistic_user_item_id,
         start: TurnStart::ResumedThread { thread_id },
     };
     let run_id = new_run_id();
@@ -1389,6 +1421,11 @@ fn suggested_next_check_for_failure(code: &str) -> &'static str {
     }
 }
 
+fn map_optimistic_user_item_id(mut item: AgentItem, optimistic_user_item_id: &str) -> AgentItem {
+    item.id = optimistic_user_item_id.to_string();
+    item
+}
+
 fn diagnostics_failure_from_event(
     event: &serde_json::Value,
     path_hint: &str,
@@ -1583,6 +1620,7 @@ fn run_turn_worker(
     thread_id: Option<&str>,
     cwd: Option<&str>,
     prompt: &str,
+    optimistic_user_item_id: Option<&str>,
 ) -> std::io::Result<()> {
     if let Some(thread_id) = thread_id {
         return run_turn_on_existing_thread(
@@ -1592,10 +1630,19 @@ fn run_turn_worker(
             session_id,
             thread_id,
             prompt,
+            optimistic_user_item_id,
         );
     }
     if let Some(cwd) = cwd {
-        return run_session(&out_tx, &decision_rx, id, session_id, cwd, prompt);
+        return run_session(
+            &out_tx,
+            &decision_rx,
+            id,
+            session_id,
+            cwd,
+            prompt,
+            optimistic_user_item_id,
+        );
     }
     Err(std::io::Error::new(
         ErrorKind::InvalidInput,
@@ -1669,6 +1716,7 @@ fn main() -> std::io::Result<()> {
                 thread_id,
                 cwd,
                 prompt,
+                optimistic_user_item_id,
             }) => {
                 let (decision_tx, decision_rx) = mpsc::channel::<ActionDecision>();
                 match runtime_hub.handle_spawn_turn(id, &session_id, decision_tx) {
@@ -1687,6 +1735,7 @@ fn main() -> std::io::Result<()> {
                                 thread_id.as_deref(),
                                 cwd.as_deref(),
                                 &prompt,
+                                optimistic_user_item_id.as_deref(),
                             ) {
                                 let _ = worker_tx.send(IpcMessage::session_event(
                                     &session_id,
@@ -1759,10 +1808,35 @@ mod tests {
 
     #[test]
     fn start_turn_params_reads_thread_and_prompt() {
-        let p = json!({"threadId": "thread_1", "prompt": "continue"});
+        let p = json!({
+            "threadId": "thread_1",
+            "prompt": "continue",
+            "optimisticUserItemId": "user-local-1"
+        });
         let params = start_turn_params(Some(&p)).unwrap();
         assert_eq!(params.thread_id, "thread_1");
         assert_eq!(params.prompt, "continue");
+        assert_eq!(
+            params.optimistic_user_item_id.as_deref(),
+            Some("user-local-1")
+        );
+    }
+
+    #[test]
+    fn optimistic_user_item_mapping_reuses_client_id() {
+        let item = AgentItem {
+            id: "server-user-1".into(),
+            lifecycle: ipc::Lifecycle::Completed,
+            kind: AgentItemKind::User {
+                text: "hello".into(),
+                attachments: vec![],
+            },
+        };
+
+        let mapped = map_optimistic_user_item_id(item, "user-local-1");
+
+        assert_eq!(mapped.id, "user-local-1");
+        assert!(matches!(mapped.kind, AgentItemKind::User { .. }));
     }
 
     #[test]
@@ -1803,6 +1877,7 @@ mod tests {
             id: Some(1),
             session_id: "session_new",
             prompt: "hello",
+            optimistic_user_item_id: None,
             start: TurnStart::NewSession {
                 cwd: "/tmp/project",
             },
@@ -1811,6 +1886,7 @@ mod tests {
             id: Some(2),
             session_id: "session_existing",
             prompt: "continue",
+            optimistic_user_item_id: None,
             start: TurnStart::ResumedThread {
                 thread_id: "thread_1",
             },
@@ -1938,13 +2014,20 @@ mod tests {
             thread_id: Some("thread_7".into()),
             payload: Some(serde_json::json!({
                 "threadId": "thread_7",
-                "prompt": "hello"
+                "prompt": "hello",
+                "optimisticUserItemId": "user-local-7"
             })),
         };
 
         let action = classify_request(&msg).unwrap();
 
-        assert!(matches!(action, HubAction::SpawnTurn { .. }));
+        assert!(matches!(
+            action,
+            HubAction::SpawnTurn {
+                optimistic_user_item_id: Some(ref id),
+                ..
+            } if id == "user-local-7"
+        ));
     }
 
     #[test]

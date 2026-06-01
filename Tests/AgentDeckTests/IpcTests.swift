@@ -270,13 +270,15 @@ struct DaemonMessageRoutingTests {
             sessionId: "session_a",
             threadId: "thread_a",
             cwd: URL(fileURLWithPath: "/tmp/a"),
-            prompt: "first"
+            prompt: "first",
+            optimisticUserItemId: "user-first"
         )
         let second = try client.prepareRuntimeTurnRequest(
             sessionId: "session_b",
             threadId: "thread_b",
             cwd: URL(fileURLWithPath: "/tmp/b"),
-            prompt: "second"
+            prompt: "second",
+            optimisticUserItemId: "user-second"
         )
 
         #expect(first.id != 4)
@@ -417,6 +419,7 @@ struct SessionRenderThrottlingTests {
         #expect(model.selectedItems[0].text == "hello")
         #expect(model.scrollToLatestRequest != initialRequest)
         #expect(turnStarter.requests.map(\.prompt) == ["hello"])
+        #expect(turnStarter.requests[0].optimisticUserItemId == model.selectedItems[0].id)
     }
 
     @Test("live session continues on returned thread id")
@@ -470,6 +473,18 @@ struct SessionRenderThrottlingTests {
 
         #expect(runtime.items.count == 1)
         #expect(runtime.items.first?.text == "Hello")
+    }
+
+    @Test("server user item upserts optimistic local prompt by correlated id")
+    func serverUserItemUpsertsOptimisticLocalPromptByCorrelatedId() {
+        let runtime = ThreadRuntimeModel(id: "s1", threadId: "t1", cwd: URL(fileURLWithPath: "/tmp/project"))
+
+        let optimisticId = runtime.appendUserPrompt("hello")
+        runtime.ingest(agentItem(id: optimisticId, lifecycle: "completed", kind: "user", text: "hello"))
+
+        #expect(runtime.items.map(\.kind) == ["user"])
+        #expect(runtime.items[0].id == optimisticId)
+        #expect(runtime.items[0].text == "hello")
     }
 
     @Test("loading history groups threads without clearing current stream")
@@ -1118,6 +1133,7 @@ final class RecordingRuntimeTurnStarter: RuntimeTurnStarting, RuntimeActionDecid
         let threadId: String?
         let cwd: URL
         let prompt: String
+        let optimisticUserItemId: String
     }
     struct Decision {
         let sessionId: String
@@ -1133,13 +1149,15 @@ final class RecordingRuntimeTurnStarter: RuntimeTurnStarting, RuntimeActionDecid
         threadId: String?,
         cwd: URL,
         prompt: String,
+        optimisticUserItemId: String,
         onEvent: @escaping @MainActor (IpcMessage) -> Void
     ) {
         requests.append(Request(
             sessionId: sessionId,
             threadId: threadId,
             cwd: cwd,
-            prompt: prompt
+            prompt: prompt,
+            optimisticUserItemId: optimisticUserItemId
         ))
     }
 
@@ -1233,6 +1251,7 @@ final class RecordingSessionClient: SessionClienting, @unchecked Sendable {
         threadId: String?,
         cwd: URL,
         prompt: String,
+        optimisticUserItemId: String,
         onEvent: @escaping @MainActor @Sendable (IpcMessage) -> Void
     ) {
         startedTurnThreadId = threadId
@@ -1460,7 +1479,8 @@ struct DaemonHistoryRequestTests {
             sessionId: "session_a",
             threadId: "thread_a",
             cwd: URL(fileURLWithPath: "/tmp/a"),
-            prompt: "continue"
+            prompt: "continue",
+            optimisticUserItemId: "user-local-1"
         )
 
         let json = try #require(JSONSerialization.jsonObject(with: try JSONEncoder().encode(msg)) as? [String: Any])
@@ -1469,6 +1489,7 @@ struct DaemonHistoryRequestTests {
         #expect(json["sessionId"] as? String == "session_a")
         #expect(payload["threadId"] as? String == "thread_a")
         #expect(payload["prompt"] as? String == "continue")
+        #expect(payload["optimisticUserItemId"] as? String == "user-local-1")
     }
 
     @Test("runtime session request encodes session routing")
@@ -1478,7 +1499,8 @@ struct DaemonHistoryRequestTests {
             sessionId: "session_a",
             threadId: nil,
             cwd: URL(fileURLWithPath: "/tmp/a"),
-            prompt: "start"
+            prompt: "start",
+            optimisticUserItemId: "user-local-2"
         )
 
         let json = try #require(JSONSerialization.jsonObject(with: try JSONEncoder().encode(msg)) as? [String: Any])
@@ -1487,6 +1509,7 @@ struct DaemonHistoryRequestTests {
         #expect(json["sessionId"] as? String == "session_a")
         #expect(payload["cwd"] as? String == "/tmp/a")
         #expect(payload["prompt"] as? String == "start")
+        #expect(payload["optimisticUserItemId"] as? String == "user-local-2")
     }
 
     @Test("approval decision request encodes session routing")

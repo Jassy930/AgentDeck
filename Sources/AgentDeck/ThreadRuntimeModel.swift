@@ -105,7 +105,8 @@ final class ThreadRuntimeModel: Identifiable {
         return request
     }
 
-    func appendUserPrompt(_ prompt: String) {
+    @discardableResult
+    func appendUserPrompt(_ prompt: String) -> String {
         let userItem = UIItem(
             id: "user-\(UUID().uuidString)",
             lifecycle: "completed",
@@ -114,6 +115,7 @@ final class ThreadRuntimeModel: Identifiable {
         )
         itemIndexById[userItem.id] = items.count
         items.append(userItem)
+        return userItem.id
     }
 
     private func drainQueueIfPossible() -> RuntimeAction? {

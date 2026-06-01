@@ -114,7 +114,7 @@ final class WorkbenchModel {
             return
         }
 
-        runtime.appendUserPrompt(trimmed)
+        let optimisticUserItemId = runtime.appendUserPrompt(trimmed)
         runtime.errorMessage = nil
         runtime.warningMessage = nil
         runtime.phase = .starting
@@ -122,7 +122,8 @@ final class WorkbenchModel {
             sessionId: runtime.id,
             threadId: runtime.threadId,
             cwd: runtime.cwd,
-            prompt: trimmed
+            prompt: trimmed,
+            optimisticUserItemId: optimisticUserItemId
         ) { [weak self] msg in
             self?.ingestSessionEvent(msg)
         }
@@ -153,6 +154,7 @@ final class NoopRuntimeTurnStarter: RuntimeTurnStarting {
         threadId: String?,
         cwd: URL,
         prompt: String,
+        optimisticUserItemId: String,
         onEvent: @escaping @MainActor @Sendable (IpcMessage) -> Void
     ) {}
 }
