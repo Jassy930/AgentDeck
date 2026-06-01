@@ -148,6 +148,21 @@ swift run AgentDeck -- --selfcheck  # 无窗口自检: IPC lifecycle + logging/r
 swift run AgentDeck -- --diagnostics-report --json  # 输出机器可读诊断报告
 ```
 
+Profile（用于拆分稳定工作实例和开发调试实例）：
+
+```bash
+swift run AgentDeck -- --profile stable
+swift run AgentDeck -- --profile dev
+swift run AgentDeck -- --selfcheck --profile dev
+swift run AgentDeck -- --diagnostics-report --json --profile dev
+```
+
+- `stable` 是默认 profile，写入 `~/Library/Application Support/AgentDeck/`。
+- `dev` 写入 `~/Library/Application Support/AgentDeck-Dev/`，窗口标题显示
+  `AgentDeck Dev`。
+- profile 只隔离 AgentDeck 管理的数据，不隔离 Codex 登录状态或 Codex
+  app-server 历史。
+
 测试：
 
 ```bash
@@ -167,13 +182,15 @@ framing（逐行 JSONL）。codex 版本固定在 `protocol/CODEX_VERSION.txt`�
   - 每次 turn 的中立 `AgentItem` 留痕，可按 `runId` 回放和排查。
 - diagnostic log：`~/Library/Application Support/AgentDeck/diagnostic.log`
   - 结构化 JSONL，记录进程、IPC、adapter、run record 写入和自检异常。
+- dev profile 数据：`~/Library/Application Support/AgentDeck-Dev/`
+  - 用于快速迭代和调试，避免污染 stable 的工作记录。
 
 Agent 自查流程见 [docs/AGENT_DIAGNOSTICS.md](docs/AGENT_DIAGNOSTICS.md)。
 质量门禁和文档结构检查见 [docs/QUALITY.md](docs/QUALITY.md)。
 
 写入前做 best-effort 密钥脱敏。写失败不阻塞会话，但会在界面可见
 警告（绝不静默）。`AGENTDECK_DATA_DIR` 只用于测试/诊断时覆盖数据目录，
-不是普通用户配置。
+不是普通用户配置；它优先于 `--profile` / `AGENTDECK_PROFILE`。
 
 ### 回滚
 

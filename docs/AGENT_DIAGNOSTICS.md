@@ -7,12 +7,15 @@
 ```bash
 swift run AgentDeck -- --selfcheck
 swift run AgentDeck -- --diagnostics-report --json
+swift run AgentDeck -- --selfcheck --profile dev
+swift run AgentDeck -- --diagnostics-report --json --profile dev
 ```
 
 ## 日志位置
 
 - run record: `~/Library/Application Support/AgentDeck/runs/*.jsonl`
 - diagnostic log: `~/Library/Application Support/AgentDeck/diagnostic.log`
+- dev profile: `~/Library/Application Support/AgentDeck-Dev/`
 - 测试覆盖目录: 设置 `AGENTDECK_DATA_DIR=/tmp/agentdeck-diag`
 
 ## 关联规则
@@ -28,6 +31,9 @@ swift run AgentDeck -- --diagnostics-report --json
 3. 跑 `swift run AgentDeck -- --diagnostics-report --json`。
 4. 优先处理 `failures[]` 中 severity 最高的项目。
 5. 按 `suggestedNextCheck` 继续执行只读检查。
+
+排查开发调试实例时，在 selfcheck 和 diagnostics report 后加 `--profile dev`。
+`AGENTDECK_DATA_DIR` 仍优先于 profile，主要用于一次性测试覆盖目录。
 
 ## Failure Codes
 
