@@ -501,35 +501,25 @@ struct SessionView: View {
         items: [ConversationTurnNavigationItem],
         proxy: ScrollViewProxy
     ) {
-        guard !items.isEmpty else {
-            selectedConversationTurnId = nil
-            withAnimation(.easeInOut(duration: 0.18)) {
-                proxy.scrollTo(conversationLatestAnchorId, anchor: .bottom)
-            }
-            return
-        }
-
-        let currentIndex = selectedConversationTurnId.flatMap { selected in
-            items.firstIndex { $0.turnId == selected }
-        }
-
-        switch TurnJumpRailLayout.stepTarget(
-            selectedIndex: currentIndex,
-            direction: direction,
-            count: items.count
+        // A2: Pure decision lives in `ConversationRailNavigator`; this method
+        // is now just the SwiftUI adapter that maps each `Outcome` to a
+        // selection mutation + animated scroll.
+        switch ConversationRailNavigator.next(
+            currentSelected: selectedConversationTurnId,
+            items: items,
+            direction: direction
         ) {
-        case .latest:
+        case .scrollToLatest:
             selectedConversationTurnId = nil
             withAnimation(.easeInOut(duration: 0.18)) {
                 proxy.scrollTo(conversationLatestAnchorId, anchor: .bottom)
             }
-        case .turn(let nextIndex):
-            let turnId = items[nextIndex].turnId
+        case .scrollToTurn(let turnId):
             selectedConversationTurnId = turnId
             withAnimation(.easeInOut(duration: 0.18)) {
                 proxy.scrollTo(turnId, anchor: .top)
             }
-        case nil:
+        case .none:
             break
         }
     }
