@@ -1692,17 +1692,39 @@ fn send_turn_done_once(
     }
 }
 
-fn main() -> std::io::Result<()> {
-    let stdin = std::io::stdin();
+// Injection seam for the JSONL dispatch loop. `LiveDeps` is the production
+// wiring; tests substitute a fake to control hub capacity and observe spawned
+// workers without touching real OS threads.
+pub(crate) trait RuntimeDeps {
+    fn hub_capacity(&self) -> usize;
+    fn spawn_worker(&self, work: Box<dyn FnOnce() + Send + 'static>);
+}
+
+pub(crate) struct LiveDeps;
+
+impl RuntimeDeps for LiveDeps {
+    fn hub_capacity(&self) -> usize {
+        4
+    }
+    fn spawn_worker(&self, work: Box<dyn FnOnce() + Send + 'static>) {
+        std::thread::spawn(work);
+    }
+}
+
+pub(crate) fn run<R, W>(stdin: R, stdout: W, deps: impl RuntimeDeps) -> std::io::Result<()>
+where
+    R: BufRead,
+    W: Write + Send + 'static,
+{
     let (out_tx, out_rx) = mpsc::channel::<IpcMessage>();
     let (worker_done_tx, worker_done_rx) = mpsc::channel::<RuntimeHubWorkerDone>();
-    let mut runtime_hub = RuntimeHub::new(4);
-    let writer = std::thread::spawn(move || {
-        let stdout = std::io::stdout();
-        write_outbound_messages(stdout, out_rx)
-    });
+    let mut runtime_hub = RuntimeHub::new(deps.hub_capacity());
+    // Writer stays on a real `std::thread::spawn` (not `deps.spawn_worker`)
+    // because we need its `JoinHandle` to propagate I/O errors / panics back
+    // to `main`'s return. `spawn_worker` is fire-and-forget by design.
+    let writer = std::thread::spawn(move || write_outbound_messages(stdout, out_rx));
 
-    for line in stdin.lock().lines() {
+    for line in stdin.lines() {
         runtime_hub.drain_finished(&worker_done_rx);
         let line = line?;
         if line.trim().is_empty() {
@@ -1739,12 +1761,12 @@ fn main() -> std::io::Result<()> {
                     RuntimeHubDispatch::StartHistory => {
                         let worker_tx = out_tx.clone();
                         let done_tx = worker_done_tx.clone();
-                        std::thread::spawn(move || {
+                        deps.spawn_worker(Box::new(move || {
                             if let Err(err) = run_history_worker(worker_tx.clone(), action) {
                                 let _ = worker_tx.send(IpcMessage::error(None, &err.to_string()));
                             }
                             let _ = done_tx.send(RuntimeHubWorkerDone::History);
-                        });
+                        }));
                     }
                     RuntimeHubDispatch::Reply(reply) => send_msg(&out_tx, reply)?,
                     RuntimeHubDispatch::StartTurn => {
@@ -1768,7 +1790,7 @@ fn main() -> std::io::Result<()> {
 
                         let worker_tx = out_tx.clone();
                         let done_tx = worker_done_tx.clone();
-                        std::thread::spawn(move || {
+                        deps.spawn_worker(Box::new(move || {
                             let done_sent = Arc::new(AtomicBool::new(false));
                             let early_done_tx = done_tx.clone();
                             let early_done_session_id = session_id.clone();
@@ -1797,7 +1819,7 @@ fn main() -> std::io::Result<()> {
                                 ));
                             }
                             send_turn_done_once(&done_tx, &session_id, &done_sent);
-                        });
+                        }));
                     }
                     RuntimeHubDispatch::Reply(reply) => send_msg(&out_tx, reply)?,
                     RuntimeHubDispatch::StartHistory => {
@@ -1827,6 +1849,12 @@ fn main() -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn main() -> std::io::Result<()> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    run(stdin.lock(), stdout, LiveDeps)
 }
 
 // main.rs is the thin dispatch shell. Real coverage lives where the logic
