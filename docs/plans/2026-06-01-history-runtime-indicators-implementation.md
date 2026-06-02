@@ -52,3 +52,17 @@
 3. 运行 `swift test`。
 4. 运行 `scripts/verify-agent-docs.sh`。
 5. 检查 `git status --short --branch`。
+
+### Follow-up: History 滚动性能
+
+**实施记录（2026-06-02）：** 左侧历史列表滚动卡顿的根因之一是每个历史行渲染
+agent 图标时都会重新从 bundle 查找并解码 SVG；另一个热路径是视图读取
+`historyGroups` 时重复按 cwd 分组排序。已新增 `HistoryAgentImageCache`，按资源名缓存
+`NSImage`（包括 miss），并把 `SessionModel.historyGroups` 改为
+`setHistoryThreads(_:)` 时维护的存储投影，避免滚动期间重复做 I/O、图片解码和分组排序。
+
+验证：
+
+```bash
+swift test --filter historyAgentImagesAreCachedByResourceName
+```

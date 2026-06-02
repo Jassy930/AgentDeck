@@ -340,24 +340,7 @@ struct SessionView: View {
     }
 
     private func historyThreadAgentImage(named name: String) -> NSImage? {
-        let resource: (subdirectory: String, filename: String)
-        switch name {
-        case "CodexIcon":
-            resource = ("Assets.xcassets/CodexIcon.imageset", "codex")
-        case "UnknownAgentIcon":
-            resource = ("Assets.xcassets/UnknownAgentIcon.imageset", "unknown-agent")
-        default:
-            return nil
-        }
-
-        guard let url = Bundle.module.url(
-            forResource: resource.filename,
-            withExtension: "svg",
-            subdirectory: resource.subdirectory
-        ) else {
-            return nil
-        }
-        return NSImage(contentsOf: url)
+        HistoryAgentImageCache.shared.image(named: name)
     }
 
     private func historyThreadAgentIconColor(_ presentation: HistoryThreadRowPresentation) -> Color {

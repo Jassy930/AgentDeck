@@ -1437,6 +1437,24 @@ struct HistoryModelTests {
         #expect(waiting.runtimeStatusLabel == "waitingApproval")
     }
 
+    @MainActor
+    @Test("history agent images are cached by resource name")
+    func historyAgentImagesAreCachedByResourceName() {
+        var loadCount = 0
+        let cache = HistoryAgentImageCache { _ in
+            loadCount += 1
+            return NSImage(size: NSSize(width: 14, height: 14))
+        }
+
+        let first = cache.image(named: "CodexIcon")
+        let second = cache.image(named: "CodexIcon")
+        _ = cache.image(named: "UnknownAgentIcon")
+
+        #expect(first != nil)
+        #expect(first === second)
+        #expect(loadCount == 2)
+    }
+
     @Test("history replay item tolerates per-kind missing fields")
     func replayItemToleratesMissingPerKindFields() throws {
         let data = Data("""

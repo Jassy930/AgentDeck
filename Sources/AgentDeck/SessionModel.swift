@@ -219,7 +219,8 @@ final class SessionModel {
         }
     }
     private var legacyQueuedPrompts: [String] = []
-    var historyThreads: [HistoryThreadSummary] = []
+    private(set) var historyThreads: [HistoryThreadSummary] = []
+    private(set) var historyGroups: [HistoryProjectGroup] = []
     var historyErrorMessage: String?
     var isLoadingHistory = false
     var openingHistoryThreadId: String?
@@ -229,10 +230,6 @@ final class SessionModel {
     var conversationViewportIdentity = "live:0"
     var scrollToLatestRequest = 0
     private var didRequestInitialHistoryRefresh = false
-
-    var historyGroups: [HistoryProjectGroup] {
-        HistoryProjectGroup.group(historyThreads)
-    }
 
     var selectedItems: [UIItem] {
         workbench.selectedRuntime?.items ?? items
@@ -383,6 +380,7 @@ final class SessionModel {
 
     func setHistoryThreads(_ threads: [HistoryThreadSummary]) {
         historyThreads = threads
+        historyGroups = HistoryProjectGroup.group(threads)
     }
 
     func shouldAutoRefreshHistoryOnAppear() -> Bool {

@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 /// Neutral summary for one persisted agent thread. Mirrors the daemon's
 /// history shape; Swift never parses vendor thread JSON directly.
@@ -130,6 +131,57 @@ struct HistoryAgentSourceMarker: Equatable {
             label = normalizedSource.isEmpty ? "Unknown agent" : source
             imageName = "UnknownAgentIcon"
         }
+    }
+}
+
+@MainActor
+final class HistoryAgentImageCache {
+    typealias Loader = @MainActor (String) -> NSImage?
+
+    static let shared = HistoryAgentImageCache(loader: loadBundledImage(named:))
+
+    private let loader: Loader
+    private var images: [String: NSImage] = [:]
+    private var misses: Set<String> = []
+
+    init(loader: @escaping Loader) {
+        self.loader = loader
+    }
+
+    func image(named name: String) -> NSImage? {
+        if let image = images[name] {
+            return image
+        }
+        if misses.contains(name) {
+            return nil
+        }
+        guard let image = loader(name) else {
+            misses.insert(name)
+            return nil
+        }
+        images[name] = image
+        return image
+    }
+
+    private static func loadBundledImage(named name: String) -> NSImage? {
+        let resource: (subdirectory: String, filename: String)
+        switch name {
+        case "CodexIcon":
+            resource = ("Assets.xcassets/CodexIcon.imageset", "codex")
+        case "UnknownAgentIcon":
+            resource = ("Assets.xcassets/UnknownAgentIcon.imageset", "unknown-agent")
+        default:
+            return nil
+        }
+
+        guard let url = Bundle.module.url(
+            forResource: resource.filename,
+            withExtension: "svg",
+            subdirectory: resource.subdirectory
+        ) else {
+            return nil
+        }
+        return NSImage(contentsOf: url)
     }
 }
 
