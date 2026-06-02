@@ -594,7 +594,7 @@ struct SessionView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("$ \(item.command)")
                     .font(.system(.callout, design: .monospaced))
-                metadataLine(shellMetadata(item))
+                metadataLine(ToolPresentation.shellMetadata(item))
                 if !item.output.isEmpty {
                     DisclosureGroup {
                         DeferredStreamingTextView(
@@ -609,7 +609,7 @@ struct SessionView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.top, 4)
                     } label: {
-                        Text(outputLabel(item.output))
+                        Text(ToolPresentation.outputLabel(item.output))
                             .font(.system(.caption, design: .monospaced))
                             .foregroundStyle(.tertiary)
                     }
@@ -655,7 +655,7 @@ struct SessionView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.top, 4)
                     } label: {
-                        Text(outputLabel(item.diff, noun: "diff"))
+                        Text(ToolPresentation.outputLabel(item.diff, noun: "diff"))
                             .font(.system(.caption, design: .monospaced))
                             .foregroundStyle(.tertiary)
                     }
@@ -690,7 +690,7 @@ struct SessionView: View {
                 HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass")
                         .foregroundStyle(.tertiary)
-                    Text(webSearchTitle(item))
+                    Text(ToolPresentation.webSearchTitle(item))
                         .font(.system(.caption, weight: .medium))
                         .foregroundStyle(.tertiary)
                 }
@@ -765,17 +765,6 @@ struct SessionView: View {
         }
     }
 
-    private func webSearchTitle(_ item: UIItem) -> String {
-        switch item.action {
-        case "search": return "Web search"
-        case "openPage": return "Open web page"
-        case "findInPage": return "Find in web page"
-        case "other": return "Web search action"
-        case "": return "Web search"
-        default: return "Web search · \(item.action)"
-        }
-    }
-
     private func webSearchDetail(_ label: String, _ value: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
             Text(label)
@@ -819,16 +808,6 @@ struct SessionView: View {
         }
     }
 
-    private func shellMetadata(_ item: UIItem) -> [String] {
-        var parts: [String] = []
-        if !item.statusName.isEmpty { parts.append(item.statusName) }
-        if !item.cwdText.isEmpty { parts.append(item.cwdText) }
-        if let duration = item.durationMs { parts.append("\(duration)ms") }
-        if !item.sourceName.isEmpty { parts.append(item.sourceName) }
-        if !item.processId.isEmpty { parts.append("pid \(item.processId)") }
-        return parts
-    }
-
     private func toolActionRow(_ action: HistoryToolAction) -> some View {
         let detail = [action.name, action.path, action.query]
             .compactMap { $0 }
@@ -864,31 +843,15 @@ struct SessionView: View {
     private func toolCallBlock(_ item: UIItem) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             toolHeader(item.toolKind == "mcp" ? "MCP tool" : "Tool call", systemImage: "wrench.and.screwdriver")
-            Text(toolName(item))
+            Text(ToolPresentation.toolName(item))
                 .font(.system(.callout, design: .monospaced, weight: .medium))
-            metadataLine(toolMetadata(item))
+            metadataLine(ToolPresentation.toolMetadata(item))
             toolPayload("arguments", item.arguments)
             toolPayload("result", item.result)
             toolPayload("error", item.errorText)
             referenceList(item.contentItems)
         }
         .padding(.vertical, 10)
-    }
-
-    private func toolName(_ item: UIItem) -> String {
-        let prefix = [item.server, item.namespace].first { !$0.isEmpty }
-        if let prefix {
-            return "\(prefix)/\(item.tool)"
-        }
-        return item.tool
-    }
-
-    private func toolMetadata(_ item: UIItem) -> [String] {
-        var parts = [item.statusName].filter { !$0.isEmpty }
-        if let success = item.success { parts.append(success ? "success" : "failed") }
-        if let duration = item.durationMs { parts.append("\(duration)ms") }
-        if !item.resourceUri.isEmpty { parts.append(item.resourceUri) }
-        return parts
     }
 
     private func toolPayload(_ label: String, _ value: String) -> some View {
@@ -1098,13 +1061,6 @@ struct SessionView: View {
                     model.materializeDeferredContent(itemId: itemId, content: content)
                 }
         }
-    }
-
-    private func outputLabel(_ text: String, noun: String = "output") -> String {
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).count
-        return lines <= 1
-            ? "Show \(noun)"
-            : "Show \(noun) (\(lines) lines)"
     }
 
     private func updatedLabel(_ seconds: Int) -> String {
