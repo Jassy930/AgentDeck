@@ -976,7 +976,12 @@ final class DaemonClient {
     /// Ask the daemon to shut down, then ensure it is gone (A1: app exit
     /// kills the daemon — request a clean shutdown, then hard-kill as backstop).
     func shutdown() {
-        if transport.isStarted {
+        // Gate the `bye` send on `isAlive` (not `isStarted`): if the daemon
+        // already crashed/EOF'd, the reader loop is still "started" but the
+        // pipe is broken, so writing would surface a noisy error and waste a
+        // roundTrip on a guaranteed-fail path. Pre-B3 behaviour used
+        // `process.isRunning` directly; `isAlive` restores it via the transport.
+        if transport.isAlive {
             let bye = IpcMessage(kind: "shutdown", id: 0, payload: nil)
             _ = try? roundTrip(bye)
         }

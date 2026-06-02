@@ -51,6 +51,17 @@ final class ProcessDaemonTransport: DaemonTransport, @unchecked Sendable {
         return readerLoopStarted
     }
 
+    /// True if the underlying process is still running. Tighter than
+    /// `isStarted`, which only tracks "we ever spawned." Distinguishes "live"
+    /// from "started but died" so callers can avoid writing a `shutdown` frame
+    /// into a broken pipe when the daemon has already crashed (pre-B3 used
+    /// `process.isRunning` directly for this).
+    var isAlive: Bool {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        return readerLoopStarted && process.isRunning
+    }
+
     func setIncomingHandler(_ handler: @escaping (IpcMessage) -> Void) {
         lifecycleLock.lock()
         incomingHandler = handler
@@ -129,17 +140,23 @@ final class ProcessDaemonTransport: DaemonTransport, @unchecked Sendable {
 
     private func startReaderLoop(_ reader: BufferedLineReader) {
         readerLoopStarted = true
-        Thread.detachNewThread { [weak self] in
+        // Strong capture of `self` is intentional: the reader thread is bounded
+        // by EOF on `fromDaemon` (delivered when `shutdown()` terminates the
+        // process), so the strong reference is always released. A `[weak self]`
+        // capture would race the owner's deinit and could drop the disconnect
+        // signal, leaving `waitForReply` callers hung (violates Eng premise 9
+        // "named error, never silent hang").
+        Thread.detachNewThread {
             while let raw = reader.nextLine() {
                 if raw.isEmpty { continue }
                 do {
                     let message = try JSONDecoder().decode(IpcMessage.self, from: Data(raw.utf8))
-                    self?.deliverIncoming(message)
+                    self.deliverIncoming(message)
                 } catch {
-                    self?.deliverMalformed(raw)
+                    self.deliverMalformed(raw)
                 }
             }
-            self?.deliverDisconnect()
+            self.deliverDisconnect()
         }
     }
 
