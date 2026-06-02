@@ -141,6 +141,27 @@ cargo install cargo-llvm-cov
   - 计划中"session.ended 触发 transport close signal"在 codex.rs 不可测：transport（`child` / `stdin` / `stdout` / `reader`）是 `CodexAdapter` 的私有字段，关闭由 `Drop for CodexAdapter` 完成（A1 第二层 + 进程组 SIGKILL），与 wire 上的 `thread/closed` 通知是两条独立路径。C4 改为钉死：`thread/closed` 通知翻译为 None（不是 AgentItem）；且 `thread/closed` 之后到达的 item 事件仍被翻译——"close 之后拒收"不归此层。transport 关闭的 signal 由 main.rs 调用方 / `CodexAdapter::Drop` 负责，与 wire 通知解耦。
   - 计划中"重复 session_started、以最新为准、旧 session 状态被清理"在 codex.rs 没有承载对象：`AgentItem` 没有 `session_id` 字段（`session_id` 只存在于 IPC envelope，由 main.rs 在写出时填充，见 `ipc.rs::IpcMessage`）；`translate()` 不缓存 sessionId。可测的等价契约：translate 对多次 `thread/started`（不同 sessionId）一致返回 None；其间到达的 item 事件的 `AgentItem` 输出与 sessionId 完全无关——序列化后既不含 `session_old` 也不含 `session_new`，证明 codex.rs 没有"旧 session 状态残留"对象。"以最新 session 为准 / 清理旧 session 状态"的责任明确归 main.rs 的 `RuntimeHubWorker` / `session_event` 路径。
 
+### 阶段 1+2 实测记录（2026-06-02）
+
+所有任务（C1-C5、D1-D3、B1-B10、A1-A2、F1-F4）完成。
+
+| 范围 | 起始（2026-06-01） | 完成时（2026-06-02） | 修订后目标 | 达成 |
+| --- | --- | --- | --- | --- |
+| Rust 整体 | 59.95% | 71.74% | ≥ 72% | 差 0.26pp |
+| Swift 整体 | 27.46% | 30.69% | ≥ 32% | 差 1.31pp |
+| 加权整体 | ≈ 40% | 48.17% | ≥ 50% | 差 1.83pp |
+
+每文件明细：
+
+- Rust: `ipc.rs` 100% / `diag.rs` 97.22% / `record.rs` 92.83% / `codex.rs` 82.31% / `main.rs` 53.92%
+- Swift: `ConversationRailNavigator.swift` 100% / `ToolPresentation.swift` 100% / `ConversationTurn.swift` 96.83% / `HistoryModel.swift` 95.40% / `WorkbenchModel.swift` 91.97% / `ThreadRuntimeModel.swift` 87.57% / `SessionModel.swift` 73.60% / `AgentItemReducer.swift` 52.98% / `DaemonClient.swift` 44.93% / `DaemonTransport.swift` 100% (`{ get }`-only protocol) / `ProcessDaemonTransport.swift` 24.24% / `SessionView.swift` 4.27% / `MessageRoleViews.swift` 0% / `RichMessageView.swift` 11.76% / `StreamingTextView.swift` 20.48% / `SessionTextSelectionCoordinator.swift` 17.46% / `main.swift` 27.12%
+
+测试规模：起始 167（Rust 62 + Swift 89）→ 完成 215（Rust 85 + Swift 130，+48）。
+
+差距说明：三项目标都在 1-2pp 内未达成。原因是阶段 2 的 SessionView 重构在实读后被 Plan agent 校正为"原计划的三个抽出对象已被先前工作实现"，缩减为瘦版 A1+A2，预期提升 +2-3pp Swift，实测 +1.09pp。这是真实可达数字；进一步提升必须啃 SessionView 视图体或 SpawnTurn/History/ActionDecision worker 分派路径，按显式不测策略均不在阶段 1+2 范围内。
+
+`docs/QUALITY.md` 已固化基线、测量命令与显式不测清单，作为后续 PR 的判断依据。
+
 ### 2026-06-02 修订记录
 
 C5 实测后两项决策更新：
