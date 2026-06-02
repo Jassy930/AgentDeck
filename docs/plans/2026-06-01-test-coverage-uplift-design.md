@@ -15,7 +15,7 @@
 ## 目标
 
 - 加权整体行覆盖率 **≥ 70%**。
-- Rust daemon **≥ 75%**（`codex.rs` ≥ 88%、`main.rs` ≥ 65%、`record/diag/ipc` 维持现状）。
+- Rust daemon **≥ 75%**（`codex.rs` ≥ 82%、`main.rs` ≥ 65%、`record/diag/ipc` 维持现状）。`codex.rs` 目标从原 88% 下调至 82%，详见 风险与权衡 末尾的 2026-06-02 修订记录。
 - Swift UI **≥ 50%**（`DaemonClient` ≥ 70%、`SessionEventReducer` ≥ 85%、`SessionModel/HistoryModel` 等模型层维持 ≥ 85%）。
 - `docs/QUALITY.md` 新增"测试覆盖率"章节，固化测量命令、当前基线与"显式不测"清单。
 - 不引入新外部依赖（mock 库等），不接 CI 门禁脚本。
@@ -55,7 +55,7 @@ cargo install cargo-llvm-cov
 **阶段 1（PR 1，预计 4-5 天）**：低风险快胜，顺序 C → D → B。
 
 - 块 C — `codex.rs` 补测：不动源码，纯补错误分支、协议边角、approval 状态机、turn/session 边界测试。目标 77.17% → ≥ 88%。
-- 块 D — `main.rs` 启动序列重构：把 `fn main()` 切成 `parse_args` + `run(command, deps)` + 薄壳 main，新增 `RuntimeDeps` 注入；补 CLI 解析、命令分派、profile 解析测试。目标 34.83% → ≥ 65%。
+- 块 D — `main.rs` JSONL 派发循环重构：把 `fn main()` 切成 `run<R: BufRead, W: Write>(stdin, stdout, deps) -> io::Result<()>` + 薄壳 main，新增 `RuntimeDeps` 让 RuntimeHub 与 worker spawn 可注入；补 JSONL 派发、`HubAction` 路径、错误帧测试。目标 34.83% → ≥ 65%。原计划"抽 parse_args + CliCommand"在 2026-06-02 实读 main.rs 后撤回（理由见 风险与权衡 末尾的 2026-06-02 修订记录）。
 - 块 B — `DaemonClient` 协议化：抽 `DaemonTransport` 协议，`ProcessDaemonTransport` 留真实 Process/Socket，`StubDaemonTransport` 用于单测；补请求-响应配对、流式分发、错误路径、关闭语义、握手测试。目标 30.84% → ≥ 70%。
 
 阶段 1 完成后实测：
@@ -81,7 +81,7 @@ cargo install cargo-llvm-cov
 ## 错误处理与可观测性
 
 - 块 C 补测的协议错误分支必须覆盖：无 `thread_id`、未知 `event_type`、JSON-RPC error 帧、SSE partial JSON、`turn.completed` 后 stale event 等场景，要求 `diag::*` 收到对应警告。
-- 块 D 重构后 selfcheck 与 diagnostics report 行为不变，`--profile dev` 变体继续按 `2026-06-01-agentdeck-profile-isolation-design.md` 约束工作。
+- 块 D 重构后 selfcheck 与 diagnostics report 输出格式必须逐字节不变（CLI 解析归 Swift，daemon 只通过 `selfcheck/logging` 与 `diagnostics/report` JSONL 请求被驱动）；`--profile dev` 变体继续按 `2026-06-01-agentdeck-profile-isolation-design.md` 约束工作（env var 路径未变）。
 - 块 B 的 `StubDaemonTransport` 不写文件、不起进程；测试不依赖真实 daemon。
 - 块 A 的 reducer 是纯函数，测试用确定的事件序列断言确定的 state；不依赖时钟、I/O。
 
@@ -92,7 +92,7 @@ cargo install cargo-llvm-cov
 | 块 | 必跑验证 |
 | --- | --- |
 | C | `cargo test`、核对 `protocol/SPIKE_FINDINGS.md` |
-| D | `cargo test`、`swift run AgentDeck -- --selfcheck`、`swift run AgentDeck -- --diagnostics-report --json`、加跑 `--profile dev` 变体 |
+| D | `cargo test`、`swift run AgentDeck -- --selfcheck`、`swift run AgentDeck -- --diagnostics-report --json`、加跑 `--profile dev` 变体（Swift 入口分派的 daemon JSONL 请求被处理，输出格式不变） |
 | B | `swift test`、`swift run AgentDeck -- --selfcheck` |
 | A | `swift test`（旧 88 用例 + 新 reducer/coordinator 测试） |
 | 全部完成后 | `scripts/verify-agent-docs.sh` |
@@ -118,7 +118,7 @@ cargo install cargo-llvm-cov
 
 ## 风险与权衡
 
-- 块 D 的 `RuntimeDeps` 引入新 trait 抽象。权衡：仅 `main.rs` 内部使用，影响范围可控；不为通用 DI，避免过度设计。
+- 块 D 的 `RuntimeDeps` 引入新 trait 抽象。权衡：仅 `main.rs` 内部使用，影响范围可控；不为通用 DI，避免过度设计。注入面限定为 RuntimeHub 工厂 + worker spawn 适配，不抽象 env/clock/fs（已分别通过 `record::*`、`diag::*` 完成）。
 - 块 B 改动跨 Swift 多文件（`SessionModel`、`WorkbenchModel` 引用 `DaemonClient`）。权衡：放在阶段 1 最后做，一次性扫尾。
 - 块 A 改动最大且最容易触发回归。权衡：放在阶段 2，只在阶段 1 不达标时执行；重构前先写行为钉死测试。
 - 不接 CI 门禁脚本。权衡：仓库目前无 CI，门禁脚本闲置反而是债；`QUALITY.md` 描述性记录基线足够给未来 agent 提供判断依据。
@@ -140,3 +140,14 @@ cargo install cargo-llvm-cov
   - 计划中"session.started 前事件被缓冲、不丢失"在 codex.rs 不可测：`translate()` 无状态，看到什么翻什么，没有"先看 session.started 再放行"的门禁；也没有缓冲队列对象。C4 改为钉死两条可观测契约：`thread/started` 通知不变成 `AgentItem`（translate 返回 None，归 main.rs 边界消费）；且 item 事件在没有任何前导生命周期通知时仍被独立翻译——证明"缓冲 / 丢弃"责任不在 codex.rs。
   - 计划中"session.ended 触发 transport close signal"在 codex.rs 不可测：transport（`child` / `stdin` / `stdout` / `reader`）是 `CodexAdapter` 的私有字段，关闭由 `Drop for CodexAdapter` 完成（A1 第二层 + 进程组 SIGKILL），与 wire 上的 `thread/closed` 通知是两条独立路径。C4 改为钉死：`thread/closed` 通知翻译为 None（不是 AgentItem）；且 `thread/closed` 之后到达的 item 事件仍被翻译——"close 之后拒收"不归此层。transport 关闭的 signal 由 main.rs 调用方 / `CodexAdapter::Drop` 负责，与 wire 通知解耦。
   - 计划中"重复 session_started、以最新为准、旧 session 状态被清理"在 codex.rs 没有承载对象：`AgentItem` 没有 `session_id` 字段（`session_id` 只存在于 IPC envelope，由 main.rs 在写出时填充，见 `ipc.rs::IpcMessage`）；`translate()` 不缓存 sessionId。可测的等价契约：translate 对多次 `thread/started`（不同 sessionId）一致返回 None；其间到达的 item 事件的 `AgentItem` 输出与 sessionId 完全无关——序列化后既不含 `session_old` 也不含 `session_new`，证明 codex.rs 没有"旧 session 状态残留"对象。"以最新 session 为准 / 清理旧 session 状态"的责任明确归 main.rs 的 `RuntimeHubWorker` / `session_event` 路径。
+
+### 2026-06-02 修订记录
+
+C5 实测后两项决策更新：
+
+- **C5 目标下调**：`codex.rs` 行覆盖目标从 ≥ 88% 改为 ≥ 82%。C 块共加 16 个测试后实测 codex.rs = 82.31%。剩余约 17% 未覆盖集中在罕见 unknown event variants、turn_start 长循环的错误分支与 Drop 路径，强行追加测试会产生大量低价值断言（针对几乎不可能命中的协议路径）。Rust 整体目标 ≥ 75% 不变，杠杆改由 D 块（main.rs 从 34.83% → ≥ 65%）承担。
+- **D 块方向修正**：原计划"抽 `parse_args` + `CliCommand` + `RuntimeDeps`"在 D1+D2 实施前被 implementer 拒绝并报回——读 `agentdeckd/src/main.rs:1695-1830` 确认 Rust daemon 完全不解析 CLI flag。CLI 参数（`--selfcheck` / `--diagnostics-report` / `--profile`）的解析全部在 Swift 侧 `Sources/AgentDeck/main.swift`，daemon 通过 stdin JSONL 派发循环消费已分类的请求（`selfcheck/logging`、`diagnostics/report`、`history/*`、`turn/*` 等）。修订为：
+  - 抽 `run<R: BufRead, W: Write + Send + 'static>(stdin: R, stdout: W, deps: impl RuntimeDeps) -> std::io::Result<()>`，让 stdin/stdout 与 RuntimeHub/worker spawn 可注入测试。
+  - `RuntimeDeps` 仅注入 `RuntimeHub` 构造（容量参数）与 worker spawn 适配（生产用 `thread::spawn`，测试用 inline 执行 + 完成信号）；不抽 env/clock/fs。
+  - 写 dispatch 测试：覆盖空行跳过、malformed JSONL 错误帧、ping/pong、shutdown、selfcheck/logging、diagnostics/report 各路径与 RuntimeHub 拒绝并发同 session 的等错误反馈。
+  - selfcheck/diagnostics CLI 行为不变是 daemon JSONL 输出格式不变的等价命题，因为 Swift 入口只是把 stdout JSONL 转写为最终输出。
