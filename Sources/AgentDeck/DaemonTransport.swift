@@ -24,6 +24,28 @@ protocol DaemonTransport: AnyObject {
     /// context; implementations rely on it not blocking.
     func setIncomingHandler(_ handler: @escaping (IpcMessage) -> Void)
 
+    /// Register the sink for raw lines that failed to decode as `IpcMessage`.
+    /// B3 added this because the daemon's "send something garbage" diagnostic
+    /// surfaces here, and DaemonClient needs to route it to the router's
+    /// malformed-line bookkeeping rather than silently drop it.
+    func setMalformedLineHandler(_ handler: @escaping (String) -> Void)
+
+    /// Register the callback fired exactly once when the underlying transport
+    /// hits EOF / the peer goes away. DaemonClient uses it to close the router
+    /// (B3) so in-flight roundTrips fail fast instead of hanging.
+    func setDisconnectHandler(_ handler: @escaping () -> Void)
+
+    /// True between a successful `start()` and `shutdown()`. DaemonClient
+    /// uses this to guard `send` paths against "you forgot to start()" so the
+    /// error name is `notStarted` instead of a generic write failure.
+    var isStarted: Bool { get }
+
+    /// True while the underlying transport is believed live (process running,
+    /// pipe open, etc.). DaemonClient.shutdown gates its courtesy `bye` send
+    /// on this to avoid a guaranteed-fail roundTrip when the peer has already
+    /// gone away.
+    var isAlive: Bool { get }
+
     /// Best-effort synchronous teardown. Idempotent; never throws — shutdown
     /// is cleanup, not a failure path.
     func shutdown()

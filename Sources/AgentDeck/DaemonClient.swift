@@ -383,11 +383,10 @@ protocol RuntimeActionDeciding: AnyObject {
 /// Speaks the neutral JSONL IPC protocol on top of a `DaemonTransport`.
 ///
 /// B3 extracted the process+pipes+reader machinery into
-/// `ProcessDaemonTransport`; this class now owns only the protocol-level
-/// concerns (request-id allocation, router, kind-specific request/reply
-/// shaping). It still spawns the daemon eagerly today via a concrete
-/// `ProcessDaemonTransport`; B4 swaps that for an injected `DaemonTransport`
-/// so tests can stub the wire.
+/// `ProcessDaemonTransport`; B4 made the transport injectable so tests can
+/// stub the wire without touching `Process`/`Pipe`. The field is the protocol
+/// type, not the concrete class — production callers get a process-backed
+/// transport by default; tests pass in a `StubDaemonTransport`.
 ///
 /// Process lifecycle (Eng A1, first layer): the Swift app spawns the daemon;
 /// when the app exits — normally OR via this object deinit — the daemon is
@@ -396,24 +395,30 @@ protocol RuntimeActionDeciding: AnyObject {
 /// killing the daemon cascades to the app-server too — A1's second layer.)
 final class DaemonClient {
     private let profile: AgentDeckProfile
-    private let transport: ProcessDaemonTransport
+    private let transport: DaemonTransport
     private let router = DaemonMessageRouter()
     private let requestIdAllocator = DaemonRequestIdAllocator(startingAt: 1_000)
 
-    init(profile: AgentDeckProfile = .stable) {
+    /// Designated init. Tests pass an explicit `transport`; production callers
+    /// omit it and get a `ProcessDaemonTransport` bound to `profile`. Keeping
+    /// `transport` as a defaulted parameter (rather than splitting into a
+    /// convenience + designated pair) means every existing call site
+    /// (`DaemonClient()`, `DaemonClient(profile: .stable)`) keeps compiling
+    /// unchanged.
+    init(profile: AgentDeckProfile = .stable, transport: DaemonTransport? = nil) {
         self.profile = profile
-        self.transport = ProcessDaemonTransport(profile: profile)
+        self.transport = transport ?? ProcessDaemonTransport(profile: profile)
         // Wire the router as the transport's sink. The reader thread runs
         // inside the transport; these handlers run on that thread and the
         // router's locks make the cross-thread hop safe (B3 reshape).
         let router = self.router
-        transport.setIncomingHandler { message in
+        self.transport.setIncomingHandler { message in
             router.route(message)
         }
-        transport.setMalformedLineHandler { rawLine in
+        self.transport.setMalformedLineHandler { rawLine in
             router.routeMalformedLine(rawLine)
         }
-        transport.setDisconnectHandler {
+        self.transport.setDisconnectHandler {
             router.close()
         }
         router.onUnmatchedMessage = { message in
