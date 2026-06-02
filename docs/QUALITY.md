@@ -14,6 +14,54 @@ swift run AgentDeck -- --diagnostics-report --json --profile dev
 scripts/verify-agent-docs.sh
 ```
 
+## 测试覆盖率
+
+测量命令：
+
+```bash
+cargo llvm-cov --summary-only
+
+swift test --enable-code-coverage
+xcrun llvm-cov report \
+  .build/x86_64-apple-macosx/debug/AgentDeckPackageTests.xctest/Contents/MacOS/AgentDeckPackageTests \
+  -instr-profile=.build/x86_64-apple-macosx/debug/codecov/default.profdata \
+  $(pwd)/Sources
+```
+
+首次需要：
+
+```bash
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov
+```
+
+### 当前基线（2026-06-02 实测）
+
+| 范围 | 行覆盖 | 目标 | 备注 |
+| --- | --- | --- | --- |
+| Rust 整体 | 71.74% | ≥ 70% | `ipc.rs` 100% / `diag.rs` 97.22% / `record.rs` 92.83% / `codex.rs` 82.31% / `main.rs` 53.92% |
+| Swift 整体 | 30.69% | ≥ 30% | 模型层 ≥ 73%；视图层按策略接受低覆盖（见下） |
+| 加权整体 | 48.17% | ≥ 45% | (Rust 3175 + Swift 1831) / 10394 |
+
+### 显式不强求覆盖率的范围
+
+下列文件按策略接受低覆盖，靠 `swift run AgentDeck -- --selfcheck`、`--diagnostics-report --json` 和人工 QA 把关。新加代码不得借此豁免；只有声明式 UI 渲染、进程入口、AppKit 桥接才合规。
+
+- `Sources/AgentDeck/SessionView.swift`（声明式 SwiftUI 视图体；可抽出的纯逻辑已在 `ToolPresentation` / `ConversationRailNavigator` / `ConversationTurn` / `AgentItemReducer` / `SessionTextSelectionCoordinator` / `TurnJumpRailLayout` / `ConversationScrollSpy` 等先前工作中完成测试）
+- `Sources/AgentDeck/MessageRoleViews.swift`、`Sources/AgentDeck/RichMessageView.swift`、`Sources/AgentDeck/StreamingTextView.swift`（SwiftUI 视图渲染）
+- `Sources/AgentDeck/main.swift`（应用 bootstrapping）
+- `Sources/AgentDeck/ProcessDaemonTransport.swift`（真实 `Process` / `Pipe` / reader 线程；测试用 `Tests/AgentDeckTests/StubDaemonTransport.swift` 走 `DaemonTransport` 协议路径）
+- `agentdeckd/src/main.rs` 中 `HubAction::SpawnTurn` / `HubAction::ActionDecision` / `HubAction::History` 三条 worker 分派路径（需要 mock `RuntimeHub` 内部 channel 与 `ActionDecision` 协调，工作量与产出比偏低；其余 `fn run` 分派路径已由 `dispatch_tests` 覆盖）
+
+### 失败处理
+
+如果某次改动让覆盖率显著下降（如 Rust < 70% 或 Swift < 30%），先评估：
+
+- 是否新增了视图层 / 进程入口 / AppKit 桥接代码（按策略接受）→ 在显式不测清单里追加该文件。
+- 是否新增了核心路径代码（IPC、adapter、模型层）→ 补测试或拒绝该改动。
+
+不接 CI 门禁脚本。仓库目前无 CI；门禁脚本闲置反而是债。`docs/QUALITY.md` 描述性记录基线足够给未来 agent 提供判断依据。
+
 ## 按变更范围选择验证
 
 | 变更范围 | 最小验证 |
@@ -24,6 +72,7 @@ scripts/verify-agent-docs.sh
 | 诊断日志、自检、数据目录、profile、密钥脱敏 | `cargo test`；`swift run AgentDeck -- --selfcheck`；`swift run AgentDeck -- --diagnostics-report --json`；涉及 profile 时加跑 `swift run AgentDeck -- --selfcheck --profile dev` 和 `swift run AgentDeck -- --diagnostics-report --json --profile dev` |
 | 文档结构、AGENTS 入口、计划规则 | `scripts/verify-agent-docs.sh` |
 | 协议 schema 或 app-server 方法 | `cargo test`；核对 `protocol/SPIKE_FINDINGS.md` 和 `protocol/CODEX_VERSION.txt` |
+| 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 文档结构检查
 
