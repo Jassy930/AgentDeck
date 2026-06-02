@@ -1697,9 +1697,14 @@ fn send_turn_done_once(
 // workers without touching real OS threads.
 pub(crate) trait RuntimeDeps {
     fn hub_capacity(&self) -> usize;
+    /// Fire-and-forget worker spawn. The implementation MUST NOT block;
+    /// production wires this to `std::thread::spawn`, tests can execute `work`
+    /// synchronously. Completion is signaled by the closure itself via the
+    /// `RuntimeHubWorkerDone` channel, not by this trait.
     fn spawn_worker(&self, work: Box<dyn FnOnce() + Send + 'static>);
 }
 
+#[derive(Copy, Clone, Debug, Default)]
 pub(crate) struct LiveDeps;
 
 impl RuntimeDeps for LiveDeps {
@@ -2269,5 +2274,226 @@ mod tests {
         let err = write_outbound_messages(FailingWriter, out_rx).unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::BrokenPipe);
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    //! End-to-end JSONL dispatch tests for `run()`. `FakeDeps` runs spawned
+    //! workers synchronously and reports a hub capacity of 1, so stdout order
+    //! is deterministic without touching real OS threads (other than the
+    //! writer thread `run` itself spawns).
+    use super::*;
+    use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+
+    struct FakeDeps {
+        spawned: Mutex<usize>,
+    }
+
+    impl FakeDeps {
+        fn new() -> Self {
+            Self {
+                spawned: Mutex::new(0),
+            }
+        }
+        #[allow(dead_code)]
+        fn worker_count(&self) -> usize {
+            *self.spawned.lock().unwrap()
+        }
+    }
+
+    impl RuntimeDeps for FakeDeps {
+        fn hub_capacity(&self) -> usize {
+            1
+        }
+        fn spawn_worker(&self, work: Box<dyn FnOnce() + Send + 'static>) {
+            // Synchronous execution so the test can assert ordered stdout.
+            *self.spawned.lock().unwrap() += 1;
+            work();
+        }
+    }
+
+    #[derive(Clone)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedBuf {
+        fn new() -> Self {
+            Self(Arc::new(Mutex::new(Vec::new())))
+        }
+        fn bytes(&self) -> Vec<u8> {
+            self.0.lock().unwrap().clone()
+        }
+        fn text(&self) -> String {
+            String::from_utf8(self.bytes()).expect("utf8")
+        }
+    }
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn run_with(input: &[u8]) -> String {
+        let stdin = Cursor::new(input.to_vec());
+        let stdout = SharedBuf::new();
+        let deps = FakeDeps::new();
+        run(stdin, stdout.clone(), deps).expect("run ok");
+        stdout.text()
+    }
+
+    #[test]
+    fn dispatch_empty_lines_are_skipped() {
+        let out = run_with(b"\n\n{\"kind\":\"shutdown\",\"id\":1}\n");
+
+        // No malformed JSONL error frame should be emitted for empty lines.
+        assert!(
+            !out.contains("malformed JSONL"),
+            "blank lines must not surface as malformed JSONL: {out}"
+        );
+        // Pong for the shutdown id should appear (Shutdown emits a pong with
+        // the request id).
+        assert!(
+            out.contains(r#""kind":"pong""#) && out.contains(r#""id":1"#),
+            "expected pong with id=1 in {out}"
+        );
+        // Writer-stop sentinel is consumed by the writer thread and must NOT
+        // appear in the serialized stdout stream.
+        assert!(
+            !out.contains(WRITER_STOP_KIND),
+            "writer-stop sentinel must not be written to stdout: {out}"
+        );
+    }
+
+    #[test]
+    fn dispatch_malformed_jsonl_emits_error_and_continues() {
+        let out =
+            run_with(b"not json\n{\"kind\":\"ping\",\"id\":2}\n{\"kind\":\"shutdown\",\"id\":3}\n");
+
+        let err_pos = out
+            .find("malformed JSONL")
+            .expect("error frame mentioning malformed JSONL");
+        let pong2_pos = out
+            .find(r#""id":2"#)
+            .expect("pong frame for id=2 after the error");
+        let pong3_pos = out
+            .find(r#""id":3"#)
+            .expect("pong frame for id=3 after shutdown");
+
+        // Order: error -> ping pong -> shutdown pong.
+        assert!(
+            err_pos < pong2_pos && pong2_pos < pong3_pos,
+            "expected error then id=2 then id=3 in {out}"
+        );
+        assert!(out.contains(r#""kind":"error""#));
+        assert!(out.contains(r#""kind":"pong""#));
+    }
+
+    #[test]
+    fn dispatch_ping_returns_pong_with_same_id() {
+        let out = run_with(b"{\"kind\":\"ping\",\"id\":42}\n{\"kind\":\"shutdown\",\"id\":99}\n");
+
+        // Pong with id=42 must appear before the shutdown pong.
+        let pong42 = out.find(r#""id":42"#).expect("pong frame for id=42");
+        let pong99 = out
+            .find(r#""id":99"#)
+            .expect("pong frame for id=99 (shutdown)");
+        assert!(
+            pong42 < pong99,
+            "ping pong must precede shutdown pong: {out}"
+        );
+        assert!(out.contains(r#""kind":"pong""#));
+    }
+
+    #[test]
+    fn dispatch_shutdown_terminates_loop() {
+        let out = run_with(b"{\"kind\":\"shutdown\",\"id\":7}\n{\"kind\":\"ping\",\"id\":8}\n");
+
+        assert!(
+            out.contains(r#""id":7"#),
+            "shutdown pong with id=7 missing: {out}"
+        );
+        assert!(
+            !out.contains(r#""id":8"#),
+            "post-shutdown ping must not be processed: {out}"
+        );
+    }
+
+    #[test]
+    fn dispatch_logging_selfcheck_emits_completed_message() {
+        let out = run_with(
+            b"{\"kind\":\"selfcheck/logging\",\"id\":10}\n{\"kind\":\"shutdown\",\"id\":11}\n",
+        );
+
+        // run_logging_selfcheck emits a "loggingSelfcheck" frame with the
+        // request id and a probeId/runId payload. We don't assert recordOk
+        // truthiness because that depends on filesystem state, but the frame
+        // shape and id must be present.
+        assert!(
+            out.contains(r#""kind":"loggingSelfcheck""#),
+            "missing loggingSelfcheck frame: {out}"
+        );
+        assert!(
+            out.contains(r#""id":10"#),
+            "loggingSelfcheck must carry id=10: {out}"
+        );
+        assert!(
+            out.contains("probeId"),
+            "loggingSelfcheck payload must include probeId: {out}"
+        );
+        // Trailing shutdown pong proves the loop continued after selfcheck.
+        assert!(out.contains(r#""id":11"#));
+    }
+
+    #[test]
+    fn dispatch_diagnostics_report_emits_payload() {
+        let out = run_with(
+            b"{\"kind\":\"diagnostics/report\",\"id\":20,\"payload\":{\"format\":\"json\"}}\n{\"kind\":\"shutdown\",\"id\":21}\n",
+        );
+
+        // run_diagnostics_report emits a "diagnosticsReport" frame whose
+        // payload contains schemaVersion + dataDir/runsDir/diagnosticLog
+        // string hints (even when no data dir is configured, the helpers
+        // fall back to descriptive strings).
+        assert!(
+            out.contains(r#""kind":"diagnosticsReport""#),
+            "missing diagnosticsReport frame: {out}"
+        );
+        assert!(
+            out.contains(r#""id":20"#),
+            "diagnosticsReport must carry id=20: {out}"
+        );
+        assert!(
+            out.contains("schemaVersion"),
+            "diagnosticsReport payload must include schemaVersion: {out}"
+        );
+        // Trailing shutdown pong proves the loop continued after the report.
+        assert!(out.contains(r#""id":21"#));
+    }
+
+    #[test]
+    fn dispatch_classify_error_emits_error_with_msg_id() {
+        let out = run_with(
+            b"{\"kind\":\"bogus/whatever\",\"id\":99}\n{\"kind\":\"shutdown\",\"id\":100}\n",
+        );
+
+        // classify_request returns Err for unknown kinds; the run loop wraps
+        // it as IpcMessage::error(msg.id, ...). The resulting frame is
+        // `kind:"error"` with `id:99`.
+        assert!(
+            out.contains(r#""kind":"error""#),
+            "missing error frame: {out}"
+        );
+        assert!(
+            out.contains(r#""id":99"#),
+            "error frame must carry the offending msg.id=99: {out}"
+        );
+        // Shutdown pong follows.
+        assert!(out.contains(r#""id":100"#));
     }
 }
