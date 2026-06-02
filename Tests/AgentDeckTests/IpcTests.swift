@@ -121,6 +121,12 @@ struct AppLaunchProfileTests {
         #expect(AgentDeckProfile.stable.windowTitle == "AgentDeck")
         #expect(AgentDeckProfile.dev.windowTitle == "AgentDeck Dev")
     }
+
+    @Test("app exposes explicit quit command shortcut")
+    func appExposesExplicitQuitCommandShortcut() {
+        #expect(AgentDeckQuitCommand.title == "Quit AgentDeck")
+        #expect(AgentDeckQuitCommand.shortcutKey == "q")
+    }
 }
 
 @Suite("Daemon message routing")

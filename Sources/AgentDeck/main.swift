@@ -141,6 +141,16 @@ final class AppActivator: NSObject, NSApplicationDelegate {
     }
 }
 
+enum AgentDeckQuitCommand {
+    static let title = "Quit AgentDeck"
+    static let shortcutKey = "q"
+
+    @MainActor
+    static func terminate() {
+        NSApp.terminate(nil)
+    }
+}
+
 struct AgentDeckApp: App {
     @NSApplicationDelegateAdaptor(AppActivator.self) var activator
 
@@ -149,6 +159,14 @@ struct AgentDeckApp: App {
             SessionView()
         }
         .windowResizability(.contentSize)
+        .commands {
+            CommandGroup(replacing: .appTermination) {
+                Button(AgentDeckQuitCommand.title) {
+                    AgentDeckQuitCommand.terminate()
+                }
+                .keyboardShortcut(KeyEquivalent(Character(AgentDeckQuitCommand.shortcutKey)), modifiers: .command)
+            }
+        }
     }
 }
 
