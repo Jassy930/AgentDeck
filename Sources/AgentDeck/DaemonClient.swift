@@ -380,7 +380,14 @@ protocol RuntimeActionDeciding: AnyObject {
     func sendActionDecision(sessionId: String, requestId: UInt64, decision: String)
 }
 
-/// Owns the agentdeckd child process and the JSONL IPC channel to it.
+/// Speaks the neutral JSONL IPC protocol on top of a `DaemonTransport`.
+///
+/// B3 extracted the process+pipes+reader machinery into
+/// `ProcessDaemonTransport`; this class now owns only the protocol-level
+/// concerns (request-id allocation, router, kind-specific request/reply
+/// shaping). It still spawns the daemon eagerly today via a concrete
+/// `ProcessDaemonTransport`; B4 swaps that for an injected `DaemonTransport`
+/// so tests can stub the wire.
 ///
 /// Process lifecycle (Eng A1, first layer): the Swift app spawns the daemon;
 /// when the app exits — normally OR via this object deinit — the daemon is
@@ -389,18 +396,29 @@ protocol RuntimeActionDeciding: AnyObject {
 /// killing the daemon cascades to the app-server too — A1's second layer.)
 final class DaemonClient {
     private let profile: AgentDeckProfile
-    private let process = Process()
-    private let toDaemon = Pipe()
-    private let fromDaemon = Pipe()
-    private var reader: BufferedLineReader?
+    private let transport: ProcessDaemonTransport
     private let router = DaemonMessageRouter()
     private let requestIdAllocator = DaemonRequestIdAllocator(startingAt: 1_000)
-    private let lifecycleLock = NSLock()
-    private let writeLock = NSLock()
-    private var readerLoopStarted = false
 
     init(profile: AgentDeckProfile = .stable) {
         self.profile = profile
+        self.transport = ProcessDaemonTransport(profile: profile)
+        // Wire the router as the transport's sink. The reader thread runs
+        // inside the transport; these handlers run on that thread and the
+        // router's locks make the cross-thread hop safe (B3 reshape).
+        let router = self.router
+        transport.setIncomingHandler { message in
+            router.route(message)
+        }
+        transport.setMalformedLineHandler { rawLine in
+            router.routeMalformedLine(rawLine)
+        }
+        transport.setDisconnectHandler {
+            router.close()
+        }
+        router.onUnmatchedMessage = { message in
+            Self.writeDiagnostic("unmatched daemon message: \(message.kind)")
+        }
     }
 
     /// Locate the daemon binary. v0.1 uses PATH / dev-build lookup (Eng D-cwd
@@ -438,30 +456,7 @@ final class DaemonClient {
     }
 
     func start() throws {
-        lifecycleLock.lock()
-        defer { lifecycleLock.unlock() }
-        if readerLoopStarted {
-            return
-        }
-        guard let path = Self.locateDaemon() else {
-            throw DaemonError.binaryNotFound("target/{debug,release}/agentdeckd or PATH")
-        }
-        process.executableURL = URL(fileURLWithPath: path)
-        process.standardInput = toDaemon
-        process.standardOutput = fromDaemon
-        process.environment = Self.daemonEnvironment(profile: profile)
-        // stderr inherits — daemon diagnostic logging (Eng O1) lands in Step 5.
-        do {
-            try process.run()
-        } catch {
-            throw DaemonError.spawnFailed("\(error)")
-        }
-        let lineReader = BufferedLineReader(handle: fromDaemon.fileHandleForReading)
-        reader = lineReader
-        router.onUnmatchedMessage = { message in
-            Self.writeDiagnostic("unmatched daemon message: \(message.kind)")
-        }
-        startReaderLoop(lineReader)
+        try transport.start()
     }
 
     /// Send one neutral message and block for the correlated reply.
@@ -502,19 +497,16 @@ final class DaemonClient {
     }
 
     private func sendRoundTrip(_ msg: IpcMessage) throws -> IpcMessage {
-        if reader == nil {
+        if !transport.isStarted {
             try start()
         }
         guard let id = msg.id else {
             throw DaemonError.malformedReply("failed to assign id: \(msg.kind)")
         }
-        let enc = JSONEncoder()
-        var data = try enc.encode(msg)
-        data.append(0x0A) // newline-delimited JSON (D7-confirmed framing)
         guard router.registerPending(id: id) else {
             throw DaemonError.duplicateRequestId(id)
         }
-        write(data)
+        try transport.send(msg)
 
         guard let reply = router.waitForReply(id: id) else {
             throw DaemonError.disconnected
@@ -584,7 +576,7 @@ final class DaemonClient {
         cursor: String? = nil,
         limit: Int? = 50
     ) throws -> HistoryThreadListPayload {
-        if reader == nil {
+        if !transport.isStarted {
             try start()
         }
         let reply = try roundTripWithGeneratedId(Self.historyListRequest(
@@ -615,7 +607,7 @@ final class DaemonClient {
     }
 
     func readHistoryThread(threadId: String) throws -> HistoryThreadDetail {
-        if reader == nil {
+        if !transport.isStarted {
             try start()
         }
         let reply = try roundTripWithGeneratedId(Self.historyReadRequest(id: 3, threadId: threadId))
@@ -718,7 +710,7 @@ final class DaemonClient {
     }
 
     private func manageHistoryThread(_ request: IpcMessage) throws {
-        if reader == nil {
+        if !transport.isStarted {
             try start()
         }
         let reply = try roundTripWithGeneratedId(request)
@@ -762,7 +754,7 @@ final class DaemonClient {
         var line = data
         line.append(0x0A)
 
-        if reader == nil {
+        if !transport.isStarted {
             Task { @MainActor in
                 onLine(#"{"kind":"error","payload":{"message":"reader not initialized"}}"#)
             }
@@ -771,7 +763,13 @@ final class DaemonClient {
         router.setStreamLineHandler(expectedSessionId: "session_1") { raw in
             DispatchQueue.main.async { onLine(raw) }
         }
-        write(line)
+        do {
+            try transport.send(msg)
+        } catch {
+            Task { @MainActor in
+                onLine(#"{"kind":"error","payload":{"message":"failed to send startSession"}}"#)
+            }
+        }
     }
 
     func startTurn(
@@ -782,16 +780,7 @@ final class DaemonClient {
         // Deprecated compatibility path. Runtime-first callers must use the
         // overload below so events stay wrapped in neutral `session/event`.
         let msg = Self.startTurnRequest(id: 4, threadId: threadId, prompt: prompt)
-        guard let data = try? JSONEncoder().encode(msg) else {
-            Task { @MainActor in
-                onLine(#"{"kind":"error","payload":{"message":"failed to encode startTurn"}}"#)
-            }
-            return
-        }
-        var line = data
-        line.append(0x0A)
-
-        if reader == nil {
+        if !transport.isStarted {
             Task { @MainActor in
                 onLine(#"{"kind":"error","payload":{"message":"reader not initialized"}}"#)
             }
@@ -800,7 +789,13 @@ final class DaemonClient {
         router.setStreamLineHandler(expectedSessionId: "session_\(threadId)") { raw in
             DispatchQueue.main.async { onLine(raw) }
         }
-        write(line)
+        do {
+            try transport.send(msg)
+        } catch {
+            Task { @MainActor in
+                onLine(#"{"kind":"error","payload":{"message":"failed to send startTurn"}}"#)
+            }
+        }
     }
 
     func startTurn(
@@ -831,22 +826,8 @@ final class DaemonClient {
             }
             return
         }
-        guard let data = try? JSONEncoder().encode(msg) else {
-            Task { @MainActor in
-                onEvent(Self.syntheticSessionEvent(
-                    sessionId: sessionId,
-                    threadId: threadId,
-                    kind: "error",
-                    payload: ["message": "failed to encode runtime turn"]
-                ))
-            }
-            return
-        }
-        var line = data
-        line.append(0x0A)
-
         do {
-            if reader == nil {
+            if !transport.isStarted {
                 try start()
             }
         } catch {
@@ -892,7 +873,18 @@ final class DaemonClient {
                 onEvent: onEvent
             )
         }
-        write(line)
+        do {
+            try transport.send(msg)
+        } catch {
+            Task { @MainActor in
+                onEvent(Self.syntheticSessionEvent(
+                    sessionId: sessionId,
+                    threadId: threadId,
+                    kind: "error",
+                    payload: ["message": "\(error)"]
+                ))
+            }
+        }
     }
 
     func sendActionDecision(sessionId: String, requestId: UInt64, decision: String) {
@@ -902,14 +894,8 @@ final class DaemonClient {
             requestId: requestId,
             decision: decision
         ))
-        guard let data = try? JSONEncoder().encode(msg) else {
-            Self.writeDiagnostic("failed to encode actionDecision")
-            return
-        }
-        var line = data
-        line.append(0x0A)
         do {
-            if reader == nil {
+            if !transport.isStarted {
                 try start()
             }
         } catch {
@@ -922,7 +908,11 @@ final class DaemonClient {
                 _ = router.waitForReply(id: id)
             }
         }
-        write(line)
+        do {
+            try transport.send(msg)
+        } catch {
+            Self.writeDiagnostic("failed to send actionDecision: \(error)")
+        }
     }
 
     private func waitForTurnAccepted(
@@ -986,42 +976,19 @@ final class DaemonClient {
     /// Ask the daemon to shut down, then ensure it is gone (A1: app exit
     /// kills the daemon — request a clean shutdown, then hard-kill as backstop).
     func shutdown() {
-        if process.isRunning {
+        if transport.isStarted {
             let bye = IpcMessage(kind: "shutdown", id: 0, payload: nil)
             _ = try? roundTrip(bye)
         }
-        if process.isRunning {
-            process.terminate()
-        }
+        transport.shutdown()
     }
 
     deinit {
         // Backstop: even if the app forgot to call shutdown(), the daemon
-        // must not outlive its owner (A1 — no orphan daemon).
-        if process.isRunning { process.terminate() }
-    }
-
-    private func startReaderLoop(_ reader: BufferedLineReader) {
-        readerLoopStarted = true
-        let router = router
-        Thread.detachNewThread {
-            while let raw = reader.nextLine() {
-                if raw.isEmpty { continue }
-                do {
-                    let message = try JSONDecoder().decode(IpcMessage.self, from: Data(raw.utf8))
-                    router.route(message, rawLine: raw)
-                } catch {
-                    router.routeMalformedLine(raw)
-                }
-            }
-            router.close()
-        }
-    }
-
-    private func write(_ data: Data) {
-        writeLock.lock()
-        defer { writeLock.unlock() }
-        toDaemon.fileHandleForWriting.write(data)
+        // must not outlive its owner (A1 — no orphan daemon). The transport's
+        // own deinit also terminates the process; calling shutdown() here
+        // makes the ordering explicit and idempotent.
+        transport.shutdown()
     }
 
     private static func writeDiagnostic(_ message: String) {
@@ -1091,9 +1058,10 @@ final class DaemonHistoryDetailReader: HistoryDetailReading, @unchecked Sendable
 ///
 /// `@unchecked Sendable` is sound here by ownership discipline, not by
 /// thread-safety primitives: exactly ONE consumer touches a reader at a time.
-/// DaemonClient owns that consumer in its single reader loop. There is no
-/// overlap, so no lock is needed. (If a future change adds a second concurrent
-/// reader, this annotation is the thing to revisit.)
+/// `ProcessDaemonTransport` owns that consumer in its single reader loop
+/// (post-B3 the loop moved off `DaemonClient`). There is no overlap, so no
+/// lock is needed. (If a future change adds a second concurrent reader, this
+/// annotation is the thing to revisit.)
 final class BufferedLineReader: @unchecked Sendable {
     private let handle: FileHandle
     private var buffer = Data()
