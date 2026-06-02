@@ -138,8 +138,11 @@ struct DaemonClientStreamingTests {
             payload: AnyCodable(["event": ["kind": "turnComplete"]])
         ))
 
-        // Allow the DispatchQueue.main.async hop to drain.
-        try await Task.sleep(for: .milliseconds(50))
+        // Allow the DispatchQueue.main.async hop to drain. Polling the
+        // collector is deterministic (no fixed sleep), so we don't go flaky
+        // under coverage instrumentation when the dispatch hop is slower.
+        let arrived = await collected.waitForCount(1, timeout: 1.0)
+        #expect(arrived, "stream event should arrive within 1s")
         let lines = collected.snapshot()
         #expect(lines.count == 1)
         let decoded = try JSONDecoder().decode(IpcMessage.self, from: Data(try #require(lines.first).utf8))
@@ -170,7 +173,12 @@ struct DaemonClientStreamingTests {
             payload: AnyCodable(["event": ["kind": "turnComplete"]])
         ))
 
-        try await Task.sleep(for: .milliseconds(50))
+        // Probabilistic check: we can't deterministically wait for "nothing
+        // arrives", so we give the main-queue hop a generous window. 200ms
+        // is comfortable headroom even under coverage instrumentation while
+        // keeping the suite snappy. If the dispatch were to leak, the line
+        // would land here.
+        try await Task.sleep(for: .milliseconds(200))
         #expect(collected.snapshot().isEmpty)
     }
 
@@ -350,6 +358,23 @@ private final class LineCollector: @unchecked Sendable {
     func snapshot() -> [String] {
         lock.lock(); defer { lock.unlock() }
         return lines
+    }
+
+    /// Polls until `lines.count >= expected` or `timeout` elapses. Used by
+    /// tests that push a stream event and need to wait for the
+    /// `DispatchQueue.main.async` hop to drain without resorting to a fixed
+    /// `Task.sleep` (which goes flaky under coverage instrumentation).
+    ///
+    /// Counts are sampled via `snapshot()` so the NSLock is only ever held
+    /// across a synchronous call — never across an `await` suspension, which
+    /// would trip strict-concurrency `unlock()` unavailable-async warnings.
+    func waitForCount(_ expected: Int, timeout: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if snapshot().count >= expected { return true }
+            try? await Task.sleep(nanoseconds: 5_000_000)  // 5ms
+        }
+        return snapshot().count >= expected
     }
 }
 
