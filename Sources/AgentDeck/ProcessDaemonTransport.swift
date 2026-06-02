@@ -43,8 +43,8 @@ final class ProcessDaemonTransport: DaemonTransport, @unchecked Sendable {
 
     /// Whether `start()` has already spawned the daemon and the reader loop is
     /// running. Used by the owning client to lazy-start on the first request.
-    /// Not on the `DaemonTransport` protocol yet — B4 will revisit how clients
-    /// observe transport readiness.
+    /// Promoted onto the `DaemonTransport` protocol in B4 so test transports
+    /// can satisfy the same readiness contract.
     var isStarted: Bool {
         lifecycleLock.lock()
         defer { lifecycleLock.unlock() }
@@ -68,21 +68,22 @@ final class ProcessDaemonTransport: DaemonTransport, @unchecked Sendable {
         lifecycleLock.unlock()
     }
 
-    /// Sink for raw lines that fail JSON decoding. Kept off the `DaemonTransport`
-    /// protocol because the protocol only carries `IpcMessage`; the router
-    /// needs the raw-line variant to fan an `error` reply out to every pending
-    /// id (pinned by the B1 baseline `router_routes_malformed_line_...` test).
+    /// Sink for raw lines that fail JSON decoding. Promoted onto the
+    /// `DaemonTransport` protocol in B4 because the router needs the raw-line
+    /// variant to fan an `error` reply out to every pending id (pinned by the
+    /// B1 baseline `router_routes_malformed_line_...` test) — and stub
+    /// transports must drive that same fan-out.
     func setMalformedLineHandler(_ handler: @escaping (String) -> Void) {
         lifecycleLock.lock()
         malformedLineHandler = handler
         lifecycleLock.unlock()
     }
 
-    /// Sink for reader-loop termination (daemon EOF or shutdown). Kept off
-    /// the `DaemonTransport` protocol because shutdown signaling is the
-    /// router's concern, not the wire format's — `DaemonClient` uses it to
+    /// Sink for reader-loop termination (daemon EOF or shutdown). Promoted
+    /// onto the `DaemonTransport` protocol in B4 — `DaemonClient` uses it to
     /// close the router so blocked `waitForReply` calls surface
-    /// `DaemonError.disconnected` instead of hanging (Eng premise 9).
+    /// `DaemonError.disconnected` instead of hanging (Eng premise 9), and the
+    /// stub transport drives it via `triggerDisconnect()` to exercise that path.
     func setDisconnectHandler(_ handler: @escaping () -> Void) {
         lifecycleLock.lock()
         disconnectHandler = handler
