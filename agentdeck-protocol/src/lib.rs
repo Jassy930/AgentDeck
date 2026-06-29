@@ -10,10 +10,11 @@
 //! shell as a command block, fileEdit as a diff, WITHOUT parsing vendor
 //! formats (which would leak the boundary back into Swift).
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// A message on the neutral IPC wire (Swift ↔ daemon).
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 pub struct IpcMessage {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -93,7 +94,7 @@ impl IpcMessage {
 
 /// The neutral session state machine (Eng D9). The daemon owns this; the
 /// Swift app renders a mirror and never invents transitions.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum SessionState {
     Idle,
@@ -109,7 +110,7 @@ pub enum SessionState {
 /// Neutral request for a user decision before the agent performs a risky
 /// action. Adapter-specific fields stay behind the daemon boundary; Swift only
 /// sees these stable routing and presentation fields.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ActionRequest {
     pub request_id: u64,
@@ -129,7 +130,7 @@ pub struct ActionDecision {
 
 /// Lifecycle of a streaming item (Eng D4 / front-of-mind started→delta→
 /// completed). Neutral — not tied to any vendor's event names.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum Lifecycle {
     Started,
@@ -142,7 +143,8 @@ pub enum Lifecycle {
 /// types (Eng E1 + Codex #19): unknown items are neutralized HERE, in the
 /// daemon, and surface to Swift as `AgentItemKind::Raw` — the Swift app never
 /// sees vendor JSON directly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "A neutral agent item with per-kind structured payload.")]
 pub struct AgentItem {
     /// Stable id correlating started/delta/completed for the same item.
     pub id: String,
@@ -151,7 +153,7 @@ pub struct AgentItem {
     pub kind: AgentItemKind,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentReference {
     pub kind: String,
@@ -165,14 +167,14 @@ pub struct AgentReference {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HookFragment {
     pub hook_run_id: String,
     pub text: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FileEditChange {
     pub path: String,
@@ -180,7 +182,7 @@ pub struct FileEditChange {
     pub change_kind: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolAction {
     pub kind: String,
@@ -193,7 +195,7 @@ pub struct ToolAction {
     pub query: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum AgentItemKind {
     /// A user prompt restored from historical thread turns.
@@ -207,6 +209,7 @@ pub enum AgentItemKind {
     /// the D3 misread: D3's "reasoning default-collapsed" applies to the
     /// chain-of-thought below, not to the answer). `text` accumulates across
     /// deltas.
+    #[schemars(description = "The agent's primary user-facing answer. Text accumulates across deltas.")]
     Message {
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -217,6 +220,7 @@ pub enum AgentItemKind {
     /// The agent's chain-of-thought (Codex internal `reasoning`). Genuinely
     /// secondary — default-collapsed in the UI per Eng D3. Distinct from
     /// `Message`: this is HOW it thought, not the answer.
+    #[schemars(description = "The agent's chain-of-thought. Secondary, default-collapsed in UI.")]
     Reasoning {
         text: String,
     },
@@ -339,6 +343,7 @@ pub enum AgentItemKind {
     /// An unknown vendor item type, NEUTRALIZED in the daemon (Codex #19):
     /// only a short, size-limited description crosses to Swift, never raw
     /// vendor JSON. Fails loud, not silent (Eng E1 / premise 9).
+    #[schemars(description = "An unknown item type neutralized in the daemon. Only a short description crosses to Swift.")]
     Raw {
         description: String,
     },
@@ -348,7 +353,7 @@ pub enum AgentItemKind {
 /// `model_provider` and `source` are metadata from the runtime; the wire shape
 /// stays agent-neutral so Swift can group and render history without parsing a
 /// vendor protocol.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryThreadSummary {
     pub id: String,
@@ -362,23 +367,91 @@ pub struct HistoryThreadSummary {
     pub source: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryThreadList {
     pub threads: Vec<HistoryThreadSummary>,
     pub next_cursor: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryThreadDetail {
     pub thread: HistoryThreadSummary,
     pub items: Vec<AgentItem>,
 }
 
+/// 契约产物版本。改动协议形态时手动 +1，并重生成快照。
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// 生成版本化 JSON Schema 文档（聚合各 typed 协议组件）。
+/// 这是 `agentdeck protocol schema` 与 drift 测试的唯一来源。
+pub fn protocol_schema() -> serde_json::Value {
+    let mut defs = serde_json::Map::new();
+    macro_rules! add {
+        ($t:ty) => {
+            defs.insert(
+                stringify!($t).to_string(),
+                serde_json::to_value(schemars::schema_for!($t)).expect("schema serializes"),
+            );
+        };
+    }
+    add!(IpcMessage);
+    add!(SessionState);
+    add!(ActionRequest);
+    add!(Lifecycle);
+    add!(AgentItem);
+    add!(AgentItemKind);
+    add!(AgentReference);
+    add!(HookFragment);
+    add!(FileEditChange);
+    add!(ToolAction);
+    add!(HistoryThreadSummary);
+    add!(HistoryThreadList);
+    add!(HistoryThreadDetail);
+
+    serde_json::json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": "AgentDeck Neutral Protocol",
+        "protocolVersion": PROTOCOL_VERSION,
+        "definitions": serde_json::Value::Object(defs),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_version_is_positive() {
+        assert!(super::PROTOCOL_VERSION >= 1);
+    }
+
+    #[test]
+    fn schema_matches_committed_snapshot() {
+        let generated = serde_json::to_string_pretty(&super::protocol_schema()).unwrap() + "\n";
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../protocol/agentdeck/agentdeck-protocol.schema.json");
+        if std::env::var("UPDATE_SCHEMA").is_ok() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &generated).unwrap();
+            return;
+        }
+        let committed = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+            panic!("schema snapshot missing; run `UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot`")
+        });
+        assert_eq!(
+            generated, committed,
+            "protocol schema drifted; run `UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot` to regenerate"
+        );
+    }
+
+    #[test]
+    fn protocol_schema_has_no_vendor_names() {
+        let wire = serde_json::to_string(&super::protocol_schema()).unwrap().to_lowercase();
+        assert!(!wire.contains("codex"), "vendor name leaked into schema");
+        assert!(!wire.contains("openai"), "vendor name leaked into schema");
+    }
 
     #[test]
     fn ipc_message_can_carry_session_and_thread_routing() {
