@@ -2,7 +2,6 @@
 use agentdeck_protocol::IpcMessage;
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum CliError {
     Usage(String),
     Protocol(String),
@@ -34,7 +33,6 @@ impl CliError {
     }
 }
 
-#[allow(dead_code)]
 pub fn req(kind: &str, payload: Option<serde_json::Value>) -> IpcMessage {
     IpcMessage { kind: kind.to_string(), id: None, session_id: None, thread_id: None, payload }
 }

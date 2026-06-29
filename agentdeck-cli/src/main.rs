@@ -43,6 +43,42 @@ enum Command {
         #[command(subcommand)]
         what: HistoryCmd,
     },
+    /// 流式会话
+    Session {
+        #[command(subcommand)]
+        what: SessionCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionCmd {
+    /// 新会话
+    Run {
+        #[arg(long)] cwd: String,
+        #[arg(long)] prompt: String,
+        #[arg(long, value_enum, default_value_t = ApprovalArg::Prompt)]
+        approval_policy: ApprovalArg,
+    },
+    /// 在既有 thread 上继续
+    Continue {
+        #[arg(long)] thread_id: String,
+        #[arg(long)] prompt: String,
+        #[arg(long, value_enum, default_value_t = ApprovalArg::Prompt)]
+        approval_policy: ApprovalArg,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ApprovalArg { Prompt, AutoApprove, AutoDeny }
+
+impl From<ApprovalArg> for client::ApprovalPolicy {
+    fn from(a: ApprovalArg) -> Self {
+        match a {
+            ApprovalArg::Prompt => client::ApprovalPolicy::Prompt,
+            ApprovalArg::AutoApprove => client::ApprovalPolicy::AutoApprove,
+            ApprovalArg::AutoDeny => client::ApprovalPolicy::AutoDeny,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -140,6 +176,25 @@ fn run(cli: Cli) -> Result<(), CliError> {
             client.shutdown();
             println!("{}", render(&payload, cli.pretty));
             Ok(())
+        }
+        Command::Session { what } => {
+            let session_id = format!("cli-{}", std::process::id());
+            let (request, policy) = match what {
+                SessionCmd::Run { cwd, prompt, approval_policy } => (
+                    output::req("startSession", Some(serde_json::json!({"cwd": cwd, "prompt": prompt}))),
+                    approval_policy.into(),
+                ),
+                SessionCmd::Continue { thread_id, prompt, approval_policy } => (
+                    output::req("startTurn", Some(serde_json::json!({"threadId": thread_id, "prompt": prompt}))),
+                    approval_policy.into(),
+                ),
+            };
+            let mut client = connect(&cli.profile, cli.data_dir.as_deref())?;
+            let pretty = cli.pretty;
+            let mut emit = |inner: &serde_json::Value| println!("{}", render(inner, pretty));
+            let result = client.run_stream(request, &session_id, policy, &mut emit);
+            client.shutdown();
+            result
         }
     }
 }

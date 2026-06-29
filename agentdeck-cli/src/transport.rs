@@ -1,8 +1,10 @@
 use agentdeck_protocol::IpcMessage;
-use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+#[cfg(test)]
+use std::collections::VecDeque;
 
 /// 阻塞式单连接传输缝。`recv` 返回 `Ok(None)` 表示 daemon EOF/断连。
 pub trait Transport {
@@ -11,17 +13,20 @@ pub trait Transport {
 }
 
 /// 内存测试传输：记录发出的帧，按脚本顺序回放收到的帧。
+#[cfg(test)]
 pub struct FakeTransport {
     pub sent: Vec<IpcMessage>,
     incoming: VecDeque<IpcMessage>,
 }
 
+#[cfg(test)]
 impl FakeTransport {
     pub fn new(incoming: Vec<IpcMessage>) -> Self {
         Self { sent: Vec::new(), incoming: incoming.into() }
     }
 }
 
+#[cfg(test)]
 impl Transport for FakeTransport {
     fn send(&mut self, msg: &IpcMessage) -> std::io::Result<()> {
         self.sent.push(msg.clone());
