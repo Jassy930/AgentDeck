@@ -18,7 +18,6 @@ Package.resolved
 # Rust
 target/
 **/*.rs.bk
-Cargo.lock
 
 # AgentDeck local data (never committed — managed by AgentDeck itself)
 # Run records / diagnostic logs live in ~/Library/Application Support/AgentDeck/
