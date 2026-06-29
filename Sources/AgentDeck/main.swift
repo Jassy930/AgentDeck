@@ -1,4 +1,4 @@
-import SwiftUI
+import AppKit
 
 enum AgentDeckProfile: String, Equatable {
     case stable
@@ -128,19 +128,12 @@ if CommandLine.arguments.contains("--selfcheck") {
 }
 
 // A SwiftPM executable is a plain command-line binary, not a `.app`
-// bundle, so macOS treats it as a background tool by default — the
-// WindowGroup never shows (no Info.plist declaring it a GUI app). Force
-// regular activation policy and bring the app to the front so the window
+// bundle, so macOS treats it as a background tool by default — the window
+// never shows (no Info.plist declaring it a GUI app). The AppDelegate forces
+// the regular activation policy and brings the app to the front so the window
 // appears even when launched from a terminal. (A real `.app` bundle with
-// Info.plist is the Step 5 README distribution path; this makes the dev
-// build runnable too.)
-final class AppActivator: NSObject, NSApplicationDelegate {
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
-    }
-}
-
+// Info.plist is the README distribution path; this makes the dev build
+// runnable too.)
 enum AgentDeckQuitCommand {
     static let title = "Quit AgentDeck"
     static let shortcutKey = "q"
@@ -151,23 +144,7 @@ enum AgentDeckQuitCommand {
     }
 }
 
-struct AgentDeckApp: App {
-    @NSApplicationDelegateAdaptor(AppActivator.self) var activator
-
-    var body: some Scene {
-        WindowGroup(launchProfile.windowTitle) {
-            SessionView()
-        }
-        .windowResizability(.contentSize)
-        .commands {
-            CommandGroup(replacing: .appTermination) {
-                Button(AgentDeckQuitCommand.title) {
-                    AgentDeckQuitCommand.terminate()
-                }
-                .keyboardShortcut(KeyEquivalent(Character(AgentDeckQuitCommand.shortcutKey)), modifiers: .command)
-            }
-        }
-    }
-}
-
-AgentDeckApp.main()
+let app = NSApplication.shared
+let delegate = AppDelegate(profile: launchProfile)
+app.delegate = delegate
+app.run()

@@ -1,5 +1,4 @@
 import AppKit
-import SwiftUI
 
 enum StreamingTextStorageSyncResult: Equatable {
     case unchanged
@@ -71,32 +70,6 @@ final class StreamingTextBuffer: @unchecked Sendable {
         for observer in observers.values {
             observer(change)
         }
-    }
-}
-
-struct StreamingTextView: NSViewRepresentable {
-    let buffer: StreamingTextBuffer
-    let font: NSFont
-    let textColor: NSColor
-    var isSelectable = true
-
-    func makeNSView(context: Context) -> StreamingTextContainerView {
-        let view = StreamingTextContainerView()
-        view.update(buffer: buffer, font: font, textColor: textColor, isSelectable: isSelectable)
-        return view
-    }
-
-    func updateNSView(_ nsView: StreamingTextContainerView, context: Context) {
-        nsView.update(buffer: buffer, font: font, textColor: textColor, isSelectable: isSelectable)
-    }
-
-    func sizeThatFits(
-        _ proposal: ProposedViewSize,
-        nsView: StreamingTextContainerView,
-        context: Context
-    ) -> CGSize? {
-        let width = max(proposal.width ?? nsView.bounds.width, 1)
-        return CGSize(width: width, height: nsView.fittingHeight(for: width))
     }
 }
 
@@ -198,26 +171,6 @@ final class StreamingTextContainerView: NSView {
     /// code / link), not just plain text.
     var currentAttributedText: NSAttributedString {
         textView.textStorage ?? NSTextStorage()
-    }
-
-    // MARK: - SwiftUI NSViewRepresentable path (unchanged)
-
-    func update(buffer: StreamingTextBuffer, font: NSFont, textColor: NSColor, isSelectable: Bool) {
-        textView.font = font
-        textView.textColor = textColor
-        textView.isSelectable = isSelectable
-
-        if observedBuffer !== buffer {
-            if let observationToken {
-                observedBuffer?.removeObserver(observationToken)
-            }
-            observedBuffer = buffer
-            observationToken = buffer.observe { [weak self] change in
-                self?.apply(change)
-            }
-        }
-
-        markAppearanceChanged(font: font, textColor: textColor)
     }
 
     deinit {

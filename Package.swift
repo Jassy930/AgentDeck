@@ -12,15 +12,9 @@ import PackageDescription
 let package = Package(
     name: "AgentDeck",
     platforms: [.macOS(.v15)],
-    dependencies: [
-        .package(url: "https://github.com/gonzalezreal/textual", from: "0.3.1"),
-    ],
     targets: [
         .executableTarget(
             name: "AgentDeck",
-            dependencies: [
-                .product(name: "Textual", package: "textual"),
-            ],
             path: "Sources/AgentDeck",
             resources: [
                 .process("Resources"),
@@ -30,7 +24,6 @@ let package = Package(
             name: "AgentDeckTests",
             dependencies: [
                 "AgentDeck",
-                .product(name: "Textual", package: "textual"),
             ],
             path: "Tests/AgentDeckTests"
         ),

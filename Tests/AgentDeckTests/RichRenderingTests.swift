@@ -1,59 +1,15 @@
 import Testing
-import Textual
 import CoreGraphics
 import Foundation
 @testable import AgentDeck
 
-@Suite("Textual compatibility")
-struct TextualCompatibilityTests {
-    @MainActor
-    @Test("StructuredText accepts markdown with code block and table")
-    func structuredTextAcceptsMarkdownBlocks() {
-        let markdown = """
-        ## Result
-
-        ```swift
-        let value = 42
-        ```
-
-        | Name | Count |
-        | --- | ---: |
-        | Build | 12 |
-        """
-
-        _ = StructuredText(markdown: markdown)
-    }
-
-    @MainActor
-    @Test("rich message view stores raw markdown for Textual rendering")
-    func richMessageViewStoresRawMarkdown() {
-        let state = RichMessageRenderState()
-
-        state.replace("## Result")
-
-        #expect(state.markdown == "## Result")
-    }
-
-    @MainActor
-    @Test("rich message view can be created from streaming buffer")
-    func richMessageViewCanBeCreatedFromStreamingBuffer() {
-        let buffer = StreamingTextBuffer()
-
-        _ = RichMessageView(buffer: buffer)
-    }
-
-    @MainActor
-    @Test("document reader role views can be created")
-    func documentReaderRoleViewsCanBeCreated() {
-        let buffer = StreamingTextBuffer()
-
-        _ = UserPromptBlock(text: "Summarize the plan")
-        _ = StaticRichMessageView(markdown: "Summarize the plan")
-        _ = CodexTurnSection {
-            RichMessageView(buffer: buffer)
-        }
-    }
-
+/// Framework-agnostic rendering/geometry assertions that survived the AppKit
+/// cutover. The former SwiftUI-view-construction cases (RichMessageView,
+/// UserPromptBlock, StaticRichMessageView, CodexTurnSection, TurnJumpRail) and
+/// the Textual `StructuredText` smoke test were removed with the SwiftUI layer;
+/// markdown rendering is now covered by `MarkdownAttributedStringBuilder` tests.
+@Suite("Rich rendering")
+struct RichRenderingTests {
     @Test("image generation media selects saved path for preview")
     func imageGenerationMediaSelectsSavedPathForPreview() {
         var item = UIItem(id: "ig1", lifecycle: "completed", kind: "media")
@@ -111,32 +67,6 @@ struct TextualCompatibilityTests {
         #expect(items[0].attachmentCount == 2)
         #expect(items[1].summary == "continue")
         #expect(items[1].attachmentCount == 0)
-    }
-
-    @Test("turn jump rail can be constructed")
-    @MainActor
-    func turnJumpRailCanBeConstructed() {
-        let item = ConversationTurnNavigationItem(
-            turnId: "u1",
-            index: 1,
-            summary: "find docs",
-            attachmentCount: 0
-        )
-
-        _ = TurnJumpRail(
-            items: [],
-            selectedTurnId: nil,
-            onJump: { _ in },
-            onJumpLatest: {},
-            onWheelStep: { _ in }
-        )
-        _ = TurnJumpRail(
-            items: [item],
-            selectedTurnId: item.turnId,
-            onJump: { _ in },
-            onJumpLatest: {},
-            onWheelStep: { _ in }
-        )
     }
 
     @Test("turn jump rail hit testing covers full rail positions")
@@ -215,26 +145,6 @@ struct TextualCompatibilityTests {
         #expect(visualFirst < baseFirst)
         #expect(visualLast > baseLast)
         #expect(visualLast - visualFirst > baseLast - baseFirst)
-    }
-
-    @Test("conversation scroll spy follows the turn nearest the viewport top")
-    func conversationScrollSpyFollowsTheTurnNearestTheViewportTop() {
-        #expect(ConversationScrollSpy.currentTurnId(from: [
-            ConversationTurnViewportPosition(turnId: "u1", minY: 18),
-            ConversationTurnViewportPosition(turnId: "u2", minY: 260),
-        ]) == "u1")
-
-        #expect(ConversationScrollSpy.currentTurnId(from: [
-            ConversationTurnViewportPosition(turnId: "u1", minY: -180),
-            ConversationTurnViewportPosition(turnId: "u2", minY: 20),
-            ConversationTurnViewportPosition(turnId: "u3", minY: 260),
-        ]) == "u2")
-
-        #expect(ConversationScrollSpy.currentTurnId(from: [
-            ConversationTurnViewportPosition(turnId: "u1", minY: -320),
-            ConversationTurnViewportPosition(turnId: "u2", minY: -80),
-            ConversationTurnViewportPosition(turnId: "u3", minY: 180),
-        ]) == "u2")
     }
 
     @Test("turn jump rail step target clamps at edges")

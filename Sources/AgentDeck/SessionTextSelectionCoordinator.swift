@@ -1,5 +1,4 @@
 import AppKit
-import SwiftUI
 
 @MainActor
 final class SessionTextSelectionOwner {
@@ -33,23 +32,6 @@ final class SessionTextSelectionCoordinator {
     func deactivate(_ owner: SessionTextSelectionOwner) {
         guard activeOwner === owner else { return }
         activeOwner = nil
-    }
-}
-
-struct SessionTextSelectionActivationMonitor: NSViewRepresentable {
-    let owner: SessionTextSelectionOwner
-    var coordinator: SessionTextSelectionCoordinator = .shared
-
-    func makeNSView(context: Context) -> SessionTextSelectionActivationView {
-        let view = SessionTextSelectionActivationView()
-        view.owner = owner
-        view.selectionCoordinator = coordinator
-        return view
-    }
-
-    func updateNSView(_ nsView: SessionTextSelectionActivationView, context: Context) {
-        nsView.owner = owner
-        nsView.selectionCoordinator = coordinator
     }
 }
 
