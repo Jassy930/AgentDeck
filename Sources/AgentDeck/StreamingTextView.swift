@@ -133,6 +133,38 @@ final class StreamingTextContainerView: NSView {
         textView.frame = NSRect(x: 0, y: 0, width: bounds.width, height: height)
     }
 
+    // MARK: - Rebindable AppKit core interface (Task 6)
+
+    /// Bind this view to a new buffer, cancelling any previous subscription.
+    /// Safe to call multiple times (rebind for cell reuse).
+    func bindBuffer(to buffer: StreamingTextBuffer, font: NSFont, color: NSColor) {
+        unbind()
+        textView.font = font
+        textView.textColor = color
+        textView.isSelectable = true
+        observedBuffer = buffer
+        observationToken = buffer.observe { [weak self] change in
+            self?.apply(change)
+        }
+        markAppearanceChanged(font: font, textColor: color)
+    }
+
+    /// Cancel the current buffer subscription without clearing displayed text.
+    func unbind() {
+        if let token = observationToken {
+            observedBuffer?.removeObserver(token)
+            observationToken = nil
+        }
+        observedBuffer = nil
+    }
+
+    /// The text currently displayed in the text view. Read-only; intended for testing and AppKit consumers.
+    var currentText: String {
+        textView.string
+    }
+
+    // MARK: - SwiftUI NSViewRepresentable path (unchanged)
+
     func update(buffer: StreamingTextBuffer, font: NSFont, textColor: NSColor, isSelectable: Bool) {
         textView.font = font
         textView.textColor = textColor
