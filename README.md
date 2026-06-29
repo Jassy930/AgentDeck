@@ -35,7 +35,13 @@ v0.1 验收两件事（"双拍"）：
 ## 架构
 
 ```
-AgentDeck.app  (macOS, SwiftUI + AppKit)
+AgentDeck.app  (macOS, 纯 AppKit)
+      │  前端为 AppKit NSViewController 树（SessionViewController →
+      │  StatusBarView + NSSplitView[HistorySidebarViewController(NSOutlineView)
+      │  | ConversationViewController(虚拟化 NSTableView) + TurnJumpRailView]）；
+      │  Markdown 渲染使用原生 NSAttributedString（已移除 Textual 依赖）；
+      │  模型层经 ObservationBinder 消费 @Observable 模型。
+      │
       │  stdio JSONL IPC（中立 AgentItem，无 Codex 字样）
       ▼
 agentdeckd  (Rust daemon)
@@ -63,7 +69,8 @@ app-server 的 server request 映射成中立 `actionRequest`，Swift 只显示
 流式性能边界：daemon 不合并 Codex delta，而是忠实转发中立
 `agentItem`；Swift 端的 `SessionModel` 按约 30fps 合并待渲染 delta，并把
 message / reasoning / shell / diff 长文本交给 AppKit `NSTextView` +
-`NSTextStorage` 增量追加，避免 SwiftUI `Text` 在 token 流中反复测量整段文本。
+`NSTextStorage` 增量追加；会话流由虚拟化 NSTableView 按需渲染可见行，
+避免在 token 流中反复布局整个视图树。
 
 ## 历史会话
 

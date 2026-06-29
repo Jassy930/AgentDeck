@@ -14,6 +14,49 @@ swift run AgentDeck -- --diagnostics-report --json --profile dev
 scripts/verify-agent-docs.sh
 ```
 
+## AppKit 重写后的验证清单
+
+前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。
+
+### 必跑验证命令
+
+```bash
+# 零 SwiftUI / Textual import（必须为空输出）
+grep -rn "import SwiftUI" Sources Tests
+
+# 构建与测试
+swift build
+swift test   # 覆盖：markdown builder、display-row、observation binder、
+             #         行高缓存、契约一致性、rail 几何、smoke tests
+
+# headless 自检（IPC 生命周期 + 日志/脱敏）
+swift run AgentDeck -- --selfcheck
+
+# 文档结构检查
+bash scripts/verify-agent-docs.sh
+
+# Rust 后端（确认后端/协议未被牵动）
+cargo test
+```
+
+### 手动 `swift run AgentDeck` 核验清单
+
+下列项目无法通过单元测试覆盖，须每次发布前人工验证：
+
+- [ ] 应用正常启动，窗口标题显示 `AgentDeck Dev`（debug 构建）
+- [ ] 左侧历史侧栏（NSOutlineView）宽度约 260pt，可自由拖动分割线
+- [ ] 历史列表刷新后按项目 `cwd` 分组展示
+- [ ] 新建会话（点击项目旁加号）→ 右侧显示空状态视图
+- [ ] 发送第一条 prompt → 会话流开始流式渲染（reasoning / shell / file-edit 行）
+- [ ] 高风险操作触发 approve / deny 控件
+- [ ] TurnJumpRail 导航点随轮次更新；点击可跳转
+- [ ] 继续历史会话：点击历史行 → 右侧回放历史 items
+- [ ] Cmd-Q 正常退出
+
+### 已知遗落的功能对等差异
+
+- **点击空白处清除文字选中**：原 SwiftUI 实现中的 `SessionTextSelectionActivationView`（监听区域内鼠标点击来切换 active owner）已在 AppKit 重写后删除，该功能未移植。单条 cell 内点击文字仍可选择；跨 cell 的 active selection 通过 `SessionTextSelectionCoordinator` 正常维护。此差异为有意取舍，不视为缺陷。
+
 ## 测试覆盖率
 
 测量命令：
@@ -45,11 +88,14 @@ cargo install cargo-llvm-cov
 
 ### 显式不强求覆盖率的范围
 
-下列文件按策略接受低覆盖，靠 `swift run AgentDeck -- --selfcheck`、`--diagnostics-report --json` 和人工 QA 把关。新加代码不得借此豁免；只有声明式 UI 渲染、进程入口、AppKit 桥接才合规。
+下列文件按策略接受低覆盖，靠 `swift run AgentDeck -- --selfcheck`、`--diagnostics-report --json` 和人工 QA 把关。新加代码不得借此豁免；只有进程入口、AppKit 视图控制器装配、真实 IO 桥接才合规。
 
-- `Sources/AgentDeck/SessionView.swift`（声明式 SwiftUI 视图体；可抽出的纯逻辑已在 `ToolPresentation` / `ConversationRailNavigator` / `ConversationTurn` / `AgentItemReducer` / `SessionTextSelectionCoordinator` / `TurnJumpRailLayout` / `ConversationScrollSpy` 等先前工作中完成测试）
-- `Sources/AgentDeck/MessageRoleViews.swift`、`Sources/AgentDeck/RichMessageView.swift`、`Sources/AgentDeck/StreamingTextView.swift`（SwiftUI 视图渲染）
+- `Sources/AgentDeck/SessionViewController.swift`（AppKit 视图控制器装配；纯逻辑已在 `ObservationBinder` / `TurnJumpRailLayout` / `ConversationRailNavigator` / `SessionTextSelectionCoordinator` 等测试中覆盖）
+- `Sources/AgentDeck/HistorySidebarViewController.swift`、`Sources/AgentDeck/ConversationViewController.swift`（NSOutlineView / NSTableView delegate 与数据源；与 AppKit 运行时强耦合）
+- `Sources/AgentDeck/ConversationRowFactory.swift`、`Sources/AgentDeck/ConversationRowViews.swift`（AppKit NSView 行视图）
+- `Sources/AgentDeck/StatusBarView.swift`、`Sources/AgentDeck/TurnJumpRailView.swift`、`Sources/AgentDeck/EmptyStateView.swift`（AppKit 视图渲染）
 - `Sources/AgentDeck/main.swift`（应用 bootstrapping）
+- `Sources/AgentDeck/AppDelegate.swift`（NSApplication 生命周期）
 - `Sources/AgentDeck/ProcessDaemonTransport.swift`（真实 `Process` / `Pipe` / reader 线程；测试用 `Tests/AgentDeckTests/StubDaemonTransport.swift` 走 `DaemonTransport` 协议路径）
 - `agentdeckd/src/main.rs` 中 `HubAction::SpawnTurn` / `HubAction::ActionDecision` / `HubAction::History` 三条 worker 分派路径（需要 mock `RuntimeHub` 内部 channel 与 `ActionDecision` 协调，工作量与产出比偏低；其余 `fn run` 分派路径已由 `dispatch_tests` 覆盖）
 

@@ -53,6 +53,11 @@ final class SessionViewController: NSViewController {
     /// Composite view that holds conversationVC.view + rail overlay.
     private let conversationComposite = NSView()
 
+    // MARK: - Split view (retained for deferred initial-width application)
+
+    private weak var splitVC: NSSplitViewController?
+    private var didApplyInitialSidebarWidth = false
+
     // MARK: - Observation
 
     private let binder = ObservationBinder()
@@ -91,11 +96,12 @@ final class SessionViewController: NSViewController {
         splitVC.splitView.dividerStyle = .thin
 
         let sidebarItem = NSSplitViewItem(sidebarWithViewController: historySidebarVC)
-        sidebarItem.minimumThickness = 160
+        sidebarItem.minimumThickness = 200
         sidebarItem.maximumThickness = 400
         sidebarItem.preferredThicknessFraction = NSSplitViewItem.unspecifiedDimension
-        // Set initial width to 260pt; the user can resize freely after that.
-        splitVC.splitView.setPosition(260, ofDividerAt: 0)
+        // setPosition is deferred to viewDidLayout (first pass) so the split
+        // view already has a real frame; calling it here (pre-layout) is a
+        // no-op on some macOS versions, leaving the sidebar at ~160pt.
 
         let contentItem = NSSplitViewItem(viewController: makeContentContainerVC())
         contentItem.minimumThickness = 300
@@ -104,6 +110,7 @@ final class SessionViewController: NSViewController {
         splitVC.addSplitViewItem(contentItem)
 
         addChild(splitVC)
+        self.splitVC = splitVC
         splitVC.view.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(splitVC.view)
 
@@ -130,6 +137,16 @@ final class SessionViewController: NSViewController {
         observeCwdChanges()
         // Apply initial content based on current cwd state
         updateContentPane(hasCwd: model.cwd != nil)
+    }
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        // Apply the 260pt initial sidebar width on the first layout pass, when
+        // the split view has a real frame and setPosition takes effect.
+        guard !didApplyInitialSidebarWidth, let sv = splitVC?.splitView,
+              sv.frame.width > 0 else { return }
+        sv.setPosition(260, ofDividerAt: 0)
+        didApplyInitialSidebarWidth = true
     }
 
     // MARK: - Content container VC

@@ -137,11 +137,6 @@ if CommandLine.arguments.contains("--selfcheck") {
 enum AgentDeckQuitCommand {
     static let title = "Quit AgentDeck"
     static let shortcutKey = "q"
-
-    @MainActor
-    static func terminate() {
-        NSApp.terminate(nil)
-    }
 }
 
 let app = NSApplication.shared

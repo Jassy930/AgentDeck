@@ -14,7 +14,17 @@ v0.1 只验证两个核心能力：
 ## 总体结构
 
 ```text
-AgentDeck.app  (macOS, SwiftUI + AppKit)
+AgentDeck.app  (macOS, 纯 AppKit)
+      │                     前端为 AppKit NSViewController 树：
+      │   SessionViewController
+      │     ├── StatusBarView
+      │     └── NSSplitView
+      │           ├── HistorySidebarViewController（NSOutlineView）
+      │           └── ConversationViewController（虚拟化 NSTableView）
+      │                 └── TurnJumpRailView（叠加层）
+      │   Markdown 渲染：原生 NSAttributedString（已移除 Textual 依赖）
+      │   模型层：经 ObservationBinder 消费 @Observable 模型
+      │
       │  stdio JSONL IPC，中立 AgentItem / ActionRequest / ActionDecision
       ▼
 agentdeckd  (Rust daemon)
@@ -104,7 +114,7 @@ agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
 
 ## 变更指引
 
-- 改 UI 行为：先看相关 `Sources/AgentDeck/*Model.swift` 与最近的 `docs/plans/*design.md`。
+- 改 UI 行为：先看相关 `Sources/AgentDeck/*ViewController.swift` / `*Model.swift` 与最近的 `docs/plans/*design.md`。
 - 改 IPC：同步更新 Swift/Rust 两侧模型、测试和 README/架构文档。
 - 改 Codex 协议翻译：先看 `protocol/SPIKE_FINDINGS.md` 和 `protocol/CODEX_VERSION.txt`，再改 adapter。
 - 改诊断或记录：同步更新 `docs/AGENT_DIAGNOSTICS.md` 和 `docs/QUALITY.md`。
