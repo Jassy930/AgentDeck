@@ -96,7 +96,7 @@ agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
 
 `agentdeck-protocol` crate 是 IPC 协议的唯一事实源：
 
-- `PROTOCOL_VERSION`：语义版本字符串，用于 `protocol version` 子命令输出与漂移检测。
+- `PROTOCOL_VERSION`：协议版本整数（`u32`，当前为 1），用于 `protocol version` 子命令输出（`{"protocolVersion": 1}`）与漂移检测。
 - `protocol_schema()`：通过 schemars 从 Rust 类型派生的 JSON Schema，输出即 `protocol schema` 子命令所印内容。
 - 快照文件：`protocol/agentdeck/agentdeck-protocol.schema.json`（由 `UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot` 重新生成）。
 - 漂移测试随 `cargo test` 运行：协议类型变更而未重新生成快照则失败。

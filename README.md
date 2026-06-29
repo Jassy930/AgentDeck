@@ -166,7 +166,8 @@ agentdeck selfcheck                     # IPC 生命周期 + logging 自检
 agentdeck diagnostics report            # 输出机器可读诊断报告（JSON）
 agentdeck protocol schema               # 打印 IPC 协议 JSON Schema
 agentdeck protocol version              # 打印协议版本号
-agentdeck session run --prompt "..."    # 启动流式会话
+agentdeck session run \
+  --cwd <path> --prompt "..."           # 启动流式会话（--cwd 必填）
 agentdeck session continue \
   --thread-id <id> --prompt "..."       # 继续历史 thread
 agentdeck history list                  # 列出历史 threads

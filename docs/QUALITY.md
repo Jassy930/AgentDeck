@@ -98,17 +98,19 @@ cargo run -q -p agentdeck-cli -- protocol schema \
 
 ## 门控 E2E 测试
 
-`agentdeck-cli/tests/e2e.rs` 是真实 daemon 的 E2E 集成测试，默认被跳过（`#[ignore]`）。启用方式：
+`agentdeck-cli/tests/e2e.rs` 是真实 daemon 的 E2E 集成测试。启用方式：
 
 ```bash
 AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e
 ```
 
+**门控机制：** 每个测试在未设置环境变量 `AGENTDECK_E2E` 时 `eprintln!("skipped...")` 后直接早返回（不是 `#[ignore]`，因此不能用 `--ignored` 启用；标准 `cargo test` 中显示为 passed 而非 ignored）。设 `AGENTDECK_E2E=1`（需 `codex login`）才真正运行。
+
 **前置条件：** `codex login` 已完成（测试会真实 spawn daemon 并发送 IPC）。
 
 **断言策略：** E2E 测试只断言响应的契约形态（消息 kind、必要字段存在、退出码等），不断言 agent 返回的具体文本内容，以避免测试因模型输出变化而 flaky。
 
-**CI 默认跳过：** 不设置 `AGENTDECK_E2E=1` 时，标准 `cargo test` 不触发 E2E，不需要 `codex login`。
+**CI 默认跳过：** 不设置 `AGENTDECK_E2E=1` 时，标准 `cargo test` 不触发真实 E2E，不需要 `codex login`。
 
 ## 文档结构检查
 
