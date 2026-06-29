@@ -305,6 +305,21 @@ final class ConversationViewController: NSViewController {
         tableView.scrollRowToVisible(rows.count - 1)
     }
 
+    // MARK: Public scroll API (rail wiring — Task 11)
+
+    /// Scroll the row whose `turnId` matches `turnId` into view.
+    /// No-op when no matching row exists or the transcript is empty.
+    func scrollToTurn(_ turnId: String) {
+        guard let index = rows.firstIndex(where: { $0.turnId == turnId }) else { return }
+        tableView.scrollRowToVisible(index)
+    }
+
+    /// Public wrapper over the private `scrollToLatestRow()`.
+    /// Used by `TurnJumpRailView.onJumpToLatest` (Task 11).
+    func scrollToLatest() {
+        scrollToLatestRow()
+    }
+
     // MARK: Height helpers
 
     private var columnWidth: CGFloat {
