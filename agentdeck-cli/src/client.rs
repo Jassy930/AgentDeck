@@ -229,6 +229,15 @@ mod tests {
     }
 
     #[test]
+    fn decide_fixed_policies_map_to_decisions() {
+        let client = Client::new(FakeTransport::new(vec![]));
+        assert_eq!(client.decide(ApprovalPolicy::AutoApprove, 1).unwrap(), "approve");
+        assert_eq!(client.decide(ApprovalPolicy::AutoDeny, 1).unwrap(), "deny");
+        // Prompt 分支读 stdin，不在单测覆盖；构造一次以消除 dead_code 并表意
+        let _prompt = ApprovalPolicy::Prompt;
+    }
+
+    #[test]
     fn run_stream_inner_error_is_session_failure() {
         let t = FakeTransport::new(vec![
             msg("turnAccepted", Some(1000), None),
