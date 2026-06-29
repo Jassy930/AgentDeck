@@ -241,9 +241,13 @@ final class UserPromptCellView: ConversationRowCellView {
 
 // MARK: - Message (streaming markdown)
 
-/// Ports the assistant "message" branch: streaming text. SwiftUI renders this
-/// through Textual's GitHub-flavoured markdown; the AppKit transcript streams
-/// the raw text via `bindBuffer` (selectable), the locked AppKit-core path.
+/// Ports the assistant "message" branch: streaming RICH markdown (design §5).
+/// SwiftUI renders this through Textual's GitHub-flavoured markdown; the AppKit
+/// transcript streams the text through `bindMarkdownBuffer`, which re-renders
+/// the whole buffer via `MarkdownAttributedStringBuilder` on every change so
+/// bold / inline-code / links appear — matching userPrompt and the original.
+/// Height (factory) is measured from the SAME markdown attributed string, so
+/// measurement and rendering can never disagree.
 final class MessageCellView: ConversationRowCellView {
     override var verticalPadding: CGFloat { 4 }
 
@@ -261,11 +265,7 @@ final class MessageCellView: ConversationRowCellView {
     required init?(coder: NSCoder) { super.init(coder: coder) }
 
     override func configure(row: ConversationDisplayRow, width: CGFloat, model: SessionModel) {
-        streamingView.bindBuffer(
-            to: row.item.textBuffer,
-            font: ConversationRowMetrics.calloutFont,
-            color: .labelColor
-        )
+        streamingView.bindMarkdownBuffer(to: row.item.textBuffer, style: .standard)
     }
 }
 

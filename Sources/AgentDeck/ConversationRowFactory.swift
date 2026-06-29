@@ -105,9 +105,12 @@ enum ConversationRowFactory {
 
         switch item.kind {
         case "message":
-            // padding(.vertical, 4) + streaming callout text.
+            // padding(.vertical, 4) + streaming RICH markdown. Measured from the
+            // SAME markdown attributed string the cell renders (design §5), so
+            // measurement and rendering can never diverge.
             let pad: CGFloat = 4 * 2
-            return pad + max(textHeight(item.text, font: ConversationRowMetrics.calloutFont, width: contentW),
+            let attributed = MarkdownAttributedStringBuilder.attributedString(from: item.text, style: .standard)
+            return pad + max(measuredTextHeight(attributed, width: contentW),
                              ConversationRowMetrics.lineHeight(ConversationRowMetrics.calloutFont))
 
         case "reasoning":

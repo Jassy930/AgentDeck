@@ -107,6 +107,11 @@ final class StreamingTextContainerView: NSView {
     private var lastTextColor: NSColor?
     private weak var observedBuffer: StreamingTextBuffer?
     private var observationToken: UUID?
+    /// Non-nil while the view is in markdown mode (design §5). In markdown mode
+    /// every buffer change recomputes the full attributed string via
+    /// `MarkdownAttributedStringBuilder` and replaces the storage — the builder
+    /// owns the attributes, so the plain-text font/color path is bypassed.
+    private var markdownStyle: MarkdownStyle?
     private lazy var selectionOwner = SessionTextSelectionOwner { [weak self] in
         self?.textView.clearSelection()
     }
@@ -136,9 +141,13 @@ final class StreamingTextContainerView: NSView {
     // MARK: - Rebindable AppKit core interface (Task 6)
 
     /// Bind this view to a new buffer, cancelling any previous subscription.
-    /// Safe to call multiple times (rebind for cell reuse).
+    /// Safe to call multiple times (rebind for cell reuse). Plain-text mode:
+    /// the supplied font/color style every glyph (correct for raw monospaced
+    /// output — reasoning / shell / fileEdit).
     func bindBuffer(to buffer: StreamingTextBuffer, font: NSFont, color: NSColor) {
         unbind()
+        markdownStyle = nil
+        textView.isRichText = false
         textView.font = font
         textView.textColor = color
         textView.isSelectable = true
@@ -147,6 +156,27 @@ final class StreamingTextContainerView: NSView {
             self?.apply(change)
         }
         markAppearanceChanged(font: font, textColor: color)
+    }
+
+    /// Bind this view to a new buffer in MARKDOWN mode (design §5). On every
+    /// change the whole `buffer.text` is re-rendered through
+    /// `MarkdownAttributedStringBuilder` and replaced into the storage so the
+    /// streamed assistant message shows rich markdown (bold/inline-code/links),
+    /// matching userPrompt and the original SwiftUI Textual rendering. Safe to
+    /// call multiple times (rebind for cell reuse) and to alternate with the
+    /// plain-text `bindBuffer`.
+    func bindMarkdownBuffer(to buffer: StreamingTextBuffer, style: MarkdownStyle = .standard) {
+        unbind()
+        markdownStyle = style
+        textView.isRichText = true
+        textView.isSelectable = true
+        // Track the body font so the empty-state line-height fallback is sane.
+        textView.font = style.bodyFont
+        textView.textColor = style.textColor
+        observedBuffer = buffer
+        observationToken = buffer.observe { [weak self] change in
+            self?.apply(change)
+        }
     }
 
     /// Cancel the current buffer subscription without clearing displayed text.
@@ -161,6 +191,13 @@ final class StreamingTextContainerView: NSView {
     /// The text currently displayed in the text view. Read-only; intended for testing and AppKit consumers.
     var currentText: String {
         textView.string
+    }
+
+    /// The attributed string currently in the text storage. Read-only; lets
+    /// tests assert that markdown mode produced rich attributes (bold / inline
+    /// code / link), not just plain text.
+    var currentAttributedText: NSAttributedString {
+        textView.textStorage ?? NSTextStorage()
     }
 
     // MARK: - SwiftUI NSViewRepresentable path (unchanged)
@@ -190,6 +227,11 @@ final class StreamingTextContainerView: NSView {
     }
 
     func apply(_ change: StreamingTextBufferChange) {
+        if let style = markdownStyle {
+            applyMarkdown(change, style: style)
+            recalculateHeight(for: max(bounds.width, 1))
+            return
+        }
         let attributes = currentAttributes()
         let storage = textView.textStorage ?? NSTextStorage()
         switch change {
@@ -207,6 +249,25 @@ final class StreamingTextContainerView: NSView {
         recalculateHeight(for: max(bounds.width, 1))
     }
 
+    /// Markdown mode: recompute the FULL attributed string and replace storage.
+    /// Both append and replace resolve to the buffer's current full text — the
+    /// builder is whole-string (inline intents can change as later tokens
+    /// arrive), so incremental appends are not safe here (design §5 「重算→替换」).
+    private func applyMarkdown(_ change: StreamingTextBufferChange, style: MarkdownStyle) {
+        let fullText: String
+        switch change {
+        case .append:
+            fullText = observedBuffer?.text ?? textView.string
+        case .replace(let text):
+            fullText = text
+        }
+        let attributed = MarkdownAttributedStringBuilder.attributedString(from: fullText, style: style)
+        let storage = textView.textStorage ?? NSTextStorage()
+        storage.beginEditing()
+        storage.setAttributedString(attributed)
+        storage.endEditing()
+    }
+
     private func currentAttributes() -> [NSAttributedString.Key: Any] {
         [
             .font: textView.font ?? NSFont.systemFont(ofSize: NSFont.systemFontSize),
@@ -215,7 +276,9 @@ final class StreamingTextContainerView: NSView {
     }
 
     private func refreshTextAttributes() {
-        guard let storage = textView.textStorage else { return }
+        // In markdown mode the builder owns every attribute; a uniform
+        // font/color sweep would strip the rich styling, so skip it.
+        guard markdownStyle == nil, let storage = textView.textStorage else { return }
         let fullRange = NSRange(location: 0, length: storage.length)
         storage.beginEditing()
         storage.setAttributes(currentAttributes(), range: fullRange)
