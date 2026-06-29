@@ -1244,11 +1244,6 @@ struct TurnJumpRail: View {
     }
 }
 
-enum TurnJumpRailHitTarget: Equatable {
-    case turn(Int)
-    case latest
-}
-
 struct ConversationTurnViewportPosition: Equatable {
     let turnId: String
     let minY: CGFloat
@@ -1271,156 +1266,6 @@ struct ConversationScrollSpy {
             return reached.turnId
         }
         return sorted.first?.turnId
-    }
-}
-
-private struct ConversationTurnPositionPreferenceKey: PreferenceKey {
-    static let defaultValue: [ConversationTurnViewportPosition] = []
-
-    static func reduce(
-        value: inout [ConversationTurnViewportPosition],
-        nextValue: () -> [ConversationTurnViewportPosition]
-    ) {
-        value.append(contentsOf: nextValue())
-    }
-}
-
-struct TurnJumpRailLayout {
-    static let width: CGFloat = 28
-    static let centerX: CGFloat = 14
-    static let turnSpacing: CGFloat = 18
-    private static let topPadding: CGFloat = 14
-    private static let latestBottomPadding: CGFloat = 18
-    private static let latestGap: CGFloat = 32
-    private static let hitRadius: CGFloat = 12
-
-    static func turnY(
-        index: Int,
-        count: Int,
-        height: CGFloat,
-        scrollOffset: CGFloat = 0
-    ) -> CGFloat {
-        firstTurnY(count: count, height: height) + CGFloat(index) * turnSpacing - scrollOffset
-    }
-
-    static func visualTurnY(
-        index: Int,
-        count: Int,
-        height: CGFloat,
-        scrollOffset: CGFloat = 0,
-        hoveredIndex: Int? = nil
-    ) -> CGFloat {
-        let baseY = turnY(index: index, count: count, height: height, scrollOffset: scrollOffset)
-        guard let hoveredIndex else { return baseY }
-        let distance = index - hoveredIndex
-        guard distance != 0 else { return baseY }
-        return baseY + (distance > 0 ? 1 : -1) * cumulativeDockExpansion(stepsFromHover: abs(distance))
-    }
-
-    private static func cumulativeDockExpansion(stepsFromHover: Int) -> CGFloat {
-        guard stepsFromHover > 0 else { return 0 }
-        let perGapExpansion: [CGFloat] = [7, 3, 1.5]
-        return (0..<stepsFromHover).reduce(CGFloat(0)) { total, step in
-            total + (step < perGapExpansion.count ? perGapExpansion[step] : perGapExpansion.last ?? 0)
-        }
-    }
-
-    static func firstTurnY(count: Int, height: CGFloat) -> CGFloat {
-        guard count > 0 else { return height / 2 }
-        let latest = latestY(height: height)
-        let availableTop = topPadding
-        let availableBottom = max(availableTop, latest - latestGap)
-        let contentHeight = CGFloat(max(0, count - 1)) * turnSpacing
-        let centeredStart = (height - contentHeight) / 2
-        return min(max(centeredStart, availableTop), availableBottom)
-    }
-
-    static func latestY(height: CGFloat) -> CGFloat {
-        max(topPadding + latestGap, height - latestBottomPadding)
-    }
-
-    static func maxScrollOffset(count: Int, height: CGFloat) -> CGFloat {
-        guard count > 0 else { return 0 }
-        let latest = latestY(height: height)
-        let availableBottom = max(topPadding, latest - latestGap)
-        let lastYWithoutScroll = turnY(index: count - 1, count: count, height: height, scrollOffset: 0)
-        return max(0, lastYWithoutScroll - availableBottom)
-    }
-
-    static func clampedScrollOffset(_ offset: CGFloat, count: Int, height: CGFloat) -> CGFloat {
-        min(max(0, offset), maxScrollOffset(count: count, height: height))
-    }
-
-    static func scrollOffsetToReveal(
-        index: Int,
-        count: Int,
-        height: CGFloat,
-        currentOffset: CGFloat
-    ) -> CGFloat {
-        let currentY = turnY(index: index, count: count, height: height, scrollOffset: currentOffset)
-        let visibleTop = topPadding
-        let visibleBottom = max(visibleTop, latestY(height: height) - latestGap)
-        if currentY < visibleTop {
-            return clampedScrollOffset(
-                currentOffset - (visibleTop - currentY),
-                count: count,
-                height: height
-            )
-        }
-        if currentY > visibleBottom {
-            return clampedScrollOffset(
-                currentOffset + (currentY - visibleBottom),
-                count: count,
-                height: height
-            )
-        }
-        return clampedScrollOffset(currentOffset, count: count, height: height)
-    }
-
-    static func stepTarget(
-        selectedIndex: Int?,
-        direction: Int,
-        count: Int
-    ) -> TurnJumpRailHitTarget? {
-        guard count > 0 else { return nil }
-        if direction > 0 {
-            guard let selectedIndex else { return nil }
-            if selectedIndex >= count - 1 { return .latest }
-            return .turn(selectedIndex + 1)
-        }
-        if direction < 0 {
-            guard let selectedIndex else { return .turn(count - 1) }
-            if selectedIndex <= 0 { return .turn(0) }
-            return .turn(selectedIndex - 1)
-        }
-        return nil
-    }
-
-    static func hitTarget(
-        at point: CGPoint,
-        count: Int,
-        height: CGFloat,
-        scrollOffset: CGFloat = 0
-    ) -> TurnJumpRailHitTarget? {
-        guard point.x >= 0, point.x <= width else { return nil }
-        if abs(point.y - latestY(height: height)) <= hitRadius {
-            return .latest
-        }
-
-        guard count > 0 else { return nil }
-        let hits = (0..<count).map { index in
-            (index: index, distance: abs(point.y - turnY(
-                index: index,
-                count: count,
-                height: height,
-                scrollOffset: scrollOffset
-            )))
-        }
-        guard let nearest = hits.min(by: { $0.distance < $1.distance }),
-              nearest.distance <= hitRadius else {
-            return nil
-        }
-        return .turn(nearest.index)
     }
 }
 
@@ -1450,74 +1295,13 @@ private struct RailInteractionView: NSViewRepresentable {
     }
 }
 
-private final class RailInteractionNSView: NSView {
-    var itemCount: Int
-    var railScrollOffset: CGFloat
-    var onHoverTarget: (TurnJumpRailHitTarget?) -> Void
-    var onClickTarget: (TurnJumpRailHitTarget) -> Void
-    var onWheelStep: (Int) -> Void
-    private var lastStepAt = Date.distantPast
+private struct ConversationTurnPositionPreferenceKey: PreferenceKey {
+    static let defaultValue: [ConversationTurnViewportPosition] = []
 
-    init(
-        itemCount: Int,
-        railScrollOffset: CGFloat,
-        onHoverTarget: @escaping (TurnJumpRailHitTarget?) -> Void,
-        onClickTarget: @escaping (TurnJumpRailHitTarget) -> Void,
-        onWheelStep: @escaping (Int) -> Void
+    static func reduce(
+        value: inout [ConversationTurnViewportPosition],
+        nextValue: () -> [ConversationTurnViewportPosition]
     ) {
-        self.itemCount = itemCount
-        self.railScrollOffset = railScrollOffset
-        self.onHoverTarget = onHoverTarget
-        self.onClickTarget = onClickTarget
-        self.onWheelStep = onWheelStep
-        super.init(frame: .zero)
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.clear.cgColor
-    }
-
-    required init?(coder: NSCoder) { nil }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        trackingAreas.forEach(removeTrackingArea)
-        addTrackingArea(NSTrackingArea(
-            rect: bounds,
-            options: [.activeInKeyWindow, .mouseMoved, .mouseEnteredAndExited, .inVisibleRect],
-            owner: self,
-            userInfo: nil
-        ))
-    }
-
-    override func mouseMoved(with event: NSEvent) {
-        onHoverTarget(hitTarget(for: event))
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        onHoverTarget(nil)
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        guard let target = hitTarget(for: event) else { return }
-        onClickTarget(target)
-    }
-
-    override func scrollWheel(with event: NSEvent) {
-        let now = Date()
-        guard now.timeIntervalSince(lastStepAt) >= 0.12 else { return }
-        let delta = event.scrollingDeltaY
-        guard abs(delta) >= 0.1 else { return }
-        lastStepAt = now
-        onWheelStep(delta < 0 ? 1 : -1)
-    }
-
-    private func hitTarget(for event: NSEvent) -> TurnJumpRailHitTarget? {
-        let local = convert(event.locationInWindow, from: nil)
-        let topOriginPoint = CGPoint(x: local.x, y: bounds.height - local.y)
-        return TurnJumpRailLayout.hitTarget(
-            at: topOriginPoint,
-            count: itemCount,
-            height: bounds.height,
-            scrollOffset: railScrollOffset
-        )
+        value.append(contentsOf: nextValue())
     }
 }
