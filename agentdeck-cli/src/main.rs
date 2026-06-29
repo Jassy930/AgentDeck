@@ -1,4 +1,5 @@
 mod client;
+mod commands;
 mod output;
 mod transport;
 
@@ -28,6 +29,43 @@ enum Command {
         #[command(subcommand)]
         what: ProtocolCmd,
     },
+    /// 往返自检
+    Ping,
+    /// IPC 生命周期 + logging 自检
+    Selfcheck,
+    /// 诊断报告
+    Diagnostics {
+        #[command(subcommand)]
+        what: DiagnosticsCmd,
+    },
+    /// 历史操作
+    History {
+        #[command(subcommand)]
+        what: HistoryCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum DiagnosticsCmd {
+    Report {
+        #[arg(long)] limit: Option<u64>,
+        #[arg(long)] since_seconds: Option<u64>,
+        #[arg(long)] run_id: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum HistoryCmd {
+    List {
+        #[arg(long)] cwd: Option<String>,
+        #[arg(long)] search: Option<String>,
+        #[arg(long)] cursor: Option<String>,
+        #[arg(long)] limit: Option<u64>,
+    },
+    Read { #[arg(long)] thread_id: String },
+    Archive { #[arg(long)] thread_id: String },
+    Unarchive { #[arg(long)] thread_id: String },
+    Rename { #[arg(long)] thread_id: String, #[arg(long)] name: String },
 }
 
 #[derive(Subcommand)]
@@ -36,6 +74,12 @@ enum ProtocolCmd {
     Schema,
     /// 输出协议版本号
     Version,
+}
+
+fn connect(profile: &str, data_dir: Option<&str>) -> Result<client::Client<transport::ProcessTransport>, CliError> {
+    let transport = transport::ProcessTransport::spawn(profile, data_dir)
+        .map_err(|e| CliError::Transport(e.to_string()))?;
+    Ok(client::Client::new(transport))
 }
 
 fn run(cli: Cli) -> Result<(), CliError> {
@@ -52,6 +96,51 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 Ok(())
             }
         },
+        Command::Ping => {
+            let mut client = connect(&cli.profile, cli.data_dir.as_deref())?;
+            let reply = client.round_trip(commands::ping_request())?;
+            let payload = client::Client::<transport::ProcessTransport>::expect_kind(reply, "pong")?;
+            client.shutdown();
+            println!("{}", render(&serde_json::json!({"kind":"pong","payload":payload}), cli.pretty));
+            Ok(())
+        }
+        Command::Selfcheck => {
+            let mut client = connect(&cli.profile, cli.data_dir.as_deref())?;
+            let reply = client.round_trip(commands::selfcheck_request())?;
+            let payload = client::Client::<transport::ProcessTransport>::expect_kind(reply, "loggingSelfcheck")?;
+            client.shutdown();
+            println!("{}", render(&payload, cli.pretty));
+            commands::interpret_selfcheck(&payload)
+        }
+        Command::Diagnostics { what } => {
+            let DiagnosticsCmd::Report { limit, since_seconds, run_id } = what;
+            let mut client = connect(&cli.profile, cli.data_dir.as_deref())?;
+            let reply = client.round_trip(commands::diagnostics_request(limit, since_seconds, run_id))?;
+            let payload = client::Client::<transport::ProcessTransport>::expect_kind(reply, "diagnosticsReport")?;
+            client.shutdown();
+            println!("{}", render(&payload, cli.pretty));
+            Ok(())
+        }
+        Command::History { what } => {
+            let (request, expected) = match what {
+                HistoryCmd::List { cwd, search, cursor, limit } =>
+                    (commands::history_list_request(cwd, search, cursor, limit), "historyThreads"),
+                HistoryCmd::Read { thread_id } =>
+                    (commands::history_read_request(&thread_id), "historyThread"),
+                HistoryCmd::Archive { thread_id } =>
+                    (commands::history_manage_request("history/archiveThread", &thread_id, None), "historyThreadUpdated"),
+                HistoryCmd::Unarchive { thread_id } =>
+                    (commands::history_manage_request("history/unarchiveThread", &thread_id, None), "historyThreadUpdated"),
+                HistoryCmd::Rename { thread_id, name } =>
+                    (commands::history_manage_request("history/renameThread", &thread_id, Some(&name)), "historyThreadUpdated"),
+            };
+            let mut client = connect(&cli.profile, cli.data_dir.as_deref())?;
+            let reply = client.round_trip(request)?;
+            let payload = client::Client::<transport::ProcessTransport>::expect_kind(reply, expected)?;
+            client.shutdown();
+            println!("{}", render(&payload, cli.pretty));
+            Ok(())
+        }
     }
 }
 

@@ -118,6 +118,16 @@ impl<T: Transport> Client<T> {
         }
     }
 
+    pub fn shutdown(&mut self) {
+        let id = self.alloc_id();
+        let bye = IpcMessage { kind: "shutdown".into(), id: Some(id), session_id: None, thread_id: None, payload: None };
+        let _ = self.transport.send(&bye);
+        // best-effort：读到对应 pong 或 EOF 即止
+        while let Ok(Some(msg)) = self.transport.recv() {
+            if msg.id == Some(id) { break; }
+        }
+    }
+
     fn decide(&self, policy: ApprovalPolicy, _request_id: u64) -> Result<String, CliError> {
         match policy {
             ApprovalPolicy::AutoApprove => Ok("approve".into()),
@@ -226,6 +236,15 @@ mod tests {
         assert_eq!(decision.payload.as_ref().unwrap()["requestId"], 5);
         assert_eq!(decision.payload.as_ref().unwrap()["decision"], "approve");
         assert_eq!(decision.session_id.as_deref(), Some("cli-1"));
+    }
+
+    #[test]
+    fn shutdown_sends_shutdown_frame() {
+        let t = FakeTransport::new(vec![msg("pong", Some(1000), None)]);
+        let mut client = Client::new(t);
+        client.shutdown();
+        let sent = client.into_sent();
+        assert!(sent.iter().any(|m| m.kind == "shutdown"));
     }
 
     #[test]
