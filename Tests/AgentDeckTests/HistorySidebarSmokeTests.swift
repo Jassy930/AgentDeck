@@ -1,4 +1,5 @@
 import XCTest
+import AppKit
 @testable import AgentDeck
 
 @MainActor
@@ -17,17 +18,7 @@ final class HistorySidebarSmokeTests: XCTestCase {
     func testOutlineViewIsPresent() {
         let model = SessionModel()
         let vc = HistorySidebarViewController(model: model)
-        // Trigger loadView
-        _ = vc.view
-        // The VC must expose an NSOutlineView in its view hierarchy.
-        func findOutline(in view: NSView) -> NSOutlineView? {
-            if let ov = view as? NSOutlineView { return ov }
-            for sub in view.subviews {
-                if let found = findOutline(in: sub) { return found }
-            }
-            return nil
-        }
-        // Look inside the scroll view's document view as well
+        _ = vc.view  // trigger loadView
         func allViews(_ root: NSView) -> [NSView] {
             var result = [root]
             for s in root.subviews { result += allViews(s) }
@@ -38,5 +29,80 @@ final class HistorySidebarSmokeTests: XCTestCase {
         }
         let hasOutline = allViews(vc.view).contains { $0 is NSOutlineView }
         XCTAssertTrue(hasOutline, "Expected NSOutlineView in view hierarchy")
+    }
+
+    // MARK: - clickedRow → thread resolver
+
+    /// Minimal data source mirroring the VC's two-level shape:
+    /// top-level = groups, children = threads. Used to populate a real
+    /// NSOutlineView so `thread(forClickedRow:in:)` can be exercised against
+    /// a deterministic row layout (group at row 0, threads beneath it).
+    private final class StubDataSource: NSObject, NSOutlineViewDataSource {
+        let groups: [HistoryProjectGroup]
+        init(_ groups: [HistoryProjectGroup]) { self.groups = groups }
+
+        func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
+            if item == nil { return groups.count }
+            if let g = item as? HistoryProjectGroup { return g.threads.count }
+            return 0
+        }
+        func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
+            if item == nil { return groups[index] }
+            return (item as! HistoryProjectGroup).threads[index]
+        }
+        func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
+            item is HistoryProjectGroup
+        }
+    }
+
+    private func makePopulatedOutline() -> (NSOutlineView, StubDataSource) {
+        let threads = [
+            HistoryThreadSummary(id: "t1", name: "Alpha", preview: "a", cwd: "/tmp/proj",
+                                 createdAt: 1, updatedAt: 2, status: "ready",
+                                 modelProvider: "openai", source: "cli"),
+            HistoryThreadSummary(id: "t2", name: "Beta", preview: "b", cwd: "/tmp/proj",
+                                 createdAt: 3, updatedAt: 4, status: "ready",
+                                 modelProvider: "openai", source: "cli"),
+        ]
+        let groups = HistoryProjectGroup.group(threads)
+        let ds = StubDataSource(groups)
+        let ov = NSOutlineView()
+        let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("main"))
+        ov.addTableColumn(col)
+        ov.outlineTableColumn = col
+        ov.dataSource = ds
+        ov.reloadData()
+        // Expand the single group so its threads materialize as rows 1..n.
+        for g in groups { ov.expandItem(g) }
+        // Row layout now: 0 = group row, rows 1..2 = thread rows.
+        return (ov, ds)
+    }
+
+    func testClickedRowResolvesThread() {
+        let (ov, ds) = makePopulatedOutline()
+        XCTAssertEqual(ov.numberOfRows, 3, "Expected 1 group row + 2 thread rows")
+        // Rows 1 and 2 are thread rows → resolve to HistoryThreadSummary.
+        let row1 = HistorySidebarViewController.thread(forClickedRow: 1, in: ov)
+        let row2 = HistorySidebarViewController.thread(forClickedRow: 2, in: ov)
+        XCTAssertNotNil(row1)
+        XCTAssertNotNil(row2)
+        XCTAssertEqual(Set([row1!.id, row2!.id]), Set(["t1", "t2"]))
+        _ = ds  // keep the data source alive for the duration of the test
+    }
+
+    func testClickedRowGroupRowReturnsNil() {
+        let (ov, ds) = makePopulatedOutline()
+        // Row 0 is the project group → not a thread.
+        XCTAssertNil(HistorySidebarViewController.thread(forClickedRow: 0, in: ov),
+                     "Group row must not resolve to a thread")
+        _ = ds
+    }
+
+    func testClickedRowOutOfRangeReturnsNil() {
+        let (ov, ds) = makePopulatedOutline()
+        // -1 is NSOutlineView's "no row" sentinel; a too-large index is also safe.
+        XCTAssertNil(HistorySidebarViewController.thread(forClickedRow: -1, in: ov))
+        XCTAssertNil(HistorySidebarViewController.thread(forClickedRow: 999, in: ov))
+        _ = ds
     }
 }

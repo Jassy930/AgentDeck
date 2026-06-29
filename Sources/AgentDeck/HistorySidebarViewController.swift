@@ -104,6 +104,11 @@ final class HistorySidebarViewController: NSViewController {
         return ov
     }()
 
+    /// Right-click context menu shared by all thread rows. Its items are
+    /// rebuilt in `menuNeedsUpdate(_:)` against the clicked row so Rename /
+    /// Archive carry the correct thread.
+    private let contextMenu = NSMenu()
+
     // MARK: - Observation
 
     private let binder = ObservationBinder()
@@ -178,11 +183,17 @@ final class HistorySidebarViewController: NSViewController {
         outlineView.dataSource = self
         outlineView.delegate   = self
 
+        // Real AppKit context-menu wiring: assign an NSMenu whose delegate
+        // rebuilds items per clicked row (a `menuFor:` delegate method does NOT
+        // exist in any AppKit protocol and would never fire).
+        contextMenu.delegate = self
+        outlineView.menu = contextMenu
+
         refreshButton.target = self
         refreshButton.action = #selector(refreshTapped)
 
-        searchField.target = self
-        searchField.action = #selector(searchChanged)
+        // Search is driven solely by NSSearchFieldDelegate.controlTextDidChange;
+        // no target/action so each keystroke only reloads once.
         searchField.delegate = self
 
         // Reopen all groups by default after data load
@@ -268,11 +279,6 @@ final class HistorySidebarViewController: NSViewController {
         model.loadHistory()
     }
 
-    @objc private func searchChanged() {
-        model.historySearchTerm = searchField.stringValue
-        model.loadHistory()
-    }
-
     // MARK: - Context Menu (Rename / Archive)
 
     private func showRenameAlert(for thread: HistoryThreadSummary) {
@@ -311,13 +317,14 @@ extension HistorySidebarViewController: NSOutlineViewDataSource {
 
     func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
         if item == nil {
-            return groups[index]
+            if groups.indices.contains(index) { return groups[index] }
+        } else if let group = item as? HistoryProjectGroup {
+            if group.threads.indices.contains(index) { return group.threads[index] }
         }
-        if let group = item as? HistoryProjectGroup {
-            return group.threads[index]
-        }
-        // Unreachable in practice; return an empty placeholder
-        return groups[0]
+        // Bounds-safe fallback: AppKit only asks for indices it learned from
+        // numberOfChildrenOfItem, so this is effectively unreachable. Return an
+        // empty group rather than crashing if the data shifts mid-reload.
+        return HistoryProjectGroup(cwd: "", threads: [])
     }
 
     func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
@@ -413,11 +420,35 @@ extension HistorySidebarViewController: NSOutlineViewDelegate {
         item is HistoryProjectGroup
     }
 
-    // MARK: Context Menu
+    @objc private func handleRename(_ sender: NSMenuItem) {
+        guard let thread = sender.representedObject as? HistoryThreadSummary else { return }
+        showRenameAlert(for: thread)
+    }
 
-    func outlineView(_ outlineView: NSOutlineView, menuFor tableColumn: NSTableColumn?, item: Any, event: NSEvent) -> NSMenu? {
-        guard let thread = item as? HistoryThreadSummary else { return nil }
-        let menu = NSMenu()
+    @objc private func handleArchive(_ sender: NSMenuItem) {
+        guard let thread = sender.representedObject as? HistoryThreadSummary else { return }
+        model.archiveHistoryThread(thread)
+    }
+}
+
+// MARK: - NSMenuDelegate (right-click context menu)
+
+extension HistorySidebarViewController: NSMenuDelegate {
+
+    /// Resolve which `HistoryThreadSummary` (if any) the right-clicked row maps
+    /// to. Returns `nil` when the row is out of range, a group row, or empty.
+    /// Pure function of the outline state so it can be unit-tested in isolation.
+    static func thread(forClickedRow row: Int, in outlineView: NSOutlineView) -> HistoryThreadSummary? {
+        guard row >= 0, row < outlineView.numberOfRows else { return nil }
+        return outlineView.item(atRow: row) as? HistoryThreadSummary
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        // `clickedRow` is the row under the cursor at right-click time.
+        guard let thread = Self.thread(forClickedRow: outlineView.clickedRow, in: outlineView) else {
+            return  // group row or empty space → no thread menu
+        }
 
         let renameItem = NSMenuItem(title: "Rename", action: #selector(handleRename(_:)), keyEquivalent: "")
         renameItem.target = self
@@ -428,18 +459,6 @@ extension HistorySidebarViewController: NSOutlineViewDelegate {
         archiveItem.target = self
         archiveItem.representedObject = thread
         menu.addItem(archiveItem)
-
-        return menu
-    }
-
-    @objc private func handleRename(_ sender: NSMenuItem) {
-        guard let thread = sender.representedObject as? HistoryThreadSummary else { return }
-        showRenameAlert(for: thread)
-    }
-
-    @objc private func handleArchive(_ sender: NSMenuItem) {
-        guard let thread = sender.representedObject as? HistoryThreadSummary else { return }
-        model.archiveHistoryThread(thread)
     }
 }
 

@@ -80,6 +80,13 @@ final class HistoryThreadRowView: NSView {
     private let metaLabel = NSTextField(labelWithString: "")
     private let openingProgress = NSProgressIndicator()
 
+    /// Size constraints for the runtime dot — updated on configure so the dot
+    /// truly resizes between 5pt (cached) and 7pt (unread). Auto Layout owns
+    /// the size; we never touch `layer.bounds` (which the next layout pass
+    /// would overwrite).
+    private var runtimeDotWidth: NSLayoutConstraint!
+    private var runtimeDotHeight: NSLayoutConstraint!
+
     // MARK: Init
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -106,9 +113,11 @@ final class HistoryThreadRowView: NSView {
 
         // Runtime phase dot
         runtimeDotView.wantsLayer = true
-        runtimeDotView.layer?.cornerRadius = 3.5
+        runtimeDotView.layer?.cornerRadius = 2.5  // default 5pt dot
         runtimeDotView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(runtimeDotView)
+        runtimeDotWidth = runtimeDotView.widthAnchor.constraint(equalToConstant: 5)
+        runtimeDotHeight = runtimeDotView.heightAnchor.constraint(equalToConstant: 5)
 
         // Title label
         titleLabel.font = .systemFont(ofSize: NSFont.systemFontSize)
@@ -156,11 +165,11 @@ final class HistoryThreadRowView: NSView {
             agentIconView.widthAnchor.constraint(equalToConstant: 14),
             agentIconView.heightAnchor.constraint(equalToConstant: 14),
 
-            // Runtime dot
+            // Runtime dot (size driven by runtimeDotWidth/Height, updated on configure)
             runtimeDotView.leadingAnchor.constraint(equalTo: agentIconView.trailingAnchor, constant: 4),
             runtimeDotView.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
-            runtimeDotView.widthAnchor.constraint(equalToConstant: 7),
-            runtimeDotView.heightAnchor.constraint(equalToConstant: 7),
+            runtimeDotWidth,
+            runtimeDotHeight,
 
             // Title + meta stack
             textStack.leadingAnchor.constraint(equalTo: runtimeDotView.trailingAnchor, constant: 4),
@@ -192,7 +201,7 @@ final class HistoryThreadRowView: NSView {
         }
         metaParts.append(thread.source)
         metaParts.append(Self.updatedLabel(thread.updatedAt))
-        metaLabel.stringValue = metaParts.joined(separator: "  ")
+        metaLabel.stringValue = metaParts.joined(separator: " · ")
 
         // Accent bar
         let accentColor = Self.accentBarColor(presentation)
@@ -209,13 +218,13 @@ final class HistoryThreadRowView: NSView {
         }
         agentIconView.toolTip = presentation.agentSourceLabel
 
-        // Runtime dot
+        // Runtime dot — size driven by Auto Layout constraints (5pt cached / 7pt unread)
         if presentation.hasRuntimeIndicator {
             runtimeDotView.isHidden = false
             let dotSize: CGFloat = presentation.hasUnreadIndicator ? 7 : 5
+            runtimeDotWidth.constant = dotSize
+            runtimeDotHeight.constant = dotSize
             runtimeDotView.layer?.cornerRadius = dotSize / 2
-            // Re-apply size constraints via a tag approach: just use frame on layer
-            runtimeDotView.layer?.bounds = CGRect(x: 0, y: 0, width: dotSize, height: dotSize)
             runtimeDotView.layer?.backgroundColor = Self.runtimeDotColor(presentation).cgColor
         } else {
             runtimeDotView.isHidden = true
