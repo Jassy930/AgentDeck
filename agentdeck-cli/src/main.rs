@@ -1,4 +1,5 @@
 mod output;
+mod transport;
 
 use clap::{Parser, Subcommand};
 use output::{render, CliError};
