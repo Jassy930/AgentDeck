@@ -4,9 +4,16 @@ import XCTest
 final class ProtocolConformanceTests: XCTestCase {
     /// 读取仓库内协议 schema（子项目 1 提交的生成产物）。
     private func loadSchema() throws -> [String: Any] {
-        // 测试运行的 CWD 是包根；schema 在 protocol/agentdeck 下。
-        let path = "protocol/agentdeck/agentdeck-protocol.schema.json"
-        let url = URL(fileURLWithPath: path)
+        // 用 #file 推导仓库根，避免依赖测试运行时的 CWD：
+        // <repo>/Tests/AgentDeckTests/ProtocolConformanceTests.swift → 向上 3 级即仓库根。
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // AgentDeckTests/
+            .deletingLastPathComponent()   // Tests/
+            .deletingLastPathComponent()   // <repo>/
+        let url = repoRoot
+            .appendingPathComponent("protocol")
+            .appendingPathComponent("agentdeck")
+            .appendingPathComponent("agentdeck-protocol.schema.json")
         let data = try Data(contentsOf: url)
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         return json ?? [:]

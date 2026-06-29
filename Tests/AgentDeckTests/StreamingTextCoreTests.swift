@@ -91,6 +91,53 @@ final class StreamingTextCoreTests: XCTestCase {
         )
     }
 
+    /// C2: re-binding the SAME markdown buffer object (the streaming
+    /// reconfigure path) must keep the live subscription and NOT collapse a
+    /// selection the user is making. Previously `bindMarkdownBuffer` always
+    /// unbound + re-observed, which rewrote the storage and reset selection.
+    func testRebindSameMarkdownBufferPreservesSelection() {
+        let buffer = StreamingTextBuffer()
+        buffer.replace(with: "hello world from agent")
+        let view = StreamingTextContainerView(frame: .zero)
+        view.bindMarkdownBuffer(to: buffer, style: .standard)
+
+        // User selects "world".
+        let worldRange = (view.currentText as NSString).range(of: "world")
+        view.selectedRangeForTesting = worldRange
+        XCTAssertEqual(view.selectedRangeForTesting, worldRange)
+
+        // A streaming flush reconfigures the cell with the same buffer.
+        view.bindMarkdownBuffer(to: buffer, style: .standard)
+        XCTAssertEqual(
+            view.selectedRangeForTesting, worldRange,
+            "重绑同一 markdown buffer 不应清空用户选区（C2）"
+        )
+
+        // And the live subscription still flows new tokens in.
+        buffer.append(" tail")
+        XCTAssertEqual(view.currentText, "hello world from agent tail", "同一 buffer 仍随追加更新")
+    }
+
+    /// C2: an unchanged markdown replace (the buffer notifies with text that
+    /// renders to the same string) must skip the storage rewrite so a selection
+    /// survives — mirroring the plain path's `.unchanged` early-return.
+    func testUnchangedMarkdownReplacePreservesSelection() {
+        let buffer = StreamingTextBuffer()
+        buffer.replace(with: "alpha beta gamma")
+        let view = StreamingTextContainerView(frame: .zero)
+        view.bindMarkdownBuffer(to: buffer, style: .standard)
+
+        let betaRange = (view.currentText as NSString).range(of: "beta")
+        view.selectedRangeForTesting = betaRange
+
+        // Replace with the identical text → rendered string unchanged.
+        buffer.replace(with: "alpha beta gamma")
+        XCTAssertEqual(
+            view.selectedRangeForTesting, betaRange,
+            "重算结果字符串未变时应跳过 setAttributedString，保留选区（C2）"
+        )
+    }
+
     /// Rebinding the same view from markdown mode back to plain-text mode must
     /// drop the rich attributes (cell reuse safety).
     func testRebindFromMarkdownToPlainDropsRichAttributes() {

@@ -46,8 +46,10 @@ enum AgentDeckProfileError: Error, Equatable, CustomStringConvertible {
     }
 }
 
-// AgentDeck — Step 4: the SwiftUI app. Beat 1 (the only user-perceivable
-// wow in v0.1) lives in SessionView, built to the locked D3-D9 design specs.
+// AgentDeck — AppKit bootstrapping. The app is a pure AppKit build: the
+// AppDelegate installs an NSWindow whose content is driven by
+// SessionViewController (status bar + history sidebar + conversation pane +
+// input bar), all to the locked D3-D9 design specs.
 //
 // A headless self-check mode is retained for CI: `AgentDeck --selfcheck`
 // runs the Step 1 IPC round trip + A1 lifecycle assertion without a

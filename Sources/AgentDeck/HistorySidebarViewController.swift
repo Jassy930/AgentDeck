@@ -228,9 +228,14 @@ final class HistorySidebarViewController: NSViewController {
         }
     }
 
-    override func viewWillDisappear() {
-        super.viewWillDisappear()
-        binder.invalidate()
+    /// Invalidate the observation re-arm loop only on teardown, NOT on a
+    /// transient `viewWillDisappear`. The sidebar binds once in `viewDidLoad`;
+    /// invalidating on hide would permanently freeze runtime phase / unread
+    /// updates on a later show, since nothing re-binds (I2). Mirrors
+    /// `TurnJumpRailView` / `StatusBarView` / `ConversationViewController`.
+    deinit {
+        let b = binder
+        Task { @MainActor in b.invalidate() }
     }
 
     // MARK: - Data Helpers

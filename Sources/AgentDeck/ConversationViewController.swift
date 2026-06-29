@@ -47,7 +47,18 @@ final class ConversationViewController: NSViewController {
 
     private var rows: [ConversationDisplayRow] = []
     private var lastScrollToLatestRequest = 0
-    private var registeredReuseIdentifiers: Set<String> = []
+
+    /// The `(id, contentVersion)` of every row currently presented by the table.
+    /// Compared against a freshly rebuilt sequence in `modelDidChange()` so a
+    /// pure streaming-text flush (identical id sequence) skips the full reload
+    /// and only re-measures the rows whose content actually grew.
+    private var displayedRowSignatures: [(id: String, version: Int)] = []
+
+    /// Per-item disclosure expansion state for the collapsible tool rows
+    /// (shell output / fileEdit diff). Held here so it SURVIVES cell reuse and
+    /// the streaming reconfigure path (C1): a cell restores its expanded state
+    /// from this set in `configure` instead of hard-resetting to collapsed.
+    private var expandedItemIds: Set<String> = []
 
     // MARK: Views
 
@@ -77,13 +88,13 @@ final class ConversationViewController: NSViewController {
 
     // MARK: View lifecycle
 
-    /// Stop the observation re-arm loop when the pane goes away. The binder is
-    /// owned by this controller and its `onChange` already guards `[weak self]`,
-    /// so an orphaned callback is a harmless no-op; invalidating here also stops
-    /// the re-arm so nothing lingers.
-    override func viewWillDisappear() {
-        super.viewWillDisappear()
-        binder.invalidate()
+    /// Stop the observation re-arm loop only when the controller is torn down,
+    /// NOT on `viewWillDisappear`. The pane binds once in `loadView`; invalidating
+    /// on a transient hide would permanently freeze it on a later show, since
+    /// nothing re-binds (I2). This matches `TurnJumpRailView` / `StatusBarView`.
+    deinit {
+        let b = binder
+        Task { @MainActor in b.invalidate() }
     }
 
     override func loadView() {
@@ -205,16 +216,17 @@ final class ConversationViewController: NSViewController {
 
     private func modelDidChange() {
         let previousExpansion = lastReasoningExpanded
+        let previousSignatures = displayedRowSignatures
         rebuildRows()
         // The reasoning rows auto-expand/collapse with the running phase; their
         // height changes when that flips, so drop their cached heights.
-        if previousExpansion != model.shouldShowReasoningExpanded {
+        let reasoningFlipped = previousExpansion != model.shouldShowReasoningExpanded
+        if reasoningFlipped {
             invalidateReasoningHeights()
         }
-        tableView.reloadData()
-        if !rows.isEmpty {
-            tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<rows.count))
-        }
+
+        applyRowUpdate(previousSignatures: previousSignatures, reasoningFlipped: reasoningFlipped)
+
         refreshFooter()
         inputBar.refreshQueuedCount()
 
@@ -223,6 +235,60 @@ final class ConversationViewController: NSViewController {
             scrollToLatestRow()
         }
         recomputeTopVisibleTurn()
+    }
+
+    /// Apply the cheapest correct table update for the transition from
+    /// `previousSignatures` to the freshly rebuilt `rows`.
+    ///
+    /// • Same id sequence (pure streaming growth): do NOT reload or reconfigure
+    ///   any cell — the visible cells already stream their own buffers. Only
+    ///   `noteHeightOfRows` for rows whose content version changed so growing
+    ///   text re-lays-out its height. The one exception is the reasoning
+    ///   auto-expand flag flipping (running ⇄ idle): the reasoning cells must
+    ///   reconfigure to show/hide their body, so those specific rows are
+    ///   reloaded (and re-measured) — every other row is left untouched, so a
+    ///   disclosure (C1) or selection (C2) elsewhere is never disturbed.
+    /// • Structural change (append / remove / reorder): fall back to a full
+    ///   `reloadData()`. Disclosure state (C1) is restored from `expandedItemIds`
+    ///   and selection (C2) is protected by the streaming-view unchanged guards,
+    ///   so the reload no longer destroys user state.
+    private func applyRowUpdate(
+        previousSignatures: [(id: String, version: Int)],
+        reasoningFlipped: Bool
+    ) {
+        let diff = ConversationRowsDiff.decide(
+            previous: previousSignatures,
+            next: displayedRowSignatures
+        )
+        switch diff {
+        case .sameRows(let changedIndexes):
+            var heightIndexes = IndexSet(changedIndexes)
+            if reasoningFlipped {
+                // The reasoning rows toggle their visible body with the running
+                // phase; reload just those so `configure` re-applies the
+                // expansion, then re-measure them.
+                let reasoningIndexes = IndexSet(
+                    rows.enumerated()
+                        .filter { $0.element.item.kind == "reasoning" }
+                        .map(\.offset)
+                )
+                if !reasoningIndexes.isEmpty {
+                    tableView.reloadData(
+                        forRowIndexes: reasoningIndexes,
+                        columnIndexes: IndexSet(integer: 0)
+                    )
+                    heightIndexes.formUnion(reasoningIndexes)
+                }
+            }
+            if !heightIndexes.isEmpty {
+                tableView.noteHeightOfRows(withIndexesChanged: heightIndexes)
+            }
+        case .structural:
+            tableView.reloadData()
+            if !rows.isEmpty {
+                tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<rows.count))
+            }
+        }
     }
 
     private var lastReasoningExpanded = false
@@ -236,6 +302,7 @@ final class ConversationViewController: NSViewController {
     private func rebuildRows() {
         let turns = makeConversationTurns(from: model.selectedItems)
         rows = ConversationDisplayRowBuilder.rows(from: turns)
+        displayedRowSignatures = rows.map { ($0.id, contentVersion(for: $0)) }
         lastReasoningExpanded = model.shouldShowReasoningExpanded
     }
 
@@ -342,6 +409,12 @@ final class ConversationViewController: NSViewController {
         if row.item.kind == "reasoning", model.shouldShowReasoningExpanded {
             version = version &* 31 &+ 1  // distinct key for the expanded body
         }
+        // A collapsible row that the user expanded measures taller (its body is
+        // included). Fold the expanded flag into the version so the height cache
+        // re-measures when it flips. (C1)
+        if (item.kind == "shell" || item.kind == "fileEdit"), expandedItemIds.contains(item.id) {
+            version = version &* 31 &+ 2
+        }
         return version
     }
 
@@ -354,7 +427,36 @@ final class ConversationViewController: NSViewController {
         if row.item.kind == "reasoning", model.shouldShowReasoningExpanded {
             height += reasoningExpandedBodyHeight(for: row, width: width)
         }
+        // The factory counts only the collapsed disclosure header for shell /
+        // fileEdit rows; when the user has expanded one, add its streamed body
+        // (output / diff) so the row reserves room for it. (C1)
+        if expandedItemIds.contains(row.item.id) {
+            height += disclosureBodyHeight(for: row, width: width)
+        }
         return height
+    }
+
+    /// Height of an expanded shell-output / fileEdit-diff body, measured the
+    /// same way the factory measures wrapped monospaced text. The contentStack
+    /// uses a 4pt gap before the body (matching the cells' `spacing = 4`).
+    private func disclosureBodyHeight(for row: ConversationDisplayRow, width: CGFloat) -> CGFloat {
+        let item = row.item
+        let text: String
+        let font: NSFont
+        switch item.kind {
+        case "shell":
+            text = item.outputBuffer.text
+            font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+        case "fileEdit":
+            text = item.diffBuffer.text
+            font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        default:
+            return 0
+        }
+        guard !text.isEmpty else { return 0 }
+        let contentW = max(width - ConversationRowCellView.horizontalInset * 2, 1)
+        let attributed = NSAttributedString(string: text, attributes: [.font: font])
+        return 4 + measuredTextHeight(attributed, width: contentW)
     }
 
     /// Height of the auto-expanded reasoning body (small secondary streaming
@@ -376,10 +478,9 @@ final class ConversationViewController: NSViewController {
         if let reused = tableView.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView {
             return reused
         }
-        let cell = ConversationRowFactory.makeCell(for: row)
-        cell.identifier = identifier
-        registeredReuseIdentifiers.insert(identifier.rawValue)
-        return cell
+        // `makeCell` already stamps the reuse identifier, so the table can
+        // recycle this cell on its next `makeView(withIdentifier:)`.
+        return ConversationRowFactory.makeCell(for: row)
     }
 }
 
@@ -399,6 +500,9 @@ extension ConversationViewController: NSTableViewDelegate {
         let displayRow = rows[row]
         let cell = dequeueCell(for: displayRow)
         if let conversationCell = cell as? ConversationRowCellView {
+            // Hand the cell the persisted disclosure store BEFORE configuring so
+            // collapsible cells (shell / fileEdit) restore their expansion (C1).
+            conversationCell.disclosureStore = self
             conversationCell.configure(row: displayRow, width: columnWidth, model: model)
         }
         return cell
@@ -420,5 +524,40 @@ extension ConversationViewController: NSTableViewDelegate {
 
     func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
         false
+    }
+}
+
+// MARK: - ConversationDisclosureStateStore (C1)
+
+extension ConversationViewController: ConversationDisclosureStateStore {
+    func isItemExpanded(_ itemId: String) -> Bool {
+        expandedItemIds.contains(itemId)
+    }
+
+    /// Persist the toggle, then re-measure the affected row so the table opens /
+    /// closes room for the disclosure body. The cell itself already showed /
+    /// hid the body; this only updates the reserved height.
+    func setItem(_ itemId: String, expanded: Bool) {
+        let changed: Bool
+        if expanded {
+            changed = expandedItemIds.insert(itemId).inserted
+        } else {
+            changed = expandedItemIds.remove(itemId) != nil
+        }
+        guard changed else { return }
+
+        var indexes = IndexSet()
+        for (offset, row) in rows.enumerated() where row.item.id == itemId {
+            cache.invalidate(rowId: row.id)
+            // Keep the cached signature in sync so the next streaming flush sees
+            // the new expanded version and does not force a redundant reload.
+            if displayedRowSignatures.indices.contains(offset) {
+                displayedRowSignatures[offset].version = contentVersion(for: row)
+            }
+            indexes.insert(offset)
+        }
+        if !indexes.isEmpty {
+            tableView.noteHeightOfRows(withIndexesChanged: indexes)
+        }
     }
 }

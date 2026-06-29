@@ -24,6 +24,23 @@ import AppKit
 // daemon stream flows straight into the text view. Everything else renders
 // static text via `MarkdownAttributedStringBuilder` / `NSTextField`.
 
+// MARK: - Disclosure persistence (C1)
+
+/// Lets the collapsible tool cells (`ShellCellView` / `FileEditCellView`)
+/// persist their expand/collapse state OUTSIDE the recycled cell, in the
+/// controller. Cells are reconfigured on every ~30fps streaming flush; without
+/// an external store each `configure` would reset the disclosure to collapsed,
+/// snapping shut output the user just expanded mid-turn (C1).
+///
+/// `configure` reads `isItemExpanded` to restore state; the disclosure toggle
+/// writes `setItem(_:expanded:)`, which persists the flag, invalidates the
+/// cached row height and re-measures the row.
+@MainActor
+protocol ConversationDisclosureStateStore: AnyObject {
+    func isItemExpanded(_ itemId: String) -> Bool
+    func setItem(_ itemId: String, expanded: Bool)
+}
+
 // MARK: - Shared metrics & helpers
 
 /// Layout constants shared by cells and the factory's height math. Centralised
@@ -109,6 +126,11 @@ class ConversationRowCellView: NSTableCellView {
 
     private var topConstraint: NSLayoutConstraint?
     private var bottomConstraint: NSLayoutConstraint?
+
+    /// Set by the controller when (re)configuring a collapsible cell so it can
+    /// persist its disclosure state across reuse (C1). Weak — the controller
+    /// owns the store; cells are recycled and must not extend its lifetime.
+    weak var disclosureStore: ConversationDisclosureStateStore?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -367,6 +389,9 @@ final class ShellCellView: ConversationRowCellView {
     @objc private func toggle() {
         let expanded = disclosure.state == .on
         outputView.isHidden = !expanded
+        // Persist the expansion so a streaming reconfigure restores it (C1);
+        // the store also re-measures the row height for the new body.
+        disclosureStore?.setItem(itemId, expanded: expanded)
         if expanded {
             // Deferred materialization (SwiftUI `DeferredStreamingTextView`).
             model?.materializeDeferredContent(itemId: itemId, content: .output)
@@ -395,9 +420,15 @@ final class ShellCellView: ConversationRowCellView {
                 color: .secondaryLabelColor
             )
         }
-        // Default-collapsed: output hidden until the user expands.
-        disclosure.state = .off
-        outputView.isHidden = true
+        // RESTORE persisted expansion instead of hard-resetting to collapsed —
+        // otherwise every streaming flush snaps the output shut (C1). Defaults
+        // to collapsed for items the user never expanded.
+        let expanded = hasOutput && (disclosureStore?.isItemExpanded(item.id) ?? false)
+        disclosure.state = expanded ? .on : .off
+        outputView.isHidden = !expanded
+        if expanded {
+            model.materializeDeferredContent(itemId: item.id, content: .output)
+        }
 
         if let code = item.exitCode, code != 0 {
             exitLabel.stringValue = "exit \(code)"
@@ -450,6 +481,8 @@ final class FileEditCellView: ConversationRowCellView {
     @objc private func toggle() {
         let expanded = disclosure.state == .on
         diffView.isHidden = !expanded
+        // Persist the expansion so a streaming reconfigure restores it (C1).
+        disclosureStore?.setItem(itemId, expanded: expanded)
         if expanded {
             model?.materializeDeferredContent(itemId: itemId, content: .diff)
         }
@@ -476,8 +509,13 @@ final class FileEditCellView: ConversationRowCellView {
                 color: .labelColor
             )
         }
-        disclosure.state = .off
-        diffView.isHidden = true
+        // RESTORE persisted expansion instead of hard-resetting to collapsed (C1).
+        let expanded = hasDiff && (disclosureStore?.isItemExpanded(item.id) ?? false)
+        disclosure.state = expanded ? .on : .off
+        diffView.isHidden = !expanded
+        if expanded {
+            model.materializeDeferredContent(itemId: item.id, content: .diff)
+        }
     }
 }
 

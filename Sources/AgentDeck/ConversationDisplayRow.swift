@@ -34,6 +34,47 @@ struct ConversationDisplayRow: Identifiable {
     var id: String { "\(turnId)#\(item.id)#\(role)" }
 }
 
+// MARK: - Reload decision
+
+/// The structural relationship between a previously displayed row sequence and a
+/// freshly rebuilt one, used by `ConversationViewController` to pick the cheapest
+/// correct table-view update.
+enum ConversationRowsDiff: Equatable {
+    /// The `row.id` sequence is identical — the only thing that can have changed
+    /// is streaming text growth inside existing rows. No cell needs to be
+    /// reconfigured (each cell already streams its own buffer); the table only
+    /// needs row-height re-measurement. Carries the offsets whose content
+    /// version changed so the controller can `noteHeightOfRows` precisely.
+    case sameRows(changedIndexes: [Int])
+    /// The id sequence differs (append / remove / reorder). The controller falls
+    /// back to a full `reloadData()` for correctness; disclosure state (C1) is
+    /// restored from the persisted set and selection (C2) is protected by the
+    /// unchanged-guards, so a reload no longer destroys user state.
+    case structural
+
+    /// Decide how the table should update from `previous` to `next`.
+    ///
+    /// Pure function of the two id/version sequences so it is unit-testable
+    /// without any AppKit view. When the id sequence matches, only rows whose
+    /// content `version` changed are reported as needing height re-measurement.
+    static func decide(
+        previous: [(id: String, version: Int)],
+        next: [(id: String, version: Int)]
+    ) -> ConversationRowsDiff {
+        guard previous.count == next.count else { return .structural }
+        var changed: [Int] = []
+        for index in next.indices {
+            if previous[index].id != next[index].id {
+                return .structural
+            }
+            if previous[index].version != next[index].version {
+                changed.append(index)
+            }
+        }
+        return .sameRows(changedIndexes: changed)
+    }
+}
+
 // MARK: - Builder
 
 enum ConversationDisplayRowBuilder {

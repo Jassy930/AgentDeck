@@ -55,10 +55,6 @@ final class EmptyStateView: NSView {
         )
         chooseButton.bezelStyle = .rounded
         chooseButton.controlSize = .regular
-        if #available(macOS 14.0, *) {
-            // borderedProminent style equivalent
-            chooseButton.hasDestructiveAction = false
-        }
         chooseButton.keyEquivalent = "\r"
         chooseButton.translatesAutoresizingMaskIntoConstraints = false
 

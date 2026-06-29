@@ -139,6 +139,15 @@ final class StreamingTextContainerView: NSView {
     /// call multiple times (rebind for cell reuse) and to alternate with the
     /// plain-text `bindBuffer`.
     func bindMarkdownBuffer(to buffer: StreamingTextBuffer, style: MarkdownStyle = .standard) {
+        // Cell reuse re-runs `configure` on every streaming flush. If we are
+        // already subscribed to this exact buffer object in markdown mode,
+        // re-binding would tear down the live subscription and rewrite the
+        // storage — wiping any in-progress text selection (C2). The buffer's
+        // own observer already pushes new tokens into the storage, so keep the
+        // existing subscription and selection untouched.
+        if markdownStyle != nil, observedBuffer === buffer {
+            return
+        }
         unbind()
         markdownStyle = style
         textView.isRichText = true
@@ -171,6 +180,14 @@ final class StreamingTextContainerView: NSView {
     /// code / link), not just plain text.
     var currentAttributedText: NSAttributedString {
         textView.textStorage ?? NSTextStorage()
+    }
+
+    /// The text view's current selection. Exposed so tests can assert that a
+    /// streaming reconfigure (same-buffer re-bind / unchanged markdown replace)
+    /// does NOT collapse a selection the user is making (C2).
+    var selectedRangeForTesting: NSRange {
+        get { textView.selectedRange() }
+        set { textView.setSelectedRange(newValue) }
     }
 
     deinit {
@@ -210,12 +227,22 @@ final class StreamingTextContainerView: NSView {
         let fullText: String
         switch change {
         case .append:
-            fullText = observedBuffer?.text ?? textView.string
+            // The whole-string builder needs the buffer's current full text;
+            // with no bound buffer there is nothing authoritative to render, so
+            // leave the existing storage (and any selection) intact.
+            guard let buffer = observedBuffer else { return }
+            fullText = buffer.text
         case .replace(let text):
             fullText = text
         }
-        let attributed = MarkdownAttributedStringBuilder.attributedString(from: fullText, style: style)
         let storage = textView.textStorage ?? NSTextStorage()
+        let attributed = MarkdownAttributedStringBuilder.attributedString(from: fullText, style: style)
+        // Mirror the plain path's `.unchanged` early-return: when the rendered
+        // STRING already matches what is displayed, rewriting the storage would
+        // be a no-op visually but would still collapse the user's selection (C2).
+        if storage.string == attributed.string {
+            return
+        }
         storage.beginEditing()
         storage.setAttributedString(attributed)
         storage.endEditing()
