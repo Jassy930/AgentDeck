@@ -25,16 +25,24 @@ agentdeckd  (Rust daemon)
       │  └── CodexAdapter
       ▼
 codex app-server  (子进程, JSON-RPC over stdio)
+
+agentdeck-cli  (参考客户端 / 门控 E2E 驱动，独立二进制，不在 GUI 实时通路上)
+      │  通过 stdio JSONL 与 agentdeckd 交互（Transport trait）
+      ▼
+agentdeckd
 ```
 
 ## 分层边界
 
 - `Sources/AgentDeck/`：macOS 原生 UI、会话模型、历史回放和本地交互。这里只能依赖中立 IPC shape。
-- `agentdeckd/src/ipc.rs`：AgentDeck 自己的 stdio JSONL IPC 协议，是 Swift 与 daemon 的物理边界。
+- `agentdeck-protocol/`：中立 IPC 协议的事实源 crate。`PROTOCOL_VERSION` 版本常量、所有消息类型和 `protocol_schema()` JSON Schema 生成均定义于此。daemon 与 CLI 共用这个 crate，保证双边类型一致。
+- `agentdeckd/src/ipc.rs`：仅作为 `agentdeck-protocol` 的 re-export 壳（`pub use agentdeck_protocol::*`），保持 daemon 内部的 `crate::ipc::X` 引用不变。
 - `agentdeckd/src/codex.rs`：Codex app-server adapter。Codex vendor JSON、方法名和 schema 翻译只能留在这里或紧邻模块。
 - `agentdeckd/src/record.rs`：AgentDeck 管理的 run record 写入与脱敏。
 - `agentdeckd/src/diag.rs`：诊断日志、自检和机器可读诊断报告。
+- `agentdeck-cli/`：参考客户端与门控 E2E 驱动。提供 `agentdeck` 二进制，供脚本化调用和本地验证使用；**不在 Swift GUI 的实时通路上**——Swift app 仍直接与 daemon 通过 stdio JSONL 交互。
 - `protocol/`：官方 Codex app-server schema 快照和 spike 事实源。
+- `protocol/agentdeck/`：AgentDeck 自身中立协议的 JSON Schema 快照（由 `agentdeck-protocol` 的 schemars 派生生成）。`cargo test` 会执行漂移测试，若协议类型变更而未重新生成快照则失败。
 - `docs/plans/`：设计、实施计划和决策历史。
 
 ## 不变量
@@ -67,17 +75,32 @@ codex app-server  (子进程, JSON-RPC over stdio)
 ```text
 Swift UI
   -> WorkbenchModel / ThreadRuntimeModel / SessionModel
-  -> AgentDeck IPC models
+  -> AgentDeck IPC models（来自 agentdeck-protocol）
   -> daemon stdio
 
 daemon main
-  -> ipc
+  -> ipc（re-export agentdeck-protocol）
   -> codex adapter
   -> record / diag
   -> codex app-server child process
+
+agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
+  -> agentdeck-protocol（共享类型）
+  -> Transport trait（ProcessTransport → daemon stdio）
+  -> daemon child process
 ```
 
 允许的跨层访问应沿上图向下。新增功能如果需要反向依赖，先把接口下沉到中立模型或 daemon adapter，不要让 UI 穿透到供应商协议。
+
+## 协议即契约
+
+`agentdeck-protocol` crate 是 IPC 协议的唯一事实源：
+
+- `PROTOCOL_VERSION`：语义版本字符串，用于 `protocol version` 子命令输出与漂移检测。
+- `protocol_schema()`：通过 schemars 从 Rust 类型派生的 JSON Schema，输出即 `protocol schema` 子命令所印内容。
+- 快照文件：`protocol/agentdeck/agentdeck-protocol.schema.json`（由 `UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot` 重新生成）。
+- 漂移测试随 `cargo test` 运行：协议类型变更而未重新生成快照则失败。
+- 可验证中立性：协议 crate 中不得出现任何供应商字样（`Codex`、`OpenAI` 等）；中立性测试同步断言此约束。
 
 ## 变更指引
 

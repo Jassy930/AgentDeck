@@ -72,7 +72,43 @@ cargo install cargo-llvm-cov
 | 诊断日志、自检、数据目录、profile、密钥脱敏 | `cargo test`；`swift run AgentDeck -- --selfcheck`；`swift run AgentDeck -- --diagnostics-report --json`；涉及 profile 时加跑 `swift run AgentDeck -- --selfcheck --profile dev` 和 `swift run AgentDeck -- --diagnostics-report --json --profile dev` |
 | 文档结构、AGENTS 入口、计划规则 | `scripts/verify-agent-docs.sh` |
 | 协议 schema 或 app-server 方法 | `cargo test`；核对 `protocol/SPIKE_FINDINGS.md` 和 `protocol/CODEX_VERSION.txt` |
+| agentdeck-protocol 类型变更 | `cargo test`（漂移测试自动运行）；若漂移测试失败须先重新生成快照（见下） |
+| 参考客户端 CLI（agentdeck-cli）、Transport、Client | `cargo test -p agentdeck-cli`；再跑完整 `cargo test` |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
+
+## 协议 schema 漂移测试
+
+`cargo test` 会在 `agentdeck-protocol` 测试套件中运行 `schema_matches_committed_snapshot`：比较 schemars 从 Rust 类型实时生成的 JSON Schema 与 `protocol/agentdeck/agentdeck-protocol.schema.json` 快照。若两者不一致，说明协议类型已变更但快照未更新，测试失败。
+
+重新生成快照：
+
+```bash
+UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot
+```
+
+重新生成后须将快照提交进仓库（`git add protocol/agentdeck/agentdeck-protocol.schema.json`）。
+
+核对快照与当前代码是否同步（独立验证，无需构建测试二进制）：
+
+```bash
+cargo run -q -p agentdeck-cli -- protocol schema \
+  | diff - protocol/agentdeck/agentdeck-protocol.schema.json \
+  && echo "schema in sync"
+```
+
+## 门控 E2E 测试
+
+`agentdeck-cli/tests/e2e.rs` 是真实 daemon 的 E2E 集成测试，默认被跳过（`#[ignore]`）。启用方式：
+
+```bash
+AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e
+```
+
+**前置条件：** `codex login` 已完成（测试会真实 spawn daemon 并发送 IPC）。
+
+**断言策略：** E2E 测试只断言响应的契约形态（消息 kind、必要字段存在、退出码等），不断言 agent 返回的具体文本内容，以避免测试因模型输出变化而 flaky。
+
+**CI 默认跳过：** 不设置 `AGENTDECK_E2E=1` 时，标准 `cargo test` 不触发 E2E，不需要 `codex login`。
 
 ## 文档结构检查
 

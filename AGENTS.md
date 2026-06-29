@@ -46,6 +46,30 @@ scripts/verify-agent-docs.sh
 
 涉及 daemon、IPC、记录、诊断、协议翻译时至少运行 `cargo test` 和自检。涉及 Swift UI、会话模型、历史回放、富文本渲染时至少运行 `swift test`。涉及诊断、日志或数据目录时同时运行 diagnostics report。
 
+### 统一接口层补充验证
+
+```bash
+# 打印 IPC 协议 JSON Schema（可与快照核对）
+cargo run -p agentdeck-cli -- protocol schema
+
+# 核对快照与代码是否同步（漂移测试也随 cargo test 自动运行）
+cargo run -q -p agentdeck-cli -- protocol schema \
+  | diff - protocol/agentdeck/agentdeck-protocol.schema.json \
+  && echo "schema in sync"
+
+# 通过 CLI 执行 IPC + logging 自检
+cargo run -p agentdeck-cli -- selfcheck
+
+# 门控 E2E（本地执行，需要 codex login；默认 cargo test 跳过）
+AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e
+```
+
+协议 schema 漂移测试随标准 `cargo test` 运行；改动 `agentdeck-protocol` 中的类型后须用以下命令重新生成快照：
+
+```bash
+UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot
+```
+
 ## 浏览与外部资料
 
 需要网页资料时优先使用当前环境可用的官方浏览工具和一手来源。不要引入项目级外部浏览 skill 依赖，也不要要求安装额外工具才能在本仓库工作。

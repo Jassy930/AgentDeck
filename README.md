@@ -139,8 +139,70 @@ History 面板的分组结果在历史线程列表更新时一次性计算；age
 # Rust daemon
 cargo build --release            # 产出 target/release/agentdeckd
 
+# 参考客户端 CLI
+cargo build --release -p agentdeck-cli  # 产出 target/release/agentdeck
+
 # Swift app
 swift build -c release           # 产出 .build/release/AgentDeck
+```
+
+## agentdeck CLI（参考客户端 / E2E 驱动）
+
+`agentdeck` 是一个 Rust 二进制参考客户端，**不在 Swift GUI 的实时通路上**。Swift app 仍直接通过 stdio JSONL 与 daemon 通信；`agentdeck` 用于脚本化调用、本地验证以及门控 E2E 测试驱动。
+
+### 全局标志
+
+| 标志 | 说明 |
+| --- | --- |
+| `--profile stable\|dev` | 选择 AgentDeck 数据目录（默认 stable） |
+| `--data-dir <path>` | 直接覆盖数据目录（优先于 --profile） |
+| `--pretty` | 人读格式输出（E2E 不依赖此标志） |
+
+### 子命令目录
+
+```bash
+agentdeck ping                          # 往返自检（ping → pong）
+agentdeck selfcheck                     # IPC 生命周期 + logging 自检
+agentdeck diagnostics report            # 输出机器可读诊断报告（JSON）
+agentdeck protocol schema               # 打印 IPC 协议 JSON Schema
+agentdeck protocol version              # 打印协议版本号
+agentdeck session run --prompt "..."    # 启动流式会话
+agentdeck session continue \
+  --thread-id <id> --prompt "..."       # 继续历史 thread
+agentdeck history list                  # 列出历史 threads
+agentdeck history read <id>             # 读取历史 thread 详情
+agentdeck history archive <id>          # 归档 thread
+agentdeck history unarchive <id>        # 取消归档
+agentdeck history rename <id> <title>   # 重命名 thread
+```
+
+`session run/continue` 支持 `--approval-policy prompt|auto-approve|auto-deny`（默认 `prompt`，等待 stdin 输入）。
+
+### 输出与退出码契约
+
+所有输出为稳定 JSON / JSONL，机器可解析。退出码：
+
+| 码 | 含义 |
+| --- | --- |
+| 0 | 成功 |
+| 2 | 用法错误（参数缺失等） |
+| 3 | 协议错误（类型不符或意外消息） |
+| 4 | 传输错误（daemon 未启动、连接失败） |
+| 5 | 会话或自检失败 |
+
+### 协议 schema / version 用法示例
+
+```bash
+# 打印当前协议 JSON Schema
+agentdeck protocol schema
+
+# 核对快照是否与代码同步
+cargo run -q -p agentdeck-cli -- protocol schema \
+  | diff - protocol/agentdeck/agentdeck-protocol.schema.json \
+  && echo "schema in sync"
+
+# 打印协议版本号
+agentdeck protocol version
 ```
 
 运行（Swift app 会自动 spawn 同目录或 PATH 上的 agentdeckd）：

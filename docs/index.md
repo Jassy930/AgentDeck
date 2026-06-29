@@ -25,6 +25,7 @@
 - `../protocol/SPIKE_FINDINGS.md`：Codex app-server wire framing、方法和 schema 事实源。
 - `../protocol/CODEX_VERSION.txt`：生成当前 schema 时使用的 Codex 版本。
 - `../protocol/*.json`：官方 schema 快照。
+- `../protocol/agentdeck/`：AgentDeck 自身中立协议 schema 与说明。`agentdeck-protocol.schema.json` 由 schemars 从 Rust 类型派生生成（非手写），`README.md` 说明生成与更新流程。
 
 ## 更新规则
 
