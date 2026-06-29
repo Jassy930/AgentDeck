@@ -1,3 +1,4 @@
+mod client;
 mod output;
 mod transport;
 
