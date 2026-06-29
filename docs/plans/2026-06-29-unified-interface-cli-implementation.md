@@ -468,8 +468,8 @@ Expected: PASS（output 模块单元测试）。
 Run: `cargo run -p agentdeck-cli -- protocol version`
 Expected: 输出 `{"protocolVersion":1}`。
 
-Run: `diff <(cargo run -q -p agentdeck-cli -- protocol schema) <(sed '$d' protocol/agentdeck/agentdeck-protocol.schema.json)`
-Expected: 无差异（CLI schema 输出与快照仅差末尾换行；`sed '$d'` 去掉快照末行空行后逐字相同）。
+Run: `diff <(cargo run -q -p agentdeck-cli -- protocol schema) protocol/agentdeck/agentdeck-protocol.schema.json`
+Expected: 无差异（CLI 用 `println!` 输出 `to_string_pretty(...)` 末尾恰好补一个 `\n`，与快照 `}\n` 逐字相同。注意用 plain `diff`，快照末尾无额外空行，不要用 `sed '$d'`）。
 
 - [ ] **Step 6: 提交**
 
@@ -1500,8 +1500,8 @@ Expected: `verify-agent-docs: ok`。
 Run: `cargo test`
 Expected: PASS（protocol drift / 中立性 / CLI 单元 / daemon 既有测试；默认不触发需登录的 E2E）。
 
-Run: `cargo run -q -p agentdeck-cli -- protocol schema | diff - <(sed '$d' protocol/agentdeck/agentdeck-protocol.schema.json) && echo "schema in sync"`
-Expected: `schema in sync`。
+Run: `cargo run -q -p agentdeck-cli -- protocol schema | diff - protocol/agentdeck/agentdeck-protocol.schema.json && echo "schema in sync"`
+Expected: `schema in sync`（plain `diff`；快照末尾为 `}\n`，无额外空行）。
 
 - [ ] **Step 7: 提交**
 
