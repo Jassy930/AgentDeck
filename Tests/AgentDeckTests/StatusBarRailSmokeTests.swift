@@ -50,12 +50,15 @@ final class StatusBarRailSmokeTests: XCTestCase {
         view.syncSelection(topVisibleTurnId: "turn-1")
     }
 
-    func testTurnJumpRailViewOnSelectTurnCallbackWires() {
+    func testTurnJumpRailViewCallbacksWire() {
         let model = SessionModel()
         let view = TurnJumpRailView(model: model)
-        var received: String?
-        view.onSelectTurn = { received = $0 }
-        XCTAssertNil(received, "callback must not fire during construction")
+        var receivedTurn: String?
+        var jumpedToLatest = false
+        view.onSelectTurn = { receivedTurn = $0 }
+        view.onJumpToLatest = { jumpedToLatest = true }
+        XCTAssertNil(receivedTurn, "onSelectTurn must not fire during construction")
+        XCTAssertFalse(jumpedToLatest, "onJumpToLatest must not fire during construction")
     }
 
     func testTurnJumpRailViewSizesToFit() {

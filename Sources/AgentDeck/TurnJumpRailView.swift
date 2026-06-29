@@ -1,6 +1,5 @@
 import AppKit
 import CoreGraphics
-import QuartzCore
 
 // MARK: - Migrated from SessionView.swift (verbatim logic, visibility changed private → internal)
 
@@ -222,14 +221,28 @@ final class RailInteractionNSView: NSView {
 
 // MARK: - TurnJumpRailView (AppKit, Task 10)
 
-/// AppKit turn-jump rail. Renders dots via draw(_:) / CALayer;
-/// dock-magnification + scroll animation use explicit CABasicAnimation
-/// (replacing SwiftUI withAnimation). Wheel steps go through
-/// ConversationRailNavigator.next(…).
+/// AppKit turn-jump rail. Renders dots and the jump-to-latest glyph via
+/// `draw(_:)` (CGContext). Dock-magnification and rail scroll are animated by a
+/// manual eased timer animation — a self-scheduled `DispatchQueue.main.asyncAfter`
+/// step loop that interpolates state and calls `needsDisplay` each frame
+/// (replacing SwiftUI `withAnimation`). Each animation chain carries a
+/// generation token so starting a new chain (or deinit) invalidates the old one,
+/// preventing overlapping/zombie animations. Wheel steps go through
+/// `ConversationRailNavigator.next(…)`.
 @MainActor
 final class TurnJumpRailView: NSView {
     // MARK: Public interface
+
+    /// Fired when the user selects a concrete conversation turn (dot click or
+    /// wheel-step that lands on a turn). The argument is always a real
+    /// `turnId` — never a sentinel. For "jump to latest", `onJumpToLatest` fires
+    /// instead.
     var onSelectTurn: ((String) -> Void)?
+
+    /// Fired when the user jumps to the latest message (latest-anchor click or
+    /// wheel-step past the newest turn). Distinct from `onSelectTurn` so callers
+    /// never have to interpret an empty-string sentinel.
+    var onJumpToLatest: (() -> Void)?
 
     // MARK: Private state
     private let model: SessionModel
@@ -239,8 +252,17 @@ final class TurnJumpRailView: NSView {
     private var hoveredTarget: TurnJumpRailHitTarget?
     private var railScrollOffset: CGFloat = 0
 
+    /// Bumped whenever a new rail-scroll animation starts. A scheduled scroll
+    /// step that finds its captured token no longer current simply returns,
+    /// which cancels the stale chain — preventing two scroll chains from fighting
+    /// over `railScrollOffset`, and stopping any in-flight scroll on deinit.
+    private var scrollGeneration: UInt64 = 0
+
+    /// Same idea, dedicated to the hover redraw burst so a hover never cancels an
+    /// in-flight scroll (they animate independent state) and vice versa.
+    private var hoverGeneration: UInt64 = 0
+
     // MARK: Subviews
-    private let dotsLayer = CALayer()
     private let interactionView: RailInteractionNSView
 
     init(model: SessionModel) {
@@ -272,7 +294,6 @@ final class TurnJumpRailView: NSView {
 
     override func layout() {
         super.layout()
-        dotsLayer.frame = bounds
         interactionView.frame = bounds
         interactionView.itemCount = navItems.count
         interactionView.railScrollOffset = railScrollOffset
@@ -377,9 +398,8 @@ final class TurnJumpRailView: NSView {
                 guard self.navItems.indices.contains(index) else { return }
                 self.onSelectTurn?(self.navItems[index].turnId)
             case .latest:
-                self.onSelectTurn?(nil as String? ?? "")
-                // Caller uses nil to mean "jump to latest"; signal via nil selectedTurnId
                 self.selectedTurnId = nil
+                self.onJumpToLatest?()
                 self.needsDisplay = true
             }
         }
@@ -394,7 +414,7 @@ final class TurnJumpRailView: NSView {
             switch outcome {
             case .scrollToLatest:
                 self.selectedTurnId = nil
-                self.onSelectTurn?("")  // empty string signals "latest" to caller
+                self.onJumpToLatest?()
                 self.needsDisplay = true
             case .scrollToTurn(let turnId):
                 self.selectedTurnId = turnId
@@ -452,23 +472,34 @@ final class TurnJumpRailView: NSView {
         }
     }
 
+    /// Animate `railScrollOffset` toward `target` with a manual eased timer
+    /// animation (self-scheduled `asyncAfter` step loop, not Core Animation).
+    /// Bumps `scrollGeneration` so any in-flight chain is cancelled before a
+    /// new one starts. Sub-pixel deltas snap immediately.
     private func animateScrollOffset(to target: CGFloat) {
-        // Use a CABasicAnimation on a custom property is not trivially doable;
-        // instead drive the offset via a display link step pattern.
-        // For simplicity here, directly set + redraw (no perceptible diff
-        // for < 1px deltas; larger jumps use a simple linear approach).
         let start = railScrollOffset
         let delta = target - start
+
+        // Starting (or short-circuiting) a new animation invalidates the
+        // previous chain: stale steps will see a mismatched token and bail.
+        scrollGeneration &+= 1
+
         guard abs(delta) > 0.5 else {
             railScrollOffset = target
             interactionView.railScrollOffset = railScrollOffset
             needsDisplay = true
             return
         }
-        animateScroll(from: start, to: target, step: 0, totalSteps: 6)
+        animateScroll(from: start, to: target, step: 0, totalSteps: 6, generation: scrollGeneration)
     }
 
-    private func animateScroll(from start: CGFloat, to end: CGFloat, step: Int, totalSteps: Int) {
+    /// One frame of the manual eased scroll animation. Re-schedules the next
+    /// frame via `asyncAfter` unless its `generation` token is stale (a newer
+    /// scroll started, or the view was torn down) — that check is what makes
+    /// the chain cancellable and non-overlapping.
+    private func animateScroll(from start: CGFloat, to end: CGFloat, step: Int, totalSteps: Int, generation: UInt64) {
+        guard generation == scrollGeneration else { return }
+
         let progress = CGFloat(step + 1) / CGFloat(totalSteps)
         // Ease-in-out curve
         let eased = progress < 0.5
@@ -480,24 +511,32 @@ final class TurnJumpRailView: NSView {
 
         guard step + 1 < totalSteps else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
-            self?.animateScroll(from: start, to: end, step: step + 1, totalSteps: totalSteps)
+            self?.animateScroll(from: start, to: end, step: step + 1, totalSteps: totalSteps, generation: generation)
         }
     }
 
+    /// Briefly nudge the rail to redraw so dot dock-magnification animates in.
+    /// Carries its own generation token so a newer hover (or deinit) cancels the
+    /// redraw burst, while leaving any in-flight scroll untouched.
     private func animateHoverChange() {
-        // Trigger a brief redraw pass to animate dot size changes
+        hoverGeneration &+= 1
+        let generation = hoverGeneration
         let steps = 4
         for i in 0..<steps {
             DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 0.03) { [weak self] in
-                self?.needsDisplay = true
+                guard let self, generation == self.hoverGeneration else { return }
+                self.needsDisplay = true
             }
         }
     }
 
     deinit {
-        // binder is already @MainActor; invalidate on deinit (may be called off-main)
-        // — safe because ObservationBinder.invalidate only sets a Bool.
-        // We must capture it and call off the actor; Task handles this.
+        // Bump both generations so any scheduled animation step bails on its next
+        // tick (it captured the now-stale value), stopping in-flight chains.
+        scrollGeneration &+= 1
+        hoverGeneration &+= 1
+        // binder is @MainActor; invalidate may be reached off-main on deinit, so
+        // hop onto the actor. invalidate() only flips a Bool — cheap and safe.
         let b = binder
         Task { @MainActor in b?.invalidate() }
     }
