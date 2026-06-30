@@ -1,27 +1,24 @@
 import Foundation
 import Observation
 
-/// A neutral agent item as the UI sees it. Mirrors the daemon's AgentItem
-/// (Eng D4 per-kind). The Swift app NEVER parses vendor formats — it only
-/// ever decodes this neutral shape (Eng D2). Adding a Claude Code adapter
-/// later changes nothing here.
+/// A neutral agent item as the UI sees it. Mirrors the v0.1 rendering shape;
+/// the UI renderers depend on these field names.
 struct UIItem: Identifiable {
-    let id: String
-    var lifecycle: String          // started | delta | completed
-    var kind: String               // reasoning | shell | fileEdit | webSearch | raw
-    // Per-kind fields (only the relevant ones are populated).
-    var text: String = ""          // reasoning
-    var command: String = ""       // shell
-    var output: String = ""        // shell
-    var exitCode: Int?             // shell
-    var path: String = ""          // fileEdit
-    var diff: String = ""          // fileEdit
-    var query: String = ""         // webSearch
-    var action: String = ""        // webSearch
-    var actionQuery: String = ""   // webSearch
-    var queries: [String] = []     // webSearch
-    var url: String = ""           // webSearch
-    var pattern: String = ""       // webSearch
+    var id: String
+    var lifecycle: String
+    var kind: String
+    var text: String = ""
+    var command: String = ""
+    var output: String = ""
+    var exitCode: Int?
+    var path: String = ""
+    var diff: String = ""
+    var query: String = ""
+    var action: String = ""
+    var actionQuery: String = ""
+    var queries: [String] = []
+    var url: String = ""
+    var pattern: String = ""
     var attachments: [HistoryReference] = []
     var phaseName: String = ""
     var memoryCitation: String = ""
@@ -53,7 +50,7 @@ struct UIItem: Identifiable {
     var savedPath: String = ""
     var revisedPrompt: String = ""
     var review: String = ""
-    var descriptionText: String = "" // raw (neutralized unknown)
+    var descriptionText: String = ""
     var hasNonWhitespaceText = false
     var hasDeferredOutputBuffer = false
     var hasDeferredDiffBuffer = false
@@ -147,13 +144,9 @@ struct HistoryOpenTiming: Equatable {
     let totalMilliseconds: Int
 }
 
-/// The session view model. `@MainActor` + `@Observable`: every mutation is
-/// main-thread (Eng C-uitest), SwiftUI observes it directly.
-///
-/// `state` is a MIRROR of the daemon's session state machine (Eng D9). The
-/// daemon is the sole source of truth; this never invents a transition, it
-/// only reflects `sessionState` messages. `statusText` drives the D6
-/// transition copy ("Connecting to Codex…" etc).
+/// Session view model. `@MainActor` + `@Observable`. v2 (Task 6A): pure
+/// orchestrator over `WorkbenchModel`; the cross-agent history layer is
+/// pending Task 6.5 and is currently a stub.
 @MainActor
 @Observable
 final class SessionModel {
@@ -161,8 +154,11 @@ final class SessionModel {
         case idle, starting, ready, running, waitingApproval, draining, failed, closed
     }
 
-    /// The chosen project directory (Eng D3: Swift validates before the
-    /// daemon's authoritative check). nil → show the empty state (D5).
+    enum DeferredContent {
+        case output
+        case diff
+    }
+
     var cwd: URL?
     var phase: Phase = .idle {
         didSet {
@@ -179,13 +175,10 @@ final class SessionModel {
         }
     }
 
-    /// True while a turn is in flight — the view auto-EXPANDS reasoning so
-    /// the user sees the chain-of-thought stream while waiting for the
-    /// final answer (which Codex sends in one burst). When the turn ends,
-    /// reasoning collapses back to its D3 secondary role.
     var shouldShowReasoningExpanded: Bool {
         selectedPhase == .running || selectedPhase == .starting
     }
+
     var items: [UIItem] = []
     var errorMessage: String?
     var warningMessage: String?
@@ -195,17 +188,13 @@ final class SessionModel {
     var selectedWarningMessage: String? {
         workbench.selectedRuntime?.warningMessage ?? warningMessage
     }
-    var selectedActionRequest: ActionRequest? {
+    var selectedActionRequest: PendingActionRequest? {
         workbench.selectedRuntime?.pendingActionRequest
     }
-    /// When the current turn began. `nil` outside a turn.
     var runStartedAt: Date?
-    /// Driven by a tick timer; the status bar reads this so the elapsed
-    /// counter updates once per second while a turn is running.
     var tickNow: Date = .now
     private var tickTimer: Timer?
-    /// Prompts queued while a turn runs (Eng I1). v0.1: enqueue, auto-send
-    /// on turn completion. Step 5 wires the auto-send; Step 4 shows the count.
+
     var queuedPrompts: [String] {
         get {
             workbench.selectedRuntime?.queuedPrompts ?? legacyQueuedPrompts
@@ -219,6 +208,9 @@ final class SessionModel {
         }
     }
     private var legacyQueuedPrompts: [String] = []
+
+    /// v2 cross-agent history — stub until Task 6.5 wires daemon history.
+    /// Existing UI references this; we keep the API so the UI compiles.
     private(set) var historyThreads: [HistoryThreadSummary] = []
     private(set) var historyGroups: [HistoryProjectGroup] = []
     var historyErrorMessage: String?
@@ -241,53 +233,40 @@ final class SessionModel {
 
     let workbench: WorkbenchModel
 
-    private let client: SessionClienting
-    private let historyDetailClient: HistoryDetailReading
+    private let client: DaemonClient?
     private var daemonStarted = false
-    private var itemIndexById: [String: Int] = [:]
-    private var pendingAgentItems: [[String: Any]] = []
-    private var renderFlushTimer: Timer?
-    private let renderFlushInterval: TimeInterval = 1.0 / 30.0
-    private let largeHistoryTextThreshold = 16 * 1024
     private var conversationViewportRevision = 0
 
-    enum DeferredContent {
-        case output
-        case diff
-    }
-
     init(
-        client: SessionClienting = DaemonClient(),
-        historyDetailClient: HistoryDetailReading? = nil,
+        client: DaemonClient? = nil,
         runtimeTurnStarter: RuntimeTurnStarting? = nil
     ) {
-        self.client = client
+        let daemon = client ?? DaemonClient()
+        self.client = daemon
         self.workbench = WorkbenchModel(
-            turnStarter: runtimeTurnStarter
-                ?? (client as? RuntimeTurnStarting)
-                ?? NoopRuntimeTurnStarter(),
-            actionDecider: client as? RuntimeActionDeciding
+            turnStarter: runtimeTurnStarter ?? daemon,
+            actionDecider: daemon
         )
-        self.historyDetailClient = historyDetailClient ?? DaemonHistoryDetailReader()
     }
 
-    /// Elapsed seconds in the current turn (nil outside a turn). Driven by
-    /// `tickNow` so SwiftUI re-renders every second.
+    /// Test-only init: bypass DaemonClient entirely.
+    init(turnStarter: RuntimeTurnStarting, actionDecider: RuntimeActionDeciding? = nil) {
+        self.client = nil
+        self.workbench = WorkbenchModel(turnStarter: turnStarter, actionDecider: actionDecider)
+    }
+
     var elapsedSeconds: Int? {
         guard let start = runStartedAt else { return nil }
         return max(0, Int(tickNow.timeIntervalSince(start)))
     }
 
-    /// D6 transition copy: reuse the D9 state machine, not a generic spinner.
-    /// When a turn is running, append elapsed seconds so the user can SEE
-    /// time passing while Codex assembles the final answer.
     var statusText: String {
         let base: String
         switch selectedPhase {
         case .idle: base = "Ready"
-        case .starting: base = "Connecting to Codex…"
+        case .starting: base = "Starting…"
         case .ready: base = "Ready"
-        case .running: base = "Codex is working…"
+        case .running: base = "Working…"
         case .waitingApproval: base = "Waiting for your approval"
         case .draining: base = "Finishing up…"
         case .failed: base = "Failed"
@@ -306,8 +285,6 @@ final class SessionModel {
         return "history read \(timing.readMilliseconds)ms · apply \(timing.applyMilliseconds)ms · \(timing.itemCount) items"
     }
 
-    /// Start/stop the 1Hz tick so `elapsedSeconds` updates while a turn
-    /// runs and stays still otherwise (no idle CPU).
     func tickIfNeeded() {
         let needsTick = (phase == .running || phase == .starting)
         if needsTick && tickTimer == nil {
@@ -320,9 +297,6 @@ final class SessionModel {
         }
     }
 
-    /// Eng D3: Swift-side cwd validation (existence/readability) — closest to
-    /// the user, fastest feedback. The daemon does the authoritative final
-    /// check before app-server.
     func chooseCwd(_ url: URL) -> String? {
         var isDir: ObjCBool = false
         let ok = FileManager.default.fileExists(
@@ -337,7 +311,7 @@ final class SessionModel {
         return nil
     }
 
-    func submit(_ prompt: String) {
+    func submit(_ prompt: String, agentKind: AgentKind = .codex) {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
@@ -354,7 +328,7 @@ final class SessionModel {
 
         let sessionId = "live-\(UUID().uuidString)"
         selectedHistoryThreadId = nil
-        workbench.ensureRuntime(sessionId: sessionId, threadId: nil, cwd: cwd)
+        workbench.ensureRuntime(sessionId: sessionId, agentKind: agentKind, threadId: nil, cwd: cwd)
         workbench.selectRuntime(sessionId: sessionId)
         let oldCount = selectedItems.count
         workbench.submit(trimmed)
@@ -365,6 +339,7 @@ final class SessionModel {
 
     @discardableResult
     private func ensureDaemonStarted() -> Bool {
+        guard let client else { return true }
         if !daemonStarted {
             do {
                 try client.start()
@@ -396,19 +371,32 @@ final class SessionModel {
 
     func loadHistory(currentProjectOnly: Bool = false) {
         guard !isLoadingHistory else { return }
+        guard let client else {
+            historyErrorMessage = "no daemon client"
+            return
+        }
         guard ensureDaemonStarted() else { return }
         isLoadingHistory = true
         historyErrorMessage = nil
         let cwdFilter = currentProjectOnly ? cwd?.path : nil
-        let search = historySearchTerm.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
-            let list = try client.listHistoryThreads(
-                cwd: cwdFilter,
-                searchTerm: search.isEmpty ? nil : search,
-                cursor: nil,
-                limit: 50
-            )
-            setHistoryThreads(list.threads)
+            let response = try client.history(.list(agentKind: nil, cwdFilter: cwdFilter))
+            if case .list(let items) = response {
+                let summaries = items.map { item in
+                    HistoryThreadSummary(
+                        id: item.threadId,
+                        name: item.title,
+                        preview: item.title ?? "",
+                        cwd: item.cwd,
+                        createdAt: Int(item.lastActiveMs / 1000),
+                        updatedAt: Int(item.lastActiveMs / 1000),
+                        status: item.archived ? "archived" : "ready",
+                        modelProvider: item.agentKind == .codex ? "openai" : "anthropic",
+                        source: item.agentKind == .codex ? "codex" : "claude_code"
+                    )
+                }
+                setHistoryThreads(summaries)
+            }
         } catch {
             historyErrorMessage = "\(error)"
         }
@@ -416,37 +404,56 @@ final class SessionModel {
     }
 
     func openHistoryThread(_ thread: HistoryThreadSummary) {
-        if historyDetailClient === client {
-            guard ensureDaemonStarted() else { return }
-        }
+        guard let client else { return }
+        guard ensureDaemonStarted() else { return }
         openingHistoryThreadId = thread.id
         historyErrorMessage = nil
         lastHistoryOpenTiming = nil
-        let reader = historyDetailClient
+        let agentKind: AgentKind = thread.source.lowercased().contains("claude") ? .claudeCode : .codex
         let startedAt = Date()
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let result = Result { try reader.readHistoryThread(threadId: thread.id) }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, weak client] in
+            guard let client else { return }
+            let result = Result<HistoryResponse, Error> {
+                try client.history(.read(threadId: thread.id, agentKind: agentKind))
+            }
             let readFinishedAt = Date()
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.openingHistoryThreadId == thread.id else { return }
                 self.openingHistoryThreadId = nil
                 switch result {
-                case .success(let detail):
-                    let applyStartedAt = Date()
-                    self.applyHistoryThreadDetail(detail)
-                    let appliedAt = Date()
-                    self.lastHistoryOpenTiming = HistoryOpenTiming(
-                        threadId: thread.id,
-                        itemCount: detail.items.count,
-                        readMilliseconds: Self.milliseconds(from: startedAt, to: readFinishedAt),
-                        applyMilliseconds: Self.milliseconds(from: applyStartedAt, to: appliedAt),
-                        totalMilliseconds: Self.milliseconds(from: startedAt, to: appliedAt)
-                    )
+                case .success(let response):
+                    if case .read(let detail) = response {
+                        let applyStartedAt = Date()
+                        self.applyHistoryReadResponse(detail, originalThread: thread)
+                        let appliedAt = Date()
+                        self.lastHistoryOpenTiming = HistoryOpenTiming(
+                            threadId: thread.id,
+                            itemCount: detail.turns.reduce(0) { $0 + $1.items.count },
+                            readMilliseconds: Self.milliseconds(from: startedAt, to: readFinishedAt),
+                            applyMilliseconds: Self.milliseconds(from: applyStartedAt, to: appliedAt),
+                            totalMilliseconds: Self.milliseconds(from: startedAt, to: appliedAt)
+                        )
+                    }
                 case .failure(let error):
                     self.historyErrorMessage = "\(error)"
                 }
             }
         }
+    }
+
+    func applyHistoryReadResponse(_ response: HistoryReadResponse, originalThread thread: HistoryThreadSummary) {
+        cwd = URL(fileURLWithPath: thread.cwd)
+        selectedHistoryThreadId = thread.id
+        resetConversationViewport(prefix: "history:\(thread.id)")
+        let runtime = ThreadRuntimeModel(
+            id: thread.id,
+            agentKind: response.agentKind,
+            threadId: thread.id,
+            cwd: URL(fileURLWithPath: thread.cwd)
+        )
+        runtime.applyReplayTurns(response.turns)
+        workbench.installRuntime(runtime)
+        workbench.selectRuntime(sessionId: thread.id)
     }
 
     func applyHistoryThreadDetail(_ detail: HistoryThreadDetail) {
@@ -462,7 +469,6 @@ final class SessionModel {
         openingHistoryThreadId = nil
         resetConversationViewport(prefix: "live")
         items.removeAll()
-        itemIndexById.removeAll(keepingCapacity: true)
         errorMessage = nil
         warningMessage = nil
         phase = cwd == nil ? .idle : .ready
@@ -479,9 +485,10 @@ final class SessionModel {
     }
 
     func archiveHistoryThread(_ thread: HistoryThreadSummary) {
-        guard ensureDaemonStarted() else { return }
+        guard let client, ensureDaemonStarted() else { return }
+        let agentKind: AgentKind = thread.source.lowercased().contains("claude") ? .claudeCode : .codex
         do {
-            try client.archiveHistoryThread(threadId: thread.id)
+            _ = try client.history(.archive(threadId: thread.id, agentKind: agentKind))
             if selectedHistoryThreadId == thread.id {
                 startNewSessionFromCurrentProject()
             }
@@ -493,9 +500,10 @@ final class SessionModel {
 
     func renameHistoryThread(_ thread: HistoryThreadSummary, name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, ensureDaemonStarted() else { return }
+        guard !trimmed.isEmpty, let client, ensureDaemonStarted() else { return }
+        let agentKind: AgentKind = thread.source.lowercased().contains("claude") ? .claudeCode : .codex
         do {
-            try client.renameHistoryThread(threadId: thread.id, name: trimmed)
+            _ = try client.history(.rename(threadId: thread.id, agentKind: agentKind, title: trimmed))
             loadHistory()
         } catch {
             historyErrorMessage = "\(error)"
@@ -503,102 +511,15 @@ final class SessionModel {
     }
 
     func materializeDeferredContent(itemId: String, content: DeferredContent) {
-        if let runtime = workbench.selectedRuntime {
-            runtime.materializeDeferredContent(itemId: itemId, content: content)
-            return
-        }
-        guard let idx = itemIndexById[itemId], items.indices.contains(idx) else { return }
-        switch content {
-        case .output:
-            guard items[idx].hasDeferredOutputBuffer else { return }
-            items[idx].outputBuffer.replace(with: items[idx].output)
-            items[idx].hasDeferredOutputBuffer = false
-        case .diff:
-            guard items[idx].hasDeferredDiffBuffer else { return }
-            items[idx].diffBuffer.replace(with: items[idx].diff)
-            items[idx].hasDeferredDiffBuffer = false
-        }
+        workbench.selectedRuntime?.materializeDeferredContent(itemId: itemId, content: content)
     }
 
-    func decidePendingAction(_ decision: String) {
-        workbench.decidePendingAction(decision)
+    func decidePendingAction(_ decision: ActionDecisionKind, persist: Bool = false) {
+        workbench.decidePendingAction(decision, persist: persist)
     }
 
-    func ingest(rawLine raw: String) {
-        let msg = (try? JSONDecoder().decode(
-            IpcMessage.self, from: Data(raw.utf8)))
-            ?? IpcMessage(kind: "error", id: nil,
-                payload: AnyCodable(["message": "malformed reply"]))
-        ingest(msg)
-    }
-
-    func ingest(_ msg: IpcMessage) {
-        switch msg.kind {
-        case "agentItem":
-            if let dict = msg.payload?.value as? [String: Any] {
-                enqueueAgentItem(dict)
-            }
-        case "sessionState":
-            flushPendingAgentItems()
-            if let s = (msg.payload?.value as? [String: Any])?["state"] as? String,
-               let p = Phase(rawValue: s) {
-                phase = p
-            }
-        case "turnComplete":
-            flushPendingAgentItems()
-            phase = .ready
-            drainQueueIfPossible()
-        case "error":
-            flushPendingAgentItems()
-            let m = (msg.payload?.value as? [String: Any])?["message"] as? String
-            errorMessage = m ?? "unknown error"
-            phase = .failed
-        case "warning":
-            let m = (msg.payload?.value as? [String: Any])?["message"] as? String
-            warningMessage = m ?? "unknown warning"
-        default:
-            break
-        }
-    }
-
-    private func enqueueAgentItem(_ item: [String: Any]) {
-        pendingAgentItems.append(item)
-        guard renderFlushTimer == nil else { return }
-        renderFlushTimer = Timer.scheduledTimer(
-            withTimeInterval: renderFlushInterval,
-            repeats: false
-        ) { [weak self] _ in
-            Task { @MainActor in self?.flushPendingAgentItems() }
-        }
-    }
-
-    /// Applies all pending stream deltas in one SwiftUI-observable mutation
-    /// window. This keeps the daemon faithful while preventing token-rate UI
-    /// invalidation from fighting ScrollView interaction.
-    func flushPendingAgentItems() {
-        renderFlushTimer?.invalidate()
-        renderFlushTimer = nil
-        guard !pendingAgentItems.isEmpty else { return }
-        let pending = pendingAgentItems
-        pendingAgentItems.removeAll(keepingCapacity: true)
-        for item in pending {
-            upsert(item)
-        }
-    }
-
-    /// Merge a streamed item by id: started creates, delta appends, completed
-    /// finalizes. Delta rate is throttled by `flushPendingAgentItems`.
-    private func upsert(_ d: [String: Any]) {
-        var store = AgentItemStore(items: items, itemIndexById: itemIndexById)
-        AgentItemReducer.upsert(d, into: &store)
-        items = store.items
-        itemIndexById = store.itemIndexById
-    }
-
-    private func drainQueueIfPossible() {
-        guard !legacyQueuedPrompts.isEmpty, phase == .ready else { return }
-        let next = legacyQueuedPrompts.removeFirst()
-        submit(next)
+    func ingest(_ event: ServerEvent) {
+        workbench.ingestServerEvent(event)
     }
 
     private static func milliseconds(from start: Date, to end: Date) -> Int {
@@ -606,11 +527,7 @@ final class SessionModel {
     }
 
     func teardown() {
-        flushPendingAgentItems()
-        renderFlushTimer?.invalidate()
         tickTimer?.invalidate()
-        historyDetailClient.shutdown()
-        client.shutdown()
+        client?.shutdown()
     }
-
 }

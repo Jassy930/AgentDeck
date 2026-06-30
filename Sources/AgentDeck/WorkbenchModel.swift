@@ -30,15 +30,16 @@ final class WorkbenchModel {
         }
     }
 
-    func ensureRuntime(sessionId: String, threadId: String?, cwd: URL) {
+    func ensureRuntime(sessionId: String, agentKind: AgentKind, threadId: String?, cwd: URL) {
         if let runtime = runtimes[sessionId] {
             if runtime.threadId == nil {
                 runtime.threadId = threadId
             }
             return
         }
-
-        runtimes[sessionId] = ThreadRuntimeModel(id: sessionId, threadId: threadId, cwd: cwd)
+        runtimes[sessionId] = ThreadRuntimeModel(
+            id: sessionId, agentKind: agentKind, threadId: threadId, cwd: cwd
+        )
         if selectedSessionId == nil {
             selectRuntime(sessionId: sessionId)
         }
@@ -54,10 +55,19 @@ final class WorkbenchModel {
         runtimes[sessionId]?.unreadEventCount = 0
     }
 
+    /// Direct insertion used by history replay paths to install a hydrated
+    /// runtime. Keeps the `private(set)` access on `runtimes` so streaming
+    /// callers must go through `ensureRuntime`/`ingestServerEvent`.
+    func installRuntime(_ runtime: ThreadRuntimeModel) {
+        runtimes[runtime.id] = runtime
+    }
+
     func applyHistoryThreadDetail(_ detail: HistoryThreadDetail) {
         let sessionId = detail.thread.id
+        let agentKind = inferAgentKind(from: detail.thread)
         let runtime = ThreadRuntimeModel(
             id: sessionId,
+            agentKind: agentKind,
             threadId: detail.thread.id,
             cwd: URL(fileURLWithPath: detail.thread.cwd)
         )
@@ -71,34 +81,22 @@ final class WorkbenchModel {
         submit(prompt, to: runtime)
     }
 
-    func decidePendingAction(_ decision: String) {
+    func decidePendingAction(_ decision: ActionDecisionKind, persist: Bool = false) {
         guard let runtime = selectedRuntime,
               let pending = runtime.resolvePendingAction() else { return }
         actionDecider.sendActionDecision(
             sessionId: runtime.id,
             requestId: pending.requestId,
-            decision: decision
+            decision: decision,
+            persist: persist
         )
     }
 
-    func ingestSessionEvent(_ msg: IpcMessage) {
-        guard msg.kind == "session/event",
-              let sessionId = msg.sessionId,
-              let runtime = runtimes[sessionId],
-              let payload = msg.payload?.value as? [String: Any],
-              let event = payload["event"] as? [String: Any],
-              let kind = event["kind"] as? String else { return }
-
-        if runtime.threadId == nil {
-            runtime.threadId = msg.threadId
-        }
-
-        let action = runtime.ingest(IpcMessage(
-            kind: kind,
-            sessionId: sessionId,
-            threadId: msg.threadId,
-            payload: legacyPayload(from: event)
-        ))
+    /// Ingest a v2 ServerEvent into the matching runtime.
+    func ingestServerEvent(_ event: ServerEvent) {
+        guard let sessionId = event.sessionId,
+              let runtime = runtimes[sessionId] else { return }
+        let action = runtime.ingest(event)
         if selectedSessionId == sessionId {
             runtime.unreadEventCount = 0
         }
@@ -121,11 +119,13 @@ final class WorkbenchModel {
         turnStarter.startTurn(
             sessionId: runtime.id,
             threadId: runtime.threadId,
+            agentKind: runtime.agentKind,
             cwd: runtime.cwd,
             prompt: trimmed,
-            optimisticUserItemId: optimisticUserItemId
-        ) { [weak self] msg in
-            self?.ingestSessionEvent(msg)
+            optimisticUserItemId: optimisticUserItemId,
+            sessionStart: nil
+        ) { [weak self] event in
+            self?.ingestServerEvent(event)
         }
     }
 
@@ -137,13 +137,13 @@ final class WorkbenchModel {
         }
     }
 
-    private func legacyPayload(from event: [String: Any]) -> AnyCodable? {
-        if let wrappedPayload = event["payload"] {
-            return AnyCodable(wrappedPayload)
-        }
-
-        let unwrapped = event.filter { key, _ in key != "kind" }
-        return unwrapped.isEmpty ? nil : AnyCodable(unwrapped)
+    /// Legacy `HistoryThreadSummary.source/modelProvider` mapping — v0.2 we
+    /// default to `.codex` for backward-compat with persisted v0.1 records,
+    /// but cross-agent history lookup (T6.5) replaces this with a real lookup.
+    private func inferAgentKind(from thread: HistoryThreadSummary) -> AgentKind {
+        let src = thread.source.lowercased()
+        if src.contains("claude") { return .claudeCode }
+        return .codex
     }
 }
 
@@ -152,14 +152,16 @@ final class NoopRuntimeTurnStarter: RuntimeTurnStarting {
     func startTurn(
         sessionId: String,
         threadId: String?,
+        agentKind: AgentKind,
         cwd: URL,
         prompt: String,
         optimisticUserItemId: String,
-        onEvent: @escaping @MainActor @Sendable (IpcMessage) -> Void
+        sessionStart: SessionStart?,
+        onEvent: @escaping @MainActor (ServerEvent) -> Void
     ) {}
 }
 
 @MainActor
 final class NoopRuntimeActionDecider: RuntimeActionDeciding {
-    func sendActionDecision(sessionId: String, requestId: UInt64, decision: String) {}
+    func sendActionDecision(sessionId: String, requestId: String, decision: ActionDecisionKind, persist: Bool) {}
 }

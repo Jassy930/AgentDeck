@@ -104,18 +104,27 @@ final class ApprovalCardView: NSView {
     }
 
     /// Bind the card to the pending request and the model that decides it.
-    func configure(action: ActionRequest, model: SessionModel) {
+    /// v2 (Task 6A): consumes typed `PendingActionRequest`; Task 6B will
+    /// route the `vendor` slot to per-agent vendor SubViews under the
+    /// header. v0.2 stub renders only the neutral trunk fields.
+    func configure(action: PendingActionRequest, model: SessionModel) {
         self.model = model
-        titleLabel.stringValue = action.title
-        detailLabel.stringValue = action.detail
-        detailLabel.isHidden = action.detail.isEmpty
+        let title: String
+        switch action.actionKind {
+        case .executeCommand: title = "Run command"
+        case .editFiles: title = "Edit files"
+        case .grantExtraPermission: title = "Grant extra permission"
+        }
+        titleLabel.stringValue = title
+        detailLabel.stringValue = action.summary
+        detailLabel.isHidden = action.summary.isEmpty
     }
 
     @objc private func approve() {
-        model?.decidePendingAction("approve")
+        model?.decidePendingAction(.approve)
     }
 
     @objc private func deny() {
-        model?.decidePendingAction("deny")
+        model?.decidePendingAction(.deny)
     }
 }

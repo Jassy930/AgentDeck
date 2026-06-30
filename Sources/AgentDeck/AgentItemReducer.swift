@@ -1,108 +1,119 @@
 import Foundation
 
+/// Cumulative-semantics agent item store. v2 (Task 6A) ingests typed
+/// `AgentItem` values from the daemon's `ServerEvent::AgentItem` and
+/// translates them into the existing `UIItem` rendering shape (kept stable
+/// to preserve all rendering work from v0.1).
+///
+/// The daemon now emits cumulative AgentItems (each event is the complete
+/// current state), so the reducer no longer needs delta accumulation logic
+/// — each `apply` replaces the matching slot.
 struct AgentItemStore {
     var items: [UIItem] = []
     var itemIndexById: [String: Int] = [:]
 }
 
 enum AgentItemReducer {
-    static func upsert(_ d: [String: Any], into store: inout AgentItemStore) {
-        guard let id = d["id"] as? String,
-              let kind = d["kind"] as? String,
-              let life = d["lifecycle"] as? String else { return }
-
-        var item = store.itemIndexById[id].flatMap { idx in
+    /// Apply a typed v2 AgentItem to the store. The store key is a stable id
+    /// derived from item content + a monotonic per-store sequence — since
+    /// daemon AgentItems don't carry their own id we synthesize one per
+    /// (kind, position) pair using the caller-provided `itemId`.
+    static func apply(_ item: AgentItem, itemId: String, into store: inout AgentItemStore) {
+        var ui = store.itemIndexById[itemId].flatMap { idx in
             store.items.indices.contains(idx) ? store.items[idx] : nil
-        } ?? UIItem(id: id, lifecycle: life, kind: kind)
-        item.lifecycle = life
-        item.kind = kind
+        } ?? UIItem(id: itemId, lifecycle: "completed", kind: kindLabel(for: item))
+        ui.id = itemId
+        ui.kind = kindLabel(for: item)
+        ui.lifecycle = "completed"
+        populate(&ui, from: item)
+        if let idx = store.itemIndexById[itemId], store.items.indices.contains(idx) {
+            store.items[idx] = ui
+        } else {
+            store.itemIndexById[itemId] = store.items.count
+            store.items.append(ui)
+        }
+    }
 
-        switch kind {
-        case "user", "message", "reasoning":
-            let t = d["text"] as? String ?? ""
-            if life == "delta" {
-                item.text.append(contentsOf: t)
-                item.textBuffer.append(t)
-                item.hasNonWhitespaceText = item.hasNonWhitespaceText || agentDeckContainsNonWhitespace(t)
-            } else if !t.isEmpty {
-                item.text = t
-                item.textBuffer.replace(with: t)
-                item.hasNonWhitespaceText = agentDeckContainsNonWhitespace(t)
-            }
-        case "shell":
-            item.command = d["command"] as? String ?? item.command
-            if let o = d["output"] as? String {
-                if life == "delta" {
-                    item.output.append(contentsOf: o)
-                    item.outputBuffer.append(o)
-                } else {
-                    item.output = o
-                    item.outputBuffer.replace(with: o)
+    /// Map AgentItem variant → legacy `UIItem.kind` label, kept for UI compat.
+    static func kindLabel(for item: AgentItem) -> String {
+        switch item {
+        case .userMessage: "user"
+        case .assistantMessage: "message"
+        case .reasoning: "reasoning"
+        case .shell: "shell"
+        case .diff: "fileEdit"
+        case .plan: "plan"
+        case .imageReference: "media"
+        case .toolCall: "toolCall"
+        case .raw: "raw"
+        }
+    }
+
+    private static func populate(_ ui: inout UIItem, from item: AgentItem) {
+        switch item {
+        case .userMessage(let text, _),
+             .assistantMessage(let text, _),
+             .reasoning(let text, _):
+            ui.text = text
+            ui.textBuffer.replace(with: text)
+            ui.hasNonWhitespaceText = agentDeckContainsNonWhitespace(text)
+        case .shell(let command, let status, let exitCode, let durationMs, _):
+            ui.command = command
+            ui.statusName = status.rawValue
+            ui.exitCode = exitCode
+            if let durationMs { ui.durationMs = Int(durationMs) }
+        case .diff(let files, _):
+            if let first = files.first {
+                ui.path = first.path
+                ui.statusName = first.status.rawValue
+                ui.diff = first.patch ?? ""
+                ui.diffBuffer.replace(with: first.patch ?? "")
+                ui.changes = files.map { f in
+                    HistoryFileChange(path: f.path, diff: f.patch ?? "", changeKind: f.status.rawValue)
                 }
             }
-            item.exitCode = d["exitCode"] as? Int ?? item.exitCode
-            item.cwdText = d["cwd"] as? String ?? item.cwdText
-            item.statusName = d["status"] as? String ?? item.statusName
-            item.durationMs = d["durationMs"] as? Int ?? item.durationMs
-            item.sourceName = d["source"] as? String ?? item.sourceName
-            item.processId = d["processId"] as? String ?? item.processId
-        case "fileEdit":
-            item.path = d["path"] as? String ?? item.path
-            if let diff = d["diff"] as? String {
-                item.diff = diff
-                item.diffBuffer.replace(with: diff)
+        case .plan(let steps, _):
+            let serialized = steps.map { step -> String in
+                let detail = step.detail.map { ": \($0)" } ?? ""
+                return "[\(step.status.rawValue)] \(step.title)\(detail)"
             }
-            item.statusName = d["status"] as? String ?? item.statusName
-        case "webSearch":
-            item.query = d["query"] as? String ?? item.query
-            item.action = d["action"] as? String ?? item.action
-            item.actionQuery = d["actionQuery"] as? String ?? item.actionQuery
-            item.queries = agentDeckStringArray(from: d["queries"]) ?? item.queries
-            item.url = d["url"] as? String ?? item.url
-            item.pattern = d["pattern"] as? String ?? item.pattern
-        case "plan", "reviewMode":
-            item.text = d["text"] as? String ?? item.text
-            item.review = d["review"] as? String ?? item.review
-            item.action = d["action"] as? String ?? item.action
-        case "toolCall":
-            item.toolKind = d["toolKind"] as? String ?? item.toolKind
-            item.server = d["server"] as? String ?? item.server
-            item.namespace = d["namespace"] as? String ?? item.namespace
-            item.tool = d["tool"] as? String ?? item.tool
-            item.statusName = d["status"] as? String ?? item.statusName
-            item.arguments = d["arguments"] as? String ?? item.arguments
-            item.result = d["result"] as? String ?? item.result
-            item.errorText = d["error"] as? String ?? item.errorText
-            item.durationMs = d["durationMs"] as? Int ?? item.durationMs
-            item.success = d["success"] as? Bool ?? item.success
-            item.resourceUri = d["resourceUri"] as? String ?? item.resourceUri
-        case "collabAgentToolCall":
-            item.tool = d["tool"] as? String ?? item.tool
-            item.statusName = d["status"] as? String ?? item.statusName
-            item.prompt = d["prompt"] as? String ?? item.prompt
-            item.model = d["model"] as? String ?? item.model
-            item.reasoningEffort = d["reasoningEffort"] as? String ?? item.reasoningEffort
-            item.senderThreadId = d["senderThreadId"] as? String ?? item.senderThreadId
-            item.receiverThreadIds = agentDeckStringArray(from: d["receiverThreadIds"]) ?? item.receiverThreadIds
-            item.agentsStates = d["agentsStates"] as? String ?? item.agentsStates
-        case "media":
-            item.mediaKind = d["mediaKind"] as? String ?? item.mediaKind
-            item.path = d["path"] as? String ?? item.path
-            item.statusName = d["status"] as? String ?? item.statusName
-            item.result = d["result"] as? String ?? item.result
-            item.revisedPrompt = d["revisedPrompt"] as? String ?? item.revisedPrompt
-            item.savedPath = d["savedPath"] as? String ?? item.savedPath
-        case "raw":
-            item.descriptionText = d["description"] as? String ?? ""
-        default:
-            break
+            ui.text = serialized.joined(separator: "\n")
+            ui.textBuffer.replace(with: ui.text)
+        case .imageReference(let savedPath, let originalPath, _):
+            ui.mediaKind = "image"
+            ui.savedPath = savedPath ?? ""
+            ui.path = originalPath ?? savedPath ?? ""
+        case .toolCall(let name, let args, let result, _):
+            ui.tool = name
+            ui.toolKind = "generic"
+            if let argsData = try? JSONSerialization.data(
+                withJSONObject: AgentItemReducer.unwrap(args.value),
+                options: [.sortedKeys]
+            ), let argsStr = String(data: argsData, encoding: .utf8) {
+                ui.arguments = argsStr
+            }
+            if let result {
+                if let resData = try? JSONSerialization.data(
+                    withJSONObject: AgentItemReducer.unwrap(result.value),
+                    options: [.sortedKeys]
+                ), let resStr = String(data: resData, encoding: .utf8) {
+                    ui.result = resStr
+                }
+            }
+        case .raw(let rawKind, let rawPayload, _):
+            ui.descriptionText = "unsupported item type: \(rawKind)"
+            ui.text = rawPayload
         }
+    }
 
-        if let idx = store.itemIndexById[id], store.items.indices.contains(idx) {
-            store.items[idx] = item
-        } else {
-            store.itemIndexById[item.id] = store.items.count
-            store.items.append(item)
+    /// JSONSerialization rejects raw primitives at top level (it expects an
+    /// object/array). Wrap primitives so they round-trip cleanly.
+    private static func unwrap(_ value: Any) -> Any {
+        if JSONSerialization.isValidJSONObject(value) {
+            return value
         }
+        // Wrap as single-item array so JSONSerialization can encode it; the
+        // caller surfaces this as the argument blob anyway.
+        return [value]
     }
 }

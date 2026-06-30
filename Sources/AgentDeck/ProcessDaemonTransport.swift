@@ -1,23 +1,11 @@
 import Foundation
 
-/// Concrete `DaemonTransport` that spawns the real `agentdeckd` binary,
-/// shuttles JSONL frames in/out over its stdin/stdout, and surfaces incoming
-/// `IpcMessage` frames through a registered handler.
+/// Concrete `DaemonTransport` that spawns the real `agentdeckd` binary and
+/// shuttles raw JSONL lines in/out over its stdin/stdout.
 ///
-/// Extracted from `DaemonClient` in B3 so the process/pipes/reader machinery
-/// lives behind the neutral transport seam (B2). After the B4 step
-/// `DaemonClient` accepts any `DaemonTransport`, so tests can swap this for an
-/// in-memory stub instead of forking a binary.
-///
-/// `daemonEnvironment` and `locateDaemon` deliberately stay on `DaemonClient`
-/// as statics — the B1 baseline tests reference them by their original symbol
-/// path, so the extraction must not move them. This class calls back into
-/// those statics to keep the wire-format and lookup policy single-sourced.
-///
-/// `@unchecked Sendable`: the two locks (`lifecycleLock`, `writeLock`) and the
-/// single reader thread (which owns its `BufferedLineReader`) make the shared
-/// state safe across threads. The same pattern previously lived on
-/// `DaemonClient` and is preserved verbatim.
+/// v2 redesign (Task 6A): the reader loop no longer attempts to decode each
+/// line — it forwards strings to the incoming handler. `DaemonClient` parses
+/// `ServerEvent` vs admin `{"reply":...}` shapes.
 final class ProcessDaemonTransport: DaemonTransport, @unchecked Sendable {
     private let profile: AgentDeckProfile
     private let process = Process()
@@ -27,8 +15,7 @@ final class ProcessDaemonTransport: DaemonTransport, @unchecked Sendable {
     private let lifecycleLock = NSLock()
     private let writeLock = NSLock()
     private var readerLoopStarted = false
-    private var incomingHandler: ((IpcMessage) -> Void)?
-    private var malformedLineHandler: ((String) -> Void)?
+    private var incomingHandler: ((String) -> Void)?
     private var disconnectHandler: (() -> Void)?
 
     init(profile: AgentDeckProfile = .stable) {
@@ -36,54 +23,27 @@ final class ProcessDaemonTransport: DaemonTransport, @unchecked Sendable {
     }
 
     deinit {
-        // Backstop: even if the owner forgot to call shutdown(), the daemon
-        // must not outlive its transport (A1 — no orphan daemon).
         if process.isRunning { process.terminate() }
     }
 
-    /// Whether `start()` has already spawned the daemon and the reader loop is
-    /// running. Used by the owning client to lazy-start on the first request.
-    /// Promoted onto the `DaemonTransport` protocol in B4 so test transports
-    /// can satisfy the same readiness contract.
     var isStarted: Bool {
         lifecycleLock.lock()
         defer { lifecycleLock.unlock() }
         return readerLoopStarted
     }
 
-    /// True if the underlying process is still running. Tighter than
-    /// `isStarted`, which only tracks "we ever spawned." Distinguishes "live"
-    /// from "started but died" so callers can avoid writing a `shutdown` frame
-    /// into a broken pipe when the daemon has already crashed (pre-B3 used
-    /// `process.isRunning` directly for this).
     var isAlive: Bool {
         lifecycleLock.lock()
         defer { lifecycleLock.unlock() }
         return readerLoopStarted && process.isRunning
     }
 
-    func setIncomingHandler(_ handler: @escaping (IpcMessage) -> Void) {
+    func setIncomingHandler(_ handler: @escaping (String) -> Void) {
         lifecycleLock.lock()
         incomingHandler = handler
         lifecycleLock.unlock()
     }
 
-    /// Sink for raw lines that fail JSON decoding. Promoted onto the
-    /// `DaemonTransport` protocol in B4 because the router needs the raw-line
-    /// variant to fan an `error` reply out to every pending id (pinned by the
-    /// B1 baseline `router_routes_malformed_line_...` test) — and stub
-    /// transports must drive that same fan-out.
-    func setMalformedLineHandler(_ handler: @escaping (String) -> Void) {
-        lifecycleLock.lock()
-        malformedLineHandler = handler
-        lifecycleLock.unlock()
-    }
-
-    /// Sink for reader-loop termination (daemon EOF or shutdown). Promoted
-    /// onto the `DaemonTransport` protocol in B4 — `DaemonClient` uses it to
-    /// close the router so blocked `waitForReply` calls surface
-    /// `DaemonError.disconnected` instead of hanging (Eng premise 9), and the
-    /// stub transport drives it via `triggerDisconnect()` to exercise that path.
     func setDisconnectHandler(_ handler: @escaping () -> Void) {
         lifecycleLock.lock()
         disconnectHandler = handler
@@ -103,7 +63,6 @@ final class ProcessDaemonTransport: DaemonTransport, @unchecked Sendable {
         process.standardInput = toDaemon
         process.standardOutput = fromDaemon
         process.environment = DaemonClient.daemonEnvironment(profile: profile)
-        // stderr inherits — daemon diagnostic logging (Eng O1) lands in Step 5.
         do {
             try process.run()
         } catch {
@@ -114,25 +73,15 @@ final class ProcessDaemonTransport: DaemonTransport, @unchecked Sendable {
         startReaderLoop(lineReader)
     }
 
-    /// Ship one frame as JSON + `\n`. Encoding happens here so the transport
-    /// — not its callers — owns the on-wire framing (D7-confirmed JSONL).
-    func send(_ message: IpcMessage) throws {
-        let encoded: Data
-        do {
-            encoded = try JSONEncoder().encode(message)
-        } catch {
-            throw TransportError.writeFailed("encode failed: \(error)")
-        }
-        var line = encoded
-        line.append(0x0A)
+    /// Ship one raw JSON line to the daemon, appending the trailing newline.
+    func send(_ line: String) throws {
+        var data = Data(line.utf8)
+        data.append(0x0A)
         writeLock.lock()
         defer { writeLock.unlock() }
-        toDaemon.fileHandleForWriting.write(line)
+        toDaemon.fileHandleForWriting.write(data)
     }
 
-    /// Best-effort teardown: kills the daemon if it's still running. The
-    /// reader loop exits on its own once `fromDaemon` reaches EOF. Idempotent
-    /// and non-throwing per `DaemonTransport`'s shutdown contract.
     func shutdown() {
         if process.isRunning {
             process.terminate()
@@ -141,36 +90,18 @@ final class ProcessDaemonTransport: DaemonTransport, @unchecked Sendable {
 
     private func startReaderLoop(_ reader: BufferedLineReader) {
         readerLoopStarted = true
-        // Strong capture of `self` is intentional: the reader thread is bounded
-        // by EOF on `fromDaemon` (delivered when `shutdown()` terminates the
-        // process), so the strong reference is always released. A `[weak self]`
-        // capture would race the owner's deinit and could drop the disconnect
-        // signal, leaving `waitForReply` callers hung (violates Eng premise 9
-        // "named error, never silent hang").
         Thread.detachNewThread {
             while let raw = reader.nextLine() {
                 if raw.isEmpty { continue }
-                do {
-                    let message = try JSONDecoder().decode(IpcMessage.self, from: Data(raw.utf8))
-                    self.deliverIncoming(message)
-                } catch {
-                    self.deliverMalformed(raw)
-                }
+                self.deliverIncoming(raw)
             }
             self.deliverDisconnect()
         }
     }
 
-    private func deliverIncoming(_ message: IpcMessage) {
+    private func deliverIncoming(_ rawLine: String) {
         lifecycleLock.lock()
         let handler = incomingHandler
-        lifecycleLock.unlock()
-        handler?(message)
-    }
-
-    private func deliverMalformed(_ rawLine: String) {
-        lifecycleLock.lock()
-        let handler = malformedLineHandler
         lifecycleLock.unlock()
         handler?(rawLine)
     }
@@ -180,5 +111,32 @@ final class ProcessDaemonTransport: DaemonTransport, @unchecked Sendable {
         let handler = disconnectHandler
         lifecycleLock.unlock()
         handler?()
+    }
+}
+
+/// Reads `\n`-delimited lines from a FileHandle, buffering partial reads.
+/// A single JSONL message can arrive split across multiple read() calls.
+final class BufferedLineReader: @unchecked Sendable {
+    private let handle: FileHandle
+    private var buffer = Data()
+
+    init(handle: FileHandle) { self.handle = handle }
+
+    func nextLine() -> String? {
+        while true {
+            if let nl = buffer.firstIndex(of: 0x0A) {
+                let lineData = buffer.subdata(in: buffer.startIndex..<nl)
+                buffer.removeSubrange(buffer.startIndex...nl)
+                return String(data: lineData, encoding: .utf8)
+            }
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                if buffer.isEmpty { return nil }
+                let rest = String(data: buffer, encoding: .utf8)
+                buffer.removeAll()
+                return rest
+            }
+            buffer.append(chunk)
+        }
     }
 }

@@ -1,59 +1,43 @@
 import Foundation
 
-/// Neutral IPC transport: ships frames in/out, owns nothing else.
+/// Neutral IPC transport: ships JSONL frames in/out as raw strings.
 ///
-/// Exists so `DaemonClient` stops directly owning `Process`/`Pipe`/reader —
-/// that coupling is what makes the client untestable. Implementations may
-/// spawn a child process, drive an in-memory pair, or replay fixtures; the
-/// client only sees `IpcMessage` frames.
-///
-/// Stays agent-neutral per AGENTS.md §"项目边界": only carries the already-
-/// neutral `IpcMessage`, never parses Codex vendor JSON.
+/// v2 redesign (Task 6A): the transport no longer parses messages — it
+/// shuttles raw lines and lets `DaemonClient` decide whether each line is a
+/// `ServerEvent` or an admin reply (`{"reply":...}`). The two-channel
+/// disambiguation is done up at the client because admin replies bypass
+/// `ServerEvent` (per daemon Task 3C / cli Task 5A design).
 protocol DaemonTransport: AnyObject {
     /// Spawn/connect and begin delivering frames to the registered handler.
     /// Idempotent: a second call after a successful start is a no-op.
     func start() throws
 
-    /// Synchronously ship one frame (JSON + newline on the wire). Blocks
-    /// until the write completes; throws on transport-layer faults so the
-    /// caller can surface a named error rather than hang (Eng premise 9).
-    func send(_ message: IpcMessage) throws
+    /// Synchronously ship one raw JSON line (the transport appends the
+    /// trailing newline). Blocks until the write completes; throws on
+    /// transport-layer faults.
+    func send(_ line: String) throws
 
-    /// Register the sink for incoming frames. Called exactly once during
+    /// Register the sink for incoming raw lines. Called exactly once during
     /// setup, before `start()`. The handler runs on the transport's reader
     /// context; implementations rely on it not blocking.
-    func setIncomingHandler(_ handler: @escaping (IpcMessage) -> Void)
-
-    /// Register the sink for raw lines that failed to decode as `IpcMessage`.
-    /// B3 added this because the daemon's "send something garbage" diagnostic
-    /// surfaces here, and DaemonClient needs to route it to the router's
-    /// malformed-line bookkeeping rather than silently drop it.
-    func setMalformedLineHandler(_ handler: @escaping (String) -> Void)
+    func setIncomingHandler(_ handler: @escaping (String) -> Void)
 
     /// Register the callback fired exactly once when the underlying transport
-    /// hits EOF / the peer goes away. DaemonClient uses it to close the router
-    /// (B3) so in-flight roundTrips fail fast instead of hanging.
+    /// hits EOF / the peer goes away. DaemonClient uses it to fail in-flight
+    /// admin round-trips so they don't hang.
     func setDisconnectHandler(_ handler: @escaping () -> Void)
 
-    /// True between a successful `start()` and `shutdown()`. DaemonClient
-    /// uses this to guard `send` paths against "you forgot to start()" so the
-    /// error name is `notStarted` instead of a generic write failure.
+    /// True between a successful `start()` and `shutdown()`.
     var isStarted: Bool { get }
 
-    /// True while the underlying transport is believed live (process running,
-    /// pipe open, etc.). DaemonClient.shutdown gates its courtesy `bye` send
-    /// on this to avoid a guaranteed-fail roundTrip when the peer has already
-    /// gone away.
+    /// True while the underlying transport is believed live.
     var isAlive: Bool { get }
 
-    /// Best-effort synchronous teardown. Idempotent; never throws — shutdown
-    /// is cleanup, not a failure path.
+    /// Best-effort synchronous teardown. Idempotent; never throws.
     func shutdown()
 }
 
-/// Errors raised by `DaemonTransport` implementations. Kept separate from
-/// `DaemonError` because transport faults are a layer below the client's
-/// protocol-level errors.
+/// Errors raised by `DaemonTransport` implementations.
 enum TransportError: Error, CustomStringConvertible {
     case notStarted
     case alreadyShutdown

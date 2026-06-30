@@ -70,57 +70,20 @@ do {
     exit(1)
 }
 
-if CommandLine.arguments.contains("--diagnostics-report") {
-    guard CommandLine.arguments.contains("--json") else {
-        FileHandle.standardError.write(Data("diagnostics-report FATAL: --json is required\n".utf8))
-        exit(1)
-    }
-
-    let client = DaemonClient(profile: launchProfile)
-    do {
-        try client.start()
-        let report = try client.diagnosticsReport(
-            limit: argumentValue(after: "--limit").flatMap(Int.init) ?? 50,
-            sinceSeconds: argumentValue(after: "--since-seconds").flatMap(Int.init) ?? 3600,
-            runId: argumentValue(after: "--run-id")
-        )
-        let data = try JSONSerialization.data(
-            withJSONObject: report,
-            options: [.prettyPrinted, .sortedKeys]
-        )
-        client.shutdown()
-        FileHandle.standardOutput.write(data)
-        FileHandle.standardOutput.write(Data("\n".utf8))
-        exit(0)
-    } catch {
-        FileHandle.standardError.write(Data("diagnostics-report FATAL: \(error)\n".utf8))
-        client.shutdown()
-        exit(1)
-    }
-}
-
 if CommandLine.arguments.contains("--selfcheck") {
     let client = DaemonClient(profile: launchProfile)
     do {
         try client.start()
-        let pong = try client.roundTrip(IpcMessage(kind: "ping", id: 1, payload: nil))
-        guard pong.kind == "pong", pong.id == 1 else {
-            FileHandle.standardError.write(Data("selfcheck: unexpected reply\n".utf8))
-            client.shutdown()
-            exit(1)
-        }
-        let logging = try client.loggingSelfcheck()
-        let recordOk = logging["recordOk"] as? Bool ?? false
-        let diagnosticOk = logging["diagnosticOk"] as? Bool ?? false
-        let redactionOk = logging["redactionOk"] as? Bool ?? false
-        guard recordOk, diagnosticOk, redactionOk else {
-            let failures = logging["failures"] ?? []
-            FileHandle.standardError.write(Data("selfcheck FATAL: logging selfcheck failed: \(failures)\n".utf8))
+        try client.ping()
+        let reply = try client.selfcheck()
+        let ok = reply["ok"] as? Bool ?? false
+        guard ok else {
+            FileHandle.standardError.write(Data("selfcheck FATAL: daemon reported failure: \(reply)\n".utf8))
             client.shutdown()
             exit(1)
         }
         client.shutdown()
-        print("selfcheck OK: IPC lifecycle + logging clean.")
+        print("selfcheck OK: v2 ping + selfcheck clean.")
         exit(0)
     } catch {
         FileHandle.standardError.write(Data("selfcheck FATAL: \(error)\n".utf8))

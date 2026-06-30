@@ -5,19 +5,26 @@ enum RuntimeAction: Equatable {
     case drainNextPrompt(String)
 }
 
-struct ActionRequest: Equatable {
-    let requestId: UInt64
-    let itemId: String
-    let approvalId: String?
-    let actionKind: String
-    let title: String
-    let detail: String
+/// UI-shaped pending action snapshot. v2 (Task 6A): builds from
+/// `ServerEvent.actionRequest` carrying typed `ActionRequest`.
+struct PendingActionRequest: Equatable {
+    let requestId: String
+    let actionKind: ActionKind
+    let summary: String
+    let vendor: ActionRequestVendor
+
+    static func == (lhs: PendingActionRequest, rhs: PendingActionRequest) -> Bool {
+        lhs.requestId == rhs.requestId &&
+        lhs.actionKind == rhs.actionKind &&
+        lhs.summary == rhs.summary
+    }
 }
 
 @MainActor
 @Observable
 final class ThreadRuntimeModel: Identifiable {
-    let id: String
+    let id: String                                      // sessionId
+    let agentKind: AgentKind
     var threadId: String?
     var cwd: URL
     var phase: SessionModel.Phase = .ready
@@ -25,15 +32,15 @@ final class ThreadRuntimeModel: Identifiable {
     var queuedPrompts: [String] = []
     var errorMessage: String?
     var warningMessage: String?
-    var pendingActionRequest: ActionRequest?
+    var pendingActionRequest: PendingActionRequest?
     var unreadEventCount = 0
     var itemIndexById: [String: Int] = [:]
-    var pendingAgentItems: [[String: Any]] = []
-    private var renderFlushTimer: Timer?
-    private let renderFlushInterval: TimeInterval = 1.0 / 30.0
+    private(set) var capabilities: SessionCapabilities?
+    private var agentItemSeq: Int = 0
 
-    init(id: String, threadId: String?, cwd: URL) {
+    init(id: String, agentKind: AgentKind, threadId: String? = nil, cwd: URL) {
         self.id = id
+        self.agentKind = agentKind
         self.threadId = threadId
         self.cwd = cwd
     }
@@ -53,56 +60,55 @@ final class ThreadRuntimeModel: Identifiable {
         return phase.rawValue
     }
 
-    @discardableResult
-    func ingest(_ msg: IpcMessage) -> RuntimeAction? {
-        unreadEventCount += 1
+    func applyCapabilities(_ caps: SessionCapabilities) {
+        self.capabilities = caps
+    }
 
-        switch msg.kind {
-        case "agentItem":
-            if let dict = msg.payload?.value as? [String: Any] {
-                enqueueAgentItem(dict)
-            }
+    /// Consume a single v2 ServerEvent. Returns a follow-up action (e.g.
+    /// drain queued prompts on turn complete) so the caller can route it.
+    @discardableResult
+    func ingest(_ event: ServerEvent) -> RuntimeAction? {
+        unreadEventCount += 1
+        switch event {
+        case .sessionStarted(_, let tid, _):
+            if let tid, threadId == nil { threadId = tid }
             return nil
-        case "sessionState":
-            flushPendingAgentItems()
-            if let s = (msg.payload?.value as? [String: Any])?["state"] as? String,
-               let p = SessionModel.Phase(rawValue: s) {
-                phase = p
-            }
+        case .sessionCapabilities(_, _, let caps):
+            applyCapabilities(caps)
             return nil
-        case "turnComplete":
-            flushPendingAgentItems()
+        case .agentItem(_, let tid, _, let item):
+            if threadId == nil { threadId = tid }
+            applyAgentItem(item)
+            return nil
+        case .actionRequest(_, _, _, let req):
+            phase = .waitingApproval
+            pendingActionRequest = PendingActionRequest(
+                requestId: req.requestId,
+                actionKind: req.kind,
+                summary: req.summary,
+                vendor: req.vendor
+            )
+            return nil
+        case .turnComplete:
             phase = .ready
             return drainQueueIfPossible()
-        case "error":
-            flushPendingAgentItems()
-            let m = (msg.payload?.value as? [String: Any])?["message"] as? String
-            errorMessage = m ?? "unknown error"
+        case .error(_, let err):
+            errorMessage = err.message
             phase = .failed
             return nil
-        case "warning":
-            let m = (msg.payload?.value as? [String: Any])?["message"] as? String
-            warningMessage = m ?? "unknown warning"
-            return nil
-        case "actionRequest":
-            flushPendingAgentItems()
-            if let action = Self.actionRequest(from: msg.payload?.value as? [String: Any]) {
-                pendingActionRequest = action
-                phase = .waitingApproval
-            }
-            return nil
-        default:
+        case .vendorControl, .vendorPanelEvent:
+            // v0.2: UI ignores vendor side-channels for now; T6B will route.
             return nil
         }
     }
 
-    func resolvePendingAction() -> ActionRequest? {
-        let request = pendingActionRequest
+    func resolvePendingAction() -> PendingActionRequest? {
+        let pending = pendingActionRequest
         pendingActionRequest = nil
         if phase == .waitingApproval {
             phase = .running
         }
-        return request
+        return pending
     }
 
     @discardableResult
@@ -118,58 +124,51 @@ final class ThreadRuntimeModel: Identifiable {
         return userItem.id
     }
 
-    private func drainQueueIfPossible() -> RuntimeAction? {
-        guard !queuedPrompts.isEmpty, phase == .ready else { return nil }
-        return .drainNextPrompt(queuedPrompts.removeFirst())
-    }
-
-    private func enqueueAgentItem(_ item: [String: Any]) {
-        pendingAgentItems.append(item)
-        if item["lifecycle"] as? String != "delta" {
-            flushPendingAgentItems()
-            return
-        }
-        guard renderFlushTimer == nil else {
-            return
-        }
-        renderFlushTimer = Timer.scheduledTimer(
-            withTimeInterval: renderFlushInterval,
-            repeats: false
-        ) { [weak self] _ in
-            Task { @MainActor in self?.flushPendingAgentItems() }
-        }
-    }
-
-    func flushPendingAgentItems() {
-        renderFlushTimer?.invalidate()
-        renderFlushTimer = nil
-        guard !pendingAgentItems.isEmpty else { return }
-        let pending = pendingAgentItems
-        pendingAgentItems.removeAll(keepingCapacity: true)
-        for item in pending {
-            upsert(item)
-        }
-    }
-
-    func applyReplayItems(_ replayItems: [HistoryReplayItem]) {
-        flushPendingAgentItems()
+    func applyReplayTurns(_ turns: [HistoryTurn]) {
         itemIndexById.removeAll(keepingCapacity: true)
-        items = replayItems.map { agentDeckUIItem(from: $0) }
-        for (index, item) in items.enumerated() {
-            itemIndexById[item.id] = index
+        items.removeAll(keepingCapacity: true)
+        for turn in turns {
+            for item in turn.items {
+                applyAgentItem(item)
+            }
         }
         errorMessage = nil
         phase = .ready
     }
 
+    /// Bridge for legacy v0.1 `HistoryReplayItem` arrays produced by
+    /// HistoryModel decoding. Phase 7+ will replace with native v2 history
+    /// once daemon serves the new HistoryResponse shape end-to-end.
+    func applyReplayItems(_ replayItems: [HistoryReplayItem]) {
+        itemIndexById.removeAll(keepingCapacity: true)
+        items.removeAll(keepingCapacity: true)
+        for replay in replayItems {
+            var ui = agentDeckUIItem(from: replay)
+            ui.id = replay.id
+            itemIndexById[ui.id] = items.count
+            items.append(ui)
+        }
+        errorMessage = nil
+        phase = .ready
+    }
+
+    private func drainQueueIfPossible() -> RuntimeAction? {
+        guard !queuedPrompts.isEmpty, phase == .ready else { return nil }
+        return .drainNextPrompt(queuedPrompts.removeFirst())
+    }
+
+    private func applyAgentItem(_ item: AgentItem) {
+        agentItemSeq += 1
+        let itemId = "ai-\(agentItemSeq)"
+        var store = AgentItemStore(items: items, itemIndexById: itemIndexById)
+        AgentItemReducer.apply(item, itemId: itemId, into: &store)
+        items = store.items
+        itemIndexById = store.itemIndexById
+    }
+
     @discardableResult
     func materializeDeferredContent(itemId: String, content: SessionModel.DeferredContent) -> Bool {
-        let lookupId = itemIndexById[itemId] == nil
-            ? itemId.split(separator: ":", maxSplits: 1).last.map(String.init)
-            : itemId
-        guard let lookupId,
-              let idx = itemIndexById[lookupId],
-              items.indices.contains(idx) else { return false }
+        guard let idx = itemIndexById[itemId], items.indices.contains(idx) else { return false }
         switch content {
         case .output:
             guard items[idx].hasDeferredOutputBuffer else { return false }
@@ -181,29 +180,5 @@ final class ThreadRuntimeModel: Identifiable {
             items[idx].hasDeferredDiffBuffer = false
         }
         return true
-    }
-
-    private func upsert(_ d: [String: Any]) {
-        var store = AgentItemStore(items: items, itemIndexById: itemIndexById)
-        AgentItemReducer.upsert(d, into: &store)
-        items = store.items
-        itemIndexById = store.itemIndexById
-    }
-
-    private static func actionRequest(from payload: [String: Any]?) -> ActionRequest? {
-        guard let payload,
-              let requestId = payload["requestId"] as? UInt64 ?? (payload["requestId"] as? Int).map(UInt64.init),
-              let itemId = payload["itemId"] as? String,
-              let actionKind = payload["actionKind"] as? String,
-              let title = payload["title"] as? String,
-              let detail = payload["detail"] as? String else { return nil }
-        return ActionRequest(
-            requestId: requestId,
-            itemId: itemId,
-            approvalId: payload["approvalId"] as? String,
-            actionKind: actionKind,
-            title: title,
-            detail: detail
-        )
     }
 }
