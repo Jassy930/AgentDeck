@@ -23,6 +23,10 @@ pub use vendor::codex::{CodexSessionOptions, McpOverride};
 pub use vendor::claude_code::{ClaudeCodeCapabilities, ClaudeCodePermissionMode};
 pub use vendor::claude_code::{ClaudeCodeHookConfig, ClaudeCodeSessionOptions};
 pub use transport::{AuthContext, Transport, TransportConfig, TransportError};
+pub use trunk::{
+    AgentItem, AgentItemMeta, DiffFile, DiffStatus, PlanStep, PlanStepStatus,
+    ProtocolError, ServerEvent, SessionId, ShellStatus, ThreadId, TurnSummary,
+};
 
 // 现有所有类型保持不变（T1.5/T1.6 之后才迁移）
 
@@ -65,7 +69,7 @@ impl IpcMessage {
     }
 
     /// Wrap a neutral AgentItem as an IPC message (kind = "agentItem").
-    pub fn agent_item(item: &AgentItem) -> Self {
+    pub fn agent_item(item: &LegacyAgentItem) -> Self {
         Self {
             kind: "agentItem".into(),
             id: None,
@@ -154,14 +158,17 @@ pub enum Lifecycle {
     Completed,
 }
 
-/// A neutral agent item. `kind` carries a per-kind structured payload (D4),
+/// A neutral agent item (v1 / legacy). `kind` carries a per-kind structured payload (D4),
 /// never an opaque string. `raw` is the escape hatch for unknown vendor item
 /// types (Eng E1 + Codex #19): unknown items are neutralized HERE, in the
 /// daemon, and surface to Swift as `AgentItemKind::Raw` — the Swift app never
 /// sees vendor JSON directly.
+///
+/// NOTE: renamed to `LegacyAgentItem` in T1.6 to avoid conflict with the new
+/// `trunk::AgentItem` enum. Will be removed in T1.9.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "A neutral agent item with per-kind structured payload.")]
-pub struct AgentItem {
+pub struct LegacyAgentItem {
     /// Stable id correlating started/delta/completed for the same item.
     pub id: String,
     pub lifecycle: Lifecycle,
@@ -394,7 +401,7 @@ pub struct HistoryThreadList {
 #[serde(rename_all = "camelCase")]
 pub struct HistoryThreadDetail {
     pub thread: HistoryThreadSummary,
-    pub items: Vec<AgentItem>,
+    pub items: Vec<LegacyAgentItem>,
 }
 
 /// 契约产物版本。改动协议形态时手动 +1，并重生成快照。
@@ -416,7 +423,7 @@ pub fn protocol_schema() -> serde_json::Value {
     add!(SessionState);
     add!(ActionRequest);
     add!(Lifecycle);
-    add!(AgentItem);
+    add!(LegacyAgentItem);
     add!(AgentItemKind);
     add!(AgentReference);
     add!(HookFragment);
@@ -507,7 +514,7 @@ mod tests {
             serde_json::to_string(&IpcMessage::pong(Some(1))).unwrap(),
             serde_json::to_string(&IpcMessage::error(Some(1), "boom")).unwrap(),
             serde_json::to_string(&IpcMessage::session_state(SessionState::Running)).unwrap(),
-            serde_json::to_string(&IpcMessage::agent_item(&AgentItem {
+            serde_json::to_string(&IpcMessage::agent_item(&LegacyAgentItem {
                 id: "i1".into(),
                 lifecycle: Lifecycle::Started,
                 kind: AgentItemKind::Reasoning {
@@ -515,7 +522,7 @@ mod tests {
                 },
             }))
             .unwrap(),
-            serde_json::to_string(&IpcMessage::agent_item(&AgentItem {
+            serde_json::to_string(&IpcMessage::agent_item(&LegacyAgentItem {
                 id: "i2".into(),
                 lifecycle: Lifecycle::Completed,
                 kind: AgentItemKind::Shell {
@@ -531,7 +538,7 @@ mod tests {
                 },
             }))
             .unwrap(),
-            serde_json::to_string(&IpcMessage::agent_item(&AgentItem {
+            serde_json::to_string(&IpcMessage::agent_item(&LegacyAgentItem {
                 id: "i3".into(),
                 lifecycle: Lifecycle::Completed,
                 kind: AgentItemKind::Raw {
@@ -539,7 +546,7 @@ mod tests {
                 },
             }))
             .unwrap(),
-            serde_json::to_string(&IpcMessage::agent_item(&AgentItem {
+            serde_json::to_string(&IpcMessage::agent_item(&LegacyAgentItem {
                 id: "i4".into(),
                 lifecycle: Lifecycle::Completed,
                 kind: AgentItemKind::WebSearch {
@@ -570,7 +577,7 @@ mod tests {
     fn agent_item_kinds_are_per_kind_structured_not_opaque() {
         // D4: shell carries command/output/exitCode as discrete fields, not
         // a blob string the Swift side would have to parse.
-        let item = AgentItem {
+        let item = LegacyAgentItem {
             id: "x".into(),
             lifecycle: Lifecycle::Completed,
             kind: AgentItemKind::Shell {
