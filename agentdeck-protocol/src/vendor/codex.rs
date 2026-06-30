@@ -35,3 +35,21 @@ pub struct CodexCapabilities {
     pub persistence_supported: bool,
     pub reasoning_effort_levels: Vec<CodexReasoningEffort>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpOverride {
+    pub name: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CodexSessionOptions {
+    pub approval_policy: CodexApprovalPolicy,
+    pub sandbox: CodexSandboxMode,
+    pub persist_approval: bool,
+    pub reasoning_effort: CodexReasoningEffort,
+    #[serde(default)]
+    pub mcp_overrides: Vec<McpOverride>,
+}

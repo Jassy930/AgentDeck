@@ -1,5 +1,6 @@
 //! Claude Code-specific vendor types. Populated in tasks T1.5, T1.7.
 
+use std::path::PathBuf;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -21,4 +22,31 @@ pub struct ClaudeCodeCapabilities {
     pub output_styles: Vec<String>,
     pub hooks_supported: Vec<String>,
     pub cli_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaudeCodeHookConfig {
+    pub matcher: String,
+    pub command: String,
+    pub timeout_ms: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaudeCodeSessionOptions {
+    pub permission_mode: ClaudeCodePermissionMode,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub hooks: Vec<ClaudeCodeHookConfig>,
+    pub output_style: Option<String>,
+    pub allowed_tools: Option<Vec<String>>,
+    pub disallowed_tools: Option<Vec<String>>,
+    pub mcp_config_path: Option<PathBuf>,
+    #[serde(default)]
+    pub plugin_dirs: Vec<PathBuf>,
+    pub worktree: Option<String>,
+    pub session_name: Option<String>,
+    pub session_id: Option<String>,
 }

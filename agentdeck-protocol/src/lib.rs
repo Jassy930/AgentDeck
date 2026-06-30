@@ -16,9 +16,12 @@ pub mod transport;
 pub mod vendor;
 
 pub use trunk::AgentKind;
+pub use trunk::{RuntimeOptions, SessionStart, VendorSessionOptions};
 pub use capabilities::{CapabilityId, SessionCapabilities, VendorCapabilities};
 pub use vendor::codex::{CodexApprovalPolicy, CodexCapabilities, CodexReasoningEffort, CodexSandboxMode};
+pub use vendor::codex::{CodexSessionOptions, McpOverride};
 pub use vendor::claude_code::{ClaudeCodeCapabilities, ClaudeCodePermissionMode};
+pub use vendor::claude_code::{ClaudeCodeHookConfig, ClaudeCodeSessionOptions};
 pub use transport::{AuthContext, Transport, TransportConfig, TransportError};
 
 // 现有所有类型保持不变（T1.5/T1.6 之后才迁移）
