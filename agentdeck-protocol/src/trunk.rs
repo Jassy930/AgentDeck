@@ -86,7 +86,9 @@ pub enum AgentItem {
     Shell {
         command: String,
         status: ShellStatus,
+        #[serde(rename = "exitCode")]
         exit_code: Option<i32>,
+        #[serde(rename = "durationMs")]
         duration_ms: Option<u64>,
         #[serde(default)] meta: AgentItemMeta,
     },
@@ -99,7 +101,9 @@ pub enum AgentItem {
         #[serde(default)] meta: AgentItemMeta,
     },
     ImageReference {
+        #[serde(rename = "savedPath")]
         saved_path: Option<PathBuf>,
+        #[serde(rename = "originalPath")]
         original_path: Option<PathBuf>,
         #[serde(default)] meta: AgentItemMeta,
     },
@@ -110,7 +114,9 @@ pub enum AgentItem {
         #[serde(default)] meta: AgentItemMeta,
     },
     Raw {
+        #[serde(rename = "rawKind")]
         raw_kind: String,
+        #[serde(rename = "rawPayload")]
         raw_payload: String,
         #[serde(default)] meta: AgentItemMeta,
     },
@@ -211,6 +217,8 @@ pub enum ServerEvent {
     SessionCapabilities {
         #[serde(rename = "sessionId")]
         session_id: SessionId,
+        #[serde(rename = "agentKind")]
+        agent_kind: AgentKind,
         capabilities: SessionCapabilities,
     },
     AgentItem {

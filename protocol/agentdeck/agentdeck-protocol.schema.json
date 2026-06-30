@@ -39,651 +39,6 @@
       "title": "ActionRequest",
       "type": "object"
     },
-    "AgentItem": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "definitions": {
-        "AgentReference": {
-          "properties": {
-            "kind": {
-              "type": "string"
-            },
-            "name": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "path": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "text": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "url": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
-        },
-        "FileEditChange": {
-          "properties": {
-            "changeKind": {
-              "type": "string"
-            },
-            "diff": {
-              "type": "string"
-            },
-            "path": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "changeKind",
-            "diff",
-            "path"
-          ],
-          "type": "object"
-        },
-        "HookFragment": {
-          "properties": {
-            "hookRunId": {
-              "type": "string"
-            },
-            "text": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "hookRunId",
-            "text"
-          ],
-          "type": "object"
-        },
-        "Lifecycle": {
-          "description": "Lifecycle of a streaming item (Eng D4 / front-of-mind started→delta→ completed). Neutral — not tied to any vendor's event names.",
-          "enum": [
-            "started",
-            "delta",
-            "completed"
-          ],
-          "type": "string"
-        },
-        "ToolAction": {
-          "properties": {
-            "command": {
-              "type": "string"
-            },
-            "kind": {
-              "type": "string"
-            },
-            "name": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "path": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "query": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "command",
-            "kind"
-          ],
-          "type": "object"
-        }
-      },
-      "description": "A neutral agent item with per-kind structured payload.",
-      "oneOf": [
-        {
-          "description": "A user prompt restored from historical thread turns.",
-          "properties": {
-            "attachments": {
-              "items": {
-                "$ref": "#/definitions/AgentReference"
-              },
-              "type": "array"
-            },
-            "kind": {
-              "enum": [
-                "user"
-              ],
-              "type": "string"
-            },
-            "text": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "attachments",
-            "kind",
-            "text"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "The agent's primary user-facing answer. Text accumulates across deltas.",
-          "properties": {
-            "kind": {
-              "enum": [
-                "message"
-              ],
-              "type": "string"
-            },
-            "memoryCitation": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "phase": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "text": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "text"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "The agent's chain-of-thought. Secondary, default-collapsed in UI.",
-          "properties": {
-            "kind": {
-              "enum": [
-                "reasoning"
-              ],
-              "type": "string"
-            },
-            "text": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "text"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "A shell command the agent ran. Per-kind structured (D4).",
-          "properties": {
-            "actions": {
-              "items": {
-                "$ref": "#/definitions/ToolAction"
-              },
-              "type": "array"
-            },
-            "command": {
-              "type": "string"
-            },
-            "cwd": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "durationMs": {
-              "format": "int64",
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "exitCode": {
-              "format": "int64",
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "kind": {
-              "enum": [
-                "shell"
-              ],
-              "type": "string"
-            },
-            "output": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "processId": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "source": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "status": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "actions",
-            "command",
-            "kind"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "A file the agent edited. Per-kind structured (D4).",
-          "properties": {
-            "changes": {
-              "items": {
-                "$ref": "#/definitions/FileEditChange"
-              },
-              "type": "array"
-            },
-            "diff": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "kind": {
-              "enum": [
-                "fileEdit"
-              ],
-              "type": "string"
-            },
-            "path": {
-              "type": "string"
-            },
-            "status": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "changes",
-            "kind",
-            "path"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "A web search / page navigation action performed by the agent. The shape keeps the useful action fields separate so the UI can render a readable historical trace without parsing vendor JSON.",
-          "properties": {
-            "action": {
-              "type": "string"
-            },
-            "actionQuery": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "kind": {
-              "enum": [
-                "webSearch"
-              ],
-              "type": "string"
-            },
-            "pattern": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "queries": {
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            "query": {
-              "type": "string"
-            },
-            "url": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "action",
-            "kind",
-            "queries",
-            "query"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "kind": {
-              "enum": [
-                "plan"
-              ],
-              "type": "string"
-            },
-            "text": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "text"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "fragments": {
-              "items": {
-                "$ref": "#/definitions/HookFragment"
-              },
-              "type": "array"
-            },
-            "kind": {
-              "enum": [
-                "hookPrompt"
-              ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "fragments",
-            "kind"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "arguments": {
-              "type": "string"
-            },
-            "contentItems": {
-              "items": {
-                "$ref": "#/definitions/AgentReference"
-              },
-              "type": "array"
-            },
-            "durationMs": {
-              "format": "int64",
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "error": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "kind": {
-              "enum": [
-                "toolCall"
-              ],
-              "type": "string"
-            },
-            "namespace": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "resourceUri": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "result": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "server": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "status": {
-              "type": "string"
-            },
-            "success": {
-              "type": [
-                "boolean",
-                "null"
-              ]
-            },
-            "tool": {
-              "type": "string"
-            },
-            "toolKind": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "arguments",
-            "contentItems",
-            "kind",
-            "status",
-            "tool",
-            "toolKind"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "agentsStates": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "kind": {
-              "enum": [
-                "collabAgentToolCall"
-              ],
-              "type": "string"
-            },
-            "model": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "prompt": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "reasoningEffort": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "receiverThreadIds": {
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            "senderThreadId": {
-              "type": "string"
-            },
-            "status": {
-              "type": "string"
-            },
-            "tool": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "receiverThreadIds",
-            "senderThreadId",
-            "status",
-            "tool"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "kind": {
-              "enum": [
-                "media"
-              ],
-              "type": "string"
-            },
-            "mediaKind": {
-              "type": "string"
-            },
-            "path": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "result": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "revisedPrompt": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "savedPath": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "status": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "kind",
-            "mediaKind"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "action": {
-              "type": "string"
-            },
-            "kind": {
-              "enum": [
-                "reviewMode"
-              ],
-              "type": "string"
-            },
-            "review": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "action",
-            "kind",
-            "review"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "kind": {
-              "enum": [
-                "contextCompaction"
-              ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "An unknown item type neutralized in the daemon. Only a short description crosses to Swift.",
-          "properties": {
-            "description": {
-              "type": "string"
-            },
-            "kind": {
-              "enum": [
-                "raw"
-              ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "description",
-            "kind"
-          ],
-          "type": "object"
-        }
-      ],
-      "properties": {
-        "id": {
-          "description": "Stable id correlating started/delta/completed for the same item.",
-          "type": "string"
-        },
-        "lifecycle": {
-          "$ref": "#/definitions/Lifecycle"
-        }
-      },
-      "required": [
-        "id",
-        "lifecycle"
-      ],
-      "title": "AgentItem",
-      "type": "object"
-    },
     "AgentItemKind": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "definitions": {
@@ -1366,7 +721,124 @@
     "HistoryThreadDetail": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "definitions": {
-        "AgentItem": {
+        "AgentReference": {
+          "properties": {
+            "kind": {
+              "type": "string"
+            },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "text": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "url": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        "FileEditChange": {
+          "properties": {
+            "changeKind": {
+              "type": "string"
+            },
+            "diff": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "changeKind",
+            "diff",
+            "path"
+          ],
+          "type": "object"
+        },
+        "HistoryThreadSummary": {
+          "description": "A neutral summary for a historical agent thread. Values such as `model_provider` and `source` are metadata from the runtime; the wire shape stays agent-neutral so Swift can group and render history without parsing a vendor protocol.",
+          "properties": {
+            "createdAt": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "cwd": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "modelProvider": {
+              "type": "string"
+            },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "preview": {
+              "type": "string"
+            },
+            "source": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            },
+            "updatedAt": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "createdAt",
+            "cwd",
+            "id",
+            "modelProvider",
+            "preview",
+            "source",
+            "status",
+            "updatedAt"
+          ],
+          "type": "object"
+        },
+        "HookFragment": {
+          "properties": {
+            "hookRunId": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "hookRunId",
+            "text"
+          ],
+          "type": "object"
+        },
+        "LegacyAgentItem": {
           "description": "A neutral agent item with per-kind structured payload.",
           "oneOf": [
             {
@@ -1896,123 +1368,6 @@
           ],
           "type": "object"
         },
-        "AgentReference": {
-          "properties": {
-            "kind": {
-              "type": "string"
-            },
-            "name": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "path": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "text": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "url": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
-        },
-        "FileEditChange": {
-          "properties": {
-            "changeKind": {
-              "type": "string"
-            },
-            "diff": {
-              "type": "string"
-            },
-            "path": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "changeKind",
-            "diff",
-            "path"
-          ],
-          "type": "object"
-        },
-        "HistoryThreadSummary": {
-          "description": "A neutral summary for a historical agent thread. Values such as `model_provider` and `source` are metadata from the runtime; the wire shape stays agent-neutral so Swift can group and render history without parsing a vendor protocol.",
-          "properties": {
-            "createdAt": {
-              "format": "int64",
-              "type": "integer"
-            },
-            "cwd": {
-              "type": "string"
-            },
-            "id": {
-              "type": "string"
-            },
-            "modelProvider": {
-              "type": "string"
-            },
-            "name": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "preview": {
-              "type": "string"
-            },
-            "source": {
-              "type": "string"
-            },
-            "status": {
-              "type": "string"
-            },
-            "updatedAt": {
-              "format": "int64",
-              "type": "integer"
-            }
-          },
-          "required": [
-            "createdAt",
-            "cwd",
-            "id",
-            "modelProvider",
-            "preview",
-            "source",
-            "status",
-            "updatedAt"
-          ],
-          "type": "object"
-        },
-        "HookFragment": {
-          "properties": {
-            "hookRunId": {
-              "type": "string"
-            },
-            "text": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "hookRunId",
-            "text"
-          ],
-          "type": "object"
-        },
         "Lifecycle": {
           "description": "Lifecycle of a streaming item (Eng D4 / front-of-mind started→delta→ completed). Neutral — not tied to any vendor's event names.",
           "enum": [
@@ -2059,7 +1414,7 @@
       "properties": {
         "items": {
           "items": {
-            "$ref": "#/definitions/AgentItem"
+            "$ref": "#/definitions/LegacyAgentItem"
           },
           "type": "array"
         },
@@ -2246,6 +1601,651 @@
         "kind"
       ],
       "title": "IpcMessage",
+      "type": "object"
+    },
+    "LegacyAgentItem": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "definitions": {
+        "AgentReference": {
+          "properties": {
+            "kind": {
+              "type": "string"
+            },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "text": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "url": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        "FileEditChange": {
+          "properties": {
+            "changeKind": {
+              "type": "string"
+            },
+            "diff": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "changeKind",
+            "diff",
+            "path"
+          ],
+          "type": "object"
+        },
+        "HookFragment": {
+          "properties": {
+            "hookRunId": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "hookRunId",
+            "text"
+          ],
+          "type": "object"
+        },
+        "Lifecycle": {
+          "description": "Lifecycle of a streaming item (Eng D4 / front-of-mind started→delta→ completed). Neutral — not tied to any vendor's event names.",
+          "enum": [
+            "started",
+            "delta",
+            "completed"
+          ],
+          "type": "string"
+        },
+        "ToolAction": {
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "query": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "command",
+            "kind"
+          ],
+          "type": "object"
+        }
+      },
+      "description": "A neutral agent item with per-kind structured payload.",
+      "oneOf": [
+        {
+          "description": "A user prompt restored from historical thread turns.",
+          "properties": {
+            "attachments": {
+              "items": {
+                "$ref": "#/definitions/AgentReference"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "enum": [
+                "user"
+              ],
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "attachments",
+            "kind",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The agent's primary user-facing answer. Text accumulates across deltas.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "message"
+              ],
+              "type": "string"
+            },
+            "memoryCitation": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "phase": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The agent's chain-of-thought. Secondary, default-collapsed in UI.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "reasoning"
+              ],
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A shell command the agent ran. Per-kind structured (D4).",
+          "properties": {
+            "actions": {
+              "items": {
+                "$ref": "#/definitions/ToolAction"
+              },
+              "type": "array"
+            },
+            "command": {
+              "type": "string"
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "durationMs": {
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "exitCode": {
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "enum": [
+                "shell"
+              ],
+              "type": "string"
+            },
+            "output": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "processId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "actions",
+            "command",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A file the agent edited. Per-kind structured (D4).",
+          "properties": {
+            "changes": {
+              "items": {
+                "$ref": "#/definitions/FileEditChange"
+              },
+              "type": "array"
+            },
+            "diff": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "enum": [
+                "fileEdit"
+              ],
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "status": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "changes",
+            "kind",
+            "path"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A web search / page navigation action performed by the agent. The shape keeps the useful action fields separate so the UI can render a readable historical trace without parsing vendor JSON.",
+          "properties": {
+            "action": {
+              "type": "string"
+            },
+            "actionQuery": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "enum": [
+                "webSearch"
+              ],
+              "type": "string"
+            },
+            "pattern": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "queries": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "query": {
+              "type": "string"
+            },
+            "url": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "action",
+            "kind",
+            "queries",
+            "query"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "plan"
+              ],
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "fragments": {
+              "items": {
+                "$ref": "#/definitions/HookFragment"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "enum": [
+                "hookPrompt"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "fragments",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "arguments": {
+              "type": "string"
+            },
+            "contentItems": {
+              "items": {
+                "$ref": "#/definitions/AgentReference"
+              },
+              "type": "array"
+            },
+            "durationMs": {
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "enum": [
+                "toolCall"
+              ],
+              "type": "string"
+            },
+            "namespace": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "resourceUri": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "result": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "server": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "type": "string"
+            },
+            "success": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "tool": {
+              "type": "string"
+            },
+            "toolKind": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "arguments",
+            "contentItems",
+            "kind",
+            "status",
+            "tool",
+            "toolKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "agentsStates": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "enum": [
+                "collabAgentToolCall"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "prompt": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reasoningEffort": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "receiverThreadIds": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "senderThreadId": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            },
+            "tool": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "receiverThreadIds",
+            "senderThreadId",
+            "status",
+            "tool"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "media"
+              ],
+              "type": "string"
+            },
+            "mediaKind": {
+              "type": "string"
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "result": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "revisedPrompt": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "savedPath": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "mediaKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "action": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "reviewMode"
+              ],
+              "type": "string"
+            },
+            "review": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "action",
+            "kind",
+            "review"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "contextCompaction"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "An unknown item type neutralized in the daemon. Only a short description crosses to Swift.",
+          "properties": {
+            "description": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "raw"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "description",
+            "kind"
+          ],
+          "type": "object"
+        }
+      ],
+      "properties": {
+        "id": {
+          "description": "Stable id correlating started/delta/completed for the same item.",
+          "type": "string"
+        },
+        "lifecycle": {
+          "$ref": "#/definitions/Lifecycle"
+        }
+      },
+      "required": [
+        "id",
+        "lifecycle"
+      ],
+      "title": "LegacyAgentItem",
       "type": "object"
     },
     "Lifecycle": {

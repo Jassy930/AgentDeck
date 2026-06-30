@@ -1,4 +1,4 @@
-use agentdeck_protocol::{ServerEvent, AgentKind, SessionId, ThreadId, AgentItem, AgentItemMeta, SessionCapabilities};
+use agentdeck_protocol::{ServerEvent, AgentKind, SessionId, ThreadId, AgentItem, AgentItemMeta, SessionCapabilities, ShellStatus};
 use std::collections::BTreeSet;
 
 fn ek(agent_kind: AgentKind) -> ServerEvent {
@@ -30,9 +30,29 @@ fn capabilities_event_round_trip() {
     };
     let event = ServerEvent::SessionCapabilities {
         session_id: SessionId("s1".into()),
+        agent_kind: AgentKind::ClaudeCode,
         capabilities: caps,
     };
     let json = serde_json::to_string(&event).unwrap();
     let back: ServerEvent = serde_json::from_str(&json).unwrap();
     assert!(matches!(back, ServerEvent::SessionCapabilities { .. }));
+}
+
+#[test]
+fn agent_item_shell_fields_camel_case() {
+    let event = ServerEvent::AgentItem {
+        session_id: SessionId("s1".into()),
+        thread_id: ThreadId("t1".into()),
+        agent_kind: AgentKind::ClaudeCode,
+        item: AgentItem::Shell {
+            command: "ls".into(),
+            status: ShellStatus::Completed,
+            exit_code: Some(0),
+            duration_ms: Some(10),
+            meta: AgentItemMeta::default(),
+        },
+    };
+    let json = serde_json::to_string(&event).unwrap();
+    assert!(json.contains(r#""exitCode":0"#), "exitCode missing in: {json}");
+    assert!(json.contains(r#""durationMs":10"#), "durationMs missing in: {json}");
 }
