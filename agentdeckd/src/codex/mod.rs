@@ -21,6 +21,10 @@
 //! / approval land in Step 3+. Render backpressure is handled by the Swift UI
 //! layer so the daemon can forward Codex deltas faithfully.
 
+pub mod adapter;
+pub mod capabilities;
+pub mod translate;
+
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
