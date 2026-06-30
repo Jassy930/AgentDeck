@@ -1,115 +1,486 @@
-//! RuntimeHub — stdin main loop, stdout writer, per-session lock,
-//! worker pool. Extracted from main.rs in T2.3; AgentRouter wiring
-//! added in T2.4; CodexAdapter migration to v2 in Phase 3.
+//! RuntimeHub — owns the `AgentRouter`, the stdin reader, the stdout
+//! writer, and the per-session events mpsc. Translates wire JSONL
+//! ⇄ `ClientCommand` / `ServerEvent`.
 //!
-//! NOTE: This file moved verbatim from main.rs. References to v1
-//! protocol types (IpcMessage, AgentItemKind, etc.) will not compile
-//! until Phase 3 migrates them. The [[bin]] target has
-//! required-features = ["daemon-bin"] so cargo skips bin compile
-//! by default.
+//! Wire protocol: newline-delimited JSON in both directions.
+//!
+//!   stdin  : one `ClientCommand` per line (deny_unknown_fields).
+//!   stdout : one `ServerEvent` per line ‑ except for the four
+//!            admin commands (Ping / Selfcheck / ProtocolSchema /
+//!            ProtocolVersion) which write a vendor-neutral JSON
+//!            reply directly. This is a deliberate side-channel
+//!            (see "Admin replies" below) chosen to avoid protocol
+//!            churn during Phase 3.
+//!
+//! Admin replies (request → response, NOT streaming events):
+//! `ServerEvent` has no `Reply { ... }` variant; the four admin
+//! commands above need a one-shot reply rather than a stream of
+//! events. We side-channel them through a second mpsc carrying raw
+//! JSON lines; the single writer task drains BOTH channels and
+//! serializes writes onto stdout. Concretely the reader handles
+//! these inline and pushes a JSON string ‑ event-side mpsc is
+//! untouched, so streaming events for concurrent sessions are not
+//! starved. This keeps the writer single-owner (no shared
+//! Mutex<Stdout>) and means Phase 4 / Phase 5 can add a real
+//! `ServerEvent::Reply` later without breaking on-wire behavior.
 
-use std::sync::mpsc::{Receiver, Sender};
+use crate::agent::{AgentEventSender, AgentSessionHandle};
+use crate::runtime::router::AgentRouter;
+use agentdeck_protocol::{
+    AgentKind, ClientCommand, ProtocolError, ServerEvent, SessionId, PROTOCOL_VERSION,
+};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::{mpsc, Mutex};
 
-use crate::ipc::{ActionDecision, IpcMessage};
+/// Channel depth for the unified ServerEvent stream coming out of all
+/// sessions. 256 is generous: the writer drains it as fast as stdout
+/// will accept (line per `recv`).
+const EVENTS_CHANNEL_CAPACITY: usize = 256;
 
-#[derive(Debug)]
-pub(crate) enum RuntimeHubDispatch {
-    StartTurn,
-    StartHistory,
-    Reply(IpcMessage),
-}
+/// Channel depth for admin (request/response) replies — Ping, Selfcheck,
+/// ProtocolSchema, ProtocolVersion. These are bursty but rare; 32 is
+/// enough headroom for a flood of selfchecks during boot.
+const ADMIN_REPLY_CAPACITY: usize = 32;
 
-#[derive(Debug)]
-pub(crate) enum RuntimeHubWorkerDone {
-    Turn(String),
-    History,
-}
-
-#[derive(Debug)]
+/// Coordinator for the daemon's stdin/stdout main loop.
+///
+/// Owns an `Arc<AgentRouter>` (shared with every spawned session pump)
+/// plus an in-process map of `session_id → AgentSessionHandle`. The
+/// handle map keeps abort handles alive so `SessionCancel` can drop
+/// them via the router and `Drop for Hub` reaps everything cleanly.
 pub struct RuntimeHub {
-    running_sessions: std::collections::HashSet<String>,
-    decision_senders: std::collections::HashMap<String, Sender<ActionDecision>>,
-    active_history_workers: usize,
-    max_history_workers: usize,
-    pub router: std::sync::Arc<crate::runtime::router::AgentRouter>,
+    pub router: Arc<AgentRouter>,
+    /// Holds every started session's `AgentSessionHandle`. We keep them
+    /// alive so the abort_handle inside them stays valid; on
+    /// `SessionCancel`, the router walks its own session map and we
+    /// drop ours afterward. This is independent of the router's K2
+    /// per-session lock (the router's map is keyed by `SessionId` →
+    /// `AgentKind` and is purely for routing).
+    sessions: Arc<Mutex<HashMap<SessionId, AgentSessionHandle>>>,
 }
 
 impl RuntimeHub {
-    pub fn new(max_history_workers: usize) -> Self {
+    pub fn new(router: Arc<AgentRouter>) -> Self {
         Self {
-            running_sessions: std::collections::HashSet::new(),
-            decision_senders: std::collections::HashMap::new(),
-            active_history_workers: 0,
-            max_history_workers: max_history_workers.max(1),
-            router: std::sync::Arc::new(crate::runtime::router::AgentRouter::new()),
+            router,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub(crate) fn drain_finished(&mut self, done_rx: &Receiver<RuntimeHubWorkerDone>) {
-        while let Ok(done) = done_rx.try_recv() {
-            match done {
-                RuntimeHubWorkerDone::Turn(session_id) => self.finish_turn(&session_id),
-                RuntimeHubWorkerDone::History => self.finish_history(),
+    /// Run the daemon main loop until stdin closes or an unrecoverable
+    /// write error occurs on stdout.
+    ///
+    /// Two concurrent tasks coordinate via mpsc:
+    ///   - **Writer task**: drains `events_rx` (per-session events)
+    ///     and `admin_rx` (admin command replies) and serializes
+    ///     every line to stdout. Single owner of `stdout`, so no
+    ///     lock is needed.
+    ///   - **Reader loop (this future)**: reads stdin line by line,
+    ///     parses `ClientCommand`, dispatches via `self.router`.
+    pub async fn run<R, W>(self, stdin: R, stdout: W) -> std::io::Result<()>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (events_tx, events_rx) = mpsc::channel::<ServerEvent>(EVENTS_CHANNEL_CAPACITY);
+        let (admin_tx, admin_rx) = mpsc::channel::<String>(ADMIN_REPLY_CAPACITY);
+
+        let writer_handle = tokio::spawn(writer_task(stdout, events_rx, admin_rx));
+
+        let mut reader = BufReader::new(stdin).lines();
+        loop {
+            match reader.next_line().await {
+                Ok(Some(line)) => {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    self.handle_line(&line, &events_tx, &admin_tx).await;
+                }
+                Ok(None) => break, // EOF
+                Err(e) => {
+                    // stdin closed unexpectedly; treat as graceful EOF.
+                    eprintln!("[agentdeckd] stdin read error: {e}");
+                    break;
+                }
+            }
+        }
+
+        // Drop both senders so the writer task drains and exits.
+        drop(events_tx);
+        drop(admin_tx);
+        let _ = writer_handle.await;
+        Ok(())
+    }
+
+    async fn handle_line(
+        &self,
+        line: &str,
+        events_tx: &AgentEventSender,
+        admin_tx: &mpsc::Sender<String>,
+    ) {
+        let cmd: ClientCommand = match serde_json::from_str(line) {
+            Ok(c) => c,
+            Err(e) => {
+                let err = ServerEvent::Error {
+                    session_id: None,
+                    error: ProtocolError {
+                        code: "parse-error".into(),
+                        message: format!("invalid ClientCommand: {e}"),
+                        diagnostic_ref: None,
+                    },
+                };
+                let _ = events_tx.send(err).await;
+                return;
+            }
+        };
+        self.dispatch(cmd, events_tx, admin_tx).await;
+    }
+
+    async fn dispatch(
+        &self,
+        cmd: ClientCommand,
+        events_tx: &AgentEventSender,
+        admin_tx: &mpsc::Sender<String>,
+    ) {
+        match cmd {
+            ClientCommand::Ping => {
+                let reply = serde_json::json!({ "reply": "ping", "ok": true });
+                let _ = admin_tx.send(reply.to_string()).await;
+            }
+            ClientCommand::Selfcheck => {
+                // v2 selfcheck reports daemon liveness + registered adapters.
+                // The CLI / Swift can call this without spawning a real turn.
+                let agents: Vec<String> = self
+                    .router
+                    .list_agents()
+                    .iter()
+                    .map(|k| k.as_str().to_string())
+                    .collect();
+                let reply = serde_json::json!({
+                    "reply": "selfcheck",
+                    "ok": true,
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "agents": agents,
+                });
+                let _ = admin_tx.send(reply.to_string()).await;
+            }
+            ClientCommand::ProtocolSchema => {
+                let reply = serde_json::json!({
+                    "reply": "protocolSchema",
+                    "schema": agentdeck_protocol::protocol_schema(),
+                });
+                let _ = admin_tx.send(reply.to_string()).await;
+            }
+            ClientCommand::ProtocolVersion => {
+                let reply = serde_json::json!({
+                    "reply": "protocolVersion",
+                    "protocolVersion": PROTOCOL_VERSION,
+                });
+                let _ = admin_tx.send(reply.to_string()).await;
+            }
+            ClientCommand::SessionStart(start) => {
+                match self
+                    .router
+                    .start_session(start, events_tx.clone())
+                    .await
+                {
+                    Ok(handle) => {
+                        self.sessions
+                            .lock()
+                            .await
+                            .insert(handle.session_id.clone(), handle);
+                    }
+                    Err(error) => {
+                        let _ = events_tx
+                            .send(ServerEvent::Error {
+                                session_id: None,
+                                error,
+                            })
+                            .await;
+                    }
+                }
+            }
+            ClientCommand::SessionContinue { thread_id, agent_kind, prompt } => {
+                match self
+                    .router
+                    .continue_thread(thread_id, agent_kind, prompt, events_tx.clone())
+                    .await
+                {
+                    Ok(handle) => {
+                        self.sessions
+                            .lock()
+                            .await
+                            .insert(handle.session_id.clone(), handle);
+                    }
+                    Err(error) => {
+                        let _ = events_tx
+                            .send(ServerEvent::Error {
+                                session_id: None,
+                                error,
+                            })
+                            .await;
+                    }
+                }
+            }
+            ClientCommand::SessionCancel { session_id } => {
+                if let Err(error) = self.router.cancel(&session_id).await {
+                    let _ = events_tx
+                        .send(ServerEvent::Error {
+                            session_id: Some(session_id.clone()),
+                            error,
+                        })
+                        .await;
+                }
+                // Drop our handle reference regardless — cancel is
+                // idempotent at the router level.
+                self.sessions.lock().await.remove(&session_id);
+            }
+            ClientCommand::ActionDecision { session_id, decision } => {
+                if let Err(error) =
+                    self.router.submit_decision(&session_id, decision).await
+                {
+                    let _ = events_tx
+                        .send(ServerEvent::Error {
+                            session_id: Some(session_id),
+                            error,
+                        })
+                        .await;
+                }
+            }
+            ClientCommand::VendorControl { session_id, payload } => {
+                if let Err(error) = self
+                    .router
+                    .submit_vendor_control(&session_id, payload)
+                    .await
+                {
+                    let _ = events_tx
+                        .send(ServerEvent::Error {
+                            session_id: Some(session_id),
+                            error,
+                        })
+                        .await;
+                }
+            }
+            ClientCommand::History(req) => {
+                // History dispatch is not wired through the Agent trait
+                // in Phase 3. Phase 4 / 5 will add a `list_history` /
+                // `read_history` method (per-adapter) and route here.
+                // Until then, surface a structured error so callers see
+                // an explicit "not yet implemented" rather than a hang.
+                let agent_hint = history_agent_kind_hint(&req);
+                let _ = events_tx
+                    .send(ServerEvent::Error {
+                        session_id: None,
+                        error: ProtocolError {
+                            code: "history-not-yet-wired".into(),
+                            message: format!(
+                                "HistoryRequest not yet routed in Phase 3 (agentKindHint={:?})",
+                                agent_hint
+                            ),
+                            diagnostic_ref: None,
+                        },
+                    })
+                    .await;
             }
         }
     }
+}
 
-    pub(crate) fn handle_spawn_turn(
-        &mut self,
-        id: Option<u64>,
-        session_id: &str,
-        decision_tx: Sender<ActionDecision>,
-    ) -> RuntimeHubDispatch {
-        if self.running_sessions.contains(session_id) {
-            return RuntimeHubDispatch::Reply(IpcMessage::error(
-                id,
-                "runtime busy: turn already running for this session",
-            ));
+/// Single-owner stdout writer. Drains the per-session events stream and
+/// the admin reply stream into a single newline-delimited byte stream.
+async fn writer_task<W>(
+    mut stdout: W,
+    mut events_rx: mpsc::Receiver<ServerEvent>,
+    mut admin_rx: mpsc::Receiver<String>,
+) where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    loop {
+        tokio::select! {
+            biased; // prefer admin (request/response) replies for snappier
+                    // selfchecks under load; events are still drained next.
+            maybe_admin = admin_rx.recv() => {
+                match maybe_admin {
+                    Some(line) => {
+                        if !write_line(&mut stdout, line.as_bytes()).await { break; }
+                    }
+                    None => {
+                        // admin channel closed; keep draining events
+                        // until that side also closes.
+                        while let Some(event) = events_rx.recv().await {
+                            let line = match serde_json::to_string(&event) {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            };
+                            if !write_line(&mut stdout, line.as_bytes()).await { break; }
+                        }
+                        break;
+                    }
+                }
+            }
+            maybe_event = events_rx.recv() => {
+                match maybe_event {
+                    Some(event) => {
+                        let line = match serde_json::to_string(&event) {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        };
+                        if !write_line(&mut stdout, line.as_bytes()).await { break; }
+                    }
+                    None => {
+                        // events channel closed; keep draining admin
+                        // until that side also closes.
+                        while let Some(line) = admin_rx.recv().await {
+                            if !write_line(&mut stdout, line.as_bytes()).await { break; }
+                        }
+                        break;
+                    }
+                }
+            }
         }
-        self.running_sessions.insert(session_id.to_string());
-        self.decision_senders
-            .insert(session_id.to_string(), decision_tx);
-        RuntimeHubDispatch::StartTurn
     }
+    // Best-effort flush before returning.
+    let _ = stdout.flush().await;
+}
 
-    pub(crate) fn finish_turn(&mut self, session_id: &str) {
-        self.running_sessions.remove(session_id);
-        self.decision_senders.remove(session_id);
+async fn write_line<W: AsyncWrite + Unpin>(stdout: &mut W, body: &[u8]) -> bool {
+    if stdout.write_all(body).await.is_err() {
+        return false;
     }
+    if stdout.write_all(b"\n").await.is_err() {
+        return false;
+    }
+    if stdout.flush().await.is_err() {
+        return false;
+    }
+    true
+}
 
-    pub(crate) fn handle_action_decision(
-        &self,
-        id: Option<u64>,
-        session_id: &str,
-        decision: ActionDecision,
-    ) -> RuntimeHubDispatch {
-        match self.decision_senders.get(session_id) {
-            Some(tx) => match tx.send(decision) {
-                Ok(()) => RuntimeHubDispatch::Reply(IpcMessage::pong(id)),
-                Err(_) => RuntimeHubDispatch::Reply(IpcMessage::error(
-                    id,
-                    "runtime approval channel closed",
-                )),
-            },
-            None => RuntimeHubDispatch::Reply(IpcMessage::error(
-                id,
-                "runtime has no pending turn for action decision",
-            )),
+fn history_agent_kind_hint(req: &agentdeck_protocol::HistoryRequest) -> Option<AgentKind> {
+    use agentdeck_protocol::HistoryRequest::*;
+    match req {
+        List { agent_kind, .. } => *agent_kind,
+        Read { agent_kind, .. }
+        | Archive { agent_kind, .. }
+        | Unarchive { agent_kind, .. }
+        | Rename { agent_kind, .. } => Some(*agent_kind),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentdeck_protocol::*;
+    use std::time::Duration;
+    use tokio::io::{duplex, AsyncWriteExt as _};
+
+    /// Sanity: parse errors come back as ServerEvent::Error not a panic
+    /// or a silent drop.
+    #[tokio::test]
+    async fn malformed_stdin_line_yields_error_event() {
+        let router = Arc::new(AgentRouter::new());
+        let hub = RuntimeHub::new(router);
+
+        let (mut client_to_daemon, daemon_stdin) = duplex(4096);
+        let (daemon_stdout, mut client_from_daemon) = duplex(4096);
+
+        let hub_task = tokio::spawn(hub.run(daemon_stdin, daemon_stdout));
+
+        client_to_daemon
+            .write_all(b"{ this is not json }\n")
+            .await
+            .unwrap();
+        client_to_daemon.shutdown().await.unwrap();
+
+        let mut buf = Vec::new();
+        let read_fut = async {
+            use tokio::io::AsyncReadExt;
+            client_from_daemon.read_to_end(&mut buf).await.unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(2), read_fut)
+            .await
+            .expect("daemon should respond and exit");
+        hub_task.await.unwrap().unwrap();
+
+        let response = String::from_utf8_lossy(&buf);
+        let first_line = response.lines().next().expect("at least one reply line");
+        let event: ServerEvent = serde_json::from_str(first_line).expect("ServerEvent JSON");
+        match event {
+            ServerEvent::Error { error, .. } => {
+                assert_eq!(error.code, "parse-error");
+            }
+            other => panic!("expected Error, got {other:?}"),
         }
     }
 
-    pub(crate) fn handle_history_request(&mut self, id: Option<u64>) -> RuntimeHubDispatch {
-        if self.active_history_workers >= self.max_history_workers {
-            return RuntimeHubDispatch::Reply(IpcMessage::error(
-                id,
-                "history busy: too many concurrent history requests",
-            ));
-        }
-        self.active_history_workers += 1;
-        RuntimeHubDispatch::StartHistory
+    /// Ping is side-channeled as a `{reply: "ping"}` line.
+    #[tokio::test]
+    async fn ping_returns_reply_line() {
+        let router = Arc::new(AgentRouter::new());
+        let hub = RuntimeHub::new(router);
+
+        let (mut client_to_daemon, daemon_stdin) = duplex(4096);
+        let (daemon_stdout, mut client_from_daemon) = duplex(4096);
+
+        let hub_task = tokio::spawn(hub.run(daemon_stdin, daemon_stdout));
+
+        let line = serde_json::to_string(&ClientCommand::Ping).unwrap();
+        client_to_daemon.write_all(line.as_bytes()).await.unwrap();
+        client_to_daemon.write_all(b"\n").await.unwrap();
+        client_to_daemon.shutdown().await.unwrap();
+
+        let mut buf = Vec::new();
+        let read_fut = async {
+            use tokio::io::AsyncReadExt;
+            client_from_daemon.read_to_end(&mut buf).await.unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(2), read_fut)
+            .await
+            .expect("daemon should respond and exit");
+        hub_task.await.unwrap().unwrap();
+
+        let response = String::from_utf8_lossy(&buf);
+        let first_line = response.lines().next().expect("at least one reply line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(first_line).expect("reply JSON");
+        assert_eq!(parsed["reply"], "ping");
+        assert_eq!(parsed["ok"], true);
     }
 
-    pub(crate) fn finish_history(&mut self) {
-        self.active_history_workers = self.active_history_workers.saturating_sub(1);
+    /// Selfcheck reports protocolVersion + registered agent kinds.
+    #[tokio::test]
+    async fn selfcheck_returns_protocol_and_agents() {
+        let router = Arc::new(AgentRouter::new());
+        let hub = RuntimeHub::new(router);
+
+        let (mut client_to_daemon, daemon_stdin) = duplex(4096);
+        let (daemon_stdout, mut client_from_daemon) = duplex(4096);
+
+        let hub_task = tokio::spawn(hub.run(daemon_stdin, daemon_stdout));
+
+        let line = serde_json::to_string(&ClientCommand::Selfcheck).unwrap();
+        client_to_daemon.write_all(line.as_bytes()).await.unwrap();
+        client_to_daemon.write_all(b"\n").await.unwrap();
+        client_to_daemon.shutdown().await.unwrap();
+
+        let mut buf = Vec::new();
+        let read_fut = async {
+            use tokio::io::AsyncReadExt;
+            client_from_daemon.read_to_end(&mut buf).await.unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(2), read_fut)
+            .await
+            .expect("daemon should respond and exit");
+        hub_task.await.unwrap().unwrap();
+
+        let response = String::from_utf8_lossy(&buf);
+        let first_line = response.lines().next().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(first_line).unwrap();
+        assert_eq!(parsed["reply"], "selfcheck");
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["protocolVersion"], PROTOCOL_VERSION);
+        assert!(parsed["agents"].is_array());
     }
 }

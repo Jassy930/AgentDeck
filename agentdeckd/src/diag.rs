@@ -16,6 +16,8 @@ use std::fs::{OpenOptions, create_dir_all};
 use std::io::Write;
 use std::path::PathBuf;
 
+use agentdeck_protocol::AgentKind;
+
 use crate::record::{app_data_dir, redact};
 
 #[derive(Clone, Debug)]
@@ -23,9 +25,17 @@ pub struct DiagnosticEvent {
     event: String,
     level: String,
     code: String,
+    /// Phase 3 / Task 3C addition: identify which adapter produced the
+    /// event so multi-adapter diagnostics (Phase 4 adds ClaudeCode) can
+    /// be filtered/grouped without parsing free-form `event` strings.
+    agent_kind: Option<AgentKind>,
     run_id: Option<String>,
     thread_id: Option<String>,
-    request_id: Option<u64>,
+    /// v1 used u64; the v2 protocol's `ActionRequest.request_id` is a
+    /// String. Diagnostic correlation also accepts JSON-RPC numeric ids
+    /// from codex, so we widen to `Option<String>` and serialize as JSON
+    /// number when it parses cleanly.
+    request_id: Option<String>,
     event_seq: Option<u64>,
     message: Option<String>,
     detail: Option<String>,
@@ -38,6 +48,7 @@ impl DiagnosticEvent {
             code: event.clone(),
             event,
             level: "info".into(),
+            agent_kind: None,
             run_id: None,
             thread_id: None,
             request_id: None,
@@ -57,6 +68,17 @@ impl DiagnosticEvent {
         self
     }
 
+    /// Stamp the producing adapter (Codex / ClaudeCode / …).
+    pub fn agent_kind(mut self, kind: AgentKind) -> Self {
+        self.agent_kind = Some(kind);
+        self
+    }
+
+    pub fn agent_kind_opt(mut self, kind: Option<AgentKind>) -> Self {
+        self.agent_kind = kind;
+        self
+    }
+
     pub fn run_id(mut self, run_id: impl Into<String>) -> Self {
         self.run_id = Some(run_id.into());
         self
@@ -67,8 +89,16 @@ impl DiagnosticEvent {
         self
     }
 
+    /// Backward-compatible setter (legacy callers passed u64 directly).
+    /// Stores the decimal stringification.
     pub fn request_id_opt(mut self, request_id: Option<u64>) -> Self {
-        self.request_id = request_id;
+        self.request_id = request_id.map(|n| n.to_string());
+        self
+    }
+
+    /// Preferred v2 setter — Codex now uses string request ids.
+    pub fn request_id_str(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
         self
     }
 
@@ -88,21 +118,36 @@ impl DiagnosticEvent {
     }
 
     pub fn to_json_line(&self) -> String {
+        // Render requestId as a JSON number when it round-trips through
+        // u64 (preserves the v1 wire shape for log consumers that haven't
+        // updated yet); otherwise as a string (v2 codex request ids).
+        let request_id_json: serde_json::Value = match &self.request_id {
+            Some(s) => match s.parse::<u64>() {
+                Ok(n) => serde_json::Value::Number(n.into()),
+                Err(_) => serde_json::Value::String(s.clone()),
+            },
+            None => serde_json::Value::Null,
+        };
+        let agent_kind_json: serde_json::Value = match self.agent_kind {
+            Some(k) => serde_json::Value::String(k.as_str().to_string()),
+            None => serde_json::Value::Null,
+        };
         let value = serde_json::json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "ts": chrono_now(),
             "level": self.level,
             "event": self.event,
             "code": self.code,
+            "agentKind": agent_kind_json,
             "runId": self.run_id,
             "threadId": self.thread_id,
-            "requestId": self.request_id,
+            "requestId": request_id_json,
             "eventSeq": self.event_seq,
             "message": self.message,
             "detail": self.detail.as_deref().map(redact),
         });
         serde_json::to_string(&value).unwrap_or_else(|_| {
-            r#"{"schemaVersion":1,"level":"error","event":"diagnostic_encode_failed"}"#.into()
+            r#"{"schemaVersion":2,"level":"error","event":"diagnostic_encode_failed"}"#.into()
         })
     }
 }
@@ -197,6 +242,7 @@ mod tests {
         let event = DiagnosticEvent::new("session_start")
             .level("info")
             .code("session_start")
+            .agent_kind(AgentKind::Codex)
             .run_id("run_1")
             .thread_id("thread_1")
             .request_id_opt(Some(7))
@@ -206,14 +252,38 @@ mod tests {
         let line = event.to_json_line();
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
 
-        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["schemaVersion"], 2);
         assert_eq!(value["event"], "session_start");
         assert_eq!(value["level"], "info");
         assert_eq!(value["code"], "session_start");
+        assert_eq!(value["agentKind"], "codex");
         assert_eq!(value["runId"], "run_1");
         assert_eq!(value["threadId"], "thread_1");
+        // Numeric (legacy) request ids preserve the wire shape.
         assert_eq!(value["requestId"], 7);
         assert_eq!(value["eventSeq"], 3);
+    }
+
+    #[test]
+    fn diagnostic_event_accepts_string_request_id_for_v2_codex() {
+        // v2 Codex translator emits string action request ids (e.g.
+        // "rpc:42" or a uuid). DiagnosticEvent must round-trip those
+        // verbatim without forcing them through u64 parse.
+        let event = DiagnosticEvent::new("approval_route")
+            .agent_kind(AgentKind::Codex)
+            .request_id_str("rpc:42-uuid");
+        let line = event.to_json_line();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["requestId"], "rpc:42-uuid");
+        assert_eq!(value["agentKind"], "codex");
+    }
+
+    #[test]
+    fn diagnostic_event_omits_agent_kind_when_unset() {
+        let event = DiagnosticEvent::new("daemon_start");
+        let line = event.to_json_line();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(value["agentKind"].is_null());
     }
 
     #[test]

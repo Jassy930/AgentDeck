@@ -181,6 +181,87 @@ pub fn try_append(run_id: &str, line: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ── v2 RunRecord ────────────────────────────────────────────────────────────
+//
+// Phase 3 / Task 3C: thin record helper for v2 `ServerEvent` streams.
+// Stamps the producing adapter (Codex / ClaudeCode / …) at session
+// start so a single run log can be replayed without ambiguity. Wraps
+// the always-on `try_append` so the redactor still runs on every line.
+
+use agentdeck_protocol::{AgentKind, ServerEvent};
+
+/// One run = one session = one `runs/<runId>.jsonl` file. The header
+/// line records `agentKind` + `agentVersion` + `cwd` + `startedAt` so
+/// the file is self-describing.
+pub struct RunRecord {
+    run_id: String,
+    agent_kind: AgentKind,
+}
+
+impl RunRecord {
+    /// Open a new run record. Writes a header line immediately so the
+    /// file always carries adapter identity (even if no AgentItem ever
+    /// arrives). Errors mirror `try_append` — visible to the caller, not
+    /// silent.
+    pub fn open(
+        run_id: impl Into<String>,
+        agent_kind: AgentKind,
+        agent_version: impl Into<String>,
+        cwd: &std::path::Path,
+    ) -> Result<Self, String> {
+        let run_id = run_id.into();
+        let agent_version = agent_version.into();
+        let header = serde_json::json!({
+            "kind": "runHeader",
+            "schemaVersion": 2,
+            "runId": run_id,
+            "agentKind": agent_kind.as_str(),
+            "agentVersion": agent_version,
+            "cwd": cwd,
+            "startedAtMs": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        });
+        try_append(&run_id, &header.to_string())?;
+        Ok(Self { run_id, agent_kind })
+    }
+
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub fn agent_kind(&self) -> AgentKind {
+        self.agent_kind
+    }
+
+    /// Append one ServerEvent to the run log. Serialization failure
+    /// (impossible for ServerEvent in practice) is mapped to a string
+    /// error, consistent with `try_append`.
+    pub fn append_event(&self, event: &ServerEvent) -> Result<(), String> {
+        let line = serde_json::to_string(event)
+            .map_err(|e| format!("ServerEvent serialize failed: {e}"))?;
+        try_append(&self.run_id, &line)
+    }
+
+    /// Close the record by writing a footer line. Best-effort: a write
+    /// failure here is logged via the returned error but doesn't poison
+    /// the file (header + events are already on disk).
+    pub fn close(self) -> Result<(), String> {
+        let footer = serde_json::json!({
+            "kind": "runFooter",
+            "schemaVersion": 2,
+            "runId": self.run_id,
+            "agentKind": self.agent_kind.as_str(),
+            "endedAtMs": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        });
+        try_append(&self.run_id, &footer.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,8 +364,74 @@ mod tests {
         assert_eq!(r, "line one\nline two\n");
     }
 
+    /// Mutex used by env-mutating tests so they don't race with each
+    /// other (HOME / AGENTDECK_DATA_DIR are process-global).
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn run_record_writes_header_and_appends_events_with_agent_kind() {
+        use agentdeck_protocol::{AgentItem, AgentItemMeta, AgentKind, ServerEvent, SessionId, ThreadId};
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+
+        let dir = std::env::temp_dir().join(format!(
+            "agentdeck-runrec-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Drive RunRecord via the AGENTDECK_DATA_DIR override.
+        let prev = std::env::var_os("AGENTDECK_DATA_DIR");
+        unsafe { std::env::set_var("AGENTDECK_DATA_DIR", &dir); }
+
+        let cwd = std::path::PathBuf::from("/tmp/example");
+        let rec = RunRecord::open(
+            "run_test_123",
+            AgentKind::Codex,
+            "codex-cli 0.x".to_string(),
+            &cwd,
+        )
+        .expect("open run record");
+
+        let event = ServerEvent::AgentItem {
+            session_id: SessionId("sid".into()),
+            thread_id: ThreadId("tid".into()),
+            agent_kind: AgentKind::Codex,
+            item: AgentItem::AssistantMessage {
+                text: "hello".into(),
+                meta: AgentItemMeta::default(),
+            },
+        };
+        rec.append_event(&event).expect("append event");
+        rec.close().expect("close run record");
+
+        let log = dir.join("runs/run_test_123.jsonl");
+        let body = std::fs::read_to_string(&log).expect("read run log");
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(lines.len() >= 3, "expected header + event + footer, got {lines:?}");
+        let header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(header["kind"], "runHeader");
+        assert_eq!(header["agentKind"], "codex");
+        assert_eq!(header["agentVersion"], "codex-cli 0.x");
+        let event_line: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(event_line["type"], "agentItem");
+        assert_eq!(event_line["agentKind"], "codex");
+        let footer: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(footer["kind"], "runFooter");
+
+        // Restore env.
+        if let Some(p) = prev {
+            unsafe { std::env::set_var("AGENTDECK_DATA_DIR", p); }
+        } else {
+            unsafe { std::env::remove_var("AGENTDECK_DATA_DIR"); }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn try_append_failure_returns_reason_not_panic() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         // E2: a bad HOME yields a visible reason, never a panic / silent drop.
         let saved = std::env::var_os("HOME");
         unsafe { std::env::remove_var("HOME") }

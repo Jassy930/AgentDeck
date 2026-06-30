@@ -1,7 +1,14 @@
-//! Daemon library facade — exposes modules to integration tests without
-//! requiring the bin to compile. The bin (main.rs) is rebuilt in Phase 2/3
-//! to consume this lib; until then bin and lib coexist as separate targets.
+//! Daemon library facade — exposes modules to integration tests and to
+//! the bin crate `agentdeckd`.
+//!
+//! v2 protocol only; v1 IPC types were removed in T1.9. The codex
+//! module is the only place in the daemon that knows Codex exists
+//! (N3); a future ClaudeCodeAdapter will be a sibling under
+//! `claude_code/`.
 
 pub mod agent;
 pub mod codex;
+pub mod diag;
+pub mod ipc;
+pub mod record;
 pub mod runtime;
