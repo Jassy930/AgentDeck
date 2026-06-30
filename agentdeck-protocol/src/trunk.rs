@@ -323,6 +323,40 @@ pub struct HistoryTurn {
     pub items: Vec<AgentItem>,
 }
 
+// ── T1.9: ClientCommand — all v2 client-to-server commands ──────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "command", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ClientCommand {
+    Ping,
+    Selfcheck,
+    SessionStart(SessionStart),
+    SessionContinue {
+        #[serde(rename = "threadId")]
+        thread_id: ThreadId,
+        #[serde(rename = "agentKind")]
+        agent_kind: AgentKind,
+        prompt: String,
+    },
+    SessionCancel {
+        #[serde(rename = "sessionId")]
+        session_id: SessionId,
+    },
+    ActionDecision {
+        #[serde(rename = "sessionId")]
+        session_id: SessionId,
+        decision: ActionDecision,
+    },
+    VendorControl {
+        #[serde(rename = "sessionId")]
+        session_id: SessionId,
+        payload: VendorControlPayload,
+    },
+    History(HistoryRequest),
+    ProtocolSchema,
+    ProtocolVersion,
+}
+
 // ServerEvent — main trunk
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]

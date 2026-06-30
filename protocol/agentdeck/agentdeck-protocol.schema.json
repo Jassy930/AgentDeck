@@ -1,483 +1,530 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "definitions": {
-    "AgentItemKind": {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "AgentKind": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "enum": [
+        "codex",
+        "claude_code"
+      ],
+      "title": "AgentKind",
+      "type": "string"
+    },
+    "ClientCommand": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "definitions": {
-        "AgentReference": {
+        "ActionDecision": {
+          "additionalProperties": false,
           "properties": {
-            "kind": {
-              "type": "string"
+            "decision": {
+              "$ref": "#/definitions/ActionDecisionKind"
             },
-            "name": {
-              "type": [
-                "string",
-                "null"
-              ]
+            "persist": {
+              "type": "boolean"
             },
-            "path": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "text": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "url": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
-        },
-        "FileEditChange": {
-          "properties": {
-            "changeKind": {
-              "type": "string"
-            },
-            "diff": {
-              "type": "string"
-            },
-            "path": {
+            "requestId": {
               "type": "string"
             }
           },
           "required": [
-            "changeKind",
-            "diff",
-            "path"
+            "decision",
+            "persist",
+            "requestId"
           ],
           "type": "object"
         },
-        "HookFragment": {
-          "properties": {
-            "hookRunId": {
-              "type": "string"
-            },
-            "text": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "hookRunId",
-            "text"
+        "ActionDecisionKind": {
+          "enum": [
+            "approve",
+            "deny"
           ],
-          "type": "object"
+          "type": "string"
         },
-        "ToolAction": {
+        "AgentKind": {
+          "enum": [
+            "codex",
+            "claude_code"
+          ],
+          "type": "string"
+        },
+        "ClaudeCodeHookConfig": {
+          "additionalProperties": false,
           "properties": {
             "command": {
               "type": "string"
             },
-            "kind": {
+            "matcher": {
               "type": "string"
             },
-            "name": {
+            "timeoutMs": {
+              "format": "uint32",
+              "minimum": 0.0,
               "type": [
-                "string",
-                "null"
-              ]
-            },
-            "path": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "query": {
-              "type": [
-                "string",
+                "integer",
                 "null"
               ]
             }
           },
           "required": [
             "command",
-            "kind"
+            "matcher"
           ],
           "type": "object"
+        },
+        "ClaudeCodePermissionMode": {
+          "enum": [
+            "default",
+            "acceptEdits",
+            "plan",
+            "auto",
+            "dontAsk",
+            "bypassPermissions"
+          ],
+          "type": "string"
+        },
+        "ClaudeCodeVendorControl": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "updatePermissionMode"
+                  ],
+                  "type": "string"
+                },
+                "payload": {
+                  "$ref": "#/definitions/ClaudeCodePermissionMode"
+                }
+              },
+              "required": [
+                "kind",
+                "payload"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "updateOutputStyle"
+                  ],
+                  "type": "string"
+                },
+                "payload": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "name": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "required": [
+                "kind",
+                "payload"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "addHook"
+                  ],
+                  "type": "string"
+                },
+                "payload": {
+                  "$ref": "#/definitions/ClaudeCodeHookConfig"
+                }
+              },
+              "required": [
+                "kind",
+                "payload"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "removeHook"
+                  ],
+                  "type": "string"
+                },
+                "payload": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "matcher": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "matcher"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "kind",
+                "payload"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "CodexApprovalPolicy": {
+          "enum": [
+            "on-request",
+            "never",
+            "always"
+          ],
+          "type": "string"
+        },
+        "CodexReasoningEffort": {
+          "enum": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          "type": "string"
+        },
+        "CodexSandboxMode": {
+          "enum": [
+            "read-only",
+            "workspace-write",
+            "full-access"
+          ],
+          "type": "string"
+        },
+        "CodexVendorControl": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "updateSandbox"
+                  ],
+                  "type": "string"
+                },
+                "payload": {
+                  "$ref": "#/definitions/CodexSandboxMode"
+                }
+              },
+              "required": [
+                "kind",
+                "payload"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "updateApprovalPolicy"
+                  ],
+                  "type": "string"
+                },
+                "payload": {
+                  "$ref": "#/definitions/CodexApprovalPolicy"
+                }
+              },
+              "required": [
+                "kind",
+                "payload"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "updateReasoningEffort"
+                  ],
+                  "type": "string"
+                },
+                "payload": {
+                  "$ref": "#/definitions/CodexReasoningEffort"
+                }
+              },
+              "required": [
+                "kind",
+                "payload"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "McpOverride": {
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "enabled",
+            "name"
+          ],
+          "type": "object"
+        },
+        "RuntimeOptions": {
+          "additionalProperties": false,
+          "properties": {
+            "idleTimeoutSecs": {
+              "default": 0,
+              "description": "daemon-level idle timeout for the spawned adapter process; 0 = no timeout",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "logVerbosity": {
+              "description": "adapter log verbosity passthrough",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "VendorControlPayload": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agentKind": {
+                  "enum": [
+                    "codex"
+                  ],
+                  "type": "string"
+                },
+                "control": {
+                  "$ref": "#/definitions/CodexVendorControl"
+                }
+              },
+              "required": [
+                "agentKind",
+                "control"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agentKind": {
+                  "enum": [
+                    "claude_code"
+                  ],
+                  "type": "string"
+                },
+                "control": {
+                  "$ref": "#/definitions/ClaudeCodeVendorControl"
+                }
+              },
+              "required": [
+                "agentKind",
+                "control"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "VendorSessionOptions": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agentKind": {
+                  "enum": [
+                    "codex"
+                  ],
+                  "type": "string"
+                },
+                "approvalPolicy": {
+                  "$ref": "#/definitions/CodexApprovalPolicy"
+                },
+                "mcpOverrides": {
+                  "default": [],
+                  "items": {
+                    "$ref": "#/definitions/McpOverride"
+                  },
+                  "type": "array"
+                },
+                "persistApproval": {
+                  "type": "boolean"
+                },
+                "reasoningEffort": {
+                  "$ref": "#/definitions/CodexReasoningEffort"
+                },
+                "sandbox": {
+                  "$ref": "#/definitions/CodexSandboxMode"
+                }
+              },
+              "required": [
+                "agentKind",
+                "approvalPolicy",
+                "persistApproval",
+                "reasoningEffort",
+                "sandbox"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agentKind": {
+                  "enum": [
+                    "claude_code"
+                  ],
+                  "type": "string"
+                },
+                "allowedTools": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": [
+                    "array",
+                    "null"
+                  ]
+                },
+                "disallowedTools": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": [
+                    "array",
+                    "null"
+                  ]
+                },
+                "effort": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "hooks": {
+                  "default": [],
+                  "items": {
+                    "$ref": "#/definitions/ClaudeCodeHookConfig"
+                  },
+                  "type": "array"
+                },
+                "mcpConfigPath": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "model": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "outputStyle": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "permissionMode": {
+                  "$ref": "#/definitions/ClaudeCodePermissionMode"
+                },
+                "pluginDirs": {
+                  "default": [],
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "sessionId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "sessionName": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "worktree": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "agentKind",
+                "permissionMode"
+              ],
+              "type": "object"
+            }
+          ]
         }
       },
       "oneOf": [
         {
-          "description": "A user prompt restored from historical thread turns.",
+          "additionalProperties": false,
           "properties": {
-            "attachments": {
-              "items": {
-                "$ref": "#/definitions/AgentReference"
-              },
-              "type": "array"
-            },
-            "kind": {
+            "command": {
               "enum": [
-                "user"
+                "ping"
               ],
-              "type": "string"
-            },
-            "text": {
               "type": "string"
             }
           },
           "required": [
-            "attachments",
-            "kind",
-            "text"
+            "command"
           ],
           "type": "object"
         },
         {
-          "description": "The agent's primary user-facing answer. Text accumulates across deltas.",
+          "additionalProperties": false,
           "properties": {
-            "kind": {
+            "command": {
               "enum": [
-                "message"
+                "selfcheck"
               ],
-              "type": "string"
-            },
-            "memoryCitation": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "phase": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "text": {
               "type": "string"
             }
           },
           "required": [
-            "kind",
-            "text"
+            "command"
           ],
           "type": "object"
         },
         {
-          "description": "The agent's chain-of-thought. Secondary, default-collapsed in UI.",
+          "additionalProperties": false,
           "properties": {
-            "kind": {
-              "enum": [
-                "reasoning"
-              ],
-              "type": "string"
-            },
-            "text": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "text"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "A shell command the agent ran. Per-kind structured (D4).",
-          "properties": {
-            "actions": {
-              "items": {
-                "$ref": "#/definitions/ToolAction"
-              },
-              "type": "array"
+            "agentKind": {
+              "$ref": "#/definitions/AgentKind"
             },
             "command": {
+              "enum": [
+                "sessionStart"
+              ],
               "type": "string"
             },
             "cwd": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "durationMs": {
-              "format": "int64",
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "exitCode": {
-              "format": "int64",
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "kind": {
-              "enum": [
-                "shell"
-              ],
               "type": "string"
-            },
-            "output": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "processId": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "source": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "status": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "actions",
-            "command",
-            "kind"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "A file the agent edited. Per-kind structured (D4).",
-          "properties": {
-            "changes": {
-              "items": {
-                "$ref": "#/definitions/FileEditChange"
-              },
-              "type": "array"
-            },
-            "diff": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "kind": {
-              "enum": [
-                "fileEdit"
-              ],
-              "type": "string"
-            },
-            "path": {
-              "type": "string"
-            },
-            "status": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "changes",
-            "kind",
-            "path"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "A web search / page navigation action performed by the agent. The shape keeps the useful action fields separate so the UI can render a readable historical trace without parsing vendor JSON.",
-          "properties": {
-            "action": {
-              "type": "string"
-            },
-            "actionQuery": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "kind": {
-              "enum": [
-                "webSearch"
-              ],
-              "type": "string"
-            },
-            "pattern": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "queries": {
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            "query": {
-              "type": "string"
-            },
-            "url": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "action",
-            "kind",
-            "queries",
-            "query"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "kind": {
-              "enum": [
-                "plan"
-              ],
-              "type": "string"
-            },
-            "text": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "text"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "fragments": {
-              "items": {
-                "$ref": "#/definitions/HookFragment"
-              },
-              "type": "array"
-            },
-            "kind": {
-              "enum": [
-                "hookPrompt"
-              ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "fragments",
-            "kind"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "arguments": {
-              "type": "string"
-            },
-            "contentItems": {
-              "items": {
-                "$ref": "#/definitions/AgentReference"
-              },
-              "type": "array"
-            },
-            "durationMs": {
-              "format": "int64",
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "error": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "kind": {
-              "enum": [
-                "toolCall"
-              ],
-              "type": "string"
-            },
-            "namespace": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "resourceUri": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "result": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "server": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "status": {
-              "type": "string"
-            },
-            "success": {
-              "type": [
-                "boolean",
-                "null"
-              ]
-            },
-            "tool": {
-              "type": "string"
-            },
-            "toolKind": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "arguments",
-            "contentItems",
-            "kind",
-            "status",
-            "tool",
-            "toolKind"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "agentsStates": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "kind": {
-              "enum": [
-                "collabAgentToolCall"
-              ],
-              "type": "string"
-            },
-            "model": {
-              "type": [
-                "string",
-                "null"
-              ]
             },
             "prompt": {
               "type": [
@@ -485,370 +532,399 @@
                 "null"
               ]
             },
-            "reasoningEffort": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "receiverThreadIds": {
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            "senderThreadId": {
-              "type": "string"
-            },
-            "status": {
-              "type": "string"
-            },
-            "tool": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "receiverThreadIds",
-            "senderThreadId",
-            "status",
-            "tool"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "kind": {
-              "enum": [
-                "media"
+            "runtimeOptions": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/RuntimeOptions"
+                }
               ],
-              "type": "string"
+              "default": {
+                "idleTimeoutSecs": 0,
+                "logVerbosity": null
+              }
             },
-            "mediaKind": {
-              "type": "string"
-            },
-            "path": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "result": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "revisedPrompt": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "savedPath": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "status": {
-              "type": [
-                "string",
-                "null"
-              ]
+            "vendorOptions": {
+              "$ref": "#/definitions/VendorSessionOptions"
             }
           },
           "required": [
-            "kind",
-            "mediaKind"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "action": {
-              "type": "string"
-            },
-            "kind": {
-              "enum": [
-                "reviewMode"
-              ],
-              "type": "string"
-            },
-            "review": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "action",
-            "kind",
-            "review"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "kind": {
-              "enum": [
-                "contextCompaction"
-              ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "An unknown item type neutralized in the daemon. Only a short description crosses to Swift.",
-          "properties": {
-            "description": {
-              "type": "string"
-            },
-            "kind": {
-              "enum": [
-                "raw"
-              ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "description",
-            "kind"
-          ],
-          "type": "object"
-        }
-      ],
-      "title": "AgentItemKind"
-    },
-    "AgentReference": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "kind": {
-          "type": "string"
-        },
-        "name": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "path": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "text": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "url": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "kind"
-      ],
-      "title": "AgentReference",
-      "type": "object"
-    },
-    "FileEditChange": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "changeKind": {
-          "type": "string"
-        },
-        "diff": {
-          "type": "string"
-        },
-        "path": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "changeKind",
-        "diff",
-        "path"
-      ],
-      "title": "FileEditChange",
-      "type": "object"
-    },
-    "HistoryThreadDetail": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "definitions": {
-        "AgentReference": {
-          "properties": {
-            "kind": {
-              "type": "string"
-            },
-            "name": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "path": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "text": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "url": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
-        },
-        "FileEditChange": {
-          "properties": {
-            "changeKind": {
-              "type": "string"
-            },
-            "diff": {
-              "type": "string"
-            },
-            "path": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "changeKind",
-            "diff",
-            "path"
-          ],
-          "type": "object"
-        },
-        "HistoryThreadSummary": {
-          "description": "A neutral summary for a historical agent thread. Values such as `model_provider` and `source` are metadata from the runtime; the wire shape stays agent-neutral so Swift can group and render history without parsing a vendor protocol.",
-          "properties": {
-            "createdAt": {
-              "format": "int64",
-              "type": "integer"
-            },
-            "cwd": {
-              "type": "string"
-            },
-            "id": {
-              "type": "string"
-            },
-            "modelProvider": {
-              "type": "string"
-            },
-            "name": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "preview": {
-              "type": "string"
-            },
-            "source": {
-              "type": "string"
-            },
-            "status": {
-              "type": "string"
-            },
-            "updatedAt": {
-              "format": "int64",
-              "type": "integer"
-            }
-          },
-          "required": [
-            "createdAt",
+            "agentKind",
+            "command",
             "cwd",
-            "id",
-            "modelProvider",
-            "preview",
-            "source",
-            "status",
-            "updatedAt"
+            "vendorOptions"
           ],
           "type": "object"
         },
-        "HookFragment": {
+        {
+          "additionalProperties": false,
           "properties": {
-            "hookRunId": {
+            "agentKind": {
+              "$ref": "#/definitions/AgentKind"
+            },
+            "command": {
+              "enum": [
+                "sessionContinue"
+              ],
               "type": "string"
             },
-            "text": {
+            "prompt": {
+              "type": "string"
+            },
+            "threadId": {
               "type": "string"
             }
           },
           "required": [
-            "hookRunId",
-            "text"
+            "agentKind",
+            "command",
+            "prompt",
+            "threadId"
           ],
           "type": "object"
         },
-        "LegacyAgentItem": {
-          "description": "A neutral agent item with per-kind structured payload.",
+        {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "enum": [
+                "sessionCancel"
+              ],
+              "type": "string"
+            },
+            "sessionId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command",
+            "sessionId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "enum": [
+                "actionDecision"
+              ],
+              "type": "string"
+            },
+            "decision": {
+              "$ref": "#/definitions/ActionDecision"
+            },
+            "sessionId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command",
+            "decision",
+            "sessionId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "enum": [
+                "vendorControl"
+              ],
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/definitions/VendorControlPayload"
+            },
+            "sessionId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command",
+            "payload",
+            "sessionId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "oneOf": [
             {
-              "description": "A user prompt restored from historical thread turns.",
+              "additionalProperties": false,
               "properties": {
-                "attachments": {
-                  "items": {
-                    "$ref": "#/definitions/AgentReference"
-                  },
-                  "type": "array"
+                "agentKind": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/definitions/AgentKind"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 },
-                "kind": {
+                "cwdFilter": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "op": {
                   "enum": [
-                    "user"
+                    "list"
                   ],
                   "type": "string"
+                }
+              },
+              "required": [
+                "op"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agentKind": {
+                  "$ref": "#/definitions/AgentKind"
+                },
+                "op": {
+                  "enum": [
+                    "read"
+                  ],
+                  "type": "string"
+                },
+                "threadId": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "agentKind",
+                "op",
+                "threadId"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agentKind": {
+                  "$ref": "#/definitions/AgentKind"
+                },
+                "op": {
+                  "enum": [
+                    "archive"
+                  ],
+                  "type": "string"
+                },
+                "threadId": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "agentKind",
+                "op",
+                "threadId"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agentKind": {
+                  "$ref": "#/definitions/AgentKind"
+                },
+                "op": {
+                  "enum": [
+                    "unarchive"
+                  ],
+                  "type": "string"
+                },
+                "threadId": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "agentKind",
+                "op",
+                "threadId"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agentKind": {
+                  "$ref": "#/definitions/AgentKind"
+                },
+                "op": {
+                  "enum": [
+                    "rename"
+                  ],
+                  "type": "string"
+                },
+                "threadId": {
+                  "type": "string"
+                },
+                "title": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "agentKind",
+                "op",
+                "threadId",
+                "title"
+              ],
+              "type": "object"
+            }
+          ],
+          "properties": {
+            "command": {
+              "enum": [
+                "history"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "enum": [
+                "protocolSchema"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "enum": [
+                "protocolVersion"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "ClientCommand"
+    },
+    "HistoryListItem": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "AgentKind": {
+          "enum": [
+            "codex",
+            "claude_code"
+          ],
+          "type": "string"
+        }
+      },
+      "properties": {
+        "agentKind": {
+          "$ref": "#/definitions/AgentKind"
+        },
+        "archived": {
+          "type": "boolean"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "lastActiveMs": {
+          "description": "epoch milliseconds; for sorting only",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "agentKind",
+        "archived",
+        "cwd",
+        "lastActiveMs",
+        "threadId"
+      ],
+      "title": "HistoryListItem",
+      "type": "object"
+    },
+    "HistoryReadResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "AgentItem": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "userMessage"
+                  ],
+                  "type": "string"
+                },
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
                 },
                 "text": {
                   "type": "string"
                 }
               },
               "required": [
-                "attachments",
                 "kind",
                 "text"
               ],
               "type": "object"
             },
             {
-              "description": "The agent's primary user-facing answer. Text accumulates across deltas.",
+              "additionalProperties": false,
               "properties": {
                 "kind": {
                   "enum": [
-                    "message"
+                    "assistantMessage"
                   ],
                   "type": "string"
                 },
-                "memoryCitation": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "phase": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
                 },
                 "text": {
                   "type": "string"
@@ -861,7 +937,7 @@
               "type": "object"
             },
             {
-              "description": "The agent's chain-of-thought. Secondary, default-collapsed in UI.",
+              "additionalProperties": false,
               "properties": {
                 "kind": {
                   "enum": [
@@ -869,6 +945,16 @@
                   ],
                   "type": "string"
                 },
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
+                },
                 "text": {
                   "type": "string"
                 }
@@ -880,32 +966,21 @@
               "type": "object"
             },
             {
-              "description": "A shell command the agent ran. Per-kind structured (D4).",
+              "additionalProperties": false,
               "properties": {
-                "actions": {
-                  "items": {
-                    "$ref": "#/definitions/ToolAction"
-                  },
-                  "type": "array"
-                },
                 "command": {
                   "type": "string"
                 },
-                "cwd": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
                 "durationMs": {
-                  "format": "int64",
+                  "format": "uint64",
+                  "minimum": 0.0,
                   "type": [
                     "integer",
                     "null"
                   ]
                 },
                 "exitCode": {
-                  "format": "int64",
+                  "format": "int32",
                   "type": [
                     "integer",
                     "null"
@@ -917,131 +992,574 @@
                   ],
                   "type": "string"
                 },
-                "output": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "processId": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "source": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
                 },
                 "status": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
+                  "$ref": "#/definitions/ShellStatus"
                 }
               },
               "required": [
-                "actions",
                 "command",
+                "kind",
+                "status"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "files": {
+                  "items": {
+                    "$ref": "#/definitions/DiffFile"
+                  },
+                  "type": "array"
+                },
+                "kind": {
+                  "enum": [
+                    "diff"
+                  ],
+                  "type": "string"
+                },
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
+                }
+              },
+              "required": [
+                "files",
                 "kind"
               ],
               "type": "object"
             },
             {
-              "description": "A file the agent edited. Per-kind structured (D4).",
-              "properties": {
-                "changes": {
-                  "items": {
-                    "$ref": "#/definitions/FileEditChange"
-                  },
-                  "type": "array"
-                },
-                "diff": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "kind": {
-                  "enum": [
-                    "fileEdit"
-                  ],
-                  "type": "string"
-                },
-                "path": {
-                  "type": "string"
-                },
-                "status": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                }
-              },
-              "required": [
-                "changes",
-                "kind",
-                "path"
-              ],
-              "type": "object"
-            },
-            {
-              "description": "A web search / page navigation action performed by the agent. The shape keeps the useful action fields separate so the UI can render a readable historical trace without parsing vendor JSON.",
-              "properties": {
-                "action": {
-                  "type": "string"
-                },
-                "actionQuery": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "kind": {
-                  "enum": [
-                    "webSearch"
-                  ],
-                  "type": "string"
-                },
-                "pattern": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "queries": {
-                  "items": {
-                    "type": "string"
-                  },
-                  "type": "array"
-                },
-                "query": {
-                  "type": "string"
-                },
-                "url": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                }
-              },
-              "required": [
-                "action",
-                "kind",
-                "queries",
-                "query"
-              ],
-              "type": "object"
-            },
-            {
+              "additionalProperties": false,
               "properties": {
                 "kind": {
                   "enum": [
                     "plan"
                   ],
                   "type": "string"
+                },
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
+                },
+                "steps": {
+                  "items": {
+                    "$ref": "#/definitions/PlanStep"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "kind",
+                "steps"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "imageReference"
+                  ],
+                  "type": "string"
+                },
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
+                },
+                "originalPath": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "savedPath": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "args": true,
+                "kind": {
+                  "enum": [
+                    "toolCall"
+                  ],
+                  "type": "string"
+                },
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
+                },
+                "name": {
+                  "type": "string"
+                },
+                "result": true
+              },
+              "required": [
+                "args",
+                "kind",
+                "name"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "raw"
+                  ],
+                  "type": "string"
+                },
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
+                },
+                "rawKind": {
+                  "type": "string"
+                },
+                "rawPayload": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "rawKind",
+                "rawPayload"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "AgentItemMeta": {
+          "additionalProperties": false,
+          "properties": {
+            "vendorExtensions": {
+              "additionalProperties": true,
+              "default": {},
+              "description": "Vendor-specific extension fields. Allowed in main trunk because the keys carry no vendor name; consumers must opt-in.",
+              "type": "object"
+            }
+          },
+          "type": "object"
+        },
+        "AgentKind": {
+          "enum": [
+            "codex",
+            "claude_code"
+          ],
+          "type": "string"
+        },
+        "DiffFile": {
+          "additionalProperties": false,
+          "properties": {
+            "patch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/definitions/DiffStatus"
+            }
+          },
+          "required": [
+            "path",
+            "status"
+          ],
+          "type": "object"
+        },
+        "DiffStatus": {
+          "enum": [
+            "added",
+            "modified",
+            "deleted",
+            "renamed"
+          ],
+          "type": "string"
+        },
+        "HistoryTurn": {
+          "additionalProperties": false,
+          "properties": {
+            "items": {
+              "items": {
+                "$ref": "#/definitions/AgentItem"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "items"
+          ],
+          "type": "object"
+        },
+        "PlanStep": {
+          "additionalProperties": false,
+          "properties": {
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "$ref": "#/definitions/PlanStepStatus"
+            },
+            "title": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "title"
+          ],
+          "type": "object"
+        },
+        "PlanStepStatus": {
+          "enum": [
+            "pending",
+            "inProgress",
+            "done",
+            "failed"
+          ],
+          "type": "string"
+        },
+        "ShellStatus": {
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "canceled"
+          ],
+          "type": "string"
+        }
+      },
+      "properties": {
+        "agentKind": {
+          "$ref": "#/definitions/AgentKind"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turns": {
+          "items": {
+            "$ref": "#/definitions/HistoryTurn"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "agentKind",
+        "threadId",
+        "turns"
+      ],
+      "title": "HistoryReadResponse",
+      "type": "object"
+    },
+    "HistoryRequest": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "definitions": {
+        "AgentKind": {
+          "enum": [
+            "codex",
+            "claude_code"
+          ],
+          "type": "string"
+        }
+      },
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "agentKind": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AgentKind"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "cwdFilter": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "op": {
+              "enum": [
+                "list"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "agentKind": {
+              "$ref": "#/definitions/AgentKind"
+            },
+            "op": {
+              "enum": [
+                "read"
+              ],
+              "type": "string"
+            },
+            "threadId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "agentKind",
+            "op",
+            "threadId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "agentKind": {
+              "$ref": "#/definitions/AgentKind"
+            },
+            "op": {
+              "enum": [
+                "archive"
+              ],
+              "type": "string"
+            },
+            "threadId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "agentKind",
+            "op",
+            "threadId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "agentKind": {
+              "$ref": "#/definitions/AgentKind"
+            },
+            "op": {
+              "enum": [
+                "unarchive"
+              ],
+              "type": "string"
+            },
+            "threadId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "agentKind",
+            "op",
+            "threadId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "agentKind": {
+              "$ref": "#/definitions/AgentKind"
+            },
+            "op": {
+              "enum": [
+                "rename"
+              ],
+              "type": "string"
+            },
+            "threadId": {
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "agentKind",
+            "op",
+            "threadId",
+            "title"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "HistoryRequest"
+    },
+    "ServerEvent": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "definitions": {
+        "ActionKind": {
+          "enum": [
+            "executeCommand",
+            "editFiles",
+            "grantExtraPermission"
+          ],
+          "type": "string"
+        },
+        "ActionRequest": {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "$ref": "#/definitions/ActionKind"
+            },
+            "requestId": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            },
+            "vendor": {
+              "$ref": "#/definitions/ActionRequestVendor"
+            }
+          },
+          "required": [
+            "kind",
+            "requestId",
+            "summary",
+            "vendor"
+          ],
+          "type": "object"
+        },
+        "ActionRequestVendor": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agentKind": {
+                  "enum": [
+                    "codex"
+                  ],
+                  "type": "string"
+                },
+                "approvalPolicyAtDecision": {
+                  "$ref": "#/definitions/CodexApprovalPolicy"
+                },
+                "canPersist": {
+                  "type": "boolean"
+                },
+                "sandboxAtDecision": {
+                  "$ref": "#/definitions/CodexSandboxMode"
+                }
+              },
+              "required": [
+                "agentKind",
+                "approvalPolicyAtDecision",
+                "canPersist",
+                "sandboxAtDecision"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agentKind": {
+                  "enum": [
+                    "claude_code"
+                  ],
+                  "type": "string"
+                },
+                "permissionModeAtDecision": {
+                  "$ref": "#/definitions/ClaudeCodePermissionMode"
+                },
+                "toolName": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "agentKind",
+                "permissionModeAtDecision",
+                "toolName"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "AgentItem": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "userMessage"
+                  ],
+                  "type": "string"
+                },
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
                 },
                 "text": {
                   "type": "string"
@@ -1054,187 +1572,195 @@
               "type": "object"
             },
             {
+              "additionalProperties": false,
               "properties": {
-                "fragments": {
-                  "items": {
-                    "$ref": "#/definitions/HookFragment"
-                  },
-                  "type": "array"
-                },
                 "kind": {
                   "enum": [
-                    "hookPrompt"
+                    "assistantMessage"
                   ],
+                  "type": "string"
+                },
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
+                },
+                "text": {
                   "type": "string"
                 }
               },
               "required": [
-                "fragments",
-                "kind"
+                "kind",
+                "text"
               ],
               "type": "object"
             },
             {
+              "additionalProperties": false,
               "properties": {
-                "arguments": {
+                "kind": {
+                  "enum": [
+                    "reasoning"
+                  ],
                   "type": "string"
                 },
-                "contentItems": {
-                  "items": {
-                    "$ref": "#/definitions/AgentReference"
-                  },
-                  "type": "array"
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
+                },
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "text"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "command": {
+                  "type": "string"
                 },
                 "durationMs": {
-                  "format": "int64",
+                  "format": "uint64",
+                  "minimum": 0.0,
                   "type": [
                     "integer",
                     "null"
                   ]
                 },
-                "error": {
+                "exitCode": {
+                  "format": "int32",
                   "type": [
-                    "string",
+                    "integer",
                     "null"
                   ]
                 },
                 "kind": {
                   "enum": [
-                    "toolCall"
+                    "shell"
                   ],
                   "type": "string"
                 },
-                "namespace": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "resourceUri": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "result": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "server": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
                 },
                 "status": {
-                  "type": "string"
-                },
-                "success": {
-                  "type": [
-                    "boolean",
-                    "null"
-                  ]
-                },
-                "tool": {
-                  "type": "string"
-                },
-                "toolKind": {
-                  "type": "string"
+                  "$ref": "#/definitions/ShellStatus"
                 }
               },
               "required": [
-                "arguments",
-                "contentItems",
+                "command",
                 "kind",
-                "status",
-                "tool",
-                "toolKind"
+                "status"
               ],
               "type": "object"
             },
             {
+              "additionalProperties": false,
               "properties": {
-                "agentsStates": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "kind": {
-                  "enum": [
-                    "collabAgentToolCall"
-                  ],
-                  "type": "string"
-                },
-                "model": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "prompt": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "reasoningEffort": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "receiverThreadIds": {
+                "files": {
                   "items": {
-                    "type": "string"
+                    "$ref": "#/definitions/DiffFile"
                   },
                   "type": "array"
                 },
-                "senderThreadId": {
+                "kind": {
+                  "enum": [
+                    "diff"
+                  ],
                   "type": "string"
                 },
-                "status": {
-                  "type": "string"
-                },
-                "tool": {
-                  "type": "string"
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
                 }
               },
               "required": [
-                "kind",
-                "receiverThreadIds",
-                "senderThreadId",
-                "status",
-                "tool"
+                "files",
+                "kind"
               ],
               "type": "object"
             },
             {
+              "additionalProperties": false,
               "properties": {
                 "kind": {
                   "enum": [
-                    "media"
+                    "plan"
                   ],
                   "type": "string"
                 },
-                "mediaKind": {
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
+                },
+                "steps": {
+                  "items": {
+                    "$ref": "#/definitions/PlanStep"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "kind",
+                "steps"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "imageReference"
+                  ],
                   "type": "string"
                 },
-                "path": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
                 },
-                "result": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "revisedPrompt": {
+                "originalPath": {
                   "type": [
                     "string",
                     "null"
@@ -1245,8 +1771,284 @@
                     "string",
                     "null"
                   ]
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "args": true,
+                "kind": {
+                  "enum": [
+                    "toolCall"
+                  ],
+                  "type": "string"
                 },
-                "status": {
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
+                },
+                "name": {
+                  "type": "string"
+                },
+                "result": true
+              },
+              "required": [
+                "args",
+                "kind",
+                "name"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "raw"
+                  ],
+                  "type": "string"
+                },
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
+                },
+                "rawKind": {
+                  "type": "string"
+                },
+                "rawPayload": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "rawKind",
+                "rawPayload"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "AgentItemMeta": {
+          "additionalProperties": false,
+          "properties": {
+            "vendorExtensions": {
+              "additionalProperties": true,
+              "default": {},
+              "description": "Vendor-specific extension fields. Allowed in main trunk because the keys carry no vendor name; consumers must opt-in.",
+              "type": "object"
+            }
+          },
+          "type": "object"
+        },
+        "AgentKind": {
+          "enum": [
+            "codex",
+            "claude_code"
+          ],
+          "type": "string"
+        },
+        "CapabilityId": {
+          "enum": [
+            "streamingMessages",
+            "streamingReasoning",
+            "shell",
+            "diff",
+            "approval",
+            "mcp",
+            "tokenCounters",
+            "authStatus",
+            "reasoningEffort",
+            "imageInput",
+            "worktree",
+            "codexSandboxMode",
+            "codexApprovalPersistence",
+            "codexSkills",
+            "codexCustomPrompts",
+            "claudeCodePermissionMode",
+            "claudeCodeHooks",
+            "claudeCodeOutputStyle",
+            "claudeCodeSlashCommands",
+            "claudeCodePlanMode",
+            "claudeCodeBackgroundAgents",
+            "claudeCodePluginDir",
+            "claudeCodeForkSession"
+          ],
+          "type": "string"
+        },
+        "ClaudeCodeHookConfig": {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "matcher": {
+              "type": "string"
+            },
+            "timeoutMs": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "command",
+            "matcher"
+          ],
+          "type": "object"
+        },
+        "ClaudeCodePermissionMode": {
+          "enum": [
+            "default",
+            "acceptEdits",
+            "plan",
+            "auto",
+            "dontAsk",
+            "bypassPermissions"
+          ],
+          "type": "string"
+        },
+        "ClaudeCodeVendorControl": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "updatePermissionMode"
+                  ],
+                  "type": "string"
+                },
+                "payload": {
+                  "$ref": "#/definitions/ClaudeCodePermissionMode"
+                }
+              },
+              "required": [
+                "kind",
+                "payload"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "updateOutputStyle"
+                  ],
+                  "type": "string"
+                },
+                "payload": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "name": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "required": [
+                "kind",
+                "payload"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "addHook"
+                  ],
+                  "type": "string"
+                },
+                "payload": {
+                  "$ref": "#/definitions/ClaudeCodeHookConfig"
+                }
+              },
+              "required": [
+                "kind",
+                "payload"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "removeHook"
+                  ],
+                  "type": "string"
+                },
+                "payload": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "matcher": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "matcher"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "kind",
+                "payload"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "ClaudeCodeVendorPanelEvent": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "description": "Hook fire events from `claude --include-hook-events`.",
+              "properties": {
+                "elapsedMs": {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "hookFired"
+                  ],
+                  "type": "string"
+                },
+                "matcher": {
+                  "type": "string"
+                },
+                "toolUseId": {
                   "type": [
                     "string",
                     "null"
@@ -1255,1062 +2057,1115 @@
               },
               "required": [
                 "kind",
-                "mediaKind"
-              ],
-              "type": "object"
-            },
-            {
-              "properties": {
-                "action": {
-                  "type": "string"
-                },
-                "kind": {
-                  "enum": [
-                    "reviewMode"
-                  ],
-                  "type": "string"
-                },
-                "review": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "action",
-                "kind",
-                "review"
-              ],
-              "type": "object"
-            },
-            {
-              "properties": {
-                "kind": {
-                  "enum": [
-                    "contextCompaction"
-                  ],
-                  "type": "string"
-                }
-              },
-              "required": [
-                "kind"
-              ],
-              "type": "object"
-            },
-            {
-              "description": "An unknown item type neutralized in the daemon. Only a short description crosses to Swift.",
-              "properties": {
-                "description": {
-                  "type": "string"
-                },
-                "kind": {
-                  "enum": [
-                    "raw"
-                  ],
-                  "type": "string"
-                }
-              },
-              "required": [
-                "description",
-                "kind"
+                "matcher"
               ],
               "type": "object"
             }
-          ],
-          "properties": {
-            "id": {
-              "description": "Stable id correlating started/delta/completed for the same item.",
-              "type": "string"
-            },
-            "lifecycle": {
-              "$ref": "#/definitions/Lifecycle"
-            }
-          },
-          "required": [
-            "id",
-            "lifecycle"
-          ],
-          "type": "object"
+          ]
         },
-        "Lifecycle": {
-          "description": "Lifecycle of a streaming item (Eng D4 / front-of-mind started→delta→ completed). Neutral — not tied to any vendor's event names.",
+        "CodexApprovalPolicy": {
           "enum": [
-            "started",
-            "delta",
-            "completed"
+            "on-request",
+            "never",
+            "always"
           ],
           "type": "string"
         },
-        "ToolAction": {
+        "CodexReasoningEffort": {
+          "enum": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          "type": "string"
+        },
+        "CodexSandboxMode": {
+          "enum": [
+            "read-only",
+            "workspace-write",
+            "full-access"
+          ],
+          "type": "string"
+        },
+        "CodexVendorControl": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "updateSandbox"
+                  ],
+                  "type": "string"
+                },
+                "payload": {
+                  "$ref": "#/definitions/CodexSandboxMode"
+                }
+              },
+              "required": [
+                "kind",
+                "payload"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "updateApprovalPolicy"
+                  ],
+                  "type": "string"
+                },
+                "payload": {
+                  "$ref": "#/definitions/CodexApprovalPolicy"
+                }
+              },
+              "required": [
+                "kind",
+                "payload"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "updateReasoningEffort"
+                  ],
+                  "type": "string"
+                },
+                "payload": {
+                  "$ref": "#/definitions/CodexReasoningEffort"
+                }
+              },
+              "required": [
+                "kind",
+                "payload"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "CodexVendorPanelEvent": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "description": "Vendor-specific events that don't fit the neutral trunk. v0.2 has no Codex panel events, but the enum exists so adapters can extend without breaking schema.",
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "placeholder"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "DiffFile": {
+          "additionalProperties": false,
           "properties": {
-            "command": {
-              "type": "string"
-            },
-            "kind": {
-              "type": "string"
-            },
-            "name": {
+            "patch": {
               "type": [
                 "string",
                 "null"
               ]
             },
             "path": {
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/definitions/DiffStatus"
+            }
+          },
+          "required": [
+            "path",
+            "status"
+          ],
+          "type": "object"
+        },
+        "DiffStatus": {
+          "enum": [
+            "added",
+            "modified",
+            "deleted",
+            "renamed"
+          ],
+          "type": "string"
+        },
+        "PlanStep": {
+          "additionalProperties": false,
+          "properties": {
+            "detail": {
               "type": [
                 "string",
                 "null"
               ]
             },
-            "query": {
+            "status": {
+              "$ref": "#/definitions/PlanStepStatus"
+            },
+            "title": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "title"
+          ],
+          "type": "object"
+        },
+        "PlanStepStatus": {
+          "enum": [
+            "pending",
+            "inProgress",
+            "done",
+            "failed"
+          ],
+          "type": "string"
+        },
+        "ProtocolError": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "diagnosticRef": {
               "type": [
                 "string",
+                "null"
+              ]
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        },
+        "SessionCapabilities": {
+          "additionalProperties": false,
+          "properties": {
+            "agentKind": {
+              "$ref": "#/definitions/AgentKind"
+            },
+            "agentVersion": {
+              "type": "string"
+            },
+            "features": {
+              "items": {
+                "$ref": "#/definitions/CapabilityId"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "vendor": {
+              "$ref": "#/definitions/VendorCapabilities"
+            }
+          },
+          "required": [
+            "agentKind",
+            "agentVersion",
+            "features",
+            "vendor"
+          ],
+          "type": "object"
+        },
+        "ShellStatus": {
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "canceled"
+          ],
+          "type": "string"
+        },
+        "TurnSummary": {
+          "additionalProperties": false,
+          "properties": {
+            "elapsedMs": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "totalInputTokens": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "totalOutputTokens": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "elapsedMs"
+          ],
+          "type": "object"
+        },
+        "VendorCapabilities": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agentKind": {
+                  "enum": [
+                    "codex"
+                  ],
+                  "type": "string"
+                },
+                "persistenceSupported": {
+                  "type": "boolean"
+                },
+                "reasoningEffortLevels": {
+                  "items": {
+                    "$ref": "#/definitions/CodexReasoningEffort"
+                  },
+                  "type": "array"
+                },
+                "sandboxModes": {
+                  "items": {
+                    "$ref": "#/definitions/CodexSandboxMode"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "agentKind",
+                "persistenceSupported",
+                "reasoningEffortLevels",
+                "sandboxModes"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agentKind": {
+                  "enum": [
+                    "claude_code"
+                  ],
+                  "type": "string"
+                },
+                "cliVersion": {
+                  "type": "string"
+                },
+                "hooksSupported": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "outputStyles": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "permissionModes": {
+                  "items": {
+                    "$ref": "#/definitions/ClaudeCodePermissionMode"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "agentKind",
+                "cliVersion",
+                "hooksSupported",
+                "outputStyles",
+                "permissionModes"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "VendorControlPayload": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agentKind": {
+                  "enum": [
+                    "codex"
+                  ],
+                  "type": "string"
+                },
+                "control": {
+                  "$ref": "#/definitions/CodexVendorControl"
+                }
+              },
+              "required": [
+                "agentKind",
+                "control"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agentKind": {
+                  "enum": [
+                    "claude_code"
+                  ],
+                  "type": "string"
+                },
+                "control": {
+                  "$ref": "#/definitions/ClaudeCodeVendorControl"
+                }
+              },
+              "required": [
+                "agentKind",
+                "control"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "VendorPanelPayload": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agentKind": {
+                  "enum": [
+                    "codex"
+                  ],
+                  "type": "string"
+                },
+                "event": {
+                  "$ref": "#/definitions/CodexVendorPanelEvent"
+                }
+              },
+              "required": [
+                "agentKind",
+                "event"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agentKind": {
+                  "enum": [
+                    "claude_code"
+                  ],
+                  "type": "string"
+                },
+                "event": {
+                  "$ref": "#/definitions/ClaudeCodeVendorPanelEvent"
+                }
+              },
+              "required": [
+                "agentKind",
+                "event"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "agentKind": {
+              "$ref": "#/definitions/AgentKind"
+            },
+            "sessionId": {
+              "type": "string"
+            },
+            "threadId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "sessionStarted"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "agentKind",
+            "sessionId",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "agentKind": {
+              "$ref": "#/definitions/AgentKind"
+            },
+            "capabilities": {
+              "$ref": "#/definitions/SessionCapabilities"
+            },
+            "sessionId": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "sessionCapabilities"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "agentKind",
+            "capabilities",
+            "sessionId",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "agentKind": {
+              "$ref": "#/definitions/AgentKind"
+            },
+            "item": {
+              "$ref": "#/definitions/AgentItem"
+            },
+            "sessionId": {
+              "type": "string"
+            },
+            "threadId": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "agentItem"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "agentKind",
+            "item",
+            "sessionId",
+            "threadId",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "agentKind": {
+              "$ref": "#/definitions/AgentKind"
+            },
+            "request": {
+              "$ref": "#/definitions/ActionRequest"
+            },
+            "sessionId": {
+              "type": "string"
+            },
+            "threadId": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "actionRequest"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "agentKind",
+            "request",
+            "sessionId",
+            "threadId",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "agentKind": {
+              "$ref": "#/definitions/AgentKind"
+            },
+            "sessionId": {
+              "type": "string"
+            },
+            "summary": {
+              "$ref": "#/definitions/TurnSummary"
+            },
+            "threadId": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "turnComplete"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "agentKind",
+            "sessionId",
+            "summary",
+            "threadId",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "error": {
+              "$ref": "#/definitions/ProtocolError"
+            },
+            "sessionId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "error"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "error",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "agentKind": {
+              "$ref": "#/definitions/AgentKind"
+            },
+            "payload": {
+              "$ref": "#/definitions/VendorControlPayload"
+            },
+            "sessionId": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "vendorControl"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "agentKind",
+            "payload",
+            "sessionId",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "agentKind": {
+              "$ref": "#/definitions/AgentKind"
+            },
+            "payload": {
+              "$ref": "#/definitions/VendorPanelPayload"
+            },
+            "sessionId": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "vendorPanelEvent"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "agentKind",
+            "payload",
+            "sessionId",
+            "type"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "ServerEvent"
+    },
+    "SessionCapabilities": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "AgentKind": {
+          "enum": [
+            "codex",
+            "claude_code"
+          ],
+          "type": "string"
+        },
+        "CapabilityId": {
+          "enum": [
+            "streamingMessages",
+            "streamingReasoning",
+            "shell",
+            "diff",
+            "approval",
+            "mcp",
+            "tokenCounters",
+            "authStatus",
+            "reasoningEffort",
+            "imageInput",
+            "worktree",
+            "codexSandboxMode",
+            "codexApprovalPersistence",
+            "codexSkills",
+            "codexCustomPrompts",
+            "claudeCodePermissionMode",
+            "claudeCodeHooks",
+            "claudeCodeOutputStyle",
+            "claudeCodeSlashCommands",
+            "claudeCodePlanMode",
+            "claudeCodeBackgroundAgents",
+            "claudeCodePluginDir",
+            "claudeCodeForkSession"
+          ],
+          "type": "string"
+        },
+        "ClaudeCodePermissionMode": {
+          "enum": [
+            "default",
+            "acceptEdits",
+            "plan",
+            "auto",
+            "dontAsk",
+            "bypassPermissions"
+          ],
+          "type": "string"
+        },
+        "CodexReasoningEffort": {
+          "enum": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          "type": "string"
+        },
+        "CodexSandboxMode": {
+          "enum": [
+            "read-only",
+            "workspace-write",
+            "full-access"
+          ],
+          "type": "string"
+        },
+        "VendorCapabilities": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agentKind": {
+                  "enum": [
+                    "codex"
+                  ],
+                  "type": "string"
+                },
+                "persistenceSupported": {
+                  "type": "boolean"
+                },
+                "reasoningEffortLevels": {
+                  "items": {
+                    "$ref": "#/definitions/CodexReasoningEffort"
+                  },
+                  "type": "array"
+                },
+                "sandboxModes": {
+                  "items": {
+                    "$ref": "#/definitions/CodexSandboxMode"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "agentKind",
+                "persistenceSupported",
+                "reasoningEffortLevels",
+                "sandboxModes"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agentKind": {
+                  "enum": [
+                    "claude_code"
+                  ],
+                  "type": "string"
+                },
+                "cliVersion": {
+                  "type": "string"
+                },
+                "hooksSupported": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "outputStyles": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "permissionModes": {
+                  "items": {
+                    "$ref": "#/definitions/ClaudeCodePermissionMode"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "agentKind",
+                "cliVersion",
+                "hooksSupported",
+                "outputStyles",
+                "permissionModes"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "properties": {
+        "agentKind": {
+          "$ref": "#/definitions/AgentKind"
+        },
+        "agentVersion": {
+          "type": "string"
+        },
+        "features": {
+          "items": {
+            "$ref": "#/definitions/CapabilityId"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "vendor": {
+          "$ref": "#/definitions/VendorCapabilities"
+        }
+      },
+      "required": [
+        "agentKind",
+        "agentVersion",
+        "features",
+        "vendor"
+      ],
+      "title": "SessionCapabilities",
+      "type": "object"
+    },
+    "SessionStart": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "AgentKind": {
+          "enum": [
+            "codex",
+            "claude_code"
+          ],
+          "type": "string"
+        },
+        "ClaudeCodeHookConfig": {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "matcher": {
+              "type": "string"
+            },
+            "timeoutMs": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
                 "null"
               ]
             }
           },
           "required": [
             "command",
-            "kind"
+            "matcher"
           ],
           "type": "object"
-        }
-      },
-      "properties": {
-        "items": {
-          "items": {
-            "$ref": "#/definitions/LegacyAgentItem"
-          },
-          "type": "array"
         },
-        "thread": {
-          "$ref": "#/definitions/HistoryThreadSummary"
-        }
-      },
-      "required": [
-        "items",
-        "thread"
-      ],
-      "title": "HistoryThreadDetail",
-      "type": "object"
-    },
-    "HistoryThreadList": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "definitions": {
-        "HistoryThreadSummary": {
-          "description": "A neutral summary for a historical agent thread. Values such as `model_provider` and `source` are metadata from the runtime; the wire shape stays agent-neutral so Swift can group and render history without parsing a vendor protocol.",
+        "ClaudeCodePermissionMode": {
+          "enum": [
+            "default",
+            "acceptEdits",
+            "plan",
+            "auto",
+            "dontAsk",
+            "bypassPermissions"
+          ],
+          "type": "string"
+        },
+        "CodexApprovalPolicy": {
+          "enum": [
+            "on-request",
+            "never",
+            "always"
+          ],
+          "type": "string"
+        },
+        "CodexReasoningEffort": {
+          "enum": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          "type": "string"
+        },
+        "CodexSandboxMode": {
+          "enum": [
+            "read-only",
+            "workspace-write",
+            "full-access"
+          ],
+          "type": "string"
+        },
+        "McpOverride": {
+          "additionalProperties": false,
           "properties": {
-            "createdAt": {
-              "format": "int64",
-              "type": "integer"
-            },
-            "cwd": {
-              "type": "string"
-            },
-            "id": {
-              "type": "string"
-            },
-            "modelProvider": {
-              "type": "string"
+            "enabled": {
+              "type": "boolean"
             },
             "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "enabled",
+            "name"
+          ],
+          "type": "object"
+        },
+        "RuntimeOptions": {
+          "additionalProperties": false,
+          "properties": {
+            "idleTimeoutSecs": {
+              "default": 0,
+              "description": "daemon-level idle timeout for the spawned adapter process; 0 = no timeout",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "logVerbosity": {
+              "description": "adapter log verbosity passthrough",
               "type": [
                 "string",
                 "null"
               ]
-            },
-            "preview": {
-              "type": "string"
-            },
-            "source": {
-              "type": "string"
-            },
-            "status": {
-              "type": "string"
-            },
-            "updatedAt": {
-              "format": "int64",
-              "type": "integer"
             }
           },
-          "required": [
-            "createdAt",
-            "cwd",
-            "id",
-            "modelProvider",
-            "preview",
-            "source",
-            "status",
-            "updatedAt"
-          ],
           "type": "object"
-        }
-      },
-      "properties": {
-        "nextCursor": {
-          "type": [
-            "string",
-            "null"
-          ]
         },
-        "threads": {
-          "items": {
-            "$ref": "#/definitions/HistoryThreadSummary"
-          },
-          "type": "array"
+        "VendorSessionOptions": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agentKind": {
+                  "enum": [
+                    "codex"
+                  ],
+                  "type": "string"
+                },
+                "approvalPolicy": {
+                  "$ref": "#/definitions/CodexApprovalPolicy"
+                },
+                "mcpOverrides": {
+                  "default": [],
+                  "items": {
+                    "$ref": "#/definitions/McpOverride"
+                  },
+                  "type": "array"
+                },
+                "persistApproval": {
+                  "type": "boolean"
+                },
+                "reasoningEffort": {
+                  "$ref": "#/definitions/CodexReasoningEffort"
+                },
+                "sandbox": {
+                  "$ref": "#/definitions/CodexSandboxMode"
+                }
+              },
+              "required": [
+                "agentKind",
+                "approvalPolicy",
+                "persistApproval",
+                "reasoningEffort",
+                "sandbox"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agentKind": {
+                  "enum": [
+                    "claude_code"
+                  ],
+                  "type": "string"
+                },
+                "allowedTools": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": [
+                    "array",
+                    "null"
+                  ]
+                },
+                "disallowedTools": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": [
+                    "array",
+                    "null"
+                  ]
+                },
+                "effort": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "hooks": {
+                  "default": [],
+                  "items": {
+                    "$ref": "#/definitions/ClaudeCodeHookConfig"
+                  },
+                  "type": "array"
+                },
+                "mcpConfigPath": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "model": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "outputStyle": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "permissionMode": {
+                  "$ref": "#/definitions/ClaudeCodePermissionMode"
+                },
+                "pluginDirs": {
+                  "default": [],
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "sessionId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "sessionName": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "worktree": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "agentKind",
+                "permissionMode"
+              ],
+              "type": "object"
+            }
+          ]
         }
       },
-      "required": [
-        "threads"
-      ],
-      "title": "HistoryThreadList",
-      "type": "object"
-    },
-    "HistoryThreadSummary": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "description": "A neutral summary for a historical agent thread. Values such as `model_provider` and `source` are metadata from the runtime; the wire shape stays agent-neutral so Swift can group and render history without parsing a vendor protocol.",
       "properties": {
-        "createdAt": {
-          "format": "int64",
-          "type": "integer"
+        "agentKind": {
+          "$ref": "#/definitions/AgentKind"
         },
         "cwd": {
           "type": "string"
         },
-        "id": {
-          "type": "string"
-        },
-        "modelProvider": {
-          "type": "string"
-        },
-        "name": {
+        "prompt": {
           "type": [
             "string",
             "null"
           ]
         },
-        "preview": {
-          "type": "string"
+        "runtimeOptions": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RuntimeOptions"
+            }
+          ],
+          "default": {
+            "idleTimeoutSecs": 0,
+            "logVerbosity": null
+          }
         },
-        "source": {
-          "type": "string"
-        },
-        "status": {
-          "type": "string"
-        },
-        "updatedAt": {
-          "format": "int64",
-          "type": "integer"
+        "vendorOptions": {
+          "$ref": "#/definitions/VendorSessionOptions"
         }
       },
       "required": [
-        "createdAt",
+        "agentKind",
         "cwd",
-        "id",
-        "modelProvider",
-        "preview",
-        "source",
-        "status",
-        "updatedAt"
+        "vendorOptions"
       ],
-      "title": "HistoryThreadSummary",
-      "type": "object"
-    },
-    "HookFragment": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "hookRunId": {
-          "type": "string"
-        },
-        "text": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "hookRunId",
-        "text"
-      ],
-      "title": "HookFragment",
-      "type": "object"
-    },
-    "IpcMessage": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "description": "A message on the neutral IPC wire (Swift ↔ daemon).",
-      "properties": {
-        "id": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "kind": {
-          "type": "string"
-        },
-        "payload": true,
-        "sessionId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "threadId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "kind"
-      ],
-      "title": "IpcMessage",
-      "type": "object"
-    },
-    "LegacyActionRequest": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "description": "Neutral request for a user decision before the agent performs a risky action. Adapter-specific fields stay behind the daemon boundary; Swift only sees these stable routing and presentation fields.\n\nNOTE: renamed to `LegacyActionRequest` in T1.7 to avoid conflict with the new `trunk::ActionRequest` struct. Will be removed in T1.9.",
-      "properties": {
-        "actionKind": {
-          "type": "string"
-        },
-        "approvalId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "detail": {
-          "type": "string"
-        },
-        "itemId": {
-          "type": "string"
-        },
-        "requestId": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "title": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "actionKind",
-        "detail",
-        "itemId",
-        "requestId",
-        "title"
-      ],
-      "title": "LegacyActionRequest",
-      "type": "object"
-    },
-    "LegacyAgentItem": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "definitions": {
-        "AgentReference": {
-          "properties": {
-            "kind": {
-              "type": "string"
-            },
-            "name": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "path": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "text": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "url": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
-        },
-        "FileEditChange": {
-          "properties": {
-            "changeKind": {
-              "type": "string"
-            },
-            "diff": {
-              "type": "string"
-            },
-            "path": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "changeKind",
-            "diff",
-            "path"
-          ],
-          "type": "object"
-        },
-        "HookFragment": {
-          "properties": {
-            "hookRunId": {
-              "type": "string"
-            },
-            "text": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "hookRunId",
-            "text"
-          ],
-          "type": "object"
-        },
-        "Lifecycle": {
-          "description": "Lifecycle of a streaming item (Eng D4 / front-of-mind started→delta→ completed). Neutral — not tied to any vendor's event names.",
-          "enum": [
-            "started",
-            "delta",
-            "completed"
-          ],
-          "type": "string"
-        },
-        "ToolAction": {
-          "properties": {
-            "command": {
-              "type": "string"
-            },
-            "kind": {
-              "type": "string"
-            },
-            "name": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "path": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "query": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "command",
-            "kind"
-          ],
-          "type": "object"
-        }
-      },
-      "description": "A neutral agent item with per-kind structured payload.",
-      "oneOf": [
-        {
-          "description": "A user prompt restored from historical thread turns.",
-          "properties": {
-            "attachments": {
-              "items": {
-                "$ref": "#/definitions/AgentReference"
-              },
-              "type": "array"
-            },
-            "kind": {
-              "enum": [
-                "user"
-              ],
-              "type": "string"
-            },
-            "text": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "attachments",
-            "kind",
-            "text"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "The agent's primary user-facing answer. Text accumulates across deltas.",
-          "properties": {
-            "kind": {
-              "enum": [
-                "message"
-              ],
-              "type": "string"
-            },
-            "memoryCitation": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "phase": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "text": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "text"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "The agent's chain-of-thought. Secondary, default-collapsed in UI.",
-          "properties": {
-            "kind": {
-              "enum": [
-                "reasoning"
-              ],
-              "type": "string"
-            },
-            "text": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "text"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "A shell command the agent ran. Per-kind structured (D4).",
-          "properties": {
-            "actions": {
-              "items": {
-                "$ref": "#/definitions/ToolAction"
-              },
-              "type": "array"
-            },
-            "command": {
-              "type": "string"
-            },
-            "cwd": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "durationMs": {
-              "format": "int64",
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "exitCode": {
-              "format": "int64",
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "kind": {
-              "enum": [
-                "shell"
-              ],
-              "type": "string"
-            },
-            "output": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "processId": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "source": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "status": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "actions",
-            "command",
-            "kind"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "A file the agent edited. Per-kind structured (D4).",
-          "properties": {
-            "changes": {
-              "items": {
-                "$ref": "#/definitions/FileEditChange"
-              },
-              "type": "array"
-            },
-            "diff": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "kind": {
-              "enum": [
-                "fileEdit"
-              ],
-              "type": "string"
-            },
-            "path": {
-              "type": "string"
-            },
-            "status": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "changes",
-            "kind",
-            "path"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "A web search / page navigation action performed by the agent. The shape keeps the useful action fields separate so the UI can render a readable historical trace without parsing vendor JSON.",
-          "properties": {
-            "action": {
-              "type": "string"
-            },
-            "actionQuery": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "kind": {
-              "enum": [
-                "webSearch"
-              ],
-              "type": "string"
-            },
-            "pattern": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "queries": {
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            "query": {
-              "type": "string"
-            },
-            "url": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "action",
-            "kind",
-            "queries",
-            "query"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "kind": {
-              "enum": [
-                "plan"
-              ],
-              "type": "string"
-            },
-            "text": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "text"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "fragments": {
-              "items": {
-                "$ref": "#/definitions/HookFragment"
-              },
-              "type": "array"
-            },
-            "kind": {
-              "enum": [
-                "hookPrompt"
-              ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "fragments",
-            "kind"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "arguments": {
-              "type": "string"
-            },
-            "contentItems": {
-              "items": {
-                "$ref": "#/definitions/AgentReference"
-              },
-              "type": "array"
-            },
-            "durationMs": {
-              "format": "int64",
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "error": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "kind": {
-              "enum": [
-                "toolCall"
-              ],
-              "type": "string"
-            },
-            "namespace": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "resourceUri": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "result": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "server": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "status": {
-              "type": "string"
-            },
-            "success": {
-              "type": [
-                "boolean",
-                "null"
-              ]
-            },
-            "tool": {
-              "type": "string"
-            },
-            "toolKind": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "arguments",
-            "contentItems",
-            "kind",
-            "status",
-            "tool",
-            "toolKind"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "agentsStates": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "kind": {
-              "enum": [
-                "collabAgentToolCall"
-              ],
-              "type": "string"
-            },
-            "model": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "prompt": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "reasoningEffort": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "receiverThreadIds": {
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            "senderThreadId": {
-              "type": "string"
-            },
-            "status": {
-              "type": "string"
-            },
-            "tool": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "receiverThreadIds",
-            "senderThreadId",
-            "status",
-            "tool"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "kind": {
-              "enum": [
-                "media"
-              ],
-              "type": "string"
-            },
-            "mediaKind": {
-              "type": "string"
-            },
-            "path": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "result": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "revisedPrompt": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "savedPath": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "status": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "kind",
-            "mediaKind"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "action": {
-              "type": "string"
-            },
-            "kind": {
-              "enum": [
-                "reviewMode"
-              ],
-              "type": "string"
-            },
-            "review": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "action",
-            "kind",
-            "review"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "kind": {
-              "enum": [
-                "contextCompaction"
-              ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "An unknown item type neutralized in the daemon. Only a short description crosses to Swift.",
-          "properties": {
-            "description": {
-              "type": "string"
-            },
-            "kind": {
-              "enum": [
-                "raw"
-              ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "description",
-            "kind"
-          ],
-          "type": "object"
-        }
-      ],
-      "properties": {
-        "id": {
-          "description": "Stable id correlating started/delta/completed for the same item.",
-          "type": "string"
-        },
-        "lifecycle": {
-          "$ref": "#/definitions/Lifecycle"
-        }
-      },
-      "required": [
-        "id",
-        "lifecycle"
-      ],
-      "title": "LegacyAgentItem",
-      "type": "object"
-    },
-    "Lifecycle": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "description": "Lifecycle of a streaming item (Eng D4 / front-of-mind started→delta→ completed). Neutral — not tied to any vendor's event names.",
-      "enum": [
-        "started",
-        "delta",
-        "completed"
-      ],
-      "title": "Lifecycle",
-      "type": "string"
-    },
-    "SessionState": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "description": "The neutral session state machine (Eng D9). The daemon owns this; the Swift app renders a mirror and never invents transitions.",
-      "enum": [
-        "idle",
-        "starting",
-        "ready",
-        "running",
-        "waitingApproval",
-        "draining",
-        "failed",
-        "closed"
-      ],
-      "title": "SessionState",
-      "type": "string"
-    },
-    "ToolAction": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "command": {
-          "type": "string"
-        },
-        "kind": {
-          "type": "string"
-        },
-        "name": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "path": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "query": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "command",
-        "kind"
-      ],
-      "title": "ToolAction",
+      "title": "SessionStart",
       "type": "object"
     }
   },
-  "protocolVersion": 1,
-  "title": "AgentDeck Neutral Protocol"
+  "title": "AgentDeck Protocol v2",
+  "type": "object"
 }
