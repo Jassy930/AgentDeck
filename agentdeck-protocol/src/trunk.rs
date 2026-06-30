@@ -12,7 +12,7 @@ use crate::vendor::codex::CodexSessionOptions;
 use crate::vendor::claude_code::ClaudeCodeSessionOptions;
 use crate::capabilities::SessionCapabilities;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentKind {
     Codex,

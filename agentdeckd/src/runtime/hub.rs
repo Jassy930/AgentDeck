@@ -31,6 +31,7 @@ pub struct RuntimeHub {
     decision_senders: std::collections::HashMap<String, Sender<ActionDecision>>,
     active_history_workers: usize,
     max_history_workers: usize,
+    pub router: std::sync::Arc<crate::runtime::router::AgentRouter>,
 }
 
 impl RuntimeHub {
@@ -40,6 +41,7 @@ impl RuntimeHub {
             decision_senders: std::collections::HashMap::new(),
             active_history_workers: 0,
             max_history_workers: max_history_workers.max(1),
+            router: std::sync::Arc::new(crate::runtime::router::AgentRouter::new()),
         }
     }
 
