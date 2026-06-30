@@ -265,23 +265,33 @@ pub enum VendorPanelPayload {
 #[serde(tag = "op", rename_all = "camelCase", deny_unknown_fields)]
 pub enum HistoryRequest {
     List {
+        #[serde(rename = "agentKind")]
         agent_kind: Option<AgentKind>,
+        #[serde(rename = "cwdFilter")]
         cwd_filter: Option<PathBuf>,
     },
     Read {
+        #[serde(rename = "threadId")]
         thread_id: ThreadId,
+        #[serde(rename = "agentKind")]
         agent_kind: AgentKind,
     },
     Archive {
+        #[serde(rename = "threadId")]
         thread_id: ThreadId,
+        #[serde(rename = "agentKind")]
         agent_kind: AgentKind,
     },
     Unarchive {
+        #[serde(rename = "threadId")]
         thread_id: ThreadId,
+        #[serde(rename = "agentKind")]
         agent_kind: AgentKind,
     },
     Rename {
+        #[serde(rename = "threadId")]
         thread_id: ThreadId,
+        #[serde(rename = "agentKind")]
         agent_kind: AgentKind,
         title: String,
     },

@@ -41,3 +41,14 @@ fn list_item_round_trip() {
     };
     let _: HistoryListItem = serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
 }
+
+#[test]
+fn history_archive_wire_is_camel_case() {
+    let req = HistoryRequest::Archive {
+        thread_id: ThreadId("t1".into()),
+        agent_kind: AgentKind::ClaudeCode,
+    };
+    let json = serde_json::to_string(&req).unwrap();
+    assert!(json.contains(r#""threadId":"t1""#), "thread_id should be threadId in wire: {}", json);
+    assert!(json.contains(r#""agentKind":"claude_code""#), "agent_kind should be agentKind in wire: {}", json);
+}
