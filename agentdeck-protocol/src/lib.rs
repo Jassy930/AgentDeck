@@ -10,6 +10,13 @@
 //! shell as a command block, fileEdit as a diff, WITHOUT parsing vendor
 //! formats (which would leak the boundary back into Swift).
 
+pub mod trunk;
+pub mod capabilities;
+pub mod transport;
+pub mod vendor;
+
+// 现有所有类型保持不变（T1.5/T1.6 之后才迁移）
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
