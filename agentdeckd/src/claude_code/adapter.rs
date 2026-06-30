@@ -483,6 +483,7 @@ impl Agent for ClaudeCodeAdapter {
     async fn continue_thread(
         &self,
         thread_id: ThreadId,
+        cwd: std::path::PathBuf,
         prompt: String,
         events: AgentEventSender,
     ) -> Result<AgentSessionHandle, ProtocolError> {
@@ -491,6 +492,9 @@ impl Agent for ClaudeCodeAdapter {
         // permission_mode for the resumed thread. For v0.2 we
         // default to BypassPermissions so the resumed turn flows
         // end-to-end without prompting (spec § 5.5 interim posture).
+        // `cwd` is supplied by the client so `~/.claude/projects/
+        // <encoded_cwd>/<id>.jsonl` resume lookup matches the
+        // original session and tool_use runs in the right directory.
         let opts = ClaudeCodeSessionOptions {
             permission_mode: ClaudeCodePermissionMode::BypassPermissions,
             model: None,
@@ -505,7 +509,6 @@ impl Agent for ClaudeCodeAdapter {
             session_name: None,
             session_id: Some(thread_id.0.clone()),
         };
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let synth_start = SessionStart {
             agent_kind: AgentKind::ClaudeCode,
             cwd,

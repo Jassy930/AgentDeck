@@ -357,6 +357,7 @@ pub enum ClientCommand {
         thread_id: ThreadId,
         #[serde(rename = "agentKind")]
         agent_kind: AgentKind,
+        cwd: PathBuf,
         prompt: String,
     },
     SessionCancel {

@@ -127,6 +127,13 @@ enum SessionOp {
         thread_id: String,
         #[arg(long)]
         agent: AgentKindArg,
+        /// Working directory associated with the thread. Required so
+        /// `claude --resume` finds the right session file under
+        /// `~/.claude/projects/<encoded_cwd>/<id>.jsonl` and tool_use
+        /// runs in the same directory as the original session
+        /// (C3 fix, final v0.2 review).
+        #[arg(long)]
+        cwd: std::path::PathBuf,
         #[arg(long)]
         prompt: String,
     },
@@ -283,10 +290,11 @@ async fn main() {
                     };
                     commands::handle_session_run(args, &profile, data_dir.as_deref(), pretty).await
                 }
-                SessionOp::Continue { thread_id, agent, prompt } => {
+                SessionOp::Continue { thread_id, agent, cwd, prompt } => {
                     commands::handle_session_continue(
                         thread_id.clone(),
                         *agent,
+                        cwd.clone(),
                         prompt.clone(),
                         &profile,
                         data_dir.as_deref(),

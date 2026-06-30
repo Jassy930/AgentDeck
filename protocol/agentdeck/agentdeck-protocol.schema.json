@@ -567,6 +567,9 @@
               ],
               "type": "string"
             },
+            "cwd": {
+              "type": "string"
+            },
             "prompt": {
               "type": "string"
             },
@@ -577,6 +580,7 @@
           "required": [
             "agentKind",
             "command",
+            "cwd",
             "prompt",
             "threadId"
           ],

@@ -633,6 +633,7 @@ impl Agent for CodexAdapter {
     async fn continue_thread(
         &self,
         thread_id: ThreadId,
+        cwd: std::path::PathBuf,
         prompt: String,
         events: AgentEventSender,
     ) -> Result<AgentSessionHandle, ProtocolError> {
@@ -640,6 +641,9 @@ impl Agent for CodexAdapter {
         // trait (intentional — Task 3C wires per-thread saved options).
         // For v0.2 we use safe defaults; sandbox + on-request approvals
         // are the conservative baseline when resuming an unknown thread.
+        // `cwd` is carried by the client (Swift/CLI) so the resumed
+        // child runs in the same directory as the original session,
+        // matching tool_use expectations.
         let opts = CodexSessionOptions {
             approval_policy: CodexApprovalPolicy::OnRequest,
             sandbox: CodexSandboxMode::WorkspaceWrite,
@@ -647,8 +651,6 @@ impl Agent for CodexAdapter {
             reasoning_effort: CodexReasoningEffort::Medium,
             mcp_overrides: vec![],
         };
-        // The hub layer (3C) should override cwd before calling.
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         self.start_inner(&cwd, &opts, Some(prompt), Some(thread_id), events)
             .await
     }

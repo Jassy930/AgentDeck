@@ -173,6 +173,32 @@ final class ProtocolV2DecodingTests: XCTestCase {
         XCTAssertTrue(line.contains("\"sandbox\":\"read-only\""))
     }
 
+    /// C3 fix (v0.2 final review): sessionContinue now carries `cwd`
+    /// on the wire so the daemon adapter can resume CC from the
+    /// right `~/.claude/projects/<encoded_cwd>/<id>.jsonl` and run
+    /// tool_use in the same directory as the original session.
+    /// Without this the adapter fell back to `std::env::current_dir()`,
+    /// which is the daemon's spawn directory — not the user's.
+    func testEncodeClientCommandSessionContinueIncludesCwd() throws {
+        let cmd: ClientCommand = .sessionContinue(
+            threadId: "tid-1",
+            agentKind: .claudeCode,
+            cwd: "/Users/me/work/proj",
+            prompt: "continue please"
+        )
+        let line = try DaemonClient.encodeClientCommand(cmd)
+        XCTAssertTrue(line.contains("\"command\":\"sessionContinue\""), "got: \(line)")
+        XCTAssertTrue(line.contains("\"agentKind\":\"claude_code\""), "got: \(line)")
+        XCTAssertTrue(line.contains("\"threadId\":\"tid-1\""), "got: \(line)")
+        // JSONEncoder escapes forward slashes by default (`\/`), so
+        // match the encoded form rather than the literal path.
+        XCTAssertTrue(
+            line.contains("\"cwd\":\"\\/Users\\/me\\/work\\/proj\""),
+            "got: \(line)"
+        )
+        XCTAssertTrue(line.contains("\"prompt\":\"continue please\""), "got: \(line)")
+    }
+
     func testEncodeClientCommandHistoryList() throws {
         let cmd: ClientCommand = .history(.list(agentKind: .codex, cwdFilter: nil))
         let line = try DaemonClient.encodeClientCommand(cmd)

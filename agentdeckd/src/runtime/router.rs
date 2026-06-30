@@ -57,6 +57,7 @@ impl AgentRouter {
         &self,
         thread_id: ThreadId,
         agent_kind: AgentKind,
+        cwd: std::path::PathBuf,
         prompt: String,
         events: AgentEventSender,
     ) -> Result<AgentSessionHandle, ProtocolError> {
@@ -65,7 +66,7 @@ impl AgentRouter {
             message: format!("no adapter registered for agentKind={:?}", agent_kind),
             diagnostic_ref: None,
         })?;
-        let handle = agent.continue_thread(thread_id, prompt, events).await?;
+        let handle = agent.continue_thread(thread_id, cwd, prompt, events).await?;
         self.sessions.lock().await.insert(handle.session_id.clone(), handle.agent_kind);
         Ok(handle)
     }

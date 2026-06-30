@@ -80,7 +80,13 @@ fn admin_round_trip(
                 // keep reading.
             }
             DaemonLine::Event(ServerEvent::Error { error, .. }) => {
-                return Err(CliError::Protocol(error.message));
+                // C5 fix: thread the daemon's structured `error.code`
+                // (e.g. `agent-not-registered`) through to the CLI
+                // envelope instead of collapsing it to "protocol".
+                return Err(CliError::Protocol {
+                    code: Some(error.code),
+                    message: error.message,
+                });
             }
             DaemonLine::Event(_) => continue,
             DaemonLine::Unknown => continue,
@@ -107,7 +113,10 @@ impl Client {
         if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
             Ok(())
         } else {
-            Err(CliError::Protocol("ping returned ok=false".into()))
+            Err(CliError::Protocol {
+                code: None,
+                message: "ping returned ok=false".into(),
+            })
         }
     }
 
@@ -116,7 +125,10 @@ impl Client {
         if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
             Ok(v)
         } else {
-            Err(CliError::Session("selfcheck returned ok=false".into()))
+            Err(CliError::Session {
+                code: None,
+                message: "selfcheck returned ok=false".into(),
+            })
         }
     }
 
@@ -126,7 +138,10 @@ impl Client {
             &ClientCommand::ProtocolSchema,
             "protocolSchema",
         )?;
-        v.get("schema").cloned().ok_or_else(|| CliError::Protocol("missing schema field".into()))
+        v.get("schema").cloned().ok_or_else(|| CliError::Protocol {
+            code: None,
+            message: "missing schema field".into(),
+        })
     }
 
     pub fn protocol_version(&mut self) -> Result<u32, CliError> {
@@ -138,7 +153,10 @@ impl Client {
         v.get("protocolVersion")
             .and_then(|x| x.as_u64())
             .map(|n| n as u32)
-            .ok_or_else(|| CliError::Protocol("missing protocolVersion field".into()))
+            .ok_or_else(|| CliError::Protocol {
+                code: None,
+                message: "missing protocolVersion field".into(),
+            })
     }
 
     pub fn agent_list(&mut self) -> Result<Vec<String>, CliError> {
@@ -146,7 +164,10 @@ impl Client {
         let arr = v
             .get("agents")
             .and_then(|a| a.as_array())
-            .ok_or_else(|| CliError::Protocol("missing agents array".into()))?;
+            .ok_or_else(|| CliError::Protocol {
+                code: None,
+                message: "missing agents array".into(),
+            })?;
         Ok(arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
     }
 
@@ -159,7 +180,10 @@ impl Client {
         let caps_val = v
             .get("capabilities")
             .cloned()
-            .ok_or_else(|| CliError::Protocol("missing capabilities field".into()))?;
+            .ok_or_else(|| CliError::Protocol {
+                code: None,
+                message: "missing capabilities field".into(),
+            })?;
         serde_json::from_value::<SessionCapabilities>(caps_val).map_err(CliError::Json)
     }
 
@@ -172,7 +196,10 @@ impl Client {
         let resp_val = v
             .get("response")
             .cloned()
-            .ok_or_else(|| CliError::Protocol("missing response field in history reply".into()))?;
+            .ok_or_else(|| CliError::Protocol {
+                code: None,
+                message: "missing response field in history reply".into(),
+            })?;
         serde_json::from_value::<HistoryResponse>(resp_val).map_err(CliError::Json)
     }
 }
@@ -237,10 +264,16 @@ pub fn session_start_cmd(start: SessionStart) -> ClientCommand {
     ClientCommand::SessionStart(start)
 }
 
-pub fn session_continue_cmd(thread_id: String, agent_kind: AgentKind, prompt: String) -> ClientCommand {
+pub fn session_continue_cmd(
+    thread_id: String,
+    agent_kind: AgentKind,
+    cwd: std::path::PathBuf,
+    prompt: String,
+) -> ClientCommand {
     ClientCommand::SessionContinue {
         thread_id: ThreadId(thread_id),
         agent_kind,
+        cwd,
         prompt,
     }
 }
@@ -301,7 +334,10 @@ mod tests {
                     }
                 }
                 DaemonLine::Event(ServerEvent::Error { error, .. }) => {
-                    return Err(CliError::Protocol(error.message));
+                    return Err(CliError::Protocol {
+                        code: Some(error.code),
+                        message: error.message,
+                    });
                 }
                 DaemonLine::Event(_) => continue,
                 DaemonLine::Unknown => continue,
@@ -390,10 +426,42 @@ mod tests {
         let cmd = session_continue_cmd(
             "tid-1".into(),
             AgentKind::ClaudeCode,
+            std::path::PathBuf::from("/tmp/work"),
             "continue this".into(),
         );
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("sessionContinue"));
         assert!(json.contains("claude_code"));
+        // C3 fix: cwd is now part of the on-wire SessionContinue payload
+        // so adapter `continue_thread` no longer falls back to
+        // `std::env::current_dir()` (which broke CC `--resume` and
+        // tool_use cwd).
+        assert!(json.contains("/tmp/work"));
+    }
+
+    /// C5 fix: when the daemon emits a `ServerEvent::Error` with a
+    /// structured `error.code` (e.g. `cc-not-installed`), the CLI
+    /// surfaces that code in the envelope instead of the literal
+    /// `"protocol"` discriminator.
+    #[test]
+    fn admin_round_trip_propagates_daemon_error_code() {
+        let raw = serde_json::json!({
+            "type": "error",
+            "error": {
+                "code": "cc-not-installed",
+                "message": "no claude binary",
+                "diagnosticRef": null,
+            }
+        })
+        .to_string();
+        let mut fake = FakeTransport::new(vec![raw]);
+        let err = admin_round_trip_fake(&mut fake, &ClientCommand::Ping, "ping").unwrap_err();
+        match err {
+            CliError::Protocol { code, message } => {
+                assert_eq!(code.as_deref(), Some("cc-not-installed"));
+                assert_eq!(message, "no claude binary");
+            }
+            other => panic!("expected CliError::Protocol, got {other:?}"),
+        }
     }
 }

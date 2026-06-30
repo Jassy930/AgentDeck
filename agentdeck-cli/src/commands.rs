@@ -32,7 +32,14 @@ pub fn handle_selfcheck(c: &mut Client, pretty: bool) -> Result<(), CliError> {
     let v = c.selfcheck()?;
     println!("{}", render(&v, pretty));
     let ok = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
-    if ok { Ok(()) } else { Err(CliError::Session("selfcheck failed".into())) }
+    if ok {
+        Ok(())
+    } else {
+        Err(CliError::Session {
+            code: None,
+            message: "selfcheck failed".into(),
+        })
+    }
 }
 
 // ── Diagnostics ───────────────────────────────────────────────────────────────
@@ -101,12 +108,16 @@ pub async fn handle_session_run(args: SessionRunArgs, profile: &str, data_dir: O
 pub async fn handle_session_continue(
     thread_id: String,
     agent: AgentKindArg,
+    cwd: std::path::PathBuf,
     prompt: String,
     profile: &str,
     data_dir: Option<&str>,
     pretty: bool,
 ) -> Result<(), CliError> {
-    let cmd = session_continue_cmd(thread_id, agent.into(), prompt);
+    // C3 fix: `cwd` now flows from CLI flag → daemon → vendor adapter,
+    // so CC `--resume` and tool_use run in the original session's
+    // directory rather than the daemon's `std::env::current_dir()`.
+    let cmd = session_continue_cmd(thread_id, agent.into(), cwd, prompt);
     let mut events = client::stream_session(cmd, profile, data_dir).await?;
     drain_events(&mut events, pretty).await
 }
@@ -121,7 +132,14 @@ async fn drain_events(
         match &ev {
             ServerEvent::TurnComplete { .. } => return Ok(()),
             ServerEvent::Error { error, .. } => {
-                return Err(CliError::Session(error.message.clone()));
+                // C5 fix: surface the daemon's structured `error.code`
+                // (e.g. `cc-not-installed`) so callers / tests can
+                // discriminate failure modes without scraping the
+                // message string.
+                return Err(CliError::Session {
+                    code: Some(error.code.clone()),
+                    message: error.message.clone(),
+                });
             }
             _ => {}
         }

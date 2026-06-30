@@ -253,11 +253,16 @@ fn e2e_cc_session_continue_to_completion() {
     let (thread_id, _) = run_cc_session("say hi briefly");
     eprintln!("captured CC thread_id={thread_id} for continue test");
 
+    // C3 fix: session continue now requires --cwd so CC `--resume`
+    // can find `~/.claude/projects/<encoded_cwd>/<id>.jsonl` and
+    // tool_use runs in the same directory as the original session.
+    let cwd = std::env::current_dir().unwrap().to_string_lossy().to_string();
     let out = Command::new(cli_bin())
         .args([
             "session", "continue",
             "--thread-id", &thread_id,
             "--agent", "claude-code",
+            "--cwd", &cwd,
             "--prompt", "ok",
         ])
         .output()
@@ -384,20 +389,30 @@ fn e2e_cc_not_installed_returns_error_code() {
     let stdout = String::from_utf8_lossy(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);
 
-    // The error output (stdout JSON envelope or stderr) must mention cc-not-installed
-    // OR a related installation error message.
-    let has_not_installed = stdout.contains("cc-not-installed")
-        || stderr.contains("cc-not-installed")
-        || stdout.contains("not found")
-        || stderr.contains("not found")
-        || stdout.contains("No such file")
-        || stderr.contains("No such file")
-        || stdout.contains("claude")
-        || stderr.contains("claude");
-    assert!(
-        has_not_installed,
-        "expected cc-not-installed error in output when claude is absent\
-         \nstdout: {stdout}\nstderr: {stderr}"
+    // C5 fix (v0.2 final review): the CLI now threads daemon's
+    // structured `error.code` through `CliError::Session { code: ... }`
+    // into the JSON envelope on stdout. Assert the strong contract:
+    //   - exit code == 5 (session failure)
+    //   - stdout envelope has `error.code == "cc-not-installed"`
+    // The exit code is the load-bearing E2E claim. The envelope code
+    // is the diagnostic claim that previously regressed silently to
+    // the literal `"session"`.
+    assert_eq!(
+        result.status.code(),
+        Some(5),
+        "expected exit code 5 (session failure), got status={}\nstdout: {stdout}\nstderr: {stderr}",
+        result.status
+    );
+
+    let envelope_line = stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with('{'))
+        .expect("expected at least one JSON envelope line on stdout");
+    let parsed: serde_json::Value = serde_json::from_str(envelope_line)
+        .unwrap_or_else(|e| panic!("envelope line is not JSON: {e}\nline: {envelope_line}"));
+    assert_eq!(
+        parsed["error"]["code"], "cc-not-installed",
+        "expected envelope error.code == 'cc-not-installed', got: {parsed}\nstdout: {stdout}\nstderr: {stderr}"
     );
     eprintln!("CC preflight failure test OK (exit={})", result.status);
 }

@@ -33,6 +33,7 @@ impl Agent for StubAgent {
     async fn continue_thread(
         &self,
         _: ThreadId,
+        _: std::path::PathBuf,
         _: String,
         _: AgentEventSender,
     ) -> Result<AgentSessionHandle, ProtocolError> {

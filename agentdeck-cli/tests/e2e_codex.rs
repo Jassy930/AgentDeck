@@ -252,12 +252,16 @@ fn e2e_codex_session_continue_to_completion() {
     let (thread_id, _) = run_codex_session("say hi");
     eprintln!("captured thread_id={thread_id} for continue test");
 
-    // Now continue that session
+    // Now continue that session. C3 fix: --cwd is now required so the
+    // adapter resumes from the same directory as the original session
+    // (avoids `std::env::current_dir()` fallback).
+    let cwd = std::env::current_dir().unwrap().to_string_lossy().to_string();
     let out = Command::new(cli_bin())
         .args([
             "session", "continue",
             "--thread-id", &thread_id,
             "--agent", "codex",
+            "--cwd", &cwd,
             "--prompt", "ok",
         ])
         .output()

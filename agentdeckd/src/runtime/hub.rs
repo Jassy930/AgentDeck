@@ -96,7 +96,16 @@ impl RuntimeHub {
                     if line.trim().is_empty() {
                         continue;
                     }
-                    self.handle_line(&line, &events_tx, &admin_tx).await;
+                    // K1 (C6 fix): never await long-running session commands
+                    // inline — that blocks the stdin loop so subsequent
+                    // Ping / SessionCancel queue behind a vendor handshake.
+                    // Long-running commands (SessionStart, SessionContinue,
+                    // History) are tokio::spawn'd; cheap admin commands
+                    // (Ping, Selfcheck, AgentList, AgentCapabilities,
+                    // ProtocolVersion, ProtocolSchema, SessionCancel,
+                    // ActionDecision, VendorControl) stay inline since
+                    // they complete near-instantly.
+                    self.handle_line(line, &events_tx, &admin_tx).await;
                 }
                 Ok(None) => break, // EOF
                 Err(e) => {
@@ -116,11 +125,11 @@ impl RuntimeHub {
 
     async fn handle_line(
         &self,
-        line: &str,
+        line: String,
         events_tx: &AgentEventSender,
         admin_tx: &mpsc::Sender<String>,
     ) {
-        let cmd: ClientCommand = match serde_json::from_str(line) {
+        let cmd: ClientCommand = match serde_json::from_str(&line) {
             Ok(c) => c,
             Err(e) => {
                 let err = ServerEvent::Error {
@@ -145,6 +154,7 @@ impl RuntimeHub {
         admin_tx: &mpsc::Sender<String>,
     ) {
         match cmd {
+            // ── Cheap / admin commands: handle inline ──────────────────
             ClientCommand::Ping => {
                 let reply = serde_json::json!({ "reply": "ping", "ok": true });
                 let _ = admin_tx.send(reply.to_string()).await;
@@ -179,50 +189,6 @@ impl RuntimeHub {
                     "protocolVersion": PROTOCOL_VERSION,
                 });
                 let _ = admin_tx.send(reply.to_string()).await;
-            }
-            ClientCommand::SessionStart(start) => {
-                match self
-                    .router
-                    .start_session(start, events_tx.clone())
-                    .await
-                {
-                    Ok(handle) => {
-                        self.sessions
-                            .lock()
-                            .await
-                            .insert(handle.session_id.clone(), handle);
-                    }
-                    Err(error) => {
-                        let _ = events_tx
-                            .send(ServerEvent::Error {
-                                session_id: None,
-                                error,
-                            })
-                            .await;
-                    }
-                }
-            }
-            ClientCommand::SessionContinue { thread_id, agent_kind, prompt } => {
-                match self
-                    .router
-                    .continue_thread(thread_id, agent_kind, prompt, events_tx.clone())
-                    .await
-                {
-                    Ok(handle) => {
-                        self.sessions
-                            .lock()
-                            .await
-                            .insert(handle.session_id.clone(), handle);
-                    }
-                    Err(error) => {
-                        let _ = events_tx
-                            .send(ServerEvent::Error {
-                                session_id: None,
-                                error,
-                            })
-                            .await;
-                    }
-                }
             }
             ClientCommand::SessionCancel { session_id } => {
                 if let Err(error) = self.router.cancel(&session_id).await {
@@ -302,6 +268,67 @@ impl RuntimeHub {
                     }
                 }
             }
+            // ── K1 (C6 fix): spawn long-running commands so the stdin
+            // loop stays responsive. Each spawned task gets its own
+            // Arc<AgentRouter> + Arc<Mutex<sessions>> clone and its own
+            // mpsc::Sender clones — all are cheap. Output ordering on
+            // the wire is preserved because the writer task is the
+            // single owner of stdout and drains events_rx / admin_rx
+            // serially.
+            ClientCommand::SessionStart(start) => {
+                let router = Arc::clone(&self.router);
+                let sessions = Arc::clone(&self.sessions);
+                let events_tx = events_tx.clone();
+                tokio::spawn(async move {
+                    match router.start_session(start, events_tx.clone()).await {
+                        Ok(handle) => {
+                            sessions
+                                .lock()
+                                .await
+                                .insert(handle.session_id.clone(), handle);
+                        }
+                        Err(error) => {
+                            let _ = events_tx
+                                .send(ServerEvent::Error {
+                                    session_id: None,
+                                    error,
+                                })
+                                .await;
+                        }
+                    }
+                });
+            }
+            ClientCommand::SessionContinue {
+                thread_id,
+                agent_kind,
+                cwd,
+                prompt,
+            } => {
+                let router = Arc::clone(&self.router);
+                let sessions = Arc::clone(&self.sessions);
+                let events_tx = events_tx.clone();
+                tokio::spawn(async move {
+                    match router
+                        .continue_thread(thread_id, agent_kind, cwd, prompt, events_tx.clone())
+                        .await
+                    {
+                        Ok(handle) => {
+                            sessions
+                                .lock()
+                                .await
+                                .insert(handle.session_id.clone(), handle);
+                        }
+                        Err(error) => {
+                            let _ = events_tx
+                                .send(ServerEvent::Error {
+                                    session_id: None,
+                                    error,
+                                })
+                                .await;
+                        }
+                    }
+                });
+            }
             ClientCommand::History(req) => {
                 // Task 4C — Phase 4 finalization: route through the
                 // router's `handle_history`, which routes by agent kind
@@ -315,28 +342,32 @@ impl RuntimeHub {
                 // Errors still flow through events_tx as
                 // `ServerEvent::Error` (consistent with every other
                 // failure path in this dispatch).
-                match self.router.handle_history(req).await {
-                    Ok(response) => {
-                        // Wrap in `{ reply: "history", response: <...> }`
-                        // so the admin-reply consumer can distinguish
-                        // history payloads from ping / selfcheck /
-                        // protocolVersion replies.
-                        let line = serde_json::json!({
-                            "reply": "history",
-                            "response": response,
-                        })
-                        .to_string();
-                        let _ = admin_tx.send(line).await;
-                    }
-                    Err(error) => {
-                        let _ = events_tx
-                            .send(ServerEvent::Error {
-                                session_id: None,
-                                error,
+                //
+                // K1 (C6 fix): spawn — Read/List can fan out across
+                // adapters and touch disk; don't block stdin.
+                let router = Arc::clone(&self.router);
+                let events_tx = events_tx.clone();
+                let admin_tx = admin_tx.clone();
+                tokio::spawn(async move {
+                    match router.handle_history(req).await {
+                        Ok(response) => {
+                            let line = serde_json::json!({
+                                "reply": "history",
+                                "response": response,
                             })
-                            .await;
+                            .to_string();
+                            let _ = admin_tx.send(line).await;
+                        }
+                        Err(error) => {
+                            let _ = events_tx
+                                .send(ServerEvent::Error {
+                                    session_id: None,
+                                    error,
+                                })
+                                .await;
+                        }
                     }
-                }
+                });
             }
         }
     }
@@ -577,6 +608,151 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    /// K1 regression (C6 fix): a slow SessionStart must NOT block
+    /// subsequent admin commands. We register a stub agent whose
+    /// `start_session` sleeps for 500 ms, send SessionStart then Ping
+    /// back-to-back, and assert the Ping reply lands on stdout long
+    /// before the slow start completes. Before C6 this would block.
+    #[tokio::test]
+    async fn ping_during_slow_session_start_is_not_blocked() {
+        use crate::agent::{Agent, AgentEventSender, AgentSessionHandle, DynAgent};
+        use agentdeck_protocol::{
+            ActionDecision, AgentKind, CodexApprovalPolicy, CodexReasoningEffort,
+            CodexSandboxMode, CodexSessionOptions, ProtocolError, SessionCapabilities,
+            SessionStart, ThreadId, VendorControlPayload, VendorSessionOptions,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Instant;
+
+        struct SlowStub {
+            started: Arc<AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl Agent for SlowStub {
+            fn kind(&self) -> AgentKind { AgentKind::Codex }
+            fn capabilities(&self) -> SessionCapabilities {
+                use agentdeck_protocol::{
+                    CodexCapabilities, VendorCapabilities,
+                };
+                SessionCapabilities {
+                    agent_kind: AgentKind::Codex,
+                    agent_version: "stub".into(),
+                    features: Default::default(),
+                    vendor: VendorCapabilities::Codex(CodexCapabilities {
+                        persistence_supported: false,
+                        sandbox_modes: vec![],
+                        reasoning_effort_levels: vec![],
+                    }),
+                }
+            }
+            async fn start_session(
+                &self,
+                _: SessionStart,
+                _: AgentEventSender,
+            ) -> Result<AgentSessionHandle, ProtocolError> {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                self.started.store(true, Ordering::SeqCst);
+                Err(ProtocolError {
+                    code: "stub".into(),
+                    message: "slow stub completed".into(),
+                    diagnostic_ref: None,
+                })
+            }
+            async fn continue_thread(
+                &self,
+                _: ThreadId,
+                _: std::path::PathBuf,
+                _: String,
+                _: AgentEventSender,
+            ) -> Result<AgentSessionHandle, ProtocolError> {
+                unimplemented!()
+            }
+            async fn submit_decision(
+                &self,
+                _: &SessionId,
+                _: ActionDecision,
+            ) -> Result<(), ProtocolError> { Ok(()) }
+            async fn submit_vendor_control(
+                &self,
+                _: &SessionId,
+                _: VendorControlPayload,
+            ) -> Result<(), ProtocolError> { Ok(()) }
+            async fn cancel(&self, _: &SessionId) -> Result<(), ProtocolError> { Ok(()) }
+        }
+
+        let started = Arc::new(AtomicBool::new(false));
+        let stub: DynAgent = Arc::new(SlowStub { started: Arc::clone(&started) });
+        let mut router = AgentRouter::new();
+        router.register(stub);
+        let hub = RuntimeHub::new(Arc::new(router));
+
+        let (mut client_to_daemon, daemon_stdin) = duplex(4096);
+        let (daemon_stdout, mut client_from_daemon) = duplex(4096);
+
+        let hub_task = tokio::spawn(hub.run(daemon_stdin, daemon_stdout));
+
+        // 1) Submit SessionStart — will take 500ms inside the stub.
+        let start = ClientCommand::SessionStart(SessionStart {
+            agent_kind: AgentKind::Codex,
+            cwd: std::path::PathBuf::from("/tmp"),
+            prompt: Some("hi".into()),
+            vendor_options: VendorSessionOptions::Codex(CodexSessionOptions {
+                approval_policy: CodexApprovalPolicy::OnRequest,
+                sandbox: CodexSandboxMode::WorkspaceWrite,
+                persist_approval: false,
+                reasoning_effort: CodexReasoningEffort::Medium,
+                mcp_overrides: vec![],
+            }),
+            runtime_options: Default::default(),
+        });
+        let line = serde_json::to_string(&start).unwrap();
+        client_to_daemon.write_all(line.as_bytes()).await.unwrap();
+        client_to_daemon.write_all(b"\n").await.unwrap();
+
+        // 2) Immediately follow with a Ping — must be answered before
+        //    the 500ms slow start finishes (K1).
+        let ping = serde_json::to_string(&ClientCommand::Ping).unwrap();
+        client_to_daemon.write_all(ping.as_bytes()).await.unwrap();
+        client_to_daemon.write_all(b"\n").await.unwrap();
+
+        // 3) Read the first line off stdout: should be the ping reply
+        //    within ~50ms, while the slow start is still pending.
+        use tokio::io::AsyncReadExt;
+        let t0 = Instant::now();
+        let mut byte = [0u8; 1];
+        let mut line_buf = Vec::new();
+        loop {
+            let n = tokio::time::timeout(
+                Duration::from_millis(250),
+                client_from_daemon.read(&mut byte),
+            )
+            .await
+            .expect("ping reply should arrive well before slow start completes")
+            .unwrap();
+            if n == 0 { break; }
+            if byte[0] == b'\n' { break; }
+            line_buf.push(byte[0]);
+        }
+        let elapsed = t0.elapsed();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&line_buf).expect("ping reply JSON");
+        assert_eq!(parsed["reply"], "ping");
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "ping reply took {elapsed:?}; stdin appears blocked by slow SessionStart"
+        );
+        assert!(
+            !started.load(Ordering::SeqCst),
+            "slow SessionStart must still be in flight when Ping returned"
+        );
+
+        // Cleanup: shut the daemon down cleanly so the test exits.
+        client_to_daemon.shutdown().await.unwrap();
+        // Best-effort wait for hub to exit; the slow stub finishes its
+        // sleep then emits an Error event, which the writer drains.
+        let _ = tokio::time::timeout(Duration::from_secs(2), hub_task).await;
     }
 
     /// Selfcheck reports protocolVersion + registered agent kinds.

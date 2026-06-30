@@ -293,8 +293,12 @@ final class DaemonClient {
         try send(.sessionStart(start))
     }
 
-    func continueThread(threadId: String, agentKind: AgentKind, prompt: String) throws {
-        try send(.sessionContinue(threadId: threadId, agentKind: agentKind, prompt: prompt))
+    /// Resume an existing thread. `cwd` is REQUIRED so the daemon
+    /// adapter can point CC `--resume` at the right per-cwd resume
+    /// file and run tool_use in the original directory (C3 fix,
+    /// v0.2 final review).
+    func continueThread(threadId: String, agentKind: AgentKind, cwd: String, prompt: String) throws {
+        try send(.sessionContinue(threadId: threadId, agentKind: agentKind, cwd: cwd, prompt: prompt))
     }
 
     func cancelSession(sessionId: String) throws {
@@ -350,7 +354,15 @@ extension DaemonClient: RuntimeTurnStarting {
         }
         do {
             if let threadId {
-                try continueThread(threadId: threadId, agentKind: agentKind, prompt: prompt)
+                // C3 fix: propagate the original cwd so CC `--resume`
+                // and tool_use run in the same directory as the
+                // original session.
+                try continueThread(
+                    threadId: threadId,
+                    agentKind: agentKind,
+                    cwd: cwd.path,
+                    prompt: prompt
+                )
             } else if let sessionStart {
                 try startSession(sessionStart)
             } else {

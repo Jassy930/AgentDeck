@@ -48,10 +48,16 @@ pub trait Agent: Send + Sync + 'static {
         events: AgentEventSender,
     ) -> Result<AgentSessionHandle, ProtocolError>;
 
-    /// Continue an existing thread with a new prompt.
+    /// Continue an existing thread with a new prompt. `cwd` MUST be the
+    /// working directory associated with the thread — vendors like
+    /// Claude Code look up resume files under
+    /// `~/.claude/projects/<encoded_cwd>/<id>.jsonl`, and tool_use runs
+    /// in this directory. The hub passes the cwd from the original
+    /// `SessionStart` (the Swift UI / CLI carries it forward).
     async fn continue_thread(
         &self,
         thread_id: ThreadId,
+        cwd: std::path::PathBuf,
         prompt: String,
         events: AgentEventSender,
     ) -> Result<AgentSessionHandle, ProtocolError>;

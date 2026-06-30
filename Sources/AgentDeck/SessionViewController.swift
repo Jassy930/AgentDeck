@@ -257,8 +257,20 @@ final class SessionViewController: NSViewController {
     }
 
     private func refreshControlBar() {
-        if let caps = model.workbench.selectedRuntime?.capabilities {
-            controlBar.bind(capabilities: caps)
+        if let caps = model.workbench.selectedRuntime?.capabilities,
+           let sid = model.workbench.selectedSessionId {
+            // C2 fix (v0.2 final review): wire vendor-control callbacks
+            // so popup changes round-trip through DaemonClient.
+            // SessionModel.submitVendorControl swallows errors after
+            // logging; daemon-side rejections still surface via the
+            // normal events stream as `ServerEvent.error`.
+            controlBar.bind(
+                capabilities: caps,
+                sessionId: sid,
+                onVendorControl: { [weak self] sessionId, payload in
+                    self?.model.submitVendorControl(sessionId: sessionId, payload: payload)
+                }
+            )
             controlBarHeight?.constant = 30
         } else {
             controlBar.clear()
@@ -284,17 +296,19 @@ final class SessionViewController: NSViewController {
     }
 
     private func handleNewSessionStart(_ start: SessionStart) {
-        // 在 v0.2 阶段，SessionModel 通过 workbench.submit 自带 sessionStart
-        // 的链路尚未暴露，这里先把 cwd 切到 dialog 选择的目录、并 submit prompt。
-        // 完整的 explicit-start (无需 prompt) 走 daemon `sessionStart` 命令在
-        // T6.10 的 dialog 提交链路里补全。当前先做最小可工作的 cwd+prompt 提交。
+        // C1 fix (v0.2 final review): forward the dialog's full
+        // `SessionStart` (including vendor_options: sandbox / approval /
+        // permission_mode / reasoning_effort / etc.) into the workbench
+        // so the daemon sees the user's choices on the first turn.
+        // Previously only `prompt` + `agentKind` propagated and the
+        // user's vendor options were silently replaced by synthesized
+        // defaults inside `DaemonClient.startTurn`.
         if let cwdMsg = model.chooseCwd(URL(fileURLWithPath: start.cwd)) {
             model.workbench.selectedRuntime?.warningMessage = cwdMsg
             return
         }
-        if let prompt = start.prompt, !prompt.isEmpty {
-            model.submit(prompt, agentKind: start.agentKind)
-        }
+        let prompt = start.prompt ?? ""
+        model.submit(prompt, agentKind: start.agentKind, sessionStart: start)
     }
 
     /// Swap EmptyStateView ↔ conversationComposite inside `contentContainer`.

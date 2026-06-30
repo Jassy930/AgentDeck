@@ -312,12 +312,26 @@ final class SessionModel {
     }
 
     func submit(_ prompt: String, agentKind: AgentKind = .codex) {
+        submit(prompt, agentKind: agentKind, sessionStart: nil)
+    }
+
+    /// Submit with a pre-built `SessionStart` (vendor options carried).
+    /// Used by NewSessionDialog so the user-chosen sandbox/approval/
+    /// permission_mode actually reach the daemon (C1 fix, v0.2 final
+    /// review). On legacy fall-through (no SessionStart) we synthesize
+    /// defaults inside `DaemonClient.startTurn`, preserving existing
+    /// behavior for input-bar submissions.
+    func submit(_ prompt: String, agentKind: AgentKind, sessionStart: SessionStart?) {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
         if workbench.selectedRuntime != nil {
             let oldCount = selectedItems.count
-            workbench.submit(trimmed)
+            if let sessionStart {
+                workbench.submit(trimmed, sessionStart: sessionStart)
+            } else {
+                workbench.submit(trimmed)
+            }
             if selectedItems.count > oldCount {
                 scrollToLatestRequest += 1
             }
@@ -331,7 +345,11 @@ final class SessionModel {
         workbench.ensureRuntime(sessionId: sessionId, agentKind: agentKind, threadId: nil, cwd: cwd)
         workbench.selectRuntime(sessionId: sessionId)
         let oldCount = selectedItems.count
-        workbench.submit(trimmed)
+        if let sessionStart {
+            workbench.submit(trimmed, sessionStart: sessionStart)
+        } else {
+            workbench.submit(trimmed)
+        }
         if selectedItems.count > oldCount {
             scrollToLatestRequest += 1
         }
@@ -521,6 +539,24 @@ final class SessionModel {
 
     func ingest(_ event: ServerEvent) {
         workbench.ingestServerEvent(event)
+    }
+
+    /// Push a typed vendor-control update for the live runtime over the
+    /// daemon socket. Used by AgentControlBar so user toggles on the
+    /// sandbox / approval / permission popups reach the daemon
+    /// mid-session (C2 fix, v0.2 final review). Errors are swallowed
+    /// here — the daemon will surface `cc-vendor-control-requires-new-turn`
+    /// (or similar) via the normal events stream if rejected.
+    func submitVendorControl(sessionId: String, payload: VendorControlPayload) {
+        guard let client else { return }
+        do {
+            try client.submitVendorControl(sessionId: sessionId, payload: payload)
+        } catch {
+            // Best-effort: log to stderr, do not interrupt the UI.
+            FileHandle.standardError.write(
+                Data("[AgentDeck] submitVendorControl failed: \(error)\n".utf8)
+            )
+        }
     }
 
     private static func milliseconds(from start: Date, to end: Date) -> Int {

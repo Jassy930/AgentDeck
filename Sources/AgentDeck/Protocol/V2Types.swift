@@ -997,7 +997,11 @@ public enum ClientCommand: Codable, Sendable {
     case ping
     case selfcheck
     case sessionStart(SessionStart)
-    case sessionContinue(threadId: String, agentKind: AgentKind, prompt: String)
+    /// `cwd` is now part of the on-wire payload (C3 fix, v0.2 final
+    /// review). The daemon adapter uses it to point CC `--resume` at
+    /// `~/.claude/projects/<encoded_cwd>/<id>.jsonl` and to run vendor
+    /// tool_use in the same directory as the original session.
+    case sessionContinue(threadId: String, agentKind: AgentKind, cwd: String, prompt: String)
     case sessionCancel(sessionId: String)
     case actionDecision(sessionId: String, decision: ActionDecision)
     case vendorControl(sessionId: String, payload: VendorControlPayload)
@@ -1008,7 +1012,7 @@ public enum ClientCommand: Codable, Sendable {
     case agentCapabilities(agentKind: AgentKind)
 
     private enum CodingKeys: String, CodingKey {
-        case command, threadId, agentKind, prompt, sessionId, decision, payload
+        case command, threadId, agentKind, cwd, prompt, sessionId, decision, payload
     }
 
     public init(from decoder: Decoder) throws {
@@ -1022,8 +1026,9 @@ public enum ClientCommand: Codable, Sendable {
         case "sessionContinue":
             let tid = try c.decode(String.self, forKey: .threadId)
             let kind = try c.decode(AgentKind.self, forKey: .agentKind)
+            let cwd = try c.decode(String.self, forKey: .cwd)
             let prompt = try c.decode(String.self, forKey: .prompt)
-            self = .sessionContinue(threadId: tid, agentKind: kind, prompt: prompt)
+            self = .sessionContinue(threadId: tid, agentKind: kind, cwd: cwd, prompt: prompt)
         case "sessionCancel":
             let sid = try c.decode(String.self, forKey: .sessionId)
             self = .sessionCancel(sessionId: sid)
@@ -1058,10 +1063,11 @@ public enum ClientCommand: Codable, Sendable {
         case .sessionStart(let s):
             try c.encode("sessionStart", forKey: .command)
             try s.encode(to: encoder)
-        case .sessionContinue(let tid, let kind, let prompt):
+        case .sessionContinue(let tid, let kind, let cwd, let prompt):
             try c.encode("sessionContinue", forKey: .command)
             try c.encode(tid, forKey: .threadId)
             try c.encode(kind, forKey: .agentKind)
+            try c.encode(cwd, forKey: .cwd)
             try c.encode(prompt, forKey: .prompt)
         case .sessionCancel(let sid):
             try c.encode("sessionCancel", forKey: .command)

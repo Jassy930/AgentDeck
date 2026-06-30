@@ -78,7 +78,18 @@ final class WorkbenchModel {
 
     func submit(_ prompt: String) {
         guard let runtime = selectedRuntime else { return }
-        submit(prompt, to: runtime)
+        submit(prompt, to: runtime, sessionStart: nil)
+    }
+
+    /// Submit with a fully-formed `SessionStart` (vendor options
+    /// included). Used by NewSessionDialog so user-chosen sandbox,
+    /// approval policy, permission mode, etc., actually reach the
+    /// daemon on the first turn (C1 fix, v0.2 final review).
+    /// When the runtime already has a `threadId`, the `sessionStart`
+    /// is unused — vendor options come from the original session.
+    func submit(_ prompt: String, sessionStart: SessionStart) {
+        guard let runtime = selectedRuntime else { return }
+        submit(prompt, to: runtime, sessionStart: sessionStart)
     }
 
     func decidePendingAction(_ decision: ActionDecisionKind, persist: Bool = false) {
@@ -103,7 +114,7 @@ final class WorkbenchModel {
         handle(action, for: runtime)
     }
 
-    private func submit(_ prompt: String, to runtime: ThreadRuntimeModel) {
+    private func submit(_ prompt: String, to runtime: ThreadRuntimeModel, sessionStart: SessionStart?) {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
@@ -123,7 +134,12 @@ final class WorkbenchModel {
             cwd: runtime.cwd,
             prompt: trimmed,
             optimisticUserItemId: optimisticUserItemId,
-            sessionStart: nil
+            // C1 fix: propagate the caller's `SessionStart` so vendor
+            // options from NewSessionDialog (sandbox / approval /
+            // permission_mode / etc.) actually reach the daemon
+            // instead of being silently replaced by synthesized
+            // defaults.
+            sessionStart: sessionStart
         ) { [weak self] event in
             self?.ingestServerEvent(event)
         }
@@ -133,7 +149,9 @@ final class WorkbenchModel {
         guard let action else { return }
         switch action {
         case .drainNextPrompt(let prompt):
-            submit(prompt, to: runtime)
+            // Drained prompts always run as continuations of an
+            // existing runtime — no new vendor options to plumb.
+            submit(prompt, to: runtime, sessionStart: nil)
         }
     }
 
