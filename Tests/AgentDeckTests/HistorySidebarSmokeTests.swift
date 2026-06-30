@@ -59,10 +59,10 @@ final class HistorySidebarSmokeTests: XCTestCase {
         let threads = [
             HistoryThreadSummary(id: "t1", name: "Alpha", preview: "a", cwd: "/tmp/proj",
                                  createdAt: 1, updatedAt: 2, status: "ready",
-                                 modelProvider: "openai", source: "cli"),
+                                 modelProvider: "openai", source: "cli", agentKind: .codex),
             HistoryThreadSummary(id: "t2", name: "Beta", preview: "b", cwd: "/tmp/proj",
                                  createdAt: 3, updatedAt: 4, status: "ready",
-                                 modelProvider: "openai", source: "cli"),
+                                 modelProvider: "openai", source: "cli", agentKind: .codex),
         ]
         let groups = HistoryProjectGroup.group(threads)
         let ds = StubDataSource(groups)

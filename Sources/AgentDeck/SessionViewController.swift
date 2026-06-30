@@ -264,6 +264,8 @@ final class SessionViewController: NSViewController {
             controlBar.clear()
             controlBarHeight?.constant = 0
         }
+        // T6C: keep status bar agent-kind icon in sync with the active runtime.
+        statusBarView.bind(agentKind: model.workbench.selectedRuntime?.capabilities?.agentKind)
     }
 
     /// T6B: present the new-session dialog and dispatch the resulting

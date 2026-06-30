@@ -5,6 +5,7 @@ import Observation
 ///
 /// Layout (left → right):
 ///   • Phase dot (8×8, color by phase — see `phaseColor`)
+///   • Agent kind icon (18×18, Task 6C)
 ///   • Status text (statusText, already includes elapsed seconds when running)
 ///   • [history badge] "Restored history" + timing if selectedHistoryThreadId != nil
 ///   • [new-session button] shown when viewing history
@@ -26,11 +27,18 @@ final class StatusBarView: NSView {
         refresh()
     }
 
+    /// No-arg init for unit tests or standalone usage (no model binding).
+    init() {
+        self.model = nil
+        super.init(frame: .zero)
+        buildSubviews()
+    }
+
     required init?(coder: NSCoder) { nil }
 
     // MARK: - Private state
 
-    private let model: SessionModel
+    private let model: SessionModel?
     private var binder: ObservationBinder?
 
     // MARK: - Subviews
@@ -40,6 +48,14 @@ final class StatusBarView: NSView {
         v.wantsLayer = true
         v.layer?.cornerRadius = 4
         return v
+    }()
+
+    /// T6C: agent kind icon shown between phase dot and status label.
+    private let agentKindIconView: NSImageView = {
+        let iv = NSImageView()
+        iv.imageScaling = .scaleProportionallyUpOrDown
+        iv.isHidden = true
+        return iv
     }()
 
     private let statusLabel: NSTextField = {
@@ -90,13 +106,13 @@ final class StatusBarView: NSView {
     // MARK: - Layout
 
     private func buildSubviews() {
-        for sub in [phaseDot, statusLabel, historyBadge, historyTimingLabel,
+        for sub in [phaseDot, agentKindIconView, statusLabel, historyBadge, historyTimingLabel,
                     newSessionButton, spacer, projectLabel] as [NSView] {
             sub.translatesAutoresizingMaskIntoConstraints = false
             addSubview(sub)
         }
 
-        // Horizontal stack: dot · statusLabel · historyBadge · timing · newSession · spacer · project
+        // Horizontal stack: dot · agentKindIcon · statusLabel · historyBadge · timing · newSession · spacer · project
         let h: CGFloat = 16
         let vPad: CGFloat = 8
         let hPad: CGFloat = 16
@@ -112,8 +128,14 @@ final class StatusBarView: NSView {
             phaseDot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: hPad),
             phaseDot.centerYAnchor.constraint(equalTo: centerYAnchor),
 
+            // Agent kind icon (T6C) — sits between dot and status label
+            agentKindIconView.widthAnchor.constraint(equalToConstant: 18),
+            agentKindIconView.heightAnchor.constraint(equalToConstant: 18),
+            agentKindIconView.leadingAnchor.constraint(equalTo: phaseDot.trailingAnchor, constant: gap),
+            agentKindIconView.centerYAnchor.constraint(equalTo: centerYAnchor),
+
             // Status label
-            statusLabel.leadingAnchor.constraint(equalTo: phaseDot.trailingAnchor, constant: gap),
+            statusLabel.leadingAnchor.constraint(equalTo: agentKindIconView.trailingAnchor, constant: gap),
             statusLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
 
             // History badge
@@ -143,18 +165,32 @@ final class StatusBarView: NSView {
         newSessionButton.action = #selector(newSessionTapped)
     }
 
+    // MARK: - T6C: Agent kind icon binding
+
+    /// Bind an agent-kind icon into the status bar. Shown when a runtime is
+    /// active; hidden when `kind == nil` (e.g., empty state, no selected runtime).
+    func bind(agentKind: AgentKind?) {
+        if let kind = agentKind, let img = AgentKindIcon.compactImage(for: kind) {
+            agentKindIconView.image = img
+            agentKindIconView.isHidden = false
+        } else {
+            agentKindIconView.isHidden = true
+        }
+    }
+
     // MARK: - Observation
 
     private func setupObservation() {
+        guard let model else { return }
         let binder = ObservationBinder()
         self.binder = binder
-        binder.bind { [weak self] in
-            guard let self else { return }
-            _ = self.model.selectedPhase
-            _ = self.model.statusText
-            _ = self.model.cwd
-            _ = self.model.selectedHistoryThreadId
-            _ = self.model.historyTimingSummary
+        binder.bind { [weak model] in
+            guard let model else { return }
+            _ = model.selectedPhase
+            _ = model.statusText
+            _ = model.cwd
+            _ = model.selectedHistoryThreadId
+            _ = model.historyTimingSummary
         } onChange: { [weak self] in
             self?.refresh()
         }
@@ -163,6 +199,7 @@ final class StatusBarView: NSView {
     // MARK: - Refresh
 
     private func refresh() {
+        guard let model else { return }
         // Phase dot color (mirrors SessionView.statusColor)
         phaseDot.layer?.backgroundColor = phaseColor(for: model.selectedPhase).cgColor
 
@@ -204,7 +241,7 @@ final class StatusBarView: NSView {
     // MARK: - Actions
 
     @objc private func newSessionTapped() {
-        model.startNewSessionFromCurrentProject()
+        model?.startNewSessionFromCurrentProject()
     }
 
     // MARK: - Deinit

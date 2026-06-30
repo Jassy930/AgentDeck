@@ -66,6 +66,13 @@ final class InputBarView: NSView {
         refreshQueuedCount()
     }
 
+    /// No-arg init for unit tests or standalone usage (no model binding).
+    init() {
+        self.model = nil
+        super.init(frame: .zero)
+        build()
+    }
+
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     private func build() {
@@ -138,6 +145,12 @@ final class InputBarView: NSView {
         queuedLabel.isHidden = count == 0
         refreshPlanModeBadge()
         updateSendEnabled()
+    }
+
+    /// T6C: programmatically set the plan-mode badge state (for testing or
+    /// external binding). Pass `true` to show the badge, `false` to hide it.
+    func applyState(planMode: Bool) {
+        planModeBadge.isHidden = !planMode
     }
 
     /// Pure decision: should the Plan Mode badge be shown for this capabilities

@@ -13,6 +13,7 @@ struct HistoryThreadSummary: Identifiable, Codable, Equatable {
     var status: String
     var modelProvider: String
     var source: String
+    var agentKind: AgentKind
 
     var displayTitle: String {
         let title = (name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -428,4 +429,30 @@ struct HistoryReplayItem: Codable, Equatable, Identifiable {
 struct HistoryThreadDetail: Codable, Equatable {
     var thread: HistoryThreadSummary
     var items: [HistoryReplayItem]
+}
+
+// MARK: - History filter (Task 6C)
+
+public enum HistoryFilterMode: String, CaseIterable {
+    case all
+    case codex
+    case claudeCode
+
+    var displayName: String {
+        switch self {
+        case .all: return "All"
+        case .codex: return "Codex"
+        case .claudeCode: return "Claude Code"
+        }
+    }
+}
+
+public enum HistoryFilter {
+    public static func apply(_ items: [HistoryListItem], filter: HistoryFilterMode) -> [HistoryListItem] {
+        switch filter {
+        case .all: return items
+        case .codex: return items.filter { $0.agentKind == .codex }
+        case .claudeCode: return items.filter { $0.agentKind == .claudeCode }
+        }
+    }
 }

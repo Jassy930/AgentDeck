@@ -194,12 +194,12 @@ final class HistoryThreadRowView: NSView {
         titleLabel.textColor = presentation.isEmphasized ? .labelColor : .secondaryLabelColor
         titleLabel.stringValue = thread.displayTitle
 
-        // Meta line: status · runtimeStatus · source · date
+        // Meta line: status · runtimeStatus · agentKind · date
         var metaParts: [String] = [thread.status]
         if let runtimeStatus = presentation.runtimeStatusLabel {
             metaParts.append(runtimeStatus)
         }
-        metaParts.append(thread.source)
+        metaParts.append(thread.agentKind == .claudeCode ? "Claude Code" : "Codex")
         metaParts.append(Self.updatedLabel(thread.updatedAt))
         metaLabel.stringValue = metaParts.joined(separator: " · ")
 
@@ -207,16 +207,15 @@ final class HistoryThreadRowView: NSView {
         let accentColor = Self.accentBarColor(presentation)
         accentBar.layer?.backgroundColor = accentColor.cgColor
 
-        // Agent icon
-        let imageCache = HistoryAgentImageCache.shared
-        if let img = imageCache.image(named: presentation.agentSourceImageName) {
+        // Agent icon — use AgentKindIcon for accurate cross-agent images
+        if let img = AgentKindIcon.image(for: thread.agentKind) {
             agentIconView.image = img
             agentIconView.contentTintColor = presentation.isEmphasized ? .controlAccentColor : .secondaryLabelColor
         } else {
             agentIconView.image = NSImage(systemSymbolName: "questionmark.circle", accessibilityDescription: nil)
             agentIconView.contentTintColor = .secondaryLabelColor
         }
-        agentIconView.toolTip = presentation.agentSourceLabel
+        agentIconView.toolTip = thread.agentKind == .claudeCode ? "Claude Code" : "Codex"
 
         // Runtime dot — size driven by Auto Layout constraints (5pt cached / 7pt unread)
         if presentation.hasRuntimeIndicator {

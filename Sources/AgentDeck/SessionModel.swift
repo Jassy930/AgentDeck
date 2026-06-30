@@ -392,7 +392,8 @@ final class SessionModel {
                         updatedAt: Int(item.lastActiveMs / 1000),
                         status: item.archived ? "archived" : "ready",
                         modelProvider: item.agentKind == .codex ? "openai" : "anthropic",
-                        source: item.agentKind == .codex ? "codex" : "claude_code"
+                        source: item.agentKind == .codex ? "codex" : "claude_code",
+                        agentKind: item.agentKind
                     )
                 }
                 setHistoryThreads(summaries)
@@ -409,7 +410,7 @@ final class SessionModel {
         openingHistoryThreadId = thread.id
         historyErrorMessage = nil
         lastHistoryOpenTiming = nil
-        let agentKind: AgentKind = thread.source.lowercased().contains("claude") ? .claudeCode : .codex
+        let agentKind: AgentKind = thread.agentKind
         let startedAt = Date()
         DispatchQueue.global(qos: .userInitiated).async { [weak self, weak client] in
             guard let client else { return }
@@ -486,7 +487,7 @@ final class SessionModel {
 
     func archiveHistoryThread(_ thread: HistoryThreadSummary) {
         guard let client, ensureDaemonStarted() else { return }
-        let agentKind: AgentKind = thread.source.lowercased().contains("claude") ? .claudeCode : .codex
+        let agentKind: AgentKind = thread.agentKind
         do {
             _ = try client.history(.archive(threadId: thread.id, agentKind: agentKind))
             if selectedHistoryThreadId == thread.id {
@@ -501,7 +502,7 @@ final class SessionModel {
     func renameHistoryThread(_ thread: HistoryThreadSummary, name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let client, ensureDaemonStarted() else { return }
-        let agentKind: AgentKind = thread.source.lowercased().contains("claude") ? .claudeCode : .codex
+        let agentKind: AgentKind = thread.agentKind
         do {
             _ = try client.history(.rename(threadId: thread.id, agentKind: agentKind, title: trimmed))
             loadHistory()
