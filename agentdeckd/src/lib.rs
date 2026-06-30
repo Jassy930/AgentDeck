@@ -7,6 +7,7 @@
 //! `claude_code/`.
 
 pub mod agent;
+pub mod claude_code;
 pub mod codex;
 pub mod diag;
 pub mod ipc;
