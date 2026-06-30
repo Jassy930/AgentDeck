@@ -7,15 +7,19 @@
 //!         或任何 CC 元数据层；history（在 Task 4B 实现）一律走 CC 原生接口
 //!         （`claude agents --json` 与 `~/.claude/projects/*.jsonl`）。
 //!
-//! Task 4A scope:
-//!   - `adapter.rs` — `ClaudeCodeAdapter`: spawn `claude` CLI + initial
-//!     `start_session` + cancel; `submit_decision` / `submit_vendor_control`
-//!     / `continue_thread` stubbed for Task 4B.
+//! Module map (Phase 4 Tasks 4A + 4B):
+//!   - `adapter.rs` — `ClaudeCodeAdapter`: spawn `claude` CLI, run the
+//!     pump, route permission responses (`submit_decision`) and reject
+//!     vendor-control mutations with structured "requires new turn"
+//!     errors (`submit_vendor_control`).
 //!   - `translate.rs` — `ClaudeCodeTranslator`: full stream-json → v2
-//!     `ServerEvent` mapping for the assistant / user / system / result /
-//!     hook line types.
-//!   - `capabilities.rs` / `auth.rs` / `history.rs` — docstring-only stubs
-//!     for Task 4B.
+//!     `ServerEvent` mapping for the assistant / user / system / result
+//!     / hook line types.
+//!   - `capabilities.rs` — real `claude --version` probe + typed
+//!     `SessionCapabilities` builder (N5 对称约束).
+//!   - `auth.rs` — `claude auth status` probe → tri+1 `AuthState`.
+//!   - `history.rs` — `.jsonl` enumeration + read + native rename /
+//!     archive (no `cc-meta/` layer; N8 守护).
 
 pub mod adapter;
 pub mod auth;

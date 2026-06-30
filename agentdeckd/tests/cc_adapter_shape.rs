@@ -7,6 +7,8 @@
 
 use agentdeckd::agent::Agent;
 use agentdeckd::claude_code::ClaudeCodeAdapter;
+use agentdeckd::claude_code::auth::{AuthState, probe_auth_status};
+use agentdeckd::claude_code::history;
 use agentdeck_protocol::*;
 
 fn cc_opts() -> ClaudeCodeSessionOptions {
@@ -34,16 +36,23 @@ fn cc_adapter_impls_agent_trait() {
 }
 
 #[test]
-fn placeholder_capabilities_advertise_cc_agent_kind() {
-    // Task 4A returns a placeholder; real probe is Task 4B. We only
-    // check the shape here so the daemon can satisfy N7.
+fn capabilities_advertise_cc_agent_kind_and_full_feature_set() {
+    // Task 4B: capabilities() returns the real builder result.
     let a = ClaudeCodeAdapter::new_for_test();
     let caps = a.capabilities();
     assert_eq!(caps.agent_kind, AgentKind::ClaudeCode);
     assert!(!caps.agent_version.is_empty());
     // Vendor block is the CC variant.
     assert!(matches!(caps.vendor, VendorCapabilities::ClaudeCode(_)));
-    // No Codex features leaked.
+    // CC-only features are present.
+    assert!(caps
+        .features
+        .contains(&CapabilityId::ClaudeCodePermissionMode));
+    assert!(caps.features.contains(&CapabilityId::ClaudeCodeHooks));
+    // Shared features symmetric with Codex (N5).
+    assert!(caps.features.contains(&CapabilityId::StreamingMessages));
+    assert!(caps.features.contains(&CapabilityId::Worktree));
+    // No Codex-only features leaked.
     assert!(!caps.features.contains(&CapabilityId::CodexSandboxMode));
 }
 
@@ -88,7 +97,7 @@ async fn submit_vendor_control_rejects_codex_payload() {
 }
 
 #[tokio::test]
-async fn submit_vendor_control_cc_returns_pending_task_4b() {
+async fn submit_vendor_control_permission_mode_requires_new_turn() {
     let a = ClaudeCodeAdapter::new_for_test();
     let sid = SessionId("phantom".into());
     let result = a
@@ -102,12 +111,36 @@ async fn submit_vendor_control_cc_returns_pending_task_4b() {
     assert!(result.is_err());
     assert_eq!(
         result.unwrap_err().code,
-        "cc-vendor-control-pending-task-4b"
+        "cc-vendor-control-requires-new-turn",
+        "Permission mode change should return structured 'requires new turn' error \
+         (CC has no in-place mutation API)"
     );
 }
 
 #[tokio::test]
-async fn submit_decision_returns_pending_task_4b() {
+async fn submit_vendor_control_output_style_not_supported() {
+    let a = ClaudeCodeAdapter::new_for_test();
+    let sid = SessionId("phantom".into());
+    let result = a
+        .submit_vendor_control(
+            &sid,
+            VendorControlPayload::ClaudeCode(ClaudeCodeVendorControl::UpdateOutputStyle {
+                name: Some("explanatory".into()),
+            }),
+        )
+        .await;
+    assert!(result.is_err());
+    assert_eq!(
+        result.unwrap_err().code,
+        "cc-vendor-control-not-supported"
+    );
+}
+
+#[tokio::test]
+async fn submit_decision_on_unknown_session_returns_session_not_found() {
+    // Without an active CC session in the adapter's map, submit_decision
+    // surfaces a structured `session-not-found` error rather than
+    // silently dropping or hanging.
     let a = ClaudeCodeAdapter::new_for_test();
     let sid = SessionId("phantom".into());
     let decision = ActionDecision {
@@ -117,10 +150,7 @@ async fn submit_decision_returns_pending_task_4b() {
     };
     let result = a.submit_decision(&sid, decision).await;
     assert!(result.is_err());
-    assert_eq!(
-        result.unwrap_err().code,
-        "cc-submit-decision-pending-task-4b"
-    );
+    assert_eq!(result.unwrap_err().code, "session-not-found");
 }
 
 #[tokio::test]
@@ -189,6 +219,49 @@ async fn real_claude_emits_started_then_capabilities() {
     a.cancel(&handle.session_id).await.expect("cancel ok");
     // Drop the receiver so any in-flight events don't block the test.
     drop(rx);
+}
+
+/// Opt-in real-claude smoke for the auth probe. Skipped when claude
+/// is missing. Always succeeds — both authenticated and not-logged-in
+/// developers can run the suite.
+#[test]
+fn real_claude_auth_status_probe_returns_known_state() {
+    if which::which("claude").is_err() {
+        println!("SKIP real_claude_auth_status_probe: `claude` not in PATH");
+        return;
+    }
+    let state = probe_auth_status();
+    assert!(
+        matches!(
+            state,
+            AuthState::LoggedInSubscription
+                | AuthState::LoggedInConsoleApiKey
+                | AuthState::NotAuthenticated
+                | AuthState::Unknown
+        ),
+        "auth state {state:?} unexpected"
+    );
+    eprintln!("real_claude_auth_status_probe: state={state:?}");
+}
+
+/// Opt-in real-claude smoke for `list_history` (jsonl enumeration).
+/// Either succeeds with N items, or returns an empty list — both are
+/// acceptable. Should never panic / hang.
+#[tokio::test]
+async fn real_claude_list_history_returns_or_empty() {
+    if which::which("claude").is_err() {
+        println!("SKIP real_claude_list_history: `claude` not in PATH");
+        return;
+    }
+    let items = history::list_history(None)
+        .await
+        .expect("list_history should not error on a working CC install");
+    eprintln!("real_claude_list_history: {} sessions found", items.len());
+    // Every returned item must be CC-kinded.
+    for it in &items {
+        assert_eq!(it.agent_kind, AgentKind::ClaudeCode);
+        assert!(!it.thread_id.0.is_empty());
+    }
 }
 
 /// Slower end-to-end smoke that waits for the translator to emit at

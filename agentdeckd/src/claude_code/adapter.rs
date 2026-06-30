@@ -2,69 +2,85 @@
 //! stream-json` child per session (turn-scoped, matching the Codex
 //! adapter shape, per spec § 5.2).
 //!
-//! Phase 4 Task 4A. This file implements the v2 `Agent` trait surface
-//! that 4A is responsible for:
+//! Phase 4 Task 4B completes the v2 `Agent` trait surface scaffolded
+//! in 4A:
 //!
-//!   - `kind()` / `capabilities()` — `capabilities` returns a
-//!     **placeholder** SessionCapabilities (empty feature set, default
-//!     vendor block, "claude pending" version) so the daemon can satisfy
-//!     N7 ("SessionCapabilities before any AgentItem") for early
-//!     end-to-end smoke. Task 4B replaces with a real probe
-//!     (`claude --version`, `claude auth status`, plugin scan).
+//!   - `capabilities()` — real probe via `claude --version` cached in
+//!     a `OnceLock`; builds a typed `SessionCapabilities` covering
+//!     every Shared CapabilityId Codex has (N5 对称约束) plus the
+//!     CC-only ids the spec § 4.4 enumerated.
 //!
-//!   - `start_session()` — spawns the CLI, emits SessionStarted +
-//!     placeholder SessionCapabilities synchronously, then pumps stdout
-//!     through `ClaudeCodeTranslator` on a background task.
+//!   - `start_session()` / `continue_thread()` — unchanged from 4A;
+//!     spawns CC, emits `SessionStarted` + `SessionCapabilities`
+//!     synchronously before any AgentItem (N7), then pumps stdout
+//!     through `ClaudeCodeTranslator` on a background task. The pump
+//!     now also records `permission_route_hint`s into the per-session
+//!     routing table BEFORE forwarding the `ActionRequest` event, so
+//!     a racing `submit_decision` cannot miss the mapping.
 //!
-//!   - `continue_thread()` — same but with `--resume <thread_id>`.
+//!   - `submit_decision()` — wire-format speculative (spec § 5.5
+//!     leaves the exact shape to live verification): writes one
+//!     `{"type":"permission_response", "tool_use_id":<id>,
+//!     "approved":<bool>}` JSON line to CC's stdin. Real-fixture
+//!     verification deferred (4A could not capture a CC permission
+//!     prompt under `bypassPermissions`; 4C records and revises if
+//!     needed).
+//!
+//!   - `submit_vendor_control()` — CC has no in-place mutation of
+//!     permission mode, output style or hooks. The adapter returns a
+//!     structured `cc-vendor-control-requires-new-turn` error for the
+//!     permission-mode case (symmetric with Codex's posture), and
+//!     `cc-vendor-control-not-supported` for the style / hook edits
+//!     (configure via `settings.json` or start-options instead).
 //!
 //!   - `cancel()` — aborts the pump and best-effort group-kills the
-//!     child subprocess tree.
-//!
-//!   - `submit_decision()` / `submit_vendor_control()` — return
-//!     structured `pending-task-4b` errors so the hub surfaces them as
-//!     diagnostics rather than silently dropping. The wire shape for
-//!     CC's permission response and runtime control needs a real fixture,
-//!     which 4B records.
+//!     child subprocess tree (unchanged from 4A).
 
 use crate::agent::{Agent, AgentEventSender, AgentSessionHandle};
 use crate::claude_code::translate::ClaudeCodeTranslator;
 use agentdeck_protocol::{
-    ActionDecision, AgentKind, ClaudeCodeCapabilities, ClaudeCodePermissionMode,
-    ClaudeCodeSessionOptions, ProtocolError, ServerEvent, SessionCapabilities, SessionId,
-    SessionStart, ThreadId, VendorCapabilities, VendorControlPayload, VendorSessionOptions,
+    ActionDecision, ActionDecisionKind, AgentKind, ClaudeCodePermissionMode,
+    ClaudeCodeSessionOptions, ClaudeCodeVendorControl, ProtocolError, ServerEvent,
+    SessionCapabilities, SessionId, SessionStart, ThreadId, VendorControlPayload,
+    VendorSessionOptions,
 };
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Mutex;
 
+/// Shared routing table for permission responses. Cloned into both
+/// the stdout pump (writer side) and `SessionEntry` (reader side
+/// when `submit_decision` arrives).
+type PermissionRoutes = Arc<Mutex<HashMap<String, String>>>;
+
 /// Per-session bag of mutable state the adapter keeps alive for
-/// `submit_decision` / `submit_vendor_control` / `cancel`. Task 4A only
-/// populates `child` + `stdin` + `pump_abort`; `permission_routes` is
-/// pre-allocated for 4B (when CC permission responses are wired).
+/// `submit_decision` / `cancel`.
 struct SessionEntry {
     child: Mutex<Child>,
-    #[allow(dead_code)] // Task 4B uses this when wiring permission responses
     stdin: Mutex<ChildStdin>,
-    /// `request_id` (= `tool_use_id` from the prompt translator) →
-    /// arbitrary route payload. Empty in 4A; Task 4B populates.
-    #[allow(dead_code)]
-    permission_routes: Mutex<HashMap<String, String>>,
+    /// `request_id` (= `tool_use_id` from the translator) → the
+    /// underlying CC `tool_use_id` we must echo back in the
+    /// permission response. Populated by the stdout pump immediately
+    /// when an `ActionRequest` is translated; consumed by
+    /// `submit_decision`.
+    permission_routes: PermissionRoutes,
     pump_abort: tokio::task::AbortHandle,
 }
 
 /// Claude Code adapter — v2 `Agent` implementation.
 pub struct ClaudeCodeAdapter {
+    cli_version: OnceLock<String>,
     sessions: Arc<Mutex<HashMap<SessionId, Arc<SessionEntry>>>>,
 }
 
 impl ClaudeCodeAdapter {
     pub fn new() -> Self {
         Self {
+            cli_version: OnceLock::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -74,23 +90,23 @@ impl ClaudeCodeAdapter {
         Self::new()
     }
 
-    /// Placeholder capabilities. Task 4B replaces with a real probe.
-    fn placeholder_capabilities() -> SessionCapabilities {
-        SessionCapabilities {
-            agent_kind: AgentKind::ClaudeCode,
-            agent_version: "claude pending".to_string(),
-            features: BTreeSet::new(),
-            vendor: VendorCapabilities::ClaudeCode(ClaudeCodeCapabilities::default()),
-        }
+    /// Build a `SessionCapabilities` payload, caching the
+    /// `claude --version` probe behind a `OnceLock` (one shell-out
+    /// per process).
+    fn capabilities_for_v2(&self) -> SessionCapabilities {
+        use crate::claude_code::capabilities::{
+            build_claude_code_capabilities, probe_claude_code_version,
+        };
+        let version = self
+            .cli_version
+            .get_or_init(probe_claude_code_version)
+            .clone();
+        build_claude_code_capabilities(version)
     }
 
     /// Build the `claude` command line from a `SessionStart`. Wraps the
     /// vendor-options destructure + flag mapping in one place so
     /// `start_session` and `continue_thread` agree on encoding.
-    ///
-    /// Returns `(Command, permission_mode)` — the permission mode is
-    /// passed downstream to the translator so every `ActionRequest`
-    /// stamps the correct value.
     fn build_command(
         start: &SessionStart,
         resume_thread_id: Option<&ThreadId>,
@@ -150,8 +166,6 @@ impl ClaudeCodeAdapter {
             cmd.arg("--name").arg(n);
         }
         if let Some(id) = resume_thread_id {
-            // Continuing — both --resume <id> AND --session-id <id>
-            // (CC uses the latter to bind a known UUID).
             cmd.arg("--resume").arg(&id.0);
         } else if let Some(id) = &opts.session_id {
             cmd.arg("--session-id").arg(id);
@@ -182,6 +196,7 @@ impl ClaudeCodeAdapter {
         let session_id = SessionId(uuid::Uuid::new_v4().to_string());
 
         // N7: SessionStarted + SessionCapabilities BEFORE any AgentItem.
+        let caps = self.capabilities_for_v2();
         let _ = events
             .send(ServerEvent::SessionStarted {
                 session_id: session_id.clone(),
@@ -193,7 +208,7 @@ impl ClaudeCodeAdapter {
             .send(ServerEvent::SessionCapabilities {
                 session_id: session_id.clone(),
                 agent_kind: AgentKind::ClaudeCode,
-                capabilities: Self::placeholder_capabilities(),
+                capabilities: caps,
             })
             .await;
 
@@ -223,8 +238,6 @@ impl ClaudeCodeAdapter {
             }))
             .unwrap_or_default();
             if stdin.write_all(line.as_bytes()).await.is_err() {
-                // child crashed before we could write — surface as
-                // structured error so caller knows.
                 let _ = events
                     .send(ServerEvent::Error {
                         session_id: Some(session_id.clone()),
@@ -240,12 +253,15 @@ impl ClaudeCodeAdapter {
             let _ = stdin.flush().await;
         }
 
-        // Stamp the resume thread id (if any) into the translator so
-        // events have it populated even before `system.subtype=init`
-        // arrives.
+        // Build the per-session shared routes up front so the pump
+        // and the entry hold the same Arc.
+        let permission_routes: PermissionRoutes =
+            Arc::new(Mutex::new(HashMap::new()));
+
         let translator_thread_id = resume_thread_id.clone();
         let pump_session = session_id.clone();
         let pump_events = events.clone();
+        let pump_routes = Arc::clone(&permission_routes);
         let pump_handle = tokio::spawn(async move {
             let mut translator =
                 ClaudeCodeTranslator::new(pump_session.clone(), permission_mode);
@@ -257,12 +273,24 @@ impl ClaudeCodeAdapter {
                 match lines.next_line().await {
                     Ok(Some(line)) => {
                         let out = translator.translate_line(&line);
+                        // Record permission routing BEFORE forwarding
+                        // the event downstream so a racing
+                        // submit_decision cannot miss the mapping.
+                        if let Some(tool_use_id) = out.permission_route_hint.clone() {
+                            // The translator stores `request_id =
+                            // tool_use_id` for the ActionRequest, so
+                            // the map key and value happen to
+                            // coincide; we still record explicitly so
+                            // a future request_id ↔ tool_use_id
+                            // divergence doesn't silently break.
+                            let mut routes = pump_routes.lock().await;
+                            routes.insert(tool_use_id.clone(), tool_use_id);
+                        }
                         for event in out.events {
                             if pump_events.send(event).await.is_err() {
                                 return;
                             }
                         }
-                        // permission_route_hint: Task 4B records.
                     }
                     Ok(None) => return, // EOF
                     Err(e) => {
@@ -286,7 +314,7 @@ impl ClaudeCodeAdapter {
         let entry = Arc::new(SessionEntry {
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
-            permission_routes: Mutex::new(HashMap::new()),
+            permission_routes,
             pump_abort: pump_abort.clone(),
         });
         self.sessions
@@ -339,7 +367,7 @@ impl Agent for ClaudeCodeAdapter {
     }
 
     fn capabilities(&self) -> SessionCapabilities {
-        Self::placeholder_capabilities()
+        self.capabilities_for_v2()
     }
 
     async fn start_session(
@@ -347,8 +375,6 @@ impl Agent for ClaudeCodeAdapter {
         start: SessionStart,
         events: AgentEventSender,
     ) -> Result<AgentSessionHandle, ProtocolError> {
-        // Validate vendor options up front so we never spawn `claude`
-        // with a wrong-vendor config. Mirrors CodexAdapter check.
         if !matches!(start.vendor_options, VendorSessionOptions::ClaudeCode(_)) {
             return Err(ProtocolError {
                 code: "wrong-vendor".into(),
@@ -366,11 +392,10 @@ impl Agent for ClaudeCodeAdapter {
         events: AgentEventSender,
     ) -> Result<AgentSessionHandle, ProtocolError> {
         // continue_thread on the Agent trait doesn't carry vendor
-        // options — Task 4B + Phase 4 hub plumbing will look up the
-        // saved permission_mode for the resumed thread. For 4A we
+        // options — Phase 4 hub plumbing will look up the saved
+        // permission_mode for the resumed thread. For v0.2 we
         // default to BypassPermissions so the resumed turn flows
-        // end-to-end without prompting (matching v0.2 spec § 5.5
-        // "approval double track" interim posture).
+        // end-to-end without prompting (spec § 5.5 interim posture).
         let opts = ClaudeCodeSessionOptions {
             permission_mode: ClaudeCodePermissionMode::BypassPermissions,
             model: None,
@@ -399,17 +424,63 @@ impl Agent for ClaudeCodeAdapter {
 
     async fn submit_decision(
         &self,
-        _session_id: &SessionId,
-        _decision: ActionDecision,
+        session_id: &SessionId,
+        decision: ActionDecision,
     ) -> Result<(), ProtocolError> {
-        Err(ProtocolError {
-            code: "cc-submit-decision-pending-task-4b".into(),
-            message: "Claude Code permission-response wire format is captured \
-                      by Task 4B (needs a real `--permission-mode default` \
-                      fixture); v0.2 spec § 5.5"
-                .into(),
-            diagnostic_ref: None,
-        })
+        let entry = {
+            let map = self.sessions.lock().await;
+            map.get(session_id).cloned().ok_or_else(|| ProtocolError {
+                code: "session-not-found".into(),
+                message: format!("submit_decision: session {:?} unknown", session_id),
+                diagnostic_ref: None,
+            })?
+        };
+        let tool_use_id = {
+            let routes = entry.permission_routes.lock().await;
+            routes
+                .get(&decision.request_id)
+                .cloned()
+                .ok_or_else(|| ProtocolError {
+                    code: "cc-decision-no-route".into(),
+                    message: format!(
+                        "no pending permission for request_id {}",
+                        decision.request_id
+                    ),
+                    diagnostic_ref: None,
+                })?
+        };
+        let approved = matches!(decision.decision, ActionDecisionKind::Approve);
+        // Speculative wire shape — spec § 5.5 leaves this to live
+        // verification. A Task 4C recorded fixture from
+        // `--permission-mode default` will revise field names if
+        // necessary. We pick `permission_response` / `tool_use_id` /
+        // `approved` (snake_case) to match CC's existing stream-json
+        // conventions (`tool_use`, `tool_result`, `session_id`).
+        let line = serde_json::to_string(&serde_json::json!({
+            "type": "permission_response",
+            "tool_use_id": tool_use_id,
+            "approved": approved,
+        }))
+        .unwrap_or_default();
+        let mut stdin = entry.stdin.lock().await;
+        stdin
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| ProtocolError {
+                code: "cc-decision-write".into(),
+                message: format!("write permission_response to claude stdin: {e}"),
+                diagnostic_ref: None,
+            })?;
+        let _ = stdin.write_all(b"\n").await;
+        let _ = stdin.flush().await;
+        // Drop the route — CC won't ask the same permission again
+        // under the same tool_use_id.
+        entry
+            .permission_routes
+            .lock()
+            .await
+            .remove(&decision.request_id);
+        Ok(())
     }
 
     async fn submit_vendor_control(
@@ -417,18 +488,32 @@ impl Agent for ClaudeCodeAdapter {
         _session_id: &SessionId,
         payload: VendorControlPayload,
     ) -> Result<(), ProtocolError> {
-        match payload {
-            VendorControlPayload::ClaudeCode(_) => Err(ProtocolError {
-                code: "cc-vendor-control-pending-task-4b".into(),
-                message: "Claude Code vendor controls (permission mode, \
-                          output style, hook add/remove) are implemented in \
-                          Task 4B / Phase 4 hardening"
+        let ctrl = match payload {
+            VendorControlPayload::ClaudeCode(c) => c,
+            VendorControlPayload::Codex(_) => {
+                return Err(ProtocolError {
+                    code: "wrong-vendor".into(),
+                    message: "ClaudeCodeAdapter received non-ClaudeCode vendor control".into(),
+                    diagnostic_ref: None,
+                });
+            }
+        };
+        match ctrl {
+            ClaudeCodeVendorControl::UpdatePermissionMode(_) => Err(ProtocolError {
+                code: "cc-vendor-control-requires-new-turn".into(),
+                message: "Claude Code permission mode change requires starting a \
+                          new turn with the desired --permission-mode value"
                     .into(),
                 diagnostic_ref: None,
             }),
-            VendorControlPayload::Codex(_) => Err(ProtocolError {
-                code: "wrong-vendor".into(),
-                message: "ClaudeCodeAdapter received non-ClaudeCode vendor control".into(),
+            ClaudeCodeVendorControl::UpdateOutputStyle { .. }
+            | ClaudeCodeVendorControl::AddHook(_)
+            | ClaudeCodeVendorControl::RemoveHook { .. } => Err(ProtocolError {
+                code: "cc-vendor-control-not-supported".into(),
+                message: "Output style / hook editing via vendor control not \
+                          supported in v0.2; configure via ~/.claude/settings.json \
+                          or start-options"
+                    .into(),
                 diagnostic_ref: None,
             }),
         }
@@ -470,10 +555,6 @@ fn permission_mode_to_cli(m: ClaudeCodePermissionMode) -> &'static str {
 }
 
 // ── libc binding for group-kill (Unix only) ─────────────────────────────────
-//
-// Mirrors `codex::adapter` so the two adapters stay symmetric without
-// taking a dependency on the `libc` crate. Negative pid = "every process
-// in the group whose pgid == pid".
 #[cfg(unix)]
 const SIGKILL: i32 = 9;
 #[cfg(unix)]
@@ -482,9 +563,8 @@ unsafe extern "C" {
     fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
-// Path-import sentinel — silences an unused-import lint when the
-// host platform is not Unix (the cwd PathBuf import is needed for both
-// branches, but the lints differ).
+// Path-import sentinel — silences an unused-import lint when the host
+// platform is not Unix.
 #[allow(dead_code)]
 fn _path_import_marker(_p: &Path) {}
 
@@ -494,16 +574,16 @@ mod tests {
 
     #[test]
     fn permission_mode_cli_strings_cover_all_six_variants() {
-        // Hard-coded list so a future protocol addition forces a
-        // compiler error here (match exhaustiveness above) AND a test
-        // signal (this assertion).
         let modes = [
             (ClaudeCodePermissionMode::Default, "default"),
             (ClaudeCodePermissionMode::AcceptEdits, "acceptEdits"),
             (ClaudeCodePermissionMode::Plan, "plan"),
             (ClaudeCodePermissionMode::Auto, "auto"),
             (ClaudeCodePermissionMode::DontAsk, "dontAsk"),
-            (ClaudeCodePermissionMode::BypassPermissions, "bypassPermissions"),
+            (
+                ClaudeCodePermissionMode::BypassPermissions,
+                "bypassPermissions",
+            ),
         ];
         for (m, expected) in modes {
             assert_eq!(permission_mode_to_cli(m), expected);

@@ -1,8 +1,933 @@
-//! Claude Code history layer — `claude agents --json` + direct read of
-//! `~/.claude/projects/<encoded_cwd>/<id>.jsonl`.
+//! Claude Code cross-agent history layer (N8 守护：CC 原生接口为事实唯一来源).
 //!
-//! Populated in Task 4B. Per N8, this module is the only allowed read path
-//! for CC history; it must NEVER create or maintain an AgentDeck-side
-//! metadata layer (no `cc-meta/` directory, no rename/archive sidecar).
-//! Rename / archive operations shell out to CC's native commands
-//! (`claude --name`, `claude rm`).
+//! Phase 4 Task 4B. **No AgentDeck-side metadata layer** — list /
+//! read / archive / rename all go through CC's native artefacts
+//! (`~/.claude/projects/<encoded_cwd>/*.jsonl`, `claude rm`,
+//! `claude --resume --name`). No `cc-meta/` directory exists; this
+//! file does not create one.
+//!
+//! ## Wire-shape findings vs spec § 5.6
+//!
+//! The spec assumed `claude agents --json` was the catalogue of "all
+//! CC sessions for a cwd"; reality is that it's the **background /
+//! interactive agent view** (only sessions tracked by `agents start`
+//! or currently-running interactive REPLs). The full session
+//! catalogue (which the user actually needs in a cross-agent history
+//! sidebar) lives in:
+//!
+//!   `~/.claude/projects/<encoded_cwd>/<session_uuid>.jsonl`
+//!
+//! where `<encoded_cwd>` is `/`→`-` (and `.`→`-`) with leading
+//! separators preserved by the same substitution (so
+//! `/Users/jassy/foo` → `-Users-jassy-foo`).
+//!
+//! `claude rm <id>` is **background-agent-only**. For regular `--print`
+//! sessions there is no native "archive" command — we fall back to
+//! a structured error so the UI tells the user to delete the jsonl
+//! file manually (and so we don't silently lose state).
+//!
+//! Rename: `claude --print --resume <id> -n <name>
+//! --output-format stream-json --input-format stream-json < /dev/null`
+//! writes a `{"type":"custom-title", "customTitle":"<name>", ...}`
+//! line into the jsonl tail; subsequent list scans pick it up as
+//! `HistoryListItem::title`. Verified live against `claude 2.1.191`.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use agentdeck_protocol::{
+    AgentItem, AgentItemMeta, AgentKind, DiffFile, DiffStatus, HistoryListItem,
+    HistoryReadResponse, HistoryTurn, ProtocolError, ShellStatus, ThreadId,
+};
+use serde::Deserialize;
+use serde_json::Value;
+
+// ── Path encoding (CC convention) ───────────────────────────────────────────
+
+/// Encode a cwd into CC's project-directory name (replace `/` with
+/// `-`, also `.`). Round-trip-tested below.
+pub fn encode_cwd(cwd: &Path) -> String {
+    let s = cwd.to_string_lossy();
+    s.replace('/', "-").replace('.', "-")
+}
+
+/// Decode a CC project-directory name back into an absolute path.
+/// Best-effort — CC drops the `/` vs `-` distinction, so any `-` in
+/// the original cwd becomes ambiguous. We re-build the most plausible
+/// absolute path by replacing every `-` with `/`.
+pub fn decode_cwd(dirname: &str) -> PathBuf {
+    let s = dirname.replace('-', "/");
+    PathBuf::from(s)
+}
+
+/// `~/.claude/projects/` resolved against `$HOME`. Returns `None` only
+/// when `$HOME` is unset (test-time isolation).
+fn claude_projects_root() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".claude").join("projects"))
+}
+
+// ── claude agents --json parser (best-effort live-agent enrichment) ─────────
+
+/// Subset of fields `claude agents --json` returns. Real shape includes
+/// many more (sessionId, kind, status, state, pid, …). We keep only
+/// the fields the v0.2 sidebar needs, all optional, so a future CC
+/// shape change lands soft.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct AgentsJsonRow {
+    session_id: Option<String>,
+    cwd: Option<String>,
+    name: Option<String>,
+    /// epoch millis
+    started_at: Option<u64>,
+    kind: Option<String>,
+    state: Option<String>,
+    status: Option<String>,
+}
+
+impl Default for AgentsJsonRow {
+    fn default() -> Self {
+        Self {
+            session_id: None,
+            cwd: None,
+            name: None,
+            started_at: None,
+            kind: None,
+            state: None,
+            status: None,
+        }
+    }
+}
+
+/// Parse a `claude agents --json` payload. Tolerant: each row's
+/// fields are all optional, and rows without a `session_id` are
+/// dropped (they can't be addressed in the History namespace anyway).
+pub fn parse_agents_json_array(raw: &str) -> Result<Vec<HistoryListItem>, ProtocolError> {
+    // CC's serializer uses camelCase, but we accept either by setting
+    // serde's default. (#[serde(default)] keeps unknown fields out of
+    // the way.)
+    let rows: Vec<serde_json::Value> = serde_json::from_str(raw.trim()).map_err(|e| {
+        ProtocolError {
+            code: "cc-history-parse".into(),
+            message: format!("claude agents --json parse failed: {e}"),
+            diagnostic_ref: None,
+        }
+    })?;
+    let mut out = Vec::with_capacity(rows.len());
+    for v in rows {
+        // Manual extraction: CC uses both camelCase and snake_case in
+        // different versions; pulling fields by name in either casing
+        // is more robust than two struct variants.
+        let row = AgentsJsonRow {
+            session_id: v
+                .get("sessionId")
+                .or_else(|| v.get("session_id"))
+                .and_then(Value::as_str)
+                .map(String::from),
+            cwd: v.get("cwd").and_then(Value::as_str).map(String::from),
+            name: v.get("name").and_then(Value::as_str).map(String::from),
+            started_at: v
+                .get("startedAt")
+                .or_else(|| v.get("started_at"))
+                .and_then(Value::as_u64),
+            kind: v.get("kind").and_then(Value::as_str).map(String::from),
+            state: v.get("state").and_then(Value::as_str).map(String::from),
+            status: v.get("status").and_then(Value::as_str).map(String::from),
+        };
+        let Some(session_id) = row.session_id else {
+            continue;
+        };
+        let cwd = row.cwd.map(PathBuf::from).unwrap_or_else(PathBuf::new);
+        // CC `agents` `state ∈ {stopped, failed, done, blocked}` are
+        // "no longer live"; we surface those as `archived=false` (the
+        // catalogue still owns them) so the UI sidebar shows them
+        // until the user explicitly removes via `claude rm`.
+        let _ = (row.kind, row.state, row.status); // intentionally unused fields kept for future filters
+        out.push(HistoryListItem {
+            thread_id: ThreadId(session_id),
+            agent_kind: AgentKind::ClaudeCode,
+            title: row.name,
+            cwd,
+            last_active_ms: row.started_at.unwrap_or(0),
+            archived: false,
+        });
+    }
+    Ok(out)
+}
+
+// ── .jsonl-based catalogue (the actual source of all sessions) ──────────────
+
+/// Enumerate every `*.jsonl` under `~/.claude/projects/<encoded_cwd>/`
+/// (or every project dir when `cwd_filter` is `None`) and return one
+/// `HistoryListItem` per file.
+///
+/// Title resolution: scan the jsonl for the latest
+/// `{"type":"custom-title", "customTitle":"<x>"}` line (set by
+/// `rename`); fall back to first 80 chars of the first `user`
+/// message content; fall back to `None`.
+pub fn list_history_from_jsonl(
+    cwd_filter: Option<&Path>,
+) -> Result<Vec<HistoryListItem>, ProtocolError> {
+    let root = match claude_projects_root() {
+        Some(r) => r,
+        None => return Ok(vec![]),
+    };
+    let mut items = Vec::new();
+    let dirs: Vec<PathBuf> = if let Some(cwd) = cwd_filter {
+        let p = root.join(encode_cwd(cwd));
+        if p.is_dir() { vec![p] } else { vec![] }
+    } else {
+        match std::fs::read_dir(&root) {
+            Ok(rd) => rd
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect(),
+            // Missing projects dir = no history. Not an error.
+            Err(_) => vec![],
+        }
+    };
+    for dir in dirs {
+        let Some(dirname) = dir.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let cwd = decode_cwd(dirname);
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            // session id is the bare uuid; sanity-check shape (length
+            // & dashes) so transient files don't pollute the list.
+            if stem.len() < 8 || !stem.contains('-') {
+                continue;
+            }
+            let last_active_ms = file_mtime_ms(&path);
+            let title = scan_title(&path);
+            items.push(HistoryListItem {
+                thread_id: ThreadId(stem.to_string()),
+                agent_kind: AgentKind::ClaudeCode,
+                title,
+                cwd: cwd.clone(),
+                last_active_ms,
+                archived: false,
+            });
+        }
+    }
+    // Newest first — what the sidebar wants by default.
+    items.sort_by_key(|i| std::cmp::Reverse(i.last_active_ms));
+    Ok(items)
+}
+
+fn file_mtime_ms(p: &Path) -> u64 {
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Scan a jsonl for the last `custom-title` line (CC's rename
+/// artefact) and, failing that, the first user message excerpt.
+fn scan_title(path: &Path) -> Option<String> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return None;
+    };
+    let mut custom: Option<String> = None;
+    let mut first_user: Option<String> = None;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let v: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
+        match kind {
+            "custom-title" => {
+                if let Some(t) = v
+                    .get("customTitle")
+                    .or_else(|| v.get("custom_title"))
+                    .and_then(Value::as_str)
+                {
+                    // Last one wins.
+                    custom = Some(t.to_string());
+                }
+            }
+            "agent-name" if custom.is_none() => {
+                if let Some(t) = v
+                    .get("agentName")
+                    .or_else(|| v.get("agent_name"))
+                    .and_then(Value::as_str)
+                {
+                    custom = Some(t.to_string());
+                }
+            }
+            "user" if first_user.is_none() => {
+                if let Some(s) = v
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(Value::as_str)
+                {
+                    let snippet: String = s.chars().take(80).collect();
+                    first_user = Some(snippet);
+                }
+            }
+            _ => {}
+        }
+    }
+    custom.or(first_user)
+}
+
+/// List history (async wrapper). Spawning is sync-blocking on the
+/// filesystem so we run inside `spawn_blocking` to keep tokio runtime
+/// responsive even on slow disks.
+pub async fn list_history(
+    cwd_filter: Option<&Path>,
+) -> Result<Vec<HistoryListItem>, ProtocolError> {
+    let cwd_owned = cwd_filter.map(PathBuf::from);
+    tokio::task::spawn_blocking(move || list_history_from_jsonl(cwd_owned.as_deref()))
+        .await
+        .map_err(|e| ProtocolError {
+            code: "cc-history-task-join".into(),
+            message: format!("history task panicked: {e}"),
+            diagnostic_ref: None,
+        })?
+}
+
+// ── jsonl → HistoryReadResponse ─────────────────────────────────────────────
+
+/// Parse one session's jsonl content into a `HistoryReadResponse`.
+///
+/// Grouping rule: every `type=user` line opens a new `HistoryTurn`;
+/// assistant content blocks and tool_result blocks (echoed on `user`
+/// lines that carry a `tool_result`) accumulate into the open turn.
+pub fn parse_session_jsonl(
+    content: &str,
+    thread_id: ThreadId,
+) -> Result<HistoryReadResponse, ProtocolError> {
+    let mut turns: Vec<HistoryTurn> = Vec::new();
+    let mut current: Vec<AgentItem> = Vec::new();
+    let mut in_flight: HashMap<String, (String, Value)> = HashMap::new();
+
+    let flush = |current: &mut Vec<AgentItem>, turns: &mut Vec<HistoryTurn>| {
+        if !current.is_empty() {
+            turns.push(HistoryTurn {
+                items: std::mem::take(current),
+            });
+        }
+    };
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let v: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let line_kind = v.get("type").and_then(Value::as_str).unwrap_or("");
+        match line_kind {
+            "user" => {
+                // Two sub-shapes:
+                //   1) plain user prompt: message.content is a string
+                //      → open a new turn with UserMessage
+                //   2) tool_result echo: message.content is an array
+                //      with `type:"tool_result"` blocks → fold into
+                //      the current turn (don't open a new one)
+                let content_val = v.get("message").and_then(|m| m.get("content"));
+                if let Some(text) = content_val.and_then(Value::as_str) {
+                    // New turn boundary.
+                    flush(&mut current, &mut turns);
+                    current.push(AgentItem::UserMessage {
+                        text: text.to_string(),
+                        meta: AgentItemMeta::default(),
+                    });
+                } else if let Some(arr) = content_val.and_then(Value::as_array) {
+                    for block in arr {
+                        if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+                            let id = block
+                                .get("tool_use_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            let is_error = block
+                                .get("is_error")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
+                            let text = extract_tool_result_text(block);
+                            if let Some((name, input)) = in_flight.remove(id) {
+                                current.push(tool_result_to_agent_item(&name, &input, is_error, &text));
+                            } else {
+                                current.push(AgentItem::Raw {
+                                    raw_kind: "user.tool_result_orphan".into(),
+                                    raw_payload: serde_json::to_string(block).unwrap_or_default(),
+                                    meta: AgentItemMeta::default(),
+                                });
+                            }
+                        } else if block.get("type").and_then(Value::as_str) == Some("text") {
+                            // Plain user prompt that arrived as a block array.
+                            if let Some(t) = block.get("text").and_then(Value::as_str) {
+                                if !t.is_empty() {
+                                    flush(&mut current, &mut turns);
+                                    current.push(AgentItem::UserMessage {
+                                        text: t.to_string(),
+                                        meta: AgentItemMeta::default(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "assistant" => {
+                let blocks = v
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                for block in &blocks {
+                    let bk = block.get("type").and_then(Value::as_str).unwrap_or("");
+                    match bk {
+                        "text" => {
+                            if let Some(t) = block.get("text").and_then(Value::as_str) {
+                                if !t.is_empty() {
+                                    current.push(AgentItem::AssistantMessage {
+                                        text: t.to_string(),
+                                        meta: AgentItemMeta::default(),
+                                    });
+                                }
+                            }
+                        }
+                        "thinking" => {
+                            if let Some(t) = block
+                                .get("thinking")
+                                .or_else(|| block.get("text"))
+                                .and_then(Value::as_str)
+                            {
+                                if !t.is_empty() {
+                                    current.push(AgentItem::Reasoning {
+                                        text: t.to_string(),
+                                        meta: AgentItemMeta::default(),
+                                    });
+                                }
+                            }
+                        }
+                        "tool_use" => {
+                            if let (Some(id), Some(name)) = (
+                                block.get("id").and_then(Value::as_str),
+                                block.get("name").and_then(Value::as_str),
+                            ) {
+                                let input = block.get("input").cloned().unwrap_or(Value::Null);
+                                in_flight.insert(id.to_string(), (name.to_string(), input.clone()));
+                                current.push(tool_use_to_agent_item(name, &input));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {
+                // attachments, hook events, mode-changes, etc. — not
+                // surfaced in the v0.2 history reader.
+            }
+        }
+    }
+    flush(&mut current, &mut turns);
+
+    Ok(HistoryReadResponse {
+        thread_id,
+        agent_kind: AgentKind::ClaudeCode,
+        turns,
+    })
+}
+
+/// Map a `tool_use` block onto an `AgentItem` (Shell / Diff /
+/// ToolCall depending on the tool name). Mirrors translator logic but
+/// without mutable state.
+fn tool_use_to_agent_item(name: &str, input: &Value) -> AgentItem {
+    match name {
+        "Bash" => {
+            let command = input
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            AgentItem::Shell {
+                command,
+                status: ShellStatus::Running,
+                exit_code: None,
+                duration_ms: None,
+                meta: AgentItemMeta::default(),
+            }
+        }
+        "Edit" | "Write" | "MultiEdit" => AgentItem::Diff {
+            files: diff_files_from_tool_use(name, input),
+            meta: AgentItemMeta::default(),
+        },
+        _ => AgentItem::ToolCall {
+            name: name.to_string(),
+            args: input.clone(),
+            result: None,
+            meta: AgentItemMeta::default(),
+        },
+    }
+}
+
+/// Build a finalized AgentItem from a tool_result given the matching
+/// original tool_use's name + input.
+fn tool_result_to_agent_item(
+    name: &str,
+    input: &Value,
+    is_error: bool,
+    result_text: &str,
+) -> AgentItem {
+    match name {
+        "Bash" => {
+            let command = input
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            AgentItem::Shell {
+                command,
+                status: if is_error {
+                    ShellStatus::Failed
+                } else {
+                    ShellStatus::Completed
+                },
+                exit_code: Some(if is_error { 1 } else { 0 }),
+                duration_ms: None,
+                meta: AgentItemMeta::default(),
+            }
+        }
+        "Edit" | "Write" | "MultiEdit" => AgentItem::Diff {
+            files: diff_files_from_tool_use(name, input),
+            meta: AgentItemMeta::default(),
+        },
+        _ => AgentItem::ToolCall {
+            name: name.to_string(),
+            args: input.clone(),
+            result: Some(serde_json::json!(result_text)),
+            meta: AgentItemMeta::default(),
+        },
+    }
+}
+
+fn diff_files_from_tool_use(tool_name: &str, input: &Value) -> Vec<DiffFile> {
+    match tool_name {
+        "Write" => {
+            let path = input
+                .get("file_path")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let content = input.get("content").and_then(Value::as_str).unwrap_or("");
+            vec![DiffFile {
+                path: PathBuf::from(path),
+                status: DiffStatus::Added,
+                patch: Some(content.to_string()),
+            }]
+        }
+        "Edit" => {
+            let path = input
+                .get("file_path")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let old = input.get("old_string").and_then(Value::as_str).unwrap_or("");
+            let new = input.get("new_string").and_then(Value::as_str).unwrap_or("");
+            vec![DiffFile {
+                path: PathBuf::from(path),
+                status: DiffStatus::Modified,
+                patch: Some(synth_patch(old, new)),
+            }]
+        }
+        "MultiEdit" => {
+            let path = input
+                .get("file_path")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let edits = input
+                .get("edits")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut patch = String::new();
+            for e in &edits {
+                let old = e.get("old_string").and_then(Value::as_str).unwrap_or("");
+                let new = e.get("new_string").and_then(Value::as_str).unwrap_or("");
+                patch.push_str(&synth_patch(old, new));
+                patch.push('\n');
+            }
+            vec![DiffFile {
+                path: PathBuf::from(path),
+                status: DiffStatus::Modified,
+                patch: Some(patch),
+            }]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn synth_patch(old: &str, new: &str) -> String {
+    let mut out = String::new();
+    for line in old.lines() {
+        out.push('-');
+        out.push_str(line);
+        out.push('\n');
+    }
+    for line in new.lines() {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn extract_tool_result_text(block: &Value) -> String {
+    let c = block.get("content");
+    if let Some(s) = c.and_then(Value::as_str) {
+        return s.to_string();
+    }
+    if let Some(arr) = c.and_then(Value::as_array) {
+        return arr
+            .iter()
+            .filter_map(|el| {
+                if el.get("type").and_then(Value::as_str) == Some("text") {
+                    el.get("text").and_then(Value::as_str)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    String::new()
+}
+
+// ── Public async API ────────────────────────────────────────────────────────
+
+/// Read a session's transcript. Looks up the jsonl file by scanning
+/// all project dirs for `<thread_id>.jsonl` (the cwd is encoded into
+/// the dir name and is not knowable up front for read requests).
+pub async fn read_history(thread_id: &ThreadId) -> Result<HistoryReadResponse, ProtocolError> {
+    let tid = thread_id.clone();
+    tokio::task::spawn_blocking(move || -> Result<HistoryReadResponse, ProtocolError> {
+        let root = claude_projects_root().ok_or_else(|| ProtocolError {
+            code: "cc-history-no-home".into(),
+            message: "$HOME unset; cannot resolve ~/.claude/projects".into(),
+            diagnostic_ref: None,
+        })?;
+        let rd = std::fs::read_dir(&root).map_err(|e| ProtocolError {
+            code: "cc-history-projects-read".into(),
+            message: format!("read {}: {e}", root.display()),
+            diagnostic_ref: None,
+        })?;
+        for entry in rd.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let candidate = dir.join(format!("{}.jsonl", tid.0));
+            if candidate.is_file() {
+                let content = std::fs::read_to_string(&candidate).map_err(|e| ProtocolError {
+                    code: "cc-history-read".into(),
+                    message: format!("read {}: {e}", candidate.display()),
+                    diagnostic_ref: None,
+                })?;
+                return parse_session_jsonl(&content, tid.clone());
+            }
+        }
+        Err(ProtocolError {
+            code: "cc-history-not-found".into(),
+            message: format!("session {} not found in ~/.claude/projects", tid.0),
+            diagnostic_ref: None,
+        })
+    })
+    .await
+    .map_err(|e| ProtocolError {
+        code: "cc-history-task-join".into(),
+        message: format!("read task panicked: {e}"),
+        diagnostic_ref: None,
+    })?
+}
+
+/// Archive a session. CC's `claude rm <id>` only handles background
+/// agents — for regular `--print` sessions there is no native archive,
+/// so we **invoke `claude rm` best-effort** and propagate its exit
+/// status as a structured error if it fails. The hub layer decides
+/// whether to fall back to a UI-side "hidden" flag (out of N8 scope —
+/// not allowed).
+pub async fn archive(thread_id: &ThreadId) -> Result<(), ProtocolError> {
+    run_claude(&["rm", &thread_id.0], "cc-archive").await
+}
+
+/// Rename a session via `claude --print --resume <id> -n <name>
+/// --output-format stream-json --input-format stream-json` with stdin
+/// closed (empty input). Verified live (CC 2.1.191): exits cleanly,
+/// writes `{"type":"custom-title","customTitle":"<name>"}` to the
+/// jsonl tail. Subsequent `list_history` scans pick the title up.
+pub async fn rename(thread_id: &ThreadId, title: &str) -> Result<(), ProtocolError> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+    let mut cmd = Command::new("claude");
+    cmd.arg("--print")
+        .arg("--resume")
+        .arg(&thread_id.0)
+        .arg("-n")
+        .arg(title)
+        .arg("--output-format")
+        .arg("stream-json")
+        .arg("--input-format")
+        .arg("stream-json")
+        .arg("--verbose")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| ProtocolError {
+        code: "cc-rename-spawn".into(),
+        message: format!("spawn claude --resume --name: {e}"),
+        diagnostic_ref: None,
+    })?;
+    // Close stdin so CC exits immediately after applying the name
+    // (verified: an open stdin keeps the session interactive).
+    if let Some(stdin) = child.stdin.take() {
+        let mut s = stdin;
+        let _ = s.shutdown().await;
+    }
+    let out = child.wait_with_output().await.map_err(|e| ProtocolError {
+        code: "cc-rename-wait".into(),
+        message: format!("wait claude --resume --name: {e}"),
+        diagnostic_ref: None,
+    })?;
+    if !out.status.success() {
+        return Err(ProtocolError {
+            code: "cc-rename-status".into(),
+            message: format!(
+                "claude --resume --name exited with {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            diagnostic_ref: None,
+        });
+    }
+    Ok(())
+}
+
+/// Generic wrapper for fire-and-forget `claude <args>` invocations
+/// (used by `archive`). Captures stderr into structured errors.
+async fn run_claude(args: &[&str], code_prefix: &str) -> Result<(), ProtocolError> {
+    use tokio::process::Command;
+    let mut cmd = Command::new("claude");
+    for a in args {
+        cmd.arg(a);
+    }
+    let out = cmd.output().await.map_err(|e| ProtocolError {
+        code: format!("{code_prefix}-spawn"),
+        message: format!("spawn claude {}: {e}", args.join(" ")),
+        diagnostic_ref: None,
+    })?;
+    if !out.status.success() {
+        return Err(ProtocolError {
+            code: format!("{code_prefix}-status"),
+            message: format!(
+                "claude {} exited with {}: {}",
+                args.join(" "),
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            diagnostic_ref: None,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_cwd_round_trip_unix_path() {
+        let p = Path::new("/Users/jassy/Documents/glm/AgentDeck");
+        assert_eq!(encode_cwd(p), "-Users-jassy-Documents-glm-AgentDeck");
+    }
+
+    #[test]
+    fn decode_cwd_recovers_a_plausible_path() {
+        let d = decode_cwd("-Users-jassy-Documents-glm-AgentDeck");
+        assert_eq!(d, PathBuf::from("/Users/jassy/Documents/glm/AgentDeck"));
+    }
+
+    #[test]
+    fn parse_agents_json_real_shape_extracts_sessionid_and_name() {
+        // Truncated real `claude agents --json` payload (CC 2.1.191).
+        let raw = r#"[
+          {"id":"31472303","cwd":"/private/tmp/claude-bg","kind":"background",
+           "startedAt":1782398046433,
+           "sessionId":"31472303-b986-42f3-9e63-71a1fa9605c6",
+           "name":"write hello to /tmp/claude-bg/note.txt then wait 30 seconds",
+           "state":"stopped"},
+          {"pid":7088,"cwd":"/Users/jassy/Documents/glm/AgentDeck","kind":"interactive",
+           "startedAt":1782791596105,
+           "sessionId":"590b6337-73da-4285-836e-87071ac305db","status":"busy"}
+        ]"#;
+        let items = parse_agents_json_array(raw).expect("parse ok");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].thread_id.0, "31472303-b986-42f3-9e63-71a1fa9605c6");
+        assert_eq!(items[0].cwd, PathBuf::from("/private/tmp/claude-bg"));
+        assert!(items[0]
+            .title
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("write hello"));
+        assert_eq!(items[0].agent_kind, AgentKind::ClaudeCode);
+        assert_eq!(items[0].last_active_ms, 1782398046433);
+        assert!(items[1].title.is_none());
+    }
+
+    #[test]
+    fn parse_agents_json_rows_without_sessionid_dropped() {
+        let raw = r#"[{"cwd":"/x","kind":"background"}]"#;
+        let items = parse_agents_json_array(raw).expect("parse ok");
+        assert!(items.is_empty(), "row without sessionId must be dropped");
+    }
+
+    #[test]
+    fn parse_agents_json_malformed_returns_structured_error() {
+        let err = parse_agents_json_array("not json").unwrap_err();
+        assert_eq!(err.code, "cc-history-parse");
+    }
+
+    #[test]
+    fn parse_session_jsonl_user_then_assistant_groups_into_one_turn() {
+        let content = r#"
+{"type":"user","message":{"role":"user","content":"hello"},"sessionId":"abc"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"world"}]},"sessionId":"abc"}
+"#;
+        let resp = parse_session_jsonl(content, ThreadId("abc".into())).unwrap();
+        assert_eq!(resp.turns.len(), 1);
+        assert_eq!(resp.turns[0].items.len(), 2);
+        assert!(matches!(resp.turns[0].items[0], AgentItem::UserMessage { .. }));
+        assert!(matches!(
+            resp.turns[0].items[1],
+            AgentItem::AssistantMessage { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_session_jsonl_bash_tool_use_and_result_emit_shell_pair() {
+        let content = r#"
+{"type":"user","message":{"role":"user","content":"run ls"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"a\nb","is_error":false}]}}
+"#;
+        let resp = parse_session_jsonl(content, ThreadId("x".into())).unwrap();
+        assert_eq!(resp.turns.len(), 1);
+        let items = &resp.turns[0].items;
+        assert!(matches!(items[0], AgentItem::UserMessage { .. }));
+        match &items[1] {
+            AgentItem::Shell { command, status, .. } => {
+                assert_eq!(command, "ls");
+                assert!(matches!(status, ShellStatus::Running));
+            }
+            other => panic!("expected Shell tool_use, got {other:?}"),
+        }
+        match &items[2] {
+            AgentItem::Shell {
+                command,
+                status,
+                exit_code,
+                ..
+            } => {
+                assert_eq!(command, "ls");
+                assert!(matches!(status, ShellStatus::Completed));
+                assert_eq!(*exit_code, Some(0));
+            }
+            other => panic!("expected Shell tool_result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_session_jsonl_two_user_messages_yield_two_turns() {
+        let content = r#"
+{"type":"user","message":{"role":"user","content":"q1"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"a1"}]}}
+{"type":"user","message":{"role":"user","content":"q2"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"a2"}]}}
+"#;
+        let resp = parse_session_jsonl(content, ThreadId("x".into())).unwrap();
+        assert_eq!(resp.turns.len(), 2);
+        assert_eq!(resp.turns[0].items.len(), 2);
+        assert_eq!(resp.turns[1].items.len(), 2);
+    }
+
+    #[test]
+    fn parse_session_jsonl_skips_attachments_and_modes() {
+        let content = r#"
+{"type":"queue-operation","operation":"enqueue"}
+{"type":"mode","mode":"normal"}
+{"type":"permission-mode","permissionMode":"default"}
+{"type":"user","message":{"role":"user","content":"hi"}}
+"#;
+        let resp = parse_session_jsonl(content, ThreadId("x".into())).unwrap();
+        // Only the user line opens a turn.
+        assert_eq!(resp.turns.len(), 1);
+        assert_eq!(resp.turns[0].items.len(), 1);
+    }
+
+    #[test]
+    fn scan_title_prefers_custom_title_line() {
+        let dir = tempdir_unique();
+        let path = dir.join("sess.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"user","message":{"role":"user","content":"first prompt here"}}
+{"type":"custom-title","customTitle":"My Renamed Session"}
+"#,
+        )
+        .unwrap();
+        let title = scan_title(&path);
+        assert_eq!(title.as_deref(), Some("My Renamed Session"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_title_falls_back_to_first_user_snippet() {
+        let dir = tempdir_unique();
+        let path = dir.join("sess.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"user","message":{"role":"user","content":"first prompt content here"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"reply"}]}}
+"#,
+        )
+        .unwrap();
+        let title = scan_title(&path);
+        assert_eq!(title.as_deref(), Some("first prompt content here"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tempdir_unique() -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "agentdeck-cc-history-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+}
