@@ -56,6 +56,9 @@ pub fn protocol_schema() -> serde_json::Value {
 }
 
 #[cfg(test)]
+mod neutrality_tests;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn protocol_version_is_positive() {
