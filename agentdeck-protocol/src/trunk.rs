@@ -376,6 +376,11 @@ pub enum ClientCommand {
     History(HistoryRequest),
     ProtocolSchema,
     ProtocolVersion,
+    AgentList,
+    AgentCapabilities {
+        #[serde(rename = "agentKind")]
+        agent_kind: AgentKind,
+    },
 }
 
 // ServerEvent — main trunk

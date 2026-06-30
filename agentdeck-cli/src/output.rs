@@ -1,5 +1,11 @@
 //! 稳定的输出与退出码契约。E2E 断言对象。
-use agentdeck_protocol::IpcMessage;
+//!
+//! Exit codes (per spec §README):
+//!   0  success
+//!   2  usage error
+//!   3  protocol error
+//!   4  transport error
+//!   5  selfcheck / session failure
 
 #[derive(Debug)]
 pub enum CliError {
@@ -7,13 +13,15 @@ pub enum CliError {
     Protocol(String),
     Transport(String),
     Session(String),
+    Json(serde_json::Error),
+    NoResponse,
 }
 
 impl CliError {
     pub fn exit_code(&self) -> i32 {
         match self {
             CliError::Usage(_) => 2,
-            CliError::Protocol(_) => 3,
+            CliError::Protocol(_) | CliError::Json(_) | CliError::NoResponse => 3,
             CliError::Transport(_) => 4,
             CliError::Session(_) => 5,
         }
@@ -21,20 +29,30 @@ impl CliError {
     pub fn code_str(&self) -> &'static str {
         match self {
             CliError::Usage(_) => "usage",
-            CliError::Protocol(_) => "protocol",
+            CliError::Protocol(_) | CliError::Json(_) | CliError::NoResponse => "protocol",
             CliError::Transport(_) => "transport",
             CliError::Session(_) => "session",
         }
     }
-    pub fn message(&self) -> &str {
+    pub fn message(&self) -> String {
         match self {
-            CliError::Usage(m) | CliError::Protocol(m) | CliError::Transport(m) | CliError::Session(m) => m,
+            CliError::Usage(m) | CliError::Protocol(m) | CliError::Transport(m) | CliError::Session(m) => m.clone(),
+            CliError::Json(e) => format!("JSON error: {e}"),
+            CliError::NoResponse => "daemon closed without response".to_string(),
         }
     }
 }
 
-pub fn req(kind: &str, payload: Option<serde_json::Value>) -> IpcMessage {
-    IpcMessage { kind: kind.to_string(), id: None, session_id: None, thread_id: None, payload }
+impl From<serde_json::Error> for CliError {
+    fn from(e: serde_json::Error) -> Self {
+        CliError::Json(e)
+    }
+}
+
+impl From<std::io::Error> for CliError {
+    fn from(e: std::io::Error) -> Self {
+        CliError::Transport(e.to_string())
+    }
 }
 
 pub fn render(value: &serde_json::Value, pretty: bool) -> String {
@@ -59,6 +77,7 @@ mod tests {
         assert_eq!(CliError::Protocol("x".into()).exit_code(), 3);
         assert_eq!(CliError::Transport("x".into()).exit_code(), 4);
         assert_eq!(CliError::Session("x".into()).exit_code(), 5);
+        assert_eq!(CliError::NoResponse.exit_code(), 3);
     }
 
     #[test]
@@ -69,9 +88,8 @@ mod tests {
     }
 
     #[test]
-    fn req_builds_neutral_message() {
-        let m = req("ping", None);
-        assert_eq!(m.kind, "ping");
-        assert!(m.id.is_none() && m.payload.is_none());
+    fn exit_for_json_error_is_protocol() {
+        let je: serde_json::Error = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        assert_eq!(CliError::Json(je).exit_code(), 3);
     }
 }

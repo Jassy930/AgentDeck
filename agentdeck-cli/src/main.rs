@@ -1,208 +1,305 @@
 mod client;
 mod commands;
+mod main_types;
 mod output;
 mod transport;
 
 use clap::{Parser, Subcommand};
+use main_types::{AgentKindArg, ApprovalArg, EffortArg, PermissionArg, SandboxArg, SessionRunArgs};
 use output::{render, CliError};
+use std::path::PathBuf;
+use agentdeck_protocol::{HistoryRequest, ThreadId};
+
+// ── Top-level CLI ─────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "agentdeck", about = "AgentDeck unified interface CLI")]
+#[command(name = "agentdeck", about = "AgentDeck unified interface CLI (v2)")]
 struct Cli {
-    /// AgentDeck profile（仅影响 AgentDeck 自管理数据目录）
+    /// AgentDeck profile (stable|dev)
     #[arg(long, global = true, default_value = "stable")]
     profile: String,
-    /// 覆盖数据目录（优先于 profile）
+    /// Override data directory (takes precedence over profile)
     #[arg(long, global = true)]
     data_dir: Option<String>,
-    /// 人读 pretty 输出（E2E 不依赖）
+    /// Human-readable pretty output
     #[arg(long, global = true)]
     pretty: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Cmd,
 }
 
 #[derive(Subcommand)]
-enum Command {
-    /// 协议自省
-    Protocol {
-        #[command(subcommand)]
-        what: ProtocolCmd,
-    },
-    /// 往返自检
+enum Cmd {
+    /// Round-trip liveness check
     Ping,
-    /// IPC 生命周期 + logging 自检
+    /// Daemon plumbing self-check
     Selfcheck,
-    /// 诊断报告
+    /// Diagnostics
     Diagnostics {
         #[command(subcommand)]
-        what: DiagnosticsCmd,
+        op: DiagOp,
     },
-    /// 历史操作
-    History {
+    /// Protocol introspection
+    Protocol {
         #[command(subcommand)]
-        what: HistoryCmd,
+        op: ProtocolOp,
     },
-    /// 流式会话
+    /// Agent adapter operations (list, capabilities)
+    Agent {
+        #[command(subcommand)]
+        op: AgentOp,
+    },
+    /// Session operations (run, continue)
     Session {
         #[command(subcommand)]
-        what: SessionCmd,
+        op: SessionOp,
     },
+    /// Cross-agent history operations
+    History {
+        #[command(subcommand)]
+        op: HistoryOp,
+    },
+}
+
+// ── Subcommand enums ──────────────────────────────────────────────────────────
+
+#[derive(Subcommand)]
+enum DiagOp {
+    /// Print a diagnostics report
+    Report,
 }
 
 #[derive(Subcommand)]
-enum SessionCmd {
-    /// 新会话
-    Run {
-        #[arg(long)] cwd: String,
-        #[arg(long)] prompt: String,
-        #[arg(long, value_enum, default_value_t = ApprovalArg::Prompt)]
-        approval_policy: ApprovalArg,
-    },
-    /// 在既有 thread 上继续
-    Continue {
-        #[arg(long)] thread_id: String,
-        #[arg(long)] prompt: String,
-        #[arg(long, value_enum, default_value_t = ApprovalArg::Prompt)]
-        approval_policy: ApprovalArg,
-    },
-}
-
-#[derive(Clone, Copy, clap::ValueEnum)]
-enum ApprovalArg { Prompt, AutoApprove, AutoDeny }
-
-impl From<ApprovalArg> for client::ApprovalPolicy {
-    fn from(a: ApprovalArg) -> Self {
-        match a {
-            ApprovalArg::Prompt => client::ApprovalPolicy::Prompt,
-            ApprovalArg::AutoApprove => client::ApprovalPolicy::AutoApprove,
-            ApprovalArg::AutoDeny => client::ApprovalPolicy::AutoDeny,
-        }
-    }
-}
-
-#[derive(Subcommand)]
-enum DiagnosticsCmd {
-    Report {
-        #[arg(long)] limit: Option<u64>,
-        #[arg(long)] since_seconds: Option<u64>,
-        #[arg(long)] run_id: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum HistoryCmd {
-    List {
-        #[arg(long)] cwd: Option<String>,
-        #[arg(long)] search: Option<String>,
-        #[arg(long)] cursor: Option<String>,
-        #[arg(long)] limit: Option<u64>,
-    },
-    Read { #[arg(long)] thread_id: String },
-    Archive { #[arg(long)] thread_id: String },
-    Unarchive { #[arg(long)] thread_id: String },
-    Rename { #[arg(long)] thread_id: String, #[arg(long)] name: String },
-}
-
-#[derive(Subcommand)]
-enum ProtocolCmd {
-    /// 输出版本化 JSON Schema
+enum ProtocolOp {
+    /// Print the versioned JSON Schema
     Schema,
-    /// 输出协议版本号
+    /// Print the protocol version number
     Version,
 }
 
-fn connect(profile: &str, data_dir: Option<&str>) -> Result<client::Client<transport::ProcessTransport>, CliError> {
-    let transport = transport::ProcessTransport::spawn(profile, data_dir)
-        .map_err(|e| CliError::Transport(e.to_string()))?;
-    Ok(client::Client::new(transport))
+#[derive(Subcommand)]
+enum AgentOp {
+    /// List registered agent adapters
+    List,
+    /// Show capabilities for a specific agent
+    Capabilities {
+        #[arg(long)]
+        agent: AgentKindArg,
+    },
 }
 
-fn run(cli: Cli) -> Result<(), CliError> {
-    match cli.command {
-        Command::Protocol { what } => match what {
-            ProtocolCmd::Schema => {
-                // schema 始终 pretty（它是文档产物），与 drift 快照一致
-                println!("{}", serde_json::to_string_pretty(&agentdeck_protocol::protocol_schema()).expect("json"));
-                Ok(())
+#[derive(Subcommand)]
+enum SessionOp {
+    /// Start a new agent session
+    Run {
+        #[arg(long)]
+        agent: AgentKindArg,
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long)]
+        prompt: String,
+        // Codex-only flags
+        #[arg(long)]
+        sandbox: Option<SandboxArg>,
+        #[arg(long)]
+        approval: Option<ApprovalArg>,
+        #[arg(long)]
+        persist_approval: bool,
+        #[arg(long)]
+        reasoning_effort: Option<EffortArg>,
+        // CC-only flags
+        #[arg(long)]
+        permission: Option<PermissionArg>,
+        #[arg(long)]
+        output_style: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        effort: Option<String>,
+        #[arg(long)]
+        worktree: Option<String>,
+        #[arg(long)]
+        session_name: Option<String>,
+    },
+    /// Continue an existing thread
+    Continue {
+        #[arg(long)]
+        thread_id: String,
+        #[arg(long)]
+        agent: AgentKindArg,
+        #[arg(long)]
+        prompt: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum HistoryOp {
+    /// List threads (default: all agents)
+    List {
+        #[arg(long)]
+        agent: Option<AgentKindArg>,
+        #[arg(long)]
+        cwd_filter: Option<PathBuf>,
+    },
+    /// Read thread turns
+    Read {
+        thread_id: String,
+        #[arg(long)]
+        agent: AgentKindArg,
+    },
+    /// Archive a thread
+    Archive {
+        thread_id: String,
+        #[arg(long)]
+        agent: AgentKindArg,
+    },
+    /// Unarchive a thread
+    Unarchive {
+        thread_id: String,
+        #[arg(long)]
+        agent: AgentKindArg,
+    },
+    /// Rename a thread
+    Rename {
+        thread_id: String,
+        title: String,
+        #[arg(long)]
+        agent: AgentKindArg,
+    },
+}
+
+// ── Main dispatcher ───────────────────────────────────────────────────────────
+
+fn run_sync(cli: &Cli) -> Result<(), CliError> {
+    let profile = &cli.profile;
+    let data_dir = cli.data_dir.as_deref();
+    let pretty = cli.pretty;
+
+    match &cli.command {
+        Cmd::Protocol { op } => {
+            let mut c = client::Client::connect(profile, data_dir)?;
+            match op {
+                ProtocolOp::Schema => commands::handle_protocol_schema(&mut c, pretty),
+                ProtocolOp::Version => commands::handle_protocol_version(&mut c, pretty),
             }
-            ProtocolCmd::Version => {
-                let v = serde_json::json!({ "protocolVersion": agentdeck_protocol::PROTOCOL_VERSION });
-                println!("{}", render(&v, cli.pretty));
-                Ok(())
+        }
+        Cmd::Ping => {
+            let mut c = client::Client::connect(profile, data_dir)?;
+            commands::handle_ping(&mut c, pretty)
+        }
+        Cmd::Selfcheck => {
+            let mut c = client::Client::connect(profile, data_dir)?;
+            commands::handle_selfcheck(&mut c, pretty)
+        }
+        Cmd::Diagnostics { op } => {
+            let mut c = client::Client::connect(profile, data_dir)?;
+            match op {
+                DiagOp::Report => commands::handle_diagnostics_schema(&mut c, pretty),
             }
-        },
-        Command::Ping => {
-            let mut client = connect(&cli.profile, cli.data_dir.as_deref())?;
-            let reply = client.round_trip(commands::ping_request())?;
-            let payload = client::Client::<transport::ProcessTransport>::expect_kind(reply, "pong")?;
-            client.shutdown();
-            println!("{}", render(&serde_json::json!({"kind":"pong","payload":payload}), cli.pretty));
-            Ok(())
         }
-        Command::Selfcheck => {
-            let mut client = connect(&cli.profile, cli.data_dir.as_deref())?;
-            let reply = client.round_trip(commands::selfcheck_request())?;
-            let payload = client::Client::<transport::ProcessTransport>::expect_kind(reply, "loggingSelfcheck")?;
-            client.shutdown();
-            println!("{}", render(&payload, cli.pretty));
-            commands::interpret_selfcheck(&payload)
+        Cmd::Agent { op } => {
+            let mut c = client::Client::connect(profile, data_dir)?;
+            match op {
+                AgentOp::List => commands::handle_agent_list(&mut c, pretty),
+                AgentOp::Capabilities { agent } => {
+                    commands::handle_agent_capabilities(&mut c, *agent, pretty)
+                }
+            }
         }
-        Command::Diagnostics { what } => {
-            let DiagnosticsCmd::Report { limit, since_seconds, run_id } = what;
-            let mut client = connect(&cli.profile, cli.data_dir.as_deref())?;
-            let reply = client.round_trip(commands::diagnostics_request(limit, since_seconds, run_id))?;
-            let payload = client::Client::<transport::ProcessTransport>::expect_kind(reply, "diagnosticsReport")?;
-            client.shutdown();
-            println!("{}", render(&payload, cli.pretty));
-            Ok(())
-        }
-        Command::History { what } => {
-            let (request, expected) = match what {
-                HistoryCmd::List { cwd, search, cursor, limit } =>
-                    (commands::history_list_request(cwd, search, cursor, limit), "historyThreads"),
-                HistoryCmd::Read { thread_id } =>
-                    (commands::history_read_request(&thread_id), "historyThread"),
-                HistoryCmd::Archive { thread_id } =>
-                    (commands::history_manage_request("history/archiveThread", &thread_id, None), "historyThreadUpdated"),
-                HistoryCmd::Unarchive { thread_id } =>
-                    (commands::history_manage_request("history/unarchiveThread", &thread_id, None), "historyThreadUpdated"),
-                HistoryCmd::Rename { thread_id, name } =>
-                    (commands::history_manage_request("history/renameThread", &thread_id, Some(&name)), "historyThreadUpdated"),
+        Cmd::History { op } => {
+            let mut c = client::Client::connect(profile, data_dir)?;
+            let req = match op {
+                HistoryOp::List { agent, cwd_filter } => HistoryRequest::List {
+                    agent_kind: agent.map(|a| a.into()),
+                    cwd_filter: cwd_filter.clone(),
+                },
+                HistoryOp::Read { thread_id, agent } => HistoryRequest::Read {
+                    thread_id: ThreadId(thread_id.clone()),
+                    agent_kind: (*agent).into(),
+                },
+                HistoryOp::Archive { thread_id, agent } => HistoryRequest::Archive {
+                    thread_id: ThreadId(thread_id.clone()),
+                    agent_kind: (*agent).into(),
+                },
+                HistoryOp::Unarchive { thread_id, agent } => HistoryRequest::Unarchive {
+                    thread_id: ThreadId(thread_id.clone()),
+                    agent_kind: (*agent).into(),
+                },
+                HistoryOp::Rename { thread_id, title, agent } => HistoryRequest::Rename {
+                    thread_id: ThreadId(thread_id.clone()),
+                    agent_kind: (*agent).into(),
+                    title: title.clone(),
+                },
             };
-            let mut client = connect(&cli.profile, cli.data_dir.as_deref())?;
-            let reply = client.round_trip(request)?;
-            let payload = client::Client::<transport::ProcessTransport>::expect_kind(reply, expected)?;
-            client.shutdown();
-            println!("{}", render(&payload, cli.pretty));
-            Ok(())
+            commands::handle_history(&mut c, req, pretty)
         }
-        Command::Session { what } => {
-            let session_id = format!("cli-{}", std::process::id());
-            let (request, policy) = match what {
-                SessionCmd::Run { cwd, prompt, approval_policy } => (
-                    output::req("startSession", Some(serde_json::json!({"cwd": cwd, "prompt": prompt}))),
-                    approval_policy.into(),
-                ),
-                SessionCmd::Continue { thread_id, prompt, approval_policy } => (
-                    output::req("startTurn", Some(serde_json::json!({"threadId": thread_id, "prompt": prompt}))),
-                    approval_policy.into(),
-                ),
-            };
-            let mut client = connect(&cli.profile, cli.data_dir.as_deref())?;
-            let pretty = cli.pretty;
-            let mut emit = |inner: &serde_json::Value| println!("{}", render(inner, pretty));
-            let result = client.run_stream(request, &session_id, policy, &mut emit);
-            client.shutdown();
-            result
+        // Session commands need async — handled below in main()
+        Cmd::Session { .. } => {
+            // Should not reach here in sync path
+            unreachable!("session commands handled in async path")
         }
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
     let pretty = cli.pretty;
-    if let Err(err) = run(cli) {
+    let profile = cli.profile.clone();
+    let data_dir = cli.data_dir.clone();
+
+    let result: Result<(), CliError> = match &cli.command {
+        Cmd::Session { op } => {
+            match op {
+                SessionOp::Run {
+                    agent,
+                    cwd,
+                    prompt,
+                    sandbox,
+                    approval,
+                    persist_approval,
+                    reasoning_effort,
+                    permission,
+                    output_style,
+                    model,
+                    effort,
+                    worktree,
+                    session_name,
+                } => {
+                    let args = SessionRunArgs {
+                        agent: *agent,
+                        cwd: cwd.clone(),
+                        prompt: prompt.clone(),
+                        sandbox: *sandbox,
+                        approval: *approval,
+                        persist_approval: *persist_approval,
+                        reasoning_effort: *reasoning_effort,
+                        permission: *permission,
+                        output_style: output_style.clone(),
+                        model: model.clone(),
+                        effort: effort.clone(),
+                        worktree: worktree.clone(),
+                        session_name: session_name.clone(),
+                    };
+                    commands::handle_session_run(args, &profile, data_dir.as_deref(), pretty).await
+                }
+                SessionOp::Continue { thread_id, agent, prompt } => {
+                    commands::handle_session_continue(
+                        thread_id.clone(),
+                        *agent,
+                        prompt.clone(),
+                        &profile,
+                        data_dir.as_deref(),
+                        pretty,
+                    )
+                    .await
+                }
+            }
+        }
+        _ => run_sync(&cli),
+    };
+
+    if let Err(err) = result {
         eprintln!("agentdeck: {}", err.message());
         println!("{}", render(&output::error_envelope(&err), pretty));
         std::process::exit(err.exit_code());

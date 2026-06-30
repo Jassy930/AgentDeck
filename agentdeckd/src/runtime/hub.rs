@@ -263,6 +263,45 @@ impl RuntimeHub {
                         .await;
                 }
             }
+            ClientCommand::AgentList => {
+                let kinds: Vec<String> = self
+                    .router
+                    .list_agents()
+                    .iter()
+                    .map(|k| k.as_str().to_string())
+                    .collect();
+                let reply = serde_json::json!({
+                    "reply": "agentList",
+                    "agents": kinds,
+                });
+                let _ = admin_tx.send(reply.to_string()).await;
+            }
+            ClientCommand::AgentCapabilities { agent_kind } => {
+                match self.router.capabilities(agent_kind) {
+                    Some(caps) => {
+                        let reply = serde_json::json!({
+                            "reply": "agentCapabilities",
+                            "agentKind": agent_kind.as_str(),
+                            "capabilities": caps,
+                        });
+                        let _ = admin_tx.send(reply.to_string()).await;
+                    }
+                    None => {
+                        let err = ServerEvent::Error {
+                            session_id: None,
+                            error: ProtocolError {
+                                code: "agent-not-registered".into(),
+                                message: format!(
+                                    "no adapter registered for agentKind={:?}",
+                                    agent_kind
+                                ),
+                                diagnostic_ref: None,
+                            },
+                        };
+                        let _ = events_tx.send(err).await;
+                    }
+                }
+            }
             ClientCommand::History(req) => {
                 // Task 4C — Phase 4 finalization: route through the
                 // router's `handle_history`, which routes by agent kind

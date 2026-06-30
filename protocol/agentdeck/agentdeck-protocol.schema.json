@@ -820,6 +820,40 @@
             "command"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "enum": [
+                "agentList"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "agentKind": {
+              "$ref": "#/definitions/AgentKind"
+            },
+            "command": {
+              "enum": [
+                "agentCapabilities"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "agentKind",
+            "command"
+          ],
+          "type": "object"
         }
       ],
       "title": "ClientCommand"

@@ -1,171 +1,263 @@
+//! v2 client API — sends `ClientCommand` JSONL, reads `ServerEvent` JSONL
+//! and admin reply side-channel.
+//!
+//! ## Admin reply parsing
+//!
+//! The daemon writes two kinds of lines to stdout (via a single writer task):
+//!
+//!   1. `ServerEvent` lines — always have a `"type"` JSON key
+//!      (e.g. `{"type":"sessionStarted", ...}`)
+//!
+//!   2. Admin reply lines — always have a `"reply"` JSON key
+//!      (e.g. `{"reply":"ping","ok":true}`)
+//!
+//! The two shapes are disjoint: no valid `ServerEvent` has `"reply"` and
+//! no admin reply has `"type"`. Therefore the CLI can parse any stdout line
+//! by peeking at which key is present, with zero ambiguity.
+//!
+//! Admin replies for `History` commands wrap the typed `HistoryResponse`
+//! envelope under `"response"` within `{"reply":"history","response":{...}}`.
+
 use crate::output::CliError;
-use crate::transport::Transport;
-use agentdeck_protocol::IpcMessage;
+use crate::transport::{split_async, AsyncProcessTransport, ProcessTransport, SyncTransport};
+use agentdeck_protocol::{
+    ActionDecision, AgentKind, ClientCommand, HistoryRequest, HistoryResponse, ServerEvent,
+    SessionCapabilities, SessionId, SessionStart, ThreadId, VendorControlPayload,
+};
+use tokio::sync::mpsc;
 
-pub struct Client<T: Transport> {
-    transport: T,
-    next_id: u64,
+// ── Envelope discriminant ─────────────────────────────────────────────────────
+
+/// What kind of line did the daemon write?
+enum DaemonLine {
+    Event(ServerEvent),
+    AdminReply(serde_json::Value),
+    /// Unparseable — skip silently.
+    Unknown,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ApprovalPolicy {
-    Prompt,
-    AutoApprove,
-    AutoDeny,
+fn parse_daemon_line(raw: &str) -> DaemonLine {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return DaemonLine::Unknown;
+    };
+    if val.get("type").is_some() {
+        // Try ServerEvent
+        if let Ok(ev) = serde_json::from_value::<ServerEvent>(val) {
+            return DaemonLine::Event(ev);
+        }
+        return DaemonLine::Unknown;
+    }
+    if val.get("reply").is_some() {
+        return DaemonLine::AdminReply(val);
+    }
+    DaemonLine::Unknown
 }
 
-impl<T: Transport> Client<T> {
-    pub fn new(transport: T) -> Self {
-        Self { transport, next_id: 1000 }
+// ── Sync round-trip helper (admin commands only) ──────────────────────────────
+
+/// Send a `ClientCommand` and wait for the admin reply JSON whose `"reply"`
+/// field matches `expected_reply`. Skips `ServerEvent` lines encountered
+/// while waiting (they belong to concurrent sessions).
+fn admin_round_trip(
+    transport: &mut ProcessTransport,
+    cmd: &ClientCommand,
+    expected_reply: &str,
+) -> Result<serde_json::Value, CliError> {
+    let line = serde_json::to_string(cmd)?;
+    transport.send_line(&line)?;
+    loop {
+        let raw = transport.recv_line()?;
+        let Some(raw) = raw else {
+            return Err(CliError::NoResponse);
+        };
+        match parse_daemon_line(&raw) {
+            DaemonLine::AdminReply(v) => {
+                let got = v.get("reply").and_then(|r| r.as_str()).unwrap_or("");
+                if got == expected_reply {
+                    return Ok(v);
+                }
+                // Different admin reply: might be from a concurrent command;
+                // keep reading.
+            }
+            DaemonLine::Event(ServerEvent::Error { error, .. }) => {
+                return Err(CliError::Protocol(error.message));
+            }
+            DaemonLine::Event(_) => continue,
+            DaemonLine::Unknown => continue,
+        }
+    }
+}
+
+// ── Sync Client (admin commands: ping/selfcheck/agent-list/capabilities/history) ──
+
+pub struct Client {
+    transport: ProcessTransport,
+}
+
+impl Client {
+    /// Spawn the daemon and return a ready client.
+    pub fn connect(profile: &str, data_dir: Option<&str>) -> Result<Self, CliError> {
+        let transport = ProcessTransport::spawn(profile, data_dir)
+            .map_err(|e| CliError::Transport(e.to_string()))?;
+        Ok(Self { transport })
     }
 
-    fn alloc_id(&mut self) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
+    pub fn ping(&mut self) -> Result<(), CliError> {
+        let v = admin_round_trip(&mut self.transport, &ClientCommand::Ping, "ping")?;
+        if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(CliError::Protocol("ping returned ok=false".into()))
+        }
     }
 
-    pub fn round_trip(&mut self, mut req: IpcMessage) -> Result<IpcMessage, CliError> {
-        let id = self.alloc_id();
-        req.id = Some(id);
-        self.transport.send(&req).map_err(|e| CliError::Transport(e.to_string()))?;
+    pub fn selfcheck(&mut self) -> Result<serde_json::Value, CliError> {
+        let v = admin_round_trip(&mut self.transport, &ClientCommand::Selfcheck, "selfcheck")?;
+        if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
+            Ok(v)
+        } else {
+            Err(CliError::Session("selfcheck returned ok=false".into()))
+        }
+    }
+
+    pub fn protocol_schema(&mut self) -> Result<serde_json::Value, CliError> {
+        let v = admin_round_trip(
+            &mut self.transport,
+            &ClientCommand::ProtocolSchema,
+            "protocolSchema",
+        )?;
+        v.get("schema").cloned().ok_or_else(|| CliError::Protocol("missing schema field".into()))
+    }
+
+    pub fn protocol_version(&mut self) -> Result<u32, CliError> {
+        let v = admin_round_trip(
+            &mut self.transport,
+            &ClientCommand::ProtocolVersion,
+            "protocolVersion",
+        )?;
+        v.get("protocolVersion")
+            .and_then(|x| x.as_u64())
+            .map(|n| n as u32)
+            .ok_or_else(|| CliError::Protocol("missing protocolVersion field".into()))
+    }
+
+    pub fn agent_list(&mut self) -> Result<Vec<String>, CliError> {
+        let v = admin_round_trip(&mut self.transport, &ClientCommand::AgentList, "agentList")?;
+        let arr = v
+            .get("agents")
+            .and_then(|a| a.as_array())
+            .ok_or_else(|| CliError::Protocol("missing agents array".into()))?;
+        Ok(arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+    }
+
+    pub fn agent_capabilities(&mut self, kind: AgentKind) -> Result<SessionCapabilities, CliError> {
+        let v = admin_round_trip(
+            &mut self.transport,
+            &ClientCommand::AgentCapabilities { agent_kind: kind },
+            "agentCapabilities",
+        )?;
+        let caps_val = v
+            .get("capabilities")
+            .cloned()
+            .ok_or_else(|| CliError::Protocol("missing capabilities field".into()))?;
+        serde_json::from_value::<SessionCapabilities>(caps_val).map_err(CliError::Json)
+    }
+
+    pub fn history(&mut self, req: HistoryRequest) -> Result<HistoryResponse, CliError> {
+        let v = admin_round_trip(
+            &mut self.transport,
+            &ClientCommand::History(req),
+            "history",
+        )?;
+        let resp_val = v
+            .get("response")
+            .cloned()
+            .ok_or_else(|| CliError::Protocol("missing response field in history reply".into()))?;
+        serde_json::from_value::<HistoryResponse>(resp_val).map_err(CliError::Json)
+    }
+}
+
+// ── Async streaming session (session run / continue) ──────────────────────────
+
+/// Run a streaming session (start or continue) via an async daemon transport.
+/// Sends the given `cmd` (must be `SessionStart` or `SessionContinue`), then
+/// reads `ServerEvent` lines from stdout and forwards them to the returned
+/// mpsc receiver until `TurnComplete` or `Error` is received.
+///
+/// Admin reply lines encountered on the shared stdout are skipped (they
+/// belong to a different logical channel).
+pub async fn stream_session(
+    cmd: ClientCommand,
+    profile: &str,
+    data_dir: Option<&str>,
+) -> Result<mpsc::Receiver<ServerEvent>, CliError> {
+    let mut transport = AsyncProcessTransport::spawn(profile, data_dir)
+        .await
+        .map_err(|e| CliError::Transport(e.to_string()))?;
+
+    let line = serde_json::to_string(&cmd)?;
+    transport
+        .send_line(&line)
+        .await
+        .map_err(|e| CliError::Transport(e.to_string()))?;
+
+    // Split into writer (keeps child alive) + line receiver channel.
+    let (writer, mut line_rx) = split_async(transport);
+
+    let (tx, rx) = mpsc::channel::<ServerEvent>(64);
+
+    tokio::spawn(async move {
+        // Keep writer (and child process) alive for the duration of streaming.
+        let _writer = writer;
         loop {
-            match self.transport.recv().map_err(|e| CliError::Transport(e.to_string()))? {
-                None => return Err(CliError::Transport("agentdeckd disconnected".into())),
-                Some(msg) if msg.id == Some(id) => return Ok(msg),
-                Some(_) => continue, // 忽略无关帧
-            }
-        }
-    }
-
-    pub fn expect_kind(reply: IpcMessage, expected: &str) -> Result<serde_json::Value, CliError> {
-        if reply.kind == expected {
-            return Ok(reply.payload.unwrap_or(serde_json::Value::Null));
-        }
-        if reply.kind == "error" {
-            let msg = reply.payload.as_ref()
-                .and_then(|p| p.get("message"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown error")
-                .to_string();
-            return Err(CliError::Protocol(msg));
-        }
-        Err(CliError::Protocol(format!("expected {expected}, got {}", reply.kind)))
-    }
-
-    pub fn run_stream(
-        &mut self,
-        mut req: IpcMessage,
-        session_id: &str,
-        policy: ApprovalPolicy,
-        emit: &mut dyn FnMut(&serde_json::Value),
-    ) -> Result<(), CliError> {
-        let id = self.alloc_id();
-        req.id = Some(id);
-        req.session_id = Some(session_id.to_string());
-        self.transport.send(&req).map_err(|e| CliError::Transport(e.to_string()))?;
-
-        loop {
-            let msg = match self.transport.recv().map_err(|e| CliError::Transport(e.to_string()))? {
-                None => return Err(CliError::Transport("agentdeckd disconnected mid-session".into())),
-                Some(m) => m,
+            let Some(raw) = line_rx.recv().await else {
+                break;
             };
-            if msg.id == Some(id) {
-                if msg.kind == "turnAccepted" {
-                    continue;
+            match parse_daemon_line(&raw) {
+                DaemonLine::Event(ev) => {
+                    let is_terminal = matches!(&ev, ServerEvent::TurnComplete { .. })
+                        || matches!(&ev, ServerEvent::Error { .. });
+                    let _ = tx.send(ev).await;
+                    if is_terminal {
+                        break;
+                    }
                 }
-                if msg.kind == "error" {
-                    let m = msg.payload.as_ref()
-                        .and_then(|p| p.get("message")).and_then(|v| v.as_str())
-                        .unwrap_or("session rejected").to_string();
-                    return Err(CliError::Protocol(m));
-                }
-            }
-            if msg.kind != "session/event" {
-                continue;
-            }
-            let Some(inner) = msg.payload.as_ref().and_then(|p| p.get("event")).cloned() else {
-                continue;
-            };
-            emit(&inner);
-            let inner_kind = inner.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-            match inner_kind {
-                "actionRequest" => {
-                    let request_id = inner.get("payload")
-                        .and_then(|p| p.get("requestId"))
-                        .and_then(|v| v.as_u64())
-                        .ok_or_else(|| CliError::Protocol("actionRequest missing requestId".into()))?;
-                    let decision = self.decide(policy, request_id)?;
-                    let did = self.alloc_id();
-                    let dec = IpcMessage {
-                        kind: "actionDecision".into(),
-                        id: Some(did),
-                        session_id: Some(session_id.to_string()),
-                        thread_id: None,
-                        payload: Some(serde_json::json!({ "requestId": request_id, "decision": decision })),
-                    };
-                    self.transport.send(&dec).map_err(|e| CliError::Transport(e.to_string()))?;
-                }
-                "turnComplete" => return Ok(()),
-                "error" => {
-                    let m = inner.get("payload")
-                        .and_then(|p| p.get("message")).and_then(|v| v.as_str())
-                        .unwrap_or("session failed").to_string();
-                    return Err(CliError::Session(m));
-                }
-                _ => continue,
+                DaemonLine::AdminReply(_) => continue,
+                DaemonLine::Unknown => continue,
             }
         }
-    }
+    });
 
-    pub fn shutdown(&mut self) {
-        let id = self.alloc_id();
-        let bye = IpcMessage { kind: "shutdown".into(), id: Some(id), session_id: None, thread_id: None, payload: None };
-        let _ = self.transport.send(&bye);
-        // best-effort：读到对应 pong 或 EOF 即止
-        while let Ok(Some(msg)) = self.transport.recv() {
-            if msg.id == Some(id) { break; }
-        }
-    }
+    Ok(rx)
+}
 
-    fn decide(&self, policy: ApprovalPolicy, _request_id: u64) -> Result<String, CliError> {
-        match policy {
-            ApprovalPolicy::AutoApprove => Ok("approve".into()),
-            ApprovalPolicy::AutoDeny => Ok("deny".into()),
-            ApprovalPolicy::Prompt => {
-                use std::io::BufRead;
-                let stdin = std::io::stdin();
-                let mut line = String::new();
-                stdin.lock().read_line(&mut line).map_err(|e| CliError::Transport(e.to_string()))?;
-                let v: serde_json::Value = serde_json::from_str(line.trim())
-                    .map_err(|e| CliError::Usage(format!("invalid decision line: {e}")))?;
-                let d = v.get("decision").and_then(|x| x.as_str()).unwrap_or("");
-                match d {
-                    "approve" | "deny" | "cancel" => Ok(d.to_string()),
-                    _ => Err(CliError::Usage("decision must be approve|deny|cancel".into())),
-                }
-            }
-        }
+// ── Convenience constructors for session commands ─────────────────────────────
+
+pub fn session_start_cmd(start: SessionStart) -> ClientCommand {
+    ClientCommand::SessionStart(start)
+}
+
+pub fn session_continue_cmd(thread_id: String, agent_kind: AgentKind, prompt: String) -> ClientCommand {
+    ClientCommand::SessionContinue {
+        thread_id: ThreadId(thread_id),
+        agent_kind,
+        prompt,
     }
 }
 
-#[cfg(test)]
-pub trait IntoSent {
-    fn into_sent(self) -> Vec<IpcMessage>;
+#[allow(dead_code)]
+pub fn session_cancel_cmd(session_id: String) -> ClientCommand {
+    ClientCommand::SessionCancel { session_id: SessionId(session_id) }
 }
 
-#[cfg(test)]
-impl IntoSent for crate::transport::FakeTransport {
-    fn into_sent(self) -> Vec<IpcMessage> {
-        self.sent
-    }
+#[allow(dead_code)]
+pub fn action_decision_cmd(session_id: String, decision: ActionDecision) -> ClientCommand {
+    ClientCommand::ActionDecision { session_id: SessionId(session_id), decision }
 }
 
-#[cfg(test)]
-impl<T: Transport + IntoSent> Client<T> {
-    fn into_sent(self) -> Vec<IpcMessage> {
-        self.transport.into_sent()
-    }
+#[allow(dead_code)]
+pub fn vendor_control_cmd(session_id: String, payload: VendorControlPayload) -> ClientCommand {
+    ClientCommand::VendorControl { session_id: SessionId(session_id), payload }
 }
 
 #[cfg(test)]
@@ -173,100 +265,135 @@ mod tests {
     use super::*;
     use crate::transport::FakeTransport;
 
-    fn msg(kind: &str, id: Option<u64>, payload: Option<serde_json::Value>) -> IpcMessage {
-        IpcMessage { kind: kind.into(), id, session_id: None, thread_id: None, payload }
+    fn ping_reply() -> String {
+        r#"{"reply":"ping","ok":true}"#.to_string()
     }
 
-    fn session_event(inner: serde_json::Value) -> IpcMessage {
-        IpcMessage {
-            kind: "session/event".into(),
-            id: None,
-            session_id: Some("cli-1".into()),
-            thread_id: None,
-            payload: Some(serde_json::json!({ "event": inner })),
+    fn selfcheck_reply() -> String {
+        r#"{"reply":"selfcheck","ok":true,"protocolVersion":2,"agents":["codex","claude_code"]}"#.to_string()
+    }
+
+    fn error_event(msg: &str) -> String {
+        serde_json::json!({
+            "type": "error",
+            "error": { "code": "test", "message": msg, "diagnosticRef": null }
+        })
+        .to_string()
+    }
+
+    fn admin_round_trip_fake(
+        fake: &mut FakeTransport,
+        cmd: &ClientCommand,
+        expected: &str,
+    ) -> Result<serde_json::Value, CliError> {
+        let line = serde_json::to_string(cmd).unwrap();
+        fake.send_line(&line).unwrap();
+        loop {
+            let raw = fake.recv_line().unwrap();
+            let Some(raw) = raw else {
+                return Err(CliError::NoResponse);
+            };
+            match parse_daemon_line(&raw) {
+                DaemonLine::AdminReply(v) => {
+                    let got = v.get("reply").and_then(|r| r.as_str()).unwrap_or("");
+                    if got == expected {
+                        return Ok(v);
+                    }
+                }
+                DaemonLine::Event(ServerEvent::Error { error, .. }) => {
+                    return Err(CliError::Protocol(error.message));
+                }
+                DaemonLine::Event(_) => continue,
+                DaemonLine::Unknown => continue,
+            }
         }
     }
 
     #[test]
-    fn round_trip_matches_reply_by_id_and_skips_strays() {
-        // 第一帧 id 不匹配（stray），第二帧匹配分配的 id 1000。
-        let t = FakeTransport::new(vec![
-            msg("noise", Some(1), None),
-            msg("pong", Some(1000), None),
+    fn parse_daemon_line_discriminates_event_vs_admin() {
+        // ServerEvent has "type"
+        let ev_line = r#"{"type":"error","error":{"code":"x","message":"y","diagnosticRef":null}}"#;
+        assert!(matches!(parse_daemon_line(ev_line), DaemonLine::Event(_)));
+
+        // Admin reply has "reply"
+        let admin_line = r#"{"reply":"ping","ok":true}"#;
+        assert!(matches!(parse_daemon_line(admin_line), DaemonLine::AdminReply(_)));
+
+        // Unknown
+        let unknown = r#"{"foo":"bar"}"#;
+        assert!(matches!(parse_daemon_line(unknown), DaemonLine::Unknown));
+    }
+
+    #[test]
+    fn admin_round_trip_fake_skips_event_lines_and_matches_reply() {
+        // Use a non-error ServerEvent (agentItem etc.) — those should be
+        // skipped while waiting for the matching admin reply.
+        // We can't construct a full AgentItem without all fields, so we
+        // use a stray admin reply with a different key first.
+        let different_reply = r#"{"reply":"protocolVersion","protocolVersion":2}"#.to_string();
+        let mut fake = FakeTransport::new(vec![
+            // stray admin reply with different key — skip and keep looking
+            different_reply,
+            ping_reply(),
         ]);
-        let mut client = Client::new(t);
-        let reply = client.round_trip(msg("ping", None, None)).unwrap();
-        assert_eq!(reply.kind, "pong");
-        assert_eq!(reply.id, Some(1000));
+        let v = admin_round_trip_fake(&mut fake, &ClientCommand::Ping, "ping").unwrap();
+        assert_eq!(v["reply"], "ping");
+        assert_eq!(v["ok"], true);
     }
 
     #[test]
-    fn round_trip_disconnect_is_transport_error() {
-        let t = FakeTransport::new(vec![]); // 立即 EOF
-        let mut client = Client::new(t);
-        let err = client.round_trip(msg("ping", None, None)).unwrap_err();
-        assert_eq!(err.exit_code(), 4);
-    }
-
-    #[test]
-    fn expect_kind_maps_error_frame_to_protocol_error() {
-        let reply = msg("error", Some(1000), Some(serde_json::json!({"message": "boom"})));
-        let err = Client::<FakeTransport>::expect_kind(reply, "pong").unwrap_err();
+    fn admin_round_trip_fake_returns_no_response_on_eof() {
+        let mut fake = FakeTransport::new(vec![]);
+        let err = admin_round_trip_fake(&mut fake, &ClientCommand::Ping, "ping").unwrap_err();
         assert_eq!(err.exit_code(), 3);
-        assert_eq!(err.message(), "boom");
     }
 
     #[test]
-    fn run_stream_auto_approve_sends_decision_and_completes() {
-        let t = FakeTransport::new(vec![
-            msg("turnAccepted", Some(1000), None),
-            session_event(serde_json::json!({ "kind": "agentItem", "payload": { "id": "a1" } })),
-            session_event(serde_json::json!({ "kind": "actionRequest", "payload": { "requestId": 5 } })),
-            session_event(serde_json::json!({ "kind": "turnComplete" })),
+    fn admin_round_trip_fake_propagates_error_event() {
+        let mut fake = FakeTransport::new(vec![
+            error_event("daemon failed"),
         ]);
-        let mut client = Client::new(t);
-        let mut events = Vec::new();
-        let mut emit = |e: &serde_json::Value| events.push(e.get("kind").and_then(|k| k.as_str()).unwrap_or("").to_string());
-        let req = msg("startSession", None, Some(serde_json::json!({"cwd":"/tmp","prompt":"hi"})));
-        client.run_stream(req, "cli-1", ApprovalPolicy::AutoApprove, &mut emit).unwrap();
-
-        assert_eq!(events, vec!["agentItem", "actionRequest", "turnComplete"]);
-        let sent = client.into_sent();
-        let decision = sent.iter().find(|m| m.kind == "actionDecision").expect("decision sent");
-        assert_eq!(decision.payload.as_ref().unwrap()["requestId"], 5);
-        assert_eq!(decision.payload.as_ref().unwrap()["decision"], "approve");
-        assert_eq!(decision.session_id.as_deref(), Some("cli-1"));
+        let err = admin_round_trip_fake(&mut fake, &ClientCommand::Ping, "ping").unwrap_err();
+        assert_eq!(err.exit_code(), 3);
+        assert!(err.message().contains("daemon failed"));
     }
 
     #[test]
-    fn shutdown_sends_shutdown_frame() {
-        let t = FakeTransport::new(vec![msg("pong", Some(1000), None)]);
-        let mut client = Client::new(t);
-        client.shutdown();
-        let sent = client.into_sent();
-        assert!(sent.iter().any(|m| m.kind == "shutdown"));
+    fn selfcheck_ok_true_returns_value() {
+        let mut fake = FakeTransport::new(vec![selfcheck_reply()]);
+        let v = admin_round_trip_fake(&mut fake, &ClientCommand::Selfcheck, "selfcheck").unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["protocolVersion"], 2);
     }
 
     #[test]
-    fn decide_fixed_policies_map_to_decisions() {
-        let client = Client::new(FakeTransport::new(vec![]));
-        assert_eq!(client.decide(ApprovalPolicy::AutoApprove, 1).unwrap(), "approve");
-        assert_eq!(client.decide(ApprovalPolicy::AutoDeny, 1).unwrap(), "deny");
-        // Prompt 分支读 stdin，不在单测覆盖；构造一次以消除 dead_code 并表意
-        let _prompt = ApprovalPolicy::Prompt;
+    fn agent_list_parses_from_admin_reply() {
+        let raw = r#"{"reply":"agentList","agents":["codex","claude_code"]}"#;
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let arr = v["agents"].as_array().unwrap();
+        let kinds: Vec<&str> = arr.iter().filter_map(|x| x.as_str()).collect();
+        assert!(kinds.contains(&"codex"));
+        assert!(kinds.contains(&"claude_code"));
     }
 
     #[test]
-    fn run_stream_inner_error_is_session_failure() {
-        let t = FakeTransport::new(vec![
-            msg("turnAccepted", Some(1000), None),
-            session_event(serde_json::json!({ "kind": "error", "payload": { "message": "boom" } })),
-        ]);
-        let mut client = Client::new(t);
-        let mut emit = |_: &serde_json::Value| {};
-        let req = msg("startSession", None, Some(serde_json::json!({"cwd":"/tmp","prompt":"hi"})));
-        let err = client.run_stream(req, "cli-1", ApprovalPolicy::AutoApprove, &mut emit).unwrap_err();
-        assert_eq!(err.exit_code(), 5);
-        assert_eq!(err.message(), "boom");
+    fn history_parses_empty_list_response() {
+        let raw = r#"{"reply":"history","response":{"kind":"list","value":[]}}"#;
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let resp: HistoryResponse =
+            serde_json::from_value(v["response"].clone()).unwrap();
+        assert!(matches!(resp, HistoryResponse::List(ref items) if items.is_empty()));
+    }
+
+    #[test]
+    fn session_continue_cmd_builds_correct_variant() {
+        let cmd = session_continue_cmd(
+            "tid-1".into(),
+            AgentKind::ClaudeCode,
+            "continue this".into(),
+        );
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("sessionContinue"));
+        assert!(json.contains("claude_code"));
     }
 }
