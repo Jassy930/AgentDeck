@@ -3,4 +3,5 @@
 //! to consume this lib; until then bin and lib coexist as separate targets.
 
 pub mod agent;
+pub mod codex;
 pub mod runtime;

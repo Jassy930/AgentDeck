@@ -25,6 +25,22 @@ pub mod adapter;
 pub mod capabilities;
 pub mod translate;
 
+// ── v1 implementation (gated) ───────────────────────────────────────────────
+// The original `CodexAdapter` struct + `impl` + Drop + helpers below are kept
+// as source material for Task 3B (which rewrites adapter.rs against the new
+// `Agent` trait). They reference v1 IPC types (Lifecycle, AgentItemKind, …)
+// that were deleted in T1.6, so they CANNOT compile in the v2 lib build.
+//
+// Solution per Phase 3 delta spec: gate the entire v1 body behind the
+// `daemon-bin` feature. The lib build (no features) sees only the
+// `pub mod adapter / capabilities / translate` declarations above —
+// Task 3A's new code lives in `capabilities.rs` + `translate.rs`.
+//
+// Task 3B will incrementally migrate this body into `adapter.rs`; Task 3C
+// finally deletes the gated block and drops the `daemon-bin` feature.
+#[cfg(feature = "daemon-bin")]
+mod v1_legacy {
+
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
@@ -2580,3 +2596,5 @@ mod tests {
         );
     }
 }
+
+} // end mod v1_legacy (cfg = daemon-bin)
