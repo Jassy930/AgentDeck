@@ -2,7 +2,6 @@
 //! must support remote (async, reconnectable, auth context).
 
 use serde::{Deserialize, Serialize};
-use std::fmt::Debug;
 
 /// Auth context carried with a transport connection. v0.2 stdio impl
 /// uses `Anonymous`; v0.5 remote impls fill in token / device id.
