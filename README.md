@@ -245,6 +245,20 @@ cargo test        # daemon: ipc/codex/record/diag/report(含 fixture 回放)
 swift test        # app: 中立协议 + 分行成帧 + headless 请求编码
 ```
 
+### 门控 E2E 测试
+
+E2E 测试需要真实 vendor 二进制，默认 `cargo test` 会跳过它们。
+
+运行前置条件：`codex login` 和 `claude auth login` 均已完成。
+
+```bash
+AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_codex
+AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_claude_code
+AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_cross_agent_history
+```
+
+若某个 vendor 二进制不在 PATH，对应测试会打印 `SKIP:` 并退出 0（不算失败）。
+
 ### 协议
 
 `protocol/` 是从官方 `codex app-server generate-json-schema` 生成的

@@ -1,0 +1,311 @@
+//! Gate: `AGENTDECK_E2E=1` — requires real `codex` binary in PATH and `codex login`.
+//!
+//! Run with:
+//!   AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_codex
+//!
+//! All tests double-gated: skip cleanly when `AGENTDECK_E2E` is unset OR
+//! when the `codex` binary is absent.
+
+use std::process::Command;
+use std::time::Duration;
+
+fn gated() -> bool {
+    std::env::var("AGENTDECK_E2E").is_ok()
+}
+
+fn codex_available() -> bool {
+    which_bin("codex")
+}
+
+fn which_bin(name: &str) -> bool {
+    Command::new("which").arg(name).output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+fn cli_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_agentdeck")
+}
+
+/// Helper: run a CLI command and return output or panic with diagnostics.
+fn run_cli(args: &[&str]) -> std::process::Output {
+    Command::new(cli_bin())
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn agentdeck {args:?}: {e}"))
+}
+
+// ── Basic plumbing ─────────────────────────────────────────────────────────────
+
+#[test]
+fn e2e_codex_ping() {
+    if !gated() {
+        eprintln!("SKIP: set AGENTDECK_E2E=1 to run Codex E2E tests");
+        return;
+    }
+    if !codex_available() {
+        eprintln!("SKIP: codex not in PATH");
+        return;
+    }
+    let out = run_cli(&["ping"]);
+    assert!(
+        out.status.success(),
+        "agentdeck ping failed\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("ping output must be valid JSON");
+    assert_eq!(json["ok"], true, "ping reply must contain ok=true");
+}
+
+#[test]
+fn e2e_codex_selfcheck() {
+    if !gated() { eprintln!("SKIP: set AGENTDECK_E2E=1"); return; }
+    if !codex_available() { eprintln!("SKIP: codex not in PATH"); return; }
+    let out = run_cli(&["selfcheck"]);
+    assert!(
+        out.status.success(),
+        "agentdeck selfcheck failed\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("selfcheck output must be valid JSON");
+    assert_eq!(json["ok"], true, "selfcheck must return ok=true");
+}
+
+// ── Agent subcommands ─────────────────────────────────────────────────────────
+
+#[test]
+fn e2e_codex_agent_list_contains_codex() {
+    if !gated() { eprintln!("SKIP: set AGENTDECK_E2E=1"); return; }
+    if !codex_available() { eprintln!("SKIP: codex not in PATH"); return; }
+    let out = run_cli(&["agent", "list"]);
+    assert!(
+        out.status.success(),
+        "agentdeck agent list failed\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("agent list must be valid JSON");
+    let agents: Vec<&str> = json["agents"]
+        .as_array()
+        .expect("agents must be an array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        agents.contains(&"codex"),
+        "expected 'codex' in agent list, got: {agents:?}"
+    );
+}
+
+#[test]
+fn e2e_codex_agent_capabilities_has_sandbox_mode() {
+    if !gated() { eprintln!("SKIP: set AGENTDECK_E2E=1"); return; }
+    if !codex_available() { eprintln!("SKIP: codex not in PATH"); return; }
+    let out = run_cli(&["agent", "capabilities", "--agent", "codex"]);
+    assert!(
+        out.status.success(),
+        "agentdeck agent capabilities --agent codex failed\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("capabilities output must be valid JSON");
+    let features: Vec<&str> = json["features"]
+        .as_array()
+        .expect("features must be an array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        !features.is_empty(),
+        "Codex capabilities must contain at least one feature"
+    );
+    assert!(
+        features.contains(&"codexSandboxMode"),
+        "Codex capabilities must include 'codexSandboxMode', got: {features:?}"
+    );
+    assert_eq!(json["agentKind"], "codex", "agentKind in capabilities reply must be 'codex'");
+}
+
+// ── Session run / continue ─────────────────────────────────────────────────────
+
+/// Run a Codex session and collect all JSONL event lines until TurnComplete.
+/// Returns `(thread_id, events)`. Panics on timeout (30s) or error event.
+fn run_codex_session(prompt: &str) -> (String, Vec<serde_json::Value>) {
+    use std::io::{BufRead, BufReader};
+
+    let cwd = std::env::current_dir()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    let mut child = Command::new(cli_bin())
+        .args([
+            "session", "run",
+            "--agent", "codex",
+            "--cwd", &cwd,
+            "--prompt", prompt,
+            "--sandbox", "read-only",
+            "--approval", "never",
+            "--reasoning-effort", "minimal",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn agentdeck session run (codex)");
+
+    let stdout = child.stdout.take().expect("child stdout");
+    let reader = BufReader::new(stdout);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut events: Vec<serde_json::Value> = Vec::new();
+    let mut thread_id = String::new();
+
+    for line in reader.lines() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("codex session run timed out after 60s\nevents so far: {events:?}");
+        }
+        let line = line.expect("readline failed");
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        // Capture threadId from sessionStarted or any event that has it
+        if thread_id.is_empty() {
+            if let Some(tid) = val.get("threadId").and_then(|v| v.as_str()) {
+                thread_id = tid.to_string();
+            }
+        }
+        let is_complete = val.get("type").and_then(|t| t.as_str()) == Some("turnComplete");
+        let is_error = val.get("type").and_then(|t| t.as_str()) == Some("error");
+        events.push(val.clone());
+        if is_error {
+            let _ = child.kill();
+            panic!("codex session produced error event: {val}");
+        }
+        if is_complete {
+            break;
+        }
+    }
+
+    let status = child.wait().expect("wait failed");
+    assert!(
+        status.success(),
+        "agentdeck session run (codex) exited non-zero: {status}"
+    );
+    assert!(
+        !thread_id.is_empty(),
+        "no threadId found in session events: {events:?}"
+    );
+
+    // Assert N7: sessionCapabilities must appear before first agentItem
+    let cap_pos = events.iter().position(|v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("sessionCapabilities")
+    });
+    let item_pos = events.iter().position(|v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("agentItem")
+    });
+    if let (Some(cp), Some(ip)) = (cap_pos, item_pos) {
+        assert!(
+            cp < ip,
+            "N7 violation: sessionCapabilities (pos {cp}) must come before first agentItem (pos {ip})"
+        );
+    }
+
+    // Assert turnComplete is present
+    let has_complete = events.iter().any(|v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("turnComplete")
+    });
+    assert!(has_complete, "session must end with turnComplete; events: {events:?}");
+
+    (thread_id, events)
+}
+
+#[test]
+fn e2e_codex_session_run_to_completion() {
+    if !gated() { eprintln!("SKIP: set AGENTDECK_E2E=1"); return; }
+    if !codex_available() { eprintln!("SKIP: codex not in PATH"); return; }
+
+    let (thread_id, events) = run_codex_session("say hi");
+
+    // sessionStarted agentKind must be codex
+    let started = events.iter().find(|v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("sessionStarted")
+    }).expect("sessionStarted event must be present");
+    assert_eq!(
+        started["agentKind"], "codex",
+        "sessionStarted agentKind must be 'codex'"
+    );
+
+    assert!(!thread_id.is_empty(), "threadId must be non-empty after run");
+    eprintln!("codex session run OK, threadId={thread_id}, {} events", events.len());
+}
+
+#[test]
+fn e2e_codex_session_continue_to_completion() {
+    if !gated() { eprintln!("SKIP: set AGENTDECK_E2E=1"); return; }
+    if !codex_available() { eprintln!("SKIP: codex not in PATH"); return; }
+
+    // First run to get a thread_id
+    let (thread_id, _) = run_codex_session("say hi");
+    eprintln!("captured thread_id={thread_id} for continue test");
+
+    // Now continue that session
+    let out = Command::new(cli_bin())
+        .args([
+            "session", "continue",
+            "--thread-id", &thread_id,
+            "--agent", "codex",
+            "--prompt", "ok",
+        ])
+        .output()
+        .expect("failed to spawn agentdeck session continue (codex)");
+
+    assert!(
+        out.status.success(),
+        "agentdeck session continue (codex) failed\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    let has_complete = stdout_str.lines().any(|l| {
+        serde_json::from_str::<serde_json::Value>(l)
+            .ok()
+            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|s| s == "turnComplete"))
+            .unwrap_or(false)
+    });
+    assert!(
+        has_complete,
+        "session continue must produce turnComplete event\nstdout: {stdout_str}"
+    );
+    eprintln!("codex session continue OK (thread_id={thread_id})");
+}
+
+// ── History ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn e2e_codex_history_list_succeeds() {
+    if !gated() { eprintln!("SKIP: set AGENTDECK_E2E=1"); return; }
+    if !codex_available() { eprintln!("SKIP: codex not in PATH"); return; }
+
+    let out = run_cli(&["history", "list", "--agent", "codex"]);
+    assert!(
+        out.status.success(),
+        "agentdeck history list --agent codex failed\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Must return valid JSON — either List (may be empty) or an error envelope
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("history list output must be valid JSON");
+    // kind must be "list"
+    assert_eq!(
+        json["kind"], "list",
+        "history list response must have kind=list; got: {json}"
+    );
+    eprintln!(
+        "codex history list OK, {} items",
+        json["value"].as_array().map(|a| a.len()).unwrap_or(0)
+    );
+}
