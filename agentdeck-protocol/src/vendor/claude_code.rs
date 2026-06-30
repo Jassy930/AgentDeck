@@ -54,7 +54,7 @@ pub struct ClaudeCodeSessionOptions {
 // ── T1.7: ClaudeCodeVendorControl / ClaudeCodeVendorPanelEvent ───────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(tag = "kind", content = "payload", rename_all = "camelCase", deny_unknown_fields)]
 pub enum ClaudeCodeVendorControl {
     UpdatePermissionMode(ClaudeCodePermissionMode),
     UpdateOutputStyle { name: Option<String> },

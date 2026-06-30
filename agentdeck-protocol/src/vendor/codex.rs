@@ -57,7 +57,7 @@ pub struct CodexSessionOptions {
 // ── T1.7: CodexVendorControl / CodexVendorPanelEvent ────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(tag = "kind", content = "payload", rename_all = "camelCase", deny_unknown_fields)]
 pub enum CodexVendorControl {
     UpdateSandbox(CodexSandboxMode),
     UpdateApprovalPolicy(CodexApprovalPolicy),

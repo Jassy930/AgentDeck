@@ -1,44 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
-    "ActionRequest": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "description": "Neutral request for a user decision before the agent performs a risky action. Adapter-specific fields stay behind the daemon boundary; Swift only sees these stable routing and presentation fields.",
-      "properties": {
-        "actionKind": {
-          "type": "string"
-        },
-        "approvalId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "detail": {
-          "type": "string"
-        },
-        "itemId": {
-          "type": "string"
-        },
-        "requestId": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "title": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "actionKind",
-        "detail",
-        "itemId",
-        "requestId",
-        "title"
-      ],
-      "title": "ActionRequest",
-      "type": "object"
-    },
     "AgentItemKind": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "definitions": {
@@ -1601,6 +1563,44 @@
         "kind"
       ],
       "title": "IpcMessage",
+      "type": "object"
+    },
+    "LegacyActionRequest": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Neutral request for a user decision before the agent performs a risky action. Adapter-specific fields stay behind the daemon boundary; Swift only sees these stable routing and presentation fields.\n\nNOTE: renamed to `LegacyActionRequest` in T1.7 to avoid conflict with the new `trunk::ActionRequest` struct. Will be removed in T1.9.",
+      "properties": {
+        "actionKind": {
+          "type": "string"
+        },
+        "approvalId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "detail": {
+          "type": "string"
+        },
+        "itemId": {
+          "type": "string"
+        },
+        "requestId": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "actionKind",
+        "detail",
+        "itemId",
+        "requestId",
+        "title"
+      ],
+      "title": "LegacyActionRequest",
       "type": "object"
     },
     "LegacyAgentItem": {
