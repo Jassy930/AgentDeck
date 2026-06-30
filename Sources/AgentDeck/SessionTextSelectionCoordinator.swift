@@ -33,5 +33,13 @@ final class SessionTextSelectionCoordinator {
         guard activeOwner === owner else { return }
         activeOwner = nil
     }
+
+    /// Clear the currently active selection (if any) and deregister the owner.
+    /// After this call, a freshly activated owner will NOT trigger the old
+    /// owner's clearSelection — proving activeOwner was reset.
+    func clearActiveSelection() {
+        activeOwner?.clearSelection()
+        activeOwner = nil
+    }
 }
 

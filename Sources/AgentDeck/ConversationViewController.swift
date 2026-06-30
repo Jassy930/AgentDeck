@@ -43,6 +43,15 @@ final class ConversationViewController: NSViewController {
     /// coordinator, so the controller does not drive register/unregister.
     private let selectionCoordinator = SessionTextSelectionCoordinator.shared
 
+    // MARK: Event monitor
+
+    /// Local event monitor that clears any active text selection when the user
+    /// clicks on empty (non-text) space inside the conversation transcript.
+    /// Stored so it can be removed in `deinit`. Marked `nonisolated(unsafe)`
+    /// only so the nonisolated deinit can read this non-Sendable `Any?` to
+    /// remove the monitor — the controller is set/read on the main thread.
+    nonisolated(unsafe) private var emptySpaceClickMonitor: Any?
+
     // MARK: State
 
     private var rows: [ConversationDisplayRow] = []
@@ -93,6 +102,9 @@ final class ConversationViewController: NSViewController {
     /// on a transient hide would permanently freeze it on a later show, since
     /// nothing re-binds (I2). This matches `TurnJumpRailView` / `StatusBarView`.
     deinit {
+        if let monitor = emptySpaceClickMonitor {
+            NSEvent.removeMonitor(monitor)
+        }
         let b = binder
         Task { @MainActor in b.invalidate() }
     }
@@ -129,6 +141,7 @@ final class ConversationViewController: NSViewController {
         rebuildRows()
         bindModel()
         observeBoundsChanges()
+        installEmptySpaceClickMonitor()
     }
 
     // MARK: Configuration
@@ -348,6 +361,60 @@ final class ConversationViewController: NSViewController {
 
     @objc private func boundsDidChange() {
         recomputeTopVisibleTurn()
+    }
+
+    // MARK: Empty-space click → clear selection
+
+    /// Install a local left-mouse-down monitor that clears any active text
+    /// selection when the user clicks empty space in the transcript.
+    ///
+    /// Design invariants:
+    /// - The monitor is observe-only: it always returns `event` unchanged so
+    ///   clicks, scrolling, disclosure toggles and row interactions are never
+    ///   consumed.
+    /// - Clicks on a `CoordinatedStreamingTextView` (or a descendant of one)
+    ///   are left untouched; the text view's own `mouseDown` drives activation.
+    /// - Clicks outside the `scrollView` (input bar / sidebar / status bar /
+    ///   rail) are ignored — only the transcript area participates.
+    private func installEmptySpaceClickMonitor() {
+        emptySpaceClickMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+            guard let self else { return event }
+            // Only handle events in this controller's window.
+            guard let window = self.tableView.window, event.window === window else { return event }
+
+            // Convert the click location into the scroll view's coordinate space
+            // and hit-test against the content view hierarchy.
+            let locationInWindow = event.locationInWindow
+            guard let contentView = window.contentView else { return event }
+            let locationInContent = contentView.convert(locationInWindow, from: nil)
+            let locationInScrollView = self.scrollView.convert(locationInContent, from: contentView)
+            let inTranscript = self.scrollView.bounds.contains(locationInScrollView)
+
+            let hitView = contentView.hitTest(locationInContent)
+
+            if ConversationViewController.shouldClearSelection(forHitView: hitView, inTranscript: inTranscript) {
+                self.selectionCoordinator.clearActiveSelection()
+            }
+            return event
+        }
+    }
+
+    /// Pure, testable decision: should a click with the given hit view and
+    /// transcript-membership clear the active text selection?
+    ///
+    /// Returns `true` only when the click is inside the transcript area AND the
+    /// hit view is NOT a `CoordinatedStreamingTextView` nor a descendant of one
+    /// (those handle their own activation via `mouseDown`).
+    static func shouldClearSelection(forHitView hitView: NSView?, inTranscript: Bool) -> Bool {
+        guard inTranscript else { return false }
+        // Walk the superview chain; if we're inside a CoordinatedStreamingTextView
+        // do nothing — let the text view's own mouseDown handle it.
+        var candidate: NSView? = hitView
+        while let view = candidate {
+            if view is CoordinatedStreamingTextView { return false }
+            candidate = view.superview
+        }
+        return true
     }
 
     /// Compute the turnId of the row at the top of the viewport and publish it
