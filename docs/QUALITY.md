@@ -52,10 +52,11 @@ cargo test
 - [ ] TurnJumpRail 导航点随轮次更新；点击可跳转
 - [ ] 继续历史会话：点击历史行 → 右侧回放历史 items
 - [ ] Cmd-Q 正常退出
+- [ ] 选中一段会话文字 → 点击会话区空白处 → 选区清除；点击另一段文字 → 选区切换（跨 cell 单选）
 
-### 已知遗落的功能对等差异
+### 已知功能对等差异
 
-- **点击空白处清除文字选中**：原 SwiftUI 实现中的 `SessionTextSelectionActivationView`（监听区域内鼠标点击来切换 active owner）已在 AppKit 重写后删除，该功能未移植。单条 cell 内点击文字仍可选择；跨 cell 的 active selection 通过 `SessionTextSelectionCoordinator` 正常维护。此差异为有意取舍，不视为缺陷。
+- 当前无已知差异。（曾遗落的「点击空白处清除文字选中」已补回：`SessionTextSelectionCoordinator.clearActiveSelection()` 配合 `ConversationViewController` 的 leftMouseDown 本地监视器；跨 cell 的 active selection 仍由 `SessionTextSelectionCoordinator` 维护。）
 
 ## 测试覆盖率
 
