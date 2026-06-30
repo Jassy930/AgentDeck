@@ -1,101 +1,120 @@
 # AgentDeck
 
-**Codex 写代码，AgentDeck 组织工作。**
+**Codex 写代码，Claude Code 写代码，AgentDeck 是工作台。**
 
-AgentDeck 是一个 macOS 原生的本地 Coding Agent 工作台，通过官方
-[Codex app-server](https://developers.openai.com/codex/app-server) 协议连接
-OpenAI Codex，让你在原生界面里实时看到 agent 在做什么、并掌控它。
+AgentDeck 是 Coding Agent 的统一原生桌面客户端。它把 OpenAI Codex 和
+Anthropic Claude Code 作为**绝对一等公民**，两家的功能、概念和原始语义
+都被完整保留——AgentDeck 不强行统一它们，而是为它们提供同一个工作台。
 
-> 状态：v0.1 开发中。这是一个开源 / 学习项目。
+> 状态：v0.2 开发中（统一壳）。这是一个开源 / 学习项目。
 
 ## 这是什么
 
-每次你让 Codex 干活，AgentDeck 在一个 macOS 原生窗口里流式展示它的
-工作过程 —— 它在想什么（reasoning）、跑了什么命令（shell）、改了哪些
-文件（file-edit）—— 并在它要执行有风险的操作前让你 approve / deny。
+每次你让 Codex 或 Claude Code 干活，AgentDeck 在一个 macOS 原生窗口里
+流式展示它的工作过程 —— 它在想什么（reasoning）、跑了什么命令（shell）、
+改了哪些文件（file-edit）—— 并在它要执行有风险的操作前让你 approve / deny。
+两家 agent 的 vendor 原词（如 Codex approval policy、CC permission mode）
+在 UI 上保留原始语义，不强译为中立词。
 
 AgentDeck **不是** IDE，**不是** Codex Desktop 替代品，**不是**通用多
-agent 聊天界面。它是本地代码项目的 agent 工作台。
+agent 聊天界面。它是 Coding Agent 的工作台、控制台、管理面。
 
-## v0.1 范围
+## v0.2 范围（统一壳）
 
-v0.1 验收两件事（"双拍"）：
+v0.2 在 macOS AppKit 上端到端验证「统一壳」架构：
 
-1. **原生流式会话**：macOS 原生界面，流式渲染 Codex 的
-   reasoning / shell / file-edit item，带交互式 approve / deny。这是
-   "为什么必须 macOS 原生"的证明。
-2. **agent-中立的适配器边界**：daemon 内翻译，IPC 协议本身就是中立的
-   `AgentItem`。Swift 永远不知道 Codex 存在。这是社区能平行贡献
-   Claude Code / SSH / 云端 adapter 的地基 —— 官方产品结构上做不了
-   agent 中立。
+1. **IPC 协议 v2**：两层结构（事件主干中立 + Vendor 控件命名空间）、
+   agent capabilities 握手、Transport trait 预留。
+2. **ClaudeCodeAdapter MVP**：`claude` CLI 子进程接入，CC 特色能力
+   （permission mode、hooks、output-style 等）完整可用。
+3. **UI 整体范式统一**：`CapabilityRouter` 按 `SessionCapabilities` 路由
+   vendor SubView，禁止 UI 硬编码 `if agentKind == .codex` 分支。
+4. **跨 agent 历史聚合**：侧栏同时显示 Codex 和 CC 的历史 thread，带
+   agent kind 图标区分，可各自过滤。
 
-稳定架构边界见 [ARCHITECTURE.md](ARCHITECTURE.md)。完整设计与三层评审记录见
-[docs/plans/](docs/plans/)；文档导航见 [docs/index.md](docs/index.md)。
+稳定架构边界见 [ARCHITECTURE.md](ARCHITECTURE.md)。完整设计见
+[docs/plans/2026-06-30-unified-shell-v02-design.md](docs/plans/2026-06-30-unified-shell-v02-design.md)；
+文档导航见 [docs/index.md](docs/index.md)。
 
 ## 架构
 
 ```
-AgentDeck.app  (macOS, 纯 AppKit)
-      │  前端为 AppKit NSViewController 树（SessionViewController →
-      │  StatusBarView + NSSplitView[HistorySidebarViewController(NSOutlineView)
-      │  | ConversationViewController(虚拟化 NSTableView) + TurnJumpRailView]）；
-      │  Markdown 渲染使用原生 NSAttributedString（已移除 Textual 依赖）；
-      │  模型层经 ObservationBinder 消费 @Observable 模型。
-      │
-      │  stdio JSONL IPC（中立 AgentItem，无 Codex 字样）
+┌─────────────────────────────────────────────────────────────────┐
+│  AgentDeck.app (macOS, AppKit)                                  │
+│                                                                 │
+│  SessionViewController                                          │
+│   ├─ StatusBarView（当前 agentKind + auth）                      │
+│   ├─ HistorySidebarVC（跨 agent 列表 + 过滤器）                   │
+│   ├─ AgentControlBar（capability 路由 → vendor SubView）          │
+│   ├─ ConversationVC（虚拟化 NSTableView，中立 AgentItem）          │
+│   └─ ApprovalCardView（主干壳 + vendor 高级区 SubView）            │
+│                                                                 │
+│  CapabilityRouter  ← UI 渲染按 SessionCapabilities 派发          │
+│  ObservationBinder ← @Observable 模型绑定                        │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ Layer A 中立事件主干（AgentItem）
+                           │ Layer B Vendor 控件命名空间
+                           │ Layer C 启动配置（SessionStart）
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  agentdeckd (Rust daemon)                                       │
+│  RuntimeHub（stdin loop, stdout writer, per-session lock）       │
+│       │                                                         │
+│       └─→ AgentRouter（按 sessionId.agentKind 路由）              │
+│            ├─ CodexAdapter      (capabilities = {...})          │
+│            └─ ClaudeCodeAdapter (capabilities = {...})          │
+│                                                                 │
+│  共享层：record / diag / profile / capabilities registry         │
+└─────────────────────────────────────────────────────────────────┘
+   ▼ spawn (turn-scoped)                  ▼ spawn (turn-scoped)
+codex app-server                       claude CLI (--print --stream-json)
+
+agentdeck-cli  (参考客户端 / 门控 E2E 驱动，不在 GUI 实时通路上)
+      │  通过 stdio JSONL 与 agentdeckd 交互（Transport trait）
       ▼
-agentdeckd  (Rust daemon)
-      │  ├── async runtime hub（stdin main loop + stdout writer）
-      │  ├── turn/history workers（带 sessionId/threadId 路由）
-      │  ├── CodexAdapter（Codex item → 中立 AgentItem 翻译）
-      │  └── 进程组拥有 app-server，退出连带 kill
-      ▼
-codex app-server  (子进程, JSON-RPC over stdio)
+agentdeckd
 ```
 
-中立边界的物理位置 = IPC 协议本身。可验证事实：IPC schema 里不出现
-任何 Codex 字样。
+IPC 协议两层：Layer A 事件主干严禁出现 vendor 字样（N1 不变量守护）；
+Layer B Vendor 控件命名空间允许 vendor 前缀但类型化（禁 `serde_json::Value`
+透传，N4 守护）。UI 通过 `CapabilityRouter` 消费 `SessionCapabilities`
+选择渲染路径，不得硬编码 `if agentKind == .codex` 分支（N2 守护）。
 
 AgentDeck 使用一个 `agentdeckd` 作为 runtime hub。daemon 的 stdin 主循环不被
 单个 turn 阻塞；每个后台 turn 由独立 worker 持有 turn 级 adapter，turn 结束即
-释放，所有 worker 通过统一 stdout writer 输出带 `sessionId/threadId` 的中立事件。历史请求按 request id
-分发 reply，不和 streaming `agentItem` 抢 reader。RuntimeHub 会阻止同一
-`sessionId` 同时启动多个 turn，并限制并发 history worker；超限时返回明确
-busy error，而不是继续无界创建线程。需要用户确认的高风险动作会由 Codex
-app-server 的 server request 映射成中立 `actionRequest`，Swift 只显示
-`title/detail/actionKind` 并回写 `actionDecision`；daemon 再把 approve / deny
-翻译回 app-server response。
+释放，所有 worker 通过统一 stdout writer 输出带 `sessionId/threadId/agentKind`
+的中立事件。RuntimeHub 会阻止同一 `sessionId` 同时启动多个 turn；超限时
+返回明确 busy error。`AgentRouter` 按 session 创建时绑定的 `agentKind` 路由
+到对应 adapter，`agentKind` 一旦绑定不可变（K2）。
 
-流式性能边界：daemon 不合并 Codex delta，而是忠实转发中立
-`agentItem`；Swift 端的 `SessionModel` 按约 30fps 合并待渲染 delta，并把
+流式性能边界：Swift 端的 `SessionModel` 按约 30fps 合并待渲染 delta，并把
 message / reasoning / shell / diff 长文本交给 AppKit `NSTextView` +
 `NSTextStorage` 增量追加；会话流由虚拟化 NSTableView 按需渲染可见行，
 避免在 token 流中反复布局整个视图树。
 
-## 历史会话
+## 历史会话（跨 agent）
 
-AgentDeck 可以通过 Codex app-server 扫描 Codex 已持久化的历史
-thread，并按项目 `cwd` 分组显示。点击历史 thread 后，AgentDeck 会读取
-`thread/read(includeTurns: true)` 返回的 turns/items，并用同一套中立
-`AgentItem` stream 回放到右侧。
+v0.2 起历史侧栏聚合 **Codex + Claude Code** 两家历史 thread，带 agent kind
+图标区分，可按 agent 过滤。这是 AgentDeck 区别于 Codex Desktop 的第一个
+面向用户的价值。
 
-历史回放会保留 Codex app-server schema 里的已知 `ThreadItem`：用户消息
-（含图片、skill、mention 引用）、模型回复、reasoning 摘要、计划、hook
-prompt、shell（含 cwd、状态、耗时、来源、解析出的 command actions）、
-多文件变更、MCP / dynamic tool call、协作子代理调用、web search、图片查看 /
-生成、review mode 事件和 context compaction。未知块仍以可见的 `raw` 记录
-出现，避免静默丢失。
+**Codex 历史**：通过 Codex app-server 扫描已持久化的历史 thread，按项目
+`cwd` 分组显示。点击历史 thread 后读取 `thread/read(includeTurns: true)`
+返回的 turns/items，用同一套中立 `AgentItem` stream 回放到右侧。历史回放
+保留已知 `ThreadItem`（用户消息、模型回复、reasoning、计划、shell、diff、
+MCP/tool call、web search、图片等）；未知块以可见 `raw` 记录出现。
 
-图片查看 / 生成事件会优先使用中立 `AgentItem` 的 `savedPath`，回退到 `path`，
-在会话流里直接显示本地图片预览，同时保留路径 metadata 便于定位原文件。
+**Claude Code 历史**：通过 `claude agents --json` 及直读
+`~/.claude/projects/<encoded_cwd>/<id>.jsonl` 获取，事实唯一来源在 CC 原生
+接口（N8 不变量：AgentDeck 不建 `cc-meta/` 目录）。Archive 走 `claude rm`
+（软删，`--resume` 仍能找回）；Rename 走 `claude --resume <id> --name`；
+Unarchive 等同 no-op（CC 不区分 unarchive）。
 
-继续历史会话时，AgentDeck 走 `thread/resume(threadId)` 后再执行
-`turn/start`，因此新 prompt 会进入原有 Codex 上下文，而不是创建新
-thread。历史详情读取在后台完成，点击后先标记正在打开，详情返回后再回放到
-右侧，并记录 read / apply 耗时，便于继续定位慢点。大段 shell output 和
-diff 默认只保留摘要与原文，展开时才填充 TextKit buffer，避免大历史
-thread 阻塞主界面。AgentDeck 只做轻量索引、回放和管理入口；Codex
-持久化历史仍是上下文真相源。
+继续历史会话时，Codex 走 `thread/resume(threadId)`；CC 走
+`claude --resume <id>`。历史读取操作必须带 `agent_kind`（两家持久化结构不同）。
+
+历史详情读取在后台完成，点击后先标记正在打开，详情返回后再回放到右侧。大段
+shell output 和 diff 展开时才填充 TextKit buffer，避免大历史 thread 阻塞主界面。
 
 历史详情回放会进入 Swift 端 `WorkbenchModel` 中独立的 `ThreadRuntimeModel`。
 打开历史 thread 只切换当前选中的 runtime 和右侧视图，不会把其他正在运行的
@@ -173,18 +192,29 @@ agentdeck selfcheck                     # IPC 生命周期 + logging 自检
 agentdeck diagnostics report            # 输出机器可读诊断报告（JSON）
 agentdeck protocol schema               # 打印 IPC 协议 JSON Schema
 agentdeck protocol version              # 打印协议版本号
-agentdeck session run \
-  --cwd <path> --prompt "..."           # 启动流式会话（--cwd 必填）
+
+# v0.2 新增：agent 子命令组
+agentdeck agent list                           # 列出可用 adapter
+agentdeck agent capabilities --agent <kind>    # 列某 adapter capabilities（JSON）
+
+# session 子命令（v0.2 起须带 --agent）
+agentdeck session run --agent codex \
+  --cwd <path> --prompt "..."           # Codex 新会话（--cwd 必填）
+agentdeck session run --agent claude-code \
+  --cwd <path> --prompt "..."           # Claude Code 新会话
 agentdeck session continue \
   --thread-id <id> --prompt "..."       # 继续历史 thread
-agentdeck history list                  # 列出历史 threads
-agentdeck history read <id>             # 读取历史 thread 详情
-agentdeck history archive <id>          # 归档 thread
-agentdeck history unarchive <id>        # 取消归档
-agentdeck history rename <id> <title>   # 重命名 thread
+
+# history 子命令（v0.2 起跨 agent；--agent 可选过滤）
+agentdeck history list                         # 跨 agent 列出全部历史 threads
+agentdeck history list --agent claude-code     # 仅 CC 历史
+agentdeck history read <id> --agent <kind>     # 读取历史 thread（必须带 --agent）
+agentdeck history archive <id> --agent <kind>  # 归档 thread
+agentdeck history unarchive <id> --agent <kind># 取消归档
+agentdeck history rename <id> --agent <kind> <title>  # 重命名 thread
 ```
 
-`session run/continue` 支持 `--approval-policy prompt|auto-approve|auto-deny`（默认 `prompt`，等待 stdin 输入）。
+`session run/continue` 支持 `--approval-policy prompt|auto-approve|auto-deny`（默认 `prompt`，等待 stdin 输入）。`--agent` 取值 `codex` 或 `claude-code`（snake_case 线形式为 `claude_code`）。
 
 ### 输出与退出码契约
 
@@ -289,9 +319,11 @@ Agent 自查流程见 [docs/AGENT_DIAGNOSTICS.md](docs/AGENT_DIAGNOSTICS.md)。
 
 ## 贡献
 
-AgentDeck 的核心是那条 agent-中立适配器接口。今天它只有一个
-`CodexAdapter`；社区可以平行贡献新 adapter（Claude Code、SSH 远程、
-云端 agent）。贡献指南待补（adapter 接口稳定后）。
+AgentDeck 的核心是 `Agent` trait + `CapabilityRouter` 组成的一等公民
+适配器接口。v0.2 已有 `CodexAdapter` 和 `ClaudeCodeAdapter` 两家实现；
+社区可以按同样标准平行贡献新 adapter（SSH 远程、云端 agent 等）。
+新增 adapter 不得要求 Swift 侧知道该 adapter 的 vendor JSON，
+也不得阉割已有 adapter 的 capability（N5 对称约束）。贡献指南待补。
 
 ## License
 

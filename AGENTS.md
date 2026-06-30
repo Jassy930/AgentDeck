@@ -4,24 +4,25 @@
 
 ## 必读顺序
 
-1. `NORTH_STAR.md`：产品北极星和 v0.1 不做什么。
+1. `NORTH_STAR.md`：产品北极星和 v0.2 必赢目标。
 2. `README.md`：当前用户可见能力、架构摘要、构建与测试命令。
-3. `ARCHITECTURE.md`：稳定架构、分层边界、依赖方向和不变量。
+3. `ARCHITECTURE.md`：稳定架构、分层边界、依赖方向和不变量（v0.2 含 N1–N8 新不变量）。
 4. `docs/index.md`：文档记录系统导航。
-5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code。
-6. `docs/QUALITY.md`：验证命令、质量门禁和文档结构检查。
-7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。修改相关功能前先读最近的设计文档和实施计划。当前重点：`docs/plans/2026-06-30-unified-shell-v02-design.md`（v0.2 统一壳：Codex 与 Claude Code 双一等公民 + IPC v2 + 新不变量 N1–N8）。
+5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code（含 CC adapter failure codes）。
+6. `docs/QUALITY.md`：验证命令、质量门禁和文档结构检查（含 v0.2 手动 QA 清单）。
+7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前重点：`docs/plans/2026-06-30-unified-shell-v02-design.md`（v0.2 统一壳：Codex 与 Claude Code 双一等公民 + IPC v2 + 新不变量 N1–N8）和实施计划 `docs/plans/2026-06-30-unified-shell-v02-implementation.md`。
 8. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
 
 ## 项目边界
 
-- AgentDeck 是 macOS 原生的本地 Coding Agent 工作台，不是 IDE、不是 Codex Desktop 替代品，也不是通用多 agent 聊天界面。
-- v0.1 的核心是原生流式会话和 agent-中立适配器边界。
-- 中立边界在 IPC 协议本身：Swift UI 只处理中立 `AgentItem`，不得解析 Codex vendor JSON。
-- Codex 细节只能留在 Rust daemon adapter 层；新增 adapter 不能要求 Swift 侧知道具体 agent。
-- `protocol/` 中 schema 必须来自官方 `codex app-server generate-json-schema`，不要手写或逆向猜测协议。
-- AgentDeck 不读取、不保存、不转发 Codex token；沿用用户已有 `codex login` 状态。
-- AgentDeck 管理的 run record 与 diagnostic log 写入 `~/Library/Application Support/AgentDeck/`，不得写入用户项目 git。
+- AgentDeck 是 Coding Agent 的统一原生桌面客户端，把 Codex 和 Claude Code 作为绝对一等公民，不是 IDE、不是 Codex Desktop 替代品、不是通用多 agent 聊天界面。
+- v0.2 核心：IPC v2 双层协议 + ClaudeCodeAdapter MVP + CapabilityRouter + 跨 agent 历史聚合。
+- UI 必须通过 `CapabilityRouter` 按 `SessionCapabilities` 路由渲染路径，禁止 `if agentKind == .codex` 硬编码分支（N2）。
+- IPC 主干类型严禁出现 vendor 字样；vendor 字段只能出现在 `capabilities.*` / `vendorControl.*` / `vendorPanel.*` 命名空间（N1）。
+- Codex 细节只能留在 `agentdeckd/src/codex/` 子模块；CC 细节只能留在 `agentdeckd/src/claude_code/` 子模块；两者互不知晓（N3）。
+- `protocol/` 中 Codex schema 必须来自官方 `codex app-server generate-json-schema`，不要手写或逆向猜测协议（K8）。
+- AgentDeck 不读取、不保存、不转发任何 vendor token（Codex 或 Claude Code）；CC 历史走 CC 原生接口，不建 `cc-meta/` 目录（K9、N8）。
+- AgentDeck 管理的 run record 与 diagnostic log 写入 `~/Library/Application Support/AgentDeck/`，不得写入用户项目 git（K5）。
 
 ## 工作规则
 

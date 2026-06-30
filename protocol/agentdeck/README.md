@@ -14,3 +14,58 @@
 ## actionDecision 线形态（非 typed 结构，故不在 schema）
 `{ "kind": "actionDecision", "id": <u64>, "sessionId": <string>,
    "payload": { "requestId": <u64>, "decision": "approve"|"deny"|"cancel" } }`
+
+## v0.2 起：两层协议
+
+v0.2 引入了严格的两层协议结构：
+
+### Layer A — 事件主干（中立，vendor 中性）
+
+包含：`AgentItem` / `ActionRequest` / `TurnComplete` / `SessionStarted` /
+`SessionCapabilities` / `Error`。
+
+**守护规则**：主干类型严禁出现 `Codex`、`OpenAI`、`Anthropic`、`Claude` 字样。
+由 `agentdeck-protocol/src/neutrality_tests.rs` 中的静态断言守护（N1 不变量）。
+
+每条主干事件必须带 `agentKind` 字段（K4 升级）。`SessionCapabilities` 必须
+先于该 session 的任何 `AgentItem`（N7 不变量）。
+
+### Layer B — Vendor 控件命名空间
+
+包含：`VendorControl` / `VendorPanelEvent`。
+
+payload 是 enum-by-AgentKind，类型化，禁止 `serde_json::Value` 透传（N4 不变量）。
+vendor 字段只能出现在 `capabilities.*` / `vendorControl.*` / `vendorPanel.*` 三个
+命名空间下。
+
+### 四道守护测试
+
+`agentdeck-protocol` 共有 30 个测试守护协议正确性，其中四道核心守护：
+
+1. `schema_matches_committed_snapshot` — 协议类型变更必须重生成 schema 快照（K10）
+2. `protocol_neutrality_main_trunk` — 主干类型不出现 vendor 字样（N1）
+3. `capabilities_namespace_is_typed` — vendor enum variant 不含 `serde_json::Value` 或裸 `String` raw payload（N4）
+4. `agent_kind_appears_on_every_trunk_event` — 主干 enum 全部 variant 都有 `agent_kind` 字段（K4）
+
+### UPDATE_SCHEMA 命令
+
+改动 `agentdeck-protocol` 中任何公开类型后，须重生成 schema 快照，否则
+`schema_matches_committed_snapshot` 测试失败：
+
+```bash
+UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot
+```
+
+重生成后须将快照提交进仓库：
+
+```bash
+git add protocol/agentdeck/agentdeck-protocol.schema.json
+```
+
+独立验证 schema 与当前代码同步（无需运行 test）：
+
+```bash
+cargo run -q -p agentdeck-cli -- protocol schema \
+  | diff - protocol/agentdeck/agentdeck-protocol.schema.json \
+  && echo "schema in sync"
+```

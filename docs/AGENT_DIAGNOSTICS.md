@@ -77,3 +77,42 @@ Codex 的命令执行、文件变更和额外权限审批会先在 daemon adapte
 3. 如果控件点击后没有继续，检查 Swift 是否发送 `kind=actionDecision` 且带
    `sessionId`、`requestId` 和 `decision`。
 4. 如果 daemon 返回 error，按同一 `requestId` 查看 diagnostic log 和 run record。
+
+## Claude Code Adapter Failure Codes（v0.2 新增）
+
+| code | 含义 | 下一步 |
+| --- | --- | --- |
+| `cc-not-installed` | `claude` 二进制不存在 | 运行 `npm install -g @anthropic-ai/claude-code` 安装 Claude Code CLI |
+| `cc-version-too-old` | `claude` 版本过老，不支持 `--output-format stream-json` | 运行 `npm update -g @anthropic-ai/claude-code` 升级到最低支持版本 |
+| `cc-not-authenticated` | 用户未 `claude auth login` | 运行 `claude auth login` 完成登录 |
+| `cc-spawn-failed` | `claude` CLI 进程 spawn 失败（权限或路径问题） | 检查 `PATH` 和 `claude` 可执行权限；确认 GUI 启动环境里 `node` 可找到 |
+| `cc-history-not-found` | 指定 session_id 在 `~/.claude/projects/` 下找不到对应 `.jsonl` | 确认 session_id 正确；历史可能已被 `claude rm` 彻底删除 |
+| `cc-history-parse-failed` | 读取 CC `.jsonl` 历史文件时解析失败 | 检查 `~/.claude/projects/<encoded_cwd>/<id>.jsonl` 文件格式；可能是 CC 版本升级导致格式变更 |
+| `cc-archive-not-supported` | 对普通 CC session 调用 `claude rm`（仅 background-agent 支持） | 普通 session 不支持 archive；历史会保留在原路径，可用 `--resume` 继续 |
+| `cc-archive-failed` | `claude rm` 执行失败（非 0 退出） | 查看 daemon diagnostic log 中的 stderr 摘要 |
+| `cc-rename-failed` | `claude --resume <id> --name <title>` 执行失败 | 确认 session_id 存在且 `claude` 版本支持 `--name` 参数 |
+| `cc-vendor-control-requires-new-turn` | CC 的 permission mode 等 vendor 控件变更需通过新 turn 生效，不支持会话内即时切换 | 下次启动新 session 或新 turn 时携带更新后的 `ClaudeCodeSessionOptions` |
+| `cc-vendor-control-not-supported` | 收到不支持的 ClaudeCodeVendorControl variant | 检查 client 与 daemon 协议版本是否匹配（v2）；升级 client 到最新版 |
+
+## v0.2 双 adapter 探测
+
+v0.2 起 daemon 注册了 Codex 和 ClaudeCode 两个 adapter。`agentdeck selfcheck` 和
+`swift run AgentDeck -- --selfcheck` 会在响应中报告已注册的 adapter 列表：
+
+```bash
+# CLI 探测（输出 JSON，含 adapters 数组）
+agentdeck selfcheck
+
+# 查看可用 adapter 列表
+agentdeck agent list
+
+# 查看各 adapter 的 capabilities
+agentdeck agent capabilities --agent codex
+agentdeck agent capabilities --agent claude-code
+```
+
+若 selfcheck 只报告一个 adapter，说明另一个 adapter 的 preflight 探测失败
+（对应 `cc-not-installed` / `cc-not-authenticated` 等错误码）。先修复对应
+failure，再重跑 selfcheck 验证。
+
+两家 adapter 互不影响：Codex 不可用时 CC 仍可正常工作，反之亦然。

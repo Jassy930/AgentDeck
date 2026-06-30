@@ -177,6 +177,29 @@ AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e
 - 如果失败来自文档漂移，优先更新真实文档或检查脚本，不要绕过规则。
 - 如果失败来自 flaky 外部条件，记录命令、错误和复验结果到对应计划文档。
 
+## v0.2 手动 QA 清单（每次 v0.2 发布前必须勾选）
+
+下列项目须人工验证，在 `swift run AgentDeck` 真实运行时逐项确认：
+
+- [ ] 同窗口可启动 Codex 会话 / CC 会话 / 在两者间切换
+- [ ] CC 流式消息、reasoning、shell、diff 渲染对等于 Codex
+- [ ] CC permission mode（6 种）下拉可切换，新 turn 生效
+- [ ] Plan mode 进入后 UI 显示 Plan 内容并可批准/拒绝
+- [ ] CC tool use 触发 approval 时显示卡片，底部 vendor 区显示"当前 permission mode + tool name"
+- [ ] Codex tool use 触发 approval 时显示卡片，底部 vendor 区显示 sandbox + policy + persist
+- [ ] CC 历史 thread 在侧栏与 Codex 历史共存，带 agent kind 图标区分
+- [ ] CC 历史 thread 点开可回放 + 继续
+- [ ] CC archive（`claude rm` 调用）后侧栏不可见；通过过滤器"已归档"仍可见
+- [ ] CC rename 后侧栏标题更新；终端 `claude --resume <id>` 看到同名
+- [ ] CC 未登录 → 明确诊断错误，不静默
+- [ ] CC 二进制不存在 → 明确诊断错误，附 `npm install` 提示
+- [ ] Token usage 在 mini 面板显示
+- [ ] Output Style 下拉可见
+- [ ] CC capability、Codex 没的，UI 仅在 CC session 显示对应控件
+- [ ] Codex capability、CC 没的，UI 仅在 Codex session 显示对应控件
+- [ ] AgentDeck 创建的 CC 会话，在终端 `claude --resume <id>` 能看见且能继续（事实唯一来源验证）
+- [ ] `cargo test` + `swift test` + `agentdeck selfcheck` + `scripts/verify-agent-docs.sh` 全绿
+
 ## 收口清单
 
 阶段性工作结束前至少完成：
