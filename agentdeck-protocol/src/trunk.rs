@@ -259,6 +259,60 @@ pub enum VendorPanelPayload {
     ClaudeCode(ClaudeCodeVendorPanelEvent),
 }
 
+// ── T1.8: HistoryRequest / HistoryListItem / HistoryReadResponse / HistoryTurn ─
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "camelCase", deny_unknown_fields)]
+pub enum HistoryRequest {
+    List {
+        agent_kind: Option<AgentKind>,
+        cwd_filter: Option<PathBuf>,
+    },
+    Read {
+        thread_id: ThreadId,
+        agent_kind: AgentKind,
+    },
+    Archive {
+        thread_id: ThreadId,
+        agent_kind: AgentKind,
+    },
+    Unarchive {
+        thread_id: ThreadId,
+        agent_kind: AgentKind,
+    },
+    Rename {
+        thread_id: ThreadId,
+        agent_kind: AgentKind,
+        title: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HistoryListItem {
+    pub thread_id: ThreadId,
+    pub agent_kind: AgentKind,
+    pub title: Option<String>,
+    pub cwd: PathBuf,
+    /// epoch milliseconds; for sorting only
+    pub last_active_ms: u64,
+    pub archived: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HistoryReadResponse {
+    pub thread_id: ThreadId,
+    pub agent_kind: AgentKind,
+    pub turns: Vec<HistoryTurn>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HistoryTurn {
+    pub items: Vec<AgentItem>,
+}
+
 // ServerEvent — main trunk
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]

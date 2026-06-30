@@ -30,6 +30,7 @@ pub use trunk::{
 pub use trunk::{ActionDecision, ActionDecisionKind, ActionKind, ActionRequest, ActionRequestVendor, VendorControlPayload, VendorPanelPayload};
 pub use vendor::codex::{CodexVendorControl, CodexVendorPanelEvent};
 pub use vendor::claude_code::{ClaudeCodeVendorControl, ClaudeCodeVendorPanelEvent};
+pub use trunk::{HistoryListItem, HistoryReadResponse, HistoryRequest, HistoryTurn};
 
 // 现有所有类型保持不变（T1.5/T1.6 之后才迁移）
 
