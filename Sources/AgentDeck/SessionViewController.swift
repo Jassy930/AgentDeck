@@ -37,7 +37,13 @@ final class SessionViewController: NSViewController {
 
     // MARK: - Sub-view controllers
 
-    private lazy var historySidebarVC = HistorySidebarViewController(model: model)
+    private lazy var historySidebarVC: HistorySidebarViewController = {
+        let vc = HistorySidebarViewController(model: model)
+        vc.onNewSessionRequested = { [weak self] in
+            self?.presentNewSessionDialog()
+        }
+        return vc
+    }()
     private lazy var conversationVC   = ConversationViewController(model: model)
 
     // MARK: - Views / containers
@@ -45,6 +51,13 @@ final class SessionViewController: NSViewController {
     private let statusBarView: StatusBarView
     private let rail: TurnJumpRailView
     private let emptyStateView: EmptyStateView
+
+    /// T6B: agent control bar — bound to `selectedRuntime?.capabilities`.
+    private let controlBar = AgentControlBar()
+    private var controlBarHeight: NSLayoutConstraint?
+
+    /// T6B: optional new-session dialog, retained while open.
+    private var newSessionDialog: NewSessionDialog?
 
     /// Container placed as the right pane of the split; we swap its content
     /// child between EmptyStateView and the conversation+rail composite.
@@ -84,6 +97,11 @@ final class SessionViewController: NSViewController {
         statusBarView.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(statusBarView)
 
+        // T6B: agent control bar sits below the status bar; height collapses to 0
+        // when no runtime/capabilities are active.
+        controlBar.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(controlBar)
+
         // 1pt separator between status bar and split pane
         let separator = NSBox()
         separator.boxType = .separator
@@ -114,13 +132,21 @@ final class SessionViewController: NSViewController {
         splitVC.view.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(splitVC.view)
 
+        let controlBarH = controlBar.heightAnchor.constraint(equalToConstant: 0)
+        controlBarHeight = controlBarH
+
         NSLayoutConstraint.activate([
             statusBarView.topAnchor.constraint(equalTo: root.topAnchor),
             statusBarView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             statusBarView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             statusBarView.heightAnchor.constraint(equalToConstant: 36),
 
-            separator.topAnchor.constraint(equalTo: statusBarView.bottomAnchor),
+            controlBar.topAnchor.constraint(equalTo: statusBarView.bottomAnchor),
+            controlBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            controlBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            controlBarH,
+
+            separator.topAnchor.constraint(equalTo: controlBar.bottomAnchor),
             separator.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             separator.trailingAnchor.constraint(equalTo: root.trailingAnchor),
 
@@ -135,8 +161,10 @@ final class SessionViewController: NSViewController {
         buildConversationComposite()
         wireRailCallbacks()
         observeCwdChanges()
+        observeCapabilities()
         // Apply initial content based on current cwd state
         updateContentPane(hasCwd: model.cwd != nil)
+        refreshControlBar()
     }
 
     override func viewDidLayout() {
@@ -212,6 +240,59 @@ final class SessionViewController: NSViewController {
             guard let self else { return }
             self.updateContentPane(hasCwd: self.model.cwd != nil)
         })
+    }
+
+    // MARK: - T6B: capabilities observation → AgentControlBar swap
+
+    private let capabilitiesBinder = ObservationBinder()
+
+    private func observeCapabilities() {
+        capabilitiesBinder.bind({ [weak self] in
+            guard let self else { return }
+            _ = self.model.workbench.selectedSessionId
+            _ = self.model.workbench.selectedRuntime?.capabilities?.agentKind
+        }, onChange: { [weak self] in
+            self?.refreshControlBar()
+        })
+    }
+
+    private func refreshControlBar() {
+        if let caps = model.workbench.selectedRuntime?.capabilities {
+            controlBar.bind(capabilities: caps)
+            controlBarHeight?.constant = 30
+        } else {
+            controlBar.clear()
+            controlBarHeight?.constant = 0
+        }
+    }
+
+    /// T6B: present the new-session dialog and dispatch the resulting
+    /// `SessionStart` to the workbench → daemon path.
+    func presentNewSessionDialog() {
+        let dlg = NewSessionDialog()
+        dlg.onSubmit = { [weak self] start in
+            self?.handleNewSessionStart(start)
+        }
+        newSessionDialog = dlg
+        if let win = dlg.window {
+            view.window?.beginSheet(win) { [weak self] _ in
+                self?.newSessionDialog = nil
+            }
+        }
+    }
+
+    private func handleNewSessionStart(_ start: SessionStart) {
+        // 在 v0.2 阶段，SessionModel 通过 workbench.submit 自带 sessionStart
+        // 的链路尚未暴露，这里先把 cwd 切到 dialog 选择的目录、并 submit prompt。
+        // 完整的 explicit-start (无需 prompt) 走 daemon `sessionStart` 命令在
+        // T6.10 的 dialog 提交链路里补全。当前先做最小可工作的 cwd+prompt 提交。
+        if let cwdMsg = model.chooseCwd(URL(fileURLWithPath: start.cwd)) {
+            model.workbench.selectedRuntime?.warningMessage = cwdMsg
+            return
+        }
+        if let prompt = start.prompt, !prompt.isEmpty {
+            model.submit(prompt, agentKind: start.agentKind)
+        }
     }
 
     /// Swap EmptyStateView ↔ conversationComposite inside `contentContainer`.

@@ -1,6 +1,6 @@
 import AppKit
 
-// MARK: - ApprovalCardView (Task 8)
+// MARK: - ApprovalCardView (Task 8 → T6B vendor slot)
 //
 // The ONE card in the conversation pane (Design law D7: only approval draws a
 // card). Ports the SwiftUI `approvalRow` (SessionView.swift ~915):
@@ -8,10 +8,15 @@ import AppKit
 //   ┌─────────────────────────────────────────────────────────┐
 //   │ 🖐  <title>                            [ Deny ] [Approve ]│
 //   │ <detail, monospaced, secondary>                          │
+//   │ ─── vendor slot (CapabilityRouter.bottomView) ────────── │
+//   │ Codex:  Policy: on-request   Sandbox: workspace-write    │
+//   │         [Persist this decision]                          │
+//   │ Claude: Permission mode: default   Tool: Bash            │
 //   └─────────────────────────────────────────────────────────┘
 //
 // Backed by a pending `ActionRequest` (ThreadRuntimeModel.swift). Approve/Deny
-// route straight to `SessionModel.decidePendingAction("approve"|"deny")`.
+// route through `SessionModel.decidePendingAction(.approve|.deny, persist:)`;
+// the `persist` flag is read from the vendor SubView (only Codex sets it for now).
 @MainActor
 final class ApprovalCardView: NSView {
 
@@ -39,6 +44,19 @@ final class ApprovalCardView: NSView {
     }()
     private let denyButton = NSButton(title: "Deny", target: nil, action: nil)
     private let approveButton = NSButton(title: "Approve", target: nil, action: nil)
+
+    /// 容纳 vendor 槽位的纵向 stack（垂直延伸 ApprovalCard 高度）。
+    private let column: NSStackView = {
+        let s = NSStackView()
+        s.orientation = .vertical
+        s.alignment = .leading
+        s.spacing = 8
+        s.translatesAutoresizingMaskIntoConstraints = false
+        return s
+    }()
+
+    /// 当前嵌入的 vendor 视图（CodexApprovalPanel 或 ClaudeCodePermissionPanel）。
+    private(set) var vendorBottomView: NSView?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -78,15 +96,11 @@ final class ApprovalCardView: NSView {
         headerRow.alignment = .centerY
         headerRow.spacing = 8
         headerRow.translatesAutoresizingMaskIntoConstraints = false
-        // Title takes the slack between glyph and the trailing buttons.
         headerRow.setCustomSpacing(8, after: icon)
         titleLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-        let column = NSStackView(views: [headerRow, detailLabel])
-        column.orientation = .vertical
-        column.alignment = .leading
-        column.spacing = 8
-        column.translatesAutoresizingMaskIntoConstraints = false
+        column.addArrangedSubview(headerRow)
+        column.addArrangedSubview(detailLabel)
 
         addSubview(column)
         NSLayoutConstraint.activate([
@@ -104,10 +118,14 @@ final class ApprovalCardView: NSView {
     }
 
     /// Bind the card to the pending request and the model that decides it.
-    /// v2 (Task 6A): consumes typed `PendingActionRequest`; Task 6B will
-    /// route the `vendor` slot to per-agent vendor SubViews under the
-    /// header. v0.2 stub renders only the neutral trunk fields.
-    func configure(action: PendingActionRequest, model: SessionModel) {
+    ///
+    /// `capabilities` 决定 vendor 槽位的渲染；为空时回退到只有 trunk 的旧
+    /// 行为（兼容 capabilities 未到达前的窗口期）。
+    func configure(
+        action: PendingActionRequest,
+        model: SessionModel,
+        capabilities: SessionCapabilities? = nil
+    ) {
         self.model = model
         let title: String
         switch action.actionKind {
@@ -118,10 +136,28 @@ final class ApprovalCardView: NSView {
         titleLabel.stringValue = title
         detailLabel.stringValue = action.summary
         detailLabel.isHidden = action.summary.isEmpty
+
+        // 替换 vendor 槽位
+        vendorBottomView?.removeFromSuperview()
+        vendorBottomView = nil
+        guard let capabilities else { return }
+        let request = ActionRequest(
+            requestId: action.requestId,
+            kind: action.actionKind,
+            summary: action.summary,
+            vendor: action.vendor
+        )
+        let bottom = CapabilityRouter.bottomView(for: request, in: capabilities)
+        bottom.translatesAutoresizingMaskIntoConstraints = false
+        column.addArrangedSubview(bottom)
+        bottom.leadingAnchor.constraint(equalTo: column.leadingAnchor).isActive = true
+        bottom.trailingAnchor.constraint(equalTo: column.trailingAnchor).isActive = true
+        vendorBottomView = bottom
     }
 
     @objc private func approve() {
-        model?.decidePendingAction(.approve)
+        let persist = (vendorBottomView as? CodexApprovalPanel)?.persistEnabled ?? false
+        model?.decidePendingAction(.approve, persist: persist)
     }
 
     @objc private func deny() {

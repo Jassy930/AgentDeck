@@ -37,6 +37,20 @@ final class HistorySidebarViewController: NSViewController {
         return btn
     }()
 
+    /// T6B: "+ New Session" — when set, the sidebar shows a plus button beside
+    /// Refresh and invokes the closure when tapped (SessionViewController
+    /// presents `NewSessionDialog`).
+    var onNewSessionRequested: (() -> Void)?
+    private let newSessionButton: NSButton = {
+        let btn = NSButton()
+        btn.bezelStyle = .inline
+        btn.isBordered = false
+        btn.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "New session")
+        btn.toolTip = "New session"
+        btn.translatesAutoresizingMaskIntoConstraints = false
+        return btn
+    }()
+
     private let searchField: NSSearchField = {
         let sf = NSSearchField()
         sf.placeholderString = "Search threads"
@@ -132,7 +146,9 @@ final class HistorySidebarViewController: NSViewController {
         view = container
 
         // Header row
-        let headerRow = NSStackView(views: [headerLabel, NSView(), refreshButton])
+        newSessionButton.target = self
+        newSessionButton.action = #selector(handleNewSession)
+        let headerRow = NSStackView(views: [headerLabel, NSView(), newSessionButton, refreshButton])
         headerRow.orientation = .horizontal
         headerRow.spacing = 8
         headerRow.translatesAutoresizingMaskIntoConstraints = false
@@ -282,6 +298,10 @@ final class HistorySidebarViewController: NSViewController {
 
     @objc private func refreshTapped() {
         model.loadHistory()
+    }
+
+    @objc private func handleNewSession() {
+        onNewSessionRequested?()
     }
 
     // MARK: - Context Menu (Rename / Archive)

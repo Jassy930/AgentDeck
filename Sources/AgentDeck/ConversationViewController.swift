@@ -335,7 +335,10 @@ final class ConversationViewController: NSViewController {
         }
 
         if let action = model.selectedActionRequest {
-            approvalCard.configure(action: action, model: model)
+            // T6B: route vendor slot via SessionCapabilities (may be nil briefly
+            // until the daemon sends sessionCapabilities — falls back to trunk only).
+            let caps = model.workbench.selectedRuntime?.capabilities
+            approvalCard.configure(action: action, model: model, capabilities: caps)
             approvalCard.superview?.isHidden = false
         } else {
             approvalCard.superview?.isHidden = true

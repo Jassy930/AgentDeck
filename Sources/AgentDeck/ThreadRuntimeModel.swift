@@ -36,6 +36,10 @@ final class ThreadRuntimeModel: Identifiable {
     var unreadEventCount = 0
     var itemIndexById: [String: Int] = [:]
     private(set) var capabilities: SessionCapabilities?
+    /// 当 capabilities.agentKind == .claudeCode 时，跟踪当前 permission mode；
+    /// 由 `vendorControl(.claudeCode(.updatePermissionMode(...)))` 更新。
+    /// Codex 当前不暴露 plan 类似状态。InputBarView 据此显示 Plan Mode 角标。
+    var claudeCurrentPermissionMode: ClaudeCodePermissionMode?
     private var agentItemSeq: Int = 0
 
     init(id: String, agentKind: AgentKind, threadId: String? = nil, cwd: URL) {
@@ -96,8 +100,16 @@ final class ThreadRuntimeModel: Identifiable {
             errorMessage = err.message
             phase = .failed
             return nil
-        case .vendorControl, .vendorPanelEvent:
-            // v0.2: UI ignores vendor side-channels for now; T6B will route.
+        case .vendorControl(_, _, let payload):
+            // T6B: route Claude Code permission-mode echo to runtime state so
+            // InputBarView can show the "Plan Mode" badge. Other vendor-control
+            // events are still ignored (T6.9 will wire output style + hooks).
+            if case .claudeCode(let cc) = payload,
+               case .updatePermissionMode(let mode) = cc {
+                claudeCurrentPermissionMode = mode
+            }
+            return nil
+        case .vendorPanelEvent:
             return nil
         }
     }

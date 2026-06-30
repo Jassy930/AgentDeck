@@ -37,6 +37,18 @@ final class InputBarView: NSView {
         field.setContentCompressionResistancePriority(.required, for: .horizontal)
         return field
     }()
+
+    /// T6B: Claude Code "Plan Mode" 角标 — 仅当 runtime.capabilities 包含
+    /// `.claudeCodePlanMode` 且当前 permissionMode == .plan 时显示。
+    private let planModeBadge: NSTextField = {
+        let field = NSTextField(labelWithString: "Plan Mode")
+        field.font = ConversationRowMetrics.captionFont
+        field.textColor = .systemBlue
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.isHidden = true
+        field.setContentHuggingPriority(.required, for: .horizontal)
+        return field
+    }()
     private let sendButton = NSButton()
 
     private var scrollHeightConstraint: NSLayoutConstraint!
@@ -90,6 +102,7 @@ final class InputBarView: NSView {
         sendButton.setContentHuggingPriority(.required, for: .horizontal)
 
         addSubview(scrollView)
+        addSubview(planModeBadge)
         addSubview(queuedLabel)
         addSubview(sendButton)
 
@@ -101,7 +114,10 @@ final class InputBarView: NSView {
             scrollView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
             scrollHeightConstraint,
 
-            queuedLabel.leadingAnchor.constraint(equalTo: scrollView.trailingAnchor, constant: 10),
+            planModeBadge.leadingAnchor.constraint(equalTo: scrollView.trailingAnchor, constant: 10),
+            planModeBadge.centerYAnchor.constraint(equalTo: sendButton.centerYAnchor),
+
+            queuedLabel.leadingAnchor.constraint(equalTo: planModeBadge.trailingAnchor, constant: 8),
             queuedLabel.centerYAnchor.constraint(equalTo: sendButton.centerYAnchor),
 
             sendButton.leadingAnchor.constraint(equalTo: queuedLabel.trailingAnchor, constant: 8),
@@ -114,12 +130,34 @@ final class InputBarView: NSView {
     }
 
     /// Recompute queued count + send button enabled state (called by the
-    /// controller whenever the model changes).
+    /// controller whenever the model changes). Also refreshes the T6B Plan
+    /// Mode badge from the currently selected runtime.
     func refreshQueuedCount() {
         let count = model?.queuedPrompts.count ?? 0
         queuedLabel.stringValue = count > 0 ? "\(count) queued" : ""
         queuedLabel.isHidden = count == 0
+        refreshPlanModeBadge()
         updateSendEnabled()
+    }
+
+    /// Pure decision: should the Plan Mode badge be shown for this capabilities
+    /// + permission state? Exposed `static` for unit testing.
+    static func shouldShowPlanModeBadge(
+        capabilities: SessionCapabilities?,
+        permissionMode: ClaudeCodePermissionMode?
+    ) -> Bool {
+        guard let capabilities,
+              capabilities.features.contains(.claudeCodePlanMode),
+              permissionMode == .plan else { return false }
+        return true
+    }
+
+    private func refreshPlanModeBadge() {
+        let caps = model?.workbench.selectedRuntime?.capabilities
+        let mode = model?.workbench.selectedRuntime?.claudeCurrentPermissionMode
+        planModeBadge.isHidden = !Self.shouldShowPlanModeBadge(
+            capabilities: caps, permissionMode: mode
+        )
     }
 
     private func textDidChange() {
