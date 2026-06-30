@@ -27,6 +27,9 @@ pub use trunk::{
     AgentItem, AgentItemMeta, DiffFile, DiffStatus, PlanStep, PlanStepStatus,
     ProtocolError, ServerEvent, SessionId, ShellStatus, ThreadId, TurnSummary,
 };
+pub use trunk::{ActionDecision, ActionDecisionKind, ActionKind, ActionRequest, ActionRequestVendor, VendorControlPayload, VendorPanelPayload};
+pub use vendor::codex::{CodexVendorControl, CodexVendorPanelEvent};
+pub use vendor::claude_code::{ClaudeCodeVendorControl, ClaudeCodeVendorPanelEvent};
 
 // 现有所有类型保持不变（T1.5/T1.6 之后才迁移）
 
@@ -101,7 +104,7 @@ impl IpcMessage {
         }
     }
 
-    pub fn action_request(request: &ActionRequest) -> Self {
+    pub fn action_request(request: &LegacyActionRequest) -> Self {
         Self {
             kind: "actionRequest".into(),
             id: None,
@@ -130,9 +133,12 @@ pub enum SessionState {
 /// Neutral request for a user decision before the agent performs a risky
 /// action. Adapter-specific fields stay behind the daemon boundary; Swift only
 /// sees these stable routing and presentation fields.
+///
+/// NOTE: renamed to `LegacyActionRequest` in T1.7 to avoid conflict with the
+/// new `trunk::ActionRequest` struct. Will be removed in T1.9.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct ActionRequest {
+pub struct LegacyActionRequest {
     pub request_id: u64,
     pub item_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -142,8 +148,10 @@ pub struct ActionRequest {
     pub detail: String,
 }
 
+/// NOTE: renamed to `LegacyActionDecision` in T1.7 to avoid conflict with the
+/// new `trunk::ActionDecision` struct. Will be removed in T1.9.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActionDecision {
+pub struct LegacyActionDecision {
     pub request_id: u64,
     pub decision: String,
 }
@@ -421,7 +429,7 @@ pub fn protocol_schema() -> serde_json::Value {
     }
     add!(IpcMessage);
     add!(SessionState);
-    add!(ActionRequest);
+    add!(LegacyActionRequest);
     add!(Lifecycle);
     add!(LegacyAgentItem);
     add!(AgentItemKind);
@@ -617,7 +625,7 @@ mod tests {
 
     #[test]
     fn action_request_serializes_as_neutral_approval_prompt() {
-        let request = ActionRequest {
+        let request = LegacyActionRequest {
             request_id: 42,
             item_id: "cmd1".into(),
             approval_id: Some("approval-1".into()),

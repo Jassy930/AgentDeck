@@ -50,3 +50,27 @@ pub struct ClaudeCodeSessionOptions {
     pub session_name: Option<String>,
     pub session_id: Option<String>,
 }
+
+// ── T1.7: ClaudeCodeVendorControl / ClaudeCodeVendorPanelEvent ───────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ClaudeCodeVendorControl {
+    UpdatePermissionMode(ClaudeCodePermissionMode),
+    UpdateOutputStyle { name: Option<String> },
+    AddHook(ClaudeCodeHookConfig),
+    RemoveHook { matcher: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ClaudeCodeVendorPanelEvent {
+    /// Hook fire events from `claude --include-hook-events`.
+    HookFired {
+        matcher: String,
+        #[serde(rename = "toolUseId")]
+        tool_use_id: Option<String>,
+        #[serde(rename = "elapsedMs")]
+        elapsed_ms: Option<u64>,
+    },
+}

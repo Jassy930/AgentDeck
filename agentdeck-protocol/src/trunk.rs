@@ -181,25 +181,82 @@ pub struct ProtocolError {
     pub diagnostic_ref: Option<String>,
 }
 
-// Placeholders — replaced in T1.7
+// ── T1.7: ActionKind / ActionRequestVendor / ActionRequest / ActionDecision ──
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum ActionKind {
+    ExecuteCommand,
+    EditFiles,
+    GrantExtraPermission,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "agentKind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ActionRequestVendor {
+    #[serde(rename = "codex")]
+    Codex {
+        #[serde(rename = "approvalPolicyAtDecision")]
+        approval_policy_at_decision: crate::vendor::codex::CodexApprovalPolicy,
+        #[serde(rename = "sandboxAtDecision")]
+        sandbox_at_decision: crate::vendor::codex::CodexSandboxMode,
+        #[serde(rename = "canPersist")]
+        can_persist: bool,
+    },
+    #[serde(rename = "claude_code")]
+    ClaudeCode {
+        #[serde(rename = "permissionModeAtDecision")]
+        permission_mode_at_decision: crate::vendor::claude_code::ClaudeCodePermissionMode,
+        #[serde(rename = "toolName")]
+        tool_name: String,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ActionRequest {
     pub request_id: String,
+    pub kind: ActionKind,
+    pub summary: String,
+    pub vendor: ActionRequestVendor,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "agentKind", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActionDecision {
+    pub request_id: String,
+    pub decision: ActionDecisionKind,
+    pub persist: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum ActionDecisionKind {
+    Approve,
+    Deny,
+}
+
+// ── T1.7: VendorControlPayload / VendorPanelPayload (real typed) ─────────────
+
+use crate::vendor::codex::{CodexVendorControl, CodexVendorPanelEvent};
+use crate::vendor::claude_code::{ClaudeCodeVendorControl, ClaudeCodeVendorPanelEvent};
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "agentKind", content = "control", rename_all = "camelCase", deny_unknown_fields)]
 pub enum VendorControlPayload {
-    #[serde(rename = "codex")] Codex {},
-    #[serde(rename = "claude_code")] ClaudeCode {},
+    #[serde(rename = "codex")]
+    Codex(CodexVendorControl),
+    #[serde(rename = "claude_code")]
+    ClaudeCode(ClaudeCodeVendorControl),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "agentKind", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(tag = "agentKind", content = "event", rename_all = "camelCase", deny_unknown_fields)]
 pub enum VendorPanelPayload {
-    #[serde(rename = "codex")] Codex {},
-    #[serde(rename = "claude_code")] ClaudeCode {},
+    #[serde(rename = "codex")]
+    Codex(CodexVendorPanelEvent),
+    #[serde(rename = "claude_code")]
+    ClaudeCode(ClaudeCodeVendorPanelEvent),
 }
 
 // ServerEvent — main trunk

@@ -53,3 +53,22 @@ pub struct CodexSessionOptions {
     #[serde(default)]
     pub mcp_overrides: Vec<McpOverride>,
 }
+
+// ── T1.7: CodexVendorControl / CodexVendorPanelEvent ────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum CodexVendorControl {
+    UpdateSandbox(CodexSandboxMode),
+    UpdateApprovalPolicy(CodexApprovalPolicy),
+    UpdateReasoningEffort(CodexReasoningEffort),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum CodexVendorPanelEvent {
+    /// Vendor-specific events that don't fit the neutral trunk. v0.2 has
+    /// no Codex panel events, but the enum exists so adapters can extend
+    /// without breaking schema.
+    Placeholder,
+}
