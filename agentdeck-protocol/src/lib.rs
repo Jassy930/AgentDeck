@@ -15,6 +15,8 @@ pub mod capabilities;
 pub mod transport;
 pub mod vendor;
 
+pub use trunk::AgentKind;
+
 // 现有所有类型保持不变（T1.5/T1.6 之后才迁移）
 
 use schemars::JsonSchema;
