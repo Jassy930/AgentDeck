@@ -27,7 +27,7 @@
 use crate::agent::{AgentEventSender, AgentSessionHandle};
 use crate::runtime::router::AgentRouter;
 use agentdeck_protocol::{
-    AgentKind, ClientCommand, ProtocolError, ServerEvent, SessionId, PROTOCOL_VERSION,
+    ClientCommand, ProtocolError, ServerEvent, SessionId, PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -264,25 +264,40 @@ impl RuntimeHub {
                 }
             }
             ClientCommand::History(req) => {
-                // History dispatch is not wired through the Agent trait
-                // in Phase 3. Phase 4 / 5 will add a `list_history` /
-                // `read_history` method (per-adapter) and route here.
-                // Until then, surface a structured error so callers see
-                // an explicit "not yet implemented" rather than a hang.
-                let agent_hint = history_agent_kind_hint(&req);
-                let _ = events_tx
-                    .send(ServerEvent::Error {
-                        session_id: None,
-                        error: ProtocolError {
-                            code: "history-not-yet-wired".into(),
-                            message: format!(
-                                "HistoryRequest not yet routed in Phase 3 (agentKindHint={:?})",
-                                agent_hint
-                            ),
-                            diagnostic_ref: None,
-                        },
-                    })
-                    .await;
+                // Task 4C — Phase 4 finalization: route through the
+                // router's `handle_history`, which routes by agent kind
+                // (or fans out for cross-agent List). The response is
+                // a typed `HistoryResponse` envelope; we side-channel
+                // the JSON onto the admin reply stream (same posture
+                // as Ping / Selfcheck — request/response, not streaming
+                // events) so it doesn't try to fit through the
+                // `ServerEvent` shape.
+                //
+                // Errors still flow through events_tx as
+                // `ServerEvent::Error` (consistent with every other
+                // failure path in this dispatch).
+                match self.router.handle_history(req).await {
+                    Ok(response) => {
+                        // Wrap in `{ reply: "history", response: <...> }`
+                        // so the admin-reply consumer can distinguish
+                        // history payloads from ping / selfcheck /
+                        // protocolVersion replies.
+                        let line = serde_json::json!({
+                            "reply": "history",
+                            "response": response,
+                        })
+                        .to_string();
+                        let _ = admin_tx.send(line).await;
+                    }
+                    Err(error) => {
+                        let _ = events_tx
+                            .send(ServerEvent::Error {
+                                session_id: None,
+                                error,
+                            })
+                            .await;
+                    }
+                }
             }
         }
     }
@@ -356,17 +371,6 @@ async fn write_line<W: AsyncWrite + Unpin>(stdout: &mut W, body: &[u8]) -> bool 
         return false;
     }
     true
-}
-
-fn history_agent_kind_hint(req: &agentdeck_protocol::HistoryRequest) -> Option<AgentKind> {
-    use agentdeck_protocol::HistoryRequest::*;
-    match req {
-        List { agent_kind, .. } => *agent_kind,
-        Read { agent_kind, .. }
-        | Archive { agent_kind, .. }
-        | Unarchive { agent_kind, .. }
-        | Rename { agent_kind, .. } => Some(*agent_kind),
-    }
 }
 
 #[cfg(test)]
@@ -447,6 +451,93 @@ mod tests {
             serde_json::from_str(first_line).expect("reply JSON");
         assert_eq!(parsed["reply"], "ping");
         assert_eq!(parsed["ok"], true);
+    }
+
+    /// Task 4C — Phase 4 finalization: History command now flows
+    /// end-to-end through the router. With an empty router the
+    /// cross-agent List collapses to `{"reply":"history","response":
+    /// {"kind":"list","value":[]}}` on the admin reply side-channel.
+    /// Asserts the wire shape so Phase 5 / 6 clients can rely on it.
+    #[tokio::test]
+    async fn history_list_returns_admin_reply_with_empty_list_on_bare_router() {
+        let router = Arc::new(AgentRouter::new());
+        let hub = RuntimeHub::new(router);
+
+        let (mut client_to_daemon, daemon_stdin) = duplex(4096);
+        let (daemon_stdout, mut client_from_daemon) = duplex(4096);
+
+        let hub_task = tokio::spawn(hub.run(daemon_stdin, daemon_stdout));
+
+        let cmd = ClientCommand::History(HistoryRequest::List {
+            agent_kind: None,
+            cwd_filter: None,
+        });
+        let line = serde_json::to_string(&cmd).unwrap();
+        client_to_daemon.write_all(line.as_bytes()).await.unwrap();
+        client_to_daemon.write_all(b"\n").await.unwrap();
+        client_to_daemon.shutdown().await.unwrap();
+
+        let mut buf = Vec::new();
+        let read_fut = async {
+            use tokio::io::AsyncReadExt;
+            client_from_daemon.read_to_end(&mut buf).await.unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(2), read_fut)
+            .await
+            .expect("daemon should respond and exit");
+        hub_task.await.unwrap().unwrap();
+
+        let response = String::from_utf8_lossy(&buf);
+        let first_line = response.lines().next().expect("at least one reply line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(first_line).expect("history reply JSON");
+        assert_eq!(parsed["reply"], "history");
+        assert_eq!(parsed["response"]["kind"], "list");
+        assert!(parsed["response"]["value"].is_array());
+        assert_eq!(parsed["response"]["value"].as_array().unwrap().len(), 0);
+    }
+
+    /// Read against an unregistered agent kind surfaces an Error
+    /// event (not a hung-forever admin reply). Confirms the failure
+    /// path still flows through the normal events stream.
+    #[tokio::test]
+    async fn history_read_for_unregistered_kind_yields_error_event() {
+        let router = Arc::new(AgentRouter::new());
+        let hub = RuntimeHub::new(router);
+
+        let (mut client_to_daemon, daemon_stdin) = duplex(4096);
+        let (daemon_stdout, mut client_from_daemon) = duplex(4096);
+
+        let hub_task = tokio::spawn(hub.run(daemon_stdin, daemon_stdout));
+
+        let cmd = ClientCommand::History(HistoryRequest::Read {
+            thread_id: ThreadId("nope".into()),
+            agent_kind: AgentKind::Codex,
+        });
+        let line = serde_json::to_string(&cmd).unwrap();
+        client_to_daemon.write_all(line.as_bytes()).await.unwrap();
+        client_to_daemon.write_all(b"\n").await.unwrap();
+        client_to_daemon.shutdown().await.unwrap();
+
+        let mut buf = Vec::new();
+        let read_fut = async {
+            use tokio::io::AsyncReadExt;
+            client_from_daemon.read_to_end(&mut buf).await.unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(2), read_fut)
+            .await
+            .expect("daemon should respond and exit");
+        hub_task.await.unwrap().unwrap();
+
+        let response = String::from_utf8_lossy(&buf);
+        let first_line = response.lines().next().expect("at least one reply line");
+        let event: ServerEvent = serde_json::from_str(first_line).expect("ServerEvent");
+        match event {
+            ServerEvent::Error { error, .. } => {
+                assert_eq!(error.code, "agent-not-registered");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     /// Selfcheck reports protocolVersion + registered agent kinds.

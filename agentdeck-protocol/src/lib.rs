@@ -26,7 +26,7 @@ pub use trunk::{
 pub use trunk::{ActionDecision, ActionDecisionKind, ActionKind, ActionRequest, ActionRequestVendor, VendorControlPayload, VendorPanelPayload};
 pub use vendor::codex::{CodexVendorControl, CodexVendorPanelEvent};
 pub use vendor::claude_code::{ClaudeCodeVendorControl, ClaudeCodeVendorPanelEvent};
-pub use trunk::{HistoryListItem, HistoryReadResponse, HistoryRequest, HistoryTurn};
+pub use trunk::{HistoryListItem, HistoryReadResponse, HistoryRequest, HistoryResponse, HistoryTurn};
 pub use trunk::ClientCommand;
 
 /// 契约产物版本。改动协议形态时手动 +1，并重生成快照。
@@ -51,6 +51,7 @@ pub fn protocol_schema() -> serde_json::Value {
             "HistoryRequest": serde_json::to_value(schema_for!(trunk::HistoryRequest)).unwrap(),
             "HistoryListItem": serde_json::to_value(schema_for!(trunk::HistoryListItem)).unwrap(),
             "HistoryReadResponse": serde_json::to_value(schema_for!(trunk::HistoryReadResponse)).unwrap(),
+            "HistoryResponse": serde_json::to_value(schema_for!(trunk::HistoryResponse)).unwrap(),
         }
     })
 }

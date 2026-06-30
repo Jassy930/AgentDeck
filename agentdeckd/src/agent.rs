@@ -5,8 +5,8 @@
 //! 方法，或 daemon 层。
 
 use agentdeck_protocol::{
-    ActionDecision, AgentKind, ProtocolError, ServerEvent, SessionCapabilities,
-    SessionId, SessionStart, ThreadId, VendorControlPayload,
+    ActionDecision, AgentKind, HistoryRequest, HistoryResponse, ProtocolError, ServerEvent,
+    SessionCapabilities, SessionId, SessionStart, ThreadId, VendorControlPayload,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -72,6 +72,28 @@ pub trait Agent: Send + Sync + 'static {
 
     /// Cancel a running session.
     async fn cancel(&self, session_id: &SessionId) -> Result<(), ProtocolError>;
+
+    /// Serve a `HistoryRequest` (List / Read / Archive / Unarchive /
+    /// Rename) for this adapter's own threads. The default returns a
+    /// structured "not-supported" error so older / partial adapters
+    /// don't break compilation when this trait grows. CC and Codex
+    /// override this; the router merges cross-agent `List` results
+    /// across all registered adapters (see `AgentRouter::handle_history`).
+    ///
+    /// Added by Task 4C — Phase 4 finalization.
+    async fn handle_history(
+        &self,
+        _request: HistoryRequest,
+    ) -> Result<HistoryResponse, ProtocolError> {
+        Err(ProtocolError {
+            code: "history-not-supported".into(),
+            message: format!(
+                "agent {:?} does not implement history",
+                self.kind()
+            ),
+            diagnostic_ref: None,
+        })
+    }
 }
 
 /// Newtype wrapper to allow `dyn Agent` in maps.

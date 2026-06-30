@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use agentdeckd::claude_code::ClaudeCodeAdapter;
 use agentdeckd::codex::CodexAdapter;
 use agentdeckd::diag;
 use agentdeckd::record;
@@ -230,7 +231,10 @@ fn run_main_loop() -> std::io::Result<()> {
         diag::log("daemon_start", "agentdeckd main loop starting");
         let mut router = AgentRouter::new();
         router.register(Arc::new(CodexAdapter::new()));
-        // Phase 4 adds: router.register(Arc::new(ClaudeCodeAdapter::new()));
+        // Task 4C — Phase 4 finalization: CC adapter now registered
+        // alongside Codex. Both kinds route through the same hub and
+        // cross-agent History List merges results from both.
+        router.register(Arc::new(ClaudeCodeAdapter::new()));
         let hub = RuntimeHub::new(Arc::new(router));
         let res = hub.run(tokio::io::stdin(), tokio::io::stdout()).await;
         diag::log("daemon_stop", &format!("agentdeckd main loop exited: {res:?}"));

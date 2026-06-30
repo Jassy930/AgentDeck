@@ -323,6 +323,27 @@ pub struct HistoryTurn {
     pub items: Vec<AgentItem>,
 }
 
+/// Discriminated response envelope for any `HistoryRequest` variant.
+///
+/// - `List`            → `HistoryResponse::List(Vec<HistoryListItem>)`
+/// - `Read`            → `HistoryResponse::Read(HistoryReadResponse)`
+/// - `Archive` /
+///   `Unarchive` /
+///   `Rename`          → `HistoryResponse::Ack` (success-only)
+///
+/// Added by Task 4C — Phase 4 finalization. Previously the daemon
+/// surfaced history results only as a side-channel JSON dump; the
+/// router now needs a typed return value to merge cross-agent List
+/// results from multiple adapters.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", content = "value", rename_all = "camelCase", deny_unknown_fields)]
+pub enum HistoryResponse {
+    List(Vec<HistoryListItem>),
+    Read(HistoryReadResponse),
+    /// Archive / Unarchive / Rename success — body intentionally empty.
+    Ack,
+}
+
 // ── T1.9: ClientCommand — all v2 client-to-server commands ──────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

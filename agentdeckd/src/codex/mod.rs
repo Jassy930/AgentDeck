@@ -3,6 +3,7 @@
 
 pub mod adapter;
 pub mod capabilities;
+pub mod history;
 pub mod translate;
 
 pub use adapter::CodexAdapter;

@@ -40,9 +40,9 @@ use crate::agent::{Agent, AgentEventSender, AgentSessionHandle};
 use crate::claude_code::translate::ClaudeCodeTranslator;
 use agentdeck_protocol::{
     ActionDecision, ActionDecisionKind, AgentKind, ClaudeCodePermissionMode,
-    ClaudeCodeSessionOptions, ClaudeCodeVendorControl, ProtocolError, ServerEvent,
-    SessionCapabilities, SessionId, SessionStart, ThreadId, VendorControlPayload,
-    VendorSessionOptions,
+    ClaudeCodeSessionOptions, ClaudeCodeVendorControl, HistoryRequest, HistoryResponse,
+    ProtocolError, ServerEvent, SessionCapabilities, SessionId, SessionStart, ThreadId,
+    VendorControlPayload, VendorSessionOptions,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -183,6 +183,95 @@ impl ClaudeCodeAdapter {
         Ok((cmd, opts.permission_mode))
     }
 
+    /// Run the spec § 5.8 preflight checks before spawning the CC
+    /// child. Each failure is BOTH returned as a structured
+    /// `ProtocolError` (so the caller's Result chain sees the error)
+    /// AND surfaced on the events channel as a `ServerEvent::Error`
+    /// (so a streaming client gets it through the same wire it would
+    /// have seen other session errors on).
+    ///
+    /// Codes:
+    ///   - `cc-not-installed`     — `claude` binary missing from PATH
+    ///   - `cc-version-too-old`   — version probe failed / placeholder
+    ///   - `cc-not-authenticated` — `claude auth status` explicit no
+    ///
+    /// `cc-not-authenticated` is NON-fatal in degraded mode (returns
+    /// `AuthState::Unknown` → no error) because some valid setups
+    /// (Bedrock, env-var keys) don't surface through `auth status`;
+    /// only the unambiguous "NotAuthenticated" exit triggers a block.
+    async fn preflight(
+        &self,
+        events: &AgentEventSender,
+        session_id: Option<&SessionId>,
+    ) -> Result<(), ProtocolError> {
+        use crate::claude_code::auth::{probe_auth_status, AuthState};
+
+        // 1. Binary on PATH?
+        if which::which("claude").is_err() {
+            let err = ProtocolError {
+                code: "cc-not-installed".into(),
+                message: "`claude` binary not in PATH. Install: \
+                          npm install -g @anthropic-ai/claude-code"
+                    .into(),
+                diagnostic_ref: None,
+            };
+            let _ = events
+                .send(ServerEvent::Error {
+                    session_id: session_id.cloned(),
+                    error: err.clone(),
+                })
+                .await;
+            return Err(err);
+        }
+
+        // 2. Version probe. `probe_claude_code_version` returns
+        //    "claude unknown" when the spawn fails OR when stdout is
+        //    empty; either way it means we don't know the version, and
+        //    spec § 5.8 wants a clear failure rather than silent guess.
+        let version = self
+            .cli_version
+            .get_or_init(crate::claude_code::capabilities::probe_claude_code_version)
+            .clone();
+        if version.starts_with("claude unknown") {
+            let err = ProtocolError {
+                code: "cc-version-too-old".into(),
+                message: format!(
+                    "claude --version probe failed (got {:?}); \
+                     ensure claude >= 2.1.x supporting --output-format stream-json",
+                    version
+                ),
+                diagnostic_ref: None,
+            };
+            let _ = events
+                .send(ServerEvent::Error {
+                    session_id: session_id.cloned(),
+                    error: err.clone(),
+                })
+                .await;
+            return Err(err);
+        }
+
+        // 3. Auth status. Only the unambiguous "logged out" branch
+        //    triggers an abort; "Unknown" is treated as degraded-OK
+        //    because some legitimate setups (Bedrock, ANTHROPIC_API_KEY
+        //    env) report opaque auth state.
+        if matches!(probe_auth_status(), AuthState::NotAuthenticated) {
+            let err = ProtocolError {
+                code: "cc-not-authenticated".into(),
+                message: "Not logged in to Claude. Run: claude login".into(),
+                diagnostic_ref: None,
+            };
+            let _ = events
+                .send(ServerEvent::Error {
+                    session_id: session_id.cloned(),
+                    error: err.clone(),
+                })
+                .await;
+            return Err(err);
+        }
+        Ok(())
+    }
+
     /// Shared driver behind `start_session` and `continue_thread`.
     async fn start_inner(
         &self,
@@ -191,6 +280,12 @@ impl ClaudeCodeAdapter {
         resume_thread_id: Option<ThreadId>,
         prompt_override: Option<String>,
     ) -> Result<AgentSessionHandle, ProtocolError> {
+        // Preflight per spec § 5.8 — run BEFORE we mint a session id
+        // or emit SessionStarted, so a missing binary / bad version /
+        // logged-out user surfaces as a single clean error rather than
+        // a half-started session.
+        self.preflight(&events, None).await?;
+
         let (mut cmd, permission_mode) =
             Self::build_command(&start, resume_thread_id.as_ref())?;
         let session_id = SessionId(uuid::Uuid::new_v4().to_string());
@@ -516,6 +611,44 @@ impl Agent for ClaudeCodeAdapter {
                     .into(),
                 diagnostic_ref: None,
             }),
+        }
+    }
+
+    /// Task 4C — Phase 4 finalization: wire CC's history layer onto
+    /// the trait. Delegates to the free functions in
+    /// `crate::claude_code::history` (added in Task 4B). `Unarchive`
+    /// is a no-op for CC because `claude rm` is soft and
+    /// `claude --resume <id>` keeps working regardless of archived
+    /// state (spec § 5.6).
+    async fn handle_history(
+        &self,
+        request: HistoryRequest,
+    ) -> Result<HistoryResponse, ProtocolError> {
+        use crate::claude_code::history;
+        match request {
+            HistoryRequest::List { cwd_filter, .. } => {
+                let items = history::list_history(cwd_filter.as_deref()).await?;
+                Ok(HistoryResponse::List(items))
+            }
+            HistoryRequest::Read { thread_id, .. } => {
+                let resp = history::read_history(&thread_id).await?;
+                Ok(HistoryResponse::Read(resp))
+            }
+            HistoryRequest::Archive { thread_id, .. } => {
+                history::archive(&thread_id).await?;
+                Ok(HistoryResponse::Ack)
+            }
+            HistoryRequest::Unarchive { .. } => {
+                // CC: `claude rm` is soft; --resume always finds the
+                // jsonl back. Unarchive is therefore a guaranteed
+                // no-op — return Ack so the UI can fold the action
+                // away without surfacing an error.
+                Ok(HistoryResponse::Ack)
+            }
+            HistoryRequest::Rename { thread_id, title, .. } => {
+                history::rename(&thread_id, &title).await?;
+                Ok(HistoryResponse::Ack)
+            }
         }
     }
 

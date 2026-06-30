@@ -1451,6 +1451,542 @@
       ],
       "title": "HistoryRequest"
     },
+    "HistoryResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "definitions": {
+        "AgentItem": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "userMessage"
+                  ],
+                  "type": "string"
+                },
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
+                },
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "text"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "assistantMessage"
+                  ],
+                  "type": "string"
+                },
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
+                },
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "text"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "reasoning"
+                  ],
+                  "type": "string"
+                },
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
+                },
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "text"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "command": {
+                  "type": "string"
+                },
+                "durationMs": {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "exitCode": {
+                  "format": "int32",
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "shell"
+                  ],
+                  "type": "string"
+                },
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
+                },
+                "status": {
+                  "$ref": "#/definitions/ShellStatus"
+                }
+              },
+              "required": [
+                "command",
+                "kind",
+                "status"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "files": {
+                  "items": {
+                    "$ref": "#/definitions/DiffFile"
+                  },
+                  "type": "array"
+                },
+                "kind": {
+                  "enum": [
+                    "diff"
+                  ],
+                  "type": "string"
+                },
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
+                }
+              },
+              "required": [
+                "files",
+                "kind"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "plan"
+                  ],
+                  "type": "string"
+                },
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
+                },
+                "steps": {
+                  "items": {
+                    "$ref": "#/definitions/PlanStep"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "kind",
+                "steps"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "imageReference"
+                  ],
+                  "type": "string"
+                },
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
+                },
+                "originalPath": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "savedPath": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "args": true,
+                "kind": {
+                  "enum": [
+                    "toolCall"
+                  ],
+                  "type": "string"
+                },
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
+                },
+                "name": {
+                  "type": "string"
+                },
+                "result": true
+              },
+              "required": [
+                "args",
+                "kind",
+                "name"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "raw"
+                  ],
+                  "type": "string"
+                },
+                "meta": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AgentItemMeta"
+                    }
+                  ],
+                  "default": {
+                    "vendorExtensions": {}
+                  }
+                },
+                "rawKind": {
+                  "type": "string"
+                },
+                "rawPayload": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "rawKind",
+                "rawPayload"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "AgentItemMeta": {
+          "additionalProperties": false,
+          "properties": {
+            "vendorExtensions": {
+              "additionalProperties": true,
+              "default": {},
+              "description": "Vendor-specific extension fields. Allowed in main trunk because the keys carry no vendor name; consumers must opt-in.",
+              "type": "object"
+            }
+          },
+          "type": "object"
+        },
+        "AgentKind": {
+          "enum": [
+            "codex",
+            "claude_code"
+          ],
+          "type": "string"
+        },
+        "DiffFile": {
+          "additionalProperties": false,
+          "properties": {
+            "patch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/definitions/DiffStatus"
+            }
+          },
+          "required": [
+            "path",
+            "status"
+          ],
+          "type": "object"
+        },
+        "DiffStatus": {
+          "enum": [
+            "added",
+            "modified",
+            "deleted",
+            "renamed"
+          ],
+          "type": "string"
+        },
+        "HistoryListItem": {
+          "additionalProperties": false,
+          "properties": {
+            "agentKind": {
+              "$ref": "#/definitions/AgentKind"
+            },
+            "archived": {
+              "type": "boolean"
+            },
+            "cwd": {
+              "type": "string"
+            },
+            "lastActiveMs": {
+              "description": "epoch milliseconds; for sorting only",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "threadId": {
+              "type": "string"
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "agentKind",
+            "archived",
+            "cwd",
+            "lastActiveMs",
+            "threadId"
+          ],
+          "type": "object"
+        },
+        "HistoryReadResponse": {
+          "additionalProperties": false,
+          "properties": {
+            "agentKind": {
+              "$ref": "#/definitions/AgentKind"
+            },
+            "threadId": {
+              "type": "string"
+            },
+            "turns": {
+              "items": {
+                "$ref": "#/definitions/HistoryTurn"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "agentKind",
+            "threadId",
+            "turns"
+          ],
+          "type": "object"
+        },
+        "HistoryTurn": {
+          "additionalProperties": false,
+          "properties": {
+            "items": {
+              "items": {
+                "$ref": "#/definitions/AgentItem"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "items"
+          ],
+          "type": "object"
+        },
+        "PlanStep": {
+          "additionalProperties": false,
+          "properties": {
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "$ref": "#/definitions/PlanStepStatus"
+            },
+            "title": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "title"
+          ],
+          "type": "object"
+        },
+        "PlanStepStatus": {
+          "enum": [
+            "pending",
+            "inProgress",
+            "done",
+            "failed"
+          ],
+          "type": "string"
+        },
+        "ShellStatus": {
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "canceled"
+          ],
+          "type": "string"
+        }
+      },
+      "description": "Discriminated response envelope for any `HistoryRequest` variant.\n\n- `List`            → `HistoryResponse::List(Vec<HistoryListItem>)` - `Read`            → `HistoryResponse::Read(HistoryReadResponse)` - `Archive` / `Unarchive` / `Rename`          → `HistoryResponse::Ack` (success-only)\n\nAdded by Task 4C — Phase 4 finalization. Previously the daemon surfaced history results only as a side-channel JSON dump; the router now needs a typed return value to merge cross-agent List results from multiple adapters.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "list"
+              ],
+              "type": "string"
+            },
+            "value": {
+              "items": {
+                "$ref": "#/definitions/HistoryListItem"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "read"
+              ],
+              "type": "string"
+            },
+            "value": {
+              "$ref": "#/definitions/HistoryReadResponse"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Archive / Unarchive / Rename success — body intentionally empty.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "ack"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "HistoryResponse"
+    },
     "ServerEvent": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "definitions": {

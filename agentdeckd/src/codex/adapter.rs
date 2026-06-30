@@ -38,9 +38,9 @@ use crate::codex::capabilities::{build_codex_capabilities, probe_codex_version};
 use crate::codex::translate::CodexTranslator;
 use agentdeck_protocol::{
     ActionDecision, ActionDecisionKind, AgentKind, CodexApprovalPolicy,
-    CodexReasoningEffort, CodexSandboxMode, CodexSessionOptions, ProtocolError, ServerEvent,
-    SessionCapabilities, SessionId, SessionStart, ThreadId, VendorControlPayload,
-    VendorSessionOptions,
+    CodexReasoningEffort, CodexSandboxMode, CodexSessionOptions, HistoryRequest,
+    HistoryResponse, ProtocolError, ServerEvent, SessionCapabilities, SessionId,
+    SessionStart, ThreadId, VendorControlPayload, VendorSessionOptions,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -717,6 +717,43 @@ impl Agent for CodexAdapter {
                 message: "CodexAdapter received non-Codex vendor control".into(),
                 diagnostic_ref: None,
             }),
+        }
+    }
+
+    /// Task 4C — Phase 4 finalization: wire codex's stub history layer
+    /// onto the trait. v0.2 returns empty for List and structured
+    /// "not-supported" errors for the mutating ops; the unified
+    /// `HistoryRequest` protocol still works end-to-end across both
+    /// adapters (cross-agent List from the router merges these results
+    /// with CC's real history). v0.3 replaces `codex::history` stubs
+    /// with `thread/list` + `thread/read` over a short-lived
+    /// `codex app-server` child.
+    async fn handle_history(
+        &self,
+        request: HistoryRequest,
+    ) -> Result<HistoryResponse, ProtocolError> {
+        use crate::codex::history;
+        match request {
+            HistoryRequest::List { cwd_filter, .. } => {
+                let items = history::list_history(cwd_filter.as_deref()).await?;
+                Ok(HistoryResponse::List(items))
+            }
+            HistoryRequest::Read { thread_id, .. } => {
+                let resp = history::read_history(&thread_id).await?;
+                Ok(HistoryResponse::Read(resp))
+            }
+            HistoryRequest::Archive { thread_id, .. } => {
+                history::archive(&thread_id).await?;
+                Ok(HistoryResponse::Ack)
+            }
+            HistoryRequest::Unarchive { thread_id, .. } => {
+                history::unarchive(&thread_id).await?;
+                Ok(HistoryResponse::Ack)
+            }
+            HistoryRequest::Rename { thread_id, title, .. } => {
+                history::rename(&thread_id, &title).await?;
+                Ok(HistoryResponse::Ack)
+            }
         }
     }
 

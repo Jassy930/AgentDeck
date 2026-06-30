@@ -21,6 +21,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "process", "io-util", "time", "io-std", "signal"] }
 uuid = { version = "1", features = ["v4"] }
+# Used by claude_code adapter preflight (spec § 5.8 cc-not-installed
+# check). Kept as a runtime dep — also re-exported for tests via the
+# same crate version (no dev-dep duplication needed).
+which = "6"
 
 [dev-dependencies]
 which = "6"

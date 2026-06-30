@@ -4,8 +4,8 @@
 
 use crate::agent::{AgentEventSender, AgentSessionHandle, DynAgent};
 use agentdeck_protocol::{
-    ActionDecision, AgentKind, ProtocolError, SessionCapabilities, SessionId,
-    SessionStart, ThreadId, VendorControlPayload,
+    ActionDecision, AgentKind, HistoryRequest, HistoryResponse, ProtocolError,
+    SessionCapabilities, SessionId, SessionStart, ThreadId, VendorControlPayload,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -93,6 +93,66 @@ impl AgentRouter {
         self.agents.get(&kind).unwrap().cancel(session_id).await?;
         self.sessions.lock().await.remove(session_id);
         Ok(())
+    }
+
+    /// Route a `HistoryRequest` to the matching adapter. For `List` with
+    /// `agent_kind = None` we fan out to every registered adapter and
+    /// merge the resulting `HistoryListItem`s (newest first by
+    /// `last_active_ms`). A single adapter's failure during cross-agent
+    /// list does NOT block the others — surfacing partial results is
+    /// preferable to surfacing zero. Read / Archive / Unarchive / Rename
+    /// always carry an explicit `agent_kind` and route to one adapter.
+    ///
+    /// Added by Task 4C — Phase 4 finalization.
+    pub async fn handle_history(
+        &self,
+        request: HistoryRequest,
+    ) -> Result<HistoryResponse, ProtocolError> {
+        let agent_kind = match &request {
+            HistoryRequest::List { agent_kind: Some(k), .. } => *k,
+            HistoryRequest::List { agent_kind: None, .. } => {
+                return self.handle_history_cross_agent(request).await;
+            }
+            HistoryRequest::Read { agent_kind, .. }
+            | HistoryRequest::Archive { agent_kind, .. }
+            | HistoryRequest::Unarchive { agent_kind, .. }
+            | HistoryRequest::Rename { agent_kind, .. } => *agent_kind,
+        };
+        let agent = self.agents.get(&agent_kind).ok_or_else(|| ProtocolError {
+            code: "agent-not-registered".into(),
+            message: format!("no adapter registered for agentKind={:?}", agent_kind),
+            diagnostic_ref: None,
+        })?;
+        agent.handle_history(request).await
+    }
+
+    /// Fan-out helper for cross-agent `List`. Queries every registered
+    /// adapter with the agent-specific `List` (cwd_filter preserved),
+    /// merges items, and sorts newest-first. Per-adapter errors and
+    /// wrong-variant responses are silently dropped — the caller gets
+    /// whatever items the working adapters produced.
+    async fn handle_history_cross_agent(
+        &self,
+        request: HistoryRequest,
+    ) -> Result<HistoryResponse, ProtocolError> {
+        let cwd_filter = match &request {
+            HistoryRequest::List { cwd_filter, .. } => cwd_filter.clone(),
+            _ => unreachable!("handle_history_cross_agent only called for List"),
+        };
+        let mut all = Vec::new();
+        for (kind, agent) in self.agents.iter() {
+            let req = HistoryRequest::List {
+                agent_kind: Some(*kind),
+                cwd_filter: cwd_filter.clone(),
+            };
+            match agent.handle_history(req).await {
+                Ok(HistoryResponse::List(items)) => all.extend(items),
+                Ok(_) => {} // wrong variant from adapter; ignore
+                Err(_) => {} // one adapter's failure doesn't block the others
+            }
+        }
+        all.sort_by_key(|item| std::cmp::Reverse(item.last_active_ms));
+        Ok(HistoryResponse::List(all))
     }
 
     async fn lookup_session(&self, sid: &SessionId) -> Result<AgentKind, ProtocolError> {
