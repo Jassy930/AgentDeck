@@ -25,6 +25,8 @@ pub mod adapter;
 pub mod capabilities;
 pub mod translate;
 
+pub use adapter::CodexAdapter;
+
 // ── v1 implementation (gated) ───────────────────────────────────────────────
 // The original `CodexAdapter` struct + `impl` + Drop + helpers below are kept
 // as source material for Task 3B (which rewrites adapter.rs against the new

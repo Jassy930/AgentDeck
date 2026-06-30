@@ -63,6 +63,37 @@ use agentdeck_protocol::{
     ProtocolError, ServerEvent, SessionId, ShellStatus, ThreadId, TurnSummary,
 };
 
+/// One translator output. Carries the neutral `ServerEvent` plus an
+/// optional `rpc_route_hint` the adapter uses to wire approval responses.
+///
+/// When the translator emits `ServerEvent::ActionRequest`, the underlying
+/// Codex JSON-RPC request also has a numeric `id` the adapter must echo
+/// back as the response correlation id. The translator surfaces both the
+/// public `request_id` (which travels to the client and comes back on
+/// `ActionDecision`) and the original codex `rpc_id`, so the adapter can
+/// build a `{request_id → rpc_id}` routing table without re-parsing the
+/// raw JSON.
+#[derive(Debug, Clone)]
+pub struct TranslateOutput {
+    pub event: ServerEvent,
+    pub rpc_route_hint: Option<RpcRouteHint>,
+}
+
+/// Pairing between the public `ActionRequest.request_id` (string, travels
+/// the v2 protocol) and the underlying Codex JSON-RPC numeric id (the
+/// frame-level `id` field the adapter must echo when writing the response).
+#[derive(Debug, Clone)]
+pub struct RpcRouteHint {
+    pub request_id: String,
+    pub rpc_id: u64,
+    /// Original approval method (e.g. `item/commandExecution/requestApproval`)
+    /// — the adapter needs it to build the correct response body shape.
+    pub method: String,
+    /// Original `params` block — the adapter passes it through to
+    /// `permissions/requestApproval` responses (which echo `permissions`).
+    pub params: Value,
+}
+
 /// Per-session Codex translator. Owns the in-flight item accumulators and
 /// a monotonic counter for synthetic request ids.
 #[derive(Debug)]
@@ -170,15 +201,41 @@ impl CodexTranslator {
 
     /// Translate one line of Codex app-server JSONL output.
     ///
-    /// Returns 0..N `ServerEvent`s:
+    /// Returns 0..N `ServerEvent`s. Equivalent to `translate_line_with_routes`
+    /// but drops the per-event `rpc_route_hint`; preserved as a convenience
+    /// for tests that don't care about approval routing.
+    pub fn translate_line(&mut self, line: &str) -> Vec<ServerEvent> {
+        self.translate_line_with_routes(line)
+            .into_iter()
+            .map(|o| o.event)
+            .collect()
+    }
+
+    /// Translate a pre-parsed JSON frame (test entry point + internal call).
+    ///
+    /// Equivalent to `translate_value_with_routes` but drops the per-event
+    /// `rpc_route_hint`.
+    pub fn translate_value(&mut self, frame: &Value) -> Vec<ServerEvent> {
+        self.translate_value_with_routes(frame)
+            .into_iter()
+            .map(|o| o.event)
+            .collect()
+    }
+
+    /// Translate one line, returning each `ServerEvent` together with an
+    /// optional `RpcRouteHint`. Adapters use the hint to register approval
+    /// routing entries before forwarding the event downstream.
+    ///
+    /// Returns 0..N `TranslateOutput`s. The shape is:
     /// - Empty for lifecycle-only frames (`thread/started`,
     ///   `item/*/delta` while accumulating, plain JSON-RPC responses to
     ///   our outbound requests).
     /// - One `AgentItem` for each `item/completed`.
-    /// - One `ActionRequest` for each Codex approval request.
+    /// - One `ActionRequest` + populated `RpcRouteHint` for each Codex
+    ///   approval request.
     /// - One `TurnComplete` for each `turn/completed`.
     /// - One `Error` for any malformed input or Codex-reported error frame.
-    pub fn translate_line(&mut self, line: &str) -> Vec<ServerEvent> {
+    pub fn translate_line_with_routes(&mut self, line: &str) -> Vec<TranslateOutput> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             return Vec::new();
@@ -186,26 +243,33 @@ impl CodexTranslator {
         let frame: Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
             Err(e) => {
-                return vec![self.error_event(
-                    "codex-malformed-json",
-                    format!("malformed codex frame: {e}: {trimmed}"),
-                )];
+                return vec![TranslateOutput {
+                    event: self.error_event(
+                        "codex-malformed-json",
+                        format!("malformed codex frame: {e}: {trimmed}"),
+                    ),
+                    rpc_route_hint: None,
+                }];
             }
         };
-        self.translate_value(&frame)
+        self.translate_value_with_routes(&frame)
     }
 
-    /// Translate a pre-parsed JSON frame (test entry point + internal call).
-    pub fn translate_value(&mut self, frame: &Value) -> Vec<ServerEvent> {
+    /// Translate a pre-parsed JSON frame, returning route hints for any
+    /// approval requests so the adapter can wire `request_id → rpc_id`.
+    pub fn translate_value_with_routes(&mut self, frame: &Value) -> Vec<TranslateOutput> {
         // Error frame from Codex (response.error or notification with `error`).
         if let Some(err) = frame.get("error").filter(|v| !v.is_null()) {
-            return vec![self.error_event(
-                "codex-protocol-error",
-                err.get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("codex returned error frame")
-                    .to_string(),
-            )];
+            return vec![TranslateOutput {
+                event: self.error_event(
+                    "codex-protocol-error",
+                    err.get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("codex returned error frame")
+                        .to_string(),
+                ),
+                rpc_route_hint: None,
+            }];
         }
 
         let method = frame.get("method").and_then(Value::as_str);
@@ -218,17 +282,30 @@ impl CodexTranslator {
         if is_request {
             if let Some(m) = method {
                 if let Some(req) = self.approval_to_action_request(m, &params, frame.get("id")) {
-                    return vec![ServerEvent::ActionRequest {
-                        session_id: self.session_id.clone(),
-                        thread_id: self.resolve_thread_id(&params),
-                        agent_kind: AgentKind::Codex,
-                        request: req,
+                    let rpc_id = frame.get("id").and_then(Value::as_u64);
+                    let hint = rpc_id.map(|rpc_id| RpcRouteHint {
+                        request_id: req.request_id.clone(),
+                        rpc_id,
+                        method: m.to_string(),
+                        params: params.clone(),
+                    });
+                    return vec![TranslateOutput {
+                        event: ServerEvent::ActionRequest {
+                            session_id: self.session_id.clone(),
+                            thread_id: self.resolve_thread_id(&params),
+                            agent_kind: AgentKind::Codex,
+                            request: req,
+                        },
+                        rpc_route_hint: hint,
                     }];
                 }
                 // Unknown server-request method — surface as Raw so it
                 // doesn't disappear, but tag as Raw `AgentItem` (not
                 // `Error`, since Codex might add benign future requests).
-                return vec![self.raw_event_for_unknown_method(m, frame)];
+                return vec![TranslateOutput {
+                    event: self.raw_event_for_unknown_method(m, frame),
+                    rpc_route_hint: None,
+                }];
             }
             return Vec::new();
         }
@@ -240,25 +317,27 @@ impl CodexTranslator {
             return Vec::new();
         }
 
-        // Notification (method only).
+        // Notification (method only). Everything below this point produces
+        // route-less events — map through `TranslateOutput { hint: None }`.
         let Some(m) = method else {
             return Vec::new();
         };
 
-        match m {
+        let events: Vec<ServerEvent> = match m {
             "thread/started" => {
                 if let Some(id) = params.get("threadId").and_then(Value::as_str) {
                     let tid = ThreadId(id.to_string());
                     if self.thread_id.is_none() {
                         self.thread_id = Some(tid.clone());
                     }
-                    return vec![ServerEvent::SessionStarted {
+                    vec![ServerEvent::SessionStarted {
                         session_id: self.session_id.clone(),
                         thread_id: Some(tid),
                         agent_kind: AgentKind::Codex,
-                    }];
+                    }]
+                } else {
+                    Vec::new()
                 }
-                Vec::new()
             }
             "turn/started" => {
                 // Pure lifecycle, no neutral counterpart in v2. Capture
@@ -320,7 +399,11 @@ impl CodexTranslator {
                 vec![self.raw_event_for_unknown_method(other, &json!({"params": params}))]
             }
             _ => Vec::new(),
-        }
+        };
+        events
+            .into_iter()
+            .map(|event| TranslateOutput { event, rpc_route_hint: None })
+            .collect()
     }
 
     // ── item/started ────────────────────────────────────────────────────────
