@@ -4,18 +4,16 @@
 //! and returns `Result<(), CliError>`. The `main.rs` `run()` function owns the
 //! `Client` and calls these.
 
-use crate::client::{
-    self, session_continue_cmd, session_start_cmd, Client,
-};
+use crate::client::{self, Client, session_continue_cmd, session_start_cmd};
 use crate::main_types::{
     AgentKindArg, ApprovalArg, EffortArg, PermissionArg, SandboxArg, SessionRunArgs,
 };
-use crate::output::{render, CliError};
+use crate::output::{CliError, render};
+use crate::transport;
 use agentdeck_protocol::{
     ActionDecision, ActionDecisionKind, AgentKind, ClaudeCodePermissionMode,
     ClaudeCodeSessionOptions, CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode,
-    CodexSessionOptions, HistoryRequest, ServerEvent, SessionStart,
-    VendorSessionOptions,
+    CodexSessionOptions, HistoryRequest, ServerEvent, SessionStart, VendorSessionOptions,
 };
 
 // ── Ping ──────────────────────────────────────────────────────────────────────
@@ -44,9 +42,15 @@ pub fn handle_selfcheck(c: &mut Client, pretty: bool) -> Result<(), CliError> {
 
 // ── Diagnostics ───────────────────────────────────────────────────────────────
 
-pub fn handle_diagnostics_schema(c: &mut Client, pretty: bool) -> Result<(), CliError> {
-    let schema = c.protocol_schema()?;
-    println!("{}", render(&schema, pretty));
+pub fn handle_diagnostics_report(
+    profile: &str,
+    data_dir: Option<&str>,
+    pretty: bool,
+) -> Result<(), CliError> {
+    let raw = transport::run_daemon_diagnostics_report(profile, data_dir)
+        .map_err(|e| CliError::Transport(e.to_string()))?;
+    let report: serde_json::Value = serde_json::from_str(&raw)?;
+    println!("{}", render(&report, pretty));
     Ok(())
 }
 
@@ -55,18 +59,18 @@ pub fn handle_diagnostics_schema(c: &mut Client, pretty: bool) -> Result<(), Cli
 pub fn handle_protocol_schema(c: &mut Client, pretty: bool) -> Result<(), CliError> {
     // schema is always pretty (it's a documentation artifact)
     let schema = c.protocol_schema()?;
-    let out = if pretty {
-        serde_json::to_string_pretty(&schema).unwrap()
-    } else {
-        serde_json::to_string(&schema).unwrap()
-    };
+    let _ = pretty;
+    let out = serde_json::to_string_pretty(&schema).unwrap();
     println!("{out}");
     Ok(())
 }
 
 pub fn handle_protocol_version(c: &mut Client, pretty: bool) -> Result<(), CliError> {
     let ver = c.protocol_version()?;
-    println!("{}", render(&serde_json::json!({"protocolVersion": ver}), pretty));
+    println!(
+        "{}",
+        render(&serde_json::json!({"protocolVersion": ver}), pretty)
+    );
     Ok(())
 }
 
@@ -91,7 +95,12 @@ pub fn handle_agent_capabilities(
 
 // ── Session run / continue ────────────────────────────────────────────────────
 
-pub async fn handle_session_run(args: SessionRunArgs, profile: &str, data_dir: Option<&str>, pretty: bool) -> Result<(), CliError> {
+pub async fn handle_session_run(
+    args: SessionRunArgs,
+    profile: &str,
+    data_dir: Option<&str>,
+    pretty: bool,
+) -> Result<(), CliError> {
     let vendor_options = build_vendor_options(&args)?;
     let start = SessionStart {
         agent_kind: args.agent.into(),
@@ -149,11 +158,7 @@ async fn drain_events(
 
 // ── History ───────────────────────────────────────────────────────────────────
 
-pub fn handle_history(
-    c: &mut Client,
-    req: HistoryRequest,
-    pretty: bool,
-) -> Result<(), CliError> {
+pub fn handle_history(c: &mut Client, req: HistoryRequest, pretty: bool) -> Result<(), CliError> {
     let resp = c.history(req)?;
     let v = serde_json::to_value(&resp)?;
     println!("{}", render(&v, pretty));
@@ -180,23 +185,25 @@ fn build_vendor_options(args: &SessionRunArgs) -> Result<VendorSessionOptions, C
                 .unwrap_or(CodexReasoningEffort::Medium),
             mcp_overrides: vec![],
         })),
-        AgentKindArg::ClaudeCode => Ok(VendorSessionOptions::ClaudeCode(ClaudeCodeSessionOptions {
-            permission_mode: args
-                .permission
-                .map(Into::into)
-                .unwrap_or(ClaudeCodePermissionMode::Default),
-            model: args.model.clone(),
-            effort: args.effort.clone(),
-            hooks: vec![],
-            output_style: args.output_style.clone(),
-            allowed_tools: None,
-            disallowed_tools: None,
-            mcp_config_path: None,
-            plugin_dirs: vec![],
-            worktree: args.worktree.clone(),
-            session_name: args.session_name.clone(),
-            session_id: None,
-        })),
+        AgentKindArg::ClaudeCode => {
+            Ok(VendorSessionOptions::ClaudeCode(ClaudeCodeSessionOptions {
+                permission_mode: args
+                    .permission
+                    .map(Into::into)
+                    .unwrap_or(ClaudeCodePermissionMode::Default),
+                model: args.model.clone(),
+                effort: args.effort.clone(),
+                hooks: vec![],
+                output_style: args.output_style.clone(),
+                allowed_tools: None,
+                disallowed_tools: None,
+                mcp_config_path: None,
+                plugin_dirs: vec![],
+                worktree: args.worktree.clone(),
+                session_name: args.session_name.clone(),
+                session_id: None,
+            }))
+        }
     }
 }
 
@@ -278,12 +285,12 @@ pub fn resolve_action_decision(
         }),
         _ => {
             // Interactive: prompt on stderr, read from stdin
-            eprintln!(
-                "approval request {request_id}: [approve/deny]? ",
-            );
+            eprintln!("approval request {request_id}: [approve/deny]? ",);
             use std::io::BufRead;
             let mut line = String::new();
-            std::io::stdin().lock().read_line(&mut line)
+            std::io::stdin()
+                .lock()
+                .read_line(&mut line)
                 .map_err(|e| CliError::Transport(e.to_string()))?;
             match line.trim() {
                 "approve" => Ok(ActionDecision {
@@ -401,26 +408,62 @@ mod tests {
 
     #[test]
     fn sandbox_arg_converts_to_codex_sandbox_mode() {
-        assert_eq!(CodexSandboxMode::from(SandboxArg::ReadOnly), CodexSandboxMode::ReadOnly);
-        assert_eq!(CodexSandboxMode::from(SandboxArg::WorkspaceWrite), CodexSandboxMode::WorkspaceWrite);
-        assert_eq!(CodexSandboxMode::from(SandboxArg::FullAccess), CodexSandboxMode::FullAccess);
+        assert_eq!(
+            CodexSandboxMode::from(SandboxArg::ReadOnly),
+            CodexSandboxMode::ReadOnly
+        );
+        assert_eq!(
+            CodexSandboxMode::from(SandboxArg::WorkspaceWrite),
+            CodexSandboxMode::WorkspaceWrite
+        );
+        assert_eq!(
+            CodexSandboxMode::from(SandboxArg::FullAccess),
+            CodexSandboxMode::FullAccess
+        );
     }
 
     #[test]
     fn approval_arg_converts_to_codex_approval_policy() {
-        assert_eq!(CodexApprovalPolicy::from(ApprovalArg::OnRequest), CodexApprovalPolicy::OnRequest);
-        assert_eq!(CodexApprovalPolicy::from(ApprovalArg::Never), CodexApprovalPolicy::Never);
-        assert_eq!(CodexApprovalPolicy::from(ApprovalArg::Always), CodexApprovalPolicy::Always);
+        assert_eq!(
+            CodexApprovalPolicy::from(ApprovalArg::OnRequest),
+            CodexApprovalPolicy::OnRequest
+        );
+        assert_eq!(
+            CodexApprovalPolicy::from(ApprovalArg::Never),
+            CodexApprovalPolicy::Never
+        );
+        assert_eq!(
+            CodexApprovalPolicy::from(ApprovalArg::Always),
+            CodexApprovalPolicy::Always
+        );
     }
 
     #[test]
     fn permission_arg_converts_to_cc_permission_mode() {
         use PermissionArg::*;
-        assert_eq!(ClaudeCodePermissionMode::from(Default), ClaudeCodePermissionMode::Default);
-        assert_eq!(ClaudeCodePermissionMode::from(AcceptEdits), ClaudeCodePermissionMode::AcceptEdits);
-        assert_eq!(ClaudeCodePermissionMode::from(Plan), ClaudeCodePermissionMode::Plan);
-        assert_eq!(ClaudeCodePermissionMode::from(Auto), ClaudeCodePermissionMode::Auto);
-        assert_eq!(ClaudeCodePermissionMode::from(DontAsk), ClaudeCodePermissionMode::DontAsk);
-        assert_eq!(ClaudeCodePermissionMode::from(BypassPermissions), ClaudeCodePermissionMode::BypassPermissions);
+        assert_eq!(
+            ClaudeCodePermissionMode::from(Default),
+            ClaudeCodePermissionMode::Default
+        );
+        assert_eq!(
+            ClaudeCodePermissionMode::from(AcceptEdits),
+            ClaudeCodePermissionMode::AcceptEdits
+        );
+        assert_eq!(
+            ClaudeCodePermissionMode::from(Plan),
+            ClaudeCodePermissionMode::Plan
+        );
+        assert_eq!(
+            ClaudeCodePermissionMode::from(Auto),
+            ClaudeCodePermissionMode::Auto
+        );
+        assert_eq!(
+            ClaudeCodePermissionMode::from(DontAsk),
+            ClaudeCodePermissionMode::DontAsk
+        );
+        assert_eq!(
+            ClaudeCodePermissionMode::from(BypassPermissions),
+            ClaudeCodePermissionMode::BypassPermissions
+        );
     }
 }

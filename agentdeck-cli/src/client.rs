@@ -19,7 +19,7 @@
 //! envelope under `"response"` within `{"reply":"history","response":{...}}`.
 
 use crate::output::CliError;
-use crate::transport::{split_async, AsyncProcessTransport, ProcessTransport, SyncTransport};
+use crate::transport::{AsyncProcessTransport, ProcessTransport, SyncTransport, split_async};
 use agentdeck_protocol::{
     ActionDecision, AgentKind, ClientCommand, HistoryRequest, HistoryResponse, ServerEvent,
     SessionCapabilities, SessionId, SessionStart, ThreadId, VendorControlPayload,
@@ -168,7 +168,10 @@ impl Client {
                 code: None,
                 message: "missing agents array".into(),
             })?;
-        Ok(arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        Ok(arr
+            .iter()
+            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+            .collect())
     }
 
     pub fn agent_capabilities(&mut self, kind: AgentKind) -> Result<SessionCapabilities, CliError> {
@@ -188,11 +191,7 @@ impl Client {
     }
 
     pub fn history(&mut self, req: HistoryRequest) -> Result<HistoryResponse, CliError> {
-        let v = admin_round_trip(
-            &mut self.transport,
-            &ClientCommand::History(req),
-            "history",
-        )?;
+        let v = admin_round_trip(&mut self.transport, &ClientCommand::History(req), "history")?;
         let resp_val = v
             .get("response")
             .cloned()
@@ -280,17 +279,25 @@ pub fn session_continue_cmd(
 
 #[allow(dead_code)]
 pub fn session_cancel_cmd(session_id: String) -> ClientCommand {
-    ClientCommand::SessionCancel { session_id: SessionId(session_id) }
+    ClientCommand::SessionCancel {
+        session_id: SessionId(session_id),
+    }
 }
 
 #[allow(dead_code)]
 pub fn action_decision_cmd(session_id: String, decision: ActionDecision) -> ClientCommand {
-    ClientCommand::ActionDecision { session_id: SessionId(session_id), decision }
+    ClientCommand::ActionDecision {
+        session_id: SessionId(session_id),
+        decision,
+    }
 }
 
 #[allow(dead_code)]
 pub fn vendor_control_cmd(session_id: String, payload: VendorControlPayload) -> ClientCommand {
-    ClientCommand::VendorControl { session_id: SessionId(session_id), payload }
+    ClientCommand::VendorControl {
+        session_id: SessionId(session_id),
+        payload,
+    }
 }
 
 #[cfg(test)]
@@ -303,7 +310,8 @@ mod tests {
     }
 
     fn selfcheck_reply() -> String {
-        r#"{"reply":"selfcheck","ok":true,"protocolVersion":2,"agents":["codex","claude_code"]}"#.to_string()
+        r#"{"reply":"selfcheck","ok":true,"protocolVersion":2,"agents":["codex","claude_code"]}"#
+            .to_string()
     }
 
     fn error_event(msg: &str) -> String {
@@ -353,7 +361,10 @@ mod tests {
 
         // Admin reply has "reply"
         let admin_line = r#"{"reply":"ping","ok":true}"#;
-        assert!(matches!(parse_daemon_line(admin_line), DaemonLine::AdminReply(_)));
+        assert!(matches!(
+            parse_daemon_line(admin_line),
+            DaemonLine::AdminReply(_)
+        ));
 
         // Unknown
         let unknown = r#"{"foo":"bar"}"#;
@@ -386,9 +397,7 @@ mod tests {
 
     #[test]
     fn admin_round_trip_fake_propagates_error_event() {
-        let mut fake = FakeTransport::new(vec![
-            error_event("daemon failed"),
-        ]);
+        let mut fake = FakeTransport::new(vec![error_event("daemon failed")]);
         let err = admin_round_trip_fake(&mut fake, &ClientCommand::Ping, "ping").unwrap_err();
         assert_eq!(err.exit_code(), 3);
         assert!(err.message().contains("daemon failed"));
@@ -416,8 +425,7 @@ mod tests {
     fn history_parses_empty_list_response() {
         let raw = r#"{"reply":"history","response":{"kind":"list","value":[]}}"#;
         let v: serde_json::Value = serde_json::from_str(raw).unwrap();
-        let resp: HistoryResponse =
-            serde_json::from_value(v["response"].clone()).unwrap();
+        let resp: HistoryResponse = serde_json::from_value(v["response"].clone()).unwrap();
         assert!(matches!(resp, HistoryResponse::List(ref items) if items.is_empty()));
     }
 

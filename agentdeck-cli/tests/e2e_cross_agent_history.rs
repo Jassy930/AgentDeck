@@ -17,7 +17,11 @@ fn gated() -> bool {
 }
 
 fn which_bin(name: &str) -> bool {
-    Command::new("which").arg(name).output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("which")
+        .arg(name)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn both_vendors_available() -> bool {
@@ -43,10 +47,7 @@ fn run_session(agent: &str, extra_args: &[&str], prompt: &str) -> (String, Strin
         .to_string();
 
     let mut cmd_args = vec![
-        "session", "run",
-        "--agent", agent,
-        "--cwd", &cwd,
-        "--prompt", prompt,
+        "session", "run", "--agent", agent, "--cwd", &cwd, "--prompt", prompt,
     ];
     cmd_args.extend_from_slice(extra_args);
 
@@ -124,7 +125,14 @@ fn e2e_cross_history_merged_list_contains_both_agents() {
     // Run a Codex session
     let (codex_tid, codex_kind) = run_session(
         "codex",
-        &["--sandbox", "read-only", "--approval", "never", "--reasoning-effort", "minimal"],
+        &[
+            "--sandbox",
+            "read-only",
+            "--approval",
+            "never",
+            "--reasoning-effort",
+            "minimal",
+        ],
         "say hi",
     );
     eprintln!("codex session done: thread_id={codex_tid}, agentKind={codex_kind}");
@@ -132,7 +140,12 @@ fn e2e_cross_history_merged_list_contains_both_agents() {
     // Run a CC session
     let (cc_tid, cc_kind) = run_session(
         "claude-code",
-        &["--permission", "bypass-permissions", "--model", "claude-haiku-4-5"],
+        &[
+            "--permission",
+            "bypass-permissions",
+            "--model",
+            "claude-haiku-4-5",
+        ],
         "say hi briefly",
     );
     eprintln!("CC session done: thread_id={cc_tid}, agentKind={cc_kind}");
@@ -144,9 +157,12 @@ fn e2e_cross_history_merged_list_contains_both_agents() {
         "agentdeck history list (merged) failed\nstderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .expect("history list output must be valid JSON");
-    assert_eq!(json["kind"], "list", "merged history must have kind=list; got: {json}");
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("history list output must be valid JSON");
+    assert_eq!(
+        json["kind"], "list",
+        "merged history must have kind=list; got: {json}"
+    );
 
     let items = json["value"].as_array().expect("value must be an array");
     let agent_kinds: Vec<&str> = items
@@ -182,7 +198,10 @@ fn e2e_cross_history_merged_list_contains_both_agents() {
 
 #[test]
 fn e2e_cross_history_codex_filter_returns_only_codex() {
-    if !gated() { eprintln!("SKIP: set AGENTDECK_E2E=1"); return; }
+    if !gated() {
+        eprintln!("SKIP: set AGENTDECK_E2E=1");
+        return;
+    }
     if !both_vendors_available() {
         eprintln!("SKIP: both codex and claude must be in PATH");
         return;
@@ -194,13 +213,16 @@ fn e2e_cross_history_codex_filter_returns_only_codex() {
         "agentdeck history list --agent codex failed\nstderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .expect("history list --agent codex must be valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("history list --agent codex must be valid JSON");
     assert_eq!(json["kind"], "list");
 
     let items = json["value"].as_array().expect("value must be an array");
     for item in items {
-        let kind = item.get("agentKind").and_then(|v| v.as_str()).unwrap_or("(missing)");
+        let kind = item
+            .get("agentKind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(missing)");
         assert_eq!(
             kind, "codex",
             "all items with --agent codex filter must have agentKind=codex; found: {kind}"
@@ -211,7 +233,10 @@ fn e2e_cross_history_codex_filter_returns_only_codex() {
 
 #[test]
 fn e2e_cross_history_cc_filter_returns_only_cc() {
-    if !gated() { eprintln!("SKIP: set AGENTDECK_E2E=1"); return; }
+    if !gated() {
+        eprintln!("SKIP: set AGENTDECK_E2E=1");
+        return;
+    }
     if !both_vendors_available() {
         eprintln!("SKIP: both codex and claude must be in PATH");
         return;
@@ -229,11 +254,17 @@ fn e2e_cross_history_cc_filter_returns_only_cc() {
 
     let items = json["value"].as_array().expect("value must be an array");
     for item in items {
-        let kind = item.get("agentKind").and_then(|v| v.as_str()).unwrap_or("(missing)");
+        let kind = item
+            .get("agentKind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(missing)");
         assert_eq!(
             kind, "claude_code",
             "all items with --agent claude-code filter must have agentKind=claude_code; found: {kind}"
         );
     }
-    eprintln!("CC-only history filter OK: {} claude_code items", items.len());
+    eprintln!(
+        "CC-only history filter OK: {} claude_code items",
+        items.len()
+    );
 }

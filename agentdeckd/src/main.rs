@@ -237,7 +237,10 @@ fn run_main_loop() -> std::io::Result<()> {
         router.register(Arc::new(ClaudeCodeAdapter::new()));
         let hub = RuntimeHub::new(Arc::new(router));
         let res = hub.run(tokio::io::stdin(), tokio::io::stdout()).await;
-        diag::log("daemon_stop", &format!("agentdeckd main loop exited: {res:?}"));
+        diag::log(
+            "daemon_stop",
+            &format!("agentdeckd main loop exited: {res:?}"),
+        );
         res
     })
 }
@@ -294,27 +297,24 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(args.profile.as_deref(), Some("dev"));
-        assert_eq!(args.data_dir.as_deref(), Some(std::path::Path::new("/tmp/xx")));
+        assert_eq!(
+            args.data_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/xx"))
+        );
     }
 
     #[test]
     fn parse_args_flags_selfcheck_and_diagnostics() {
-        let args =
-            parse_args(vec!["agentdeckd".into(), "--selfcheck".into()]).unwrap();
+        let args = parse_args(vec!["agentdeckd".into(), "--selfcheck".into()]).unwrap();
         assert!(args.selfcheck);
 
-        let args = parse_args(vec![
-            "agentdeckd".into(),
-            "--diagnostics-report".into(),
-        ])
-        .unwrap();
+        let args = parse_args(vec!["agentdeckd".into(), "--diagnostics-report".into()]).unwrap();
         assert!(args.diagnostics_report);
     }
 
     #[test]
     fn parse_args_rejects_unknown_flag() {
-        let err = parse_args(vec!["agentdeckd".into(), "--not-a-flag".into()])
-            .unwrap_err();
+        let err = parse_args(vec!["agentdeckd".into(), "--not-a-flag".into()]).unwrap_err();
         assert!(err.contains("--not-a-flag"));
     }
 }

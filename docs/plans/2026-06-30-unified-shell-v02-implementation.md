@@ -252,7 +252,7 @@ git commit -m "refactor(protocol): scaffold v2 module structure (trunk/capabilit
 - Consumes: schemars
 - Produces: `pub enum AgentKind { Codex, ClaudeCode }`，serde 字符串值 `"codex"` / `"claude_code"`；后续所有事件主干消息和 vendor 命名空间路由都用这个
 
-- [ ] **Step 1: 写测试**
+- [x] **Step 1: 写测试**
 
 `agentdeck-protocol/tests/agent_kind.rs`:
 ```rust
@@ -5009,6 +5009,7 @@ git commit -m "feat(daemon/cc/history): archive via `claude rm`, rename via `cla
 **Interfaces:**
 - 当 CC 处于 `--permission-mode plan` 时输出特殊 plan blocks → 映射到 `AgentItem::Plan { steps, meta.vendor=cc }`
 - 当 `--include-hook-events` 启用时，CC 输出 `type:"hook"` 的事件 → `ServerEvent::VendorPanelEvent { payload: VendorPanelPayload::ClaudeCode(ClaudeCodeVendorPanelEvent::HookFired { matcher, tool_use_id, elapsed_ms }) }`
+- 当 CC 输出非 `init` / 非 hook 的 `system` 诊断 subtype（如 `api_retry` / `status` / `thinking_tokens`）时 → `VendorPanelEvent::systemStatus`，只保留 typed 摘要字段，不进入中立主干。
 - `submit_vendor_control` 处理 `ClaudeCodeVendorControl::UpdatePermissionMode/UpdateOutputStyle/AddHook/RemoveHook`——v0.2 简化策略：通过"取消当前 turn + 用新选项重启新 turn"实现（CC 不支持运行中切换）；首版**只支持 UpdatePermissionMode**，其他三个返回 `Err(ProtocolError { code: "cc-vendor-control-not-yet", ... })`
 
 - [ ] **Step 1: 写测试**
@@ -6436,66 +6437,46 @@ git commit -m "feat(swift/ui): AgentKindIcon resource loader + claude.svg from L
 
 **Interfaces:**
 - `HistoryModel.threads: [HistoryListItem]` 已含 `agentKind`
-- `HistorySidebarViewController` 顶部加 `NSSegmentedControl`（All / Codex / Claude Code）作为 filter；分组逻辑按 `cwd` 不变
-- `HistoryRowViews` 行左侧加 `AgentKindIcon` 小图标
+- `HistorySidebarViewController` 不暴露 Codex / Claude Code 切换或过滤控件；分组逻辑按 `cwd` 默认合并展示全部 thread
+- `HistoryRowViews` 不在左侧显示 agent 来源文案或图标；`agentKind` 只保留为读取、归档、重命名时的路由字段
 
 - [ ] **Step 1: 写测试**
 
-`Tests/AgentDeckTests/HistorySidebarFilterTests.swift`:
+`Tests/AgentDeckTests/HistorySidebarUnifiedHistoryTests.swift`:
 ```swift
 import XCTest
+import AppKit
 @testable import AgentDeck
 
-final class HistorySidebarFilterTests: XCTestCase {
-    func testFilterAllShowsBoth() {
-        let items: [HistoryListItem] = [
-            .stub(kind: .codex, title: "a"),
-            .stub(kind: .claudeCode, title: "b"),
-        ]
-        let filtered = HistoryFilter.apply(items, filter: .all)
-        XCTAssertEqual(filtered.count, 2)
-    }
-    func testFilterCodexOnly() {
-        let items: [HistoryListItem] = [
-            .stub(kind: .codex, title: "a"),
-            .stub(kind: .claudeCode, title: "b"),
-        ]
-        XCTAssertEqual(HistoryFilter.apply(items, filter: .codex).count, 1)
-    }
-    func testFilterClaudeCodeOnly() {
-        let items: [HistoryListItem] = [.stub(kind: .codex, title: "a"), .stub(kind: .claudeCode, title: "b")]
-        XCTAssertEqual(HistoryFilter.apply(items, filter: .claudeCode).count, 1)
-    }
+final class HistorySidebarUnifiedHistoryTests: XCTestCase {
+    func testSidebarDoesNotExposeAgentKindSwitch()
+    func testThreadRowDoesNotDisplayAgentKindInLeftSidebar()
 }
 ```
 
-- [ ] **Step 2: 实现 filter + segmented control**
+- [x] **Step 2: 实现统一历史列表**
 
 ```swift
-public enum HistoryFilterMode { case all, codex, claudeCode }
-
-public enum HistoryFilter {
-    public static func apply(_ items: [HistoryListItem], filter: HistoryFilterMode) -> [HistoryListItem] {
-        switch filter {
-        case .all: return items
-        case .codex: return items.filter { $0.agentKind == .codex }
-        case .claudeCode: return items.filter { $0.agentKind == .claudeCode }
-        }
-    }
+private var groups: [HistoryProjectGroup] {
+    model.historyGroups
 }
 ```
 
-`HistorySidebarViewController` 内加 `NSSegmentedControl` 槽位，target/action 触发 reload。
+`HistorySidebarViewController` 只保留搜索框、刷新、新建和全量 `NSOutlineView`。
 
-`HistoryRowViews.swift` 内行 cell 左侧加 `NSImageView`，image 来自 `AgentKindIcon.image(for: row.agentKind)`。
+`HistoryRowViews.swift` 行内只显示状态、runtime 状态和时间，不显示 Codex / Claude Code 来源。
 
-- [ ] **Step 3: 跑测试 PASS + 提交**
+- [x] **Step 3: 跑测试 PASS + 提交**
 
 ```bash
-swift test --filter HistorySidebarFilterTests
-git add Sources/ Tests/
-git commit -m "feat(swift/ui): HistorySidebar adds All/Codex/CC segmented filter; rows show agentKind icon"
+swift test --filter HistorySidebarUnifiedHistoryTests
+swift test
+scripts/verify-agent-docs.sh
 ```
+
+收口验证（2026-07-01）：`HistorySidebarUnifiedHistoryTests`、完整
+`swift test`、`scripts/verify-agent-docs.sh` 通过；`grep -rn "import SwiftUI"
+Sources Tests` 无匹配。
 
 ### Task 6.6：`NewSessionDialog`
 
@@ -7318,8 +7299,8 @@ v0.2 的"双拍"为：
    按 capability 路由到不同 SubView，**保留原始语义**（Codex 仍叫
    approval policy / sandbox / persist，CC 仍叫 permission mode /
    acceptEdits / plan）。
-2. **跨 agent 历史聚合**：左侧历史面板默认列出两家 thread，可按
-   All / Codex / Claude Code 过滤。
+2. **跨 agent 历史聚合**：左侧历史面板默认合并列出两家 thread，不按
+   Codex / Claude Code 提供切换或过滤。
 
 详细范围见 [docs/plans/2026-06-30-unified-shell-v02-design.md](docs/plans/2026-06-30-unified-shell-v02-design.md)
 与 [docs/plans/2026-06-30-unified-shell-v02-implementation.md](docs/plans/2026-06-30-unified-shell-v02-implementation.md)。
@@ -7333,8 +7314,8 @@ v0.2 的"双拍"为：
 
 ```markdown
 v0.2 起，左侧历史面板默认跨 agent 聚合：Codex 与 Claude Code 的会话按 cwd
-分组共存，行内左侧的小图标区分 agent 来源。顶部 segmented control
-（All / Codex / Claude Code）可单独过滤。
+分组共存，不在左侧区分 agent 来源，也不提供 Codex / Claude Code 切换控件。
+`agentKind` 仍保留在数据模型中，用于历史读取和管理动作路由。
 ```
 
 - [ ] **Step 4: 在"agentdeck CLI"段加 `agent` 子命令与 `--agent` flag 说明**
@@ -7470,9 +7451,9 @@ git commit -m "docs(diagnostics): consolidate CC failure codes; document selfche
 - [ ] Plan mode 进入后 UI 显示 Plan 内容并可批准/拒绝
 - [ ] CC tool use 触发 approval 时显示卡片，底部 vendor 区显示"当前 permission mode + tool name"
 - [ ] Codex tool use 触发 approval 时显示卡片，底部 vendor 区显示 sandbox + policy + persist
-- [ ] CC 历史 thread 在侧栏与 Codex 历史共存，带 agent kind 图标区分
+- [ ] CC 历史 thread 在侧栏与 Codex 历史共存，左侧默认合并显示且不提供 agent 切换
 - [ ] CC 历史 thread 点开可回放 + 继续
-- [ ] CC archive (`claude rm` 调用) 后侧栏不可见；通过过滤器"已归档"仍可见
+- [ ] CC archive (`claude rm` 调用) 后侧栏不可见，且不影响 Codex 历史显示
 - [ ] CC rename 后侧栏标题更新；终端 `claude --resume <id>` 看到同名
 - [ ] CC 未登录 → 明确诊断错误，不静默
 - [ ] CC 二进制不存在 → 明确诊断错误，附 `npm install` 提示
@@ -7781,5 +7762,3 @@ Plan 完整保存在 `docs/plans/2026-06-30-unified-shell-v02-implementation.md`
 **我推荐选项 1**，理由：本 plan 含 64 个 task、跨 4 个 crate + Swift 大量文件改造、估算 5-7 周日历周期；上下文长度风险与单次会话上限不匹配；且你在 v0.1 重构里已经验证 subagent 流程跑得通。
 
 请回复 **1 / 2 / 其他**，或要求我先做其他事（如把这份 implementation plan 也 commit 到 git）。
-
-

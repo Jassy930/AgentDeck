@@ -132,7 +132,7 @@ AgentDeck 的"原生体验"意思是每个平台都用平台原生 UI 框架：
 - ClaudeCodeAdapter MVP（节 5）：CLI 子进程接入，CC 特色能力完整可用
 - AppKit UI 改造：CapabilityRouter + vendor SubView + 新会话向导
 - Codex Desktop 对标点：**Approval + Sandbox + Persistence 完整 Codex 三维度**、**Reasoning Effort + Token/Auth mini 面板**
-- 跨 agent 历史聚合（侧栏多 agent 列表 + 过滤器）
+- 跨 agent 历史聚合（侧栏默认合并显示，不提供 agent 切换或过滤入口）
 - 协议 schema 重生成 + 中立性测试 + agent kind 标注测试
 
 ### 2.3 v0.2 范围（don't）
@@ -166,7 +166,7 @@ AgentDeck 的"原生体验"意思是每个平台都用平台原生 UI 框架：
 │                                                                │
 │  SessionViewController                                         │
 │   ├─ StatusBarView (显示当前 agentKind + auth)                  │
-│   ├─ HistorySidebarVC (跨 agent 列表 + 过滤器)                  │
+│   ├─ HistorySidebarVC (跨 agent 合并列表)                       │
 │   ├─ AgentControlBar (capability 路由 → vendor SubView)         │
 │   ├─ ConversationVC (虚拟化 NSTableView, 中立 AgentItem)        │
 │   ├─ ApprovalCardView (主干壳 + vendor 高级区 SubView)          │
@@ -471,7 +471,7 @@ CC 端实现细节见节 5.6。
 
 ### 4.10 run record 适配
 
-`runs/<runId>.jsonl` 文件内容**不变**（仍是中立 AgentItem 流）；新增文件元信息字段 `agent_kind`、`agent_version`，便于按 agent 过滤回放。
+`runs/<runId>.jsonl` 文件内容**不变**（仍是中立 AgentItem 流）；新增文件元信息字段 `agent_kind`、`agent_version`，便于回放、诊断和 adapter 路由。
 
 ### 4.11 K 不变量延伸
 
@@ -560,6 +560,7 @@ CC 端实现细节见节 5.6。
 CC stream-json 输出                       AgentItem 主干
 ─────────────────────────────────────     ─────────────────────────────
 system message (subtype=init)             → SessionStarted + 抓 session_id
+system message (诊断 subtype)             → VendorPanelEvent::systemStatus（不入主干）
 assistant message: text                   AssistantMessage
 assistant message: thinking               Reasoning
 assistant message: tool_use(Bash)         Shell { command, ... }
@@ -772,7 +773,7 @@ fixture 文件位置：`agentdeckd/tests/fixtures/{codex,claude_code}/*.jsonl`
 | `CapabilityRouterTests`（新） | 给不同 capabilities 集合，路由出正确 vendor SubView 类型 |
 | `AgentKindAnnotationTests`（新） | 所有事件主干消息都带 agentKind |
 | `ClaudeCodeSessionEncodingTests`（新） | CC SessionStart 编码符合 v2 |
-| `HistorySidebarFilterTests`（新） | All / Codex / CC 过滤器行为；跨 agent 列表排序 |
+| `HistorySidebarUnifiedHistoryTests`（新） | 侧栏不暴露 agent 切换控件；历史行不显示 agent 来源文案或图标 |
 | `ApprovalCardVendorBottomViewTests`（新） | 主干壳 + vendor 底部 SubView 装配 |
 | `NewSessionDialogFlowTests`（新） | 选 agent → vendor options 表单显示正确字段 → 提交编码 |
 | `ClaudeCodeAuthStatusBadgeTests`（新） | 模拟 auth status 三态显示 |
@@ -823,9 +824,9 @@ AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_cross_agent_history
 - [ ] Plan mode 进入后 UI 显示 Plan 内容并可批准/拒绝
 - [ ] CC tool use 触发 approval 时显示卡片，底部 vendor 区显示"当前 permission mode + tool name"
 - [ ] Codex tool use 触发 approval 时显示卡片，底部 vendor 区显示 sandbox + policy + persist
-- [ ] CC 历史 thread 在侧栏与 Codex 历史共存，带 agent kind 图标区分
+- [ ] CC 历史 thread 在侧栏与 Codex 历史共存，左侧默认合并显示且不提供 agent 切换
 - [ ] CC 历史 thread 点开可回放 + 继续
-- [ ] CC archive (`claude rm` 调用) 后侧栏不可见；通过过滤器"已归档"仍可见
+- [ ] CC archive (`claude rm` 调用) 后侧栏不可见，且不影响 Codex 历史显示
 - [ ] CC rename 后侧栏标题更新；终端 `claude --resume <id>` 看到同名
 - [ ] CC 未登录 → 明确诊断错误，不静默
 - [ ] CC 二进制不存在 → 明确诊断错误，附 `npm install` 提示

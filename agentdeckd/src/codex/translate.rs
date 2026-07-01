@@ -350,11 +350,17 @@ impl CodexTranslator {
                 Vec::new()
             }
             "turn/completed" => vec![self.turn_complete_event(&params)],
-            "thread/closed" | "thread/archived" | "thread/unarchived"
-            | "thread/name/updated" | "thread/tokenUsage/updated"
-            | "thread/status/changed" | "thread/goal/cleared"
-            | "thread/goal/updated" | "thread/compacted"
-            | "turn/diff/updated" | "turn/plan/updated" => {
+            "thread/closed"
+            | "thread/archived"
+            | "thread/unarchived"
+            | "thread/name/updated"
+            | "thread/tokenUsage/updated"
+            | "thread/status/changed"
+            | "thread/goal/cleared"
+            | "thread/goal/updated"
+            | "thread/compacted"
+            | "turn/diff/updated"
+            | "turn/plan/updated" => {
                 // Lifecycle / panel-only notifications. Task 3B may wire
                 // some of these into VendorPanelEvent later; v0.2 ignores.
                 Vec::new()
@@ -390,8 +396,7 @@ impl CodexTranslator {
                 Vec::new()
             }
             "item/mcpToolCall/progress" => Vec::new(),
-            "item/autoApprovalReview/started"
-            | "item/autoApprovalReview/completed" => Vec::new(),
+            "item/autoApprovalReview/started" | "item/autoApprovalReview/completed" => Vec::new(),
             other if other.starts_with("item/") => {
                 // Unknown item-level notification. Don't drop; produce a Raw
                 // item carrying the method + payload so the issue is
@@ -402,7 +407,10 @@ impl CodexTranslator {
         };
         events
             .into_iter()
-            .map(|event| TranslateOutput { event, rpc_route_hint: None })
+            .map(|event| TranslateOutput {
+                event,
+                rpc_route_hint: None,
+            })
             .collect()
     }
 
@@ -424,7 +432,10 @@ impl CodexTranslator {
                 if matches!(kind, InFlightKind::Reasoning) {
                     reasoning_text(item)
                 } else {
-                    item.get("text").and_then(Value::as_str).unwrap_or("").to_string()
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string()
                 }
             }
             _ => String::new(),
@@ -459,8 +470,14 @@ impl CodexTranslator {
         // If we never saw `started`, classify on the fly so completed-only
         // streams (some panel-style items) still surface.
         let prior = self.in_flight.remove(&id);
-        let kind = prior.as_ref().map(|p| p.kind).unwrap_or_else(|| classify(item));
-        let accumulated = prior.as_ref().map(|p| p.accumulated_text.clone()).unwrap_or_default();
+        let kind = prior
+            .as_ref()
+            .map(|p| p.kind)
+            .unwrap_or_else(|| classify(item));
+        let accumulated = prior
+            .as_ref()
+            .map(|p| p.accumulated_text.clone())
+            .unwrap_or_default();
 
         let agent_item = match kind {
             InFlightKind::AssistantMessage => {
@@ -486,16 +503,25 @@ impl CodexTranslator {
                         accumulated
                     }
                 };
-                AgentItem::Reasoning { text, meta: AgentItemMeta::default() }
+                AgentItem::Reasoning {
+                    text,
+                    meta: AgentItemMeta::default(),
+                }
             }
             InFlightKind::Shell => return vec![self.shell_event(item, shell_status_from(item))],
             InFlightKind::Diff => {
                 let files = diff_files(item);
-                AgentItem::Diff { files, meta: AgentItemMeta::default() }
+                AgentItem::Diff {
+                    files,
+                    meta: AgentItemMeta::default(),
+                }
             }
             InFlightKind::Plan => {
                 let steps = plan_steps(item, &accumulated);
-                AgentItem::Plan { steps, meta: AgentItemMeta::default() }
+                AgentItem::Plan {
+                    steps,
+                    meta: AgentItemMeta::default(),
+                }
             }
             InFlightKind::Image => AgentItem::ImageReference {
                 saved_path: item
@@ -503,10 +529,7 @@ impl CodexTranslator {
                     .or_else(|| item.get("path"))
                     .and_then(Value::as_str)
                     .map(Into::into),
-                original_path: item
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .map(Into::into),
+                original_path: item.get("path").and_then(Value::as_str).map(Into::into),
                 meta: AgentItemMeta::default(),
             },
             InFlightKind::ToolCall => AgentItem::ToolCall {
@@ -541,7 +564,10 @@ impl CodexTranslator {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let exit_code = item.get("exitCode").and_then(Value::as_i64).map(|v| v as i32);
+        let exit_code = item
+            .get("exitCode")
+            .and_then(Value::as_i64)
+            .map(|v| v as i32);
         let duration_ms = item
             .get("durationMs")
             .and_then(Value::as_i64)
@@ -624,7 +650,12 @@ impl CodexTranslator {
             .get("deltaBase64")
             .and_then(Value::as_str)
             .and_then(decode_base64)
-            .or_else(|| params.get("delta").and_then(Value::as_str).map(str::to_string))
+            .or_else(|| {
+                params
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
             .unwrap_or_default();
         let slot = self
             .in_flight
@@ -657,7 +688,10 @@ impl CodexTranslator {
                 (ActionKind::ExecuteCommand, summary)
             }
             "item/fileChange/requestApproval" => {
-                let root = params.get("grantRoot").and_then(Value::as_str).unwrap_or("");
+                let root = params
+                    .get("grantRoot")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 let summary = if root.is_empty() {
                     "Apply file changes".to_string()
                 } else {
@@ -724,7 +758,9 @@ impl CodexTranslator {
         {
             return ThreadId(id.to_string());
         }
-        self.thread_id.clone().unwrap_or_else(|| ThreadId(String::new()))
+        self.thread_id
+            .clone()
+            .unwrap_or_else(|| ThreadId(String::new()))
     }
 
     fn error_event(&self, code: &str, message: String) -> ServerEvent {
@@ -774,7 +810,8 @@ fn classify(item: &Value) -> InFlightKind {
 fn assistant_meta(item: &Value) -> AgentItemMeta {
     let mut meta = AgentItemMeta::default();
     if let Some(phase) = item.get("phase") {
-        meta.vendor_extensions.insert("phase".to_string(), phase.clone());
+        meta.vendor_extensions
+            .insert("phase".to_string(), phase.clone());
     }
     if let Some(citation) = item.get("memoryCitation") {
         meta.vendor_extensions
@@ -785,7 +822,14 @@ fn assistant_meta(item: &Value) -> AgentItemMeta {
 
 fn tool_meta(item: &Value) -> AgentItemMeta {
     let mut meta = AgentItemMeta::default();
-    for key in ["server", "tool", "namespace", "status", "durationMs", "mcpAppResourceUri"] {
+    for key in [
+        "server",
+        "tool",
+        "namespace",
+        "status",
+        "durationMs",
+        "mcpAppResourceUri",
+    ] {
         if let Some(v) = item.get(key) {
             meta.vendor_extensions.insert(key.to_string(), v.clone());
         }
@@ -875,11 +919,7 @@ fn diff_files(item: &Value) -> Vec<DiffFile> {
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
-                    let status = match change
-                        .get("kind")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                    {
+                    let status = match change.get("kind").and_then(Value::as_str).unwrap_or("") {
                         "add" | "added" | "create" => DiffStatus::Added,
                         "delete" | "deleted" | "remove" => DiffStatus::Deleted,
                         "rename" | "renamed" => DiffStatus::Renamed,
@@ -1036,7 +1076,8 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0] {
             ServerEvent::AgentItem {
-                item: AgentItem::AssistantMessage { text, .. }, ..
+                item: AgentItem::AssistantMessage { text, .. },
+                ..
             } => assert_eq!(text, "from-delta"),
             other => panic!("expected AssistantMessage, got {other:?}"),
         }
@@ -1063,7 +1104,8 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0] {
             ServerEvent::AgentItem {
-                item: AgentItem::Reasoning { text, .. }, ..
+                item: AgentItem::Reasoning { text, .. },
+                ..
             } => assert_eq!(text, "A digest"),
             other => panic!("expected Reasoning, got {other:?}"),
         }
@@ -1081,7 +1123,10 @@ mod tests {
         assert_eq!(started.len(), 1);
         match &started[0] {
             ServerEvent::AgentItem {
-                item: AgentItem::Shell { command, status, .. }, ..
+                item: AgentItem::Shell {
+                    command, status, ..
+                },
+                ..
             } => {
                 assert_eq!(command, "ls -la");
                 assert!(matches!(status, ShellStatus::Running));
@@ -1099,7 +1144,13 @@ mod tests {
         assert_eq!(completed.len(), 1);
         match &completed[0] {
             ServerEvent::AgentItem {
-                item: AgentItem::Shell { status, exit_code, duration_ms, .. },
+                item:
+                    AgentItem::Shell {
+                        status,
+                        exit_code,
+                        duration_ms,
+                        ..
+                    },
                 ..
             } => {
                 assert!(matches!(status, ShellStatus::Completed));
@@ -1134,7 +1185,11 @@ mod tests {
         let events = t.translate_value(&req);
         assert_eq!(events.len(), 1);
         match &events[0] {
-            ServerEvent::ActionRequest { request, agent_kind, .. } => {
+            ServerEvent::ActionRequest {
+                request,
+                agent_kind,
+                ..
+            } => {
                 assert_eq!(*agent_kind, AgentKind::Codex);
                 assert_eq!(request.request_id, "appr-1");
                 assert!(matches!(request.kind, ActionKind::ExecuteCommand));
@@ -1180,7 +1235,13 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0] {
             ServerEvent::AgentItem {
-                item: AgentItem::Raw { raw_kind, raw_payload, .. }, ..
+                item:
+                    AgentItem::Raw {
+                        raw_kind,
+                        raw_payload,
+                        ..
+                    },
+                ..
             } => {
                 assert_eq!(raw_kind, "newFutureItem");
                 assert!(raw_payload.contains("newFutureItem"));
@@ -1198,7 +1259,11 @@ mod tests {
         }));
         assert_eq!(events.len(), 1);
         match &events[0] {
-            ServerEvent::SessionStarted { thread_id, agent_kind, .. } => {
+            ServerEvent::SessionStarted {
+                thread_id,
+                agent_kind,
+                ..
+            } => {
                 assert_eq!(thread_id.as_ref().unwrap().0, "thread_abc");
                 assert_eq!(*agent_kind, AgentKind::Codex);
             }
@@ -1249,15 +1314,18 @@ mod tests {
     #[test]
     fn lifecycle_notifications_yield_no_events() {
         let mut t = tr();
-        assert!(t
-            .translate_value(&json!({"method": "thread/tokenUsage/updated", "params": {}}))
-            .is_empty());
-        assert!(t
-            .translate_value(&json!({"method": "turn/started", "params": {}}))
-            .is_empty());
-        assert!(t
-            .translate_value(&json!({"method": "thread/closed", "params": {}}))
-            .is_empty());
+        assert!(
+            t.translate_value(&json!({"method": "thread/tokenUsage/updated", "params": {}}))
+                .is_empty()
+        );
+        assert!(
+            t.translate_value(&json!({"method": "turn/started", "params": {}}))
+                .is_empty()
+        );
+        assert!(
+            t.translate_value(&json!({"method": "thread/closed", "params": {}}))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1280,7 +1348,8 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0] {
             ServerEvent::AgentItem {
-                item: AgentItem::Diff { files, .. }, ..
+                item: AgentItem::Diff { files, .. },
+                ..
             } => {
                 assert_eq!(files.len(), 2);
                 assert!(matches!(files[0].status, DiffStatus::Added));

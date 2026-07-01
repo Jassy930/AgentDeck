@@ -36,7 +36,10 @@ pub struct FakeTransport {
 #[cfg(test)]
 impl FakeTransport {
     pub fn new(incoming: Vec<String>) -> Self {
-        Self { sent: Vec::new(), incoming: incoming.into() }
+        Self {
+            sent: Vec::new(),
+            incoming: incoming.into(),
+        }
     }
 }
 
@@ -80,6 +83,34 @@ pub fn locate_daemon() -> Option<PathBuf> {
     None
 }
 
+pub fn run_daemon_diagnostics_report(
+    profile: &str,
+    data_dir: Option<&str>,
+) -> std::io::Result<String> {
+    let path = locate_daemon().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "agentdeckd not found (build it: cargo build -p agentdeckd)",
+        )
+    })?;
+    let mut cmd = Command::new(path);
+    cmd.arg("--diagnostics-report")
+        .arg("--profile")
+        .arg(profile);
+    if let Some(d) = data_dir {
+        cmd.arg("--data-dir").arg(d);
+    }
+    let out = cmd.output()?;
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    Err(std::io::Error::other(format!(
+        "agentdeckd --diagnostics-report failed: {stderr}{stdout}"
+    )))
+}
+
 // ── Synchronous ProcessTransport (blocking I/O, used for admin commands) ─────
 
 /// 真实传输：spawn agentdeckd，走其 stdin/stdout JSONL。
@@ -107,7 +138,11 @@ impl ProcessTransport {
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
-        Ok(Self { child, reader: BufReader::new(stdout), stdin })
+        Ok(Self {
+            child,
+            reader: BufReader::new(stdout),
+            stdin,
+        })
     }
 }
 
@@ -168,7 +203,9 @@ impl AsyncProcessTransport {
             )
         })?;
         let mut cmd = TokioCommand::new(path);
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         cmd.env("AGENTDECK_PROFILE", profile);
         if let Some(d) = data_dir {
             cmd.env("AGENTDECK_DATA_DIR", d);
@@ -275,7 +312,10 @@ mod tests {
         t.send_line(r#"{"command":"ping"}"#).unwrap();
         assert_eq!(t.sent.len(), 1);
         assert_eq!(t.sent[0], r#"{"command":"ping"}"#);
-        assert_eq!(t.recv_line().unwrap().as_deref(), Some(r#"{"reply":"pong"}"#));
+        assert_eq!(
+            t.recv_line().unwrap().as_deref(),
+            Some(r#"{"reply":"pong"}"#)
+        );
         assert!(t.recv_line().unwrap().is_none());
     }
 

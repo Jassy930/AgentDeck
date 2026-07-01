@@ -2,7 +2,7 @@
 //! and carry auth context. If a future PR weakens these, this file fails
 //! to compile.
 
-use agentdeck_protocol::transport::{Transport, AuthContext, TransportConfig};
+use agentdeck_protocol::transport::Transport;
 
 #[allow(dead_code)]
 fn assert_send_sync_static<T: Transport>() {}

@@ -37,15 +37,10 @@ fn all_fixtures_replay_without_panic_and_emit_events() {
     let entries: Vec<_> = std::fs::read_dir(&dir)
         .expect("read fixtures dir")
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path().extension().and_then(|s| s.to_str()) == Some("jsonl")
-        })
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("jsonl"))
         .collect();
     if entries.is_empty() {
-        eprintln!(
-            "SKIP: no .jsonl fixtures found under {}",
-            dir.display()
-        );
+        eprintln!("SKIP: no .jsonl fixtures found under {}", dir.display());
         return;
     }
     for entry in entries {
@@ -111,10 +106,7 @@ fn simple_turn_fixture_emits_assistant_message_when_present() {
         for ev in &out.events {
             match ev {
                 ServerEvent::AgentItem { item, .. } => {
-                    if matches!(
-                        item,
-                        agentdeck_protocol::AgentItem::AssistantMessage { .. }
-                    ) {
+                    if matches!(item, agentdeck_protocol::AgentItem::AssistantMessage { .. }) {
                         saw_assistant = true;
                     }
                 }

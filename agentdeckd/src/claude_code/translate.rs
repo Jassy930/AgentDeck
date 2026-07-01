@@ -208,10 +208,25 @@ impl ClaudeCodeTranslator {
                     permission_route_hint: None,
                 }
             }
-            // Other system subtypes ("status", and any future additions)
-            // are accepted silently — they carry config / progress info
-            // with no neutral counterpart.
-            _ => TranslateOutput::default(),
+            _ => {
+                let payload = ClaudeCodeVendorPanelEvent::SystemStatus {
+                    subtype: subtype.to_string(),
+                    status: parsed
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                    message: system_status_message(parsed),
+                    attempt: parsed.get("attempt").and_then(Value::as_u64),
+                };
+                TranslateOutput {
+                    events: vec![ServerEvent::VendorPanelEvent {
+                        session_id: self.session_id.clone(),
+                        agent_kind: AgentKind::ClaudeCode,
+                        payload: VendorPanelPayload::ClaudeCode(payload),
+                    }],
+                    permission_route_hint: None,
+                }
+            }
         }
     }
 
@@ -230,7 +245,11 @@ impl ClaudeCodeTranslator {
             let block_kind = block.get("type").and_then(Value::as_str).unwrap_or("");
             match block_kind {
                 "text" => {
-                    let text = block.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+                    let text = block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
                     if text.is_empty() {
                         continue;
                     }
@@ -368,7 +387,10 @@ impl ClaudeCodeTranslator {
                 }));
                 continue;
             };
-            let is_error = block.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+            let is_error = block
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let duration_ms = now_ms().saturating_sub(record.started_at_ms);
             let result_text = extract_tool_result_text(block);
 
@@ -537,6 +559,20 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn system_status_message(parsed: &Value) -> Option<String> {
+    parsed
+        .get("message")
+        .or_else(|| parsed.get("status"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            parsed
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+        })
+        .map(String::from)
+}
+
 /// Build a `Vec<DiffFile>` from an Edit / Write / MultiEdit tool_use input.
 /// For Edit we synthesize a minimal unified-diff-ish patch ("- old\n+ new")
 /// since CC's snapshot does not include a server-side diff payload.
@@ -561,8 +597,14 @@ fn diff_files_from_tool_use(tool_name: &str, input: &Value) -> Vec<DiffFile> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let old = input.get("old_string").and_then(Value::as_str).unwrap_or("");
-            let new = input.get("new_string").and_then(Value::as_str).unwrap_or("");
+            let old = input
+                .get("old_string")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let new = input
+                .get("new_string")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             let patch = synth_patch(old, new);
             vec![DiffFile {
                 path: std::path::PathBuf::from(path),

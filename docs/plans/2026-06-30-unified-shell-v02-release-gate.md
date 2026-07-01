@@ -49,9 +49,9 @@
 | `cc_streaming/translate_1000_lines` | ~446 µs | ~171 MiB/s | 1000 行 CC JSON 文本 delta 翻译；目标 >100 KB/s，实测超出约 1700x |
 | `8_concurrent_translators_100_lines_each` | ~390 µs | — | 8 个翻译器（4 CC + 4 Codex）各 100 行，总 800 次翻译调用 |
 | `history_5k_group_by_cwd` | ~566 µs | — | 5000 条历史条目按 cwd 分组（BTreeMap） |
-| `history_5k_filter_codex_only` | ~3.6 µs | — | 5000 条历史条目过滤 AgentKind::Codex |
+| `history_5k_filter_codex_only` | ~3.6 µs | — | 5000 条历史条目按 AgentKind::Codex 过滤（CLI / 后端路径） |
 
-所有基准均顺利编译并完成采样，无 criterion 断言失败。历史过滤为亚毫秒级，UI 响应充裕。
+所有基准均顺利编译并完成采样，无 criterion 断言失败。历史分组和 CLI / 后端过滤均为亚毫秒级。
 
 ---
 

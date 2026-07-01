@@ -93,10 +93,7 @@ pub trait Agent: Send + Sync + 'static {
     ) -> Result<HistoryResponse, ProtocolError> {
         Err(ProtocolError {
             code: "history-not-supported".into(),
-            message: format!(
-                "agent {:?} does not implement history",
-                self.kind()
-            ),
+            message: format!("agent {:?} does not implement history", self.kind()),
             diagnostic_ref: None,
         })
     }

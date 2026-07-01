@@ -1,7 +1,7 @@
 use agentdeck_protocol::{ClaudeCodePermissionMode, SessionId};
 use agentdeckd::claude_code::translate::ClaudeCodeTranslator;
 use agentdeckd::codex::translate::CodexTranslator;
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 fn bench(c: &mut Criterion) {
     let cc_line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"x"}]}}"#;

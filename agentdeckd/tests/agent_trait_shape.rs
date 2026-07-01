@@ -2,8 +2,8 @@
 //! Send+Sync+'static or removes a required method, this file fails to
 //! compile, breaking the build.
 
-use agentdeckd::agent::{Agent, AgentEventSender, AgentSessionHandle};
 use agentdeck_protocol::*;
+use agentdeckd::agent::{Agent, AgentEventSender, AgentSessionHandle};
 
 #[allow(dead_code)]
 fn assert_send_sync_static<T: Agent>() {}
@@ -52,11 +52,7 @@ impl Agent for DefaultHistoryStub {
     ) -> Result<AgentSessionHandle, ProtocolError> {
         unimplemented!()
     }
-    async fn submit_decision(
-        &self,
-        _: &SessionId,
-        _: ActionDecision,
-    ) -> Result<(), ProtocolError> {
+    async fn submit_decision(&self, _: &SessionId, _: ActionDecision) -> Result<(), ProtocolError> {
         Ok(())
     }
     async fn submit_vendor_control(
@@ -77,6 +73,7 @@ async fn default_handle_history_returns_history_not_supported() {
     let req = HistoryRequest::List {
         agent_kind: Some(AgentKind::Codex),
         cwd_filter: None,
+        limit: None,
     };
     let err = a.handle_history(req).await.unwrap_err();
     assert_eq!(err.code, "history-not-supported");

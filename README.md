@@ -29,8 +29,8 @@ v0.2 在 macOS AppKit 上端到端验证「统一壳」架构：
    （permission mode、hooks、output-style 等）完整可用。
 3. **UI 整体范式统一**：`CapabilityRouter` 按 `SessionCapabilities` 路由
    vendor SubView，禁止 UI 硬编码 `if agentKind == .codex` 分支。
-4. **跨 agent 历史聚合**：侧栏同时显示 Codex 和 CC 的历史 thread，带
-   agent kind 图标区分，可各自过滤。
+4. **跨 agent 历史聚合**：侧栏默认同时显示 Codex 和 CC 的历史 thread，
+   不提供 agent 切换或过滤入口。
 
 稳定架构边界见 [ARCHITECTURE.md](ARCHITECTURE.md)。完整设计见
 [docs/plans/2026-06-30-unified-shell-v02-design.md](docs/plans/2026-06-30-unified-shell-v02-design.md)；
@@ -44,7 +44,7 @@ v0.2 在 macOS AppKit 上端到端验证「统一壳」架构：
 │                                                                 │
 │  SessionViewController                                          │
 │   ├─ StatusBarView（当前 agentKind + auth）                      │
-│   ├─ HistorySidebarVC（跨 agent 列表 + 过滤器）                   │
+│   ├─ HistorySidebarVC（跨 agent 合并列表）                         │
 │   ├─ AgentControlBar（capability 路由 → vendor SubView）          │
 │   ├─ ConversationVC（虚拟化 NSTableView，中立 AgentItem）          │
 │   └─ ApprovalCardView（主干壳 + vendor 高级区 SubView）            │
@@ -94,9 +94,10 @@ message / reasoning / shell / diff 长文本交给 AppKit `NSTextView` +
 
 ## 历史会话（跨 agent）
 
-v0.2 起历史侧栏聚合 **Codex + Claude Code** 两家历史 thread，带 agent kind
-图标区分，可按 agent 过滤。这是 AgentDeck 区别于 Codex Desktop 的第一个
-面向用户的价值。
+v0.2 起历史侧栏聚合 **Codex + Claude Code** 两家历史 thread，左侧不区分
+agent 来源、不提供 agent 切换或过滤入口，默认按项目和更新时间合并展示。
+`agentKind` 仍保留在数据模型中，用于读取、继续、归档和重命名时路由到正确
+adapter。
 
 **Codex 历史**：通过 Codex app-server 扫描已持久化的历史 thread，按项目
 `cwd` 分组显示。点击历史 thread 后读取 `thread/read(includeTurns: true)`
@@ -140,11 +141,9 @@ thread 会在对应历史行内显示小状态点：普通缓存态保持低调�
 应用窗口打开时会自动刷新一次历史列表；之后可以通过左侧 History 面板的刷新
 按钮手动重新扫描。History 列表中的每个 thread 都是整行块级点击目标，
 每个项目文件夹标题右侧提供加号按钮，可在对应 `cwd` 下开启新的空白会话；
-新 thread 仍等用户发送第一条 prompt 后才创建。标题前会显示 agent 来源小图标；当前历史会话来自 Codex，因此显示 Codex
-透明背景图标。该 SVG 来自 LobeHub Icons 的 `codex.svg`，并在本地 bundle 中使用。
+新 thread 仍等用户发送第一条 prompt 后才创建。
 列表项同时提供 hover、正在打开和已选中状态，避免只点标题文字才有响应。
-History 面板的分组结果在历史线程列表更新时一次性计算；agent 来源图标也会按
-资源名缓存，滚动列表时不会反复排序分组或重新从 bundle 解码 SVG。
+History 面板的分组结果在历史线程列表更新时一次性计算，滚动列表时不会反复排序分组。
 打开或切换历史会话时，右侧会话视图区会重置滚动身份并从顶部显示，避免沿用
 上一个长会话的滚动位置导致短会话首屏空白。
 右侧会话区提供无背板的竖排轮次导航点：每个点对应一条用户消息，hover 时点位会临时放大并显示摘要，

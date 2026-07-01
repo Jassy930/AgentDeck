@@ -4,8 +4,8 @@
 
 use crate::agent::{AgentEventSender, AgentSessionHandle, DynAgent};
 use agentdeck_protocol::{
-    ActionDecision, AgentKind, HistoryRequest, HistoryResponse, ProtocolError,
-    SessionCapabilities, SessionId, SessionStart, ThreadId, VendorControlPayload,
+    ActionDecision, AgentKind, HistoryRequest, HistoryResponse, ProtocolError, SessionCapabilities,
+    SessionId, SessionStart, ThreadId, VendorControlPayload, effective_history_list_limit,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -43,13 +43,19 @@ impl AgentRouter {
         start: SessionStart,
         events: AgentEventSender,
     ) -> Result<AgentSessionHandle, ProtocolError> {
-        let agent = self.agents.get(&start.agent_kind).ok_or_else(|| ProtocolError {
-            code: "agent-not-registered".into(),
-            message: format!("no adapter registered for agentKind={:?}", start.agent_kind),
-            diagnostic_ref: None,
-        })?;
+        let agent = self
+            .agents
+            .get(&start.agent_kind)
+            .ok_or_else(|| ProtocolError {
+                code: "agent-not-registered".into(),
+                message: format!("no adapter registered for agentKind={:?}", start.agent_kind),
+                diagnostic_ref: None,
+            })?;
         let handle = agent.start_session(start, events).await?;
-        self.sessions.lock().await.insert(handle.session_id.clone(), handle.agent_kind);
+        self.sessions
+            .lock()
+            .await
+            .insert(handle.session_id.clone(), handle.agent_kind);
         Ok(handle)
     }
 
@@ -66,8 +72,13 @@ impl AgentRouter {
             message: format!("no adapter registered for agentKind={:?}", agent_kind),
             diagnostic_ref: None,
         })?;
-        let handle = agent.continue_thread(thread_id, cwd, prompt, events).await?;
-        self.sessions.lock().await.insert(handle.session_id.clone(), handle.agent_kind);
+        let handle = agent
+            .continue_thread(thread_id, cwd, prompt, events)
+            .await?;
+        self.sessions
+            .lock()
+            .await
+            .insert(handle.session_id.clone(), handle.agent_kind);
         Ok(handle)
     }
 
@@ -77,7 +88,11 @@ impl AgentRouter {
         decision: ActionDecision,
     ) -> Result<(), ProtocolError> {
         let kind = self.lookup_session(session_id).await?;
-        self.agents.get(&kind).unwrap().submit_decision(session_id, decision).await
+        self.agents
+            .get(&kind)
+            .unwrap()
+            .submit_decision(session_id, decision)
+            .await
     }
 
     pub async fn submit_vendor_control(
@@ -86,7 +101,11 @@ impl AgentRouter {
         payload: VendorControlPayload,
     ) -> Result<(), ProtocolError> {
         let kind = self.lookup_session(session_id).await?;
-        self.agents.get(&kind).unwrap().submit_vendor_control(session_id, payload).await
+        self.agents
+            .get(&kind)
+            .unwrap()
+            .submit_vendor_control(session_id, payload)
+            .await
     }
 
     pub async fn cancel(&self, session_id: &SessionId) -> Result<(), ProtocolError> {
@@ -110,8 +129,13 @@ impl AgentRouter {
         request: HistoryRequest,
     ) -> Result<HistoryResponse, ProtocolError> {
         let agent_kind = match &request {
-            HistoryRequest::List { agent_kind: Some(k), .. } => *k,
-            HistoryRequest::List { agent_kind: None, .. } => {
+            HistoryRequest::List {
+                agent_kind: Some(k),
+                ..
+            } => *k,
+            HistoryRequest::List {
+                agent_kind: None, ..
+            } => {
                 return self.handle_history_cross_agent(request).await;
             }
             HistoryRequest::Read { agent_kind, .. }
@@ -136,8 +160,10 @@ impl AgentRouter {
         &self,
         request: HistoryRequest,
     ) -> Result<HistoryResponse, ProtocolError> {
-        let cwd_filter = match &request {
-            HistoryRequest::List { cwd_filter, .. } => cwd_filter.clone(),
+        let (cwd_filter, limit) = match &request {
+            HistoryRequest::List {
+                cwd_filter, limit, ..
+            } => (cwd_filter.clone(), *limit),
             _ => unreachable!("handle_history_cross_agent only called for List"),
         };
         let mut all = Vec::new();
@@ -145,23 +171,30 @@ impl AgentRouter {
             let req = HistoryRequest::List {
                 agent_kind: Some(*kind),
                 cwd_filter: cwd_filter.clone(),
+                limit,
             };
             match agent.handle_history(req).await {
                 Ok(HistoryResponse::List(items)) => all.extend(items),
-                Ok(_) => {} // wrong variant from adapter; ignore
+                Ok(_) => {}  // wrong variant from adapter; ignore
                 Err(_) => {} // one adapter's failure doesn't block the others
             }
         }
         all.sort_by_key(|item| std::cmp::Reverse(item.last_active_ms));
+        all.truncate(effective_history_list_limit(limit));
         Ok(HistoryResponse::List(all))
     }
 
     async fn lookup_session(&self, sid: &SessionId) -> Result<AgentKind, ProtocolError> {
-        self.sessions.lock().await.get(sid).copied().ok_or_else(|| ProtocolError {
-            code: "session-not-found".into(),
-            message: format!("session {:?} unknown to router", sid),
-            diagnostic_ref: None,
-        })
+        self.sessions
+            .lock()
+            .await
+            .get(sid)
+            .copied()
+            .ok_or_else(|| ProtocolError {
+                code: "session-not-found".into(),
+                message: format!("session {:?} unknown to router", sid),
+                diagnostic_ref: None,
+            })
     }
 }
 

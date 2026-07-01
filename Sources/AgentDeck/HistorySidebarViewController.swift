@@ -58,25 +58,6 @@ final class HistorySidebarViewController: NSViewController {
         return sf
     }()
 
-    /// T6C: agent kind filter segmented control — "All / Codex / Claude Code"
-    private lazy var filterSegment: NSSegmentedControl = {
-        let ctrl = NSSegmentedControl(
-            labels: HistoryFilterMode.allCases.map { $0.displayName },
-            trackingMode: .selectOne,
-            target: self,
-            action: #selector(filterChanged(_:))
-        )
-        ctrl.selectedSegment = 0
-        ctrl.controlSize = .mini
-        ctrl.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-        ctrl.translatesAutoresizingMaskIntoConstraints = false
-        return ctrl
-    }()
-
-    // MARK: - Filter state (Task 6C)
-
-    private var currentFilter: HistoryFilterMode = .all
-
     /// Shown while isLoadingHistory
     private let loadingIndicator: NSProgressIndicator = {
         let pi = NSProgressIndicator()
@@ -178,7 +159,6 @@ final class HistorySidebarViewController: NSViewController {
 
         container.addSubview(headerRow)
         container.addSubview(searchField)
-        container.addSubview(filterSegment)
         container.addSubview(loadingIndicator)
         container.addSubview(errorLabel)
         container.addSubview(emptyStateLabel)
@@ -195,27 +175,22 @@ final class HistorySidebarViewController: NSViewController {
             searchField.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
             searchField.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
 
-            // Filter segmented control (T6C)
-            filterSegment.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 6),
-            filterSegment.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
-            filterSegment.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
-
-            // Loading indicator (anchored below filter)
-            loadingIndicator.topAnchor.constraint(equalTo: filterSegment.bottomAnchor, constant: 12),
+            // Loading indicator
+            loadingIndicator.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 12),
             loadingIndicator.centerXAnchor.constraint(equalTo: container.centerXAnchor),
 
             // Error label
-            errorLabel.topAnchor.constraint(equalTo: filterSegment.bottomAnchor, constant: 8),
+            errorLabel.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 8),
             errorLabel.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
             errorLabel.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
 
             // Empty-state label
-            emptyStateLabel.topAnchor.constraint(equalTo: filterSegment.bottomAnchor, constant: 12),
+            emptyStateLabel.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 12),
             emptyStateLabel.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
             emptyStateLabel.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
 
-            // Outline scroll view (below filter segment)
-            scrollView.topAnchor.constraint(equalTo: filterSegment.bottomAnchor, constant: 6),
+            // Outline scroll view
+            scrollView.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 8),
             scrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             scrollView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
@@ -279,19 +254,10 @@ final class HistorySidebarViewController: NSViewController {
         Task { @MainActor in b.invalidate() }
     }
 
-    // MARK: - Data Helpers (Task 6C: filtered)
-
-    private var filteredThreads: [HistoryThreadSummary] {
-        let all = model.historyThreads
-        switch currentFilter {
-        case .all: return all
-        case .codex: return all.filter { $0.agentKind == .codex }
-        case .claudeCode: return all.filter { $0.agentKind == .claudeCode }
-        }
-    }
+    // MARK: - Data Helpers
 
     private var groups: [HistoryProjectGroup] {
-        HistoryProjectGroup.group(filteredThreads)
+        model.historyGroups
     }
 
     // MARK: - Reload
@@ -338,15 +304,6 @@ final class HistorySidebarViewController: NSViewController {
 
     @objc private func handleNewSession() {
         onNewSessionRequested?()
-    }
-
-    /// T6C: filter segmented control changed → update currentFilter and reload.
-    @objc private func filterChanged(_ sender: NSSegmentedControl) {
-        let modes = HistoryFilterMode.allCases
-        let idx = sender.selectedSegment
-        guard modes.indices.contains(idx) else { return }
-        currentFilter = modes[idx]
-        reloadOutline()
     }
 
     // MARK: - Context Menu (Rename / Archive)
@@ -444,8 +401,6 @@ extension HistorySidebarViewController: NSOutlineViewDelegate {
             selectedThreadId: model.selectedHistoryThreadId,
             openingThreadId: model.openingHistoryThreadId,
             hoveredThreadId: nil,   // hover tracking is NSOutlineView's built-in highlight
-            modelProvider: thread.modelProvider,
-            source: thread.source,
             runtimePhase: runtime?.phase,
             unreadEventCount: runtime?.unreadEventCount ?? 0
         )

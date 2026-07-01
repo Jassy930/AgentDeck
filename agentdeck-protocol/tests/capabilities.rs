@@ -1,7 +1,6 @@
 use agentdeck_protocol::{
-    AgentKind, CapabilityId, SessionCapabilities, VendorCapabilities,
-    CodexCapabilities, CodexSandboxMode, CodexReasoningEffort,
-    ClaudeCodeCapabilities, ClaudeCodePermissionMode,
+    AgentKind, CapabilityId, ClaudeCodeCapabilities, ClaudeCodePermissionMode, CodexCapabilities,
+    CodexReasoningEffort, CodexSandboxMode, SessionCapabilities, VendorCapabilities,
 };
 use std::collections::BTreeSet;
 
@@ -16,15 +15,9 @@ fn codex_capabilities_round_trip() {
             CapabilityId::Approval,
         ]),
         vendor: VendorCapabilities::Codex(CodexCapabilities {
-            sandbox_modes: vec![
-                CodexSandboxMode::ReadOnly,
-                CodexSandboxMode::WorkspaceWrite,
-            ],
+            sandbox_modes: vec![CodexSandboxMode::ReadOnly, CodexSandboxMode::WorkspaceWrite],
             persistence_supported: true,
-            reasoning_effort_levels: vec![
-                CodexReasoningEffort::Low,
-                CodexReasoningEffort::Medium,
-            ],
+            reasoning_effort_levels: vec![CodexReasoningEffort::Low, CodexReasoningEffort::Medium],
         }),
     };
     let json = serde_json::to_string(&caps).unwrap();

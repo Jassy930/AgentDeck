@@ -1,4 +1,7 @@
-use agentdeck_protocol::{ServerEvent, AgentKind, SessionId, ThreadId, AgentItem, AgentItemMeta, SessionCapabilities, ShellStatus};
+use agentdeck_protocol::{
+    AgentItem, AgentItemMeta, AgentKind, ServerEvent, SessionCapabilities, SessionId, ShellStatus,
+    ThreadId,
+};
 use std::collections::BTreeSet;
 
 fn ek(agent_kind: AgentKind) -> ServerEvent {
@@ -53,6 +56,12 @@ fn agent_item_shell_fields_camel_case() {
         },
     };
     let json = serde_json::to_string(&event).unwrap();
-    assert!(json.contains(r#""exitCode":0"#), "exitCode missing in: {json}");
-    assert!(json.contains(r#""durationMs":10"#), "durationMs missing in: {json}");
+    assert!(
+        json.contains(r#""exitCode":0"#),
+        "exitCode missing in: {json}"
+    );
+    assert!(
+        json.contains(r#""durationMs":10"#),
+        "durationMs missing in: {json}"
+    );
 }

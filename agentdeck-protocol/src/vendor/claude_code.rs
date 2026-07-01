@@ -1,8 +1,8 @@
 //! Claude Code-specific vendor types. Populated in tasks T1.5, T1.7.
 
-use std::path::PathBuf;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -54,7 +54,12 @@ pub struct ClaudeCodeSessionOptions {
 // ── T1.7: ClaudeCodeVendorControl / ClaudeCodeVendorPanelEvent ───────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", content = "payload", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    tag = "kind",
+    content = "payload",
+    rename_all = "camelCase",
+    deny_unknown_fields
+)]
 pub enum ClaudeCodeVendorControl {
     UpdatePermissionMode(ClaudeCodePermissionMode),
     UpdateOutputStyle { name: Option<String> },
@@ -72,5 +77,13 @@ pub enum ClaudeCodeVendorPanelEvent {
         tool_use_id: Option<String>,
         #[serde(rename = "elapsedMs")]
         elapsed_ms: Option<u64>,
+    },
+    /// Diagnostic system events such as api_retry/status/thinking_tokens
+    /// that are useful to clients but have no neutral trunk counterpart.
+    SystemStatus {
+        subtype: String,
+        status: Option<String>,
+        message: Option<String>,
+        attempt: Option<u64>,
     },
 }

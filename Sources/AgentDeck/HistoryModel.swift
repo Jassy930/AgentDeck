@@ -1,5 +1,4 @@
 import Foundation
-import AppKit
 
 /// Neutral summary for one persisted agent thread. Mirrors the daemon's
 /// history shape; Swift never parses vendor thread JSON directly.
@@ -66,8 +65,6 @@ struct HistoryThreadRowPresentation: Equatable {
 
     let visualState: VisualState
     let usesFullRowHitTarget = true
-    let agentSourceLabel: String
-    let agentSourceImageName: String
     let runtimePhase: SessionModel.Phase?
     let unreadEventCount: Int
 
@@ -76,8 +73,6 @@ struct HistoryThreadRowPresentation: Equatable {
         selectedThreadId: String?,
         openingThreadId: String?,
         hoveredThreadId: String?,
-        modelProvider: String = "",
-        source: String = "",
         runtimePhase: SessionModel.Phase? = nil,
         unreadEventCount: Int = 0
     ) {
@@ -91,9 +86,6 @@ struct HistoryThreadRowPresentation: Equatable {
             visualState = .idle
         }
 
-        let marker = HistoryAgentSourceMarker(modelProvider: modelProvider, source: source)
-        agentSourceLabel = marker.label
-        agentSourceImageName = marker.imageName
         self.runtimePhase = runtimePhase
         self.unreadEventCount = unreadEventCount
     }
@@ -112,77 +104,6 @@ struct HistoryThreadRowPresentation: Equatable {
 
     var runtimeStatusLabel: String? {
         runtimePhase?.rawValue
-    }
-}
-
-struct HistoryAgentSourceMarker: Equatable {
-    let label: String
-    let imageName: String
-
-    init(modelProvider: String, source: String) {
-        let normalizedProvider = modelProvider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let normalizedSource = source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-
-        if normalizedProvider.contains("openai")
-            || normalizedSource.contains("codex")
-            || normalizedSource == "cli" {
-            label = "Codex"
-            imageName = "CodexIcon"
-        } else {
-            label = normalizedSource.isEmpty ? "Unknown agent" : source
-            imageName = "UnknownAgentIcon"
-        }
-    }
-}
-
-@MainActor
-final class HistoryAgentImageCache {
-    typealias Loader = @MainActor (String) -> NSImage?
-
-    static let shared = HistoryAgentImageCache(loader: loadBundledImage(named:))
-
-    private let loader: Loader
-    private var images: [String: NSImage] = [:]
-    private var misses: Set<String> = []
-
-    init(loader: @escaping Loader) {
-        self.loader = loader
-    }
-
-    func image(named name: String) -> NSImage? {
-        if let image = images[name] {
-            return image
-        }
-        if misses.contains(name) {
-            return nil
-        }
-        guard let image = loader(name) else {
-            misses.insert(name)
-            return nil
-        }
-        images[name] = image
-        return image
-    }
-
-    private static func loadBundledImage(named name: String) -> NSImage? {
-        let resource: (subdirectory: String, filename: String)
-        switch name {
-        case "CodexIcon":
-            resource = ("Assets.xcassets/CodexIcon.imageset", "codex")
-        case "UnknownAgentIcon":
-            resource = ("Assets.xcassets/UnknownAgentIcon.imageset", "unknown-agent")
-        default:
-            return nil
-        }
-
-        guard let url = Bundle.module.url(
-            forResource: resource.filename,
-            withExtension: "svg",
-            subdirectory: resource.subdirectory
-        ) else {
-            return nil
-        }
-        return NSImage(contentsOf: url)
     }
 }
 
@@ -429,30 +350,4 @@ struct HistoryReplayItem: Codable, Equatable, Identifiable {
 struct HistoryThreadDetail: Codable, Equatable {
     var thread: HistoryThreadSummary
     var items: [HistoryReplayItem]
-}
-
-// MARK: - History filter (Task 6C)
-
-public enum HistoryFilterMode: String, CaseIterable {
-    case all
-    case codex
-    case claudeCode
-
-    var displayName: String {
-        switch self {
-        case .all: return "All"
-        case .codex: return "Codex"
-        case .claudeCode: return "Claude Code"
-        }
-    }
-}
-
-public enum HistoryFilter {
-    public static func apply(_ items: [HistoryListItem], filter: HistoryFilterMode) -> [HistoryListItem] {
-        switch filter {
-        case .all: return items
-        case .codex: return items.filter { $0.agentKind == .codex }
-        case .claudeCode: return items.filter { $0.agentKind == .claudeCode }
-        }
-    }
 }

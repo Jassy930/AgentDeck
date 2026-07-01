@@ -706,8 +706,11 @@ public enum CodexVendorPanelEvent: Codable, Sendable {
 
 public enum ClaudeCodeVendorPanelEvent: Codable, Sendable {
     case hookFired(matcher: String, toolUseId: String?, elapsedMs: UInt64?)
+    case systemStatus(subtype: String, status: String?, message: String?, attempt: UInt64?)
 
-    private enum CodingKeys: String, CodingKey { case kind, matcher, toolUseId, elapsedMs }
+    private enum CodingKeys: String, CodingKey {
+        case kind, matcher, toolUseId, elapsedMs, subtype, status, message, attempt
+    }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -718,6 +721,12 @@ public enum ClaudeCodeVendorPanelEvent: Codable, Sendable {
             let t = try c.decodeIfPresent(String.self, forKey: .toolUseId)
             let e = try c.decodeIfPresent(UInt64.self, forKey: .elapsedMs)
             self = .hookFired(matcher: m, toolUseId: t, elapsedMs: e)
+        case "systemStatus":
+            let subtype = try c.decode(String.self, forKey: .subtype)
+            let status = try c.decodeIfPresent(String.self, forKey: .status)
+            let message = try c.decodeIfPresent(String.self, forKey: .message)
+            let attempt = try c.decodeIfPresent(UInt64.self, forKey: .attempt)
+            self = .systemStatus(subtype: subtype, status: status, message: message, attempt: attempt)
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .kind, in: c, debugDescription: "unknown ClaudeCodeVendorPanelEvent kind: \(kind)"
@@ -733,6 +742,12 @@ public enum ClaudeCodeVendorPanelEvent: Codable, Sendable {
             try c.encode(m, forKey: .matcher)
             try c.encodeIfPresent(t, forKey: .toolUseId)
             try c.encodeIfPresent(e, forKey: .elapsedMs)
+        case .systemStatus(let subtype, let status, let message, let attempt):
+            try c.encode("systemStatus", forKey: .kind)
+            try c.encode(subtype, forKey: .subtype)
+            try c.encodeIfPresent(status, forKey: .status)
+            try c.encodeIfPresent(message, forKey: .message)
+            try c.encodeIfPresent(attempt, forKey: .attempt)
         }
     }
 }
@@ -882,13 +897,13 @@ public struct HistoryReadResponse: Codable, Sendable {
 
 /// `#[serde(tag = "op", rename_all = "camelCase")]`
 public enum HistoryRequest: Codable, Sendable {
-    case list(agentKind: AgentKind?, cwdFilter: String?)
+    case list(agentKind: AgentKind?, cwdFilter: String?, limit: UInt?)
     case read(threadId: String, agentKind: AgentKind)
     case archive(threadId: String, agentKind: AgentKind)
     case unarchive(threadId: String, agentKind: AgentKind)
     case rename(threadId: String, agentKind: AgentKind, title: String)
 
-    private enum CodingKeys: String, CodingKey { case op, agentKind, cwdFilter, threadId, title }
+    private enum CodingKeys: String, CodingKey { case op, agentKind, cwdFilter, limit, threadId, title }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -897,7 +912,8 @@ public enum HistoryRequest: Codable, Sendable {
         case "list":
             let kind = try c.decodeIfPresent(AgentKind.self, forKey: .agentKind)
             let cwd = try c.decodeIfPresent(String.self, forKey: .cwdFilter)
-            self = .list(agentKind: kind, cwdFilter: cwd)
+            let limit = try c.decodeIfPresent(UInt.self, forKey: .limit)
+            self = .list(agentKind: kind, cwdFilter: cwd, limit: limit)
         case "read":
             let tid = try c.decode(String.self, forKey: .threadId)
             let kind = try c.decode(AgentKind.self, forKey: .agentKind)
@@ -925,10 +941,11 @@ public enum HistoryRequest: Codable, Sendable {
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         switch self {
-        case .list(let kind, let cwd):
+        case .list(let kind, let cwd, let limit):
             try c.encode("list", forKey: .op)
             try c.encodeIfPresent(kind, forKey: .agentKind)
             try c.encodeIfPresent(cwd, forKey: .cwdFilter)
+            try c.encodeIfPresent(limit, forKey: .limit)
         case .read(let tid, let kind):
             try c.encode("read", forKey: .op)
             try c.encode(tid, forKey: .threadId)

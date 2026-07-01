@@ -18,7 +18,11 @@ fn claude_available() -> bool {
 }
 
 fn which_bin(name: &str) -> bool {
-    Command::new("which").arg(name).output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("which")
+        .arg(name)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn cli_bin() -> &'static str {
@@ -50,23 +54,29 @@ fn e2e_cc_ping() {
         "agentdeck ping failed\nstderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .expect("ping output must be valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("ping output must be valid JSON");
     assert_eq!(json["ok"], true, "ping must return ok=true");
 }
 
 #[test]
 fn e2e_cc_selfcheck() {
-    if !gated() { eprintln!("SKIP: set AGENTDECK_E2E=1"); return; }
-    if !claude_available() { eprintln!("SKIP: claude not in PATH"); return; }
+    if !gated() {
+        eprintln!("SKIP: set AGENTDECK_E2E=1");
+        return;
+    }
+    if !claude_available() {
+        eprintln!("SKIP: claude not in PATH");
+        return;
+    }
     let out = run_cli(&["selfcheck"]);
     assert!(
         out.status.success(),
         "agentdeck selfcheck failed\nstderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .expect("selfcheck output must be valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("selfcheck output must be valid JSON");
     assert_eq!(json["ok"], true, "selfcheck must return ok=true");
 }
 
@@ -74,16 +84,22 @@ fn e2e_cc_selfcheck() {
 
 #[test]
 fn e2e_cc_agent_list_contains_claude_code() {
-    if !gated() { eprintln!("SKIP: set AGENTDECK_E2E=1"); return; }
-    if !claude_available() { eprintln!("SKIP: claude not in PATH"); return; }
+    if !gated() {
+        eprintln!("SKIP: set AGENTDECK_E2E=1");
+        return;
+    }
+    if !claude_available() {
+        eprintln!("SKIP: claude not in PATH");
+        return;
+    }
     let out = run_cli(&["agent", "list"]);
     assert!(
         out.status.success(),
         "agentdeck agent list failed\nstderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .expect("agent list must be valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("agent list must be valid JSON");
     let agents: Vec<&str> = json["agents"]
         .as_array()
         .expect("agents must be an array")
@@ -98,16 +114,22 @@ fn e2e_cc_agent_list_contains_claude_code() {
 
 #[test]
 fn e2e_cc_agent_capabilities_has_permission_mode() {
-    if !gated() { eprintln!("SKIP: set AGENTDECK_E2E=1"); return; }
-    if !claude_available() { eprintln!("SKIP: claude not in PATH"); return; }
+    if !gated() {
+        eprintln!("SKIP: set AGENTDECK_E2E=1");
+        return;
+    }
+    if !claude_available() {
+        eprintln!("SKIP: claude not in PATH");
+        return;
+    }
     let out = run_cli(&["agent", "capabilities", "--agent", "claude-code"]);
     assert!(
         out.status.success(),
         "agentdeck agent capabilities --agent claude-code failed\nstderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .expect("capabilities output must be valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("capabilities output must be valid JSON");
     let features: Vec<&str> = json["features"]
         .as_array()
         .expect("features must be an array")
@@ -141,12 +163,18 @@ fn run_cc_session(prompt: &str) -> (String, Vec<serde_json::Value>) {
 
     let mut child = Command::new(cli_bin())
         .args([
-            "session", "run",
-            "--agent", "claude-code",
-            "--cwd", &cwd,
-            "--prompt", prompt,
-            "--permission", "bypass-permissions",
-            "--model", "claude-haiku-4-5",
+            "session",
+            "run",
+            "--agent",
+            "claude-code",
+            "--cwd",
+            &cwd,
+            "--prompt",
+            prompt,
+            "--permission",
+            "bypass-permissions",
+            "--model",
+            "claude-haiku-4-5",
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -198,12 +226,12 @@ fn run_cc_session(prompt: &str) -> (String, Vec<serde_json::Value>) {
     );
 
     // Assert N7: sessionCapabilities before first agentItem
-    let cap_pos = events.iter().position(|v| {
-        v.get("type").and_then(|t| t.as_str()) == Some("sessionCapabilities")
-    });
-    let item_pos = events.iter().position(|v| {
-        v.get("type").and_then(|t| t.as_str()) == Some("agentItem")
-    });
+    let cap_pos = events
+        .iter()
+        .position(|v| v.get("type").and_then(|t| t.as_str()) == Some("sessionCapabilities"));
+    let item_pos = events
+        .iter()
+        .position(|v| v.get("type").and_then(|t| t.as_str()) == Some("agentItem"));
     if let (Some(cp), Some(ip)) = (cap_pos, item_pos) {
         assert!(
             cp < ip,
@@ -211,10 +239,13 @@ fn run_cc_session(prompt: &str) -> (String, Vec<serde_json::Value>) {
         );
     }
 
-    let has_complete = events.iter().any(|v| {
-        v.get("type").and_then(|t| t.as_str()) == Some("turnComplete")
-    });
-    assert!(has_complete, "CC session must end with turnComplete; events: {events:?}");
+    let has_complete = events
+        .iter()
+        .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("turnComplete"));
+    assert!(
+        has_complete,
+        "CC session must end with turnComplete; events: {events:?}"
+    );
 
     assert!(
         !thread_id.is_empty(),
@@ -226,28 +257,47 @@ fn run_cc_session(prompt: &str) -> (String, Vec<serde_json::Value>) {
 
 #[test]
 fn e2e_cc_session_run_to_completion() {
-    if !gated() { eprintln!("SKIP: set AGENTDECK_E2E=1"); return; }
-    if !claude_available() { eprintln!("SKIP: claude not in PATH"); return; }
+    if !gated() {
+        eprintln!("SKIP: set AGENTDECK_E2E=1");
+        return;
+    }
+    if !claude_available() {
+        eprintln!("SKIP: claude not in PATH");
+        return;
+    }
 
     let (thread_id, events) = run_cc_session("say hi briefly");
 
     // sessionStarted agentKind must be claude_code
-    let started = events.iter().find(|v| {
-        v.get("type").and_then(|t| t.as_str()) == Some("sessionStarted")
-    }).expect("sessionStarted event must be present");
+    let started = events
+        .iter()
+        .find(|v| v.get("type").and_then(|t| t.as_str()) == Some("sessionStarted"))
+        .expect("sessionStarted event must be present");
     assert_eq!(
         started["agentKind"], "claude_code",
         "sessionStarted agentKind must be 'claude_code'"
     );
 
-    assert!(!thread_id.is_empty(), "threadId must be non-empty after CC session run");
-    eprintln!("CC session run OK, threadId={thread_id}, {} events", events.len());
+    assert!(
+        !thread_id.is_empty(),
+        "threadId must be non-empty after CC session run"
+    );
+    eprintln!(
+        "CC session run OK, threadId={thread_id}, {} events",
+        events.len()
+    );
 }
 
 #[test]
 fn e2e_cc_session_continue_to_completion() {
-    if !gated() { eprintln!("SKIP: set AGENTDECK_E2E=1"); return; }
-    if !claude_available() { eprintln!("SKIP: claude not in PATH"); return; }
+    if !gated() {
+        eprintln!("SKIP: set AGENTDECK_E2E=1");
+        return;
+    }
+    if !claude_available() {
+        eprintln!("SKIP: claude not in PATH");
+        return;
+    }
 
     // First run to get a thread_id
     let (thread_id, _) = run_cc_session("say hi briefly");
@@ -256,14 +306,22 @@ fn e2e_cc_session_continue_to_completion() {
     // C3 fix: session continue now requires --cwd so CC `--resume`
     // can find `~/.claude/projects/<encoded_cwd>/<id>.jsonl` and
     // tool_use runs in the same directory as the original session.
-    let cwd = std::env::current_dir().unwrap().to_string_lossy().to_string();
+    let cwd = std::env::current_dir()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
     let out = Command::new(cli_bin())
         .args([
-            "session", "continue",
-            "--thread-id", &thread_id,
-            "--agent", "claude-code",
-            "--cwd", &cwd,
-            "--prompt", "ok",
+            "session",
+            "continue",
+            "--thread-id",
+            &thread_id,
+            "--agent",
+            "claude-code",
+            "--cwd",
+            &cwd,
+            "--prompt",
+            "ok",
         ])
         .output()
         .expect("failed to spawn agentdeck session continue (claude-code)");
@@ -278,7 +336,11 @@ fn e2e_cc_session_continue_to_completion() {
     let has_complete = stdout_str.lines().any(|l| {
         serde_json::from_str::<serde_json::Value>(l)
             .ok()
-            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|s| s == "turnComplete"))
+            .and_then(|v| {
+                v.get("type")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s == "turnComplete")
+            })
             .unwrap_or(false)
     });
     assert!(
@@ -292,8 +354,14 @@ fn e2e_cc_session_continue_to_completion() {
 
 #[test]
 fn e2e_cc_history_list_returns_items() {
-    if !gated() { eprintln!("SKIP: set AGENTDECK_E2E=1"); return; }
-    if !claude_available() { eprintln!("SKIP: claude not in PATH"); return; }
+    if !gated() {
+        eprintln!("SKIP: set AGENTDECK_E2E=1");
+        return;
+    }
+    if !claude_available() {
+        eprintln!("SKIP: claude not in PATH");
+        return;
+    }
 
     let out = run_cli(&["history", "list", "--agent", "claude-code"]);
     assert!(
@@ -301,9 +369,12 @@ fn e2e_cc_history_list_returns_items() {
         "agentdeck history list --agent claude-code failed\nstderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .expect("history list output must be valid JSON");
-    assert_eq!(json["kind"], "list", "history list must have kind=list; got: {json}");
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("history list output must be valid JSON");
+    assert_eq!(
+        json["kind"], "list",
+        "history list must have kind=list; got: {json}"
+    );
     let items = json["value"].as_array().expect("value must be an array");
     // CC typically has history; just verify it's a valid response (may be 0 in CI)
     eprintln!("CC history list OK, {} items", items.len());
@@ -311,8 +382,14 @@ fn e2e_cc_history_list_returns_items() {
 
 #[test]
 fn e2e_cc_history_archive_then_rename() {
-    if !gated() { eprintln!("SKIP: set AGENTDECK_E2E=1"); return; }
-    if !claude_available() { eprintln!("SKIP: claude not in PATH"); return; }
+    if !gated() {
+        eprintln!("SKIP: set AGENTDECK_E2E=1");
+        return;
+    }
+    if !claude_available() {
+        eprintln!("SKIP: claude not in PATH");
+        return;
+    }
 
     // Run a session so we have a fresh thread to archive/rename
     let (thread_id, _) = run_cc_session("say hi briefly");
@@ -338,8 +415,12 @@ fn e2e_cc_history_archive_then_rename() {
 
     // Rename it — should always succeed (CC supports --name on resume)
     let rename_out = run_cli(&[
-        "history", "rename", &thread_id, "renamed-by-e2e",
-        "--agent", "claude-code",
+        "history",
+        "rename",
+        &thread_id,
+        "renamed-by-e2e",
+        "--agent",
+        "claude-code",
     ]);
     assert!(
         rename_out.status.success(),
@@ -347,10 +428,13 @@ fn e2e_cc_history_archive_then_rename() {
         String::from_utf8_lossy(&rename_out.stdout),
         String::from_utf8_lossy(&rename_out.stderr)
     );
-    let rename_json: serde_json::Value = serde_json::from_slice(&rename_out.stdout)
-        .expect("history rename must return valid JSON");
+    let rename_json: serde_json::Value =
+        serde_json::from_slice(&rename_out.stdout).expect("history rename must return valid JSON");
     // Rename returns Ack — kind = "ack"
-    assert_eq!(rename_json["kind"], "ack", "rename response must have kind=ack; got: {rename_json}");
+    assert_eq!(
+        rename_json["kind"], "ack",
+        "rename response must have kind=ack; got: {rename_json}"
+    );
     eprintln!("CC rename OK for thread_id={thread_id}");
 }
 
@@ -358,7 +442,10 @@ fn e2e_cc_history_archive_then_rename() {
 
 #[test]
 fn e2e_cc_not_installed_returns_error_code() {
-    if !gated() { eprintln!("SKIP: set AGENTDECK_E2E=1"); return; }
+    if !gated() {
+        eprintln!("SKIP: set AGENTDECK_E2E=1");
+        return;
+    }
     // This test intentionally runs regardless of whether claude is present,
     // because it masks the PATH to simulate absence.
 
@@ -371,11 +458,16 @@ fn e2e_cc_not_installed_returns_error_code() {
     let result = Command::new(cli_bin())
         .env("PATH", "/tmp/no-such-dir-agentdeck-e2e")
         .args([
-            "session", "run",
-            "--agent", "claude-code",
-            "--cwd", &cwd,
-            "--prompt", "x",
-            "--permission", "default",
+            "session",
+            "run",
+            "--agent",
+            "claude-code",
+            "--cwd",
+            &cwd,
+            "--prompt",
+            "x",
+            "--permission",
+            "default",
         ])
         .output()
         .expect("failed to spawn agentdeck with masked PATH");

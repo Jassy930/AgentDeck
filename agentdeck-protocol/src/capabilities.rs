@@ -1,13 +1,15 @@
 //! Layer A — capabilities handshake.
 
 use crate::AgentKind;
-use crate::vendor::codex::CodexCapabilities;
 use crate::vendor::claude_code::ClaudeCodeCapabilities;
+use crate::vendor::codex::CodexCapabilities;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum CapabilityId {
     // —— Shared ——

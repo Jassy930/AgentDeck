@@ -19,9 +19,9 @@
 //!      emits SessionStarted then SessionCapabilities as its first
 //!      two events (N7).
 
+use agentdeck_protocol::*;
 use agentdeckd::agent::Agent;
 use agentdeckd::codex::adapter::CodexAdapter;
-use agentdeck_protocol::*;
 
 #[test]
 fn codex_adapter_impls_agent_trait() {
@@ -38,7 +38,11 @@ fn capabilities_includes_codex_features() {
     assert!(caps.features.contains(&CapabilityId::CodexSandboxMode));
     assert!(caps.features.contains(&CapabilityId::Approval));
     // Sanity: the Claude-Code-only features did NOT leak in.
-    assert!(!caps.features.contains(&CapabilityId::ClaudeCodePermissionMode));
+    assert!(
+        !caps
+            .features
+            .contains(&CapabilityId::ClaudeCodePermissionMode)
+    );
 }
 
 #[tokio::test]
@@ -160,20 +164,35 @@ async fn real_codex_emits_started_then_capabilities() {
         }),
         runtime_options: Default::default(),
     };
-    let handle = tokio::time::timeout(std::time::Duration::from_secs(15), a.start_session(start, tx))
-        .await
-        .expect("start_session timed out")
-        .expect("start_session failed");
+    let handle = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        a.start_session(start, tx),
+    )
+    .await
+    .expect("start_session timed out")
+    .expect("start_session failed");
     let e1 = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
         .await
         .expect("recv timeout")
         .expect("channel closed");
-    assert!(matches!(e1, ServerEvent::SessionStarted { agent_kind: AgentKind::Codex, .. }));
+    assert!(matches!(
+        e1,
+        ServerEvent::SessionStarted {
+            agent_kind: AgentKind::Codex,
+            ..
+        }
+    ));
     let e2 = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
         .await
         .expect("recv timeout")
         .expect("channel closed");
-    assert!(matches!(e2, ServerEvent::SessionCapabilities { agent_kind: AgentKind::Codex, .. }));
+    assert!(matches!(
+        e2,
+        ServerEvent::SessionCapabilities {
+            agent_kind: AgentKind::Codex,
+            ..
+        }
+    ));
     // Clean up: cancel the session so the codex child process dies.
     a.cancel(&handle.session_id).await.expect("cancel ok");
 }

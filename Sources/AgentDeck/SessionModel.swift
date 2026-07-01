@@ -398,7 +398,7 @@ final class SessionModel {
         historyErrorMessage = nil
         let cwdFilter = currentProjectOnly ? cwd?.path : nil
         do {
-            let response = try client.history(.list(agentKind: nil, cwdFilter: cwdFilter))
+            let response = try client.history(.list(agentKind: nil, cwdFilter: cwdFilter, limit: nil))
             if case .list(let items) = response {
                 let summaries = items.map { item in
                     HistoryThreadSummary(

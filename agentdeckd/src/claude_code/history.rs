@@ -39,6 +39,7 @@ use std::time::SystemTime;
 use agentdeck_protocol::{
     AgentItem, AgentItemMeta, AgentKind, DiffFile, DiffStatus, HistoryListItem,
     HistoryReadResponse, HistoryTurn, ProtocolError, ShellStatus, ThreadId,
+    effective_history_list_limit,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -108,13 +109,12 @@ pub fn parse_agents_json_array(raw: &str) -> Result<Vec<HistoryListItem>, Protoc
     // CC's serializer uses camelCase, but we accept either by setting
     // serde's default. (#[serde(default)] keeps unknown fields out of
     // the way.)
-    let rows: Vec<serde_json::Value> = serde_json::from_str(raw.trim()).map_err(|e| {
-        ProtocolError {
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(raw.trim()).map_err(|e| ProtocolError {
             code: "cc-history-parse".into(),
             message: format!("claude agents --json parse failed: {e}"),
             diagnostic_ref: None,
-        }
-    })?;
+        })?;
     let mut out = Vec::with_capacity(rows.len());
     for v in rows {
         // Manual extraction: CC uses both camelCase and snake_case in
@@ -169,11 +169,20 @@ pub fn parse_agents_json_array(raw: &str) -> Result<Vec<HistoryListItem>, Protoc
 /// message content; fall back to `None`.
 pub fn list_history_from_jsonl(
     cwd_filter: Option<&Path>,
+    limit: Option<usize>,
 ) -> Result<Vec<HistoryListItem>, ProtocolError> {
     let root = match claude_projects_root() {
         Some(r) => r,
         None => return Ok(vec![]),
     };
+    list_history_from_jsonl_root(&root, cwd_filter, effective_history_list_limit(limit))
+}
+
+fn list_history_from_jsonl_root(
+    root: &Path,
+    cwd_filter: Option<&Path>,
+    limit: usize,
+) -> Result<Vec<HistoryListItem>, ProtocolError> {
     let mut items = Vec::new();
     let dirs: Vec<PathBuf> = if let Some(cwd) = cwd_filter {
         let p = root.join(encode_cwd(cwd));
@@ -225,6 +234,7 @@ pub fn list_history_from_jsonl(
     }
     // Newest first — what the sidebar wants by default.
     items.sort_by_key(|i| std::cmp::Reverse(i.last_active_ms));
+    items.truncate(limit);
     Ok(items)
 }
 
@@ -296,9 +306,10 @@ fn scan_title(path: &Path) -> Option<String> {
 /// responsive even on slow disks.
 pub async fn list_history(
     cwd_filter: Option<&Path>,
+    limit: Option<usize>,
 ) -> Result<Vec<HistoryListItem>, ProtocolError> {
     let cwd_owned = cwd_filter.map(PathBuf::from);
-    tokio::task::spawn_blocking(move || list_history_from_jsonl(cwd_owned.as_deref()))
+    tokio::task::spawn_blocking(move || list_history_from_jsonl(cwd_owned.as_deref(), limit))
         .await
         .map_err(|e| ProtocolError {
             code: "cc-history-task-join".into(),
@@ -369,7 +380,9 @@ pub fn parse_session_jsonl(
                                 .unwrap_or(false);
                             let text = extract_tool_result_text(block);
                             if let Some((name, input)) = in_flight.remove(id) {
-                                current.push(tool_result_to_agent_item(&name, &input, is_error, &text));
+                                current.push(tool_result_to_agent_item(
+                                    &name, &input, is_error, &text,
+                                ));
                             } else {
                                 current.push(AgentItem::Raw {
                                     raw_kind: "user.tool_result_orphan".into(),
@@ -530,10 +543,7 @@ fn tool_result_to_agent_item(
 fn diff_files_from_tool_use(tool_name: &str, input: &Value) -> Vec<DiffFile> {
     match tool_name {
         "Write" => {
-            let path = input
-                .get("file_path")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let path = input.get("file_path").and_then(Value::as_str).unwrap_or("");
             let content = input.get("content").and_then(Value::as_str).unwrap_or("");
             vec![DiffFile {
                 path: PathBuf::from(path),
@@ -542,12 +552,15 @@ fn diff_files_from_tool_use(tool_name: &str, input: &Value) -> Vec<DiffFile> {
             }]
         }
         "Edit" => {
-            let path = input
-                .get("file_path")
+            let path = input.get("file_path").and_then(Value::as_str).unwrap_or("");
+            let old = input
+                .get("old_string")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let old = input.get("old_string").and_then(Value::as_str).unwrap_or("");
-            let new = input.get("new_string").and_then(Value::as_str).unwrap_or("");
+            let new = input
+                .get("new_string")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             vec![DiffFile {
                 path: PathBuf::from(path),
                 status: DiffStatus::Modified,
@@ -555,10 +568,7 @@ fn diff_files_from_tool_use(tool_name: &str, input: &Value) -> Vec<DiffFile> {
             }]
         }
         "MultiEdit" => {
-            let path = input
-                .get("file_path")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let path = input.get("file_path").and_then(Value::as_str).unwrap_or("");
             let edits = input
                 .get("edits")
                 .and_then(Value::as_array)
@@ -680,7 +690,7 @@ pub async fn archive(thread_id: &ThreadId) -> Result<(), ProtocolError> {
 /// Look up the original cwd for a session by scanning history. Returns
 /// error if not found.
 async fn find_session_cwd(thread_id: &ThreadId) -> Result<PathBuf, ProtocolError> {
-    let items = list_history(None).await?;
+    let items = list_history(None, Some(agentdeck_protocol::MAX_HISTORY_LIST_LIMIT)).await?;
     items
         .into_iter()
         .find(|i| i.thread_id == *thread_id)
@@ -817,11 +827,13 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].thread_id.0, "31472303-b986-42f3-9e63-71a1fa9605c6");
         assert_eq!(items[0].cwd, PathBuf::from("/private/tmp/claude-bg"));
-        assert!(items[0]
-            .title
-            .as_deref()
-            .unwrap_or("")
-            .starts_with("write hello"));
+        assert!(
+            items[0]
+                .title
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("write hello")
+        );
         assert_eq!(items[0].agent_kind, AgentKind::ClaudeCode);
         assert_eq!(items[0].last_active_ms, 1782398046433);
         assert!(items[1].title.is_none());
@@ -849,7 +861,10 @@ mod tests {
         let resp = parse_session_jsonl(content, ThreadId("abc".into())).unwrap();
         assert_eq!(resp.turns.len(), 1);
         assert_eq!(resp.turns[0].items.len(), 2);
-        assert!(matches!(resp.turns[0].items[0], AgentItem::UserMessage { .. }));
+        assert!(matches!(
+            resp.turns[0].items[0],
+            AgentItem::UserMessage { .. }
+        ));
         assert!(matches!(
             resp.turns[0].items[1],
             AgentItem::AssistantMessage { .. }
@@ -868,7 +883,9 @@ mod tests {
         let items = &resp.turns[0].items;
         assert!(matches!(items[0], AgentItem::UserMessage { .. }));
         match &items[1] {
-            AgentItem::Shell { command, status, .. } => {
+            AgentItem::Shell {
+                command, status, ..
+            } => {
                 assert_eq!(command, "ls");
                 assert!(matches!(status, ShellStatus::Running));
             }
@@ -947,6 +964,35 @@ mod tests {
         let title = scan_title(&path);
         assert_eq!(title.as_deref(), Some("first prompt content here"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_history_from_jsonl_root_sorts_newest_first_and_applies_limit() {
+        let home = tempdir_unique();
+        let root = home.join(".claude").join("projects");
+        let project = root.join(encode_cwd(Path::new("/tmp/agentdeck")));
+        std::fs::create_dir_all(&project).unwrap();
+
+        for idx in 0..3 {
+            let path = project.join(format!("00000000-0000-0000-0000-00000000000{idx}.jsonl"));
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"type":"user","message":{{"role":"user","content":"prompt {idx}"}}}}"#
+                ),
+            )
+            .unwrap();
+            let now = std::time::SystemTime::now() + std::time::Duration::from_secs(idx as u64);
+            let _ = std::fs::File::open(&path).unwrap().set_modified(now);
+        }
+
+        let items = list_history_from_jsonl_root(&root, None, 2).unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(
+            items[0].last_active_ms >= items[1].last_active_ms,
+            "items should stay newest-first"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     fn tempdir_unique() -> PathBuf {

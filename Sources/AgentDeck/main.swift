@@ -62,6 +62,36 @@ func argumentValue(after flag: String, in args: [String] = CommandLine.arguments
     return args[idx + 1]
 }
 
+func runDaemonOneShot(args daemonArgs: [String]) -> Int32 {
+    guard let path = DaemonClient.locateDaemon() else {
+        FileHandle.standardError.write(Data("AgentDeck FATAL: agentdeckd not found at target/{debug,release}/agentdeckd or PATH\n".utf8))
+        return 1
+    }
+    let process = Process()
+    let stdout = Pipe()
+    let stderr = Pipe()
+    process.executableURL = URL(fileURLWithPath: path)
+    process.arguments = daemonArgs
+    process.standardOutput = stdout
+    process.standardError = stderr
+    do {
+        try process.run()
+    } catch {
+        FileHandle.standardError.write(Data("AgentDeck FATAL: failed to spawn agentdeckd: \(error)\n".utf8))
+        return 1
+    }
+    process.waitUntilExit()
+    let out = stdout.fileHandleForReading.readDataToEndOfFile()
+    let err = stderr.fileHandleForReading.readDataToEndOfFile()
+    if !out.isEmpty {
+        FileHandle.standardOutput.write(out)
+    }
+    if !err.isEmpty {
+        FileHandle.standardError.write(err)
+    }
+    return process.terminationStatus
+}
+
 let launchProfile: AgentDeckProfile
 do {
     launchProfile = try AgentDeckProfile.parse(defaultProfile: .defaultForCurrentBuild)
@@ -90,6 +120,14 @@ if CommandLine.arguments.contains("--selfcheck") {
         client.shutdown()
         exit(1)
     }
+}
+
+if CommandLine.arguments.contains("--diagnostics-report") {
+    var args = ["--diagnostics-report", "--profile", launchProfile.rawValue]
+    if let dataDir = argumentValue(after: "--data-dir") {
+        args += ["--data-dir", dataDir]
+    }
+    exit(runDaemonOneShot(args: args))
 }
 
 // A SwiftPM executable is a plain command-line binary, not a `.app`

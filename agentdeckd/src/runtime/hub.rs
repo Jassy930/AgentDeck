@@ -26,13 +26,11 @@
 
 use crate::agent::{AgentEventSender, AgentSessionHandle};
 use crate::runtime::router::AgentRouter;
-use agentdeck_protocol::{
-    ClientCommand, ProtocolError, ServerEvent, SessionId, PROTOCOL_VERSION,
-};
+use agentdeck_protocol::{ClientCommand, PROTOCOL_VERSION, ProtocolError, ServerEvent, SessionId};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 /// Channel depth for the unified ServerEvent stream coming out of all
 /// sessions. 256 is generous: the writer drains it as fast as stdout
@@ -203,10 +201,11 @@ impl RuntimeHub {
                 // idempotent at the router level.
                 self.sessions.lock().await.remove(&session_id);
             }
-            ClientCommand::ActionDecision { session_id, decision } => {
-                if let Err(error) =
-                    self.router.submit_decision(&session_id, decision).await
-                {
+            ClientCommand::ActionDecision {
+                session_id,
+                decision,
+            } => {
+                if let Err(error) = self.router.submit_decision(&session_id, decision).await {
                     let _ = events_tx
                         .send(ServerEvent::Error {
                             session_id: Some(session_id),
@@ -215,7 +214,10 @@ impl RuntimeHub {
                         .await;
                 }
             }
-            ClientCommand::VendorControl { session_id, payload } => {
+            ClientCommand::VendorControl {
+                session_id,
+                payload,
+            } => {
                 if let Err(error) = self
                     .router
                     .submit_vendor_control(&session_id, payload)
@@ -448,7 +450,7 @@ mod tests {
     use super::*;
     use agentdeck_protocol::*;
     use std::time::Duration;
-    use tokio::io::{duplex, AsyncWriteExt as _};
+    use tokio::io::duplex;
 
     /// Sanity: parse errors come back as ServerEvent::Error not a panic
     /// or a silent drop.
@@ -517,8 +519,7 @@ mod tests {
 
         let response = String::from_utf8_lossy(&buf);
         let first_line = response.lines().next().expect("at least one reply line");
-        let parsed: serde_json::Value =
-            serde_json::from_str(first_line).expect("reply JSON");
+        let parsed: serde_json::Value = serde_json::from_str(first_line).expect("reply JSON");
         assert_eq!(parsed["reply"], "ping");
         assert_eq!(parsed["ok"], true);
     }
@@ -541,6 +542,7 @@ mod tests {
         let cmd = ClientCommand::History(HistoryRequest::List {
             agent_kind: None,
             cwd_filter: None,
+            limit: None,
         });
         let line = serde_json::to_string(&cmd).unwrap();
         client_to_daemon.write_all(line.as_bytes()).await.unwrap();
@@ -619,9 +621,9 @@ mod tests {
     async fn ping_during_slow_session_start_is_not_blocked() {
         use crate::agent::{Agent, AgentEventSender, AgentSessionHandle, DynAgent};
         use agentdeck_protocol::{
-            ActionDecision, AgentKind, CodexApprovalPolicy, CodexReasoningEffort,
-            CodexSandboxMode, CodexSessionOptions, ProtocolError, SessionCapabilities,
-            SessionStart, ThreadId, VendorControlPayload, VendorSessionOptions,
+            ActionDecision, AgentKind, CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode,
+            CodexSessionOptions, ProtocolError, SessionCapabilities, SessionStart, ThreadId,
+            VendorControlPayload, VendorSessionOptions,
         };
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Instant;
@@ -631,11 +633,11 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl Agent for SlowStub {
-            fn kind(&self) -> AgentKind { AgentKind::Codex }
+            fn kind(&self) -> AgentKind {
+                AgentKind::Codex
+            }
             fn capabilities(&self) -> SessionCapabilities {
-                use agentdeck_protocol::{
-                    CodexCapabilities, VendorCapabilities,
-                };
+                use agentdeck_protocol::{CodexCapabilities, VendorCapabilities};
                 SessionCapabilities {
                     agent_kind: AgentKind::Codex,
                     agent_version: "stub".into(),
@@ -673,17 +675,25 @@ mod tests {
                 &self,
                 _: &SessionId,
                 _: ActionDecision,
-            ) -> Result<(), ProtocolError> { Ok(()) }
+            ) -> Result<(), ProtocolError> {
+                Ok(())
+            }
             async fn submit_vendor_control(
                 &self,
                 _: &SessionId,
                 _: VendorControlPayload,
-            ) -> Result<(), ProtocolError> { Ok(()) }
-            async fn cancel(&self, _: &SessionId) -> Result<(), ProtocolError> { Ok(()) }
+            ) -> Result<(), ProtocolError> {
+                Ok(())
+            }
+            async fn cancel(&self, _: &SessionId) -> Result<(), ProtocolError> {
+                Ok(())
+            }
         }
 
         let started = Arc::new(AtomicBool::new(false));
-        let stub: DynAgent = Arc::new(SlowStub { started: Arc::clone(&started) });
+        let stub: DynAgent = Arc::new(SlowStub {
+            started: Arc::clone(&started),
+        });
         let mut router = AgentRouter::new();
         router.register(stub);
         let hub = RuntimeHub::new(Arc::new(router));
@@ -731,13 +741,16 @@ mod tests {
             .await
             .expect("ping reply should arrive well before slow start completes")
             .unwrap();
-            if n == 0 { break; }
-            if byte[0] == b'\n' { break; }
+            if n == 0 {
+                break;
+            }
+            if byte[0] == b'\n' {
+                break;
+            }
             line_buf.push(byte[0]);
         }
         let elapsed = t0.elapsed();
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&line_buf).expect("ping reply JSON");
+        let parsed: serde_json::Value = serde_json::from_slice(&line_buf).expect("ping reply JSON");
         assert_eq!(parsed["reply"], "ping");
         assert!(
             elapsed < Duration::from_millis(400),

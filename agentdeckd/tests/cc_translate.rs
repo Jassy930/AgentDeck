@@ -11,10 +11,8 @@ use agentdeckd::claude_code::translate::ClaudeCodeTranslator;
 use serde_json::json;
 
 fn tr() -> ClaudeCodeTranslator {
-    let mut t = ClaudeCodeTranslator::new(
-        SessionId("s1".into()),
-        ClaudeCodePermissionMode::Default,
-    );
+    let mut t =
+        ClaudeCodeTranslator::new(SessionId("s1".into()), ClaudeCodePermissionMode::Default);
     t.set_thread_id(ThreadId("thread_1".into()));
     t
 }
@@ -56,7 +54,8 @@ fn thinking_becomes_reasoning() {
     assert_eq!(out.events.len(), 1);
     match &out.events[0] {
         ServerEvent::AgentItem {
-            item: AgentItem::Reasoning { text, .. }, ..
+            item: AgentItem::Reasoning { text, .. },
+            ..
         } => assert_eq!(text, "let me consider..."),
         other => panic!("expected Reasoning, got {other:?}"),
     }
@@ -79,7 +78,9 @@ fn bash_tool_use_becomes_shell_running() {
     assert_eq!(out.events.len(), 1);
     match &out.events[0] {
         ServerEvent::AgentItem {
-            item: AgentItem::Shell { command, status, .. },
+            item: AgentItem::Shell {
+                command, status, ..
+            },
             agent_kind,
             ..
         } => {
@@ -121,7 +122,13 @@ fn tool_result_after_bash_emits_shell_completion() {
     assert_eq!(out.events.len(), 1);
     match &out.events[0] {
         ServerEvent::AgentItem {
-            item: AgentItem::Shell { command, status, exit_code, .. },
+            item:
+                AgentItem::Shell {
+                    command,
+                    status,
+                    exit_code,
+                    ..
+                },
             ..
         } => {
             assert_eq!(command, "echo ok");
@@ -160,7 +167,10 @@ fn tool_result_with_error_emits_shell_failed() {
     assert_eq!(out.events.len(), 1);
     match &out.events[0] {
         ServerEvent::AgentItem {
-            item: AgentItem::Shell { status, exit_code, .. }, ..
+            item: AgentItem::Shell {
+                status, exit_code, ..
+            },
+            ..
         } => {
             assert!(matches!(status, ShellStatus::Failed));
             assert_eq!(*exit_code, Some(1));
@@ -190,7 +200,8 @@ fn edit_tool_use_becomes_diff() {
     assert_eq!(out.events.len(), 1);
     match &out.events[0] {
         ServerEvent::AgentItem {
-            item: AgentItem::Diff { files, .. }, ..
+            item: AgentItem::Diff { files, .. },
+            ..
         } => {
             assert_eq!(files.len(), 1);
             assert_eq!(files[0].path.to_string_lossy(), "/tmp/a.txt");
@@ -223,7 +234,8 @@ fn write_tool_use_becomes_diff_added() {
     assert_eq!(out.events.len(), 1);
     match &out.events[0] {
         ServerEvent::AgentItem {
-            item: AgentItem::Diff { files, .. }, ..
+            item: AgentItem::Diff { files, .. },
+            ..
         } => {
             assert_eq!(files.len(), 1);
             assert!(matches!(files[0].status, DiffStatus::Added));
@@ -250,7 +262,8 @@ fn unknown_tool_becomes_tool_call() {
     assert_eq!(out.events.len(), 1);
     match &out.events[0] {
         ServerEvent::AgentItem {
-            item: AgentItem::ToolCall { name, result, .. }, ..
+            item: AgentItem::ToolCall { name, result, .. },
+            ..
         } => {
             assert_eq!(name, "Read");
             assert!(result.is_none()); // populated on tool_result
@@ -273,7 +286,9 @@ fn result_message_becomes_turn_complete_with_usage() {
     assert_eq!(out.events.len(), 1);
     match &out.events[0] {
         ServerEvent::TurnComplete {
-            summary, agent_kind, ..
+            summary,
+            agent_kind,
+            ..
         } => {
             assert_eq!(*agent_kind, AgentKind::ClaudeCode);
             assert_eq!(summary.elapsed_ms, 5149);
@@ -299,12 +314,15 @@ fn hook_started_becomes_vendor_panel_event() {
     assert_eq!(out.events.len(), 1);
     match &out.events[0] {
         ServerEvent::VendorPanelEvent {
-            agent_kind, payload, ..
+            agent_kind,
+            payload,
+            ..
         } => {
             assert_eq!(*agent_kind, AgentKind::ClaudeCode);
             match payload {
                 VendorPanelPayload::ClaudeCode(ClaudeCodeVendorPanelEvent::HookFired {
-                    matcher, ..
+                    matcher,
+                    ..
                 }) => assert_eq!(matcher, "SessionStart"),
                 _ => panic!("expected ClaudeCode HookFired"),
             }
@@ -318,10 +336,8 @@ fn system_init_captures_session_id_silently() {
     // `system.subtype=init` does NOT emit an event — the adapter has
     // already sent SessionStarted; the translator just captures
     // thread_id for downstream events.
-    let mut t = ClaudeCodeTranslator::new(
-        SessionId("s1".into()),
-        ClaudeCodePermissionMode::Default,
-    );
+    let mut t =
+        ClaudeCodeTranslator::new(SessionId("s1".into()), ClaudeCodePermissionMode::Default);
     let line = json!({
         "type": "system",
         "subtype": "init",
@@ -398,7 +414,8 @@ fn unknown_type_becomes_raw() {
     assert_eq!(out.events.len(), 1);
     match &out.events[0] {
         ServerEvent::AgentItem {
-            item: AgentItem::Raw { raw_kind, .. }, ..
+            item: AgentItem::Raw { raw_kind, .. },
+            ..
         } => assert_eq!(raw_kind, "future_unknown_kind"),
         other => panic!("expected Raw, got {other:?}"),
     }
@@ -435,7 +452,10 @@ fn permission_mode_is_stamped_on_action_request() {
             permission_mode_at_decision,
             ref tool_name,
         } => {
-            assert_eq!(permission_mode_at_decision, ClaudeCodePermissionMode::AcceptEdits);
+            assert_eq!(
+                permission_mode_at_decision,
+                ClaudeCodePermissionMode::AcceptEdits
+            );
             assert_eq!(tool_name, "Edit");
         }
         _ => panic!("expected ClaudeCode vendor block"),

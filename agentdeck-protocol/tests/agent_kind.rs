@@ -2,8 +2,14 @@ use agentdeck_protocol::AgentKind;
 
 #[test]
 fn serializes_to_snake_case() {
-    assert_eq!(serde_json::to_string(&AgentKind::Codex).unwrap(), r#""codex""#);
-    assert_eq!(serde_json::to_string(&AgentKind::ClaudeCode).unwrap(), r#""claude_code""#);
+    assert_eq!(
+        serde_json::to_string(&AgentKind::Codex).unwrap(),
+        r#""codex""#
+    );
+    assert_eq!(
+        serde_json::to_string(&AgentKind::ClaudeCode).unwrap(),
+        r#""claude_code""#
+    );
 }
 
 #[test]

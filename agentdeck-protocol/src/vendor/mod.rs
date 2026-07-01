@@ -2,5 +2,5 @@
 //! and vendor-specific fields (sandbox modes, permission modes, etc).
 //! Strongly typed: no `serde_json::Value` passthrough allowed.
 
-pub mod codex;
 pub mod claude_code;
+pub mod codex;

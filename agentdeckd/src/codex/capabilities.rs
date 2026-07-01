@@ -15,8 +15,8 @@
 use std::collections::BTreeSet;
 
 use agentdeck_protocol::{
-    AgentKind, CapabilityId, CodexApprovalPolicy, CodexCapabilities,
-    CodexReasoningEffort, CodexSandboxMode, SessionCapabilities, VendorCapabilities,
+    AgentKind, CapabilityId, CodexApprovalPolicy, CodexCapabilities, CodexReasoningEffort,
+    CodexSandboxMode, SessionCapabilities, VendorCapabilities,
 };
 
 /// Build the `SessionCapabilities` payload for a Codex session.
@@ -131,11 +131,18 @@ mod tests {
         assert!(caps.features.contains(&CapabilityId::Worktree));
         // Codex-only
         assert!(caps.features.contains(&CapabilityId::CodexSandboxMode));
-        assert!(caps.features.contains(&CapabilityId::CodexApprovalPersistence));
+        assert!(
+            caps.features
+                .contains(&CapabilityId::CodexApprovalPersistence)
+        );
         assert!(caps.features.contains(&CapabilityId::CodexSkills));
         assert!(caps.features.contains(&CapabilityId::CodexCustomPrompts));
         // No Claude-Code features leaked in.
-        assert!(!caps.features.contains(&CapabilityId::ClaudeCodePermissionMode));
+        assert!(
+            !caps
+                .features
+                .contains(&CapabilityId::ClaudeCodePermissionMode)
+        );
         assert!(!caps.features.contains(&CapabilityId::ClaudeCodeHooks));
     }
 
@@ -147,11 +154,23 @@ mod tests {
                 assert!(codex.persistence_supported);
                 assert_eq!(codex.sandbox_modes.len(), 3);
                 assert!(codex.sandbox_modes.contains(&CodexSandboxMode::ReadOnly));
-                assert!(codex.sandbox_modes.contains(&CodexSandboxMode::WorkspaceWrite));
+                assert!(
+                    codex
+                        .sandbox_modes
+                        .contains(&CodexSandboxMode::WorkspaceWrite)
+                );
                 assert!(codex.sandbox_modes.contains(&CodexSandboxMode::FullAccess));
                 assert_eq!(codex.reasoning_effort_levels.len(), 4);
-                assert!(codex.reasoning_effort_levels.contains(&CodexReasoningEffort::Minimal));
-                assert!(codex.reasoning_effort_levels.contains(&CodexReasoningEffort::High));
+                assert!(
+                    codex
+                        .reasoning_effort_levels
+                        .contains(&CodexReasoningEffort::Minimal)
+                );
+                assert!(
+                    codex
+                        .reasoning_effort_levels
+                        .contains(&CodexReasoningEffort::High)
+                );
             }
             VendorCapabilities::ClaudeCode(_) => panic!("expected codex vendor block"),
         }

@@ -6,28 +6,36 @@
 //! HookFragment, FileEditChange, ToolAction) have been removed in T1.9.
 //! Phase 2 / Phase 5 migrate downstream consumers.
 
-pub mod trunk;
 pub mod capabilities;
 pub mod transport;
+pub mod trunk;
 pub mod vendor;
 
-pub use trunk::AgentKind;
-pub use trunk::{RuntimeOptions, SessionStart, VendorSessionOptions};
 pub use capabilities::{CapabilityId, SessionCapabilities, VendorCapabilities};
-pub use vendor::codex::{CodexApprovalPolicy, CodexCapabilities, CodexReasoningEffort, CodexSandboxMode};
-pub use vendor::codex::{CodexSessionOptions, McpOverride};
+pub use transport::{AuthContext, Transport, TransportConfig, TransportError};
+pub use trunk::AgentKind;
+pub use trunk::ClientCommand;
+pub use trunk::{
+    ActionDecision, ActionDecisionKind, ActionKind, ActionRequest, ActionRequestVendor,
+    VendorControlPayload, VendorPanelPayload,
+};
+pub use trunk::{
+    AgentItem, AgentItemMeta, DiffFile, DiffStatus, PlanStep, PlanStepStatus, ProtocolError,
+    ServerEvent, SessionId, ShellStatus, ThreadId, TurnSummary,
+};
+pub use trunk::{DEFAULT_HISTORY_LIST_LIMIT, MAX_HISTORY_LIST_LIMIT, effective_history_list_limit};
+pub use trunk::{
+    HistoryListItem, HistoryReadResponse, HistoryRequest, HistoryResponse, HistoryTurn,
+};
+pub use trunk::{RuntimeOptions, SessionStart, VendorSessionOptions};
 pub use vendor::claude_code::{ClaudeCodeCapabilities, ClaudeCodePermissionMode};
 pub use vendor::claude_code::{ClaudeCodeHookConfig, ClaudeCodeSessionOptions};
-pub use transport::{AuthContext, Transport, TransportConfig, TransportError};
-pub use trunk::{
-    AgentItem, AgentItemMeta, DiffFile, DiffStatus, PlanStep, PlanStepStatus,
-    ProtocolError, ServerEvent, SessionId, ShellStatus, ThreadId, TurnSummary,
-};
-pub use trunk::{ActionDecision, ActionDecisionKind, ActionKind, ActionRequest, ActionRequestVendor, VendorControlPayload, VendorPanelPayload};
-pub use vendor::codex::{CodexVendorControl, CodexVendorPanelEvent};
 pub use vendor::claude_code::{ClaudeCodeVendorControl, ClaudeCodeVendorPanelEvent};
-pub use trunk::{HistoryListItem, HistoryReadResponse, HistoryRequest, HistoryResponse, HistoryTurn};
-pub use trunk::ClientCommand;
+pub use vendor::codex::{
+    CodexApprovalPolicy, CodexCapabilities, CodexReasoningEffort, CodexSandboxMode,
+};
+pub use vendor::codex::{CodexSessionOptions, McpOverride};
+pub use vendor::codex::{CodexVendorControl, CodexVendorPanelEvent};
 
 /// 契约产物版本。改动协议形态时手动 +1，并重生成快照。
 pub const PROTOCOL_VERSION: u32 = 2;

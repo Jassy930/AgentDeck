@@ -204,7 +204,7 @@ impl ClaudeCodeAdapter {
         events: &AgentEventSender,
         session_id: Option<&SessionId>,
     ) -> Result<(), ProtocolError> {
-        use crate::claude_code::auth::{probe_auth_status, AuthState};
+        use crate::claude_code::auth::{AuthState, probe_auth_status};
 
         // 1. Binary on PATH?
         if which::which("claude").is_err() {
@@ -286,8 +286,7 @@ impl ClaudeCodeAdapter {
         // a half-started session.
         self.preflight(&events, None).await?;
 
-        let (mut cmd, permission_mode) =
-            Self::build_command(&start, resume_thread_id.as_ref())?;
+        let (mut cmd, permission_mode) = Self::build_command(&start, resume_thread_id.as_ref())?;
         let session_id = SessionId(uuid::Uuid::new_v4().to_string());
 
         // N7: SessionStarted + SessionCapabilities BEFORE any AgentItem.
@@ -350,16 +349,14 @@ impl ClaudeCodeAdapter {
 
         // Build the per-session shared routes up front so the pump
         // and the entry hold the same Arc.
-        let permission_routes: PermissionRoutes =
-            Arc::new(Mutex::new(HashMap::new()));
+        let permission_routes: PermissionRoutes = Arc::new(Mutex::new(HashMap::new()));
 
         let translator_thread_id = resume_thread_id.clone();
         let pump_session = session_id.clone();
         let pump_events = events.clone();
         let pump_routes = Arc::clone(&permission_routes);
         let pump_handle = tokio::spawn(async move {
-            let mut translator =
-                ClaudeCodeTranslator::new(pump_session.clone(), permission_mode);
+            let mut translator = ClaudeCodeTranslator::new(pump_session.clone(), permission_mode);
             if let Some(tid) = translator_thread_id {
                 translator.set_thread_id(tid);
             }
@@ -629,8 +626,10 @@ impl Agent for ClaudeCodeAdapter {
     ) -> Result<HistoryResponse, ProtocolError> {
         use crate::claude_code::history;
         match request {
-            HistoryRequest::List { cwd_filter, .. } => {
-                let items = history::list_history(cwd_filter.as_deref()).await?;
+            HistoryRequest::List {
+                cwd_filter, limit, ..
+            } => {
+                let items = history::list_history(cwd_filter.as_deref(), limit).await?;
                 Ok(HistoryResponse::List(items))
             }
             HistoryRequest::Read { thread_id, .. } => {
@@ -648,7 +647,9 @@ impl Agent for ClaudeCodeAdapter {
                 // away without surfacing an error.
                 Ok(HistoryResponse::Ack)
             }
-            HistoryRequest::Rename { thread_id, title, .. } => {
+            HistoryRequest::Rename {
+                thread_id, title, ..
+            } => {
                 history::rename(&thread_id, &title).await?;
                 Ok(HistoryResponse::Ack)
             }

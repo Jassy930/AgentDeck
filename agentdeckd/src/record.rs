@@ -370,7 +370,9 @@ mod tests {
 
     #[test]
     fn run_record_writes_header_and_appends_events_with_agent_kind() {
-        use agentdeck_protocol::{AgentItem, AgentItemMeta, AgentKind, ServerEvent, SessionId, ThreadId};
+        use agentdeck_protocol::{
+            AgentItem, AgentItemMeta, AgentKind, ServerEvent, SessionId, ThreadId,
+        };
         let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
 
         let dir = std::env::temp_dir().join(format!(
@@ -383,7 +385,9 @@ mod tests {
         ));
         // Drive RunRecord via the AGENTDECK_DATA_DIR override.
         let prev = std::env::var_os("AGENTDECK_DATA_DIR");
-        unsafe { std::env::set_var("AGENTDECK_DATA_DIR", &dir); }
+        unsafe {
+            std::env::set_var("AGENTDECK_DATA_DIR", &dir);
+        }
 
         let cwd = std::path::PathBuf::from("/tmp/example");
         let rec = RunRecord::open(
@@ -409,7 +413,10 @@ mod tests {
         let log = dir.join("runs/run_test_123.jsonl");
         let body = std::fs::read_to_string(&log).expect("read run log");
         let lines: Vec<&str> = body.lines().collect();
-        assert!(lines.len() >= 3, "expected header + event + footer, got {lines:?}");
+        assert!(
+            lines.len() >= 3,
+            "expected header + event + footer, got {lines:?}"
+        );
         let header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(header["kind"], "runHeader");
         assert_eq!(header["agentKind"], "codex");
@@ -422,9 +429,13 @@ mod tests {
 
         // Restore env.
         if let Some(p) = prev {
-            unsafe { std::env::set_var("AGENTDECK_DATA_DIR", p); }
+            unsafe {
+                std::env::set_var("AGENTDECK_DATA_DIR", p);
+            }
         } else {
-            unsafe { std::env::remove_var("AGENTDECK_DATA_DIR"); }
+            unsafe {
+                std::env::remove_var("AGENTDECK_DATA_DIR");
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

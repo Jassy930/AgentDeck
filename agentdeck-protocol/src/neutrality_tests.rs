@@ -5,12 +5,14 @@
 //! K4 — ServerEvent 的每个变体（Error 除外）都必须携带 agentKind 字段
 
 use crate::trunk::*;
-use crate::vendor::codex::CodexVendorControl;
 use crate::vendor::claude_code::ClaudeCodeVendorControl;
+use crate::vendor::codex::CodexVendorControl;
 use schemars::schema_for;
 
-/// N1：AgentItem、TurnSummary、ProtocolError 的 JSON Schema 属性名中
-/// 不得出现 vendor 相关词汇（Codex/OpenAI/Anthropic/Claude 等）。
+/// N1：AgentItem、ActionRequest、TurnSummary、ProtocolError 的 JSON Schema
+/// 属性名中不得出现 vendor 相关词汇（Codex/OpenAI/Anthropic/Claude 等）。
+/// `ActionRequest.vendor` 是显式允许的 typed approval detail 插槽，
+/// 其内部仍必须是强类型 enum，不能透传任意 JSON。
 ///
 /// 实现策略：对每个变体的 `properties` 键进行结构化检查，而非脆弱的字符串扫描。
 #[test]
@@ -38,6 +40,33 @@ fn protocol_neutrality_main_trunk() {
             }
         }
     }
+
+    // 检查 TurnSummary 属性名
+    let schema_val = serde_json::to_value(schema_for!(ActionRequest)).expect("serializable");
+    if let Some(props) = schema_val["properties"].as_object() {
+        for key in props.keys() {
+            if key == "vendor" {
+                continue;
+            }
+            let key_lower = key.to_lowercase();
+            for prefix in FORBIDDEN_PREFIXES {
+                assert!(
+                    !key_lower.starts_with(prefix),
+                    "ActionRequest property name `{}` starts with vendor prefix `{}`",
+                    key,
+                    prefix
+                );
+            }
+        }
+    }
+
+    let schema =
+        serde_json::to_string(&serde_json::to_value(schema_for!(ActionRequestVendor)).unwrap())
+            .unwrap();
+    assert!(
+        !schema.contains(r#""additionalProperties":true"#),
+        "ActionRequestVendor must be typed, not arbitrary JSON"
+    );
 
     // 检查 TurnSummary 属性名
     let schema_val = serde_json::to_value(schema_for!(TurnSummary)).expect("serializable");
@@ -76,13 +105,17 @@ fn protocol_neutrality_main_trunk() {
 /// 不得出现 `"additionalProperties":true`，确保 vendor payload 是强类型的。
 #[test]
 fn capabilities_namespace_is_typed() {
-    let schema = serde_json::to_string(&serde_json::to_value(schema_for!(CodexVendorControl)).unwrap()).unwrap();
+    let schema =
+        serde_json::to_string(&serde_json::to_value(schema_for!(CodexVendorControl)).unwrap())
+            .unwrap();
     assert!(
         !schema.contains(r#""additionalProperties":true"#),
         "CodexVendorControl must not allow arbitrary additionalProperties — all variants must be typed"
     );
 
-    let schema = serde_json::to_string(&serde_json::to_value(schema_for!(ClaudeCodeVendorControl)).unwrap()).unwrap();
+    let schema =
+        serde_json::to_string(&serde_json::to_value(schema_for!(ClaudeCodeVendorControl)).unwrap())
+            .unwrap();
     assert!(
         !schema.contains(r#""additionalProperties":true"#),
         "ClaudeCodeVendorControl must not allow arbitrary additionalProperties — all variants must be typed"
@@ -100,7 +133,10 @@ fn agent_kind_appears_on_every_trunk_event() {
         .as_array()
         .expect("ServerEvent should be oneOf variants");
 
-    assert!(!variants.is_empty(), "ServerEvent should have at least one variant");
+    assert!(
+        !variants.is_empty(),
+        "ServerEvent should have at least one variant"
+    );
 
     for variant in variants {
         // 取变体的 type 标识符（来自 enum 数组的第一个元素）

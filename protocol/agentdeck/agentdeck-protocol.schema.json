@@ -673,6 +673,15 @@
                     "null"
                   ]
                 },
+                "limit": {
+                  "default": null,
+                  "format": "uint",
+                  "minimum": 0.0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
                 "op": {
                   "enum": [
                     "list"
@@ -1375,6 +1384,15 @@
             "cwdFilter": {
               "type": [
                 "string",
+                "null"
+              ]
+            },
+            "limit": {
+              "default": null,
+              "format": "uint",
+              "minimum": 0.0,
+              "type": [
+                "integer",
                 "null"
               ]
             },
@@ -2632,6 +2650,46 @@
               "required": [
                 "kind",
                 "matcher"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "Diagnostic system events such as api_retry/status/thinking_tokens that are useful to clients but have no neutral trunk counterpart.",
+              "properties": {
+                "attempt": {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "systemStatus"
+                  ],
+                  "type": "string"
+                },
+                "message": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "status": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "subtype": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "subtype"
               ],
               "type": "object"
             }

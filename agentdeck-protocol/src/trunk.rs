@@ -4,15 +4,26 @@
 
 // Populated in tasks T1.5, T1.6, T1.7, T1.8.
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use crate::capabilities::SessionCapabilities;
+use crate::vendor::claude_code::ClaudeCodeSessionOptions;
+use crate::vendor::codex::CodexSessionOptions;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use crate::vendor::codex::CodexSessionOptions;
-use crate::vendor::claude_code::ClaudeCodeSessionOptions;
-use crate::capabilities::SessionCapabilities;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+pub const DEFAULT_HISTORY_LIST_LIMIT: usize = 500;
+pub const MAX_HISTORY_LIST_LIMIT: usize = 2_000;
+
+pub fn effective_history_list_limit(limit: Option<usize>) -> usize {
+    limit
+        .unwrap_or(DEFAULT_HISTORY_LIST_LIMIT)
+        .clamp(1, MAX_HISTORY_LIST_LIMIT)
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentKind {
     Codex,
@@ -80,9 +91,21 @@ pub struct AgentItemMeta {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum AgentItem {
-    UserMessage { text: String, #[serde(default)] meta: AgentItemMeta },
-    AssistantMessage { text: String, #[serde(default)] meta: AgentItemMeta },
-    Reasoning { text: String, #[serde(default)] meta: AgentItemMeta },
+    UserMessage {
+        text: String,
+        #[serde(default)]
+        meta: AgentItemMeta,
+    },
+    AssistantMessage {
+        text: String,
+        #[serde(default)]
+        meta: AgentItemMeta,
+    },
+    Reasoning {
+        text: String,
+        #[serde(default)]
+        meta: AgentItemMeta,
+    },
     Shell {
         command: String,
         status: ShellStatus,
@@ -90,35 +113,41 @@ pub enum AgentItem {
         exit_code: Option<i32>,
         #[serde(rename = "durationMs")]
         duration_ms: Option<u64>,
-        #[serde(default)] meta: AgentItemMeta,
+        #[serde(default)]
+        meta: AgentItemMeta,
     },
     Diff {
         files: Vec<DiffFile>,
-        #[serde(default)] meta: AgentItemMeta,
+        #[serde(default)]
+        meta: AgentItemMeta,
     },
     Plan {
         steps: Vec<PlanStep>,
-        #[serde(default)] meta: AgentItemMeta,
+        #[serde(default)]
+        meta: AgentItemMeta,
     },
     ImageReference {
         #[serde(rename = "savedPath")]
         saved_path: Option<PathBuf>,
         #[serde(rename = "originalPath")]
         original_path: Option<PathBuf>,
-        #[serde(default)] meta: AgentItemMeta,
+        #[serde(default)]
+        meta: AgentItemMeta,
     },
     ToolCall {
         name: String,
         args: serde_json::Value,
         result: Option<serde_json::Value>,
-        #[serde(default)] meta: AgentItemMeta,
+        #[serde(default)]
+        meta: AgentItemMeta,
     },
     Raw {
         #[serde(rename = "rawKind")]
         raw_kind: String,
         #[serde(rename = "rawPayload")]
         raw_payload: String,
-        #[serde(default)] meta: AgentItemMeta,
+        #[serde(default)]
+        meta: AgentItemMeta,
     },
 }
 
@@ -238,11 +267,16 @@ pub enum ActionDecisionKind {
 
 // ── T1.7: VendorControlPayload / VendorPanelPayload (real typed) ─────────────
 
-use crate::vendor::codex::{CodexVendorControl, CodexVendorPanelEvent};
 use crate::vendor::claude_code::{ClaudeCodeVendorControl, ClaudeCodeVendorPanelEvent};
+use crate::vendor::codex::{CodexVendorControl, CodexVendorPanelEvent};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "agentKind", content = "control", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    tag = "agentKind",
+    content = "control",
+    rename_all = "camelCase",
+    deny_unknown_fields
+)]
 pub enum VendorControlPayload {
     #[serde(rename = "codex")]
     Codex(CodexVendorControl),
@@ -251,7 +285,12 @@ pub enum VendorControlPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "agentKind", content = "event", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    tag = "agentKind",
+    content = "event",
+    rename_all = "camelCase",
+    deny_unknown_fields
+)]
 pub enum VendorPanelPayload {
     #[serde(rename = "codex")]
     Codex(CodexVendorPanelEvent),
@@ -269,6 +308,8 @@ pub enum HistoryRequest {
         agent_kind: Option<AgentKind>,
         #[serde(rename = "cwdFilter")]
         cwd_filter: Option<PathBuf>,
+        #[serde(default)]
+        limit: Option<usize>,
     },
     Read {
         #[serde(rename = "threadId")]
@@ -336,7 +377,12 @@ pub struct HistoryTurn {
 /// router now needs a typed return value to merge cross-agent List
 /// results from multiple adapters.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", content = "value", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "camelCase",
+    deny_unknown_fields
+)]
 pub enum HistoryResponse {
     List(Vec<HistoryListItem>),
     Read(HistoryReadResponse),

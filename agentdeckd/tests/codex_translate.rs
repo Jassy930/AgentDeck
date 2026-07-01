@@ -7,8 +7,8 @@
 //! by replaying realistic short Codex turn sequences.
 
 use agentdeck_protocol::{
-    ActionKind, ActionRequestVendor, AgentItem, AgentKind, CodexApprovalPolicy,
-    CodexSandboxMode, DiffStatus, ServerEvent, SessionId, ShellStatus, ThreadId,
+    ActionKind, ActionRequestVendor, AgentItem, AgentKind, CodexApprovalPolicy, CodexSandboxMode,
+    DiffStatus, ServerEvent, SessionId, ShellStatus, ThreadId,
 };
 use agentdeckd::codex::translate::CodexTranslator;
 
@@ -37,7 +37,8 @@ fn fixture_replay_basic_assistant_message_emits_one_cumulative_item() {
             matches!(
                 e,
                 ServerEvent::AgentItem {
-                    item: AgentItem::AssistantMessage { .. }, ..
+                    item: AgentItem::AssistantMessage { .. },
+                    ..
                 }
             )
         })
@@ -88,10 +89,22 @@ fn fixture_replay_full_shell_turn() {
         .map(|e| match e {
             ServerEvent::SessionStarted { .. } => "SessionStarted",
             ServerEvent::AgentItem { item, .. } => match item {
-                AgentItem::Shell { status: ShellStatus::Running, .. } => "Shell(Running)",
-                AgentItem::Shell { status: ShellStatus::Completed, .. } => "Shell(Completed)",
-                AgentItem::Shell { status: ShellStatus::Failed, .. } => "Shell(Failed)",
-                AgentItem::Shell { status: ShellStatus::Canceled, .. } => "Shell(Canceled)",
+                AgentItem::Shell {
+                    status: ShellStatus::Running,
+                    ..
+                } => "Shell(Running)",
+                AgentItem::Shell {
+                    status: ShellStatus::Completed,
+                    ..
+                } => "Shell(Completed)",
+                AgentItem::Shell {
+                    status: ShellStatus::Failed,
+                    ..
+                } => "Shell(Failed)",
+                AgentItem::Shell {
+                    status: ShellStatus::Canceled,
+                    ..
+                } => "Shell(Canceled)",
                 _ => "AgentItem(other)",
             },
             ServerEvent::TurnComplete { .. } => "TurnComplete",
@@ -100,7 +113,12 @@ fn fixture_replay_full_shell_turn() {
         .collect();
     assert_eq!(
         kinds,
-        vec!["SessionStarted", "Shell(Running)", "Shell(Completed)", "TurnComplete"],
+        vec![
+            "SessionStarted",
+            "Shell(Running)",
+            "Shell(Completed)",
+            "TurnComplete"
+        ],
         "shell turn event sequence drifted: {events:?}"
     );
 }
@@ -119,7 +137,10 @@ fn fixture_replay_approval_request_with_codex_vendor_block() {
     assert_eq!(events.len(), 1);
     match &events[0] {
         ServerEvent::ActionRequest {
-            request, agent_kind, thread_id, ..
+            request,
+            agent_kind,
+            thread_id,
+            ..
         } => {
             assert_eq!(*agent_kind, AgentKind::Codex);
             assert_eq!(thread_id.0, "thread-1");
@@ -152,7 +173,12 @@ fn fixture_replay_unknown_item_type_falls_back_to_raw_not_silently_dropped() {
     assert_eq!(events.len(), 1);
     match &events[0] {
         ServerEvent::AgentItem {
-            item: AgentItem::Raw { raw_kind, raw_payload, .. },
+            item:
+                AgentItem::Raw {
+                    raw_kind,
+                    raw_payload,
+                    ..
+                },
             agent_kind,
             ..
         } => {
@@ -198,7 +224,8 @@ fn fixture_replay_file_change_emits_diff_with_per_file_status() {
     assert_eq!(events.len(), 1);
     match &events[0] {
         ServerEvent::AgentItem {
-            item: AgentItem::Diff { files, .. }, ..
+            item: AgentItem::Diff { files, .. },
+            ..
         } => {
             assert_eq!(files.len(), 3);
             assert!(matches!(files[0].status, DiffStatus::Added));

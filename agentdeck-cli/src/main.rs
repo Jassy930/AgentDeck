@@ -4,11 +4,11 @@ mod main_types;
 mod output;
 mod transport;
 
+use agentdeck_protocol::{HistoryRequest, ThreadId};
 use clap::{Parser, Subcommand};
 use main_types::{AgentKindArg, ApprovalArg, EffortArg, PermissionArg, SandboxArg, SessionRunArgs};
-use output::{render, CliError};
+use output::{CliError, render};
 use std::path::PathBuf;
-use agentdeck_protocol::{HistoryRequest, ThreadId};
 
 // ── Top-level CLI ─────────────────────────────────────────────────────────────
 
@@ -147,6 +147,10 @@ enum HistoryOp {
         agent: Option<AgentKindArg>,
         #[arg(long)]
         cwd_filter: Option<PathBuf>,
+        /// Maximum number of items to return. Defaults to the daemon's
+        /// bounded history limit; values above the daemon maximum are clamped.
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Read thread turns
     Read {
@@ -198,12 +202,9 @@ fn run_sync(cli: &Cli) -> Result<(), CliError> {
             let mut c = client::Client::connect(profile, data_dir)?;
             commands::handle_selfcheck(&mut c, pretty)
         }
-        Cmd::Diagnostics { op } => {
-            let mut c = client::Client::connect(profile, data_dir)?;
-            match op {
-                DiagOp::Report => commands::handle_diagnostics_schema(&mut c, pretty),
-            }
-        }
+        Cmd::Diagnostics { op } => match op {
+            DiagOp::Report => commands::handle_diagnostics_report(profile, data_dir, pretty),
+        },
         Cmd::Agent { op } => {
             let mut c = client::Client::connect(profile, data_dir)?;
             match op {
@@ -216,9 +217,14 @@ fn run_sync(cli: &Cli) -> Result<(), CliError> {
         Cmd::History { op } => {
             let mut c = client::Client::connect(profile, data_dir)?;
             let req = match op {
-                HistoryOp::List { agent, cwd_filter } => HistoryRequest::List {
+                HistoryOp::List {
+                    agent,
+                    cwd_filter,
+                    limit,
+                } => HistoryRequest::List {
                     agent_kind: agent.map(|a| a.into()),
                     cwd_filter: cwd_filter.clone(),
+                    limit: *limit,
                 },
                 HistoryOp::Read { thread_id, agent } => HistoryRequest::Read {
                     thread_id: ThreadId(thread_id.clone()),
@@ -232,7 +238,11 @@ fn run_sync(cli: &Cli) -> Result<(), CliError> {
                     thread_id: ThreadId(thread_id.clone()),
                     agent_kind: (*agent).into(),
                 },
-                HistoryOp::Rename { thread_id, title, agent } => HistoryRequest::Rename {
+                HistoryOp::Rename {
+                    thread_id,
+                    title,
+                    agent,
+                } => HistoryRequest::Rename {
                     thread_id: ThreadId(thread_id.clone()),
                     agent_kind: (*agent).into(),
                     title: title.clone(),
@@ -256,54 +266,57 @@ async fn main() {
     let data_dir = cli.data_dir.clone();
 
     let result: Result<(), CliError> = match &cli.command {
-        Cmd::Session { op } => {
-            match op {
-                SessionOp::Run {
-                    agent,
-                    cwd,
-                    prompt,
-                    sandbox,
-                    approval,
-                    persist_approval,
-                    reasoning_effort,
-                    permission,
-                    output_style,
-                    model,
-                    effort,
-                    worktree,
-                    session_name,
-                } => {
-                    let args = SessionRunArgs {
-                        agent: *agent,
-                        cwd: cwd.clone(),
-                        prompt: prompt.clone(),
-                        sandbox: *sandbox,
-                        approval: *approval,
-                        persist_approval: *persist_approval,
-                        reasoning_effort: *reasoning_effort,
-                        permission: *permission,
-                        output_style: output_style.clone(),
-                        model: model.clone(),
-                        effort: effort.clone(),
-                        worktree: worktree.clone(),
-                        session_name: session_name.clone(),
-                    };
-                    commands::handle_session_run(args, &profile, data_dir.as_deref(), pretty).await
-                }
-                SessionOp::Continue { thread_id, agent, cwd, prompt } => {
-                    commands::handle_session_continue(
-                        thread_id.clone(),
-                        *agent,
-                        cwd.clone(),
-                        prompt.clone(),
-                        &profile,
-                        data_dir.as_deref(),
-                        pretty,
-                    )
-                    .await
-                }
+        Cmd::Session { op } => match op {
+            SessionOp::Run {
+                agent,
+                cwd,
+                prompt,
+                sandbox,
+                approval,
+                persist_approval,
+                reasoning_effort,
+                permission,
+                output_style,
+                model,
+                effort,
+                worktree,
+                session_name,
+            } => {
+                let args = SessionRunArgs {
+                    agent: *agent,
+                    cwd: cwd.clone(),
+                    prompt: prompt.clone(),
+                    sandbox: *sandbox,
+                    approval: *approval,
+                    persist_approval: *persist_approval,
+                    reasoning_effort: *reasoning_effort,
+                    permission: *permission,
+                    output_style: output_style.clone(),
+                    model: model.clone(),
+                    effort: effort.clone(),
+                    worktree: worktree.clone(),
+                    session_name: session_name.clone(),
+                };
+                commands::handle_session_run(args, &profile, data_dir.as_deref(), pretty).await
             }
-        }
+            SessionOp::Continue {
+                thread_id,
+                agent,
+                cwd,
+                prompt,
+            } => {
+                commands::handle_session_continue(
+                    thread_id.clone(),
+                    *agent,
+                    cwd.clone(),
+                    prompt.clone(),
+                    &profile,
+                    data_dir.as_deref(),
+                    pretty,
+                )
+                .await
+            }
+        },
         _ => run_sync(&cli),
     };
 

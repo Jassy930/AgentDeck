@@ -37,10 +37,10 @@ use crate::agent::{Agent, AgentEventSender, AgentSessionHandle};
 use crate::codex::capabilities::{build_codex_capabilities, probe_codex_version};
 use crate::codex::translate::CodexTranslator;
 use agentdeck_protocol::{
-    ActionDecision, ActionDecisionKind, AgentKind, CodexApprovalPolicy,
-    CodexReasoningEffort, CodexSandboxMode, CodexSessionOptions, HistoryRequest,
-    HistoryResponse, ProtocolError, ServerEvent, SessionCapabilities, SessionId,
-    SessionStart, ThreadId, VendorControlPayload, VendorSessionOptions,
+    ActionDecision, ActionDecisionKind, AgentKind, CodexApprovalPolicy, CodexReasoningEffort,
+    CodexSandboxMode, CodexSessionOptions, HistoryRequest, HistoryResponse, ProtocolError,
+    ServerEvent, SessionCapabilities, SessionId, SessionStart, ThreadId, VendorControlPayload,
+    VendorSessionOptions,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -514,7 +514,14 @@ impl CodexAdapter {
         let pump_session = session_id.clone();
         let pump_translator = Arc::clone(&translator);
         let pump_handle = tokio::spawn(async move {
-            stdout_pump(reader, pump_translator, pump_state, pump_events, pump_session).await;
+            stdout_pump(
+                reader,
+                pump_translator,
+                pump_state,
+                pump_events,
+                pump_session,
+            )
+            .await;
         });
         let pump_abort = pump_handle.abort_handle();
 
@@ -677,10 +684,7 @@ impl Agent for CodexAdapter {
                 .cloned()
                 .ok_or_else(|| ProtocolError {
                     code: "approval-route-not-found".into(),
-                    message: format!(
-                        "no pending approval for request_id={}",
-                        decision.request_id
-                    ),
+                    message: format!("no pending approval for request_id={}", decision.request_id),
                     diagnostic_ref: None,
                 })?
         };
@@ -752,7 +756,9 @@ impl Agent for CodexAdapter {
                 history::unarchive(&thread_id).await?;
                 Ok(HistoryResponse::Ack)
             }
-            HistoryRequest::Rename { thread_id, title, .. } => {
+            HistoryRequest::Rename {
+                thread_id, title, ..
+            } => {
                 history::rename(&thread_id, &title).await?;
                 Ok(HistoryResponse::Ack)
             }

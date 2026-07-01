@@ -129,6 +129,28 @@ final class ProtocolV2DecodingTests: XCTestCase {
         XCTAssertEqual(err.message, "boom")
     }
 
+    func testDecodeClaudeCodeSystemStatusVendorPanelEvent() throws {
+        let json = """
+        {"type":"vendorPanelEvent","sessionId":"s1","agentKind":"claude_code",
+         "payload":{"agentKind":"claude_code","event":{"kind":"systemStatus",
+                    "subtype":"api_retry","status":null,"message":"Overloaded","attempt":3}}}
+        """
+        let event = try DaemonClient.decodeServerEvent(json)
+        guard case let .vendorPanelEvent(_, kind, payload) = event else {
+            return XCTFail("expected vendorPanelEvent")
+        }
+        XCTAssertEqual(kind, .claudeCode)
+        guard case let .claudeCode(vendor) = payload,
+              case let .systemStatus(subtype, status, message, attempt) = vendor
+        else {
+            return XCTFail("expected Claude Code systemStatus")
+        }
+        XCTAssertEqual(subtype, "api_retry")
+        XCTAssertNil(status)
+        XCTAssertEqual(message, "Overloaded")
+        XCTAssertEqual(attempt, 3)
+    }
+
     func testDecodeActionRequestCodex() throws {
         let json = """
         {"type":"actionRequest","sessionId":"s1","threadId":"t1","agentKind":"codex",
@@ -200,7 +222,7 @@ final class ProtocolV2DecodingTests: XCTestCase {
     }
 
     func testEncodeClientCommandHistoryList() throws {
-        let cmd: ClientCommand = .history(.list(agentKind: .codex, cwdFilter: nil))
+        let cmd: ClientCommand = .history(.list(agentKind: .codex, cwdFilter: nil, limit: nil))
         let line = try DaemonClient.encodeClientCommand(cmd)
         XCTAssertTrue(line.contains("\"command\":\"history\""))
         XCTAssertTrue(line.contains("\"op\":\"list\""))

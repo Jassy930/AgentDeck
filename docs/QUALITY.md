@@ -187,9 +187,9 @@ AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e
 - [ ] Plan mode 进入后 UI 显示 Plan 内容并可批准/拒绝
 - [ ] CC tool use 触发 approval 时显示卡片，底部 vendor 区显示"当前 permission mode + tool name"
 - [ ] Codex tool use 触发 approval 时显示卡片，底部 vendor 区显示 sandbox + policy + persist
-- [ ] CC 历史 thread 在侧栏与 Codex 历史共存，带 agent kind 图标区分
+- [ ] CC 历史 thread 在侧栏与 Codex 历史共存，左侧默认合并显示且不提供 agent 切换
 - [ ] CC 历史 thread 点开可回放 + 继续
-- [ ] CC archive（`claude rm` 调用）后侧栏不可见；通过过滤器"已归档"仍可见
+- [ ] CC archive（`claude rm` 调用）后侧栏不可见，且不影响 Codex 历史显示
 - [ ] CC rename 后侧栏标题更新；终端 `claude --resume <id>` 看到同名
 - [ ] CC 未登录 → 明确诊断错误，不静默
 - [ ] CC 二进制不存在 → 明确诊断错误，附 `npm install` 提示

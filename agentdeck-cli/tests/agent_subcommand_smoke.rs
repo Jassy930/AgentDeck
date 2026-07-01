@@ -18,7 +18,10 @@ fn agent_list_returns_both_kinds() {
         eprintln!("SKIP: set AGENTDECK_E2E=1 to run");
         return;
     }
-    let out = Command::new(bin()).args(["agent", "list"]).output().unwrap();
+    let out = Command::new(bin())
+        .args(["agent", "list"])
+        .output()
+        .unwrap();
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -32,7 +35,11 @@ fn agent_list_returns_both_kinds() {
         .filter_map(|v| v.as_str())
         .collect();
     assert!(kinds.contains(&"codex"), "expected codex in {:?}", kinds);
-    assert!(kinds.contains(&"claude_code"), "expected claude_code in {:?}", kinds);
+    assert!(
+        kinds.contains(&"claude_code"),
+        "expected claude_code in {:?}",
+        kinds
+    );
 }
 
 #[test]
@@ -44,10 +51,17 @@ fn agent_capabilities_codex_is_non_empty() {
         .args(["agent", "capabilities", "--agent", "codex"])
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let features = json["features"].as_array().expect("features array");
-    assert!(!features.is_empty(), "expected non-empty features for codex");
+    assert!(
+        !features.is_empty(),
+        "expected non-empty features for codex"
+    );
     assert_eq!(json["agentKind"], "codex");
 }
 
@@ -60,9 +74,16 @@ fn agent_capabilities_claude_code_is_non_empty() {
         .args(["agent", "capabilities", "--agent", "claude-code"])
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let features = json["features"].as_array().expect("features array");
-    assert!(!features.is_empty(), "expected non-empty features for claude_code");
+    assert!(
+        !features.is_empty(),
+        "expected non-empty features for claude_code"
+    );
     assert_eq!(json["agentKind"], "claude_code");
 }

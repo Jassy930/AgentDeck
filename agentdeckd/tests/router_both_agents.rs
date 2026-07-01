@@ -57,6 +57,7 @@ async fn router_cross_agent_history_list_merges_without_error() {
     let req = HistoryRequest::List {
         agent_kind: None,
         cwd_filter: None,
+        limit: None,
     };
     let result = r.handle_history(req).await.expect("merge must not error");
     let items = match result {
@@ -89,8 +90,12 @@ async fn router_codex_list_returns_empty_stub() {
     let req = HistoryRequest::List {
         agent_kind: Some(AgentKind::Codex),
         cwd_filter: None,
+        limit: None,
     };
-    let result = r.handle_history(req).await.expect("codex stub must not error");
+    let result = r
+        .handle_history(req)
+        .await
+        .expect("codex stub must not error");
     match result {
         HistoryResponse::List(v) => assert!(
             v.is_empty(),
@@ -138,7 +143,11 @@ async fn router_unregistered_kind_returns_structured_error() {
     let req = HistoryRequest::List {
         agent_kind: Some(AgentKind::Codex),
         cwd_filter: None,
+        limit: None,
     };
-    let err = r.handle_history(req).await.expect_err("empty router errors");
+    let err = r
+        .handle_history(req)
+        .await
+        .expect_err("empty router errors");
     assert_eq!(err.code, "agent-not-registered");
 }

@@ -86,15 +86,11 @@ fn classify(json: &AuthStatusJson) -> AuthState {
         Some("oauth_token") | Some("oauth") | Some("subscription") => {
             AuthState::LoggedInSubscription
         }
-        Some("api_key") | Some("console") | Some("apiKey") => {
-            AuthState::LoggedInConsoleApiKey
-        }
+        Some("api_key") | Some("console") | Some("apiKey") => AuthState::LoggedInConsoleApiKey,
         // `apiProvider != firstParty` strongly suggests an API-key
         // route even if `authMethod` is missing (e.g. `bedrock`).
         _ => match json.api_provider.as_deref() {
-            Some(p) if p != "firstParty" && p != "first_party" => {
-                AuthState::LoggedInConsoleApiKey
-            }
+            Some(p) if p != "firstParty" && p != "first_party" => AuthState::LoggedInConsoleApiKey,
             // Logged in, neither field told us — assume the most
             // common (subscription) but the UI may still show
             // "unknown" badge through this enum's degraded variants.

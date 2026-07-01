@@ -19,7 +19,10 @@ fn codex_session_start_round_trip() {
     let json = serde_json::to_string(&start).unwrap();
     let back: SessionStart = serde_json::from_str(&json).unwrap();
     assert_eq!(back.agent_kind, AgentKind::Codex);
-    assert!(matches!(back.vendor_options, VendorSessionOptions::Codex(_)));
+    assert!(matches!(
+        back.vendor_options,
+        VendorSessionOptions::Codex(_)
+    ));
 }
 
 #[test]

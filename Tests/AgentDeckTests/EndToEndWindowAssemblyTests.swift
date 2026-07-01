@@ -7,23 +7,6 @@ import AppKit
 @MainActor
 final class EndToEndWindowAssemblyTests: XCTestCase {
 
-    // MARK: - HistoryFilter
-
-    func testHistoryFilterAllReturnsAllItems() {
-        let items = [
-            HistoryListItem.stub(kind: .codex, title: "c"),
-            HistoryListItem.stub(kind: .claudeCode, title: "cc"),
-        ]
-        XCTAssertEqual(HistoryFilter.apply(items, filter: .all).count, 2)
-    }
-
-    func testHistoryFilterModeCases() {
-        XCTAssertEqual(HistoryFilterMode.allCases.count, 3)
-        XCTAssertEqual(HistoryFilterMode.all.displayName, "All")
-        XCTAssertEqual(HistoryFilterMode.codex.displayName, "Codex")
-        XCTAssertEqual(HistoryFilterMode.claudeCode.displayName, "Claude Code")
-    }
-
     // MARK: - StatusBarView
 
     func testStatusBarViewBuildsWithoutModel() {

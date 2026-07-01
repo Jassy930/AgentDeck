@@ -1,6 +1,6 @@
-use agentdeckd::agent::{Agent, AgentEventSender, AgentSessionHandle, DynAgent};
-use agentdeckd::runtime::router::AgentRouter;
 use agentdeck_protocol::*;
+use agentdeckd::agent::{Agent, AgentEventSender, AgentSessionHandle};
+use agentdeckd::runtime::router::AgentRouter;
 use std::sync::Arc;
 
 struct StubAgent {
@@ -39,11 +39,7 @@ impl Agent for StubAgent {
     ) -> Result<AgentSessionHandle, ProtocolError> {
         unimplemented!()
     }
-    async fn submit_decision(
-        &self,
-        _: &SessionId,
-        _: ActionDecision,
-    ) -> Result<(), ProtocolError> {
+    async fn submit_decision(&self, _: &SessionId, _: ActionDecision) -> Result<(), ProtocolError> {
         Ok(())
     }
     async fn submit_vendor_control(
@@ -61,8 +57,12 @@ impl Agent for StubAgent {
 #[test]
 fn router_lists_registered_agents() {
     let mut r = AgentRouter::new();
-    r.register(Arc::new(StubAgent { kind: AgentKind::Codex }));
-    r.register(Arc::new(StubAgent { kind: AgentKind::ClaudeCode }));
+    r.register(Arc::new(StubAgent {
+        kind: AgentKind::Codex,
+    }));
+    r.register(Arc::new(StubAgent {
+        kind: AgentKind::ClaudeCode,
+    }));
     let mut listed = r.list_agents();
     listed.sort_by_key(|k| k.as_str());
     assert_eq!(listed.len(), 2);
@@ -71,7 +71,9 @@ fn router_lists_registered_agents() {
 #[test]
 fn router_returns_capabilities_for_known_kind() {
     let mut r = AgentRouter::new();
-    r.register(Arc::new(StubAgent { kind: AgentKind::Codex }));
+    r.register(Arc::new(StubAgent {
+        kind: AgentKind::Codex,
+    }));
     let caps = r.capabilities(AgentKind::Codex).expect("codex registered");
     assert_eq!(caps.agent_kind, AgentKind::Codex);
 }

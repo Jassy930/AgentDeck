@@ -22,8 +22,8 @@
 use std::collections::BTreeSet;
 
 use agentdeck_protocol::{
-    AgentKind, CapabilityId, ClaudeCodeCapabilities, ClaudeCodePermissionMode,
-    SessionCapabilities, VendorCapabilities,
+    AgentKind, CapabilityId, ClaudeCodeCapabilities, ClaudeCodePermissionMode, SessionCapabilities,
+    VendorCapabilities,
 };
 
 /// Build the `SessionCapabilities` payload for a Claude Code session.
@@ -74,11 +74,7 @@ pub fn build_claude_code_capabilities(cli_version: String) -> SessionCapabilitie
             // Output styles ship with CC out-of-the-box (v0.2 only
             // advertises the built-ins; user-defined output styles
             // discovered via `~/.claude/output-styles/` scan are v0.3+).
-            output_styles: vec![
-                "default".into(),
-                "explanatory".into(),
-                "concise".into(),
-            ],
+            output_styles: vec!["default".into(), "explanatory".into(), "concise".into()],
             // Hook lifecycle names CC emits on `--include-hook-events`
             // and accepts in `settings.json`. Surfaced so the UI can
             // present a picker for `AddHook` vendor control.
@@ -161,7 +157,11 @@ mod tests {
         }
         // No Codex-only features leaked in.
         assert!(!caps.features.contains(&CapabilityId::CodexSandboxMode));
-        assert!(!caps.features.contains(&CapabilityId::CodexApprovalPersistence));
+        assert!(
+            !caps
+                .features
+                .contains(&CapabilityId::CodexApprovalPersistence)
+        );
         assert!(!caps.features.contains(&CapabilityId::CodexSkills));
         assert!(!caps.features.contains(&CapabilityId::CodexCustomPrompts));
     }

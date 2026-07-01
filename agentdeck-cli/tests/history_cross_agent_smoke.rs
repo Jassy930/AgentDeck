@@ -18,8 +18,15 @@ fn history_list_default_returns_json() {
         eprintln!("SKIP: set AGENTDECK_E2E=1 to run");
         return;
     }
-    let out = Command::new(bin()).args(["history", "list"]).output().unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new(bin())
+        .args(["history", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     // Should be valid JSON (either {"kind":"list","value":[...]} or similar)
     let _: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON output");
 }
@@ -33,7 +40,11 @@ fn history_list_with_codex_agent_filter_returns_json() {
         .args(["history", "list", "--agent", "codex"])
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let _: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
 }
 
@@ -46,6 +57,10 @@ fn history_list_with_cc_agent_filter_returns_json() {
         .args(["history", "list", "--agent", "claude-code"])
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let _: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
 }

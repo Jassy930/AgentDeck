@@ -74,7 +74,6 @@ final class HistoryGroupRowView: NSView {
 final class HistoryThreadRowView: NSView {
     // MARK: Subviews
     private let accentBar = NSView()
-    private let agentIconView = NSImageView()
     private let runtimeDotView = NSView()
     private let titleLabel = NSTextField(labelWithString: "")
     private let metaLabel = NSTextField(labelWithString: "")
@@ -104,12 +103,6 @@ final class HistoryThreadRowView: NSView {
         accentBar.layer?.cornerRadius = 1.5
         accentBar.translatesAutoresizingMaskIntoConstraints = false
         addSubview(accentBar)
-
-        // Agent icon (14×14)
-        agentIconView.imageScaling = .scaleProportionallyUpOrDown
-        agentIconView.contentTintColor = .secondaryLabelColor
-        agentIconView.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(agentIconView)
 
         // Runtime phase dot
         runtimeDotView.wantsLayer = true
@@ -159,14 +152,8 @@ final class HistoryThreadRowView: NSView {
             accentBar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
             accentBar.widthAnchor.constraint(equalToConstant: 3),
 
-            // Agent icon
-            agentIconView.leadingAnchor.constraint(equalTo: accentBar.trailingAnchor, constant: 6),
-            agentIconView.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
-            agentIconView.widthAnchor.constraint(equalToConstant: 14),
-            agentIconView.heightAnchor.constraint(equalToConstant: 14),
-
             // Runtime dot (size driven by runtimeDotWidth/Height, updated on configure)
-            runtimeDotView.leadingAnchor.constraint(equalTo: agentIconView.trailingAnchor, constant: 4),
+            runtimeDotView.leadingAnchor.constraint(equalTo: accentBar.trailingAnchor, constant: 8),
             runtimeDotView.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
             runtimeDotWidth,
             runtimeDotHeight,
@@ -194,28 +181,17 @@ final class HistoryThreadRowView: NSView {
         titleLabel.textColor = presentation.isEmphasized ? .labelColor : .secondaryLabelColor
         titleLabel.stringValue = thread.displayTitle
 
-        // Meta line: status · runtimeStatus · agentKind · date
+        // Meta line: status · runtimeStatus · date
         var metaParts: [String] = [thread.status]
         if let runtimeStatus = presentation.runtimeStatusLabel {
             metaParts.append(runtimeStatus)
         }
-        metaParts.append(thread.agentKind == .claudeCode ? "Claude Code" : "Codex")
         metaParts.append(Self.updatedLabel(thread.updatedAt))
         metaLabel.stringValue = metaParts.joined(separator: " · ")
 
         // Accent bar
         let accentColor = Self.accentBarColor(presentation)
         accentBar.layer?.backgroundColor = accentColor.cgColor
-
-        // Agent icon — use AgentKindIcon for accurate cross-agent images
-        if let img = AgentKindIcon.image(for: thread.agentKind) {
-            agentIconView.image = img
-            agentIconView.contentTintColor = presentation.isEmphasized ? .controlAccentColor : .secondaryLabelColor
-        } else {
-            agentIconView.image = NSImage(systemSymbolName: "questionmark.circle", accessibilityDescription: nil)
-            agentIconView.contentTintColor = .secondaryLabelColor
-        }
-        agentIconView.toolTip = thread.agentKind == .claudeCode ? "Claude Code" : "Codex"
 
         // Runtime dot — size driven by Auto Layout constraints (5pt cached / 7pt unread)
         if presentation.hasRuntimeIndicator {
@@ -240,7 +216,7 @@ final class HistoryThreadRowView: NSView {
         }
 
         // Accessibility
-        setAccessibilityLabel("Open \(presentation.agentSourceLabel) thread, \(thread.displayTitle)")
+        setAccessibilityLabel("Open thread, \(thread.displayTitle)")
     }
 
     // MARK: Helpers

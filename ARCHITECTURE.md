@@ -16,7 +16,7 @@ AgentDeck 不做 IDE，不做通用多 agent 聊天界面，不是 Codex Desktop
 │                                                                 │
 │  SessionViewController                                          │
 │   ├─ StatusBarView（当前 agentKind + auth）                      │
-│   ├─ HistorySidebarVC（跨 agent 列表 + 过滤器）                   │
+│   ├─ HistorySidebarVC（跨 agent 合并列表）                         │
 │   ├─ AgentControlBar（capability 路由 → vendor SubView）          │
 │   ├─ ConversationVC（虚拟化 NSTableView，中立 AgentItem）          │
 │   ├─ ApprovalCardView（主干壳 + vendor 高级区 SubView）            │
@@ -91,7 +91,7 @@ agentdeckd
 
 | # | 不变量 | 守护方式 |
 |---|---|---|
-| **N1** | **两层协议**：`AgentItem` / `ActionRequest` / `TurnComplete` / `SessionStarted` / `SessionCapabilities` / `Error` 主干必须 vendor 中立；vendor 字段只能出现在 `capabilities.*` / `vendorControl.*` / `vendorPanel.*` 三个命名空间下 | schemars 派生 + `neutrality_tests.rs` 静态断言 |
+| **N1** | **两层协议**：`AgentItem` / `TurnComplete` / `SessionStarted` / `SessionCapabilities` / `Error` 主干必须 vendor 中立；vendor 字段默认只能出现在 `capabilities.*` / `vendorControl.*` / `vendorPanel.*` 三个命名空间下。唯一例外是 `ActionRequest.vendor`，用于 typed approval detail，禁止任意 JSON 透传 | schemars 派生 + `neutrality_tests.rs` 静态断言 |
 | **N2** | **Capabilities Handshake**：每个 session 启动时 daemon 必须先发 `SessionCapabilities`；UI 必须按它路由控件渲染；禁止 UI 硬编码 `if agentKind == .codex` 分支 | Swift 端 `NoVendorBranchInUITests` grep + AST 扫描 |
 | **N3** | **Adapter 互不知晓**：`agentdeckd/src/codex/` 不依赖 `claude_code/` 任何类型，反之亦然；共享逻辑下沉到 `agent.rs` trait | cargo 模块依赖检查 |
 | **N4** | **Adapter 内 vendor JSON 不外泄**：被 IPC 推到 UI 的 vendor 字段必须经 adapter 显式建模，禁止 `serde_json::Value` 透传 | `capabilities_namespace_is_typed` 测试断言 |

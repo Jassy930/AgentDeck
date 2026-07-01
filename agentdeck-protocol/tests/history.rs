@@ -6,6 +6,7 @@ fn history_list_all_agents() {
     let req = HistoryRequest::List {
         agent_kind: None,
         cwd_filter: None,
+        limit: None,
     };
     let json = serde_json::to_string(&req).unwrap();
     let _: HistoryRequest = serde_json::from_str(&json).unwrap();
@@ -16,6 +17,7 @@ fn history_list_only_codex() {
     let req = HistoryRequest::List {
         agent_kind: Some(AgentKind::Codex),
         cwd_filter: Some(PathBuf::from("/proj")),
+        limit: None,
     };
     let _: HistoryRequest = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
 }
@@ -49,6 +51,14 @@ fn history_archive_wire_is_camel_case() {
         agent_kind: AgentKind::ClaudeCode,
     };
     let json = serde_json::to_string(&req).unwrap();
-    assert!(json.contains(r#""threadId":"t1""#), "thread_id should be threadId in wire: {}", json);
-    assert!(json.contains(r#""agentKind":"claude_code""#), "agent_kind should be agentKind in wire: {}", json);
+    assert!(
+        json.contains(r#""threadId":"t1""#),
+        "thread_id should be threadId in wire: {}",
+        json
+    );
+    assert!(
+        json.contains(r#""agentKind":"claude_code""#),
+        "agent_kind should be agentKind in wire: {}",
+        json
+    );
 }

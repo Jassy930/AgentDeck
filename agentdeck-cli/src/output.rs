@@ -20,9 +20,15 @@
 #[derive(Debug)]
 pub enum CliError {
     Usage(String),
-    Protocol { code: Option<String>, message: String },
+    Protocol {
+        code: Option<String>,
+        message: String,
+    },
     Transport(String),
-    Session { code: Option<String>, message: String },
+    Session {
+        code: Option<String>,
+        message: String,
+    },
     Json(serde_json::Error),
     NoResponse,
 }
@@ -97,12 +103,20 @@ mod tests {
     fn exit_codes_match_contract() {
         assert_eq!(CliError::Usage("x".into()).exit_code(), 2);
         assert_eq!(
-            CliError::Protocol { code: None, message: "x".into() }.exit_code(),
+            CliError::Protocol {
+                code: None,
+                message: "x".into()
+            }
+            .exit_code(),
             3
         );
         assert_eq!(CliError::Transport("x".into()).exit_code(), 4);
         assert_eq!(
-            CliError::Session { code: None, message: "x".into() }.exit_code(),
+            CliError::Session {
+                code: None,
+                message: "x".into()
+            }
+            .exit_code(),
             5
         );
         assert_eq!(CliError::NoResponse.exit_code(), 3);
@@ -110,7 +124,10 @@ mod tests {
 
     #[test]
     fn error_envelope_has_code_and_message() {
-        let v = error_envelope(&CliError::Protocol { code: None, message: "boom".into() });
+        let v = error_envelope(&CliError::Protocol {
+            code: None,
+            message: "boom".into(),
+        });
         assert_eq!(v["error"]["code"], "protocol");
         assert_eq!(v["error"]["message"], "boom");
     }
@@ -130,7 +147,8 @@ mod tests {
 
     #[test]
     fn exit_for_json_error_is_protocol() {
-        let je: serde_json::Error = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        let je: serde_json::Error =
+            serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
         assert_eq!(CliError::Json(je).exit_code(), 3);
     }
 }

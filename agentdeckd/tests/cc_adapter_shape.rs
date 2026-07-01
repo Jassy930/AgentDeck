@@ -5,11 +5,11 @@
 //! offline cases, then opt-in spawns a real `claude` (skipped when not
 //! on PATH) to verify the N7 invariant end-to-end.
 
+use agentdeck_protocol::*;
 use agentdeckd::agent::Agent;
 use agentdeckd::claude_code::ClaudeCodeAdapter;
 use agentdeckd::claude_code::auth::{AuthState, probe_auth_status};
 use agentdeckd::claude_code::history;
-use agentdeck_protocol::*;
 
 fn cc_opts() -> ClaudeCodeSessionOptions {
     ClaudeCodeSessionOptions {
@@ -45,9 +45,10 @@ fn capabilities_advertise_cc_agent_kind_and_full_feature_set() {
     // Vendor block is the CC variant.
     assert!(matches!(caps.vendor, VendorCapabilities::ClaudeCode(_)));
     // CC-only features are present.
-    assert!(caps
-        .features
-        .contains(&CapabilityId::ClaudeCodePermissionMode));
+    assert!(
+        caps.features
+            .contains(&CapabilityId::ClaudeCodePermissionMode)
+    );
     assert!(caps.features.contains(&CapabilityId::ClaudeCodeHooks));
     // Shared features symmetric with Codex (N5).
     assert!(caps.features.contains(&CapabilityId::StreamingMessages));
@@ -130,10 +131,7 @@ async fn submit_vendor_control_output_style_not_supported() {
         )
         .await;
     assert!(result.is_err());
-    assert_eq!(
-        result.unwrap_err().code,
-        "cc-vendor-control-not-supported"
-    );
+    assert_eq!(result.unwrap_err().code, "cc-vendor-control-not-supported");
 }
 
 #[tokio::test]
@@ -202,7 +200,13 @@ async fn real_claude_emits_started_then_capabilities() {
         .expect("first event timeout")
         .expect("channel closed");
     assert!(
-        matches!(e1, ServerEvent::SessionStarted { agent_kind: AgentKind::ClaudeCode, .. }),
+        matches!(
+            e1,
+            ServerEvent::SessionStarted {
+                agent_kind: AgentKind::ClaudeCode,
+                ..
+            }
+        ),
         "first event should be SessionStarted, got {e1:?}"
     );
 
@@ -211,7 +215,13 @@ async fn real_claude_emits_started_then_capabilities() {
         .expect("second event timeout")
         .expect("channel closed");
     assert!(
-        matches!(e2, ServerEvent::SessionCapabilities { agent_kind: AgentKind::ClaudeCode, .. }),
+        matches!(
+            e2,
+            ServerEvent::SessionCapabilities {
+                agent_kind: AgentKind::ClaudeCode,
+                ..
+            }
+        ),
         "second event should be SessionCapabilities, got {e2:?}"
     );
 
@@ -253,7 +263,7 @@ async fn real_claude_list_history_returns_or_empty() {
         println!("SKIP real_claude_list_history: `claude` not in PATH");
         return;
     }
-    let items = history::list_history(None)
+    let items = history::list_history(None, None)
         .await
         .expect("list_history should not error on a working CC install");
     eprintln!("real_claude_list_history: {} sessions found", items.len());

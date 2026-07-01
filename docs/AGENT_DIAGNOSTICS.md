@@ -66,6 +66,14 @@ runtime UI。`raw` 只显示中立描述，不携带 vendor 原始 JSON；如果
 daemon 写入失败等非致命问题会发出 `warning` 事件。当前选中的 runtime 应显示
 自己的 warning；没有选中 runtime 时才回退显示 legacy session warning。
 
+## Claude Code System Events
+
+CC `stream-json` 中 `system.subtype=init` 只用于抓取原生 `session_id`。
+`hook_started` / `hook_response` 仍映射为 `VendorPanelEvent::hookFired`；
+其他 `system` 诊断事件（例如 `api_retry`、`status`、`thinking_tokens`）
+映射为 `VendorPanelEvent::systemStatus`，保留 `subtype`、可读 `message`
+和 `attempt`，不进入中立 `AgentItem` 主干，也不透传原始 vendor JSON。
+
 ## Approval 卡住排查
 
 Codex 的命令执行、文件变更和额外权限审批会先在 daemon adapter 层映射为中立
