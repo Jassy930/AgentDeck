@@ -671,7 +671,25 @@ pub async fn read_history(thread_id: &ThreadId) -> Result<HistoryReadResponse, P
 /// whether to fall back to a UI-side "hidden" flag (out of N8 scope —
 /// not allowed).
 pub async fn archive(thread_id: &ThreadId) -> Result<(), ProtocolError> {
-    run_claude(&["rm", &thread_id.0], "cc-archive").await
+    // CC's `claude rm` looks up the session by ID within the current cwd.
+    // We must run it from the session's ORIGINAL cwd, discovered via list_history.
+    let cwd = find_session_cwd(thread_id).await?;
+    run_claude_in(&["rm", &thread_id.0], "cc-archive", &cwd).await
+}
+
+/// Look up the original cwd for a session by scanning history. Returns
+/// error if not found.
+async fn find_session_cwd(thread_id: &ThreadId) -> Result<PathBuf, ProtocolError> {
+    let items = list_history(None).await?;
+    items
+        .into_iter()
+        .find(|i| i.thread_id == *thread_id)
+        .map(|i| i.cwd)
+        .ok_or_else(|| ProtocolError {
+            code: "cc-session-not-found".into(),
+            message: format!("session {} not found in history", thread_id.0),
+            diagnostic_ref: None,
+        })
 }
 
 /// Rename a session via `claude --print --resume <id> -n <name>
@@ -682,8 +700,14 @@ pub async fn archive(thread_id: &ThreadId) -> Result<(), ProtocolError> {
 pub async fn rename(thread_id: &ThreadId, title: &str) -> Result<(), ProtocolError> {
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
+    // CC `--resume` looks up the session by ID within the current cwd. We
+    // must run rename from the session's original cwd, discovered via
+    // list_history. Without this the CC binary reports
+    // "No conversation found with session ID: <id>".
+    let session_cwd = find_session_cwd(thread_id).await?;
     let mut cmd = Command::new("claude");
-    cmd.arg("--print")
+    cmd.current_dir(&session_cwd)
+        .arg("--print")
         .arg("--resume")
         .arg(&thread_id.0)
         .arg("-n")
@@ -716,7 +740,8 @@ pub async fn rename(thread_id: &ThreadId, title: &str) -> Result<(), ProtocolErr
         return Err(ProtocolError {
             code: "cc-rename-status".into(),
             message: format!(
-                "claude --resume --name exited with {}: {}",
+                "claude --resume --name (cwd={}) exited with {}: {}",
+                session_cwd.display(),
                 out.status,
                 String::from_utf8_lossy(&out.stderr)
             ),
@@ -728,9 +753,14 @@ pub async fn rename(thread_id: &ThreadId, title: &str) -> Result<(), ProtocolErr
 
 /// Generic wrapper for fire-and-forget `claude <args>` invocations
 /// (used by `archive`). Captures stderr into structured errors.
-async fn run_claude(args: &[&str], code_prefix: &str) -> Result<(), ProtocolError> {
+async fn run_claude_in(
+    args: &[&str],
+    code_prefix: &str,
+    cwd: &std::path::Path,
+) -> Result<(), ProtocolError> {
     use tokio::process::Command;
     let mut cmd = Command::new("claude");
+    cmd.current_dir(cwd);
     for a in args {
         cmd.arg(a);
     }
