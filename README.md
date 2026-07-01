@@ -110,7 +110,10 @@ app-server 的 `thread/list` / `thread/read(includeTurns: true)` 接入留到 v0
 （软删，`--resume` 仍能找回）；Rename 走 `claude --resume <id> --name`；
 Unarchive 等同 no-op（CC 不区分 unarchive）。历史列表默认返回最新 500 条；
 daemon 先按 `.jsonl` mtime 排序并截断，再只为最终返回条目扫描标题，避免大型
-`~/.claude/projects` 历史库拖慢左侧侧栏刷新。
+`~/.claude/projects` 历史库拖慢左侧侧栏刷新。`claude-mem` observer 会话属于
+后台记忆工具噪声：project dir 匹配 `.claude-mem/observer-sessions`，或开头为
+`Hello memory agent` / `You are a Claude-Mem` 的会话，会在 history list 阶段过滤，
+不进入 CLI 输出或左侧侧栏。
 
 继续历史会话时，Codex 走 `thread/resume(threadId)`；CC 走
 `claude --resume <id>`。历史读取操作必须带 `agent_kind`（两家持久化结构不同）。

@@ -33,6 +33,7 @@
 //! `HistoryListItem::title`. Verified live against `claude 2.1.191`.
 
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -239,22 +240,25 @@ fn list_history_from_jsonl_root(
     }
     // Newest first — what the sidebar wants by default.
     candidates.sort_by_key(|i| std::cmp::Reverse(i.last_active_ms));
-    candidates.truncate(limit);
 
-    let items = candidates
-        .into_iter()
-        .map(|candidate| {
-            let title = scan_title(&candidate.path);
-            HistoryListItem {
-                thread_id: candidate.thread_id,
-                agent_kind: AgentKind::ClaudeCode,
-                title,
-                cwd: candidate.cwd,
-                last_active_ms: candidate.last_active_ms,
-                archived: false,
-            }
-        })
-        .collect();
+    let mut items = Vec::new();
+    for candidate in candidates {
+        if items.len() >= limit {
+            break;
+        }
+        if is_memory_agent_session(&candidate.path) {
+            continue;
+        }
+        let title = scan_title(&candidate.path);
+        items.push(HistoryListItem {
+            thread_id: candidate.thread_id,
+            agent_kind: AgentKind::ClaudeCode,
+            title,
+            cwd: candidate.cwd,
+            last_active_ms: candidate.last_active_ms,
+            archived: false,
+        });
+    }
 
     Ok(items)
 }
@@ -320,6 +324,65 @@ fn scan_title(path: &Path) -> Option<String> {
         }
     }
     custom.or(first_user)
+}
+
+fn is_memory_agent_session(path: &Path) -> bool {
+    if is_memory_agent_project_path(path) {
+        return true;
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let reader = BufReader::new(file);
+    let mut bytes_seen = 0usize;
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        bytes_seen = bytes_seen.saturating_add(line.len());
+        if bytes_seen > 64 * 1024 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if v
+            .get("content")
+            .and_then(Value::as_str)
+            .map(is_memory_agent_prompt)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if v.get("type").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        return v
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_str)
+            .map(is_memory_agent_prompt)
+            .unwrap_or(false);
+    }
+    false
+}
+
+fn is_memory_agent_project_path(path: &Path) -> bool {
+    path.parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .map(|name| name.contains("claude-mem-observer-sessions"))
+        .unwrap_or(false)
+}
+
+fn is_memory_agent_prompt(prompt: &str) -> bool {
+    let normalized = prompt.trim_start().to_ascii_lowercase();
+    normalized.starts_with("hello memory agent")
+        || normalized.starts_with("you are a claude-mem")
 }
 
 /// List history (async wrapper). Spawning is sync-blocking on the
@@ -1013,6 +1076,88 @@ mod tests {
             items[0].last_active_ms >= items[1].last_active_ms,
             "items should stay newest-first"
         );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn list_history_filters_memory_agent_sessions_and_backfills_limit() {
+        let home = tempdir_unique();
+        let root = home.join(".claude").join("projects");
+        let project = root.join(encode_cwd(Path::new("/tmp/agentdeck")));
+        std::fs::create_dir_all(&project).unwrap();
+
+        let claude_mem = project.join("00000000-0000-0000-0000-000000000300.jsonl");
+        std::fs::write(
+            &claude_mem,
+            r#"{"type":"user","message":{"role":"user","content":"You are a Claude-Mem, a specialized observer tool for creating searchable memory FOR FUTURE SESSIONS."}}"#,
+        )
+        .unwrap();
+        let newest = std::time::SystemTime::now() + std::time::Duration::from_secs(180);
+        std::fs::File::open(&claude_mem).unwrap().set_modified(newest).unwrap();
+
+        let memory = project.join("00000000-0000-0000-0000-000000000200.jsonl");
+        std::fs::write(
+            &memory,
+            r#"{"type":"user","message":{"role":"user","content":"Hello memory agent, you are continuing to observe the primary Claude session."}}"#,
+        )
+        .unwrap();
+        let second_newest = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+        std::fs::File::open(&memory)
+            .unwrap()
+            .set_modified(second_newest)
+            .unwrap();
+
+        let normal = project.join("00000000-0000-0000-0000-000000000100.jsonl");
+        std::fs::write(
+            &normal,
+            r#"{"type":"user","message":{"role":"user","content":"real user prompt"}}"#,
+        )
+        .unwrap();
+        let older = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        std::fs::File::open(&normal).unwrap().set_modified(older).unwrap();
+
+        let items = list_history_from_jsonl_root(&root, None, 1).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].thread_id.0, "00000000-0000-0000-0000-000000000100");
+        assert_eq!(items[0].title.as_deref(), Some("real user prompt"));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn list_history_filters_claude_mem_observer_project_dir() {
+        let home = tempdir_unique();
+        let root = home.join(".claude").join("projects");
+        let observer = root.join("-Users-jassy--claude-mem-observer-sessions");
+        let project = root.join(encode_cwd(Path::new("/tmp/agentdeck")));
+        std::fs::create_dir_all(&observer).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+
+        let observer_session = observer.join("00000000-0000-0000-0000-000000000200.jsonl");
+        std::fs::write(
+            &observer_session,
+            r#"{"type":"user","message":{"role":"user","content":"internal observer prompt"}}"#,
+        )
+        .unwrap();
+        let newest = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+        std::fs::File::open(&observer_session)
+            .unwrap()
+            .set_modified(newest)
+            .unwrap();
+
+        let normal = project.join("00000000-0000-0000-0000-000000000100.jsonl");
+        std::fs::write(
+            &normal,
+            r#"{"type":"user","message":{"role":"user","content":"real user prompt"}}"#,
+        )
+        .unwrap();
+        let older = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        std::fs::File::open(&normal).unwrap().set_modified(older).unwrap();
+
+        let items = list_history_from_jsonl_root(&root, None, 1).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].thread_id.0, "00000000-0000-0000-0000-000000000100");
+
         let _ = std::fs::remove_dir_all(&home);
     }
 
