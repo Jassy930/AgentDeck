@@ -133,7 +133,8 @@ final class ProtocolV2DecodingTests: XCTestCase {
         let json = """
         {"type":"vendorPanelEvent","sessionId":"s1","agentKind":"claude_code",
          "payload":{"agentKind":"claude_code","event":{"kind":"systemStatus",
-                    "subtype":"api_retry","status":null,"message":"Overloaded","attempt":3}}}
+                    "subtype":"api_retry","status":null,"message":"server_error","attempt":3,
+                    "error":"server_error","errorStatus":503,"maxRetries":10,"retryDelayMs":2218.38}}}
         """
         let event = try DaemonClient.decodeServerEvent(json)
         guard case let .vendorPanelEvent(_, kind, payload) = event else {
@@ -141,14 +142,27 @@ final class ProtocolV2DecodingTests: XCTestCase {
         }
         XCTAssertEqual(kind, .claudeCode)
         guard case let .claudeCode(vendor) = payload,
-              case let .systemStatus(subtype, status, message, attempt) = vendor
+              case let .systemStatus(
+                  subtype,
+                  status,
+                  message,
+                  attempt,
+                  error,
+                  errorStatus,
+                  maxRetries,
+                  retryDelayMs
+              ) = vendor
         else {
             return XCTFail("expected Claude Code systemStatus")
         }
         XCTAssertEqual(subtype, "api_retry")
         XCTAssertNil(status)
-        XCTAssertEqual(message, "Overloaded")
+        XCTAssertEqual(message, "server_error")
         XCTAssertEqual(attempt, 3)
+        XCTAssertEqual(error, "server_error")
+        XCTAssertEqual(errorStatus, 503)
+        XCTAssertEqual(maxRetries, 10)
+        XCTAssertEqual(retryDelayMs ?? 0, 2218.38, accuracy: 0.001)
     }
 
     func testDecodeActionRequestCodex() throws {

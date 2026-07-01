@@ -99,11 +99,10 @@ agent 来源、不提供 agent 切换或过滤入口，默认按项目和更新�
 `agentKind` 仍保留在数据模型中，用于读取、继续、归档和重命名时路由到正确
 adapter。
 
-**Codex 历史**：通过 Codex app-server 扫描已持久化的历史 thread，按项目
-`cwd` 分组显示。点击历史 thread 后读取 `thread/read(includeTurns: true)`
-返回的 turns/items，用同一套中立 `AgentItem` stream 回放到右侧。历史回放
-保留已知 `ThreadItem`（用户消息、模型回复、reasoning、计划、shell、diff、
-MCP/tool call、web search、图片等）；未知块以可见 `raw` 记录出现。
+**Codex 历史**：v0.2 仍是显式 stub，`history list --agent codex` 返回空列表，
+`history read --agent codex` 返回 `codex-history-read-not-implemented`。Codex
+app-server 的 `thread/list` / `thread/read(includeTurns: true)` 接入留到 v0.3；
+文档和 UI 不应把 Codex 历史回放说成已接通。
 
 **Claude Code 历史**：通过 `claude agents --json` 及直读
 `~/.claude/projects/<encoded_cwd>/<id>.jsonl` 获取，事实唯一来源在 CC 原生
@@ -202,18 +201,19 @@ agentdeck session run --agent codex \
 agentdeck session run --agent claude-code \
   --cwd <path> --prompt "..."           # Claude Code 新会话
 agentdeck session continue \
+  --agent <kind> --cwd <path> \
   --thread-id <id> --prompt "..."       # 继续历史 thread
 
 # history 子命令（v0.2 起跨 agent；--agent 可选过滤）
-agentdeck history list                         # 跨 agent 列出全部历史 threads
-agentdeck history list --agent claude-code     # 仅 CC 历史
+agentdeck history list                         # 跨 agent 列出历史 threads（默认限流）
+agentdeck history list --agent claude-code --limit 200  # 仅 CC 历史
 agentdeck history read <id> --agent <kind>     # 读取历史 thread（必须带 --agent）
 agentdeck history archive <id> --agent <kind>  # 归档 thread
 agentdeck history unarchive <id> --agent <kind># 取消归档
 agentdeck history rename <id> --agent <kind> <title>  # 重命名 thread
 ```
 
-`session run/continue` 支持 `--approval-policy prompt|auto-approve|auto-deny`（默认 `prompt`，等待 stdin 输入）。`--agent` 取值 `codex` 或 `claude-code`（snake_case 线形式为 `claude_code`）。
+`session run` 的 Codex 选项使用 `--approval on-request|never|always`、`--sandbox read-only|workspace-write|full-access`、`--reasoning-effort minimal|low|medium|high`；Claude Code 选项使用 `--permission default|accept-edits|plan|auto|dont-ask|bypass-permissions`。`--agent` 取值 `codex` 或 `claude-code`（wire 值为 `claude_code`）。
 
 ### 输出与退出码契约
 

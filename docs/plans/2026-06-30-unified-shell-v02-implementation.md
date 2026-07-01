@@ -5009,7 +5009,7 @@ git commit -m "feat(daemon/cc/history): archive via `claude rm`, rename via `cla
 **Interfaces:**
 - 当 CC 处于 `--permission-mode plan` 时输出特殊 plan blocks → 映射到 `AgentItem::Plan { steps, meta.vendor=cc }`
 - 当 `--include-hook-events` 启用时，CC 输出 `type:"hook"` 的事件 → `ServerEvent::VendorPanelEvent { payload: VendorPanelPayload::ClaudeCode(ClaudeCodeVendorPanelEvent::HookFired { matcher, tool_use_id, elapsed_ms }) }`
-- 当 CC 输出非 `init` / 非 hook 的 `system` 诊断 subtype（如 `api_retry` / `status` / `thinking_tokens`）时 → `VendorPanelEvent::systemStatus`，只保留 typed 摘要字段，不进入中立主干。
+- 当 CC 输出非 `init` / 非 hook 的 `system` 诊断 subtype（如 `api_retry` / `status` / `thinking_tokens`）时 → `VendorPanelEvent::systemStatus`，保留 `subtype/message/attempt/error/errorStatus/maxRetries/retryDelayMs` 等 typed 摘要字段，不进入中立主干。
 - `submit_vendor_control` 处理 `ClaudeCodeVendorControl::UpdatePermissionMode/UpdateOutputStyle/AddHook/RemoveHook`——v0.2 简化策略：通过"取消当前 turn + 用新选项重启新 turn"实现（CC 不支持运行中切换）；首版**只支持 UpdatePermissionMode**，其他三个返回 `Err(ProtocolError { code: "cc-vendor-control-not-yet", ... })`
 
 - [ ] **Step 1: 写测试**

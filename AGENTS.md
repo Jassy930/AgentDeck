@@ -62,7 +62,9 @@ cargo run -q -p agentdeck-cli -- protocol schema \
 cargo run -p agentdeck-cli -- selfcheck
 
 # 门控 E2E（本地执行，需要 codex login；默认 cargo test 跳过）
-AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e
+AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_codex -- --nocapture
+AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_claude_code -- --nocapture
+AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_cross_agent_history -- --nocapture --test-threads=1
 ```
 
 协议 schema 漂移测试随标准 `cargo test` 运行；改动 `agentdeck-protocol` 中的类型后须用以下命令重新生成快照：

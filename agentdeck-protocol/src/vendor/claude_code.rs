@@ -85,5 +85,12 @@ pub enum ClaudeCodeVendorPanelEvent {
         status: Option<String>,
         message: Option<String>,
         attempt: Option<u64>,
+        error: Option<String>,
+        #[serde(rename = "errorStatus")]
+        error_status: Option<u64>,
+        #[serde(rename = "maxRetries")]
+        max_retries: Option<u64>,
+        #[serde(rename = "retryDelayMs")]
+        retry_delay_ms: Option<f64>,
     },
 }

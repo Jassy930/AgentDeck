@@ -217,6 +217,10 @@ impl ClaudeCodeTranslator {
                         .map(String::from),
                     message: system_status_message(parsed),
                     attempt: parsed.get("attempt").and_then(Value::as_u64),
+                    error: system_status_error(parsed),
+                    error_status: parsed.get("error_status").and_then(Value::as_u64),
+                    max_retries: parsed.get("max_retries").and_then(Value::as_u64),
+                    retry_delay_ms: parsed.get("retry_delay_ms").and_then(Value::as_f64),
                 };
                 TranslateOutput {
                     events: vec![ServerEvent::VendorPanelEvent {
@@ -564,12 +568,23 @@ fn system_status_message(parsed: &Value) -> Option<String> {
         .get("message")
         .or_else(|| parsed.get("status"))
         .and_then(Value::as_str)
+        .or_else(|| parsed.get("error").and_then(Value::as_str))
         .or_else(|| {
             parsed
                 .get("error")
                 .and_then(|e| e.get("message"))
                 .and_then(Value::as_str)
         })
+        .map(String::from)
+}
+
+fn system_status_error(parsed: &Value) -> Option<String> {
+    let error = parsed.get("error")?;
+    error
+        .as_str()
+        .or_else(|| error.get("type").and_then(Value::as_str))
+        .or_else(|| error.get("code").and_then(Value::as_str))
+        .or_else(|| error.get("message").and_then(Value::as_str))
         .map(String::from)
 }
 

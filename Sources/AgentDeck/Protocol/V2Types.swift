@@ -706,10 +706,20 @@ public enum CodexVendorPanelEvent: Codable, Sendable {
 
 public enum ClaudeCodeVendorPanelEvent: Codable, Sendable {
     case hookFired(matcher: String, toolUseId: String?, elapsedMs: UInt64?)
-    case systemStatus(subtype: String, status: String?, message: String?, attempt: UInt64?)
+    case systemStatus(
+        subtype: String,
+        status: String?,
+        message: String?,
+        attempt: UInt64?,
+        error: String?,
+        errorStatus: UInt64?,
+        maxRetries: UInt64?,
+        retryDelayMs: Double?
+    )
 
     private enum CodingKeys: String, CodingKey {
         case kind, matcher, toolUseId, elapsedMs, subtype, status, message, attempt
+        case error, errorStatus, maxRetries, retryDelayMs
     }
 
     public init(from decoder: Decoder) throws {
@@ -726,7 +736,20 @@ public enum ClaudeCodeVendorPanelEvent: Codable, Sendable {
             let status = try c.decodeIfPresent(String.self, forKey: .status)
             let message = try c.decodeIfPresent(String.self, forKey: .message)
             let attempt = try c.decodeIfPresent(UInt64.self, forKey: .attempt)
-            self = .systemStatus(subtype: subtype, status: status, message: message, attempt: attempt)
+            let error = try c.decodeIfPresent(String.self, forKey: .error)
+            let errorStatus = try c.decodeIfPresent(UInt64.self, forKey: .errorStatus)
+            let maxRetries = try c.decodeIfPresent(UInt64.self, forKey: .maxRetries)
+            let retryDelayMs = try c.decodeIfPresent(Double.self, forKey: .retryDelayMs)
+            self = .systemStatus(
+                subtype: subtype,
+                status: status,
+                message: message,
+                attempt: attempt,
+                error: error,
+                errorStatus: errorStatus,
+                maxRetries: maxRetries,
+                retryDelayMs: retryDelayMs
+            )
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .kind, in: c, debugDescription: "unknown ClaudeCodeVendorPanelEvent kind: \(kind)"
@@ -742,12 +765,25 @@ public enum ClaudeCodeVendorPanelEvent: Codable, Sendable {
             try c.encode(m, forKey: .matcher)
             try c.encodeIfPresent(t, forKey: .toolUseId)
             try c.encodeIfPresent(e, forKey: .elapsedMs)
-        case .systemStatus(let subtype, let status, let message, let attempt):
+        case .systemStatus(
+            let subtype,
+            let status,
+            let message,
+            let attempt,
+            let error,
+            let errorStatus,
+            let maxRetries,
+            let retryDelayMs
+        ):
             try c.encode("systemStatus", forKey: .kind)
             try c.encode(subtype, forKey: .subtype)
             try c.encodeIfPresent(status, forKey: .status)
             try c.encodeIfPresent(message, forKey: .message)
             try c.encodeIfPresent(attempt, forKey: .attempt)
+            try c.encodeIfPresent(error, forKey: .error)
+            try c.encodeIfPresent(errorStatus, forKey: .errorStatus)
+            try c.encodeIfPresent(maxRetries, forKey: .maxRetries)
+            try c.encodeIfPresent(retryDelayMs, forKey: .retryDelayMs)
         }
     }
 }

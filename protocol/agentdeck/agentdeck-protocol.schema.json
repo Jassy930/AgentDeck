@@ -2665,15 +2665,44 @@
                     "null"
                   ]
                 },
+                "error": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "errorStatus": {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
                 "kind": {
                   "enum": [
                     "systemStatus"
                   ],
                   "type": "string"
                 },
+                "maxRetries": {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
                 "message": {
                   "type": [
                     "string",
+                    "null"
+                  ]
+                },
+                "retryDelayMs": {
+                  "format": "double",
+                  "type": [
+                    "number",
                     "null"
                   ]
                 },

@@ -29,8 +29,8 @@ swift run AgentDeck -- --diagnostics-report --json --profile dev
 1. 跑 `swift run AgentDeck -- --selfcheck`。
 2. 如果失败，先看 stderr 的 failure code。
 3. 跑 `swift run AgentDeck -- --diagnostics-report --json`。
-4. 优先处理 `failures[]` 中 severity 最高的项目。
-5. 按 `suggestedNextCheck` 继续执行只读检查。
+4. 查看 `byLevel` / `byEvent` 和 `tail` 中最近的错误或告警。
+5. 按 `tail` 里的事件上下文继续执行只读检查。
 
 排查开发调试实例时，在 selfcheck 和 diagnostics report 后加 `--profile dev`。
 SwiftPM/debug 构建未显式传 `--profile` 时也会默认使用 dev profile。
@@ -71,8 +71,9 @@ daemon 写入失败等非致命问题会发出 `warning` 事件。当前选中�
 CC `stream-json` 中 `system.subtype=init` 只用于抓取原生 `session_id`。
 `hook_started` / `hook_response` 仍映射为 `VendorPanelEvent::hookFired`；
 其他 `system` 诊断事件（例如 `api_retry`、`status`、`thinking_tokens`）
-映射为 `VendorPanelEvent::systemStatus`，保留 `subtype`、可读 `message`
-和 `attempt`，不进入中立 `AgentItem` 主干，也不透传原始 vendor JSON。
+映射为 `VendorPanelEvent::systemStatus`，保留 `subtype`、可读 `message`、
+`attempt`、`error`、`errorStatus`、`maxRetries` 和 `retryDelayMs`，不进入
+中立 `AgentItem` 主干，也不透传原始 vendor JSON。
 
 ## Approval 卡住排查
 
