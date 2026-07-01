@@ -212,13 +212,18 @@ final class SessionModel {
     /// v2 cross-agent history — stub until Task 6.5 wires daemon history.
     /// Existing UI references this; we keep the API so the UI compiles.
     private(set) var historyThreads: [HistoryThreadSummary] = []
-    private(set) var historyGroups: [HistoryProjectGroup] = []
+    var historyGroups: [HistoryProjectGroup] {
+        HistoryProjectGroup.group(combinedHistoryThreads())
+    }
     var historyErrorMessage: String?
     var isLoadingHistory = false
     var openingHistoryThreadId: String?
     var lastHistoryOpenTiming: HistoryOpenTiming?
     var historySearchTerm = ""
     var selectedHistoryThreadId: String?
+    var selectedSidebarThreadId: String? {
+        selectedHistoryThreadId ?? workbench.selectedSessionId
+    }
     var conversationViewportIdentity = "live:0"
     var scrollToLatestRequest = 0
     private var didRequestInitialHistoryRefresh = false
@@ -373,7 +378,34 @@ final class SessionModel {
 
     func setHistoryThreads(_ threads: [HistoryThreadSummary]) {
         historyThreads = threads
-        historyGroups = HistoryProjectGroup.group(threads)
+    }
+
+    private func combinedHistoryThreads() -> [HistoryThreadSummary] {
+        let persistedIds = Set(historyThreads.map(\.id))
+        let liveThreads = workbench.runtimeList.compactMap { runtime -> HistoryThreadSummary? in
+            if persistedIds.contains(runtime.id) { return nil }
+            if let threadId = runtime.threadId, persistedIds.contains(threadId) { return nil }
+            return liveHistoryThreadSummary(for: runtime)
+        }
+        return historyThreads + liveThreads
+    }
+
+    private func liveHistoryThreadSummary(for runtime: ThreadRuntimeModel) -> HistoryThreadSummary {
+        let prompt = runtime.items.first { $0.kind == "user" }?.text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let preview = (prompt?.isEmpty == false ? prompt : nil) ?? runtime.displayTitle
+        return HistoryThreadSummary(
+            id: runtime.id,
+            name: nil,
+            preview: preview,
+            cwd: runtime.cwd.path,
+            createdAt: Int(runtime.createdAt.timeIntervalSince1970),
+            updatedAt: Int(runtime.updatedAt.timeIntervalSince1970),
+            status: runtime.phase.rawValue,
+            modelProvider: runtime.agentKind == .codex ? "openai" : "anthropic",
+            source: "live",
+            agentKind: runtime.agentKind
+        )
     }
 
     func shouldAutoRefreshHistoryOnAppear() -> Bool {
@@ -423,6 +455,13 @@ final class SessionModel {
     }
 
     func openHistoryThread(_ thread: HistoryThreadSummary) {
+        if thread.source == "live", let runtime = workbench.runtime(sessionId: thread.id) {
+            cwd = runtime.cwd
+            selectedHistoryThreadId = nil
+            resetConversationViewport(prefix: "live:\(thread.id)")
+            workbench.selectRuntime(sessionId: thread.id)
+            return
+        }
         guard let client else { return }
         guard ensureDaemonStarted() else { return }
         openingHistoryThreadId = thread.id

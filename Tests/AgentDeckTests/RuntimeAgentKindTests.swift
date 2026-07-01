@@ -91,4 +91,33 @@ final class RuntimeAgentKindTests: XCTestCase {
         ))
         XCTAssertEqual(workbench.runtime(sessionId: "s1")?.items.count, 1)
     }
+
+    func testWorkbenchAdoptsDaemonSessionIdForNewRuntime() {
+        let workbench = WorkbenchModel(turnStarter: NoopRuntimeTurnStarter())
+        workbench.ensureRuntime(
+            sessionId: "live-provisional",
+            agentKind: .codex,
+            threadId: nil,
+            cwd: URL(fileURLWithPath: "/tmp/project")
+        )
+        workbench.selectRuntime(sessionId: "live-provisional")
+
+        workbench.ingestServerEvent(.sessionStarted(
+            sessionId: "daemon-session",
+            threadId: nil,
+            agentKind: .codex
+        ))
+        workbench.ingestServerEvent(.agentItem(
+            sessionId: "daemon-session",
+            threadId: "thread-1",
+            agentKind: .codex,
+            item: .assistantMessage(text: "hello", meta: AgentItemMeta())
+        ))
+
+        XCTAssertNil(workbench.runtime(sessionId: "live-provisional"))
+        XCTAssertEqual(workbench.selectedSessionId, "daemon-session")
+        XCTAssertEqual(workbench.runtime(sessionId: "daemon-session")?.id, "daemon-session")
+        XCTAssertEqual(workbench.runtime(sessionId: "daemon-session")?.threadId, "thread-1")
+        XCTAssertEqual(workbench.runtime(sessionId: "daemon-session")?.items.first?.text, "hello")
+    }
 }

@@ -108,7 +108,9 @@ app-server 的 `thread/list` / `thread/read(includeTurns: true)` 接入留到 v0
 `~/.claude/projects/<encoded_cwd>/<id>.jsonl` 获取，事实唯一来源在 CC 原生
 接口（N8 不变量：AgentDeck 不建 `cc-meta/` 目录）。Archive 走 `claude rm`
 （软删，`--resume` 仍能找回）；Rename 走 `claude --resume <id> --name`；
-Unarchive 等同 no-op（CC 不区分 unarchive）。
+Unarchive 等同 no-op（CC 不区分 unarchive）。历史列表默认返回最新 500 条；
+daemon 先按 `.jsonl` mtime 排序并截断，再只为最终返回条目扫描标题，避免大型
+`~/.claude/projects` 历史库拖慢左侧侧栏刷新。
 
 继续历史会话时，Codex 走 `thread/resume(threadId)`；CC 走
 `claude --resume <id>`。历史读取操作必须带 `agent_kind`（两家持久化结构不同）。
@@ -120,8 +122,9 @@ shell output 和 diff 展开时才填充 TextKit buffer，避免大历史 thread
 打开历史 thread 只切换当前选中的 runtime 和右侧视图，不会把其他正在运行的
 runtime 标记为 ready 或停止其后台事件处理。runtime 自身按约 30fps 刷新
 streaming delta，避免视图切到 runtime 后出现长时间不刷新的流式文本。
-普通新会话也会先创建 live runtime；daemon 返回真实 `threadId` 后写回该
-runtime，后续 prompt 继续走同一个 thread，而不是在 UI 上伪装成连续对话。
+普通新会话也会先创建 live runtime，并立即合并进左侧历史侧栏，避免当前会话
+只能在右侧可见。daemon 返回真实 `sessionId` / `threadId` 后写回该 runtime，
+后续 prompt 继续走同一个 thread，而不是在 UI 上伪装成连续对话。
 提交 prompt 时，正在运行、启动中或等待 approval 的 runtime 只会排入自己的
 队列；对应 runtime 收到 `turnComplete` 后才 drain 自己的下一条 prompt，不会
 把队列发送到当前选中的其他 history/runtime。

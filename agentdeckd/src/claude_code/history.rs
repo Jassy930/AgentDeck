@@ -183,7 +183,14 @@ fn list_history_from_jsonl_root(
     cwd_filter: Option<&Path>,
     limit: usize,
 ) -> Result<Vec<HistoryListItem>, ProtocolError> {
-    let mut items = Vec::new();
+    struct HistoryListCandidate {
+        path: PathBuf,
+        thread_id: ThreadId,
+        cwd: PathBuf,
+        last_active_ms: u64,
+    }
+
+    let mut candidates = Vec::new();
     let dirs: Vec<PathBuf> = if let Some(cwd) = cwd_filter {
         let p = root.join(encode_cwd(cwd));
         if p.is_dir() { vec![p] } else { vec![] }
@@ -220,21 +227,35 @@ fn list_history_from_jsonl_root(
             if stem.len() < 8 || !stem.contains('-') {
                 continue;
             }
+            let thread_id = ThreadId(stem.to_string());
             let last_active_ms = file_mtime_ms(&path);
-            let title = scan_title(&path);
-            items.push(HistoryListItem {
-                thread_id: ThreadId(stem.to_string()),
-                agent_kind: AgentKind::ClaudeCode,
-                title,
+            candidates.push(HistoryListCandidate {
+                path,
+                thread_id,
                 cwd: cwd.clone(),
                 last_active_ms,
-                archived: false,
             });
         }
     }
     // Newest first — what the sidebar wants by default.
-    items.sort_by_key(|i| std::cmp::Reverse(i.last_active_ms));
-    items.truncate(limit);
+    candidates.sort_by_key(|i| std::cmp::Reverse(i.last_active_ms));
+    candidates.truncate(limit);
+
+    let items = candidates
+        .into_iter()
+        .map(|candidate| {
+            let title = scan_title(&candidate.path);
+            HistoryListItem {
+                thread_id: candidate.thread_id,
+                agent_kind: AgentKind::ClaudeCode,
+                title,
+                cwd: candidate.cwd,
+                last_active_ms: candidate.last_active_ms,
+                archived: false,
+            }
+        })
+        .collect();
+
     Ok(items)
 }
 
@@ -992,6 +1013,68 @@ mod tests {
             items[0].last_active_ms >= items[1].last_active_ms,
             "items should stay newest-first"
         );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_history_applies_limit_before_scanning_titles() {
+        use std::io::Write;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let home = tempdir_unique();
+        let root = home.join(".claude").join("projects");
+        let project = root.join(encode_cwd(Path::new("/tmp/agentdeck")));
+        std::fs::create_dir_all(&project).unwrap();
+
+        let newest = project.join("00000000-0000-0000-0000-000000000100.jsonl");
+        std::fs::write(
+            &newest,
+            r#"{"type":"user","message":{"role":"user","content":"newest prompt"}}"#,
+        )
+        .unwrap();
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        std::fs::File::open(&newest).unwrap().set_modified(future).unwrap();
+
+        let stale_fifo = project.join("00000000-0000-0000-0000-000000000001.jsonl");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&stale_fifo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mkfifo should create a blocking stale candidate");
+
+        let root_for_thread = root.clone();
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let result = list_history_from_jsonl_root(&root_for_thread, None, 1);
+            let _ = tx.send(result);
+        });
+
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(result) => {
+                let items = result.unwrap();
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].thread_id.0, "00000000-0000-0000-0000-000000000100");
+            }
+            Err(_) => {
+                let mut writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&stale_fifo)
+                    .unwrap();
+                writeln!(
+                    writer,
+                    r#"{{"type":"user","message":{{"role":"user","content":"stale prompt"}}}}"#
+                )
+                .unwrap();
+                drop(writer);
+                let _ = handle.join();
+                let _ = std::fs::remove_dir_all(&home);
+                panic!("history list blocked while scanning a truncated-out stale title");
+            }
+        }
+
+        let _ = handle.join();
         let _ = std::fs::remove_dir_all(&home);
     }
 

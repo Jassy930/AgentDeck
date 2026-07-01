@@ -105,6 +105,7 @@ final class WorkbenchModel {
 
     /// Ingest a v2 ServerEvent into the matching runtime.
     func ingestServerEvent(_ event: ServerEvent) {
+        adoptRuntimeIdentityIfNeeded(for: event)
         guard let sessionId = event.sessionId,
               let runtime = runtimes[sessionId] else { return }
         let action = runtime.ingest(event)
@@ -112,6 +113,39 @@ final class WorkbenchModel {
             runtime.unreadEventCount = 0
         }
         handle(action, for: runtime)
+    }
+
+    private func adoptRuntimeIdentityIfNeeded(for event: ServerEvent) {
+        guard case .sessionStarted(let daemonSessionId, let threadId, let agentKind) = event else {
+            return
+        }
+        guard runtimes[daemonSessionId] == nil else { return }
+
+        let selectedCandidate = selectedSessionId.flatMap { sid -> String? in
+            guard let runtime = runtimes[sid],
+                  runtime.agentKind == agentKind,
+                  runtime.phase == .starting || runtime.threadId == threadId || runtime.threadId == nil
+            else { return nil }
+            return sid
+        }
+
+        let fallbackCandidate = runtimes.first { _, runtime in
+            runtime.agentKind == agentKind &&
+            (runtime.phase == .starting || runtime.threadId == threadId || runtime.threadId == nil)
+        }?.key
+
+        guard let oldSessionId = selectedCandidate ?? fallbackCandidate,
+              let runtime = runtimes.removeValue(forKey: oldSessionId)
+        else { return }
+
+        runtime.adoptSessionId(daemonSessionId)
+        if runtime.threadId == nil {
+            runtime.threadId = threadId
+        }
+        runtimes[daemonSessionId] = runtime
+        if selectedSessionId == oldSessionId {
+            selectedSessionId = daemonSessionId
+        }
     }
 
     private func submit(_ prompt: String, to runtime: ThreadRuntimeModel, sessionStart: SessionStart?) {

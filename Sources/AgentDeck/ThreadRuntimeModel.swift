@@ -22,8 +22,8 @@ struct PendingActionRequest: Equatable {
 
 @MainActor
 @Observable
-final class ThreadRuntimeModel: Identifiable {
-    let id: String                                      // sessionId
+final class ThreadRuntimeModel {
+    var id: String                                      // sessionId
     let agentKind: AgentKind
     var threadId: String?
     var cwd: URL
@@ -40,13 +40,17 @@ final class ThreadRuntimeModel: Identifiable {
     /// 由 `vendorControl(.claudeCode(.updatePermissionMode(...)))` 更新。
     /// Codex 当前不暴露 plan 类似状态。InputBarView 据此显示 Plan Mode 角标。
     var claudeCurrentPermissionMode: ClaudeCodePermissionMode?
+    let createdAt: Date
+    private(set) var updatedAt: Date
     private var agentItemSeq: Int = 0
 
-    init(id: String, agentKind: AgentKind, threadId: String? = nil, cwd: URL) {
+    init(id: String, agentKind: AgentKind, threadId: String? = nil, cwd: URL, createdAt: Date = .now) {
         self.id = id
         self.agentKind = agentKind
         self.threadId = threadId
         self.cwd = cwd
+        self.createdAt = createdAt
+        self.updatedAt = createdAt
     }
 
     var displayTitle: String {
@@ -65,6 +69,7 @@ final class ThreadRuntimeModel: Identifiable {
     }
 
     func applyCapabilities(_ caps: SessionCapabilities) {
+        markUpdated()
         self.capabilities = caps
     }
 
@@ -72,6 +77,7 @@ final class ThreadRuntimeModel: Identifiable {
     /// drain queued prompts on turn complete) so the caller can route it.
     @discardableResult
     func ingest(_ event: ServerEvent) -> RuntimeAction? {
+        markUpdated()
         unreadEventCount += 1
         switch event {
         case .sessionStarted(_, let tid, _):
@@ -125,6 +131,7 @@ final class ThreadRuntimeModel: Identifiable {
 
     @discardableResult
     func appendUserPrompt(_ prompt: String) -> String {
+        markUpdated()
         let userItem = UIItem(
             id: "user-\(UUID().uuidString)",
             lifecycle: "completed",
@@ -137,6 +144,7 @@ final class ThreadRuntimeModel: Identifiable {
     }
 
     func applyReplayTurns(_ turns: [HistoryTurn]) {
+        markUpdated()
         itemIndexById.removeAll(keepingCapacity: true)
         items.removeAll(keepingCapacity: true)
         for turn in turns {
@@ -152,6 +160,7 @@ final class ThreadRuntimeModel: Identifiable {
     /// HistoryModel decoding. Phase 7+ will replace with native v2 history
     /// once daemon serves the new HistoryResponse shape end-to-end.
     func applyReplayItems(_ replayItems: [HistoryReplayItem]) {
+        markUpdated()
         itemIndexById.removeAll(keepingCapacity: true)
         items.removeAll(keepingCapacity: true)
         for replay in replayItems {
@@ -170,6 +179,7 @@ final class ThreadRuntimeModel: Identifiable {
     }
 
     private func applyAgentItem(_ item: AgentItem) {
+        markUpdated()
         agentItemSeq += 1
         let itemId = "ai-\(agentItemSeq)"
         var store = AgentItemStore(items: items, itemIndexById: itemIndexById)
@@ -181,6 +191,7 @@ final class ThreadRuntimeModel: Identifiable {
     @discardableResult
     func materializeDeferredContent(itemId: String, content: SessionModel.DeferredContent) -> Bool {
         guard let idx = itemIndexById[itemId], items.indices.contains(idx) else { return false }
+        markUpdated()
         switch content {
         case .output:
             guard items[idx].hasDeferredOutputBuffer else { return false }
@@ -192,5 +203,15 @@ final class ThreadRuntimeModel: Identifiable {
             items[idx].hasDeferredDiffBuffer = false
         }
         return true
+    }
+
+    func adoptSessionId(_ sessionId: String) {
+        guard id != sessionId else { return }
+        id = sessionId
+        markUpdated()
+    }
+
+    private func markUpdated() {
+        updatedAt = .now
     }
 }

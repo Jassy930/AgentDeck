@@ -113,8 +113,8 @@ cargo install cargo-llvm-cov
 
 | 变更范围 | 最小验证 |
 | --- | --- |
-| Rust daemon、IPC、Codex adapter、run record、diagnostics | `cargo test`；涉及运行态再跑 `swift run AgentDeck -- --selfcheck` |
-| Swift UI、会话模型、历史回放、富文本渲染、选择/滚动行为 | `swift test` |
+| Rust daemon、IPC、Codex adapter、history list 性能、run record、diagnostics | `cargo test`；涉及运行态再跑 `swift run AgentDeck -- --selfcheck` |
+| Swift UI、会话模型、历史回放、live session 侧栏可见性、富文本渲染、选择/滚动行为 | `swift test` |
 | approval / action request / action decision | `cargo test approval`；`swift test --filter approval`；再跑完整 `cargo test`、`swift test`、`swift run AgentDeck -- --selfcheck` |
 | 诊断日志、自检、数据目录、profile、密钥脱敏 | `cargo test`；`swift run AgentDeck -- --selfcheck`；`swift run AgentDeck -- --diagnostics-report --json`；涉及 profile 时加跑 `swift run AgentDeck -- --selfcheck --profile dev` 和 `swift run AgentDeck -- --diagnostics-report --json --profile dev` |
 | 文档结构、AGENTS 入口、计划规则 | `scripts/verify-agent-docs.sh` |

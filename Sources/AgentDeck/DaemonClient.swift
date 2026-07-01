@@ -52,6 +52,7 @@ final class DaemonRouter: @unchecked Sendable {
     private let lock = NSLock()
     private let cond = NSCondition()
     private var sessionHandlers: [String: (ServerEvent) -> Void] = [:]
+    private var pendingNewSessionHandlers: [(ServerEvent) -> Void] = []
     private var globalEventHandler: ((ServerEvent) -> Void)?
     private var pendingAdminReplies: [String] = []
     private var isClosed = false
@@ -64,6 +65,12 @@ final class DaemonRouter: @unchecked Sendable {
     func registerSessionHandler(_ sessionId: String, _ handler: @escaping (ServerEvent) -> Void) {
         lock.lock()
         sessionHandlers[sessionId] = handler
+        lock.unlock()
+    }
+
+    func registerPendingNewSessionHandler(_ handler: @escaping (ServerEvent) -> Void) {
+        lock.lock()
+        pendingNewSessionHandlers.append(handler)
         lock.unlock()
     }
 
@@ -102,9 +109,22 @@ final class DaemonRouter: @unchecked Sendable {
     private func routeEvent(_ event: ServerEvent) {
         lock.lock()
         let perSession = event.sessionId.flatMap { sessionHandlers[$0] }
+        var adoptedPending: ((ServerEvent) -> Void)?
+        if perSession == nil, !pendingNewSessionHandlers.isEmpty {
+            switch event {
+            case .sessionStarted(let sessionId, _, _):
+                let handler = pendingNewSessionHandlers.removeFirst()
+                sessionHandlers[sessionId] = handler
+                adoptedPending = handler
+            case .error(nil, _):
+                adoptedPending = pendingNewSessionHandlers.removeFirst()
+            default:
+                break
+            }
+        }
         let global = globalEventHandler
         lock.unlock()
-        perSession?(event)
+        (perSession ?? adoptedPending)?(event)
         global?(event)
     }
 
@@ -349,9 +369,11 @@ extension DaemonClient: RuntimeTurnStarting {
         sessionStart: SessionStart?,
         onEvent: @escaping @MainActor (ServerEvent) -> Void
     ) {
-        setSessionEventHandler(sessionId: sessionId) { event in
+        let handler: (ServerEvent) -> Void = { event in
             DispatchQueue.main.async { onEvent(event) }
         }
+        router.registerPendingNewSessionHandler(handler)
+        setSessionEventHandler(sessionId: sessionId, handler: handler)
         do {
             if let threadId {
                 // C3 fix: propagate the original cwd so CC `--resume`
