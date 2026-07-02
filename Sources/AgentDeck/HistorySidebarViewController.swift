@@ -292,9 +292,10 @@ final class HistorySidebarViewController: NSViewController {
         let name = NSTextField(labelWithString: "Jassy")
         name.font = .systemFont(ofSize: 13, weight: .medium)
         name.textColor = DesignTokens.text
-        let plan = NSTextField(labelWithString: "Pro")
-        plan.font = .systemFont(ofSize: 11)
-        plan.textColor = DesignTokens.text2
+        // 设计系统：客户端不管理鉴权，账号栏显示身份标识而非订阅计划
+        let plan = NSTextField(labelWithString: "身份 · ad_8f3k…q2b")
+        plan.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        plan.textColor = DesignTokens.text3
         for label in [name, plan] {
             label.translatesAutoresizingMaskIntoConstraints = false
         }
