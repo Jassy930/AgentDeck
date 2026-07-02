@@ -21,7 +21,7 @@ public final class ClaudeCodeAuthStatusBadge: NSView {
     private let label: NSTextField = {
         let f = NSTextField(labelWithString: "Claude · ?")
         f.font = .systemFont(ofSize: NSFont.systemFontSize(for: .mini))
-        f.textColor = .secondaryLabelColor
+        f.textColor = DesignTokens.text2
         f.translatesAutoresizingMaskIntoConstraints = false
         return f
     }()

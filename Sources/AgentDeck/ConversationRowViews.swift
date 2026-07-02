@@ -95,7 +95,7 @@ enum ConversationRowControls {
         button.bezelStyle = .disclosure
         button.title = title
         button.font = ConversationRowMetrics.monoCaptionFont
-        button.contentTintColor = .tertiaryLabelColor
+        button.contentTintColor = DesignTokens.text3
         button.translatesAutoresizingMaskIntoConstraints = false
         return button
     }
@@ -194,9 +194,9 @@ final class UserPromptCellView: ConversationRowCellView {
     private let bubble = NSView()
     private let accentBar = NSView()
     private let youLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.captionSemiboldFont, color: .secondaryLabelColor)
+        font: ConversationRowMetrics.captionSemiboldFont, color: DesignTokens.text2)
     private let bodyLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.calloutFont, color: .labelColor)
+        font: ConversationRowMetrics.calloutFont, color: DesignTokens.text)
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -335,7 +335,7 @@ final class ReasoningCellView: ConversationRowCellView {
         streamingView.bindBuffer(
             to: row.item.textBuffer,
             font: .systemFont(ofSize: NSFont.smallSystemFontSize),
-            color: .secondaryLabelColor
+            color: DesignTokens.text2
         )
         // Default-collapsed; auto-expand while the selected turn is running
         // (mirrors `model.shouldShowReasoningExpanded`).
@@ -349,13 +349,13 @@ final class ReasoningCellView: ConversationRowCellView {
 /// collapsible output, and red exit-code line when non-zero.
 final class ShellCellView: ConversationRowCellView {
     private let commandLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.monoCalloutFont, color: .labelColor)
+        font: ConversationRowMetrics.monoCalloutFont, color: DesignTokens.text)
     private let metadataLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.monoCaptionFont, color: .tertiaryLabelColor)
+        font: ConversationRowMetrics.monoCaptionFont, color: DesignTokens.text3)
     private let disclosure = ConversationRowControls.disclosureButton(title: "")
     private let outputView = StreamingTextContainerView()
     private let exitLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.monoCaptionFont, color: .systemRed)
+        font: ConversationRowMetrics.monoCaptionFont, color: DesignTokens.danger)
 
     private weak var model: SessionModel?
     private var itemId = ""
@@ -417,7 +417,7 @@ final class ShellCellView: ConversationRowCellView {
             outputView.bindBuffer(
                 to: item.outputBuffer,
                 font: .monospacedSystemFont(ofSize: 13, weight: .regular),
-                color: .secondaryLabelColor
+                color: DesignTokens.text2
             )
         }
         // RESTORE persisted expansion instead of hard-resetting to collapsed —
@@ -445,9 +445,9 @@ final class ShellCellView: ConversationRowCellView {
 /// + collapsible diff.
 final class FileEditCellView: ConversationRowCellView {
     private let pathLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.monoCalloutMediumFont, color: .labelColor)
+        font: ConversationRowMetrics.monoCalloutMediumFont, color: DesignTokens.text)
     private let statusLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.monoCaptionFont, color: .tertiaryLabelColor)
+        font: ConversationRowMetrics.monoCaptionFont, color: DesignTokens.text3)
     private let disclosure = ConversationRowControls.disclosureButton(title: "")
     private let diffView = StreamingTextContainerView()
 
@@ -506,7 +506,7 @@ final class FileEditCellView: ConversationRowCellView {
             diffView.bindBuffer(
                 to: item.diffBuffer,
                 font: .monospacedSystemFont(ofSize: 12, weight: .regular),
-                color: .labelColor
+                color: DesignTokens.text
             )
         }
         // RESTORE persisted expansion instead of hard-resetting to collapsed (C1).
@@ -525,11 +525,11 @@ final class FileEditCellView: ConversationRowCellView {
 /// line, and the detail rows (query / queries / url / pattern).
 final class WebSearchCellView: ConversationRowCellView {
     private let header = ConversationRowControls.label(
-        font: ConversationRowMetrics.captionSemiboldFont, color: .tertiaryLabelColor)
+        font: ConversationRowMetrics.captionSemiboldFont, color: DesignTokens.text3)
     private let queryLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.calloutFont, color: .labelColor)
+        font: ConversationRowMetrics.calloutFont, color: DesignTokens.text)
     private let detailLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.monoCaptionFont, color: .secondaryLabelColor)
+        font: ConversationRowMetrics.monoCaptionFont, color: DesignTokens.text2)
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -577,7 +577,7 @@ final class WebSearchCellView: ConversationRowCellView {
 final class ToolHeaderView: NSStackView {
     private let icon = NSImageView()
     private let titleLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.captionSemiboldFont, color: .tertiaryLabelColor)
+        font: ConversationRowMetrics.captionSemiboldFont, color: DesignTokens.text3)
 
     init(systemImage: String, title: String) {
         super.init(frame: .zero)
@@ -587,7 +587,7 @@ final class ToolHeaderView: NSStackView {
         translatesAutoresizingMaskIntoConstraints = false
         icon.translatesAutoresizingMaskIntoConstraints = false
         icon.imageScaling = .scaleProportionallyDown
-        icon.contentTintColor = .tertiaryLabelColor
+        icon.contentTintColor = DesignTokens.text3
         NSLayoutConstraint.activate([
             icon.widthAnchor.constraint(equalToConstant: 13),
             icon.heightAnchor.constraint(equalToConstant: 13),
@@ -614,7 +614,7 @@ final class ToolHeaderView: NSStackView {
 final class LabelledBlockCellView: ConversationRowCellView {
     private let header = ToolHeaderView(systemImage: "checklist", title: "")
     private let bodyLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.calloutFont, color: .labelColor)
+        font: ConversationRowMetrics.calloutFont, color: DesignTokens.text)
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -680,11 +680,11 @@ final class HookPromptCellView: ConversationRowCellView {
         let contentW = contentWidth(forRowWidth: width)
         for fragment in row.item.fragments {
             let runId = ConversationRowControls.label(
-                font: ConversationRowMetrics.monoCaptionFont, color: .tertiaryLabelColor)
+                font: ConversationRowMetrics.monoCaptionFont, color: DesignTokens.text3)
             runId.stringValue = fragment.hookRunId
             runId.preferredMaxLayoutWidth = contentW
             let body = ConversationRowControls.label(
-                font: ConversationRowMetrics.calloutFont, color: .labelColor)
+                font: ConversationRowMetrics.calloutFont, color: DesignTokens.text)
             body.stringValue = fragment.text
             body.preferredMaxLayoutWidth = contentW
             let column = NSStackView(views: [runId, body])
@@ -702,11 +702,11 @@ final class HookPromptCellView: ConversationRowCellView {
 final class ToolCallCellView: ConversationRowCellView {
     private let header = ToolHeaderView(systemImage: "wrench.and.screwdriver", title: "Tool call")
     private let nameLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.monoCalloutMediumFont, color: .labelColor)
+        font: ConversationRowMetrics.monoCalloutMediumFont, color: DesignTokens.text)
     private let metadataLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.monoCaptionFont, color: .tertiaryLabelColor)
+        font: ConversationRowMetrics.monoCaptionFont, color: DesignTokens.text3)
     private let payloadLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.monoCaptionFont, color: .secondaryLabelColor)
+        font: ConversationRowMetrics.monoCaptionFont, color: DesignTokens.text2)
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -754,11 +754,11 @@ final class ToolCallCellView: ConversationRowCellView {
 final class CollabAgentCellView: ConversationRowCellView {
     private let header = ToolHeaderView(systemImage: "person.2", title: "Subagent")
     private let metadataLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.monoCaptionFont, color: .tertiaryLabelColor)
+        font: ConversationRowMetrics.monoCaptionFont, color: DesignTokens.text3)
     private let promptLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.calloutFont, color: .labelColor)
+        font: ConversationRowMetrics.calloutFont, color: DesignTokens.text)
     private let receiversLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.monoCaptionFont, color: .secondaryLabelColor)
+        font: ConversationRowMetrics.monoCaptionFont, color: DesignTokens.text2)
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -807,9 +807,9 @@ final class MediaCellView: ConversationRowCellView {
     private let header = ToolHeaderView(systemImage: "photo", title: "Image")
     private let previewImageView = NSImageView()
     private let metadataLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.monoCaptionFont, color: .tertiaryLabelColor)
+        font: ConversationRowMetrics.monoCaptionFont, color: DesignTokens.text3)
     private let revisedLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.monoCaptionFont, color: .secondaryLabelColor)
+        font: ConversationRowMetrics.monoCaptionFont, color: DesignTokens.text2)
     private var imageHeightConstraint: NSLayoutConstraint?
 
     nonisolated static let maxImageWidth: CGFloat = 420
@@ -911,7 +911,7 @@ final class RawCellView: ConversationRowCellView {
     override var verticalPadding: CGFloat { 8 }
 
     private let bodyLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.calloutFont, color: .tertiaryLabelColor)
+        font: ConversationRowMetrics.calloutFont, color: DesignTokens.text3)
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -978,7 +978,7 @@ class BannerCellView: ConversationRowCellView {
 
 /// Ports `errorRow`: red triangle glyph + red callout message.
 final class ErrorCellView: BannerCellView {
-    init() { super.init(tint: .systemRed) }
+    init() { super.init(tint: DesignTokens.danger) }
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     override func configure(row: ConversationDisplayRow, width: CGFloat, model: SessionModel) {
@@ -988,7 +988,7 @@ final class ErrorCellView: BannerCellView {
 
 /// Ports `warningRow`: orange triangle + orange callout.
 final class WarningCellView: BannerCellView {
-    init() { super.init(tint: .systemOrange) }
+    init() { super.init(tint: DesignTokens.accent) }
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     override func configure(row: ConversationDisplayRow, width: CGFloat, model: SessionModel) {

@@ -251,7 +251,7 @@ final class StreamingTextContainerView: NSView {
     private func currentAttributes() -> [NSAttributedString.Key: Any] {
         [
             .font: textView.font ?? NSFont.systemFont(ofSize: NSFont.systemFontSize),
-            .foregroundColor: textView.textColor ?? NSColor.labelColor,
+            .foregroundColor: textView.textColor ?? DesignTokens.text,
         ]
     }
 

@@ -27,9 +27,9 @@ public final class CodexApprovalPanel: NSView {
         _ = capabilities  // 保留参数以支持后续 caps-aware 渲染（暂不使用）
 
         policyLabel.font = .systemFont(ofSize: NSFont.systemFontSize(for: .small) + 1)
-        policyLabel.textColor = .secondaryLabelColor
+        policyLabel.textColor = DesignTokens.text2
         sandboxLabel.font = .systemFont(ofSize: NSFont.systemFontSize(for: .small) + 1)
-        sandboxLabel.textColor = .secondaryLabelColor
+        sandboxLabel.textColor = DesignTokens.text2
 
         policyLabel.stringValue = "Policy: \(approvalPolicy.rawValue)"
         sandboxLabel.stringValue = "Sandbox: \(sandbox.rawValue)"

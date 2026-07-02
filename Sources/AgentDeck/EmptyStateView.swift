@@ -39,7 +39,7 @@ final class EmptyStateView: NSView {
         let titleLabel = NSTextField(labelWithString: "我们应该在 AgentDeck 中构建什么？")
         titleLabel.font = .systemFont(ofSize: 24, weight: .semibold)
         titleLabel.alignment = .center
-        titleLabel.textColor = .labelColor
+        titleLabel.textColor = DesignTokens.text
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
 
         let composer = NSView()
@@ -49,7 +49,7 @@ final class EmptyStateView: NSView {
 
         let promptLabel = NSTextField(wrappingLabelWithString: "选择一个项目目录后，AgentDeck 会在这里开始新的 Codex / Claude Code 会话。")
         promptLabel.font = .systemFont(ofSize: 13, weight: .medium)
-        promptLabel.textColor = .secondaryLabelColor
+        promptLabel.textColor = DesignTokens.text2
         promptLabel.translatesAutoresizingMaskIntoConstraints = false
 
         let plusButton = iconButton("plus", tooltip: "选择项目目录")
@@ -67,14 +67,14 @@ final class EmptyStateView: NSView {
         refreshButton.bezelStyle = .inline
         refreshButton.isBordered = false
         refreshButton.font = .systemFont(ofSize: 13, weight: .medium)
-        refreshButton.contentTintColor = .secondaryLabelColor
+        refreshButton.contentTintColor = DesignTokens.text2
         refreshButton.translatesAutoresizingMaskIntoConstraints = false
 
         let sendButton = iconButton("arrow.up", tooltip: "开始")
         sendButton.target = self
         sendButton.action = #selector(pickDirectory)
         sendButton.wantsLayer = true
-        sendButton.layer?.backgroundColor = NSColor.labelColor.cgColor
+        sendButton.layer?.backgroundColor = DesignTokens.text.cgColor
         sendButton.layer?.cornerRadius = 15
 
         let spacer = NSView()
@@ -141,7 +141,7 @@ final class EmptyStateView: NSView {
         button.toolTip = tooltip
         button.bezelStyle = .inline
         button.isBordered = false
-        button.contentTintColor = .secondaryLabelColor
+        button.contentTintColor = DesignTokens.text2
         button.translatesAutoresizingMaskIntoConstraints = false
         return button
     }
@@ -153,14 +153,14 @@ final class EmptyStateView: NSView {
         card.layer?.backgroundColor = CodexDesktopChrome.cardBackground.cgColor
 
         let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil) ?? NSImage())
-        icon.contentTintColor = .secondaryLabelColor
+        icon.contentTintColor = DesignTokens.text2
         icon.translatesAutoresizingMaskIntoConstraints = false
         let titleLabel = NSTextField(labelWithString: title)
         titleLabel.font = .systemFont(ofSize: 13, weight: .medium)
-        titleLabel.textColor = .labelColor
+        titleLabel.textColor = DesignTokens.text
         let subtitleLabel = NSTextField(labelWithString: subtitle)
         subtitleLabel.font = .systemFont(ofSize: 12)
-        subtitleLabel.textColor = .secondaryLabelColor
+        subtitleLabel.textColor = DesignTokens.text2
         for label in [titleLabel, subtitleLabel] {
             label.lineBreakMode = .byTruncatingTail
             label.translatesAutoresizingMaskIntoConstraints = false
@@ -191,14 +191,14 @@ final class EmptyStateView: NSView {
         CodexDesktopChrome.roundedPanel(panel, radius: 18)
 
         let icon = NSImageView(image: NSImage(systemSymbolName: "seal", accessibilityDescription: nil) ?? NSImage())
-        icon.contentTintColor = .secondaryLabelColor
+        icon.contentTintColor = DesignTokens.text2
         icon.translatesAutoresizingMaskIntoConstraints = false
         let title = NSTextField(labelWithString: "你有新的速率限制重置机会")
         title.font = .systemFont(ofSize: 13, weight: .semibold)
-        title.textColor = .labelColor
+        title.textColor = DesignTokens.text
         let subtitle = NSTextField(labelWithString: "你已获得一次速率限制重置机会，将于 30 天后失效。")
         subtitle.font = .systemFont(ofSize: 12)
-        subtitle.textColor = .secondaryLabelColor
+        subtitle.textColor = DesignTokens.text2
         for label in [title, subtitle] {
             label.translatesAutoresizingMaskIntoConstraints = false
         }

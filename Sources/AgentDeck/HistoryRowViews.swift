@@ -26,7 +26,7 @@ final class HistoryGroupRowView: NSView {
     private func setup() {
         // Project name label
         nameLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
-        nameLabel.textColor = .secondaryLabelColor
+        nameLabel.textColor = DesignTokens.text2
         nameLabel.lineBreakMode = .byTruncatingMiddle
         nameLabel.maximumNumberOfLines = 1
         nameLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -39,7 +39,7 @@ final class HistoryGroupRowView: NSView {
         addButton.image?.size = NSSize(width: 11, height: 11)
         addButton.bezelStyle = .inline
         addButton.isBordered = false
-        addButton.contentTintColor = .secondaryLabelColor
+        addButton.contentTintColor = DesignTokens.text2
         addButton.target = self
         addButton.action = #selector(handleAdd)
         addButton.translatesAutoresizingMaskIntoConstraints = false
@@ -114,7 +114,7 @@ final class HistoryThreadRowView: NSView {
 
         // Title label
         titleLabel.font = .systemFont(ofSize: NSFont.systemFontSize)
-        titleLabel.textColor = .secondaryLabelColor
+        titleLabel.textColor = DesignTokens.text2
         titleLabel.lineBreakMode = .byWordWrapping
         titleLabel.maximumNumberOfLines = 2
         titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -123,7 +123,7 @@ final class HistoryThreadRowView: NSView {
 
         // Meta label (status / source / date)
         metaLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize - 1)
-        metaLabel.textColor = .tertiaryLabelColor
+        metaLabel.textColor = DesignTokens.text3
         metaLabel.lineBreakMode = .byTruncatingTail
         metaLabel.maximumNumberOfLines = 1
         metaLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -178,7 +178,7 @@ final class HistoryThreadRowView: NSView {
         // Title
         let fontWeight: NSFont.Weight = presentation.isEmphasized ? .medium : .regular
         titleLabel.font = .systemFont(ofSize: NSFont.systemFontSize, weight: fontWeight)
-        titleLabel.textColor = presentation.isEmphasized ? .labelColor : .secondaryLabelColor
+        titleLabel.textColor = presentation.isEmphasized ? DesignTokens.text : DesignTokens.text2
         titleLabel.stringValue = thread.displayTitle
 
         // Meta line: status · runtimeStatus · date
@@ -224,7 +224,7 @@ final class HistoryThreadRowView: NSView {
     private static func accentBarColor(_ p: HistoryThreadRowPresentation) -> NSColor {
         switch p.visualState {
         case .opening, .selected: return .controlAccentColor
-        case .hovered:            return .tertiaryLabelColor
+        case .hovered:            return DesignTokens.text3
         case .idle:               return .clear
         }
     }
@@ -233,9 +233,9 @@ final class HistoryThreadRowView: NSView {
         if p.hasUnreadIndicator { return .controlAccentColor }
         switch p.runtimePhase {
         case .running, .starting: return .controlAccentColor
-        case .waitingApproval:    return .systemOrange
-        case .failed:             return .systemRed
-        case .some:               return .tertiaryLabelColor
+        case .waitingApproval:    return DesignTokens.accent
+        case .failed:             return DesignTokens.danger
+        case .some:               return DesignTokens.text3
         case .none:               return .clear
         }
     }

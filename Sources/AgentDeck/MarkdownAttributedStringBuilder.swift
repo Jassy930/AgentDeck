@@ -11,8 +11,8 @@ struct MarkdownStyle {
         MarkdownStyle(
             bodyFont: .systemFont(ofSize: NSFont.systemFontSize),
             codeFont: .monospacedSystemFont(ofSize: NSFont.systemFontSize - 1, weight: .regular),
-            textColor: .labelColor,
-            codeBackground: .quaternaryLabelColor,
+            textColor: DesignTokens.text,
+            codeBackground: DesignTokens.text3,
             linkColor: .linkColor
         )
     }

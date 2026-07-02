@@ -16,7 +16,7 @@ public final class ClaudeCodeControlsView: NSView {
     private let planBadge: NSTextField = {
         let f = NSTextField(labelWithString: "Plan Mode")
         f.font = .systemFont(ofSize: NSFont.systemFontSize(for: .mini), weight: .medium)
-        f.textColor = .systemBlue
+        f.textColor = DesignTokens.info
         f.isBezeled = false
         f.drawsBackground = false
         f.isHidden = true

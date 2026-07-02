@@ -26,7 +26,7 @@ final class ApprovalCardView: NSView {
     private let titleLabel: NSTextField = {
         let field = NSTextField(labelWithString: "")
         field.font = ConversationRowMetrics.calloutMediumFont
-        field.textColor = .labelColor
+        field.textColor = DesignTokens.text
         field.lineBreakMode = .byTruncatingTail
         field.translatesAutoresizingMaskIntoConstraints = false
         field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -35,7 +35,7 @@ final class ApprovalCardView: NSView {
     private let detailLabel: NSTextField = {
         let field = NSTextField(labelWithString: "")
         field.font = ConversationRowMetrics.monoCalloutFont
-        field.textColor = .secondaryLabelColor
+        field.textColor = DesignTokens.text2
         field.lineBreakMode = .byWordWrapping
         field.maximumNumberOfLines = 0
         field.isSelectable = true
@@ -77,7 +77,7 @@ final class ApprovalCardView: NSView {
 
         icon.translatesAutoresizingMaskIntoConstraints = false
         icon.image = NSImage(systemSymbolName: "hand.raised.fill", accessibilityDescription: nil)
-        icon.contentTintColor = .systemOrange
+        icon.contentTintColor = DesignTokens.accent
         icon.imageScaling = .scaleProportionallyDown
 
         denyButton.target = self

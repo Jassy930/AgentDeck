@@ -14,7 +14,7 @@ public final class AgentTokenAuthMiniPanel: NSView {
     private let tokenLabel: NSTextField = {
         let f = NSTextField(labelWithString: "tokens: -")
         f.font = .systemFont(ofSize: NSFont.systemFontSize(for: .mini))
-        f.textColor = .tertiaryLabelColor
+        f.textColor = DesignTokens.text3
         return f
     }()
     private let authView: NSView
@@ -26,7 +26,7 @@ public final class AgentTokenAuthMiniPanel: NSView {
         case .codex:
             let codexLabel = NSTextField(labelWithString: "Codex · auth")
             codexLabel.font = .systemFont(ofSize: NSFont.systemFontSize(for: .mini))
-            codexLabel.textColor = .secondaryLabelColor
+            codexLabel.textColor = DesignTokens.text2
             authView = codexLabel
             claudeBadge = nil
         case .claudeCode:

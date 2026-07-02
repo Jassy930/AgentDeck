@@ -32,7 +32,7 @@ final class InputBarView: NSView {
     private let queuedLabel: NSTextField = {
         let field = NSTextField(labelWithString: "")
         field.font = ConversationRowMetrics.captionFont
-        field.textColor = .tertiaryLabelColor
+        field.textColor = DesignTokens.text3
         field.translatesAutoresizingMaskIntoConstraints = false
         field.setContentHuggingPriority(.required, for: .horizontal)
         field.setContentCompressionResistancePriority(.required, for: .horizontal)
@@ -44,7 +44,7 @@ final class InputBarView: NSView {
     private let planModeBadge: NSTextField = {
         let field = NSTextField(labelWithString: "Plan Mode")
         field.font = ConversationRowMetrics.captionFont
-        field.textColor = .systemBlue
+        field.textColor = DesignTokens.info
         field.translatesAutoresizingMaskIntoConstraints = false
         field.isHidden = true
         field.setContentHuggingPriority(.required, for: .horizontal)
@@ -62,7 +62,7 @@ final class InputBarView: NSView {
     private let effortBadge: NSTextField = {
         let field = NSTextField(labelWithString: "5.5 超高⌄")
         field.font = ConversationRowMetrics.captionFont
-        field.textColor = .secondaryLabelColor
+        field.textColor = DesignTokens.text2
         field.translatesAutoresizingMaskIntoConstraints = false
         field.setContentHuggingPriority(.required, for: .horizontal)
         return field
@@ -107,7 +107,7 @@ final class InputBarView: NSView {
         textView.onTextChange = { [weak self] in self?.textDidChange() }
         textView.isRichText = false
         textView.font = ConversationRowMetrics.calloutFont
-        textView.textColor = .labelColor
+        textView.textColor = DesignTokens.text
         textView.drawsBackground = false
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
@@ -130,14 +130,14 @@ final class InputBarView: NSView {
         attachButton.toolTip = "添加上下文"
         attachButton.bezelStyle = .inline
         attachButton.isBordered = false
-        attachButton.contentTintColor = .secondaryLabelColor
+        attachButton.contentTintColor = DesignTokens.text2
         attachButton.translatesAutoresizingMaskIntoConstraints = false
 
         microphoneButton.image = NSImage(systemSymbolName: "mic", accessibilityDescription: "语音输入")
         microphoneButton.toolTip = "语音输入"
         microphoneButton.bezelStyle = .inline
         microphoneButton.isBordered = false
-        microphoneButton.contentTintColor = .secondaryLabelColor
+        microphoneButton.contentTintColor = DesignTokens.text2
         microphoneButton.translatesAutoresizingMaskIntoConstraints = false
 
         sendButton.image = NSImage(systemSymbolName: "arrow.up", accessibilityDescription: "发送")
@@ -148,7 +148,7 @@ final class InputBarView: NSView {
         sendButton.translatesAutoresizingMaskIntoConstraints = false
         sendButton.setContentHuggingPriority(.required, for: .horizontal)
         sendButton.wantsLayer = true
-        sendButton.layer?.backgroundColor = NSColor.labelColor.cgColor
+        sendButton.layer?.backgroundColor = DesignTokens.text.cgColor
         sendButton.layer?.cornerRadius = 15
 
         addSubview(composerChrome)

@@ -23,7 +23,7 @@ final class HistorySidebarViewController: NSViewController {
     private let headerLabel: NSTextField = {
         let label = NSTextField(labelWithString: "项目")
         label.font = .systemFont(ofSize: 12, weight: .medium)
-        label.textColor = .secondaryLabelColor
+        label.textColor = DesignTokens.text2
         label.translatesAutoresizingMaskIntoConstraints = false
         return label
     }()
@@ -74,7 +74,7 @@ final class HistorySidebarViewController: NSViewController {
     private let errorLabel: NSTextField = {
         let label = NSTextField(wrappingLabelWithString: "")
         label.font = .systemFont(ofSize: NSFont.smallSystemFontSize - 1)
-        label.textColor = .systemRed
+        label.textColor = DesignTokens.danger
         label.isSelectable = true
         label.isHidden = true
         label.translatesAutoresizingMaskIntoConstraints = false
@@ -85,7 +85,7 @@ final class HistorySidebarViewController: NSViewController {
     private let emptyStateLabel: NSTextField = {
         let label = NSTextField(wrappingLabelWithString: "暂无历史\n刷新以扫描已持久化的 agent 会话。")
         label.font = .systemFont(ofSize: NSFont.systemFontSize)
-        label.textColor = .secondaryLabelColor
+        label.textColor = DesignTokens.text2
         label.isHidden = true
         label.translatesAutoresizingMaskIntoConstraints = false
         return label
@@ -246,11 +246,11 @@ final class HistorySidebarViewController: NSViewController {
         ]
         let views = actions.map { symbol, title in
             let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil) ?? NSImage())
-            icon.contentTintColor = .secondaryLabelColor
+            icon.contentTintColor = DesignTokens.text2
             icon.translatesAutoresizingMaskIntoConstraints = false
             let label = NSTextField(labelWithString: title)
             label.font = .systemFont(ofSize: 13, weight: .medium)
-            label.textColor = .labelColor
+            label.textColor = DesignTokens.text
             label.translatesAutoresizingMaskIntoConstraints = false
             let row = NSStackView(views: [icon, label])
             row.orientation = .horizontal
@@ -276,7 +276,7 @@ final class HistorySidebarViewController: NSViewController {
         let footer = NSView()
         footer.translatesAutoresizingMaskIntoConstraints = false
         footer.wantsLayer = true
-        footer.layer?.backgroundColor = NSColor(calibratedRed: 0.24, green: 0.25, blue: 0.25, alpha: 0.7).cgColor
+        footer.layer?.backgroundColor = DesignTokens.surface2.withAlphaComponent(0.7).cgColor
         footer.layer?.cornerRadius = 8
         footer.layer?.cornerCurve = .continuous
 
@@ -286,15 +286,15 @@ final class HistorySidebarViewController: NSViewController {
         avatar.alignment = .center
         avatar.translatesAutoresizingMaskIntoConstraints = false
         avatar.wantsLayer = true
-        avatar.layer?.backgroundColor = NSColor.systemBlue.cgColor
+        avatar.layer?.backgroundColor = DesignTokens.info.cgColor
         avatar.layer?.cornerRadius = 14
 
         let name = NSTextField(labelWithString: "Jassy")
         name.font = .systemFont(ofSize: 13, weight: .medium)
-        name.textColor = .labelColor
+        name.textColor = DesignTokens.text
         let plan = NSTextField(labelWithString: "Pro")
         plan.font = .systemFont(ofSize: 11)
-        plan.textColor = .secondaryLabelColor
+        plan.textColor = DesignTokens.text2
         for label in [name, plan] {
             label.translatesAutoresizingMaskIntoConstraints = false
         }

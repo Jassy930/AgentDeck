@@ -1,18 +1,20 @@
 import AppKit
 
+// 视觉 token 统一走 DesignTokens（由设计系统 SSOT 生成）。此处仅做语义别名，
+// 保持既有调用点 API 不变，同时让全 App 配色对齐设计系统 codex 主题。
 enum CodexDesktopChrome {
-    static let windowBackground = NSColor(calibratedRed: 0.075, green: 0.075, blue: 0.075, alpha: 1)
-    static let sidebarBackground = NSColor(calibratedRed: 0.17, green: 0.18, blue: 0.18, alpha: 0.92)
-    static let sidebarTopTint = NSColor(calibratedRed: 0.08, green: 0.25, blue: 0.17, alpha: 0.38)
-    static let panelBackground = NSColor(calibratedRed: 0.18, green: 0.18, blue: 0.18, alpha: 1)
-    static let panelHoverBackground = NSColor(calibratedRed: 0.235, green: 0.235, blue: 0.235, alpha: 1)
-    static let cardBackground = NSColor(calibratedRed: 0.105, green: 0.105, blue: 0.105, alpha: 1)
-    static let border = NSColor(calibratedRed: 0.245, green: 0.245, blue: 0.245, alpha: 1)
-    static let separator = NSColor(calibratedRed: 0.165, green: 0.165, blue: 0.165, alpha: 1)
-    static let orange = NSColor(calibratedRed: 1.0, green: 0.49, blue: 0.18, alpha: 1)
+    static let windowBackground = DesignTokens.bg
+    static let sidebarBackground = DesignTokens.sidebarBg
+    static let sidebarTopTint = NSColor(srgbRed: 0.08, green: 0.25, blue: 0.17, alpha: 0.30)
+    static let panelBackground = DesignTokens.surface
+    static let panelHoverBackground = DesignTokens.surface2
+    static let cardBackground = DesignTokens.surface
+    static let border = DesignTokens.border
+    static let separator = DesignTokens.separator
+    static let orange = DesignTokens.accent
 
     @MainActor
-    static func roundedPanel(_ view: NSView, radius: CGFloat, border: Bool = true) {
+    static func roundedPanel(_ view: NSView, radius: CGFloat, border: Bool = true, shadow: Bool = false) {
         view.wantsLayer = true
         view.layer?.backgroundColor = panelBackground.cgColor
         view.layer?.cornerRadius = radius
@@ -20,6 +22,13 @@ enum CodexDesktopChrome {
         if border {
             view.layer?.borderWidth = 1
             view.layer?.borderColor = CodexDesktopChrome.border.cgColor
+        }
+        if shadow {
+            view.layer?.shadowColor = DesignTokens.panelShadowColor.cgColor
+            view.layer?.shadowOpacity = 1
+            view.layer?.shadowRadius = DesignTokens.panelShadowBlur / 2
+            view.layer?.shadowOffset = DesignTokens.panelShadowOffset
+            view.layer?.masksToBounds = false
         }
     }
 }
@@ -32,7 +41,7 @@ final class CodexContentHeaderView: NSView {
     private let titleLabel: NSTextField = {
         let label = NSTextField(labelWithString: "AgentDeck")
         label.font = .systemFont(ofSize: 14, weight: .semibold)
-        label.textColor = .labelColor
+        label.textColor = DesignTokens.text
         label.lineBreakMode = .byTruncatingTail
         label.translatesAutoresizingMaskIntoConstraints = false
         return label
@@ -65,12 +74,12 @@ final class CodexContentHeaderView: NSView {
         moreButton.bezelStyle = .inline
         moreButton.isBordered = false
         moreButton.font = .systemFont(ofSize: 15, weight: .semibold)
-        moreButton.contentTintColor = .secondaryLabelColor
+        moreButton.contentTintColor = DesignTokens.text2
         moreButton.translatesAutoresizingMaskIntoConstraints = false
 
         openLocationButton.bezelStyle = .rounded
         openLocationButton.font = .systemFont(ofSize: NSFont.systemFontSize(for: .small), weight: .medium)
-        openLocationButton.contentTintColor = .labelColor
+        openLocationButton.contentTintColor = DesignTokens.text
         openLocationButton.translatesAutoresizingMaskIntoConstraints = false
 
         controlsButton.image = NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: "界面选项")
@@ -153,13 +162,13 @@ final class CodexEnvironmentPanelView: NSView {
 
     private func build() {
         translatesAutoresizingMaskIntoConstraints = false
-        CodexDesktopChrome.roundedPanel(self, radius: 18)
+        CodexDesktopChrome.roundedPanel(self, radius: 18, shadow: true)
 
-        let title = label("环境信息", size: 13, weight: .medium, color: .secondaryLabelColor)
+        let title = label("环境信息", size: 13, weight: .medium, color: DesignTokens.text2)
         let add = symbolButton("plus", tooltip: "添加环境信息")
         let titleRow = row([title, spacer(), add], spacing: 8)
 
-        let changes = metricRow(symbol: "plusminus.square", title: "变更", trailing: "+0 -0", trailingColor: .secondaryLabelColor)
+        let changes = metricRow(symbol: "plusminus.square", title: "变更", trailing: "+0 -0", trailingColor: DesignTokens.text2)
         let local = metricRow(symbol: "laptopcomputer", title: "本地⌄", trailing: nil)
         let branch = metricRow(symbol: "point.3.connected.trianglepath.dotted", title: "master⌄", trailing: nil)
         let push = metricRow(symbol: "icloud.and.arrow.up", title: "提交或推送", trailing: nil)
@@ -168,8 +177,8 @@ final class CodexEnvironmentPanelView: NSView {
         divider.boxType = .separator
         divider.translatesAutoresizingMaskIntoConstraints = false
 
-        let sourceTitle = label("来源", size: 13, weight: .regular, color: .secondaryLabelColor)
-        let sourceEmpty = label("暂无来源", size: 13, weight: .regular, color: .tertiaryLabelColor)
+        let sourceTitle = label("来源", size: 13, weight: .regular, color: DesignTokens.text2)
+        let sourceEmpty = label("暂无来源", size: 13, weight: .regular, color: DesignTokens.text3)
 
         let stack = NSStackView(views: [titleRow, changes, local, branch, push, divider, sourceTitle, sourceEmpty])
         stack.orientation = .vertical
@@ -188,11 +197,11 @@ final class CodexEnvironmentPanelView: NSView {
         ])
     }
 
-    private func metricRow(symbol: String, title: String, trailing: String?, trailingColor: NSColor = .labelColor) -> NSView {
+    private func metricRow(symbol: String, title: String, trailing: String?, trailingColor: NSColor = DesignTokens.text) -> NSView {
         let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil) ?? NSImage())
-        icon.contentTintColor = .secondaryLabelColor
+        icon.contentTintColor = DesignTokens.text2
         icon.translatesAutoresizingMaskIntoConstraints = false
-        let titleLabel = label(title, size: 13, weight: .medium, color: .labelColor)
+        let titleLabel = label(title, size: 13, weight: .medium, color: DesignTokens.text)
         var views: [NSView] = [icon, titleLabel, spacer()]
         if let trailing {
             views.append(label(trailing, size: 13, weight: .semibold, color: trailingColor))
@@ -219,7 +228,7 @@ final class CodexEnvironmentPanelView: NSView {
         button.toolTip = tooltip
         button.bezelStyle = .inline
         button.isBordered = false
-        button.contentTintColor = .secondaryLabelColor
+        button.contentTintColor = DesignTokens.text2
         button.translatesAutoresizingMaskIntoConstraints = false
         return button
     }

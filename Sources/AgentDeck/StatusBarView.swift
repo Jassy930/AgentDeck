@@ -61,7 +61,7 @@ final class StatusBarView: NSView {
     private let statusLabel: NSTextField = {
         let f = NSTextField(labelWithString: "")
         f.font = .systemFont(ofSize: NSFont.systemFontSize(for: .small) + 1)
-        f.textColor = .secondaryLabelColor
+        f.textColor = DesignTokens.text2
         f.lineBreakMode = .byTruncatingTail
         return f
     }()
@@ -69,7 +69,7 @@ final class StatusBarView: NSView {
     private let historyBadge: NSTextField = {
         let f = NSTextField(labelWithString: "Restored history")
         f.font = .systemFont(ofSize: NSFont.systemFontSize(for: .mini))
-        f.textColor = .secondaryLabelColor
+        f.textColor = DesignTokens.text2
         f.isHidden = true
         return f
     }()
@@ -77,7 +77,7 @@ final class StatusBarView: NSView {
     private let historyTimingLabel: NSTextField = {
         let f = NSTextField(labelWithString: "")
         f.font = .systemFont(ofSize: NSFont.systemFontSize(for: .mini))
-        f.textColor = .tertiaryLabelColor
+        f.textColor = DesignTokens.text3
         f.isHidden = true
         return f
     }()
@@ -97,7 +97,7 @@ final class StatusBarView: NSView {
     private let projectLabel: NSTextField = {
         let f = NSTextField(labelWithString: "")
         f.font = .systemFont(ofSize: NSFont.systemFontSize(for: .small) + 1)
-        f.textColor = .tertiaryLabelColor
+        f.textColor = DesignTokens.text3
         f.lineBreakMode = .byTruncatingHead
         f.setContentHuggingPriority(.required, for: .horizontal)
         return f
@@ -230,11 +230,11 @@ final class StatusBarView: NSView {
         case .running, .starting:
             return .controlAccentColor
         case .failed:
-            return .systemRed
+            return DesignTokens.danger
         case .waitingApproval:
-            return .systemOrange
+            return DesignTokens.accent
         default:
-            return .secondaryLabelColor
+            return DesignTokens.text2
         }
     }
 

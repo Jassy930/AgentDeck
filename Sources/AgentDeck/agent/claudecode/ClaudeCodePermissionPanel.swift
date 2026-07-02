@@ -22,11 +22,11 @@ public final class ClaudeCodePermissionPanel: NSView {
 
         let modeLabel = NSTextField(labelWithString: "Permission mode: \(permissionMode.rawValue)")
         modeLabel.font = .systemFont(ofSize: NSFont.systemFontSize(for: .small) + 1)
-        modeLabel.textColor = .secondaryLabelColor
+        modeLabel.textColor = DesignTokens.text2
 
         let toolLabel = NSTextField(labelWithString: "Tool: \(toolName)")
         toolLabel.font = .systemFont(ofSize: NSFont.systemFontSize(for: .small) + 1)
-        toolLabel.textColor = .secondaryLabelColor
+        toolLabel.textColor = DesignTokens.text2
 
         let stack = NSStackView(views: [modeLabel, toolLabel])
         stack.orientation = .horizontal

@@ -93,7 +93,7 @@ public final class NewSessionDialog: NSWindowController {
 
         let promptLabel = NSTextField(labelWithString: "Prompt (optional)")
         promptLabel.font = .systemFont(ofSize: NSFont.systemFontSize(for: .small) + 1)
-        promptLabel.textColor = .secondaryLabelColor
+        promptLabel.textColor = DesignTokens.text2
 
         let buttonRow = NSStackView(views: [NSView(), cancelButton, startButton])
         buttonRow.orientation = .horizontal
