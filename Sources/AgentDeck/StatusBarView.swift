@@ -87,7 +87,7 @@ final class StatusBarView: NSView {
         b.bezelStyle = .inline
         b.isBordered = false
         b.font = .systemFont(ofSize: NSFont.systemFontSize(for: .mini))
-        b.contentTintColor = .controlAccentColor
+        b.contentTintColor = DesignTokens.accent
         b.isHidden = true
         return b
     }()
@@ -228,7 +228,7 @@ final class StatusBarView: NSView {
     private func phaseColor(for phase: SessionModel.Phase) -> NSColor {
         switch phase {
         case .running, .starting:
-            return .controlAccentColor
+            return DesignTokens.accent
         case .failed:
             return DesignTokens.danger
         case .waitingApproval:

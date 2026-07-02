@@ -45,7 +45,7 @@ final class EmptyStateView: NSView {
         let composer = NSView()
         composer.translatesAutoresizingMaskIntoConstraints = false
         composer.setAccessibilityIdentifier("codex-empty-composer")
-        CodexDesktopChrome.roundedPanel(composer, radius: 18)
+        CodexDesktopChrome.roundedPanel(composer, radius: DesignTokens.radiusLg)
 
         let promptLabel = NSTextField(wrappingLabelWithString: "选择一个项目目录后，AgentDeck 会在这里开始新的 Codex / Claude Code 会话。")
         promptLabel.font = .systemFont(ofSize: 13, weight: .medium)
@@ -149,7 +149,7 @@ final class EmptyStateView: NSView {
     private func connectorCard(symbol: String, title: String, subtitle: String) -> NSView {
         let card = NSView()
         card.translatesAutoresizingMaskIntoConstraints = false
-        CodexDesktopChrome.roundedPanel(card, radius: 10, border: true)
+        CodexDesktopChrome.roundedPanel(card, radius: DesignTokens.radiusMd, border: true)
         card.layer?.backgroundColor = CodexDesktopChrome.cardBackground.cgColor
 
         let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil) ?? NSImage())
@@ -188,7 +188,7 @@ final class EmptyStateView: NSView {
     private func resetLimitPanel() -> NSView {
         let panel = NSView()
         panel.translatesAutoresizingMaskIntoConstraints = false
-        CodexDesktopChrome.roundedPanel(panel, radius: 18)
+        CodexDesktopChrome.roundedPanel(panel, radius: DesignTokens.radiusLg)
 
         let icon = NSImageView(image: NSImage(systemSymbolName: "seal", accessibilityDescription: nil) ?? NSImage())
         icon.contentTintColor = DesignTokens.text2

@@ -162,7 +162,7 @@ final class CodexEnvironmentPanelView: NSView {
 
     private func build() {
         translatesAutoresizingMaskIntoConstraints = false
-        CodexDesktopChrome.roundedPanel(self, radius: 18, shadow: true)
+        CodexDesktopChrome.roundedPanel(self, radius: DesignTokens.radiusLg, shadow: true)
 
         let title = label("环境信息", size: 13, weight: .medium, color: DesignTokens.text2)
         let add = symbolButton("plus", tooltip: "添加环境信息")

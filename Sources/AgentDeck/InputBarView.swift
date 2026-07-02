@@ -24,7 +24,7 @@ final class InputBarView: NSView {
     private let placeholderLabel: NSTextField = {
         let field = NSTextField(labelWithString: "要求后续变更")
         field.font = ConversationRowMetrics.calloutFont
-        field.textColor = .placeholderTextColor
+        field.textColor = DesignTokens.text3
         field.translatesAutoresizingMaskIntoConstraints = false
         field.isSelectable = false
         return field
@@ -101,7 +101,7 @@ final class InputBarView: NSView {
 
         composerChrome.translatesAutoresizingMaskIntoConstraints = false
         composerChrome.setAccessibilityIdentifier("codex-composer")
-        CodexDesktopChrome.roundedPanel(composerChrome, radius: 18)
+        CodexDesktopChrome.roundedPanel(composerChrome, radius: DesignTokens.radiusLg)
 
         textView.onSubmit = { [weak self] in self?.send() }
         textView.onTextChange = { [weak self] in self?.textDidChange() }

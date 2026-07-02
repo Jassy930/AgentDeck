@@ -323,7 +323,7 @@ final class TurnJumpRailView: NSView {
 
             let color: NSColor
             if isSelected {
-                color = .controlAccentColor
+                color = DesignTokens.accent
             } else {
                 color = DesignTokens.text3
             }
@@ -342,7 +342,7 @@ final class TurnJumpRailView: NSView {
 
         // Draw "jump to latest" arrow at bottom
         let latestY = TurnJumpRailLayout.latestY(height: height)
-        let latestColor: NSColor = selectedTurnId == nil ? .controlAccentColor : DesignTokens.text2
+        let latestColor: NSColor = selectedTurnId == nil ? DesignTokens.accent : DesignTokens.text2
         let latestSize = latestIconSize()
 
         // Draw a downward-pointing chevron glyph as a simple filled triangle

@@ -115,8 +115,8 @@ final class HistoryThreadRowView: NSView {
         // Title label
         titleLabel.font = .systemFont(ofSize: NSFont.systemFontSize)
         titleLabel.textColor = DesignTokens.text2
-        titleLabel.lineBreakMode = .byWordWrapping
-        titleLabel.maximumNumberOfLines = 2
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.maximumNumberOfLines = 1
         titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         addSubview(titleLabel)
@@ -223,17 +223,17 @@ final class HistoryThreadRowView: NSView {
 
     private static func accentBarColor(_ p: HistoryThreadRowPresentation) -> NSColor {
         switch p.visualState {
-        case .opening, .selected: return .controlAccentColor
+        case .opening, .selected: return DesignTokens.accent
         case .hovered:            return DesignTokens.text3
         case .idle:               return .clear
         }
     }
 
     private static func runtimeDotColor(_ p: HistoryThreadRowPresentation) -> NSColor {
-        if p.hasUnreadIndicator { return .controlAccentColor }
+        if p.hasUnreadIndicator { return DesignTokens.accent }
         switch p.runtimePhase {
-        case .running, .starting: return .controlAccentColor
-        case .waitingApproval:    return DesignTokens.accent
+        case .running, .starting: return DesignTokens.running
+        case .waitingApproval:    return DesignTokens.warn
         case .failed:             return DesignTokens.danger
         case .some:               return DesignTokens.text3
         case .none:               return .clear

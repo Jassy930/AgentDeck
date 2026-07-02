@@ -218,7 +218,7 @@ final class UserPromptCellView: ConversationRowCellView {
         accentBar.translatesAutoresizingMaskIntoConstraints = false
         accentBar.wantsLayer = true
         accentBar.layer?.cornerRadius = 1.5
-        accentBar.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.45).cgColor
+        accentBar.layer?.backgroundColor = DesignTokens.accent.withAlphaComponent(0.45).cgColor
 
         youLabel.stringValue = "You"
 
@@ -824,7 +824,7 @@ final class MediaCellView: ConversationRowCellView {
         previewImageView.wantsLayer = true
         previewImageView.layer?.cornerRadius = 6
         previewImageView.layer?.borderWidth = 1
-        previewImageView.layer?.borderColor = NSColor.separatorColor.cgColor
+        previewImageView.layer?.borderColor = DesignTokens.separator.cgColor
         previewImageView.layer?.masksToBounds = true
         let heightConstraint = previewImageView.heightAnchor.constraint(equalToConstant: 0)
         imageHeightConstraint = heightConstraint

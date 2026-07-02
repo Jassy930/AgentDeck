@@ -70,10 +70,16 @@ final class ApprovalCardView: NSView {
 
     private func build() {
         wantsLayer = true
-        layer?.cornerRadius = 8
+        layer?.cornerRadius = DesignTokens.radiusMd
+        layer?.cornerCurve = .continuous
         layer?.borderWidth = 1
-        layer?.borderColor = NSColor.separatorColor.cgColor
-        layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        layer?.borderColor = DesignTokens.border.cgColor
+        layer?.backgroundColor = DesignTokens.surface.cgColor
+        layer?.shadowColor = DesignTokens.panelShadowColor.cgColor
+        layer?.shadowOpacity = 1
+        layer?.shadowRadius = DesignTokens.panelShadowBlur / 2
+        layer?.shadowOffset = DesignTokens.panelShadowOffset
+        layer?.masksToBounds = false
 
         icon.translatesAutoresizingMaskIntoConstraints = false
         icon.image = NSImage(systemSymbolName: "hand.raised.fill", accessibilityDescription: nil)
