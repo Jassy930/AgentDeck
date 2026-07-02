@@ -1,0 +1,18 @@
+{
+  "type": "design",
+  "designSystems": [],
+  "primaryDesignSystem": null,
+  "assets": {
+    "AgentDeck Design System": {
+      "versions": [
+        {
+          "path": "AgentDeck Design System.html",
+          "createdAt": "2026-07-01T14:33:15.230Z",
+          "status": "needs-review"
+        }
+      ]
+    }
+  },
+  "createdAt": "2026-07-01T14:33:15.230Z",
+  "updatedAt": "2026-07-01T14:33:15.230Z"
+}

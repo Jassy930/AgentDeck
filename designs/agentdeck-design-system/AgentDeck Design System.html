@@ -1,0 +1,996 @@
+<!DOCTYPE html>
+<html lang="zh" data-theme="codex">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AgentDeck 设计系统</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,600;1,6..72,400&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="tokens.css" />
+<link rel="stylesheet" href="system.css" />
+<link rel="stylesheet" href="interface.css" />
+<link rel="stylesheet" href="languages.css" />
+</head>
+<body>
+
+<!-- 图标精灵：真实 Codex / Claude Code 图标（fill=currentColor，随主题着色） -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="ic-codex" viewBox="0 0 24 24"><path fill="currentColor" clip-rule="evenodd" d="M8.086.457a6.105 6.105 0 013.046-.415c1.333.153 2.521.72 3.564 1.7a.117.117 0 00.107.029c1.408-.346 2.762-.224 4.061.366l.063.03.154.076c1.357.703 2.33 1.77 2.918 3.198.278.679.418 1.388.421 2.126a5.655 5.655 0 01-.18 1.631.167.167 0 00.04.155a5.982 5.982 0 011.578 2.891c.385 1.901-.01 3.615-1.183 5.14l-.182.22a6.063 6.063 0 01-2.934 1.851a.162.162 0 00-.108.102c-.255.736-.511 1.364-.987 1.992c-1.199 1.582-2.962 2.462-4.948 2.451c-1.583-.008-2.986-.587-4.21-1.736a.145.145 0 00-.14-.032c-.518.167-1.04.191-1.604.185a5.924 5.924 0 01-2.595-.622a6.058 6.058 0 01-2.146-1.781c-.203-.269-.404-.522-.551-.821a7.74 7.74 0 01-.495-1.283a6.11 6.11 0 01-.017-3.064a.166.166 0 00.008-.074a.115.115 0 00-.037-.064a5.958 5.958 0 01-1.38-2.202a5.196 5.196 0 01-.333-1.589a6.915 6.915 0 01.188-2.132c.45-1.484 1.309-2.648 2.577-3.493c.282-.188.55-.334.802-.438c.286-.12.573-.22.861-.304a.129.129 0 00.087-.087A6.016 6.016 0 015.635 2.31C6.315 1.464 7.132.846 8.086.457zm-.804 7.85a.848.848 0 00-1.473.842l1.694 2.965l-1.688 2.848a.849.849 0 001.46.864l1.94-3.272a.849.849 0 00.007-.854l-1.94-3.393zm5.446 6.24a.849.849 0 000 1.695h4.848a.849.849 0 000-1.696h-4.848z"></path></symbol>
+  <symbol id="ic-claude" viewBox="0 0 24 24"><path fill="currentColor" clip-rule="evenodd" d="M20.998 10.949H24v3.102h-3v3.028h-1.487V20H18v-2.921h-1.487V20H15v-2.921H9V20H7.488v-2.921H6V20H4.487v-2.921H3V14.05H0V10.95h3V5h17.998v5.949zM6 10.949h1.488V8.102H6v2.847zm10.51 0H18V8.102h-1.49v2.847z"></path></symbol>
+</svg>
+
+<!-- ==================== 顶栏 ==================== -->
+<header class="appbar">
+  <div class="brand">
+    <div class="brand__mark"><i data-lucide="layout-panel-left"></i></div>
+    <div>
+      <div class="brand__name">AgentDeck 设计系统</div>
+      <div class="brand__tag">Coding Agent 工作台 · 跨桌面 / 手机端</div>
+    </div>
+  </div>
+  <div class="appbar__spacer"></div>
+  <div class="theme-switch" role="group" aria-label="切换设计语言">
+    <button class="sw-codex" data-theme-btn="codex" aria-pressed="true"><span class="dot"></span><span>Codex</span></button>
+    <button class="sw-terminal" data-theme-btn="terminal" aria-pressed="false"><span class="dot"></span><span>Terminal</span></button>
+    <button class="sw-linear" data-theme-btn="linear" aria-pressed="false"><span class="dot"></span><span>Linear</span></button>
+    <button class="sw-warm" data-theme-btn="warm" aria-pressed="false"><span class="dot"></span><span>Warm</span></button>
+    <button class="sw-notion" data-theme-btn="notion" aria-pressed="false"><span class="dot"></span><span>Notion</span></button>
+    <button class="sw-macos" data-theme-btn="macos" aria-pressed="false"><span class="dot"></span><span>macOS</span></button>
+  </div>
+</header>
+
+<div class="shell">
+  <!-- 侧栏导航 -->
+  <nav class="sidenav">
+    <div class="sidenav__group">
+      <div class="eyebrow">设计系统</div>
+      <a href="#overview" class="active"><i data-lucide="sparkles"></i>概览</a>
+      <a href="#theming"><i data-lucide="layers-3"></i>主题与切换</a>
+      <a href="#foundations"><i data-lucide="palette"></i>基础规范</a>
+      <a href="#components"><i data-lucide="box"></i>组件库</a>
+    </div>
+    <div class="sidenav__group">
+      <div class="eyebrow">界面套件</div>
+      <a href="#desktop"><i data-lucide="monitor"></i>桌面工作台</a>
+      <a href="#mobile"><i data-lucide="smartphone"></i>移动端</a>
+    </div>
+  </nav>
+
+  <main class="content">
+
+    <!-- ==================== 概览 ==================== -->
+    <section id="overview" class="section">
+      <div class="hero">
+        <h1>为 Coding Agent 打造的<br /><span class="accent">统一工作台</span></h1>
+        <p>AgentDeck 让你在同一处观察、审批并驾驭 Codex 与 Claude Code——流式的思考、命令与文件变更，从桌面延伸到手中。这套设计系统提供一个统一的信息架构，六种设计语言可一键切换。</p>
+        <div class="hero__meta">
+          <div class="k"><b>6</b><span>设计语言</span></div>
+          <div class="k"><b>2</b><span>平台形态</span></div>
+          <div class="k"><b>1</b><span>语义 Token 层</span></div>
+        </div>
+      </div>
+
+      <div class="subhead"><h3>六种设计语言</h3><span class="eyebrow">点击卡片即可切换</span></div>
+      <div class="styleslist">
+        <div class="stylecard" data-theme-btn="codex">
+          <div class="sw"><i style="background:#131313;border:1px solid #333"></i><i style="background:#ff7d2e"></i><i style="background:#4a9bff"></i></div>
+          <b>① Codex Desktop</b>
+          <p>主基调。近黑、极低饱和、暖橙强调，柔和 18pt 大圆角，SF 系统字体。安静、克制、贴近终端。</p>
+        </div>
+        <div class="stylecard" data-theme-btn="terminal">
+          <div class="sw"><i style="background:#070807;border:1px solid #1d251d"></i><i style="background:#4ade80"></i><i style="background:#f5b544"></i></div>
+          <b>② Terminal 终端</b>
+          <p>纯黑、全等宽字体、磷光绿、锐角与微网格。高密度、高对比，像一块开发者控制台。</p>
+        </div>
+        <div class="stylecard" data-theme-btn="linear">
+          <div class="sw"><i style="background:#0a0b0f;border:1px solid #26283a"></i><i style="background:#7c74ff"></i><i style="background:#4cd471"></i></div>
+          <b>③ Linear 精密</b>
+          <p>蓝黑基底、靛紫强调，8pt 锐利圆角、微渐变表面与细高光边。精致的现代产品感。</p>
+        </div>
+        <div class="stylecard" data-theme-btn="warm">
+          <div class="sw"><i style="background:#f4f0e7;border:1px solid #e3dbc9"></i><i style="background:#b5501f"></i><i style="background:#3f6ea5"></i></div>
+          <b>④ Warm 编辑感</b>
+          <p>暖纸白亮色主题、锈红强调、衬线标题。为日间与户外阅读而生，也是移动端的一张好牌。</p>
+        </div>
+        <div class="stylecard" data-theme-btn="notion">
+          <div class="sw"><i style="background:#ffffff;border:1px solid #e9e9e7"></i><i style="background:#2383e2"></i><i style="background:#cb7b25"></i></div>
+          <b>⑤ Notion 文档感</b>
+          <p>纯白、Notion 蓝、暖灰发丝边、极小圆角。刻意「结构全默认」——只填皮肤即成一套主题，零组件改动。</p>
+        </div>
+        <div class="stylecard" data-theme-btn="macos">
+          <div class="sw"><i style="background:#ffffff;border:1px solid #d9d9dc"></i><i style="background:#007aff"></i><i style="background:#34c759"></i></div>
+          <b>⑥ macOS 原生</b>
+          <p>系统蓝、SF 字体、系统灰、标准控件圆角与柔和系统阴影。原生感来自色/字/圆角/材质，而非奇异结构。</p>
+        </div>
+      </div>
+
+      <div class="note" style="margin-top:26px">所有界面共用一套语义 Token（<span class="mono">--surface / --accent / --warn …</span>）。切换主题只是翻转 <span class="mono">data-theme</span>，组件代码零改动——这正是跨端与多品牌可持续的关键。</div>
+    </section>
+
+    <!-- ==================== 主题与切换（接口契约）==================== -->
+    <section id="theming" class="section">
+      <div class="section__head">
+        <h2>主题与切换 · Theming</h2>
+        <p>多套设计语言如何长期共存、可维护地切换。核心原则：组件从不写 <span class="mono">if theme ==</span>，只读一组【可枚举的结构开关】；加一套新主题 = 填值，不改组件。完整契约见 <span class="mono">THEMING.md</span>。</p>
+      </div>
+
+      <div class="subhead"><h3>三层模型</h3></div>
+      <div class="spec">
+        <div class="tier">
+          <div class="tier__badge" style="background:var(--surface-2);color:var(--text-2)">L1</div>
+          <div><b>语义 / 契约层 —— 统一，永不切换</b><p>信息架构、区域拓扑、组件契约与状态、内容、交互逻辑、状态语义（running/await/fail/done 的含义）、可访问性、44pt 触控、焦点顺序。</p><span class="tag tag--vendor">统一</span></div>
+        </div>
+        <div class="tier">
+          <div class="tier__badge" style="background:var(--info-weak);color:var(--info)">L2</div>
+          <div><b>Token 层（皮肤）—— 声明式切换</b><p>颜色、字体、圆角、间距刻度、阴影、动效。纯值，安全且无限扩展。<span class="mono">tokens.css</span></p><span class="tag tag--plan">切换 · 值</span></div>
+        </div>
+        <div class="tier">
+          <div class="tier__badge" style="background:var(--accent-weak);color:var(--accent)">L3</div>
+          <div><b>结构 / 语言层 —— 可枚举开关切换</b><p>词缀、图标策略、状态形状、表面质感、composer 形态、大小写、纹理、可选插槽。<span class="mono">interface.css</span>(引擎) + <span class="mono">languages.css</span>(赋值)</p><span class="tag tag--perm">切换 · 开关</span></div>
+        </div>
+      </div>
+
+      <div class="subhead"><h3>接缝：哪些统一 / 哪些切换</h3><span class="eyebrow">「是什么」统一 · 「长什么样」切换</span></div>
+      <div class="seam">
+        <div class="seam__col unified">
+          <h4><i data-lucide="lock"></i>统一（永不随主题变）</h4>
+          <ul>
+            <li>信息架构与界面清单</li>
+            <li>区域拓扑：侧栏 + 内容 + composer + 环境面板 + 轮次导航</li>
+            <li>组件契约与状态机</li>
+            <li>状态语义（等待审批 = 等待审批）</li>
+            <li>交互逻辑、键盘模型</li>
+            <li>可访问性、≥44pt 触控、焦点顺序、reduced-motion 回退</li>
+            <li>内容与文案</li>
+          </ul>
+        </div>
+        <div class="seam__col switch">
+          <h4><i data-lucide="shuffle"></i>切换（主题通过接口填）</h4>
+          <ul>
+            <li>颜色 / 字体 / 圆角 / 间距 / 阴影 / 动效（L2）</li>
+            <li>词缀：<span class="mono">$ &nbsp;# &nbsp;&gt; &nbsp;[] &nbsp;├─ &nbsp;—</span></li>
+            <li>状态渲染：圆点 / 方块 / pill</li>
+            <li>图标策略：line / glyph / 隐藏</li>
+            <li>表面质感：浮起 / 平面 / 规线 / TUI 盒</li>
+            <li>composer 形态：卡片 / 命令行 / 编辑器</li>
+            <li>大小写、密度、背景纹理</li>
+            <li>可选插槽：命令栏 / 块光标 / byline</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="subhead"><h3>结构开关清单（节选）</h3><span class="eyebrow">有限且封闭的菜单 · 组件读它，主题填它</span></div>
+      <div class="spec">
+        <table class="knobs">
+          <thead><tr><th>开关</th><th>默认</th><th>示例值</th><th>作用</th></tr></thead>
+          <tbody>
+            <tr><td class="k">--k-title-prefix</td><td class="v">""</td><td class="v">"$ "</td><td class="d">标题前缀（Terminal）</td></tr>
+            <tr><td class="k">--k-reason-prefix</td><td class="v">""</td><td class="v">"# "</td><td class="d">推理行前缀</td></tr>
+            <tr><td class="k">--k-thread-tree</td><td class="v">""</td><td class="v">"├─ "</td><td class="d">线程树枝符</td></tr>
+            <tr><td class="k">--k-status-radius</td><td class="v">50%</td><td class="v">1px</td><td class="d">状态点：圆点 / 方块</td></tr>
+            <tr><td class="k">--k-status-chip-*</td><td class="v">透明/0</td><td class="v">pill</td><td class="d">状态芯片化（Linear）</td></tr>
+            <tr><td class="k">--k-reason-italic</td><td class="v">normal</td><td class="v">italic</td><td class="d">旁注模式（Warm）</td></tr>
+            <tr><td class="k">--k-composer-caret</td><td class="v">""</td><td class="v">"▊"</td><td class="d">命令行块光标（Terminal）</td></tr>
+            <tr><td class="k">--k-composer-slash</td><td class="v">""</td><td class="v">"/ 唤起命令"</td><td class="d">slash 提示（Linear）</td></tr>
+            <tr><td class="k">--k-icon-gutter-display</td><td class="v">flex</td><td class="v">none</td><td class="d">行首图标显隐</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="subhead"><h3>加一套新主题 = 填值，不改组件</h3></div>
+      <pre class="codeblock"><span class="c">/* tokens.css：声明皮肤 */</span>
+[data-theme=<span class="s">"notion"</span>] {
+  color-scheme: light;
+  <span class="k">--bg</span>:#fff; <span class="k">--surface</span>:#f7f6f3; <span class="k">--text</span>:#37352f; <span class="k">--accent</span>:#2383e2;
+  <span class="k">--radius-md</span>:6px; <span class="k">--font-display</span>:"…";
+}
+<span class="c">/* languages.css：从开关菜单里选（这套走极简，几乎全默认）*/</span>
+[data-theme=<span class="s">"notion"</span>] {
+  <span class="k">--k-status-radius</span>: 3px;      <span class="c">/* 圆角小方块 */</span>
+  <span class="k">--k-label-variant</span>: normal;
+}
+<span class="c">// 完成。不改任何组件，不写一条 [data-theme] .someComponent 覆盖。</span></pre>
+
+      <div class="note" style="margin-top:18px">治理原则：开关清单封闭；组件禁止写 <span class="mono">if theme ==</span>；空值零副作用；语义永远留在 L1。该契约可平移到 AppKit 的 <span class="mono">Theme</span> 值类型（token + 结构枚举），呼应 <span class="mono">CapabilityRouter</span> 无分支哲学。详见 <a href="THEMING.md">THEMING.md</a>。</div>
+
+      <div class="subhead"><h3>平台适配 · iOS / Android</h3><span class="eyebrow">统一品牌化 + 薄平台层</span></div>
+      <div class="seam">
+        <div class="seam__col unified">
+          <h4><i data-lucide="lock"></i>两端完全一致</h4>
+          <ul>
+            <li>全部内容组件：按钮/标签/状态/卡片/列表/设置行/开关/气泡/tab 内容</li>
+            <li>信息架构、交互逻辑、文案</li>
+            <li>6 套主题与结构母题</li>
+          </ul>
+        </div>
+        <div class="seam__col switch">
+          <h4><i data-lucide="smartphone"></i>仅平台适配（薄层）</h4>
+          <ul>
+            <li>安全区：刘海 + home indicator ↔ 打孔 + 手势条</li>
+            <li>状态栏高度、底部导航模糊 / 实底</li>
+            <li>返回：iOS 左滑 ↔ Android 系统返回</li>
+            <li>默认字体栈：SF ↔ Roboto（token 可切）</li>
+          </ul>
+        </div>
+      </div>
+      <div class="spec" style="margin-top:14px">
+        <table class="knobs">
+          <thead><tr><th>平台开关</th><th>iOS</th><th>Android</th><th>作用</th></tr></thead>
+          <tbody>
+            <tr><td class="k">--p-safe-top</td><td class="v">46px</td><td class="v">30px</td><td class="d">状态栏 / 安全区高度</td></tr>
+            <tr><td class="k">--p-safe-bottom</td><td class="v">22px</td><td class="v">12px</td><td class="d">底部导航余量</td></tr>
+            <tr><td class="k">--p-nav-blur</td><td class="v">12px</td><td class="v">0</td><td class="d">底部导航材质（模糊 / 实底）</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note" style="margin-top:14px">通过 <span class="mono">data-platform="ios|android"</span> 切换，与 <span class="mono">data-theme</span> 正交；内容组件零改动。本轮仅定规范，Android 设备框与专属屏后续再加。</div>
+    </section>
+
+    <!-- ==================== 基础规范 ==================== -->
+    <section id="foundations" class="section">
+      <div class="section__head">
+        <h2>基础规范 · Foundations</h2>
+        <p>颜色、字体、间距、圆角、层级与动效。切换上方主题可实时观察每一项 token 在四种设计语言下的取值。</p>
+      </div>
+
+      <div class="subhead"><h3>色板 · Palette</h3></div>
+      <div class="grid grid--2">
+        <div class="spec">
+          <div class="eyebrow" style="margin-bottom:12px">表面层级 Surfaces</div>
+          <div class="swatches">
+            <div class="swatch"><div class="swatch__chip" style="background:var(--bg)"></div><div class="swatch__cap"><b>背景</b><span>--bg</span></div></div>
+            <div class="swatch"><div class="swatch__chip" style="background:var(--surface)"></div><div class="swatch__cap"><b>卡片</b><span>--surface</span></div></div>
+            <div class="swatch"><div class="swatch__chip" style="background:var(--surface-2)"></div><div class="swatch__cap"><b>悬浮 / 面板</b><span>--surface-2</span></div></div>
+            <div class="swatch"><div class="swatch__chip" style="background:var(--surface-inset)"></div><div class="swatch__cap"><b>凹陷</b><span>--surface-inset</span></div></div>
+            <div class="swatch"><div class="swatch__chip" style="background:var(--sidebar-bg)"></div><div class="swatch__cap"><b>侧栏</b><span>--sidebar-bg</span></div></div>
+            <div class="swatch"><div class="swatch__chip" style="background:var(--border)"></div><div class="swatch__cap"><b>边框</b><span>--border</span></div></div>
+          </div>
+        </div>
+        <div class="spec">
+          <div class="eyebrow" style="margin-bottom:4px">语义色 Semantic</div>
+          <div class="semrow"><span class="dot" style="background:var(--accent)"></span><div><b>Accent</b><div class="desc">品牌 / 激活 / 主操作</div></div><span class="tok">--accent</span></div>
+          <div class="semrow"><span class="dot" style="background:var(--warn)"></span><div><b>Approval</b><div class="desc">待审批 / 权限提示</div></div><span class="tok">--warn</span></div>
+          <div class="semrow"><span class="dot" style="background:var(--running)"></span><div><b>Running</b><div class="desc">运行中 / Plan Mode</div></div><span class="tok">--running</span></div>
+          <div class="semrow"><span class="dot" style="background:var(--success)"></span><div><b>Success</b><div class="desc">完成 / 新增行</div></div><span class="tok">--success</span></div>
+          <div class="semrow"><span class="dot" style="background:var(--danger)"></span><div><b>Danger</b><div class="desc">失败 / 删除行</div></div><span class="tok">--danger</span></div>
+        </div>
+      </div>
+
+      <div class="subhead"><h3>字体 · Typography</h3><span class="eyebrow">CJK 行高 1.72 · Latin 1.45</span></div>
+      <div class="spec">
+        <div class="type-row"><div class="sample t-display-xl">写代码的是 Agent</div><div class="meta">Display XL · --font-display · 34/600</div></div>
+        <div class="type-row"><div class="sample t-display">统一的工作台</div><div class="meta">Display · 24/600</div></div>
+        <div class="type-row"><div class="sample t-title">会话标题 Session title</div><div class="meta">Title · 16/600</div></div>
+        <div class="type-row"><div class="sample t-body">正文与推理过程。把登录模块拆分为独立 service，并补齐单元测试。</div><div class="meta">Body · 14/400</div></div>
+        <div class="type-row"><div class="sample t-caption">元信息 · 2 分钟前 · main 分支</div><div class="meta">Caption · 11/400 · --text-2</div></div>
+        <div class="type-row"><div class="sample t-mono">$ rg &quot;login&quot; src/ &nbsp;·&nbsp; +128 −34</div><div class="meta">Mono · --font-mono · 12.5/400</div></div>
+      </div>
+
+      <div class="grid grid--2" style="margin-top:14px">
+        <div class="spec">
+          <div class="eyebrow" style="margin-bottom:10px">间距刻度 Spacing · 4pt 基准</div>
+          <div class="scale-row"><span class="lbl">--sp-1 · 4</span><span class="bar" style="width:4px"></span></div>
+          <div class="scale-row"><span class="lbl">--sp-2 · 8</span><span class="bar" style="width:8px"></span></div>
+          <div class="scale-row"><span class="lbl">--sp-3 · 12</span><span class="bar" style="width:12px"></span></div>
+          <div class="scale-row"><span class="lbl">--sp-4 · 16</span><span class="bar" style="width:16px"></span></div>
+          <div class="scale-row"><span class="lbl">--sp-6 · 24</span><span class="bar" style="width:24px"></span></div>
+          <div class="scale-row"><span class="lbl">--sp-8 · 32</span><span class="bar" style="width:32px"></span></div>
+        </div>
+        <div class="spec">
+          <div class="eyebrow" style="margin-bottom:12px">圆角 Radius</div>
+          <div class="radius-demo">
+            <div class="box" style="border-radius:var(--radius-sm)">sm</div>
+            <div class="box" style="border-radius:var(--radius-md)">md</div>
+            <div class="box" style="border-radius:var(--radius-lg)">lg</div>
+            <div class="box" style="border-radius:var(--radius-pill)">pill</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid grid--2" style="margin-top:14px">
+        <div class="spec">
+          <div class="eyebrow" style="margin-bottom:14px">层级 Elevation</div>
+          <div class="elev-demo">
+            <div class="card elev-1">flat</div>
+            <div class="card elev-2">panel</div>
+            <div class="card elev-3">pop</div>
+          </div>
+        </div>
+        <div class="spec">
+          <div class="eyebrow" style="margin-bottom:14px">动效 Motion · --ease</div>
+          <div class="motion-track"><div class="motion-dot"></div></div>
+          <div class="spec__meta" style="margin-top:10px">进入 220ms · cubic-bezier(.22,.61,.36,1)　运行态点用脉冲，加载用旋转环</div>
+        </div>
+      </div>
+
+      <div class="subhead"><h3>图标 · Iconography</h3></div>
+      <div class="spec">
+        <div style="display:flex;gap:26px;align-items:center;flex-wrap:wrap">
+          <div style="display:flex;flex-direction:column;align-items:center;gap:8px"><svg class="agicon" style="width:26px;height:26px;color:var(--text)"><use href="#ic-codex"/></svg><span class="spec__meta">Codex</span></div>
+          <div style="display:flex;flex-direction:column;align-items:center;gap:8px"><svg class="agicon" style="width:26px;height:26px;color:var(--text)"><use href="#ic-claude"/></svg><span class="spec__meta">Claude Code</span></div>
+          <div style="width:1px;height:40px;background:var(--separator)"></div>
+          <div style="display:flex;gap:16px;color:var(--text-2)">
+            <i data-lucide="square-pen"></i><i data-lucide="search"></i><i data-lucide="clock"></i><i data-lucide="puzzle"></i><i data-lucide="paperclip"></i><i data-lucide="mic"></i><i data-lucide="refresh-cw"></i><i data-lucide="git-branch"></i>
+          </div>
+          <div class="spec__meta" style="flex-basis:100%">Agent 图标为产品自带真实资源；UI 图标采用 Lucide（线性、细描边，贴近 SF Symbols 观感）。<b style="color:var(--warn)">替代说明</b>：原生端使用 SF Symbols，Web 展示以 Lucide 近似代替。</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== 组件库 ==================== -->
+    <section id="components" class="section">
+      <div class="section__head">
+        <h2>组件库 · Components</h2>
+        <p>从原子到复合。每个组件只消费语义 token，因此在四种设计语言下都能得到一致而恰当的呈现。</p>
+      </div>
+
+      <div class="subhead"><h3>按钮与图标按钮</h3></div>
+      <div class="spec">
+        <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
+          <button class="btn btn--primary"><i data-lucide="arrow-up"></i>发送</button>
+          <button class="btn btn--secondary">选择项目目录</button>
+          <button class="btn btn--ghost"><i data-lucide="refresh-cw"></i>刷新历史</button>
+          <button class="btn btn--text">打开位置</button>
+          <button class="btn btn--approve"><i data-lucide="check"></i>批准</button>
+          <button class="btn btn--danger"><i data-lucide="x"></i>拒绝</button>
+          <button class="btn btn--secondary" disabled>禁用</button>
+          <div style="width:1px;height:26px;background:var(--separator)"></div>
+          <span class="iconbtn"><i data-lucide="plus"></i></span>
+          <span class="iconbtn"><i data-lucide="mic"></i></span>
+          <span class="iconbtn iconbtn--send"><i data-lucide="arrow-up"></i></span>
+        </div>
+      </div>
+
+      <div class="subhead"><h3>徽章与标签</h3><span class="eyebrow">权限 · Plan Mode · Effort · 队列</span></div>
+      <div class="spec">
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+          <span class="tag tag--perm"><i data-lucide="shield"></i>workspace-write</span>
+          <span class="tag tag--plan"><i data-lucide="list-checks"></i>Plan Mode</span>
+          <span class="tag tag--effort">effort: high</span>
+          <span class="tag tag--queued"><i data-lucide="layers"></i>2 已排队</span>
+          <span class="tag tag--vendor"><svg class="agicon" style="width:12px;height:12px"><use href="#ic-codex"/></svg>Codex</span>
+          <span class="tag tag--vendor"><svg class="agicon" style="width:12px;height:12px"><use href="#ic-claude"/></svg>Claude Code</span>
+        </div>
+        <div style="display:flex;gap:22px;flex-wrap:wrap;align-items:center;margin-top:16px;padding-top:16px;border-top:1px solid var(--separator)">
+          <span class="status"><span class="sdot sdot--run"></span>运行中</span>
+          <span class="status"><span class="sdot sdot--wait"></span>等待审批</span>
+          <span class="status"><span class="sdot sdot--done"></span>已完成</span>
+          <span class="status"><span class="sdot sdot--fail"></span>失败</span>
+          <span class="status"><span class="sdot sdot--idle"></span>空闲</span>
+          <span class="status"><span class="ring"></span>加载中</span>
+        </div>
+      </div>
+
+      <div class="subhead"><h3>Composer 输入栏</h3></div>
+      <div class="spec">
+        <div class="composer" style="max-width:560px">
+          <div class="composer__input"><span class="ph">给 Agent 下达指令，或 @ 引用文件…</span></div>
+          <div class="composer__bar">
+            <span class="iconbtn"><i data-lucide="plus"></i></span>
+            <span class="tag tag--perm"><i data-lucide="shield"></i>workspace-write</span>
+            <span class="tag tag--plan"><i data-lucide="list-checks"></i>Plan</span>
+            <span class="spacer"></span>
+            <span class="tag tag--effort">high</span>
+            <span class="iconbtn"><i data-lucide="mic"></i></span>
+            <span class="iconbtn iconbtn--send"><i data-lucide="arrow-up"></i></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="subhead"><h3>卡片</h3><span class="eyebrow">审批 · 连接器 · 环境面板</span></div>
+      <div class="grid grid--2">
+        <div class="spec">
+          <div class="approval">
+            <div class="approval__head">
+              <span class="icn"><i data-lucide="shield-alert"></i></span>
+              <div style="flex:1"><b>需要批准 · 执行命令</b><div class="sub">Codex · refactor-auth</div></div>
+              <span class="tag tag--perm">workspace-write</span>
+            </div>
+            <div class="approval__body"><span class="cmt"># 将删除并重建构建产物</span><br /><span class="prompt" style="color:var(--accent)">$</span> rm -rf ./dist &amp;&amp; npm run build</div>
+            <div class="approval__foot">
+              <span class="spacer"></span>
+              <button class="btn btn--danger"><i data-lucide="x"></i>拒绝</button>
+              <button class="btn btn--approve"><i data-lucide="check"></i>批准</button>
+            </div>
+          </div>
+        </div>
+        <div class="spec">
+          <div class="envpanel">
+            <div class="envpanel__sec">
+              <span class="eyebrow">变更 Changes</span>
+              <div class="env-delta"><span class="add">+128</span><span class="del">−34</span><span class="spec__meta">3 个文件</span></div>
+            </div>
+            <div class="envpanel__sec">
+              <span class="eyebrow">Git</span>
+              <div class="env-line"><span>分支</span><span>main</span></div>
+              <div class="env-line"><span>提交</span><span>a1b2c3d</span></div>
+            </div>
+            <div class="envpanel__sec">
+              <span class="eyebrow">来源 Sources</span>
+              <div class="env-file"><i data-lucide="file-code-2" style="width:14px;height:14px"></i>auth/service.ts<span class="g"><span class="a">+64</span> <span class="d">−12</span></span></div>
+              <div class="env-file"><i data-lucide="file-code-2" style="width:14px;height:14px"></i>auth/login.ts<span class="g"><span class="a">+40</span> <span class="d">−22</span></span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div style="display:flex;gap:14px;margin-top:14px;flex-wrap:wrap">
+        <div class="connector">
+          <span class="icn"><svg class="agicon" style="width:26px;height:26px"><use href="#ic-codex"/></svg></span>
+          <b>Codex</b>
+          <div class="st"><span class="sdot sdot--done"></span>已连接</div>
+        </div>
+        <div class="connector">
+          <span class="icn"><svg class="agicon" style="width:26px;height:26px"><use href="#ic-claude"/></svg></span>
+          <b>Claude Code</b>
+          <div class="st"><span class="sdot sdot--done"></span>已连接</div>
+        </div>
+        <div class="connector">
+          <span class="icn" style="color:var(--text-3)"><i data-lucide="plus-circle" style="width:26px;height:26px"></i></span>
+          <b style="color:var(--text-2)">添加 Agent</b>
+          <div class="st"><span class="sdot sdot--idle"></span>待接入</div>
+        </div>
+      </div>
+
+      <div class="subhead"><h3>列表行</h3><span class="eyebrow">历史线程 · 项目组</span></div>
+      <div class="spec" style="max-width:360px">
+        <div class="projgroup"><i class="chev" data-lucide="chevron-down"></i><b>refactor-auth</b><span class="count">6</span><span class="add"><i data-lucide="plus" style="width:14px;height:14px"></i></span></div>
+        <div class="thread sel">
+          <div class="thread__dot"><span class="sdot sdot--run"></span></div>
+          <div class="thread__main">
+            <div class="thread__title">把登录模块拆分为独立的 service 并补齐测试</div>
+            <div class="thread__meta"><svg class="agent"><use href="#ic-codex"/></svg>运行中 · 刚刚</div>
+          </div>
+          <span class="ring" style="align-self:center"></span>
+        </div>
+        <div class="thread">
+          <div class="thread__dot"><span class="sdot sdot--wait"></span></div>
+          <div class="thread__main">
+            <div class="thread__title">修复 token 刷新的竞态条件</div>
+            <div class="thread__meta"><svg class="agent"><use href="#ic-claude"/></svg>等待审批 · 3 分钟前</div>
+          </div>
+        </div>
+        <div class="thread">
+          <div class="thread__dot"><span class="sdot sdot--done"></span></div>
+          <div class="thread__main">
+            <div class="thread__title">补充 README 的部署章节</div>
+            <div class="thread__meta"><svg class="agent"><use href="#ic-codex"/></svg>已完成 · 昨天</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="subhead"><h3>表单与控件</h3><span class="eyebrow">开关 · 分段 · 芯片 · 输入 · 头像 · 用量</span></div>
+      <div class="grid grid--2">
+        <div class="spec">
+          <div style="display:flex;gap:22px;align-items:center;flex-wrap:wrap">
+            <span class="m-toggle on"></span>
+            <span class="m-toggle"></span>
+            <span class="seg"><button class="on">50%</button><button>75%</button><button>100%</button></span>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:16px">
+            <span class="chip on">全部</span><span class="chip">运行中</span><span class="chip">待审批</span><span class="chip">已完成</span>
+          </div>
+        </div>
+        <div class="spec">
+          <div class="field"><i data-lucide="search"></i><span class="ph">搜索会话与项目</span></div>
+          <div class="field" style="margin-top:10px"><span class="ph">给分支起个名字…</span></div>
+          <div style="display:flex;gap:14px;align-items:center;margin-top:14px">
+            <span class="avatar avatar--lg">J</span><span class="avatar">J</span><span class="avatar avatar--sm">A</span>
+            <div style="flex:1"><div class="spec__meta" style="margin-bottom:5px">用量 68%</div><div class="meter"><i style="width:68%"></i></div></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="subhead"><h3>导航与菜单</h3><span class="eyebrow">Tab bar · 上下文菜单</span></div>
+      <div class="grid grid--2">
+        <div class="spec">
+          <div style="max-width:300px;border:1px solid var(--border);border-radius:14px;overflow:hidden">
+            <div class="m-tabs" style="border-top:none;background:var(--surface);backdrop-filter:none">
+              <div class="m-tab on"><i data-lucide="messages-square"></i>会话</div>
+              <div class="m-tab"><i data-lucide="clock"></i>历史</div>
+              <div class="m-tab"><i data-lucide="shield-check"></i>审批<span class="badge">1</span></div>
+              <div class="m-tab"><i data-lucide="user"></i>我的</div>
+            </div>
+          </div>
+        </div>
+        <div class="spec">
+          <div class="menu" style="max-width:210px">
+            <div class="menu__item"><i data-lucide="pencil"></i>重命名</div>
+            <div class="menu__item"><i data-lucide="archive"></i>归档</div>
+            <div class="menu__item"><i data-lucide="folder-open"></i>在 Finder 中打开</div>
+            <div class="menu__sep"></div>
+            <div class="menu__item danger"><i data-lucide="trash-2"></i>删除</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="subhead"><h3>覆盖层与反馈</h3><span class="eyebrow">Toast · 对话框 · 底部弹层 · 空状态</span></div>
+      <div class="grid grid--2">
+        <div class="spec">
+          <div class="toast"><span class="ic" style="background:var(--success-weak);color:var(--success)"><i data-lucide="check"></i></span><div><b>已完成运行</b> · refactor-auth<div class="spec__meta" style="margin-top:2px">+128 −34 · 3 个文件</div></div></div>
+          <div class="toast" style="margin-top:12px"><span class="ic" style="background:var(--warn-weak);color:var(--warn)"><i data-lucide="shield-alert"></i></span><div><b>需要审批</b> · Codex 想执行命令</div></div>
+        </div>
+        <div class="spec" style="display:flex;justify-content:center;align-items:flex-start;gap:16px;flex-wrap:wrap">
+          <div class="dialog" style="width:260px">
+            <div class="dialog__body"><b>放弃本次改动？</b><p>Agent 尚有未提交的 3 个文件变更，放弃后不可恢复。</p></div>
+            <div class="dialog__actions"><button>取消</button><button class="danger">放弃</button></div>
+          </div>
+        </div>
+        <div class="spec" style="display:flex;justify-content:center;align-items:flex-end">
+          <div class="sheet" style="width:260px">
+            <div class="sheet__grip"></div>
+            <div class="sheet__body">
+              <div class="sheet__title">会话操作</div>
+              <div class="menu" style="border:none;box-shadow:none;padding:0">
+                <div class="menu__item"><i data-lucide="pencil"></i>重命名</div>
+                <div class="menu__item"><i data-lucide="archive"></i>归档</div>
+                <div class="menu__item danger"><i data-lucide="trash-2"></i>删除</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="spec">
+          <div class="empty">
+            <div class="ic"><i data-lucide="plug"></i></div>
+            <b>还没有连接 Agent</b>
+            <p>连接 Codex 或 Claude Code，即可开始一个会话。</p>
+            <button class="btn btn--primary" style="margin-top:14px"><i data-lucide="plus"></i>连接 Agent</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="subhead"><h3>内容与展示</h3><span class="eyebrow">气泡 · 命令块 · Diff 行 · 设置行 · 图标块 · kbd</span></div>
+      <div class="grid grid--2">
+        <div class="spec">
+          <div class="turn__user" style="max-width:100%;margin-bottom:12px">把登录模块拆分成独立 service，并补齐测试。</div>
+          <div class="cmd"><span class="prompt" style="color:var(--accent)">$</span> rg &quot;login&quot; src/ -l<div class="cmd__out">src/auth/login.ts
+src/auth/service.ts</div></div>
+          <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
+            <span class="difftag"><i data-lucide="file-code-2"></i>service.ts <span class="a">+64</span> <span class="d">−12</span></span>
+            <span class="kbd">⌘K</span><span class="kbd">⌘↵</span>
+          </div>
+        </div>
+        <div class="spec">
+          <div class="m-set" style="box-shadow:none;margin:0">
+            <div class="m-set__row"><span class="ico" style="background:var(--warn-weak);color:var(--warn)"><i data-lucide="shield"></i></span>权限模式<span class="val">workspace-write<i data-lucide="chevron-right" class="chev"></i></span></div>
+            <div class="m-set__row"><span class="ico" style="background:var(--info-weak);color:var(--info)"><i data-lucide="gauge"></i></span>推理强度<span class="val">high<i data-lucide="chevron-right" class="chev"></i></span></div>
+            <div class="m-set__row"><span class="ico" style="background:var(--success-weak);color:var(--success)"><i data-lucide="bell"></i></span>审批推送<span class="val"><span class="m-toggle on"></span></span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== 桌面工作台 ==================== -->
+    <section id="desktop" class="section">
+      <div class="section__head">
+        <h2>桌面工作台 · Desktop</h2>
+        <p>透明标题栏 + 全高侧栏的经典布局：左侧跨 Agent 的历史，右侧是流式会话、悬浮 composer、右上环境面板与右缘轮次导航。这是主场景。</p>
+      </div>
+
+      <div class="wbscene">
+        <div class="wbscene__bar">
+          <span class="eyebrow">真实尺寸预览 · 1280 × 820</span>
+          <span class="wbscene__scales" role="group" aria-label="缩放">
+            <button class="wbscale-btn" data-scale="0.5" aria-pressed="false">50%</button>
+            <button class="wbscale-btn" data-scale="0.75" aria-pressed="true">75%</button>
+            <button class="wbscale-btn" data-scale="1" aria-pressed="false">100%</button>
+          </span>
+        </div>
+        <div class="wbscene__view">
+      <div class="workbench">
+        <div class="wb-traffic"><i class="r"></i><i class="y"></i><i class="g"></i></div>
+
+        <!-- 侧栏 -->
+        <aside class="wb-side">
+          <div class="wb-side__actions">
+            <div class="wb-act"><i data-lucide="square-pen"></i>新对话</div>
+            <div class="wb-act"><i data-lucide="search"></i>搜索</div>
+            <div class="wb-act"><i data-lucide="clock"></i>已安排</div>
+            <div class="wb-act"><i data-lucide="puzzle"></i>插件</div>
+          </div>
+          <div class="wb-side__title"><span class="eyebrow">项目</span><span class="sp"></span><span class="iconbtn" style="width:24px;height:24px"><i data-lucide="plus" style="width:14px;height:14px"></i></span></div>
+          <div class="wb-side__list">
+            <div class="projgroup"><i class="chev" data-lucide="chevron-down"></i><b>refactor-auth</b><span class="count">6</span></div>
+            <div class="thread sel">
+              <div class="thread__dot"><span class="sdot sdot--run"></span></div>
+              <div class="thread__main"><div class="thread__title">把登录模块拆分为独立 service</div><div class="thread__meta"><svg class="agent"><use href="#ic-codex"/></svg>运行中</div></div>
+            </div>
+            <div class="thread">
+              <div class="thread__dot"><span class="sdot sdot--wait"></span></div>
+              <div class="thread__main"><div class="thread__title">修复 token 刷新竞态</div><div class="thread__meta"><svg class="agent"><use href="#ic-claude"/></svg>等待审批</div></div>
+            </div>
+            <div class="projgroup" style="margin-top:6px"><i class="chev" data-lucide="chevron-right"></i><b>agentdeck-docs</b><span class="count">3</span></div>
+            <div class="thread">
+              <div class="thread__dot"><span class="sdot sdot--done"></span></div>
+              <div class="thread__main"><div class="thread__title">补充部署章节</div><div class="thread__meta"><svg class="agent"><use href="#ic-codex"/></svg>已完成</div></div>
+            </div>
+          </div>
+          <div class="wb-side__foot" style="cursor:pointer" title="点击打开设置">
+            <div class="wb-avatar">J</div>
+            <div style="flex:1;min-width:0"><b>Jassy</b><span class="mono">身份 · ad_8f3k…q2b</span></div>
+            <i data-lucide="settings" style="width:15px;height:15px;color:var(--text-3)"></i>
+          </div>
+        </aside>
+
+        <!-- 内容区 -->
+        <div class="wb-main">
+          <div class="wb-header">
+            <svg class="agent"><use href="#ic-codex"/></svg>
+            <b>把登录模块拆分为独立 service</b>
+            <span class="cwd">~/glm/AgentDeck</span>
+            <span class="sp"></span>
+            <span class="iconbtn"><i data-lucide="folder-open"></i></span>
+            <span class="iconbtn"><i data-lucide="sliders-horizontal"></i></span>
+          </div>
+
+          <!-- Linear 专属：顶部命令栏 + ⌘K + 过滤芯片 -->
+          <div class="wb-cmdbar l-linear">
+            <span class="lin-search"><i data-lucide="search"></i>搜索或跳转到…<span class="kbd">⌘K</span></span>
+            <span class="lin-chip on">全部</span>
+            <span class="lin-chip">运行中</span>
+            <span class="lin-chip">待审批</span>
+          </div>
+
+          <div class="wb-stream">
+            <div class="wb-col">
+              <div class="turn">
+                <div class="turn__user">把登录模块拆分成独立的 auth service，抽出 token 刷新逻辑，并补齐单元测试。</div>
+              </div>
+              <div class="turn">
+                <div class="item"><div class="item__gutter"><i data-lucide="brain"></i></div><div class="item__body"><div class="reason">先梳理 <span class="mono">auth</span> 目录下的依赖关系，确认哪些函数被外部引用，再决定拆分边界。</div></div></div>
+                <div class="item"><div class="item__gutter"><i data-lucide="terminal"></i></div><div class="item__body"><div class="cmd"><span class="prompt">$</span> rg &quot;login&quot; src/ -l<div class="cmd__out">src/auth/login.ts
+src/auth/service.ts
+src/api/session.ts</div></div></div></div>
+                <div class="item"><div class="item__gutter"><i data-lucide="file-pen"></i></div><div class="item__body"><span class="difftag"><i data-lucide="file-code-2" style="width:14px;height:14px"></i>auth/service.ts <span class="a">+64</span> <span class="d">−12</span></span></div></div>
+                <div class="item"><div class="item__gutter"><span class="sdot sdot--run"></span></div><div class="item__body"><div class="reason" style="color:var(--running)">正在运行测试 <span class="mono">npm test -- auth</span> …</div></div></div>
+              </div>
+            </div>
+
+            <!-- 环境面板叠加 -->
+            <div class="wb-env">
+              <div class="envpanel">
+                <div class="envpanel__sec"><span class="eyebrow">变更 Changes</span><div class="env-delta"><span class="add">+128</span><span class="del">−34</span><span class="spec__meta">3 文件</span></div></div>
+                <div class="envpanel__sec"><span class="eyebrow">Git</span><div class="env-line"><span>分支</span><span>main</span></div><div class="env-line"><span>提交</span><span>a1b2c3d</span></div></div>
+              </div>
+            </div>
+
+            <!-- 轮次导航 -->
+            <div class="wb-rail"><i></i><i class="on"></i><i></i><i></i></div>
+          </div>
+
+          <!-- 悬浮 composer -->
+          <div class="wb-composer">
+            <div class="composer">
+              <div class="composer__input"><span class="ph">继续对话，或 @ 引用文件…</span></div>
+              <div class="composer__bar">
+                <span class="iconbtn"><i data-lucide="plus"></i></span>
+                <span class="tag tag--perm"><i data-lucide="shield"></i>workspace-write</span>
+                <span class="spacer"></span>
+                <span class="tag tag--effort">high</span>
+                <span class="iconbtn"><i data-lucide="mic"></i></span>
+                <span class="iconbtn iconbtn--send"><i data-lucide="arrow-up"></i></span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+        </div><!-- /.wbscene__view -->
+      </div><!-- /.wbscene -->
+
+      <div class="subhead"><h3>设置窗口 · Settings</h3><span class="eyebrow">点击侧栏身份后打开</span></div>
+      <div class="wbscene">
+        <div class="wbscene__bar">
+          <span class="eyebrow">真实尺寸预览 · 880 × 520</span>
+          <span class="wbscene__scales" role="group" aria-label="缩放">
+            <button class="wbscale-btn" data-scale="0.5" aria-pressed="false">50%</button>
+            <button class="wbscale-btn" data-scale="0.75" aria-pressed="true">75%</button>
+            <button class="wbscale-btn" data-scale="1" aria-pressed="false">100%</button>
+          </span>
+        </div>
+        <div class="wbscene__view">
+      <div class="setwin">
+        <div class="wb-traffic"><i class="r"></i><i class="y"></i><i class="g"></i></div>
+        <aside class="setwin__side">
+          <div class="setwin__cat on"><i data-lucide="user-round"></i>身份</div>
+          <div class="setwin__cat"><i data-lucide="server"></i>主机</div>
+          <div class="setwin__cat"><svg class="agent" style="width:15px;height:15px"><use href="#ic-codex"/></svg>Agent</div>
+          <div class="setwin__cat"><i data-lucide="sliders-horizontal"></i>默认</div>
+          <div class="setwin__cat"><i data-lucide="bell"></i>通知</div>
+          <div class="setwin__cat"><i data-lucide="palette"></i>外观</div>
+          <div class="setwin__cat"><i data-lucide="info"></i>关于</div>
+        </aside>
+        <div class="setwin__main">
+          <div class="setwin__title">身份</div>
+          <p style="font-size:12.5px;color:var(--text-3);margin-bottom:12px">本地身份，用于区分设备与保存偏好。</p>
+          <div class="setrow"><span class="lbl">头像</span><span class="avatar avatar--lg">J</span><button class="btn btn--secondary">更换</button></div>
+          <div class="setrow"><span class="lbl">显示名称</span><span class="field" style="flex:1;max-width:300px">Jassy</span></div>
+          <div class="setrow"><span class="lbl">身份标识</span><span class="field mono" style="flex:1;max-width:300px">ad_live_8f3k…q2b</span><button class="btn btn--secondary"><i data-lucide="copy"></i>复制</button><button class="btn btn--ghost"><i data-lucide="refresh-cw"></i>重置</button></div>
+          <div class="note" style="margin-top:18px">AgentDeck 不管理鉴权——各机器 / relay 各自鉴权；此处仅保存本地身份标识与偏好。</div>
+        </div>
+      </div>
+        </div><!-- /.wbscene__view -->
+      </div><!-- /.wbscene -->
+    </section>
+
+    <!-- ==================== 移动端 ==================== -->
+    <section id="mobile" class="section">
+      <div class="section__head">
+        <h2>移动端 · Mobile</h2>
+        <p>三屏 · 列表 ↔ 详情导航：<b>会话列表</b>（机器 + 项目平铺分组，会话经 relay 连接，标注 relay 名）、<b>会话页</b>（不输入即监控、一输入即介入，不再显式标注状态；审批以流内卡片就地选择；去底部 tab、最大化工作区、返回列表）、<b>我的</b>（身份标识 / 主机管理 / 用量热力图）。所有触控目标 ≥ 44pt。</p>
+      </div>
+
+      <div class="wbscene__bar"><span class="eyebrow">屏幕参考 · iPhone 390 × 844 pt · 显示 80%</span></div>
+
+      <div class="phones">
+
+        <!-- 手机 1：会话列表（多主机 + 多项目）-->
+        <div class="phone-wrap">
+          <div class="phone">
+            <div class="phone__notch"></div>
+            <div class="phone__screen">
+              <div class="m-status"><span>9:41</span><span class="r"><i data-lucide="signal"></i><i data-lucide="wifi"></i><i data-lucide="battery-full" style="width:19px"></i></span></div>
+              <div class="m-top"><h1>会话</h1><span class="sp"></span><span class="iconbtn"><i data-lucide="search"></i></span><span class="iconbtn"><i data-lucide="square-pen"></i></span><span class="avatar avatar--sm" style="margin-left:4px">J</span></div>
+              <div class="m-body m-sessions">
+                <div class="m-grp"><i class="chev" data-lucide="chevron-down"></i><b>refactor-auth</b><span class="meta">dev-box · sf-1</span></div>
+                <div class="m-thread">
+                  <span class="sdot sdot--run" style="margin-top:4px"></span>
+                  <div class="m-thread__main"><div class="m-thread__title">把登录模块拆分为独立的 service 并补齐测试</div><div class="m-thread__meta"><svg class="agent"><use href="#ic-codex"/></svg>运行中 · 刚刚</div></div>
+                </div>
+                <div class="m-thread">
+                  <span class="sdot sdot--wait" style="margin-top:4px"></span>
+                  <div class="m-thread__main"><div class="m-thread__title">修复 token 刷新的竞态条件</div><div class="m-thread__meta"><svg class="agent"><use href="#ic-claude"/></svg>等待审批 · 3 分钟前</div></div>
+                </div>
+                <div class="m-grp"><i class="chev" data-lucide="chevron-down"></i><b>agentdeck-docs</b><span class="meta">dev-box · sf-1</span></div>
+                <div class="m-thread">
+                  <span class="sdot sdot--done" style="margin-top:4px"></span>
+                  <div class="m-thread__main"><div class="m-thread__title">补充 README 的部署章节</div><div class="m-thread__meta"><svg class="agent"><use href="#ic-codex"/></svg>已完成 · 昨天</div></div>
+                </div>
+                <div class="m-grp"><i class="chev" data-lucide="chevron-down"></i><b>api-gateway</b><span class="meta">prod-box · tokyo-2</span></div>
+                <div class="m-thread">
+                  <span class="sdot sdot--done" style="margin-top:4px"></span>
+                  <div class="m-thread__main"><div class="m-thread__title">给限流中间件加 Redis 后端</div><div class="m-thread__meta"><svg class="agent"><use href="#ic-codex"/></svg>已完成 · 2 天前</div></div>
+                </div>
+                <div class="m-thread">
+                  <span class="sdot sdot--fail" style="margin-top:4px"></span>
+                  <div class="m-thread__main"><div class="m-thread__title">升级到 Node 20 并修复告警</div><div class="m-thread__meta"><svg class="agent"><use href="#ic-claude"/></svg>已中断 · 3 天前</div></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="phone-cap"><b>会话列表</b><span>参考 Codex · 按主机 + 项目分组</span></div>
+        </div>
+
+        <!-- 手机 2：会话页（监控 + 介入 + 审批 合一）-->
+        <div class="phone-wrap">
+          <div class="phone">
+            <div class="phone__notch"></div>
+            <div class="phone__screen">
+              <div class="m-status"><span>9:41</span><span class="r"><i data-lucide="signal"></i><i data-lucide="wifi"></i><i data-lucide="battery-full" style="width:19px"></i></span></div>
+              <div class="m-top">
+                <span class="iconbtn"><i data-lucide="chevron-left"></i></span>
+                <svg class="agent"><use href="#ic-codex"/></svg>
+                <div class="m-top__title"><b>拆分登录模块</b><span>dev-box · refactor-auth</span></div>
+                <span class="sp"></span>
+                <span class="status"><span class="sdot sdot--run"></span></span>
+                <span class="iconbtn"><i data-lucide="ellipsis"></i></span>
+              </div>
+              <div class="m-body">
+                <div class="m-turn"><div class="m-user">把登录模块拆分成独立 service，并补齐测试。</div></div>
+                <div class="m-turn">
+                  <div class="m-item"><span class="g"><i data-lucide="brain"></i></span><div class="m-reason">梳理 <span class="mono">auth</span> 目录依赖，确认拆分边界。</div></div>
+                  <div class="m-item"><span class="g"><i data-lucide="terminal"></i></span><div style="flex:1"><div class="m-cmd"><span class="prompt">$</span> rg &quot;login&quot; src/ -l<div class="out">3 个文件命中</div></div></div></div>
+                  <div class="m-item"><span class="g"><i data-lucide="file-pen"></i></span><div style="flex:1"><span class="tag tag--vendor" style="font-family:var(--font-mono)">service.ts <span style="color:var(--success)">+64</span> <span style="color:var(--danger)">−12</span></span></div></div>
+                  <div class="m-item"><span class="g"><i data-lucide="brain"></i></span><div class="m-reason">构建产物需要重建，准备执行清理命令。</div></div>
+                </div>
+                <div class="m-turn">
+                  <div class="approval">
+                    <div class="approval__head"><span class="icn"><i data-lucide="shield-alert"></i></span><div style="flex:1"><b>需要批准 · 执行命令</b><div class="sub">Codex 想改动磁盘</div></div></div>
+                    <div class="approval__body"><span class="prompt" style="color:var(--accent)">$</span> rm -rf ./dist &amp;&amp; npm run build</div>
+                    <div class="approval__foot"><span class="tag tag--perm"><i data-lucide="shield"></i>workspace-write</span><span class="spacer"></span><button class="btn btn--danger"><i data-lucide="x"></i>拒绝</button><button class="btn btn--approve"><i data-lucide="check"></i>批准</button></div>
+                  </div>
+                </div>
+              </div>
+              <div class="m-composer">
+                <div class="composer">
+                  <div class="composer__input" style="padding:11px 14px 4px"><span class="ph">输入消息，或让它继续运行…</span></div>
+                  <div class="composer__bar">
+                    <span class="iconbtn"><i data-lucide="plus"></i></span>
+                    <span class="spacer"></span>
+                    <span class="iconbtn"><i data-lucide="mic"></i></span>
+                    <span class="iconbtn iconbtn--send"><i data-lucide="arrow-up"></i></span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="phone-cap"><b>会话页</b><span>未接管即监控，输入即介入 · 流内审批 · 返回列表</span></div>
+        </div>
+
+        <!-- 手机 3：我的（主机管理 · 用量 · 设置）-->
+        <div class="phone-wrap">
+          <div class="phone">
+            <div class="phone__notch"></div>
+            <div class="phone__screen">
+              <div class="m-status"><span>9:41</span><span class="r"><i data-lucide="signal"></i><i data-lucide="wifi"></i><i data-lucide="battery-full" style="width:19px"></i></span></div>
+              <div class="m-top"><span class="iconbtn"><i data-lucide="chevron-left"></i></span><h1 style="font-size:20px">我的</h1></div>
+              <div class="m-body">
+                <div class="m-profile">
+                  <div class="av">J</div>
+                  <div style="flex:1;min-width:0"><b>Jassy</b><div class="sub mono" style="font-size:12px">身份 · ad_8f3k…q2b</div></div>
+                  <i data-lucide="chevron-right" class="chev" style="color:var(--text-3)"></i>
+                </div>
+
+                <span class="eyebrow m-seth">用量统计</span>
+                <div class="m-set" style="padding:14px;cursor:pointer">
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><b style="font-size:14px;font-weight:600">近 4 个月活跃</b><span class="val" style="font-size:12.5px">详情<i data-lucide="chevron-right" class="chev"></i></span></div>
+                  <div class="heatmap" data-weeks="17"></div>
+                  <div style="display:flex;justify-content:flex-end;align-items:center;gap:6px;margin-top:11px"><span class="spec__meta">少</span><span class="hm-legend"><span class="hm hm-1"></span><span class="hm hm-2"></span><span class="hm hm-3"></span><span class="hm hm-4"></span></span><span class="spec__meta">多</span></div>
+                </div>
+
+                <span class="eyebrow m-seth">主机管理</span>
+                <div class="m-set">
+                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><i data-lucide="server"></i></span>dev-box<span class="val">relay · sf-1 <span class="sdot sdot--done"></span></span></div>
+                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><i data-lucide="server"></i></span>prod-box<span class="val">relay · tokyo-2 <span class="sdot sdot--done"></span></span></div>
+                  <div class="m-set__row" style="color:var(--accent)"><span class="ico" style="background:var(--accent-weak);color:var(--accent)"><i data-lucide="plus"></i></span>添加主机</div>
+                </div>
+
+                <span class="eyebrow m-seth">Agent 连接</span>
+                <div class="m-set">
+                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><svg class="agent" style="width:16px;height:16px"><use href="#ic-codex"/></svg></span>Codex<span class="val"><span class="sdot sdot--done"></span>已连接</span></div>
+                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><svg class="agent" style="width:16px;height:16px"><use href="#ic-claude"/></svg></span>Claude Code<span class="val"><span class="sdot sdot--done"></span>已连接</span></div>
+                </div>
+
+                <span class="eyebrow m-seth">默认</span>
+                <div class="m-set">
+                  <div class="m-set__row"><span class="ico" style="background:var(--warn-weak);color:var(--warn)"><i data-lucide="shield"></i></span>权限模式<span class="val">workspace-write<i data-lucide="chevron-right" class="chev"></i></span></div>
+                  <div class="m-set__row"><span class="ico" style="background:var(--info-weak);color:var(--info)"><i data-lucide="gauge"></i></span>推理强度<span class="val">high<i data-lucide="chevron-right" class="chev"></i></span></div>
+                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><i data-lucide="cpu"></i></span>默认 Agent<span class="val">Codex<i data-lucide="chevron-right" class="chev"></i></span></div>
+                </div>
+
+                <span class="eyebrow m-seth">通知</span>
+                <div class="m-set">
+                  <div class="m-set__row"><span class="ico" style="background:var(--danger-weak);color:var(--danger)"><i data-lucide="bell"></i></span>审批推送<span class="val"><span class="m-toggle on"></span></span></div>
+                  <div class="m-set__row"><span class="ico" style="background:var(--success-weak);color:var(--success)"><i data-lucide="check-check"></i></span>运行完成提醒<span class="val"><span class="m-toggle on"></span></span></div>
+                </div>
+
+                <span class="eyebrow m-seth">相关信息</span>
+                <div class="m-set">
+                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><i data-lucide="palette"></i></span>主题<span class="val">跟随系统<i data-lucide="chevron-right" class="chev"></i></span></div>
+                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><i data-lucide="info"></i></span>关于 AgentDeck<span class="val"><i data-lucide="chevron-right" class="chev"></i></span></div>
+                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><i data-lucide="book-open"></i></span>帮助与文档<span class="val"><i data-lucide="chevron-right" class="chev"></i></span></div>
+                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><i data-lucide="git-commit-horizontal"></i></span>版本<span class="val">v0.2 (128)</span></div>
+                </div>
+
+                <div class="m-set">
+                  <div class="m-set__row" style="justify-content:center;gap:8px;color:var(--danger)"><i data-lucide="log-out"></i>退出登录</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="phone-cap"><b>我的</b><span>主机管理 · 用量统计 · 设置</span></div>
+        </div>
+
+      </div>
+
+      <div class="wbscene__bar" style="margin-top:36px"><span class="eyebrow">Android · 同一套设计，仅平台 chrome 不同（punch-hole / 手势条 / 状态栏）</span></div>
+      <div class="phones" data-platform="android">
+
+        <!-- Android 1：会话列表 -->
+        <div class="phone-wrap">
+          <div class="phone">
+            <div class="phone__notch"></div><div class="phone__punch"></div><div class="phone__gesture"></div>
+            <div class="phone__screen">
+              <div class="m-status"><span>9:41</span><span class="r"><i data-lucide="signal"></i><i data-lucide="wifi"></i><i data-lucide="battery-full" style="width:19px"></i></span></div>
+              <div class="m-top"><h1>会话</h1><span class="sp"></span><span class="iconbtn"><i data-lucide="search"></i></span><span class="iconbtn"><i data-lucide="square-pen"></i></span><span class="avatar avatar--sm" style="margin-left:4px">J</span></div>
+              <div class="m-body m-sessions">
+                <div class="m-grp"><i class="chev" data-lucide="chevron-down"></i><b>refactor-auth</b><span class="meta">dev-box · sf-1</span></div>
+                <div class="m-thread"><span class="sdot sdot--run" style="margin-top:4px"></span><div class="m-thread__main"><div class="m-thread__title">把登录模块拆分为独立的 service 并补齐测试</div><div class="m-thread__meta"><svg class="agent"><use href="#ic-codex"/></svg>运行中 · 刚刚</div></div></div>
+                <div class="m-thread"><span class="sdot sdot--wait" style="margin-top:4px"></span><div class="m-thread__main"><div class="m-thread__title">修复 token 刷新的竞态条件</div><div class="m-thread__meta"><svg class="agent"><use href="#ic-claude"/></svg>等待审批 · 3 分钟前</div></div></div>
+                <div class="m-grp"><i class="chev" data-lucide="chevron-down"></i><b>agentdeck-docs</b><span class="meta">dev-box · sf-1</span></div>
+                <div class="m-thread"><span class="sdot sdot--done" style="margin-top:4px"></span><div class="m-thread__main"><div class="m-thread__title">补充 README 的部署章节</div><div class="m-thread__meta"><svg class="agent"><use href="#ic-codex"/></svg>已完成 · 昨天</div></div></div>
+                <div class="m-grp"><i class="chev" data-lucide="chevron-down"></i><b>api-gateway</b><span class="meta">prod-box · tokyo-2</span></div>
+                <div class="m-thread"><span class="sdot sdot--done" style="margin-top:4px"></span><div class="m-thread__main"><div class="m-thread__title">给限流中间件加 Redis 后端</div><div class="m-thread__meta"><svg class="agent"><use href="#ic-codex"/></svg>已完成 · 2 天前</div></div></div>
+                <div class="m-thread"><span class="sdot sdot--fail" style="margin-top:4px"></span><div class="m-thread__main"><div class="m-thread__title">升级到 Node 20 并修复告警</div><div class="m-thread__meta"><svg class="agent"><use href="#ic-claude"/></svg>已中断 · 3 天前</div></div></div>
+              </div>
+            </div>
+          </div>
+          <div class="phone-cap"><b>会话列表 · Android</b><span>punch-hole · 手势条</span></div>
+        </div>
+
+        <!-- Android 2：会话页 -->
+        <div class="phone-wrap">
+          <div class="phone">
+            <div class="phone__notch"></div><div class="phone__punch"></div><div class="phone__gesture"></div>
+            <div class="phone__screen">
+              <div class="m-status"><span>9:41</span><span class="r"><i data-lucide="signal"></i><i data-lucide="wifi"></i><i data-lucide="battery-full" style="width:19px"></i></span></div>
+              <div class="m-top">
+                <span class="iconbtn"><i data-lucide="arrow-left"></i></span>
+                <svg class="agent"><use href="#ic-codex"/></svg>
+                <div class="m-top__title"><b>拆分登录模块</b><span>dev-box · refactor-auth</span></div>
+                <span class="sp"></span>
+                <span class="status"><span class="sdot sdot--run"></span></span>
+                <span class="iconbtn"><i data-lucide="ellipsis-vertical"></i></span>
+              </div>
+              <div class="m-body">
+                <div class="m-turn"><div class="m-user">把登录模块拆分成独立 service，并补齐测试。</div></div>
+                <div class="m-turn">
+                  <div class="m-item"><span class="g"><i data-lucide="brain"></i></span><div class="m-reason">梳理 <span class="mono">auth</span> 目录依赖，确认拆分边界。</div></div>
+                  <div class="m-item"><span class="g"><i data-lucide="terminal"></i></span><div style="flex:1"><div class="m-cmd"><span class="prompt">$</span> rg &quot;login&quot; src/ -l<div class="out">3 个文件命中</div></div></div></div>
+                  <div class="m-item"><span class="g"><i data-lucide="file-pen"></i></span><div style="flex:1"><span class="tag tag--vendor" style="font-family:var(--font-mono)">service.ts <span style="color:var(--success)">+64</span> <span style="color:var(--danger)">−12</span></span></div></div>
+                  <div class="m-item"><span class="g"><i data-lucide="brain"></i></span><div class="m-reason">构建产物需要重建，准备执行清理命令。</div></div>
+                </div>
+                <div class="m-turn">
+                  <div class="approval">
+                    <div class="approval__head"><span class="icn"><i data-lucide="shield-alert"></i></span><div style="flex:1"><b>需要批准 · 执行命令</b><div class="sub">Codex 想改动磁盘</div></div></div>
+                    <div class="approval__body"><span class="prompt" style="color:var(--accent)">$</span> rm -rf ./dist &amp;&amp; npm run build</div>
+                    <div class="approval__foot"><span class="tag tag--perm"><i data-lucide="shield"></i>workspace-write</span><span class="spacer"></span><button class="btn btn--danger"><i data-lucide="x"></i>拒绝</button><button class="btn btn--approve"><i data-lucide="check"></i>批准</button></div>
+                  </div>
+                </div>
+              </div>
+              <div class="m-composer">
+                <div class="composer">
+                  <div class="composer__input" style="padding:11px 14px 4px"><span class="ph">输入消息，或让它继续运行…</span></div>
+                  <div class="composer__bar"><span class="iconbtn"><i data-lucide="plus"></i></span><span class="spacer"></span><span class="iconbtn"><i data-lucide="mic"></i></span><span class="iconbtn iconbtn--send"><i data-lucide="arrow-up"></i></span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="phone-cap"><b>会话页 · Android</b><span>内容一致，仅 chrome 不同</span></div>
+        </div>
+
+        <!-- Android 3：我的 -->
+        <div class="phone-wrap">
+          <div class="phone">
+            <div class="phone__notch"></div><div class="phone__punch"></div><div class="phone__gesture"></div>
+            <div class="phone__screen">
+              <div class="m-status"><span>9:41</span><span class="r"><i data-lucide="signal"></i><i data-lucide="wifi"></i><i data-lucide="battery-full" style="width:19px"></i></span></div>
+              <div class="m-top"><span class="iconbtn"><i data-lucide="arrow-left"></i></span><h1 style="font-size:20px">我的</h1></div>
+              <div class="m-body">
+                <div class="m-profile"><div class="av">J</div><div style="flex:1;min-width:0"><b>Jassy</b><div class="sub mono" style="font-size:12px">身份 · ad_8f3k…q2b</div></div><i data-lucide="chevron-right" class="chev" style="color:var(--text-3)"></i></div>
+                <span class="eyebrow m-seth">用量统计</span>
+                <div class="m-set" style="padding:14px;cursor:pointer"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><b style="font-size:14px;font-weight:600">近 4 个月活跃</b><span class="val" style="font-size:12.5px">详情<i data-lucide="chevron-right" class="chev"></i></span></div><div class="heatmap" data-weeks="17"></div><div style="display:flex;justify-content:flex-end;align-items:center;gap:6px;margin-top:11px"><span class="spec__meta">少</span><span class="hm-legend"><span class="hm hm-1"></span><span class="hm hm-2"></span><span class="hm hm-3"></span><span class="hm hm-4"></span></span><span class="spec__meta">多</span></div></div>
+                <span class="eyebrow m-seth">主机管理</span>
+                <div class="m-set">
+                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><i data-lucide="server"></i></span>dev-box<span class="val">relay · sf-1 <span class="sdot sdot--done"></span></span></div>
+                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><i data-lucide="server"></i></span>prod-box<span class="val">relay · tokyo-2 <span class="sdot sdot--done"></span></span></div>
+                  <div class="m-set__row" style="color:var(--accent)"><span class="ico" style="background:var(--accent-weak);color:var(--accent)"><i data-lucide="plus"></i></span>添加主机</div>
+                </div>
+                <span class="eyebrow m-seth">Agent 连接</span>
+                <div class="m-set">
+                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><svg class="agent" style="width:16px;height:16px"><use href="#ic-codex"/></svg></span>Codex<span class="val"><span class="sdot sdot--done"></span>已连接</span></div>
+                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><svg class="agent" style="width:16px;height:16px"><use href="#ic-claude"/></svg></span>Claude Code<span class="val"><span class="sdot sdot--done"></span>已连接</span></div>
+                </div>
+                <span class="eyebrow m-seth">默认</span>
+                <div class="m-set">
+                  <div class="m-set__row"><span class="ico" style="background:var(--warn-weak);color:var(--warn)"><i data-lucide="shield"></i></span>权限模式<span class="val">workspace-write<i data-lucide="chevron-right" class="chev"></i></span></div>
+                  <div class="m-set__row"><span class="ico" style="background:var(--info-weak);color:var(--info)"><i data-lucide="gauge"></i></span>推理强度<span class="val">high<i data-lucide="chevron-right" class="chev"></i></span></div>
+                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><i data-lucide="cpu"></i></span>默认 Agent<span class="val">Codex<i data-lucide="chevron-right" class="chev"></i></span></div>
+                </div>
+                <span class="eyebrow m-seth">通知</span>
+                <div class="m-set">
+                  <div class="m-set__row"><span class="ico" style="background:var(--danger-weak);color:var(--danger)"><i data-lucide="bell"></i></span>审批推送<span class="val"><span class="m-toggle on"></span></span></div>
+                  <div class="m-set__row"><span class="ico" style="background:var(--success-weak);color:var(--success)"><i data-lucide="check-check"></i></span>运行完成提醒<span class="val"><span class="m-toggle on"></span></span></div>
+                </div>
+                <span class="eyebrow m-seth">相关信息</span>
+                <div class="m-set">
+                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><i data-lucide="palette"></i></span>主题<span class="val">跟随系统<i data-lucide="chevron-right" class="chev"></i></span></div>
+                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><i data-lucide="info"></i></span>关于 AgentDeck<span class="val"><i data-lucide="chevron-right" class="chev"></i></span></div>
+                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><i data-lucide="git-commit-horizontal"></i></span>版本<span class="val">v0.2 (128)</span></div>
+                </div>
+                <div class="m-set"><div class="m-set__row" style="justify-content:center;gap:8px;color:var(--danger)"><i data-lucide="log-out"></i>退出登录</div></div>
+              </div>
+            </div>
+          </div>
+          <div class="phone-cap"><b>我的 · Android</b><span>返回栈 · 手势导航</span></div>
+        </div>
+
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script src="https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+<script src="showcase.js"></script>
+</body>
+</html>

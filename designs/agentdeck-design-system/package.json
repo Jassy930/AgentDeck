@@ -1,0 +1,13 @@
+{
+  "name": "agentdeck-design-system",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "AgentDeck 设计系统 · 单一数据源 + 生成器 + 约束门禁",
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "lint": "node tools/lint.mjs",
+    "a11y": "node tools/a11y.mjs",
+    "check": "node tools/build.mjs && node tools/lint.mjs && node tools/a11y.mjs"
+  }
+}

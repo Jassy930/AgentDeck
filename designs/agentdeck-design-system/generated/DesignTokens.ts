@@ -1,0 +1,557 @@
+// 生成物 · 由 tools/build.mjs 从 tokens/tokens.json 生成，禁止手改。
+export const DesignTokens = {
+  "global": {
+    "spacing": {
+      "1": 4,
+      "2": 8,
+      "3": 12,
+      "4": 16,
+      "5": 20,
+      "6": 24,
+      "8": 32,
+      "10": 40,
+      "12": 48
+    },
+    "lineHeight": {
+      "cjk": 1.72,
+      "latin": 1.45
+    },
+    "motion": {
+      "durationMs": 220,
+      "ease": "cubic-bezier(0.22, 0.61, 0.36, 1)",
+      "easeOut": "cubic-bezier(0.16, 1, 0.3, 1)"
+    },
+    "type": {
+      "displayXl": 34,
+      "display": 24,
+      "title": 16,
+      "body": 14,
+      "callout": 13,
+      "caption": 11,
+      "mono": 12.5
+    },
+    "hitTargetMin": 44
+  },
+  "themes": {
+    "codex": {
+      "colorScheme": "dark",
+      "color": {
+        "bg": "#131313",
+        "bgElevated": "#161616",
+        "surface": "#1c1c1c",
+        "surface2": "#262626",
+        "surfaceInset": "#0f0f0f",
+        "sidebarBg": "#202121",
+        "border": "#2f2f2f",
+        "borderStrong": "#454545",
+        "separator": "#212121",
+        "text": "rgba(255,255,255,0.93)",
+        "text2": "rgba(255,255,255,0.60)",
+        "text3": "rgba(255,255,255,0.40)",
+        "textOnAccent": "#1c0f04",
+        "accent": "#ff7d2e",
+        "accentWeak": "rgba(255,125,46,0.14)",
+        "warn": "#ff7d2e",
+        "warnWeak": "rgba(255,125,46,0.14)",
+        "danger": "#ff5c5c",
+        "dangerWeak": "rgba(255,92,92,0.13)",
+        "success": "#57cf7c",
+        "successWeak": "rgba(87,207,124,0.13)",
+        "info": "#4a9bff",
+        "infoWeak": "rgba(74,155,255,0.14)",
+        "running": "#4a9bff"
+      },
+      "radius": {
+        "lg": 18,
+        "md": 10,
+        "sm": 6,
+        "pill": 999
+      },
+      "font": {
+        "ui": [
+          "-apple-system",
+          "SF Pro Text",
+          "PingFang SC",
+          "Noto Sans SC",
+          "sans-serif"
+        ],
+        "display": [
+          "-apple-system",
+          "SF Pro Display",
+          "PingFang SC",
+          "Noto Sans SC",
+          "sans-serif"
+        ],
+        "mono": [
+          "SF Mono",
+          "JetBrains Mono",
+          "ui-monospace",
+          "PingFang SC",
+          "monospace"
+        ]
+      },
+      "shadow": {
+        "panel": "0 1px 2px rgba(0,0,0,0.30), 0 8px 26px rgba(0,0,0,0.42)",
+        "pop": "0 2px 6px rgba(0,0,0,0.35), 0 18px 48px rgba(0,0,0,0.55)"
+      },
+      "effect": {
+        "accentGlow": "none",
+        "surfaceGrad": "none",
+        "gridLines": "none",
+        "sidebarTint": "linear-gradient(180deg, rgba(20,64,44,0.28), rgba(20,64,44,0) 160px)"
+      },
+      "label": {
+        "transform": "none",
+        "tracking": "0.01em",
+        "dispTracking": "-0.01em"
+      },
+      "structure": {
+        "statusShape": "dot",
+        "surfaceMode": "float",
+        "composerForm": "card",
+        "iconMode": "line",
+        "labelCase": "normal",
+        "texture": "none",
+        "affixes": {}
+      }
+    },
+    "terminal": {
+      "colorScheme": "dark",
+      "color": {
+        "bg": "#070807",
+        "bgElevated": "#0a0c0a",
+        "surface": "#0d100d",
+        "surface2": "#141a14",
+        "surfaceInset": "#050605",
+        "sidebarBg": "#0a0c0a",
+        "border": "#1d251d",
+        "borderStrong": "#2c382c",
+        "separator": "#151b15",
+        "text": "#cfe8cf",
+        "text2": "#7fa47f",
+        "text3": "#4c644c",
+        "textOnAccent": "#041004",
+        "accent": "#4ade80",
+        "accentWeak": "rgba(74,222,128,0.12)",
+        "warn": "#f5b544",
+        "warnWeak": "rgba(245,181,68,0.14)",
+        "danger": "#ff6b6b",
+        "dangerWeak": "rgba(255,107,107,0.13)",
+        "success": "#4ade80",
+        "successWeak": "rgba(74,222,128,0.13)",
+        "info": "#58c8ff",
+        "infoWeak": "rgba(88,200,255,0.14)",
+        "running": "#4ade80"
+      },
+      "radius": {
+        "lg": 4,
+        "md": 3,
+        "sm": 2,
+        "pill": 3
+      },
+      "font": {
+        "ui": [
+          "JetBrains Mono",
+          "SF Mono",
+          "ui-monospace",
+          "PingFang SC",
+          "monospace"
+        ],
+        "display": [
+          "JetBrains Mono",
+          "ui-monospace",
+          "monospace"
+        ],
+        "mono": [
+          "JetBrains Mono",
+          "SF Mono",
+          "ui-monospace",
+          "monospace"
+        ]
+      },
+      "shadow": {
+        "panel": "0 0 0 1px rgba(74,222,128,0.06), 0 10px 30px rgba(0,0,0,0.6)",
+        "pop": "0 0 26px rgba(74,222,128,0.08), 0 14px 44px rgba(0,0,0,0.72)"
+      },
+      "effect": {
+        "accentGlow": "0 0 12px rgba(74,222,128,0.45)",
+        "surfaceGrad": "none",
+        "gridLines": "linear-gradient(rgba(74,222,128,0.035) 1px, transparent 1px) 0 0 / 100% 22px",
+        "sidebarTint": "none"
+      },
+      "label": {
+        "transform": "uppercase",
+        "tracking": "0.14em",
+        "dispTracking": "0.02em"
+      },
+      "structure": {
+        "statusShape": "square",
+        "surfaceMode": "boxed",
+        "composerForm": "cli",
+        "iconMode": "glyph",
+        "labelCase": "upper",
+        "texture": "grid",
+        "affixes": {
+          "title": "$ ",
+          "reason": "# ",
+          "user": "> ",
+          "projectPrefix": "▾ ",
+          "projectSuffix": "/",
+          "act": "› ",
+          "tree": "├─ ",
+          "labelOpen": "[ ",
+          "labelClose": " ]",
+          "composerPrefix": "> ",
+          "composerCaret": "▊"
+        }
+      }
+    },
+    "linear": {
+      "colorScheme": "dark",
+      "color": {
+        "bg": "#0a0b0f",
+        "bgElevated": "#0e0f14",
+        "surface": "#14161d",
+        "surface2": "#1b1e27",
+        "surfaceInset": "#0b0c11",
+        "sidebarBg": "#0d0e13",
+        "border": "rgba(255,255,255,0.09)",
+        "borderStrong": "rgba(255,255,255,0.16)",
+        "separator": "rgba(255,255,255,0.05)",
+        "text": "#e7e8ee",
+        "text2": "#9a9cab",
+        "text3": "#61636f",
+        "textOnAccent": "#ffffff",
+        "accent": "#7c74ff",
+        "accentWeak": "rgba(124,116,255,0.16)",
+        "warn": "#f5a623",
+        "warnWeak": "rgba(245,166,35,0.14)",
+        "danger": "#ff5d6c",
+        "dangerWeak": "rgba(255,93,108,0.14)",
+        "success": "#4cd471",
+        "successWeak": "rgba(76,212,113,0.13)",
+        "info": "#7c74ff",
+        "infoWeak": "rgba(124,116,255,0.16)",
+        "running": "#7c74ff"
+      },
+      "radius": {
+        "lg": 12,
+        "md": 8,
+        "sm": 6,
+        "pill": 999
+      },
+      "font": {
+        "ui": [
+          "-apple-system",
+          "SF Pro Text",
+          "PingFang SC",
+          "Noto Sans SC",
+          "sans-serif"
+        ],
+        "display": [
+          "Space Grotesk",
+          "-apple-system",
+          "PingFang SC",
+          "Noto Sans SC",
+          "sans-serif"
+        ],
+        "mono": [
+          "JetBrains Mono",
+          "ui-monospace",
+          "monospace"
+        ]
+      },
+      "shadow": {
+        "panel": "inset 0 1px 0 rgba(255,255,255,0.05), 0 12px 34px rgba(0,0,0,0.5)",
+        "pop": "inset 0 1px 0 rgba(255,255,255,0.06), 0 18px 52px rgba(0,0,0,0.6)"
+      },
+      "effect": {
+        "accentGlow": "0 0 0 1px rgba(124,116,255,0.45), 0 8px 26px rgba(124,116,255,0.28)",
+        "surfaceGrad": "linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0))",
+        "gridLines": "none",
+        "sidebarTint": "none"
+      },
+      "label": {
+        "transform": "none",
+        "tracking": "0.02em",
+        "dispTracking": "-0.02em"
+      },
+      "structure": {
+        "statusShape": "pill",
+        "surfaceMode": "float",
+        "composerForm": "card",
+        "iconMode": "line",
+        "labelCase": "normal",
+        "texture": "none",
+        "affixes": {
+          "composerSlash": "   /  唤起命令"
+        },
+        "slots": [
+          "commandBar",
+          "kbd"
+        ]
+      }
+    },
+    "warm": {
+      "colorScheme": "light",
+      "color": {
+        "bg": "#f4f0e7",
+        "bgElevated": "#efe9dc",
+        "surface": "#fffdf8",
+        "surface2": "#f5f0e4",
+        "surfaceInset": "#efe9dc",
+        "sidebarBg": "#efe8d9",
+        "border": "#e3dbc9",
+        "borderStrong": "#d3c9b2",
+        "separator": "#eae2d3",
+        "text": "#221d15",
+        "text2": "#6d6454",
+        "text3": "#9a917d",
+        "textOnAccent": "#fff8ef",
+        "accent": "#b5501f",
+        "accentWeak": "rgba(181,80,31,0.10)",
+        "warn": "#b87a12",
+        "warnWeak": "rgba(184,122,18,0.13)",
+        "danger": "#bb392b",
+        "dangerWeak": "rgba(187,57,43,0.10)",
+        "success": "#3f7d4f",
+        "successWeak": "rgba(63,125,79,0.12)",
+        "info": "#3f6ea5",
+        "infoWeak": "rgba(63,110,165,0.12)",
+        "running": "#3f6ea5"
+      },
+      "radius": {
+        "lg": 14,
+        "md": 10,
+        "sm": 7,
+        "pill": 999
+      },
+      "font": {
+        "ui": [
+          "-apple-system",
+          "SF Pro Text",
+          "PingFang SC",
+          "Noto Sans SC",
+          "sans-serif"
+        ],
+        "display": [
+          "Newsreader",
+          "Georgia",
+          "Songti SC",
+          "Noto Serif SC",
+          "serif"
+        ],
+        "mono": [
+          "JetBrains Mono",
+          "ui-monospace",
+          "monospace"
+        ]
+      },
+      "shadow": {
+        "panel": "0 1px 2px rgba(60,40,10,0.06), 0 10px 30px rgba(80,55,20,0.10)",
+        "pop": "0 18px 46px rgba(80,55,20,0.16)"
+      },
+      "effect": {
+        "accentGlow": "none",
+        "surfaceGrad": "none",
+        "gridLines": "none",
+        "sidebarTint": "none"
+      },
+      "label": {
+        "transform": "none",
+        "tracking": "0.02em",
+        "dispTracking": "0em"
+      },
+      "structure": {
+        "statusShape": "dot",
+        "surfaceMode": "hairline",
+        "composerForm": "editorial",
+        "iconMode": "minimal",
+        "labelCase": "smallCaps",
+        "texture": "none",
+        "affixes": {}
+      }
+    },
+    "notion": {
+      "colorScheme": "light",
+      "color": {
+        "bg": "#ffffff",
+        "bgElevated": "#fbfbfa",
+        "surface": "#ffffff",
+        "surface2": "#f1f1ef",
+        "surfaceInset": "#f7f6f3",
+        "sidebarBg": "#fbfbfa",
+        "border": "#e9e9e7",
+        "borderStrong": "#dddcd8",
+        "separator": "#efefee",
+        "text": "#37352f",
+        "text2": "#787774",
+        "text3": "#9b9a97",
+        "textOnAccent": "#ffffff",
+        "accent": "#2383e2",
+        "accentWeak": "rgba(35,131,226,0.10)",
+        "warn": "#cb7b25",
+        "warnWeak": "rgba(203,123,37,0.13)",
+        "danger": "#e03e3e",
+        "dangerWeak": "rgba(224,62,62,0.10)",
+        "success": "#0f7b6c",
+        "successWeak": "rgba(15,123,108,0.12)",
+        "info": "#2383e2",
+        "infoWeak": "rgba(35,131,226,0.10)",
+        "running": "#2383e2"
+      },
+      "radius": {
+        "lg": 6,
+        "md": 4,
+        "sm": 3,
+        "pill": 999
+      },
+      "font": {
+        "ui": [
+          "-apple-system",
+          "SF Pro Text",
+          "Segoe UI",
+          "PingFang SC",
+          "Noto Sans SC",
+          "sans-serif"
+        ],
+        "display": [
+          "-apple-system",
+          "SF Pro Display",
+          "Segoe UI",
+          "PingFang SC",
+          "sans-serif"
+        ],
+        "mono": [
+          "SF Mono",
+          "JetBrains Mono",
+          "ui-monospace",
+          "monospace"
+        ]
+      },
+      "shadow": {
+        "panel": "0 0 0 1px rgba(15,15,15,0.03), 0 3px 6px rgba(15,15,15,0.04), 0 9px 24px rgba(15,15,15,0.06)",
+        "pop": "0 0 0 1px rgba(15,15,15,0.05), 0 8px 28px rgba(15,15,15,0.13)"
+      },
+      "effect": {
+        "accentGlow": "none",
+        "surfaceGrad": "none",
+        "gridLines": "none",
+        "sidebarTint": "none"
+      },
+      "label": {
+        "transform": "none",
+        "tracking": "0.01em",
+        "dispTracking": "-0.01em"
+      },
+      "structure": {
+        "statusShape": "dot",
+        "surfaceMode": "flat",
+        "composerForm": "card",
+        "iconMode": "line",
+        "labelCase": "normal",
+        "texture": "none",
+        "affixes": {}
+      }
+    },
+    "macos": {
+      "colorScheme": "light",
+      "color": {
+        "bg": "#ffffff",
+        "bgElevated": "#f5f5f7",
+        "surface": "#ffffff",
+        "surface2": "#ececec",
+        "surfaceInset": "#f5f5f7",
+        "sidebarBg": "rgba(246,246,248,0.82)",
+        "border": "#d9d9dc",
+        "borderStrong": "#c5c5c8",
+        "separator": "#e6e6e8",
+        "text": "#1d1d1f",
+        "text2": "rgba(0,0,0,0.52)",
+        "text3": "rgba(0,0,0,0.34)",
+        "textOnAccent": "#ffffff",
+        "accent": "#007aff",
+        "accentWeak": "rgba(0,122,255,0.12)",
+        "warn": "#ff9500",
+        "warnWeak": "rgba(255,149,0,0.16)",
+        "danger": "#ff3b30",
+        "dangerWeak": "rgba(255,59,48,0.12)",
+        "success": "#34c759",
+        "successWeak": "rgba(52,199,89,0.16)",
+        "info": "#007aff",
+        "infoWeak": "rgba(0,122,255,0.12)",
+        "running": "#007aff"
+      },
+      "radius": {
+        "lg": 12,
+        "md": 8,
+        "sm": 6,
+        "pill": 999
+      },
+      "font": {
+        "ui": [
+          "-apple-system",
+          "SF Pro Text",
+          "Helvetica Neue",
+          "PingFang SC",
+          "Noto Sans SC",
+          "sans-serif"
+        ],
+        "display": [
+          "-apple-system",
+          "SF Pro Display",
+          "Helvetica Neue",
+          "PingFang SC",
+          "sans-serif"
+        ],
+        "mono": [
+          "SF Mono",
+          "JetBrains Mono",
+          "ui-monospace",
+          "monospace"
+        ]
+      },
+      "shadow": {
+        "panel": "0 0 0 0.5px rgba(0,0,0,0.08), 0 6px 18px rgba(0,0,0,0.10)",
+        "pop": "0 0 0 0.5px rgba(0,0,0,0.10), 0 12px 34px rgba(0,0,0,0.16)"
+      },
+      "effect": {
+        "accentGlow": "none",
+        "surfaceGrad": "none",
+        "gridLines": "none",
+        "sidebarTint": "none"
+      },
+      "label": {
+        "transform": "none",
+        "tracking": "0.02em",
+        "dispTracking": "-0.02em"
+      },
+      "structure": {
+        "statusShape": "dot",
+        "surfaceMode": "float",
+        "composerForm": "card",
+        "iconMode": "line",
+        "labelCase": "normal",
+        "texture": "none",
+        "affixes": {}
+      }
+    }
+  },
+  "platform": {
+    "ios": {
+      "safeTop": 46,
+      "safeBottom": 22,
+      "navBlur": 12,
+      "navSolid": "transparent"
+    },
+    "android": {
+      "safeTop": 30,
+      "safeBottom": 12,
+      "navBlur": 0,
+      "navSolid": "surface"
+    }
+  }
+} as const;
+export type ThemeId = "codex" | "terminal" | "linear" | "warm" | "notion" | "macos";
+export type PlatformId = "ios" | "android";
+export type ColorToken = keyof typeof DesignTokens.themes.codex.color;

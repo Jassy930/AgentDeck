@@ -1,0 +1,128 @@
+/* ============================================================
+   AgentDeck 设计系统 · 主题赋值层
+   ------------------------------------------------------------
+   每套主题在这里【只做两件事】：
+   1) 对 interface.css 定义的结构开关（--k-*）赋值；
+   2) 提供少数天生需要 DOM 的「插槽」组件样式。
+   通用消费规则全在 interface.css，这里不再写散落的 [data-theme] 覆盖。
+   ============================================================ */
+
+/* ===== 通用小组件（插槽用）===== */
+.kbd {
+  font-family: var(--font-mono); font-size: 10.5px; line-height: 1;
+  padding: 3px 5px; border-radius: 5px; color: var(--text-2);
+  background: var(--surface-inset); border: 1px solid var(--border);
+  box-shadow: 0 1px 0 var(--border);
+}
+
+/* ============================================================
+   ② TERMINAL —— 命令行 / TUI 母题
+   ============================================================ */
+[data-theme="terminal"] {
+  --k-label-open: "[ ";  --k-label-close: " ]";
+  --k-reason-prefix: "# ";
+  --k-user-prefix: "> ";
+  --k-title-prefix: "$ ";
+  --k-project-prefix: "▾ ";  --k-project-suffix: "/";
+  --k-act-prefix: "› ";
+  --k-thread-tree: "├─ ";
+  --k-status-radius: 1px;
+  --k-avatar-radius: 2px;
+  --k-chevron-display: none;
+  --k-stream-texture: var(--grid-lines);
+  --k-icon-gutter-display: none;
+  --k-cmd-border-left: 2px solid var(--accent);
+  --k-composer-bg: var(--surface-inset);
+  --k-composer-prefix: "> ";
+  --k-composer-caret: "▊";
+}
+/* 状态方块去柔光脉冲，换硬边辉光（更 TUI）*/
+[data-theme="terminal"] .sdot--run { animation: none; box-shadow: 0 0 6px var(--running); }
+
+/* ============================================================
+   ③ LINEAR —— 精密产品母题
+   ============================================================ */
+[data-theme="linear"] {
+  --k-status-chip-bg: var(--surface-2);
+  --k-status-chip-border: 1px solid var(--border);
+  --k-status-chip-pad: 3px 9px 3px 8px;
+  --k-composer-slash: "   /  唤起命令";
+}
+/* 数字表格对齐 */
+[data-theme="linear"] .env-delta,
+[data-theme="linear"] .env-line span:last-child { font-variant-numeric: tabular-nums; }
+/* effort 标签 → 键位芯片质感 */
+[data-theme="linear"] .tag--effort { font-family: var(--font-mono); font-size: 10.5px; box-shadow: 0 1px 0 var(--border); }
+
+/* —— 插槽 A：工作台顶部命令栏（.l-linear 控显隐）—— */
+.wb-cmdbar {
+  align-items: center; gap: 8px; padding: 8px 16px;
+  border-bottom: 1px solid var(--separator);
+  background: linear-gradient(180deg, rgba(255,255,255,0.02), transparent);
+}
+.wb-cmdbar .lin-search {
+  display: flex; align-items: center; gap: 8px; flex: 1; max-width: 340px;
+  padding: 6px 10px; font-size: 12.5px; color: var(--text-3);
+  background: var(--surface-inset); border: 1px solid var(--border); border-radius: 8px;
+}
+.wb-cmdbar .lin-search i { width: 14px; height: 14px; }
+.wb-cmdbar .lin-search .kbd { margin-left: auto; }
+.lin-chip {
+  padding: 5px 11px; font-size: 12px; border-radius: 999px; color: var(--text-2);
+  border: 1px solid var(--border); background: var(--surface);
+}
+.lin-chip.on { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, transparent); background: var(--accent-weak); }
+
+/* —— 插槽 B：composer 发送区 ⌘↵ 键位提示 —— */
+[data-theme="linear"] .composer__bar .spacer::after {
+  content: "⌘↵"; float: right; font-family: var(--font-mono); font-size: 10.5px;
+  color: var(--text-3); background: var(--surface-inset); border: 1px solid var(--border);
+  padding: 3px 6px; border-radius: 6px; margin-right: 8px;
+}
+
+/* ============================================================
+   ④ WARM —— 编辑排版母题
+   ============================================================ */
+[data-theme="warm"] {
+  --k-label-variant: small-caps;
+  --k-title-font: var(--font-display);
+  --k-icon-gutter-display: none;
+  --k-reason-font: var(--font-display);
+  --k-reason-italic: italic;
+  --k-reason-size: 15px;
+  --k-reason-border: 2px solid var(--border-strong);
+  --k-reason-pad: 14px;
+  --k-cmd-border: 1px solid var(--border);
+  --k-cmd-border-left: 3px solid var(--text-3);
+  --k-cmd-bg: var(--surface-2);
+}
+/* 标题栏改发丝规线（而非实边框）*/
+[data-theme="warm"] .wb-header { border-bottom: none; box-shadow: inset 0 -1px 0 var(--border); }
+/* 区块标签尾随一段发丝规线（编辑感）—— 覆盖通用 ::after */
+[data-theme="warm"] .envpanel__sec .eyebrow::after {
+  content: ""; display: inline-block; width: 22px; height: 1px;
+  background: var(--border-strong); vertical-align: middle; margin-left: 8px; opacity: 1;
+}
+/* 按钮 / 标签走克制的描边 + 小型大写 */
+[data-theme="warm"] .btn--secondary { background: none; border-color: var(--border-strong); }
+[data-theme="warm"] .tag { font-variant: small-caps; letter-spacing: 0.04em; }
+/* 列表行分隔改发丝规线，弱化选中块 */
+[data-theme="warm"] .thread { border-bottom: 1px solid var(--separator); border-radius: 0; }
+[data-theme="warm"] .thread.sel { background: var(--surface); }
+[data-theme="warm"] .wb-side__list .thread:last-child { border-bottom: none; }
+
+/* ============================================================
+   ⑤ NOTION —— 极简文档感
+   ------------------------------------------------------------
+   刻意「结构全默认」：不覆盖任何 --k-* 开关，仅靠 tokens.css 的皮肤区分。
+   这正是接口的示范——一套新主题可以只填皮肤、零结构改动、零组件改动。
+   （无需在此写任何规则；留此注释以示"什么都不用做"。）
+   ============================================================ */
+
+/* ============================================================
+   ⑥ MACOS —— 系统原生（Aqua）
+   ------------------------------------------------------------
+   同样以皮肤为主：系统蓝 / SF / 系统灰 / 标准控件圆角 / 柔和系统阴影，
+   结构走默认（圆点、卡片、line 图标）——恰好符合"原生感来自色/字/圆角/材质"。
+   ============================================================ */
+/* macOS 亦全用开关默认值，无需覆盖。 */
