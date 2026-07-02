@@ -18,10 +18,11 @@ final class InputBarView: NSView {
 
     private weak var model: SessionModel?
 
+    private let composerChrome = NSView()
     private let textView = InputTextView()
     private let scrollView = NSScrollView()
     private let placeholderLabel: NSTextField = {
-        let field = NSTextField(labelWithString: "Ask Codex to…")
+        let field = NSTextField(labelWithString: "要求后续变更")
         field.font = ConversationRowMetrics.calloutFont
         field.textColor = .placeholderTextColor
         field.translatesAutoresizingMaskIntoConstraints = false
@@ -49,6 +50,24 @@ final class InputBarView: NSView {
         field.setContentHuggingPriority(.required, for: .horizontal)
         return field
     }()
+    private let attachButton = NSButton()
+    private let approvalBadge: NSTextField = {
+        let field = NSTextField(labelWithString: "完全访问⌄")
+        field.font = ConversationRowMetrics.captionFont
+        field.textColor = CodexDesktopChrome.orange
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.setContentHuggingPriority(.required, for: .horizontal)
+        return field
+    }()
+    private let effortBadge: NSTextField = {
+        let field = NSTextField(labelWithString: "5.5 超高⌄")
+        field.font = ConversationRowMetrics.captionFont
+        field.textColor = .secondaryLabelColor
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.setContentHuggingPriority(.required, for: .horizontal)
+        return field
+    }()
+    private let microphoneButton = NSButton()
     private let sendButton = NSButton()
 
     private var scrollHeightConstraint: NSLayoutConstraint!
@@ -77,6 +96,12 @@ final class InputBarView: NSView {
 
     private func build() {
         translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+
+        composerChrome.translatesAutoresizingMaskIntoConstraints = false
+        composerChrome.setAccessibilityIdentifier("codex-composer")
+        CodexDesktopChrome.roundedPanel(composerChrome, radius: 18)
 
         textView.onSubmit = { [weak self] in self?.send() }
         textView.onTextChange = { [weak self] in self?.textDidChange() }
@@ -101,35 +126,82 @@ final class InputBarView: NSView {
         // Placeholder overlays the text view's first line.
         scrollView.addSubview(placeholderLabel)
 
-        sendButton.image = NSImage(systemSymbolName: "return", accessibilityDescription: "Send")
-        sendButton.bezelStyle = .rounded
+        attachButton.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "添加上下文")
+        attachButton.toolTip = "添加上下文"
+        attachButton.bezelStyle = .inline
+        attachButton.isBordered = false
+        attachButton.contentTintColor = .secondaryLabelColor
+        attachButton.translatesAutoresizingMaskIntoConstraints = false
+
+        microphoneButton.image = NSImage(systemSymbolName: "mic", accessibilityDescription: "语音输入")
+        microphoneButton.toolTip = "语音输入"
+        microphoneButton.bezelStyle = .inline
+        microphoneButton.isBordered = false
+        microphoneButton.contentTintColor = .secondaryLabelColor
+        microphoneButton.translatesAutoresizingMaskIntoConstraints = false
+
+        sendButton.image = NSImage(systemSymbolName: "arrow.up", accessibilityDescription: "发送")
+        sendButton.bezelStyle = .inline
+        sendButton.isBordered = false
         sendButton.target = self
         sendButton.action = #selector(sendAction)
         sendButton.translatesAutoresizingMaskIntoConstraints = false
         sendButton.setContentHuggingPriority(.required, for: .horizontal)
+        sendButton.wantsLayer = true
+        sendButton.layer?.backgroundColor = NSColor.labelColor.cgColor
+        sendButton.layer?.cornerRadius = 15
 
-        addSubview(scrollView)
-        addSubview(planModeBadge)
-        addSubview(queuedLabel)
-        addSubview(sendButton)
+        addSubview(composerChrome)
+        composerChrome.addSubview(scrollView)
+        composerChrome.addSubview(attachButton)
+        composerChrome.addSubview(approvalBadge)
+        composerChrome.addSubview(planModeBadge)
+        composerChrome.addSubview(queuedLabel)
+        composerChrome.addSubview(effortBadge)
+        composerChrome.addSubview(microphoneButton)
+        composerChrome.addSubview(sendButton)
 
         scrollHeightConstraint = scrollView.heightAnchor.constraint(equalToConstant: minHeight)
 
         NSLayoutConstraint.activate([
-            scrollView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
-            scrollView.topAnchor.constraint(equalTo: topAnchor, constant: 10),
-            scrollView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
+            composerChrome.topAnchor.constraint(equalTo: topAnchor),
+            composerChrome.leadingAnchor.constraint(equalTo: leadingAnchor),
+            composerChrome.trailingAnchor.constraint(equalTo: trailingAnchor),
+            composerChrome.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            scrollView.leadingAnchor.constraint(equalTo: composerChrome.leadingAnchor, constant: 14),
+            scrollView.topAnchor.constraint(equalTo: composerChrome.topAnchor, constant: 14),
+            scrollView.trailingAnchor.constraint(equalTo: composerChrome.trailingAnchor, constant: -14),
             scrollHeightConstraint,
 
-            planModeBadge.leadingAnchor.constraint(equalTo: scrollView.trailingAnchor, constant: 10),
-            planModeBadge.centerYAnchor.constraint(equalTo: sendButton.centerYAnchor),
+            attachButton.leadingAnchor.constraint(equalTo: composerChrome.leadingAnchor, constant: 12),
+            attachButton.topAnchor.constraint(equalTo: scrollView.bottomAnchor, constant: 13),
+            attachButton.bottomAnchor.constraint(equalTo: composerChrome.bottomAnchor, constant: -12),
+            attachButton.widthAnchor.constraint(equalToConstant: 28),
+            attachButton.heightAnchor.constraint(equalToConstant: 28),
+
+            approvalBadge.leadingAnchor.constraint(equalTo: attachButton.trailingAnchor, constant: 10),
+            approvalBadge.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
+
+            planModeBadge.leadingAnchor.constraint(equalTo: approvalBadge.trailingAnchor, constant: 10),
+            planModeBadge.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
 
             queuedLabel.leadingAnchor.constraint(equalTo: planModeBadge.trailingAnchor, constant: 8),
-            queuedLabel.centerYAnchor.constraint(equalTo: sendButton.centerYAnchor),
+            queuedLabel.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
 
-            sendButton.leadingAnchor.constraint(equalTo: queuedLabel.trailingAnchor, constant: 8),
-            sendButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
-            sendButton.centerYAnchor.constraint(equalTo: scrollView.centerYAnchor),
+            effortBadge.leadingAnchor.constraint(greaterThanOrEqualTo: queuedLabel.trailingAnchor, constant: 10),
+            effortBadge.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
+
+            microphoneButton.leadingAnchor.constraint(equalTo: effortBadge.trailingAnchor, constant: 10),
+            microphoneButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
+            microphoneButton.widthAnchor.constraint(equalToConstant: 24),
+            microphoneButton.heightAnchor.constraint(equalToConstant: 24),
+
+            sendButton.leadingAnchor.constraint(equalTo: microphoneButton.trailingAnchor, constant: 10),
+            sendButton.trailingAnchor.constraint(equalTo: composerChrome.trailingAnchor, constant: -12),
+            sendButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
+            sendButton.widthAnchor.constraint(equalToConstant: 30),
+            sendButton.heightAnchor.constraint(equalToConstant: 30),
 
             placeholderLabel.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor, constant: 4),
             placeholderLabel.topAnchor.constraint(equalTo: scrollView.topAnchor, constant: verticalTextInset),

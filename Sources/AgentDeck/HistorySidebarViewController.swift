@@ -21,8 +21,9 @@ final class HistorySidebarViewController: NSViewController {
     // MARK: - Subviews
 
     private let headerLabel: NSTextField = {
-        let label = NSTextField(labelWithString: "History")
-        label.font = .systemFont(ofSize: 13, weight: .semibold)
+        let label = NSTextField(labelWithString: "项目")
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        label.textColor = .secondaryLabelColor
         label.translatesAutoresizingMaskIntoConstraints = false
         return label
     }()
@@ -53,7 +54,7 @@ final class HistorySidebarViewController: NSViewController {
 
     private let searchField: NSSearchField = {
         let sf = NSSearchField()
-        sf.placeholderString = "Search threads"
+        sf.placeholderString = "搜索会话"
         sf.translatesAutoresizingMaskIntoConstraints = false
         return sf
     }()
@@ -82,7 +83,7 @@ final class HistorySidebarViewController: NSViewController {
 
     /// Shown when history is empty (and not loading or errored)
     private let emptyStateLabel: NSTextField = {
-        let label = NSTextField(wrappingLabelWithString: "No history loaded\nRefresh to scan persisted agent threads.")
+        let label = NSTextField(wrappingLabelWithString: "暂无历史\n刷新以扫描已持久化的 agent 会话。")
         label.font = .systemFont(ofSize: NSFont.systemFontSize)
         label.textColor = .secondaryLabelColor
         label.isHidden = true
@@ -103,7 +104,7 @@ final class HistorySidebarViewController: NSViewController {
         let ov = NSOutlineView()
         ov.style = .sourceList
         ov.headerView = nil          // no column header
-        ov.rowHeight = 52
+        ov.rowHeight = 36
         ov.intercellSpacing = NSSize(width: 0, height: 2)
         ov.indentationPerLevel = 0   // groups are not indented relative to root
         ov.autoresizesOutlineColumn = false
@@ -143,7 +144,11 @@ final class HistorySidebarViewController: NSViewController {
     override func loadView() {
         let container = NSView()
         container.translatesAutoresizingMaskIntoConstraints = false
+        container.wantsLayer = true
+        container.layer?.backgroundColor = CodexDesktopChrome.sidebarBackground.cgColor
         view = container
+
+        let topActions = makeTopActions()
 
         // Header row
         newSessionButton.target = self
@@ -157,43 +162,59 @@ final class HistorySidebarViewController: NSViewController {
         headerRow.views[1].translatesAutoresizingMaskIntoConstraints = false
         headerRow.setHuggingPriority(.defaultLow, for: .horizontal)
 
+        let accountFooter = makeAccountFooter()
+
+        searchField.isHidden = true
+
+        container.addSubview(topActions)
         container.addSubview(headerRow)
         container.addSubview(searchField)
         container.addSubview(loadingIndicator)
         container.addSubview(errorLabel)
         container.addSubview(emptyStateLabel)
         container.addSubview(scrollView)
+        container.addSubview(accountFooter)
 
         NSLayoutConstraint.activate([
+            topActions.topAnchor.constraint(equalTo: container.topAnchor, constant: 54),
+            topActions.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14),
+            topActions.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
+
             // Header
-            headerRow.topAnchor.constraint(equalTo: container.topAnchor, constant: 12),
-            headerRow.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
-            headerRow.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
+            headerRow.topAnchor.constraint(equalTo: topActions.bottomAnchor, constant: 28),
+            headerRow.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14),
+            headerRow.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
 
             // Search field
             searchField.topAnchor.constraint(equalTo: headerRow.bottomAnchor, constant: 8),
             searchField.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
             searchField.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
+            searchField.heightAnchor.constraint(equalToConstant: 0),
 
             // Loading indicator
-            loadingIndicator.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 12),
+            loadingIndicator.topAnchor.constraint(equalTo: headerRow.bottomAnchor, constant: 12),
             loadingIndicator.centerXAnchor.constraint(equalTo: container.centerXAnchor),
 
             // Error label
-            errorLabel.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 8),
+            errorLabel.topAnchor.constraint(equalTo: headerRow.bottomAnchor, constant: 8),
             errorLabel.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
             errorLabel.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
 
             // Empty-state label
-            emptyStateLabel.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 12),
+            emptyStateLabel.topAnchor.constraint(equalTo: headerRow.bottomAnchor, constant: 12),
             emptyStateLabel.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
             emptyStateLabel.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
 
             // Outline scroll view
-            scrollView.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 8),
+            scrollView.topAnchor.constraint(equalTo: headerRow.bottomAnchor, constant: 10),
             scrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: accountFooter.topAnchor, constant: -10),
+
+            accountFooter.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14),
+            accountFooter.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
+            accountFooter.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -14),
+            accountFooter.heightAnchor.constraint(equalToConstant: 44),
         ])
 
         outlineView.dataSource = self
@@ -214,6 +235,89 @@ final class HistorySidebarViewController: NSViewController {
 
         // Reopen all groups by default after data load
         updateVisibility()
+    }
+
+    private func makeTopActions() -> NSStackView {
+        let actions: [(String, String)] = [
+            ("square.and.pencil", "新对话"),
+            ("magnifyingglass", "搜索"),
+            ("clock", "已安排"),
+            ("puzzlepiece.extension", "插件"),
+        ]
+        let views = actions.map { symbol, title in
+            let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil) ?? NSImage())
+            icon.contentTintColor = .secondaryLabelColor
+            icon.translatesAutoresizingMaskIntoConstraints = false
+            let label = NSTextField(labelWithString: title)
+            label.font = .systemFont(ofSize: 13, weight: .medium)
+            label.textColor = .labelColor
+            label.translatesAutoresizingMaskIntoConstraints = false
+            let row = NSStackView(views: [icon, label])
+            row.orientation = .horizontal
+            row.alignment = .centerY
+            row.spacing = 9
+            row.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                icon.widthAnchor.constraint(equalToConstant: 15),
+                icon.heightAnchor.constraint(equalToConstant: 15),
+                row.heightAnchor.constraint(equalToConstant: 27),
+            ])
+            return row
+        }
+        let stack = NSStackView(views: views)
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 7
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        return stack
+    }
+
+    private func makeAccountFooter() -> NSView {
+        let footer = NSView()
+        footer.translatesAutoresizingMaskIntoConstraints = false
+        footer.wantsLayer = true
+        footer.layer?.backgroundColor = NSColor(calibratedRed: 0.24, green: 0.25, blue: 0.25, alpha: 0.7).cgColor
+        footer.layer?.cornerRadius = 8
+        footer.layer?.cornerCurve = .continuous
+
+        let avatar = NSTextField(labelWithString: "JA")
+        avatar.font = .systemFont(ofSize: 11, weight: .medium)
+        avatar.textColor = .white
+        avatar.alignment = .center
+        avatar.translatesAutoresizingMaskIntoConstraints = false
+        avatar.wantsLayer = true
+        avatar.layer?.backgroundColor = NSColor.systemBlue.cgColor
+        avatar.layer?.cornerRadius = 14
+
+        let name = NSTextField(labelWithString: "Jassy")
+        name.font = .systemFont(ofSize: 13, weight: .medium)
+        name.textColor = .labelColor
+        let plan = NSTextField(labelWithString: "Pro")
+        plan.font = .systemFont(ofSize: 11)
+        plan.textColor = .secondaryLabelColor
+        for label in [name, plan] {
+            label.translatesAutoresizingMaskIntoConstraints = false
+        }
+        let textStack = NSStackView(views: [name, plan])
+        textStack.orientation = .vertical
+        textStack.alignment = .leading
+        textStack.spacing = 1
+        textStack.translatesAutoresizingMaskIntoConstraints = false
+
+        footer.addSubview(avatar)
+        footer.addSubview(textStack)
+
+        NSLayoutConstraint.activate([
+            avatar.leadingAnchor.constraint(equalTo: footer.leadingAnchor, constant: 8),
+            avatar.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+            avatar.widthAnchor.constraint(equalToConstant: 28),
+            avatar.heightAnchor.constraint(equalToConstant: 28),
+            textStack.leadingAnchor.constraint(equalTo: avatar.trailingAnchor, constant: 10),
+            textStack.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+            textStack.trailingAnchor.constraint(lessThanOrEqualTo: footer.trailingAnchor, constant: -8),
+        ])
+
+        return footer
     }
 
     override func viewDidLoad() {

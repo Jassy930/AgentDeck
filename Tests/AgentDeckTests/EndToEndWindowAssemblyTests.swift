@@ -44,7 +44,7 @@ final class EndToEndWindowAssemblyTests: XCTestCase {
     func testInputBarPlanModeToggle() {
         let bar = InputBarView()
         bar.applyState(planMode: true)
-        let labels = bar.subviews.compactMap { $0 as? NSTextField }
+        let labels = bar.allTextFields()
         let planVisible = labels.contains(where: { $0.stringValue.contains("Plan") && !$0.isHidden })
         XCTAssertTrue(planVisible, "Plan badge should be visible when planMode=true")
     }
@@ -52,7 +52,7 @@ final class EndToEndWindowAssemblyTests: XCTestCase {
     func testInputBarPlanModeHidden() {
         let bar = InputBarView()
         bar.applyState(planMode: false)
-        let labels = bar.subviews.compactMap { $0 as? NSTextField }
+        let labels = bar.allTextFields()
         let planVisible = labels.contains(where: { $0.stringValue.contains("Plan") && !$0.isHidden })
         XCTAssertFalse(planVisible, "Plan badge should be hidden when planMode=false")
     }
@@ -89,5 +89,15 @@ final class EndToEndWindowAssemblyTests: XCTestCase {
             agentKind: .claudeCode
         )
         XCTAssertEqual(thread.agentKind, .claudeCode)
+    }
+}
+
+private extension NSView {
+    func allTextFields() -> [NSTextField] {
+        var fields = subviews.compactMap { $0 as? NSTextField }
+        for subview in subviews {
+            fields.append(contentsOf: subview.allTextFields())
+        }
+        return fields
     }
 }

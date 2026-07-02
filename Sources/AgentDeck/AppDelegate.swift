@@ -21,8 +21,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let vc = SessionViewController(model: model)
         let win = NSWindow(contentViewController: vc)
         win.title = profile.windowTitle
-        win.setContentSize(NSSize(width: 1100, height: 720))
-        win.styleMask.insert([.titled, .closable, .miniaturizable, .resizable])
+        win.setContentSize(NSSize(width: 1280, height: 760))
+        win.styleMask.insert([.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView])
+        win.titleVisibility = .hidden
+        win.titlebarAppearsTransparent = true
+        win.backgroundColor = CodexDesktopChrome.windowBackground
+        win.isMovableByWindowBackground = true
+        win.toolbarStyle = .unifiedCompact
         win.center()
         win.makeKeyAndOrderFront(nil)
         self.window = win

@@ -251,10 +251,17 @@ agentdeck protocol version
 运行（Swift app 会自动 spawn 同目录或 PATH 上的 agentdeckd）：
 
 ```bash
+./script/build_and_run.sh        # 构建 SwiftPM 产物，临时打包 dist/AgentDeck.app 并启动
+./script/build_and_run.sh --verify  # 启动后确认 AgentDeck 进程存在
 swift run AgentDeck               # 本地 debug 构建默认使用 dev profile
 swift run AgentDeck -- --selfcheck  # 无窗口自检: IPC lifecycle + logging/redaction probe
 swift run AgentDeck -- --diagnostics-report --json  # 输出机器可读诊断报告
 ```
+
+macOS 前端使用纯 AppKit。当前主窗口外壳对齐 Codex Desktop：透明标题栏、
+全高左侧历史/项目侧栏、右侧 thread header、Codex 风格空态 composer、
+会话态悬浮 composer 和右侧环境信息面板。外观层仍保持 v0.2 统一壳边界：
+vendor 控件由 `CapabilityRouter` 装配，daemon / IPC / history 模型不因视觉同步而改动。
 
 Profile（用于拆分稳定工作实例和开发调试实例）：
 

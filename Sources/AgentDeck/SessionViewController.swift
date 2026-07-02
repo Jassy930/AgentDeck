@@ -48,13 +48,14 @@ final class SessionViewController: NSViewController {
 
     // MARK: - Views / containers
 
-    private let statusBarView: StatusBarView
     private let rail: TurnJumpRailView
     private let emptyStateView: EmptyStateView
+    private let contentHeaderView: CodexContentHeaderView
 
     /// T6B: agent control bar — bound to `selectedRuntime?.capabilities`.
     private let controlBar = AgentControlBar()
     private var controlBarHeight: NSLayoutConstraint?
+    private var contentHeaderHeight: NSLayoutConstraint?
 
     /// T6B: optional new-session dialog, retained while open.
     private var newSessionDialog: NewSessionDialog?
@@ -62,6 +63,7 @@ final class SessionViewController: NSViewController {
     /// Container placed as the right pane of the split; we swap its content
     /// child between EmptyStateView and the conversation+rail composite.
     private let contentContainer = NSView()
+    private let contentBodyContainer = NSView()
 
     /// Composite view that holds conversationVC.view + rail overlay.
     private let conversationComposite = NSView()
@@ -79,9 +81,9 @@ final class SessionViewController: NSViewController {
 
     init(model: SessionModel) {
         self.model         = model
-        self.statusBarView = StatusBarView(model: model)
         self.rail          = TurnJumpRailView(model: model)
         self.emptyStateView = EmptyStateView(model: model)
+        self.contentHeaderView = CodexContentHeaderView(model: model)
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -92,30 +94,19 @@ final class SessionViewController: NSViewController {
     override func loadView() {
         let root = NSView()
         root.translatesAutoresizingMaskIntoConstraints = false
-
-        // Status bar (fixed height)
-        statusBarView.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(statusBarView)
-
-        // T6B: agent control bar sits below the status bar; height collapses to 0
-        // when no runtime/capabilities are active.
-        controlBar.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(controlBar)
-
-        // 1pt separator between status bar and split pane
-        let separator = NSBox()
-        separator.boxType = .separator
-        separator.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(separator)
+        root.wantsLayer = true
+        root.layer?.backgroundColor = CodexDesktopChrome.windowBackground.cgColor
 
         // NSSplitViewController: left = sidebar, right = content
         let splitVC = NSSplitViewController()
         splitVC.splitView.isVertical = true
         splitVC.splitView.dividerStyle = .thin
+        splitVC.splitView.wantsLayer = true
+        splitVC.splitView.layer?.backgroundColor = CodexDesktopChrome.windowBackground.cgColor
 
         let sidebarItem = NSSplitViewItem(sidebarWithViewController: historySidebarVC)
-        sidebarItem.minimumThickness = 200
-        sidebarItem.maximumThickness = 400
+        sidebarItem.minimumThickness = 236
+        sidebarItem.maximumThickness = 360
         sidebarItem.preferredThicknessFraction = NSSplitViewItem.unspecifiedDimension
         // setPosition is deferred to viewDidLayout (first pass) so the split
         // view already has a real frame; calling it here (pre-layout) is a
@@ -132,25 +123,8 @@ final class SessionViewController: NSViewController {
         splitVC.view.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(splitVC.view)
 
-        let controlBarH = controlBar.heightAnchor.constraint(equalToConstant: 0)
-        controlBarHeight = controlBarH
-
         NSLayoutConstraint.activate([
-            statusBarView.topAnchor.constraint(equalTo: root.topAnchor),
-            statusBarView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            statusBarView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            statusBarView.heightAnchor.constraint(equalToConstant: 36),
-
-            controlBar.topAnchor.constraint(equalTo: statusBarView.bottomAnchor),
-            controlBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            controlBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            controlBarH,
-
-            separator.topAnchor.constraint(equalTo: controlBar.bottomAnchor),
-            separator.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            separator.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-
-            splitVC.view.topAnchor.constraint(equalTo: separator.bottomAnchor),
+            splitVC.view.topAnchor.constraint(equalTo: root.topAnchor),
             splitVC.view.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             splitVC.view.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             splitVC.view.bottomAnchor.constraint(equalTo: root.bottomAnchor),
@@ -164,6 +138,7 @@ final class SessionViewController: NSViewController {
         observeCapabilities()
         // Apply initial content based on current cwd state
         updateContentPane(hasCwd: model.cwd != nil)
+        refreshContentChrome(hasCwd: model.cwd != nil)
         refreshControlBar()
     }
 
@@ -173,7 +148,7 @@ final class SessionViewController: NSViewController {
         // the split view has a real frame and setPosition takes effect.
         guard !didApplyInitialSidebarWidth, let sv = splitVC?.splitView,
               sv.frame.width > 0 else { return }
-        sv.setPosition(260, ofDividerAt: 0)
+        sv.setPosition(220, ofDividerAt: 0)
         didApplyInitialSidebarWidth = true
     }
 
@@ -184,6 +159,39 @@ final class SessionViewController: NSViewController {
     private func makeContentContainerVC() -> NSViewController {
         let vc = NSViewController()
         contentContainer.translatesAutoresizingMaskIntoConstraints = false
+        contentContainer.wantsLayer = true
+        contentContainer.layer?.backgroundColor = CodexDesktopChrome.windowBackground.cgColor
+
+        contentHeaderView.translatesAutoresizingMaskIntoConstraints = false
+        controlBar.translatesAutoresizingMaskIntoConstraints = false
+        contentBodyContainer.translatesAutoresizingMaskIntoConstraints = false
+
+        contentContainer.addSubview(contentHeaderView)
+        contentContainer.addSubview(controlBar)
+        contentContainer.addSubview(contentBodyContainer)
+
+        let headerH = contentHeaderView.heightAnchor.constraint(equalToConstant: 0)
+        let controlBarH = controlBar.heightAnchor.constraint(equalToConstant: 0)
+        contentHeaderHeight = headerH
+        controlBarHeight = controlBarH
+
+        NSLayoutConstraint.activate([
+            contentHeaderView.topAnchor.constraint(equalTo: contentContainer.topAnchor),
+            contentHeaderView.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
+            contentHeaderView.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
+            headerH,
+
+            controlBar.topAnchor.constraint(equalTo: contentHeaderView.bottomAnchor),
+            controlBar.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor, constant: 18),
+            controlBar.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor, constant: -18),
+            controlBarH,
+
+            contentBodyContainer.topAnchor.constraint(equalTo: controlBar.bottomAnchor),
+            contentBodyContainer.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
+            contentBodyContainer.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
+            contentBodyContainer.bottomAnchor.constraint(equalTo: contentContainer.bottomAnchor),
+        ])
+
         vc.view = contentContainer
         return vc
     }
@@ -239,6 +247,7 @@ final class SessionViewController: NSViewController {
         }, onChange: { [weak self] in
             guard let self else { return }
             self.updateContentPane(hasCwd: self.model.cwd != nil)
+            self.refreshContentChrome(hasCwd: self.model.cwd != nil)
         })
     }
 
@@ -251,6 +260,7 @@ final class SessionViewController: NSViewController {
             guard let self else { return }
             _ = self.model.workbench.selectedSessionId
             _ = self.model.workbench.selectedRuntime?.capabilities?.agentKind
+            _ = self.model.cwd
         }, onChange: { [weak self] in
             self?.refreshControlBar()
         })
@@ -271,13 +281,17 @@ final class SessionViewController: NSViewController {
                     self?.model.submitVendorControl(sessionId: sessionId, payload: payload)
                 }
             )
-            controlBarHeight?.constant = 30
+            controlBarHeight?.constant = 0
         } else {
             controlBar.clear()
             controlBarHeight?.constant = 0
         }
-        // T6C: keep status bar agent-kind icon in sync with the active runtime.
-        statusBarView.bind(agentKind: model.workbench.selectedRuntime?.capabilities?.agentKind)
+        refreshContentChrome(hasCwd: model.cwd != nil)
+    }
+
+    private func refreshContentChrome(hasCwd: Bool) {
+        contentHeaderHeight?.constant = hasCwd ? 44 : 0
+        contentHeaderView.isHidden = !hasCwd
     }
 
     /// T6B: present the new-session dialog and dispatch the resulting
@@ -316,24 +330,24 @@ final class SessionViewController: NSViewController {
         if hasCwd {
             emptyStateView.removeFromSuperview()
             if conversationComposite.superview == nil {
-                contentContainer.addSubview(conversationComposite)
+                contentBodyContainer.addSubview(conversationComposite)
                 NSLayoutConstraint.activate([
-                    conversationComposite.topAnchor.constraint(equalTo: contentContainer.topAnchor),
-                    conversationComposite.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
-                    conversationComposite.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
-                    conversationComposite.bottomAnchor.constraint(equalTo: contentContainer.bottomAnchor),
+                    conversationComposite.topAnchor.constraint(equalTo: contentBodyContainer.topAnchor),
+                    conversationComposite.leadingAnchor.constraint(equalTo: contentBodyContainer.leadingAnchor),
+                    conversationComposite.trailingAnchor.constraint(equalTo: contentBodyContainer.trailingAnchor),
+                    conversationComposite.bottomAnchor.constraint(equalTo: contentBodyContainer.bottomAnchor),
                 ])
             }
         } else {
             conversationComposite.removeFromSuperview()
             if emptyStateView.superview == nil {
                 emptyStateView.translatesAutoresizingMaskIntoConstraints = false
-                contentContainer.addSubview(emptyStateView)
+                contentBodyContainer.addSubview(emptyStateView)
                 NSLayoutConstraint.activate([
-                    emptyStateView.topAnchor.constraint(equalTo: contentContainer.topAnchor),
-                    emptyStateView.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
-                    emptyStateView.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
-                    emptyStateView.bottomAnchor.constraint(equalTo: contentContainer.bottomAnchor),
+                    emptyStateView.topAnchor.constraint(equalTo: contentBodyContainer.topAnchor),
+                    emptyStateView.leadingAnchor.constraint(equalTo: contentBodyContainer.leadingAnchor),
+                    emptyStateView.trailingAnchor.constraint(equalTo: contentBodyContainer.trailingAnchor),
+                    emptyStateView.bottomAnchor.constraint(equalTo: contentBodyContainer.bottomAnchor),
                 ])
             }
         }

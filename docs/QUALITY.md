@@ -7,6 +7,7 @@
 ```bash
 cargo test
 swift test
+./script/build_and_run.sh --verify
 swift run AgentDeck -- --selfcheck
 swift run AgentDeck -- --diagnostics-report --json
 swift run AgentDeck -- --selfcheck --profile dev
@@ -27,7 +28,10 @@ grep -rn "import SwiftUI" Sources Tests
 # 构建与测试
 swift build
 swift test   # 覆盖：markdown builder、display-row、observation binder、
-             #         行高缓存、契约一致性、rail 几何、smoke tests
+             #         行高缓存、契约一致性、rail 几何、Codex chrome smoke tests
+
+# GUI bundle 启动验证（避免 raw SwiftPM GUI 启动差异）
+./script/build_and_run.sh --verify
 
 # headless 自检（IPC 生命周期 + 日志/脱敏）
 swift run AgentDeck -- --selfcheck
@@ -43,7 +47,10 @@ cargo test
 
 下列项目无法通过单元测试覆盖，须每次发布前人工验证：
 
+- [ ] 应用可通过 `./script/build_and_run.sh --verify` 启动为 `dist/AgentDeck.app`
 - [ ] 应用正常启动，窗口标题显示 `AgentDeck Dev`（debug 构建）
+- [ ] 空态首屏对齐 Codex Desktop：透明标题栏、全高左侧侧栏、居中大标题、圆角 composer、连接卡片和底部速率提示
+- [ ] 会话态对齐 Codex Desktop：右侧 thread header、右上环境信息面板、底部悬浮 composer
 - [ ] 左侧历史侧栏（NSOutlineView）宽度约 260pt，可自由拖动分割线
 - [ ] 历史列表刷新后按项目 `cwd` 分组展示
 - [ ] 新建会话（点击项目旁加号）→ 右侧显示空状态视图

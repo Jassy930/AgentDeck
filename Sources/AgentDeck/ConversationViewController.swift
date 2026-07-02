@@ -74,6 +74,7 @@ final class ConversationViewController: NSViewController {
     private let scrollView = NSScrollView()
     private let tableView = NSTableView()
     private lazy var inputBar = InputBarView(model: model)
+    private let environmentPanel = CodexEnvironmentPanelView()
     private let errorCell = ErrorCellView()
     private let warningCell = WarningCellView()
     private let approvalCard = ApprovalCardView()
@@ -112,28 +113,44 @@ final class ConversationViewController: NSViewController {
     override func loadView() {
         let root = NSView()
         root.translatesAutoresizingMaskIntoConstraints = false
+        root.wantsLayer = true
+        root.layer?.backgroundColor = CodexDesktopChrome.windowBackground.cgColor
 
         configureTableView()
         configureScrollView()
         configureFooter()
 
         root.addSubview(scrollView)
+        root.addSubview(environmentPanel)
         root.addSubview(footerStack)
         root.addSubview(inputBar)
 
+        let preferredTranscriptWidth = scrollView.widthAnchor.constraint(equalToConstant: 900)
+        preferredTranscriptWidth.priority = .defaultHigh
+        let preferredInputWidth = inputBar.widthAnchor.constraint(equalToConstant: 860)
+        preferredInputWidth.priority = .defaultHigh
+
         NSLayoutConstraint.activate([
             scrollView.topAnchor.constraint(equalTo: root.topAnchor),
-            scrollView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            scrollView.centerXAnchor.constraint(equalTo: root.centerXAnchor, constant: -70),
+            preferredTranscriptWidth,
+            scrollView.widthAnchor.constraint(lessThanOrEqualToConstant: 900),
+            scrollView.leadingAnchor.constraint(greaterThanOrEqualTo: root.leadingAnchor, constant: 34),
+            scrollView.trailingAnchor.constraint(lessThanOrEqualTo: environmentPanel.leadingAnchor, constant: -24),
 
             footerStack.topAnchor.constraint(equalTo: scrollView.bottomAnchor),
-            footerStack.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            footerStack.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            footerStack.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
+            footerStack.widthAnchor.constraint(equalTo: inputBar.widthAnchor),
 
             inputBar.topAnchor.constraint(equalTo: footerStack.bottomAnchor),
-            inputBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            inputBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            inputBar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            inputBar.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
+            preferredInputWidth,
+            inputBar.widthAnchor.constraint(lessThanOrEqualToConstant: 860),
+            inputBar.leadingAnchor.constraint(greaterThanOrEqualTo: root.leadingAnchor, constant: 34),
+            inputBar.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -18),
+
+            environmentPanel.topAnchor.constraint(equalTo: root.topAnchor, constant: 20),
+            environmentPanel.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24),
         ])
 
         self.view = root
