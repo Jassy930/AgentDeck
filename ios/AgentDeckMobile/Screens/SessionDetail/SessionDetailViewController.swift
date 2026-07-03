@@ -7,6 +7,8 @@ final class SessionDetailViewController: UIViewController {
     private let viewModel: SessionDetailViewModel
     private var collectionView: UICollectionView!
     private var dataSource: UICollectionViewDiffableDataSource<Section, String>!
+    private var expandedRowIDs: Set<String> = []
+    private let errorBanner = ErrorBannerView()
 
     init(source: MobileSessionSource, sessionID: String, title: String) {
         self.viewModel = SessionDetailViewModel(source: source, sessionID: sessionID)
@@ -20,6 +22,7 @@ final class SessionDetailViewController: UIViewController {
         super.viewDidLoad()
         view.backgroundColor = DesignTokens.bg
         configureCollectionView()
+        configureErrorBanner()
         viewModel.onUpdate = { [weak self] in self?.applySnapshot() }
         viewModel.start()
     }
@@ -45,6 +48,26 @@ final class SessionDetailViewController: UIViewController {
         let textReg = UICollectionView.CellRegistration<AssistantTextCell, UIItem> { cell, _, item in
             cell.configure(with: item)
         }
+        let collapsibleReg = UICollectionView.CellRegistration<CollapsibleItemCell, String> {
+            [weak self] cell, _, rowID in
+            guard let self, let row = self.viewModel.rows.first(where: { $0.id == rowID }),
+                  let presentation = CollapsiblePresentation.make(from: row.item) else { return }
+            let expanded = self.expandedRowIDs.contains(rowID)
+            cell.configure(with: presentation, expanded: expanded)
+            cell.onToggle = { [weak self] in
+                guard let self else { return }
+                if self.expandedRowIDs.contains(rowID) {
+                    self.expandedRowIDs.remove(rowID)
+                } else {
+                    self.expandedRowIDs.insert(rowID)
+                }
+                // reconfigure 该行，并 invalidateLayout 刷新高度
+                var snapshot = self.dataSource.snapshot()
+                snapshot.reconfigureItems([rowID])
+                self.dataSource.apply(snapshot, animatingDifferences: true)
+                self.collectionView.collectionViewLayout.invalidateLayout()
+            }
+        }
         dataSource = UICollectionViewDiffableDataSource<Section, String>(collectionView: collectionView) {
             [weak self] collectionView, indexPath, rowID in
             guard let self, let row = self.viewModel.rows.first(where: { $0.id == rowID }) else { return nil }
@@ -53,9 +76,24 @@ final class SessionDetailViewController: UIViewController {
             case .userPrompt:
                 return collectionView.dequeueConfiguredReusableCell(using: userReg, for: indexPath, item: row.item)
             case .assistantItem:
-                return collectionView.dequeueConfiguredReusableCell(using: textReg, for: indexPath, item: row.item)
+                // 优先走折叠 cell；非折叠 kind 降级到文本 cell
+                if CollapsiblePresentation.make(from: row.item) != nil {
+                    return collectionView.dequeueConfiguredReusableCell(using: collapsibleReg, for: indexPath, item: rowID)
+                } else {
+                    return collectionView.dequeueConfiguredReusableCell(using: textReg, for: indexPath, item: row.item)
+                }
             }
         }
+    }
+
+    private func configureErrorBanner() {
+        errorBanner.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(errorBanner)
+        NSLayoutConstraint.activate([
+            errorBanner.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: DesignTokens.sp2),
+            errorBanner.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: DesignTokens.sp4),
+            errorBanner.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -DesignTokens.sp4),
+        ])
     }
 
     private func applySnapshot() {
@@ -68,6 +106,12 @@ final class SessionDetailViewController: UIViewController {
         dataSource.apply(snapshot, animatingDifferences: false)
         if let last = ids.last, let indexPath = dataSource.indexPath(for: last) {
             collectionView.scrollToItem(at: indexPath, at: .bottom, animated: false)
+        }
+        // 同步错误横幅
+        if let errorText = viewModel.errorText {
+            errorBanner.show(message: errorText)
+        } else {
+            errorBanner.hide()
         }
     }
 }
