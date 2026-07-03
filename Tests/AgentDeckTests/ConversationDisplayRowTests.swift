@@ -1,4 +1,5 @@
 import XCTest
+import AgentDeckCore
 @testable import AgentDeck
 
 // MARK: - Test support
@@ -18,12 +19,12 @@ enum ConversationDisplayRowTestSupport {
             kind: "reasoning",
             text: "Thinking..."
         )
-        let assistantItem2 = UIItem(
+        var assistantItem2 = UIItem(
             id: "item-assistant-2",
             lifecycle: "completed",
-            kind: "shell",
-            command: "ls -la"
+            kind: "shell"
         )
+        assistantItem2.command = "ls -la"
         // makeConversationTurns groups by "user" kind boundary.
         let items: [UIItem] = [userItem, assistantItem1, assistantItem2]
         return makeConversationTurns(from: items)

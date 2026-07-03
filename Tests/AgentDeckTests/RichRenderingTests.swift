@@ -1,6 +1,7 @@
 import Testing
 import CoreGraphics
 import Foundation
+import AgentDeckCore
 @testable import AgentDeck
 
 /// Framework-agnostic rendering/geometry assertions that survived the AppKit
@@ -45,16 +46,14 @@ struct RichRenderingTests {
         let longPrompt = "  first line\n\nsecond line with    extra spaces and enough text to be truncated after the summary limit keeps the rail compact  "
         let turns = makeConversationTurns(from: [
             UIItem(id: "intro", lifecycle: "completed", kind: "message", text: "orphan assistant"),
-            UIItem(
-                id: "u1",
-                lifecycle: "completed",
-                kind: "user",
-                text: longPrompt,
-                attachments: [
+            {
+                var u1 = UIItem(id: "u1", lifecycle: "completed", kind: "user", text: longPrompt)
+                u1.attachments = [
                     HistoryReference(kind: "file", text: nil, url: nil, path: "/tmp/a.swift", name: "a.swift"),
                     HistoryReference(kind: "url", text: nil, url: "https://example.com", path: nil, name: nil),
                 ]
-            ),
+                return u1
+            }(),
             UIItem(id: "m1", lifecycle: "completed", kind: "message", text: "answer"),
             UIItem(id: "u2", lifecycle: "completed", kind: "user", text: "continue"),
         ])

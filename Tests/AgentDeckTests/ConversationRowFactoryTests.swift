@@ -1,5 +1,6 @@
 import XCTest
 import AppKit
+import AgentDeckCore
 @testable import AgentDeck
 
 // MARK: - Test support

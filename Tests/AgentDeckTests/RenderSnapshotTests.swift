@@ -1,5 +1,6 @@
 import XCTest
 import AppKit
+import AgentDeckCore
 @testable import AgentDeck
 
 /// 把"有数据"的界面渲染成 PNG（/tmp），供人工核对真实呈现。

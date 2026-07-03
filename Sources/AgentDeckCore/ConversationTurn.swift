@@ -1,20 +1,33 @@
 import Foundation
 
-struct ConversationTurn: Identifiable {
-    let id: String
-    var user: UIItem?
-    var assistantItems: [UIItem]
+public struct ConversationTurn: Identifiable {
+    public let id: String
+    public var user: UIItem?
+    public var assistantItems: [UIItem]
+
+    public init(id: String, user: UIItem? = nil, assistantItems: [UIItem]) {
+        self.id = id
+        self.user = user
+        self.assistantItems = assistantItems
+    }
 }
 
-struct ConversationTurnNavigationItem: Identifiable, Equatable {
-    var id: String { turnId }
-    let turnId: String
-    let index: Int
-    let summary: String
-    let attachmentCount: Int
+public struct ConversationTurnNavigationItem: Identifiable, Equatable {
+    public var id: String { turnId }
+    public let turnId: String
+    public let index: Int
+    public let summary: String
+    public let attachmentCount: Int
+
+    public init(turnId: String, index: Int, summary: String, attachmentCount: Int) {
+        self.turnId = turnId
+        self.index = index
+        self.summary = summary
+        self.attachmentCount = attachmentCount
+    }
 }
 
-func makeConversationTurns(from items: [UIItem]) -> [ConversationTurn] {
+public func makeConversationTurns(from items: [UIItem]) -> [ConversationTurn] {
     var turns: [ConversationTurn] = []
     var currentUser: UIItem?
     var currentAssistantItems: [UIItem] = []
@@ -46,7 +59,7 @@ func makeConversationTurns(from items: [UIItem]) -> [ConversationTurn] {
     return turns
 }
 
-func makeConversationTurnNavigationItems(
+public func makeConversationTurnNavigationItems(
     from turns: [ConversationTurn],
     summaryLimit: Int = 80
 ) -> [ConversationTurnNavigationItem] {

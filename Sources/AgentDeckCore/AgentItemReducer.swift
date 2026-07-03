@@ -1,5 +1,4 @@
 import Foundation
-import AgentDeckCore
 
 /// Cumulative-semantics agent item store. v2 (Task 6A) ingests typed
 /// `AgentItem` values from the daemon's `ServerEvent::AgentItem` and
@@ -9,17 +8,19 @@ import AgentDeckCore
 /// The daemon now emits cumulative AgentItems (each event is the complete
 /// current state), so the reducer no longer needs delta accumulation logic
 /// — each `apply` replaces the matching slot.
-struct AgentItemStore {
-    var items: [UIItem] = []
-    var itemIndexById: [String: Int] = [:]
+public struct AgentItemStore {
+    public var items: [UIItem] = []
+    public var itemIndexById: [String: Int] = [:]
+
+    public init() {}
 }
 
-enum AgentItemReducer {
+public enum AgentItemReducer {
     /// Apply a typed v2 AgentItem to the store. The store key is a stable id
     /// derived from item content + a monotonic per-store sequence — since
     /// daemon AgentItems don't carry their own id we synthesize one per
     /// (kind, position) pair using the caller-provided `itemId`.
-    static func apply(_ item: AgentItem, itemId: String, into store: inout AgentItemStore) {
+    public static func apply(_ item: AgentItem, itemId: String, into store: inout AgentItemStore) {
         var ui = store.itemIndexById[itemId].flatMap { idx in
             store.items.indices.contains(idx) ? store.items[idx] : nil
         } ?? UIItem(id: itemId, lifecycle: "completed", kind: kindLabel(for: item))
@@ -36,7 +37,7 @@ enum AgentItemReducer {
     }
 
     /// Map AgentItem variant → legacy `UIItem.kind` label, kept for UI compat.
-    static func kindLabel(for item: AgentItem) -> String {
+    public static func kindLabel(for item: AgentItem) -> String {
         switch item {
         case .userMessage: "user"
         case .assistantMessage: "message"

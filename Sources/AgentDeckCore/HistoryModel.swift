@@ -1,21 +1,33 @@
 import Foundation
-import AgentDeckCore
 
 /// Neutral summary for one persisted agent thread. Mirrors the daemon's
 /// history shape; Swift never parses vendor thread JSON directly.
-struct HistoryThreadSummary: Identifiable, Codable, Equatable {
-    let id: String
-    var name: String?
-    var preview: String
-    var cwd: String
-    var createdAt: Int
-    var updatedAt: Int
-    var status: String
-    var modelProvider: String
-    var source: String
-    var agentKind: AgentKind
+public struct HistoryThreadSummary: Identifiable, Codable, Equatable, Sendable {
+    public let id: String
+    public var name: String?
+    public var preview: String
+    public var cwd: String
+    public var createdAt: Int
+    public var updatedAt: Int
+    public var status: String
+    public var modelProvider: String
+    public var source: String
+    public var agentKind: AgentKind
 
-    var displayTitle: String {
+    public init(id: String, name: String? = nil, preview: String, cwd: String, createdAt: Int, updatedAt: Int, status: String, modelProvider: String, source: String, agentKind: AgentKind) {
+        self.id = id
+        self.name = name
+        self.preview = preview
+        self.cwd = cwd
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.status = status
+        self.modelProvider = modelProvider
+        self.source = source
+        self.agentKind = agentKind
+    }
+
+    public var displayTitle: String {
         let title = (name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if !title.isEmpty { return title }
         // 兜底清洗预览里的 CLI 命令元数据标签（持久化线程的 preview 可能仍带标签）。
@@ -24,16 +36,21 @@ struct HistoryThreadSummary: Identifiable, Codable, Equatable {
     }
 }
 
-struct HistoryProjectGroup: Identifiable, Equatable {
-    var id: String { cwd }
-    let cwd: String
-    let threads: [HistoryThreadSummary]
+public struct HistoryProjectGroup: Identifiable, Equatable {
+    public var id: String { cwd }
+    public let cwd: String
+    public let threads: [HistoryThreadSummary]
 
-    var projectName: String {
+    public init(cwd: String, threads: [HistoryThreadSummary]) {
+        self.cwd = cwd
+        self.threads = threads
+    }
+
+    public var projectName: String {
         URL(fileURLWithPath: cwd).lastPathComponent
     }
 
-    static func group(_ threads: [HistoryThreadSummary]) -> [HistoryProjectGroup] {
+    public static func group(_ threads: [HistoryThreadSummary]) -> [HistoryProjectGroup] {
         let grouped = Dictionary(grouping: threads, by: \.cwd)
         return grouped.map { cwd, items in
             HistoryProjectGroup(
@@ -57,140 +74,120 @@ struct HistoryProjectGroup: Identifiable, Equatable {
     }
 }
 
-struct HistoryThreadRowPresentation: Equatable {
-    enum VisualState: Equatable {
-        case idle
-        case hovered
-        case selected
-        case opening
-    }
+public struct HistoryThreadListPayload: Codable, Equatable {
+    public var threads: [HistoryThreadSummary]
+    public var nextCursor: String?
 
-    let visualState: VisualState
-    let usesFullRowHitTarget = true
-    let runtimePhase: SessionModel.Phase?
-    let unreadEventCount: Int
-
-    init(
-        threadId: String,
-        selectedThreadId: String?,
-        openingThreadId: String?,
-        hoveredThreadId: String?,
-        runtimePhase: SessionModel.Phase? = nil,
-        unreadEventCount: Int = 0
-    ) {
-        if openingThreadId == threadId {
-            visualState = .opening
-        } else if selectedThreadId == threadId {
-            visualState = .selected
-        } else if hoveredThreadId == threadId {
-            visualState = .hovered
-        } else {
-            visualState = .idle
-        }
-
-        self.runtimePhase = runtimePhase
-        self.unreadEventCount = unreadEventCount
-    }
-
-    var isEmphasized: Bool {
-        visualState == .selected || visualState == .opening
-    }
-
-    var hasRuntimeIndicator: Bool {
-        runtimePhase != nil
-    }
-
-    var hasUnreadIndicator: Bool {
-        unreadEventCount > 0
-    }
-
-    var runtimeStatusLabel: String? {
-        runtimePhase?.rawValue
+    public init(threads: [HistoryThreadSummary], nextCursor: String? = nil) {
+        self.threads = threads
+        self.nextCursor = nextCursor
     }
 }
 
-struct HistoryThreadListPayload: Codable, Equatable {
-    var threads: [HistoryThreadSummary]
-    var nextCursor: String?
+public struct HistoryReference: Codable, Equatable {
+    public var kind: String
+    public var text: String?
+    public var url: String?
+    public var path: String?
+    public var name: String?
+
+    public init(kind: String, text: String? = nil, url: String? = nil, path: String? = nil, name: String? = nil) {
+        self.kind = kind
+        self.text = text
+        self.url = url
+        self.path = path
+        self.name = name
+    }
 }
 
-struct HistoryReference: Codable, Equatable {
-    var kind: String
-    var text: String?
-    var url: String?
-    var path: String?
-    var name: String?
+public struct HistoryHookFragment: Codable, Equatable {
+    public var hookRunId: String
+    public var text: String
+
+    public init(hookRunId: String, text: String) {
+        self.hookRunId = hookRunId
+        self.text = text
+    }
 }
 
-struct HistoryHookFragment: Codable, Equatable {
-    var hookRunId: String
-    var text: String
+public struct HistoryFileChange: Codable, Equatable {
+    public var path: String
+    public var diff: String
+    public var changeKind: String
+
+    public init(path: String, diff: String, changeKind: String) {
+        self.path = path
+        self.diff = diff
+        self.changeKind = changeKind
+    }
 }
 
-struct HistoryFileChange: Codable, Equatable {
-    var path: String
-    var diff: String
-    var changeKind: String
+public struct HistoryToolAction: Codable, Equatable {
+    public var kind: String
+    public var command: String
+    public var path: String?
+    public var name: String?
+    public var query: String?
+
+    public init(kind: String, command: String, path: String? = nil, name: String? = nil, query: String? = nil) {
+        self.kind = kind
+        self.command = command
+        self.path = path
+        self.name = name
+        self.query = query
+    }
 }
 
-struct HistoryToolAction: Codable, Equatable {
-    var kind: String
-    var command: String
-    var path: String?
-    var name: String?
-    var query: String?
-}
+public struct HistoryReplayItem: Codable, Equatable, Identifiable {
+    public let id: String
+    public var lifecycle: String
+    public var kind: String
+    public var text: String = ""
+    public var command: String = ""
+    public var output: String?
+    public var exitCode: Int?
+    public var path: String = ""
+    public var diff: String?
+    public var description: String?
+    public var query: String = ""
+    public var action: String = ""
+    public var actionQuery: String?
+    public var queries: [String] = []
+    public var url: String?
+    public var pattern: String?
+    public var attachments: [HistoryReference] = []
+    public var phase: String?
+    public var memoryCitation: String?
+    public var cwd: String?
+    public var status: String?
+    public var durationMs: Int?
+    public var source: String?
+    public var processId: String?
+    public var actions: [HistoryToolAction] = []
+    public var changes: [HistoryFileChange] = []
+    public var fragments: [HistoryHookFragment] = []
+    public var toolKind: String = ""
+    public var server: String?
+    public var namespace: String?
+    public var tool: String = ""
+    public var arguments: String = ""
+    public var result: String?
+    public var error: String?
+    public var success: Bool?
+    public var resourceUri: String?
+    public var contentItems: [HistoryReference] = []
+    public var prompt: String?
+    public var model: String?
+    public var reasoningEffort: String?
+    public var senderThreadId: String?
+    public var receiverThreadIds: [String] = []
+    public var agentsStates: String?
+    public var mediaKind: String = ""
+    public var savedPath: String?
+    public var revisedPrompt: String?
+    public var review: String?
 
-struct HistoryReplayItem: Codable, Equatable, Identifiable {
-    let id: String
-    var lifecycle: String
-    var kind: String
-    var text: String = ""
-    var command: String = ""
-    var output: String?
-    var exitCode: Int?
-    var path: String = ""
-    var diff: String?
-    var description: String?
-    var query: String = ""
-    var action: String = ""
-    var actionQuery: String?
-    var queries: [String] = []
-    var url: String?
-    var pattern: String?
-    var attachments: [HistoryReference] = []
-    var phase: String?
-    var memoryCitation: String?
-    var cwd: String?
-    var status: String?
-    var durationMs: Int?
-    var source: String?
-    var processId: String?
-    var actions: [HistoryToolAction] = []
-    var changes: [HistoryFileChange] = []
-    var fragments: [HistoryHookFragment] = []
-    var toolKind: String = ""
-    var server: String?
-    var namespace: String?
-    var tool: String = ""
-    var arguments: String = ""
-    var result: String?
-    var error: String?
-    var success: Bool?
-    var resourceUri: String?
-    var contentItems: [HistoryReference] = []
-    var prompt: String?
-    var model: String?
-    var reasoningEffort: String?
-    var senderThreadId: String?
-    var receiverThreadIds: [String] = []
-    var agentsStates: String?
-    var mediaKind: String = ""
-    var savedPath: String?
-    var revisedPrompt: String?
-    var review: String?
-
-    enum CodingKeys: String, CodingKey {
+    public enum CodingKeys: String, CodingKey {
         case id, lifecycle, kind, text, command, output, exitCode, path, diff, description
         case query, action, actionQuery, queries, url, pattern
         case attachments, phase, memoryCitation, cwd, status, durationMs, source, processId, actions
@@ -199,7 +196,7 @@ struct HistoryReplayItem: Codable, Equatable, Identifiable {
         case receiverThreadIds, agentsStates, mediaKind, savedPath, revisedPrompt, review
     }
 
-    init(
+    public init(
         id: String,
         lifecycle: String,
         kind: String,
@@ -297,7 +294,7 @@ struct HistoryReplayItem: Codable, Equatable, Identifiable {
         self.review = review
     }
 
-    init(from decoder: Decoder) throws {
+    public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
         lifecycle = try c.decode(String.self, forKey: .lifecycle)
@@ -349,7 +346,12 @@ struct HistoryReplayItem: Codable, Equatable, Identifiable {
     }
 }
 
-struct HistoryThreadDetail: Codable, Equatable {
-    var thread: HistoryThreadSummary
-    var items: [HistoryReplayItem]
+public struct HistoryThreadDetail: Codable, Equatable {
+    public var thread: HistoryThreadSummary
+    public var items: [HistoryReplayItem]
+
+    public init(thread: HistoryThreadSummary, items: [HistoryReplayItem]) {
+        self.thread = thread
+        self.items = items
+    }
 }

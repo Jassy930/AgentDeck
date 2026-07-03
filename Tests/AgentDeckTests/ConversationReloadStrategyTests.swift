@@ -1,4 +1,5 @@
 import XCTest
+import AgentDeckCore
 @testable import AgentDeck
 
 /// Covers the reload-strategy decision (root-cause fix for C1/C2): a pure

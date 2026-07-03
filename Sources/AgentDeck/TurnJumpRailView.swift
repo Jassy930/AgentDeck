@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import AgentDeckCore
 
 // MARK: - Migrated from SessionView.swift (verbatim logic, visibility changed private → internal)
 

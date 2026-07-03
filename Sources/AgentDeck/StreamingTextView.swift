@@ -1,4 +1,5 @@
 import AppKit
+import AgentDeckCore
 
 enum StreamingTextStorageSyncResult: Equatable {
     case unchanged

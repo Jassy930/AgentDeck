@@ -14,24 +14,32 @@ import Foundation
 /// Error/warning messages (`errorMessage`/`warningMessage`) are also separate
 /// model fields, not `UIItem` kinds, so they are likewise excluded from the
 /// flattened stream.
-struct ConversationDisplayRow: Identifiable {
+public struct ConversationDisplayRow: Identifiable {
 
-    enum Role: Equatable {
+    public enum Role: Equatable {
         case userPrompt
         case assistantItem
     }
 
-    let role: Role
-    let turnId: String
-    let item: UIItem
-    let firstInTurn: Bool
-    let lastInTurn: Bool
+    public let role: Role
+    public let turnId: String
+    public let item: UIItem
+    public let firstInTurn: Bool
+    public let lastInTurn: Bool
 
     /// Globally unique within the flattened list.
     /// Uses turnId + item.id + role to guarantee uniqueness even if the same
     /// UIItem somehow appears in two roles (which the model prevents, but
     /// defensive uniqueness costs nothing).
-    var id: String { "\(turnId)#\(item.id)#\(role)" }
+    public var id: String { "\(turnId)#\(item.id)#\(role)" }
+
+    public init(role: Role, turnId: String, item: UIItem, firstInTurn: Bool, lastInTurn: Bool) {
+        self.role = role
+        self.turnId = turnId
+        self.item = item
+        self.firstInTurn = firstInTurn
+        self.lastInTurn = lastInTurn
+    }
 }
 
 // MARK: - Reload decision
@@ -39,7 +47,7 @@ struct ConversationDisplayRow: Identifiable {
 /// The structural relationship between a previously displayed row sequence and a
 /// freshly rebuilt one, used by `ConversationViewController` to pick the cheapest
 /// correct table-view update.
-enum ConversationRowsDiff: Equatable {
+public enum ConversationRowsDiff: Equatable {
     /// The `row.id` sequence is identical — the only thing that can have changed
     /// is streaming text growth inside existing rows. No cell needs to be
     /// reconfigured (each cell already streams its own buffer); the table only
@@ -57,7 +65,7 @@ enum ConversationRowsDiff: Equatable {
     /// Pure function of the two id/version sequences so it is unit-testable
     /// without any AppKit view. When the id sequence matches, only rows whose
     /// content `version` changed are reported as needing height re-measurement.
-    static func decide(
+    public static func decide(
         previous: [(id: String, version: Int)],
         next: [(id: String, version: Int)]
     ) -> ConversationRowsDiff {
@@ -77,14 +85,14 @@ enum ConversationRowsDiff: Equatable {
 
 // MARK: - Builder
 
-enum ConversationDisplayRowBuilder {
+public enum ConversationDisplayRowBuilder {
 
     /// Flatten `[ConversationTurn]` into a virtualizable sequence of rows.
     ///
     /// Order: user-prompt row (if present) then assistant-item rows, in the
     /// order stored on the turn. `firstInTurn`/`lastInTurn` mark the first and
     /// last row of each turn respectively.
-    static func rows(from turns: [ConversationTurn]) -> [ConversationDisplayRow] {
+    public static func rows(from turns: [ConversationTurn]) -> [ConversationDisplayRow] {
         var out: [ConversationDisplayRow] = []
         for turn in turns {
             // Collect (role, item) pairs for this turn.

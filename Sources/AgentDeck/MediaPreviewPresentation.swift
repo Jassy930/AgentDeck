@@ -1,4 +1,5 @@
 import AppKit
+import AgentDeckCore
 
 /// Resolves the on-disk path used to preview a media item and loads it as an
 /// `NSImage`. Prefers the saved path (the durable, user-visible artifact) over

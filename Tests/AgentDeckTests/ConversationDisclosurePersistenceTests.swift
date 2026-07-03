@@ -14,7 +14,8 @@ final class ConversationDisclosurePersistenceTests: XCTestCase {
         let model = SessionModel()
         var user = UIItem(id: "u1", lifecycle: "completed", kind: "user", text: "run it")
         user.textBuffer.replace(with: "run it")
-        var shell = UIItem(id: "s1", lifecycle: "completed", kind: "shell", command: "ls -la")
+        var shell = UIItem(id: "s1", lifecycle: "completed", kind: "shell")
+        shell.command = "ls -la"
         shell.output = output
         shell.outputBuffer.replace(with: output)
         model.items = [user, shell]

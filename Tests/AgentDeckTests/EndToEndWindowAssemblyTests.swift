@@ -1,5 +1,6 @@
 import XCTest
 import AppKit
+import AgentDeckCore
 @testable import AgentDeck
 
 /// End-to-end smoke tests: verify the main window assembly components can be

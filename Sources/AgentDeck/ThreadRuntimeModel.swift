@@ -133,12 +133,12 @@ final class ThreadRuntimeModel {
     @discardableResult
     func appendUserPrompt(_ prompt: String) -> String {
         markUpdated()
-        let userItem = UIItem(
+        var userItem = UIItem(
             id: "user-\(UUID().uuidString)",
             lifecycle: "completed",
-            kind: "user",
-            text: prompt
+            kind: "user"
         )
+        userItem.text = prompt
         itemIndexById[userItem.id] = items.count
         items.append(userItem)
         return userItem.id
@@ -183,7 +183,9 @@ final class ThreadRuntimeModel {
         markUpdated()
         agentItemSeq += 1
         let itemId = "ai-\(agentItemSeq)"
-        var store = AgentItemStore(items: items, itemIndexById: itemIndexById)
+        var store = AgentItemStore()
+        store.items = items
+        store.itemIndexById = itemIndexById
         AgentItemReducer.apply(item, itemId: itemId, into: &store)
         items = store.items
         itemIndexById = store.itemIndexById

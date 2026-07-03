@@ -1,4 +1,5 @@
 import Foundation
+import AgentDeckCore
 
 // A2: Pure decision core for the conversation rail's wheel-step navigation.
 // `SessionView.scrollConversationRailStep` previously interleaved this logic

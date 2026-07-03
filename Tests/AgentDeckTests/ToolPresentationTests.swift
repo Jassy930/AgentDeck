@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import AgentDeckCore
 @testable import AgentDeck
 
 // A1: Unit coverage for the pure presentation helpers extracted from

@@ -11,7 +11,7 @@ import Foundation
 ///
 /// 本工具是纯函数（可测），既用于对话流构建（`makeConversationTurns`），
 /// 也用于侧栏标题/预览的清洗。
-enum CommandMessageSanitizer {
+public enum CommandMessageSanitizer {
     /// 需整块移除（含标签内文字）的噪声标签。
     private static let noiseTags = [
         "local-command-caveat",
@@ -25,7 +25,7 @@ enum CommandMessageSanitizer {
 
     /// 返回清洗后的用户文本；若整条只是 CLI 命令元数据（应从对话流/标题中隐藏），
     /// 返回 `nil`。带真实正文的消息会剥离残留标签后原样返回。
-    static func sanitize(userText raw: String) -> String? {
+    public static func sanitize(userText raw: String) -> String? {
         var text = raw
         for tag in noiseTags {
             text = removeBlocks(of: tag, in: text)
@@ -38,7 +38,7 @@ enum CommandMessageSanitizer {
 
     /// 清洗用于展示的文本（标题/预览）：与 `sanitize(userText:)` 同规则，
     /// 但纯噪声时返回空串而非 `nil`，方便调用方走既有的空串回退逻辑。
-    static func cleanedForDisplay(_ raw: String) -> String {
+    public static func cleanedForDisplay(_ raw: String) -> String {
         sanitize(userText: raw) ?? ""
     }
 

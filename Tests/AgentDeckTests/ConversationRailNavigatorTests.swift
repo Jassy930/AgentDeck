@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import AgentDeckCore
 @testable import AgentDeck
 
 @Suite("ConversationRailNavigator (A2)")

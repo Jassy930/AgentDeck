@@ -1,5 +1,6 @@
 import XCTest
 import AppKit
+import AgentDeckCore
 @testable import AgentDeck
 
 /// 端到端交互：侧栏选中 / 切换 / 历史。

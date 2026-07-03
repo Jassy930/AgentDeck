@@ -1,4 +1,5 @@
 import AppKit
+import AgentDeckCore
 
 /// NSOutlineView-based history sidebar (source list style).
 /// Reproduces the SwiftUI `historySidebar` / `historyGroup` / `historyThreadRow`

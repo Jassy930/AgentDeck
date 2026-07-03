@@ -1,4 +1,5 @@
 import AppKit
+import AgentDeckCore
 
 // MARK: - AppKit conversation row cell views (Task 7)
 //

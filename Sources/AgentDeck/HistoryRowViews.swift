@@ -1,4 +1,5 @@
 import AppKit
+import AgentDeckCore
 
 // MARK: - Group Row View
 
