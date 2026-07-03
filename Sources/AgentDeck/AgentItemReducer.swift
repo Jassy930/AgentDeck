@@ -1,4 +1,5 @@
 import Foundation
+import AgentDeckCore
 
 /// Cumulative-semantics agent item store. v2 (Task 6A) ingests typed
 /// `AgentItem` values from the daemon's `ServerEvent::AgentItem` and

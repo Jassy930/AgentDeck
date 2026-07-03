@@ -1,4 +1,5 @@
 import Foundation
+import AgentDeckCore
 
 /// Errors surfaced by the daemon client.
 enum DaemonError: Error, CustomStringConvertible {

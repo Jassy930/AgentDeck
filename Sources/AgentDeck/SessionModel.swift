@@ -1,4 +1,5 @@
 import Foundation
+import AgentDeckCore
 import Observation
 
 /// A neutral agent item as the UI sees it. Mirrors the v0.1 rendering shape;

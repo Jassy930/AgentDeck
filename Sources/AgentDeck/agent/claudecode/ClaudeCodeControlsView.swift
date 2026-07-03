@@ -1,4 +1,5 @@
 import AppKit
+import AgentDeckCore
 
 // MARK: - ClaudeCodeControlsView (Task 6B)
 //

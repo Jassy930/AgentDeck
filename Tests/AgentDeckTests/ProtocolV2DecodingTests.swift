@@ -1,4 +1,5 @@
 import XCTest
+import AgentDeckCore
 @testable import AgentDeck
 
 /// Verifies the v2 wire shapes decode correctly on the Swift side. These

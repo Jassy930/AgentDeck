@@ -1,4 +1,5 @@
 import AppKit
+import AgentDeckCore
 
 // MARK: - InputBarView (Task 8)
 //

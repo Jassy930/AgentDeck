@@ -1,4 +1,5 @@
 import AppKit
+import AgentDeckCore
 import XCTest
 @testable import AgentDeck
 

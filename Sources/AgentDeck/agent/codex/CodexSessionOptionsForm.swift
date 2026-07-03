@@ -1,4 +1,5 @@
 import AppKit
+import AgentDeckCore
 
 // MARK: - CodexSessionOptionsForm (Task 6B)
 //

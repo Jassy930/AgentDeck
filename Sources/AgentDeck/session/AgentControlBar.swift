@@ -1,4 +1,5 @@
 import AppKit
+import AgentDeckCore
 
 // MARK: - AgentControlBar (Task 6B)
 //

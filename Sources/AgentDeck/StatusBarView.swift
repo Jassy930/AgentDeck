@@ -1,4 +1,5 @@
 import AppKit
+import AgentDeckCore
 import Observation
 
 /// AppKit status bar mirroring the SwiftUI `SessionView.statusBar` (D3/D9).

@@ -1,4 +1,5 @@
 import AppKit
+import AgentDeckCore
 
 // MARK: - AgentKindIcon (Task 6B)
 //

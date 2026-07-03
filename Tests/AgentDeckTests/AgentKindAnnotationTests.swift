@@ -1,4 +1,5 @@
 import XCTest
+import AgentDeckCore
 @testable import AgentDeck
 
 final class AgentKindAnnotationTests: XCTestCase {

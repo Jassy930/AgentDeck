@@ -1,20 +1,25 @@
 // swift-tools-version: 6.0
 import PackageDescription
 
-// AgentDeck — macOS native app.
+// AgentDeck — macOS native app + 平台无关共享层。
 //
-// Step 1 scope: a SwiftPM executable (NOT an .xcodeproj) so the project is
-// command-line buildable, CI-friendly, and contributors don't need the Xcode
-// GUI — this serves the open-source / community-contribution goal. The
-// SwiftUI window comes in Step 4; Step 1 is the IPC round trip + the daemon
-// process-lifecycle contract (Swift spawns agentdeckd, kills it on exit —
-// Eng A1's first layer).
+// AgentDeckCore 收纳协议类型与平台无关会话模型，供 macOS 可执行目标与
+// ios/ 下的 UIKit 工程（XcodeGen，经本地 package 依赖）共同消费。
+// Core 内禁止 AppKit / UIKit import，边界由编译器保证。
 let package = Package(
     name: "AgentDeck",
-    platforms: [.macOS(.v15)],
+    platforms: [.macOS(.v15), .iOS(.v17)],
+    products: [
+        .library(name: "AgentDeckCore", targets: ["AgentDeckCore"]),
+    ],
     targets: [
+        .target(
+            name: "AgentDeckCore",
+            path: "Sources/AgentDeckCore"
+        ),
         .executableTarget(
             name: "AgentDeck",
+            dependencies: ["AgentDeckCore"],
             path: "Sources/AgentDeck",
             resources: [
                 .process("Resources"),
@@ -24,6 +29,7 @@ let package = Package(
             name: "AgentDeckTests",
             dependencies: [
                 "AgentDeck",
+                "AgentDeckCore",
             ],
             path: "Tests/AgentDeckTests"
         ),

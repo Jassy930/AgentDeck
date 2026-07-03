@@ -1,4 +1,5 @@
 import AppKit
+import AgentDeckCore
 
 // MARK: - AgentTokenAuthMiniPanel (Task 6B)
 //

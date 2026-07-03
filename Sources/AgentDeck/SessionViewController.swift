@@ -1,4 +1,5 @@
 import AppKit
+import AgentDeckCore
 
 // MARK: - SessionViewController (Task 11)
 //

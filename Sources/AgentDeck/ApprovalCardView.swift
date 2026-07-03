@@ -1,4 +1,5 @@
 import AppKit
+import AgentDeckCore
 
 // MARK: - ApprovalCardView (Task 8 → T6B vendor slot)
 //

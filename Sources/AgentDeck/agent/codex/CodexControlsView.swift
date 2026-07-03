@@ -1,4 +1,5 @@
 import AppKit
+import AgentDeckCore
 
 // MARK: - CodexControlsView (Task 6B)
 //

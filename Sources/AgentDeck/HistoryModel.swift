@@ -1,4 +1,5 @@
 import Foundation
+import AgentDeckCore
 
 /// Neutral summary for one persisted agent thread. Mirrors the daemon's
 /// history shape; Swift never parses vendor thread JSON directly.

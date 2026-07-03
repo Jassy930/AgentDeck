@@ -1,4 +1,5 @@
 import AppKit
+import AgentDeckCore
 
 // MARK: - ClaudeCodeSessionOptionsForm (Task 6B)
 //

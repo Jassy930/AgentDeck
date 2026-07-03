@@ -1,4 +1,5 @@
 import AppKit
+import AgentDeckCore
 
 // MARK: - CapabilityRouter (Task 6B)
 //

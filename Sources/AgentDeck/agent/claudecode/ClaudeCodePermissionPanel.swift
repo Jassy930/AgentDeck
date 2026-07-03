@@ -1,4 +1,5 @@
 import AppKit
+import AgentDeckCore
 
 // MARK: - ClaudeCodePermissionPanel (Task 6B)
 //
