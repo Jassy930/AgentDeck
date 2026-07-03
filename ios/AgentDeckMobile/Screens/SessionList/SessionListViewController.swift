@@ -115,12 +115,7 @@ extension SessionListViewController: UICollectionViewDelegate {
         collectionView.deselectItem(at: indexPath, animated: true)
         guard let sessionID = dataSource.itemIdentifier(for: indexPath),
               let session = session(for: sessionID) else { return }
-        // Task 10 前 SessionDetailViewController 尚不存在，先 push 占位 VC；
-        // Task 10 落地后改为：
-        // SessionDetailViewController(source: source, sessionID: session.id, title: session.title)
-        let placeholder = UIViewController()
-        placeholder.view.backgroundColor = DesignTokens.bg
-        placeholder.title = session.title
-        navigationController?.pushViewController(placeholder, animated: true)
+        let vc = SessionDetailViewController(source: source, sessionID: session.id, title: session.title)
+        navigationController?.pushViewController(vc, animated: true)
     }
 }
