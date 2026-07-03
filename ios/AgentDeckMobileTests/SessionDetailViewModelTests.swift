@@ -47,4 +47,23 @@ final class SessionDetailViewModelTests: XCTestCase {
         await fulfillment(of: [errored], timeout: 3)
         XCTAssertTrue(vm.errorText?.contains("peer dependency") == true)
     }
+
+    func testSendPromptAppendsOptimisticUserRow() async {
+        let vm = makeVM("sess-cc-01")
+        let done = expectation(description: "initial stream done")
+        vm.onUpdate = { if !vm.isStreaming { done.fulfill() } }
+        vm.start()
+        await fulfillment(of: [done], timeout: 3)
+        let baseline = vm.rows.count
+        let echoed = expectation(description: "prompt echoed")
+        echoed.assertForOverFulfill = false
+        vm.onUpdate = {
+            if vm.rows.count > baseline,
+               vm.rows.contains(where: { $0.role == .userPrompt && $0.item.text == "再补一个空输入的用例" }) {
+                echoed.fulfill()
+            }
+        }
+        vm.sendPrompt("再补一个空输入的用例")
+        await fulfillment(of: [echoed], timeout: 3)
+    }
 }

@@ -9,6 +9,7 @@ final class SessionDetailViewController: UIViewController {
     private var dataSource: UICollectionViewDiffableDataSource<Section, String>!
     private var expandedRowIDs: Set<String> = []
     private let errorBanner = ErrorBannerView()
+    private let inputBar = MobileInputBarView()
 
     init(source: MobileSessionSource, sessionID: String, title: String) {
         self.viewModel = SessionDetailViewModel(source: source, sessionID: sessionID)
@@ -22,6 +23,7 @@ final class SessionDetailViewController: UIViewController {
         super.viewDidLoad()
         view.backgroundColor = DesignTokens.bg
         configureCollectionView()
+        configureInputBar()
         configureErrorBanner()
         viewModel.onUpdate = { [weak self] in self?.applySnapshot() }
         viewModel.start()
@@ -38,7 +40,6 @@ final class SessionDetailViewController: UIViewController {
         view.addSubview(collectionView)
         NSLayoutConstraint.activate([
             collectionView.topAnchor.constraint(equalTo: view.topAnchor),
-            collectionView.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor),
             collectionView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             collectionView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
         ])
@@ -102,6 +103,18 @@ final class SessionDetailViewController: UIViewController {
                 }
             }
         }
+    }
+
+    private func configureInputBar() {
+        inputBar.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(inputBar)
+        NSLayoutConstraint.activate([
+            inputBar.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: DesignTokens.sp3),
+            inputBar.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -DesignTokens.sp3),
+            inputBar.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor, constant: -DesignTokens.sp2),
+            collectionView.bottomAnchor.constraint(equalTo: inputBar.topAnchor, constant: -DesignTokens.sp2),
+        ])
+        inputBar.onSend = { [weak self] text in self?.viewModel.sendPrompt(text) }
     }
 
     private func configureErrorBanner() {
