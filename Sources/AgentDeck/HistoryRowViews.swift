@@ -7,6 +7,7 @@ import AppKit
 final class HistoryGroupRowView: NSView {
     // MARK: Subviews
     let nameLabel = NSTextField(labelWithString: "")
+    let countLabel = NSTextField(labelWithString: "")
     let addButton = NSButton()
 
     // MARK: Callbacks
@@ -30,8 +31,15 @@ final class HistoryGroupRowView: NSView {
         nameLabel.lineBreakMode = .byTruncatingMiddle
         nameLabel.maximumNumberOfLines = 1
         nameLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        nameLabel.setContentHuggingPriority(.defaultHigh, for: .horizontal)
         nameLabel.translatesAutoresizingMaskIntoConstraints = false
         addSubview(nameLabel)
+
+        // 项目会话数（设计系统组标题："refactor-auth 6"）
+        countLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        countLabel.textColor = DesignTokens.text3
+        countLabel.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(countLabel)
 
         // "+" button
         addButton.title = ""
@@ -48,7 +56,10 @@ final class HistoryGroupRowView: NSView {
         NSLayoutConstraint.activate([
             nameLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
             nameLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
-            nameLabel.trailingAnchor.constraint(lessThanOrEqualTo: addButton.leadingAnchor, constant: -4),
+
+            countLabel.leadingAnchor.constraint(equalTo: nameLabel.trailingAnchor, constant: 6),
+            countLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            countLabel.trailingAnchor.constraint(lessThanOrEqualTo: addButton.leadingAnchor, constant: -6),
 
             addButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
             addButton.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -63,6 +74,7 @@ final class HistoryGroupRowView: NSView {
 
     func configure(with group: HistoryProjectGroup) {
         nameLabel.stringValue = group.projectName
+        countLabel.stringValue = "\(group.threads.count)"
         addButton.toolTip = "New session in \(group.projectName)"
     }
 }
@@ -76,7 +88,6 @@ final class HistoryThreadRowView: NSView {
     private let accentBar = NSView()
     private let runtimeDotView = NSView()
     private let titleLabel = NSTextField(labelWithString: "")
-    private let metaLabel = NSTextField(labelWithString: "")
     private let openingProgress = NSProgressIndicator()
 
     /// Size constraints for the runtime dot — updated on configure so the dot
@@ -121,15 +132,6 @@ final class HistoryThreadRowView: NSView {
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         addSubview(titleLabel)
 
-        // Meta label (status / source / date)
-        metaLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize - 1)
-        metaLabel.textColor = DesignTokens.text3
-        metaLabel.lineBreakMode = .byTruncatingTail
-        metaLabel.maximumNumberOfLines = 1
-        metaLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        metaLabel.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(metaLabel)
-
         // Opening progress spinner (mini)
         openingProgress.style = .spinning
         openingProgress.controlSize = .mini
@@ -138,34 +140,26 @@ final class HistoryThreadRowView: NSView {
         openingProgress.translatesAutoresizingMaskIntoConstraints = false
         addSubview(openingProgress)
 
-        let textStack = NSStackView(views: [titleLabel, metaLabel])
-        textStack.orientation = .vertical
-        textStack.alignment = .leading
-        textStack.spacing = 3
-        textStack.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(textStack)
-
         NSLayoutConstraint.activate([
-            // Accent bar: 3 px wide, full height
+            // Accent bar: 3 px wide, near-full height
             accentBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
-            accentBar.topAnchor.constraint(equalTo: topAnchor, constant: 4),
-            accentBar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
+            accentBar.topAnchor.constraint(equalTo: topAnchor, constant: 5),
+            accentBar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -5),
             accentBar.widthAnchor.constraint(equalToConstant: 3),
 
-            // Runtime dot (size driven by runtimeDotWidth/Height, updated on configure)
+            // Runtime dot — 垂直居中（单行）
             runtimeDotView.leadingAnchor.constraint(equalTo: accentBar.trailingAnchor, constant: 8),
-            runtimeDotView.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+            runtimeDotView.centerYAnchor.constraint(equalTo: centerYAnchor),
             runtimeDotWidth,
             runtimeDotHeight,
 
-            // Title + meta stack
-            textStack.leadingAnchor.constraint(equalTo: runtimeDotView.trailingAnchor, constant: 4),
-            textStack.trailingAnchor.constraint(equalTo: openingProgress.leadingAnchor, constant: -4),
-            textStack.topAnchor.constraint(equalTo: topAnchor, constant: 7),
-            textStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -7),
+            // 单行标题填充（统一历史：不显示 agent 图标）
+            titleLabel.leadingAnchor.constraint(equalTo: runtimeDotView.trailingAnchor, constant: 8),
+            titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -10),
 
             // Opening spinner
-            openingProgress.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            openingProgress.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -9),
             openingProgress.centerYAnchor.constraint(equalTo: centerYAnchor),
             openingProgress.widthAnchor.constraint(equalToConstant: 12),
             openingProgress.heightAnchor.constraint(equalToConstant: 12),
@@ -181,13 +175,13 @@ final class HistoryThreadRowView: NSView {
         titleLabel.textColor = presentation.isEmphasized ? DesignTokens.text : DesignTokens.text2
         titleLabel.stringValue = thread.displayTitle
 
-        // Meta line: status · runtimeStatus · date
+        // meta（status · 运行态 · 日期）转为 tooltip（单行不再显示文本；统一历史不显示 agent 图标）
         var metaParts: [String] = [thread.status]
         if let runtimeStatus = presentation.runtimeStatusLabel {
             metaParts.append(runtimeStatus)
         }
         metaParts.append(Self.updatedLabel(thread.updatedAt))
-        metaLabel.stringValue = metaParts.joined(separator: " · ")
+        toolTip = metaParts.joined(separator: " · ")
 
         // Accent bar
         let accentColor = Self.accentBarColor(presentation)
