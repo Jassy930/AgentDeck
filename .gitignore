@@ -36,3 +36,8 @@ target/
 # Env / secrets
 .env
 *.local
+
+# iOS XcodeGen output
+ios/AgentDeckMobile.xcodeproj/
+ios/AgentDeckMobile/Info.plist
+ios/DerivedData/
