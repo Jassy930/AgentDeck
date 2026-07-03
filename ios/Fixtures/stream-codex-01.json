@@ -1,0 +1,11 @@
+[
+  { "delayMs": 0, "event": { "type": "sessionStarted", "sessionId": "sess-codex-01", "threadId": "t1", "agentKind": "codex" } },
+  { "delayMs": 100, "itemId": "i1", "event": { "type": "agentItem", "sessionId": "sess-codex-01", "threadId": "t1", "agentKind": "codex", "item": { "kind": "userMessage", "text": "把 IPC 重连改成指数退避", "meta": { "vendorExtensions": {} } } } },
+  { "delayMs": 400, "itemId": "i2", "event": { "type": "agentItem", "sessionId": "sess-codex-01", "threadId": "t1", "agentKind": "codex", "item": { "kind": "reasoning", "text": "需要先确认现有重连在 ipc.rs 的位置，然后加退避与上限。", "meta": { "vendorExtensions": {} } } } },
+  { "delayMs": 500, "itemId": "i3", "event": { "type": "agentItem", "sessionId": "sess-codex-01", "threadId": "t1", "agentKind": "codex", "item": { "kind": "shell", "command": "rg -n \"reconnect\" agentdeckd/src", "status": "completed", "exitCode": 0, "durationMs": 180, "meta": { "vendorExtensions": {} } } } },
+  { "delayMs": 400, "itemId": "i4", "event": { "type": "agentItem", "sessionId": "sess-codex-01", "threadId": "t1", "agentKind": "codex", "item": { "kind": "assistantMessage", "text": "找到重连入口，", "meta": { "vendorExtensions": {} } } } },
+  { "delayMs": 300, "itemId": "i4", "event": { "type": "agentItem", "sessionId": "sess-codex-01", "threadId": "t1", "agentKind": "codex", "item": { "kind": "assistantMessage", "text": "找到重连入口，我把固定 1s 间隔改成 **指数退避**（上限 30s），", "meta": { "vendorExtensions": {} } } } },
+  { "delayMs": 300, "itemId": "i4", "event": { "type": "agentItem", "sessionId": "sess-codex-01", "threadId": "t1", "agentKind": "codex", "item": { "kind": "assistantMessage", "text": "找到重连入口，我把固定 1s 间隔改成 **指数退避**（上限 30s），并补了抖动，避免雪崩重连。", "meta": { "vendorExtensions": {} } } } },
+  { "delayMs": 500, "itemId": "i5", "event": { "type": "agentItem", "sessionId": "sess-codex-01", "threadId": "t1", "agentKind": "codex", "item": { "kind": "diff", "files": [ { "path": "agentdeckd/src/ipc.rs", "status": "modified", "patch": "@@ -41,7 +41,12 @@\n-    sleep(Duration::from_secs(1));\n+    let backoff = base * 2u32.pow(attempt.min(5));\n+    sleep(jitter(backoff));" } ], "meta": { "vendorExtensions": {} } } } },
+  { "delayMs": 400, "event": { "type": "turnComplete", "sessionId": "sess-codex-01", "threadId": "t1", "agentKind": "codex", "summary": { "totalInputTokens": 1200, "totalOutputTokens": 460, "elapsedMs": 8400 } } }
+]
