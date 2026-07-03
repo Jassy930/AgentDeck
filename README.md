@@ -203,7 +203,7 @@ cd ios && xcodegen generate && \
     -destination 'platform=iOS Simulator,name=iPhone 17' test
 ```
 
-iOS 端唯一数据入口是 `FixtureSessionSource`（bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
+iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
 ## agentdeck CLI（参考客户端 / E2E 驱动）
 
