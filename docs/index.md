@@ -20,6 +20,11 @@
 - `plans/*-design.md`：功能设计、架构取舍和验收标准。
 - `plans/*-implementation.md`：可执行实施步骤、验证命令和收口记录。
 
+### iOS 前端计划（2026-07-03）
+
+- `plans/2026-07-03-ios-uikit-frontend-design.md`：iOS UIKit companion 前端设计（fixture 驱动，R3 界面骨架，状态：Implemented）。
+- `plans/2026-07-03-ios-uikit-frontend-implementation.md`：iOS UIKit companion 前端实施计划（Task 1–15，含 AgentDeckCore 共享库抽取）。
+
 ## 协议资料
 
 - `../protocol/SPIKE_FINDINGS.md`：Codex app-server wire framing、方法和 schema 事实源。

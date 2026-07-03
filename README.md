@@ -176,6 +176,35 @@ cargo build --release -p agentdeck-cli  # 产出 target/release/agentdeck
 swift build -c release           # 产出 .build/release/AgentDeck
 ```
 
+## iOS Companion（fixture 驱动，先前端后链路）
+
+AgentDeck Mobile 是与 macOS 主客户端配套的 iPhone companion，用协议对齐的 fixture 回放代替真实链路，在模拟器上完整跑通 R3 companion 界面骨架，接 Relay 时 UI 层零迁移。
+
+`ios/` 目录结构：
+
+```
+ios/
+├── project.yml                  # XcodeGen 声明式工程（xcodeproj 不入库）
+├── AgentDeckMobile/
+│   ├── App/                     # AppDelegate / SceneDelegate / 导航
+│   ├── Screens/                 # 各屏 VC + @Observable view model
+│   ├── DataSource/              # MobileSessionSource 协议 + FixtureSessionSource
+│   ├── DesignTokens.swift       # 生成物：UIKit 版 token（禁止手改）
+│   └── Fixtures/                # 协议语义对齐的 JSON fixture（见 ios/Fixtures/）
+└── AgentDeckMobileTests/
+```
+
+前置依赖：Xcode 16+（iOS 17 模拟器），`brew install xcodegen`。
+
+```bash
+# iOS 工程生成 + 构建 + 单测（fixture 驱动，无真实链路）
+cd ios && xcodegen generate && \
+  xcodebuild -project AgentDeckMobile.xcodeproj -scheme AgentDeckMobile \
+    -destination 'platform=iOS Simulator,name=iPhone 17' test
+```
+
+iOS 端唯一数据入口是 `FixtureSessionSource`（bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
+
 ## agentdeck CLI（参考客户端 / E2E 驱动）
 
 `agentdeck` 是一个 Rust 二进制参考客户端，**不在 Swift GUI 的实时通路上**。Swift app 仍直接通过 stdio JSONL 与 daemon 通信；`agentdeck` 用于脚本化调用、本地验证以及门控 E2E 测试驱动。

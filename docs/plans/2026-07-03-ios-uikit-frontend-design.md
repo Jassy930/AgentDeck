@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Design - 已确认 |
+| 状态 | Implemented |
 | 日期 | 2026-07-03 |
 | 主题 | iOS UIKit companion 前端骨架，用协议对齐 fixture 回放代替真实链路 |
 | 关联 | `NORTH_STAR.md`、`docs/plans/2026-07-01-agentdeck-mobile-relay-design.md`、`designs/agentdeck-design-system/` |
@@ -162,6 +162,14 @@ iOS 单测重点：
 - prompt 输入后用户消息乐观出现，假响应回流。
 - 配对屏与收件箱骨架可进入、可返回。
 - `swift test` 全绿（macOS 无回归），iOS 单测全绿，`scripts/verify-agent-docs.sh` 通过。
+
+## 12. 实现偏差记录
+
+实现阶段与本设计的差异如下，均属有意决策：
+
+1. **FixtureSessionSource 状态保持**：`FixtureSessionSource` 在内存中维护完整 transcript 缓冲区（`Playback.transcript`），切屏返回时新订阅者立即收到全量 transcript 回放，与设计文档「切屏返回状态保持」一致。prompt 回声后流式 `turnComplete` 正常收尾，回放 transcript 不截断。
+2. **DesignTokens 实名**：iOS `DesignTokens.swift` 生成的语义色实名为 `text`、`text2`、`surface`（来自设计 SSOT `tokens.json` 的实际 key），设计期草案内文描述曾引用 `fg`/`fgMuted`/`bgRaised` 作为占位名称，以生成物为准。
+3. **强制暗色**：iOS app 在 `SceneDelegate` 中对 `UIWindow` 设置 `overrideUserInterfaceStyle = .dark`，与 macOS 端设计风格一致（纯暗色 token 设计，本期不做明暗切换）。
 
 ## 11. 后续衔接
 
