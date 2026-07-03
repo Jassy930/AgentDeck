@@ -208,10 +208,46 @@ function genAppSwift() {
   return path.relative(path.join(root, "../.."), path.join(appDir, "DesignTokens.swift"));
 }
 
+/* ============================================================
+   5) ios/AgentDeckMobile/DesignTokens.swift —— UIKit 消费（codex 主题）
+   仅当 iOS 源码树存在时生成。
+   ============================================================ */
+function genMobileSwift() {
+  const appDir = path.join(root, "../../ios/AgentDeckMobile");
+  if (!fs.existsSync(appDir)) return null;
+  const id = src.$meta.primaryTheme;
+  const t = src.themes[id];
+  const g = src.global;
+  const L = [];
+  L.push("// 生成物 · 由设计系统 SSOT 生成（designs/agentdeck-design-system/tokens/tokens.json，" + id + " 主题）。");
+  L.push("// 禁止手改；改 SSOT 后在 designs/agentdeck-design-system 跑 `node tools/build.mjs` 重生成。");
+  L.push("import UIKit\n");
+  L.push("enum DesignTokens {");
+  L.push("    // 颜色（sRGB，来自设计系统语义 token）");
+  for (const [k, v] of Object.entries(t.color)) {
+    const c = parseColor(v);
+    if (!c) continue;
+    L.push(`    static let ${k} = UIColor(red: ${f4(c.r)}, green: ${f4(c.g)}, blue: ${f4(c.b)}, alpha: ${f4(c.a)})`);
+  }
+  L.push("");
+  L.push("    // 圆角");
+  L.push(`    static let radiusLg: CGFloat = ${t.radius.lg}`);
+  L.push(`    static let radiusMd: CGFloat = ${t.radius.md}`);
+  L.push(`    static let radiusSm: CGFloat = ${t.radius.sm}`);
+  L.push(`    static let radiusPill: CGFloat = ${t.radius.pill}`);
+  L.push("");
+  L.push("    // 间距（4pt 基准）");
+  for (const [k, v] of Object.entries(g.spacing)) L.push(`    static let sp${k}: CGFloat = ${v}`);
+  L.push("}");
+  fs.writeFileSync(path.join(appDir, "DesignTokens.swift"), L.join("\n") + "\n");
+  return "ios/AgentDeckMobile/DesignTokens.swift";
+}
+
 genCss();
 genSwift();
 genTs();
 const appOut = genAppSwift();
+const mobileOut = genMobileSwift();
 console.log("✓ 生成完成 → generated/tokens.css, generated/Theme.swift, generated/DesignTokens.ts");
-if (appOut) console.log("  + App 端 → " + appOut);
-console.log(`  主题 ${THEMES.length} 套 · 平台 ${Object.keys(src.platform).length} 个`);
+if (appOut) console.log("✓ App 契约 → " + appOut);
+if (mobileOut) console.log("✓ Mobile 契约 → " + mobileOut);
