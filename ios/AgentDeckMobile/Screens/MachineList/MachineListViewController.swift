@@ -104,8 +104,13 @@ final class MachineListViewController: UIViewController {
         emptyView.isHidden = !viewModel.machines.isEmpty
     }
 
-    @objc private func openPairing() { /* Task 14 接 PairingViewController */ }
-    @objc private func openInbox() { /* Task 14 接 InboxViewController */ }
+    @objc private func openPairing() {
+        present(UINavigationController(rootViewController: PairingViewController()), animated: true)
+    }
+
+    @objc private func openInbox() {
+        navigationController?.pushViewController(InboxViewController(source: source), animated: true)
+    }
 }
 
 extension MachineListViewController: UICollectionViewDelegate {
