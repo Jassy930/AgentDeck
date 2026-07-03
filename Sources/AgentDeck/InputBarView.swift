@@ -140,6 +140,7 @@ final class InputBarView: NSView {
         microphoneButton.contentTintColor = DesignTokens.text2
         microphoneButton.translatesAutoresizingMaskIntoConstraints = false
 
+        sendButton.setAccessibilityIdentifier("composer-send")
         sendButton.image = NSImage(systemSymbolName: "arrow.up", accessibilityDescription: "发送")
         sendButton.bezelStyle = .inline
         sendButton.isBordered = false

@@ -95,6 +95,7 @@ final class HistorySidebarViewController: NSViewController {
         let sv = NSScrollView()
         sv.hasVerticalScroller = true
         sv.autohidesScrollers = true
+        sv.drawsBackground = false   // 让侧栏容器底色透过，不自绘浅色/黑底
         sv.documentView = outlineView
         sv.translatesAutoresizingMaskIntoConstraints = false
         return sv
@@ -108,6 +109,9 @@ final class HistorySidebarViewController: NSViewController {
         ov.intercellSpacing = NSSize(width: 0, height: 2)
         ov.indentationPerLevel = 0   // groups are not indented relative to root
         ov.autoresizesOutlineColumn = false
+        // 对齐设计系统侧栏底色：避免 sourceList 组行浮动/默认底色透出黑带
+        ov.backgroundColor = CodexDesktopChrome.sidebarBackground
+        ov.floatsGroupRows = false
 
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("main"))
         col.isEditable = false
