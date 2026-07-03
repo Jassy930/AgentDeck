@@ -3,7 +3,7 @@ import AgentDeckCore
 @testable import AgentDeckMobile
 
 final class FixtureDecodingTests: XCTestCase {
-    private var bundle: Bundle { Bundle(for: PlaceholderViewController.self) }
+    private var bundle: Bundle { Bundle(for: MachineListViewController.self) }
 
     func testDeckDecodes() throws {
         let url = try XCTUnwrap(bundle.url(forResource: "deck", withExtension: "json"))

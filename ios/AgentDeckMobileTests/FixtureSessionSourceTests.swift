@@ -4,7 +4,7 @@ import AgentDeckCore
 
 @MainActor
 final class FixtureSessionSourceTests: XCTestCase {
-    private var testBundle: Bundle { Bundle(for: PlaceholderViewController.self) }
+    private var testBundle: Bundle { Bundle(for: MachineListViewController.self) }
 
     private func makeSource() -> FixtureSessionSource {
         FixtureSessionSource(bundle: testBundle, tickScale: 0)

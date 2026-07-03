@@ -10,8 +10,8 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     ) {
         guard let windowScene = scene as? UIWindowScene else { return }
         let window = UIWindow(windowScene: windowScene)
-        // Task 8 起替换为 MachineListViewController(source: FixtureSessionSource())
-        window.rootViewController = UINavigationController(rootViewController: PlaceholderViewController())
+        window.rootViewController = UINavigationController(
+            rootViewController: MachineListViewController(source: FixtureSessionSource()))
         window.makeKeyAndVisible()
         self.window = window
     }
