@@ -88,6 +88,7 @@ final class HistoryThreadRowView: NSView {
     private let accentBar = NSView()
     private let runtimeDotView = NSView()
     private let titleLabel = NSTextField(labelWithString: "")
+    private let agentIcon = NSImageView()
     private let openingProgress = NSProgressIndicator()
 
     /// Size constraints for the runtime dot — updated on configure so the dot
@@ -132,6 +133,12 @@ final class HistoryThreadRowView: NSView {
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         addSubview(titleLabel)
 
+        // 尾随 agent 图标（设计系统：区分 Codex / Claude Code；数据→图像映射，非 vendor 分支）
+        agentIcon.imageScaling = .scaleProportionallyDown
+        agentIcon.contentTintColor = DesignTokens.text3
+        agentIcon.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(agentIcon)
+
         // Opening progress spinner (mini)
         openingProgress.style = .spinning
         openingProgress.controlSize = .mini
@@ -153,12 +160,17 @@ final class HistoryThreadRowView: NSView {
             runtimeDotWidth,
             runtimeDotHeight,
 
-            // 单行标题填充（统一历史：不显示 agent 图标）
+            // 单行标题填充，尾随 agent 图标
             titleLabel.leadingAnchor.constraint(equalTo: runtimeDotView.trailingAnchor, constant: 8),
             titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
-            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -10),
+            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: agentIcon.leadingAnchor, constant: -6),
 
-            // Opening spinner
+            agentIcon.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            agentIcon.centerYAnchor.constraint(equalTo: centerYAnchor),
+            agentIcon.widthAnchor.constraint(equalToConstant: 13),
+            agentIcon.heightAnchor.constraint(equalToConstant: 13),
+
+            // Opening spinner（覆盖 agent 图标位置）
             openingProgress.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -9),
             openingProgress.centerYAnchor.constraint(equalTo: centerYAnchor),
             openingProgress.widthAnchor.constraint(equalToConstant: 12),
@@ -175,7 +187,8 @@ final class HistoryThreadRowView: NSView {
         titleLabel.textColor = presentation.isEmphasized ? DesignTokens.text : DesignTokens.text2
         titleLabel.stringValue = thread.displayTitle
 
-        // meta（status · 运行态 · 日期）转为 tooltip（单行不再显示文本；统一历史不显示 agent 图标）
+        // 尾随 agent 图标（设计系统）；meta（status · 运行态 · 日期）转为 tooltip
+        agentIcon.image = AgentKindIcon.compactImage(for: thread.agentKind)
         var metaParts: [String] = [thread.status]
         if let runtimeStatus = presentation.runtimeStatusLabel {
             metaParts.append(runtimeStatus)
@@ -204,9 +217,11 @@ final class HistoryThreadRowView: NSView {
         if presentation.visualState == .opening {
             openingProgress.isHidden = false
             openingProgress.startAnimation(nil)
+            agentIcon.isHidden = true
         } else {
             openingProgress.stopAnimation(nil)
             openingProgress.isHidden = true
+            agentIcon.isHidden = (agentIcon.image == nil)
         }
 
         // Accessibility
