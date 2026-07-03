@@ -170,9 +170,13 @@ iOS 单测重点：
 1. **FixtureSessionSource 状态保持**：`FixtureSessionSource` 在内存中维护完整 transcript 缓冲区（`Playback.transcript`），切屏返回时新订阅者立即收到全量 transcript 回放，与设计文档「切屏返回状态保持」一致。prompt 回声后流式 `turnComplete` 正常收尾，回放 transcript 不截断。
 2. **DesignTokens 实名**：iOS `DesignTokens.swift` 生成的语义色实名为 `text`、`text2`、`surface`（来自设计 SSOT `tokens.json` 的实际 key），设计期草案内文描述曾引用 `fg`/`fgMuted`/`bgRaised` 作为占位名称，以生成物为准。
 3. **强制暗色**：iOS app 在 `SceneDelegate` 中对 `UIWindow` 设置 `overrideUserInterfaceStyle = .dark`，与 macOS 端设计风格一致（纯暗色 token 设计，本期不做明暗切换）。
+4. **VM 未用 @Observable**：实现为普通 `@MainActor` class + `onUpdate` 闭包（UIKit 无自动观察，四屏一致），设计文档 §7 中"每屏一个 `@Observable` view model"的描述属于草案占位，以实现为准。
+5. **§9 断流重连占位态未实现**：fixture 流总是正常结束、无法模拟断流，该功能后置到 `RelaySessionSource` 接入时实现（届时真实网络可断流）。
+6. **机器卡片「最近心跳」字段本期未在 UI 展示**：`MachineSummary` 中已计算 `lastHeartbeat` 字段，但本期 UI 未展示，待 Relay 接入后随真实心跳数据一起在机器卡片显示。
 
 ## 12. 后续衔接
 
 - R1/R2（Relay 与 remote mode）落地后，新增 `RelaySessionSource` 实现 `MobileSessionSource`，替换 fixture 数据源；配对屏接真实扫码与 credential 流程。
 - 收件箱升级为 APNs 通知入口（沿用 relay 设计的通知 hook）。
+- `RelaySessionSource` 接入时，`sendPrompt` 应改为 VM 本地乐观插入（当前 fixture 模式为回声后插入，网络延迟下体验不可接受）。
 - （已完成：AGENTS.md、README.md、docs/index.md 已补 iOS 入口与验证命令。）

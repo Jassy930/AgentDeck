@@ -24,15 +24,17 @@ final class SessionDetailViewModel {
 
     func start() {
         task = Task { [weak self] in
-            guard let self else { return }
-            for await element in source.events(sessionID: sessionID) {
-                handle(element)
+            guard let source = self?.source, let sessionID = self?.sessionID else { return }
+            let stream = source.events(sessionID: sessionID)
+            for await element in stream {
+                guard let self else { break }
+                self.handle(element)
             }
             // 流结束后若 turnComplete 尚未将 isStreaming 设为 false，
             // 在此兜底（error-only 会话不会收到 turnComplete）。
-            if isStreaming {
-                isStreaming = false
-                onUpdate?()
+            if self?.isStreaming == true {
+                self?.isStreaming = false
+                self?.onUpdate?()
             }
         }
     }

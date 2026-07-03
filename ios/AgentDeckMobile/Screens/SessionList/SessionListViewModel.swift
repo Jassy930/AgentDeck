@@ -15,13 +15,14 @@ final class SessionListViewModel {
 
     func start() {
         task = Task { [weak self] in
-            guard let self else { return }
-            for await sessions in source.sessions(machineID: machineID) {
-                groups = [SessionGroup.waitingApproval, .active, .recent].compactMap { group in
+            guard let source = self?.source, let machineID = self?.machineID else { return }
+            let stream = source.sessions(machineID: machineID)
+            for await sessions in stream {
+                self?.groups = [SessionGroup.waitingApproval, .active, .recent].compactMap { group in
                     let matched = sessions.filter { $0.group == group }
                     return matched.isEmpty ? nil : (group, matched)
                 }
-                onUpdate?()
+                self?.onUpdate?()
             }
         }
     }
