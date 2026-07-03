@@ -7,6 +7,17 @@ import AppKit
 @MainActor
 final class RenderSnapshotTests: XCTestCase {
 
+    func testRenderHeader() {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        model.cwd = URL(fileURLWithPath: "/Users/jassy/glm/AgentDeck")
+        model.submit("把登录模块拆分为独立 service，抽出 token 刷新逻辑，并补齐单元测试。")
+        let header = CodexContentHeaderView(model: model)
+        header.wantsLayer = true
+        header.frame = NSRect(x: 0, y: 0, width: 1100, height: 44)
+        header.layoutSubtreeIfNeeded()
+        header.renderPNG(to: "/tmp/adk-header.png")
+    }
+
     func testRenderFullSessionWindow() {
         let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
         model.cwd = URL(fileURLWithPath: "/p/refactor-auth")

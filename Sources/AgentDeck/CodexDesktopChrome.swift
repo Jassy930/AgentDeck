@@ -47,6 +47,15 @@ final class CodexContentHeaderView: NSView {
         return label
     }()
 
+    private let cwdLabel: NSTextField = {
+        let label = NSTextField(labelWithString: "")
+        label.font = .systemFont(ofSize: 12)
+        label.textColor = DesignTokens.text3
+        label.lineBreakMode = .byTruncatingMiddle
+        label.translatesAutoresizingMaskIntoConstraints = false
+        return label
+    }()
+
     private let agentIcon = NSImageView()
     private let openLocationButton = NSButton(title: "打开位置⌄", target: nil, action: nil)
     private let controlsButton = NSButton()
@@ -70,24 +79,23 @@ final class CodexContentHeaderView: NSView {
         agentIcon.imageScaling = .scaleProportionallyUpOrDown
         agentIcon.translatesAutoresizingMaskIntoConstraints = false
 
-        let moreButton = NSButton(title: "…", target: nil, action: nil)
-        moreButton.bezelStyle = .inline
-        moreButton.isBordered = false
-        moreButton.font = .systemFont(ofSize: 15, weight: .semibold)
-        moreButton.contentTintColor = DesignTokens.text2
-        moreButton.translatesAutoresizingMaskIntoConstraints = false
-
-        openLocationButton.bezelStyle = .rounded
-        openLocationButton.font = .systemFont(ofSize: NSFont.systemFontSize(for: .small), weight: .medium)
-        openLocationButton.contentTintColor = DesignTokens.text
+        // 设计系统：右侧用文件夹图标（打开位置），非文字按钮
+        openLocationButton.image = NSImage(systemSymbolName: "folder", accessibilityDescription: "打开位置")
+        openLocationButton.imagePosition = .imageOnly
+        openLocationButton.title = ""
+        openLocationButton.bezelStyle = .inline
+        openLocationButton.isBordered = false
+        openLocationButton.contentTintColor = DesignTokens.text2
         openLocationButton.translatesAutoresizingMaskIntoConstraints = false
 
         controlsButton.image = NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: "界面选项")
-        controlsButton.bezelStyle = .rounded
-        controlsButton.isBordered = true
+        controlsButton.bezelStyle = .inline
+        controlsButton.isBordered = false
+        controlsButton.contentTintColor = DesignTokens.text2
         controlsButton.translatesAutoresizingMaskIntoConstraints = false
 
-        let leftStack = NSStackView(views: [agentIcon, titleLabel, moreButton])
+        // 设计系统：agent 图标 + 标题 + cwd 灰字（无「…」）
+        let leftStack = NSStackView(views: [agentIcon, titleLabel, cwdLabel])
         leftStack.orientation = .horizontal
         leftStack.alignment = .centerY
         leftStack.spacing = 10
@@ -142,6 +150,8 @@ final class CodexContentHeaderView: NSView {
             agentIcon.image = nil
             agentIcon.isHidden = true
         }
+        cwdLabel.stringValue = model.cwd.map { ($0.path as NSString).abbreviatingWithTildeInPath } ?? ""
+        cwdLabel.isHidden = model.cwd == nil
         openLocationButton.isHidden = model.cwd == nil
     }
 
