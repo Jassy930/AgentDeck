@@ -52,7 +52,8 @@ final class InputBarView: NSView {
     }()
     private let attachButton = NSButton()
     private let approvalBadge: NSTextField = {
-        let field = NSTextField(labelWithString: "完全访问⌄")
+        // 设计系统：权限徽章文案为沙箱模式（workspace-write），非「完全访问⌄」占位
+        let field = NSTextField(labelWithString: "workspace-write")
         field.font = ConversationRowMetrics.captionFont
         field.textColor = CodexDesktopChrome.orange
         field.translatesAutoresizingMaskIntoConstraints = false
@@ -60,7 +61,8 @@ final class InputBarView: NSView {
         return field
     }()
     private let effortBadge: NSTextField = {
-        let field = NSTextField(labelWithString: "5.5 超高⌄")
+        // 设计系统：推理强度徽章文案为 high，非「5.5 超高⌄」占位
+        let field = NSTextField(labelWithString: "high")
         field.font = ConversationRowMetrics.captionFont
         field.textColor = DesignTokens.text2
         field.translatesAutoresizingMaskIntoConstraints = false
