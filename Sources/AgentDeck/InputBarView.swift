@@ -51,24 +51,15 @@ final class InputBarView: NSView {
         return field
     }()
     private let attachButton = NSButton()
-    private let approvalBadge: NSTextField = {
-        // 设计系统：权限徽章文案为沙箱模式（workspace-write），非「完全访问⌄」占位
-        let field = NSTextField(labelWithString: "workspace-write")
-        field.font = ConversationRowMetrics.captionFont
-        field.textColor = CodexDesktopChrome.orange
-        field.translatesAutoresizingMaskIntoConstraints = false
-        field.setContentHuggingPriority(.required, for: .horizontal)
-        return field
-    }()
-    private let effortBadge: NSTextField = {
-        // 设计系统：推理强度徽章文案为 high，非「5.5 超高⌄」占位
-        let field = NSTextField(labelWithString: "high")
-        field.font = ConversationRowMetrics.captionFont
-        field.textColor = DesignTokens.text2
-        field.translatesAutoresizingMaskIntoConstraints = false
-        field.setContentHuggingPriority(.required, for: .horizontal)
-        return field
-    }()
+    // 设计系统：权限徽章 = 橙色胶囊（盾牌图标 + workspace-write），effort = 灰色胶囊（high）。
+    private let approvalBadge = InputBarView.badgePill(
+        icon: "shield.lefthalf.filled", text: "workspace-write",
+        fg: CodexDesktopChrome.orange, bg: DesignTokens.warnWeak,
+        border: DesignTokens.warn.withAlphaComponent(0.35))
+    private let effortBadge = InputBarView.badgePill(
+        icon: nil, text: "high",
+        fg: DesignTokens.text2, bg: DesignTokens.surface2,
+        border: DesignTokens.border)
     private let microphoneButton = NSButton()
     private let sendButton = NSButton()
 
@@ -95,6 +86,51 @@ final class InputBarView: NSView {
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    /// 设计系统胶囊徽章：圆角容器 + 可选 SF Symbol 图标 + 文案。
+    /// 用于 composer 权限（橙）/ 推理强度（灰）标签，视觉对齐设计系统。
+    private static func badgePill(icon: String?, text: String,
+                                  fg: NSColor, bg: NSColor, border: NSColor) -> NSView {
+        let pill = NSView()
+        pill.wantsLayer = true
+        pill.layer?.backgroundColor = bg.cgColor
+        pill.layer?.cornerRadius = 11
+        pill.layer?.cornerCurve = .continuous
+        pill.layer?.borderWidth = 1
+        pill.layer?.borderColor = border.cgColor
+        pill.translatesAutoresizingMaskIntoConstraints = false
+        pill.setContentHuggingPriority(.required, for: .horizontal)
+        pill.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        let stack = NSStackView()
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 4
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        if let icon, let img = NSImage(systemSymbolName: icon, accessibilityDescription: nil) {
+            let iv = NSImageView(image: img)
+            iv.contentTintColor = fg
+            iv.imageScaling = .scaleProportionallyDown
+            iv.translatesAutoresizingMaskIntoConstraints = false
+            iv.widthAnchor.constraint(equalToConstant: 11).isActive = true
+            iv.heightAnchor.constraint(equalToConstant: 11).isActive = true
+            stack.addArrangedSubview(iv)
+        }
+        let label = NSTextField(labelWithString: text)
+        label.font = ConversationRowMetrics.captionFont
+        label.textColor = fg
+        label.translatesAutoresizingMaskIntoConstraints = false
+        stack.addArrangedSubview(label)
+
+        pill.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 8),
+            stack.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -8),
+            stack.topAnchor.constraint(equalTo: pill.topAnchor, constant: 3),
+            stack.bottomAnchor.constraint(equalTo: pill.bottomAnchor, constant: -3),
+        ])
+        return pill
+    }
 
     private func build() {
         translatesAutoresizingMaskIntoConstraints = false
@@ -154,13 +190,18 @@ final class InputBarView: NSView {
         sendButton.layer?.backgroundColor = DesignTokens.text.cgColor
         sendButton.layer?.cornerRadius = 15
 
+        // 设计系统：左侧徽章成组（权限 / Plan Mode / 队列 / effort）。
+        // 用 NSStackView 让隐藏项自动折叠，避免占位造成的空隙。
+        let badgeStack = NSStackView(views: [approvalBadge, planModeBadge, queuedLabel, effortBadge])
+        badgeStack.orientation = .horizontal
+        badgeStack.alignment = .centerY
+        badgeStack.spacing = 8
+        badgeStack.translatesAutoresizingMaskIntoConstraints = false
+
         addSubview(composerChrome)
         composerChrome.addSubview(scrollView)
         composerChrome.addSubview(attachButton)
-        composerChrome.addSubview(approvalBadge)
-        composerChrome.addSubview(planModeBadge)
-        composerChrome.addSubview(queuedLabel)
-        composerChrome.addSubview(effortBadge)
+        composerChrome.addSubview(badgeStack)
         composerChrome.addSubview(microphoneButton)
         composerChrome.addSubview(sendButton)
 
@@ -183,19 +224,13 @@ final class InputBarView: NSView {
             attachButton.widthAnchor.constraint(equalToConstant: 28),
             attachButton.heightAnchor.constraint(equalToConstant: 28),
 
-            approvalBadge.leadingAnchor.constraint(equalTo: attachButton.trailingAnchor, constant: 10),
-            approvalBadge.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
+            // 设计系统：徽章组紧挨 + 号成组在左，尾部不越过 mic
+            badgeStack.leadingAnchor.constraint(equalTo: attachButton.trailingAnchor, constant: 10),
+            badgeStack.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
+            badgeStack.trailingAnchor.constraint(lessThanOrEqualTo: microphoneButton.leadingAnchor, constant: -10),
 
-            planModeBadge.leadingAnchor.constraint(equalTo: approvalBadge.trailingAnchor, constant: 10),
-            planModeBadge.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-
-            queuedLabel.leadingAnchor.constraint(equalTo: planModeBadge.trailingAnchor, constant: 8),
-            queuedLabel.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-
-            effortBadge.leadingAnchor.constraint(greaterThanOrEqualTo: queuedLabel.trailingAnchor, constant: 10),
-            effortBadge.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-
-            microphoneButton.leadingAnchor.constraint(equalTo: effortBadge.trailingAnchor, constant: 10),
+            // mic / send 独立锚定到右侧
+            microphoneButton.trailingAnchor.constraint(equalTo: sendButton.leadingAnchor, constant: -10),
             microphoneButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
             microphoneButton.widthAnchor.constraint(equalToConstant: 24),
             microphoneButton.heightAnchor.constraint(equalToConstant: 24),

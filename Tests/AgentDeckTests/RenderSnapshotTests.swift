@@ -18,6 +18,17 @@ final class RenderSnapshotTests: XCTestCase {
         header.renderPNG(to: "/tmp/adk-header.png")
     }
 
+    func testRenderComposer() {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        model.cwd = URL(fileURLWithPath: "/p/refactor-auth")
+        let bar = InputBarView(model: model)
+        bar.wantsLayer = true
+        bar.layer?.backgroundColor = DesignTokens.bg.cgColor
+        bar.frame = NSRect(x: 0, y: 0, width: 720, height: 96)
+        bar.layoutSubtreeIfNeeded()
+        bar.renderPNG(to: "/tmp/adk-composer.png")
+    }
+
     func testRenderConversationStream() {
         let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
         model.cwd = URL(fileURLWithPath: "/p/refactor-auth")
