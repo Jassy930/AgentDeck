@@ -29,8 +29,14 @@ func makeConversationTurns(from items: [UIItem]) -> [ConversationTurn] {
 
     for item in items {
         if item.kind == "user" {
+            // 丢弃纯 CLI 命令元数据（caveat / 斜杠命令），并剥离真实消息里的残留标签。
+            guard let cleaned = CommandMessageSanitizer.sanitize(userText: item.text) else {
+                continue
+            }
             flush()
-            currentUser = item
+            var user = item
+            user.text = cleaned
+            currentUser = user
         } else {
             currentAssistantItems.append(item)
         }

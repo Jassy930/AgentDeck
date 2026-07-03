@@ -705,16 +705,22 @@ final class ToolCallCellView: ConversationRowCellView {
         font: ConversationRowMetrics.monoCalloutMediumFont, color: DesignTokens.text)
     private let metadataLabel = ConversationRowControls.label(
         font: ConversationRowMetrics.monoCaptionFont, color: DesignTokens.text3)
+    private let disclosure = ConversationRowControls.disclosureButton(title: "")
     private let payloadLabel = ConversationRowControls.label(
         font: ConversationRowMetrics.monoCaptionFont, color: DesignTokens.text2)
+
+    private var itemId = ""
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         applyVerticalPadding()
         contentStack.spacing = 5
+        disclosure.target = self
+        disclosure.action = #selector(toggle)
         contentStack.addArrangedSubview(header)
         contentStack.addArrangedSubview(nameLabel)
         contentStack.addArrangedSubview(metadataLabel)
+        contentStack.addArrangedSubview(disclosure)
         contentStack.addArrangedSubview(payloadLabel)
         pin(nameLabel); pin(metadataLabel); pin(payloadLabel)
     }
@@ -726,8 +732,16 @@ final class ToolCallCellView: ConversationRowCellView {
         view.trailingAnchor.constraint(equalTo: contentStack.trailingAnchor).isActive = true
     }
 
+    @objc private func toggle() {
+        let expanded = disclosure.state == .on
+        payloadLabel.isHidden = !expanded
+        // 持久化折叠态，避免流式重配时被重置（与 shell / fileEdit 一致）。
+        disclosureStore?.setItem(itemId, expanded: expanded)
+    }
+
     override func configure(row: ConversationDisplayRow, width: CGFloat, model: SessionModel) {
         let item = row.item
+        itemId = item.id
         header.update(
             systemImage: "wrench.and.screwdriver",
             title: item.toolKind == "mcp" ? "MCP tool" : "Tool call"
@@ -740,13 +754,17 @@ final class ToolCallCellView: ConversationRowCellView {
         metadataLabel.stringValue = metadata.joined(separator: " · ")
         metadataLabel.isHidden = metadata.isEmpty
 
-        var payloads: [String] = []
-        if !item.arguments.isEmpty { payloads.append("arguments\n\(item.arguments)") }
-        if !item.result.isEmpty { payloads.append("result\n\(item.result)") }
-        if !item.errorText.isEmpty { payloads.append("error\n\(item.errorText)") }
-        payloadLabel.stringValue = payloads.joined(separator: "\n\n")
-        payloadLabel.isHidden = payloads.isEmpty
+        // 参数/结果默认折叠：对话流保持干净，展开时才显示美化后的 JSON。
+        let payload = ToolPresentation.toolPayload(item)
+        let hasPayload = !payload.isEmpty
+        disclosure.isHidden = !hasPayload
+        disclosure.title = ToolPresentation.outputLabel(payload, noun: "details")
+        payloadLabel.stringValue = payload
         payloadLabel.preferredMaxLayoutWidth = contentW
+
+        let expanded = hasPayload && (disclosureStore?.isItemExpanded(item.id) ?? false)
+        disclosure.state = expanded ? .on : .off
+        payloadLabel.isHidden = !expanded
     }
 }
 

@@ -17,7 +17,8 @@ struct HistoryThreadSummary: Identifiable, Codable, Equatable {
     var displayTitle: String {
         let title = (name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if !title.isEmpty { return title }
-        let fallback = preview.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 兜底清洗预览里的 CLI 命令元数据标签（持久化线程的 preview 可能仍带标签）。
+        let fallback = CommandMessageSanitizer.cleanedForDisplay(preview)
         return fallback.isEmpty ? "Untitled thread" : fallback
     }
 }

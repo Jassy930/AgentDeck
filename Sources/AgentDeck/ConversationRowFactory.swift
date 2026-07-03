@@ -192,13 +192,9 @@ enum ConversationRowFactory {
             if !metadata.isEmpty {
                 h += verticalGap + ConversationRowMetrics.lineHeight(ConversationRowMetrics.monoCaptionFont)
             }
-            var payloads: [String] = []
-            if !item.arguments.isEmpty { payloads.append("arguments\n\(item.arguments)") }
-            if !item.result.isEmpty { payloads.append("result\n\(item.result)") }
-            if !item.errorText.isEmpty { payloads.append("error\n\(item.errorText)") }
-            if !payloads.isEmpty {
-                h += verticalGap + textHeight(payloads.joined(separator: "\n\n"),
-                                              font: ConversationRowMetrics.monoCaptionFont, width: contentW)
+            // 参数/结果默认折叠：只算 disclosure 头（展开后的载荷高度由控制器补上）。
+            if !ToolPresentation.toolPayload(item).isEmpty {
+                h += verticalGap + disclosureHeaderHeight
             }
             return h
 

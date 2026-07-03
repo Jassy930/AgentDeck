@@ -66,4 +66,28 @@ enum ToolPresentation {
         if !item.resourceUri.isEmpty { parts.append(item.resourceUri) }
         return parts
     }
+
+    /// Human-readable payload for a tool call: arguments / result / error,
+    /// each pretty-printed (compact JSON → indented) so the disclosure body is
+    /// legible instead of a single wrapped line. Empty sections are skipped.
+    static func toolPayload(_ item: UIItem) -> String {
+        var blocks: [String] = []
+        if !item.arguments.isEmpty { blocks.append("arguments\n" + prettyJSON(item.arguments)) }
+        if !item.result.isEmpty { blocks.append("result\n" + prettyJSON(item.result)) }
+        if !item.errorText.isEmpty { blocks.append("error\n" + item.errorText) }
+        return blocks.joined(separator: "\n\n")
+    }
+
+    /// Re-indent a compact JSON string. Falls back to the original text when it
+    /// isn't valid JSON (e.g. a plain string result) so nothing is ever lost.
+    static func prettyJSON(_ compact: String) -> String {
+        guard let data = compact.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let pretty = try? JSONSerialization.data(
+                withJSONObject: object,
+                options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]),
+              let string = String(data: pretty, encoding: .utf8)
+        else { return compact }
+        return string
+    }
 }

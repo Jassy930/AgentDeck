@@ -391,7 +391,13 @@ final class SessionModel {
     }
 
     private func liveHistoryThreadSummary(for runtime: ThreadRuntimeModel) -> HistoryThreadSummary {
-        let prompt = runtime.items.first { $0.kind == "user" }?.text
+        // 取第一条「真实」用户消息作为预览：跳过 CLI 命令元数据（caveat / 斜杠命令），
+        // 并剥离残留标签，避免侧栏标题显示成 `<local-command-cave…>`。
+        let prompt = runtime.items
+            .lazy
+            .filter { $0.kind == "user" }
+            .compactMap { CommandMessageSanitizer.sanitize(userText: $0.text) }
+            .first?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let preview = (prompt?.isEmpty == false ? prompt : nil) ?? runtime.displayTitle
         return HistoryThreadSummary(

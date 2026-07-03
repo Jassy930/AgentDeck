@@ -499,7 +499,8 @@ final class ConversationViewController: NSViewController {
         // A collapsible row that the user expanded measures taller (its body is
         // included). Fold the expanded flag into the version so the height cache
         // re-measures when it flips. (C1)
-        if (item.kind == "shell" || item.kind == "fileEdit"), expandedItemIds.contains(item.id) {
+        if (item.kind == "shell" || item.kind == "fileEdit" || item.kind == "toolCall"),
+           expandedItemIds.contains(item.id) {
             version = version &* 31 &+ 2
         }
         return version
@@ -515,8 +516,8 @@ final class ConversationViewController: NSViewController {
             height += reasoningExpandedBodyHeight(for: row, width: width)
         }
         // The factory counts only the collapsed disclosure header for shell /
-        // fileEdit rows; when the user has expanded one, add its streamed body
-        // (output / diff) so the row reserves room for it. (C1)
+        // fileEdit / toolCall rows; when the user has expanded one, add its body
+        // (output / diff / JSON payload) so the row reserves room for it. (C1)
         if expandedItemIds.contains(row.item.id) {
             height += disclosureBodyHeight(for: row, width: width)
         }
@@ -537,6 +538,14 @@ final class ConversationViewController: NSViewController {
         case "fileEdit":
             text = item.diffBuffer.text
             font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        case "toolCall":
+            // 展开后显示美化 JSON（payloadLabel 用 monoCaptionFont，stack 间距 5）。
+            let payload = ToolPresentation.toolPayload(item)
+            guard !payload.isEmpty else { return 0 }
+            let contentW = max(width - ConversationRowCellView.horizontalInset * 2, 1)
+            let attributed = NSAttributedString(
+                string: payload, attributes: [.font: ConversationRowMetrics.monoCaptionFont])
+            return 5 + measuredTextHeight(attributed, width: contentW)
         default:
             return 0
         }
