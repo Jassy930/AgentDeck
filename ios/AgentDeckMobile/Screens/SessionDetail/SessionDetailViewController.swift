@@ -2,7 +2,7 @@ import UIKit
 import AgentDeckCore
 
 final class SessionDetailViewController: UIViewController {
-    private enum Section: Hashable { case conversation }
+    private enum Section: Hashable { case conversation; case approval }
 
     private let viewModel: SessionDetailViewModel
     private var collectionView: UICollectionView!
@@ -70,9 +70,23 @@ final class SessionDetailViewController: UIViewController {
                 self.collectionView.collectionViewLayout.invalidateLayout()
             }
         }
+        let approvalReg = UICollectionView.CellRegistration<ApprovalCardCell, Void> {
+            [weak self] cell, _, _ in
+            guard let self, let request = self.viewModel.pendingApproval else { return }
+            let presentation = ApprovalCardPresentation.make(from: request)
+            cell.configure(with: presentation, state: self.viewModel.approvalState)
+            cell.onApprove = { [weak self] in self?.viewModel.resolveApproval(approve: true) }
+            cell.onDeny = { [weak self] in self?.viewModel.resolveApproval(approve: false) }
+        }
         dataSource = UICollectionViewDiffableDataSource<Section, String>(collectionView: collectionView) {
             [weak self] collectionView, indexPath, rowID in
-            guard let self, let row = self.viewModel.rows.first(where: { $0.id == rowID }) else { return nil }
+            guard let self else { return nil }
+            // 审批卡片：固定 item ID
+            if rowID == "approval-card" {
+                guard self.viewModel.pendingApproval != nil else { return UICollectionViewCell() }
+                return collectionView.dequeueConfiguredReusableCell(using: approvalReg, for: indexPath, item: ())
+            }
+            guard let row = self.viewModel.rows.first(where: { $0.id == rowID }) else { return nil }
             // 渲染路径由 row 数据（role / item.kind）决定，不看 agentKind（N2）。
             switch row.role {
             case .userPrompt:
@@ -105,8 +119,18 @@ final class SessionDetailViewController: UIViewController {
         snapshot.appendSections([.conversation])
         let ids = viewModel.rows.map(\.id)
         snapshot.appendItems(ids, toSection: .conversation)
+        // 审批 section：仅当 approvalState != .none 时追加
+        var reconfigureIDs: [String] = []
         let existing = Set(dataSource.snapshot().itemIdentifiers)
-        snapshot.reconfigureItems(ids.filter(existing.contains))
+        reconfigureIDs = ids.filter(existing.contains)
+        if viewModel.approvalState != .none {
+            snapshot.appendSections([.approval])
+            snapshot.appendItems(["approval-card"], toSection: .approval)
+            if existing.contains("approval-card") {
+                reconfigureIDs.append("approval-card")
+            }
+        }
+        snapshot.reconfigureItems(reconfigureIDs)
         dataSource.apply(snapshot, animatingDifferences: false)
         if let last = ids.last, let indexPath = dataSource.indexPath(for: last) {
             collectionView.scrollToItem(at: indexPath, at: .bottom, animated: false)
