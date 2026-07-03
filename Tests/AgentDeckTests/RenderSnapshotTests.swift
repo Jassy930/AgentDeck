@@ -18,6 +18,28 @@ final class RenderSnapshotTests: XCTestCase {
         header.renderPNG(to: "/tmp/adk-header.png")
     }
 
+    func testRenderConversationStream() {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        model.cwd = URL(fileURLWithPath: "/p/refactor-auth")
+        model.workbench.ensureRuntime(sessionId: "live-1", agentKind: .codex, threadId: nil, cwd: model.cwd!)
+        let rt = model.workbench.runtime(sessionId: "live-1")!
+        rt.items = [
+            UIItem(id: "u1", lifecycle: "completed", kind: "user",
+                   text: "把登录模块拆分成独立的 auth service，抽出 token 刷新逻辑，并补齐单元测试。"),
+            UIItem(id: "r1", lifecycle: "completed", kind: "reasoning",
+                   text: "先梳理 auth 目录下的依赖关系，确认哪些函数被外部引用，再决定拆分边界。"),
+            UIItem(id: "m1", lifecycle: "completed", kind: "message",
+                   text: "我会先分析依赖，再抽出 service，最后补测试。"),
+        ]
+        model.workbench.selectRuntime(sessionId: "live-1")
+
+        let vc = ConversationViewController(model: model)
+        let v = vc.view
+        v.frame = NSRect(x: 0, y: 0, width: 900, height: 640)
+        v.layoutSubtreeIfNeeded()
+        v.renderPNG(to: "/tmp/adk-stream.png")
+    }
+
     func testRenderFullSessionWindow() {
         let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
         model.cwd = URL(fileURLWithPath: "/p/refactor-auth")
