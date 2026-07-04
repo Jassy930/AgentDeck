@@ -9,10 +9,11 @@ import AppKit
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let profile: AgentDeckProfile
     private var window: NSWindow?
-    private let model = SessionModel()
+    private let model: SessionModel
 
-    init(profile: AgentDeckProfile) {
+    init(profile: AgentDeckProfile, preview: Bool = false) {
         self.profile = profile
+        self.model = preview ? PreviewBootstrap.makeSessionModel() : SessionModel()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {

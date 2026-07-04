@@ -88,3 +88,5 @@ SessionModel ──真实──> DaemonClient ──真实 IPC──> MockDaemon
 
 - 前端渲染路径无 `if preview` 分支；mock 全部收敛在 `Preview/` 两个文件 + 注入点。
 - 非 preview 启动行为完全不变。
+
+实现已落地

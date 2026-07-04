@@ -142,7 +142,11 @@ enum AgentDeckQuitCommand {
     static let shortcutKey = "q"
 }
 
+let previewMode = CommandLine.arguments.contains("--preview")
+if previewMode {
+    FileHandle.standardError.write(Data("[AgentDeck] preview mode: mock daemon\n".utf8))
+}
 let app = NSApplication.shared
-let delegate = AppDelegate(profile: launchProfile)
+let delegate = AppDelegate(profile: launchProfile, preview: previewMode)
 app.delegate = delegate
 app.run()

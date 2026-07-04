@@ -285,6 +285,7 @@ agentdeck protocol version
 swift run AgentDeck               # 本地 debug 构建默认使用 dev profile
 swift run AgentDeck -- --selfcheck  # 无窗口自检: IPC lifecycle + logging/redaction probe
 swift run AgentDeck -- --diagnostics-report --json  # 输出机器可读诊断报告
+swift run AgentDeck -- --preview  # 前端 mock 预览，不连真实 daemon
 ```
 
 macOS 前端使用纯 AppKit。当前主窗口外壳对齐 Codex Desktop：透明标题栏、
