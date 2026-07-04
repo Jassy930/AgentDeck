@@ -1,0 +1,27 @@
+{
+  "$meta": {
+    "name": "AgentDeck 组件视觉骨架 SSOT",
+    "version": "0.1.0",
+    "note": "组件稳定视觉骨架的单一数据源：只描述设计自有的静态标签与禁止元素（不描述行为，也不含 fixture 数据）。改这里跑 tools/build.mjs 生成 Sources/AgentDeck/ComponentSpecs.swift。禁止手改生成物。"
+  },
+  "components": {
+    "m-user": {
+      "title": "用户气泡 · m-user",
+      "requiredLabels": [],
+      "forbiddenLabels": ["You"],
+      "forbidAccentBar": true
+    },
+    "envpanel": {
+      "title": "环境面板 · envpanel",
+      "requiredLabels": ["变更 Changes", "Git", "分支", "提交"],
+      "forbiddenLabels": ["环境信息", "提交或推送", "暂无来源"],
+      "forbidAccentBar": false
+    },
+    "composer": {
+      "title": "输入栏 · composer",
+      "requiredLabels": ["继续对话，或 @ 引用文件…"],
+      "forbiddenLabels": [],
+      "forbidAccentBar": false
+    }
+  }
+}

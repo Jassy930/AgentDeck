@@ -11,6 +11,10 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const src = JSON.parse(fs.readFileSync(path.join(root, "tokens/tokens.json"), "utf8"));
+const componentsPath = path.join(root, "components/components.json");
+const components = fs.existsSync(componentsPath)
+  ? JSON.parse(fs.readFileSync(componentsPath, "utf8"))
+  : null;
 const outDir = path.join(root, "generated");
 fs.mkdirSync(outDir, { recursive: true });
 
@@ -243,11 +247,56 @@ function genMobileSwift() {
   return "ios/AgentDeckMobile/DesignTokens.swift";
 }
 
+/* ============================================================
+   6) Sources/AgentDeck/ComponentSpecs.swift —— 组件视觉骨架契约
+   由 components/components.json 生成；供画廊结构断言测试消费。
+   ============================================================ */
+function swiftStringArray(arr) {
+  return "[" + arr.map((s) => JSON.stringify(s)).join(", ") + "]";
+}
+function genComponentSpecs() {
+  const appDir = path.join(root, "../../Sources/AgentDeck");
+  if (!components || !fs.existsSync(appDir)) return null;
+  const L = [];
+  L.push("// 生成物 · 由设计系统 SSOT 生成（designs/agentdeck-design-system/components/components.json）。");
+  L.push("// 禁止手改；改 SSOT 后在 designs/agentdeck-design-system 跑 `node tools/build.mjs` 重生成。");
+  L.push("");
+  L.push("/// 组件稳定视觉骨架契约：设计自有的静态标签与禁止元素（不含行为、不含 fixture 数据）。");
+  L.push("enum ComponentSpecs {");
+  L.push("    struct Spec {");
+  L.push("        let key: String");
+  L.push("        let title: String");
+  L.push("        let requiredLabels: [String]");
+  L.push("        let forbiddenLabels: [String]");
+  L.push("        let forbidAccentBar: Bool");
+  L.push("    }");
+  L.push("");
+  const entries = Object.entries(components.components);
+  L.push("    static let all: [Spec] = [");
+  for (const [key, c] of entries) {
+    L.push("        Spec(");
+    L.push(`            key: ${JSON.stringify(key)},`);
+    L.push(`            title: ${JSON.stringify(c.title || key)},`);
+    L.push(`            requiredLabels: ${swiftStringArray(c.requiredLabels || [])},`);
+    L.push(`            forbiddenLabels: ${swiftStringArray(c.forbiddenLabels || [])},`);
+    L.push(`            forbidAccentBar: ${c.forbidAccentBar ? "true" : "false"}`);
+    L.push("        ),");
+  }
+  L.push("    ]");
+  L.push("");
+  L.push("    static func spec(_ key: String) -> Spec? { all.first { $0.key == key } }");
+  L.push("}");
+  fs.writeFileSync(path.join(appDir, "ComponentSpecs.swift"), L.join("\n") + "\n");
+  return path.relative(path.join(root, "../.."), path.join(appDir, "ComponentSpecs.swift"));
+}
+
 genCss();
 genSwift();
 genTs();
 const appOut = genAppSwift();
 const mobileOut = genMobileSwift();
+const specsOut = genComponentSpecs();
 console.log("✓ 生成完成 → generated/tokens.css, generated/Theme.swift, generated/DesignTokens.ts");
 if (appOut) console.log("✓ App 契约 → " + appOut);
 if (mobileOut) console.log("✓ Mobile 契约 → " + mobileOut);
+if (specsOut) console.log("✓ 组件契约 → " + specsOut);
