@@ -153,6 +153,16 @@ final class SessionViewController: NSViewController {
         didApplyInitialSidebarWidth = true
     }
 
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        // Restore the former SwiftUI `.onAppear { model.loadHistoryOnAppear() }`
+        // that the AppKit cutover (83e8853) dropped: without it the one-shot
+        // initial history scan never fires, so persisted sessions only appear
+        // after a manual Refresh. `loadHistoryOnAppear()` is idempotent — its
+        // `shouldAutoRefreshHistoryOnAppear()` guard runs the scan only once.
+        model.loadHistoryOnAppear()
+    }
+
     // MARK: - Content container VC
 
     /// Returns a lightweight NSViewController that owns `contentContainer`.

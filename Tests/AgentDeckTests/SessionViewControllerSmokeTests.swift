@@ -53,6 +53,25 @@ final class SessionViewControllerSmokeTests: XCTestCase {
         convVC.scrollToLatest()
     }
 
+    // MARK: - Initial history auto-refresh on appear
+
+    /// Regression for the AppKit cutover (83e8853) dropping the SwiftUI
+    /// `.onAppear { model.loadHistoryOnAppear() }`, which left the initial
+    /// history scan never firing — persisted sessions only showed after a
+    /// manual Refresh. The nil-client test init keeps `loadHistory` from
+    /// spawning `agentdeckd`; we only assert the one-shot guard was consumed.
+    func testViewDidAppearTriggersInitialHistoryRefresh() {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        let vc = SessionViewController(model: model)
+        _ = vc.view  // trigger loadView
+        vc.viewDidAppear()
+
+        XCTAssertFalse(
+            model.shouldAutoRefreshHistoryOnAppear(),
+            "viewDidAppear must consume the one-shot initial history auto-refresh"
+        )
+    }
+
     // MARK: - Child controllers
 
     func testSessionViewControllerHasChildControllers() {
