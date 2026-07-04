@@ -163,9 +163,20 @@ final class CodexContentHeaderView: NSView {
 
 @MainActor
 final class CodexEnvironmentPanelView: NSView {
-    override init(frame: NSRect) {
-        super.init(frame: frame)
+    private weak var model: SessionModel?
+    private let binder = ObservationBinder()
+
+    private let changesValue = NSTextField(labelWithString: "")
+    private let fileCountValue = NSTextField(labelWithString: "")
+    private let branchValue = NSTextField(labelWithString: "")
+    private let commitValue = NSTextField(labelWithString: "")
+
+    init(model: SessionModel) {
+        self.model = model
+        super.init(frame: .zero)
         build()
+        bind()
+        refresh()
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) not supported") }
@@ -174,26 +185,27 @@ final class CodexEnvironmentPanelView: NSView {
         translatesAutoresizingMaskIntoConstraints = false
         CodexDesktopChrome.roundedPanel(self, radius: DesignTokens.radiusLg, shadow: true)
 
-        let title = label("环境信息", size: 13, weight: .medium, color: DesignTokens.text2)
-        let add = symbolButton("plus", tooltip: "添加环境信息")
-        let titleRow = row([title, spacer(), add], spacing: 8)
+        // 标题：变更 Changes
+        let title = label("变更 Changes", size: 13, weight: .medium, color: DesignTokens.text2)
 
-        let changes = metricRow(symbol: "plusminus.square", title: "变更", trailing: "+0 -0", trailingColor: DesignTokens.text2)
-        let local = metricRow(symbol: "laptopcomputer", title: "本地⌄", trailing: nil)
-        let branch = metricRow(symbol: "point.3.connected.trianglepath.dotted", title: "master⌄", trailing: nil)
-        let push = metricRow(symbol: "icloud.and.arrow.up", title: "提交或推送", trailing: nil)
+        // 大号统计：+128 -34   3 文件
+        changesValue.font = .systemFont(ofSize: 22, weight: .semibold)
+        changesValue.textColor = DesignTokens.text
+        fileCountValue.font = .systemFont(ofSize: 12, weight: .regular)
+        fileCountValue.textColor = DesignTokens.text3
+        let changesRow = row([changesValue, fileCountValue, spacer()], spacing: 10)
 
-        let divider = NSBox()
-        divider.boxType = .separator
-        divider.translatesAutoresizingMaskIntoConstraints = false
+        // 分组标题：Git
+        let gitTitle = label("Git", size: 13, weight: .medium, color: DesignTokens.text2)
 
-        let sourceTitle = label("来源", size: 13, weight: .regular, color: DesignTokens.text2)
-        let sourceEmpty = label("暂无来源", size: 13, weight: .regular, color: DesignTokens.text3)
+        // 键值：分支 …… main / 提交 …… a1b2c3d（值右对齐）
+        let branchRow = keyValueRow("分支", value: branchValue)
+        let commitRow = keyValueRow("提交", value: commitValue)
 
-        let stack = NSStackView(views: [titleRow, changes, local, branch, push, divider, sourceTitle, sourceEmpty])
+        let stack = NSStackView(views: [title, changesRow, gitTitle, branchRow, commitRow])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 13
+        stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)
 
@@ -203,50 +215,45 @@ final class CodexEnvironmentPanelView: NSView {
             stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
             stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
             stack.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -16),
-            divider.widthAnchor.constraint(equalTo: stack.widthAnchor),
         ])
     }
 
-    private func metricRow(symbol: String, title: String, trailing: String?, trailingColor: NSColor = DesignTokens.text) -> NSView {
-        let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil) ?? NSImage())
-        icon.contentTintColor = DesignTokens.text2
-        icon.translatesAutoresizingMaskIntoConstraints = false
-        let titleLabel = label(title, size: 13, weight: .medium, color: DesignTokens.text)
-        var views: [NSView] = [icon, titleLabel, spacer()]
-        if let trailing {
-            views.append(label(trailing, size: 13, weight: .semibold, color: trailingColor))
-        }
-        let v = row(views, spacing: 10)
-        NSLayoutConstraint.activate([
-            icon.widthAnchor.constraint(equalToConstant: 15),
-            icon.heightAnchor.constraint(equalToConstant: 15),
-        ])
-        return v
+    private func bind() {
+        binder.bind({ [weak self] in
+            _ = self?.model?.environmentInfo
+        }, onChange: { [weak self] in
+            self?.refresh()
+        })
     }
 
-    private func label(_ string: String, size: CGFloat, weight: NSFont.Weight, color: NSColor) -> NSTextField {
-        let label = NSTextField(labelWithString: string)
-        label.font = .systemFont(ofSize: size, weight: weight)
-        label.textColor = color
-        label.translatesAutoresizingMaskIntoConstraints = false
-        return label
+    private func refresh() {
+        let info = model?.environmentInfo
+        changesValue.stringValue = info?.changesSummary ?? "+0 -0"
+        fileCountValue.stringValue = info?.fileCountSummary ?? "0 文件"
+        branchValue.stringValue = info?.branch ?? "—"
+        commitValue.stringValue = info?.commit ?? "—"
     }
 
-    private func symbolButton(_ symbol: String, tooltip: String) -> NSButton {
-        let button = NSButton()
-        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tooltip)
-        button.toolTip = tooltip
-        button.bezelStyle = .inline
-        button.isBordered = false
-        button.contentTintColor = DesignTokens.text2
-        button.translatesAutoresizingMaskIntoConstraints = false
-        return button
+    private func keyValueRow(_ key: String, value: NSTextField) -> NSView {
+        let k = label(key, size: 13, weight: .regular, color: DesignTokens.text2)
+        value.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        value.textColor = DesignTokens.text
+        value.alignment = .right
+        return row([k, spacer(), value], spacing: 10)
+    }
+
+    private func label(_ s: String, size: CGFloat, weight: NSFont.Weight, color: NSColor) -> NSTextField {
+        let l = NSTextField(labelWithString: s)
+        l.font = .systemFont(ofSize: size, weight: weight)
+        l.textColor = color
+        l.translatesAutoresizingMaskIntoConstraints = false
+        return l
     }
 
     private func row(_ views: [NSView], spacing: CGFloat) -> NSStackView {
         let stack = NSStackView(views: views)
         stack.orientation = .horizontal
-        stack.alignment = .centerY
+        stack.alignment = .firstBaseline
         stack.spacing = spacing
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.widthAnchor.constraint(equalToConstant: 228).isActive = true
@@ -254,9 +261,25 @@ final class CodexEnvironmentPanelView: NSView {
     }
 
     private func spacer() -> NSView {
-        let view = NSView()
-        view.translatesAutoresizingMaskIntoConstraints = false
-        view.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        return view
+        let v = NSView()
+        v.translatesAutoresizingMaskIntoConstraints = false
+        v.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        return v
+    }
+
+    /// 测试辅助：收集所有子 label 文本。
+    func allLabelsForTest() -> [String] {
+        func collect(_ v: NSView) -> [String] {
+            var out: [String] = []
+            if let tf = v as? NSTextField { out.append(tf.stringValue) }
+            for sub in v.subviews { out += collect(sub) }
+            return out
+        }
+        return collect(self)
+    }
+
+    deinit {
+        let b = binder
+        Task { @MainActor in b.invalidate() }
     }
 }

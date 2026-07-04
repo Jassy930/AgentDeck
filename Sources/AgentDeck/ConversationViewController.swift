@@ -75,7 +75,7 @@ final class ConversationViewController: NSViewController {
     private let scrollView = NSScrollView()
     private let tableView = NSTableView()
     private lazy var inputBar = InputBarView(model: model)
-    private let environmentPanel = CodexEnvironmentPanelView()
+    private lazy var environmentPanel = CodexEnvironmentPanelView(model: model)
     private let errorCell = ErrorCellView()
     private let warningCell = WarningCellView()
     private let approvalCard = ApprovalCardView()
