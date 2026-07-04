@@ -88,16 +88,16 @@ enum ConversationRowFactory {
     private static let tightGap: CGFloat = 4
 
     private static func userPromptHeight(row: ConversationDisplayRow, width: CGFloat) -> CGFloat {
-        // padding(.vertical, 8) outer + bubble inner padding (10 top + 10 bottom)
+        // padding(.vertical, 8) outer + bubble inner padding (10 top + 10 bottom).
+        // 「You」标题与左边条已移除，高度只含气泡内边距 + 正文。
         let outer: CGFloat = 8 * 2
         let bubbleInset: CGFloat = 10 * 2
-        let you = ConversationRowMetrics.lineHeight(ConversationRowMetrics.captionSemiboldFont)
         let bodyWidth = UserPromptCellView.bodyWidth(forRowWidth: width)
         let body = measuredTextHeight(
             MarkdownAttributedStringBuilder.attributedString(from: row.item.text),
             width: bodyWidth
         )
-        return outer + bubbleInset + you + verticalGap + body
+        return outer + bubbleInset + body
     }
 
     private static func assistantHeight(row: ConversationDisplayRow, width: CGFloat) -> CGFloat {

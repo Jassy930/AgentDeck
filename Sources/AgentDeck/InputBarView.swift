@@ -23,7 +23,7 @@ final class InputBarView: NSView {
     private let textView = InputTextView()
     private let scrollView = NSScrollView()
     private let placeholderLabel: NSTextField = {
-        let field = NSTextField(labelWithString: "要求后续变更")
+        let field = NSTextField(labelWithString: "继续对话，或 @ 引用文件…")
         field.font = ConversationRowMetrics.calloutFont
         field.textColor = DesignTokens.text3
         field.translatesAutoresizingMaskIntoConstraints = false
@@ -181,6 +181,8 @@ final class InputBarView: NSView {
 
         sendButton.setAccessibilityIdentifier("composer-send")
         sendButton.image = NSImage(systemSymbolName: "arrow.up", accessibilityDescription: "发送")
+        // 浅色圆底上箭头需深色，否则模板图默认取浅色前景 → 白底白箭头看不见。
+        sendButton.contentTintColor = CodexDesktopChrome.windowBackground
         sendButton.bezelStyle = .inline
         sendButton.isBordered = false
         sendButton.target = self

@@ -187,15 +187,12 @@ class ConversationRowCellView: NSTableCellView {
 
 // MARK: - User prompt
 
-/// Ports `UserPromptBlock`: left accent bar + "You" caption + markdown body,
-/// wrapped in a quaternary-fill rounded rectangle.
+/// 设计系统对齐：用户消息为纯灰色圆角气泡，仅含 markdown 正文——不再有
+/// 「You」小标题和橙色左边条（对齐目标设计稿）。
 final class UserPromptCellView: ConversationRowCellView {
     override var verticalPadding: CGFloat { 8 }
 
     private let bubble = NSView()
-    private let accentBar = NSView()
-    private let youLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.captionSemiboldFont, color: DesignTokens.text2)
     private let bodyLabel = ConversationRowControls.label(
         font: ConversationRowMetrics.calloutFont, color: DesignTokens.text)
 
@@ -216,31 +213,13 @@ final class UserPromptCellView: ConversationRowCellView {
         bubble.layer?.cornerRadius = 7
         bubble.layer?.backgroundColor = NSColor.quaternarySystemFill.cgColor
 
-        accentBar.translatesAutoresizingMaskIntoConstraints = false
-        accentBar.wantsLayer = true
-        accentBar.layer?.cornerRadius = 1.5
-        accentBar.layer?.backgroundColor = DesignTokens.accent.withAlphaComponent(0.45).cgColor
-
-        youLabel.stringValue = "You"
-
-        let textColumn = NSStackView(views: [youLabel, bodyLabel])
-        textColumn.orientation = .vertical
-        textColumn.alignment = .leading
-        textColumn.spacing = 5
-        textColumn.translatesAutoresizingMaskIntoConstraints = false
-
-        bubble.addSubview(accentBar)
-        bubble.addSubview(textColumn)
+        bodyLabel.translatesAutoresizingMaskIntoConstraints = false
+        bubble.addSubview(bodyLabel)
         NSLayoutConstraint.activate([
-            accentBar.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 12),
-            accentBar.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 10),
-            accentBar.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -10),
-            accentBar.widthAnchor.constraint(equalToConstant: 3),
-
-            textColumn.leadingAnchor.constraint(equalTo: accentBar.trailingAnchor, constant: 10),
-            textColumn.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 10),
-            textColumn.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -12),
-            textColumn.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -10),
+            bodyLabel.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 14),
+            bodyLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14),
+            bodyLabel.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 10),
+            bodyLabel.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -10),
         ])
 
         contentStack.addArrangedSubview(bubble)
@@ -254,11 +233,10 @@ final class UserPromptCellView: ConversationRowCellView {
         bodyLabel.preferredMaxLayoutWidth = UserPromptCellView.bodyWidth(forRowWidth: width)
     }
 
-    /// Markdown body width inside the bubble: row minus stream insets, bubble
-    /// horizontal padding (12 + 12), accent bar (3) and its gap (10). Pure math,
-    /// so `nonisolated` for the factory's height calculation.
+    /// 气泡内 markdown 正文宽度：行宽减去流插入，再减去气泡水平内边距（14 + 14）。
+    /// 纯计算，`nonisolated` 供 factory 计算高度复用。
     nonisolated static func bodyWidth(forRowWidth width: CGFloat) -> CGFloat {
-        max(width - horizontalInset * 2 - 12 - 12 - 3 - 10, 1)
+        max(width - horizontalInset * 2 - 14 - 14, 1)
     }
 }
 

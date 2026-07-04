@@ -171,6 +171,26 @@ final class ConversationViewController: NSViewController {
         installEmptySpaceClickMonitor()
     }
 
+    /// Row heights are width-dependent (wrapped text), but `NSTableView` caches
+    /// them and only re-queries on `noteHeightOfRows`. The transcript column
+    /// starts at its pre-layout default width (~40pt) when rows first load, so
+    /// heights measured then are wildly wrong — a single line of CJK text wraps
+    /// to hundreds of points at width ~1, producing a giant user bubble that
+    /// never shrinks. Re-measure every row whenever the column width actually
+    /// changes (initial tiny → real width, and later window resizes).
+    private var lastLaidOutColumnWidth: CGFloat = 0
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        let width = columnWidth
+        guard abs(width - lastLaidOutColumnWidth) > 0.5 else { return }
+        lastLaidOutColumnWidth = width
+        cache.invalidateAll()
+        if !rows.isEmpty {
+            tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<rows.count))
+        }
+    }
+
     // MARK: Configuration
 
     private func configureTableView() {

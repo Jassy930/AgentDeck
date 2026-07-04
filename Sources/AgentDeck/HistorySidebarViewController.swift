@@ -29,15 +29,6 @@ final class HistorySidebarViewController: NSViewController {
         return label
     }()
 
-    private let refreshButton: NSButton = {
-        let btn = NSButton()
-        btn.bezelStyle = .inline
-        btn.isBordered = false
-        btn.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Refresh history")
-        btn.toolTip = "Refresh history"
-        btn.translatesAutoresizingMaskIntoConstraints = false
-        return btn
-    }()
 
     /// T6B: "+ New Session" — when set, the sidebar shows a plus button beside
     /// Refresh and invokes the closure when tapped (SessionViewController
@@ -158,7 +149,7 @@ final class HistorySidebarViewController: NSViewController {
         // Header row
         newSessionButton.target = self
         newSessionButton.action = #selector(handleNewSession)
-        let headerRow = NSStackView(views: [headerLabel, NSView(), newSessionButton, refreshButton])
+        let headerRow = NSStackView(views: [headerLabel, NSView(), newSessionButton])
         headerRow.orientation = .horizontal
         headerRow.spacing = 8
         headerRow.translatesAutoresizingMaskIntoConstraints = false
@@ -230,9 +221,6 @@ final class HistorySidebarViewController: NSViewController {
         // exist in any AppKit protocol and would never fire).
         contextMenu.delegate = self
         outlineView.menu = contextMenu
-
-        refreshButton.target = self
-        refreshButton.action = #selector(refreshTapped)
 
         // Search is driven solely by NSSearchFieldDelegate.controlTextDidChange;
         // no target/action so each keystroke only reloads once.
@@ -376,7 +364,6 @@ final class HistorySidebarViewController: NSViewController {
         outlineView.reloadData()
         expandAllGroups()
         updateVisibility()
-        syncRefreshButton()
     }
 
     private func expandAllGroups() {
@@ -402,15 +389,7 @@ final class HistorySidebarViewController: NSViewController {
         scrollView.isHidden = loading || hasError || isEmpty
     }
 
-    private func syncRefreshButton() {
-        refreshButton.isEnabled = !model.isLoadingHistory
-    }
-
     // MARK: - Actions
-
-    @objc private func refreshTapped() {
-        model.loadHistory()
-    }
 
     @objc private func handleNewSession() {
         onNewSessionRequested?()
