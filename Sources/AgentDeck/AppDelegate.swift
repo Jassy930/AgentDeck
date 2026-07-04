@@ -10,9 +10,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let profile: AgentDeckProfile
     private var window: NSWindow?
     private let model: SessionModel
+    private let preview: Bool
 
     init(profile: AgentDeckProfile, preview: Bool = false) {
         self.profile = profile
+        self.preview = preview
         self.model = preview ? PreviewBootstrap.makeSessionModel() : SessionModel()
     }
 
@@ -35,6 +37,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         NSApp.activate(ignoringOtherApps: true)
         installMainMenu()
+
+        // preview：直接开进主 mock 会话（对齐设计稿的会话视图，而非空态）。
+        if preview {
+            DispatchQueue.main.async { [model] in
+                model.loadHistory()
+                if let primary = model.historyThreads.first(where: {
+                    $0.id == MockDaemonScript.primaryThreadId
+                }) {
+                    model.openHistoryThread(primary)
+                }
+            }
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
