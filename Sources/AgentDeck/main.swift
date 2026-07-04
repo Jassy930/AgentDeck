@@ -143,10 +143,14 @@ enum AgentDeckQuitCommand {
 }
 
 let previewMode = CommandLine.arguments.contains("--preview")
+let galleryMode = CommandLine.arguments.contains("--gallery")
 if previewMode {
     FileHandle.standardError.write(Data("[AgentDeck] preview mode: mock daemon\n".utf8))
 }
+if galleryMode {
+    FileHandle.standardError.write(Data("[AgentDeck] gallery mode: design-system component gallery\n".utf8))
+}
 let app = NSApplication.shared
-let delegate = AppDelegate(profile: launchProfile, preview: previewMode)
+let delegate = AppDelegate(profile: launchProfile, preview: previewMode, gallery: galleryMode)
 app.delegate = delegate
 app.run()

@@ -11,17 +11,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
     private let model: SessionModel
     private let preview: Bool
+    private let gallery: Bool
 
-    init(profile: AgentDeckProfile, preview: Bool = false) {
+    init(profile: AgentDeckProfile, preview: Bool = false, gallery: Bool = false) {
         self.profile = profile
         self.preview = preview
+        self.gallery = gallery
         self.model = preview ? PreviewBootstrap.makeSessionModel() : SessionModel()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
 
-        let vc = SessionViewController(model: model)
+        let vc: NSViewController = gallery ? GalleryViewController() : SessionViewController(model: model)
         let win = NSWindow(contentViewController: vc)
         win.title = profile.windowTitle
         win.setContentSize(NSSize(width: 1280, height: 760))
