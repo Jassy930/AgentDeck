@@ -28,6 +28,12 @@ target/
 # Local git worktrees
 .worktrees/
 
+# Agent 工具本地产物（各家 CLI 的会话/技能缓存，不入库）
+.agents/
+.claude/
+.codex/
+skills-lock.json
+
 # Editor
 *.swp
 .idea/
