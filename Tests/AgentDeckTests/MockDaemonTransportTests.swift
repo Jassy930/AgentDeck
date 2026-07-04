@@ -33,7 +33,9 @@ final class MockDaemonTransportTests: XCTestCase {
         let t = MockDaemonTransport()
         let start = SessionStart(agentKind: .codex, cwd: MockDaemonScript.previewCwd, prompt: "hi",
                                  vendorOptions: .codex(CodexSessionOptions(approvalPolicy: .onRequest, sandbox: .workspaceWrite, persistApproval: false, reasoningEffort: .medium)))
-        let frames = lines(from: t, after: .sessionStart(start), count: 5, timeout: 4)
+        // 帧数由脚本推导，避免与脚本实现硬耦合
+        let expectedCount = MockDaemonScript.liveTurnEvents(sessionId: "mock-session-1", threadId: "mock-live-thread").count
+        let frames = lines(from: t, after: .sessionStart(start), count: expectedCount, timeout: 4)
         let events = frames.compactMap { try? DaemonClient.decodeServerEvent($0) }
         guard case .sessionStarted = events.first else { return XCTFail("首帧 sessionStarted") }
         guard case .turnComplete = events.last else { return XCTFail("末帧 turnComplete") }

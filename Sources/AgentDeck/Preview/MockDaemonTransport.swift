@@ -72,7 +72,7 @@ final class MockDaemonTransport: DaemonTransport {
         case .archive, .unarchive, .rename:
             response = .ack
         }
-        guard let responseJSON = try? String(data: encoder.encode(response), encoding: .utf8) ?? "" else { return }
+        guard let responseJSON = try? String(data: encoder.encode(response), encoding: .utf8) else { return }
         emit("{\"reply\":\"history\",\"response\":\(responseJSON)}")
     }
 
@@ -80,7 +80,7 @@ final class MockDaemonTransport: DaemonTransport {
         sessionCounter += 1
         let sessionId = "mock-session-\(sessionCounter)"
         for event in MockDaemonScript.liveTurnEvents(sessionId: sessionId, threadId: threadId) {
-            if let json = try? String(data: encoder.encode(event), encoding: .utf8) ?? "" {
+            if let json = try? String(data: encoder.encode(event), encoding: .utf8) {
                 emit(json)
             }
         }
@@ -105,6 +105,7 @@ final class MockDaemonTransport: DaemonTransport {
 
     private func errorFrame(message: String) -> String {
         let event = ServerEvent.error(sessionId: nil, error: ProtocolError(code: "mock.malformed", message: message))
-        return (try? String(data: encoder.encode(event), encoding: .utf8) ?? "") ?? ""
+        guard let s = try? String(data: encoder.encode(event), encoding: .utf8) else { return "" }
+        return s
     }
 }
