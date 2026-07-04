@@ -64,6 +64,7 @@ CSS 与 AppKit 不能共享渲染，所以：
 - **Phase 0（低成本、与大方向无关，先做）**
   - 把 `RenderSnapshotTests` 变成真快照：提交参照 PNG + 加 diff 断言；会话流在**极小宽度 + 真实宽度**都渲染（覆盖巨型气泡这类布局 bug）。
   - 加 `--gallery` 模式（复用预览台基础设施）。
+  - **已证实的坑（Phase 0 必须先解决）**：现有 `RenderSnapshotTests` 在无头环境下渲染的是**空表格**——会话表格的 `reloadData` 是观察驱动的（`ObservationBinder` 的 `onChange` 经 `Task`/async 重排），不 spin runloop 就不触发；`NSTableView.rect(ofRow:)` 在未 tile/display 时返回 0。所以「无头 metric 断言」对布局 bug 不可靠（已实测：装用户项后 `numberOfRows` 仍为 0）。真快照必须：构造好 fixture 后 **spin 一次 runloop（或显式强制 reload + tile/display）**，再对**渲染出的像素/cell frame** 断言，而不是对 delegate 现算值断言。这也解释了为什么本类 bug 一直漏网。
 - **Phase 1（需确认方案后做）**
   - `components.json` 覆盖首批组件（用户气泡、envpanel、composer、shell/diff/reasoning cell），codegen `ComponentSpecs.swift`。
   - 对画廊写结构断言（方案 C）。
