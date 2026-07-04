@@ -72,6 +72,37 @@ final class SessionViewControllerSmokeTests: XCTestCase {
         )
     }
 
+    // MARK: - Window must not resize when a session opens
+
+    /// Regression: the content pane is hosted in a window created via
+    /// `NSWindow(contentViewController:)`, which sizes the window to the
+    /// content view's Auto Layout `fittingSize`. The conversation pane used a
+    /// fixed `width == 900` transcript constraint, inflating its fitting width
+    /// to ~1620pt, so opening a session grew the 1280pt window. The transcript
+    /// now fills the available pane width (still capped at 900), keeping the
+    /// fitting size small so the window stays put.
+    func testOpeningSessionDoesNotGrowWindowWidth() {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        let vc = SessionViewController(model: model)
+        let win = NSWindow(contentViewController: vc)
+        win.styleMask.insert([.titled, .resizable, .fullSizeContentView])
+        win.setContentSize(NSSize(width: 1280, height: 760))
+        win.makeKeyAndOrderFront(nil)
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
+        let widthBefore = win.frame.width
+
+        // Set cwd → swaps EmptyState → conversation pane (observation-driven,
+        // so spin the runloop to let the pane swap and relayout settle).
+        model.cwd = URL(fileURLWithPath: NSTemporaryDirectory())
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
+        let widthAfter = win.frame.width
+
+        XCTAssertLessThanOrEqual(
+            widthAfter, widthBefore + 0.5,
+            "Opening a session must not grow the window (was \(widthBefore) → \(widthAfter))"
+        )
+    }
+
     // MARK: - Child controllers
 
     func testSessionViewControllerHasChildControllers() {

@@ -126,9 +126,18 @@ final class ConversationViewController: NSViewController {
         root.addSubview(footerStack)
         root.addSubview(inputBar)
 
-        let preferredTranscriptWidth = scrollView.widthAnchor.constraint(equalToConstant: 900)
+        // Fill the available pane width (capped below at ≤ 900 / ≤ 860) rather
+        // than *demanding* a fixed 900/860. A fixed `equalToConstant` makes the
+        // content view's Auto Layout `fittingSize` want that exact width; since
+        // the window is created via `NSWindow(contentViewController:)`, the
+        // window resizes to satisfy that fitting size — so opening a session
+        // (empty pane → conversation pane) grew the window from ~920 to ~1620pt.
+        // Expanding relative to the pane width keeps the transcript at its 900pt
+        // cap on wide windows while letting `fittingSize` stay small, so the
+        // window no longer jumps. (systematic-debugging: window↔fitting tie.)
+        let preferredTranscriptWidth = scrollView.widthAnchor.constraint(equalTo: root.widthAnchor)
         preferredTranscriptWidth.priority = .defaultHigh
-        let preferredInputWidth = inputBar.widthAnchor.constraint(equalToConstant: 860)
+        let preferredInputWidth = inputBar.widthAnchor.constraint(equalTo: root.widthAnchor)
         preferredInputWidth.priority = .defaultHigh
 
         NSLayoutConstraint.activate([
