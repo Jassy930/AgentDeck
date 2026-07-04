@@ -86,6 +86,9 @@ final class SessionModel {
     var openingHistoryThreadId: String?
     var lastHistoryOpenTiming: HistoryOpenTiming?
     var historySearchTerm = ""
+    /// 右上环境面板数据源。真实 app 默认 nil（面板显示零值占位）；
+    /// preview 引导层注入 mock 值。不经 IPC——面板暂无 daemon 后端。
+    var environmentInfo: EnvironmentInfo?
     var selectedHistoryThreadId: String?
     var selectedSidebarThreadId: String? {
         selectedHistoryThreadId ?? workbench.selectedSessionId
