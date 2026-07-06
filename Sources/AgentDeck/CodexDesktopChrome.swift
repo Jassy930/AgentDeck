@@ -77,6 +77,8 @@ final class CodexContentHeaderView: NSView {
         layer?.backgroundColor = CodexDesktopChrome.windowBackground.cgColor
 
         agentIcon.imageScaling = .scaleProportionallyUpOrDown
+        // 模板图跟随此 tint（暗背景下可见；标题旁略醒目用 text）。
+        agentIcon.contentTintColor = DesignTokens.text
         agentIcon.translatesAutoresizingMaskIntoConstraints = false
 
         // 设计系统：右侧用文件夹图标（打开位置），非文字按钮

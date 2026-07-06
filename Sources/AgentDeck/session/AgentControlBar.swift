@@ -52,6 +52,7 @@ public final class AgentControlBar: NSView {
                 systemSymbolName: "circle.dashed", accessibilityDescription: nil
             )
         }
+        icon.contentTintColor = DesignTokens.text2   // 模板图着色，暗背景可见
         icon.imageScaling = .scaleProportionallyDown
         icon.translatesAutoresizingMaskIntoConstraints = false
 

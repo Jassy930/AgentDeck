@@ -26,7 +26,11 @@ public enum AgentKindIcon {
         ) else {
             return nil
         }
-        return NSImage(contentsOf: url)
+        let image = NSImage(contentsOf: url)
+        // SVG 用 fill="currentColor"（单色），经 NSImage 加载时 currentColor 解析为黑，
+        // 暗背景下不可见。标记为模板图，让它跟随显示处的 contentTintColor 着色。
+        image?.isTemplate = true
+        return image
     }
 
     /// 提供 18×18 的展示图。SVG 加载后默认尺寸为 24，这里统一缩放到 18，

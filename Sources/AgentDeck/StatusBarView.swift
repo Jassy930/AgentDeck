@@ -55,6 +55,7 @@ final class StatusBarView: NSView {
     private let agentKindIconView: NSImageView = {
         let iv = NSImageView()
         iv.imageScaling = .scaleProportionallyUpOrDown
+        iv.contentTintColor = DesignTokens.text2   // 模板图着色，暗背景可见
         iv.isHidden = true
         return iv
     }()
