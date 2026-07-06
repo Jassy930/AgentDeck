@@ -57,8 +57,6 @@ final class SessionViewController: NSViewController {
     private let controlBar = AgentControlBar()
     private var controlBarHeight: NSLayoutConstraint?
     private var contentHeaderHeight: NSLayoutConstraint?
-    /// 顶部 header 左内边距：侧栏收起时留出红绿灯宽度（避免标题压住窗口控制按钮）。
-    private var contentHeaderLeading: NSLayoutConstraint?
 
     /// T6B: optional new-session dialog, retained while open.
     private var newSessionDialog: NewSessionDialog?
@@ -117,7 +115,9 @@ final class SessionViewController: NSViewController {
         sidebarItem.minimumThickness = 200
         sidebarItem.maximumThickness = 280
         sidebarItem.preferredThicknessFraction = NSSplitViewItem.unspecifiedDimension
-        sidebarItem.canCollapse = true   // 允许窄窗自动收起
+        // 不收起：原生窗口的最小内容宽度（~760，由内容区约束决定）够不着设计的 <760 隐藏断点，
+        // 自动收起实际不可达；且收起会引发标题压红绿灯。改为固定 232 + 可拖拽 + 内容随窗口伸缩。
+        sidebarItem.canCollapse = false
         // 不加硬宽度约束（会挡住拖拽）；改用 holding priority 让侧栏在窗口缩放时保持宽度、
         // 内容区吃伸缩，同时分隔线仍可拖。初始宽度由 viewDidLayout 的 setPosition(232) 决定。
 
@@ -162,19 +162,6 @@ final class SessionViewController: NSViewController {
             sv.setPosition(232, ofDividerAt: 0)
             didApplyInitialSidebarWidth = true
         }
-        // 响应式：窗口/分栏过窄（< 760pt）自动收起侧栏，变宽再展开（对齐设计 <760 隐藏断点）。
-        if let sidebar = splitVC?.splitViewItems.first {
-            let shouldCollapse = sv.frame.width < 760
-            if sidebar.isCollapsed != shouldCollapse {
-                sidebar.isCollapsed = shouldCollapse
-            }
-            // 侧栏收起后内容移到窗口最左，需给顶部 header 留出红绿灯宽度，避免标题压住窗口控制按钮。
-            // 基于实际收起态（含用户手动拖收起），而非仅宽度阈值。
-            let leading: CGFloat = sidebar.isCollapsed ? 72 : 0
-            if contentHeaderLeading?.constant != leading {
-                contentHeaderLeading?.constant = leading
-            }
-        }
     }
 
     override func viewDidAppear() {
@@ -210,12 +197,9 @@ final class SessionViewController: NSViewController {
         contentHeaderHeight = headerH
         controlBarHeight = controlBarH
 
-        let headerLeading = contentHeaderView.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor)
-        contentHeaderLeading = headerLeading
-
         NSLayoutConstraint.activate([
             contentHeaderView.topAnchor.constraint(equalTo: contentContainer.topAnchor),
-            headerLeading,
+            contentHeaderView.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
             contentHeaderView.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
             headerH,
 
