@@ -26,8 +26,8 @@ final class HistoryGroupRowView: NSView {
     }
 
     private func setup() {
-        // Project name label
-        nameLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
+        // Project name label（设计 .projgroup b：12px / 600）
+        nameLabel.font = .systemFont(ofSize: 12, weight: .semibold)
         nameLabel.textColor = DesignTokens.text2
         nameLabel.lineBreakMode = .byTruncatingMiddle
         nameLabel.maximumNumberOfLines = 1
@@ -36,8 +36,8 @@ final class HistoryGroupRowView: NSView {
         nameLabel.translatesAutoresizingMaskIntoConstraints = false
         addSubview(nameLabel)
 
-        // 项目会话数（设计系统组标题："refactor-auth 6"）
-        countLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        // 项目会话数（设计 .projgroup .count：11px 等宽 text-3，如 "refactor-auth 6"）
+        countLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         countLabel.textColor = DesignTokens.text3
         countLabel.translatesAutoresizingMaskIntoConstraints = false
         addSubview(countLabel)
@@ -55,7 +55,7 @@ final class HistoryGroupRowView: NSView {
         addSubview(addButton)
 
         NSLayoutConstraint.activate([
-            nameLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            nameLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
             nameLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
 
             countLabel.leadingAnchor.constraint(equalTo: nameLabel.trailingAnchor, constant: 6),
@@ -149,10 +149,10 @@ final class HistoryThreadRowView: NSView {
         addSubview(openingProgress)
 
         NSLayoutConstraint.activate([
-            // Accent bar: 3 px wide, near-full height
-            accentBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
-            accentBar.topAnchor.constraint(equalTo: topAnchor, constant: 5),
-            accentBar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -5),
+            // Accent bar（设计 .thread.sel::before：left 1、top/bottom inset 9、width 3、radius 2）
+            accentBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
+            accentBar.topAnchor.constraint(equalTo: topAnchor, constant: 9),
+            accentBar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -9),
             accentBar.widthAnchor.constraint(equalToConstant: 3),
 
             // Runtime dot — 垂直居中（单行）

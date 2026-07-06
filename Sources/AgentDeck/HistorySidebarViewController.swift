@@ -172,14 +172,15 @@ final class HistorySidebarViewController: NSViewController {
         container.addSubview(accountFooter)
 
         NSLayoutConstraint.activate([
-            topActions.topAnchor.constraint(equalTo: container.topAnchor, constant: 54),
-            topActions.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14),
-            topActions.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
+            // 设计系统 .wb-side padding-top:44 + .wb-side__actions padding:6 10 → 顶起 50、水平 10
+            topActions.topAnchor.constraint(equalTo: container.topAnchor, constant: 50),
+            topActions.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
+            topActions.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
 
-            // Header
-            headerRow.topAnchor.constraint(equalTo: topActions.bottomAnchor, constant: 28),
-            headerRow.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14),
-            headerRow.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
+            // Header（设计 .wb-side__title padding:14 16 6 → 上 14、水平 16）
+            headerRow.topAnchor.constraint(equalTo: topActions.bottomAnchor, constant: 14),
+            headerRow.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
+            headerRow.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
 
             // Search field
             searchField.topAnchor.constraint(equalTo: headerRow.bottomAnchor, constant: 8),
@@ -508,8 +509,9 @@ extension HistorySidebarViewController: NSOutlineViewDelegate {
     // MARK: Row height
 
     func outlineView(_ outlineView: NSOutlineView, heightOfRowByItem item: Any) -> CGFloat {
-        if item is HistoryProjectGroup { return 28 }
-        return 52
+        // 设计系统：.projgroup padding:7 12（≈30）；.wb-side__list .thread padding:10 12 单行标题（≈40）。
+        if item is HistoryProjectGroup { return 30 }
+        return 40
     }
 
     // MARK: Group rows should not be selectable
