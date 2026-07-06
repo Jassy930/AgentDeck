@@ -155,11 +155,23 @@ final class HistorySidebarViewController: NSViewController {
         blur.state = .followsWindowActiveState
         blur.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(blur)
+
+        // 在材质之上叠一层半透明深色遮罩把侧栏压暗，同时保留磨砂通透（alpha 越大越黑）。
+        let darkTint = NSView()
+        darkTint.wantsLayer = true
+        darkTint.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.45).cgColor
+        darkTint.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(darkTint)
+
         NSLayoutConstraint.activate([
             blur.topAnchor.constraint(equalTo: container.topAnchor),
             blur.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             blur.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             blur.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            darkTint.topAnchor.constraint(equalTo: container.topAnchor),
+            darkTint.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            darkTint.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            darkTint.bottomAnchor.constraint(equalTo: container.bottomAnchor),
         ])
 
         let topActions = makeTopActions()
