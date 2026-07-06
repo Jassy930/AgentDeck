@@ -103,8 +103,8 @@ final class HistorySidebarViewController: NSViewController {
         ov.intercellSpacing = NSSize(width: 0, height: 2)
         ov.indentationPerLevel = 0   // groups are not indented relative to root
         ov.autoresizesOutlineColumn = false
-        // 侧栏用半透明材质做底，outline 自身透明让材质透出
-        ov.backgroundColor = .clear
+        // 对齐设计系统侧栏底色：避免 sourceList 组行浮动/默认底色透出黑带
+        ov.backgroundColor = CodexDesktopChrome.sidebarBackground
         ov.floatsGroupRows = false
         // 关掉内建满宽高亮：设计里选中/悬停是内缩圆角块，由 HistoryThreadRowView 自绘。
         ov.selectionHighlightStyle = .none
@@ -141,37 +141,24 @@ final class HistorySidebarViewController: NSViewController {
 
     // MARK: - View Life Cycle
 
+    /// 顶部绿色渐变 tint（设计系统 --sidebar-tint：linear-gradient(rgba(20,64,44,0.28)→0, 160px)）。
+    private let sidebarTintView = SidebarTintView()
+
     override func loadView() {
         let container = NSView()
         container.translatesAutoresizingMaskIntoConstraints = false
         container.wantsLayer = true
-        container.layer?.backgroundColor = NSColor.clear.cgColor
+        container.layer?.backgroundColor = CodexDesktopChrome.sidebarBackground.cgColor
         view = container
 
-        // 设计系统：侧栏半透明。用 .sidebar 材质 + behindWindow 透出并模糊桌面；
-        // 之上叠一层 sidebarBg 低透明度着色，贴近设计色又保留通透感。
-        let blur = NSVisualEffectView()
-        blur.material = .sidebar
-        blur.blendingMode = .behindWindow
-        blur.state = .followsWindowActiveState
-        blur.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(blur)
-
-        let tint = NSView()
-        tint.wantsLayer = true
-        tint.layer?.backgroundColor = CodexDesktopChrome.sidebarBackground.withAlphaComponent(0.55).cgColor
-        tint.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(tint)
-
+        // 设计系统 --sidebar-tint：顶部一道绿色渐变（160px 淡出）——原图的"磨砂/半透"观感来源。
+        sidebarTintView.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(sidebarTintView)
         NSLayoutConstraint.activate([
-            blur.topAnchor.constraint(equalTo: container.topAnchor),
-            blur.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            blur.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            blur.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            tint.topAnchor.constraint(equalTo: container.topAnchor),
-            tint.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            tint.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            tint.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            sidebarTintView.topAnchor.constraint(equalTo: container.topAnchor),
+            sidebarTintView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            sidebarTintView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            sidebarTintView.heightAnchor.constraint(equalToConstant: 160),
         ])
 
         let topActions = makeTopActions()
@@ -617,5 +604,32 @@ extension HistorySidebarViewController: NSSearchFieldDelegate {
         // Debouncing intentionally omitted — mirrors the SwiftUI onChange behaviour
         // which calls loadHistory via .onSubmit / binding. Drive explicit reload here.
         model.loadHistory()
+    }
+}
+
+// MARK: - Sidebar top tint
+
+/// 侧栏顶部绿色渐变（设计系统 --sidebar-tint）。backing layer 即 CAGradientLayer，
+/// 随视图 bounds 自动伸缩：顶部 rgba(20,64,44,0.28) → 底部透明。
+final class SidebarTintView: NSView {
+    override func makeBackingLayer() -> CALayer {
+        let gradient = CAGradientLayer()
+        gradient.colors = [
+            CodexDesktopChrome.sidebarTopTint.cgColor,
+            CodexDesktopChrome.sidebarTopTint.withAlphaComponent(0).cgColor,
+        ]
+        gradient.startPoint = CGPoint(x: 0.5, y: 1.0)  // 顶
+        gradient.endPoint = CGPoint(x: 0.5, y: 0.0)    // 底
+        return gradient
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        wantsLayer = true
     }
 }

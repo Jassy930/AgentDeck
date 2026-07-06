@@ -96,15 +96,14 @@ final class SessionViewController: NSViewController {
         let root = NSView()
         root.translatesAutoresizingMaskIntoConstraints = false
         root.wantsLayer = true
-        // 透明：让侧栏 .behindWindow 材质不被根视图实色遮挡（内容区自绘不透明底）。
-        root.layer?.backgroundColor = NSColor.clear.cgColor
+        root.layer?.backgroundColor = CodexDesktopChrome.windowBackground.cgColor
 
         // NSSplitViewController: left = sidebar, right = content
         let splitVC = NSSplitViewController()
         splitVC.splitView.isVertical = true
         splitVC.splitView.dividerStyle = .thin
         splitVC.splitView.wantsLayer = true
-        splitVC.splitView.layer?.backgroundColor = NSColor.clear.cgColor
+        splitVC.splitView.layer?.backgroundColor = CodexDesktopChrome.windowBackground.cgColor
 
         // 用普通 split item 而非 `sidebarWithViewController:`：后者会套上 macOS 侧栏材质，
         // 配合透明标题栏 + fullSizeContentView 会把侧栏渲染成内嵌、圆角、带一圈描边的浮动
