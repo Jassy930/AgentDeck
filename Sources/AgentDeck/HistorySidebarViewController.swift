@@ -104,6 +104,8 @@ final class HistorySidebarViewController: NSViewController {
         // 对齐设计系统侧栏底色：避免 sourceList 组行浮动/默认底色透出黑带
         ov.backgroundColor = CodexDesktopChrome.sidebarBackground
         ov.floatsGroupRows = false
+        // 关掉内建满宽高亮：设计里选中/悬停是内缩圆角块，由 HistoryThreadRowView 自绘。
+        ov.selectionHighlightStyle = .none
 
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("main"))
         col.isEditable = false

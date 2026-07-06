@@ -55,14 +55,15 @@ final class HistoryGroupRowView: NSView {
         addSubview(addButton)
 
         NSLayoutConstraint.activate([
-            nameLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            // 缩进对齐会话内缩块：list padding 8 + projgroup padding 12 = 20
+            nameLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20),
             nameLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
 
             countLabel.leadingAnchor.constraint(equalTo: nameLabel.trailingAnchor, constant: 6),
             countLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
             countLabel.trailingAnchor.constraint(lessThanOrEqualTo: addButton.leadingAnchor, constant: -6),
 
-            addButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
+            addButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -20),
             addButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             addButton.widthAnchor.constraint(equalToConstant: 18),
             addButton.heightAnchor.constraint(equalToConstant: 18),
@@ -86,11 +87,18 @@ final class HistoryGroupRowView: NSView {
 /// Mirrors the SwiftUI `historyThreadRow` visual treatment.
 final class HistoryThreadRowView: NSView {
     // MARK: Subviews
+    /// 内缩圆角高亮块（设计 .thread：list padding 8 + radius-sm；.sel/.hover 自绘底色）。
+    private let highlightView = NSView()
     private let accentBar = NSView()
     private let runtimeDotView = NSView()
     private let titleLabel = NSTextField(labelWithString: "")
     private let agentIcon = NSImageView()
     private let openingProgress = NSProgressIndicator()
+
+    /// 当前选中/展示态与悬停态，共同决定高亮块底色。
+    private var currentVisualState: HistoryThreadRowPresentation.VisualState = .idle
+    private var hovered = false
+    private var hoverTracking: NSTrackingArea?
 
     /// Size constraints for the runtime dot — updated on configure so the dot
     /// truly resizes between 5pt (cached) and 7pt (unread). Auto Layout owns
@@ -111,6 +119,14 @@ final class HistoryThreadRowView: NSView {
     }
 
     private func setup() {
+        // 内缩圆角高亮块（最底层，选中/悬停时显色）
+        highlightView.wantsLayer = true
+        highlightView.layer?.cornerRadius = DesignTokens.radiusSm
+        highlightView.layer?.cornerCurve = .continuous
+        highlightView.layer?.backgroundColor = NSColor.clear.cgColor
+        highlightView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(highlightView)
+
         // Accent bar on left edge
         accentBar.wantsLayer = true
         accentBar.layer?.cornerRadius = 1.5
@@ -149,14 +165,20 @@ final class HistoryThreadRowView: NSView {
         addSubview(openingProgress)
 
         NSLayoutConstraint.activate([
-            // Accent bar（设计 .thread.sel::before：left 1、top/bottom inset 9、width 3、radius 2）
-            accentBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
-            accentBar.topAnchor.constraint(equalTo: topAnchor, constant: 9),
-            accentBar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -9),
+            // 内缩块：设计 list padding 8（水平）+ 行间距（垂直 2）
+            highlightView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            highlightView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            highlightView.topAnchor.constraint(equalTo: topAnchor, constant: 2),
+            highlightView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2),
+
+            // Accent bar（设计 .thread.sel::before：块内 left 1、上下内缩 7、width 3、radius 2）
+            accentBar.leadingAnchor.constraint(equalTo: highlightView.leadingAnchor, constant: 1),
+            accentBar.topAnchor.constraint(equalTo: highlightView.topAnchor, constant: 7),
+            accentBar.bottomAnchor.constraint(equalTo: highlightView.bottomAnchor, constant: -7),
             accentBar.widthAnchor.constraint(equalToConstant: 3),
 
-            // Runtime dot — 垂直居中（单行）
-            runtimeDotView.leadingAnchor.constraint(equalTo: accentBar.trailingAnchor, constant: 8),
+            // 内容缩进 = 块内 padding 12（设计 .thread padding:_ 12）
+            runtimeDotView.leadingAnchor.constraint(equalTo: highlightView.leadingAnchor, constant: 12),
             runtimeDotView.centerYAnchor.constraint(equalTo: centerYAnchor),
             runtimeDotWidth,
             runtimeDotHeight,
@@ -166,13 +188,13 @@ final class HistoryThreadRowView: NSView {
             titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
             titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: agentIcon.leadingAnchor, constant: -6),
 
-            agentIcon.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            agentIcon.trailingAnchor.constraint(equalTo: highlightView.trailingAnchor, constant: -12),
             agentIcon.centerYAnchor.constraint(equalTo: centerYAnchor),
             agentIcon.widthAnchor.constraint(equalToConstant: 13),
             agentIcon.heightAnchor.constraint(equalToConstant: 13),
 
             // Opening spinner（覆盖 agent 图标位置）
-            openingProgress.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -9),
+            openingProgress.trailingAnchor.constraint(equalTo: highlightView.trailingAnchor, constant: -11),
             openingProgress.centerYAnchor.constraint(equalTo: centerYAnchor),
             openingProgress.widthAnchor.constraint(equalToConstant: 12),
             openingProgress.heightAnchor.constraint(equalToConstant: 12),
@@ -201,6 +223,11 @@ final class HistoryThreadRowView: NSView {
         let accentColor = Self.accentBarColor(presentation)
         accentBar.layer?.backgroundColor = accentColor.cgColor
 
+        // 内缩块高亮：选中/展开 → surface2；悬停 → surface；否则透明（cell 复用时重置悬停）
+        currentVisualState = presentation.visualState
+        hovered = false
+        updateHighlight()
+
         // Runtime dot — size driven by Auto Layout constraints (5pt cached / 7pt unread)
         if presentation.hasRuntimeIndicator {
             runtimeDotView.isHidden = false
@@ -227,6 +254,42 @@ final class HistoryThreadRowView: NSView {
 
         // Accessibility
         setAccessibilityLabel("Open thread, \(thread.displayTitle)")
+    }
+
+    // MARK: Highlight & hover
+
+    private func updateHighlight() {
+        let color: NSColor
+        switch currentVisualState {
+        case .opening, .selected:
+            color = DesignTokens.surface2
+        case .hovered:
+            color = DesignTokens.surface
+        case .idle:
+            color = hovered ? DesignTokens.surface : .clear
+        }
+        highlightView.layer?.backgroundColor = color.cgColor
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = hoverTracking { removeTrackingArea(existing) }
+        let ta = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+            owner: self, userInfo: nil)
+        addTrackingArea(ta)
+        hoverTracking = ta
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hovered = true
+        updateHighlight()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovered = false
+        updateHighlight()
     }
 
     // MARK: Helpers
