@@ -5,6 +5,8 @@ import AppKit
 enum CodexDesktopChrome {
     static let windowBackground = DesignTokens.bg
     static let sidebarBackground = DesignTokens.sidebarBg
+    /// 侧栏固定深色底（跨屏一致；贴近毛玻璃压暗后的观感，单值可调）。
+    static let sidebarSolid = NSColor(srgbRed: 0.098, green: 0.098, blue: 0.098, alpha: 1)
     static let sidebarTopTint = NSColor(srgbRed: 0.08, green: 0.25, blue: 0.17, alpha: 0.30)
     static let panelBackground = DesignTokens.surface
     static let panelHoverBackground = DesignTokens.surface2
