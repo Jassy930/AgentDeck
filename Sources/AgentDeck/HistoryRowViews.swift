@@ -48,7 +48,7 @@ final class HistoryGroupRowView: NSView {
         addButton.image?.size = NSSize(width: 11, height: 11)
         addButton.bezelStyle = .inline
         addButton.isBordered = false
-        addButton.contentTintColor = DesignTokens.text2
+        addButton.contentTintColor = DesignTokens.text3
         addButton.target = self
         addButton.action = #selector(handleAdd)
         addButton.translatesAutoresizingMaskIntoConstraints = false

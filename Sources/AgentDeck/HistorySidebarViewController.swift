@@ -40,6 +40,8 @@ final class HistorySidebarViewController: NSViewController {
         btn.isBordered = false
         btn.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "New session")
         btn.toolTip = "New session"
+        // 显式灰色，避免材质/vibrancy 下取系统强调色（蓝）；对齐设计的浅灰 +。
+        btn.contentTintColor = DesignTokens.text3
         btn.translatesAutoresizingMaskIntoConstraints = false
         return btn
     }()
