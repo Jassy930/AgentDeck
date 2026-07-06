@@ -111,23 +111,22 @@ final class SessionViewController: NSViewController {
         // 面板。设计系统要的是齐平满高的侧栏 + 一道从顶到底的竖分割线（dividerStyle=.thin），
         // 侧栏底色由 HistorySidebarViewController 自绘 sidebarBackground，无需材质。
         let sidebarItem = NSSplitViewItem(viewController: historySidebarVC)
-        // 设计系统 .workbench 侧栏列宽 232px；收紧 min/max 避免抓到过宽默认值。
+        // 设计系统 .workbench 侧栏列宽 232px；min/max 200–280 允许用户拖拽微调。
         sidebarItem.minimumThickness = 200
         sidebarItem.maximumThickness = 280
         sidebarItem.preferredThicknessFraction = NSSplitViewItem.unspecifiedDimension
-        sidebarItem.canCollapse = false
-        // 兜底：给侧栏一个 232 的默认宽度约束（低于 required，仍可拖动），
-        // 避免 split view 在无偏好时把侧栏撑到 max。
-        let sidebarWidth = historySidebarVC.view.widthAnchor.constraint(equalToConstant: 232)
-        sidebarWidth.priority = .defaultHigh
-        sidebarWidth.isActive = true
-        // setPosition 仍在 viewDidLayout 首次布局时设 232（此时 split 已有真实 frame）。
+        sidebarItem.canCollapse = true   // 允许窄窗自动收起
+        // 不加硬宽度约束（会挡住拖拽）；改用 holding priority 让侧栏在窗口缩放时保持宽度、
+        // 内容区吃伸缩，同时分隔线仍可拖。初始宽度由 viewDidLayout 的 setPosition(232) 决定。
 
         let contentItem = NSSplitViewItem(viewController: makeContentContainerVC())
         contentItem.minimumThickness = 300
 
         splitVC.addSplitViewItem(sidebarItem)
         splitVC.addSplitViewItem(contentItem)
+        // 侧栏保持宽度、内容区随窗口伸缩：侧栏 holding priority 高于内容。
+        splitVC.splitView.setHoldingPriority(NSLayoutConstraint.Priority(260), forSubviewAt: 0)
+        splitVC.splitView.setHoldingPriority(NSLayoutConstraint.Priority(250), forSubviewAt: 1)
 
         addChild(splitVC)
         self.splitVC = splitVC
@@ -155,12 +154,19 @@ final class SessionViewController: NSViewController {
 
     override func viewDidLayout() {
         super.viewDidLayout()
-        // Apply the 260pt initial sidebar width on the first layout pass, when
-        // the split view has a real frame and setPosition takes effect.
-        guard !didApplyInitialSidebarWidth, let sv = splitVC?.splitView,
-              sv.frame.width > 0 else { return }
-        sv.setPosition(232, ofDividerAt: 0)
-        didApplyInitialSidebarWidth = true
+        guard let sv = splitVC?.splitView, sv.frame.width > 0 else { return }
+        // 首次布局设初始宽度 232（此时 split 已有真实 frame，setPosition 才生效）。
+        if !didApplyInitialSidebarWidth {
+            sv.setPosition(232, ofDividerAt: 0)
+            didApplyInitialSidebarWidth = true
+        }
+        // 响应式：窗口/分栏过窄（< 760pt）自动收起侧栏，变宽再展开（对齐设计 <760 隐藏断点）。
+        if let sidebar = splitVC?.splitViewItems.first {
+            let shouldCollapse = sv.frame.width < 760
+            if sidebar.isCollapsed != shouldCollapse {
+                sidebar.isCollapsed = shouldCollapse
+            }
+        }
     }
 
     override func viewDidAppear() {
