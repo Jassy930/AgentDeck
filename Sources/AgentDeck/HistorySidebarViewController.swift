@@ -101,8 +101,8 @@ final class HistorySidebarViewController: NSViewController {
         ov.intercellSpacing = NSSize(width: 0, height: 2)
         ov.indentationPerLevel = 0   // groups are not indented relative to root
         ov.autoresizesOutlineColumn = false
-        // 对齐设计系统侧栏底色：避免 sourceList 组行浮动/默认底色透出黑带
-        ov.backgroundColor = CodexDesktopChrome.sidebarBackground
+        // 侧栏用半透明材质做底，outline 自身透明让材质透出
+        ov.backgroundColor = .clear
         ov.floatsGroupRows = false
         // 关掉内建满宽高亮：设计里选中/悬停是内缩圆角块，由 HistoryThreadRowView 自绘。
         ov.selectionHighlightStyle = .none
@@ -143,8 +143,34 @@ final class HistorySidebarViewController: NSViewController {
         let container = NSView()
         container.translatesAutoresizingMaskIntoConstraints = false
         container.wantsLayer = true
-        container.layer?.backgroundColor = CodexDesktopChrome.sidebarBackground.cgColor
+        container.layer?.backgroundColor = NSColor.clear.cgColor
         view = container
+
+        // 设计系统：侧栏半透明。用 .sidebar 材质 + behindWindow 透出并模糊桌面；
+        // 之上叠一层 sidebarBg 低透明度着色，贴近设计色又保留通透感。
+        let blur = NSVisualEffectView()
+        blur.material = .sidebar
+        blur.blendingMode = .behindWindow
+        blur.state = .followsWindowActiveState
+        blur.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(blur)
+
+        let tint = NSView()
+        tint.wantsLayer = true
+        tint.layer?.backgroundColor = CodexDesktopChrome.sidebarBackground.withAlphaComponent(0.55).cgColor
+        tint.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(tint)
+
+        NSLayoutConstraint.activate([
+            blur.topAnchor.constraint(equalTo: container.topAnchor),
+            blur.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            blur.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            blur.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            tint.topAnchor.constraint(equalTo: container.topAnchor),
+            tint.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            tint.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            tint.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
 
         let topActions = makeTopActions()
 
