@@ -204,8 +204,8 @@ final class HistorySidebarViewController: NSViewController {
         NSLayoutConstraint.activate([
             // 设计系统 .wb-side padding-top:44 + .wb-side__actions padding:6 10 → 顶起 50、水平 10
             topActions.topAnchor.constraint(equalTo: container.topAnchor, constant: 50),
-            topActions.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
-            topActions.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
+            topActions.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 18),
+            topActions.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -18),
 
             // Header（设计 .wb-side__title padding:14 16 6 → 上 14、水平 16）
             headerRow.topAnchor.constraint(equalTo: topActions.bottomAnchor, constant: 14),
