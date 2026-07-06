@@ -57,6 +57,8 @@ final class SessionViewController: NSViewController {
     private let controlBar = AgentControlBar()
     private var controlBarHeight: NSLayoutConstraint?
     private var contentHeaderHeight: NSLayoutConstraint?
+    /// 顶部 header 左内边距：侧栏收起时留出红绿灯宽度（避免标题压住窗口控制按钮）。
+    private var contentHeaderLeading: NSLayoutConstraint?
 
     /// T6B: optional new-session dialog, retained while open.
     private var newSessionDialog: NewSessionDialog?
@@ -166,6 +168,12 @@ final class SessionViewController: NSViewController {
             if sidebar.isCollapsed != shouldCollapse {
                 sidebar.isCollapsed = shouldCollapse
             }
+            // 侧栏收起后内容移到窗口最左，需给顶部 header 留出红绿灯宽度，避免标题压住窗口控制按钮。
+            // 基于实际收起态（含用户手动拖收起），而非仅宽度阈值。
+            let leading: CGFloat = sidebar.isCollapsed ? 72 : 0
+            if contentHeaderLeading?.constant != leading {
+                contentHeaderLeading?.constant = leading
+            }
         }
     }
 
@@ -202,9 +210,12 @@ final class SessionViewController: NSViewController {
         contentHeaderHeight = headerH
         controlBarHeight = controlBarH
 
+        let headerLeading = contentHeaderView.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor)
+        contentHeaderLeading = headerLeading
+
         NSLayoutConstraint.activate([
             contentHeaderView.topAnchor.constraint(equalTo: contentContainer.topAnchor),
-            contentHeaderView.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
+            headerLeading,
             contentHeaderView.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
             headerH,
 
