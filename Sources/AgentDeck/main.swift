@@ -92,6 +92,13 @@ func runDaemonOneShot(args daemonArgs: [String]) -> Int32 {
     return process.terminationStatus
 }
 
+// 启动最早期加载 CWD 下的 `.env`（真实环境优先，只填补未设的键）。放在一切读环境变量
+// 之前，让 AGENTDECK_* 配置项经 .env 也能生效；daemon 子进程继承本进程环境亦受惠。
+let injectedEnvCount = DotEnv.loadDefault()
+if injectedEnvCount > 0 {
+    FileHandle.standardError.write(Data("[AgentDeck] .env: injected \(injectedEnvCount) var(s)\n".utf8))
+}
+
 let launchProfile: AgentDeckProfile
 do {
     launchProfile = try AgentDeckProfile.parse(defaultProfile: .defaultForCurrentBuild)
