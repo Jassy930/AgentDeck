@@ -30,7 +30,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         win.styleMask.insert([.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView])
         win.titleVisibility = .hidden
         win.titlebarAppearsTransparent = true
-        win.backgroundColor = CodexDesktopChrome.windowBackground
+        // 侧栏毛玻璃需要窗口非不透明，让 .behindWindow 材质透出并模糊桌面；
+        // 内容区各自绘制不透明底色，故内容不跟着透。
+        win.isOpaque = false
+        win.backgroundColor = .clear
         win.isMovableByWindowBackground = true
         win.toolbarStyle = .unifiedCompact
         // preview/gallery 可选把窗口开在指定屏，便于对照设计稿而不占主屏。
