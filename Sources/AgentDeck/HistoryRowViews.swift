@@ -119,10 +119,9 @@ final class HistoryThreadRowView: NSView {
     }
 
     private func setup() {
-        // 内缩圆角高亮块（最底层，选中/悬停时显色）
+        // 全宽高亮块（最底层，选中/悬停时显色）——子项不随层级缩短，层级只靠内容左缩进表示。
         highlightView.wantsLayer = true
-        highlightView.layer?.cornerRadius = DesignTokens.radiusSm
-        highlightView.layer?.cornerCurve = .continuous
+        highlightView.layer?.cornerRadius = 0
         highlightView.layer?.backgroundColor = NSColor.clear.cgColor
         highlightView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(highlightView)
@@ -165,20 +164,20 @@ final class HistoryThreadRowView: NSView {
         addSubview(openingProgress)
 
         NSLayoutConstraint.activate([
-            // 内缩块：设计 list padding 8（水平）+ 行间距（垂直 2）
-            highlightView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
-            highlightView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            highlightView.topAnchor.constraint(equalTo: topAnchor, constant: 2),
-            highlightView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2),
+            // 全宽高亮块：边到边、满行高（子项不随层级缩短）
+            highlightView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            highlightView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            highlightView.topAnchor.constraint(equalTo: topAnchor),
+            highlightView.bottomAnchor.constraint(equalTo: bottomAnchor),
 
-            // Accent bar（设计 .thread.sel::before：块内 left 1、上下内缩 7、width 3、radius 2）
-            accentBar.leadingAnchor.constraint(equalTo: highlightView.leadingAnchor, constant: 1),
-            accentBar.topAnchor.constraint(equalTo: highlightView.topAnchor, constant: 7),
-            accentBar.bottomAnchor.constraint(equalTo: highlightView.bottomAnchor, constant: -7),
+            // Accent bar 贴最左边缘（全宽行的选中指示）
+            accentBar.leadingAnchor.constraint(equalTo: leadingAnchor),
+            accentBar.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            accentBar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
             accentBar.widthAnchor.constraint(equalToConstant: 3),
 
-            // 内容缩进 = 块内 padding 12（设计 .thread padding:_ 12）
-            runtimeDotView.leadingAnchor.constraint(equalTo: highlightView.leadingAnchor, constant: 12),
+            // 内容左缩进表示层级（子项缩进到 24，比分组名 20 更靠右）
+            runtimeDotView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 24),
             runtimeDotView.centerYAnchor.constraint(equalTo: centerYAnchor),
             runtimeDotWidth,
             runtimeDotHeight,
@@ -188,7 +187,7 @@ final class HistoryThreadRowView: NSView {
             titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
             titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: agentIcon.leadingAnchor, constant: -6),
 
-            agentIcon.trailingAnchor.constraint(equalTo: highlightView.trailingAnchor, constant: -12),
+            agentIcon.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
             agentIcon.centerYAnchor.constraint(equalTo: centerYAnchor),
             agentIcon.widthAnchor.constraint(equalToConstant: 13),
             agentIcon.heightAnchor.constraint(equalToConstant: 13),
