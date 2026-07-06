@@ -111,13 +111,17 @@ final class SessionViewController: NSViewController {
         // 面板。设计系统要的是齐平满高的侧栏 + 一道从顶到底的竖分割线（dividerStyle=.thin），
         // 侧栏底色由 HistorySidebarViewController 自绘 sidebarBackground，无需材质。
         let sidebarItem = NSSplitViewItem(viewController: historySidebarVC)
-        sidebarItem.minimumThickness = 236
-        sidebarItem.maximumThickness = 360
+        // 设计系统 .workbench 侧栏列宽 232px；收紧 min/max 避免抓到过宽默认值。
+        sidebarItem.minimumThickness = 200
+        sidebarItem.maximumThickness = 280
         sidebarItem.preferredThicknessFraction = NSSplitViewItem.unspecifiedDimension
         sidebarItem.canCollapse = false
-        // setPosition is deferred to viewDidLayout (first pass) so the split
-        // view already has a real frame; calling it here (pre-layout) is a
-        // no-op on some macOS versions, leaving the sidebar at ~160pt.
+        // 兜底：给侧栏一个 232 的默认宽度约束（低于 required，仍可拖动），
+        // 避免 split view 在无偏好时把侧栏撑到 max。
+        let sidebarWidth = historySidebarVC.view.widthAnchor.constraint(equalToConstant: 232)
+        sidebarWidth.priority = .defaultHigh
+        sidebarWidth.isActive = true
+        // setPosition 仍在 viewDidLayout 首次布局时设 232（此时 split 已有真实 frame）。
 
         let contentItem = NSSplitViewItem(viewController: makeContentContainerVC())
         contentItem.minimumThickness = 300
@@ -155,7 +159,7 @@ final class SessionViewController: NSViewController {
         // the split view has a real frame and setPosition takes effect.
         guard !didApplyInitialSidebarWidth, let sv = splitVC?.splitView,
               sv.frame.width > 0 else { return }
-        sv.setPosition(220, ofDividerAt: 0)
+        sv.setPosition(232, ofDividerAt: 0)
         didApplyInitialSidebarWidth = true
     }
 
