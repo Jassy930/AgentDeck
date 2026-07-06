@@ -105,10 +105,15 @@ final class SessionViewController: NSViewController {
         splitVC.splitView.wantsLayer = true
         splitVC.splitView.layer?.backgroundColor = CodexDesktopChrome.windowBackground.cgColor
 
-        let sidebarItem = NSSplitViewItem(sidebarWithViewController: historySidebarVC)
+        // 用普通 split item 而非 `sidebarWithViewController:`：后者会套上 macOS 侧栏材质，
+        // 配合透明标题栏 + fullSizeContentView 会把侧栏渲染成内嵌、圆角、带一圈描边的浮动
+        // 面板。设计系统要的是齐平满高的侧栏 + 一道从顶到底的竖分割线（dividerStyle=.thin），
+        // 侧栏底色由 HistorySidebarViewController 自绘 sidebarBackground，无需材质。
+        let sidebarItem = NSSplitViewItem(viewController: historySidebarVC)
         sidebarItem.minimumThickness = 236
         sidebarItem.maximumThickness = 360
         sidebarItem.preferredThicknessFraction = NSSplitViewItem.unspecifiedDimension
+        sidebarItem.canCollapse = false
         // setPosition is deferred to viewDidLayout (first pass) so the split
         // view already has a real frame; calling it here (pre-layout) is a
         // no-op on some macOS versions, leaving the sidebar at ~160pt.
