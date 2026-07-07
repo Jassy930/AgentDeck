@@ -34,6 +34,7 @@ impl StdioMachineBridge {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .kill_on_drop(true)
             .spawn()?;
         let mut stdin = child.stdin.take().expect("daemon stdin");
         let stdout = child.stdout.take().expect("daemon stdout");
@@ -125,6 +126,21 @@ impl StdioMachineBridge {
         self.pump.abort();
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
+    }
+}
+
+impl Drop for StdioMachineBridge {
+    /// Anti-orphan safety net: `shutdown(self)` is the normal path (abort
+    /// pump + kill + reap child), but any path that doesn't reach it (test
+    /// assert fails first, panic, early return) must not leak the real
+    /// agentdeckd child process or its stdout pump task. Idempotent with
+    /// `shutdown`: aborting an already-aborted task and `start_kill`-ing an
+    /// already-reaped child are both no-ops (`kill_on_drop(true)` on the
+    /// `Command` above is the same belt-and-suspenders pattern used by
+    /// `CodexAdapter`).
+    fn drop(&mut self) {
+        self.pump.abort();
+        let _ = self.child.start_kill();
     }
 }
 

@@ -34,7 +34,10 @@ fn machine() -> MachineDescriptor {
 #[tokio::test]
 async fn t4_real_session_stream_transits_relay() {
     if std::env::var("AGENTDECK_E2E").is_err() {
-        eprintln!("skip: 设置 AGENTDECK_E2E=1 且已登录 codex 后运行");
+        eprintln!(
+            "skip: 设置 AGENTDECK_E2E=1 且已登录 codex 后运行（真实会话穿透证明推迟到 \
+             R2 身份 bootstrap，见 docs/plans/2026-07-07-relay-r0-contract-spike-design.md §7）"
+        );
         return;
     }
     let daemon = Path::new(env!("CARGO_BIN_EXE_agentdeckd"));
