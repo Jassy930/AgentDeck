@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use agentdeck_protocol::remote::{
-    ClientRole, MachineDescriptor, RelayControlMsg, RemoteFrame, SessionDescriptor, SubTarget,
+    ClientRole, CommandTarget, MachineDescriptor, RelayControlMsg, RemoteFrame, SessionDescriptor,
+    SubTarget,
 };
 use tokio::sync::mpsc;
 
@@ -86,7 +87,6 @@ struct Core {
     sessions: HashMap<String, Vec<SessionDescriptor>>,
     conv_seq: HashMap<String, u64>,
     conv_buffer: HashMap<String, Vec<RelayControlMsg>>,
-    #[allow(dead_code)] // req_origin 供 Task 5（命令面：请求/回执关联）使用，R0 先占位
     req_origin: HashMap<String, ClientId>,
     subs_machines: HashSet<ClientId>,
     subs_sessions: HashMap<String, HashSet<ClientId>>,
@@ -190,7 +190,53 @@ impl Core {
                 }
             }
             RelayControlMsg::Ack { .. } | RelayControlMsg::Heartbeat { .. } => {}
-            // 其余变体（命令面）在 Task 5 加入
+            RelayControlMsg::SendCommand { request_id, target, data } => {
+                let machine_id = match &target {
+                    CommandTarget::Machine { machine_id } => Some(machine_id.clone()),
+                    CommandTarget::Conversation { conversation_id } => {
+                        self.conv_machine.get(conversation_id).cloned()
+                    }
+                    CommandTarget::Turn { turn_session_id } => self
+                        .turn_conv
+                        .get(turn_session_id)
+                        .and_then(|c| self.conv_machine.get(c))
+                        .cloned(),
+                };
+                match machine_id.and_then(|m| self.machines.get(&m).map(|e| e.conn)) {
+                    Some(machine_conn) => {
+                        self.req_origin.insert(request_id.clone(), id);
+                        self.send_to(
+                            machine_conn,
+                            &trace,
+                            RelayControlMsg::SendCommand {
+                                request_id: request_id.clone(),
+                                target,
+                                data,
+                            },
+                        )
+                        .await;
+                        self.send_to(id, &trace, RelayControlMsg::CommandDelivered { request_id }).await;
+                    }
+                    None => {
+                        self.send_to(
+                            id,
+                            &trace,
+                            RelayControlMsg::Error {
+                                code: "remote.session.not_found".into(),
+                                message: "no online machine for command target".into(),
+                                in_reply_to: Some(request_id),
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+            RelayControlMsg::AdminReply { in_reply_to, data } => {
+                if let Some(&dev) = self.req_origin.get(&in_reply_to) {
+                    self.send_to(dev, &trace, RelayControlMsg::AdminReply { in_reply_to: in_reply_to.clone(), data }).await;
+                    self.req_origin.remove(&in_reply_to);
+                }
+            }
             _ => {}
         }
     }
@@ -362,6 +408,148 @@ mod tests {
             match frame.msg {
                 RelayControlMsg::Event { conversation_id, turn_session_id, seq, .. } => {
                     return (conversation_id, turn_session_id, seq)
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    use agentdeck_protocol::remote::CommandTarget;
+
+    #[tokio::test]
+    async fn send_command_routes_to_machine_and_admin_reply_returns_to_origin_device() {
+        let relay = FakeRelay::start();
+        let mut m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
+        m.send(frame(
+            ClientRole::Machine { machine_id: "M1".into() },
+            RelayControlMsg::RegisterMachine { machine: machine("M1") },
+        ))
+        .await;
+
+        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        // device → machine 的机器级命令（内层用占位字符串，relay 不解码）
+        d.send(frame(
+            ClientRole::Device { device_id: "D1".into() },
+            RelayControlMsg::SendCommand {
+                request_id: "r1".into(),
+                target: CommandTarget::Machine { machine_id: "M1".into() },
+                data: DataEnvelope::plaintext(&"ping-cmd").unwrap(),
+            },
+        ))
+        .await;
+
+        // machine 收到该 SendCommand（relay 未解码 data）
+        let at_machine = recv_send_command(&mut m).await;
+        assert_eq!(at_machine, "r1");
+
+        // machine 回 AdminReply
+        m.send(frame(
+            ClientRole::Machine { machine_id: "M1".into() },
+            RelayControlMsg::AdminReply { in_reply_to: "r1".into(), data: DataEnvelope::plaintext(&"pong").unwrap() },
+        ))
+        .await;
+
+        // 发起 device 应收到该 AdminReply
+        loop {
+            let frame = match tokio::time::timeout(std::time::Duration::from_secs(5), d.recv()).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => panic!("timed out waiting for AdminReply frame: stream closed"),
+                Err(_) => panic!("timed out waiting for AdminReply frame"),
+            };
+            match frame.msg {
+                RelayControlMsg::AdminReply { in_reply_to, data } => {
+                    assert_eq!(in_reply_to, "r1");
+                    let s: String = data.decode_plaintext().unwrap();
+                    assert_eq!(s, "pong");
+                    break;
+                }
+                RelayControlMsg::CommandDelivered { .. } => continue,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    async fn recv_send_command(c: &mut RelayClient) -> String {
+        loop {
+            let frame = match tokio::time::timeout(std::time::Duration::from_secs(5), c.recv()).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => panic!("timed out waiting for SendCommand frame: stream closed"),
+                Err(_) => panic!("timed out waiting for SendCommand frame"),
+            };
+            match frame.msg {
+                RelayControlMsg::SendCommand { request_id, .. } => return request_id,
+                _ => continue,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_conversation_command_returns_not_found_error() {
+        let relay = FakeRelay::start();
+        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        d.send(frame(
+            ClientRole::Device { device_id: "D1".into() },
+            RelayControlMsg::SendCommand {
+                request_id: "r9".into(),
+                target: CommandTarget::Conversation { conversation_id: "NOPE".into() },
+                data: DataEnvelope::plaintext(&"x").unwrap(),
+            },
+        ))
+        .await;
+        match tokio::time::timeout(std::time::Duration::from_secs(5), d.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for Error frame"))
+            .expect("frame")
+            .msg
+        {
+            RelayControlMsg::Error { code, in_reply_to, .. } => {
+                assert_eq!(code, "remote.session.not_found");
+                assert_eq!(in_reply_to.as_deref(), Some("r9"));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_routes_opaque_data_without_decoding_it() {
+        let relay = FakeRelay::start();
+        let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
+        m.send(frame(
+            ClientRole::Machine { machine_id: "M1".into() },
+            RelayControlMsg::RegisterMachine { machine: machine("M1") },
+        ))
+        .await;
+        m.send(frame(
+            ClientRole::Machine { machine_id: "M1".into() },
+            RelayControlMsg::AnnounceSession { session: session("C1", "M1") },
+        ))
+        .await;
+        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        d.send(frame(
+            ClientRole::Device { device_id: "D1".into() },
+            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into() } },
+        ))
+        .await;
+
+        // 不可解码为任何协议类型的随机字节
+        let garbage = DataEnvelope::Plaintext { agentdeck_protocol_version: 2, bytes: vec![0xFF, 0x00, 0x13, 0x37] };
+        m.send(frame(
+            ClientRole::Machine { machine_id: "M1".into() },
+            RelayControlMsg::PublishEvent { conversation_id: "C1".into(), turn_session_id: "S1".into(), seq: 0, data: garbage.clone() },
+        ))
+        .await;
+
+        // device 仍按控制面元数据收到，data 原样透传（relay 未解码）
+        loop {
+            let frame = match tokio::time::timeout(std::time::Duration::from_secs(5), d.recv()).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => panic!("timed out waiting for Event frame: stream closed"),
+                Err(_) => panic!("timed out waiting for Event frame"),
+            };
+            match frame.msg {
+                RelayControlMsg::Event { data, .. } => {
+                    assert_eq!(data, garbage);
+                    break;
                 }
                 _ => continue,
             }
