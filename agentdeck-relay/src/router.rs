@@ -202,7 +202,11 @@ impl Core {
                         .and_then(|c| self.conv_machine.get(c))
                         .cloned(),
                 };
-                match machine_id.and_then(|m| self.machines.get(&m).map(|e| e.conn)) {
+                let target_conn = machine_id
+                    .and_then(|m| self.machines.get(&m))
+                    .filter(|e| e.descriptor.is_online && self.conns.contains_key(&e.conn))
+                    .map(|e| e.conn);
+                match target_conn {
                     Some(machine_conn) => {
                         self.req_origin.insert(request_id.clone(), id);
                         self.send_to(
