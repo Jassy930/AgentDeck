@@ -29,6 +29,7 @@ which = "6"
 [dev-dependencies]
 which = "6"
 criterion = { version = "0.5", features = ["html_reports"] }
+agentdeck-relay = { path = "../agentdeck-relay" }
 
 [[bench]]
 name = "cc_streaming_throughput"
