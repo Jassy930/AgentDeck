@@ -104,8 +104,8 @@ final class HistorySidebarViewController: NSViewController {
         ov.intercellSpacing = NSSize(width: 0, height: 2)
         ov.indentationPerLevel = 0   // groups are not indented relative to root
         ov.autoresizesOutlineColumn = false
-        // 侧栏固定深色底，outline 用同色避免透出黑带
-        ov.backgroundColor = CodexDesktopChrome.sidebarSolid
+        // 侧栏毛玻璃做底，outline 自身透明让材质透出
+        ov.backgroundColor = .clear
         ov.floatsGroupRows = false
         // 关掉内建满宽高亮：设计里选中/悬停是内缩圆角块，由 HistoryThreadRowView 自绘。
         ov.selectionHighlightStyle = .none
@@ -146,10 +146,35 @@ final class HistorySidebarViewController: NSViewController {
         let container = NSView()
         container.translatesAutoresizingMaskIntoConstraints = false
         container.wantsLayer = true
-        // 固定深色（跨屏一致）。behindWindow 毛玻璃在外接显示器上不可靠地退化为不透明，
-        // 且真透明必然随各屏桌面变化——故用实色。颜色贴近之前压暗后认可的观感，单值可调。
-        container.layer?.backgroundColor = CodexDesktopChrome.sidebarSolid.cgColor
+        container.layer?.backgroundColor = NSColor.clear.cgColor
         view = container
+
+        // 整个侧栏毛玻璃：.sidebar 材质 + behindWindow 透出并模糊窗口后面的桌面。
+        let blur = NSVisualEffectView()
+        blur.material = .sidebar
+        blur.blendingMode = .behindWindow
+        blur.state = .followsWindowActiveState
+        blur.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(blur)
+
+        // 在材质之上叠一层半透明深色遮罩把侧栏压暗，同时保留磨砂通透（alpha 越大越黑，
+        // 越小越透出桌面）。0.20 更通透、桌面透出更明显，单值可调。
+        let darkTint = NSView()
+        darkTint.wantsLayer = true
+        darkTint.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.20).cgColor
+        darkTint.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(darkTint)
+
+        NSLayoutConstraint.activate([
+            blur.topAnchor.constraint(equalTo: container.topAnchor),
+            blur.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            blur.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            blur.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            darkTint.topAnchor.constraint(equalTo: container.topAnchor),
+            darkTint.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            darkTint.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            darkTint.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
 
         let topActions = makeTopActions()
 
