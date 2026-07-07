@@ -60,6 +60,12 @@ pub fn protocol_schema() -> serde_json::Value {
             "HistoryListItem": serde_json::to_value(schema_for!(trunk::HistoryListItem)).unwrap(),
             "HistoryReadResponse": serde_json::to_value(schema_for!(trunk::HistoryReadResponse)).unwrap(),
             "HistoryResponse": serde_json::to_value(schema_for!(trunk::HistoryResponse)).unwrap(),
+            "RemoteFrame": serde_json::to_value(schema_for!(remote::RemoteFrame)).unwrap(),
+            "RelayControlMsg": serde_json::to_value(schema_for!(remote::RelayControlMsg)).unwrap(),
+            "DataEnvelope": serde_json::to_value(schema_for!(remote::DataEnvelope)).unwrap(),
+            "MachineDescriptor": serde_json::to_value(schema_for!(remote::MachineDescriptor)).unwrap(),
+            "SessionDescriptor": serde_json::to_value(schema_for!(remote::SessionDescriptor)).unwrap(),
+            "DeviceDescriptor": serde_json::to_value(schema_for!(remote::DeviceDescriptor)).unwrap(),
         }
     })
 }
