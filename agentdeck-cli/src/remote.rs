@@ -52,8 +52,18 @@ pub async fn smoke(profile: &str) -> ExitCode {
         eprintln!("remote.daemon.not_found: 找不到 agentdeckd 二进制，请先 `cargo build`");
         return ExitCode::FAILURE;
     };
+    run_smoke(&daemon, profile).await
+}
+
+/// `smoke` 的可注入驱动：接受调用方定位好的 `daemon` 路径，跑完整条
+/// FakeRelay + StdioMachineBridge + device 客户端 冒烟路径。拆出来是为了让
+/// 单测能绕开 `locate_daemon()`（其 current_exe sibling 探测在
+/// `cargo test` 的 `target/debug/deps/` cwd 下不命中真实二进制所在的
+/// workspace 根 `target/debug/`），改用稳健路径注入，而不改变 `smoke`
+/// 本身对外的行为。
+pub async fn run_smoke(daemon: &std::path::Path, profile: &str) -> ExitCode {
     let relay = FakeRelay::start();
-    let bridge = match StdioMachineBridge::spawn(&daemon, profile, machine(), &relay).await {
+    let bridge = match StdioMachineBridge::spawn(daemon, profile, machine(), &relay).await {
         Ok(b) => b,
         Err(e) => {
             eprintln!("remote.bridge.spawn_failed: {e}");
@@ -191,12 +201,27 @@ mod tests {
 
     #[tokio::test]
     async fn smoke_pings_real_daemon_through_relay() {
-        // 需要已构建的 daemon 二进制（locate_daemon 查 target/{debug,release}）。
-        if locate_daemon().is_none() {
-            eprintln!("skip: agentdeckd 未构建");
+        // `cargo test -p agentdeck-cli` 的测试二进制在 workspace 根
+        // `target/debug/deps/` 下运行、cwd = 包目录，`locate_daemon()`
+        // 的 current_exe sibling 探测与 cwd 相对回退都不命中——真实
+        // `agentdeckd` 二进制在 workspace 根 `target/{debug,release}/`
+        // 下，不是 `agentdeck-cli/target/...`。因此这里不经
+        // `locate_daemon()`，改用 `CARGO_MANIFEST_DIR`（=
+        // `.../agentdeck-cli`，其父目录即 workspace 根）稳健定位，
+        // 只有真未构建才 skip；已构建时真正跑通 `run_smoke` 的完整
+        // relay 路径。
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let candidates = [
+            root.join("target/debug/agentdeckd"),
+            root.join("target/release/agentdeckd"),
+        ];
+        let Some(daemon) = candidates.iter().find(|p| p.exists()) else {
+            eprintln!("skip: agentdeckd 未构建（在 workspace 根 target/{{debug,release}} 均未找到）");
             return;
-        }
-        let code = smoke("stable").await;
+        };
+        let code = run_smoke(daemon, "stable").await;
         assert_eq!(code, ExitCode::SUCCESS);
     }
 }
