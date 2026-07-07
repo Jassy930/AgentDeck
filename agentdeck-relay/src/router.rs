@@ -78,7 +78,6 @@ struct MachineEntry {
 }
 
 #[derive(Default)]
-#[allow(dead_code)] // conv_machine/turn_conv/sessions/conv_seq/conv_buffer/req_origin 供 Task 4（事件面）/ Task 5（命令面）使用，R0 先占位
 struct Core {
     conns: HashMap<ClientId, Conn>,
     machines: HashMap<String, MachineEntry>,
@@ -87,6 +86,7 @@ struct Core {
     sessions: HashMap<String, Vec<SessionDescriptor>>,
     conv_seq: HashMap<String, u64>,
     conv_buffer: HashMap<String, Vec<RelayControlMsg>>,
+    #[allow(dead_code)] // req_origin 供 Task 5（命令面：请求/回执关联）使用，R0 先占位
     req_origin: HashMap<String, ClientId>,
     subs_machines: HashSet<ClientId>,
     subs_sessions: HashMap<String, HashSet<ClientId>>,
@@ -141,7 +141,56 @@ impl Core {
                 let list = self.machine_list();
                 self.send_to(id, &trace, RelayControlMsg::MachineList { machines: list }).await;
             }
-            // 其余变体在 Task 4 / Task 5 加入
+            RelayControlMsg::AnnounceSession { session } => {
+                let mid = session.machine_id.clone();
+                self.conv_machine.insert(session.conversation_id.clone(), mid.clone());
+                self.sessions.entry(mid.clone()).or_default().push(session);
+                let list = self.sessions.get(&mid).cloned().unwrap_or_default();
+                if let Some(devs) = self.subs_sessions.get(&mid) {
+                    for dev in devs.clone() {
+                        self.send_to(dev, &trace, RelayControlMsg::SessionList { machine_id: mid.clone(), sessions: list.clone() }).await;
+                    }
+                }
+            }
+            RelayControlMsg::RetireSession { conversation_id } => {
+                self.conv_machine.remove(&conversation_id);
+            }
+            RelayControlMsg::PublishEvent { conversation_id, turn_session_id, seq: _, data } => {
+                let seq = {
+                    let s = self.conv_seq.entry(conversation_id.clone()).or_insert(0);
+                    let cur = *s;
+                    *s += 1;
+                    cur
+                };
+                self.turn_conv.insert(turn_session_id.clone(), conversation_id.clone());
+                let ev = RelayControlMsg::Event {
+                    conversation_id: conversation_id.clone(),
+                    turn_session_id,
+                    seq,
+                    data,
+                };
+                self.conv_buffer.entry(conversation_id.clone()).or_default().push(ev.clone());
+                if let Some(devs) = self.subs_events.get(&conversation_id) {
+                    for dev in devs.clone() {
+                        self.send_to(dev, &trace, ev.clone()).await;
+                    }
+                }
+            }
+            RelayControlMsg::Subscribe { target: SubTarget::Sessions { machine_id } } => {
+                self.subs_sessions.entry(machine_id.clone()).or_default().insert(id);
+                let list = self.sessions.get(&machine_id).cloned().unwrap_or_default();
+                self.send_to(id, &trace, RelayControlMsg::SessionList { machine_id, sessions: list }).await;
+            }
+            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id } } => {
+                self.subs_events.entry(conversation_id.clone()).or_default().insert(id);
+                if let Some(buf) = self.conv_buffer.get(&conversation_id).cloned() {
+                    for ev in buf {
+                        self.send_to(id, &trace, ev).await;
+                    }
+                }
+            }
+            RelayControlMsg::Ack { .. } | RelayControlMsg::Heartbeat { .. } => {}
+            // 其余变体（命令面）在 Task 5 加入
             _ => {}
         }
     }
@@ -179,7 +228,7 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentdeck_protocol::remote::{DeviceDescriptor, DeviceKind};
+    use agentdeck_protocol::remote::{DataEnvelope, DeviceDescriptor, DeviceKind};
 
     fn machine(id: &str) -> MachineDescriptor {
         MachineDescriptor {
@@ -228,6 +277,89 @@ mod tests {
                 assert_eq!(machines[0].machine_id, "M1");
             }
             other => panic!("expected MachineList, got {other:?}"),
+        }
+    }
+
+    fn session(conv: &str, machine: &str) -> SessionDescriptor {
+        SessionDescriptor {
+            conversation_id: conv.into(),
+            machine_id: machine.into(),
+            thread_id: Some(conv.into()),
+            current_turn_session_id: None,
+            agent_kind: agentdeck_protocol::AgentKind::Codex,
+            cwd: "/tmp/proj".into(),
+            title: None,
+        }
+    }
+
+    // 从 machine 发一条 PublishEvent（payload 用一个字符串占位内层字节）
+    async fn publish(m: &RelayClient, conv: &str, turn: &str) {
+        m.send(frame(
+            ClientRole::Machine { machine_id: "M1".into() },
+            RelayControlMsg::PublishEvent {
+                conversation_id: conv.into(),
+                turn_session_id: turn.into(),
+                seq: 0, // relay 自行 re-stamp
+                data: DataEnvelope::plaintext(&format!("evt-{turn}")).unwrap(),
+            },
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn events_keyed_on_conversation_survive_new_turn_and_replay_for_late_subscriber() {
+        let relay = FakeRelay::start();
+        let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
+        m.send(frame(
+            ClientRole::Machine { machine_id: "M1".into() },
+            RelayControlMsg::RegisterMachine { machine: machine("M1") },
+        ))
+        .await;
+        m.send(frame(
+            ClientRole::Machine { machine_id: "M1".into() },
+            RelayControlMsg::AnnounceSession { session: session("C1", "M1") },
+        ))
+        .await;
+
+        // device 订阅 conversation C1
+        let mut d1 = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        d1.send(frame(
+            ClientRole::Device { device_id: "D1".into() },
+            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into() } },
+        ))
+        .await;
+
+        // turn A（session S1）发一条事件；随后 turn B（session S2，同 conversation）
+        publish(&m, "C1", "S1").await;
+        publish(&m, "C1", "S2").await;
+
+        // D1 应按序收到两个 turn 的事件，seq 单调 0,1
+        let e0 = recv_event(&mut d1).await;
+        let e1 = recv_event(&mut d1).await;
+        assert_eq!(e0, ("C1".to_string(), "S1".to_string(), 0));
+        assert_eq!(e1, ("C1".to_string(), "S2".to_string(), 1));
+
+        // 晚订阅的 D2 应补拉到已缓冲的两条
+        let mut d2 = relay.connect(ClientRole::Device { device_id: "D2".into() }).await;
+        d2.send(frame(
+            ClientRole::Device { device_id: "D2".into() },
+            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into() } },
+        ))
+        .await;
+        let r0 = recv_event(&mut d2).await;
+        let r1 = recv_event(&mut d2).await;
+        assert_eq!(r0, ("C1".to_string(), "S1".to_string(), 0));
+        assert_eq!(r1, ("C1".to_string(), "S2".to_string(), 1));
+    }
+
+    async fn recv_event(c: &mut RelayClient) -> (String, String, u64) {
+        loop {
+            match c.recv().await.expect("frame").msg {
+                RelayControlMsg::Event { conversation_id, turn_session_id, seq, .. } => {
+                    return (conversation_id, turn_session_id, seq)
+                }
+                _ => continue,
+            }
         }
     }
 }
