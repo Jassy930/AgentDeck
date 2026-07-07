@@ -354,7 +354,12 @@ mod tests {
 
     async fn recv_event(c: &mut RelayClient) -> (String, String, u64) {
         loop {
-            match c.recv().await.expect("frame").msg {
+            let frame = match tokio::time::timeout(std::time::Duration::from_secs(5), c.recv()).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => panic!("timed out waiting for Event frame: stream closed"),
+                Err(_) => panic!("timed out waiting for Event frame"),
+            };
+            match frame.msg {
                 RelayControlMsg::Event { conversation_id, turn_session_id, seq, .. } => {
                     return (conversation_id, turn_session_id, seq)
                 }
