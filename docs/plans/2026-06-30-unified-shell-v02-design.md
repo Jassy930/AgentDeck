@@ -45,7 +45,7 @@ v0.1 的根本不变量（即将被本设计部分推翻）：
 2. **语义保留**：vendor 原始概念（Codex `approval policy/sandbox`、CC `permission mode/hooks`）UI 上保留原词，不强译为中立词
 3. **统一壳**：整体 UI 范式（会话流、历史侧栏、prompt 输入、approval 卡片骨架）一致；vendor-specific 控件按 capability 路由到对应 SubView
 4. **多端原生**：macOS=AppKit、iOS=UIKit、Windows/Linux/Web=Rust 壳 + Web UI（Tauri 风格）。**不追求跨平台共享 UI 框架**
-5. **AgentDeck 自带能力**：Project/Task/Run 工作台、Skill 管理、插件系统、SSH 远程、移动伴侣（v0.4+ 路线图）
+5. **AgentDeck 自带能力**：Project/Task/Run 工作台、Skill 管理、插件系统、SSH 远程、移动伴侣（v0.4+ 路线图，= Relay 母设计 R3，见 `docs/plans/2026-07-01-agentdeck-mobile-relay-design.md`）
 6. **事实唯一来源**：vendor 自管的数据（CC 会话历史、session rename、archive）一律走 vendor 原生接口，AgentDeck **不**自管元数据层
 
 ### 1.3 v0.1 北极星修订（必须执行）
@@ -121,7 +121,7 @@ AgentDeck 的"原生体验"意思是每个平台都用平台原生 UI 框架：
 | **v0.2** | 统一壳端到端验证（macOS AppKit + Codex + CC + IPC v2） | 5–7 周 |
 | v0.3 | Codex Desktop 对标补齐 + CC 特色补齐（Worktree、MCP 面板、CC hooks 编辑、Codex skills 浏览、Diff 浏览器升级） | 4–6 周 |
 | v0.4 | AgentDeck 工作台（Projects / Tasks / Runs）+ AgentDeck 自管 Skill v1 | 8–12 周 |
-| v0.5 | daemon 远程化 + Web UI v0.1（仅会话流，验证跨客户端中立） | 6–10 周 |
+| v0.5 | daemon 远程化（= Relay 母设计 R1 Relay MVP + R2 remote mode；R0 契约 spike 见 `docs/plans/2026-07-07-relay-r0-contract-spike-design.md`） + Web UI v0.1（仅会话流，验证跨客户端中立） | 6–10 周 |
 | v0.6 | Web/Tauri 发布 + Win/Linux 包装 | 4–8 周 |
 | v0.7 | 插件 SDK（双层：vendor passthrough + AgentDeck 自有）+ 插件市场 MVP | 8–12 周 |
 | v1.0 | iOS UIKit 伴侣 + macOS Menu Bar Radar / 通知 / 全局快捷键 / 多端统一发布 | 10–14 周 |

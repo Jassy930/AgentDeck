@@ -1912,7 +1912,7 @@ git commit -m "docs(relay): R0 落地收口——版本↔阶段交叉引用、i
 
 - `cargo test` 全绿：协议 remote 往返 + N1 中立性 + schema 快照无漂移；relay 机器/事件/命令面单测；T1 真实 daemon admin 往返（含并发关联）；T2 合成会话稳定身份穿透 + 补拉；T3 内容不可见；T4 默认跳过。
 - `agentdeck remote smoke` 单进程打印 machines 快照 + `{"reply":"ping","ok":true}` + round-trip OK。
-- gated `AGENTDECK_E2E=1 cargo test -p agentdeckd --test relay_r0_e2e` 下 T4 通过（本地已登录）。
+- gated `AGENTDECK_E2E=1 cargo test -p agentdeckd --test relay_r0_e2e` 下 T4 **编译 + 默认 skip 通过**；真实穿透留 R2——R0 订阅模型需已知 conversation_id 精确订阅（无通配目标），真实 daemon 场景下 device 无法预知 conversation_id，即使手动设置 `AGENTDECK_E2E=1` 运行也会超时失败，非 R0 验收项（详见设计文档 §7 实现偏差记录）。
 - 无任何 crate 启用 tokio `net`；relay/bridge 不经手 vendor token、不写数据目录。
 - relay 明文不入日志：R0 的 `FakeRelay`/`StdioMachineBridge` 不引入 `tracing`、不打印数据面内容，日志边界由「零日志构造」保证（R1 引入日志时再补明文脱敏断言）。
 - `scripts/verify-agent-docs.sh` 通过；schema 快照与生成一致。

@@ -265,6 +265,8 @@ remote --relay <endpoint> ping <machine_id>                # 机器级 admin 往
 - **T2 会话流转发 + 稳定身份（合成 machine，ungated）**：合成 machine 发脚本化流：turn A（`SessionStarted{session_id=S1, thread_id=T1}`→…→`ActionRequest`→[device 发 `SendCommand{Turn{S1}}` ActionDecision]→…→`TurnComplete`），随后 device 发 `SendCommand{Conversation{T1}}`（prompt），合成 machine 起 turn B（`SessionStarted{session_id=S2, thread_id=T1}`→`AgentItem`→`TurnComplete`）。device **订阅 `Events{conversation_id=T1}`**，断言：A、B 两个 turn 的事件都收到（**证明 prompt 触发新 turn_session_id 后 watcher 不丢流**）、seq 单调、`(conversation_id, turn_session_id)` 标注正确、晚订阅的第二 device 重放缓冲。→ 证明 fleet 转发 + 稳定身份 + 排序 + 补发。
 - **T3 数据面不可见 / 控制面可读**：断言路由器仅凭控制面（`RemoteFrame.msg` 的 target/subscription）路由，喂随机不透明 `DataEnvelope::Plaintext` 仍正确路由且**从不解码内层**；反证控制面必须可读（把控制消息也 opaque 会导致无法路由）。→ 证明分层正确。
 - **T4 真实会话全流穿透（gated，`AGENTDECK_E2E=1`）**：真实 `agentdeckd` 跑一次真实 Codex 或 CC 会话，device 订阅 conversation，断言 `SessionStarted→AgentItem 流→TurnComplete` 经 relay 完整穿透。默认 `cargo test` 跳过，对齐 AGENTS.md 门控 E2E 约定。
+
+> **实现偏差记录（Task 8/9 落地后）**：R0 的订阅模型要求 device 已知 conversation_id 才能精确订阅（`SubTarget::Events` 无通配目标），而真实 daemon 场景下 conversation_id 在 SessionStart 之前不可预知，device 无法提前订阅。因此 T4 在 R0 阶段**只是编译校验 + 默认 skip 的意图占位**，即使设置 `AGENTDECK_E2E=1` 手动运行也会因收不到事件而超时失败（非 hang，30s 轮询超时后断言失败）。真实会话全流穿透的证明推迟到 **R2**（需身份 bootstrap，让 device 能在会话真正开始前按 conversation 精确订阅真实 daemon 会话）。R0 阶段的真实穿透证明改由 **T1（真实 daemon admin 双向往返）+ T2（合成会话全生命周期穿透，含稳定身份与补拉）+ T3（数据面内容不可见）** 三项 ungated 测试共同承担。
 - **schema/中立性（ungated）**：protocol schema 快照纳入 `remote::*` 并同步；中立性测试断言 remote 类型无 vendor 字样。
 
 ### 验收标准（R0）
@@ -275,7 +277,7 @@ remote --relay <endpoint> ping <machine_id>                # 机器级 admin 往
 - 路由器可证明只读控制面、从不解码数据面内层。
 - relay 日志中不出现数据面明文或 token-like 串。
 - `agentdeck-cli remote smoke` 单进程跑通 machines/sessions/watch/ping（合成 machine 时含 send/approve），打印经 relay 转发的内容 + 信封元数据 + trace_id。
-- gated `AGENTDECK_E2E=1` 下 T4 通过（本地执行，需 codex/claude 登录）。
+- gated `AGENTDECK_E2E=1` 下 T4 **编译通过、默认 skip**；真实会话穿透证明推迟到 R2（见上方实现偏差记录），R0 不要求 T4 手动运行通过。
 - `scripts/verify-agent-docs.sh` 通过；协议变更后 schema 漂移测试通过；文档同步更新。
 
 ## 8. 后置项与开放问题

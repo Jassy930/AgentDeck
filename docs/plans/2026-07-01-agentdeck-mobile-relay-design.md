@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Design - 方向已确认 |
+| 状态 | Design - R0 落地中 |
 | 日期 | 2026-07-01 |
 | 主题 | 参考 Happier 的跨设备 agent 工作流，为 AgentDeck 手机端先补最小服务端能力 |
 | 关联 | `NORTH_STAR.md`、`ARCHITECTURE.md`、`docs/plans/2026-06-30-unified-shell-v02-design.md` |
@@ -150,6 +150,8 @@ RemoteEnvelope {
 ```
 
 `ciphertext` 内部才是 `agentdeck-protocol` 的 `ClientCommand` / `ServerEvent` / history response。Relay 只按外层元数据路由、排序和补发。
+
+> **R0 细化注记**：R0 已将其细化为控制面（`RemoteFrame` + `RelayControlMsg`，relay 可读）+ 数据面（`DataEnvelope`，relay 不可见）两层，见 `2026-07-07-relay-r0-contract-spike-design.md`。
 
 第一版需要的对象：
 
