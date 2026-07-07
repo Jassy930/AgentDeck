@@ -2,9 +2,9 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Design - 待评审 |
+| 状态 | Design - 已按代码评审修订，待复审 |
 | 日期 | 2026-07-07 |
-| 主题 | Relay 远程访问第一阶段（R0）：证明 RemoteEnvelope 能包住现有 agentdeck-protocol，并用内存 fake relay + CLI remote 客户端打通「协议组合 + 转发」 |
+| 主题 | Relay 远程访问第一阶段（R0）：证明控制面/数据面分层的 remote frame 能包住现有 agentdeck-protocol，并用内存 fake relay + CLI 单进程 smoke 打通「协议组合 + 转发」 |
 | 关联 | `docs/plans/2026-07-01-agentdeck-mobile-relay-design.md`（母设计，R0-R4 路线）、`docs/plans/2026-07-03-ios-uikit-frontend-design.md`（MobileSessionSource 接口）、`ARCHITECTURE.md`（N1/N6/K5/K9/N8）、`NORTH_STAR.md` |
 
 ## 1. 背景和用户问题
@@ -16,42 +16,53 @@ AgentDeck 的北极星把「移动端伴侣」列为跨 agent 自带能力，并
 - daemon 与客户端之间**只有 stdio 子进程管道**（JSONL 分帧），无 socket/端口/鉴权；`agentdeckd` 编译层面连 tokio `net` feature 都没开，完全假设本机、单客户端、单管道。
 - 协议层已为远程预留：`agentdeck-protocol/src/transport.rs` 有异步 `Transport` trait + `AuthContext::Bearer{token,device_id}` + 重连配置（不变量 N6 编译期锁死），但全是 v0.5 占位、无实现。
 - `agentdeckd` 主循环 `hub.run<R:AsyncRead, W:AsyncWrite>(stdin, stdout)` 是泛型的——**换成任意流即为 relay 注入缝**。
-- iOS 侧唯一数据入口 `MobileSessionSource`（4 只读流 + 2 写指令）已就绪，当前只有 `FixtureSessionSource`；`SceneDelegate` 硬编码注入，未来换 `RelaySessionSource` 视图层零改动。
-- 母设计 §6 的 `RemoteEnvelope` 与 fleet 对象（Machine/Device/Subscription…）目前只是伪代码，仓库无对应 Rust 类型、无 `agentdeck-relay` crate。**R0 尚未落地。**
+- **会话身份现实**：`codex/adapter.rs` 与 `claude_code/adapter.rs` 的 `start_inner`（`start_session` 与 `continue_thread` 共用）每次调用都 `SessionId(uuid::v4())` **新铸一个 session_id**；`ServerEvent::SessionStarted{session_id, thread_id: resume_thread_id, agent_kind}` 表明 **`thread_id` 才是跨 turn 稳定的会话身份，`session_id` 是 per-turn/per-invocation 的**。`ClientCommand::SessionContinue{thread_id, agent_kind, cwd, prompt}` 只吃 `thread_id`，不吃旧 `session_id`。
+- **admin reply 现实**：daemon 的 7 个 admin 命令（Ping/Selfcheck/ProtocolSchema/ProtocolVersion/AgentList/AgentCapabilities/History）走 `{"reply":"..."}` 侧通道，**无 request id**；CLI 按 `"reply"` 字段值匹配等待（`agentdeck-cli/src/client.rs`），同类并发会误关联。
+- iOS 侧唯一数据入口 `MobileSessionSource`（4 只读流 + 2 写指令）已就绪，当前只有 `FixtureSessionSource`；未来换 `RelaySessionSource` 视图层零改动。
+- 母设计 §6 的 `RemoteEnvelope` 与 fleet 对象目前只是伪代码，仓库无对应 Rust 类型、无 `agentdeck-relay` crate。**R0 尚未落地。**
 
-用户问题：完整 relay 横跨 5 个子系统（协议信封、relay 服务器、daemon remote mode、iOS 网络数据源、加密/配对），不适合一次做完。需要一个**最小但有真实证明力**的第一步，把后续阶段的最大风险提前拆掉：协议能否组合、daemon 协议缺失的 fleet 概念（机器/会话列表）怎么补、加密与网络的接缝留在哪。
+用户问题：完整 relay 横跨 5 个子系统，不适合一次做完。需要一个**最小但有真实证明力**的第一步，把后续阶段的最大风险提前拆掉：协议能否组合、daemon 协议缺失的 fleet 概念怎么补、会话身份怎么稳定、加密与网络的接缝留在哪。
 
 ## 2. 目标与非目标
 
 ### 目标
 
-- 证明 `RemoteEnvelope` 能包住现有 `ClientCommand` / `ServerEvent` / admin-reply / `HistoryResponse` 并原样解出，语义无损。
-- 证明一个「有状态但内容不可见」的转发器能在 machine（真实 `agentdeckd`）与 device（第二个客户端）之间路由/转发/排序/补发，会话生命周期完整穿透。
-- 在 R0 就定义**最小 relay 控制协议（fleet 层）**，补齐 daemon 协议没有的「机器列表 / 会话列表 / 事件订阅」，并与 `MobileSessionSource` 一一对齐。
-- 交付一个**人工可驱动的 CLI remote 客户端作为接口基线**：它是 iOS `RelaySessionSource` 与集成测试共同对齐的参照面，且在 iOS 出现之前持续验证 relay 链路。
-- 留好加密接缝（`Sealed`）和网络接缝，使 R1（真加密/真网络）对路由器与信封形状零破坏。
-- 全部进默认 `cargo test`（**不需要真实 codex/claude 登录**）。
+- 证明**控制面/数据面分层的 remote frame** 能包住现有 `ClientCommand` / `ServerEvent` / admin-reply / `HistoryResponse`：relay 可读控制面做路由，agent 内容作为 opaque 数据面穿透、relay 不可见。
+- 证明一个「控制面可读、数据面不可见」的转发器能在 machine（真实 `agentdeckd`）与 device（第二个客户端）之间路由/转发/排序/补发。
+- 在 R0 就定义**稳定远程身份模型**：`conversation_id`（映射 daemon `thread_id`）与 `turn_session_id`（每次 start/continue 新铸的 `session_id`）分离；事件订阅键在 `conversation_id`，approval 定位当前 `turn_session_id`。
+- 在 R0 定义**最小 relay 控制协议（fleet 层）**，补齐 daemon 没有的「机器列表 / 会话列表 / 事件订阅」，并与 `MobileSessionSource` 一一对齐。
+- 交付**可人工驱动的 CLI remote 命令面作为接口基线**（语义冻结、跨 R0-R2 稳定），R0 用**单进程 `remote smoke`** 提供可执行证明。
+- 留好数据面加密接缝（`DataEnvelope`）和网络接缝，使 R1（真加密/真网络）对控制面协议与路由器零破坏。
+- 默认 `cargo test` 覆盖「真实 daemon admin 双向组合 + 合成 session lifecycle 穿透」，**不需要 vendor 登录**；真实 Codex/CC 全流穿透由 **gated E2E**（`AGENTDECK_E2E=1`）覆盖。
 
 ### 非目标
 
 - 不做真实端到端加密（R1/R2 决定库与落地）。
-- 不做真实网络传输 / WebSocket / TLS（R1）——R0 任何 crate 都不新增 tokio `net` feature，让「无网络」边界字面可强制。
-- 不改 `agentdeckd`，不做 agentdeckd remote mode（R2）。
+- 不做真实网络传输 / WebSocket / TLS（R1）——R0 任何 crate 都不新增 tokio `net` feature，编译层面强制「无网络」。
+- 不改 `agentdeckd`，不做 agentdeckd remote mode（R2）；R0 用 bridge 从外部把真实 daemon 当 machine 接入。
+- 不解决真实 daemon「首个 turn 之前 thread_id 尚未确定」的 bootstrap（R2 remote mode 处理）；R0 合成 machine 直接分配 `conversation_id`。
 - 不做扫码配对、相机、device credential、撤销流程（R2/R3）。
-- 不做持久化存储（SQLite/Postgres，R1）；R0 纯内存。
-- 不做 APNs 通知（R3+）。
-- 不做 iOS `RelaySessionSource`（R3）；R0 只保证接口面对齐，不写 iOS 网络代码。
+- 不做持久化存储（R1）；R0 纯内存。不做 APNs（R3+）。
+- 不做 iOS `RelaySessionSource`（R3）；R0 只保证接口面对齐。
 - 不做 SaaS/多租户/团队（R4）。
 
 ## 3. 已确认决策
 
-本设计经头脑风暴对齐，以下决策已确认：
+本设计经头脑风暴对齐 + 一轮代码评审修订，决策如下：
 
-1. **落地范围 = R0 契约 spike**（横跨 5 子系统的完整 relay 切片推进，先做 R0）。
+1. **落地范围 = R0 契约 spike**（先做 R0，后续切片推进）。
 2. **R0 方案 = 方案 B**：内存 fake relay + 真实 daemon 组合 + CLI smoke；新建 `agentdeck-relay` lib crate，`agentdeckd` 零改动，进默认 `cargo test`，为 R1 生长。
-3. **relay 控制协议（fleet 消息）在 R0 就定义**（不压到 R1），因为它正是「证明协议能组合」的核心，并当场填上 iOS `sendPrompt` 缺 threadId 的坑。
-4. **CLI remote 客户端最优先、最早做，并作为验证与接口基线**：R0 的构建从 CLI device 客户端起步，其命令面镜像 `MobileSessionSource`，冻结为跨 R0-R2 稳定的接口基线。
-5. **阶段↔版本映射修订要做**：在本 spec 记录 R0-R4 与 v0.4+/v0.5 的映射，并顺手修 README/unified-shell 一行交叉引用消歧（文档一致性，非代码）。
+3. **relay 控制协议（fleet 消息）在 R0 就定义**，并当场填上 iOS `sendPrompt` 缺 thread_id 的坑。
+4. **CLI remote 命令面最优先、作为接口基线**（语义冻结）；R0 的可执行证明是单进程 `remote smoke`。
+5. **阶段↔版本映射修订要做**（§9）。
+
+代码评审引入的 5 处修订（见对应章节）：
+
+- **R1 控制面/数据面分离**：control plane（`RemoteFrame`/`RelayControlMsg`）relay 可读，仅 agent payload 走 opaque `DataEnvelope`（§4.2/§4.3）。
+- **R2 稳定远程身份**：`conversation_id`(=thread_id) 与 `turn_session_id`(=session_id) 分离（§4.3）。
+- **R3 CLI 基线可执行性**：R0 用单进程 `remote smoke`，独立子命令语义冻结但独立可运行始于 R1（§4.5/§5）。
+- **R4 admin reply single-flight**：bridge 对 machine admin 命令串行化 + FIFO 关联（§4.4/§6）。
+- **R5 验收口径校正**：默认 CI 覆盖「真实 admin + 合成 lifecycle」，真实全流走 gated E2E（§2/§7）。
 
 ## 4. 架构方案和边界
 
@@ -59,109 +70,114 @@ AgentDeck 的北极星把「移动端伴侣」列为跨 agent 自带能力，并
 
 ```text
 agentdeck-protocol/src/remote/        # 契约事实源（受 schema 快照 + 中立性约束）
-  mod.rs        # 模块根 + RELAY_PROTOCOL_VERSION 常量 + re-export
-  envelope.rs   # RemoteEnvelope + Sealed（加密接缝）+ EnvelopeKind
-  relay.rs      # relay 控制协议：RelayClientMsg / RelayServerMsg / SubTarget
+  mod.rs        # 模块根 + RELAY_PROTOCOL_VERSION + re-export
+  frame.rs      # RemoteFrame（控制面外壳，relay 可读）+ ClientRole
+  control.rs    # RelayControlMsg（控制面消息，relay 可读）+ SubTarget + CommandTarget
+  data.rs       # DataEnvelope（数据面，relay 不可见）+ 加密接缝
   fleet.rs      # MachineDescriptor / DeviceDescriptor / SessionDescriptor
   # lib.rs 加 `pub mod remote;` 并把 remote 类型纳入 protocol_schema()
 
 agentdeck-relay/                       # 新 lib crate（R0 无 binary，R1 生长为 relay 服务）
   Cargo.toml    # deps: agentdeck-protocol, tokio(sync/io-util/time/macros，**不含 net**),
                 #       serde, serde_json, thiserror, tracing
-  src/
-    lib.rs
-    router.rs   # FakeRelay：内存异步路由器核心
-    bridge.rs   # StdioMachineBridge：把 spawn 的真实 agentdeckd 当 machine 接入
-  tests/
-    r0_composition.rs
+  src/{lib.rs, router.rs, bridge.rs}
+  tests/r0_composition.rs
 
-agentdeck-cli/                         # 扩 remote 子命令组（接口基线，最优先）
-  src/remote/   # remote 客户端：连接（R0 仅 in-proc fake）、订阅、发指令、打印
+agentdeck-cli/src/remote/              # remote 命令面（接口基线）+ 单进程 smoke
 ```
 
-remote 类型放 `agentdeck-protocol` 与已有 `transport.rs` 远程预留同源；路由运行时逻辑放 `agentdeck-relay`；人工驱动面放 `agentdeck-cli`。
+### 4.2 控制面/数据面分层（评审修订 R1）
 
-### 4.2 RemoteEnvelope + 「暂无加密」接缝
+关键更正：relay 必须能读控制消息（Subscribe/SendCommand/…）才能路由，所以**控制面不能是 opaque 的**；只有 agent 的 `ClientCommand`/`ServerEvent` 内容才是 relay 不可见的数据面。
 
 ```rust
 pub const RELAY_PROTOCOL_VERSION: u16 = 0; // R0 草案
 
-pub struct RemoteEnvelope {
+// 控制面外壳：relay 完整可读。
+pub struct RemoteFrame {
     pub relay_protocol_version: u16,
-    pub agentdeck_protocol_version: u16,   // == PROTOCOL_VERSION (2)
-    pub account_or_profile_id: String,
-    pub device_id: String,
-    pub machine_id: String,
-    pub session_id: Option<String>,
-    pub stream_seq: u64,                   // per-session 单调，供断线补拉（R1+）
-    pub kind: EnvelopeKind,
-    pub created_at_ms: i64,                // 外部传入，不在协议内取时钟（确定性/可测）
-    pub trace_id: String,                  // 三端关联（母设计 §8）
-    pub payload: Sealed,                   // 接缝
+    pub trace_id: String,          // 三端关联
+    pub created_at_ms: i64,        // 外部传入，不在协议内取时钟（确定性/可测）
+    pub from: ClientRole,          // Machine{machine_id} | Device{device_id}
+    pub msg: RelayControlMsg,      // relay 可读的控制消息
 }
+pub enum ClientRole { Machine { machine_id: String }, Device { device_id: String } }
 
-pub enum EnvelopeKind { Command, Event, AdminReply, History, RelayControl }
-
-pub enum Sealed {
-    Plaintext { bytes: Vec<u8> },          // R0：明文字节 = 内层 JSON 序列化
-    // Encrypted { alg, nonce, ciphertext, tag }  // R1/R2 追加；路由器零改动
+// 数据面：relay 不可见。R0 = 明文字节；R1/R2 换 Encrypted，控制面与路由器零改动。
+pub enum DataEnvelope {
+    Plaintext { agentdeck_protocol_version: u16, bytes: Vec<u8> }, // 内层 ClientCommand/ServerEvent/HistoryResponse JSON
+    // Encrypted { alg, nonce, ciphertext, tag }  // R1/R2
 }
 ```
 
-**接缝语义**：relay 只读**外层元数据**（ids/seq/kind/trace_id）做路由、排序、补发；`Sealed` 对它永远不透明。R0 里 payload 是明文（好让测试解码断言），但路由器代码把它当不透明字节处理——从而证明 R1 把 `Plaintext` 换成 `Encrypted` 时路由器与信封形状零改动。内层字节按 `kind` 解码为对应 trunk 类型，信封本身不需要认识内层类型。
+与母设计 §6 的对应：母设计的 `RemoteEnvelope.ciphertext` 即本设计的 **`DataEnvelope`**（数据面）；母设计未显式区分的路由元数据被提升为 relay 可读的 **`RemoteFrame` + `RelayControlMsg`**（控制面）。母设计文档在 R0 落地后据此更新。
 
-`created_at_ms` 由调用方传入（不在协议内调用时钟），保证测试确定性并对齐「时间戳外部注入」的工程约束。
+### 4.3 relay 控制协议、稳定身份与 MobileSessionSource 映射（评审修订 R1+R2）
 
-### 4.3 relay 控制协议（fleet 层）与 MobileSessionSource 映射
-
-daemon 协议只到「单会话 events + history」，没有「机器列表 / 会话列表 / 收件箱」。R0 定义最小 relay 控制协议补齐：
+`RelayControlMsg` 是 relay 可读的控制面消息；凡携带 agent 内容的变体，用**嵌套 `DataEnvelope`** 承载 opaque payload：
 
 ```rust
-// 装在 RemoteEnvelope{kind: RelayControl} 里
-pub enum RelayClientMsg {
-    // machine 侧
+pub enum RelayControlMsg {
+    // ── machine → relay ──
     RegisterMachine { machine: MachineDescriptor },
     Heartbeat { machine_id: String },
     AnnounceSession { session: SessionDescriptor },
-    RetireSession { session_id: String },
-    PublishEvent { session_id: String, seq: u64, sealed: Sealed }, // 转发一条 ServerEvent
-    // device 侧
+    RetireSession { conversation_id: String },
+    PublishEvent { conversation_id: String, turn_session_id: String, seq: u64, data: DataEnvelope },
+    AdminReply { in_reply_to: String, data: DataEnvelope },   // in_reply_to = SendCommand.request_id
+    // ── device → relay ──
     ConnectDevice { device: DeviceDescriptor },
-    Subscribe { target: SubTarget },     // Machines | Sessions{machine_id} | Events{session_id}
+    Subscribe { target: SubTarget },
     Unsubscribe { target: SubTarget },
-    SendCommand { target: CommandTarget, sealed: Sealed }, // device→machine 的 ClientCommand
-    Ack { up_to_seq: u64, session_id: Option<String> },
+    SendCommand { request_id: String, target: CommandTarget, data: DataEnvelope },
+    Ack { up_to_seq: u64, conversation_id: Option<String> },
+    // ── relay → client ──
+    MachineList { machines: Vec<MachineDescriptor> },                        // → machines()
+    SessionList { machine_id: String, sessions: Vec<SessionDescriptor> },    // → sessions()
+    Event { conversation_id: String, turn_session_id: String, seq: u64, data: DataEnvelope }, // → events()
+    CommandDelivered { request_id: String },
+    Error { code: String, message: String, in_reply_to: Option<String> },    // relay.* / remote.* 失败码
 }
 
-// SendCommand 寻址：会话级命令走 Session（relay 用 AnnounceSession 建的 session→machine 索引解析），
-// 机器级 admin 命令（Ping/ProtocolVersion/Selfcheck/History 等无 session）走 Machine。
-pub enum CommandTarget { Session { session_id: String }, Machine { machine_id: String } }
-
-pub enum RelayServerMsg {
-    MachineList { machines: Vec<MachineDescriptor> },              // → machines()
-    SessionList { machine_id: String, sessions: Vec<SessionDescriptor> }, // → sessions()
-    Event { session_id: String, seq: u64, sealed: Sealed },       // → events()
-    CommandDelivered { session_id: String },
-    Error { code: String, message: String },                      // relay.* / remote.* 失败码
+pub enum SubTarget {
+    Machines,
+    Sessions { machine_id: String },
+    Events { conversation_id: String },     // ← 订阅键在稳定 conversation，而非 per-turn session
 }
 
-pub enum SubTarget { Machines, Sessions { machine_id: String }, Events { session_id: String } }
+// 命令寻址：会话级命令走 Conversation（发新 prompt→续接稳定会话）；
+// 审批定位当前活跃 turn；机器级 admin（Ping/History 等，无会话）走 Machine。
+pub enum CommandTarget {
+    Conversation { conversation_id: String },   // sendPrompt → 内层 SessionContinue{thread_id=conversation_id}
+    Turn { turn_session_id: String },           // resolveApproval → 内层 ActionDecision{session_id=turn_session_id}
+    Machine { machine_id: String },             // 机器级 admin（Ping/ProtocolVersion/Selfcheck/History）
+}
 ```
 
-`MobileSessionSource` 映射（接口基线的核心对齐关系）：
+**稳定身份模型（修订 R2 的核心）**：daemon 每次 start/continue 新铸 `session_id`，故：
 
-| MobileSessionSource 方法 | relay 控制协议 | CLI 命令（基线） |
+- `conversation_id`（remote 稳定）↔ daemon `thread_id`（`SessionContinue` 用的持久会话句柄）。
+- `turn_session_id`（per-turn）↔ 每次新铸的 `session_id`。
+- device **订阅 `conversation_id`**；每条 `Event` 带 `(conversation_id, turn_session_id, seq)`，故发 prompt 触发新 turn（新 turn_session_id）后，订阅同一 conversation 的 watcher 仍持续收流。
+- `sendPrompt` → `SendCommand{ target: Conversation }` → bridge/remote-mode 发 `SessionContinue{ thread_id=conversation_id }`。
+- `resolveApproval` → `SendCommand{ target: Turn{turn_session_id} }` → `ActionDecision{ session_id=turn_session_id, persist:false }`（persist 默认 false，R2 补显式开关）。
+- bridge 维护 `thread_id ↔ conversation_id` 映射与每 conversation 的当前 `turn_session_id`（随 `SessionStarted` 更新）。真实 daemon 首个 turn 之前 thread_id 未定的 bootstrap 是 R2 事项；R0 合成 machine 直接分配 conversation_id。
+
+`MobileSessionSource` 映射（接口基线冻结点）：
+
+| MobileSessionSource 方法 | relay 控制协议 | CLI 命令（语义基线） |
 |---|---|---|
-| `machines()` | `Subscribe{Machines}` → `MachineList` | `agentdeck-cli remote machines` |
-| `sessions(machineID:)` | `Subscribe{Sessions{id}}` → `SessionList` | `agentdeck-cli remote sessions <machine_id>` |
-| `events(sessionID:)` | `Subscribe{Events{id}}` → `Event` 流 | `agentdeck-cli remote watch <session_id>` |
-| `sendPrompt(sessionID:text:)` | `SendCommand`（内层 `SessionContinue`/`SessionStart`） | `agentdeck-cli remote send <session_id> <text>` |
-| `resolveApproval(sessionID:requestID:approve:)` | `SendCommand`（内层 `ActionDecision`） | `agentdeck-cli remote approve/deny <session_id> <request_id>` |
+| `machines()` | `Subscribe{Machines}` → `MachineList` | `remote machines` |
+| `sessions(machineID:)` | `Subscribe{Sessions{id}}` → `SessionList` | `remote sessions <machine_id>` |
+| `events(sessionID:)`（键=conversation） | `Subscribe{Events{conversation_id}}` → `Event` 流 | `remote watch <conversation_id>` |
+| `sendPrompt(...)` | `SendCommand{Conversation}`（内层 `SessionContinue`） | `remote send <conversation_id> <text>` |
+| `resolveApproval(...)` | `SendCommand{Turn}`（内层 `ActionDecision`） | `remote approve/deny <turn_session_id> <request_id>` |
+| （机器级 admin） | `SendCommand{Machine}`（内层 Ping 等） | `remote ping <machine_id>` |
 | `inbox()` | **后置**（可由事件派生） | 后置 |
 
-`inbox()` 明确后置：它可由事件派生（`actionRequest`→待审批 / `turnComplete`→完成 / `error`→失败，`FixtureSessionSource` 已在这么做），R3 移植该派生逻辑。
+`inbox()` 后置：可由事件派生（`actionRequest`→待审批 / `turnComplete`→完成 / `error`→失败，`FixtureSessionSource` 已在这么做），R3 移植。
 
-fleet 数据类型填上探索发现的缺口：
+fleet 数据类型：
 
 ```rust
 pub struct MachineDescriptor {
@@ -171,126 +187,124 @@ pub struct MachineDescriptor {
 }
 pub struct DeviceDescriptor { pub device_id: String, pub kind: DeviceKind } // Cli | Mobile | Desktop
 pub struct SessionDescriptor {
-    pub session_id: String, pub machine_id: String,
-    pub thread_id: Option<String>,   // ← 填坑：sendPrompt→SessionContinue 需要
-    pub agent_kind: AgentKind,       // ← 填坑：SessionContinue 需要
-    pub cwd: String,                 // ← 填坑：SessionContinue 需要（CC --resume 指向 per-cwd）
+    pub conversation_id: String,               // 稳定身份（= thread_id 已知时）
+    pub machine_id: String,
+    pub thread_id: Option<String>,             // daemon 持久会话句柄
+    pub current_turn_session_id: Option<String>, // 当前活跃 turn 的 session_id
+    pub agent_kind: AgentKind,                 // SessionContinue 需要
+    pub cwd: String,                           // SessionContinue 需要（CC --resume 指向 per-cwd）
     pub title: Option<String>,
 }
 ```
 
-`SessionDescriptor` 携带 `thread_id + agent_kind + cwd`，正好补上探索发现的坑：`sendPrompt` 要构造 `ClientCommand::SessionContinue{thread_id, agent_kind, cwd, prompt}`，而现有 iOS `SessionSummary` 缺 `thread_id`。`resolveApproval` 的 `persist` 标志在 R0 默认 `false`（Codex 可持久化审批的语义在 R2 device 侧补显式开关）。
-
-### 4.4 FakeRelay 路由器 + stdio bridge
+### 4.4 FakeRelay 路由器 + stdio bridge（评审修订 R1+R4）
 
 **FakeRelay（router.rs）**：内存异步 actor。
 
-- 状态：`machines: HashMap<machine_id, MachineConn>`、`devices: HashMap<device_id, DeviceConn>`、`subscriptions`、per-session `seq` 计数、per-session 近期 sealed 事件环形缓冲（R0 内存版「按 seq 补拉」，对齐 happier 的单调 seq 思路）。
-- 连接：`tokio::sync::mpsc`（内存双工，**无 socket**）。每个接入方持 `RelayHandle{ tx, rx }`。
-- 路由规则：machine 的 `PublishEvent/AnnounceSession` → 扇出给订阅 device 的 `Event/SessionList`；device 的 `SendCommand` → 按 `CommandTarget` 解析目标 machine（`Session` 经 `AnnounceSession` 建的 session→machine 索引，`Machine` 直接寻址）后转发；machine 的 admin reply 以 `EnvelopeKind::AdminReply` 经 `trace_id` 关联回发起 device；`Subscribe` → 先发当前快照（`MachineList`/`SessionList`）再流增量（对齐 `FixtureSessionSource`「先快照后增量」与 happier 的 update/ephemeral 分离）。
-- **路由器永不 match `Sealed` 内层**——证明内容不可见（content-agnostic）。
+- 状态：`machines/devices/subscriptions`、per-conversation `seq` 计数、per-conversation 近期事件环形缓冲（R0 内存版「按 seq 补拉」）、`conversation_id → machine_id` 与 `request_id → device` 路由索引（由 `AnnounceSession`/`SendCommand` 建立）。
+- 连接：`tokio::sync::mpsc`（内存双工，**无 socket**）。
+- 路由规则：读 `RemoteFrame.msg`（**控制面可读**）路由——`PublishEvent/AnnounceSession` 扇出给订阅 device；`SendCommand` 按 `CommandTarget` 解析目标 machine（Conversation→索引，Turn→其 conversation→machine，Machine→直接）转发；`AdminReply` 按 `in_reply_to`→发起 device 回送；`Subscribe` 先发快照再流增量。
+- **路由器只读控制面，永不解码 `DataEnvelope`**——这是「agent 内容不可见」的证明点（数据面 opaque，控制面可读）。
 
 **StdioMachineBridge（bridge.rs）**：把 spawn 的真实 `agentdeckd` 当 machine 接入，**不改 daemon**。
 
-- 复用 `agentdeck-cli` 的 daemon 定位思路 spawn `agentdeckd`，持 stdin/stdout。
-- machine→relay：读 daemon stdout 每行 JSONL（`ServerEvent` 或 admin `{"reply":...}`），原样字节包进 `Sealed::Plaintext`，据 `session_id`（ServerEvent 已带）发 `PublishEvent`；admin reply 走 `EnvelopeKind::AdminReply`。
-- relay→machine：收 `SendCommand`，解出原始 `ClientCommand` JSON 行写 daemon stdin。
-- 这是 R2 真实 remote mode 的 R0 替身，且作为 R2 in-daemon 实现的参照可复用。
+- machine→relay：读 daemon stdout 每行 JSONL。`ServerEvent` → 提取 `session_id`/`thread_id`，按 bridge 维护的映射解析 `conversation_id` 与 `turn_session_id`，原样字节包进 `DataEnvelope::Plaintext` 发 `PublishEvent`；admin `{"reply":...}` 行 → 发 `AdminReply{in_reply_to}`（见下 single-flight）。
+- relay→machine：收 `SendCommand`，据 `CommandTarget` + 内层解出的 `ClientCommand`（Conversation→SessionContinue、Turn→ActionDecision、Machine→admin）写 daemon stdin。
+- **admin reply single-flight（修订 R4）**：daemon admin reply 无 request id，故 bridge 对同一 machine 的 admin 命令**串行化**：维护 FIFO pending 队列，同一时刻至多一个在途 admin 命令，收到下一行 `{"reply":...}` 关联到队头，再据队头的 `request_id` 生成 `AdminReply`。会话级命令（SessionContinue/ActionDecision）不受此限（它们的回执走 `ServerEvent` 流）。R2 引入真实 reply envelope + request id 后可解除串行化。
 
-### 4.5 CLI remote 客户端（接口基线，最优先）
+### 4.5 CLI remote 命令面（接口基线）+ 单进程 smoke（评审修订 R3）
 
-`agentdeck-cli` 新增 `remote` 子命令组，是 R0 **最先落地**的部分，作为验证与接口基线：
+`agentdeck-cli remote` 子命令组是**语义接口基线**（冻结、跨 R0-R2 稳定，iOS `RelaySessionSource` 与测试都对齐它）：
 
 ```text
-agentdeck-cli remote --relay <endpoint> machines
-agentdeck-cli remote --relay <endpoint> sessions <machine_id>
-agentdeck-cli remote --relay <endpoint> watch <session_id>          # 流式打印
-agentdeck-cli remote --relay <endpoint> send <session_id> <text>
-agentdeck-cli remote --relay <endpoint> approve <session_id> <request_id>
-agentdeck-cli remote --relay <endpoint> deny <session_id> <request_id>
-agentdeck-cli remote --relay <endpoint> ping <machine_id>          # 机器级 admin 往返（T1 的 CLI 驱动）
+remote --relay <endpoint> machines
+remote --relay <endpoint> sessions <machine_id>
+remote --relay <endpoint> watch <conversation_id>          # 流式打印
+remote --relay <endpoint> send <conversation_id> <text>
+remote --relay <endpoint> approve <turn_session_id> <request_id>
+remote --relay <endpoint> deny <turn_session_id> <request_id>
+remote --relay <endpoint> ping <machine_id>                # 机器级 admin 往返
 ```
 
-- **endpoint 抽象**：R0 唯一支持 `fake:inproc`（进程内起 FakeRelay + `StdioMachineBridge` 到本地真实 daemon，或接合成 machine）；R1 追加 `ws://...`。命令面在 R0-R2 保持不变——这就是「接口基线」的含义：iOS `RelaySessionSource` 与集成测试都对齐这套命令语义。
-- 每条命令输出信封元数据（machine_id/session_id/seq/trace_id）+ 解出的内层内容，便于人工诊断三端链路。
-- 冻结点：`remote` 命令与 `MobileSessionSource` 方法的映射（见 §4.3 表）作为契约冻结，后续阶段只允许追加、不允许破坏语义。
+**可执行性更正**：这些独立子命令需要**长驻 relay endpoint** 才能跨进程共享状态。R0 不引入网络/socket，进程内 FakeRelay 状态不跨命令保留，故：
+
+- **R0 的可执行证明 = 单进程 `remote smoke`**：`agentdeck-cli remote smoke` 在一个进程里同时起 FakeRelay + `StdioMachineBridge`（接真实本地 daemon）+ device，按序驱动 `machines → sessions → watch → ping →（合成 machine 时）send/approve`，逐步打印信封元数据 + 解出内容 + trace_id。这是 R0 唯一保证可跑通的 CLI 路径。
+- **独立子命令**（`machines`/`watch`/`send`/…）语义在 R0 冻结为基线，但**独立可运行始于 R1**（`--relay ws://…` 长驻 endpoint）。R0 spec 不把「独立子命令跨进程跑通」列为验收项。
 
 ### 4.6 边界与不变量守护
 
-- **N1 中立性**：所有 remote 类型 Layer-A 中立（无 Codex/OpenAI/Anthropic/Claude 字样），扩 `neutrality_tests`。
-- **N6**：R0 用 mpsc 通道，不实现 remote `Transport`（那是 R1/R2），也**不削弱** `Transport` trait 形状；`transport_trait_remote_ready.rs` 保持绿。
-- **K9/N8**：relay/bridge 绝不读/存/转发 vendor token；bridge 只搬不透明 daemon I/O 字节；不建 `cc-meta/`。
+- **N1 中立性**：所有 remote 类型 Layer-A 中立（无 vendor 字样），扩 `neutrality_tests`。
+- **N6**：R0 用 mpsc 通道，不实现 remote `Transport`，也**不削弱** trait 形状；`transport_trait_remote_ready.rs` 保持绿。
+- **K9/N8**：relay/bridge 绝不读/存/转发 vendor token；bridge 只搬 opaque 数据面字节；不建 `cc-meta/`。
 - **K5**：R0 纯内存，不新增数据目录写入；daemon 诊断仍写 `~/Library/Application Support/AgentDeck/`。
 - **无 `net` feature**：R0 任何 crate 都不加 tokio `net`，编译层面强制「无网络」。
 - **schema 快照**：`agentdeck-protocol` schema 重生成纳入 `remote::*`，漂移测试随 `cargo test` 运行。
 
 ## 5. 构建顺序（CLI-first）
 
-按「CLI 最优先、作为接口基线」的决策，R0 实现顺序：
-
-1. **协议 remote 类型骨架**（envelope + Sealed + relay 控制协议 + fleet），能编译、能序列化，schema 快照先建。
-2. **CLI remote 客户端 + 最小 FakeRelay**：先让 `agentdeck-cli remote --relay fake:inproc machines/watch/...` 能跑起来，用最小 FakeRelay（可先接合成 machine）驱动，**冻结 §4.3 映射表为接口基线**。
-3. **StdioMachineBridge 接真实 daemon**：把 CLI 的 `send Ping/ProtocolVersion` 打到真实 `agentdeckd` 并经 relay 收回。
-4. **集成测试** `r0_composition.rs` 把上面的链路固化为断言（T1/T2/T3，见 §7）。
+1. **协议 remote 类型骨架**（frame + control + data + fleet），编译、序列化通过，schema 快照先建。（CLI 依赖这些类型，是薄前置。）
+2. **CLI `remote smoke`（单进程）+ 最小 FakeRelay**：先让 `agentdeck-cli remote smoke` 跑起来（可先接合成 machine），**冻结 §4.3 映射表为接口基线**。
+3. **StdioMachineBridge 接真实 daemon**：把 `remote smoke` 的 `ping` 打到真实 `agentdeckd` 并经 relay 收回（含 admin single-flight）。
+4. **集成测试** `r0_composition.rs` 固化链路为断言（T1/T2/T3，见 §7）；补 gated T4。
 5. **中立性 + schema 快照 + 文档收口**（含 §9 的 README 映射修订）。
 
-先有可人工驱动的 CLI，再用测试固化——CLI 既是最早的验证手段，又是 iOS 与测试共同对齐的接口面。
+先有可人工驱动的单进程 smoke，再用测试固化——smoke 既是最早验证手段，又是 iOS 与测试对齐的接口面。
 
 ## 6. 错误处理与可观测性
 
-- **失败码（R0 可达子集，常量化）**：`relay.machine.offline`、`remote.session.not_found`、`relay.envelope.bad_kind`（kind 与内层解码不匹配）。全集（`relay.auth.*`、`relay.envelope.decrypt_failed`、`remote.daemon.busy` 等）随 R1/R2 引入。
-- **trace_id**：每条 relay 路由消息都带；CLI/relay/（未来 daemon）三端可关联。
-- **日志边界**：relay 只记外层信封元数据与失败码，**禁止**输出 prompt/shell output/diff/路径片段/token-like 字符串。R0 用一个日志捕获测试或按构造断言这一点。
-- **断流语义**：R0 用内存环形缓冲支持晚订阅重放；真实断线重连（游标/背压）留到 R1 网络实现。
+- **失败码（R0 可达子集，常量化）**：`relay.machine.offline`、`remote.session.not_found`（含未知 conversation_id）、`relay.frame.bad_kind`（控制面解析失败）、`relay.data.bad_inner`（数据面内层解码失败，仅接收端遇到）。全集随 R1/R2。
+- **trace_id + request_id**：每条 `RemoteFrame` 带 `trace_id`（三端关联）；`SendCommand`/`AdminReply`/`CommandDelivered`/`Error` 用 `request_id`/`in_reply_to` 做可实现的请求-应答关联（修订 R4，解决 admin reply 无 id 的误配）。
+- **日志边界**：relay 只记控制面元数据与失败码，**禁止**输出数据面明文（prompt/shell/diff）或 token-like 串。R0 用日志捕获测试或按构造断言。
+- **断流语义**：R0 用内存环形缓冲支持晚订阅重放（键 conversation_id + seq）；真实断线重连（游标/背压）留到 R1。
 
 ## 7. 测试和验收标准
 
-### 集成测试（全部 ungated，进默认 `cargo test`）
+### 集成测试
 
-- **T1 admin 往返（真实 daemon）**：FakeRelay + 真实 `agentdeckd`(machine M1) + device D1。D1 发 `SendCommand{ target: Machine{M1}, sealed: Ping/ProtocolVersion/Selfcheck }`（机器级 admin，不需 vendor 登录），断言 daemon admin reply 以 `AdminReply` 信封经 `trace_id` 关联回到 D1、解码正确、与直连 stdio 基线语义一致；等价可用 `agentdeck-cli remote ping <machine_id>` 人工驱动。→ 证明真实 daemon 组合 + 双向路由。
-- **T2 会话流转发（合成 machine）**：合成 machine 发脚本化 `ServerEvent` 序列（`SessionStarted`→`SessionCapabilities`→`AgentItem`→`ActionRequest`→[device 发 `ActionDecision`]→`AgentItem`→`TurnComplete`），复用真实协议类型。device 订阅，断言有序收全、seq 单调、晚订阅第二 device 能重放缓冲序列。→ 证明 fleet 层转发 + 排序 + 补发，无需登录。
-- **T3 内容不可见**：喂路由器随机不透明 `Sealed::Plaintext`，断言仅凭外层元数据仍能路由。→ 证明加密接缝。
-- **schema/中立性**：protocol schema 快照纳入 `remote::*` 并同步；中立性测试断言 remote 类型无 vendor 字样。
+- **T1 admin 往返（真实 daemon，ungated）**：FakeRelay + 真实 `agentdeckd`(machine M1) + device D1。D1 发 `SendCommand{ request_id, target: Machine{M1}, data: Ping/ProtocolVersion/Selfcheck }`（不需 vendor 登录），断言 daemon admin reply 经 bridge single-flight → `AdminReply{in_reply_to=request_id}` → relay 回到 D1、解码正确、与直连 stdio 基线语义一致。并发两条同类 admin 命令断言各自 request_id 正确关联、不串。→ 证明真实 daemon 组合 + 双向路由 + single-flight 关联。
+- **T2 会话流转发 + 稳定身份（合成 machine，ungated）**：合成 machine 发脚本化流：turn A（`SessionStarted{session_id=S1, thread_id=T1}`→…→`ActionRequest`→[device 发 `SendCommand{Turn{S1}}` ActionDecision]→…→`TurnComplete`），随后 device 发 `SendCommand{Conversation{T1}}`（prompt），合成 machine 起 turn B（`SessionStarted{session_id=S2, thread_id=T1}`→`AgentItem`→`TurnComplete`）。device **订阅 `Events{conversation_id=T1}`**，断言：A、B 两个 turn 的事件都收到（**证明 prompt 触发新 turn_session_id 后 watcher 不丢流**）、seq 单调、`(conversation_id, turn_session_id)` 标注正确、晚订阅的第二 device 重放缓冲。→ 证明 fleet 转发 + 稳定身份 + 排序 + 补发。
+- **T3 数据面不可见 / 控制面可读**：断言路由器仅凭控制面（`RemoteFrame.msg` 的 target/subscription）路由，喂随机不透明 `DataEnvelope::Plaintext` 仍正确路由且**从不解码内层**；反证控制面必须可读（把控制消息也 opaque 会导致无法路由）。→ 证明分层正确。
+- **T4 真实会话全流穿透（gated，`AGENTDECK_E2E=1`）**：真实 `agentdeckd` 跑一次真实 Codex 或 CC 会话，device 订阅 conversation，断言 `SessionStarted→AgentItem 流→TurnComplete` 经 relay 完整穿透。默认 `cargo test` 跳过，对齐 AGENTS.md 门控 E2E 约定。
+- **schema/中立性（ungated）**：protocol schema 快照纳入 `remote::*` 并同步；中立性测试断言 remote 类型无 vendor 字样。
 
-### 验收标准（R0，母设计 §10 的子集）
+### 验收标准（R0）
 
-- `cargo test` 全绿，含 `r0_composition` + schema 漂移 + 中立性。
-- 第二个客户端经 relay 看到某 machine 广告的 session 与其流式 `ServerEvent`，有序；晚订阅者得到缓冲重放。
-- device→machine 命令（Ping/ProtocolVersion）经 relay 往返到**真实** `agentdeckd`。
-- 路由器可证明从不检视 `Sealed` 内层（内容不可见）。
-- relay 日志中不出现 prompt/shell/diff 明文或 token-like 串。
-- `agentdeck-cli remote --relay fake:inproc` 的 machines/watch/send 能人工跑通，打印经 relay 转发的 reply/事件 + 信封元数据。
-- `scripts/verify-agent-docs.sh` 通过；协议变更后 `cargo test` 与 schema 漂移测试通过；文档同步更新。
+- 默认 `cargo test` 全绿，含 T1/T2/T3 + schema 漂移 + 中立性。
+- 第二个客户端经 relay 看到某 machine 广告的 session 与其流式 `ServerEvent`（键 conversation_id）；prompt 触发的新 turn 事件不丢；晚订阅者得到缓冲重放。
+- device→machine 命令（Ping/ProtocolVersion）经 relay 往返到**真实** `agentdeckd`，并发同类命令正确关联。
+- 路由器可证明只读控制面、从不解码数据面内层。
+- relay 日志中不出现数据面明文或 token-like 串。
+- `agentdeck-cli remote smoke` 单进程跑通 machines/sessions/watch/ping（合成 machine 时含 send/approve），打印经 relay 转发的内容 + 信封元数据 + trace_id。
+- gated `AGENTDECK_E2E=1` 下 T4 通过（本地执行，需 codex/claude 登录）。
+- `scripts/verify-agent-docs.sh` 通过；协议变更后 schema 漂移测试通过；文档同步更新。
 
 ## 8. 后置项与开放问题
 
-R0 显式将以下决定为「后置」，并记录倾向以便后续复用：
-
-- **E2EE 库（R1 决定）**：倾向 daemon/relay 侧 Rust `crypto_box` + `chacha20poly1305`（对齐 happier 的 libsodium 语义），iOS 侧 CryptoKit `Curve25519` + `ChaChaPoly`，R1 做互操作验证。不手写密码学。
+- **E2EE 库（R1 决定）**：倾向 daemon/relay 侧 Rust `crypto_box` + `chacha20poly1305`（对齐 happier 的 libsodium 语义），iOS 侧 CryptoKit `Curve25519` + `ChaChaPoly`，R1 互操作验证。不手写密码学。数据面 `DataEnvelope::Encrypted` 落在这里。
 - **存储（R1）**：先 SQLite，公开托管前再评估 Postgres；R0 纯内存。
 - **APNs（R3+）**：R0 无，R3 用 app 内在线通知先闭环。
-- **配对安全（R2/R3 硬性要求）**：challenge nonce 必须服务端生成带 TTL（借鉴 happy issue #669 重放隐患教训），一开始就做对。
+- **配对安全（R2/R3 硬性要求）**：challenge nonce 必须服务端生成带 TTL（借鉴 happy issue #669 重放隐患教训）。
+- **真实 daemon 会话身份 bootstrap（R2）**：首个 turn 前 thread_id 未定时，conversation_id 如何 bootstrap（临时以首个 turn_session_id 占位、thread_id 到达后回填）。R0 合成 machine 绕开。
 - **macOS 是否也经 relay 接远端 machine**：后置，第一版 AppKit 仍优先本地 daemon。
 - **`resolveApproval` 的 `persist` 语义**：R0 默认 `false`，R2 device 侧补显式开关。
 
 ## 9. 阶段↔版本映射（含 README 修订）
 
-母设计用 R0-R4 阶段编号，README/unified-shell 用 v0.4+/v0.5 版本号，二者此前未对齐。本 spec 记录映射，并在 README/unified-shell 加一行交叉引用消歧：
+母设计用 R0-R4 阶段编号，README/unified-shell 用 v0.4+/v0.5 版本号，此前未对齐。本 spec 记录映射，并在 README/unified-shell 加一行交叉引用消歧：
 
 | Relay 阶段 | 内容 | 版本锚点 |
 |---|---|---|
-| R0（本 spec） | 契约 spike：RemoteEnvelope + fleet 协议 + 内存 relay + CLI 基线 | v0.5 前置铺垫 |
+| R0（本 spec） | 契约 spike：分层 remote frame + fleet 协议 + 稳定身份 + 内存 relay + CLI 基线 | v0.5 前置铺垫 |
 | R1 | Relay MVP（`agentdeck-relay` binary、WS、SQLite、E2EE 落地） | v0.5 |
-| R2 | agentdeckd remote mode（`--remote --relay-url`） | v0.5 |
+| R2 | agentdeckd remote mode（`--remote --relay-url`、身份 bootstrap、真实 reply envelope） | v0.5 |
 | R3 | iOS Mobile Companion MVP（`RelaySessionSource`、扫码配对） | v0.4+ 移动伴侣 |
 | R4 | Hosted / team mode 评估 | 后置 |
 
-README/unified-shell 的修订仅为文档一致性（在「v0.5 daemon 远程化」「v0.4+ 移动伴侣」处加「= Relay 母设计 R1/R2 / R3」的交叉引用），不改代码。
+README/unified-shell 的修订仅为文档一致性（在「v0.5 daemon 远程化」「v0.4+ 移动伴侣」处加「= Relay 母设计 R1/R2 / R3」交叉引用），不改代码。
 
 ## 10. 落地后文档更新清单
 
-- `AGENTS.md`：必读顺序补本 spec 与母设计的关系（若需要）。
-- `README.md` / `docs/plans/2026-06-30-unified-shell-v02-design.md`：§9 的版本映射交叉引用。
+- `README.md` / `docs/plans/2026-06-30-unified-shell-v02-design.md`：§9 版本映射交叉引用。
 - `docs/index.md`：登记本 spec。
-- `ARCHITECTURE.md`：R0 落地后如引入新不变量（如「relay 内容不可见」）再补；R0 本身不新增不变量，仅复用 N1/N6/K5/K9/N8。
-- 母设计 `2026-07-01-agentdeck-mobile-relay-design.md`：状态从「方向已确认」更新为「R0 落地中」。
+- 母设计 `2026-07-01-agentdeck-mobile-relay-design.md`：状态更新为「R0 落地中」，§6 `RemoteEnvelope` 标注被 R0 的控制面/数据面分层细化（`RemoteFrame`+`RelayControlMsg` / `DataEnvelope`）。
+- `ARCHITECTURE.md`：R0 落地后如引入新不变量（如「relay 控制面可读、数据面不可见」）再补；R0 本身不新增不变量，仅复用 N1/N6/K5/K9/N8。
