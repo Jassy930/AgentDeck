@@ -7,6 +7,7 @@ name = "agentdeck-cli"
 version = "0.1.0"
 dependencies = [
  "agentdeck-protocol",
+ "agentdeck-relay",
  "clap",
  "serde",
  "serde_json",

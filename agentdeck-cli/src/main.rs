@@ -2,6 +2,7 @@ mod client;
 mod commands;
 mod main_types;
 mod output;
+mod remote;
 mod transport;
 
 use agentdeck_protocol::{HistoryRequest, ThreadId};
@@ -58,6 +59,11 @@ enum Cmd {
     History {
         #[command(subcommand)]
         op: HistoryOp,
+    },
+    /// Remote relay 客户端（R0：仅 `smoke` 可执行；其余为接口基线占位）
+    Remote {
+        #[command(subcommand)]
+        op: RemoteOp,
     },
 }
 
@@ -179,6 +185,32 @@ enum HistoryOp {
     },
 }
 
+#[derive(Subcommand)]
+enum RemoteOp {
+    /// 单进程 R0 冒烟：内存 FakeRelay + 真实 daemon bridge + device 驱动
+    Smoke,
+    /// 列出机器（R1 relay endpoint 就绪后可独立运行）
+    Machines,
+    /// 列出某机器的会话
+    Sessions { machine_id: String },
+    /// 流式查看某 conversation
+    Watch { conversation_id: String },
+    /// 向 conversation 发 prompt
+    Send { conversation_id: String, text: String },
+    /// 批准某 turn 的审批
+    Approve {
+        turn_session_id: String,
+        request_id: String,
+    },
+    /// 拒绝某 turn 的审批
+    Deny {
+        turn_session_id: String,
+        request_id: String,
+    },
+    /// 机器级 admin 往返
+    Ping { machine_id: String },
+}
+
 // ── Main dispatcher ───────────────────────────────────────────────────────────
 
 fn run_sync(cli: &Cli) -> Result<(), CliError> {
@@ -255,6 +287,10 @@ fn run_sync(cli: &Cli) -> Result<(), CliError> {
             // Should not reach here in sync path
             unreachable!("session commands handled in async path")
         }
+        // Remote commands need async — handled below in main()
+        Cmd::Remote { .. } => {
+            unreachable!("remote commands handled in async path")
+        }
     }
 }
 
@@ -264,6 +300,26 @@ async fn main() {
     let pretty = cli.pretty;
     let profile = cli.profile.clone();
     let data_dir = cli.data_dir.clone();
+
+    // Remote commands have their own (non-CliError) exit contract — dispatch and
+    // exit here rather than folding into the `Result<(), CliError>` path below.
+    if let Cmd::Remote { op } = &cli.command {
+        let arg = match op {
+            RemoteOp::Smoke => remote::RemoteOpArg::Smoke,
+            RemoteOp::Machines => remote::RemoteOpArg::Machines,
+            RemoteOp::Sessions { .. } => remote::RemoteOpArg::Sessions,
+            RemoteOp::Watch { .. } => remote::RemoteOpArg::Watch,
+            RemoteOp::Send { .. } => remote::RemoteOpArg::Send,
+            RemoteOp::Approve { .. } => remote::RemoteOpArg::Approve,
+            RemoteOp::Deny { .. } => remote::RemoteOpArg::Deny,
+            RemoteOp::Ping { .. } => remote::RemoteOpArg::Ping,
+        };
+        let code = remote::run(arg, &profile, data_dir.as_deref()).await;
+        if code == std::process::ExitCode::SUCCESS {
+            return;
+        }
+        std::process::exit(1);
+    }
 
     let result: Result<(), CliError> = match &cli.command {
         Cmd::Session { op } => match op {
