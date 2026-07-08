@@ -9,8 +9,9 @@ pub mod data;
 pub mod fleet;
 pub mod frame;
 
-/// relay 线协议版本，独立于内层 `PROTOCOL_VERSION`。R0 草案 = 0。
-pub const RELAY_PROTOCOL_VERSION: u16 = 0;
+/// relay 线协议版本，独立于内层 `PROTOCOL_VERSION`。R0 草案 = 0；
+/// R1a：首个联网 wire-stable 版本 = 1。
+pub const RELAY_PROTOCOL_VERSION: u16 = 1;
 
 pub use control::{CommandTarget, RelayControlMsg, SubTarget};
 pub use data::DataEnvelope;
@@ -39,7 +40,7 @@ mod tests {
         );
         let json = serde_json::to_value(&frame).unwrap();
         // 控制面字段对 relay 明文可读：
-        assert_eq!(json["relayProtocolVersion"], 0);
+        assert_eq!(json["relayProtocolVersion"], 1);
         assert_eq!(json["from"]["role"], "device");
         assert_eq!(json["msg"]["msg"], "subscribe");
         assert_eq!(json["msg"]["target"]["kind"], "events");

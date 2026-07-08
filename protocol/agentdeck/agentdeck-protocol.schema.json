@@ -884,12 +884,7 @@
               "type": "integer"
             },
             "bytes": {
-              "items": {
-                "format": "uint8",
-                "minimum": 0.0,
-                "type": "integer"
-              },
-              "type": "array"
+              "type": "string"
             },
             "seal": {
               "enum": [
@@ -2226,12 +2221,7 @@
                   "type": "integer"
                 },
                 "bytes": {
-                  "items": {
-                    "format": "uint8",
-                    "minimum": 0.0,
-                    "type": "integer"
-                  },
-                  "type": "array"
+                  "type": "string"
                 },
                 "seal": {
                   "enum": [
@@ -2925,12 +2915,7 @@
                   "type": "integer"
                 },
                 "bytes": {
-                  "items": {
-                    "format": "uint8",
-                    "minimum": 0.0,
-                    "type": "integer"
-                  },
-                  "type": "array"
+                  "type": "string"
                 },
                 "seal": {
                   "enum": [
