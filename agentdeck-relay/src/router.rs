@@ -37,8 +37,24 @@ impl crate::relay_link::RelayLink for RelayClient {
     }
 }
 
+/// 连接身份中的角色（供 Task 5 授权检查、Task 9 server 鉴权使用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnRole {
+    Machine { machine_id: String },
+    Device,
+}
+
+/// 一个已建立连接的稳定身份：账号 + 设备/机器 + 角色。
+/// R1a 本任务只负责携带/存储；Task 5 才会据此做授权检查。
+#[derive(Debug, Clone)]
+pub struct ConnIdentity {
+    pub account_id: String,
+    pub device_id: String,
+    pub role: ConnRole,
+}
+
 enum CoreMsg {
-    Connect { id: ClientId, role: ClientRole, out: mpsc::Sender<RemoteFrame> },
+    Connect { id: ClientId, identity: ConnIdentity, out: mpsc::Sender<RemoteFrame> },
     Frame { id: ClientId, frame: RemoteFrame },
     Disconnect { id: ClientId },
 }
@@ -56,13 +72,31 @@ impl FakeRelay {
         FakeRelay { core_tx, next_id: Arc::new(AtomicU64::new(1)) }
     }
 
+    /// 便捷入口（内存测试/匿名 dev）：合成一个 dev-scope 身份。
     pub async fn connect(&self, role: ClientRole) -> RelayClient {
+        let identity = ConnIdentity {
+            account_id: "dev".into(),
+            device_id: match &role {
+                ClientRole::Device { device_id } => device_id.clone(),
+                ClientRole::Machine { machine_id } => machine_id.clone(),
+                ClientRole::Relay => "relay".into(),
+            },
+            role: match &role {
+                ClientRole::Machine { machine_id } => ConnRole::Machine { machine_id: machine_id.clone() },
+                _ => ConnRole::Device,
+            },
+        };
+        self.connect_with_identity(identity).await
+    }
+
+    /// 携带稳定身份接入（Task 9 server 用：真实鉴权解析出的 account/device/role）。
+    pub async fn connect_with_identity(&self, identity: ConnIdentity) -> RelayClient {
         let id = ClientId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let (to_relay_tx, mut to_relay_rx) = mpsc::channel::<RemoteFrame>(64);
         let (from_relay_tx, from_relay_rx) = mpsc::channel::<RemoteFrame>(64);
         let _ = self
             .core_tx
-            .send(CoreMsg::Connect { id, role, out: from_relay_tx })
+            .send(CoreMsg::Connect { id, identity, out: from_relay_tx })
             .await;
         let core_tx = self.core_tx.clone();
         tokio::spawn(async move {
@@ -77,10 +111,12 @@ impl FakeRelay {
     }
 }
 
-#[allow(dead_code)] // `role` 供 Task 4/5（按角色路由命令/事件）使用
 struct Conn {
-    role: ClientRole,
+    #[allow(dead_code)] // Task 5 授权检查读取；本任务只负责存储
+    identity: ConnIdentity,
     out: mpsc::Sender<RemoteFrame>,
+    #[allow(dead_code)] // R1b 补发对齐使用；本任务只在事件溢出时置位
+    lagged: bool,
 }
 
 struct MachineEntry {
@@ -101,14 +137,17 @@ struct Core {
     subs_machines: HashSet<ClientId>,
     subs_sessions: HashMap<String, HashSet<ClientId>>,
     subs_events: HashMap<String, HashSet<ClientId>>,
+    /// send_to 遇到满/已关闭的连接时延迟登记于此，避免在持有 conns 借用时直接
+    /// handle_disconnect（借用冲突）；由 run 循环在每条消息处理完后统一 drain。
+    disconnect_conns: Vec<ClientId>,
 }
 
 impl Core {
     async fn run(mut self, mut rx: mpsc::Receiver<CoreMsg>) {
         while let Some(msg) = rx.recv().await {
             match msg {
-                CoreMsg::Connect { id, role, out } => {
-                    self.conns.insert(id, Conn { role, out });
+                CoreMsg::Connect { id, identity, out } => {
+                    self.conns.insert(id, Conn { identity, out, lagged: false });
                 }
                 CoreMsg::Disconnect { id } => {
                     self.handle_disconnect(id).await;
@@ -117,14 +156,48 @@ impl Core {
                     self.handle_frame(id, frame).await;
                 }
             }
+            self.drain_disconnects().await;
         }
     }
 
-    /// relay → 指定连接 发一帧（from = Relay）。
-    async fn send_to(&self, id: ClientId, trace_id: &str, msg: RelayControlMsg) {
-        if let Some(conn) = self.conns.get(&id) {
+    /// 统一处理 send_to 延迟登记的断连（可能级联产生新的登记，故循环至空）。
+    async fn drain_disconnects(&mut self) {
+        while !self.disconnect_conns.is_empty() {
+            let batch: Vec<ClientId> = self.disconnect_conns.drain(..).collect();
+            for id in batch {
+                self.handle_disconnect(id).await;
+            }
+        }
+    }
+
+    /// relay → 指定连接 发一帧（from = Relay）。用 try_send 防止单个慢/卡死
+    /// 连接的出站队列写满时阻塞整个 Core 单任务循环（HOL）。
+    /// 溢出策略：控制/回执类（会丢关键状态）→ 该连接不可用，登记延迟断连；
+    /// 事件类（R1b 可补发）→ 丢帧并标记 lagged。
+    async fn send_to(&mut self, id: ClientId, trace_id: &str, msg: RelayControlMsg) {
+        let is_control = matches!(
+            msg,
+            RelayControlMsg::AdminReply { .. }
+                | RelayControlMsg::CommandDelivered { .. }
+                | RelayControlMsg::Error { .. }
+                | RelayControlMsg::MachineList { .. }
+                | RelayControlMsg::SessionList { .. }
+        );
+        if let Some(conn) = self.conns.get_mut(&id) {
             let frame = RemoteFrame::control(ClientRole::Relay, trace_id.to_string(), 0, msg);
-            let _ = conn.out.send(frame).await;
+            match conn.out.try_send(frame) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    if is_control {
+                        self.disconnect_conns.push(id);
+                    } else {
+                        conn.lagged = true;
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.disconnect_conns.push(id);
+                }
+            }
         }
     }
 
@@ -298,6 +371,28 @@ mod tests {
             is_online: true,
             last_heartbeat_ms: None,
         }
+    }
+
+    #[tokio::test]
+    async fn slow_consumer_does_not_block_other_connections() {
+        let relay = FakeRelay::start();
+        // D_slow 订阅 machines 但从不 recv（模拟慢/卡死连接）
+        let _d_slow = relay.connect(ClientRole::Device { device_id: "slow".into() }).await;
+        _d_slow.send(frame(ClientRole::Device { device_id: "slow".into() },
+            RelayControlMsg::Subscribe { target: SubTarget::Machines })).await;
+        // 灌满 D_slow 的出站队列（>64）：注册很多机器触发广播
+        for i in 0..200 {
+            let m = relay.connect(ClientRole::Machine { machine_id: format!("M{i}") }).await;
+            m.send(frame(ClientRole::Machine { machine_id: format!("M{i}") },
+                RelayControlMsg::RegisterMachine { machine: machine(&format!("M{i}")) })).await;
+        }
+        // 新 device 订阅仍能及时拿到快照（Core 未被 D_slow 卡死）
+        let mut d = relay.connect(ClientRole::Device { device_id: "fast".into() }).await;
+        d.send(frame(ClientRole::Device { device_id: "fast".into() },
+            RelayControlMsg::Subscribe { target: SubTarget::Machines })).await;
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), d.recv()).await
+            .expect("Core 被慢连接阻塞了（HOL）").expect("frame");
+        assert!(matches!(got.msg, RelayControlMsg::MachineList { .. }));
     }
 
     fn frame(from: ClientRole, msg: RelayControlMsg) -> RemoteFrame {
