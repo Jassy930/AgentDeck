@@ -22,8 +22,6 @@ pub enum WsError {
     Io(String),
     #[error("invalid frame: {0}")]
     InvalidFrame(String),
-    #[error("closed")]
-    Closed,
 }
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
