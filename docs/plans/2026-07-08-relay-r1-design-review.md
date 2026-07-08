@@ -112,4 +112,21 @@
 
 **建议下一步**：
 - 若用户认可本评审的方向 → 先按 §3 订正母设计 + R0 文档的漂移/矛盾项（G3/G4/G5/G6/G9/G11/G13/G15 等，低成本消歧），再以本文的决策表为输入，走 R0 同款「头脑风暴 → 设计文档（含代码评审修订）→ 实现计划 → subagent 驱动执行」流程做 R1。
-- R1 体量明显大于 R0，建议正式设计时进一步把 R1 切成可独立验收的子切片（如 R1a 传输+鉴权骨架、R1b 持久化+router 健壮化、R1c Encrypted 格式冻结+seal 策略），每片一份 spec+plan。
+- R1 体量明显大于 R0，建议正式设计时进一步把 R1 切成可独立验收的子切片（如 R1a 传输+鉴权骨架、R1b 持久化+router 健壮化、R1c E2EE 真加解密），每片一份 spec+plan。
+
+## 8. 决策记录（2026-07-08 用户拍板）
+
+进入正式 R1 设计前，用户对关键决策的拍板结果，作为 R1 设计的直接输入：
+
+| 决策 | 拍板 | vs 评审推荐 | 连带影响 |
+|---|---|---|---|
+| **D6 鉴权范围** | **A 最小但完整骨架** | = 推荐 | R1 落 WS 握手 Bearer + 服务端派生角色 + account scope + device credential 签发/撤销（存哈希）+ REST challenge-response（服务端 CSPRNG nonce+TTL+单次消费）；QR 扫码 UX → R3；daemon-as-machine → R2 |
+| **D7 E2EE** | **B R1 就上真 E2EE** | **≠ 推荐（A 是分期）** | 用户要 relay 从首个联网版本起**结构上真零知识**（只见密文）。连带：① canonical 密码学从建议升为**强制**（IETF ChaCha20-Poly1305 12B nonce + X25519 ECDH + HKDF；**禁 crypto_box NaCl**；R1 定跨语言测试向量）；② 配对（D6）**同时登记 sign(身份)+box(E2EE) 双公钥**；③ **机器侧密钥托管**是 R1 新增子问题（bridge keyfile 临时 → R2 daemon remote-mode）；④ iOS 跨平台互操作验证仍落 R3（R1 只能验 Rust↔Rust）；⑤ 正面副作用：加密事件可安全落盘（利好 D8） |
+| **D8 存储** | **A 纯 SQLite，加密事件也落盘** | = 推荐 | SQLite(WAL) 存身份/会话目录/**seq 高水位**/凭证/revocation + 加密离线事件队列；连接态全内存；rusqlite + 专用 Store 任务 + HiLo seq 预留区间；**persist-before-deliver** 保 seq 不回退 |
+| **D5 net 拓扑** | **A 拆 client crate** | = 推荐 | 新建 `agentdeck-relay-client`(WsTransport+WsRelayClient, tungstenite+net)；`agentdeck-relay`=服务端(axum+net)；CLI(R1)/daemon-remote(R2) 只依赖 client；daemon 无 net 至 R2；补 CI guard 断言 agentdeckd 无 tokio net |
+| **D3 服务端抽象** | **A 另立抽象 + RelayLink 层** | = 推荐 | relay 服务端=accept+per-conn actor（不碰 Transport trait）；Transport 留客户端字节层；新增 RemoteFrame 类型的 RelayLink/WsRelayClient，内存 RelayClient 与 WsRelayClient 共用；N6 守护测试不动、保持绿 |
+| **D2 TLS** | **A 可选 rustls 进程内 wss** | = 推荐 | dev 默认 ws loopback；生产可选 rustls feature 终结 wss（用户给 cert/key）；反代作备选；满足 iOS ATS 与公网验收 |
+
+**采纳的工程默认（无异议直接采用）**：D1 axum(server)+tokio-tungstenite(client)；D4 `DataEnvelope` 字节字段 base64 serde + 一条 RemoteFrame = 一条 WS text 帧 + `max_message_size`；D9 router 健壮化全套（per-conn 写任务 + 有界队列 + `try_send` 溢出策略；Ack 驱动 conv_buffer trim + 上界 + RetireSession 级联清；AnnounceSession upsert 去重；req_origin TTL + disconnect 清理；AdminReply 校验回复者=目标 machine + RegisterMachine 凭证/machine_id 一致；bridge 写失败不置 inflight、回错误码、下线；CommandDelivered = enqueued-to-machine；不引 expectedVersion）；D10 RELAY_PROTOCOL_VERSION 0→1 + 握手期版本/seal 能力协商；D11 测试分层（内存确定性逻辑测 + loopback+ephemeral WS 适配器测 + tokio test-util paused time；新增 T5 WS 传输冒烟；T4 真实会话穿透留 R2；CLI smoke 支持 `--relay ws://`；补 daemon-no-net guard）；D12 relay binary + 配置（`--bind` 默认 127.0.0.1、storage、log、可选 TLS、`AGENTDECK_RELAY_*` env + dotenvy）+ tracing + `DataEnvelope`/`AuthContext` 脱敏 Debug + 哨兵-token 日志脱敏测试 + Docker + `relay --selfcheck` + 错误码集中为类型化注册表 + AGENTS.md 验证入口。
+
+**R1 范围结论**：D6=A + D7=B 使 R1 = **「可安全联网 + 结构真零知识的 relay MVP」**，显著大于母设计 §9 字面。建议正式设计切成子片：**R1a**（传输 axum/tungstenite + WS 握手鉴权骨架 + account scope）、**R1b**（SQLite 持久化 + router 健壮化 + Ack/seq/背压）、**R1c**（E2EE：canonical 密码学 + 配对双公钥登记 + 真加解密 + 机器侧密钥托管 + seal 策略），每片一份 spec+plan，按 R0 同款「头脑风暴 → 设计（含代码评审修订）→ 计划 → subagent 驱动执行」推进。
