@@ -231,30 +231,61 @@ impl Core {
         self.machines.values().map(|m| m.descriptor.clone()).collect()
     }
 
+    /// 取连接当前身份的 owned 克隆（借用干净：结束对 `self.conns` 的借用后，
+    /// 调用方可安全地再对 `&mut self` 调用 `send_to`/`deny`）。
+    fn identity_of(&self, id: ClientId) -> Option<ConnIdentity> {
+        self.conns.get(&id).map(|c| c.identity.clone())
+    }
+
+    /// 授权检查失败时的统一拒绝：发一条 `Error` 帧给发起连接。
+    async fn deny(
+        &mut self,
+        id: ClientId,
+        trace_id: &str,
+        code: &'static str,
+        message: impl Into<String>,
+        in_reply_to: Option<String>,
+    ) {
+        self.send_to(
+            id,
+            trace_id,
+            RelayControlMsg::Error { code: code.into(), message: message.into(), in_reply_to },
+        )
+        .await;
+    }
+
+    /// 该身份是否是 `machine_id` 对应的 machine 连接本身。
+    fn owns_machine(&self, identity: &ConnIdentity, machine_id: &str) -> bool {
+        matches!(&identity.role, ConnRole::Machine { machine_id: m } if m == machine_id)
+    }
+
+    /// 该身份是否拥有 `conversation_id`（即是否是曾 `AnnounceSession` 挂载该会话的 machine）。
+    /// 未 announce 的会话 fail-closed（返回 false）——防止 Device/其它 machine 伪造事件或清理映射。
+    fn owns_conversation(&self, identity: &ConnIdentity, conversation_id: &str) -> bool {
+        match self.conv_machine.get(conversation_id) {
+            Some(machine_id) => self.owns_machine(identity, machine_id),
+            None => false,
+        }
+    }
+
     async fn handle_frame(&mut self, id: ClientId, frame: RemoteFrame) {
         let trace = frame.trace_id.clone();
         match frame.msg {
             RelayControlMsg::RegisterMachine { machine } => {
-                let identity = match self.conns.get(&id) {
-                    Some(c) => c.identity.clone(),
+                let identity = match self.identity_of(id) {
+                    Some(i) => i,
                     None => return,
                 };
-                let authorized = match &identity.role {
-                    ConnRole::Machine { machine_id } => *machine_id == machine.machine_id,
-                    ConnRole::Device => false,
-                };
-                if !authorized {
-                    self.send_to(
+                if !self.owns_machine(&identity, &machine.machine_id) {
+                    self.deny(
                         id,
                         &trace,
-                        RelayControlMsg::Error {
-                            code: failure::MACHINE_IDENTITY_CONFLICT.into(),
-                            message: format!(
-                                "connection identity does not authorize machine_id {}",
-                                machine.machine_id
-                            ),
-                            in_reply_to: None,
-                        },
+                        failure::MACHINE_IDENTITY_CONFLICT,
+                        format!(
+                            "connection identity does not authorize machine_id {}",
+                            machine.machine_id
+                        ),
+                        None,
                     )
                     .await;
                     return;
@@ -278,26 +309,20 @@ impl Core {
                 self.send_to(id, &trace, RelayControlMsg::MachineList { machines: list }).await;
             }
             RelayControlMsg::AnnounceSession { session } => {
-                let identity = match self.conns.get(&id) {
-                    Some(c) => c.identity.clone(),
+                let identity = match self.identity_of(id) {
+                    Some(i) => i,
                     None => return,
                 };
-                let authorized = match &identity.role {
-                    ConnRole::Machine { machine_id } => *machine_id == session.machine_id,
-                    ConnRole::Device => false,
-                };
-                if !authorized {
-                    self.send_to(
+                if !self.owns_machine(&identity, &session.machine_id) {
+                    self.deny(
                         id,
                         &trace,
-                        RelayControlMsg::Error {
-                            code: failure::MACHINE_IDENTITY_CONFLICT.into(),
-                            message: format!(
-                                "connection identity does not authorize machine_id {}",
-                                session.machine_id
-                            ),
-                            in_reply_to: None,
-                        },
+                        failure::MACHINE_IDENTITY_CONFLICT,
+                        format!(
+                            "connection identity does not authorize machine_id {}",
+                            session.machine_id
+                        ),
+                        None,
                     )
                     .await;
                     return;
@@ -313,26 +338,18 @@ impl Core {
                 }
             }
             RelayControlMsg::RetireSession { conversation_id } => {
-                let identity = match self.conns.get(&id) {
-                    Some(c) => c.identity.clone(),
+                let identity = match self.identity_of(id) {
+                    Some(i) => i,
                     None => return,
                 };
-                let owner = self.conv_machine.get(&conversation_id).cloned();
-                let authorized = match (&identity.role, &owner) {
-                    (ConnRole::Machine { machine_id }, Some(owner_machine)) => machine_id == owner_machine,
-                    _ => false,
-                };
-                if !authorized {
-                    self.send_to(
+                // 未 announce 的会话 fail-closed——防止伪造 RetireSession 清理他人映射（DoS）。
+                if !self.owns_conversation(&identity, &conversation_id) {
+                    self.deny(
                         id,
                         &trace,
-                        RelayControlMsg::Error {
-                            code: failure::AUTH_FORBIDDEN.into(),
-                            message: format!(
-                                "connection does not own conversation {conversation_id}"
-                            ),
-                            in_reply_to: None,
-                        },
+                        failure::AUTH_FORBIDDEN,
+                        format!("connection does not own conversation {conversation_id}"),
+                        None,
                     )
                     .await;
                     return;
@@ -340,26 +357,17 @@ impl Core {
                 self.conv_machine.remove(&conversation_id);
             }
             RelayControlMsg::PublishEvent { conversation_id, turn_session_id, seq: _, data } => {
-                let identity = match self.conns.get(&id) {
-                    Some(c) => c.identity.clone(),
+                let identity = match self.identity_of(id) {
+                    Some(i) => i,
                     None => return,
                 };
-                let owner = self.conv_machine.get(&conversation_id).cloned();
-                let authorized = match (&identity.role, &owner) {
-                    (ConnRole::Machine { machine_id }, Some(owner_machine)) => machine_id == owner_machine,
-                    _ => false,
-                };
-                if !authorized {
-                    self.send_to(
+                if !self.owns_conversation(&identity, &conversation_id) {
+                    self.deny(
                         id,
                         &trace,
-                        RelayControlMsg::Error {
-                            code: failure::AUTH_FORBIDDEN.into(),
-                            message: format!(
-                                "connection does not own conversation {conversation_id}"
-                            ),
-                            in_reply_to: None,
-                        },
+                        failure::AUTH_FORBIDDEN,
+                        format!("connection does not own conversation {conversation_id}"),
+                        None,
                     )
                     .await;
                     return;
@@ -387,6 +395,7 @@ impl Core {
             RelayControlMsg::Subscribe { target: SubTarget::Sessions { machine_id } } => {
                 let my_account = self.conns.get(&id).map(|c| c.identity.account_id.clone());
                 let target_account = self.machines.get(&machine_id).map(|m| m.account_id.clone());
+                // target_account 为 None（machine 未注册）时 fail-open：R1a 单账户下无法区分「跨账户」与「目标未注册」。
                 if let (Some(mine), Some(theirs)) = (&my_account, &target_account) {
                     if mine != theirs {
                         self.send_to(
@@ -507,9 +516,9 @@ impl Core {
             }
             RelayControlMsg::AdminReply { in_reply_to, data } => {
                 if let Some(req) = self.req_origin.get(&in_reply_to).cloned() {
-                    let is_target = match self.conns.get(&id).map(|c| c.identity.role.clone()) {
-                        Some(ConnRole::Machine { machine_id }) => machine_id == req.target_machine,
-                        _ => false,
+                    let is_target = match self.identity_of(id) {
+                        Some(identity) => self.owns_machine(&identity, &req.target_machine),
+                        None => false,
                     };
                     if is_target {
                         self.send_to(
@@ -520,16 +529,14 @@ impl Core {
                         .await;
                         self.req_origin.remove(&in_reply_to);
                     } else {
-                        self.send_to(
+                        self.deny(
                             id,
                             &trace,
-                            RelayControlMsg::Error {
-                                code: failure::REPLY_UNAUTHORIZED.into(),
-                                message: format!(
-                                    "connection is not the target machine for request {in_reply_to}"
-                                ),
-                                in_reply_to: Some(in_reply_to),
-                            },
+                            failure::REPLY_UNAUTHORIZED,
+                            format!(
+                                "connection is not the target machine for request {in_reply_to}"
+                            ),
+                            Some(in_reply_to),
                         )
                         .await;
                     }
