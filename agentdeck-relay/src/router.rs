@@ -278,6 +278,30 @@ impl Core {
                 self.send_to(id, &trace, RelayControlMsg::MachineList { machines: list }).await;
             }
             RelayControlMsg::AnnounceSession { session } => {
+                let identity = match self.conns.get(&id) {
+                    Some(c) => c.identity.clone(),
+                    None => return,
+                };
+                let authorized = match &identity.role {
+                    ConnRole::Machine { machine_id } => *machine_id == session.machine_id,
+                    ConnRole::Device => false,
+                };
+                if !authorized {
+                    self.send_to(
+                        id,
+                        &trace,
+                        RelayControlMsg::Error {
+                            code: failure::MACHINE_IDENTITY_CONFLICT.into(),
+                            message: format!(
+                                "connection identity does not authorize machine_id {}",
+                                session.machine_id
+                            ),
+                            in_reply_to: None,
+                        },
+                    )
+                    .await;
+                    return;
+                }
                 let mid = session.machine_id.clone();
                 self.conv_machine.insert(session.conversation_id.clone(), mid.clone());
                 self.sessions.entry(mid.clone()).or_default().push(session);
@@ -289,9 +313,57 @@ impl Core {
                 }
             }
             RelayControlMsg::RetireSession { conversation_id } => {
+                let identity = match self.conns.get(&id) {
+                    Some(c) => c.identity.clone(),
+                    None => return,
+                };
+                let owner = self.conv_machine.get(&conversation_id).cloned();
+                let authorized = match (&identity.role, &owner) {
+                    (ConnRole::Machine { machine_id }, Some(owner_machine)) => machine_id == owner_machine,
+                    _ => false,
+                };
+                if !authorized {
+                    self.send_to(
+                        id,
+                        &trace,
+                        RelayControlMsg::Error {
+                            code: failure::AUTH_FORBIDDEN.into(),
+                            message: format!(
+                                "connection does not own conversation {conversation_id}"
+                            ),
+                            in_reply_to: None,
+                        },
+                    )
+                    .await;
+                    return;
+                }
                 self.conv_machine.remove(&conversation_id);
             }
             RelayControlMsg::PublishEvent { conversation_id, turn_session_id, seq: _, data } => {
+                let identity = match self.conns.get(&id) {
+                    Some(c) => c.identity.clone(),
+                    None => return,
+                };
+                let owner = self.conv_machine.get(&conversation_id).cloned();
+                let authorized = match (&identity.role, &owner) {
+                    (ConnRole::Machine { machine_id }, Some(owner_machine)) => machine_id == owner_machine,
+                    _ => false,
+                };
+                if !authorized {
+                    self.send_to(
+                        id,
+                        &trace,
+                        RelayControlMsg::Error {
+                            code: failure::AUTH_FORBIDDEN.into(),
+                            message: format!(
+                                "connection does not own conversation {conversation_id}"
+                            ),
+                            in_reply_to: None,
+                        },
+                    )
+                    .await;
+                    return;
+                }
                 let seq = {
                     let s = self.conv_seq.entry(conversation_id.clone()).or_insert(0);
                     let cur = *s;
@@ -933,5 +1005,168 @@ mod tests {
                 other => panic!("unexpected {other:?}"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn device_cannot_announce_or_publish() {
+        let relay = FakeRelay::start();
+        let mut d = relay
+            .connect_with_identity(ConnIdentity {
+                account_id: "acc".into(),
+                device_id: "d1".into(),
+                role: ConnRole::Device,
+            })
+            .await;
+
+        // Device 冒充 machine 挂会话——推送路径必须先经身份门，不能自报 machine_id
+        d.send(RemoteFrame::control(
+            ClientRole::Device { device_id: "d1".into() },
+            "t".into(),
+            0,
+            RelayControlMsg::AnnounceSession { session: session("C1", "M1") },
+        ))
+        .await;
+        let e1 = recv_until_error(&mut d).await;
+        assert_eq!(e1, agentdeck_protocol::remote::failure::MACHINE_IDENTITY_CONFLICT);
+
+        // Device 冒充 machine 发布事件——同样必须被身份门拒绝（即便 conversation 不存在）
+        d.send(RemoteFrame::control(
+            ClientRole::Device { device_id: "d1".into() },
+            "t".into(),
+            0,
+            RelayControlMsg::PublishEvent {
+                conversation_id: "C1".into(),
+                turn_session_id: "S1".into(),
+                seq: 0,
+                data: DataEnvelope::plaintext(&"forged").unwrap(),
+            },
+        ))
+        .await;
+        let e2 = recv_until_error(&mut d).await;
+        assert_eq!(e2, agentdeck_protocol::remote::failure::AUTH_FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn machine_cannot_publish_to_others_conversation() {
+        let relay = FakeRelay::start();
+        let m1 = relay
+            .connect_with_identity(ConnIdentity {
+                account_id: "acc".into(),
+                device_id: "m1".into(),
+                role: ConnRole::Machine { machine_id: "M1".into() },
+            })
+            .await;
+        m1.send(mframe("M1", RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        m1.send(mframe("M1", RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+
+        let mut m2 = relay
+            .connect_with_identity(ConnIdentity {
+                account_id: "acc".into(),
+                device_id: "m2".into(),
+                role: ConnRole::Machine { machine_id: "M2".into() },
+            })
+            .await;
+
+        let mut d1 = relay
+            .connect_with_identity(ConnIdentity {
+                account_id: "acc".into(),
+                device_id: "d1".into(),
+                role: ConnRole::Device,
+            })
+            .await;
+        d1.send(RemoteFrame::control(
+            ClientRole::Device { device_id: "d1".into() },
+            "t".into(),
+            0,
+            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into() } },
+        ))
+        .await;
+
+        // M2 伪造 PublishEvent 冒充 M1 拥有的 conversation C1（turn_session_id 用可辨识的 evil 标记）
+        m2.send(mframe(
+            "M2",
+            RelayControlMsg::PublishEvent {
+                conversation_id: "C1".into(),
+                turn_session_id: "S-evil".into(),
+                seq: 0,
+                data: DataEnvelope::plaintext(&"forged").unwrap(),
+            },
+        ))
+        .await;
+        let e = recv_until_error(&mut m2).await;
+        assert_eq!(e, agentdeck_protocol::remote::failure::AUTH_FORBIDDEN);
+
+        // M1（真正拥有者）随后发布真实事件
+        m1.send(mframe(
+            "M1",
+            RelayControlMsg::PublishEvent {
+                conversation_id: "C1".into(),
+                turn_session_id: "S1".into(),
+                seq: 0,
+                data: DataEnvelope::plaintext(&"real").unwrap(),
+            },
+        ))
+        .await;
+
+        // D1 只应收到 M1 的真实事件；若伪造事件未被拒绝，会先收到 turn=S-evil 的事件导致断言失败
+        let (conv, turn, seq) = recv_event(&mut d1).await;
+        assert_eq!((conv.as_str(), turn.as_str(), seq), ("C1", "S1", 0));
+    }
+
+    #[tokio::test]
+    async fn non_owner_cannot_retire() {
+        let relay = FakeRelay::start();
+        let m1 = relay
+            .connect_with_identity(ConnIdentity {
+                account_id: "acc".into(),
+                device_id: "m1".into(),
+                role: ConnRole::Machine { machine_id: "M1".into() },
+            })
+            .await;
+        m1.send(mframe("M1", RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        m1.send(mframe("M1", RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+
+        let mut m2 = relay
+            .connect_with_identity(ConnIdentity {
+                account_id: "acc".into(),
+                device_id: "m2".into(),
+                role: ConnRole::Machine { machine_id: "M2".into() },
+            })
+            .await;
+
+        // M2 试图 retire M1 拥有的 conversation C1（DoS 尝试：移除他人会话映射）
+        m2.send(mframe("M2", RelayControlMsg::RetireSession { conversation_id: "C1".into() })).await;
+        let e = recv_until_error(&mut m2).await;
+        assert_eq!(e, agentdeck_protocol::remote::failure::AUTH_FORBIDDEN);
+
+        // 映射未被移除的见证：M1 随后仍能正常发布事件到 C1
+        // （若映射已被误删，PublishEvent 会因 owner=None 被身份门拒绝）
+        m1.send(mframe(
+            "M1",
+            RelayControlMsg::PublishEvent {
+                conversation_id: "C1".into(),
+                turn_session_id: "S1".into(),
+                seq: 0,
+                data: DataEnvelope::plaintext(&"still-owned").unwrap(),
+            },
+        ))
+        .await;
+        let mut check = relay
+            .connect_with_identity(ConnIdentity {
+                account_id: "acc".into(),
+                device_id: "checker".into(),
+                role: ConnRole::Device,
+            })
+            .await;
+        check.send(RemoteFrame::control(
+            ClientRole::Device { device_id: "checker".into() },
+            "t".into(),
+            0,
+            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into() } },
+        ))
+        .await;
+        let (conv, turn, _seq) = recv_event(&mut check).await;
+        assert_eq!(conv, "C1");
+        assert_eq!(turn, "S1");
     }
 }
