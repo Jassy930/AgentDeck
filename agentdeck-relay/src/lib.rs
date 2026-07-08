@@ -3,17 +3,21 @@
 //!
 //! 控制面（RelayControlMsg）relay 可读用于路由；数据面（DataEnvelope）不可见。
 
-// auth 的公开面在 Task 6 尚无调用方（server 层由 Task 9 引入并消费）；
-// 整个模块（数据模型/密码学/enroll 纯函数）此刻只被自身单测使用。
+// auth 的 store 子模块起本 task 起需要对外可见（main.rs 二进制 crate 构造
+// `InMemoryRelayStore` 并传给 `server::serve`）；其余子模块（crypto/enroll）
+// 仍是 pub(crate)，只供 crate 内部（server 层）使用。整个模块在 default（无
+// server feature）构建下仍只被自身单测使用，故保留 dead_code 静默。
 #[allow(dead_code)]
-mod auth;
+pub mod auth;
 mod bridge;
-// config 的公开面在 Task 8 尚无调用方（server 层由 Task 9 引入并消费 RelayConfig）；
-// 此刻只被自身单测使用。
+// config 的公开面起本 task 起需要对外可见（main.rs 构造 `RelayConfig`）；
+// 在 default（无 server feature）构建下仍只被自身单测使用，保留 dead_code 静默。
 #[allow(dead_code)]
-mod config;
+pub mod config;
 mod relay_link;
 mod router;
+#[cfg(feature = "server")]
+pub mod server;
 
 pub use bridge::StdioMachineBridge;
 pub use relay_link::RelayLink;

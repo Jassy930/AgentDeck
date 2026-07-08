@@ -76,6 +76,13 @@ struct RawArgs {
 
     #[arg(long)]
     log_level: Option<String>,
+
+    /// `agentdeck-relay` 二进制（main.rs，Task 9）的 `--selfcheck` 标志——本模块
+    /// 不消费它（不映射进 `RelayConfig` 任何字段），只声明它以便 clap 不把它当
+    /// unknown argument 拒绝解析；真正的 selfcheck 分支逻辑在 main.rs。
+    #[arg(long)]
+    #[allow(dead_code)]
+    selfcheck: bool,
 }
 
 impl RelayConfig {

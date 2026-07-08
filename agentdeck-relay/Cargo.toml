@@ -21,3 +21,19 @@ rand_core = "0.6"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
+axum = { version = "0.8", features = ["ws"], optional = true }
+futures-util = { version = "0.3", optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+rustls = { version = "0.23", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+
+[features]
+default = []
+server = ["dep:axum", "dep:futures-util", "dep:tracing", "dep:tracing-subscriber", "tokio/net", "tokio/rt-multi-thread"]
+tls = ["server", "dep:rustls", "dep:tokio-rustls"]
+
+[[bin]]
+name = "agentdeck-relay"
+path = "src/main.rs"
+required-features = ["server"]

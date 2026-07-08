@@ -44,13 +44,19 @@ pub(crate) trait RelayStore {
     fn create_account(&mut self, account: Account);
     fn put_device(&mut self, device: Device);
     fn device(&self, device_id: &str) -> Option<&Device>;
+    /// WS 握手鉴权用：客户端只携带 bearer credential（非 device_id），需要反查
+    /// 命中的 `Device`。`InMemoryRelayStore` 未维护额外反向索引，线性扫描
+    /// `devices`——内存 fake relay 场景设备规模小，可接受。
+    fn device_by_credential_hash(&self, credential_hash: &str) -> Option<&Device>;
     fn account_count(&self) -> usize;
     /// Task 9 起用于设备撤销流程；本 task 无消费方，靠 crate 顶层 `#[allow(dead_code)]` 静默。
     fn mark_revoked(&mut self, device_id: &str);
 }
 
+/// 起 Task 9 起为 `pub`——`agentdeck-relay` 二进制（main.rs，独立 crate）需要
+/// 直接构造它并传给 `server::serve`。字段仍私有，只能通过 `Default` 构造。
 #[derive(Debug, Default)]
-pub(crate) struct InMemoryRelayStore {
+pub struct InMemoryRelayStore {
     challenges: HashMap<String, Challenge>,
     account: Option<Account>,
     devices: HashMap<String, Device>,
@@ -87,6 +93,10 @@ impl RelayStore for InMemoryRelayStore {
 
     fn device(&self, device_id: &str) -> Option<&Device> {
         self.devices.get(device_id)
+    }
+
+    fn device_by_credential_hash(&self, credential_hash: &str) -> Option<&Device> {
+        self.devices.values().find(|d| d.credential_hash == credential_hash)
     }
 
     fn account_count(&self) -> usize {
