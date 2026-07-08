@@ -37,3 +37,12 @@ tls = ["server", "dep:rustls", "dep:tokio-rustls"]
 name = "agentdeck-relay"
 path = "src/main.rs"
 required-features = ["server"]
+
+[dev-dependencies]
+# R1a Task 10 e2e（tests/r1a_ws_e2e.rs，`#[cfg(feature = "server")]`）：真 loopback
+# WS 客户端 + 阻塞 REST enroll 客户端。ed25519-dalek/base64/serde_json/rand 已在
+# `[dependencies]`（对 `tests/*.rs` 同样可见），无需在此重复声明；
+# tracing-subscriber 是 `[dependencies]` 里的 optional dep，`--features server`
+# 编译本测试文件时已随 feature 一并可见，同理无需重复声明。
+agentdeck-relay-client = { path = "../agentdeck-relay-client" }
+ureq = { version = "2", features = ["json"] }
