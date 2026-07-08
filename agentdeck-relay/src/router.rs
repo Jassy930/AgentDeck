@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use agentdeck_protocol::remote::{
-    ClientRole, CommandTarget, MachineDescriptor, RelayControlMsg, RemoteFrame, SessionDescriptor,
-    SubTarget,
+    failure, ClientRole, CommandTarget, MachineDescriptor, RelayControlMsg, RemoteFrame,
+    SessionDescriptor, SubTarget,
 };
 use tokio::sync::mpsc;
 
@@ -57,6 +57,8 @@ enum CoreMsg {
     Connect { id: ClientId, identity: ConnIdentity, out: mpsc::Sender<RemoteFrame> },
     Frame { id: ClientId, frame: RemoteFrame },
     Disconnect { id: ClientId },
+    /// 撤销一个设备/机器身份：断开所有 `identity.device_id == device_id` 的活连接。
+    Revoke { device_id: String },
 }
 
 /// 内存内容不可见转发器（有状态）。
@@ -109,10 +111,15 @@ impl FakeRelay {
         });
         RelayClient { tx: to_relay_tx, rx: from_relay_rx }
     }
+
+    /// 撤销一个设备/机器身份（Task 9 server 收到 `RelayStore` 的 revoked 事件时调用）：
+    /// Core 断开所有该 `device_id` 的活连接；后续同 credential 的新连接由鉴权层拒绝。
+    pub async fn revoke(&self, device_id: String) {
+        let _ = self.core_tx.send(CoreMsg::Revoke { device_id }).await;
+    }
 }
 
 struct Conn {
-    #[allow(dead_code)] // Task 5 授权检查读取；本任务只负责存储
     identity: ConnIdentity,
     out: mpsc::Sender<RemoteFrame>,
     #[allow(dead_code)] // R1b 补发对齐使用；本任务只在事件溢出时置位
@@ -122,6 +129,14 @@ struct Conn {
 struct MachineEntry {
     conn: ClientId,
     descriptor: MachineDescriptor,
+    account_id: String,
+}
+
+/// `SendCommand` 的来源登记：回复者绑定校验用（AdminReply 必须来自 `target_machine`）。
+#[derive(Debug, Clone)]
+struct ReqOrigin {
+    origin: ClientId,
+    target_machine: String,
 }
 
 #[derive(Default)]
@@ -133,7 +148,7 @@ struct Core {
     sessions: HashMap<String, Vec<SessionDescriptor>>,
     conv_seq: HashMap<String, u64>,
     conv_buffer: HashMap<String, Vec<RelayControlMsg>>,
-    req_origin: HashMap<String, ClientId>,
+    req_origin: HashMap<String, ReqOrigin>,
     subs_machines: HashSet<ClientId>,
     subs_sessions: HashMap<String, HashSet<ClientId>>,
     subs_events: HashMap<String, HashSet<ClientId>>,
@@ -154,6 +169,17 @@ impl Core {
                 }
                 CoreMsg::Frame { id, frame } => {
                     self.handle_frame(id, frame).await;
+                }
+                CoreMsg::Revoke { device_id } => {
+                    let ids: Vec<ClientId> = self
+                        .conns
+                        .iter()
+                        .filter(|(_, c)| c.identity.device_id == device_id)
+                        .map(|(id, _)| *id)
+                        .collect();
+                    for id in ids {
+                        self.handle_disconnect(id).await;
+                    }
                 }
             }
             self.drain_disconnects().await;
@@ -209,8 +235,35 @@ impl Core {
         let trace = frame.trace_id.clone();
         match frame.msg {
             RelayControlMsg::RegisterMachine { machine } => {
+                let identity = match self.conns.get(&id) {
+                    Some(c) => c.identity.clone(),
+                    None => return,
+                };
+                let authorized = match &identity.role {
+                    ConnRole::Machine { machine_id } => *machine_id == machine.machine_id,
+                    ConnRole::Device => false,
+                };
+                if !authorized {
+                    self.send_to(
+                        id,
+                        &trace,
+                        RelayControlMsg::Error {
+                            code: failure::MACHINE_IDENTITY_CONFLICT.into(),
+                            message: format!(
+                                "connection identity does not authorize machine_id {}",
+                                machine.machine_id
+                            ),
+                            in_reply_to: None,
+                        },
+                    )
+                    .await;
+                    return;
+                }
                 let mid = machine.machine_id.clone();
-                self.machines.insert(mid, MachineEntry { conn: id, descriptor: machine });
+                self.machines.insert(
+                    mid,
+                    MachineEntry { conn: id, descriptor: machine, account_id: identity.account_id },
+                );
                 let list = self.machine_list();
                 for dev in self.subs_machines.clone() {
                     self.send_to(dev, &trace, RelayControlMsg::MachineList { machines: list.clone() }).await;
@@ -260,11 +313,51 @@ impl Core {
                 }
             }
             RelayControlMsg::Subscribe { target: SubTarget::Sessions { machine_id } } => {
+                let my_account = self.conns.get(&id).map(|c| c.identity.account_id.clone());
+                let target_account = self.machines.get(&machine_id).map(|m| m.account_id.clone());
+                if let (Some(mine), Some(theirs)) = (&my_account, &target_account) {
+                    if mine != theirs {
+                        self.send_to(
+                            id,
+                            &trace,
+                            RelayControlMsg::Error {
+                                code: failure::AUTH_FORBIDDEN.into(),
+                                message: format!("machine {machine_id} belongs to a different account"),
+                                in_reply_to: None,
+                            },
+                        )
+                        .await;
+                        return;
+                    }
+                }
                 self.subs_sessions.entry(machine_id.clone()).or_default().insert(id);
                 let list = self.sessions.get(&machine_id).cloned().unwrap_or_default();
                 self.send_to(id, &trace, RelayControlMsg::SessionList { machine_id, sessions: list }).await;
             }
             RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id } } => {
+                let my_account = self.conns.get(&id).map(|c| c.identity.account_id.clone());
+                let target_account = self
+                    .conv_machine
+                    .get(&conversation_id)
+                    .and_then(|mid| self.machines.get(mid))
+                    .map(|m| m.account_id.clone());
+                if let (Some(mine), Some(theirs)) = (&my_account, &target_account) {
+                    if mine != theirs {
+                        self.send_to(
+                            id,
+                            &trace,
+                            RelayControlMsg::Error {
+                                code: failure::AUTH_FORBIDDEN.into(),
+                                message: format!(
+                                    "conversation {conversation_id} belongs to a different account"
+                                ),
+                                in_reply_to: None,
+                            },
+                        )
+                        .await;
+                        return;
+                    }
+                }
                 self.subs_events.entry(conversation_id.clone()).or_default().insert(id);
                 if let Some(buf) = self.conv_buffer.get(&conversation_id).cloned() {
                     for ev in buf {
@@ -285,13 +378,35 @@ impl Core {
                         .and_then(|c| self.conv_machine.get(c))
                         .cloned(),
                 };
+                let my_account = self.conns.get(&id).map(|c| c.identity.account_id.clone());
+                let target_account =
+                    machine_id.as_ref().and_then(|m| self.machines.get(m)).map(|e| e.account_id.clone());
+                if let (Some(mine), Some(theirs)) = (&my_account, &target_account) {
+                    if mine != theirs {
+                        self.send_to(
+                            id,
+                            &trace,
+                            RelayControlMsg::Error {
+                                code: failure::AUTH_FORBIDDEN.into(),
+                                message: "target machine belongs to a different account".into(),
+                                in_reply_to: Some(request_id),
+                            },
+                        )
+                        .await;
+                        return;
+                    }
+                }
                 let target_conn = machine_id
-                    .and_then(|m| self.machines.get(&m))
+                    .as_ref()
+                    .and_then(|m| self.machines.get(m))
                     .filter(|e| e.descriptor.is_online && self.conns.contains_key(&e.conn))
                     .map(|e| e.conn);
                 match target_conn {
                     Some(machine_conn) => {
-                        self.req_origin.insert(request_id.clone(), id);
+                        self.req_origin.insert(
+                            request_id.clone(),
+                            ReqOrigin { origin: id, target_machine: machine_id.expect("target_conn implies machine_id") },
+                        );
                         self.send_to(
                             machine_conn,
                             &trace,
@@ -309,7 +424,7 @@ impl Core {
                             id,
                             &trace,
                             RelayControlMsg::Error {
-                                code: "remote.session.not_found".into(),
+                                code: failure::REMOTE_SESSION_NOT_FOUND.into(),
                                 message: "no online machine for command target".into(),
                                 in_reply_to: Some(request_id),
                             },
@@ -319,9 +434,33 @@ impl Core {
                 }
             }
             RelayControlMsg::AdminReply { in_reply_to, data } => {
-                if let Some(&dev) = self.req_origin.get(&in_reply_to) {
-                    self.send_to(dev, &trace, RelayControlMsg::AdminReply { in_reply_to: in_reply_to.clone(), data }).await;
-                    self.req_origin.remove(&in_reply_to);
+                if let Some(req) = self.req_origin.get(&in_reply_to).cloned() {
+                    let is_target = match self.conns.get(&id).map(|c| c.identity.role.clone()) {
+                        Some(ConnRole::Machine { machine_id }) => machine_id == req.target_machine,
+                        _ => false,
+                    };
+                    if is_target {
+                        self.send_to(
+                            req.origin,
+                            &trace,
+                            RelayControlMsg::AdminReply { in_reply_to: in_reply_to.clone(), data },
+                        )
+                        .await;
+                        self.req_origin.remove(&in_reply_to);
+                    } else {
+                        self.send_to(
+                            id,
+                            &trace,
+                            RelayControlMsg::Error {
+                                code: failure::REPLY_UNAUTHORIZED.into(),
+                                message: format!(
+                                    "connection is not the target machine for request {in_reply_to}"
+                                ),
+                                in_reply_to: Some(in_reply_to),
+                            },
+                        )
+                        .await;
+                    }
                 }
             }
             _ => {}
@@ -665,6 +804,133 @@ mod tests {
                     break;
                 }
                 _ => continue,
+            }
+        }
+    }
+
+    fn mframe(machine_id: &str, msg: RelayControlMsg) -> RemoteFrame {
+        RemoteFrame::control(ClientRole::Machine { machine_id: machine_id.into() }, "t".into(), 0, msg)
+    }
+
+    async fn recv_until_error(c: &mut RelayClient) -> String {
+        loop {
+            let frame = match tokio::time::timeout(std::time::Duration::from_secs(5), c.recv()).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => panic!("timed out waiting for Error frame: stream closed"),
+                Err(_) => panic!("timed out waiting for Error frame"),
+            };
+            match frame.msg {
+                RelayControlMsg::Error { code, .. } => return code,
+                _ => continue,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn register_machine_rejects_cross_identity() {
+        let relay = FakeRelay::start();
+        // M1 以 machine 身份 machine_id=M1 注册
+        let m1 = relay
+            .connect_with_identity(ConnIdentity {
+                account_id: "acc".into(),
+                device_id: "m1".into(),
+                role: ConnRole::Machine { machine_id: "M1".into() },
+            })
+            .await;
+        m1.send(mframe("M1", RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        // 攻击者连接以 machine_id=Evil 身份，却试图注册 machine_id=M1（覆盖）
+        let mut evil = relay
+            .connect_with_identity(ConnIdentity {
+                account_id: "acc".into(),
+                device_id: "evil".into(),
+                role: ConnRole::Machine { machine_id: "Evil".into() },
+            })
+            .await;
+        evil.send(mframe("M1", RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        // evil 应收到 identity_conflict Error
+        let e = recv_until_error(&mut evil).await;
+        assert_eq!(e, agentdeck_protocol::remote::failure::MACHINE_IDENTITY_CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn admin_reply_from_non_target_machine_rejected() {
+        let relay = FakeRelay::start();
+        let mut m1 = relay
+            .connect_with_identity(ConnIdentity {
+                account_id: "acc".into(),
+                device_id: "m1".into(),
+                role: ConnRole::Machine { machine_id: "M1".into() },
+            })
+            .await;
+        m1.send(mframe("M1", RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+
+        let m2 = relay
+            .connect_with_identity(ConnIdentity {
+                account_id: "acc".into(),
+                device_id: "m2".into(),
+                role: ConnRole::Machine { machine_id: "M2".into() },
+            })
+            .await;
+        m2.send(mframe("M2", RelayControlMsg::RegisterMachine { machine: machine("M2") })).await;
+
+        let mut d = relay
+            .connect_with_identity(ConnIdentity {
+                account_id: "acc".into(),
+                device_id: "d1".into(),
+                role: ConnRole::Device,
+            })
+            .await;
+        d.send(RemoteFrame::control(
+            ClientRole::Device { device_id: "d1".into() },
+            "t".into(),
+            0,
+            RelayControlMsg::SendCommand {
+                request_id: "r1".into(),
+                target: CommandTarget::Machine { machine_id: "M1".into() },
+                data: DataEnvelope::plaintext(&"ping-cmd").unwrap(),
+            },
+        ))
+        .await;
+
+        // M1（真正目标）收到该 SendCommand，确认路由正确、req_origin 已登记 target_machine=M1
+        let _ = recv_send_command(&mut m1).await;
+
+        // M2 冒充目标机器抢答——relay 必须丢弃（不转发给 D1，也不消费掉 req_origin）
+        m2.send(mframe(
+            "M2",
+            RelayControlMsg::AdminReply {
+                in_reply_to: "r1".into(),
+                data: DataEnvelope::plaintext(&"forged").unwrap(),
+            },
+        ))
+        .await;
+
+        // M1 随后真实回复——若 M2 的冒充被错误地消费了 req_origin，这条真实回复将无处可去
+        m1.send(mframe(
+            "M1",
+            RelayControlMsg::AdminReply {
+                in_reply_to: "r1".into(),
+                data: DataEnvelope::plaintext(&"real").unwrap(),
+            },
+        ))
+        .await;
+
+        // D1 应且只应收到来自 M1 的真实回复；若冒充未被拒绝，会先收到 "forged" 导致断言失败
+        loop {
+            let frame = match tokio::time::timeout(std::time::Duration::from_secs(5), d.recv()).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => panic!("timed out waiting for AdminReply frame: stream closed"),
+                Err(_) => panic!("timed out waiting for AdminReply frame"),
+            };
+            match frame.msg {
+                RelayControlMsg::AdminReply { in_reply_to, data } => {
+                    assert_eq!(in_reply_to, "r1");
+                    let s: String = data.decode_plaintext().unwrap();
+                    assert_eq!(s, "real", "device 只应看到目标机器的真实回复，冒充回复必须被丢弃");
+                    break;
+                }
+                RelayControlMsg::CommandDelivered { .. } => continue,
+                other => panic!("unexpected {other:?}"),
             }
         }
     }
