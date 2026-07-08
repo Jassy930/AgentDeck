@@ -375,24 +375,28 @@ mod tests {
 
     #[tokio::test]
     async fn slow_consumer_does_not_block_other_connections() {
-        let relay = FakeRelay::start();
-        // D_slow 订阅 machines 但从不 recv（模拟慢/卡死连接）
-        let _d_slow = relay.connect(ClientRole::Device { device_id: "slow".into() }).await;
-        _d_slow.send(frame(ClientRole::Device { device_id: "slow".into() },
-            RelayControlMsg::Subscribe { target: SubTarget::Machines })).await;
-        // 灌满 D_slow 的出站队列（>64）：注册很多机器触发广播
-        for i in 0..200 {
-            let m = relay.connect(ClientRole::Machine { machine_id: format!("M{i}") }).await;
-            m.send(frame(ClientRole::Machine { machine_id: format!("M{i}") },
-                RelayControlMsg::RegisterMachine { machine: machine(&format!("M{i}")) })).await;
-        }
-        // 新 device 订阅仍能及时拿到快照（Core 未被 D_slow 卡死）
-        let mut d = relay.connect(ClientRole::Device { device_id: "fast".into() }).await;
-        d.send(frame(ClientRole::Device { device_id: "fast".into() },
-            RelayControlMsg::Subscribe { target: SubTarget::Machines })).await;
-        let got = tokio::time::timeout(std::time::Duration::from_secs(5), d.recv()).await
-            .expect("Core 被慢连接阻塞了（HOL）").expect("frame");
-        assert!(matches!(got.msg, RelayControlMsg::MachineList { .. }));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let relay = FakeRelay::start();
+            // D_slow 订阅 machines 但从不 recv（模拟慢/卡死连接）
+            let _d_slow = relay.connect(ClientRole::Device { device_id: "slow".into() }).await;
+            _d_slow.send(frame(ClientRole::Device { device_id: "slow".into() },
+                RelayControlMsg::Subscribe { target: SubTarget::Machines })).await;
+            // 灌满 D_slow 的出站队列（>64）：注册很多机器触发广播
+            for i in 0..200 {
+                let m = relay.connect(ClientRole::Machine { machine_id: format!("M{i}") }).await;
+                m.send(frame(ClientRole::Machine { machine_id: format!("M{i}") },
+                    RelayControlMsg::RegisterMachine { machine: machine(&format!("M{i}")) })).await;
+            }
+            // 新 device 订阅仍能及时拿到快照（Core 未被 D_slow 卡死）
+            let mut d = relay.connect(ClientRole::Device { device_id: "fast".into() }).await;
+            d.send(frame(ClientRole::Device { device_id: "fast".into() },
+                RelayControlMsg::Subscribe { target: SubTarget::Machines })).await;
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), d.recv()).await
+                .expect("Core 被慢连接阻塞了（HOL）").expect("frame");
+            assert!(matches!(got.msg, RelayControlMsg::MachineList { .. }));
+        })
+        .await
+        .expect("HOL deadlock — Core 在 setup 阶段被阻塞（回归）");
     }
 
     fn frame(from: ClientRole, msg: RelayControlMsg) -> RemoteFrame {
