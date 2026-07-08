@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
-use crate::router::{FakeRelay, RelayClient};
+use crate::relay_link::RelayLink;
 
 /// 把一个真实 agentdeckd 子进程当作 relay 的 machine 接入（不改 daemon）。
 /// R0 主要证明 admin（Machine 目标）往返；ServerEvent 为 best-effort 转发，
@@ -26,7 +26,7 @@ impl StdioMachineBridge {
         daemon_path: &Path,
         profile: &str,
         machine: MachineDescriptor,
-        relay: &FakeRelay,
+        link: impl RelayLink,
     ) -> std::io::Result<StdioMachineBridge> {
         let machine_id = machine.machine_id.clone();
         let mut child = Command::new(daemon_path)
@@ -39,16 +39,12 @@ impl StdioMachineBridge {
         let mut stdin = child.stdin.take().expect("daemon stdin");
         let stdout = child.stdout.take().expect("daemon stdout");
 
-        let client = relay
-            .connect(ClientRole::Machine { machine_id: machine_id.clone() })
-            .await;
-        client
-            .send(mk_frame(&machine_id, RelayControlMsg::RegisterMachine { machine }))
+        link.send(mk_frame(&machine_id, RelayControlMsg::RegisterMachine { machine }))
             .await;
 
         let pump = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
-            let mut client: RelayClient = client;
+            let mut link = link;
             // admin single-flight：请求 request_id FIFO 队列 + 待写命令行
             let mut admin_queue: VecDeque<(String, String)> = VecDeque::new();
             let mut admin_inflight = false;
@@ -56,7 +52,7 @@ impl StdioMachineBridge {
             loop {
                 tokio::select! {
                     // 来自 relay 的 device 命令
-                    frame = client.recv() => {
+                    frame = link.recv() => {
                         let Some(frame) = frame else { break };
                         if let RelayControlMsg::SendCommand { request_id, target, data } = frame.msg {
                             let Ok(cmd) = data.decode_plaintext::<ClientCommand>() else { continue };
@@ -93,7 +89,7 @@ impl StdioMachineBridge {
                                     agentdeck_protocol_version: agentdeck_protocol::PROTOCOL_VERSION,
                                     bytes: raw.into_bytes(),
                                 };
-                                client.send(mk_frame(&machine_id, RelayControlMsg::AdminReply { in_reply_to: req, data })).await;
+                                link.send(mk_frame(&machine_id, RelayControlMsg::AdminReply { in_reply_to: req, data })).await;
                                 admin_inflight = false;
                                 if let Some((_, l)) = admin_queue.front() {
                                     let _ = stdin.write_all(l.as_bytes()).await;
@@ -110,7 +106,7 @@ impl StdioMachineBridge {
                                 agentdeck_protocol_version: agentdeck_protocol::PROTOCOL_VERSION,
                                 bytes: raw.into_bytes(),
                             };
-                            client.send(mk_frame(&machine_id, RelayControlMsg::PublishEvent {
+                            link.send(mk_frame(&machine_id, RelayControlMsg::PublishEvent {
                                 conversation_id: conv, turn_session_id: sid, seq: 0, data,
                             })).await;
                         }

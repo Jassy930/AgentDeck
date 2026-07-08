@@ -31,6 +31,7 @@ name = "agentdeck-relay"
 version = "0.1.0"
 dependencies = [
  "agentdeck-protocol",
+ "async-trait",
  "serde",
  "serde_json",
  "thiserror",

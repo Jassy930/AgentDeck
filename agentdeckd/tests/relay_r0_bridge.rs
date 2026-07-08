@@ -58,7 +58,10 @@ async fn recv_admin_reply(d: &mut RelayClient, want: &str) -> serde_json::Value 
 async fn t1_real_daemon_admin_ping_round_trips_through_relay() {
     let daemon = Path::new(env!("CARGO_BIN_EXE_agentdeckd"));
     let relay = FakeRelay::start();
-    let bridge = agentdeck_relay::StdioMachineBridge::spawn(daemon, "stable", machine(), &relay)
+    let link = relay
+        .connect(ClientRole::Machine { machine_id: "M1".into() })
+        .await;
+    let bridge = agentdeck_relay::StdioMachineBridge::spawn(daemon, "stable", machine(), link)
         .await
         .expect("bridge spawn");
 

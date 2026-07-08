@@ -63,7 +63,12 @@ pub async fn smoke(profile: &str) -> ExitCode {
 /// 本身对外的行为。
 pub async fn run_smoke(daemon: &std::path::Path, profile: &str) -> ExitCode {
     let relay = FakeRelay::start();
-    let bridge = match StdioMachineBridge::spawn(daemon, profile, machine(), &relay).await {
+    let link = relay
+        .connect(ClientRole::Machine {
+            machine_id: "local".into(),
+        })
+        .await;
+    let bridge = match StdioMachineBridge::spawn(daemon, profile, machine(), link).await {
         Ok(b) => b,
         Err(e) => {
             eprintln!("remote.bridge.spawn_failed: {e}");

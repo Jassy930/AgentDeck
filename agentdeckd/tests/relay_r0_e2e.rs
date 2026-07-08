@@ -42,7 +42,10 @@ async fn t4_real_session_stream_transits_relay() {
     }
     let daemon = Path::new(env!("CARGO_BIN_EXE_agentdeckd"));
     let relay = FakeRelay::start();
-    let bridge = agentdeck_relay::StdioMachineBridge::spawn(daemon, "stable", machine(), &relay)
+    let link = relay
+        .connect(ClientRole::Machine { machine_id: "M1".into() })
+        .await;
+    let bridge = agentdeck_relay::StdioMachineBridge::spawn(daemon, "stable", machine(), link)
         .await
         .expect("bridge");
 

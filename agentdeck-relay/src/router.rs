@@ -27,6 +27,16 @@ impl RelayClient {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::relay_link::RelayLink for RelayClient {
+    async fn send(&self, frame: RemoteFrame) {
+        RelayClient::send(self, frame).await
+    }
+    async fn recv(&mut self) -> Option<RemoteFrame> {
+        RelayClient::recv(self).await
+    }
+}
+
 enum CoreMsg {
     Connect { id: ClientId, role: ClientRole, out: mpsc::Sender<RemoteFrame> },
     Frame { id: ClientId, frame: RemoteFrame },

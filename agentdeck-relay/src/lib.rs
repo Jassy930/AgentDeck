@@ -4,7 +4,9 @@
 //! 控制面（RelayControlMsg）relay 可读用于路由；数据面（DataEnvelope）不可见。
 
 mod bridge;
+mod relay_link;
 mod router;
 
 pub use bridge::StdioMachineBridge;
+pub use relay_link::RelayLink;
 pub use router::{FakeRelay, RelayClient};
