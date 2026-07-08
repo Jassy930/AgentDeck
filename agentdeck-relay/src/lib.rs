@@ -8,6 +8,10 @@
 #[allow(dead_code)]
 mod auth;
 mod bridge;
+// config 的公开面在 Task 8 尚无调用方（server 层由 Task 9 引入并消费 RelayConfig）；
+// 此刻只被自身单测使用。
+#[allow(dead_code)]
+mod config;
 mod relay_link;
 mod router;
 
