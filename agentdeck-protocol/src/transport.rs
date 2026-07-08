@@ -5,10 +5,22 @@ use serde::{Deserialize, Serialize};
 
 /// Auth context carried with a transport connection. v0.2 stdio impl
 /// uses `Anonymous`; v0.5 remote impls fill in token / device id.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum AuthContext {
     Anonymous,
     Bearer { token: String, device_id: String },
+}
+
+impl std::fmt::Debug for AuthContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthContext::Anonymous => write!(f, "AuthContext::Anonymous"),
+            AuthContext::Bearer { device_id, .. } => {
+                // token 脱敏，device_id 保留用于诊断
+                write!(f, "AuthContext::Bearer {{ token: <redacted>, device_id: {device_id:?} }}")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,4 +70,16 @@ pub enum TransportError {
     NotReconnectable,
     #[error("transport auth failed: {0}")]
     AuthFailed(String),
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::*;
+    #[test]
+    fn auth_context_debug_redacts_token() {
+        let a = AuthContext::Bearer { token: "SECRET-TOKEN-123".into(), device_id: "dev-1".into() };
+        let s = format!("{a:?}");
+        assert!(!s.contains("SECRET-TOKEN-123"), "token must be redacted in Debug: {s}");
+        assert!(s.contains("Bearer"), "should still show variant");
+    }
 }

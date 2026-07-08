@@ -6,6 +6,7 @@
 
 pub mod control;
 pub mod data;
+pub mod failure;
 pub mod fleet;
 pub mod frame;
 
