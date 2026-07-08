@@ -2,10 +2,17 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Design - R0 落地中 |
-| 日期 | 2026-07-01 |
+| 状态 | Design - R0 已落地；R1 评审已出，本文含 R1 评审订正 |
+| 日期 | 2026-07-01（2026-07-08 按 R1 评审订正） |
 | 主题 | 参考 Happier 的跨设备 agent 工作流，为 AgentDeck 手机端先补最小服务端能力 |
-| 关联 | `NORTH_STAR.md`、`ARCHITECTURE.md`、`docs/plans/2026-06-30-unified-shell-v02-design.md` |
+| 关联 | `NORTH_STAR.md`、`ARCHITECTURE.md`、`docs/plans/2026-06-30-unified-shell-v02-design.md`、`docs/plans/2026-07-07-relay-r0-contract-spike-design.md`（R0，已落地）、`docs/plans/2026-07-08-relay-r1-design-review.md`（R1 评审，本文订正的依据） |
+
+> **R1 评审订正记录（2026-07-08）**：R0 落地后对 R1 做了 6 维度批判性评审（见 `2026-07-08-relay-r1-design-review.md`），发现本文若干处对 R1 已不成立或自相矛盾。下列各处已按评审订正；完整理由见评审 §3：
+> - **§6 数据模型**：`stream_seq` 单数（隐含全局序号）→ 实际是 **per-conversation seq**；`signature` 逐帧签名字段 → **R1 不做**（传输鉴权=握手 Bearer，内容完整性=Encrypted 的 AEAD tag）；`Connection`/`Subscription` 是**连接态、不持久化**（与 Device/EncryptedEvent/Revocation 不同层）；`account_or_profile_id` 在 R0 被丢弃 → **R1 重引 account scope**。
+> - **§7 安全边界**：「Relay 默认不保存明文/无法读取」对 R0 与 R1-plaintext **过度承诺**（relay 内存+缓冲完整持明文）→ 区分**结构化零知识(Encrypted，跨信任边界)** 与**按策略不检视(Plaintext，自托管单运营者)**。
+> - **§9 R1**：「5 个 WS endpoints」措辞过时（R0 已把 subscribe/send/ack 折进单连接的 `RelayControlMsg` 变体）→ R1 实际只需 **1-2 条 WS 路由**；**鉴权/凭据签发+撤销+challenge 骨架属 R1**（不能推 R2/R3，否则网络端点裸奔），QR 扫码 UX 才是 R3。
+> - **§10 验收**：混入了「daemon 断线重连补拉未 ack 事件」「撤销 device credential 后禁订阅」等 **R2/R3 概念**，不应作为 R1 门槛。
+> - **§11 加密库**：`crypto_box`(NaCl) 与 iOS `CryptoKit.ChaChaPoly`(IETF) **不可互操作**（nonce 长度/原语不同）；canonical 由 R1 定（评审推荐 IETF ChaCha20-Poly1305 + X25519/HKDF）。CLI 扩成 remote 客户端**已隐性拍板为做**（R0 已冻结 `--relay ws://` 语义）。
 
 ## 1. 背景
 
@@ -172,6 +179,8 @@ RemoteEnvelope {
 - Device credential 可撤销；daemon 下次心跳必须同步撤销列表。
 - Relay 日志禁止输出 prompt、shell output、diff、路径片段和 token-like 字符串。
 
+> **R1 评审订正（§7）**：本节「默认不保存明文/无法读取」对 R0 与 R1-plaintext **过度承诺**——relay 在内存与事件缓冲里完整持有 `DataEnvelope::Plaintext{bytes}`（R0 的 T3 只证明「不 decode」非「读不到」）。应区分：**结构化零知识**（`DataEnvelope::Encrypted`，跨信任边界时 relay 按构造读不到）与**按策略不检视**（Plaintext，自托管单运营者同信任域）。R1 交付 Encrypted 帧格式 + seal 策略 + loopback 默认/非 loopback 拒 Plaintext 门禁，真加解密留 R2/R3。详见 R1 评审 §2 D7、§4。
+
 ## 8. 错误处理与可观测性
 
 建议新增 failure code 命名空间：
@@ -217,6 +226,8 @@ RemoteEnvelope {
 - SQLite 存储或内存存储加文件快照；公开托管前不引入复杂数据库。
 - WebSocket endpoints：machine connect、device connect、subscribe、send command、ack。
 - structured error 与基础诊断。
+
+> **R1 评审订正（§9 R1）**：(1) 上面「5 个 WS endpoints」是措辞遗留——R0 已把 subscribe/send command/ack 折进**单连接上的 `RelayControlMsg` 变体**，R1 实际只需 **1-2 条 WS 路由**（/machine、/device 或单路由 + 握手角色），不要误建 5 条 REST 端点。(2) **R1 必须落地最小连接鉴权**（握手 Bearer + 服务端派生角色 + account scope + device credential 签发/撤销 + challenge-response 骨架）：R0 的 `from`/`connect(role)`/`RegisterMachine` 全部自述、从不校验，无鉴权的网络 relay = 完全授权绕过。QR 扫码 UX 才是 R3。(3) 存储评审推荐**纯 SQLite（WAL）存身份/目录/seq 高水位/凭证/revocation + 事件负载只留内存**，而非「内存+文件快照」（快照崩溃窗口会破坏 seq 单调）。详见 R1 评审 §2 D6/D8、§6。
 
 ### R2：agentdeckd Remote Mode
 

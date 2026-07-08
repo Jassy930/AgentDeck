@@ -2,10 +2,12 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Design - 已按代码评审修订，待复审 |
-| 日期 | 2026-07-07 |
+| 状态 | Implemented（2026-07-08，9 任务 + 终审全绿，master 已推送）；含 R1 评审订正 |
+| 日期 | 2026-07-07（2026-07-08 按 R1 评审订正） |
 | 主题 | Relay 远程访问第一阶段（R0）：证明控制面/数据面分层的 remote frame 能包住现有 agentdeck-protocol，并用内存 fake relay + CLI 单进程 smoke 打通「协议组合 + 转发」 |
-| 关联 | `docs/plans/2026-07-01-agentdeck-mobile-relay-design.md`（母设计，R0-R4 路线）、`docs/plans/2026-07-03-ios-uikit-frontend-design.md`（MobileSessionSource 接口）、`ARCHITECTURE.md`（N1/N6/K5/K9/N8）、`NORTH_STAR.md` |
+| 关联 | `docs/plans/2026-07-01-agentdeck-mobile-relay-design.md`（母设计）、`docs/plans/2026-07-03-ios-uikit-frontend-design.md`（MobileSessionSource 接口）、`ARCHITECTURE.md`（N1/N6/K5/K9/N8）、`docs/plans/2026-07-08-relay-r1-design-review.md`（R1 评审，本文订正的依据） |
+
+> **R1 评审订正记录（2026-07-08）**：R0 已实现落地；R1 评审（见 `2026-07-08-relay-r1-design-review.md`）发现本设计几处需订正，已就地标注：① §4.2 `DataEnvelope::Plaintext.agentdeck_protocol_version` 类型 **u16→u32**（与代码 `data.rs` 一致；`RELAY_PROTOCOL_VERSION` 保持 u16），R1 起 `bytes` 改 base64 serde；② §4.1 Cargo.toml 注释误列 tracing，**R0 实际无 tracing**，tracing + 脱敏日志在 R1 落地（`AuthContext`/`DataEnvelope` derive Debug/Serialize 会打印 token/明文，R1 接线日志前须补脱敏）；③ §8 E2EE 库 crypto_box+CryptoKit **不可互操作**已订正为 canonical IETF ChaCha20-Poly1305 + X25519/HKDF；④ `PublishEvent.seq`（machine→relay 方向）被 relay 忽略、自行 re-stamp（§4.4），是僵尸字段，R1 移除或注明。R1 的完整待决策/风险/范围切分见 R1 评审文档。
 
 ## 1. 背景和用户问题
 
@@ -79,7 +81,7 @@ agentdeck-protocol/src/remote/        # 契约事实源（受 schema 快照 + �
 
 agentdeck-relay/                       # 新 lib crate（R0 无 binary，R1 生长为 relay 服务）
   Cargo.toml    # deps: agentdeck-protocol, tokio(sync/io-util/time/macros，**不含 net**),
-                #       serde, serde_json, thiserror, tracing
+                #       serde, serde_json, thiserror（注：R0 实际未引入 tracing——见下方 R1 评审订正；tracing + 脱敏日志在 R1 落地）
   src/{lib.rs, router.rs, bridge.rs}
   tests/r0_composition.rs
 
@@ -105,7 +107,7 @@ pub enum ClientRole { Machine { machine_id: String }, Device { device_id: String
 
 // 数据面：relay 不可见。R0 = 明文字节；R1/R2 换 Encrypted，控制面与路由器零改动。
 pub enum DataEnvelope {
-    Plaintext { agentdeck_protocol_version: u16, bytes: Vec<u8> }, // 内层 ClientCommand/ServerEvent/HistoryResponse JSON
+    Plaintext { agentdeck_protocol_version: u32, bytes: Vec<u8> }, // 内层 ClientCommand/ServerEvent/HistoryResponse JSON（= PROTOCOL_VERSION:u32；bytes R1 改 base64 serde，见 R1 评审 §2 D4）
     // Encrypted { alg, nonce, ciphertext, tag }  // R1/R2
 }
 ```
@@ -182,7 +184,7 @@ fleet 数据类型：
 ```rust
 pub struct MachineDescriptor {
     pub machine_id: String, pub name: String,
-    pub agentdeck_protocol_version: u16,
+    pub agentdeck_protocol_version: u32,
     pub is_online: bool, pub last_heartbeat_ms: Option<i64>,
 }
 pub struct DeviceDescriptor { pub device_id: String, pub kind: DeviceKind } // Cli | Mobile | Desktop
@@ -282,7 +284,7 @@ remote --relay <endpoint> ping <machine_id>                # 机器级 admin 往
 
 ## 8. 后置项与开放问题
 
-- **E2EE 库（R1 决定）**：倾向 daemon/relay 侧 Rust `crypto_box` + `chacha20poly1305`（对齐 happier 的 libsodium 语义），iOS 侧 CryptoKit `Curve25519` + `ChaChaPoly`，R1 互操作验证。不手写密码学。数据面 `DataEnvelope::Encrypted` 落在这里。
+- **E2EE 库（R1 决定）**：~~倾向 daemon/relay 侧 Rust `crypto_box` + `chacha20poly1305`，iOS 侧 CryptoKit `Curve25519` + `ChaChaPoly`~~。**R1 评审订正**：`crypto_box`(NaCl secretbox/box，XSalsa20-Poly1305，24B nonce) 与 iOS `CryptoKit.ChaChaPoly`(IETF ChaCha20-Poly1305，12B nonce) **对同一 payload 不可互操作**——原语与 nonce 长度不同。评审推荐 canonical：内容层统一 **IETF ChaCha20-Poly1305（12B nonce）**（Rust `chacha20poly1305` 与 iOS `CryptoKit.ChaChaPoly` 唯一共同 AEAD），密钥封装用 **X25519 ECDH + HKDF 手工 box**；由 agentdeck-protocol(Rust) 在 R1 先定布局 + 跨语言测试向量。不手写核心密码学（用成熟库的 primitive）。数据面 `DataEnvelope::Encrypted` 格式 R1 冻结、真加解密 R2/R3。见 R1 评审 §2 D7。
 - **存储（R1）**：先 SQLite，公开托管前再评估 Postgres；R0 纯内存。
 - **APNs（R3+）**：R0 无，R3 用 app 内在线通知先闭环。
 - **配对安全（R2/R3 硬性要求）**：challenge nonce 必须服务端生成带 TTL（借鉴 happy issue #669 重放隐患教训）。
