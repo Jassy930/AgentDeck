@@ -1,5 +1,5 @@
 [workspace]
-members = ["agentdeckd", "agentdeck-protocol", "agentdeck-cli", "agentdeck-relay"]
+members = ["agentdeckd", "agentdeck-protocol", "agentdeck-cli", "agentdeck-relay", "agentdeck-relay-client"]
 resolver = "3"
 
 [workspace.package]
