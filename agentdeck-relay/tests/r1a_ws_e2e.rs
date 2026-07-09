@@ -565,8 +565,55 @@ async fn sentinel_token_not_in_logs() {
     // 才去检查日志，而不是引入任意 sleep。
     let _ = recv_error_code(&mut link).await;
 
+    // review fix（Critical）：happy-path 流程（enroll + 一次 SendCommand/Error）
+    // 全程不经过 `agentdeck-relay/src` 里任何一处 `tracing::*!` 调用点——唯一的
+    // instrumentation 是 `server/conn.rs` 里的 `info!("relay: connection closed")`
+    // （连接 loop 退出时才打）。之前的写法在这里直接读 buffer，如果 buffer 为空，
+    // 三条 sentinel/credential 断言全部对空字符串成立——测试假绿，测不出真正的
+    // 日志泄漏。显式 drop 连接触发 close 分支，给 server 端一点时间处理关闭，
+    // 再断言 buffer 非空，让"这条测试真的 exercise 了 tracing 路径"本身可验证。
+    drop(link);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
     let captured = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    assert!(!captured.is_empty(), "tracing buffer 为空——log capture 未生效，测试无效");
     assert!(!captured.contains(SENTINEL_BOOTSTRAP), "bootstrap secret leaked into logs");
     assert!(!captured.contains(SENTINEL_PAYLOAD), "opaque payload leaked into logs");
     assert!(!captured.contains(&enrolled.credential), "issued credential leaked into logs");
+    // 注：`device_id` 会出现在 `info!(device_id, "relay: connection closed")`
+    // 里——这是设计上允许的（identifier 而非 secret，R1a 脱敏语义与 Task 2
+    // `AuthContext::Bearer` Debug 一致：保留 device_id、脱敏 token），因此本测试
+    // 不对 device_id 做"不得出现"断言。
+}
+
+/// review fix（Important）：Task 10 前四个测试覆盖了 bad_secret / expired_nonce /
+/// revoked / unknown_cred / cross_identity / forged_from / non_target_reply 等
+/// 拒绝路径，但未测 `server/ws.rs::connect` 里 `version != RELAY_PROTOCOL_VERSION
+/// → reject(BAD_REQUEST, VERSION_UNSUPPORTED)` 分支。补一条握手带 `?v=999` 的
+/// WS 连接，断言 relay-client 侧返回 `Err`——`WsRelayClient` 内部会把 tungstenite
+/// 的 HTTP 4xx 折叠为 `WsError::Connect(...)`（Task 7 review 已知遗留），无法在
+/// client 端精确断言 code，故本测试**只**断言"连接被拒绝"这一 R1a 核心 invariant。
+#[tokio::test]
+async fn ws_connect_rejects_wrong_protocol_version() {
+    let (addr, _store, base_url) = setup_server("boot-version").await;
+    let enrolled = enroll(
+        &base_url,
+        "boot-version",
+        "dev-version",
+        "device",
+        Some("owner-version"),
+    )
+    .await;
+
+    let bad_url = format!("ws://{addr}/v1/connect?v=999");
+    let result = WsRelayClient::connect(
+        &bad_url,
+        &enrolled.credential,
+        ClientRole::Device { device_id: enrolled.device_id.clone() },
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "protocol version 不符时 WS 连接必须被 relay 拒绝（v=999 不该被 upgrade）"
+    );
 }
