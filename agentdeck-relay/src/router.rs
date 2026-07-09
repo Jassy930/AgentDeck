@@ -396,7 +396,14 @@ impl Core {
                 }
                 let mid = session.machine_id.clone();
                 self.conv_machine.insert(session.conversation_id.clone(), mid.clone());
-                self.sessions.entry(mid.clone()).or_default().push(session);
+                let list_mut = self.sessions.entry(mid.clone()).or_default();
+                // 按 conversation_id upsert：同一 machine 重启后重新
+                // AnnounceSession 同一会话时覆盖既有条目，而不是无条件 push
+                // 造成 SessionList 重复展示（R1a 遗留 bug）。
+                match list_mut.iter().position(|s| s.conversation_id == session.conversation_id) {
+                    Some(i) => list_mut[i] = session,
+                    None => list_mut.push(session),
+                }
                 let list = self.sessions.get(&mid).cloned().unwrap_or_default();
                 if let Some(devs) = self.subs_sessions.get(&mid) {
                     for dev in devs.clone() {
@@ -1606,5 +1613,27 @@ mod tests {
         .await;
         let code = recv_until_error(&mut d).await;
         assert_eq!(code, failure::REPLAY_GAP, "since_seq 早于 buffer 应返回 REPLAY_GAP");
+    }
+
+    /// Task 7（R1a 遗留 bug 修复）：同一 machine 重启后重新 `AnnounceSession`
+    /// 同一 `conversation_id`，`SessionList` 不应出现重复条目——按
+    /// `conversation_id` upsert 覆盖，而不是无条件 `push`。
+    #[tokio::test]
+    async fn announce_session_same_conversation_twice_does_not_duplicate_in_session_list() {
+        let relay = FakeRelay::start();
+        let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
+        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+        // 同一 machine 重启后重新 announce 同一 conversation_id（模拟 machine 侧重连场景）
+        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+
+        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        d.send(frame(ClientRole::Device { device_id: "D1".into() },
+            RelayControlMsg::Subscribe { target: SubTarget::Sessions { machine_id: "M1".into() } })).await;
+        let got = d.recv().await.expect("frame");
+        match got.msg {
+            RelayControlMsg::SessionList { sessions, .. } => assert_eq!(sessions.len(), 1, "重复 announce 同一 conversation 不应产生重复条目"),
+            other => panic!("expected SessionList, got {other:?}"),
+        }
     }
 }
