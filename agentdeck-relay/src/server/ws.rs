@@ -81,7 +81,9 @@ pub(crate) async fn connect(
 
     let device = {
         let store = state.store.lock().expect("relay store mutex poisoned");
-        store.device_by_credential_hash(&credential_hash).cloned()
+        // R1b Task 3：trait 签名改为 owned return（SQL backend 无法返 borrow），
+        // 值已 owned，`.cloned()` 移除。
+        store.device_by_credential_hash(&credential_hash)
     };
     let Some(device) = device else {
         return reject(

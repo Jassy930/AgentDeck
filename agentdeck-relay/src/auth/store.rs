@@ -36,18 +36,27 @@ pub struct Challenge {
 }
 
 /// enroll 逻辑所需的存储接口——由 `InMemoryRelayStore` 实现；Task 9 起可换持久化实现。
+///
+/// **R1b Task 3 签名收编**：`singleton_account`/`device`/`device_by_credential_hash`
+/// 从 `Option<&T>` 改为 `Option<T>`。R1a Task 6 定义 trait 时未预留 SQL backend——
+/// `SqliteRelayStore` 每次调用都从 SQL 现造一个新的 `Account`/`Device`，无法在
+/// safe Rust 下把临时值的引用绑定到 `&self` 的生命周期返回出去。三个结构体已
+/// `#[derive(Clone)]`，`InMemoryRelayStore` 一侧对应加 `.cloned()`；调用方大多
+/// 是 field access（owned 与 borrow 语法相同），仅 `server/ws.rs` 里 `.cloned()`
+/// 因值已 owned 而移除。
 pub(crate) trait RelayStore {
     fn put_challenge(&mut self, challenge: Challenge);
     /// 单次消费：命中且未过期未使用 → 返回并从存储中移除（等价于原子 mark_used）；否则 None。
     fn take_challenge(&mut self, device_sign_pubkey: &str, now_ms: i64) -> Option<Challenge>;
-    fn singleton_account(&self) -> Option<&Account>;
+    fn singleton_account(&self) -> Option<Account>;
     fn create_account(&mut self, account: Account);
     fn put_device(&mut self, device: Device);
-    fn device(&self, device_id: &str) -> Option<&Device>;
+    fn device(&self, device_id: &str) -> Option<Device>;
     /// WS 握手鉴权用：客户端只携带 bearer credential（非 device_id），需要反查
     /// 命中的 `Device`。`InMemoryRelayStore` 未维护额外反向索引，线性扫描
-    /// `devices`——内存 fake relay 场景设备规模小，可接受。
-    fn device_by_credential_hash(&self, credential_hash: &str) -> Option<&Device>;
+    /// `devices`——内存 fake relay 场景设备规模小，可接受；`SqliteRelayStore`
+    /// 走 `idx_devices_credential_hash` 索引替换线性扫描。
+    fn device_by_credential_hash(&self, credential_hash: &str) -> Option<Device>;
     fn account_count(&self) -> usize;
     /// Task 9 起用于设备撤销流程；本 task 无消费方，靠 crate 顶层 `#[allow(dead_code)]` 静默。
     fn mark_revoked(&mut self, device_id: &str);
@@ -79,8 +88,8 @@ impl RelayStore for InMemoryRelayStore {
         }
     }
 
-    fn singleton_account(&self) -> Option<&Account> {
-        self.account.as_ref()
+    fn singleton_account(&self) -> Option<Account> {
+        self.account.clone()
     }
 
     fn create_account(&mut self, account: Account) {
@@ -91,12 +100,12 @@ impl RelayStore for InMemoryRelayStore {
         self.devices.insert(device.device_id.clone(), device);
     }
 
-    fn device(&self, device_id: &str) -> Option<&Device> {
-        self.devices.get(device_id)
+    fn device(&self, device_id: &str) -> Option<Device> {
+        self.devices.get(device_id).cloned()
     }
 
-    fn device_by_credential_hash(&self, credential_hash: &str) -> Option<&Device> {
-        self.devices.values().find(|d| d.credential_hash == credential_hash)
+    fn device_by_credential_hash(&self, credential_hash: &str) -> Option<Device> {
+        self.devices.values().find(|d| d.credential_hash == credential_hash).cloned()
     }
 
     fn account_count(&self) -> usize {

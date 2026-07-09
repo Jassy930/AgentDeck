@@ -18,7 +18,13 @@ mod relay_link;
 mod router;
 #[cfg(feature = "server")]
 pub mod server;
+// R1b Task 3：SQLite backed `RelayStore` 实现；`pub` 因 Task 9 main.rs 需要
+// 跨 crate 构造（`agentdeck-relay` 二进制 crate）。default（无 server feature）
+// 构建下仍只被自身单测使用，保留 dead_code 静默。
+#[allow(dead_code)]
+pub mod store;
 
 pub use bridge::StdioMachineBridge;
 pub use relay_link::RelayLink;
 pub use router::{FakeRelay, RelayClient};
+pub use store::SqliteRelayStore;

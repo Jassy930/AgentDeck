@@ -28,6 +28,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 rustls = { version = "0.23", optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }
+# R1b Task 3：SQLite backed `RelayStore`。`bundled` feature 拉进 sqlite3 C 源码
+# 避开系统 lib 依赖（portability + CI 一致性）。非 optional——Task 4 Core/router
+# 层无 server feature 门也要用（persist-before-deliver）。
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [features]
 default = []
@@ -55,3 +59,5 @@ ureq = { version = "2", features = ["json"] }
 # 这里显式声明是因为测试代码要直接引用 `CertificateDer`/`ServerName` 等类型。
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 rustls-pki-types = "1"
+# R1b Task 3：`SqliteRelayStore::open` 跨重启单测需要临时目录。
+tempfile = "3"
