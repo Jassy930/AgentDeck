@@ -184,6 +184,35 @@ impl SqliteRelayStore {
         .optional()
         .map(|opt| opt.unwrap_or(0))
     }
+
+    /// Task 5：记录一次 Ack 的落盘游标。`MAX(acked_seq, ?2)` 防止乱序/重复 Ack
+    /// 回退游标（Ack 乱序或重复到达时保守取最大，不允许倒退）。该行必须已由
+    /// `reserve_and_persist_event` 创建（即至少发布过一条事件）——Ack 早于任何
+    /// 事件发布时此 `UPDATE` 影响 0 行，静默无操作（该场景无意义：没有 seq 可
+    /// ack）。
+    pub(crate) fn record_ack(&self, conversation_id: &str, up_to_seq: u64) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        conn.execute(
+            "UPDATE seq_high_water_marks SET acked_seq = MAX(acked_seq, ?2) WHERE conversation_id = ?1",
+            params![conversation_id, up_to_seq],
+        )?;
+        Ok(())
+    }
+
+    /// 测试断言用：读回 `record_ack` 落盘的 `acked_seq`。无该 conversation 记录
+    /// 时返回 `None`（与 `load_next_seq` 的"未知即 0"不同——`acked_seq` 的默认
+    /// 值 `-1` 语义是"尚未 ack"，用 `Option` 更诚实地表达"行不存在"与"已 ack 到
+    /// -1（从未 ack）"的区别）。
+    #[cfg(test)]
+    pub(crate) fn load_acked_seq(&self, conversation_id: &str) -> rusqlite::Result<Option<i64>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        conn.query_row(
+            "SELECT acked_seq FROM seq_high_water_marks WHERE conversation_id = ?1",
+            params![conversation_id],
+            |r| r.get(0),
+        )
+        .optional()
+    }
 }
 
 fn role_to_str(role: DeviceRole) -> &'static str {

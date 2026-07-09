@@ -14,6 +14,11 @@ use crate::store::SqliteRelayStore;
 /// 边缘时间戳获取：`conv_events.created_at_ms` 只用于审计/排障展示，不参与
 /// seq 高水位计算（seq 单调性完全由 `reserve_and_persist_event` 的 SQL 事务
 /// 保证）。用 `std::time`，不引入新依赖。
+/// Task 5：`conv_buffer` 每 conversation 保留的最近事件数硬上界（独立于 Ack
+/// 生效的 OOM 防线——即使暂无客户端发 Ack，超过此值也会丢最旧的）。Task 9
+/// 换成 `RelayConfig` 传入的可配置值；本任务先用私有常量占位。
+const DEFAULT_CONV_BUFFER_CAP: usize = 1000;
+
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -175,6 +180,10 @@ struct Core {
     subs_machines: HashSet<ClientId>,
     subs_sessions: HashMap<String, HashSet<ClientId>>,
     subs_events: HashMap<String, HashSet<ClientId>>,
+    /// Task 5：每连接对每 conversation 的已确认 seq（`Ack.up_to_seq` 的内存
+    /// 镜像，用于计算 min-acked 以驱动 `conv_buffer` trim）。连接断开时清理
+    /// 该连接的所有 entry（见 `handle_disconnect`）。
+    conn_acked_seq: HashMap<(ClientId, String), u64>,
     /// send_to 遇到满/已关闭的连接时延迟登记于此，避免在持有 conns 借用时直接
     /// handle_disconnect（借用冲突）；由 run 循环在每条消息处理完后统一 drain。
     disconnect_conns: Vec<ClientId>,
@@ -198,6 +207,7 @@ impl Core {
             subs_machines: HashSet::new(),
             subs_sessions: HashMap::new(),
             subs_events: HashMap::new(),
+            conn_acked_seq: HashMap::new(),
             disconnect_conns: Vec::new(),
             store,
         }
@@ -454,7 +464,14 @@ impl Core {
                     seq,
                     data,
                 };
-                self.conv_buffer.entry(conversation_id.clone()).or_default().push(ev.clone());
+                let buf = self.conv_buffer.entry(conversation_id.clone()).or_default();
+                buf.push(ev.clone());
+                // 硬上界 FIFO（独立于 Ack 生效——不管有没有客户端发 Ack，超过
+                // 上界都丢最旧的，防止无界内存增长）。
+                if buf.len() > DEFAULT_CONV_BUFFER_CAP {
+                    let drop_count = buf.len() - DEFAULT_CONV_BUFFER_CAP;
+                    buf.drain(0..drop_count);
+                }
                 if let Some(devs) = self.subs_events.get(&conversation_id) {
                     for dev in devs.clone() {
                         self.send_to(dev, &trace, ev.clone()).await;
@@ -515,7 +532,67 @@ impl Core {
                     }
                 }
             }
-            RelayControlMsg::Ack { .. } | RelayControlMsg::Heartbeat { .. } => {}
+            RelayControlMsg::Heartbeat { .. } => {}
+            RelayControlMsg::Ack { up_to_seq, conversation_id } => {
+                // 鉴权：Ack 发起方是订阅方（Device），不是 conversation 的
+                // owner（machine）——检查该连接确实订阅了该 conversation，
+                // 未订阅却发 Ack 静默丢弃（不 send Error，避免为无意义的乱序
+                // /过期 Ack 制造噪音）。
+                let is_subscribed = self
+                    .subs_events
+                    .get(&conversation_id)
+                    .map(|subs| subs.contains(&id))
+                    .unwrap_or(false);
+                if !is_subscribed {
+                    return;
+                }
+                // 内存侧记录该连接对该 conversation 的 acked_seq（只前进不倒退，
+                // 与落盘侧 `MAX(acked_seq, ?)` 语义一致，防止乱序/重复 Ack 回退
+                // 游标）。
+                self.conn_acked_seq
+                    .entry((id, conversation_id.clone()))
+                    .and_modify(|s| *s = (*s).max(up_to_seq))
+                    .or_insert(up_to_seq);
+                // min-acked：该 conversation 当前所有订阅连接里 acked_seq 的最小
+                // 值（未 ack 过的连接按 0 计）——防止裁掉某个慢连接尚未看到的
+                // 事件。
+                let subs = self.subs_events.get(&conversation_id).cloned().unwrap_or_default();
+                let min_acked = subs
+                    .iter()
+                    .map(|conn_id| {
+                        self.conn_acked_seq
+                            .get(&(*conn_id, conversation_id.clone()))
+                            .copied()
+                            .unwrap_or(0)
+                    })
+                    .min()
+                    .unwrap_or(0);
+                // trim conv_buffer 到 min-acked：只裁掉 `seq <= min_acked` 的，
+                // 不裁到 `up_to_seq` 本身（防止裁掉其它订阅连接尚未确认看到的
+                // 部分）。
+                if let Some(buf) = self.conv_buffer.get_mut(&conversation_id) {
+                    buf.retain(|ev| match ev {
+                        RelayControlMsg::Event { seq, .. } => *seq > min_acked,
+                        _ => true,
+                    });
+                }
+                // 落盘：fire-and-forget（不阻塞 Core 单任务循环）——用
+                // `tokio::spawn` 包一层，spawn_blocking 的 join 结果只用于
+                // 记日志，不影响后续消息处理。
+                let store = self.store.clone();
+                let conv = conversation_id.clone();
+                tokio::spawn(async move {
+                    match tokio::task::spawn_blocking(move || store.record_ack(&conv, up_to_seq)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            eprintln!("agentdeck-relay: record_ack failed: {err:?}");
+                        }
+                        Err(join_err) => {
+                            eprintln!("agentdeck-relay: record_ack spawn_blocking join failed: {join_err:?}");
+                        }
+                    }
+                });
+            }
             RelayControlMsg::SendCommand { request_id, target, data } => {
                 let machine_id = match &target {
                     CommandTarget::Machine { machine_id } => Some(machine_id.clone()),
@@ -624,6 +701,10 @@ impl Core {
         for set in self.subs_events.values_mut() {
             set.remove(&id);
         }
+        // Task 5：清理该连接在所有 conversation 上记录的 acked_seq，避免
+        // `conn_acked_seq` 里累积已断开连接的僵尸 entry（内存泄漏 + 污染
+        // min-acked 计算——已断开连接不应再拖慢其它订阅方的 trim）。
+        self.conn_acked_seq.retain(|(cid, _), _| cid != &id);
         // 机器断开 → 标记离线并广播
         let offline: Vec<String> = self
             .machines
@@ -1285,5 +1366,108 @@ mod tests {
         let (conv, turn, _seq) = recv_event(&mut check).await;
         assert_eq!(conv, "C1");
         assert_eq!(turn, "S1");
+    }
+
+    /// Task 5：`conv_buffer` 硬上界 FIFO 是独立于 Ack 的正确性防线——即使暂无
+    /// 客户端发过 Ack，超过 `DEFAULT_CONV_BUFFER_CAP` 后仍必须丢最旧的，防止
+    /// 无界内存增长（OOM）。
+    #[tokio::test]
+    async fn conv_buffer_hard_cap_drops_oldest_regardless_of_ack() {
+        let relay = FakeRelay::start();
+        let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
+        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+
+        // 同步屏障：`m.send(...).await` 只保证消息进入 m 自己的本地 channel，
+        // 不保证 Core 已经处理完——1010 条 PublishEvent 全靠 `.await` 排队并不
+        // 能构成"Core 已处理完"的证据（早期版本的测试因此 flaky：新订阅者
+        // 可能在 Core 消化完积压之前就已订阅，读到未裁剪的 buffer）。
+        // Core 单任务串行消费 core_rx，且同一连接 m 发出的消息严格按 enqueue
+        // 顺序被处理——因此发布循环之后，再从 m 发一条 `RegisterMachine`
+        // （幂等）触发对 `sync_dev` 的广播，收到该广播即可断言此前所有
+        // PublishEvent 已经处理完毕（conv_buffer 已完成硬上界裁剪）。
+        let mut sync_dev = relay.connect(ClientRole::Device { device_id: "SYNC".into() }).await;
+        sync_dev
+            .send(frame(
+                ClientRole::Device { device_id: "SYNC".into() },
+                RelayControlMsg::Subscribe { target: SubTarget::Machines },
+            ))
+            .await;
+        let _ = sync_dev.recv().await; // 消化订阅时的初始 MachineList 快照
+
+        for i in 0..(DEFAULT_CONV_BUFFER_CAP + 10) {
+            publish(&m, "C1", &format!("S{i}")).await;
+        }
+
+        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        let barrier = tokio::time::timeout(std::time::Duration::from_secs(10), sync_dev.recv())
+            .await
+            .expect("屏障 RegisterMachine 广播超时——Core 可能被 1010 条持久化拖慢")
+            .expect("frame");
+        assert!(matches!(barrier.msg, RelayControlMsg::MachineList { .. }));
+
+        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        d.send(frame(
+            ClientRole::Device { device_id: "D1".into() },
+            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: Some(0) } },
+        ))
+        .await;
+        let (_, _, first_seq) = recv_event(&mut d).await;
+        assert!(first_seq >= 10, "硬上界应已丢弃最旧的至少 10 条（不管有没有 ack），got first_seq={first_seq}");
+    }
+
+    /// Task 5：`Ack` 分支不再是 no-op——鉴权通过（发起方已订阅该 conversation）
+    /// 后，`record_ack` 通过 fire-and-forget `spawn_blocking` 异步落盘
+    /// `seq_high_water_marks.acked_seq`。用轮询（而非固定 sleep）等待落盘完成，
+    /// 避免 CI 下调度延迟导致的 flaky。
+    #[tokio::test]
+    async fn ack_records_to_store_acked_seq() {
+        let store = crate::SqliteRelayStore::open_in_memory().unwrap();
+        let store_check = store.clone();
+        let relay = FakeRelay::start_with_store(store);
+
+        let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
+        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+
+        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        d.send(frame(
+            ClientRole::Device { device_id: "D1".into() },
+            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: None } },
+        ))
+        .await;
+
+        for i in 0..4 {
+            publish(&m, "C1", &format!("S{i}")).await;
+        }
+        for _ in 0..4 {
+            recv_event(&mut d).await;
+        }
+
+        // 未订阅的连接发 Ack 应被静默丢弃——先验证这一边界，避免误把
+        // "订阅门槛" 和 "落盘生效" 两件事混在一次断言里。
+        let stranger = relay.connect(ClientRole::Device { device_id: "D2".into() }).await;
+        stranger
+            .send(frame(
+                ClientRole::Device { device_id: "D2".into() },
+                RelayControlMsg::Ack { up_to_seq: 999, conversation_id: "C1".into() },
+            ))
+            .await;
+
+        d.send(frame(
+            ClientRole::Device { device_id: "D1".into() },
+            RelayControlMsg::Ack { up_to_seq: 3, conversation_id: "C1".into() },
+        ))
+        .await;
+
+        let mut acked = store_check.load_acked_seq("C1").unwrap();
+        for _ in 0..50 {
+            if acked == Some(3) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            acked = store_check.load_acked_seq("C1").unwrap();
+        }
+        assert_eq!(acked, Some(3), "订阅方的 Ack 应异步落盘到 seq_high_water_marks.acked_seq");
     }
 }

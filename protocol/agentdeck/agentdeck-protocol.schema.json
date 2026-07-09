@@ -2628,10 +2628,7 @@
           "additionalProperties": false,
           "properties": {
             "conversationId": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             },
             "msg": {
               "enum": [
@@ -2646,6 +2643,7 @@
             }
           },
           "required": [
+            "conversationId",
             "msg",
             "upToSeq"
           ],
@@ -3222,10 +3220,7 @@
               "additionalProperties": false,
               "properties": {
                 "conversationId": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
+                  "type": "string"
                 },
                 "msg": {
                   "enum": [
@@ -3240,6 +3235,7 @@
                 }
               },
               "required": [
+                "conversationId",
                 "msg",
                 "upToSeq"
               ],

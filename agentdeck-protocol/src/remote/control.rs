@@ -94,7 +94,7 @@ pub enum RelayControlMsg {
         #[serde(rename = "upToSeq")]
         up_to_seq: u64,
         #[serde(rename = "conversationId")]
-        conversation_id: Option<String>,
+        conversation_id: String,
     },
     // relay → client
     MachineList {
