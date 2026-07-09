@@ -215,6 +215,11 @@ pub enum PairError {
     MalformedResp,
     #[error("failed to persist credentials: {0}")]
     Io(String),
+    /// 凭据文件里的 `role` 字段既不是 `"machine"` 也不是 `"device"`——多半是凭据
+    /// 文件被手工改坏，或未来新增角色但本 CLI 版本还不认识。绝不静默 fallback
+    /// 到某个角色继续跑（那会让请求带着错误身份连上 relay）。
+    #[error("unrecognized credential role {0:?} (expected \"machine\" or \"device\")")]
+    InvalidRole(String),
 }
 
 /// 凭据文件路径：`<data_dir>/relay/<profile>.credentials.json`。profile 作为
@@ -366,20 +371,24 @@ pub async fn pair(
 
 // ── 已配对 op 的执行（machines/sessions/watch/send/ping）─────────────────────
 
-fn role_for(creds: &RelayCredentials) -> ClientRole {
+/// 凭据文件里 `role: String` 字段到 wire `ClientRole` 的映射——未识别的字符串
+/// 直接报错，绝不静默 fallback 到某个角色（那会让请求带着错误身份连上
+/// relay，且现象是"莫名其妙的权限/授权失败"而不是清楚的报错）。
+fn role_for(creds: &RelayCredentials) -> Result<ClientRole, PairError> {
     match creds.role.as_str() {
-        "machine" => ClientRole::Machine { machine_id: creds.device_id.clone() },
-        _ => ClientRole::Device { device_id: creds.device_id.clone() },
+        "machine" => Ok(ClientRole::Machine { machine_id: creds.device_id.clone() }),
+        "device" => Ok(ClientRole::Device { device_id: creds.device_id.clone() }),
+        other => Err(PairError::InvalidRole(other.to_string())),
     }
 }
 
-async fn connect_device(creds: &RelayCredentials) -> Result<WsRelayClient, WsError> {
+async fn connect_device(creds: &RelayCredentials, role: ClientRole) -> Result<WsRelayClient, WsError> {
     let ws_url = format!(
         "{}/v1/connect?v={}",
         creds.relay_url,
         agentdeck_protocol::remote::RELAY_PROTOCOL_VERSION
     );
-    WsRelayClient::connect(&ws_url, &creds.credential, role_for(creds)).await
+    WsRelayClient::connect(&ws_url, &creds.credential, role).await
 }
 
 /// 读凭据文件失败时打印统一的提示（先跑 `pair`）并返回失败退出码。
@@ -430,7 +439,14 @@ async fn cmd_machines(relay: &str, profile: &str, data_dir: Option<&str>) -> Exi
         Err(code) => return code,
     };
     warn_relay_mismatch(relay, &creds.relay_url);
-    let mut link = match connect_device(&creds).await {
+    let role = match role_for(&creds) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("remote.machines: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut link = match connect_device(&creds, role.clone()).await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("remote.machines: connect 失败: {e}");
@@ -438,7 +454,7 @@ async fn cmd_machines(relay: &str, profile: &str, data_dir: Option<&str>) -> Exi
         }
     };
     link.send(RemoteFrame::control(
-        role_for(&creds),
+        role,
         "cli-machines".into(),
         0,
         RelayControlMsg::Subscribe { target: SubTarget::Machines },
@@ -472,7 +488,14 @@ async fn cmd_sessions(relay: &str, machine_id: &str, profile: &str, data_dir: Op
         Err(code) => return code,
     };
     warn_relay_mismatch(relay, &creds.relay_url);
-    let mut link = match connect_device(&creds).await {
+    let role = match role_for(&creds) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("remote.sessions: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut link = match connect_device(&creds, role.clone()).await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("remote.sessions: connect 失败: {e}");
@@ -480,7 +503,7 @@ async fn cmd_sessions(relay: &str, machine_id: &str, profile: &str, data_dir: Op
         }
     };
     link.send(RemoteFrame::control(
-        role_for(&creds),
+        role,
         "cli-sessions".into(),
         0,
         RelayControlMsg::Subscribe { target: SubTarget::Sessions { machine_id: machine_id.to_string() } },
@@ -522,7 +545,14 @@ async fn cmd_watch(relay: &str, conversation_id: &str, profile: &str, data_dir: 
         Err(code) => return code,
     };
     warn_relay_mismatch(relay, &creds.relay_url);
-    let mut link = match connect_device(&creds).await {
+    let role = match role_for(&creds) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("remote.watch: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut link = match connect_device(&creds, role.clone()).await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("remote.watch: connect 失败: {e}");
@@ -530,7 +560,7 @@ async fn cmd_watch(relay: &str, conversation_id: &str, profile: &str, data_dir: 
         }
     };
     link.send(RemoteFrame::control(
-        role_for(&creds),
+        role,
         "cli-watch".into(),
         0,
         RelayControlMsg::Subscribe {
@@ -575,7 +605,14 @@ async fn cmd_send(relay: &str, conversation_id: &str, text: &str, profile: &str,
         Err(code) => return code,
     };
     warn_relay_mismatch(relay, &creds.relay_url);
-    let mut link = match connect_device(&creds).await {
+    let role = match role_for(&creds) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("remote.send: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut link = match connect_device(&creds, role.clone()).await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("remote.send: connect 失败: {e}");
@@ -591,7 +628,7 @@ async fn cmd_send(relay: &str, conversation_id: &str, text: &str, profile: &str,
         }
     };
     link.send(RemoteFrame::control(
-        role_for(&creds),
+        role,
         "cli-send".into(),
         0,
         RelayControlMsg::SendCommand {
@@ -633,7 +670,14 @@ async fn cmd_ping(relay: &str, machine_id: &str, profile: &str, data_dir: Option
         Err(code) => return code,
     };
     warn_relay_mismatch(relay, &creds.relay_url);
-    let mut link = match connect_device(&creds).await {
+    let role = match role_for(&creds) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("remote.ping: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut link = match connect_device(&creds, role.clone()).await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("remote.ping: connect 失败: {e}");
@@ -649,7 +693,7 @@ async fn cmd_ping(relay: &str, machine_id: &str, profile: &str, data_dir: Option
         }
     };
     link.send(RemoteFrame::control(
-        role_for(&creds),
+        role,
         "cli-ping".into(),
         0,
         RelayControlMsg::SendCommand {
@@ -687,7 +731,14 @@ async fn cmd_approve_deny(
         Err(code) => return code,
     };
     warn_relay_mismatch(relay, &creds.relay_url);
-    let mut link = match connect_device(&creds).await {
+    let role = match role_for(&creds) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("remote.decision: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut link = match connect_device(&creds, role.clone()).await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("remote.decision: connect 失败: {e}");
@@ -707,7 +758,7 @@ async fn cmd_approve_deny(
     };
     let cmd_request_id = format!("cli-decision-{}", short_random_suffix());
     link.send(RemoteFrame::control(
-        role_for(&creds),
+        role,
         "cli-decision".into(),
         0,
         RelayControlMsg::SendCommand {
@@ -749,7 +800,14 @@ pub async fn run(op: RemoteOpArg, profile: &str, data_dir: Option<&str>) -> Exit
         RemoteOpArg::Pair { relay, bootstrap_secret, role } => {
             match pair(&relay, &bootstrap_secret, role, profile, data_dir).await {
                 Ok(creds) => {
-                    println!("{}", serde_json::to_string_pretty(&creds).unwrap());
+                    // 明文 bearer credential 只落盘（0600 权限保护），绝不打到
+                    // stdout/日志——这里只打印人类可读的、不敏感的确认信息。
+                    println!("pair ok:");
+                    println!("  saved: {}", creds_path(data_dir, profile).display());
+                    println!("  account: {}", creds.account_id);
+                    println!("  device: {}", creds.device_id);
+                    println!("  role: {}", creds.role);
+                    println!("  relay: {}", creds.relay_url);
                     ExitCode::SUCCESS
                 }
                 Err(e) => {

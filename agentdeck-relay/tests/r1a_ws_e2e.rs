@@ -617,3 +617,161 @@ async fn ws_connect_rejects_wrong_protocol_version() {
         "protocol version 不符时 WS 连接必须被 relay 拒绝（v=999 不该被 upgrade）"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 测试 6（`tls` feature 门内）：`--tls-cert/--tls-key` 真正接通
+// `axum-server` + `rustls` 的 TLS 终结（whole-branch review Critical #1
+// fix）——REST enroll 走一个明文兄弟监听拿到真实凭据（REST handler 与传输层
+// 无关，明文/TLS 复用同一份 `pair::challenge`/`pair::complete`，这里选明文只是
+// 避免连 `ureq` 也要去信任测试自签证书），随后用同一个共享 `store` 另起一个
+// TLS 监听，验证 WS 握手在真 TLS 终结下依然成立。
+//
+// **不**经 `agentdeck_relay_client::WsRelayClient`——它 R1a 只支持 `ws://`
+// （Task 7 遗留，wss 客户端支持留给 R1b，brief 明确不许为此测试改它的
+// 签名）；这里手写 wss:// 直连：`tokio-tungstenite` + 自定义
+// `rustls::client::danger::ServerCertVerifier`（只信任测试自签证书、不校验
+// 证书链——测试专用，生产客户端不会用这个 verifier）。
+// ---------------------------------------------------------------------------
+#[cfg(feature = "tls")]
+mod tls_e2e {
+    use super::*;
+    use std::sync::Arc;
+
+    use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+    use tokio_tungstenite::{Connector, connect_async_tls_with_config};
+
+    /// 一次性生成的测试自签证书（`openssl req -x509 -newkey ed25519 ...`，
+    /// `CN=127.0.0.1`，10 年有效期）——只用于本测试信任链，不代表任何生产
+    /// 证书材料。key 文件权限特意放宽到 0644（仓库内测试 fixture，不是真机密）。
+    const TEST_CERT_PEM: &[u8] = include_bytes!("fixtures/test_cert.pem");
+    const TEST_KEY_PEM: &[u8] = include_bytes!("fixtures/test_key.pem");
+
+    /// 只信任任意证书、跳过证书链校验的 rustls verifier——**仅供本测试**验证
+    /// "TLS 握手本身能否成功"，不代表生产客户端的证书信任策略（生产 wss
+    /// 客户端支持连同真实证书校验一起留给 R1b）。
+    #[derive(Debug)]
+    struct AcceptAnyCert;
+
+    impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::CryptoProvider::get_default()
+                .map(|p| p.signature_verification_algorithms.supported_schemes())
+                .unwrap_or_default()
+        }
+    }
+
+    /// 本测试进程里同时编译了 `aws-lc-rs`（rustls 默认）与 `ring`
+    /// （`tokio-tungstenite` 的 `rustls-tls-native-roots` feature 传递引入）
+    /// 两个 rustls crypto provider，rustls 无法自动二选一——首次构造任何
+    /// `ServerConfig`/`ClientConfig` 前必须显式 `install_default()`，否则
+    /// panic（"Could not automatically determine the process-level
+    /// CryptoProvider"）。`Once` 保证多个 `#[tokio::test]` 并发跑本测试文件时
+    /// 只装一次；只在这个 TLS 专属子模块调用，不影响其余 5 个不碰 rustls 的
+    /// 明文测试。
+    fn ensure_crypto_provider_installed() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+    }
+
+    #[tokio::test]
+    async fn wss_connect_over_tls() {
+        ensure_crypto_provider_installed();
+
+        // 1) 明文兄弟监听：真实 REST challenge/complete enroll 一个 device 凭据。
+        let (_plain_addr, store, base_url) = setup_server("boot-tls").await;
+        let enrolled =
+            enroll(&base_url, "boot-tls", "dev-tls", "device", Some("owner-tls")).await;
+
+        // 2) 用同一个共享 store（已含刚 enroll 的凭据）另起一个 TLS 监听。
+        let tls_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tls_addr = tls_listener.local_addr().unwrap();
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(
+            TEST_CERT_PEM.to_vec(),
+            TEST_KEY_PEM.to_vec(),
+        )
+        .await
+        .expect("测试 fixture 自签证书/私钥必须能装载");
+        let config = RelayConfig {
+            bind: tls_addr,
+            bootstrap_secret: "boot-tls".to_string(),
+            // `serve_with_listener_tls` 不读 `config.tls`（cert/key 已经作为
+            // `tls_config` 参数单独传入）——这里留 `None` 避免误导性地暗示
+            // 这两个占位路径会被读取。
+            tls: None,
+            allow_plaintext: true,
+            log_level: "info".to_string(),
+        };
+        let relay = agentdeck_relay::FakeRelay::start();
+        tokio::spawn(agentdeck_relay::server::serve_with_listener_tls(
+            config,
+            store,
+            relay,
+            tls_listener,
+            tls_config,
+        ));
+
+        // 3) 手写 wss:// 直连：自定义 Authorization header + 信任测试自签
+        //    证书的 rustls ClientConfig。
+        let url = format!(
+            "wss://{tls_addr}/v1/connect?v={}",
+            agentdeck_protocol::remote::RELAY_PROTOCOL_VERSION
+        );
+        let mut request = url.into_client_request().expect("valid ws url");
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            format!("Bearer {}", enrolled.credential).parse().unwrap(),
+        );
+
+        let client_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
+            .with_no_client_auth();
+        let connector = Connector::Rustls(Arc::new(client_config));
+
+        let result = tokio::time::timeout(
+            RECV_TIMEOUT,
+            connect_async_tls_with_config(request, None, false, Some(connector)),
+        )
+        .await
+        .expect("wss 握手超时");
+
+        assert!(
+            result.is_ok(),
+            "wss:// 直连必须握手成功——TLS 终结（axum-server + rustls）已真正接通: {:?}",
+            result.err().map(|e| e.to_string())
+        );
+    }
+}

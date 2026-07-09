@@ -32,9 +32,31 @@ pub enum ServeError {
     Bind(std::io::Error),
     #[error("relay server io error: {0}")]
     Io(std::io::Error),
+    /// `--tls-cert`/`--tls-key` 指向的文件读取或 PEM 解析失败（`tls` feature
+    /// 打开时才会真正构造：证书/私钥装载只发生在 `serve()` 的 TLS 分支）。
+    #[cfg(feature = "tls")]
+    #[error("relay tls cert/key load failed: {0}")]
+    TlsLoad(String),
+}
+
+/// 装配共享的 axum `Router`（REST enroll + WS 握手）——明文/TLS 两条 serve
+/// 路径共用同一份路由与 handler，只是外层监听套不套 TLS 终结不同。
+fn build_app(state: AppState) -> Router {
+    Router::new()
+        .route("/v1/pair/challenge", post(pair::challenge))
+        .route("/v1/pair/complete", post(pair::complete))
+        .route("/v1/connect", get(ws::connect))
+        .with_state(state)
 }
 
 /// 装配 axum `Router`（REST enroll + WS 握手）并起监听——阻塞直到进程终止或出错。
+///
+/// TLS 分支：`config.tls`（`--tls-cert`/`--tls-key`）非空且二进制编译了 `tls`
+/// feature 时，装载证书/私钥并走 `serve_with_listener_tls`（真 TLS 终结，
+/// `axum-server` + `rustls`）；否则（含"配了 `--tls-cert`/`--tls-key` 但二进制
+/// 未编译 `tls` feature"这一边缘情形——`RelayConfig::validate_transport_gate`
+/// 只校验路径是否配置，不知道当前二进制是否真的编译了 `tls` feature）回退明文
+/// `serve_with_listener`，并在后一种情形下打一条 `tracing::warn!`——不静默。
 pub async fn serve(
     config: RelayConfig,
     store: InMemoryRelayStore,
@@ -42,7 +64,31 @@ pub async fn serve(
 ) -> Result<(), ServeError> {
     let bind = config.bind;
     let listener = tokio::net::TcpListener::bind(bind).await.map_err(ServeError::Bind)?;
-    serve_with_listener(config, Arc::new(Mutex::new(store)), relay, listener).await
+    let store = Arc::new(Mutex::new(store));
+
+    if let Some(tls_paths) = config.tls.clone() {
+        if cfg!(feature = "tls") {
+            #[cfg(feature = "tls")]
+            {
+                let tls_config =
+                    axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls_paths.cert, &tls_paths.key)
+                        .await
+                        .map_err(|e| ServeError::TlsLoad(e.to_string()))?;
+                return serve_with_listener_tls(config, store, relay, listener, tls_config).await;
+            }
+            #[cfg(not(feature = "tls"))]
+            unreachable!("cfg!(feature = \"tls\") 上面已判为 false 才会走到这个分支")
+        } else {
+            tracing::warn!(
+                cert = %tls_paths.cert,
+                key = %tls_paths.key,
+                "config.tls 已配置（--tls-cert/--tls-key）但本二进制未编译 tls feature——\
+                 回退明文服务；请用 `cargo build -p agentdeck-relay --features server,tls` 重新构建以启用真 TLS 终结"
+            );
+        }
+    }
+
+    serve_with_listener(config, store, relay, listener).await
 }
 
 /// `serve` 的可测试变体：接受一个已就绪的 `TcpListener`（e2e 测试用
@@ -61,13 +107,40 @@ pub async fn serve_with_listener(
         bootstrap_secret: config.bootstrap_secret,
         challenge_ttl_ms: 60_000,
     };
-    let app = Router::new()
-        .route("/v1/pair/challenge", post(pair::challenge))
-        .route("/v1/pair/complete", post(pair::complete))
-        .route("/v1/connect", get(ws::connect))
-        .with_state(state);
+    let app = build_app(state);
 
     axum::serve(listener, app).await.map_err(ServeError::Io)?;
+    Ok(())
+}
+
+/// `serve_with_listener` 的 TLS 变体：`tls_config`（证书/私钥已从磁盘装载并
+/// 解析好的 `RustlsConfig`）驱动 `axum-server` 的 rustls acceptor 完成真
+/// TLS 终结，而不是明文 `axum::serve`。`listener` 与明文版一样是外部已经
+/// `bind` 好的 `tokio::net::TcpListener`（e2e 测试同样可以 `127.0.0.1:0` 绑定
+/// 后读回动态端口）——`axum-server` 的 `from_tcp_rustls` 要的是
+/// `std::net::TcpListener`，`into_std()` 转换后它自己会重新置为非阻塞模式
+/// （见 `axum-server` 内部 `Listener::Std` 分支），调用方不需要关心。
+#[cfg(feature = "tls")]
+pub async fn serve_with_listener_tls(
+    config: RelayConfig,
+    store: Arc<Mutex<InMemoryRelayStore>>,
+    relay: FakeRelay,
+    listener: tokio::net::TcpListener,
+    tls_config: axum_server::tls_rustls::RustlsConfig,
+) -> Result<(), ServeError> {
+    let state = AppState {
+        store,
+        relay: Arc::new(relay),
+        bootstrap_secret: config.bootstrap_secret,
+        challenge_ttl_ms: 60_000,
+    };
+    let app = build_app(state);
+
+    let std_listener = listener.into_std().map_err(ServeError::Io)?;
+    axum_server::tls_rustls::from_tcp_rustls(std_listener, tls_config)
+        .serve(app.into_make_service())
+        .await
+        .map_err(ServeError::Io)?;
     Ok(())
 }
 

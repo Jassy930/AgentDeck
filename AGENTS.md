@@ -101,6 +101,13 @@ bash scripts/check-daemon-no-net.sh
 agentdeck-relay --bootstrap-secret s &
 agentdeck-cli remote pair --relay ws://127.0.0.1:PORT --bootstrap-secret s
 agentdeck-cli remote machines --relay ws://127.0.0.1:PORT
+# （PORT 用 `agentdeck-relay` 启动时打印的实际端口替换；默认 config 里 bind 是
+#  127.0.0.1:8443，除非通过 --bind 或 AGENTDECK_RELAY_BIND 覆盖）
+
+# 用 TLS 起 relay（生产模式，非 loopback）
+cargo run -p agentdeck-relay --features server,tls -- \
+  --bind 0.0.0.0:8443 --tls-cert path/to/cert.pem --tls-key path/to/key.pem \
+  --bootstrap-secret <secret>
 ```
 
 改动 `RELAY_PROTOCOL_VERSION`（`agentdeck-protocol/src/remote/mod.rs`）或 protocol schema 后须：

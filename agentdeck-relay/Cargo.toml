@@ -27,11 +27,12 @@ tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 rustls = { version = "0.23", optional = true }
 tokio-rustls = { version = "0.26", optional = true }
+axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }
 
 [features]
 default = []
 server = ["dep:axum", "dep:futures-util", "dep:tracing", "dep:tracing-subscriber", "tokio/net", "tokio/rt-multi-thread"]
-tls = ["server", "dep:rustls", "dep:tokio-rustls"]
+tls = ["server", "dep:rustls", "dep:tokio-rustls", "dep:axum-server"]
 
 [[bin]]
 name = "agentdeck-relay"
@@ -46,3 +47,11 @@ required-features = ["server"]
 # 编译本测试文件时已随 feature 一并可见，同理无需重复声明。
 agentdeck-relay-client = { path = "../agentdeck-relay-client" }
 ureq = { version = "2", features = ["json"] }
+# 仅供 `tests/r1a_ws_e2e.rs` 里 `#[cfg(all(feature = "server", feature = "tls"))]`
+# 门内的 `wss_connect_over_tls` 测试使用：手动直连 wss（不经 `agentdeck-relay-client`
+# 的 `WsRelayClient`——它 R1a 只支持 `ws://`），用自定义 rustls
+# `ServerCertVerifier`（信任测试自签证书）绕开证书链校验。
+# `rustls-pki-types` 是 `[dependencies]` 里 `rustls`（optional）的传递依赖，
+# 这里显式声明是因为测试代码要直接引用 `CertificateDer`/`ServerName` 等类型。
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+rustls-pki-types = "1"
