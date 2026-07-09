@@ -100,7 +100,7 @@ final class HistorySidebarViewController: NSViewController {
         let ov = NSOutlineView()
         ov.style = .sourceList
         ov.headerView = nil          // no column header
-        ov.rowHeight = 36
+        ov.rowHeight = 30
         ov.intercellSpacing = NSSize(width: 0, height: 2)
         ov.indentationPerLevel = 0   // groups are not indented relative to root
         ov.autoresizesOutlineColumn = false

@@ -72,6 +72,7 @@ final class SessionViewController: NSViewController {
     // MARK: - Split view (retained for deferred initial-width application)
 
     private weak var splitVC: NSSplitViewController?
+    private var sidebarWidthConstraint: NSLayoutConstraint?
     private var didApplyInitialSidebarWidth = false
 
     // MARK: - Observation
@@ -100,7 +101,7 @@ final class SessionViewController: NSViewController {
         root.layer?.backgroundColor = NSColor.clear.cgColor
 
         // NSSplitViewController: left = sidebar, right = content
-        let splitVC = NSSplitViewController()
+        let splitVC = SidebarWidthSplitViewController()
         splitVC.splitView.isVertical = true
         splitVC.splitView.dividerStyle = .thin
         splitVC.splitView.wantsLayer = true
@@ -118,16 +119,20 @@ final class SessionViewController: NSViewController {
         // 不收起：原生窗口的最小内容宽度（~760，由内容区约束决定）够不着设计的 <760 隐藏断点，
         // 自动收起实际不可达；且收起会引发标题压红绿灯。改为固定 232 + 可拖拽 + 内容随窗口伸缩。
         sidebarItem.canCollapse = false
-        // 不加硬宽度约束（会挡住拖拽）；改用 holding priority 让侧栏在窗口缩放时保持宽度、
-        // 内容区吃伸缩，同时分隔线仍可拖。初始宽度由 viewDidLayout 的 setPosition(232) 决定。
+
+        let sidebarWidth = historySidebarVC.view.widthAnchor.constraint(equalToConstant: 232)
+        sidebarWidth.priority = .required
+        sidebarWidth.isActive = true
+        sidebarWidthConstraint = sidebarWidth
+        splitVC.sidebarWidthConstraint = sidebarWidth
 
         let contentItem = NSSplitViewItem(viewController: makeContentContainerVC())
         contentItem.minimumThickness = 300
 
         splitVC.addSplitViewItem(sidebarItem)
         splitVC.addSplitViewItem(contentItem)
-        // 侧栏保持宽度、内容区随窗口伸缩：侧栏 holding priority 高于内容。
-        splitVC.splitView.setHoldingPriority(NSLayoutConstraint.Priority(260), forSubviewAt: 0)
+        // 内容区吃窗口伸缩；侧栏宽度由上面的 required constraint 表达。
+        splitVC.splitView.setHoldingPriority(NSLayoutConstraint.Priority(250), forSubviewAt: 0)
         splitVC.splitView.setHoldingPriority(NSLayoutConstraint.Priority(250), forSubviewAt: 1)
 
         addChild(splitVC)
@@ -160,6 +165,7 @@ final class SessionViewController: NSViewController {
         // 首次布局设初始宽度 232（此时 split 已有真实 frame，setPosition 才生效）。
         if !didApplyInitialSidebarWidth {
             sv.setPosition(232, ofDividerAt: 0)
+            sidebarWidthConstraint?.constant = 232
             didApplyInitialSidebarWidth = true
         }
     }
@@ -373,5 +379,20 @@ final class SessionViewController: NSViewController {
                 ])
             }
         }
+    }
+}
+
+private final class SidebarWidthSplitViewController: NSSplitViewController {
+    weak var sidebarWidthConstraint: NSLayoutConstraint?
+
+    override func splitView(
+        _ splitView: NSSplitView,
+        constrainSplitPosition proposedPosition: CGFloat,
+        ofSubviewAt dividerIndex: Int
+    ) -> CGFloat {
+        guard dividerIndex == 0 else { return proposedPosition }
+        let width = min(max(proposedPosition, 200), 280)
+        sidebarWidthConstraint?.constant = width
+        return width
     }
 }

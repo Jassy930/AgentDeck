@@ -52,6 +52,7 @@ cargo test
 - [ ] 空态首屏对齐 Codex Desktop：透明标题栏、全高左侧侧栏、居中大标题、圆角 composer、连接卡片和底部速率提示
 - [ ] 会话态对齐 Codex Desktop：右侧 thread header、右上环境信息面板、底部悬浮 composer
 - [ ] 左侧历史侧栏（NSOutlineView）宽度约 260pt，可自由拖动分割线
+- [ ] 拖动左侧历史侧栏分割线后，点击/切换会话时分割线保持在用户拖动后的宽度
 - [ ] 历史列表刷新后按项目 `cwd` 分组展示
 - [ ] 新建会话（点击项目旁加号）→ 右侧显示空状态视图
 - [ ] 发送第一条 prompt → 会话流开始流式渲染（reasoning / shell / file-edit 行）

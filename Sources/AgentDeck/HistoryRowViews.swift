@@ -119,9 +119,10 @@ final class HistoryThreadRowView: NSView {
     }
 
     private func setup() {
-        // 全宽高亮块（最底层，选中/悬停时显色）——子项不随层级缩短，层级只靠内容左缩进表示。
+        // 全宽圆角高亮块（最底层，选中/悬停时显色）——子项不随层级缩短，层级只靠内容左缩进表示。
+        // 保持满宽贴边，仅四角切 radius-md 圆角（backgroundColor 会被 cornerRadius 裁圆，无子层故不需 masksToBounds）。
         highlightView.wantsLayer = true
-        highlightView.layer?.cornerRadius = 0
+        highlightView.layer?.cornerRadius = DesignTokens.radiusMd
         highlightView.layer?.backgroundColor = NSColor.clear.cgColor
         highlightView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(highlightView)

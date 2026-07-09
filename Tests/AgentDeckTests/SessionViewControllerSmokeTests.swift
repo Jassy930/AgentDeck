@@ -103,6 +103,38 @@ final class SessionViewControllerSmokeTests: XCTestCase {
         )
     }
 
+    func testDividerResizeSticksWithoutEventGuard() throws {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        let vc = SessionViewController(model: model)
+        let win = NSWindow(contentViewController: vc)
+        win.styleMask.insert([.titled, .resizable, .fullSizeContentView])
+        win.setContentSize(NSSize(width: 1280, height: 760))
+        win.makeKeyAndOrderFront(nil)
+        defer { win.close() }
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
+
+        let splitView = try XCTUnwrap(vc.view.firstDescendant(ofType: NSSplitView.self))
+        splitView.setPosition(250, ofDividerAt: 0)
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
+
+        XCTAssertEqual(
+            splitView.subviews.first?.frame.width ?? 0,
+            250,
+            accuracy: 1,
+            "A valid divider position must remain effective without relying on NSApp.currentEvent"
+        )
+
+        model.cwd = URL(fileURLWithPath: NSTemporaryDirectory())
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
+
+        XCTAssertEqual(
+            splitView.subviews.first?.frame.width ?? 0,
+            250,
+            accuracy: 1,
+            "Opening the conversation pane must not let content fitting reclaim sidebar width"
+        )
+    }
+
     // MARK: - Child controllers
 
     func testSessionViewControllerHasChildControllers() {
