@@ -30,6 +30,12 @@
 - `plans/2026-07-07-relay-r0-contract-spike-design.md`：Relay R0 契约 spike 设计（控制面/数据面分层、fleet 协议、内存 FakeRelay + 真实 daemon 组合、CLI remote 接口基线）。
 - `plans/2026-07-07-relay-r0-contract-spike-implementation.md`：Relay R0 契约 spike 实施计划（Task 1–9，含 T1–T4 测试矩阵与文档收口）。
 
+### Relay R1a 传输 + 鉴权骨架（2026-07-08）
+
+- `plans/2026-07-08-relay-r1-design-review.md`：Relay R1 设计评审（就绪度评估、决策拍板、R1a/R1b/R1c 切分）。
+- `plans/2026-07-08-relay-r1a-transport-auth-design.md`：Relay R1a 传输+鉴权骨架设计。
+- `plans/2026-07-08-relay-r1a-transport-auth-implementation.md`：Relay R1a 12 任务 TDD 实施计划（已全部落地）。
+
 ## 协议资料
 
 - `../protocol/SPIKE_FINDINGS.md`：Codex app-server wire framing、方法和 schema 事实源。

@@ -85,6 +85,29 @@ AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_cross_agent_history -- --
 UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot
 ```
 
+### Relay R1a（传输 + 鉴权骨架）
+
+```bash
+# Relay 服务端（server feature）测试
+cargo test -p agentdeck-relay --features server
+
+# Relay binary selfcheck（load + validate + build store/relay 后 exit）
+cargo run -p agentdeck-relay --features server -- --selfcheck --bootstrap-secret x
+
+# daemon 无 net/axum 不变量（R1a→R2 关键 invariant）
+bash scripts/check-daemon-no-net.sh
+
+# CLI remote pair + --relay 端到端（需先起 relay）
+agentdeck-relay --bootstrap-secret s &
+agentdeck-cli remote pair --relay ws://127.0.0.1:PORT --bootstrap-secret s
+agentdeck-cli remote machines --relay ws://127.0.0.1:PORT
+```
+
+改动 `RELAY_PROTOCOL_VERSION`（`agentdeck-protocol/src/remote/mod.rs`）或 protocol schema 后须：
+```bash
+UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot
+```
+
 ## 浏览与外部资料
 
 需要网页资料时优先使用当前环境可用的官方浏览工具和一手来源。不要引入项目级外部浏览 skill 依赖，也不要要求安装额外工具才能在本仓库工作。

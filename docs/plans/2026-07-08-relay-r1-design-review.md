@@ -102,6 +102,29 @@
 
 > 注意：这个切分把母设计 §9「R1 = 单纯 relay MVP」实质**扩展**为「R1 = 可安全联网的 relay MVP」——因为「开放网络端点但不鉴权」不可接受。R1 的真实工作量因此显著大于母设计字面，需在正式设计/计划时按此认知排期。
 
+### R1a 落地状态（2026-07-09）
+
+R1a（传输+鉴权骨架）已按 `docs/plans/2026-07-08-relay-r1a-transport-auth-implementation.md` 12 任务 TDD 全部落地并通过 SDD subagent 驱动 review。commits `005be32..65fd0d2 + 收尾 commit`。
+
+- **Task 1-2**：`DataEnvelope` base64 wire、`RELAY_PROTOCOL_VERSION 0→1`、类型化 failure 常量、`AuthContext` 脱敏 Debug
+- **Task 3-5**：`RelayLink` trait、`ConnIdentity` + `try_send`/HOL 防阻、`handle_frame` 5 处授权（RegisterMachine/Subscribe/SendCommand/AdminReply/Revoke + AnnounceSession/PublishEvent/RetireSession 身份绑定）+ 4 helpers 去除 verbatim 复制
+- **Task 6**：`auth` 模块（身份模型 + `RelayStore` trait + 内存实现 + ed25519/sha2 密码学 + challenge-response enroll，singleton account）
+- **Task 7**：`agentdeck-relay-client` crate（`WsRelayClient` + `InProcRelayClient` + `WsTransport`）
+- **Task 8**：`RelayConfig` + 非 loopback 强制 TLS 门禁
+- **Task 9**：axum WS 服务端（server feature）+ REST enroll + WS 握手鉴权派生 `ConnIdentity` + binary `agentdeck-relay` + `--selfcheck`
+- **Task 10**：5 组 R1a WS e2e 集成测试（真 loopback）：正向 flow + bad_secret/expired_nonce/revoked/unknown_cred 拒绝 + forged_from/cross_identity/nontarget_reply 拒绝 + sentinel 日志脱敏 + version_mismatch 拒绝
+- **Task 11**：CLI `remote pair --relay --bootstrap-secret --role` + 各 remote 子命令加 `--relay` + 凭据文件（0600）+ `WsRelayClient` 接线取代 `baseline_stub`
+- **Task 12**：daemon-no-net guard + AGENTS/ARCHITECTURE/index 文档收口
+
+**遗留技术债**（交 R1b/R1c/R2）：
+- `WsRelayClient::recv` 把 IO 错误吞成 None（`RelayLink` trait 无 Result；加日志需引 brief 未钉版 tracing dep）——R2 wire trait 时统一
+- `Subscribe` replay 无 dedup（客户端 vec 无界增长；relay 端 subs 用 HashSet 幂等）——R1b 收敛
+- `EnrollError::MissingOwnerPubkey` 映射 ad-hoc 未注册 failure code——R1b 补 `failure::PAIR_MISSING_OWNER_PUBKEY` 常量
+- `Subscribe{Machines}` 无 account scope 过滤（R1a 单账户下无泄漏）——多账户场景前补
+- `RelayStore` SQLite 实现——R1b（Task 6 是内存 store）
+- `DataEnvelope::Encrypted`（IETF ChaCha20-Poly1305 + X25519/HKDF）——R1c（Task 1 只上 base64 wire）
+- `agentdeckd` remote-mode 取代外部 bridge——R2
+
 ## 7. 进入正式 R1 设计的前置条件与下一步
 
 **进入 R1 头脑风暴/设计前需确认（用户拍板）**：
