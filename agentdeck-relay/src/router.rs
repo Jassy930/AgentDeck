@@ -169,6 +169,18 @@ struct ReqOrigin {
     target_machine: String,
 }
 
+/// Task 6：从 `conv_buffer` 中缓存的帧取出其 `seq`（`conv_buffer` 存的是 relay
+/// 广播用的 `RelayControlMsg::Event`——已由 `reserve_and_persist_event` 重新
+/// 分配 seq——而非客户端发来的 `PublishEvent`）。用于 `Subscribe{Events,
+/// since_seq}` 的重放窗口判定。
+fn event_seq(ev: &RelayControlMsg) -> Option<u64> {
+    if let RelayControlMsg::Event { seq, .. } = ev {
+        Some(*seq)
+    } else {
+        None
+    }
+}
+
 struct Core {
     conns: HashMap<ClientId, Conn>,
     machines: HashMap<String, MachineEntry>,
@@ -501,7 +513,7 @@ impl Core {
                 let list = self.sessions.get(&machine_id).cloned().unwrap_or_default();
                 self.send_to(id, &trace, RelayControlMsg::SessionList { machine_id, sessions: list }).await;
             }
-            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id, .. } } => {
+            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id, since_seq } } => {
                 let my_account = self.conns.get(&id).map(|c| c.identity.account_id.clone());
                 let target_account = self
                     .conv_machine
@@ -525,10 +537,51 @@ impl Core {
                         return;
                     }
                 }
-                self.subs_events.entry(conversation_id.clone()).or_default().insert(id);
-                if let Some(buf) = self.conv_buffer.get(&conversation_id).cloned() {
-                    for ev in buf {
-                        self.send_to(id, &trace, ev).await;
+
+                // Task 6：`since_seq` 语义分支。
+                // - `None`：R1a 现状——回放整个 `conv_buffer`（等价于"从当前起
+                //   订阅"，因为 buffer 本就只装未裁剪部分）。
+                // - `Some(n)`：仅当 `n` 仍在 buffer 覆盖范围内（buffer 最旧一条
+                //   的 seq <= n + 1，即 n 本身或更早已被缓存）时命中，回放
+                //   `seq > n` 的部分（不含 n 本身，语义与 Ack 的 `up_to_seq`
+                //   对称）；否则说明缺口部分已被硬上界 FIFO 丢弃，relay 不能
+                //   凭空补上，回 `Error{code: REPLAY_GAP}` 并拒绝订阅。
+                match since_seq {
+                    None => {
+                        self.subs_events.entry(conversation_id.clone()).or_default().insert(id);
+                        if let Some(buf) = self.conv_buffer.get(&conversation_id).cloned() {
+                            for ev in buf {
+                                self.send_to(id, &trace, ev).await;
+                            }
+                        }
+                    }
+                    Some(n) => {
+                        let buf = self.conv_buffer.get(&conversation_id).cloned();
+                        let oldest_seq_in_buffer =
+                            buf.as_ref().and_then(|b| b.first()).and_then(event_seq);
+                        match oldest_seq_in_buffer {
+                            Some(oldest) if oldest <= n + 1 => {
+                                self.subs_events.entry(conversation_id.clone()).or_default().insert(id);
+                                if let Some(buf) = buf {
+                                    for ev in buf.iter().filter(|ev| event_seq(ev).is_some_and(|s| s > n)) {
+                                        self.send_to(id, &trace, ev.clone()).await;
+                                    }
+                                }
+                            }
+                            _ => {
+                                self.deny(
+                                    id,
+                                    &trace,
+                                    failure::REPLAY_GAP,
+                                    format!(
+                                        "since_seq {n} is outside the retained replay window for {conversation_id}"
+                                    ),
+                                    None,
+                                )
+                                .await;
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -1406,10 +1459,14 @@ mod tests {
             .expect("frame");
         assert!(matches!(barrier.msg, RelayControlMsg::MachineList { .. }));
 
+        // 用 since_seq: None（而非 Some(0)）——本测试验证的是 FIFO 硬上界丢弃
+        // 行为本身，不是 Task 6 的 since_seq 重放窗口判定；Some(0) 在丢弃后
+        // 已早于 buffer 最旧条目，会命中 REPLAY_GAP（见 Task 6 新增测试），
+        // 与本测试意图无关。
         let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
         d.send(frame(
             ClientRole::Device { device_id: "D1".into() },
-            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: Some(0) } },
+            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: None } },
         ))
         .await;
         let (_, _, first_seq) = recv_event(&mut d).await;
@@ -1469,5 +1526,85 @@ mod tests {
             acked = store_check.load_acked_seq("C1").unwrap();
         }
         assert_eq!(acked, Some(3), "订阅方的 Ack 应异步落盘到 seq_high_water_marks.acked_seq");
+    }
+
+    /// Task 6：`since_seq` 命中内存 `conv_buffer` 覆盖窗口——只补拉遗漏部分，
+    /// 不重复已有的 `n` 本身（语义与 Ack 的 `up_to_seq` 对称）。
+    #[tokio::test]
+    async fn since_seq_within_buffer_replays_missed_events() {
+        let relay = FakeRelay::start();
+        let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
+        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+
+        publish(&m, "C1", "S0").await;
+        publish(&m, "C1", "S1").await;
+        publish(&m, "C1", "S2").await;
+
+        // 同步屏障（Task 5 pattern）：探针 RegisterMachine 保证前面 3 条
+        // PublishEvent 都已被 Core 处理完，避免 flaky。
+        let mut probe = relay.connect(ClientRole::Device { device_id: "probe".into() }).await;
+        probe
+            .send(frame(
+                ClientRole::Device { device_id: "probe".into() },
+                RelayControlMsg::Subscribe { target: SubTarget::Machines },
+            ))
+            .await;
+        let _ = probe.recv().await; // 初始 MachineList 快照
+        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), probe.recv())
+            .await
+            .expect("屏障 RegisterMachine 广播超时")
+            .expect("frame"); // barrier 广播——之前的 PublishEvent 都已处理
+
+        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        d.send(frame(
+            ClientRole::Device { device_id: "D1".into() },
+            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: Some(0) } },
+        ))
+        .await;
+        let (_, _, seq1) = recv_event(&mut d).await;
+        let (_, _, seq2) = recv_event(&mut d).await;
+        assert_eq!(seq1, 1, "since_seq=0 应回放 seq > 0，第一条是 seq=1");
+        assert_eq!(seq2, 2, "第二条是 seq=2");
+    }
+
+    /// Task 6：`since_seq` 早于 buffer 最旧条目（已被硬上界 FIFO 丢弃）——relay
+    /// 不能凭空补上缺口，必须显式回 `Error{code: REPLAY_GAP}`，而不是静默漏发。
+    #[tokio::test]
+    async fn since_seq_beyond_buffer_window_returns_replay_gap_error() {
+        let relay = FakeRelay::start();
+        let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
+        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+
+        for i in 0..(DEFAULT_CONV_BUFFER_CAP + 10) {
+            publish(&m, "C1", &format!("S{i}")).await;
+        }
+
+        // 同步屏障（Task 5 pattern）
+        let mut probe = relay.connect(ClientRole::Device { device_id: "probe".into() }).await;
+        probe
+            .send(frame(
+                ClientRole::Device { device_id: "probe".into() },
+                RelayControlMsg::Subscribe { target: SubTarget::Machines },
+            ))
+            .await;
+        let _ = probe.recv().await;
+        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), probe.recv())
+            .await
+            .expect("屏障 RegisterMachine 广播超时——Core 可能被 1010 条持久化拖慢")
+            .expect("frame");
+
+        // since_seq=Some(0) 早于 buffer 最旧的 seq（>=10，已被 FIFO 丢弃）
+        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        d.send(frame(
+            ClientRole::Device { device_id: "D1".into() },
+            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: Some(0) } },
+        ))
+        .await;
+        let code = recv_until_error(&mut d).await;
+        assert_eq!(code, failure::REPLAY_GAP, "since_seq 早于 buffer 应返回 REPLAY_GAP");
     }
 }
