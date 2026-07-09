@@ -36,6 +36,11 @@
 - `plans/2026-07-08-relay-r1a-transport-auth-design.md`：Relay R1a 传输+鉴权骨架设计。
 - `plans/2026-07-08-relay-r1a-transport-auth-implementation.md`：Relay R1a 12 任务 TDD 实施计划（已全部落地）。
 
+### Relay R1b 存储 + Router 健壮化（2026-07-09）
+
+- `plans/2026-07-09-relay-r1b-storage-hardening-design.md`
+- `plans/2026-07-09-relay-r1b-storage-hardening-implementation.md`
+
 ## 协议资料
 
 - `../protocol/SPIKE_FINDINGS.md`：Codex app-server wire framing、方法和 schema 事实源。

@@ -125,6 +125,12 @@ R1a（传输+鉴权骨架）已按 `docs/plans/2026-07-08-relay-r1a-transport-au
 - `DataEnvelope::Encrypted`（IETF ChaCha20-Poly1305 + X25519/HKDF）——R1c（Task 1 只上 base64 wire）
 - `agentdeckd` remote-mode 取代外部 bridge——R2
 
+---
+
+### R1b 落地状态（2026-07-09）
+
+R1b（SQLite 持久化 + Router 健壮化）设计已 lock-in，实施计划见 `docs/plans/2026-07-09-relay-r1b-storage-hardening-implementation.md`（11 tasks + whole-branch review），11 tasks 均已 SDD approved（含 T3 SqliteRelayStore、T4 persist-before-deliver + seq HWM、T5 Ack + conv_buffer 硬上界、T6 since_seq 重放补拉、T7 AnnounceSession upsert、T8 req_origin TTL 心跳、T9 RelayConfig + main.rs 接入、T10 R1b e2e 4 组）；whole-branch review pending。
+
 ## 7. 进入正式 R1 设计的前置条件与下一步
 
 **进入 R1 头脑风暴/设计前需确认（用户拍板）**：

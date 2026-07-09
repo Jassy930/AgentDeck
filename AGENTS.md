@@ -115,6 +115,33 @@ cargo run -p agentdeck-relay --features server,tls -- \
 UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot
 ```
 
+### Relay R1b（SQLite 持久化 + Router 健壮化）
+
+```bash
+# R1b hardening e2e（SQLite tempdir 重启恢复 + 重放补拉 gap + AnnounceSession 幂等 + Revoke）
+cargo test -p agentdeck-relay --features server --test r1b_hardening_e2e -- --test-threads=1
+
+# 起 relay 指定 SQLite 存储路径（默认 ./agentdeck-relay-data/relay.db）
+cargo run -p agentdeck-relay --features server -- \
+  --bind 127.0.0.1:8443 \
+  --storage /var/lib/agentdeck-relay/relay.db \
+  --bootstrap-secret <secret>
+
+# 可选 tunable
+--conv-buffer-cap 1000        # 每 conversation 硬上界（默认 1000）
+--req-origin-ttl-ms 300000    # req_origin TTL（默认 5 分钟）
+
+# 或用 env
+AGENTDECK_RELAY_STORAGE=/path/to/relay.db
+AGENTDECK_RELAY_CONV_BUFFER_CAP=1000
+AGENTDECK_RELAY_REQ_ORIGIN_TTL_MS=300000
+```
+
+改动 `SubTarget::Events.since_seq` 字段或 `Ack.conversation_id` 类型后须：
+```bash
+UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot
+```
+
 ## 浏览与外部资料
 
 需要网页资料时优先使用当前环境可用的官方浏览工具和一手来源。不要引入项目级外部浏览 skill 依赖，也不要要求安装额外工具才能在本仓库工作。
