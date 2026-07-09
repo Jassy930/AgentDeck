@@ -14,10 +14,18 @@ version = "0.1.0"
 dependencies = [
  "agentdeck-protocol",
  "agentdeck-relay",
+ "agentdeck-relay-client",
+ "base64",
  "clap",
+ "ed25519-dalek",
+ "rand 0.8.6",
+ "rand_core 0.6.4",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
  "tokio",
+ "ureq",
+ "x25519-dalek",
 ]
 
 [[package]]

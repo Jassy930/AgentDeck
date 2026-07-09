@@ -189,26 +189,67 @@ enum HistoryOp {
 enum RemoteOp {
     /// 单进程 R0 冒烟：内存 FakeRelay + 真实 daemon bridge + device 驱动
     Smoke,
-    /// 列出机器（R1 relay endpoint 就绪后可独立运行）
-    Machines,
+    /// 用 bootstrap secret 向 relay 注册本机身份，写入凭据文件
+    Pair {
+        #[arg(long)]
+        relay: String,
+        #[arg(long)]
+        bootstrap_secret: String,
+        #[arg(long, value_enum, default_value = "device")]
+        role: RoleArg,
+    },
+    /// 列出机器
+    Machines {
+        #[arg(long)]
+        relay: String,
+    },
     /// 列出某机器的会话
-    Sessions { machine_id: String },
+    Sessions {
+        #[arg(long)]
+        relay: String,
+        machine_id: String,
+    },
     /// 流式查看某 conversation
-    Watch { conversation_id: String },
+    Watch {
+        #[arg(long)]
+        relay: String,
+        conversation_id: String,
+    },
     /// 向 conversation 发 prompt
-    Send { conversation_id: String, text: String },
+    Send {
+        #[arg(long)]
+        relay: String,
+        conversation_id: String,
+        text: String,
+    },
     /// 批准某 turn 的审批
     Approve {
+        #[arg(long)]
+        relay: String,
         turn_session_id: String,
         request_id: String,
     },
     /// 拒绝某 turn 的审批
     Deny {
+        #[arg(long)]
+        relay: String,
         turn_session_id: String,
         request_id: String,
     },
     /// 机器级 admin 往返
-    Ping { machine_id: String },
+    Ping {
+        #[arg(long)]
+        relay: String,
+        machine_id: String,
+    },
+}
+
+/// `Pair` 的 `--role` clap 值枚举；`remote::PairRole` 是逻辑层的对应类型
+/// （窄化映射见 dispatch 处），避免 clap 派生类型泄漏进 remote 模块。
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum RoleArg {
+    Machine,
+    Device,
 }
 
 // ── Main dispatcher ───────────────────────────────────────────────────────────
@@ -306,13 +347,42 @@ async fn main() {
     if let Cmd::Remote { op } = &cli.command {
         let arg = match op {
             RemoteOp::Smoke => remote::RemoteOpArg::Smoke,
-            RemoteOp::Machines => remote::RemoteOpArg::Machines,
-            RemoteOp::Sessions { .. } => remote::RemoteOpArg::Sessions,
-            RemoteOp::Watch { .. } => remote::RemoteOpArg::Watch,
-            RemoteOp::Send { .. } => remote::RemoteOpArg::Send,
-            RemoteOp::Approve { .. } => remote::RemoteOpArg::Approve,
-            RemoteOp::Deny { .. } => remote::RemoteOpArg::Deny,
-            RemoteOp::Ping { .. } => remote::RemoteOpArg::Ping,
+            RemoteOp::Pair { relay, bootstrap_secret, role } => remote::RemoteOpArg::Pair {
+                relay: relay.clone(),
+                bootstrap_secret: bootstrap_secret.clone(),
+                role: match role {
+                    RoleArg::Machine => remote::PairRole::Machine,
+                    RoleArg::Device => remote::PairRole::Device,
+                },
+            },
+            RemoteOp::Machines { relay } => remote::RemoteOpArg::Machines { relay: relay.clone() },
+            RemoteOp::Sessions { relay, machine_id } => remote::RemoteOpArg::Sessions {
+                relay: relay.clone(),
+                machine_id: machine_id.clone(),
+            },
+            RemoteOp::Watch { relay, conversation_id } => remote::RemoteOpArg::Watch {
+                relay: relay.clone(),
+                conversation_id: conversation_id.clone(),
+            },
+            RemoteOp::Send { relay, conversation_id, text } => remote::RemoteOpArg::Send {
+                relay: relay.clone(),
+                conversation_id: conversation_id.clone(),
+                text: text.clone(),
+            },
+            RemoteOp::Approve { relay, turn_session_id, request_id } => remote::RemoteOpArg::Approve {
+                relay: relay.clone(),
+                turn_session_id: turn_session_id.clone(),
+                request_id: request_id.clone(),
+            },
+            RemoteOp::Deny { relay, turn_session_id, request_id } => remote::RemoteOpArg::Deny {
+                relay: relay.clone(),
+                turn_session_id: turn_session_id.clone(),
+                request_id: request_id.clone(),
+            },
+            RemoteOp::Ping { relay, machine_id } => remote::RemoteOpArg::Ping {
+                relay: relay.clone(),
+                machine_id: machine_id.clone(),
+            },
         };
         let code = remote::run(arg, &profile, data_dir.as_deref()).await;
         if code == std::process::ExitCode::SUCCESS {
