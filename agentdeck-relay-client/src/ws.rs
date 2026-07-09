@@ -3,10 +3,11 @@
 //! `WsRelayClient`：在 `WsTransport` 之上编解码 `RemoteFrame`（serde_json
 //! text），实现 `RelayLink`；记录已发的 `Subscribe` 帧，`reconnect` 后重放。
 
-use agentdeck_protocol::remote::{ClientRole, RelayControlMsg, RemoteFrame};
+use agentdeck_protocol::remote::{ClientRole, RelayControlMsg, RemoteFrame, SubTarget};
 use agentdeck_protocol::{AuthContext, Transport, TransportError};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use std::collections::HashMap;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
@@ -148,22 +149,32 @@ impl Transport for WsTransport {
 /// 恢复此连接此前建立的所有订阅。
 pub struct WsRelayClient {
     transport: WsTransport,
-    subscriptions: Mutex<Vec<RemoteFrame>>,
+    subscriptions: Mutex<HashMap<SubTarget, RemoteFrame>>,
+}
+
+/// 记录一个 `Subscribe` 帧到去重映射：以 `SubTarget` 为 key，同一 target 的
+/// 重复 `Subscribe`（例如客户端重试）覆盖旧记录而非无界追加（R1a 遗留 #2）。
+/// 非 `Subscribe` 消息不记录（不参与 `reconnect` 重放）。
+fn record_subscription(map: &mut HashMap<SubTarget, RemoteFrame>, frame: RemoteFrame) {
+    if let RelayControlMsg::Subscribe { target } = &frame.msg {
+        map.insert(target.clone(), frame);
+    }
 }
 
 impl WsRelayClient {
     pub async fn connect(url: &str, bearer: &str, from: ClientRole) -> Result<Self, WsError> {
         let transport = WsTransport::connect(url, bearer, role_label(&from)).await?;
-        Ok(Self { transport, subscriptions: Mutex::new(Vec::new()) })
+        Ok(Self { transport, subscriptions: Mutex::new(HashMap::new()) })
     }
 
-    /// 重连底层 WS 连接，并按记录顺序重放此前发出的所有 `Subscribe` 帧。
+    /// 重连底层 WS 连接，并重放此前发出的所有 `Subscribe` 帧（按 target 去重后，
+    /// 顺序不保证与原发送顺序一致）。
     pub async fn reconnect(&self) -> Result<(), WsError> {
         self.transport
             .reconnect()
             .await
             .map_err(|e| WsError::Connect(e.to_string()))?;
-        let subs = self.subscriptions.lock().await.clone();
+        let subs: Vec<RemoteFrame> = self.subscriptions.lock().await.values().cloned().collect();
         for frame in subs {
             let line = serde_json::to_string(&frame)
                 .map_err(|e| WsError::InvalidFrame(e.to_string()))?;
@@ -177,7 +188,8 @@ impl WsRelayClient {
 impl agentdeck_relay::RelayLink for WsRelayClient {
     async fn send(&self, frame: RemoteFrame) {
         if matches!(frame.msg, RelayControlMsg::Subscribe { .. }) {
-            self.subscriptions.lock().await.push(frame.clone());
+            let mut subs = self.subscriptions.lock().await;
+            record_subscription(&mut subs, frame.clone());
         }
         let Ok(line) = serde_json::to_string(&frame) else { return };
         let _ = self.transport.send(line).await;
@@ -204,5 +216,40 @@ mod tests {
     fn ws_error_rejected_carries_status_and_code() {
         let e = WsError::Rejected { status: 401, code: Some("relay.pair.bad_secret".into()) };
         assert!(e.to_string().contains("401"));
+    }
+
+    fn mk_subscribe_frame(target: SubTarget) -> RemoteFrame {
+        RemoteFrame::control(
+            ClientRole::Device { device_id: "d".into() },
+            "t".into(),
+            0,
+            RelayControlMsg::Subscribe { target },
+        )
+    }
+
+    #[test]
+    fn duplicate_subscribe_same_target_deduped() {
+        let mut map: HashMap<SubTarget, RemoteFrame> = HashMap::new();
+        let target = SubTarget::Machines;
+        for _ in 0..3 {
+            record_subscription(&mut map, mk_subscribe_frame(target.clone()));
+        }
+        assert_eq!(map.len(), 1, "重复 Subscribe 同一 target 必须去重");
+        assert!(map.contains_key(&target));
+    }
+
+    #[test]
+    fn different_targets_are_kept_separately() {
+        let mut map: HashMap<SubTarget, RemoteFrame> = HashMap::new();
+        record_subscription(&mut map, mk_subscribe_frame(SubTarget::Machines));
+        record_subscription(
+            &mut map,
+            mk_subscribe_frame(SubTarget::Sessions { machine_id: "M1".into() }),
+        );
+        record_subscription(
+            &mut map,
+            mk_subscribe_frame(SubTarget::Events { conversation_id: "C1".into(), since_seq: None }),
+        );
+        assert_eq!(map.len(), 3, "不同 target 应保留");
     }
 }
