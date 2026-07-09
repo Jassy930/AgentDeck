@@ -15,8 +15,11 @@ use crate::store::SqliteRelayStore;
 /// seq 高水位计算（seq 单调性完全由 `reserve_and_persist_event` 的 SQL 事务
 /// 保证）。用 `std::time`，不引入新依赖。
 /// Task 5：`conv_buffer` 每 conversation 保留的最近事件数硬上界（独立于 Ack
-/// 生效的 OOM 防线——即使暂无客户端发 Ack，超过此值也会丢最旧的）。Task 9
-/// 换成 `RelayConfig` 传入的可配置值；本任务先用私有常量占位。
+/// 生效的 OOM 防线——即使暂无客户端发 Ack，超过此值也会丢最旧的）。Task 9：
+/// 生效值现在是 `Core.conv_buffer_cap` 字段（`RelayConfig::conv_buffer_cap`
+/// 经 main.rs 传入）；本常量现在只是无需显式传 cap 的便捷入口
+/// （`FakeRelay::start`/`start_with_store`/`start_with_store_and_ttl`，含既有
+/// 测试调用点）的默认 fallback 值。
 const DEFAULT_CONV_BUFFER_CAP: usize = 1000;
 
 fn now_ms() -> i64 {
@@ -111,12 +114,25 @@ impl FakeRelay {
     }
 
     /// Task 8：test-friendly 构造——可注入短 `req_origin_ttl_ms` 以便测试快速
-    /// 验证 TTL 清扫，无需等待默认 5 分钟。除起 Core actor 外，另起一个独立
-    /// 心跳任务，按 `ttl/2`（下限 1s）周期发送 `CoreMsg::SweepReqOrigin`，
-    /// 不给 Core 主循环加计时器（保持 Core 单纯响应消息）。
+    /// 验证 TTL 清扫，无需等待默认 5 分钟。签名不变（现有调用点无需改动）——
+    /// 委托 `start_with_all` 用默认 `conv_buffer_cap`。
     pub(crate) fn start_with_store_and_ttl(store: SqliteRelayStore, req_origin_ttl_ms: i64) -> Self {
+        Self::start_with_all(store, req_origin_ttl_ms, DEFAULT_CONV_BUFFER_CAP)
+    }
+
+    /// Task 9：全参构造——`main.rs`（独立二进制 crate，故本函数须 `pub`——
+    /// `pub(crate)` 只在 lib crate 内可见，`main.rs` 是单独编译的 bin target）
+    /// 用 `RelayConfig` 传入的 `req_origin_ttl_ms`/`conv_buffer_cap` 启动 Core。
+    /// 除起 Core actor 外，另起一个独立心跳任务，按 `ttl/2`（下限 1s）周期发送
+    /// `CoreMsg::SweepReqOrigin`，不给 Core 主循环加计时器（保持 Core 单纯响应
+    /// 消息）。
+    pub fn start_with_all(
+        store: SqliteRelayStore,
+        req_origin_ttl_ms: i64,
+        conv_buffer_cap: usize,
+    ) -> Self {
         let (core_tx, core_rx) = mpsc::channel::<CoreMsg>(256);
-        tokio::spawn(Core::new_with_ttl(store, req_origin_ttl_ms).run(core_rx));
+        tokio::spawn(Core::new_with_ttl_and_cap(store, req_origin_ttl_ms, conv_buffer_cap).run(core_rx));
 
         let sweep_tx = core_tx.clone();
         let period_ms = (req_origin_ttl_ms / 2).max(1000) as u64;
@@ -251,14 +267,23 @@ struct Core {
     /// `+= 1`（重启后内存归零会导致 seq 回退，SQLite 高水位跨重启单调）。
     store: SqliteRelayStore,
     /// Task 8：`req_origin` 条目 TTL（毫秒）。由 `CoreMsg::SweepReqOrigin` 驱动
-    /// 的清扫用此值判定过期。测试可经 `new_with_ttl` 注入短 TTL 快速验证。
+    /// 的清扫用此值判定过期。测试可经 `new_with_ttl_and_cap` 注入短 TTL 快速验证。
     req_origin_ttl_ms: i64,
+    /// Task 9：`conv_buffer` 每 conversation 保留的最近事件数硬上界（替换 Task 5
+    /// 的私有常量占位——生效值现在由 `RelayConfig::conv_buffer_cap` 经
+    /// `FakeRelay::start_with_all` 传入）。
+    conv_buffer_cap: usize,
 }
 
 impl Core {
-    /// Task 8：`req_origin_ttl_ms` 可注入，测试用短 TTL 快速验证清扫；生产路径
-    /// （`FakeRelay::start_with_store`）传入 `DEFAULT_REQ_ORIGIN_TTL_MS`。
-    fn new_with_ttl(store: SqliteRelayStore, req_origin_ttl_ms: i64) -> Self {
+    /// Task 9：全参构造——`req_origin_ttl_ms`/`conv_buffer_cap` 均可注入，生产
+    /// 路径（`main.rs` 经 `FakeRelay::start_with_all`）传入 `RelayConfig` 里的
+    /// 配置值。
+    fn new_with_ttl_and_cap(
+        store: SqliteRelayStore,
+        req_origin_ttl_ms: i64,
+        conv_buffer_cap: usize,
+    ) -> Self {
         Self {
             conns: HashMap::new(),
             machines: HashMap::new(),
@@ -274,6 +299,7 @@ impl Core {
             disconnect_conns: Vec::new(),
             store,
             req_origin_ttl_ms,
+            conv_buffer_cap,
         }
     }
 
@@ -547,8 +573,8 @@ impl Core {
                 buf.push(ev.clone());
                 // 硬上界 FIFO（独立于 Ack 生效——不管有没有客户端发 Ack，超过
                 // 上界都丢最旧的，防止无界内存增长）。
-                if buf.len() > DEFAULT_CONV_BUFFER_CAP {
-                    let drop_count = buf.len() - DEFAULT_CONV_BUFFER_CAP;
+                if buf.len() > self.conv_buffer_cap {
+                    let drop_count = buf.len() - self.conv_buffer_cap;
                     buf.drain(0..drop_count);
                 }
                 if let Some(devs) = self.subs_events.get(&conversation_id) {

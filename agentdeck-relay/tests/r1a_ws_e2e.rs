@@ -23,7 +23,7 @@ use agentdeck_protocol::remote::{
     SubTarget, failure,
 };
 use agentdeck_relay::RelayLink;
-use agentdeck_relay::auth::store::InMemoryRelayStore;
+use agentdeck_relay::SqliteRelayStore;
 use agentdeck_relay::config::RelayConfig;
 use agentdeck_relay_client::{WsError, WsRelayClient};
 
@@ -39,7 +39,10 @@ async fn recv<L: RelayLink>(link: &mut L) -> RemoteFrame {
 /// 起一个 server：`127.0.0.1:0` 绑定读回动态端口 + 共享 store 句柄（供测试直接
 /// 驱动 revoke 场景）。返回的 `JoinHandle` 不需要显式等待——测试进程退出时
 /// 自然回收；ephemeral 端口不会跨测试冲突。
-async fn setup_server(bootstrap_secret: &str) -> (SocketAddr, Arc<Mutex<InMemoryRelayStore>>, String) {
+///
+/// Task 9：`SqliteRelayStore` 自带内部 `Arc<Mutex<Connection>>` + `Clone`，测试
+/// 用 in-memory 变体（不落盘），不再需要外层 `Arc<Mutex<_>>` 包裹。
+async fn setup_server(bootstrap_secret: &str) -> (SocketAddr, SqliteRelayStore, String) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let config = RelayConfig {
@@ -48,8 +51,11 @@ async fn setup_server(bootstrap_secret: &str) -> (SocketAddr, Arc<Mutex<InMemory
         tls: None,
         allow_plaintext: true,
         log_level: "info".to_string(),
+        storage_path: std::path::PathBuf::from(":memory:"),
+        conv_buffer_cap: 1000,
+        req_origin_ttl_ms: 300_000,
     };
-    let store = Arc::new(Mutex::new(InMemoryRelayStore::default()));
+    let store = SqliteRelayStore::open_in_memory().unwrap();
     let relay = agentdeck_relay::FakeRelay::start();
     let store_for_server = store.clone();
     tokio::spawn(async move {
@@ -751,6 +757,9 @@ mod tls_e2e {
             tls: None,
             allow_plaintext: true,
             log_level: "info".to_string(),
+            storage_path: std::path::PathBuf::from(":memory:"),
+            conv_buffer_cap: 1000,
+            req_origin_ttl_ms: 300_000,
         };
         let relay = agentdeck_relay::FakeRelay::start();
         tokio::spawn(agentdeck_relay::server::serve_with_listener_tls(

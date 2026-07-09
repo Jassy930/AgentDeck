@@ -23,16 +23,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(config.log_level.clone()));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
+    // `--selfcheck`：不落盘真实数据文件（避免每次 selfcheck 污染 CWD/部署目录）——
+    // 走 in-memory SQLite，只验证配置/依赖装配是否正常，不做网络 IO。
+    let store = if selfcheck {
+        agentdeck_relay::SqliteRelayStore::open_in_memory()
+            .map_err(|e| format!("selfcheck: failed to open in-memory sqlite store: {e}"))?
+    } else {
+        if let Some(parent) = config.storage_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "failed to create storage directory {}: {e}",
+                    parent.display()
+                )
+            })?;
+        }
+        agentdeck_relay::SqliteRelayStore::open(&config.storage_path).map_err(|e| {
+            format!(
+                "failed to open sqlite store at {}: {e}",
+                config.storage_path.display()
+            )
+        })?
+    };
+
+    let relay = agentdeck_relay::FakeRelay::start_with_all(
+        store.clone(),
+        config.req_origin_ttl_ms as i64,
+        config.conv_buffer_cap,
+    );
+
     if selfcheck {
-        let _store = agentdeck_relay::auth::store::InMemoryRelayStore::default();
-        let _relay = agentdeck_relay::FakeRelay::start();
         println!("relay selfcheck ok");
         return Ok(());
     }
 
-    let store = agentdeck_relay::auth::store::InMemoryRelayStore::default();
-    let relay = agentdeck_relay::FakeRelay::start();
-    tracing::info!(bind = %config.bind, "relay listening");
+    tracing::info!(bind = %config.bind, storage_path = %config.storage_path.display(), "relay listening");
     agentdeck_relay::server::serve(config, store, relay).await?;
     Ok(())
 }

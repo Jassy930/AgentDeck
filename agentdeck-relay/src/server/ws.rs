@@ -79,12 +79,10 @@ pub(crate) async fn connect(
     };
     let credential_hash = hash_credential(&bearer);
 
-    let device = {
-        let store = state.store.lock().expect("relay store mutex poisoned");
-        // R1b Task 3：trait 签名改为 owned return（SQL backend 无法返 borrow），
-        // 值已 owned，`.cloned()` 移除。
-        store.device_by_credential_hash(&credential_hash)
-    };
+    // R1b Task 3：trait 签名改为 owned return（SQL backend 无法返 borrow），
+    // 值已 owned，`.cloned()` 移除。`device_by_credential_hash` 只需 `&self`
+    // （Task 9：`SqliteRelayStore` 自带内部同步，不再需要外层 `.lock()`）。
+    let device = state.store.device_by_credential_hash(&credential_hash);
     let Some(device) = device else {
         return reject(
             StatusCode::UNAUTHORIZED,

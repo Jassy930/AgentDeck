@@ -7,19 +7,22 @@ mod conn;
 mod pair;
 mod ws;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::Router;
 use axum::routing::{get, post};
 
-use crate::auth::store::{InMemoryRelayStore, RelayStore};
+use crate::auth::store::RelayStore;
 use crate::config::RelayConfig;
 use crate::router::FakeRelay;
+use crate::store::SqliteRelayStore;
 
-/// Handler 依赖注入：`Arc`/`Mutex` 包裹以便在 axum `State` extractor 里 `Clone` 共享。
+/// Handler 依赖注入：`SqliteRelayStore` 自带内部 `Arc<Mutex<Connection>>` +
+/// `Clone`（Task 3），不需要外层再包一层 `Arc<Mutex<_>>`——`AppState` 的
+/// `#[derive(Clone)]`（axum `State` extractor 需要）天然满足。
 #[derive(Clone)]
 pub(crate) struct AppState {
-    store: Arc<Mutex<InMemoryRelayStore>>,
+    store: SqliteRelayStore,
     relay: Arc<FakeRelay>,
     bootstrap_secret: String,
     challenge_ttl_ms: u64,
@@ -59,12 +62,11 @@ fn build_app(state: AppState) -> Router {
 /// `serve_with_listener`，并在后一种情形下打一条 `tracing::warn!`——不静默。
 pub async fn serve(
     config: RelayConfig,
-    store: InMemoryRelayStore,
+    store: SqliteRelayStore,
     relay: FakeRelay,
 ) -> Result<(), ServeError> {
     let bind = config.bind;
     let listener = tokio::net::TcpListener::bind(bind).await.map_err(ServeError::Bind)?;
-    let store = Arc::new(Mutex::new(store));
 
     if let Some(tls_paths) = config.tls.clone() {
         if cfg!(feature = "tls") {
@@ -97,7 +99,7 @@ pub async fn serve(
 /// 内部构造 `Arc<Mutex<_>>` 后委托本函数，行为等价，仅多出可观测性。
 pub async fn serve_with_listener(
     config: RelayConfig,
-    store: Arc<Mutex<InMemoryRelayStore>>,
+    store: SqliteRelayStore,
     relay: FakeRelay,
     listener: tokio::net::TcpListener,
 ) -> Result<(), ServeError> {
@@ -123,7 +125,7 @@ pub async fn serve_with_listener(
 #[cfg(feature = "tls")]
 pub async fn serve_with_listener_tls(
     config: RelayConfig,
-    store: Arc<Mutex<InMemoryRelayStore>>,
+    store: SqliteRelayStore,
     relay: FakeRelay,
     listener: tokio::net::TcpListener,
     tls_config: axum_server::tls_rustls::RustlsConfig,
@@ -147,8 +149,10 @@ pub async fn serve_with_listener_tls(
 /// 直接标记一个设备/机器凭据被撤销（不经 REST——R1a 尚无 revoke 端点，留给
 /// 后续 task）。供 e2e 测试驱动"凭据已撤销后连接被拒"场景：`RelayStore` trait
 /// 本身是 `pub(crate)`（只供 crate 内部按 trait 方法使用），外部 crate 无法直接
-/// 调用 `InMemoryRelayStore` 上的 `mark_revoked`——这里以最小 `pub fn` 包装暴露
-/// 出去，不改变 store/auth 模块本身的可见性。
-pub fn revoke_device(store: &Arc<Mutex<InMemoryRelayStore>>, device_id: &str) {
-    store.lock().expect("relay store mutex poisoned").mark_revoked(device_id);
+/// 调用 `SqliteRelayStore` 上的 `mark_revoked`——这里以最小 `pub fn` 包装暴露
+/// 出去，不改变 store/auth 模块本身的可见性。`SqliteRelayStore` 内部
+/// `Arc<Mutex<Connection>>` 共享连接，`clone()` 后在克隆上调用 `&mut self`
+/// trait 方法即可作用于同一份底层数据，调用方无需持有 `mut` 绑定。
+pub fn revoke_device(store: &SqliteRelayStore, device_id: &str) {
+    store.clone().mark_revoked(device_id);
 }

@@ -4,6 +4,7 @@
 
 use clap::Parser;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 /// Relay 运行时配置。
 #[derive(Debug, Clone)]
@@ -13,6 +14,31 @@ pub struct RelayConfig {
     pub tls: Option<TlsPaths>,
     pub allow_plaintext: bool,
     pub log_level: String,
+    /// Task 9：`SqliteRelayStore` 落盘文件路径（相对 CWD 或绝对路径）。
+    /// `--selfcheck` 不使用此字段——走 `SqliteRelayStore::open_in_memory()`。
+    pub storage_path: PathBuf,
+    /// Task 9：`Core.conv_buffer` 每 conversation 保留的最近事件数硬上界。
+    pub conv_buffer_cap: usize,
+    /// Task 9：`req_origin` 条目 TTL（毫秒）。
+    pub req_origin_ttl_ms: u64,
+}
+
+/// 默认落盘路径：相对 CWD，可被 `--storage`/`AGENTDECK_RELAY_STORAGE` 覆盖。
+const DEFAULT_STORAGE_PATH: &str = "./agentdeck-relay-data/relay.db";
+/// 默认 `conv_buffer` 硬上界（每 conversation，假设约 10 events/s、100s 缓冲窗口）。
+const DEFAULT_CONV_BUFFER_CAP: usize = 1000;
+/// 默认 `req_origin` TTL（5 分钟，对齐典型 RPC timeout）。
+const DEFAULT_REQ_ORIGIN_TTL_MS: u64 = 300_000;
+
+/// 供 test 用的默认值 helper（保持默认值单一来源）。
+pub(crate) fn default_conv_buffer_cap() -> usize {
+    DEFAULT_CONV_BUFFER_CAP
+}
+pub(crate) fn default_req_origin_ttl_ms() -> u64 {
+    DEFAULT_REQ_ORIGIN_TTL_MS
+}
+pub(crate) fn default_storage_path() -> PathBuf {
+    PathBuf::from(DEFAULT_STORAGE_PATH)
 }
 
 /// TLS 证书/私钥文件路径。
@@ -77,6 +103,15 @@ struct RawArgs {
     #[arg(long)]
     log_level: Option<String>,
 
+    #[arg(long)]
+    storage: Option<String>,
+
+    #[arg(long)]
+    conv_buffer_cap: Option<usize>,
+
+    #[arg(long)]
+    req_origin_ttl_ms: Option<u64>,
+
     /// `agentdeck-relay` 二进制（main.rs，Task 9）的 `--selfcheck` 标志——本模块
     /// 不消费它（不映射进 `RelayConfig` 任何字段），只声明它以便 clap 不把它当
     /// unknown argument 拒绝解析；真正的 selfcheck 分支逻辑在 main.rs。
@@ -128,12 +163,39 @@ impl RelayConfig {
             .or_else(|| std::env::var("AGENTDECK_RELAY_LOG").ok())
             .unwrap_or_else(|| "info".to_string());
 
+        let storage_path = raw
+            .storage
+            .or_else(|| std::env::var("AGENTDECK_RELAY_STORAGE").ok())
+            .map(PathBuf::from)
+            .unwrap_or_else(default_storage_path);
+
+        let conv_buffer_cap = raw
+            .conv_buffer_cap
+            .or_else(|| {
+                std::env::var("AGENTDECK_RELAY_CONV_BUFFER_CAP")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+            })
+            .unwrap_or(DEFAULT_CONV_BUFFER_CAP);
+
+        let req_origin_ttl_ms = raw
+            .req_origin_ttl_ms
+            .or_else(|| {
+                std::env::var("AGENTDECK_RELAY_REQ_ORIGIN_TTL_MS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+            })
+            .unwrap_or(DEFAULT_REQ_ORIGIN_TTL_MS);
+
         Ok(RelayConfig {
             bind,
             bootstrap_secret,
             tls,
             allow_plaintext,
             log_level,
+            storage_path,
+            conv_buffer_cap,
+            req_origin_ttl_ms,
         })
     }
 
@@ -158,7 +220,10 @@ mod tests {
     fn cfg(bind: &str, tls: bool, allow: bool) -> RelayConfig {
         RelayConfig { bind: bind.parse().unwrap(), bootstrap_secret: "s".into(),
             tls: if tls { Some(TlsPaths { cert: "c".into(), key: "k".into() }) } else { None },
-            allow_plaintext: allow, log_level: "info".into() }
+            allow_plaintext: allow, log_level: "info".into(),
+            storage_path: default_storage_path(),
+            conv_buffer_cap: default_conv_buffer_cap(),
+            req_origin_ttl_ms: default_req_origin_ttl_ms() }
     }
     #[test]
     fn loopback_plaintext_ok() { assert!(cfg("127.0.0.1:8080", false, false).validate_transport_gate().is_ok()); }
@@ -171,4 +236,11 @@ mod tests {
     fn non_loopback_with_tls_ok() { assert!(cfg("0.0.0.0:8080", true, false).validate_transport_gate().is_ok()); }
     #[test]
     fn non_loopback_allow_plaintext_ok() { assert!(cfg("0.0.0.0:8080", false, true).validate_transport_gate().is_ok()); }
+
+    #[test]
+    fn defaults_match_documented_values() {
+        assert_eq!(default_conv_buffer_cap(), 1000);
+        assert_eq!(default_req_origin_ttl_ms(), 300_000);
+        assert_eq!(default_storage_path().to_str().unwrap(), "./agentdeck-relay-data/relay.db");
+    }
 }

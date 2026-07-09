@@ -85,9 +85,9 @@ pub(crate) async fn challenge(
     State(state): State<AppState>,
     Json(body): Json<ChallengeReqBody>,
 ) -> Json<ChallengeRespBody> {
-    let mut store = state.store.lock().expect("relay store mutex poisoned");
+    let mut store = state.store.clone();
     let resp = enroll::start_challenge(
-        &mut *store,
+        &mut store,
         ChallengeReq { device_sign_pubkey: body.device_sign_pubkey },
         state.challenge_ttl_ms as i64,
         now_ms() as i64,
@@ -116,8 +116,8 @@ pub(crate) async fn complete(
         owner_pubkey: body.owner_pubkey,
     };
 
-    let mut store = state.store.lock().expect("relay store mutex poisoned");
-    let resp = enroll::complete(&mut *store, req, &state.bootstrap_secret, now_ms() as i64)
+    let mut store = state.store.clone();
+    let resp = enroll::complete(&mut store, req, &state.bootstrap_secret, now_ms() as i64)
         .map_err(map_enroll_error)?;
     Ok(Json(CompleteRespBody {
         account_id: resp.account_id,
