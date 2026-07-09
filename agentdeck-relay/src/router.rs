@@ -77,6 +77,12 @@ enum CoreMsg {
     Disconnect { id: ClientId },
     /// 撤销一个设备/机器身份：断开所有 `identity.device_id == device_id` 的活连接。
     Revoke { device_id: String },
+    /// Task 8：由独立心跳任务周期性发送，驱动 `req_origin` 的 TTL 清扫（防长驻
+    /// 进程因 `SendCommand` 从未收到回复而无限累积登记）。
+    SweepReqOrigin { now_ms: i64 },
+    /// Task 8 测试专用：白盒探测 `req_origin` 当前条目数，验证清扫生效。
+    #[cfg(test)]
+    ProbeReqOrigin { reply: tokio::sync::oneshot::Sender<usize> },
 }
 
 /// 内存内容不可见转发器（有状态）。
@@ -98,10 +104,42 @@ impl FakeRelay {
     /// Task 4：携带一个已打开的 `SqliteRelayStore`（落盘文件或 in-memory）启动
     /// Core。Task 9 main.rs 会用此入口传入真实 SQLite 文件；本 task 测试用
     /// `tempfile::tempdir()` 验证跨重启 seq 单调。
+    /// Task 8：委托 `start_with_store_and_ttl` 用默认 TTL（签名不变——现有
+    /// 调用点无需改动）。
     pub fn start_with_store(store: SqliteRelayStore) -> Self {
+        Self::start_with_store_and_ttl(store, DEFAULT_REQ_ORIGIN_TTL_MS)
+    }
+
+    /// Task 8：test-friendly 构造——可注入短 `req_origin_ttl_ms` 以便测试快速
+    /// 验证 TTL 清扫，无需等待默认 5 分钟。除起 Core actor 外，另起一个独立
+    /// 心跳任务，按 `ttl/2`（下限 1s）周期发送 `CoreMsg::SweepReqOrigin`，
+    /// 不给 Core 主循环加计时器（保持 Core 单纯响应消息）。
+    pub(crate) fn start_with_store_and_ttl(store: SqliteRelayStore, req_origin_ttl_ms: i64) -> Self {
         let (core_tx, core_rx) = mpsc::channel::<CoreMsg>(256);
-        tokio::spawn(Core::new(store).run(core_rx));
+        tokio::spawn(Core::new_with_ttl(store, req_origin_ttl_ms).run(core_rx));
+
+        let sweep_tx = core_tx.clone();
+        let period_ms = (req_origin_ttl_ms / 2).max(1000) as u64;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(period_ms));
+            loop {
+                ticker.tick().await;
+                let now = now_ms();
+                if sweep_tx.send(CoreMsg::SweepReqOrigin { now_ms: now }).await.is_err() {
+                    break;
+                }
+            }
+        });
+
         FakeRelay { core_tx, next_id: Arc::new(AtomicU64::new(1)) }
+    }
+
+    /// Task 8 测试专用：白盒探测 `req_origin` 当前条目数。
+    #[cfg(test)]
+    pub(crate) async fn probe_req_origin_len(&self) -> usize {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self.core_tx.send(CoreMsg::ProbeReqOrigin { reply: tx }).await;
+        rx.await.unwrap_or(0)
     }
 
     /// 便捷入口（内存测试/匿名 dev）：合成一个 dev-scope 身份。
@@ -163,11 +201,19 @@ struct MachineEntry {
 }
 
 /// `SendCommand` 的来源登记：回复者绑定校验用（AdminReply 必须来自 `target_machine`）。
+/// Task 8：`created_at_ms` 供 TTL 清扫（`CoreMsg::SweepReqOrigin`）判定过期——
+/// 长驻进程若 `SendCommand` 从未收到回复，登记会无限累积，需定期清扫防内存泄漏。
 #[derive(Debug, Clone)]
 struct ReqOrigin {
     origin: ClientId,
     target_machine: String,
+    created_at_ms: i64,
 }
+
+/// Task 8：`req_origin` 条目 TTL 默认值（5 分钟）。Task 9 会接入
+/// `RelayConfig::req_origin_ttl_ms` 令其可配置；本任务先用常量占位，通过
+/// `Core::new_with_ttl` / `FakeRelay::start_with_store_and_ttl` 支持测试注入短 TTL。
+const DEFAULT_REQ_ORIGIN_TTL_MS: i64 = 300_000;
 
 /// Task 6：从 `conv_buffer` 中缓存的帧取出其 `seq`（`conv_buffer` 存的是 relay
 /// 广播用的 `RelayControlMsg::Event`——已由 `reserve_and_persist_event` 重新
@@ -204,10 +250,15 @@ struct Core {
     /// `store.reserve_and_persist_event` 的 SQLite 事务分配，Core 不再自行
     /// `+= 1`（重启后内存归零会导致 seq 回退，SQLite 高水位跨重启单调）。
     store: SqliteRelayStore,
+    /// Task 8：`req_origin` 条目 TTL（毫秒）。由 `CoreMsg::SweepReqOrigin` 驱动
+    /// 的清扫用此值判定过期。测试可经 `new_with_ttl` 注入短 TTL 快速验证。
+    req_origin_ttl_ms: i64,
 }
 
 impl Core {
-    fn new(store: SqliteRelayStore) -> Self {
+    /// Task 8：`req_origin_ttl_ms` 可注入，测试用短 TTL 快速验证清扫；生产路径
+    /// （`FakeRelay::start_with_store`）传入 `DEFAULT_REQ_ORIGIN_TTL_MS`。
+    fn new_with_ttl(store: SqliteRelayStore, req_origin_ttl_ms: i64) -> Self {
         Self {
             conns: HashMap::new(),
             machines: HashMap::new(),
@@ -222,6 +273,7 @@ impl Core {
             conn_acked_seq: HashMap::new(),
             disconnect_conns: Vec::new(),
             store,
+            req_origin_ttl_ms,
         }
     }
 
@@ -247,6 +299,14 @@ impl Core {
                     for id in ids {
                         self.handle_disconnect(id).await;
                     }
+                }
+                CoreMsg::SweepReqOrigin { now_ms } => {
+                    self.req_origin
+                        .retain(|_, origin| now_ms - origin.created_at_ms < self.req_origin_ttl_ms);
+                }
+                #[cfg(test)]
+                CoreMsg::ProbeReqOrigin { reply } => {
+                    let _ = reply.send(self.req_origin.len());
                 }
             }
             self.drain_disconnects().await;
@@ -692,7 +752,11 @@ impl Core {
                     Some(machine_conn) => {
                         self.req_origin.insert(
                             request_id.clone(),
-                            ReqOrigin { origin: id, target_machine: machine_id.expect("target_conn implies machine_id") },
+                            ReqOrigin {
+                                origin: id,
+                                target_machine: machine_id.expect("target_conn implies machine_id"),
+                                created_at_ms: now_ms(),
+                            },
                         );
                         self.send_to(
                             machine_conn,
@@ -1049,6 +1113,68 @@ mod tests {
                 other => panic!("unexpected {other:?}"),
             }
         }
+    }
+
+    /// Task 8：`req_origin` 条目超 TTL 后应被独立心跳任务清扫，防长驻进程
+    /// `SendCommand` 从未收到回复时无限累积登记（内存泄漏）。
+    ///
+    /// 注：`created_at_ms` 用 `SystemTime::now()`（真实墙钟），不受
+    /// `tokio::time::pause`/`advance` 影响——`start_paused` 只能推进 tokio 内部
+    /// 定时器（`sleep`/`interval`）用的虚拟时钟，两者不可混用，否则 TTL 判定
+    /// 永远看不到时间流逝。因此本测试不用 `start_paused`，改用真实短 TTL +
+    /// 真实 `sleep` 跨过心跳周期下限（`(ttl/2).max(1000ms)`）。用 `#[cfg(test)]
+    /// CoreMsg::ProbeReqOrigin` 白盒探测内部状态，直接验证清扫生效（而非依赖
+    /// 后续伪造回复的间接行为断言）。
+    #[tokio::test]
+    async fn stale_req_origin_is_swept_after_ttl() {
+        let store = SqliteRelayStore::open_in_memory().expect("in-memory sqlite open");
+        let relay = FakeRelay::start_with_store_and_ttl(store, 200);
+
+        let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
+        m.send(frame(
+            ClientRole::Machine { machine_id: "M1".into() },
+            RelayControlMsg::RegisterMachine { machine: machine("M1") },
+        ))
+        .await;
+
+        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        d.send(frame(
+            ClientRole::Device { device_id: "D1".into() },
+            RelayControlMsg::SendCommand {
+                request_id: "r1".into(),
+                target: CommandTarget::Machine { machine_id: "M1".into() },
+                data: DataEnvelope::plaintext(&"x").unwrap(),
+            },
+        ))
+        .await;
+
+        // 同步屏障：等 CommandDelivered 回执，确保 req_origin 已写入（避免与
+        // probe 竞态）。machine M1 故意从不回复——模拟长驻进程的悬空登记。
+        match tokio::time::timeout(std::time::Duration::from_secs(5), d.recv())
+            .await
+            .expect("CommandDelivered 超时")
+            .expect("frame")
+            .msg
+        {
+            RelayControlMsg::CommandDelivered { request_id } => assert_eq!(request_id, "r1"),
+            other => panic!("expected CommandDelivered, got {other:?}"),
+        }
+
+        assert_eq!(
+            relay.probe_req_origin_len().await,
+            1,
+            "SendCommand 后 req_origin 应有 1 条登记"
+        );
+
+        // 心跳周期下限为 1000ms（(200/2).max(1000)），需真实等待跨过至少一轮
+        // 心跳 + TTL(200ms) 才能观察到清扫生效。
+        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+
+        assert_eq!(
+            relay.probe_req_origin_len().await,
+            0,
+            "超 TTL 后 req_origin 应被心跳任务清扫为空"
+        );
     }
 
     async fn recv_send_command(c: &mut RelayClient) -> String {
