@@ -564,7 +564,7 @@ async fn cmd_watch(relay: &str, conversation_id: &str, profile: &str, data_dir: 
         "cli-watch".into(),
         0,
         RelayControlMsg::Subscribe {
-            target: SubTarget::Events { conversation_id: conversation_id.to_string() },
+            target: SubTarget::Events { conversation_id: conversation_id.to_string(), since_seq: None },
         },
     ))
     .await;

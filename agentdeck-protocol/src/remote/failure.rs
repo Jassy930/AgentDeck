@@ -9,6 +9,9 @@ pub const AUTH_FORBIDDEN: &str = "relay.auth.forbidden";
 pub const PAIR_BAD_SECRET: &str = "relay.pair.bad_secret";
 pub const PAIR_CHALLENGE_EXPIRED: &str = "relay.pair.challenge_expired";
 pub const PAIR_BAD_SIGNATURE: &str = "relay.pair.bad_signature";
+pub const PAIR_MISSING_OWNER_PUBKEY: &str = "relay.pair.missing_owner_pubkey";
+// relay.replay.*（Task 6 消费：重放补拉窗口外的错误码；本 task 一并注册避免二次改 failure.rs）
+pub const REPLAY_GAP: &str = "relay.replay.gap";
 // relay.*
 pub const VERSION_UNSUPPORTED: &str = "relay.version.unsupported";
 pub const MACHINE_IDENTITY_CONFLICT: &str = "relay.machine.identity_conflict";

@@ -37,7 +37,7 @@ mod tests {
             ClientRole::Device { device_id: "D1".into() },
             "trace-1".into(),
             0,
-            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into() } },
+            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: None } },
         );
         let json = serde_json::to_value(&frame).unwrap();
         // 控制面字段对 relay 明文可读：

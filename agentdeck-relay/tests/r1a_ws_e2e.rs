@@ -25,7 +25,7 @@ use agentdeck_protocol::remote::{
 use agentdeck_relay::RelayLink;
 use agentdeck_relay::auth::store::InMemoryRelayStore;
 use agentdeck_relay::config::RelayConfig;
-use agentdeck_relay_client::WsRelayClient;
+use agentdeck_relay_client::{WsError, WsRelayClient};
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -372,8 +372,8 @@ async fn rejects_bad_secret_expired_nonce_revoked_and_unknown_cred() {
         assert_eq!(body["code"], failure::PAIR_CHALLENGE_EXPIRED);
     }
 
-    // 3) 未知 credential → WS 连接被拒（无法从客户端侧区分具体 401 vs 其它连接
-    // 失败，故只断言 connect 返回 Err，见 report 里的决定记录）。
+    // 3) 未知 credential → WS 连接被拒——R1b Task 1 起 relay-client 能精确解析
+    // 握手期 HTTP 4xx（`WsError::Rejected{status,code}`），不再折叠成泛化 Err。
     {
         let result = WsRelayClient::connect(
             &ws_url(addr),
@@ -381,7 +381,14 @@ async fn rejects_bad_secret_expired_nonce_revoked_and_unknown_cred() {
             ClientRole::Device { device_id: "ghost".into() },
         )
         .await;
-        assert!(result.is_err(), "expected ws connect with unknown credential to fail");
+        match result {
+            Err(WsError::Rejected { status, code }) => {
+                assert_eq!(status, 401, "unknown credential must be rejected with 401");
+                assert_eq!(code.as_deref(), Some(failure::AUTH_INVALID_DEVICE));
+            }
+            Ok(_) => panic!("expected ws connect with unknown credential to be rejected, but it succeeded"),
+            Err(other) => panic!("expected WsError::Rejected{{401, AUTH_INVALID_DEVICE}}, got {other}"),
+        }
     }
 
     // 4) revoked credential → 先 enroll 成功，再直接标记撤销，随后同凭据连接被拒
@@ -394,7 +401,14 @@ async fn rejects_bad_secret_expired_nonce_revoked_and_unknown_cred() {
             ClientRole::Device { device_id: enrolled.device_id.clone() },
         )
         .await;
-        assert!(result.is_err(), "expected ws connect with a revoked credential to fail");
+        match result {
+            Err(WsError::Rejected { status, code }) => {
+                assert_eq!(status, 401, "revoked credential must be rejected with 401");
+                assert_eq!(code.as_deref(), Some(failure::AUTH_REVOKED_DEVICE));
+            }
+            Ok(_) => panic!("expected ws connect with a revoked credential to be rejected, but it succeeded"),
+            Err(other) => panic!("expected WsError::Rejected{{401, AUTH_REVOKED_DEVICE}}, got {other}"),
+        }
     }
 }
 
@@ -590,9 +604,9 @@ async fn sentinel_token_not_in_logs() {
 /// revoked / unknown_cred / cross_identity / forged_from / non_target_reply 等
 /// 拒绝路径，但未测 `server/ws.rs::connect` 里 `version != RELAY_PROTOCOL_VERSION
 /// → reject(BAD_REQUEST, VERSION_UNSUPPORTED)` 分支。补一条握手带 `?v=999` 的
-/// WS 连接，断言 relay-client 侧返回 `Err`——`WsRelayClient` 内部会把 tungstenite
-/// 的 HTTP 4xx 折叠为 `WsError::Connect(...)`（Task 7 review 已知遗留），无法在
-/// client 端精确断言 code，故本测试**只**断言"连接被拒绝"这一 R1a 核心 invariant。
+/// WS 连接。R1b Task 1 起 `WsRelayClient` 能精确解析握手期 HTTP 4xx
+/// （`WsError::Rejected{status,code}`，不再折叠成泛化 `WsError::Connect`——Task 7
+/// review 遗留在本 task 收编），断言升级到具体 `400 + VERSION_UNSUPPORTED`。
 #[tokio::test]
 async fn ws_connect_rejects_wrong_protocol_version() {
     let (addr, _store, base_url) = setup_server("boot-version").await;
@@ -612,10 +626,14 @@ async fn ws_connect_rejects_wrong_protocol_version() {
         ClientRole::Device { device_id: enrolled.device_id.clone() },
     )
     .await;
-    assert!(
-        result.is_err(),
-        "protocol version 不符时 WS 连接必须被 relay 拒绝（v=999 不该被 upgrade）"
-    );
+    match result {
+        Err(WsError::Rejected { status, code }) => {
+            assert_eq!(status, 400, "unsupported protocol version must be rejected with 400");
+            assert_eq!(code.as_deref(), Some(failure::VERSION_UNSUPPORTED));
+        }
+        Ok(_) => panic!("expected ws connect with unsupported protocol version to be rejected, but it succeeded"),
+        Err(other) => panic!("expected WsError::Rejected{{400, VERSION_UNSUPPORTED}}, got {other}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

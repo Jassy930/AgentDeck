@@ -22,6 +22,11 @@ pub enum WsError {
     Io(String),
     #[error("invalid frame: {0}")]
     InvalidFrame(String),
+    /// relay 在握手阶段以 HTTP 4xx 拒绝了升级请求（例如版本不支持、凭据无效/已
+    /// 撤销）；`status` 是 HTTP 状态码，`code` 是 `server/ws.rs::reject()` 响应体
+    /// 里的 `failure::*` 稳定码（若响应体不是预期 JSON 形状则为 `None`）。
+    #[error("ws rejected: status={status} code={code:?}")]
+    Rejected { status: u16, code: Option<String> },
 }
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -62,12 +67,26 @@ fn build_request(
     Ok(request)
 }
 
+/// 从 `server/ws.rs::reject()` 的 `ConnectErrorBody { code, message }` JSON 响应体
+/// 里取 `code` 字段；响应体不是预期形状（非 JSON / 无 `code` 字段）时返回 `None`，
+/// 不 panic。
+fn extract_reject_code(body: Option<Vec<u8>>) -> Option<String> {
+    let body = body?;
+    let value = serde_json::from_slice::<serde_json::Value>(&body).ok()?;
+    value.get("code").and_then(|c| c.as_str()).map(String::from)
+}
+
 async fn dial(url: &str, bearer: &str) -> Result<(WsSink, SplitStream<WsStream>), WsError> {
     let request = build_request(url, bearer)?;
-    let (ws_stream, _response) = connect_async(request)
-        .await
-        .map_err(|e| WsError::Connect(e.to_string()))?;
-    Ok(ws_stream.split())
+    match connect_async(request).await {
+        Ok((ws_stream, _response)) => Ok(ws_stream.split()),
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            let status = response.status().as_u16();
+            let code = extract_reject_code(response.into_body());
+            Err(WsError::Rejected { status, code })
+        }
+        Err(e) => Err(WsError::Connect(e.to_string())),
+    }
 }
 
 impl WsTransport {
@@ -174,5 +193,16 @@ impl agentdeck_relay::RelayLink for WsRelayClient {
                 Ok(None) | Err(_) => return None,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ws_error_rejected_carries_status_and_code() {
+        let e = WsError::Rejected { status: 401, code: Some("relay.pair.bad_secret".into()) };
+        assert!(e.to_string().contains("401"));
     }
 }

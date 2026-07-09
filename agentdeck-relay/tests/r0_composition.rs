@@ -79,7 +79,7 @@ async fn t2_conversation_stream_survives_new_turn_through_relay() {
 
     let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
     d.send(d_frame(RelayControlMsg::Subscribe {
-        target: SubTarget::Events { conversation_id: "C1".into() },
+        target: SubTarget::Events { conversation_id: "C1".into(), since_seq: None },
     }))
     .await;
 

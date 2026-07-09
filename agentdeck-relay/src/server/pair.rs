@@ -74,9 +74,9 @@ fn map_enroll_error(err: EnrollError) -> (StatusCode, Json<EnrollErrorBody>) {
         EnrollError::BadSecret => (StatusCode::UNAUTHORIZED, failure::PAIR_BAD_SECRET),
         EnrollError::ChallengeExpired => (StatusCode::BAD_REQUEST, failure::PAIR_CHALLENGE_EXPIRED),
         EnrollError::BadSignature => (StatusCode::UNAUTHORIZED, failure::PAIR_BAD_SIGNATURE),
-        // brief 的 failure 注册表未列该变体（Task 6 review 新增，非签名失败）；
-        // 沿用 `relay.pair.*` 命名空间自定一个稳定码。
-        EnrollError::MissingOwnerPubkey => (StatusCode::BAD_REQUEST, "relay.pair.missing_owner_pubkey"),
+        EnrollError::MissingOwnerPubkey => {
+            (StatusCode::BAD_REQUEST, failure::PAIR_MISSING_OWNER_PUBKEY)
+        }
     };
     (status, Json(EnrollErrorBody { code, message: err.to_string() }))
 }
@@ -124,4 +124,17 @@ pub(crate) async fn complete(
         credential: resp.credential,
         device_id: resp.device.device_id,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_owner_pubkey_uses_registered_failure_code() {
+        assert_eq!(
+            map_enroll_error(EnrollError::MissingOwnerPubkey).1.0.code,
+            agentdeck_protocol::remote::failure::PAIR_MISSING_OWNER_PUBKEY
+        );
+    }
 }

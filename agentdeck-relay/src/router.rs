@@ -415,7 +415,7 @@ impl Core {
                 let list = self.sessions.get(&machine_id).cloned().unwrap_or_default();
                 self.send_to(id, &trace, RelayControlMsg::SessionList { machine_id, sessions: list }).await;
             }
-            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id } } => {
+            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id, .. } } => {
                 let my_account = self.conns.get(&id).map(|c| c.identity.account_id.clone());
                 let target_account = self
                     .conv_machine
@@ -702,7 +702,7 @@ mod tests {
         let mut d1 = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
         d1.send(frame(
             ClientRole::Device { device_id: "D1".into() },
-            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into() } },
+            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: None } },
         ))
         .await;
 
@@ -720,7 +720,7 @@ mod tests {
         let mut d2 = relay.connect(ClientRole::Device { device_id: "D2".into() }).await;
         d2.send(frame(
             ClientRole::Device { device_id: "D2".into() },
-            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into() } },
+            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: None } },
         ))
         .await;
         let r0 = recv_event(&mut d2).await;
@@ -858,7 +858,7 @@ mod tests {
         let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
         d.send(frame(
             ClientRole::Device { device_id: "D1".into() },
-            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into() } },
+            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: None } },
         ))
         .await;
 
@@ -1085,7 +1085,7 @@ mod tests {
             ClientRole::Device { device_id: "d1".into() },
             "t".into(),
             0,
-            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into() } },
+            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: None } },
         ))
         .await;
 
@@ -1169,7 +1169,7 @@ mod tests {
             ClientRole::Device { device_id: "checker".into() },
             "t".into(),
             0,
-            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into() } },
+            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: None } },
         ))
         .await;
         let (conv, turn, _seq) = recv_event(&mut check).await;
