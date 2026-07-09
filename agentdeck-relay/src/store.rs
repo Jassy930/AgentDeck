@@ -135,6 +135,55 @@ impl SqliteRelayStore {
         let conn = self.conn.lock().expect("sqlite store mutex poisoned");
         f(&*conn)
     }
+
+    /// Task 4：persist-before-deliver 的核心方法——同一事务内 UPSERT
+    /// `seq_high_water_marks` 取号（`next_seq` 自增，返回值即新分配的 `seq`）
+    /// + `INSERT conv_events`（`payload` 恒 NULL，见 §2.4 决策——R1c 才写密文）。
+    /// 不属于 `RelayStore` trait（trait 只覆盖 accounts/devices/challenges），
+    /// 是 Core 专用的 inherent 方法。事务保证"取号"与"落盘事件"原子——不会出现
+    /// 号已分配但事件未落盘（或反之）的中间态。
+    pub(crate) fn reserve_and_persist_event(
+        &self,
+        conversation_id: &str,
+        turn_session_id: &str,
+        now_ms: i64,
+    ) -> rusqlite::Result<u64> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO seq_high_water_marks(conversation_id, next_seq) VALUES (?1, 1)
+             ON CONFLICT(conversation_id) DO UPDATE SET next_seq = next_seq + 1",
+            params![conversation_id],
+        )?;
+        let next_seq: u64 = tx.query_row(
+            "SELECT next_seq FROM seq_high_water_marks WHERE conversation_id = ?1",
+            params![conversation_id],
+            |r| r.get(0),
+        )?;
+        let seq = next_seq - 1;
+        tx.execute(
+            "INSERT INTO conv_events(conversation_id, seq, turn_session_id, encryption_version, payload, created_at_ms)
+             VALUES (?1, ?2, ?3, 0, NULL, ?4)",
+            params![conversation_id, seq, turn_session_id, now_ms],
+        )?;
+        tx.commit()?;
+        Ok(seq)
+    }
+
+    /// 重启恢复用：返回持久化的高水位（下一个将分配的 seq）。无该 conversation
+    /// 记录时返回 0（与内存版 `conv_seq` 首次 `entry().or_insert(0)` 语义对齐）。
+    /// 供测试断言；生产路径本身不消费（`reserve_and_persist_event` 自足）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn load_next_seq(&self, conversation_id: &str) -> rusqlite::Result<u64> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        conn.query_row(
+            "SELECT next_seq FROM seq_high_water_marks WHERE conversation_id = ?1",
+            params![conversation_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map(|opt| opt.unwrap_or(0))
+    }
 }
 
 fn role_to_str(role: DeviceRole) -> &'static str {

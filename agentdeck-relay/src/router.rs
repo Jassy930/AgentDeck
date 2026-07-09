@@ -9,6 +9,19 @@ use agentdeck_protocol::remote::{
 };
 use tokio::sync::mpsc;
 
+use crate::store::SqliteRelayStore;
+
+/// 边缘时间戳获取：`conv_events.created_at_ms` 只用于审计/排障展示，不参与
+/// seq 高水位计算（seq 单调性完全由 `reserve_and_persist_event` 的 SQL 事务
+/// 保证）。用 `std::time`，不引入新依赖。
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before UNIX_EPOCH")
+        .as_millis() as i64
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ClientId(u64);
 
@@ -68,9 +81,21 @@ pub struct FakeRelay {
 }
 
 impl FakeRelay {
+    /// 内存测试/匿名 dev 便捷入口：内部委托 `start_with_store` 一个 in-memory
+    /// `SqliteRelayStore`（进程退出即丢弃，不落盘）。签名不变——现有 15+ 调用点
+    /// 无需改动。
     pub fn start() -> Self {
+        Self::start_with_store(
+            SqliteRelayStore::open_in_memory().expect("in-memory sqlite open"),
+        )
+    }
+
+    /// Task 4：携带一个已打开的 `SqliteRelayStore`（落盘文件或 in-memory）启动
+    /// Core。Task 9 main.rs 会用此入口传入真实 SQLite 文件；本 task 测试用
+    /// `tempfile::tempdir()` 验证跨重启 seq 单调。
+    pub fn start_with_store(store: SqliteRelayStore) -> Self {
         let (core_tx, core_rx) = mpsc::channel::<CoreMsg>(256);
-        tokio::spawn(Core::default().run(core_rx));
+        tokio::spawn(Core::new(store).run(core_rx));
         FakeRelay { core_tx, next_id: Arc::new(AtomicU64::new(1)) }
     }
 
@@ -139,14 +164,12 @@ struct ReqOrigin {
     target_machine: String,
 }
 
-#[derive(Default)]
 struct Core {
     conns: HashMap<ClientId, Conn>,
     machines: HashMap<String, MachineEntry>,
     conv_machine: HashMap<String, String>,
     turn_conv: HashMap<String, String>,
     sessions: HashMap<String, Vec<SessionDescriptor>>,
-    conv_seq: HashMap<String, u64>,
     conv_buffer: HashMap<String, Vec<RelayControlMsg>>,
     req_origin: HashMap<String, ReqOrigin>,
     subs_machines: HashSet<ClientId>,
@@ -155,9 +178,31 @@ struct Core {
     /// send_to 遇到满/已关闭的连接时延迟登记于此，避免在持有 conns 借用时直接
     /// handle_disconnect（借用冲突）；由 run 循环在每条消息处理完后统一 drain。
     disconnect_conns: Vec<ClientId>,
+    /// Task 4：seq 高水位 + conv_events 落盘的权威来源。取代原内存
+    /// `conv_seq: HashMap<String, u64>`——`PublishEvent` 的 seq 完全由
+    /// `store.reserve_and_persist_event` 的 SQLite 事务分配，Core 不再自行
+    /// `+= 1`（重启后内存归零会导致 seq 回退，SQLite 高水位跨重启单调）。
+    store: SqliteRelayStore,
 }
 
 impl Core {
+    fn new(store: SqliteRelayStore) -> Self {
+        Self {
+            conns: HashMap::new(),
+            machines: HashMap::new(),
+            conv_machine: HashMap::new(),
+            turn_conv: HashMap::new(),
+            sessions: HashMap::new(),
+            conv_buffer: HashMap::new(),
+            req_origin: HashMap::new(),
+            subs_machines: HashSet::new(),
+            subs_sessions: HashMap::new(),
+            subs_events: HashMap::new(),
+            disconnect_conns: Vec::new(),
+            store,
+        }
+    }
+
     async fn run(mut self, mut rx: mpsc::Receiver<CoreMsg>) {
         while let Some(msg) = rx.recv().await {
             match msg {
@@ -372,11 +417,35 @@ impl Core {
                     .await;
                     return;
                 }
-                let seq = {
-                    let s = self.conv_seq.entry(conversation_id.clone()).or_insert(0);
-                    let cur = *s;
-                    *s += 1;
-                    cur
+                // persist-before-deliver（§2.4 决策）：先在 SQLite 事务里取号+落盘
+                // （`payload` 恒 NULL，R1c 才写密文），成功后才 push conv_buffer/广播。
+                // `spawn_blocking` 前 clone 出所有需要的字段——`&mut self` 不能跨 await
+                // 存活，闭包内也不持有 `self` 借用。
+                let store = self.store.clone();
+                let conv_for_persist = conversation_id.clone();
+                let turn_for_persist = turn_session_id.clone();
+                let now = now_ms();
+                let seq = match tokio::task::spawn_blocking(move || {
+                    store.reserve_and_persist_event(&conv_for_persist, &turn_for_persist, now)
+                })
+                .await
+                {
+                    Ok(Ok(seq)) => seq,
+                    Ok(Err(err)) => {
+                        // 持久化失败：正确性优先于可用性——不 push、不广播，静默丢弃
+                        // 该事件（不发起方 Error 帧，避免为此扩 protocol failure code
+                        // scope；见 task-4-report.md 决策记录）。
+                        eprintln!(
+                            "agentdeck-relay: reserve_and_persist_event failed for conversation {conversation_id}: {err:?}"
+                        );
+                        return;
+                    }
+                    Err(join_err) => {
+                        eprintln!(
+                            "agentdeck-relay: reserve_and_persist_event spawn_blocking join failed: {join_err:?}"
+                        );
+                        return;
+                    }
                 };
                 self.turn_conv.insert(turn_session_id.clone(), conversation_id.clone());
                 let ev = RelayControlMsg::Event {
@@ -742,6 +811,47 @@ mod tests {
                 }
                 _ => continue,
             }
+        }
+    }
+
+    /// Task 4：SQLite 高水位跨重启单调——同一 `relay.db` 文件重开新 `FakeRelay`
+    /// 后，第三条事件的 seq 必须从持久化高水位延续（2），不因内存 `conv_seq`
+    /// 归零而回退到 0。
+    #[tokio::test]
+    async fn seq_survives_relay_restart_via_same_sqlite_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay.db");
+
+        // 第一次"启动"：发布两条事件，seq 应为 0, 1
+        {
+            let store = crate::SqliteRelayStore::open(&path).unwrap();
+            let relay = FakeRelay::start_with_store(store);
+            let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
+            m.send(frame(ClientRole::Machine { machine_id: "M1".into() },
+                RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+            m.send(frame(ClientRole::Machine { machine_id: "M1".into() },
+                RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+            publish(&m, "C1", "S1").await;
+            publish(&m, "C1", "S2").await;
+            // 给持久化 spawn_blocking 一点时间落盘（无直接回执可等时用短 sleep）
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        // 模拟进程重启：重开同一文件的新 FakeRelay，第三条事件的 seq 必须是 2（不回退到 0）
+        {
+            let store = crate::SqliteRelayStore::open(&path).unwrap();
+            let relay = FakeRelay::start_with_store(store);
+            let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
+            m.send(frame(ClientRole::Machine { machine_id: "M1".into() },
+                RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+            m.send(frame(ClientRole::Machine { machine_id: "M1".into() },
+                RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+            let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+            d.send(frame(ClientRole::Device { device_id: "D1".into() },
+                RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: None } })).await;
+            publish(&m, "C1", "S3").await;
+            let (_, _, seq) = recv_event(&mut d).await;
+            assert_eq!(seq, 2, "重启后 seq 必须从持久化高水位延续，不回退");
         }
     }
 
