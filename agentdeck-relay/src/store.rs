@@ -370,6 +370,7 @@ mod tests {
         });
         assert!(store.take_challenge("pk1", 5_000).is_some());
         // 已消费：第二次 take 必须 None（即便时间仍在 TTL 内）
+        assert!(store.take_challenge("pk1", 5_000).is_none(), "已消费的 challenge 不应再次命中（仍在 TTL 内）");
         store.put_challenge(Challenge {
             device_sign_pubkey: "pk1".into(),
             nonce: "n1".into(),
