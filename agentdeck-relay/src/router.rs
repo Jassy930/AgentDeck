@@ -228,7 +228,7 @@ struct ReqOrigin {
 
 /// Task 8：`req_origin` 条目 TTL 默认值（5 分钟）。Task 9 会接入
 /// `RelayConfig::req_origin_ttl_ms` 令其可配置；本任务先用常量占位，通过
-/// `Core::new_with_ttl` / `FakeRelay::start_with_store_and_ttl` 支持测试注入短 TTL。
+/// `Core::new_with_ttl_and_cap` / `FakeRelay::start_with_store_and_ttl` 支持测试注入短 TTL。
 const DEFAULT_REQ_ORIGIN_TTL_MS: i64 = 300_000;
 
 /// Task 6：从 `conv_buffer` 中缓存的帧取出其 `seq`（`conv_buffer` 存的是 relay
@@ -273,6 +273,13 @@ struct Core {
     /// 的私有常量占位——生效值现在由 `RelayConfig::conv_buffer_cap` 经
     /// `FakeRelay::start_with_all` 传入）。
     conv_buffer_cap: usize,
+    /// R1b whole-branch review fix：per-conversation 最新持久化 seq（每次
+    /// `PublishEvent` 成功持久化后更新）。用于 `Subscribe{Events, since_seq}`
+    /// 区分「真 gap」（`n < highest_seq` 且 `conv_buffer` 不再覆盖，数据已被
+    /// 硬上界 FIFO 丢弃不可恢复）与「无 gap，空回放正确」（conversation 从未
+    /// `PublishEvent` 过，或 `n >= highest_seq` 即客户端已 up-to-date）——避免
+    /// 仅凭 `conv_buffer.get()` 返回 `None`/空 vec 就误判为 gap。
+    conv_highest_seq: HashMap<String, u64>,
 }
 
 impl Core {
@@ -300,6 +307,7 @@ impl Core {
             store,
             req_origin_ttl_ms,
             conv_buffer_cap,
+            conv_highest_seq: HashMap::new(),
         }
     }
 
@@ -563,6 +571,10 @@ impl Core {
                     }
                 };
                 self.turn_conv.insert(turn_session_id.clone(), conversation_id.clone());
+                // R1b whole-branch review fix：记录该 conversation 的最新持久化
+                // seq，供 `Subscribe{Events, since_seq}` gap 判定使用（见
+                // `conv_highest_seq` 字段注释）。
+                self.conv_highest_seq.insert(conversation_id.clone(), seq);
                 let ev = RelayControlMsg::Event {
                     conversation_id: conversation_id.clone(),
                     turn_session_id,
@@ -639,6 +651,15 @@ impl Core {
                 //   `seq > n` 的部分（不含 n 本身，语义与 Ack 的 `up_to_seq`
                 //   对称）；否则说明缺口部分已被硬上界 FIFO 丢弃，relay 不能
                 //   凭空补上，回 `Error{code: REPLAY_GAP}` 并拒绝订阅。
+                //
+                // R1b whole-branch review fix：`Some(n)` 分支不能只看
+                // `conv_buffer` 是否为空/不存在就判 gap——conversation 从未
+                // `PublishEvent`（`conv_buffer` 无 entry）或 T5 Ack-trim 已把
+                // buffer 清空（所有订阅方都已 ack 到 seq）时，`conv_buffer`
+                // 同样是空的，但这不是 gap，而是「无历史」或「客户端已
+                // up-to-date」。用 `conv_highest_seq` 先判断 `n` 是否已达到/
+                // 超过该 conversation 见过的最新 seq；只有 `n` 落后于
+                // `highest_seq` 且 buffer 不再覆盖时，才是真正不可恢复的 gap。
                 match since_seq {
                     None => {
                         self.subs_events.entry(conversation_id.clone()).or_default().insert(id);
@@ -649,6 +670,18 @@ impl Core {
                         }
                     }
                     Some(n) => {
+                        let is_up_to_date = self
+                            .conv_highest_seq
+                            .get(&conversation_id)
+                            .map(|&highest| n >= highest)
+                            .unwrap_or(true);
+                        if is_up_to_date {
+                            // 从未 publish 过（无历史可漏）或 n 已达到/超过最新
+                            // seq（客户端已收到全部历史）——只注册订阅，无需
+                            // 回放，也不是 gap。
+                            self.subs_events.entry(conversation_id.clone()).or_default().insert(id);
+                            return;
+                        }
                         let buf = self.conv_buffer.get(&conversation_id).cloned();
                         let oldest_seq_in_buffer =
                             buf.as_ref().and_then(|b| b.first()).and_then(event_seq);
@@ -1765,6 +1798,95 @@ mod tests {
         .await;
         let code = recv_until_error(&mut d).await;
         assert_eq!(code, failure::REPLAY_GAP, "since_seq 早于 buffer 应返回 REPLAY_GAP");
+    }
+
+    /// R1b whole-branch review fix（NEW-12）：conversation 从未 `PublishEvent`
+    /// 过时，`conv_buffer.get()` 返回 `None`，`Subscribe{Events, since_seq:
+    /// Some(n)}` 不应误判为 gap——无历史等价于「已 up-to-date」，应订阅成功、
+    /// 静默无回放，而不是返回 `REPLAY_GAP`。
+    #[tokio::test]
+    async fn since_seq_on_never_published_conversation_returns_empty_replay_not_gap() {
+        let relay = FakeRelay::start();
+        let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
+        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+        // 从未 publish 任何 event。
+
+        // 同步屏障（Task 5/6 pattern）：确保上面两条消息已被 Core 处理完。
+        let mut probe = relay.connect(ClientRole::Device { device_id: "probe".into() }).await;
+        probe
+            .send(frame(
+                ClientRole::Device { device_id: "probe".into() },
+                RelayControlMsg::Subscribe { target: SubTarget::Machines },
+            ))
+            .await;
+        let _ = probe.recv().await; // 初始 MachineList 快照
+        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), probe.recv())
+            .await
+            .expect("屏障 RegisterMachine 广播超时")
+            .expect("frame");
+
+        // Device 用 since_seq=Some(0) 订阅（想补拉但无事可补——conversation 从未
+        // publish 过）。
+        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        d.send(frame(
+            ClientRole::Device { device_id: "D1".into() },
+            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: Some(0) } },
+        ))
+        .await;
+
+        // 期望：无 REPLAY_GAP Error（订阅成功注册，无 replay）；后续 publish 一条
+        // 事件应能收到，证明订阅确实生效，而不是因为静默拒绝导致后面也收不到。
+        publish(&m, "C1", "S0").await;
+        let (_, _, seq) = recv_event(&mut d).await;
+        assert_eq!(seq, 0, "从未 publish 的 conv + since_seq=0 应订阅成功不返 REPLAY_GAP");
+    }
+
+    /// R1b whole-branch review fix（NEW-12）：客户端 `since_seq` 已达到/超过该
+    /// conversation 见过的最新 seq（已收到全部历史，含 T5 Ack-trim 后 buffer
+    /// 合理清空的场景）——不是 gap，应订阅成功、静默无回放。
+    #[tokio::test]
+    async fn since_seq_at_or_beyond_highest_seq_returns_empty_replay_not_gap() {
+        let relay = FakeRelay::start();
+        let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
+        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+
+        publish(&m, "C1", "S0").await;
+        publish(&m, "C1", "S1").await;
+        publish(&m, "C1", "S2").await;
+
+        // 同步屏障（Task 5/6 pattern）：确保前面 3 条 PublishEvent 都已被 Core
+        // 处理完，避免 flaky。
+        let mut probe = relay.connect(ClientRole::Device { device_id: "probe".into() }).await;
+        probe
+            .send(frame(
+                ClientRole::Device { device_id: "probe".into() },
+                RelayControlMsg::Subscribe { target: SubTarget::Machines },
+            ))
+            .await;
+        let _ = probe.recv().await; // 初始 MachineList 快照
+        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), probe.recv())
+            .await
+            .expect("屏障 RegisterMachine 广播超时")
+            .expect("frame");
+
+        // Device 用 since_seq=Some(2) 订阅（已收到 seq=0,1,2，只想订阅未来事件——
+        // n >= highest_seq(=2)）。
+        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        d.send(frame(
+            ClientRole::Device { device_id: "D1".into() },
+            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: Some(2) } },
+        ))
+        .await;
+
+        // 期望：无 REPLAY_GAP + 无历史 event replay（已 up-to-date）；新 publish
+        // 的事件应能正常收到（订阅生效，只是没有回放）。
+        publish(&m, "C1", "S3").await;
+        let (_, _, seq) = recv_event(&mut d).await;
+        assert_eq!(seq, 3, "since_seq >= highest_seq 应订阅成功不返 REPLAY_GAP，收到新事件 seq=3");
     }
 
     /// Task 7（R1a 遗留 bug 修复）：同一 machine 重启后重新 `AnnounceSession`
