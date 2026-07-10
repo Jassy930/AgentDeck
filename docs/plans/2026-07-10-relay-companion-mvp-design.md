@@ -806,6 +806,7 @@ Relay 外层错误只描述通用路由/传输失败；daemon 业务错误必须
 - 冻结本文、标记 Relay v1 不兼容。
 - 准备显式 trust reset 和验证脚本骨架。
 - 保证现有 cargo/swift/iOS/docs tests 仍全绿。
+- P0冻结当前Relay v1 schema与行为基线；P1继续编译v1 namespace并运行历史行为测试，但按P1.3把v1 entries从local IPC aggregate schema移除，不另建目标v1 schema。严格最小可见不变量从并列的Relay v2 contract开始生效，并在P2.9原子cutover后成为唯一生产路径。期间不扩展v1产品能力，也不提供v1/v2双栈生产listener。
 - 固定四个独立版本轴：现有 local IPC `PROTOCOL_VERSION=2` 保持不变；新增 `RUNTIME_PROTOCOL_VERSION=1`、目标 `RELAY_PROTOCOL_VERSION=2`、`E2EE_FORMAT_VERSION=1`。schema 快照与 CLI 导出入口按 IPC/Runtime/Relay 分开，禁止再用一个常量暗示四层同时升级。
 - 每个阶段在合入代码时同步更新 README、ARCHITECTURE、QUALITY、DIAGNOSTICS、docs index/对应计划与 AGENTS 当前重点；不能把行为/架构文档全部拖到 P6。本次 design-only commit 仍保持单文件 scoped boundary，正式代码阶段再按实际落地事实更新入口文档。
 

@@ -14,7 +14,7 @@
 
 - 版本轴彼此独立：现有 local IPC `PROTOCOL_VERSION = 2`；新增 `RUNTIME_PROTOCOL_VERSION = 1`；Relay 目标 `RELAY_PROTOCOL_VERSION = 2`；`E2EE_FORMAT_VERSION = 1`。四者不得联动 bump。
 - P1 只并列加入 Runtime/Relay v2/E2EE contract；P2 最后一个 cutover task 才删除 Relay v1 生产路径。生产 listener 不提供 v1/v2 双栈。
-- Relay wire、schema、SQLite、日志和 metrics 禁止出现机器名、session title、cwd、agent kind、conversation/thread/turn/approval/vendor 真实业务字段或业务 payload。
+- Relay v2 wire、schema、SQLite、日志和 metrics，以及 P2.9 cutover 后的全部生产路径，禁止出现机器名、session title、cwd、agent kind、conversation/thread/turn/approval/vendor 真实业务字段或业务 payload。P0冻结当前Relay v1 schema/行为基线；P1继续编译v1 namespace并运行历史行为测试，但P1.3会按计划从local IPC aggregate schema移除v1 entries，不另建或冒充目标v1 schema。P0–P1均不扩展v1产品能力，也不提供v1/v2双栈生产listener。
 - 生产 Relay v2 没有 plaintext data envelope；`ws://` 仅允许 loopback 且必须显式 `--allow-insecure-loopback`；非 loopback、TLS feature 缺失、证书不匹配、pin 不匹配都 fail-closed。
 - 固定密码套件：HPKE Base mode X25519 + HKDF-SHA256 + ChaCha20-Poly1305；Ed25519；高频 AEAD 为 ChaCha20-Poly1305。禁止手写 X25519/HKDF box。
 - CryptoKit HPKE Sender 无固定 RNG 注入口：确定性 byte-for-byte vector 只覆盖 canonical TBS/AAD、ChaChaPoly、签名和 Rust 固定 HPKE KAT；互操作覆盖 Rust 固定 KAT→Swift open、Swift 随机 seal→Rust open。
@@ -58,18 +58,22 @@
 - Create: `scripts/reset-relay-v1-dev-state.sh`
 - Create: `scripts/tests/reset-relay-v1-dev-state.sh`
 - Modify: `.gitignore`
+- Modify: `ARCHITECTURE.md`
+- Modify: `AGENTS.md`
 - Modify: `docs/QUALITY.md`
 - Modify: `docs/AGENT_DIAGNOSTICS.md`
+- Modify: `docs/index.md`
+- Modify: `docs/plans/2026-07-10-relay-companion-mvp-implementation.md`
 - Modify: `README.md`
 
-**Interfaces:** `verify-relay-companion-mvp.sh p0` 只编排当前已存在门禁；reset 脚本只接受 `--storage ABSOLUTE_FILE --credentials ABSOLUTE_FILE --confirm DELETE-RELAY-V1-DEV-STATE`，拒绝目录、根路径、symlink 与非 v1 schema/credential shape。
+**Interfaces:** `verify-relay-companion-mvp.sh p0` 只编排当前已存在门禁；reset 脚本只接受 `--storage ABSOLUTE_FILE --credentials ABSOLUTE_FILE --confirm DELETE-RELAY-V1-DEV-STATE`，拒绝目录、根路径、symlink 与非 v1 schema/credential shape。开始第一次 unlink 前必须完成全部验证，并证明 credential JSON 的 `account_id/device_id/role` 与 DB 行一致、`Base64(SHA256(credential原字符串))` 等于该行 `credential_hash`；任一失败都零删除。
 
-- [ ] Step 1: 先写 destructive-boundary shell test。 测试在 tempdir 创建 v1 DB/WAL/SHM、旧 bearer JSON、无关文件和 symlink；断言缺确认串、目录、symlink、v2 marker 均退出非零，只有精确 v1 输入会删除 DB 三件套与 bearer JSON且保留无关文件。
+- [ ] Step 1: 先写 destructive-boundary shell test。测试在 tempdir 创建 v1 DB/WAL/SHM、旧 bearer JSON、无关文件和 symlink；断言缺确认串、目录、任一路径组件/sidecar symlink、v2 marker、未知/额外表、错误user_version、DB与JSON account/device/role/credential hash不匹配均退出非零且零删除。只有精确匹配的v1输入会删除DB、精确`-wal`/`-shm`与bearer JSON，并保留同前缀及其他无关文件。
 - [ ] Step 2: 运行 `bash scripts/tests/reset-relay-v1-dev-state.sh`。 Expected: FAIL，原因是 `scripts/reset-relay-v1-dev-state.sh` 尚不存在。
-- [ ] Step 3: 实现 reset 与 P0 verifier。 reset 使用 `set -euo pipefail`、`realpath`/`stat` 校验和 `sqlite3` 只读 schema 判断；verifier 顺序运行设计 §16.5 的 P0 命令，并确保 `agentdeck-relay-data/` 未出现在 git 状态。
+- [ ] Step 3: 实现 reset 与 P0 verifier。reset 使用 `set -euo pipefail`、`realpath`/`stat` 校验、`sqlite3` 只读精确schema/user_version判断和DB↔credential关联校验；先收集并验证全部四个允许删除的精确path，再开始unlink，禁止宽泛glob。verifier顺序运行设计§16.5的P0命令，并确保`agentdeck-relay-data/`未出现在git状态。
 - [ ] Step 4: 运行 `bash scripts/tests/reset-relay-v1-dev-state.sh` 与 `bash scripts/verify-relay-companion-mvp.sh p0`。 Expected: 两者 exit 0；每个子门禁打印 `PASS`；最终 `git status --short` 不含构建/DB 产物。
-- [ ] Step 5: 更新三份入口文档，只记录已经存在的 reset 与 verifier 命令；运行 `scripts/verify-agent-docs.sh`。 Expected: `agent docs verification passed`。
-- [ ] Step 6: 提交。 `git add .gitignore scripts README.md docs/QUALITY.md docs/AGENT_DIAGNOSTICS.md && git commit -m "chore(relay): 建立 Companion MVP 基线与显式 v1 reset"`
+- [ ] Step 5: 更新README、ARCHITECTURE、QUALITY、DIAGNOSTICS、docs index、AGENTS与本计划进度，只记录已经存在的reset/verifier命令和“先停Relay、显式路径、无dev恢复”边界；运行`scripts/verify-agent-docs.sh`。Expected: `verify-agent-docs: ok`。
+- [ ] Step 6: 核对精确pathspec并提交。 `git add .gitignore scripts/verify-relay-companion-mvp.sh scripts/reset-relay-v1-dev-state.sh scripts/tests/reset-relay-v1-dev-state.sh README.md ARCHITECTURE.md AGENTS.md docs/QUALITY.md docs/AGENT_DIAGNOSTICS.md docs/index.md docs/plans/2026-07-10-relay-companion-mvp-implementation.md && git commit -m "chore(relay): 建立 Companion MVP 基线与显式 v1 reset"`
 
 ---
 
