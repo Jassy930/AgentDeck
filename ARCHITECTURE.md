@@ -118,6 +118,17 @@ agentdeckd
 - **R1b-3**：重放补拉（`since_seq`）语义为 **relay 进程存活期内** 的有界补拉，不是跨重启完整历史重放；窗口外返回 `relay.replay.gap`。
 - **R1b-4**：`RelayLink::recv` 仍不返回 `Result`（R2 defer，见 R1b 设计 §4.1）。
 
+### Relay Companion MVP P0 迁移边界
+
+- P0 冻结上述 Relay v1 schema 与行为基线，不扩展 v1 产品能力，也不改变现有
+  Rust/Swift 生产路径。
+- `scripts/reset-relay-v1-dev-state.sh` 只是 v1 开发状态的显式 trust reset：调用方
+  必须先停止 Relay，并提供 canonical absolute DB 与 credential 路径及固定确认串。
+- reset 的删除集合固定为 DB、同路径精确 `-wal` / `-shm` 与指定 bearer JSON。
+  path/schema/credential/DB 行关联全部校验完成前不开始 unlink；任一失败零删除。
+- reset 不提供开发状态恢复或迁移；成功后只能重新配对。P0 统一门禁入口是
+  `bash scripts/verify-relay-companion-mvp.sh p0`。
+
 ### R1a 隐含约束（供 R2 参考）
 
 - **R1a machine_id ≡ device_id**：`server/ws.rs::connect` 用 `device.device_id` 作 `ConnRole::Machine.machine_id`，`router.rs` RegisterMachine 授权强制 `machine.machine_id == connection.machine_id`——**enrolled 的 machine 设备的 `machine_id` 严格等于 `device_id`**。CLI 生成的随机 `device_id = "cli-<profile>-<random>"` 会锁定 R2 daemon remote-mode 里对应 machine 的 identifier；R2 设计需评估是否解耦 machine_id 与 device_id（例如 machine 元数据里显式携带独立 machine_id）。

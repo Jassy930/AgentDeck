@@ -142,6 +142,26 @@ AGENTDECK_RELAY_REQ_ORIGIN_TTL_MS=300000
 UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot
 ```
 
+### Relay Companion MVP P0
+
+```bash
+# P0 统一门禁（按批准设计 §16.5 编排现有门禁）
+bash scripts/verify-relay-companion-mvp.sh p0
+
+# v1 reset 的聚焦 destructive-boundary 测试
+bash scripts/tests/reset-relay-v1-dev-state.sh
+
+# 显式清理不兼容的 v1 开发状态；执行前必须先停止 Relay
+bash scripts/reset-relay-v1-dev-state.sh \
+  --storage /absolute/path/to/relay.db \
+  --credentials /absolute/path/to/relay/dev.credentials.json \
+  --confirm DELETE-RELAY-V1-DEV-STATE
+```
+
+reset 只接受 canonical absolute 普通文件路径，拒绝 symlink、非 v1 schema、非 v1
+credential shape 或 DB 关联不匹配；任一失败必须零删除。成功后没有开发状态恢复
+路径，必须重新配对。不得用 glob 或手工扩大删除集合。
+
 ## 浏览与外部资料
 
 需要网页资料时优先使用当前环境可用的官方浏览工具和一手来源。不要引入项目级外部浏览 skill 依赖，也不要要求安装额外工具才能在本仓库工作。

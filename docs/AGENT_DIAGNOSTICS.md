@@ -36,6 +36,25 @@ swift run AgentDeck -- --diagnostics-report --json --profile dev
 SwiftPM/debug 构建未显式传 `--profile` 时也会默认使用 dev profile。
 `AGENTDECK_DATA_DIR` 仍优先于 profile，主要用于一次性测试覆盖目录。
 
+## Relay v1 开发状态 reset
+
+Relay v1 状态与后续 Companion MVP 版本不兼容时，没有开发恢复或自动迁移路径。
+先停止 Relay，确认 DB 与 bearer credential 的 canonical absolute 路径，再执行：
+
+```bash
+bash scripts/reset-relay-v1-dev-state.sh \
+  --storage /absolute/path/to/relay.db \
+  --credentials /absolute/path/to/relay/dev.credentials.json \
+  --confirm DELETE-RELAY-V1-DEV-STATE
+```
+
+脚本拒绝相对路径、目录、symlink、非 v1 schema/credential shape，以及
+`account_id` / `device_id` / `role` / credential hash 与 DB 行不一致的输入。
+任一拒绝都发生在首次 unlink 前，因此应保留全部四个目标。若报告文件在校验期间
+变化，说明 Relay 可能仍在运行：停止它后重新检查路径，不要手工 `rm` 绕过。
+成功只删除 DB、精确 `-wal` / `-shm` 与指定 credential；同前缀和其他文件保留，
+之后必须重新配对。
+
 ## Failure Codes
 
 | code | 含义 | 下一步 |

@@ -11,8 +11,9 @@
 
 ## 运行与诊断
 
-- `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、failure code 和排查流程。
-- `QUALITY.md`：按变更范围选择验证命令，以及文档结构检查入口。
+- `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、failure code、Relay v1 显式
+  reset 和排查流程。
+- `QUALITY.md`：按变更范围选择验证命令，以及 Companion MVP P0 与文档结构检查入口。
 
 ## 计划与历史
 
@@ -44,7 +45,7 @@
 ### Relay Companion MVP（2026-07-10）
 
 - `plans/2026-07-10-relay-companion-mvp-design.md`：已批准的目标架构；固定 singleton daemon、多读者/多写者串行裁决、按机器独立配对、Relay 严格最小可见与真实 iOS Companion 边界。
-- `plans/2026-07-10-relay-companion-mvp-implementation.md`：P0–P6、48 个逐文件 TDD task；覆盖 Relay v2、RuntimeCore、UDS/LaunchAgent、E2EE/Keychain、iOS/远程 macOS 与真实跨网 DoD。
+- `plans/2026-07-10-relay-companion-mvp-implementation.md`：P0–P6、48 个逐文件 TDD task；P0.1 已建立 v1 显式 reset 与统一 verifier，后续覆盖 Relay v2、RuntimeCore、UDS/LaunchAgent、E2EE/Keychain、iOS/远程 macOS 与真实跨网 DoD。
 
 ## 协议资料
 

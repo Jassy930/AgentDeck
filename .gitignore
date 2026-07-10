@@ -25,6 +25,10 @@ target/
 # NOT in the repo. This entry is a guard in case of accidental local writes.
 .agentdeck/
 
+# Relay local development state / bearer credentials (never committed)
+agentdeck-relay-data/
+**/relay/*.credentials.json
+
 # Local git worktrees
 .worktrees/
 

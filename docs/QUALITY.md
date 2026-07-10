@@ -13,7 +13,26 @@ swift run AgentDeck -- --diagnostics-report --json
 swift run AgentDeck -- --selfcheck --profile dev
 swift run AgentDeck -- --diagnostics-report --json --profile dev
 scripts/verify-agent-docs.sh
+bash scripts/verify-relay-companion-mvp.sh p0
 ```
+
+## Relay Companion MVP P0 门禁
+
+P0 的统一入口只编排批准设计 §16.5 已存在的门禁，不把合成测试冒充真实 vendor
+或物理设备验收：
+
+```bash
+# 完整 P0 基线：每个子门禁成功后打印 PASS
+bash scripts/verify-relay-companion-mvp.sh p0
+
+# 迭代 reset 脚本时只跑这个聚焦 suite
+bash scripts/tests/reset-relay-v1-dev-state.sh
+```
+
+统一入口依次覆盖完整 Cargo、Relay server+TLS、R1b hardening、自检、Swift、
+iOS Simulator、daemon no-net、文档与 local IPC schema snapshot，并检查
+`agentdeck-relay-data/` 不出现在 `git status --short`。真实 vendor、公网 WSS 和
+物理 iPhone 仍是后续 gated E2E，不属于 P0 通过声明。
 
 ## AppKit 重写后的验证清单
 
@@ -115,7 +134,8 @@ cargo install cargo-llvm-cov
 - 是否新增了视图层 / 进程入口 / AppKit 桥接代码（按策略接受）→ 在显式不测清单里追加该文件。
 - 是否新增了核心路径代码（IPC、adapter、模型层）→ 补测试或拒绝该改动。
 
-不接 CI 门禁脚本。仓库目前无 CI；门禁脚本闲置反而是债。`docs/QUALITY.md` 描述性记录基线足够给未来 agent 提供判断依据。
+仓库目前无 CI。`scripts/verify-relay-companion-mvp.sh p0` 是 Companion MVP 实施期
+的本地统一门禁，不代表已经接入 CI；覆盖率仍按本页记录的命令人工复核。
 
 ## 按变更范围选择验证
 
@@ -129,6 +149,7 @@ cargo install cargo-llvm-cov
 | 协议 schema 或 app-server 方法 | `cargo test`；核对 `protocol/SPIKE_FINDINGS.md` 和 `protocol/CODEX_VERSION.txt` |
 | agentdeck-protocol 类型变更 | `cargo test`（漂移测试自动运行）；若漂移测试失败须先重新生成快照（见下） |
 | 参考客户端 CLI（agentdeck-cli）、Transport、Client | `cargo test -p agentdeck-cli`；再跑完整 `cargo test` |
+| Relay Companion MVP P0 基线或 v1 reset | 迭代时跑 `bash scripts/tests/reset-relay-v1-dev-state.sh`；提交前跑一次 `bash scripts/verify-relay-companion-mvp.sh p0` |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

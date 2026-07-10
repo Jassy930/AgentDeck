@@ -68,12 +68,12 @@
 
 **Interfaces:** `verify-relay-companion-mvp.sh p0` 只编排当前已存在门禁；reset 脚本只接受 `--storage ABSOLUTE_FILE --credentials ABSOLUTE_FILE --confirm DELETE-RELAY-V1-DEV-STATE`，拒绝目录、根路径、symlink 与非 v1 schema/credential shape。开始第一次 unlink 前必须完成全部验证，并证明 credential JSON 的 `account_id/device_id/role` 与 DB 行一致、`Base64(SHA256(credential原字符串))` 等于该行 `credential_hash`；任一失败都零删除。
 
-- [ ] Step 1: 先写 destructive-boundary shell test。测试在 tempdir 创建 v1 DB/WAL/SHM、旧 bearer JSON、无关文件和 symlink；断言缺确认串、目录、任一路径组件/sidecar symlink、v2 marker、未知/额外表、错误user_version、DB与JSON account/device/role/credential hash不匹配均退出非零且零删除。只有精确匹配的v1输入会删除DB、精确`-wal`/`-shm`与bearer JSON，并保留同前缀及其他无关文件。
-- [ ] Step 2: 运行 `bash scripts/tests/reset-relay-v1-dev-state.sh`。 Expected: FAIL，原因是 `scripts/reset-relay-v1-dev-state.sh` 尚不存在。
-- [ ] Step 3: 实现 reset 与 P0 verifier。reset 使用 `set -euo pipefail`、`realpath`/`stat` 校验、`sqlite3` 只读精确schema/user_version判断和DB↔credential关联校验；先收集并验证全部四个允许删除的精确path，再开始unlink，禁止宽泛glob。verifier顺序运行设计§16.5的P0命令，并确保`agentdeck-relay-data/`未出现在git状态。
-- [ ] Step 4: 运行 `bash scripts/tests/reset-relay-v1-dev-state.sh` 与 `bash scripts/verify-relay-companion-mvp.sh p0`。 Expected: 两者 exit 0；每个子门禁打印 `PASS`；最终 `git status --short` 不含构建/DB 产物。
-- [ ] Step 5: 更新README、ARCHITECTURE、QUALITY、DIAGNOSTICS、docs index、AGENTS与本计划进度，只记录已经存在的reset/verifier命令和“先停Relay、显式路径、无dev恢复”边界；运行`scripts/verify-agent-docs.sh`。Expected: `verify-agent-docs: ok`。
-- [ ] Step 6: 核对精确pathspec并提交。 `git add .gitignore scripts/verify-relay-companion-mvp.sh scripts/reset-relay-v1-dev-state.sh scripts/tests/reset-relay-v1-dev-state.sh README.md ARCHITECTURE.md AGENTS.md docs/QUALITY.md docs/AGENT_DIAGNOSTICS.md docs/index.md docs/plans/2026-07-10-relay-companion-mvp-implementation.md && git commit -m "chore(relay): 建立 Companion MVP 基线与显式 v1 reset"`
+- [x] Step 1: 先写 destructive-boundary shell test。测试在 tempdir 创建 v1 DB/WAL/SHM、旧 bearer JSON、无关文件和 symlink；断言缺确认串、目录、任一路径组件/sidecar symlink、v2 marker、未知/额外表、错误user_version、DB与JSON account/device/role/credential hash不匹配均退出非零且零删除。只有精确匹配的v1输入会删除DB、精确`-wal`/`-shm`与bearer JSON，并保留同前缀及其他无关文件。
+- [x] Step 2: 运行 `bash scripts/tests/reset-relay-v1-dev-state.sh`。 Expected: FAIL，原因是 `scripts/reset-relay-v1-dev-state.sh` 尚不存在。
+- [x] Step 3: 实现 reset 与 P0 verifier。reset 使用 `set -euo pipefail`、`realpath`/`stat` 校验、`sqlite3` 只读精确schema/user_version判断和DB↔credential关联校验；先收集并验证全部四个允许删除的精确path，再开始unlink，禁止宽泛glob。verifier顺序运行设计§16.5的P0命令，并确保`agentdeck-relay-data/`未出现在git状态。
+- [x] Step 4: 运行 `bash scripts/tests/reset-relay-v1-dev-state.sh` 与 `bash scripts/verify-relay-companion-mvp.sh p0`。 Expected: 两者 exit 0；每个子门禁打印 `PASS`；最终 `git status --short` 不含构建/DB 产物。
+- [x] Step 5: 更新README、ARCHITECTURE、QUALITY、DIAGNOSTICS、docs index、AGENTS与本计划进度，只记录已经存在的reset/verifier命令和“先停Relay、显式路径、无dev恢复”边界；运行`scripts/verify-agent-docs.sh`。Expected: `verify-agent-docs: ok`。
+- [x] Step 6: 核对精确pathspec并提交。 `git add .gitignore scripts/verify-relay-companion-mvp.sh scripts/reset-relay-v1-dev-state.sh scripts/tests/reset-relay-v1-dev-state.sh README.md ARCHITECTURE.md AGENTS.md docs/QUALITY.md docs/AGENT_DIAGNOSTICS.md docs/index.md docs/plans/2026-07-10-relay-companion-mvp-implementation.md && git commit -m "chore(relay): 建立 Companion MVP 基线与显式 v1 reset"`
 
 ---
 

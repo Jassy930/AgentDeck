@@ -205,6 +205,31 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
+## Relay Companion MVP 实施基线（P0）
+
+当前 P0 只冻结既有 Relay v1 行为并建立实施门禁，不改变 Rust/Swift 产品路径。
+统一基线验证入口按批准设计 §16.5 顺序运行现有 Rust、Swift、iOS、网络边界、
+文档和 schema 门禁：
+
+```bash
+bash scripts/verify-relay-companion-mvp.sh p0
+```
+
+Relay v1 开发状态与后续版本不兼容时，只能做显式 reset。先停止 Relay，再传入
+canonical absolute DB 与 bearer credential 文件路径：
+
+```bash
+bash scripts/reset-relay-v1-dev-state.sh \
+  --storage /absolute/path/to/relay.db \
+  --credentials /absolute/path/to/relay/dev.credentials.json \
+  --confirm DELETE-RELAY-V1-DEV-STATE
+```
+
+脚本在第一次 unlink 前一次性验证四个精确删除路径、Relay v1 schema、credential
+shape 及 DB 行关联；任何校验失败都零删除。成功时只删除 DB、精确 `-wal`、
+`-shm` 和指定 credential，不使用 glob。此开发 reset 没有恢复路径，后续使用前
+必须重新配对。脚本需要 `awk`、`sqlite3`、`jq`、`openssl`、`realpath` 和 `stat`。
+
 ## agentdeck CLI（参考客户端 / E2E 驱动）
 
 `agentdeck` 是一个 Rust 二进制参考客户端，**不在 Swift GUI 的实时通路上**。Swift app 仍直接通过 stdio JSONL 与 daemon 通信；`agentdeck` 用于脚本化调用、本地验证以及门控 E2E 测试驱动。
