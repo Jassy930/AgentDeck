@@ -41,6 +41,11 @@
 - `plans/2026-07-09-relay-r1b-storage-hardening-design.md`
 - `plans/2026-07-09-relay-r1b-storage-hardening-implementation.md`
 
+### Relay Companion MVP（2026-07-10）
+
+- `plans/2026-07-10-relay-companion-mvp-design.md`：已批准的目标架构；固定 singleton daemon、多读者/多写者串行裁决、按机器独立配对、Relay 严格最小可见与真实 iOS Companion 边界。
+- `plans/2026-07-10-relay-companion-mvp-implementation.md`：P0–P6、48 个逐文件 TDD task；覆盖 Relay v2、RuntimeCore、UDS/LaunchAgent、E2EE/Keychain、iOS/远程 macOS 与真实跨网 DoD。
+
 ## 协议资料
 
 - `../protocol/SPIKE_FINDINGS.md`：Codex app-server wire framing、方法和 schema 事实源。

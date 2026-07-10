@@ -2,11 +2,11 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Design - 六节设计已逐节确认（2026-07-10）；等待书面 spec 复核，尚未进入实施计划与代码实现 |
+| 状态 | Approved - 六节设计与书面 spec 已确认（2026-07-10）；实施计划已建立，尚未进入代码实现 |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-01-agentdeck-mobile-relay-design.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
-| 后续 | 书面复核通过后，单独编写 `2026-07-10-relay-companion-mvp-implementation.md`；本文不承载逐文件 TDD 步骤 |
+| 后续 | 按 `2026-07-10-relay-companion-mvp-implementation.md` 逐 task 执行；本文继续作为目标架构事实源，不承载逐文件 TDD 步骤 |
 
 ## 0. 摘要与文档权威性
 
@@ -230,24 +230,27 @@ Relay 机器登记只允许一个新随机 route 上线，不赋予任何设备�
 - MachineRoot public key/fingerprint 与当前 root-signed MachineDataSign cert，供设备在收到 PairResponse 前建立机器真实性锚点。
 - 仅供人识别的机器显示名；它存在于带外邀请中，不进入 Relay 明文。
 
-邀请使用 QR、`agentdeck-pair:v1:<base64url>` 或完整文本传给 iPhone/远程客户端；SSH 复制是合法的带外方式。完整 invite 的持有就是这次配对的 bearer authorization，不能在公开聊天或日志中传播。daemon 以 StorageKEK 加密邀请私钥、secret 和消费状态并放入有界临时表；5 分钟过期后安全删除。
+daemon 必须先向 Relay 发送带 absolute invite expiry 的 `OpenPairRoute` 并收到 ACK，才把邀请返回给本地 App/CLI；打开失败时不得交付一个不可用邀请。同一 machine、`pairRouteId` 与 absolute expiry 的 Open 是幂等重试，不同 owner 或 expiry 必须冲突拒绝。未过期邀请及其 route 状态用 StorageKEK 加密持久化，daemon 或 Relay 重启后复用同一 `pairRouteId` 重新打开，而不是生成第二份邀请。邀请 delivered、expired 或本地取消后，daemon 把 `ClosePairRoute` 放入 durable terminal outbox；只有收到 `Closed/AlreadyAbsent` ACK 才清除本地临时材料。Close 对同一 owner/route 幂等，active route 的不同 owner 一律拒绝。
+
+邀请使用 QR、`agentdeck-pair:v1:<base64url>` 或完整文本传给 iPhone/远程客户端；SSH 复制是合法的带外方式。完整 invite 的持有只是发起本次配对的 bearer authorization，不能在公开聊天或日志中传播；它不绕过被控机器上的设备指纹确认。daemon 以 StorageKEK 加密邀请私钥、secret、PairRequest 与消费状态并放入有界临时表；5 分钟过期后安全删除。
 
 ### 6.3 PairRequest 与 DeviceGrant
 
 1. 设备为这台机器生成独立的 `DeviceSign` 和 `DeviceHPKE` keypair。
 2. 设备使用 HPKE Base mode 向邀请临时公钥封装 PairRequest，内部包含 invite secret、设备公钥和设备加密授权请求；同时用 DeviceSign 对完整 invite transcript、HPKE `enc` 与 ciphertext hash 做 possession proof。
 3. Relay 只按 `pairRouteId` 转发密文，不能读取 secret 或设备信息。
-4. daemon 解密、验证 invite 与 DeviceSign proof，并以 compare-and-swap 将 invite 从 `unused` 改为 `preparing(requestHash, frozenArtifacts)`；DeviceGrant、device route/serial 和待加密响应内容从此冻结。
-5. MachineRoot 签发 DeviceGrant：最小 `RelayGrant` + encrypted `DeviceAuthorization`。
-6. daemon 通过 machine-authenticated `InstallGrant(rootSignedGrant)` 注册公开 RelayGrant；Relay 验 root signature 与 serial/hash 单调性，事务提交后返回 `GrantCommitted(serial, grantHash)`。
-7. daemon 收到 commit 后才把状态推进到 `grantCommitted(requestHash, encryptedResponse)`，再向设备返回由 MachineDataSign 签名、以 DeviceHPKE 加密的 DeviceGrant 与 machine key directory。崩溃在 commit 前则对同 request 继续同一份 InstallGrant；崩溃在 commit 后则重发同一 encryptedResponse。
-8. 设备把 pending keys、DeviceGrant 和 PairedMachineRecord 原子提升为 paired 状态，随后通过 challenge-response 正式连接。
+4. daemon 解密、验证 invite 与 DeviceSign proof，并以 compare-and-swap 将 invite 从 `unused` 改为 `preparing(requestHash, frozenRequest)`；随后持久化 `awaitingLocalConfirmation(requestHash, deviceFingerprint, frozenRequest)`，只向 same-UID UDS 的 `LocalPrincipal` 发出待确认事件。远端此时只能取得与 requestHash 绑定的 encrypted/signed `PairPending`，不能得到 grant。
+5. 被控机器本地 App/CLI 显示设备指纹并明确确认或取消。只有 `LocalPrincipal` 可以调用 confirm/cancel；任何 `RemotePrincipal`、PairingAccess 或 Relay 管理员都无权批准。多个本地 App/CLI 的 confirm、cancel 与 expiry 在 `awaitingLocalConfirmation` 上执行 first-valid compare-and-swap：赢家得到持久化 canonical `PairingReceipt`，同动作重试幂等重放，冲突方收到 `AlreadyHandled(winner, state)`。confirm 赢后状态进入 `grantPreparing(frozenGrantArtifacts)`，从此 DeviceGrant、device route/serial 和待加密响应内容冻结，cancel/expiry 不得逆转；cancel 或 expiry 赢则绝不签发 grant，并关闭 PairRoute。
+6. MachineRoot 签发 DeviceGrant：最小 `RelayGrant` + encrypted `DeviceAuthorization`。
+7. daemon 通过 machine-authenticated `InstallGrant(rootSignedGrant)` 注册公开 RelayGrant；Relay 验 root signature 与 serial/hash 单调性，事务提交后返回 `GrantCommitted(serial, grantHash)`。
+8. daemon 收到 commit 后才把状态推进到 `grantCommitted(requestHash, encryptedResponse)`，再向设备返回由 MachineDataSign 签名、以 DeviceHPKE 加密的 DeviceGrant 与 machine key directory。崩溃在 commit 前则对同 request 继续同一份 InstallGrant；崩溃在 commit 后则重发同一 encryptedResponse。
+9. 设备把 pending keys、DeviceGrant 和 PairedMachineRecord 原子提升为 paired 状态，然后在 PairRoute 上发送 DeviceSign-signed `PairResponseReceived(requestHash, grantHash, responseHash)`；daemon 验签并匹配 frozen response 后才进入 delivered，再关闭 PairRoute，随后设备通过 challenge-response 正式连接。回执丢失时 daemon 保持 grantCommitted 并对同 request 逐字节重发响应；不能把 Relay writer enqueue/flush 的 `RouteAccepted` 当作 delivered。TTL 到期仍无有效回执时必须撤销 orphan grant。
 
 `RelayGrant` 只包含 Relay 鉴权所需字段：随机 machine/device route、设备连接验签公钥、grant serial 和 MachineRoot 签名。`DeviceAuthorization` 绑定同一 grant serial、设备 HPKE 公钥、能力和业务权限，并由 MachineRoot 签名后加密；Relay 只能看到前者。两者合称 DeviceGrant。
 
 DeviceGrant 默认不自动过期，直到被撤销、用更高 serial 更新或 machine trust reset；这样普通长时间离线不会制造不必要的重配。grant renewal 会产生新 serial，也会产生新的 `RemotePrincipal`，旧 serial 进入 tombstone，不能重新上线覆盖新 principal。
 
-PairInvite 一旦进入 preparing 就不恢复为 unused。完整状态机是 `unused → preparing(requestHash, frozenArtifacts) → grantCommitted(encryptedResponse) → delivered | expired`。完全相同的 `requestHash` 在 TTL 内可以续做 InstallGrant 或幂等取回同一份 `encryptedResponse`；相同 invite 上任何不同 request 都拒绝。这样中间崩溃/响应丢失不会签出第二份 grant。TTL 结束仍未完成时，本次邀请失效并要求重新生成；已经 committed 的 grant 同时进入本机/Relay revoke 清理队列，不能遗留孤儿授权。
+PairInvite 一旦进入 preparing 就不恢复为 unused。完整状态机是 `routeOpening → unused → preparing(requestHash, frozenRequest) → awaitingLocalConfirmation → grantPreparing(frozenGrantArtifacts) → grantCommitted(encryptedResponse) → delivered | expired | canceled`。完全相同的 `requestHash` 在 TTL 内可以查询同一 pending 状态、续做同一份 InstallGrant 或幂等取回同一份 `encryptedResponse`；相同 invite 上任何不同 request 都拒绝。daemon 重启后恢复同一状态并重新打开同一未过期 PairRoute，不重复弹出不同请求，也不签出第二份 grant。只有有效 `PairResponseReceived` 才能把 grantCommitted 推进为 delivered。TTL 结束仍未完成时，本次邀请失效并要求重新生成；已经 committed 的 grant 同时进入本机/Relay revoke 清理队列，不能遗留孤儿授权。delivered、expired、canceled 都先持久化 terminal close outbox，等 Relay Close ACK 后再清除邀请密钥/状态。
 
 ### 6.4 连接鉴权
 
@@ -344,6 +347,8 @@ Relay 可见 `OpaqueRouteFrame` 仅保留：
 - 一段 canonical `sealedBlob` bytes。
 
 `receivedAt` 与 `size` 由 Relay 从实际接收结果计算，不由 sender 声明，也不是加密安全前提。`sealedBlob` 对 Relay 是不可解析字段；endpoint 的 E2EE codec 才解析其中的 E2EE format、key ID/epoch、counter/nonce、key-directory revision、ciphertext 与 endpoint signature。Relay SQLite 必须原样保存完整 canonical blob，不能只留 ciphertext 或把 crypto header 拆成可解释列。
+
+Relay v2 的生产 WebSocket outer frame 使用固定、长度前缀的二进制 codec（magic/version/kind/typed fields），`sealedBlob` 直接作为 bytes 携带；不使用 JSON base64 承载生产数据帧。这样 3.5 MiB transfer part 加上 AEAD/outer overhead 后仍可落在 4 MiB WebSocket message 硬上限内。Runtime UDS 与本机 admin socket 仍可使用各自有界 JSONL framing；binary codec 不参与签名 canonicalization，TBS/AAD 继续使用本节定义的独立确定性编码。
 
 业务 payload 全部在 `SealedPayload` 中，包括机器名、session title/cwd、agent kind、prompt、输出、tool call、审批和 daemon 业务 failure。真实 vendor resume reference **永不进入任何客户端 wire**，即使加密也不允许。
 
@@ -546,11 +551,15 @@ Relay 单 frame 硬上限为 4 MiB，因此 E2EE payload 使用统一：
 `RELAY_PROTOCOL_VERSION` 从 1 升到 2；v1 直接拒绝。v2 只保留通用 frame：
 
 - Handshake：`Hello`、`Challenge`、`Authenticate`、`Authenticated`。
-- Pairing：`OpenPairRoute`、`PairData`、`ClosePairRoute`。
+- Pairing：`OpenPairRoute`、`PairRouteOpened`、`PairData`、`ClosePairRoute`、`PairRouteClosed`；opened 回显 owner/route/absolute expiry，closed outcome 只允许 `Closed | AlreadyAbsent`。
 - Stream：`RegisterStream`、`Publish`、`Subscribe`、`Unsubscribe`、`Ack`、`Gap`、`ReplayComplete`。
 - Request：`Send`、`Reply`。
 - Auth control：`InstallGrant`、`GrantCommitted`、`RevokeDevice`、`RevocationCommitted`、`RetireMachine`。
 - Runtime：`Ping`、`Pong`、`RouteAccepted`、`Error`、`ServerRestarting`。
+
+首次 machine enrollment 不属于已鉴权 Relay frame family：Relay 额外提供一个只接收 `MachineEnrollmentRequestV1` 的专用 TLS endpoint，消费本机 admin 生成的 5 分钟单次 code，并在同一事务插入 machine route；它不提供 inventory、purge 或其他管理员能力。daemon 必须在发送 code 与 root/link/data public material 前完成公开 CA 或 enrollment bundle SPKI pin 验证。尚未取得 DeviceGrant 的设备则只能建立绑定已打开 `pairRouteId` 的受限 pairing connection；该 connection 只能发送 `PairData/ClosePairRoute`，不能订阅、发布或发送 Runtime request，DeviceSign possession proof 仍由 daemon 在密文内验证。
+
+PairRoute 是 Relay 内存态但其操作必须幂等：`OpenPairRoute(machine, pairRoute, absoluteExpiry)` 在字段逐字相同且 route owner 相同时返回同一 ACK；active route 上 owner/expiry 任一不同都返回 conflict。`ClosePairRoute` 对 owner 相同或已不存在的 route 返回 `Closed/AlreadyAbsent`，对仍 active 且 owner 不同的 route 拒绝。daemon 以 durable open/terminal-close outbox 跨重启重试；Open ACK 前不交付 invite，Close ACK 前不擦除本地邀请状态。Relay writer 的 `RouteAccepted` 只表示有界入队，不构成 PairResponse delivery proof。
 
 `Send/Reply` 外壳显式带随机 deviceRoute/requestRoute；machine 只能回复同 trust domain 的 active device。这样不需要易泄漏/易过期的 `req_origin` 内存表。
 
@@ -597,7 +606,7 @@ Relay 只持久化：
 - `streams(stream_route, machine_route, generation, high_water_seq, oldest_seq, retained_bytes)`；新 generation 的 high-water 固定从 -1 开始。
 - `frames(stream_route, generation, stream_seq, frame_hash, sealed_blob, size, received_at)`；`sealed_blob` 是 wire 上的 canonical opaque bytes，Relay 不拆 keyId/nonce/signature 列。
 - `subscriptions(machine_route, device_route, grant_serial, stream_route, stream_generation, start_cursor_seq_nullable, ack_nullable, updated_at)`；NULL start/ack 表示 BeforeFirst/尚未 ACK，grant renewal 是新 principal，不继承旧 serial 的 ACK lease。
-- `enrollment_codes(code_hash, expires_at, consumed_at)`。
+- `enrollment_codes(code_hash, expires_at, consumed_at, request_hash, response_blob, receipt_hash)`；首次成功消费在 machine row 同一事务冻结 canonical request hash/response/receipt。TTL 内同 code + 同 request hash 幂等重放逐字节相同 response；同 code + 不同 hash 拒绝，解决 COMMIT 后响应丢失而不创建第二个 route。
 
 Challenge、PairRoute、connection registry、writer queues、heartbeat timers 只在有界内存中。
 
@@ -763,7 +772,7 @@ broadcast 不能使用默认无界缓冲：catalog/machine/session resource stat
 ### 13.6 远程 macOS 与 CLI
 
 - 远程 macOS App 通过 `SessionSourceRegistry` 复用 `AgentDeckRelayClient` 的 `RelaySessionSource`/Keychain，实现和 iOS 相同的 machine pairing、catalog、conversation、prompt、approval 与 resume；被控机器本地 machine entry 固定路由到 LocalDaemonSessionSource/UDS，不把本机流量绕 Relay。
-- persistent 远程 CLI pairing 在 MVP 只支持 macOS，并把 DeviceSign/DeviceHPKE、grant、counter/replay state 写入 Keychain；禁止退回明文 JSON/0600 文件保存长期私钥。
+- persistent 远程 CLI pairing 在 MVP 只支持发行签名的 macOS CLI。DeviceSign/DeviceHPKE、grant、设备 StorageKEK 与 CounterGuard 写入 CLI 独立、不可同步的 Data Protection Keychain；wrapped key directory、stream cursor 与 receive replay state 写入由 StorageKEK 密封的 `CryptoStateStore`。禁止退回明文 JSON/0600 文件保存长期私钥；unsigned/ad-hoc CLI 的 persistent mode 返回 typed unsupported。
 - Linux Relay server/admin CLI 不持有任何 device private key。Linux 端到端自动测试使用进程内 ephemeral keys；headless Linux persistent device pairing 留到后续独立 keystore 设计。
 
 ## 14. 错误处理
@@ -823,7 +832,7 @@ Relay 外层错误只描述通用路由/传输失败；daemon 业务错误必须
 - 各 adapter 私有 `adapterStateKey → vendor resume ref` 映射；同步更新 N8，明确 CC 索引为 derived/non-authoritative 且不创建 `cc-meta/`。
 - macOS App/CLI 切到同一 daemon；保留能力降级的 local IPC v2/stdin compatibility adapter 给旧测试。
 
-退出门禁：两个本地 Runtime v1 客户端共享一个真实会话且 prompt/approval 竞态符合本文；同时在干净用户环境验证 install + `launchctl print`、active-turn stage/idle switch、protocol mismatch、uninstall 保留数据、显式 purge，以及 `--ephemeral --no-remote` 无法读取 stable DB/Keychain/socket。
+退出门禁：两个本地 Runtime v1 客户端共享一个真实会话且 prompt/approval 竞态符合本文；同时在干净用户环境验证 install + `launchctl print`、active-turn stage/idle switch、protocol mismatch、uninstall 保留数据，以及 `--ephemeral --no-remote` 无法读取 stable DB/Keychain/socket。P3 的 `uninstall --purge` 只验证 typed `daemon.purge.remote_not_ready` 且零删除；完整 trust-reset/purge 门禁留到 P4 RemoteTransport 存在后执行。
 
 ### P4 Machine RemoteLink
 
@@ -831,7 +840,7 @@ Relay 外层错误只描述通用路由/传输失败；daemon 业务错误必须
 - daemon WSS/E2EE、MachineDataSign、Catalog/events/commands/replay、key/counter crash recovery。
 - macOS persistent 远程 CLI 使用 Keychain 中的真实 grant/private keys 和 daemon receipts；Linux synthetic client 只用 ephemeral keys。
 
-退出门禁：远程 CLI 真配对并分别穿透真实 Codex/Claude Code；CLI 重启后能从 Keychain 读回 DeviceSign/DeviceHPKE/grant/counter state；旧 credential JSON 不含 private key/grant/bearer；Linux persistent pairing 返回 typed unsupported，不能降级明文文件。
+退出门禁：本地 App/CLI 必须确认待配对设备指纹，远端不能自批；远程 CLI 真配对并分别穿透真实 Codex/Claude Code；完整 `daemon uninstall --purge` 必须完成 trust reset、Relay purge/readback、LaunchAgent bootout 和本地删除；CLI 重启后能从 Keychain/CryptoStateStore读回 DeviceSign/DeviceHPKE/grant/counter/replay state；旧 credential JSON 不含 private key/grant/bearer；Linux及unsigned/ad-hoc macOS CLI persistent pairing 返回 typed unsupported，不能降级明文文件。
 
 ### P5 iOS Companion
 
@@ -951,7 +960,7 @@ bash scripts/verify-relay-companion-mvp.sh
 
 1. **唯一常驻 daemon**：LaunchAgent 只运行一个 `agentdeckd`；macOS App 和 CLI 同时连接同一 UDS；关闭 App 不终止活跃 turn。
 2. **可安装可升级**：versioned daemon、`bin/current`、plist/bootstrap、idle upgrade、protocol mismatch 与 uninstall/preserve-data 流程在干净用户环境通过；dev ephemeral 实例不能读取 stable trust/data。
-3. **真实独立配对**：iPhone 用 5 分钟单次邀请与一台机器配对，keys 落 ThisDeviceOnly Keychain；第二台机器必须单独配对；完全相同 PairRequest 丢响应后只取回同一 grant。
+3. **真实独立配对**：iPhone 用 5 分钟单次邀请发起配对，被控机器本地 App/CLI 必须显示并确认 DeviceSign fingerprint，远端与 Relay 管理员均不能自批；keys 落 ThisDeviceOnly Keychain；第二台机器必须单独配对；完全相同 PairRequest 丢响应后只取回同一 grant。
 4. **真实双 agent 控制**：iPhone 能查看、继续并审批真实 Codex 和 Claude Code 会话，收到完整 canonical stream。
 5. **多写者确定性**：本地 macOS App、远程 macOS、iPhone、远程 CLI 同时写同一 conversation；prompt FIFO；审批只有一个不可变赢家，所有端读到精确 delivery state。
 6. **普通重启连续**：clean daemon restart 后恢复 grant/key directory、counter/replay guard、Accepted queue、catalog/event high-water 和 daemon backfill；iOS 前后台、网络切换、Relay restart 都不需重配、不复用 nonce、不重复副作用。Started command crash 明确为 `Interrupted`；故意让 vendor child 在父进程崩溃后存活时，新 daemon 必须先 fencing 成功或 RecoveryBlocked，不能并行启动下一 turn。
