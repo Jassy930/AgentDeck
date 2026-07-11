@@ -41,8 +41,15 @@ pub use vendor::codex::{CodexVendorControl, CodexVendorPanelEvent};
 /// 契约产物版本。改动协议形态时手动 +1，并重生成快照。
 pub const PROTOCOL_VERSION: u32 = 2;
 
-/// Aggregate JSON Schema for all v2 wire types. Snapshot-tested against
-/// `protocol/agentdeck/agentdeck-protocol.schema.json`.
+/// Aggregate JSON Schema for the local IPC v2 wire types (CLI/Swift ⇄
+/// daemon). Snapshot-tested against `protocol/agentdeck/agentdeck-protocol.schema.json`.
+///
+/// Relay v1 (`crate::remote`) entries were removed here in P1.3: Relay is now
+/// its own independent version axis (see `relay_v2_schema()` /
+/// `RELAY_PROTOCOL_VERSION`) and no longer rides on the local IPC schema.
+/// `crate::remote` itself is unchanged and keeps compiling/testing on its own
+/// (R0/R1a/R1b behavior is unaffected); only its presence in this aggregate
+/// export was removed.
 pub fn protocol_schema() -> serde_json::Value {
     use schemars::schema_for;
     use serde_json::json;
@@ -61,12 +68,6 @@ pub fn protocol_schema() -> serde_json::Value {
             "HistoryListItem": serde_json::to_value(schema_for!(trunk::HistoryListItem)).unwrap(),
             "HistoryReadResponse": serde_json::to_value(schema_for!(trunk::HistoryReadResponse)).unwrap(),
             "HistoryResponse": serde_json::to_value(schema_for!(trunk::HistoryResponse)).unwrap(),
-            "RemoteFrame": serde_json::to_value(schema_for!(remote::RemoteFrame)).unwrap(),
-            "RelayControlMsg": serde_json::to_value(schema_for!(remote::RelayControlMsg)).unwrap(),
-            "DataEnvelope": serde_json::to_value(schema_for!(remote::DataEnvelope)).unwrap(),
-            "MachineDescriptor": serde_json::to_value(schema_for!(remote::MachineDescriptor)).unwrap(),
-            "SessionDescriptor": serde_json::to_value(schema_for!(remote::SessionDescriptor)).unwrap(),
-            "DeviceDescriptor": serde_json::to_value(schema_for!(remote::DeviceDescriptor)).unwrap(),
         }
     })
 }

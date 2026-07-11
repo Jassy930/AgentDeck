@@ -55,21 +55,51 @@ pub fn handle_diagnostics_report(
 }
 
 // ── Protocol ─────────────────────────────────────────────────────────────────
+//
+// All four schema exports are pure local data — each version axis
+// (IPC/Runtime/Relay v2/E2EE) owns an aggregate schema function in
+// `agentdeck-protocol` that these handlers call directly. None of them touch
+// `Client`/the daemon (see `main.rs::run_sync`, which dispatches `Cmd::Protocol`
+// before any `Client::connect`).
 
-pub fn handle_protocol_schema(c: &mut Client, pretty: bool) -> Result<(), CliError> {
-    // schema is always pretty (it's a documentation artifact)
-    let schema = c.protocol_schema()?;
+/// Print a schema JSON value pretty-printed with a trailing newline — schema
+/// output is always pretty (it's a documentation artifact), independent of
+/// the `--pretty` flag.
+fn print_schema(schema: &serde_json::Value) {
+    println!("{}", serde_json::to_string_pretty(schema).unwrap());
+}
+
+pub fn handle_protocol_schema(pretty: bool) -> Result<(), CliError> {
     let _ = pretty;
-    let out = serde_json::to_string_pretty(&schema).unwrap();
-    println!("{out}");
+    print_schema(&agentdeck_protocol::protocol_schema());
     Ok(())
 }
 
-pub fn handle_protocol_version(c: &mut Client, pretty: bool) -> Result<(), CliError> {
-    let ver = c.protocol_version()?;
+pub fn handle_protocol_runtime_schema(pretty: bool) -> Result<(), CliError> {
+    let _ = pretty;
+    print_schema(&agentdeck_protocol::runtime::runtime_schema());
+    Ok(())
+}
+
+pub fn handle_protocol_relay_schema(pretty: bool) -> Result<(), CliError> {
+    let _ = pretty;
+    print_schema(&agentdeck_protocol::relay_v2::relay_v2_schema());
+    Ok(())
+}
+
+pub fn handle_protocol_e2ee_schema(pretty: bool) -> Result<(), CliError> {
+    let _ = pretty;
+    print_schema(&agentdeck_protocol::e2ee::e2ee_schema());
+    Ok(())
+}
+
+pub fn handle_protocol_version(pretty: bool) -> Result<(), CliError> {
     println!(
         "{}",
-        render(&serde_json::json!({"protocolVersion": ver}), pretty)
+        render(
+            &serde_json::json!({"protocolVersion": agentdeck_protocol::PROTOCOL_VERSION}),
+            pretty
+        )
     );
     Ok(())
 }

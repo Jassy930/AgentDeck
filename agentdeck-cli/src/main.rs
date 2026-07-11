@@ -77,10 +77,19 @@ enum DiagOp {
 
 #[derive(Subcommand)]
 enum ProtocolOp {
-    /// Print the versioned JSON Schema
+    /// Print the local IPC v2 aggregate JSON Schema (PROTOCOL_VERSION)
     Schema,
-    /// Print the protocol version number
+    /// Print the local IPC protocol version number (PROTOCOL_VERSION)
     Version,
+    /// Print the Runtime v1 aggregate JSON Schema (RUNTIME_PROTOCOL_VERSION)
+    #[command(name = "runtime-schema")]
+    RuntimeSchema,
+    /// Print the Relay v2 aggregate JSON Schema (RELAY_PROTOCOL_VERSION=2)
+    #[command(name = "relay-schema")]
+    RelaySchema,
+    /// Print the E2EE v1 aggregate JSON Schema (E2EE_FORMAT_VERSION)
+    #[command(name = "e2ee-schema")]
+    E2eeSchema,
 }
 
 #[derive(Subcommand)]
@@ -260,13 +269,17 @@ fn run_sync(cli: &Cli) -> Result<(), CliError> {
     let pretty = cli.pretty;
 
     match &cli.command {
-        Cmd::Protocol { op } => {
-            let mut c = client::Client::connect(profile, data_dir)?;
-            match op {
-                ProtocolOp::Schema => commands::handle_protocol_schema(&mut c, pretty),
-                ProtocolOp::Version => commands::handle_protocol_version(&mut c, pretty),
-            }
-        }
+        // Protocol schema/version introspection is pure local data (the four
+        // version axes each expose their own aggregate schema function in
+        // `agentdeck-protocol`) — dispatch happens before any `Client::connect`
+        // so these subcommands never spawn or talk to the daemon.
+        Cmd::Protocol { op } => match op {
+            ProtocolOp::Schema => commands::handle_protocol_schema(pretty),
+            ProtocolOp::Version => commands::handle_protocol_version(pretty),
+            ProtocolOp::RuntimeSchema => commands::handle_protocol_runtime_schema(pretty),
+            ProtocolOp::RelaySchema => commands::handle_protocol_relay_schema(pretty),
+            ProtocolOp::E2eeSchema => commands::handle_protocol_e2ee_schema(pretty),
+        },
         Cmd::Ping => {
             let mut c = client::Client::connect(profile, data_dir)?;
             commands::handle_ping(&mut c, pretty)

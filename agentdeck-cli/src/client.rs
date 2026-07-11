@@ -132,33 +132,6 @@ impl Client {
         }
     }
 
-    pub fn protocol_schema(&mut self) -> Result<serde_json::Value, CliError> {
-        let v = admin_round_trip(
-            &mut self.transport,
-            &ClientCommand::ProtocolSchema,
-            "protocolSchema",
-        )?;
-        v.get("schema").cloned().ok_or_else(|| CliError::Protocol {
-            code: None,
-            message: "missing schema field".into(),
-        })
-    }
-
-    pub fn protocol_version(&mut self) -> Result<u32, CliError> {
-        let v = admin_round_trip(
-            &mut self.transport,
-            &ClientCommand::ProtocolVersion,
-            "protocolVersion",
-        )?;
-        v.get("protocolVersion")
-            .and_then(|x| x.as_u64())
-            .map(|n| n as u32)
-            .ok_or_else(|| CliError::Protocol {
-                code: None,
-                message: "missing protocolVersion field".into(),
-            })
-    }
-
     pub fn agent_list(&mut self) -> Result<Vec<String>, CliError> {
         let v = admin_round_trip(&mut self.transport, &ClientCommand::AgentList, "agentList")?;
         let arr = v
