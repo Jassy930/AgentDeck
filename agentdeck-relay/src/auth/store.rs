@@ -73,7 +73,8 @@ pub struct InMemoryRelayStore {
 
 impl RelayStore for InMemoryRelayStore {
     fn put_challenge(&mut self, challenge: Challenge) {
-        self.challenges.insert(challenge.device_sign_pubkey.clone(), challenge);
+        self.challenges
+            .insert(challenge.device_sign_pubkey.clone(), challenge);
     }
 
     fn take_challenge(&mut self, device_sign_pubkey: &str, now_ms: i64) -> Option<Challenge> {
@@ -105,7 +106,10 @@ impl RelayStore for InMemoryRelayStore {
     }
 
     fn device_by_credential_hash(&self, credential_hash: &str) -> Option<Device> {
-        self.devices.values().find(|d| d.credential_hash == credential_hash).cloned()
+        self.devices
+            .values()
+            .find(|d| d.credential_hash == credential_hash)
+            .cloned()
     }
 
     fn account_count(&self) -> usize {

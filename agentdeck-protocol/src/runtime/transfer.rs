@@ -271,7 +271,7 @@ impl TransferReassembler {
 
 /// 32-byte hash 的 base64 wire 编解码。
 mod b64_hash {
-    use base64::{engine::general_purpose::STANDARD, Engine};
+    use base64::{Engine, engine::general_purpose::STANDARD};
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
@@ -280,7 +280,9 @@ mod b64_hash {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
         let s = String::deserialize(d)?;
-        let raw = STANDARD.decode(s.as_bytes()).map_err(serde::de::Error::custom)?;
+        let raw = STANDARD
+            .decode(s.as_bytes())
+            .map_err(serde::de::Error::custom)?;
         raw.try_into()
             .map_err(|_| serde::de::Error::custom("totalSha256 must decode to exactly 32 bytes"))
     }
@@ -288,7 +290,7 @@ mod b64_hash {
 
 /// 可变长 bytes 的 base64 wire 编解码。
 mod b64_bytes {
-    use base64::{engine::general_purpose::STANDARD, Engine};
+    use base64::{Engine, engine::general_purpose::STANDARD};
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
@@ -297,6 +299,8 @@ mod b64_bytes {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         let s = String::deserialize(d)?;
-        STANDARD.decode(s.as_bytes()).map_err(serde::de::Error::custom)
+        STANDARD
+            .decode(s.as_bytes())
+            .map_err(serde::de::Error::custom)
     }
 }

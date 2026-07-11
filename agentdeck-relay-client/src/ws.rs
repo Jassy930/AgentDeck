@@ -59,11 +59,11 @@ fn build_request(
     let mut request = url
         .into_client_request()
         .map_err(|e| WsError::Connect(e.to_string()))?;
-    let value = format!("Bearer {bearer}")
-        .parse()
-        .map_err(|e: tokio_tungstenite::tungstenite::http::header::InvalidHeaderValue| {
+    let value = format!("Bearer {bearer}").parse().map_err(
+        |e: tokio_tungstenite::tungstenite::http::header::InvalidHeaderValue| {
             WsError::Connect(e.to_string())
-        })?;
+        },
+    )?;
     request.headers_mut().insert(AUTHORIZATION, value);
     Ok(request)
 }
@@ -98,7 +98,10 @@ impl WsTransport {
         Ok(Self {
             url: url.to_string(),
             bearer: bearer.to_string(),
-            auth: AuthContext::Bearer { token: bearer.to_string(), device_id: auth_label },
+            auth: AuthContext::Bearer {
+                token: bearer.to_string(),
+                device_id: auth_label,
+            },
             sink: Mutex::new(sink),
             stream: Mutex::new(stream),
         })
@@ -120,7 +123,9 @@ impl Transport for WsTransport {
             match stream.next().await {
                 Some(Ok(Message::Text(text))) => return Ok(Some(text.to_string())),
                 Some(Ok(Message::Close(_))) | None => return Ok(None),
-                Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_))) => {
+                Some(Ok(
+                    Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_),
+                )) => {
                     continue;
                 }
                 Some(Err(e)) => {
@@ -164,7 +169,10 @@ fn record_subscription(map: &mut HashMap<SubTarget, RemoteFrame>, frame: RemoteF
 impl WsRelayClient {
     pub async fn connect(url: &str, bearer: &str, from: ClientRole) -> Result<Self, WsError> {
         let transport = WsTransport::connect(url, bearer, role_label(&from)).await?;
-        Ok(Self { transport, subscriptions: Mutex::new(HashMap::new()) })
+        Ok(Self {
+            transport,
+            subscriptions: Mutex::new(HashMap::new()),
+        })
     }
 
     /// 重连底层 WS 连接，并重放此前发出的所有 `Subscribe` 帧（按 target 去重后，
@@ -176,9 +184,12 @@ impl WsRelayClient {
             .map_err(|e| WsError::Connect(e.to_string()))?;
         let subs: Vec<RemoteFrame> = self.subscriptions.lock().await.values().cloned().collect();
         for frame in subs {
-            let line = serde_json::to_string(&frame)
-                .map_err(|e| WsError::InvalidFrame(e.to_string()))?;
-            self.transport.send(line).await.map_err(|e| WsError::Io(e.to_string()))?;
+            let line =
+                serde_json::to_string(&frame).map_err(|e| WsError::InvalidFrame(e.to_string()))?;
+            self.transport
+                .send(line)
+                .await
+                .map_err(|e| WsError::Io(e.to_string()))?;
         }
         Ok(())
     }
@@ -191,7 +202,9 @@ impl agentdeck_relay::RelayLink for WsRelayClient {
             let mut subs = self.subscriptions.lock().await;
             record_subscription(&mut subs, frame.clone());
         }
-        let Ok(line) = serde_json::to_string(&frame) else { return };
+        let Ok(line) = serde_json::to_string(&frame) else {
+            return;
+        };
         let _ = self.transport.send(line).await;
     }
 
@@ -214,13 +227,18 @@ mod tests {
 
     #[test]
     fn ws_error_rejected_carries_status_and_code() {
-        let e = WsError::Rejected { status: 401, code: Some("relay.pair.bad_secret".into()) };
+        let e = WsError::Rejected {
+            status: 401,
+            code: Some("relay.pair.bad_secret".into()),
+        };
         assert!(e.to_string().contains("401"));
     }
 
     fn mk_subscribe_frame(target: SubTarget) -> RemoteFrame {
         RemoteFrame::control(
-            ClientRole::Device { device_id: "d".into() },
+            ClientRole::Device {
+                device_id: "d".into(),
+            },
             "t".into(),
             0,
             RelayControlMsg::Subscribe { target },
@@ -244,11 +262,16 @@ mod tests {
         record_subscription(&mut map, mk_subscribe_frame(SubTarget::Machines));
         record_subscription(
             &mut map,
-            mk_subscribe_frame(SubTarget::Sessions { machine_id: "M1".into() }),
+            mk_subscribe_frame(SubTarget::Sessions {
+                machine_id: "M1".into(),
+            }),
         );
         record_subscription(
             &mut map,
-            mk_subscribe_frame(SubTarget::Events { conversation_id: "C1".into(), since_seq: None }),
+            mk_subscribe_frame(SubTarget::Events {
+                conversation_id: "C1".into(),
+                since_seq: None,
+            }),
         );
         assert_eq!(map.len(), 3, "不同 target 应保留");
     }

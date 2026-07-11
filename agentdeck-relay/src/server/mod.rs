@@ -66,16 +66,20 @@ pub async fn serve(
     relay: FakeRelay,
 ) -> Result<(), ServeError> {
     let bind = config.bind;
-    let listener = tokio::net::TcpListener::bind(bind).await.map_err(ServeError::Bind)?;
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .map_err(ServeError::Bind)?;
 
     if let Some(tls_paths) = config.tls.clone() {
         if cfg!(feature = "tls") {
             #[cfg(feature = "tls")]
             {
-                let tls_config =
-                    axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls_paths.cert, &tls_paths.key)
-                        .await
-                        .map_err(|e| ServeError::TlsLoad(e.to_string()))?;
+                let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+                    &tls_paths.cert,
+                    &tls_paths.key,
+                )
+                .await
+                .map_err(|e| ServeError::TlsLoad(e.to_string()))?;
                 return serve_with_listener_tls(config, store, relay, listener, tls_config).await;
             }
             #[cfg(not(feature = "tls"))]

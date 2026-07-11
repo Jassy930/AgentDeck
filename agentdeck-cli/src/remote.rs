@@ -124,7 +124,9 @@ pub async fn run_smoke(daemon: &std::path::Path, profile: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
         Err(_) => {
-            eprintln!("remote.smoke.timeout: 等待 machines 快照超时（{ADMIN_REPLY_FRAME_TIMEOUT:?}）");
+            eprintln!(
+                "remote.smoke.timeout: 等待 machines 快照超时（{ADMIN_REPLY_FRAME_TIMEOUT:?}）"
+            );
             bridge.shutdown().await;
             return ExitCode::FAILURE;
         }
@@ -167,7 +169,7 @@ async fn wait_admin_reply(d: &mut RelayClient, want: &str) -> bool {
                 }
             }
             Ok(None) => return false, // relay 流已关闭
-            Err(_) => return false,    // 超时：不再重试，快速失败
+            Err(_) => return false,   // 超时：不再重试，快速失败
         }
     }
     false
@@ -230,7 +232,8 @@ fn creds_path(data_dir: Option<&str>, profile: &str) -> PathBuf {
         Some(d) => PathBuf::from(d),
         None => default_data_dir(),
     };
-    base.join("relay").join(format!("{profile}.credentials.json"))
+    base.join("relay")
+        .join(format!("{profile}.credentials.json"))
 }
 
 #[cfg(target_os = "macos")]
@@ -337,7 +340,10 @@ pub async fn pair(
     let challenge = tokio::task::spawn_blocking(move || post_json(&challenge_url, challenge_body))
         .await
         .map_err(|e| PairError::Http(format!("challenge task panicked: {e}")))??;
-    let nonce = challenge["nonce"].as_str().ok_or(PairError::MalformedResp)?.to_string();
+    let nonce = challenge["nonce"]
+        .as_str()
+        .ok_or(PairError::MalformedResp)?
+        .to_string();
 
     let sig_b64 = B64.encode(sk.sign(nonce.as_bytes()).to_bytes());
     let device_id = format!("cli-{profile}-{}", short_random_suffix());
@@ -359,13 +365,23 @@ pub async fn pair(
 
     let creds = RelayCredentials {
         relay_url: relay_url.to_string(),
-        account_id: resp["account_id"].as_str().ok_or(PairError::MalformedResp)?.to_string(),
-        device_id: resp["device_id"].as_str().ok_or(PairError::MalformedResp)?.to_string(),
-        credential: resp["credential"].as_str().ok_or(PairError::MalformedResp)?.to_string(),
+        account_id: resp["account_id"]
+            .as_str()
+            .ok_or(PairError::MalformedResp)?
+            .to_string(),
+        device_id: resp["device_id"]
+            .as_str()
+            .ok_or(PairError::MalformedResp)?
+            .to_string(),
+        credential: resp["credential"]
+            .as_str()
+            .ok_or(PairError::MalformedResp)?
+            .to_string(),
         role: role.as_wire().to_string(),
     };
 
-    write_creds(&creds_path(data_dir, profile), &creds).map_err(|e| PairError::Io(e.to_string()))?;
+    write_creds(&creds_path(data_dir, profile), &creds)
+        .map_err(|e| PairError::Io(e.to_string()))?;
     Ok(creds)
 }
 
@@ -376,13 +392,20 @@ pub async fn pair(
 /// relay，且现象是"莫名其妙的权限/授权失败"而不是清楚的报错）。
 fn role_for(creds: &RelayCredentials) -> Result<ClientRole, PairError> {
     match creds.role.as_str() {
-        "machine" => Ok(ClientRole::Machine { machine_id: creds.device_id.clone() }),
-        "device" => Ok(ClientRole::Device { device_id: creds.device_id.clone() }),
+        "machine" => Ok(ClientRole::Machine {
+            machine_id: creds.device_id.clone(),
+        }),
+        "device" => Ok(ClientRole::Device {
+            device_id: creds.device_id.clone(),
+        }),
         other => Err(PairError::InvalidRole(other.to_string())),
     }
 }
 
-async fn connect_device(creds: &RelayCredentials, role: ClientRole) -> Result<WsRelayClient, WsError> {
+async fn connect_device(
+    creds: &RelayCredentials,
+    role: ClientRole,
+) -> Result<WsRelayClient, WsError> {
     let ws_url = format!(
         "{}/v1/connect?v={}",
         creds.relay_url,
@@ -457,7 +480,9 @@ async fn cmd_machines(relay: &str, profile: &str, data_dir: Option<&str>) -> Exi
         role,
         "cli-machines".into(),
         0,
-        RelayControlMsg::Subscribe { target: SubTarget::Machines },
+        RelayControlMsg::Subscribe {
+            target: SubTarget::Machines,
+        },
     ))
     .await;
     match tokio::time::timeout(ADMIN_REPLY_FRAME_TIMEOUT, link.recv()).await {
@@ -482,7 +507,12 @@ async fn cmd_machines(relay: &str, profile: &str, data_dir: Option<&str>) -> Exi
     }
 }
 
-async fn cmd_sessions(relay: &str, machine_id: &str, profile: &str, data_dir: Option<&str>) -> ExitCode {
+async fn cmd_sessions(
+    relay: &str,
+    machine_id: &str,
+    profile: &str,
+    data_dir: Option<&str>,
+) -> ExitCode {
     let creds = match load_creds(profile, data_dir) {
         Ok(c) => c,
         Err(code) => return code,
@@ -506,12 +536,19 @@ async fn cmd_sessions(relay: &str, machine_id: &str, profile: &str, data_dir: Op
         role,
         "cli-sessions".into(),
         0,
-        RelayControlMsg::Subscribe { target: SubTarget::Sessions { machine_id: machine_id.to_string() } },
+        RelayControlMsg::Subscribe {
+            target: SubTarget::Sessions {
+                machine_id: machine_id.to_string(),
+            },
+        },
     ))
     .await;
     match tokio::time::timeout(ADMIN_REPLY_FRAME_TIMEOUT, link.recv()).await {
         Ok(Some(frame)) => match frame.msg {
-            RelayControlMsg::SessionList { machine_id, sessions } => {
+            RelayControlMsg::SessionList {
+                machine_id,
+                sessions,
+            } => {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
@@ -539,7 +576,12 @@ async fn cmd_sessions(relay: &str, machine_id: &str, profile: &str, data_dir: Op
 }
 
 /// 持续打印某 conversation 的 `Event` 帧，直到连接关闭（Ctrl-C 中断进程）。
-async fn cmd_watch(relay: &str, conversation_id: &str, profile: &str, data_dir: Option<&str>) -> ExitCode {
+async fn cmd_watch(
+    relay: &str,
+    conversation_id: &str,
+    profile: &str,
+    data_dir: Option<&str>,
+) -> ExitCode {
     let creds = match load_creds(profile, data_dir) {
         Ok(c) => c,
         Err(code) => return code,
@@ -564,14 +606,22 @@ async fn cmd_watch(relay: &str, conversation_id: &str, profile: &str, data_dir: 
         "cli-watch".into(),
         0,
         RelayControlMsg::Subscribe {
-            target: SubTarget::Events { conversation_id: conversation_id.to_string(), since_seq: None },
+            target: SubTarget::Events {
+                conversation_id: conversation_id.to_string(),
+                since_seq: None,
+            },
         },
     ))
     .await;
     loop {
         match link.recv().await {
             Some(frame) => match frame.msg {
-                RelayControlMsg::Event { conversation_id, turn_session_id, seq, data } => {
+                RelayControlMsg::Event {
+                    conversation_id,
+                    turn_session_id,
+                    seq,
+                    data,
+                } => {
                     let payload: serde_json::Value =
                         data.decode_plaintext().unwrap_or(serde_json::Value::Null);
                     println!(
@@ -599,7 +649,13 @@ async fn cmd_watch(relay: &str, conversation_id: &str, profile: &str, data_dir: 
 /// 这里只发一个通用 `{"text": ...}` 明文 envelope 并等待 relay 的
 /// `CommandDelivered` 送达确认（而非业务层回复——业务语义留给未来接住这条
 /// 命令的真实 machine 适配器定义）。
-async fn cmd_send(relay: &str, conversation_id: &str, text: &str, profile: &str, data_dir: Option<&str>) -> ExitCode {
+async fn cmd_send(
+    relay: &str,
+    conversation_id: &str,
+    text: &str,
+    profile: &str,
+    data_dir: Option<&str>,
+) -> ExitCode {
     let creds = match load_creds(profile, data_dir) {
         Ok(c) => c,
         Err(code) => return code,
@@ -633,7 +689,9 @@ async fn cmd_send(relay: &str, conversation_id: &str, text: &str, profile: &str,
         0,
         RelayControlMsg::SendCommand {
             request_id: request_id.clone(),
-            target: CommandTarget::Conversation { conversation_id: conversation_id.to_string() },
+            target: CommandTarget::Conversation {
+                conversation_id: conversation_id.to_string(),
+            },
             data,
         },
     ))
@@ -664,7 +722,12 @@ async fn cmd_send(relay: &str, conversation_id: &str, text: &str, profile: &str,
     }
 }
 
-async fn cmd_ping(relay: &str, machine_id: &str, profile: &str, data_dir: Option<&str>) -> ExitCode {
+async fn cmd_ping(
+    relay: &str,
+    machine_id: &str,
+    profile: &str,
+    data_dir: Option<&str>,
+) -> ExitCode {
     let creds = match load_creds(profile, data_dir) {
         Ok(c) => c,
         Err(code) => return code,
@@ -698,7 +761,9 @@ async fn cmd_ping(relay: &str, machine_id: &str, profile: &str, data_dir: Option
         0,
         RelayControlMsg::SendCommand {
             request_id: request_id.clone(),
-            target: CommandTarget::Machine { machine_id: machine_id.to_string() },
+            target: CommandTarget::Machine {
+                machine_id: machine_id.to_string(),
+            },
             data,
         },
     ))
@@ -747,7 +812,11 @@ async fn cmd_approve_deny(
     };
     let cmd = ClientCommand::ActionDecision {
         session_id: SessionId(turn_session_id.to_string()),
-        decision: ActionDecision { request_id: request_id.to_string(), decision, persist: false },
+        decision: ActionDecision {
+            request_id: request_id.to_string(),
+            decision,
+            persist: false,
+        },
     };
     let data = match DataEnvelope::plaintext(&cmd) {
         Ok(d) => d,
@@ -763,7 +832,9 @@ async fn cmd_approve_deny(
         0,
         RelayControlMsg::SendCommand {
             request_id: cmd_request_id.clone(),
-            target: CommandTarget::Turn { turn_session_id: turn_session_id.to_string() },
+            target: CommandTarget::Turn {
+                turn_session_id: turn_session_id.to_string(),
+            },
             data,
         },
     ))
@@ -797,7 +868,11 @@ async fn cmd_approve_deny(
 pub async fn run(op: RemoteOpArg, profile: &str, data_dir: Option<&str>) -> ExitCode {
     match op {
         RemoteOpArg::Smoke => smoke(profile).await,
-        RemoteOpArg::Pair { relay, bootstrap_secret, role } => {
+        RemoteOpArg::Pair {
+            relay,
+            bootstrap_secret,
+            role,
+        } => {
             match pair(&relay, &bootstrap_secret, role, profile, data_dir).await {
                 Ok(creds) => {
                     // 明文 bearer credential 只落盘（0600 权限保护），绝不打到
@@ -820,21 +895,48 @@ pub async fn run(op: RemoteOpArg, profile: &str, data_dir: Option<&str>) -> Exit
         RemoteOpArg::Sessions { relay, machine_id } => {
             cmd_sessions(&relay, &machine_id, profile, data_dir).await
         }
-        RemoteOpArg::Watch { relay, conversation_id } => {
-            cmd_watch(&relay, &conversation_id, profile, data_dir).await
+        RemoteOpArg::Watch {
+            relay,
+            conversation_id,
+        } => cmd_watch(&relay, &conversation_id, profile, data_dir).await,
+        RemoteOpArg::Send {
+            relay,
+            conversation_id,
+            text,
+        } => cmd_send(&relay, &conversation_id, &text, profile, data_dir).await,
+        RemoteOpArg::Approve {
+            relay,
+            turn_session_id,
+            request_id,
+        } => {
+            cmd_approve_deny(
+                &relay,
+                &turn_session_id,
+                &request_id,
+                ActionDecisionKind::Approve,
+                profile,
+                data_dir,
+            )
+            .await
         }
-        RemoteOpArg::Send { relay, conversation_id, text } => {
-            cmd_send(&relay, &conversation_id, &text, profile, data_dir).await
+        RemoteOpArg::Deny {
+            relay,
+            turn_session_id,
+            request_id,
+        } => {
+            cmd_approve_deny(
+                &relay,
+                &turn_session_id,
+                &request_id,
+                ActionDecisionKind::Deny,
+                profile,
+                data_dir,
+            )
+            .await
         }
-        RemoteOpArg::Approve { relay, turn_session_id, request_id } => {
-            cmd_approve_deny(&relay, &turn_session_id, &request_id, ActionDecisionKind::Approve, profile, data_dir)
-                .await
+        RemoteOpArg::Ping { relay, machine_id } => {
+            cmd_ping(&relay, &machine_id, profile, data_dir).await
         }
-        RemoteOpArg::Deny { relay, turn_session_id, request_id } => {
-            cmd_approve_deny(&relay, &turn_session_id, &request_id, ActionDecisionKind::Deny, profile, data_dir)
-                .await
-        }
-        RemoteOpArg::Ping { relay, machine_id } => cmd_ping(&relay, &machine_id, profile, data_dir).await,
     }
 }
 
@@ -842,14 +944,41 @@ pub async fn run(op: RemoteOpArg, profile: &str, data_dir: Option<&str>) -> Exit
 /// 需要的参数，避免 clap 派生类型泄漏进 remote 的逻辑层。
 pub enum RemoteOpArg {
     Smoke,
-    Pair { relay: String, bootstrap_secret: String, role: PairRole },
-    Machines { relay: String },
-    Sessions { relay: String, machine_id: String },
-    Watch { relay: String, conversation_id: String },
-    Send { relay: String, conversation_id: String, text: String },
-    Approve { relay: String, turn_session_id: String, request_id: String },
-    Deny { relay: String, turn_session_id: String, request_id: String },
-    Ping { relay: String, machine_id: String },
+    Pair {
+        relay: String,
+        bootstrap_secret: String,
+        role: PairRole,
+    },
+    Machines {
+        relay: String,
+    },
+    Sessions {
+        relay: String,
+        machine_id: String,
+    },
+    Watch {
+        relay: String,
+        conversation_id: String,
+    },
+    Send {
+        relay: String,
+        conversation_id: String,
+        text: String,
+    },
+    Approve {
+        relay: String,
+        turn_session_id: String,
+        request_id: String,
+    },
+    Deny {
+        relay: String,
+        turn_session_id: String,
+        request_id: String,
+    },
+    Ping {
+        relay: String,
+        machine_id: String,
+    },
 }
 
 #[cfg(test)]
@@ -875,7 +1004,9 @@ mod tests {
             root.join("target/release/agentdeckd"),
         ];
         let Some(daemon) = candidates.iter().find(|p| p.exists()) else {
-            eprintln!("skip: agentdeckd 未构建（在 workspace 根 target/{{debug,release}} 均未找到）");
+            eprintln!(
+                "skip: agentdeckd 未构建（在 workspace 根 target/{{debug,release}} 均未找到）"
+            );
             return;
         };
         let code = run_smoke(daemon, "stable").await;
@@ -940,7 +1071,11 @@ mod tests {
         write_creds(&path, &sample_creds()).expect("write_creds should succeed");
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "credentials file must be owner-read/write only");
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "credentials file must be owner-read/write only"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -948,8 +1083,14 @@ mod tests {
     #[test]
     fn to_http_url_maps_ws_schemes_and_leaves_others() {
         assert_eq!(to_http_url("ws://127.0.0.1:8443"), "http://127.0.0.1:8443");
-        assert_eq!(to_http_url("wss://relay.example.com"), "https://relay.example.com");
+        assert_eq!(
+            to_http_url("wss://relay.example.com"),
+            "https://relay.example.com"
+        );
         assert_eq!(to_http_url("http://already-http"), "http://already-http");
-        assert_eq!(to_http_url("https://already-https"), "https://already-https");
+        assert_eq!(
+            to_http_url("https://already-https"),
+            "https://already-https"
+        );
     }
 }

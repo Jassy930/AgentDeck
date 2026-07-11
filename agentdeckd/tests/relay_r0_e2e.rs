@@ -43,13 +43,19 @@ async fn t4_real_session_stream_transits_relay() {
     let daemon = Path::new(env!("CARGO_BIN_EXE_agentdeckd"));
     let relay = FakeRelay::start();
     let link = relay
-        .connect(ClientRole::Machine { machine_id: "M1".into() })
+        .connect(ClientRole::Machine {
+            machine_id: "M1".into(),
+        })
         .await;
     let bridge = agentdeck_relay::StdioMachineBridge::spawn(daemon, "stable", machine(), link)
         .await
         .expect("bridge");
 
-    let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+    let mut d = relay
+        .connect(ClientRole::Device {
+            device_id: "D1".into(),
+        })
+        .await;
     // 真实会话经 SendCommand{Machine} 发 SessionStart；bridge 收到后立即写 daemon
     // stdin（非 admin 命令），daemon 产生的 ServerEvent 流经 relay best-effort 转发。
     let start = ClientCommand::SessionStart(agentdeck_protocol::SessionStart {
@@ -66,12 +72,16 @@ async fn t4_real_session_stream_transits_relay() {
         runtime_options: Default::default(),
     });
     d.send(RemoteFrame::control(
-        ClientRole::Device { device_id: "D1".into() },
+        ClientRole::Device {
+            device_id: "D1".into(),
+        },
         "e2e".into(),
         0,
         RelayControlMsg::SendCommand {
             request_id: "e1".into(),
-            target: CommandTarget::Machine { machine_id: "M1".into() },
+            target: CommandTarget::Machine {
+                machine_id: "M1".into(),
+            },
             data: DataEnvelope::plaintext(&start).unwrap(),
         },
     ))

@@ -17,7 +17,10 @@ impl std::fmt::Debug for AuthContext {
             AuthContext::Anonymous => write!(f, "AuthContext::Anonymous"),
             AuthContext::Bearer { device_id, .. } => {
                 // token 脱敏，device_id 保留用于诊断
-                write!(f, "AuthContext::Bearer {{ token: <redacted>, device_id: {device_id:?} }}")
+                write!(
+                    f,
+                    "AuthContext::Bearer {{ token: <redacted>, device_id: {device_id:?} }}"
+                )
             }
         }
     }
@@ -77,9 +80,15 @@ mod redact_tests {
     use super::*;
     #[test]
     fn auth_context_debug_redacts_token() {
-        let a = AuthContext::Bearer { token: "SECRET-TOKEN-123".into(), device_id: "dev-1".into() };
+        let a = AuthContext::Bearer {
+            token: "SECRET-TOKEN-123".into(),
+            device_id: "dev-1".into(),
+        };
         let s = format!("{a:?}");
-        assert!(!s.contains("SECRET-TOKEN-123"), "token must be redacted in Debug: {s}");
+        assert!(
+            !s.contains("SECRET-TOKEN-123"),
+            "token must be redacted in Debug: {s}"
+        );
         assert!(s.contains("Bearer"), "should still show variant");
     }
 }

@@ -27,16 +27,24 @@ mod tests {
     #[tokio::test]
     async fn subscribe_machines_via_relay_link_returns_machine_list() {
         let relay = FakeRelay::start();
-        let client = relay.connect(ClientRole::Device { device_id: "d".into() }).await;
+        let client = relay
+            .connect(ClientRole::Device {
+                device_id: "d".into(),
+            })
+            .await;
         let mut link = InProcRelayClient::new(client);
 
         RelayLink::send(
             &link,
             RemoteFrame::control(
-                ClientRole::Device { device_id: "d".into() },
+                ClientRole::Device {
+                    device_id: "d".into(),
+                },
                 "trace-1".into(),
                 0,
-                RelayControlMsg::Subscribe { target: SubTarget::Machines },
+                RelayControlMsg::Subscribe {
+                    target: SubTarget::Machines,
+                },
             ),
         )
         .await;

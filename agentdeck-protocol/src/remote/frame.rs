@@ -30,7 +30,12 @@ pub struct RemoteFrame {
 }
 
 impl RemoteFrame {
-    pub fn control(from: ClientRole, trace_id: String, created_at_ms: i64, msg: RelayControlMsg) -> Self {
+    pub fn control(
+        from: ClientRole,
+        trace_id: String,
+        created_at_ms: i64,
+        msg: RelayControlMsg,
+    ) -> Self {
         RemoteFrame {
             relay_protocol_version: super::RELAY_PROTOCOL_VERSION,
             trace_id,

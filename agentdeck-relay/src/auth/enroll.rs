@@ -90,13 +90,20 @@ pub(crate) fn complete<S: RelayStore>(
     let challenge = store
         .take_challenge(&req.device.sign_pubkey, now_ms)
         .ok_or(EnrollError::ChallengeExpired)?;
-    if !crypto::verify_ed25519(&req.device.sign_pubkey, challenge.nonce.as_bytes(), &req.nonce_sig) {
+    if !crypto::verify_ed25519(
+        &req.device.sign_pubkey,
+        challenge.nonce.as_bytes(),
+        &req.nonce_sig,
+    ) {
         return Err(EnrollError::BadSignature);
     }
     let account_id = match store.singleton_account() {
         Some(account) => account.account_id.clone(),
         None => {
-            let owner_pubkey = req.owner_pubkey.as_deref().ok_or(EnrollError::MissingOwnerPubkey)?;
+            let owner_pubkey = req
+                .owner_pubkey
+                .as_deref()
+                .ok_or(EnrollError::MissingOwnerPubkey)?;
             let account_id = derive_account_id(owner_pubkey);
             store.create_account(Account {
                 account_id: account_id.clone(),
@@ -116,14 +123,18 @@ pub(crate) fn complete<S: RelayStore>(
         revoked: false,
     };
     store.put_device(device.clone());
-    Ok(CompleteResp { account_id, credential, device })
+    Ok(CompleteResp {
+        account_id,
+        credential,
+        device,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::store::{InMemoryRelayStore, DeviceRole};
     use crate::auth::crypto;
+    use crate::auth::store::{DeviceRole, InMemoryRelayStore};
     use ed25519_dalek::Signer; // 需要 trait 在 scope 内才能调用 SigningKey::sign（brief 测试片段未列，编译要求补）
 
     fn dev_keys() -> (String, ed25519_dalek::SigningKey) {
@@ -137,46 +148,109 @@ mod tests {
         let secret = "boot-secret";
         // 设备1（device 角色）
         let (dpub, dsk) = dev_keys();
-        let ch = start_challenge(&mut store, ChallengeReq { device_sign_pubkey: dpub.clone() }, 60_000, 1_000);
+        let ch = start_challenge(
+            &mut store,
+            ChallengeReq {
+                device_sign_pubkey: dpub.clone(),
+            },
+            60_000,
+            1_000,
+        );
         let sig = crypto::b64(&dsk.sign(ch.nonce.as_bytes()).to_bytes());
-        let r1 = complete(&mut store, CompleteReq {
-            bootstrap_secret: secret.into(), nonce_sig: sig,
-            device: NewDevice { device_id: "d1".into(), role: DeviceRole::Device,
-                sign_pubkey: dpub.clone(), box_pubkey: "box1".into() },
-            owner_pubkey: Some("owner-pub".into()),
-        }, secret, 2_000).unwrap();
+        let r1 = complete(
+            &mut store,
+            CompleteReq {
+                bootstrap_secret: secret.into(),
+                nonce_sig: sig,
+                device: NewDevice {
+                    device_id: "d1".into(),
+                    role: DeviceRole::Device,
+                    sign_pubkey: dpub.clone(),
+                    box_pubkey: "box1".into(),
+                },
+                owner_pubkey: Some("owner-pub".into()),
+            },
+            secret,
+            2_000,
+        )
+        .unwrap();
         let acc = r1.account_id.clone();
         // 设备2（machine 角色）——同 bootstrap secret，应加入同一 account、不新建
         let (mpub, msk) = dev_keys();
-        let ch2 = start_challenge(&mut store, ChallengeReq { device_sign_pubkey: mpub.clone() }, 60_000, 3_000);
+        let ch2 = start_challenge(
+            &mut store,
+            ChallengeReq {
+                device_sign_pubkey: mpub.clone(),
+            },
+            60_000,
+            3_000,
+        );
         let sig2 = crypto::b64(&msk.sign(ch2.nonce.as_bytes()).to_bytes());
-        let r2 = complete(&mut store, CompleteReq {
-            bootstrap_secret: secret.into(), nonce_sig: sig2,
-            device: NewDevice { device_id: "m1".into(), role: DeviceRole::Machine,
-                sign_pubkey: mpub, box_pubkey: "box2".into() },
-            owner_pubkey: None,
-        }, secret, 4_000).unwrap();
+        let r2 = complete(
+            &mut store,
+            CompleteReq {
+                bootstrap_secret: secret.into(),
+                nonce_sig: sig2,
+                device: NewDevice {
+                    device_id: "m1".into(),
+                    role: DeviceRole::Machine,
+                    sign_pubkey: mpub,
+                    box_pubkey: "box2".into(),
+                },
+                owner_pubkey: None,
+            },
+            secret,
+            4_000,
+        )
+        .unwrap();
         assert_eq!(r2.account_id, acc, "第二设备必须加入同一 singleton account");
         assert_eq!(store.account_count(), 1);
-        assert!(crypto::hash_credential(&r1.credential) == store.device(&r1.device.device_id).unwrap().credential_hash);
+        assert!(
+            crypto::hash_credential(&r1.credential)
+                == store.device(&r1.device.device_id).unwrap().credential_hash
+        );
     }
 
     #[test]
     fn enroll_rejects_bad_secret_expired_and_reused_nonce() {
         let mut store = InMemoryRelayStore::default();
         let (dpub, dsk) = dev_keys();
-        let ch = start_challenge(&mut store, ChallengeReq { device_sign_pubkey: dpub.clone() }, 60_000, 1_000);
+        let ch = start_challenge(
+            &mut store,
+            ChallengeReq {
+                device_sign_pubkey: dpub.clone(),
+            },
+            60_000,
+            1_000,
+        );
         let sig = crypto::b64(&dsk.sign(ch.nonce.as_bytes()).to_bytes());
-        let good = CompleteReq { bootstrap_secret: "boot".into(), nonce_sig: sig.clone(),
-            device: NewDevice { device_id: "d1".into(), role: DeviceRole::Device,
-                sign_pubkey: dpub.clone(), box_pubkey: "b".into() }, owner_pubkey: Some("o".into()) };
+        let good = CompleteReq {
+            bootstrap_secret: "boot".into(),
+            nonce_sig: sig.clone(),
+            device: NewDevice {
+                device_id: "d1".into(),
+                role: DeviceRole::Device,
+                sign_pubkey: dpub.clone(),
+                box_pubkey: "b".into(),
+            },
+            owner_pubkey: Some("o".into()),
+        };
         // 错 secret
-        assert!(matches!(complete(&mut store, good.clone(), "WRONG", 2_000), Err(EnrollError::BadSecret)));
+        assert!(matches!(
+            complete(&mut store, good.clone(), "WRONG", 2_000),
+            Err(EnrollError::BadSecret)
+        ));
         // TTL 过期
-        assert!(matches!(complete(&mut store, good.clone(), "boot", 999_999), Err(EnrollError::ChallengeExpired)));
+        assert!(matches!(
+            complete(&mut store, good.clone(), "boot", 999_999),
+            Err(EnrollError::ChallengeExpired)
+        ));
         // 正常一次
         complete(&mut store, good.clone(), "boot", 2_000).unwrap();
         // nonce 重用（已消费）
-        assert!(matches!(complete(&mut store, good, "boot", 2_000), Err(EnrollError::ChallengeExpired)));
+        assert!(matches!(
+            complete(&mut store, good, "boot", 2_000),
+            Err(EnrollError::ChallengeExpired)
+        ));
     }
 }

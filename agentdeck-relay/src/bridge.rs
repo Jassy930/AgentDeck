@@ -3,10 +3,10 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Stdio;
 
+use agentdeck_protocol::ClientCommand;
 use agentdeck_protocol::remote::{
     ClientRole, CommandTarget, DataEnvelope, MachineDescriptor, RelayControlMsg,
 };
-use agentdeck_protocol::ClientCommand;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
@@ -39,8 +39,11 @@ impl StdioMachineBridge {
         let mut stdin = child.stdin.take().expect("daemon stdin");
         let stdout = child.stdout.take().expect("daemon stdout");
 
-        link.send(mk_frame(&machine_id, RelayControlMsg::RegisterMachine { machine }))
-            .await;
+        link.send(mk_frame(
+            &machine_id,
+            RelayControlMsg::RegisterMachine { machine },
+        ))
+        .await;
 
         let pump = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
@@ -142,7 +145,9 @@ impl Drop for StdioMachineBridge {
 
 fn mk_frame(machine_id: &str, msg: RelayControlMsg) -> agentdeck_protocol::remote::RemoteFrame {
     agentdeck_protocol::remote::RemoteFrame::control(
-        ClientRole::Machine { machine_id: machine_id.to_string() },
+        ClientRole::Machine {
+            machine_id: machine_id.to_string(),
+        },
         "bridge".into(),
         0,
         msg,

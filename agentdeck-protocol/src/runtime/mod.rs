@@ -30,11 +30,11 @@ pub const RUNTIME_PROTOCOL_VERSION: u16 = 1;
 
 pub use catalog::{CatalogChange, CatalogDelta, CatalogError, CatalogSnapshot, ConversationEntry};
 pub use command::{
-    LocalOnlyAdministration, PromptError, PromptPayload, RuntimeRequest, MAX_PROMPT_BYTES,
+    LocalOnlyAdministration, MAX_PROMPT_BYTES, PromptError, PromptPayload, RuntimeRequest,
 };
 pub use envelope::{
-    ensure_request_within_limit, PairInvite, PendingPairing, RuntimeEnvelope, RuntimeMessage,
-    RuntimeReply, RuntimeSizeError, RuntimeStreamItem, MAX_RUNTIME_REQUEST_BYTES,
+    MAX_RUNTIME_REQUEST_BYTES, PairInvite, PendingPairing, RuntimeEnvelope, RuntimeMessage,
+    RuntimeReply, RuntimeSizeError, RuntimeStreamItem, ensure_request_within_limit,
 };
 pub use event::{RuntimeEvent, RuntimeEventBody};
 pub use failure::RuntimeFailure;
@@ -45,6 +45,6 @@ pub use sync::{
     StreamCursor,
 };
 pub use transfer::{
-    TransferEnvelope, TransferError, TransferProgress, TransferReassembler, MAX_PART_BYTES,
-    MAX_REASSEMBLY_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_PARTS, TRANSFER_TTL_MS,
+    MAX_PART_BYTES, MAX_REASSEMBLY_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_PARTS, TRANSFER_TTL_MS,
+    TransferEnvelope, TransferError, TransferProgress, TransferReassembler,
 };

@@ -6,11 +6,11 @@
 use std::path::Path;
 use std::time::Duration;
 
+use agentdeck_protocol::ClientCommand;
 use agentdeck_protocol::remote::{
     ClientRole, CommandTarget, DataEnvelope, DeviceDescriptor, DeviceKind, MachineDescriptor,
     RelayControlMsg, RemoteFrame,
 };
-use agentdeck_protocol::ClientCommand;
 use agentdeck_relay::{FakeRelay, RelayClient};
 
 fn machine() -> MachineDescriptor {
@@ -25,12 +25,16 @@ fn machine() -> MachineDescriptor {
 
 fn device_frame(request_id: &str) -> RemoteFrame {
     RemoteFrame::control(
-        ClientRole::Device { device_id: "D1".into() },
+        ClientRole::Device {
+            device_id: "D1".into(),
+        },
         "t".into(),
         0,
         RelayControlMsg::SendCommand {
             request_id: request_id.into(),
-            target: CommandTarget::Machine { machine_id: "M1".into() },
+            target: CommandTarget::Machine {
+                machine_id: "M1".into(),
+            },
             data: DataEnvelope::plaintext(&ClientCommand::Ping).unwrap(),
         },
     )
@@ -59,19 +63,30 @@ async fn t1_real_daemon_admin_ping_round_trips_through_relay() {
     let daemon = Path::new(env!("CARGO_BIN_EXE_agentdeckd"));
     let relay = FakeRelay::start();
     let link = relay
-        .connect(ClientRole::Machine { machine_id: "M1".into() })
+        .connect(ClientRole::Machine {
+            machine_id: "M1".into(),
+        })
         .await;
     let bridge = agentdeck_relay::StdioMachineBridge::spawn(daemon, "stable", machine(), link)
         .await
         .expect("bridge spawn");
 
-    let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+    let mut d = relay
+        .connect(ClientRole::Device {
+            device_id: "D1".into(),
+        })
+        .await;
     d.send(RemoteFrame::control(
-        ClientRole::Device { device_id: "D1".into() },
+        ClientRole::Device {
+            device_id: "D1".into(),
+        },
         "t".into(),
         0,
         RelayControlMsg::ConnectDevice {
-            device: DeviceDescriptor { device_id: "D1".into(), kind: DeviceKind::Cli },
+            device: DeviceDescriptor {
+                device_id: "D1".into(),
+                kind: DeviceKind::Cli,
+            },
         },
     ))
     .await;

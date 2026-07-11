@@ -9,8 +9,8 @@
 
 use agentdeck_protocol::runtime::identity::TransferId;
 use agentdeck_protocol::runtime::transfer::{
-    TransferEnvelope, TransferProgress, TransferReassembler, MAX_PART_BYTES, MAX_REASSEMBLY_BYTES,
-    MAX_TRANSFER_BYTES, MAX_TRANSFER_PARTS, TRANSFER_TTL_MS,
+    MAX_PART_BYTES, MAX_REASSEMBLY_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_PARTS, TRANSFER_TTL_MS,
+    TransferEnvelope, TransferProgress, TransferReassembler,
 };
 use sha2::{Digest, Sha256};
 
@@ -123,8 +123,8 @@ fn oversize_total_rejected_at_construction() {
 
 #[test]
 fn part_index_out_of_range_rejected() {
-    let err =
-        TransferEnvelope::new(TransferId::new("t1"), 3, 3, [0u8; 32], 10, vec![0u8; 10]).unwrap_err();
+    let err = TransferEnvelope::new(TransferId::new("t1"), 3, 3, [0u8; 32], 10, vec![0u8; 10])
+        .unwrap_err();
     assert_eq!(err.code(), "remote.transfer.too_large");
 }
 
@@ -136,7 +136,10 @@ fn duplicate_same_part_is_idempotent() {
     r.accept(parts[0].clone(), 0).unwrap();
     // re-send part 0 verbatim → idempotent, no error, still in progress
     match r.accept(parts[0].clone(), 0).unwrap() {
-        TransferProgress::InProgress { received_parts, part_count } => {
+        TransferProgress::InProgress {
+            received_parts,
+            part_count,
+        } => {
             assert_eq!(received_parts, 1);
             assert_eq!(part_count, 3);
         }
@@ -234,7 +237,8 @@ fn reassembly_cap_enforced_across_transfers() {
     // t2：另一个 transfer 的首片 250 字节。
     let payload_b = vec![2u8; 500];
     let hash_b = sha256(&payload_b);
-    let b0 = TransferEnvelope::new(TransferId::new("t2"), 0, 2, hash_b, 500, vec![2u8; 250]).unwrap();
+    let b0 =
+        TransferEnvelope::new(TransferId::new("t2"), 0, 2, hash_b, 500, vec![2u8; 250]).unwrap();
     // 300 (t1) + 250 (t2) = 550 > 500 cap
     let err = r.accept(b0, 0).unwrap_err();
     assert_eq!(err.code(), "remote.transfer.reassembly_full");
@@ -242,9 +246,15 @@ fn reassembly_cap_enforced_across_transfers() {
 
 #[test]
 fn envelope_round_trips_with_base64_wire() {
-    let env =
-        TransferEnvelope::new(TransferId::new("t1"), 0, 1, [0xAB; 32], 4, vec![0xDE, 0xAD, 0xBE, 0xEF])
-            .unwrap();
+    let env = TransferEnvelope::new(
+        TransferId::new("t1"),
+        0,
+        1,
+        [0xAB; 32],
+        4,
+        vec![0xDE, 0xAD, 0xBE, 0xEF],
+    )
+    .unwrap();
     let json = serde_json::to_value(&env).unwrap();
     // part 与 hash 走 base64 字符串，不是 JSON 数字数组
     assert!(json["part"].is_string());

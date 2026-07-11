@@ -3,15 +3,12 @@
 //! RuntimeEnvelope v1 是 UDS 与解密后远程链路的共同业务 wire（design §8.2）。
 //! 本 task 只定义中立契约与构造校验，不接线任何运行时行为。
 
-use agentdeck_protocol::runtime::{
-    self, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeMessage, RuntimeRequest,
-    ensure_request_within_limit, MAX_RUNTIME_REQUEST_BYTES,
+use agentdeck_protocol::runtime::command::{
+    LocalOnlyAdministration, MAX_PROMPT_BYTES, PromptPayload, SendPromptRequest,
 };
+use agentdeck_protocol::runtime::failure::{self, RuntimeFailure};
 use agentdeck_protocol::runtime::identity::{
     ApprovalId, CommandId, ConversationId, IdempotencyKey, MessageId, PairingId, TurnId,
-};
-use agentdeck_protocol::runtime::command::{
-    LocalOnlyAdministration, PromptPayload, SendPromptRequest, MAX_PROMPT_BYTES,
 };
 use agentdeck_protocol::runtime::receipt::{
     ApprovalDeliveryState, ApprovalReceipt, CommandReceipt,
@@ -19,7 +16,10 @@ use agentdeck_protocol::runtime::receipt::{
 use agentdeck_protocol::runtime::sync::{
     ConversationSnapshot, SnapshotError, SnapshotItem, StreamCursor,
 };
-use agentdeck_protocol::runtime::failure::{self, RuntimeFailure};
+use agentdeck_protocol::runtime::{
+    self, MAX_RUNTIME_REQUEST_BYTES, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeMessage,
+    RuntimeRequest, ensure_request_within_limit,
+};
 use agentdeck_protocol::{
     ActionDecision, ActionDecisionKind, AgentItem, AgentKind, CapabilityId, CodexCapabilities,
     SessionCapabilities, VendorCapabilities,
@@ -184,7 +184,10 @@ fn runtime_request_covers_all_brief_variants() {
     assert_eq!(variants.len(), 15);
     for v in variants {
         let json = serde_json::to_value(&v).unwrap();
-        assert!(json["request"].is_string(), "each request is internally tagged: {json}");
+        assert!(
+            json["request"].is_string(),
+            "each request is internally tagged: {json}"
+        );
         // wire round-trip (RuntimeRequest embeds non-PartialEq trunk ActionDecision).
         let back: RuntimeRequest = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(serde_json::to_value(&back).unwrap(), json);
@@ -330,7 +333,10 @@ fn snapshot_requires_capabilities_first() {
             },
         ],
     );
-    assert!(matches!(not_first, Err(SnapshotError::CapabilitiesNotFirst)));
+    assert!(matches!(
+        not_first,
+        Err(SnapshotError::CapabilitiesNotFirst)
+    ));
 
     // duplicate capabilities
     let dup = ConversationSnapshot::new(
@@ -363,7 +369,10 @@ fn snapshot_deserialize_rejects_capabilities_not_first() {
         ]
     });
     let res: Result<ConversationSnapshot, _> = serde_json::from_value(bad);
-    assert!(res.is_err(), "wire snapshot must also enforce capabilities-first");
+    assert!(
+        res.is_err(),
+        "wire snapshot must also enforce capabilities-first"
+    );
 }
 
 #[test]

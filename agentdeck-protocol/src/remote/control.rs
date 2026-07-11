@@ -133,6 +133,12 @@ mod tests {
     fn subtarget_events_since_seq_defaults_to_none_for_old_wire() {
         let v = serde_json::json!({"kind": "events", "conversationId": "C1"});
         let t: SubTarget = serde_json::from_value(v).unwrap();
-        assert_eq!(t, SubTarget::Events { conversation_id: "C1".into(), since_seq: None });
+        assert_eq!(
+            t,
+            SubTarget::Events {
+                conversation_id: "C1".into(),
+                since_seq: None
+            }
+        );
     }
 }

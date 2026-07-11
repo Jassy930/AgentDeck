@@ -122,7 +122,9 @@ impl SqliteRelayStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         run_migrations(&conn)?;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     /// 测试专用 helper：让单测直接对 `Connection` 跑校验（例如复跑 `run_migrations`
@@ -258,7 +260,11 @@ impl RelayStore for SqliteRelayStore {
         conn.execute(
             "INSERT OR REPLACE INTO challenges (device_sign_pubkey, nonce, expires_at_ms)
              VALUES (?1, ?2, ?3)",
-            params![challenge.device_sign_pubkey, challenge.nonce, challenge.expires_at_ms],
+            params![
+                challenge.device_sign_pubkey,
+                challenge.nonce,
+                challenge.expires_at_ms
+            ],
         )
         .expect("sqlite put_challenge failed");
     }
@@ -420,7 +426,10 @@ mod tests {
     #[test]
     fn device_crud_and_credential_hash_lookup() {
         let mut store = SqliteRelayStore::open_in_memory().unwrap();
-        store.create_account(Account { account_id: "acc1".into(), owner_sign_pubkey: "opk".into() });
+        store.create_account(Account {
+            account_id: "acc1".into(),
+            owner_sign_pubkey: "opk".into(),
+        });
         store.put_device(Device {
             device_id: "d1".into(),
             account_id: "acc1".into(),
@@ -431,7 +440,10 @@ mod tests {
             revoked: false,
         });
         assert_eq!(store.device("d1").unwrap().credential_hash, "hash1");
-        assert_eq!(store.device_by_credential_hash("hash1").unwrap().device_id, "d1");
+        assert_eq!(
+            store.device_by_credential_hash("hash1").unwrap().device_id,
+            "d1"
+        );
         assert_eq!(store.account_count(), 1);
         store.mark_revoked("d1");
         assert!(store.device("d1").unwrap().revoked);
@@ -448,14 +460,20 @@ mod tests {
         });
         assert!(store.take_challenge("pk1", 5_000).is_some());
         // 已消费：第二次 take 必须 None（即便时间仍在 TTL 内）
-        assert!(store.take_challenge("pk1", 5_000).is_none(), "已消费的 challenge 不应再次命中（仍在 TTL 内）");
+        assert!(
+            store.take_challenge("pk1", 5_000).is_none(),
+            "已消费的 challenge 不应再次命中（仍在 TTL 内）"
+        );
         store.put_challenge(Challenge {
             device_sign_pubkey: "pk1".into(),
             nonce: "n1".into(),
             expires_at_ms: 10_000,
             used: false,
         });
-        assert!(store.take_challenge("pk1", 20_000).is_none(), "过期后不应命中");
+        assert!(
+            store.take_challenge("pk1", 20_000).is_none(),
+            "过期后不应命中"
+        );
     }
 
     #[test]
@@ -464,7 +482,10 @@ mod tests {
         let path = dir.path().join("relay.db");
         {
             let mut store = SqliteRelayStore::open(&path).unwrap();
-            store.create_account(Account { account_id: "acc1".into(), owner_sign_pubkey: "opk".into() });
+            store.create_account(Account {
+                account_id: "acc1".into(),
+                owner_sign_pubkey: "opk".into(),
+            });
             store.put_device(Device {
                 device_id: "d1".into(),
                 account_id: "acc1".into(),
@@ -478,6 +499,9 @@ mod tests {
         // 重新打开同一文件（模拟 relay 进程重启）
         let store2 = SqliteRelayStore::open(&path).unwrap();
         assert_eq!(store2.account_count(), 1);
-        assert!(store2.device("d1").unwrap().revoked, "撤销状态必须跨重启保留");
+        assert!(
+            store2.device("d1").unwrap().revoked,
+            "撤销状态必须跨重启保留"
+        );
     }
 }

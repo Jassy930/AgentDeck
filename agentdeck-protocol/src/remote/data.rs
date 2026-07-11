@@ -22,14 +22,16 @@ pub enum DataEnvelope {
 /// `bytes` 的 wire 编码：base64 字符串（而非 serde_json 默认的 uint8 数组），
 /// 降低 WS 线上体积；schema 侧用 `#[schemars(with = "String")]` 保持一致。
 mod b64 {
-    use base64::{engine::general_purpose::STANDARD, Engine};
+    use base64::{Engine, engine::general_purpose::STANDARD};
     use serde::{Deserialize, Deserializer, Serializer};
     pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&STANDARD.encode(bytes))
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         let s = String::deserialize(d)?;
-        STANDARD.decode(s.as_bytes()).map_err(serde::de::Error::custom)
+        STANDARD
+            .decode(s.as_bytes())
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -55,7 +57,10 @@ mod tests {
     use super::*;
     #[test]
     fn plaintext_bytes_serialize_as_base64_string() {
-        let env = DataEnvelope::Plaintext { agentdeck_protocol_version: 2, bytes: vec![0xDE, 0xAD, 0xBE, 0xEF] };
+        let env = DataEnvelope::Plaintext {
+            agentdeck_protocol_version: 2,
+            bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
         let v = serde_json::to_value(&env).unwrap();
         // bytes 必须是 base64 字符串，不是 JSON 数字数组
         assert_eq!(v["bytes"], serde_json::json!("3q2+7w=="));

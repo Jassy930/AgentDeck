@@ -78,7 +78,13 @@ fn map_enroll_error(err: EnrollError) -> (StatusCode, Json<EnrollErrorBody>) {
             (StatusCode::BAD_REQUEST, failure::PAIR_MISSING_OWNER_PUBKEY)
         }
     };
-    (status, Json(EnrollErrorBody { code, message: err.to_string() }))
+    (
+        status,
+        Json(EnrollErrorBody {
+            code,
+            message: err.to_string(),
+        }),
+    )
 }
 
 pub(crate) async fn challenge(
@@ -88,7 +94,9 @@ pub(crate) async fn challenge(
     let mut store = state.store.clone();
     let resp = enroll::start_challenge(
         &mut store,
-        ChallengeReq { device_sign_pubkey: body.device_sign_pubkey },
+        ChallengeReq {
+            device_sign_pubkey: body.device_sign_pubkey,
+        },
         state.challenge_ttl_ms as i64,
         now_ms() as i64,
     );

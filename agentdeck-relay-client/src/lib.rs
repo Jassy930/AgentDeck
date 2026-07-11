@@ -7,4 +7,4 @@ mod inproc;
 mod ws;
 
 pub use inproc::InProcRelayClient;
-pub use ws::{WsRelayClient, WsError};
+pub use ws::{WsError, WsRelayClient};

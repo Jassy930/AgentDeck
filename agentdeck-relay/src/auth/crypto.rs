@@ -1,11 +1,15 @@
 // agentdeck-relay/src/auth/crypto.rs
 //! ed25519 签名验证 + sha2 hash + CSPRNG nonce/credential 生成。纯函数，无 panic。
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
 
-pub fn b64(bytes: &[u8]) -> String { STANDARD.encode(bytes) }
-pub fn unb64(s: &str) -> Option<Vec<u8>> { STANDARD.decode(s.as_bytes()).ok() }
+pub fn b64(bytes: &[u8]) -> String {
+    STANDARD.encode(bytes)
+}
+pub fn unb64(s: &str) -> Option<Vec<u8>> {
+    STANDARD.decode(s.as_bytes()).ok()
+}
 
 pub fn new_challenge_nonce() -> String {
     use rand::RngCore;
@@ -26,9 +30,18 @@ pub fn hash_credential(cred: &str) -> String {
 }
 pub fn verify_ed25519(pubkey_b64: &str, msg: &[u8], sig_b64: &str) -> bool {
     use ed25519_dalek::{Signature, VerifyingKey};
-    let (Some(pk), Some(sig)) = (unb64(pubkey_b64), unb64(sig_b64)) else { return false };
-    let Ok(pk_arr) = <[u8; 32]>::try_from(pk.as_slice()) else { return false };
-    let Ok(sig_arr) = <[u8; 64]>::try_from(sig.as_slice()) else { return false };
-    let Ok(vk) = VerifyingKey::from_bytes(&pk_arr) else { return false };
-    vk.verify_strict(msg, &Signature::from_bytes(&sig_arr)).is_ok()
+    let (Some(pk), Some(sig)) = (unb64(pubkey_b64), unb64(sig_b64)) else {
+        return false;
+    };
+    let Ok(pk_arr) = <[u8; 32]>::try_from(pk.as_slice()) else {
+        return false;
+    };
+    let Ok(sig_arr) = <[u8; 64]>::try_from(sig.as_slice()) else {
+        return false;
+    };
+    let Ok(vk) = VerifyingKey::from_bytes(&pk_arr) else {
+        return false;
+    };
+    vk.verify_strict(msg, &Signature::from_bytes(&sig_arr))
+        .is_ok()
 }

@@ -347,7 +347,11 @@ async fn main() {
     if let Cmd::Remote { op } = &cli.command {
         let arg = match op {
             RemoteOp::Smoke => remote::RemoteOpArg::Smoke,
-            RemoteOp::Pair { relay, bootstrap_secret, role } => remote::RemoteOpArg::Pair {
+            RemoteOp::Pair {
+                relay,
+                bootstrap_secret,
+                role,
+            } => remote::RemoteOpArg::Pair {
                 relay: relay.clone(),
                 bootstrap_secret: bootstrap_secret.clone(),
                 role: match role {
@@ -355,26 +359,43 @@ async fn main() {
                     RoleArg::Device => remote::PairRole::Device,
                 },
             },
-            RemoteOp::Machines { relay } => remote::RemoteOpArg::Machines { relay: relay.clone() },
+            RemoteOp::Machines { relay } => remote::RemoteOpArg::Machines {
+                relay: relay.clone(),
+            },
             RemoteOp::Sessions { relay, machine_id } => remote::RemoteOpArg::Sessions {
                 relay: relay.clone(),
                 machine_id: machine_id.clone(),
             },
-            RemoteOp::Watch { relay, conversation_id } => remote::RemoteOpArg::Watch {
+            RemoteOp::Watch {
+                relay,
+                conversation_id,
+            } => remote::RemoteOpArg::Watch {
                 relay: relay.clone(),
                 conversation_id: conversation_id.clone(),
             },
-            RemoteOp::Send { relay, conversation_id, text } => remote::RemoteOpArg::Send {
+            RemoteOp::Send {
+                relay,
+                conversation_id,
+                text,
+            } => remote::RemoteOpArg::Send {
                 relay: relay.clone(),
                 conversation_id: conversation_id.clone(),
                 text: text.clone(),
             },
-            RemoteOp::Approve { relay, turn_session_id, request_id } => remote::RemoteOpArg::Approve {
+            RemoteOp::Approve {
+                relay,
+                turn_session_id,
+                request_id,
+            } => remote::RemoteOpArg::Approve {
                 relay: relay.clone(),
                 turn_session_id: turn_session_id.clone(),
                 request_id: request_id.clone(),
             },
-            RemoteOp::Deny { relay, turn_session_id, request_id } => remote::RemoteOpArg::Deny {
+            RemoteOp::Deny {
+                relay,
+                turn_session_id,
+                request_id,
+            } => remote::RemoteOpArg::Deny {
                 relay: relay.clone(),
                 turn_session_id: turn_session_id.clone(),
                 request_id: request_id.clone(),

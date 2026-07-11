@@ -13,10 +13,24 @@ use agentdeck_protocol::{AgentKind, ServerEvent, SessionId, ThreadId};
 use agentdeck_relay::{FakeRelay, RelayClient};
 
 fn m_frame(msg: RelayControlMsg) -> RemoteFrame {
-    RemoteFrame::control(ClientRole::Machine { machine_id: "M1".into() }, "t".into(), 0, msg)
+    RemoteFrame::control(
+        ClientRole::Machine {
+            machine_id: "M1".into(),
+        },
+        "t".into(),
+        0,
+        msg,
+    )
 }
 fn d_frame(msg: RelayControlMsg) -> RemoteFrame {
-    RemoteFrame::control(ClientRole::Device { device_id: "D1".into() }, "t".into(), 0, msg)
+    RemoteFrame::control(
+        ClientRole::Device {
+            device_id: "D1".into(),
+        },
+        "t".into(),
+        0,
+        msg,
+    )
 }
 
 fn machine() -> MachineDescriptor {
@@ -55,14 +69,18 @@ async fn publish_event(m: &RelayClient, conv: &str, turn: &str, ev: &ServerEvent
 /// 无限期挂起。
 async fn next_event(d: &mut RelayClient) -> (String, u64, ServerEvent) {
     loop {
-        let frame = match tokio::time::timeout(std::time::Duration::from_secs(5), d.recv()).await
-        {
+        let frame = match tokio::time::timeout(std::time::Duration::from_secs(5), d.recv()).await {
             Ok(Some(frame)) => frame,
             Ok(None) => panic!("timed out waiting for Event frame: stream closed"),
             Err(_) => panic!("timed out waiting for Event frame after 5s"),
         };
         match frame.msg {
-            RelayControlMsg::Event { turn_session_id, seq, data, .. } => {
+            RelayControlMsg::Event {
+                turn_session_id,
+                seq,
+                data,
+                ..
+            } => {
                 return (turn_session_id, seq, data.decode_plaintext().unwrap());
             }
             _ => continue,
@@ -73,13 +91,30 @@ async fn next_event(d: &mut RelayClient) -> (String, u64, ServerEvent) {
 #[tokio::test]
 async fn t2_conversation_stream_survives_new_turn_through_relay() {
     let relay = FakeRelay::start();
-    let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
-    m.send(m_frame(RelayControlMsg::RegisterMachine { machine: machine() })).await;
-    m.send(m_frame(RelayControlMsg::AnnounceSession { session: session() })).await;
+    let m = relay
+        .connect(ClientRole::Machine {
+            machine_id: "M1".into(),
+        })
+        .await;
+    m.send(m_frame(RelayControlMsg::RegisterMachine {
+        machine: machine(),
+    }))
+    .await;
+    m.send(m_frame(RelayControlMsg::AnnounceSession {
+        session: session(),
+    }))
+    .await;
 
-    let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+    let mut d = relay
+        .connect(ClientRole::Device {
+            device_id: "D1".into(),
+        })
+        .await;
     d.send(d_frame(RelayControlMsg::Subscribe {
-        target: SubTarget::Events { conversation_id: "C1".into(), since_seq: None },
+        target: SubTarget::Events {
+            conversation_id: "C1".into(),
+            since_seq: None,
+        },
     }))
     .await;
 

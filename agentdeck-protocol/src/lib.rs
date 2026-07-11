@@ -74,7 +74,7 @@ pub fn protocol_schema() -> serde_json::Value {
 pub mod remote;
 pub use remote::{
     ClientRole, CommandTarget, DataEnvelope, DeviceDescriptor, DeviceKind, MachineDescriptor,
-    RelayControlMsg, RemoteFrame, SessionDescriptor, SubTarget, RELAY_PROTOCOL_VERSION,
+    RELAY_PROTOCOL_VERSION, RelayControlMsg, RemoteFrame, SessionDescriptor, SubTarget,
 };
 
 #[cfg(test)]

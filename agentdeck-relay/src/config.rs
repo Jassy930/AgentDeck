@@ -218,29 +218,66 @@ mod tests {
     #[allow(unused_imports)]
     use std::net::SocketAddr;
     fn cfg(bind: &str, tls: bool, allow: bool) -> RelayConfig {
-        RelayConfig { bind: bind.parse().unwrap(), bootstrap_secret: "s".into(),
-            tls: if tls { Some(TlsPaths { cert: "c".into(), key: "k".into() }) } else { None },
-            allow_plaintext: allow, log_level: "info".into(),
+        RelayConfig {
+            bind: bind.parse().unwrap(),
+            bootstrap_secret: "s".into(),
+            tls: if tls {
+                Some(TlsPaths {
+                    cert: "c".into(),
+                    key: "k".into(),
+                })
+            } else {
+                None
+            },
+            allow_plaintext: allow,
+            log_level: "info".into(),
             storage_path: default_storage_path(),
             conv_buffer_cap: default_conv_buffer_cap(),
-            req_origin_ttl_ms: default_req_origin_ttl_ms() }
+            req_origin_ttl_ms: default_req_origin_ttl_ms(),
+        }
     }
     #[test]
-    fn loopback_plaintext_ok() { assert!(cfg("127.0.0.1:8080", false, false).validate_transport_gate().is_ok()); }
+    fn loopback_plaintext_ok() {
+        assert!(
+            cfg("127.0.0.1:8080", false, false)
+                .validate_transport_gate()
+                .is_ok()
+        );
+    }
     #[test]
     fn non_loopback_plaintext_rejected() {
-        let e = cfg("0.0.0.0:8080", false, false).validate_transport_gate().unwrap_err();
-        assert_eq!(e.code(), agentdeck_protocol::remote::failure::CONFIG_PLAINTEXT_NON_LOOPBACK);
+        let e = cfg("0.0.0.0:8080", false, false)
+            .validate_transport_gate()
+            .unwrap_err();
+        assert_eq!(
+            e.code(),
+            agentdeck_protocol::remote::failure::CONFIG_PLAINTEXT_NON_LOOPBACK
+        );
     }
     #[test]
-    fn non_loopback_with_tls_ok() { assert!(cfg("0.0.0.0:8080", true, false).validate_transport_gate().is_ok()); }
+    fn non_loopback_with_tls_ok() {
+        assert!(
+            cfg("0.0.0.0:8080", true, false)
+                .validate_transport_gate()
+                .is_ok()
+        );
+    }
     #[test]
-    fn non_loopback_allow_plaintext_ok() { assert!(cfg("0.0.0.0:8080", false, true).validate_transport_gate().is_ok()); }
+    fn non_loopback_allow_plaintext_ok() {
+        assert!(
+            cfg("0.0.0.0:8080", false, true)
+                .validate_transport_gate()
+                .is_ok()
+        );
+    }
 
     #[test]
     fn defaults_match_documented_values() {
         assert_eq!(default_conv_buffer_cap(), 1000);
         assert_eq!(default_req_origin_ttl_ms(), 300_000);
-        assert_eq!(default_storage_path().to_str().unwrap(), "./agentdeck-relay-data/relay.db");
+        assert_eq!(
+            default_storage_path().to_str().unwrap(),
+            "./agentdeck-relay-data/relay.db"
+        );
     }
 }

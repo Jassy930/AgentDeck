@@ -79,7 +79,8 @@ async fn challenge(base_url: &str, sign_pub: &str) -> Value {
         let resp = ureq::post(&format!("{base_url}/v1/pair/challenge"))
             .send_json(json!({ "device_sign_pubkey": sign_pub }))
             .expect("challenge request failed");
-        resp.into_json::<Value>().expect("challenge response not JSON")
+        resp.into_json::<Value>()
+            .expect("challenge response not JSON")
     })
     .await
     .unwrap()
@@ -120,7 +121,9 @@ async fn complete(
             body["owner_pubkey"] = json!(owner_pubkey);
         }
         match ureq::post(&format!("{base_url}/v1/pair/complete")).send_json(body) {
-            Ok(resp) => Ok(resp.into_json::<Value>().expect("complete response not JSON")),
+            Ok(resp) => Ok(resp
+                .into_json::<Value>()
+                .expect("complete response not JSON")),
             Err(ureq::Error::Status(code, resp)) => {
                 let body = resp.into_json::<Value>().unwrap_or(Value::Null);
                 Err((code, body))
@@ -171,7 +174,10 @@ async fn enroll(
 }
 
 fn ws_url(addr: SocketAddr) -> String {
-    format!("ws://{addr}/v1/connect?v={}", agentdeck_protocol::remote::RELAY_PROTOCOL_VERSION)
+    format!(
+        "ws://{addr}/v1/connect?v={}",
+        agentdeck_protocol::remote::RELAY_PROTOCOL_VERSION
+    )
 }
 
 fn machine_descriptor(machine_id: &str, name: &str) -> MachineDescriptor {
@@ -228,7 +234,8 @@ async fn recv_error_code(link: &mut WsRelayClient) -> String {
 async fn enroll_then_device_sees_machine_and_admin_ping() {
     let (addr, _store, base_url) = setup_server("boot-secret-1").await;
 
-    let machine_enrolled = enroll(&base_url, "boot-secret-1", "m1", "machine", Some("owner-1")).await;
+    let machine_enrolled =
+        enroll(&base_url, "boot-secret-1", "m1", "machine", Some("owner-1")).await;
     let device_enrolled = enroll(&base_url, "boot-secret-1", "d1", "device", None).await;
     assert_eq!(
         device_enrolled.account_id, machine_enrolled.account_id,
@@ -238,32 +245,44 @@ async fn enroll_then_device_sees_machine_and_admin_ping() {
     let mut device_link = WsRelayClient::connect(
         &ws_url(addr),
         &device_enrolled.credential,
-        ClientRole::Device { device_id: device_enrolled.device_id.clone() },
+        ClientRole::Device {
+            device_id: device_enrolled.device_id.clone(),
+        },
     )
     .await
     .expect("device ws connect failed");
     device_link
         .send(RemoteFrame::control(
-            ClientRole::Device { device_id: device_enrolled.device_id.clone() },
+            ClientRole::Device {
+                device_id: device_enrolled.device_id.clone(),
+            },
             "t-sub".into(),
             0,
-            RelayControlMsg::Subscribe { target: SubTarget::Machines },
+            RelayControlMsg::Subscribe {
+                target: SubTarget::Machines,
+            },
         ))
         .await;
 
     let mut machine_link = WsRelayClient::connect(
         &ws_url(addr),
         &machine_enrolled.credential,
-        ClientRole::Machine { machine_id: machine_enrolled.device_id.clone() },
+        ClientRole::Machine {
+            machine_id: machine_enrolled.device_id.clone(),
+        },
     )
     .await
     .expect("machine ws connect failed");
     machine_link
         .send(RemoteFrame::control(
-            ClientRole::Machine { machine_id: machine_enrolled.device_id.clone() },
+            ClientRole::Machine {
+                machine_id: machine_enrolled.device_id.clone(),
+            },
             "t-reg".into(),
             0,
-            RelayControlMsg::RegisterMachine { machine: machine_descriptor("m1", "Machine One") },
+            RelayControlMsg::RegisterMachine {
+                machine: machine_descriptor("m1", "Machine One"),
+            },
         ))
         .await;
 
@@ -271,12 +290,16 @@ async fn enroll_then_device_sees_machine_and_admin_ping() {
 
     device_link
         .send(RemoteFrame::control(
-            ClientRole::Device { device_id: device_enrolled.device_id.clone() },
+            ClientRole::Device {
+                device_id: device_enrolled.device_id.clone(),
+            },
             "t-cmd".into(),
             0,
             RelayControlMsg::SendCommand {
                 request_id: "r1".into(),
-                target: CommandTarget::Machine { machine_id: "m1".into() },
+                target: CommandTarget::Machine {
+                    machine_id: "m1".into(),
+                },
                 data: DataEnvelope::plaintext(&"ping-cmd").unwrap(),
             },
         ))
@@ -287,7 +310,9 @@ async fn enroll_then_device_sees_machine_and_admin_ping() {
 
     machine_link
         .send(RemoteFrame::control(
-            ClientRole::Machine { machine_id: "m1".into() },
+            ClientRole::Machine {
+                machine_id: "m1".into(),
+            },
             "t-reply".into(),
             0,
             RelayControlMsg::AdminReply {
@@ -384,7 +409,9 @@ async fn rejects_bad_secret_expired_nonce_revoked_and_unknown_cred() {
         let result = WsRelayClient::connect(
             &ws_url(addr),
             "totally-unknown-credential",
-            ClientRole::Device { device_id: "ghost".into() },
+            ClientRole::Device {
+                device_id: "ghost".into(),
+            },
         )
         .await;
         match result {
@@ -392,19 +419,32 @@ async fn rejects_bad_secret_expired_nonce_revoked_and_unknown_cred() {
                 assert_eq!(status, 401, "unknown credential must be rejected with 401");
                 assert_eq!(code.as_deref(), Some(failure::AUTH_INVALID_DEVICE));
             }
-            Ok(_) => panic!("expected ws connect with unknown credential to be rejected, but it succeeded"),
-            Err(other) => panic!("expected WsError::Rejected{{401, AUTH_INVALID_DEVICE}}, got {other}"),
+            Ok(_) => panic!(
+                "expected ws connect with unknown credential to be rejected, but it succeeded"
+            ),
+            Err(other) => {
+                panic!("expected WsError::Rejected{{401, AUTH_INVALID_DEVICE}}, got {other}")
+            }
         }
     }
 
     // 4) revoked credential → 先 enroll 成功，再直接标记撤销，随后同凭据连接被拒
     {
-        let enrolled = enroll(&base_url, "boot-secret-2", "to-revoke", "device", Some("owner-z")).await;
+        let enrolled = enroll(
+            &base_url,
+            "boot-secret-2",
+            "to-revoke",
+            "device",
+            Some("owner-z"),
+        )
+        .await;
         agentdeck_relay::server::revoke_device(&store, &enrolled.device_id);
         let result = WsRelayClient::connect(
             &ws_url(addr),
             &enrolled.credential,
-            ClientRole::Device { device_id: enrolled.device_id.clone() },
+            ClientRole::Device {
+                device_id: enrolled.device_id.clone(),
+            },
         )
         .await;
         match result {
@@ -412,8 +452,12 @@ async fn rejects_bad_secret_expired_nonce_revoked_and_unknown_cred() {
                 assert_eq!(status, 401, "revoked credential must be rejected with 401");
                 assert_eq!(code.as_deref(), Some(failure::AUTH_REVOKED_DEVICE));
             }
-            Ok(_) => panic!("expected ws connect with a revoked credential to be rejected, but it succeeded"),
-            Err(other) => panic!("expected WsError::Rejected{{401, AUTH_REVOKED_DEVICE}}, got {other}"),
+            Ok(_) => panic!(
+                "expected ws connect with a revoked credential to be rejected, but it succeeded"
+            ),
+            Err(other) => {
+                panic!("expected WsError::Rejected{{401, AUTH_REVOKED_DEVICE}}, got {other}")
+            }
         }
     }
 }
@@ -434,16 +478,22 @@ async fn forged_from_and_cross_identity_and_nontarget_reply_rejected() {
     let mut device_link = WsRelayClient::connect(
         &ws_url(addr),
         &device.credential,
-        ClientRole::Device { device_id: device.device_id.clone() },
+        ClientRole::Device {
+            device_id: device.device_id.clone(),
+        },
     )
     .await
     .expect("device connect failed");
     device_link
         .send(RemoteFrame::control(
-            ClientRole::Machine { machine_id: "fake".into() },
+            ClientRole::Machine {
+                machine_id: "fake".into(),
+            },
             "t-forge".into(),
             0,
-            RelayControlMsg::RegisterMachine { machine: machine_descriptor("fake", "Fake Machine") },
+            RelayControlMsg::RegisterMachine {
+                machine: machine_descriptor("fake", "Fake Machine"),
+            },
         ))
         .await;
     let code = recv_error_code(&mut device_link).await;
@@ -457,32 +507,44 @@ async fn forged_from_and_cross_identity_and_nontarget_reply_rejected() {
     let mut m1_link = WsRelayClient::connect(
         &ws_url(addr),
         &m1.credential,
-        ClientRole::Machine { machine_id: m1.device_id.clone() },
+        ClientRole::Machine {
+            machine_id: m1.device_id.clone(),
+        },
     )
     .await
     .expect("m1 connect failed");
     m1_link
         .send(RemoteFrame::control(
-            ClientRole::Machine { machine_id: "m1".into() },
+            ClientRole::Machine {
+                machine_id: "m1".into(),
+            },
             "t-reg-m1".into(),
             0,
-            RelayControlMsg::RegisterMachine { machine: machine_descriptor("m1", "Machine One") },
+            RelayControlMsg::RegisterMachine {
+                machine: machine_descriptor("m1", "Machine One"),
+            },
         ))
         .await;
 
     let mut m2_link = WsRelayClient::connect(
         &ws_url(addr),
         &m2.credential,
-        ClientRole::Machine { machine_id: m2.device_id.clone() },
+        ClientRole::Machine {
+            machine_id: m2.device_id.clone(),
+        },
     )
     .await
     .expect("m2 connect failed");
     m2_link
         .send(RemoteFrame::control(
-            ClientRole::Machine { machine_id: "m1".into() },
+            ClientRole::Machine {
+                machine_id: "m1".into(),
+            },
             "t-cross".into(),
             0,
-            RelayControlMsg::RegisterMachine { machine: machine_descriptor("m1", "Hijacked") },
+            RelayControlMsg::RegisterMachine {
+                machine: machine_descriptor("m1", "Hijacked"),
+            },
         ))
         .await;
     let code = recv_error_code(&mut m2_link).await;
@@ -491,12 +553,16 @@ async fn forged_from_and_cross_identity_and_nontarget_reply_rejected() {
     // --- 非目标机器抢答 AdminReply：device SendCommand 指向 m1，m2 冒充回复 ---
     device_link
         .send(RemoteFrame::control(
-            ClientRole::Device { device_id: device.device_id.clone() },
+            ClientRole::Device {
+                device_id: device.device_id.clone(),
+            },
             "t-cmd".into(),
             0,
             RelayControlMsg::SendCommand {
                 request_id: "r-x".into(),
-                target: CommandTarget::Machine { machine_id: "m1".into() },
+                target: CommandTarget::Machine {
+                    machine_id: "m1".into(),
+                },
                 data: DataEnvelope::plaintext(&"ping").unwrap(),
             },
         ))
@@ -506,7 +572,9 @@ async fn forged_from_and_cross_identity_and_nontarget_reply_rejected() {
 
     m2_link
         .send(RemoteFrame::control(
-            ClientRole::Machine { machine_id: "m1".into() },
+            ClientRole::Machine {
+                machine_id: "m1".into(),
+            },
             "t-nontarget".into(),
             0,
             RelayControlMsg::AdminReply {
@@ -542,7 +610,9 @@ impl std::io::Write for BufWriter {
 /// process-global 的；本测试文件内其它测试不断言日志内容，共用同一个 subscriber
 /// 不影响它们的正确性）。返回捕获 buffer 的共享句柄。
 fn init_log_capture() -> Arc<Mutex<Vec<u8>>> {
-    let buf = LOG_BUF.get_or_init(|| Arc::new(Mutex::new(Vec::new()))).clone();
+    let buf = LOG_BUF
+        .get_or_init(|| Arc::new(Mutex::new(Vec::new())))
+        .clone();
     LOG_INIT.call_once(|| {
         let writer_buf = buf.clone();
         tracing_subscriber::fmt()
@@ -561,22 +631,35 @@ async fn sentinel_token_not_in_logs() {
     const SENTINEL_PAYLOAD: &str = "SENTINEL_PAYLOAD_YYYY";
 
     let (addr, _store, base_url) = setup_server(SENTINEL_BOOTSTRAP).await;
-    let enrolled = enroll(&base_url, SENTINEL_BOOTSTRAP, "sentinel-dev", "device", Some("owner-s")).await;
+    let enrolled = enroll(
+        &base_url,
+        SENTINEL_BOOTSTRAP,
+        "sentinel-dev",
+        "device",
+        Some("owner-s"),
+    )
+    .await;
 
     let mut link = WsRelayClient::connect(
         &ws_url(addr),
         &enrolled.credential,
-        ClientRole::Device { device_id: enrolled.device_id.clone() },
+        ClientRole::Device {
+            device_id: enrolled.device_id.clone(),
+        },
     )
     .await
     .expect("connect failed");
     link.send(RemoteFrame::control(
-        ClientRole::Device { device_id: enrolled.device_id.clone() },
+        ClientRole::Device {
+            device_id: enrolled.device_id.clone(),
+        },
         "t-sentinel".into(),
         0,
         RelayControlMsg::SendCommand {
             request_id: "r-sentinel".into(),
-            target: CommandTarget::Machine { machine_id: "no-such-machine".into() },
+            target: CommandTarget::Machine {
+                machine_id: "no-such-machine".into(),
+            },
             data: DataEnvelope::plaintext(&SENTINEL_PAYLOAD).unwrap(),
         },
     ))
@@ -596,10 +679,22 @@ async fn sentinel_token_not_in_logs() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let captured = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
-    assert!(!captured.is_empty(), "tracing buffer 为空——log capture 未生效，测试无效");
-    assert!(!captured.contains(SENTINEL_BOOTSTRAP), "bootstrap secret leaked into logs");
-    assert!(!captured.contains(SENTINEL_PAYLOAD), "opaque payload leaked into logs");
-    assert!(!captured.contains(&enrolled.credential), "issued credential leaked into logs");
+    assert!(
+        !captured.is_empty(),
+        "tracing buffer 为空——log capture 未生效，测试无效"
+    );
+    assert!(
+        !captured.contains(SENTINEL_BOOTSTRAP),
+        "bootstrap secret leaked into logs"
+    );
+    assert!(
+        !captured.contains(SENTINEL_PAYLOAD),
+        "opaque payload leaked into logs"
+    );
+    assert!(
+        !captured.contains(&enrolled.credential),
+        "issued credential leaked into logs"
+    );
     // 注：`device_id` 会出现在 `info!(device_id, "relay: connection closed")`
     // 里——这是设计上允许的（identifier 而非 secret，R1a 脱敏语义与 Task 2
     // `AuthContext::Bearer` Debug 一致：保留 device_id、脱敏 token），因此本测试
@@ -629,15 +724,22 @@ async fn ws_connect_rejects_wrong_protocol_version() {
     let result = WsRelayClient::connect(
         &bad_url,
         &enrolled.credential,
-        ClientRole::Device { device_id: enrolled.device_id.clone() },
+        ClientRole::Device {
+            device_id: enrolled.device_id.clone(),
+        },
     )
     .await;
     match result {
         Err(WsError::Rejected { status, code }) => {
-            assert_eq!(status, 400, "unsupported protocol version must be rejected with 400");
+            assert_eq!(
+                status, 400,
+                "unsupported protocol version must be rejected with 400"
+            );
             assert_eq!(code.as_deref(), Some(failure::VERSION_UNSUPPORTED));
         }
-        Ok(_) => panic!("expected ws connect with unsupported protocol version to be rejected, but it succeeded"),
+        Ok(_) => panic!(
+            "expected ws connect with unsupported protocol version to be rejected, but it succeeded"
+        ),
         Err(other) => panic!("expected WsError::Rejected{{400, VERSION_UNSUPPORTED}}, got {other}"),
     }
 }
@@ -736,8 +838,14 @@ mod tls_e2e {
 
         // 1) 明文兄弟监听：真实 REST challenge/complete enroll 一个 device 凭据。
         let (_plain_addr, store, base_url) = setup_server("boot-tls").await;
-        let enrolled =
-            enroll(&base_url, "boot-tls", "dev-tls", "device", Some("owner-tls")).await;
+        let enrolled = enroll(
+            &base_url,
+            "boot-tls",
+            "dev-tls",
+            "device",
+            Some("owner-tls"),
+        )
+        .await;
 
         // 2) 用同一个共享 store（已含刚 enroll 的凭据）另起一个 TLS 监听。
         let tls_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

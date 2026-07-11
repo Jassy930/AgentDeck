@@ -118,7 +118,10 @@ fn pending_pairing_admin_is_marked_local_only() {
             .find(|v| v["properties"]["request"]["enum"][0] == tag)
             .unwrap_or_else(|| panic!("missing variant `{tag}`"));
         assert!(
-            variant["properties"].as_object().unwrap().contains_key("scope"),
+            variant["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("scope"),
             "admin variant `{tag}` must carry a local-only `scope` marker"
         );
     }

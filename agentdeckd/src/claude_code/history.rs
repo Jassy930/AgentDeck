@@ -350,8 +350,7 @@ fn is_memory_agent_session(path: &Path) -> bool {
         let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
-        if v
-            .get("content")
+        if v.get("content")
             .and_then(Value::as_str)
             .map(is_memory_agent_prompt)
             .unwrap_or(false)
@@ -381,8 +380,7 @@ fn is_memory_agent_project_path(path: &Path) -> bool {
 
 fn is_memory_agent_prompt(prompt: &str) -> bool {
     let normalized = prompt.trim_start().to_ascii_lowercase();
-    normalized.starts_with("hello memory agent")
-        || normalized.starts_with("you are a claude-mem")
+    normalized.starts_with("hello memory agent") || normalized.starts_with("you are a claude-mem")
 }
 
 /// List history (async wrapper). Spawning is sync-blocking on the
@@ -1093,7 +1091,10 @@ mod tests {
         )
         .unwrap();
         let newest = std::time::SystemTime::now() + std::time::Duration::from_secs(180);
-        std::fs::File::open(&claude_mem).unwrap().set_modified(newest).unwrap();
+        std::fs::File::open(&claude_mem)
+            .unwrap()
+            .set_modified(newest)
+            .unwrap();
 
         let memory = project.join("00000000-0000-0000-0000-000000000200.jsonl");
         std::fs::write(
@@ -1114,7 +1115,10 @@ mod tests {
         )
         .unwrap();
         let older = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-        std::fs::File::open(&normal).unwrap().set_modified(older).unwrap();
+        std::fs::File::open(&normal)
+            .unwrap()
+            .set_modified(older)
+            .unwrap();
 
         let items = list_history_from_jsonl_root(&root, None, 1).unwrap();
         assert_eq!(items.len(), 1);
@@ -1152,7 +1156,10 @@ mod tests {
         )
         .unwrap();
         let older = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-        std::fs::File::open(&normal).unwrap().set_modified(older).unwrap();
+        std::fs::File::open(&normal)
+            .unwrap()
+            .set_modified(older)
+            .unwrap();
 
         let items = list_history_from_jsonl_root(&root, None, 1).unwrap();
         assert_eq!(items.len(), 1);
@@ -1180,14 +1187,20 @@ mod tests {
         )
         .unwrap();
         let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-        std::fs::File::open(&newest).unwrap().set_modified(future).unwrap();
+        std::fs::File::open(&newest)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
 
         let stale_fifo = project.join("00000000-0000-0000-0000-000000000001.jsonl");
         let status = std::process::Command::new("mkfifo")
             .arg(&stale_fifo)
             .status()
             .unwrap();
-        assert!(status.success(), "mkfifo should create a blocking stale candidate");
+        assert!(
+            status.success(),
+            "mkfifo should create a blocking stale candidate"
+        );
 
         let root_for_thread = root.clone();
         let (tx, rx) = mpsc::channel();

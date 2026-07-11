@@ -1,11 +1,11 @@
 // agentdeck-relay/src/router.rs
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use agentdeck_protocol::remote::{
-    failure, ClientRole, CommandTarget, MachineDescriptor, RelayControlMsg, RemoteFrame,
-    SessionDescriptor, SubTarget,
+    ClientRole, CommandTarget, MachineDescriptor, RelayControlMsg, RemoteFrame, SessionDescriptor,
+    SubTarget, failure,
 };
 use tokio::sync::mpsc;
 
@@ -75,17 +75,32 @@ pub struct ConnIdentity {
 }
 
 enum CoreMsg {
-    Connect { id: ClientId, identity: ConnIdentity, out: mpsc::Sender<RemoteFrame> },
-    Frame { id: ClientId, frame: RemoteFrame },
-    Disconnect { id: ClientId },
+    Connect {
+        id: ClientId,
+        identity: ConnIdentity,
+        out: mpsc::Sender<RemoteFrame>,
+    },
+    Frame {
+        id: ClientId,
+        frame: RemoteFrame,
+    },
+    Disconnect {
+        id: ClientId,
+    },
     /// 撤销一个设备/机器身份：断开所有 `identity.device_id == device_id` 的活连接。
-    Revoke { device_id: String },
+    Revoke {
+        device_id: String,
+    },
     /// Task 8：由独立心跳任务周期性发送，驱动 `req_origin` 的 TTL 清扫（防长驻
     /// 进程因 `SendCommand` 从未收到回复而无限累积登记）。
-    SweepReqOrigin { now_ms: i64 },
+    SweepReqOrigin {
+        now_ms: i64,
+    },
     /// Task 8 测试专用：白盒探测 `req_origin` 当前条目数，验证清扫生效。
     #[cfg(test)]
-    ProbeReqOrigin { reply: tokio::sync::oneshot::Sender<usize> },
+    ProbeReqOrigin {
+        reply: tokio::sync::oneshot::Sender<usize>,
+    },
 }
 
 /// 内存内容不可见转发器（有状态）。
@@ -99,9 +114,7 @@ impl FakeRelay {
     /// `SqliteRelayStore`（进程退出即丢弃，不落盘）。签名不变——现有 15+ 调用点
     /// 无需改动。
     pub fn start() -> Self {
-        Self::start_with_store(
-            SqliteRelayStore::open_in_memory().expect("in-memory sqlite open"),
-        )
+        Self::start_with_store(SqliteRelayStore::open_in_memory().expect("in-memory sqlite open"))
     }
 
     /// Task 4：携带一个已打开的 `SqliteRelayStore`（落盘文件或 in-memory）启动
@@ -116,7 +129,10 @@ impl FakeRelay {
     /// Task 8：test-friendly 构造——可注入短 `req_origin_ttl_ms` 以便测试快速
     /// 验证 TTL 清扫，无需等待默认 5 分钟。签名不变（现有调用点无需改动）——
     /// 委托 `start_with_all` 用默认 `conv_buffer_cap`。
-    pub(crate) fn start_with_store_and_ttl(store: SqliteRelayStore, req_origin_ttl_ms: i64) -> Self {
+    pub(crate) fn start_with_store_and_ttl(
+        store: SqliteRelayStore,
+        req_origin_ttl_ms: i64,
+    ) -> Self {
         Self::start_with_all(store, req_origin_ttl_ms, DEFAULT_CONV_BUFFER_CAP)
     }
 
@@ -132,7 +148,9 @@ impl FakeRelay {
         conv_buffer_cap: usize,
     ) -> Self {
         let (core_tx, core_rx) = mpsc::channel::<CoreMsg>(256);
-        tokio::spawn(Core::new_with_ttl_and_cap(store, req_origin_ttl_ms, conv_buffer_cap).run(core_rx));
+        tokio::spawn(
+            Core::new_with_ttl_and_cap(store, req_origin_ttl_ms, conv_buffer_cap).run(core_rx),
+        );
 
         let sweep_tx = core_tx.clone();
         let period_ms = (req_origin_ttl_ms / 2).max(1000) as u64;
@@ -141,20 +159,30 @@ impl FakeRelay {
             loop {
                 ticker.tick().await;
                 let now = now_ms();
-                if sweep_tx.send(CoreMsg::SweepReqOrigin { now_ms: now }).await.is_err() {
+                if sweep_tx
+                    .send(CoreMsg::SweepReqOrigin { now_ms: now })
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
         });
 
-        FakeRelay { core_tx, next_id: Arc::new(AtomicU64::new(1)) }
+        FakeRelay {
+            core_tx,
+            next_id: Arc::new(AtomicU64::new(1)),
+        }
     }
 
     /// Task 8 测试专用：白盒探测 `req_origin` 当前条目数。
     #[cfg(test)]
     pub(crate) async fn probe_req_origin_len(&self) -> usize {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.core_tx.send(CoreMsg::ProbeReqOrigin { reply: tx }).await;
+        let _ = self
+            .core_tx
+            .send(CoreMsg::ProbeReqOrigin { reply: tx })
+            .await;
         rx.await.unwrap_or(0)
     }
 
@@ -168,7 +196,9 @@ impl FakeRelay {
                 ClientRole::Relay => "relay".into(),
             },
             role: match &role {
-                ClientRole::Machine { machine_id } => ConnRole::Machine { machine_id: machine_id.clone() },
+                ClientRole::Machine { machine_id } => ConnRole::Machine {
+                    machine_id: machine_id.clone(),
+                },
                 _ => ConnRole::Device,
             },
         };
@@ -182,7 +212,11 @@ impl FakeRelay {
         let (from_relay_tx, from_relay_rx) = mpsc::channel::<RemoteFrame>(64);
         let _ = self
             .core_tx
-            .send(CoreMsg::Connect { id, identity, out: from_relay_tx })
+            .send(CoreMsg::Connect {
+                id,
+                identity,
+                out: from_relay_tx,
+            })
             .await;
         let core_tx = self.core_tx.clone();
         tokio::spawn(async move {
@@ -193,7 +227,10 @@ impl FakeRelay {
             }
             let _ = core_tx.send(CoreMsg::Disconnect { id }).await;
         });
-        RelayClient { tx: to_relay_tx, rx: from_relay_rx }
+        RelayClient {
+            tx: to_relay_tx,
+            rx: from_relay_rx,
+        }
     }
 
     /// 撤销一个设备/机器身份（Task 9 server 收到 `RelayStore` 的 revoked 事件时调用）：
@@ -315,7 +352,14 @@ impl Core {
         while let Some(msg) = rx.recv().await {
             match msg {
                 CoreMsg::Connect { id, identity, out } => {
-                    self.conns.insert(id, Conn { identity, out, lagged: false });
+                    self.conns.insert(
+                        id,
+                        Conn {
+                            identity,
+                            out,
+                            lagged: false,
+                        },
+                    );
                 }
                 CoreMsg::Disconnect { id } => {
                     self.handle_disconnect(id).await;
@@ -389,7 +433,10 @@ impl Core {
     }
 
     fn machine_list(&self) -> Vec<MachineDescriptor> {
-        self.machines.values().map(|m| m.descriptor.clone()).collect()
+        self.machines
+            .values()
+            .map(|m| m.descriptor.clone())
+            .collect()
     }
 
     /// 取连接当前身份的 owned 克隆（借用干净：结束对 `self.conns` 的借用后，
@@ -410,7 +457,11 @@ impl Core {
         self.send_to(
             id,
             trace_id,
-            RelayControlMsg::Error { code: code.into(), message: message.into(), in_reply_to },
+            RelayControlMsg::Error {
+                code: code.into(),
+                message: message.into(),
+                in_reply_to,
+            },
         )
         .await;
     }
@@ -454,20 +505,34 @@ impl Core {
                 let mid = machine.machine_id.clone();
                 self.machines.insert(
                     mid,
-                    MachineEntry { conn: id, descriptor: machine, account_id: identity.account_id },
+                    MachineEntry {
+                        conn: id,
+                        descriptor: machine,
+                        account_id: identity.account_id,
+                    },
                 );
                 let list = self.machine_list();
                 for dev in self.subs_machines.clone() {
-                    self.send_to(dev, &trace, RelayControlMsg::MachineList { machines: list.clone() }).await;
+                    self.send_to(
+                        dev,
+                        &trace,
+                        RelayControlMsg::MachineList {
+                            machines: list.clone(),
+                        },
+                    )
+                    .await;
                 }
             }
             RelayControlMsg::ConnectDevice { .. } => {
                 // R0：设备描述暂不持久化；连接已在 Connect 建立。
             }
-            RelayControlMsg::Subscribe { target: SubTarget::Machines } => {
+            RelayControlMsg::Subscribe {
+                target: SubTarget::Machines,
+            } => {
                 self.subs_machines.insert(id);
                 let list = self.machine_list();
-                self.send_to(id, &trace, RelayControlMsg::MachineList { machines: list }).await;
+                self.send_to(id, &trace, RelayControlMsg::MachineList { machines: list })
+                    .await;
             }
             RelayControlMsg::AnnounceSession { session } => {
                 let identity = match self.identity_of(id) {
@@ -489,19 +554,31 @@ impl Core {
                     return;
                 }
                 let mid = session.machine_id.clone();
-                self.conv_machine.insert(session.conversation_id.clone(), mid.clone());
+                self.conv_machine
+                    .insert(session.conversation_id.clone(), mid.clone());
                 let list_mut = self.sessions.entry(mid.clone()).or_default();
                 // 按 conversation_id upsert：同一 machine 重启后重新
                 // AnnounceSession 同一会话时覆盖既有条目，而不是无条件 push
                 // 造成 SessionList 重复展示（R1a 遗留 bug）。
-                match list_mut.iter().position(|s| s.conversation_id == session.conversation_id) {
+                match list_mut
+                    .iter()
+                    .position(|s| s.conversation_id == session.conversation_id)
+                {
                     Some(i) => list_mut[i] = session,
                     None => list_mut.push(session),
                 }
                 let list = self.sessions.get(&mid).cloned().unwrap_or_default();
                 if let Some(devs) = self.subs_sessions.get(&mid) {
                     for dev in devs.clone() {
-                        self.send_to(dev, &trace, RelayControlMsg::SessionList { machine_id: mid.clone(), sessions: list.clone() }).await;
+                        self.send_to(
+                            dev,
+                            &trace,
+                            RelayControlMsg::SessionList {
+                                machine_id: mid.clone(),
+                                sessions: list.clone(),
+                            },
+                        )
+                        .await;
                     }
                 }
             }
@@ -524,7 +601,12 @@ impl Core {
                 }
                 self.conv_machine.remove(&conversation_id);
             }
-            RelayControlMsg::PublishEvent { conversation_id, turn_session_id, seq: _, data } => {
+            RelayControlMsg::PublishEvent {
+                conversation_id,
+                turn_session_id,
+                seq: _,
+                data,
+            } => {
                 let identity = match self.identity_of(id) {
                     Some(i) => i,
                     None => return,
@@ -570,7 +652,8 @@ impl Core {
                         return;
                     }
                 };
-                self.turn_conv.insert(turn_session_id.clone(), conversation_id.clone());
+                self.turn_conv
+                    .insert(turn_session_id.clone(), conversation_id.clone());
                 // R1b whole-branch review fix：记录该 conversation 的最新持久化
                 // seq，供 `Subscribe{Events, since_seq}` gap 判定使用（见
                 // `conv_highest_seq` 字段注释）。
@@ -595,7 +678,9 @@ impl Core {
                     }
                 }
             }
-            RelayControlMsg::Subscribe { target: SubTarget::Sessions { machine_id } } => {
+            RelayControlMsg::Subscribe {
+                target: SubTarget::Sessions { machine_id },
+            } => {
                 let my_account = self.conns.get(&id).map(|c| c.identity.account_id.clone());
                 let target_account = self.machines.get(&machine_id).map(|m| m.account_id.clone());
                 // target_account 为 None（machine 未注册）时 fail-open：R1a 单账户下无法区分「跨账户」与「目标未注册」。
@@ -606,7 +691,9 @@ impl Core {
                             &trace,
                             RelayControlMsg::Error {
                                 code: failure::AUTH_FORBIDDEN.into(),
-                                message: format!("machine {machine_id} belongs to a different account"),
+                                message: format!(
+                                    "machine {machine_id} belongs to a different account"
+                                ),
                                 in_reply_to: None,
                             },
                         )
@@ -614,11 +701,28 @@ impl Core {
                         return;
                     }
                 }
-                self.subs_sessions.entry(machine_id.clone()).or_default().insert(id);
+                self.subs_sessions
+                    .entry(machine_id.clone())
+                    .or_default()
+                    .insert(id);
                 let list = self.sessions.get(&machine_id).cloned().unwrap_or_default();
-                self.send_to(id, &trace, RelayControlMsg::SessionList { machine_id, sessions: list }).await;
+                self.send_to(
+                    id,
+                    &trace,
+                    RelayControlMsg::SessionList {
+                        machine_id,
+                        sessions: list,
+                    },
+                )
+                .await;
             }
-            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id, since_seq } } => {
+            RelayControlMsg::Subscribe {
+                target:
+                    SubTarget::Events {
+                        conversation_id,
+                        since_seq,
+                    },
+            } => {
                 let my_account = self.conns.get(&id).map(|c| c.identity.account_id.clone());
                 let target_account = self
                     .conv_machine
@@ -662,7 +766,10 @@ impl Core {
                 // `highest_seq` 且 buffer 不再覆盖时，才是真正不可恢复的 gap。
                 match since_seq {
                     None => {
-                        self.subs_events.entry(conversation_id.clone()).or_default().insert(id);
+                        self.subs_events
+                            .entry(conversation_id.clone())
+                            .or_default()
+                            .insert(id);
                         if let Some(buf) = self.conv_buffer.get(&conversation_id).cloned() {
                             for ev in buf {
                                 self.send_to(id, &trace, ev).await;
@@ -679,7 +786,10 @@ impl Core {
                             // 从未 publish 过（无历史可漏）或 n 已达到/超过最新
                             // seq（客户端已收到全部历史）——只注册订阅，无需
                             // 回放，也不是 gap。
-                            self.subs_events.entry(conversation_id.clone()).or_default().insert(id);
+                            self.subs_events
+                                .entry(conversation_id.clone())
+                                .or_default()
+                                .insert(id);
                             return;
                         }
                         let buf = self.conv_buffer.get(&conversation_id).cloned();
@@ -687,9 +797,14 @@ impl Core {
                             buf.as_ref().and_then(|b| b.first()).and_then(event_seq);
                         match oldest_seq_in_buffer {
                             Some(oldest) if oldest <= n + 1 => {
-                                self.subs_events.entry(conversation_id.clone()).or_default().insert(id);
+                                self.subs_events
+                                    .entry(conversation_id.clone())
+                                    .or_default()
+                                    .insert(id);
                                 if let Some(buf) = buf {
-                                    for ev in buf.iter().filter(|ev| event_seq(ev).is_some_and(|s| s > n)) {
+                                    for ev in
+                                        buf.iter().filter(|ev| event_seq(ev).is_some_and(|s| s > n))
+                                    {
                                         self.send_to(id, &trace, ev.clone()).await;
                                     }
                                 }
@@ -712,7 +827,10 @@ impl Core {
                 }
             }
             RelayControlMsg::Heartbeat { .. } => {}
-            RelayControlMsg::Ack { up_to_seq, conversation_id } => {
+            RelayControlMsg::Ack {
+                up_to_seq,
+                conversation_id,
+            } => {
                 // 鉴权：Ack 发起方是订阅方（Device），不是 conversation 的
                 // owner（machine）——检查该连接确实订阅了该 conversation，
                 // 未订阅却发 Ack 静默丢弃（不 send Error，避免为无意义的乱序
@@ -735,7 +853,11 @@ impl Core {
                 // min-acked：该 conversation 当前所有订阅连接里 acked_seq 的最小
                 // 值（未 ack 过的连接按 0 计）——防止裁掉某个慢连接尚未看到的
                 // 事件。
-                let subs = self.subs_events.get(&conversation_id).cloned().unwrap_or_default();
+                let subs = self
+                    .subs_events
+                    .get(&conversation_id)
+                    .cloned()
+                    .unwrap_or_default();
                 let min_acked = subs
                     .iter()
                     .map(|conn_id| {
@@ -761,18 +883,26 @@ impl Core {
                 let store = self.store.clone();
                 let conv = conversation_id.clone();
                 tokio::spawn(async move {
-                    match tokio::task::spawn_blocking(move || store.record_ack(&conv, up_to_seq)).await {
+                    match tokio::task::spawn_blocking(move || store.record_ack(&conv, up_to_seq))
+                        .await
+                    {
                         Ok(Ok(())) => {}
                         Ok(Err(err)) => {
                             eprintln!("agentdeck-relay: record_ack failed: {err:?}");
                         }
                         Err(join_err) => {
-                            eprintln!("agentdeck-relay: record_ack spawn_blocking join failed: {join_err:?}");
+                            eprintln!(
+                                "agentdeck-relay: record_ack spawn_blocking join failed: {join_err:?}"
+                            );
                         }
                     }
                 });
             }
-            RelayControlMsg::SendCommand { request_id, target, data } => {
+            RelayControlMsg::SendCommand {
+                request_id,
+                target,
+                data,
+            } => {
                 let machine_id = match &target {
                     CommandTarget::Machine { machine_id } => Some(machine_id.clone()),
                     CommandTarget::Conversation { conversation_id } => {
@@ -785,8 +915,10 @@ impl Core {
                         .cloned(),
                 };
                 let my_account = self.conns.get(&id).map(|c| c.identity.account_id.clone());
-                let target_account =
-                    machine_id.as_ref().and_then(|m| self.machines.get(m)).map(|e| e.account_id.clone());
+                let target_account = machine_id
+                    .as_ref()
+                    .and_then(|m| self.machines.get(m))
+                    .map(|e| e.account_id.clone());
                 if let (Some(mine), Some(theirs)) = (&my_account, &target_account) {
                     if mine != theirs {
                         self.send_to(
@@ -827,7 +959,8 @@ impl Core {
                             },
                         )
                         .await;
-                        self.send_to(id, &trace, RelayControlMsg::CommandDelivered { request_id }).await;
+                        self.send_to(id, &trace, RelayControlMsg::CommandDelivered { request_id })
+                            .await;
                     }
                     None => {
                         self.send_to(
@@ -853,7 +986,10 @@ impl Core {
                         self.send_to(
                             req.origin,
                             &trace,
-                            RelayControlMsg::AdminReply { in_reply_to: in_reply_to.clone(), data },
+                            RelayControlMsg::AdminReply {
+                                in_reply_to: in_reply_to.clone(),
+                                data,
+                            },
                         )
                         .await;
                         self.req_origin.remove(&in_reply_to);
@@ -903,7 +1039,14 @@ impl Core {
         if !self.machines.is_empty() || !self.subs_machines.is_empty() {
             let list = self.machine_list();
             for dev in self.subs_machines.clone() {
-                self.send_to(dev, "disconnect", RelayControlMsg::MachineList { machines: list.clone() }).await;
+                self.send_to(
+                    dev,
+                    "disconnect",
+                    RelayControlMsg::MachineList {
+                        machines: list.clone(),
+                    },
+                )
+                .await;
             }
         }
     }
@@ -929,21 +1072,57 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             let relay = FakeRelay::start();
             // D_slow 订阅 machines 但从不 recv（模拟慢/卡死连接）
-            let _d_slow = relay.connect(ClientRole::Device { device_id: "slow".into() }).await;
-            _d_slow.send(frame(ClientRole::Device { device_id: "slow".into() },
-                RelayControlMsg::Subscribe { target: SubTarget::Machines })).await;
+            let _d_slow = relay
+                .connect(ClientRole::Device {
+                    device_id: "slow".into(),
+                })
+                .await;
+            _d_slow
+                .send(frame(
+                    ClientRole::Device {
+                        device_id: "slow".into(),
+                    },
+                    RelayControlMsg::Subscribe {
+                        target: SubTarget::Machines,
+                    },
+                ))
+                .await;
             // 灌满 D_slow 的出站队列（>64）：注册很多机器触发广播
             for i in 0..200 {
-                let m = relay.connect(ClientRole::Machine { machine_id: format!("M{i}") }).await;
-                m.send(frame(ClientRole::Machine { machine_id: format!("M{i}") },
-                    RelayControlMsg::RegisterMachine { machine: machine(&format!("M{i}")) })).await;
+                let m = relay
+                    .connect(ClientRole::Machine {
+                        machine_id: format!("M{i}"),
+                    })
+                    .await;
+                m.send(frame(
+                    ClientRole::Machine {
+                        machine_id: format!("M{i}"),
+                    },
+                    RelayControlMsg::RegisterMachine {
+                        machine: machine(&format!("M{i}")),
+                    },
+                ))
+                .await;
             }
             // 新 device 订阅仍能及时拿到快照（Core 未被 D_slow 卡死）
-            let mut d = relay.connect(ClientRole::Device { device_id: "fast".into() }).await;
-            d.send(frame(ClientRole::Device { device_id: "fast".into() },
-                RelayControlMsg::Subscribe { target: SubTarget::Machines })).await;
-            let got = tokio::time::timeout(std::time::Duration::from_secs(5), d.recv()).await
-                .expect("Core 被慢连接阻塞了（HOL）").expect("frame");
+            let mut d = relay
+                .connect(ClientRole::Device {
+                    device_id: "fast".into(),
+                })
+                .await;
+            d.send(frame(
+                ClientRole::Device {
+                    device_id: "fast".into(),
+                },
+                RelayControlMsg::Subscribe {
+                    target: SubTarget::Machines,
+                },
+            ))
+            .await;
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), d.recv())
+                .await
+                .expect("Core 被慢连接阻塞了（HOL）")
+                .expect("frame");
             assert!(matches!(got.msg, RelayControlMsg::MachineList { .. }));
         })
         .await
@@ -959,23 +1138,46 @@ mod tests {
         let relay = FakeRelay::start();
 
         // machine 接入并注册
-        let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
+        let m = relay
+            .connect(ClientRole::Machine {
+                machine_id: "M1".into(),
+            })
+            .await;
         m.send(frame(
-            ClientRole::Machine { machine_id: "M1".into() },
-            RelayControlMsg::RegisterMachine { machine: machine("M1") },
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M1"),
+            },
         ))
         .await;
 
         // device 接入并订阅机器列表
-        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        let mut d = relay
+            .connect(ClientRole::Device {
+                device_id: "D1".into(),
+            })
+            .await;
         d.send(frame(
-            ClientRole::Device { device_id: "D1".into() },
-            RelayControlMsg::ConnectDevice { device: DeviceDescriptor { device_id: "D1".into(), kind: DeviceKind::Cli } },
+            ClientRole::Device {
+                device_id: "D1".into(),
+            },
+            RelayControlMsg::ConnectDevice {
+                device: DeviceDescriptor {
+                    device_id: "D1".into(),
+                    kind: DeviceKind::Cli,
+                },
+            },
         ))
         .await;
         d.send(frame(
-            ClientRole::Device { device_id: "D1".into() },
-            RelayControlMsg::Subscribe { target: SubTarget::Machines },
+            ClientRole::Device {
+                device_id: "D1".into(),
+            },
+            RelayControlMsg::Subscribe {
+                target: SubTarget::Machines,
+            },
         ))
         .await;
 
@@ -1005,7 +1207,9 @@ mod tests {
     // 从 machine 发一条 PublishEvent（payload 用一个字符串占位内层字节）
     async fn publish(m: &RelayClient, conv: &str, turn: &str) {
         m.send(frame(
-            ClientRole::Machine { machine_id: "M1".into() },
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
             RelayControlMsg::PublishEvent {
                 conversation_id: conv.into(),
                 turn_session_id: turn.into(),
@@ -1019,23 +1223,46 @@ mod tests {
     #[tokio::test]
     async fn events_keyed_on_conversation_survive_new_turn_and_replay_for_late_subscriber() {
         let relay = FakeRelay::start();
-        let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
+        let m = relay
+            .connect(ClientRole::Machine {
+                machine_id: "M1".into(),
+            })
+            .await;
         m.send(frame(
-            ClientRole::Machine { machine_id: "M1".into() },
-            RelayControlMsg::RegisterMachine { machine: machine("M1") },
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M1"),
+            },
         ))
         .await;
         m.send(frame(
-            ClientRole::Machine { machine_id: "M1".into() },
-            RelayControlMsg::AnnounceSession { session: session("C1", "M1") },
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::AnnounceSession {
+                session: session("C1", "M1"),
+            },
         ))
         .await;
 
         // device 订阅 conversation C1
-        let mut d1 = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        let mut d1 = relay
+            .connect(ClientRole::Device {
+                device_id: "D1".into(),
+            })
+            .await;
         d1.send(frame(
-            ClientRole::Device { device_id: "D1".into() },
-            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: None } },
+            ClientRole::Device {
+                device_id: "D1".into(),
+            },
+            RelayControlMsg::Subscribe {
+                target: SubTarget::Events {
+                    conversation_id: "C1".into(),
+                    since_seq: None,
+                },
+            },
         ))
         .await;
 
@@ -1050,10 +1277,21 @@ mod tests {
         assert_eq!(e1, ("C1".to_string(), "S2".to_string(), 1));
 
         // 晚订阅的 D2 应补拉到已缓冲的两条
-        let mut d2 = relay.connect(ClientRole::Device { device_id: "D2".into() }).await;
+        let mut d2 = relay
+            .connect(ClientRole::Device {
+                device_id: "D2".into(),
+            })
+            .await;
         d2.send(frame(
-            ClientRole::Device { device_id: "D2".into() },
-            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: None } },
+            ClientRole::Device {
+                device_id: "D2".into(),
+            },
+            RelayControlMsg::Subscribe {
+                target: SubTarget::Events {
+                    conversation_id: "C1".into(),
+                    since_seq: None,
+                },
+            },
         ))
         .await;
         let r0 = recv_event(&mut d2).await;
@@ -1064,15 +1302,19 @@ mod tests {
 
     async fn recv_event(c: &mut RelayClient) -> (String, String, u64) {
         loop {
-            let frame = match tokio::time::timeout(std::time::Duration::from_secs(5), c.recv()).await {
-                Ok(Some(frame)) => frame,
-                Ok(None) => panic!("timed out waiting for Event frame: stream closed"),
-                Err(_) => panic!("timed out waiting for Event frame"),
-            };
+            let frame =
+                match tokio::time::timeout(std::time::Duration::from_secs(5), c.recv()).await {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => panic!("timed out waiting for Event frame: stream closed"),
+                    Err(_) => panic!("timed out waiting for Event frame"),
+                };
             match frame.msg {
-                RelayControlMsg::Event { conversation_id, turn_session_id, seq, .. } => {
-                    return (conversation_id, turn_session_id, seq)
-                }
+                RelayControlMsg::Event {
+                    conversation_id,
+                    turn_session_id,
+                    seq,
+                    ..
+                } => return (conversation_id, turn_session_id, seq),
                 _ => continue,
             }
         }
@@ -1090,11 +1332,29 @@ mod tests {
         {
             let store = crate::SqliteRelayStore::open(&path).unwrap();
             let relay = FakeRelay::start_with_store(store);
-            let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
-            m.send(frame(ClientRole::Machine { machine_id: "M1".into() },
-                RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
-            m.send(frame(ClientRole::Machine { machine_id: "M1".into() },
-                RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+            let m = relay
+                .connect(ClientRole::Machine {
+                    machine_id: "M1".into(),
+                })
+                .await;
+            m.send(frame(
+                ClientRole::Machine {
+                    machine_id: "M1".into(),
+                },
+                RelayControlMsg::RegisterMachine {
+                    machine: machine("M1"),
+                },
+            ))
+            .await;
+            m.send(frame(
+                ClientRole::Machine {
+                    machine_id: "M1".into(),
+                },
+                RelayControlMsg::AnnounceSession {
+                    session: session("C1", "M1"),
+                },
+            ))
+            .await;
             publish(&m, "C1", "S1").await;
             publish(&m, "C1", "S2").await;
             // 给持久化 spawn_blocking 一点时间落盘（无直接回执可等时用短 sleep）
@@ -1105,14 +1365,46 @@ mod tests {
         {
             let store = crate::SqliteRelayStore::open(&path).unwrap();
             let relay = FakeRelay::start_with_store(store);
-            let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
-            m.send(frame(ClientRole::Machine { machine_id: "M1".into() },
-                RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
-            m.send(frame(ClientRole::Machine { machine_id: "M1".into() },
-                RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
-            let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
-            d.send(frame(ClientRole::Device { device_id: "D1".into() },
-                RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: None } })).await;
+            let m = relay
+                .connect(ClientRole::Machine {
+                    machine_id: "M1".into(),
+                })
+                .await;
+            m.send(frame(
+                ClientRole::Machine {
+                    machine_id: "M1".into(),
+                },
+                RelayControlMsg::RegisterMachine {
+                    machine: machine("M1"),
+                },
+            ))
+            .await;
+            m.send(frame(
+                ClientRole::Machine {
+                    machine_id: "M1".into(),
+                },
+                RelayControlMsg::AnnounceSession {
+                    session: session("C1", "M1"),
+                },
+            ))
+            .await;
+            let mut d = relay
+                .connect(ClientRole::Device {
+                    device_id: "D1".into(),
+                })
+                .await;
+            d.send(frame(
+                ClientRole::Device {
+                    device_id: "D1".into(),
+                },
+                RelayControlMsg::Subscribe {
+                    target: SubTarget::Events {
+                        conversation_id: "C1".into(),
+                        since_seq: None,
+                    },
+                },
+            ))
+            .await;
             publish(&m, "C1", "S3").await;
             let (_, _, seq) = recv_event(&mut d).await;
             assert_eq!(seq, 2, "重启后 seq 必须从持久化高水位延续，不回退");
@@ -1124,20 +1416,36 @@ mod tests {
     #[tokio::test]
     async fn send_command_routes_to_machine_and_admin_reply_returns_to_origin_device() {
         let relay = FakeRelay::start();
-        let mut m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
+        let mut m = relay
+            .connect(ClientRole::Machine {
+                machine_id: "M1".into(),
+            })
+            .await;
         m.send(frame(
-            ClientRole::Machine { machine_id: "M1".into() },
-            RelayControlMsg::RegisterMachine { machine: machine("M1") },
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M1"),
+            },
         ))
         .await;
 
-        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        let mut d = relay
+            .connect(ClientRole::Device {
+                device_id: "D1".into(),
+            })
+            .await;
         // device → machine 的机器级命令（内层用占位字符串，relay 不解码）
         d.send(frame(
-            ClientRole::Device { device_id: "D1".into() },
+            ClientRole::Device {
+                device_id: "D1".into(),
+            },
             RelayControlMsg::SendCommand {
                 request_id: "r1".into(),
-                target: CommandTarget::Machine { machine_id: "M1".into() },
+                target: CommandTarget::Machine {
+                    machine_id: "M1".into(),
+                },
                 data: DataEnvelope::plaintext(&"ping-cmd").unwrap(),
             },
         ))
@@ -1149,18 +1457,24 @@ mod tests {
 
         // machine 回 AdminReply
         m.send(frame(
-            ClientRole::Machine { machine_id: "M1".into() },
-            RelayControlMsg::AdminReply { in_reply_to: "r1".into(), data: DataEnvelope::plaintext(&"pong").unwrap() },
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::AdminReply {
+                in_reply_to: "r1".into(),
+                data: DataEnvelope::plaintext(&"pong").unwrap(),
+            },
         ))
         .await;
 
         // 发起 device 应收到该 AdminReply
         loop {
-            let frame = match tokio::time::timeout(std::time::Duration::from_secs(5), d.recv()).await {
-                Ok(Some(frame)) => frame,
-                Ok(None) => panic!("timed out waiting for AdminReply frame: stream closed"),
-                Err(_) => panic!("timed out waiting for AdminReply frame"),
-            };
+            let frame =
+                match tokio::time::timeout(std::time::Duration::from_secs(5), d.recv()).await {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => panic!("timed out waiting for AdminReply frame: stream closed"),
+                    Err(_) => panic!("timed out waiting for AdminReply frame"),
+                };
             match frame.msg {
                 RelayControlMsg::AdminReply { in_reply_to, data } => {
                     assert_eq!(in_reply_to, "r1");
@@ -1189,19 +1503,35 @@ mod tests {
         let store = SqliteRelayStore::open_in_memory().expect("in-memory sqlite open");
         let relay = FakeRelay::start_with_store_and_ttl(store, 200);
 
-        let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
+        let m = relay
+            .connect(ClientRole::Machine {
+                machine_id: "M1".into(),
+            })
+            .await;
         m.send(frame(
-            ClientRole::Machine { machine_id: "M1".into() },
-            RelayControlMsg::RegisterMachine { machine: machine("M1") },
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M1"),
+            },
         ))
         .await;
 
-        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        let mut d = relay
+            .connect(ClientRole::Device {
+                device_id: "D1".into(),
+            })
+            .await;
         d.send(frame(
-            ClientRole::Device { device_id: "D1".into() },
+            ClientRole::Device {
+                device_id: "D1".into(),
+            },
             RelayControlMsg::SendCommand {
                 request_id: "r1".into(),
-                target: CommandTarget::Machine { machine_id: "M1".into() },
+                target: CommandTarget::Machine {
+                    machine_id: "M1".into(),
+                },
                 data: DataEnvelope::plaintext(&"x").unwrap(),
             },
         ))
@@ -1238,11 +1568,12 @@ mod tests {
 
     async fn recv_send_command(c: &mut RelayClient) -> String {
         loop {
-            let frame = match tokio::time::timeout(std::time::Duration::from_secs(5), c.recv()).await {
-                Ok(Some(frame)) => frame,
-                Ok(None) => panic!("timed out waiting for SendCommand frame: stream closed"),
-                Err(_) => panic!("timed out waiting for SendCommand frame"),
-            };
+            let frame =
+                match tokio::time::timeout(std::time::Duration::from_secs(5), c.recv()).await {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => panic!("timed out waiting for SendCommand frame: stream closed"),
+                    Err(_) => panic!("timed out waiting for SendCommand frame"),
+                };
             match frame.msg {
                 RelayControlMsg::SendCommand { request_id, .. } => return request_id,
                 _ => continue,
@@ -1253,12 +1584,20 @@ mod tests {
     #[tokio::test]
     async fn unknown_conversation_command_returns_not_found_error() {
         let relay = FakeRelay::start();
-        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        let mut d = relay
+            .connect(ClientRole::Device {
+                device_id: "D1".into(),
+            })
+            .await;
         d.send(frame(
-            ClientRole::Device { device_id: "D1".into() },
+            ClientRole::Device {
+                device_id: "D1".into(),
+            },
             RelayControlMsg::SendCommand {
                 request_id: "r9".into(),
-                target: CommandTarget::Conversation { conversation_id: "NOPE".into() },
+                target: CommandTarget::Conversation {
+                    conversation_id: "NOPE".into(),
+                },
                 data: DataEnvelope::plaintext(&"x").unwrap(),
             },
         ))
@@ -1269,7 +1608,9 @@ mod tests {
             .expect("frame")
             .msg
         {
-            RelayControlMsg::Error { code, in_reply_to, .. } => {
+            RelayControlMsg::Error {
+                code, in_reply_to, ..
+            } => {
                 assert_eq!(code, "remote.session.not_found");
                 assert_eq!(in_reply_to.as_deref(), Some("r9"));
             }
@@ -1280,39 +1621,73 @@ mod tests {
     #[tokio::test]
     async fn relay_routes_opaque_data_without_decoding_it() {
         let relay = FakeRelay::start();
-        let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
+        let m = relay
+            .connect(ClientRole::Machine {
+                machine_id: "M1".into(),
+            })
+            .await;
         m.send(frame(
-            ClientRole::Machine { machine_id: "M1".into() },
-            RelayControlMsg::RegisterMachine { machine: machine("M1") },
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M1"),
+            },
         ))
         .await;
         m.send(frame(
-            ClientRole::Machine { machine_id: "M1".into() },
-            RelayControlMsg::AnnounceSession { session: session("C1", "M1") },
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::AnnounceSession {
+                session: session("C1", "M1"),
+            },
         ))
         .await;
-        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        let mut d = relay
+            .connect(ClientRole::Device {
+                device_id: "D1".into(),
+            })
+            .await;
         d.send(frame(
-            ClientRole::Device { device_id: "D1".into() },
-            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: None } },
+            ClientRole::Device {
+                device_id: "D1".into(),
+            },
+            RelayControlMsg::Subscribe {
+                target: SubTarget::Events {
+                    conversation_id: "C1".into(),
+                    since_seq: None,
+                },
+            },
         ))
         .await;
 
         // 不可解码为任何协议类型的随机字节
-        let garbage = DataEnvelope::Plaintext { agentdeck_protocol_version: 2, bytes: vec![0xFF, 0x00, 0x13, 0x37] };
+        let garbage = DataEnvelope::Plaintext {
+            agentdeck_protocol_version: 2,
+            bytes: vec![0xFF, 0x00, 0x13, 0x37],
+        };
         m.send(frame(
-            ClientRole::Machine { machine_id: "M1".into() },
-            RelayControlMsg::PublishEvent { conversation_id: "C1".into(), turn_session_id: "S1".into(), seq: 0, data: garbage.clone() },
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::PublishEvent {
+                conversation_id: "C1".into(),
+                turn_session_id: "S1".into(),
+                seq: 0,
+                data: garbage.clone(),
+            },
         ))
         .await;
 
         // device 仍按控制面元数据收到，data 原样透传（relay 未解码）
         loop {
-            let frame = match tokio::time::timeout(std::time::Duration::from_secs(5), d.recv()).await {
-                Ok(Some(frame)) => frame,
-                Ok(None) => panic!("timed out waiting for Event frame: stream closed"),
-                Err(_) => panic!("timed out waiting for Event frame"),
-            };
+            let frame =
+                match tokio::time::timeout(std::time::Duration::from_secs(5), d.recv()).await {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => panic!("timed out waiting for Event frame: stream closed"),
+                    Err(_) => panic!("timed out waiting for Event frame"),
+                };
             match frame.msg {
                 RelayControlMsg::Event { data, .. } => {
                     assert_eq!(data, garbage);
@@ -1324,16 +1699,24 @@ mod tests {
     }
 
     fn mframe(machine_id: &str, msg: RelayControlMsg) -> RemoteFrame {
-        RemoteFrame::control(ClientRole::Machine { machine_id: machine_id.into() }, "t".into(), 0, msg)
+        RemoteFrame::control(
+            ClientRole::Machine {
+                machine_id: machine_id.into(),
+            },
+            "t".into(),
+            0,
+            msg,
+        )
     }
 
     async fn recv_until_error(c: &mut RelayClient) -> String {
         loop {
-            let frame = match tokio::time::timeout(std::time::Duration::from_secs(5), c.recv()).await {
-                Ok(Some(frame)) => frame,
-                Ok(None) => panic!("timed out waiting for Error frame: stream closed"),
-                Err(_) => panic!("timed out waiting for Error frame"),
-            };
+            let frame =
+                match tokio::time::timeout(std::time::Duration::from_secs(5), c.recv()).await {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => panic!("timed out waiting for Error frame: stream closed"),
+                    Err(_) => panic!("timed out waiting for Error frame"),
+                };
             match frame.msg {
                 RelayControlMsg::Error { code, .. } => return code,
                 _ => continue,
@@ -1349,22 +1732,41 @@ mod tests {
             .connect_with_identity(ConnIdentity {
                 account_id: "acc".into(),
                 device_id: "m1".into(),
-                role: ConnRole::Machine { machine_id: "M1".into() },
+                role: ConnRole::Machine {
+                    machine_id: "M1".into(),
+                },
             })
             .await;
-        m1.send(mframe("M1", RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        m1.send(mframe(
+            "M1",
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M1"),
+            },
+        ))
+        .await;
         // 攻击者连接以 machine_id=Evil 身份，却试图注册 machine_id=M1（覆盖）
         let mut evil = relay
             .connect_with_identity(ConnIdentity {
                 account_id: "acc".into(),
                 device_id: "evil".into(),
-                role: ConnRole::Machine { machine_id: "Evil".into() },
+                role: ConnRole::Machine {
+                    machine_id: "Evil".into(),
+                },
             })
             .await;
-        evil.send(mframe("M1", RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        evil.send(mframe(
+            "M1",
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M1"),
+            },
+        ))
+        .await;
         // evil 应收到 identity_conflict Error
         let e = recv_until_error(&mut evil).await;
-        assert_eq!(e, agentdeck_protocol::remote::failure::MACHINE_IDENTITY_CONFLICT);
+        assert_eq!(
+            e,
+            agentdeck_protocol::remote::failure::MACHINE_IDENTITY_CONFLICT
+        );
     }
 
     #[tokio::test]
@@ -1374,19 +1776,35 @@ mod tests {
             .connect_with_identity(ConnIdentity {
                 account_id: "acc".into(),
                 device_id: "m1".into(),
-                role: ConnRole::Machine { machine_id: "M1".into() },
+                role: ConnRole::Machine {
+                    machine_id: "M1".into(),
+                },
             })
             .await;
-        m1.send(mframe("M1", RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        m1.send(mframe(
+            "M1",
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M1"),
+            },
+        ))
+        .await;
 
         let m2 = relay
             .connect_with_identity(ConnIdentity {
                 account_id: "acc".into(),
                 device_id: "m2".into(),
-                role: ConnRole::Machine { machine_id: "M2".into() },
+                role: ConnRole::Machine {
+                    machine_id: "M2".into(),
+                },
             })
             .await;
-        m2.send(mframe("M2", RelayControlMsg::RegisterMachine { machine: machine("M2") })).await;
+        m2.send(mframe(
+            "M2",
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M2"),
+            },
+        ))
+        .await;
 
         let mut d = relay
             .connect_with_identity(ConnIdentity {
@@ -1396,12 +1814,16 @@ mod tests {
             })
             .await;
         d.send(RemoteFrame::control(
-            ClientRole::Device { device_id: "d1".into() },
+            ClientRole::Device {
+                device_id: "d1".into(),
+            },
             "t".into(),
             0,
             RelayControlMsg::SendCommand {
                 request_id: "r1".into(),
-                target: CommandTarget::Machine { machine_id: "M1".into() },
+                target: CommandTarget::Machine {
+                    machine_id: "M1".into(),
+                },
                 data: DataEnvelope::plaintext(&"ping-cmd").unwrap(),
             },
         ))
@@ -1432,16 +1854,20 @@ mod tests {
 
         // D1 应且只应收到来自 M1 的真实回复；若冒充未被拒绝，会先收到 "forged" 导致断言失败
         loop {
-            let frame = match tokio::time::timeout(std::time::Duration::from_secs(5), d.recv()).await {
-                Ok(Some(frame)) => frame,
-                Ok(None) => panic!("timed out waiting for AdminReply frame: stream closed"),
-                Err(_) => panic!("timed out waiting for AdminReply frame"),
-            };
+            let frame =
+                match tokio::time::timeout(std::time::Duration::from_secs(5), d.recv()).await {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => panic!("timed out waiting for AdminReply frame: stream closed"),
+                    Err(_) => panic!("timed out waiting for AdminReply frame"),
+                };
             match frame.msg {
                 RelayControlMsg::AdminReply { in_reply_to, data } => {
                     assert_eq!(in_reply_to, "r1");
                     let s: String = data.decode_plaintext().unwrap();
-                    assert_eq!(s, "real", "device 只应看到目标机器的真实回复，冒充回复必须被丢弃");
+                    assert_eq!(
+                        s, "real",
+                        "device 只应看到目标机器的真实回复，冒充回复必须被丢弃"
+                    );
                     break;
                 }
                 RelayControlMsg::CommandDelivered { .. } => continue,
@@ -1463,18 +1889,27 @@ mod tests {
 
         // Device 冒充 machine 挂会话——推送路径必须先经身份门，不能自报 machine_id
         d.send(RemoteFrame::control(
-            ClientRole::Device { device_id: "d1".into() },
+            ClientRole::Device {
+                device_id: "d1".into(),
+            },
             "t".into(),
             0,
-            RelayControlMsg::AnnounceSession { session: session("C1", "M1") },
+            RelayControlMsg::AnnounceSession {
+                session: session("C1", "M1"),
+            },
         ))
         .await;
         let e1 = recv_until_error(&mut d).await;
-        assert_eq!(e1, agentdeck_protocol::remote::failure::MACHINE_IDENTITY_CONFLICT);
+        assert_eq!(
+            e1,
+            agentdeck_protocol::remote::failure::MACHINE_IDENTITY_CONFLICT
+        );
 
         // Device 冒充 machine 发布事件——同样必须被身份门拒绝（即便 conversation 不存在）
         d.send(RemoteFrame::control(
-            ClientRole::Device { device_id: "d1".into() },
+            ClientRole::Device {
+                device_id: "d1".into(),
+            },
             "t".into(),
             0,
             RelayControlMsg::PublishEvent {
@@ -1496,17 +1931,33 @@ mod tests {
             .connect_with_identity(ConnIdentity {
                 account_id: "acc".into(),
                 device_id: "m1".into(),
-                role: ConnRole::Machine { machine_id: "M1".into() },
+                role: ConnRole::Machine {
+                    machine_id: "M1".into(),
+                },
             })
             .await;
-        m1.send(mframe("M1", RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
-        m1.send(mframe("M1", RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+        m1.send(mframe(
+            "M1",
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M1"),
+            },
+        ))
+        .await;
+        m1.send(mframe(
+            "M1",
+            RelayControlMsg::AnnounceSession {
+                session: session("C1", "M1"),
+            },
+        ))
+        .await;
 
         let mut m2 = relay
             .connect_with_identity(ConnIdentity {
                 account_id: "acc".into(),
                 device_id: "m2".into(),
-                role: ConnRole::Machine { machine_id: "M2".into() },
+                role: ConnRole::Machine {
+                    machine_id: "M2".into(),
+                },
             })
             .await;
 
@@ -1518,10 +1969,17 @@ mod tests {
             })
             .await;
         d1.send(RemoteFrame::control(
-            ClientRole::Device { device_id: "d1".into() },
+            ClientRole::Device {
+                device_id: "d1".into(),
+            },
             "t".into(),
             0,
-            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: None } },
+            RelayControlMsg::Subscribe {
+                target: SubTarget::Events {
+                    conversation_id: "C1".into(),
+                    since_seq: None,
+                },
+            },
         ))
         .await;
 
@@ -1563,22 +2021,44 @@ mod tests {
             .connect_with_identity(ConnIdentity {
                 account_id: "acc".into(),
                 device_id: "m1".into(),
-                role: ConnRole::Machine { machine_id: "M1".into() },
+                role: ConnRole::Machine {
+                    machine_id: "M1".into(),
+                },
             })
             .await;
-        m1.send(mframe("M1", RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
-        m1.send(mframe("M1", RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+        m1.send(mframe(
+            "M1",
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M1"),
+            },
+        ))
+        .await;
+        m1.send(mframe(
+            "M1",
+            RelayControlMsg::AnnounceSession {
+                session: session("C1", "M1"),
+            },
+        ))
+        .await;
 
         let mut m2 = relay
             .connect_with_identity(ConnIdentity {
                 account_id: "acc".into(),
                 device_id: "m2".into(),
-                role: ConnRole::Machine { machine_id: "M2".into() },
+                role: ConnRole::Machine {
+                    machine_id: "M2".into(),
+                },
             })
             .await;
 
         // M2 试图 retire M1 拥有的 conversation C1（DoS 尝试：移除他人会话映射）
-        m2.send(mframe("M2", RelayControlMsg::RetireSession { conversation_id: "C1".into() })).await;
+        m2.send(mframe(
+            "M2",
+            RelayControlMsg::RetireSession {
+                conversation_id: "C1".into(),
+            },
+        ))
+        .await;
         let e = recv_until_error(&mut m2).await;
         assert_eq!(e, agentdeck_protocol::remote::failure::AUTH_FORBIDDEN);
 
@@ -1601,13 +2081,21 @@ mod tests {
                 role: ConnRole::Device,
             })
             .await;
-        check.send(RemoteFrame::control(
-            ClientRole::Device { device_id: "checker".into() },
-            "t".into(),
-            0,
-            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: None } },
-        ))
-        .await;
+        check
+            .send(RemoteFrame::control(
+                ClientRole::Device {
+                    device_id: "checker".into(),
+                },
+                "t".into(),
+                0,
+                RelayControlMsg::Subscribe {
+                    target: SubTarget::Events {
+                        conversation_id: "C1".into(),
+                        since_seq: None,
+                    },
+                },
+            ))
+            .await;
         let (conv, turn, _seq) = recv_event(&mut check).await;
         assert_eq!(conv, "C1");
         assert_eq!(turn, "S1");
@@ -1619,9 +2107,29 @@ mod tests {
     #[tokio::test]
     async fn conv_buffer_hard_cap_drops_oldest_regardless_of_ack() {
         let relay = FakeRelay::start();
-        let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
-        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
-        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+        let m = relay
+            .connect(ClientRole::Machine {
+                machine_id: "M1".into(),
+            })
+            .await;
+        m.send(frame(
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M1"),
+            },
+        ))
+        .await;
+        m.send(frame(
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::AnnounceSession {
+                session: session("C1", "M1"),
+            },
+        ))
+        .await;
 
         // 同步屏障：`m.send(...).await` 只保证消息进入 m 自己的本地 channel，
         // 不保证 Core 已经处理完——1010 条 PublishEvent 全靠 `.await` 排队并不
@@ -1631,11 +2139,19 @@ mod tests {
         // 顺序被处理——因此发布循环之后，再从 m 发一条 `RegisterMachine`
         // （幂等）触发对 `sync_dev` 的广播，收到该广播即可断言此前所有
         // PublishEvent 已经处理完毕（conv_buffer 已完成硬上界裁剪）。
-        let mut sync_dev = relay.connect(ClientRole::Device { device_id: "SYNC".into() }).await;
+        let mut sync_dev = relay
+            .connect(ClientRole::Device {
+                device_id: "SYNC".into(),
+            })
+            .await;
         sync_dev
             .send(frame(
-                ClientRole::Device { device_id: "SYNC".into() },
-                RelayControlMsg::Subscribe { target: SubTarget::Machines },
+                ClientRole::Device {
+                    device_id: "SYNC".into(),
+                },
+                RelayControlMsg::Subscribe {
+                    target: SubTarget::Machines,
+                },
             ))
             .await;
         let _ = sync_dev.recv().await; // 消化订阅时的初始 MachineList 快照
@@ -1644,7 +2160,15 @@ mod tests {
             publish(&m, "C1", &format!("S{i}")).await;
         }
 
-        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        m.send(frame(
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M1"),
+            },
+        ))
+        .await;
         let barrier = tokio::time::timeout(std::time::Duration::from_secs(10), sync_dev.recv())
             .await
             .expect("屏障 RegisterMachine 广播超时——Core 可能被 1010 条持久化拖慢")
@@ -1655,14 +2179,28 @@ mod tests {
         // 行为本身，不是 Task 6 的 since_seq 重放窗口判定；Some(0) 在丢弃后
         // 已早于 buffer 最旧条目，会命中 REPLAY_GAP（见 Task 6 新增测试），
         // 与本测试意图无关。
-        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        let mut d = relay
+            .connect(ClientRole::Device {
+                device_id: "D1".into(),
+            })
+            .await;
         d.send(frame(
-            ClientRole::Device { device_id: "D1".into() },
-            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: None } },
+            ClientRole::Device {
+                device_id: "D1".into(),
+            },
+            RelayControlMsg::Subscribe {
+                target: SubTarget::Events {
+                    conversation_id: "C1".into(),
+                    since_seq: None,
+                },
+            },
         ))
         .await;
         let (_, _, first_seq) = recv_event(&mut d).await;
-        assert!(first_seq >= 10, "硬上界应已丢弃最旧的至少 10 条（不管有没有 ack），got first_seq={first_seq}");
+        assert!(
+            first_seq >= 10,
+            "硬上界应已丢弃最旧的至少 10 条（不管有没有 ack），got first_seq={first_seq}"
+        );
     }
 
     /// Task 5：`Ack` 分支不再是 no-op——鉴权通过（发起方已订阅该 conversation）
@@ -1675,14 +2213,45 @@ mod tests {
         let store_check = store.clone();
         let relay = FakeRelay::start_with_store(store);
 
-        let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
-        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
-        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+        let m = relay
+            .connect(ClientRole::Machine {
+                machine_id: "M1".into(),
+            })
+            .await;
+        m.send(frame(
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M1"),
+            },
+        ))
+        .await;
+        m.send(frame(
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::AnnounceSession {
+                session: session("C1", "M1"),
+            },
+        ))
+        .await;
 
-        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        let mut d = relay
+            .connect(ClientRole::Device {
+                device_id: "D1".into(),
+            })
+            .await;
         d.send(frame(
-            ClientRole::Device { device_id: "D1".into() },
-            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: None } },
+            ClientRole::Device {
+                device_id: "D1".into(),
+            },
+            RelayControlMsg::Subscribe {
+                target: SubTarget::Events {
+                    conversation_id: "C1".into(),
+                    since_seq: None,
+                },
+            },
         ))
         .await;
 
@@ -1695,17 +2264,31 @@ mod tests {
 
         // 未订阅的连接发 Ack 应被静默丢弃——先验证这一边界，避免误把
         // "订阅门槛" 和 "落盘生效" 两件事混在一次断言里。
-        let stranger = relay.connect(ClientRole::Device { device_id: "D2".into() }).await;
+        let stranger = relay
+            .connect(ClientRole::Device {
+                device_id: "D2".into(),
+            })
+            .await;
         stranger
             .send(frame(
-                ClientRole::Device { device_id: "D2".into() },
-                RelayControlMsg::Ack { up_to_seq: 999, conversation_id: "C1".into() },
+                ClientRole::Device {
+                    device_id: "D2".into(),
+                },
+                RelayControlMsg::Ack {
+                    up_to_seq: 999,
+                    conversation_id: "C1".into(),
+                },
             ))
             .await;
 
         d.send(frame(
-            ClientRole::Device { device_id: "D1".into() },
-            RelayControlMsg::Ack { up_to_seq: 3, conversation_id: "C1".into() },
+            ClientRole::Device {
+                device_id: "D1".into(),
+            },
+            RelayControlMsg::Ack {
+                up_to_seq: 3,
+                conversation_id: "C1".into(),
+            },
         ))
         .await;
 
@@ -1717,7 +2300,11 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             acked = store_check.load_acked_seq("C1").unwrap();
         }
-        assert_eq!(acked, Some(3), "订阅方的 Ack 应异步落盘到 seq_high_water_marks.acked_seq");
+        assert_eq!(
+            acked,
+            Some(3),
+            "订阅方的 Ack 应异步落盘到 seq_high_water_marks.acked_seq"
+        );
     }
 
     /// Task 6：`since_seq` 命中内存 `conv_buffer` 覆盖窗口——只补拉遗漏部分，
@@ -1725,9 +2312,29 @@ mod tests {
     #[tokio::test]
     async fn since_seq_within_buffer_replays_missed_events() {
         let relay = FakeRelay::start();
-        let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
-        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
-        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+        let m = relay
+            .connect(ClientRole::Machine {
+                machine_id: "M1".into(),
+            })
+            .await;
+        m.send(frame(
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M1"),
+            },
+        ))
+        .await;
+        m.send(frame(
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::AnnounceSession {
+                session: session("C1", "M1"),
+            },
+        ))
+        .await;
 
         publish(&m, "C1", "S0").await;
         publish(&m, "C1", "S1").await;
@@ -1735,24 +2342,51 @@ mod tests {
 
         // 同步屏障（Task 5 pattern）：探针 RegisterMachine 保证前面 3 条
         // PublishEvent 都已被 Core 处理完，避免 flaky。
-        let mut probe = relay.connect(ClientRole::Device { device_id: "probe".into() }).await;
+        let mut probe = relay
+            .connect(ClientRole::Device {
+                device_id: "probe".into(),
+            })
+            .await;
         probe
             .send(frame(
-                ClientRole::Device { device_id: "probe".into() },
-                RelayControlMsg::Subscribe { target: SubTarget::Machines },
+                ClientRole::Device {
+                    device_id: "probe".into(),
+                },
+                RelayControlMsg::Subscribe {
+                    target: SubTarget::Machines,
+                },
             ))
             .await;
         let _ = probe.recv().await; // 初始 MachineList 快照
-        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        m.send(frame(
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M1"),
+            },
+        ))
+        .await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), probe.recv())
             .await
             .expect("屏障 RegisterMachine 广播超时")
             .expect("frame"); // barrier 广播——之前的 PublishEvent 都已处理
 
-        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        let mut d = relay
+            .connect(ClientRole::Device {
+                device_id: "D1".into(),
+            })
+            .await;
         d.send(frame(
-            ClientRole::Device { device_id: "D1".into() },
-            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: Some(0) } },
+            ClientRole::Device {
+                device_id: "D1".into(),
+            },
+            RelayControlMsg::Subscribe {
+                target: SubTarget::Events {
+                    conversation_id: "C1".into(),
+                    since_seq: Some(0),
+                },
+            },
         ))
         .await;
         let (_, _, seq1) = recv_event(&mut d).await;
@@ -1766,38 +2400,89 @@ mod tests {
     #[tokio::test]
     async fn since_seq_beyond_buffer_window_returns_replay_gap_error() {
         let relay = FakeRelay::start();
-        let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
-        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
-        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+        let m = relay
+            .connect(ClientRole::Machine {
+                machine_id: "M1".into(),
+            })
+            .await;
+        m.send(frame(
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M1"),
+            },
+        ))
+        .await;
+        m.send(frame(
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::AnnounceSession {
+                session: session("C1", "M1"),
+            },
+        ))
+        .await;
 
         for i in 0..(DEFAULT_CONV_BUFFER_CAP + 10) {
             publish(&m, "C1", &format!("S{i}")).await;
         }
 
         // 同步屏障（Task 5 pattern）
-        let mut probe = relay.connect(ClientRole::Device { device_id: "probe".into() }).await;
+        let mut probe = relay
+            .connect(ClientRole::Device {
+                device_id: "probe".into(),
+            })
+            .await;
         probe
             .send(frame(
-                ClientRole::Device { device_id: "probe".into() },
-                RelayControlMsg::Subscribe { target: SubTarget::Machines },
+                ClientRole::Device {
+                    device_id: "probe".into(),
+                },
+                RelayControlMsg::Subscribe {
+                    target: SubTarget::Machines,
+                },
             ))
             .await;
         let _ = probe.recv().await;
-        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        m.send(frame(
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M1"),
+            },
+        ))
+        .await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(10), probe.recv())
             .await
             .expect("屏障 RegisterMachine 广播超时——Core 可能被 1010 条持久化拖慢")
             .expect("frame");
 
         // since_seq=Some(0) 早于 buffer 最旧的 seq（>=10，已被 FIFO 丢弃）
-        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        let mut d = relay
+            .connect(ClientRole::Device {
+                device_id: "D1".into(),
+            })
+            .await;
         d.send(frame(
-            ClientRole::Device { device_id: "D1".into() },
-            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: Some(0) } },
+            ClientRole::Device {
+                device_id: "D1".into(),
+            },
+            RelayControlMsg::Subscribe {
+                target: SubTarget::Events {
+                    conversation_id: "C1".into(),
+                    since_seq: Some(0),
+                },
+            },
         ))
         .await;
         let code = recv_until_error(&mut d).await;
-        assert_eq!(code, failure::REPLAY_GAP, "since_seq 早于 buffer 应返回 REPLAY_GAP");
+        assert_eq!(
+            code,
+            failure::REPLAY_GAP,
+            "since_seq 早于 buffer 应返回 REPLAY_GAP"
+        );
     }
 
     /// R1b whole-branch review fix（NEW-12）：conversation 从未 `PublishEvent`
@@ -1807,21 +2492,57 @@ mod tests {
     #[tokio::test]
     async fn since_seq_on_never_published_conversation_returns_empty_replay_not_gap() {
         let relay = FakeRelay::start();
-        let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
-        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
-        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+        let m = relay
+            .connect(ClientRole::Machine {
+                machine_id: "M1".into(),
+            })
+            .await;
+        m.send(frame(
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M1"),
+            },
+        ))
+        .await;
+        m.send(frame(
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::AnnounceSession {
+                session: session("C1", "M1"),
+            },
+        ))
+        .await;
         // 从未 publish 任何 event。
 
         // 同步屏障（Task 5/6 pattern）：确保上面两条消息已被 Core 处理完。
-        let mut probe = relay.connect(ClientRole::Device { device_id: "probe".into() }).await;
+        let mut probe = relay
+            .connect(ClientRole::Device {
+                device_id: "probe".into(),
+            })
+            .await;
         probe
             .send(frame(
-                ClientRole::Device { device_id: "probe".into() },
-                RelayControlMsg::Subscribe { target: SubTarget::Machines },
+                ClientRole::Device {
+                    device_id: "probe".into(),
+                },
+                RelayControlMsg::Subscribe {
+                    target: SubTarget::Machines,
+                },
             ))
             .await;
         let _ = probe.recv().await; // 初始 MachineList 快照
-        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        m.send(frame(
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M1"),
+            },
+        ))
+        .await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), probe.recv())
             .await
             .expect("屏障 RegisterMachine 广播超时")
@@ -1829,10 +2550,21 @@ mod tests {
 
         // Device 用 since_seq=Some(0) 订阅（想补拉但无事可补——conversation 从未
         // publish 过）。
-        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        let mut d = relay
+            .connect(ClientRole::Device {
+                device_id: "D1".into(),
+            })
+            .await;
         d.send(frame(
-            ClientRole::Device { device_id: "D1".into() },
-            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: Some(0) } },
+            ClientRole::Device {
+                device_id: "D1".into(),
+            },
+            RelayControlMsg::Subscribe {
+                target: SubTarget::Events {
+                    conversation_id: "C1".into(),
+                    since_seq: Some(0),
+                },
+            },
         ))
         .await;
 
@@ -1840,7 +2572,10 @@ mod tests {
         // 事件应能收到，证明订阅确实生效，而不是因为静默拒绝导致后面也收不到。
         publish(&m, "C1", "S0").await;
         let (_, _, seq) = recv_event(&mut d).await;
-        assert_eq!(seq, 0, "从未 publish 的 conv + since_seq=0 应订阅成功不返 REPLAY_GAP");
+        assert_eq!(
+            seq, 0,
+            "从未 publish 的 conv + since_seq=0 应订阅成功不返 REPLAY_GAP"
+        );
     }
 
     /// R1b whole-branch review fix（NEW-12）：客户端 `since_seq` 已达到/超过该
@@ -1849,9 +2584,29 @@ mod tests {
     #[tokio::test]
     async fn since_seq_at_or_beyond_highest_seq_returns_empty_replay_not_gap() {
         let relay = FakeRelay::start();
-        let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
-        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
-        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+        let m = relay
+            .connect(ClientRole::Machine {
+                machine_id: "M1".into(),
+            })
+            .await;
+        m.send(frame(
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M1"),
+            },
+        ))
+        .await;
+        m.send(frame(
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::AnnounceSession {
+                session: session("C1", "M1"),
+            },
+        ))
+        .await;
 
         publish(&m, "C1", "S0").await;
         publish(&m, "C1", "S1").await;
@@ -1859,15 +2614,31 @@ mod tests {
 
         // 同步屏障（Task 5/6 pattern）：确保前面 3 条 PublishEvent 都已被 Core
         // 处理完，避免 flaky。
-        let mut probe = relay.connect(ClientRole::Device { device_id: "probe".into() }).await;
+        let mut probe = relay
+            .connect(ClientRole::Device {
+                device_id: "probe".into(),
+            })
+            .await;
         probe
             .send(frame(
-                ClientRole::Device { device_id: "probe".into() },
-                RelayControlMsg::Subscribe { target: SubTarget::Machines },
+                ClientRole::Device {
+                    device_id: "probe".into(),
+                },
+                RelayControlMsg::Subscribe {
+                    target: SubTarget::Machines,
+                },
             ))
             .await;
         let _ = probe.recv().await; // 初始 MachineList 快照
-        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
+        m.send(frame(
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M1"),
+            },
+        ))
+        .await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), probe.recv())
             .await
             .expect("屏障 RegisterMachine 广播超时")
@@ -1875,10 +2646,21 @@ mod tests {
 
         // Device 用 since_seq=Some(2) 订阅（已收到 seq=0,1,2，只想订阅未来事件——
         // n >= highest_seq(=2)）。
-        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
+        let mut d = relay
+            .connect(ClientRole::Device {
+                device_id: "D1".into(),
+            })
+            .await;
         d.send(frame(
-            ClientRole::Device { device_id: "D1".into() },
-            RelayControlMsg::Subscribe { target: SubTarget::Events { conversation_id: "C1".into(), since_seq: Some(2) } },
+            ClientRole::Device {
+                device_id: "D1".into(),
+            },
+            RelayControlMsg::Subscribe {
+                target: SubTarget::Events {
+                    conversation_id: "C1".into(),
+                    since_seq: Some(2),
+                },
+            },
         ))
         .await;
 
@@ -1886,7 +2668,10 @@ mod tests {
         // 的事件应能正常收到（订阅生效，只是没有回放）。
         publish(&m, "C1", "S3").await;
         let (_, _, seq) = recv_event(&mut d).await;
-        assert_eq!(seq, 3, "since_seq >= highest_seq 应订阅成功不返 REPLAY_GAP，收到新事件 seq=3");
+        assert_eq!(
+            seq, 3,
+            "since_seq >= highest_seq 应订阅成功不返 REPLAY_GAP，收到新事件 seq=3"
+        );
     }
 
     /// Task 7（R1a 遗留 bug 修复）：同一 machine 重启后重新 `AnnounceSession`
@@ -1895,18 +2680,63 @@ mod tests {
     #[tokio::test]
     async fn announce_session_same_conversation_twice_does_not_duplicate_in_session_list() {
         let relay = FakeRelay::start();
-        let m = relay.connect(ClientRole::Machine { machine_id: "M1".into() }).await;
-        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::RegisterMachine { machine: machine("M1") })).await;
-        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+        let m = relay
+            .connect(ClientRole::Machine {
+                machine_id: "M1".into(),
+            })
+            .await;
+        m.send(frame(
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::RegisterMachine {
+                machine: machine("M1"),
+            },
+        ))
+        .await;
+        m.send(frame(
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::AnnounceSession {
+                session: session("C1", "M1"),
+            },
+        ))
+        .await;
         // 同一 machine 重启后重新 announce 同一 conversation_id（模拟 machine 侧重连场景）
-        m.send(frame(ClientRole::Machine { machine_id: "M1".into() }, RelayControlMsg::AnnounceSession { session: session("C1", "M1") })).await;
+        m.send(frame(
+            ClientRole::Machine {
+                machine_id: "M1".into(),
+            },
+            RelayControlMsg::AnnounceSession {
+                session: session("C1", "M1"),
+            },
+        ))
+        .await;
 
-        let mut d = relay.connect(ClientRole::Device { device_id: "D1".into() }).await;
-        d.send(frame(ClientRole::Device { device_id: "D1".into() },
-            RelayControlMsg::Subscribe { target: SubTarget::Sessions { machine_id: "M1".into() } })).await;
+        let mut d = relay
+            .connect(ClientRole::Device {
+                device_id: "D1".into(),
+            })
+            .await;
+        d.send(frame(
+            ClientRole::Device {
+                device_id: "D1".into(),
+            },
+            RelayControlMsg::Subscribe {
+                target: SubTarget::Sessions {
+                    machine_id: "M1".into(),
+                },
+            },
+        ))
+        .await;
         let got = d.recv().await.expect("frame");
         match got.msg {
-            RelayControlMsg::SessionList { sessions, .. } => assert_eq!(sessions.len(), 1, "重复 announce 同一 conversation 不应产生重复条目"),
+            RelayControlMsg::SessionList { sessions, .. } => assert_eq!(
+                sessions.len(),
+                1,
+                "重复 announce 同一 conversation 不应产生重复条目"
+            ),
             other => panic!("expected SessionList, got {other:?}"),
         }
     }

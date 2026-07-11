@@ -70,7 +70,8 @@ async fn setup_server_with_db(
     let relay = agentdeck_relay::FakeRelay::start_with_all(store.clone(), 300_000, conv_buffer_cap);
     let store_for_server = store.clone();
     let handle = tokio::spawn(async move {
-        agentdeck_relay::server::serve_with_listener(config, store_for_server, relay, listener).await
+        agentdeck_relay::server::serve_with_listener(config, store_for_server, relay, listener)
+            .await
     });
     let base_url = format!("http://{addr}");
     (addr, store, base_url, handle)
@@ -89,7 +90,8 @@ async fn challenge(base_url: &str, sign_pub: &str) -> Value {
         let resp = ureq::post(&format!("{base_url}/v1/pair/challenge"))
             .send_json(json!({ "device_sign_pubkey": sign_pub }))
             .expect("challenge request failed");
-        resp.into_json::<Value>().expect("challenge response not JSON")
+        resp.into_json::<Value>()
+            .expect("challenge response not JSON")
     })
     .await
     .unwrap()
@@ -129,7 +131,9 @@ async fn complete(
             body["owner_pubkey"] = json!(owner_pubkey);
         }
         match ureq::post(&format!("{base_url}/v1/pair/complete")).send_json(body) {
-            Ok(resp) => Ok(resp.into_json::<Value>().expect("complete response not JSON")),
+            Ok(resp) => Ok(resp
+                .into_json::<Value>()
+                .expect("complete response not JSON")),
             Err(ureq::Error::Status(code, resp)) => {
                 let body = resp.into_json::<Value>().unwrap_or(Value::Null);
                 Err((code, body))
@@ -178,7 +182,10 @@ async fn enroll(
 }
 
 fn ws_url(addr: SocketAddr) -> String {
-    format!("ws://{addr}/v1/connect?v={}", agentdeck_protocol::remote::RELAY_PROTOCOL_VERSION)
+    format!(
+        "ws://{addr}/v1/connect?v={}",
+        agentdeck_protocol::remote::RELAY_PROTOCOL_VERSION
+    )
 }
 
 fn machine_descriptor(machine_id: &str, name: &str) -> MachineDescriptor {
@@ -203,9 +210,16 @@ fn session_descriptor(conversation_id: &str, machine_id: &str) -> SessionDescrip
     }
 }
 
-async fn publish_event<L: RelayLink>(link: &L, machine_id: &str, conversation_id: &str, turn_session_id: &str) {
+async fn publish_event<L: RelayLink>(
+    link: &L,
+    machine_id: &str,
+    conversation_id: &str,
+    turn_session_id: &str,
+) {
     link.send(RemoteFrame::control(
-        ClientRole::Machine { machine_id: machine_id.to_string() },
+        ClientRole::Machine {
+            machine_id: machine_id.to_string(),
+        },
         format!("t-pub-{turn_session_id}"),
         0,
         RelayControlMsg::PublishEvent {
@@ -220,7 +234,13 @@ async fn publish_event<L: RelayLink>(link: &L, machine_id: &str, conversation_id
 
 async fn recv_event<L: RelayLink>(link: &mut L) -> (String, String, u64) {
     loop {
-        if let RelayControlMsg::Event { conversation_id, turn_session_id, seq, .. } = recv(link).await.msg {
+        if let RelayControlMsg::Event {
+            conversation_id,
+            turn_session_id,
+            seq,
+            ..
+        } = recv(link).await.msg
+        {
             return (conversation_id, turn_session_id, seq);
         }
     }
@@ -246,48 +266,79 @@ async fn restart_preserves_seq_and_revocation() {
     let (addr1, store1, base_url1, handle1) =
         setup_server_with_db("boot-secret-restart", &db_path, 1000).await;
 
-    let machine = enroll(&base_url1, "boot-secret-restart", "m1", "machine", Some("owner-1")).await;
+    let machine = enroll(
+        &base_url1,
+        "boot-secret-restart",
+        "m1",
+        "machine",
+        Some("owner-1"),
+    )
+    .await;
     let device = enroll(&base_url1, "boot-secret-restart", "d1", "device", None).await;
-    let to_revoke = enroll(&base_url1, "boot-secret-restart", "will-be-revoked", "device", None).await;
+    let to_revoke = enroll(
+        &base_url1,
+        "boot-secret-restart",
+        "will-be-revoked",
+        "device",
+        None,
+    )
+    .await;
 
     let m1_link = WsRelayClient::connect(
         &ws_url(addr1),
         &machine.credential,
-        ClientRole::Machine { machine_id: machine.device_id.clone() },
+        ClientRole::Machine {
+            machine_id: machine.device_id.clone(),
+        },
     )
     .await
     .expect("machine ws connect failed");
     m1_link
         .send(RemoteFrame::control(
-            ClientRole::Machine { machine_id: machine.device_id.clone() },
+            ClientRole::Machine {
+                machine_id: machine.device_id.clone(),
+            },
             "t-reg".into(),
             0,
-            RelayControlMsg::RegisterMachine { machine: machine_descriptor("m1", "Machine One") },
+            RelayControlMsg::RegisterMachine {
+                machine: machine_descriptor("m1", "Machine One"),
+            },
         ))
         .await;
     m1_link
         .send(RemoteFrame::control(
-            ClientRole::Machine { machine_id: machine.device_id.clone() },
+            ClientRole::Machine {
+                machine_id: machine.device_id.clone(),
+            },
             "t-announce".into(),
             0,
-            RelayControlMsg::AnnounceSession { session: session_descriptor("C1", "m1") },
+            RelayControlMsg::AnnounceSession {
+                session: session_descriptor("C1", "m1"),
+            },
         ))
         .await;
 
     let mut d1_link = WsRelayClient::connect(
         &ws_url(addr1),
         &device.credential,
-        ClientRole::Device { device_id: device.device_id.clone() },
+        ClientRole::Device {
+            device_id: device.device_id.clone(),
+        },
     )
     .await
     .expect("device ws connect failed");
     d1_link
         .send(RemoteFrame::control(
-            ClientRole::Device { device_id: device.device_id.clone() },
+            ClientRole::Device {
+                device_id: device.device_id.clone(),
+            },
             "t-sub-events".into(),
             0,
             RelayControlMsg::Subscribe {
-                target: SubTarget::Events { conversation_id: "C1".into(), since_seq: None },
+                target: SubTarget::Events {
+                    conversation_id: "C1".into(),
+                    since_seq: None,
+                },
             },
         ))
         .await;
@@ -300,7 +351,10 @@ async fn restart_preserves_seq_and_revocation() {
         let (_, _, seq) = recv_event(&mut d1_link).await;
         last_seq = last_seq.max(seq);
     }
-    assert_eq!(last_seq, 2, "3 个事件发布后（seq 从 0 起分配）最大 seq 应为 2");
+    assert_eq!(
+        last_seq, 2,
+        "3 个事件发布后（seq 从 0 起分配）最大 seq 应为 2"
+    );
 
     // round 1 撤销一个凭据（不需要它建立过活连接——本测试只断言"重启后仍被拒"）
     agentdeck_relay::server::revoke_device(&store1, &to_revoke.device_id);
@@ -321,7 +375,9 @@ async fn restart_preserves_seq_and_revocation() {
     match WsRelayClient::connect(
         &ws_url(addr2),
         &to_revoke.credential,
-        ClientRole::Device { device_id: to_revoke.device_id.clone() },
+        ClientRole::Device {
+            device_id: to_revoke.device_id.clone(),
+        },
     )
     .await
     {
@@ -329,7 +385,9 @@ async fn restart_preserves_seq_and_revocation() {
             assert_eq!(status, 401);
             assert_eq!(code.as_deref(), Some(failure::AUTH_REVOKED_DEVICE));
         }
-        Ok(_) => panic!("expected revoked credential to be rejected after restart, but it connected"),
+        Ok(_) => {
+            panic!("expected revoked credential to be rejected after restart, but it connected")
+        }
         Err(other) => panic!("expected WsError::Rejected, got a different WsError: {other:?}"),
     }
 
@@ -339,41 +397,58 @@ async fn restart_preserves_seq_and_revocation() {
     let m1_link2 = WsRelayClient::connect(
         &ws_url(addr2),
         &machine.credential,
-        ClientRole::Machine { machine_id: machine.device_id.clone() },
+        ClientRole::Machine {
+            machine_id: machine.device_id.clone(),
+        },
     )
     .await
     .expect("machine ws reconnect after restart failed");
     m1_link2
         .send(RemoteFrame::control(
-            ClientRole::Machine { machine_id: machine.device_id.clone() },
+            ClientRole::Machine {
+                machine_id: machine.device_id.clone(),
+            },
             "t-reg-2".into(),
             0,
-            RelayControlMsg::RegisterMachine { machine: machine_descriptor("m1", "Machine One") },
+            RelayControlMsg::RegisterMachine {
+                machine: machine_descriptor("m1", "Machine One"),
+            },
         ))
         .await;
     m1_link2
         .send(RemoteFrame::control(
-            ClientRole::Machine { machine_id: machine.device_id.clone() },
+            ClientRole::Machine {
+                machine_id: machine.device_id.clone(),
+            },
             "t-announce-2".into(),
             0,
-            RelayControlMsg::AnnounceSession { session: session_descriptor("C1", "m1") },
+            RelayControlMsg::AnnounceSession {
+                session: session_descriptor("C1", "m1"),
+            },
         ))
         .await;
 
     let mut d1_link2 = WsRelayClient::connect(
         &ws_url(addr2),
         &device.credential,
-        ClientRole::Device { device_id: device.device_id.clone() },
+        ClientRole::Device {
+            device_id: device.device_id.clone(),
+        },
     )
     .await
     .expect("device ws reconnect after restart failed");
     d1_link2
         .send(RemoteFrame::control(
-            ClientRole::Device { device_id: device.device_id.clone() },
+            ClientRole::Device {
+                device_id: device.device_id.clone(),
+            },
             "t-sub-events-2".into(),
             0,
             RelayControlMsg::Subscribe {
-                target: SubTarget::Events { conversation_id: "C1".into(), since_seq: None },
+                target: SubTarget::Events {
+                    conversation_id: "C1".into(),
+                    since_seq: None,
+                },
             },
         ))
         .await;
@@ -398,29 +473,46 @@ async fn ack_then_lagged_subscriber_gets_gap_not_stale_data() {
     let (addr, _store, base_url, _handle) =
         setup_server_with_db("boot-secret-gap", &db_path, CAP).await;
 
-    let machine = enroll(&base_url, "boot-secret-gap", "m1", "machine", Some("owner-1")).await;
+    let machine = enroll(
+        &base_url,
+        "boot-secret-gap",
+        "m1",
+        "machine",
+        Some("owner-1"),
+    )
+    .await;
 
     let m1_link = WsRelayClient::connect(
         &ws_url(addr),
         &machine.credential,
-        ClientRole::Machine { machine_id: machine.device_id.clone() },
+        ClientRole::Machine {
+            machine_id: machine.device_id.clone(),
+        },
     )
     .await
     .expect("machine ws connect failed");
     m1_link
         .send(RemoteFrame::control(
-            ClientRole::Machine { machine_id: machine.device_id.clone() },
+            ClientRole::Machine {
+                machine_id: machine.device_id.clone(),
+            },
             "t-reg".into(),
             0,
-            RelayControlMsg::RegisterMachine { machine: machine_descriptor("m1", "Machine One") },
+            RelayControlMsg::RegisterMachine {
+                machine: machine_descriptor("m1", "Machine One"),
+            },
         ))
         .await;
     m1_link
         .send(RemoteFrame::control(
-            ClientRole::Machine { machine_id: machine.device_id.clone() },
+            ClientRole::Machine {
+                machine_id: machine.device_id.clone(),
+            },
             "t-announce".into(),
             0,
-            RelayControlMsg::AnnounceSession { session: session_descriptor("C2", "m1") },
+            RelayControlMsg::AnnounceSession {
+                session: session_descriptor("C2", "m1"),
+            },
         ))
         .await;
 
@@ -437,27 +529,39 @@ async fn ack_then_lagged_subscriber_gets_gap_not_stale_data() {
     // 的 flaky。
     let mut sync_device = WsRelayClient::connect(
         &ws_url(addr),
-        &enroll(&base_url, "boot-secret-gap", "sync-dev", "device", None).await.credential,
-        ClientRole::Device { device_id: "sync-dev".into() },
+        &enroll(&base_url, "boot-secret-gap", "sync-dev", "device", None)
+            .await
+            .credential,
+        ClientRole::Device {
+            device_id: "sync-dev".into(),
+        },
     )
     .await
     .expect("sync device ws connect failed");
     sync_device
         .send(RemoteFrame::control(
-            ClientRole::Device { device_id: "sync-dev".into() },
+            ClientRole::Device {
+                device_id: "sync-dev".into(),
+            },
             "t-sub-machines".into(),
             0,
-            RelayControlMsg::Subscribe { target: SubTarget::Machines },
+            RelayControlMsg::Subscribe {
+                target: SubTarget::Machines,
+            },
         ))
         .await;
     let _ = recv(&mut sync_device).await; // 消化订阅时的初始 MachineList 快照
 
     m1_link
         .send(RemoteFrame::control(
-            ClientRole::Machine { machine_id: machine.device_id.clone() },
+            ClientRole::Machine {
+                machine_id: machine.device_id.clone(),
+            },
             "t-reg-barrier".into(),
             0,
-            RelayControlMsg::RegisterMachine { machine: machine_descriptor("m1", "Machine One") },
+            RelayControlMsg::RegisterMachine {
+                machine: machine_descriptor("m1", "Machine One"),
+            },
         ))
         .await;
     let barrier = recv(&mut sync_device).await; // 屏障广播：之前所有 PublishEvent 均已处理完
@@ -466,18 +570,27 @@ async fn ack_then_lagged_subscriber_gets_gap_not_stale_data() {
     // since_seq=3 早于 buffer 最旧保留的 seq（此时 buffer 只剩 seq 10..19）
     let mut d1_link = WsRelayClient::connect(
         &ws_url(addr),
-        &enroll(&base_url, "boot-secret-gap", "d1", "device", None).await.credential,
-        ClientRole::Device { device_id: "d1".into() },
+        &enroll(&base_url, "boot-secret-gap", "d1", "device", None)
+            .await
+            .credential,
+        ClientRole::Device {
+            device_id: "d1".into(),
+        },
     )
     .await
     .expect("device ws connect failed");
     d1_link
         .send(RemoteFrame::control(
-            ClientRole::Device { device_id: "d1".into() },
+            ClientRole::Device {
+                device_id: "d1".into(),
+            },
             "t-sub-events".into(),
             0,
             RelayControlMsg::Subscribe {
-                target: SubTarget::Events { conversation_id: "C2".into(), since_seq: Some(3) },
+                target: SubTarget::Events {
+                    conversation_id: "C2".into(),
+                    since_seq: Some(3),
+                },
             },
         ))
         .await;
@@ -500,23 +613,36 @@ async fn announce_session_idempotent_across_reconnect() {
     let (addr, _store, base_url, _handle) =
         setup_server_with_db("boot-secret-idem", &db_path, 1000).await;
 
-    let machine = enroll(&base_url, "boot-secret-idem", "m1", "machine", Some("owner-1")).await;
+    let machine = enroll(
+        &base_url,
+        "boot-secret-idem",
+        "m1",
+        "machine",
+        Some("owner-1"),
+    )
+    .await;
     let device = enroll(&base_url, "boot-secret-idem", "d1", "device", None).await;
 
     // d1 先订阅 Machines（用作下面几步的顺序屏障），消化初始空快照。
     let mut d1_link = WsRelayClient::connect(
         &ws_url(addr),
         &device.credential,
-        ClientRole::Device { device_id: device.device_id.clone() },
+        ClientRole::Device {
+            device_id: device.device_id.clone(),
+        },
     )
     .await
     .expect("device ws connect failed");
     d1_link
         .send(RemoteFrame::control(
-            ClientRole::Device { device_id: device.device_id.clone() },
+            ClientRole::Device {
+                device_id: device.device_id.clone(),
+            },
             "t-sub-machines".into(),
             0,
-            RelayControlMsg::Subscribe { target: SubTarget::Machines },
+            RelayControlMsg::Subscribe {
+                target: SubTarget::Machines,
+            },
         ))
         .await;
     let _ = recv(&mut d1_link).await; // 初始空 MachineList 快照
@@ -525,26 +651,39 @@ async fn announce_session_idempotent_across_reconnect() {
     let m1_link = WsRelayClient::connect(
         &ws_url(addr),
         &machine.credential,
-        ClientRole::Machine { machine_id: machine.device_id.clone() },
+        ClientRole::Machine {
+            machine_id: machine.device_id.clone(),
+        },
     )
     .await
     .expect("machine ws connect failed");
     m1_link
         .send(RemoteFrame::control(
-            ClientRole::Machine { machine_id: machine.device_id.clone() },
+            ClientRole::Machine {
+                machine_id: machine.device_id.clone(),
+            },
             "t-reg-1".into(),
             0,
-            RelayControlMsg::RegisterMachine { machine: machine_descriptor("m1", "Machine One") },
+            RelayControlMsg::RegisterMachine {
+                machine: machine_descriptor("m1", "Machine One"),
+            },
         ))
         .await;
     let after_reg1 = recv(&mut d1_link).await; // m1 上线广播
-    assert!(matches!(after_reg1.msg, RelayControlMsg::MachineList { .. }));
+    assert!(matches!(
+        after_reg1.msg,
+        RelayControlMsg::MachineList { .. }
+    ));
     m1_link
         .send(RemoteFrame::control(
-            ClientRole::Machine { machine_id: machine.device_id.clone() },
+            ClientRole::Machine {
+                machine_id: machine.device_id.clone(),
+            },
             "t-announce-1".into(),
             0,
-            RelayControlMsg::AnnounceSession { session: session_descriptor("C1", "m1") },
+            RelayControlMsg::AnnounceSession {
+                session: session_descriptor("C1", "m1"),
+            },
         ))
         .await;
 
@@ -552,7 +691,10 @@ async fn announce_session_idempotent_across_reconnect() {
     // 已经处理完这次断连（同时也是下面重连广播的顺序屏障起点）。
     drop(m1_link);
     let after_disconnect = recv(&mut d1_link).await;
-    assert!(matches!(after_disconnect.msg, RelayControlMsg::MachineList { .. }));
+    assert!(matches!(
+        after_disconnect.msg,
+        RelayControlMsg::MachineList { .. }
+    ));
 
     // machine 重连（同一 credential）：重新 announce 同一个 conversation_id，
     // 随后紧跟一条 RegisterMachine 作为屏障——Core 单任务串行消费同一条连接
@@ -560,24 +702,34 @@ async fn announce_session_idempotent_across_reconnect() {
     let m1_link2 = WsRelayClient::connect(
         &ws_url(addr),
         &machine.credential,
-        ClientRole::Machine { machine_id: machine.device_id.clone() },
+        ClientRole::Machine {
+            machine_id: machine.device_id.clone(),
+        },
     )
     .await
     .expect("machine ws reconnect failed");
     m1_link2
         .send(RemoteFrame::control(
-            ClientRole::Machine { machine_id: machine.device_id.clone() },
+            ClientRole::Machine {
+                machine_id: machine.device_id.clone(),
+            },
             "t-announce-2".into(),
             0,
-            RelayControlMsg::AnnounceSession { session: session_descriptor("C1", "m1") },
+            RelayControlMsg::AnnounceSession {
+                session: session_descriptor("C1", "m1"),
+            },
         ))
         .await;
     m1_link2
         .send(RemoteFrame::control(
-            ClientRole::Machine { machine_id: machine.device_id.clone() },
+            ClientRole::Machine {
+                machine_id: machine.device_id.clone(),
+            },
             "t-reg-2".into(),
             0,
-            RelayControlMsg::RegisterMachine { machine: machine_descriptor("m1", "Machine One") },
+            RelayControlMsg::RegisterMachine {
+                machine: machine_descriptor("m1", "Machine One"),
+            },
         ))
         .await;
     let barrier = recv(&mut d1_link).await; // m1 重新上线广播——第二次 AnnounceSession 已先于它处理完
@@ -585,10 +737,16 @@ async fn announce_session_idempotent_across_reconnect() {
 
     d1_link
         .send(RemoteFrame::control(
-            ClientRole::Device { device_id: device.device_id.clone() },
+            ClientRole::Device {
+                device_id: device.device_id.clone(),
+            },
             "t-sub-sessions".into(),
             0,
-            RelayControlMsg::Subscribe { target: SubTarget::Sessions { machine_id: "m1".into() } },
+            RelayControlMsg::Subscribe {
+                target: SubTarget::Sessions {
+                    machine_id: "m1".into(),
+                },
+            },
         ))
         .await;
     loop {
@@ -636,8 +794,11 @@ async fn revoke_closes_active_connection_and_blocks_reconnect() {
     // 产品代码本身） ----
     let probe_store = SqliteRelayStore::open_in_memory().expect("in-memory sqlite open");
     let probe_relay = agentdeck_relay::FakeRelay::start_with_store(probe_store);
-    let mut probe_link =
-        probe_relay.connect(ClientRole::Device { device_id: "probe-dev".into() }).await;
+    let mut probe_link = probe_relay
+        .connect(ClientRole::Device {
+            device_id: "probe-dev".into(),
+        })
+        .await;
     probe_relay.revoke("probe-dev".to_string()).await;
     let after_revoke = tokio::time::timeout(RECV_TIMEOUT, probe_link.recv())
         .await
@@ -653,13 +814,22 @@ async fn revoke_closes_active_connection_and_blocks_reconnect() {
     let (addr, store, base_url, _handle) =
         setup_server_with_db("boot-secret-revoke", &db_path, 1000).await;
 
-    let dev = enroll(&base_url, "boot-secret-revoke", "d-revoke", "device", Some("owner-revoke")).await;
+    let dev = enroll(
+        &base_url,
+        "boot-secret-revoke",
+        "d-revoke",
+        "device",
+        Some("owner-revoke"),
+    )
+    .await;
 
     // revoke 前：凭据有效，正常连接成功。
     let link1 = WsRelayClient::connect(
         &ws_url(addr),
         &dev.credential,
-        ClientRole::Device { device_id: dev.device_id.clone() },
+        ClientRole::Device {
+            device_id: dev.device_id.clone(),
+        },
     )
     .await
     .expect("initial connect with a not-yet-revoked credential should succeed");
@@ -670,7 +840,9 @@ async fn revoke_closes_active_connection_and_blocks_reconnect() {
     match WsRelayClient::connect(
         &ws_url(addr),
         &dev.credential,
-        ClientRole::Device { device_id: dev.device_id.clone() },
+        ClientRole::Device {
+            device_id: dev.device_id.clone(),
+        },
     )
     .await
     {
@@ -678,7 +850,9 @@ async fn revoke_closes_active_connection_and_blocks_reconnect() {
             assert_eq!(status, 401);
             assert_eq!(code.as_deref(), Some(failure::AUTH_REVOKED_DEVICE));
         }
-        Ok(_) => panic!("expected reconnection with a revoked credential to be rejected, but it connected"),
+        Ok(_) => panic!(
+            "expected reconnection with a revoked credential to be rejected, but it connected"
+        ),
         Err(other) => panic!("expected WsError::Rejected, got a different WsError: {other:?}"),
     }
 }

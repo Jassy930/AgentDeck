@@ -37,14 +37,24 @@ struct ConnectErrorBody {
 }
 
 fn reject(status: StatusCode, code: &'static str, message: &str) -> Response {
-    (status, Json(ConnectErrorBody { code, message: message.to_string() })).into_response()
+    (
+        status,
+        Json(ConnectErrorBody {
+            code,
+            message: message.to_string(),
+        }),
+    )
+        .into_response()
 }
 
 /// 从 header 取 `Authorization: Bearer <cred>`。header 名比对由 `HeaderMap`/
 /// `HeaderName` 天然大小写不敏感（`get` 按 `HeaderName` 相等性查找，不区分大小
 /// 写）；这里额外对 `Bearer` scheme 关键字也做大小写不敏感比对。
 fn extract_bearer(headers: &HeaderMap) -> Option<String> {
-    let value = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    let value = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
     let mut parts = value.splitn(2, ' ');
     let scheme = parts.next()?;
     let token = parts.next()?.trim();
@@ -101,10 +111,16 @@ pub(crate) async fn connect(
     // Device 的角色本身就是 machine/device 概念的来源；R1a 未额外传 machine_id
     // 元数据，用 device_id 兼作 machine_id（同一实体的两个视角）。
     let role = match device.role {
-        DeviceRole::Machine => ConnRole::Machine { machine_id: device.device_id.clone() },
+        DeviceRole::Machine => ConnRole::Machine {
+            machine_id: device.device_id.clone(),
+        },
         DeviceRole::Device => ConnRole::Device,
     };
-    let identity = ConnIdentity { account_id: device.account_id, device_id: device.device_id, role };
+    let identity = ConnIdentity {
+        account_id: device.account_id,
+        device_id: device.device_id,
+        role,
+    };
 
     let relay = state.relay.clone();
     ws.max_message_size(MAX_MESSAGE_SIZE)
