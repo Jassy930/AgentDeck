@@ -34,6 +34,32 @@ iOS Simulator、daemon no-net、文档与 local IPC schema snapshot，并检查
 `agentdeck-relay-data/` 不出现在 `git status --short`。真实 vendor、公网 WSS 和
 物理 iPhone 仍是后续 gated E2E，不属于 P0 通过声明。
 
+## Relay Companion MVP P2.1 Store 门禁
+
+P2.1 仍是与 v1 并列的 v2 Store library，不代表生产 listener 已切换。改动
+`agentdeck-relay/src/v2/store/` 或 `RelayV2StoreSettings` 后至少运行：
+
+```bash
+# v2 Store migration、事务、故障注入、retention/replay/disk gate
+cargo test -p agentdeck-relay --features server \
+  --test relay_v2_store -- --test-threads=1
+
+# 独立 v2 配置面：全部配额透传、绝对路径与 hard maxima
+cargo test -p agentdeck-relay --features server --lib \
+  config::tests::v2_store_settings
+
+# v1 server 回归与代码/文档静态门禁
+cargo test -p agentdeck-relay --features server
+cargo fmt --all --check
+rg -n 'expect\(|unwrap\(|panic!|eprintln!' agentdeck-relay/src/v2/store
+bash scripts/verify-agent-docs.sh
+git diff --check
+```
+
+`rg` 预期生产 Store 源码为空输出；测试中的断言不在扫描目录。若 full-target
+clippy 被仓库既有 v1/protocol lint 阻塞，仍须运行聚焦 library clippy，并在
+阶段报告中逐项记录既有阻塞，不能用它掩盖 v2 Store 新 warning。
+
 ## AppKit 重写后的验证清单
 
 前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。

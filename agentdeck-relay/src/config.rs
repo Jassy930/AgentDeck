@@ -6,6 +6,10 @@ use clap::Parser;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use crate::v2::store::{
+    MAX_ENROLLMENT_CODES, RelayV2StoreConfig, RetentionLimits, StoreError, validate_store_path,
+};
+
 /// Relay 运行时配置。
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
@@ -39,6 +43,90 @@ pub(crate) fn default_req_origin_ttl_ms() -> u64 {
 }
 pub(crate) fn default_storage_path() -> PathBuf {
     PathBuf::from(DEFAULT_STORAGE_PATH)
+}
+
+/// Relay v2 Store 的独立运行配置面。
+///
+/// P2.1 只建立与 v1 并列的 Store library，因此此类型不嵌入上方的 v1
+/// `RelayConfig`，也不会让当前 binary 提前切到 v2。P2.6 会把这些字段接入
+/// CLI / env / config file；无论来源如何，启动 Store 前都必须通过本类型到
+/// `RelayV2StoreConfig` 的显式转换。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayV2StoreSettings {
+    pub storage_path: PathBuf,
+    pub max_frames_per_stream: u64,
+    pub max_bytes_per_stream: u64,
+    pub max_age_ms: u64,
+    pub max_bytes_per_machine: u64,
+    pub max_bytes_global: u64,
+    pub replay_page_max_frames: u64,
+    pub replay_page_max_bytes: u64,
+    pub disk_reserve_bytes: u64,
+    pub disk_reserve_percent: u8,
+    pub max_enrollment_codes: u64,
+}
+
+impl RelayV2StoreSettings {
+    /// 使用设计 §11.4 的配额默认值；调用方必须显式给出生产绝对路径。
+    pub fn new(storage_path: PathBuf) -> Self {
+        let retention = RetentionLimits::default();
+        Self {
+            storage_path,
+            max_frames_per_stream: retention.max_frames_per_stream,
+            max_bytes_per_stream: retention.max_bytes_per_stream,
+            max_age_ms: retention.max_age_ms,
+            max_bytes_per_machine: retention.max_bytes_per_machine,
+            max_bytes_global: retention.max_bytes_global,
+            replay_page_max_frames: retention.replay_page_max_frames,
+            replay_page_max_bytes: retention.replay_page_max_bytes,
+            disk_reserve_bytes: retention.disk_reserve_bytes,
+            disk_reserve_percent: retention.disk_reserve_percent,
+            max_enrollment_codes: MAX_ENROLLMENT_CODES,
+        }
+    }
+
+    pub fn retention_limits(&self) -> RetentionLimits {
+        RetentionLimits {
+            max_frames_per_stream: self.max_frames_per_stream,
+            max_bytes_per_stream: self.max_bytes_per_stream,
+            max_age_ms: self.max_age_ms,
+            max_bytes_per_machine: self.max_bytes_per_machine,
+            max_bytes_global: self.max_bytes_global,
+            replay_page_max_frames: self.replay_page_max_frames,
+            replay_page_max_bytes: self.replay_page_max_bytes,
+            disk_reserve_bytes: self.disk_reserve_bytes,
+            disk_reserve_percent: self.disk_reserve_percent,
+        }
+    }
+
+    /// 在 worker 或 SQLite 文件创建前验证路径和所有配额。
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_store_path(&self.storage_path)?;
+        self.retention_limits().validate()?;
+        if self.max_enrollment_codes == 0 || self.max_enrollment_codes > MAX_ENROLLMENT_CODES {
+            return Err(StoreError::InvalidValue {
+                field: "max_enrollment_codes",
+                reason: "enrollment code bound must be in 1...4096",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn into_store_config(self) -> Result<RelayV2StoreConfig, StoreError> {
+        RelayV2StoreConfig::try_from(self)
+    }
+}
+
+impl TryFrom<RelayV2StoreSettings> for RelayV2StoreConfig {
+    type Error = StoreError;
+
+    fn try_from(settings: RelayV2StoreSettings) -> Result<Self, Self::Error> {
+        settings.validate()?;
+        let retention = settings.retention_limits();
+        Ok(RelayV2StoreConfig::new(settings.storage_path)
+            .with_retention(retention)
+            .with_max_enrollment_codes(settings.max_enrollment_codes))
+    }
 }
 
 /// TLS 证书/私钥文件路径。
@@ -215,6 +303,7 @@ impl RelayConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::v2::store::{RelayV2StoreConfig, StoreError};
     #[allow(unused_imports)]
     use std::net::SocketAddr;
     fn cfg(bind: &str, tls: bool, allow: bool) -> RelayConfig {
@@ -279,5 +368,116 @@ mod tests {
             default_storage_path().to_str().unwrap(),
             "./agentdeck-relay-data/relay.db"
         );
+    }
+
+    #[test]
+    fn v2_store_settings_preserve_every_runtime_limit_during_conversion() {
+        let mut settings =
+            RelayV2StoreSettings::new(PathBuf::from("/var/lib/agentdeck-relay/v2.db"));
+        settings.max_frames_per_stream = 111;
+        settings.max_bytes_per_stream = 222;
+        settings.max_age_ms = 333;
+        settings.max_bytes_per_machine = 444;
+        settings.max_bytes_global = 555;
+        settings.replay_page_max_frames = 12;
+        settings.replay_page_max_bytes = 4 * 1024 * 1024 + 666;
+        settings.disk_reserve_bytes = 777;
+        settings.disk_reserve_percent = 8;
+        settings.max_enrollment_codes = 999;
+
+        let store_config = RelayV2StoreConfig::try_from(settings).unwrap();
+
+        assert_eq!(
+            store_config.storage_path,
+            PathBuf::from("/var/lib/agentdeck-relay/v2.db")
+        );
+        assert_eq!(store_config.retention.max_frames_per_stream, 111);
+        assert_eq!(store_config.retention.max_bytes_per_stream, 222);
+        assert_eq!(store_config.retention.max_age_ms, 333);
+        assert_eq!(store_config.retention.max_bytes_per_machine, 444);
+        assert_eq!(store_config.retention.max_bytes_global, 555);
+        assert_eq!(store_config.retention.replay_page_max_frames, 12);
+        assert_eq!(
+            store_config.retention.replay_page_max_bytes,
+            4 * 1024 * 1024 + 666
+        );
+        assert_eq!(store_config.retention.disk_reserve_bytes, 777);
+        assert_eq!(store_config.retention.disk_reserve_percent, 8);
+        assert_eq!(store_config.max_enrollment_codes, 999);
+    }
+
+    #[test]
+    fn v2_store_settings_use_the_approved_retention_defaults() {
+        let settings =
+            RelayV2StoreSettings::new(PathBuf::from("/var/lib/agentdeck-relay/relay.db"));
+
+        assert_eq!(settings.max_frames_per_stream, 2_000);
+        assert_eq!(settings.max_bytes_per_stream, 64 * 1024 * 1024);
+        assert_eq!(settings.max_age_ms, 24 * 60 * 60 * 1_000);
+        assert_eq!(settings.max_bytes_per_machine, 512 * 1024 * 1024);
+        assert_eq!(settings.max_bytes_global, 4 * 1024 * 1024 * 1024);
+        assert_eq!(settings.replay_page_max_frames, 64);
+        assert_eq!(settings.replay_page_max_bytes, 8 * 1024 * 1024);
+        assert_eq!(settings.disk_reserve_bytes, 512 * 1024 * 1024);
+        assert_eq!(settings.disk_reserve_percent, 5);
+        assert_eq!(settings.max_enrollment_codes, 4_096);
+    }
+
+    #[test]
+    fn v2_store_settings_reject_relative_storage_before_store_start() {
+        let error = RelayV2StoreConfig::try_from(RelayV2StoreSettings::new(PathBuf::from(
+            "relative/relay.db",
+        )))
+        .unwrap_err();
+
+        assert!(matches!(error, StoreError::PathNotAbsolute));
+
+        let noncanonical =
+            RelayV2StoreSettings::new(PathBuf::from("/var/lib/agentdeck-relay/../relay.db"));
+        let error = RelayV2StoreConfig::try_from(noncanonical).unwrap_err();
+        assert!(matches!(error, StoreError::PathNotCanonical));
+
+        for alias in [
+            "/var/lib/./agentdeck-relay/relay.db",
+            "/var//lib/agentdeck-relay/relay.db",
+            "/var/lib/agentdeck-relay/relay.db/",
+        ] {
+            let error =
+                RelayV2StoreConfig::try_from(RelayV2StoreSettings::new(PathBuf::from(alias)))
+                    .unwrap_err();
+            assert!(
+                matches!(error, StoreError::PathNotCanonical),
+                "lexical alias must be rejected: {alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_store_settings_reject_invalid_replay_and_retention_limits() {
+        let mut settings =
+            RelayV2StoreSettings::new(PathBuf::from("/var/lib/agentdeck-relay/relay.db"));
+        settings.replay_page_max_frames = 65;
+
+        let error = RelayV2StoreConfig::try_from(settings).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoreError::InvalidValue {
+                field: "retention",
+                ..
+            }
+        ));
+
+        let mut enrollment =
+            RelayV2StoreSettings::new(PathBuf::from("/var/lib/agentdeck-relay/relay.db"));
+        enrollment.max_enrollment_codes = 4_097;
+        let error = RelayV2StoreConfig::try_from(enrollment).unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::InvalidValue {
+                field: "max_enrollment_codes",
+                ..
+            }
+        ));
     }
 }

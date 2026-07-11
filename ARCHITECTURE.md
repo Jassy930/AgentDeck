@@ -132,6 +132,35 @@ agentdeckd
 - reset 不提供开发状态恢复或迁移；成功后只能重新配对。P0 统一门禁入口是
   `bash scripts/verify-relay-companion-mvp.sh p0`。
 
+### Relay Companion MVP P2.1 v2 Store actor 边界
+
+- P2.1 在 `agentdeck-relay::v2::store` 建立与 v1 并列的 library；生产 binary、
+  listener 与 CLI 仍走 v1，直到 P2.9 原子切换，禁止提前形成双栈生产入口。
+- 一个 bounded async command queue 只通向一个 blocking worker；队列满时立即返回
+  typed busy，不保留任意数量的等待请求。该 worker 独占
+  唯一 `rusqlite::Connection`。async router 不持有 connection，也不能绕过 actor
+  直接执行 SQL。worker 停止或未回复必须返回 typed `StoreError`。
+- machine/grant/stream/enrollment、Publish/HWM/retention、subscription/ACK、revoke
+  tombstone 与 purge readback 分别在 `BEGIN IMMEDIATE` 事务中完成；需要持久化的
+  成功只能在 COMMIT 后返回。fault injection tests 固定 COMMIT 前 rollback 与
+  重试/重启幂等语义。
+- startup/显式 full maintenance 用 keyset 常量内存遍历并收敛所有硬配额；replay
+  只检查并清理目标 stream 的逻辑过期行，正常无过期 replay 不开启写事务。
+  P2.6 只负责 full maintenance 周期调度与 lifecycle，不在 actor 内藏永久 timer。
+- Relay 只保存随机 route、公钥/证书 hash、单调 generation/serial、sequence、
+  Relay 计算的 receive time/size 与 opaque sealed bytes；challenge、PairRoute、
+  active writer 和业务目录不进入 v2 SQLite。
+- `RelayV2StoreSettings` 是独立运行配置面，覆盖 stream/machine/global retention、
+  bounded replay、enrollment code count 与磁盘 reserve；显式转换在 worker 启动前校验生产绝对路径与
+  hard maxima。它不复用 v1 的相对 `--storage` 默认值，也不改变 v1 行为。
+- Store 打开必须读回 WAL/FULL/foreign_keys/5s busy timeout；existing/new
+  目录与 DB 都必须由当前 uid 持有且权限为 0700/0600。schema
+  family/version/DDL signature 不匹配、legacy v1、高版本或损坏
+  DB 均 fail-closed，不自动恢复或降级。
+- hot-WAL inspection snapshot 在复制前持久化 source-bound marker 并持有排他锁；
+  restart cleanup 只接受 exact marker、owner/mode、child allowlist 与 unlocked 四重
+  证明，逐文件删除后 `remove_dir`，禁止前缀 `remove_dir_all`。
+
 ### R1a 隐含约束（供 R2 参考）
 
 - **R1a machine_id ≡ device_id**：`server/ws.rs::connect` 用 `device.device_id` 作 `ConnRole::Machine.machine_id`，`router.rs` RegisterMachine 授权强制 `machine.machine_id == connection.machine_id`——**enrolled 的 machine 设备的 `machine_id` 严格等于 `device_id`**。CLI 生成的随机 `device_id = "cli-<profile>-<random>"` 会锁定 R2 daemon remote-mode 里对应 machine 的 identifier；R2 设计需评估是否解耦 machine_id 与 device_id（例如 machine 元数据里显式携带独立 machine_id）。

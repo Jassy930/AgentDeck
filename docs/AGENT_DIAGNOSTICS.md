@@ -59,6 +59,67 @@ unlink 前，因此应保留全部四个目标。若报告文件在校验期间�
 成功只删除 DB、精确 `-wal` / `-shm` 与指定 credential；同前缀和其他文件保留，
 之后必须重新配对。
 
+## Relay v2 Store 诊断（Companion MVP P2.1）
+
+P2.1 只建立与 v1 并列的 v2 Store library；生产 Relay binary 要到 P2.9 才原子
+切换，当前不能把 Store 测试通过解释为公网 v2 listener 已上线。v2 Store 由一个
+blocking worker 独占 SQLite connection，async 调用通过有界队列串行进入；启动
+成功必须同时读回 `journal_mode=WAL`、`synchronous=FULL`、`foreign_keys=ON` 与
+`busy_timeout=5000`。
+
+生产存储路径必须是 lexical-canonical absolute regular-file path，拒绝 `.` / `..`
+alias、文件或任一父级
+symlink；新建目录和 DB 权限分别为 0700/0600，已有路径权限更宽时 fail-closed。
+schema marker 同时绑定 family、version、精确 DDL SHA-256 signature 与
+relay server ID。高版本、精确 v1 legacy、未知或损坏 schema 都在写入前拒绝，
+检查路径不会改写 DB/WAL/SHM。没有原地恢复或自动降级：停止对应 Relay，保留
+原文件用于取证；开发状态按受控 reset 后重新配对，不能手改 `user_version`、
+marker 或 DDL 冒充兼容。
+
+Store 默认 retention 为每 stream 2,000 frames / 64 MiB / 24 小时、每 machine
+512 MiB、全局 4 GiB；replay 每页最多 64 frames / 8 MiB。磁盘安全余量取
+512 MiB 与总容量 5% 的较大值。`relay.disk.low` 只拒绝新的 Publish，replay、
+revoke 与 purge 等读/控制路径仍可用；配额淘汰优先于 ACK，随后重放旧 cursor
+会明确返回 `relay.replay.gap`，不得静默跳过。
+
+Store 启动和显式 full maintenance 用 keyset 逐项收敛全部配额；每次 replay 只对
+目标 stream 做有过期行才写入的 age maintenance，避免单页重放扫描全库，同时确保
+超过 age cap 的 ciphertext 不会等到下一次 Publish 才失效。P2.6 的 lifecycle
+sweeper 只负责周期触发 full maintenance。full maintenance 同时删除严格早于当前
+时间的 enrollment code，exact
+expiry 仍允许相同请求取回冻结 response，超过 1 ms 后不提供恢复。code 表最多
+4,096 行，可按部署下调但不能调高。hot-WAL schema 快照若需要物理复制，必须先按
+预计复制 bytes 加磁盘 reserve 做 fail-closed preflight。每个 snapshot 在复制前
+fsync 与 source path hash 绑定的 marker 并持有排他锁；重启只逐文件清理同 owner、
+0700/0600、marker 精确匹配、无额外 child 且锁已释放的 artifact，绝不按前缀递归删。
+
+P2.1 的 v2 配置面是独立 `RelayV2StoreSettings`，没有复用或改变 v1
+`RelayConfig`。它显式承载 storage path、stream count/bytes/age、machine/global
+bytes、replay page count/bytes 与磁盘 reserve bytes/percent；转换为
+`RelayV2StoreConfig` 时还带入 enrollment code count，并先拒绝相对路径和
+无效/越界配额。CLI、env 与 config file
+优先级要到 P2.6 接入，当前不要把 v1 `--storage` 当成已启用的 v2 配置入口。
+
+| v2 Store diagnostic code | 含义 | 下一步 |
+| --- | --- | --- |
+| `relay.store.path_invalid` | 路径非规范绝对路径、含 symlink、owner 不符、不是 regular file 或权限过宽 | 停止 Relay，核对 exact path、owner、父目录和 0700/0600 权限 |
+| `relay.store.schema_too_new` | DB schema 高于当前 binary | 使用匹配版本；禁止降级打开或改 marker |
+| `relay.store.legacy_reset_required` | exact v1 DB 被交给 v2 Store | 使用上节受控 v1 reset，随后重新配对 |
+| `relay.store.schema_corrupt` | marker、DDL、字段类型或 signature 不匹配 | 保留文件取证；受控重建 Store 并重新配对 |
+| `relay.store.pragma_mismatch` | WAL/FULL/FK/5s 任一启动读回不一致 | 检查 SQLite build、文件系统和进程占用，不能带病启动 |
+| `relay.store.unavailable` | SQLite/I/O/worker 不可用 | 检查磁盘、权限和同路径进程；不要把 frame 视为已持久化 |
+| `relay.store.busy` | bounded Store command queue 已满 | 对当前连接施加背压或返回可重试失败；请求未被 Store 接管，禁止当作已提交 |
+| `relay.store.invalid_value` | 持久值或 retention 配置超出约束 | 修正配置/调用方；禁止截断或整数 wrap |
+| `relay.store.not_found` | machine、grant 或 stream 不存在 | 重新同步授权/stream；不要隐式创建跨 route 绑定 |
+| `relay.store.enrollment_not_found` | enrollment code hash 不存在 | 核对 bundle 是否来自当前 Relay；重新创建短期 enrollment bundle |
+| `relay.store.enrollment_expired` | enrollment code 已超过 absolute expiry | 重新创建 bundle；禁止延长或复活旧 code |
+| `relay.store.conflict` / `relay.store.stale` | 幂等 bytes 冲突或单调值回退 | 终止该请求并检查 generation、serial 与 canonical bytes |
+| `relay.stream.out_of_order` | stream sequence 不是期望的下一值 | 以当前 generation/HWM 重连；到 `u64::MAX` 前创建新 generation |
+| `relay.auth.revoked` | grant 已撤销 | 终止设备链路并走重新配对 |
+| `relay.quota.exceeded` / `relay.disk.low` | 单帧/stream/machine/global 或磁盘安全门禁拒绝 Publish | 先释放容量或调整经批准的配额，再重试同一 canonical frame |
+| `relay.frame.too_large` | canonical outer frame 超过 4 MiB | 按 transfer part 规则拆分，不能截断 |
+| `relay.replay.gap` / `relay.replay.cursor_invalid` | cursor 已被淘汰或 continuation 不属于本次 replay | 暂停 live，执行 bounded backfill/snapshot 后重新订阅 |
+
 ## Failure Codes
 
 | code | 含义 | 下一步 |

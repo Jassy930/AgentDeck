@@ -23,6 +23,8 @@ pub mod server;
 // 构建下仍只被自身单测使用，保留 dead_code 静默。
 #[allow(dead_code)]
 pub mod store;
+/// Relay Companion MVP v2 原子 cutover 实现；与 Relay v1 路径并列。
+pub mod v2;
 
 pub use bridge::StdioMachineBridge;
 pub use relay_link::RelayLink;
