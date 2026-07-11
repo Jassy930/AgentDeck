@@ -15,8 +15,10 @@
 
 pub mod aead;
 pub mod canonical;
+pub mod counter;
 pub mod error;
 pub mod hpke;
+pub mod replay;
 pub mod sealed_blob;
 pub mod signature;
 
