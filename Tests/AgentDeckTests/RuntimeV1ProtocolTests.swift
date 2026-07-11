@@ -80,6 +80,39 @@ final class RuntimeV1ProtocolTests: XCTestCase {
         )
     }
 
+    func testCreatePairInviteTTLDefaultsWhenMissingButRejectsNull() throws {
+        let fixtures = try loadRawFixtureObjects()
+        let source = try fixtureValue(named: "requestCreatePairInvite", in: fixtures)
+
+        var missing = source
+        var missingBody = try XCTUnwrap(missing["body"] as? [String: Any])
+        var missingPayload = try XCTUnwrap(missingBody["payload"] as? [String: Any])
+        missingPayload.removeValue(forKey: "ttlSecs")
+        missingBody["payload"] = missingPayload
+        missing["body"] = missingBody
+
+        let decoded = try RuntimeV1WireCodec.decodeEnvelope(
+            JSONSerialization.data(withJSONObject: missing)
+        )
+        guard case .request(.createPairInvite(_, let ttlSecs, _)) = decoded.body else {
+            return XCTFail("expected createPairInvite request")
+        }
+        XCTAssertEqual(ttlSecs, 300)
+
+        var explicitNull = source
+        var nullBody = try XCTUnwrap(explicitNull["body"] as? [String: Any])
+        var nullPayload = try XCTUnwrap(nullBody["payload"] as? [String: Any])
+        nullPayload["ttlSecs"] = NSNull()
+        nullBody["payload"] = nullPayload
+        explicitNull["body"] = nullBody
+
+        XCTAssertThrowsError(
+            try RuntimeV1WireCodec.decodeEnvelope(
+                JSONSerialization.data(withJSONObject: explicitNull)
+            )
+        )
+    }
+
     func testRustJSONLDecodesAndReencodesWithEquivalentJSON() throws {
         let fixtures = try loadFixtures()
         XCTAssertGreaterThan(fixtures.count, 16)

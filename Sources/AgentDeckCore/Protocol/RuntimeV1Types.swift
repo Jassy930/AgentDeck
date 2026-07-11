@@ -364,9 +364,15 @@ public enum RuntimeRequestV1: Codable, Sendable {
                 decoder,
                 allowed: ["request", "displayName", "ttlSecs", "scope"]
             )
+            let ttlSecs: UInt32
+            if container.contains(key("ttlSecs")) {
+                ttlSecs = try container.decode(UInt32.self, forKey: key("ttlSecs"))
+            } else {
+                ttlSecs = 300
+            }
             self = .createPairInvite(
                 displayName: try container.decode(String.self, forKey: key("displayName")),
-                ttlSecs: try container.decodeIfPresent(UInt32.self, forKey: key("ttlSecs")) ?? 300,
+                ttlSecs: ttlSecs,
                 scope: try container.decode(
                     RuntimeLocalOnlyAdministrationV1.self,
                     forKey: key("scope")
