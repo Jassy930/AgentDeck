@@ -41,6 +41,14 @@ impl SecretAeadKey {
 pub struct SenderCounter(pub u64);
 
 /// 单方向发送 key：key 身份 + epoch + key-directory revision + nonce prefix + 秘密 key。
+///
+/// # 安全（nonce 唯一性）
+///
+/// nonce = `nonce_prefix || counter`（design §7.4），因此**同一 key 下 counter 复用等价于
+/// nonce 复用**——对 ChaCha20-Poly1305 是灾难性的（泄漏 keystream 与认证密钥）。counter 的
+/// 唯一性由上层 CounterGuard / counter block reservation（P1.5，design §7.4）负责：预留先
+/// 提升 Keychain high-water，崩溃恢复允许跳号但绝不复用；本类型与 [`seal_symmetric`]
+/// **不做任何复用防护**。
 #[derive(Debug)]
 pub struct AeadSendingKey {
     pub key_id: KeyId,
@@ -133,6 +141,13 @@ fn open(
 /// 对称封装明文，产出未签名 sealed blob（design §7.3/§7.4）。AAD 绑定 `context`，nonce 由
 /// key prefix + counter 组装。`payload_kind` 是每条消息的业务类型引用（只在密文外壳头，供
 /// endpoint 解析），`key_directory_revision` 来自发送 key 的目录状态。
+///
+/// # 安全（调用方契约）
+///
+/// 调用方**必须保证同一 `key` 下 `counter` 永不复用**：(key, counter) 复用即 nonce 复用，
+/// 对 ChaCha20-Poly1305 是灾难性的。本函数**不校验**复用——唯一性由上层 CounterGuard /
+/// counter block reservation（P1.5，design §7.4）负责；counter 接近上界时上层必须强制新
+/// epoch，不允许 wrap。
 pub fn seal_symmetric(
     key: &AeadSendingKey,
     context: &OuterContextV1,
@@ -155,6 +170,13 @@ pub fn seal_symmetric(
 
 /// 对已验证 sealed blob 做 AEAD 解密取明文（type-state 保证已验签发送方）。AAD 必须与
 /// 发送方 `context` 逐字节一致，否则 tag 校验失败返回 [`CryptoError::BadCiphertext`]。
+///
+/// # key 选择（上层职责）
+///
+/// 本函数**不交叉校验** [`AeadReceivingKey`] 的 `key_id`/`epoch` 与 blob 头
+/// （`key_id`/`key_epoch`/`key_directory_revision`）的一致性——按 blob 头选取正确接收 key
+/// 属上层（key directory / replay state，design §7.2/§7.5）职责；传错 key 由 AEAD tag
+/// 校验失败兜底（[`CryptoError::BadCiphertext`]），不会静默解出错误明文。
 pub fn open_symmetric(
     key: &AeadReceivingKey,
     context: &OuterContextV1,

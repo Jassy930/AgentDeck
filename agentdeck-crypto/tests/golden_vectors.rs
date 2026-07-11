@@ -606,6 +606,18 @@ fn verify_sealed_rejects_epoch_tamper() {
 }
 
 #[test]
+fn verify_sealed_rejects_key_id_epoch_tamper() {
+    // 区别于上面的 `key_epoch` 字段：这里篡改 blob 头 `key_id.epoch`（TBS 独立绑定的
+    // key 身份 epoch），验签同样必须失败。
+    let mut signed = signed_sealed_sample();
+    signed.inner.key_id.epoch = 5;
+    assert!(matches!(
+        verify_sealed(signed, &vk(), &outer_sample()),
+        Err(CryptoError::BadSignature)
+    ));
+}
+
+#[test]
 fn verify_sealed_rejects_counter_tamper() {
     let mut signed = signed_sealed_sample();
     // counter 位于 nonce 的后 8 字节，tbs 绑定 nonce → 篡改必被验证捕获。
