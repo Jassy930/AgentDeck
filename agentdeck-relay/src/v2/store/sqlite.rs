@@ -20,11 +20,12 @@ use super::model::{
     MAX_ENROLLMENT_CODES, MachineLinkAuthCommit, MachineRecord, MachineTrustView,
     MaintenanceReport, PersistAck, PersistPublish, PersistRevocation, PersistSubscription,
     PersistUnsubscribe, PublishCommit, PublishDisposition, PurgeMachine, PurgeReadback,
-    RegisterMachine, RelayV2StoreConfig, ReplayCursor, ReplayFrame, ReplayPage, ReplayPageRequest,
-    ReplayPosition, RevocationCommit, StoreError, StoreSnapshot, StreamRecord, StreamRegistration,
-    SubscriptionLease, UnsubscribeCommit, high_water_from_text, high_water_text, monotonic_blob,
-    monotonic_from_blob, normalize_platform_root_alias, sql_i64, stream_seq_from_text,
-    stream_seq_text, validate_store_path,
+    REPLAY_PAGE_HARD_MAX_BYTES, REPLAY_PAGE_HARD_MAX_FRAMES, RegisterMachine, RelayV2StoreConfig,
+    ReplayCursor, ReplayFrame, ReplayPage, ReplayPageRequest, ReplayPosition, RevocationCommit,
+    StoreError, StoreSnapshot, StreamRecord, StreamRegistration, SubscriptionLease,
+    UnsubscribeCommit, high_water_from_text, high_water_text, monotonic_blob, monotonic_from_blob,
+    normalize_platform_root_alias, sql_i64, stream_seq_from_text, stream_seq_text,
+    validate_store_path,
 };
 
 const DIRECTORY_MODE: u32 = 0o700;
@@ -32,6 +33,7 @@ const DATABASE_MODE: u32 = 0o600;
 const INSPECTION_DIRECTORY_PREFIX: &str = ".agentdeck-relay-schema-inspect-";
 const INSPECTION_MARKER_NAME: &str = ".agentdeck-schema-snapshot-v1";
 const INSPECTION_MARKER_MAGIC: &[u8] = b"agentdeck-relay-schema-snapshot-v1\0";
+const METADATA_GROWTH_RESERVE_BYTES: u64 = 64 * 1024;
 
 /// 打开并完整准备生产 store。
 ///
@@ -40,6 +42,7 @@ const INSPECTION_MARKER_MAGIC: &[u8] = b"agentdeck-relay-schema-snapshot-v1\0";
 /// journal 下原子迁移，再切到 WAL，避免把初始 schema 只留在 WAL sidecar。
 pub(crate) fn open(config: &RelayV2StoreConfig) -> Result<Connection, StoreError> {
     config.retention.validate()?;
+    config.metadata_limits.validate()?;
     if config.max_enrollment_codes == 0 || config.max_enrollment_codes > MAX_ENROLLMENT_CODES {
         return Err(StoreError::InvalidValue {
             field: "max_enrollment_codes",
@@ -94,8 +97,77 @@ pub(crate) fn open(config: &RelayV2StoreConfig) -> Result<Connection, StoreError
     // `open` 只在 marker、精确 schema 和全部 PRAGMA 都能从 worker 所持连接
     // 读回后返回；ready oneshot 因而不会早于完整 startup gate。
     snapshot(&conn)?;
+    validate_existing_metadata_limits(&conn, config)?;
     run_maintenance(&mut conn, config)?;
     Ok(conn)
+}
+
+/// 配置下调或旧版本遗留数据也必须受当前 hard bound 约束。这里不静默删除 durable
+/// stream/subscription；任何既有超限都在 worker 发出 ready 前 typed fail-closed。
+fn validate_existing_metadata_limits(
+    conn: &Connection,
+    config: &RelayV2StoreConfig,
+) -> Result<(), StoreError> {
+    let stream_machine_limit = sql_i64(
+        config.metadata_limits.max_streams_per_machine,
+        "metadata_limits.max_streams_per_machine",
+    )?;
+    let over_stream_machine = conn
+        .query_row(
+            "SELECT 1 FROM streams
+             GROUP BY machine_route HAVING COUNT(*) > ?1 LIMIT 1",
+            params![stream_machine_limit],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+    if over_stream_machine {
+        return Err(StoreError::QuotaExceeded {
+            scope: "streams.machine",
+        });
+    }
+    if query_u64(
+        conn,
+        "SELECT COUNT(*) FROM streams",
+        [],
+        "streams.global_count",
+    )? > config.metadata_limits.max_streams_global
+    {
+        return Err(StoreError::QuotaExceeded {
+            scope: "streams.global",
+        });
+    }
+
+    let subscription_device_limit = sql_i64(
+        config.metadata_limits.max_subscriptions_per_device,
+        "metadata_limits.max_subscriptions_per_device",
+    )?;
+    let over_subscription_device = conn
+        .query_row(
+            "SELECT 1 FROM subscriptions
+             GROUP BY machine_route, device_route HAVING COUNT(*) > ?1 LIMIT 1",
+            params![subscription_device_limit],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+    if over_subscription_device {
+        return Err(StoreError::QuotaExceeded {
+            scope: "subscriptions.device",
+        });
+    }
+    if query_u64(
+        conn,
+        "SELECT COUNT(*) FROM subscriptions",
+        [],
+        "subscriptions.global_count",
+    )? > config.metadata_limits.max_subscriptions_global
+    {
+        return Err(StoreError::QuotaExceeded {
+            scope: "subscriptions.global",
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn snapshot(conn: &Connection) -> Result<StoreSnapshot, StoreError> {
@@ -701,7 +773,10 @@ pub(crate) fn register_stream(
         let generation = agentdeck_protocol::relay_v2::StreamGenerationId::from_bytes(
             array_from_blob::<16>(generation_blob, "streams.generation")?,
         );
-        if machine != request.machine_route || generation != request.generation {
+        if machine != request.machine_route {
+            return Err(StoreError::StreamOwnerConflict);
+        }
+        if generation != request.generation {
             return Err(StoreError::StreamBindingConflict);
         }
         let retained_bytes = u64::try_from(retained).map_err(|_| StoreError::InvalidValue {
@@ -733,8 +808,31 @@ pub(crate) fn register_stream(
         .optional()?
         .is_some()
     {
-        return Err(StoreError::StreamBindingConflict);
+        return Err(StoreError::StreamOwnerConflict);
     }
+    let machine_streams = query_u64(
+        &tx,
+        "SELECT COUNT(*) FROM streams WHERE machine_route = ?1",
+        params![request.machine_route.as_bytes().as_slice()],
+        "streams.machine_count",
+    )?;
+    if machine_streams >= config.metadata_limits.max_streams_per_machine {
+        return Err(StoreError::QuotaExceeded {
+            scope: "streams.machine",
+        });
+    }
+    let global_streams = query_u64(
+        &tx,
+        "SELECT COUNT(*) FROM streams",
+        [],
+        "streams.global_count",
+    )?;
+    if global_streams >= config.metadata_limits.max_streams_global {
+        return Err(StoreError::QuotaExceeded {
+            scope: "streams.global",
+        });
+    }
+    ensure_metadata_growth_capacity(config)?;
     tx.execute(
         "INSERT INTO streams(
             stream_route, machine_route, generation, high_water_seq, oldest_seq, retained_bytes
@@ -794,9 +892,7 @@ pub(crate) fn publish(
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     load_active_machine_trust(&tx, request.machine_route)?;
     let stream = load_stream_state(&tx, stream_route)?;
-    if stream.machine_route != request.machine_route || stream.generation != generation {
-        return Err(StoreError::StreamBindingConflict);
-    }
+    ensure_stream_binding(&stream, request.machine_route, generation)?;
 
     let existing_hash = tx
         .query_row(
@@ -956,6 +1052,20 @@ fn load_stream_state(
             .map(|value| stream_seq_from_text(value, "streams.oldest_seq"))
             .transpose()?,
     })
+}
+
+fn ensure_stream_binding(
+    stream: &StoredStreamState,
+    machine_route: MachineRouteId,
+    generation: StreamGenerationId,
+) -> Result<(), StoreError> {
+    if stream.machine_route != machine_route {
+        return Err(StoreError::StreamOwnerConflict);
+    }
+    if stream.generation != generation {
+        return Err(StoreError::StreamBindingConflict);
+    }
+    Ok(())
 }
 
 fn enforce_retention(
@@ -1180,6 +1290,44 @@ fn trim_fully_acked_prefixes(tx: &rusqlite::Transaction<'_>) -> Result<u64, Stor
     Ok(deleted)
 }
 
+fn trim_fully_acked_prefix_for_stream(
+    tx: &rusqlite::Transaction<'_>,
+    stream_route: StreamRouteId,
+    generation: StreamGenerationId,
+) -> Result<u64, StoreError> {
+    let ack = tx
+        .query_row(
+            "SELECT MIN(ack)
+             FROM subscriptions
+             WHERE stream_route = ?1 AND stream_generation = ?2
+             GROUP BY stream_route, stream_generation
+             HAVING COUNT(*) = COUNT(ack)",
+            params![
+                stream_route.as_bytes().as_slice(),
+                generation.as_bytes().as_slice(),
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(ack) = ack else {
+        // 没有 subscription，或仍有至少一个 NULL ACK 时，不存在可安全裁剪的前缀。
+        return Ok(0);
+    };
+    u64::try_from(tx.execute(
+        "DELETE FROM frames
+         WHERE stream_route = ?1 AND generation = ?2 AND stream_seq <= ?3",
+        params![
+            stream_route.as_bytes().as_slice(),
+            generation.as_bytes().as_slice(),
+            ack,
+        ],
+    )?)
+    .map_err(|_| StoreError::InvalidValue {
+        field: "maintenance.ack_trimmed_frames",
+        reason: "deleted frame count does not fit u64",
+    })
+}
+
 fn delete_oldest_for_stream(
     tx: &rusqlite::Transaction<'_>,
     stream_route: StreamRouteId,
@@ -1283,6 +1431,19 @@ fn query_u64<P: rusqlite::Params>(
     })
 }
 
+fn ensure_metadata_growth_capacity(config: &RelayV2StoreConfig) -> Result<(), StoreError> {
+    let disk = config.disk_space_probe.space(&config.storage_path)?;
+    let reserve = config.retention.disk_reserve_for(disk.total_bytes);
+    if disk
+        .available_bytes
+        .checked_sub(METADATA_GROWTH_RESERVE_BYTES)
+        .is_none_or(|remaining| remaining < reserve)
+    {
+        return Err(StoreError::DiskSpaceLow);
+    }
+    Ok(())
+}
+
 pub(crate) fn subscribe(
     conn: &mut Connection,
     config: &RelayV2StoreConfig,
@@ -1299,9 +1460,11 @@ pub(crate) fn subscribe(
         false,
     )?;
     let stream = load_stream_state(&tx, request.stream_route)?;
-    if stream.machine_route != request.machine_route || stream.generation != request.generation {
-        return Err(StoreError::StreamBindingConflict);
-    }
+    ensure_stream_binding(&stream, request.machine_route, request.generation)?;
+    let replay_through = stream
+        .high_water_seq
+        .map(StreamCursor::At)
+        .unwrap_or(StreamCursor::BeforeFirst);
     match (stream.high_water_seq, request.start) {
         (None, StreamCursor::At(_)) => return Err(StoreError::InvalidReplayCursor),
         (Some(high_water), StreamCursor::At(cursor)) if cursor > high_water => {
@@ -1346,6 +1509,35 @@ pub(crate) fn subscribe(
         )
         .optional()?;
     let duplicate = existing_ack.is_some();
+    if !duplicate {
+        let device_subscriptions = query_u64(
+            &tx,
+            "SELECT COUNT(*) FROM subscriptions
+             WHERE machine_route = ?1 AND device_route = ?2",
+            params![
+                request.machine_route.as_bytes().as_slice(),
+                request.device_route.as_bytes().as_slice(),
+            ],
+            "subscriptions.device_count",
+        )?;
+        if device_subscriptions >= config.metadata_limits.max_subscriptions_per_device {
+            return Err(StoreError::QuotaExceeded {
+                scope: "subscriptions.device",
+            });
+        }
+        let global_subscriptions = query_u64(
+            &tx,
+            "SELECT COUNT(*) FROM subscriptions",
+            [],
+            "subscriptions.global_count",
+        )?;
+        if global_subscriptions >= config.metadata_limits.max_subscriptions_global {
+            return Err(StoreError::QuotaExceeded {
+                scope: "subscriptions.global",
+            });
+        }
+        ensure_metadata_growth_capacity(config)?;
+    }
     tx.execute(
         "INSERT INTO subscriptions(
             machine_route, device_route, grant_serial, stream_route, stream_generation,
@@ -1373,6 +1565,7 @@ pub(crate) fn subscribe(
         .transpose()?;
     Ok(SubscriptionLease {
         start: request.start,
+        replay_through,
         ack,
         duplicate,
     })
@@ -1396,8 +1589,13 @@ pub(crate) fn unsubscribe(
             request.generation.as_bytes().as_slice(),
         ],
     )? > 0;
-    trim_fully_acked_prefixes(&tx)?;
-    recompute_stream_stats(&tx)?;
+    if removed {
+        let deleted =
+            trim_fully_acked_prefix_for_stream(&tx, request.stream_route, request.generation)?;
+        if deleted > 0 {
+            recompute_one_stream_stats(&tx, request.stream_route, request.generation)?;
+        }
+    }
     tx.commit()?;
     Ok(UnsubscribeCommit { removed })
 }
@@ -1417,9 +1615,7 @@ pub(crate) fn ack(
         false,
     )?;
     let stream = load_stream_state(&tx, request.stream_route)?;
-    if stream.machine_route != request.machine_route || stream.generation != request.generation {
-        return Err(StoreError::StreamBindingConflict);
-    }
+    ensure_stream_binding(&stream, request.machine_route, request.generation)?;
     let high_water = stream.high_water_seq.ok_or(StoreError::SequenceConflict {
         expected: 0,
         found: request.up_to_seq,
@@ -1449,7 +1645,8 @@ pub(crate) fn ack(
     let current = current
         .map(|value| stream_seq_from_text(value, "subscriptions.ack"))
         .transpose()?;
-    if current.is_none_or(|value| request.up_to_seq > value) {
+    let advanced = current.is_none_or(|value| request.up_to_seq > value);
+    if advanced {
         tx.execute(
             "UPDATE subscriptions SET ack = ?6, updated_at = ?7
              WHERE machine_route = ?1 AND device_route = ?2 AND grant_serial = ?3
@@ -1464,9 +1661,12 @@ pub(crate) fn ack(
                 now,
             ],
         )?;
+        let deleted =
+            trim_fully_acked_prefix_for_stream(&tx, request.stream_route, request.generation)?;
+        if deleted > 0 {
+            recompute_one_stream_stats(&tx, request.stream_route, request.generation)?;
+        }
     }
-    trim_fully_acked_prefixes(&tx)?;
-    recompute_stream_stats(&tx)?;
     config.fault_injector.check(FaultPoint::AckBeforeCommit)?;
     tx.commit()?;
     Ok(())
@@ -1477,11 +1677,30 @@ pub(crate) fn replay_page(
     config: &RelayV2StoreConfig,
     request: ReplayPageRequest,
 ) -> Result<ReplayPage, StoreError> {
+    if request.page_max_frames == 0
+        || request.page_max_frames > REPLAY_PAGE_HARD_MAX_FRAMES
+        || request.page_max_bytes == 0
+        || request.page_max_bytes > REPLAY_PAGE_HARD_MAX_BYTES
+    {
+        return Err(StoreError::InvalidValue {
+            field: "replay_page.limit",
+            reason: "caller page limit must be non-zero and within Store hard maxima",
+        });
+    }
+    let page_max_frames = request
+        .page_max_frames
+        .min(config.retention.replay_page_max_frames);
+    let page_max_bytes = request
+        .page_max_bytes
+        .min(config.retention.replay_page_max_bytes);
+    // 先校验 opaque stream 的 trust-domain ownership，再允许 replay 触发目标 stream 的
+    // age maintenance。否则知道 foreign route/generation 的设备可以借 replay 请求对别的
+    // machine 产生持久化副作用，即使最终响应仍是 forbidden/not-found。
+    let stream = load_stream_state(conn, request.stream_route)?;
+    ensure_stream_binding(&stream, request.machine_route, request.generation)?;
     run_replay_maintenance(conn, config, request.stream_route, request.generation)?;
     let stream = load_stream_state(conn, request.stream_route)?;
-    if stream.machine_route != request.machine_route || stream.generation != request.generation {
-        return Err(StoreError::StreamBindingConflict);
-    }
+    ensure_stream_binding(&stream, request.machine_route, request.generation)?;
     let Some(current_high_water) = stream.high_water_seq else {
         return match request.position {
             ReplayPosition::Start(StreamCursor::BeforeFirst) => Ok(ReplayPage {
@@ -1537,11 +1756,9 @@ pub(crate) fn replay_page(
         });
     }
 
-    let limit = i64::try_from(config.retention.replay_page_max_frames).map_err(|_| {
-        StoreError::InvalidValue {
-            field: "retention.replay_page_max_frames",
-            reason: "page limit does not fit SQLite LIMIT",
-        }
+    let limit = i64::try_from(page_max_frames).map_err(|_| StoreError::InvalidValue {
+        field: "retention.replay_page_max_frames",
+        reason: "page limit does not fit SQLite LIMIT",
     })?;
     let mut statement = conn.prepare(
         "SELECT stream_seq, size FROM frames
@@ -1574,11 +1791,13 @@ pub(crate) fn replay_page(
             field: "frames.size",
             reason: "frame size must be non-negative",
         })?;
-        if !selected.is_empty()
-            && bytes
-                .checked_add(size)
-                .is_none_or(|sum| sum > config.retention.replay_page_max_bytes)
+        if bytes
+            .checked_add(size)
+            .is_none_or(|sum| sum > page_max_bytes)
         {
+            if selected.is_empty() {
+                return Err(StoreError::ReplayPageLimitExceeded);
+            }
             break;
         }
         bytes = bytes.checked_add(size).ok_or(StoreError::InvalidValue {
@@ -1650,6 +1869,7 @@ pub(crate) fn replay_page(
     } else {
         None
     };
+    config.fault_injector.check(FaultPoint::ReplayAfterRead)?;
     Ok(ReplayPage {
         frames,
         replay_through: StreamCursor::At(through),

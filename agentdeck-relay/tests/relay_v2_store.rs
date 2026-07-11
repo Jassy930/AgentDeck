@@ -24,10 +24,10 @@ use agentdeck_protocol::relay_v2::{
 };
 use agentdeck_relay::v2::store::{
     Clock, DiskSpace, DiskSpaceProbe, EnrollmentCodeSeed, FaultInjector, FaultPoint,
-    InstallGrantRecord, PersistAck, PersistPublish, PersistRevocation, PersistSubscription,
-    PersistUnsubscribe, PublishDisposition, PurgeMachine, RegisterMachine, RelayStoreHandle,
-    RelayV2StoreConfig, ReplayPageRequest, ReplayPosition, RetentionLimits, StoreError,
-    StoreSnapshot, StreamRegistration,
+    InstallGrantRecord, MetadataLimits, PersistAck, PersistPublish, PersistRevocation,
+    PersistSubscription, PersistUnsubscribe, PublishDisposition, PurgeMachine, RegisterMachine,
+    RelayStoreHandle, RelayV2StoreConfig, ReplayPageRequest, ReplayPosition, RetentionLimits,
+    StoreError, StoreSnapshot, StreamRegistration,
 };
 #[cfg(unix)]
 use fs2::FileExt;
@@ -51,6 +51,32 @@ const EXPECTED_TABLES: [&str; 8] = [
 
 fn store_path(temp: &TempDir) -> PathBuf {
     temp.path().join("relay-private").join("relay.db")
+}
+
+fn overwrite_retained_bytes_for_probe(
+    path: &Path,
+    stream_route: StreamRouteId,
+    retained_bytes: i64,
+) {
+    let connection = Connection::open(path).expect("open maintenance probe connection");
+    let changed = connection
+        .execute(
+            "UPDATE streams SET retained_bytes = ?2 WHERE stream_route = ?1",
+            params![stream_route.as_bytes().as_slice(), retained_bytes],
+        )
+        .expect("write maintenance probe sentinel");
+    assert_eq!(changed, 1, "probe stream must exist");
+}
+
+fn retained_bytes_for_probe(path: &Path, stream_route: StreamRouteId) -> i64 {
+    Connection::open(path)
+        .expect("open maintenance probe connection")
+        .query_row(
+            "SELECT retained_bytes FROM streams WHERE stream_route = ?1",
+            params![stream_route.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("read maintenance probe sentinel")
 }
 
 #[cfg(unix)]
@@ -125,6 +151,35 @@ struct FixedDiskProbe(DiskSpace);
 impl DiskSpaceProbe for FixedDiskProbe {
     fn space(&self, _storage_path: &Path) -> Result<DiskSpace, StoreError> {
         Ok(self.0)
+    }
+}
+
+#[derive(Debug)]
+struct MutableDiskProbe {
+    available_bytes: AtomicU64,
+    total_bytes: u64,
+}
+
+impl MutableDiskProbe {
+    fn new(available_bytes: u64, total_bytes: u64) -> Self {
+        Self {
+            available_bytes: AtomicU64::new(available_bytes),
+            total_bytes,
+        }
+    }
+
+    fn set_available(&self, available_bytes: u64) {
+        self.available_bytes
+            .store(available_bytes, Ordering::SeqCst);
+    }
+}
+
+impl DiskSpaceProbe for MutableDiskProbe {
+    fn space(&self, _storage_path: &Path) -> Result<DiskSpace, StoreError> {
+        Ok(DiskSpace {
+            available_bytes: self.available_bytes.load(Ordering::SeqCst),
+            total_bytes: self.total_bytes,
+        })
     }
 }
 
@@ -381,6 +436,8 @@ fn replay_request(
         stream_route: stream_route(stream_seed),
         generation: stream_generation(stream_seed.wrapping_add(1)),
         position,
+        page_max_frames: 64,
+        page_max_bytes: 8 * 1024 * 1024,
     }
 }
 
@@ -1378,6 +1435,16 @@ async fn register_stream_starts_before_first_is_idempotent_and_rejects_route_reb
         generation_error,
         StoreError::StreamBindingConflict
     ));
+    assert_eq!(generation_error.diagnostic_code(), "relay.store.conflict");
+
+    let mut generation_collision = stream_registration(0x23, 0x40);
+    generation_collision.generation = request.generation;
+    let collision_error = store
+        .register_stream(generation_collision)
+        .await
+        .expect_err("a generation cannot be reused by another opaque route");
+    assert!(matches!(collision_error, StoreError::StreamOwnerConflict));
+    assert_eq!(collision_error.diagnostic_code(), "relay.route.not_found");
 
     let mut owner_conflict = request;
     owner_conflict.machine_route = machine_route(0x24);
@@ -1385,8 +1452,147 @@ async fn register_stream_starts_before_first_is_idempotent_and_rejects_route_reb
         .register_stream(owner_conflict)
         .await
         .expect_err("stream route cannot change owner");
-    assert!(matches!(owner_error, StoreError::StreamBindingConflict));
+    assert!(matches!(owner_error, StoreError::StreamOwnerConflict));
+    assert_eq!(owner_error.diagnostic_code(), "relay.route.not_found");
 
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn stream_and_subscription_metadata_have_principal_and_global_hard_counts() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let config = fixed_config(&path)
+        .with_metadata_limits(MetadataLimits {
+            max_streams_per_machine: 1,
+            max_streams_global: 2,
+            max_subscriptions_per_device: 2,
+            max_subscriptions_global: 2,
+        })
+        .with_disk_space_probe(Arc::new(FixedDiskProbe(DiskSpace {
+            available_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        })));
+    let store = RelayStoreHandle::open(config).await.expect("open store");
+    seed_and_register(&store, 0x31).await;
+    let first = stream_registration(0x31, 0x50);
+    store
+        .register_stream(first.clone())
+        .await
+        .expect("first stream");
+    assert!(
+        store
+            .register_stream(first)
+            .await
+            .expect("duplicate does not consume capacity")
+            .duplicate
+    );
+    assert!(matches!(
+        store.register_stream(stream_registration(0x31, 0x51)).await,
+        Err(StoreError::QuotaExceeded {
+            scope: "streams.machine"
+        })
+    ));
+    store.shutdown().await.expect("shutdown store");
+
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let config = fixed_config(&path)
+        .with_metadata_limits(MetadataLimits {
+            max_streams_per_machine: 2,
+            max_streams_global: 2,
+            max_subscriptions_per_device: 2,
+            max_subscriptions_global: 2,
+        })
+        .with_disk_space_probe(Arc::new(FixedDiskProbe(DiskSpace {
+            available_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        })));
+    let store = RelayStoreHandle::open(config).await.expect("open store");
+    seed_and_register(&store, 0x32).await;
+    seed_and_register(&store, 0x33).await;
+    register_fixture_stream(&store, 0x32, 0x52).await;
+    register_fixture_stream(&store, 0x32, 0x53).await;
+    assert!(matches!(
+        store.register_stream(stream_registration(0x33, 0x54)).await,
+        Err(StoreError::QuotaExceeded {
+            scope: "streams.global"
+        })
+    ));
+    store.shutdown().await.expect("shutdown store");
+
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let config = fixed_config(&path)
+        .with_metadata_limits(MetadataLimits {
+            max_streams_per_machine: 3,
+            max_streams_global: 3,
+            max_subscriptions_per_device: 2,
+            max_subscriptions_global: 2,
+        })
+        .with_disk_space_probe(Arc::new(FixedDiskProbe(DiskSpace {
+            available_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        })));
+    let store = RelayStoreHandle::open(config).await.expect("open store");
+    seed_and_register(&store, 0x37).await;
+    install_fixture_grant(&store, 0x37, 0x47, 1).await;
+    install_fixture_grant(&store, 0x37, 0x48, 1).await;
+    for stream_seed in [0x5a, 0x5b, 0x5c] {
+        register_fixture_stream(&store, 0x37, stream_seed).await;
+    }
+    store
+        .subscribe(subscription_request(
+            0x37,
+            0x47,
+            1,
+            0x5a,
+            StreamCursor::BeforeFirst,
+        ))
+        .await
+        .expect("first global lease");
+    store
+        .subscribe(subscription_request(
+            0x37,
+            0x48,
+            1,
+            0x5b,
+            StreamCursor::BeforeFirst,
+        ))
+        .await
+        .expect("second global lease");
+    assert!(matches!(
+        store
+            .subscribe(subscription_request(
+                0x37,
+                0x47,
+                1,
+                0x5c,
+                StreamCursor::BeforeFirst,
+            ))
+            .await,
+        Err(StoreError::QuotaExceeded {
+            scope: "subscriptions.global"
+        })
+    ));
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn disk_reserve_blocks_new_empty_stream_metadata() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let reserve = 512 * 1024 * 1024;
+    let config = fixed_config(&path).with_disk_space_probe(Arc::new(FixedDiskProbe(DiskSpace {
+        available_bytes: reserve,
+        total_bytes: 10 * 1024 * 1024 * 1024,
+    })));
+    let store = RelayStoreHandle::open(config).await.expect("open store");
+    seed_and_register(&store, 0x34).await;
+    assert!(matches!(
+        store.register_stream(stream_registration(0x34, 0x55)).await,
+        Err(StoreError::DiskSpaceLow)
+    ));
     store.shutdown().await.expect("shutdown store");
 }
 
@@ -1447,6 +1653,97 @@ async fn publish_requires_first_seq_zero_is_canonical_duplicate_and_rejects_conf
             found: 2
         }
     ));
+
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn stream_operations_hide_owner_mismatch_but_preserve_generation_conflict() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let store = RelayStoreHandle::open(fixed_config(&path))
+        .await
+        .expect("open binding-classification store");
+    seed_and_register(&store, 0x6d).await;
+    seed_and_register(&store, 0x6e).await;
+    install_fixture_grant(&store, 0x6d, 0x7d, 1).await;
+    install_fixture_grant(&store, 0x6e, 0x7e, 1).await;
+    register_fixture_stream(&store, 0x6d, 0x8d).await;
+    store
+        .publish(publish_request(0x6d, 0x8d, 0, 0x9d))
+        .await
+        .expect("publish binding fixture");
+
+    let owner_publish = store
+        .publish(publish_request(0x6e, 0x8d, 1, 0x9e))
+        .await
+        .expect_err("foreign owner cannot publish");
+    let owner_subscribe = store
+        .subscribe(subscription_request(
+            0x6e,
+            0x7e,
+            1,
+            0x8d,
+            StreamCursor::BeforeFirst,
+        ))
+        .await
+        .expect_err("foreign owner cannot subscribe");
+    let owner_ack = store
+        .ack(ack_request(0x6e, 0x7e, 1, 0x8d, 0))
+        .await
+        .expect_err("foreign owner cannot ACK");
+    let owner_replay = store
+        .replay_page(replay_request(
+            0x6e,
+            0x8d,
+            ReplayPosition::Start(StreamCursor::BeforeFirst),
+        ))
+        .await
+        .expect_err("foreign owner cannot replay");
+    for error in [owner_publish, owner_subscribe, owner_ack, owner_replay] {
+        assert!(matches!(error, StoreError::StreamOwnerConflict));
+        assert_eq!(error.diagnostic_code(), "relay.route.not_found");
+    }
+
+    let stale_generation = stream_generation(0xfe);
+    let mut generation_publish = publish_request(0x6d, 0x8d, 1, 0xae);
+    match &mut generation_publish.frame.body {
+        agentdeck_protocol::relay_v2::RelayFrameBody::Publish(frame) => {
+            frame.generation = stale_generation;
+        }
+        _ => unreachable!("fixture builder always creates Publish"),
+    }
+    let mut generation_subscribe =
+        subscription_request(0x6d, 0x7d, 1, 0x8d, StreamCursor::BeforeFirst);
+    generation_subscribe.generation = stale_generation;
+    let mut generation_ack = ack_request(0x6d, 0x7d, 1, 0x8d, 0);
+    generation_ack.generation = stale_generation;
+    let mut generation_replay =
+        replay_request(0x6d, 0x8d, ReplayPosition::Start(StreamCursor::BeforeFirst));
+    generation_replay.generation = stale_generation;
+
+    let generation_errors = [
+        store
+            .publish(generation_publish)
+            .await
+            .expect_err("stale generation cannot publish"),
+        store
+            .subscribe(generation_subscribe)
+            .await
+            .expect_err("stale generation cannot subscribe"),
+        store
+            .ack(generation_ack)
+            .await
+            .expect_err("stale generation cannot ACK"),
+        store
+            .replay_page(generation_replay)
+            .await
+            .expect_err("stale generation cannot replay"),
+    ];
+    for error in generation_errors {
+        assert!(matches!(error, StoreError::StreamBindingConflict));
+        assert_eq!(error.diagnostic_code(), "relay.store.conflict");
+    }
 
     store.shutdown().await.expect("shutdown store");
 }
@@ -1551,6 +1848,8 @@ async fn restart_replay_returns_byte_identical_sealed_blob() {
             stream_route: stream_route(0x44),
             generation: stream_generation(0x45),
             position: ReplayPosition::Start(StreamCursor::BeforeFirst),
+            page_max_frames: 64,
+            page_max_bytes: 8 * 1024 * 1024,
         })
         .await
         .expect("replay after restart");
@@ -1605,6 +1904,8 @@ async fn subscription_preserves_before_first_vs_at_zero_and_ack_is_monotonic() {
         .expect("subscribe from At(0)");
     assert_eq!(before.start, StreamCursor::BeforeFirst);
     assert_eq!(at_zero.start, StreamCursor::At(0));
+    assert_eq!(before.replay_through, StreamCursor::At(1));
+    assert_eq!(at_zero.replay_through, StreamCursor::At(1));
 
     store
         .ack(ack_request(0x28, 0x38, 1, 0x45, 1))
@@ -1625,6 +1926,7 @@ async fn subscription_preserves_before_first_vs_at_zero_and_ack_is_monotonic() {
         .await
         .expect("read back existing lease");
     assert_eq!(readback.ack, Some(1));
+    assert_eq!(readback.replay_through, StreamCursor::At(1));
 
     store.shutdown().await.expect("shutdown store");
 
@@ -1649,6 +1951,273 @@ async fn subscription_preserves_before_first_vs_at_zero_and_ack_is_monotonic() {
         Some("00000000000000000000"),
         "At(0) must remain canonical u64 text and not collapse into NULL"
     );
+}
+
+#[tokio::test]
+async fn durable_subscription_rows_have_per_device_hard_count_and_duplicate_retry() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let config = fixed_config(&path)
+        .with_metadata_limits(MetadataLimits {
+            max_streams_per_machine: 2,
+            max_streams_global: 2,
+            max_subscriptions_per_device: 1,
+            max_subscriptions_global: 2,
+        })
+        .with_disk_space_probe(Arc::new(FixedDiskProbe(DiskSpace {
+            available_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        })));
+    let store = RelayStoreHandle::open(config).await.expect("open store");
+    seed_and_register(&store, 0x35).await;
+    install_fixture_grant(&store, 0x35, 0x45, 1).await;
+    register_fixture_stream(&store, 0x35, 0x56).await;
+    register_fixture_stream(&store, 0x35, 0x57).await;
+    let first = subscription_request(0x35, 0x45, 1, 0x56, StreamCursor::BeforeFirst);
+    store
+        .subscribe(first.clone())
+        .await
+        .expect("first durable lease");
+    assert!(
+        store
+            .subscribe(first)
+            .await
+            .expect("duplicate lease at capacity remains idempotent")
+            .duplicate
+    );
+    assert!(matches!(
+        store
+            .subscribe(subscription_request(
+                0x35,
+                0x45,
+                1,
+                0x57,
+                StreamCursor::BeforeFirst,
+            ))
+            .await,
+        Err(StoreError::QuotaExceeded {
+            scope: "subscriptions.device"
+        })
+    ));
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn startup_rejects_existing_metadata_above_lowered_limits() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let healthy_disk = Arc::new(FixedDiskProbe(DiskSpace {
+        available_bytes: u64::MAX,
+        total_bytes: u64::MAX,
+    }));
+    let initial_limits = MetadataLimits {
+        max_streams_per_machine: 2,
+        max_streams_global: 2,
+        max_subscriptions_per_device: 2,
+        max_subscriptions_global: 2,
+    };
+    let store = RelayStoreHandle::open(
+        fixed_config(&path)
+            .with_metadata_limits(initial_limits)
+            .with_disk_space_probe(healthy_disk.clone()),
+    )
+    .await
+    .expect("open initial store");
+    seed_and_register(&store, 0x3a).await;
+    install_fixture_grant(&store, 0x3a, 0x4a, 1).await;
+    register_fixture_stream(&store, 0x3a, 0x6a).await;
+    register_fixture_stream(&store, 0x3a, 0x6b).await;
+    for stream_seed in [0x6a, 0x6b] {
+        store
+            .subscribe(subscription_request(
+                0x3a,
+                0x4a,
+                1,
+                stream_seed,
+                StreamCursor::BeforeFirst,
+            ))
+            .await
+            .expect("create durable subscription");
+    }
+    store.shutdown().await.expect("shutdown initial store");
+
+    let lowered_streams = MetadataLimits {
+        max_streams_per_machine: 1,
+        ..initial_limits
+    };
+    let stream_error = RelayStoreHandle::open(
+        fixed_config(&path)
+            .with_metadata_limits(lowered_streams)
+            .with_disk_space_probe(healthy_disk.clone()),
+    )
+    .await
+    .expect_err("existing per-machine streams must fail closed at startup");
+    assert!(matches!(
+        stream_error,
+        StoreError::QuotaExceeded {
+            scope: "streams.machine"
+        }
+    ));
+
+    let lowered_subscriptions = MetadataLimits {
+        max_subscriptions_per_device: 1,
+        ..initial_limits
+    };
+    let subscription_error = RelayStoreHandle::open(
+        fixed_config(&path)
+            .with_metadata_limits(lowered_subscriptions)
+            .with_disk_space_probe(healthy_disk),
+    )
+    .await
+    .expect_err("existing per-device subscriptions must fail closed at startup");
+    assert!(matches!(
+        subscription_error,
+        StoreError::QuotaExceeded {
+            scope: "subscriptions.device"
+        }
+    ));
+}
+
+#[tokio::test]
+async fn startup_rejects_existing_global_metadata_above_lowered_limits() {
+    let healthy_disk = Arc::new(FixedDiskProbe(DiskSpace {
+        available_bytes: u64::MAX,
+        total_bytes: u64::MAX,
+    }));
+    let initial_limits = MetadataLimits {
+        max_streams_per_machine: 2,
+        max_streams_global: 2,
+        max_subscriptions_per_device: 2,
+        max_subscriptions_global: 2,
+    };
+
+    let stream_temp = TempDir::new().expect("tempdir");
+    let stream_path = store_path(&stream_temp);
+    let stream_store = RelayStoreHandle::open(
+        fixed_config(&stream_path)
+            .with_metadata_limits(initial_limits)
+            .with_disk_space_probe(healthy_disk.clone()),
+    )
+    .await
+    .expect("open initial stream store");
+    for (machine_seed, stream_seed) in [(0x3b, 0x6c), (0x3c, 0x6d)] {
+        seed_and_register(&stream_store, machine_seed).await;
+        register_fixture_stream(&stream_store, machine_seed, stream_seed).await;
+    }
+    stream_store
+        .shutdown()
+        .await
+        .expect("shutdown initial stream store");
+    let lowered_streams = MetadataLimits {
+        max_streams_per_machine: 1,
+        max_streams_global: 1,
+        ..initial_limits
+    };
+    let stream_error = RelayStoreHandle::open(
+        fixed_config(&stream_path)
+            .with_metadata_limits(lowered_streams)
+            .with_disk_space_probe(healthy_disk.clone()),
+    )
+    .await
+    .expect_err("existing global streams must fail closed at startup");
+    assert!(matches!(
+        stream_error,
+        StoreError::QuotaExceeded {
+            scope: "streams.global"
+        }
+    ));
+
+    let subscription_temp = TempDir::new().expect("tempdir");
+    let subscription_path = store_path(&subscription_temp);
+    let subscription_store = RelayStoreHandle::open(
+        fixed_config(&subscription_path)
+            .with_metadata_limits(initial_limits)
+            .with_disk_space_probe(healthy_disk.clone()),
+    )
+    .await
+    .expect("open initial subscription store");
+    seed_and_register(&subscription_store, 0x3d).await;
+    for device_seed in [0x4b, 0x4c] {
+        install_fixture_grant(&subscription_store, 0x3d, device_seed, 1).await;
+    }
+    for stream_seed in [0x6e, 0x6f] {
+        register_fixture_stream(&subscription_store, 0x3d, stream_seed).await;
+    }
+    for (device_seed, stream_seed) in [(0x4b, 0x6e), (0x4c, 0x6f)] {
+        subscription_store
+            .subscribe(subscription_request(
+                0x3d,
+                device_seed,
+                1,
+                stream_seed,
+                StreamCursor::BeforeFirst,
+            ))
+            .await
+            .expect("create global durable subscription");
+    }
+    subscription_store
+        .shutdown()
+        .await
+        .expect("shutdown initial subscription store");
+    let lowered_subscriptions = MetadataLimits {
+        max_subscriptions_per_device: 1,
+        max_subscriptions_global: 1,
+        ..initial_limits
+    };
+    let subscription_error = RelayStoreHandle::open(
+        fixed_config(&subscription_path)
+            .with_metadata_limits(lowered_subscriptions)
+            .with_disk_space_probe(healthy_disk),
+    )
+    .await
+    .expect_err("existing global subscriptions must fail closed at startup");
+    assert!(matches!(
+        subscription_error,
+        StoreError::QuotaExceeded {
+            scope: "subscriptions.global"
+        }
+    ));
+}
+
+#[tokio::test]
+async fn disk_reserve_blocks_new_subscription_metadata_but_not_existing_retry() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let total = 10 * 1024 * 1024 * 1024;
+    let reserve = 512 * 1024 * 1024;
+    let disk = Arc::new(MutableDiskProbe::new(u64::MAX, total));
+    let config = fixed_config(&path).with_disk_space_probe(disk.clone());
+    let store = RelayStoreHandle::open(config).await.expect("open store");
+    seed_and_register(&store, 0x36).await;
+    install_fixture_grant(&store, 0x36, 0x46, 1).await;
+    register_fixture_stream(&store, 0x36, 0x58).await;
+    register_fixture_stream(&store, 0x36, 0x59).await;
+    let existing = subscription_request(0x36, 0x46, 1, 0x58, StreamCursor::BeforeFirst);
+    store
+        .subscribe(existing.clone())
+        .await
+        .expect("create lease while disk is healthy");
+    disk.set_available(reserve);
+    assert!(
+        store
+            .subscribe(existing)
+            .await
+            .expect("existing lease retry consumes no metadata capacity")
+            .duplicate
+    );
+    assert!(matches!(
+        store
+            .subscribe(subscription_request(
+                0x36,
+                0x46,
+                1,
+                0x59,
+                StreamCursor::BeforeFirst,
+            ))
+            .await,
+        Err(StoreError::DiskSpaceLow)
+    ));
+    store.shutdown().await.expect("shutdown store");
 }
 
 #[tokio::test]
@@ -1773,6 +2342,113 @@ async fn unsubscribe_immediately_stops_blocking_ack_safe_prefix_trim() {
     ));
 
     store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn ack_and_unsubscribe_only_maintain_the_affected_stream_and_skip_noops() {
+    const UNRELATED_SENTINEL: i64 = 7_777_777;
+
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let store = RelayStoreHandle::open(config_with_limits(&path, limits_without_disk_gate()))
+        .await
+        .expect("open scoped-maintenance store");
+    seed_and_register(&store, 0x2e).await;
+    install_fixture_grant(&store, 0x2e, 0x40, 1).await;
+    install_fixture_grant(&store, 0x2e, 0x41, 1).await;
+    register_fixture_stream(&store, 0x2e, 0x4b).await;
+    register_fixture_stream(&store, 0x2e, 0x4c).await;
+    store
+        .publish(publish_request(0x2e, 0x4b, 0, 0xc0))
+        .await
+        .expect("publish target stream frame");
+    store
+        .publish(publish_request(0x2e, 0x4c, 0, 0xc1))
+        .await
+        .expect("publish unrelated stream frame");
+    for device_seed in [0x40, 0x41] {
+        store
+            .subscribe(subscription_request(
+                0x2e,
+                device_seed,
+                1,
+                0x4b,
+                StreamCursor::BeforeFirst,
+            ))
+            .await
+            .expect("create target stream lease");
+    }
+
+    // retained_bytes sentinel 是一个确定性的路径探针：旧实现每次 ACK/Unsubscribe 都会
+    // UPDATE 全部 streams，从而把这个无关 stream 恢复成真实值。scoped helper 不应触碰它。
+    let unrelated = stream_route(0x4c);
+    overwrite_retained_bytes_for_probe(&path, unrelated, UNRELATED_SENTINEL);
+
+    store
+        .ack(ack_request(0x2e, 0x40, 1, 0x4b, 0))
+        .await
+        .expect("advance target ACK");
+    assert_eq!(
+        retained_bytes_for_probe(&path, unrelated),
+        UNRELATED_SENTINEL,
+        "advancing ACK must not run global stream maintenance"
+    );
+    store
+        .ack(ack_request(0x2e, 0x40, 1, 0x4b, 0))
+        .await
+        .expect("duplicate target ACK");
+    assert_eq!(
+        retained_bytes_for_probe(&path, unrelated),
+        UNRELATED_SENTINEL,
+        "duplicate ACK must skip maintenance entirely"
+    );
+
+    let request = unsubscribe_request(0x2e, 0x41, 1, 0x4b);
+    assert!(
+        store
+            .unsubscribe(request.clone())
+            .await
+            .expect("remove blocking target lease")
+            .removed
+    );
+    assert_eq!(
+        retained_bytes_for_probe(&path, unrelated),
+        UNRELATED_SENTINEL,
+        "removed lease must only maintain its target stream"
+    );
+    assert!(
+        !store
+            .unsubscribe(request)
+            .await
+            .expect("repeat target unsubscribe")
+            .removed
+    );
+    assert_eq!(
+        retained_bytes_for_probe(&path, unrelated),
+        UNRELATED_SENTINEL,
+        "no-op unsubscribe must skip maintenance entirely"
+    );
+
+    let gap = store
+        .replay_page(replay_request(
+            0x2e,
+            0x4b,
+            ReplayPosition::Start(StreamCursor::BeforeFirst),
+        ))
+        .await
+        .expect_err("removing the blocker still trims the target prefix");
+    assert!(matches!(
+        gap,
+        StoreError::ReplayGap {
+            needed: 0,
+            oldest: 1
+        }
+    ));
+
+    store
+        .shutdown()
+        .await
+        .expect("shutdown scoped-maintenance store");
 }
 
 #[tokio::test]
@@ -2442,18 +3118,17 @@ async fn projected_disk_reserve_uses_max_of_absolute_and_percent_but_control_wri
     let limits = RetentionLimits::default();
     assert_eq!(limits.disk_reserve_for(GIB), 512 * 1024 * 1024);
     assert_eq!(limits.disk_reserve_for(20 * GIB), GIB);
+    let disk = Arc::new(MutableDiskProbe::new(u64::MAX, 20 * GIB));
     let config = RelayV2StoreConfig::new(path.clone())
         .with_clock(Arc::new(FixedClock(NOW_MS)))
-        .with_disk_space_probe(Arc::new(FixedDiskProbe(DiskSpace {
-            available_bytes: GIB + frame_size - 1,
-            total_bytes: 20 * GIB,
-        })));
+        .with_disk_space_probe(disk.clone());
     let store = RelayStoreHandle::open(config)
         .await
         .expect("open disk-gated store");
     seed_and_register(&store, 0x58).await;
     install_fixture_grant(&store, 0x58, 0x39, 1).await;
     register_fixture_stream(&store, 0x58, 0x69).await;
+    disk.set_available(GIB + frame_size - 1);
 
     let disk_low = store
         .publish(frame)
@@ -3220,7 +3895,82 @@ async fn subscribe_before_commit_fault_rolls_back_and_retry_creates_fresh_lease(
         .expect("rolled-back subscription must insert on retry");
     assert!(!retry.duplicate);
     assert_eq!(retry.ack, None);
+    assert_eq!(retry.replay_through, StreamCursor::BeforeFirst);
 
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn subscribe_freezes_replay_through_before_a_later_publish_commits() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let (entered_tx, entered_rx) = std_mpsc::channel();
+    let (release_tx, release_rx) = std_mpsc::channel();
+    let injector = Arc::new(BlockingFaultInjector::new(
+        FaultPoint::SubscribeBeforeCommit,
+        entered_tx,
+        release_rx,
+    ));
+    let store = RelayStoreHandle::open(fixed_config(&path).with_fault_injector(injector))
+        .await
+        .expect("open atomic-subscribe store");
+    seed_and_register(&store, 0x8d).await;
+    install_fixture_grant(&store, 0x8d, 0x9d, 1).await;
+    register_fixture_stream(&store, 0x8d, 0xad).await;
+
+    let subscribe_store = store.clone();
+    let subscribe = tokio::spawn(async move {
+        subscribe_store
+            .subscribe(subscription_request(
+                0x8d,
+                0x9d,
+                1,
+                0xad,
+                StreamCursor::BeforeFirst,
+            ))
+            .await
+    });
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(std::time::Duration::from_secs(5)))
+        .await
+        .expect("join subscribe transaction wait")
+        .expect("subscribe reached its pre-COMMIT boundary");
+
+    let publish_store = store.clone();
+    let publish = tokio::spawn(async move {
+        publish_store
+            .publish(publish_request(0x8d, 0xad, 0, 0xbd))
+            .await
+    });
+    tokio::task::yield_now().await;
+    release_tx
+        .send(())
+        .expect("release subscribe transaction before queued publish");
+
+    let lease = subscribe
+        .await
+        .expect("join subscribe")
+        .expect("subscribe commits");
+    publish
+        .await
+        .expect("join queued publish")
+        .expect("later publish commits");
+    assert_eq!(
+        lease.replay_through,
+        StreamCursor::BeforeFirst,
+        "lease must expose the high-water frozen inside its own transaction"
+    );
+
+    let refreshed = store
+        .subscribe(subscription_request(
+            0x8d,
+            0x9d,
+            1,
+            0xad,
+            StreamCursor::BeforeFirst,
+        ))
+        .await
+        .expect("refresh lease after publish");
+    assert_eq!(refreshed.replay_through, StreamCursor::At(0));
     store.shutdown().await.expect("shutdown store");
 }
 
@@ -3456,6 +4206,55 @@ async fn maintenance_enforces_logical_age_expiry_without_a_later_publish() {
         .expect("idempotent explicit maintenance");
     assert_eq!(report.expired_frames, 0);
 
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn foreign_replay_cannot_trigger_target_stream_age_maintenance() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let clock = Arc::new(MutableClock::new(NOW_MS));
+    let limits = RetentionLimits {
+        max_age_ms: 100,
+        ..limits_without_disk_gate()
+    };
+    let config = RelayV2StoreConfig::new(path.clone())
+        .with_retention(limits)
+        .with_clock(clock.clone())
+        .with_disk_space_probe(Arc::new(FixedDiskProbe(DiskSpace {
+            available_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        })));
+    let store = RelayStoreHandle::open(config)
+        .await
+        .expect("open owner-gated maintenance store");
+    seed_and_register(&store, 0xb7).await;
+    seed_and_register(&store, 0xb8).await;
+    register_fixture_stream(&store, 0xb7, 0xc7).await;
+    store
+        .publish(publish_request(0xb7, 0xc7, 0, 0xd7))
+        .await
+        .expect("publish owner-gated maintenance fixture");
+
+    clock.set(NOW_MS + 101);
+    let foreign = store
+        .replay_page(replay_request(
+            0xb8,
+            0xc7,
+            ReplayPosition::Start(StreamCursor::BeforeFirst),
+        ))
+        .await
+        .expect_err("foreign replay must fail before target maintenance");
+    assert!(matches!(foreign, StoreError::StreamOwnerConflict));
+
+    let report = store
+        .run_maintenance()
+        .await
+        .expect("owner-neutral maintenance still finds the expired frame");
+    assert_eq!(
+        report.expired_frames, 1,
+        "foreign replay must not have physically removed the target frame"
+    );
     store.shutdown().await.expect("shutdown store");
 }
 

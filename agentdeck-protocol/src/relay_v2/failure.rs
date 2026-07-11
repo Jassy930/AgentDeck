@@ -29,6 +29,7 @@ pub const RELAY_ROUTE_CONFLICT: &str = "relay.route.conflict";
 pub const RELAY_FRAME_TOO_LARGE: &str = "relay.frame.too_large";
 pub const RELAY_STREAM_OUT_OF_ORDER: &str = "relay.stream.out_of_order";
 pub const RELAY_REPLAY_GAP: &str = "relay.replay.gap";
+pub const RELAY_REPLAY_CURSOR_INVALID: &str = "relay.replay.cursor_invalid";
 pub const RELAY_STREAM_GENERATION_STALE: &str = "relay.stream.generation_stale";
 
 // —— relay.store.* / relay.quota.* / relay.disk.* ——

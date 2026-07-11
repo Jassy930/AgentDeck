@@ -101,6 +101,62 @@ protocol `--all-targets -D warnings` 当前仍会命中既有 `trunk.rs` 两处
 production library focused clippy，并在阶段报告记录这些既有 blocker，不能为消 warning
 改 Relay wire enum 大小或夹带无关清理。
 
+## Relay Companion MVP P2.3 Stream Core 门禁
+
+P2.3 仍不代表 v2 listener 已上线。改动 `agentdeck-relay/src/v2/core/`、stream Store
+语义或 writer/replay 上限后至少运行：
+
+```bash
+# 真实 auth context 下的 role/ownership、COMMIT barrier、多 stream FIFO/hot-stream 轮转、
+# tiny writer/Store page clamp、WorkerBusy、ACK/gap/reconnect、per-writer/global 背压、
+# origin acceptance 优先级、replay transition fence、heartbeat 与 replacement
+cargo test -p agentdeck-relay --features server \
+  --test relay_v2_stream_e2e -- --test-threads=1
+
+# Store frozen terminal、cursor/gap、ACK/Unsubscribe target-only maintenance、fault gate、
+# stream/subscription principal/global metadata count、disk growth gate 与 startup preflight
+cargo test -p agentdeck-relay --features server \
+  --test relay_v2_store -- --test-threads=1
+
+# v1/P2.1/P2.2 回归与 production Core lint
+cargo test -p agentdeck-relay --features server -- --test-threads=1
+cargo test -p agentdeck-protocol
+cargo clippy -p agentdeck-relay --features server --lib --no-deps -- -D warnings \
+  -A clippy::needless_return -A clippy::collapsible_if \
+  -A clippy::doc_lazy_continuation -A clippy::explicit_auto_deref
+
+# 静态门禁
+cargo fmt --all --check
+for file in agentdeck-relay/src/v2/core/*.rs; do
+  awk '/^#\[cfg\(test\)\]/{exit} {print}' "$file"
+done | rg -n 'expect\(|unwrap\(|panic!|eprintln!|todo!|unimplemented!|unreachable!'
+bash scripts/verify-agent-docs.sh
+git diff --check
+```
+
+production Core panic 扫描预期为空输出；`#[cfg(test)]` 断言必须先裁掉再判定。
+`relay_v2_stream_e2e` 的多 stream case 使用仅容纳一页的 writer，必须证明第二个
+Subscribe 在第一个 replay 仍受背压时被 FIFO 接纳，且两个 `ReplayComplete` 和后续
+catch-up 都不跨 stream 乱序；hot stream 必须在一个 catch-up quantum 后让出执行权。
+tiny-writer case 必须证明非空 replay 会按单帧分页，Store page clamp case 必须证明配置小于
+Core 默认时仍完整重放；WorkerBusy case 必须证明 retry 前释放 writer/staging 预算。
+slow-writer case 必须同时保留一个 fast reader，证明隔离而不是全局停机；global-budget case
+必须证明聚合预算在 socket flush 前不释放、normal 不吃 control reserve，且 Publish 先保留
+origin acceptance 再隔离慢 reader。transition-fence case 必须让 Store 在 replay page 读完后
+阻塞，同时把 device 置为 Revoke `Transitioning`，证明 replay Publish/Gap/ReplayComplete
+均不能跨过 fence。Store metadata case 必须同时覆盖后续 INSERT 与较低配置 reopen 的
+principal/global count，并证明幂等 retry 不消耗新 row/disk growth 容量。
+
+涉及 replay 调度、预算释放或 actor lifecycle 的改动，阶段收口再重复运行 stream E2E 10 次，
+排除只在调度时序下出现的丢帧/饥饿：
+
+```bash
+for _ in {1..10}; do
+  cargo test -q -p agentdeck-relay --features server \
+    --test relay_v2_stream_e2e -- --test-threads=1 || exit 1
+done
+```
+
 ## AppKit 重写后的验证清单
 
 前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。

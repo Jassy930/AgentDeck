@@ -299,6 +299,19 @@ impl AuthorizationCoordinator {
         self.active.is_current(access)
     }
 
+    /// 把 current access 检查与一个短小、无 await 的数据面动作线性化；主要供 Core
+    /// 在 revoke/replacement transition 与 writer enqueue 之间建立原子先后关系。
+    pub(crate) fn with_current<T>(
+        &self,
+        access: &AccessContext,
+        action: impl FnOnce() -> T,
+    ) -> Result<Option<T>, RelayFailure> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        self.active.with_current(access, action)
+    }
+
     pub fn current(
         &self,
         route: PrincipalRoute,

@@ -78,9 +78,16 @@ marker 或 DDL 冒充兼容。
 
 Store 默认 retention 为每 stream 2,000 frames / 64 MiB / 24 小时、每 machine
 512 MiB、全局 4 GiB；replay 每页最多 64 frames / 8 MiB。磁盘安全余量取
-512 MiB 与总容量 5% 的较大值。`relay.disk.low` 只拒绝新的 Publish，replay、
-revoke 与 purge 等读/控制路径仍可用；配额淘汰优先于 ACK，随后重放旧 cursor
+512 MiB 与总容量 5% 的较大值。`relay.disk.low` 拒绝新的 Publish，也拒绝新增空 stream
+或 durable subscription metadata（metadata growth 另预留 64 KiB）；完全相同的幂等 retry、
+replay、revoke 与 purge 等不增长数据的路径仍可用。配额淘汰优先于 ACK，随后重放旧 cursor
 会明确返回 `relay.replay.gap`，不得静默跳过。
+
+空 stream / subscription row 也有 count hard bound：默认每 machine 4,096 streams、全局
+65,536 streams、每 device 4,096 subscriptions、全局 262,144 subscriptions，只能下调不能
+调高。每次新 INSERT 在 transaction 内同时检查 principal/global count；Store 启动还会在
+ready 前读回现有计数，配置下调或旧 DB 超限时返回 typed `relay.quota.exceeded`，不静默删
+durable state。
 
 Store 启动和显式 full maintenance 用 keyset 逐项收敛全部配额；每次 replay 只对
 目标 stream 做有过期行才写入的 age maintenance，避免单页重放扫描全库，同时确保
@@ -116,7 +123,7 @@ bytes、replay page count/bytes 与磁盘 reserve bytes/percent；转换为
 | `relay.store.conflict` / `relay.store.stale` | 幂等 bytes 冲突或单调值回退 | 终止该请求并检查 generation、serial 与 canonical bytes |
 | `relay.stream.out_of_order` | stream sequence 不是期望的下一值 | 以当前 generation/HWM 重连；到 `u64::MAX` 前创建新 generation |
 | `relay.auth.revoked` | grant 已撤销 | 终止设备链路并走重新配对 |
-| `relay.quota.exceeded` / `relay.disk.low` | 单帧/stream/machine/global 或磁盘安全门禁拒绝 Publish | 先释放容量或调整经批准的配额，再重试同一 canonical frame |
+| `relay.quota.exceeded` / `relay.disk.low` | frame retention、stream/subscription metadata principal/global count 或磁盘增长安全门禁拒绝写入；也可能是启动读回已超当前上限 | 先释放容量或恢复经批准且不超过代码 hard max 的配置；Publish 只重试同一 canonical frame，现有 metadata 不得手改或静默删除 |
 | `relay.frame.too_large` | canonical outer frame 超过 4 MiB | 按 transfer part 规则拆分，不能截断 |
 | `relay.replay.gap` / `relay.replay.cursor_invalid` | cursor 已被淘汰或 continuation 不属于本次 replay | 暂停 live，执行 bounded backfill/snapshot 后重新订阅 |
 
@@ -161,6 +168,61 @@ oracle。诊断日志同样只能记录 failure code、脱敏 route 短标识和
 | `relay.route.not_found` | PairRoute 不存在、server/route 不匹配或已过 absolute expiry | 关闭 pairing connection，重新生成并带外传递 PairInvite |
 | `relay.route.forbidden` | PairingAccess 发送了 PairData/Close 之外的 frame，或 route 不匹配 | 立即拒绝该 frame；重复越权应关闭连接 |
 | `relay.version.unsupported` | pairing/普通握手不是 Relay v2 | 升级 client/Relay；禁止自动降级到 v1 |
+
+## Relay v2 Stream Core 诊断（Companion MVP P2.3）
+
+P2.3 只建立 v2 stream routing library，生产 listener 仍走 v1。`RelayCore` 是唯一
+stream mutation 裁决者：命令队列、ingress bytes、连接数和每连接订阅数都有 hard bound；
+Core 可以等待单一 Store worker，但任何 socket write 都必须由 per-connection writer task
+完成。看到 stream 测试通过，只能说明 library contract 成立，不能解释为公网 WSS 已切换。
+
+Publish 的可见屏障是 SQLite COMMIT。Store 返回前没有 fan-out，也没有
+`RouteAccepted`；如果 COMMIT 后 reply 丢失，publisher 必须用完全相同的 canonical frame
+重试，Core 会补做尚未发生的 fan-out。`RouteAccepted` 只表示 Relay 已持久化并接纳路由，
+不表示 Companion 已 flush 或 daemon 已处理业务命令。
+
+每个连接同一时刻只物化一个 replay page，其他 stream replay 在连接内 FIFO 排队；hot stream
+每完成一个 catch-up quantum 都轮转到队尾。initial terminal 来自 Subscribe transaction 冻结的
+high-water；每页实际大小取 writer 可用预算、Store 配置和 64 frames / 8 MiB 协议 hard max
+三者最小值。最后一页入 writer 后异步等待 control reserve，再发送一次 `ReplayComplete`，
+随后追赶 terminal 之后的并发 Publish；超过 16 个同时排队的空 replay 也不能因 control reserve
+暂满而误断。
+
+Writer normal 上限为 512 frames / 16 MiB，control reserve 为 16 frames / 1 MiB；全 Core 默认
+另受 normal 16,384 frames / 256 MiB、control 4,096 frames / 16 MiB 聚合预算约束，所有预算
+直到 socket flush 才释放。Publish COMMIT 后先给 origin `RouteAccepted` 占 normal permit，再
+fan-out readers。单个慢 writer 会以 Lagged/CriticalBackpressure 关闭，不应阻塞其他 reader、
+publisher 或 Store。Store command queue 瞬时满时 replay 会先释放整页预算，最多三次可取消
+退避；持续 busy 则关闭该连接并要求重连，绝不无界等待或堆积 ciphertext。
+
+authorization 的 `Transitioning` 是数据面即时 fence：live/replay Publish、Gap 与
+`ReplayComplete` 都必须把 current-generation 检查和 writer enqueue 放在同一个
+`with_current` 临界区。若 fence 已建立，Core 以 AuthorizationInvalidated 关闭旧 writer；
+不能依赖先 `is_current`、稍后 enqueue 的两步检查，也不能让 terminal 作为例外跨过 fence。
+
+`Gap` 表示 cursor 已无法连续重放或 live sequence 出现缺口。收到后该 stream 进入暂停态，
+更高 sequence 不再交付；客户端完成 backfill/snapshot 后，必须使用同 generation 与合法
+cursor 显式重新 Subscribe。disconnect 只清 runtime subscription；durable lease/ACK 保留，
+只有显式 Unsubscribe 删除。ACK 只允许单调推进，grant serial 更新不会继承旧 serial lease。
+
+heartbeat 每 20 秒生成一个 server Ping；只有 exact outstanding nonce 的 Pong 才刷新连接，
+60 秒边界关闭。authorization replacement、revoke、lifecycle overflow terminal、writer/receiver
+退出都会取消该连接 replay 并清理 active generation；Core task panic 会优先于 command backlog
+回收，Core future 意外被 runtime 取消时 registry Drop guard 仍会取消 replay 并关闭 transport
+writer clone。重复出现应先检查唯一 coordinator、Store 健康与客户端是否及时 flush，而不是
+调大为无界队列。
+
+| v2 stream/core code | 含义 | 下一步 |
+| --- | --- | --- |
+| `relay.route.not_found` | stream 不存在、owner 不匹配或不可见 | 核对当前 machine trust domain 与已注册随机 route；不要枚举 route |
+| `relay.route.forbidden` | 当前 access role 发送了不允许的 frame | 修正端点 dispatch；endpoint 不能发送 server-only Ping/ReplayComplete/Gap |
+| `relay.stream.generation_stale` | route generation 不匹配或 generation 已耗尽 | 从 machine 建立全新随机 generation；禁止 wrap 或重绑旧 route |
+| `relay.stream.out_of_order` | sequence 跳号、same-seq different bytes 或 ACK 超过 HWM | 读取当前 cursor/HWM，按相同 canonical frame 重试或新建 generation |
+| `relay.replay.cursor_invalid` | cursor/continuation 非法、越过冻结边界或已耗尽 | 停止自动推进，按当前 generation 重新取得合法 cursor |
+| `relay.replay.gap` | retention 已删除需要的 frame，或 live 连续性丢失 | 暂停该 stream，完成 backfill/snapshot 后显式 re-Subscribe |
+| `relay.quota.exceeded` | Core command/ingress/connection/subscription、per-writer 或 global normal/control hard bound 已满 | 对当前端退避；慢 writer 应重连，禁止把任一上限改成无界 |
+| `relay.store.unavailable` | Store 持续 busy、停止、replay 校验失败或 Core 内部状态不可用 | 当前连接 fail-closed；检查 DB/worker 后用新 challenge 重连 |
+| `relay.auth.invalid_grant` / `relay.auth.revoked` | command/replay 时 access 已被 replacement 或撤销 | 立即停止旧 connection；按机器重新配对或使用当前 active grant |
 
 ## Failure Codes
 

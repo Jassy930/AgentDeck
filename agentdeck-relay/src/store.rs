@@ -420,7 +420,7 @@ mod tests {
     fn migration_is_idempotent() {
         let store = SqliteRelayStore::open_in_memory().unwrap();
         // 重复跑 migration 不报错（open 内部已跑一次；这里直接调 run_migrations 复跑）
-        store.with_conn(|conn| run_migrations(conn)).unwrap();
+        store.with_conn(run_migrations).unwrap();
     }
 
     #[test]

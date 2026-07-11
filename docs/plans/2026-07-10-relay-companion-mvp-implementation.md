@@ -309,24 +309,24 @@ pub fn authorize_pairing_route(hello: PairingHello, routes: &PairRouteView) -> R
 ### Task P2.3：实现 stream router、replay、ACK/gap 与慢 writer 隔离
 
 **Files:**
-- Create: `agentdeck-relay/src/v2/core/{mod,router,connection,writer,lifecycle}.rs`
+- Create: `agentdeck-relay/src/v2/core/{mod,router,connection,writer,lifecycle,replay}.rs`
 - Create: `agentdeck-relay/tests/relay_v2_stream_e2e.rs`
-- Modify: `agentdeck-relay/src/v2/mod.rs`
+- Modify: `agentdeck-relay/src/v2/{mod,store/{model,sqlite}}.rs`
+- Modify: `agentdeck-protocol/src/relay_v2/failure.rs`
 
 **Core interface:**
 ```rust
-pub struct RelayCore { store: RelayStoreHandle, connections: ConnectionRegistry, streams: StreamRegistry }
 impl RelayCore { pub async fn handle(&self, access: &AccessContext, frame: OpaqueRouteFrame) -> Result<RouteOutcome, RelayFailure>; }
-pub enum RouteOutcome { Queued(RouteAccepted), Replay(ReplayTicket), Gap(Gap), Closed }
-pub struct ReplayTicket { pub stream: StreamRouteId, pub generation: StreamGeneration, pub next: StreamCursor, pub terminal: StreamCursor }
+pub enum RouteOutcome { Applied, Queued(RouteAccepted), Replay(ReplayTicket), Gap(Gap), Closed }
+pub struct ReplayTicket { pub stream: StreamRouteId, pub generation: StreamGenerationId, pub next: StreamCursor, pub terminal: StreamCursor }
 ```
 
-- [ ] Step 1: 写stream tests。 覆盖random route/generation ownership、BeforeFirst→0、独立streamSeq、接近u64上界必须新generation且禁止wrap、out-of-order、persist-before-fanout、Subscribe/Unsubscribe幂等且Unsubscribe不阻塞trim、monotonic ACK、grant renewal不继承旧serial ACK lease、gap pauses live、reconnect resume、512 frames/16MiB writer、slow writer只断自己、heartbeat20s/60s与disconnect cleanup。
-- [ ] Step 2: 运行 stream e2e。 Expected: FAIL，core module 不存在。
-- [ ] Step 3: 实现actor core与bounded writer。 Core只能`try_send`且不得await socket；replay由connection actor按writer可用预算从Store游标分页拉取，每批最多64 frames/8MiB，最后一批成功入队后才发ReplayComplete；Store COMMIT后才能fan-out/RouteAccepted；gap后禁止投递更高seq，直到客户端完成backfill/snapshot并以同generation/cursor幂等re-Subscribe。
-- [ ] Step 4: 重跑 stream e2e与 store COMMIT fault test。 Expected: PASS，fault 时没有观察到 frame。
-- [ ] Step 5: 运行 fmt/clippy。
-- [ ] Step 6: 提交。 `git add agentdeck-relay && git commit -m "feat(relay): 实现 v2 stream replay 与慢连接隔离"`
+- [x] Step 1: 写stream tests。 覆盖random route/generation ownership、BeforeFirst→0、独立streamSeq、接近u64上界必须新generation且禁止wrap、out-of-order、persist-before-fanout、Subscribe/Unsubscribe幂等且Unsubscribe不阻塞trim、monotonic ACK、grant renewal不继承旧serial ACK lease、gap pauses live、reconnect resume、512 frames/16MiB writer、slow writer只断自己、heartbeat20s/60s与disconnect cleanup；补充tiny writer、Store page clamp、WorkerBusy、hot-stream公平轮转、聚合normal/control预算、origin acceptance优先、replay transition-fence race、metadata count/disk/startup preflight与actor Drop guard。
+- [x] Step 2: 运行 stream e2e。 Expected: FAIL，core module 不存在。已保留红测阶段证据，并逐项转绿。
+- [x] Step 3: 实现actor core与bounded writer。 Core只能`try_send`且不得await socket；replay由connection actor按writer/Store/协议三重上限从Store游标分页拉取，每批最多64 frames/8MiB，最后一批成功入队后异步取得control reserve再发ReplayComplete；Store COMMIT后先origin RouteAccepted再fan-out；gap后禁止投递更高seq，直到客户端完成backfill/snapshot并以同generation/cursor幂等re-Subscribe。所有连接共享有界normal/control预算，stream/subscription metadata同时受principal/global count与disk growth gate约束。
+- [x] Step 4: 重跑 stream e2e与 store COMMIT fault test。 Expected: PASS，fault 时没有观察到 frame。已覆盖全量Store/Auth/Protocol回归与stream E2E重复运行。
+- [x] Step 5: 运行 fmt/clippy。focused production clippy、rustdoc、panic scan、docs gate与diff check均纳入P2.3门禁。
+- [x] Step 6: 提交。 `git add agentdeck-relay && git commit -m "feat(relay): 实现 v2 stream replay 与慢连接隔离"`
 
 ### Task P2.4：实现 PairRoute 与在线 Send/Reply
 

@@ -210,6 +210,54 @@ agentdeckd
   关联标识使用带类型域 SHA-256 的 32-bit 截断，不得直接打印 route 原始前缀。failure 只
   返回稳定通用 code/message，不泄漏完整 route、key、hash、signature 或验签步骤。
 
+### Relay Companion MVP P2.3 v2 Stream Core 边界
+
+- P2.3 仍是与 v1 listener 并列的 library，不接管生产 WebSocket。唯一
+  `RelayCore` actor 线性裁决 stream mutation；公开入口只有有界 command count 与
+  64 MiB ingress byte admission，队列满立即返回 typed quota；所有可配置容量还有不可调高的
+  代码级 hard maximum（command 4,096、ingress 256 MiB、connection 4,096、每连接
+  subscription 4,096、replay staging page 16）。actor 可以等待 Store，但绝不等待 socket；
+  每次命令出队、Store 返回和 replay page 入队前都重新验证当前 `AccessContext` 与
+  authorization generation。所有 live/replay Publish、Gap 与 ReplayComplete 的授权检查和
+  writer enqueue 都在 `with_current` 的同一 active-registry 临界区内线性化；transition fence
+  之后旧 generation 不得再跨出任何一帧。
+- `RegisterStream` / `Publish` 只接受 MachineAccess，`Subscribe` / `Unsubscribe` / `Ack`
+  只接受 DeviceAccess；PairingAccess 和 endpoint 伪造的 server-only frame 固定拒绝。
+  Publish 只有在 SQLite COMMIT 后才允许 fan-out 和向 origin 入队 `RouteAccepted`；COMMIT
+  后先为 origin acceptance 占聚合 normal permit，再投递 readers，避免慢读者反向关闭健康的
+  machine writer。COMMIT 后响应丢失的 canonical retry 会修复 fan-out，但已经推进的订阅
+  不会重复交付。
+- 每条 connection 只有一个 actor-owned runtime subscription map 和一个 active replay。
+  多个 stream 可同时订阅，额外 replay 进入受每连接 subscription hard cap 约束的 FIFO；
+  当前 replay、catch-up、gap 或 unsubscribe 终结后才启动下一项。这样 Companion 可同时
+  观察多个会话，又不会让单连接并发物化多页 ciphertext。
+- `Subscribe` 的 `replay_through` 与 durable lease 在同一 SQLite transaction 冻结。
+  replay 的每次请求取 writer 当前可用预算、Store 配置与协议 hard maximum 三者最小值，
+  上限仍为 64 frames / 8 MiB；拉取前必须原子预留整页 writer normal 预算，全局同时最多
+  物化 2 页。Store 瞬时 `WorkerBusy` 释放 writer/staging 预算后做三次可取消退避，不把合法
+  reader 误判为失效。每页重新校验 canonical size/hash/sequence/boundary；最后一页全部进入
+  同一 FIFO 后异步等待 control reserve，再发送唯一 `ReplayComplete`，因此 tiny writer 与
+  同时排队超过 16 个空 replay 都不会被误断。
+- 冻结边界后的并发 Publish 只推进 `missed_hwm`，由 post-terminal catch-up 串行追赶；
+  `ReplayComplete` 不移动。hot stream 每完成一个 catch-up quantum 就轮转到 replay FIFO 尾部，
+  不能饿死其他 stream。live sequence 跳跃或 retention gap 会发送保留容量内的 `Gap` 并暂停
+  该 stream，显式同 generation re-Subscribe 前不得继续交付更高 sequence。
+- writer normal 默认 512 frames / 16 MiB，control reserve 为 16 frames / 1 MiB；两类预算
+  共用一条 FIFO，socket flush 前一直占用；全 Core 另有独立的聚合 normal 16,384 frames /
+  256 MiB 与 control 4,096 frames / 16 MiB 默认预算，normal 不能消耗 control reserve。
+  per-writer 或 global normal/control 耗尽、delivery 丢失或 receiver 退出均 fail-closed，且只
+  清理对应慢连接。heartbeat 每 20 秒发送 Ping，仅 exact pending Pong 刷新；60 秒边界关闭。
+  replacement、revoke、lifecycle terminal 与 shutdown 都取消 replay、关闭 writer、清 runtime
+  并确定性 join 后台 task；registry entry 还有 Drop guard，覆盖 Core future 被 runtime 取消或
+  panic 的最后关闭路径。durable subscription/ACK 仅由显式 Store mutation 改变。
+- 空 stream 与 durable subscription 同样是受限元数据：默认每 machine 4,096 streams、全局
+  65,536 streams、每 device 4,096 subscriptions、全局 262,144 subscriptions；新增 row 还需
+  额外 64 KiB 磁盘增长余量。幂等 retry 不重复占容量，配置下调或旧 DB 已超限时在 Store
+  ready 前 typed fail-closed，不静默删除 durable state。
+- Core、writer、replay 的 Debug 只能打印计数、failure code 和带类型域的 route 短 hash；
+  不格式化 sealed bytes 或完整 route/generation。P2.4 才加入 PairRoute 与在线 Send/Reply，
+  P2.9 前仍不能把本节测试通过描述为 v2 公网 listener 已上线。
+
 ### R1a 隐含约束（供 R2 参考）
 
 - **R1a machine_id ≡ device_id**：`server/ws.rs::connect` 用 `device.device_id` 作 `ConnRole::Machine.machine_id`，`router.rs` RegisterMachine 授权强制 `machine.machine_id == connection.machine_id`——**enrolled 的 machine 设备的 `machine_id` 严格等于 `device_id`**。CLI 生成的随机 `device_id = "cli-<profile>-<random>"` 会锁定 R2 daemon remote-mode 里对应 machine 的 identifier；R2 设计需评估是否解耦 machine_id 与 device_id（例如 machine 元数据里显式携带独立 machine_id）。

@@ -15,14 +15,62 @@ use agentdeck_protocol::relay_v2::{
 use thiserror::Error;
 
 pub const MAX_CONTROL_BLOB_BYTES: usize = 64 * 1024;
+pub const REPLAY_PAGE_HARD_MAX_FRAMES: u64 = 64;
+pub const REPLAY_PAGE_HARD_MAX_BYTES: u64 = 8 * 1024 * 1024;
 pub const PUBLISH_OUTER_OVERHEAD_BYTES: usize = 53;
 pub const MAX_ENROLLMENT_CODES: u64 = 4_096;
+pub const MAX_STREAMS_PER_MACHINE: u64 = 4_096;
+pub const MAX_STREAMS_GLOBAL: u64 = 65_536;
+pub const MAX_SUBSCRIPTIONS_PER_DEVICE: u64 = 4_096;
+pub const MAX_SUBSCRIPTIONS_GLOBAL: u64 = 262_144;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataLimits {
+    pub max_streams_per_machine: u64,
+    pub max_streams_global: u64,
+    pub max_subscriptions_per_device: u64,
+    pub max_subscriptions_global: u64,
+}
+
+impl Default for MetadataLimits {
+    fn default() -> Self {
+        Self {
+            max_streams_per_machine: MAX_STREAMS_PER_MACHINE,
+            max_streams_global: MAX_STREAMS_GLOBAL,
+            max_subscriptions_per_device: MAX_SUBSCRIPTIONS_PER_DEVICE,
+            max_subscriptions_global: MAX_SUBSCRIPTIONS_GLOBAL,
+        }
+    }
+}
+
+impl MetadataLimits {
+    pub fn validate(&self) -> Result<(), StoreError> {
+        if self.max_streams_per_machine == 0
+            || self.max_streams_per_machine > MAX_STREAMS_PER_MACHINE
+            || self.max_streams_global == 0
+            || self.max_streams_global > MAX_STREAMS_GLOBAL
+            || self.max_streams_per_machine > self.max_streams_global
+            || self.max_subscriptions_per_device == 0
+            || self.max_subscriptions_per_device > MAX_SUBSCRIPTIONS_PER_DEVICE
+            || self.max_subscriptions_global == 0
+            || self.max_subscriptions_global > MAX_SUBSCRIPTIONS_GLOBAL
+            || self.max_subscriptions_per_device > self.max_subscriptions_global
+        {
+            return Err(StoreError::InvalidValue {
+                field: "metadata_limits",
+                reason: "metadata counts must be non-zero, ordered, and within hard maxima",
+            });
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone)]
 pub struct RelayV2StoreConfig {
     pub storage_path: PathBuf,
     pub retention: RetentionLimits,
     pub max_enrollment_codes: u64,
+    pub metadata_limits: MetadataLimits,
     pub clock: Arc<dyn Clock>,
     pub disk_space_probe: Arc<dyn DiskSpaceProbe>,
     pub fault_injector: Arc<dyn FaultInjector>,
@@ -34,6 +82,7 @@ impl RelayV2StoreConfig {
             storage_path,
             retention: RetentionLimits::default(),
             max_enrollment_codes: MAX_ENROLLMENT_CODES,
+            metadata_limits: MetadataLimits::default(),
             clock: Arc::new(SystemClock),
             disk_space_probe: Arc::new(SystemDiskSpaceProbe),
             fault_injector: Arc::new(NoFaults),
@@ -47,6 +96,11 @@ impl RelayV2StoreConfig {
 
     pub fn with_max_enrollment_codes(mut self, max_enrollment_codes: u64) -> Self {
         self.max_enrollment_codes = max_enrollment_codes;
+        self
+    }
+
+    pub fn with_metadata_limits(mut self, limits: MetadataLimits) -> Self {
+        self.metadata_limits = limits;
         self
     }
 
@@ -73,6 +127,7 @@ impl fmt::Debug for RelayV2StoreConfig {
             .field("storage_path", &self.storage_path)
             .field("retention", &self.retention)
             .field("max_enrollment_codes", &self.max_enrollment_codes)
+            .field("metadata_limits", &self.metadata_limits)
             .finish_non_exhaustive()
     }
 }
@@ -153,7 +208,9 @@ pub enum StoreError {
     GrantNotFound,
     #[error("stream route was not found")]
     StreamNotFound,
-    #[error("stream route is already bound to a different machine or generation")]
+    #[error("stream route is not owned by the authenticated machine")]
+    StreamOwnerConflict,
+    #[error("stream route is already bound to a different generation")]
     StreamBindingConflict,
     #[error("monotonic value for {field} would roll back")]
     MonotonicRollback { field: &'static str },
@@ -181,6 +238,8 @@ pub enum StoreError {
     ReplayGap { needed: u64, oldest: u64 },
     #[error("invalid replay continuation")]
     InvalidReplayCursor,
+    #[error("next replay frame exceeds the caller page budget")]
+    ReplayPageLimitExceeded,
 }
 
 impl StoreError {
@@ -210,6 +269,7 @@ impl StoreError {
             Self::MachineNotFound | Self::GrantNotFound | Self::StreamNotFound => {
                 "relay.store.not_found"
             }
+            Self::StreamOwnerConflict => "relay.route.not_found",
             Self::StreamBindingConflict
             | Self::IdempotencyConflict { .. }
             | Self::EnrollmentCodeConflict => "relay.store.conflict",
@@ -224,6 +284,7 @@ impl StoreError {
             Self::FrameTooLarge => "relay.frame.too_large",
             Self::ReplayGap { .. } => "relay.replay.gap",
             Self::InvalidReplayCursor => "relay.replay.cursor_invalid",
+            Self::ReplayPageLimitExceeded => "relay.quota.exceeded",
         }
     }
 }
@@ -279,8 +340,8 @@ impl Default for RetentionLimits {
             max_age_ms: 24 * 60 * 60 * 1_000,
             max_bytes_per_machine: 512 * 1024 * 1024,
             max_bytes_global: 4 * 1024 * 1024 * 1024,
-            replay_page_max_frames: 64,
-            replay_page_max_bytes: 8 * 1024 * 1024,
+            replay_page_max_frames: REPLAY_PAGE_HARD_MAX_FRAMES,
+            replay_page_max_bytes: REPLAY_PAGE_HARD_MAX_BYTES,
             disk_reserve_bytes: 512 * 1024 * 1024,
             disk_reserve_percent: 5,
         }
@@ -301,9 +362,9 @@ impl RetentionLimits {
             || self.max_bytes_per_machine == 0
             || self.max_bytes_global == 0
             || self.replay_page_max_frames == 0
-            || self.replay_page_max_frames > 64
+            || self.replay_page_max_frames > REPLAY_PAGE_HARD_MAX_FRAMES
             || self.replay_page_max_bytes < MAX_FRAME_BYTES as u64
-            || self.replay_page_max_bytes > 8 * 1024 * 1024
+            || self.replay_page_max_bytes > REPLAY_PAGE_HARD_MAX_BYTES
         {
             return Err(StoreError::InvalidValue {
                 field: "retention",
@@ -377,6 +438,7 @@ pub enum FaultPoint {
     PublishAfterCommit,
     SubscribeBeforeCommit,
     AckBeforeCommit,
+    ReplayAfterRead,
     RevokeBeforeCommit,
     PurgeBeforeCommit,
     MaintenanceBeforeCommit,
@@ -664,6 +726,9 @@ pub struct PersistSubscription {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscriptionLease {
     pub start: StreamCursor,
+    /// 与 subscription upsert 在同一 SQLite transaction 内读取并冻结的 high-water。
+    /// Core 只能重放到该边界，避免随后提交的 live publish 越过 ReplayComplete。
+    pub replay_through: StreamCursor,
     pub ack: Option<u64>,
     pub duplicate: bool,
 }
@@ -694,6 +759,9 @@ pub struct ReplayPageRequest {
     pub stream_route: StreamRouteId,
     pub generation: StreamGenerationId,
     pub position: ReplayPosition,
+    /// 本次调用方可原子接纳的 page 上限；必须非零且不超过 Store hard maximum。
+    pub page_max_frames: u64,
+    pub page_max_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

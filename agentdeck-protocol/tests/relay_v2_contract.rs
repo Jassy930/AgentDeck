@@ -20,6 +20,7 @@ use agentdeck_protocol::relay_v2::codec::{self, CodecError, MAX_FRAME_BYTES, REL
 use agentdeck_protocol::relay_v2::enrollment::{
     EnrollmentCode, MachineEnrollmentRequestV1, MachineEnrollmentResponseV1,
 };
+use agentdeck_protocol::relay_v2::failure::RELAY_REPLAY_CURSOR_INVALID;
 use agentdeck_protocol::relay_v2::frame::{
     AcceptedRef, Ack, AuthProof, Authenticate, Authenticated, Challenge, ClosePairRoute, Gap,
     GrantCommitted, Hello, InstallGrant, OpaqueRouteFrame, OpenPairRoute, PairData,
@@ -39,6 +40,11 @@ use std::path::PathBuf;
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+#[test]
+fn replay_cursor_invalid_failure_code_is_stable() {
+    assert_eq!(RELAY_REPLAY_CURSOR_INVALID, "relay.replay.cursor_invalid");
 }
 
 fn check_golden(name: &str, actual: &str, expected: &str) {

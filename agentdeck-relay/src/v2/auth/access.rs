@@ -615,6 +615,29 @@ impl ActiveConnectionRegistry {
         Ok(self.current(route)? == Some(access.connection_instance()))
     }
 
+    /// 在 active-registry mutex 内把 current 检查与一个无等待动作线性化。数据面 fan-out
+    /// 用它保证 enqueue 与 revoke/replacement transition 有明确先后，不留下 check/use 窗口。
+    pub(super) fn with_current<T>(
+        &self,
+        access: &AccessContext,
+        action: impl FnOnce() -> T,
+    ) -> Result<Option<T>, RelayFailure> {
+        let Some(route) = access.principal_route() else {
+            return Ok(None);
+        };
+        let active = self.lock()?;
+        let is_current = matches!(
+            active.get(&route),
+            Some(ActiveState::Active(entry))
+                if entry.connection_instance == access.connection_instance()
+        );
+        if is_current {
+            Ok(Some(action()))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn lock(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, HashMap<PrincipalRoute, ActiveState>>, RelayFailure> {
@@ -736,6 +759,35 @@ mod tests {
         assert!(!rendered.contains(&format!("{:?}", [0xaa_u8; 16])));
         assert!(!rendered.contains(&"aa".repeat(16)));
         assert!(!rendered.contains(&"bb".repeat(32)));
+    }
+
+    #[test]
+    fn with_current_linearizes_action_against_transition_fence() {
+        let registry = ActiveConnectionRegistry::new(2).expect("registry");
+        let route = machine(0xab);
+        let access = machine_access(route, 9, 1, 0xcd);
+        activate(&registry, &access).expect("activate");
+        let calls = std::cell::Cell::new(0_u8);
+        assert_eq!(
+            registry
+                .with_current(&access, || calls.set(calls.get() + 1))
+                .expect("current action"),
+            Some(())
+        );
+        let transition = registry
+            .begin_transition(PrincipalRoute::Machine(route), false)
+            .expect("begin transition");
+        assert_eq!(
+            registry
+                .with_current(&access, || calls.set(calls.get() + 1))
+                .expect("fenced action"),
+            None
+        );
+        assert_eq!(calls.get(), 1);
+        registry
+            .abort_transition(transition)
+            .expect("restore active entry");
+        assert!(registry.is_current(&access).expect("restored"));
     }
 
     #[test]
