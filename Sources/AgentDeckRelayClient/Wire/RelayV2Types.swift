@@ -1117,7 +1117,7 @@ public struct RelayV2OutboundFrame: Sendable {
         pairRoute: Data,
         payload: RelayEndpointPayloadV1
     ) throws -> Self {
-        Self(
+        return Self(
             body: .pairData(
                 pairRoute: pairRoute,
                 sealedBlob: try RelayV2JSONCodec.encodeEndpoint(payload)
@@ -1131,12 +1131,18 @@ public struct RelayV2OutboundFrame: Sendable {
         streamSeq: UInt64,
         sealedBlob: SignedSealedBlobV1
     ) throws -> Self {
-        Self(
+        let sealedBudget = try RelayV2SignedSealedBlobCodec.remainingBudget(
+            afterOuterBytes: 5 + 2 + 2 + 16 + 16 + 8 + 4
+        )
+        return Self(
             body: .publish(
                 streamRoute: streamRoute,
                 generation: generation,
                 streamSeq: streamSeq,
-                sealedBlob: try RelayV2SignedSealedBlobCodec.encode(sealedBlob)
+                sealedBlob: try RelayV2SignedSealedBlobCodec.encode(
+                    sealedBlob,
+                    maxEncodedBytes: sealedBudget
+                )
             )
         )
     }
@@ -1146,11 +1152,17 @@ public struct RelayV2OutboundFrame: Sendable {
         requestRoute: Data,
         sealedBlob: SignedSealedBlobV1
     ) throws -> Self {
-        Self(
+        let sealedBudget = try RelayV2SignedSealedBlobCodec.remainingBudget(
+            afterOuterBytes: 5 + 2 + 2 + 16 + 16 + 4
+        )
+        return Self(
             body: .send(
                 deviceRoute: deviceRoute,
                 requestRoute: requestRoute,
-                sealedBlob: try RelayV2SignedSealedBlobCodec.encode(sealedBlob)
+                sealedBlob: try RelayV2SignedSealedBlobCodec.encode(
+                    sealedBlob,
+                    maxEncodedBytes: sealedBudget
+                )
             )
         )
     }
@@ -1160,11 +1172,17 @@ public struct RelayV2OutboundFrame: Sendable {
         requestRoute: Data,
         sealedBlob: SignedSealedBlobV1
     ) throws -> Self {
-        Self(
+        let sealedBudget = try RelayV2SignedSealedBlobCodec.remainingBudget(
+            afterOuterBytes: 5 + 2 + 2 + 16 + 16 + 4
+        )
+        return Self(
             body: .reply(
                 deviceRoute: deviceRoute,
                 requestRoute: requestRoute,
-                sealedBlob: try RelayV2SignedSealedBlobCodec.encode(sealedBlob)
+                sealedBlob: try RelayV2SignedSealedBlobCodec.encode(
+                    sealedBlob,
+                    maxEncodedBytes: sealedBudget
+                )
             )
         )
     }
@@ -1173,7 +1191,20 @@ public struct RelayV2OutboundFrame: Sendable {
 private enum RelayV2SignedSealedBlobCodec {
     private static let domain = Data("AgentDeck/SealedBlobV1\0".utf8)
 
-    static func encode(_ value: SignedSealedBlobV1) throws -> Data {
+    static func remainingBudget(afterOuterBytes outerBytes: Int) throws -> Int {
+        let (budget, overflow) = RelayWireCodecV2.maxFrameBytes.subtractingReportingOverflow(
+            outerBytes
+        )
+        guard !overflow, budget >= 0 else {
+            throw RelayWireCodecError.lengthOutOfBounds
+        }
+        return budget
+    }
+
+    static func encode(
+        _ value: SignedSealedBlobV1,
+        maxEncodedBytes: Int
+    ) throws -> Data {
         guard value.inner.formatVersion == 1 else {
             throw RelayWireCodecError.unsupportedVersion(value.inner.formatVersion)
         }
@@ -1192,12 +1223,19 @@ private enum RelayV2SignedSealedBlobCodec {
             )
         }
 
+        guard UInt32(exactly: value.inner.ciphertext.count) != nil else {
+            throw RelayWireCodecError.lengthOutOfBounds
+        }
+
         let fixedCapacity = domain.count + 2 + 1 + 1 + 8 + 8 + 8 + 4 + 12 + 4 + 64
         let (capacity, capacityOverflow) = fixedCapacity.addingReportingOverflow(
             value.inner.ciphertext.count
         )
         guard !capacityOverflow else {
             throw RelayWireCodecError.lengthOutOfBounds
+        }
+        guard capacity <= maxEncodedBytes else {
+            throw RelayWireCodecError.oversize
         }
         var output = Data()
         output.reserveCapacity(capacity)
@@ -2235,26 +2273,55 @@ private struct RelayBinaryWriter {
         guard let count = UInt32(exactly: value.count) else {
             throw RelayWireCodecError.lengthOutOfBounds
         }
-        let (afterPrefix, prefixOverflow) = storage.count.addingReportingOverflow(4)
-        let (afterValue, valueOverflow) = afterPrefix.addingReportingOverflow(value.count)
-        guard !prefixOverflow, !valueOverflow, afterValue <= maxBytes else {
-            throw RelayWireCodecError.oversize
-        }
+        try ensureRemainingForLengthPrefixed(byteCount: value.count)
         u32(count)
         raw(value)
     }
 
     mutating func string(_ value: String) throws {
-        try bytes(Data(value.utf8), field: "string")
+        let utf8 = value.utf8
+        guard let count = UInt32(exactly: utf8.count) else {
+            throw RelayWireCodecError.lengthOutOfBounds
+        }
+        try ensureRemainingForLengthPrefixed(byteCount: utf8.count)
+        u32(count)
+        storage.append(contentsOf: utf8)
     }
 
     mutating func optionalString(_ value: String?) throws {
         guard let value else {
+            try ensureRemaining(1)
             u8(0)
             return
         }
+        let utf8 = value.utf8
+        guard let count = UInt32(exactly: utf8.count) else {
+            throw RelayWireCodecError.lengthOutOfBounds
+        }
+        let (prefixedCount, prefixOverflow) = utf8.count.addingReportingOverflow(4)
+        let (totalCount, tagOverflow) = prefixedCount.addingReportingOverflow(1)
+        guard !prefixOverflow, !tagOverflow else {
+            throw RelayWireCodecError.lengthOutOfBounds
+        }
+        try ensureRemaining(totalCount)
         u8(1)
-        try string(value)
+        u32(count)
+        storage.append(contentsOf: utf8)
+    }
+
+    private func ensureRemainingForLengthPrefixed(byteCount: Int) throws {
+        let (required, overflow) = byteCount.addingReportingOverflow(4)
+        guard !overflow else {
+            throw RelayWireCodecError.lengthOutOfBounds
+        }
+        try ensureRemaining(required)
+    }
+
+    private func ensureRemaining(_ required: Int) throws {
+        let (end, overflow) = storage.count.addingReportingOverflow(required)
+        guard required >= 0, !overflow, end <= maxBytes else {
+            throw RelayWireCodecError.oversize
+        }
     }
 
     mutating func cursor(_ value: StreamCursor) {

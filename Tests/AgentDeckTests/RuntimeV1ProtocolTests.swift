@@ -3,6 +3,83 @@ import XCTest
 @testable import AgentDeckCore
 
 final class RuntimeV1ProtocolTests: XCTestCase {
+    func testBackfillBareEventRejectsInjectedStreamContextTag() throws {
+        let fixtures = try loadRawFixtureObjects()
+        var backfill = try fixtureValue(named: "replyBackfill", in: fixtures)
+        let stable = try fixtureValue(named: "stableIds", in: fixtures)
+        let stableBody = try XCTUnwrap(stable["body"] as? [String: Any])
+        let injectedEvent = try XCTUnwrap(stableBody["payload"] as? [String: Any])
+        XCTAssertEqual(injectedEvent["stream"] as? String, "event")
+
+        var backfillBody = try XCTUnwrap(backfill["body"] as? [String: Any])
+        var backfillPayload = try XCTUnwrap(backfillBody["payload"] as? [String: Any])
+        backfillPayload["events"] = [injectedEvent]
+        backfillBody["payload"] = backfillPayload
+        backfill["body"] = backfillBody
+
+        XCTAssertThrowsError(
+            try RuntimeV1WireCodec.decodeEnvelope(
+                JSONSerialization.data(withJSONObject: backfill)
+            )
+        )
+    }
+
+    func testStreamSyncCompleteRejectsInjectedReplyContextTag() throws {
+        let fixtures = try loadRawFixtureObjects()
+        var value = try fixtureValue(named: "streamSyncComplete", in: fixtures)
+        var body = try XCTUnwrap(value["body"] as? [String: Any])
+        var payload = try XCTUnwrap(body["payload"] as? [String: Any])
+        payload["reply"] = "syncComplete"
+        body["payload"] = payload
+        value["body"] = body
+
+        XCTAssertThrowsError(
+            try RuntimeV1WireCodec.decodeEnvelope(
+                JSONSerialization.data(withJSONObject: value)
+            )
+        )
+    }
+
+    func testAgentItemMetaNullIsRejectedInsteadOfDefaulted() throws {
+        let fixtures = try loadRawFixtureObjects()
+        var value = try fixtureValue(named: "agentItemAssistantMessage", in: fixtures)
+        var envelopeBody = try XCTUnwrap(value["body"] as? [String: Any])
+        var payload = try XCTUnwrap(envelopeBody["payload"] as? [String: Any])
+        var body = try XCTUnwrap(payload["body"] as? [String: Any])
+        var item = try XCTUnwrap(body["item"] as? [String: Any])
+        item["meta"] = NSNull()
+        body["item"] = item
+        payload["body"] = body
+        envelopeBody["payload"] = payload
+        value["body"] = envelopeBody
+
+        XCTAssertThrowsError(
+            try RuntimeV1WireCodec.decodeEnvelope(
+                JSONSerialization.data(withJSONObject: value)
+            )
+        )
+    }
+
+    func testVendorExtensionsNullIsRejectedInsteadOfDefaulted() throws {
+        let fixtures = try loadRawFixtureObjects()
+        var value = try fixtureValue(named: "agentItemAssistantMessage", in: fixtures)
+        var envelopeBody = try XCTUnwrap(value["body"] as? [String: Any])
+        var payload = try XCTUnwrap(envelopeBody["payload"] as? [String: Any])
+        var body = try XCTUnwrap(payload["body"] as? [String: Any])
+        var item = try XCTUnwrap(body["item"] as? [String: Any])
+        item["meta"] = ["vendorExtensions": NSNull()]
+        body["item"] = item
+        payload["body"] = body
+        envelopeBody["payload"] = payload
+        value["body"] = envelopeBody
+
+        XCTAssertThrowsError(
+            try RuntimeV1WireCodec.decodeEnvelope(
+                JSONSerialization.data(withJSONObject: value)
+            )
+        )
+    }
+
     func testRustJSONLDecodesAndReencodesWithEquivalentJSON() throws {
         let fixtures = try loadFixtures()
         XCTAssertGreaterThan(fixtures.count, 16)

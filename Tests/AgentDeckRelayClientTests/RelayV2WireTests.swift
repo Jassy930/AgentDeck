@@ -232,6 +232,120 @@ final class RelayV2WireTests: XCTestCase {
         }
     }
 
+    func testSignedSealedFactoriesPreflightTheirExactOuterBudgets() throws {
+        let sealedVector = try XCTUnwrap(
+            try loadCryptoVectors()["sealed_blob"] as? [String: Any]
+        )
+        let baseCiphertext = Data(hex: try XCTUnwrap(sealedVector["ciphertextHex"] as? String))
+        let baseWire = Data(hex: try XCTUnwrap(sealedVector["wireHex"] as? String))
+        let sealedFixedBytes = baseWire.count - baseCiphertext.count
+        let route = Data(repeating: 0x33, count: 16)
+        let generation = Data(repeating: 0x66, count: 16)
+
+        let cases: [(
+            name: String,
+            outerBytes: Int,
+            make: (SignedSealedBlobV1) throws -> RelayV2OutboundFrame
+        )] = [
+            (
+                "publish",
+                5 + 2 + 2 + 16 + 16 + 8 + 4,
+                { blob in
+                    try RelayV2OutboundFrame.publish(
+                        streamRoute: route,
+                        generation: generation,
+                        streamSeq: 7,
+                        sealedBlob: blob
+                    )
+                }
+            ),
+            (
+                "send",
+                5 + 2 + 2 + 16 + 16 + 4,
+                { blob in
+                    try RelayV2OutboundFrame.send(
+                        deviceRoute: route,
+                        requestRoute: generation,
+                        sealedBlob: blob
+                    )
+                }
+            ),
+            (
+                "reply",
+                5 + 2 + 2 + 16 + 16 + 4,
+                { blob in
+                    try RelayV2OutboundFrame.reply(
+                        deviceRoute: route,
+                        requestRoute: generation,
+                        sealedBlob: blob
+                    )
+                }
+            ),
+        ]
+
+        for boundary in cases {
+            let maximumCiphertextBytes = RelayWireCodecV2.maxFrameBytes
+                - boundary.outerBytes
+                - sealedFixedBytes
+            let nearLimit = try signedSealedBlob(
+                from: sealedVector,
+                ciphertext: Data(repeating: 0xA5, count: maximumCiphertextBytes)
+            )
+            XCTAssertNoThrow(try boundary.make(nearLimit), boundary.name)
+
+            let oversize = try signedSealedBlob(
+                from: sealedVector,
+                ciphertext: Data(repeating: 0xA5, count: maximumCiphertextBytes + 1)
+            )
+            XCTAssertThrowsError(try boundary.make(oversize), boundary.name) { error in
+                XCTAssertEqual(error as? RelayWireCodecError, .oversize, boundary.name)
+            }
+        }
+    }
+
+    func testErrorStringsRespectExactUTF8NearLimitAndOversizeBudgets() throws {
+        let nilOptionalFixedBytes = 5 + 2 + 2 + 4 + 4 + 1
+        let maximumCodeBytes = RelayWireCodecV2.maxFrameBytes - nilOptionalFixedBytes
+        let nearCode = string(withUTF8Count: maximumCodeBytes)
+        XCTAssertEqual(nearCode.utf8.count, maximumCodeBytes)
+        let nearFrame = RelayV2OutboundFrame.control(
+            .error(RelayV2Failure(code: nearCode, message: "", inReplyTo: nil))
+        )
+        XCTAssertEqual(try RelayWireCodecV2.encode(nearFrame).count, RelayWireCodecV2.maxFrameBytes)
+
+        let oversizeCode = string(withUTF8Count: maximumCodeBytes + 1)
+        let oversizeFrame = RelayV2OutboundFrame.control(
+            .error(RelayV2Failure(code: oversizeCode, message: "", inReplyTo: nil))
+        )
+        XCTAssertThrowsError(try RelayWireCodecV2.encode(oversizeFrame)) { error in
+            XCTAssertEqual(error as? RelayWireCodecError, .oversize)
+        }
+
+        let optionalFixedBytes = 5 + 2 + 2 + 4 + 4 + 1 + 4
+        let maximumOptionalBytes = RelayWireCodecV2.maxFrameBytes - optionalFixedBytes
+        let nearOptional = string(withUTF8Count: maximumOptionalBytes)
+        let nearOptionalFrame = RelayV2OutboundFrame.control(
+            .error(RelayV2Failure(code: "", message: "", inReplyTo: nearOptional))
+        )
+        XCTAssertEqual(
+            try RelayWireCodecV2.encode(nearOptionalFrame).count,
+            RelayWireCodecV2.maxFrameBytes
+        )
+
+        let oversizeOptionalFrame = RelayV2OutboundFrame.control(
+            .error(
+                RelayV2Failure(
+                    code: "",
+                    message: "",
+                    inReplyTo: string(withUTF8Count: maximumOptionalBytes + 1)
+                )
+            )
+        )
+        XCTAssertThrowsError(try RelayWireCodecV2.encode(oversizeOptionalFrame)) { error in
+            XCTAssertEqual(error as? RelayWireCodecError, .oversize)
+        }
+    }
+
     func testRawFrameBinaryEncodeIsNotPublicAPI() throws {
         let source = try String(contentsOf: relayV2TypesURL, encoding: .utf8)
         XCTAssertFalse(source.contains("public static func encode(_ frame: RelayV2Frame)"))
@@ -457,6 +571,10 @@ final class RelayV2WireTests: XCTestCase {
             throw RelayWireCodecError.lengthOutOfBounds
         }
         return data[start..<end]
+    }
+
+    private func string(withUTF8Count count: Int) -> String {
+        String(repeating: "界", count: count / 3) + String(repeating: "x", count: count % 3)
     }
 
     private var repoRoot: URL {

@@ -707,7 +707,11 @@ public struct RuntimeSyncCompleteV1: Codable, Sendable {
     }
 
     public init(from decoder: Decoder) throws {
-        try rejectUnknownKeys(decoder, allowed: CodingKeys.all.union(["reply", "stream"]))
+        try rejectUnknownKeys(decoder, allowed: CodingKeys.all)
+        try self.init(decodingFieldsFrom: decoder)
+    }
+
+    fileprivate init(decodingFieldsFrom decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         streamGeneration = try container.decode(RuntimeStreamGeneration.self, forKey: .streamGeneration)
         streamCursor = try container.decode(RuntimeStreamCursorV1.self, forKey: .streamCursor)
@@ -823,7 +827,7 @@ public enum RuntimeReplyV1: Codable, Sendable {
                     "keyDirectoryRevision",
                 ]
             )
-            self = .syncComplete(try RuntimeSyncCompleteV1(from: decoder))
+            self = .syncComplete(try RuntimeReplySyncCompleteV1(from: decoder).value)
         case "pairInvite":
             try rejectUnknownKeys(
                 decoder,
@@ -1274,10 +1278,14 @@ public struct RuntimeAgentItemMetaV1: Codable, Sendable {
     public init(from decoder: Decoder) throws {
         try rejectUnknownKeys(decoder, allowed: CodingKeys.all)
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        vendorExtensions = try container.decodeIfPresent(
-            [String: AnyCodable].self,
-            forKey: .vendorExtensions
-        ) ?? [:]
+        if container.contains(.vendorExtensions) {
+            vendorExtensions = try container.decode(
+                [String: AnyCodable].self,
+                forKey: .vendorExtensions
+            )
+        } else {
+            vendorExtensions = [:]
+        }
     }
 }
 
@@ -1356,10 +1364,12 @@ public enum RuntimeAgentItemV1: Codable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: RuntimeV1CodingKey.self)
         let kindValue = try container.decode(String.self, forKey: key("kind"))
-        let meta = try container.decodeIfPresent(
-            RuntimeAgentItemMetaV1.self,
-            forKey: key("meta")
-        ) ?? RuntimeAgentItemMetaV1()
+        let meta: RuntimeAgentItemMetaV1
+        if container.contains(key("meta")) {
+            meta = try container.decode(RuntimeAgentItemMetaV1.self, forKey: key("meta"))
+        } else {
+            meta = RuntimeAgentItemMetaV1()
+        }
         switch kindValue {
         case "userMessage", "assistantMessage", "reasoning":
             try rejectUnknownKeys(decoder, allowed: ["kind", "text", "meta"])
@@ -1603,9 +1613,10 @@ public enum RuntimeStreamItemV1: Codable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         switch try container.decode(String.self, forKey: .stream) {
-        case "event": self = .event(try RuntimeEventV1(from: decoder))
+        case "event": self = .event(try RuntimeStreamEventV1(from: decoder).value)
         case "catalogDelta": self = .catalogDelta(try RuntimeCatalogDeltaV1(from: decoder))
-        case "syncComplete": self = .syncComplete(try RuntimeSyncCompleteV1(from: decoder))
+        case "syncComplete":
+            self = .syncComplete(try RuntimeStreamSyncCompleteV1(from: decoder).value)
         case let value:
             throw DecodingError.dataCorruptedError(
                 forKey: .stream,
@@ -1644,8 +1655,12 @@ public struct RuntimeEventV1: Codable, Sendable {
     public init(from decoder: Decoder) throws {
         try rejectUnknownKeys(
             decoder,
-            allowed: ["stream", "conversationId", "eventId", "eventSeq", "itemId", "entityId", "body"]
+            allowed: ["conversationId", "eventId", "eventSeq", "itemId", "entityId", "body"]
         )
+        try self.init(decodingFieldsFrom: decoder)
+    }
+
+    fileprivate init(decodingFieldsFrom decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: RuntimeV1CodingKey.self)
         conversationID = try container.decode(RuntimeConversationID.self, forKey: key("conversationId"))
         eventID = try container.decode(RuntimeEventID.self, forKey: key("eventId"))
@@ -1669,6 +1684,66 @@ public struct RuntimeEventV1: Codable, Sendable {
         try container.encode(itemID, forKey: key("itemId"))
         try container.encode(entityID, forKey: key("entityId"))
         try container.encode(body, forKey: key("body"))
+    }
+}
+
+private struct RuntimeReplySyncCompleteV1: Decodable {
+    let value: RuntimeSyncCompleteV1
+
+    init(from decoder: Decoder) throws {
+        try rejectUnknownKeys(
+            decoder,
+            allowed: [
+                "reply", "streamGeneration", "streamCursor", "eventSeq",
+                "keyDirectoryRevision",
+            ]
+        )
+        let container = try decoder.container(keyedBy: RuntimeV1CodingKey.self)
+        let tag = try container.decode(String.self, forKey: key("reply"))
+        guard tag == "syncComplete" else {
+            throw invalidTag(tag, field: "reply", in: container)
+        }
+        value = try RuntimeSyncCompleteV1(decodingFieldsFrom: decoder)
+    }
+}
+
+private struct RuntimeStreamSyncCompleteV1: Decodable {
+    let value: RuntimeSyncCompleteV1
+
+    init(from decoder: Decoder) throws {
+        try rejectUnknownKeys(
+            decoder,
+            allowed: [
+                "stream", "streamGeneration", "streamCursor", "eventSeq",
+                "keyDirectoryRevision",
+            ]
+        )
+        let container = try decoder.container(keyedBy: RuntimeV1CodingKey.self)
+        let tag = try container.decode(String.self, forKey: key("stream"))
+        guard tag == "syncComplete" else {
+            throw invalidTag(tag, field: "stream", in: container)
+        }
+        value = try RuntimeSyncCompleteV1(decodingFieldsFrom: decoder)
+    }
+}
+
+private struct RuntimeStreamEventV1: Decodable {
+    let value: RuntimeEventV1
+
+    init(from decoder: Decoder) throws {
+        try rejectUnknownKeys(
+            decoder,
+            allowed: [
+                "stream", "conversationId", "eventId", "eventSeq", "itemId", "entityId",
+                "body",
+            ]
+        )
+        let container = try decoder.container(keyedBy: RuntimeV1CodingKey.self)
+        let tag = try container.decode(String.self, forKey: key("stream"))
+        guard tag == "event" else {
+            throw invalidTag(tag, field: "stream", in: container)
+        }
+        value = try RuntimeEventV1(decodingFieldsFrom: decoder)
     }
 }
 
