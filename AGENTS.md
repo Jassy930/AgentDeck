@@ -159,8 +159,11 @@ bash scripts/reset-relay-v1-dev-state.sh \
 ```
 
 reset 只接受 canonical absolute 普通文件路径，拒绝 symlink、非 v1 schema、非 v1
-credential shape 或 DB 关联不匹配；任一失败必须零删除。成功后没有开发状态恢复
-路径，必须重新配对。不得用 glob 或手工扩大删除集合。
+credential shape 或 DB 关联不匹配；所有 validation 与 unlink preflight（含父目录
+权限、macOS immutable/system flags）失败都发生在首次 unlink 前，零删除。preflight
+之后 OS unlink 仍因 race/I/O 失败时可能部分删除：脚本非零退出、逐个列出仍存在的
+exact path、不打印成功、不承诺 rollback，需人工清理残留后重新配对。成功后没有
+开发状态恢复路径，必须重新配对。不得用 glob 或手工扩大删除集合。
 
 ## 浏览与外部资料
 

@@ -48,10 +48,14 @@ bash scripts/reset-relay-v1-dev-state.sh \
   --confirm DELETE-RELAY-V1-DEV-STATE
 ```
 
-脚本拒绝相对路径、目录、symlink、非 v1 schema/credential shape，以及
-`account_id` / `device_id` / `role` / credential hash 与 DB 行不一致的输入。
-任一拒绝都发生在首次 unlink 前，因此应保留全部四个目标。若报告文件在校验期间
-变化，说明 Relay 可能仍在运行：停止它后重新检查路径，不要手工 `rm` 绕过。
+脚本拒绝相对路径、目录、symlink、非 v1 schema/credential shape、非 canonical
+Base64 或解码长度不是 32 bytes 的 credential，以及 `account_id` / `device_id` /
+`role` / credential hash 与 DB 行不一致的输入；unlink preflight 还会检查父目录
+权限与 macOS immutable/system flags。任一 validation/preflight 拒绝都发生在首次
+unlink 前，因此应保留全部四个目标。若报告文件在校验期间变化，说明 Relay 可能
+仍在运行：停止它后重新检查路径，不要手工 `rm` 绕过。preflight 之后 OS unlink
+仍因 race/I/O 失败时可能部分删除：脚本非零退出、逐个列出仍存在的 exact path、
+不打印成功、不承诺 rollback；按列出的路径人工清理后重新配对。
 成功只删除 DB、精确 `-wal` / `-shm` 与指定 credential；同前缀和其他文件保留，
 之后必须重新配对。
 

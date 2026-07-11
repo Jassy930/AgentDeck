@@ -96,6 +96,34 @@ validate_optional_sidecar() {
   fi
 }
 
+validate_macos_unlink_flags() {
+  local label="$1"
+  local path="$2"
+  local flags
+
+  [[ "$(uname -s)" == 'Darwin' ]] || return 0
+  flags="$(stat -f '%Sf' "$path")" || fail "cannot inspect $label file flags"
+  case ",$flags," in
+    *,uchg,*|*,uappnd,*|*,schg,*|*,sappnd,*|*,restricted,*)
+      fail "$label has a macOS flag that can block unlink: $flags"
+      ;;
+  esac
+}
+
+validate_unlink_preflight() {
+  local label="$1"
+  local path="$2"
+  local parent
+
+  [[ -e "$path" || -L "$path" ]] || return 0
+  parent="$(dirname "$path")"
+  [[ -d "$parent" ]] || fail "$label parent is not a directory"
+  [[ -x "$parent" ]] || fail "$label parent directory is not searchable"
+  [[ -w "$parent" ]] || fail "$label parent directory is not writable"
+  validate_macos_unlink_flags "$label" "$path"
+  validate_macos_unlink_flags "$label parent" "$parent"
+}
+
 stat_fingerprint() {
   local path="$1"
   if [[ ! -e "$path" && ! -L "$path" ]]; then
@@ -118,17 +146,20 @@ validate_required_file storage "$storage"
 validate_required_file credentials "$credentials"
 validate_optional_sidecar storage-wal "$wal"
 validate_optional_sidecar storage-shm "$shm"
-
-[[ -w "$(dirname "$storage")" ]] || fail 'storage parent directory is not writable'
-[[ -w "$(dirname "$credentials")" ]] || fail 'credentials parent directory is not writable'
+validate_unlink_preflight storage "$storage"
+validate_unlink_preflight storage-wal "$wal"
+validate_unlink_preflight storage-shm "$shm"
+validate_unlink_preflight credentials "$credentials"
 
 storage_before="$(stat_fingerprint "$storage")"
 wal_before="$(stat_fingerprint "$wal")"
 shm_before="$(stat_fingerprint "$shm")"
 credentials_before="$(stat_fingerprint "$credentials")"
 
+storage_uri="file:$(printf '%s' "$storage" | jq -sRr @uri)?mode=ro&immutable=1"
+
 sqlite_read() {
-  sqlite3 -readonly -batch -noheader "$storage" "$1"
+  sqlite3 -batch -noheader "$storage_uri" "$1"
 }
 
 user_version="$(sqlite_read 'PRAGMA user_version;')" || fail 'storage is not a readable SQLite database'
@@ -224,7 +255,7 @@ jq -e '
   (.relay_url | length > 0) and
   (.account_id | length > 0) and
   (.device_id | length > 0) and
-  (.credential | test("^[A-Za-z0-9+/]{43}=$")) and
+  (.credential | length > 0) and
   (.role == "machine" or .role == "device")
 ' "$credentials" >/dev/null || fail 'credentials JSON is not the exact Relay v1 bearer shape'
 
@@ -232,10 +263,18 @@ account_id="$(jq -er '.account_id' "$credentials")" || fail 'cannot read credent
 device_id="$(jq -er '.device_id' "$credentials")" || fail 'cannot read credentials device_id'
 role="$(jq -er '.role' "$credentials")" || fail 'cannot read credentials role'
 credential="$(jq -er '.credential' "$credentials")" || fail 'cannot read bearer credential'
+decoded_credential_length="$(
+  printf '%s' "$credential" | openssl base64 -d -A | LC_ALL=C wc -c | awk '{print $1}'
+)" || fail 'bearer credential is not valid Base64'
+[[ "$decoded_credential_length" == '32' ]] || fail 'bearer credential must decode to exactly 32 bytes'
+canonical_credential="$(
+  printf '%s' "$credential" | openssl base64 -d -A | openssl base64 -A
+)" || fail 'cannot canonicalize bearer credential Base64'
+[[ "$canonical_credential" == "$credential" ]] || fail 'bearer credential Base64 is not canonical'
 hash="$(printf '%s' "$credential" | openssl dgst -sha256 -binary | openssl base64 -A)" || \
   fail 'cannot hash bearer credential'
 
-device_rows="$(sqlite3 -readonly -batch -json "$storage" \
+device_rows="$(sqlite3 -batch -json "$storage_uri" \
   'SELECT device_id, account_id, role, credential_hash FROM devices;')" || \
   fail 'cannot read Relay v1 device rows'
 jq -e \
@@ -262,7 +301,30 @@ validate_optional_sidecar storage-shm "$shm"
 [[ "$(stat_fingerprint "$shm")" == "$shm_before" ]] || fail 'storage-shm changed during validation; stop Relay and retry'
 [[ "$(stat_fingerprint "$credentials")" == "$credentials_before" ]] || fail 'credentials changed during validation; stop Relay and retry'
 
-rm -f -- "$wal" "$shm" "$storage" "$credentials"
+delete_paths=("$wal" "$shm" "$storage" "$credentials")
+unlink_failed=0
+for path in "${delete_paths[@]}"; do
+  if ! rm -f -- "$path"; then
+    unlink_failed=1
+  fi
+done
+
+remaining_paths=()
+for path in "${delete_paths[@]}"; do
+  if [[ -e "$path" || -L "$path" ]]; then
+    remaining_paths+=("$path")
+  fi
+done
+
+if ((unlink_failed != 0 || ${#remaining_paths[@]} != 0)); then
+  printf 'reset-relay-v1-dev-state: unlink stage failed; no rollback is guaranteed\n' >&2
+  for path in "${remaining_paths[@]}"; do
+    printf 'reset-relay-v1-dev-state: remaining exact path: %s\n' "$path" >&2
+  done
+  printf '%s\n' \
+    'reset-relay-v1-dev-state: manually remove the remaining exact paths, then pair again before reuse' >&2
+  exit 1
+fi
 
 printf 'reset-relay-v1-dev-state: deleted exact Relay v1 DB, -wal, -shm, and credentials paths\n'
 printf 'reset-relay-v1-dev-state: no development recovery is available; pair again before reuse\n'

@@ -66,7 +66,7 @@
 - Modify: `docs/plans/2026-07-10-relay-companion-mvp-implementation.md`
 - Modify: `README.md`
 
-**Interfaces:** `verify-relay-companion-mvp.sh p0` 只编排当前已存在门禁；reset 脚本只接受 `--storage ABSOLUTE_FILE --credentials ABSOLUTE_FILE --confirm DELETE-RELAY-V1-DEV-STATE`，拒绝目录、根路径、symlink 与非 v1 schema/credential shape。开始第一次 unlink 前必须完成全部验证，并证明 credential JSON 的 `account_id/device_id/role` 与 DB 行一致、`Base64(SHA256(credential原字符串))` 等于该行 `credential_hash`；任一失败都零删除。
+**Interfaces:** `verify-relay-companion-mvp.sh p0` 只编排当前已存在门禁；reset 脚本只接受 `--storage ABSOLUTE_FILE --credentials ABSOLUTE_FILE --confirm DELETE-RELAY-V1-DEV-STATE`，拒绝目录、根路径、symlink 与非 v1 schema/credential shape。开始第一次 unlink 前必须完成全部验证与 unlink preflight（含父目录权限、macOS immutable/system flags），并证明 credential 是解码恰好 32 bytes 的 canonical Base64、credential JSON 的 `account_id/device_id/role` 与 DB 行一致、`Base64(SHA256(credential原字符串))` 等于该行 `credential_hash`；删除前任一 validation/preflight 失败都零删除。preflight 之后 OS unlink 仍因 race/I/O 失败时允许部分删除，但必须非零退出、逐个列出仍存在的 exact path、不打印成功、不承诺 rollback，并指引人工清理后重新配对；SQLite 校验必须使用不触碰 WAL/SHM 的 immutable read。
 
 - [x] Step 1: 先写 destructive-boundary shell test。测试在 tempdir 创建 v1 DB/WAL/SHM、旧 bearer JSON、无关文件和 symlink；断言缺确认串、目录、任一路径组件/sidecar symlink、v2 marker、未知/额外表、错误user_version、DB与JSON account/device/role/credential hash不匹配均退出非零且零删除。只有精确匹配的v1输入会删除DB、精确`-wal`/`-shm`与bearer JSON，并保留同前缀及其他无关文件。
 - [x] Step 2: 运行 `bash scripts/tests/reset-relay-v1-dev-state.sh`。 Expected: FAIL，原因是 `scripts/reset-relay-v1-dev-state.sh` 尚不存在。

@@ -226,9 +226,13 @@ bash scripts/reset-relay-v1-dev-state.sh \
 ```
 
 脚本在第一次 unlink 前一次性验证四个精确删除路径、Relay v1 schema、credential
-shape 及 DB 行关联；任何校验失败都零删除。成功时只删除 DB、精确 `-wal`、
-`-shm` 和指定 credential，不使用 glob。此开发 reset 没有恢复路径，后续使用前
-必须重新配对。脚本需要 `awk`、`sqlite3`、`jq`、`openssl`、`realpath` 和 `stat`。
+canonical Base64（解码恰好 32 bytes）、DB 行关联和 unlink preflight（父目录权限、
+macOS immutable flags）；删除前任一 validation/preflight 失败都零删除。preflight
+之后 OS unlink 仍失败时可能部分删除：脚本非零退出、列出全部 remaining exact
+paths、不打印成功、不承诺 rollback，需人工清理残留后重新配对。成功时只删除
+DB、精确 `-wal`、`-shm` 和指定 credential，不使用 glob。此开发 reset 没有恢复
+路径，后续使用前必须重新配对。脚本需要 `awk`、`sqlite3`、`jq`、`openssl`、
+`realpath` 和 `stat`。
 
 ## agentdeck CLI（参考客户端 / E2E 驱动）
 

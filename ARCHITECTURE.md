@@ -125,7 +125,10 @@ agentdeckd
 - `scripts/reset-relay-v1-dev-state.sh` 只是 v1 开发状态的显式 trust reset：调用方
   必须先停止 Relay，并提供 canonical absolute DB 与 credential 路径及固定确认串。
 - reset 的删除集合固定为 DB、同路径精确 `-wal` / `-shm` 与指定 bearer JSON。
-  path/schema/credential/DB 行关联全部校验完成前不开始 unlink；任一失败零删除。
+  path/schema/credential/DB 行关联与 unlink preflight 全部通过前不开始 unlink；
+  删除前任一 validation/preflight 失败都零删除。preflight 后 OS unlink 仍失败时
+  允许部分删除，但必须非零退出并列出全部 remaining exact paths，不宣称成功、
+  不承诺 rollback；残留需人工清理后重新配对。
 - reset 不提供开发状态恢复或迁移；成功后只能重新配对。P0 统一门禁入口是
   `bash scripts/verify-relay-companion-mvp.sh p0`。
 
