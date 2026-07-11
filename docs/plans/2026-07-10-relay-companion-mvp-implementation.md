@@ -118,7 +118,7 @@ pub struct RuntimeEvent { pub conversation_id: ConversationId, pub event_id: Eve
 pub const RELAY_PROTOCOL_VERSION: u16 = 2;
 pub const E2EE_FORMAT_VERSION: u16 = 1;
 pub struct OpaqueRouteFrame { pub version: u16, pub body: RelayFrameBody }
-pub enum RelayFrameBody { Hello(Hello), Challenge(Challenge), Authenticate(Authenticate), Authenticated(Authenticated), OpenPairRoute(OpenPairRoute), PairRouteOpened(PairRouteOpened), PairData(PairData), ClosePairRoute(ClosePairRoute), PairRouteClosed(PairRouteClosed), RegisterStream(RegisterStream), Publish(Publish), Subscribe(Subscribe), Unsubscribe(Unsubscribe), Ack(Ack), Gap(Gap), ReplayComplete(ReplayComplete), Send(Send), Reply(Reply), InstallGrant(InstallGrant), GrantCommitted(GrantCommitted), RevokeDevice(RevokeDevice), RevocationCommitted(RevocationCommitted), RetireMachine(RetireMachine), Ping(Ping), Pong(Pong), RouteAccepted(RouteAccepted), Error(RelayFailure), ServerRestarting(ServerRestarting) }
+pub enum RelayFrameBody { Hello(Hello), Challenge(Challenge), Authenticate(Authenticate), Authenticated(Authenticated), OpenPairRoute(OpenPairRoute), PairRouteOpened(PairRouteOpened), PairData(PairData), ClosePairRoute(ClosePairRoute), PairRouteClosed(PairRouteClosed), RegisterStream(RegisterStream), Publish(Publish), Subscribe(Subscribe), Unsubscribe(Unsubscribe), Ack(Ack), Gap(Gap), ReplayComplete(ReplayComplete), Send(Send), Reply(Reply), InstallGrant(InstallGrant), GrantCommitted(GrantCommitted), RevokeDevice(RevokeDevice), RevocationCommitted(RevocationCommitted), RetireMachine(RetireMachine), Ping(Ping), Pong(Pong), RouteAccepted(RouteAccepted), Error(RelayFailure), ServerRestarting(ServerRestarting), RetirementCommitted(RetirementCommitted) }
 pub struct MachineEnrollmentRequestV1 { pub code: EnrollmentCode, pub machine_route: MachineRouteId, pub root_pubkey: PublicKeyBytes, pub link_cert: SignedCertificate, pub data_cert: SignedCertificate }
 pub struct MachineEnrollmentResponseV1 { pub relay_server_id: RelayServerId, pub machine_route: MachineRouteId, pub trust_epoch: u64, pub receipt_hash: [u8; 32] }
 ```
@@ -348,15 +348,17 @@ pub struct ReplayTicket { pub stream: StreamRouteId, pub generation: StreamGener
 **Files:**
 - Create: `agentdeck-relay/src/v2/core/revocation.rs`
 - Create: `agentdeck-relay/tests/relay_v2_revocation_e2e.rs`
-- Modify: `agentdeck-relay/src/v2/core/{mod,router,connection}.rs`
-- Modify: `agentdeck-relay/src/v2/store/{model,sqlite}.rs`
+- Create: `agentdeck-protocol/tests/relay_v2_revocation_canonical_contract.rs`
+- Modify: `agentdeck-protocol/src/relay_v2/{auth,frame,codec}.rs` 与 Relay v2 schema/golden
+- Modify: `Sources/AgentDeckRelayClient/Wire/RelayV2Types.swift` 与 Swift wire tests
+- Modify: `agentdeck-relay/src/v2/{auth/{access,coordinator,verify},core/{mod,router,connection,writer},store/{migrations,model,sqlite,worker}}.rs`
 
-- [ ] Step 1: 写 revocation tests。 覆盖 InstallGrant COMMIT 前 crash、同 hash retry、serial rollback、revoke COMMIT 前/后、普通 writer queue 丢弃、control slot terminal、2s close、terminal 丢失后再鉴权重放、RetireMachine/purge 删除 grants/subscriptions/frames/active route且保留不可激活 tombstone。
-- [ ] Step 2: 运行 revocation e2e。 Expected: FAIL，缺少 v2 revoke dispatch。
-- [ ] Step 3: 实现事务顺序与 terminal control slot。 COMMIT 后才失效 generation和发送 `RevocationCommitted`；readback 必须逐表证明 active data 不存在。
-- [ ] Step 4: 重跑测试并重开 SQLite 后再次鉴权 revoked device。 Expected: 仍返回同一 signed terminal state。
-- [ ] Step 5: 运行 store/core clippy。
-- [ ] Step 6: 提交。 `git add agentdeck-relay && git commit -m "feat(relay): 闭环 v2 revoke 与 machine purge"`
+- [x] Step 1: 写 revocation tests。覆盖真实 root-signed InstallGrant/Revoke/Retire、COMMIT fault、same hash retry/serial rollback、普通/control queue 丢弃、独立 terminal、2s close、SQLite reopen后 terminal-only鉴权、target-only purge/readback与 PairRoute清理；另补 canonical/TBS、29种wire与Swift mirror。
+- [x] Step 2: 运行 revocation e2e。红态先固定在缺少 `RelayCore::activate_authentication`/revoke dispatch；实现前 protocol canonical测试也精确红在缺 API/variant。
+- [x] Step 3: 实现事务顺序与 terminal slot。origin current检查和 target/整机 transition同锁；COMMIT 后才失效 generation。terminal使用每writer单槽与全局4,096 frames/16MiB独立预算，普通Invalidated跳过，flush或2s关闭。
+- [x] Step 4: 重跑测试并重开 SQLite。合法旧 DeviceSign/MachineLink proof分别逐字节重放 `RevocationCommitted`/`RetirementCommitted` 且不建立 active generation；purge 在 COMMIT 前按冻结 stream keys、foreign-key check与 exact terminal完成事务内 `0/1/0/0/0/0/0` 读回，COMMIT 后回执丢失用同 canonical request幂等恢复，SQLite reopen再次验证。
+- [x] Step 5: 运行 store/core clippy。`agentdeck-relay --features server` 全量、Revocation E2E 11 cases连续10轮、Protocol全量、Swift RelayV2Wire 14/14、focused clippy/rustdoc/fmt/schema/docs/daemon-no-net/diff均通过；独立 security/core/test复审发现的 raw bypass、COMMIT-unknown、purge假读回、terminal伪造/ABA/双份内存与metadata测试缺口已全部闭环。
+- [x] Step 6: 提交。按完整 scoped path stage protocol、Swift mirror、Relay、fixtures/schema 与 docs，并以 `feat(relay): 闭环 v2 revoke 与 machine purge` 收口；未包含构建产物、运行数据或本地 SDD ledger。
 
 ### Task P2.6：实现 TLS fail-closed、server lifecycle、health/readiness 与 redacted telemetry
 

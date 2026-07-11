@@ -11,8 +11,8 @@ use thiserror::Error;
 pub const SCHEMA_FAMILY: &str = "agentdeck-relay-v2";
 pub const SCHEMA_VERSION: u32 = 1;
 pub const SCHEMA_SIGNATURE: [u8; 32] = [
-    0x9d, 0xfb, 0xb4, 0x07, 0x3b, 0xac, 0xcb, 0xf8, 0x56, 0x1d, 0xa1, 0x8b, 0x02, 0x6b, 0x78, 0x09,
-    0x70, 0x74, 0xed, 0x75, 0x9e, 0xf4, 0x93, 0x5b, 0x48, 0x80, 0x46, 0x7d, 0x12, 0xbb, 0x9f, 0xe2,
+    0x0a, 0x66, 0x67, 0x20, 0x39, 0x4a, 0xfd, 0x28, 0xd4, 0x7d, 0x43, 0x43, 0x90, 0x60, 0xa2, 0x08,
+    0x9c, 0x2d, 0x3f, 0xdc, 0x6b, 0x63, 0x42, 0x27, 0x86, 0x14, 0x44, 0x5c, 0x55, 0xaf, 0x54, 0x23,
 ];
 
 type RawSchemaMarker = (i64, String, i64, Vec<u8>, Vec<u8>);
@@ -69,7 +69,20 @@ CREATE TABLE machine_routes (
     highest_link_generation BLOB NOT NULL CHECK(typeof(highest_link_generation) = 'blob' AND length(highest_link_generation) = 8),
     link_cert_hash BLOB NOT NULL CHECK(typeof(link_cert_hash) = 'blob' AND length(link_cert_hash) = 32),
     data_cert_hash BLOB NOT NULL CHECK(typeof(data_cert_hash) = 'blob' AND length(data_cert_hash) = 32),
+    retirement_hash BLOB CHECK(retirement_hash IS NULL OR (typeof(retirement_hash) = 'blob' AND length(retirement_hash) = 32)),
+    retirement_terminal_blob BLOB CHECK(
+        retirement_terminal_blob IS NULL
+        OR (typeof(retirement_terminal_blob) = 'blob' AND length(retirement_terminal_blob) BETWEEN 1 AND 4096)
+    ),
     status TEXT NOT NULL CHECK(status IN ('active', 'retired')),
+    CHECK(
+        (status = 'active' AND retirement_hash IS NULL AND retirement_terminal_blob IS NULL)
+        OR
+        (status = 'retired' AND (
+            (retirement_hash IS NULL AND retirement_terminal_blob IS NULL)
+            OR (retirement_hash IS NOT NULL AND retirement_terminal_blob IS NOT NULL)
+        ))
+    ),
     FOREIGN KEY(relay_server_id) REFERENCES relay_meta(relay_server_id) ON UPDATE RESTRICT ON DELETE RESTRICT
 );
 CREATE INDEX idx_machine_routes_status ON machine_routes(status);

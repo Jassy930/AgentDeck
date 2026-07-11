@@ -205,15 +205,24 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（P2.4）
+## Relay Companion MVP 实施状态（P2.5）
 
-P0 已冻结既有 Relay v1 行为并建立实施门禁；P2.1–P2.4 已并列完成 Relay v2 SQLite
-store、challenge/auth、stream core、内存 PairRoute 与在线 Send/Reply library contract。
+P0 已冻结既有 Relay v1 行为并建立实施门禁；P2.1–P2.5 已并列完成 Relay v2 SQLite
+store、challenge/auth、stream core、内存 PairRoute、在线 Send/Reply，以及 root-signed
+grant/revoke/machine retirement library contract。
 PairRoute 默认受每 machine 8、全局 1,024、每 route 32 frames / 1 MiB / 300 秒及独立
 token bucket 约束；Send/Reply 只投递 current bounded writer，不建离线队列或 `req_origin`。
+Revoke/Retire 先建立 authorization transition fence，再执行 SQLite COMMIT；COMMIT 后普通
+queue 被独立单槽 terminal 取代，flush 或最多 2 秒关闭。有效旧 DeviceSign/MachineLink proof
+在重启后只会读回逐字节相同的 terminal，不会重新激活 route；machine purge 逐表读回 active
+grant/subscription/stream/frame 均为空，只保留最小 retired trust tombstone。MachineLink、
+Install/Revoke/Retire 的 COMMIT 回执丢失时 Store 以同一 canonical request 做一次精确幂等恢复，
+仍不确定则保持 target/整机 fail-closed；
+production coordinator 不再暴露未验签的 raw grant/revoke/purge 入口。device route 元数据同时受
+每 machine 256、全局 65,536 的启动与运行时硬上限约束。
 这些能力尚未在 P2.9 原子切换生产 listener，也未接通 daemon/iOS，因此不能描述为公网
 Companion 已可用。当前统一 P0 回归入口仍按批准设计 §16.5 运行 Rust、Swift、iOS、网络、
-文档和 schema 基线门禁；P2.4 专项门禁见 `docs/QUALITY.md`：
+文档和 schema 基线门禁；P2.5 专项门禁见 `docs/QUALITY.md`：
 
 ```bash
 bash scripts/verify-relay-companion-mvp.sh p0

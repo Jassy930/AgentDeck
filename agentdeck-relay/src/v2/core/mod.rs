@@ -5,6 +5,7 @@ mod lifecycle;
 mod pair_route;
 mod replay;
 mod request_route;
+mod revocation;
 mod router;
 pub mod writer;
 

@@ -273,7 +273,7 @@ PairInvite 一旦进入 preparing 就不恢复为 unused。完整状态机是 `r
 - 对 `revokeSelf`，Relay COMMIT 后先丢普通 queue，再从保留的 control slot 向该连接发送包含 MachineRoot-signed `DeviceRevocation` 的 `RevocationCommitted` terminal frame；flush 成功或最多 2 秒后关闭连接。若 terminal frame 丢失，设备再次鉴权会收到同一份 signed revoked terminal state，而不是模糊的网络错误。
 - iOS 只允许 revoke self；管理其他设备由被控机器本地 App/CLI 完成。
 - 普通 daemon/Relay 重启不需要重新配对。
-- 显式 trust reset 且 MachineRoot 尚在时：先签 `RetireMachine`，等 Relay purge ACK 并读回旧 route 不存在，再删除本机 root/runtime crypto state，最后登记新 route。
+- 显式 trust reset 且 MachineRoot 尚在时：先签包含 `rootKeyId` 的 `RetireMachine`，等 Relay 返回严格最小的 `RetirementCommitted(machineRoute, trustEpoch, retireHash)` 并读回旧 route 不存在，再删除本机 root/runtime crypto state，最后登记新 route。ACK 丢失时，旧 exact MachineLink challenge proof只重放同一 terminal，不重新激活 route。
 - daemon 在 Runtime DB 保存不含私钥的 `MachineEnrollmentReceipt(relayServerId, oldRoute, rootFingerprint)`，用于 Keychain 丢失后的定位；它不是恢复凭据。
 - MachineRoot 意外丢失时 daemon remote mode 必须保持 blocked；Relay 操作者通过本地 0600 admin Unix socket 执行 `machine purge <oldRoute> --confirm <rootFingerprint>` 并读回确认后，机器才能建立新 route。若连本机 receipt 也丢失，Relay admin 只能从本地 inventory 列出 route/root fingerprints 由操作者人工确认；无法访问 Relay 管理面时不能安全重新登记。
 - purge 事务删除该 machine 的 grants、subscriptions、frames 与 active route material，只保留不可重新激活的最小 retired tombstone；读回必须证明 active route/data 已不存在，再允许 daemon 删除本地 keys/state 并重新 enroll。
@@ -554,7 +554,7 @@ Relay 单 frame 硬上限为 4 MiB，因此 E2EE payload 使用统一：
 - Pairing：`OpenPairRoute`、`PairRouteOpened`、`PairData`、`ClosePairRoute`、`PairRouteClosed`；opened 回显 owner/route/absolute expiry，closed outcome 只允许 `Closed | AlreadyAbsent`。
 - Stream：`RegisterStream`、`Publish`、`Subscribe`、`Unsubscribe`、`Ack`、`Gap`、`ReplayComplete`。
 - Request：`Send`、`Reply`。
-- Auth control：`InstallGrant`、`GrantCommitted`、`RevokeDevice`、`RevocationCommitted`、`RetireMachine`。
+- Auth control：`InstallGrant`、`GrantCommitted`、`RevokeDevice`、`RevocationCommitted`、`RetireMachine`、追加 kind 28 的 `RetirementCommitted`；既有 kind 0–27 不移动。
 - Runtime：`Ping`、`Pong`、`RouteAccepted`、`Error`、`ServerRestarting`。
 
 首次 machine enrollment 不属于已鉴权 Relay frame family：Relay 额外提供一个只接收 `MachineEnrollmentRequestV1` 的专用 TLS endpoint，消费本机 admin 生成的 5 分钟单次 code，并在同一事务插入 machine route；它不提供 inventory、purge 或其他管理员能力。daemon 必须在发送 code 与 root/link/data public material 前完成公开 CA 或 enrollment bundle SPKI pin 验证。尚未取得 DeviceGrant 的设备则只能建立绑定已打开 `pairRouteId` 的受限 pairing connection；该 connection 只能发送 `PairData/ClosePairRoute`，不能订阅、发布或发送 Runtime request，DeviceSign possession proof 仍由 daemon 在密文内验证。
@@ -600,7 +600,7 @@ Relay v2 没有：
 
 Relay 只持久化：
 
-- `machine_routes(machine_route, relay_server_id, root_key_id, root_pubkey, trust_epoch, highest_link_generation, link_cert_hash, data_cert_hash, status)`。
+- `machine_routes(machine_route, relay_server_id, root_key_id, root_pubkey, trust_epoch, highest_link_generation, link_cert_hash, data_cert_hash, retirement_hash, retirement_terminal_blob, status)`；active 行的 retirement 两列为 NULL，root-signed retire 后保存 exact hash/terminal，root-lost admin purge 的 retired tombstone 两列均为 NULL。
 - `device_grants(machine_route, device_route, auth_pubkey, auth_fingerprint, grant_serial, grant_hash, revoked_at, tombstone)`。
 - `revocations(machine_route, device_route, grant_serial, revocation_hash, signed_revocation_blob, committed_at)`；Authenticate/revokeSelf terminal 在 Relay restart 后原样重放这份 root-signed canonical blob。
 - `streams(stream_route, machine_route, generation, high_water_seq, oldest_seq, retained_bytes)`；新 generation 的 high-water 固定从 -1 开始。

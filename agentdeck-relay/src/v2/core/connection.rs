@@ -7,13 +7,15 @@
 use std::collections::{HashMap, VecDeque};
 
 use agentdeck_protocol::relay_v2::{
-    ConnectionInstanceId, MachineRouteId, StreamCursor, StreamGenerationId, StreamRouteId,
+    ConnectionInstanceId, MachineRouteId, OpaqueRouteFrame, StreamCursor, StreamGenerationId,
+    StreamRouteId, encode,
 };
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::v2::auth::{AccessContext, PrincipalRoute};
 
-use super::writer::{WriterCloseReason, WriterHandle};
+use super::writer::{TerminalAdmission, WriterCloseReason, WriterHandle};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct StreamKey {
@@ -196,6 +198,7 @@ pub(crate) enum ConnectionStateError {
     ReplayEpochExhausted,
     ReplayMismatch,
     HeartbeatAlreadyPending,
+    TerminalRejected,
 }
 
 impl std::fmt::Display for ConnectionStateError {
@@ -229,6 +232,25 @@ pub(crate) struct ConnectionEntry {
     pub last_pong_ms: u64,
     pub last_ping_ms: u64,
     pub pending_ping: Option<PendingPing>,
+    pub terminal: Option<TerminalDrain>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TerminalDrain {
+    pub token: TerminalToken,
+    pub close_reason: WriterCloseReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TerminalToken {
+    epoch: u64,
+    digest: [u8; 32],
+}
+
+pub(crate) struct TerminalStage {
+    pub token: TerminalToken,
+    pub writer: WriterHandle,
+    pub admission: TerminalAdmission,
 }
 
 /// Actor future 被 runtime 取消或 panic 时，`ConnectionRegistry` 可能来不及走显式
@@ -247,6 +269,7 @@ impl Drop for ConnectionEntry {
 pub struct ConnectionRegistry {
     pub(crate) entries: HashMap<ConnectionInstanceId, ConnectionEntry>,
     pub(crate) max_subscriptions_per_connection: usize,
+    next_terminal_epoch: u64,
 }
 
 impl ConnectionRegistry {
@@ -254,6 +277,7 @@ impl ConnectionRegistry {
         Self {
             entries: HashMap::new(),
             max_subscriptions_per_connection,
+            next_terminal_epoch: 1,
         }
     }
 
@@ -289,6 +313,7 @@ impl ConnectionRegistry {
                 last_pong_ms: now_ms,
                 last_ping_ms: now_ms,
                 pending_ping: None,
+                terminal: None,
             },
         );
         Ok(())
@@ -315,6 +340,9 @@ impl ConnectionRegistry {
             )
         {
             return Err(ConnectionStateError::AccessMismatch);
+        }
+        if target.terminal.is_some() {
+            return Err(ConnectionStateError::ConnectionNotActive);
         }
         if let Some(existing) = &target.access {
             if existing == &access {
@@ -377,6 +405,7 @@ impl ConnectionRegistry {
     pub(crate) fn validates(&self, access: &AccessContext) -> bool {
         self.entries
             .get(&access.connection_instance())
+            .filter(|entry| entry.terminal.is_none())
             .and_then(|entry| entry.access.as_ref())
             == Some(access)
     }
@@ -384,8 +413,122 @@ impl ConnectionRegistry {
     pub(crate) fn writer_for(&self, access: &AccessContext) -> Option<WriterHandle> {
         self.entries
             .get(&access.connection_instance())
-            .filter(|entry| entry.access.as_ref() == Some(access))
+            .filter(|entry| entry.terminal.is_none() && entry.access.as_ref() == Some(access))
             .map(|entry| entry.writer.clone())
+    }
+
+    /// COMMIT 后把连接切到 terminal drain。普通 runtime/replay 状态立即清空，但 entry 与
+    /// writer 保留到 terminal flush、2 秒 deadline 或 transport failure。
+    pub(crate) fn begin_terminal(
+        &mut self,
+        connection: ConnectionInstanceId,
+        frame: OpaqueRouteFrame,
+        close_reason: WriterCloseReason,
+    ) -> Result<TerminalStage, ConnectionStateError> {
+        let encoded = encode(&frame);
+        let digest: [u8; 32] = Sha256::digest(&encoded).into();
+        let entry = self
+            .entries
+            .get(&connection)
+            .ok_or(ConnectionStateError::ConnectionNotFound)?;
+        if let Some(existing) = entry.terminal {
+            return if existing.token.digest == digest && existing.close_reason == close_reason {
+                Ok(TerminalStage {
+                    token: existing.token,
+                    writer: entry.writer.clone(),
+                    admission: TerminalAdmission::Existing,
+                })
+            } else {
+                Err(ConnectionStateError::TerminalRejected)
+            };
+        }
+        let epoch = self.next_terminal_epoch;
+        self.next_terminal_epoch = self
+            .next_terminal_epoch
+            .checked_add(1)
+            .ok_or(ConnectionStateError::TerminalRejected)?;
+        let token = TerminalToken { epoch, digest };
+        let entry = self
+            .entries
+            .get_mut(&connection)
+            .ok_or(ConnectionStateError::ConnectionNotFound)?;
+        let admission = entry
+            .writer
+            .try_begin_terminal(frame, close_reason)
+            .map_err(|_| ConnectionStateError::TerminalRejected)?;
+        if let Some(cancel) = entry.replay_cancel.take() {
+            cancel.cancel();
+        }
+        entry.replay_key = None;
+        entry.pending_replays.clear();
+        entry.subscriptions.clear();
+        entry.pending_ping = None;
+        entry.terminal = Some(TerminalDrain {
+            token,
+            close_reason,
+        });
+        Ok(TerminalStage {
+            token,
+            writer: entry.writer.clone(),
+            admission,
+        })
+    }
+
+    pub(crate) fn begin_terminal_reauth(
+        &mut self,
+        access: &AccessContext,
+        frame: OpaqueRouteFrame,
+        close_reason: WriterCloseReason,
+    ) -> Result<TerminalStage, ConnectionStateError> {
+        let connection = access.connection_instance();
+        let principal = access
+            .principal_route()
+            .ok_or(ConnectionStateError::AccessMismatch)?;
+        let entry = self
+            .entries
+            .get(&connection)
+            .ok_or(ConnectionStateError::ConnectionNotFound)?;
+        if entry.access.is_some()
+            || entry
+                .pending_principal
+                .is_some_and(|pending| pending != principal)
+        {
+            return Err(ConnectionStateError::AccessMismatch);
+        }
+        let staged = self.begin_terminal(connection, frame, close_reason)?;
+        let entry = self
+            .entries
+            .get_mut(&connection)
+            .ok_or(ConnectionStateError::ConnectionNotFound)?;
+        entry.pending_principal = Some(principal);
+        Ok(staged)
+    }
+
+    pub(crate) fn is_terminal(&self, connection: ConnectionInstanceId) -> bool {
+        self.entries
+            .get(&connection)
+            .is_some_and(|entry| entry.terminal.is_some())
+    }
+
+    pub(crate) fn finish_terminal(
+        &mut self,
+        connection: ConnectionInstanceId,
+        token: TerminalToken,
+    ) -> Option<ConnectionCleanup> {
+        let matches = self
+            .entries
+            .get(&connection)
+            .and_then(|entry| entry.terminal)
+            .is_some_and(|terminal| terminal.token == token);
+        if !matches {
+            return None;
+        }
+        let reason = self
+            .entries
+            .get(&connection)
+            .and_then(|entry| entry.terminal)
+            .map(|terminal| terminal.close_reason)?;
+        self.remove_and_close(connection, reason)
     }
 
     pub(crate) fn begin_initial_replay(
@@ -767,6 +910,7 @@ impl ConnectionRegistry {
             .iter()
             .filter_map(|(connection, entry)| {
                 (entry.access.is_some()
+                    && entry.terminal.is_none()
                     && entry.pending_ping.is_none()
                     && now_ms.saturating_sub(entry.last_ping_ms) >= interval_ms)
                     .then_some(*connection)
@@ -815,7 +959,9 @@ impl ConnectionRegistry {
         self.entries
             .iter()
             .filter_map(|(connection, entry)| {
-                (now_ms.saturating_sub(entry.last_pong_ms) >= timeout_ms).then_some(*connection)
+                (entry.terminal.is_none()
+                    && now_ms.saturating_sub(entry.last_pong_ms) >= timeout_ms)
+                    .then_some(*connection)
             })
             .collect()
     }
@@ -870,6 +1016,9 @@ impl ConnectionRegistry {
             .get_mut(&connection)
             .ok_or(ConnectionStateError::ConnectionNotFound)?;
         if entry.access.is_none() {
+            return Err(ConnectionStateError::ConnectionNotActive);
+        }
+        if entry.terminal.is_some() {
             return Err(ConnectionStateError::ConnectionNotActive);
         }
         Ok(entry)
@@ -1033,8 +1182,10 @@ impl std::fmt::Debug for ConnectionRegistry {
 
 #[cfg(test)]
 mod tests {
+    use agentdeck_protocol::relay_v2::frame::Ping;
     use agentdeck_protocol::relay_v2::{
-        DeviceRouteId, GrantSerial, LinkGeneration, PairRouteId, RelayServerId, TrustEpoch,
+        DeviceRouteId, GrantSerial, LinkGeneration, PairRouteId, RELAY_PROTOCOL_VERSION,
+        RelayFrameBody, RelayServerId, TrustEpoch,
     };
 
     use crate::v2::auth::{DeviceAccess, MachineAccess, PairingAccess};
@@ -1097,6 +1248,79 @@ mod tests {
             StreamRouteId::from_bytes([seed; 16]),
             StreamGenerationId::from_bytes([seed.wrapping_add(1); 16]),
         )
+    }
+
+    fn terminal_frame(nonce: u64) -> OpaqueRouteFrame {
+        OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::Ping(Ping { nonce }),
+        }
+    }
+
+    #[test]
+    fn terminal_reauth_requires_pending_principal_and_reuses_no_deadline_token() {
+        let mut registry = ConnectionRegistry::new(8);
+        let access = device_access(1, 2);
+        let (writer, _receiver) = WriterHandle::channel();
+        registry
+            .attach_pending(connection(1), writer, 0)
+            .expect("attach pending");
+        let staged = registry
+            .begin_terminal_reauth(&access, terminal_frame(1), WriterCloseReason::Revoked)
+            .expect("first terminal");
+        assert_eq!(staged.admission, TerminalAdmission::Staged);
+        let existing = registry
+            .begin_terminal_reauth(&access, terminal_frame(1), WriterCloseReason::Revoked)
+            .expect("exact retry");
+        assert_eq!(existing.admission, TerminalAdmission::Existing);
+        assert_eq!(existing.token, staged.token);
+
+        registry
+            .finish_terminal(connection(1), staged.token)
+            .expect("finish old terminal");
+        let (replacement, _receiver) = WriterHandle::channel();
+        registry
+            .attach_pending(connection(1), replacement, 0)
+            .expect("reuse connection id");
+        let replacement = registry
+            .begin_terminal_reauth(&access, terminal_frame(1), WriterCloseReason::Revoked)
+            .expect("new terminal generation");
+        assert_ne!(replacement.token, staged.token, "ABA token must be unique");
+    }
+
+    #[test]
+    fn terminal_reauth_cannot_be_applied_to_an_active_entry() {
+        let mut registry = ConnectionRegistry::new(8);
+        let access = device_access(2, 3);
+        let (writer, _receiver) = WriterHandle::channel();
+        registry
+            .attach_pending(connection(2), writer, 0)
+            .expect("attach pending");
+        registry
+            .activate(access.clone(), 0, WriterCloseReason::Replaced)
+            .expect("activate");
+        assert!(matches!(
+            registry.begin_terminal_reauth(&access, terminal_frame(2), WriterCloseReason::Revoked,),
+            Err(ConnectionStateError::AccessMismatch)
+        ));
+    }
+
+    #[test]
+    fn terminal_reauth_rejects_a_mismatched_pending_principal() {
+        let mut registry = ConnectionRegistry::new(8);
+        let access = device_access(3, 4);
+        let (writer, _receiver) = WriterHandle::channel();
+        registry
+            .attach_pending(connection(3), writer, 0)
+            .expect("attach pending");
+        registry
+            .note_activation(connection(3), PrincipalRoute::Machine(machine(9)))
+            .expect("bind another pending principal");
+        assert!(matches!(
+            registry.begin_terminal_reauth(&access, terminal_frame(3), WriterCloseReason::Revoked),
+            Err(ConnectionStateError::AccessMismatch)
+        ));
+        assert!(!registry.is_terminal(connection(3)));
     }
 
     #[test]

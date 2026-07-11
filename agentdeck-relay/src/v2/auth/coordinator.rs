@@ -8,19 +8,26 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use agentdeck_protocol::relay_v2::failure::{RELAY_QUOTA_EXCEEDED, RELAY_STORE_UNAVAILABLE};
-use agentdeck_protocol::relay_v2::frame::Authenticate;
-use agentdeck_protocol::relay_v2::{ConnectionInstanceId, RelayFailure};
+use agentdeck_protocol::relay_v2::failure::{
+    RELAY_AUTH_INVALID_GRANT, RELAY_AUTH_REVOKED, RELAY_QUOTA_EXCEEDED, RELAY_STORE_UNAVAILABLE,
+};
+use agentdeck_protocol::relay_v2::frame::{Authenticate, RetireMachine};
+use agentdeck_protocol::relay_v2::{
+    ConnectionInstanceId, DeviceRevocation, RelayFailure, RelayGrant,
+};
 use tokio::sync::{mpsc, oneshot};
 
 use super::access::{
     AccessContext, Activation, ActiveConnectionRegistry, PrincipalRoute, RouteTransition,
 };
 use super::challenge::ConsumedChallenge;
-use super::verify::{AuthenticationActivation, AuthenticationService};
+use super::verify::{
+    AuthenticationActivation, AuthenticationCommitError, AuthenticationOutcome,
+    AuthenticationService, PreparedTerminal,
+};
 use crate::v2::store::{
-    GrantCommit, InstallGrantRecord, MAX_CONTROL_BLOB_BYTES, MachineRecord, PersistRevocation,
-    PurgeMachine, PurgeReadback, RegisterMachine, RelayStoreHandle, RevocationCommit, StoreError,
+    GrantCommit, MAX_CONTROL_BLOB_BYTES, MachineRecord, RegisterMachine, RelayStoreHandle,
+    RetirementCommit, RevocationCommit, StoreError,
 };
 
 const AUTHORIZATION_COMMAND_CAPACITY: usize = 256;
@@ -238,6 +245,25 @@ impl AuthorizationCoordinator {
         challenge: ConsumedChallenge,
         now_ms: u64,
     ) -> Result<AuthenticationActivation, RelayFailure> {
+        match self.authenticate_outcome(frame, challenge, now_ms).await? {
+            AuthenticationOutcome::Activated(activation) => Ok(activation),
+            AuthenticationOutcome::RevokedTerminal(_) => Err(RelayFailure::new(
+                RELAY_AUTH_REVOKED,
+                "authentication credential is revoked",
+            )),
+            AuthenticationOutcome::RetiredTerminal(_) => Err(RelayFailure::new(
+                RELAY_AUTH_INVALID_GRANT,
+                "authentication credential is invalid",
+            )),
+        }
+    }
+
+    pub async fn authenticate_outcome(
+        &self,
+        frame: Authenticate,
+        challenge: ConsumedChallenge,
+        now_ms: u64,
+    ) -> Result<AuthenticationOutcome, RelayFailure> {
         let (reply, response) = oneshot::channel();
         self.send_auth(AuthorizationCommand::Authenticate {
             frame,
@@ -262,34 +288,43 @@ impl AuthorizationCoordinator {
             .await
     }
 
-    pub async fn install_grant(
+    pub async fn install_grant_from(
         &self,
-        request: InstallGrantRecord,
-    ) -> Result<AuthorizationMutation<GrantCommit>, StoreError> {
-        self.dispatch_store(|reply| AuthorizationCommand::InstallGrant { request, reply })
-            .await
+        origin: AccessContext,
+        grant: RelayGrant,
+    ) -> Result<AuthorizationMutation<GrantCommit>, RelayFailure> {
+        self.dispatch_control(|reply| AuthorizationCommand::InstallGrantFrom {
+            origin,
+            grant,
+            reply,
+        })
+        .await
     }
 
-    pub async fn revoke(
+    pub async fn revoke_from(
         &self,
-        request: PersistRevocation,
-    ) -> Result<AuthorizationMutation<RevocationCommit>, StoreError> {
-        if request.signed_revocation_blob.len() > MAX_CONTROL_BLOB_BYTES {
-            return Err(StoreError::InvalidValue {
-                field: "revocation.signed_blob",
-                reason: "control blob exceeds 64 KiB",
-            });
-        }
-        self.dispatch_store(|reply| AuthorizationCommand::Revoke { request, reply })
-            .await
+        origin: AccessContext,
+        revocation: DeviceRevocation,
+    ) -> Result<AuthorizationMutation<RevocationCommit>, RelayFailure> {
+        self.dispatch_control(|reply| AuthorizationCommand::RevokeFrom {
+            origin,
+            revocation,
+            reply,
+        })
+        .await
     }
 
-    pub async fn purge_machine(
+    pub async fn retire_machine_from(
         &self,
-        request: PurgeMachine,
-    ) -> Result<AuthorizationMutation<PurgeReadback>, StoreError> {
-        self.dispatch_store(|reply| AuthorizationCommand::PurgeMachine { request, reply })
-            .await
+        origin: AccessContext,
+        retirement: RetireMachine,
+    ) -> Result<AuthorizationMutation<RetirementCommit>, RelayFailure> {
+        self.dispatch_control(|reply| AuthorizationCommand::RetireMachineFrom {
+            origin,
+            retirement,
+            reply,
+        })
+        .await
     }
 
     pub fn is_current(&self, access: &AccessContext) -> Result<bool, RelayFailure> {
@@ -378,6 +413,15 @@ impl AuthorizationCoordinator {
         response.await.map_err(|_| StoreError::WorkerStopped)?
     }
 
+    async fn dispatch_control<T>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<Result<T, RelayFailure>>) -> AuthorizationCommand,
+    ) -> Result<T, RelayFailure> {
+        let (reply, response) = oneshot::channel();
+        self.send_auth(command(reply))?;
+        response.await.map_err(|_| unavailable())?
+    }
+
     fn send_auth(&self, command: AuthorizationCommand) -> Result<(), RelayFailure> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(unavailable());
@@ -398,23 +442,26 @@ enum AuthorizationCommand {
         frame: Authenticate,
         challenge: ConsumedChallenge,
         now_ms: u64,
-        reply: oneshot::Sender<Result<AuthenticationActivation, RelayFailure>>,
+        reply: oneshot::Sender<Result<AuthenticationOutcome, RelayFailure>>,
     },
     RegisterMachine {
         request: RegisterMachine,
         reply: oneshot::Sender<Result<AuthorizationMutation<MachineRecord>, StoreError>>,
     },
-    InstallGrant {
-        request: InstallGrantRecord,
-        reply: oneshot::Sender<Result<AuthorizationMutation<GrantCommit>, StoreError>>,
+    InstallGrantFrom {
+        origin: AccessContext,
+        grant: RelayGrant,
+        reply: oneshot::Sender<Result<AuthorizationMutation<GrantCommit>, RelayFailure>>,
     },
-    Revoke {
-        request: PersistRevocation,
-        reply: oneshot::Sender<Result<AuthorizationMutation<RevocationCommit>, StoreError>>,
+    RevokeFrom {
+        origin: AccessContext,
+        revocation: DeviceRevocation,
+        reply: oneshot::Sender<Result<AuthorizationMutation<RevocationCommit>, RelayFailure>>,
     },
-    PurgeMachine {
-        request: PurgeMachine,
-        reply: oneshot::Sender<Result<AuthorizationMutation<PurgeReadback>, StoreError>>,
+    RetireMachineFrom {
+        origin: AccessContext,
+        retirement: RetireMachine,
+        reply: oneshot::Sender<Result<AuthorizationMutation<RetirementCommit>, RelayFailure>>,
     },
     Shutdown {
         reply: oneshot::Sender<Result<(), RelayFailure>>,
@@ -456,16 +503,29 @@ async fn run(
                 let result = register_machine(&service, &active, &lifecycle, request).await;
                 let _ = reply.send(result);
             }
-            AuthorizationCommand::InstallGrant { request, reply } => {
-                let result = install_grant(&service, &active, &lifecycle, request).await;
+            AuthorizationCommand::InstallGrantFrom {
+                origin,
+                grant,
+                reply,
+            } => {
+                let result = install_grant_from(&service, &active, &lifecycle, origin, grant).await;
                 let _ = reply.send(result);
             }
-            AuthorizationCommand::Revoke { request, reply } => {
-                let result = revoke(&service, &active, &lifecycle, request).await;
+            AuthorizationCommand::RevokeFrom {
+                origin,
+                revocation,
+                reply,
+            } => {
+                let result = revoke_from(&service, &active, &lifecycle, origin, revocation).await;
                 let _ = reply.send(result);
             }
-            AuthorizationCommand::PurgeMachine { request, reply } => {
-                let result = purge_machine(&service, &active, &lifecycle, request).await;
+            AuthorizationCommand::RetireMachineFrom {
+                origin,
+                retirement,
+                reply,
+            } => {
+                let result =
+                    retire_machine_from(&service, &active, &lifecycle, origin, retirement).await;
                 let _ = reply.send(result);
             }
             AuthorizationCommand::Shutdown { reply } => {
@@ -492,13 +552,26 @@ async fn authenticate(
     frame: Authenticate,
     challenge: ConsumedChallenge,
     now_ms: u64,
-) -> Result<AuthenticationActivation, RelayFailure> {
-    let prepared = service.prepare(&frame, &challenge, now_ms).await?;
+) -> Result<AuthenticationOutcome, RelayFailure> {
+    let mut prepared = service.prepare(&frame, &challenge, now_ms).await?;
+    if let Some(terminal) = prepared.terminal.take() {
+        return Ok(match terminal {
+            PreparedTerminal::Revoked(terminal) => AuthenticationOutcome::RevokedTerminal(terminal),
+            PreparedTerminal::Retired(terminal) => AuthenticationOutcome::RetiredTerminal(terminal),
+        });
+    }
     let route = prepared.access.principal_route().ok_or_else(unavailable)?;
     let transition = active.begin_transition(route, true)?;
-    if let Err(error) = service.commit(&prepared).await {
-        active.abort_transition(transition)?;
-        return Err(error);
+    match service.commit(&prepared).await {
+        Ok(()) => {}
+        Err(AuthenticationCommitError::Rollback(error)) => {
+            active.abort_transition(transition)?;
+            return Err(error);
+        }
+        Err(AuthenticationCommitError::OutcomeUnknown(error)) => {
+            finish_uncertain_invalidation(active, lifecycle, transition)?;
+            return Err(error);
+        }
     }
     let activation = active.commit_transition(transition, &prepared.access)?;
     let mut affected_connections = vec![activation.connection_instance];
@@ -515,10 +588,10 @@ async fn authenticate(
     {
         return Err(unavailable());
     }
-    Ok(AuthenticationActivation {
+    Ok(AuthenticationOutcome::Activated(AuthenticationActivation {
         access: prepared.access,
         activation,
-    })
+    }))
 }
 
 async fn register_machine(
@@ -559,108 +632,164 @@ async fn register_machine(
     }
 }
 
-async fn install_grant(
+async fn install_grant_from(
     service: &AuthenticationService,
     active: &ActiveConnectionRegistry,
     lifecycle: &LifecycleSink,
-    request: InstallGrantRecord,
-) -> Result<AuthorizationMutation<GrantCommit>, StoreError> {
+    origin: AccessContext,
+    grant: RelayGrant,
+) -> Result<AuthorizationMutation<GrantCommit>, RelayFailure> {
     let route = PrincipalRoute::Device {
-        machine_route: request.grant.machine_route,
-        device_route: request.grant.device_route,
+        machine_route: grant.machine_route,
+        device_route: grant.device_route,
     };
-    let transition = active
-        .begin_transition(route, false)
-        .map_err(|_| StoreError::WorkerUnavailable)?;
+    let transition = active.begin_transition_from_machine(&origin, route)?;
+    let request = match service.prepare_install_grant(grant).await {
+        Ok(request) => request,
+        Err(error) => {
+            active.abort_transition(transition)?;
+            return Err(error);
+        }
+    };
     match service.install_grant(request).await {
         Ok(commit) if commit.duplicate => {
-            active
-                .abort_transition(transition)
-                .map_err(|_| StoreError::WorkerUnavailable)?;
+            active.abort_transition(transition)?;
             Ok(AuthorizationMutation {
                 commit,
                 invalidated_connections: Vec::new(),
             })
         }
-        Ok(commit) => finish_invalidation(active, lifecycle, transition, commit),
+        Ok(commit) => finish_committed_invalidation(active, lifecycle, transition, commit),
+        Err(error @ StoreError::CommitOutcomeUnknown { .. }) => {
+            finish_uncertain_invalidation(active, lifecycle, transition)?;
+            Err(map_control_store_error(error))
+        }
         Err(error) => {
-            active
-                .abort_transition(transition)
-                .map_err(|_| StoreError::WorkerUnavailable)?;
-            Err(error)
+            active.abort_transition(transition)?;
+            Err(map_control_store_error(error))
         }
     }
 }
 
-async fn revoke(
+async fn revoke_from(
     service: &AuthenticationService,
     active: &ActiveConnectionRegistry,
     lifecycle: &LifecycleSink,
-    request: PersistRevocation,
-) -> Result<AuthorizationMutation<RevocationCommit>, StoreError> {
+    origin: AccessContext,
+    revocation: DeviceRevocation,
+) -> Result<AuthorizationMutation<RevocationCommit>, RelayFailure> {
     let route = PrincipalRoute::Device {
-        machine_route: request.revocation.machine_route,
-        device_route: request.revocation.device_route,
+        machine_route: revocation.machine_route,
+        device_route: revocation.device_route,
     };
-    let transition = active
-        .begin_transition(route, false)
-        .map_err(|_| StoreError::WorkerUnavailable)?;
-    match service.revoke(request).await {
-        Ok(commit) => finish_invalidation(active, lifecycle, transition, commit),
+    let transition = active.begin_transition_from_machine(&origin, route)?;
+    let request = match service.prepare_revocation(revocation).await {
+        Ok(request) => request,
         Err(error) => {
-            active
-                .abort_transition(transition)
-                .map_err(|_| StoreError::WorkerUnavailable)?;
-            Err(error)
+            active.abort_transition(transition)?;
+            return Err(error);
+        }
+    };
+    match service.revoke(request).await {
+        Ok(commit) => finish_committed_invalidation(active, lifecycle, transition, commit),
+        Err(error @ StoreError::CommitOutcomeUnknown { .. }) => {
+            finish_uncertain_invalidation(active, lifecycle, transition)?;
+            Err(map_control_store_error(error))
+        }
+        Err(error) => {
+            active.abort_transition(transition)?;
+            Err(map_control_store_error(error))
         }
     }
 }
 
-async fn purge_machine(
+async fn retire_machine_from(
     service: &AuthenticationService,
     active: &ActiveConnectionRegistry,
     lifecycle: &LifecycleSink,
-    request: PurgeMachine,
-) -> Result<AuthorizationMutation<PurgeReadback>, StoreError> {
-    let transitions = active
-        .begin_machine_transition(request.machine_route)
-        .map_err(|_| StoreError::WorkerUnavailable)?;
-    match service.purge_machine(request).await {
+    origin: AccessContext,
+    retirement: RetireMachine,
+) -> Result<AuthorizationMutation<RetirementCommit>, RelayFailure> {
+    let transitions = active.begin_machine_transition_from(&origin, retirement.machine_route)?;
+    let request = match service.prepare_retirement(retirement).await {
+        Ok(request) => request,
+        Err(error) => {
+            active.abort_machine_transition(&transitions)?;
+            return Err(error);
+        }
+    };
+    match service.retire_machine(request).await {
         Ok(commit) => {
-            let connections = active
-                .complete_machine_invalidation(&transitions)
-                .map_err(|_| StoreError::WorkerUnavailable)?;
-            emit_invalidated(active, lifecycle, &connections)?;
+            let connections = active.complete_machine_invalidation(&transitions)?;
+            let _ = emit_invalidated(active, lifecycle, &connections);
             Ok(AuthorizationMutation {
                 commit,
                 invalidated_connections: connections,
             })
         }
+        Err(error @ StoreError::CommitOutcomeUnknown { .. }) => {
+            let connections = active.complete_machine_invalidation(&transitions)?;
+            // 精确幂等恢复也失败时无法判断 retirement 是否 durable；停止整个 Core，
+            // 让 PairRoute registry 与全部 writer 一并 fail-closed，绝不恢复旧 machine。
+            trigger_fail_closed(active, lifecycle, &connections);
+            Err(map_control_store_error(error))
+        }
         Err(error) => {
-            active
-                .abort_machine_transition(&transitions)
-                .map_err(|_| StoreError::WorkerUnavailable)?;
-            Err(error)
+            active.abort_machine_transition(&transitions)?;
+            Err(map_control_store_error(error))
         }
     }
 }
 
-fn finish_invalidation<T>(
+fn finish_uncertain_invalidation(
+    active: &ActiveConnectionRegistry,
+    lifecycle: &LifecycleSink,
+    transition: RouteTransition,
+) -> Result<(), RelayFailure> {
+    let connections = active
+        .complete_invalidation(transition)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    let _ = emit_invalidated(active, lifecycle, &connections);
+    Ok(())
+}
+
+fn finish_committed_invalidation<T>(
     active: &ActiveConnectionRegistry,
     lifecycle: &LifecycleSink,
     transition: RouteTransition,
     commit: T,
-) -> Result<AuthorizationMutation<T>, StoreError> {
+) -> Result<AuthorizationMutation<T>, RelayFailure> {
     let connections = active
-        .complete_invalidation(transition)
-        .map_err(|_| StoreError::WorkerUnavailable)?
+        .complete_invalidation(transition)?
         .into_iter()
         .collect::<Vec<_>>();
-    emit_invalidated(active, lifecycle, &connections)?;
+    // Store COMMIT 已完成后，lifecycle overflow 会触发 emergency fail-close，但不能把
+    // durable commit 伪装成“未提交”错误；Core 仍需拿到精确 target 以先尝试 terminal。
+    let _ = emit_invalidated(active, lifecycle, &connections);
     Ok(AuthorizationMutation {
         commit,
         invalidated_connections: connections,
     })
+}
+
+fn map_control_store_error(error: StoreError) -> RelayFailure {
+    match error {
+        StoreError::QuotaExceeded { .. } => RelayFailure::new(
+            RELAY_QUOTA_EXCEEDED,
+            "authorization metadata capacity is exhausted",
+        ),
+        StoreError::MachineNotFound
+        | StoreError::GrantNotFound
+        | StoreError::Revoked
+        | StoreError::MonotonicRollback { .. }
+        | StoreError::IdempotencyConflict { .. }
+        | StoreError::AuthenticationMismatch { .. } => RelayFailure::new(
+            RELAY_AUTH_INVALID_GRANT,
+            "authentication credential is invalid",
+        ),
+        _ => unavailable(),
+    }
 }
 
 fn emit_invalidated(

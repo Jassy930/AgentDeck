@@ -27,14 +27,14 @@ use agentdeck_protocol::relay_v2::{
     SignedCertificate, StreamCursor, StreamGenerationId, StreamRouteId, TrustEpoch,
 };
 use agentdeck_relay::v2::auth::{
-    ActivePairRoute, AuthenticationTrust, AuthenticationTrustView, AuthorizationCoordinator,
-    AuthorizationLifecycleEvent, ChallengeLimits, ChallengeRegistry, ChallengeRoute,
-    ChallengeSource, MonotonicClock, PairRouteView, PairingHello, PrincipalRoute,
+    AccessContext, ActivePairRoute, AuthenticationTrust, AuthenticationTrustView,
+    AuthorizationCoordinator, AuthorizationLifecycleEvent, ChallengeLimits, ChallengeRegistry,
+    ChallengeRoute, ChallengeSource, MonotonicClock, PairRouteView, PairingHello, PrincipalRoute,
     TokenBucketLimits, authorize_pairing_route, verify_authentication,
 };
 use agentdeck_relay::v2::store::{
     Clock, CommitMachineLinkAuth, ConfirmDeviceAuth, EnrollmentCodeSeed, FaultInjector, FaultPoint,
-    InstallGrantRecord, MAX_CONTROL_BLOB_BYTES, PersistRevocation, RegisterMachine,
+    InstallGrantRecord, MAX_CONTROL_BLOB_BYTES, PersistRevocation, PurgeMachine, RegisterMachine,
     RelayStoreHandle, RelayV2StoreConfig, StoreError,
 };
 use tempfile::TempDir;
@@ -64,26 +64,49 @@ impl Clock for FixedStoreClock {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ArmedLinkAuthFault {
-    armed: AtomicBool,
+    point: FaultPoint,
+    remaining: AtomicU64,
 }
 
 impl ArmedLinkAuthFault {
+    fn new(point: FaultPoint) -> Self {
+        Self {
+            point,
+            remaining: AtomicU64::new(0),
+        }
+    }
+
     fn arm(&self) {
-        self.armed.store(true, Ordering::SeqCst);
+        self.arm_times(1);
+    }
+
+    fn arm_times(&self, count: u64) {
+        self.remaining.store(count, Ordering::SeqCst);
     }
 }
 
 impl FaultInjector for ArmedLinkAuthFault {
     fn check(&self, point: FaultPoint) -> Result<(), StoreError> {
-        if point == FaultPoint::MachineLinkAuthBeforeCommit
-            && self.armed.swap(false, Ordering::SeqCst)
+        if point == self.point
+            && self
+                .remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
         {
             Err(StoreError::InjectedFault(point))
         } else {
             Ok(())
         }
+    }
+}
+
+impl Default for ArmedLinkAuthFault {
+    fn default() -> Self {
+        Self::new(FaultPoint::MachineLinkAuthBeforeCommit)
     }
 }
 
@@ -297,6 +320,16 @@ impl Fixture {
         Self::new_inner(Some(Arc::new(ArmedLinkAuthFault::default())), None).await
     }
 
+    async fn with_link_auth_after_commit_fault() -> Self {
+        Self::new_inner(
+            Some(Arc::new(ArmedLinkAuthFault::new(
+                FaultPoint::MachineLinkAuthAfterCommit,
+            ))),
+            None,
+        )
+        .await
+    }
+
     async fn with_blocking_fault(point: FaultPoint) -> (Self, Arc<BlockingFault>) {
         let fault = Arc::new(BlockingFault::new(point));
         let fixture = Self::new_inner(None, Some(fault.clone())).await;
@@ -461,6 +494,48 @@ impl Fixture {
             signature: sign_authentication_transcript(signer, &transcript).into(),
         }
     }
+
+    fn signed_revocation(&self) -> DeviceRevocation {
+        let mut revocation = DeviceRevocation {
+            machine_route: self.machine_route,
+            device_route: self.device_route,
+            grant_serial: self.grant.grant_serial,
+            root_key_id: self.root_key_id,
+            trust_epoch: self.trust_epoch,
+            signature: Ed25519Signature([0; 64]),
+        };
+        revocation.signature = sign_tbs(
+            &self.root,
+            &revocation.to_be_signed_v1(self.server, sha256(&self.root.verifying_key().to_bytes())),
+        )
+        .into();
+        revocation
+    }
+}
+
+async fn authenticate_machine_access(
+    fixture: &Fixture,
+    registry: &ChallengeRegistry,
+    coordinator: &AuthorizationCoordinator,
+    instance: ConnectionInstanceId,
+    source_id: u64,
+) -> AccessContext {
+    let challenge = registry
+        .issue(instance, source(source_id))
+        .expect("issue machine control challenge");
+    let frame = fixture.machine_frame(&challenge, fixture.link_cert.clone(), &fixture.link);
+    let consumed = registry
+        .consume(
+            instance,
+            source(source_id),
+            ChallengeRoute::Machine(fixture.machine_route),
+        )
+        .expect("consume machine control challenge");
+    coordinator
+        .authenticate(frame, consumed, NOW_MS)
+        .await
+        .expect("machine control origin authenticates")
+        .access
 }
 
 #[test]
@@ -771,6 +846,162 @@ async fn link_cas_commit_fault_rolls_back_before_active_replacement() {
 }
 
 #[tokio::test]
+async fn link_cas_after_commit_loss_exactly_recovers_without_restoring_old_generation() {
+    let fixture = Fixture::with_link_auth_after_commit_fault().await;
+    let (_clock, registry) = fixture.registry();
+    let (coordinator, _lifecycle) = AuthorizationCoordinator::start(fixture.store.clone(), 32)
+        .expect("authorization coordinator");
+
+    let first_connection = connection(14);
+    let challenge = registry
+        .issue(first_connection, source(1))
+        .expect("issue initial");
+    let frame = fixture.machine_frame(&challenge, fixture.link_cert.clone(), &fixture.link);
+    let consumed = registry
+        .consume(
+            first_connection,
+            source(1),
+            ChallengeRoute::Machine(fixture.machine_route),
+        )
+        .expect("consume initial");
+    let first = coordinator
+        .authenticate(frame, consumed, NOW_MS)
+        .await
+        .expect("initial active");
+
+    let higher = signed_certificate(
+        &fixture.root,
+        &fixture.link,
+        fixture.server,
+        fixture.machine_route,
+        fixture.root_key_id,
+        fixture.trust_epoch,
+        LinkGeneration::new(2),
+        CertRole::Link,
+        Some(NOW_MS + 60_000),
+    );
+    fixture
+        .link_auth_fault
+        .as_ref()
+        .expect("fault fixture")
+        .arm();
+    let second_connection = connection(15);
+    let challenge = registry
+        .issue(second_connection, source(1))
+        .expect("issue replacement");
+    let frame = fixture.machine_frame(&challenge, higher.clone(), &fixture.link);
+    let consumed = registry
+        .consume(
+            second_connection,
+            source(1),
+            ChallengeRoute::Machine(fixture.machine_route),
+        )
+        .expect("consume replacement");
+    let second = coordinator
+        .authenticate(frame, consumed, NOW_MS)
+        .await
+        .expect("exact retry recovers durable generation");
+    assert_eq!(second.activation.replaced, Some(first_connection));
+    assert!(!coordinator.is_current(&first.access).expect("old invalid"));
+    assert!(coordinator.is_current(&second.access).expect("new current"));
+    let trust = fixture
+        .store
+        .machine_trust(fixture.machine_route)
+        .await
+        .expect("persisted trust");
+    assert_eq!(trust.highest_link_generation, LinkGeneration::new(2));
+    assert_eq!(trust.link_cert_hash, higher.canonical_sha256());
+
+    coordinator.shutdown().await.expect("shutdown coordinator");
+    fixture.store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn link_cas_unknown_retry_failure_invalidates_old_generation_instead_of_rollback() {
+    let fixture = Fixture::with_link_auth_after_commit_fault().await;
+    let (_clock, registry) = fixture.registry();
+    let (coordinator, _lifecycle) = AuthorizationCoordinator::start(fixture.store.clone(), 32)
+        .expect("authorization coordinator");
+
+    let first_connection = connection(16);
+    let challenge = registry
+        .issue(first_connection, source(1))
+        .expect("issue initial");
+    let frame = fixture.machine_frame(&challenge, fixture.link_cert.clone(), &fixture.link);
+    let consumed = registry
+        .consume(
+            first_connection,
+            source(1),
+            ChallengeRoute::Machine(fixture.machine_route),
+        )
+        .expect("consume initial");
+    let first = coordinator
+        .authenticate(frame, consumed, NOW_MS)
+        .await
+        .expect("initial active");
+
+    let higher = signed_certificate(
+        &fixture.root,
+        &fixture.link,
+        fixture.server,
+        fixture.machine_route,
+        fixture.root_key_id,
+        fixture.trust_epoch,
+        LinkGeneration::new(2),
+        CertRole::Link,
+        Some(NOW_MS + 60_000),
+    );
+    fixture
+        .link_auth_fault
+        .as_ref()
+        .expect("fault fixture")
+        .arm_times(2);
+    let second_connection = connection(17);
+    let challenge = registry
+        .issue(second_connection, source(1))
+        .expect("issue replacement");
+    let frame = fixture.machine_frame(&challenge, higher, &fixture.link);
+    let consumed = registry
+        .consume(
+            second_connection,
+            source(1),
+            ChallengeRoute::Machine(fixture.machine_route),
+        )
+        .expect("consume replacement");
+    assert_eq!(
+        coordinator
+            .authenticate(frame, consumed, NOW_MS)
+            .await
+            .expect_err("two lost results remain commit-unknown")
+            .code,
+        RELAY_STORE_UNAVAILABLE
+    );
+    assert!(
+        !coordinator.is_current(&first.access).expect("old invalid"),
+        "commit-unknown must not restore the stale MachineLink"
+    );
+    assert_eq!(
+        coordinator
+            .current(PrincipalRoute::Machine(fixture.machine_route))
+            .expect("current machine"),
+        None
+    );
+    assert_eq!(
+        fixture
+            .store
+            .machine_trust(fixture.machine_route)
+            .await
+            .expect("durable trust")
+            .highest_link_generation,
+        LinkGeneration::new(2),
+        "the first COMMIT was durable even though both results were lost"
+    );
+
+    coordinator.shutdown().await.expect("shutdown coordinator");
+    fixture.store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn device_auth_requires_installed_exact_grant_and_revocation_survives_restart() {
     let fixture = Fixture::new().await;
     let (_clock, registry) = fixture.registry();
@@ -830,20 +1061,11 @@ async fn device_auth_requires_installed_exact_grant_and_revocation_survives_rest
         RELAY_AUTH_INVALID_GRANT
     );
 
-    let revocation = DeviceRevocation {
-        machine_route: fixture.machine_route,
-        device_route: fixture.device_route,
-        grant_serial: GrantSerial::new(1),
-        root_key_id: fixture.root_key_id,
-        trust_epoch: fixture.trust_epoch,
-        signature: Ed25519Signature([0x77; 64]),
-    };
+    let machine_access =
+        authenticate_machine_access(&fixture, &registry, &coordinator, connection(200), 3).await;
+    let revocation = fixture.signed_revocation();
     coordinator
-        .revoke(PersistRevocation {
-            revocation,
-            revocation_hash: [0x78; 32],
-            signed_revocation_blob: vec![0x79],
-        })
+        .revoke_from(machine_access, revocation.clone())
         .await
         .expect("revoke");
     coordinator.shutdown().await.expect("shutdown coordinator");
@@ -936,19 +1158,14 @@ async fn authorization_coordinator_serializes_revoke_and_invalidates_device_acce
             .expect("current")
     );
 
+    let machine_access =
+        authenticate_machine_access(&fixture, &registry, &coordinator, connection(240), 3).await;
+    assert!(matches!(
+        lifecycle.recv().await,
+        Some(AuthorizationLifecycleEvent::Activated(_))
+    ));
     let committed = coordinator
-        .revoke(PersistRevocation {
-            revocation: DeviceRevocation {
-                machine_route: fixture.machine_route,
-                device_route: fixture.device_route,
-                grant_serial: GrantSerial::new(1),
-                root_key_id: fixture.root_key_id,
-                trust_epoch: fixture.trust_epoch,
-                signature: Ed25519Signature([0x81; 64]),
-            },
-            revocation_hash: [0x82; 32],
-            signed_revocation_blob: vec![0x83],
-        })
+        .revoke_from(machine_access, fixture.signed_revocation())
         .await
         .expect("revoke through coordinator");
     assert_eq!(committed.invalidated_connections(), &[instance]);
@@ -996,24 +1213,35 @@ async fn authorization_owner_is_singleton_and_blocks_raw_trust_mutators() {
         Err(StoreError::AuthorizationOwned)
     ));
     assert!(matches!(
-        coordinator
-            .revoke(PersistRevocation {
-                revocation: DeviceRevocation {
-                    machine_route: fixture.machine_route,
-                    device_route: fixture.device_route,
-                    grant_serial: GrantSerial::new(1),
-                    root_key_id: fixture.root_key_id,
-                    trust_epoch: fixture.trust_epoch,
-                    signature: Ed25519Signature([0x91; 64]),
-                },
-                revocation_hash: [0x92; 32],
-                signed_revocation_blob: vec![0_u8; MAX_CONTROL_BLOB_BYTES + 1],
+        fixture
+            .store
+            .install_grant(InstallGrantRecord {
+                grant: fixture.grant.clone(),
+                grant_hash: fixture.grant.canonical_sha256(),
             })
             .await,
-        Err(StoreError::InvalidValue {
-            field: "revocation.signed_blob",
-            ..
-        })
+        Err(StoreError::AuthorizationOwned)
+    ));
+    let revocation = fixture.signed_revocation();
+    assert!(matches!(
+        fixture
+            .store
+            .revoke(PersistRevocation {
+                revocation: revocation.clone(),
+                revocation_hash: revocation.canonical_sha256(),
+                signed_revocation_blob: vec![0x91],
+            })
+            .await,
+        Err(StoreError::AuthorizationOwned)
+    ));
+    assert!(matches!(
+        fixture
+            .store
+            .purge_machine(PurgeMachine {
+                machine_route: fixture.machine_route,
+            })
+            .await,
+        Err(StoreError::AuthorizationOwned)
     ));
     assert!(matches!(
         coordinator
@@ -1146,22 +1374,21 @@ async fn transitioning_fences_device_before_revoke_commit() {
         lifecycle.recv().await,
         Some(AuthorizationLifecycleEvent::Activated(_))
     ));
+    let machine_access =
+        authenticate_machine_access(&fixture, &registry, &coordinator, connection(250), 3).await;
+    assert!(matches!(
+        lifecycle.recv().await,
+        Some(AuthorizationLifecycleEvent::Activated(_))
+    ));
 
     let release = fault.arm();
-    let request = PersistRevocation {
-        revocation: DeviceRevocation {
-            machine_route: fixture.machine_route,
-            device_route: fixture.device_route,
-            grant_serial: GrantSerial::new(1),
-            root_key_id: fixture.root_key_id,
-            trust_epoch: fixture.trust_epoch,
-            signature: Ed25519Signature([0x84; 64]),
-        },
-        revocation_hash: [0x85; 32],
-        signed_revocation_blob: vec![0x86],
-    };
+    let revocation = fixture.signed_revocation();
     let task_coordinator = coordinator.clone();
-    let revoke_task = tokio::spawn(async move { task_coordinator.revoke(request).await });
+    let revoke_task = tokio::spawn(async move {
+        task_coordinator
+            .revoke_from(machine_access, revocation)
+            .await
+    });
     fault.wait_until_entered().await;
     assert!(
         !coordinator

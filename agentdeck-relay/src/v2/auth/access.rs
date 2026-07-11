@@ -361,6 +361,51 @@ impl ActiveConnectionRegistry {
         Ok(RouteTransition { route })
     }
 
+    /// 在同一 registry 临界区复核 current MachineAccess 并建立目标 device transition。
+    /// 这样 control frame 的 origin check 与 target 数据面 fence 之间没有 TOCTOU 窗口。
+    pub(super) fn begin_transition_from_machine(
+        &self,
+        origin: &AccessContext,
+        route: PrincipalRoute,
+    ) -> Result<RouteTransition, RelayFailure> {
+        let AccessContext::Machine(machine) = origin else {
+            return Err(failure(
+                RELAY_ROUTE_FORBIDDEN,
+                "auth control requires current machine access",
+            ));
+        };
+        if principal_machine(route) != machine.machine_route {
+            return Err(failure(
+                RELAY_ROUTE_FORBIDDEN,
+                "auth control target belongs to another machine",
+            ));
+        }
+        let mut active = self.lock()?;
+        let origin_route = PrincipalRoute::Machine(machine.machine_route);
+        if !matches!(
+            active.get(&origin_route),
+            Some(ActiveState::Active(entry))
+                if entry.connection_instance == machine.connection_instance
+        ) {
+            return Err(failure(
+                RELAY_ROUTE_FORBIDDEN,
+                "auth control requires current machine access",
+            ));
+        }
+        let previous = match active.get(&route).copied() {
+            Some(ActiveState::Active(entry)) => Some(entry),
+            Some(ActiveState::Transitioning { .. }) => {
+                return Err(failure(
+                    RELAY_STORE_UNAVAILABLE,
+                    "authentication state is unavailable",
+                ));
+            }
+            None => None,
+        };
+        active.insert(route, ActiveState::Transitioning { previous });
+        Ok(RouteTransition { route })
+    }
+
     pub(super) fn begin_machine_transition(
         &self,
         machine_route: MachineRouteId,
@@ -388,6 +433,69 @@ impl ActiveConnectionRegistry {
                 } => *machine == machine_route,
             };
             belongs && matches!(state, ActiveState::Transitioning { .. })
+        }) {
+            return Err(failure(
+                RELAY_STORE_UNAVAILABLE,
+                "authentication state is unavailable",
+            ));
+        }
+        for route in &routes {
+            if let Some(ActiveState::Active(previous)) = active.get(route).copied() {
+                active.insert(
+                    *route,
+                    ActiveState::Transitioning {
+                        previous: Some(previous),
+                    },
+                );
+            }
+        }
+        Ok(routes
+            .into_iter()
+            .map(|route| RouteTransition { route })
+            .collect())
+    }
+
+    /// 在同一 registry 临界区复核 current MachineAccess 后 fence 整个 trust domain。
+    pub(super) fn begin_machine_transition_from(
+        &self,
+        origin: &AccessContext,
+        machine_route: MachineRouteId,
+    ) -> Result<Vec<RouteTransition>, RelayFailure> {
+        let AccessContext::Machine(machine) = origin else {
+            return Err(failure(
+                RELAY_ROUTE_FORBIDDEN,
+                "machine retirement requires current machine access",
+            ));
+        };
+        if machine.machine_route != machine_route {
+            return Err(failure(
+                RELAY_ROUTE_FORBIDDEN,
+                "machine retirement target belongs to another machine",
+            ));
+        }
+        let mut active = self.lock()?;
+        let origin_route = PrincipalRoute::Machine(machine_route);
+        if !matches!(
+            active.get(&origin_route),
+            Some(ActiveState::Active(entry))
+                if entry.connection_instance == machine.connection_instance
+        ) {
+            return Err(failure(
+                RELAY_ROUTE_FORBIDDEN,
+                "machine retirement requires current machine access",
+            ));
+        }
+        let routes = active
+            .iter()
+            .filter_map(|(route, state)| {
+                (principal_machine(*route) == machine_route
+                    && matches!(state, ActiveState::Active(_)))
+                .then_some(*route)
+            })
+            .collect::<Vec<_>>();
+        if active.iter().any(|(route, state)| {
+            principal_machine(*route) == machine_route
+                && matches!(state, ActiveState::Transitioning { .. })
         }) {
             return Err(failure(
                 RELAY_STORE_UNAVAILABLE,
@@ -679,6 +787,13 @@ impl ActiveConnectionRegistry {
                 "authentication state is unavailable",
             )
         })
+    }
+}
+
+fn principal_machine(route: PrincipalRoute) -> MachineRouteId {
+    match route {
+        PrincipalRoute::Machine(machine) => machine,
+        PrincipalRoute::Device { machine_route, .. } => machine_route,
     }
 }
 

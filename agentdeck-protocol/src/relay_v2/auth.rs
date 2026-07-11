@@ -30,6 +30,7 @@ pub const AUTH_SIGNATURE_FORMAT_VERSION: u16 = 1;
 const MACHINE_LINK_ROLE_SCOPE: &str = "machine-link";
 const MACHINE_DATA_ROLE_SCOPE: &str = "machine-data";
 const RELAY_GRANT_ROLE_SCOPE: &str = "relay-device-grant";
+const DEVICE_REVOCATION_ROLE_SCOPE: &str = "relay-device-revocation";
 
 /// challenge endpoint 身份域。枚举 tag 是 canonical transcript 的一部分，不得重排。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -356,6 +357,67 @@ impl std::fmt::Debug for DeviceRevocation {
             .field("trust_epoch", &self.trust_epoch.value())
             .field("signature", &"<redacted>")
             .finish()
+    }
+}
+
+impl DeviceRevocation {
+    /// 不含 MachineRoot signature 的撤销 canonical bytes。
+    pub fn unsigned_canonical_bytes(&self) -> Vec<u8> {
+        let mut encoder = Enc::new();
+        encoder.domain(b"AgentDeck/DeviceRevocationUnsignedV1\0");
+        encoder.bytes(self.machine_route.as_bytes());
+        encoder.bytes(self.device_route.as_bytes());
+        encoder.u64(self.grant_serial.value());
+        encoder.bytes(self.root_key_id.as_bytes());
+        encoder.u64(self.trust_epoch.value());
+        encoder.finish()
+    }
+
+    /// 包含 MachineRoot signature 的完整撤销 credential bytes。
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let unsigned = self.unsigned_canonical_bytes();
+        let mut encoder = Enc::new();
+        encoder.domain(b"AgentDeck/DeviceRevocationV1\0");
+        encoder.bytes(&unsigned);
+        encoder.bytes(&self.signature.0);
+        encoder.finish()
+    }
+
+    pub fn unsigned_canonical_sha256(&self) -> [u8; 32] {
+        sha256(&self.unsigned_canonical_bytes())
+    }
+
+    pub fn canonical_sha256(&self) -> [u8; 32] {
+        sha256(&self.canonical_bytes())
+    }
+
+    /// 构造 MachineRoot 对设备撤销签名的 canonical [`ToBeSignedV1`]。
+    pub fn to_be_signed_v1(
+        &self,
+        relay_server_id: RelayServerId,
+        root_public_key_fingerprint: [u8; 32],
+    ) -> ToBeSignedV1 {
+        ToBeSignedV1 {
+            object_type: SignedObjectType::DeviceRevocation,
+            signature_format_version: AUTH_SIGNATURE_FORMAT_VERSION,
+            relay_protocol_version: RELAY_PROTOCOL_VERSION,
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            e2ee_format_version: E2EE_FORMAT_VERSION,
+            relay_server_id,
+            machine_route: self.machine_route,
+            device_route: Some(self.device_route),
+            stream_route: None,
+            request_route: None,
+            stream_generation: None,
+            stream_cursor: None,
+            role_scope: DEVICE_REVOCATION_ROLE_SCOPE.to_owned(),
+            signing_key_fingerprint: root_public_key_fingerprint,
+            root_key_id: self.root_key_id,
+            trust_epoch: self.trust_epoch,
+            serial_or_generation: self.grant_serial.value(),
+            not_after_ms: None,
+            signed_object_sha256: self.unsigned_canonical_sha256(),
+        }
     }
 }
 

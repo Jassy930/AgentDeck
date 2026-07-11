@@ -9,6 +9,7 @@
 use agentdeck_protocol::e2ee::schema::e2ee_schema;
 use agentdeck_protocol::relay_v2::schema::relay_v2_schema;
 use serde_json::Value;
+use std::collections::BTreeSet;
 
 /// 属性名里禁止出现的业务子串（小写包含匹配）。
 const FORBIDDEN_PROPERTY_SUBSTR: &[&str] = &[
@@ -130,4 +131,49 @@ fn relay_schema_does_not_leak_e2ee_business_payload_words() {
             "e2ee endpoint schema should legitimately carry business payload word `{word}`"
         );
     }
+}
+
+#[test]
+fn retirement_terminal_schema_is_explicit_and_strictly_minimal() {
+    let schema = relay_v2_schema();
+    let relay_body = &schema["properties"]["RelayFrameBody"];
+    let terminal = &relay_body["definitions"]["RetirementCommitted"];
+    let fields = terminal["properties"]
+        .as_object()
+        .expect("RetirementCommitted must be a struct schema")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        fields,
+        BTreeSet::from(["machineRoute", "retireHash", "trustEpoch"]),
+        "retirement ACK carries only routing identity, epoch and the verified RetireMachine canonical hash"
+    );
+    assert_eq!(terminal["additionalProperties"], Value::Bool(false));
+
+    let variants = relay_body["oneOf"]
+        .as_array()
+        .expect("RelayFrameBody must expose tagged variants");
+    assert!(variants.iter().any(|variant| {
+        variant["properties"]["frameKind"]["enum"]
+            .as_array()
+            .is_some_and(|tags| tags == &[Value::String("retirementCommitted".into())])
+    }));
+
+    let retire_machine = &relay_body["definitions"]["RetireMachine"];
+    let retire_fields = retire_machine["properties"]
+        .as_object()
+        .expect("RetireMachine must be a struct schema")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        retire_fields,
+        BTreeSet::from(["machineRoute", "rootKeyId", "signature", "trustEpoch"]),
+        "root-signed retirement must be self-describing without adding business metadata"
+    );
+
+    let text = serde_json::to_string(relay_body).unwrap();
+    assert!(!text.contains("signedRetirement"));
+    assert!(!text.contains("signedRetireMachine"));
 }

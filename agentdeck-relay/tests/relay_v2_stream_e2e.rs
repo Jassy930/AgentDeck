@@ -36,8 +36,8 @@ use agentdeck_relay::v2::core::writer::{
 use agentdeck_relay::v2::core::{CoreConfig, RelayCore, RouteOutcome};
 use agentdeck_relay::v2::store::{
     Clock, DiskSpace, DiskSpaceProbe, EnrollmentCodeSeed, FaultInjector, FaultPoint,
-    InstallGrantRecord, PersistRevocation, PersistSubscription, RegisterMachine, RelayStoreHandle,
-    RelayV2StoreConfig, RetentionLimits, StoreError,
+    InstallGrantRecord, PersistSubscription, RegisterMachine, RelayStoreHandle, RelayV2StoreConfig,
+    RetentionLimits, StoreError,
 };
 use tempfile::TempDir;
 
@@ -345,7 +345,11 @@ struct DeviceFixture {
 }
 
 struct RealmFixture {
+    server: RelayServerId,
     machine_route: MachineRouteId,
+    root_key_id: RootKeyId,
+    trust_epoch: TrustEpoch,
+    root: SigningKey,
     link: SigningKey,
     link_cert: SignedCertificate,
     devices: Vec<DeviceFixture>,
@@ -442,11 +446,33 @@ impl RealmFixture {
             devices.push(DeviceFixture { route, key, grant });
         }
         Self {
+            server,
             machine_route,
+            root_key_id,
+            trust_epoch,
+            root,
             link,
             link_cert,
             devices,
         }
+    }
+
+    fn signed_revocation(&self, server: RelayServerId, device: usize) -> DeviceRevocation {
+        let grant = &self.devices[device].grant;
+        let mut revocation = DeviceRevocation {
+            machine_route: self.machine_route,
+            device_route: grant.device_route,
+            grant_serial: grant.grant_serial,
+            root_key_id: self.root_key_id,
+            trust_epoch: self.trust_epoch,
+            signature: Ed25519Signature([0; 64]),
+        };
+        revocation.signature = sign_tbs(
+            &self.root,
+            &revocation.to_be_signed_v1(server, sha256(&self.root.verifying_key().to_bytes())),
+        )
+        .into();
+        revocation
     }
 
     fn machine_authenticate(
@@ -1501,21 +1527,10 @@ async fn replay_output_observes_auth_transition_fence_before_writer_enqueue() {
     ));
     blocker.replay.wait_until_entered().await;
 
-    let grant = fixture.realms[0].devices[0].grant.clone();
-    let revoke = PersistRevocation {
-        revocation: DeviceRevocation {
-            machine_route: grant.machine_route,
-            device_route: grant.device_route,
-            grant_serial: grant.grant_serial,
-            root_key_id: grant.root_key_id,
-            trust_epoch: grant.trust_epoch,
-            signature: Ed25519Signature([0xee; 64]),
-        },
-        revocation_hash: [0xef; 32],
-        signed_revocation_blob: vec![0xf0],
-    };
+    let revoke = fixture.realms[0].signed_revocation(fixture.realms[0].server, 0);
+    let origin = machine.access.clone();
     let auth = fixture.auth.clone();
-    let revoke_task = tokio::spawn(async move { auth.revoke(revoke).await });
+    let revoke_task = tokio::spawn(async move { auth.revoke_from(origin, revoke).await });
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if !fixture

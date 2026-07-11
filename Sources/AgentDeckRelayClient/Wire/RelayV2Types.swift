@@ -608,7 +608,8 @@ public enum RelayV2FrameBody: Codable, Equatable, Sendable {
         grantSerial: UInt64,
         signedRevocation: RelayV2DeviceRevocation
     )
-    case retireMachine(machineRoute: Data, trustEpoch: UInt64, signature: Data)
+    case retireMachine(machineRoute: Data, rootKeyId: Data, trustEpoch: UInt64, signature: Data)
+    case retirementCommitted(machineRoute: Data, trustEpoch: UInt64, retireHash: Data)
     case ping(nonce: UInt64)
     case pong(nonce: UInt64)
     case routeAccepted(accepted: RelayV2AcceptedRef)
@@ -645,6 +646,7 @@ public enum RelayV2FrameBody: Codable, Equatable, Sendable {
         case .routeAccepted: 25
         case .error: 26
         case .serverRestarting: 27
+        case .retirementCommitted: 28
         }
     }
 
@@ -787,8 +789,16 @@ public enum RelayV2FrameBody: Codable, Equatable, Sendable {
             let value = try container.decode(RetireMachineWire.self, forKey: .frame)
             self = .retireMachine(
                 machineRoute: value.machineRoute,
+                rootKeyId: value.rootKeyId,
                 trustEpoch: value.trustEpoch,
                 signature: value.signature
+            )
+        case "retirementCommitted":
+            let value = try container.decode(RetirementCommittedWire.self, forKey: .frame)
+            self = .retirementCommitted(
+                machineRoute: value.machineRoute,
+                trustEpoch: value.trustEpoch,
+                retireHash: value.retireHash
             )
         case "ping":
             self = .ping(nonce: try container.decode(NonceWire.self, forKey: .frame).nonce)
@@ -961,13 +971,24 @@ public enum RelayV2FrameBody: Codable, Equatable, Sendable {
                 ),
                 forKey: .frame
             )
-        case .retireMachine(let machineRoute, let trustEpoch, let signature):
+        case .retireMachine(let machineRoute, let rootKeyId, let trustEpoch, let signature):
             try container.encode("retireMachine", forKey: .frameKind)
             try container.encode(
                 RetireMachineWire(
                     machineRoute: machineRoute,
+                    rootKeyId: rootKeyId,
                     trustEpoch: trustEpoch,
                     signature: signature
+                ),
+                forKey: .frame
+            )
+        case .retirementCommitted(let machineRoute, let trustEpoch, let retireHash):
+            try container.encode("retirementCommitted", forKey: .frameKind)
+            try container.encode(
+                RetirementCommittedWire(
+                    machineRoute: machineRoute,
+                    trustEpoch: trustEpoch,
+                    retireHash: retireHash
                 ),
                 forKey: .frame
             )
@@ -1015,7 +1036,8 @@ public enum RelayV2OutboundControlFrame: Sendable {
         grantSerial: UInt64,
         signedRevocation: RelayV2DeviceRevocation
     )
-    case retireMachine(machineRoute: Data, trustEpoch: UInt64, signature: Data)
+    case retireMachine(machineRoute: Data, rootKeyId: Data, trustEpoch: UInt64, signature: Data)
+    case retirementCommitted(machineRoute: Data, trustEpoch: UInt64, retireHash: Data)
     case ping(nonce: UInt64)
     case pong(nonce: UInt64)
     case routeAccepted(accepted: RelayV2AcceptedRef)
@@ -1085,8 +1107,19 @@ public enum RelayV2OutboundControlFrame: Sendable {
                 grantSerial: serial,
                 signedRevocation: revocation
             )
-        case .retireMachine(let machineRoute, let epoch, let signature):
-            .retireMachine(machineRoute: machineRoute, trustEpoch: epoch, signature: signature)
+        case .retireMachine(let machineRoute, let rootKeyId, let epoch, let signature):
+            .retireMachine(
+                machineRoute: machineRoute,
+                rootKeyId: rootKeyId,
+                trustEpoch: epoch,
+                signature: signature
+            )
+        case .retirementCommitted(let machineRoute, let epoch, let retireHash):
+            .retirementCommitted(
+                machineRoute: machineRoute,
+                trustEpoch: epoch,
+                retireHash: retireHash
+            )
         case .ping(let nonce): .ping(nonce: nonce)
         case .pong(let nonce): .pong(nonce: nonce)
         case .routeAccepted(let accepted): .routeAccepted(accepted: accepted)
@@ -1384,8 +1417,14 @@ private struct RevocationCommittedWire: Codable {
 }
 private struct RetireMachineWire: Codable {
     let machineRoute: Data
+    let rootKeyId: Data
     let trustEpoch: UInt64
     let signature: Data
+}
+private struct RetirementCommittedWire: Codable {
+    let machineRoute: Data
+    let trustEpoch: UInt64
+    let retireHash: Data
 }
 private struct NonceWire: Codable { let nonce: UInt64 }
 private struct RouteAcceptedWire: Codable { let accepted: RelayV2AcceptedRef }
@@ -1499,7 +1538,13 @@ public enum RelayV2JSONCodec {
         case "retireMachine":
             try exactKeys(
                 payload,
-                allowed: ["machineRoute", "trustEpoch", "signature"],
+                allowed: ["machineRoute", "rootKeyId", "trustEpoch", "signature"],
+                path: "frame.body.frame"
+            )
+        case "retirementCommitted":
+            try exactKeys(
+                payload,
+                allowed: ["machineRoute", "trustEpoch", "retireHash"],
                 path: "frame.body.frame"
             )
         case "registerStream":
@@ -2021,10 +2066,15 @@ public enum RelayWireCodecV2 {
             try writer.fixed(deviceRoute, count: 16, field: "deviceRoute")
             writer.u64(grantSerial)
             try writer.revocation(signedRevocation)
-        case .retireMachine(let machineRoute, let trustEpoch, let signature):
+        case .retireMachine(let machineRoute, let rootKeyId, let trustEpoch, let signature):
             try writer.fixed(machineRoute, count: 16, field: "machineRoute")
+            try writer.fixed(rootKeyId, count: 16, field: "rootKeyId")
             writer.u64(trustEpoch)
             try writer.fixed(signature, count: 64, field: "signature")
+        case .retirementCommitted(let machineRoute, let trustEpoch, let retireHash):
+            try writer.fixed(machineRoute, count: 16, field: "machineRoute")
+            writer.u64(trustEpoch)
+            try writer.fixed(retireHash, count: 32, field: "retireHash")
         case .ping(let nonce), .pong(let nonce):
             writer.u64(nonce)
         case .routeAccepted(let accepted):
@@ -2192,6 +2242,7 @@ public enum RelayWireCodecV2 {
         case 22:
             body = .retireMachine(
                 machineRoute: try reader.raw(count: 16),
+                rootKeyId: try reader.raw(count: 16),
                 trustEpoch: try reader.u64(),
                 signature: try reader.raw(count: 64)
             )
@@ -2219,6 +2270,12 @@ public enum RelayWireCodecV2 {
                 )
             )
         case 27: body = .serverRestarting(drainDeadlineMs: try reader.u64())
+        case 28:
+            body = .retirementCommitted(
+                machineRoute: try reader.raw(count: 16),
+                trustEpoch: try reader.u64(),
+                retireHash: try reader.raw(count: 32)
+            )
         default: throw RelayWireCodecError.unknownKind(kind)
         }
         guard reader.isAtEnd else {
@@ -2559,7 +2616,8 @@ private let relayFramePayloadKeys: [String: Set<String>] = [
     "grantCommitted": ["deviceRoute", "grantSerial", "grantHash"],
     "revokeDevice": ["revocation"],
     "revocationCommitted": ["deviceRoute", "grantSerial", "signedRevocation"],
-    "retireMachine": ["machineRoute", "trustEpoch", "signature"],
+    "retireMachine": ["machineRoute", "rootKeyId", "trustEpoch", "signature"],
+    "retirementCommitted": ["machineRoute", "trustEpoch", "retireHash"],
     "ping": ["nonce"],
     "pong": ["nonce"],
     "routeAccepted": ["accepted"],

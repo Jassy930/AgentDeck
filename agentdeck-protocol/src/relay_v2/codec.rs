@@ -412,6 +412,7 @@ fn encode_body(w: &mut W, body: &RelayFrameBody) {
         }
         RelayFrameBody::RetireMachine(x) => {
             w.raw(&x.machine_route.0);
+            w.raw(&x.root_key_id.0);
             w.u64(x.trust_epoch.0);
             w.raw(&x.signature.0);
         }
@@ -441,6 +442,11 @@ fn encode_body(w: &mut W, body: &RelayFrameBody) {
             w.opt_str(&x.in_reply_to);
         }
         RelayFrameBody::ServerRestarting(x) => w.u64(x.drain_deadline_ms),
+        RelayFrameBody::RetirementCommitted(x) => {
+            w.raw(&x.machine_route.0);
+            w.u64(x.trust_epoch.0);
+            w.raw(&x.retire_hash);
+        }
     }
 }
 
@@ -588,6 +594,7 @@ fn decode_body(kind: u16, r: &mut R) -> Result<RelayFrameBody, CodecError> {
         }),
         22 => RelayFrameBody::RetireMachine(RetireMachine {
             machine_route: MachineRouteId::from_bytes(r.arr16()?),
+            root_key_id: RootKeyId::from_bytes(r.arr16()?),
             trust_epoch: TrustEpoch::new(r.u64()?),
             signature: Ed25519Signature(r.arr64()?),
         }),
@@ -616,6 +623,11 @@ fn decode_body(kind: u16, r: &mut R) -> Result<RelayFrameBody, CodecError> {
         }),
         27 => RelayFrameBody::ServerRestarting(ServerRestarting {
             drain_deadline_ms: r.u64()?,
+        }),
+        28 => RelayFrameBody::RetirementCommitted(RetirementCommitted {
+            machine_route: MachineRouteId::from_bytes(r.arr16()?),
+            trust_epoch: TrustEpoch::new(r.u64()?),
+            retire_hash: r.arr32()?,
         }),
         other => return Err(CodecError::UnknownKind(other)),
     })

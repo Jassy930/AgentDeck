@@ -10,11 +10,11 @@ use tokio::sync::{mpsc, oneshot};
 use super::model::{
     CommitMachineLinkAuth, ConfirmDeviceAuth, DeviceTrustView, EnrollmentCodeSeed, GrantCommit,
     InstallGrantRecord, MAX_CONTROL_BLOB_BYTES, MachineLinkAuthCommit, MachineRecord,
-    MachineTrustView, MaintenanceReport, PersistAck, PersistPublish, PersistRevocation,
-    PersistSubscription, PersistUnsubscribe, PublishCommit, PurgeMachine, PurgeReadback,
-    RegisterMachine, RelayV2StoreConfig, ReplayPage, ReplayPageRequest, RevocationCommit,
-    StoreError, StoreSnapshot, StreamRecord, StreamRegistration, SubscriptionLease,
-    UnsubscribeCommit, normalize_platform_root_alias,
+    MachineTrustView, MaintenanceReport, PersistAck, PersistPublish, PersistRetirement,
+    PersistRevocation, PersistSubscription, PersistUnsubscribe, PublishCommit, PurgeMachine,
+    PurgeReadback, RegisterMachine, RelayV2StoreConfig, ReplayPage, ReplayPageRequest,
+    RetirementCommit, RevocationCommit, StoreError, StoreSnapshot, StreamRecord,
+    StreamRegistration, SubscriptionLease, UnsubscribeCommit, normalize_platform_root_alias,
 };
 use super::sqlite;
 use agentdeck_protocol::relay_v2::{DeviceRouteId, MachineRouteId, RelayServerId};
@@ -310,16 +310,26 @@ impl RelayStoreHandle {
             .await
     }
 
-    pub async fn purge_machine(&self, request: PurgeMachine) -> Result<PurgeReadback, StoreError> {
-        self.purge_machine_inner(None, request).await
-    }
-
-    pub(crate) async fn purge_machine_authorized(
+    pub(crate) async fn retire_machine_authorized(
         &self,
         owner: &AuthorizationOwner,
-        request: PurgeMachine,
-    ) -> Result<PurgeReadback, StoreError> {
-        self.purge_machine_inner(Some(owner), request).await
+        request: PersistRetirement,
+    ) -> Result<RetirementCommit, StoreError> {
+        if request.retirement_terminal_blob.len() > super::model::MAX_TERMINAL_BLOB_BYTES {
+            return Err(StoreError::InvalidValue {
+                field: "retirement.terminal_blob",
+                reason: "terminal blob exceeds 4 KiB",
+            });
+        }
+        self.dispatch_trust(Some(owner), |reply| StoreCommand::RetireMachine {
+            request,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn purge_machine(&self, request: PurgeMachine) -> Result<PurgeReadback, StoreError> {
+        self.purge_machine_inner(None, request).await
     }
 
     async fn purge_machine_inner(
@@ -469,6 +479,10 @@ enum StoreCommand {
         request: PersistRevocation,
         reply: oneshot::Sender<Result<RevocationCommit, StoreError>>,
     },
+    RetireMachine {
+        request: PersistRetirement,
+        reply: oneshot::Sender<Result<RetirementCommit, StoreError>>,
+    },
     PurgeMachine {
         request: PurgeMachine,
         reply: oneshot::Sender<Result<PurgeReadback, StoreError>>,
@@ -561,6 +575,9 @@ fn run(
             }
             StoreCommand::Revoke { request, reply } => {
                 let _ = reply.send(sqlite::revoke(&mut conn, &config, request));
+            }
+            StoreCommand::RetireMachine { request, reply } => {
+                let _ = reply.send(sqlite::retire_machine(&mut conn, &config, request));
             }
             StoreCommand::PurgeMachine { request, reply } => {
                 let _ = reply.send(sqlite::purge_machine(&mut conn, &config, request));

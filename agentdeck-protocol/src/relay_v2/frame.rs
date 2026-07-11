@@ -8,15 +8,25 @@
 //! 生产 WS outer frame 是固定长度前缀二进制 codec（`codec` 模块）；这里的 serde/JSON
 //! 只用于 schema 生成与调试。`sealedBlob` 对 Relay 不可解析（见 `e2ee`）。
 
-use crate::relay_v2::auth::{DeviceRevocation, Ed25519Signature, RelayGrant, SignedCertificate};
+use crate::e2ee::tbs::{SignedObjectType, ToBeSignedV1};
+use crate::e2ee::{E2EE_FORMAT_VERSION, Enc};
+use crate::relay_v2::RELAY_PROTOCOL_VERSION;
+use crate::relay_v2::auth::{
+    AUTH_SIGNATURE_FORMAT_VERSION, DeviceRevocation, Ed25519Signature, RelayGrant,
+    SignedCertificate,
+};
 use crate::relay_v2::cursor::StreamCursor;
 use crate::relay_v2::failure::RelayFailure;
 use crate::relay_v2::id::{
     ConnectionInstanceId, DeviceRouteId, GrantSerial, MachineRouteId, PairRouteId, RelayServerId,
-    RequestRouteId, StreamGenerationId, StreamRouteId, TrustEpoch, b64_32, b64_vec,
+    RequestRouteId, RootKeyId, StreamGenerationId, StreamRouteId, TrustEpoch, b64_32, b64_vec,
 };
+use crate::runtime::RUNTIME_PROTOCOL_VERSION;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+const MACHINE_RETIREMENT_ROLE_SCOPE: &str = "relay-machine-retirement";
 
 /// 一段对 Relay 不可解析的 canonical sealed bytes（endpoint E2EE codec 才解析）。
 /// wire/JSON 走 base64；二进制 codec 直接携带 bytes。
@@ -280,8 +290,79 @@ pub struct RevocationCommitted {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RetireMachine {
     pub machine_route: MachineRouteId,
+    pub root_key_id: RootKeyId,
     pub trust_epoch: TrustEpoch,
     pub signature: Ed25519Signature,
+}
+
+impl RetireMachine {
+    /// 不含 MachineRoot signature 的退役请求 canonical bytes。
+    pub fn unsigned_canonical_bytes(&self) -> Vec<u8> {
+        let mut encoder = Enc::new();
+        encoder.domain(b"AgentDeck/RetireMachineUnsignedV1\0");
+        encoder.bytes(self.machine_route.as_bytes());
+        encoder.bytes(self.root_key_id.as_bytes());
+        encoder.u64(self.trust_epoch.value());
+        encoder.finish()
+    }
+
+    /// 包含 MachineRoot signature 的完整退役请求 canonical bytes。
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let unsigned = self.unsigned_canonical_bytes();
+        let mut encoder = Enc::new();
+        encoder.domain(b"AgentDeck/RetireMachineV1\0");
+        encoder.bytes(&unsigned);
+        encoder.bytes(&self.signature.0);
+        encoder.finish()
+    }
+
+    pub fn unsigned_canonical_sha256(&self) -> [u8; 32] {
+        Sha256::digest(self.unsigned_canonical_bytes()).into()
+    }
+
+    pub fn canonical_sha256(&self) -> [u8; 32] {
+        Sha256::digest(self.canonical_bytes()).into()
+    }
+
+    /// 构造 MachineRoot 对整机退役请求签名的 canonical [`ToBeSignedV1`]。
+    pub fn to_be_signed_v1(
+        &self,
+        relay_server_id: RelayServerId,
+        root_public_key_fingerprint: [u8; 32],
+    ) -> ToBeSignedV1 {
+        ToBeSignedV1 {
+            object_type: SignedObjectType::RetireMachine,
+            signature_format_version: AUTH_SIGNATURE_FORMAT_VERSION,
+            relay_protocol_version: RELAY_PROTOCOL_VERSION,
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            e2ee_format_version: E2EE_FORMAT_VERSION,
+            relay_server_id,
+            machine_route: self.machine_route,
+            device_route: None,
+            stream_route: None,
+            request_route: None,
+            stream_generation: None,
+            stream_cursor: None,
+            role_scope: MACHINE_RETIREMENT_ROLE_SCOPE.to_owned(),
+            signing_key_fingerprint: root_public_key_fingerprint,
+            root_key_id: self.root_key_id,
+            trust_epoch: self.trust_epoch,
+            serial_or_generation: self.trust_epoch.value(),
+            not_after_ms: None,
+            signed_object_sha256: self.unsigned_canonical_sha256(),
+        }
+    }
+}
+
+/// Relay 只在 machine purge COMMIT 且逐表 readback 通过后生成的终态 ACK。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetirementCommitted {
+    pub machine_route: MachineRouteId,
+    pub trust_epoch: TrustEpoch,
+    #[serde(with = "b64_32")]
+    #[schemars(with = "String")]
+    pub retire_hash: [u8; 32],
 }
 
 // —— Runtime ——
@@ -326,7 +407,7 @@ pub struct ServerRestarting {
     pub drain_deadline_ms: u64,
 }
 
-/// 通用 frame body：六组共 28 个 variant（design core interface）。
+/// 通用 frame body：六组共 29 个 variant（P2.5 追加 retirement commit ACK）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "frameKind", content = "frame", rename_all = "camelCase")]
 pub enum RelayFrameBody {
@@ -364,10 +445,12 @@ pub enum RelayFrameBody {
     RouteAccepted(RouteAccepted),
     Error(RelayFailure),
     ServerRestarting(ServerRestarting),
+    /// 追加到 kind 28，既有 0..=27 判别码保持冻结。
+    RetirementCommitted(RetirementCommitted),
 }
 
 impl RelayFrameBody {
-    /// 二进制 codec 的稳定 frame kind 判别码（`0..=27`，与 wire 契约绑定）。
+    /// 二进制 codec 的稳定 frame kind 判别码（`0..=28`，与 wire 契约绑定）。
     pub fn kind(&self) -> u16 {
         match self {
             RelayFrameBody::Hello(_) => 0,
@@ -398,6 +481,7 @@ impl RelayFrameBody {
             RelayFrameBody::RouteAccepted(_) => 25,
             RelayFrameBody::Error(_) => 26,
             RelayFrameBody::ServerRestarting(_) => 27,
+            RelayFrameBody::RetirementCommitted(_) => 28,
         }
     }
 }

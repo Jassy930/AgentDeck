@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION;
-use agentdeck_protocol::relay_v2::frame::Publish;
+use agentdeck_protocol::relay_v2::frame::{Publish, RetireMachine};
 use agentdeck_protocol::relay_v2::{
     DeviceRevocation, DeviceRouteId, GrantSerial, LinkGeneration, MAX_FRAME_BYTES, MachineRouteId,
     OpaqueRouteFrame, PublicKeyBytes, RelayFrameBody, RelayGrant, RelayServerId, RootKeyId,
@@ -23,9 +23,14 @@ pub const MAX_STREAMS_PER_MACHINE: u64 = 4_096;
 pub const MAX_STREAMS_GLOBAL: u64 = 65_536;
 pub const MAX_SUBSCRIPTIONS_PER_DEVICE: u64 = 4_096;
 pub const MAX_SUBSCRIPTIONS_GLOBAL: u64 = 262_144;
+pub const MAX_DEVICE_ROUTES_PER_MACHINE: u64 = 256;
+pub const MAX_DEVICE_ROUTES_GLOBAL: u64 = 65_536;
+pub const MAX_TERMINAL_BLOB_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetadataLimits {
+    pub max_device_routes_per_machine: u64,
+    pub max_device_routes_global: u64,
     pub max_streams_per_machine: u64,
     pub max_streams_global: u64,
     pub max_subscriptions_per_device: u64,
@@ -35,6 +40,8 @@ pub struct MetadataLimits {
 impl Default for MetadataLimits {
     fn default() -> Self {
         Self {
+            max_device_routes_per_machine: MAX_DEVICE_ROUTES_PER_MACHINE,
+            max_device_routes_global: MAX_DEVICE_ROUTES_GLOBAL,
             max_streams_per_machine: MAX_STREAMS_PER_MACHINE,
             max_streams_global: MAX_STREAMS_GLOBAL,
             max_subscriptions_per_device: MAX_SUBSCRIPTIONS_PER_DEVICE,
@@ -45,7 +52,12 @@ impl Default for MetadataLimits {
 
 impl MetadataLimits {
     pub fn validate(&self) -> Result<(), StoreError> {
-        if self.max_streams_per_machine == 0
+        if self.max_device_routes_per_machine == 0
+            || self.max_device_routes_per_machine > MAX_DEVICE_ROUTES_PER_MACHINE
+            || self.max_device_routes_global == 0
+            || self.max_device_routes_global > MAX_DEVICE_ROUTES_GLOBAL
+            || self.max_device_routes_per_machine > self.max_device_routes_global
+            || self.max_streams_per_machine == 0
             || self.max_streams_per_machine > MAX_STREAMS_PER_MACHINE
             || self.max_streams_global == 0
             || self.max_streams_global > MAX_STREAMS_GLOBAL
@@ -191,6 +203,8 @@ pub enum StoreError {
     WorkerBusy,
     #[error("Relay store worker stopped before replying")]
     WorkerStopped,
+    #[error("Relay trust mutation {operation} may have committed before its result was lost")]
+    CommitOutcomeUnknown { operation: &'static str },
     #[error("Relay store path is already open in this process")]
     StoreAlreadyOpen,
     #[error("Relay trust mutations are owned by the authorization coordinator")]
@@ -262,7 +276,8 @@ impl StoreError {
             | Self::WorkerUnavailable
             | Self::StoreAlreadyOpen
             | Self::AuthorizationOwned
-            | Self::WorkerStopped => "relay.store.unavailable",
+            | Self::WorkerStopped
+            | Self::CommitOutcomeUnknown { .. } => "relay.store.unavailable",
             Self::WorkerBusy => "relay.store.busy",
             Self::InvalidValue { .. } => "relay.store.invalid_value",
             Self::InjectedFault(_) => "relay.store.injected_fault",
@@ -432,6 +447,7 @@ pub enum FaultPoint {
     RegisterMachineAfterCommit,
     InstallGrantBeforeCommit,
     MachineLinkAuthBeforeCommit,
+    MachineLinkAuthAfterCommit,
     DeviceAuthBeforeConfirm,
     RegisterStreamBeforeCommit,
     PublishBeforeCommit,
@@ -440,7 +456,10 @@ pub enum FaultPoint {
     AckBeforeCommit,
     ReplayAfterRead,
     RevokeBeforeCommit,
+    RevokeAfterCommit,
     PurgeBeforeCommit,
+    PurgeAfterCommit,
+    InstallGrantAfterCommit,
     MaintenanceBeforeCommit,
 }
 
@@ -500,6 +519,8 @@ pub struct MachineTrustView {
     pub trust_epoch: TrustEpoch,
     pub highest_link_generation: LinkGeneration,
     pub link_cert_hash: [u8; 32],
+    pub retired: bool,
+    pub retirement_terminal: Option<RetirementTerminalView>,
 }
 
 impl fmt::Debug for MachineTrustView {
@@ -512,7 +533,24 @@ impl fmt::Debug for MachineTrustView {
                 "highest_link_generation",
                 &self.highest_link_generation.value(),
             )
+            .field("retired", &self.retired)
             .field("trust_material", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RetirementTerminalView {
+    pub retirement_hash: [u8; 32],
+    pub retirement_terminal_blob: Vec<u8>,
+}
+
+impl fmt::Debug for RetirementTerminalView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetirementTerminalView")
+            .field("terminal_bytes", &self.retirement_terminal_blob.len())
+            .field("terminal", &"<redacted>")
             .finish()
     }
 }
@@ -527,6 +565,7 @@ pub struct DeviceTrustView {
     pub grant_serial: GrantSerial,
     pub grant_hash: [u8; 32],
     pub revoked: bool,
+    pub revocation_terminal: Option<RevocationTerminalView>,
 }
 
 impl fmt::Debug for DeviceTrustView {
@@ -538,6 +577,22 @@ impl fmt::Debug for DeviceTrustView {
             .field("grant_serial", &self.grant_serial.value())
             .field("revoked", &self.revoked)
             .field("trust_material", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RevocationTerminalView {
+    pub revocation_hash: [u8; 32],
+    pub signed_revocation_blob: Vec<u8>,
+}
+
+impl fmt::Debug for RevocationTerminalView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RevocationTerminalView")
+            .field("terminal_bytes", &self.signed_revocation_blob.len())
+            .field("terminal", &"<redacted>")
             .finish()
     }
 }
@@ -819,7 +874,24 @@ pub struct PurgeMachine {
     pub machine_route: MachineRouteId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistRetirement {
+    pub retirement: RetireMachine,
+    pub retirement_hash: [u8; 32],
+    pub retirement_terminal_blob: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetirementCommit {
+    pub machine_route: MachineRouteId,
+    pub trust_epoch: TrustEpoch,
+    pub retirement_hash: [u8; 32],
+    pub retirement_terminal_blob: Vec<u8>,
+    pub readback: PurgeReadback,
+    pub duplicate: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PurgeReadback {
     pub active_machine_routes: u64,
     pub retired_tombstones: u64,
@@ -828,6 +900,8 @@ pub struct PurgeReadback {
     pub streams: u64,
     pub frames: u64,
     pub subscriptions: u64,
+    pub retirement_hash: Option<[u8; 32]>,
+    pub retirement_terminal_blob: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

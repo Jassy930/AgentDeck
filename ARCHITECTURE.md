@@ -143,7 +143,8 @@ agentdeckd
 - machine/grant/stream/enrollment、Publish/HWM/retention、subscription/ACK、revoke
   tombstone 与 purge readback 分别在 `BEGIN IMMEDIATE` 事务中完成；需要持久化的
   成功只能在 COMMIT 后返回。fault injection tests 固定 COMMIT 前 rollback 与
-  重试/重启幂等语义。
+  COMMIT 后结果未知的 exact canonical retry/重启幂等语义；成功 COMMIT 后不再执行会被
+  上层误判为 rollback 的普通可失败 readback。
 - startup/显式 full maintenance 用 keyset 常量内存遍历并收敛所有硬配额；replay
   只检查并清理目标 stream 的逻辑过期行，正常无过期 replay 不开启写事务。
   P2.6 只负责 full maintenance 周期调度与 lifecycle，不在 actor 内藏永久 timer。
@@ -284,6 +285,47 @@ agentdeckd
 - PairData/Send/Reply 都遵循 target-first：只有目标 bounded writer 接纳后才产生
   `RouteAccepted`；该回执不代表 socket flush、解密、journal、执行或 PairResponse delivered。
   PairRoute/online request 的 Debug 与 failure 同样只暴露通用 code、计数和脱敏短 hash。
+
+### Relay Companion MVP P2.5 授权撤销与退役边界
+
+- P2.5 仍是并列 library contract，不接管 production listener。`DeviceRevocation` 与
+  `RetireMachine` 的 unsigned/full canonical bytes、SHA-256 和 MachineRoot `ToBeSignedV1`
+  由 `agentdeck-protocol` 唯一定义；`RetireMachine` 显式绑定 `rootKeyId`。既有 wire kind
+  0–27 保持不动，严格最小的 `RetirementCommitted(machineRoute, trustEpoch, retireHash)`
+  追加为 kind 28，Rust/Swift 共用 golden fixture。
+- 只有 current、同 trust domain 的 `MachineAccess` 可以 InstallGrant/Revoke/Retire。
+  AuthorizationCoordinator 在同一 active-registry 锁内复核 origin 并建立 device/整机
+  transition fence；然后才读取持久 trust、验 MachineRoot signature 并进入 Store。
+  fault/rollback 恢复旧 generation；只有 SQLite COMMIT 后才永久失效旧 generation。
+- production control path 只接受 typed wire object并自行派生 grant/revocation/retirement
+  hash 与 canonical terminal blob；Store raw mutator只作为事务级测试入口，
+  `AuthorizationCoordinator` 不公开 raw install/revoke/purge 旁路。Install duplicate
+  使用 same serial/same full hash，higher serial才替换；显式 revoke 后同 device route永久
+  tombstone，不能靠 higher serial复活。device metadata硬上限为每 machine 256、全局 65,536。
+- writer 在既有 Data/Control 预算外拥有每连接一个、全 Core 4,096 frames / 16 MiB 的独立
+  terminal reserve。COMMIT 后原子拒绝新普通 enqueue、丢弃尚未出队的 Data/Control、取消
+  replay/subscription，并发送唯一 terminal；最多一个已经交给 socket 的旧 frame可自然完成。
+  terminal flush 后立即关闭，未 flush 从 COMMIT-observed 起最多 2 秒关闭。普通
+  `Invalidated` 不得抢先清掉 terminal；`FailClosedAll`、shutdown、receiver/delivery failure
+  仍立即覆盖。terminal state 与 queued/in-flight delivery 共享一份 immutable bytes；幂等
+  admission 复用既有唯一 drain token，不重复 spawn deadline，connection ID 复用则分配新 epoch。
+- Revocation row保存 exact `RevocationCommitted` outer bytes。只有完整验证 current root-signed
+  grant 与 DeviceSign challenge proof 后才返回该 terminal；伪造者仍只见
+  `relay.auth.invalid_grant`。retired machine tombstone保留公开 root/link proof material、
+  `retirementHash` 与 exact terminal bytes，清除 device grants、revocations、subscriptions、
+  streams、frames、PairRoute 与 data cert active material；旧 exact MachineLink proof只读回
+  retirement terminal，绝不恢复 active route。
+- terminal-only auth outcome 是 coordinator 独占构造的不可克隆 capability；Core 只允许它绑定
+  尚未 active 且 principal 匹配的 pending writer，并复核 terminal kind/route/serial 或 trust epoch。
+  active entry 不能借该 API 被伪造 terminal 关闭。
+- purge 在 COMMIT 前的同一事务内按删除前冻结的 stream key 直查 frame、核对 foreign keys、
+  retirement hash/exact terminal 与
+  `active/retired/grants/revocations/streams/frames/subscriptions = 0/1/0/0/0/0/0`；成功 COMMIT
+  后不再执行可返回普通 rollback error 的 I/O。若 COMMIT/回执结果未知，Store 以同一 canonical
+  request 精确重试；恢复仍失败则不恢复旧 generation，整机 retirement 会终止 Core 以清空
+  PairRoute。未知 route
+  不是成功。admin root-lost purge沿用同一 primitive但 terminal hash为空，详细 authority 与
+  root fingerprint确认留在 P2.7 本机 0600 admin UDS。
 
 ### R1a 隐含约束（供 R2 参考）
 

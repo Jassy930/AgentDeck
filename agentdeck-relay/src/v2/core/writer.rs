@@ -23,6 +23,12 @@ pub const DEFAULT_NORMAL_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_CONTROL_MAX_FRAMES: usize = 16;
 /// 关键 control 的默认预留 byte 上限（1 MiB）。
 pub const DEFAULT_CONTROL_MAX_BYTES: usize = 1024 * 1024;
+/// 单个 revoke/retirement terminal frame 的硬上限（4 KiB）。
+pub const TERMINAL_MAX_BYTES: usize = 4 * 1024;
+/// 全 Core 同时 queued/in-flight terminal 的硬 frame 上限。
+pub const GLOBAL_TERMINAL_MAX_FRAMES: usize = 4_096;
+/// 全 Core 同时 queued/in-flight terminal 的硬 byte 上限（16 MiB）。
+pub const GLOBAL_TERMINAL_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// 一类 frame 的 frame/byte 双重预算。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +85,43 @@ pub enum WriterCloseReason {
     ReceiverDropped,
     DeliveryDropped,
     AllWritersDropped,
+    /// root-signed device revocation terminal 已 flush 或达到 deadline。
+    Revoked,
+    /// root-signed machine retirement terminal 已 flush 或达到 deadline。
+    Retired,
+}
+
+/// 独立 terminal slot 的幂等 admission 结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalAdmission {
+    Staged,
+    Existing,
+}
+
+/// 独立 terminal slot admission 失败。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BeginTerminalError {
+    Closed(WriterCloseReason),
+    Conflict,
+    FrameTooLarge,
+    Capacity,
+    InvalidCloseReason,
+}
+
+impl std::error::Error for BeginTerminalError {}
+
+impl fmt::Display for BeginTerminalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Closed(reason) => write!(formatter, "outbound writer is closed: {reason:?}"),
+            Self::Conflict => formatter.write_str("a different terminal is already staged"),
+            Self::FrameTooLarge => formatter.write_str("terminal frame exceeds hard limit"),
+            Self::Capacity => formatter.write_str("global terminal reserve is exhausted"),
+            Self::InvalidCloseReason => {
+                formatter.write_str("terminal requires revoked or retired close reason")
+            }
+        }
+    }
 }
 
 /// 非等待入队失败。
@@ -164,8 +207,9 @@ impl Usage {
 }
 
 struct QueuedFrame {
-    encoded: Vec<u8>,
+    encoded: Arc<[u8]>,
     class: OutboundClass,
+    terminal_reason: Option<WriterCloseReason>,
     _global: Option<GlobalWriterReservation>,
 }
 
@@ -174,6 +218,7 @@ impl fmt::Debug for QueuedFrame {
         formatter
             .debug_struct("QueuedFrame")
             .field("class", &self.class)
+            .field("terminal", &self.terminal_reason.is_some())
             .field(
                 "encoded",
                 &format_args!("<redacted:{} bytes>", self.encoded.len()),
@@ -186,8 +231,16 @@ struct Inner {
     queue: VecDeque<QueuedFrame>,
     normal_usage: Usage,
     control_usage: Usage,
+    terminal_usage: Usage,
+    terminal_state: Option<TerminalState>,
     close_reason: Option<WriterCloseReason>,
     global_budget: Option<Arc<GlobalWriterBudget>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalState {
+    encoded: Arc<[u8]>,
+    close_reason: WriterCloseReason,
 }
 
 impl Inner {
@@ -205,14 +258,31 @@ impl Inner {
         }
     }
 
+    fn unavailable_reason(&self) -> Option<WriterCloseReason> {
+        self.close_reason.or_else(|| {
+            self.terminal_state
+                .as_ref()
+                .map(|terminal| terminal.close_reason)
+        })
+    }
+
+    fn release_queued(&mut self, frame: &QueuedFrame) {
+        if frame.terminal_reason.is_some() {
+            self.terminal_usage.release(frame.encoded.len());
+        } else {
+            self.usage_mut(frame.class).release(frame.encoded.len());
+        }
+    }
+
     /// 设置 first close reason，清理尚未取出的 frame。
     fn close(&mut self, reason: WriterCloseReason) -> bool {
         if self.close_reason.is_some() {
             return false;
         }
         self.close_reason = Some(reason);
+        self.terminal_state = None;
         while let Some(frame) = self.queue.pop_front() {
-            self.usage_mut(frame.class).release(frame.encoded.len());
+            self.release_queued(&frame);
         }
         true
     }
@@ -225,6 +295,16 @@ fn reserve_global(
 ) -> Result<Option<GlobalWriterReservation>, ()> {
     match &inner.global_budget {
         Some(budget) => budget.try_reserve(class, bytes).map(Some).ok_or(()),
+        None => Ok(None),
+    }
+}
+
+fn reserve_global_terminal(
+    inner: &Inner,
+    bytes: usize,
+) -> Result<Option<GlobalWriterReservation>, ()> {
+    match &inner.global_budget {
+        Some(budget) => budget.try_reserve_terminal(bytes).map(Some).ok_or(()),
         None => Ok(None),
     }
 }
@@ -265,6 +345,27 @@ impl Shared {
         match class {
             OutboundClass::Data => self.normal_budget_changed.notify_waiters(),
             OutboundClass::Control => self.control_budget_changed.notify_waiters(),
+        }
+    }
+
+    fn release_terminal(&self, bytes: usize) {
+        {
+            let mut inner = self.lock();
+            inner.terminal_usage.release(bytes);
+        }
+    }
+
+    fn terminal_flushed(&self, bytes: usize, reason: WriterCloseReason) {
+        let changed = {
+            let mut inner = self.lock();
+            inner.terminal_usage.release(bytes);
+            inner.close(reason)
+        };
+        if changed {
+            self.item_ready.notify_waiters();
+            self.normal_budget_changed.notify_waiters();
+            self.control_budget_changed.notify_waiters();
+            self.closed.notify_waiters();
         }
     }
 
@@ -328,6 +429,7 @@ pub(crate) enum BindGlobalBudgetError {
 /// flush、close 或 drop 时释放。
 pub(crate) struct GlobalWriterBudget {
     limits: OutboundWriterConfig,
+    terminal_limit: WriterBudget,
     usage: Mutex<GlobalUsage>,
 }
 
@@ -335,12 +437,17 @@ pub(crate) struct GlobalWriterBudget {
 struct GlobalUsage {
     normal: Usage,
     control: Usage,
+    terminal: Usage,
 }
 
 impl GlobalWriterBudget {
     pub(crate) fn new(normal: WriterBudget, control: WriterBudget) -> Self {
         Self {
             limits: OutboundWriterConfig { normal, control },
+            terminal_limit: WriterBudget::new(
+                GLOBAL_TERMINAL_MAX_FRAMES,
+                GLOBAL_TERMINAL_MAX_BYTES,
+            ),
             usage: Mutex::new(GlobalUsage::default()),
         }
     }
@@ -365,19 +472,39 @@ impl GlobalWriterBudget {
         drop(usage);
         Some(GlobalWriterReservation {
             budget: Arc::clone(self),
-            class,
+            class: GlobalReservationClass::Ordinary(class),
             bytes,
         })
     }
 
-    fn release(&self, class: OutboundClass, bytes: usize) {
+    fn try_reserve_terminal(self: &Arc<Self>, bytes: usize) -> Option<GlobalWriterReservation> {
+        let mut usage = self
+            .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !usage.terminal.can_reserve(self.terminal_limit, bytes) {
+            return None;
+        }
+        usage.terminal.reserve(bytes);
+        drop(usage);
+        Some(GlobalWriterReservation {
+            budget: Arc::clone(self),
+            class: GlobalReservationClass::Terminal,
+            bytes,
+        })
+    }
+
+    fn release(&self, class: GlobalReservationClass, bytes: usize) {
         let mut usage = self
             .usage
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match class {
-            OutboundClass::Data => usage.normal.release(bytes),
-            OutboundClass::Control => usage.control.release(bytes),
+            GlobalReservationClass::Ordinary(OutboundClass::Data) => usage.normal.release(bytes),
+            GlobalReservationClass::Ordinary(OutboundClass::Control) => {
+                usage.control.release(bytes)
+            }
+            GlobalReservationClass::Terminal => usage.terminal.release(bytes),
         }
     }
 
@@ -395,14 +522,21 @@ impl fmt::Debug for GlobalWriterBudget {
         formatter
             .debug_struct("GlobalWriterBudget")
             .field("limits", &self.limits)
+            .field("terminal_limit", &self.terminal_limit)
             .finish_non_exhaustive()
     }
 }
 
 struct GlobalWriterReservation {
     budget: Arc<GlobalWriterBudget>,
-    class: OutboundClass,
+    class: GlobalReservationClass,
     bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlobalReservationClass {
+    Ordinary(OutboundClass),
+    Terminal,
 }
 
 impl Drop for GlobalWriterReservation {
@@ -437,13 +571,13 @@ impl NormalWriterReservation {
         &mut self,
         frame: OpaqueRouteFrame,
     ) -> Result<(), TryEnqueueError> {
-        if let Some(reason) = self.shared.lock().close_reason {
+        if let Some(reason) = self.shared.lock().unavailable_reason() {
             return Err(TryEnqueueError::Closed(reason));
         }
-        let encoded = encode(&frame);
+        let encoded: Arc<[u8]> = encode(&frame).into();
         let encoded_len = encoded.len();
         let mut inner = self.shared.lock();
-        if let Some(reason) = inner.close_reason {
+        if let Some(reason) = inner.unavailable_reason() {
             return Err(TryEnqueueError::Closed(reason));
         }
         if self.remaining_frames == 0 || encoded_len > self.remaining_bytes {
@@ -471,6 +605,7 @@ impl NormalWriterReservation {
         inner.queue.push_back(QueuedFrame {
             encoded,
             class: OutboundClass::Data,
+            terminal_reason: None,
             _global: global,
         });
         drop(inner);
@@ -513,13 +648,13 @@ impl ControlWriterReservation {
         &mut self,
         frame: OpaqueRouteFrame,
     ) -> Result<(), TryEnqueueError> {
-        if let Some(reason) = self.shared.lock().close_reason {
+        if let Some(reason) = self.shared.lock().unavailable_reason() {
             return Err(TryEnqueueError::Closed(reason));
         }
-        let encoded = encode(&frame);
+        let encoded: Arc<[u8]> = encode(&frame).into();
         let encoded_len = encoded.len();
         let mut inner = self.shared.lock();
-        if let Some(reason) = inner.close_reason {
+        if let Some(reason) = inner.unavailable_reason() {
             return Err(TryEnqueueError::Closed(reason));
         }
         if self.remaining_frames == 0 || encoded_len > self.remaining_bytes {
@@ -548,6 +683,7 @@ impl ControlWriterReservation {
         inner.queue.push_back(QueuedFrame {
             encoded,
             class: OutboundClass::Control,
+            terminal_reason: None,
             _global: global,
         });
         drop(inner);
@@ -589,6 +725,8 @@ impl OutboundWriter {
                 ),
                 normal_usage: Usage::default(),
                 control_usage: Usage::default(),
+                terminal_usage: Usage::default(),
+                terminal_state: None,
                 close_reason: None,
                 global_budget: None,
             }),
@@ -624,6 +762,8 @@ impl OutboundWriter {
         if !inner.queue.is_empty()
             || inner.normal_usage != Usage::default()
             || inner.control_usage != Usage::default()
+            || inner.terminal_usage != Usage::default()
+            || inner.terminal_state.is_some()
         {
             return Err(BindGlobalBudgetError::WriterAlreadyUsed);
         }
@@ -641,10 +781,10 @@ impl OutboundWriter {
     ) -> Result<(), TryEnqueueError> {
         // 已关闭连接不应继续为攻击者反复 canonical encode 大 frame。编码后仍会在
         // 同一把锁内复核 close_reason，以覆盖 fast-path check 后发生的并发 close。
-        if let Some(reason) = self.shared.lock().close_reason {
+        if let Some(reason) = self.shared.lock().unavailable_reason() {
             return Err(TryEnqueueError::Closed(reason));
         }
-        let encoded = encode(&frame);
+        let encoded: Arc<[u8]> = encode(&frame).into();
         let encoded_len = encoded.len();
         let budget = match class {
             OutboundClass::Data => self.shared.config.normal,
@@ -652,7 +792,7 @@ impl OutboundWriter {
         };
 
         let mut inner = self.shared.lock();
-        if let Some(reason) = inner.close_reason {
+        if let Some(reason) = inner.unavailable_reason() {
             return Err(TryEnqueueError::Closed(reason));
         }
         if !inner.usage(class).can_reserve(budget, encoded_len) {
@@ -695,6 +835,7 @@ impl OutboundWriter {
         inner.queue.push_back(QueuedFrame {
             encoded,
             class,
+            terminal_reason: None,
             _global: global,
         });
         drop(inner);
@@ -710,6 +851,78 @@ impl OutboundWriter {
         self.try_enqueue(frame, OutboundClass::Control)
     }
 
+    /// 在 revoke/retirement COMMIT 后接管 writer。
+    ///
+    /// 本操作在一把锁内丢弃所有尚未出队的普通 data/control、拒绝后续普通入队，并把
+    /// 唯一 terminal 放入不受普通预算影响的专用槽。已经被 socket receiver 取出的一个
+    /// pre-COMMIT frame 允许自然完成；terminal 会成为下一次 `recv` 的唯一 frame。
+    pub fn try_begin_terminal(
+        &self,
+        frame: OpaqueRouteFrame,
+        close_reason: WriterCloseReason,
+    ) -> Result<TerminalAdmission, BeginTerminalError> {
+        if !matches!(
+            close_reason,
+            WriterCloseReason::Revoked | WriterCloseReason::Retired
+        ) {
+            return Err(BeginTerminalError::InvalidCloseReason);
+        }
+        if let Some(reason) = self.shared.lock().close_reason {
+            return Err(BeginTerminalError::Closed(reason));
+        }
+
+        let encoded: Arc<[u8]> = encode(&frame).into();
+        if encoded.len() > TERMINAL_MAX_BYTES {
+            return Err(BeginTerminalError::FrameTooLarge);
+        }
+
+        let mut inner = self.shared.lock();
+        if let Some(reason) = inner.close_reason {
+            return Err(BeginTerminalError::Closed(reason));
+        }
+        if let Some(existing) = &inner.terminal_state {
+            return if existing.close_reason == close_reason && existing.encoded == encoded {
+                Ok(TerminalAdmission::Existing)
+            } else {
+                Err(BeginTerminalError::Conflict)
+            };
+        }
+
+        let global = match reserve_global_terminal(&inner, encoded.len()) {
+            Ok(reservation) => reservation,
+            Err(()) => {
+                inner.close(WriterCloseReason::CriticalBackpressure);
+                drop(inner);
+                self.shared.item_ready.notify_waiters();
+                self.shared.normal_budget_changed.notify_waiters();
+                self.shared.control_budget_changed.notify_waiters();
+                self.shared.closed.notify_waiters();
+                return Err(BeginTerminalError::Capacity);
+            }
+        };
+
+        while let Some(queued) = inner.queue.pop_front() {
+            inner.release_queued(&queued);
+        }
+        inner.terminal_usage.reserve(encoded.len());
+        inner.terminal_state = Some(TerminalState {
+            encoded: encoded.clone(),
+            close_reason,
+        });
+        inner.queue.push_back(QueuedFrame {
+            encoded,
+            class: OutboundClass::Control,
+            terminal_reason: Some(close_reason),
+            _global: global,
+        });
+        drop(inner);
+
+        self.shared.normal_budget_changed.notify_waiters();
+        self.shared.control_budget_changed.notify_waiters();
+        self.shared.item_ready.notify_one();
+        Ok(TerminalAdmission::Staged)
+    }
+
     /// 在读取 replay page 前原子预留整页 normal 预算；不足时不关闭 writer，调用方可等待
     /// `wait_for_normal_budget` 后重试。请求超过本 writer 固定上限则立即返回配置错误。
     pub(crate) fn try_reserve_normal(
@@ -722,7 +935,7 @@ impl OutboundWriter {
             return Err(TryReserveWriterError::RequestExceedsLimit);
         }
         let mut inner = self.shared.lock();
-        if let Some(reason) = inner.close_reason {
+        if let Some(reason) = inner.unavailable_reason() {
             return Err(TryReserveWriterError::Closed(reason));
         }
         if !inner.normal_usage.can_reserve_many(limit, frames, bytes) {
@@ -749,7 +962,7 @@ impl OutboundWriter {
             return Err(TryReserveWriterError::RequestExceedsLimit);
         }
         let mut inner = self.shared.lock();
-        if let Some(reason) = inner.close_reason {
+        if let Some(reason) = inner.unavailable_reason() {
             return Err(TryReserveWriterError::Closed(reason));
         }
         if !inner.control_usage.can_reserve_many(limit, frames, bytes) {
@@ -793,7 +1006,7 @@ impl OutboundWriter {
             }
             {
                 let inner = self.shared.lock();
-                if let Some(reason) = inner.close_reason {
+                if let Some(reason) = inner.unavailable_reason() {
                     return Err(WaitForBudgetError::Closed(reason));
                 }
                 let usage = inner.normal_usage;
@@ -849,7 +1062,7 @@ impl OutboundWriter {
             }
             {
                 let inner = self.shared.lock();
-                if let Some(reason) = inner.close_reason {
+                if let Some(reason) = inner.unavailable_reason() {
                     return Err(WaitForBudgetError::Closed(reason));
                 }
                 let usage = inner.control_usage;
@@ -881,6 +1094,11 @@ impl OutboundWriter {
         self.shared.lock().close_reason.is_some()
     }
 
+    pub fn is_terminalizing(&self) -> bool {
+        let inner = self.shared.lock();
+        inner.close_reason.is_none() && inner.terminal_state.is_some()
+    }
+
     pub fn close_reason(&self) -> Option<WriterCloseReason> {
         self.shared.lock().close_reason
     }
@@ -905,6 +1123,11 @@ impl OutboundWriter {
     #[cfg(test)]
     fn queued_len(&self) -> usize {
         self.shared.lock().queue.len()
+    }
+
+    #[cfg(test)]
+    fn terminal_usage(&self) -> Usage {
+        self.shared.lock().terminal_usage
     }
 }
 
@@ -932,6 +1155,8 @@ impl fmt::Debug for OutboundWriter {
             .debug_struct("OutboundWriter")
             .field("normal_usage", &inner.normal_usage)
             .field("control_usage", &inner.control_usage)
+            .field("terminal_usage", &inner.terminal_usage)
+            .field("terminalizing", &inner.terminal_state.is_some())
             .field("queued_frames", &inner.queue.len())
             .field("close_reason", &inner.close_reason)
             .finish()
@@ -956,6 +1181,7 @@ impl OutboundReceiver {
                         shared: Arc::clone(&self.shared),
                         encoded: Some(frame.encoded),
                         class: frame.class,
+                        terminal_reason: frame.terminal_reason,
                         _global: frame._global,
                         flushed: false,
                     });
@@ -1003,8 +1229,9 @@ impl fmt::Debug for OutboundReceiver {
 /// fail-close 连接，不允许静默释放 permit 后继续路由。
 pub struct OutboundDelivery {
     shared: Arc<Shared>,
-    encoded: Option<Vec<u8>>,
+    encoded: Option<Arc<[u8]>>,
     class: OutboundClass,
+    terminal_reason: Option<WriterCloseReason>,
     _global: Option<GlobalWriterReservation>,
     flushed: bool,
 }
@@ -1015,17 +1242,25 @@ impl OutboundDelivery {
     }
 
     pub fn encoded_len(&self) -> usize {
-        self.encoded.as_ref().map_or(0, Vec::len)
+        self.encoded.as_ref().map_or(0, |encoded| encoded.len())
     }
 
     pub fn class(&self) -> OutboundClass {
         self.class
     }
 
+    pub fn is_terminal(&self) -> bool {
+        self.terminal_reason.is_some()
+    }
+
     /// socket write/flush 已成功，释放该帧的 frame + byte 预算。
     pub fn mark_flushed(mut self) {
         let bytes = self.encoded.take().map_or(0, |encoded| encoded.len());
-        self.shared.release(self.class, bytes);
+        if let Some(reason) = self.terminal_reason {
+            self.shared.terminal_flushed(bytes, reason);
+        } else {
+            self.shared.release(self.class, bytes);
+        }
         self.flushed = true;
     }
 }
@@ -1037,7 +1272,11 @@ impl Drop for OutboundDelivery {
         }
         let bytes = self.encoded.take().map_or(0, |encoded| encoded.len());
         self.shared.close(WriterCloseReason::DeliveryDropped);
-        self.shared.release(self.class, bytes);
+        if self.terminal_reason.is_some() {
+            self.shared.release_terminal(bytes);
+        } else {
+            self.shared.release(self.class, bytes);
+        }
     }
 }
 
@@ -1046,6 +1285,7 @@ impl fmt::Debug for OutboundDelivery {
         formatter
             .debug_struct("OutboundDelivery")
             .field("class", &self.class)
+            .field("terminal", &self.terminal_reason.is_some())
             .field(
                 "encoded",
                 &format_args!("<redacted:{} bytes>", self.encoded_len()),
@@ -1467,6 +1707,240 @@ mod tests {
             writer.try_enqueue_data(ping(2)),
             Err(TryEnqueueError::Closed(WriterCloseReason::Lagged))
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_admission_discards_queued_ordinary_frames_and_closes_after_flush() {
+        let (writer, mut receiver) = OutboundWriter::channel();
+        writer.try_enqueue_data(ping(1)).expect("queued data");
+        writer
+            .try_enqueue_control(replay_complete())
+            .expect("queued control");
+
+        assert_eq!(
+            writer
+                .try_begin_terminal(replay_complete(), WriterCloseReason::Revoked)
+                .expect("dedicated terminal slot"),
+            TerminalAdmission::Staged
+        );
+        assert!(writer.is_terminalizing());
+        assert_eq!(writer.usage(OutboundClass::Data), Usage::default());
+        assert_eq!(writer.usage(OutboundClass::Control), Usage::default());
+        assert_eq!(
+            writer.terminal_usage(),
+            Usage {
+                frames: 1,
+                bytes: encode(&replay_complete()).len()
+            }
+        );
+        assert_eq!(
+            writer.try_enqueue_data(ping(2)),
+            Err(TryEnqueueError::Closed(WriterCloseReason::Revoked))
+        );
+
+        let terminal = receiver.recv().await.expect("terminal delivery");
+        assert!(terminal.is_terminal());
+        assert!(matches!(
+            decode(terminal.encoded()).expect("canonical terminal").body,
+            RelayFrameBody::ReplayComplete(_)
+        ));
+        assert_eq!(writer.close_reason(), None, "close waits for flush");
+        terminal.mark_flushed();
+
+        assert_eq!(writer.close_reason(), Some(WriterCloseReason::Revoked));
+        assert_eq!(writer.terminal_usage(), Usage::default());
+        assert!(receiver.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_state_and_delivery_share_one_payload_allocation_and_clear_on_flush() {
+        let (writer, mut receiver) = OutboundWriter::channel();
+        writer
+            .try_begin_terminal(replay_complete(), WriterCloseReason::Revoked)
+            .expect("stage terminal");
+        {
+            let inner = writer.shared.lock();
+            let state = inner.terminal_state.as_ref().expect("terminal state");
+            let queued = inner.queue.front().expect("queued terminal");
+            assert!(Arc::ptr_eq(&state.encoded, &queued.encoded));
+        }
+        let terminal = receiver.recv().await.expect("terminal delivery");
+        {
+            let inner = writer.shared.lock();
+            let state = inner
+                .terminal_state
+                .as_ref()
+                .expect("state while in flight");
+            assert!(Arc::ptr_eq(
+                &state.encoded,
+                terminal.encoded.as_ref().expect("delivery payload"),
+            ));
+        }
+        terminal.mark_flushed();
+        assert!(writer.shared.lock().terminal_state.is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_slot_survives_full_local_and_global_control_budget() {
+        let control_len = encode(&replay_complete()).len();
+        let global = Arc::new(GlobalWriterBudget::new(
+            WriterBudget::new(1, 1024),
+            WriterBudget::new(1, control_len),
+        ));
+        let config = OutboundWriterConfig {
+            normal: WriterBudget::new(1, 1024),
+            control: WriterBudget::new(1, control_len),
+        };
+        let (writer, mut receiver) = OutboundWriter::new(config);
+        writer
+            .bind_global_budget(Arc::clone(&global))
+            .expect("bind unused writer");
+        writer
+            .try_enqueue_control(replay_complete())
+            .expect("fill local and global control");
+
+        writer
+            .try_begin_terminal(replay_complete(), WriterCloseReason::Revoked)
+            .expect("terminal has an independent reserve");
+        assert_eq!(global.current_usage().control, Usage::default());
+        assert_eq!(global.current_usage().terminal.frames, 1);
+
+        let terminal = receiver.recv().await.expect("terminal delivery");
+        assert!(terminal.is_terminal());
+        terminal.mark_flushed();
+        assert_eq!(global.current_usage(), GlobalUsage::default());
+    }
+
+    #[tokio::test]
+    async fn terminal_waits_behind_one_in_flight_frame_but_not_queued_frames() {
+        let (writer, mut receiver) = OutboundWriter::channel();
+        writer
+            .try_enqueue_data(ping(1))
+            .expect("in flight candidate");
+        writer.try_enqueue_data(ping(2)).expect("queued candidate");
+        let in_flight = receiver.recv().await.expect("ordinary in flight");
+
+        writer
+            .try_begin_terminal(replay_complete(), WriterCloseReason::Retired)
+            .expect("stage terminal");
+        assert_eq!(writer.usage(OutboundClass::Data).frames, 1);
+        in_flight.mark_flushed();
+
+        let terminal = receiver.recv().await.expect("terminal follows in-flight");
+        assert!(terminal.is_terminal());
+        terminal.mark_flushed();
+        assert_eq!(writer.close_reason(), Some(WriterCloseReason::Retired));
+    }
+
+    #[tokio::test]
+    async fn identical_terminal_retry_is_idempotent_and_conflict_is_rejected() {
+        let (writer, mut receiver) = OutboundWriter::channel();
+        assert_eq!(
+            writer
+                .try_begin_terminal(replay_complete(), WriterCloseReason::Revoked)
+                .expect("first terminal"),
+            TerminalAdmission::Staged
+        );
+        assert_eq!(
+            writer
+                .try_begin_terminal(replay_complete(), WriterCloseReason::Revoked)
+                .expect("same terminal retry"),
+            TerminalAdmission::Existing
+        );
+        assert_eq!(
+            writer.try_begin_terminal(ping(9), WriterCloseReason::Revoked),
+            Err(BeginTerminalError::Conflict)
+        );
+        assert_eq!(writer.terminal_usage().frames, 1);
+
+        receiver
+            .recv()
+            .await
+            .expect("one terminal only")
+            .mark_flushed();
+        assert_eq!(writer.close_reason(), Some(WriterCloseReason::Revoked));
+    }
+
+    #[tokio::test]
+    async fn dropped_terminal_delivery_fails_closed_and_releases_global_reserve() {
+        let global = Arc::new(GlobalWriterBudget::new(
+            WriterBudget::new(1, 1024),
+            WriterBudget::new(1, 1024),
+        ));
+        let (writer, mut receiver) = OutboundWriter::channel();
+        writer
+            .bind_global_budget(Arc::clone(&global))
+            .expect("bind unused writer");
+        writer
+            .try_begin_terminal(replay_complete(), WriterCloseReason::Revoked)
+            .expect("stage terminal");
+        let terminal = receiver.recv().await.expect("terminal delivery");
+        drop(terminal);
+
+        assert_eq!(
+            writer.close_reason(),
+            Some(WriterCloseReason::DeliveryDropped)
+        );
+        assert_eq!(writer.terminal_usage(), Usage::default());
+        assert_eq!(global.current_usage(), GlobalUsage::default());
+    }
+
+    #[test]
+    fn explicit_close_of_queued_terminal_releases_local_and_global_reserve() {
+        let global = Arc::new(GlobalWriterBudget::new(
+            WriterBudget::new(1, 1024),
+            WriterBudget::new(1, 1024),
+        ));
+        let (writer, _receiver) = OutboundWriter::channel();
+        writer
+            .bind_global_budget(Arc::clone(&global))
+            .expect("bind unused writer");
+        writer
+            .try_begin_terminal(replay_complete(), WriterCloseReason::Retired)
+            .expect("stage terminal");
+        assert!(writer.close(WriterCloseReason::Shutdown));
+
+        assert_eq!(writer.terminal_usage(), Usage::default());
+        assert_eq!(global.current_usage(), GlobalUsage::default());
+    }
+
+    #[test]
+    fn aggregate_terminal_reserve_is_exactly_bounded_by_core_connection_hard_max() {
+        let global = Arc::new(GlobalWriterBudget::new(
+            WriterBudget::new(1, 1024),
+            WriterBudget::new(1, 1024),
+        ));
+        let mut channels = Vec::with_capacity(GLOBAL_TERMINAL_MAX_FRAMES);
+        for _ in 0..GLOBAL_TERMINAL_MAX_FRAMES {
+            let (writer, receiver) = OutboundWriter::channel();
+            writer
+                .bind_global_budget(Arc::clone(&global))
+                .expect("bind unused writer");
+            writer
+                .try_begin_terminal(replay_complete(), WriterCloseReason::Revoked)
+                .expect("within aggregate terminal cap");
+            channels.push((writer, receiver));
+        }
+        assert_eq!(
+            global.current_usage().terminal.frames,
+            GLOBAL_TERMINAL_MAX_FRAMES
+        );
+
+        let (excess, _receiver) = OutboundWriter::channel();
+        excess
+            .bind_global_budget(Arc::clone(&global))
+            .expect("bind excess writer");
+        assert_eq!(
+            excess.try_begin_terminal(replay_complete(), WriterCloseReason::Revoked),
+            Err(BeginTerminalError::Capacity)
+        );
+        assert_eq!(
+            excess.close_reason(),
+            Some(WriterCloseReason::CriticalBackpressure)
+        );
+
+        drop(channels);
+        assert_eq!(global.current_usage(), GlobalUsage::default());
     }
 
     #[tokio::test]

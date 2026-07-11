@@ -141,8 +141,10 @@ trust epoch/link generation gate 和 MachineLinkSign challenge signature。Devic
 tombstone 与 DeviceSign challenge signature。验签通过后仍需 Store CAS/confirm 成功，才会
 原子替换 active connection。`AuthorizationCoordinator` 在 Store mutation 前把 route 标为
 `Transitioning`，这时所有数据面 `is_current` 检查都必须失败；Store 失败只恢复仍在线的旧
-entry，COMMIT 成功后在同一 actor poll 中提交 replacement/invalidation。COMMIT fault、旧
-generation、未安装的 higher grant 或错误签名都不能踢掉旧连接。
+entry；这里只包括明确发生在 COMMIT 前的 rollback。MachineLink COMMIT 或其结果未知时先以
+同 cert hash/generation 精确重试，恢复仍失败则失效旧 entry，绝不能恢复已经低于 SQLite
+最高 generation 的连接。COMMIT 成功后在同一 actor poll 中提交 replacement/invalidation。
+COMMIT 前 fault、旧 generation、未安装的 higher grant 或错误签名都不能踢掉旧连接。
 
 每个 Store 只能有一个 coordinator owner；owner 存活时 raw trust mutator 被拒绝。active
 变更同时写入独立 bounded lifecycle channel，P2.3 Core 必须持续读取并关闭返回的旧 writer。
@@ -251,6 +253,45 @@ TTL 300 秒，另有每 route burst 8、refill 2 frames/s。Close 后 tombstone 
 Pairing 发出 Close 后若 ACK 不确定，可在同一已激活 connection、同 machine/route/expiry 且
 tombstone 未过期时重试，Relay 返回 `AlreadyAbsent`；PairData/Pong 不享受该 terminal 例外，
 route close 后立即不可用。
+
+## Relay v2 Grant / Revoke / Retire 诊断（Companion MVP P2.5）
+
+P2.5 仍未切换 production listener。看到 revocation E2E 通过，只证明 library 的真实签名、
+事务和 writer 生命周期成立，不能解释为当前公网 WSS 已支持撤销。生产 control frame必须来自
+current、同 machine 的 MachineAccess；Device/Pairing 直接发送 InstallGrant、RevokeDevice 或
+RetireMachine 均是 `relay.route.forbidden`。
+
+撤销以 SQLite COMMIT 为计时边界。目标 writer 尚未出队的普通 Data/Control 会被丢弃，唯一
+`RevocationCommitted` 使用独立 terminal slot；flush 后立即关闭，未 flush 最多 2 秒关闭。
+连接先关闭但没有 signed terminal 不能让 endpoint 删除 key；用原 grant + DeviceSign 建立新
+challenge，合法 proof 会只读回同一 terminal，不会出现 `Authenticated`。伪造 proof 只能得到
+`relay.auth.invalid_grant`，不能据 route 探测是否已撤销。
+
+若 COMMIT 已成功但 Store 回执丢失，authorization actor 会用完全相同的 canonical grant、
+revocation 或 retirement 做一次精确幂等恢复；恢复读回的 duplicate 仍按原 mutation 失效旧
+generation。再次失败时 target 不会恢复为 active，整机 retirement 会触发 Core 全局
+fail-close，避免内存 PairRoute 与 SQLite retired tombstone 分叉。排查时不要调用或重新暴露
+coordinator raw mutator；生产只允许 `*_from(current MachineAccess, signed object)`。
+
+RetireMachine 成功后 origin 收到 `RetirementCommitted(machineRoute, trustEpoch, retireHash)`
+terminal，其他同 machine writer与 PairRoute关闭。readback必须是
+`0/1/0/0/0/0/0`；daemon 在收到 matching retireHash 前不得删除本地 MachineRoot/Link材料。
+ACK 丢失时旧 exact MachineLink proof只会重放 terminal；更高 generation、普通 command或重新
+enroll旧 route都不能复活。root-lost admin purge要到 P2.7 的本机 admin UDS执行，不能从公网
+frame伪造。
+
+| v2 revoke code / state | 含义 | 下一步 |
+| --- | --- | --- |
+| `relay.route.forbidden` | role 或 machine trust domain 不匹配 | 拒绝 endpoint 自行改授权；由被控机 daemon 的 current MachineAccess 重发 |
+| `relay.auth.invalid_grant` | root signature、rootKeyId、trustEpoch、serial/hash 或 possession proof 不匹配 | 丢弃 frame；重新读取本机冻结对象，不能修改字段后复用 signature |
+| `relay.store.unavailable` | Store fault/busy、COMMIT 精确恢复仍失败或 purge readback不完整 | 保留本地 key与 frozen request；恢复 Store 后 exact retry，不能假设未提交；旧 access 已 fail-closed |
+| `relay.quota.exceeded` | device metadata或 terminal aggregate hard bound已满 | 先完成受控撤销/整机 purge；禁止调成无界或删除单行绕过 tombstone |
+| writer close=`Revoked` / `Retired` | terminal 已 flush或达到2秒硬 deadline | 只有已验证 terminal/hash才推进本地删 key；单纯 socket close继续重连读取终态 |
+
+若排查 retired tombstone，可只读确认 `status`、root fingerprint、retirement hash与各表计数；
+禁止打印 root pubkey、link hash、terminal bytes或完整 route。P2.5 schema signature因新增最小
+retirement tombstone列而更新；旧的未发布 v2 开发 DB会被严格 schema signature拒绝，应按开发
+环境 reset流程清理并重新配对，不能手改 SQLite schema。
 
 ## Failure Codes
 

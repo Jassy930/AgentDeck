@@ -66,7 +66,8 @@ P2.2 仍不代表 v2 listener 已上线。改动 canonical auth contract、chall
 MachineLink/DeviceLink 验签、Store trust CAS 或 PairingAccess 后至少运行：
 
 ```bash
-# 真实 Ed25519、challenge hard bounds、Store restart/CAS、Transitioning fence、
+# 真实 Ed25519、challenge hard bounds、Store restart/CAS、MachineLink COMMIT前rollback与
+# COMMIT后exact retry/fail-closed、Transitioning fence、
 # singleton owner/store path、caller cancellation、shutdown/Drop、terminal emergency lifecycle、
 # bounded control admission、active replacement、pairing allowlist
 cargo test -p agentdeck-relay --features server \
@@ -204,6 +205,68 @@ Send/Reply 没有任何 commit，不能只比较空表行数。
 for _ in {1..10}; do
   cargo test -q -p agentdeck-relay --features server \
     --test relay_v2_route_e2e -- --test-threads=1 || exit 1
+done
+```
+
+## Relay Companion MVP P2.5 Grant / Revoke / Retire 门禁
+
+改动 root-signed control、auth outcome、terminal writer、retired tombstone 或 purge 后至少运行：
+
+```bash
+# 真实 MachineRoot/MachineLink/DeviceSign；COMMIT fault、terminal独立槽/2秒、restart重放、
+# target-only purge与RetirementCommitted terminal-only reauth
+cargo test -p agentdeck-relay --features server \
+  --test relay_v2_revocation_e2e -- --test-threads=1
+
+# 两种 root-signed object 的 canonical/TBS golden、29种 outer family与最小可见 schema
+cargo test -p agentdeck-protocol --test relay_v2_revocation_canonical_contract
+cargo test -p agentdeck-protocol --test relay_v2_contract
+cargo test -p agentdeck-protocol --test relay_v2_neutrality
+
+# Rust/Swift kind 28、RetireMachine rootKeyId与共享 wire fixture
+swift test --filter RelayV2WireTests
+
+# Store/Auth/Core 全回归；Store测试须串行以稳定注入 transaction fault
+cargo test -p agentdeck-relay --features server --test relay_v2_store -- --test-threads=1
+cargo test -p agentdeck-relay --features server --test relay_v2_auth_e2e -- --test-threads=1
+cargo test -p agentdeck-relay --features server
+cargo test -p agentdeck-protocol
+
+# schema、lint、API docs与静态门禁
+cargo run -q -p agentdeck-cli -- protocol schema \
+  | diff - protocol/agentdeck/agentdeck-protocol.schema.json
+cargo clippy -p agentdeck-relay --features server --lib --no-deps -- -D warnings \
+  -A clippy::needless_return -A clippy::collapsible_if \
+  -A clippy::doc_lazy_continuation -A clippy::explicit_auto_deref
+RUSTDOCFLAGS="-D warnings" cargo doc -p agentdeck-relay --features server --no-deps
+cargo fmt --all --check
+bash scripts/verify-agent-docs.sh
+git diff --check
+```
+
+revocation E2E 必须从真实 current MachineAccess 经 `RelayCore.handle` 进入，不能用 raw Store
+mutation冒充安全证据。必须同时证明：签名/route/trust/serial错误零写入；COMMIT 前 fault恢复旧
+generation与普通 queue；Install/Revoke/Retire 的 COMMIT 后回执丢失由 exact canonical retry
+恢复且不恢复旧 generation；COMMIT后 normal/control满仍只保留一个 terminal；flush立即关闭，
+未 flush不早于约1.75秒且不晚于2.5秒观察窗口；重开 SQLite后合法 possession proof逐字节
+重放，伪造 proof零 terminal。coordinator 公共 API 不得出现未验签 raw install/revoke/purge；
+terminal-only outcome 只能绑定 principal 匹配的 pending writer，不能用于 active entry。
+
+RetireMachine case必须预填两台 machine 的 grant/stream/frame/subscription，只清目标；事务内
+readback须按删除前冻结的 stream keys 直查 frame、执行 `PRAGMA foreign_key_check`、核对 exact
+retirement terminal，并在 SQLite reopen后满足 `0/1/0/0/0/0/0`；同时证明 PairRoute、machine/device
+writer清空，非目标 machine仍能收到 heartbeat。retired proof只能得到 kind 28 terminal，active
+registry保持空。writer单测另须覆盖 queued/in-flight ordinary frame、共享单份 terminal payload、
+幂等 admission 不重复 deadline、delivery/receiver/shutdown释放 terminal预算、普通 lifecycle不抢关、
+emergency fail-close覆盖，以及全局4,096槽硬上限。device route metadata须覆盖 per-machine/global、
+duplicate/higher serial、tombstone占容量与降低限额 reopen fail-closed。
+
+阶段收口重复运行 revocation E2E 10 次：
+
+```bash
+for _ in {1..10}; do
+  cargo test -q -p agentdeck-relay --features server \
+    --test relay_v2_revocation_e2e -- --test-threads=1 || exit 1
 done
 ```
 

@@ -3,7 +3,7 @@
 //! Relay v2 是严格最小可见的外层路由 wire（design §10）。本 task 只定义并列契约：
 //! - 128-bit 随机 route/generation ID（不可比较、不可复用）。
 //! - u64 单调值（trust epoch / link generation / grant serial / key revision）到 MAX 拒绝 wrap。
-//! - 28 个通用 frame family variant 的 `ADRV2` 二进制 codec round-trip + 固定字节 fixture。
+//! - 29 个通用 frame family variant 的 `ADRV2` 二进制 codec round-trip + 固定字节 fixture。
 //! - 公开授权对象（RelayGrant / SignedCertificate / DeviceRevocation）与 enrollment DTO。
 //!
 //! 现有 Relay v1 namespace（`remote::`）本 task 原样保留、彼此独立。
@@ -25,8 +25,8 @@ use agentdeck_protocol::relay_v2::frame::{
     AcceptedRef, Ack, AuthProof, Authenticate, Authenticated, Challenge, ClosePairRoute, Gap,
     GrantCommitted, Hello, InstallGrant, OpaqueRouteFrame, OpenPairRoute, PairData,
     PairRouteCloseOutcome, PairRouteClosed, PairRouteOpened, Ping, Pong, Publish, RegisterStream,
-    RelayFrameBody, ReplayComplete, Reply, RetireMachine, RevocationCommitted, RevokeDevice,
-    RouteAccepted, SealedBlob, Send, ServerRestarting, Subscribe, Unsubscribe,
+    RelayFrameBody, ReplayComplete, Reply, RetireMachine, RetirementCommitted, RevocationCommitted,
+    RevokeDevice, RouteAccepted, SealedBlob, Send, ServerRestarting, Subscribe, Unsubscribe,
 };
 use agentdeck_protocol::relay_v2::id::{
     ConnectionInstanceId, DeviceRouteId, GrantSerial, KeyDirectoryRevision, LinkGeneration,
@@ -117,6 +117,14 @@ fn revocation() -> DeviceRevocation {
         signature: sig(),
     }
 }
+fn retirement() -> RetireMachine {
+    RetireMachine {
+        machine_route: mr(),
+        root_key_id: rk(),
+        trust_epoch: TrustEpoch::new(4),
+        signature: sig(),
+    }
+}
 fn blob() -> SealedBlob {
     SealedBlob(vec![0xDE, 0xAD, 0xBE, 0xEF])
 }
@@ -144,7 +152,7 @@ fn key_directory() -> KeyDirectoryV1 {
     }
 }
 
-/// 每个 frame family 至少一个代表帧，按 RelayFrameBody 定义顺序覆盖全部 28 variant。
+/// 每个 frame family 至少一个代表帧，按 RelayFrameBody 定义顺序覆盖全部 29 variant。
 fn all_bodies() -> Vec<RelayFrameBody> {
     vec![
         // Handshake
@@ -251,10 +259,11 @@ fn all_bodies() -> Vec<RelayFrameBody> {
             grant_serial: GrantSerial::new(9),
             signed_revocation: revocation(),
         }),
-        RelayFrameBody::RetireMachine(RetireMachine {
+        RelayFrameBody::RetireMachine(retirement()),
+        RelayFrameBody::RetirementCommitted(RetirementCommitted {
             machine_route: mr(),
             trust_epoch: TrustEpoch::new(4),
-            signature: sig(),
+            retire_hash: retirement().canonical_sha256(),
         }),
         // Runtime
         RelayFrameBody::Ping(Ping {
@@ -289,7 +298,7 @@ fn outer_family(kind: u16) -> &'static str {
         4..=8 => "pairing",
         9..=15 => "stream",
         16..=17 => "request",
-        18..=22 => "authControl",
+        18..=22 | 28 => "authControl",
         23..=27 => "runtime",
         _ => unreachable!("all_bodies only contains known Relay v2 kinds"),
     }
@@ -471,18 +480,36 @@ fn relay_protocol_version_is_two_and_independent() {
 }
 
 #[test]
-fn all_twenty_eight_variants_covered_with_unique_kinds() {
+fn all_twenty_nine_variants_covered_with_unique_kinds() {
     let bodies = all_bodies();
     assert_eq!(
         bodies.len(),
-        28,
-        "brief lists exactly 28 RelayFrameBody variants"
+        29,
+        "P2.5 contract lists exactly 29 RelayFrameBody variants"
     );
     let kinds: BTreeSet<u16> = bodies.iter().map(|b| b.kind()).collect();
     assert_eq!(
         kinds.len(),
-        28,
+        29,
         "every variant must map to a distinct codec kind"
+    );
+    assert_eq!(
+        RelayFrameBody::RetirementCommitted(RetirementCommitted {
+            machine_route: mr(),
+            trust_epoch: TrustEpoch::new(4),
+            retire_hash: retirement().canonical_sha256(),
+        })
+        .kind(),
+        28,
+        "RetirementCommitted is appended so frozen kinds 0..=27 never move"
+    );
+    assert_eq!(RelayFrameBody::Ping(Ping { nonce: 1 }).kind(), 23);
+    assert_eq!(
+        RelayFrameBody::ServerRestarting(ServerRestarting {
+            drain_deadline_ms: 1,
+        })
+        .kind(),
+        27
     );
 }
 
@@ -708,6 +735,7 @@ const GOLDEN_PAIRDATA: &str = "4144525632000200065555555555555555555555555555555
 const GOLDEN_PUBLISH: &str = "41445256320002000a3333333333333333333333333333333366666666666666666666666666666666000000000000000000000004deadbeef";
 const GOLDEN_SEND: &str = "414452563200020010222222222222222222222222222222224444444444444444444444444444444400000004deadbeef";
 const GOLDEN_INSTALL_GRANT: &str = "4144525632000200121111111111111111111111111111111122222222222222222222222222222222a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a00000000000000009777777777777777777777777777777770000000000000003b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0";
+const GOLDEN_RETIREMENT_COMMITTED: &str = "41445256320002001c111111111111111111111111111111110000000000000004251660b89c346510f961d588109a333495af462064cb7557b35ed2ebecb5e9a4";
 const GOLDEN_PING: &str = "4144525632000200170102030405060708";
 
 fn encode_hex(body: RelayFrameBody) -> String {
@@ -788,6 +816,19 @@ fn fixture_auth_control_install_grant() {
             grant: grant(),
         })),
         GOLDEN_INSTALL_GRANT,
+    );
+}
+
+#[test]
+fn fixture_auth_control_retirement_committed() {
+    check_golden(
+        "retirementCommitted",
+        &encode_hex(RelayFrameBody::RetirementCommitted(RetirementCommitted {
+            machine_route: mr(),
+            trust_epoch: TrustEpoch::new(4),
+            retire_hash: retirement().canonical_sha256(),
+        })),
+        GOLDEN_RETIREMENT_COMMITTED,
     );
 }
 

@@ -6,20 +6,25 @@ use agentdeck_crypto::{
     SignatureBytes, VerifyingKey, sha256, verify_authentication_transcript, verify_tbs,
 };
 use agentdeck_protocol::relay_v2::auth::{
-    AuthenticationRole, AuthenticationTranscriptV1, CertRole,
+    AuthenticationRole, AuthenticationTranscriptV1, CertRole, DeviceRevocation, RelayGrant,
 };
 use agentdeck_protocol::relay_v2::failure::{
     RELAY_AUTH_INVALID_GRANT, RELAY_AUTH_REVOKED, RELAY_STORE_UNAVAILABLE,
 };
-use agentdeck_protocol::relay_v2::frame::{AuthProof, Authenticate};
-use agentdeck_protocol::relay_v2::{RELAY_PROTOCOL_VERSION, RelayFailure};
+use agentdeck_protocol::relay_v2::frame::{
+    AuthProof, Authenticate, OpaqueRouteFrame, RetireMachine, RetirementCommitted,
+    RevocationCommitted,
+};
+use agentdeck_protocol::relay_v2::{
+    RELAY_PROTOCOL_VERSION, RelayFailure, RelayFrameBody, decode, encode,
+};
 
 use super::access::{AccessContext, Activation, DeviceAccess, MachineAccess};
 use super::challenge::{ChallengeRoute, ConsumedChallenge};
 use crate::v2::store::{
     AuthorizationOwner, CommitMachineLinkAuth, ConfirmDeviceAuth, DeviceTrustView, GrantCommit,
-    InstallGrantRecord, MachineRecord, MachineTrustView, PersistRevocation, PurgeMachine,
-    PurgeReadback, RegisterMachine, RelayStoreHandle, RevocationCommit, StoreError,
+    InstallGrantRecord, MachineRecord, MachineTrustView, PersistRetirement, PersistRevocation,
+    RegisterMachine, RelayStoreHandle, RetirementCommit, RevocationCommit, StoreError,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -51,11 +56,35 @@ impl fmt::Debug for AuthenticationTrustView {
     }
 }
 
+enum VerifiedAuthentication {
+    Active(AccessContext),
+    Revoked {
+        access: DeviceAccess,
+        terminal: OpaqueRouteFrame,
+    },
+    Retired {
+        access: MachineAccess,
+        terminal: OpaqueRouteFrame,
+    },
+}
+
 pub fn verify_authentication(
     frame: &Authenticate,
     challenge: &ConsumedChallenge,
     trust: &AuthenticationTrustView,
 ) -> Result<AccessContext, RelayFailure> {
+    match verify_authentication_endpoint(frame, challenge, trust)? {
+        VerifiedAuthentication::Active(access) => Ok(access),
+        VerifiedAuthentication::Revoked { .. } => Err(revoked()),
+        VerifiedAuthentication::Retired { .. } => Err(invalid_grant()),
+    }
+}
+
+fn verify_authentication_endpoint(
+    frame: &Authenticate,
+    challenge: &ConsumedChallenge,
+    trust: &AuthenticationTrustView,
+) -> Result<VerifiedAuthentication, RelayFailure> {
     match (&frame.proof, &trust.trust) {
         (
             AuthProof::MachineLink {
@@ -79,10 +108,13 @@ pub fn verify_authentication(
             }
 
             let cert_hash = link_cert.canonical_sha256();
-            if link_cert.generation < machine.highest_link_generation
+            let credential_rolls_back = link_cert.generation < machine.highest_link_generation
                 || (link_cert.generation == machine.highest_link_generation
-                    && cert_hash != machine.link_cert_hash)
-            {
+                    && cert_hash != machine.link_cert_hash);
+            let retired_credential_mismatch = machine.retired
+                && (link_cert.generation != machine.highest_link_generation
+                    || cert_hash != machine.link_cert_hash);
+            if credential_rolls_back || retired_credential_mismatch {
                 return Err(invalid_grant());
             }
 
@@ -119,13 +151,20 @@ pub fn verify_authentication(
             )
             .map_err(|_| invalid_grant())?;
 
-            Ok(AccessContext::Machine(MachineAccess {
+            let access = MachineAccess {
                 machine_route: *machine_route,
                 connection_instance: challenge.challenge().connection_instance,
                 trust_epoch: machine.trust_epoch,
                 link_generation: link_cert.generation,
                 cert_hash,
-            }))
+            };
+            if machine.retired {
+                let terminal = decode_retirement_terminal(machine)?;
+                return Ok(VerifiedAuthentication::Retired { access, terminal });
+            }
+            Ok(VerifiedAuthentication::Active(AccessContext::Machine(
+                access,
+            )))
         }
         (AuthProof::Device { relay_grant }, AuthenticationTrust::Device(device)) => {
             let expected_route = ChallengeRoute::Device {
@@ -178,18 +217,87 @@ pub fn verify_authentication(
 
             // 只有能证明持有当前、MachineRoot-signed grant 与 DeviceSign 私钥的 endpoint
             // 才能观察 terminal revoked 状态；伪造 route/proof 仍统一折叠为 invalid_grant。
-            if device.revoked {
-                return Err(revoked());
-            }
-
-            Ok(AccessContext::Device(DeviceAccess {
+            let access = DeviceAccess {
                 machine_route: relay_grant.machine_route,
                 device_route: relay_grant.device_route,
                 connection_instance: challenge.challenge().connection_instance,
                 grant_serial: relay_grant.grant_serial,
                 grant_hash,
                 device_sign_fingerprint: device_fingerprint,
-            }))
+            };
+            if device.revoked {
+                let terminal = decode_revocation_terminal(device, &root_key)?;
+                return Ok(VerifiedAuthentication::Revoked { access, terminal });
+            }
+
+            Ok(VerifiedAuthentication::Active(AccessContext::Device(
+                access,
+            )))
+        }
+        _ => Err(invalid_grant()),
+    }
+}
+
+fn decode_revocation_terminal(
+    device: &DeviceTrustView,
+    root_key: &VerifyingKey,
+) -> Result<OpaqueRouteFrame, RelayFailure> {
+    let persisted = device
+        .revocation_terminal
+        .as_ref()
+        .ok_or_else(invalid_grant)?;
+    let terminal = decode(&persisted.signed_revocation_blob).map_err(|_| invalid_grant())?;
+    if encode(&terminal) != persisted.signed_revocation_blob {
+        return Err(invalid_grant());
+    }
+    let RelayFrameBody::RevocationCommitted(committed) = &terminal.body else {
+        return Err(invalid_grant());
+    };
+    let revocation = &committed.signed_revocation;
+    if committed.device_route != device.device_route
+        || committed.grant_serial != device.grant_serial
+        || revocation.machine_route != device.machine.machine_route
+        || revocation.device_route != device.device_route
+        || revocation.grant_serial != device.grant_serial
+        || revocation.root_key_id != device.machine.root_key_id
+        || revocation.trust_epoch != device.machine.trust_epoch
+        || revocation.canonical_sha256() != persisted.revocation_hash
+    {
+        return Err(invalid_grant());
+    }
+    verify_tbs(
+        root_key,
+        &revocation.to_be_signed_v1(
+            device.machine.relay_server_id,
+            sha256(&device.machine.root_pubkey.0),
+        ),
+        &SignatureBytes::from(revocation.signature),
+    )
+    .map_err(|_| invalid_grant())?;
+    Ok(terminal)
+}
+
+fn decode_retirement_terminal(
+    machine: &MachineTrustView,
+) -> Result<OpaqueRouteFrame, RelayFailure> {
+    let persisted = machine
+        .retirement_terminal
+        .as_ref()
+        .ok_or_else(invalid_grant)?;
+    let terminal = decode(&persisted.retirement_terminal_blob).map_err(|_| invalid_grant())?;
+    if encode(&terminal) != persisted.retirement_terminal_blob {
+        return Err(invalid_grant());
+    }
+    match &terminal.body {
+        RelayFrameBody::RetirementCommitted(RetirementCommitted {
+            machine_route,
+            trust_epoch,
+            retire_hash,
+        }) if *machine_route == machine.machine_route
+            && *trust_epoch == machine.trust_epoch
+            && *retire_hash == persisted.retirement_hash =>
+        {
+            Ok(terminal)
         }
         _ => Err(invalid_grant()),
     }
@@ -201,14 +309,46 @@ pub struct AuthenticationActivation {
     pub activation: Activation,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct RevokedAuthentication {
+    pub(crate) access: DeviceAccess,
+    pub(crate) terminal: OpaqueRouteFrame,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct RetiredAuthentication {
+    pub(crate) access: MachineAccess,
+    pub(crate) terminal: OpaqueRouteFrame,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AuthenticationOutcome {
+    Activated(AuthenticationActivation),
+    RevokedTerminal(RevokedAuthentication),
+    RetiredTerminal(RetiredAuthentication),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum PreparedTerminal {
+    Revoked(RevokedAuthentication),
+    Retired(RetiredAuthentication),
+}
+
 pub(super) struct PreparedAuthentication {
     pub(super) access: AccessContext,
     trust: AuthenticationTrust,
+    pub(super) terminal: Option<PreparedTerminal>,
 }
 
 pub(super) struct AuthenticationService {
     store: RelayStoreHandle,
     owner: AuthorizationOwner,
+}
+
+#[derive(Debug)]
+pub(super) enum AuthenticationCommitError {
+    Rollback(RelayFailure),
+    OutcomeUnknown(RelayFailure),
 }
 
 impl fmt::Debug for AuthenticationService {
@@ -251,10 +391,34 @@ impl AuthenticationService {
                 ),
             },
         };
-        let access = verify_authentication(frame, challenge, &trust)?;
+        let verified = verify_authentication_endpoint(frame, challenge, &trust)?;
+        let (access, terminal) = match verified {
+            VerifiedAuthentication::Active(access) => (access, None),
+            VerifiedAuthentication::Revoked { access, terminal } => {
+                let context = AccessContext::Device(access.clone());
+                (
+                    context,
+                    Some(PreparedTerminal::Revoked(RevokedAuthentication {
+                        access,
+                        terminal,
+                    })),
+                )
+            }
+            VerifiedAuthentication::Retired { access, terminal } => {
+                let context = AccessContext::Machine(access.clone());
+                (
+                    context,
+                    Some(PreparedTerminal::Retired(RetiredAuthentication {
+                        access,
+                        terminal,
+                    })),
+                )
+            }
+        };
         Ok(PreparedAuthentication {
             access,
             trust: trust.trust,
+            terminal,
         })
     }
 
@@ -263,30 +427,53 @@ impl AuthenticationService {
     pub(super) async fn commit(
         &self,
         prepared: &PreparedAuthentication,
-    ) -> Result<(), RelayFailure> {
+    ) -> Result<(), AuthenticationCommitError> {
+        if prepared.terminal.is_some() {
+            return Err(AuthenticationCommitError::Rollback(invalid_grant()));
+        }
         match &prepared.access {
             AccessContext::Machine(access) => {
-                self.store
-                    .commit_machine_link_auth_authorized(
-                        &self.owner,
-                        CommitMachineLinkAuth {
-                            machine_route: access.machine_route,
-                            root_key_id: match &prepared.trust {
-                                AuthenticationTrust::Machine(machine) => machine.root_key_id,
-                                AuthenticationTrust::Device(_) => return Err(invalid_grant()),
-                            },
-                            trust_epoch: access.trust_epoch,
-                            generation: access.link_generation,
-                            cert_hash: access.cert_hash,
-                        },
-                    )
+                let request = CommitMachineLinkAuth {
+                    machine_route: access.machine_route,
+                    root_key_id: match &prepared.trust {
+                        AuthenticationTrust::Machine(machine) => machine.root_key_id,
+                        AuthenticationTrust::Device(_) => {
+                            return Err(AuthenticationCommitError::Rollback(invalid_grant()));
+                        }
+                    },
+                    trust_epoch: access.trust_epoch,
+                    generation: access.link_generation,
+                    cert_hash: access.cert_hash,
+                };
+                match self
+                    .store
+                    .commit_machine_link_auth_authorized(&self.owner, request.clone())
                     .await
-                    .map_err(map_store_error)?;
+                {
+                    Ok(_) => {}
+                    Err(unknown @ StoreError::CommitOutcomeUnknown { .. }) => {
+                        if self
+                            .store
+                            .commit_machine_link_auth_authorized(&self.owner, request)
+                            .await
+                            .is_err()
+                        {
+                            return Err(AuthenticationCommitError::OutcomeUnknown(
+                                map_store_error(unknown),
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        return Err(AuthenticationCommitError::Rollback(map_store_error(error)));
+                    }
+                }
             }
             AccessContext::Device(access) => {
                 let device = match &prepared.trust {
                     AuthenticationTrust::Device(device) => device,
-                    AuthenticationTrust::Machine(_) => return Err(invalid_grant()),
+                    AuthenticationTrust::Machine(_) => {
+                        return Err(AuthenticationCommitError::Rollback(invalid_grant()));
+                    }
                 };
                 self.store
                     .confirm_device_auth_authorized(
@@ -301,9 +488,11 @@ impl AuthenticationService {
                         },
                     )
                     .await
-                    .map_err(map_store_error)?;
+                    .map_err(|error| AuthenticationCommitError::Rollback(map_store_error(error)))?;
             }
-            AccessContext::Pairing(_) => return Err(invalid_grant()),
+            AccessContext::Pairing(_) => {
+                return Err(AuthenticationCommitError::Rollback(invalid_grant()));
+            }
         }
         Ok(())
     }
@@ -312,35 +501,187 @@ impl AuthenticationService {
         &self,
         request: RegisterMachine,
     ) -> Result<MachineRecord, StoreError> {
-        self.store
+        let retry = request.clone();
+        match self
+            .store
             .register_machine_authorized(&self.owner, request)
             .await
+        {
+            Err(unknown @ StoreError::CommitOutcomeUnknown { .. }) => self
+                .store
+                .register_machine_authorized(&self.owner, retry)
+                .await
+                .map_err(|_| unknown),
+            result => result,
+        }
+    }
+
+    pub(super) async fn prepare_install_grant(
+        &self,
+        grant: RelayGrant,
+    ) -> Result<InstallGrantRecord, RelayFailure> {
+        let machine = self
+            .store
+            .machine_trust(grant.machine_route)
+            .await
+            .map_err(map_store_error)?;
+        verify_machine_root_object(
+            &machine,
+            grant.root_key_id,
+            grant.trust_epoch,
+            &grant.to_be_signed_v1(machine.relay_server_id, sha256(&machine.root_pubkey.0)),
+            grant.signature,
+        )?;
+        Ok(InstallGrantRecord {
+            grant_hash: grant.canonical_sha256(),
+            grant,
+        })
+    }
+
+    pub(super) async fn prepare_revocation(
+        &self,
+        revocation: DeviceRevocation,
+    ) -> Result<PersistRevocation, RelayFailure> {
+        let machine = self
+            .store
+            .machine_trust(revocation.machine_route)
+            .await
+            .map_err(map_store_error)?;
+        verify_machine_root_object(
+            &machine,
+            revocation.root_key_id,
+            revocation.trust_epoch,
+            &revocation.to_be_signed_v1(machine.relay_server_id, sha256(&machine.root_pubkey.0)),
+            revocation.signature,
+        )?;
+        let revocation_hash = revocation.canonical_sha256();
+        let terminal = OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::RevocationCommitted(RevocationCommitted {
+                device_route: revocation.device_route,
+                grant_serial: revocation.grant_serial,
+                signed_revocation: revocation.clone(),
+            }),
+        };
+        Ok(PersistRevocation {
+            revocation,
+            revocation_hash,
+            signed_revocation_blob: encode(&terminal),
+        })
+    }
+
+    pub(super) async fn prepare_retirement(
+        &self,
+        retirement: RetireMachine,
+    ) -> Result<PersistRetirement, RelayFailure> {
+        let machine = self
+            .store
+            .machine_trust(retirement.machine_route)
+            .await
+            .map_err(map_store_error)?;
+        verify_machine_root_object(
+            &machine,
+            retirement.root_key_id,
+            retirement.trust_epoch,
+            &retirement.to_be_signed_v1(machine.relay_server_id, sha256(&machine.root_pubkey.0)),
+            retirement.signature,
+        )?;
+        let retirement_hash = retirement.canonical_sha256();
+        let terminal = OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::RetirementCommitted(RetirementCommitted {
+                machine_route: retirement.machine_route,
+                trust_epoch: retirement.trust_epoch,
+                retire_hash: retirement_hash,
+            }),
+        };
+        Ok(PersistRetirement {
+            retirement,
+            retirement_hash,
+            retirement_terminal_blob: encode(&terminal),
+        })
     }
 
     pub(super) async fn install_grant(
         &self,
         request: InstallGrantRecord,
     ) -> Result<GrantCommit, StoreError> {
-        self.store
+        let retry = request.clone();
+        match self
+            .store
             .install_grant_authorized(&self.owner, request)
             .await
+        {
+            Err(unknown @ StoreError::CommitOutcomeUnknown { .. }) => {
+                match self
+                    .store
+                    .install_grant_authorized(&self.owner, retry)
+                    .await
+                {
+                    Ok(mut commit) => {
+                        // 第一次 COMMIT 可能已经提升 grant；即使精确重试读回 duplicate，
+                        // coordinator 也必须按 mutation 失效旧 device generation。
+                        commit.duplicate = false;
+                        Ok(commit)
+                    }
+                    Err(_) => Err(unknown),
+                }
+            }
+            result => result,
+        }
     }
 
     pub(super) async fn revoke(
         &self,
         request: PersistRevocation,
     ) -> Result<RevocationCommit, StoreError> {
-        self.store.revoke_authorized(&self.owner, request).await
+        let retry = request.clone();
+        match self.store.revoke_authorized(&self.owner, request).await {
+            Err(unknown @ StoreError::CommitOutcomeUnknown { .. }) => self
+                .store
+                .revoke_authorized(&self.owner, retry)
+                .await
+                .map_err(|_| unknown),
+            result => result,
+        }
     }
 
-    pub(super) async fn purge_machine(
+    pub(super) async fn retire_machine(
         &self,
-        request: PurgeMachine,
-    ) -> Result<PurgeReadback, StoreError> {
-        self.store
-            .purge_machine_authorized(&self.owner, request)
+        request: PersistRetirement,
+    ) -> Result<RetirementCommit, StoreError> {
+        let retry = request.clone();
+        match self
+            .store
+            .retire_machine_authorized(&self.owner, request)
             .await
+        {
+            Err(unknown @ StoreError::CommitOutcomeUnknown { .. }) => self
+                .store
+                .retire_machine_authorized(&self.owner, retry)
+                .await
+                .map_err(|_| unknown),
+            result => result,
+        }
     }
+}
+
+fn verify_machine_root_object(
+    machine: &MachineTrustView,
+    root_key_id: agentdeck_protocol::relay_v2::RootKeyId,
+    trust_epoch: agentdeck_protocol::relay_v2::TrustEpoch,
+    tbs: &agentdeck_protocol::e2ee::ToBeSignedV1,
+    signature: agentdeck_protocol::relay_v2::Ed25519Signature,
+) -> Result<(), RelayFailure> {
+    if machine.retired || root_key_id != machine.root_key_id || trust_epoch != machine.trust_epoch {
+        return Err(invalid_grant());
+    }
+    verify_tbs(
+        &verifying_key(machine.root_pubkey.0)?,
+        tbs,
+        &SignatureBytes::from(signature),
+    )
+    .map_err(|_| invalid_grant())
 }
 
 fn verifying_key(bytes: [u8; 32]) -> Result<VerifyingKey, RelayFailure> {

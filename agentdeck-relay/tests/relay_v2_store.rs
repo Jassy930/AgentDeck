@@ -8,7 +8,8 @@
 //!   DB 分别为 0700/0600；
 //! - worker 报 ready 前必须读回 WAL、FULL、foreign_keys=ON、busy_timeout=5000；
 //! - enrollment/grant/stream/publish/subscription/revoke/purge 均在明确事务边界内；
-//! - count/bytes/age/machine/global/disk、replay page 与 command queue 均有硬上界。
+//! - device route/stream/subscription 的 principal/global count，以及 bytes/age/disk、
+//!   replay page 与 command queue 均有硬上界。
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -77,6 +78,17 @@ fn retained_bytes_for_probe(path: &Path, stream_route: StreamRouteId) -> i64 {
             |row| row.get(0),
         )
         .expect("read maintenance probe sentinel")
+}
+
+fn device_grant_counts(path: &Path) -> (u64, u64) {
+    Connection::open(path)
+        .expect("open device grant count connection")
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(tombstone), 0) FROM device_grants",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read device grant counts")
 }
 
 #[cfg(unix)]
@@ -1297,7 +1309,9 @@ async fn register_machine_after_commit_response_loss_recovers_frozen_response_af
         .expect_err("lost response after COMMIT must surface");
     assert!(matches!(
         injected,
-        StoreError::InjectedFault(FaultPoint::RegisterMachineAfterCommit)
+        StoreError::CommitOutcomeUnknown {
+            operation: "register_machine"
+        }
     ));
     store.shutdown().await.expect("shutdown first worker");
 
@@ -1461,6 +1475,230 @@ async fn register_stream_starts_before_first_is_idempotent_and_rejects_route_reb
 }
 
 #[tokio::test]
+async fn device_route_metadata_has_per_machine_hard_count_without_charging_existing_rows() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let store = RelayStoreHandle::open(fixed_config(&path).with_metadata_limits(MetadataLimits {
+        max_device_routes_per_machine: 2,
+        max_device_routes_global: 3,
+        ..MetadataLimits::default()
+    }))
+    .await
+    .expect("open store");
+    seed_and_register(&store, 0x70).await;
+
+    let first = install_fixture_grant(&store, 0x70, 0x80, 1).await;
+    install_fixture_grant(&store, 0x70, 0x81, 1).await;
+    let duplicate = store
+        .install_grant(first)
+        .await
+        .expect("duplicate at capacity must not consume another row");
+    assert!(duplicate.duplicate);
+    let renewed = store
+        .install_grant(install_grant_request(0x70, 0x80, 2))
+        .await
+        .expect("higher serial at capacity must update the existing row");
+    assert!(!renewed.duplicate);
+
+    let error = store
+        .install_grant(install_grant_request(0x70, 0x82, 1))
+        .await
+        .expect_err("third device route on one machine must exceed its hard count");
+    assert!(matches!(
+        error,
+        StoreError::QuotaExceeded {
+            scope: "device_routes.machine"
+        }
+    ));
+
+    store.shutdown().await.expect("shutdown store");
+    assert_eq!(device_grant_counts(&path), (2, 0));
+}
+
+#[tokio::test]
+async fn device_route_metadata_has_global_hard_count_without_charging_existing_rows() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let store = RelayStoreHandle::open(fixed_config(&path).with_metadata_limits(MetadataLimits {
+        max_device_routes_per_machine: 2,
+        max_device_routes_global: 2,
+        ..MetadataLimits::default()
+    }))
+    .await
+    .expect("open store");
+    for machine_seed in [0x71, 0x72, 0x73] {
+        seed_and_register(&store, machine_seed).await;
+    }
+
+    let first = install_fixture_grant(&store, 0x71, 0x83, 1).await;
+    install_fixture_grant(&store, 0x72, 0x84, 1).await;
+    assert!(
+        store
+            .install_grant(first)
+            .await
+            .expect("duplicate at global capacity must remain idempotent")
+            .duplicate
+    );
+    assert!(
+        !store
+            .install_grant(install_grant_request(0x71, 0x83, 2))
+            .await
+            .expect("higher serial at global capacity must update in place")
+            .duplicate
+    );
+
+    let error = store
+        .install_grant(install_grant_request(0x73, 0x85, 1))
+        .await
+        .expect_err("new route on another machine must observe global hard count");
+    assert!(matches!(
+        error,
+        StoreError::QuotaExceeded {
+            scope: "device_routes.global"
+        }
+    ));
+
+    store.shutdown().await.expect("shutdown store");
+    assert_eq!(device_grant_counts(&path), (2, 0));
+}
+
+#[tokio::test]
+async fn revoked_device_route_tombstones_continue_to_consume_metadata_capacity() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let store = RelayStoreHandle::open(fixed_config(&path).with_metadata_limits(MetadataLimits {
+        max_device_routes_per_machine: 1,
+        max_device_routes_global: 2,
+        ..MetadataLimits::default()
+    }))
+    .await
+    .expect("open store");
+    for machine_seed in [0x74, 0x75, 0x76] {
+        seed_and_register(&store, machine_seed).await;
+    }
+
+    install_fixture_grant(&store, 0x74, 0x86, 1).await;
+    store
+        .revoke(revocation_request(0x74, 0x86, 1))
+        .await
+        .expect("revoke first device route");
+    let machine_error = store
+        .install_grant(install_grant_request(0x74, 0x87, 1))
+        .await
+        .expect_err("a tombstone must continue to occupy per-machine capacity");
+    assert!(matches!(
+        machine_error,
+        StoreError::QuotaExceeded {
+            scope: "device_routes.machine"
+        }
+    ));
+
+    install_fixture_grant(&store, 0x75, 0x88, 1).await;
+    store
+        .revoke(revocation_request(0x75, 0x88, 1))
+        .await
+        .expect("revoke second device route");
+    let global_error = store
+        .install_grant(install_grant_request(0x76, 0x89, 1))
+        .await
+        .expect_err("tombstones on other machines must consume global capacity");
+    assert!(matches!(
+        global_error,
+        StoreError::QuotaExceeded {
+            scope: "device_routes.global"
+        }
+    ));
+
+    store.shutdown().await.expect("shutdown store");
+    assert_eq!(device_grant_counts(&path), (2, 2));
+}
+
+#[tokio::test]
+async fn startup_rejects_existing_device_routes_above_lowered_metadata_limits() {
+    let healthy_disk = Arc::new(FixedDiskProbe(DiskSpace {
+        available_bytes: u64::MAX,
+        total_bytes: u64::MAX,
+    }));
+    let initial_limits = MetadataLimits {
+        max_device_routes_per_machine: 2,
+        max_device_routes_global: 2,
+        ..MetadataLimits::default()
+    };
+
+    let machine_temp = TempDir::new().expect("tempdir");
+    let machine_path = store_path(&machine_temp);
+    let machine_store = RelayStoreHandle::open(
+        fixed_config(&machine_path)
+            .with_metadata_limits(initial_limits)
+            .with_disk_space_probe(healthy_disk.clone()),
+    )
+    .await
+    .expect("open per-machine fixture store");
+    seed_and_register(&machine_store, 0x77).await;
+    install_fixture_grant(&machine_store, 0x77, 0x8a, 1).await;
+    install_fixture_grant(&machine_store, 0x77, 0x8b, 1).await;
+    machine_store
+        .shutdown()
+        .await
+        .expect("shutdown per-machine fixture store");
+
+    let machine_error = RelayStoreHandle::open(
+        fixed_config(&machine_path)
+            .with_metadata_limits(MetadataLimits {
+                max_device_routes_per_machine: 1,
+                ..initial_limits
+            })
+            .with_disk_space_probe(healthy_disk.clone()),
+    )
+    .await
+    .expect_err("lowered per-machine device limit must fail closed on reopen");
+    assert!(matches!(
+        machine_error,
+        StoreError::QuotaExceeded {
+            scope: "device_routes.machine"
+        }
+    ));
+    assert_eq!(device_grant_counts(&machine_path), (2, 0));
+
+    let global_temp = TempDir::new().expect("tempdir");
+    let global_path = store_path(&global_temp);
+    let global_store = RelayStoreHandle::open(
+        fixed_config(&global_path)
+            .with_metadata_limits(initial_limits)
+            .with_disk_space_probe(healthy_disk.clone()),
+    )
+    .await
+    .expect("open global fixture store");
+    for (machine_seed, device_seed) in [(0x78, 0x8c), (0x79, 0x8d)] {
+        seed_and_register(&global_store, machine_seed).await;
+        install_fixture_grant(&global_store, machine_seed, device_seed, 1).await;
+    }
+    global_store
+        .shutdown()
+        .await
+        .expect("shutdown global fixture store");
+
+    let global_error = RelayStoreHandle::open(
+        fixed_config(&global_path)
+            .with_metadata_limits(MetadataLimits {
+                max_device_routes_per_machine: 1,
+                max_device_routes_global: 1,
+                ..initial_limits
+            })
+            .with_disk_space_probe(healthy_disk),
+    )
+    .await
+    .expect_err("lowered global device limit must fail closed on reopen");
+    assert!(matches!(
+        global_error,
+        StoreError::QuotaExceeded {
+            scope: "device_routes.global"
+        }
+    ));
+    assert_eq!(device_grant_counts(&global_path), (2, 0));
+}
+
+#[tokio::test]
 async fn stream_and_subscription_metadata_have_principal_and_global_hard_counts() {
     let temp = TempDir::new().expect("tempdir");
     let path = store_path(&temp);
@@ -1470,6 +1708,7 @@ async fn stream_and_subscription_metadata_have_principal_and_global_hard_counts(
             max_streams_global: 2,
             max_subscriptions_per_device: 2,
             max_subscriptions_global: 2,
+            ..MetadataLimits::default()
         })
         .with_disk_space_probe(Arc::new(FixedDiskProbe(DiskSpace {
             available_bytes: u64::MAX,
@@ -1505,6 +1744,7 @@ async fn stream_and_subscription_metadata_have_principal_and_global_hard_counts(
             max_streams_global: 2,
             max_subscriptions_per_device: 2,
             max_subscriptions_global: 2,
+            ..MetadataLimits::default()
         })
         .with_disk_space_probe(Arc::new(FixedDiskProbe(DiskSpace {
             available_bytes: u64::MAX,
@@ -1531,6 +1771,7 @@ async fn stream_and_subscription_metadata_have_principal_and_global_hard_counts(
             max_streams_global: 3,
             max_subscriptions_per_device: 2,
             max_subscriptions_global: 2,
+            ..MetadataLimits::default()
         })
         .with_disk_space_probe(Arc::new(FixedDiskProbe(DiskSpace {
             available_bytes: u64::MAX,
@@ -1965,6 +2206,7 @@ async fn durable_subscription_rows_have_per_device_hard_count_and_duplicate_retr
             max_streams_global: 2,
             max_subscriptions_per_device: 1,
             max_subscriptions_global: 2,
+            ..MetadataLimits::default()
         })
         .with_disk_space_probe(Arc::new(FixedDiskProbe(DiskSpace {
             available_bytes: u64::MAX,
@@ -2017,6 +2259,7 @@ async fn startup_rejects_existing_metadata_above_lowered_limits() {
         max_streams_global: 2,
         max_subscriptions_per_device: 2,
         max_subscriptions_global: 2,
+        ..MetadataLimits::default()
     };
     let store = RelayStoreHandle::open(
         fixed_config(&path)
@@ -2091,6 +2334,7 @@ async fn startup_rejects_existing_global_metadata_above_lowered_limits() {
         max_streams_global: 2,
         max_subscriptions_per_device: 2,
         max_subscriptions_global: 2,
+        ..MetadataLimits::default()
     };
 
     let stream_temp = TempDir::new().expect("tempdir");
@@ -3779,9 +4023,9 @@ async fn hot_wal_legacy_schema_inspection_requires_reset_and_is_byte_immutable()
 #[tokio::test]
 async fn schema_signature_matches_independent_canonical_ddl_digest_fixture() {
     const EXPECTED_CANONICAL_DDL_SHA256: [u8; 32] = [
-        0x9d, 0xfb, 0xb4, 0x07, 0x3b, 0xac, 0xcb, 0xf8, 0x56, 0x1d, 0xa1, 0x8b, 0x02, 0x6b, 0x78,
-        0x09, 0x70, 0x74, 0xed, 0x75, 0x9e, 0xf4, 0x93, 0x5b, 0x48, 0x80, 0x46, 0x7d, 0x12, 0xbb,
-        0x9f, 0xe2,
+        0x0a, 0x66, 0x67, 0x20, 0x39, 0x4a, 0xfd, 0x28, 0xd4, 0x7d, 0x43, 0x43, 0x90, 0x60, 0xa2,
+        0x08, 0x9c, 0x2d, 0x3f, 0xdc, 0x6b, 0x63, 0x42, 0x27, 0x86, 0x14, 0x44, 0x5c, 0x55, 0xaf,
+        0x54, 0x23,
     ];
 
     let temp = TempDir::new().expect("tempdir");

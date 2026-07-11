@@ -550,12 +550,13 @@
     },
     {
       "case": "retireMachine",
-      "expectedHex": "414452563200020016111111111111111111111111111111110000000000000004b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+      "expectedHex": "41445256320002001611111111111111111111111111111111777777777777777777777777777777770000000000000004b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
       "family": "authControl",
       "input": {
         "body": {
           "frame": {
             "machineRoute": "EREREREREREREREREREREQ==",
+            "rootKeyId": "d3d3d3d3d3d3d3d3d3d3dw==",
             "signature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA==",
             "trustEpoch": 4
           },
@@ -564,6 +565,23 @@
         "version": 2
       },
       "kind": 22
+    },
+    {
+      "case": "retirementCommitted",
+      "expectedHex": "41445256320002001c111111111111111111111111111111110000000000000004251660b89c346510f961d588109a333495af462064cb7557b35ed2ebecb5e9a4",
+      "family": "authControl",
+      "input": {
+        "body": {
+          "frame": {
+            "machineRoute": "EREREREREREREREREREREQ==",
+            "retireHash": "JRZguJw0ZRD5YdWIEJozNJWvRiBky3VXs17S6+y16aQ=",
+            "trustEpoch": 4
+          },
+          "frameKind": "retirementCommitted"
+        },
+        "version": 2
+      },
+      "kind": 28
     },
     {
       "case": "ping",

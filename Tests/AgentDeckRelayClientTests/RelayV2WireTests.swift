@@ -6,7 +6,7 @@ final class RelayV2WireTests: XCTestCase {
     func testEveryRustOuterVectorMatchesBinaryCodecAndRoundTrips() throws {
         let vectors = try loadRelayVectors()
         let outer = try XCTUnwrap(vectors["outerFrames"] as? [[String: Any]])
-        XCTAssertEqual(outer.count, 28)
+        XCTAssertEqual(outer.count, 29)
         XCTAssertEqual(
             Set(outer.compactMap { $0["family"] as? String }),
             ["handshake", "pairing", "stream", "request", "authControl", "runtime"]
@@ -30,6 +30,123 @@ final class RelayV2WireTests: XCTestCase {
                 "Swift binary round-trip drift for \(name)"
             )
         }
+    }
+
+    func testRetirementControlFramesMirrorFrozenRustKindsAndPayloads() throws {
+        let outer = try XCTUnwrap(
+            try loadRelayVectors()["outerFrames"] as? [[String: Any]]
+        )
+        let machineRoute = Data(repeating: 0x11, count: 16)
+        let rootKeyID = Data(repeating: 0x77, count: 16)
+        let signature = Data(repeating: 0xB0, count: 64)
+
+        let retireVector = try XCTUnwrap(
+            outer.first { ($0["case"] as? String) == "retireMachine" }
+        )
+        let retireInput = try JSONSerialization.data(
+            withJSONObject: XCTUnwrap(retireVector["input"])
+        )
+        let retireFrame = try RelayV2JSONCodec.decodeFrame(retireInput)
+        guard case let .retireMachine(route, root, epoch, signed) = retireFrame.body else {
+            return XCTFail("expected RetireMachine")
+        }
+        XCTAssertEqual(route, machineRoute)
+        XCTAssertEqual(root, rootKeyID)
+        XCTAssertEqual(epoch, 4)
+        XCTAssertEqual(signed, signature)
+        XCTAssertEqual(
+            try RelayWireCodecV2.encode(
+                .control(
+                    .retireMachine(
+                        machineRoute: machineRoute,
+                        rootKeyId: rootKeyID,
+                        trustEpoch: 4,
+                        signature: signature
+                    )
+                )
+            ),
+            Data(hex: try XCTUnwrap(retireVector["expectedHex"] as? String))
+        )
+
+        let committedVector = try XCTUnwrap(
+            outer.first { ($0["case"] as? String) == "retirementCommitted" }
+        )
+        let committedInput = try JSONSerialization.data(
+            withJSONObject: XCTUnwrap(committedVector["input"])
+        )
+        let committedFrame = try RelayV2JSONCodec.decodeFrame(committedInput)
+        let retireHash = Data(
+            hex: "251660b89c346510f961d588109a333495af462064cb7557b35ed2ebecb5e9a4"
+        )
+        guard case let .retirementCommitted(route, epoch, hash) = committedFrame.body else {
+            return XCTFail("expected RetirementCommitted")
+        }
+        XCTAssertEqual(route, machineRoute)
+        XCTAssertEqual(epoch, 4)
+        XCTAssertEqual(hash, retireHash)
+
+        let committedWire = try RelayWireCodecV2.encode(
+            .control(
+                .retirementCommitted(
+                    machineRoute: machineRoute,
+                    trustEpoch: 4,
+                    retireHash: retireHash
+                )
+            )
+        )
+        XCTAssertEqual(committedWire[7], 0)
+        XCTAssertEqual(committedWire[8], 28)
+        XCTAssertEqual(
+            committedWire,
+            Data(hex: try XCTUnwrap(committedVector["expectedHex"] as? String))
+        )
+    }
+
+    func testRetirementJSONPayloadsAreStrictAndRootKeyIsRequired() throws {
+        let outer = try XCTUnwrap(
+            try loadRelayVectors()["outerFrames"] as? [[String: Any]]
+        )
+        let retireVector = try XCTUnwrap(
+            outer.first { ($0["case"] as? String) == "retireMachine" }
+        )
+        var retireInput = try XCTUnwrap(retireVector["input"] as? [String: Any])
+        var retireBody = try XCTUnwrap(retireInput["body"] as? [String: Any])
+        var retirePayload = try XCTUnwrap(retireBody["frame"] as? [String: Any])
+        retirePayload["unexpected"] = true
+        retireBody["frame"] = retirePayload
+        retireInput["body"] = retireBody
+        XCTAssertThrowsError(
+            try RelayV2JSONCodec.decodeFrame(
+                try JSONSerialization.data(withJSONObject: retireInput)
+            )
+        )
+
+        retireInput = try XCTUnwrap(retireVector["input"] as? [String: Any])
+        retireBody = try XCTUnwrap(retireInput["body"] as? [String: Any])
+        retirePayload = try XCTUnwrap(retireBody["frame"] as? [String: Any])
+        retirePayload.removeValue(forKey: "rootKeyId")
+        retireBody["frame"] = retirePayload
+        retireInput["body"] = retireBody
+        XCTAssertThrowsError(
+            try RelayV2JSONCodec.decodeFrame(
+                try JSONSerialization.data(withJSONObject: retireInput)
+            )
+        )
+
+        let committedVector = try XCTUnwrap(
+            outer.first { ($0["case"] as? String) == "retirementCommitted" }
+        )
+        var committedInput = try XCTUnwrap(committedVector["input"] as? [String: Any])
+        var committedBody = try XCTUnwrap(committedInput["body"] as? [String: Any])
+        var committedPayload = try XCTUnwrap(committedBody["frame"] as? [String: Any])
+        committedPayload["signedRetirement"] = ["opaque": true]
+        committedBody["frame"] = committedPayload
+        committedInput["body"] = committedBody
+        XCTAssertThrowsError(
+            try RelayV2JSONCodec.decodeFrame(
+                try JSONSerialization.data(withJSONObject: committedInput)
+            )
+        )
     }
 
     func testPublicOutboundFactoriesRequireTypedPayloadsAndMatchP16SealedWire() throws {

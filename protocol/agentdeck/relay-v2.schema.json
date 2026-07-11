@@ -678,7 +678,7 @@
           "type": "object"
         },
         "RelayFrameBody": {
-          "description": "通用 frame body：六组共 28 个 variant（design core interface）。",
+          "description": "通用 frame body：六组共 29 个 variant（P2.5 追加 retirement commit ACK）。",
           "oneOf": [
             {
               "properties": {
@@ -1183,6 +1183,25 @@
                 "frameKind"
               ],
               "type": "object"
+            },
+            {
+              "description": "追加到 kind 28，既有 0..=27 判别码保持冻结。",
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/RetirementCommitted"
+                },
+                "frameKind": {
+                  "enum": [
+                    "retirementCommitted"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -1274,6 +1293,9 @@
             "machineRoute": {
               "type": "string"
             },
+            "rootKeyId": {
+              "type": "string"
+            },
             "signature": {
               "type": "string"
             },
@@ -1285,7 +1307,31 @@
           },
           "required": [
             "machineRoute",
+            "rootKeyId",
             "signature",
+            "trustEpoch"
+          ],
+          "type": "object"
+        },
+        "RetirementCommitted": {
+          "additionalProperties": false,
+          "description": "Relay 只在 machine purge COMMIT 且逐表 readback 通过后生成的终态 ACK。",
+          "properties": {
+            "machineRoute": {
+              "type": "string"
+            },
+            "retireHash": {
+              "type": "string"
+            },
+            "trustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "machineRoute",
+            "retireHash",
             "trustEpoch"
           ],
           "type": "object"
@@ -2133,6 +2179,9 @@
             "machineRoute": {
               "type": "string"
             },
+            "rootKeyId": {
+              "type": "string"
+            },
             "signature": {
               "type": "string"
             },
@@ -2144,7 +2193,31 @@
           },
           "required": [
             "machineRoute",
+            "rootKeyId",
             "signature",
+            "trustEpoch"
+          ],
+          "type": "object"
+        },
+        "RetirementCommitted": {
+          "additionalProperties": false,
+          "description": "Relay 只在 machine purge COMMIT 且逐表 readback 通过后生成的终态 ACK。",
+          "properties": {
+            "machineRoute": {
+              "type": "string"
+            },
+            "retireHash": {
+              "type": "string"
+            },
+            "trustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "machineRoute",
+            "retireHash",
             "trustEpoch"
           ],
           "type": "object"
@@ -2346,7 +2419,7 @@
           "type": "object"
         }
       },
-      "description": "通用 frame body：六组共 28 个 variant（design core interface）。",
+      "description": "通用 frame body：六组共 29 个 variant（P2.5 追加 retirement commit ACK）。",
       "oneOf": [
         {
           "properties": {
@@ -2842,6 +2915,25 @@
             "frameKind": {
               "enum": [
                 "serverRestarting"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "追加到 kind 28，既有 0..=27 判别码保持冻结。",
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/RetirementCommitted"
+            },
+            "frameKind": {
+              "enum": [
+                "retirementCommitted"
               ],
               "type": "string"
             }

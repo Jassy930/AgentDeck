@@ -15,19 +15,20 @@ use agentdeck_protocol::relay_v2::failure::{
     RELAY_STREAM_OUT_OF_ORDER, RELAY_VERSION_UNSUPPORTED,
 };
 use agentdeck_protocol::relay_v2::frame::{
-    AcceptedRef, Ack, ClosePairRoute, Gap, OpenPairRoute, PairData, Ping, Pong, Publish,
-    RegisterStream, ReplayComplete, Reply, RouteAccepted, Send, Subscribe, Unsubscribe,
+    AcceptedRef, Ack, ClosePairRoute, Gap, GrantCommitted, InstallGrant, OpenPairRoute, PairData,
+    Ping, Pong, Publish, RegisterStream, ReplayComplete, Reply, RetireMachine, RouteAccepted, Send,
+    Subscribe, Unsubscribe,
 };
 use agentdeck_protocol::relay_v2::{
     ConnectionInstanceId, DeviceRouteId, GrantSerial, MAX_FRAME_BYTES, MachineRouteId,
     OpaqueRouteFrame, PairRouteId, RELAY_PROTOCOL_VERSION, RelayFailure, RelayFrameBody,
-    StreamCursor, StreamGenerationId, StreamRouteId, encode,
+    StreamCursor, StreamGenerationId, StreamRouteId, decode, encode,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use crate::v2::auth::{
-    AccessContext, AuthorizationCoordinator, AuthorizationLifecycle, AuthorizationLifecycleEvent,
-    PairRouteView, PrincipalRoute,
+    AccessContext, AuthenticationOutcome, AuthorizationCoordinator, AuthorizationLifecycle,
+    AuthorizationLifecycleEvent, PairRouteView, PrincipalRoute,
 };
 use crate::v2::store::{
     PersistAck, PersistPublish, PersistSubscription, PersistUnsubscribe, RelayStoreHandle,
@@ -36,7 +37,7 @@ use crate::v2::store::{
 
 use super::connection::{
     ConnectionCleanup, ConnectionRegistry, ConnectionStateError, LiveDeliveryKind, ReplayAdmission,
-    ReplayStart, ReplayStartMode, StreamKey, SubscriptionPhase,
+    ReplayStart, ReplayStartMode, StreamKey, SubscriptionPhase, TerminalToken,
 };
 use super::lifecycle::CoreTasks;
 use super::pair_route::{PairRouteLimits, PairRouteRegistry};
@@ -45,9 +46,10 @@ use super::replay::{
     ReplayPageReady, fetch_replay_page, initial_replay_ticket, post_terminal_replay_ticket,
 };
 use super::request_route::{RequestTarget, resolve_reply, resolve_send};
+use super::revocation::close_on_terminal_deadline;
 use super::writer::{
-    ControlWriterReservation, GlobalWriterBudget, NormalWriterReservation, TryReserveWriterError,
-    WaitForBudgetError, WriterCloseReason, WriterHandle,
+    ControlWriterReservation, GlobalWriterBudget, NormalWriterReservation, TerminalAdmission,
+    TryReserveWriterError, WaitForBudgetError, WriterCloseReason, WriterHandle,
 };
 
 pub const DEFAULT_CORE_COMMAND_CAPACITY: usize = 256;
@@ -237,6 +239,10 @@ enum CoreCommand {
         access: AccessContext,
         reply: oneshot::Sender<Result<(), RelayFailure>>,
     },
+    ActivateAuthentication {
+        outcome: AuthenticationOutcome,
+        reply: oneshot::Sender<Result<(), RelayFailure>>,
+    },
     PairRouteView {
         pair_route: PairRouteId,
         reply: oneshot::Sender<Result<PairRouteView, RelayFailure>>,
@@ -264,6 +270,10 @@ enum CoreCommand {
     Disconnect {
         connection: ConnectionInstanceId,
         reply: oneshot::Sender<Result<(), RelayFailure>>,
+    },
+    TerminalClosed {
+        connection: ConnectionInstanceId,
+        token: TerminalToken,
     },
     Shutdown {
         reply: oneshot::Sender<Result<(), RelayFailure>>,
@@ -350,6 +360,18 @@ impl RelayCore {
     pub async fn activate(&self, access: AccessContext) -> Result<(), RelayFailure> {
         let (reply, response) = oneshot::channel();
         self.try_send(CoreCommand::Activate { access, reply })?;
+        response
+            .await
+            .map_err(|_| unavailable("Relay Core stopped"))?
+    }
+
+    /// 把 authentication actor 的 active 或 terminal-only 结果绑定到已 attach writer。
+    pub async fn activate_authentication(
+        &self,
+        outcome: AuthenticationOutcome,
+    ) -> Result<(), RelayFailure> {
+        let (reply, response) = oneshot::channel();
+        self.try_send(CoreCommand::ActivateAuthentication { outcome, reply })?;
         response
             .await
             .map_err(|_| unavailable("Relay Core stopped"))?
@@ -527,6 +549,10 @@ impl RelayCoreActor {
                 let result = self.activate(access);
                 let _ = reply.send(result);
             }
+            CoreCommand::ActivateAuthentication { outcome, reply } => {
+                let result = self.activate_authentication(outcome);
+                let _ = reply.send(result);
+            }
             CoreCommand::PairRouteView { pair_route, reply } => {
                 let _ = reply.send(Ok(self.pair_routes.view(pair_route, self.now_ms)));
             }
@@ -555,6 +581,11 @@ impl RelayCoreActor {
             CoreCommand::Disconnect { connection, reply } => {
                 self.close_connection(connection, WriterCloseReason::Disconnected);
                 let _ = reply.send(Ok(()));
+            }
+            CoreCommand::TerminalClosed { connection, token } => {
+                if let Some(cleanup) = self.connections.finish_terminal(connection, token) {
+                    self.finish_cleanup(cleanup);
+                }
             }
             CoreCommand::Shutdown { reply } => {
                 let result = self.graceful_shutdown().await;
@@ -611,6 +642,86 @@ impl RelayCoreActor {
         Ok(())
     }
 
+    fn activate_authentication(
+        &mut self,
+        outcome: AuthenticationOutcome,
+    ) -> Result<(), RelayFailure> {
+        match outcome {
+            AuthenticationOutcome::Activated(activation) => self.activate(activation.access),
+            AuthenticationOutcome::RevokedTerminal(terminal) => self.begin_terminal_reauth(
+                AccessContext::Device(terminal.access),
+                terminal.terminal,
+                WriterCloseReason::Revoked,
+            ),
+            AuthenticationOutcome::RetiredTerminal(terminal) => self.begin_terminal_reauth(
+                AccessContext::Machine(terminal.access),
+                terminal.terminal,
+                WriterCloseReason::Retired,
+            ),
+        }
+    }
+
+    fn begin_terminal_reauth(
+        &mut self,
+        access: AccessContext,
+        frame: OpaqueRouteFrame,
+        close_reason: WriterCloseReason,
+    ) -> Result<(), RelayFailure> {
+        if !terminal_matches_access(&access, &frame, close_reason) {
+            self.close_connection(
+                access.connection_instance(),
+                WriterCloseReason::AuthorizationInvalidated,
+            );
+            return Err(invalid_access());
+        }
+        let connection = access.connection_instance();
+        let staged = self
+            .connections
+            .begin_terminal_reauth(&access, frame, close_reason)
+            .map_err(connection_failure)?;
+        self.spawn_terminal_deadline(connection, staged, close_reason);
+        Ok(())
+    }
+
+    fn begin_terminal(
+        &mut self,
+        connection: ConnectionInstanceId,
+        frame: OpaqueRouteFrame,
+        close_reason: WriterCloseReason,
+    ) -> Result<(), RelayFailure> {
+        if !terminal_matches_reason(&frame, close_reason) {
+            return Err(invalid_access());
+        }
+        let staged = self
+            .connections
+            .begin_terminal(connection, frame, close_reason)
+            .map_err(connection_failure)?;
+        self.spawn_terminal_deadline(connection, staged, close_reason);
+        Ok(())
+    }
+
+    fn spawn_terminal_deadline(
+        &mut self,
+        connection: ConnectionInstanceId,
+        staged: super::connection::TerminalStage,
+        close_reason: WriterCloseReason,
+    ) {
+        if staged.admission == TerminalAdmission::Existing {
+            return;
+        }
+        let token = staged.token;
+        let writer = staged.writer;
+        let weak_tx = self.weak_tx.clone();
+        self.tasks.spawn(async move {
+            let _ = close_on_terminal_deadline(writer, close_reason).await;
+            if let Some(tx) = weak_tx.upgrade() {
+                let _ = tx
+                    .send(CoreCommand::TerminalClosed { connection, token })
+                    .await;
+            }
+        });
+    }
+
     async fn route(
         &mut self,
         access: AccessContext,
@@ -659,8 +770,132 @@ impl RelayCoreActor {
             RelayFrameBody::Ack(frame) => self.ack(&access, frame).await,
             RelayFrameBody::Send(frame) => self.send(&access, frame),
             RelayFrameBody::Reply(frame) => self.reply(&access, frame),
+            RelayFrameBody::InstallGrant(frame) => self.install_grant(&access, frame).await,
+            RelayFrameBody::RevokeDevice(frame) => {
+                self.revoke_device(&access, frame.revocation).await
+            }
+            RelayFrameBody::RetireMachine(frame) => self.retire_machine(&access, frame).await,
             RelayFrameBody::Pong(Pong { nonce }) => self.pong(&access, nonce),
             _ => Err(forbidden()),
+        }
+    }
+
+    async fn install_grant(
+        &mut self,
+        access: &AccessContext,
+        frame: InstallGrant,
+    ) -> Result<RouteOutcome, RelayFailure> {
+        let machine = machine_access(access)?;
+        if frame.grant.machine_route != machine {
+            return Err(forbidden());
+        }
+        let mutation = self
+            .authorization
+            .install_grant_from(access.clone(), frame.grant)
+            .await?;
+        let commit = mutation.commit();
+        let ack = OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::GrantCommitted(GrantCommitted {
+                device_route: commit.device_route,
+                grant_serial: commit.grant_serial,
+                grant_hash: commit.grant_hash,
+            }),
+        };
+        self.enqueue_origin_control(access, ack)
+    }
+
+    async fn revoke_device(
+        &mut self,
+        access: &AccessContext,
+        revocation: agentdeck_protocol::relay_v2::DeviceRevocation,
+    ) -> Result<RouteOutcome, RelayFailure> {
+        let machine = machine_access(access)?;
+        if revocation.machine_route != machine {
+            return Err(forbidden());
+        }
+        let mutation = self
+            .authorization
+            .revoke_from(access.clone(), revocation)
+            .await?;
+        let (commit, targets) = mutation.into_parts();
+        let terminal = decode(&commit.signed_revocation_blob)
+            .map_err(|_| unavailable("persisted revocation terminal is unavailable"))?;
+        for connection in targets {
+            if self
+                .begin_terminal(connection, terminal.clone(), WriterCloseReason::Revoked)
+                .is_err()
+            {
+                self.close_connection(connection, WriterCloseReason::AuthorizationInvalidated);
+            }
+        }
+        self.enqueue_origin_control(access, terminal)
+    }
+
+    async fn retire_machine(
+        &mut self,
+        access: &AccessContext,
+        retirement: RetireMachine,
+    ) -> Result<RouteOutcome, RelayFailure> {
+        let machine = machine_access(access)?;
+        if retirement.machine_route != machine {
+            return Err(forbidden());
+        }
+        let origin = access.connection_instance();
+        let mutation = self
+            .authorization
+            .retire_machine_from(access.clone(), retirement)
+            .await?;
+        let (commit, invalidated) = mutation.into_parts();
+        let terminal = decode(&commit.retirement_terminal_blob)
+            .map_err(|_| unavailable("persisted retirement terminal is unavailable"))?;
+
+        let removed = self.pair_routes.remove_machine(machine);
+        for connection in removed.detached_pairings {
+            self.close_connection(connection, WriterCloseReason::Retired);
+        }
+        for connection in invalidated {
+            if connection == origin {
+                if self
+                    .begin_terminal(connection, terminal.clone(), WriterCloseReason::Retired)
+                    .is_err()
+                {
+                    self.close_connection(connection, WriterCloseReason::Retired);
+                }
+            } else {
+                self.close_connection(connection, WriterCloseReason::Retired);
+            }
+        }
+        Ok(RouteOutcome::Applied)
+    }
+
+    fn enqueue_origin_control(
+        &mut self,
+        access: &AccessContext,
+        frame: OpaqueRouteFrame,
+    ) -> Result<RouteOutcome, RelayFailure> {
+        let Some(writer) = self.connections.writer_for(access) else {
+            return Ok(RouteOutcome::Closed);
+        };
+        match self
+            .authorization
+            .with_current(access, || writer.try_enqueue_control(frame))
+        {
+            Ok(Some(Ok(()))) => Ok(RouteOutcome::Applied),
+            Ok(Some(Err(_))) => {
+                self.close_connection(
+                    access.connection_instance(),
+                    WriterCloseReason::CriticalBackpressure,
+                );
+                Ok(RouteOutcome::Closed)
+            }
+            Ok(None) | Err(_) => {
+                self.close_connection(
+                    access.connection_instance(),
+                    WriterCloseReason::AuthorizationInvalidated,
+                );
+                Ok(RouteOutcome::Closed)
+            }
         }
     }
 
@@ -2016,7 +2251,12 @@ impl RelayCoreActor {
             }
             Some(AuthorizationLifecycleEvent::Invalidated { connections }) => {
                 for connection in connections {
-                    self.close_connection(connection, WriterCloseReason::AuthorizationInvalidated);
+                    if !self.connections.is_terminal(connection) {
+                        self.close_connection(
+                            connection,
+                            WriterCloseReason::AuthorizationInvalidated,
+                        );
+                    }
                 }
                 false
             }
@@ -2037,6 +2277,9 @@ impl RelayCoreActor {
     }
 
     fn ensure_current(&mut self, access: &AccessContext) -> Result<(), RelayFailure> {
+        if self.connections.is_terminal(access.connection_instance()) {
+            return Err(invalid_access());
+        }
         match self.authorization.is_current(access) {
             Ok(true) if self.connections.validates(access) => Ok(()),
             Ok(_) => {
@@ -2151,6 +2394,43 @@ fn device_access(
     }
 }
 
+fn terminal_matches_reason(frame: &OpaqueRouteFrame, reason: WriterCloseReason) -> bool {
+    if frame.version != RELAY_PROTOCOL_VERSION {
+        return false;
+    }
+    match (&frame.body, reason) {
+        (RelayFrameBody::RevocationCommitted(committed), WriterCloseReason::Revoked) => {
+            committed.device_route == committed.signed_revocation.device_route
+                && committed.grant_serial == committed.signed_revocation.grant_serial
+        }
+        (RelayFrameBody::RetirementCommitted(_), WriterCloseReason::Retired) => true,
+        _ => false,
+    }
+}
+
+fn terminal_matches_access(
+    access: &AccessContext,
+    frame: &OpaqueRouteFrame,
+    reason: WriterCloseReason,
+) -> bool {
+    if !terminal_matches_reason(frame, reason) {
+        return false;
+    }
+    match (access, &frame.body) {
+        (AccessContext::Device(access), RelayFrameBody::RevocationCommitted(committed)) => {
+            let signed = &committed.signed_revocation;
+            signed.machine_route == access.machine_route
+                && signed.device_route == access.device_route
+                && signed.grant_serial == access.grant_serial
+        }
+        (AccessContext::Machine(access), RelayFrameBody::RetirementCommitted(committed)) => {
+            committed.machine_route == access.machine_route
+                && committed.trust_epoch == access.trust_epoch
+        }
+        _ => false,
+    }
+}
+
 fn map_store_error(error: StoreError) -> RelayFailure {
     match error {
         StoreError::StreamOwnerConflict
@@ -2205,6 +2485,9 @@ fn connection_failure(error: ConnectionStateError) -> RelayFailure {
         ConnectionStateError::HeartbeatAlreadyPending => {
             unavailable("Relay heartbeat state is unavailable")
         }
+        ConnectionStateError::TerminalRejected => {
+            unavailable("Relay terminal writer state is unavailable")
+        }
     }
 }
 
@@ -2241,6 +2524,79 @@ fn failure(code: &'static str, message: &'static str) -> RelayFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fail_closed_all_overrides_terminal_grace_and_reaps_core_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = RelayStoreHandle::open(crate::v2::store::RelayV2StoreConfig::new(
+            temp.path().join("relay-private").join("relay.db"),
+        ))
+        .await
+        .expect("open store");
+        let (authorization, lifecycle) =
+            AuthorizationCoordinator::start(store.clone(), 8).expect("authorization coordinator");
+        let config = CoreConfig::default();
+        let (tx, _rx) = mpsc::channel(config.command_capacity);
+        let mut actor = RelayCoreActor {
+            store: store.clone(),
+            authorization,
+            lifecycle,
+            connections: ConnectionRegistry::new(config.max_subscriptions_per_connection),
+            pair_routes: PairRouteRegistry::new(store.relay_server_id(), config.pair_route_limits)
+                .expect("pair registry"),
+            config,
+            now_ms: config.initial_now_ms,
+            next_nonce: config.nonce_seed,
+            replay_staging: Arc::new(Semaphore::new(config.replay_staging_pages)),
+            outbound_budget: Arc::new(GlobalWriterBudget::new(
+                super::super::writer::WriterBudget::new(
+                    config.global_normal_max_frames,
+                    config.global_normal_max_bytes,
+                ),
+                super::super::writer::WriterBudget::new(
+                    config.global_control_max_frames,
+                    config.global_control_max_bytes,
+                ),
+            )),
+            weak_tx: tx.downgrade(),
+            tasks: CoreTasks::new(),
+        };
+        let connection = ConnectionInstanceId::from_bytes([0x41; 16]);
+        let (writer, _receiver) = super::super::writer::OutboundWriter::channel();
+        actor
+            .connections
+            .attach_pending(connection, writer.clone(), 0)
+            .expect("attach terminalizing writer");
+        actor
+            .connections
+            .begin_terminal(
+                connection,
+                OpaqueRouteFrame {
+                    version: RELAY_PROTOCOL_VERSION,
+                    body: RelayFrameBody::Pong(Pong { nonce: 1 }),
+                },
+                WriterCloseReason::Retired,
+            )
+            .expect("stage terminal grace");
+        actor.tasks.spawn(std::future::pending());
+
+        assert!(
+            actor.handle_lifecycle(Some(AuthorizationLifecycleEvent::FailClosedAll {
+                connections: vec![connection],
+            },))
+        );
+        assert_eq!(
+            writer.close_reason(),
+            Some(WriterCloseReason::AuthorizationInvalidated),
+            "emergency fail-close must override terminal grace"
+        );
+        assert_eq!(actor.connections.len(), 0);
+
+        actor.fail_closed_shutdown().await;
+        assert!(actor.tasks.is_empty());
+        assert!(actor.tasks.is_cancelled());
+        store.shutdown().await.expect("shutdown store");
+    }
 
     #[test]
     fn core_config_accepts_exact_hard_maxima_and_rejects_every_unbounded_dimension() {
