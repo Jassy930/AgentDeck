@@ -9,7 +9,10 @@
 //!
 //! - Publish/outbound 只接收 [`SignedSealedBlobV1`]（`to_wire_bytes` 只在 Signed 上）。
 //! - AEAD open 只接收 [`VerifiedSealedBlobV1`]（`open_plaintext` 只在 Verified 上）。
-//! - 本 task 只定义类型与转换签名；真实 sign/verify/AEAD 在 P1.4。
+//! - 本 task 只定义类型与转换签名；真实 sign/verify/AEAD 在 P1.4。**P1 fail-closed**：
+//!   `verify` 桩直接返回 `CryptoNotAvailable`，且 `VerifiedSealedBlobV1` 字段私有、
+//!   不派生 `Deserialize`——P1 无法经任何公共 API 构造 Verified 实例；P4 必须显式实现
+//!   真实 Ed25519 验签，链路才能跑通（RC-15）。
 //!
 //! type-state 编译期约束（Unsigned 不能发布、Signed 不能直接 open）：
 //! ```compile_fail
@@ -152,22 +155,29 @@ impl SignedSealedBlobV1 {
 
     /// 验证发送方签名并进入 [`VerifiedSealedBlobV1`]。
     ///
-    /// **P1 边界**：真实 Ed25519 验签在 P1.4 接入——本转换当前只推进 type-state，不做
-    /// 密码学判定；因此即便"verify" 成功，`open_plaintext` 在 P1 仍返回
-    /// `CryptoNotAvailable`，绝不产生未经真实验证的明文。
+    /// **P1 fail-closed 边界**：真实 Ed25519 验签在 P1.4 接入——在此之前本桩直接返回
+    /// `Err(CryptoNotAvailable)`，使 `VerifiedSealedBlobV1` 在 P1 无法经公共 API 构造。
+    /// 这样即使 P4 接入真实 AEAD 时漏改本桩，也不会出现"解密但未验发送方签名"的
+    /// 数据（design RC-15：共享对称 key 不能替代发送方签名）。
+    // SECURITY(P1.4): 接入真实 Ed25519 验签时替换本桩——验签通过才返回
+    // `Ok(VerifiedSealedBlobV1 { inner: self })`，失败返回 `BadSenderSignature`。
     pub fn verify(
         self,
         _verifying_key: &PublicKeyBytes,
     ) -> Result<VerifiedSealedBlobV1, E2eeError> {
-        Ok(VerifiedSealedBlobV1 { inner: self })
+        Err(E2eeError::CryptoNotAvailable)
     }
 }
 
 /// 已验证 sealed blob。AEAD open 只接收本类型。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+///
+/// 字段私有且**不派生 `Deserialize`**：唯一构造入口是
+/// [`SignedSealedBlobV1::verify`]（P1 fail-closed，P1.4 接真实验签）。"已验证"是
+/// 本地密码学判定的结果，不能从 wire 反序列化得到。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VerifiedSealedBlobV1 {
-    pub inner: SignedSealedBlobV1,
+    inner: SignedSealedBlobV1,
 }
 
 impl VerifiedSealedBlobV1 {

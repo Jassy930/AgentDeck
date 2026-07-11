@@ -71,6 +71,24 @@ fn relay_schema_property_names_carry_no_business_fields() {
 }
 
 #[test]
+fn relay_schema_full_text_carries_no_business_words() {
+    // 整串 lowercase 扫描（review Minor #2）：覆盖 enum/const 判别值、`description` 与
+    // 定义名等仅扫 properties key 会漏检的位置。当前禁词表与合法 schema 关键词无冲突
+    // （已验证整串零命中）；若未来某禁词与合法词冲突（如英文 description 中的
+    // "return" 含 "turn"），必须在此逐条显式排除并注释理由，不得直接放宽禁词表。
+    let text = serde_json::to_string(&relay_v2_schema())
+        .unwrap()
+        .to_lowercase();
+    for forbidden in FORBIDDEN_PROPERTY_SUBSTR {
+        assert!(
+            !text.contains(forbidden),
+            "relay v2 schema full text contains business word `{forbidden}` \
+             (check enum values / descriptions / definition names, not only property keys)"
+        );
+    }
+}
+
+#[test]
 fn relay_schema_has_no_size_or_received_at_columns() {
     // §7.3：size / receivedAt 由 Relay 计算，不进 wire。
     let text = serde_json::to_string(&relay_v2_schema()).unwrap();

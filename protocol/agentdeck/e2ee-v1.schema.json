@@ -1692,7 +1692,7 @@
           "type": "object"
         }
       },
-      "description": "已验证 sealed blob。AEAD open 只接收本类型。",
+      "description": "已验证 sealed blob。AEAD open 只接收本类型。\n\n字段私有且**不派生 `Deserialize`**：唯一构造入口是 [`SignedSealedBlobV1::verify`]（P1 fail-closed，P1.4 接真实验签）。\"已验证\"是 本地密码学判定的结果，不能从 wire 反序列化得到。",
       "properties": {
         "inner": {
           "$ref": "#/definitions/SignedSealedBlobV1"

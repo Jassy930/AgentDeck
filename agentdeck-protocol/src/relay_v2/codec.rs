@@ -150,10 +150,10 @@ struct R<'a> {
 
 impl<'a> R<'a> {
     fn need(&self, n: usize) -> Result<(), CodecError> {
-        if self.p + n > self.b.len() {
-            Err(CodecError::ShortInput)
-        } else {
-            Ok(())
+        // checked_add：消除 32-bit usize 上 `p + n` 回绕绕过越界检查的平台假设。
+        match self.p.checked_add(n) {
+            Some(end) if end <= self.b.len() => Ok(()),
+            _ => Err(CodecError::ShortInput),
         }
     }
     fn u8(&mut self) -> Result<u8, CodecError> {
@@ -204,11 +204,13 @@ impl<'a> R<'a> {
     /// 长度前缀 bytes：先读 u32 长度，越界返回 `LengthOutOfBounds`（不 panic）。
     fn bytes(&mut self) -> Result<Vec<u8>, CodecError> {
         let n = self.u32()? as usize;
-        if self.p + n > self.b.len() {
-            return Err(CodecError::LengthOutOfBounds);
-        }
-        let s = self.b[self.p..self.p + n].to_vec();
-        self.p += n;
+        // checked_add：同 `need`，防 32-bit usize 回绕绕过越界检查。
+        let end = match self.p.checked_add(n) {
+            Some(end) if end <= self.b.len() => end,
+            _ => return Err(CodecError::LengthOutOfBounds),
+        };
+        let s = self.b[self.p..end].to_vec();
+        self.p = end;
         Ok(s)
     }
     fn str(&mut self) -> Result<String, CodecError> {

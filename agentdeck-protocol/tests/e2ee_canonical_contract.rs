@@ -94,11 +94,12 @@ fn type_state_progresses_unsigned_signed_verified() {
         "signed blob must serialize to canonical wire bytes"
     );
 
-    // AEAD open only exists on Verified.
-    let verified = signed.verify(&pk()).expect("P1 verify transition");
-    // P1 boundary: no real crypto yet → open reports unavailable, never a silent plaintext.
+    // P1 fail-closed：verify 桩直接返回 CryptoNotAvailable —— VerifiedSealedBlobV1
+    // 在 P1 无法经任何公共 API 构造（字段私有、无 Deserialize）。P4 必须显式实现
+    // 真实 Ed25519 验签，链路才能跑通（RC-15）。`open_plaintext` 只在 Verified 上，
+    // 因此 P1 也不可达（type-state compile_fail doctest 继续证明 Signed 不能 open）。
     assert_eq!(
-        verified.open_plaintext().unwrap_err(),
+        signed.verify(&pk()).unwrap_err(),
         E2eeError::CryptoNotAvailable
     );
 }
