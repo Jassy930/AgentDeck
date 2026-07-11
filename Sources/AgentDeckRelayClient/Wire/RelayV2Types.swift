@@ -13,6 +13,7 @@ public enum RelayWireCodecError: Error, Equatable, Sendable {
     case invalidEnumTag(UInt8)
     case invalidUTF8
     case invalidLength(field: String, expected: Int, actual: Int)
+    case invalidVersion(field: String, expected: UInt16, actual: UInt16)
     case unknownField(String)
 }
 
@@ -21,6 +22,16 @@ public struct RelayV2Hello: Codable, Equatable, Sendable {
 
     public init(protocolVersion: UInt16) {
         self.protocolVersion = protocolVersion
+    }
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case protocolVersion
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
+        protocolVersion = try decoder.container(keyedBy: CodingKeys.self)
+            .decode(UInt16.self, forKey: .protocolVersion)
     }
 }
 
@@ -55,6 +66,22 @@ public struct RelayV2SignedCertificate: Codable, Equatable, Sendable {
         self.notAfterMs = notAfterMs
         self.signature = signature
     }
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case subjectPubkey, certRole, generation, rootKeyId, trustEpoch, notAfterMs, signature
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        subjectPubkey = try container.decode(Data.self, forKey: .subjectPubkey)
+        certRole = try container.decode(RelayV2CertRole.self, forKey: .certRole)
+        generation = try container.decode(UInt64.self, forKey: .generation)
+        rootKeyId = try container.decode(Data.self, forKey: .rootKeyId)
+        trustEpoch = try container.decode(UInt64.self, forKey: .trustEpoch)
+        notAfterMs = try container.decodeIfPresent(UInt64.self, forKey: .notAfterMs)
+        signature = try container.decode(Data.self, forKey: .signature)
+    }
 }
 
 public struct RelayV2Grant: Codable, Equatable, Sendable {
@@ -83,6 +110,23 @@ public struct RelayV2Grant: Codable, Equatable, Sendable {
         self.trustEpoch = trustEpoch
         self.signature = signature
     }
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case machineRoute, deviceRoute, deviceSignPubkey, grantSerial
+        case rootKeyId, trustEpoch, signature
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        machineRoute = try container.decode(Data.self, forKey: .machineRoute)
+        deviceRoute = try container.decode(Data.self, forKey: .deviceRoute)
+        deviceSignPubkey = try container.decode(Data.self, forKey: .deviceSignPubkey)
+        grantSerial = try container.decode(UInt64.self, forKey: .grantSerial)
+        rootKeyId = try container.decode(Data.self, forKey: .rootKeyId)
+        trustEpoch = try container.decode(UInt64.self, forKey: .trustEpoch)
+        signature = try container.decode(Data.self, forKey: .signature)
+    }
 }
 
 public struct RelayV2DeviceRevocation: Codable, Equatable, Sendable {
@@ -108,6 +152,21 @@ public struct RelayV2DeviceRevocation: Codable, Equatable, Sendable {
         self.trustEpoch = trustEpoch
         self.signature = signature
     }
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case machineRoute, deviceRoute, grantSerial, rootKeyId, trustEpoch, signature
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        machineRoute = try container.decode(Data.self, forKey: .machineRoute)
+        deviceRoute = try container.decode(Data.self, forKey: .deviceRoute)
+        grantSerial = try container.decode(UInt64.self, forKey: .grantSerial)
+        rootKeyId = try container.decode(Data.self, forKey: .rootKeyId)
+        trustEpoch = try container.decode(UInt64.self, forKey: .trustEpoch)
+        signature = try container.decode(Data.self, forKey: .signature)
+    }
 }
 
 public enum RelayV2AuthProof: Codable, Equatable, Sendable {
@@ -123,9 +182,16 @@ public enum RelayV2AuthProof: Codable, Equatable, Sendable {
         }
         switch variant.stringValue {
         case "machineLink":
+            let nestedDecoder = try container.superDecoder(forKey: variant)
+            try rejectRelayUnknownKeys(
+                nestedDecoder,
+                allowed: ["machine_route", "link_cert"]
+            )
             let value = try container.decode(MachineLinkProofWire.self, forKey: variant)
             self = .machineLink(machineRoute: value.machine_route, linkCert: value.link_cert)
         case "device":
+            let nestedDecoder = try container.superDecoder(forKey: variant)
+            try rejectRelayUnknownKeys(nestedDecoder, allowed: ["relay_grant"])
             let value = try container.decode(DeviceProofWire.self, forKey: variant)
             self = .device(relayGrant: value.relay_grant)
         default:
@@ -173,12 +239,24 @@ public enum RelayV2AcceptedRef: Codable, Equatable, Sendable {
         }
         switch variant.stringValue {
         case "request":
+            try rejectRelayUnknownKeys(
+                container.superDecoder(forKey: variant),
+                allowed: ["request_route"]
+            )
             let value = try container.decode(RequestAcceptedWire.self, forKey: variant)
             self = .request(requestRoute: value.request_route)
         case "streamFrame":
+            try rejectRelayUnknownKeys(
+                container.superDecoder(forKey: variant),
+                allowed: ["stream_route", "stream_seq"]
+            )
             let value = try container.decode(StreamAcceptedWire.self, forKey: variant)
             self = .streamFrame(streamRoute: value.stream_route, streamSeq: value.stream_seq)
         case "pairFrame":
+            try rejectRelayUnknownKeys(
+                container.superDecoder(forKey: variant),
+                allowed: ["pair_route"]
+            )
             let value = try container.decode(PairAcceptedWire.self, forKey: variant)
             self = .pairFrame(pairRoute: value.pair_route)
         default:
@@ -222,6 +300,18 @@ public struct RelayV2Failure: Codable, Equatable, Sendable {
         self.message = message
         self.inReplyTo = inReplyTo
     }
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case code, message, inReplyTo
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        code = try container.decode(String.self, forKey: .code)
+        message = try container.decode(String.self, forKey: .message)
+        inReplyTo = try container.decodeIfPresent(String.self, forKey: .inReplyTo)
+    }
 }
 
 public enum RelayEndpointWireType: String, Sendable {
@@ -250,6 +340,31 @@ public struct RelayPairInviteV1: Codable, Sendable {
     public var machineRootFingerprint: Data
     public var dataSignCert: RelayV2SignedCertificate
     public var machineDisplayName: String
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case formatVersion, relayProtocolVersion, pairRoute, inviteSecret, inviteHpkePubkey
+        case wssUrl, relayServerId, currentSpkiPin, nextSpkiPin, expiresAtMs
+        case machineRootPubkey, machineRootFingerprint, dataSignCert, machineDisplayName
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        formatVersion = try container.decode(UInt16.self, forKey: .formatVersion)
+        relayProtocolVersion = try container.decode(UInt16.self, forKey: .relayProtocolVersion)
+        pairRoute = try container.decode(Data.self, forKey: .pairRoute)
+        inviteSecret = try container.decode(Data.self, forKey: .inviteSecret)
+        inviteHpkePubkey = try container.decode(Data.self, forKey: .inviteHpkePubkey)
+        wssUrl = try container.decode(String.self, forKey: .wssUrl)
+        relayServerId = try container.decode(Data.self, forKey: .relayServerId)
+        currentSpkiPin = try container.decode(Data.self, forKey: .currentSpkiPin)
+        nextSpkiPin = try container.decode(Data.self, forKey: .nextSpkiPin)
+        expiresAtMs = try container.decode(UInt64.self, forKey: .expiresAtMs)
+        machineRootPubkey = try container.decode(Data.self, forKey: .machineRootPubkey)
+        machineRootFingerprint = try container.decode(Data.self, forKey: .machineRootFingerprint)
+        dataSignCert = try container.decode(RelayV2SignedCertificate.self, forKey: .dataSignCert)
+        machineDisplayName = try container.decode(String.self, forKey: .machineDisplayName)
+    }
 }
 
 public struct RelayPairRequestV1: Codable, Sendable {
@@ -259,6 +374,25 @@ public struct RelayPairRequestV1: Codable, Sendable {
     public var deviceHpkePubkey: Data
     public var sealedAuthorizationRequest: Data
     public var proofSignature: Data
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case formatVersion, inviteSecret, deviceSignPubkey, deviceHpkePubkey
+        case sealedAuthorizationRequest, proofSignature
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        formatVersion = try container.decode(UInt16.self, forKey: .formatVersion)
+        inviteSecret = try container.decode(Data.self, forKey: .inviteSecret)
+        deviceSignPubkey = try container.decode(Data.self, forKey: .deviceSignPubkey)
+        deviceHpkePubkey = try container.decode(Data.self, forKey: .deviceHpkePubkey)
+        sealedAuthorizationRequest = try container.decode(
+            Data.self,
+            forKey: .sealedAuthorizationRequest
+        )
+        proofSignature = try container.decode(Data.self, forKey: .proofSignature)
+    }
 }
 
 public struct RelayDeviceAuthorizationV1: Codable, Sendable {
@@ -269,6 +403,23 @@ public struct RelayDeviceAuthorizationV1: Codable, Sendable {
     public var rootKeyId: Data
     public var trustEpoch: UInt64
     public var signature: Data
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case grantSerial, deviceHpkePubkey, capabilities, permissions
+        case rootKeyId, trustEpoch, signature
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        grantSerial = try container.decode(UInt64.self, forKey: .grantSerial)
+        deviceHpkePubkey = try container.decode(Data.self, forKey: .deviceHpkePubkey)
+        capabilities = try container.decode([String].self, forKey: .capabilities)
+        permissions = try container.decode([String].self, forKey: .permissions)
+        rootKeyId = try container.decode(Data.self, forKey: .rootKeyId)
+        trustEpoch = try container.decode(UInt64.self, forKey: .trustEpoch)
+        signature = try container.decode(Data.self, forKey: .signature)
+    }
 }
 
 public struct RelayKeyDirectoryEntryV1: Codable, Sendable {
@@ -276,12 +427,37 @@ public struct RelayKeyDirectoryEntryV1: Codable, Sendable {
     public var deviceRoute: Data
     public var enc: Data
     public var wrappedKey: Data
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case keyId, deviceRoute, enc, wrappedKey
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        keyId = try container.decode(KeyIDV1.self, forKey: .keyId)
+        deviceRoute = try container.decode(Data.self, forKey: .deviceRoute)
+        enc = try container.decode(Data.self, forKey: .enc)
+        wrappedKey = try container.decode(Data.self, forKey: .wrappedKey)
+    }
 }
 
 public struct RelayKeyDirectoryV1: Codable, Sendable {
     public var revision: UInt64
     public var entries: [RelayKeyDirectoryEntryV1]
     public var signature: Data
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case revision, entries, signature
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        revision = try container.decode(UInt64.self, forKey: .revision)
+        entries = try container.decode([RelayKeyDirectoryEntryV1].self, forKey: .entries)
+        signature = try container.decode(Data.self, forKey: .signature)
+    }
 }
 
 public struct RelayPairResponseV1: Codable, Sendable {
@@ -290,6 +466,23 @@ public struct RelayPairResponseV1: Codable, Sendable {
     public var sealedDeviceAuthorization: Data
     public var keyDirectory: RelayKeyDirectoryV1
     public var signature: Data
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case requestHash, relayGrant, sealedDeviceAuthorization, keyDirectory, signature
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        requestHash = try container.decode(Data.self, forKey: .requestHash)
+        relayGrant = try container.decode(RelayV2Grant.self, forKey: .relayGrant)
+        sealedDeviceAuthorization = try container.decode(
+            Data.self,
+            forKey: .sealedDeviceAuthorization
+        )
+        keyDirectory = try container.decode(RelayKeyDirectoryV1.self, forKey: .keyDirectory)
+        signature = try container.decode(Data.self, forKey: .signature)
+    }
 }
 
 public struct RelayKeyUpdateV1: Codable, Sendable {
@@ -299,6 +492,21 @@ public struct RelayKeyUpdateV1: Codable, Sendable {
     public var enc: Data
     public var wrappedKey: Data
     public var signature: Data
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case keyDirectoryRevision, keyId, deviceRoute, enc, wrappedKey, signature
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        keyDirectoryRevision = try container.decode(UInt64.self, forKey: .keyDirectoryRevision)
+        keyId = try container.decode(KeyIDV1.self, forKey: .keyId)
+        deviceRoute = try container.decode(Data.self, forKey: .deviceRoute)
+        enc = try container.decode(Data.self, forKey: .enc)
+        wrappedKey = try container.decode(Data.self, forKey: .wrappedKey)
+        signature = try container.decode(Data.self, forKey: .signature)
+    }
 }
 
 public struct RelayEpochBarrierV1: Codable, Sendable {
@@ -308,11 +516,37 @@ public struct RelayEpochBarrierV1: Codable, Sendable {
     public var oldEpoch: UInt64
     public var newEpoch: UInt64
     public var keyDirectoryRevision: UInt64
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case streamGeneration, streamCursor, eventSeq, oldEpoch, newEpoch, keyDirectoryRevision
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        streamGeneration = try container.decode(Data.self, forKey: .streamGeneration)
+        streamCursor = try container.decode(StreamCursor.self, forKey: .streamCursor)
+        eventSeq = try container.decode(UInt64.self, forKey: .eventSeq)
+        oldEpoch = try container.decode(UInt64.self, forKey: .oldEpoch)
+        newEpoch = try container.decode(UInt64.self, forKey: .newEpoch)
+        keyDirectoryRevision = try container.decode(UInt64.self, forKey: .keyDirectoryRevision)
+    }
 }
 
 public struct RelaySealedPayloadV1: Codable, Sendable {
     public var formatVersion: UInt16
     public var payloadKind: SealedPayloadKind
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case formatVersion, payloadKind
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        formatVersion = try container.decode(UInt16.self, forKey: .formatVersion)
+        payloadKind = try container.decode(SealedPayloadKind.self, forKey: .payloadKind)
+    }
 }
 
 public enum RelayEndpointPayloadV1: Sendable {
@@ -333,6 +567,17 @@ public struct RelayV2Frame: Codable, Equatable, Sendable {
     public init(version: UInt16, body: RelayV2FrameBody) {
         self.version = version
         self.body = body
+    }
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case version, body
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decode(UInt16.self, forKey: .version)
+        body = try container.decode(RelayV2FrameBody.self, forKey: .body)
     }
 }
 
@@ -403,13 +648,21 @@ public enum RelayV2FrameBody: Codable, Equatable, Sendable {
         }
     }
 
-    private enum CodingKeys: String, CodingKey {
+    private enum CodingKeys: String, CodingKey, CaseIterable {
         case frameKind, frame
     }
 
     public init(from decoder: Decoder) throws {
+        try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        switch try container.decode(String.self, forKey: .frameKind) {
+        let frameKind = try container.decode(String.self, forKey: .frameKind)
+        if let allowed = relayFramePayloadKeys[frameKind] {
+            try rejectRelayUnknownKeys(
+                container.superDecoder(forKey: .frame),
+                allowed: allowed
+            )
+        }
+        switch frameKind {
         case "hello": self = .hello(try container.decode(RelayV2Hello.self, forKey: .frame))
         case "challenge":
             let value = try container.decode(ChallengeWire.self, forKey: .frame)
@@ -737,6 +990,248 @@ public enum RelayV2FrameBody: Codable, Equatable, Sendable {
     }
 }
 
+/// Public outbound control surface. Data-bearing pair/publish/request frames are deliberately
+/// absent; those can only be built through `RelayV2OutboundFrame` typed factories below.
+public enum RelayV2OutboundControlFrame: Sendable {
+    case hello(RelayV2Hello)
+    case challenge(relayServerId: Data, connectionInstance: Data, challengeNonce: Data)
+    case authenticate(proof: RelayV2AuthProof, signature: Data)
+    case authenticated(heartbeatIntervalSecs: UInt16)
+    case openPairRoute(machineRoute: Data, pairRoute: Data, absoluteExpiryMs: UInt64)
+    case pairRouteOpened(machineRoute: Data, pairRoute: Data, absoluteExpiryMs: UInt64)
+    case closePairRoute(machineRoute: Data, pairRoute: Data)
+    case pairRouteClosed(pairRoute: Data, outcome: RelayV2PairRouteCloseOutcome)
+    case registerStream(machineRoute: Data, streamRoute: Data, generation: Data)
+    case subscribe(streamRoute: Data, generation: Data, cursor: StreamCursor)
+    case unsubscribe(streamRoute: Data, generation: Data)
+    case ack(streamRoute: Data, generation: Data, upToSeq: UInt64)
+    case gap(streamRoute: Data, generation: Data, needStreamSeq: UInt64, oldestStreamSeq: UInt64)
+    case replayComplete(streamRoute: Data, generation: Data, currentCursor: StreamCursor)
+    case installGrant(grant: RelayV2Grant)
+    case grantCommitted(deviceRoute: Data, grantSerial: UInt64, grantHash: Data)
+    case revokeDevice(revocation: RelayV2DeviceRevocation)
+    case revocationCommitted(
+        deviceRoute: Data,
+        grantSerial: UInt64,
+        signedRevocation: RelayV2DeviceRevocation
+    )
+    case retireMachine(machineRoute: Data, trustEpoch: UInt64, signature: Data)
+    case ping(nonce: UInt64)
+    case pong(nonce: UInt64)
+    case routeAccepted(accepted: RelayV2AcceptedRef)
+    case error(RelayV2Failure)
+    case serverRestarting(drainDeadlineMs: UInt64)
+
+    fileprivate var body: RelayV2FrameBody {
+        switch self {
+        case .hello(let value): .hello(value)
+        case .challenge(let relayServerId, let connectionInstance, let challengeNonce):
+            .challenge(
+                relayServerId: relayServerId,
+                connectionInstance: connectionInstance,
+                challengeNonce: challengeNonce
+            )
+        case .authenticate(let proof, let signature):
+            .authenticate(proof: proof, signature: signature)
+        case .authenticated(let interval): .authenticated(heartbeatIntervalSecs: interval)
+        case .openPairRoute(let machineRoute, let pairRoute, let expiry):
+            .openPairRoute(
+                machineRoute: machineRoute,
+                pairRoute: pairRoute,
+                absoluteExpiryMs: expiry
+            )
+        case .pairRouteOpened(let machineRoute, let pairRoute, let expiry):
+            .pairRouteOpened(
+                machineRoute: machineRoute,
+                pairRoute: pairRoute,
+                absoluteExpiryMs: expiry
+            )
+        case .closePairRoute(let machineRoute, let pairRoute):
+            .closePairRoute(machineRoute: machineRoute, pairRoute: pairRoute)
+        case .pairRouteClosed(let pairRoute, let outcome):
+            .pairRouteClosed(pairRoute: pairRoute, outcome: outcome)
+        case .registerStream(let machineRoute, let streamRoute, let generation):
+            .registerStream(
+                machineRoute: machineRoute,
+                streamRoute: streamRoute,
+                generation: generation
+            )
+        case .subscribe(let streamRoute, let generation, let cursor):
+            .subscribe(streamRoute: streamRoute, generation: generation, cursor: cursor)
+        case .unsubscribe(let streamRoute, let generation):
+            .unsubscribe(streamRoute: streamRoute, generation: generation)
+        case .ack(let streamRoute, let generation, let upToSeq):
+            .ack(streamRoute: streamRoute, generation: generation, upToSeq: upToSeq)
+        case .gap(let streamRoute, let generation, let need, let oldest):
+            .gap(
+                streamRoute: streamRoute,
+                generation: generation,
+                needStreamSeq: need,
+                oldestStreamSeq: oldest
+            )
+        case .replayComplete(let streamRoute, let generation, let cursor):
+            .replayComplete(
+                streamRoute: streamRoute,
+                generation: generation,
+                currentCursor: cursor
+            )
+        case .installGrant(let grant): .installGrant(grant: grant)
+        case .grantCommitted(let deviceRoute, let serial, let hash):
+            .grantCommitted(deviceRoute: deviceRoute, grantSerial: serial, grantHash: hash)
+        case .revokeDevice(let revocation): .revokeDevice(revocation: revocation)
+        case .revocationCommitted(let deviceRoute, let serial, let revocation):
+            .revocationCommitted(
+                deviceRoute: deviceRoute,
+                grantSerial: serial,
+                signedRevocation: revocation
+            )
+        case .retireMachine(let machineRoute, let epoch, let signature):
+            .retireMachine(machineRoute: machineRoute, trustEpoch: epoch, signature: signature)
+        case .ping(let nonce): .ping(nonce: nonce)
+        case .pong(let nonce): .pong(nonce: nonce)
+        case .routeAccepted(let accepted): .routeAccepted(accepted: accepted)
+        case .error(let failure): .error(failure)
+        case .serverRestarting(let deadline): .serverRestarting(drainDeadlineMs: deadline)
+        }
+    }
+}
+
+/// The only public binary-encode input. Its initializer is private so callers cannot inject
+/// arbitrary `sealedBlob: Data` into the production outbound path.
+public struct RelayV2OutboundFrame: Sendable {
+    fileprivate let frame: RelayV2Frame
+
+    private init(body: RelayV2FrameBody) {
+        frame = RelayV2Frame(version: relayProtocolVersionV2, body: body)
+    }
+
+    public static func control(_ value: RelayV2OutboundControlFrame) -> Self {
+        Self(body: value.body)
+    }
+
+    public static func hello(protocolVersion: UInt16 = relayProtocolVersionV2) -> Self {
+        control(.hello(RelayV2Hello(protocolVersion: protocolVersion)))
+    }
+
+    public static func pairData(
+        pairRoute: Data,
+        payload: RelayEndpointPayloadV1
+    ) throws -> Self {
+        Self(
+            body: .pairData(
+                pairRoute: pairRoute,
+                sealedBlob: try RelayV2JSONCodec.encodeEndpoint(payload)
+            )
+        )
+    }
+
+    public static func publish(
+        streamRoute: Data,
+        generation: Data,
+        streamSeq: UInt64,
+        sealedBlob: SignedSealedBlobV1
+    ) throws -> Self {
+        Self(
+            body: .publish(
+                streamRoute: streamRoute,
+                generation: generation,
+                streamSeq: streamSeq,
+                sealedBlob: try RelayV2SignedSealedBlobCodec.encode(sealedBlob)
+            )
+        )
+    }
+
+    public static func send(
+        deviceRoute: Data,
+        requestRoute: Data,
+        sealedBlob: SignedSealedBlobV1
+    ) throws -> Self {
+        Self(
+            body: .send(
+                deviceRoute: deviceRoute,
+                requestRoute: requestRoute,
+                sealedBlob: try RelayV2SignedSealedBlobCodec.encode(sealedBlob)
+            )
+        )
+    }
+
+    public static func reply(
+        deviceRoute: Data,
+        requestRoute: Data,
+        sealedBlob: SignedSealedBlobV1
+    ) throws -> Self {
+        Self(
+            body: .reply(
+                deviceRoute: deviceRoute,
+                requestRoute: requestRoute,
+                sealedBlob: try RelayV2SignedSealedBlobCodec.encode(sealedBlob)
+            )
+        )
+    }
+}
+
+private enum RelayV2SignedSealedBlobCodec {
+    private static let domain = Data("AgentDeck/SealedBlobV1\0".utf8)
+
+    static func encode(_ value: SignedSealedBlobV1) throws -> Data {
+        guard value.inner.formatVersion == 1 else {
+            throw RelayWireCodecError.unsupportedVersion(value.inner.formatVersion)
+        }
+        guard value.inner.nonce.count == 12 else {
+            throw RelayWireCodecError.invalidLength(
+                field: "nonce",
+                expected: 12,
+                actual: value.inner.nonce.count
+            )
+        }
+        guard value.signature.count == 64 else {
+            throw RelayWireCodecError.invalidLength(
+                field: "signature",
+                expected: 64,
+                actual: value.signature.count
+            )
+        }
+
+        let fixedCapacity = domain.count + 2 + 1 + 1 + 8 + 8 + 8 + 4 + 12 + 4 + 64
+        let (capacity, capacityOverflow) = fixedCapacity.addingReportingOverflow(
+            value.inner.ciphertext.count
+        )
+        guard !capacityOverflow else {
+            throw RelayWireCodecError.lengthOutOfBounds
+        }
+        var output = Data()
+        output.reserveCapacity(capacity)
+        output.append(domain)
+        appendBigEndian(value.inner.formatVersion, to: &output)
+        output.append(value.inner.payloadKind.canonicalTag)
+        output.append(value.inner.keyID.purpose.canonicalTag)
+        appendBigEndian(value.inner.keyID.epoch, to: &output)
+        appendBigEndian(value.inner.keyEpoch, to: &output)
+        appendBigEndian(value.inner.keyDirectoryRevision, to: &output)
+        try appendLengthPrefixed(value.inner.nonce, field: "nonce", to: &output)
+        try appendLengthPrefixed(value.inner.ciphertext, field: "ciphertext", to: &output)
+        output.append(value.signature)
+        return output
+    }
+
+    private static func appendLengthPrefixed(
+        _ value: Data,
+        field: String,
+        to output: inout Data
+    ) throws {
+        guard let length = UInt32(exactly: value.count) else {
+            throw RelayWireCodecError.lengthOutOfBounds
+        }
+        appendBigEndian(length, to: &output)
+        output.append(value)
+    }
+
+    private static func appendBigEndian<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
+        var value = value.bigEndian
+        Swift.withUnsafeBytes(of: &value) { data.append(contentsOf: $0) }
+    }
+}
+
 extension StreamCursor: Codable {
     public init(from decoder: Decoder) throws {
         if let single = try? decoder.singleValueContainer(),
@@ -767,11 +1262,12 @@ extension StreamCursor: Codable {
 }
 
 extension KeyIDV1: Codable {
-    private enum CodingKeys: String, CodingKey {
+    private enum CodingKeys: String, CodingKey, CaseIterable {
         case purpose, epoch
     }
 
     public init(from decoder: Decoder) throws {
+        try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
         let container = try decoder.container(keyedBy: CodingKeys.self)
         purpose = try container.decode(KeyPurpose.self, forKey: .purpose)
         epoch = try container.decode(UInt64.self, forKey: .epoch)
@@ -867,6 +1363,9 @@ private struct PairAcceptedWire: Codable { let pair_route: Data }
 
 public enum RelayV2JSONCodec {
     public static func decodeFrame(_ data: Data) throws -> RelayV2Frame {
+        guard data.count <= RelayWireCodecV2.maxFrameBytes else {
+            throw RelayWireCodecError.oversize
+        }
         let root = try jsonObject(data)
         try exactKeys(root, allowed: ["version", "body"], path: "frame")
         guard let body = root["body"] as? [String: Any] else {
@@ -1076,7 +1575,7 @@ public enum RelayV2JSONCodec {
         guard frame.version == relayProtocolVersionV2 else {
             throw RelayWireCodecError.unsupportedVersion(frame.version)
         }
-        _ = try RelayWireCodecV2.encode(frame)
+        _ = try RelayWireCodecV2.encodeFixture(frame)
         return frame
     }
 
@@ -1084,6 +1583,9 @@ public enum RelayV2JSONCodec {
         _ wireType: RelayEndpointWireType,
         from data: Data
     ) throws -> RelayEndpointPayloadV1 {
+        guard data.count <= RelayWireCodecV2.maxFrameBytes else {
+            throw RelayWireCodecError.oversize
+        }
         let object = try jsonObject(data)
         try validateEndpointObject(object, wireType: wireType)
         let decoder = JSONDecoder()
@@ -1113,6 +1615,7 @@ public enum RelayV2JSONCodec {
     }
 
     public static func encodeEndpoint(_ payload: RelayEndpointPayloadV1) throws -> Data {
+        try validateEndpointLengths(payload)
         let encoder = JSONEncoder()
         switch payload {
         case .pairInvite(let value): return try encoder.encode(value)
@@ -1235,6 +1738,12 @@ public enum RelayV2JSONCodec {
     private static func validateEndpointLengths(_ payload: RelayEndpointPayloadV1) throws {
         switch payload {
         case .pairInvite(let value):
+            try requireVersion(value.formatVersion, expected: 1, field: "formatVersion")
+            try requireVersion(
+                value.relayProtocolVersion,
+                expected: relayProtocolVersionV2,
+                field: "relayProtocolVersion"
+            )
             try require(value.pairRoute, count: 16, field: "pairRoute")
             try require(value.inviteSecret, count: 32, field: "inviteSecret")
             try require(value.inviteHpkePubkey, count: 32, field: "inviteHpkePubkey")
@@ -1249,6 +1758,7 @@ public enum RelayV2JSONCodec {
             )
             try validateCertificateLengths(value.dataSignCert)
         case .pairRequest(let value):
+            try requireVersion(value.formatVersion, expected: 1, field: "formatVersion")
             try require(value.inviteSecret, count: 32, field: "inviteSecret")
             try require(value.deviceSignPubkey, count: 32, field: "deviceSignPubkey")
             try require(value.deviceHpkePubkey, count: 32, field: "deviceHpkePubkey")
@@ -1268,8 +1778,8 @@ public enum RelayV2JSONCodec {
             try require(value.signature, count: 64, field: "signature")
         case .epochBarrier(let value):
             try require(value.streamGeneration, count: 16, field: "streamGeneration")
-        case .sealedPayload:
-            break
+        case .sealedPayload(let value):
+            try requireVersion(value.formatVersion, expected: 1, field: "formatVersion")
         }
     }
 
@@ -1300,6 +1810,20 @@ public enum RelayV2JSONCodec {
                 field: field,
                 expected: count,
                 actual: value.count
+            )
+        }
+    }
+
+    private static func requireVersion(
+        _ value: UInt16,
+        expected: UInt16,
+        field: String
+    ) throws {
+        guard value == expected else {
+            throw RelayWireCodecError.invalidVersion(
+                field: field,
+                expected: expected,
+                actual: value
             )
         }
     }
@@ -1368,7 +1892,11 @@ public enum RelayWireCodecV2 {
     public static let maxFrameBytes = 4 * 1024 * 1024
     private static let magic = Data("ADRV2".utf8)
 
-    public static func encode(_ frame: RelayV2Frame) throws -> Data {
+    public static func encode(_ frame: RelayV2OutboundFrame) throws -> Data {
+        try encodeFixture(frame.frame)
+    }
+
+    static func encodeFixture(_ frame: RelayV2Frame) throws -> Data {
         guard frame.version == relayProtocolVersionV2 else {
             throw RelayWireCodecError.unsupportedVersion(frame.version)
         }
@@ -1664,6 +2192,7 @@ public enum RelayWireCodecV2 {
 
 private struct RelayBinaryWriter {
     private var storage = Data()
+    private let maxBytes = RelayWireCodecV2.maxFrameBytes
 
     mutating func raw(_ value: Data) {
         storage.append(value)
@@ -1705,6 +2234,11 @@ private struct RelayBinaryWriter {
     mutating func bytes(_ value: Data, field: String) throws {
         guard let count = UInt32(exactly: value.count) else {
             throw RelayWireCodecError.lengthOutOfBounds
+        }
+        let (afterPrefix, prefixOverflow) = storage.count.addingReportingOverflow(4)
+        let (afterValue, valueOverflow) = afterPrefix.addingReportingOverflow(value.count)
+        guard !prefixOverflow, !valueOverflow, afterValue <= maxBytes else {
+            throw RelayWireCodecError.oversize
         }
         u32(count)
         raw(value)
@@ -1811,7 +2345,9 @@ private struct RelayBinaryReader {
     }
 
     mutating func bytes() throws -> Data {
-        let count = Int(try u32())
+        guard let count = Int(exactly: try u32()) else {
+            throw RelayWireCodecError.lengthOutOfBounds
+        }
         guard count <= input.count - offset else {
             throw RelayWireCodecError.lengthOutOfBounds
         }
@@ -1915,3 +2451,51 @@ private struct RelayJSONCodingKey: CodingKey, Hashable {
 private func relayKey(_ value: String) -> RelayJSONCodingKey {
     RelayJSONCodingKey(value)
 }
+
+private func rejectRelayUnknownKeys(_ decoder: Decoder, allowed: Set<String>) throws {
+    let container = try decoder.container(keyedBy: RelayJSONCodingKey.self)
+    if let unknown = container.allKeys.first(where: { !allowed.contains($0.stringValue) }) {
+        throw DecodingError.dataCorruptedError(
+            forKey: unknown,
+            in: container,
+            debugDescription: "unknown field \(unknown.stringValue)"
+        )
+    }
+}
+
+private extension CaseIterable where Self: CodingKey {
+    static var all: Set<String> {
+        Set(allCases.map(\.stringValue))
+    }
+}
+
+private let relayFramePayloadKeys: [String: Set<String>] = [
+    "hello": ["protocolVersion"],
+    "challenge": ["relayServerId", "connectionInstance", "challengeNonce"],
+    "authenticate": ["proof", "signature"],
+    "authenticated": ["heartbeatIntervalSecs"],
+    "openPairRoute": ["machineRoute", "pairRoute", "absoluteExpiryMs"],
+    "pairRouteOpened": ["machineRoute", "pairRoute", "absoluteExpiryMs"],
+    "pairData": ["pairRoute", "sealedBlob"],
+    "closePairRoute": ["machineRoute", "pairRoute"],
+    "pairRouteClosed": ["pairRoute", "outcome"],
+    "registerStream": ["machineRoute", "streamRoute", "generation"],
+    "publish": ["streamRoute", "generation", "streamSeq", "sealedBlob"],
+    "subscribe": ["streamRoute", "generation", "cursor"],
+    "unsubscribe": ["streamRoute", "generation"],
+    "ack": ["streamRoute", "generation", "upToSeq"],
+    "gap": ["streamRoute", "generation", "needStreamSeq", "oldestStreamSeq"],
+    "replayComplete": ["streamRoute", "generation", "currentCursor"],
+    "send": ["deviceRoute", "requestRoute", "sealedBlob"],
+    "reply": ["deviceRoute", "requestRoute", "sealedBlob"],
+    "installGrant": ["grant"],
+    "grantCommitted": ["deviceRoute", "grantSerial", "grantHash"],
+    "revokeDevice": ["revocation"],
+    "revocationCommitted": ["deviceRoute", "grantSerial", "signedRevocation"],
+    "retireMachine": ["machineRoute", "trustEpoch", "signature"],
+    "ping": ["nonce"],
+    "pong": ["nonce"],
+    "routeAccepted": ["accepted"],
+    "error": ["code", "message", "inReplyTo"],
+    "serverRestarting": ["drainDeadlineMs"],
+]

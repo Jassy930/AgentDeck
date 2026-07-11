@@ -2,49 +2,6 @@ import Foundation
 import XCTest
 @testable import AgentDeckRelayClient
 
-final class RelayV2WireVerticalSliceTests: XCTestCase {
-    func testHelloMatchesRustExpectedHexAndRoundTrips() throws {
-        let input = Data(
-            #"{"version":2,"body":{"frameKind":"hello","frame":{"protocolVersion":2}}}"#.utf8
-        )
-        let frame = try RelayV2JSONCodec.decodeFrame(input)
-        let encoded = try RelayWireCodecV2.encode(frame)
-        XCTAssertEqual(encoded, Data(hex: "4144525632000200000002"))
-        XCTAssertEqual(try RelayWireCodecV2.decode(encoded), frame)
-    }
-
-    func testImplementedFamiliesMatchRustVectors() throws {
-        let url = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("protocol/agentdeck/fixtures/relay-v2-wire-vectors.json")
-        let root = try XCTUnwrap(
-            try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
-        )
-        let all = try XCTUnwrap(root["outerFrames"] as? [[String: Any]])
-        let implementedFamilies: Set<String> = [
-            "handshake", "pairing", "stream", "request", "authControl", "runtime",
-        ]
-        let vectors = all.filter {
-            implementedFamilies.contains(($0["family"] as? String) ?? "")
-        }
-        XCTAssertEqual(vectors.count, 28)
-        for vector in vectors {
-            let name = try XCTUnwrap(vector["case"] as? String)
-            let input = try JSONSerialization.data(withJSONObject: XCTUnwrap(vector["input"]))
-            let frame = try RelayV2JSONCodec.decodeFrame(input)
-            let encoded = try RelayWireCodecV2.encode(frame)
-            XCTAssertEqual(
-                encoded,
-                Data(hex: try XCTUnwrap(vector["expectedHex"] as? String)),
-                name
-            )
-            XCTAssertEqual(try RelayWireCodecV2.decode(encoded), frame)
-        }
-    }
-}
-
 final class RelayV2WireTests: XCTestCase {
     func testEveryRustOuterVectorMatchesBinaryCodecAndRoundTrips() throws {
         let vectors = try loadRelayVectors()
@@ -61,7 +18,7 @@ final class RelayV2WireTests: XCTestCase {
                 withJSONObject: XCTUnwrap(vector["input"])
             )
             let frame = try RelayV2JSONCodec.decodeFrame(input)
-            let encoded = try RelayWireCodecV2.encode(frame)
+            let encoded = try RelayWireCodecV2.encodeFixture(frame)
             XCTAssertEqual(
                 encoded,
                 Data(hex: try XCTUnwrap(vector["expectedHex"] as? String)),
@@ -73,6 +30,211 @@ final class RelayV2WireTests: XCTestCase {
                 "Swift binary round-trip drift for \(name)"
             )
         }
+    }
+
+    func testPublicOutboundFactoriesRequireTypedPayloadsAndMatchP16SealedWire() throws {
+        let cryptoVectors = try loadCryptoVectors()
+        let sealedVector = try XCTUnwrap(cryptoVectors["sealed_blob"] as? [String: Any])
+        let signed = try signedSealedBlob(from: sealedVector)
+        let expectedSealed = Data(hex: try XCTUnwrap(sealedVector["wireHex"] as? String))
+
+        let publish = try RelayV2OutboundFrame.publish(
+            streamRoute: Data(repeating: 0x33, count: 16),
+            generation: Data(repeating: 0x66, count: 16),
+            streamSeq: 7,
+            sealedBlob: signed
+        )
+        let publishWire = try RelayWireCodecV2.encode(publish)
+        XCTAssertEqual(
+            try lengthPrefixedPayload(in: publishWire, after: 5 + 2 + 2 + 16 + 16 + 8),
+            expectedSealed
+        )
+
+        let send = try RelayV2OutboundFrame.send(
+            deviceRoute: Data(repeating: 0x22, count: 16),
+            requestRoute: Data(repeating: 0x44, count: 16),
+            sealedBlob: signed
+        )
+        XCTAssertEqual(
+            try lengthPrefixedPayload(
+                in: RelayWireCodecV2.encode(send),
+                after: 5 + 2 + 2 + 16 + 16
+            ),
+            expectedSealed
+        )
+
+        let reply = try RelayV2OutboundFrame.reply(
+            deviceRoute: Data(repeating: 0x22, count: 16),
+            requestRoute: Data(repeating: 0x44, count: 16),
+            sealedBlob: signed
+        )
+        XCTAssertEqual(
+            try lengthPrefixedPayload(
+                in: RelayWireCodecV2.encode(reply),
+                after: 5 + 2 + 2 + 16 + 16
+            ),
+            expectedSealed
+        )
+
+        let endpoints = try XCTUnwrap(
+            try loadRelayVectors()["endpointTypes"] as? [[String: Any]]
+        )
+        let pairRequest = try XCTUnwrap(
+            endpoints.first { ($0["wireType"] as? String) == "PairRequestV1" }
+        )
+        let pairRequestData = try JSONSerialization.data(
+            withJSONObject: XCTUnwrap(pairRequest["value"])
+        )
+        let typedPairRequest = try RelayV2JSONCodec.decodeEndpoint(
+            .pairRequest,
+            from: pairRequestData
+        )
+        let pairData = try RelayV2OutboundFrame.pairData(
+            pairRoute: Data(repeating: 0x55, count: 16),
+            payload: typedPairRequest
+        )
+        let encodedPairPayload = try lengthPrefixedPayload(
+            in: RelayWireCodecV2.encode(pairData),
+            after: 5 + 2 + 2 + 16
+        )
+        XCTAssertEqual(
+            try normalizedJSON(encodedPairPayload),
+            try normalizedJSON(pairRequestData)
+        )
+    }
+
+    func testDirectPublicCodableDecodeCannotBypassRecursiveStrictness() throws {
+        let vectors = try loadRelayVectors()
+        let outer = try XCTUnwrap(vectors["outerFrames"] as? [[String: Any]])
+        let hello = try XCTUnwrap(outer.first { ($0["case"] as? String) == "hello" })
+        var helloInput = try XCTUnwrap(hello["input"] as? [String: Any])
+        helloInput["unexpected"] = true
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(
+                RelayV2Frame.self,
+                from: JSONSerialization.data(withJSONObject: helloInput)
+            )
+        )
+
+        let install = try XCTUnwrap(
+            outer.first { ($0["case"] as? String) == "installGrant" }
+        )
+        let installInput = try XCTUnwrap(install["input"] as? [String: Any])
+        let installBody = try XCTUnwrap(installInput["body"] as? [String: Any])
+        let installFrame = try XCTUnwrap(installBody["frame"] as? [String: Any])
+        var grant = try XCTUnwrap(installFrame["grant"] as? [String: Any])
+        grant["unexpected"] = true
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(
+                RelayV2Grant.self,
+                from: JSONSerialization.data(withJSONObject: grant)
+            )
+        )
+
+        let endpoints = try XCTUnwrap(vectors["endpointTypes"] as? [[String: Any]])
+        let invite = try XCTUnwrap(
+            endpoints.first { ($0["wireType"] as? String) == "PairInviteV1" }
+        )
+        var inviteValue = try XCTUnwrap(invite["value"] as? [String: Any])
+        var cert = try XCTUnwrap(inviteValue["dataSignCert"] as? [String: Any])
+        cert["unexpected"] = true
+        inviteValue["dataSignCert"] = cert
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(
+                RelayPairInviteV1.self,
+                from: JSONSerialization.data(withJSONObject: inviteValue)
+            )
+        )
+    }
+
+    func testEncodeEndpointRevalidatesVersionsLengthsAndNestedObjects() throws {
+        let vectors = try loadRelayVectors()
+        let endpoints = try XCTUnwrap(vectors["endpointTypes"] as? [[String: Any]])
+        let inviteVector = try XCTUnwrap(
+            endpoints.first { ($0["wireType"] as? String) == "PairInviteV1" }
+        )
+        let inviteData = try JSONSerialization.data(
+            withJSONObject: XCTUnwrap(inviteVector["value"])
+        )
+        let decoded = try RelayV2JSONCodec.decodeEndpoint(.pairInvite, from: inviteData)
+        guard case var .pairInvite(invite) = decoded else {
+            return XCTFail("expected PairInviteV1")
+        }
+
+        invite.formatVersion = 2
+        XCTAssertThrowsError(try RelayV2JSONCodec.encodeEndpoint(.pairInvite(invite)))
+
+        invite = try pairInvite(from: inviteData)
+        invite.relayProtocolVersion = 1
+        XCTAssertThrowsError(try RelayV2JSONCodec.encodeEndpoint(.pairInvite(invite)))
+
+        invite = try pairInvite(from: inviteData)
+        invite.pairRoute = Data(repeating: 0, count: 15)
+        XCTAssertThrowsError(try RelayV2JSONCodec.encodeEndpoint(.pairInvite(invite)))
+
+        invite = try pairInvite(from: inviteData)
+        invite.dataSignCert.subjectPubkey = Data(repeating: 0, count: 31)
+        XCTAssertThrowsError(try RelayV2JSONCodec.encodeEndpoint(.pairInvite(invite)))
+    }
+
+    func testJSONAndBinaryEncodersRejectOversizeBeforeWireCompletion() throws {
+        let oversizeJSON = Data(repeating: 0x20, count: RelayWireCodecV2.maxFrameBytes + 1)
+        XCTAssertThrowsError(try RelayV2JSONCodec.decodeFrame(oversizeJSON)) { error in
+            XCTAssertEqual(error as? RelayWireCodecError, .oversize)
+        }
+        XCTAssertThrowsError(
+            try RelayV2JSONCodec.decodeEndpoint(.pairInvite, from: oversizeJSON)
+        ) { error in
+            XCTAssertEqual(error as? RelayWireCodecError, .oversize)
+        }
+
+        let sealedVector = try XCTUnwrap(
+            try loadCryptoVectors()["sealed_blob"] as? [String: Any]
+        )
+        let baseCiphertext = Data(hex: try XCTUnwrap(sealedVector["ciphertextHex"] as? String))
+        let baseWire = Data(hex: try XCTUnwrap(sealedVector["wireHex"] as? String))
+        let sealedFixedBytes = baseWire.count - baseCiphertext.count
+        let publishFixedBytes = 5 + 2 + 2 + 16 + 16 + 8 + 4
+        let maximumCiphertextBytes = RelayWireCodecV2.maxFrameBytes
+            - publishFixedBytes
+            - sealedFixedBytes
+
+        let nearLimit = try signedSealedBlob(
+            from: sealedVector,
+            ciphertext: Data(repeating: 0xA5, count: maximumCiphertextBytes)
+        )
+        XCTAssertNoThrow(
+            try RelayWireCodecV2.encode(
+                RelayV2OutboundFrame.publish(
+                    streamRoute: Data(repeating: 0x33, count: 16),
+                    generation: Data(repeating: 0x66, count: 16),
+                    streamSeq: 7,
+                    sealedBlob: nearLimit
+                )
+            )
+        )
+
+        let oversize = try signedSealedBlob(
+            from: sealedVector,
+            ciphertext: Data(repeating: 0xA5, count: maximumCiphertextBytes + 1)
+        )
+        XCTAssertThrowsError(
+            try RelayWireCodecV2.encode(
+                RelayV2OutboundFrame.publish(
+                    streamRoute: Data(repeating: 0x33, count: 16),
+                    generation: Data(repeating: 0x66, count: 16),
+                    streamSeq: 7,
+                    sealedBlob: oversize
+                )
+            )
+        ) { error in
+            XCTAssertEqual(error as? RelayWireCodecError, .oversize)
+        }
+    }
+
+    func testRawFrameBinaryEncodeIsNotPublicAPI() throws {
+        let source = try String(contentsOf: relayV2TypesURL, encoding: .utf8)
+        XCTAssertFalse(source.contains("public static func encode(_ frame: RelayV2Frame)"))
     }
 
     func testEveryEndpointVariantDecodesStrictlyAndReencodesSemantically() throws {
@@ -252,11 +414,60 @@ final class RelayV2WireTests: XCTestCase {
         return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
 
+    private func signedSealedBlob(
+        from vector: [String: Any],
+        ciphertext: Data? = nil
+    ) throws -> SignedSealedBlobV1 {
+        let resolvedCiphertext = try ciphertext
+            ?? Data(hex: XCTUnwrap(vector["ciphertextHex"] as? String))
+        return SignedSealedBlobV1(
+            inner: UnsignedSealedBlobV1(
+                formatVersion: 1,
+                payloadKind: .conversationEvent,
+                keyID: KeyIDV1(purpose: .conversationDEK, epoch: 4),
+                keyEpoch: 4,
+                keyDirectoryRevision: 2,
+                nonce: Data(hex: try XCTUnwrap(vector["nonceHex"] as? String)),
+                ciphertext: resolvedCiphertext
+            ),
+            signature: Data(hex: try XCTUnwrap(vector["signatureHex"] as? String))
+        )
+    }
+
+    private func pairInvite(from data: Data) throws -> RelayPairInviteV1 {
+        guard case let .pairInvite(value) = try RelayV2JSONCodec.decodeEndpoint(
+            .pairInvite,
+            from: data
+        ) else {
+            throw RelayWireCodecError.unknownField("PairInviteV1")
+        }
+        return value
+    }
+
+    private func lengthPrefixedPayload(in data: Data, after offset: Int) throws -> Data {
+        guard offset >= 0, offset + 4 <= data.count else {
+            throw RelayWireCodecError.shortInput
+        }
+        let length = data[offset..<(offset + 4)].reduce(UInt32(0)) {
+            ($0 << 8) | UInt32($1)
+        }
+        let start = offset + 4
+        let end = start + Int(length)
+        guard end <= data.count else {
+            throw RelayWireCodecError.lengthOutOfBounds
+        }
+        return data[start..<end]
+    }
+
     private var repoRoot: URL {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
+    }
+
+    private var relayV2TypesURL: URL {
+        repoRoot.appendingPathComponent("Sources/AgentDeckRelayClient/Wire/RelayV2Types.swift")
     }
 }
 

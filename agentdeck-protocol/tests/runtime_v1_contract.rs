@@ -9,7 +9,7 @@ use agentdeck_protocol::runtime::command::{
 use agentdeck_protocol::runtime::failure::{self, RuntimeFailure};
 use agentdeck_protocol::runtime::identity::{
     ApprovalId, CommandId, ConversationId, EntityId, EventId, IdempotencyKey, ItemId, MessageId,
-    PairingId, TransferId, TurnId,
+    PairingId, StreamGeneration, TransferId, TurnId,
 };
 use agentdeck_protocol::runtime::receipt::{
     ApprovalDeliveryState, ApprovalReceipt, CommandReceipt, RevocationReceipt,
@@ -23,8 +23,10 @@ use agentdeck_protocol::runtime::{
     TransferEnvelope, ensure_request_within_limit,
 };
 use agentdeck_protocol::{
-    ActionDecision, ActionDecisionKind, AgentItem, AgentKind, CapabilityId, CodexCapabilities,
-    SessionCapabilities, VendorCapabilities,
+    ActionDecision, ActionDecisionKind, ActionKind, ActionRequest, ActionRequestVendor, AgentItem,
+    AgentItemMeta, AgentKind, CapabilityId, CodexApprovalPolicy, CodexCapabilities,
+    CodexReasoningEffort, CodexSandboxMode, DiffFile, DiffStatus, PlanStep, PlanStepStatus,
+    SessionCapabilities, ShellStatus, TurnSummary, VendorCapabilities,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -38,6 +40,24 @@ fn sample_caps() -> SessionCapabilities {
         agent_version: "x".into(),
         features: BTreeSet::from([CapabilityId::Approval]),
         vendor: VendorCapabilities::Codex(CodexCapabilities::default()),
+    }
+}
+
+fn sample_multi_caps() -> SessionCapabilities {
+    SessionCapabilities {
+        agent_kind: AgentKind::Codex,
+        agent_version: "fixture-2".into(),
+        features: BTreeSet::from([
+            CapabilityId::CodexSkills,
+            CapabilityId::Worktree,
+            CapabilityId::StreamingMessages,
+            CapabilityId::Approval,
+        ]),
+        vendor: VendorCapabilities::Codex(CodexCapabilities {
+            sandbox_modes: vec![CodexSandboxMode::ReadOnly, CodexSandboxMode::WorkspaceWrite],
+            persistence_supported: true,
+            reasoning_effort_levels: vec![CodexReasoningEffort::Low, CodexReasoningEffort::High],
+        }),
     }
 }
 
@@ -92,6 +112,439 @@ fn render_runtime_wire_fixture() -> String {
         })),
     );
     cases.push(fixture_case("stableIds", "runtimeEnvelope", &stable_ids));
+
+    let request_conversation = ConversationId::new("conversation-request-1");
+    let request_variants = vec![
+        (
+            "requestHello",
+            RuntimeRequest::Hello(runtime::command::HelloParams {
+                runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            }),
+        ),
+        (
+            "requestCatalog",
+            RuntimeRequest::Catalog(runtime::command::CatalogRequest {
+                subscribe: true,
+                since_revision: None,
+            }),
+        ),
+        (
+            "requestSubscribe",
+            RuntimeRequest::Subscribe {
+                conversation_id: request_conversation.clone(),
+                cursor: StreamCursor::BeforeFirst,
+            },
+        ),
+        (
+            "requestStart",
+            RuntimeRequest::Start(runtime::command::ConversationStart {
+                agent_kind: AgentKind::Codex,
+                prompt: None,
+            }),
+        ),
+        ("requestSendPrompt", sample_send_prompt()),
+        (
+            "requestResolveApproval",
+            RuntimeRequest::ResolveApproval {
+                conversation_id: request_conversation.clone(),
+                turn_id: TurnId::new("turn-request-1"),
+                approval_id: ApprovalId::new("approval-request-1"),
+                decision: ActionDecision {
+                    request_id: "action-request-1".into(),
+                    decision: ActionDecisionKind::Approve,
+                    persist: false,
+                },
+            },
+        ),
+        (
+            "requestRetryApproval",
+            RuntimeRequest::RetryApproval {
+                conversation_id: request_conversation.clone(),
+                approval_id: ApprovalId::new("approval-request-1"),
+            },
+        ),
+        (
+            "requestCancel",
+            RuntimeRequest::Cancel {
+                conversation_id: request_conversation.clone(),
+                turn_id: None,
+            },
+        ),
+        (
+            "requestQueryReceipt",
+            RuntimeRequest::QueryReceipt(runtime::command::QueryReceiptRequest {
+                conversation_id: None,
+                command_id: None,
+                idempotency_key: None,
+            }),
+        ),
+        (
+            "requestCreatePairInvite",
+            RuntimeRequest::CreatePairInvite(runtime::command::CreatePairInviteRequest {
+                display_name: "fixture machine".into(),
+                ttl_secs: 300,
+                scope: LocalOnlyAdministration::LocalOnly,
+            }),
+        ),
+        (
+            "requestListPendingPairings",
+            RuntimeRequest::ListPendingPairings {
+                scope: LocalOnlyAdministration::LocalOnly,
+            },
+        ),
+        (
+            "requestConfirmPairing",
+            RuntimeRequest::ConfirmPairing {
+                pairing_id: PairingId::new("pairing-request-1"),
+                scope: LocalOnlyAdministration::LocalOnly,
+            },
+        ),
+        (
+            "requestCancelPairing",
+            RuntimeRequest::CancelPairing {
+                pairing_id: PairingId::new("pairing-request-1"),
+                scope: LocalOnlyAdministration::LocalOnly,
+            },
+        ),
+        (
+            "requestRevoke",
+            RuntimeRequest::Revoke(runtime::command::RevokeRequest {
+                target: runtime::command::RevokeTarget::SelfDevice,
+            }),
+        ),
+        (
+            "requestTrustReset",
+            RuntimeRequest::TrustReset {
+                scope: LocalOnlyAdministration::LocalOnly,
+            },
+        ),
+    ];
+    for (index, (name, request)) in request_variants.into_iter().enumerate() {
+        cases.push(fixture_case(
+            name,
+            "runtimeEnvelope",
+            &envelope_with_id(
+                &format!("message-request-{index}"),
+                RuntimeMessage::Request(request),
+            ),
+        ));
+    }
+
+    let hello_reply = envelope_with_id(
+        "message-reply-hello",
+        RuntimeMessage::Reply(RuntimeReply::Hello(runtime::command::HelloParams {
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+        })),
+    );
+    cases.push(fixture_case("replyHello", "runtimeEnvelope", &hello_reply));
+
+    let catalog_reply = envelope_with_id(
+        "message-reply-catalog",
+        RuntimeMessage::Reply(RuntimeReply::Catalog(
+            runtime::catalog::CatalogSnapshot::new(
+                9,
+                vec![runtime::catalog::ConversationEntry {
+                    conversation_id: ConversationId::new("conversation-catalog-1"),
+                    adapter_state_key: runtime::identity::AdapterStateKey::new(
+                        "adapter-state-catalog-1",
+                    ),
+                    agent_kind: AgentKind::Codex,
+                    title: None,
+                    cwd: None,
+                    last_active_ms: 123,
+                    archived: false,
+                }],
+                false,
+            )
+            .expect("fixture catalog page must satisfy bounds"),
+        )),
+    );
+    cases.push(fixture_case(
+        "replyCatalog",
+        "runtimeEnvelope",
+        &catalog_reply,
+    ));
+
+    let sync_complete = runtime::sync::RuntimeSyncComplete {
+        stream_generation: StreamGeneration::new("generation-sync-1"),
+        stream_cursor: StreamCursor::At(7),
+        event_seq: 7,
+        key_directory_revision: 3,
+    };
+    let reply_only_variants = vec![
+        (
+            "replyBackfill",
+            RuntimeReply::Backfill(runtime::sync::BackfillChunk {
+                conversation_id: ConversationId::new("conversation-backfill-1"),
+                events: vec![],
+            }),
+        ),
+        (
+            "replySyncComplete",
+            RuntimeReply::SyncComplete(sync_complete.clone()),
+        ),
+        (
+            "replyPairInvite",
+            RuntimeReply::PairInvite(runtime::envelope::PairInvite {
+                pairing_id: PairingId::new("pairing-invite-1"),
+                display_name: "fixture machine".into(),
+                expires_at_ms: 456,
+            }),
+        ),
+        (
+            "replyPendingPairings",
+            RuntimeReply::PendingPairings {
+                pairings: vec![runtime::envelope::PendingPairing {
+                    pairing_id: PairingId::new("pairing-pending-1"),
+                    device_fingerprint: "fixture fingerprint".into(),
+                    requested_at_ms: 234,
+                }],
+            },
+        ),
+        (
+            "replyFailure",
+            RuntimeReply::Failure(RuntimeFailure::new(
+                failure::DAEMON_CONVERSATION_NOT_FOUND,
+                "conversation not found",
+            )),
+        ),
+    ];
+    for (index, (name, reply)) in reply_only_variants.into_iter().enumerate() {
+        cases.push(fixture_case(
+            name,
+            "runtimeEnvelope",
+            &envelope_with_id(
+                &format!("message-reply-extra-{index}"),
+                RuntimeMessage::Reply(reply),
+            ),
+        ));
+    }
+
+    let catalog_delta_stream = envelope_with_id(
+        "message-stream-catalog-delta",
+        RuntimeMessage::Stream(RuntimeStreamItem::CatalogDelta(
+            runtime::catalog::CatalogDelta {
+                catalog_revision: 10,
+                changes: vec![runtime::catalog::CatalogChange::Removed {
+                    conversation_id: ConversationId::new("conversation-removed-1"),
+                }],
+            },
+        )),
+    );
+    cases.push(fixture_case(
+        "streamCatalogDelta",
+        "runtimeEnvelope",
+        &catalog_delta_stream,
+    ));
+    let sync_stream = envelope_with_id(
+        "message-stream-sync-complete",
+        RuntimeMessage::Stream(RuntimeStreamItem::SyncComplete(sync_complete)),
+    );
+    cases.push(fixture_case(
+        "streamSyncComplete",
+        "runtimeEnvelope",
+        &sync_stream,
+    ));
+
+    let event_envelope = |message_id: &str, body: RuntimeEventBody| {
+        envelope_with_id(
+            message_id,
+            RuntimeMessage::Stream(RuntimeStreamItem::Event(RuntimeEvent {
+                conversation_id: ConversationId::new("conversation-event-matrix-1"),
+                event_id: EventId::new(format!("event-{message_id}")),
+                event_seq: 11,
+                item_id: None,
+                entity_id: None,
+                body,
+            })),
+        )
+    };
+    let event_body_variants = vec![
+        (
+            "eventCapabilitiesMulti",
+            RuntimeEventBody::Capabilities {
+                capabilities: sample_multi_caps(),
+            },
+        ),
+        (
+            "eventTurnStarted",
+            RuntimeEventBody::TurnStarted {
+                turn_id: TurnId::new("turn-event-started-1"),
+                command_id: CommandId::new("command-event-started-1"),
+            },
+        ),
+        (
+            "eventActionRequest",
+            RuntimeEventBody::ActionRequest {
+                turn_id: TurnId::new("turn-event-action-1"),
+                approval_id: ApprovalId::new("approval-event-action-1"),
+                request: ActionRequest {
+                    request_id: "action-event-1".into(),
+                    kind: ActionKind::ExecuteCommand,
+                    summary: "fixture action".into(),
+                    vendor: ActionRequestVendor::Codex {
+                        approval_policy_at_decision: CodexApprovalPolicy::OnRequest,
+                        sandbox_at_decision: CodexSandboxMode::WorkspaceWrite,
+                        can_persist: true,
+                    },
+                },
+            },
+        ),
+        (
+            "eventApprovalResolved",
+            RuntimeEventBody::ApprovalResolved {
+                turn_id: TurnId::new("turn-event-resolved-1"),
+                approval_id: ApprovalId::new("approval-event-resolved-1"),
+                decision: ActionDecisionKind::Deny,
+                state: ApprovalDeliveryState::Applied,
+            },
+        ),
+        (
+            "eventTurnCompleted",
+            RuntimeEventBody::TurnCompleted {
+                turn_id: TurnId::new("turn-event-completed-1"),
+                summary: TurnSummary {
+                    total_input_tokens: None,
+                    total_output_tokens: None,
+                    elapsed_ms: 99,
+                },
+            },
+        ),
+        (
+            "eventTurnInterrupted",
+            RuntimeEventBody::TurnInterrupted {
+                turn_id: TurnId::new("turn-event-interrupted-1"),
+            },
+        ),
+        (
+            "eventError",
+            RuntimeEventBody::Error {
+                failure: RuntimeFailure::new(
+                    failure::DAEMON_COMMAND_INTERRUPTED,
+                    "fixture interrupted",
+                ),
+            },
+        ),
+    ];
+    for (index, (name, event_body)) in event_body_variants.into_iter().enumerate() {
+        cases.push(fixture_case(
+            name,
+            "runtimeEnvelope",
+            &event_envelope(&format!("message-event-body-{index}"), event_body),
+        ));
+    }
+
+    let empty_meta = || AgentItemMeta::default();
+    let agent_items = vec![
+        (
+            "agentItemUserMessage",
+            AgentItem::UserMessage {
+                text: "fixture user".into(),
+                meta: empty_meta(),
+            },
+        ),
+        (
+            "agentItemAssistantMessage",
+            AgentItem::AssistantMessage {
+                text: "fixture assistant".into(),
+                meta: empty_meta(),
+            },
+        ),
+        (
+            "agentItemReasoning",
+            AgentItem::Reasoning {
+                text: "fixture reasoning".into(),
+                meta: empty_meta(),
+            },
+        ),
+        (
+            "agentItemShellMinExit",
+            AgentItem::Shell {
+                command: "fixture-shell-min".into(),
+                status: ShellStatus::Completed,
+                exit_code: Some(i32::MIN),
+                duration_ms: None,
+                meta: empty_meta(),
+            },
+        ),
+        (
+            "agentItemDiffNullPatch",
+            AgentItem::Diff {
+                files: vec![DiffFile {
+                    path: PathBuf::from("fixture.txt"),
+                    status: DiffStatus::Modified,
+                    patch: None,
+                }],
+                meta: empty_meta(),
+            },
+        ),
+        (
+            "agentItemPlanNullDetail",
+            AgentItem::Plan {
+                steps: vec![PlanStep {
+                    title: "fixture plan".into(),
+                    status: PlanStepStatus::Pending,
+                    detail: None,
+                }],
+                meta: empty_meta(),
+            },
+        ),
+        (
+            "agentItemImageReferenceNullPaths",
+            AgentItem::ImageReference {
+                saved_path: None,
+                original_path: None,
+                meta: empty_meta(),
+            },
+        ),
+        (
+            "agentItemToolCallNullResult",
+            AgentItem::ToolCall {
+                name: "fixture-tool".into(),
+                args: serde_json::json!({"nested": [1, true, null]}),
+                result: None,
+                meta: empty_meta(),
+            },
+        ),
+        (
+            "agentItemRaw",
+            AgentItem::Raw {
+                raw_kind: "fixture.raw".into(),
+                raw_payload: "fixture payload".into(),
+                meta: empty_meta(),
+            },
+        ),
+        (
+            "agentItemShellMaxExit",
+            AgentItem::Shell {
+                command: "fixture-shell-max".into(),
+                status: ShellStatus::Failed,
+                exit_code: Some(i32::MAX),
+                duration_ms: None,
+                meta: empty_meta(),
+            },
+        ),
+        (
+            "agentItemShellNullOptionals",
+            AgentItem::Shell {
+                command: "fixture-shell-null".into(),
+                status: ShellStatus::Running,
+                exit_code: None,
+                duration_ms: None,
+                meta: empty_meta(),
+            },
+        ),
+    ];
+    for (index, (name, item)) in agent_items.into_iter().enumerate() {
+        cases.push(fixture_case(
+            name,
+            "runtimeEnvelope",
+            &event_envelope(
+                &format!("message-agent-item-{index}"),
+                RuntimeEventBody::Item { item },
+            ),
+        ));
+    }
 
     let command_receipts = [
         (
@@ -193,6 +646,17 @@ fn render_runtime_wire_fixture() -> String {
         "revocationCommitted",
         "runtimeEnvelope",
         &revocation,
+    ));
+    let revocation_failed = envelope_with_id(
+        "message-revocation-failed-1",
+        RuntimeMessage::Reply(RuntimeReply::Revocation(RevocationReceipt::Failed {
+            failure: RuntimeFailure::new(failure::REMOTE_MACHINE_OFFLINE, "machine offline"),
+        })),
+    );
+    cases.push(fixture_case(
+        "revocationFailed",
+        "runtimeEnvelope",
+        &revocation_failed,
     ));
 
     let snapshot = ConversationSnapshot::new(

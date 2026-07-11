@@ -5,20 +5,7 @@ import XCTest
 final class RuntimeV1ProtocolTests: XCTestCase {
     func testRustJSONLDecodesAndReencodesWithEquivalentJSON() throws {
         let fixtures = try loadFixtures()
-        XCTAssertEqual(fixtures.count, 16)
-        XCTAssertEqual(
-            Set(fixtures.map(\.name)),
-            [
-                "stableIds",
-                "commandAccepted", "commandReplayed", "commandFailed",
-                "approvalClaimed", "approvalApplied", "approvalDeliveryFailed",
-                "approvalExpired",
-                "approvalAlreadyHandled-claimed", "approvalAlreadyHandled-applying",
-                "approvalAlreadyHandled-applied", "approvalAlreadyHandled-deliveryFailed",
-                "approvalAlreadyHandled-expired",
-                "revocationCommitted", "capabilitiesFirstSnapshot", "transferEnvelope",
-            ]
-        )
+        XCTAssertGreaterThan(fixtures.count, 16)
 
         for fixture in fixtures {
             let encoded: Data
@@ -38,6 +25,244 @@ final class RuntimeV1ProtocolTests: XCTestCase {
                 try normalizedJSON(encoded),
                 try normalizedJSON(fixture.value),
                 "Rust/Swift semantic JSON drift for \(fixture.name)"
+            )
+        }
+    }
+
+    func testRustFixtureCoversEveryTopLevelRuntimeVariant() throws {
+        let fixtures = try loadRawFixtureObjects()
+        let payloads = fixtures.compactMap { fixture -> [String: Any]? in
+            guard fixture["wireType"] as? String == "runtimeEnvelope",
+                  let value = fixture["value"] as? [String: Any],
+                  let body = value["body"] as? [String: Any]
+            else {
+                return nil
+            }
+            return body
+        }
+
+        XCTAssertEqual(
+            Set(payloads.compactMap { $0["message"] as? String }),
+            ["request", "reply", "stream"]
+        )
+        XCTAssertEqual(
+            Set(payloads.compactMap { body in
+                (body["payload"] as? [String: Any])?["request"] as? String
+            }),
+            [
+                "hello", "catalog", "subscribe", "start", "sendPrompt",
+                "resolveApproval", "retryApproval", "cancel", "queryReceipt",
+                "createPairInvite", "listPendingPairings", "confirmPairing",
+                "cancelPairing", "revoke", "trustReset",
+            ]
+        )
+        XCTAssertEqual(
+            Set(payloads.compactMap { body in
+                (body["payload"] as? [String: Any])?["reply"] as? String
+            }),
+            [
+                "hello", "command", "approval", "revocation", "catalog", "snapshot",
+                "backfill", "syncComplete", "pairInvite", "pendingPairings", "failure",
+            ]
+        )
+        XCTAssertEqual(
+            Set(payloads.compactMap { body in
+                (body["payload"] as? [String: Any])?["stream"] as? String
+            }),
+            ["event", "catalogDelta", "syncComplete"]
+        )
+    }
+
+    func testRustFixtureCoversEveryRuntimeEventAndAgentItemVariant() throws {
+        let events = try loadRawFixtureObjects().compactMap { fixture -> [String: Any]? in
+            guard fixture["wireType"] as? String == "runtimeEnvelope",
+                  let value = fixture["value"] as? [String: Any],
+                  let envelopeBody = value["body"] as? [String: Any],
+                  envelopeBody["message"] as? String == "stream",
+                  let payload = envelopeBody["payload"] as? [String: Any],
+                  payload["stream"] as? String == "event"
+            else {
+                return nil
+            }
+            return payload
+        }
+        let eventBodies = events.compactMap { $0["body"] as? [String: Any] }
+        XCTAssertEqual(
+            Set(eventBodies.compactMap { $0["kind"] as? String }),
+            [
+                "capabilities", "item", "turnStarted", "actionRequest",
+                "approvalResolved", "turnCompleted", "turnInterrupted", "error",
+            ]
+        )
+        XCTAssertEqual(
+            Set(eventBodies.compactMap { body in
+                (body["item"] as? [String: Any])?["kind"] as? String
+            }),
+            [
+                "userMessage", "assistantMessage", "reasoning", "shell", "diff", "plan",
+                "imageReference", "toolCall", "raw",
+            ]
+        )
+    }
+
+    func testRustOptionalNullsAndBTreeSetOrderArePreserved() throws {
+        let fixtures = try loadRawFixtureObjects()
+        let capabilities = try fixtureValue(named: "eventCapabilitiesMulti", in: fixtures)
+        let capabilitiesBody = try eventBody(in: capabilities)
+        let capabilitiesValue = try XCTUnwrap(capabilitiesBody["capabilities"] as? [String: Any])
+        XCTAssertEqual(
+            capabilitiesValue["features"] as? [String],
+            ["streamingMessages", "approval", "worktree", "codexSkills"]
+        )
+
+        let shell = try eventItem(
+            in: fixtureValue(named: "agentItemShellNullOptionals", in: fixtures)
+        )
+        XCTAssertTrue(shell["exitCode"] is NSNull)
+        XCTAssertTrue(shell["durationMs"] is NSNull)
+
+        let image = try eventItem(
+            in: fixtureValue(named: "agentItemImageReferenceNullPaths", in: fixtures)
+        )
+        XCTAssertTrue(image["savedPath"] is NSNull)
+        XCTAssertTrue(image["originalPath"] is NSNull)
+
+        let tool = try eventItem(
+            in: fixtureValue(named: "agentItemToolCallNullResult", in: fixtures)
+        )
+        XCTAssertTrue(tool["result"] is NSNull)
+    }
+
+    func testShellExitCodeUsesRustI32Bounds() throws {
+        let fixtures = try loadRawFixtureObjects()
+        for name in ["agentItemShellMinExit", "agentItemShellMaxExit"] {
+            let value = try fixtureValue(named: name, in: fixtures)
+            XCTAssertNoThrow(
+                try RuntimeV1WireCodec.decodeEnvelope(
+                    JSONSerialization.data(withJSONObject: value)
+                ),
+                name
+            )
+        }
+
+        let source = try fixtureValue(named: "agentItemShellMaxExit", in: fixtures)
+        for overflow in [Int64(Int32.max) + 1, Int64(Int32.min) - 1] {
+            var value = source
+            var envelopeBody = try XCTUnwrap(value["body"] as? [String: Any])
+            var payload = try XCTUnwrap(envelopeBody["payload"] as? [String: Any])
+            var body = try XCTUnwrap(payload["body"] as? [String: Any])
+            var item = try XCTUnwrap(body["item"] as? [String: Any])
+            item["exitCode"] = overflow
+            body["item"] = item
+            payload["body"] = body
+            envelopeBody["payload"] = payload
+            value["body"] = envelopeBody
+            XCTAssertThrowsError(
+                try RuntimeV1WireCodec.decodeEnvelope(
+                    JSONSerialization.data(withJSONObject: value)
+                ),
+                "Rust i32 overflow must fail closed"
+            )
+        }
+    }
+
+    func testExpandedRuntimeDTOsRejectNestedUnknownFieldsAtRealEntry() throws {
+        let fixtures = try loadRawFixtureObjects()
+        let mutations: [(String, (inout [String: Any]) throws -> Void)] = [
+            ("requestResolveApproval", { value in
+                var envelopeBody = try XCTUnwrap(value["body"] as? [String: Any])
+                var payload = try XCTUnwrap(envelopeBody["payload"] as? [String: Any])
+                var decision = try XCTUnwrap(payload["decision"] as? [String: Any])
+                decision["unexpected"] = true
+                payload["decision"] = decision
+                envelopeBody["payload"] = payload
+                value["body"] = envelopeBody
+            }),
+            ("replyCatalog", { value in
+                var envelopeBody = try XCTUnwrap(value["body"] as? [String: Any])
+                var payload = try XCTUnwrap(envelopeBody["payload"] as? [String: Any])
+                var entries = try XCTUnwrap(payload["entries"] as? [[String: Any]])
+                entries[0]["unexpected"] = true
+                payload["entries"] = entries
+                envelopeBody["payload"] = payload
+                value["body"] = envelopeBody
+            }),
+            ("eventActionRequest", { value in
+                var envelopeBody = try XCTUnwrap(value["body"] as? [String: Any])
+                var payload = try XCTUnwrap(envelopeBody["payload"] as? [String: Any])
+                var body = try XCTUnwrap(payload["body"] as? [String: Any])
+                var request = try XCTUnwrap(body["request"] as? [String: Any])
+                var vendor = try XCTUnwrap(request["vendor"] as? [String: Any])
+                vendor["unexpected"] = true
+                request["vendor"] = vendor
+                body["request"] = request
+                payload["body"] = body
+                envelopeBody["payload"] = payload
+                value["body"] = envelopeBody
+            }),
+            ("eventTurnCompleted", { value in
+                var envelopeBody = try XCTUnwrap(value["body"] as? [String: Any])
+                var payload = try XCTUnwrap(envelopeBody["payload"] as? [String: Any])
+                var body = try XCTUnwrap(payload["body"] as? [String: Any])
+                var summary = try XCTUnwrap(body["summary"] as? [String: Any])
+                summary["unexpected"] = true
+                body["summary"] = summary
+                payload["body"] = body
+                envelopeBody["payload"] = payload
+                value["body"] = envelopeBody
+            }),
+        ]
+
+        for (name, mutate) in mutations {
+            var value = try fixtureValue(named: name, in: fixtures)
+            try mutate(&value)
+            try assertEnvelopeDecodeRejects(value, at: "unexpected")
+        }
+    }
+
+    func testTransferEnvelopeEnforcesRustBoundsAtRealCodecEntry() throws {
+        let fixtures = try loadRawFixtureObjects()
+        let source = try fixtureValue(named: "transferEnvelope", in: fixtures)
+
+        var maximums = source
+        maximums["partIndex"] = Int(TransferEnvelopeV1.maxPartCount - 1)
+        maximums["partCount"] = Int(TransferEnvelopeV1.maxPartCount)
+        maximums["totalBytes"] = Int(TransferEnvelopeV1.maxTotalBytes)
+        XCTAssertNoThrow(
+            try RuntimeV1WireCodec.decodeTransferEnvelope(
+                JSONSerialization.data(withJSONObject: maximums)
+            )
+        )
+
+        var maximumPart = source
+        maximumPart["part"] = Data(repeating: 0xA5, count: TransferEnvelopeV1.maxPartBytes)
+            .base64EncodedString()
+        XCTAssertNoThrow(
+            try RuntimeV1WireCodec.decodeTransferEnvelope(
+                JSONSerialization.data(withJSONObject: maximumPart)
+            )
+        )
+
+        let invalidMutations: [(String, Any)] = [
+            ("partCount", 0),
+            ("partCount", Int(TransferEnvelopeV1.maxPartCount) + 1),
+            ("partIndex", 1),
+            ("totalBytes", Int(TransferEnvelopeV1.maxTotalBytes) + 1),
+            ("totalSha256", Data(repeating: 0, count: 31).base64EncodedString()),
+            (
+                "part",
+                Data(repeating: 0, count: TransferEnvelopeV1.maxPartBytes + 1)
+                    .base64EncodedString()
+            ),
+        ]
+        for (field, value) in invalidMutations {
+            var invalid = source
+            invalid[field] = value
+            XCTAssertThrowsError(
+                try RuntimeV1WireCodec.decodeTransferEnvelope(
+                    JSONSerialization.data(withJSONObject: invalid)
+                ),
+                field
             )
         }
     }
@@ -115,6 +340,33 @@ final class RuntimeV1ProtocolTests: XCTestCase {
             )
         )
 
+        var missingValue = try XCTUnwrap(snapshot["value"] as? [String: Any])
+        var missingBody = try XCTUnwrap(missingValue["body"] as? [String: Any])
+        var missingPayload = try XCTUnwrap(missingBody["payload"] as? [String: Any])
+        let originalItems = try XCTUnwrap(missingPayload["items"] as? [[String: Any]])
+        missingPayload["items"] = Array(originalItems.dropFirst())
+        missingBody["payload"] = missingPayload
+        missingValue["body"] = missingBody
+        XCTAssertThrowsError(
+            try RuntimeV1WireCodec.decodeEnvelope(
+                JSONSerialization.data(withJSONObject: missingValue)
+            )
+        )
+
+        var duplicateValue = try XCTUnwrap(snapshot["value"] as? [String: Any])
+        var duplicateBody = try XCTUnwrap(duplicateValue["body"] as? [String: Any])
+        var duplicatePayload = try XCTUnwrap(duplicateBody["payload"] as? [String: Any])
+        var duplicateItems = try XCTUnwrap(duplicatePayload["items"] as? [[String: Any]])
+        duplicateItems.append(originalItems[0])
+        duplicatePayload["items"] = duplicateItems
+        duplicateBody["payload"] = duplicatePayload
+        duplicateValue["body"] = duplicateBody
+        XCTAssertThrowsError(
+            try RuntimeV1WireCodec.decodeEnvelope(
+                JSONSerialization.data(withJSONObject: duplicateValue)
+            )
+        )
+
         let transfer = try XCTUnwrap(
             fixtures.first { ($0["case"] as? String) == "transferEnvelope" }
         )
@@ -180,6 +432,46 @@ final class RuntimeV1ProtocolTests: XCTestCase {
         let name: String
         let wireType: String
         let value: Data
+    }
+
+    private func fixtureValue(
+        named name: String,
+        in fixtures: [[String: Any]]
+    ) throws -> [String: Any] {
+        let fixture = try XCTUnwrap(fixtures.first { ($0["case"] as? String) == name })
+        return try XCTUnwrap(fixture["value"] as? [String: Any])
+    }
+
+    private func eventBody(in value: [String: Any]) throws -> [String: Any] {
+        let envelopeBody = try XCTUnwrap(value["body"] as? [String: Any])
+        let payload = try XCTUnwrap(envelopeBody["payload"] as? [String: Any])
+        return try XCTUnwrap(payload["body"] as? [String: Any])
+    }
+
+    private func eventItem(in value: [String: Any]) throws -> [String: Any] {
+        try XCTUnwrap(eventBody(in: value)["item"] as? [String: Any])
+    }
+
+    private func assertEnvelopeDecodeRejects(
+        _ value: [String: Any],
+        at expectedKey: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        do {
+            _ = try RuntimeV1WireCodec.decodeEnvelope(
+                JSONSerialization.data(withJSONObject: value)
+            )
+            XCTFail("decode unexpectedly accepted invalid (expectedKey)", file: file, line: line)
+        } catch let DecodingError.typeMismatch(_, context),
+                let DecodingError.valueNotFound(_, context),
+                let DecodingError.dataCorrupted(context) {
+            XCTAssertEqual(context.codingPath.last?.stringValue, expectedKey, file: file, line: line)
+        } catch let DecodingError.keyNotFound(key, _) {
+            XCTAssertEqual(key.stringValue, expectedKey, file: file, line: line)
+        } catch {
+            XCTFail("unexpected decode error (error)", file: file, line: line)
+        }
     }
 
     private func loadFixtures() throws -> [Fixture] {
