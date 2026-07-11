@@ -127,6 +127,55 @@ final class RuntimeV1ProtocolTests: XCTestCase {
         )
     }
 
+    func testRealDecodeEntryRejectsUnknownFieldsInsideNestedAgentItems() throws {
+        let fixtures = try loadRawFixtureObjects()
+        let snapshot = try XCTUnwrap(
+            fixtures.first { ($0["case"] as? String) == "capabilitiesFirstSnapshot" }
+        )
+        let nestedCases: [(name: String, item: [String: Any])] = [
+            (
+                "diff file",
+                [
+                    "kind": "diff",
+                    "files": [[
+                        "path": "README.md",
+                        "status": "modified",
+                        "unexpected": true,
+                    ]],
+                ]
+            ),
+            (
+                "plan step",
+                [
+                    "kind": "plan",
+                    "steps": [[
+                        "title": "ship Runtime v1",
+                        "status": "pending",
+                        "unexpected": true,
+                    ]],
+                ]
+            ),
+        ]
+
+        for nestedCase in nestedCases {
+            var snapshotValue = try XCTUnwrap(snapshot["value"] as? [String: Any])
+            var body = try XCTUnwrap(snapshotValue["body"] as? [String: Any])
+            var payload = try XCTUnwrap(body["payload"] as? [String: Any])
+            var items = try XCTUnwrap(payload["items"] as? [[String: Any]])
+            items[1]["item"] = nestedCase.item
+            payload["items"] = items
+            body["payload"] = payload
+            snapshotValue["body"] = body
+
+            XCTAssertThrowsError(
+                try RuntimeV1WireCodec.decodeEnvelope(
+                    try JSONSerialization.data(withJSONObject: snapshotValue)
+                ),
+                "nested unknown field must fail closed for \(nestedCase.name)"
+            )
+        }
+    }
+
     private struct Fixture {
         let name: String
         let wireType: String

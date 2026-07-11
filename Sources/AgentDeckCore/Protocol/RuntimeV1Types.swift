@@ -732,8 +732,12 @@ private struct StrictAgentItem: Decodable {
         switch kindValue {
         case "userMessage", "assistantMessage", "reasoning": fields = common + ["text"]
         case "shell": fields = common + ["command", "status", "exitCode", "durationMs"]
-        case "diff": fields = common + ["files"]
-        case "plan": fields = common + ["steps"]
+        case "diff":
+            fields = common + ["files"]
+            _ = try container.decode([StrictDiffFile].self, forKey: key("files"))
+        case "plan":
+            fields = common + ["steps"]
+            _ = try container.decode([StrictPlanStep].self, forKey: key("steps"))
         case "imageReference": fields = common + ["savedPath", "originalPath"]
         case "toolCall": fields = common + ["name", "args", "result"]
         case "raw": fields = common + ["rawKind", "rawPayload"]
@@ -750,5 +754,19 @@ private struct StrictAgentItem: Decodable {
 private struct StrictAgentItemMeta: Decodable {
     init(from decoder: Decoder) throws {
         try rejectUnknownKeys(decoder, allowed: ["vendorExtensions"])
+    }
+}
+
+private struct StrictDiffFile: Decodable {
+    init(from decoder: Decoder) throws {
+        try rejectUnknownKeys(decoder, allowed: ["path", "status", "patch"])
+        _ = try DiffFile(from: decoder)
+    }
+}
+
+private struct StrictPlanStep: Decodable {
+    init(from decoder: Decoder) throws {
+        try rejectUnknownKeys(decoder, allowed: ["title", "status", "detail"])
+        _ = try PlanStep(from: decoder)
     }
 }
