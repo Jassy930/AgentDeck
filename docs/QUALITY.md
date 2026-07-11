@@ -60,6 +60,47 @@ git diff --check
 clippy 被仓库既有 v1/protocol lint 阻塞，仍须运行聚焦 library clippy，并在
 阶段报告中逐项记录既有阻塞，不能用它掩盖 v2 Store 新 warning。
 
+## Relay Companion MVP P2.2 Auth 门禁
+
+P2.2 仍不代表 v2 listener 已上线。改动 canonical auth contract、challenge、
+MachineLink/DeviceLink 验签、Store trust CAS 或 PairingAccess 后至少运行：
+
+```bash
+# 真实 Ed25519、challenge hard bounds、Store restart/CAS、Transitioning fence、
+# singleton owner/store path、caller cancellation、shutdown/Drop、terminal emergency lifecycle、
+# bounded control admission、active replacement、pairing allowlist
+cargo test -p agentdeck-relay --features server \
+  --test relay_v2_auth_e2e -- --test-threads=1
+
+# challenge 内存状态机（含并发双消费与 source/route token bucket）
+cargo test -p agentdeck-relay --lib v2::auth::challenge::tests -- --test-threads=1
+
+# shared canonical contract / typed crypto 与 v1+P2.1 回归
+cargo test -p agentdeck-protocol
+cargo test -p agentdeck-crypto
+cargo test -p agentdeck-relay --features server
+
+# P2.2 production library focused clippy（既有 wire enum 不在本 task 改尺寸）
+cargo clippy -p agentdeck-relay --features server --lib --no-deps -- -D warnings \
+  -A clippy::needless_return -A clippy::collapsible_if \
+  -A clippy::doc_lazy_continuation -A clippy::explicit_auto_deref
+
+# production auth/store 不得增加 panic path；先裁掉 challenge.rs 的内联 test module
+for file in agentdeck-relay/src/v2/auth/*.rs; do
+  awk '/^#\[cfg\(test\)\]/{exit} {print}' "$file"
+done | rg -n 'expect\(|unwrap\(|panic!|eprintln!|todo!|unimplemented!|unreachable!'
+cargo fmt --all --check
+bash scripts/verify-agent-docs.sh
+git diff --check
+```
+
+生产 auth 扫描预期为空输出；文件内 `#[cfg(test)]` 的断言可以单独排除后复核。字面
+protocol `--all-targets -D warnings` 当前仍会命中既有 `trunk.rs` 两处
+`large_enum_variant`、`src/lib.rs` 的 `assertions_on_constants` 与
+`tests/relay_v2_contract.rs` 的 `needless_borrows_for_generic_args`。阶段门禁使用上面的
+production library focused clippy，并在阶段报告记录这些既有 blocker，不能为消 warning
+改 Relay wire enum 大小或夹带无关清理。
+
 ## AppKit 重写后的验证清单
 
 前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。

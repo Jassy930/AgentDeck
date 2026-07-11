@@ -161,6 +161,55 @@ agentdeckd
   restart cleanup 只接受 exact marker、owner/mode、child allowlist 与 unlocked 四重
   证明，逐文件删除后 `remove_dir`，禁止前缀 `remove_dir_all`。
 
+### Relay Companion MVP P2.2 v2 链路鉴权边界
+
+- P2.2 仍是与 v1 listener 并列的 library，不接管生产 WS。Relay v2 的签名字节事实源
+  位于 `agentdeck-protocol::relay_v2::auth`：credential unsigned/full canonical bytes、
+  root-signed `ToBeSignedV1` 与 `AuthenticationTranscriptV1` 都使用独立 domain、长度前缀
+  和大端数字，禁止复用明确声明“不参与签名”的 outer frame codec。
+- `agentdeck-crypto` 只暴露 typed authentication-transcript sign/verify；Relay 复用该 crate
+  的 Ed25519 实现，不建立第二套 raw-sign API。challenge transcript 逐字节绑定 nonce、
+  connection instance、relayServerId、Relay version、machine/device route、generation/
+  serial 与包含 root signature 的 credential hash。
+- `ChallengeRegistry` 只存在于内存：30 秒起精确过期、全局最多 4,096、同一 mutex 内
+  one-shot consume。source 与目标 route 分别使用可配置 token bucket，pending/source/
+  route 三类 map 都有 hard count；bucket idle TTL 只能在 30 秒到 5 分钟内配置，禁止
+  用 `u64::MAX` 实际关闭清理。Registry 不保存原始 source identity，
+  不写 SQLite。
+- 鉴权顺序固定为：消费 challenge → 读取 machine/device trust snapshot → 验
+  MachineRoot cert/grant signature → 验 endpoint challenge signature →
+  `AuthorizationCoordinator` 把 principal route fence 为 `Transitioning` → Store 串行
+  `commit_machine_link_auth` / `confirm_device_auth` → 在同一个无 await 的 actor poll 中提交
+  active generation。`Transitioning` 对数据面等价于非 current；Store 失败只恢复仍未断开的
+  previous entry，COMMIT 成功后不得出现旧 generation 可见窗口。Device Authenticate 不能
+  绕过 `InstallGrant` 自行安装 higher serial。
+- 同一 `RelayStoreHandle` 的共享 ownership 只允许启动一个 `AuthorizationCoordinator`；claim
+  与 raw/authorized trust command 的 `try_send` admission 共用 mutex，保证 admission 顺序即
+  Store worker FIFO 顺序。owner 存活期间，raw register/install/auth-confirm/revoke/purge
+  mutator 与 raw Store shutdown 固定 fail-closed；P2.3/P2.5 Core 必须把所有 trust mutation
+  送入该 coordinator。相同 platform-normalized DB path 在同一进程只能有一个 live Store
+  worker，第二次 `open` 直接拒绝，避免多 worker 破坏 admission FIFO；P2.6 再负责跨进程
+  server lock。
+- active replacement / invalidation 还必须先写入独立 bounded lifecycle channel，再回复
+  caller oneshot。普通槽 512；overflow 使用不依赖普通队列的单独 emergency slot，并把普通
+  backlog 中的 connection IDs 去重合并成 terminal `FailClosedAll`，之后不再返回 stale
+  `Activated`。P2.3 Core 必须持续 drain 并关闭列出的全部 writer/control slot；caller future
+  cancellation 不取消已入队转换，也不能吞掉 writer ID。receiver Drop 同步 poison 并清空
+  registry；coordinator shutdown 也必须先清 active/投递 lifecycle，再释放 owner，随后才允许
+  raw Store shutdown。
+- coordinator public admission 在进入 256-command queue 前先校验 enrollment/revocation
+  control blob 的 64 KiB hard bound；不能只在 actor 出队时校验而让 queue bytes 无界。
+- active registry 以 machine route 或 `(machine route, device route)` 为 key；same authority
+  + same credential 可重连替换，lower 或 same/different 均拒绝。旧连接退出只能
+  `remove_if_current`；P2.3 Core 还必须在 command 出队时调用 `is_current`，防止 replacement
+  前排队的旧 frame 污染新 connection 状态。
+- `PairingHello` 是后续 pairing transport 传给 auth library 的连接元数据，不是新增
+  ADRV2 frame；P2.2 不提前写死 URL/path carrier。`PairingAccess` 仅允许 active、未过期
+  route 上的同 route `PairData` / `ClosePairRoute`，其他 frame 统一拒绝。
+- auth access、challenge、credential、public key/signature 等 `Debug` 输出必须脱敏；route
+  关联标识使用带类型域 SHA-256 的 32-bit 截断，不得直接打印 route 原始前缀。failure 只
+  返回稳定通用 code/message，不泄漏完整 route、key、hash、signature 或验签步骤。
+
 ### R1a 隐含约束（供 R2 参考）
 
 - **R1a machine_id ≡ device_id**：`server/ws.rs::connect` 用 `device.device_id` 作 `ConnRole::Machine.machine_id`，`router.rs` RegisterMachine 授权强制 `machine.machine_id == connection.machine_id`——**enrolled 的 machine 设备的 `machine_id` 严格等于 `device_id`**。CLI 生成的随机 `device_id = "cli-<profile>-<random>"` 会锁定 R2 daemon remote-mode 里对应 machine 的 identifier；R2 设计需评估是否解耦 machine_id 与 device_id（例如 machine 元数据里显式携带独立 machine_id）。

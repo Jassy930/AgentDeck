@@ -3,7 +3,7 @@
 //! 私钥 wrapper zeroize-on-drop（ed25519-dalek `zeroize` feature）且 `Debug` 不输出材料。
 
 use agentdeck_protocol::e2ee::tbs::ToBeSignedV1;
-use agentdeck_protocol::relay_v2::auth::Ed25519Signature;
+use agentdeck_protocol::relay_v2::auth::{AuthenticationTranscriptV1, Ed25519Signature};
 use ed25519_dalek::{Signature, Signer};
 
 use crate::error::CryptoError;
@@ -58,9 +58,7 @@ pub struct VerifyingKey(ed25519_dalek::VerifyingKey);
 
 impl std::fmt::Debug for VerifyingKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("VerifyingKey")
-            .field(&self.0.to_bytes())
-            .finish()
+        f.debug_tuple("VerifyingKey").field(&"<redacted>").finish()
     }
 }
 
@@ -97,6 +95,29 @@ pub fn verify_tbs(
         .map_err(|_| CryptoError::BadSignature)
 }
 
+/// 对 Relay v2 单次 challenge 的 typed canonical transcript 签名。
+///
+/// 本接口故意只接受 [`AuthenticationTranscriptV1`]，避免把 auth call site 退化成可对任意
+/// raw bytes 签名的通用 oracle。
+pub fn sign_authentication_transcript(
+    key: &SigningKey,
+    transcript: &AuthenticationTranscriptV1,
+) -> SignatureBytes {
+    SignatureBytes(key.0.sign(&transcript.encode()).to_bytes())
+}
+
+/// 验证 Relay v2 单次 challenge 的 typed canonical transcript 签名。
+pub fn verify_authentication_transcript(
+    key: &VerifyingKey,
+    transcript: &AuthenticationTranscriptV1,
+    signature: &SignatureBytes,
+) -> Result<(), CryptoError> {
+    let signature = Signature::from_bytes(&signature.0);
+    key.0
+        .verify_strict(&transcript.encode(), &signature)
+        .map_err(|_| CryptoError::BadSignature)
+}
+
 /// 对任意 canonical bytes 验签（供 sealed-blob verifier-hook 复用）。
 pub(crate) fn verify_raw(
     key: &VerifyingKey,
@@ -112,4 +133,108 @@ pub(crate) fn verify_raw(
 /// 对任意 canonical bytes 签名（供 sealed-blob 签名复用）。
 pub(crate) fn sign_raw(key: &SigningKey, message: &[u8]) -> Ed25519Signature {
     Ed25519Signature(key.0.sign(message).to_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use agentdeck_protocol::relay_v2::auth::{AuthenticationRole, AuthenticationTranscriptV1};
+    use agentdeck_protocol::relay_v2::{
+        ConnectionInstanceId, DeviceRouteId, MachineRouteId, RelayServerId,
+    };
+
+    use super::*;
+
+    fn transcript() -> AuthenticationTranscriptV1 {
+        AuthenticationTranscriptV1 {
+            role: AuthenticationRole::MachineLink,
+            challenge_nonce: [1; 32],
+            connection_instance: ConnectionInstanceId::from_bytes([2; 16]),
+            relay_server_id: RelayServerId::from_bytes([3; 16]),
+            relay_protocol_version: 2,
+            machine_route: MachineRouteId::from_bytes([4; 16]),
+            device_route: None,
+            serial_or_generation: 5,
+            credential_sha256: [6; 32],
+        }
+    }
+
+    #[test]
+    fn typed_authentication_signature_golden_is_stable() {
+        let signing = SigningKey::from_seed(&[0x42; 32]);
+        let signature = sign_authentication_transcript(&signing, &transcript());
+        assert_eq!(
+            signature.0,
+            [
+                0xd3, 0xb5, 0x86, 0xf2, 0x35, 0x8a, 0xed, 0x77, 0x5b, 0x3b, 0x83, 0x21, 0xc1, 0x34,
+                0x52, 0x33, 0x93, 0xd4, 0xd6, 0x04, 0x81, 0x1b, 0x3a, 0x68, 0x32, 0x7a, 0x5a, 0xfe,
+                0xec, 0x28, 0x7d, 0x1a, 0x9b, 0xbf, 0x9c, 0x82, 0x79, 0xda, 0xd3, 0x3a, 0x12, 0xcf,
+                0x03, 0x9e, 0xd8, 0x33, 0x0d, 0xb9, 0x2d, 0x1a, 0x97, 0xe7, 0x21, 0xcc, 0x85, 0x5c,
+                0x99, 0x33, 0x04, 0x6a, 0x31, 0x70, 0x11, 0x04,
+            ]
+        );
+        verify_authentication_transcript(&signing.verifying_key(), &transcript(), &signature)
+            .expect("golden signature verifies");
+    }
+
+    #[test]
+    fn typed_authentication_signature_rejects_every_bound_field_tamper() {
+        let signing = SigningKey::from_seed(&[0x42; 32]);
+        let base = transcript();
+        let signature = sign_authentication_transcript(&signing, &base);
+        let mut tampered = Vec::new();
+
+        let mut value = base.clone();
+        value.role = AuthenticationRole::Device;
+        tampered.push(value);
+        let mut value = base.clone();
+        value.challenge_nonce[0] ^= 1;
+        tampered.push(value);
+        let mut value = base.clone();
+        value.connection_instance = ConnectionInstanceId::from_bytes([7; 16]);
+        tampered.push(value);
+        let mut value = base.clone();
+        value.relay_server_id = RelayServerId::from_bytes([7; 16]);
+        tampered.push(value);
+        let mut value = base.clone();
+        value.relay_protocol_version = 3;
+        tampered.push(value);
+        let mut value = base.clone();
+        value.machine_route = MachineRouteId::from_bytes([7; 16]);
+        tampered.push(value);
+        let mut value = base.clone();
+        value.device_route = Some(DeviceRouteId::from_bytes([7; 16]));
+        tampered.push(value);
+        let mut value = base.clone();
+        value.serial_or_generation += 1;
+        tampered.push(value);
+        let mut value = base;
+        value.credential_sha256[0] ^= 1;
+        tampered.push(value);
+
+        for changed in tampered {
+            assert_eq!(
+                verify_authentication_transcript(&signing.verifying_key(), &changed, &signature),
+                Err(CryptoError::BadSignature)
+            );
+        }
+    }
+
+    #[test]
+    fn typed_authentication_signature_rejects_wrong_key_and_signature() {
+        let signing = SigningKey::from_seed(&[0x42; 32]);
+        let wrong = SigningKey::from_seed(&[0x43; 32]);
+        let transcript = transcript();
+        let signature = sign_authentication_transcript(&signing, &transcript);
+        assert_eq!(
+            verify_authentication_transcript(&wrong.verifying_key(), &transcript, &signature),
+            Err(CryptoError::BadSignature)
+        );
+
+        let mut changed = signature;
+        changed.0[0] ^= 1;
+        assert_eq!(
+            verify_authentication_transcript(&signing.verifying_key(), &transcript, &changed),
+            Err(CryptoError::BadSignature)
+        );
+    }
 }

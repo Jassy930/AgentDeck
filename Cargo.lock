@@ -70,6 +70,7 @@ dependencies = [
 name = "agentdeck-relay"
 version = "0.1.0"
 dependencies = [
+ "agentdeck-crypto",
  "agentdeck-protocol",
  "agentdeck-relay-client",
  "async-trait",

@@ -6,4 +6,5 @@ mod sqlite;
 mod worker;
 
 pub use model::*;
+pub(crate) use worker::AuthorizationOwner;
 pub use worker::RelayStoreHandle;

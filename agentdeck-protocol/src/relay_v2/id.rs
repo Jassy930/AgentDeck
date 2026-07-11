@@ -20,6 +20,7 @@
 use rand::RngCore;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// 16-byte 数组的 base64 wire 编解码（与既有 `b64_hash` 风格一致）。
 pub(crate) mod b64_16 {
@@ -125,10 +126,17 @@ macro_rules! random_id_128 {
                 Self(b)
             }
 
-            /// 脱敏短 hash（前 4 bytes 的 hex）——供日志使用，绝不打印完整 route ID
-            /// （design §12.3）。
+            /// 带类型域的 SHA-256 脱敏短 hash（前 4 digest bytes 的 hex）——供日志关联，
+            /// 绝不直接暴露 route 原始前缀或完整 ID（design §12.3）。
             pub fn redacted(&self) -> String {
-                self.0[..4].iter().map(|x| format!("{x:02x}")).collect()
+                let mut hasher = Sha256::new();
+                hasher.update(b"agentdeck-relay-log-route-v1\0");
+                hasher.update(stringify!($name).as_bytes());
+                hasher.update(self.0);
+                hasher.finalize()[..4]
+                    .iter()
+                    .map(|x| format!("{x:02x}"))
+                    .collect()
             }
         }
     };
@@ -232,3 +240,18 @@ monotonic_u64!(
     /// key directory revision（成员/epoch 变化时递增）。
     KeyDirectoryRevision
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacted_route_is_domain_separated_hash_not_raw_prefix() {
+        let machine = MachineRouteId::from_bytes([0xaa; 16]);
+        let device = DeviceRouteId::from_bytes([0xaa; 16]);
+        assert_eq!(machine.redacted().len(), 8);
+        assert_ne!(machine.redacted(), "aaaaaaaa");
+        assert_ne!(machine.redacted(), device.redacted());
+        assert_eq!(machine.redacted(), machine.redacted());
+    }
+}

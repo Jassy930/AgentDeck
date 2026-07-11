@@ -44,7 +44,7 @@ pub struct Hello {
     pub protocol_version: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Challenge {
     pub relay_server_id: RelayServerId,
@@ -54,8 +54,19 @@ pub struct Challenge {
     pub challenge_nonce: [u8; 32],
 }
 
+impl std::fmt::Debug for Challenge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Challenge")
+            .field("relay_server", &"<redacted>")
+            .field("connection", &"<redacted>")
+            .field("nonce", &"<redacted>")
+            .finish()
+    }
+}
+
 /// 连接鉴权凭据（design §6.4）：MachineLink 用 link cert，DeviceLink 用 RelayGrant。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum AuthProof {
     MachineLink {
@@ -67,12 +78,38 @@ pub enum AuthProof {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+impl std::fmt::Debug for AuthProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MachineLink { machine_route, .. } => formatter
+                .debug_struct("MachineLink")
+                .field("machine", &machine_route.redacted())
+                .field("credential", &"<redacted>")
+                .finish(),
+            Self::Device { .. } => formatter
+                .debug_struct("Device")
+                .field("credential", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Authenticate {
     pub proof: AuthProof,
     /// 对 challenge transcript 的签名（MachineLinkSign / DeviceSign）。
     pub signature: Ed25519Signature,
+}
+
+impl std::fmt::Debug for Authenticate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Authenticate")
+            .field("proof", &self.proof)
+            .field("signature", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

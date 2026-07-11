@@ -136,6 +136,10 @@ pub enum StoreError {
     WorkerBusy,
     #[error("Relay store worker stopped before replying")]
     WorkerStopped,
+    #[error("Relay store path is already open in this process")]
+    StoreAlreadyOpen,
+    #[error("Relay trust mutations are owned by the authorization coordinator")]
+    AuthorizationOwned,
     #[error("invalid store value for {field}: {reason}")]
     InvalidValue {
         field: &'static str,
@@ -165,6 +169,8 @@ pub enum StoreError {
     EnrollmentCodeConflict,
     #[error("device grant has been revoked")]
     Revoked,
+    #[error("authentication state does not match the persisted {field}")]
+    AuthenticationMismatch { field: &'static str },
     #[error("retention quota exceeded: {scope}")]
     QuotaExceeded { scope: &'static str },
     #[error("available disk space is below the configured safety reserve")]
@@ -195,6 +201,8 @@ impl StoreError {
             | Self::Sqlite(_)
             | Self::SchemaInspectionRaced
             | Self::WorkerUnavailable
+            | Self::StoreAlreadyOpen
+            | Self::AuthorizationOwned
             | Self::WorkerStopped => "relay.store.unavailable",
             Self::WorkerBusy => "relay.store.busy",
             Self::InvalidValue { .. } => "relay.store.invalid_value",
@@ -210,6 +218,7 @@ impl StoreError {
             Self::EnrollmentCodeNotFound => "relay.store.enrollment_not_found",
             Self::EnrollmentCodeExpired => "relay.store.enrollment_expired",
             Self::Revoked => "relay.auth.revoked",
+            Self::AuthenticationMismatch { .. } => "relay.auth.invalid_grant",
             Self::QuotaExceeded { .. } => "relay.quota.exceeded",
             Self::DiskSpaceLow => "relay.disk.low",
             Self::FrameTooLarge => "relay.frame.too_large",
@@ -232,6 +241,21 @@ pub fn validate_store_path(path: &Path) -> Result<(), StoreError> {
         return Err(StoreError::PathNotCanonical);
     }
     Ok(())
+}
+
+/// macOS 的 `/var` 是系统提供且不可由普通用户替换的 `/private/var` alias。Store 打开、
+/// process-local ownership key 与后续路径检查必须共用这一规范化，避免同一 DB 双 owner。
+#[cfg(target_os = "macos")]
+pub(crate) fn normalize_platform_root_alias(path: &Path) -> PathBuf {
+    match path.strip_prefix("/var") {
+        Ok(suffix) => Path::new("/private/var").join(suffix),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn normalize_platform_root_alias(path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -346,6 +370,8 @@ pub enum FaultPoint {
     RegisterMachineBeforeCommit,
     RegisterMachineAfterCommit,
     InstallGrantBeforeCommit,
+    MachineLinkAuthBeforeCommit,
+    DeviceAuthBeforeConfirm,
     RegisterStreamBeforeCommit,
     PublishBeforeCommit,
     PublishAfterCommit,
@@ -399,6 +425,121 @@ pub struct MachineRecord {
     pub response_blob: Vec<u8>,
     pub receipt_hash: [u8; 32],
     pub duplicate: bool,
+}
+
+/// Relay 鉴权所需的最小 machine trust 快照。只包含公开验签材料与单调状态，
+/// 不包含任何 endpoint 私钥、业务权限或对称 key。
+#[derive(Clone, PartialEq, Eq)]
+pub struct MachineTrustView {
+    pub relay_server_id: RelayServerId,
+    pub machine_route: MachineRouteId,
+    pub root_key_id: RootKeyId,
+    pub root_pubkey: PublicKeyBytes,
+    pub trust_epoch: TrustEpoch,
+    pub highest_link_generation: LinkGeneration,
+    pub link_cert_hash: [u8; 32],
+}
+
+impl fmt::Debug for MachineTrustView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MachineTrustView")
+            .field("machine", &self.machine_route.redacted())
+            .field("trust_epoch", &self.trust_epoch.value())
+            .field(
+                "highest_link_generation",
+                &self.highest_link_generation.value(),
+            )
+            .field("trust_material", &"<redacted>")
+            .finish()
+    }
+}
+
+/// 当前 device grant 与其 machine trust domain 的同一 worker 快照。
+#[derive(Clone, PartialEq, Eq)]
+pub struct DeviceTrustView {
+    pub machine: MachineTrustView,
+    pub device_route: DeviceRouteId,
+    pub auth_pubkey: PublicKeyBytes,
+    pub auth_fingerprint: [u8; 32],
+    pub grant_serial: GrantSerial,
+    pub grant_hash: [u8; 32],
+    pub revoked: bool,
+}
+
+impl fmt::Debug for DeviceTrustView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeviceTrustView")
+            .field("machine", &self.machine.machine_route.redacted())
+            .field("device", &self.device_route.redacted())
+            .field("grant_serial", &self.grant_serial.value())
+            .field("revoked", &self.revoked)
+            .field("trust_material", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct CommitMachineLinkAuth {
+    pub machine_route: MachineRouteId,
+    pub root_key_id: RootKeyId,
+    pub trust_epoch: TrustEpoch,
+    pub generation: LinkGeneration,
+    pub cert_hash: [u8; 32],
+}
+
+impl fmt::Debug for CommitMachineLinkAuth {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommitMachineLinkAuth")
+            .field("machine", &self.machine_route.redacted())
+            .field("generation", &self.generation.value())
+            .field("trust_material", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct MachineLinkAuthCommit {
+    pub machine_route: MachineRouteId,
+    pub generation: LinkGeneration,
+    pub cert_hash: [u8; 32],
+    pub duplicate: bool,
+}
+
+impl fmt::Debug for MachineLinkAuthCommit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MachineLinkAuthCommit")
+            .field("machine", &self.machine_route.redacted())
+            .field("generation", &self.generation.value())
+            .field("duplicate", &self.duplicate)
+            .field("cert_hash", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConfirmDeviceAuth {
+    pub machine_route: MachineRouteId,
+    pub device_route: DeviceRouteId,
+    pub grant_serial: GrantSerial,
+    pub grant_hash: [u8; 32],
+    pub auth_pubkey: PublicKeyBytes,
+    pub auth_fingerprint: [u8; 32],
+}
+
+impl fmt::Debug for ConfirmDeviceAuth {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfirmDeviceAuth")
+            .field("machine", &self.machine_route.redacted())
+            .field("device", &self.device_route.redacted())
+            .field("grant_serial", &self.grant_serial.value())
+            .field("trust_material", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

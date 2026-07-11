@@ -120,6 +120,48 @@ bytes、replay page count/bytes 与磁盘 reserve bytes/percent；转换为
 | `relay.frame.too_large` | canonical outer frame 超过 4 MiB | 按 transfer part 规则拆分，不能截断 |
 | `relay.replay.gap` / `relay.replay.cursor_invalid` | cursor 已被淘汰或 continuation 不属于本次 replay | 暂停 live，执行 bounded backfill/snapshot 后重新订阅 |
 
+## Relay v2 鉴权诊断（Companion MVP P2.2）
+
+P2.2 只建立 challenge/auth/access library，生产 listener 仍未切到 v2。每次普通
+machine/device 连接都必须取得 Relay 新生成的 32-byte challenge；challenge 仅内存保存、
+30 秒起过期、单次消费、全局最多 4,096。source/route token bucket 或任一内存 hard
+bound 拒绝不会访问 SQLite，也不会产生半个授权状态；bucket idle TTL 只允许配置在
+30 秒到 5 分钟之间，不能用超大值关闭回收。
+
+MachineLink 必须同时通过 MachineRoot-signed Link cert、absolute cert expiry、持久化
+trust epoch/link generation gate 和 MachineLinkSign challenge signature。DeviceLink 必须
+同时通过 MachineRoot-signed RelayGrant、当前持久化 serial/hash/pubkey/fingerprint、
+tombstone 与 DeviceSign challenge signature。验签通过后仍需 Store CAS/confirm 成功，才会
+原子替换 active connection。`AuthorizationCoordinator` 在 Store mutation 前把 route 标为
+`Transitioning`，这时所有数据面 `is_current` 检查都必须失败；Store 失败只恢复仍在线的旧
+entry，COMMIT 成功后在同一 actor poll 中提交 replacement/invalidation。COMMIT fault、旧
+generation、未安装的 higher grant 或错误签名都不能踢掉旧连接。
+
+每个 Store 只能有一个 coordinator owner；owner 存活时 raw trust mutator 被拒绝。active
+变更同时写入独立 bounded lifecycle channel，P2.3 Core 必须持续读取并关闭返回的旧 writer。
+caller future 取消不取消转换；普通 lifecycle channel 满时独立 emergency slot 会把 backlog
+与当前受影响 connection IDs 合并为 terminal `FailClosedAll`。收到 terminal 后必须关闭 Core
+拥有的全部列出 writer 且不再处理旧 lifecycle backlog。receiver Drop 会立即 poison/清空
+active；coordinator shutdown 先投递失效并释放 owner，随后才允许 Store shutdown。相同
+platform-normalized DB path 的第二个进程内 Store worker 会被拒绝；跨进程 lock 留给 P2.6
+server lifecycle。
+
+对外错误故意不报告“哪一段签名/哪个字段错误”，避免把 Relay 变成 trust inventory
+oracle。诊断日志同样只能记录 failure code、脱敏 route 短标识和阶段，不得格式化完整
+`Authenticate`、credential、challenge 或 access context。
+
+| v2 auth/route code | 含义 | 下一步 |
+| --- | --- | --- |
+| `relay.auth.invalid_grant` | cert/grant、root/trust、route、generation/serial、hash 或任一签名不满足同一 trust domain | 停止自动重试；核对本地持久 grant/cert。状态不一致或 key 丢失时按机器重新配对 |
+| `relay.auth.revoked` | 当前 device route/serial 已有 terminal tombstone | 立即关闭旧链路并重新配对；禁止提高 serial 复活同 route |
+| `relay.auth.challenge_expired` | consume 时已达到 30 秒 TTL | 建立新连接并取得全新 challenge；不得复用旧签名 |
+| `relay.auth.replay` | challenge 不存在、source 不匹配、connection collision 或已消费 | 丢弃当前握手并重新连接；若持续出现，检查重复 writer/重放 |
+| `relay.quota.exceeded` | challenge pending、source/route token bucket、bucket map 或 active connection hard bound 已满 | 对该 source 退避；检查异常握手洪泛，不能调成无界 |
+| `relay.store.unavailable` | trust snapshot、单调 CAS/confirm、coordinator ownership/lifecycle 或 challenge 内部状态不可用 | 不激活新连接并关闭该 Core 的现存 writer；恢复唯一 coordinator/Store 后用新 challenge 重试 |
+| `relay.route.not_found` | PairRoute 不存在、server/route 不匹配或已过 absolute expiry | 关闭 pairing connection，重新生成并带外传递 PairInvite |
+| `relay.route.forbidden` | PairingAccess 发送了 PairData/Close 之外的 frame，或 route 不匹配 | 立即拒绝该 frame；重复越权应关闭连接 |
+| `relay.version.unsupported` | pairing/普通握手不是 Relay v2 | 升级 client/Relay；禁止自动降级到 v1 |
+
 ## Failure Codes
 
 | code | 含义 | 下一步 |

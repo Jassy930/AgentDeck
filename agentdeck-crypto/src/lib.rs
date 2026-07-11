@@ -33,4 +33,7 @@ pub use canonical::sha256;
 pub use error::CryptoError;
 pub use hpke::{HpkeEnvelopeV1, HpkePrivateKey, HpkePublicKey, hpke_open_base, hpke_seal_base};
 pub use sealed_blob::{sign_sealed, verify_sealed};
-pub use signature::{SignatureBytes, SigningKey, VerifyingKey, sign_tbs, verify_tbs};
+pub use signature::{
+    SignatureBytes, SigningKey, VerifyingKey, sign_authentication_transcript, sign_tbs,
+    verify_authentication_transcript, verify_tbs,
+};

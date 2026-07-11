@@ -27,7 +27,8 @@ pub mod schema;
 pub const RELAY_PROTOCOL_VERSION: u16 = 2;
 
 pub use auth::{
-    CertRole, DeviceRevocation, Ed25519Signature, PublicKeyBytes, RelayGrant, SignedCertificate,
+    AUTH_SIGNATURE_FORMAT_VERSION, AuthenticationRole, AuthenticationTranscriptV1, CertRole,
+    DeviceRevocation, Ed25519Signature, PublicKeyBytes, RelayGrant, SignedCertificate,
 };
 pub use codec::{CodecError, MAX_FRAME_BYTES, RELAY_FRAME_MAGIC, decode, encode};
 pub use cursor::StreamCursor;

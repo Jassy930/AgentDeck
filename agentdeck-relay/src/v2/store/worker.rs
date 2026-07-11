@@ -1,17 +1,23 @@
 //! 单一 blocking worker 独占 SQLite connection 的 async handle。
 
+use std::collections::HashMap;
 use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use tokio::sync::{mpsc, oneshot};
 
 use super::model::{
-    EnrollmentCodeSeed, GrantCommit, InstallGrantRecord, MAX_CONTROL_BLOB_BYTES, MachineRecord,
-    MaintenanceReport, PersistAck, PersistPublish, PersistRevocation, PersistSubscription,
-    PersistUnsubscribe, PublishCommit, PurgeMachine, PurgeReadback, RegisterMachine,
-    RelayV2StoreConfig, ReplayPage, ReplayPageRequest, RevocationCommit, StoreError, StoreSnapshot,
-    StreamRecord, StreamRegistration, SubscriptionLease, UnsubscribeCommit,
+    CommitMachineLinkAuth, ConfirmDeviceAuth, DeviceTrustView, EnrollmentCodeSeed, GrantCommit,
+    InstallGrantRecord, MAX_CONTROL_BLOB_BYTES, MachineLinkAuthCommit, MachineRecord,
+    MachineTrustView, MaintenanceReport, PersistAck, PersistPublish, PersistRevocation,
+    PersistSubscription, PersistUnsubscribe, PublishCommit, PurgeMachine, PurgeReadback,
+    RegisterMachine, RelayV2StoreConfig, ReplayPage, ReplayPageRequest, RevocationCommit,
+    StoreError, StoreSnapshot, StreamRecord, StreamRegistration, SubscriptionLease,
+    UnsubscribeCommit, normalize_platform_root_alias,
 };
 use super::sqlite;
+use agentdeck_protocol::relay_v2::{DeviceRouteId, MachineRouteId};
 
 // Publish command may carry a full 4 MiB frame. Keep the actor queue deliberately
 // small and use non-waiting admission: the store owns at most four queued commands
@@ -21,6 +27,42 @@ const STORE_COMMAND_CAPACITY: usize = 4;
 #[derive(Clone)]
 pub struct RelayStoreHandle {
     tx: mpsc::Sender<StoreCommand>,
+    authorization_ownership: Arc<AuthorizationOwnership>,
+}
+
+struct AuthorizationOwnership {
+    claimed: Mutex<bool>,
+}
+
+struct StoreOpenLease;
+
+fn claim_store_path(storage_path: &Path) -> Result<Arc<StoreOpenLease>, StoreError> {
+    static OPEN_STORES: OnceLock<Mutex<HashMap<PathBuf, Weak<StoreOpenLease>>>> = OnceLock::new();
+    let registry = OPEN_STORES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut open_stores = registry.lock().map_err(|_| StoreError::WorkerUnavailable)?;
+    open_stores.retain(|_, lease| lease.strong_count() > 0);
+    if open_stores
+        .get(storage_path)
+        .and_then(Weak::upgrade)
+        .is_some()
+    {
+        return Err(StoreError::StoreAlreadyOpen);
+    }
+    let lease = Arc::new(StoreOpenLease);
+    open_stores.insert(storage_path.to_path_buf(), Arc::downgrade(&lease));
+    Ok(lease)
+}
+
+pub(crate) struct AuthorizationOwner {
+    ownership: Arc<AuthorizationOwnership>,
+}
+
+impl Drop for AuthorizationOwner {
+    fn drop(&mut self) {
+        if let Ok(mut claimed) = self.ownership.claimed.lock() {
+            *claimed = false;
+        }
+    }
 }
 
 impl fmt::Debug for RelayStoreHandle {
@@ -35,15 +77,23 @@ impl RelayStoreHandle {
     /// 启动专用 std blocking worker；只有 worker 完成 schema、migration、PRAGMA
     /// 与快照读回后，startup oneshot 才返回成功。
     pub async fn open(config: RelayV2StoreConfig) -> Result<Self, StoreError> {
+        let ownership_path = normalize_platform_root_alias(&config.storage_path);
+        let open_lease = claim_store_path(&ownership_path)?;
+        let authorization_ownership = Arc::new(AuthorizationOwnership {
+            claimed: Mutex::new(false),
+        });
         let (tx, rx) = mpsc::channel(STORE_COMMAND_CAPACITY);
         let (ready_tx, ready_rx) = oneshot::channel();
 
         std::thread::Builder::new()
             .name("agentdeck-relay-v2-store".to_owned())
-            .spawn(move || run(config, rx, ready_tx))?;
+            .spawn(move || run(config, rx, ready_tx, open_lease))?;
 
         match ready_rx.await {
-            Ok(Ok(())) => Ok(Self { tx }),
+            Ok(Ok(())) => Ok(Self {
+                tx,
+                authorization_ownership,
+            }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(StoreError::WorkerStopped),
         }
@@ -51,6 +101,73 @@ impl RelayStoreHandle {
 
     pub async fn inspect(&self) -> Result<StoreSnapshot, StoreError> {
         self.dispatch(|reply| StoreCommand::Inspect { reply }).await
+    }
+
+    pub async fn machine_trust(
+        &self,
+        machine_route: MachineRouteId,
+    ) -> Result<MachineTrustView, StoreError> {
+        self.dispatch(|reply| StoreCommand::MachineTrust {
+            machine_route,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn device_trust(
+        &self,
+        machine_route: MachineRouteId,
+        device_route: DeviceRouteId,
+    ) -> Result<DeviceTrustView, StoreError> {
+        self.dispatch(|reply| StoreCommand::DeviceTrust {
+            machine_route,
+            device_route,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn commit_machine_link_auth(
+        &self,
+        request: CommitMachineLinkAuth,
+    ) -> Result<MachineLinkAuthCommit, StoreError> {
+        self.dispatch_trust(None, |reply| StoreCommand::CommitMachineLinkAuth {
+            request,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn confirm_device_auth(&self, request: ConfirmDeviceAuth) -> Result<(), StoreError> {
+        self.dispatch_trust(None, |reply| StoreCommand::ConfirmDeviceAuth {
+            request,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn commit_machine_link_auth_authorized(
+        &self,
+        owner: &AuthorizationOwner,
+        request: CommitMachineLinkAuth,
+    ) -> Result<MachineLinkAuthCommit, StoreError> {
+        self.dispatch_trust(Some(owner), |reply| StoreCommand::CommitMachineLinkAuth {
+            request,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn confirm_device_auth_authorized(
+        &self,
+        owner: &AuthorizationOwner,
+        request: ConfirmDeviceAuth,
+    ) -> Result<(), StoreError> {
+        self.dispatch_trust(Some(owner), |reply| StoreCommand::ConfirmDeviceAuth {
+            request,
+            reply,
+        })
+        .await
     }
 
     pub async fn seed_enrollment_code(
@@ -65,13 +182,29 @@ impl RelayStoreHandle {
         &self,
         request: RegisterMachine,
     ) -> Result<MachineRecord, StoreError> {
+        self.register_machine_inner(None, request).await
+    }
+
+    pub(crate) async fn register_machine_authorized(
+        &self,
+        owner: &AuthorizationOwner,
+        request: RegisterMachine,
+    ) -> Result<MachineRecord, StoreError> {
+        self.register_machine_inner(Some(owner), request).await
+    }
+
+    async fn register_machine_inner(
+        &self,
+        owner: Option<&AuthorizationOwner>,
+        request: RegisterMachine,
+    ) -> Result<MachineRecord, StoreError> {
         if request.response_blob.len() > MAX_CONTROL_BLOB_BYTES {
             return Err(StoreError::InvalidValue {
                 field: "register_machine.response_blob",
                 reason: "control blob exceeds 64 KiB",
             });
         }
-        self.dispatch(|reply| StoreCommand::RegisterMachine {
+        self.dispatch_trust(owner, |reply| StoreCommand::RegisterMachine {
             request: Box::new(request),
             reply,
         })
@@ -82,7 +215,23 @@ impl RelayStoreHandle {
         &self,
         request: InstallGrantRecord,
     ) -> Result<GrantCommit, StoreError> {
-        self.dispatch(|reply| StoreCommand::InstallGrant { request, reply })
+        self.install_grant_inner(None, request).await
+    }
+
+    pub(crate) async fn install_grant_authorized(
+        &self,
+        owner: &AuthorizationOwner,
+        request: InstallGrantRecord,
+    ) -> Result<GrantCommit, StoreError> {
+        self.install_grant_inner(Some(owner), request).await
+    }
+
+    async fn install_grant_inner(
+        &self,
+        owner: Option<&AuthorizationOwner>,
+        request: InstallGrantRecord,
+    ) -> Result<GrantCommit, StoreError> {
+        self.dispatch_trust(owner, |reply| StoreCommand::InstallGrant { request, reply })
             .await
     }
 
@@ -127,18 +276,50 @@ impl RelayStoreHandle {
     }
 
     pub async fn revoke(&self, request: PersistRevocation) -> Result<RevocationCommit, StoreError> {
+        self.revoke_inner(None, request).await
+    }
+
+    pub(crate) async fn revoke_authorized(
+        &self,
+        owner: &AuthorizationOwner,
+        request: PersistRevocation,
+    ) -> Result<RevocationCommit, StoreError> {
+        self.revoke_inner(Some(owner), request).await
+    }
+
+    async fn revoke_inner(
+        &self,
+        owner: Option<&AuthorizationOwner>,
+        request: PersistRevocation,
+    ) -> Result<RevocationCommit, StoreError> {
         if request.signed_revocation_blob.len() > MAX_CONTROL_BLOB_BYTES {
             return Err(StoreError::InvalidValue {
                 field: "revocation.signed_blob",
                 reason: "control blob exceeds 64 KiB",
             });
         }
-        self.dispatch(|reply| StoreCommand::Revoke { request, reply })
+        self.dispatch_trust(owner, |reply| StoreCommand::Revoke { request, reply })
             .await
     }
 
     pub async fn purge_machine(&self, request: PurgeMachine) -> Result<PurgeReadback, StoreError> {
-        self.dispatch(|reply| StoreCommand::PurgeMachine { request, reply })
+        self.purge_machine_inner(None, request).await
+    }
+
+    pub(crate) async fn purge_machine_authorized(
+        &self,
+        owner: &AuthorizationOwner,
+        request: PurgeMachine,
+    ) -> Result<PurgeReadback, StoreError> {
+        self.purge_machine_inner(Some(owner), request).await
+    }
+
+    async fn purge_machine_inner(
+        &self,
+        owner: Option<&AuthorizationOwner>,
+        request: PurgeMachine,
+    ) -> Result<PurgeReadback, StoreError> {
+        self.dispatch_trust(owner, |reply| StoreCommand::PurgeMachine { request, reply })
             .await
     }
 
@@ -150,8 +331,57 @@ impl RelayStoreHandle {
     }
 
     pub async fn shutdown(&self) -> Result<(), StoreError> {
-        self.dispatch(|reply| StoreCommand::Shutdown { reply })
+        self.dispatch_trust(None, |reply| StoreCommand::Shutdown { reply })
             .await
+    }
+
+    pub(crate) fn claim_authorization_owner(&self) -> Result<AuthorizationOwner, StoreError> {
+        let mut claimed = self
+            .authorization_ownership
+            .claimed
+            .lock()
+            .map_err(|_| StoreError::WorkerUnavailable)?;
+        if *claimed {
+            return Err(StoreError::AuthorizationOwned);
+        }
+        *claimed = true;
+        drop(claimed);
+        Ok(AuthorizationOwner {
+            ownership: self.authorization_ownership.clone(),
+        })
+    }
+
+    async fn dispatch_trust<T>(
+        &self,
+        owner: Option<&AuthorizationOwner>,
+        command: impl FnOnce(oneshot::Sender<Result<T, StoreError>>) -> StoreCommand,
+    ) -> Result<T, StoreError> {
+        let response = {
+            let claimed = self
+                .authorization_ownership
+                .claimed
+                .lock()
+                .map_err(|_| StoreError::WorkerUnavailable)?;
+            let authorized = match owner {
+                Some(owner) => {
+                    Arc::ptr_eq(&self.authorization_ownership, &owner.ownership) && *claimed
+                }
+                None => !*claimed,
+            };
+            if !authorized {
+                return Err(StoreError::AuthorizationOwned);
+            }
+            let (reply, response) = oneshot::channel();
+            match self.tx.try_send(command(reply)) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => return Err(StoreError::WorkerBusy),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(StoreError::WorkerUnavailable);
+                }
+            }
+            response
+        };
+        response.await.map_err(|_| StoreError::WorkerStopped)?
     }
 
     async fn dispatch<T>(
@@ -173,6 +403,23 @@ impl RelayStoreHandle {
 enum StoreCommand {
     Inspect {
         reply: oneshot::Sender<Result<StoreSnapshot, StoreError>>,
+    },
+    MachineTrust {
+        machine_route: MachineRouteId,
+        reply: oneshot::Sender<Result<MachineTrustView, StoreError>>,
+    },
+    DeviceTrust {
+        machine_route: MachineRouteId,
+        device_route: DeviceRouteId,
+        reply: oneshot::Sender<Result<DeviceTrustView, StoreError>>,
+    },
+    CommitMachineLinkAuth {
+        request: CommitMachineLinkAuth,
+        reply: oneshot::Sender<Result<MachineLinkAuthCommit, StoreError>>,
+    },
+    ConfirmDeviceAuth {
+        request: ConfirmDeviceAuth,
+        reply: oneshot::Sender<Result<(), StoreError>>,
     },
     SeedEnrollmentCode {
         request: EnrollmentCodeSeed,
@@ -230,6 +477,7 @@ fn run(
     config: RelayV2StoreConfig,
     mut rx: mpsc::Receiver<StoreCommand>,
     ready: oneshot::Sender<Result<(), StoreError>>,
+    open_lease: Arc<StoreOpenLease>,
 ) {
     let mut conn = match sqlite::open(&config) {
         Ok(conn) => conn,
@@ -247,6 +495,27 @@ fn run(
         match command {
             StoreCommand::Inspect { reply } => {
                 let _ = reply.send(sqlite::snapshot(&conn));
+            }
+            StoreCommand::MachineTrust {
+                machine_route,
+                reply,
+            } => {
+                let _ = reply.send(sqlite::machine_trust(&conn, machine_route));
+            }
+            StoreCommand::DeviceTrust {
+                machine_route,
+                device_route,
+                reply,
+            } => {
+                let _ = reply.send(sqlite::device_trust(&conn, machine_route, device_route));
+            }
+            StoreCommand::CommitMachineLinkAuth { request, reply } => {
+                let _ = reply.send(sqlite::commit_machine_link_auth(
+                    &mut conn, &config, request,
+                ));
+            }
+            StoreCommand::ConfirmDeviceAuth { request, reply } => {
+                let _ = reply.send(sqlite::confirm_device_auth(&conn, &config, request));
             }
             StoreCommand::SeedEnrollmentCode { request, reply } => {
                 let _ = reply.send(sqlite::seed_enrollment_code(&mut conn, &config, request));
@@ -286,6 +555,7 @@ fn run(
             }
             StoreCommand::Shutdown { reply } => {
                 drop(conn);
+                drop(open_lease);
                 let _ = reply.send(Ok(()));
                 return;
             }

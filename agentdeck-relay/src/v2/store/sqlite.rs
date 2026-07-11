@@ -5,8 +5,9 @@ use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 use agentdeck_protocol::relay_v2::{
-    CertRole, DeviceRouteId, GrantSerial, LinkGeneration, MachineRouteId, RelayFrameBody,
-    RelayServerId, RootKeyId, StreamCursor, StreamGenerationId, StreamRouteId, TrustEpoch,
+    CertRole, DeviceRouteId, GrantSerial, LinkGeneration, MachineRouteId, PublicKeyBytes,
+    RelayFrameBody, RelayServerId, RootKeyId, StreamCursor, StreamGenerationId, StreamRouteId,
+    TrustEpoch,
 };
 use fs2::FileExt;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -14,14 +15,16 @@ use sha2::{Digest, Sha256};
 
 use super::migrations::{self, SCHEMA_VERSION, SchemaError, SchemaState};
 use super::model::{
-    EMPTY_HIGH_WATER_TEXT, EnrollmentCodeSeed, FaultPoint, GrantCommit, InstallGrantRecord,
-    MAX_CONTROL_BLOB_BYTES, MAX_ENROLLMENT_CODES, MachineRecord, MaintenanceReport, PersistAck,
-    PersistPublish, PersistRevocation, PersistSubscription, PersistUnsubscribe, PublishCommit,
-    PublishDisposition, PurgeMachine, PurgeReadback, RegisterMachine, RelayV2StoreConfig,
-    ReplayCursor, ReplayFrame, ReplayPage, ReplayPageRequest, ReplayPosition, RevocationCommit,
-    StoreError, StoreSnapshot, StreamRecord, StreamRegistration, SubscriptionLease,
-    UnsubscribeCommit, high_water_from_text, high_water_text, monotonic_blob, monotonic_from_blob,
-    sql_i64, stream_seq_from_text, stream_seq_text, validate_store_path,
+    CommitMachineLinkAuth, ConfirmDeviceAuth, DeviceTrustView, EMPTY_HIGH_WATER_TEXT,
+    EnrollmentCodeSeed, FaultPoint, GrantCommit, InstallGrantRecord, MAX_CONTROL_BLOB_BYTES,
+    MAX_ENROLLMENT_CODES, MachineLinkAuthCommit, MachineRecord, MachineTrustView,
+    MaintenanceReport, PersistAck, PersistPublish, PersistRevocation, PersistSubscription,
+    PersistUnsubscribe, PublishCommit, PublishDisposition, PurgeMachine, PurgeReadback,
+    RegisterMachine, RelayV2StoreConfig, ReplayCursor, ReplayFrame, ReplayPage, ReplayPageRequest,
+    ReplayPosition, RevocationCommit, StoreError, StoreSnapshot, StreamRecord, StreamRegistration,
+    SubscriptionLease, UnsubscribeCommit, high_water_from_text, high_water_text, monotonic_blob,
+    monotonic_from_blob, normalize_platform_root_alias, sql_i64, stream_seq_from_text,
+    stream_seq_text, validate_store_path,
 };
 
 const DIRECTORY_MODE: u32 = 0o700;
@@ -330,6 +333,236 @@ pub(crate) fn register_machine(
         receipt_hash: request.receipt_hash,
         duplicate: false,
     })
+}
+
+pub(crate) fn machine_trust(
+    conn: &Connection,
+    machine_route: MachineRouteId,
+) -> Result<MachineTrustView, StoreError> {
+    let row = conn
+        .query_row(
+            "SELECT relay_server_id, root_key_id, root_pubkey, trust_epoch,
+                    highest_link_generation, link_cert_hash, status
+             FROM machine_routes WHERE machine_route = ?1",
+            params![machine_route.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(StoreError::MachineNotFound)?;
+    if row.6 != "active" {
+        return Err(StoreError::MachineNotFound);
+    }
+    Ok(MachineTrustView {
+        relay_server_id: RelayServerId::from_bytes(array_from_blob::<16>(
+            row.0,
+            "machine_routes.relay_server_id",
+        )?),
+        machine_route,
+        root_key_id: RootKeyId::from_bytes(array_from_blob::<16>(
+            row.1,
+            "machine_routes.root_key_id",
+        )?),
+        root_pubkey: PublicKeyBytes(array_from_blob::<32>(row.2, "machine_routes.root_pubkey")?),
+        trust_epoch: TrustEpoch::new(monotonic_from_blob(row.3, "machine_routes.trust_epoch")?),
+        highest_link_generation: LinkGeneration::new(monotonic_from_blob(
+            row.4,
+            "machine_routes.highest_link_generation",
+        )?),
+        link_cert_hash: array_from_blob::<32>(row.5, "machine_routes.link_cert_hash")?,
+    })
+}
+
+pub(crate) fn device_trust(
+    conn: &Connection,
+    machine_route: MachineRouteId,
+    device_route: DeviceRouteId,
+) -> Result<DeviceTrustView, StoreError> {
+    let row = conn
+        .query_row(
+            "SELECT m.relay_server_id, m.root_key_id, m.root_pubkey, m.trust_epoch,
+                    m.highest_link_generation, m.link_cert_hash, m.status,
+                    d.auth_pubkey, d.auth_fingerprint, d.grant_serial, d.grant_hash,
+                    d.tombstone
+             FROM machine_routes m
+             JOIN device_grants d ON d.machine_route = m.machine_route
+             WHERE m.machine_route = ?1 AND d.device_route = ?2",
+            params![
+                machine_route.as_bytes().as_slice(),
+                device_route.as_bytes().as_slice(),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, Vec<u8>>(9)?,
+                    row.get::<_, Vec<u8>>(10)?,
+                    row.get::<_, i64>(11)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(StoreError::GrantNotFound)?;
+    if row.6 != "active" {
+        return Err(StoreError::MachineNotFound);
+    }
+    Ok(DeviceTrustView {
+        machine: MachineTrustView {
+            relay_server_id: RelayServerId::from_bytes(array_from_blob::<16>(
+                row.0,
+                "machine_routes.relay_server_id",
+            )?),
+            machine_route,
+            root_key_id: RootKeyId::from_bytes(array_from_blob::<16>(
+                row.1,
+                "machine_routes.root_key_id",
+            )?),
+            root_pubkey: PublicKeyBytes(array_from_blob::<32>(
+                row.2,
+                "machine_routes.root_pubkey",
+            )?),
+            trust_epoch: TrustEpoch::new(monotonic_from_blob(row.3, "machine_routes.trust_epoch")?),
+            highest_link_generation: LinkGeneration::new(monotonic_from_blob(
+                row.4,
+                "machine_routes.highest_link_generation",
+            )?),
+            link_cert_hash: array_from_blob::<32>(row.5, "machine_routes.link_cert_hash")?,
+        },
+        device_route,
+        auth_pubkey: PublicKeyBytes(array_from_blob::<32>(row.7, "device_grants.auth_pubkey")?),
+        auth_fingerprint: array_from_blob::<32>(row.8, "device_grants.auth_fingerprint")?,
+        grant_serial: GrantSerial::new(monotonic_from_blob(row.9, "device_grants.grant_serial")?),
+        grant_hash: array_from_blob::<32>(row.10, "device_grants.grant_hash")?,
+        revoked: row.11 != 0,
+    })
+}
+
+pub(crate) fn commit_machine_link_auth(
+    conn: &mut Connection,
+    config: &RelayV2StoreConfig,
+    request: CommitMachineLinkAuth,
+) -> Result<MachineLinkAuthCommit, StoreError> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let row = tx
+        .query_row(
+            "SELECT root_key_id, trust_epoch, highest_link_generation, link_cert_hash, status
+             FROM machine_routes WHERE machine_route = ?1",
+            params![request.machine_route.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(StoreError::MachineNotFound)?;
+    if row.4 != "active" {
+        return Err(StoreError::MachineNotFound);
+    }
+    let root_key_id =
+        RootKeyId::from_bytes(array_from_blob::<16>(row.0, "machine_routes.root_key_id")?);
+    let trust_epoch = TrustEpoch::new(monotonic_from_blob(row.1, "machine_routes.trust_epoch")?);
+    if root_key_id != request.root_key_id || trust_epoch != request.trust_epoch {
+        return Err(StoreError::AuthenticationMismatch {
+            field: "machine_trust",
+        });
+    }
+    let stored_generation = LinkGeneration::new(monotonic_from_blob(
+        row.2,
+        "machine_routes.highest_link_generation",
+    )?);
+    let stored_hash = array_from_blob::<32>(row.3, "machine_routes.link_cert_hash")?;
+    let duplicate = match request.generation.cmp(&stored_generation) {
+        std::cmp::Ordering::Less => {
+            return Err(StoreError::MonotonicRollback {
+                field: "link_generation",
+            });
+        }
+        std::cmp::Ordering::Equal if stored_hash != request.cert_hash => {
+            return Err(StoreError::IdempotencyConflict {
+                field: "link_generation",
+            });
+        }
+        std::cmp::Ordering::Equal => true,
+        std::cmp::Ordering::Greater => {
+            tx.execute(
+                "UPDATE machine_routes
+                 SET highest_link_generation = ?2, link_cert_hash = ?3
+                 WHERE machine_route = ?1 AND status = 'active'",
+                params![
+                    request.machine_route.as_bytes().as_slice(),
+                    monotonic_blob(request.generation.value()).as_slice(),
+                    request.cert_hash.as_slice(),
+                ],
+            )?;
+            false
+        }
+    };
+    config
+        .fault_injector
+        .check(FaultPoint::MachineLinkAuthBeforeCommit)?;
+    tx.commit()?;
+    Ok(MachineLinkAuthCommit {
+        machine_route: request.machine_route,
+        generation: request.generation,
+        cert_hash: request.cert_hash,
+        duplicate,
+    })
+}
+
+pub(crate) fn confirm_device_auth(
+    conn: &Connection,
+    config: &RelayV2StoreConfig,
+    request: ConfirmDeviceAuth,
+) -> Result<(), StoreError> {
+    let trust = device_trust(conn, request.machine_route, request.device_route)?;
+    if trust.revoked {
+        return Err(StoreError::Revoked);
+    }
+    if trust.grant_serial != request.grant_serial {
+        return Err(StoreError::AuthenticationMismatch {
+            field: "grant_serial",
+        });
+    }
+    if trust.grant_hash != request.grant_hash {
+        return Err(StoreError::AuthenticationMismatch {
+            field: "grant_hash",
+        });
+    }
+    if trust.auth_pubkey != request.auth_pubkey {
+        return Err(StoreError::AuthenticationMismatch {
+            field: "auth_pubkey",
+        });
+    }
+    if trust.auth_fingerprint != request.auth_fingerprint {
+        return Err(StoreError::AuthenticationMismatch {
+            field: "auth_fingerprint",
+        });
+    }
+    config
+        .fault_injector
+        .check(FaultPoint::DeviceAuthBeforeConfirm)?;
+    Ok(())
 }
 
 pub(crate) fn install_grant(
@@ -2537,22 +2770,6 @@ fn nonzero_relay_server_id() -> RelayServerId {
             return relay_server_id;
         }
     }
-}
-
-/// macOS 的 `/var` 是系统提供且不可由普通用户替换的 `/private/var` alias，
-/// `std::env::temp_dir()` / `tempfile` 会把它作为绝对路径返回。先把这一固定系统
-/// alias 规范化，随后仍逐项拒绝其下任何调用方可控的 symlink component。
-#[cfg(target_os = "macos")]
-fn normalize_platform_root_alias(path: &Path) -> PathBuf {
-    match path.strip_prefix("/var") {
-        Ok(suffix) => Path::new("/private/var").join(suffix),
-        Err(_) => path.to_path_buf(),
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn normalize_platform_root_alias(path: &Path) -> PathBuf {
-    path.to_path_buf()
 }
 
 impl From<SchemaError> for StoreError {
