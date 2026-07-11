@@ -1224,12 +1224,16 @@ mod tests {
     }
 
     fn tempdir_unique() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let base = std::env::temp_dir().join(format!(
-            "agentdeck-cc-history-test-{}",
+            "agentdeck-cc-history-test-{}-{}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
-                .unwrap_or(0)
+                .unwrap_or(0),
+            seq
         ));
         std::fs::create_dir_all(&base).unwrap();
         base
