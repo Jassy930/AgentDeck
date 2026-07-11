@@ -205,11 +205,15 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施基线（P0）
+## Relay Companion MVP 实施状态（P2.4）
 
-当前 P0 只冻结既有 Relay v1 行为并建立实施门禁，不改变 Rust/Swift 产品路径。
-统一基线验证入口按批准设计 §16.5 顺序运行现有 Rust、Swift、iOS、网络边界、
-文档和 schema 门禁：
+P0 已冻结既有 Relay v1 行为并建立实施门禁；P2.1–P2.4 已并列完成 Relay v2 SQLite
+store、challenge/auth、stream core、内存 PairRoute 与在线 Send/Reply library contract。
+PairRoute 默认受每 machine 8、全局 1,024、每 route 32 frames / 1 MiB / 300 秒及独立
+token bucket 约束；Send/Reply 只投递 current bounded writer，不建离线队列或 `req_origin`。
+这些能力尚未在 P2.9 原子切换生产 listener，也未接通 daemon/iOS，因此不能描述为公网
+Companion 已可用。当前统一 P0 回归入口仍按批准设计 §16.5 运行 Rust、Swift、iOS、网络、
+文档和 schema 基线门禁；P2.4 专项门禁见 `docs/QUALITY.md`：
 
 ```bash
 bash scripts/verify-relay-companion-mvp.sh p0

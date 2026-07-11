@@ -17,7 +17,7 @@ use super::model::{
     UnsubscribeCommit, normalize_platform_root_alias,
 };
 use super::sqlite;
-use agentdeck_protocol::relay_v2::{DeviceRouteId, MachineRouteId};
+use agentdeck_protocol::relay_v2::{DeviceRouteId, MachineRouteId, RelayServerId};
 
 // Publish command may carry a full 4 MiB frame. Keep the actor queue deliberately
 // small and use non-waiting admission: the store owns at most four queued commands
@@ -28,6 +28,7 @@ const STORE_COMMAND_CAPACITY: usize = 4;
 pub struct RelayStoreHandle {
     tx: mpsc::Sender<StoreCommand>,
     authorization_ownership: Arc<AuthorizationOwnership>,
+    relay_server_id: RelayServerId,
 }
 
 struct AuthorizationOwnership {
@@ -90,13 +91,20 @@ impl RelayStoreHandle {
             .spawn(move || run(config, rx, ready_tx, open_lease))?;
 
         match ready_rx.await {
-            Ok(Ok(())) => Ok(Self {
+            Ok(Ok(relay_server_id)) => Ok(Self {
                 tx,
                 authorization_ownership,
+                relay_server_id,
             }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(StoreError::WorkerStopped),
         }
+    }
+
+    /// Store ready gate 已从 worker 持有连接读回的权威 server identity；Core/handshake
+    /// 可同步读取，不能信任客户端 Hello 自报或为每次 Pairing 额外排队 Inspect。
+    pub fn relay_server_id(&self) -> RelayServerId {
+        self.relay_server_id
     }
 
     pub async fn inspect(&self) -> Result<StoreSnapshot, StoreError> {
@@ -476,7 +484,7 @@ enum StoreCommand {
 fn run(
     config: RelayV2StoreConfig,
     mut rx: mpsc::Receiver<StoreCommand>,
-    ready: oneshot::Sender<Result<(), StoreError>>,
+    ready: oneshot::Sender<Result<RelayServerId, StoreError>>,
     open_lease: Arc<StoreOpenLease>,
 ) {
     let mut conn = match sqlite::open(&config) {
@@ -487,7 +495,14 @@ fn run(
         }
     };
 
-    if ready.send(Ok(())).is_err() {
+    let relay_server_id = match sqlite::snapshot(&conn) {
+        Ok(snapshot) => snapshot.relay_server_id,
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
+    if ready.send(Ok(relay_server_id)).is_err() {
         return;
     }
 

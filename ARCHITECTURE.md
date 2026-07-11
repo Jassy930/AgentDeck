@@ -255,8 +255,35 @@ agentdeckd
   额外 64 KiB 磁盘增长余量。幂等 retry 不重复占容量，配置下调或旧 DB 已超限时在 Store
   ready 前 typed fail-closed，不静默删除 durable state。
 - Core、writer、replay 的 Debug 只能打印计数、failure code 和带类型域的 route 短 hash；
-  不格式化 sealed bytes 或完整 route/generation。P2.4 才加入 PairRoute 与在线 Send/Reply，
-  P2.9 前仍不能把本节测试通过描述为 v2 公网 listener 已上线。
+  不格式化 sealed bytes 或完整 route/generation。P2.9 前仍不能把本节测试通过描述为
+  v2 公网 listener 已上线。
+
+### Relay Companion MVP P2.4 PairRoute 与在线请求边界
+
+- P2.4 仍是与 v1 listener 并列的 library，不接管生产 WebSocket。`PairRouteRegistry` 只由
+  `RelayCore` actor 修改且不落 SQLite：默认/不可调高上限为每 machine 8、全局 1,024、
+  每 route lifetime 32 frames / 1 MiB、absolute TTL 300 秒；每 route 独立 burst 8、
+  refill 2 frames/s。Close 后保留到 absolute expiry 的 bounded tombstone 并继续占容量，
+  防止迟到 Open 复活；Core 重建则按设计清空全部 active/tombstone，由 daemon 以同一
+  route/absolute expiry 重开。
+- 只有 current `MachineAccess` 可以 Open；owner/route/expiry 完全相同才是幂等 retry。
+  Pairing handshake 先读取单 route view，activate 时在 actor 内二次验证并绑定唯一 pairing
+  writer，封住 view→activate TOCTOU。Pairing 数据面只允许同 route `PairData` /
+  `ClosePairRoute`，另有 exact outstanding `Pong` 这一 transport-control 例外；每帧都重验
+  active、expiry 与 binding。断线只解绑，close/expiry 才终结 route。
+- `PairData` 使用 canonical outer frame bytes 计 lifetime 容量，并采用 reserve→target writer
+  enqueue→commit 两阶段计数。目标背压会 rollback lifetime 计数、关闭目标并向 origin 返回
+  typed quota；rate token 不退，避免离线目标被无限探测。目标成功入队后才向 origin 入队
+  `RouteAccepted(PairFrame)`；origin ACK 背压只关闭 origin，不回滚已发生的目标入队。
+- `Send/Reply` 是纯在线、无状态路由：Device 只能声明自身 device route 并 Send 到所属
+  machine，Machine 只能 Reply 到同 trust domain 的 current device；`requestRoute` 只作 opaque
+  correlation ID，不建立 `req_origin`、seen-map 或 TTL-map，也不写 frames/subscriptions/HWM。
+  target 和 origin 两个普通 principal 的 current-generation 检查与 target enqueue 在同一
+  active-registry 临界区内完成；任一 replacement/revoke transition fence 建立后，旧
+  generation 都不能再跨出 frame，且旧 origin 不能借失败请求关闭健康 target。
+- PairData/Send/Reply 都遵循 target-first：只有目标 bounded writer 接纳后才产生
+  `RouteAccepted`；该回执不代表 socket flush、解密、journal、执行或 PairResponse delivered。
+  PairRoute/online request 的 Debug 与 failure 同样只暴露通用 code、计数和脱敏短 hash。
 
 ### R1a 隐含约束（供 R2 参考）
 

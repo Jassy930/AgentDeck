@@ -312,6 +312,19 @@ impl AuthorizationCoordinator {
         self.active.with_current(access, action)
     }
 
+    /// 把两个普通 principal 的 generation 检查与一个短小无等待动作共同线性化。
+    pub(crate) fn with_both_current<T>(
+        &self,
+        first: &AccessContext,
+        second: &AccessContext,
+        action: impl FnOnce() -> T,
+    ) -> Result<(bool, bool, Option<T>), RelayFailure> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Ok((false, false, None));
+        }
+        self.active.with_both_current(first, second, action)
+    }
+
     pub fn current(
         &self,
         route: PrincipalRoute,

@@ -750,6 +750,7 @@ async fn fresh_migration_creates_marker_and_exact_eight_table_family() {
     assert_eq!(snapshot.schema_version, SCHEMA_VERSION);
     assert_ne!(snapshot.schema_signature, [0_u8; 32]);
     assert_ne!(snapshot.relay_server_id.as_bytes(), &[0_u8; 16]);
+    assert_eq!(store.relay_server_id(), snapshot.relay_server_id);
     assert_eq!(
         table_set(&snapshot),
         EXPECTED_TABLES.into_iter().collect::<BTreeSet<_>>()
@@ -770,6 +771,7 @@ async fn reopen_preserves_relay_server_id_and_schema_marker() {
     let reopened = open_production(&path).await;
     let after = reopened.inspect().await.expect("inspect reopened store");
 
+    assert_eq!(reopened.relay_server_id(), before.relay_server_id);
     assert_eq!(after.relay_server_id, before.relay_server_id);
     assert_eq!(after.schema_family, before.schema_family);
     assert_eq!(after.schema_version, before.schema_version);

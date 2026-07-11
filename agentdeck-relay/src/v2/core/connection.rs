@@ -192,7 +192,6 @@ pub(crate) enum ConnectionStateError {
     ConnectionNotFound,
     ConnectionNotActive,
     AccessMismatch,
-    PrincipalUnavailable,
     SubscriptionLimit,
     ReplayEpochExhausted,
     ReplayMismatch,
@@ -304,16 +303,16 @@ impl ConnectionRegistry {
         replacement_reason: WriterCloseReason,
     ) -> Result<Option<ConnectionCleanup>, ConnectionStateError> {
         let connection = access.connection_instance();
-        let principal = access
-            .principal_route()
-            .ok_or(ConnectionStateError::PrincipalUnavailable)?;
+        let principal = access.principal_route();
         let target = self
             .entries
             .get(&connection)
             .ok_or(ConnectionStateError::ConnectionNotFound)?;
-        if target
-            .pending_principal
-            .is_some_and(|pending| pending != principal)
+        if matches!((target.pending_principal, principal), (Some(_), None))
+            || matches!(
+                (target.pending_principal, principal),
+                (Some(pending), Some(active)) if pending != active
+            )
         {
             return Err(ConnectionStateError::AccessMismatch);
         }
@@ -324,14 +323,16 @@ impl ConnectionRegistry {
             return Err(ConnectionStateError::AccessMismatch);
         }
 
-        let replaced = self.entries.iter().find_map(|(candidate, entry)| {
-            (*candidate != connection
-                && entry
-                    .access
-                    .as_ref()
-                    .and_then(AccessContext::principal_route)
-                    == Some(principal))
-            .then_some(*candidate)
+        let replaced = principal.and_then(|principal| {
+            self.entries.iter().find_map(|(candidate, entry)| {
+                (*candidate != connection
+                    && entry
+                        .access
+                        .as_ref()
+                        .and_then(AccessContext::principal_route)
+                        == Some(principal))
+                .then_some(*candidate)
+            })
         });
         let cleanup = replaced.and_then(|old| self.remove_and_close(old, replacement_reason));
 
@@ -340,7 +341,7 @@ impl ConnectionRegistry {
             .get_mut(&connection)
             .ok_or(ConnectionStateError::ConnectionNotFound)?;
         target.access = Some(access);
-        target.pending_principal = Some(principal);
+        target.pending_principal = principal;
         target.last_pong_ms = now_ms;
         target.last_ping_ms = now_ms;
         target.pending_ping = None;
@@ -1032,9 +1033,11 @@ impl std::fmt::Debug for ConnectionRegistry {
 
 #[cfg(test)]
 mod tests {
-    use agentdeck_protocol::relay_v2::{DeviceRouteId, GrantSerial, LinkGeneration, TrustEpoch};
+    use agentdeck_protocol::relay_v2::{
+        DeviceRouteId, GrantSerial, LinkGeneration, PairRouteId, RelayServerId, TrustEpoch,
+    };
 
-    use crate::v2::auth::{DeviceAccess, MachineAccess};
+    use crate::v2::auth::{DeviceAccess, MachineAccess, PairingAccess};
     use crate::v2::core::writer::WriterHandle;
 
     use super::*;
@@ -1076,6 +1079,16 @@ mod tests {
             grant_serial: GrantSerial::new(1),
             grant_hash: [0x22; 32],
             device_sign_fingerprint: [0x33; 32],
+        })
+    }
+
+    fn pairing_access(connection_seed: u8, machine_seed: u8, pair_seed: u8) -> AccessContext {
+        AccessContext::Pairing(PairingAccess {
+            relay_server_id: RelayServerId::from_bytes([0xa1; 16]),
+            machine_route: machine(machine_seed),
+            pair_route: PairRouteId::from_bytes([pair_seed; 16]),
+            connection_instance: connection(connection_seed),
+            absolute_expiry_ms: 300_000,
         })
     }
 
@@ -1137,6 +1150,29 @@ mod tests {
         assert_eq!(old_writer.close_reason(), Some(WriterCloseReason::Explicit));
         assert!(registry.validates(&new_access));
         assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn pairing_activation_needs_no_principal_and_cleanup_keeps_principal_empty() {
+        let mut registry = ConnectionRegistry::new(1);
+        let (writer, _receiver) = WriterHandle::channel();
+        let access = pairing_access(2, 9, 7);
+        registry
+            .attach_pending(connection(2), writer, 10)
+            .expect("attach pairing writer");
+
+        assert!(
+            registry
+                .activate(access.clone(), 20, WriterCloseReason::Explicit)
+                .expect("activate restricted pairing access")
+                .is_none()
+        );
+        assert!(registry.validates(&access));
+        let cleanup = registry
+            .remove_and_close(connection(2), WriterCloseReason::Explicit)
+            .expect("cleanup pairing writer");
+        assert_eq!(cleanup.access, Some(access));
+        assert_eq!(cleanup.principal, None);
     }
 
     #[test]

@@ -15,18 +15,19 @@ use agentdeck_protocol::relay_v2::failure::{
     RELAY_STREAM_OUT_OF_ORDER, RELAY_VERSION_UNSUPPORTED,
 };
 use agentdeck_protocol::relay_v2::frame::{
-    AcceptedRef, Ack, Gap, Ping, Pong, Publish, RegisterStream, ReplayComplete, RouteAccepted,
-    Subscribe, Unsubscribe,
+    AcceptedRef, Ack, ClosePairRoute, Gap, OpenPairRoute, PairData, Ping, Pong, Publish,
+    RegisterStream, ReplayComplete, Reply, RouteAccepted, Send, Subscribe, Unsubscribe,
 };
 use agentdeck_protocol::relay_v2::{
     ConnectionInstanceId, DeviceRouteId, GrantSerial, MAX_FRAME_BYTES, MachineRouteId,
-    OpaqueRouteFrame, RELAY_PROTOCOL_VERSION, RelayFailure, RelayFrameBody, StreamCursor,
-    StreamGenerationId, StreamRouteId, encode,
+    OpaqueRouteFrame, PairRouteId, RELAY_PROTOCOL_VERSION, RelayFailure, RelayFrameBody,
+    StreamCursor, StreamGenerationId, StreamRouteId, encode,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use crate::v2::auth::{
     AccessContext, AuthorizationCoordinator, AuthorizationLifecycle, AuthorizationLifecycleEvent,
+    PairRouteView, PrincipalRoute,
 };
 use crate::v2::store::{
     PersistAck, PersistPublish, PersistSubscription, PersistUnsubscribe, RelayStoreHandle,
@@ -38,10 +39,12 @@ use super::connection::{
     ReplayStart, ReplayStartMode, StreamKey, SubscriptionPhase,
 };
 use super::lifecycle::CoreTasks;
+use super::pair_route::{PairRouteLimits, PairRouteRegistry};
 use super::replay::{
     REPLAY_PAGE_MAX_BYTES, REPLAY_PAGE_MAX_FRAMES, ReplayFetchError, ReplayFetchTicket, ReplayMode,
     ReplayPageReady, fetch_replay_page, initial_replay_ticket, post_terminal_replay_ticket,
 };
+use super::request_route::{RequestTarget, resolve_reply, resolve_send};
 use super::writer::{
     ControlWriterReservation, GlobalWriterBudget, NormalWriterReservation, TryReserveWriterError,
     WaitForBudgetError, WriterCloseReason, WriterHandle,
@@ -83,6 +86,7 @@ pub struct CoreConfig {
     pub global_normal_max_bytes: usize,
     pub global_control_max_frames: usize,
     pub global_control_max_bytes: usize,
+    pub pair_route_limits: PairRouteLimits,
     pub heartbeat_interval_ms: u64,
     pub heartbeat_timeout_ms: u64,
     pub initial_now_ms: u64,
@@ -101,6 +105,7 @@ impl Default for CoreConfig {
             global_normal_max_bytes: DEFAULT_GLOBAL_NORMAL_MAX_BYTES,
             global_control_max_frames: DEFAULT_GLOBAL_CONTROL_MAX_FRAMES,
             global_control_max_bytes: DEFAULT_GLOBAL_CONTROL_MAX_BYTES,
+            pair_route_limits: PairRouteLimits::default(),
             heartbeat_interval_ms: DEFAULT_HEARTBEAT_INTERVAL_MS,
             heartbeat_timeout_ms: DEFAULT_HEARTBEAT_TIMEOUT_MS,
             initial_now_ms: 0,
@@ -111,6 +116,7 @@ impl Default for CoreConfig {
 
 impl CoreConfig {
     fn validate(self) -> Result<(), RelayFailure> {
+        self.pair_route_limits.validate()?;
         if self.command_capacity == 0
             || self.command_capacity > CORE_COMMAND_CAPACITY_HARD_MAX
             || self.ingress_bytes == 0
@@ -231,6 +237,10 @@ enum CoreCommand {
         access: AccessContext,
         reply: oneshot::Sender<Result<(), RelayFailure>>,
     },
+    PairRouteView {
+        pair_route: PairRouteId,
+        reply: oneshot::Sender<Result<PairRouteView, RelayFailure>>,
+    },
     Handle {
         access: AccessContext,
         frame: OpaqueRouteFrame,
@@ -278,6 +288,7 @@ impl RelayCore {
         config: CoreConfig,
     ) -> Result<Self, RelayFailure> {
         config.validate()?;
+        let relay_server_id = store.relay_server_id();
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| unavailable("Relay Core requires a Tokio runtime"))?;
         let (tx, rx) = mpsc::channel(config.command_capacity);
@@ -286,6 +297,7 @@ impl RelayCore {
             authorization,
             lifecycle,
             connections: ConnectionRegistry::new(config.max_subscriptions_per_connection),
+            pair_routes: PairRouteRegistry::new(relay_server_id, config.pair_route_limits)?,
             config,
             now_ms: config.initial_now_ms,
             next_nonce: config.nonce_seed,
@@ -338,6 +350,19 @@ impl RelayCore {
     pub async fn activate(&self, access: AccessContext) -> Result<(), RelayFailure> {
         let (reply, response) = oneshot::channel();
         self.try_send(CoreCommand::Activate { access, reply })?;
+        response
+            .await
+            .map_err(|_| unavailable("Relay Core stopped"))?
+    }
+
+    /// PairingHello 鉴权只读取 actor 在当前时刻冻结的单 route 快照；真正 activate 时
+    /// 仍会在同一 actor 内二次校验并绑定唯一 pairing writer。
+    pub async fn pair_route_view(
+        &self,
+        pair_route: PairRouteId,
+    ) -> Result<PairRouteView, RelayFailure> {
+        let (reply, response) = oneshot::channel();
+        self.try_send(CoreCommand::PairRouteView { pair_route, reply })?;
         response
             .await
             .map_err(|_| unavailable("Relay Core stopped"))?
@@ -416,6 +441,7 @@ struct RelayCoreActor {
     authorization: AuthorizationCoordinator,
     lifecycle: AuthorizationLifecycle,
     connections: ConnectionRegistry,
+    pair_routes: PairRouteRegistry,
     config: CoreConfig,
     now_ms: u64,
     next_nonce: u64,
@@ -423,6 +449,18 @@ struct RelayCoreActor {
     outbound_budget: Arc<GlobalWriterBudget>,
     weak_tx: mpsc::WeakSender<CoreCommand>,
     tasks: CoreTasks,
+}
+
+enum PairDataTarget {
+    Machine {
+        connection: ConnectionInstanceId,
+        access: AccessContext,
+        writer: WriterHandle,
+    },
+    Pairing {
+        connection: ConnectionInstanceId,
+        writer: WriterHandle,
+    },
 }
 
 impl RelayCoreActor {
@@ -489,6 +527,9 @@ impl RelayCoreActor {
                 let result = self.activate(access);
                 let _ = reply.send(result);
             }
+            CoreCommand::PairRouteView { pair_route, reply } => {
+                let _ = reply.send(Ok(self.pair_routes.view(pair_route, self.now_ms)));
+            }
             CoreCommand::Handle {
                 access,
                 frame,
@@ -525,6 +566,34 @@ impl RelayCoreActor {
     }
 
     fn activate(&mut self, access: AccessContext) -> Result<(), RelayFailure> {
+        if let AccessContext::Pairing(pairing) = access.clone() {
+            if let Err(error) = self.pair_routes.bind_pairing(&pairing, self.now_ms) {
+                self.close_connection(
+                    pairing.connection_instance,
+                    WriterCloseReason::AuthorizationInvalidated,
+                );
+                return Err(error);
+            }
+            let activated =
+                self.connections
+                    .activate(access, self.now_ms, WriterCloseReason::Replaced);
+            match activated {
+                Ok(cleanup) => {
+                    if let Some(cleanup) = cleanup {
+                        self.finish_cleanup(cleanup);
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    self.pair_routes.unbind_pairing(pairing.connection_instance);
+                    self.close_connection(
+                        pairing.connection_instance,
+                        WriterCloseReason::AuthorizationInvalidated,
+                    );
+                    return Err(connection_failure(error));
+                }
+            }
+        }
         if !self.authorization.is_current(&access)? {
             self.close_connection(
                 access.connection_instance(),
@@ -553,16 +622,43 @@ impl RelayCoreActor {
                 "unsupported Relay protocol version",
             ));
         }
-        if matches!(access, AccessContext::Pairing(_)) {
-            return Err(forbidden());
+        if let AccessContext::Pairing(pairing) = access.clone() {
+            if let RelayFrameBody::Pong(Pong { nonce }) = &frame.body {
+                self.pair_routes.validate_pairing(&pairing, self.now_ms)?;
+                if !self.connections.validates(&access) {
+                    return Err(invalid_access());
+                }
+                return self.pairing_pong(&access, *nonce);
+            }
+            pairing.authorize_frame(&frame, self.now_ms)?;
+            if !self.connections.validates(&access) {
+                return Err(invalid_access());
+            }
+            return match frame.body {
+                RelayFrameBody::PairData(frame) => {
+                    self.pair_routes.validate_pairing(&pairing, self.now_ms)?;
+                    self.pair_data(&access, frame)
+                }
+                RelayFrameBody::ClosePairRoute(frame) => {
+                    self.pair_routes
+                        .validate_pairing_close(&pairing, self.now_ms)?;
+                    self.close_pair_route(&access, frame)
+                }
+                _ => Err(forbidden()),
+            };
         }
         self.ensure_current(&access)?;
         match frame.body {
+            RelayFrameBody::OpenPairRoute(frame) => self.open_pair_route(&access, frame),
+            RelayFrameBody::ClosePairRoute(frame) => self.close_pair_route(&access, frame),
+            RelayFrameBody::PairData(frame) => self.pair_data(&access, frame),
             RelayFrameBody::RegisterStream(frame) => self.register_stream(&access, frame).await,
             RelayFrameBody::Publish(frame) => self.publish(&access, frame).await,
             RelayFrameBody::Subscribe(frame) => self.subscribe(&access, frame).await,
             RelayFrameBody::Unsubscribe(frame) => self.unsubscribe(&access, frame).await,
             RelayFrameBody::Ack(frame) => self.ack(&access, frame).await,
+            RelayFrameBody::Send(frame) => self.send(&access, frame),
+            RelayFrameBody::Reply(frame) => self.reply(&access, frame),
             RelayFrameBody::Pong(Pong { nonce }) => self.pong(&access, nonce),
             _ => Err(forbidden()),
         }
@@ -686,6 +782,434 @@ impl RelayCoreActor {
         Ok(origin_outcome)
     }
 
+    fn open_pair_route(
+        &mut self,
+        access: &AccessContext,
+        frame: OpenPairRoute,
+    ) -> Result<RouteOutcome, RelayFailure> {
+        let machine_route = machine_access(access)?;
+        let opened = match self.authorization.with_current(access, || {
+            self.pair_routes.open(machine_route, frame, self.now_ms)
+        })? {
+            Some(result) => result?,
+            None => {
+                self.close_connection(
+                    access.connection_instance(),
+                    WriterCloseReason::AuthorizationInvalidated,
+                );
+                return Err(invalid_access());
+            }
+        };
+        let Some(writer) = self.connections.writer_for(access) else {
+            return Ok(RouteOutcome::Closed);
+        };
+        let queued = self.enqueue_if_current(
+            access,
+            access.connection_instance(),
+            WriterCloseReason::CriticalBackpressure,
+            || {
+                writer.try_enqueue_control(OpaqueRouteFrame {
+                    version: RELAY_PROTOCOL_VERSION,
+                    body: RelayFrameBody::PairRouteOpened(opened),
+                })
+            },
+        );
+        Ok(if queued {
+            RouteOutcome::Applied
+        } else {
+            RouteOutcome::Closed
+        })
+    }
+
+    fn close_pair_route(
+        &mut self,
+        access: &AccessContext,
+        frame: ClosePairRoute,
+    ) -> Result<RouteOutcome, RelayFailure> {
+        let machine_route = match access {
+            AccessContext::Machine(machine) => machine.machine_route,
+            AccessContext::Pairing(pairing) => pairing.machine_route,
+            AccessContext::Device(_) => return Err(forbidden()),
+        };
+        // Pairing requester 自己也可能在 close 时从 registry 解绑，因此先冻结 writer。
+        let writer = self.connections.writer_for(access);
+        let closed = match access {
+            AccessContext::Machine(_) => match self.authorization.with_current(access, || {
+                self.pair_routes.close(machine_route, frame, self.now_ms)
+            })? {
+                Some(result) => result?,
+                None => {
+                    self.close_connection(
+                        access.connection_instance(),
+                        WriterCloseReason::AuthorizationInvalidated,
+                    );
+                    return Err(invalid_access());
+                }
+            },
+            AccessContext::Pairing(_) => {
+                self.pair_routes.close(machine_route, frame, self.now_ms)?
+            }
+            AccessContext::Device(_) => return Err(forbidden()),
+        };
+        // Machine 关闭时对端只解绑、不立即清空 writer；Pairing 自己关闭时也必须先把
+        // PairRouteClosed 放入 FIFO。后续数据面会因 route 已 tombstone 而 fail-closed。
+        let _detached_pairing = closed.detached_pairing;
+        let Some(writer) = writer else {
+            return Ok(RouteOutcome::Closed);
+        };
+        let outbound = OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::PairRouteClosed(closed.frame),
+        };
+        let queued = match access {
+            AccessContext::Machine(_) => self.enqueue_if_current(
+                access,
+                access.connection_instance(),
+                WriterCloseReason::CriticalBackpressure,
+                || writer.try_enqueue_control(outbound),
+            ),
+            AccessContext::Pairing(_) => match writer.try_enqueue_control(outbound) {
+                Ok(()) => true,
+                Err(_) => {
+                    self.close_connection(
+                        access.connection_instance(),
+                        WriterCloseReason::CriticalBackpressure,
+                    );
+                    false
+                }
+            },
+            AccessContext::Device(_) => return Err(forbidden()),
+        };
+        Ok(if queued {
+            RouteOutcome::Applied
+        } else {
+            RouteOutcome::Closed
+        })
+    }
+
+    fn pair_data(
+        &mut self,
+        access: &AccessContext,
+        frame: PairData,
+    ) -> Result<RouteOutcome, RelayFailure> {
+        let machine_route = match access {
+            AccessContext::Machine(machine) => {
+                self.pair_routes.validate_machine(
+                    machine.machine_route,
+                    frame.pair_route,
+                    self.now_ms,
+                )?;
+                machine.machine_route
+            }
+            AccessContext::Pairing(pairing) => {
+                self.pair_routes.validate_pairing(pairing, self.now_ms)?;
+                pairing.machine_route
+            }
+            AccessContext::Device(_) => return Err(forbidden()),
+        };
+        let outbound = OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::PairData(frame.clone()),
+        };
+        let canonical_bytes = encode(&outbound).len();
+        let reservation = match access {
+            AccessContext::Machine(_) => match self.authorization.with_current(access, || {
+                self.pair_routes.reserve_frame(
+                    machine_route,
+                    frame.pair_route,
+                    canonical_bytes,
+                    self.now_ms,
+                )
+            })? {
+                Some(result) => result?,
+                None => {
+                    self.close_connection(
+                        access.connection_instance(),
+                        WriterCloseReason::AuthorizationInvalidated,
+                    );
+                    return Err(invalid_access());
+                }
+            },
+            AccessContext::Pairing(_) => self.pair_routes.reserve_frame(
+                machine_route,
+                frame.pair_route,
+                canonical_bytes,
+                self.now_ms,
+            )?,
+            AccessContext::Device(_) => return Err(forbidden()),
+        };
+        let target = match self.resolve_pair_data_target(access, machine_route, frame.pair_route) {
+            Ok(target) => target,
+            Err(error) => {
+                let _ = self.pair_routes.rollback_frame(reservation);
+                return Err(error);
+            }
+        };
+
+        let delivered = match target {
+            PairDataTarget::Machine {
+                connection,
+                access: target_access,
+                writer,
+            } => match self
+                .authorization
+                .with_current(&target_access, || writer.try_enqueue_data(outbound))
+            {
+                Ok(Some(Ok(()))) => true,
+                Ok(Some(Err(_))) => {
+                    self.close_connection(connection, WriterCloseReason::Lagged);
+                    false
+                }
+                Ok(None) | Err(_) => {
+                    self.close_connection(connection, WriterCloseReason::AuthorizationInvalidated);
+                    let _ = self.pair_routes.rollback_frame(reservation);
+                    return Err(route_not_found());
+                }
+            },
+            PairDataTarget::Pairing { connection, writer } => match self
+                .authorization
+                .with_current(access, || writer.try_enqueue_data(outbound))
+            {
+                Ok(Some(Ok(()))) => true,
+                Ok(Some(Err(_))) => {
+                    self.close_connection(connection, WriterCloseReason::Lagged);
+                    false
+                }
+                Ok(None) | Err(_) => {
+                    self.close_connection(
+                        access.connection_instance(),
+                        WriterCloseReason::AuthorizationInvalidated,
+                    );
+                    let _ = self.pair_routes.rollback_frame(reservation);
+                    return Err(invalid_access());
+                }
+            },
+        };
+        if !delivered {
+            let _ = self.pair_routes.rollback_frame(reservation);
+            return Err(quota("Relay target writer capacity is exhausted"));
+        }
+        self.pair_routes.commit_frame(reservation)?;
+
+        let accepted = RouteAccepted {
+            accepted: AcceptedRef::PairFrame {
+                pair_route: frame.pair_route,
+            },
+        };
+        let accepted_frame = OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::RouteAccepted(accepted.clone()),
+        };
+        let Some(origin_writer) = self.connections.writer_for(access) else {
+            return Ok(RouteOutcome::Closed);
+        };
+        let queued = match access {
+            AccessContext::Machine(_) => self.enqueue_if_current(
+                access,
+                access.connection_instance(),
+                WriterCloseReason::Lagged,
+                || origin_writer.try_enqueue_data(accepted_frame),
+            ),
+            AccessContext::Pairing(_) => match origin_writer.try_enqueue_data(accepted_frame) {
+                Ok(()) => true,
+                Err(_) => {
+                    self.close_connection(access.connection_instance(), WriterCloseReason::Lagged);
+                    false
+                }
+            },
+            AccessContext::Device(_) => return Err(forbidden()),
+        };
+        Ok(if queued {
+            RouteOutcome::Queued(accepted)
+        } else {
+            RouteOutcome::Closed
+        })
+    }
+
+    fn resolve_pair_data_target(
+        &mut self,
+        origin: &AccessContext,
+        machine_route: MachineRouteId,
+        pair_route: PairRouteId,
+    ) -> Result<PairDataTarget, RelayFailure> {
+        match origin {
+            AccessContext::Machine(_) => {
+                let connection =
+                    self.pair_routes
+                        .pairing_connection(machine_route, pair_route, self.now_ms)?;
+                let candidate = self.connections.entries.get(&connection).and_then(|entry| {
+                    let AccessContext::Pairing(pairing) = entry.access.as_ref()? else {
+                        return None;
+                    };
+                    (pairing.machine_route == machine_route
+                        && pairing.pair_route == pair_route
+                        && pairing.connection_instance == connection)
+                        .then(|| (pairing.clone(), entry.writer.clone()))
+                });
+                let Some((pairing, writer)) = candidate else {
+                    self.close_connection(connection, WriterCloseReason::AuthorizationInvalidated);
+                    return Err(route_not_found());
+                };
+                if self
+                    .pair_routes
+                    .validate_pairing(&pairing, self.now_ms)
+                    .is_err()
+                {
+                    self.close_connection(connection, WriterCloseReason::AuthorizationInvalidated);
+                    return Err(route_not_found());
+                }
+                Ok(PairDataTarget::Pairing { connection, writer })
+            }
+            AccessContext::Pairing(_) => {
+                let principal = PrincipalRoute::Machine(machine_route);
+                let Some(connection) = self.authorization.current(principal)? else {
+                    return Err(route_not_found());
+                };
+                let candidate = self.connections.entries.get(&connection).and_then(|entry| {
+                    let target_access = entry.access.clone()?;
+                    (target_access.principal_route() == Some(principal))
+                        .then(|| (target_access, entry.writer.clone()))
+                });
+                let Some((target_access, writer)) = candidate else {
+                    self.close_connection(connection, WriterCloseReason::AuthorizationInvalidated);
+                    return Err(route_not_found());
+                };
+                Ok(PairDataTarget::Machine {
+                    connection,
+                    access: target_access,
+                    writer,
+                })
+            }
+            AccessContext::Device(_) => Err(forbidden()),
+        }
+    }
+
+    fn send(&mut self, access: &AccessContext, frame: Send) -> Result<RouteOutcome, RelayFailure> {
+        let target = resolve_send(access, &frame)?;
+        self.route_online_request(
+            access,
+            target,
+            OpaqueRouteFrame {
+                version: RELAY_PROTOCOL_VERSION,
+                body: RelayFrameBody::Send(frame),
+            },
+        )
+    }
+
+    fn reply(
+        &mut self,
+        access: &AccessContext,
+        frame: Reply,
+    ) -> Result<RouteOutcome, RelayFailure> {
+        let target = resolve_reply(access, &frame)?;
+        self.route_online_request(
+            access,
+            target,
+            OpaqueRouteFrame {
+                version: RELAY_PROTOCOL_VERSION,
+                body: RelayFrameBody::Reply(frame),
+            },
+        )
+    }
+
+    /// Send/Reply 只做 active generation 在线转发，不创建 request/origin map，也不访问
+    /// Store。目标先成功进入 bounded writer，origin 才得到 RouteAccepted。
+    fn route_online_request(
+        &mut self,
+        origin: &AccessContext,
+        target: RequestTarget,
+        outbound: OpaqueRouteFrame,
+    ) -> Result<RouteOutcome, RelayFailure> {
+        let principal = target.principal();
+        let Some(target_connection) = self.authorization.current(principal)? else {
+            return Err(route_not_found());
+        };
+        let Some(entry) = self.connections.entries.get(&target_connection) else {
+            return Err(route_not_found());
+        };
+        let Some(target_access) = entry.access.clone() else {
+            return Err(route_not_found());
+        };
+        if target_access.principal_route() != Some(principal) {
+            self.close_connection(
+                target_connection,
+                WriterCloseReason::AuthorizationInvalidated,
+            );
+            return Err(route_not_found());
+        }
+        let target_writer = entry.writer.clone();
+        match self
+            .authorization
+            .with_both_current(origin, &target_access, || {
+                target_writer.try_enqueue_data(outbound)
+            }) {
+            Ok((true, true, Some(Ok(())))) => {}
+            Ok((true, true, Some(Err(_)))) => {
+                self.close_connection(target_connection, WriterCloseReason::Lagged);
+                return Err(quota("Relay target writer capacity is exhausted"));
+            }
+            Ok((origin_current, target_current, None)) => {
+                if !origin_current {
+                    self.close_connection(
+                        origin.connection_instance(),
+                        WriterCloseReason::AuthorizationInvalidated,
+                    );
+                }
+                if !target_current {
+                    self.close_connection(
+                        target_connection,
+                        WriterCloseReason::AuthorizationInvalidated,
+                    );
+                }
+                return Err(if origin_current {
+                    route_not_found()
+                } else {
+                    invalid_access()
+                });
+            }
+            Ok(_) => {
+                self.close_connection(
+                    origin.connection_instance(),
+                    WriterCloseReason::AuthorizationInvalidated,
+                );
+                self.close_connection(
+                    target_connection,
+                    WriterCloseReason::AuthorizationInvalidated,
+                );
+                return Err(unavailable("authorization state is unavailable"));
+            }
+            Err(error) => {
+                self.close_connection(
+                    origin.connection_instance(),
+                    WriterCloseReason::AuthorizationInvalidated,
+                );
+                self.close_connection(
+                    target_connection,
+                    WriterCloseReason::AuthorizationInvalidated,
+                );
+                return Err(error);
+            }
+        }
+
+        let accepted = target.accepted();
+        let accepted_frame = OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::RouteAccepted(accepted.clone()),
+        };
+        let Some(origin_writer) = self.connections.writer_for(origin) else {
+            return Ok(RouteOutcome::Closed);
+        };
+        if !self.enqueue_if_current(
+            origin,
+            origin.connection_instance(),
+            WriterCloseReason::Lagged,
+            || origin_writer.try_enqueue_data(accepted_frame),
+        ) {
+            return Ok(RouteOutcome::Closed);
+        }
+        Ok(RouteOutcome::Queued(accepted))
+    }
+
     async fn subscribe(
         &mut self,
         access: &AccessContext,
@@ -795,6 +1319,22 @@ impl RelayCoreActor {
             .accept_pong(access.connection_instance(), nonce, self.now_ms)
             .map_err(connection_failure)?;
         Ok(RouteOutcome::Applied)
+    }
+
+    fn pairing_pong(
+        &mut self,
+        access: &AccessContext,
+        nonce: u64,
+    ) -> Result<RouteOutcome, RelayFailure> {
+        if self
+            .connections
+            .accept_pong(access.connection_instance(), nonce, self.now_ms)
+            .map_err(connection_failure)?
+        {
+            Ok(RouteOutcome::Applied)
+        } else {
+            Err(forbidden())
+        }
     }
 
     fn pause_gap(
@@ -1409,6 +1949,11 @@ impl RelayCoreActor {
         }
         self.now_ms = now_ms;
 
+        let expired = self.pair_routes.tick(now_ms);
+        for connection in expired.detached_pairings {
+            self.close_connection(connection, WriterCloseReason::Disconnected);
+        }
+
         let closed: Vec<_> = self
             .connections
             .entries
@@ -1514,6 +2059,7 @@ impl RelayCoreActor {
     }
 
     fn close_connection(&mut self, connection: ConnectionInstanceId, reason: WriterCloseReason) {
+        self.pair_routes.unbind_pairing(connection);
         if let Some(cleanup) = self.connections.remove_and_close(connection, reason) {
             self.finish_cleanup(cleanup);
         }
@@ -1652,8 +2198,7 @@ fn connection_failure(error: ConnectionStateError) -> RelayFailure {
         ),
         ConnectionStateError::ConnectionNotFound
         | ConnectionStateError::ConnectionNotActive
-        | ConnectionStateError::AccessMismatch
-        | ConnectionStateError::PrincipalUnavailable => invalid_access(),
+        | ConnectionStateError::AccessMismatch => invalid_access(),
         ConnectionStateError::ReplayEpochExhausted | ConnectionStateError::ReplayMismatch => {
             unavailable("Relay replay state is unavailable")
         }
@@ -1668,6 +2213,10 @@ fn forbidden() -> RelayFailure {
         RELAY_ROUTE_FORBIDDEN,
         "frame is not allowed for this access",
     )
+}
+
+fn route_not_found() -> RelayFailure {
+    failure(RELAY_ROUTE_NOT_FOUND, "opaque route is unavailable")
 }
 
 fn invalid_access() -> RelayFailure {

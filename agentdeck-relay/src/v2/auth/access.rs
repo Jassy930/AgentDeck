@@ -638,6 +638,38 @@ impl ActiveConnectionRegistry {
         }
     }
 
+    /// 在线 request/reply 同时依赖 origin 与 target 两个 active generation。两侧检查与
+    /// writer enqueue 必须共用同一 registry 临界区，任一 transition fence 建立后都不能
+    /// 再让旧 generation 跨出 frame。
+    pub(super) fn with_both_current<T>(
+        &self,
+        first: &AccessContext,
+        second: &AccessContext,
+        action: impl FnOnce() -> T,
+    ) -> Result<(bool, bool, Option<T>), RelayFailure> {
+        let (Some(first_route), Some(second_route)) =
+            (first.principal_route(), second.principal_route())
+        else {
+            return Ok((false, false, None));
+        };
+        let active = self.lock()?;
+        let first_current = matches!(
+            active.get(&first_route),
+            Some(ActiveState::Active(entry))
+                if entry.connection_instance == first.connection_instance()
+        );
+        let second_current = matches!(
+            active.get(&second_route),
+            Some(ActiveState::Active(entry))
+                if entry.connection_instance == second.connection_instance()
+        );
+        if first_current && second_current {
+            Ok((true, true, Some(action())))
+        } else {
+            Ok((first_current, second_current, None))
+        }
+    }
+
     fn lock(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, HashMap<PrincipalRoute, ActiveState>>, RelayFailure> {
@@ -788,6 +820,69 @@ mod tests {
             .abort_transition(transition)
             .expect("restore active entry");
         assert!(registry.is_current(&access).expect("restored"));
+    }
+
+    #[test]
+    fn with_both_current_fences_either_side_before_cross_principal_delivery() {
+        let registry = ActiveConnectionRegistry::new(2).expect("registry");
+        let machine_route = machine(0xbc);
+        let machine_access = machine_access(machine_route, 10, 1, 0xde);
+        let device_access = AccessContext::Device(DeviceAccess {
+            machine_route,
+            device_route: device(2),
+            connection_instance: connection(11),
+            grant_serial: GrantSerial::new(1),
+            grant_hash: [0xef; 32],
+            device_sign_fingerprint: [0xf0; 32],
+        });
+        activate(&registry, &machine_access).expect("activate machine");
+        activate(&registry, &device_access).expect("activate device");
+        let calls = std::cell::Cell::new(0_u8);
+        assert_eq!(
+            registry
+                .with_both_current(&machine_access, &device_access, || {
+                    calls.set(calls.get() + 1)
+                })
+                .expect("both-current action"),
+            (true, true, Some(()))
+        );
+
+        let device_transition = registry
+            .begin_transition(
+                device_access.principal_route().expect("device route"),
+                false,
+            )
+            .expect("fence device");
+        assert_eq!(
+            registry
+                .with_both_current(&machine_access, &device_access, || {
+                    calls.set(calls.get() + 1)
+                })
+                .expect("target-fenced action"),
+            (true, false, None)
+        );
+        registry
+            .abort_transition(device_transition)
+            .expect("restore device");
+
+        let machine_transition = registry
+            .begin_transition(
+                machine_access.principal_route().expect("machine route"),
+                false,
+            )
+            .expect("fence machine");
+        assert_eq!(
+            registry
+                .with_both_current(&machine_access, &device_access, || {
+                    calls.set(calls.get() + 1)
+                })
+                .expect("origin-fenced action"),
+            (false, true, None)
+        );
+        assert_eq!(calls.get(), 1);
+        registry
+            .abort_transition(machine_transition)
+            .expect("restore machine");
     }
 
     #[test]

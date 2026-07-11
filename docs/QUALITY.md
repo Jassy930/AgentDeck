@@ -157,6 +157,56 @@ for _ in {1..10}; do
 done
 ```
 
+## Relay Companion MVP P2.4 PairRoute / 在线请求门禁
+
+P2.4 同样不代表 v2 listener 已上线。改动 PairRoute、PairingAccess、online request 路由、
+active-generation fence 或 Store cached server ID 后至少运行：
+
+```bash
+# 真实 Machine/Device auth + PairingHello/view/activate；PairRoute hard bounds、两端 close、
+# close/expiry actor race、PairData/Send/Reply target-first、两侧背压、replacement、断线丢失，
+# 非空 stream HWM sentinel + 同连接 PRAGMA data_version 零提交证明
+cargo test -p agentdeck-relay --features server \
+  --test relay_v2_route_e2e -- --test-threads=1
+
+# PairRoute/request helper、双主体 authorization fence、Store server ID cache 与全部既有回归
+cargo test -p agentdeck-relay --features server -- --test-threads=1
+cargo test -p agentdeck-protocol
+
+# production lint / API docs / 静态门禁
+cargo clippy -p agentdeck-relay --features server --lib --no-deps -- -D warnings \
+  -A clippy::needless_return -A clippy::collapsible_if \
+  -A clippy::doc_lazy_continuation -A clippy::explicit_auto_deref
+RUSTDOCFLAGS="-D warnings" cargo doc -p agentdeck-relay --features server --no-deps
+cargo fmt --all --check
+for file in agentdeck-relay/src/v2/{auth,core}/*.rs; do
+  awk '/^#\[cfg\(test\)\]/{exit} {print}' "$file"
+done | rg -n 'expect\(|unwrap\(|panic!|eprintln!|todo!|unimplemented!|unreachable!'
+bash scripts/verify-agent-docs.sh
+git diff --check
+```
+
+route E2E 必须证明 target writer 成功入队之后才产生 `RouteAccepted`：target 满只关闭
+target 并返回 quota；origin ACK 满只关闭 origin，目标帧保留。accepted Reply 在 target socket
+flush 前断线必须丢失且 SQLite 不变。Pairing Close ACK 不确定时，同一已激活 access 在未过期
+tombstone 上重试应得到 `AlreadyAbsent`，但 PairData/Pong 不能继续。biased actor-order case
+必须分别覆盖 Close 两端先后与 expiry/Data 先后，不能用 wall-clock sleep 猜竞态。
+
+authorization primitive 单测必须证明 origin 或 target 任一进入 `Transitioning` 时双主体 action
+都不执行，并在同一 registry 锁内返回两侧 current 位；router E2E 还要证明 replacement 后旧
+origin 不投递、也不能关闭健康 target。SQLite 零写入测试必须先创建非空 stream/HWM sentinel，
+再用同一只读 connection 的 `PRAGMA data_version` 与八表语义快照证明 PairRoute/PairData/
+Send/Reply 没有任何 commit，不能只比较空表行数。
+
+阶段收口重复运行 route E2E 10 次：
+
+```bash
+for _ in {1..10}; do
+  cargo test -q -p agentdeck-relay --features server \
+    --test relay_v2_route_e2e -- --test-threads=1 || exit 1
+done
+```
+
 ## AppKit 重写后的验证清单
 
 前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。

@@ -224,6 +224,34 @@ writer clone。重复出现应先检查唯一 coordinator、Store 健康与客�
 | `relay.store.unavailable` | Store 持续 busy、停止、replay 校验失败或 Core 内部状态不可用 | 当前连接 fail-closed；检查 DB/worker 后用新 challenge 重连 |
 | `relay.auth.invalid_grant` / `relay.auth.revoked` | command/replay 时 access 已被 replacement 或撤销 | 立即停止旧 connection；按机器重新配对或使用当前 active grant |
 
+## Relay v2 PairRoute / 在线请求诊断（Companion MVP P2.4）
+
+P2.4 仍是 library contract，尚未切换生产 listener。PairRoute 只存在于当前 `RelayCore`
+内存：Core/Relay 重启后 view 为空是预期行为，daemon 必须从 durable outbox 以完全相同的
+machine/route/absolute expiry 重开；不能生成第二个邀请或把该现象误判为 SQLite 丢数据。
+
+PairRoute 默认 hard bound 为每 machine 8、全局 1,024、每 route lifetime 32 frames / 1 MiB、
+TTL 300 秒，另有每 route burst 8、refill 2 frames/s。Close 后 tombstone 在 absolute expiry
+前继续占容量。`RouteAccepted` 只说明目标 frame 已进入 bounded writer；目标尚未 flush 时
+断线，PairData/Send/Reply 都可以丢失，不能据此推进 pairing delivered 或业务执行状态。
+
+`Send/Reply` 不进 SQLite，也没有 `req_origin`。目标离线立即 not-found；目标 writer 满时只
+关闭目标并向 origin 返回 quota；目标已入队但 origin ACK writer 满时只关闭 origin，目标
+事实不回滚。origin 与 target 的 generation 在同一 authorization 临界区核对；replacement
+或 revoke fence 后看到旧连接继续发送，属于安全回归，不能靠重试旧 access 绕过。
+
+| v2 route code | 含义 | 下一步 |
+| --- | --- | --- |
+| `relay.route.conflict` | Open 的 owner/expiry 与已有 active/tombstone 冲突，或同 route 已有 pairing writer | 使用原 durable route/absolute expiry 做完全相同的 retry；不要延长 TTL 或复用随机 ID |
+| `relay.route.not_found` | PairRoute 不存在/已过期、pairing 未绑定、或在线 Send/Reply 目标离线 | Pairing 重新生成邀请；已配对端重新认证目标并用业务 idempotency key 查询状态 |
+| `relay.route.forbidden` | role、self device route、trust domain 或 pairing allowlist 不匹配 | 修正 endpoint dispatch；Pairing 只允许同 route PairData/Close 与 exact Pong |
+| `relay.quota.exceeded` | PairRoute 数量/lifetime/rate 或目标 writer 容量耗尽 | 对当前 route 有界退避；writer 已关闭时用新 connection 重连，禁止调成无界 |
+| `relay.auth.invalid_grant` | origin/target 在路由时已被 replacement/revoke fence | 丢弃旧 connection 上的排队操作，只使用当前 active generation |
+
+Pairing 发出 Close 后若 ACK 不确定，可在同一已激活 connection、同 machine/route/expiry 且
+tombstone 未过期时重试，Relay 返回 `AlreadyAbsent`；PairData/Pong 不享受该 terminal 例外，
+route close 后立即不可用。
+
 ## Failure Codes
 
 | code | 含义 | 下一步 |

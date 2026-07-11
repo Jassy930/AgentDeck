@@ -333,14 +333,15 @@ pub struct ReplayTicket { pub stream: StreamRouteId, pub generation: StreamGener
 **Files:**
 - Create: `agentdeck-relay/src/v2/core/{pair_route,request_route}.rs`
 - Create: `agentdeck-relay/tests/relay_v2_route_e2e.rs`
-- Modify: `agentdeck-relay/src/v2/core/{mod,router}.rs`
+- Modify: `agentdeck-relay/src/v2/{auth/{access,coordinator},core/{connection,mod,router},store/worker}.rs`
+- Modify: `agentdeck-relay/tests/relay_v2_store.rs`
 
-- [ ] Step 1: 写routing tests。只有MachineAccess能OpenPairRoute；Open固定absolute expiry，同machine/route/expiry逐字相同幂等ACK，owner或expiry不同冲突；Close对同owner及已不存在route幂等返回Closed/AlreadyAbsent，不同active owner拒绝。PairingAccess只能访问邀请中的active route并发送PairData/ClosePairRoute，越权Subscribe/Send/Publish全部拒绝；PairRoute覆盖每machine8、全局1,024、32 frames/1MiB/5m、token bucket、Relay重启丢内存态后重开、daemon重启但Relay未重启时重复Open、未知route、过期与两端close；Send/Reply覆盖active writer、machine/device trust-domain binding、offline、disconnect reply loss、requestRoute伪造和RouteAccepted不持久化/不代表端侧收到。
-- [ ] Step 2: 运行 route e2e。 Expected: FAIL，frame family 尚未 dispatch。
-- [ ] Step 3: 实现内存有界且Open/Close幂等的 PairRoute，以及显式 deviceRoute/requestRoute 在线路由。PairRoute record固定owner与absolute expiry；重复Open不延长TTL，Close unknown返回AlreadyAbsent。删除 v2 中 `req_origin` 概念；Send/Reply 不进入 frames 表，不改变 stream HWM。
-- [ ] Step 4: 重跑 route e2e并查询 test DB。 Expected: PASS；`frames`/`subscriptions` 不含 request/reply payload。
-- [ ] Step 5: 运行 fmt/clippy。
-- [ ] Step 6: 提交。 `git add agentdeck-relay && git commit -m "feat(relay): 实现 PairRoute 与在线 request reply"`
+- [x] Step 1: 写routing tests。只有MachineAccess能OpenPairRoute；Open固定absolute expiry，同machine/route/expiry逐字相同幂等ACK，owner或expiry不同冲突；Close对同owner及已不存在route幂等返回Closed/AlreadyAbsent，不同active owner拒绝。PairingAccess只能访问邀请中的active route并发送PairData/ClosePairRoute，越权Subscribe/Send/Publish全部拒绝；PairRoute覆盖每machine8、全局1,024、32 frames/1MiB/5m、token bucket、Relay重启丢内存态后重开、daemon重启但Relay未重启时重复Open、未知route、过期与两端close；Send/Reply覆盖active writer、machine/device trust-domain binding、offline、disconnect reply loss、requestRoute伪造和RouteAccepted不持久化/不代表端侧收到。补充 target/origin writer 背压、pairing Close ACK 丢失重试、biased actor-order close/expiry race、stale replacement 与双主体 transition fence。
+- [x] Step 2: 运行 route e2e。 Expected: FAIL，frame family 尚未 dispatch。已保留 `pair_route_view` 缺失与 terminal Close retry 被 active validator 拦截的红测证据，并逐项转绿。
+- [x] Step 3: 实现内存有界且Open/Close幂等的 PairRoute，以及显式 deviceRoute/requestRoute 在线路由。PairRoute record固定owner与absolute expiry；重复Open不延长TTL，Close unknown返回AlreadyAbsent。删除 v2 中 `req_origin` 概念；Send/Reply 不进入 frames 表，不改变 stream HWM。所有 machine mutation/enqueue 与 current generation 同锁线性化；Send/Reply 同时验证 origin+target，PairData 使用 canonical bytes 两阶段预算。
+- [x] Step 4: 重跑 route e2e并查询 test DB。 Expected: PASS；`frames`/`subscriptions` 不含 request/reply payload。已用非空 stream/HWM sentinel、同一 read-only connection 的 `PRAGMA data_version` 与八表语义快照证明 PairRoute/PairData/Send/Reply 零 SQLite commit；route E2E 10/10 case 全绿。
+- [x] Step 5: 运行 fmt/clippy。focused production clippy、rustdoc、panic scan、全量 Relay/Auth/Store/Protocol 回归、route E2E 10 轮、docs gate 与 diff check 纳入 P2.4 门禁。
+- [x] Step 6: 提交。 `git add agentdeck-relay README.md ARCHITECTURE.md docs && git commit -m "feat(relay): 实现 PairRoute 与在线 request reply"`
 
 ### Task P2.5：实现 grant install、revoke terminal、RetireMachine 与 purge readback
 
