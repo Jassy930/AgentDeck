@@ -16,7 +16,9 @@ use agentdeck_protocol::e2ee::pairing::{
     DeviceAuthorizationV1, PairInviteV1, PairPendingV1, PairRequestInfoV1, PairRequestV1,
     PairResponseInfoV1, PairResponseReceivedV1, PairResponseV1,
 };
-use agentdeck_protocol::e2ee::payload::{SealedPayloadKind, SealedPayloadV1, UnsignedSealedBlobV1};
+use agentdeck_protocol::e2ee::payload::{
+    SealedBlobSignatureVerifier, SealedPayloadKind, SealedPayloadV1, UnsignedSealedBlobV1,
+};
 use agentdeck_protocol::e2ee::tbs::{SignedObjectType, ToBeSignedV1};
 use agentdeck_protocol::e2ee::{E2EE_FORMAT_VERSION, E2eeError};
 use agentdeck_protocol::relay_v2::StreamCursor;
@@ -102,6 +104,66 @@ fn type_state_progresses_unsigned_signed_verified() {
         signed.verify(&pk()).unwrap_err(),
         E2eeError::CryptoNotAvailable
     );
+}
+
+// —— verify_with hook（P1.4 crypto 注入真实验签；protocol 侧计算 TBS bytes）——
+
+struct OkVerifier;
+impl SealedBlobSignatureVerifier for OkVerifier {
+    fn verify_sealed_tbs(
+        &self,
+        _tbs: &[u8],
+        _signature: &Ed25519Signature,
+    ) -> Result<(), E2eeError> {
+        Ok(())
+    }
+}
+
+struct FailVerifier;
+impl SealedBlobSignatureVerifier for FailVerifier {
+    fn verify_sealed_tbs(
+        &self,
+        _tbs: &[u8],
+        _signature: &Ed25519Signature,
+    ) -> Result<(), E2eeError> {
+        Err(E2eeError::BadSenderSignature)
+    }
+}
+
+#[test]
+fn verify_with_constructs_verified_only_when_verifier_ok() {
+    let signed = unsigned().attach_signature(sig());
+    let ctx = outer_sample();
+
+    // TBS bytes 由 protocol 侧从 context + blob 计算，带独立 domain separator。
+    let tbs = signed.inner.sealed_blob_tbs(&ctx);
+    assert!(tbs.starts_with(b"AgentDeck/SealedBlobTbsV1"));
+
+    // verifier Ok → 构造 Verified，且底层就是原 signed blob。
+    let verified = signed.clone().verify_with(&OkVerifier, &ctx).unwrap();
+    assert_eq!(verified.sealed(), &signed);
+
+    // verifier 失败 → 透传 typed error，绝不构造 Verified。
+    assert_eq!(
+        signed.verify_with(&FailVerifier, &ctx).unwrap_err(),
+        E2eeError::BadSenderSignature
+    );
+}
+
+#[test]
+fn sealed_blob_tbs_binds_context_and_ciphertext() {
+    let signed = unsigned().attach_signature(sig());
+    let base = signed.inner.sealed_blob_tbs(&outer_sample());
+
+    // 不同 context（route 变化）→ 不同 TBS。
+    let mut ctx2 = outer_sample();
+    ctx2.machine_route = Some(MachineRouteId::from_bytes([0x99; 16]));
+    assert_ne!(base, signed.inner.sealed_blob_tbs(&ctx2));
+
+    // 不同 ciphertext → 不同 TBS（绑定 encrypted-section SHA-256）。
+    let mut tampered = signed.inner.clone();
+    tampered.ciphertext = vec![0xAB, 0xCD];
+    assert_ne!(base, tampered.sealed_blob_tbs(&outer_sample()));
 }
 
 #[test]

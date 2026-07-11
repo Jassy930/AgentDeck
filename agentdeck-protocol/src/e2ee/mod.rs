@@ -182,8 +182,8 @@ pub use pairing::{
     PairResponseInfoV1, PairResponseReceivedV1, PairResponseV1,
 };
 pub use payload::{
-    SealedPayloadKind, SealedPayloadV1, SignedSealedBlobV1, UnsignedSealedBlobV1,
-    VerifiedSealedBlobV1,
+    SealedBlobSignatureVerifier, SealedPayloadKind, SealedPayloadV1, SignedSealedBlobV1,
+    UnsignedSealedBlobV1, VerifiedSealedBlobV1,
 };
 pub use schema::e2ee_schema;
 pub use tbs::{SignedObjectType, ToBeSignedV1};

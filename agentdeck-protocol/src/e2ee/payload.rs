@@ -24,11 +24,13 @@
 //! fn f(s: SignedSealedBlobV1) { let _ = s.open_plaintext(); } // 只有 Verified 能 open
 //! ```
 
+use crate::e2ee::context::OuterContextV1;
 use crate::e2ee::keys::KeyId;
 use crate::e2ee::{E2eeError, Enc};
 use crate::relay_v2::auth::{Ed25519Signature, PublicKeyBytes};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// 业务 payload 类型引用（endpoint 契约，只在密文内）。这些词允许出现在 e2ee schema，
 /// **禁止**出现在 Relay outer schema（两份 schema 独立，见 `relay_v2_neutrality`）。
@@ -127,6 +129,35 @@ impl UnsignedSealedBlobV1 {
         e.finish()
     }
 
+    /// 发送方签名 TBS preimage（design §7.3）——确定性长度前缀编码，供 crypto 侧
+    /// （MachineDataSign / DeviceSign）签名与验签。
+    ///
+    /// 绑定：outer machine/device/stream/request route、outer stream generation +
+    /// streamSeq/cursor、key epoch、inner format version + payload kind + key id +
+    /// key-directory revision、nonce（含 sender counter，design §7.4）与 encrypted-section
+    /// （ciphertext）的 SHA-256。**排除**签名本身，避免循环 preimage。
+    ///
+    /// TBS bytes 由 protocol 侧从 `context` + blob 计算，[`SignedSealedBlobV1::verify_with`]
+    /// 只对这份 bytes 验签——调用方无法对任意错误字节验签并构造 [`VerifiedSealedBlobV1`]。
+    pub fn sealed_blob_tbs(&self, context: &OuterContextV1) -> Vec<u8> {
+        let mut e = Enc::new();
+        e.domain(b"AgentDeck/SealedBlobTbsV1\0");
+        // outer context（route / generation / cursor / seq / version / message key epoch）。
+        e.bytes(&context.encode_aad());
+        // inner 头部字段。
+        e.u16(self.format_version);
+        e.u8(self.payload_kind.tag());
+        e.u8(self.key_id.purpose.tag());
+        e.u64(self.key_id.epoch);
+        e.u64(self.key_epoch);
+        e.u64(self.key_directory_revision);
+        e.bytes(&self.nonce);
+        // encrypted-section SHA-256（design §7.3）。
+        let hash: [u8; 32] = Sha256::digest(&self.ciphertext).into();
+        e.bytes(&hash);
+        e.finish()
+    }
+
     /// 附加发送方签名（MachineDataSign / DeviceSign），进入 [`SignedSealedBlobV1`]。
     /// 真实签名由 P1.4 crypto 产生；此处只接受已产生的签名并推进 type-state。
     pub fn attach_signature(self, signature: Ed25519Signature) -> SignedSealedBlobV1 {
@@ -153,20 +184,44 @@ impl SignedSealedBlobV1 {
         out
     }
 
-    /// 验证发送方签名并进入 [`VerifiedSealedBlobV1`]。
+    /// 无 crypto verifier 的验证入口——**恒 fail-closed**。
     ///
-    /// **P1 fail-closed 边界**：真实 Ed25519 验签在 P1.4 接入——在此之前本桩直接返回
-    /// `Err(CryptoNotAvailable)`，使 `VerifiedSealedBlobV1` 在 P1 无法经公共 API 构造。
-    /// 这样即使 P4 接入真实 AEAD 时漏改本桩，也不会出现"解密但未验发送方签名"的
-    /// 数据（design RC-15：共享对称 key 不能替代发送方签名）。
-    // SECURITY(P1.4): 接入真实 Ed25519 验签时替换本桩——验签通过才返回
-    // `Ok(VerifiedSealedBlobV1 { inner: self })`，失败返回 `BadSenderSignature`。
+    /// 真实 Ed25519 验签经 [`SignedSealedBlobV1::verify_with`] 由 `agentdeck-crypto`
+    /// （P1.4）注入的 [`SealedBlobSignatureVerifier`] 完成；本方法不持有 verifier，故永远
+    /// 返回 `Err(CryptoNotAvailable)`，保证 `VerifiedSealedBlobV1` 不会经无验签路径构造
+    /// （design RC-15：共享对称 key 不能替代发送方签名）。
     pub fn verify(
         self,
         _verifying_key: &PublicKeyBytes,
     ) -> Result<VerifiedSealedBlobV1, E2eeError> {
         Err(E2eeError::CryptoNotAvailable)
     }
+
+    /// 用注入的 [`SealedBlobSignatureVerifier`] 验证发送方签名并进入 [`VerifiedSealedBlobV1`]。
+    ///
+    /// TBS bytes 由 protocol 侧从 `context` + blob 计算（见
+    /// [`UnsignedSealedBlobV1::sealed_blob_tbs`]），verifier 只能对这份 bytes 验签；调用方
+    /// 无法对任意错误字节验签并构造 Verified。verifier 返回 `Ok` 才构造 Verified，否则透传
+    /// 其 typed error（`agentdeck-crypto` 用 ed25519-dalek 实现该 trait）。
+    pub fn verify_with<V: SealedBlobSignatureVerifier>(
+        self,
+        verifier: &V,
+        context: &OuterContextV1,
+    ) -> Result<VerifiedSealedBlobV1, E2eeError> {
+        let tbs = self.inner.sealed_blob_tbs(context);
+        verifier.verify_sealed_tbs(&tbs, &self.signature)?;
+        Ok(VerifiedSealedBlobV1 { inner: self })
+    }
+}
+
+/// P1.4 verifier-hook（design RC-15）：由 `agentdeck-crypto` 用 ed25519-dalek 实现真实的
+/// sealed-blob 发送方验签。protocol 侧负责计算 canonical TBS bytes，本 trait 只对给定
+/// bytes + 签名验签——它无法自行选择被验字节，因此不能绕过 [`SignedSealedBlobV1::verify_with`]
+/// 的 type-state 约束去构造 [`VerifiedSealedBlobV1`]。
+pub trait SealedBlobSignatureVerifier {
+    /// 对 protocol 计算好的 sealed-blob TBS bytes 验签；`Ok(())` 表示签名有效。
+    /// 失败必须返回 typed error（约定 [`E2eeError::BadSenderSignature`]）。
+    fn verify_sealed_tbs(&self, tbs: &[u8], signature: &Ed25519Signature) -> Result<(), E2eeError>;
 }
 
 /// 已验证 sealed blob。AEAD open 只接收本类型。

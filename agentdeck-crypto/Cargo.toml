@@ -1,0 +1,22 @@
+[package]
+name = "agentdeck-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AgentDeck Relay E2EE cryptography — fixed cipher suite (Ed25519 / HPKE Base X25519+HKDF-SHA256+ChaCha20Poly1305 / RFC 8439 ChaCha20-Poly1305) and deterministic golden vectors"
+
+[dependencies]
+agentdeck-protocol = { path = "../agentdeck-protocol" }
+# 单一高层 HPKE 实现（design §7.1，禁止手写 X25519/HKDF box）。default-features off，只启
+# 用 X25519+HKDF-SHA256（x25519 feature）与 ChaCha20-Poly1305（chacha feature）。
+hpke = { version = "0.14", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
+ed25519-dalek = { version = "2", features = ["zeroize"] }
+# §7.1 高频 RFC 8439 AEAD；0.11 与 hpke 0.14 内部同一版本，cargo tree 无第二套 AEAD。
+chacha20poly1305 = "0.11"
+sha2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+thiserror = "1"
+
+[dev-dependencies]
+serde_json = "1"
