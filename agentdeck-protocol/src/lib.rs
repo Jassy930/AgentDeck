@@ -7,6 +7,7 @@
 //! Phase 2 / Phase 5 migrate downstream consumers.
 
 pub mod capabilities;
+pub mod runtime;
 pub mod transport;
 pub mod trunk;
 pub mod vendor;
