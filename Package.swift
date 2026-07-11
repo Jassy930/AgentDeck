@@ -11,11 +11,16 @@ let package = Package(
     platforms: [.macOS(.v15), .iOS(.v17)],
     products: [
         .library(name: "AgentDeckCore", targets: ["AgentDeckCore"]),
+        .library(name: "AgentDeckRelayClient", targets: ["AgentDeckRelayClient"]),
     ],
     targets: [
         .target(
             name: "AgentDeckCore",
             path: "Sources/AgentDeckCore"
+        ),
+        .target(
+            name: "AgentDeckRelayClient",
+            path: "Sources/AgentDeckRelayClient"
         ),
         .executableTarget(
             name: "AgentDeck",
@@ -32,6 +37,11 @@ let package = Package(
                 "AgentDeckCore",
             ],
             path: "Tests/AgentDeckTests"
+        ),
+        .testTarget(
+            name: "AgentDeckRelayClientTests",
+            dependencies: ["AgentDeckRelayClient"],
+            path: "Tests/AgentDeckRelayClientTests"
         ),
     ]
 )
