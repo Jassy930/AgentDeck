@@ -8,7 +8,11 @@
 //!
 //! 现有 Relay v1 namespace（`remote::`）本 task 原样保留、彼此独立。
 
-use agentdeck_protocol::e2ee::E2EE_FORMAT_VERSION;
+use agentdeck_protocol::e2ee::{
+    DeviceAuthorizationV1, E2EE_FORMAT_VERSION, EpochBarrierV1, KeyDirectoryEntry, KeyDirectoryV1,
+    KeyId, KeyPurpose, KeyUpdateV1, PairInviteV1, PairRequestV1, PairResponseV1, SealedPayloadKind,
+    SealedPayloadV1,
+};
 use agentdeck_protocol::relay_v2::auth::{
     CertRole, DeviceRevocation, Ed25519Signature, PublicKeyBytes, RelayGrant, SignedCertificate,
 };
@@ -30,6 +34,8 @@ use agentdeck_protocol::relay_v2::id::{
 };
 use agentdeck_protocol::relay_v2::{RELAY_PROTOCOL_VERSION, StreamCursor};
 use std::collections::BTreeSet;
+use std::fs;
+use std::path::PathBuf;
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -107,6 +113,29 @@ fn revocation() -> DeviceRevocation {
 }
 fn blob() -> SealedBlob {
     SealedBlob(vec![0xDE, 0xAD, 0xBE, 0xEF])
+}
+
+fn data_cert() -> SignedCertificate {
+    SignedCertificate {
+        cert_role: CertRole::Data,
+        ..cert()
+    }
+}
+
+fn key_directory() -> KeyDirectoryV1 {
+    KeyDirectoryV1 {
+        revision: KeyDirectoryRevision::new(2),
+        entries: vec![KeyDirectoryEntry {
+            key_id: KeyId {
+                purpose: KeyPurpose::ConversationDek,
+                epoch: 4,
+            },
+            device_route: dr(),
+            enc: vec![0xC1, 0xC2],
+            wrapped_key: vec![0xD1, 0xD2, 0xD3],
+        }],
+        signature: sig(),
+    }
 }
 
 /// 每个 frame family 至少一个代表帧，按 RelayFrameBody 定义顺序覆盖全部 28 variant。
@@ -241,6 +270,188 @@ fn all_bodies() -> Vec<RelayFrameBody> {
             drain_deadline_ms: 5000,
         }),
     ]
+}
+
+fn relay_fixture_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../protocol/agentdeck/fixtures/relay-v2-wire-vectors.json")
+}
+
+fn outer_family(kind: u16) -> &'static str {
+    match kind {
+        0..=3 => "handshake",
+        4..=8 => "pairing",
+        9..=15 => "stream",
+        16..=17 => "request",
+        18..=22 => "authControl",
+        23..=27 => "runtime",
+        _ => unreachable!("all_bodies only contains known Relay v2 kinds"),
+    }
+}
+
+fn endpoint_wire_vectors() -> Vec<serde_json::Value> {
+    let pair_invite = PairInviteV1 {
+        format_version: E2EE_FORMAT_VERSION,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        pair_route: pr(),
+        invite_secret: [0x01; 32],
+        invite_hpke_pubkey: PublicKeyBytes([0x02; 32]),
+        wss_url: "wss://relay.example.test/v2".into(),
+        relay_server_id: rs(),
+        current_spki_pin: [0x03; 32],
+        next_spki_pin: [0x04; 32],
+        expires_at_ms: 1_700_000_300_000,
+        machine_root_pubkey: PublicKeyBytes([0x05; 32]),
+        machine_root_fingerprint: [0x06; 32],
+        data_sign_cert: data_cert(),
+        machine_display_name: "Fixture Machine".into(),
+    };
+    let pair_request = PairRequestV1 {
+        format_version: E2EE_FORMAT_VERSION,
+        invite_secret: [0x01; 32],
+        device_sign_pubkey: PublicKeyBytes([0x07; 32]),
+        device_hpke_pubkey: PublicKeyBytes([0x08; 32]),
+        sealed_authorization_request: vec![0x09, 0x0A, 0x0B],
+        proof_signature: sig(),
+    };
+    let authorization = DeviceAuthorizationV1 {
+        grant_serial: GrantSerial::new(9),
+        device_hpke_pubkey: PublicKeyBytes([0x08; 32]),
+        capabilities: vec!["view".into(), "respond".into()],
+        permissions: vec!["approval.resolve".into()],
+        root_key_id: rk(),
+        trust_epoch: TrustEpoch::new(3),
+        signature: sig(),
+    };
+    let directory = key_directory();
+    let pair_response = PairResponseV1 {
+        request_hash: [0x0C; 32],
+        relay_grant: grant(),
+        sealed_device_authorization: vec![0x0D, 0x0E],
+        key_directory: directory.clone(),
+        signature: sig(),
+    };
+    let key_update = KeyUpdateV1 {
+        key_directory_revision: KeyDirectoryRevision::new(3),
+        key_id: KeyId {
+            purpose: KeyPurpose::DeviceReplyTx,
+            epoch: 5,
+        },
+        device_route: dr(),
+        enc: vec![0x0F, 0x10],
+        wrapped_key: vec![0x11, 0x12, 0x13],
+        signature: sig(),
+    };
+    let barrier = EpochBarrierV1 {
+        stream_generation: sg(),
+        stream_cursor: StreamCursor::At(42),
+        event_seq: 41,
+        old_epoch: 4,
+        new_epoch: 5,
+        key_directory_revision: KeyDirectoryRevision::new(3),
+    };
+    let sealed_payload = SealedPayloadV1 {
+        format_version: E2EE_FORMAT_VERSION,
+        payload_kind: SealedPayloadKind::ConversationEvent,
+    };
+
+    vec![
+        serde_json::json!({
+            "case": "pairInvite",
+            "wireType": "PairInviteV1",
+            "value": serde_json::to_value(pair_invite).unwrap(),
+        }),
+        serde_json::json!({
+            "case": "pairRequest",
+            "wireType": "PairRequestV1",
+            "value": serde_json::to_value(pair_request).unwrap(),
+        }),
+        serde_json::json!({
+            "case": "pairResponse",
+            "wireType": "PairResponseV1",
+            "value": serde_json::to_value(pair_response).unwrap(),
+        }),
+        serde_json::json!({
+            "case": "deviceAuthorization",
+            "wireType": "DeviceAuthorizationV1",
+            "value": serde_json::to_value(authorization).unwrap(),
+        }),
+        serde_json::json!({
+            "case": "keyDirectory",
+            "wireType": "KeyDirectoryV1",
+            "value": serde_json::to_value(directory).unwrap(),
+        }),
+        serde_json::json!({
+            "case": "keyUpdate",
+            "wireType": "KeyUpdateV1",
+            "value": serde_json::to_value(key_update).unwrap(),
+        }),
+        serde_json::json!({
+            "case": "epochBarrier",
+            "wireType": "EpochBarrierV1",
+            "value": serde_json::to_value(barrier).unwrap(),
+        }),
+        serde_json::json!({
+            "case": "sealedPayload",
+            "wireType": "SealedPayloadV1",
+            "value": serde_json::to_value(sealed_payload).unwrap(),
+        }),
+    ]
+}
+
+fn render_relay_v2_wire_vectors() -> String {
+    let outer_frames = all_bodies()
+        .into_iter()
+        .map(|body| {
+            let kind = body.kind();
+            let frame = OpaqueRouteFrame {
+                version: RELAY_PROTOCOL_VERSION,
+                body,
+            };
+            let input = serde_json::to_value(&frame).expect("outer frame must serialize");
+            let case = input["body"]["frameKind"]
+                .as_str()
+                .expect("RelayFrameBody must expose frameKind");
+            serde_json::json!({
+                "case": case,
+                "family": outer_family(kind),
+                "kind": kind,
+                "input": input,
+                "expectedHex": hex(&codec::encode(&frame)),
+            })
+        })
+        .collect::<Vec<_>>();
+    let document = serde_json::json!({
+        "fixtureFormatVersion": 1,
+        "relayProtocolVersion": RELAY_PROTOCOL_VERSION,
+        "outerFrames": outer_frames,
+        "endpointTypes": endpoint_wire_vectors(),
+    });
+    let mut output = serde_json::to_string_pretty(&document).expect("fixture must serialize");
+    output.push('\n');
+    output
+}
+
+#[test]
+fn relay_v2_wire_fixture_is_rust_produced_and_in_sync() {
+    let expected = render_relay_v2_wire_vectors();
+    let path = relay_fixture_path();
+    if std::env::var("UPDATE_WIRE_FIXTURES").as_deref() == Ok("1") {
+        fs::create_dir_all(path.parent().expect("relay fixture has parent directory"))
+            .expect("create relay fixture directory");
+        fs::write(&path, expected.as_bytes()).expect("write Relay v2 wire fixture");
+    }
+    let committed = fs::read(&path).unwrap_or_else(|error| {
+        panic!(
+            "read committed relay fixture {}: {error}; run with UPDATE_WIRE_FIXTURES=1",
+            path.display()
+        )
+    });
+    assert_eq!(
+        committed,
+        expected.as_bytes(),
+        "Relay v2 fixture drifted; review Rust DTO/codec changes and regenerate with UPDATE_WIRE_FIXTURES=1"
+    );
 }
 
 #[test]

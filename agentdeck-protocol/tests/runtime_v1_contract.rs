@@ -8,23 +8,29 @@ use agentdeck_protocol::runtime::command::{
 };
 use agentdeck_protocol::runtime::failure::{self, RuntimeFailure};
 use agentdeck_protocol::runtime::identity::{
-    ApprovalId, CommandId, ConversationId, IdempotencyKey, MessageId, PairingId, TurnId,
+    ApprovalId, CommandId, ConversationId, EntityId, EventId, IdempotencyKey, ItemId, MessageId,
+    PairingId, TransferId, TurnId,
 };
 use agentdeck_protocol::runtime::receipt::{
-    ApprovalDeliveryState, ApprovalReceipt, CommandReceipt,
+    ApprovalDeliveryState, ApprovalReceipt, CommandReceipt, RevocationReceipt,
 };
 use agentdeck_protocol::runtime::sync::{
     ConversationSnapshot, SnapshotError, SnapshotItem, StreamCursor,
 };
 use agentdeck_protocol::runtime::{
-    self, MAX_RUNTIME_REQUEST_BYTES, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeMessage,
-    RuntimeRequest, ensure_request_within_limit,
+    self, MAX_RUNTIME_REQUEST_BYTES, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeEvent,
+    RuntimeEventBody, RuntimeMessage, RuntimeReply, RuntimeRequest, RuntimeStreamItem,
+    TransferEnvelope, ensure_request_within_limit,
 };
 use agentdeck_protocol::{
     ActionDecision, ActionDecisionKind, AgentItem, AgentKind, CapabilityId, CodexCapabilities,
     SessionCapabilities, VendorCapabilities,
 };
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::fs;
+use std::path::PathBuf;
 
 fn sample_caps() -> SessionCapabilities {
     SessionCapabilities {
@@ -44,11 +50,224 @@ fn sample_send_prompt() -> RuntimeRequest {
 }
 
 fn envelope(body: RuntimeMessage) -> RuntimeEnvelope {
+    envelope_with_id("m1", body)
+}
+
+fn envelope_with_id(message_id: &str, body: RuntimeMessage) -> RuntimeEnvelope {
     RuntimeEnvelope {
         version: RUNTIME_PROTOCOL_VERSION,
-        message_id: MessageId::new("m1"),
+        message_id: MessageId::new(message_id),
         body,
     }
+}
+
+fn fixture_case<T: Serialize>(name: &str, wire_type: &str, value: &T) -> serde_json::Value {
+    serde_json::json!({
+        "case": name,
+        "wireType": wire_type,
+        "value": serde_json::to_value(value).expect("fixture DTO must serialize"),
+    })
+}
+
+fn runtime_fixture_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../protocol/agentdeck/fixtures/runtime-v1-wire.jsonl")
+}
+
+fn render_runtime_wire_fixture() -> String {
+    let mut cases = Vec::new();
+
+    let stable_ids = envelope_with_id(
+        "message-stable-1",
+        RuntimeMessage::Stream(RuntimeStreamItem::Event(RuntimeEvent {
+            conversation_id: ConversationId::new("conversation-stable-1"),
+            event_id: EventId::new("event-stable-1"),
+            event_seq: 7,
+            item_id: Some(ItemId::new("item-stable-1")),
+            entity_id: Some(EntityId::new("entity-stable-1")),
+            body: RuntimeEventBody::TurnStarted {
+                turn_id: TurnId::new("turn-stable-1"),
+                command_id: CommandId::new("command-stable-1"),
+            },
+        })),
+    );
+    cases.push(fixture_case("stableIds", "runtimeEnvelope", &stable_ids));
+
+    let command_receipts = [
+        (
+            "commandAccepted",
+            CommandReceipt::Accepted {
+                command_id: CommandId::new("command-accepted-1"),
+                queue_position: 2,
+            },
+        ),
+        (
+            "commandReplayed",
+            CommandReceipt::Replayed {
+                command_id: CommandId::new("command-replayed-1"),
+            },
+        ),
+        (
+            "commandFailed",
+            CommandReceipt::Failed {
+                failure: RuntimeFailure::new(
+                    failure::DAEMON_COMMAND_IDEMPOTENCY_CONFLICT,
+                    "idempotency conflict",
+                )
+                .with_diagnostic("diag-command-1"),
+            },
+        ),
+    ];
+    for (index, (name, receipt)) in command_receipts.into_iter().enumerate() {
+        let value = envelope_with_id(
+            &format!("message-command-{index}"),
+            RuntimeMessage::Reply(RuntimeReply::Command(receipt)),
+        );
+        cases.push(fixture_case(name, "runtimeEnvelope", &value));
+    }
+
+    let approval_outcomes = [
+        (
+            "approvalClaimed",
+            ApprovalReceipt::Claimed {
+                approval_id: ApprovalId::new("approval-claimed-1"),
+            },
+        ),
+        (
+            "approvalApplied",
+            ApprovalReceipt::Applied {
+                approval_id: ApprovalId::new("approval-applied-1"),
+            },
+        ),
+        (
+            "approvalDeliveryFailed",
+            ApprovalReceipt::DeliveryFailed {
+                approval_id: ApprovalId::new("approval-delivery-failed-1"),
+            },
+        ),
+        (
+            "approvalExpired",
+            ApprovalReceipt::Expired {
+                approval_id: ApprovalId::new("approval-expired-1"),
+            },
+        ),
+    ];
+    for (index, (name, receipt)) in approval_outcomes.into_iter().enumerate() {
+        let value = envelope_with_id(
+            &format!("message-approval-outcome-{index}"),
+            RuntimeMessage::Reply(RuntimeReply::Approval(receipt)),
+        );
+        cases.push(fixture_case(name, "runtimeEnvelope", &value));
+    }
+
+    let approval_states = [
+        ("claimed", ApprovalDeliveryState::Claimed),
+        ("applying", ApprovalDeliveryState::Applying),
+        ("applied", ApprovalDeliveryState::Applied),
+        ("deliveryFailed", ApprovalDeliveryState::DeliveryFailed),
+        ("expired", ApprovalDeliveryState::Expired),
+    ];
+    for (index, (state_name, state)) in approval_states.into_iter().enumerate() {
+        let value = envelope_with_id(
+            &format!("message-approval-state-{index}"),
+            RuntimeMessage::Reply(RuntimeReply::Approval(ApprovalReceipt::AlreadyHandled {
+                approval_id: ApprovalId::new(format!("approval-state-{state_name}")),
+                decision: ActionDecisionKind::Approve,
+                state,
+            })),
+        );
+        cases.push(fixture_case(
+            &format!("approvalAlreadyHandled-{state_name}"),
+            "runtimeEnvelope",
+            &value,
+        ));
+    }
+
+    let revocation = envelope_with_id(
+        "message-revocation-1",
+        RuntimeMessage::Reply(RuntimeReply::Revocation(RevocationReceipt::Committed {
+            grant_serial: agentdeck_protocol::runtime::identity::GrantSerial::new(11),
+        })),
+    );
+    cases.push(fixture_case(
+        "revocationCommitted",
+        "runtimeEnvelope",
+        &revocation,
+    ));
+
+    let snapshot = ConversationSnapshot::new(
+        ConversationId::new("conversation-snapshot-1"),
+        6,
+        vec![
+            SnapshotItem::Capabilities {
+                capabilities: sample_caps(),
+            },
+            SnapshotItem::Item {
+                item_id: ItemId::new("item-snapshot-1"),
+                item: AgentItem::AssistantMessage {
+                    text: "fixture assistant message".into(),
+                    meta: Default::default(),
+                },
+            },
+        ],
+    )
+    .expect("fixture snapshot must be capabilities-first");
+    let snapshot_envelope = envelope_with_id(
+        "message-snapshot-1",
+        RuntimeMessage::Reply(RuntimeReply::Snapshot(snapshot)),
+    );
+    cases.push(fixture_case(
+        "capabilitiesFirstSnapshot",
+        "runtimeEnvelope",
+        &snapshot_envelope,
+    ));
+
+    let part = b"runtime-transfer-fixture".to_vec();
+    let total_sha256: [u8; 32] = Sha256::digest(&part).into();
+    let transfer = TransferEnvelope::new(
+        TransferId::new("transfer-stable-1"),
+        0,
+        1,
+        total_sha256,
+        part.len() as u64,
+        part,
+    )
+    .expect("fixture transfer must satisfy bounds");
+    cases.push(fixture_case(
+        "transferEnvelope",
+        "transferEnvelope",
+        &transfer,
+    ));
+
+    let mut output = cases
+        .into_iter()
+        .map(|value| serde_json::to_string(&value).expect("fixture case must serialize"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    output.push('\n');
+    output
+}
+
+#[test]
+fn runtime_v1_wire_fixture_is_rust_produced_and_in_sync() {
+    let expected = render_runtime_wire_fixture();
+    let path = runtime_fixture_path();
+    if std::env::var("UPDATE_WIRE_FIXTURES").as_deref() == Ok("1") {
+        fs::create_dir_all(path.parent().expect("runtime fixture has parent directory"))
+            .expect("create runtime fixture directory");
+        fs::write(&path, expected.as_bytes()).expect("write runtime v1 wire fixture");
+    }
+    let committed = fs::read(&path).unwrap_or_else(|error| {
+        panic!(
+            "read committed runtime fixture {}: {error}; run with UPDATE_WIRE_FIXTURES=1",
+            path.display()
+        )
+    });
+    assert_eq!(
+        committed,
+        expected.as_bytes(),
+        "runtime fixture drifted; review Rust DTO changes and regenerate with UPDATE_WIRE_FIXTURES=1"
+    );
 }
 
 #[test]

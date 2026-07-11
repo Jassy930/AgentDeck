@@ -1,0 +1,650 @@
+{
+  "endpointTypes": [
+    {
+      "case": "pairInvite",
+      "value": {
+        "currentSpkiPin": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+        "dataSignCert": {
+          "certRole": "data",
+          "generation": 7,
+          "rootKeyId": "d3d3d3d3d3d3d3d3d3d3dw==",
+          "signature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA==",
+          "subjectPubkey": "oKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKA=",
+          "trustEpoch": 3
+        },
+        "expiresAtMs": 1700000300000,
+        "formatVersion": 1,
+        "inviteHpkePubkey": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+        "inviteSecret": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "machineDisplayName": "Fixture Machine",
+        "machineRootFingerprint": "BgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgY=",
+        "machineRootPubkey": "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU=",
+        "nextSpkiPin": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=",
+        "pairRoute": "VVVVVVVVVVVVVVVVVVVVVQ==",
+        "relayProtocolVersion": 2,
+        "relayServerId": "iIiIiIiIiIiIiIiIiIiIiA==",
+        "wssUrl": "wss://relay.example.test/v2"
+      },
+      "wireType": "PairInviteV1"
+    },
+    {
+      "case": "pairRequest",
+      "value": {
+        "deviceHpkePubkey": "CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg=",
+        "deviceSignPubkey": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+        "formatVersion": 1,
+        "inviteSecret": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "proofSignature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA==",
+        "sealedAuthorizationRequest": "CQoL"
+      },
+      "wireType": "PairRequestV1"
+    },
+    {
+      "case": "pairResponse",
+      "value": {
+        "keyDirectory": {
+          "entries": [
+            {
+              "deviceRoute": "IiIiIiIiIiIiIiIiIiIiIg==",
+              "enc": "wcI=",
+              "keyId": {
+                "epoch": 4,
+                "purpose": "conversationDek"
+              },
+              "wrappedKey": "0dLT"
+            }
+          ],
+          "revision": 2,
+          "signature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA=="
+        },
+        "relayGrant": {
+          "deviceRoute": "IiIiIiIiIiIiIiIiIiIiIg==",
+          "deviceSignPubkey": "oKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKA=",
+          "grantSerial": 9,
+          "machineRoute": "EREREREREREREREREREREQ==",
+          "rootKeyId": "d3d3d3d3d3d3d3d3d3d3dw==",
+          "signature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA==",
+          "trustEpoch": 3
+        },
+        "requestHash": "DAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw=",
+        "sealedDeviceAuthorization": "DQ4=",
+        "signature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA=="
+      },
+      "wireType": "PairResponseV1"
+    },
+    {
+      "case": "deviceAuthorization",
+      "value": {
+        "capabilities": [
+          "view",
+          "respond"
+        ],
+        "deviceHpkePubkey": "CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg=",
+        "grantSerial": 9,
+        "permissions": [
+          "approval.resolve"
+        ],
+        "rootKeyId": "d3d3d3d3d3d3d3d3d3d3dw==",
+        "signature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA==",
+        "trustEpoch": 3
+      },
+      "wireType": "DeviceAuthorizationV1"
+    },
+    {
+      "case": "keyDirectory",
+      "value": {
+        "entries": [
+          {
+            "deviceRoute": "IiIiIiIiIiIiIiIiIiIiIg==",
+            "enc": "wcI=",
+            "keyId": {
+              "epoch": 4,
+              "purpose": "conversationDek"
+            },
+            "wrappedKey": "0dLT"
+          }
+        ],
+        "revision": 2,
+        "signature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA=="
+      },
+      "wireType": "KeyDirectoryV1"
+    },
+    {
+      "case": "keyUpdate",
+      "value": {
+        "deviceRoute": "IiIiIiIiIiIiIiIiIiIiIg==",
+        "enc": "DxA=",
+        "keyDirectoryRevision": 3,
+        "keyId": {
+          "epoch": 5,
+          "purpose": "deviceReplyTx"
+        },
+        "signature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA==",
+        "wrappedKey": "ERIT"
+      },
+      "wireType": "KeyUpdateV1"
+    },
+    {
+      "case": "epochBarrier",
+      "value": {
+        "eventSeq": 41,
+        "keyDirectoryRevision": 3,
+        "newEpoch": 5,
+        "oldEpoch": 4,
+        "streamCursor": {
+          "at": 42
+        },
+        "streamGeneration": "ZmZmZmZmZmZmZmZmZmZmZg=="
+      },
+      "wireType": "EpochBarrierV1"
+    },
+    {
+      "case": "sealedPayload",
+      "value": {
+        "formatVersion": 1,
+        "payloadKind": "conversationEvent"
+      },
+      "wireType": "SealedPayloadV1"
+    }
+  ],
+  "fixtureFormatVersion": 1,
+  "outerFrames": [
+    {
+      "case": "hello",
+      "expectedHex": "4144525632000200000002",
+      "family": "handshake",
+      "input": {
+        "body": {
+          "frame": {
+            "protocolVersion": 2
+          },
+          "frameKind": "hello"
+        },
+        "version": 2
+      },
+      "kind": 0
+    },
+    {
+      "case": "challenge",
+      "expectedHex": "41445256320002000188888888888888888888888888888888999999999999999999999999999999990101010101010101010101010101010101010101010101010101010101010101",
+      "family": "handshake",
+      "input": {
+        "body": {
+          "frame": {
+            "challengeNonce": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "connectionInstance": "mZmZmZmZmZmZmZmZmZmZmQ==",
+            "relayServerId": "iIiIiIiIiIiIiIiIiIiIiA=="
+          },
+          "frameKind": "challenge"
+        },
+        "version": 2
+      },
+      "kind": 1
+    },
+    {
+      "case": "authenticate",
+      "expectedHex": "414452563200020002011111111111111111111111111111111122222222222222222222222222222222a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a00000000000000009777777777777777777777777777777770000000000000003b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+      "family": "handshake",
+      "input": {
+        "body": {
+          "frame": {
+            "proof": {
+              "device": {
+                "relay_grant": {
+                  "deviceRoute": "IiIiIiIiIiIiIiIiIiIiIg==",
+                  "deviceSignPubkey": "oKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKA=",
+                  "grantSerial": 9,
+                  "machineRoute": "EREREREREREREREREREREQ==",
+                  "rootKeyId": "d3d3d3d3d3d3d3d3d3d3dw==",
+                  "signature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA==",
+                  "trustEpoch": 3
+                }
+              }
+            },
+            "signature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA=="
+          },
+          "frameKind": "authenticate"
+        },
+        "version": 2
+      },
+      "kind": 2
+    },
+    {
+      "case": "authenticated",
+      "expectedHex": "4144525632000200030014",
+      "family": "handshake",
+      "input": {
+        "body": {
+          "frame": {
+            "heartbeatIntervalSecs": 20
+          },
+          "frameKind": "authenticated"
+        },
+        "version": 2
+      },
+      "kind": 3
+    },
+    {
+      "case": "openPairRoute",
+      "expectedHex": "41445256320002000411111111111111111111111111111111555555555555555555555555555555550000018bcfe56800",
+      "family": "pairing",
+      "input": {
+        "body": {
+          "frame": {
+            "absoluteExpiryMs": 1700000000000,
+            "machineRoute": "EREREREREREREREREREREQ==",
+            "pairRoute": "VVVVVVVVVVVVVVVVVVVVVQ=="
+          },
+          "frameKind": "openPairRoute"
+        },
+        "version": 2
+      },
+      "kind": 4
+    },
+    {
+      "case": "pairRouteOpened",
+      "expectedHex": "41445256320002000511111111111111111111111111111111555555555555555555555555555555550000018bcfe56800",
+      "family": "pairing",
+      "input": {
+        "body": {
+          "frame": {
+            "absoluteExpiryMs": 1700000000000,
+            "machineRoute": "EREREREREREREREREREREQ==",
+            "pairRoute": "VVVVVVVVVVVVVVVVVVVVVQ=="
+          },
+          "frameKind": "pairRouteOpened"
+        },
+        "version": 2
+      },
+      "kind": 5
+    },
+    {
+      "case": "pairData",
+      "expectedHex": "4144525632000200065555555555555555555555555555555500000004deadbeef",
+      "family": "pairing",
+      "input": {
+        "body": {
+          "frame": {
+            "pairRoute": "VVVVVVVVVVVVVVVVVVVVVQ==",
+            "sealedBlob": "3q2+7w=="
+          },
+          "frameKind": "pairData"
+        },
+        "version": 2
+      },
+      "kind": 6
+    },
+    {
+      "case": "closePairRoute",
+      "expectedHex": "4144525632000200071111111111111111111111111111111155555555555555555555555555555555",
+      "family": "pairing",
+      "input": {
+        "body": {
+          "frame": {
+            "machineRoute": "EREREREREREREREREREREQ==",
+            "pairRoute": "VVVVVVVVVVVVVVVVVVVVVQ=="
+          },
+          "frameKind": "closePairRoute"
+        },
+        "version": 2
+      },
+      "kind": 7
+    },
+    {
+      "case": "pairRouteClosed",
+      "expectedHex": "4144525632000200085555555555555555555555555555555500",
+      "family": "pairing",
+      "input": {
+        "body": {
+          "frame": {
+            "outcome": "closed",
+            "pairRoute": "VVVVVVVVVVVVVVVVVVVVVQ=="
+          },
+          "frameKind": "pairRouteClosed"
+        },
+        "version": 2
+      },
+      "kind": 8
+    },
+    {
+      "case": "registerStream",
+      "expectedHex": "414452563200020009111111111111111111111111111111113333333333333333333333333333333366666666666666666666666666666666",
+      "family": "stream",
+      "input": {
+        "body": {
+          "frame": {
+            "generation": "ZmZmZmZmZmZmZmZmZmZmZg==",
+            "machineRoute": "EREREREREREREREREREREQ==",
+            "streamRoute": "MzMzMzMzMzMzMzMzMzMzMw=="
+          },
+          "frameKind": "registerStream"
+        },
+        "version": 2
+      },
+      "kind": 9
+    },
+    {
+      "case": "publish",
+      "expectedHex": "41445256320002000a3333333333333333333333333333333366666666666666666666666666666666000000000000000000000004deadbeef",
+      "family": "stream",
+      "input": {
+        "body": {
+          "frame": {
+            "generation": "ZmZmZmZmZmZmZmZmZmZmZg==",
+            "sealedBlob": "3q2+7w==",
+            "streamRoute": "MzMzMzMzMzMzMzMzMzMzMw==",
+            "streamSeq": 0
+          },
+          "frameKind": "publish"
+        },
+        "version": 2
+      },
+      "kind": 10
+    },
+    {
+      "case": "subscribe",
+      "expectedHex": "41445256320002000b333333333333333333333333333333336666666666666666666666666666666600",
+      "family": "stream",
+      "input": {
+        "body": {
+          "frame": {
+            "cursor": "beforeFirst",
+            "generation": "ZmZmZmZmZmZmZmZmZmZmZg==",
+            "streamRoute": "MzMzMzMzMzMzMzMzMzMzMw=="
+          },
+          "frameKind": "subscribe"
+        },
+        "version": 2
+      },
+      "kind": 11
+    },
+    {
+      "case": "unsubscribe",
+      "expectedHex": "41445256320002000c3333333333333333333333333333333366666666666666666666666666666666",
+      "family": "stream",
+      "input": {
+        "body": {
+          "frame": {
+            "generation": "ZmZmZmZmZmZmZmZmZmZmZg==",
+            "streamRoute": "MzMzMzMzMzMzMzMzMzMzMw=="
+          },
+          "frameKind": "unsubscribe"
+        },
+        "version": 2
+      },
+      "kind": 12
+    },
+    {
+      "case": "ack",
+      "expectedHex": "41445256320002000d33333333333333333333333333333333666666666666666666666666666666660000000000000005",
+      "family": "stream",
+      "input": {
+        "body": {
+          "frame": {
+            "generation": "ZmZmZmZmZmZmZmZmZmZmZg==",
+            "streamRoute": "MzMzMzMzMzMzMzMzMzMzMw==",
+            "upToSeq": 5
+          },
+          "frameKind": "ack"
+        },
+        "version": 2
+      },
+      "kind": 13
+    },
+    {
+      "case": "gap",
+      "expectedHex": "41445256320002000e333333333333333333333333333333336666666666666666666666666666666600000000000000030000000000000007",
+      "family": "stream",
+      "input": {
+        "body": {
+          "frame": {
+            "generation": "ZmZmZmZmZmZmZmZmZmZmZg==",
+            "needStreamSeq": 3,
+            "oldestStreamSeq": 7,
+            "streamRoute": "MzMzMzMzMzMzMzMzMzMzMw=="
+          },
+          "frameKind": "gap"
+        },
+        "version": 2
+      },
+      "kind": 14
+    },
+    {
+      "case": "replayComplete",
+      "expectedHex": "41445256320002000f333333333333333333333333333333336666666666666666666666666666666601000000000000002a",
+      "family": "stream",
+      "input": {
+        "body": {
+          "frame": {
+            "currentCursor": {
+              "at": 42
+            },
+            "generation": "ZmZmZmZmZmZmZmZmZmZmZg==",
+            "streamRoute": "MzMzMzMzMzMzMzMzMzMzMw=="
+          },
+          "frameKind": "replayComplete"
+        },
+        "version": 2
+      },
+      "kind": 15
+    },
+    {
+      "case": "send",
+      "expectedHex": "414452563200020010222222222222222222222222222222224444444444444444444444444444444400000004deadbeef",
+      "family": "request",
+      "input": {
+        "body": {
+          "frame": {
+            "deviceRoute": "IiIiIiIiIiIiIiIiIiIiIg==",
+            "requestRoute": "RERERERERERERERERERERA==",
+            "sealedBlob": "3q2+7w=="
+          },
+          "frameKind": "send"
+        },
+        "version": 2
+      },
+      "kind": 16
+    },
+    {
+      "case": "reply",
+      "expectedHex": "414452563200020011222222222222222222222222222222224444444444444444444444444444444400000004deadbeef",
+      "family": "request",
+      "input": {
+        "body": {
+          "frame": {
+            "deviceRoute": "IiIiIiIiIiIiIiIiIiIiIg==",
+            "requestRoute": "RERERERERERERERERERERA==",
+            "sealedBlob": "3q2+7w=="
+          },
+          "frameKind": "reply"
+        },
+        "version": 2
+      },
+      "kind": 17
+    },
+    {
+      "case": "installGrant",
+      "expectedHex": "4144525632000200121111111111111111111111111111111122222222222222222222222222222222a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a00000000000000009777777777777777777777777777777770000000000000003b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+      "family": "authControl",
+      "input": {
+        "body": {
+          "frame": {
+            "grant": {
+              "deviceRoute": "IiIiIiIiIiIiIiIiIiIiIg==",
+              "deviceSignPubkey": "oKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKA=",
+              "grantSerial": 9,
+              "machineRoute": "EREREREREREREREREREREQ==",
+              "rootKeyId": "d3d3d3d3d3d3d3d3d3d3dw==",
+              "signature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA==",
+              "trustEpoch": 3
+            }
+          },
+          "frameKind": "installGrant"
+        },
+        "version": 2
+      },
+      "kind": 18
+    },
+    {
+      "case": "grantCommitted",
+      "expectedHex": "4144525632000200132222222222222222222222222222222200000000000000090c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "family": "authControl",
+      "input": {
+        "body": {
+          "frame": {
+            "deviceRoute": "IiIiIiIiIiIiIiIiIiIiIg==",
+            "grantHash": "DAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw=",
+            "grantSerial": 9
+          },
+          "frameKind": "grantCommitted"
+        },
+        "version": 2
+      },
+      "kind": 19
+    },
+    {
+      "case": "revokeDevice",
+      "expectedHex": "41445256320002001411111111111111111111111111111111222222222222222222222222222222220000000000000009777777777777777777777777777777770000000000000003b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+      "family": "authControl",
+      "input": {
+        "body": {
+          "frame": {
+            "revocation": {
+              "deviceRoute": "IiIiIiIiIiIiIiIiIiIiIg==",
+              "grantSerial": 9,
+              "machineRoute": "EREREREREREREREREREREQ==",
+              "rootKeyId": "d3d3d3d3d3d3d3d3d3d3dw==",
+              "signature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA==",
+              "trustEpoch": 3
+            }
+          },
+          "frameKind": "revokeDevice"
+        },
+        "version": 2
+      },
+      "kind": 20
+    },
+    {
+      "case": "revocationCommitted",
+      "expectedHex": "41445256320002001522222222222222222222222222222222000000000000000911111111111111111111111111111111222222222222222222222222222222220000000000000009777777777777777777777777777777770000000000000003b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+      "family": "authControl",
+      "input": {
+        "body": {
+          "frame": {
+            "deviceRoute": "IiIiIiIiIiIiIiIiIiIiIg==",
+            "grantSerial": 9,
+            "signedRevocation": {
+              "deviceRoute": "IiIiIiIiIiIiIiIiIiIiIg==",
+              "grantSerial": 9,
+              "machineRoute": "EREREREREREREREREREREQ==",
+              "rootKeyId": "d3d3d3d3d3d3d3d3d3d3dw==",
+              "signature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA==",
+              "trustEpoch": 3
+            }
+          },
+          "frameKind": "revocationCommitted"
+        },
+        "version": 2
+      },
+      "kind": 21
+    },
+    {
+      "case": "retireMachine",
+      "expectedHex": "414452563200020016111111111111111111111111111111110000000000000004b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+      "family": "authControl",
+      "input": {
+        "body": {
+          "frame": {
+            "machineRoute": "EREREREREREREREREREREQ==",
+            "signature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA==",
+            "trustEpoch": 4
+          },
+          "frameKind": "retireMachine"
+        },
+        "version": 2
+      },
+      "kind": 22
+    },
+    {
+      "case": "ping",
+      "expectedHex": "4144525632000200170102030405060708",
+      "family": "runtime",
+      "input": {
+        "body": {
+          "frame": {
+            "nonce": 72623859790382856
+          },
+          "frameKind": "ping"
+        },
+        "version": 2
+      },
+      "kind": 23
+    },
+    {
+      "case": "pong",
+      "expectedHex": "4144525632000200180102030405060708",
+      "family": "runtime",
+      "input": {
+        "body": {
+          "frame": {
+            "nonce": 72623859790382856
+          },
+          "frameKind": "pong"
+        },
+        "version": 2
+      },
+      "kind": 24
+    },
+    {
+      "case": "routeAccepted",
+      "expectedHex": "4144525632000200190044444444444444444444444444444444",
+      "family": "runtime",
+      "input": {
+        "body": {
+          "frame": {
+            "accepted": {
+              "request": {
+                "request_route": "RERERERERERERERERERERA=="
+              }
+            }
+          },
+          "frameKind": "routeAccepted"
+        },
+        "version": 2
+      },
+      "kind": 25
+    },
+    {
+      "case": "error",
+      "expectedHex": "41445256320002001a0000001572656c61792e726f7574652e6e6f745f666f756e640000000d6e6f207375636820726f75746500",
+      "family": "runtime",
+      "input": {
+        "body": {
+          "frame": {
+            "code": "relay.route.not_found",
+            "message": "no such route"
+          },
+          "frameKind": "error"
+        },
+        "version": 2
+      },
+      "kind": 26
+    },
+    {
+      "case": "serverRestarting",
+      "expectedHex": "41445256320002001b0000000000001388",
+      "family": "runtime",
+      "input": {
+        "body": {
+          "frame": {
+            "drainDeadlineMs": 5000
+          },
+          "frameKind": "serverRestarting"
+        },
+        "version": 2
+      },
+      "kind": 27
+    }
+  ],
+  "relayProtocolVersion": 2
+}
