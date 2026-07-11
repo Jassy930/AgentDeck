@@ -1,0 +1,586 @@
+//! P1.2 Relay v2 opaque contract —— types / codec / monotonic-version / id 契约。
+//!
+//! Relay v2 是严格最小可见的外层路由 wire（design §10）。本 task 只定义并列契约：
+//! - 128-bit 随机 route/generation ID（不可比较、不可复用）。
+//! - u64 单调值（trust epoch / link generation / grant serial / key revision）到 MAX 拒绝 wrap。
+//! - 28 个通用 frame family variant 的 `ADRV2` 二进制 codec round-trip + 固定字节 fixture。
+//! - 公开授权对象（RelayGrant / SignedCertificate / DeviceRevocation）与 enrollment DTO。
+//!
+//! 现有 Relay v1 namespace（`remote::`）本 task 原样保留、彼此独立。
+
+use agentdeck_protocol::e2ee::E2EE_FORMAT_VERSION;
+use agentdeck_protocol::relay_v2::auth::{
+    CertRole, DeviceRevocation, Ed25519Signature, PublicKeyBytes, RelayGrant, SignedCertificate,
+};
+use agentdeck_protocol::relay_v2::codec::{self, CodecError, MAX_FRAME_BYTES, RELAY_FRAME_MAGIC};
+use agentdeck_protocol::relay_v2::enrollment::{
+    EnrollmentCode, MachineEnrollmentRequestV1, MachineEnrollmentResponseV1,
+};
+use agentdeck_protocol::relay_v2::frame::{
+    AcceptedRef, Ack, AuthProof, Authenticate, Authenticated, Challenge, ClosePairRoute, Gap,
+    GrantCommitted, Hello, InstallGrant, OpaqueRouteFrame, OpenPairRoute, PairData,
+    PairRouteCloseOutcome, PairRouteClosed, PairRouteOpened, Ping, Pong, Publish, RegisterStream,
+    RelayFrameBody, ReplayComplete, Reply, RetireMachine, RevocationCommitted, RevokeDevice,
+    RouteAccepted, SealedBlob, Send, ServerRestarting, Subscribe, Unsubscribe,
+};
+use agentdeck_protocol::relay_v2::id::{
+    ConnectionInstanceId, DeviceRouteId, GrantSerial, KeyDirectoryRevision, LinkGeneration,
+    MachineRouteId, MonotonicError, PairRouteId, RelayServerId, RequestRouteId, RootKeyId,
+    StreamGenerationId, StreamRouteId, TrustEpoch,
+};
+use agentdeck_protocol::relay_v2::{RELAY_PROTOCOL_VERSION, StreamCursor};
+use std::collections::BTreeSet;
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn check_golden(name: &str, actual: &str, expected: &str) {
+    if expected.is_empty() {
+        println!("GOLDEN {name} = {actual}");
+    } else {
+        assert_eq!(actual, expected, "golden `{name}` drifted");
+    }
+}
+
+fn mr() -> MachineRouteId {
+    MachineRouteId::from_bytes([0x11; 16])
+}
+fn dr() -> DeviceRouteId {
+    DeviceRouteId::from_bytes([0x22; 16])
+}
+fn sr() -> StreamRouteId {
+    StreamRouteId::from_bytes([0x33; 16])
+}
+fn rr() -> RequestRouteId {
+    RequestRouteId::from_bytes([0x44; 16])
+}
+fn pr() -> PairRouteId {
+    PairRouteId::from_bytes([0x55; 16])
+}
+fn sg() -> StreamGenerationId {
+    StreamGenerationId::from_bytes([0x66; 16])
+}
+fn rk() -> RootKeyId {
+    RootKeyId::from_bytes([0x77; 16])
+}
+fn rs() -> RelayServerId {
+    RelayServerId::from_bytes([0x88; 16])
+}
+fn pk() -> PublicKeyBytes {
+    PublicKeyBytes([0xA0; 32])
+}
+fn sig() -> Ed25519Signature {
+    Ed25519Signature([0xB0; 64])
+}
+fn cert() -> SignedCertificate {
+    SignedCertificate {
+        subject_pubkey: pk(),
+        cert_role: CertRole::Link,
+        generation: LinkGeneration::new(7),
+        root_key_id: rk(),
+        trust_epoch: TrustEpoch::new(3),
+        not_after_ms: None,
+        signature: sig(),
+    }
+}
+fn grant() -> RelayGrant {
+    RelayGrant {
+        machine_route: mr(),
+        device_route: dr(),
+        device_sign_pubkey: pk(),
+        grant_serial: GrantSerial::new(9),
+        root_key_id: rk(),
+        trust_epoch: TrustEpoch::new(3),
+        signature: sig(),
+    }
+}
+fn revocation() -> DeviceRevocation {
+    DeviceRevocation {
+        machine_route: mr(),
+        device_route: dr(),
+        grant_serial: GrantSerial::new(9),
+        root_key_id: rk(),
+        trust_epoch: TrustEpoch::new(3),
+        signature: sig(),
+    }
+}
+fn blob() -> SealedBlob {
+    SealedBlob(vec![0xDE, 0xAD, 0xBE, 0xEF])
+}
+
+/// 每个 frame family 至少一个代表帧，按 RelayFrameBody 定义顺序覆盖全部 28 variant。
+fn all_bodies() -> Vec<RelayFrameBody> {
+    vec![
+        // Handshake
+        RelayFrameBody::Hello(Hello {
+            protocol_version: RELAY_PROTOCOL_VERSION,
+        }),
+        RelayFrameBody::Challenge(Challenge {
+            relay_server_id: rs(),
+            connection_instance: ConnectionInstanceId::from_bytes([0x99; 16]),
+            challenge_nonce: [0x01; 32],
+        }),
+        RelayFrameBody::Authenticate(Authenticate {
+            proof: AuthProof::Device {
+                relay_grant: grant(),
+            },
+            signature: sig(),
+        }),
+        RelayFrameBody::Authenticated(Authenticated {
+            heartbeat_interval_secs: 20,
+        }),
+        // Pairing
+        RelayFrameBody::OpenPairRoute(OpenPairRoute {
+            machine_route: mr(),
+            pair_route: pr(),
+            absolute_expiry_ms: 1_700_000_000_000,
+        }),
+        RelayFrameBody::PairRouteOpened(PairRouteOpened {
+            machine_route: mr(),
+            pair_route: pr(),
+            absolute_expiry_ms: 1_700_000_000_000,
+        }),
+        RelayFrameBody::PairData(PairData {
+            pair_route: pr(),
+            sealed_blob: blob(),
+        }),
+        RelayFrameBody::ClosePairRoute(ClosePairRoute {
+            machine_route: mr(),
+            pair_route: pr(),
+        }),
+        RelayFrameBody::PairRouteClosed(PairRouteClosed {
+            pair_route: pr(),
+            outcome: PairRouteCloseOutcome::Closed,
+        }),
+        // Stream
+        RelayFrameBody::RegisterStream(RegisterStream {
+            machine_route: mr(),
+            stream_route: sr(),
+            generation: sg(),
+        }),
+        RelayFrameBody::Publish(Publish {
+            stream_route: sr(),
+            generation: sg(),
+            stream_seq: 0,
+            sealed_blob: blob(),
+        }),
+        RelayFrameBody::Subscribe(Subscribe {
+            stream_route: sr(),
+            generation: sg(),
+            cursor: StreamCursor::BeforeFirst,
+        }),
+        RelayFrameBody::Unsubscribe(Unsubscribe {
+            stream_route: sr(),
+            generation: sg(),
+        }),
+        RelayFrameBody::Ack(Ack {
+            stream_route: sr(),
+            generation: sg(),
+            up_to_seq: 5,
+        }),
+        RelayFrameBody::Gap(Gap {
+            stream_route: sr(),
+            generation: sg(),
+            need_stream_seq: 3,
+            oldest_stream_seq: 7,
+        }),
+        RelayFrameBody::ReplayComplete(ReplayComplete {
+            stream_route: sr(),
+            generation: sg(),
+            current_cursor: StreamCursor::At(42),
+        }),
+        // Request
+        RelayFrameBody::Send(Send {
+            device_route: dr(),
+            request_route: rr(),
+            sealed_blob: blob(),
+        }),
+        RelayFrameBody::Reply(Reply {
+            device_route: dr(),
+            request_route: rr(),
+            sealed_blob: blob(),
+        }),
+        // Auth control
+        RelayFrameBody::InstallGrant(InstallGrant { grant: grant() }),
+        RelayFrameBody::GrantCommitted(GrantCommitted {
+            device_route: dr(),
+            grant_serial: GrantSerial::new(9),
+            grant_hash: [0x0C; 32],
+        }),
+        RelayFrameBody::RevokeDevice(RevokeDevice {
+            revocation: revocation(),
+        }),
+        RelayFrameBody::RevocationCommitted(RevocationCommitted {
+            device_route: dr(),
+            grant_serial: GrantSerial::new(9),
+            signed_revocation: revocation(),
+        }),
+        RelayFrameBody::RetireMachine(RetireMachine {
+            machine_route: mr(),
+            trust_epoch: TrustEpoch::new(4),
+            signature: sig(),
+        }),
+        // Runtime
+        RelayFrameBody::Ping(Ping {
+            nonce: 0x0102030405060708,
+        }),
+        RelayFrameBody::Pong(Pong {
+            nonce: 0x0102030405060708,
+        }),
+        RelayFrameBody::RouteAccepted(RouteAccepted {
+            accepted: AcceptedRef::Request {
+                request_route: rr(),
+            },
+        }),
+        RelayFrameBody::Error(agentdeck_protocol::relay_v2::failure::RelayFailure::new(
+            agentdeck_protocol::relay_v2::failure::RELAY_ROUTE_NOT_FOUND,
+            "no such route",
+        )),
+        RelayFrameBody::ServerRestarting(ServerRestarting {
+            drain_deadline_ms: 5000,
+        }),
+    ]
+}
+
+#[test]
+fn relay_protocol_version_is_two_and_independent() {
+    assert_eq!(RELAY_PROTOCOL_VERSION, 2);
+    assert_eq!(E2EE_FORMAT_VERSION, 1);
+    // 版本轴彼此独立：local IPC=2、Relay v1 namespace=1、Runtime=1。
+    assert_eq!(agentdeck_protocol::PROTOCOL_VERSION, 2);
+    assert_eq!(agentdeck_protocol::remote::RELAY_PROTOCOL_VERSION, 1);
+    assert_eq!(agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION, 1);
+}
+
+#[test]
+fn all_twenty_eight_variants_covered_with_unique_kinds() {
+    let bodies = all_bodies();
+    assert_eq!(
+        bodies.len(),
+        28,
+        "brief lists exactly 28 RelayFrameBody variants"
+    );
+    let kinds: BTreeSet<u16> = bodies.iter().map(|b| b.kind()).collect();
+    assert_eq!(
+        kinds.len(),
+        28,
+        "every variant must map to a distinct codec kind"
+    );
+}
+
+#[test]
+fn every_variant_round_trips_through_binary_codec() {
+    for body in all_bodies() {
+        let frame = OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body,
+        };
+        let bytes = codec::encode(&frame);
+        assert!(
+            bytes.starts_with(RELAY_FRAME_MAGIC),
+            "frame must start with ADRV2 magic"
+        );
+        // version big-endian right after magic
+        assert_eq!(&bytes[5..7], &2u16.to_be_bytes());
+        let back = codec::decode(&bytes).expect("decode must succeed");
+        assert_eq!(back, frame, "binary codec must be a lossless round trip");
+    }
+}
+
+#[test]
+fn codec_rejects_oversize_before_parsing_any_field() {
+    // 4 MiB + 1 必须在读取 magic/version/kind 之前被拒绝。
+    let too_big = vec![0u8; MAX_FRAME_BYTES + 1];
+    let err = codec::decode(&too_big).unwrap_err();
+    assert_eq!(err, CodecError::Oversize);
+    // 注意：即便 magic 错误也应先命中 oversize（解析前）。
+}
+
+#[test]
+fn full_frame_with_3_5_mib_part_stays_within_4_mib() {
+    let part = vec![0x5A; 3_670_016]; // 3.5 MiB
+    let frame = OpaqueRouteFrame {
+        version: RELAY_PROTOCOL_VERSION,
+        body: RelayFrameBody::Publish(Publish {
+            stream_route: sr(),
+            generation: sg(),
+            stream_seq: 1,
+            sealed_blob: SealedBlob(part),
+        }),
+    };
+    let bytes = codec::encode(&frame);
+    assert!(
+        bytes.len() <= MAX_FRAME_BYTES,
+        "3.5 MiB part + outer overhead must fit in 4 MiB (got {})",
+        bytes.len()
+    );
+    let back = codec::decode(&bytes).expect("must decode within limit");
+    assert_eq!(back, frame);
+}
+
+#[test]
+fn bad_frame_corpus_all_typed_no_panic() {
+    let good = codec::encode(&OpaqueRouteFrame {
+        version: RELAY_PROTOCOL_VERSION,
+        body: RelayFrameBody::Ping(Ping { nonce: 1 }),
+    });
+
+    // truncated
+    assert!(codec::decode(&good[..good.len() - 1]).is_err());
+    // wrong magic
+    let mut bad_magic = good.clone();
+    bad_magic[0] = b'X';
+    assert_eq!(codec::decode(&bad_magic).unwrap_err(), CodecError::BadMagic);
+    // unknown version
+    let mut bad_ver = good.clone();
+    bad_ver[5] = 0x00;
+    bad_ver[6] = 0x09;
+    assert_eq!(
+        codec::decode(&bad_ver).unwrap_err(),
+        CodecError::UnsupportedVersion(9)
+    );
+    // unknown kind
+    let mut bad_kind = good.clone();
+    bad_kind[7] = 0xFF;
+    bad_kind[8] = 0xFF;
+    assert_eq!(
+        codec::decode(&bad_kind).unwrap_err(),
+        CodecError::UnknownKind(0xFFFF)
+    );
+    // trailing bytes
+    let mut trailing = good.clone();
+    trailing.push(0x00);
+    assert_eq!(
+        codec::decode(&trailing).unwrap_err(),
+        CodecError::TrailingBytes
+    );
+    // length-prefix out of bounds: craft a PairData whose blob length prefix lies.
+    let pd = codec::encode(&OpaqueRouteFrame {
+        version: RELAY_PROTOCOL_VERSION,
+        body: RelayFrameBody::PairData(PairData {
+            pair_route: pr(),
+            sealed_blob: SealedBlob(vec![1, 2, 3, 4]),
+        }),
+    });
+    // last 4 payload bytes are blob content; corrupt the u32 length prefix to huge.
+    let mut oob = pd.clone();
+    let n = oob.len();
+    // blob = 4-byte len prefix + 4 bytes content at the tail.
+    oob[n - 8] = 0xFF;
+    oob[n - 7] = 0xFF;
+    oob[n - 6] = 0xFF;
+    oob[n - 5] = 0xFF;
+    assert_eq!(
+        codec::decode(&oob).unwrap_err(),
+        CodecError::LengthOutOfBounds
+    );
+}
+
+#[test]
+fn empty_input_is_short_input() {
+    assert_eq!(codec::decode(&[]).unwrap_err(), CodecError::ShortInput);
+}
+
+// —— 128-bit 随机 ID：相等/哈希可用、随机不同、base64 wire round-trip ——
+
+#[test]
+fn random_route_ids_are_distinct_and_hashable() {
+    let a = MachineRouteId::random();
+    let b = MachineRouteId::random();
+    assert_ne!(a, b, "two random 128-bit ids should not collide");
+    let mut set = BTreeSet::new();
+    // Eq + Hash 用于去重（不依赖 Ord 比较大小）。
+    set.insert(hex(a.as_bytes()));
+    set.insert(hex(b.as_bytes()));
+    assert_eq!(set.len(), 2);
+}
+
+#[test]
+fn route_id_json_wire_round_trips() {
+    let id = StreamGenerationId::from_bytes([0xAB; 16]);
+    let json = serde_json::to_value(&id).unwrap();
+    assert!(
+        json.is_string(),
+        "128-bit id encodes as a single wire string"
+    );
+    let back: StreamGenerationId = serde_json::from_value(json).unwrap();
+    assert_eq!(back, id);
+}
+
+// —— u64 单调值：到 MAX 拒绝 wrap ——
+
+#[test]
+fn monotonic_values_reject_wrap_at_max() {
+    for at_max_next in [
+        TrustEpoch::new(u64::MAX).next().err(),
+        LinkGeneration::new(u64::MAX).next().err(),
+        GrantSerial::new(u64::MAX).next().err(),
+        KeyDirectoryRevision::new(u64::MAX).next().err(),
+    ] {
+        assert_eq!(
+            at_max_next,
+            Some(MonotonicError::Exhausted),
+            "monotonic counter must refuse to wrap and demand reset/rekey"
+        );
+    }
+    assert_eq!(TrustEpoch::new(3).next().unwrap(), TrustEpoch::new(4));
+    assert!(TrustEpoch::new(3).accepts_higher(&TrustEpoch::new(4)));
+    assert!(!TrustEpoch::new(4).accepts_higher(&TrustEpoch::new(4)));
+}
+
+// —— 公开授权对象 & enrollment DTO ——
+
+#[test]
+fn public_grant_cert_revocation_round_trip_json() {
+    for v in [
+        serde_json::to_value(grant()).unwrap(),
+        serde_json::to_value(cert()).unwrap(),
+        serde_json::to_value(revocation()).unwrap(),
+    ] {
+        assert!(v.is_object());
+    }
+    let g: RelayGrant = serde_json::from_value(serde_json::to_value(grant()).unwrap()).unwrap();
+    assert_eq!(g, grant());
+    let c: SignedCertificate =
+        serde_json::from_value(serde_json::to_value(cert()).unwrap()).unwrap();
+    assert_eq!(c, cert());
+    let r: DeviceRevocation =
+        serde_json::from_value(serde_json::to_value(revocation()).unwrap()).unwrap();
+    assert_eq!(r, revocation());
+}
+
+#[test]
+fn enrollment_request_and_response_have_exact_fields() {
+    let req = MachineEnrollmentRequestV1 {
+        code: EnrollmentCode([0x01; 32]),
+        machine_route: mr(),
+        root_pubkey: pk(),
+        link_cert: cert(),
+        data_cert: SignedCertificate {
+            cert_role: CertRole::Data,
+            ..cert()
+        },
+    };
+    let jv = serde_json::to_value(&req).unwrap();
+    for key in ["code", "machineRoute", "rootPubkey", "linkCert", "dataCert"] {
+        assert!(jv.get(key).is_some(), "enrollment request missing `{key}`");
+    }
+    let back: MachineEnrollmentRequestV1 = serde_json::from_value(jv).unwrap();
+    assert_eq!(back, req);
+
+    let resp = MachineEnrollmentResponseV1 {
+        relay_server_id: rs(),
+        machine_route: mr(),
+        trust_epoch: 3,
+        receipt_hash: [0x0D; 32],
+    };
+    let jv = serde_json::to_value(&resp).unwrap();
+    for key in ["relayServerId", "machineRoute", "trustEpoch", "receiptHash"] {
+        assert!(jv.get(key).is_some(), "enrollment response missing `{key}`");
+    }
+    let back: MachineEnrollmentResponseV1 = serde_json::from_value(jv).unwrap();
+    assert_eq!(back, resp);
+}
+
+// —— 每个 family 的固定字节 fixture（为 P1.7 Swift 逐字节镜像准备）——
+
+const GOLDEN_HELLO: &str = "4144525632000200000002";
+const GOLDEN_CHALLENGE: &str = "41445256320002000188888888888888888888888888888888999999999999999999999999999999990101010101010101010101010101010101010101010101010101010101010101";
+const GOLDEN_PAIRDATA: &str = "4144525632000200065555555555555555555555555555555500000004deadbeef";
+const GOLDEN_PUBLISH: &str = "41445256320002000a3333333333333333333333333333333366666666666666666666666666666666000000000000000000000004deadbeef";
+const GOLDEN_SEND: &str = "414452563200020010222222222222222222222222222222224444444444444444444444444444444400000004deadbeef";
+const GOLDEN_INSTALL_GRANT: &str = "4144525632000200121111111111111111111111111111111122222222222222222222222222222222a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a00000000000000009777777777777777777777777777777770000000000000003b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0";
+const GOLDEN_PING: &str = "4144525632000200170102030405060708";
+
+fn encode_hex(body: RelayFrameBody) -> String {
+    hex(&codec::encode(&OpaqueRouteFrame {
+        version: RELAY_PROTOCOL_VERSION,
+        body,
+    }))
+}
+
+#[test]
+fn fixture_handshake_hello() {
+    check_golden(
+        "hello",
+        &encode_hex(RelayFrameBody::Hello(Hello {
+            protocol_version: RELAY_PROTOCOL_VERSION,
+        })),
+        GOLDEN_HELLO,
+    );
+}
+
+#[test]
+fn fixture_handshake_challenge() {
+    check_golden(
+        "challenge",
+        &encode_hex(RelayFrameBody::Challenge(Challenge {
+            relay_server_id: rs(),
+            connection_instance: ConnectionInstanceId::from_bytes([0x99; 16]),
+            challenge_nonce: [0x01; 32],
+        })),
+        GOLDEN_CHALLENGE,
+    );
+}
+
+#[test]
+fn fixture_pairing_pairdata() {
+    check_golden(
+        "pairData",
+        &encode_hex(RelayFrameBody::PairData(PairData {
+            pair_route: pr(),
+            sealed_blob: blob(),
+        })),
+        GOLDEN_PAIRDATA,
+    );
+}
+
+#[test]
+fn fixture_stream_publish() {
+    check_golden(
+        "publish",
+        &encode_hex(RelayFrameBody::Publish(Publish {
+            stream_route: sr(),
+            generation: sg(),
+            stream_seq: 0,
+            sealed_blob: blob(),
+        })),
+        GOLDEN_PUBLISH,
+    );
+}
+
+#[test]
+fn fixture_request_send() {
+    check_golden(
+        "send",
+        &encode_hex(RelayFrameBody::Send(Send {
+            device_route: dr(),
+            request_route: rr(),
+            sealed_blob: blob(),
+        })),
+        GOLDEN_SEND,
+    );
+}
+
+#[test]
+fn fixture_auth_control_install_grant() {
+    check_golden(
+        "installGrant",
+        &encode_hex(RelayFrameBody::InstallGrant(InstallGrant {
+            grant: grant(),
+        })),
+        GOLDEN_INSTALL_GRANT,
+    );
+}
+
+#[test]
+fn fixture_runtime_ping() {
+    check_golden(
+        "ping",
+        &encode_hex(RelayFrameBody::Ping(Ping {
+            nonce: 0x0102030405060708,
+        })),
+        GOLDEN_PING,
+    );
+}

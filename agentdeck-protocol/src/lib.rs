@@ -71,6 +71,8 @@ pub fn protocol_schema() -> serde_json::Value {
     })
 }
 
+pub mod e2ee;
+pub mod relay_v2;
 pub mod remote;
 pub use remote::{
     ClientRole, CommandTarget, DataEnvelope, DeviceDescriptor, DeviceKind, MachineDescriptor,

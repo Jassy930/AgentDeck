@@ -1,0 +1,2999 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "DeviceRevocation": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "description": "MachineRoot 签的设备撤销，绑定 `grantSerial`（design §6.5）。",
+      "properties": {
+        "deviceRoute": {
+          "type": "string"
+        },
+        "grantSerial": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "machineRoute": {
+          "type": "string"
+        },
+        "rootKeyId": {
+          "type": "string"
+        },
+        "signature": {
+          "type": "string"
+        },
+        "trustEpoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "deviceRoute",
+        "grantSerial",
+        "machineRoute",
+        "rootKeyId",
+        "signature",
+        "trustEpoch"
+      ],
+      "title": "DeviceRevocation",
+      "type": "object"
+    },
+    "MachineEnrollmentRequestV1": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "CertRole": {
+          "description": "证书角色：日常连接 auth（Link）或 daemon 下行数据来源签名（Data）。",
+          "enum": [
+            "link",
+            "data"
+          ],
+          "type": "string"
+        },
+        "SignedCertificate": {
+          "additionalProperties": false,
+          "description": "MachineRoot 签发的 link / data 证书（design §6.6）。",
+          "properties": {
+            "certRole": {
+              "$ref": "#/definitions/CertRole"
+            },
+            "generation": {
+              "description": "单调 cert generation；回退值一律拒绝。",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "notAfterMs": {
+              "description": "可选有效期（grant 类默认无过期，cert 可带）。",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "rootKeyId": {
+              "description": "machine trust anchor 的 root key ID。",
+              "type": "string"
+            },
+            "signature": {
+              "description": "MachineRoot 对 cert `ToBeSignedV1` 的签名。",
+              "type": "string"
+            },
+            "subjectPubkey": {
+              "description": "被证明的日常签名公钥（MachineLinkSign / MachineDataSign）。",
+              "type": "string"
+            },
+            "trustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "certRole",
+            "generation",
+            "rootKeyId",
+            "signature",
+            "subjectPubkey",
+            "trustEpoch"
+          ],
+          "type": "object"
+        }
+      },
+      "description": "专用 TLS endpoint 的机器登记请求（design core interface）。",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "dataCert": {
+          "$ref": "#/definitions/SignedCertificate"
+        },
+        "linkCert": {
+          "$ref": "#/definitions/SignedCertificate"
+        },
+        "machineRoute": {
+          "type": "string"
+        },
+        "rootPubkey": {
+          "description": "MachineRoot 验签公钥（machine trust anchor）。",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "dataCert",
+        "linkCert",
+        "machineRoute",
+        "rootPubkey"
+      ],
+      "title": "MachineEnrollmentRequestV1",
+      "type": "object"
+    },
+    "MachineEnrollmentResponseV1": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "description": "机器登记响应（design core interface）。code 消费 + machine row insert 在同一事务； TTL 内同 code + 同 request hash 幂等重放逐字节相同 response。",
+      "properties": {
+        "machineRoute": {
+          "type": "string"
+        },
+        "receiptHash": {
+          "type": "string"
+        },
+        "relayServerId": {
+          "type": "string"
+        },
+        "trustEpoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "machineRoute",
+        "receiptHash",
+        "relayServerId",
+        "trustEpoch"
+      ],
+      "title": "MachineEnrollmentResponseV1",
+      "type": "object"
+    },
+    "OpaqueRouteFrame": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "AcceptedRef": {
+          "description": "`RouteAccepted` 只表示已进入有界 writer，不代表 daemon 接受/执行（design RC-5）。",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "request": {
+                  "properties": {
+                    "request_route": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "request_route"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "request"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "streamFrame": {
+                  "properties": {
+                    "stream_route": {
+                      "type": "string"
+                    },
+                    "stream_seq": {
+                      "format": "uint64",
+                      "minimum": 0.0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "stream_route",
+                    "stream_seq"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "streamFrame"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "pairFrame": {
+                  "properties": {
+                    "pair_route": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "pair_route"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "pairFrame"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "Ack": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "string"
+            },
+            "streamRoute": {
+              "type": "string"
+            },
+            "upToSeq": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "generation",
+            "streamRoute",
+            "upToSeq"
+          ],
+          "type": "object"
+        },
+        "AuthProof": {
+          "description": "连接鉴权凭据（design §6.4）：MachineLink 用 link cert，DeviceLink 用 RelayGrant。",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "machineLink": {
+                  "properties": {
+                    "link_cert": {
+                      "$ref": "#/definitions/SignedCertificate"
+                    },
+                    "machine_route": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "link_cert",
+                    "machine_route"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "machineLink"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "device": {
+                  "properties": {
+                    "relay_grant": {
+                      "$ref": "#/definitions/RelayGrant"
+                    }
+                  },
+                  "required": [
+                    "relay_grant"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "device"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "Authenticate": {
+          "additionalProperties": false,
+          "properties": {
+            "proof": {
+              "$ref": "#/definitions/AuthProof"
+            },
+            "signature": {
+              "description": "对 challenge transcript 的签名（MachineLinkSign / DeviceSign）。",
+              "type": "string"
+            }
+          },
+          "required": [
+            "proof",
+            "signature"
+          ],
+          "type": "object"
+        },
+        "Authenticated": {
+          "additionalProperties": false,
+          "properties": {
+            "heartbeatIntervalSecs": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "heartbeatIntervalSecs"
+          ],
+          "type": "object"
+        },
+        "CertRole": {
+          "description": "证书角色：日常连接 auth（Link）或 daemon 下行数据来源签名（Data）。",
+          "enum": [
+            "link",
+            "data"
+          ],
+          "type": "string"
+        },
+        "Challenge": {
+          "additionalProperties": false,
+          "properties": {
+            "challengeNonce": {
+              "type": "string"
+            },
+            "connectionInstance": {
+              "type": "string"
+            },
+            "relayServerId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "challengeNonce",
+            "connectionInstance",
+            "relayServerId"
+          ],
+          "type": "object"
+        },
+        "ClosePairRoute": {
+          "additionalProperties": false,
+          "properties": {
+            "machineRoute": {
+              "type": "string"
+            },
+            "pairRoute": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "machineRoute",
+            "pairRoute"
+          ],
+          "type": "object"
+        },
+        "DeviceRevocation": {
+          "additionalProperties": false,
+          "description": "MachineRoot 签的设备撤销，绑定 `grantSerial`（design §6.5）。",
+          "properties": {
+            "deviceRoute": {
+              "type": "string"
+            },
+            "grantSerial": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "machineRoute": {
+              "type": "string"
+            },
+            "rootKeyId": {
+              "type": "string"
+            },
+            "signature": {
+              "type": "string"
+            },
+            "trustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "deviceRoute",
+            "grantSerial",
+            "machineRoute",
+            "rootKeyId",
+            "signature",
+            "trustEpoch"
+          ],
+          "type": "object"
+        },
+        "Gap": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "string"
+            },
+            "needStreamSeq": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "oldestStreamSeq": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "streamRoute": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "generation",
+            "needStreamSeq",
+            "oldestStreamSeq",
+            "streamRoute"
+          ],
+          "type": "object"
+        },
+        "GrantCommitted": {
+          "additionalProperties": false,
+          "properties": {
+            "deviceRoute": {
+              "type": "string"
+            },
+            "grantHash": {
+              "type": "string"
+            },
+            "grantSerial": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "deviceRoute",
+            "grantHash",
+            "grantSerial"
+          ],
+          "type": "object"
+        },
+        "Hello": {
+          "additionalProperties": false,
+          "properties": {
+            "protocolVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "protocolVersion"
+          ],
+          "type": "object"
+        },
+        "InstallGrant": {
+          "additionalProperties": false,
+          "properties": {
+            "grant": {
+              "$ref": "#/definitions/RelayGrant"
+            }
+          },
+          "required": [
+            "grant"
+          ],
+          "type": "object"
+        },
+        "OpenPairRoute": {
+          "additionalProperties": false,
+          "properties": {
+            "absoluteExpiryMs": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "machineRoute": {
+              "type": "string"
+            },
+            "pairRoute": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "absoluteExpiryMs",
+            "machineRoute",
+            "pairRoute"
+          ],
+          "type": "object"
+        },
+        "PairData": {
+          "additionalProperties": false,
+          "properties": {
+            "pairRoute": {
+              "type": "string"
+            },
+            "sealedBlob": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pairRoute",
+            "sealedBlob"
+          ],
+          "type": "object"
+        },
+        "PairRouteCloseOutcome": {
+          "description": "close outcome 只允许 `Closed | AlreadyAbsent`（design §10.1）。",
+          "enum": [
+            "closed",
+            "alreadyAbsent"
+          ],
+          "type": "string"
+        },
+        "PairRouteClosed": {
+          "additionalProperties": false,
+          "properties": {
+            "outcome": {
+              "$ref": "#/definitions/PairRouteCloseOutcome"
+            },
+            "pairRoute": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "outcome",
+            "pairRoute"
+          ],
+          "type": "object"
+        },
+        "PairRouteOpened": {
+          "additionalProperties": false,
+          "properties": {
+            "absoluteExpiryMs": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "machineRoute": {
+              "type": "string"
+            },
+            "pairRoute": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "absoluteExpiryMs",
+            "machineRoute",
+            "pairRoute"
+          ],
+          "type": "object"
+        },
+        "Ping": {
+          "additionalProperties": false,
+          "properties": {
+            "nonce": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "nonce"
+          ],
+          "type": "object"
+        },
+        "Pong": {
+          "additionalProperties": false,
+          "properties": {
+            "nonce": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "nonce"
+          ],
+          "type": "object"
+        },
+        "Publish": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "string"
+            },
+            "sealedBlob": {
+              "type": "string"
+            },
+            "streamRoute": {
+              "type": "string"
+            },
+            "streamSeq": {
+              "description": "每个随机 stream generation 自己的传输序号（与 eventSeq 独立）。",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "generation",
+            "sealedBlob",
+            "streamRoute",
+            "streamSeq"
+          ],
+          "type": "object"
+        },
+        "RegisterStream": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "string"
+            },
+            "machineRoute": {
+              "type": "string"
+            },
+            "streamRoute": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "generation",
+            "machineRoute",
+            "streamRoute"
+          ],
+          "type": "object"
+        },
+        "RelayFailure": {
+          "additionalProperties": false,
+          "description": "Relay 外层通用失败（wire 上是稳定 `code` 字符串）。绝不携带业务明文； `in_reply_to` 只做请求关联，脱敏后关联日志（design §14）。",
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "inReplyTo": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        },
+        "RelayFrameBody": {
+          "description": "通用 frame body：六组共 28 个 variant（design core interface）。",
+          "oneOf": [
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/Hello"
+                },
+                "frameKind": {
+                  "enum": [
+                    "hello"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/Challenge"
+                },
+                "frameKind": {
+                  "enum": [
+                    "challenge"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/Authenticate"
+                },
+                "frameKind": {
+                  "enum": [
+                    "authenticate"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/Authenticated"
+                },
+                "frameKind": {
+                  "enum": [
+                    "authenticated"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/OpenPairRoute"
+                },
+                "frameKind": {
+                  "enum": [
+                    "openPairRoute"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/PairRouteOpened"
+                },
+                "frameKind": {
+                  "enum": [
+                    "pairRouteOpened"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/PairData"
+                },
+                "frameKind": {
+                  "enum": [
+                    "pairData"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/ClosePairRoute"
+                },
+                "frameKind": {
+                  "enum": [
+                    "closePairRoute"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/PairRouteClosed"
+                },
+                "frameKind": {
+                  "enum": [
+                    "pairRouteClosed"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/RegisterStream"
+                },
+                "frameKind": {
+                  "enum": [
+                    "registerStream"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/Publish"
+                },
+                "frameKind": {
+                  "enum": [
+                    "publish"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/Subscribe"
+                },
+                "frameKind": {
+                  "enum": [
+                    "subscribe"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/Unsubscribe"
+                },
+                "frameKind": {
+                  "enum": [
+                    "unsubscribe"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/Ack"
+                },
+                "frameKind": {
+                  "enum": [
+                    "ack"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/Gap"
+                },
+                "frameKind": {
+                  "enum": [
+                    "gap"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/ReplayComplete"
+                },
+                "frameKind": {
+                  "enum": [
+                    "replayComplete"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/Send"
+                },
+                "frameKind": {
+                  "enum": [
+                    "send"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/Reply"
+                },
+                "frameKind": {
+                  "enum": [
+                    "reply"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/InstallGrant"
+                },
+                "frameKind": {
+                  "enum": [
+                    "installGrant"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/GrantCommitted"
+                },
+                "frameKind": {
+                  "enum": [
+                    "grantCommitted"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/RevokeDevice"
+                },
+                "frameKind": {
+                  "enum": [
+                    "revokeDevice"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/RevocationCommitted"
+                },
+                "frameKind": {
+                  "enum": [
+                    "revocationCommitted"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/RetireMachine"
+                },
+                "frameKind": {
+                  "enum": [
+                    "retireMachine"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/Ping"
+                },
+                "frameKind": {
+                  "enum": [
+                    "ping"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/Pong"
+                },
+                "frameKind": {
+                  "enum": [
+                    "pong"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/RouteAccepted"
+                },
+                "frameKind": {
+                  "enum": [
+                    "routeAccepted"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/RelayFailure"
+                },
+                "frameKind": {
+                  "enum": [
+                    "error"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/ServerRestarting"
+                },
+                "frameKind": {
+                  "enum": [
+                    "serverRestarting"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "RelayGrant": {
+          "additionalProperties": false,
+          "description": "DeviceGrant 的 Relay 可见部分（design §6.3）。只含 Relay 鉴权所需字段：随机 machine/device route、设备连接验签公钥、grant serial 与 MachineRoot 签名。加密的 `DeviceAuthorization`（业务权限）只供 endpoint，Relay 看不到。",
+          "properties": {
+            "deviceRoute": {
+              "type": "string"
+            },
+            "deviceSignPubkey": {
+              "description": "设备连接验签公钥（DeviceSign）。",
+              "type": "string"
+            },
+            "grantSerial": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "machineRoute": {
+              "type": "string"
+            },
+            "rootKeyId": {
+              "type": "string"
+            },
+            "signature": {
+              "type": "string"
+            },
+            "trustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "deviceRoute",
+            "deviceSignPubkey",
+            "grantSerial",
+            "machineRoute",
+            "rootKeyId",
+            "signature",
+            "trustEpoch"
+          ],
+          "type": "object"
+        },
+        "ReplayComplete": {
+          "additionalProperties": false,
+          "properties": {
+            "currentCursor": {
+              "$ref": "#/definitions/StreamCursor"
+            },
+            "generation": {
+              "type": "string"
+            },
+            "streamRoute": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "currentCursor",
+            "generation",
+            "streamRoute"
+          ],
+          "type": "object"
+        },
+        "Reply": {
+          "additionalProperties": false,
+          "properties": {
+            "deviceRoute": {
+              "type": "string"
+            },
+            "requestRoute": {
+              "type": "string"
+            },
+            "sealedBlob": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "deviceRoute",
+            "requestRoute",
+            "sealedBlob"
+          ],
+          "type": "object"
+        },
+        "RetireMachine": {
+          "additionalProperties": false,
+          "properties": {
+            "machineRoute": {
+              "type": "string"
+            },
+            "signature": {
+              "type": "string"
+            },
+            "trustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "machineRoute",
+            "signature",
+            "trustEpoch"
+          ],
+          "type": "object"
+        },
+        "RevocationCommitted": {
+          "additionalProperties": false,
+          "properties": {
+            "deviceRoute": {
+              "type": "string"
+            },
+            "grantSerial": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "signedRevocation": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/DeviceRevocation"
+                }
+              ],
+              "description": "terminal frame 携带的 root-signed 撤销，Relay restart 后原样重放（design §10.3）。"
+            }
+          },
+          "required": [
+            "deviceRoute",
+            "grantSerial",
+            "signedRevocation"
+          ],
+          "type": "object"
+        },
+        "RevokeDevice": {
+          "additionalProperties": false,
+          "properties": {
+            "revocation": {
+              "$ref": "#/definitions/DeviceRevocation"
+            }
+          },
+          "required": [
+            "revocation"
+          ],
+          "type": "object"
+        },
+        "RouteAccepted": {
+          "additionalProperties": false,
+          "properties": {
+            "accepted": {
+              "$ref": "#/definitions/AcceptedRef"
+            }
+          },
+          "required": [
+            "accepted"
+          ],
+          "type": "object"
+        },
+        "Send": {
+          "additionalProperties": false,
+          "properties": {
+            "deviceRoute": {
+              "type": "string"
+            },
+            "requestRoute": {
+              "type": "string"
+            },
+            "sealedBlob": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "deviceRoute",
+            "requestRoute",
+            "sealedBlob"
+          ],
+          "type": "object"
+        },
+        "ServerRestarting": {
+          "additionalProperties": false,
+          "properties": {
+            "drainDeadlineMs": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "drainDeadlineMs"
+          ],
+          "type": "object"
+        },
+        "SignedCertificate": {
+          "additionalProperties": false,
+          "description": "MachineRoot 签发的 link / data 证书（design §6.6）。",
+          "properties": {
+            "certRole": {
+              "$ref": "#/definitions/CertRole"
+            },
+            "generation": {
+              "description": "单调 cert generation；回退值一律拒绝。",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "notAfterMs": {
+              "description": "可选有效期（grant 类默认无过期，cert 可带）。",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "rootKeyId": {
+              "description": "machine trust anchor 的 root key ID。",
+              "type": "string"
+            },
+            "signature": {
+              "description": "MachineRoot 对 cert `ToBeSignedV1` 的签名。",
+              "type": "string"
+            },
+            "subjectPubkey": {
+              "description": "被证明的日常签名公钥（MachineLinkSign / MachineDataSign）。",
+              "type": "string"
+            },
+            "trustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "certRole",
+            "generation",
+            "rootKeyId",
+            "signature",
+            "subjectPubkey",
+            "trustEpoch"
+          ],
+          "type": "object"
+        },
+        "StreamCursor": {
+          "description": "两层 sequence 的外层订阅 cursor（design §9.1）。\n\n统一使用 `BeforeFirst | At(u64)`，**绝不把 SQLite `-1` 编进 unsigned wire**： `Subscribe(BeforeFirst)` 表示从 frame 0 开始。wire 表示： `BeforeFirst → \"beforeFirst\"`，`At(n) → { \"at\": n }`。",
+          "oneOf": [
+            {
+              "enum": [
+                "beforeFirst"
+              ],
+              "type": "string"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "at": {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "at"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "Subscribe": {
+          "additionalProperties": false,
+          "properties": {
+            "cursor": {
+              "$ref": "#/definitions/StreamCursor"
+            },
+            "generation": {
+              "type": "string"
+            },
+            "streamRoute": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "cursor",
+            "generation",
+            "streamRoute"
+          ],
+          "type": "object"
+        },
+        "Unsubscribe": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "string"
+            },
+            "streamRoute": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "generation",
+            "streamRoute"
+          ],
+          "type": "object"
+        }
+      },
+      "description": "Relay 可见的外层 frame：只有 `version` + 通用 body（design §7.3）。",
+      "properties": {
+        "body": {
+          "$ref": "#/definitions/RelayFrameBody"
+        },
+        "version": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "body",
+        "version"
+      ],
+      "title": "OpaqueRouteFrame",
+      "type": "object"
+    },
+    "RelayFailure": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "description": "Relay 外层通用失败（wire 上是稳定 `code` 字符串）。绝不携带业务明文； `in_reply_to` 只做请求关联，脱敏后关联日志（design §14）。",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "inReplyTo": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "title": "RelayFailure",
+      "type": "object"
+    },
+    "RelayFrameBody": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "definitions": {
+        "AcceptedRef": {
+          "description": "`RouteAccepted` 只表示已进入有界 writer，不代表 daemon 接受/执行（design RC-5）。",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "request": {
+                  "properties": {
+                    "request_route": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "request_route"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "request"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "streamFrame": {
+                  "properties": {
+                    "stream_route": {
+                      "type": "string"
+                    },
+                    "stream_seq": {
+                      "format": "uint64",
+                      "minimum": 0.0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "stream_route",
+                    "stream_seq"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "streamFrame"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "pairFrame": {
+                  "properties": {
+                    "pair_route": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "pair_route"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "pairFrame"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "Ack": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "string"
+            },
+            "streamRoute": {
+              "type": "string"
+            },
+            "upToSeq": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "generation",
+            "streamRoute",
+            "upToSeq"
+          ],
+          "type": "object"
+        },
+        "AuthProof": {
+          "description": "连接鉴权凭据（design §6.4）：MachineLink 用 link cert，DeviceLink 用 RelayGrant。",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "machineLink": {
+                  "properties": {
+                    "link_cert": {
+                      "$ref": "#/definitions/SignedCertificate"
+                    },
+                    "machine_route": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "link_cert",
+                    "machine_route"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "machineLink"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "device": {
+                  "properties": {
+                    "relay_grant": {
+                      "$ref": "#/definitions/RelayGrant"
+                    }
+                  },
+                  "required": [
+                    "relay_grant"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "device"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "Authenticate": {
+          "additionalProperties": false,
+          "properties": {
+            "proof": {
+              "$ref": "#/definitions/AuthProof"
+            },
+            "signature": {
+              "description": "对 challenge transcript 的签名（MachineLinkSign / DeviceSign）。",
+              "type": "string"
+            }
+          },
+          "required": [
+            "proof",
+            "signature"
+          ],
+          "type": "object"
+        },
+        "Authenticated": {
+          "additionalProperties": false,
+          "properties": {
+            "heartbeatIntervalSecs": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "heartbeatIntervalSecs"
+          ],
+          "type": "object"
+        },
+        "CertRole": {
+          "description": "证书角色：日常连接 auth（Link）或 daemon 下行数据来源签名（Data）。",
+          "enum": [
+            "link",
+            "data"
+          ],
+          "type": "string"
+        },
+        "Challenge": {
+          "additionalProperties": false,
+          "properties": {
+            "challengeNonce": {
+              "type": "string"
+            },
+            "connectionInstance": {
+              "type": "string"
+            },
+            "relayServerId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "challengeNonce",
+            "connectionInstance",
+            "relayServerId"
+          ],
+          "type": "object"
+        },
+        "ClosePairRoute": {
+          "additionalProperties": false,
+          "properties": {
+            "machineRoute": {
+              "type": "string"
+            },
+            "pairRoute": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "machineRoute",
+            "pairRoute"
+          ],
+          "type": "object"
+        },
+        "DeviceRevocation": {
+          "additionalProperties": false,
+          "description": "MachineRoot 签的设备撤销，绑定 `grantSerial`（design §6.5）。",
+          "properties": {
+            "deviceRoute": {
+              "type": "string"
+            },
+            "grantSerial": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "machineRoute": {
+              "type": "string"
+            },
+            "rootKeyId": {
+              "type": "string"
+            },
+            "signature": {
+              "type": "string"
+            },
+            "trustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "deviceRoute",
+            "grantSerial",
+            "machineRoute",
+            "rootKeyId",
+            "signature",
+            "trustEpoch"
+          ],
+          "type": "object"
+        },
+        "Gap": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "string"
+            },
+            "needStreamSeq": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "oldestStreamSeq": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "streamRoute": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "generation",
+            "needStreamSeq",
+            "oldestStreamSeq",
+            "streamRoute"
+          ],
+          "type": "object"
+        },
+        "GrantCommitted": {
+          "additionalProperties": false,
+          "properties": {
+            "deviceRoute": {
+              "type": "string"
+            },
+            "grantHash": {
+              "type": "string"
+            },
+            "grantSerial": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "deviceRoute",
+            "grantHash",
+            "grantSerial"
+          ],
+          "type": "object"
+        },
+        "Hello": {
+          "additionalProperties": false,
+          "properties": {
+            "protocolVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "protocolVersion"
+          ],
+          "type": "object"
+        },
+        "InstallGrant": {
+          "additionalProperties": false,
+          "properties": {
+            "grant": {
+              "$ref": "#/definitions/RelayGrant"
+            }
+          },
+          "required": [
+            "grant"
+          ],
+          "type": "object"
+        },
+        "OpenPairRoute": {
+          "additionalProperties": false,
+          "properties": {
+            "absoluteExpiryMs": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "machineRoute": {
+              "type": "string"
+            },
+            "pairRoute": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "absoluteExpiryMs",
+            "machineRoute",
+            "pairRoute"
+          ],
+          "type": "object"
+        },
+        "PairData": {
+          "additionalProperties": false,
+          "properties": {
+            "pairRoute": {
+              "type": "string"
+            },
+            "sealedBlob": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pairRoute",
+            "sealedBlob"
+          ],
+          "type": "object"
+        },
+        "PairRouteCloseOutcome": {
+          "description": "close outcome 只允许 `Closed | AlreadyAbsent`（design §10.1）。",
+          "enum": [
+            "closed",
+            "alreadyAbsent"
+          ],
+          "type": "string"
+        },
+        "PairRouteClosed": {
+          "additionalProperties": false,
+          "properties": {
+            "outcome": {
+              "$ref": "#/definitions/PairRouteCloseOutcome"
+            },
+            "pairRoute": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "outcome",
+            "pairRoute"
+          ],
+          "type": "object"
+        },
+        "PairRouteOpened": {
+          "additionalProperties": false,
+          "properties": {
+            "absoluteExpiryMs": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "machineRoute": {
+              "type": "string"
+            },
+            "pairRoute": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "absoluteExpiryMs",
+            "machineRoute",
+            "pairRoute"
+          ],
+          "type": "object"
+        },
+        "Ping": {
+          "additionalProperties": false,
+          "properties": {
+            "nonce": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "nonce"
+          ],
+          "type": "object"
+        },
+        "Pong": {
+          "additionalProperties": false,
+          "properties": {
+            "nonce": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "nonce"
+          ],
+          "type": "object"
+        },
+        "Publish": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "string"
+            },
+            "sealedBlob": {
+              "type": "string"
+            },
+            "streamRoute": {
+              "type": "string"
+            },
+            "streamSeq": {
+              "description": "每个随机 stream generation 自己的传输序号（与 eventSeq 独立）。",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "generation",
+            "sealedBlob",
+            "streamRoute",
+            "streamSeq"
+          ],
+          "type": "object"
+        },
+        "RegisterStream": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "string"
+            },
+            "machineRoute": {
+              "type": "string"
+            },
+            "streamRoute": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "generation",
+            "machineRoute",
+            "streamRoute"
+          ],
+          "type": "object"
+        },
+        "RelayFailure": {
+          "additionalProperties": false,
+          "description": "Relay 外层通用失败（wire 上是稳定 `code` 字符串）。绝不携带业务明文； `in_reply_to` 只做请求关联，脱敏后关联日志（design §14）。",
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "inReplyTo": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        },
+        "RelayGrant": {
+          "additionalProperties": false,
+          "description": "DeviceGrant 的 Relay 可见部分（design §6.3）。只含 Relay 鉴权所需字段：随机 machine/device route、设备连接验签公钥、grant serial 与 MachineRoot 签名。加密的 `DeviceAuthorization`（业务权限）只供 endpoint，Relay 看不到。",
+          "properties": {
+            "deviceRoute": {
+              "type": "string"
+            },
+            "deviceSignPubkey": {
+              "description": "设备连接验签公钥（DeviceSign）。",
+              "type": "string"
+            },
+            "grantSerial": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "machineRoute": {
+              "type": "string"
+            },
+            "rootKeyId": {
+              "type": "string"
+            },
+            "signature": {
+              "type": "string"
+            },
+            "trustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "deviceRoute",
+            "deviceSignPubkey",
+            "grantSerial",
+            "machineRoute",
+            "rootKeyId",
+            "signature",
+            "trustEpoch"
+          ],
+          "type": "object"
+        },
+        "ReplayComplete": {
+          "additionalProperties": false,
+          "properties": {
+            "currentCursor": {
+              "$ref": "#/definitions/StreamCursor"
+            },
+            "generation": {
+              "type": "string"
+            },
+            "streamRoute": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "currentCursor",
+            "generation",
+            "streamRoute"
+          ],
+          "type": "object"
+        },
+        "Reply": {
+          "additionalProperties": false,
+          "properties": {
+            "deviceRoute": {
+              "type": "string"
+            },
+            "requestRoute": {
+              "type": "string"
+            },
+            "sealedBlob": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "deviceRoute",
+            "requestRoute",
+            "sealedBlob"
+          ],
+          "type": "object"
+        },
+        "RetireMachine": {
+          "additionalProperties": false,
+          "properties": {
+            "machineRoute": {
+              "type": "string"
+            },
+            "signature": {
+              "type": "string"
+            },
+            "trustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "machineRoute",
+            "signature",
+            "trustEpoch"
+          ],
+          "type": "object"
+        },
+        "RevocationCommitted": {
+          "additionalProperties": false,
+          "properties": {
+            "deviceRoute": {
+              "type": "string"
+            },
+            "grantSerial": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "signedRevocation": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/DeviceRevocation"
+                }
+              ],
+              "description": "terminal frame 携带的 root-signed 撤销，Relay restart 后原样重放（design §10.3）。"
+            }
+          },
+          "required": [
+            "deviceRoute",
+            "grantSerial",
+            "signedRevocation"
+          ],
+          "type": "object"
+        },
+        "RevokeDevice": {
+          "additionalProperties": false,
+          "properties": {
+            "revocation": {
+              "$ref": "#/definitions/DeviceRevocation"
+            }
+          },
+          "required": [
+            "revocation"
+          ],
+          "type": "object"
+        },
+        "RouteAccepted": {
+          "additionalProperties": false,
+          "properties": {
+            "accepted": {
+              "$ref": "#/definitions/AcceptedRef"
+            }
+          },
+          "required": [
+            "accepted"
+          ],
+          "type": "object"
+        },
+        "Send": {
+          "additionalProperties": false,
+          "properties": {
+            "deviceRoute": {
+              "type": "string"
+            },
+            "requestRoute": {
+              "type": "string"
+            },
+            "sealedBlob": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "deviceRoute",
+            "requestRoute",
+            "sealedBlob"
+          ],
+          "type": "object"
+        },
+        "ServerRestarting": {
+          "additionalProperties": false,
+          "properties": {
+            "drainDeadlineMs": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "drainDeadlineMs"
+          ],
+          "type": "object"
+        },
+        "SignedCertificate": {
+          "additionalProperties": false,
+          "description": "MachineRoot 签发的 link / data 证书（design §6.6）。",
+          "properties": {
+            "certRole": {
+              "$ref": "#/definitions/CertRole"
+            },
+            "generation": {
+              "description": "单调 cert generation；回退值一律拒绝。",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "notAfterMs": {
+              "description": "可选有效期（grant 类默认无过期，cert 可带）。",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "rootKeyId": {
+              "description": "machine trust anchor 的 root key ID。",
+              "type": "string"
+            },
+            "signature": {
+              "description": "MachineRoot 对 cert `ToBeSignedV1` 的签名。",
+              "type": "string"
+            },
+            "subjectPubkey": {
+              "description": "被证明的日常签名公钥（MachineLinkSign / MachineDataSign）。",
+              "type": "string"
+            },
+            "trustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "certRole",
+            "generation",
+            "rootKeyId",
+            "signature",
+            "subjectPubkey",
+            "trustEpoch"
+          ],
+          "type": "object"
+        },
+        "StreamCursor": {
+          "description": "两层 sequence 的外层订阅 cursor（design §9.1）。\n\n统一使用 `BeforeFirst | At(u64)`，**绝不把 SQLite `-1` 编进 unsigned wire**： `Subscribe(BeforeFirst)` 表示从 frame 0 开始。wire 表示： `BeforeFirst → \"beforeFirst\"`，`At(n) → { \"at\": n }`。",
+          "oneOf": [
+            {
+              "enum": [
+                "beforeFirst"
+              ],
+              "type": "string"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "at": {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "at"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "Subscribe": {
+          "additionalProperties": false,
+          "properties": {
+            "cursor": {
+              "$ref": "#/definitions/StreamCursor"
+            },
+            "generation": {
+              "type": "string"
+            },
+            "streamRoute": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "cursor",
+            "generation",
+            "streamRoute"
+          ],
+          "type": "object"
+        },
+        "Unsubscribe": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "string"
+            },
+            "streamRoute": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "generation",
+            "streamRoute"
+          ],
+          "type": "object"
+        }
+      },
+      "description": "通用 frame body：六组共 28 个 variant（design core interface）。",
+      "oneOf": [
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/Hello"
+            },
+            "frameKind": {
+              "enum": [
+                "hello"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/Challenge"
+            },
+            "frameKind": {
+              "enum": [
+                "challenge"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/Authenticate"
+            },
+            "frameKind": {
+              "enum": [
+                "authenticate"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/Authenticated"
+            },
+            "frameKind": {
+              "enum": [
+                "authenticated"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/OpenPairRoute"
+            },
+            "frameKind": {
+              "enum": [
+                "openPairRoute"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/PairRouteOpened"
+            },
+            "frameKind": {
+              "enum": [
+                "pairRouteOpened"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/PairData"
+            },
+            "frameKind": {
+              "enum": [
+                "pairData"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/ClosePairRoute"
+            },
+            "frameKind": {
+              "enum": [
+                "closePairRoute"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/PairRouteClosed"
+            },
+            "frameKind": {
+              "enum": [
+                "pairRouteClosed"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/RegisterStream"
+            },
+            "frameKind": {
+              "enum": [
+                "registerStream"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/Publish"
+            },
+            "frameKind": {
+              "enum": [
+                "publish"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/Subscribe"
+            },
+            "frameKind": {
+              "enum": [
+                "subscribe"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/Unsubscribe"
+            },
+            "frameKind": {
+              "enum": [
+                "unsubscribe"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/Ack"
+            },
+            "frameKind": {
+              "enum": [
+                "ack"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/Gap"
+            },
+            "frameKind": {
+              "enum": [
+                "gap"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/ReplayComplete"
+            },
+            "frameKind": {
+              "enum": [
+                "replayComplete"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/Send"
+            },
+            "frameKind": {
+              "enum": [
+                "send"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/Reply"
+            },
+            "frameKind": {
+              "enum": [
+                "reply"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/InstallGrant"
+            },
+            "frameKind": {
+              "enum": [
+                "installGrant"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/GrantCommitted"
+            },
+            "frameKind": {
+              "enum": [
+                "grantCommitted"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/RevokeDevice"
+            },
+            "frameKind": {
+              "enum": [
+                "revokeDevice"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/RevocationCommitted"
+            },
+            "frameKind": {
+              "enum": [
+                "revocationCommitted"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/RetireMachine"
+            },
+            "frameKind": {
+              "enum": [
+                "retireMachine"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/Ping"
+            },
+            "frameKind": {
+              "enum": [
+                "ping"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/Pong"
+            },
+            "frameKind": {
+              "enum": [
+                "pong"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/RouteAccepted"
+            },
+            "frameKind": {
+              "enum": [
+                "routeAccepted"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/RelayFailure"
+            },
+            "frameKind": {
+              "enum": [
+                "error"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/ServerRestarting"
+            },
+            "frameKind": {
+              "enum": [
+                "serverRestarting"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "RelayFrameBody"
+    },
+    "RelayGrant": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "description": "DeviceGrant 的 Relay 可见部分（design §6.3）。只含 Relay 鉴权所需字段：随机 machine/device route、设备连接验签公钥、grant serial 与 MachineRoot 签名。加密的 `DeviceAuthorization`（业务权限）只供 endpoint，Relay 看不到。",
+      "properties": {
+        "deviceRoute": {
+          "type": "string"
+        },
+        "deviceSignPubkey": {
+          "description": "设备连接验签公钥（DeviceSign）。",
+          "type": "string"
+        },
+        "grantSerial": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "machineRoute": {
+          "type": "string"
+        },
+        "rootKeyId": {
+          "type": "string"
+        },
+        "signature": {
+          "type": "string"
+        },
+        "trustEpoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "deviceRoute",
+        "deviceSignPubkey",
+        "grantSerial",
+        "machineRoute",
+        "rootKeyId",
+        "signature",
+        "trustEpoch"
+      ],
+      "title": "RelayGrant",
+      "type": "object"
+    },
+    "SealedBlob": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "String",
+      "type": "string"
+    },
+    "SignedCertificate": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "CertRole": {
+          "description": "证书角色：日常连接 auth（Link）或 daemon 下行数据来源签名（Data）。",
+          "enum": [
+            "link",
+            "data"
+          ],
+          "type": "string"
+        }
+      },
+      "description": "MachineRoot 签发的 link / data 证书（design §6.6）。",
+      "properties": {
+        "certRole": {
+          "$ref": "#/definitions/CertRole"
+        },
+        "generation": {
+          "description": "单调 cert generation；回退值一律拒绝。",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "notAfterMs": {
+          "description": "可选有效期（grant 类默认无过期，cert 可带）。",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rootKeyId": {
+          "description": "machine trust anchor 的 root key ID。",
+          "type": "string"
+        },
+        "signature": {
+          "description": "MachineRoot 对 cert `ToBeSignedV1` 的签名。",
+          "type": "string"
+        },
+        "subjectPubkey": {
+          "description": "被证明的日常签名公钥（MachineLinkSign / MachineDataSign）。",
+          "type": "string"
+        },
+        "trustEpoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "certRole",
+        "generation",
+        "rootKeyId",
+        "signature",
+        "subjectPubkey",
+        "trustEpoch"
+      ],
+      "title": "SignedCertificate",
+      "type": "object"
+    },
+    "StreamCursor": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "两层 sequence 的外层订阅 cursor（design §9.1）。\n\n统一使用 `BeforeFirst | At(u64)`，**绝不把 SQLite `-1` 编进 unsigned wire**： `Subscribe(BeforeFirst)` 表示从 frame 0 开始。wire 表示： `BeforeFirst → \"beforeFirst\"`，`At(n) → { \"at\": n }`。",
+      "oneOf": [
+        {
+          "enum": [
+            "beforeFirst"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "at": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "at"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "StreamCursor"
+    }
+  },
+  "title": "AgentDeck Relay Protocol v2",
+  "type": "object"
+}
