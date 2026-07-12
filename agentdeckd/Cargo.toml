@@ -17,10 +17,14 @@ path = "src/main.rs"
 [dependencies]
 agentdeck-protocol = { path = "../agentdeck-protocol" }
 async-trait = "0.1"
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 getrandom = "0.4"
+hmac = "0.12"
 libc = "0.2"
+rusqlite = { version = "0.32", features = ["bundled", "limits"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "process", "io-util", "time", "io-std", "signal"] }
 uuid = { version = "1", features = ["v4"] }

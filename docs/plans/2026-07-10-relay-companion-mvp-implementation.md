@@ -529,7 +529,8 @@ pub trait KeyStore: Send + Sync { fn load(&self, account: &str) -> Result<Option
 ### Task P3.2：实现 Runtime SQLite journal、稳定身份与存储上界
 
 **Files:**
-- Create: `agentdeckd/src/runtime/{model,store}.rs`
+- Create: `agentdeckd/src/runtime/model.rs`
+- Create: `agentdeckd/src/runtime/store/{mod,worker,schema,sqlite,admission,cipher,recovery}.rs`
 - Create: `agentdeckd/tests/runtime_store.rs`
 - Modify: `agentdeckd/src/runtime/mod.rs`
 - Modify: `agentdeckd/Cargo.toml`
@@ -537,18 +538,46 @@ pub trait KeyStore: Send + Sync { fn load(&self, account: &str) -> Result<Option
 **Core interface:**
 ```rust
 impl RuntimeStoreHandle {
-    pub async fn create_conversation(&self, input: NewConversation) -> Result<ConversationRecord, RuntimeFailure>;
-    pub async fn accept_command(&self, input: AcceptCommand) -> Result<CommandReceipt, RuntimeFailure>;
-    pub async fn mark_started_with_event(&self, input: StartCommand) -> Result<ExecutionIntent, RuntimeFailure>;
-    pub async fn persist_execution_fence(&self, fence: ExecutionFence) -> Result<(), RuntimeFailure>;
-    pub async fn complete_command_with_event(&self, input: CompleteCommand) -> Result<CommandReceipt, RuntimeFailure>;
-    pub async fn load_recovery_state(&self) -> Result<RecoveryState, RuntimeFailure>;
+    pub async fn create_conversation(&self, input: NewConversation) -> Result<ConversationRecord, RuntimeStoreError>;
+    pub async fn accept_command(&self, input: AcceptCommand) -> Result<AcceptOutcome, RuntimeStoreError>;
+    pub async fn mark_started_with_event(&self, input: StartCommand) -> Result<StartOutcome, RuntimeStoreError>;
+    pub async fn persist_execution_fence(&self, fence: ExecutionFence) -> Result<ExecutionFenceRecord, RuntimeStoreError>;
+    pub async fn complete_command_with_event(&self, input: CompleteCommand) -> Result<CompleteOutcome, RuntimeStoreError>;
+    pub async fn load_recovery_state(&self) -> Result<RecoveryState, RuntimeStoreError>;
 }
 ```
 
-**Runtime DB schema:** `runtime_meta`、`conversations`、`commands`、`execution_intents`、`execution_fences`、`approval_ledger`、`event_journal`、`snapshots`、`adapter_state_index`、`auth_ledger`、`stream_generations`、`publication_outbox`、`publication_acks`、`revocation_outbox`、`machine_lifecycle`、`retirement_outbox`、`key_directory`、`counter_reservations`、`receive_replay`、`pair_invites`、不经StorageKEK包装的非秘密rescue index `machine_enrollment_receipts(relay_server_id, machine_route, root_fingerprint)`；P3.3把`adapter_state_index`拆成两个adapter私有访问namespace。
+Store 保留 SQLite/IO/crypto/commit-unknown 的内部精确语义，P3.4 `RuntimeCore` 才把
+`RuntimeStoreError` 映射成 wire `RuntimeFailure`。`CommandReceipt` 的 wire 状态只有
+Accepted/Replayed/Failed，因此 completion 必须返回内部 `CompleteOutcome`，不能伪造
+不存在的 Completed receipt。
 
-- [ ] Step 1: 写store tests。 覆盖daemon先生成stable IDs，commandSeq/eventSeq/catalogRevision跨重启单调，Accepted COMMIT，conversation/admin idempotency ledger各保留30天，2GiB按main DB+WAL+SHM总和计算、512MiB或文件系统5% reserve、1,024 prompts/256MiB/24h；disk-low拒绝新副作用但继续read/ACK/revoke/diagnostics；敏感row非明文；删除全部Keychain item后仍从非秘密receipt index读old route/fingerprint且不生成新root/KEK。
+**Runtime DB schema 演进:** P3.2 schema v1 只创建本阶段实际负责并能验证的
+`runtime_meta`、`conversations`、`commands`、`execution_intents`、`execution_fences`、
+`event_journal`，以及不经 StorageKEK 包装的非秘密 rescue index
+`machine_enrollment_receipts(relay_server_id, machine_route, root_fingerprint)`。P3.3 直接新增
+两个 adapter 私有 namespace，不先创建再拆通用 `adapter_state_index`；P3.5 添加
+`approval_ledger`；P3.6 添加 `snapshots`/publication 表；P4 由各自 task migration 添加
+auth/key/counter/replay/pair/revoke/retirement 表。machine-wide admin idempotency 使用独立
+`admin_commands` 表，由真正拥有 admin 语义的后续 task 添加，不塞入 nullable command rows。
+
+**2 GiB 边界:** 标准 SQLite 没有 custom quota VFS 时，不能把 `max_page_count` 冒充 active
+WAL 的瞬时物理零超冲保证。MVP 固定使用 main+WAL+SHM observed footprint、保守 projected
+transaction growth、`max_page_count`、有界 WAL checkpoint 与写后读回共同做 fail-closed
+准入；checkpoint 被 reader 阻塞或接近水位时停止普通副作用。若未来要求任何瞬间绝不超过
+2 GiB，必须另做 custom quota VFS。
+
+**执行记录（2026-07-11，P3.2-A/B）:** 已完成专用 blocking worker 的有界 normal lane 与
+独立 shutdown control lane、严格七表 schema v1、WAL/FULL/FK/limit 读回、StorageKEK 包装的
+行密钥/盲索引密钥、随机 nonce 行密文、真实 live `sqlite_schema` manifest 校验，以及 DB/WAL/SHM
+owner/mode/nlink/symlink 预检。fresh DB 只在临时库完整 COMMIT + fsync 后原子 no-replace 发布；
+错误 KEK、未知/更高 schema 与 live manifest drift 均在持久化 PRAGMA 前零写入拒绝。非秘密
+machine enrollment rescue index 可在无 KEK 时读取 main DB 或已提交 WAL；WAL 恢复只发生在私有
+副本，不改原始三文件。聚焦验证为 `runtime_store` 22/22、`runtime_store_cipher` 12/12，daemon
+no-net、fmt、diff-check 与 scoped clippy 通过。P3.2-C～F（稳定序列、Accepted/幂等、执行事务、
+admission/retention）仍未完成，因此本记录不勾选 P3.2 总任务。
+
+- [ ] Step 1: 写store tests。 覆盖daemon先生成stable IDs，commandSeq/eventSeq/catalogRevision跨重启单调，Accepted COMMIT，conversation-scoped idempotency ledger至少保留30天；machine-wide admin ledger留给所属后续task。2GiB准入按main DB+WAL+SHM observed+projected总量、`max_page_count`与有界checkpoint共同计算，另保留512MiB或文件系统5%（取较大者）；1,024 prompts/256MiB/24h；disk-low拒绝新副作用但继续read/safety/rescue/diagnostics；敏感row非明文；删除全部Keychain item后仍从非秘密receipt index读old route/fingerprint且不生成新root/KEK。
 - [ ] Step 2: 运行 `cargo test -p agentdeckd --test runtime_store -- --test-threads=1`。 Expected: FAIL，RuntimeStore不存在。
 - [ ] Step 3: 实现专用 blocking store worker、WAL/FULL/FK/busy timeout与 StorageKEK row cipher。 `Started + ExecutionIntent + CommandStarted event` 在同一事务；所有 store failure返回 typed error。
 - [ ] Step 4: 重跑 store test，并把 DB复制/重开验证 recovery。 Expected: Accepted queue/HWM/idempotency恢复；wrapped field扫描不含 sentinel。
