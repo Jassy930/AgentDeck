@@ -10,7 +10,7 @@
 4. `docs/index.md`：文档记录系统导航。
 5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code（含 CC adapter failure codes）。
 6. `docs/QUALITY.md`：验证命令、质量门禁和文档结构检查（含 v0.2 手动 QA 清单）。
-7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单。P2.10 已完成；P3.1/P3.2/P3.3 代码分别提交为 `835a7b3`/`8744750`/`3c58f2a`，下一项是 P3.4 RuntimeCore。真实 provisioned signed Keychain roundtrip 仍 gated BLOCKED，因此不得宣称 P3.1/P3 完成，继续按计划执行 P3–P6。
+7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单。P2.10 已完成；P3.1/P3.2/P3.3/P3.4 代码分别提交为 `835a7b3`/`8744750`/`3c58f2a`/`a58d84e`，下一项是 P3.5 approval first-wins。真实 provisioned signed Keychain roundtrip 仍 gated BLOCKED，因此不得宣称 P3.1/P3 完成，继续按计划执行 P3–P6。
 8. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
 
 ## 项目边界
@@ -168,7 +168,8 @@ P3.2 必须保持 caller-owned stable conversation/adapter IDs、全部事务精
 fence/release、32/1,024/256MiB、2GiB admission、safety tail/bounded checkpoint、真实 COMMIT
 unknown、认证 metadata/ledger、三业务 lane count/byte bound、paged recovery（单页一个
 conversation、80MiB、exact cursor/finish、恢复期 mutation fence）和 shutdown
-优先级。该组件尚未接入 compatibility RuntimeHub；P3.4 前不得把 store 测试表述为 UDS、
+优先级。P3.4 RuntimeCore 已接入该组件，但 compatibility RuntimeHub/App/CLI 尚未迁到 singleton
+UDS；不得把 store/Core 测试表述为 UDS、
 远程或 Companion E2E。标准 SQLite 无 custom quota VFS，不能声称 active WAL 瞬时零超冲。
 
 ### Relay Companion MVP P3.3（typed catalog + adapter 私域门禁）
@@ -194,8 +195,32 @@ identity 字段在 migration 前零写拒绝；v1→v2 before-COMMIT rollback �
 不返回/不发布。Codex resume response 必须返回 exact thread id；CC private history 只有经
 `O_NOFOLLOW` 有界读回有效 JSONL 才算 materialized，fresh home 重试继续复用原 session id。
 state repository 不公开，adapter 不拿通用 store/另一 namespace vault，不创建 `cc-meta/`。
-所有真实 CLI/model/history smoke 必须先检查 `AGENTDECK_E2E=1`。这些仍是 P3.4 RuntimeCore 前的
-组件门禁，不能表述为 UDS、远程或 Companion E2E。
+所有真实 CLI/model/history smoke 必须先检查 `AGENTDECK_E2E=1`。这些与 P3.4 RuntimeCore 仍是
+分层组件门禁，不能表述为 UDS、远程或 Companion E2E。
+
+### Relay Companion MVP P3.4（RuntimeCore / actor 门禁）
+
+```bash
+cargo test -p agentdeckd --lib runtime:: -- --test-threads=1
+cargo test -p agentdeckd --test runtime_core --test runtime_store_p34 -- --test-threads=1
+cargo test -p agentdeck-protocol -- --test-threads=1
+swift test --filter RuntimeV1ProtocolTests
+cargo test -p agentdeckd -- --test-threads=1
+bash scripts/check-daemon-no-net.sh
+```
+
+P3.4 的 Start 必须与首 prompt 分离，并由 StorageKEK 域分离 capability 生成跨重启稳定 ID；
+出站 writer 只接受保留 version/messageId 的完整 RuntimeEnvelope。per-conversation actor 以 durable
+commandSeq FIFO 裁决，多 reader/multi-writer 不按 transport 赋予本地优先级。prompt COMMIT
+unknown 的重试必须把仍为 Accepted 的 command 幂等补回 actor；shutdown/recovery-blocked 不得
+abort 已 dispatch 的 admission 而丢 outcome。取消或 completion channel 失败只有在
+`cancel_and_wait_fenced` 证明精确 process group 已退出后才能写 terminal；否则 conversation
+保持 RecoveryBlocked；release permit 必须绑定 committed command/boot/nonce，completion 成功也
+必须证明精确 process group 已 reap/fence。durable conversation/actor 最多 1,024，connection
+writer 最多 128，principal lease（含 revoked tombstone）最多 1,024；frame/byte/read/control
+队列同样必须有硬上界。Core 先 Closing 并等待 operation/start lease 静默，再公开 Draining；
+shutdown/Drop 后不得残留自持有 writer 或 detached actor 子任务。P3.7 前 production
+execution coordinator 固定 disabled，side-effect-free fake 不是真实 vendor exec 证据。
 
 ## 浏览与外部资料
 

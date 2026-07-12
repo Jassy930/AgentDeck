@@ -411,31 +411,45 @@ Relay 不返回包含密文内部细节的错误。TLS pin 不匹配没有绕过
 - 每个 connection 有独立 bounded writer task；RuntimeCore 不直接 await socket write。
 - UDS 与 RemoteLink 解密后的共同业务 wire 都是 `RuntimeEnvelope v1`。P3 将 macOS App/CLI 迁到 Runtime v1；现有 local IPC `PROTOCOL_VERSION=2` 只由 `StdioCompatibilityAdapter`/旧测试使用，adapter 把其受支持子集翻译到 RuntimeCore，并通过 capabilities 明示不支持多 client、remote admin/pairing 和完整 receipt replay。禁止让 UDS 继续携带 vendor threadId/sessionId trunk 作为 canonical identity。
 
-进入 RuntimeCore 的 principal 固定为：
+进入 RuntimeCore 的不是可由 transport 拼字段构造的 public enum，而是字段私有、只能由 daemon
+内部认证 issuer 签发的 `AuthenticatedPrincipal` capability。相同完整授权身份共享同一个
+authorization lease；revoke 先把 lease 原子切到 Revoking、等待所有已进入的 durable operation
+退出，再终止该身份尚未 Started 的命令并发布 Revoked。身份内容固定为：
 
 - `RemotePrincipal(machineRoute, deviceRoute, grantSerial, deviceSignFingerprint)`：来自已经验证的 Relay AccessContext。每个 RuntimeRequest 还必须带 DeviceSign 签名，daemon 重新校验 grantSerial 的本地状态。
 - `LocalPrincipal(uid, clientInstallationId)`：认证只来自 same-UID UDS peer credential；随机稳定的 `clientInstallationId` 只用于审计、配额和 idempotency namespace，不能代替 OS peer auth。
 
 grant renewal/新 serial 形成新 RemotePrincipal；trust reset 形成新的 machine trust domain。本地 App 重新安装会得到新 installation ID，因此旧 idempotency key 不能跨安装被当成同一 principal。
+P4 durable auth ledger 接入前 production issuer 不提供 remote capability；若恢复页意外出现无法
+重新绑定精确 grant serial 的 remote Accepted，RuntimeCore 必须 `RecoveryBlocked`，不能只按
+idempotency owner 近似授权。
 
 ### 8.3 Per-conversation actor
 
 每个 conversation 有一个逻辑 actor：
 
 - Prompt lane：严格按 daemon journal 分配的 `commandSeq` FIFO；一个 active turn；默认最多 32 个 queued prompts。
-- Control lane：approval、cancel、当前 turn vendor control；优先于 prompt queue，但必须校验当前 turn。
-- ReadPool：catalog/history/snapshot 进入独立有界读池，不阻塞 prompt/approval。
+- Control lane：approval、cancel、当前 turn vendor control；以有界优先批次领先 prompt/runner，
+  但必须保留公平点，禁止持续 control refill 永久饿死 completion/admission。
+- ReadPool：catalog/history/snapshot 进入独立有界读池，不阻塞 prompt/approval；并发槽满时立即
+  返回 typed overload，不允许在 semaphore 后形成无界等待 future。
 - 不同 conversation 可以并行，由全局 adapter semaphore 控制资源上界。
 
 客户端时间、Relay 到达时间和“本地/远程”身份都不能改变排序。
 
 ### 8.4 Prompt 语义
 
+`Start` 是纯幂等 catalog create，不携带首条 prompt：请求必须给 `agentKind`、start
+idempotency key、绝对 `cwd` 与可选 title；Runtime store 从 StorageKEK 取得只在 daemon
+内部持有的域分离 capability，对 owner+key 派生稳定 `conversationId/adapterStateKey`，再返回
+`ConversationStartReceipt(replayed)`。客户端收到该回执后必须用独立 key 发送 `SendPrompt`；不得把
+create 与首 prompt 拼成一个无法原子重放的请求。
+
 1. 校验 principal 权限、conversation 和 payload。
 2. 在 command journal 中写入 principal、idempotency key、payload hash、commandSeq 和 `Accepted` 状态。
 3. 事务提交后返回 `CommandReceipt::Accepted(queuePosition)`。
 4. actor 取到队首后，在 **同一个 SQLite 事务** 把 command 状态写为 `Started(executionNonce)`、写入 `ExecutionIntent(daemonBootId, executionNonce)`，并把 canonical `CommandStarted` event 写入 event journal；事务提交完成前不得 spawn/调用 adapter。
-5. 事务提交后 spawn 同一已签名 `agentdeckd --exec-gate` 子模式：gate 先建立独立 process group 并在 exec vendor 前阻塞，通过私有 pipe 回报 `processGroupId/leaderPid/leaderStartTime/executionNonce`。daemon 在第二个事务把这些值提升为 `ExecutionFence`，COMMIT 后才发送一次性 release token；gate 只有 token/nonce 匹配才 exec vendor。adapter 参数准备可以在 release 前完成，但任何 vendor/tool 副作用都不能越过 gate。
+5. 事务提交后 spawn 同一已签名 `agentdeckd --exec-gate` 子模式：gate 先建立独立 process group 并在 exec vendor 前阻塞，通过私有 pipe 回报 `processGroupId/leaderPid/leaderStartTime/executionNonce`。`prepare` 只能返回 blocked gate 的 control 与 **cold release capability**，不能返回已热启动的 completion future；daemon 在第二个事务把进程值提升为 `ExecutionFence`，再把 `authorizeExecutionRelease` 的 COMMIT 回执封装为不可伪造、单次消费的 release permit。gate 只有 capability 消费该 permit 且 token/nonce 匹配才 exec vendor，随后才产生 completion future。adapter 参数准备可以在 release 前完成，但任何 vendor/tool 副作用都不能越过 gate。
 6. 结果先写 journal/event journal，再广播 `Completed/Failed/Interrupted`。
 
 排队 prompt 可以在 Started 前取消；已经 Started 的 turn 只能走明确 cancel，不允许删除 journal 伪装未发生。四个 crash gap 固定为：Started COMMIT 前无 child、COMMIT 后未 spawn 为 Interrupted；gate ready 但 Fence COMMIT 前或 Fence COMMIT 后未 release 时 pipe 关闭使 gate 自退，启动时仍清理该 group；release 后崩溃按可能已有 vendor 副作用处理并 fencing。所有 Started crash 都保守标 `Interrupted/unknown outcome` 而不自动重放。
@@ -457,7 +471,7 @@ iOS/macOS 不得在 daemon receipt 前把卡片写成 approved/denied。
 
 ### 8.6 Idempotency
 
-授权检查使用完整 principal，但 idempotency owner 必须在 grant renewal 前后稳定：远程为 `(machine trust domain, deviceRoute, deviceSignFingerprint)`，本地为 `(machine trust domain, uid, clientInstallationId)`。唯一键为 `(idempotencyOwner, idempotencyKey)`，并保存 canonical payload hash：
+授权检查使用完整 principal，但 idempotency owner 必须在 grant renewal 前后稳定：远程为 `(machine trust domain, deviceRoute, deviceSignFingerprint)`，本地为 `(machine trust domain, uid, clientInstallationId)`。纯 `Start` 的唯一键为 `(idempotencyOwner, startIdempotencyKey)`；`SendPrompt` command ledger 的唯一键严格为 `(conversationId, idempotencyOwner, idempotencyKey)`，并保存 canonical payload hash：
 
 - 同 key、同 payload、in-flight：返回同一 Accepted/commandId。
 - 同 key、同 payload、terminal：重放原结果，不再次调用 adapter。
@@ -465,6 +479,10 @@ iOS/macOS 不得在 daemon receipt 前把卡片写成 approved/denied。
 - Relay/transport 不拥有业务 idempotency 终态。
 
 grant serial 更新会产生新 RemotePrincipal，但不改变同一 DeviceSign/deviceRoute 的 idempotency owner；renewal 事务不能清掉旧 ledger。覆盖用例必须包含“旧 serial 已 Accepted、receipt 丢失、renew 后以同 key 查询”，结果只能 replay 原 command。DeviceSign 轮换必须使用新 device route/重新配对，因此是新的 owner。
+
+断线查询使用 tagged `QueryReceiptSelector::Command(conversationId, commandId)` 或
+`Idempotency(conversationId, key)`；两种 selector 都绑定 conversation，daemon 同时校验 owner，
+并返回包含 Accepted/Started/全部 terminal 状态及可选 turnId 的精确 `CommandStatusReceipt`。
 
 conversation-scoped command ledger 与 conversation catalog 同生命周期；archive 后至少保留 30 天。machine-wide admin command ledger 至少保留 30 天。客户端不得主动复用已经使用过的 idempotency key；超过保留期后的旧 key 不再承诺去重。未满 30 天的 ledger 不能为释放空间而静默淘汰；达到 Runtime DB 硬上界时先拒绝新命令。
 
@@ -483,7 +501,9 @@ conversation-scoped command ledger 与 conversation catalog 同生命周期；ar
 
 ### 8.8 背压
 
-- 每连接 writer 默认 512 frames / 16 MiB。
+- 每连接 writer 默认 512 frames / 16 MiB；预算覆盖 Core 内队列、已交给 transport 但尚未完成
+  socket write/flush 的 frame，只有 transport ACK flush 后才释放。transport 丢弃未 ACK work
+  必须关闭并清理该 connection。
 - writer 满时标记 Lagged 并断连/重连，禁止静默丢 event。
 - command reply 已在 journal 中，连接丢失后可按 commandId/idempotency 重取。
 - per-conversation event journal 默认 10,000 events 或 64 MiB取先到者；全局默认 512 MiB。

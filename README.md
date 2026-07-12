@@ -387,9 +387,35 @@ fence、release、terminal
 由 P4 的 Keychain `CounterGuard` / generation high-water 绑定后才能检测。该门禁属于 P4/P6，
 P3.2 不能宣称已防住整库历史回滚。
 
-本节描述已经验证的持久化与 adapter-private 组件契约，不表示当前 stdio `RuntimeHub` 已改走
-该 store。P3.4 才由 `RuntimeCore` 把真实本地/远程请求接入 journal；在此之前不能把
-store/adapter unit、integration 或本机 vendor smoke 当成 Companion 端到端完成证据。
+### P3.4 RuntimeCore 当前边界
+
+transport-neutral `RuntimeCore` 已把 Runtime v1 的纯幂等 Start、SendPrompt、显式
+CancelQueued/CancelActive 与精确 QueryReceipt 接到 Runtime journal。Start 不再携带首 prompt；
+相同 owner+start key 由 StorageKEK 域分离 capability 稳定派生，跨重启返回同一
+`conversationId/adapterStateKey` 和准确 replay bit。prompt
+actor 以 journal `commandSeq` 为唯一 FIFO，同 conversation 只有一个 active，不同 conversation
+可由全局 semaphore 并行；control 使用有界优先批次，ReadPool 满时立即 overload，不排无界
+waiter。
+
+进入 Core 的 principal 是字段私有的认证 capability；同一完整身份共享强 authorization lease，
+Accepted→Started 前会重新取得 guard，revoke 与 start 由该 guard + SQLite transition 线性化。
+P4 auth ledger 前没有 production remote issuer，恢复出的 remote Accepted 明确
+RecoveryBlocked。durable conversation/actor 固定最多 1,024，connection writer 最多 128，
+principal lease（含 revoked tombstone）最多 1,024；满载均 fail-closed，不做活跃对象驱逐。
+每连接 outbox 只接收保留 version/messageId 的完整 RuntimeEnvelope，并固定
+512 frames/16 MiB；预算保持到 transport 完成 socket
+write/flush ACK；慢 writer、drop 未 ACK work 只清理自身连接。Store Safety lane 可原子终止
+Accepted 为 Canceled/RevokedBeforeStart，Read lane 的 compact receipt 同时校验
+conversation+owner。
+
+P3.4 只用 side-effect-free fake 验证两阶段执行状态机；production coordinator 固定 disabled，
+因此 Accepted 不会被写成假 Started/PID/fence。`prepare` 只能给 blocked gate 与 cold release
+capability，只有 durable release COMMIT 生成的 permit 才能取得 completion future。真实 vendor
+permit 绑定 command、daemon boot 与 execution nonce；completion 成功必须证明精确进程组已经
+reap/fence。关停会先用内部 Closing 拒绝新请求并封住 actor start lease，再公开 Draining，因而
+Draining 后不会新增 durable Started。真实 vendor 进程仍必须等 P3.7 `--exec-gate`；当前 stdio
+`RuntimeHub`、App/CLI 也尚未迁到 singleton UDS，
+所以这些单元/集成测试仍不是本地或远程 Companion 端到端完成证据。
 
 ## agentdeck CLI（参考客户端 / E2E 驱动）
 

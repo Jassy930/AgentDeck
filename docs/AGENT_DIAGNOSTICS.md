@@ -500,10 +500,10 @@ ignored 测试不是通过证据。
 | `daemon.diagnostics.path_unavailable` | diagnostics one-shot 无可用日志路径 | 提供合法 profile/absolute data-dir，或先创建一次诊断日志 |
 | `daemon.runtime.main_loop_failed` | security bootstrap 已完成，但 stdio RuntimeHub 主循环失败 | 按同一 diagnostic log 检查 IPC I/O；guard/KEK 会随进程退出释放/清零 |
 
-## Runtime SQLite / journal / adapter 私表诊断（Companion MVP P3.2/P3.3）
+## Runtime SQLite / journal / adapter 私表 / Core 诊断（Companion MVP P3.2–P3.4）
 
-P3.2/P3.3 error code 是 store 内部精确错误的稳定诊断归类；P3.4 才负责映射成 wire
-`RuntimeFailure`。排查时保留 DB/WAL/SHM 原件，先运行 diagnostics/read-only inspection，
+P3.2/P3.3 error code 是 store 内部精确错误的稳定诊断归类；P3.4 已负责映射成 wire
+`RuntimeFailure`，并增加 Core/principal/connection/read overload 分类。排查时保留 DB/WAL/SHM 原件，先运行 diagnostics/read-only inspection，
 不要用删除 sidecar、生成新 KEK 或直接改 high-water 的方式“修复”。
 
 ### Store shutdown deadline 语义
@@ -551,6 +551,22 @@ daemon fail-closed 退出，不要跳页、伪造 cursor 或删除 sidecar。
 | `daemon.payload.item_too_large` | prompt、descriptor、intent/event/fence/result 超过各自硬上界 | 在进入 store 前缩小对应 item；不能切片成多个同 key 请求规避 |
 | `daemon.runtime.recovery_too_large` | 单个 conversation recovery page 的 retained projection 超过固定 80 MiB | 视为 schema/cap 漂移或损坏并 fail-close；不能改用全库物化或复用 async lane budget，保留证据后核对 item hard limits |
 | `daemon.command.queue_expired` | Accepted 到达 24 小时边界，已事务化为 Expired 并写 canonical event | 不自动重放旧 vendor 副作用；用新 idempotency key 发起新命令 |
+
+P3.4 RuntimeCore 的 transport-neutral failure：
+
+| code | 含义 | 下一步 |
+| --- | --- | --- |
+| `daemon.runtime.not_ready` | Core 尚未完成 paged recovery，或正在 draining/stopped | 等待 daemon readiness；若 recovery 无法完成，按上节保留 DB/Keychain 证据并 fail-close |
+| `daemon.runtime.protocol_mismatch` | Runtime v1 版本不兼容 | 升级客户端/daemon 到同一 Runtime protocol；不能回退 Relay/IPC 业务字段 |
+| `daemon.runtime.invalid_request` | ID 非 canonical UUID、Start key/cwd 或其他规范化输入非法 | 修正原请求；不得由 daemon 猜 ID/path 或替客户端补目标 |
+| `daemon.runtime.feature_unavailable` | 请求属于尚未接线的后续 phase（P3.5–P4） | 读取 capabilities/实施状态后等待对应 phase；不得用 compatibility path 假成功 |
+| `daemon.authorization.revoked` | opaque principal lease 已 Revoking/Revoked 或 issuer registry 不可用 | 停止该 connection；remote 设备按 durable revocation/re-pair 流程处理，本地重新认证 peer credential |
+| `daemon.runtime.identity_unavailable` | machine trust/ID derivation domain 非法或 OS entropy 不可用 | 停止启动并检查 machine identity/系统熵；不得生成零 ID 或使用时间/PID 回退 |
+| `daemon.runtime.actor_unavailable` | conversation actor/execution control 已损坏或 recovery-blocked | 不自动重放 Started；保留 command/fence 证据，P3.7 按 orphan fencing 处理 |
+| `daemon.runtime.connection_unavailable` | connection 不存在、writer lagged、transport 未 ACK flush 或编码失败 | 仅重连当前客户端，并按 commandId/idempotency 查询 durable receipt；不得假定未执行 |
+| `daemon.runtime.read_unavailable` | 独立 ReadPool 已满或关闭 | 有界退避后重试读取；不要创建更多等待 task，副作用请求仍以 durable receipt 为准 |
+| `daemon.runtime.recovery_blocked` | 恢复页存在 Started，或 P4 前存在无法绑定精确 grant 的 remote Accepted | 保持 execution disabled；P3.7/P4 完成 fencing/auth readback 前不得 finish recovery |
+| `daemon.turn.stale` | CancelQueued 已输给 Started，或 CancelActive 的 turnId 不是当前 turn | 查询精确 CommandStatus；对 Started 只使用返回的当前 turnId 明确 cancel |
 
 P3.3 canonical adapter 边界的错误不会携带 raw resume reference：
 

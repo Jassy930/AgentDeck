@@ -526,9 +526,42 @@ conversation/key，不能伪造身份连续性。
 - `machine_enrollment_receipts` 只是 MachineRoot 丢失后仍可读的非秘密 locator，不带 MAC、
   也不是 purge authorization。P4 trust-reset 必须用 Relay/admin-signed receipt 独立验证 old
   route/root fingerprint；不得仅凭该表执行远端删除。
-- P3.2/P3.3 只建立并验证 store + adapter private boundary；当前 compatibility `RuntimeHub`
-  尚未依赖它。P3.4 的 RuntimeCore actor 才能把业务请求接入，因此本节不是本地/远程端到端
-  可用声明。
+- P3.2/P3.3 只建立并验证 store + adapter private boundary；P3.4 已由 RuntimeCore actor 把
+  Runtime v1 的 Start/SendPrompt/cancel/query 接入，但当前 compatibility `RuntimeHub` 与 App/CLI
+  尚未迁到 singleton UDS，因此本节仍不是本地/远程端到端可用声明。
+
+### Relay Companion MVP P3.4 RuntimeCore 不变量
+
+- `RuntimeCore` 不 import socket、Relay 或 transport priority 类型。UDS/RemoteLink 只能提交已
+  认证的 opaque `AuthenticatedPrincipal` 与规范化 `RuntimeRequest`；字段私有且 production
+  remote issuer 在 P4 durable auth ledger 前不存在。
+- 相同完整授权身份共享 Core 生命周期内的强 authorization lease。revoke 先 CAS Revoking 并
+  等待 inflight guard；prompt admission 在 Accepted COMMIT+actor 注册前持有 guard，runner 在
+  Accepted→Started 前再次取 guard。CAS 与 SQLite state transition 共同决定 start/revoke 唯一
+  赢家；grant serial 不进入 idempotency owner。
+- Start 是独立的纯 catalog create：Runtime store 从 StorageKEK 取得不可伪造的域分离 capability，
+  对 owner+start key 生成稳定
+  conversation/adapter IDs；Store 直接返回 Created/Replayed，禁止进程内猜 replay。首 prompt
+  必须另发。SendPrompt 去重域是 `(conversationId, owner, key)`；QueryReceipt 的 command 与
+  idempotency selector 都绑定 conversation，并再次校验 owner。
+- 每 conversation 一个 admission worker + actor。SQLite `commandSeq` 是 prompt FIFO 的唯一
+  顺序；一个 active turn；control 最多连续优先 8 个后进入公平点；ReadPool 使用 try-acquire，
+  满载立即返回 overload。恢复页在 store finish 前只安装不调度；P4 前遇到 remote Accepted 或
+  P3.7 前遇到 Started 都 RecoveryBlocked。
+- durable conversation 与常驻 actor 都以 1,024 为硬上界；connection registry 最多 128 个
+  writer，principal issuer 最多保留 1,024 个 lease（含 revoked tombstone）。命中任一上界都
+  fail-closed，不驱逐活跃身份、conversation 或 writer，也不创建 detached task。
+- connection outbox 只接受完整 `RuntimeEnvelope`，不得丢失 version/messageId；512 frames/16 MiB
+  同时覆盖队列和已交给 transport 但尚未 flush 的 work；
+  transport 只有在 socket write/flush 后 ACK 才释放 permit。overflow、sink drop 或未 ACK work
+  只删除当前 connection，不 await 慢 writer、不影响其他连接。
+- execution `prepare` 只返回 blocked process identity、cancel control 与 cold release capability。
+  `authorize_execution_release` COMMIT 回执才能构造单次 permit；capability 消费 permit 后才返回
+  completion future；permit 必须同时匹配 command、daemon boot 与 committed execution nonce。
+  completion 的成功值本身是 safety capability，表示精确 process group 已 reap/fence，不能只表示
+  收到 vendor terminal event。Core shutdown 先进入内部 Closing、等待前台 operation 静默并封住
+  actor start lease，之后才公开 Draining；因此 Draining 可见后 durable Started 不再增长。P3.7
+  前 production coordinator 固定 disabled，不得用 fake PID/fence 把 Accepted 伪装成真实执行。
 
 ### R1a 隐含约束（历史参考）
 

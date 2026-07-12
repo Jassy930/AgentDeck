@@ -656,43 +656,309 @@ ignored/GATED。独立安全复核与容量/恢复/关停复核均未发现 P0/P
 ### Task P3.4：实现 transport-neutral RuntimeCore、principal 与 prompt actors
 
 **Files:**
-- Create: `agentdeckd/src/runtime/{core,connection,conversation,read_pool}.rs`
-- Create: `agentdeckd/tests/runtime_core.rs`
-- Modify: `agentdeckd/src/runtime/{mod,router}.rs`
-- Modify: `agentdeckd/src/agent.rs`
+- Create: `agentdeckd/src/runtime/{core,connection,conversation,execution,read_pool}.rs`
+- Create: `agentdeckd/tests/{runtime_core,runtime_store_p34}.rs`
+- Modify: `agentdeckd/src/runtime/{mod,model,router,store/*}.rs`
+- Modify: `agentdeck-protocol/src/runtime/*`、`agentdeck-protocol/tests/runtime_v1_contract.rs`
+- Modify: `Sources/AgentDeckCore/Protocol/RuntimeV1Types.swift`、
+  `Tests/AgentDeckTests/RuntimeV1ProtocolTests.swift` 与 Runtime schema/fixture
 
 **Core interface:**
 ```rust
 pub struct RuntimeCore { store: RuntimeStoreHandle, router: Arc<AgentRouter>, connections: ConnectionRegistry, conversations: ConversationRegistry }
 impl RuntimeCore {
-    pub async fn connect(&self, principal: Principal, sink: ConnectionSink) -> Result<ConnectionId, RuntimeFailure>;
+    pub fn connect(&self, principal: AuthenticatedPrincipal, sink: ConnectionSink) -> Result<ConnectionId, RuntimeFailure>;
     pub async fn handle(&self, connection_id: ConnectionId, request: RuntimeRequest) -> RuntimeReply;
+    pub fn enqueue(&self, connection_id: ConnectionId, envelope: &RuntimeEnvelope) -> Result<(), RuntimeFailure>;
     pub async fn disconnect(&self, connection_id: ConnectionId);
     pub async fn recover(&self) -> Result<RecoveryReport, RuntimeFailure>;
 }
-pub enum Principal { Local(LocalPrincipal), Remote(RemotePrincipal) }
 ```
 
-- [ ] Step 1: 写FakeAgent core tests。 两principal并发同conversation prompt按journal commandSeq FIFO；不同conversation并行；control lane不被prompt堵塞；queued prompt在Started前可取消、Started后只走明确cancel；每conversation32、全局1,024/256MiB；principal撤销后Accepted未Started终止为`RevokedBeforeStart`；512/16MiB慢writer只断自己；同idempotency key replay；remote grant serial renewal后同deviceRoute+DeviceSign owner仍重放原command。
-- [ ] Step 2: 运行 runtime_core test。 Expected: FAIL，当前 RuntimeHub绑死单 stdin/stdout。
-- [ ] Step 3: 实现 RuntimeCore与per-conversation actor；保留 RuntimeHub未接线作为 compatibility。 actor不await writer；ReadPool有独立 semaphore；local/remote排序不含transport优先级。
-- [ ] Step 4: 重跑 test 100 次竞态循环。 Expected: commandSeq稳定，恰好一个 active turn，无任务泄漏。
-- [ ] Step 5: fmt/clippy。
-- [ ] Step 6: 提交。 `git add agentdeckd && git commit -m "feat(daemon): 建立持久化 RuntimeCore 与会话 actor"`
+- [x] Step 1: 写FakeAgent core tests。 两principal并发同conversation prompt按journal commandSeq FIFO；不同conversation并行；control lane不被prompt堵塞；queued prompt在Started前可取消、Started后只走明确cancel；每conversation32、全局1,024/256MiB；principal撤销后Accepted未Started终止为`RevokedBeforeStart`；512/16MiB慢writer只断自己；同idempotency key replay；remote grant serial renewal后同deviceRoute+DeviceSign owner仍重放原command。
+- [x] Step 2: 运行 runtime_core test。 Expected: FAIL，当前 RuntimeHub绑死单 stdin/stdout。
+- [x] Step 3: 实现 RuntimeCore与per-conversation actor；保留 RuntimeHub未接线作为 compatibility。 actor不await writer；ReadPool独立且满载立即overload；local/remote排序不含transport优先级。P3.7前production coordinator固定disabled，Accepted不写假Started/fence。
+- [x] Step 4: 重跑100路同key Start竞态与actor并发测试。 Expected: 1 Created + 99 Replayed、一个actor；同conversation按commandSeq FIFO、不同conversation并行、shutdown后actor/writer归零。
+- [x] Step 5: fmt/clippy。production新增范围无warning；字面全target clippy仍由既有 trunk/CC/Codex lint 阻塞，使用逐项列明的既有 lint allowance 后 `-D warnings` 通过。
+- [x] Step 6: 按精确 pathspec 暂存 Rust/Swift Runtime v1 contract、schema/fixture、daemon
+  Core/store/actor 与测试，并提交为 `a58d84e feat(daemon): 建立持久化 RuntimeCore 与会话 actor`；
+  文档与 P3.5 细化计划留在后续独立 docs commit，未混入代码提交。
+
+**P3.4 收口事实：** Runtime v1 已改为纯幂等 Start、显式 CancelQueued/CancelActive、
+tagged QueryReceipt 与精确 CommandStatus；Store Safety lane 支持 Accepted→Canceled/
+RevokedBeforeStart 原子终止，Read lane 同时校验 conversation+owner；opaque principal 对同一
+完整身份共享强 authorization lease，runner 在 Started 前重新取 guard。connection 的
+完整 `RuntimeEnvelope` 保留 version/messageId，512 frames/16 MiB 预算保持到 transport
+write/flush ACK；ReadPool 不排无界 waiter，control 使用有界优先批次。Start 的稳定 ID 由
+StorageKEK 域分离 capability 派生，不接受调用方注入的临时 key。execution `prepare` 只能返回
+blocked gate+cold release capability，只有
+durable release COMMIT 产生的 permit 才能取得 completion future。跨重启 remote Accepted 在
+P4 auth ledger 前明确 RecoveryBlocked。真实 vendor exec 仍严格属于 P3.7 gate，不计为 P3.4
+通过证据。
+
+执行记录（2026-07-12）：
+
+- `cargo test -p agentdeck-protocol -- --test-threads=1`、Swift `RuntimeV1ProtocolTests` 18/18、
+  `cargo test -p agentdeckd --lib runtime:: -- --test-threads=1` 67/67、conversation 20/20、
+  execution nonce 1/1、`runtime_store_p34` 13/13、`runtime_core` 2/2 均通过。
+- 完整 `env -u AGENTDECK_E2E cargo test -p agentdeckd -- --test-threads=1` exit 0：lib
+  154/154、全部 integration suites 通过；真实 1,024 × 256 KiB / 精确 256 MiB 慢门禁
+  5/5（263.86s）。StorageKEK 14 PASS + 1 ignored signed Keychain gate；ignored 仍是 P3.1
+  外部 provisioning BLOCKED，不计作通过。
+- `cargo fmt --all -- --check`、P3.4 scoped all-target clippy `-D warnings`、
+  `bash scripts/check-daemon-no-net.sh`、`scripts/verify-agent-docs.sh` 与 `git diff --check`
+  均通过。actor 生命周期与 Core/security 两轮独立复核均无剩余 P0/P1/P2；actor 自身 panic
+  后 registry dead entry 只 fail-close、不原地重建，作为非 safety blocker 留待进程重启恢复。
 
 ### Task P3.5：实现 approval first-wins、delivery retry 与精确 receipt
 
 **Files:**
 - Create: `agentdeckd/src/runtime/approval.rs`
 - Create: `agentdeckd/tests/runtime_approval.rs`
-- Modify: `agentdeckd/src/runtime/{core,conversation,store,model}.rs`
+- Modify: `agentdeckd/src/runtime/{core,conversation,execution,connection,model,mod}.rs`
+- Modify: `agentdeckd/src/runtime/store/{schema,sqlite,journal,worker,identity,mod}.rs`
+- Modify: `agentdeckd/src/{agent,codex/adapter,claude_code/adapter}.rs`
+- Modify: `agentdeckd/src/runtime/router.rs`
+- Modify: `agentdeckd/tests/{codex_adapter_shape,cc_adapter_shape}.rs`
+- Modify: `agentdeck-protocol/src/runtime/failure.rs`
+- Modify: `docs/{AGENT_DIAGNOSTICS,QUALITY}.md`、`ARCHITECTURE.md`
 
-- [ ] Step 1: 写 approval tests。 覆盖 principal权限、conversation+turn+approval匹配、100路并发CAS仅一赢家、Pending→Claimed→Applying→Applied、DeliveryFailed保留决定、每轮8次/60s退避、RetryApprovalDelivery只重试同决定、默认30m deadline、turn中断→Expired、AlreadyHandled返回精确state。
-- [ ] Step 2: 运行 `cargo test -p agentdeckd --test runtime_approval -- --test-threads=1`。 Expected: FAIL，approval ledger未实现。
-- [ ] Step 3: 实现 SQLite CAS、可注入Clock/Backoff与 daemon-owned delivery worker。 winner先持久化再调用 adapter；客户端断线不取消delivery；后到决定永不能覆盖。
-- [ ] Step 4: 重跑 tests并启用 paused Tokio time。 Expected: 无真实60秒等待；每条状态转换与canonical event一致。
-- [ ] Step 5: 更新 diagnostics failure code与运行 docs gate。
-- [ ] Step 6: 提交。 `git add agentdeckd docs/AGENT_DIAGNOSTICS.md && git commit -m "feat(daemon): 实现 approval first-wins 与投递恢复"`
+**Interfaces:**
+
+- daemon-private `ApprovalPrincipalCapability::try_enter_approval()` 只为
+  `AuthenticatedPrincipal` 实现，并返回字段私有的
+  `ApprovalAuthorizationGuard`；它同时证明 principal 仍 Active、拥有 approval resolve/retry
+  权限，并携带完整 authorization identity 的 opaque claimant key。permission 必须属于 issuer
+  签发的 principal capability/共享 lease identity，不能用 `is_local()`、transport 字段或
+  idempotency owner 代替。guard 生命周期覆盖 first-wins CAS COMMIT；claim 先提交后，delivery
+  已归 daemon，之后的 client disconnect/revoke 不撤销赢家。
+- `ApprovalPolicySnapshot` 在 ActionRequest 注册时冻结：精确 `agentKind/actionKind`、
+  `allowApprove/allowDeny/allowPersist` 与可选 `deadlineAtMs`。Approve 必须满足 action
+  capability；`persist=true` 只接受 Codex request 的 `canPersist=true` 且 session features
+  包含 `CodexApprovalPersistence`；当前 Runtime `ActionRequest` 无 deadline 时使用创建后
+  30 分钟。
+
+  ```rust
+  pub(crate) trait ApprovalPrincipalCapability {
+      fn try_enter_approval(
+          &self,
+      ) -> Result<ApprovalAuthorizationGuard, PrincipalAccessError>;
+  }
+
+  pub(crate) struct ApprovalPolicySnapshot {
+      pub(crate) agent_kind: AgentKind,
+      pub(crate) action_kind: ActionKind,
+      pub(crate) allow_approve: bool,
+      pub(crate) allow_deny: bool,
+      pub(crate) allow_persist: bool,
+      pub(crate) deadline_at_ms: Option<u64>,
+  }
+  ```
+
+- `BoundApprovalDelivery` 是绑定精确 active session、route 与 requestId 的 daemon-private
+  capability；Runtime approval common 层不接收 raw `SessionId`，也不通过全局 router 再按
+  requestId 猜 route。固定接口为：
+
+  ```rust
+  #[async_trait::async_trait]
+  pub(crate) trait BoundApprovalDelivery: Send + Sync + 'static {
+      fn policy(&self) -> &ApprovalPolicySnapshot;
+      async fn deliver(
+          &self,
+          key: ApprovalAttemptKey,
+          decision: &ActionDecision,
+      ) -> ApprovalDeliveryOutcome;
+  }
+
+  pub(crate) enum ApprovalDeliveryOutcome {
+      AppliedAck,
+      DefinitelyNotDelivered { retryable: bool },
+      OutcomeUnknown,
+      PermanentlyRejected,
+  }
+
+  pub(crate) struct ApprovalAttemptKey {
+      pub(crate) approval_id: RuntimeId,
+      pub(crate) delivery_round: u32,
+      pub(crate) attempt: u8,
+  }
+  ```
+
+  `ApprovalAttemptKey` 固定携带 neutral `approvalId/deliveryRound/attempt`。adapter 只有在完整
+  response write+newline+flush 成功后才返回 `AppliedAck`；部分写、flush 不明或 route 状态不明
+  必须返回 `OutcomeUnknown`，禁止自动重投。Codex delivery 使用完整 `ActionDecision` 并正确映射
+  `persist`；Claude Code speculative permission wire 未经 recorded fixture/live gate 验证时不得
+  mint production `BoundApprovalDelivery` 或广告可用 Approval。
+- `PreparedRuntimeExecution` 增加 bounded execution event receiver；事件接口固定为：
+
+  ```rust
+  pub(crate) enum RuntimeExecutionEvent {
+      ActionRequest {
+          request: ActionRequest,
+          delivery: Arc<dyn BoundApprovalDelivery>,
+      },
+  }
+  ```
+
+  P3.5 用 side-effect-free fake 证明 actor/store/worker；P3.7 的真实 exec-gate coordinator
+  负责把现有 `CanonicalAgentEvent::ActionRequest` 接入该 receiver，并由 router/adapter mint
+  绑定 capability。
+
+**SQLite schema v3 与 authenticated ledger：**
+
+- `RUNTIME_SCHEMA_VERSION=3`，`EXPECTED_TABLES` 增加 `approval_ledger`；
+  `RUNTIME_CRYPTO_CONTEXT_VERSION` 继续为 1，禁止因 physical migration 重加密既有 row 或
+  重包 wrapped key bundle。fresh DB 顺序执行 DDL v1、migration v2、migration v3；既有 DB
+  同时支持 authenticated `v1→v3` 与 `v2→v3`，迁移前先用旧 ledger token 完整认证旧表，
+  COMMIT 后逐字节核对 databaseId/keyGeneration/wrapped bundle 与既有 ciphertext 未变。
+- `runtime_meta` 新增 `approval_count` 与 `active_approval_count`，都纳入
+  `runtime.meta.ledger.v3` MAC。`approval_count == COUNT(*)`；
+  `active_approval_count == COUNT(state IN pending/claimed/applying/deliveryFailed)`。
+  `DeliveryFailed` 仍可显式 retry，因此继续计为 active。Safety reserve 使用
+  `active_approval_count * MAX_APPROVAL_TERMINATION_RESERVE_BYTES`，保证 adapter 已响应后仍能
+  durable 写入 Applied/Expired；Applied/Expired 才递减 active count。
+- `approval_ledger` 最小字段固定为：
+  - identity：`approval_id` PK、`conversation_id`、`command_id`、`turn_id`，均为 16-byte
+    neutral ID；FK 分别指向 conversations、commands、execution_intents。
+  - blind tokens：`request_token`、nullable `decision_token`、nullable `claimant_token`，均为
+    32 bytes；不得把 vendor requestId、principal、decision/persist 或 tool detail 放明文列。
+  - state/time：`state` 只允许 `pending/claimed/applying/applied/deliveryFailed/expired`，以及
+    `requested_at_ms/deadline_at_ms/claimed_at_ms/state_changed_at_ms`。
+  - retry budget：`delivery_round`、`attempts_in_round`（0...8）、nullable
+    `round_started_at_ms/last_attempt_at_ms`。
+  - event/integrity：`state_version >= 1`、unique `last_event_id`（FK 到
+    `event_journal.event_id`）、
+    `logical_request_bytes/logical_decision_bytes`、32-byte `metadata_token`。
+  - sealed payload：`sealed_request`、nullable `sealed_decision`、nullable
+    `sealed_status_detail`。`sealed_request` 同时保存 canonical ActionRequest 与
+    ApprovalPolicySnapshot；row AEAD 使用稳定 crypto context v1，metadata MAC 覆盖全部明文
+    字段、token、密文字段存在性与长度。
+- 新增 `RuntimeIdKind::Approval`、`idx_approval_active_turn(conversation_id, turn_id, state)` 与
+  `idx_approval_deadline(state, deadline_at_ms)`。load 时解密并 canonical re-serialize request/
+  decision，重算 blind token，校验 command/turn/conversation linkage、各 state 的 NULL/non-NULL
+  不变量、ledger counts 与 deadline/attempt 单调性。
+- Pending 注册与 canonical ActionRequest event 必须同事务；初始 `state_version=1`。每次真正
+  状态转换写一条 ApprovalResolved event、递增 stateVersion/全局 eventCount 并更新
+  lastEventId；`Applying→Applying` 的后续 attempt 只更新 authenticated attempt 计数，不伪造
+  状态转换事件。完整性扫描验证 command 固有 event 数 + `SUM(approval.state_version)` 等于
+  event journal 实际数，并逐条核对 approval event 的 id/turn/decision/state。
+
+**状态机、CAS 与 daemon-owned worker：**
+
+- 唯一合法转换为：`Pending→Claimed`、`Claimed→Applying`、
+  `Applying→Applying/Applied/DeliveryFailed/Expired`、`DeliveryFailed→Applying/Expired`，以及
+  `Pending/Claimed→Expired`。Applied、Expired 为终态；Claimed 后的 sealed winner 永不修改。
+  后到 Resolve 返回 `AlreadyHandled(winner, exactState)`；未 claim 的 Pending 过期返回 Expired；
+  已 claim 后过期返回 winner+Expired。
+- first-wins 使用 `BEGIN IMMEDIATE`，在同一事务重新认证 row/ledger、验证 exact
+  conversation+Started turn+approval+requestId、permission 与 policy，然后执行
+  `UPDATE ... WHERE state='pending' AND metadata_token=?`。actor 串行不是正确性前提；store CAS
+  必须独立通过 100 路竞态。赢家及 Claimed event COMMIT 后才可注册 delivery single-flight。
+- 每个 approval mutation 都有 Before/AfterCommit fault point 与
+  `RuntimeCommitOperation`；store outcome 使用 `Transitioned/Replayed/AlreadyHandled/ExpiredOrStale`。
+  Claim COMMIT unknown 只允许以同一 request/decision token 重试；同 winner 返回 Replayed，
+  不同 decision 返回 AlreadyHandled。BeginAttempt 按 round+expectedAttempt+metadataToken 重放，
+  Applied/DeliveryFailed/Expired outcome unknown 只重试 journal transaction，绝不再次调用
+  adapter。
+- `ApprovalSupervisor` 由 conversation actor 持有 bounded `approvalId→JoinHandle` single-flight
+  map，不属于 connection。Pending 只保留 deadline timer；Claimed 后 worker 接管 delivery；
+  DeliveryFailed 停止自动 loop，只保留 deadline timer。connection disconnect 不取消任务；
+  turn terminal 必须先 durable Expired，再 cancel/await worker。adapter deliver 不得在 actor
+  control handler 内 await，completion 只通过 bounded runner/control event 回 actor，继续遵守
+  control burst 公平点。
+- 注入接口固定为共享 `Arc<dyn RuntimeClock>`、async `ApprovalSleeper` 与纯函数
+  `ApprovalBackoff::delay_after(failed_attempt)`。attempt 1 立即执行，attempt 2...8 前依次等待
+  `0.5/1/2/4/8/16/16s`，正常最大 47.5s；adapter 调用耗时也计入每轮 60s，若下一次开始会越过
+  `roundStarted+60s` 或 approval deadline 就提前停止。每轮最多 8 次；自动预算耗尽但 deadline
+  未到进入 DeliveryFailed。任一当前有 approval 权限的 client 可 `RetryApproval`，事务只读取并
+  重用 sealed winner，round+1、attempt 重新计数，不能携带或覆盖 decision。为保持 Runtime v1
+  wire 不变，成功启动 retry 返回 `AlreadyHandled(winner, Applying)`，不能用 Claimed 冒充再次
+  赢得 first-wins。
+
+  ```rust
+  #[async_trait::async_trait]
+  pub(crate) trait ApprovalSleeper: Send + Sync + 'static {
+      async fn sleep(&self, duration: Duration);
+  }
+
+  pub(crate) trait ApprovalBackoff: Send + Sync + 'static {
+      fn delay_after(&self, failed_attempt: u8) -> Duration;
+  }
+  ```
+- adapter 返回 `AppliedAck` 后，如果 Applied journal 暂时失败，worker 只反复收口同一个
+  safety transaction；`OutcomeUnknown` 或永久失败停止自动重投并写 DeliveryFailed+诊断详情，
+  保留赢家供显式 same-decision Retry。
+- command Completed/Failed/Interrupted 与该 turn 所有非 Applied approval 的 Expired 更新及
+  canonical events 必须在同一个 Safety lane transaction 提交。分成两个事务会产生
+  terminal turn 仍有 active approval 的 crash gap。register/claim/begin-attempt/manual-retry 走
+  Normal lane；Applied/DeliveryFailed/Expired 与 terminal+expiry 走 Safety lane并使用预留空间。
+
+- [ ] Step 1: 先写以下 16 项 RED tests，测试名与断言固定，禁止合并成一个大用例：
+  1. `pending_registration_is_atomic_with_action_request_event`：row、event、high-water、两个 ledger
+     count 同事务；BeforeCommit fault 后没有半行。
+  2. `principal_without_approval_permission_cannot_claim`：Active 但无 resolve 权限仍拒绝，adapter
+     调用数为 0。
+  3. `resolve_requires_exact_conversation_turn_approval_and_request_id`：四种 mismatch 分别
+     fail-close，row 保持 Pending。
+  4. `decision_must_match_bound_action_capability`：缺 Approval、agent/action 不匹配、不可 Approve、
+     非法 persist 均拒绝。
+  5. `one_of_100_concurrent_resolves_wins_sqlite_cas`：50 Approve+50 Deny 只有一个 Transitioned，
+     其余 99 个观察同一 immutable winner。
+  6. `claim_after_commit_unknown_replays_and_starts_one_worker`：AfterCommit fault 后 exact retry 为
+     Replayed，adapter 最终只调用一次。
+  7. `delivery_transitions_claimed_applying_applied_and_survives_disconnect`：断开 winner connection
+     后 delivery 继续，状态/event 顺序精确。
+  8. `delivery_budget_is_eight_attempts_and_never_exceeds_sixty_seconds`：paused/manual time 下最多
+     8 次，调用时间符合 backoff，60s 后无第 9 次。
+  9. `delivery_failed_retains_winner_and_exact_receipt`：预算耗尽为 DeliveryFailed，对立 decision
+     只能得到原 winner+exact state。
+  10. `retry_delivery_reuses_exact_sealed_decision_and_new_budget`：requestId/kind/persist 逐字段相同，
+      round+1 且对立 Resolve 不能改判。
+  11. `default_deadline_is_request_time_plus_thirty_minutes`：29:59.999 仍 active，30:00.000 精确
+      Expired 且只有一个 terminal event。
+  12. `capability_deadline_overrides_default_and_stops_backoff`：更短 capability deadline 阻止下一
+      attempt 越界启动。
+  13. `turn_terminal_expires_every_non_applied_approval_atomically`：Pending/Claimed/Applying/
+      DeliveryFailed 全 Expired，Applied 保留，command terminal 与 approval events 同事务。
+  14. `applied_commit_unknown_retries_store_only`：adapter 一次成功，Applied AfterCommit unknown
+      只重试 store，最终仍只调用 adapter 一次。
+  15. `restart_never_resumes_active_approval_delivery`：重启读到 Applying/DeliveryFailed 时 adapter
+      调用为 0；P3.7 interruption hook 后全部 Expired。
+  16. `approval_row_and_ledger_tampering_is_rejected`：篡改 state/attempt/deadline/decision token/
+      approvalCount/activeApprovalCount 任一项都返回 UnknownOrCorruptSchema。
+- [ ] Step 2: 运行
+  `cargo test -p agentdeckd --test runtime_approval -- --test-threads=1`。 Expected: FAIL，错误必须
+  指向缺失 approval module/schema/store API/permission/delivery seam，而不是 fixture 或环境失败。
+- [ ] Step 3: 先实现 schema v3、v1/v2 migration、row sealing/MAC、ledger counts、完整性扫描与
+  store CAS/outcome replay；每完成一组后只运行对应 store tests，确认 tamper、Before/AfterCommit
+  与 100 路 CAS 先转绿。
+- [ ] Step 4: 实现 ApprovalAuthorizationGuard、ApprovalPolicySnapshot、BoundApprovalDelivery、
+  execution ActionRequest receiver 与 adapter/router 绑定边界。扩展 Codex/CC adapter shape tests，
+  证明 route 先绑定、完整 flush 才 AppliedAck、persist 映射正确、未验证 CC wire 不会暴露
+  production capability。
+- [ ] Step 5: 实现 conversation-owned ApprovalSupervisor、默认/能力 deadline、8次/60s backoff、
+  same-decision manual retry、disconnect independence 与精确 receipt；测试使用共享 manual clock+
+  paused Tokio time，不得等待真实 60 秒。
+- [ ] Step 6: 把 command terminal 与 approval expiry 合并进同一个 Safety transaction，并接好
+  deadline expiry/actor shutdown。P3.5 recovery 只加载并认证 active approval，发现 Started turn
+  保持 RecoveryBlocked且绝不启动 worker；不得在没有 process fencing 证据时自行标 Interrupted。
+- [ ] Step 7: 重跑
+  `cargo test -p agentdeckd --test runtime_approval -- --test-threads=1`、
+  `cargo test -p agentdeckd --test codex_adapter_shape`、
+  `cargo test -p agentdeckd --test cc_adapter_shape` 与 `cargo test -p agentdeckd`。 Expected: 16 项
+  approval tests 全绿；状态/event/ledger 一致；没有真实时间等待或 live vendor login 依赖。
+- [ ] Step 8: 更新 approval/authorization/delivery failure code、schema v3 migration/恢复说明、
+  手动 QA 与架构不变量；运行 `cargo fmt --check`、目标范围 clippy、
+  `scripts/verify-agent-docs.sh` 与 `git diff --check`。
+- [ ] Step 9: 提交。 `git add agentdeckd agentdeck-protocol/src/runtime/failure.rs ARCHITECTURE.md docs/AGENT_DIAGNOSTICS.md docs/QUALITY.md && git commit -m "feat(daemon): 实现 approval first-wins 与投递恢复"`
+
+**P3.7 依赖边界：** P3.5 的退出门禁是 schema/CAS/permission/worker/receipt 与 production
+capability contract 在 fake execution 上全部可证；它不得用当前 in-process adapter spawn 冒充真实
+vendor 闭环。P3.7 必须实现 blocked exec-gate、把 canonical adapter event receiver 接入
+`RuntimeExecutionEvent`、在精确 transient session 上 mint `BoundApprovalDelivery`、完成真实
+Codex/Claude Code gated approval，并在 orphan process group 已确认 fenced 后，使用 P3.5 的同一
+terminal+expiry transaction 写 Interrupted+Expired。任何 Started turn 尚未证明 fenced 时，
+P3.5 recovery 都保持 RecoveryBlocked、绝不恢复 approval delivery 或后续 Accepted command。
 
 ### Task P3.6：实现 canonical event/catalog、SubscriptionBarrier、backfill/snapshot
 

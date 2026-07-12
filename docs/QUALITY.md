@@ -623,6 +623,52 @@ session id。未设置 `AGENTDECK_E2E=1` 时，真实 CLI/model/history smoke �
   `--ephemeral --no-remote --profile dev`，并从 child environment 删除
   `AGENTDECK_DATA_DIR` / `AGENTDECK_PROFILE`；P3.9 UDS cutover 前不触碰 stable namespace。
 
+## Relay Companion MVP P3.4 RuntimeCore 门禁
+
+P3.4 证明 transport-neutral Core、journal actor 与 Runtime v1 精确契约；production execution
+仍固定 fail-closed，不能把 fake coordinator 当作 P3.7 vendor exec 证据：
+
+```bash
+# Core/actor/connection/read pool + 100路Start single-flight
+cargo test -p agentdeckd --lib runtime:: -- --test-threads=1
+cargo test -p agentdeckd --test runtime_core -- --test-threads=1
+
+# Accepted cancel/revoke、compact receipt、Start replay/COMMIT unknown
+cargo test -p agentdeckd --test runtime_store_p34 -- --test-threads=1
+
+# Rust/Swift wire、schema、fixture
+cargo test -p agentdeck-protocol -- --test-threads=1
+swift test --filter RuntimeV1ProtocolTests
+
+# P3.4 production新增范围 lint；allow 项是仓库既有 trunk/CC/Codex lint，不能扩展
+cargo clippy -p agentdeckd --all-targets -- -D warnings \
+  -A clippy::large-enum-variant -A clippy::collapsible-if \
+  -A clippy::collapsible-str-replace -A clippy::derivable-impls \
+  -A clippy::unwrap-or-default -A clippy::needless-borrows-for-generic-args \
+  -A clippy::doc-lazy-continuation
+
+cargo fmt --all -- --check
+bash scripts/check-daemon-no-net.sh
+git diff --check
+scripts/verify-agent-docs.sh
+```
+
+门禁必须覆盖：Start 与首 prompt 分离、100 路同 key 只能 1 Created + 99 Replayed、跨重启
+replay bit 与稳定 IDs；QueryReceipt 的 conversation+owner 双绑定及八种 CommandStatus；同
+conversation journal FIFO/单 active、跨 conversation 并行、有界 control 公平点；共享强
+authorization lease、无 lost wakeup、runner Started 前二次 guard、Accepted revoke/cancel
+Safety transaction；恢复 finish 前不调度、P4 前 remote Accepted fail-close；512 frames/16 MiB
+预算保持到 socket flush ACK、未 ACK drop 清 registry；ReadPool 满载立即 overload；prepare
+cancel/fence/release 失败都 cancel blocked gate；cold release capability 只能消费 durable release
+COMMIT permit 后产生 completion future；permit 精确绑定 command/boot/nonce，completion 成功前
+精确 process group 已 reap/fence；1,024 conversation/actor、128 writer、1,024 principal lease
+硬上界；Core 先 Closing+operation/start-lease quiescence、后发布 Draining，且 shutdown 后
+actor/writer/router ownership 归零。
+
+P3.4 production coordinator 必须保持 disabled，因此测试中 fake process identity 只用于验证
+store/actor ordering，不能作为真实 vendor 运行证据。真实 `agentdeckd --exec-gate` 属于 P3.7；
+stable Keychain signed roundtrip 仍受 P3.1 provisioning 外部门禁阻塞。
+
 ## AppKit 重写后的验证清单
 
 前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。
@@ -741,6 +787,7 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P0 基线或 v1 reset | 迭代时跑 `bash scripts/tests/reset-relay-v1-dev-state.sh`；提交前跑一次 `bash scripts/verify-relay-companion-mvp.sh p0` |
 | Relay Companion MVP P3.1 daemon namespace / singleton / StorageKEK | 运行本页 P3.1 聚焦矩阵、`cargo test -p agentdeckd`、CLI/Swift transport tests、daemon no-net；stable Keychain 必须另有真实 provisioned signed helper 证据，ignored 不算通过 |
 | Relay Companion MVP P3.2/P3.3 Runtime SQLite / journal / adapter 私表 | 运行本页十四组 store/boundary tests（含真实 256 MiB、paged recovery 与 v1→v2 migration）、canonical router/双 adapter tests、`cargo test -p agentdeckd -- --test-threads=1`、daemon no-net、fmt/clippy/diff/docs；只证明组件，不冒充 RuntimeCore/UDS/Companion E2E |
+| Relay Companion MVP P3.4 RuntimeCore / principal / actor | 运行本页 P3.4 Core+Store+Rust/Swift contract 矩阵、100 路 Start 竞态、daemon 全回归、no-net/fmt/clippy/diff/docs；production execution 必须 disabled，不能冒充 P3.7 exec-gate 或 P3.8/P3.9 UDS E2E |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试
