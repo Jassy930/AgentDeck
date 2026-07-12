@@ -973,7 +973,9 @@ P4 auth ledger 前明确 RecoveryBlocked。真实 vendor exec 仍严格属于 P3
   边界与架构不变量已更新；独立 final review 结论 PASS、无剩余 P0/P1/P2。最终
   `cargo fmt --all -- --check`、目标范围 `cargo clippy -p agentdeckd --all-targets ... -D warnings`、
   `bash scripts/check-daemon-no-net.sh`、`scripts/verify-agent-docs.sh` 与 `git diff --check` 全部通过。
-- [ ] Step 9: 提交。 `git add agentdeckd agentdeck-protocol/src/runtime/failure.rs ARCHITECTURE.md docs/AGENT_DIAGNOSTICS.md docs/QUALITY.md && git commit -m "feat(daemon): 实现 approval first-wins 与投递恢复"`
+- [x] Step 9: 已提交 `0609152 feat(daemon): 实现 approval first-wins 与投递恢复`。提交前 staged
+  diff 仅包含 P3.5 runtime/store/protocol failure code、测试与同步文档，无构建产物、运行日志或
+  secret。
 
 **P3.5 当前收口事实（2026-07-13，最终复核前）：** schema v3、approval row/ledger authenticated
 integrity、1 MiB/active safety reserve、SQLite first-wins、exact COMMIT-unknown replay、
@@ -987,7 +989,7 @@ open/recovery 完整性审计已改为全 catalog conversation 分批、每批�
 完整 canonical request 只留 keyed digest，event chain 按 eventSeq 常量空间归约，零-row orphan event
 仍 fail-close。最终 daemon lib 253/253、approval store 30/30、聚合 16/16、Rust protocol 全包与
 Swift Runtime 19/19 均通过；全回归、clippy/fmt/no-net/docs/diff 门禁和独立 review 已闭环。只剩
-Step 9 scoped commit。P3.7 的 exec-gate、真实
+P3.5 已由 `0609152` 收口。P3.7 的 exec-gate、真实
 RuntimeExecutionEvent 绑定与 live Codex/Claude Code approval 明确未完成。
 
 **P3.7 依赖边界：** P3.5 的退出门禁是 schema/CAS/permission/worker/receipt 与 production
