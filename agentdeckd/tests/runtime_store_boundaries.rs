@@ -108,6 +108,7 @@ fn runtime_id(kind: RuntimeIdKind, sequence: u32) -> RuntimeId {
         RuntimeIdKind::Command => 3,
         RuntimeIdKind::Turn => 4,
         RuntimeIdKind::Event => 5,
+        RuntimeIdKind::Approval => 8,
         RuntimeIdKind::AdapterState => 6,
         RuntimeIdKind::DaemonBoot => 7,
     };
@@ -234,6 +235,8 @@ type RawRuntimeLedger = (
     i64,
     i64,
     i64,
+    i64,
+    i64,
 );
 
 type RawCommandMetadata = (
@@ -331,6 +334,8 @@ fn runtime_ledger_token(
         fence_count,
         codex_adapter_state_count,
         claude_code_adapter_state_count,
+        approval_count,
+        active_approval_count,
         accepted_count,
         accepted_payload_bytes,
         started_without_fence_count,
@@ -340,7 +345,8 @@ fn runtime_ledger_token(
         .query_row(
             "SELECT catalog_high_water, conversation_count, command_count, event_count,
                     intent_count, fence_count, codex_adapter_state_count,
-                    claude_code_adapter_state_count, accepted_count, accepted_payload_bytes,
+                    claude_code_adapter_state_count, approval_count, active_approval_count,
+                    accepted_count, accepted_payload_bytes,
                     started_without_fence_count, started_without_release_count,
                     started_released_count
              FROM runtime_meta WHERE singleton = 1",
@@ -360,11 +366,13 @@ fn runtime_ledger_token(
                     row.get(10)?,
                     row.get(11)?,
                     row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
                 ))
             },
         )
         .expect("read Runtime authenticated ledger fixture");
-    let mut message = Vec::with_capacity(133);
+    let mut message = Vec::with_capacity(149);
     message.extend_from_slice(&database_id);
     match catalog_high_water {
         None => message.push(0),
@@ -381,6 +389,8 @@ fn runtime_ledger_token(
         fence_count,
         codex_adapter_state_count,
         claude_code_adapter_state_count,
+        approval_count,
+        active_approval_count,
         accepted_count,
         accepted_payload_bytes,
         started_without_fence_count,
@@ -394,7 +404,7 @@ fn runtime_ledger_token(
         );
     }
     *key_bundle
-        .blind_index(b"runtime.meta.ledger.v2", &message)
+        .blind_index(b"runtime.meta.ledger.v3", &message)
         .expect("authenticate Runtime boundary ledger")
         .as_bytes()
 }

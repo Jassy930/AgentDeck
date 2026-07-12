@@ -1,6 +1,7 @@
 //! Runtime SQLite journal：单 worker、严格 schema 与行级加密。
 
 pub(crate) mod admission;
+mod approval;
 pub mod cipher;
 pub mod identity;
 mod journal;

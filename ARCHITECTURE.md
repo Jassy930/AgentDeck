@@ -563,6 +563,59 @@ conversation/key，不能伪造身份连续性。
   actor start lease，之后才公开 Draining；因此 Draining 可见后 durable Started 不再增长。P3.7
   前 production coordinator 固定 disabled，不得用 fake PID/fence 把 Accepted 伪装成真实执行。
 
+### Relay Companion MVP P3.5 approval 不变量
+
+- Runtime DB physical schema v3 在 v2 九表基础上只增加 `approval_ledger`，crypto context 仍冻结为
+  v1；fresh、authenticated v1→v3 与 v2→v3 migration 都不得重加密既有 row 或重包 wrapped
+  key bundle。`runtime_meta.approval_count/active_approval_count` 纳入
+  `runtime.meta.ledger.v3` MAC；approval row 的 sealed request/policy/decision/status、blind token、
+  deadline、attempt 坐标、state/event linkage 还要通过独立 metadata MAC 与 AEAD readback。
+  任一 row、event、attempt、deadline、decision token 或 ledger count 不一致都 fail-close。open/recovery
+  的完整性扫描按全部 conversation 分批：每条完整 record 认证后立即压成 keyed request digest 的
+  compact projection，每批最多 16 MiB；event 按 `eventSeq` 单次流式归约，单链只保留固定尺寸
+  accumulator。禁止把全部解密 request/status 或无限 manual-retry event chain 同时留在内存。
+- 每个 active approval（Pending/Claimed/Applying/DeliveryFailed）固定预留 1 MiB terminal safety
+  obligation；注册新 Pending 的普通准入先投影“当前 obligation + 新增 1 MiB”，Applied/Expired 才
+  递减 active count。注册 Pending、写 canonical ActionRequest event、推进 event high-water 与两个
+  approval ledger count 必须同事务；普通写被 DiskLow/SafetyOnly 拒绝后，既有 approval 的安全收口
+  仍必须使用预留空间独立准入。
+- approval first-wins 的正确性只来自 SQLite `BEGIN IMMEDIATE` + authenticated row 的条件 CAS，
+  不依赖 actor 串行。claim 事务同时校验 conversation/Started turn/approval/requestId、冻结 policy、
+  decision/persist 与持有到 COMMIT 的 `ApprovalAuthorizationGuard`；后到 writer 只能观察不可变赢家
+  与精确状态。Pending 过期没有赢家，返回 `Expired`；Claimed 后过期保留赢家，返回
+  `AlreadyHandled(winner, Expired)`，不得伪造 decision。
+- conversation actor 持有 daemon-owned、按 approvalId 唯一的 delivery single-flight；connection
+  disconnect 或赢家 principal 随后 revoke 都不能取消已 COMMIT 的赢家。每轮最多 8 次、总预算
+  60 秒，默认 deadline 是 request time + 30 分钟；下一次 attempt 会越过轮次预算或更短 capability
+  deadline 时不得启动。自动预算耗尽进入 DeliveryFailed；显式 `RetryApproval` 只能重用 sealed
+  winner，开始新 round，不能带入替换 decision。actor 对 Claim/Retry/Register 只在收到与当前
+  mutation 完全匹配的 `CommitOutcomeUnknown` 时，用原 stable input 精确重试；其他 operation 或错误
+  必须直接 fail-close，且在 outcome 收敛前不得安装 route 或启动 worker。
+- adapter 只有在完整 response write + newline + flush 成功后才可返回 `AppliedAck`。部分写、flush
+  状态不明或 route 不明统一视为 `OutcomeUnknown`，停止自动重投并 durable 写 DeliveryFailed；
+  Applied COMMIT outcome unknown 只可重试 store safety transaction，不能再次调用 adapter。
+  每次 BeginApprovalAttempt COMMIT 成功或 exact replay 后必须重新读取时钟，并同时核对持久化
+  deadline 与 round budget；已经到达/越过边界时只做 store-only Expired/DeliveryFailed 收口，绝不
+  调用 adapter。store 在无锁 preflight 与 `BEGIN IMMEDIATE` authenticated reload 后都必须拒绝
+  早于 `max(stateChanged, roundStarted, lastAttempt)` 的时钟，回退时不得签发 attempt permit。
+  adapter 已产生结果但 durable closure 无法安全收敛时返回 `FatalClosure`，当前
+  generation 的 completion 必须令 actor 进入 RecoveryBlocked、停止全部 approval task 且禁止重投；
+  route 已 terminal cleanup 或 generation 已变化的迟到 completion 一律视为 stale。worker panic 也
+  必须被监督并清除 single-flight，不能拖垮 actor 或把 route 永久占住。
+- Completed/Failed/Interrupted 与同一 turn 的全部非 Applied approval Expired、canonical events、
+  high-water 和 ledger 更新必须在一个 Safety transaction 内提交；先 durable terminal+expiry，后
+  cancel/await delivery worker。terminal COMMIT outcome unknown 只能以同一 completion input 精确
+  重放到 `Completed/Replayed`，不得把已提交完成的 conversation 永久误锁为 RecoveryBlocked。
+  P3.5 recovery 只认证 active approval；只要 Started process group
+  尚无 fencing 证据，就保持 RecoveryBlocked、停止 delivery 且不伪造 Expired/Interrupted，也不
+  恢复后续 Accepted。
+- Codex approval route 已按精确 active session/request 绑定，kind/persist 完整映射，只有整帧
+  newline+flush 后才移除 route；错误或不明 outcome 保留 route 并 fail-close。Claude Code 的
+  speculative permission wire 尚无 recorded fixture/live gate，因此 production capabilities 仍
+  隐藏 Approval。P3.5 仅用 side-effect-free fake 验证 common store/actor/worker；真实
+  `RuntimeExecutionEvent`、exec-gate 与 Codex/Claude Code live vendor approval 仍属于 P3.7，不能
+  作为本阶段已完成能力宣传。
+
 ### R1a 隐含约束（历史参考）
 
 - **R1a machine_id ≡ device_id**：`server/ws.rs::connect` 用 `device.device_id` 作 `ConnRole::Machine.machine_id`，`router.rs` RegisterMachine 授权强制 `machine.machine_id == connection.machine_id`——**enrolled 的 machine 设备的 `machine_id` 严格等于 `device_id`**。CLI 生成的随机 `device_id = "cli-<profile>-<random>"` 会锁定 R2 daemon remote-mode 里对应 machine 的 identifier；R2 设计需评估是否解耦 machine_id 与 device_id（例如 machine 元数据里显式携带独立 machine_id）。

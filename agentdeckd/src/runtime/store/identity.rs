@@ -17,6 +17,7 @@ pub enum RuntimeIdKind {
     Command,
     Turn,
     Event,
+    Approval,
     AdapterState,
     DaemonBoot,
 }
@@ -29,6 +30,7 @@ impl fmt::Display for RuntimeIdKind {
             Self::Command => "command",
             Self::Turn => "turn",
             Self::Event => "event",
+            Self::Approval => "approval",
             Self::AdapterState => "adapter-state",
             Self::DaemonBoot => "daemon-boot",
         })
@@ -156,4 +158,17 @@ pub fn allocate_unique_runtime_id(
         kind,
         attempts: MAX_RUNTIME_ID_COLLISION_ATTEMPTS,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_id_kind_has_a_neutral_stable_label() {
+        assert_eq!(RuntimeIdKind::Approval.to_string(), "approval");
+        let id = RuntimeId::from_bytes(RuntimeIdKind::Approval, [0xa5; 16])
+            .expect("non-zero approval id");
+        assert_eq!(id.kind(), RuntimeIdKind::Approval);
+    }
 }

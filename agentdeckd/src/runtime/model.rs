@@ -7,10 +7,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agentdeck_protocol::AgentKind;
+use agentdeck_protocol::{ActionDecision, ActionRequest, AgentKind};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::approval::{ApprovalClaimantBinding, ApprovalPolicySnapshot};
 use super::store::admission::SystemRuntimeCapacityProbe;
 pub use super::store::admission::{
     RuntimeCapacityObservation, RuntimeCapacityProbe, RuntimeCapacityProbeError,
@@ -52,6 +53,12 @@ pub const MAX_EXECUTION_NONCE_BYTES: usize = 1024;
 pub const MAX_RECOVERY_PAGE_RETAINED_BYTES: usize = 80 * 1024 * 1024;
 pub const COMMAND_QUEUE_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 pub const COMMAND_LEDGER_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+pub const MAX_APPROVAL_REQUEST_BYTES: usize = 256 * 1024;
+pub const MAX_APPROVAL_DECISION_BYTES: usize = 64 * 1024;
+pub const MAX_APPROVAL_STATUS_DETAIL_BYTES: usize = 64 * 1024;
+pub const MAX_ACTIVE_APPROVALS_PER_TURN: u32 = 32;
+pub const MAX_ACTIVE_APPROVALS_GLOBAL: u64 = 1_024;
+pub const MAX_DURABLE_APPROVALS: u64 = 32_768;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeStoreOperation {
@@ -81,6 +88,20 @@ pub enum RuntimeStoreOperation {
     CompleteCommandAfterCommit,
     BindAdapterStateBeforeCommit,
     BindAdapterStateAfterCommit,
+    RegisterApprovalBeforeCommit,
+    RegisterApprovalAfterCommit,
+    ClaimApprovalBeforeCommit,
+    ClaimApprovalAfterCommit,
+    BeginApprovalAttemptBeforeCommit,
+    BeginApprovalAttemptAfterCommit,
+    MarkApprovalAppliedBeforeCommit,
+    MarkApprovalAppliedAfterCommit,
+    MarkApprovalDeliveryFailedBeforeCommit,
+    MarkApprovalDeliveryFailedAfterCommit,
+    RetryApprovalDeliveryBeforeCommit,
+    RetryApprovalDeliveryAfterCommit,
+    ExpireApprovalBeforeCommit,
+    ExpireApprovalAfterCommit,
 }
 
 pub trait RuntimeStoreFaultInjector: Send + Sync {
@@ -296,6 +317,13 @@ pub enum RuntimeCommitOperation {
     AuthorizeExecutionRelease,
     CompleteCommand,
     BindAdapterState,
+    RegisterApproval,
+    ClaimApproval,
+    BeginApprovalAttempt,
+    MarkApprovalApplied,
+    MarkApprovalDeliveryFailed,
+    RetryApprovalDelivery,
+    ExpireApproval,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -686,6 +714,206 @@ pub enum CompleteOutcome {
     Replayed {
         command: CommandRecord,
         event: EventRecord,
+    },
+}
+
+#[allow(dead_code)] // P3.5 store/actor 接线在本 task 后续步骤完成。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ApprovalState {
+    Pending,
+    Claimed,
+    Applying,
+    Applied,
+    DeliveryFailed,
+    Expired,
+}
+
+#[allow(dead_code)] // P3.5 store/actor 接线在本 task 后续步骤完成。
+impl ApprovalState {
+    #[must_use]
+    pub(crate) const fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Pending | Self::Claimed | Self::Applying | Self::DeliveryFailed
+        )
+    }
+
+    #[must_use]
+    pub(crate) const fn is_terminal(self) -> bool {
+        matches!(self, Self::Applied | Self::Expired)
+    }
+}
+
+/// approval request 与注册时 policy 的单一 canonical sealed payload。
+#[allow(dead_code)] // P3.5 store/actor 接线在本 task 后续步骤完成。
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ApprovalRequestEnvelope {
+    pub(crate) request: ActionRequest,
+    pub(crate) policy: ApprovalPolicySnapshot,
+}
+
+impl std::fmt::Debug for ApprovalRequestEnvelope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApprovalRequestEnvelope")
+            .field("request", &"[REDACTED]")
+            .field("policy", &self.policy)
+            .finish()
+    }
+}
+
+#[allow(dead_code)] // P3.5 store/actor 接线在本 task 后续步骤完成。
+#[derive(Clone)]
+pub(crate) struct ApprovalRecord {
+    pub(crate) approval_id: RuntimeId,
+    pub(crate) conversation_id: RuntimeId,
+    pub(crate) command_id: RuntimeId,
+    pub(crate) turn_id: RuntimeId,
+    pub(crate) state: ApprovalState,
+    pub(crate) request: ActionRequest,
+    pub(crate) policy: ApprovalPolicySnapshot,
+    pub(crate) decision: Option<ActionDecision>,
+    pub(crate) requested_at_ms: u64,
+    pub(crate) deadline_at_ms: u64,
+    pub(crate) claimed_at_ms: Option<u64>,
+    pub(crate) state_changed_at_ms: u64,
+    pub(crate) delivery_round: u32,
+    pub(crate) attempts_in_round: u8,
+    pub(crate) round_started_at_ms: Option<u64>,
+    pub(crate) last_attempt_at_ms: Option<u64>,
+    pub(crate) state_version: u64,
+    pub(crate) last_event_id: RuntimeId,
+    pub(crate) status_detail: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for ApprovalRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApprovalRecord")
+            .field("approval_id", &self.approval_id)
+            .field("conversation_id", &self.conversation_id)
+            .field("command_id", &self.command_id)
+            .field("turn_id", &self.turn_id)
+            .field("state", &self.state)
+            .field("request", &"[REDACTED]")
+            .field("decision", &self.decision.as_ref().map(|_| "[REDACTED]"))
+            .field("requested_at_ms", &self.requested_at_ms)
+            .field("deadline_at_ms", &self.deadline_at_ms)
+            .field("delivery_round", &self.delivery_round)
+            .field("attempts_in_round", &self.attempts_in_round)
+            .field("state_version", &self.state_version)
+            .field("last_event_id", &self.last_event_id)
+            .field(
+                "status_detail_bytes",
+                &self.status_detail.as_ref().map(std::vec::Vec::len),
+            )
+            .finish()
+    }
+}
+
+#[allow(dead_code)] // P3.5 store/actor 接线在本 task 后续步骤完成。
+pub(crate) struct RegisterApproval {
+    pub(crate) conversation_id: RuntimeId,
+    pub(crate) command_id: RuntimeId,
+    pub(crate) turn_id: RuntimeId,
+    pub(crate) request: ActionRequest,
+    pub(crate) policy: ApprovalPolicySnapshot,
+}
+
+#[allow(dead_code)] // P3.5 store/actor 接线在本 task 后续步骤完成。
+#[derive(Clone, Debug)]
+pub(crate) enum RegisterApprovalOutcome {
+    Registered {
+        approval: ApprovalRecord,
+        event: EventRecord,
+    },
+    Replayed {
+        approval: ApprovalRecord,
+        event: EventRecord,
+    },
+}
+
+#[allow(dead_code)] // P3.5 store/actor 接线在本 task 后续步骤完成。
+pub(crate) struct ClaimApproval {
+    pub(crate) conversation_id: RuntimeId,
+    pub(crate) turn_id: RuntimeId,
+    pub(crate) approval_id: RuntimeId,
+    pub(crate) decision: ActionDecision,
+    pub(crate) claimant_binding: ApprovalClaimantBinding,
+}
+
+#[allow(dead_code)] // P3.5 store/actor 接线在本 task 后续步骤完成。
+pub(crate) struct BeginApprovalAttempt {
+    pub(crate) approval_id: RuntimeId,
+    pub(crate) delivery_round: u32,
+    pub(crate) expected_attempts_in_round: u8,
+}
+
+/// daemon 私有的 delivery permit 结果。
+///
+/// `Permitted` 始终表示调用方必须消费一次 vendor delivery permit；
+/// `replayed=true` 表示该 permit 来自 begin commit-unknown 的 exact retry，调用方尚未
+/// 执行 vendor side effect，仍必须执行一次。single-flight actor 保证 permit 不会被并发消费。
+#[allow(dead_code)] // P3.5 actor 接线在本 task 后续步骤完成。
+#[derive(Clone, Debug)]
+pub(crate) enum BeginApprovalAttemptOutcome {
+    Permitted {
+        approval: ApprovalRecord,
+        event: Option<EventRecord>,
+        replayed: bool,
+    },
+    AlreadyHandled {
+        approval: ApprovalRecord,
+    },
+    ExpiredOrStale {
+        approval: ApprovalRecord,
+    },
+}
+
+#[allow(dead_code)] // P3.5 store/actor 接线在本 task 后续步骤完成。
+pub(crate) struct MarkApprovalApplied {
+    pub(crate) approval_id: RuntimeId,
+    pub(crate) delivery_round: u32,
+    pub(crate) attempt: u8,
+}
+
+#[allow(dead_code)] // P3.5 store/actor 接线在本 task 后续步骤完成。
+pub(crate) struct MarkApprovalDeliveryFailed {
+    pub(crate) approval_id: RuntimeId,
+    pub(crate) delivery_round: u32,
+    pub(crate) attempt: u8,
+    pub(crate) status_detail: Vec<u8>,
+}
+
+#[allow(dead_code)] // P3.5 store/actor 接线在本 task 后续步骤完成。
+pub(crate) struct RetryApprovalDelivery {
+    pub(crate) conversation_id: RuntimeId,
+    pub(crate) approval_id: RuntimeId,
+}
+
+#[allow(dead_code)] // P3.5 store/actor 接线在本 task 后续步骤完成。
+pub(crate) struct ExpireApproval {
+    pub(crate) conversation_id: RuntimeId,
+    pub(crate) approval_id: RuntimeId,
+}
+
+#[allow(dead_code)] // P3.5 store/actor 接线在本 task 后续步骤完成。
+#[derive(Clone, Debug)]
+pub(crate) enum ApprovalMutationOutcome {
+    Transitioned {
+        approval: ApprovalRecord,
+        event: EventRecord,
+    },
+    Replayed {
+        approval: ApprovalRecord,
+        event: Option<EventRecord>,
+    },
+    AlreadyHandled {
+        approval: ApprovalRecord,
+    },
+    ExpiredOrStale {
+        approval: ApprovalRecord,
     },
 }
 

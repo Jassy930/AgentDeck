@@ -669,6 +669,91 @@ P3.4 production coordinator 必须保持 disabled，因此测试中 fake process
 store/actor ordering，不能作为真实 vendor 运行证据。真实 `agentdeckd --exec-gate` 属于 P3.7；
 stable Keychain signed roundtrip 仍受 P3.1 provisioning 外部门禁阻塞。
 
+## Relay Companion MVP P3.5 approval 门禁
+
+P3.5 的退出证据来自 daemon-private Rust unit/store/actor/fault tests。固定 16 项
+`runtime_approval` 是聚合 gate：它逐项锁定接口、关键实现 seam 和 wire receipt shape，补足
+private API 无法从 integration crate 直接调用的边界，但其中的 `include_str!`/source-shape 断言
+本身不是行为证明。不得只跑这 16 项就宣称 CAS、COMMIT unknown、worker 或 terminal safety
+事务通过；对应私有行为测试必须一起全绿。
+
+```bash
+# 固定 16 项聚合 gate（包含 source-shape 补充，不单独作为行为证据）
+cargo test -p agentdeckd --test runtime_approval -- --test-threads=1
+
+# schema v3、migration、1 MiB/active safety reserve 与 approval store/fault 行为
+cargo test -p agentdeckd --lib runtime::store::schema::tests:: -- --test-threads=1
+cargo test -p agentdeckd --lib runtime::store::sqlite::tests:: -- --test-threads=1
+cargo test -p agentdeckd --lib runtime::store::approval::tests:: -- --test-threads=1
+cargo test -p agentdeckd --test runtime_store -- --test-threads=1
+
+# permission、policy、8 次/60 秒 worker、actor single-flight/recovery/terminal ordering
+cargo test -p agentdeckd --lib runtime::connection::tests:: -- --test-threads=1
+cargo test -p agentdeckd --lib runtime::approval::tests:: -- --test-threads=1
+cargo test -p agentdeckd --lib runtime::conversation::tests:: -- --test-threads=1
+cargo test -p agentdeckd --lib runtime::core::tests:: -- --test-threads=1
+
+# adapter write+newline+flush、route retention/single-flight 与 CC capability gate
+cargo test -p agentdeckd --lib codex::adapter::tests:: -- --test-threads=1
+cargo test -p agentdeckd --lib claude_code::adapter::tests:: -- --test-threads=1
+cargo test -p agentdeckd --lib claude_code::capabilities::tests:: -- --test-threads=1
+cargo test -p agentdeckd --test codex_adapter_shape \
+  --test cc_adapter_shape -- --test-threads=1
+
+# Runtime receipt/schema/fixture 与 daemon 全回归；显式禁止误入 live vendor smoke
+cargo test -p agentdeck-protocol -- --test-threads=1
+swift test --filter RuntimeV1ProtocolTests
+env -u AGENTDECK_E2E cargo test -p agentdeckd -- --test-threads=1
+
+# 静态边界与文档
+cargo fmt --all -- --check
+cargo clippy -p agentdeckd --all-targets -- -D warnings \
+  -A clippy::large-enum-variant -A clippy::collapsible-if \
+  -A clippy::collapsible-str-replace -A clippy::derivable-impls \
+  -A clippy::unwrap-or-default -A clippy::needless-borrows-for-generic-args \
+  -A clippy::doc-lazy-continuation
+bash scripts/check-daemon-no-net.sh
+git diff --check
+scripts/verify-agent-docs.sh
+```
+
+行为门禁至少逐项证明：
+
+- schema v3 fresh/v1→v3/v2→v3 migration 保留 crypto context v1 与既有 ciphertext；
+  approval row AEAD/metadata MAC、event linkage、deadline/attempt/decision token、
+  `approval_count/active_approval_count` ledger MAC 的任一 tamper 都 fail-close；每个 active approval
+  预留 1 MiB，普通注册低空间拒绝后 terminal safety lane 仍可收口。open/recovery 必须按全部
+  conversation 分批、最多 16 MiB compact projection，并用 keyed full-request digest + 有序常量空间
+  event fold 验证无限 manual retry；不得收集全部解密 record/event，零-row orphan event 也要拒绝。
+- Pending 注册与 ActionRequest event/high-water/count 原子；100 路 Resolve 只有一个 SQLite CAS
+  winner；每个 mutation 的 Before/AfterCommit exact retry 不产生第二个 winner、event 或 adapter
+  调用。actor 对 Register/Claim/Retry 只重试 operation 完全匹配的 `CommitOutcomeUnknown`，并始终
+  重用原 stable input；其他 outcome 不得安装 route 或启动 worker。Pending Expired 没有 decision；
+  Claimed 后 Expired 保留原 winner。
+- guard 覆盖 claim COMMIT，connection disconnect/revoke 不取消 daemon-owned delivery；每个
+  approval 只有一个 worker，panic 被监督且 route 可显式 retry；每轮最多 8 次/60 秒，默认
+  deadline 30 分钟，更短 capability deadline 阻止越界 attempt。Begin COMMIT 成功或 exact replay
+  后必须刷新时钟并复核持久化 deadline/round budget；越界时 adapter 调用数为 0，只走 store-only
+  Expired/DeliveryFailed。store preflight 与 `BEGIN IMMEDIATE` reload 两次都要对
+  `max(stateChanged, roundStarted, lastAttempt)` 做 ClockRegressed 校验；事务内回退不得改变 row、
+  event 或签发 permit。
+- `AppliedAck` 只在完整 write+newline+flush 后成立；`OutcomeUnknown`/永久失败转
+  DeliveryFailed 且不自动重投，manual retry 只能重用 sealed winner；Applied COMMIT unknown 只
+  重试 store。adapter 已产生结果但 durable closure 无法安全收敛的 `FatalClosure` 必须让当前 actor
+  进入 RecoveryBlocked、清理 approval task 且禁止重投。Completed/Failed/Interrupted 与同 turn
+  全部非 Applied approval Expired 必须同一 Safety transaction，先 durable 收口再 cancel/await
+  worker；Applied 不得被 terminal transaction 改写。terminal AfterCommit unknown 必须用同一
+  completion input 精确重放后正常清 route/启动 successor；route 不存在或 generation 不匹配的迟到
+  FatalClosure 必须忽略，不能污染已经 terminal 的 conversation。
+- RecoveryBlocked 只停止进程内 worker，不恢复 active delivery，也不在缺少 process fencing 证据
+  时伪造 Expired/Interrupted。Codex adapter shape 证明精确 route 和 kind/persist/flush；CC
+  production Approval capability 必须继续隐藏。
+
+P3.5 没有真实 vendor 或 UI 手动 QA 退出项：production coordinator、
+`RuntimeExecutionEvent` 与 `agentdeckd --exec-gate` 的真实接线属于 P3.7。未设置 live gate、没有
+Codex/CC 登录或没有公开 WSS 时，结果只能记为 GATED/BLOCKED，不能用 fake delivery、shape test
+或本地 compatibility stdio 冒充端到端通过。
+
 ## AppKit 重写后的验证清单
 
 前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。
@@ -788,6 +873,7 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P3.1 daemon namespace / singleton / StorageKEK | 运行本页 P3.1 聚焦矩阵、`cargo test -p agentdeckd`、CLI/Swift transport tests、daemon no-net；stable Keychain 必须另有真实 provisioned signed helper 证据，ignored 不算通过 |
 | Relay Companion MVP P3.2/P3.3 Runtime SQLite / journal / adapter 私表 | 运行本页十四组 store/boundary tests（含真实 256 MiB、paged recovery 与 v1→v2 migration）、canonical router/双 adapter tests、`cargo test -p agentdeckd -- --test-threads=1`、daemon no-net、fmt/clippy/diff/docs；只证明组件，不冒充 RuntimeCore/UDS/Companion E2E |
 | Relay Companion MVP P3.4 RuntimeCore / principal / actor | 运行本页 P3.4 Core+Store+Rust/Swift contract 矩阵、100 路 Start 竞态、daemon 全回归、no-net/fmt/clippy/diff/docs；production execution 必须 disabled，不能冒充 P3.7 exec-gate 或 P3.8/P3.9 UDS E2E |
+| Relay Companion MVP P3.5 approval CAS / delivery | 运行本页 P3.5 固定 16 项聚合 gate，并以 private schema/sqlite/store/permission/worker/actor fault tests 作为行为证据；补跑 adapter shape、Rust/Swift contract、daemon 全回归与静态边界。CC Approval 仍隐藏，fake delivery 不冒充 P3.7 exec-gate/live vendor E2E |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

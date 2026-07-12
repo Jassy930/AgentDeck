@@ -9,10 +9,53 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use agentdeck_protocol::ActionRequest;
+use tokio::sync::mpsc;
+
+use crate::runtime::approval::SharedApprovalDelivery;
 use crate::runtime::store::{
     AuthorizeExecutionRelease, CommandRecord, ConversationRecord, ExecutionFenceRecord, RuntimeId,
     TerminalState,
 };
+
+#[allow(dead_code)] // P3.5 conversation ApprovalSupervisor 接线后成为 production path。
+pub(crate) const RUNTIME_EXECUTION_EVENT_CAPACITY: usize = 64;
+
+#[allow(dead_code)] // P3.5 conversation ApprovalSupervisor 接线后成为 production path。
+pub(crate) enum RuntimeExecutionEvent {
+    ActionRequest {
+        request: ActionRequest,
+        delivery: SharedApprovalDelivery,
+    },
+}
+
+#[allow(dead_code)] // P3.5 conversation ApprovalSupervisor 接线后成为 production path。
+pub(crate) struct RuntimeExecutionEventReceiver {
+    receiver: mpsc::Receiver<RuntimeExecutionEvent>,
+}
+
+#[allow(dead_code)] // P3.5 conversation ApprovalSupervisor 接线后成为 production path。
+impl RuntimeExecutionEventReceiver {
+    pub(crate) async fn recv(&mut self) -> Option<RuntimeExecutionEvent> {
+        self.receiver.recv().await
+    }
+}
+
+#[allow(dead_code)] // P3.7 exec-gate coordinator mints the production sender。
+pub(crate) fn runtime_execution_event_channel() -> (
+    mpsc::Sender<RuntimeExecutionEvent>,
+    RuntimeExecutionEventReceiver,
+) {
+    let (sender, receiver) = mpsc::channel(RUNTIME_EXECUTION_EVENT_CAPACITY);
+    (sender, RuntimeExecutionEventReceiver { receiver })
+}
+
+#[allow(dead_code)] // side-effect-free coordinators use a closed stream。
+pub(crate) fn closed_execution_events() -> RuntimeExecutionEventReceiver {
+    let (sender, receiver) = runtime_execution_event_channel();
+    drop(sender);
+    receiver
+}
 
 #[allow(dead_code)] // 字段由 P3.7 production exec-gate coordinator 读取。
 #[derive(Clone, Debug)]
@@ -136,6 +179,8 @@ pub(crate) struct PreparedRuntimeExecution {
     pub(crate) process: RuntimeProcessIdentity,
     pub(crate) control: Arc<dyn RuntimeExecutionControl>,
     pub(crate) release: Box<dyn RuntimeExecutionRelease>,
+    #[allow(dead_code)] // P3.5 conversation ApprovalSupervisor consumes this stream。
+    pub(crate) events: RuntimeExecutionEventReceiver,
 }
 
 #[async_trait::async_trait]
@@ -231,5 +276,12 @@ mod tests {
         assert_eq!(permit.daemon_boot_id(), daemon_boot_id);
         assert_eq!(permit.execution_nonce(), request.execution_nonce);
         assert_eq!(permit.release_authorized_at_ms(), 44);
+    }
+
+    #[tokio::test]
+    async fn execution_approval_event_channel_is_bounded_and_closed_stream_terminates() {
+        assert_eq!(RUNTIME_EXECUTION_EVENT_CAPACITY, 64);
+        let mut events = closed_execution_events();
+        assert!(events.recv().await.is_none());
     }
 }

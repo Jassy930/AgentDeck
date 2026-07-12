@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use sha2::{Digest, Sha256};
 
 pub const RUNTIME_SCHEMA_FAMILY: &str = "agentdeck-runtime";
-pub const RUNTIME_SCHEMA_VERSION: u32 = 2;
+pub const RUNTIME_SCHEMA_VERSION: u32 = 3;
 /// 行密文与 wrapped key bundle 的 AAD context 版本。
 ///
 /// physical schema migration 只增表/增认证计数，不得让既有行重新加密或重新包装。
@@ -20,7 +20,19 @@ pub const EXPECTED_TABLES_V1: [&str; 7] = [
     "machine_enrollment_receipts",
     "runtime_meta",
 ];
-pub const EXPECTED_TABLES: [&str; 9] = [
+pub const EXPECTED_TABLES_V2: [&str; 9] = [
+    "claude_code_adapter_state",
+    "codex_adapter_state",
+    "commands",
+    "conversations",
+    "event_journal",
+    "execution_fences",
+    "execution_intents",
+    "machine_enrollment_receipts",
+    "runtime_meta",
+];
+pub const EXPECTED_TABLES: [&str; 10] = [
+    "approval_ledger",
     "claude_code_adapter_state",
     "codex_adapter_state",
     "commands",
@@ -33,6 +45,17 @@ pub const EXPECTED_TABLES: [&str; 9] = [
 ];
 
 pub fn schema_signature() -> [u8; 32] {
+    static SIGNATURE: OnceLock<[u8; 32]> = OnceLock::new();
+    *SIGNATURE.get_or_init(|| {
+        let mut digest = Sha256::new();
+        digest.update(RUNTIME_DDL_V1.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V2.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V3.as_bytes());
+        digest.finalize().into()
+    })
+}
+
+pub fn schema_signature_v2() -> [u8; 32] {
     static SIGNATURE: OnceLock<[u8; 32]> = OnceLock::new();
     *SIGNATURE.get_or_init(|| {
         let mut digest = Sha256::new();
@@ -245,3 +268,271 @@ CREATE TABLE claude_code_adapter_state (
         ON UPDATE RESTRICT ON DELETE RESTRICT
 );
 "#;
+
+/// v2 -> v3 只增 approval ledger 与两个 authenticated ledger totals。
+///
+/// 新字段的固定零 default 让 v1/v2 migration 都可以在单事务内完成 CAS token
+/// 升级；stable crypto context 仍为 v1，既有 wrapped key bundle 与密文不重写。
+pub const RUNTIME_MIGRATION_V3: &str = r#"
+ALTER TABLE runtime_meta ADD COLUMN approval_count INTEGER NOT NULL DEFAULT 0
+    CHECK(approval_count BETWEEN 0 AND 32768);
+ALTER TABLE runtime_meta ADD COLUMN active_approval_count INTEGER NOT NULL DEFAULT 0
+    CHECK(active_approval_count BETWEEN 0 AND 1024
+        AND active_approval_count <= approval_count);
+CREATE TABLE approval_ledger (
+    approval_id BLOB PRIMARY KEY
+        CHECK(typeof(approval_id) = 'blob' AND length(approval_id) = 16),
+    conversation_id BLOB NOT NULL
+        CHECK(typeof(conversation_id) = 'blob' AND length(conversation_id) = 16),
+    command_id BLOB NOT NULL
+        CHECK(typeof(command_id) = 'blob' AND length(command_id) = 16),
+    turn_id BLOB NOT NULL
+        CHECK(typeof(turn_id) = 'blob' AND length(turn_id) = 16),
+    request_token BLOB NOT NULL
+        CHECK(typeof(request_token) = 'blob' AND length(request_token) = 32),
+    decision_token BLOB
+        CHECK(decision_token IS NULL OR (
+            typeof(decision_token) = 'blob' AND length(decision_token) = 32
+        )),
+    claimant_token BLOB
+        CHECK(claimant_token IS NULL OR (
+            typeof(claimant_token) = 'blob' AND length(claimant_token) = 32
+        )),
+    state TEXT NOT NULL CHECK(state IN (
+        'pending', 'claimed', 'applying', 'applied', 'deliveryFailed', 'expired'
+    )),
+    requested_at_ms INTEGER NOT NULL CHECK(requested_at_ms >= 0),
+    deadline_at_ms INTEGER NOT NULL CHECK(deadline_at_ms >= requested_at_ms),
+    claimed_at_ms INTEGER
+        CHECK(claimed_at_ms IS NULL OR claimed_at_ms >= requested_at_ms),
+    state_changed_at_ms INTEGER NOT NULL
+        CHECK(state_changed_at_ms >= requested_at_ms),
+    delivery_round INTEGER NOT NULL
+        CHECK(delivery_round BETWEEN 0 AND 4294967295),
+    attempts_in_round INTEGER NOT NULL
+        CHECK(attempts_in_round BETWEEN 0 AND 8),
+    round_started_at_ms INTEGER CHECK(round_started_at_ms IS NULL OR (
+        claimed_at_ms IS NOT NULL AND round_started_at_ms >= claimed_at_ms
+    )),
+    last_attempt_at_ms INTEGER CHECK(last_attempt_at_ms IS NULL OR (
+        round_started_at_ms IS NOT NULL AND last_attempt_at_ms >= round_started_at_ms
+    )),
+    state_version INTEGER NOT NULL CHECK(state_version >= 1),
+    last_event_id BLOB NOT NULL UNIQUE
+        CHECK(typeof(last_event_id) = 'blob' AND length(last_event_id) = 16),
+    logical_request_bytes INTEGER NOT NULL
+        CHECK(logical_request_bytes BETWEEN 1 AND 262144),
+    logical_decision_bytes INTEGER NOT NULL
+        CHECK(logical_decision_bytes BETWEEN 0 AND 65536),
+    metadata_token BLOB NOT NULL
+        CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
+    sealed_request BLOB NOT NULL
+        CHECK(typeof(sealed_request) = 'blob'
+            AND length(sealed_request) BETWEEN 40 AND 262184),
+    sealed_decision BLOB CHECK(sealed_decision IS NULL OR (
+        typeof(sealed_decision) = 'blob'
+        AND length(sealed_decision) BETWEEN 40 AND 65576
+    )),
+    sealed_status_detail BLOB CHECK(sealed_status_detail IS NULL OR (
+        typeof(sealed_status_detail) = 'blob'
+        AND length(sealed_status_detail) BETWEEN 40 AND 65576
+    )),
+    CHECK(
+        (
+            decision_token IS NULL
+            AND claimant_token IS NULL
+            AND claimed_at_ms IS NULL
+            AND logical_decision_bytes = 0
+            AND sealed_decision IS NULL
+        ) OR (
+            decision_token IS NOT NULL
+            AND claimant_token IS NOT NULL
+            AND claimed_at_ms IS NOT NULL
+            AND logical_decision_bytes > 0
+            AND sealed_decision IS NOT NULL
+        )
+    ),
+    CHECK(
+        (
+            delivery_round = 0
+            AND attempts_in_round = 0
+            AND round_started_at_ms IS NULL
+            AND last_attempt_at_ms IS NULL
+        ) OR (
+            delivery_round >= 1
+            AND claimed_at_ms IS NOT NULL
+            AND round_started_at_ms IS NOT NULL
+            AND (
+                (attempts_in_round = 0 AND last_attempt_at_ms IS NULL)
+                OR (attempts_in_round >= 1 AND last_attempt_at_ms IS NOT NULL)
+            )
+        )
+    ),
+    CHECK(
+        (state = 'pending' AND decision_token IS NULL AND delivery_round = 0)
+        OR (state = 'claimed' AND decision_token IS NOT NULL AND delivery_round = 0)
+        OR (state = 'applying' AND decision_token IS NOT NULL AND delivery_round >= 1)
+        OR (state IN ('applied', 'deliveryFailed')
+            AND decision_token IS NOT NULL
+            AND delivery_round >= 1
+            AND attempts_in_round >= 1)
+        OR state = 'expired'
+    ),
+    CHECK(claimed_at_ms IS NULL OR state_changed_at_ms >= claimed_at_ms),
+    FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY(command_id) REFERENCES commands(command_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY(turn_id) REFERENCES execution_intents(turn_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY(last_event_id) REFERENCES event_journal(event_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+CREATE INDEX idx_approval_active_turn
+    ON approval_ledger(conversation_id, turn_id, state);
+CREATE INDEX idx_approval_deadline
+    ON approval_ledger(state, deadline_at_ms);
+CREATE UNIQUE INDEX idx_approval_request_per_turn
+    ON approval_ledger(turn_id, request_token);
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    #[test]
+    fn approval_physical_schema_advances_to_v3_without_rotating_crypto_context() {
+        assert_eq!(RUNTIME_SCHEMA_VERSION, 3);
+        assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
+        assert_eq!(EXPECTED_TABLES.len(), 10);
+        assert!(EXPECTED_TABLES.contains(&"approval_ledger"));
+    }
+
+    fn v3_connection() -> Connection {
+        let connection = Connection::open_in_memory().expect("open in-memory schema");
+        connection
+            .execute_batch(RUNTIME_DDL_V1)
+            .expect("create v1 schema");
+        connection
+            .execute_batch(RUNTIME_MIGRATION_V2)
+            .expect("apply v2 migration");
+        connection
+            .execute_batch(RUNTIME_MIGRATION_V3)
+            .expect("apply v3 migration");
+        connection
+    }
+
+    #[test]
+    fn approval_schema_has_exact_meta_columns_indexes_and_foreign_keys() {
+        let connection = v3_connection();
+        let tables = connection
+            .prepare(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                 ORDER BY name",
+            )
+            .expect("prepare table manifest")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query table manifest")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect table manifest");
+        assert_eq!(tables, EXPECTED_TABLES);
+
+        let meta_columns = connection
+            .prepare("SELECT name FROM pragma_table_info('runtime_meta') ORDER BY cid")
+            .expect("prepare meta columns")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query meta columns")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect meta columns");
+        assert_eq!(
+            &meta_columns[meta_columns.len() - 2..],
+            ["approval_count", "active_approval_count"]
+        );
+
+        let indexes = connection
+            .prepare(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'index' AND tbl_name = 'approval_ledger'
+                   AND name NOT LIKE 'sqlite_%'
+                 ORDER BY name",
+            )
+            .expect("prepare approval indexes")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query approval indexes")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect approval indexes");
+        assert_eq!(
+            indexes,
+            [
+                "idx_approval_active_turn",
+                "idx_approval_deadline",
+                "idx_approval_request_per_turn"
+            ]
+        );
+
+        let foreign_key_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('approval_ledger')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read approval foreign keys");
+        assert_eq!(foreign_key_count, 4);
+    }
+
+    #[test]
+    fn approval_schema_rejects_incoherent_winner_and_retry_state() {
+        let connection = v3_connection();
+        connection
+            .pragma_update(None, "foreign_keys", false)
+            .expect("disable foreign keys for isolated CHECK test");
+        let pending = "INSERT INTO approval_ledger (
+            approval_id, conversation_id, command_id, turn_id,
+            request_token, decision_token, claimant_token, state,
+            requested_at_ms, deadline_at_ms, claimed_at_ms, state_changed_at_ms,
+            delivery_round, attempts_in_round, round_started_at_ms, last_attempt_at_ms,
+            state_version, last_event_id, logical_request_bytes, logical_decision_bytes,
+            metadata_token, sealed_request, sealed_decision, sealed_status_detail
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, NULL, NULL, 'pending',
+            10, 20, NULL, 10, 0, 0, NULL, NULL, 1, ?6, 7, 0, ?7, ?8, NULL, NULL
+        )";
+        connection
+            .execute(
+                pending,
+                rusqlite::params![
+                    &[1_u8; 16][..],
+                    &[2_u8; 16][..],
+                    &[3_u8; 16][..],
+                    &[4_u8; 16][..],
+                    &[5_u8; 32][..],
+                    &[6_u8; 16][..],
+                    &[7_u8; 32][..],
+                    &[8_u8; 40][..],
+                ],
+            )
+            .expect("coherent pending row");
+
+        let invalid = pending.replace("NULL, NULL, 'pending'", "zeroblob(32), NULL, 'pending'");
+        assert!(
+            connection
+                .execute(
+                    &invalid,
+                    rusqlite::params![
+                        &[9_u8; 16][..],
+                        &[2_u8; 16][..],
+                        &[3_u8; 16][..],
+                        &[4_u8; 16][..],
+                        &[5_u8; 32][..],
+                        &[10_u8; 16][..],
+                        &[7_u8; 32][..],
+                        &[8_u8; 40][..],
+                    ],
+                )
+                .is_err(),
+            "pending row cannot carry only part of a winner tuple"
+        );
+    }
+}

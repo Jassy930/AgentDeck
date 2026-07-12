@@ -15,26 +15,29 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::runtime::adapter_state::AdapterStateNamespace;
 use crate::runtime::model::{
-    AcceptCommand, AcceptOutcome, AuthorizeExecutionRelease, CommandReceiptRecord,
+    AcceptCommand, AcceptOutcome, ApprovalMutationOutcome, AuthorizeExecutionRelease,
+    BeginApprovalAttempt, BeginApprovalAttemptOutcome, ClaimApproval, CommandReceiptRecord,
     CommandReceiptSelector, CompleteCommand, CompleteOutcome, ConversationRecord,
-    CreateConversationOutcome, ExecutionFence, ExecutionFenceRecord,
+    CreateConversationOutcome, ExecutionFence, ExecutionFenceRecord, ExpireApproval,
     MAX_ACCEPTED_TERMINATION_EVENT_BYTES, MAX_ADAPTER_STATE_REFERENCE_BYTES,
-    MAX_COMMAND_PAYLOAD_BYTES, MAX_COMMAND_RESULT_BYTES, MAX_CONVERSATION_DESCRIPTOR_BYTES,
-    MAX_EXECUTION_FENCE_BYTES, MAX_EXECUTION_INTENT_BYTES, MAX_EXECUTION_NONCE_BYTES,
-    MAX_IDEMPOTENCY_KEY_BYTES, MAX_RUNTIME_BUSY_TIMEOUT_MS, MAX_RUNTIME_EVENT_BYTES,
-    MAX_RUNTIME_STORE_COMMAND_CAPACITY, MAX_RUNTIME_STORE_LANE_BYTE_CAPACITY,
-    MachineEnrollmentReceiptRecord, NewConversation, QueryCommandReceipt,
+    MAX_APPROVAL_STATUS_DETAIL_BYTES, MAX_COMMAND_PAYLOAD_BYTES, MAX_COMMAND_RESULT_BYTES,
+    MAX_CONVERSATION_DESCRIPTOR_BYTES, MAX_EXECUTION_FENCE_BYTES, MAX_EXECUTION_INTENT_BYTES,
+    MAX_EXECUTION_NONCE_BYTES, MAX_IDEMPOTENCY_KEY_BYTES, MAX_RUNTIME_BUSY_TIMEOUT_MS,
+    MAX_RUNTIME_EVENT_BYTES, MAX_RUNTIME_STORE_COMMAND_CAPACITY,
+    MAX_RUNTIME_STORE_LANE_BYTE_CAPACITY, MachineEnrollmentReceiptRecord, MarkApprovalApplied,
+    MarkApprovalDeliveryFailed, NewConversation, QueryCommandReceipt,
     RUNTIME_STORE_SHUTDOWN_GRACE_MS, RecoveryCompletion, RecoveryCursor, RecoveryPage,
-    RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreLane, RuntimeStoreOperation,
-    RuntimeStoreSnapshot, StartCommand, StartOutcome, TerminateAcceptedCommand,
-    TerminateAcceptedOutcome, TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
+    RegisterApproval, RegisterApprovalOutcome, RetryApprovalDelivery, RuntimeStoreConfig,
+    RuntimeStoreError, RuntimeStoreLane, RuntimeStoreOperation, RuntimeStoreSnapshot, StartCommand,
+    StartOutcome, TerminateAcceptedCommand, TerminateAcceptedOutcome,
+    TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
 };
 use crate::security::{SecretBytes, StorageKek};
 
 use super::identity::{
     MAX_RUNTIME_ID_COLLISION_ATTEMPTS, RuntimeId, RuntimeIdError, RuntimeIdKind,
 };
-use super::{journal, sqlite};
+use super::{approval, journal, sqlite};
 
 const LIFECYCLE_RUNNING: u8 = 0;
 const LIFECYCLE_SHUTTING_DOWN: u8 = 1;
@@ -534,6 +537,134 @@ impl RuntimeStoreHandle {
         .await?
     }
 
+    pub(in crate::runtime) async fn register_approval(
+        &self,
+        input: RegisterApproval,
+    ) -> Result<RegisterApprovalOutcome, RuntimeStoreError> {
+        let charge = memory_charge(
+            size_of::<NormalCommand>(),
+            &[
+                input.request.request_id.capacity(),
+                input.request.summary.capacity(),
+            ],
+        )?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::RegisterApproval { input, reply },
+        )
+        .await?
+    }
+
+    pub(in crate::runtime) async fn claim_approval(
+        &self,
+        input: ClaimApproval,
+    ) -> Result<ApprovalMutationOutcome, RuntimeStoreError> {
+        let charge = memory_charge(
+            size_of::<NormalCommand>(),
+            &[
+                input.decision.request_id.capacity(),
+                input.claimant_binding.as_bytes().len(),
+            ],
+        )?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::ClaimApproval { input, reply },
+        )
+        .await?
+    }
+
+    pub(in crate::runtime) async fn begin_approval_attempt(
+        &self,
+        input: BeginApprovalAttempt,
+    ) -> Result<BeginApprovalAttemptOutcome, RuntimeStoreError> {
+        let charge = memory_charge(size_of::<NormalCommand>(), &[])?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::BeginApprovalAttempt { input, reply },
+        )
+        .await?
+    }
+
+    pub(in crate::runtime) async fn mark_approval_applied(
+        &self,
+        input: MarkApprovalApplied,
+    ) -> Result<ApprovalMutationOutcome, RuntimeStoreError> {
+        let charge = memory_charge(size_of::<SafetyCommand>(), &[])?;
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            charge,
+            |reply| SafetyCommand::MarkApprovalApplied { input, reply },
+        )
+        .await?
+    }
+
+    pub(in crate::runtime) async fn mark_approval_delivery_failed(
+        &self,
+        input: MarkApprovalDeliveryFailed,
+    ) -> Result<ApprovalMutationOutcome, RuntimeStoreError> {
+        validate_nonempty_maximum(&input.status_detail, MAX_APPROVAL_STATUS_DETAIL_BYTES)?;
+        let charge = memory_charge(
+            size_of::<SafetyCommand>(),
+            &[input.status_detail.capacity()],
+        )?;
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            charge,
+            |reply| SafetyCommand::MarkApprovalDeliveryFailed { input, reply },
+        )
+        .await?
+    }
+
+    pub(in crate::runtime) async fn retry_approval_delivery(
+        &self,
+        input: RetryApprovalDelivery,
+    ) -> Result<ApprovalMutationOutcome, RuntimeStoreError> {
+        let charge = memory_charge(size_of::<NormalCommand>(), &[])?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::RetryApprovalDelivery { input, reply },
+        )
+        .await?
+    }
+
+    pub(in crate::runtime) async fn expire_approval(
+        &self,
+        input: ExpireApproval,
+    ) -> Result<ApprovalMutationOutcome, RuntimeStoreError> {
+        let charge = memory_charge(size_of::<SafetyCommand>(), &[])?;
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            charge,
+            |reply| SafetyCommand::ExpireApproval { input, reply },
+        )
+        .await?
+    }
+
     pub async fn terminate_accepted_command(
         &self,
         input: TerminateAcceptedCommand,
@@ -831,6 +962,22 @@ enum NormalCommand {
         state_reference: SecretBytes,
         reply: oneshot::Sender<Result<(), RuntimeStoreError>>,
     },
+    RegisterApproval {
+        input: RegisterApproval,
+        reply: oneshot::Sender<Result<RegisterApprovalOutcome, RuntimeStoreError>>,
+    },
+    ClaimApproval {
+        input: ClaimApproval,
+        reply: oneshot::Sender<Result<ApprovalMutationOutcome, RuntimeStoreError>>,
+    },
+    BeginApprovalAttempt {
+        input: BeginApprovalAttempt,
+        reply: oneshot::Sender<Result<BeginApprovalAttemptOutcome, RuntimeStoreError>>,
+    },
+    RetryApprovalDelivery {
+        input: RetryApprovalDelivery,
+        reply: oneshot::Sender<Result<ApprovalMutationOutcome, RuntimeStoreError>>,
+    },
 }
 
 enum SafetyCommand {
@@ -857,6 +1004,18 @@ enum SafetyCommand {
     TerminateStartedBeforeRelease {
         input: TerminateStartedBeforeRelease,
         reply: oneshot::Sender<Result<TerminateStartedBeforeReleaseOutcome, RuntimeStoreError>>,
+    },
+    MarkApprovalApplied {
+        input: MarkApprovalApplied,
+        reply: oneshot::Sender<Result<ApprovalMutationOutcome, RuntimeStoreError>>,
+    },
+    MarkApprovalDeliveryFailed {
+        input: MarkApprovalDeliveryFailed,
+        reply: oneshot::Sender<Result<ApprovalMutationOutcome, RuntimeStoreError>>,
+    },
+    ExpireApproval {
+        input: ExpireApproval,
+        reply: oneshot::Sender<Result<ApprovalMutationOutcome, RuntimeStoreError>>,
     },
 }
 
@@ -1010,6 +1169,18 @@ fn handle_normal(
             NormalCommand::BindAdapterState { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
+            NormalCommand::RegisterApproval { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::ClaimApproval { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::BeginApprovalAttempt { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::RetryApprovalDelivery { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
         }
         drop(memory_permit);
         return;
@@ -1047,6 +1218,18 @@ fn handle_normal(
                 state_reference,
             ));
         }
+        NormalCommand::RegisterApproval { input, reply } => {
+            let _ = reply.send(approval::register_approval(state, config, input));
+        }
+        NormalCommand::ClaimApproval { input, reply } => {
+            let _ = reply.send(approval::claim_approval(state, config, input));
+        }
+        NormalCommand::BeginApprovalAttempt { input, reply } => {
+            let _ = reply.send(approval::begin_approval_attempt(state, config, input));
+        }
+        NormalCommand::RetryApprovalDelivery { input, reply } => {
+            let _ = reply.send(approval::retry_approval_delivery(state, config, input));
+        }
     }
     drop(memory_permit);
 }
@@ -1080,6 +1263,15 @@ fn handle_safety(
             SafetyCommand::TerminateStartedBeforeRelease { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
+            SafetyCommand::MarkApprovalApplied { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::MarkApprovalDeliveryFailed { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::ExpireApproval { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
         }
         drop(memory_permit);
         return;
@@ -1106,6 +1298,17 @@ fn handle_safety(
             let _ = reply.send(journal::terminate_started_before_release(
                 state, config, input,
             ));
+        }
+        SafetyCommand::MarkApprovalApplied { input, reply } => {
+            let _ = reply.send(approval::mark_approval_applied(state, config, input));
+        }
+        SafetyCommand::MarkApprovalDeliveryFailed { input, reply } => {
+            let _ = reply.send(approval::mark_approval_delivery_failed(
+                state, config, input,
+            ));
+        }
+        SafetyCommand::ExpireApproval { input, reply } => {
+            let _ = reply.send(approval::expire_approval(state, config, input));
         }
     }
     drop(memory_permit);

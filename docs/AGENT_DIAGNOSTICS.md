@@ -500,10 +500,11 @@ ignored 测试不是通过证据。
 | `daemon.diagnostics.path_unavailable` | diagnostics one-shot 无可用日志路径 | 提供合法 profile/absolute data-dir，或先创建一次诊断日志 |
 | `daemon.runtime.main_loop_failed` | security bootstrap 已完成，但 stdio RuntimeHub 主循环失败 | 按同一 diagnostic log 检查 IPC I/O；guard/KEK 会随进程退出释放/清零 |
 
-## Runtime SQLite / journal / adapter 私表 / Core 诊断（Companion MVP P3.2–P3.4）
+## Runtime SQLite / journal / adapter 私表 / Core 诊断（Companion MVP P3.2–P3.5）
 
-P3.2/P3.3 error code 是 store 内部精确错误的稳定诊断归类；P3.4 已负责映射成 wire
-`RuntimeFailure`，并增加 Core/principal/connection/read overload 分类。排查时保留 DB/WAL/SHM 原件，先运行 diagnostics/read-only inspection，
+P3.2/P3.3 error code 是 store 内部精确错误的稳定诊断归类；P3.4/P3.5 已负责映射成 wire
+`RuntimeFailure`，并增加 Core/principal/connection/read overload、approval authorization 与
+delivery 分类。排查时保留 DB/WAL/SHM 原件，先运行 diagnostics/read-only inspection，
 不要用删除 sidecar、生成新 KEK 或直接改 high-water 的方式“修复”。
 
 ### Store shutdown deadline 语义
@@ -537,7 +538,7 @@ daemon fail-closed 退出，不要跳页、伪造 cursor 或删除 sidecar。
 | P3.2/P3.3 code | 常见内部原因 | 下一步 |
 | --- | --- | --- |
 | `daemon.runtime.store_invalid` | path/type/owner/mode/nlink、busy/count/byte config 或 operation input 不合法 | 核对 0700 namespace、0600 artifacts 和固定 config；拒绝 symlink/hardlink，不自动放宽 |
-| `daemon.runtime.schema_incompatible` | schema family/version/signature/live manifest、typed canonical descriptor/row linkage、逐 conversation HWM、authenticated metadata、五类 journal total 或两类 adapter-state total 不一致 | 停止写入并保留 main/WAL/SHM/journal；v1→v2 只能走内置原子 migration，不能原地猜测/手改 schema |
+| `daemon.runtime.schema_incompatible` | schema family/version/signature/live manifest、typed canonical descriptor/row linkage、逐 conversation HWM、authenticated metadata、command/execution/event/approval totals 或两类 adapter-state total 不一致 | 停止写入并保留 main/WAL/SHM/journal；v1/v2→v3 只能走内置原子 migration，不能原地猜测/手改 schema |
 | `daemon.runtime.store_unavailable` | worker/shutdown/commit outcome、clock/capacity probe、SQLite/I/O、sequence coordination，或 bounded checkpoint 被 reader pin 住 | 对 unknown outcome 用完全相同 stable ID/idempotency input 重试；checkpoint blocked 时停止新副作用、释放 reader 并保留 WAL，其他错误保留 evidence 后重启/修复底层 I/O |
 | `daemon.runtime.store_busy` | normal/safety/read lane 的 count 或 retained-allocation byte permit 已满 | 客户端退避并保持同一 idempotency key；不要并发重发新 key |
 | `daemon.runtime.recovering` | 已冻结 paged recovery barrier，终页尚未核账并 finish | 继续使用上一页返回的 exact cursor；RuntimeCore 逐页消费，终页 finish 后再开放请求，不得并行 mutation |
@@ -559,7 +560,7 @@ P3.4 RuntimeCore 的 transport-neutral failure：
 | `daemon.runtime.not_ready` | Core 尚未完成 paged recovery，或正在 draining/stopped | 等待 daemon readiness；若 recovery 无法完成，按上节保留 DB/Keychain 证据并 fail-close |
 | `daemon.runtime.protocol_mismatch` | Runtime v1 版本不兼容 | 升级客户端/daemon 到同一 Runtime protocol；不能回退 Relay/IPC 业务字段 |
 | `daemon.runtime.invalid_request` | ID 非 canonical UUID、Start key/cwd 或其他规范化输入非法 | 修正原请求；不得由 daemon 猜 ID/path 或替客户端补目标 |
-| `daemon.runtime.feature_unavailable` | 请求属于尚未接线的后续 phase（P3.5–P4） | 读取 capabilities/实施状态后等待对应 phase；不得用 compatibility path 假成功 |
+| `daemon.runtime.feature_unavailable` | 请求属于尚未接线的后续 phase（P3.6–P4），或依赖尚未启用的 production execution | 读取 capabilities/实施状态后等待对应 phase；不得用 compatibility path 或 fake coordinator 假成功 |
 | `daemon.authorization.revoked` | opaque principal lease 已 Revoking/Revoked 或 issuer registry 不可用 | 停止该 connection；remote 设备按 durable revocation/re-pair 流程处理，本地重新认证 peer credential |
 | `daemon.runtime.identity_unavailable` | machine trust/ID derivation domain 非法或 OS entropy 不可用 | 停止启动并检查 machine identity/系统熵；不得生成零 ID 或使用时间/PID 回退 |
 | `daemon.runtime.actor_unavailable` | conversation actor/execution control 已损坏或 recovery-blocked | 不自动重放 Started；保留 command/fence 证据，P3.7 按 orphan fencing 处理 |
@@ -567,6 +568,50 @@ P3.4 RuntimeCore 的 transport-neutral failure：
 | `daemon.runtime.read_unavailable` | 独立 ReadPool 已满或关闭 | 有界退避后重试读取；不要创建更多等待 task，副作用请求仍以 durable receipt 为准 |
 | `daemon.runtime.recovery_blocked` | 恢复页存在 Started，或 P4 前存在无法绑定精确 grant 的 remote Accepted | 保持 execution disabled；P3.7/P4 完成 fencing/auth readback 前不得 finish recovery |
 | `daemon.turn.stale` | CancelQueued 已输给 Started，或 CancelActive 的 turnId 不是当前 turn | 查询精确 CommandStatus；对 Started 只使用返回的当前 turnId 明确 cancel |
+
+### P3.5 approval / authorization / delivery 诊断
+
+P3.5 的正常状态转换以 `ApprovalReceipt` 为主，不应把业务回执误报成 transport 失败：
+`Claimed` 表示本决定赢得 first-wins CAS；`Applied` 表示 adapter 已完整 write+newline+flush；
+`DeliveryFailed` 表示赢家仍被密封保存、自动投递已停止，可由有 retry 权限的 client 显式重试同一
+决定。`AlreadyHandled` 必须携带原赢家和当前精确 Claimed/Applying/Applied/DeliveryFailed/Expired
+状态。没有赢家的 Pending expiry 单独返回 `Expired`；已经 claim 的 expiry 返回
+`AlreadyHandled(winner, Expired)`，两者不能混写。
+
+| failure code / 状态 | 常见原因 | 下一步 |
+| --- | --- | --- |
+| `daemon.authorization.permission_denied` | principal 仍 Active，但没有本次 Resolve 或 Retry 的显式 approval permission；本地 transport 也不自动获得权限 | 保持原 approval 不变；核对 issuer capability/grant，不要用 `is_local`、connection 类型或 owner 绕过 |
+| `daemon.approval.already_handled` / `AlreadyHandled` | 另一个 writer 已先 COMMIT winner，或同一 winner 的 exact retry 读到后续状态 | 以回执中的 winner+state 为准；不要换 idempotency key 或提交对立 decision 争抢第二次 |
+| `daemon.approval.delivery_failed` / `DeliveryFailed` | 8 次/60 秒预算耗尽、明确永久拒绝，或 write/flush/route 结果为 `OutcomeUnknown` | 不自动重投；查询 durable receipt 后，只能调用 `RetryApproval` 重用 sealed winner 开新 round |
+| `daemon.approval.expired` / `Expired` | 默认 30 分钟或更短 capability deadline 到达，或 turn terminal 原子关闭 active approval | Pending 无 winner；已 claim 必须读回原 winner+Expired。重新执行用户意图需要新 ActionRequest，不能复活旧 approval |
+| `daemon.runtime.store_unavailable`（approval/terminal COMMIT unknown） | Register/Claim/Retry/Begin/Applied/DeliveryFailed/Expired 或 terminal+expiry 的 after-COMMIT 回执丢失、SQLite outcome 不明 | 只在回报的 operation 与当前 mutation 匹配时，用完全相同的 approval/attempt/decision/completion stable input 精确重试；不匹配或其他错误直接 fail-close。AppliedAck 后禁止再次调用 adapter；已提交 terminal 必须重放为 Completed/Replayed 后再清 route 与启动 successor |
+| `daemon.runtime.recovery_blocked` | 重启读到 Started turn 及 Applying/DeliveryFailed approval，但 process group 尚未被 P3.7 exec fence 证明退出；或当前 delivery generation 在 adapter 已返回后无法 durable 写入唯一终态，产生 `FatalClosure` | 停止并清理全部进程内 delivery/deadline task，但保留 durable Started/approval 原状；不得自动恢复投递、写 Expired/Interrupted 或启动后续 Accepted。`FatalClosure` 也不得把仍为 Applying 的 row 当作可重投 route |
+
+schema v3 的 `approval_ledger`、row AEAD/metadata MAC、`approval_count` 与
+`active_approval_count` ledger MAC 会在 open/recovery/readback 时一起验证。deadline、attempt、
+decision token、last event linkage 或 count 任一被改写，都按 corrupt state fail-close；不要直接
+编辑 SQLite 纠正数字。每个 active approval 已预留 1 MiB Safety obligation，因此普通注册可能因
+DiskLow/SafetyOnly 被拒，而既有 approval 的 Applied/Expired/terminal+expiry 仍应尝试安全收口。
+若 safety 写也失败，保留 main/WAL/SHM 和诊断，不要删 WAL 腾空间。
+
+open/recovery 的 approval 审计按全部 conversation 分批，单批 compact projection 上限 16 MiB；
+完整 request 只留 32-byte keyed digest，event chain 按 `eventSeq` 常量空间归约。若启动期内存随
+历史 approval payload 或 manual-retry 次数线性暴涨，应视为完整性扫描回归；不要通过调高进程
+内存限制掩盖。零 approval row conversation 中出现认证的 ActionRequest/ApprovalResolved 也必须
+作为 orphan fail-close。
+
+BeginApprovalAttempt COMMIT 成功或 exact replay 并不自动授权 adapter 调用：worker 随后还会刷新
+单调时钟，并以持久化的 deadline、round start 与 last attempt 坐标重新判定。刷新后已经到达或
+越过 deadline 时只写 Expired；越过 round budget 时只写 DeliveryFailed，adapter 调用数必须保持
+不变。store 自身还会在 preflight 与事务内 authenticated reload 后各校验一次持久化时间线；任一
+读取早于 `max(stateChanged, roundStarted, lastAttempt)` 都返回 ClockRegressed，row/event 不变且不
+签发 permit。排查“deadline 附近仍执行一次”的问题时，优先保留 Begin event 与这些时间坐标，
+不要只看 COMMIT 前的内存时钟。
+
+Codex route 只有完整 flush 后才算 Applied，失败时保留精确 route；Claude Code Approval
+capability 目前仍隐藏，直到 P3.7 recorded fixture/live gate 完成。P3.5 的 private fake
+delivery 测试不是 live vendor 证据；看到 production CC approval 或未经过 exec-gate 的真实投递，
+应视为 capability exposure/接线错误并立即 fail-close。
 
 P3.3 canonical adapter 边界的错误不会携带 raw resume reference：
 

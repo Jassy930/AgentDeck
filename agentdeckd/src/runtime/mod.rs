@@ -2,6 +2,7 @@
 //! AgentRouter.
 
 pub(crate) mod adapter_state;
+pub(crate) mod approval;
 mod connection;
 mod conversation;
 mod core;

@@ -10,13 +10,14 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use agentdeck_protocol::runtime::command::{HelloParams, QueryReceiptSelector};
 use agentdeck_protocol::runtime::failure::{
-    DAEMON_AUTHORIZATION_REVOKED, DAEMON_RUNTIME_ACTOR_UNAVAILABLE,
-    DAEMON_RUNTIME_CONNECTION_UNAVAILABLE, DAEMON_RUNTIME_FEATURE_UNAVAILABLE,
-    DAEMON_RUNTIME_IDENTITY_UNAVAILABLE, DAEMON_RUNTIME_INVALID_REQUEST, DAEMON_RUNTIME_NOT_READY,
-    DAEMON_RUNTIME_PROTOCOL_MISMATCH, DAEMON_RUNTIME_READ_UNAVAILABLE,
+    DAEMON_AUTHORIZATION_PERMISSION_DENIED, DAEMON_AUTHORIZATION_REVOKED,
+    DAEMON_RUNTIME_ACTOR_UNAVAILABLE, DAEMON_RUNTIME_CONNECTION_UNAVAILABLE,
+    DAEMON_RUNTIME_FEATURE_UNAVAILABLE, DAEMON_RUNTIME_IDENTITY_UNAVAILABLE,
+    DAEMON_RUNTIME_INVALID_REQUEST, DAEMON_RUNTIME_NOT_READY, DAEMON_RUNTIME_PROTOCOL_MISMATCH,
+    DAEMON_RUNTIME_READ_UNAVAILABLE,
 };
 use agentdeck_protocol::runtime::identity::{
-    AdapterStateKey, CommandId, ConversationId, IdempotencyKey, TurnId,
+    AdapterStateKey, ApprovalId, CommandId, ConversationId, IdempotencyKey, TurnId,
 };
 use agentdeck_protocol::runtime::{
     CancellationReceipt, CommandReceipt, CommandStatus, CommandStatusReceipt,
@@ -25,6 +26,7 @@ use agentdeck_protocol::runtime::{
 };
 use tokio::sync::{Mutex, Notify};
 
+use super::approval::ApprovalPrincipalCapability;
 use super::connection::{
     AuthenticatedPrincipal, ConnectionError, ConnectionId, ConnectionRegistry, ConnectionSink,
     DEFAULT_CONNECTION_WRITER_BYTES, DEFAULT_CONNECTION_WRITER_FRAMES, EncodedRuntimeFrame,
@@ -331,6 +333,43 @@ impl RuntimeCore {
                     ActiveCancelResult::Stale => Err(RuntimeCoreError::StaleTurn),
                 }
             }
+            RuntimeRequest::ResolveApproval {
+                conversation_id,
+                turn_id,
+                approval_id,
+                decision,
+            } => {
+                let internal_conversation = parse_conversation_id(&conversation_id)?;
+                let internal_turn = parse_turn_id(&turn_id)?;
+                let internal_approval = parse_approval_id(&approval_id)?;
+                let authorization = principal.try_enter_approval()?;
+                authorization.require_resolve()?;
+                let receipt = self
+                    .conversations
+                    .resolve_approval(
+                        internal_conversation,
+                        internal_turn,
+                        internal_approval,
+                        decision,
+                        authorization,
+                    )
+                    .await?;
+                Ok(RuntimeReply::Approval(receipt))
+            }
+            RuntimeRequest::RetryApproval {
+                conversation_id,
+                approval_id,
+            } => {
+                let internal_conversation = parse_conversation_id(&conversation_id)?;
+                let internal_approval = parse_approval_id(&approval_id)?;
+                let authorization = principal.try_enter_approval()?;
+                authorization.require_retry()?;
+                let receipt = self
+                    .conversations
+                    .retry_approval(internal_conversation, internal_approval, authorization)
+                    .await?;
+                Ok(RuntimeReply::Approval(receipt))
+            }
             RuntimeRequest::QueryReceipt(selector) => {
                 let _authorization = principal.try_enter()?;
                 let owner = principal.idempotency_owner();
@@ -384,8 +423,6 @@ impl RuntimeCore {
             }
             RuntimeRequest::Catalog(_)
             | RuntimeRequest::Subscribe { .. }
-            | RuntimeRequest::ResolveApproval { .. }
-            | RuntimeRequest::RetryApproval { .. }
             | RuntimeRequest::CreatePairInvite(_)
             | RuntimeRequest::ListPendingPairings { .. }
             | RuntimeRequest::ConfirmPairing { .. }
@@ -591,6 +628,8 @@ pub(crate) enum RuntimeCoreError {
     FeatureUnavailable,
     #[error("runtime principal authorization is revoked")]
     AuthorizationRevoked,
+    #[error("runtime principal lacks the required permission")]
+    AuthorizationDenied,
     #[error("runtime turn is stale")]
     StaleTurn,
     #[error("runtime recovery requires P3.7 orphan fencing")]
@@ -627,6 +666,10 @@ impl RuntimeCoreError {
             Self::AuthorizationRevoked => RuntimeFailure::new(
                 DAEMON_AUTHORIZATION_REVOKED,
                 "runtime principal authorization is revoked",
+            ),
+            Self::AuthorizationDenied => RuntimeFailure::new(
+                DAEMON_AUTHORIZATION_PERMISSION_DENIED,
+                "runtime principal lacks the required permission",
             ),
             Self::StaleTurn => RuntimeFailure::new(
                 agentdeck_protocol::runtime::failure::DAEMON_TURN_STALE,
@@ -693,6 +736,10 @@ impl From<super::connection::PrincipalAccessError> for RuntimeCoreError {
             super::connection::PrincipalAccessError::RegistryFull => {
                 Self::Connection(ConnectionError::ConnectionLimit)
             }
+            super::connection::PrincipalAccessError::PermissionDenied => Self::AuthorizationDenied,
+            super::connection::PrincipalAccessError::PermissionConflict => {
+                Self::Connection(ConnectionError::RegistryPoisoned)
+            }
         }
     }
 }
@@ -731,6 +778,11 @@ fn parse_turn_id(value: &TurnId) -> Result<RuntimeId, RuntimeCoreError> {
         .map_err(|_| RuntimeCoreError::InvalidRequest)
 }
 
+fn parse_approval_id(value: &ApprovalId) -> Result<RuntimeId, RuntimeCoreError> {
+    RuntimeId::parse_canonical(RuntimeIdKind::Approval, value.as_str())
+        .map_err(|_| RuntimeCoreError::InvalidRequest)
+}
+
 fn wire_conversation_id(value: RuntimeId) -> ConversationId {
     ConversationId::new(value.to_canonical_string())
 }
@@ -766,11 +818,11 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use agentdeck_protocol::AgentKind;
-    use agentdeck_protocol::runtime::identity::IdempotencyKey;
+    use agentdeck_protocol::runtime::identity::{ApprovalId, IdempotencyKey};
     use agentdeck_protocol::runtime::{
         ConversationStart, PromptPayload, QueryReceiptSelector, RuntimeMessage, SendPromptRequest,
     };
+    use agentdeck_protocol::{ActionDecision, ActionDecisionKind, AgentKind};
     use tokio::sync::mpsc;
 
     use super::*;
@@ -860,6 +912,121 @@ mod tests {
         });
         core.connect(principal, ConnectionSink::new(sink))
             .expect("connect local")
+    }
+
+    async fn connect_local_with_approval_permissions(
+        core: &RuntimeCore,
+        seed: u8,
+        permissions: crate::runtime::connection::ApprovalPermissionGrant,
+    ) -> ConnectionId {
+        let principal = core
+            .principal_issuer
+            .issue_verified_local_with_approval_permissions(501, [seed; 16], permissions)
+            .expect("issue approval principal");
+        let (sink, mut receiver) = mpsc::channel::<crate::runtime::ConnectionWrite>(8);
+        tokio::spawn(async move {
+            while let Some(write) = receiver.recv().await {
+                let _ = write.acknowledge();
+            }
+        });
+        core.connect(principal, ConnectionSink::new(sink))
+            .expect("connect approval principal")
+    }
+
+    fn synthetic_wire_id(kind: RuntimeIdKind, seed: u8) -> String {
+        RuntimeId::from_bytes(kind, [seed; 16])
+            .expect("synthetic runtime id")
+            .to_canonical_string()
+    }
+
+    #[tokio::test]
+    async fn principal_without_approval_permission_cannot_claim() {
+        let root = TestRoot::new("approval-permission-denied");
+        let core = core(&root).await;
+        core.recover().await.expect("recover");
+        let connection = connect_local(&core, 41).await;
+
+        let reply = core
+            .handle(
+                connection,
+                RuntimeRequest::ResolveApproval {
+                    conversation_id: ConversationId::new(synthetic_wire_id(
+                        RuntimeIdKind::Conversation,
+                        0x41,
+                    )),
+                    turn_id: TurnId::new(synthetic_wire_id(RuntimeIdKind::Turn, 0x42)),
+                    approval_id: ApprovalId::new(synthetic_wire_id(RuntimeIdKind::Approval, 0x43)),
+                    decision: ActionDecision {
+                        request_id: "request-permission-denied".to_owned(),
+                        decision: ActionDecisionKind::Approve,
+                        persist: false,
+                    },
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            reply,
+            RuntimeReply::Failure(RuntimeFailure { code, .. })
+                if code == DAEMON_AUTHORIZATION_PERMISSION_DENIED
+        ));
+        let retry = core
+            .handle(
+                connection,
+                RuntimeRequest::RetryApproval {
+                    conversation_id: ConversationId::new(synthetic_wire_id(
+                        RuntimeIdKind::Conversation,
+                        0x41,
+                    )),
+                    approval_id: ApprovalId::new(synthetic_wire_id(RuntimeIdKind::Approval, 0x43)),
+                },
+            )
+            .await;
+        assert!(matches!(
+            retry,
+            RuntimeReply::Failure(RuntimeFailure { code, .. })
+                if code == DAEMON_AUTHORIZATION_PERMISSION_DENIED
+        ));
+        core.shutdown().await.expect("shutdown core");
+    }
+
+    #[tokio::test]
+    async fn approval_requests_require_canonical_approval_ids() {
+        let root = TestRoot::new("approval-id-validation");
+        let core = core(&root).await;
+        core.recover().await.expect("recover");
+        let connection = connect_local_with_approval_permissions(
+            &core,
+            42,
+            crate::runtime::connection::ApprovalPermissionGrant::ResolveOnly,
+        )
+        .await;
+
+        let reply = core
+            .handle(
+                connection,
+                RuntimeRequest::ResolveApproval {
+                    conversation_id: ConversationId::new(synthetic_wire_id(
+                        RuntimeIdKind::Conversation,
+                        0x51,
+                    )),
+                    turn_id: TurnId::new(synthetic_wire_id(RuntimeIdKind::Turn, 0x52)),
+                    approval_id: ApprovalId::new("not-a-canonical-approval-id"),
+                    decision: ActionDecision {
+                        request_id: "request-invalid-id".to_owned(),
+                        decision: ActionDecisionKind::Deny,
+                        persist: false,
+                    },
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            reply,
+            RuntimeReply::Failure(RuntimeFailure { code, .. })
+                if code == DAEMON_RUNTIME_INVALID_REQUEST
+        ));
+        core.shutdown().await.expect("shutdown core");
     }
 
     #[tokio::test]

@@ -27,6 +27,7 @@ use crate::runtime::model::{
 };
 use crate::security::SecretBytes;
 
+use super::approval;
 use super::cipher::RowAad;
 use super::identity::{
     MAX_RUNTIME_ID_COLLISION_ATTEMPTS, RuntimeId, RuntimeIdError, RuntimeIdKind,
@@ -1549,6 +1550,14 @@ pub(crate) fn complete_command_with_event(
         if persisted_token.as_slice() != terminal_token.as_bytes() {
             return Err(RuntimeStoreError::TerminalConflict);
         }
+        approval::ensure_terminal_turn_has_no_active_approvals(
+            &transaction,
+            key_bundle,
+            database_id,
+            input.conversation_id,
+            input.command_id,
+            input.turn_id,
+        )?;
         let event_id = runtime_id(RuntimeIdKind::Event, event_id)?;
         let event = load_event(&transaction, key_bundle, database_id, event_id)?;
         return Ok(CompleteOutcome::Replayed { command, event });
@@ -1599,7 +1608,21 @@ pub(crate) fn complete_command_with_event(
     let previous = conversation
         .event_high_water
         .map(super::sequence::encode_sequence);
-    let event_seq = next_sequence(SequenceScope::EventSeq, previous.as_deref())?;
+    let approval_expiry = approval::expire_active_approvals_for_terminal(
+        &transaction,
+        key_bundle,
+        database_id,
+        config,
+        input.conversation_id,
+        input.command_id,
+        input.turn_id,
+        terminal_at_ms,
+        previous.as_deref(),
+    )?;
+    let event_seq = next_sequence(
+        SequenceScope::EventSeq,
+        approval_expiry.final_event_high_water.as_deref(),
+    )?;
     let event_id = allocate_id(&transaction, config, RuntimeIdKind::Event)?;
     let sealed_result = seal(
         key_bundle,
@@ -1709,7 +1732,12 @@ pub(crate) fn complete_command_with_event(
     let mut next_ledger = ledger.clone();
     next_ledger.event_count = next_ledger
         .event_count
-        .checked_add(1)
+        .checked_add(approval_expiry.expiry_event_count)
+        .and_then(|count| count.checked_add(1))
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    next_ledger.active_approval_count = next_ledger
+        .active_approval_count
+        .checked_sub(approval_expiry.active_approval_decrement)
         .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
     next_ledger.started_released_count = next_ledger
         .started_released_count
@@ -1829,6 +1857,14 @@ pub(crate) fn terminate_started_before_release(
         if persisted_token.as_slice() != terminal_token.as_bytes() {
             return Err(RuntimeStoreError::TerminalConflict);
         }
+        approval::ensure_terminal_turn_has_no_active_approvals(
+            &transaction,
+            key_bundle,
+            database_id,
+            input.conversation_id,
+            input.command_id,
+            input.turn_id,
+        )?;
         let event_id = runtime_id(
             RuntimeIdKind::Event,
             event_id.ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?,
@@ -1865,7 +1901,21 @@ pub(crate) fn terminate_started_before_release(
     let previous = conversation
         .event_high_water
         .map(super::sequence::encode_sequence);
-    let event_seq = next_sequence(SequenceScope::EventSeq, previous.as_deref())?;
+    let approval_expiry = approval::expire_active_approvals_for_terminal(
+        &transaction,
+        key_bundle,
+        database_id,
+        config,
+        input.conversation_id,
+        input.command_id,
+        input.turn_id,
+        terminal_at_ms,
+        previous.as_deref(),
+    )?;
+    let event_seq = next_sequence(
+        SequenceScope::EventSeq,
+        approval_expiry.final_event_high_water.as_deref(),
+    )?;
     let event_id = allocate_id(&transaction, config, RuntimeIdKind::Event)?;
     let sealed_result = seal(
         key_bundle,
@@ -1974,7 +2024,12 @@ pub(crate) fn terminate_started_before_release(
     let mut next_ledger = ledger.clone();
     next_ledger.event_count = next_ledger
         .event_count
-        .checked_add(1)
+        .checked_add(approval_expiry.expiry_event_count)
+        .and_then(|count| count.checked_add(1))
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    next_ledger.active_approval_count = next_ledger
+        .active_approval_count
+        .checked_sub(approval_expiry.active_approval_decrement)
         .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
     if fence.is_some() {
         next_ledger.started_without_release_count = next_ledger
@@ -3704,6 +3759,9 @@ fn id_exists(transaction: &Transaction<'_>, id: RuntimeId) -> Result<bool, Runti
         RuntimeIdKind::Command => "SELECT EXISTS(SELECT 1 FROM commands WHERE command_id = ?1)",
         RuntimeIdKind::Turn => "SELECT EXISTS(SELECT 1 FROM commands WHERE turn_id = ?1)",
         RuntimeIdKind::Event => "SELECT EXISTS(SELECT 1 FROM event_journal WHERE event_id = ?1)",
+        RuntimeIdKind::Approval => {
+            "SELECT EXISTS(SELECT 1 FROM approval_ledger WHERE approval_id = ?1)"
+        }
         RuntimeIdKind::Database | RuntimeIdKind::DaemonBoot => {
             return Err(RuntimeStoreError::InvalidConfig(
                 "this runtime id kind is not allocated by the journal",
@@ -4434,12 +4492,16 @@ fn validate_store_integrity_against_ledger(
     let catalog = validate_conversation_catalog(connection, key_bundle, database_id, None, true)?;
     let commands = validate_all_command_metadata(connection, key_bundle, database_id)?;
     validate_all_event_metadata(connection, key_bundle)?;
+    // v1/v2 migration 前 `approval_ledger` 尚不存在；approval validator 对缺表返回
+    // 严格零摘要，避免在旧 schema authentication 阶段误查 v3 表。
+    let approvals =
+        super::approval::validate_all_approval_metadata(connection, key_bundle, database_id)?;
     let mut started_without_fence_count = 0_u64;
     let mut started_without_release_count = 0_u64;
     let mut started_released_count = 0_u64;
     let mut expected_intent_count = 0_u64;
     let mut expected_fence_count = 0_u64;
-    let mut expected_event_count = 0_u64;
+    let mut expected_event_count = approvals.approval_event_count;
     let mut statement = connection.prepare("SELECT command_id FROM commands")?;
     let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
     for row in rows {
@@ -4571,6 +4633,8 @@ fn validate_store_integrity_against_ledger(
         || ledger.event_count
             != u64::try_from(actual_event_count)
                 .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
+        || ledger.approval_count != approvals.approval_count
+        || ledger.active_approval_count != approvals.active_approval_count
         || ledger.accepted_count != catalog.accepted_count
         || ledger.accepted_count != commands.accepted_count
         || ledger.accepted_payload_bytes != commands.accepted_payload_bytes

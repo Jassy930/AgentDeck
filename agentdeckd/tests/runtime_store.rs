@@ -275,6 +275,7 @@ async fn fresh_store_is_ready_only_after_exact_schema_and_pragmas_read_back() {
     assert_eq!(
         snapshot.table_names,
         [
+            "approval_ledger",
             "claude_code_adapter_state",
             "codex_adapter_state",
             "commands",
@@ -291,7 +292,7 @@ async fn fresh_store_is_ready_only_after_exact_schema_and_pragmas_read_back() {
 }
 
 #[tokio::test]
-async fn schema_v2_contains_the_durable_idempotency_and_execution_linkage_contract() {
+async fn schema_v3_contains_the_durable_idempotency_and_execution_linkage_contract() {
     let root = TestRoot::new("journal-schema-contract");
     let keys = MemoryKeyStore::new();
     let database = root.database();

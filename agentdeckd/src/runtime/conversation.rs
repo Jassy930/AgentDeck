@@ -5,26 +5,40 @@
 //! 不 await connection writer。不同 actor 可并行，同一 actor 最多一个 active turn。
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
+use agentdeck_protocol::runtime::identity::ApprovalId;
+use agentdeck_protocol::runtime::{ApprovalDeliveryState, ApprovalReceipt};
 use serde_json::json;
 use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinError, JoinHandle};
 
+use super::approval::{
+    ApprovalBackoff, ApprovalDeliveryJournal, ApprovalSleeper, ApprovalWorkerResult,
+    FixedApprovalBackoff, SharedApprovalDelivery, TokioApprovalSleeper, run_approval_deadline,
+    run_approval_delivery_round,
+};
 use super::connection::{
-    AuthenticatedPrincipal, AuthorizationGuard, PrincipalAccessError, PrincipalAuthorizationKey,
+    ApprovalAuthorizationGuard, AuthenticatedPrincipal, AuthorizationGuard, PrincipalAccessError,
+    PrincipalAuthorizationKey,
 };
 use super::execution::{
     ExecutionReleasePermit, RuntimeExecutionCompletion, RuntimeExecutionContext,
     RuntimeExecutionControl, RuntimeExecutionCoordinator, RuntimeExecutionError,
+    RuntimeExecutionEvent, RuntimeExecutionEventReceiver,
+};
+use super::model::{
+    ApprovalMutationOutcome, ApprovalRecord, ApprovalState, ClaimApproval, ExpireApproval,
+    RegisterApproval, RegisterApprovalOutcome, RetryApprovalDelivery,
 };
 use super::store::{
     AcceptCommand, AcceptOutcome, AcceptedTerminationReason, AuthorizeExecutionRelease,
     CommandRecord, CommandState, CompleteCommand, ConversationRecord, ExecutionFence, RuntimeId,
     RuntimeStoreError, RuntimeStoreHandle, StartCommand, StartOutcome,
-    StartedBeforeReleaseTermination, TerminalState, TerminateAcceptedCommand,
+    StartedBeforeReleaseTermination, SystemRuntimeClock, TerminalState, TerminateAcceptedCommand,
     TerminateAcceptedOutcome, TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
 };
 
@@ -87,6 +101,9 @@ pub(crate) struct ConversationRegistry {
     adapter_permits: Arc<Semaphore>,
     scheduling_gate: watch::Sender<bool>,
     start_transition: Arc<RwLock<()>>,
+    approval_clock: Arc<dyn super::store::RuntimeClock>,
+    approval_sleeper: Arc<dyn ApprovalSleeper>,
+    approval_backoff: Arc<dyn ApprovalBackoff>,
     actor_limit: usize,
     shutdown_grace: Duration,
 }
@@ -243,9 +260,25 @@ impl ConversationRegistry {
             adapter_permits: Arc::new(Semaphore::new(adapter_concurrency)),
             scheduling_gate,
             start_transition: Arc::new(RwLock::new(())),
+            approval_clock: Arc::new(SystemRuntimeClock),
+            approval_sleeper: Arc::new(TokioApprovalSleeper),
+            approval_backoff: Arc::new(FixedApprovalBackoff),
             actor_limit,
             shutdown_grace,
         })
+    }
+
+    #[cfg(test)]
+    fn with_approval_runtime(
+        mut self,
+        clock: Arc<dyn super::store::RuntimeClock>,
+        sleeper: Arc<dyn ApprovalSleeper>,
+        backoff: Arc<dyn ApprovalBackoff>,
+    ) -> Self {
+        self.approval_clock = clock;
+        self.approval_sleeper = sleeper;
+        self.approval_backoff = backoff;
+        self
     }
 
     /// 安装一个新建或逐页恢复出的 conversation。重复安装只接受相同 durable
@@ -290,6 +323,9 @@ impl ConversationRegistry {
             adapter_permits: self.adapter_permits.clone(),
             scheduling_gate: self.scheduling_gate.subscribe(),
             start_transition: self.start_transition.clone(),
+            approval_clock: self.approval_clock.clone(),
+            approval_sleeper: self.approval_sleeper.clone(),
+            approval_backoff: self.approval_backoff.clone(),
             prompt_ingress,
             shutdown_rx,
             shutdown_requested: false,
@@ -309,6 +345,7 @@ impl ConversationRegistry {
                 })
                 .collect(),
             active: None,
+            approval_deliveries: HashMap::new(),
             recovery_blocked: false,
         };
         let task = AbortOnDropTask::new(tokio::spawn(actor.run()));
@@ -387,6 +424,62 @@ impl ConversationRegistry {
         handle
             .control_tx
             .try_send(ControlCommand::CancelActive { turn_id, reply })
+            .map_err(map_mailbox_error)?;
+        result
+            .await
+            .map_err(|_| ConversationError::ActorUnavailable)?
+    }
+
+    pub(crate) async fn resolve_approval(
+        &self,
+        conversation_id: RuntimeId,
+        turn_id: RuntimeId,
+        approval_id: RuntimeId,
+        decision: agentdeck_protocol::ActionDecision,
+        authorization_guard: ApprovalAuthorizationGuard,
+    ) -> Result<ApprovalReceipt, ConversationError> {
+        authorization_guard.require_resolve()?;
+        let handle = self.handle(conversation_id).await?;
+        let claimant_binding = authorization_guard.claimant_binding();
+        let (reply, result) = oneshot::channel();
+        handle
+            .control_tx
+            .try_send(ControlCommand::ResolveApproval {
+                input: ClaimApproval {
+                    conversation_id,
+                    turn_id,
+                    approval_id,
+                    decision,
+                    claimant_binding,
+                },
+                _authorization_guard: authorization_guard,
+                reply,
+            })
+            .map_err(map_mailbox_error)?;
+        result
+            .await
+            .map_err(|_| ConversationError::ActorUnavailable)?
+    }
+
+    pub(crate) async fn retry_approval(
+        &self,
+        conversation_id: RuntimeId,
+        approval_id: RuntimeId,
+        authorization_guard: ApprovalAuthorizationGuard,
+    ) -> Result<ApprovalReceipt, ConversationError> {
+        authorization_guard.require_retry()?;
+        let handle = self.handle(conversation_id).await?;
+        let (reply, result) = oneshot::channel();
+        handle
+            .control_tx
+            .try_send(ControlCommand::RetryApproval {
+                input: RetryApprovalDelivery {
+                    conversation_id,
+                    approval_id,
+                },
+                _authorization_guard: authorization_guard,
+                reply,
+            })
             .map_err(map_mailbox_error)?;
         result
             .await
@@ -517,6 +610,16 @@ struct PromptAdmission {
 }
 
 enum ControlCommand {
+    ResolveApproval {
+        input: ClaimApproval,
+        _authorization_guard: ApprovalAuthorizationGuard,
+        reply: oneshot::Sender<Result<ApprovalReceipt, ConversationError>>,
+    },
+    RetryApproval {
+        input: RetryApprovalDelivery,
+        _authorization_guard: ApprovalAuthorizationGuard,
+        reply: oneshot::Sender<Result<ApprovalReceipt, ConversationError>>,
+    },
     CancelQueued {
         command_id: RuntimeId,
         principal: AuthenticatedPrincipal,
@@ -549,6 +652,14 @@ struct ActiveCommand {
     task: AbortOnDropTask<()>,
 }
 
+struct ApprovalRoute {
+    turn_id: RuntimeId,
+    delivery: SharedApprovalDelivery,
+    deadline_task: Option<AbortOnDropTask<()>>,
+    delivery_task: Option<AbortOnDropTask<()>>,
+    delivery_generation: u64,
+}
+
 #[derive(Default)]
 struct ActiveExecutionGate {
     cancel_requested: bool,
@@ -557,6 +668,19 @@ struct ActiveExecutionGate {
 }
 
 enum RunnerEvent {
+    ApprovalRequested {
+        command_id: RuntimeId,
+        turn_id: RuntimeId,
+        request: agentdeck_protocol::ActionRequest,
+        delivery: SharedApprovalDelivery,
+        acknowledged: oneshot::Sender<Result<(), ConversationError>>,
+    },
+    ApprovalTaskFinished {
+        approval_id: RuntimeId,
+        task_kind: ApprovalTaskKind,
+        generation: u64,
+        result: ApprovalWorkerResult,
+    },
     Started {
         command_id: RuntimeId,
         turn_id: RuntimeId,
@@ -580,6 +704,19 @@ enum RunnerEvent {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApprovalTaskKind {
+    Deadline,
+    Delivery,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApprovalTaskCompletionDisposition {
+    IgnoreStale,
+    RecoveryBlocked,
+    Continue,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PreparedDecision {
     Proceed,
     CanceledBeforeRelease,
@@ -593,6 +730,9 @@ struct ConversationActor {
     adapter_permits: Arc<Semaphore>,
     scheduling_gate: watch::Receiver<bool>,
     start_transition: Arc<RwLock<()>>,
+    approval_clock: Arc<dyn super::store::RuntimeClock>,
+    approval_sleeper: Arc<dyn ApprovalSleeper>,
+    approval_backoff: Arc<dyn ApprovalBackoff>,
     prompt_ingress: Arc<PromptIngress>,
     shutdown_rx: watch::Receiver<bool>,
     shutdown_requested: bool,
@@ -605,6 +745,7 @@ struct ConversationActor {
     runner_rx: mpsc::Receiver<RunnerEvent>,
     pending: VecDeque<QueuedCommand>,
     active: Option<ActiveCommand>,
+    approval_deliveries: HashMap<RuntimeId, ApprovalRoute>,
     recovery_blocked: bool,
 }
 
@@ -641,12 +782,12 @@ impl ConversationActor {
                     },
                     None => self.begin_shutdown().await,
                 },
-                event = self.runner_rx.recv(), if self.active.is_some() => {
+                event = self.runner_rx.recv(), if self.active.is_some() || !self.approval_deliveries.is_empty() => {
                     control_burst = 0;
                     match event {
                         Some(event) => self.handle_runner_event(event).await,
                         None => {
-                            self.enter_recovery_blocked();
+                            self.enter_recovery_blocked_and_stop_approvals().await;
                         }
                     }
                 },
@@ -659,14 +800,14 @@ impl ConversationActor {
                         control_burst = 0;
                         self.admission_open = false;
                         if !self.shutdown_requested && !self.recovery_blocked {
-                            self.enter_recovery_blocked();
+                            self.enter_recovery_blocked_and_stop_approvals().await;
                         }
                     },
                 },
                 changed = self.scheduling_gate.changed() => {
                     control_burst = 0;
                     if changed.is_err() {
-                        self.enter_recovery_blocked();
+                        self.enter_recovery_blocked_and_stop_approvals().await;
                     }
                 },
                 changed = self.shutdown_rx.changed(), if !self.shutdown_requested => {
@@ -748,6 +889,30 @@ impl ConversationActor {
 
     async fn handle_control(&mut self, command: ControlCommand) {
         match command {
+            ControlCommand::ResolveApproval {
+                input,
+                _authorization_guard,
+                reply,
+            } => {
+                let outcome = self
+                    .resolve_approval_control(input, &_authorization_guard)
+                    .await;
+                // Explicit binding keeps the shared lease alive through first-wins CAS COMMIT and
+                // exact receipt mapping. Adapter delivery is never awaited in this handler.
+                drop(_authorization_guard);
+                let _ = reply.send(outcome);
+            }
+            ControlCommand::RetryApproval {
+                input,
+                _authorization_guard,
+                reply,
+            } => {
+                let outcome = self.retry_approval_control(input).await;
+                // Retry permission capability likewise covers the exact round-transition COMMIT;
+                // the spawned daemon worker is independent of the client/connection afterwards.
+                drop(_authorization_guard);
+                let _ = reply.send(outcome);
+            }
             ControlCommand::CancelQueued {
                 command_id,
                 principal,
@@ -805,6 +970,16 @@ impl ConversationActor {
     fn enter_recovery_blocked(&mut self) {
         self.recovery_blocked = true;
         self.prompt_ingress.close();
+    }
+
+    async fn enter_recovery_blocked_and_stop_approvals(&mut self) {
+        let turn_id = self.active.as_ref().and_then(|active| active.turn_id);
+        self.enter_recovery_blocked();
+        if let Some(turn_id) = turn_id {
+            // RecoveryBlocked 尚无 process fence 证据，不能伪造 durable Expired；但必须先
+            // 移除 bound route 并停止所有 adapter delivery，防止未知 execution 继续副作用。
+            self.finish_approval_turn(turn_id).await;
+        }
     }
 
     async fn begin_shutdown(&mut self) {
@@ -904,6 +1079,37 @@ impl ConversationActor {
 
     async fn handle_runner_event(&mut self, event: RunnerEvent) {
         match event {
+            RunnerEvent::ApprovalRequested {
+                command_id,
+                turn_id,
+                request,
+                delivery,
+                acknowledged,
+            } => {
+                let result = self
+                    .register_action_request(command_id, turn_id, request, delivery)
+                    .await;
+                if result.is_err() {
+                    if let Some(active) = self.active.as_mut().filter(|active| {
+                        active.command.command_id == command_id && active.turn_id == Some(turn_id)
+                    }) {
+                        let _ =
+                            request_active_cancel(&active.execution_gate, active.control.clone())
+                                .await;
+                    }
+                    self.enter_recovery_blocked_and_stop_approvals().await;
+                }
+                let _ = acknowledged.send(result);
+            }
+            RunnerEvent::ApprovalTaskFinished {
+                approval_id,
+                task_kind,
+                generation,
+                result,
+            } => {
+                self.finish_approval_task(approval_id, task_kind, generation, result)
+                    .await;
+            }
             RunnerEvent::Started {
                 command_id,
                 turn_id,
@@ -949,6 +1155,11 @@ impl ConversationActor {
                     .is_some_and(|active| active.command.command_id == command_id)
                     && let Some(mut active) = self.active.take()
                 {
+                    if let Some(turn_id) = active.turn_id {
+                        // CompleteCommand 的 safety transaction 已先把所有 non-Applied
+                        // approvals durable Expired；此处才取消/等待 daemon workers。
+                        self.finish_approval_turn(turn_id).await;
+                    }
                     let _ = active.task.join().await;
                 }
             }
@@ -958,7 +1169,11 @@ impl ConversationActor {
                     .as_ref()
                     .is_some_and(|active| active.command.command_id == command_id)
                 {
+                    let turn_id = self.active.as_ref().and_then(|active| active.turn_id);
                     self.enter_recovery_blocked();
+                    if let Some(turn_id) = turn_id {
+                        self.finish_approval_turn(turn_id).await;
+                    }
                     if let Some(active) = self.active.take() {
                         let mut active = active;
                         let _ = active.task.join().await;
@@ -971,7 +1186,11 @@ impl ConversationActor {
                     .as_ref()
                     .is_some_and(|active| active.command.command_id == command_id)
                 {
+                    let turn_id = self.active.as_ref().and_then(|active| active.turn_id);
                     self.enter_recovery_blocked();
+                    if let Some(turn_id) = turn_id {
+                        self.finish_approval_turn(turn_id).await;
+                    }
                     if let Some(mut active) = self.active.take() {
                         let _ = active.task.join().await;
                     }
@@ -993,6 +1212,560 @@ impl ConversationActor {
             let _ = active.task.join().await;
         }
     }
+
+    async fn resolve_approval_control(
+        &mut self,
+        input: ClaimApproval,
+        authorization_guard: &ApprovalAuthorizationGuard,
+    ) -> Result<ApprovalReceipt, ConversationError> {
+        if self.recovery_blocked {
+            return Err(ConversationError::ActorUnavailable);
+        }
+        let ClaimApproval {
+            conversation_id,
+            turn_id,
+            approval_id,
+            decision,
+            ..
+        } = input;
+        let mut outcome = loop {
+            match self
+                .store
+                .claim_approval(ClaimApproval {
+                    conversation_id,
+                    turn_id,
+                    approval_id,
+                    decision: decision.clone(),
+                    claimant_binding: authorization_guard.claimant_binding(),
+                })
+                .await
+            {
+                Ok(outcome) => break outcome,
+                Err(RuntimeStoreError::CommitOutcomeUnknown {
+                    operation: super::store::RuntimeCommitOperation::ClaimApproval,
+                }) => tokio::task::yield_now().await,
+                Err(error) => return Err(ConversationError::Store(error)),
+            }
+        };
+        if matches!(
+            &outcome,
+            ApprovalMutationOutcome::ExpiredOrStale { approval }
+                if approval.state != ApprovalState::Expired
+        ) {
+            let approval = approval_from_mutation(&outcome).clone();
+            outcome = self
+                .expire_stale_approval_store_only(approval.conversation_id, approval.approval_id)
+                .await?;
+        }
+        let approval = approval_from_mutation(&outcome).clone();
+        let receipt = approval_receipt_for_resolve(outcome)?;
+        if matches!(
+            approval.state,
+            ApprovalState::Claimed | ApprovalState::Applying
+        ) {
+            self.start_approval_delivery(approval).await?;
+        }
+        Ok(receipt)
+    }
+
+    async fn retry_approval_control(
+        &mut self,
+        input: RetryApprovalDelivery,
+    ) -> Result<ApprovalReceipt, ConversationError> {
+        if self.recovery_blocked {
+            return Err(ConversationError::ActorUnavailable);
+        }
+        let RetryApprovalDelivery {
+            conversation_id,
+            approval_id,
+        } = input;
+        let mut outcome = loop {
+            match self
+                .store
+                .retry_approval_delivery(RetryApprovalDelivery {
+                    conversation_id,
+                    approval_id,
+                })
+                .await
+            {
+                Ok(outcome) => break outcome,
+                Err(RuntimeStoreError::CommitOutcomeUnknown {
+                    operation: super::store::RuntimeCommitOperation::RetryApprovalDelivery,
+                }) => tokio::task::yield_now().await,
+                Err(error) => return Err(ConversationError::Store(error)),
+            }
+        };
+        if matches!(
+            &outcome,
+            ApprovalMutationOutcome::ExpiredOrStale { approval }
+                if approval.state != ApprovalState::Expired
+        ) {
+            let approval = approval_from_mutation(&outcome).clone();
+            outcome = self
+                .expire_stale_approval_store_only(approval.conversation_id, approval.approval_id)
+                .await?;
+        }
+        let approval = approval_from_mutation(&outcome).clone();
+        let receipt = approval_receipt_for_retry(&approval)?;
+        if approval.state == ApprovalState::Applying {
+            self.start_approval_delivery(approval).await?;
+        }
+        Ok(receipt)
+    }
+
+    async fn expire_stale_approval_store_only(
+        &self,
+        conversation_id: RuntimeId,
+        approval_id: RuntimeId,
+    ) -> Result<ApprovalMutationOutcome, ConversationError> {
+        loop {
+            match self
+                .store
+                .expire_approval(ExpireApproval {
+                    conversation_id,
+                    approval_id,
+                })
+                .await
+            {
+                Ok(outcome) => return Ok(outcome),
+                Err(RuntimeStoreError::CommitOutcomeUnknown {
+                    operation: super::store::RuntimeCommitOperation::ExpireApproval,
+                }) => tokio::task::yield_now().await,
+                Err(error) => return Err(ConversationError::Store(error)),
+            }
+        }
+    }
+
+    async fn start_approval_delivery(
+        &mut self,
+        approval: ApprovalRecord,
+    ) -> Result<(), ConversationError> {
+        let route = self
+            .approval_deliveries
+            .get_mut(&approval.approval_id)
+            .ok_or(ConversationError::ActorUnavailable)?;
+        if route.turn_id != approval.turn_id {
+            return Err(corrupt_approval_state());
+        }
+        if route.delivery_task.is_some() {
+            if approval.state == ApprovalState::Applying && approval.attempts_in_round == 0 {
+                // Manual Retry 已 durable 开启新 round，旧 worker 必然已写入
+                // DeliveryFailed；其 completion 可能仍在 bounded runner lane。先收掉旧
+                // supervisor，并用 generation 阻止陈旧 completion 清掉新 worker。
+                if let Some(mut old_task) = route.delivery_task.take() {
+                    old_task.abort();
+                    let _ = old_task.join().await;
+                }
+            } else {
+                return Ok(());
+            }
+        }
+        route.delivery_generation = route
+            .delivery_generation
+            .checked_add(1)
+            .ok_or_else(corrupt_approval_state)?;
+        let generation = route.delivery_generation;
+        let approval_id = approval.approval_id;
+        let journal: Arc<dyn ApprovalDeliveryJournal> = Arc::new(self.store.clone());
+        let delivery = route.delivery.clone();
+        let clock = self.approval_clock.clone();
+        let sleeper = self.approval_sleeper.clone();
+        let backoff = self.approval_backoff.clone();
+        let runner_tx = self.runner_tx.clone();
+        route.delivery_task = Some(spawn_approval_task(
+            approval_id,
+            ApprovalTaskKind::Delivery,
+            generation,
+            runner_tx,
+            run_approval_delivery_round(journal, delivery, approval, clock, sleeper, backoff),
+        ));
+        Ok(())
+    }
+
+    async fn finish_approval_task(
+        &mut self,
+        approval_id: RuntimeId,
+        task_kind: ApprovalTaskKind,
+        generation: u64,
+        result: ApprovalWorkerResult,
+    ) {
+        let current_delivery_generation = self
+            .approval_deliveries
+            .get(&approval_id)
+            .map(|route| route.delivery_generation);
+        match classify_approval_task_completion(
+            task_kind,
+            generation,
+            current_delivery_generation,
+            result,
+        ) {
+            ApprovalTaskCompletionDisposition::IgnoreStale => return,
+            ApprovalTaskCompletionDisposition::RecoveryBlocked => {
+                if let Some(active) = &mut self.active {
+                    let _ =
+                        request_active_cancel(&active.execution_gate, active.control.clone()).await;
+                }
+                self.enter_recovery_blocked_and_stop_approvals().await;
+                return;
+            }
+            ApprovalTaskCompletionDisposition::Continue => {}
+        }
+        if matches!(
+            result,
+            ApprovalWorkerResult::Applied | ApprovalWorkerResult::Expired
+        ) {
+            if let Some(mut route) = self.approval_deliveries.remove(&approval_id) {
+                if task_kind != ApprovalTaskKind::Deadline
+                    && let Some(task) = &route.deadline_task
+                {
+                    task.abort();
+                }
+                if task_kind != ApprovalTaskKind::Delivery
+                    && let Some(task) = &route.delivery_task
+                {
+                    task.abort();
+                }
+                if let Some(mut task) = route.deadline_task.take() {
+                    let _ = task.join().await;
+                }
+                if let Some(mut task) = route.delivery_task.take() {
+                    let _ = task.join().await;
+                }
+            }
+            return;
+        }
+        let Some(route) = self.approval_deliveries.get_mut(&approval_id) else {
+            return;
+        };
+        let task = match task_kind {
+            ApprovalTaskKind::Deadline => route.deadline_task.take(),
+            ApprovalTaskKind::Delivery => route.delivery_task.take(),
+        };
+        if let Some(mut task) = task {
+            let _ = task.join().await;
+        }
+    }
+
+    async fn finish_approval_turn(&mut self, turn_id: RuntimeId) {
+        let approval_ids: Vec<_> = self
+            .approval_deliveries
+            .iter()
+            .filter_map(|(approval_id, route)| (route.turn_id == turn_id).then_some(*approval_id))
+            .collect();
+        for approval_id in approval_ids {
+            if let Some(mut route) = self.approval_deliveries.remove(&approval_id) {
+                if let Some(task) = &route.deadline_task {
+                    task.abort();
+                }
+                if let Some(task) = &route.delivery_task {
+                    task.abort();
+                }
+                if let Some(mut task) = route.deadline_task.take() {
+                    let _ = task.join().await;
+                }
+                if let Some(mut task) = route.delivery_task.take() {
+                    let _ = task.join().await;
+                }
+            }
+        }
+    }
+
+    async fn register_action_request(
+        &mut self,
+        command_id: RuntimeId,
+        turn_id: RuntimeId,
+        request: agentdeck_protocol::ActionRequest,
+        delivery: SharedApprovalDelivery,
+    ) -> Result<(), ConversationError> {
+        if self.recovery_blocked {
+            return Err(ConversationError::ActorUnavailable);
+        }
+        if self.active.as_ref().is_none_or(|active| {
+            active.command.command_id != command_id || active.turn_id != Some(turn_id)
+        }) {
+            return Err(ConversationError::ActorUnavailable);
+        }
+        delivery
+            .policy()
+            .validate_request(&request)
+            .map_err(|_| ConversationError::ActorUnavailable)?;
+        let route_full = self.approval_deliveries.len()
+            >= usize::try_from(super::model::MAX_ACTIVE_APPROVALS_PER_TURN)
+                .expect("approval per-turn bound fits usize");
+        let conversation_id = self.conversation.conversation_id;
+        let policy = delivery.policy().clone();
+        let outcome = loop {
+            match self
+                .store
+                .register_approval(RegisterApproval {
+                    conversation_id,
+                    command_id,
+                    turn_id,
+                    request: request.clone(),
+                    policy: policy.clone(),
+                })
+                .await
+            {
+                Ok(outcome) => break outcome,
+                Err(RuntimeStoreError::CommitOutcomeUnknown {
+                    operation: super::store::RuntimeCommitOperation::RegisterApproval,
+                }) => tokio::task::yield_now().await,
+                Err(RuntimeStoreError::InvalidStateTransition) if route_full => {
+                    return Err(ConversationError::MailboxFull);
+                }
+                Err(error) => return Err(ConversationError::Store(error)),
+            }
+        };
+        let approval = match outcome {
+            RegisterApprovalOutcome::Registered { approval, .. }
+            | RegisterApprovalOutcome::Replayed { approval, .. } => approval,
+        };
+        if approval.state.is_terminal() {
+            if let Some(mut route) = self.approval_deliveries.remove(&approval.approval_id) {
+                if let Some(task) = &route.deadline_task {
+                    task.abort();
+                }
+                if let Some(task) = &route.delivery_task {
+                    task.abort();
+                }
+                if let Some(mut task) = route.deadline_task.take() {
+                    let _ = task.join().await;
+                }
+                if let Some(mut task) = route.delivery_task.take() {
+                    let _ = task.join().await;
+                }
+            }
+            return Ok(());
+        }
+        if let Some(route) = self.approval_deliveries.get(&approval.approval_id) {
+            return if route.turn_id == approval.turn_id {
+                Ok(())
+            } else {
+                Err(corrupt_approval_state())
+            };
+        }
+        if !approval.state.is_active() {
+            return Err(corrupt_approval_state());
+        }
+
+        let approval_id = approval.approval_id;
+        let journal: Arc<dyn ApprovalDeliveryJournal> = Arc::new(self.store.clone());
+        let clock = self.approval_clock.clone();
+        let sleeper = self.approval_sleeper.clone();
+        let runner_tx = self.runner_tx.clone();
+        let deadline_approval = approval.clone();
+        let deadline_task = spawn_approval_task(
+            approval_id,
+            ApprovalTaskKind::Deadline,
+            0,
+            runner_tx,
+            run_approval_deadline(journal, deadline_approval, clock, sleeper),
+        );
+        self.approval_deliveries.insert(
+            approval.approval_id,
+            ApprovalRoute {
+                turn_id,
+                delivery,
+                deadline_task: Some(deadline_task),
+                delivery_task: None,
+                delivery_generation: 0,
+            },
+        );
+        Ok(())
+    }
+}
+
+fn classify_approval_task_completion(
+    task_kind: ApprovalTaskKind,
+    generation: u64,
+    current_delivery_generation: Option<u64>,
+    result: ApprovalWorkerResult,
+) -> ApprovalTaskCompletionDisposition {
+    if task_kind == ApprovalTaskKind::Delivery && current_delivery_generation != Some(generation) {
+        ApprovalTaskCompletionDisposition::IgnoreStale
+    } else if result == ApprovalWorkerResult::FatalClosure {
+        ApprovalTaskCompletionDisposition::RecoveryBlocked
+    } else {
+        ApprovalTaskCompletionDisposition::Continue
+    }
+}
+
+async fn forward_execution_events(
+    command_id: RuntimeId,
+    turn_id: RuntimeId,
+    mut events: RuntimeExecutionEventReceiver,
+    runner_tx: mpsc::Sender<RunnerEvent>,
+) {
+    while let Some(event) = events.recv().await {
+        match event {
+            RuntimeExecutionEvent::ActionRequest { request, delivery } => {
+                let (acknowledged, registered) = oneshot::channel();
+                if runner_tx
+                    .send(RunnerEvent::ApprovalRequested {
+                        command_id,
+                        turn_id,
+                        request,
+                        delivery,
+                        acknowledged,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if !matches!(registered.await, Ok(Ok(()))) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn spawn_approval_task<F>(
+    approval_id: RuntimeId,
+    task_kind: ApprovalTaskKind,
+    generation: u64,
+    runner_tx: mpsc::Sender<RunnerEvent>,
+    future: F,
+) -> AbortOnDropTask<()>
+where
+    F: Future<Output = ApprovalWorkerResult> + Send + 'static,
+{
+    let worker = AbortOnDropTask::new(tokio::spawn(future));
+    AbortOnDropTask::new(tokio::spawn(async move {
+        let mut worker = worker;
+        let result = match worker.join().await {
+            Ok(result) => result,
+            Err(_) => ApprovalWorkerResult::StoreBlocked,
+        };
+        let _ = runner_tx
+            .send(RunnerEvent::ApprovalTaskFinished {
+                approval_id,
+                task_kind,
+                generation,
+                result,
+            })
+            .await;
+    }))
+}
+
+fn approval_receipt_for_resolve(
+    outcome: ApprovalMutationOutcome,
+) -> Result<ApprovalReceipt, ConversationError> {
+    match outcome {
+        ApprovalMutationOutcome::Transitioned { approval, .. } => {
+            receipt_for_exact_winner(approval, true)
+        }
+        ApprovalMutationOutcome::Replayed { approval, .. } => {
+            receipt_for_exact_winner(approval, true)
+        }
+        ApprovalMutationOutcome::AlreadyHandled { approval } => {
+            receipt_for_exact_winner(approval, false)
+        }
+        ApprovalMutationOutcome::ExpiredOrStale { approval } => {
+            if approval.state == ApprovalState::Expired {
+                expired_approval_receipt(&approval)
+            } else {
+                Err(corrupt_approval_state())
+            }
+        }
+    }
+}
+
+fn approval_from_mutation(outcome: &ApprovalMutationOutcome) -> &ApprovalRecord {
+    match outcome {
+        ApprovalMutationOutcome::Transitioned { approval, .. }
+        | ApprovalMutationOutcome::Replayed { approval, .. }
+        | ApprovalMutationOutcome::AlreadyHandled { approval }
+        | ApprovalMutationOutcome::ExpiredOrStale { approval } => approval,
+    }
+}
+
+fn approval_receipt_for_retry(
+    approval: &ApprovalRecord,
+) -> Result<ApprovalReceipt, ConversationError> {
+    let approval_id = wire_approval_id(approval.approval_id);
+    match approval.state {
+        ApprovalState::Applied => Ok(ApprovalReceipt::Applied { approval_id }),
+        ApprovalState::DeliveryFailed => Ok(ApprovalReceipt::DeliveryFailed { approval_id }),
+        ApprovalState::Expired => expired_approval_receipt(approval),
+        ApprovalState::Claimed | ApprovalState::Applying => {
+            let decision = approval
+                .decision
+                .as_ref()
+                .map(|decision| decision.decision)
+                .ok_or_else(corrupt_approval_state)?;
+            Ok(ApprovalReceipt::AlreadyHandled {
+                approval_id,
+                decision,
+                state: wire_approval_delivery_state(approval.state)?,
+            })
+        }
+        ApprovalState::Pending => Err(corrupt_approval_state()),
+    }
+}
+
+fn receipt_for_exact_winner(
+    approval: ApprovalRecord,
+    exact_replay: bool,
+) -> Result<ApprovalReceipt, ConversationError> {
+    let approval_id = wire_approval_id(approval.approval_id);
+    match approval.state {
+        ApprovalState::Claimed if exact_replay => Ok(ApprovalReceipt::Claimed { approval_id }),
+        ApprovalState::Applied if exact_replay => Ok(ApprovalReceipt::Applied { approval_id }),
+        ApprovalState::DeliveryFailed if exact_replay => {
+            Ok(ApprovalReceipt::DeliveryFailed { approval_id })
+        }
+        ApprovalState::Expired if exact_replay => expired_approval_receipt(&approval),
+        ApprovalState::Pending => Err(corrupt_approval_state()),
+        state => {
+            let decision = approval
+                .decision
+                .as_ref()
+                .map(|decision| decision.decision)
+                .ok_or_else(corrupt_approval_state)?;
+            Ok(ApprovalReceipt::AlreadyHandled {
+                approval_id,
+                decision,
+                state: wire_approval_delivery_state(state)?,
+            })
+        }
+    }
+}
+
+fn expired_approval_receipt(
+    approval: &ApprovalRecord,
+) -> Result<ApprovalReceipt, ConversationError> {
+    let approval_id = wire_approval_id(approval.approval_id);
+    match approval.decision.as_ref() {
+        Some(decision) => Ok(ApprovalReceipt::AlreadyHandled {
+            approval_id,
+            decision: decision.decision,
+            state: ApprovalDeliveryState::Expired,
+        }),
+        None => Ok(ApprovalReceipt::Expired { approval_id }),
+    }
+}
+
+fn wire_approval_delivery_state(
+    state: ApprovalState,
+) -> Result<ApprovalDeliveryState, ConversationError> {
+    match state {
+        ApprovalState::Claimed => Ok(ApprovalDeliveryState::Claimed),
+        ApprovalState::Applying => Ok(ApprovalDeliveryState::Applying),
+        ApprovalState::Applied => Ok(ApprovalDeliveryState::Applied),
+        ApprovalState::DeliveryFailed => Ok(ApprovalDeliveryState::DeliveryFailed),
+        ApprovalState::Expired => Ok(ApprovalDeliveryState::Expired),
+        ApprovalState::Pending => Err(corrupt_approval_state()),
+    }
+}
+
+fn corrupt_approval_state() -> ConversationError {
+    ConversationError::Store(RuntimeStoreError::UnknownOrCorruptSchema)
+}
+
+fn wire_approval_id(value: RuntimeId) -> ApprovalId {
+    ApprovalId::new(value.to_canonical_string())
 }
 
 async fn supervise_execution_task(
@@ -1250,6 +2023,13 @@ async fn execute_command(
         }
     };
 
+    let execution_events = AbortOnDropTask::new(tokio::spawn(forward_execution_events(
+        command.command_id,
+        turn_id,
+        prepared.events,
+        runner_tx.clone(),
+    )));
+    let _execution_events = execution_events;
     let process = prepared.process;
     let control = prepared.control;
     let release = prepared.release;
@@ -1471,18 +2251,15 @@ async fn execute_command(
             }
         }
     };
-    if store
-        .complete_command_with_event(CompleteCommand {
-            conversation_id: conversation.conversation_id,
-            command_id: command.command_id,
-            turn_id,
-            terminal_state: completion.terminal_state,
-            terminal_payload: completion.terminal_payload,
-            event_payload: completion.event_payload,
-        })
-        .await
-        .is_err()
-    {
+    let completion = CompleteCommand {
+        conversation_id: conversation.conversation_id,
+        command_id: command.command_id,
+        turn_id,
+        terminal_state: completion.terminal_state,
+        terminal_payload: completion.terminal_payload,
+        event_payload: completion.event_payload,
+    };
+    if !complete_command_with_event_exact(&store, completion).await {
         let _ = runner_tx
             .send(RunnerEvent::RecoveryBlocked {
                 command_id: command.command_id,
@@ -1495,6 +2272,19 @@ async fn execute_command(
             command_id: command.command_id,
         })
         .await;
+}
+
+async fn complete_command_with_event_exact(
+    store: &RuntimeStoreHandle,
+    input: CompleteCommand,
+) -> bool {
+    match store.complete_command_with_event(input.clone()).await {
+        Ok(_) => true,
+        Err(RuntimeStoreError::CommitOutcomeUnknown {
+            operation: super::store::RuntimeCommitOperation::CompleteCommand,
+        }) => store.complete_command_with_event(input).await.is_ok(),
+        Err(_) => false,
+    }
 }
 
 async fn terminate_started_before_release_exact(
@@ -1569,13 +2359,20 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex as StdMutex, OnceLock};
 
-    use agentdeck_protocol::AgentKind;
+    use agentdeck_protocol::{
+        ActionDecision, ActionKind, ActionRequest, ActionRequestVendor, AgentKind,
+        CodexApprovalPolicy, CodexSandboxMode,
+    };
 
     use super::*;
-    use crate::runtime::connection::PrincipalIssuer;
+    use crate::runtime::approval::{
+        ApprovalAttemptKey, ApprovalDeliveryOutcome, ApprovalPolicySnapshot,
+        ApprovalPrincipalCapability, BoundApprovalDelivery,
+    };
+    use crate::runtime::connection::{ApprovalPermissionGrant, PrincipalIssuer};
     use crate::runtime::execution::{
-        DisabledExecutionCoordinator, PreparedRuntimeExecution, RuntimeExecutionRelease,
-        RuntimeProcessIdentity,
+        DisabledExecutionCoordinator, PreparedRuntimeExecution, RuntimeExecutionEvent,
+        RuntimeExecutionRelease, RuntimeProcessIdentity, runtime_execution_event_channel,
     };
     use crate::runtime::store::{
         CommandReceiptSelector, CommandState, ConversationDescriptor, NewConversation,
@@ -1586,6 +2383,394 @@ mod tests {
     use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    struct NoopApprovalDelivery {
+        policy: ApprovalPolicySnapshot,
+    }
+
+    struct GatedApprovalDelivery {
+        policy: ApprovalPolicySnapshot,
+        calls: AtomicUsize,
+        entered: tokio::sync::Notify,
+        gate: Semaphore,
+        active: AtomicUsize,
+        completed: AtomicUsize,
+    }
+
+    impl GatedApprovalDelivery {
+        fn new() -> Self {
+            Self {
+                policy: ApprovalPolicySnapshot {
+                    agent_kind: AgentKind::Codex,
+                    action_kind: ActionKind::ExecuteCommand,
+                    allow_approve: true,
+                    allow_deny: true,
+                    allow_persist: false,
+                    deadline_at_ms: None,
+                },
+                calls: AtomicUsize::new(0),
+                entered: tokio::sync::Notify::new(),
+                gate: Semaphore::new(0),
+                active: AtomicUsize::new(0),
+                completed: AtomicUsize::new(0),
+            }
+        }
+
+        async fn wait_until_called(&self) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while self.calls.load(Ordering::SeqCst) == 0 {
+                    self.entered.notified().await;
+                }
+            })
+            .await
+            .expect("approval delivery starts");
+        }
+
+        fn release(&self) {
+            self.gate.add_permits(1);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BoundApprovalDelivery for GatedApprovalDelivery {
+        fn policy(&self) -> &ApprovalPolicySnapshot {
+            &self.policy
+        }
+
+        async fn deliver(
+            &self,
+            _key: ApprovalAttemptKey,
+            _decision: &ActionDecision,
+        ) -> ApprovalDeliveryOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.active.fetch_add(1, Ordering::SeqCst);
+            struct ActiveDeliveryGuard<'a>(&'a AtomicUsize);
+            impl Drop for ActiveDeliveryGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            let _active = ActiveDeliveryGuard(&self.active);
+            self.entered.notify_waiters();
+            let _permit = self
+                .gate
+                .acquire()
+                .await
+                .expect("gated delivery remains open");
+            self.completed.fetch_add(1, Ordering::SeqCst);
+            ApprovalDeliveryOutcome::AppliedAck
+        }
+    }
+
+    struct SequencedApprovalDelivery {
+        policy: ApprovalPolicySnapshot,
+        outcomes: StdMutex<VecDeque<ApprovalDeliveryOutcome>>,
+        decisions: StdMutex<Vec<(String, agentdeck_protocol::ActionDecisionKind, bool)>>,
+    }
+
+    impl SequencedApprovalDelivery {
+        fn fail_then_apply() -> Self {
+            Self {
+                policy: ApprovalPolicySnapshot {
+                    agent_kind: AgentKind::Codex,
+                    action_kind: ActionKind::ExecuteCommand,
+                    allow_approve: true,
+                    allow_deny: true,
+                    allow_persist: false,
+                    deadline_at_ms: None,
+                },
+                outcomes: StdMutex::new(VecDeque::from([
+                    ApprovalDeliveryOutcome::PermanentlyRejected,
+                    ApprovalDeliveryOutcome::AppliedAck,
+                ])),
+                decisions: StdMutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BoundApprovalDelivery for SequencedApprovalDelivery {
+        fn policy(&self) -> &ApprovalPolicySnapshot {
+            &self.policy
+        }
+
+        async fn deliver(
+            &self,
+            _key: ApprovalAttemptKey,
+            decision: &ActionDecision,
+        ) -> ApprovalDeliveryOutcome {
+            self.decisions
+                .lock()
+                .expect("approval decisions lock")
+                .push((
+                    decision.request_id.clone(),
+                    decision.decision,
+                    decision.persist,
+                ));
+            self.outcomes
+                .lock()
+                .expect("approval outcomes lock")
+                .pop_front()
+                .expect("one outcome per delivery round")
+        }
+    }
+
+    struct PanicsThenAppliesDelivery {
+        policy: ApprovalPolicySnapshot,
+        calls: AtomicUsize,
+    }
+
+    impl PanicsThenAppliesDelivery {
+        fn new() -> Self {
+            Self {
+                policy: ApprovalPolicySnapshot {
+                    agent_kind: AgentKind::Codex,
+                    action_kind: ActionKind::ExecuteCommand,
+                    allow_approve: true,
+                    allow_deny: true,
+                    allow_persist: false,
+                    deadline_at_ms: None,
+                },
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BoundApprovalDelivery for PanicsThenAppliesDelivery {
+        fn policy(&self) -> &ApprovalPolicySnapshot {
+            &self.policy
+        }
+
+        async fn deliver(
+            &self,
+            _key: ApprovalAttemptKey,
+            _decision: &ActionDecision,
+        ) -> ApprovalDeliveryOutcome {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("injected bound delivery panic");
+            }
+            ApprovalDeliveryOutcome::AppliedAck
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BoundApprovalDelivery for NoopApprovalDelivery {
+        fn policy(&self) -> &ApprovalPolicySnapshot {
+            &self.policy
+        }
+
+        async fn deliver(
+            &self,
+            _key: ApprovalAttemptKey,
+            _decision: &ActionDecision,
+        ) -> ApprovalDeliveryOutcome {
+            ApprovalDeliveryOutcome::PermanentlyRejected
+        }
+    }
+
+    fn approval_request() -> ActionRequest {
+        approval_request_with_id("actor-request-1")
+    }
+
+    fn approval_request_with_id(request_id: impl Into<String>) -> ActionRequest {
+        ActionRequest {
+            request_id: request_id.into(),
+            kind: ActionKind::ExecuteCommand,
+            summary: "actor approval request".to_owned(),
+            vendor: ActionRequestVendor::Codex {
+                approval_policy_at_decision: CodexApprovalPolicy::OnRequest,
+                sandbox_at_decision: CodexSandboxMode::WorkspaceWrite,
+                can_persist: false,
+            },
+        }
+    }
+
+    fn approval_delivery() -> Arc<dyn BoundApprovalDelivery> {
+        Arc::new(NoopApprovalDelivery {
+            policy: ApprovalPolicySnapshot {
+                agent_kind: AgentKind::Codex,
+                action_kind: ActionKind::ExecuteCommand,
+                allow_approve: true,
+                allow_deny: true,
+                allow_persist: false,
+                deadline_at_ms: None,
+            },
+        })
+    }
+
+    fn expired_approval_record(with_winner: bool) -> ApprovalRecord {
+        ApprovalRecord {
+            approval_id: runtime_id(RuntimeIdKind::Approval, 0x61),
+            conversation_id: runtime_id(RuntimeIdKind::Conversation, 0x62),
+            command_id: runtime_id(RuntimeIdKind::Command, 0x63),
+            turn_id: runtime_id(RuntimeIdKind::Turn, 0x64),
+            state: ApprovalState::Expired,
+            request: approval_request(),
+            policy: approval_delivery().policy().clone(),
+            decision: with_winner.then(|| ActionDecision {
+                request_id: "actor-request-1".to_owned(),
+                decision: agentdeck_protocol::ActionDecisionKind::Approve,
+                persist: false,
+            }),
+            requested_at_ms: 1,
+            deadline_at_ms: 2,
+            claimed_at_ms: with_winner.then_some(1),
+            state_changed_at_ms: 2,
+            delivery_round: u32::from(with_winner),
+            attempts_in_round: u8::from(with_winner),
+            round_started_at_ms: with_winner.then_some(1),
+            last_attempt_at_ms: with_winner.then_some(1),
+            state_version: if with_winner { 4 } else { 2 },
+            last_event_id: runtime_id(RuntimeIdKind::Event, 0x65),
+            status_detail: None,
+        }
+    }
+
+    #[test]
+    fn expired_receipt_preserves_claimed_winner_but_pending_expiry_has_none() {
+        let pending = approval_receipt_for_resolve(ApprovalMutationOutcome::ExpiredOrStale {
+            approval: expired_approval_record(false),
+        })
+        .expect("pending expiry receipt");
+        assert!(matches!(pending, ApprovalReceipt::Expired { .. }));
+
+        let claimed = approval_receipt_for_resolve(ApprovalMutationOutcome::ExpiredOrStale {
+            approval: expired_approval_record(true),
+        })
+        .expect("claimed expiry receipt");
+        assert!(matches!(
+            claimed,
+            ApprovalReceipt::AlreadyHandled {
+                decision: agentdeck_protocol::ActionDecisionKind::Approve,
+                state: ApprovalDeliveryState::Expired,
+                ..
+            }
+        ));
+
+        let exact_replay = receipt_for_exact_winner(expired_approval_record(true), true)
+            .expect("exact claimed expiry replay");
+        assert!(matches!(
+            exact_replay,
+            ApprovalReceipt::AlreadyHandled {
+                decision: agentdeck_protocol::ActionDecisionKind::Approve,
+                state: ApprovalDeliveryState::Expired,
+                ..
+            }
+        ));
+
+        // A later opposing resolve is represented by AlreadyHandled; the receipt must still
+        // expose the immutable persisted winner rather than the caller's attempted decision.
+        let opposing = approval_receipt_for_resolve(ApprovalMutationOutcome::AlreadyHandled {
+            approval: expired_approval_record(true),
+        })
+        .expect("opposing resolve observes expired winner");
+        assert!(matches!(
+            opposing,
+            ApprovalReceipt::AlreadyHandled {
+                decision: agentdeck_protocol::ActionDecisionKind::Approve,
+                state: ApprovalDeliveryState::Expired,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn execution_action_request_is_forwarded_to_the_bounded_actor_lane() {
+        let command_id = runtime_id(RuntimeIdKind::Command, 0x31);
+        let turn_id = runtime_id(RuntimeIdKind::Turn, 0x32);
+        let (execution_tx, execution_rx) = runtime_execution_event_channel();
+        let (runner_tx, mut runner_rx) = mpsc::channel(1);
+        let forwarder = tokio::spawn(forward_execution_events(
+            command_id,
+            turn_id,
+            execution_rx,
+            runner_tx,
+        ));
+
+        execution_tx
+            .send(RuntimeExecutionEvent::ActionRequest {
+                request: approval_request(),
+                delivery: approval_delivery(),
+            })
+            .await
+            .expect("send bounded execution event");
+
+        match runner_rx.recv().await.expect("forwarded actor event") {
+            RunnerEvent::ApprovalRequested {
+                command_id: observed_command,
+                turn_id: observed_turn,
+                request,
+                acknowledged,
+                ..
+            } => {
+                assert_eq!(observed_command, command_id);
+                assert_eq!(observed_turn, turn_id);
+                assert_eq!(request.request_id, "actor-request-1");
+                acknowledged.send(Ok(())).expect("ack registration");
+            }
+            _ => panic!("expected approval request runner event"),
+        }
+        drop(execution_tx);
+        forwarder.await.expect("join event forwarder");
+    }
+
+    #[test]
+    fn stale_fatal_delivery_completion_cannot_block_the_new_generation() {
+        assert_eq!(
+            classify_approval_task_completion(
+                ApprovalTaskKind::Delivery,
+                1,
+                None,
+                ApprovalWorkerResult::FatalClosure,
+            ),
+            ApprovalTaskCompletionDisposition::IgnoreStale
+        );
+        assert_eq!(
+            classify_approval_task_completion(
+                ApprovalTaskKind::Delivery,
+                1,
+                Some(2),
+                ApprovalWorkerResult::FatalClosure,
+            ),
+            ApprovalTaskCompletionDisposition::IgnoreStale
+        );
+        assert_eq!(
+            classify_approval_task_completion(
+                ApprovalTaskKind::Delivery,
+                2,
+                Some(2),
+                ApprovalWorkerResult::FatalClosure,
+            ),
+            ApprovalTaskCompletionDisposition::RecoveryBlocked
+        );
+    }
+
+    #[tokio::test]
+    async fn panicking_approval_worker_is_reported_and_does_not_panic_the_actor_lane() {
+        let approval_id = runtime_id(RuntimeIdKind::Approval, 0x39);
+        let (runner_tx, mut runner_rx) = mpsc::channel(1);
+        let mut supervisor = spawn_approval_task(
+            approval_id,
+            ApprovalTaskKind::Delivery,
+            1,
+            runner_tx,
+            async move {
+                panic!("injected bound delivery panic");
+            },
+        );
+
+        assert!(matches!(
+            runner_rx.recv().await,
+            Some(RunnerEvent::ApprovalTaskFinished {
+                approval_id: observed,
+                task_kind: ApprovalTaskKind::Delivery,
+                result: ApprovalWorkerResult::StoreBlocked,
+                ..
+            }) if observed == approval_id
+        ));
+        supervisor.join().await.expect("supervisor contains panic");
+    }
 
     #[derive(Clone, Debug)]
     struct ManualClock(Arc<AtomicU64>);
@@ -1620,6 +2805,44 @@ mod tests {
                 return Err(RuntimeStoreError::WorkerStopped);
             }
             Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum InjectedStoreFailure {
+        WorkerStopped,
+        Corrupt,
+    }
+
+    #[derive(Debug)]
+    struct FailStoreOperationOnce {
+        operation: RuntimeStoreOperation,
+        failure: InjectedStoreFailure,
+        armed: AtomicBool,
+    }
+
+    impl FailStoreOperationOnce {
+        fn new(operation: RuntimeStoreOperation, failure: InjectedStoreFailure) -> Self {
+            Self {
+                operation,
+                failure,
+                armed: AtomicBool::new(true),
+            }
+        }
+    }
+
+    impl RuntimeStoreFaultInjector for FailStoreOperationOnce {
+        fn before_operation(
+            &self,
+            operation: RuntimeStoreOperation,
+        ) -> Result<(), RuntimeStoreError> {
+            if operation != self.operation || !self.armed.swap(false, Ordering::SeqCst) {
+                return Ok(());
+            }
+            Err(match self.failure {
+                InjectedStoreFailure::WorkerStopped => RuntimeStoreError::WorkerStopped,
+                InjectedStoreFailure::Corrupt => RuntimeStoreError::UnknownOrCorruptSchema,
+            })
         }
     }
 
@@ -1713,6 +2936,47 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct BlockClaimCommit {
+        entered: AtomicBool,
+        released: StdMutex<bool>,
+        released_changed: Condvar,
+    }
+
+    impl BlockClaimCommit {
+        fn new() -> Self {
+            Self {
+                entered: AtomicBool::new(false),
+                released: StdMutex::new(false),
+                released_changed: Condvar::new(),
+            }
+        }
+
+        fn release(&self) {
+            *self.released.lock().expect("claim blocker lock") = true;
+            self.released_changed.notify_all();
+        }
+    }
+
+    impl RuntimeStoreFaultInjector for BlockClaimCommit {
+        fn before_operation(
+            &self,
+            operation: RuntimeStoreOperation,
+        ) -> Result<(), RuntimeStoreError> {
+            if operation == RuntimeStoreOperation::ClaimApprovalBeforeCommit {
+                self.entered.store(true, Ordering::SeqCst);
+                let mut released = self.released.lock().expect("claim blocker lock");
+                while !*released {
+                    released = self
+                        .released_changed
+                        .wait(released)
+                        .expect("claim blocker wait");
+                }
+            }
+            Ok(())
+        }
+    }
+
     struct TestRoot(PathBuf);
 
     impl TestRoot {
@@ -1774,6 +3038,8 @@ mod tests {
         active: Arc<AtomicUsize>,
         peak: AtomicUsize,
         releases: AtomicUsize,
+        approval_delivery: StdMutex<Option<SharedApprovalDelivery>>,
+        approval_events: StdMutex<Option<mpsc::Sender<RuntimeExecutionEvent>>>,
     }
 
     struct FakeControl {
@@ -1789,6 +3055,7 @@ mod tests {
         release_error: bool,
         cancel_fails: bool,
         panic_prepare: bool,
+        emit_approval: bool,
     }
 
     struct FakeRelease {
@@ -1890,6 +3157,42 @@ mod tests {
             Self::new(true, true, FakeBehavior::default())
         }
 
+        fn held_with_approval(delivery: SharedApprovalDelivery) -> Self {
+            let fake = Self::new(
+                true,
+                false,
+                FakeBehavior {
+                    emit_approval: true,
+                    ..FakeBehavior::default()
+                },
+            );
+            *fake
+                .inner
+                .approval_delivery
+                .lock()
+                .expect("approval delivery lock") = Some(delivery);
+            fake
+        }
+
+        fn recovery_blocked_with_approval(delivery: SharedApprovalDelivery) -> Self {
+            let fake = Self::new(
+                true,
+                false,
+                FakeBehavior {
+                    completion_error: true,
+                    cancel_fails: true,
+                    emit_approval: true,
+                    ..FakeBehavior::default()
+                },
+            );
+            *fake
+                .inner
+                .approval_delivery
+                .lock()
+                .expect("approval delivery lock") = Some(delivery);
+            fake
+        }
+
         fn completion_error(cancel_fails: bool) -> Self {
             Self::new(
                 false,
@@ -1950,8 +3253,24 @@ mod tests {
                     active: Arc::new(AtomicUsize::new(0)),
                     peak: AtomicUsize::new(0),
                     releases: AtomicUsize::new(0),
+                    approval_delivery: StdMutex::new(None),
+                    approval_events: StdMutex::new(None),
                 }),
             }
+        }
+
+        async fn emit_approval(&self, request: ActionRequest, delivery: SharedApprovalDelivery) {
+            let sender = self
+                .inner
+                .approval_events
+                .lock()
+                .expect("approval events lock")
+                .clone()
+                .expect("approval execution stream is installed");
+            sender
+                .send(RuntimeExecutionEvent::ActionRequest { request, delivery })
+                .await
+                .expect("send fake approval event");
         }
 
         fn starts(&self) -> Vec<StartObservation> {
@@ -2061,6 +3380,29 @@ mod tests {
             assert!(!self.inner.behavior.panic_prepare, "injected prepare panic");
 
             let process_id = self.inner.next_pid.fetch_add(1, Ordering::SeqCst);
+            let events = if self.inner.behavior.emit_approval {
+                let (sender, receiver) = runtime_execution_event_channel();
+                sender
+                    .try_send(RuntimeExecutionEvent::ActionRequest {
+                        request: approval_request(),
+                        delivery: self
+                            .inner
+                            .approval_delivery
+                            .lock()
+                            .expect("approval delivery lock")
+                            .clone()
+                            .unwrap_or_else(approval_delivery),
+                    })
+                    .expect("fake approval event fits bounded channel");
+                *self
+                    .inner
+                    .approval_events
+                    .lock()
+                    .expect("approval events lock") = Some(sender);
+                receiver
+            } else {
+                crate::runtime::execution::closed_execution_events()
+            };
             Ok(PreparedRuntimeExecution {
                 process: RuntimeProcessIdentity {
                     process_group_id: process_id,
@@ -2084,6 +3426,7 @@ mod tests {
                     inner: self.inner.clone(),
                     active_guard: Some(active_guard),
                 }),
+                events,
             })
         }
     }
@@ -2125,6 +3468,1371 @@ mod tests {
             })
             .await
             .expect("create actor conversation")
+    }
+
+    async fn wait_for_approval_count(path: &Path, expected: i64) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let connection = rusqlite::Connection::open_with_flags(
+                    path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .expect("open runtime DB read-only");
+                let count: i64 = connection
+                    .query_row(
+                        "SELECT approval_count FROM runtime_meta WHERE singleton = 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("read approval count");
+                if count == expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("approval count reaches expected value");
+    }
+
+    fn read_only_approval_id(path: &Path) -> RuntimeId {
+        let connection =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open runtime DB read-only");
+        let bytes: Vec<u8> = connection
+            .query_row(
+                "SELECT approval_id FROM approval_ledger ORDER BY requested_at_ms LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read approval id");
+        RuntimeId::from_bytes(
+            RuntimeIdKind::Approval,
+            <[u8; 16]>::try_from(bytes.as_slice()).expect("approval id is 16 bytes"),
+        )
+        .expect("valid approval id")
+    }
+
+    async fn wait_for_approval_state(path: &Path, expected: &str) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let connection = rusqlite::Connection::open_with_flags(
+                    path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .expect("open runtime DB read-only");
+                let state: String = connection
+                    .query_row(
+                        "SELECT state FROM approval_ledger ORDER BY requested_at_ms LIMIT 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("read approval state");
+                if state == expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("approval reaches expected state");
+    }
+
+    fn read_only_approval_state(path: &Path) -> String {
+        let connection =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open runtime DB read-only");
+        connection
+            .query_row(
+                "SELECT state FROM approval_ledger ORDER BY requested_at_ms LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read approval state")
+    }
+
+    #[tokio::test]
+    async fn execution_action_request_is_registered_durably_before_actor_acknowledges() {
+        let root = TestRoot::new("approval-action-request");
+        let store = root.open().await;
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 33).await;
+        let fake = FakeCoordinator::held_with_approval(approval_delivery());
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xA3),
+            1,
+        )
+        .expect("registry")
+        .with_approval_runtime(
+            Arc::new(SystemRuntimeClock),
+            Arc::new(TokioApprovalSleeper),
+            Arc::new(FixedApprovalBackoff),
+        );
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        let principal = local_principal(33);
+        let command = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "approval-event",
+                "emit one action request",
+            )
+            .await,
+        );
+        fake.wait_for_starts(1).await;
+
+        wait_for_approval_count(&root.0.join("runtime.db"), 1).await;
+        assert_eq!(fake.cancel_count(command.command_id), 0);
+
+        // The focused test deliberately leaves the held fake unfinished; dropping the registry
+        // aborts its side-effect-free task after the durable assertion.
+        drop(registry);
+        store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test]
+    async fn delivery_transitions_to_applied_after_resolver_capability_is_dropped() {
+        let root = TestRoot::new("approval-disconnect");
+        let database = root.0.join("runtime.db");
+        let store = root.open().await;
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 34).await;
+        let delivery = Arc::new(GatedApprovalDelivery::new());
+        let fake = FakeCoordinator::held_with_approval(delivery.clone());
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xA4),
+            1,
+        )
+        .expect("registry");
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        let prompt_principal = local_principal(34);
+        let command = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &prompt_principal,
+                "approval-disconnect",
+                "hold execution while approval applies",
+            )
+            .await,
+        );
+        fake.wait_for_starts(1).await;
+        wait_for_approval_count(&database, 1).await;
+        let approval_id = read_only_approval_id(&database);
+        let turn_id = fake.starts()[0].turn_id;
+        let issuer = PrincipalIssuer::local_only([0xB4; 32]);
+        let resolver = issuer
+            .issue_verified_local_with_approval_permissions(
+                501,
+                [0xB4; 16],
+                ApprovalPermissionGrant::ResolveOnly,
+            )
+            .expect("resolve principal");
+        let guard = resolver
+            .try_enter_approval()
+            .expect("enter approval resolve");
+        guard.require_resolve().expect("resolve permission");
+        let receipt = registry
+            .resolve_approval(
+                conversation.conversation_id,
+                turn_id,
+                approval_id,
+                ActionDecision {
+                    request_id: "actor-request-1".to_owned(),
+                    decision: agentdeck_protocol::ActionDecisionKind::Approve,
+                    persist: false,
+                },
+                guard,
+            )
+            .await
+            .expect("claim approval");
+        assert!(matches!(receipt, ApprovalReceipt::Claimed { .. }));
+        delivery.wait_until_called().await;
+
+        // The route/worker is actor-owned. Dropping the resolver capability (the same lifetime
+        // consequence as disconnecting its transport connection) must not cancel daemon delivery.
+        drop(resolver);
+        delivery.release();
+        wait_for_approval_state(&database, "applied").await;
+        assert_eq!(delivery.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.cancel_count(command.command_id), 0);
+
+        drop(registry);
+        store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test]
+    async fn approval_guard_covers_claim_commit_then_revoke_does_not_cancel_delivery() {
+        let root = TestRoot::new("approval-guard-commit");
+        let database = root.0.join("runtime.db");
+        let keys = MemoryKeyStore::new();
+        let blocker = Arc::new(BlockClaimCommit::new());
+        let kek = load_or_create_storage_kek(&keys, &root.0.join("key-state.db"))
+            .expect("approval guard StorageKEK");
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(database.clone()).with_fault_injector(blocker.clone()),
+            kek,
+        )
+        .await
+        .expect("open approval guard store");
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 37).await;
+        let delivery = Arc::new(GatedApprovalDelivery::new());
+        let fake = FakeCoordinator::held_with_approval(delivery.clone());
+        let registry = Arc::new(
+            ConversationRegistry::new(
+                store.clone(),
+                Arc::new(fake.clone()),
+                runtime_id(RuntimeIdKind::DaemonBoot, 0xA7),
+                1,
+            )
+            .expect("registry"),
+        );
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        let prompt_principal = local_principal(37);
+        let _command = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &prompt_principal,
+                "approval-guard-commit",
+                "block claim commit while revoking",
+            )
+            .await,
+        );
+        fake.wait_for_starts(1).await;
+        wait_for_approval_count(&database, 1).await;
+        let approval_id = read_only_approval_id(&database);
+        let turn_id = fake.starts()[0].turn_id;
+        let issuer = PrincipalIssuer::local_only([0xB7; 32]);
+        let resolver = issuer
+            .issue_verified_local_with_approval_permissions(
+                501,
+                [0xB7; 16],
+                ApprovalPermissionGrant::ResolveOnly,
+            )
+            .expect("resolve principal");
+        let guard = resolver
+            .try_enter_approval()
+            .expect("enter approval resolve");
+        let resolving_registry = registry.clone();
+        let resolve = tokio::spawn(async move {
+            resolving_registry
+                .resolve_approval(
+                    conversation.conversation_id,
+                    turn_id,
+                    approval_id,
+                    ActionDecision {
+                        request_id: "actor-request-1".to_owned(),
+                        decision: agentdeck_protocol::ActionDecisionKind::Approve,
+                        persist: false,
+                    },
+                    guard,
+                )
+                .await
+        });
+        wait_until(|| blocker.entered.load(Ordering::SeqCst)).await;
+
+        let revoking = resolver.clone();
+        let revoke = tokio::spawn(async move { revoking.begin_revoke().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !revoke.is_finished(),
+            "revoke must wait while actor owns the approval guard across COMMIT"
+        );
+        blocker.release();
+        assert!(matches!(
+            resolve
+                .await
+                .expect("join resolve")
+                .expect("claim after blocker release"),
+            ApprovalReceipt::Claimed { .. }
+        ));
+        revoke
+            .await
+            .expect("join revoke")
+            .expect("revoke after claim COMMIT");
+        resolver.finish_revoke();
+
+        delivery.wait_until_called().await;
+        delivery.release();
+        wait_for_approval_state(&database, "applied").await;
+        assert_eq!(delivery.calls.load(Ordering::SeqCst), 1);
+
+        drop(registry);
+        store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test]
+    async fn recovery_blocked_aborts_bound_delivery_without_fabricating_expiry() {
+        let root = TestRoot::new("approval-recovery-blocked");
+        let database = root.0.join("runtime.db");
+        let store = root.open().await;
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 38).await;
+        let delivery = Arc::new(GatedApprovalDelivery::new());
+        let fake = FakeCoordinator::recovery_blocked_with_approval(delivery.clone());
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xA8),
+            1,
+        )
+        .expect("registry");
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        let prompt_principal = local_principal(38);
+        let command = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &prompt_principal,
+                "approval-recovery-blocked",
+                "unknown execution outcome must stop approval",
+            )
+            .await,
+        );
+        fake.wait_for_starts(1).await;
+        wait_for_approval_count(&database, 1).await;
+        let approval_id = read_only_approval_id(&database);
+        let turn_id = fake.starts()[0].turn_id;
+        let issuer = PrincipalIssuer::local_only([0xB8; 32]);
+        let resolver = issuer
+            .issue_verified_local_with_approval_permissions(
+                501,
+                [0xB8; 16],
+                ApprovalPermissionGrant::ResolveOnly,
+            )
+            .expect("resolve principal");
+        let guard = resolver
+            .try_enter_approval()
+            .expect("enter approval resolve");
+        let _ = registry
+            .resolve_approval(
+                conversation.conversation_id,
+                turn_id,
+                approval_id,
+                ActionDecision {
+                    request_id: "actor-request-1".to_owned(),
+                    decision: agentdeck_protocol::ActionDecisionKind::Approve,
+                    persist: false,
+                },
+                guard,
+            )
+            .await
+            .expect("claim approval");
+        delivery.wait_until_called().await;
+        assert_eq!(read_only_approval_state(&database), "applying");
+
+        fake.release(command.command_id);
+        wait_until(|| {
+            fake.cancel_count(command.command_id) == 1
+                && delivery.active.load(Ordering::SeqCst) == 0
+        })
+        .await;
+        assert_eq!(delivery.completed.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            read_only_approval_state(&database),
+            "applying",
+            "RecoveryBlocked lacks fence evidence and must not fabricate Expired"
+        );
+
+        drop(registry);
+        store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test]
+    async fn panicking_bound_delivery_is_cleared_and_explicit_retry_can_apply() {
+        let root = TestRoot::new("approval-panic-retry");
+        let database = root.0.join("runtime.db");
+        let store = root.open().await;
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 39).await;
+        let delivery = Arc::new(PanicsThenAppliesDelivery::new());
+        let fake = FakeCoordinator::held_with_approval(delivery.clone());
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xA9),
+            1,
+        )
+        .expect("registry");
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        let prompt_principal = local_principal(39);
+        let _command = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &prompt_principal,
+                "approval-panic-retry",
+                "panic is contained by approval supervisor",
+            )
+            .await,
+        );
+        fake.wait_for_starts(1).await;
+        wait_for_approval_count(&database, 1).await;
+        let approval_id = read_only_approval_id(&database);
+        let turn_id = fake.starts()[0].turn_id;
+        let issuer = PrincipalIssuer::local_only([0xB9; 32]);
+        let resolver = issuer
+            .issue_verified_local_with_approval_permissions(
+                501,
+                [0xB9; 16],
+                ApprovalPermissionGrant::ResolveAndRetry,
+            )
+            .expect("resolve and retry principal");
+        let resolve_guard = resolver
+            .try_enter_approval()
+            .expect("enter resolve capability");
+        let _ = registry
+            .resolve_approval(
+                conversation.conversation_id,
+                turn_id,
+                approval_id,
+                ActionDecision {
+                    request_id: "actor-request-1".to_owned(),
+                    decision: agentdeck_protocol::ActionDecisionKind::Approve,
+                    persist: false,
+                },
+                resolve_guard,
+            )
+            .await
+            .expect("claim approval");
+        wait_for_approval_state(&database, "applying").await;
+        wait_until(|| delivery.calls.load(Ordering::SeqCst) == 1).await;
+        // Give the bounded completion lane a fairness point to reap the panicked child task.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let retry_guard = resolver
+            .try_enter_approval()
+            .expect("enter retry capability");
+        let retry = registry
+            .retry_approval(conversation.conversation_id, approval_id, retry_guard)
+            .await
+            .expect("explicit retry after contained panic");
+        assert!(matches!(
+            retry,
+            ApprovalReceipt::AlreadyHandled {
+                decision: agentdeck_protocol::ActionDecisionKind::Approve,
+                state: ApprovalDeliveryState::Applying,
+                ..
+            }
+        ));
+        wait_for_approval_state(&database, "applied").await;
+        assert_eq!(delivery.calls.load(Ordering::SeqCst), 2);
+
+        drop(registry);
+        store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test]
+    async fn fatal_applied_closure_blocks_conversation_and_prevents_redelivery() {
+        let root = TestRoot::new("approval-fatal-closure");
+        let database = root.0.join("runtime.db");
+        let keys = MemoryKeyStore::new();
+        let kek = load_or_create_storage_kek(&keys, &root.0.join("key-state.db"))
+            .expect("fatal closure StorageKEK");
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(database.clone()).with_fault_injector(Arc::new(
+                FailStoreOperationOnce::new(
+                    RuntimeStoreOperation::MarkApprovalAppliedBeforeCommit,
+                    InjectedStoreFailure::Corrupt,
+                ),
+            )),
+            kek,
+        )
+        .await
+        .expect("open fatal closure store");
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 40).await;
+        let delivery = Arc::new(GatedApprovalDelivery::new());
+        let fake = FakeCoordinator::recovery_blocked_with_approval(delivery.clone());
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xAA),
+            1,
+        )
+        .expect("registry");
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        let prompt_principal = local_principal(40);
+        let command = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &prompt_principal,
+                "approval-fatal-closure",
+                "fatal applied closure must fence delivery",
+            )
+            .await,
+        );
+        fake.wait_for_starts(1).await;
+        wait_for_approval_count(&database, 1).await;
+        let approval_id = read_only_approval_id(&database);
+        let turn_id = fake.starts()[0].turn_id;
+        let issuer = PrincipalIssuer::local_only([0xBA; 32]);
+        let resolver = issuer
+            .issue_verified_local_with_approval_permissions(
+                501,
+                [0xBA; 16],
+                ApprovalPermissionGrant::ResolveOnly,
+            )
+            .expect("resolve principal");
+        let receipt = registry
+            .resolve_approval(
+                conversation.conversation_id,
+                turn_id,
+                approval_id,
+                ActionDecision {
+                    request_id: "actor-request-1".to_owned(),
+                    decision: agentdeck_protocol::ActionDecisionKind::Approve,
+                    persist: false,
+                },
+                resolver
+                    .try_enter_approval()
+                    .expect("first resolve capability"),
+            )
+            .await
+            .expect("claim approval");
+        assert!(matches!(receipt, ApprovalReceipt::Claimed { .. }));
+        delivery.wait_until_called().await;
+        delivery.release();
+        wait_until(|| fake.cancel_count(command.command_id) == 1).await;
+
+        let replay = registry
+            .resolve_approval(
+                conversation.conversation_id,
+                turn_id,
+                approval_id,
+                ActionDecision {
+                    request_id: "actor-request-1".to_owned(),
+                    decision: agentdeck_protocol::ActionDecisionKind::Approve,
+                    persist: false,
+                },
+                resolver
+                    .try_enter_approval()
+                    .expect("second resolve capability"),
+            )
+            .await;
+        assert!(matches!(replay, Err(ConversationError::ActorUnavailable)));
+        assert_eq!(delivery.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(read_only_approval_state(&database), "applying");
+
+        drop(registry);
+        store
+            .shutdown()
+            .await
+            .expect("shutdown fatal closure store");
+    }
+
+    #[tokio::test]
+    async fn claim_after_commit_unknown_converges_before_starting_one_worker() {
+        let root = TestRoot::new("approval-claim-after-commit");
+        let database = root.0.join("runtime.db");
+        let keys = MemoryKeyStore::new();
+        let kek = load_or_create_storage_kek(&keys, &root.0.join("key-state.db"))
+            .expect("claim after commit StorageKEK");
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(database.clone()).with_fault_injector(Arc::new(
+                FailStoreOperationOnce::new(
+                    RuntimeStoreOperation::ClaimApprovalAfterCommit,
+                    InjectedStoreFailure::WorkerStopped,
+                ),
+            )),
+            kek,
+        )
+        .await
+        .expect("open claim after commit store");
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 41).await;
+        let delivery = Arc::new(GatedApprovalDelivery::new());
+        let fake = FakeCoordinator::held_with_approval(delivery.clone());
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xAB),
+            1,
+        )
+        .expect("registry");
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        let prompt_principal = local_principal(41);
+        let _command = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &prompt_principal,
+                "approval-claim-after-commit",
+                "claim reply fault must not orphan delivery",
+            )
+            .await,
+        );
+        fake.wait_for_starts(1).await;
+        wait_for_approval_count(&database, 1).await;
+        let approval_id = read_only_approval_id(&database);
+        let turn_id = fake.starts()[0].turn_id;
+        let issuer = PrincipalIssuer::local_only([0xBB; 32]);
+        let resolver = issuer
+            .issue_verified_local_with_approval_permissions(
+                501,
+                [0xBB; 16],
+                ApprovalPermissionGrant::ResolveOnly,
+            )
+            .expect("resolve principal");
+        let receipt = registry
+            .resolve_approval(
+                conversation.conversation_id,
+                turn_id,
+                approval_id,
+                ActionDecision {
+                    request_id: "actor-request-1".to_owned(),
+                    decision: agentdeck_protocol::ActionDecisionKind::Approve,
+                    persist: false,
+                },
+                resolver.try_enter_approval().expect("resolve capability"),
+            )
+            .await
+            .expect("claim converges after unknown outcome");
+        assert!(matches!(receipt, ApprovalReceipt::Claimed { .. }));
+        delivery.wait_until_called().await;
+        assert_eq!(delivery.calls.load(Ordering::SeqCst), 1);
+        delivery.release();
+        wait_for_approval_state(&database, "applied").await;
+
+        drop(registry);
+        store
+            .shutdown()
+            .await
+            .expect("shutdown claim after commit store");
+    }
+
+    #[tokio::test]
+    async fn register_after_commit_unknown_installs_the_original_route() {
+        let root = TestRoot::new("approval-register-after-commit");
+        let database = root.0.join("runtime.db");
+        let keys = MemoryKeyStore::new();
+        let kek = load_or_create_storage_kek(&keys, &root.0.join("key-state.db"))
+            .expect("register after commit StorageKEK");
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(database.clone()).with_fault_injector(Arc::new(
+                FailStoreOperationOnce::new(
+                    RuntimeStoreOperation::RegisterApprovalAfterCommit,
+                    InjectedStoreFailure::WorkerStopped,
+                ),
+            )),
+            kek,
+        )
+        .await
+        .expect("open register after commit store");
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 42).await;
+        let delivery = Arc::new(GatedApprovalDelivery::new());
+        let fake = FakeCoordinator::held_with_approval(delivery.clone());
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xAC),
+            1,
+        )
+        .expect("registry");
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        let prompt_principal = local_principal(42);
+        let command = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &prompt_principal,
+                "approval-register-after-commit",
+                "register reply fault must keep route",
+            )
+            .await,
+        );
+        fake.wait_for_starts(1).await;
+        wait_for_approval_count(&database, 1).await;
+        let approval_id = read_only_approval_id(&database);
+        let turn_id = fake.starts()[0].turn_id;
+        let issuer = PrincipalIssuer::local_only([0xBC; 32]);
+        let resolver = issuer
+            .issue_verified_local_with_approval_permissions(
+                501,
+                [0xBC; 16],
+                ApprovalPermissionGrant::ResolveOnly,
+            )
+            .expect("resolve principal");
+        let receipt = registry
+            .resolve_approval(
+                conversation.conversation_id,
+                turn_id,
+                approval_id,
+                ActionDecision {
+                    request_id: "actor-request-1".to_owned(),
+                    decision: agentdeck_protocol::ActionDecisionKind::Approve,
+                    persist: false,
+                },
+                resolver.try_enter_approval().expect("resolve capability"),
+            )
+            .await
+            .expect("registered route accepts resolve");
+        assert!(matches!(receipt, ApprovalReceipt::Claimed { .. }));
+        delivery.wait_until_called().await;
+        assert_eq!(fake.cancel_count(command.command_id), 0);
+        assert_eq!(delivery.calls.load(Ordering::SeqCst), 1);
+        delivery.release();
+        wait_for_approval_state(&database, "applied").await;
+
+        drop(registry);
+        store
+            .shutdown()
+            .await
+            .expect("shutdown register after commit store");
+    }
+
+    #[tokio::test]
+    async fn exact_action_request_replay_at_route_capacity_keeps_the_existing_route() {
+        let root = TestRoot::new("approval-replay-at-route-capacity");
+        let database = root.0.join("runtime.db");
+        let store = root.open().await;
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 44).await;
+        let fake = FakeCoordinator::held_with_approval(approval_delivery());
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xAE),
+            1,
+        )
+        .expect("registry");
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        let principal = local_principal(44);
+        let command = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "approval-replay-at-route-capacity",
+                "fill route capacity then replay the first request",
+            )
+            .await,
+        );
+        fake.wait_for_starts(1).await;
+        wait_for_approval_count(&database, 1).await;
+        let approval_id = read_only_approval_id(&database);
+        let turn_id = fake.starts()[0].turn_id;
+
+        for index in 2..=crate::runtime::model::MAX_ACTIVE_APPROVALS_PER_TURN {
+            fake.emit_approval(
+                approval_request_with_id(format!("actor-request-{index}")),
+                approval_delivery(),
+            )
+            .await;
+            wait_for_approval_count(&database, i64::from(index)).await;
+        }
+
+        let replay_delivery = approval_delivery();
+        let replay_delivery_dropped = Arc::downgrade(&replay_delivery);
+        fake.emit_approval(approval_request(), replay_delivery)
+            .await;
+        wait_until(|| replay_delivery_dropped.upgrade().is_none()).await;
+
+        let issuer = PrincipalIssuer::local_only([0xBE; 32]);
+        let resolver = issuer
+            .issue_verified_local_with_approval_permissions(
+                501,
+                [0xBE; 16],
+                ApprovalPermissionGrant::ResolveOnly,
+            )
+            .expect("resolve principal");
+        let receipt = registry
+            .resolve_approval(
+                conversation.conversation_id,
+                turn_id,
+                approval_id,
+                ActionDecision {
+                    request_id: "actor-request-1".to_owned(),
+                    decision: agentdeck_protocol::ActionDecisionKind::Approve,
+                    persist: false,
+                },
+                resolver.try_enter_approval().expect("resolve capability"),
+            )
+            .await
+            .expect("exact replay must preserve the original route");
+        assert!(matches!(receipt, ApprovalReceipt::Claimed { .. }));
+        assert_eq!(fake.cancel_count(command.command_id), 0);
+
+        drop(registry);
+        store
+            .shutdown()
+            .await
+            .expect("shutdown route capacity store");
+    }
+
+    #[tokio::test]
+    async fn applied_action_request_replay_does_not_resurrect_or_occupy_a_route() {
+        let root = TestRoot::new("approval-terminal-replay-route");
+        let database = root.0.join("runtime.db");
+        let store = root.open().await;
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 45).await;
+        let delivery = Arc::new(GatedApprovalDelivery::new());
+        let fake = FakeCoordinator::held_with_approval(delivery.clone());
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xAF),
+            1,
+        )
+        .expect("registry");
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        let principal = local_principal(45);
+        let command = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "approval-terminal-replay-route",
+                "apply then replay the terminal action request",
+            )
+            .await,
+        );
+        fake.wait_for_starts(1).await;
+        wait_for_approval_count(&database, 1).await;
+        let approval_id = read_only_approval_id(&database);
+        let turn_id = fake.starts()[0].turn_id;
+        let issuer = PrincipalIssuer::local_only([0xBF; 32]);
+        let resolver = issuer
+            .issue_verified_local_with_approval_permissions(
+                501,
+                [0xBF; 16],
+                ApprovalPermissionGrant::ResolveOnly,
+            )
+            .expect("resolve principal");
+        let receipt = registry
+            .resolve_approval(
+                conversation.conversation_id,
+                turn_id,
+                approval_id,
+                ActionDecision {
+                    request_id: "actor-request-1".to_owned(),
+                    decision: agentdeck_protocol::ActionDecisionKind::Approve,
+                    persist: false,
+                },
+                resolver.try_enter_approval().expect("resolve capability"),
+            )
+            .await
+            .expect("claim approval");
+        assert!(matches!(receipt, ApprovalReceipt::Claimed { .. }));
+        delivery.wait_until_called().await;
+        delivery.release();
+        wait_for_approval_state(&database, "applied").await;
+
+        let replay_delivery = approval_delivery();
+        let replay_delivery_dropped = Arc::downgrade(&replay_delivery);
+        fake.emit_approval(approval_request(), replay_delivery)
+            .await;
+        wait_until(|| replay_delivery_dropped.upgrade().is_none()).await;
+
+        for index in 0..crate::runtime::model::MAX_ACTIVE_APPROVALS_PER_TURN {
+            fake.emit_approval(
+                approval_request_with_id(format!("terminal-replay-fill-{index}")),
+                approval_delivery(),
+            )
+            .await;
+            wait_for_approval_count(&database, i64::from(index) + 2).await;
+        }
+        assert_eq!(fake.cancel_count(command.command_id), 0);
+
+        drop(registry);
+        store
+            .shutdown()
+            .await
+            .expect("shutdown terminal replay store");
+    }
+
+    #[tokio::test]
+    async fn retry_after_commit_unknown_starts_the_new_round_once() {
+        let root = TestRoot::new("approval-retry-after-commit");
+        let database = root.0.join("runtime.db");
+        let keys = MemoryKeyStore::new();
+        let kek = load_or_create_storage_kek(&keys, &root.0.join("key-state.db"))
+            .expect("retry after commit StorageKEK");
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(database.clone()).with_fault_injector(Arc::new(
+                FailStoreOperationOnce::new(
+                    RuntimeStoreOperation::RetryApprovalDeliveryAfterCommit,
+                    InjectedStoreFailure::WorkerStopped,
+                ),
+            )),
+            kek,
+        )
+        .await
+        .expect("open retry after commit store");
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 43).await;
+        let delivery = Arc::new(SequencedApprovalDelivery::fail_then_apply());
+        let fake = FakeCoordinator::held_with_approval(delivery.clone());
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xAD),
+            1,
+        )
+        .expect("registry");
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        let prompt_principal = local_principal(43);
+        let _command = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &prompt_principal,
+                "approval-retry-after-commit",
+                "retry reply fault must keep new round",
+            )
+            .await,
+        );
+        fake.wait_for_starts(1).await;
+        wait_for_approval_count(&database, 1).await;
+        let approval_id = read_only_approval_id(&database);
+        let turn_id = fake.starts()[0].turn_id;
+        let issuer = PrincipalIssuer::local_only([0xBD; 32]);
+        let resolver = issuer
+            .issue_verified_local_with_approval_permissions(
+                501,
+                [0xBD; 16],
+                ApprovalPermissionGrant::ResolveAndRetry,
+            )
+            .expect("resolve and retry principal");
+        registry
+            .resolve_approval(
+                conversation.conversation_id,
+                turn_id,
+                approval_id,
+                ActionDecision {
+                    request_id: "actor-request-1".to_owned(),
+                    decision: agentdeck_protocol::ActionDecisionKind::Approve,
+                    persist: false,
+                },
+                resolver.try_enter_approval().expect("resolve capability"),
+            )
+            .await
+            .expect("claim approval");
+        wait_for_approval_state(&database, "deliveryFailed").await;
+        let receipt = registry
+            .retry_approval(
+                conversation.conversation_id,
+                approval_id,
+                resolver.try_enter_approval().expect("retry capability"),
+            )
+            .await
+            .expect("retry converges after unknown outcome");
+        assert!(matches!(
+            receipt,
+            ApprovalReceipt::AlreadyHandled {
+                state: ApprovalDeliveryState::Applying,
+                ..
+            }
+        ));
+        wait_for_approval_state(&database, "applied").await;
+        assert_eq!(
+            delivery
+                .decisions
+                .lock()
+                .expect("approval decisions lock")
+                .len(),
+            2
+        );
+
+        drop(registry);
+        store
+            .shutdown()
+            .await
+            .expect("shutdown retry after commit store");
+    }
+
+    #[tokio::test]
+    async fn retry_delivery_reuses_exact_winner_after_old_completion_races_control_lane() {
+        let root = TestRoot::new("approval-retry");
+        let database = root.0.join("runtime.db");
+        let store = root.open().await;
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 35).await;
+        let delivery = Arc::new(SequencedApprovalDelivery::fail_then_apply());
+        let fake = FakeCoordinator::held_with_approval(delivery.clone());
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xA5),
+            1,
+        )
+        .expect("registry");
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        let prompt_principal = local_principal(35);
+        let _command = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &prompt_principal,
+                "approval-retry",
+                "fail one delivery round then retry",
+            )
+            .await,
+        );
+        fake.wait_for_starts(1).await;
+        wait_for_approval_count(&database, 1).await;
+        let approval_id = read_only_approval_id(&database);
+        let turn_id = fake.starts()[0].turn_id;
+        let issuer = PrincipalIssuer::local_only([0xB5; 32]);
+        let resolver = issuer
+            .issue_verified_local_with_approval_permissions(
+                501,
+                [0xB5; 16],
+                ApprovalPermissionGrant::ResolveAndRetry,
+            )
+            .expect("resolve and retry principal");
+        let resolve_guard = resolver
+            .try_enter_approval()
+            .expect("enter resolve capability");
+        resolve_guard.require_resolve().expect("resolve permission");
+        let resolved = registry
+            .resolve_approval(
+                conversation.conversation_id,
+                turn_id,
+                approval_id,
+                ActionDecision {
+                    request_id: "actor-request-1".to_owned(),
+                    decision: agentdeck_protocol::ActionDecisionKind::Approve,
+                    persist: false,
+                },
+                resolve_guard,
+            )
+            .await
+            .expect("claim approval");
+        assert!(matches!(resolved, ApprovalReceipt::Claimed { .. }));
+        wait_for_approval_state(&database, "deliveryFailed").await;
+
+        // Control has priority over runner completion. Retry immediately after durable state is
+        // visible to exercise the stale completion/new-worker generation race.
+        let retry_guard = resolver
+            .try_enter_approval()
+            .expect("enter retry capability");
+        retry_guard.require_retry().expect("retry permission");
+        let retried = registry
+            .retry_approval(conversation.conversation_id, approval_id, retry_guard)
+            .await
+            .expect("retry exact sealed winner");
+        assert!(matches!(
+            retried,
+            ApprovalReceipt::AlreadyHandled {
+                decision: agentdeck_protocol::ActionDecisionKind::Approve,
+                state: ApprovalDeliveryState::Applying,
+                ..
+            }
+        ));
+        wait_for_approval_state(&database, "applied").await;
+        {
+            let decisions = delivery.decisions.lock().expect("approval decisions lock");
+            assert_eq!(decisions.len(), 2);
+            assert_eq!(decisions[0], decisions[1]);
+        }
+
+        drop(registry);
+        store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test]
+    async fn retry_at_deadline_durably_expires_before_returning_expired_receipt() {
+        let root = TestRoot::new("approval-retry-deadline");
+        let database = root.0.join("runtime.db");
+        let keys = MemoryKeyStore::new();
+        let clock = ManualClock::new(40_000);
+        let kek = load_or_create_storage_kek(&keys, &root.0.join("key-state.db"))
+            .expect("approval deadline StorageKEK");
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(database.clone()).with_clock(clock.clone()),
+            kek,
+        )
+        .await
+        .expect("open approval deadline store");
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 36).await;
+        let delivery = Arc::new(SequencedApprovalDelivery::fail_then_apply());
+        let fake = FakeCoordinator::held_with_approval(delivery.clone());
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xA6),
+            1,
+        )
+        .expect("registry")
+        .with_approval_runtime(
+            Arc::new(clock.clone()),
+            Arc::new(TokioApprovalSleeper),
+            Arc::new(FixedApprovalBackoff),
+        );
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        let prompt_principal = local_principal(36);
+        let _command = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &prompt_principal,
+                "approval-retry-deadline",
+                "deadline blocks manual retry",
+            )
+            .await,
+        );
+        fake.wait_for_starts(1).await;
+        wait_for_approval_count(&database, 1).await;
+        let approval_id = read_only_approval_id(&database);
+        let turn_id = fake.starts()[0].turn_id;
+        let issuer = PrincipalIssuer::local_only([0xB6; 32]);
+        let resolver = issuer
+            .issue_verified_local_with_approval_permissions(
+                501,
+                [0xB6; 16],
+                ApprovalPermissionGrant::ResolveAndRetry,
+            )
+            .expect("resolve and retry principal");
+        let resolve_guard = resolver
+            .try_enter_approval()
+            .expect("enter resolve capability");
+        let _ = registry
+            .resolve_approval(
+                conversation.conversation_id,
+                turn_id,
+                approval_id,
+                ActionDecision {
+                    request_id: "actor-request-1".to_owned(),
+                    decision: agentdeck_protocol::ActionDecisionKind::Approve,
+                    persist: false,
+                },
+                resolve_guard,
+            )
+            .await
+            .expect("claim approval");
+        wait_for_approval_state(&database, "deliveryFailed").await;
+
+        clock.set(40_000 + crate::runtime::approval::DEFAULT_APPROVAL_DEADLINE_MS);
+        let retry_guard = resolver
+            .try_enter_approval()
+            .expect("enter retry capability");
+        let receipt = registry
+            .retry_approval(conversation.conversation_id, approval_id, retry_guard)
+            .await
+            .expect("deadline retry closes expiry");
+        assert!(matches!(
+            receipt,
+            ApprovalReceipt::AlreadyHandled {
+                decision: agentdeck_protocol::ActionDecisionKind::Approve,
+                state: ApprovalDeliveryState::Expired,
+                ..
+            }
+        ));
+        wait_for_approval_state(&database, "expired").await;
+        assert_eq!(
+            delivery
+                .decisions
+                .lock()
+                .expect("approval decisions lock")
+                .len(),
+            1,
+            "deadline retry must not call adapter again"
+        );
+
+        drop(registry);
+        store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test]
+    async fn complete_after_commit_unknown_replays_terminal_cleanup_and_starts_successor() {
+        let root = TestRoot::new("complete-after-commit");
+        let database = root.0.join("runtime.db");
+        let keys = MemoryKeyStore::new();
+        let kek = load_or_create_storage_kek(&keys, &root.0.join("key-state.db"))
+            .expect("complete after commit StorageKEK");
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(database.clone()).with_fault_injector(Arc::new(
+                FailStoreOperationOnce::new(
+                    RuntimeStoreOperation::CompleteCommandAfterCommit,
+                    InjectedStoreFailure::WorkerStopped,
+                ),
+            )),
+            kek,
+        )
+        .await
+        .expect("open complete after commit store");
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 44).await;
+        let fake = FakeCoordinator::held_with_approval(approval_delivery());
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xAE),
+            1,
+        )
+        .expect("registry");
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        let principal = local_principal(44);
+        let first = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "complete-after-commit-first",
+                "first",
+            )
+            .await,
+        );
+        fake.wait_for_starts(1).await;
+        wait_for_approval_count(&database, 1).await;
+        let first_approval_id = read_only_approval_id(&database);
+        let second = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "complete-after-commit-second",
+                "second",
+            )
+            .await,
+        );
+
+        fake.release(first.command_id);
+        fake.wait_for_starts(2).await;
+        wait_for_receipt_state(
+            &store,
+            conversation.conversation_id,
+            first.command_id,
+            &principal,
+            CommandState::Completed,
+        )
+        .await;
+        let first_approval_state: String = rusqlite::Connection::open_with_flags(
+            &database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open runtime DB read-only")
+        .query_row(
+            "SELECT state FROM approval_ledger WHERE approval_id = ?1",
+            [&first_approval_id.as_bytes()[..]],
+            |row| row.get(0),
+        )
+        .expect("read first approval state");
+        assert_eq!(first_approval_state, "expired");
+
+        fake.release(second.command_id);
+        wait_for_receipt_state(
+            &store,
+            conversation.conversation_id,
+            second.command_id,
+            &principal,
+            CommandState::Completed,
+        )
+        .await;
+        assert_eq!(fake.starts().len(), 2);
+
+        registry.shutdown().await.expect("shutdown actors");
+        store.shutdown().await.expect("shutdown store");
     }
 
     fn local_principal(seed: u8) -> AuthenticatedPrincipal {

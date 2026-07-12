@@ -27,6 +27,7 @@ pub const DAEMON_RUNTIME_READ_UNAVAILABLE: &str = "daemon.runtime.read_unavailab
 
 // —— daemon.authorization.* ——
 pub const DAEMON_AUTHORIZATION_REVOKED: &str = "daemon.authorization.revoked";
+pub const DAEMON_AUTHORIZATION_PERMISSION_DENIED: &str = "daemon.authorization.permission_denied";
 
 // —— daemon.approval.* / daemon.turn.* ——
 pub const DAEMON_APPROVAL_ALREADY_HANDLED: &str = "daemon.approval.already_handled";

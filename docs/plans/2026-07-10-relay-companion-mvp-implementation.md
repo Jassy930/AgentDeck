@@ -893,7 +893,10 @@ P4 auth ledger 前明确 RecoveryBlocked。真实 vendor exec 仍严格属于 P3
   terminal turn 仍有 active approval 的 crash gap。register/claim/begin-attempt/manual-retry 走
   Normal lane；Applied/DeliveryFailed/Expired 与 terminal+expiry 走 Safety lane并使用预留空间。
 
-- [ ] Step 1: 先写以下 16 项 RED tests，测试名与断言固定，禁止合并成一个大用例：
+- [x] Step 1: 先写以下 16 项 RED tests，测试名与断言固定，禁止合并成一个大用例。
+  当前 `runtime_approval` 保留 16 个独立聚合项；由于 production API 均为 daemon-private，其中
+  source-shape 断言只补接口/seam 覆盖，最终行为证据必须来自同名或对应 private
+  unit/store/actor/fault tests：
   1. `pending_registration_is_atomic_with_action_request_event`：row、event、high-water、两个 ledger
      count 同事务；BeforeCommit fault 后没有半行。
   2. `principal_without_approval_permission_cannot_claim`：Active 但无 resolve 权限仍拒绝，adapter
@@ -926,31 +929,66 @@ P4 auth ledger 前明确 RecoveryBlocked。真实 vendor exec 仍严格属于 P3
       调用为 0；P3.7 interruption hook 后全部 Expired。
   16. `approval_row_and_ledger_tampering_is_rejected`：篡改 state/attempt/deadline/decision token/
       approvalCount/activeApprovalCount 任一项都返回 UnknownOrCorruptSchema。
-- [ ] Step 2: 运行
-  `cargo test -p agentdeckd --test runtime_approval -- --test-threads=1`。 Expected: FAIL，错误必须
-  指向缺失 approval module/schema/store API/permission/delivery seam，而不是 fixture 或环境失败。
-- [ ] Step 3: 先实现 schema v3、v1/v2 migration、row sealing/MAC、ledger counts、完整性扫描与
-  store CAS/outcome replay；每完成一组后只运行对应 store tests，确认 tamper、Before/AfterCommit
-  与 100 路 CAS 先转绿。
-- [ ] Step 4: 实现 ApprovalAuthorizationGuard、ApprovalPolicySnapshot、BoundApprovalDelivery、
-  execution ActionRequest receiver 与 adapter/router 绑定边界。扩展 Codex/CC adapter shape tests，
-  证明 route 先绑定、完整 flush 才 AppliedAck、persist 映射正确、未验证 CC wire 不会暴露
-  production capability。
-- [ ] Step 5: 实现 conversation-owned ApprovalSupervisor、默认/能力 deadline、8次/60s backoff、
-  same-decision manual retry、disconnect independence 与精确 receipt；测试使用共享 manual clock+
-  paused Tokio time，不得等待真实 60 秒。
-- [ ] Step 6: 把 command terminal 与 approval expiry 合并进同一个 Safety transaction，并接好
-  deadline expiry/actor shutdown。P3.5 recovery 只加载并认证 active approval，发现 Started turn
-  保持 RecoveryBlocked且绝不启动 worker；不得在没有 process fencing 证据时自行标 Interrupted。
-- [ ] Step 7: 重跑
+- [x] Step 2: 已先运行 RED gate；失败指向缺失 approval module/schema/store API/permission/delivery
+  seam，不依赖 fixture、真实时间或 vendor 环境。后续固定命令仍为
+  `cargo test -p agentdeckd --test runtime_approval -- --test-threads=1`，但该聚合 gate 不能替代
+  private 行为测试。
+- [x] Step 3: 已实现 schema v3、authenticated v1/v2→v3 migration、row sealing/MAC、
+  `approval_count/active_approval_count` ledger MAC、每 active approval 1 MiB safety reserve、完整性
+  扫描与 first-wins CAS/outcome replay。Pending 注册与 ActionRequest event 原子；100 路竞态、
+  tamper、所有 mutation Before/AfterCommit 与 low-space safety 收口由 private store tests 验证。
+- [x] Step 4: 已实现 ApprovalAuthorizationGuard、ApprovalPolicySnapshot、BoundApprovalDelivery 与
+  bounded execution ActionRequest receiver seam。Codex route 覆盖完整 kind/persist 映射、单飞、
+  write+newline+flush 后才 AppliedAck，失败保留 route；CC permission response shape 有私有测试，
+  但未经 recorded fixture/live gate，因此 production CC Approval capability 继续隐藏。真实
+  RuntimeExecutionEvent/adapter session 绑定仍明确留给 P3.7。
+- [x] Step 5: 已实现 conversation-owned ApprovalSupervisor、默认 30 分钟/能力 deadline、每轮
+  8 次且总计 60 秒、same-decision manual retry、disconnect/revoke 后 daemon ownership、worker
+  panic supervision 与精确 receipt。BeginApprovalAttempt COMMIT 成功或 exact replay 后会刷新时钟
+  并复核持久化 deadline/round budget，越界时不调用 adapter；adapter 已产生结果但 durable closure
+  无法安全收敛会返回 FatalClosure，使 actor 进入 RecoveryBlocked、停止 approval task 且禁止重投。
+  store 在 preflight 与 `BEGIN IMMEDIATE` authenticated reload 后都校验
+  `max(stateChanged, roundStarted, lastAttempt)`；时钟回退时 row/event 不变且不签发 permit。
+  Register/Claim/Retry 只对 operation 匹配的 CommitOutcomeUnknown 使用原 stable input 精确重试。
+  Pending Expired 没有赢家；claimed Expired 返回原 winner+Expired。测试使用 injected/manual
+  time，不等待真实 60 秒。
+- [x] Step 6: 已把 Completed/Failed/Interrupted 与该 turn 全部非 Applied approval expiry 合并为
+  同一个 Safety transaction，并按“先 durable terminal+expiry、后 cancel/await worker”收口。
+  CompleteCommand AfterCommit unknown 使用同一 completion input 精确重放，已提交 terminal 不会
+  错误进入 RecoveryBlocked；route 已清理或 generation 不匹配的迟到 FatalClosure 按 stale 忽略。
+  deadline expiry 使用同一预留 safety lane；RecoveryBlocked 只停止进程内 delivery，不在缺少
+  process fencing 证据时恢复投递或伪造 Expired/Interrupted。
+- [x] Step 7: 最终重跑
   `cargo test -p agentdeckd --test runtime_approval -- --test-threads=1`、
   `cargo test -p agentdeckd --test codex_adapter_shape`、
-  `cargo test -p agentdeckd --test cc_adapter_shape` 与 `cargo test -p agentdeckd`。 Expected: 16 项
-  approval tests 全绿；状态/event/ledger 一致；没有真实时间等待或 live vendor login 依赖。
-- [ ] Step 8: 更新 approval/authorization/delivery failure code、schema v3 migration/恢复说明、
-  手动 QA 与架构不变量；运行 `cargo fmt --check`、目标范围 clippy、
-  `scripts/verify-agent-docs.sh` 与 `git diff --check`。
+  `cargo test -p agentdeckd --test cc_adapter_shape` 与
+  `env -u AGENTDECK_E2E cargo test -p agentdeckd -- --test-threads=1`。固定 16 项只作聚合/shape
+  补充；退出结论必须同时引用 `runtime::store::approval::tests`、`runtime::approval::tests`、
+  `runtime::conversation::tests`、permission/Core 与 adapter private tests。最终证据：daemon lib
+  253/253、approval store 30/30、conversation 38/38、固定聚合 16/16、Codex shape 8/8、CC shape
+  12/12；`env -u AGENTDECK_E2E cargo test -p agentdeckd -- --test-threads=1` 整包 exit 0，包含
+  256 MiB 真实边界，只有既有 codesigned Keychain roundtrip 1 项按外部门禁 ignored。protocol
+  全包 exit 0，Swift `RuntimeV1ProtocolTests` 19/19。没有真实时间等待或 live vendor login 依赖。
+- [x] Step 8: approval/authorization/delivery failure code、schema v3 migration/恢复说明、手动 QA
+  边界与架构不变量已更新；独立 final review 结论 PASS、无剩余 P0/P1/P2。最终
+  `cargo fmt --all -- --check`、目标范围 `cargo clippy -p agentdeckd --all-targets ... -D warnings`、
+  `bash scripts/check-daemon-no-net.sh`、`scripts/verify-agent-docs.sh` 与 `git diff --check` 全部通过。
 - [ ] Step 9: 提交。 `git add agentdeckd agentdeck-protocol/src/runtime/failure.rs ARCHITECTURE.md docs/AGENT_DIAGNOSTICS.md docs/QUALITY.md && git commit -m "feat(daemon): 实现 approval first-wins 与投递恢复"`
+
+**P3.5 当前收口事实（2026-07-13，最终复核前）：** schema v3、approval row/ledger authenticated
+integrity、1 MiB/active safety reserve、SQLite first-wins、exact COMMIT-unknown replay、
+daemon-owned single-flight、8 次/60 秒、默认 30 分钟 deadline、OutcomeUnknown/DeliveryFailed、
+same-decision retry、Pending/claimed Expired 精确回执，以及 terminal+expiry 单 Safety transaction
+均已有 private 行为测试。Runtime/Swift required-null Expired contract 已随协议更新；Codex route
+完整 flush 与 CC capability gate 已在 adapter 私域验证。Begin COMMIT 后时钟复核、FatalClosure
+进入 RecoveryBlocked、Register/Claim/Retry 匹配 operation 的 exact COMMIT-unknown replay，以及
+terminal 与全部 non-Applied approval 同一 Safety transaction，也已有对应 private 行为测试。
+open/recovery 完整性审计已改为全 catalog conversation 分批、每批最多 16 MiB compact projection；
+完整 canonical request 只留 keyed digest，event chain 按 eventSeq 常量空间归约，零-row orphan event
+仍 fail-close。最终 daemon lib 253/253、approval store 30/30、聚合 16/16、Rust protocol 全包与
+Swift Runtime 19/19 均通过；全回归、clippy/fmt/no-net/docs/diff 门禁和独立 review 已闭环。只剩
+Step 9 scoped commit。P3.7 的 exec-gate、真实
+RuntimeExecutionEvent 绑定与 live Codex/Claude Code approval 明确未完成。
 
 **P3.7 依赖边界：** P3.5 的退出门禁是 schema/CAS/permission/worker/receipt 与 production
 capability contract 在 fake execution 上全部可证；它不得用当前 in-process adapter spawn 冒充真实

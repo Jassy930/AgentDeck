@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use agentdeck_protocol::runtime::RuntimeEnvelope;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use zeroize::Zeroizing;
 
 use crate::runtime::store::IdempotencyOwner;
 
@@ -57,6 +58,32 @@ struct AuthorizationLease {
     state: std::sync::atomic::AtomicU8,
     inflight: std::sync::atomic::AtomicUsize,
     quiesced: tokio::sync::Notify,
+    approval_permissions: ApprovalPermissionGrant,
+}
+
+#[allow(dead_code)] // P3.5 Core resolve/retry 接线后构造非 None grants。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ApprovalPermissionGrant {
+    #[default]
+    None,
+    ResolveOnly,
+    RetryOnly,
+    ResolveAndRetry,
+}
+
+#[allow(dead_code)] // P3.5 Core resolve/retry 接线后消费。
+impl ApprovalPermissionGrant {
+    const fn allows_any(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    const fn allows_resolve(self) -> bool {
+        matches!(self, Self::ResolveOnly | Self::ResolveAndRetry)
+    }
+
+    const fn allows_retry(self) -> bool {
+        matches!(self, Self::RetryOnly | Self::ResolveAndRetry)
+    }
 }
 
 impl AuthenticatedPrincipal {
@@ -153,11 +180,12 @@ impl fmt::Debug for PrincipalAuthorizationKey {
 }
 
 impl AuthorizationLease {
-    fn new() -> Self {
+    fn new(approval_permissions: ApprovalPermissionGrant) -> Self {
         Self {
             state: std::sync::atomic::AtomicU8::new(PRINCIPAL_ACTIVE),
             inflight: std::sync::atomic::AtomicUsize::new(0),
             quiesced: tokio::sync::Notify::new(),
+            approval_permissions,
         }
     }
 
@@ -210,6 +238,130 @@ pub(crate) struct AuthorizationGuard {
     lease: Arc<AuthorizationLease>,
 }
 
+/// Approval first-wins/retry CAS 的 daemon-private authorization capability。
+/// 字段私有，且持有共享 principal lease guard 直到调用方完成 SQLite COMMIT。
+#[allow(dead_code)] // P3.5 Core/store CAS 接线后消费。
+pub(crate) struct ApprovalAuthorizationGuard {
+    _authorization: AuthorizationGuard,
+    identity: Arc<PrincipalIdentity>,
+    permissions: ApprovalPermissionGrant,
+}
+
+#[allow(dead_code)] // P3.5 Core/store CAS 接线后消费。
+impl ApprovalAuthorizationGuard {
+    pub(crate) fn require_resolve(&self) -> Result<(), PrincipalAccessError> {
+        if self.permissions.allows_resolve() {
+            Ok(())
+        } else {
+            Err(PrincipalAccessError::PermissionDenied)
+        }
+    }
+
+    pub(crate) fn require_retry(&self) -> Result<(), PrincipalAccessError> {
+        if self.permissions.allows_retry() {
+            Ok(())
+        } else {
+            Err(PrincipalAccessError::PermissionDenied)
+        }
+    }
+
+    pub(crate) fn claimant_binding(&self) -> ApprovalClaimantBinding {
+        ApprovalClaimantBinding::from_identity(self.identity.as_ref())
+    }
+}
+
+impl fmt::Debug for ApprovalAuthorizationGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApprovalAuthorizationGuard")
+            .field("identity", &"[REDACTED]")
+            .field("permissions", &self.permissions)
+            .finish()
+    }
+}
+
+/// StorageKEK blind-index 输入；不是 claimant token，也不做无 key hash。
+/// Drop 时由 `Zeroizing` 清除完整 authorization identity canonical bytes。
+#[allow(dead_code)] // P3.5 store blind-index 接线后消费。
+pub(crate) struct ApprovalClaimantBinding {
+    canonical: Zeroizing<Vec<u8>>,
+}
+
+#[allow(dead_code)] // P3.5 store blind-index 接线后消费。
+impl ApprovalClaimantBinding {
+    fn from_identity(identity: &PrincipalIdentity) -> Self {
+        let mut canonical = Vec::with_capacity(160);
+        append_canonical_field(&mut canonical, b"approval.claimant.v1");
+        match identity {
+            PrincipalIdentity::Local {
+                machine_trust_domain,
+                uid: principal_uid,
+                client_installation_id,
+            } => {
+                append_canonical_field(&mut canonical, &[1]);
+                append_canonical_field(&mut canonical, machine_trust_domain);
+                append_canonical_field(&mut canonical, &principal_uid.to_be_bytes());
+                append_canonical_field(&mut canonical, client_installation_id);
+            }
+            PrincipalIdentity::Remote {
+                machine_trust_domain,
+                machine_route,
+                device_route,
+                grant_serial: serial,
+                device_sign_fingerprint,
+            } => {
+                append_canonical_field(&mut canonical, &[2]);
+                append_canonical_field(&mut canonical, machine_trust_domain);
+                append_canonical_field(&mut canonical, machine_route);
+                append_canonical_field(&mut canonical, device_route);
+                append_canonical_field(&mut canonical, &serial.to_be_bytes());
+                append_canonical_field(&mut canonical, device_sign_fingerprint);
+            }
+        }
+        Self {
+            canonical: Zeroizing::new(canonical),
+        }
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.canonical.as_slice()
+    }
+}
+
+impl fmt::Debug for ApprovalClaimantBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ApprovalClaimantBinding([REDACTED])")
+    }
+}
+
+#[allow(dead_code)] // 仅由 P3.5 claimant binding 构造路径调用。
+fn append_canonical_field(target: &mut Vec<u8>, field: &[u8]) {
+    let length = u32::try_from(field.len()).expect("approval claimant field length is fixed");
+    target.extend_from_slice(&length.to_be_bytes());
+    target.extend_from_slice(field);
+}
+
+#[allow(dead_code)] // P3.5 Core resolve/retry 接线后消费。
+pub(crate) trait ApprovalPrincipalCapability {
+    fn try_enter_approval(&self) -> Result<ApprovalAuthorizationGuard, PrincipalAccessError>;
+}
+
+#[allow(dead_code)] // P3.5 Core resolve/retry 接线后调用。
+impl ApprovalPrincipalCapability for AuthenticatedPrincipal {
+    fn try_enter_approval(&self) -> Result<ApprovalAuthorizationGuard, PrincipalAccessError> {
+        let permissions = self.authorization.approval_permissions;
+        if !permissions.allows_any() {
+            return Err(PrincipalAccessError::PermissionDenied);
+        }
+        let authorization = self.authorization.try_enter()?;
+        Ok(ApprovalAuthorizationGuard {
+            _authorization: authorization,
+            identity: self.identity.clone(),
+            permissions,
+        })
+    }
+}
+
 impl Drop for AuthorizationGuard {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
@@ -228,6 +380,11 @@ pub enum PrincipalAccessError {
     RegistryUnavailable,
     #[error("principal authorization registry reached its hard limit")]
     RegistryFull,
+    #[error("principal lacks the required approval permission")]
+    #[allow(dead_code)] // P3.5 Core resolve/retry 接线后由 capability 构造。
+    PermissionDenied,
+    #[error("approval permissions conflict with the existing full authorization identity")]
+    PermissionConflict,
 }
 
 /// runtime 内部 issuer。raw transport 无法直接构造 `AuthenticatedPrincipal`。
@@ -251,11 +408,31 @@ impl PrincipalIssuer {
         uid: u32,
         client_installation_id: [u8; 16],
     ) -> Result<AuthenticatedPrincipal, PrincipalAccessError> {
-        self.issue(PrincipalIdentity::Local {
-            machine_trust_domain: self.machine_trust_domain,
-            uid,
-            client_installation_id,
-        })
+        self.issue(
+            PrincipalIdentity::Local {
+                machine_trust_domain: self.machine_trust_domain,
+                uid,
+                client_installation_id,
+            },
+            ApprovalPermissionGrant::None,
+        )
+    }
+
+    #[allow(dead_code)] // P3.5 Core principal issuance 接线后调用。
+    pub(crate) fn issue_verified_local_with_approval_permissions(
+        &self,
+        uid: u32,
+        client_installation_id: [u8; 16],
+        permissions: ApprovalPermissionGrant,
+    ) -> Result<AuthenticatedPrincipal, PrincipalAccessError> {
+        self.issue(
+            PrincipalIdentity::Local {
+                machine_trust_domain: self.machine_trust_domain,
+                uid,
+                client_installation_id,
+            },
+            permissions,
+        )
     }
 
     #[cfg(test)]
@@ -266,30 +443,60 @@ impl PrincipalIssuer {
         grant_serial: u64,
         device_sign_fingerprint: [u8; 32],
     ) -> Result<AuthenticatedPrincipal, PrincipalAccessError> {
-        self.issue(PrincipalIdentity::Remote {
-            machine_trust_domain: self.machine_trust_domain,
-            machine_route,
-            device_route,
-            grant_serial,
-            device_sign_fingerprint,
-        })
+        self.issue(
+            PrincipalIdentity::Remote {
+                machine_trust_domain: self.machine_trust_domain,
+                machine_route,
+                device_route,
+                grant_serial,
+                device_sign_fingerprint,
+            },
+            ApprovalPermissionGrant::None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn issue_test_remote_with_approval_permissions(
+        &self,
+        machine_route: [u8; 16],
+        device_route: [u8; 16],
+        grant_serial: u64,
+        device_sign_fingerprint: [u8; 32],
+        permissions: ApprovalPermissionGrant,
+    ) -> Result<AuthenticatedPrincipal, PrincipalAccessError> {
+        self.issue(
+            PrincipalIdentity::Remote {
+                machine_trust_domain: self.machine_trust_domain,
+                machine_route,
+                device_route,
+                grant_serial,
+                device_sign_fingerprint,
+            },
+            permissions,
+        )
     }
 
     fn issue(
         &self,
         identity: PrincipalIdentity,
+        approval_permissions: ApprovalPermissionGrant,
     ) -> Result<AuthenticatedPrincipal, PrincipalAccessError> {
         let mut leases = self
             .leases
             .lock()
             .map_err(|_| PrincipalAccessError::RegistryUnavailable)?;
         let authorization = match leases.get(&identity).cloned() {
-            Some(lease) => lease,
+            Some(lease) => {
+                if lease.approval_permissions != approval_permissions {
+                    return Err(PrincipalAccessError::PermissionConflict);
+                }
+                lease
+            }
             None => {
                 if leases.len() >= self.lease_capacity {
                     return Err(PrincipalAccessError::RegistryFull);
                 }
-                let lease = Arc::new(AuthorizationLease::new());
+                let lease = Arc::new(AuthorizationLease::new(approval_permissions));
                 leases.insert(identity.clone(), lease.clone());
                 lease
             }
@@ -893,6 +1100,177 @@ mod tests {
             Some(PrincipalAccessError::Revoked),
             "issuer lifetime must retain the revoked lease"
         );
+    }
+
+    #[test]
+    fn approval_permissions_are_explicit_and_fail_closed_per_operation() {
+        let issuer = PrincipalIssuer::local_only([0xC4; 32]);
+        let none = issuer
+            .issue_verified_local(501, [1; 16])
+            .expect("principal without approval permission");
+        assert!(matches!(
+            none.try_enter_approval(),
+            Err(PrincipalAccessError::PermissionDenied)
+        ));
+
+        let resolve_only = issuer
+            .issue_verified_local_with_approval_permissions(
+                501,
+                [2; 16],
+                ApprovalPermissionGrant::ResolveOnly,
+            )
+            .expect("resolve-only principal");
+        let resolve = resolve_only
+            .try_enter_approval()
+            .expect("enter resolve capability");
+        resolve.require_resolve().expect("resolve permission");
+        assert_eq!(
+            resolve.require_retry(),
+            Err(PrincipalAccessError::PermissionDenied)
+        );
+
+        let retry_only = issuer
+            .issue_verified_local_with_approval_permissions(
+                501,
+                [3; 16],
+                ApprovalPermissionGrant::RetryOnly,
+            )
+            .expect("retry-only principal");
+        let retry = retry_only
+            .try_enter_approval()
+            .expect("enter retry capability");
+        retry.require_retry().expect("retry permission");
+        assert_eq!(
+            retry.require_resolve(),
+            Err(PrincipalAccessError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn verified_remote_can_resolve_without_an_is_local_shortcut() {
+        let issuer = PrincipalIssuer::local_only([0xC5; 32]);
+        let remote = issuer
+            .issue_test_remote_with_approval_permissions(
+                [4; 16],
+                [5; 16],
+                7,
+                [6; 32],
+                ApprovalPermissionGrant::ResolveOnly,
+            )
+            .expect("verified remote approval principal");
+        assert!(!remote.is_local());
+        remote
+            .try_enter_approval()
+            .expect("remote approval guard")
+            .require_resolve()
+            .expect("issuer-granted remote resolve");
+    }
+
+    #[tokio::test]
+    async fn approval_guard_holds_the_shared_lease_through_revoking() {
+        let issuer = PrincipalIssuer::local_only([0xC6; 32]);
+        let first = issuer
+            .issue_verified_local_with_approval_permissions(
+                501,
+                [7; 16],
+                ApprovalPermissionGrant::ResolveAndRetry,
+            )
+            .expect("first approval principal");
+        let second = issuer
+            .issue_verified_local_with_approval_permissions(
+                501,
+                [7; 16],
+                ApprovalPermissionGrant::ResolveAndRetry,
+            )
+            .expect("same identity reuses approval grant");
+        let guard = second.try_enter_approval().expect("shared approval guard");
+        guard.require_resolve().expect("resolve permission");
+        let revoking = first.clone();
+        let revoke = tokio::spawn(async move { revoking.begin_revoke().await });
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            second.try_enter_approval(),
+            Err(PrincipalAccessError::Revoked)
+        ));
+        assert!(!revoke.is_finished(), "approval guard must cover the CAS");
+        drop(guard);
+        revoke.await.expect("join revoke").expect("begin revoke");
+        first.finish_revoke();
+    }
+
+    #[test]
+    fn same_full_identity_cannot_be_reissued_with_different_approval_bits() {
+        let issuer = PrincipalIssuer::local_only([0xC7; 32]);
+        issuer
+            .issue_verified_local_with_approval_permissions(
+                501,
+                [8; 16],
+                ApprovalPermissionGrant::ResolveOnly,
+            )
+            .expect("first signed permission set");
+        assert!(matches!(
+            issuer.issue_verified_local_with_approval_permissions(
+                501,
+                [8; 16],
+                ApprovalPermissionGrant::RetryOnly,
+            ),
+            Err(PrincipalAccessError::PermissionConflict)
+        ));
+        assert!(matches!(
+            issuer.issue_verified_local(501, [8; 16]),
+            Err(PrincipalAccessError::PermissionConflict)
+        ));
+    }
+
+    #[test]
+    fn claimant_binding_is_canonical_full_identity_and_debug_redacted() {
+        let issuer = PrincipalIssuer::local_only([0xC8; 32]);
+        let first = issuer
+            .issue_test_remote_with_approval_permissions(
+                [9; 16],
+                [10; 16],
+                11,
+                [12; 32],
+                ApprovalPermissionGrant::ResolveAndRetry,
+            )
+            .expect("first remote claimant");
+        let replay = issuer
+            .issue_test_remote_with_approval_permissions(
+                [9; 16],
+                [10; 16],
+                11,
+                [12; 32],
+                ApprovalPermissionGrant::ResolveAndRetry,
+            )
+            .expect("same full identity");
+        let renewed = issuer
+            .issue_test_remote_with_approval_permissions(
+                [9; 16],
+                [10; 16],
+                12,
+                [12; 32],
+                ApprovalPermissionGrant::ResolveAndRetry,
+            )
+            .expect("new grant serial is a new full identity");
+        let first_binding = first
+            .try_enter_approval()
+            .expect("first approval guard")
+            .claimant_binding();
+        let replay_binding = replay
+            .try_enter_approval()
+            .expect("replay approval guard")
+            .claimant_binding();
+        let renewed_binding = renewed
+            .try_enter_approval()
+            .expect("renewed approval guard")
+            .claimant_binding();
+        assert_eq!(first_binding.as_bytes(), replay_binding.as_bytes());
+        assert_ne!(first_binding.as_bytes(), renewed_binding.as_bytes());
+        assert_eq!(
+            format!("{first_binding:?}"),
+            "ApprovalClaimantBinding([REDACTED])"
+        );
+        assert!(!format!("{first_binding:?}").contains("090909"));
     }
 
     #[tokio::test]
