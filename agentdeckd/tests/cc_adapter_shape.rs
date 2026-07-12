@@ -82,8 +82,9 @@ fn cc_adapter_impls_agent_trait() {
 }
 
 #[test]
-fn capabilities_advertise_cc_agent_kind_and_full_feature_set() {
-    // Task 4B: capabilities() returns the real builder result.
+fn capabilities_advertise_cc_agent_kind_and_verified_feature_set() {
+    // Production capabilities come from the single canonical builder;
+    // speculative wire surfaces stay absent there.
     let a = ClaudeCodeAdapter::new_for_test();
     let caps = a.capabilities();
     assert_eq!(caps.agent_kind, AgentKind::ClaudeCode);
@@ -96,9 +97,13 @@ fn capabilities_advertise_cc_agent_kind_and_full_feature_set() {
             .contains(&CapabilityId::ClaudeCodePermissionMode)
     );
     assert!(caps.features.contains(&CapabilityId::ClaudeCodeHooks));
-    // Shared features symmetric with Codex (N5).
+    // Verified shared features remain available; speculative Approval does not.
     assert!(caps.features.contains(&CapabilityId::StreamingMessages));
     assert!(caps.features.contains(&CapabilityId::Worktree));
+    assert!(
+        !caps.features.contains(&CapabilityId::Approval),
+        "CC approval must stay hidden until a recorded fixture or live gate verifies its wire contract"
+    );
     // No Codex-only features leaked.
     assert!(!caps.features.contains(&CapabilityId::CodexSandboxMode));
 }

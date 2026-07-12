@@ -53,7 +53,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc};
 
@@ -221,7 +221,10 @@ impl CodexAdapter {
 
     /// Write one JSON-RPC frame as a newline-delimited line (Codex's
     /// wire framing — see protocol/SPIKE_FINDINGS.md).
-    async fn write_frame(stdin: &mut ChildStdin, frame: &Value) -> Result<(), ProtocolError> {
+    async fn write_frame<W>(stdin: &mut W, frame: &Value) -> Result<(), ProtocolError>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let mut line = serde_json::to_string(frame).map_err(|e| ProtocolError {
             code: "codex-encode-failed".into(),
             message: format!("serialize codex frame: {e}"),
@@ -947,31 +950,7 @@ impl Agent for CodexAdapter {
                     diagnostic_ref: None,
                 })?
         };
-        let route = {
-            let routes = state.approval_routes.lock().await;
-            routes
-                .get(&decision.request_id)
-                .cloned()
-                .ok_or_else(|| ProtocolError {
-                    code: "approval-route-not-found".into(),
-                    message: format!("no pending approval for request_id={}", decision.request_id),
-                    diagnostic_ref: None,
-                })?
-        };
-        let result = approval_response_body(&route.method, &route.params, decision.decision)?;
-        let frame = json!({ "id": route.rpc_id, "result": result });
-        {
-            let mut stdin = state.stdin.lock().await;
-            Self::write_frame(&mut stdin, &frame).await?;
-        }
-        // Drop the routing entry now that we responded; codex won't
-        // send the same approval id again.
-        state
-            .approval_routes
-            .lock()
-            .await
-            .remove(&decision.request_id);
-        Ok(())
+        deliver_approval_decision(&state.approval_routes, &state.stdin, &decision).await
     }
 
     async fn submit_vendor_control(
@@ -1112,53 +1091,323 @@ fn adapter_state_error(error: RuntimeStoreError) -> ProtocolError {
     }
 }
 
+async fn deliver_approval_decision<W>(
+    approval_routes: &Mutex<HashMap<String, ApprovalRoute>>,
+    stdin: &Mutex<W>,
+    decision: &ActionDecision,
+) -> Result<(), ProtocolError>
+where
+    W: AsyncWrite + Unpin,
+{
+    // Keep the route guard across the complete write+flush and consume it
+    // only afterwards. This is the adapter-local single-flight boundary:
+    // a concurrent decision cannot clone and write the same RPC route.
+    let mut routes = approval_routes.lock().await;
+    let route = routes
+        .get(&decision.request_id)
+        .cloned()
+        .ok_or_else(|| ProtocolError {
+            code: "approval-route-not-found".into(),
+            message: format!("no pending approval for request_id={}", decision.request_id),
+            diagnostic_ref: None,
+        })?;
+    let result = approval_response_body(&route.method, &route.params, decision)?;
+    let frame = json!({ "id": route.rpc_id, "result": result });
+    let mut writer = stdin.lock().await;
+    CodexAdapter::write_frame(&mut *writer, &frame).await?;
+    drop(writer);
+    routes.remove(&decision.request_id);
+    Ok(())
+}
+
 // ── Codex approval response builders ────────────────────────────────────────
 //
-// Mirrors v1_legacy::approval_response_for_decision (mod.rs ~1830).
-// Body shape differs per approval method; centralised here so 3C can
-// audit one place.
+// Mirrors the official generated app-server request/response schemas.
+// Body shape and persistence representation differ per approval method;
+// centralised here so the complete neutral decision is audited once.
 
 fn approval_response_body(
     method: &str,
     params: &Value,
-    decision: ActionDecisionKind,
+    decision: &ActionDecision,
 ) -> Result<Value, ProtocolError> {
-    let codex_decision = match decision {
-        ActionDecisionKind::Approve => "accept",
-        ActionDecisionKind::Deny => "decline",
-    };
     match method {
         "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            let codex_decision = match (decision.decision, decision.persist) {
+                (ActionDecisionKind::Approve, false) => "accept",
+                (ActionDecisionKind::Approve, true) => "acceptForSession",
+                (ActionDecisionKind::Deny, false) => "decline",
+                (ActionDecisionKind::Deny, true) => {
+                    return Err(ProtocolError {
+                        code: "codex-invalid-persistent-decision".into(),
+                        message: "Codex has no neutral persistent-deny approval response".into(),
+                        diagnostic_ref: None,
+                    });
+                }
+            };
             Ok(json!({ "decision": codex_decision }))
         }
         "item/permissions/requestApproval" => {
-            if decision == ActionDecisionKind::Approve {
-                Ok(json!({
-                    "permissions": params.get("permissions").cloned().unwrap_or_else(|| json!({})),
-                    "scope": "turn",
+            let permissions = validated_permission_profile(params)?;
+            match (decision.decision, decision.persist) {
+                (ActionDecisionKind::Approve, persist) => Ok(json!({
+                    "permissions": permissions,
+                    "scope": if persist { "session" } else { "turn" },
                     "strictAutoReview": Value::Null,
-                }))
-            } else {
-                Ok(json!({
+                })),
+                (ActionDecisionKind::Deny, false) => Ok(json!({
                     "permissions": {
                         "fileSystem": Value::Null,
                         "network": Value::Null,
                     },
                     "scope": "turn",
                     "strictAutoReview": true,
-                }))
+                })),
+                (ActionDecisionKind::Deny, true) => Err(ProtocolError {
+                    code: "codex-invalid-persistent-decision".into(),
+                    message: "Codex has no neutral persistent-deny permission response".into(),
+                    diagnostic_ref: None,
+                }),
             }
         }
-        "item/tool/requestUserInput" => {
-            // No closer-fit response shape; echo decision as a generic
-            // accept/decline so codex doesn't hang.
-            Ok(json!({ "decision": codex_decision }))
-        }
+        // This method expects a typed answers map, not an approval
+        // decision. Never fabricate an accept/decline response.
+        "item/tool/requestUserInput" => Err(ProtocolError {
+            code: "codex-unsupported-approval-method".into(),
+            message: "item/tool/requestUserInput requires a typed answers response".into(),
+            diagnostic_ref: None,
+        }),
         other => Err(ProtocolError {
             code: "codex-unsupported-approval-method".into(),
             message: format!("unsupported approval request method: {other}"),
             diagnostic_ref: None,
         }),
+    }
+}
+
+fn validated_permission_profile(params: &Value) -> Result<Value, ProtocolError> {
+    let profile = params
+        .get("permissions")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid_approval_params("permissions must be an object"))?;
+    if let Some(unknown) = profile
+        .keys()
+        .find(|key| key.as_str() != "fileSystem" && key.as_str() != "network")
+    {
+        return Err(invalid_approval_params(&format!(
+            "permissions contains unknown field {unknown}"
+        )));
+    }
+    if let Some(file_system) = profile.get("fileSystem")
+        && !file_system.is_null()
+    {
+        validate_file_system_permissions(file_system)?;
+    }
+    if let Some(network) = profile.get("network")
+        && !network.is_null()
+    {
+        validate_network_permissions(network)?;
+    }
+    Ok(Value::Object(profile.clone()))
+}
+
+fn validate_file_system_permissions(value: &Value) -> Result<(), ProtocolError> {
+    let permissions = value.as_object().ok_or_else(|| {
+        invalid_approval_params("permissions.fileSystem must be an object or null")
+    })?;
+    reject_unknown_fields(
+        permissions,
+        &["entries", "globScanMaxDepth", "read", "write"],
+        "permissions.fileSystem",
+    )?;
+    if let Some(depth) = permissions.get("globScanMaxDepth")
+        && !depth.is_null()
+        && depth.as_u64().is_none_or(|depth| depth == 0)
+    {
+        return Err(invalid_approval_params(
+            "permissions.fileSystem.globScanMaxDepth must be a positive unsigned integer or null",
+        ));
+    }
+    for field in ["read", "write"] {
+        if let Some(paths) = permissions.get(field)
+            && !paths.is_null()
+        {
+            let paths = paths.as_array().ok_or_else(|| {
+                invalid_approval_params(&format!(
+                    "permissions.fileSystem.{field} must be an array of absolute paths or null"
+                ))
+            })?;
+            for path in paths {
+                let path = path.as_str().ok_or_else(|| {
+                    invalid_approval_params(&format!(
+                        "permissions.fileSystem.{field} entries must be absolute path strings"
+                    ))
+                })?;
+                validate_absolute_normal_path(path, &format!("permissions.fileSystem.{field}"))?;
+            }
+        }
+    }
+    if let Some(entries) = permissions.get("entries")
+        && !entries.is_null()
+    {
+        let entries = entries.as_array().ok_or_else(|| {
+            invalid_approval_params("permissions.fileSystem.entries must be an array or null")
+        })?;
+        for entry in entries {
+            validate_file_system_entry(entry)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_network_permissions(value: &Value) -> Result<(), ProtocolError> {
+    let permissions = value
+        .as_object()
+        .ok_or_else(|| invalid_approval_params("permissions.network must be an object or null"))?;
+    reject_unknown_fields(permissions, &["enabled"], "permissions.network")?;
+    if let Some(enabled) = permissions.get("enabled")
+        && !enabled.is_null()
+        && !enabled.is_boolean()
+    {
+        return Err(invalid_approval_params(
+            "permissions.network.enabled must be a boolean or null",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_file_system_entry(value: &Value) -> Result<(), ProtocolError> {
+    let entry = value.as_object().ok_or_else(|| {
+        invalid_approval_params("permissions.fileSystem.entries elements must be objects")
+    })?;
+    reject_unknown_fields(
+        entry,
+        &["access", "path"],
+        "permissions.fileSystem.entries[]",
+    )?;
+    if !matches!(
+        entry.get("access").and_then(Value::as_str),
+        Some("read" | "write" | "none")
+    ) {
+        return Err(invalid_approval_params(
+            "permissions.fileSystem.entries[].access must be read, write, or none",
+        ));
+    }
+    validate_file_system_path(entry.get("path").ok_or_else(|| {
+        invalid_approval_params("permissions.fileSystem.entries[].path is required")
+    })?)
+}
+
+fn validate_file_system_path(value: &Value) -> Result<(), ProtocolError> {
+    let path = value.as_object().ok_or_else(|| {
+        invalid_approval_params("permissions.fileSystem.entries[].path must be an object")
+    })?;
+    match path.get("type").and_then(Value::as_str) {
+        Some("path") => {
+            reject_unknown_fields(path, &["type", "path"], "fileSystem path")?;
+            let absolute = path.get("path").and_then(Value::as_str).ok_or_else(|| {
+                invalid_approval_params("fileSystem path.path must be an absolute path string")
+            })?;
+            validate_absolute_normal_path(absolute, "fileSystem path.path")
+        }
+        Some("glob_pattern") => {
+            reject_unknown_fields(path, &["type", "pattern"], "fileSystem glob path")?;
+            if path.get("pattern").and_then(Value::as_str).is_none() {
+                return Err(invalid_approval_params(
+                    "fileSystem glob path.pattern must be a string",
+                ));
+            }
+            Ok(())
+        }
+        Some("special") => {
+            reject_unknown_fields(path, &["type", "value"], "fileSystem special path")?;
+            validate_file_system_special_path(path.get("value").ok_or_else(|| {
+                invalid_approval_params("fileSystem special path.value is required")
+            })?)
+        }
+        _ => Err(invalid_approval_params(
+            "fileSystem path.type must be path, glob_pattern, or special",
+        )),
+    }
+}
+
+fn validate_file_system_special_path(value: &Value) -> Result<(), ProtocolError> {
+    let special = value.as_object().ok_or_else(|| {
+        invalid_approval_params("fileSystem special path.value must be an object")
+    })?;
+    match special.get("kind").and_then(Value::as_str) {
+        Some("root" | "minimal" | "tmpdir" | "slash_tmp") => {
+            reject_unknown_fields(special, &["kind"], "fileSystem special path")
+        }
+        Some("project_roots") => {
+            reject_unknown_fields(special, &["kind", "subpath"], "fileSystem special path")?;
+            validate_optional_string(special.get("subpath"), "fileSystem special path.subpath")
+        }
+        Some("unknown") => {
+            reject_unknown_fields(
+                special,
+                &["kind", "path", "subpath"],
+                "fileSystem special path",
+            )?;
+            if special.get("path").and_then(Value::as_str).is_none() {
+                return Err(invalid_approval_params(
+                    "fileSystem unknown special path.path must be a string",
+                ));
+            }
+            validate_optional_string(special.get("subpath"), "fileSystem special path.subpath")
+        }
+        _ => Err(invalid_approval_params(
+            "fileSystem special path.kind is not a supported official value",
+        )),
+    }
+}
+
+fn validate_optional_string(value: Option<&Value>, field: &str) -> Result<(), ProtocolError> {
+    if value.is_some_and(|value| !value.is_null() && !value.is_string()) {
+        return Err(invalid_approval_params(&format!(
+            "{field} must be a string or null"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_absolute_normal_path(value: &str, field: &str) -> Result<(), ProtocolError> {
+    use std::path::{Component, Path};
+
+    let path = Path::new(value);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(invalid_approval_params(&format!(
+            "{field} must be absolute and normalized"
+        )));
+    }
+    Ok(())
+}
+
+fn reject_unknown_fields(
+    object: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+    field: &str,
+) -> Result<(), ProtocolError> {
+    if let Some(unknown) = object
+        .keys()
+        .find(|candidate| !allowed.contains(&candidate.as_str()))
+    {
+        return Err(invalid_approval_params(&format!(
+            "{field} contains unknown field {unknown}"
+        )));
+    }
+    Ok(())
+}
+
+fn invalid_approval_params(reason: &str) -> ProtocolError {
+    ProtocolError {
+        code: "codex-invalid-approval-params".into(),
+        message: format!("invalid Codex permission approval params: {reason}"),
+        diagnostic_ref: None,
     }
 }
 
@@ -1212,11 +1461,301 @@ unsafe extern "C" {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonicalize_event, observed_codex_thread_id, validate_resume_result_thread_id};
+    use super::{
+        ApprovalRoute, approval_response_body, canonicalize_event, deliver_approval_decision,
+        observed_codex_thread_id, validate_resume_result_thread_id,
+    };
     use crate::agent::CanonicalAgentEvent;
     use agentdeck_protocol::{
-        AgentItem, AgentItemMeta, AgentKind, ProtocolError, ServerEvent, SessionId, ThreadId,
+        ActionDecision, ActionDecisionKind, AgentItem, AgentItemMeta, AgentKind, ProtocolError,
+        ServerEvent, SessionId, ThreadId,
     };
+    use std::collections::HashMap;
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncReadExt, AsyncWrite};
+    use tokio::sync::Mutex;
+
+    struct FlushErrorWriter;
+
+    struct WriteCountingWriter(Arc<AtomicUsize>);
+
+    impl AsyncWrite for WriteCountingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for FlushErrorWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "injected")))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn decision(kind: ActionDecisionKind, persist: bool) -> ActionDecision {
+        ActionDecision {
+            request_id: "request-under-test".into(),
+            decision: kind,
+            persist,
+        }
+    }
+
+    #[test]
+    fn command_and_file_approval_map_kind_and_persist_to_typed_codex_decisions() {
+        for method in [
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+        ] {
+            for (kind, persist, expected) in [
+                (ActionDecisionKind::Approve, false, "accept"),
+                (ActionDecisionKind::Approve, true, "acceptForSession"),
+                (ActionDecisionKind::Deny, false, "decline"),
+            ] {
+                assert_eq!(
+                    approval_response_body(
+                        method,
+                        &serde_json::json!({}),
+                        &decision(kind, persist),
+                    )
+                    .expect("supported typed approval decision"),
+                    serde_json::json!({"decision": expected}),
+                );
+            }
+
+            let error = approval_response_body(
+                method,
+                &serde_json::json!({}),
+                &decision(ActionDecisionKind::Deny, true),
+            )
+            .expect_err("Codex has no neutral persistent-deny decision");
+            assert_eq!(error.code, "codex-invalid-persistent-decision");
+        }
+    }
+
+    #[test]
+    fn permission_approval_maps_persist_to_typed_scope_and_rejects_persistent_deny() {
+        let params = serde_json::json!({
+            "permissions": {
+                "fileSystem": null,
+                "network": {"enabled": true}
+            }
+        });
+        for (persist, expected_scope) in [(false, "turn"), (true, "session")] {
+            assert_eq!(
+                approval_response_body(
+                    "item/permissions/requestApproval",
+                    &params,
+                    &decision(ActionDecisionKind::Approve, persist),
+                )
+                .expect("typed permission approval"),
+                serde_json::json!({
+                    "permissions": params["permissions"],
+                    "scope": expected_scope,
+                    "strictAutoReview": null,
+                }),
+            );
+        }
+
+        assert_eq!(
+            approval_response_body(
+                "item/permissions/requestApproval",
+                &params,
+                &decision(ActionDecisionKind::Deny, false),
+            )
+            .expect("one-turn permission denial"),
+            serde_json::json!({
+                "permissions": {
+                    "fileSystem": null,
+                    "network": null,
+                },
+                "scope": "turn",
+                "strictAutoReview": true,
+            }),
+        );
+
+        let error = approval_response_body(
+            "item/permissions/requestApproval",
+            &params,
+            &decision(ActionDecisionKind::Deny, true),
+        )
+        .expect_err("Codex has no neutral persistent-deny permission response");
+        assert_eq!(error.code, "codex-invalid-persistent-decision");
+    }
+
+    #[test]
+    fn permission_approval_rejects_malformed_required_typed_params() {
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({"permissions": "all"}),
+            serde_json::json!({"permissions": {"unknown": {}}}),
+            serde_json::json!({"permissions": {"network": true}}),
+            serde_json::json!({"permissions": {"network": {"enabled": "yes"}}}),
+            serde_json::json!({"permissions": {"fileSystem": {"write": "not-an-array"}}}),
+            serde_json::json!({"permissions": {"fileSystem": {"globScanMaxDepth": 0}}}),
+            serde_json::json!({"permissions": {"fileSystem": {"entries": [{"path": "/tmp"}]}}}),
+        ] {
+            let error = approval_response_body(
+                "item/permissions/requestApproval",
+                &params,
+                &decision(ActionDecisionKind::Approve, false),
+            )
+            .expect_err("malformed official permission params must fail closed");
+            assert_eq!(error.code, "codex-invalid-approval-params");
+        }
+    }
+
+    #[test]
+    fn tool_user_input_is_not_misrepresented_as_an_approval_response() {
+        let error = approval_response_body(
+            "item/tool/requestUserInput",
+            &serde_json::json!({}),
+            &decision(ActionDecisionKind::Approve, false),
+        )
+        .expect_err("tool user input requires its typed answers response");
+        assert_eq!(error.code, "codex-unsupported-approval-method");
+    }
+
+    #[tokio::test]
+    async fn approval_route_is_single_flight_and_written_once() {
+        let routes = Arc::new(Mutex::new(HashMap::from([(
+            "request-under-test".into(),
+            ApprovalRoute {
+                rpc_id: 7,
+                method: "item/commandExecution/requestApproval".into(),
+                params: serde_json::json!({}),
+            },
+        )])));
+        let (writer, mut reader) = tokio::io::duplex(1);
+        let stdin = Arc::new(Mutex::new(writer));
+
+        let first = {
+            let routes = Arc::clone(&routes);
+            let stdin = Arc::clone(&stdin);
+            tokio::spawn(async move {
+                deliver_approval_decision(
+                    routes.as_ref(),
+                    stdin.as_ref(),
+                    &decision(ActionDecisionKind::Approve, false),
+                )
+                .await
+            })
+        };
+        tokio::task::yield_now().await;
+        let second = {
+            let routes = Arc::clone(&routes);
+            let stdin = Arc::clone(&stdin);
+            tokio::spawn(async move {
+                deliver_approval_decision(
+                    routes.as_ref(),
+                    stdin.as_ref(),
+                    &decision(ActionDecisionKind::Approve, false),
+                )
+                .await
+            })
+        };
+        tokio::task::yield_now().await;
+        let reader_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).await.expect("read wire");
+            bytes
+        });
+
+        let (first, second) = tokio::join!(first, second);
+        let results = [first.expect("first task"), second.expect("second task")];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(results.iter().any(|result| {
+            result
+                .as_ref()
+                .is_err_and(|error| error.code == "approval-route-not-found")
+        }));
+        assert!(routes.lock().await.is_empty());
+        drop(stdin);
+        let wire = reader_task.await.expect("reader task");
+        assert_eq!(wire.iter().filter(|byte| **byte == b'\n').count(), 1);
+        let frame: serde_json::Value = serde_json::from_slice(&wire).expect("one JSON-RPC frame");
+        assert_eq!(
+            frame,
+            serde_json::json!({"id": 7, "result": {"decision": "accept"}})
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_route_is_retained_when_flush_fails() {
+        let routes = Mutex::new(HashMap::from([(
+            "request-under-test".into(),
+            ApprovalRoute {
+                rpc_id: 7,
+                method: "item/fileChange/requestApproval".into(),
+                params: serde_json::json!({}),
+            },
+        )]));
+        let stdin = Mutex::new(FlushErrorWriter);
+        let error = deliver_approval_decision(
+            &routes,
+            &stdin,
+            &decision(ActionDecisionKind::Approve, false),
+        )
+        .await
+        .expect_err("flush failure is not an acknowledgement");
+        assert_eq!(error.code, "codex-stdin-write-failed");
+        assert!(routes.lock().await.contains_key("request-under-test"));
+    }
+
+    #[tokio::test]
+    async fn malformed_permission_params_are_rejected_before_write_and_retain_route() {
+        let routes = Mutex::new(HashMap::from([(
+            "request-under-test".into(),
+            ApprovalRoute {
+                rpc_id: 7,
+                method: "item/permissions/requestApproval".into(),
+                params: serde_json::json!({
+                    "permissions": {"network": {"enabled": "yes"}}
+                }),
+            },
+        )]));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let stdin = Mutex::new(WriteCountingWriter(Arc::clone(&writes)));
+
+        let error = deliver_approval_decision(
+            &routes,
+            &stdin,
+            &decision(ActionDecisionKind::Approve, false),
+        )
+        .await
+        .expect_err("malformed permission params must fail before adapter IO");
+
+        assert_eq!(error.code, "codex-invalid-approval-params");
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert!(routes.lock().await.contains_key("request-under-test"));
+    }
 
     #[test]
     fn thread_id_extraction_covers_notification_item_and_resume_result_shapes() {

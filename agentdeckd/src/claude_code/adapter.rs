@@ -6,9 +6,9 @@
 //! in 4A:
 //!
 //!   - `capabilities()` — real probe via `claude --version` cached in
-//!     a `OnceLock`; builds a typed `SessionCapabilities` covering
-//!     every Shared CapabilityId Codex has (N5 对称约束) plus the
-//!     CC-only ids the spec § 4.4 enumerated.
+//!     a `OnceLock`; builds typed `SessionCapabilities` for the verified
+//!     shared and CC-only features. Approval remains hidden while its
+//!     response wire shape is speculative.
 //!
 //!   - `start_session()` / `continue_thread()` — unchanged from 4A;
 //!     spawns CC, emits `SessionStarted` + `SessionCapabilities`
@@ -21,10 +21,10 @@
 //!   - `submit_decision()` — wire-format speculative (spec § 5.5
 //!     leaves the exact shape to live verification): writes one
 //!     `{"type":"permission_response", "tool_use_id":<id>,
-//!     "approved":<bool>}` JSON line to CC's stdin. Real-fixture
-//!     verification deferred (4A could not capture a CC permission
-//!     prompt under `bypassPermissions`; 4C records and revises if
-//!     needed).
+//!     "approved":<bool>}` JSON line to CC's stdin. It reports success
+//!     only after payload, newline and flush all complete. Real-fixture
+//!     verification is still deferred, so this path is not advertised
+//!     as a production Approval capability.
 //!
 //!   - `submit_vendor_control()` — CC has no in-place mutation of
 //!     permission mode, output style or hooks. The adapter returns a
@@ -56,7 +56,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc};
 
@@ -143,6 +143,8 @@ impl ClaudeCodeAdapter {
             .cli_version
             .get_or_init(probe_claude_code_version)
             .clone();
+        // Canonical builder is the single capability fact source. It keeps
+        // speculative Approval hidden until a recorded fixture/live gate.
         build_claude_code_capabilities(version)
     }
 
@@ -1061,52 +1063,7 @@ impl Agent for ClaudeCodeAdapter {
                 diagnostic_ref: None,
             })?
         };
-        let tool_use_id = {
-            let routes = entry.permission_routes.lock().await;
-            routes
-                .get(&decision.request_id)
-                .cloned()
-                .ok_or_else(|| ProtocolError {
-                    code: "cc-decision-no-route".into(),
-                    message: format!(
-                        "no pending permission for request_id {}",
-                        decision.request_id
-                    ),
-                    diagnostic_ref: None,
-                })?
-        };
-        let approved = matches!(decision.decision, ActionDecisionKind::Approve);
-        // Speculative wire shape — spec § 5.5 leaves this to live
-        // verification. A Task 4C recorded fixture from
-        // `--permission-mode default` will revise field names if
-        // necessary. We pick `permission_response` / `tool_use_id` /
-        // `approved` (snake_case) to match CC's existing stream-json
-        // conventions (`tool_use`, `tool_result`, `session_id`).
-        let line = serde_json::to_string(&serde_json::json!({
-            "type": "permission_response",
-            "tool_use_id": tool_use_id,
-            "approved": approved,
-        }))
-        .unwrap_or_default();
-        let mut stdin = entry.stdin.lock().await;
-        stdin
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|e| ProtocolError {
-                code: "cc-decision-write".into(),
-                message: format!("write permission_response to claude stdin: {e}"),
-                diagnostic_ref: None,
-            })?;
-        let _ = stdin.write_all(b"\n").await;
-        let _ = stdin.flush().await;
-        // Drop the route — CC won't ask the same permission again
-        // under the same tool_use_id.
-        entry
-            .permission_routes
-            .lock()
-            .await
-            .remove(&decision.request_id);
-        Ok(())
+        deliver_permission_decision(entry.permission_routes.as_ref(), &entry.stdin, &decision).await
     }
 
     async fn submit_vendor_control(
@@ -1209,6 +1166,73 @@ impl Agent for ClaudeCodeAdapter {
     }
 }
 
+async fn write_permission_response_line<W>(writer: &mut W, line: &str) -> Result<(), ProtocolError>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| ProtocolError {
+            code: "cc-decision-write".into(),
+            message: format!("write permission_response payload to claude stdin: {e}"),
+            diagnostic_ref: None,
+        })?;
+    writer.write_all(b"\n").await.map_err(|e| ProtocolError {
+        code: "cc-decision-write".into(),
+        message: format!("write permission_response newline to claude stdin: {e}"),
+        diagnostic_ref: None,
+    })?;
+    writer.flush().await.map_err(|e| ProtocolError {
+        code: "cc-decision-write".into(),
+        message: format!("flush permission_response to claude stdin: {e}"),
+        diagnostic_ref: None,
+    })?;
+    Ok(())
+}
+
+async fn deliver_permission_decision<W>(
+    permission_routes: &Mutex<HashMap<String, String>>,
+    stdin: &Mutex<W>,
+    decision: &ActionDecision,
+) -> Result<(), ProtocolError>
+where
+    W: AsyncWrite + Unpin,
+{
+    // Serialize lookup, complete JSONL write+flush and route consumption
+    // under one guard so concurrent decisions cannot duplicate delivery.
+    let mut routes = permission_routes.lock().await;
+    let tool_use_id = routes
+        .get(&decision.request_id)
+        .cloned()
+        .ok_or_else(|| ProtocolError {
+            code: "cc-decision-no-route".into(),
+            message: format!(
+                "no pending permission for request_id {}",
+                decision.request_id
+            ),
+            diagnostic_ref: None,
+        })?;
+    let approved = matches!(decision.decision, ActionDecisionKind::Approve);
+    // Speculative wire shape — keep production Approval hidden until a
+    // recorded fixture or live gate verifies these field names.
+    let line = serde_json::to_string(&serde_json::json!({
+        "type": "permission_response",
+        "tool_use_id": tool_use_id,
+        "approved": approved,
+    }))
+    .map_err(|e| ProtocolError {
+        code: "cc-decision-encode".into(),
+        message: format!("encode permission_response for claude stdin: {e}"),
+        diagnostic_ref: None,
+    })?;
+    let mut writer = stdin.lock().await;
+    write_permission_response_line(&mut *writer, &line).await?;
+    drop(writer);
+    routes.remove(&decision.request_id);
+    Ok(())
+}
+
 // ── CLI flag mapping ────────────────────────────────────────────────────────
 
 fn permission_mode_to_cli(m: ClaudeCodePermissionMode) -> &'static str {
@@ -1241,7 +1265,224 @@ mod tests {
     use super::*;
     use crate::agent::CanonicalAgentEvent;
     use agentdeck_protocol::{AgentItem, AgentItemMeta, ServerEvent};
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWrite};
+
+    #[derive(Clone, Copy)]
+    enum WriteFault {
+        None,
+        Payload,
+        PartialPayload,
+        Newline,
+        Flush,
+    }
+
+    struct FaultWriter {
+        fault: WriteFault,
+        write_calls: usize,
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl FaultWriter {
+        fn new(fault: WriteFault) -> Self {
+            Self {
+                fault,
+                write_calls: 0,
+                bytes: Vec::new(),
+                flushes: 0,
+            }
+        }
+    }
+
+    impl AsyncWrite for FaultWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let call = self.write_calls;
+            self.write_calls += 1;
+            match (self.fault, call) {
+                (WriteFault::Payload, 0) | (WriteFault::Newline, 1) => {
+                    Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "injected")))
+                }
+                (WriteFault::PartialPayload, 0) => {
+                    let written = buf.len().max(2) / 2;
+                    self.bytes.extend_from_slice(&buf[..written]);
+                    Poll::Ready(Ok(written))
+                }
+                (WriteFault::PartialPayload, 1) => {
+                    Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "injected")))
+                }
+                _ => {
+                    self.bytes.extend_from_slice(buf);
+                    Poll::Ready(Ok(buf.len()))
+                }
+            }
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushes += 1;
+            if matches!(self.fault, WriteFault::Flush) {
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "injected")))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_response_requires_payload_newline_and_flush_before_success() {
+        let mut writer = FaultWriter::new(WriteFault::None);
+        write_permission_response_line(&mut writer, r#"{"approved":true}"#)
+            .await
+            .expect("complete JSONL delivery");
+        assert_eq!(writer.bytes, b"{\"approved\":true}\n");
+        assert_eq!(writer.flushes, 1);
+    }
+
+    #[tokio::test]
+    async fn permission_response_propagates_every_write_and_flush_failure() {
+        const LINE: &str = r#"{"approved":true}"#;
+        for (fault, expected_stage) in [
+            (WriteFault::Payload, "payload"),
+            (WriteFault::PartialPayload, "payload"),
+            (WriteFault::Newline, "newline"),
+            (WriteFault::Flush, "flush"),
+        ] {
+            let mut writer = FaultWriter::new(fault);
+            let error = write_permission_response_line(&mut writer, LINE)
+                .await
+                .expect_err("injected delivery failure must be visible");
+            assert_eq!(error.code, "cc-decision-write");
+            assert!(
+                error.message.contains(expected_stage),
+                "expected {expected_stage} failure, got {}",
+                error.message
+            );
+            match fault {
+                WriteFault::Payload => {
+                    assert!(writer.bytes.is_empty());
+                    assert_eq!(writer.flushes, 0);
+                }
+                WriteFault::PartialPayload => {
+                    assert!(!writer.bytes.is_empty());
+                    assert!(writer.bytes.len() < LINE.len());
+                    assert_eq!(writer.flushes, 0);
+                }
+                WriteFault::Newline => {
+                    assert_eq!(writer.bytes, LINE.as_bytes());
+                    assert_eq!(writer.flushes, 0);
+                }
+                WriteFault::Flush => {
+                    assert_eq!(writer.bytes, b"{\"approved\":true}\n");
+                    assert_eq!(writer.flushes, 1);
+                }
+                WriteFault::None => unreachable!("success is covered separately"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_route_is_single_flight_and_written_once() {
+        let routes = Arc::new(Mutex::new(HashMap::from([(
+            "request-under-test".into(),
+            "tool-use-7".into(),
+        )])));
+        let (writer, mut reader) = tokio::io::duplex(1);
+        let stdin = Arc::new(Mutex::new(writer));
+
+        let first = {
+            let routes = Arc::clone(&routes);
+            let stdin = Arc::clone(&stdin);
+            tokio::spawn(async move {
+                deliver_permission_decision(
+                    routes.as_ref(),
+                    stdin.as_ref(),
+                    &ActionDecision {
+                        request_id: "request-under-test".into(),
+                        decision: ActionDecisionKind::Approve,
+                        persist: false,
+                    },
+                )
+                .await
+            })
+        };
+        tokio::task::yield_now().await;
+        let second = {
+            let routes = Arc::clone(&routes);
+            let stdin = Arc::clone(&stdin);
+            tokio::spawn(async move {
+                deliver_permission_decision(
+                    routes.as_ref(),
+                    stdin.as_ref(),
+                    &ActionDecision {
+                        request_id: "request-under-test".into(),
+                        decision: ActionDecisionKind::Approve,
+                        persist: false,
+                    },
+                )
+                .await
+            })
+        };
+        tokio::task::yield_now().await;
+        let reader_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).await.expect("read wire");
+            bytes
+        });
+
+        let (first, second) = tokio::join!(first, second);
+        let results = [first.expect("first task"), second.expect("second task")];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(results.iter().any(|result| {
+            result
+                .as_ref()
+                .is_err_and(|error| error.code == "cc-decision-no-route")
+        }));
+        assert!(routes.lock().await.is_empty());
+        drop(stdin);
+        let wire = reader_task.await.expect("reader task");
+        assert_eq!(wire.iter().filter(|byte| **byte == b'\n').count(), 1);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&wire).expect("one JSONL frame"),
+            serde_json::json!({
+                "type": "permission_response",
+                "tool_use_id": "tool-use-7",
+                "approved": true,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_route_is_retained_when_flush_fails() {
+        let routes = Mutex::new(HashMap::from([(
+            "request-under-test".into(),
+            "tool-use-7".into(),
+        )]));
+        let stdin = Mutex::new(FaultWriter::new(WriteFault::Flush));
+        let error = deliver_permission_decision(
+            &routes,
+            &stdin,
+            &ActionDecision {
+                request_id: "request-under-test".into(),
+                decision: ActionDecisionKind::Approve,
+                persist: false,
+            },
+        )
+        .await
+        .expect_err("flush failure is not an acknowledgement");
+        assert_eq!(error.code, "cc-decision-write");
+        assert!(routes.lock().await.contains_key("request-under-test"));
+    }
 
     #[test]
     fn permission_mode_cli_strings_cover_all_six_variants() {

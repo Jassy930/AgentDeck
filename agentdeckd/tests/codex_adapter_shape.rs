@@ -83,6 +83,17 @@ fn capabilities_includes_codex_features() {
     assert_eq!(caps.agent_kind, AgentKind::Codex);
     assert!(caps.features.contains(&CapabilityId::CodexSandboxMode));
     assert!(caps.features.contains(&CapabilityId::Approval));
+    assert!(
+        caps.features
+            .contains(&CapabilityId::CodexApprovalPersistence)
+    );
+    match &caps.vendor {
+        VendorCapabilities::Codex(codex) => assert!(
+            codex.persistence_supported,
+            "Approval persistence is backed by Codex's typed acceptForSession/session scope responses"
+        ),
+        other => panic!("expected Codex vendor capabilities, got {other:?}"),
+    }
     // Sanity: the Claude-Code-only features did NOT leak in.
     assert!(
         !caps

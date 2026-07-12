@@ -6,9 +6,10 @@
 //! ## CC capability surface
 //!
 //! `features` is a typed `BTreeSet<CapabilityId>` (deterministic
-//! serialization). The CC set includes **every** Shared CapabilityId that
-//! Codex has (N5 对称约束) plus the CC-only capabilities the spec § 4.4
-//! enumerated. The vendor block carries the 6 permission modes, a small
+//! serialization). Shared capability 只有在对应 production wire 已验证后才广告；
+//! Claude Code approval response 仍缺 recorded fixture/live gate，因此唯一 builder
+//! 必须暂时隐藏 `Approval`。其余 shared 与 CC-only capabilities 按 spec § 4.4
+//! 构造。vendor block carries the 6 permission modes, a small
 //! curated `output_styles` list, and the hook names CC accepts on
 //! `--include-hook-events` lifecycle output.
 //!
@@ -33,12 +34,11 @@ use agentdeck_protocol::{
 /// block (for vendor-specific routing / debugging).
 pub fn build_claude_code_capabilities(cli_version: String) -> SessionCapabilities {
     let features: BTreeSet<CapabilityId> = [
-        // —— Shared (N5 对称约束: every Shared id Codex has) ——
+        // —— Shared（Approval 在 recorded fixture/live gate 前 fail-close 隐藏）——
         CapabilityId::StreamingMessages,
         CapabilityId::StreamingReasoning,
         CapabilityId::Shell,
         CapabilityId::Diff,
-        CapabilityId::Approval,
         CapabilityId::Mcp,
         CapabilityId::TokenCounters,
         CapabilityId::AuthStatus,
@@ -132,7 +132,6 @@ mod tests {
             CapabilityId::StreamingReasoning,
             CapabilityId::Shell,
             CapabilityId::Diff,
-            CapabilityId::Approval,
             CapabilityId::Mcp,
             CapabilityId::TokenCounters,
             CapabilityId::AuthStatus,
@@ -142,6 +141,10 @@ mod tests {
         ] {
             assert!(caps.features.contains(&id), "missing shared {id:?}");
         }
+        assert!(
+            !caps.features.contains(&CapabilityId::Approval),
+            "unverified Claude Code approval wire must not be advertised"
+        );
         // CC-only
         for id in [
             CapabilityId::ClaudeCodePermissionMode,
