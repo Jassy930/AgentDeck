@@ -434,6 +434,69 @@ agentdeckd
   self-signed helper 虽通过 `codesign --verify`，均被 AMFI 以 exit 137 拒绝启动。因此本节
   只描述实现边界，不构成 P3.1/P3 完成声明。
 
+### Relay Companion MVP P3.2 Runtime persistence 不变量
+
+- `RuntimeStoreHandle` 只把命令送入专用 blocking worker；SQLite connection、RuntimeKeyBundle
+  和 store path lease 从不跨 worker。dequeue 顺序固定为 control shutdown、safety、read、
+  normal；业务 lane 分别有 count bound，normal/safety 同时持有按 retained allocation 计费的
+  byte permit。同步 rusqlite 操作不可被优先级抢占，只有 shutdown 的 SQLite interrupt 能中止
+  当前数据库调用。
+- stable `conversationId` / `adapterStateKey` 必须在 adapter 启动前、进入 store 事务前由
+  daemon 生成。store 以 caller-owned ID 实现 create COMMIT-unknown 的精确重放；vendor
+  resume reference 仍不能进入 common `conversations` 表，P3.3 只把它写入 adapter 私表。
+- catalogRevision、commandSeq、eventSeq 是三个独立 u64 high-water，SQLite 中使用固定 20 位
+  十进制文本；分配 ID、推进 high-water、改变 command state 与插入对应 event 必须位于同一
+  `BEGIN IMMEDIATE`。所有 after-COMMIT failure 只能返回 unknown outcome，不能把已提交事实
+  改写成失败。
+- command 状态主路径是 `Accepted → Started → Completed|Failed|Interrupted|Canceled`；
+  Started 事务同时冻结 ExecutionIntent 与 started event。vendor 执行前还必须持久化
+  ExecutionFence，再单独提交 release authorization；没有 matching fence/release 的 terminal
+  COMMIT 被 store 拒绝；partial unique index 与 authenticated preflight 共同保证同一
+  conversation 最多一个 Started。Accepted 在 24 小时边界由 daemon clock sweep 为 Expired，
+  并同时推进 event high-water；clock 倒退 fail-close，不能写出逆序时间线。
+- command sealed row 内保存 owner canonical bytes、idempotency key 与 prompt；读取时从密文
+  重算 owner/idempotency/payload blind token，并核对 logical length。terminal token 绑定
+  conversation、command、turn、terminal kind、result 与 event；intent/fence nonce token 同样
+  从已认证明文重算。command/conversation/event canonical 元数据由 BIK MAC，`runtime_meta`
+  的 catalog/queue/safety counters 由 authenticated ledger MAC；open/recovery begin 以流式扫描
+  验证 descriptor 与 command/execution/event 行、全部 canonical metadata、逐 conversation
+  command/event HWM、终态审计 linkage，以及 conversation/command/event/intent/fence 总数；
+  finish 在开放 mutation 前再次做完整 readback。任何换列、换 owner、换 turn、删空 catalog row、
+  删整组 terminal audit 或
+  密文/元数据不一致都映射为 corrupt state；P4 仍须用 Keychain CounterGuard 绑定整库
+  generation/HWM，才能检测回滚到更早但内部自洽的完整 DB/WAL 快照。
+- Runtime DB schema v1 只含 `runtime_meta`、`conversations`、`commands`、
+  `execution_intents`、`execution_fences`、`event_journal`、
+  `machine_enrollment_receipts`。最后一张表是 root-lost rescue 所需的非秘密 index；其余敏感
+  payload 均使用 StorageKEK 包装的 DEK/BIK。P3.3/P3.5/P3.6/P4 只能由各自 migration 增表，
+  不能预建 nullable 通用表。
+- 普通副作用准入同时检查 main/WAL/SHM、projected growth、文件系统
+  `max(512 MiB, 5%)` reserve、`page_count/max_page_count`，并在每次 COMMIT 后重新观测。
+  Accepted/Started 在普通准入时分别预留 expiry 与 fence/release/最大 terminal safety tail；
+  `wal_autocheckpoint=0` 与 `SQLITE_FCNTL_PERSIST_WAL` 必须读回，避免 SQLite close/auto
+  checkpoint 绕过预算；显式 checkpoint 先预算 main+WAL copy peak。接近 2 GiB 水位或
+  WAL ≥64 MiB 时只做 bounded `PASSIVE` checkpoint，reader pin 后仍接近水位则 fail-close。
+  non-disk capacity violation 把当前进程 latch 为 SafetyOnly；DiskLow 本身不永久 latch。
+  inspect 不受普通写门禁，fence、release、terminal、rescue 每次写入前仍须校验剩余 safety
+  obligation。
+  `max_page_count` 只限制 main DB，不能冒充 custom quota VFS 的 active-WAL 零超冲保证。
+- 恢复是显式三阶段协议：begin 先 streaming integrity validation、expiry sweep，再冻结
+  authenticated catalog HWM；page 只接受 store 签发的 exact keyset cursor，每页一个
+  conversation，最多 32 Accepted + 一个 Started，retained 上限 80 MiB；finish 只在终页累计
+  counts 与冻结 RuntimeLedger 完全一致时开放 mutation。begin/page/finish response loss 均可
+  exact retry。Recovering 期间 inspect/shutdown 可用，其余 normal/safety mutation 全部拒绝；
+  P3.4 RuntimeCore 必须逐页处理且在 finish 前不执行任何 Accepted，禁止全库 collect。
+- 所有公开 durable write 的 COMMIT 都直接检查 SQLite transaction 状态：明确 rollback 成功
+  才返回原 SQLite error；已进入 autocommit 或 rollback 无法确认时统一返回
+  `CommitOutcomeUnknown`，由 stable input 的 exact retry 收敛。shutdown deadline 只限制调用方
+  等待，worker/SQLite/row keys/path lease 只在真正静默退出后释放。
+- `machine_enrollment_receipts` 只是 MachineRoot 丢失后仍可读的非秘密 locator，不带 MAC、
+  也不是 purge authorization。P4 trust-reset 必须用 Relay/admin-signed receipt 独立验证 old
+  route/root fingerprint；不得仅凭该表执行远端删除。
+- P3.2 只建立并验证 store boundary；当前 compatibility `RuntimeHub` 尚未依赖它。P3.3 的
+  adapter 私有映射和 P3.4 的 RuntimeCore actor 才能把业务请求接入，因此本节不是本地/远程
+  端到端可用声明。
+
 ### R1a 隐含约束（历史参考）
 
 - **R1a machine_id ≡ device_id**：`server/ws.rs::connect` 用 `device.device_id` 作 `ConnRole::Machine.machine_id`，`router.rs` RegisterMachine 授权强制 `machine.machine_id == connection.machine_id`——**enrolled 的 machine 设备的 `machine_id` 严格等于 `device_id`**。CLI 生成的随机 `device_id = "cli-<profile>-<random>"` 会锁定 R2 daemon remote-mode 里对应 machine 的 identifier；R2 设计需评估是否解耦 machine_id 与 device_id（例如 machine 元数据里显式携带独立 machine_id）。

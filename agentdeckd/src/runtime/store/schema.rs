@@ -38,7 +38,18 @@ CREATE TABLE runtime_meta (
             AND catalog_high_water NOT GLOB '*[^0-9]*'
             AND catalog_high_water <= '18446744073709551615'
         )
-    )
+    ),
+    conversation_count INTEGER NOT NULL CHECK(conversation_count >= 0),
+    command_count INTEGER NOT NULL CHECK(command_count >= 0),
+    event_count INTEGER NOT NULL CHECK(event_count >= 0),
+    intent_count INTEGER NOT NULL CHECK(intent_count >= 0),
+    fence_count INTEGER NOT NULL CHECK(fence_count >= 0),
+    accepted_count INTEGER NOT NULL CHECK(accepted_count BETWEEN 0 AND 1024),
+    accepted_payload_bytes INTEGER NOT NULL CHECK(accepted_payload_bytes BETWEEN 0 AND 268435456),
+    started_without_fence_count INTEGER NOT NULL CHECK(started_without_fence_count >= 0),
+    started_without_release_count INTEGER NOT NULL CHECK(started_without_release_count >= 0),
+    started_released_count INTEGER NOT NULL CHECK(started_released_count >= 0),
+    metadata_token BLOB NOT NULL CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32)
 );
 CREATE TABLE conversations (
     conversation_id BLOB PRIMARY KEY CHECK(typeof(conversation_id) = 'blob' AND length(conversation_id) = 16),
@@ -65,8 +76,11 @@ CREATE TABLE conversations (
     lifecycle TEXT NOT NULL CHECK(lifecycle IN ('active', 'archived', 'recoveryBlocked')),
     created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
     updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms),
+    accepted_count INTEGER NOT NULL CHECK(accepted_count BETWEEN 0 AND 32),
+    metadata_token BLOB NOT NULL CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
     sealed_descriptor BLOB NOT NULL CHECK(typeof(sealed_descriptor) = 'blob' AND length(sealed_descriptor) >= 40)
 );
+CREATE UNIQUE INDEX idx_conversations_catalog_revision ON conversations(catalog_revision);
 CREATE TABLE commands (
     conversation_id BLOB NOT NULL CHECK(typeof(conversation_id) = 'blob' AND length(conversation_id) = 16),
     command_seq TEXT NOT NULL CHECK(
@@ -75,8 +89,13 @@ CREATE TABLE commands (
         AND command_seq <= '18446744073709551615'
     ),
     command_id BLOB NOT NULL UNIQUE CHECK(typeof(command_id) = 'blob' AND length(command_id) = 16),
+    owner_token BLOB NOT NULL CHECK(typeof(owner_token) = 'blob' AND length(owner_token) = 32),
     idempotency_token BLOB NOT NULL UNIQUE CHECK(typeof(idempotency_token) = 'blob' AND length(idempotency_token) = 32),
     payload_token BLOB NOT NULL CHECK(typeof(payload_token) = 'blob' AND length(payload_token) = 32),
+    terminal_token BLOB CHECK(terminal_token IS NULL OR (typeof(terminal_token) = 'blob' AND length(terminal_token) = 32)),
+    turn_id BLOB UNIQUE CHECK(turn_id IS NULL OR (typeof(turn_id) = 'blob' AND length(turn_id) = 16)),
+    started_event_id BLOB UNIQUE CHECK(started_event_id IS NULL OR (typeof(started_event_id) = 'blob' AND length(started_event_id) = 16)),
+    terminal_event_id BLOB UNIQUE CHECK(terminal_event_id IS NULL OR (typeof(terminal_event_id) = 'blob' AND length(terminal_event_id) = 16)),
     state TEXT NOT NULL CHECK(state IN (
         'accepted', 'started', 'completed', 'failed', 'interrupted',
         'expired', 'canceled', 'revokedBeforeStart'
@@ -86,7 +105,13 @@ CREATE TABLE commands (
     expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms >= accepted_at_ms),
     retain_until_ms INTEGER NOT NULL CHECK(retain_until_ms >= expires_at_ms),
     started_at_ms INTEGER CHECK(started_at_ms IS NULL OR started_at_ms >= accepted_at_ms),
-    terminal_at_ms INTEGER CHECK(terminal_at_ms IS NULL OR terminal_at_ms >= accepted_at_ms),
+    terminal_at_ms INTEGER CHECK(
+        terminal_at_ms IS NULL OR (
+            terminal_at_ms >= accepted_at_ms
+            AND (started_at_ms IS NULL OR terminal_at_ms >= started_at_ms)
+        )
+    ),
+    metadata_token BLOB NOT NULL CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
     sealed_command BLOB NOT NULL CHECK(typeof(sealed_command) = 'blob' AND length(sealed_command) >= 40),
     sealed_result BLOB CHECK(sealed_result IS NULL OR (typeof(sealed_result) = 'blob' AND length(sealed_result) >= 40)),
     PRIMARY KEY(conversation_id, command_seq),
@@ -95,8 +120,12 @@ CREATE TABLE commands (
 CREATE INDEX idx_commands_recovery ON commands(conversation_id, state, command_seq);
 CREATE INDEX idx_commands_expiry ON commands(state, expires_at_ms);
 CREATE INDEX idx_commands_retention ON commands(retain_until_ms);
+CREATE INDEX idx_commands_owner_state ON commands(owner_token, state, conversation_id, command_seq);
+CREATE UNIQUE INDEX idx_commands_one_started ON commands(conversation_id) WHERE state = 'started';
 CREATE TABLE execution_intents (
     command_id BLOB PRIMARY KEY CHECK(typeof(command_id) = 'blob' AND length(command_id) = 16),
+    turn_id BLOB NOT NULL UNIQUE CHECK(typeof(turn_id) = 'blob' AND length(turn_id) = 16),
+    started_event_id BLOB NOT NULL UNIQUE CHECK(typeof(started_event_id) = 'blob' AND length(started_event_id) = 16),
     daemon_boot_id BLOB NOT NULL CHECK(typeof(daemon_boot_id) = 'blob' AND length(daemon_boot_id) = 16),
     execution_nonce_token BLOB NOT NULL CHECK(typeof(execution_nonce_token) = 'blob' AND length(execution_nonce_token) = 32),
     created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
@@ -117,6 +146,14 @@ CREATE TABLE execution_fences (
         AND leader_start_time <= '18446744073709551615'
     ),
     release_authorized_at_ms INTEGER CHECK(release_authorized_at_ms IS NULL OR release_authorized_at_ms >= 0),
+    release_token BLOB CHECK(
+        (release_authorized_at_ms IS NULL AND release_token IS NULL)
+        OR (
+            release_authorized_at_ms IS NOT NULL
+            AND typeof(release_token) = 'blob'
+            AND length(release_token) = 32
+        )
+    ),
     sealed_fence BLOB NOT NULL CHECK(typeof(sealed_fence) = 'blob' AND length(sealed_fence) >= 40),
     FOREIGN KEY(command_id, daemon_boot_id, execution_nonce_token)
         REFERENCES execution_intents(command_id, daemon_boot_id, execution_nonce_token)
@@ -133,6 +170,7 @@ CREATE TABLE event_journal (
     command_id BLOB CHECK(command_id IS NULL OR (typeof(command_id) = 'blob' AND length(command_id) = 16)),
     logical_event_bytes INTEGER NOT NULL CHECK(logical_event_bytes BETWEEN 0 AND 67108864),
     created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+    metadata_token BLOB NOT NULL CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
     sealed_event BLOB NOT NULL CHECK(typeof(sealed_event) = 'blob' AND length(sealed_event) >= 40),
     PRIMARY KEY(conversation_id, event_seq),
     FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id) ON UPDATE RESTRICT ON DELETE RESTRICT,

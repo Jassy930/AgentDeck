@@ -148,6 +148,29 @@ unsigned 开发实例必须显式使用 `--ephemeral --no-remote --profile dev`�
 provisioning profile 一致的 helper 上实际运行后才算通过；当前本机无匹配 provisioning
 profile，已签名尝试均被 AMFI 以 exit 137 终止。ignored 不能计作 PASS，也不能据此完成 P3.1。
 
+### Relay Companion MVP P3.2（Runtime store 组件门禁）
+
+```bash
+cargo test -p agentdeckd \
+  --test runtime_store --test runtime_store_admission \
+  --test runtime_store_capacity --test runtime_store_cipher \
+  --test runtime_store_identity --test runtime_store_sequence \
+  --test runtime_store_queue --test runtime_store_journal \
+  --test runtime_store_hardening --test runtime_store_boundaries \
+  --test runtime_store_commit_outcome --test runtime_store_recovery \
+  --test runtime_store_shutdown \
+  -- --test-threads=1
+cargo test -p agentdeckd -- --test-threads=1
+bash scripts/check-daemon-no-net.sh
+```
+
+P3.2 必须保持 caller-owned stable conversation/adapter IDs、全部事务精确重试、24h TTL、
+fence/release、32/1,024/256MiB、2GiB admission、safety tail/bounded checkpoint、真实 COMMIT
+unknown、认证 metadata/ledger、三业务 lane count/byte bound、paged recovery（单页一个
+conversation、80MiB、exact cursor/finish、恢复期 mutation fence）和 shutdown
+优先级。该组件尚未接入 compatibility RuntimeHub；P3.4 前不得把 store 测试表述为 UDS、
+远程或 Companion E2E。标准 SQLite 无 custom quota VFS，不能声称 active WAL 瞬时零超冲。
+
 ## 浏览与外部资料
 
 需要网页资料时优先使用当前环境可用的官方浏览工具和一手来源。不要引入项目级外部浏览 skill 依赖，也不要要求安装额外工具才能在本仓库工作。

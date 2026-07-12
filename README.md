@@ -299,6 +299,70 @@ StorageKEK；写入后必须立即读回并逐字节一致。既有 Runtime arti
 终止。因此 P3.1/P3 还不能声明完成，必须在具备匹配 provisioning/entitlement 的已签名
 helper 上补齐证据。
 
+### P3.2 Runtime journal 当前边界
+
+daemon 的 canonical Runtime state 现在由单一 blocking worker 独占 `runtime.db` connection。
+worker 使用 `shutdown > safety > read > normal` 四级裁决；三条业务 lane 分别有 count 上界，
+normal/safety 另有 256 MiB retained-allocation 上界。shutdown 是单槽状态机，先 interrupt
+当前 SQLite 操作，再在下一 dequeue 边界关闭并拒绝剩余队列；connection、行密钥和 path
+lease 全部释放后才返回。
+
+`conversationId` 与 `adapterStateKey` 在调用 store 前由 daemon 生成并随
+`NewConversation` 持久化。相同 ID/descriptor 的重试返回同一 catalog record；不同内容
+返回 typed conflict。command/event/catalog high-water 使用完整 u64 的固定 20 位文本，
+首次为 0、跨重启单调、`u64::MAX` fail-close。command idempotency 绑定
+conversation + stable principal owner + key；本地 owner 不含临时 connection，远程 owner
+不含可续期 grant serial。
+
+Accepted、Started + ExecutionIntent + started event、ExecutionFence、release authorization、
+terminal state + event 都以事务为边界。任何 before-COMMIT failure 完整回滚；任何
+真实 COMMIT 失败若无法确认 rollback、以及任何 after-COMMIT response loss，都返回
+`CommitOutcomeUnknown`；完全相同的重试只读回原 record。
+同一 conversation 在 store 层最多存在一个 Started，completion 必须先存在 matching fence
+且 `releaseAuthorizedAt` 已提交。24 小时未启动的
+Accepted command 由可注入 daemon clock 在 accept/start/recovery 前 sweep 为 Expired，并写入
+同 conversation 的 canonical expiry event；idempotency ledger 至少保留 30 天。
+
+schema v1 仍严格只有七张表。descriptor、owner/idempotency key、prompt、execution nonce/
+intent、fence payload、event 与 terminal result 都使用 StorageKEK 包装的行密钥加密；blind
+token 会从已认证明文重算。command/conversation/event 的 canonical 明文元数据另有行 MAC，
+`runtime_meta` 保存经过 MAC 的 queue/safety ledger；open 与 recovery begin 都以常量峰值内存
+流式验证 conversation descriptor 与 command/execution/event 密文、全部 canonical 元数据、
+逐 conversation command/event HWM、审计 linkage，以及 conversation/command/event/intent/fence
+总数与 queue/safety 计数。DB/WAL/SHM 换列、删空 catalog row、删整组 terminal audit 或伪造
+reserve 都会 fail-close。唯一故意不加密的是 root 丢失时仍需定位旧 route/fingerprint 的非秘密
+`machine_enrollment_receipts` rescue index；它不是授权证据，P4 purge 必须独立验证 Relay/admin
+签名回执，不能仅凭该 locator 删除远端状态。
+
+恢复不再返回全库 `RecoveryState`。`begin_recovery_scan` 先完成 integrity validation 与一次
+expiry sweep，再冻结 authenticated catalog high-water；`load_recovery_page` 使用 opaque
+keyset cursor，每页恰好一个 conversation（最多 32 Accepted + 一个 Started），retained-memory
+硬上界 80 MiB。丢失的 begin/page/finish 回执都可用完全相同 token 精确重试。扫描期间只允许
+inspect/shutdown，全部 durable mutation 返回 `daemon.runtime.recovering`；只有终页累计计数与
+冻结 ledger 一致、finish 再次完成全库 integrity readback 且 RuntimeCore 显式确认后才恢复写入。
+P3.4 必须逐页消费，禁止重新 collect
+成全库 Vec 或在完成全扫描前启动 Accepted。
+
+普通 create/accept/start 写入按 main DB + WAL + SHM observed footprint、保守 projected
+growth、SQLite `max_page_count=2 GiB/page_size` 与文件系统 reserve
+`max(512 MiB, 5%)` 做准入，并为 Accepted expiry 及 Started 的 fence/release/最大 terminal
+尾预留空间。SQLite `wal_autocheckpoint=0` 且启用/读回 persistent WAL，所有 checkpoint 只能
+走显式预算路径；执行 `PASSIVE` 前还按 main+WAL 同时存在的 copy peak 预检。接近水位或
+WAL ≥64 MiB 时只执行 bounded `PASSIVE` checkpoint；reader 阻塞且仍接近水位时停止普通写。
+非 DiskLow 越界后 latch `SafetyOnly`，DiskLow 可在空间恢复后重试；inspect 仍可继续，
+fence、release、terminal
+与 rescue 只有在剩余 safety tail 再次校验通过时才写入。标准 SQLite 无 custom quota VFS，
+因此这里不声称 active WAL 在任意瞬间绝不短暂超冲 2 GiB；precheck、有界 checkpoint、
+逐次 safety 校验与写后读回是当前 MVP 的 fail-closed 边界。
+
+行 MAC 能检测局部换列/删除/篡改，但“把 main+WAL 整体回滚到更早且内部自洽的有效快照”必须
+由 P4 的 Keychain `CounterGuard` / generation high-water 绑定后才能检测。该门禁属于 P4/P6，
+P3.2 不能宣称已防住整库历史回滚。
+
+本节描述已经验证的持久化组件契约，不表示当前 stdio `RuntimeHub` 已改走该 store。
+P3.3 先接 adapter 私有映射，P3.4 再由 `RuntimeCore` 把真实本地/远程请求接入 journal；在此之前
+不能把 store unit/integration tests 当成 Companion 端到端完成证据。
+
 ## agentdeck CLI（参考客户端 / E2E 驱动）
 
 `agentdeck` 是一个 Rust 二进制参考客户端，**不在 Swift GUI 的实时通路上**。Swift app 仍直接通过 stdio JSONL 与 daemon 通信；`agentdeck` 用于脚本化调用、本地验证以及门控 E2E 测试驱动。

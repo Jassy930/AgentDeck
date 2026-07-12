@@ -4,23 +4,68 @@
 //! failure 映射成客户端可见 receipt 与 `RuntimeFailure`。
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 
+use super::store::admission::SystemRuntimeCapacityProbe;
+pub use super::store::admission::{
+    RuntimeCapacityObservation, RuntimeCapacityProbe, RuntimeCapacityProbeError,
+};
 use super::store::cipher::CipherError;
+use super::store::identity::{
+    OsRuntimeIdSource, RuntimeId, RuntimeIdError, RuntimeIdKind, RuntimeIdSource,
+};
+use super::store::sequence::SequenceError;
 
 pub const DEFAULT_RUNTIME_STORE_COMMAND_CAPACITY: usize = 32;
 pub const DEFAULT_RUNTIME_BUSY_TIMEOUT_MS: u64 = 5_000;
 pub const MAX_RUNTIME_STORE_COMMAND_CAPACITY: usize = 1_024;
+pub const DEFAULT_RUNTIME_STORE_LANE_BYTE_CAPACITY: usize = 256 * 1024 * 1024;
+pub const MAX_RUNTIME_STORE_LANE_BYTE_CAPACITY: usize = 256 * 1024 * 1024;
 pub const MAX_RUNTIME_BUSY_TIMEOUT_MS: u64 = 30_000;
 pub const RUNTIME_STORE_SHUTDOWN_GRACE_MS: u64 = 5_000;
+pub const MAX_CONVERSATION_QUEUED_COMMANDS: u32 = 32;
+pub const MAX_GLOBAL_QUEUED_COMMANDS: u32 = 1_024;
+pub const MAX_GLOBAL_QUEUED_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_COMMAND_PAYLOAD_BYTES: usize = 256 * 1024;
+pub const MAX_CONVERSATION_DESCRIPTOR_BYTES: usize = 1024 * 1024;
+pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 1024;
+pub const MAX_EXECUTION_INTENT_BYTES: usize = 1024 * 1024;
+pub const MAX_RUNTIME_EVENT_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_EXECUTION_FENCE_BYTES: usize = 1024 * 1024;
+pub const MAX_COMMAND_RESULT_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_EXECUTION_NONCE_BYTES: usize = 1024;
+/// 单个 conversation 恢复页的 retained-memory 硬上界。
+///
+/// 1 MiB descriptor + 32 * 256 KiB Accepted prompts + 一个 Started prompt/
+/// intent/event/fence 的合法最大值低于 80 MiB；该上界独立于 async lane budget，
+/// 也绝不允许退化为全库 RecoveryState 物化。
+pub const MAX_RECOVERY_PAGE_RETAINED_BYTES: usize = 80 * 1024 * 1024;
+pub const COMMAND_QUEUE_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+pub const COMMAND_LEDGER_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeStoreOperation {
     InitializeBeforePublish,
     Inspect,
-    RecordEnrollmentReceipt,
+    RecordEnrollmentReceiptBeforeCommit,
+    RecordEnrollmentReceiptAfterCommit,
+    CreateConversationBeforeCommit,
+    CreateConversationAfterCommit,
+    AcceptCommandBeforeCommit,
+    AcceptCommandAfterCommit,
+    StartCommandBeforeCommit,
+    StartCommandAfterCommit,
+    ExpireCommandsBeforeCommit,
+    ExpireCommandsAfterCommit,
+    PersistFenceBeforeCommit,
+    PersistFenceAfterCommit,
+    AuthorizeExecutionReleaseBeforeCommit,
+    AuthorizeExecutionReleaseAfterCommit,
+    CompleteCommandBeforeCommit,
+    CompleteCommandAfterCommit,
 }
 
 pub trait RuntimeStoreFaultInjector: Send + Sync {
@@ -34,12 +79,47 @@ struct NoRuntimeStoreFaults;
 
 impl RuntimeStoreFaultInjector for NoRuntimeStoreFaults {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeStoreLane {
+    Normal,
+    Safety,
+    Read,
+}
+
+pub trait RuntimeClock: Send + Sync {
+    fn now_ms(&self) -> Result<u64, RuntimeClockError>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemRuntimeClock;
+
+impl RuntimeClock for SystemRuntimeClock {
+    fn now_ms(&self) -> Result<u64, RuntimeClockError> {
+        let duration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| RuntimeClockError::BeforeUnixEpoch)?;
+        u64::try_from(duration.as_millis()).map_err(|_| RuntimeClockError::OutOfRange)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum RuntimeClockError {
+    #[error("system clock is before the Unix epoch")]
+    BeforeUnixEpoch,
+    #[error("system clock milliseconds do not fit in u64")]
+    OutOfRange,
+}
+
 #[derive(Clone)]
 pub struct RuntimeStoreConfig {
     pub storage_path: PathBuf,
     pub command_capacity: usize,
+    pub lane_byte_capacity: usize,
     pub busy_timeout_ms: u64,
     pub fault_injector: Arc<dyn RuntimeStoreFaultInjector>,
+    pub id_source: Arc<Mutex<Box<dyn RuntimeIdSource>>>,
+    pub capacity_probe: Arc<dyn RuntimeCapacityProbe>,
+    pub clock: Arc<dyn RuntimeClock>,
 }
 
 impl RuntimeStoreConfig {
@@ -48,14 +128,24 @@ impl RuntimeStoreConfig {
         Self {
             storage_path,
             command_capacity: DEFAULT_RUNTIME_STORE_COMMAND_CAPACITY,
+            lane_byte_capacity: DEFAULT_RUNTIME_STORE_LANE_BYTE_CAPACITY,
             busy_timeout_ms: DEFAULT_RUNTIME_BUSY_TIMEOUT_MS,
             fault_injector: Arc::new(NoRuntimeStoreFaults),
+            id_source: Arc::new(Mutex::new(Box::new(OsRuntimeIdSource))),
+            capacity_probe: Arc::new(SystemRuntimeCapacityProbe),
+            clock: Arc::new(SystemRuntimeClock),
         }
     }
 
     #[must_use]
     pub fn with_command_capacity(mut self, command_capacity: usize) -> Self {
         self.command_capacity = command_capacity;
+        self
+    }
+
+    #[must_use]
+    pub fn with_lane_byte_capacity(mut self, lane_byte_capacity: usize) -> Self {
+        self.lane_byte_capacity = lane_byte_capacity;
         self
     }
 
@@ -67,6 +157,27 @@ impl RuntimeStoreConfig {
         self.fault_injector = fault_injector;
         self
     }
+
+    #[must_use]
+    pub fn with_id_source(mut self, id_source: impl RuntimeIdSource + 'static) -> Self {
+        self.id_source = Arc::new(Mutex::new(Box::new(id_source)));
+        self
+    }
+
+    #[must_use]
+    pub fn with_capacity_probe(
+        mut self,
+        capacity_probe: impl RuntimeCapacityProbe + 'static,
+    ) -> Self {
+        self.capacity_probe = Arc::new(capacity_probe);
+        self
+    }
+
+    #[must_use]
+    pub fn with_clock(mut self, clock: impl RuntimeClock + 'static) -> Self {
+        self.clock = Arc::new(clock);
+        self
+    }
 }
 
 impl std::fmt::Debug for RuntimeStoreConfig {
@@ -75,6 +186,7 @@ impl std::fmt::Debug for RuntimeStoreConfig {
             .debug_struct("RuntimeStoreConfig")
             .field("storage_path", &self.storage_path)
             .field("command_capacity", &self.command_capacity)
+            .field("lane_byte_capacity", &self.lane_byte_capacity)
             .field("busy_timeout_ms", &self.busy_timeout_ms)
             .finish_non_exhaustive()
     }
@@ -89,9 +201,13 @@ pub struct RuntimeStoreSnapshot {
     pub key_generation: u32,
     pub table_names: Vec<String>,
     pub journal_mode: String,
+    pub wal_autocheckpoint_pages: u64,
     pub synchronous: i64,
     pub foreign_keys: bool,
     pub busy_timeout_ms: u64,
+    pub page_size_bytes: u64,
+    pub page_count: u64,
+    pub max_page_count: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,6 +215,385 @@ pub struct MachineEnrollmentReceiptRecord {
     pub relay_server_id: [u8; 16],
     pub machine_route: [u8; 16],
     pub root_fingerprint: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConversationLifecycle {
+    Active,
+    Archived,
+    RecoveryBlocked,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandState {
+    Accepted,
+    Started,
+    Completed,
+    Failed,
+    Interrupted,
+    Expired,
+    Canceled,
+    RevokedBeforeStart,
+}
+
+impl CommandState {
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        !matches!(self, Self::Accepted | Self::Started)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalState {
+    Completed,
+    Failed,
+    Interrupted,
+    Canceled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueueScope {
+    Conversation,
+    GlobalCount,
+    GlobalPayloadBytes,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeCommitOperation {
+    RecordEnrollmentReceipt,
+    CreateConversation,
+    AcceptCommand,
+    StartCommand,
+    ExpireCommands,
+    PersistFence,
+    AuthorizeExecutionRelease,
+    CompleteCommand,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub enum IdempotencyOwner {
+    Local {
+        machine_trust_domain: [u8; 32],
+        uid: u32,
+        client_installation_id: [u8; 16],
+    },
+    Remote {
+        machine_trust_domain: [u8; 32],
+        device_route: [u8; 16],
+        device_sign_fingerprint: [u8; 32],
+    },
+}
+
+impl std::fmt::Debug for IdempotencyOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("IdempotencyOwner([REDACTED])")
+    }
+}
+
+#[derive(Clone)]
+pub struct NewConversation {
+    pub conversation_id: RuntimeId,
+    pub adapter_state_key: RuntimeId,
+    pub descriptor: Vec<u8>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct ConversationRecord {
+    pub conversation_id: RuntimeId,
+    pub adapter_state_key: RuntimeId,
+    pub catalog_revision: u64,
+    pub command_high_water: Option<u64>,
+    pub event_high_water: Option<u64>,
+    pub accepted_command_count: u32,
+    pub lifecycle: ConversationLifecycle,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub descriptor: Vec<u8>,
+}
+
+impl std::fmt::Debug for ConversationRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConversationRecord")
+            .field("conversation_id", &self.conversation_id)
+            .field("adapter_state_key", &self.adapter_state_key)
+            .field("catalog_revision", &self.catalog_revision)
+            .field("command_high_water", &self.command_high_water)
+            .field("event_high_water", &self.event_high_water)
+            .field("accepted_command_count", &self.accepted_command_count)
+            .field("lifecycle", &self.lifecycle)
+            .field("descriptor_bytes", &self.descriptor.len())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub struct AcceptCommand {
+    pub conversation_id: RuntimeId,
+    pub owner: IdempotencyOwner,
+    pub idempotency_key: String,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct CommandRecord {
+    pub conversation_id: RuntimeId,
+    pub command_id: RuntimeId,
+    pub command_seq: u64,
+    pub state: CommandState,
+    pub accepted_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub retain_until_ms: u64,
+    pub started_at_ms: Option<u64>,
+    pub terminal_at_ms: Option<u64>,
+    pub turn_id: Option<RuntimeId>,
+    pub started_event_id: Option<RuntimeId>,
+    pub terminal_event_id: Option<RuntimeId>,
+    pub payload: Vec<u8>,
+    pub result: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for CommandRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CommandRecord")
+            .field("conversation_id", &self.conversation_id)
+            .field("command_id", &self.command_id)
+            .field("command_seq", &self.command_seq)
+            .field("state", &self.state)
+            .field("turn_id", &self.turn_id)
+            .field("payload_bytes", &self.payload.len())
+            .field(
+                "result_bytes",
+                &self.result.as_ref().map(std::vec::Vec::len),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AcceptOutcome {
+    Accepted {
+        command: CommandRecord,
+        queue_position: u32,
+    },
+    Replayed {
+        command: CommandRecord,
+    },
+}
+
+#[derive(Clone)]
+pub struct StartCommand {
+    pub conversation_id: RuntimeId,
+    pub command_id: RuntimeId,
+    pub daemon_boot_id: RuntimeId,
+    pub execution_nonce: Vec<u8>,
+    pub intent_payload: Vec<u8>,
+    pub event_payload: Vec<u8>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct ExecutionIntentRecord {
+    pub command_id: RuntimeId,
+    pub turn_id: RuntimeId,
+    pub started_event_id: RuntimeId,
+    pub daemon_boot_id: RuntimeId,
+    pub execution_nonce: Vec<u8>,
+    pub created_at_ms: u64,
+    pub payload: Vec<u8>,
+}
+
+impl std::fmt::Debug for ExecutionIntentRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExecutionIntentRecord")
+            .field("command_id", &self.command_id)
+            .field("turn_id", &self.turn_id)
+            .field("started_event_id", &self.started_event_id)
+            .field("daemon_boot_id", &self.daemon_boot_id)
+            .field("execution_nonce", &"[REDACTED]")
+            .field("payload_bytes", &self.payload.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct EventRecord {
+    pub conversation_id: RuntimeId,
+    pub event_id: RuntimeId,
+    pub event_seq: u64,
+    pub command_id: Option<RuntimeId>,
+    pub created_at_ms: u64,
+    pub payload: Vec<u8>,
+}
+
+impl std::fmt::Debug for EventRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EventRecord")
+            .field("conversation_id", &self.conversation_id)
+            .field("event_id", &self.event_id)
+            .field("event_seq", &self.event_seq)
+            .field("command_id", &self.command_id)
+            .field("payload_bytes", &self.payload.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StartOutcome {
+    Started {
+        command: CommandRecord,
+        intent: ExecutionIntentRecord,
+        event: EventRecord,
+    },
+    Replayed {
+        command: CommandRecord,
+        intent: ExecutionIntentRecord,
+        event: EventRecord,
+    },
+}
+
+#[derive(Clone)]
+pub struct ExecutionFence {
+    pub command_id: RuntimeId,
+    pub daemon_boot_id: RuntimeId,
+    pub execution_nonce: Vec<u8>,
+    pub process_group_id: i64,
+    pub leader_pid: i64,
+    pub leader_start_time: u64,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Clone)]
+pub struct AuthorizeExecutionRelease {
+    pub command_id: RuntimeId,
+    pub daemon_boot_id: RuntimeId,
+    pub execution_nonce: Vec<u8>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct ExecutionFenceRecord {
+    pub command_id: RuntimeId,
+    pub daemon_boot_id: RuntimeId,
+    pub process_group_id: i64,
+    pub leader_pid: i64,
+    pub leader_start_time: u64,
+    pub release_authorized_at_ms: Option<u64>,
+    pub payload: Vec<u8>,
+}
+
+impl std::fmt::Debug for ExecutionFenceRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExecutionFenceRecord")
+            .field("command_id", &self.command_id)
+            .field("daemon_boot_id", &self.daemon_boot_id)
+            .field("process_group_id", &self.process_group_id)
+            .field("leader_pid", &self.leader_pid)
+            .field("leader_start_time", &self.leader_start_time)
+            .field("release_authorized_at_ms", &self.release_authorized_at_ms)
+            .field("payload_bytes", &self.payload.len())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub struct CompleteCommand {
+    pub conversation_id: RuntimeId,
+    pub command_id: RuntimeId,
+    pub turn_id: RuntimeId,
+    pub terminal_state: TerminalState,
+    pub terminal_payload: Vec<u8>,
+    pub event_payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CompleteOutcome {
+    Completed {
+        command: CommandRecord,
+        event: EventRecord,
+    },
+    Replayed {
+        command: CommandRecord,
+        event: EventRecord,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartedRecoveryRecord {
+    pub command: CommandRecord,
+    pub intent: ExecutionIntentRecord,
+    pub event: EventRecord,
+    pub fence: Option<ExecutionFenceRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConversationRecoveryRecord {
+    pub conversation: ConversationRecord,
+    pub accepted: Vec<CommandRecord>,
+    pub started: Option<StartedRecoveryRecord>,
+}
+
+/// 仅由 store 签发、供同一进程内 RuntimeCore 逐页回放的 opaque cursor。
+///
+/// 字段不公开，调用方只能原样重试或使用上一页返回的 next cursor；它不是 wire token。
+#[derive(Clone, Eq, PartialEq)]
+pub struct RecoveryCursor {
+    pub(crate) scan_id: [u8; 16],
+    pub(crate) after_catalog_revision: Option<u64>,
+    pub(crate) after_conversation_id: Option<RuntimeId>,
+}
+
+impl std::fmt::Debug for RecoveryCursor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoveryCursor")
+            .field("scan_id", &"[REDACTED]")
+            .field("after_catalog_revision", &self.after_catalog_revision)
+            .field("after_conversation_id", &self.after_conversation_id)
+            .finish()
+    }
+}
+
+/// 只有终页才会签发；显式 finish 之前 store 保持 Recovering 并拒绝所有 mutation。
+#[derive(Clone, Eq, PartialEq)]
+pub struct RecoveryCompletion {
+    pub(crate) scan_id: [u8; 16],
+    pub(crate) final_after_catalog_revision: Option<u64>,
+    pub(crate) final_after_conversation_id: Option<RuntimeId>,
+}
+
+impl std::fmt::Debug for RecoveryCompletion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoveryCompletion")
+            .field("scan_id", &"[REDACTED]")
+            .field(
+                "final_after_catalog_revision",
+                &self.final_after_catalog_revision,
+            )
+            .field(
+                "final_after_conversation_id",
+                &self.final_after_conversation_id,
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryPage {
+    pub conversation: Option<ConversationRecoveryRecord>,
+    pub next_cursor: Option<RecoveryCursor>,
+    pub completion: Option<RecoveryCompletion>,
+}
+
+/// 测试/诊断聚合类型；生产恢复 API 只返回 `RecoveryPage`，RuntimeCore 禁止全库 collect。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryState {
+    pub conversations: Vec<ConversationRecord>,
+    pub accepted: Vec<CommandRecord>,
+    pub started: Vec<StartedRecoveryRecord>,
 }
 
 #[derive(Debug, Error)]
@@ -127,12 +622,112 @@ pub enum RuntimeStoreError {
     StoreAlreadyOpen,
     #[error("runtime enrollment rescue receipt conflicts with the existing root fingerprint")]
     RescueReceiptConflict,
-    #[error("runtime store command queue is full")]
-    WorkerBusy,
+    #[error("runtime store {lane:?} lane is full")]
+    WorkerBusy { lane: RuntimeStoreLane },
     #[error("runtime store worker stopped before replying")]
     WorkerStopped,
     #[error("runtime store worker did not shut down before its hard deadline")]
     ShutdownTimedOut,
+    #[error("runtime store shutdown is already in progress")]
+    ShutdownInProgress,
+    #[error("runtime store is latched in safety-only mode after a capacity violation")]
+    SafetyOnly,
+    #[error(
+        "runtime filesystem has {available_bytes} bytes available but requires {required_available_bytes} bytes"
+    )]
+    DiskLow {
+        available_bytes: u64,
+        required_available_bytes: u64,
+    },
+    #[error(
+        "runtime database footprint would be {projected_footprint_bytes} bytes, above the {hard_limit_bytes} byte limit"
+    )]
+    StoreFull {
+        projected_footprint_bytes: u64,
+        hard_limit_bytes: u64,
+    },
+    #[error(
+        "runtime database would require page {projected_page_count}, above max_page_count {max_page_count}"
+    )]
+    PageLimit {
+        projected_page_count: u64,
+        max_page_count: u64,
+    },
+    #[error(
+        "runtime WAL checkpoint made only {checkpointed_frames} of {log_frames} frames reclaimable"
+    )]
+    CheckpointBlocked {
+        log_frames: i64,
+        checkpointed_frames: i64,
+    },
+    #[error("runtime capacity arithmetic overflow while calculating {field}")]
+    CapacityArithmeticOverflow { field: &'static str },
+    #[error("runtime SQLite page budget is invalid: {reason}")]
+    InvalidCapacityBudget { reason: &'static str },
+    #[error("runtime capacity observation failed: {0}")]
+    CapacityProbe(#[from] RuntimeCapacityProbeError),
+    #[error("runtime {expected} id has the wrong kind {actual}")]
+    IdKindMismatch {
+        expected: RuntimeIdKind,
+        actual: RuntimeIdKind,
+    },
+    #[error("runtime conversation was not found")]
+    ConversationNotFound,
+    #[error("runtime conversation stable identity conflicts with an existing record")]
+    ConversationConflict,
+    #[error("runtime command was not found")]
+    CommandNotFound,
+    #[error("runtime command idempotency key was reused with a different payload")]
+    IdempotencyConflict,
+    #[error("runtime command queue is full for {scope:?}")]
+    QueueFull { scope: QueueScope },
+    #[error("runtime payload exceeds the operation-specific limit")]
+    PayloadTooLarge,
+    #[error(
+        "runtime recovery page would retain {projected_bytes} bytes, above the {limit_bytes} byte limit"
+    )]
+    RecoveryPageTooLarge {
+        projected_bytes: u64,
+        limit_bytes: u64,
+    },
+    #[error("runtime recovery scan is already in progress and blocks mutations")]
+    RecoveryInProgress,
+    #[error("runtime recovery scan is not active")]
+    RecoveryNotActive,
+    #[error("runtime recovery cursor or completion token is not the exact expected value")]
+    InvalidRecoveryCursor,
+    #[error("runtime recovery scan has not reached and accounted for its terminal page")]
+    RecoveryNotReady,
+    #[error("runtime timestamp or derived deadline is outside SQLite i64 range")]
+    TimeOutOfRange,
+    #[error(
+        "runtime clock regressed from persisted {persisted_ms} ms to observed {observed_ms} ms"
+    )]
+    ClockRegressed { persisted_ms: u64, observed_ms: u64 },
+    #[error("runtime clock failed: {0}")]
+    Clock(#[from] RuntimeClockError),
+    #[error("runtime command state transition is invalid")]
+    InvalidStateTransition,
+    #[error("runtime command expired before it could start")]
+    CommandExpired,
+    #[error("runtime command is not the conversation queue head")]
+    NotQueueHead,
+    #[error("runtime start retry conflicts with the persisted execution intent")]
+    StartConflict,
+    #[error("runtime execution fence retry conflicts with the persisted fence")]
+    FenceConflict,
+    #[error("runtime execution fence is missing")]
+    ExecutionFenceMissing,
+    #[error("runtime execution release has not been durably authorized")]
+    ExecutionReleaseMissing,
+    #[error("runtime terminal retry conflicts with the persisted terminal result")]
+    TerminalConflict,
+    #[error("runtime {operation:?} commit outcome is unknown; retry the identical operation")]
+    CommitOutcomeUnknown { operation: RuntimeCommitOperation },
+    #[error("runtime stable id generation failed: {0}")]
+    IdGeneration(#[from] RuntimeIdError),
+    #[error("runtime sequence allocation failed: {0}")]
+    Sequence(#[from] SequenceError),
     #[error("runtime store configuration is invalid: {0}")]
     InvalidConfig(&'static str),
     #[error("runtime store I/O failed: {0}")]
@@ -160,10 +755,44 @@ impl RuntimeStoreError {
             | Self::RescueReceiptConflict
             | Self::WorkerStopped
             | Self::ShutdownTimedOut
+            | Self::ShutdownInProgress
+            | Self::CommitOutcomeUnknown { .. }
+            | Self::CheckpointBlocked { .. }
+            | Self::CapacityArithmeticOverflow { .. }
+            | Self::InvalidCapacityBudget { .. }
+            | Self::CapacityProbe(_)
+            | Self::Clock(_)
             | Self::Io(_)
             | Self::Sqlite(_) => "daemon.runtime.store_unavailable",
-            Self::WorkerBusy => "daemon.runtime.store_busy",
+            Self::SafetyOnly => "daemon.runtime.safety_only",
+            Self::DiskLow { .. } => "daemon.runtime.disk_low",
+            Self::StoreFull { .. } | Self::PageLimit { .. } => "daemon.runtime.store_full",
+            Self::WorkerBusy { .. } => "daemon.runtime.store_busy",
+            Self::RecoveryInProgress => "daemon.runtime.recovering",
             Self::Cipher(_) => "daemon.runtime.crypto_failed",
+            Self::IdKindMismatch { .. }
+            | Self::ConversationNotFound
+            | Self::ConversationConflict
+            | Self::CommandNotFound
+            | Self::TimeOutOfRange
+            | Self::ClockRegressed { .. }
+            | Self::InvalidStateTransition
+            | Self::NotQueueHead
+            | Self::StartConflict
+            | Self::FenceConflict
+            | Self::ExecutionFenceMissing
+            | Self::ExecutionReleaseMissing
+            | Self::TerminalConflict
+            | Self::RecoveryNotActive
+            | Self::InvalidRecoveryCursor
+            | Self::RecoveryNotReady
+            | Self::IdGeneration(_)
+            | Self::Sequence(_) => "daemon.runtime.invalid_state",
+            Self::IdempotencyConflict => "daemon.command.idempotency_conflict",
+            Self::QueueFull { .. } => "daemon.command.queue_full",
+            Self::PayloadTooLarge => "daemon.payload.item_too_large",
+            Self::RecoveryPageTooLarge { .. } => "daemon.runtime.recovery_too_large",
+            Self::CommandExpired => "daemon.command.queue_expired",
         }
     }
 }

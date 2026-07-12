@@ -522,6 +522,60 @@ ignore 后运行。本机没有匹配 access group 的 provisioning profile；Ap
 本地 self-signed helper 都能通过 `codesign --verify`，启动却被 AMFI 以 exit 137 终止。
 取得该外部条件前不得勾选计划 P3.1 Step 4，不得宣称 P3.1/P3 完成。
 
+## Relay Companion MVP P3.2 Runtime store 门禁
+
+P3.2 只验证 Runtime SQLite 组件，不表示 RuntimeCore/UDS/RemoteLink 已接入。所有 store tests
+必须串行运行，避免 raw SQLite exhaustion/tamper fixture 与 path lease 相互干扰：
+
+```bash
+cargo test -p agentdeckd \
+  --test runtime_store \
+  --test runtime_store_admission \
+  --test runtime_store_capacity \
+  --test runtime_store_cipher \
+  --test runtime_store_identity \
+  --test runtime_store_sequence \
+  --test runtime_store_queue \
+  --test runtime_store_journal \
+  --test runtime_store_hardening \
+  --test runtime_store_boundaries \
+  --test runtime_store_commit_outcome \
+  --test runtime_store_recovery \
+  --test runtime_store_shutdown \
+  -- --test-threads=1
+
+# daemon crate 回归与静态边界
+cargo test -p agentdeckd -- --test-threads=1
+bash scripts/check-daemon-no-net.sh
+cargo fmt --all -- --check
+git diff --check
+scripts/verify-agent-docs.sh
+```
+
+`runtime_store_boundaries` 会真实写入并重开 1,024 × 256 KiB Accepted payload（精确
+256 MiB），不是只改 ledger 的 synthetic fixture；本机 debug 构建单项约需 3–4 分钟。可先
+聚焦复跑：
+
+```bash
+cargo test -p agentdeckd --test runtime_store_boundaries \
+  global_queue_and_payload_accept_exact_1024_and_256_mib_then_replay_before_rejection \
+  -- --exact --test-threads=1
+```
+
+门禁至少证明：严格七表/live manifest；错误 KEK 零写；无 KEK rescue index；caller-owned
+stable IDs；catalog/command/event u64 exhaustion；32/1,024/256 MiB/24h 精确边界；全部
+before-COMMIT rollback 与 after-COMMIT exact retry（含 rescue receipt 与 expiry outer retry）；
+TTL expiry event；blind-token 重算；command/conversation/event metadata MAC、authenticated
+RuntimeLedger、descriptor AEAD open scan、逐 conversation actual MAX HWM、空 catalog row/
+整组 terminal audit/单审计行删除 fail-close；
+ExecutionFence + release authorization；`shutdown > safety > read > normal`、per-lane count/
+byte bound；真实 COMMIT failure 分类；shutdown timeout 不释放 singleton；main+WAL+SHM、
+`max_page_count`、`wal_autocheckpoint=0` + persistent WAL 读回、checkpoint copy peak、
+post-COMMIT DiskLow 不 latch、safety tail reserve、bounded PASSIVE checkpoint 与 SafetyOnly；
+paged recovery 的 expiry-before-freeze、exact keyset cursor、单页一个 conversation/80 MiB、
+mutation fence、begin/page/finish response-loss retry、累计 ledger 核账与 finish 再验证。标准 SQLite 没有 custom
+quota VFS，因此不得把这些门禁表述成 active WAL 任意瞬间的 2 GiB 零超冲证明。
+
 该门禁重点守护：
 
 - stable home 来自当前 EUID 的 `getpwuid_r`，不接受 `HOME`/data-dir/runtime access-group
@@ -656,6 +710,7 @@ cargo install cargo-llvm-cov
 | 参考客户端 CLI（agentdeck-cli）、Transport、Client | `cargo test -p agentdeck-cli`；再跑完整 `cargo test` |
 | Relay Companion MVP P0 基线或 v1 reset | 迭代时跑 `bash scripts/tests/reset-relay-v1-dev-state.sh`；提交前跑一次 `bash scripts/verify-relay-companion-mvp.sh p0` |
 | Relay Companion MVP P3.1 daemon namespace / singleton / StorageKEK | 运行本页 P3.1 聚焦矩阵、`cargo test -p agentdeckd`、CLI/Swift transport tests、daemon no-net；stable Keychain 必须另有真实 provisioned signed helper 证据，ignored 不算通过 |
+| Relay Companion MVP P3.2 Runtime SQLite / journal / admission | 运行本页 P3.2 十三组 store tests（含真实 256 MiB 与 paged recovery）、`cargo test -p agentdeckd -- --test-threads=1`、daemon no-net、fmt/diff/docs；只证明组件，不冒充 RuntimeCore/UDS/Companion E2E |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

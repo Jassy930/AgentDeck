@@ -500,6 +500,64 @@ ignored 测试不是通过证据。
 | `daemon.diagnostics.path_unavailable` | diagnostics one-shot 无可用日志路径 | 提供合法 profile/absolute data-dir，或先创建一次诊断日志 |
 | `daemon.runtime.main_loop_failed` | security bootstrap 已完成，但 stdio RuntimeHub 主循环失败 | 按同一 diagnostic log 检查 IPC I/O；guard/KEK 会随进程退出释放/清零 |
 
+## Runtime SQLite / journal 诊断（Companion MVP P3.2）
+
+P3.2 error code 是 store 内部精确错误的稳定诊断归类；P3.4 才负责映射成 wire
+`RuntimeFailure`。排查时保留 DB/WAL/SHM 原件，先运行 diagnostics/read-only inspection，
+不要用删除 sidecar、生成新 KEK 或直接改 high-water 的方式“修复”。
+
+### Store shutdown deadline 语义
+
+Store shutdown 的等待上界固定为 `busy_timeout_ms + 5000 ms`。`ShutdownTimedOut` 只表示
+调用方在 deadline 前没有观察到 worker 静默，**不表示** SQLite connection、row keys 或进程内
+path lease 已释放。worker lifecycle 会继续保持 `ShuttingDown`；重复 shutdown 返回
+`ShutdownInProgress`，普通、安全与读取请求也不再接收。取消 shutdown future 或丢弃全部
+handle 同样不会释放这些资源，更不会启动第二个 worker。
+
+只有 worker 真正退出时，才会依次关闭队列、释放 SQLite state/keys 与 path lease、切换到
+`Stopped`；成功 shutdown 回执在这些步骤之后发送。遇到 `ShutdownTimedOut` 时必须保持 daemon
+fail-closed shutdown，不得在同一进程中循环 reopen、删除 DB sidecar 或绕过 singleton；保留诊断
+证据后由 supervisor 在旧进程退出后再重启。
+
+### Paged recovery 语义
+
+daemon 启动恢复必须调用 `begin_recovery_scan`：先做全库 streaming integrity validation，再在
+冻结 catalog barrier 前完成一次 24h expiry sweep。随后只使用 store 返回的 opaque keyset
+cursor，每页读取一个 conversation；单页 retained 上限 80 MiB。RuntimeCore 必须消费并释放
+当前页后再取下一页，不能聚合全库，也不能在终页 `finish_recovery_scan` 成功前启动任何
+Accepted command。begin/page/finish 回执丢失都只重试原 token。
+finish 会在开放 mutation 前重新执行完整 integrity readback；若 begin 后有同 UID 外部工具改写
+DB/WAL，finish 必须失败并保持 Recovering。
+
+scan active 时 inspect 与 shutdown 仍可用；create/accept/start、fence/release/terminal/rescue
+全部返回 `daemon.runtime.recovering`。这不是“读永远可用”：业务 recovery read 也受 exact
+cursor/单 outstanding scan 限制。若 scan 无法结束，保留 DB/WAL/SHM 与 Keychain 原件后让
+daemon fail-closed 退出，不要跳页、伪造 cursor 或删除 sidecar。
+
+| P3.2 code | 常见内部原因 | 下一步 |
+| --- | --- | --- |
+| `daemon.runtime.store_invalid` | path/type/owner/mode/nlink、busy/count/byte config 或 operation input 不合法 | 核对 0700 namespace、0600 artifacts 和固定 config；拒绝 symlink/hardlink，不自动放宽 |
+| `daemon.runtime.schema_incompatible` | schema family/version/signature/live manifest、descriptor/row linkage、逐 conversation HWM、authenticated metadata 或五类 table total 不一致 | 停止写入并保留三文件；核对版本和 tamper，不能原地猜测 migration |
+| `daemon.runtime.store_unavailable` | worker/shutdown/commit outcome、clock/capacity probe、SQLite/I/O、sequence coordination，或 bounded checkpoint 被 reader pin 住 | 对 unknown outcome 用完全相同 stable ID/idempotency input 重试；checkpoint blocked 时停止新副作用、释放 reader 并保留 WAL，其他错误保留 evidence 后重启/修复底层 I/O |
+| `daemon.runtime.store_busy` | normal/safety/read lane 的 count 或 retained-allocation byte permit 已满 | 客户端退避并保持同一 idempotency key；不要并发重发新 key |
+| `daemon.runtime.recovering` | 已冻结 paged recovery barrier，终页尚未核账并 finish | 继续使用上一页返回的 exact cursor；RuntimeCore 逐页消费，终页 finish 后再开放请求，不得并行 mutation |
+| `daemon.runtime.safety_only` | 非 disk capacity violation 已在本进程 latch，普通副作用关闭 | read/diagnostics 可继续；fence/release/terminal/rescue 仍会逐次校验预留尾，失败时不得绕过；释放空间并按 runbook 重启 |
+| `daemon.runtime.disk_low` | projected transaction 后无法保留 `max(512 MiB, filesystem 5%)` | 释放同一文件系统空间后以相同请求重试；该错误本身不永久 latch |
+| `daemon.runtime.store_full` | main+WAL+SHM projected footprint、SQLite page budget，或剩余 safety obligation 接近/超过 2 GiB | 停止普通写；仅在安全写自身复核通过时完成终态并导出诊断，不要手工删除 WAL |
+| `daemon.runtime.crypto_failed` | StorageKEK unwrap、row AEAD、blind token 或 generation 校验失败 | 视为 key/domain/tamper 故障；恢复原 Keychain item 和正确签名环境，禁止新建 KEK |
+| `daemon.runtime.invalid_state` | stable ID/kind、clock monotonicity、queue head、fence/release、terminal/sequence 状态冲突 | 读取 canonical command/recovery state；错误 turn/nonce/fence 不能强制覆盖 |
+| `daemon.command.idempotency_conflict` | 同 conversation + stable owner + key 被不同 payload 重用 | 使用原 payload 查询原 command；新意图必须换新 key |
+| `daemon.command.queue_full` | conversation 32、全机 1,024 或 queued payload 256 MiB 任一先到 | 等待/取消已有 Accepted 后以同一请求重试；满载时 exact replay 仍应成功 |
+| `daemon.payload.item_too_large` | prompt、descriptor、intent/event/fence/result 超过各自硬上界 | 在进入 store 前缩小对应 item；不能切片成多个同 key 请求规避 |
+| `daemon.runtime.recovery_too_large` | 单个 conversation recovery page 的 retained projection 超过固定 80 MiB | 视为 schema/cap 漂移或损坏并 fail-close；不能改用全库物化或复用 async lane budget，保留证据后核对 item hard limits |
+| `daemon.command.queue_expired` | Accepted 到达 24 小时边界，已事务化为 Expired 并写 canonical event | 不自动重放旧 vendor 副作用；用新 idempotency key 发起新命令 |
+
+`machine_enrollment_receipts` 仅用于 root-lost 时定位 old route/root fingerprint；它是刻意保持
+非秘密、未加 MAC 的 rescue locator，不是授权凭据。P4 trust-reset/purge 必须另验
+Relay/admin-signed receipt；该表被改写时不得据此直接删除远端状态。行 MAC/ledger 能检测局部
+篡改，但整套 main+WAL 回滚到更早且内部自洽的快照，要等 P4 Keychain CounterGuard 绑定后才
+能检测；P3.2 诊断不能声称覆盖该攻击。
+
 ## Failure Codes
 
 | code | 含义 | 下一步 |

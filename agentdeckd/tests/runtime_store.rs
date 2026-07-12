@@ -1,3 +1,6 @@
+#[path = "support/runtime_recovery.rs"]
+mod runtime_recovery;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -50,10 +53,28 @@ impl Drop for TestRoot {
     }
 }
 
-struct BlockingFirstInspect {
+fn conversation_input(seed: u8, descriptor: &[u8]) -> agentdeckd::runtime::store::NewConversation {
+    agentdeckd::runtime::store::NewConversation {
+        conversation_id: agentdeckd::runtime::store::RuntimeId::from_bytes(
+            agentdeckd::runtime::store::RuntimeIdKind::Conversation,
+            [seed; 16],
+        )
+        .expect("conversation id"),
+        adapter_state_key: agentdeckd::runtime::store::RuntimeId::from_bytes(
+            agentdeckd::runtime::store::RuntimeIdKind::AdapterState,
+            [seed.wrapping_add(0x40); 16],
+        )
+        .expect("adapter state key"),
+        descriptor: descriptor.to_vec(),
+    }
+}
+
+struct BlockingFirstOperation {
+    operation: RuntimeStoreOperation,
     blocked: AtomicBool,
     entered: SyncSender<()>,
     release: Mutex<Receiver<()>>,
+    observed: Mutex<Vec<RuntimeStoreOperation>>,
 }
 
 struct FailBeforePublish;
@@ -70,10 +91,13 @@ impl RuntimeStoreFaultInjector for FailBeforePublish {
     }
 }
 
-impl RuntimeStoreFaultInjector for BlockingFirstInspect {
+impl RuntimeStoreFaultInjector for BlockingFirstOperation {
     fn before_operation(&self, operation: RuntimeStoreOperation) -> Result<(), RuntimeStoreError> {
-        if operation == RuntimeStoreOperation::Inspect && !self.blocked.swap(true, Ordering::SeqCst)
-        {
+        self.observed
+            .lock()
+            .map_err(|_| RuntimeStoreError::WorkerStopped)?
+            .push(operation);
+        if operation == self.operation && !self.blocked.swap(true, Ordering::SeqCst) {
             self.entered
                 .send(())
                 .map_err(|_| RuntimeStoreError::WorkerStopped)?;
@@ -148,6 +172,7 @@ async fn fresh_store_is_ready_only_after_exact_schema_and_pragmas_read_back() {
     assert_eq!(snapshot.schema_family, RUNTIME_SCHEMA_FAMILY);
     assert_eq!(snapshot.schema_version, RUNTIME_SCHEMA_VERSION);
     assert_eq!(snapshot.journal_mode.to_ascii_lowercase(), "wal");
+    assert_eq!(snapshot.wal_autocheckpoint_pages, 0);
     assert_eq!(snapshot.synchronous, 2);
     assert!(snapshot.foreign_keys);
     assert_eq!(snapshot.busy_timeout_ms, 5_000);
@@ -167,6 +192,74 @@ async fn fresh_store_is_ready_only_after_exact_schema_and_pragmas_read_back() {
     );
 
     store.shutdown().await.expect("shutdown runtime store");
+}
+
+#[tokio::test]
+async fn schema_v1_contains_the_durable_idempotency_and_execution_linkage_contract() {
+    let root = TestRoot::new("journal-schema-contract");
+    let keys = MemoryKeyStore::new();
+    let database = root.database();
+    let store = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(database.clone()),
+        root.storage_kek(&keys),
+    )
+    .await
+    .expect("create schema fixture");
+    store.shutdown().await.expect("shutdown schema fixture");
+
+    let connection = rusqlite::Connection::open(database).expect("open schema fixture");
+    let table_columns = |table: &str| {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("prepare table_info");
+        statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query table_info")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect columns")
+    };
+    let command_columns = table_columns("commands");
+    for required in [
+        "owner_token",
+        "idempotency_token",
+        "payload_token",
+        "terminal_token",
+        "turn_id",
+        "started_event_id",
+        "terminal_event_id",
+    ] {
+        assert!(
+            command_columns.iter().any(|column| column == required),
+            "commands is missing {required}"
+        );
+    }
+    let intent_columns = table_columns("execution_intents");
+    for required in ["turn_id", "started_event_id"] {
+        assert!(
+            intent_columns.iter().any(|column| column == required),
+            "execution_intents is missing {required}"
+        );
+    }
+    let indexes = connection
+        .prepare(
+            "SELECT name FROM sqlite_schema
+             WHERE type = 'index' AND tbl_name = 'commands' ORDER BY name",
+        )
+        .expect("prepare indexes")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query indexes")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect indexes");
+    assert!(
+        indexes
+            .iter()
+            .any(|name| name == "idx_commands_one_started")
+    );
+    assert!(
+        indexes
+            .iter()
+            .any(|name| name == "idx_commands_owner_state")
+    );
 }
 
 #[tokio::test]
@@ -321,10 +414,12 @@ async fn command_queue_is_bounded_and_reports_busy_without_blocking_the_caller()
     let keys = MemoryKeyStore::new();
     let (entered_tx, entered_rx) = sync_channel(1);
     let (release_tx, release_rx) = sync_channel(1);
-    let injector = Arc::new(BlockingFirstInspect {
+    let injector = Arc::new(BlockingFirstOperation {
+        operation: RuntimeStoreOperation::CreateConversationBeforeCommit,
         blocked: AtomicBool::new(false),
         entered: entered_tx,
         release: Mutex::new(release_rx),
+        observed: Mutex::new(Vec::new()),
     });
     let store = RuntimeStoreHandle::open(
         RuntimeStoreConfig::new(root.database())
@@ -337,30 +432,184 @@ async fn command_queue_is_bounded_and_reports_busy_without_blocking_the_caller()
 
     let first = tokio::spawn({
         let store = store.clone();
-        async move { store.inspect().await }
+        async move {
+            store
+                .create_conversation(conversation_input(1, b"first"))
+                .await
+        }
     });
     tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(5)))
         .await
         .expect("join entered wait")
         .expect("first command reached worker");
 
-    // timeout 会取消等待者，但已发送的 command 仍占据容量为 1 的 worker queue。
+    // timeout 会取消等待者，但已发送的 normal command 仍占据容量为 1 的队列。
     assert!(
-        tokio::time::timeout(Duration::from_millis(25), store.inspect())
-            .await
-            .is_err()
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            store.create_conversation(conversation_input(2, b"second"))
+        )
+        .await
+        .is_err()
     );
     let error = store
-        .inspect()
+        .create_conversation(conversation_input(3, b"third"))
         .await
-        .expect_err("third command must observe the full queue");
-    assert!(matches!(error, RuntimeStoreError::WorkerBusy));
+        .expect_err("third normal command must observe the full queue");
+    assert!(matches!(
+        error,
+        RuntimeStoreError::WorkerBusy {
+            lane: agentdeckd::runtime::store::RuntimeStoreLane::Normal
+        }
+    ));
 
     release_tx.send(()).expect("release worker");
     first
         .await
         .expect("join first command")
         .expect("first command succeeds");
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn safety_and_read_lanes_bypass_normal_saturation_in_priority_order() {
+    let root = TestRoot::new("priority-lanes");
+    let keys = MemoryKeyStore::new();
+    let (entered_tx, entered_rx) = sync_channel(1);
+    let (release_tx, release_rx) = sync_channel(1);
+    let injector = Arc::new(BlockingFirstOperation {
+        operation: RuntimeStoreOperation::CreateConversationBeforeCommit,
+        blocked: AtomicBool::new(false),
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+        observed: Mutex::new(Vec::new()),
+    });
+    let store = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(root.database())
+            .with_command_capacity(1)
+            .with_fault_injector(injector.clone()),
+        root.storage_kek(&keys),
+    )
+    .await
+    .expect("open store");
+
+    let first_normal = tokio::spawn({
+        let store = store.clone();
+        async move {
+            store
+                .create_conversation(conversation_input(11, b"first"))
+                .await
+        }
+    });
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(5)))
+        .await
+        .expect("join entered wait")
+        .expect("first normal command reached worker");
+
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            store.create_conversation(conversation_input(12, b"queued"))
+        )
+        .await
+        .is_err(),
+        "a polled normal command is queued behind the blocked command"
+    );
+    assert!(matches!(
+        store
+            .create_conversation(conversation_input(13, b"normal-full-probe"))
+            .await,
+        Err(RuntimeStoreError::WorkerBusy {
+            lane: agentdeckd::runtime::store::RuntimeStoreLane::Normal
+        })
+    ));
+
+    let receipt = MachineEnrollmentReceiptRecord {
+        relay_server_id: [0x11; 16],
+        machine_route: [0x22; 16],
+        root_fingerprint: [0x33; 32],
+    };
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            store.record_machine_enrollment_receipt(receipt.clone())
+        )
+        .await
+        .is_err(),
+        "a polled safety command is accepted independently"
+    );
+    assert!(matches!(
+        store.record_machine_enrollment_receipt(receipt).await,
+        Err(RuntimeStoreError::WorkerBusy {
+            lane: agentdeckd::runtime::store::RuntimeStoreLane::Safety
+        })
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), store.inspect())
+            .await
+            .is_err(),
+        "a polled read command is accepted independently"
+    );
+    assert!(matches!(
+        store.inspect().await,
+        Err(RuntimeStoreError::WorkerBusy {
+            lane: agentdeckd::runtime::store::RuntimeStoreLane::Read
+        })
+    ));
+
+    release_tx.send(()).expect("release worker");
+    first_normal
+        .await
+        .expect("join first normal")
+        .expect("first normal succeeds");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let second_normal_seen = injector
+                .observed
+                .lock()
+                .expect("read observed operations")
+                .iter()
+                .filter(|operation| {
+                    **operation == RuntimeStoreOperation::CreateConversationBeforeCommit
+                })
+                .count()
+                >= 2;
+            if second_normal_seen {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all queued lanes are serviced");
+
+    let observed = injector.observed.lock().expect("read observed operations");
+    let first = observed
+        .iter()
+        .position(|operation| *operation == RuntimeStoreOperation::CreateConversationBeforeCommit)
+        .expect("first normal observation");
+    let safety_index = observed
+        .iter()
+        .position(|operation| {
+            *operation == RuntimeStoreOperation::RecordEnrollmentReceiptBeforeCommit
+        })
+        .expect("safety observation");
+    let read_index = observed
+        .iter()
+        .position(|operation| *operation == RuntimeStoreOperation::Inspect)
+        .expect("read observation");
+    let second_normal = observed
+        .iter()
+        .enumerate()
+        .skip(first + 1)
+        .find_map(|(index, operation)| {
+            (*operation == RuntimeStoreOperation::CreateConversationBeforeCommit).then_some(index)
+        })
+        .expect("second normal observation");
+    assert!(first < safety_index);
+    assert!(safety_index < read_index, "safety is preferred over read");
+    assert!(read_index < second_normal, "read is preferred over normal");
+    drop(observed);
     store.shutdown().await.expect("shutdown store");
 }
 
@@ -373,10 +622,12 @@ async fn shutdown_control_lane_remains_available_when_the_normal_queue_is_full()
     let store = RuntimeStoreHandle::open(
         RuntimeStoreConfig::new(root.database())
             .with_command_capacity(1)
-            .with_fault_injector(Arc::new(BlockingFirstInspect {
+            .with_fault_injector(Arc::new(BlockingFirstOperation {
+                operation: RuntimeStoreOperation::CreateConversationAfterCommit,
                 blocked: AtomicBool::new(false),
                 entered: entered_tx,
                 release: Mutex::new(release_rx),
+                observed: Mutex::new(Vec::new()),
             })),
         root.storage_kek(&keys),
     )
@@ -385,16 +636,23 @@ async fn shutdown_control_lane_remains_available_when_the_normal_queue_is_full()
     let stale_handle = store.clone();
     let first = tokio::spawn({
         let store = store.clone();
-        async move { store.inspect().await }
+        async move {
+            store
+                .create_conversation(conversation_input(21, b"first"))
+                .await
+        }
     });
     tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(5)))
         .await
         .expect("join entered wait")
         .expect("first command reached worker");
     assert!(
-        tokio::time::timeout(Duration::from_millis(25), store.inspect())
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            store.create_conversation(conversation_input(22, b"queued"))
+        )
+        .await
+        .is_err(),
         "second command fills the normal queue"
     );
 
@@ -409,12 +667,113 @@ async fn shutdown_control_lane_remains_available_when_the_normal_queue_is_full()
     first
         .await
         .expect("join in-flight command")
-        .expect("in-flight command completes");
+        .expect("in-flight command committed before shutdown won arbitration");
     shutdown.await.expect("shutdown survives normal saturation");
     assert!(matches!(
         stale_handle.inspect().await,
         Err(RuntimeStoreError::WorkerStopped)
     ));
+
+    let reopened = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(root.database()),
+        root.storage_kek(&keys),
+    )
+    .await
+    .expect("reopen after shutdown");
+    let recovery = runtime_recovery::load_recovery_state(&reopened)
+        .await
+        .expect("read shutdown result");
+    assert_eq!(recovery.conversations.len(), 1);
+    assert_eq!(recovery.conversations[0].descriptor, b"first");
+    reopened.shutdown().await.expect("shutdown reopened store");
+}
+
+#[tokio::test]
+async fn shutdown_request_is_single_slot_and_second_clone_is_rejected() {
+    let root = TestRoot::new("bounded-shutdown");
+    let keys = MemoryKeyStore::new();
+    let (entered_tx, entered_rx) = sync_channel(1);
+    let (release_tx, release_rx) = sync_channel(1);
+    let store = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(root.database()).with_fault_injector(Arc::new(
+            BlockingFirstOperation {
+                operation: RuntimeStoreOperation::CreateConversationAfterCommit,
+                blocked: AtomicBool::new(false),
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+                observed: Mutex::new(Vec::new()),
+            },
+        )),
+        root.storage_kek(&keys),
+    )
+    .await
+    .expect("open store");
+    let in_flight = tokio::spawn({
+        let store = store.clone();
+        async move {
+            store
+                .create_conversation(conversation_input(31, b"committed"))
+                .await
+        }
+    });
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(5)))
+        .await
+        .expect("join entered wait")
+        .expect("operation blocks after commit");
+
+    let mut first_shutdown = Box::pin(store.clone().shutdown());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut first_shutdown)
+            .await
+            .is_err(),
+        "first shutdown owns the single control slot"
+    );
+    assert!(matches!(
+        store.shutdown().await,
+        Err(RuntimeStoreError::ShutdownInProgress)
+    ));
+
+    release_tx.send(()).expect("release committed operation");
+    in_flight
+        .await
+        .expect("join committed operation")
+        .expect("committed operation returns");
+    first_shutdown.await.expect("first shutdown completes");
+}
+
+#[tokio::test]
+async fn queued_memory_is_bounded_independently_from_command_count() {
+    let root = TestRoot::new("lane-byte-budget");
+    let keys = MemoryKeyStore::new();
+    let store = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(root.database()).with_lane_byte_capacity(1_024),
+        root.storage_kek(&keys),
+    )
+    .await
+    .expect("open store");
+
+    let mut oversized_allocation = Vec::with_capacity(2_048);
+    oversized_allocation.extend_from_slice(b"x");
+    let error = store
+        .create_conversation(agentdeckd::runtime::store::NewConversation {
+            descriptor: oversized_allocation,
+            ..conversation_input(32, b"")
+        })
+        .await
+        .expect_err("retained heap capacity must count against the lane budget");
+    assert!(matches!(
+        error,
+        RuntimeStoreError::WorkerBusy {
+            lane: agentdeckd::runtime::store::RuntimeStoreLane::Normal
+        }
+    ));
+
+    store.inspect().await.expect("read lane remains available");
+    store
+        .create_conversation(conversation_input(33, b"small"))
+        .await
+        .expect("rejected allocation releases its permit");
+    store.shutdown().await.expect("shutdown store");
 }
 
 #[tokio::test]
@@ -427,6 +786,20 @@ async fn excessive_command_capacity_is_rejected_before_creating_a_database() {
     )
     .await
     .expect_err("capacity above the hard limit must fail");
+    assert!(matches!(error, RuntimeStoreError::InvalidConfig(_)));
+    assert!(!root.database().exists());
+}
+
+#[tokio::test]
+async fn excessive_lane_byte_capacity_is_rejected_before_creating_a_database() {
+    let root = TestRoot::new("lane-byte-capacity-limit");
+    let keys = MemoryKeyStore::new();
+    let error = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(root.database()).with_lane_byte_capacity(256 * 1024 * 1024 + 1),
+        root.storage_kek(&keys),
+    )
+    .await
+    .expect_err("lane byte capacity above the hard limit must fail");
     assert!(matches!(error, RuntimeStoreError::InvalidConfig(_)));
     assert!(!root.database().exists());
 }
@@ -674,9 +1047,16 @@ async fn preexisting_sidecar_symlink_is_rejected_before_any_sqlite_open() {
     .await
     .expect("create current store");
     store.shutdown().await.expect("shutdown store");
+    let wal = PathBuf::from(format!("{}-wal", database.display()));
+    let wal_metadata = fs::symlink_metadata(&wal).expect("persistent WAL exists after shutdown");
+    assert!(
+        wal_metadata.file_type().is_file(),
+        "fixture only replaces the store-created regular WAL"
+    );
+    fs::remove_file(&wal).expect("remove store-created WAL before hostile fixture");
     let target = root.0.join("sidecar-target");
     fs::write(&target, b"must-not-be-touched").expect("create sidecar target");
-    symlink(&target, format!("{}-wal", database.display())).expect("create WAL symlink");
+    symlink(&target, &wal).expect("create WAL symlink");
 
     let before = fs::read(&target).expect("read target before rejection");
     let error =
