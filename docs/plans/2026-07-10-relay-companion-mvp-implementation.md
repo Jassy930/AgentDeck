@@ -627,7 +627,7 @@ ignored/GATED。独立安全复核与容量/恢复/关停复核均未发现 P0/P
 - [x] Step 3: 实现 typed private state repositories并迁移 history/continue lookup。 旧 `ThreadId` 只留 stdio compatibility；vendor resume ref先用 StorageKEK包装，再写对应私有表；common层拿不到明文API。
 - [x] Step 4: 重跑测试与 `rg -n 'thread_id|session_id' agentdeckd/src/runtime`。 Expected: 仅 compatibility/迁移注释允许命中，RuntimeCore key不含 vendor identity。
 - [x] Step 5: 同步 N8：允许 adapter私有、派生、可重建映射，仍禁止新 CC 元数据事实源；运行 docs gate。
-- [ ] Step 6: 提交。 `git add agentdeckd README.md ARCHITECTURE.md AGENTS.md && git commit -m "refactor(daemon): 隔离 adapter 私有 resume 映射"`
+- [x] Step 6: 提交。 `3c58f2a refactor(daemon): 隔离 adapter 私有 resume 映射`
 
 执行记录（2026-07-11）：
 
