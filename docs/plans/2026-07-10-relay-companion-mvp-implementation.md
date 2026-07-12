@@ -397,7 +397,7 @@ pub struct ReplayTicket { pub stream: StreamRouteId, pub generation: StreamGener
 - [x] Step 3: 已实现bounded admin JSONL、同binary四组client subcommand和TLS enrollment endpoint。code只在CLI stdout响应；公网不提供inventory/readback/purge，DirectTLS第一pin在DB/bind前与leaf DER SPKI比对。
 - [x] Step 4: admin TLS E2E 2/2与Core uncertain purge focused case通过；坏签名/公钥不消费code、并发双消费1胜1拒、SQLite只读hash、逐字节响应与网络admin path 404均有断言。Store/admin DTO自定义Debug脱敏，日志路径只记录typed code/计数。
 - [x] Step 5: 已新增 `docs/RELAY_RUNBOOK.md`，并同步README、文档索引、诊断和质量门禁；只记录实际通过的本机命令与P2.9尚未cutover边界。
-- [ ] Step 6: 提交。 `git add agentdeck-relay docs/RELAY_RUNBOOK.md && git commit -m "feat(relay): 加入本机管理面与 machine enrollment"`
+- [x] Step 6: 已精确暂存本阶段的 protocol、Relay/admin/enrollment、测试、依赖锁与文档改动，并提交为 `ddc7250 feat(relay): 加入本机管理面与 machine enrollment`；未包含构建产物、运行数据或本地 SDD ledger。
 
 ### Task P2.8：重写 Rust Relay client 为 v2 WSS/pin client
 
