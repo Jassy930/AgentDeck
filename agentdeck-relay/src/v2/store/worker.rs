@@ -9,11 +9,12 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::model::{
     CommitMachineLinkAuth, ConfirmDeviceAuth, DeviceTrustView, EnrollmentCodeSeed, FaultPoint,
-    GrantCommit, InstallGrantRecord, MAX_CONTROL_BLOB_BYTES, MachineLinkAuthCommit, MachineRecord,
-    MachineTrustView, MaintenanceReport, PersistAck, PersistPublish, PersistRetirement,
-    PersistRevocation, PersistSubscription, PersistUnsubscribe, PublishCommit, PurgeMachine,
-    PurgeReadback, RegisterMachine, RelayV2StoreConfig, ReplayPage, ReplayPageRequest,
-    RetirementCommit, RevocationCommit, StoreError, StoreSnapshot, StreamRecord,
+    GrantCommit, InstallGrantRecord, MAX_CONTROL_BLOB_BYTES, MachineInventoryPage,
+    MachineInventoryQuery, MachineLinkAuthCommit, MachineReadback, MachineReadbackQuery,
+    MachineRecord, MachineTrustView, MaintenanceReport, PersistAck, PersistPublish,
+    PersistRetirement, PersistRevocation, PersistSubscription, PersistUnsubscribe, PublishCommit,
+    PurgeMachine, PurgeReadback, RegisterMachine, RelayV2StoreConfig, ReplayPage,
+    ReplayPageRequest, RetirementCommit, RevocationCommit, StoreError, StoreSnapshot, StreamRecord,
     StreamRegistration, SubscriptionLease, UnsubscribeCommit, normalize_platform_root_alias,
 };
 use super::sqlite;
@@ -129,6 +130,22 @@ impl RelayStoreHandle {
             reply,
         })
         .await
+    }
+
+    pub async fn machine_inventory(
+        &self,
+        query: MachineInventoryQuery,
+    ) -> Result<MachineInventoryPage, StoreError> {
+        self.dispatch(|reply| StoreCommand::MachineInventory { query, reply })
+            .await
+    }
+
+    pub async fn machine_readback(
+        &self,
+        query: MachineReadbackQuery,
+    ) -> Result<MachineReadback, StoreError> {
+        self.dispatch(|reply| StoreCommand::MachineReadback { query, reply })
+            .await
     }
 
     pub async fn device_trust(
@@ -341,6 +358,14 @@ impl RelayStoreHandle {
         self.purge_machine_inner(None, request).await
     }
 
+    pub(crate) async fn purge_machine_authorized(
+        &self,
+        owner: &AuthorizationOwner,
+        request: PurgeMachine,
+    ) -> Result<PurgeReadback, StoreError> {
+        self.purge_machine_inner(Some(owner), request).await
+    }
+
     async fn purge_machine_inner(
         &self,
         owner: Option<&AuthorizationOwner>,
@@ -437,6 +462,14 @@ enum StoreCommand {
     MachineTrust {
         machine_route: MachineRouteId,
         reply: oneshot::Sender<Result<MachineTrustView, StoreError>>,
+    },
+    MachineInventory {
+        query: MachineInventoryQuery,
+        reply: oneshot::Sender<Result<MachineInventoryPage, StoreError>>,
+    },
+    MachineReadback {
+        query: MachineReadbackQuery,
+        reply: oneshot::Sender<Result<MachineReadback, StoreError>>,
     },
     DeviceTrust {
         machine_route: MachineRouteId,
@@ -545,6 +578,12 @@ fn run(
                 reply,
             } => {
                 let _ = reply.send(sqlite::machine_trust(&conn, machine_route));
+            }
+            StoreCommand::MachineInventory { query, reply } => {
+                let _ = reply.send(sqlite::machine_inventory(&conn, query));
+            }
+            StoreCommand::MachineReadback { query, reply } => {
+                let _ = reply.send(sqlite::machine_readback(&conn, query));
             }
             StoreCommand::DeviceTrust {
                 machine_route,

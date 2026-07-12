@@ -60,6 +60,8 @@ pub enum TlsIdentityError {
         #[source]
         source: io::Error,
     },
+    #[error("configured enrollment SPKI pin does not match the active TLS leaf certificate")]
+    PinMismatch,
 }
 
 impl TlsIdentityError {
@@ -71,6 +73,7 @@ impl TlsIdentityError {
             Self::CertificateTooLarge => "relay.tls.certificate_too_large",
             Self::PrivateKeyTooLarge => "relay.tls.private_key_too_large",
             Self::InvalidIdentity { .. } => "relay.tls.identity_invalid",
+            Self::PinMismatch => "relay.tls.spki_pin_mismatch",
         }
     }
 }
@@ -82,6 +85,8 @@ impl TlsIdentityError {
 pub struct LoadedTlsIdentity {
     #[cfg(feature = "tls")]
     config: axum_server::tls_rustls::RustlsConfig,
+    #[cfg(feature = "tls")]
+    leaf_spki_sha256: [u8; 32],
     #[cfg(not(feature = "tls"))]
     _private: (),
 }
@@ -106,6 +111,10 @@ impl LoadedTlsIdentity {
 
     pub fn server_config(&self) -> std::sync::Arc<rustls::ServerConfig> {
         self.config.get_inner()
+    }
+
+    pub fn leaf_spki_sha256(&self) -> [u8; 32] {
+        self.leaf_spki_sha256
     }
 }
 
@@ -134,12 +143,45 @@ pub async fn load_tls_identity(
             TlsIdentityError::PrivateKeyTooLarge,
             |source| TlsIdentityError::PrivateKeyRead { source },
         )?;
+        let leaf_spki_sha256 = parse_leaf_spki_sha256(&certificate_chain)?;
         let config =
             axum_server::tls_rustls::RustlsConfig::from_pem(certificate_chain, private_key)
                 .await
                 .map_err(|source| TlsIdentityError::InvalidIdentity { source })?;
-        Ok(LoadedTlsIdentity { config })
+        Ok(LoadedTlsIdentity {
+            config,
+            leaf_spki_sha256,
+        })
     }
+}
+
+#[cfg(feature = "tls")]
+fn parse_leaf_spki_sha256(pem: &[u8]) -> Result<[u8; 32], TlsIdentityError> {
+    use sha2::{Digest, Sha256};
+    use x509_parser::prelude::{FromDer, X509Certificate};
+
+    let mut reader = std::io::Cursor::new(pem);
+    let leaf = rustls_pemfile::certs(&mut reader)
+        .next()
+        .transpose()
+        .map_err(|source| TlsIdentityError::InvalidIdentity { source })?
+        .ok_or_else(|| TlsIdentityError::InvalidIdentity {
+            source: io::Error::new(io::ErrorKind::InvalidData, "certificate chain is empty"),
+        })?;
+    let (remainder, certificate) = X509Certificate::from_der(leaf.as_ref()).map_err(|_| {
+        TlsIdentityError::InvalidIdentity {
+            source: io::Error::new(io::ErrorKind::InvalidData, "leaf certificate is invalid"),
+        }
+    })?;
+    if !remainder.is_empty() {
+        return Err(TlsIdentityError::InvalidIdentity {
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "leaf certificate has trailing data",
+            ),
+        });
+    }
+    Ok(Sha256::digest(certificate.tbs_certificate.subject_pki.raw).into())
 }
 
 #[cfg(feature = "tls")]
@@ -207,6 +249,7 @@ mod tests {
             .expect("fixture identity is valid");
         let config = identity.rustls_config();
         let _server_config = config.get_inner();
+        assert_ne!(identity.leaf_spki_sha256(), [0; 32]);
         let _owned = identity.into_rustls_config();
     }
 

@@ -392,11 +392,11 @@ pub struct ReplayTicket { pub stream: StreamRouteId, pub generation: StreamGener
 
 **Admin commands:** `machine-enroll create`、`machine inventory`、`machine purge --confirm ROOT_FINGERPRINT`、`machine readback`；admin socket只允许 Relay host 本地 0600，同 UID/配置 owner。
 
-- [ ] Step 1: 写admin/enrollment tests。 覆盖socket mode/peer、256-bit enrollment code hash-only/5m/one-shot/race、bundle pins；TLS `POST /v2/machine-enroll` body≤64KiB且无redirect；首次request把code消费、machine insert、request hash和冻结response/receipt在同一事务COMMIT。 注入COMMIT前/后断线：同code+同canonical request hash在TTL内逐字节重放原response，不同hash拒绝且不产生第二route；并覆盖错误fingerprint拒purge/readback。
-- [ ] Step 2: 运行 admin e2e。 Expected: FAIL，admin server/commands 不存在。
-- [ ] Step 3: 实现admin JSONL protocol、同binary client subcommand和TLS machine-enrollment endpoint。 endpoint先canonical encode/hash请求，再按上述事务冻结响应；管理命令不暴露到network listener，网络端不提供inventory/purge；输出code只到CLI stdout且日志redaction。
-- [ ] Step 4: 重跑 admin e2e并扫描 Relay logs。 Expected: PASS；code/invite/root private material 均不出现。
-- [ ] Step 5: 更新 `docs/RELAY_RUNBOOK.md` 的 machine enrollment/purge 操作草案，只写已通过命令；运行 docs gate。
+- [x] Step 1: 已写admin/enrollment tests。覆盖0600 socket/同UID gate、256-bit code hash-only/5m bundle/one-shot race、current leaf SPKI；真实TLS `POST /v2/machine-enroll` 的64KiB/no redirect、签名与endpoint key先验、同请求exact replay/不同请求冲突；错误fingerprint同时拒readback/purge，另有persistent COMMIT-unknown整Core fail-closed。
+- [x] Step 2: 已保留RED证据：canonical request、inventory/readback/purge API与admin模块缺失时分别编译失败；真实E2E在实现前不存在target。
+- [x] Step 3: 已实现bounded admin JSONL、同binary四组client subcommand和TLS enrollment endpoint。code只在CLI stdout响应；公网不提供inventory/readback/purge，DirectTLS第一pin在DB/bind前与leaf DER SPKI比对。
+- [x] Step 4: admin TLS E2E 2/2与Core uncertain purge focused case通过；坏签名/公钥不消费code、并发双消费1胜1拒、SQLite只读hash、逐字节响应与网络admin path 404均有断言。Store/admin DTO自定义Debug脱敏，日志路径只记录typed code/计数。
+- [x] Step 5: 已新增 `docs/RELAY_RUNBOOK.md`，并同步README、文档索引、诊断和质量门禁；只记录实际通过的本机命令与P2.9尚未cutover边界。
 - [ ] Step 6: 提交。 `git add agentdeck-relay docs/RELAY_RUNBOOK.md && git commit -m "feat(relay): 加入本机管理面与 machine enrollment"`
 
 ### Task P2.8：重写 Rust Relay client 为 v2 WSS/pin client

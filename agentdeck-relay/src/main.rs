@@ -14,6 +14,22 @@
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
+    let admin_output = agentdeck_relay::v2::admin::command::execute_admin_cli(
+        args.iter().cloned(),
+        std::env::var_os("AGENTDECK_RELAY_ADMIN_SOCKET").map(std::path::PathBuf::from),
+    )
+    .await;
+    if let Err(error) = &admin_output {
+        eprintln!("{}", error.code());
+        std::process::exit(2);
+    }
+    if let Some(output) = admin_output.ok().flatten() {
+        println!("{}", output.json);
+        if !output.success {
+            std::process::exit(2);
+        }
+        return Ok(());
+    }
     let selfcheck = args.iter().any(|a| a == "--selfcheck");
 
     let config = agentdeck_relay::config::RelayConfig::load()?;

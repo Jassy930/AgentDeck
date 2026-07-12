@@ -25,6 +25,7 @@ libc = "0.2"
 rand = "0.8"
 rand_core = "0.6"
 base64 = "0.22"
+url = "2"
 clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
 axum = { version = "0.8", features = ["ws"], optional = true }
@@ -34,6 +35,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 rustls = { version = "0.23", optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }
+x509-parser = { version = "0.18", default-features = false, optional = true }
+rustls-pemfile = { version = "2", optional = true }
 # R1b Task 3：SQLite backed `RelayStore`。`bundled` feature 拉进 sqlite3 C 源码
 # 避开系统 lib 依赖（portability + CI 一致性）。非 optional——Task 4 Core/router
 # 层无 server feature 门也要用（persist-before-deliver）。
@@ -42,7 +45,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 [features]
 default = []
 server = ["dep:axum", "dep:futures-util", "dep:tracing", "dep:tracing-subscriber", "tokio/net", "tokio/rt-multi-thread", "tokio/signal"]
-tls = ["server", "dep:rustls", "dep:tokio-rustls", "dep:axum-server"]
+tls = ["server", "dep:rustls", "dep:tokio-rustls", "dep:axum-server", "dep:x509-parser", "dep:rustls-pemfile"]
 
 [[bin]]
 name = "agentdeck-relay"

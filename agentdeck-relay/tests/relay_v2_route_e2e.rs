@@ -37,8 +37,9 @@ use agentdeck_relay::v2::core::writer::{
 };
 use agentdeck_relay::v2::core::{CoreConfig, RelayCore, RouteOutcome};
 use agentdeck_relay::v2::store::{
-    Clock, DiskSpace, DiskSpaceProbe, EnrollmentCodeSeed, InstallGrantRecord, RegisterMachine,
-    RelayStoreHandle, RelayV2StoreConfig, RetentionLimits, StoreError,
+    Clock, DiskSpace, DiskSpaceProbe, EnrollmentCodeSeed, FaultInjector, FaultPoint,
+    InstallGrantRecord, MachineInventoryQuery, MachineReadbackQuery, NoFaults, PurgeMachine,
+    RegisterMachine, RelayStoreHandle, RelayV2StoreConfig, RetentionLimits, StoreError,
 };
 use rusqlite::{Connection, OpenFlags};
 use tempfile::TempDir;
@@ -234,6 +235,7 @@ struct DeviceFixture {
 
 struct RealmFixture {
     machine_route: MachineRouteId,
+    root_fingerprint: [u8; 32],
     link: SigningKey,
     link_cert: SignedCertificate,
     devices: Vec<DeviceFixture>,
@@ -319,6 +321,7 @@ impl RealmFixture {
         }
         Self {
             machine_route,
+            root_fingerprint: sha256(&root.verifying_key().to_bytes()),
             link,
             link_cert,
             devices,
@@ -375,6 +378,212 @@ impl RealmFixture {
     }
 }
 
+#[derive(Debug)]
+struct PersistentPurgeAfterCommitFailure;
+
+impl FaultInjector for PersistentPurgeAfterCommitFailure {
+    fn check(&self, point: FaultPoint) -> Result<(), StoreError> {
+        if point == FaultPoint::PurgeAfterCommit {
+            Err(StoreError::InjectedFault(point))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[tokio::test]
+async fn admin_purge_is_fenced_by_core_and_detaches_only_the_confirmed_machine_realm() {
+    let mut fixture = Fixture::new().await;
+    let machine_route = fixture.realms[0].machine_route;
+    let root_fingerprint = fixture.realms[0].root_fingerprint;
+    let route = pair_route(0x707);
+    let mut machine = fixture.connect_machine(0).await;
+    let mut device = fixture.connect_device(0, 0).await;
+    let other_machine = fixture.connect_machine(1).await;
+
+    assert_applied(
+        fixture
+            .core
+            .handle(
+                &machine.access,
+                open_pair_frame(machine_route, route, NOW_MS + PAIR_TTL_MS),
+            )
+            .await
+            .expect("open pair route before purge"),
+    );
+    assert_opened(&mut machine, machine_route, route, NOW_MS + PAIR_TTL_MS).await;
+    let mut pairing = fixture
+        .connect_pairing(route, OutboundWriterConfig::default())
+        .await;
+
+    let wrong = fixture
+        .core
+        .purge_machine_admin(PurgeMachine {
+            machine_route,
+            expected_root_fingerprint: [0xff; 32],
+        })
+        .await
+        .expect_err("wrong fingerprint cannot purge");
+    assert!(matches!(wrong, StoreError::RootFingerprintMismatch));
+    assert!(!machine.writer.is_closed());
+    assert!(!device.writer.is_closed());
+    assert!(!pairing.writer.is_closed());
+    assert!(!other_machine.writer.is_closed());
+    assert!(
+        fixture
+            .core
+            .pair_route_view(route)
+            .await
+            .expect("pair route remains after rejected purge")
+            .active_route
+            .is_some()
+    );
+
+    let readback = fixture
+        .core
+        .purge_machine_admin(PurgeMachine {
+            machine_route,
+            expected_root_fingerprint: root_fingerprint,
+        })
+        .await
+        .expect("confirmed purge");
+    assert_eq!(readback.active_machine_routes, 0);
+    assert_eq!(readback.retired_tombstones, 1);
+    assert_eq!(readback.device_grants, 0);
+    assert_eq!(readback.revocations, 0);
+    assert_eq!(readback.streams, 0);
+    assert_eq!(readback.frames, 0);
+    assert_eq!(readback.subscriptions, 0);
+    assert_eq!(readback.retirement_hash, None);
+    assert_eq!(readback.retirement_terminal_blob, None);
+    assert_eq!(
+        machine.writer.close_reason(),
+        Some(WriterCloseReason::Retired)
+    );
+    assert_eq!(
+        device.writer.close_reason(),
+        Some(WriterCloseReason::Retired)
+    );
+    assert_eq!(
+        pairing.writer.close_reason(),
+        Some(WriterCloseReason::Retired)
+    );
+    assert!(!other_machine.writer.is_closed());
+    assert_receiver_closed(&mut machine).await;
+    assert_receiver_closed(&mut device).await;
+    assert_receiver_closed(&mut pairing).await;
+    assert!(
+        fixture
+            .core
+            .pair_route_view(route)
+            .await
+            .expect("pair route view after purge")
+            .active_route
+            .is_none()
+    );
+    let inventory = fixture
+        .store
+        .machine_inventory(MachineInventoryQuery {
+            after: None,
+            limit: 128,
+        })
+        .await
+        .expect("inventory after purge");
+    let retired = inventory
+        .entries
+        .iter()
+        .find(|entry| entry.machine_route == machine_route)
+        .expect("minimal retired tombstone remains visible to local admin");
+    assert!(retired.retired);
+    assert_eq!(retired.root_fingerprint, root_fingerprint);
+    let store_readback = fixture
+        .store
+        .machine_readback(MachineReadbackQuery {
+            machine_route,
+            expected_root_fingerprint: root_fingerprint,
+        })
+        .await
+        .expect("local admin readback after purge");
+    assert_eq!(&store_readback.machine, retired);
+    assert_eq!(store_readback.data, readback);
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn uncertain_admin_purge_never_restores_old_generations_and_fails_the_whole_core_closed() {
+    let mut fixture =
+        Fixture::new_with_fault_injector(Arc::new(PersistentPurgeAfterCommitFailure)).await;
+    let machine_route = fixture.realms[0].machine_route;
+    let root_fingerprint = fixture.realms[0].root_fingerprint;
+    let route = pair_route(0x708);
+    let mut machine = fixture.connect_machine(0).await;
+    let mut device = fixture.connect_device(0, 0).await;
+    let mut other_machine = fixture.connect_machine(1).await;
+    assert_applied(
+        fixture
+            .core
+            .handle(
+                &machine.access,
+                open_pair_frame(machine_route, route, NOW_MS + PAIR_TTL_MS),
+            )
+            .await
+            .expect("open pair route before uncertain purge"),
+    );
+    assert_opened(&mut machine, machine_route, route, NOW_MS + PAIR_TTL_MS).await;
+    let mut pairing = fixture
+        .connect_pairing(route, OutboundWriterConfig::default())
+        .await;
+
+    let error = fixture
+        .core
+        .purge_machine_admin(PurgeMachine {
+            machine_route,
+            expected_root_fingerprint: root_fingerprint,
+        })
+        .await
+        .expect_err("both exact recovery attempts report outcome unknown");
+    assert!(matches!(error, StoreError::CommitOutcomeUnknown { .. }));
+
+    assert_receiver_closed(&mut machine).await;
+    assert_receiver_closed(&mut device).await;
+    assert_receiver_closed(&mut pairing).await;
+    assert_receiver_closed(&mut other_machine).await;
+    for writer in [
+        &machine.writer,
+        &device.writer,
+        &pairing.writer,
+        &other_machine.writer,
+    ] {
+        assert_eq!(
+            writer.close_reason(),
+            Some(WriterCloseReason::AuthorizationInvalidated)
+        );
+    }
+    assert!(
+        fixture.core.pair_route_view(route).await.is_err(),
+        "poisoned Core and its in-memory PairRoute registry must stop"
+    );
+    let committed = fixture
+        .store
+        .machine_readback(MachineReadbackQuery {
+            machine_route,
+            expected_root_fingerprint: root_fingerprint,
+        })
+        .await
+        .expect("durable purge readback despite lost replies");
+    assert_eq!(committed.data.active_machine_routes, 0);
+    assert_eq!(committed.data.retired_tombstones, 1);
+    assert_eq!(committed.data.device_grants, 0);
+    assert_eq!(committed.data.frames, 0);
+
+    fixture
+        .store
+        .shutdown()
+        .await
+        .expect("shutdown Store after fail-closed Core");
+}
+
 struct TestConnection {
     access: AccessContext,
     writer: OutboundWriter,
@@ -400,6 +609,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::new_with_fault_injector(Arc::new(NoFaults)).await
+    }
+
+    async fn new_with_fault_injector(fault_injector: Arc<dyn FaultInjector>) -> Self {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = store_path(&temp);
         let mut retention = RetentionLimits::default();
@@ -408,6 +621,7 @@ impl Fixture {
         let config = RelayV2StoreConfig::new(db_path.clone())
             .with_clock(Arc::new(FixedStoreClock))
             .with_disk_space_probe(Arc::new(PlentyOfDisk))
+            .with_fault_injector(fault_injector)
             .with_retention(retention);
         let store = RelayStoreHandle::open(config).await.expect("open v2 store");
         let server = store.relay_server_id();

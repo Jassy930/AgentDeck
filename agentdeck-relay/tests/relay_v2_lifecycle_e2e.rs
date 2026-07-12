@@ -37,6 +37,7 @@ fn signal_child_config(storage_path: PathBuf) -> RelayV2ServerConfig {
         health_bind: "127.0.0.1:0".parse().unwrap(),
         store,
         transport: RelayV2TransportMode::InsecureLoopback,
+        admin: None,
         log_level: "info".to_owned(),
     }
 }
@@ -163,6 +164,7 @@ async fn proxy_loopback_slow_http_cannot_extend_network_drain_past_five_seconds(
         health_bind: "127.0.0.1:0".parse().unwrap(),
         store,
         transport: RelayV2TransportMode::ProxyLoopback,
+        admin: None,
         log_level: "info".to_owned(),
     })
     .await

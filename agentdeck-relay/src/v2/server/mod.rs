@@ -1,6 +1,7 @@
 //! Relay v2 网络服务：binary-only WebSocket、TLS fail-closed、健康检查与结构化关闭。
 
 mod connection;
+mod enrollment;
 mod health;
 mod preupgrade;
 pub mod tls;
@@ -12,13 +13,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentdeck_protocol::relay_v2::frame::ServerRestarting;
 use agentdeck_protocol::relay_v2::{OpaqueRouteFrame, RELAY_PROTOCOL_VERSION, RelayFrameBody};
+use axum::body::Bytes;
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{ConnectInfo, OriginalUri, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, OriginalUri, Request, State};
 use axum::http::header::CONNECTION;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use rand::RngCore;
 use serde::Serialize;
@@ -28,8 +30,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::instrument::WithSubscriber;
 
 use crate::config::{
-    RelayV2ConfigError, RelayV2ServerConfig, RelayV2TlsPaths, RelayV2TransportMode,
+    RelayV2AdminConfig, RelayV2ConfigError, RelayV2ServerConfig, RelayV2TlsPaths,
+    RelayV2TransportMode,
 };
+use crate::v2::admin::{AdminCommandExecutor, AdminRuntimeConfig, AdminServer, AdminServerError};
 use crate::v2::auth::{
     AuthorizationCoordinator, ChallengeLimits, ChallengeRegistry, SystemMonotonicClock,
 };
@@ -40,6 +44,7 @@ use connection::{
     AcceptedConnection, ConnectionBook, ConnectionMode, ConnectionServices,
     GLOBAL_WS_INGRESS_BYTES, MAX_WS_MESSAGE_BYTES, run_connection,
 };
+use enrollment::{EnrollmentError, EnrollmentService, MAX_ENROLLMENT_BODY_BYTES};
 use health::{HealthState, ReadinessCache};
 use preupgrade::{BoundedTcpListener, PublicConnectInfo};
 use tls::{LoadedTlsIdentity, TlsIdentityError, TlsIdentityPaths, load_tls_identity};
@@ -56,6 +61,8 @@ pub enum RelayV2ServerError {
     Config(#[from] RelayV2ConfigError),
     #[error("Relay v2 TLS identity is invalid: {0}")]
     Tls(#[from] TlsIdentityError),
+    #[error("Relay v2 admin service failed: {0}")]
+    Admin(#[from] AdminServerError),
     #[error("Relay v2 store failed: {0}")]
     Store(#[from] StoreError),
     #[error("Relay v2 core failed: {code}")]
@@ -79,6 +86,8 @@ struct PublicState {
     accepted: tokio::sync::mpsc::Sender<AcceptedConnection>,
     draining: Arc<AtomicBool>,
     source_policy: SourcePolicy,
+    enrollment: Option<EnrollmentService>,
+    enrollment_ingress: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +204,58 @@ async fn connect_pairing(
     accept_websocket(state, source, uri, headers, ws, ConnectionMode::Pairing).await
 }
 
+async fn enroll_machine(
+    State(state): State<PublicState>,
+    ConnectInfo(connect_info): ConnectInfo<PublicConnectInfo>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if state.draining.load(Ordering::Acquire) {
+        return enrollment_rejection(StatusCode::SERVICE_UNAVAILABLE, "relay.server.draining");
+    }
+    if uri.query().is_some() {
+        return enrollment_rejection(StatusCode::BAD_REQUEST, "relay.enrollment.request_invalid");
+    }
+    if resolve_source(state.source_policy, connect_info.source(), &headers).is_err() {
+        return enrollment_rejection(StatusCode::BAD_REQUEST, "relay.enrollment.request_invalid");
+    }
+    let Some(service) = state.enrollment else {
+        return enrollment_rejection(StatusCode::NOT_FOUND, "relay.route.not_found");
+    };
+    let Ok(_permit) = state.enrollment_ingress.try_acquire() else {
+        return enrollment_rejection(StatusCode::SERVICE_UNAVAILABLE, "relay.quota.exceeded");
+    };
+    let request = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return enrollment_rejection(
+                StatusCode::BAD_REQUEST,
+                "relay.enrollment.request_invalid",
+            );
+        }
+    };
+    match service.enroll(request).await {
+        Ok(response) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            response,
+        )
+            .into_response(),
+        Err(error) => {
+            let status = match error {
+                EnrollmentError::Rejected => StatusCode::FORBIDDEN,
+                EnrollmentError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            enrollment_rejection(status, error.code())
+        }
+    }
+}
+
+fn enrollment_rejection(status: StatusCode, code: &'static str) -> Response {
+    (status, Json(Rejection { code })).into_response()
+}
+
 /// 公开 listener 不是通用 HTTP 服务。只有成功的 WebSocket 101 可以把物理连接 permit
 /// 转成长期 WS 生命周期；所有 400/404/405 与 extractor rejection 都必须显式关闭，避免
 /// 完整 HTTP/1.1 keep-alive 在完成 header 后、101 deadline 到达前持续占住 permit。
@@ -213,6 +274,8 @@ fn public_router(state: PublicState) -> Router {
     Router::new()
         .route("/v2/connect", get(connect_principal))
         .route("/v2/pair", get(connect_pairing))
+        .route("/v2/machine-enroll", post(enroll_machine))
+        .layer(DefaultBodyLimit::max(MAX_ENROLLMENT_BODY_BYTES))
         .layer(middleware::from_fn(close_non_switching_response))
         .with_state(state)
 }
@@ -429,10 +492,27 @@ async fn preflight_tls(
     }
 }
 
+fn validate_admin_tls_pin(
+    admin: Option<&RelayV2AdminConfig>,
+    identity: Option<&LoadedTlsIdentity>,
+) -> Result<(), RelayV2ServerError> {
+    let (Some(admin), Some(identity)) = (admin, identity) else {
+        return Ok(());
+    };
+    #[cfg(feature = "tls")]
+    if admin.spki_pins.first().copied() != Some(identity.leaf_spki_sha256()) {
+        return Err(TlsIdentityError::PinMismatch.into());
+    }
+    #[cfg(not(feature = "tls"))]
+    let _ = (admin, identity);
+    Ok(())
+}
+
 /// library-level selfcheck：TLS 先于 DB 校验，随后真实 migration/readiness/Core 构造与重开。
 pub async fn selfcheck(config: RelayV2ServerConfig) -> Result<(), RelayV2ServerError> {
     config.validate()?;
-    let _identity = preflight_tls(&config.transport).await?;
+    let identity = preflight_tls(&config.transport).await?;
+    validate_admin_tls_pin(config.admin.as_ref(), identity.as_ref())?;
     let store_config = config.store.clone().into_store_config()?;
     let reopen_config = store_config.clone();
     let service = RelayV2Service::open(store_config).await?;
@@ -512,6 +592,7 @@ async fn wait_for_shutdown_signal() -> Result<(), std::io::Error> {
 pub struct RelayV2ServerHandle {
     public_addr: SocketAddr,
     health_addr: SocketAddr,
+    admin_socket_path: Option<std::path::PathBuf>,
     shutdown: CancellationToken,
     task: Option<tokio::task::JoinHandle<Result<(), RelayV2ServerError>>>,
 }
@@ -520,6 +601,7 @@ impl RelayV2ServerHandle {
     pub async fn start(config: RelayV2ServerConfig) -> Result<Self, RelayV2ServerError> {
         config.validate()?;
         let identity = preflight_tls(&config.transport).await?;
+        validate_admin_tls_pin(config.admin.as_ref(), identity.as_ref())?;
         let source_policy = match config.transport {
             RelayV2TransportMode::ProxyLoopback => SourcePolicy::TrustedLoopbackProxy,
             RelayV2TransportMode::DirectTls(_) | RelayV2TransportMode::InsecureLoopback => {
@@ -528,6 +610,33 @@ impl RelayV2ServerHandle {
         };
         let store_config = config.store.clone().into_store_config()?;
         let service = RelayV2Service::open(store_config).await?;
+        let enrollment = config.admin.as_ref().map(|_| {
+            EnrollmentService::new(
+                service.authorization.clone(),
+                service.store.relay_server_id(),
+            )
+        });
+        let (admin_server, admin_socket_path) = if let Some(admin) = config.admin.clone() {
+            let executor = AdminCommandExecutor::new(
+                service.store.clone(),
+                service.authorization.clone(),
+                service.core.clone(),
+                AdminRuntimeConfig {
+                    public_wss_url: admin.public_wss_url,
+                    spki_pins: admin.spki_pins,
+                },
+            );
+            let path = admin.socket_path.clone();
+            match AdminServer::bind(admin.socket_path, executor).await {
+                Ok(server) => (Some(server), Some(path)),
+                Err(error) => {
+                    service.shutdown().await?;
+                    return Err(error.into());
+                }
+            }
+        } else {
+            (None, None)
+        };
         let public_listener = match TcpListener::bind(config.bind).await {
             Ok(listener) => listener,
             Err(error) => {
@@ -542,17 +651,33 @@ impl RelayV2ServerHandle {
                 return Err(RelayV2ServerError::Io(error));
             }
         };
-        let public_addr = public_listener.local_addr()?;
-        let health_addr = health_listener.local_addr()?;
+        let public_addr = match public_listener.local_addr() {
+            Ok(address) => address,
+            Err(error) => {
+                service.shutdown().await?;
+                return Err(error.into());
+            }
+        };
+        let health_addr = match health_listener.local_addr() {
+            Ok(address) => address,
+            Err(error) => {
+                service.shutdown().await?;
+                return Err(error.into());
+            }
+        };
         let shutdown = CancellationToken::new();
         let task_shutdown = shutdown.clone();
         let task = tokio::spawn(
             serve_with_listeners(
                 service,
-                public_listener,
-                health_listener,
-                identity,
-                source_policy,
+                BoundRelayV2 {
+                    public_listener,
+                    health_listener,
+                    identity,
+                    source_policy,
+                    enrollment,
+                    admin_server,
+                },
                 task_shutdown,
             )
             .with_current_subscriber(),
@@ -560,6 +685,7 @@ impl RelayV2ServerHandle {
         Ok(Self {
             public_addr,
             health_addr,
+            admin_socket_path,
             shutdown,
             task: Some(task),
         })
@@ -571,6 +697,10 @@ impl RelayV2ServerHandle {
 
     pub fn health_addr(&self) -> SocketAddr {
         self.health_addr
+    }
+
+    pub fn admin_socket_path(&self) -> Option<&std::path::Path> {
+        self.admin_socket_path.as_deref()
     }
 
     pub fn trigger_shutdown(&self) {
@@ -604,14 +734,28 @@ impl Drop for RelayV2ServerHandle {
     }
 }
 
-async fn serve_with_listeners(
-    service: RelayV2Service,
+struct BoundRelayV2 {
     public_listener: TcpListener,
     health_listener: TcpListener,
     identity: Option<LoadedTlsIdentity>,
     source_policy: SourcePolicy,
+    enrollment: Option<EnrollmentService>,
+    admin_server: Option<AdminServer>,
+}
+
+async fn serve_with_listeners(
+    service: RelayV2Service,
+    bound: BoundRelayV2,
     shutdown: CancellationToken,
 ) -> Result<(), RelayV2ServerError> {
+    let BoundRelayV2 {
+        public_listener,
+        health_listener,
+        identity,
+        source_policy,
+        enrollment,
+        admin_server,
+    } = bound;
     if !health_listener.local_addr()?.ip().is_loopback() {
         return Err(RelayV2ServerError::Config(
             RelayV2ConfigError::HealthNonLoopback,
@@ -622,6 +766,8 @@ async fn serve_with_listeners(
         accepted: accepted_tx,
         draining: Arc::clone(&service.draining),
         source_policy,
+        enrollment,
+        enrollment_ingress: Arc::new(tokio::sync::Semaphore::new(32)),
     });
     let health = health::router(service.health_state());
     let public_shutdown = CancellationToken::new();
@@ -680,6 +826,11 @@ async fn serve_with_listeners(
         )
         .with_current_subscriber(),
     );
+    let admin_shutdown = CancellationToken::new();
+    let mut admin_task = admin_server.map(|server| {
+        let token = admin_shutdown.clone();
+        tokio::spawn(async move { server.run(token).await })
+    });
 
     let mut connections = JoinSet::new();
     let run_result = loop {
@@ -698,6 +849,14 @@ async fn serve_with_listeners(
                     Some(Err(_)) => break Err(RelayV2ServerError::Task),
                 }
             }
+            result = wait_admin_task(&mut admin_task), if admin_task.is_some() => {
+                let _ = admin_task.take();
+                break match result {
+                    Ok(Ok(())) => Err(RelayV2ServerError::Task),
+                    Ok(Err(error)) => Err(error.into()),
+                    Err(_) => Err(RelayV2ServerError::Task),
+                };
+            }
             accepted = accepted_rx.recv() => {
                 let Some(accepted) = accepted else {
                     break Err(RelayV2ServerError::Task);
@@ -712,9 +871,24 @@ async fn serve_with_listeners(
     let shutdown_deadline = tokio::time::Instant::now() + DEFAULT_DRAIN_TIMEOUT;
     service.draining.store(true, Ordering::Release);
     public_shutdown.cancel();
+    admin_shutdown.cancel();
     accepted_rx.close();
     while accepted_rx.try_recv().is_ok() {}
     monitor_shutdown.cancel();
+    let mut admin_result = Ok(());
+    if let Some(task) = admin_task.take() {
+        let mut task = task;
+        match tokio::time::timeout(DEFAULT_DRAIN_TIMEOUT, &mut task).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => admin_result = Err(error.into()),
+            Ok(Err(_)) => admin_result = Err(RelayV2ServerError::Task),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                admin_result = Err(RelayV2ServerError::DrainTimeout);
+            }
+        }
+    }
     let drain_result = service.begin_drain(DEFAULT_DRAIN_TIMEOUT).await;
     health_shutdown.cancel();
 
@@ -768,9 +942,19 @@ async fn serve_with_listeners(
     // 仍必须真正 quiesce，不能以“超时返回”伪装 DB lock 和已入队 COMMIT 已回收。
     let shutdown_result = service.shutdown().await;
     run_result
+        .and(admin_result)
         .and(drain_result)
         .and(listener_result)
         .and(shutdown_result)
+}
+
+async fn wait_admin_task(
+    task: &mut Option<tokio::task::JoinHandle<Result<(), AdminServerError>>>,
+) -> Result<Result<(), AdminServerError>, tokio::task::JoinError> {
+    match task.as_mut() {
+        Some(task) => task.await,
+        None => std::future::pending().await,
+    }
 }
 
 #[cfg(test)]

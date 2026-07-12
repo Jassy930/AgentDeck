@@ -31,8 +31,8 @@ use crate::v2::auth::{
     AuthorizationLifecycleEvent, PairRouteView, PrincipalRoute,
 };
 use crate::v2::store::{
-    PersistAck, PersistPublish, PersistSubscription, PersistUnsubscribe, RelayStoreHandle,
-    StoreError, StreamRegistration, SubscriptionLease,
+    PersistAck, PersistPublish, PersistSubscription, PersistUnsubscribe, PurgeMachine,
+    PurgeReadback, RelayStoreHandle, StoreError, StreamRegistration, SubscriptionLease,
 };
 
 use super::connection::{
@@ -275,6 +275,10 @@ enum CoreCommand {
         connection: ConnectionInstanceId,
         token: TerminalToken,
     },
+    AdminPurgeMachine {
+        request: PurgeMachine,
+        reply: oneshot::Sender<Result<PurgeReadback, StoreError>>,
+    },
     BeginDrain {
         reply: oneshot::Sender<Result<(), RelayFailure>>,
     },
@@ -444,6 +448,26 @@ impl RelayCore {
         response
             .await
             .map_err(|_| unavailable("Relay Core stopped"))?
+    }
+
+    /// root-lost 本机管理面唯一 purge 入口。请求与所有 route/PairRoute 操作在同一 Core
+    /// actor FIFO 中线性化，且 caller cancellation 不取消已经接纳的 purge。
+    pub async fn purge_machine_admin(
+        &self,
+        request: PurgeMachine,
+    ) -> Result<PurgeReadback, StoreError> {
+        let (reply, response) = oneshot::channel();
+        match self
+            .tx
+            .try_send(CoreCommand::AdminPurgeMachine { request, reply })
+        {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => return Err(StoreError::WorkerBusy),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(StoreError::WorkerUnavailable);
+            }
+        }
+        response.await.map_err(|_| StoreError::WorkerStopped)?
     }
 
     /// 与所有 attach/activate/route 命令在同一 actor FIFO 中线性化 Core shutdown
@@ -629,6 +653,14 @@ impl RelayCoreActor {
                 if let Some(cleanup) = self.connections.finish_terminal(connection, token) {
                     self.finish_cleanup(cleanup);
                 }
+            }
+            CoreCommand::AdminPurgeMachine { request, reply } => {
+                let result = if self.draining {
+                    Err(StoreError::WorkerUnavailable)
+                } else {
+                    self.admin_purge_machine(request).await
+                };
+                let _ = reply.send(result);
             }
             CoreCommand::BeginDrain { reply } => {
                 self.draining = true;
@@ -914,6 +946,24 @@ impl RelayCoreActor {
             }
         }
         Ok(RouteOutcome::Applied)
+    }
+
+    async fn admin_purge_machine(
+        &mut self,
+        request: PurgeMachine,
+    ) -> Result<PurgeReadback, StoreError> {
+        let machine = request.machine_route;
+        let mutation = self.authorization.purge_machine_admin(request).await?;
+        let (commit, invalidated) = mutation.into_parts();
+
+        let removed = self.pair_routes.remove_machine(machine);
+        for connection in removed.detached_pairings {
+            self.close_connection(connection, WriterCloseReason::Retired);
+        }
+        for connection in invalidated {
+            self.close_connection(connection, WriterCloseReason::Retired);
+        }
+        Ok(commit)
     }
 
     fn enqueue_origin_control(

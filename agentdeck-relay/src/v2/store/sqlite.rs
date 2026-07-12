@@ -18,16 +18,17 @@ use super::migrations::{self, SCHEMA_VERSION, SchemaError, SchemaState};
 use super::model::{
     CommitMachineLinkAuth, ConfirmDeviceAuth, DeviceTrustView, EMPTY_HIGH_WATER_TEXT,
     EnrollmentCodeSeed, FaultPoint, GrantCommit, InstallGrantRecord, MAX_CONTROL_BLOB_BYTES,
-    MAX_ENROLLMENT_CODES, MAX_TERMINAL_BLOB_BYTES, MachineLinkAuthCommit, MachineRecord,
-    MachineTrustView, MaintenanceReport, PersistAck, PersistPublish, PersistRetirement,
-    PersistRevocation, PersistSubscription, PersistUnsubscribe, PublishCommit, PublishDisposition,
-    PurgeMachine, PurgeReadback, REPLAY_PAGE_HARD_MAX_BYTES, REPLAY_PAGE_HARD_MAX_FRAMES,
-    RegisterMachine, RelayV2StoreConfig, ReplayCursor, ReplayFrame, ReplayPage, ReplayPageRequest,
-    ReplayPosition, RetirementCommit, RetirementTerminalView, RevocationCommit,
-    RevocationTerminalView, StoreError, StoreSnapshot, StreamRecord, StreamRegistration,
-    SubscriptionLease, UnsubscribeCommit, high_water_from_text, high_water_text, monotonic_blob,
-    monotonic_from_blob, normalize_platform_root_alias, sql_i64, stream_seq_from_text,
-    stream_seq_text, validate_store_path,
+    MAX_ENROLLMENT_CODES, MAX_MACHINE_INVENTORY_PAGE, MAX_TERMINAL_BLOB_BYTES,
+    MachineInventoryEntry, MachineInventoryPage, MachineInventoryQuery, MachineLinkAuthCommit,
+    MachineReadback, MachineReadbackQuery, MachineRecord, MachineTrustView, MaintenanceReport,
+    PersistAck, PersistPublish, PersistRetirement, PersistRevocation, PersistSubscription,
+    PersistUnsubscribe, PublishCommit, PublishDisposition, PurgeMachine, PurgeReadback,
+    REPLAY_PAGE_HARD_MAX_BYTES, REPLAY_PAGE_HARD_MAX_FRAMES, RegisterMachine, RelayV2StoreConfig,
+    ReplayCursor, ReplayFrame, ReplayPage, ReplayPageRequest, ReplayPosition, RetirementCommit,
+    RetirementTerminalView, RevocationCommit, RevocationTerminalView, StoreError, StoreSnapshot,
+    StreamRecord, StreamRegistration, SubscriptionLease, UnsubscribeCommit, high_water_from_text,
+    high_water_text, monotonic_blob, monotonic_from_blob, normalize_platform_root_alias, sql_i64,
+    stream_seq_from_text, stream_seq_text, validate_store_path,
 };
 
 const DIRECTORY_MODE: u32 = 0o700;
@@ -436,7 +437,8 @@ pub(crate) fn register_machine(
     request: RegisterMachine,
 ) -> Result<MachineRecord, StoreError> {
     validate_machine_request(&request)?;
-    let now = sql_i64(config.clock.now_ms()?, "enrollment_codes.consumed_at")?;
+    let now_ms = config.clock.now_ms()?;
+    let now = sql_i64(now_ms, "enrollment_codes.consumed_at")?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let code = tx
         .query_row(
@@ -476,6 +478,20 @@ pub(crate) fn register_machine(
         )?;
         tx.commit()?;
         return Ok(record);
+    }
+
+    if request
+        .link_cert
+        .not_after_ms
+        .is_some_and(|expiry| now_ms >= expiry)
+        || request
+            .data_cert
+            .not_after_ms
+            .is_some_and(|expiry| now_ms >= expiry)
+    {
+        return Err(StoreError::AuthenticationMismatch {
+            field: "register_machine.certificate_expiry",
+        });
     }
 
     if tx
@@ -605,6 +621,126 @@ pub(crate) fn machine_trust(
         link_cert_hash: array_from_blob::<32>(row.5, "machine_routes.link_cert_hash")?,
         retired,
         retirement_terminal,
+    })
+}
+
+pub(crate) fn machine_inventory(
+    conn: &Connection,
+    query: MachineInventoryQuery,
+) -> Result<MachineInventoryPage, StoreError> {
+    if query.limit == 0 || query.limit > MAX_MACHINE_INVENTORY_PAGE {
+        return Err(StoreError::InvalidValue {
+            field: "machine_inventory.limit",
+            reason: "inventory page limit must be in 1...128",
+        });
+    }
+    let fetch =
+        i64::try_from(query.limit.saturating_add(1)).map_err(|_| StoreError::InvalidValue {
+            field: "machine_inventory.limit",
+            reason: "inventory page limit does not fit SQLite",
+        })?;
+    let mut entries = Vec::with_capacity(query.limit.saturating_add(1));
+    match query.after {
+        Some(after) => {
+            let mut statement = conn.prepare(
+                "SELECT relay_server_id, machine_route, root_pubkey, trust_epoch, status
+                 FROM machine_routes WHERE machine_route > ?1
+                 ORDER BY machine_route ASC LIMIT ?2",
+            )?;
+            let rows = statement.query_map(
+                params![after.as_bytes().as_slice(), fetch],
+                raw_machine_inventory_row,
+            )?;
+            for row in rows {
+                entries.push(parse_machine_inventory_entry(row?)?);
+            }
+        }
+        None => {
+            let mut statement = conn.prepare(
+                "SELECT relay_server_id, machine_route, root_pubkey, trust_epoch, status
+                 FROM machine_routes ORDER BY machine_route ASC LIMIT ?1",
+            )?;
+            let rows = statement.query_map(params![fetch], raw_machine_inventory_row)?;
+            for row in rows {
+                entries.push(parse_machine_inventory_entry(row?)?);
+            }
+        }
+    }
+    let has_more = entries.len() > query.limit;
+    if has_more {
+        entries.truncate(query.limit);
+    }
+    let next_after = if has_more {
+        entries.last().map(|entry| entry.machine_route)
+    } else {
+        None
+    };
+    Ok(MachineInventoryPage {
+        entries,
+        next_after,
+    })
+}
+
+pub(crate) fn machine_readback(
+    conn: &Connection,
+    query: MachineReadbackQuery,
+) -> Result<MachineReadback, StoreError> {
+    let machine = machine_inventory_entry(conn, query.machine_route)?;
+    if machine.root_fingerprint != query.expected_root_fingerprint {
+        return Err(StoreError::RootFingerprintMismatch);
+    }
+    let streams = machine_stream_keys(conn, query.machine_route)?;
+    let data = purge_readback(conn, query.machine_route, &streams, false)?;
+    Ok(MachineReadback { machine, data })
+}
+
+fn machine_inventory_entry(
+    conn: &Connection,
+    machine_route: MachineRouteId,
+) -> Result<MachineInventoryEntry, StoreError> {
+    let raw = conn
+        .query_row(
+            "SELECT relay_server_id, machine_route, root_pubkey, trust_epoch, status
+         FROM machine_routes WHERE machine_route = ?1",
+            params![machine_route.as_bytes().as_slice()],
+            raw_machine_inventory_row,
+        )
+        .optional()?
+        .ok_or(StoreError::MachineNotFound)?;
+    parse_machine_inventory_entry(raw)
+}
+
+type RawMachineInventoryRow = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, String);
+
+fn raw_machine_inventory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawMachineInventoryRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
+}
+
+fn parse_machine_inventory_entry(
+    raw: RawMachineInventoryRow,
+) -> Result<MachineInventoryEntry, StoreError> {
+    let relay_server_id = array_from_blob::<16>(raw.0, "machine_routes.relay_server_id")?;
+    let machine_route = array_from_blob::<16>(raw.1, "machine_routes.machine_route")?;
+    let root_pubkey = array_from_blob::<32>(raw.2, "machine_routes.root_pubkey")?;
+    let trust_epoch = monotonic_from_blob(raw.3, "machine_routes.trust_epoch")?;
+    let status = raw.4;
+    let retired = match status.as_str() {
+        "active" => false,
+        "retired" => true,
+        _ => return Err(StoreError::UnknownOrCorruptSchema),
+    };
+    Ok(MachineInventoryEntry {
+        relay_server_id: RelayServerId::from_bytes(relay_server_id),
+        machine_route: MachineRouteId::from_bytes(machine_route),
+        root_fingerprint: Sha256::digest(root_pubkey).into(),
+        trust_epoch: TrustEpoch::new(trust_epoch),
+        retired,
     })
 }
 
@@ -2330,7 +2466,13 @@ pub(crate) fn purge_machine(
     config: &RelayV2StoreConfig,
     request: PurgeMachine,
 ) -> Result<PurgeReadback, StoreError> {
-    let (readback, _) = purge_machine_inner(conn, config, request.machine_route, None)?;
+    let (readback, _) = purge_machine_inner(
+        conn,
+        config,
+        request.machine_route,
+        Some(request.expected_root_fingerprint),
+        None,
+    )?;
     Ok(readback)
 }
 
@@ -2344,7 +2486,8 @@ pub(crate) fn retire_machine(
     let trust_epoch = request.retirement.trust_epoch;
     let retirement_hash = request.retirement_hash;
     let retirement_terminal_blob = request.retirement_terminal_blob.clone();
-    let (readback, duplicate) = purge_machine_inner(conn, config, machine_route, Some(&request))?;
+    let (readback, duplicate) =
+        purge_machine_inner(conn, config, machine_route, None, Some(&request))?;
     Ok(RetirementCommit {
         machine_route,
         trust_epoch,
@@ -2395,12 +2538,13 @@ fn purge_machine_inner(
     conn: &mut Connection,
     config: &RelayV2StoreConfig,
     machine_route: MachineRouteId,
+    expected_root_fingerprint: Option<[u8; 32]>,
     retirement: Option<&PersistRetirement>,
 ) -> Result<(PurgeReadback, bool), StoreError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let row = tx
         .query_row(
-            "SELECT root_key_id, trust_epoch, status, retirement_hash,
+            "SELECT root_key_id, trust_epoch, root_pubkey, status, retirement_hash,
                     retirement_terminal_blob
              FROM machine_routes WHERE machine_route = ?1",
             params![machine_route.as_bytes().as_slice()],
@@ -2408,9 +2552,10 @@ fn purge_machine_inner(
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
                     row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<Vec<u8>>>(3)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
                     row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
                 ))
             },
         )
@@ -2419,30 +2564,41 @@ fn purge_machine_inner(
     let root_key_id =
         RootKeyId::from_bytes(array_from_blob::<16>(row.0, "machine_routes.root_key_id")?);
     let trust_epoch = TrustEpoch::new(monotonic_from_blob(row.1, "machine_routes.trust_epoch")?);
+    let root_pubkey = array_from_blob::<32>(row.2, "machine_routes.root_pubkey")?;
+    let actual_root_fingerprint: [u8; 32] = Sha256::digest(root_pubkey).into();
+    if expected_root_fingerprint.is_some_and(|expected| expected != actual_root_fingerprint) {
+        return Err(StoreError::RootFingerprintMismatch);
+    }
     let target_streams = machine_stream_keys(&tx, machine_route)?;
 
-    if row.2 == "retired" {
+    if row.3 == "retired" {
         if let Some(retirement) = retirement {
             let existing_hash = row
-                .3
+                .4
                 .map(|value| array_from_blob::<32>(value, "machine_routes.retirement_hash"))
                 .transpose()?;
             if existing_hash != Some(retirement.retirement_hash)
-                || row.4.as_deref() != Some(retirement.retirement_terminal_blob.as_slice())
+                || row.5.as_deref() != Some(retirement.retirement_terminal_blob.as_slice())
             {
                 return Err(StoreError::IdempotencyConflict {
                     field: "retirement_hash",
                 });
             }
         }
-        let committed = purge_readback(&tx, machine_route, &target_streams)?;
+        let committed = purge_readback(&tx, machine_route, &target_streams, true)?;
         ensure_purge_complete(&committed, retirement)?;
         tx.commit().map_err(|_| StoreError::CommitOutcomeUnknown {
             operation: "retire_machine",
         })?;
+        config
+            .fault_injector
+            .check(FaultPoint::PurgeAfterCommit)
+            .map_err(|_| StoreError::CommitOutcomeUnknown {
+                operation: "retire_machine",
+            })?;
         return Ok((committed, true));
     }
-    if row.2 != "active" {
+    if row.3 != "active" {
         return Err(StoreError::UnknownOrCorruptSchema);
     }
     if let Some(retirement) = retirement {
@@ -2485,7 +2641,7 @@ fn purge_machine_inner(
         ],
     )?;
     config.fault_injector.check(FaultPoint::PurgeBeforeCommit)?;
-    let committed = purge_readback(&tx, machine_route, &target_streams)?;
+    let committed = purge_readback(&tx, machine_route, &target_streams, true)?;
     ensure_purge_complete(&committed, retirement)?;
     tx.commit().map_err(|_| StoreError::CommitOutcomeUnknown {
         operation: "retire_machine",
@@ -2503,6 +2659,7 @@ fn purge_readback(
     conn: &Connection,
     machine_route: MachineRouteId,
     target_streams: &[(StreamRouteId, StreamGenerationId)],
+    verify_foreign_keys: bool,
 ) -> Result<PurgeReadback, StoreError> {
     let active_machine_routes = scoped_count(
         conn,
@@ -2576,10 +2733,12 @@ fn purge_readback(
             )?),
             Some(blob),
         ),
-        Some((None, None)) => (None, None),
-        Some(_) | None => return Err(StoreError::UnknownOrCorruptSchema),
+        Some((None, None)) | None => (None, None),
+        Some(_) => return Err(StoreError::UnknownOrCorruptSchema),
     };
-    ensure_foreign_keys(conn)?;
+    if verify_foreign_keys {
+        ensure_foreign_keys(conn)?;
+    }
     Ok(PurgeReadback {
         active_machine_routes,
         retired_tombstones,

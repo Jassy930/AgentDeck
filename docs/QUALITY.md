@@ -360,6 +360,55 @@ for _ in {1..10}; do
 done
 ```
 
+## Relay Companion MVP P2.7 Admin / enrollment / purge 门禁
+
+P2.7 仍未执行 production listener cutover。改动 admin UDS、enrollment canonical request、
+TLS SPKI pin、machine inventory/readback 或 root-lost purge 后至少运行：
+
+```bash
+# 真实 0600 UDS + 同 binary CLI、exact leaf SPKI、真实 TLS POST、hash-only code、
+# 同请求逐字节重放、不同请求/并发双消费、坏签名/坏 endpoint key、64 KiB/no redirect、
+# 网络面无 inventory/purge，以及 fingerprint-bound readback/purge。
+cargo test -p agentdeck-relay --features server,tls \
+  --test relay_v2_admin_e2e -- --test-threads=1
+
+# wrong-confirm零写、COMMIT-unknown全Core fail-closed、target PairRoute/writer清理和其他realm隔离。
+cargo test -p agentdeck-relay --features server \
+  --test relay_v2_route_e2e -- --test-threads=1
+cargo test -p agentdeck-relay --features server \
+  --test relay_v2_store -- --test-threads=1
+
+# admin config必须在有/无server/tls三种surface均保持严格解析。
+cargo test -p agentdeck-relay --test relay_v2_config
+cargo test -p agentdeck-relay --features server --test relay_v2_config
+cargo test -p agentdeck-relay --features server,tls --test relay_v2_config
+
+# enrollment canonical bytes/schema 与全部 Relay 回归。
+cargo test -p agentdeck-protocol --test relay_v2_contract
+cargo test -p agentdeck-relay --features server
+cargo test -p agentdeck-relay --features server,tls
+cargo clippy -p agentdeck-relay --features server,tls --lib --no-deps -- -D warnings \
+  -A clippy::large-enum-variant -A clippy::needless-return \
+  -A clippy::collapsible-if -A clippy::doc-lazy-continuation
+RUSTDOCFLAGS="-D warnings" cargo doc -p agentdeck-relay --features server,tls --no-deps
+cargo fmt --all --check
+bash scripts/check-daemon-no-net.sh
+bash scripts/verify-agent-docs.sh
+git diff --check
+```
+
+测试必须证明一次性 code、完整 route/root fingerprint、root/link/data public material、signature、
+receipt 与 frozen response 不进入 `Debug` 或 tracing。code 只允许出现在 `machine-enroll create`
+的 stdout JSON；测试直接查询 SQLite 时只能找到 SHA-256。错误 fingerprint 必须同时拒绝
+readback 和 purge，并在 transaction 的任何删除之前返回。admin purge 的 COMMIT response
+若连续两次丢失，旧 active generation 不能恢复；全部 writer 与内存 PairRoute 必须随 Core
+fail-closed。stale UDS 只可在明确 `ECONNREFUSED` 且 unlink 前 dev/inode 二次一致时删除；
+timeout、其他错误或 inode 变化一律视为已有/不确定实例。
+
+`POST /v2/machine-enroll` 只能在 secure admin 配置完整时存在。direct TLS 必须在 DB/bind 前
+把配置第一 pin 与真实 leaf DER SPKI SHA-256 比较；proxy 模式由可信部署显式提供一至两个 pin；
+insecure loopback 禁止 admin/enrollment。公网 unknown/admin path 固定 404，不 redirect。
+
 ## AppKit 重写后的验证清单
 
 前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。

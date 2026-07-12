@@ -1339,6 +1339,7 @@ async fn authorization_owner_is_singleton_and_blocks_raw_trust_mutators() {
             .store
             .purge_machine(PurgeMachine {
                 machine_route: fixture.machine_route,
+                expected_root_fingerprint: sha256(&fixture.root.verifying_key().to_bytes()),
             })
             .await,
         Err(StoreError::AuthorizationOwned)

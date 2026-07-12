@@ -2,6 +2,8 @@
 //!
 //! 本模块只产出配置数据结构与门禁校验逻辑，不含任何网络监听/绑定动作（Task 9 消费）。
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::Parser;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -161,7 +163,50 @@ pub struct RelayV2ServerConfig {
     pub health_bind: SocketAddr,
     pub store: RelayV2StoreSettings,
     pub transport: RelayV2TransportMode,
+    pub admin: Option<RelayV2AdminConfig>,
     pub log_level: String,
+}
+
+/// 仅供 Relay host 本机 UDS 与公开 enrollment bundle 使用的配置。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayV2AdminConfig {
+    pub socket_path: PathBuf,
+    pub public_wss_url: String,
+    /// 当前证书 pin 在前，可选下一证书 pin 在后。
+    pub spki_pins: Vec<[u8; 32]>,
+}
+
+impl RelayV2AdminConfig {
+    pub fn validate(&self) -> Result<(), RelayV2ConfigError> {
+        if !self.socket_path.is_absolute() || self.socket_path.file_name().is_none() {
+            return Err(RelayV2ConfigError::AdminInvalid {
+                field: "admin_socket",
+            });
+        }
+        let url = url::Url::parse(&self.public_wss_url).map_err(|_| {
+            RelayV2ConfigError::AdminInvalid {
+                field: "public_wss_url",
+            }
+        })?;
+        if url.scheme() != "wss"
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.path() != "/"
+        {
+            return Err(RelayV2ConfigError::AdminInvalid {
+                field: "public_wss_url",
+            });
+        }
+        if !(1..=2).contains(&self.spki_pins.len())
+            || (self.spki_pins.len() == 2 && self.spki_pins[0] == self.spki_pins[1])
+        {
+            return Err(RelayV2ConfigError::AdminInvalid { field: "spki_pins" });
+        }
+        Ok(())
+    }
 }
 
 const V2_DEFAULT_BIND: &str = "127.0.0.1:8443";
@@ -208,6 +253,12 @@ struct RelayV2RawArgs {
     proxy_mode: bool,
     #[arg(long)]
     log_level: Option<String>,
+    #[arg(long)]
+    admin_socket: Option<PathBuf>,
+    #[arg(long)]
+    public_wss_url: Option<String>,
+    #[arg(long = "spki-pin")]
+    spki_pins: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -231,6 +282,9 @@ struct RelayV2FileConfig {
     allow_insecure_loopback: Option<bool>,
     proxy_mode: Option<bool>,
     log_level: Option<String>,
+    admin_socket: Option<PathBuf>,
+    public_wss_url: Option<String>,
+    spki_pins: Option<Vec<String>>,
 }
 
 /// Relay v2 配置加载和传输门禁失败。
@@ -270,6 +324,12 @@ pub enum RelayV2ConfigError {
     TransportConflict,
     #[error("Relay health listener must bind loopback")]
     HealthNonLoopback,
+    #[error("admin socket, public WSS URL and SPKI pins must be configured together")]
+    AdminPartial,
+    #[error("Relay admin/enrollment requires direct TLS or trusted loopback proxy mode")]
+    AdminRequiresSecureTransport,
+    #[error("Relay admin configuration is invalid: {field}")]
+    AdminInvalid { field: &'static str },
 }
 
 impl RelayV2ConfigError {
@@ -291,6 +351,9 @@ impl RelayV2ConfigError {
             Self::ProxyNonLoopback => "relay.transport.proxy_requires_loopback",
             Self::TransportConflict => "relay.transport.mode_conflict",
             Self::HealthNonLoopback => "relay.config.health_non_loopback",
+            Self::AdminPartial => "relay.admin.config_partial",
+            Self::AdminRequiresSecureTransport => "relay.admin.secure_transport_required",
+            Self::AdminInvalid { .. } => "relay.admin.config_invalid",
         }
     }
 }
@@ -328,6 +391,12 @@ impl RelayV2ServerConfig {
                 if !self.bind.ip().is_loopback() {
                     return Err(RelayV2ConfigError::ProxyNonLoopback);
                 }
+            }
+        }
+        if let Some(admin) = &self.admin {
+            admin.validate()?;
+            if matches!(self.transport, RelayV2TransportMode::InsecureLoopback) {
+                return Err(RelayV2ConfigError::AdminRequiresSecureTransport);
             }
         }
         Ok(())
@@ -508,6 +577,23 @@ impl RelayV2ServerConfig {
 
         let transport = select_v2_transport(bind, tls, allow_insecure_loopback, proxy_mode)?;
 
+        let cli_spki_pins = (!raw.spki_pins.is_empty()).then_some(raw.spki_pins);
+        let env_spki_pins = environment
+            .get("AGENTDECK_RELAY_SPKI_PINS")
+            .map(|value| split_pin_list(value, "AGENTDECK_RELAY_SPKI_PINS"))
+            .transpose()?;
+        let admin = select_v2_admin(
+            (raw.admin_socket, raw.public_wss_url, cli_spki_pins),
+            (
+                environment
+                    .get("AGENTDECK_RELAY_ADMIN_SOCKET")
+                    .map(PathBuf::from),
+                environment.get("AGENTDECK_RELAY_PUBLIC_WSS_URL").cloned(),
+                env_spki_pins,
+            ),
+            (file.admin_socket, file.public_wss_url, file.spki_pins),
+        )?;
+
         let log_level = raw
             .log_level
             .or_else(|| environment.get("AGENTDECK_RELAY_LOG").cloned())
@@ -523,6 +609,7 @@ impl RelayV2ServerConfig {
             health_bind,
             store,
             transport,
+            admin,
             log_level,
         };
         config.validate()?;
@@ -557,7 +644,63 @@ fn load_v2_file_config(path: Option<&Path>) -> Result<RelayV2FileConfig, RelayV2
     })?;
     config.tls_cert = config.tls_cert.map(|value| resolve_from_cwd(value, parent));
     config.tls_key = config.tls_key.map(|value| resolve_from_cwd(value, parent));
+    config.admin_socket = config
+        .admin_socket
+        .map(|value| resolve_from_cwd(value, parent));
     Ok(config)
+}
+
+type RawAdminConfig = (Option<PathBuf>, Option<String>, Option<Vec<String>>);
+
+fn select_v2_admin(
+    cli: RawAdminConfig,
+    environment: RawAdminConfig,
+    file: RawAdminConfig,
+) -> Result<Option<RelayV2AdminConfig>, RelayV2ConfigError> {
+    let socket_path = cli.0.or(environment.0).or(file.0);
+    let public_wss_url = cli.1.or(environment.1).or(file.1);
+    let raw_pins = cli.2.or(environment.2).or(file.2);
+    if socket_path.is_none() && public_wss_url.is_none() && raw_pins.is_none() {
+        return Ok(None);
+    }
+    let (Some(socket_path), Some(public_wss_url), Some(raw_pins)) =
+        (socket_path, public_wss_url, raw_pins)
+    else {
+        return Err(RelayV2ConfigError::AdminPartial);
+    };
+    let pins = raw_pins
+        .iter()
+        .map(|pin| parse_spki_pin(pin))
+        .collect::<Result<Vec<_>, _>>()?;
+    let admin = RelayV2AdminConfig {
+        socket_path,
+        public_wss_url,
+        spki_pins: pins,
+    };
+    admin.validate()?;
+    Ok(Some(admin))
+}
+
+fn split_pin_list(value: &str, key: &'static str) -> Result<Vec<String>, RelayV2ConfigError> {
+    let pins = value
+        .split(',')
+        .map(str::trim)
+        .filter(|pin| !pin.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if pins.is_empty() {
+        return Err(RelayV2ConfigError::InvalidEnvironment { key });
+    }
+    Ok(pins)
+}
+
+fn parse_spki_pin(value: &str) -> Result<[u8; 32], RelayV2ConfigError> {
+    let decoded = URL_SAFE_NO_PAD
+        .decode(value.as_bytes())
+        .map_err(|_| RelayV2ConfigError::AdminInvalid { field: "spki_pins" })?;
+    decoded
+        .try_into()
+        .map_err(|_| RelayV2ConfigError::AdminInvalid { field: "spki_pins" })
 }
 
 fn select_v2_tls_paths(

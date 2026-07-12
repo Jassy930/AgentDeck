@@ -238,6 +238,8 @@ pub enum StoreError {
     EnrollmentCodeExpired,
     #[error("enrollment code was already consumed by a different request")]
     EnrollmentCodeConflict,
+    #[error("machine root fingerprint confirmation does not match")]
+    RootFingerprintMismatch,
     #[error("device grant has been revoked")]
     Revoked,
     #[error("authentication state does not match the persisted {field}")]
@@ -292,6 +294,7 @@ impl StoreError {
             Self::SequenceConflict { .. } => "relay.stream.out_of_order",
             Self::EnrollmentCodeNotFound => "relay.store.enrollment_not_found",
             Self::EnrollmentCodeExpired => "relay.store.enrollment_expired",
+            Self::RootFingerprintMismatch => "relay.store.confirmation_mismatch",
             Self::Revoked => "relay.auth.revoked",
             Self::AuthenticationMismatch { .. } => "relay.auth.invalid_grant",
             Self::QuotaExceeded { .. } => "relay.quota.exceeded",
@@ -478,13 +481,23 @@ impl FaultInjector for NoFaults {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EnrollmentCodeSeed {
     pub code_hash: [u8; 32],
     pub expires_at_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl fmt::Debug for EnrollmentCodeSeed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EnrollmentCodeSeed")
+            .field("code_hash", &"<redacted>")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct RegisterMachine {
     pub code_hash: [u8; 32],
     pub request_hash: [u8; 32],
@@ -498,7 +511,17 @@ pub struct RegisterMachine {
     pub data_cert_hash: [u8; 32],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl fmt::Debug for RegisterMachine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegisterMachine")
+            .field("machine", &self.machine_route.redacted())
+            .field("enrollment_material", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct MachineRecord {
     pub relay_server_id: RelayServerId,
     pub machine_route: MachineRouteId,
@@ -508,6 +531,23 @@ pub struct MachineRecord {
     pub response_blob: Vec<u8>,
     pub receipt_hash: [u8; 32],
     pub duplicate: bool,
+}
+
+impl fmt::Debug for MachineRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MachineRecord")
+            .field("relay_server", &self.relay_server_id.redacted())
+            .field("machine", &self.machine_route.redacted())
+            .field("trust_epoch", &self.trust_epoch.value())
+            .field(
+                "highest_link_generation",
+                &self.highest_link_generation.value(),
+            )
+            .field("duplicate", &self.duplicate)
+            .field("receipt", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Relay 鉴权所需的最小 machine trust 快照。只包含公开验签材料与单调状态，
@@ -871,9 +911,117 @@ pub struct RevocationCommit {
     pub duplicate: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PurgeMachine {
     pub machine_route: MachineRouteId,
+    pub expected_root_fingerprint: [u8; 32],
+}
+
+impl fmt::Debug for PurgeMachine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PurgeMachine")
+            .field("machine", &self.machine_route.redacted())
+            .field("root_fingerprint", &"<redacted>")
+            .finish()
+    }
+}
+
+pub const MAX_MACHINE_INVENTORY_PAGE: usize = 128;
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct MachineInventoryQuery {
+    pub after: Option<MachineRouteId>,
+    pub limit: usize,
+}
+
+impl fmt::Debug for MachineInventoryQuery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MachineInventoryQuery")
+            .field("has_cursor", &self.after.is_some())
+            .field("limit", &self.limit)
+            .finish()
+    }
+}
+
+impl Default for MachineInventoryQuery {
+    fn default() -> Self {
+        Self {
+            after: None,
+            limit: MAX_MACHINE_INVENTORY_PAGE,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct MachineInventoryEntry {
+    pub relay_server_id: RelayServerId,
+    pub machine_route: MachineRouteId,
+    pub root_fingerprint: [u8; 32],
+    pub trust_epoch: TrustEpoch,
+    pub retired: bool,
+}
+
+impl fmt::Debug for MachineInventoryEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MachineInventoryEntry")
+            .field("relay_server", &self.relay_server_id.redacted())
+            .field("machine", &self.machine_route.redacted())
+            .field("root_fingerprint", &"<redacted>")
+            .field("trust_epoch", &self.trust_epoch.value())
+            .field("retired", &self.retired)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct MachineInventoryPage {
+    pub entries: Vec<MachineInventoryEntry>,
+    pub next_after: Option<MachineRouteId>,
+}
+
+impl fmt::Debug for MachineInventoryPage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MachineInventoryPage")
+            .field("entry_count", &self.entries.len())
+            .field("has_next", &self.next_after.is_some())
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct MachineReadback {
+    pub machine: MachineInventoryEntry,
+    pub data: PurgeReadback,
+}
+
+impl fmt::Debug for MachineReadback {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MachineReadback")
+            .field("machine", &self.machine)
+            .field("data", &self.data)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct MachineReadbackQuery {
+    pub machine_route: MachineRouteId,
+    pub expected_root_fingerprint: [u8; 32],
+}
+
+impl fmt::Debug for MachineReadbackQuery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MachineReadbackQuery")
+            .field("machine", &self.machine_route.redacted())
+            .field("root_fingerprint", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -893,7 +1041,7 @@ pub struct RetirementCommit {
     pub duplicate: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct PurgeReadback {
     pub active_machine_routes: u64,
     pub retired_tombstones: u64,
@@ -904,6 +1052,26 @@ pub struct PurgeReadback {
     pub subscriptions: u64,
     pub retirement_hash: Option<[u8; 32]>,
     pub retirement_terminal_blob: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for PurgeReadback {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PurgeReadback")
+            .field("active_machine_routes", &self.active_machine_routes)
+            .field("retired_tombstones", &self.retired_tombstones)
+            .field("device_grants", &self.device_grants)
+            .field("revocations", &self.revocations)
+            .field("streams", &self.streams)
+            .field("frames", &self.frames)
+            .field("subscriptions", &self.subscriptions)
+            .field("has_retirement_hash", &self.retirement_hash.is_some())
+            .field(
+                "has_retirement_terminal",
+                &self.retirement_terminal_blob.is_some(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

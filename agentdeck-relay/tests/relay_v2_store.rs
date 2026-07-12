@@ -25,15 +25,15 @@ use agentdeck_protocol::relay_v2::{
 };
 use agentdeck_relay::v2::store::{
     Clock, DiskSpace, DiskSpaceProbe, EnrollmentCodeSeed, FaultInjector, FaultPoint,
-    InstallGrantRecord, MetadataLimits, PersistAck, PersistPublish, PersistRevocation,
-    PersistSubscription, PersistUnsubscribe, PublishDisposition, PurgeMachine, RegisterMachine,
-    RelayStoreHandle, RelayV2StoreConfig, ReplayPageRequest, ReplayPosition, RetentionLimits,
-    StoreError, StoreSnapshot, StreamRegistration,
+    InstallGrantRecord, MAX_MACHINE_INVENTORY_PAGE, MachineInventoryQuery, MachineReadbackQuery,
+    MetadataLimits, PersistAck, PersistPublish, PersistRevocation, PersistSubscription,
+    PersistUnsubscribe, PublishDisposition, PurgeMachine, RegisterMachine, RelayStoreHandle,
+    RelayV2StoreConfig, ReplayPageRequest, ReplayPosition, RetentionLimits, StoreError,
+    StoreSnapshot, StreamRegistration,
 };
 #[cfg(unix)]
 use fs2::FileExt;
 use rusqlite::{Connection, OpenFlags, params};
-#[cfg(unix)]
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
@@ -396,6 +396,10 @@ fn register_machine_request(seed: u8) -> RegisterMachine {
         link_cert_hash: [seed.wrapping_add(4); 32],
         data_cert_hash: [seed.wrapping_add(5); 32],
     }
+}
+
+fn machine_root_fingerprint(seed: u8) -> [u8; 32] {
+    Sha256::digest([seed.wrapping_add(3); 32]).into()
 }
 
 fn relay_grant(machine_seed: u8, device_seed: u8, serial: u64) -> RelayGrant {
@@ -1370,6 +1374,56 @@ async fn enrollment_consumption_and_machine_insert_are_atomic_and_exact_retry_is
         .await
         .expect_err("same code with a different request hash must conflict");
     assert!(matches!(error, StoreError::EnrollmentCodeConflict));
+
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn expired_certificate_rejects_first_consumption_but_does_not_break_frozen_exact_retry() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let clock = Arc::new(MutableClock::new(NOW_MS));
+    let store = RelayStoreHandle::open(fixed_config(&path).with_clock(clock.clone()))
+        .await
+        .expect("open store");
+    store
+        .seed_enrollment_code(enrollment_seed(0x18))
+        .await
+        .expect("seed enrollment code");
+    let mut request = register_machine_request(0x18);
+    request.link_cert.not_after_ms = Some(NOW_MS + 1);
+    request.data_cert.not_after_ms = Some(NOW_MS + 1);
+    let first = store
+        .register_machine(request.clone())
+        .await
+        .expect("consume while certificate is valid");
+
+    clock.set(NOW_MS + 2);
+    let retry = store
+        .register_machine(request)
+        .await
+        .expect("consumed exact request replays frozen response after certificate expiry");
+    assert!(retry.duplicate);
+    assert_eq!(retry.response_blob, first.response_blob);
+    assert_eq!(retry.receipt_hash, first.receipt_hash);
+
+    store
+        .seed_enrollment_code(enrollment_seed(0x19))
+        .await
+        .expect("seed second enrollment code");
+    let mut expired_first = register_machine_request(0x19);
+    expired_first.link_cert.not_after_ms = Some(NOW_MS + 1);
+    expired_first.data_cert.not_after_ms = Some(NOW_MS + 1);
+    let rejected = store
+        .register_machine(expired_first)
+        .await
+        .expect_err("expired first consumption must reject without inserting a route");
+    assert!(matches!(
+        rejected,
+        StoreError::AuthenticationMismatch {
+            field: "register_machine.certificate_expiry"
+        }
+    ));
 
     store.shutdown().await.expect("shutdown store");
 }
@@ -3107,6 +3161,7 @@ async fn purge_machine_retires_route_and_reads_back_all_active_data_empty() {
     let readback = store
         .purge_machine(PurgeMachine {
             machine_route: machine_route(0x2b),
+            expected_root_fingerprint: machine_root_fingerprint(0x2b),
         })
         .await
         .expect("purge machine");
@@ -3118,6 +3173,151 @@ async fn purge_machine_retires_route_and_reads_back_all_active_data_empty() {
     assert_eq!(readback.frames, 0);
     assert_eq!(readback.subscriptions, 0);
 
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn machine_inventory_is_bounded_paginated_and_readback_is_exact() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let store = RelayStoreHandle::open(fixed_config(&path))
+        .await
+        .expect("open store");
+    for seed in [0x31, 0x32, 0x33] {
+        seed_and_register(&store, seed).await;
+    }
+    register_fixture_stream(&store, 0x31, 0x41).await;
+    store
+        .publish(publish_request(0x31, 0x41, 0, 0x51))
+        .await
+        .expect("publish readback fixture");
+
+    let first = store
+        .machine_inventory(MachineInventoryQuery {
+            after: None,
+            limit: 2,
+        })
+        .await
+        .expect("first inventory page");
+    assert_eq!(first.entries.len(), 2);
+    let cursor = first.next_after.expect("more inventory rows");
+    let second = store
+        .machine_inventory(MachineInventoryQuery {
+            after: Some(cursor),
+            limit: 2,
+        })
+        .await
+        .expect("second inventory page");
+    assert_eq!(second.entries.len(), 1);
+    assert!(second.next_after.is_none());
+    assert!(first.entries.iter().all(|entry| !entry.retired));
+
+    let readback = store
+        .machine_readback(MachineReadbackQuery {
+            machine_route: machine_route(0x31),
+            expected_root_fingerprint: machine_root_fingerprint(0x31),
+        })
+        .await
+        .expect("active machine readback");
+    assert_eq!(
+        readback.machine.root_fingerprint,
+        machine_root_fingerprint(0x31)
+    );
+    assert_eq!(readback.data.active_machine_routes, 1);
+    assert_eq!(readback.data.retired_tombstones, 0);
+    assert_eq!(readback.data.streams, 1);
+    assert_eq!(readback.data.frames, 1);
+
+    let invalid_limit = store
+        .machine_inventory(MachineInventoryQuery {
+            after: None,
+            limit: MAX_MACHINE_INVENTORY_PAGE + 1,
+        })
+        .await
+        .expect_err("inventory page must have a hard bound");
+    assert!(matches!(
+        invalid_limit,
+        StoreError::InvalidValue {
+            field: "machine_inventory.limit",
+            ..
+        }
+    ));
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn purge_compares_root_fingerprint_inside_the_transaction_before_any_write() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let store = RelayStoreHandle::open(fixed_config(&path))
+        .await
+        .expect("open store");
+    seed_and_register(&store, 0x34).await;
+    register_fixture_stream(&store, 0x34, 0x44).await;
+    store
+        .publish(publish_request(0x34, 0x44, 0, 0x54))
+        .await
+        .expect("publish fingerprint fixture");
+    let before = store
+        .machine_readback(MachineReadbackQuery {
+            machine_route: machine_route(0x34),
+            expected_root_fingerprint: machine_root_fingerprint(0x34),
+        })
+        .await
+        .expect("pre-purge readback");
+    let wrong_readback = store
+        .machine_readback(MachineReadbackQuery {
+            machine_route: machine_route(0x34),
+            expected_root_fingerprint: [0xff; 32],
+        })
+        .await
+        .expect_err("readback must bind the same confirmed root fingerprint");
+    assert!(matches!(
+        wrong_readback,
+        StoreError::RootFingerprintMismatch
+    ));
+
+    let wrong = store
+        .purge_machine(PurgeMachine {
+            machine_route: machine_route(0x34),
+            expected_root_fingerprint: [0xff; 32],
+        })
+        .await
+        .expect_err("wrong root fingerprint must reject purge");
+    assert!(matches!(wrong, StoreError::RootFingerprintMismatch));
+    assert_eq!(
+        store
+            .machine_readback(MachineReadbackQuery {
+                machine_route: machine_route(0x34),
+                expected_root_fingerprint: machine_root_fingerprint(0x34),
+            })
+            .await
+            .expect("wrong confirmation is zero-write"),
+        before
+    );
+
+    let purged = store
+        .purge_machine(PurgeMachine {
+            machine_route: machine_route(0x34),
+            expected_root_fingerprint: machine_root_fingerprint(0x34),
+        })
+        .await
+        .expect("matching root fingerprint purges");
+    assert_eq!(purged.active_machine_routes, 0);
+    assert_eq!(purged.retired_tombstones, 1);
+    assert_eq!(purged.frames, 0);
+    let retired = store
+        .machine_readback(MachineReadbackQuery {
+            machine_route: machine_route(0x34),
+            expected_root_fingerprint: machine_root_fingerprint(0x34),
+        })
+        .await
+        .expect("retired readback");
+    assert!(retired.machine.retired);
+    assert_eq!(
+        retired.machine.root_fingerprint,
+        machine_root_fingerprint(0x34)
+    );
     store.shutdown().await.expect("shutdown store");
 }
 
@@ -3611,6 +3811,7 @@ async fn projected_disk_reserve_uses_max_of_absolute_and_percent_but_control_wri
     let purged = store
         .purge_machine(PurgeMachine {
             machine_route: machine_route(0x58),
+            expected_root_fingerprint: machine_root_fingerprint(0x58),
         })
         .await
         .expect("purge remains available under disk-low");
@@ -4576,6 +4777,7 @@ async fn purge_before_commit_fault_preserves_machine_then_retry_removes_everythi
         .expect("publish purge fixture");
     let request = PurgeMachine {
         machine_route: machine_route(0x86),
+        expected_root_fingerprint: machine_root_fingerprint(0x86),
     };
 
     let error = store

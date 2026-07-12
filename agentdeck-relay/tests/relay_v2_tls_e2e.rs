@@ -358,6 +358,7 @@ fn server_config(temp: &TempDir) -> (RelayV2ServerConfig, PathBuf) {
                 cert: fixture("test_cert.pem"),
                 key: fixture("test_key.pem"),
             }),
+            admin: None,
             log_level: "info".to_owned(),
         },
         storage_path,

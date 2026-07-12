@@ -26,8 +26,9 @@ use super::verify::{
     AuthenticationService, PreparedTerminal,
 };
 use crate::v2::store::{
-    GrantCommit, MAX_CONTROL_BLOB_BYTES, MachineRecord, RegisterMachine, RelayStoreHandle,
-    RetirementCommit, RevocationCommit, StoreError,
+    EnrollmentCodeSeed, GrantCommit, MAX_CONTROL_BLOB_BYTES, MachineRecord, PurgeMachine,
+    PurgeReadback, RegisterMachine, RelayStoreHandle, RetirementCommit, RevocationCommit,
+    StoreError,
 };
 
 const AUTHORIZATION_COMMAND_CAPACITY: usize = 256;
@@ -288,6 +289,22 @@ impl AuthorizationCoordinator {
             .await
     }
 
+    pub async fn seed_enrollment_code(
+        &self,
+        request: EnrollmentCodeSeed,
+    ) -> Result<(), StoreError> {
+        self.dispatch_store(|reply| AuthorizationCommand::SeedEnrollmentCode { request, reply })
+            .await
+    }
+
+    pub async fn purge_machine_admin(
+        &self,
+        request: PurgeMachine,
+    ) -> Result<AuthorizationMutation<PurgeReadback>, StoreError> {
+        self.dispatch_store(|reply| AuthorizationCommand::PurgeMachineAdmin { request, reply })
+            .await
+    }
+
     pub async fn install_grant_from(
         &self,
         origin: AccessContext,
@@ -457,6 +474,14 @@ enum AuthorizationCommand {
         request: RegisterMachine,
         reply: oneshot::Sender<Result<AuthorizationMutation<MachineRecord>, StoreError>>,
     },
+    SeedEnrollmentCode {
+        request: EnrollmentCodeSeed,
+        reply: oneshot::Sender<Result<(), StoreError>>,
+    },
+    PurgeMachineAdmin {
+        request: PurgeMachine,
+        reply: oneshot::Sender<Result<AuthorizationMutation<PurgeReadback>, StoreError>>,
+    },
     InstallGrantFrom {
         origin: AccessContext,
         grant: RelayGrant,
@@ -520,6 +545,22 @@ async fn run(
                     Err(StoreError::WorkerUnavailable)
                 } else {
                     register_machine(&service, &active, &lifecycle, request).await
+                };
+                let _ = reply.send(result);
+            }
+            AuthorizationCommand::SeedEnrollmentCode { request, reply } => {
+                let result = if draining {
+                    Err(StoreError::WorkerUnavailable)
+                } else {
+                    service.seed_enrollment_code(request).await
+                };
+                let _ = reply.send(result);
+            }
+            AuthorizationCommand::PurgeMachineAdmin { request, reply } => {
+                let result = if draining {
+                    Err(StoreError::WorkerUnavailable)
+                } else {
+                    purge_machine_admin(&service, &active, &lifecycle, request).await
                 };
                 let _ = reply.send(result);
             }
@@ -657,6 +698,44 @@ async fn register_machine(
                 commit,
                 invalidated_connections: connections,
             })
+        }
+        Err(error) => {
+            active
+                .abort_machine_transition(&transitions)
+                .map_err(|_| StoreError::WorkerUnavailable)?;
+            Err(error)
+        }
+    }
+}
+
+async fn purge_machine_admin(
+    service: &AuthenticationService,
+    active: &ActiveConnectionRegistry,
+    lifecycle: &LifecycleSink,
+    request: PurgeMachine,
+) -> Result<AuthorizationMutation<PurgeReadback>, StoreError> {
+    let transitions = active
+        .begin_machine_transition(request.machine_route)
+        .map_err(|_| StoreError::WorkerUnavailable)?;
+    match service.purge_machine_admin(request).await {
+        Ok(commit) => {
+            let connections = active
+                .complete_machine_invalidation(&transitions)
+                .map_err(|_| StoreError::WorkerUnavailable)?;
+            emit_invalidated(active, lifecycle, &connections)?;
+            Ok(AuthorizationMutation {
+                commit,
+                invalidated_connections: connections,
+            })
+        }
+        Err(error @ StoreError::CommitOutcomeUnknown { .. }) => {
+            let connections = active
+                .complete_machine_invalidation(&transitions)
+                .map_err(|_| StoreError::WorkerUnavailable)?;
+            // SQLite COMMIT 可能已经完成。此时绝不能恢复旧 generation：让 emergency
+            // lifecycle 停止整个 Core，PairRoute 与 writer 都随之 fail-closed。
+            trigger_fail_closed(active, lifecycle, &connections);
+            Err(error)
         }
         Err(error) => {
             active

@@ -1620,8 +1620,8 @@ async fn purge_after_commit_loss_never_restores_machine_or_pair_route_and_replay
     );
     assert_eq!(
         fixture.fault.matching_checks(),
-        1,
-        "exact retry must read one retired tombstone instead of purging twice"
+        2,
+        "exact retry reads the retired tombstone and crosses the same response-loss boundary once more"
     );
     assert!(
         !fixture

@@ -7,6 +7,8 @@ use agentdeck_relay::config::RelayV2TlsPaths;
 use agentdeck_relay::config::{
     RelayV2ConfigError, RelayV2ServerConfig, RelayV2StoreSettings, RelayV2TransportMode,
 };
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 fn env(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
     entries
@@ -275,6 +277,7 @@ fn manually_constructed_server_config_cannot_bypass_transport_or_health_gates() 
         health_bind: "127.0.0.1:8444".parse().unwrap(),
         store: RelayV2StoreSettings::new(temp.path().join("relay.db")),
         transport: RelayV2TransportMode::InsecureLoopback,
+        admin: None,
         log_level: "info".to_owned(),
     };
     base.validate().expect("valid manual loopback config");
@@ -321,6 +324,7 @@ fn manually_constructed_direct_tls_requires_tls_feature() {
             cert: PathBuf::from("/tmp/cert.pem"),
             key: PathBuf::from("/tmp/key.pem"),
         }),
+        admin: None,
         log_level: "info".to_owned(),
     };
     let error = config
@@ -558,4 +562,156 @@ fn invalid_env_and_unknown_toml_fields_fail_instead_of_falling_back() {
         unknown,
         RelayV2ConfigError::ConfigFileParse { .. }
     ));
+}
+
+#[test]
+fn admin_configuration_is_atomic_strict_and_requires_a_secure_transport_mode() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let socket = temp.path().join("relay-admin.sock");
+    let pin = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+    let complete = load(
+        &[
+            "agentdeck-relay",
+            "--proxy-mode",
+            "--admin-socket",
+            socket.to_str().unwrap(),
+            "--public-wss-url",
+            "wss://relay.example.test/",
+            "--spki-pin",
+            &pin,
+        ],
+        &BTreeMap::new(),
+        temp.path(),
+    )
+    .expect("complete proxy admin config");
+    let admin = complete.admin.expect("admin enabled");
+    assert_eq!(admin.socket_path, socket);
+    assert_eq!(admin.public_wss_url, "wss://relay.example.test/");
+    assert_eq!(admin.spki_pins, vec![[7; 32]]);
+
+    let partial = load(
+        &[
+            "agentdeck-relay",
+            "--proxy-mode",
+            "--admin-socket",
+            temp.path().join("partial.sock").to_str().unwrap(),
+        ],
+        &BTreeMap::new(),
+        temp.path(),
+    )
+    .expect_err("partial admin group fails closed");
+    assert!(matches!(partial, RelayV2ConfigError::AdminPartial));
+
+    let insecure = load(
+        &[
+            "agentdeck-relay",
+            "--allow-insecure-loopback",
+            "--admin-socket",
+            temp.path().join("insecure.sock").to_str().unwrap(),
+            "--public-wss-url",
+            "wss://relay.example.test/",
+            "--spki-pin",
+            &pin,
+        ],
+        &BTreeMap::new(),
+        temp.path(),
+    )
+    .expect_err("plaintext development listener cannot expose enrollment");
+    assert!(matches!(
+        insecure,
+        RelayV2ConfigError::AdminRequiresSecureTransport
+    ));
+}
+
+#[test]
+fn admin_url_and_pin_parser_rejects_ambiguous_or_malformed_values() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let socket = temp.path().join("relay-admin.sock");
+    let pin = URL_SAFE_NO_PAD.encode([9_u8; 32]);
+    for invalid_url in [
+        "ws://relay.example.test/",
+        "wss://user@relay.example.test/",
+        "wss://relay.example.test/v2",
+        "wss://relay.example.test/?secret=1",
+    ] {
+        let error = load(
+            &[
+                "agentdeck-relay",
+                "--proxy-mode",
+                "--admin-socket",
+                socket.to_str().unwrap(),
+                "--public-wss-url",
+                invalid_url,
+                "--spki-pin",
+                &pin,
+            ],
+            &BTreeMap::new(),
+            temp.path(),
+        )
+        .expect_err("invalid public WSS URL");
+        assert!(matches!(
+            error,
+            RelayV2ConfigError::AdminInvalid {
+                field: "public_wss_url"
+            }
+        ));
+    }
+
+    let malformed = load(
+        &[
+            "agentdeck-relay",
+            "--proxy-mode",
+            "--admin-socket",
+            socket.to_str().unwrap(),
+            "--public-wss-url",
+            "wss://relay.example.test/",
+            "--spki-pin",
+            "AA",
+        ],
+        &BTreeMap::new(),
+        temp.path(),
+    )
+    .expect_err("pin must decode to exactly 32 bytes");
+    assert!(matches!(
+        malformed,
+        RelayV2ConfigError::AdminInvalid { field: "spki_pins" }
+    ));
+}
+
+#[test]
+fn admin_fields_follow_cli_over_env_over_toml_per_field() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config_path = temp.path().join("relay.toml");
+    let file_pin = URL_SAFE_NO_PAD.encode([0x11_u8; 32]);
+    let env_pin = URL_SAFE_NO_PAD.encode([0x22_u8; 32]);
+    std::fs::write(
+        &config_path,
+        format!(
+            "proxy_mode = true\nadmin_socket = {:?}\npublic_wss_url = \"wss://file.example.test/\"\nspki_pins = [{:?}]\n",
+            temp.path().join("file.sock"),
+            file_pin,
+        ),
+    )
+    .expect("write admin config");
+    let cli_socket = temp.path().join("cli.sock");
+    let environment = env(&[
+        ("AGENTDECK_RELAY_PUBLIC_WSS_URL", "wss://env.example.test/"),
+        ("AGENTDECK_RELAY_SPKI_PINS", &env_pin),
+    ]);
+    let config = load(
+        &[
+            "agentdeck-relay",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--admin-socket",
+            cli_socket.to_str().unwrap(),
+        ],
+        &environment,
+        temp.path(),
+    )
+    .expect("admin fields merge independently");
+    let admin = config.admin.expect("admin config");
+    assert_eq!(admin.socket_path, cli_socket);
+    assert_eq!(admin.public_wss_url, "wss://env.example.test/");
+    assert_eq!(admin.spki_pins, vec![[0x22; 32]]);
 }

@@ -353,6 +353,31 @@ Store shutdown 成功回执只允许在 SQLite connection、OS 排他锁与进�
 public key/signature、terminal/sealed bytes或输入 sentinel 出现在日志中均是安全回归。P2.6 的
 真实 SIGTERM 子进程测试和 positive-event sentinel scan 命令见 `docs/QUALITY.md`。
 
+## Relay v2 Admin / machine enrollment 诊断（Companion MVP P2.7）
+
+admin、inventory、readback 与 purge 只存在于 Relay host 本机 UDS；公网只允许
+`POST /v2/machine-enroll`。操作步骤见 `RELAY_RUNBOOK.md`。production listener 尚未在 P2.9
+切换，因此 library/E2E 通过不能描述为现网 enrollment 已可用。
+
+| code | 含义 | 下一步 |
+| --- | --- | --- |
+| `relay.admin.config_partial` | socket、WSS origin、SPKI pins 最终配置不完整 | 按 CLI > env > TOML 逐字段核对三项 |
+| `relay.admin.secure_transport_required` | insecure loopback 尝试启用 admin | 改为 direct TLS 或可信 proxy loopback；禁止降级 |
+| `relay.admin.config_invalid` | socket非绝对路径、WSS origin或pin集合无效 | 修正绝对路径、纯 `wss://` origin和1–2个32-byte base64url pin |
+| `relay.tls.spki_pin_mismatch` | 配置第一 pin 与当前 leaf DER SPKI 不同 | 停止启动并核对证书轮换，不要跳过 pin |
+| `relay.admin.socket_parent_insecure` | socket父目录owner/mode不安全 | 使用Relay用户持有的0700目录 |
+| `relay.admin.socket_in_use` | socket活跃或无法安全证明stale | 查原进程；不得删除活跃pathname |
+| `relay.admin.peer_forbidden` | UDS peer不是Relay运行UID | 切到配置owner执行 |
+| `relay.admin.request_too_large` | JSONL超过64 KiB | 修复调用方；不要调大无界 |
+| `relay.store.confirmation_mismatch` | route的root fingerprint与确认值不一致 | 从可信receipt/inventory重新人工核对 |
+| `relay.enrollment.request_invalid` | JSON结构或body无效 | 生成严格V1请求，body必须≤64 KiB |
+| `relay.enrollment.rejected` | code、证书、公钥、签名或幂等请求不合法 | 修复未消费的请求；code失效/冲突时重新创建bundle |
+
+MachineRoot 丢失不进入恢复模式：daemon保持remote blocked，本机管理员执行带旧fingerprint的
+purge，再以同fingerprint readback确认active/grant/revocation/stream/frame/subscription全为0、
+只剩一个retired tombstone，之后重新enroll与重新配对。COMMIT结果不确定会让整个Core
+fail-closed；若仍观察到旧writer或PairRoute，这是P0级安全回归。
+
 ## Failure Codes
 
 | code | 含义 | 下一步 |

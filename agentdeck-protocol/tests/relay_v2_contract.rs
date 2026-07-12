@@ -742,6 +742,49 @@ fn enrollment_request_and_response_have_exact_fields() {
     assert_eq!(back, resp);
 }
 
+#[test]
+fn enrollment_request_has_independent_canonical_bytes_and_redacted_debug() {
+    let request = MachineEnrollmentRequestV1 {
+        code: EnrollmentCode([0x01; 32]),
+        machine_route: mr(),
+        root_pubkey: pk(),
+        link_cert: cert(),
+        data_cert: SignedCertificate {
+            cert_role: CertRole::Data,
+            ..cert()
+        },
+    };
+    let canonical = request.canonical_bytes();
+    assert_eq!(canonical.len(), 565);
+    assert_eq!(
+        hex(&request.canonical_sha256()),
+        "a863fa934c79e81f6e84a9376af41afb15983211d19651e0535c187fe19bae4c",
+        "deterministic enrollment request hash golden drifted"
+    );
+    assert_eq!(request.canonical_sha256(), request.canonical_sha256());
+
+    let mut changed = request.clone();
+    changed.machine_route = MachineRouteId::from_bytes([0x12; 16]);
+    assert_ne!(changed.canonical_sha256(), request.canonical_sha256());
+    changed = request.clone();
+    changed.code = EnrollmentCode([0x02; 32]);
+    assert_ne!(changed.canonical_sha256(), request.canonical_sha256());
+    changed = request.clone();
+    changed.root_pubkey = PublicKeyBytes([0x03; 32]);
+    assert_ne!(changed.canonical_sha256(), request.canonical_sha256());
+    changed = request.clone();
+    changed.link_cert.signature = Ed25519Signature([0x04; 64]);
+    assert_ne!(changed.canonical_sha256(), request.canonical_sha256());
+    changed = request.clone();
+    changed.data_cert.signature = Ed25519Signature([0x05; 64]);
+    assert_ne!(changed.canonical_sha256(), request.canonical_sha256());
+
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("1, 1, 1"));
+    assert!(!debug.contains("machine_route"));
+    assert!(format!("{:?}", request.code).contains("redacted"));
+}
+
 // —— 每个 family 的固定字节 fixture（为 P1.7 Swift 逐字节镜像准备）——
 
 const GOLDEN_HELLO: &str = "4144525632000200000002";
