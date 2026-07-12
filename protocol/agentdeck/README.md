@@ -18,11 +18,11 @@ daemon、不建 transport**（P1.3）。`protocol` 命令组的 dispatch 发生�
 `Client`/连接 daemon 之前，`agentdeck-cli/tests/protocol_schema_exports.rs`
 在一个 daemon 必然探测不到的沙盒环境里验证了这一点。
 
-`crate::remote`（Relay v1 草案 namespace，`RELAY_PROTOCOL_VERSION = 1`，与
-`relay_v2` 的 `RELAY_PROTOCOL_VERSION = 2` 是两个不同模块里的同名常量、彼此
-不联动）本身继续编译、继续跑自己的行为测试（R0/R1a/R1b），但 P1.3 起不再
-出现在任何一份聚合 schema 快照里——它不是这四条版本轴中的任何一条，也不会
-冒充其中之一。
+Relay v1 草案的 `crate::remote` namespace、schema、server/client 与行为测试已在
+P2.9 物理删除；当前只存在表中的 Relay v2 版本轴。公开 HTTP `/v1/connect`
+只保留无状态 426 tombstone，不升级 WebSocket、不进入 Auth/Core/Store，也不构成
+可协商协议版本。R0/R1 文档和 git 历史只能用于理解迁移背景，不能作为当前 schema
+或兼容接口使用。
 
 ## actionDecision 线形态（非 typed 结构，故不在本地 IPC schema）
 `{ "kind": "actionDecision", "id": <u64>, "sessionId": <string>,

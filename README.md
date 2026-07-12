@@ -205,62 +205,49 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（P2.8）
+## Relay Companion MVP 实施状态（P2.10）
 
-P0 已冻结既有 Relay v1 行为并建立实施门禁；P2.1–P2.8 已并列完成 Relay v2 SQLite
-store、challenge/auth、stream core、内存 PairRoute、在线 Send/Reply，以及 root-signed
-grant/revoke/machine retirement 和 TLS server lifecycle library contract。
-PairRoute 默认受每 machine 8、全局 1,024、每 route 32 frames / 1 MiB / 300 秒及独立
-token bucket 约束；Send/Reply 只投递 current bounded writer，不建离线队列或 `req_origin`。
-Revoke/Retire 先建立 authorization transition fence，再执行 SQLite COMMIT；COMMIT 后普通
-queue 被独立单槽 terminal 取代，flush 或最多 2 秒关闭。有效旧 DeviceSign/MachineLink proof
-在重启后只会读回逐字节相同的 terminal，不会重新激活 route；machine purge 逐表读回 active
-grant/subscription/stream/frame 均为空，只保留最小 retired trust tombstone。MachineLink、
-Install/Revoke/Retire 的 COMMIT 回执丢失时 Store 以同一 canonical request 做一次精确幂等恢复，
-仍不确定则保持 target/整机 fail-closed；
-production coordinator 不再暴露未验签的 raw grant/revoke/purge 入口。device route 元数据同时受
-每 machine 256、全局 65,536 的启动与运行时硬上限约束。
-P2.6 的公开 listener 只接受 canonical binary v2 frame，WebSocket message/frame 都在
-4 MiB 上界拒绝 text/oversize；非 loopback 必须在 bind 前验证 TLS certificate/key，缺少
-`tls` feature、证书私钥不匹配或配置不完整均 fail-closed。明文只允许显式选择 loopback
-开发模式，反向代理模式也只能监听 loopback。公开端从 TCP accept 起同时受 1,024 个物理连接、
-5 秒 TLS+完整 HTTP header+成功 101 upgrade deadline 和 64 KiB header 上界约束；只有成功
-WebSocket 才解除 deadline 并把 permit 持有到真正关闭，全部非 101 响应强制
-`Connection: close`，慢握手、慢 header 或普通 HTTP keep-alive 都不能绕过 Core 上界。proxy 模式要求可信反代删除客户端
-传入的 `x-agentdeck-client-ip` 后，以实际 TCP peer IP 覆写且只传一个 canonical IP 值；backend
-必须保持 loopback，主机上的本地进程属于同一受信部署边界。`healthz`/`readyz` 位于独立 loopback listener，
-readiness 只读取周期探针缓存，HTTP 洪泛不会进入 Store actor；磁盘 reserve、Store 不可用或
-drain 时返回 typed not-ready。SIGTERM/取消统一执行：停止 accept、向已登记 writer 发送
-`ServerRestarting`、网络最多 drain 5 秒，再确定性回收 Core/Auth/Store。Store 同时持有同目录
-`<db>.agentdeck.lock` 的 OS 排他锁，Store shutdown 回执只能在连接、OS 锁和进程内 lease 均已
-释放后返回，server 退出后才允许另一个进程打开同一 DB。
-P2.7 增加 Relay host 本机 0600、同 UID 的有界 JSONL admin UDS；同 binary 提供
-`machine-enroll create`、`machine inventory`、带 root fingerprint 确认的 `machine readback`
-和 `machine purge`。一次性 enrollment code 为 256 bit、5 分钟 TTL，SQLite 只保存 hash；
-公网仅新增无 redirect、body 不超过 64 KiB 的 `POST /v2/machine-enroll`。请求在消费 code 前
-完成 MachineRoot、link/data cert role、Ed25519 public key 与 root signature 校验；code 消费、
-machine insert、canonical request hash、冻结 response/receipt 在同一 transaction 提交，重试
-逐字节返回相同响应。direct TLS bundle 第一 SPKI pin 必须与实际 leaf DER SPKI 相等；inventory、
-readback、purge 仍完全不进入网络 listener。root-lost purge 在 Core FIFO 中裁决，错误 fingerprint
-零写入，COMMIT 不确定则全 Core fail-closed。操作命令与边界见
+Relay production binary 已原子切换到 **Relay v2**。公开数据面只接受
+`/v2/connect`、`/v2/pair` 与 enrollment 所需的 `POST /v2/machine-enroll`；
+Relay v1 的协议、server、client、daemon bridge 与测试源码已经物理删除。
+`/v1/connect` 只保留无状态 HTTP 426 tombstone：不升级 WebSocket，不进入鉴权、
+Core 或 Store，也不存在 v1 兼容 feature 或自动降级路径。R0/R1 文档仅记录历史
+探索与迁移依据，不代表当前可执行接口。
+
+生产部署只使用 Direct TLS/WSS。证书、hostname/CA 与配置 SPKI pin 必须在发送
+enrollment code、MachineRoot 或任何密文前全部验证通过；loopback 明文和 loopback
+proxy 都需要显式选择，只用于受控开发。公开 listener 只接收 canonical binary v2
+frame，并对连接数、握手/HTTP upgrade deadline、header、单帧/消息、队列与 ingress
+bytes 分层设硬上界。SQLite 由单 Store actor 串行写入，仅保存随机 route、公开
+trust material、单调元数据和 opaque sealed bytes；PairRoute、challenge、在线 writer
+与业务目录不落盘。授权变更、replay、quota、disk-low、Store fault 与 shutdown 都有
+fail-closed 门禁，慢连接只隔离自身。
+
+Relay host 的 machine 管理面只存在于同 UID、0600 的本机 JSONL admin UDS；
+`machine-enroll create`、`machine inventory`、fingerprint-bound `machine readback` 与
+`machine purge` 已可用。MachineRoot 丢失不做恢复：完成带 fingerprint 的 purge/readback
+后重新 enrollment、重新配对。具体配置与命令见
 [`docs/RELAY_RUNBOOK.md`](docs/RELAY_RUNBOOK.md)。
-P2.8 新增默认不依赖 Relay server/store 的 Rust v2 outbound client：principal 严格执行
-`Hello → Challenge → Authenticate → Authenticated`，重连使用 fresh challenge；pairing 使用独立
-`Hello → PairingHello → Authenticated` 状态机并只暴露 route-bound typed API；enrollment 在
-TLS/hostname/CA或SPKI pin验证成功前不发送code或MachineRoot材料。后台single reader自动回复heartbeat，
-应用、control、urgent与writer分别有界；send flush超时按outcome-unknown关闭当前generation，
-signed revoke/retire terminal保留canonical原字节。旧v1 client只在P2.9切换前通过非默认
-`v1-compat` feature供历史CLI/tests显式使用，默认normal依赖树不含`agentdeck-relay`、axum或rusqlite。
-这些能力尚未在 P2.9 原子切换生产 listener，也未接通 daemon/iOS，因此不能描述为公网
-Companion 已可用。当前统一 P0 回归入口仍按批准设计 §16.5 运行 Rust、Swift、iOS、网络、
-文档和 schema 基线门禁；P2.7/P2.8 专项门禁见 `docs/QUALITY.md`：
+
+`agentdeck remote synthetic --bundle FILE` 会连接一个真实、外部运行的 Direct TLS
+Relay，严格校验 CA/hostname/SPKI，并以临时 machine/device key 完成 enrollment、fresh
+challenge 鉴权、InstallGrant、register/publish/subscribe replay、Send/Reply、signed revoke
+以及终态重连验证。测试同时扫描 SQLite/outer wire，证明应用 sentinel 只以真实 AEAD 密文
+存在。这个命令不会建立持久配对；P4 完成前，`remote pair/machines/sessions/watch/send/...`
+统一返回 typed `remote.persistent.unsupported`。`agentdeckd` 仍由 no-net guard 保证不含
+网络依赖，因此 P2.10 不能被描述为 daemon/iOS Companion 已经接通。
+
+P2.10 的完整安全/故障门禁覆盖真实 Direct TLS/SPKI 链路、跨重启逐字节 replay、gap、
+quota、disk-low、fault injection、shutdown、撤销/退役和多 sentinel 持久化扫描。统一验证入口：
 
 ```bash
-bash scripts/verify-relay-companion-mvp.sh p0
+bash scripts/verify-relay-companion-mvp.sh p2
 ```
 
-Relay v1 开发状态与后续版本不兼容时，只能做显式 reset。先停止 Relay，再传入
-canonical absolute DB 与 bearer credential 文件路径：
+旧 Relay v1 开发状态不会被当前 production binary 读取、迁移、删除或用于拨号。
+CLI 对旧 credential marker 只做 `symlink_metadata` 存在性探测；存在、悬空 symlink
+或无法安全判定时都返回 `remote.v1.reset_required`。若要清理，必须先停止旧 Relay，
+再显式运行受控 reset：
 
 ```bash
 bash scripts/reset-relay-v1-dev-state.sh \
@@ -269,7 +256,7 @@ bash scripts/reset-relay-v1-dev-state.sh \
   --confirm DELETE-RELAY-V1-DEV-STATE
 ```
 
-脚本在第一次 unlink 前一次性验证四个精确删除路径、Relay v1 schema、credential
+只有该 reset 脚本拥有删除权限。它在第一次 unlink 前一次性验证四个精确删除路径、Relay v1 schema、credential
 canonical Base64（解码恰好 32 bytes）、DB 行关联和 unlink preflight（父目录权限、
 macOS immutable flags）；删除前任一 validation/preflight 失败都零删除。preflight
 之后 OS unlink 仍失败时可能部分删除：脚本非零退出、列出全部 remaining exact

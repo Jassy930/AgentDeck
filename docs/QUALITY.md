@@ -14,6 +14,7 @@ swift run AgentDeck -- --selfcheck --profile dev
 swift run AgentDeck -- --diagnostics-report --json --profile dev
 scripts/verify-agent-docs.sh
 bash scripts/verify-relay-companion-mvp.sh p0
+bash scripts/verify-relay-companion-mvp.sh p2
 ```
 
 ## Relay Companion MVP P0 门禁
@@ -29,10 +30,14 @@ bash scripts/verify-relay-companion-mvp.sh p0
 bash scripts/tests/reset-relay-v1-dev-state.sh
 ```
 
-统一入口依次覆盖完整 Cargo、Relay server+TLS、R1b hardening、自检、Swift、
-iOS Simulator、daemon no-net、文档与 local IPC schema snapshot，并检查
+统一入口依次覆盖完整 Cargo、Relay v2 server+TLS 全矩阵、v2 配置自检、Swift、
+iOS Simulator、daemon no-net、文档与四份协议 schema snapshot，并检查
 `agentdeck-relay-data/` 不出现在 `git status --short`。真实 vendor、公网 WSS 和
 物理 iPhone 仍是后续 gated E2E，不属于 P0 通过声明。
+
+下面 P2.1–P2.8 小节保留的是各增量 task 当时的聚焦门禁。文中“与 v1 并列”或
+“尚未 cutover”只描述对应历史阶段；当前生产入口已经在 P2.9 原子切到 Relay v2，
+不得据此重新启用旧 listener、旧 protocol namespace 或 `v1-compat`。
 
 ## Relay Companion MVP P2.1 Store 门禁
 
@@ -409,14 +414,13 @@ timeout、其他错误或 inode 变化一律视为已有/不确定实例。
 把配置第一 pin 与真实 leaf DER SPKI SHA-256 比较；proxy 模式由可信部署显式提供一至两个 pin；
 insecure loopback 禁止 admin/enrollment。公网 unknown/admin path 固定 404，不 redirect。
 
-## Relay Companion MVP P2.8 Rust v2 client 门禁
+## Relay Companion MVP P2.8 Rust v2 client 门禁（历史 task，当前已 cutover）
 
-P2.8 仍通过临时非默认 `v1-compat` feature维持P2.9前的旧CLI/历史测试编译；默认client必须是
-纯outbound依赖树。改动WSS、TLS verifier、heartbeat、reconnect、enrollment或pairing API后运行：
+P2.8 产出的默认 client 是纯 outbound 依赖树。P2.9 已删除临时 `v1-compat` 和旧调用方；
+改动 WSS、TLS verifier、heartbeat、reconnect、enrollment 或 pairing API 后运行：
 
 ```bash
 cargo test -p agentdeck-relay-client -- --test-threads=1
-cargo test -p agentdeck-relay-client --features v1-compat --lib
 cargo test -p agentdeck-relay --features server,tls \
   --test relay_v2_tls_e2e -- --test-threads=1
 cargo test -p agentdeck-protocol --test e2ee_canonical_contract
@@ -438,6 +442,40 @@ challenge；signed revoke/retire terminal逐字节返回。active supervisor必�
 自动Pong不被15MiB data预算饿死；send进入sink后失败或flush超时都标记outcome-unknown并取消
 generation，stalled child在join deadline后abort而非detach。PairingClient没有raw principal send，
 close ACK走urgent槽，所有PairingEvent与PairInvite/PairRequest Debug都脱敏。
+
+## Relay Companion MVP P2 完整阶段门禁
+
+P2.9 已把生产 binary、CLI synthetic 和依赖面原子切到 Relay v2；P2.10 用一条
+可机械执行的阶段门禁组合所有专项 suite。该入口只证明本机真实 DirectTLS、SQLite、
+协议和故障边界，不把 loopback 证据描述为公网或物理 Companion 验收：
+
+```bash
+bash scripts/verify-relay-companion-mvp.sh p2
+```
+
+入口会运行完整 workspace、`agentdeck-relay --features server,tls` 全矩阵、两个阶段级
+组合测试、outbound client、真实 CLI DirectTLS/SPKI synthetic、Relay v2 config selfcheck、
+daemon no-net、四份 schema、文档门禁、依赖边界与 v1 生产符号扫描。完整故障矩阵由以下
+测试共同承担，不能把新建的单个 hardening 文件写成全部证据：
+
+- `relay_v2_store`：COMMIT 前回滚、COMMIT 后响应丢失的逐字节重试、restart、quota、gap、disk-low。
+- `relay_v2_auth_e2e`：challenge 并发竞态、generation/serial 单调性、伪造或跨 machine grant 拒绝。
+- `relay_v2_stream_e2e`：replay/live barrier、慢 reader 隔离、bounded writer 与 reconnect。
+- `relay_v2_revocation_e2e`：signed revoke/retire terminal、commit-unknown、重启后逐字节 terminal replay。
+- `relay_v2_lifecycle_e2e`：生产 SIGTERM adapter、硬 drain 上界与 Store lock 释放。
+- `relay_v2_tls_e2e`：真实 WSS、证书/SPKI pin、拒绝日志脱敏和 TLS 生命周期。
+- `relay_v2_hardening_e2e`：restart byte-identical replay、disk-low 恢复、精确 quota gap、
+  PublishBeforeCommit fault 与 DirectTLS server 同库重启的阶段组合链。
+- `relay_v2_security_e2e`：endpoint 六类 sentinel 经真实 AEAD+签名后走生产
+  DirectTLS/WSS Challenge、Authenticate、RegisterStream、Publish/Core；扫描 outer、响应、
+  tracing、`healthz/readyz`、固定 404 的 `/metrics` surface、SQLite DB/WAL，输出
+  `0 plaintext matches`，并证明 ciphertext 可 SQL 读回和重启 replay。
+- `remote_v2_synthetic`：外部 CLI 进程连接真实 DirectTLS/SPKI Relay，完成 enrollment、
+  machine/device auth、grant、publish/replay、Send/Reply 和 signed revoke。
+
+`agentdeck-cli` 与 `agentdeck-relay-client` 的 normal dependency tree 不得出现
+`agentdeck-relay` server、axum 或 rusqlite。`DataEnvelope::Plaintext`、`bootstrap_secret`、
+`RelayCredentials`、`FakeRelay`、`req_origin` 任一旧生产符号命中均使门禁失败。
 
 ## AppKit 重写后的验证清单
 

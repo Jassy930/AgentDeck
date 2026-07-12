@@ -11,11 +11,11 @@
 
 ## 运行与诊断
 
-- `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、failure code、Relay v1 显式
-  reset 和排查流程。
-- `QUALITY.md`：按变更范围选择验证命令，以及 Companion MVP P0 与文档结构检查入口。
-- `RELAY_RUNBOOK.md`：Relay v2 本机 admin UDS、machine enrollment、fingerprint-bound
-  readback/purge 与 root-lost 重新配对操作手册。
+- `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、Relay v2 failure code、v1 marker
+  显式 reset 和排查流程。
+- `QUALITY.md`：按变更范围选择验证命令，以及 Companion MVP P2 与文档结构检查入口。
+- `RELAY_RUNBOOK.md`：production Relay v2 Direct TLS、本机 admin UDS、machine
+  enrollment、fingerprint-bound readback/purge 与 root-lost 重新配对操作手册。
 
 ## 计划与历史
 
@@ -28,18 +28,18 @@
 - `plans/2026-07-03-ios-uikit-frontend-design.md`：iOS UIKit companion 前端设计（fixture 驱动，R3 界面骨架，状态：Implemented）。
 - `plans/2026-07-03-ios-uikit-frontend-implementation.md`：iOS UIKit companion 前端实施计划（Task 1–15，含 AgentDeckCore 共享库抽取）。
 
-### Relay R0 契约 spike（2026-07-07）
+### Relay R0 契约 spike（2026-07-07，历史）
 
 - `plans/2026-07-07-relay-r0-contract-spike-design.md`：Relay R0 契约 spike 设计（控制面/数据面分层、fleet 协议、内存 FakeRelay + 真实 daemon 组合、CLI remote 接口基线）。
 - `plans/2026-07-07-relay-r0-contract-spike-implementation.md`：Relay R0 契约 spike 实施计划（Task 1–9，含 T1–T4 测试矩阵与文档收口）。
 
-### Relay R1a 传输 + 鉴权骨架（2026-07-08）
+### Relay R1a 传输 + 鉴权骨架（2026-07-08，历史）
 
 - `plans/2026-07-08-relay-r1-design-review.md`：Relay R1 设计评审（就绪度评估、决策拍板、R1a/R1b/R1c 切分）。
 - `plans/2026-07-08-relay-r1a-transport-auth-design.md`：Relay R1a 传输+鉴权骨架设计。
 - `plans/2026-07-08-relay-r1a-transport-auth-implementation.md`：Relay R1a 12 任务 TDD 实施计划（已全部落地）。
 
-### Relay R1b 存储 + Router 健壮化（2026-07-09）
+### Relay R1b 存储 + Router 健壮化（2026-07-09，历史）
 
 - `plans/2026-07-09-relay-r1b-storage-hardening-design.md`
 - `plans/2026-07-09-relay-r1b-storage-hardening-implementation.md`
@@ -47,7 +47,7 @@
 ### Relay Companion MVP（2026-07-10）
 
 - `plans/2026-07-10-relay-companion-mvp-design.md`：已批准的目标架构；固定 singleton daemon、多读者/多写者串行裁决、按机器独立配对、Relay 严格最小可见与真实 iOS Companion 边界。
-- `plans/2026-07-10-relay-companion-mvp-implementation.md`：P0–P6、48 个逐文件 TDD task；当前已推进到 P2.7（v2 Store/Auth/Core/PairRoute/在线请求/撤销退役、TLS lifecycle，以及本机 admin UDS、一次性 machine enrollment 和 fingerprint-bound purge），后续覆盖 Relay client/cutover、RuntimeCore、UDS/LaunchAgent、E2EE/Keychain、iOS/远程 macOS 与真实跨网 DoD。
+- `plans/2026-07-10-relay-companion-mvp-implementation.md`：P0–P6、48 个逐文件 TDD task；当前已完成 P2.10：production 仅 Relay v2、真实 Direct TLS/SPKI synthetic、admin UDS、一次性 machine enrollment、v1 物理移除与安全/故障门禁。后续覆盖 RuntimeCore、UDS/LaunchAgent、E2EE/Keychain、持久远程 CLI、iOS/远程 macOS 与真实跨网 DoD。
 
 ## 协议资料
 

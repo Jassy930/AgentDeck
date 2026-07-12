@@ -10,7 +10,7 @@
 4. `docs/index.md`：文档记录系统导航。
 5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code（含 CC adapter failure codes）。
 6. `docs/QUALITY.md`：验证命令、质量门禁和文档结构检查（含 v0.2 手动 QA 清单）。
-7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 下一阶段以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单。
+7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单，P2.10 已完成，继续执行 P3–P6。
 8. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
 
 ## 项目边界
@@ -85,85 +85,50 @@ AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_cross_agent_history -- --
 UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot
 ```
 
-### Relay R1a（传输 + 鉴权骨架）
+### Relay Companion MVP P2.10
+
+Relay R0/R1 计划与测试只保留为历史记录；v1 协议、server、client、daemon bridge
+和兼容 feature 已物理删除，不得再使用 `--bootstrap-secret`、`ws://` v1 命令或
+R1b 测试作为当前验证。production binary 只运行 Relay v2 Direct TLS/WSS；loopback
+明文或 proxy 只能显式用于受控开发。`/v1/connect` 只是无状态 HTTP 426 tombstone。
 
 ```bash
-# Relay 服务端（server feature）测试
-cargo test -p agentdeck-relay --features server
+# 当前统一 P2 门禁
+bash scripts/verify-relay-companion-mvp.sh p2
 
-# Relay binary selfcheck（load + validate + build store/relay 后 exit）
-cargo run -p agentdeck-relay --features server -- --selfcheck --bootstrap-secret x
+# Relay v2 安全与故障专项
+cargo test -p agentdeck-relay --features server,tls \
+  --test relay_v2_hardening_e2e -- --test-threads=1
+cargo test -p agentdeck-relay --features server,tls \
+  --test relay_v2_security_e2e -- --test-threads=1
+cargo test -p agentdeck-relay-client
 
-# daemon 无 net/axum 不变量（R1a→R2 关键 invariant）
-bash scripts/check-daemon-no-net.sh
-
-# CLI remote pair + --relay 端到端（需先起 relay）
-agentdeck-relay --bootstrap-secret s &
-agentdeck-cli remote pair --relay ws://127.0.0.1:PORT --bootstrap-secret s
-agentdeck-cli remote machines --relay ws://127.0.0.1:PORT
-# （PORT 用 `agentdeck-relay` 启动时打印的实际端口替换；默认 config 里 bind 是
-#  127.0.0.1:8443，除非通过 --bind 或 AGENTDECK_RELAY_BIND 覆盖）
-
-# 用 TLS 起 relay（生产模式，非 loopback）
+# Relay v2 production config selfcheck：真实 TLS preflight + Store/Core 打开/关闭
+relay_selfcheck_dir="$(mktemp -d)"
 cargo run -p agentdeck-relay --features server,tls -- \
-  --bind 0.0.0.0:8443 --tls-cert path/to/cert.pem --tls-key path/to/key.pem \
-  --bootstrap-secret <secret>
+  --selfcheck \
+  --config agentdeck-relay/tests/fixtures/relay-selfcheck.toml \
+  --storage "$relay_selfcheck_dir/relay.db"
+rm -rf "$relay_selfcheck_dir"
+
+# daemon 仍无网络依赖
+bash scripts/check-daemon-no-net.sh
 ```
 
-改动 `RELAY_PROTOCOL_VERSION`（`agentdeck-protocol/src/remote/mod.rs`）或 protocol schema 后须：
-```bash
-UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot
-```
-
-### Relay R1b（SQLite 持久化 + Router 健壮化）
-
-```bash
-# R1b hardening e2e（SQLite tempdir 重启恢复 + 重放补拉 gap + AnnounceSession 幂等 + Revoke）
-cargo test -p agentdeck-relay --features server --test r1b_hardening_e2e -- --test-threads=1
-
-# 起 relay 指定 SQLite 存储路径（默认 ./agentdeck-relay-data/relay.db）
-cargo run -p agentdeck-relay --features server -- \
-  --bind 127.0.0.1:8443 \
-  --storage /var/lib/agentdeck-relay/relay.db \
-  --bootstrap-secret <secret>
-
-# 可选 tunable
---conv-buffer-cap 1000        # 每 conversation 硬上界（默认 1000）
---req-origin-ttl-ms 300000    # req_origin TTL（默认 5 分钟）
-
-# 或用 env
-AGENTDECK_RELAY_STORAGE=/path/to/relay.db
-AGENTDECK_RELAY_CONV_BUFFER_CAP=1000
-AGENTDECK_RELAY_REQ_ORIGIN_TTL_MS=300000
-```
-
-改动 `SubTarget::Events.since_seq` 字段或 `Ack.conversation_id` 类型后须：
-```bash
-UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot
-```
-
-### Relay Companion MVP P0
+真实外部 Direct TLS/SPKI synthetic 由本机 admin UDS 先生成一次性 bundle，再执行：
 
 ```bash
-# P0 统一门禁（按批准设计 §16.5 编排现有门禁）
-bash scripts/verify-relay-companion-mvp.sh p0
-
-# v1 reset 的聚焦 destructive-boundary 测试
-bash scripts/tests/reset-relay-v1-dev-state.sh
-
-# 显式清理不兼容的 v1 开发状态；执行前必须先停止 Relay
-bash scripts/reset-relay-v1-dev-state.sh \
-  --storage /absolute/path/to/relay.db \
-  --credentials /absolute/path/to/relay/dev.credentials.json \
-  --confirm DELETE-RELAY-V1-DEV-STATE
+agentdeck remote synthetic --bundle /secure/path/machine-enrollment-bundle.json
 ```
 
-reset 只接受 canonical absolute 普通文件路径，拒绝 symlink、非 v1 schema、非 v1
-credential shape 或 DB 关联不匹配；所有 validation 与 unlink preflight（含父目录
-权限、macOS immutable/system flags）失败都发生在首次 unlink 前，零删除。preflight
-之后 OS unlink 仍因 race/I/O 失败时可能部分删除：脚本非零退出、逐个列出仍存在的
-exact path、不打印成功、不承诺 rollback，需人工清理残留后重新配对。成功后没有
-开发状态恢复路径，必须重新配对。不得用 glob 或手工扩大删除集合。
+该命令只使用临时 machine/device identity，不建立持久状态。P4 前其余
+`remote pair/machines/sessions/watch/send/...` 必须返回
+`remote.persistent.unsupported`。旧 v1 credential marker 只允许做 metadata
+存在性探测；production CLI 不读取、不删除、不拨号。需要清理时只能显式运行
+`scripts/reset-relay-v1-dev-state.sh`，成功后重新配对，不提供恢复。
+
+改动任一协议轴后，使用对应的 `UPDATE_*_SCHEMA=1` 测试更新快照，并确认以下
+四条导出都与仓库快照逐字节一致：本地 IPC、Runtime、Relay v2、E2EE。
 
 ## 浏览与外部资料
 

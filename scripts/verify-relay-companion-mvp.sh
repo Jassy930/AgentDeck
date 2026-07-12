@@ -4,10 +4,19 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd -P)"
 cd "$repo_root"
 
-if [[ $# -ne 1 || "$1" != 'p0' ]]; then
-  printf 'usage: scripts/verify-relay-companion-mvp.sh p0\n' >&2
+if [[ $# -ne 1 ]]; then
+  printf 'usage: scripts/verify-relay-companion-mvp.sh <p0|p2>\n' >&2
   exit 2
 fi
+
+phase="$1"
+case "$phase" in
+  p0|p2) ;;
+  *)
+    printf 'usage: scripts/verify-relay-companion-mvp.sh <p0|p2>\n' >&2
+    exit 2
+    ;;
+esac
 
 run_gate() {
   local label="$1"
@@ -27,9 +36,33 @@ verify_ios() (
     test
 )
 
-verify_schema_snapshot() {
+verify_schema_snapshots() {
   cargo run -q -p agentdeck-cli -- protocol schema \
     | diff - protocol/agentdeck/agentdeck-protocol.schema.json
+  cargo run -q -p agentdeck-cli -- protocol runtime-schema \
+    | diff - protocol/agentdeck/runtime-protocol.schema.json
+  cargo run -q -p agentdeck-cli -- protocol relay-schema \
+    | diff - protocol/agentdeck/relay-v2.schema.json
+  cargo run -q -p agentdeck-cli -- protocol e2ee-schema \
+    | diff - protocol/agentdeck/e2ee-v1.schema.json
+}
+
+verify_relay_selfcheck() {
+  local temp_root temp_dir status
+  temp_root="${TMPDIR:-/tmp}"
+  temp_root="${temp_root%/}"
+  temp_dir="$(mktemp -d "$temp_root/agentdeck-relay-selfcheck.XXXXXX")"
+  temp_dir="$(cd "$temp_dir" && pwd -P)"
+  if cargo run -p agentdeck-relay --features server,tls -- \
+    --selfcheck \
+    --config agentdeck-relay/tests/fixtures/relay-selfcheck.toml \
+    --storage "$temp_dir/relay.db"; then
+    status=0
+  else
+    status=$?
+  fi
+  rm -rf "$temp_dir"
+  return "$status"
 }
 
 verify_relay_data_not_in_status() {
@@ -42,20 +75,78 @@ verify_relay_data_not_in_status() {
   fi
 }
 
-run_gate 'cargo test' cargo test
-run_gate 'agentdeck-relay server,tls tests' \
-  cargo test -p agentdeck-relay --features server,tls
-run_gate 'Relay R1b hardening E2E' \
-  cargo test -p agentdeck-relay --features server \
-    --test r1b_hardening_e2e -- --test-threads=1
-run_gate 'agentdeck-relay selfcheck' \
-  cargo run -p agentdeck-relay --features server -- \
-    --selfcheck --bootstrap-secret x
-run_gate 'swift test' swift test
-run_gate 'iOS Simulator tests' verify_ios
-run_gate 'daemon no-net guard' bash scripts/check-daemon-no-net.sh
-run_gate 'agent docs gate' scripts/verify-agent-docs.sh
-run_gate 'local IPC schema snapshot' verify_schema_snapshot
-run_gate 'agentdeck-relay-data git-status guard' verify_relay_data_not_in_status
+verify_client_dependency_boundaries() {
+  local package tree
+  for package in agentdeck-cli agentdeck-relay-client; do
+    tree="$(cargo tree -p "$package" -e normal)"
+    case "$tree" in
+      *"agentdeck-relay v"*|*axum*|*rusqlite*)
+        printf '%s normal dependency tree includes Relay server/store code:\n' \
+          "$package" >&2
+        printf '%s\n' "$tree" >&2
+        return 1
+        ;;
+    esac
+  done
+}
 
-printf 'verify-relay-companion-mvp p0: PASS\n'
+verify_v1_production_symbols_absent() {
+  local pattern matches rc
+  pattern='DataEnvelope::Plaintext|bootstrap_secret|RelayCredentials|FakeRelay|req_origin'
+  if matches="$(rg -n --glob '*.rs' "$pattern" \
+    agentdeck-protocol agentdeck-relay agentdeck-relay-client agentdeck-cli agentdeckd)"; then
+    printf '%s\n' "$matches" >&2
+    printf 'removed Relay v1 production symbol found\n' >&2
+    return 1
+  else
+    rc=$?
+    if [[ "$rc" -ne 1 ]]; then
+      printf 'Relay v1 production symbol scan failed with status %s\n' "$rc" >&2
+      return "$rc"
+    fi
+  fi
+}
+
+run_common_rust_gates() {
+  run_gate 'cargo test' cargo test --locked
+  run_gate 'agentdeck-relay server,tls complete matrix' \
+    cargo test -p agentdeck-relay --features server,tls --locked
+  run_gate 'agentdeck-relay v2 config selfcheck' verify_relay_selfcheck
+  run_gate 'daemon no-net guard' bash scripts/check-daemon-no-net.sh
+  run_gate 'four protocol schema snapshots' verify_schema_snapshots
+  run_gate 'agent docs gate' scripts/verify-agent-docs.sh
+  run_gate 'agentdeck-relay-data git-status guard' verify_relay_data_not_in_status
+}
+
+run_p0() {
+  run_common_rust_gates
+  run_gate 'swift test' swift test
+  run_gate 'iOS Simulator tests' verify_ios
+}
+
+run_p2() {
+  run_common_rust_gates
+  run_gate 'Relay v2 hardening E2E' \
+    cargo test -p agentdeck-relay --features server,tls --locked \
+      --test relay_v2_hardening_e2e -- --test-threads=1
+  run_gate 'Relay v2 production-ingress security sentinel' \
+    cargo test -p agentdeck-relay --features server,tls --locked \
+      --test relay_v2_security_e2e -- --test-threads=1 --nocapture
+  run_gate 'Relay v2 outbound client' \
+    cargo test -p agentdeck-relay-client --locked
+  run_gate 'Relay v2 CLI DirectTLS/SPKI synthetic' \
+    cargo test -p agentdeck-cli --locked \
+      --test remote_v2_synthetic -- --test-threads=1
+  run_gate 'client-only normal dependency boundaries' \
+    verify_client_dependency_boundaries
+  run_gate 'removed Relay v1 production symbols' \
+    verify_v1_production_symbols_absent
+}
+
+if [[ "$phase" == 'p0' ]]; then
+  run_p0
+else
+  run_p2
+fi
+
+printf 'verify-relay-companion-mvp %s: PASS\n' "$phase"

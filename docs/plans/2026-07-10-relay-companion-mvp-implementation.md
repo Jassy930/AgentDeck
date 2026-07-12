@@ -459,7 +459,7 @@ impl RelayPairingClient {
 - [x] Step 3: CLI 与 Relay binary/config/dependencies 已原子切到 v2；旧 protocol、server/router/store、client、daemon bridge 和测试已删除。旧 credential marker 只做 no-follow metadata 探测且零写/零拨号；旧 flag/env fail-close，persistent remote 在 P4 前返回 typed unsupported。
 - [x] Step 4: `cargo test --locked` 全 workspace 通过；四份 schema byte-identical diff 通过；v1 production sentinel `rg` 零命中。Runtime 描述去除旧 seen-map 术语后已同步 schema 快照；Rustls 双 provider feature-unification 回归也已修复。
 - [x] Step 5: `bash scripts/check-daemon-no-net.sh` 通过；CLI 与 relay-client normal dependency tree 均不含 Relay server/axum/rusqlite。
-- [ ] Step 6: 精确stage并提交。 stage上述modified files与Cargo.lock；删除项只用精确pathspec：三个old protocol/relay/client source目录、`r0_composition.rs`、`r1a_ws_e2e.rs`、`r1b_hardening_e2e.rs`、`relay_r0_bridge.rs`、`relay_r0_e2e.rs`。 核对`git diff --cached --name-status`与task Files完全相同后执行`git commit -m "feat(relay): 原子切换 Relay v2 并移除 v1 生产路径"`，不得stage整个tests目录。
+- [x] Step 6: 已精确stage并核对删除/修改清单，提交为 `edb9fa8 feat(relay): 原子切换 Relay v2 并移除 v1 生产路径`；未提交构建产物、运行数据或本地 SDD ledger。
 
 ### Task P2.10：Relay v2 hardening E2E、sentinel 与阶段文档收口
 
@@ -469,10 +469,10 @@ impl RelayPairingClient {
 - Modify: `README.md`, `ARCHITECTURE.md`, `docs/QUALITY.md`, `docs/AGENT_DIAGNOSTICS.md`, `docs/index.md`, `AGENTS.md`
 - Modify: `docs/RELAY_RUNBOOK.md`, `protocol/agentdeck/README.md`
 
-- [ ] Step 1: 写阶段级故障/安全 tests。 覆盖 restart byte-identical replay、COMMIT前后 crash、gap/quota/disk-low、challenge race、generation/serial rollback、forged grant、cross-machine takeover、revoke terminal、slow client、SIGTERM、TLS pin；sentinel 同时作为 machine/session/prompt/output/approval/vendor ref输入，扫描 DB/log/metrics/outer frame。
-- [ ] Step 2: 在文档更新前运行 `bash scripts/verify-relay-companion-mvp.sh p2`。 Expected: FAIL，脚本尚未编排新 suite或入口文档仍描述 R1b。
-- [ ] Step 3: 扩展 verifier并同步所有入口文档为已落地 P2 事实；旧 R0/R1文档保留为历史，不改写成当前行为。
-- [ ] Step 4: 运行：
+- [x] Step 1: 已新增阶段级 hardening/security tests；完整矩阵由 Store/Auth/Stream/Revocation/Lifecycle/TLS 专项 suite 与两个组合 suite 共同承担。安全 sentinel 以六类 endpoint 明文经真实 AEAD+发送方签名后走生产 DirectTLS/WSS Challenge→Authenticate→RegisterStream→Publish/Core，并扫描 outer、响应、tracing、HTTP/metrics surface 和 SQLite DB/WAL 为零明文。
+- [x] Step 2: 已对更新前 `HEAD` verifier 执行 `p2`，精确返回 usage 与 exit 2；保留了脚本尚只接受 `p0` 的 RED 证据。
+- [x] Step 3: verifier 已支持 `p0|p2`，P2 明确编排全套专项矩阵、两个组合 suite、真实 CLI synthetic、四 schema、no-net、依赖边界和 v1 生产符号扫描；入口文档同步为当前仅 Relay v2，旧 R0/R1 只保留为历史记录。
+- [x] Step 4: 已运行：
   ```bash
   cargo test
   cargo test -p agentdeck-relay --features server,tls --test relay_v2_hardening_e2e -- --test-threads=1
@@ -483,8 +483,10 @@ impl RelayPairingClient {
   bash scripts/verify-relay-companion-mvp.sh p2
   scripts/verify-agent-docs.sh
   ```
-  Expected: 全部 exit 0；sentinel scan 输出 `0 plaintext matches`。
-- [ ] Step 5: 执行 `git status --short --branch`，移除测试 DB、证书私钥副本与日志产物。
+  全部 exit 0；统一 `p2` 门禁最终输出 PASS，security suite 输出
+  `0 plaintext matches in outer + logs + HTTP/metrics + SQLite DB/WAL`。门禁首轮还真实抓到
+  macOS `TMPDIR` 尾斜线形成非 canonical storage path，脚本改为 `pwd -P` 后完整重跑通过。
+- [x] Step 5: 已执行 `git status --short --branch` 与 artifact 扫描；工作树只含本 task 的两套测试、verifier 与入口文档，无 Relay DB、证书私钥副本或日志产物。`.build/build.db` 是既有 gitignored Swift 构建缓存，不纳入 stage。
 - [ ] Step 6: 提交。 `git add README.md ARCHITECTURE.md AGENTS.md docs protocol scripts agentdeck-relay/tests && git commit -m "test(relay): 收口 v2 安全与故障门禁"`
 
 ---

@@ -36,10 +36,13 @@ swift run AgentDeck -- --diagnostics-report --json --profile dev
 SwiftPM/debug 构建未显式传 `--profile` 时也会默认使用 dev profile。
 `AGENTDECK_DATA_DIR` 仍优先于 profile，主要用于一次性测试覆盖目录。
 
-## Relay v1 开发状态 reset
+## Relay v1 历史 marker 与显式 reset
 
-Relay v1 状态与后续 Companion MVP 版本不兼容时，没有开发恢复或自动迁移路径。
-先停止 Relay，确认 DB 与 bearer credential 的 canonical absolute 路径，再执行：
+当前 production binary 没有 v1 协议、兼容 feature 或自动迁移路径。CLI 只用
+`symlink_metadata` 探测旧 credential marker 是否存在；它不打开、不解析、不删除，
+也不据此拨号。marker 存在、悬空 symlink 或 metadata 无法安全判定时均返回
+`remote.v1.reset_required`。先停止旧 Relay，确认 DB 与 bearer credential 的
+canonical absolute 路径，再显式执行：
 
 ```bash
 bash scripts/reset-relay-v1-dev-state.sh \
@@ -48,8 +51,8 @@ bash scripts/reset-relay-v1-dev-state.sh \
   --confirm DELETE-RELAY-V1-DEV-STATE
 ```
 
-脚本拒绝相对路径、目录、symlink、非 v1 schema/credential shape、非 canonical
-Base64 或解码长度不是 32 bytes 的 credential，以及 `account_id` / `device_id` /
+只有该 reset 脚本拥有删除权限。脚本拒绝相对路径、目录、symlink、非 v1
+schema/credential shape、非 canonical Base64 或解码长度不是 32 bytes 的 credential，以及 `account_id` / `device_id` /
 `role` / credential hash 与 DB 行不一致的输入；unlink preflight 还会检查父目录
 权限与 macOS immutable/system flags。任一 validation/preflight 拒绝都发生在首次
 unlink 前，因此应保留全部四个目标。若报告文件在校验期间变化，说明 Relay 可能
@@ -61,8 +64,8 @@ unlink 前，因此应保留全部四个目标。若报告文件在校验期间�
 
 ## Relay v2 Store 诊断（Companion MVP P2.1）
 
-P2.1 只建立与 v1 并列的 v2 Store library；生产 Relay binary 要到 P2.9 才原子
-切换，当前不能把 Store 测试通过解释为公网 v2 listener 已上线。v2 Store 由一个
+P2.1 最初以隔离 library 建立 v2 Store；P2.9 后它已成为 production Relay 的唯一
+Store。单独 Store 测试仍不能解释为某个公网部署已上线。v2 Store 由一个
 blocking worker 独占 SQLite connection，async 调用通过有界队列串行进入；启动
 成功必须同时读回 `journal_mode=WAL`、`synchronous=FULL`、`foreign_keys=ON` 与
 `busy_timeout=5000`。
@@ -100,13 +103,11 @@ expiry 仍允许相同请求取回冻结 response，超过 1 ms 后不提供恢�
 fsync 与 source path hash 绑定的 marker 并持有排他锁；重启只逐文件清理同 owner、
 0700/0600、marker 精确匹配、无额外 child 且锁已释放的 artifact，绝不按前缀递归删。
 
-P2.1 的 v2 配置面是独立 `RelayV2StoreSettings`，没有复用或改变 v1
-`RelayConfig`。它显式承载 storage path、stream count/bytes/age、machine/global
+当前 v2 配置面使用 `RelayV2StoreSettings`。它显式承载 storage path、stream count/bytes/age、machine/global
 bytes、replay page count/bytes 与磁盘 reserve bytes/percent；转换为
 `RelayV2StoreConfig` 时还带入 enrollment code count，并先拒绝相对路径和
-无效/越界配额。P2.6 的并列 v2 library config 已按 CLI > env > TOML > defaults
-接入全部字段；v1 `--storage` 仍不是 v2 配置入口，production binary 的默认 dispatch 要到
-P2.9 才原子切换。
+无效/越界配额。server config 按 CLI > env > TOML > defaults 接入全部字段；
+已删除的 v1 参数不是 v2 配置入口。
 
 | v2 Store diagnostic code | 含义 | 下一步 |
 | --- | --- | --- |
@@ -130,7 +131,7 @@ P2.9 才原子切换。
 
 ## Relay v2 鉴权诊断（Companion MVP P2.2）
 
-P2.2 只建立 challenge/auth/access library，生产 listener 仍未切到 v2。每次普通
+P2.2 最初建立 challenge/auth/access library；P2.9 后 production listener 已只使用 v2。每次普通
 machine/device 连接都必须取得 Relay 新生成的 32-byte challenge；challenge 仅内存保存、
 30 秒起过期、单次消费、全局最多 4,096。source/route token bucket 或任一内存 hard
 bound 拒绝不会访问 SQLite，也不会产生半个授权状态；bucket idle TTL 只允许配置在
@@ -154,8 +155,8 @@ caller future 取消不取消转换；普通 lifecycle channel 满时独立 emer
 拥有的全部列出 writer 且不再处理旧 lifecycle backlog。receiver Drop 会立即 poison/清空
 active；coordinator shutdown 先投递失效并释放 owner，随后才允许 Store shutdown。相同
 platform-normalized DB path 的第二个进程内 Store worker 会被拒绝；P2.6 server lifecycle
-已在 DB 同目录增加 `<db>.agentdeck.lock` 的 OS 排他锁，覆盖不同进程，production binary
-默认使用仍随 P2.9 cutover 生效。
+已在 DB 同目录增加 `<db>.agentdeck.lock` 的 OS 排他锁，覆盖不同进程；production
+binary 当前默认使用这条路径。
 
 对外错误故意不报告“哪一段签名/哪个字段错误”，避免把 Relay 变成 trust inventory
 oracle。诊断日志同样只能记录 failure code、脱敏 route 短标识和阶段，不得格式化完整
@@ -175,10 +176,10 @@ oracle。诊断日志同样只能记录 failure code、脱敏 route 短标识和
 
 ## Relay v2 Stream Core 诊断（Companion MVP P2.3）
 
-P2.3 只建立 v2 stream routing library，生产 listener 仍走 v1。`RelayCore` 是唯一
-stream mutation 裁决者：命令队列、ingress bytes、连接数和每连接订阅数都有 hard bound；
+P2.3 最初建立 v2 stream routing library；P2.9 后 production listener 已只走 v2。
+`RelayCore` 是唯一 stream mutation 裁决者：命令队列、ingress bytes、连接数和每连接订阅数都有 hard bound；
 Core 可以等待单一 Store worker，但任何 socket write 都必须由 per-connection writer task
-完成。看到 stream 测试通过，只能说明 library contract 成立，不能解释为公网 WSS 已切换。
+完成。看到 stream 测试通过，只能说明 contract 成立，不能解释为某个公网 WSS 已部署。
 
 Publish 的可见屏障是 SQLite COMMIT。Store 返回前没有 fan-out，也没有
 `RouteAccepted`；如果 COMMIT 后 reply 丢失，publisher 必须用完全相同的 canonical frame
@@ -230,7 +231,7 @@ writer clone。重复出现应先检查唯一 coordinator、Store 健康与客�
 
 ## Relay v2 PairRoute / 在线请求诊断（Companion MVP P2.4）
 
-P2.4 仍是 library contract，尚未切换生产 listener。PairRoute 只存在于当前 `RelayCore`
+P2.4 的 PairRoute/在线请求 contract 当前已由 production v2 listener 使用。PairRoute 只存在于当前 `RelayCore`
 内存：Core/Relay 重启后 view 为空是预期行为，daemon 必须从 durable outbox 以完全相同的
 machine/route/absolute expiry 重开；不能生成第二个邀请或把该现象误判为 SQLite 丢数据。
 
@@ -258,8 +259,8 @@ route close 后立即不可用。
 
 ## Relay v2 Grant / Revoke / Retire 诊断（Companion MVP P2.5）
 
-P2.5 仍未切换 production listener。看到 revocation E2E 通过，只证明 library 的真实签名、
-事务和 writer 生命周期成立，不能解释为当前公网 WSS 已支持撤销。生产 control frame必须来自
+P2.5 的撤销/退役路径当前已由 production v2 listener 使用。看到 revocation E2E 通过只证明
+本地真实签名、事务和 writer 生命周期成立，不能解释为某个公网部署已经支持撤销。production control frame必须来自
 current、同 machine 的 MachineAccess；Device/Pairing 直接发送 InstallGrant、RevokeDevice 或
 RetireMachine 均是 `relay.route.forbidden`。
 
@@ -279,8 +280,8 @@ RetireMachine 成功后 origin 收到 `RetirementCommitted(machineRoute, trustEp
 terminal，其他同 machine writer与 PairRoute关闭。readback必须是
 `0/1/0/0/0/0/0`；daemon 在收到 matching retireHash 前不得删除本地 MachineRoot/Link材料。
 ACK 丢失时旧 exact MachineLink proof只会重放 terminal；更高 generation、普通 command或重新
-enroll旧 route都不能复活。root-lost admin purge要到 P2.7 的本机 admin UDS执行，不能从公网
-frame伪造。
+enroll 旧 route 都不能复活。root-lost admin purge 已由 P2.7 的本机 admin UDS 承载，
+不能从公网 frame 伪造。
 
 | v2 revoke code / state | 含义 | 下一步 |
 | --- | --- | --- |
@@ -297,8 +298,8 @@ retirement tombstone列而更新；旧的未发布 v2 开发 DB会被严格 sche
 
 ## Relay v2 TLS / readiness / shutdown 诊断（Companion MVP P2.6）
 
-P2.6 仍未切换 `agentdeck-relay` production binary 的默认 listener；当前可验证对象是并列 v2
-library server。不要把 library TLS E2E 或 selfcheck 通过描述为现网 WSS 已部署。public listener
+P2.6 server 已在 P2.9 成为 `agentdeck-relay` production binary 的唯一 listener。
+不要把本地 TLS E2E 或 selfcheck 通过描述为某个现网 WSS 已部署。public listener
 只应暴露固定 `/v2/connect` 与 `/v2/pair`，`/healthz`、`/readyz` 只能从单独 loopback health
 listener读取；public 上这些 path、未知 path 与旧 query pairing 都不应 redirect 到其他 host/scheme。
 
@@ -312,7 +313,7 @@ identity失败使用 `TlsIdentityError::code()`；这些 code 不包含 path 或
 | `relay.transport.tls_feature_missing` | 配置了 direct TLS，但 binary 未编译 TLS | 用带 `server,tls` features 的受控构建，禁止改成明文绕过 |
 | `relay.config.tls_partial` | cert/key 只配置一项，或高优先级层只覆盖一半 | 在同一 CLI/env/TOML 层提供完整 pair |
 | `relay.transport.tls_required` | 非 loopback 未配置 direct TLS | 配置有效 cert/key；不能启用 insecure loopback |
-| `relay.transport.insecure_loopback_opt_in_required` | loopback 明文未显式 opt-in | 只在本机开发明确启用；生产选 direct TLS/proxy loopback |
+| `relay.transport.insecure_loopback_opt_in_required` | loopback 明文未显式 opt-in | 只在本机开发明确启用；production 使用 Direct TLS |
 | `relay.transport.proxy_requires_loopback` | proxy backend 尝试监听非 loopback | 将 backend 收回 loopback，由可信反代终止 TLS |
 | `relay.proxy.source_required` | proxy 请求缺少可信来源 header | 配置反代始终覆写单个 `x-agentdeck-client-ip` |
 | `relay.proxy.source_invalid` | proxy 来源 header 重复、列表化或不是 canonical IP | 删除外部同名 header，并以实际 TCP peer IP 覆写单值 |
@@ -356,8 +357,8 @@ public key/signature、terminal/sealed bytes或输入 sentinel 出现在日志�
 ## Relay v2 Admin / machine enrollment 诊断（Companion MVP P2.7）
 
 admin、inventory、readback 与 purge 只存在于 Relay host 本机 UDS；公网只允许
-`POST /v2/machine-enroll`。操作步骤见 `RELAY_RUNBOOK.md`。production listener 尚未在 P2.9
-切换，因此 library/E2E 通过不能描述为现网 enrollment 已可用。
+`POST /v2/machine-enroll`。操作步骤见 `RELAY_RUNBOOK.md`。production listener 已在 P2.9
+切换为仅 v2，但本地 E2E 通过仍不能描述为某个现网 enrollment endpoint 已部署。
 
 | code | 含义 | 下一步 |
 | --- | --- | --- |
@@ -391,9 +392,41 @@ fail-closed；若仍观察到旧writer或PairRoute，这是P0级安全回归。
 | `relay.client.pair_event_pending` | 兼容data helper前存在close/error/restart等control event | 改用`next_event()`先处理并持久化control结果 |
 | `relay.client.enrollment_response_invalid` | server/route/epoch/receipt回显不匹配 | 视为安全错误，保留原请求，不生成新key/route后盲重试 |
 
-P2.8 只提供client library；production binary仍在P2.9前保留旧listener/CLI dispatch。看到
-`v1-compat`被默认启用、normal依赖树出现server/store，或pairing调用方能发送Subscribe/Publish/Send，
-都属于阶段边界回归。
+P2.8 client 已接入 P2.9/P2.10 的 production v2 与 synthetic 路径；v1 client/compat
+feature 已物理删除。normal client 依赖树出现 server/store，或 pairing 调用方能发送
+Subscribe/Publish/Send，都属于边界回归。
+
+## Relay v2 production cutover / synthetic 诊断（P2.9–P2.10）
+
+production `agentdeck-relay` 只加载 v2 config、Store/Auth/Core/Admin 与 server。
+`/v1/connect` 的唯一允许结果是无状态 HTTP 426；若出现 101、challenge、DB 访问或
+任何 v1 frame，属于 P0 安全回归。旧 `--bootstrap-secret` 等 v1 参数必须在 admin、
+config、TLS、Store 或网络 I/O 前本地拒绝，且不得因非 UTF-8 参数 panic。
+
+真实链路诊断使用本机 admin 生成的一次性 bundle：
+
+```bash
+agentdeck remote synthetic --bundle /secure/path/machine-enrollment-bundle.json
+bash scripts/verify-relay-companion-mvp.sh p2
+```
+
+bundle 必须是当前用户持有的 0600 regular file；读取使用 `O_NOFOLLOW`、同一 fd 并受
+64 KiB 上界约束。synthetic 会通过真实 Direct TLS/CA/hostname/SPKI 完成临时 machine/
+device 全流，但不会保存身份。测试会在 SQLite 和 Relay 可见 outer bytes 中扫描多个
+sentinel；出现应用明文、key、签名或 enrollment code 均是安全回归。
+
+| code / 现象 | 含义 | 下一步 |
+| --- | --- | --- |
+| `remote.v1.reset_required` | 发现旧 marker、悬空 symlink，或 metadata 状态无法安全判断 | 不读取 marker；停止旧 Relay，按上节显式 reset 后重新配对 |
+| `remote.persistent.unsupported` | P4 前调用了持久 remote 命令 | 只运行 synthetic 门禁；等待 P4 Keychain/持久状态机，不要自行落 secret 文件 |
+| `/v1/connect` 返回 426 | 预期的无状态 migration tombstone | 升级到 v2；禁止自动降级或重试 v1 |
+| synthetic 在 SPKI/CA/hostname 前失败 | server identity 未通过完整验证 | 核对证书、DNS、bundle 与 pin 轮换；不得改成明文或 pin-only |
+| synthetic 返回 authentication terminal | signed revoke/retire 已成为当前终态 | 验 canonical terminal；临时身份直接丢弃，持久身份由 P4 状态机处理 |
+
+P2.10 hardening suite 还必须证明 restart byte-identical replay、retention gap、quota、
+disk-low、Store fault 与 deterministic shutdown；`agentdeckd` 同时继续通过
+`scripts/check-daemon-no-net.sh`。这些证据只收口 Relay，不代表 daemon/iOS Companion
+持久链路已经完成。
 
 ## Failure Codes
 

@@ -1,13 +1,16 @@
 # AgentDeck Relay v2 运维手册
 
-本页只记录已经由自动化测试真实跑通的 Relay v2 管理命令与安全边界。P2.8 仍是与旧
-Relay listener 并列的 library server；production listener 要到 P2.9 才原子切换，因此本页
-不能作为“公网 Companion 已上线”的证明。
+本页只记录已经由自动化测试真实跑通的 Relay v2 管理命令与安全边界。production
+binary 已在 P2.9 原子切换为仅 Relay v2；P2.10 又以真实 Direct TLS/SPKI synthetic、
+安全扫描与故障注入门禁收口。daemon/iOS 的持久远程链路仍属于 P3–P5，因此本页
+不是“公网 Companion 已上线”的证明。
 
 ## 部署不变量
 
-- 公网只允许 direct TLS，或由可信反向代理终止 TLS 后连接 loopback backend。开发明文
-  loopback 不能启用 admin/enrollment。
+- production 公网只允许 Direct TLS/WSS。明文 loopback 与可信反代后的 loopback
+  backend 都必须显式选择，只用于受控开发；明文 loopback 不能启用 admin/enrollment。
+- v1 协议与兼容路径已经物理删除。`/v1/connect` 只返回无状态 HTTP 426，不升级
+  WebSocket，也不触发 Auth/Core/Store；禁止自动降级。
 - `admin_socket` 必须是绝对路径，父目录由 Relay 运行用户持有且不得向 group/other 开放；
   socket 固定为 `0600`，server 逐连接核对 peer UID。
 - `public_wss_url` 必须是无用户名、query、fragment 和额外 path 的 `wss://` origin。
@@ -19,7 +22,14 @@ Relay listener 并列的 library server；production listener 要到 P2.9 才原
 配置项可来自 CLI、`AGENTDECK_RELAY_*` 环境变量或 TOML，优先级逐字段为
 CLI > env > TOML > defaults：
 
+production Direct TLS 配置示例：
+
 ```toml
+bind = "0.0.0.0:8443"
+health_bind = "127.0.0.1:8444"
+storage = "/var/lib/agentdeck-relay/relay-v2.db"
+tls_cert = "/etc/agentdeck-relay/tls/fullchain.pem"
+tls_key = "/etc/agentdeck-relay/tls/private-key.pem"
 admin_socket = "/var/run/agentdeck-relay/admin.sock"
 public_wss_url = "wss://relay.example.com/"
 spki_pins = ["BASE64URL_SHA256_CURRENT", "BASE64URL_SHA256_NEXT"]
@@ -27,6 +37,14 @@ spki_pins = ["BASE64URL_SHA256_CURRENT", "BASE64URL_SHA256_NEXT"]
 
 对应环境变量是 `AGENTDECK_RELAY_ADMIN_SOCKET`、
 `AGENTDECK_RELAY_PUBLIC_WSS_URL` 与逗号分隔的 `AGENTDECK_RELAY_SPKI_PINS`。
+
+部署前先以同一配置执行完整 preflight；selfcheck 会验证 TLS identity/SPKI、打开并
+重开 SQLite Store、构造 Core/Auth，再在不绑定 listener 的情况下退出：
+
+```bash
+agentdeck-relay --selfcheck --config /etc/agentdeck-relay/relay.toml
+agentdeck-relay --config /etc/agentdeck-relay/relay.toml
+```
 
 ## 创建 machine enrollment bundle
 
@@ -42,10 +60,22 @@ agentdeck-relay machine-enroll create \
 
 bundle 包含 Relay server ID、公开 WSS origin、当前/下一 SPKI pin、5 分钟到期时间和一次性
 code。Relay SQLite 只保存 code 的 SHA-256。daemon 在发送 code、MachineRoot 或 link/data
-public material前，必须先完成公开 CA 或 bundle SPKI pin 验证；redirect 一律拒绝。
+public material 前，必须先完成公开 CA 或 bundle SPKI pin 验证；redirect 一律拒绝。
 
 同 code + 同 canonical request 在 TTL 内会逐字节重放首次冻结响应；同 code + 不同请求
 拒绝。两个并发请求只有一个能建立 route。签名、公钥或证书角色校验失败发生在 code 消费前。
+
+需要验证当前 Relay 全链路而不建立持久配对时，用该 bundle 驱动真实外部
+Direct TLS listener：
+
+```bash
+agentdeck remote synthetic --bundle machine-enrollment-bundle.json
+```
+
+该命令使用临时 machine/device key，真实完成 enrollment、fresh challenge 鉴权、
+InstallGrant、register/publish/subscribe replay、Send/Reply、signed revoke 与终态重连。
+P4 前持久 `remote pair/machines/sessions/watch/send/...` 会返回
+`remote.persistent.unsupported`；不得把 synthetic 临时结果当作已保存设备配对。
 
 ## 本机 inventory 与 readback
 
@@ -99,3 +129,13 @@ fail-closed，绝不恢复旧 generation。只有再次执行带相同 fingerpri
 
 日志只允许记录稳定 event/failure code 和计数；一次性 code、完整 route/fingerprint、public key、
 signature、receipt、terminal 或 request/response bytes 出现在日志中均为安全回归。
+
+## 验证入口
+
+```bash
+bash scripts/verify-relay-companion-mvp.sh p2
+```
+
+该门禁包含 workspace Rust 回归、Relay v2 hardening/security E2E、client、Direct TLS
+selfcheck、daemon no-net、四份 schema 快照、文档与运行数据 git-status guard。R0/R1
+命令和 `--bootstrap-secret` 只属于历史记录，不得用于当前部署或验收。

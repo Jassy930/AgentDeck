@@ -100,7 +100,10 @@ agentdeckd
 | **N7** | **`SessionCapabilities` 必须先于该 session 任何 `AgentItem`** | 集成测试断言序 |
 | **N8** | **CC 数据事实唯一来源**：AgentDeck 不为 CC 维护任何元数据层；不在 `~/Library/Application Support/AgentDeck/` 下创建 `cc-meta/` 目录 | code review + 文件存在性断言 |
 
-### Relay R1a 不变量（传输 + 鉴权骨架）
+### Relay R1a 不变量（传输 + 鉴权骨架，历史）
+
+本节只记录 v1 探索期约束；相关协议、server/client 与生产路径已在 P2.9 物理删除，
+不得据此实现兼容或启动当前 Relay。
 
 - **R1a-1**：`agentdeckd` 依赖树无 `tokio net` 或 `axum`——保证 daemon 至 R2 前始终无网络代码；guard `scripts/check-daemon-no-net.sh`
 - **R1a-2**：`agentdeck-cli` 依赖树无 `axum`——CLI 只走 WS client 不做 server
@@ -111,14 +114,14 @@ agentdeckd
 - **R1a-7**：一条 `RemoteFrame` = 一条 WS text 帧（`serde_json` 序列化）；`RELAY_PROTOCOL_VERSION` 变更需协商
 - **R1a-8**：`DataEnvelope` bytes wire 为 base64 string（**不**是数字数组）
 
-### Relay R1b 不变量（SQLite 持久化 + Router 健壮化）
+### Relay R1b 不变量（SQLite 持久化 + Router 健壮化，历史）
 
 - **R1b-1**：relay 持久化状态（accounts/devices/challenges/seq 高水位/事件元数据）全部落 SQLite（`rusqlite` + `bundled`），单一 `--storage` 路径文件；**事件内容（`payload`）本期恒为 NULL，不落盘明文**（R1c 引入加密后翻转）。
 - **R1b-2**：`conv_buffer` 每 conversation 有硬上界（默认 1000，可配置），独立于 Ack 生效，防 OOM。
 - **R1b-3**：重放补拉（`since_seq`）语义为 **relay 进程存活期内** 的有界补拉，不是跨重启完整历史重放；窗口外返回 `relay.replay.gap`。
 - **R1b-4**：`RelayLink::recv` 仍不返回 `Result`（R2 defer，见 R1b 设计 §4.1）。
 
-### Relay Companion MVP P0 迁移边界
+### Relay Companion MVP P0 迁移边界（历史）
 
 - P0 冻结上述 Relay v1 schema 与行为基线，不扩展 v1 产品能力，也不改变现有
   Rust/Swift 生产路径。
@@ -134,8 +137,8 @@ agentdeckd
 
 ### Relay Companion MVP P2.1 v2 Store actor 边界
 
-- P2.1 在 `agentdeck-relay::v2::store` 建立与 v1 并列的 library；生产 binary、
-  listener 与 CLI 仍走 v1，直到 P2.9 原子切换，禁止提前形成双栈生产入口。
+- P2.1 当时在 `agentdeck-relay::v2::store` 建立与 v1 并列的 library；该阶段隔离
+  已于 P2.9 的原子切换结束，当前 production binary 只走 v2。
 - 一个 bounded async command queue 只通向一个 blocking worker；队列满时立即返回
   typed busy，不保留任意数量的等待请求。该 worker 独占
   唯一 `rusqlite::Connection`。async router 不持有 connection，也不能绕过 actor
@@ -164,7 +167,8 @@ agentdeckd
 
 ### Relay Companion MVP P2.2 v2 链路鉴权边界
 
-- P2.2 仍是与 v1 listener 并列的 library，不接管生产 WS。Relay v2 的签名字节事实源
+- P2.2 当时以隔离 library 建立链路鉴权；当前 production listener 已在 P2.9 接管。
+  Relay v2 的签名字节事实源
   位于 `agentdeck-protocol::relay_v2::auth`：credential unsigned/full canonical bytes、
   root-signed `ToBeSignedV1` 与 `AuthenticationTranscriptV1` 都使用独立 domain、长度前缀
   和大端数字，禁止复用明确声明“不参与签名”的 outer frame codec。
@@ -216,7 +220,7 @@ agentdeckd
 
 ### Relay Companion MVP P2.3 v2 Stream Core 边界
 
-- P2.3 仍是与 v1 listener 并列的 library，不接管生产 WebSocket。唯一
+- P2.3 当时以隔离 library 建立 Stream Core；当前 production listener 已在 P2.9 接管。唯一
   `RelayCore` actor 线性裁决 stream mutation；公开入口只有有界 command count 与
   64 MiB ingress byte admission，队列满立即返回 typed quota；所有可配置容量还有不可调高的
   代码级 hard maximum（command 4,096、ingress 256 MiB、connection 4,096、每连接
@@ -259,12 +263,13 @@ agentdeckd
   额外 64 KiB 磁盘增长余量。幂等 retry 不重复占容量，配置下调或旧 DB 已超限时在 Store
   ready 前 typed fail-closed，不静默删除 durable state。
 - Core、writer、replay 的 Debug 只能打印计数、failure code 和带类型域的 route 短 hash；
-  不格式化 sealed bytes 或完整 route/generation。P2.9 前仍不能把本节测试通过描述为
-  v2 公网 listener 已上线。
+  不格式化 sealed bytes 或完整 route/generation。本节单元测试本身不等于部署证据；
+  production cutover 与真实 Direct TLS synthetic 分别由 P2.9/P2.10 门禁证明。
 
 ### Relay Companion MVP P2.4 PairRoute 与在线请求边界
 
-- P2.4 仍是与 v1 listener 并列的 library，不接管生产 WebSocket。`PairRouteRegistry` 只由
+- P2.4 当时以隔离 library 建立 PairRoute 与在线请求；当前 production listener 已在 P2.9
+  接管。`PairRouteRegistry` 只由
   `RelayCore` actor 修改且不落 SQLite：默认/不可调高上限为每 machine 8、全局 1,024、
   每 route lifetime 32 frames / 1 MiB、absolute TTL 300 秒；每 route 独立 burst 8、
   refill 2 frames/s。Close 后保留到 absolute expiry 的 bounded tombstone 并继续占容量，
@@ -291,7 +296,8 @@ agentdeckd
 
 ### Relay Companion MVP P2.5 授权撤销与退役边界
 
-- P2.5 仍是并列 library contract，不接管 production listener。`DeviceRevocation` 与
+- P2.5 当时以隔离 library 建立撤销/退役 contract；当前 production listener 已在 P2.9
+  接管。`DeviceRevocation` 与
   `RetireMachine` 的 unsigned/full canonical bytes、SHA-256 和 MachineRoot `ToBeSignedV1`
   由 `agentdeck-protocol` 唯一定义；`RetireMachine` 显式绑定 `rootKeyId`。既有 wire kind
   0–27 保持不动，严格最小的 `RetirementCommitted(machineRoute, trustEpoch, retireHash)`
@@ -328,12 +334,12 @@ agentdeckd
   request 精确重试；恢复仍失败则不恢复旧 generation，整机 retirement 会终止 Core 以清空
   PairRoute。未知 route
   不是成功。admin root-lost purge沿用同一 primitive但 terminal hash为空，详细 authority 与
-  root fingerprint确认留在 P2.7 本机 0600 admin UDS。
+  root fingerprint 确认已由 P2.7 本机 0600 admin UDS 承载。
 
 ### Relay Companion MVP P2.6 TLS、可用性与生命周期边界
 
-- P2.6 仍是与 v1 production binary 并列的 v2 library server；默认 dispatch 只在 P2.9
-  原子切换。公开面只有固定 `/v2/connect` 与 `/v2/pair` WebSocket path；配对 route 由
+- P2.6 建立的 v2 server 已在 P2.9 成为唯一 production dispatch。公开面只有固定
+  `/v2/connect` 与 `/v2/pair` WebSocket path；配对 route 由
   TLS 后 canonical binary `PairingHello` 传入，query 不承载 route。public listener 不挂
   health、inventory、purge 或 redirect。
 - WebSocket 聚合前先受 4 MiB max-frame/max-message 限制，协议层只接受 binary canonical
@@ -367,7 +373,35 @@ agentdeckd
   route、key、signature、sealed bytes 与输入 sentinel 不进入日志。测试必须同时覆盖正向事件
   存在与敏感值零命中，不能用“完全没有日志”冒充 redaction。
 
-### R1a 隐含约束（供 R2 参考）
+### Relay Companion MVP P2.7–P2.10 production 边界
+
+- P2.7 的 host 管理面只存在于本机 0600、同 UID、有界 JSONL admin UDS；公开网络
+  只新增 `POST /v2/machine-enroll`。enrollment code 为一次性 256 bit / 5 分钟，SQLite
+  只保存 hash。code 消费、machine trust 写入、canonical request hash 与冻结 response/
+  receipt 在一个 transaction 内提交；inventory、fingerprint-bound readback/purge 从不
+  暴露到网络 listener。MachineRoot 丢失只支持 purge 后重新 enroll/配对，不提供恢复。
+- P2.8 的 outbound client 默认不依赖 Relay server/store。principal 与 pairing 各有严格
+  typed 状态机，fresh challenge、CA/hostname/SPKI、bounded single reader/writer、heartbeat、
+  outcome-unknown、signed terminal 原字节都 fail-closed。TLS/SPKI 完整验证前绝不发送
+  enrollment code、MachineRoot 或其他秘密材料。
+- P2.9 原子删除 Relay v1 protocol/server/client/daemon bridge 与测试源码，production binary
+  只装配 v2 Store/Auth/Core/Admin/Server。`/v1/connect` 唯一遗留行为是无状态 HTTP 426：
+  不升级 WebSocket、不查询 Auth/Store、不协商降级。production 只允许 Direct TLS/WSS；
+  loopback 明文与 proxy 需要显式配置且只用于受控开发。
+- 旧 v1 credential marker 不属于自动迁移输入。CLI 只用 `symlink_metadata` 判断 marker
+  是否存在；存在、悬空 symlink 或 metadata 错误均返回 `remote.v1.reset_required`，绝不打开、
+  解析、删除或拨号。清理只能由显式 reset 脚本执行，之后重新配对。
+- `agentdeck remote synthetic --bundle FILE` 驱动一个真实外部 Direct TLS listener，使用
+  临时 machine/device identity 完成 enrollment、fresh challenge auth、InstallGrant、stream
+  replay、Send/Reply、signed revoke 与终态重连；它不保存身份。P4 前持久 remote 命令固定
+  返回 `remote.persistent.unsupported`。
+- P2.10 hardening/security suites 以真实 Store/Core/server 证明跨重启逐字节 replay、gap、
+  quota、disk-low、fault、drain/shutdown、撤销/退役和多 sentinel 密文扫描；Relay 可见
+  outer/response、tracing、health/ready/metrics HTTP surface 与 SQLite DB/WAL 均不得出现
+  应用明文。`scripts/check-daemon-no-net.sh` 继续守护
+  `agentdeckd` 无网络依赖，P2.10 不越界声称 daemon/iOS 已接入。
+
+### R1a 隐含约束（历史参考）
 
 - **R1a machine_id ≡ device_id**：`server/ws.rs::connect` 用 `device.device_id` 作 `ConnRole::Machine.machine_id`，`router.rs` RegisterMachine 授权强制 `machine.machine_id == connection.machine_id`——**enrolled 的 machine 设备的 `machine_id` 严格等于 `device_id`**。CLI 生成的随机 `device_id = "cli-<profile>-<random>"` 会锁定 R2 daemon remote-mode 里对应 machine 的 identifier；R2 设计需评估是否解耦 machine_id 与 device_id（例如 machine 元数据里显式携带独立 machine_id）。
 
