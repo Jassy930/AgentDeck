@@ -583,7 +583,7 @@ authenticated ledger 覆盖 catalog/queue/safety counters 与 conversation/comma
 Keychain CounterGuard 绑定 generation/HWM 后闭环。非秘密 enrollment receipt 只是 root-lost
 locator，P4 purge 必须另验 Relay/admin-signed receipt。
 
-**执行记录（2026-07-11，P3.2-A～F，最终门禁进行中）:** 已完成专用 blocking worker 的有界 normal lane 与
+**执行记录（2026-07-11，P3.2-A～F，已完成）:** 已完成专用 blocking worker 的有界 normal lane 与
 独立 shutdown control lane、严格七表 schema v1、WAL/FULL/FK/limit 读回、StorageKEK 包装的
 行密钥/盲索引密钥、随机 nonce 行密文、真实 live `sqlite_schema` manifest 校验，以及 DB/WAL/SHM
 owner/mode/nlink/symlink 预检。fresh DB 只在临时库完整 COMMIT + fsync 后原子 no-replace 发布；
@@ -596,14 +596,15 @@ copy-peak、shutdown quiescence 与 paged recovery。当前最新聚焦证据：
 `runtime_store_journal` 5/5、`runtime_store_recovery` 4/4。加入五类 authenticated total、
 descriptor/HWM/finish 再验证后，完整 `cargo test -p agentdeckd -- --test-threads=1` 全绿；真实
 1,024 × 256 KiB 项 262.35s，唯一 provisioned signed Keychain test 仍按 P3.1 既有边界
-ignored/GATED。独立安全复核与容量/恢复/关停复核均未发现 P0/P1/P2；Step 6 待本次实现提交完成后勾选。
+ignored/GATED。独立安全复核与容量/恢复/关停复核均未发现 P0/P1/P2。实现提交为
+`8744750 feat(daemon): 建立 Runtime 持久化 journal`。
 
 - [x] Step 1: 写store tests。 覆盖daemon先生成stable IDs，commandSeq/eventSeq/catalogRevision跨重启单调，Accepted COMMIT，conversation-scoped idempotency ledger至少保留30天；machine-wide admin ledger留给所属后续task。2GiB准入按main DB+WAL+SHM observed+projected总量、`max_page_count`与有界checkpoint共同计算，另保留512MiB或文件系统5%（取较大者）；1,024 prompts/256MiB/24h；disk-low拒绝新副作用但继续read/safety/rescue/diagnostics；敏感row非明文；删除全部Keychain item后仍从非秘密receipt index读old route/fingerprint且不生成新root/KEK。
 - [x] Step 2: 运行 `cargo test -p agentdeckd --test runtime_store -- --test-threads=1`。 Expected: FAIL，RuntimeStore不存在。
 - [x] Step 3: 实现专用 blocking store worker、WAL/FULL/FK/busy timeout与 StorageKEK row cipher。 `Started + ExecutionIntent + CommandStarted event` 在同一事务；所有 store failure返回 typed error。
 - [x] Step 4: 重跑 store test，并把 DB复制/重开验证 recovery。 Expected: Accepted queue/HWM/idempotency恢复；wrapped field扫描不含 sentinel。
 - [x] Step 5: fmt/clippy。
-- [ ] Step 6: 提交。 `git add agentdeckd && git commit -m "feat(daemon): 建立 Runtime 持久化 journal"`
+- [x] Step 6: 提交。 `git add agentdeckd && git commit -m "feat(daemon): 建立 Runtime 持久化 journal"`
 
 ### Task P3.3：建立 adapterStateKey 私有映射并收窄 N8
 
