@@ -432,7 +432,7 @@ impl RelayPairingClient {
 - [x] Step 3: 已实现默认纯client crate。三种TLS策略不互相降级；principal/enrollment/pairing互斥；后台single reader/writer、有界data/control/urgent预算和fresh auth reconnect均已落地。P2.9前旧调用方仅通过非默认`v1-compat`显式桥接，避免workspace红态。
 - [x] Step 4: client 5 unit + 9 integration + 1 compile-fail通过，真实Relay TLS E2E 11/11通过；默认normal tree不含`agentdeck-relay`、axum、rusqlite。receipt helper上移protocol，PairInvite/PairRequest/PairingEvent Debug脱敏。
 - [x] Step 5: focused clippy `-D warnings`、rustdoc、rustfmt、protocol/client/Relay TLS回归、dependency tree与diff gate纳入本阶段门禁；独立安全复审无剩余P0/P1/P2。
-- [ ] Step 6: 提交。 `git add agentdeck-relay-client Cargo.lock && git commit -m "feat(relay-client): 切换 v2 WSS 与 SPKI pin"`
+- [x] Step 6: 已精确暂存client、protocol helper/redaction、真实Relay集成、临时consumer feature桥、依赖锁与阶段文档，并提交为 `ecf8102 feat(relay-client): 切换 v2 WSS 与 SPKI pin`；未包含构建产物、运行数据或本地SDD ledger。
 
 ### Task P2.9：原子切换 binary/CLI synthetic tests 并删除 Relay v1 生产代码
 
