@@ -9,7 +9,9 @@
 pub mod agent;
 pub mod claude_code;
 pub mod codex;
+pub mod config;
 pub mod diag;
 pub mod ipc;
 pub mod record;
 pub mod runtime;
+pub mod security;

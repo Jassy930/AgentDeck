@@ -18,12 +18,94 @@
 //! (sk-..., Bearer ..., AWS keys) from landing in a plaintext run log.
 
 use std::ffi::OsStr;
+use std::fmt;
 use std::fs::{OpenOptions, create_dir_all};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+static CONFIGURED_APP_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// daemon 启动后，run record 与 diagnostics 必须固定使用已经通过 namespace /
+/// singleton 校验的目录；进程环境变量只保留给未启动 daemon 的 diagnostics one-shot。
+#[derive(Debug, Eq, PartialEq)]
+pub enum RecordNamespaceError {
+    PathNotAbsolute {
+        path: PathBuf,
+    },
+    AlreadyConfigured {
+        existing: PathBuf,
+        requested: PathBuf,
+    },
+}
+
+impl RecordNamespaceError {
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::PathNotAbsolute { .. } => "daemon.record.namespace_not_absolute",
+            Self::AlreadyConfigured { .. } => "daemon.record.namespace_already_configured",
+        }
+    }
+}
+
+impl fmt::Display for RecordNamespaceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PathNotAbsolute { path } => {
+                write!(
+                    formatter,
+                    "record namespace {} is not absolute",
+                    path.display()
+                )
+            }
+            Self::AlreadyConfigured {
+                existing,
+                requested,
+            } => write!(
+                formatter,
+                "record namespace is already configured as {}; refusing {}",
+                existing.display(),
+                requested.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RecordNamespaceError {}
+
+/// 把 record/diagnostics 路径一次性绑定到当前 daemon 的已验证 namespace。
+pub fn configure_app_data_dir(path: impl Into<PathBuf>) -> Result<(), RecordNamespaceError> {
+    let requested = path.into();
+    if !requested.is_absolute() {
+        return Err(RecordNamespaceError::PathNotAbsolute { path: requested });
+    }
+    if let Some(existing) = CONFIGURED_APP_DATA_DIR.get() {
+        return if existing == &requested {
+            Ok(())
+        } else {
+            Err(RecordNamespaceError::AlreadyConfigured {
+                existing: existing.clone(),
+                requested,
+            })
+        };
+    }
+    CONFIGURED_APP_DATA_DIR.set(requested).map_err(|requested| {
+        RecordNamespaceError::AlreadyConfigured {
+            existing: CONFIGURED_APP_DATA_DIR
+                .get()
+                .expect("OnceLock winner must be visible")
+                .clone(),
+            requested,
+        }
+    })
+}
 
 /// AgentDeck's own data directory. Never the project tree (premise 5).
 pub fn app_data_dir() -> Option<PathBuf> {
+    if let Some(configured) = CONFIGURED_APP_DATA_DIR.get() {
+        return Some(configured.clone());
+    }
     app_data_dir_from(
         std::env::var_os("AGENTDECK_DATA_DIR").as_deref(),
         std::env::var_os("AGENTDECK_PROFILE").as_deref(),

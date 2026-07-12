@@ -80,7 +80,10 @@ Layer B Vendor 控件命名空间允许 vendor 前缀但类型化（禁 `serde_j
 透传，N4 守护）。UI 通过 `CapabilityRouter` 消费 `SessionCapabilities`
 选择渲染路径，不得硬编码 `if agentKind == .codex` 分支（N2 守护）。
 
-AgentDeck 使用一个 `agentdeckd` 作为 runtime hub。daemon 的 stdin 主循环不被
+目标架构由每个 macOS 登录用户唯一的 stable `agentdeckd` 作为 runtime hub。P3.1
+已经建立固定 namespace、进程锁与 StorageKEK 启动边界；当前 GUI/CLI 仍处于 stdio
+过渡期，每个调用方只会显式启动一个 `--ephemeral --no-remote --profile dev` 子进程，
+多个客户端共享同一 daemon 要到 P3.9 的 UDS cutover 后才成立。daemon 的 stdin 主循环不被
 单个 turn 阻塞；每个后台 turn 由独立 worker 持有 turn 级 adapter，turn 结束即
 释放，所有 worker 通过统一 stdout writer 输出带 `sessionId/threadId/agentKind`
 的中立事件。RuntimeHub 会阻止同一 `sessionId` 同时启动多个 turn；超限时
@@ -205,7 +208,7 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（P2.10）
+## Relay Companion MVP 实施状态（P2.10 完成，P3.1 进行中）
 
 Relay production binary 已原子切换到 **Relay v2**。公开数据面只接受
 `/v2/connect`、`/v2/pair` 与 enrollment 所需的 `POST /v2/machine-enroll`；
@@ -265,6 +268,37 @@ DB、精确 `-wal`、`-shm` 和指定 credential，不使用 glob。此开发 re
 路径，后续使用前必须重新配对。脚本需要 `awk`、`sqlite3`、`jq`、`openssl`、
 `realpath` 和 `stat`。
 
+### P3.1 singleton namespace / StorageKEK 当前边界
+
+stable daemon 的资源名不可覆盖：data root 固定为当前 EUID 通过 `getpwuid_r`
+取得的 OS account home 下 `Library/Application Support/AgentDeck`，其内固定使用
+`runtime.db`、`agentdeckd.sock` 与 `agentdeckd.lock`。启动不信任 `HOME`、
+`AGENTDECK_DATA_DIR` 或运行时注入的 Keychain access group；`--data-dir` 只保留给
+不启动 daemon 的 diagnostics one-shot。开发实例必须同时显式传
+`--ephemeral --no-remote`，`--profile dev` 单独使用也会 fail-close。
+
+namespace 以 0700 原子建立。固定 stable 目录若来自旧版本，只允许权限精确为 0755
+且是当前 UID 拥有的真实目录时，经 `O_NOFOLLOW` 打开的 directory fd 收紧到 0700；
+0775、0777、01755 及 ephemeral 宽权限目录直接拒绝。singleton lock 只通过该 dirfd 的 `openat`
+创建/打开，并在 `flock` 前后复核目录和 lock 的 owner、mode、nlink、dev/ino，避免
+路径替换或 symlink/hardlink 绕过。
+
+stable `storage-kek.v1` 只允许存入 macOS Data Protection Keychain。access group
+必须是 release helper entitlement 中真实展开的
+`<TeamIdentifier>.com.agentdeck.agentdeckd.stable`，且在编译时注入；backend 或
+entitlement 不可用时立即失败，没有 memory 或明文 key 文件回退。item 使用 protected、
+non-synchronizable、`AccessibleAfterFirstUnlockThisDeviceOnly` 且不要求 user presence。
+只有完全 fresh、DB/WAL/SHM 都不存在或为空的 namespace 才能生成一次 32-byte
+StorageKEK；写入后必须立即读回并逐字节一致。既有 Runtime artifact 缺 key、长度错误
+或读回不一致都 fail-close；secret 的 Debug 脱敏并在 Drop 时清零。
+
+当前自动测试已覆盖 namespace 18/18、binary startup 4/4、StorageKEK 14 PASS，另有
+1 个真实签名 Keychain `set → load → delete` roundtrip 保持 ignored gate。该真实 gate
+**尚未通过**：本机没有匹配 access group 的 provisioning profile；Apple Development
+和本地 self-signed helper 虽然都通过 `codesign --verify`，启动仍被 AMFI 以 exit 137
+终止。因此 P3.1/P3 还不能声明完成，必须在具备匹配 provisioning/entitlement 的已签名
+helper 上补齐证据。
+
 ## agentdeck CLI（参考客户端 / E2E 驱动）
 
 `agentdeck` 是一个 Rust 二进制参考客户端，**不在 Swift GUI 的实时通路上**。Swift app 仍直接通过 stdio JSONL 与 daemon 通信；`agentdeck` 用于脚本化调用、本地验证以及门控 E2E 测试驱动。
@@ -273,8 +307,8 @@ DB、精确 `-wal`、`-shm` 和指定 credential，不使用 glob。此开发 re
 
 | 标志 | 说明 |
 | --- | --- |
-| `--profile stable\|dev` | 选择 AgentDeck 数据目录（默认 stable） |
-| `--data-dir <path>` | 直接覆盖数据目录（优先于 --profile） |
+| `--profile stable\|dev` | 保留给 CLI/diagnostics 的 profile 选择；P3.1 stdio 子进程固定显式 ephemeral dev，不据此进入 stable namespace |
+| `--data-dir <path>` | diagnostics one-shot 的旧数据目录读取；不能覆盖 daemon namespace |
 | `--pretty` | 人读格式输出（E2E 不依赖此标志） |
 
 ### 子命令目录
@@ -346,6 +380,9 @@ swift run AgentDeck               # 本地 debug 构建默认使用 dev profile
 swift run AgentDeck -- --selfcheck  # 无窗口自检: IPC lifecycle + logging/redaction probe
 swift run AgentDeck -- --diagnostics-report --json  # 输出机器可读诊断报告
 swift run AgentDeck -- --preview  # 前端 mock 预览，不连真实 daemon
+
+# 直接验证 P3.1 daemon 启动边界（unsigned 开发构建只能使用完整 ephemeral pair）
+cargo run -p agentdeckd -- --ephemeral --no-remote --profile dev --selfcheck
 ```
 
 macOS 前端使用纯 AppKit。当前主窗口外壳对齐 Codex Desktop：透明标题栏、
@@ -353,7 +390,7 @@ macOS 前端使用纯 AppKit。当前主窗口外壳对齐 Codex Desktop：透�
 会话态悬浮 composer 和右侧环境信息面板。外观层仍保持 v0.2 统一壳边界：
 vendor 控件由 `CapabilityRouter` 装配，daemon / IPC / history 模型不因视觉同步而改动。
 
-Profile（用于拆分稳定工作实例和开发调试实例）：
+Profile（P3.1 过渡行为）：
 
 ```bash
 swift run AgentDeck -- --profile stable
@@ -362,19 +399,27 @@ swift run AgentDeck -- --selfcheck --profile dev
 swift run AgentDeck -- --diagnostics-report --json --profile dev
 ```
 
-- release 构建未显式传 `--profile` 时默认使用 `stable`，写入
-  `~/Library/Application Support/AgentDeck/`。
-- SwiftPM/debug 构建未显式传 `--profile` 时默认使用 `dev`，适合本地迭代。
-- `dev` 写入 `~/Library/Application Support/AgentDeck-Dev/`，窗口标题显示
-  `AgentDeck Dev`。
-- profile 只隔离 AgentDeck 管理的数据，不隔离 Codex 登录状态或 Codex
-  app-server 历史。
+- App 的 profile 仍可控制窗口标题和 diagnostics 读取；它不隔离 vendor 登录状态或
+  vendor 原生历史。
+- 在 P3.9 UDS cutover 前，Swift `ProcessDaemonTransport` 与 Rust CLI 的 sync/async
+  stdio transport 都忽略旧 profile/data-dir spawn 参数，移除继承的
+  `AGENTDECK_PROFILE` / `AGENTDECK_DATA_DIR`，固定传
+  `--ephemeral --no-remote --profile dev`。因此这些子进程不会读取或创建 stable Runtime
+  信任域，也还不能让多个客户端共享同一 daemon。
+- stable 模式只面向带 daemon-only entitlement、编译进真实 access group 的 release-signed
+  helper；普通 unsigned SwiftPM/Cargo 构建直接启动 stable 必须返回
+  `daemon.keystore.access_group_unconfigured`，不能靠运行时环境变量绕过。
 
 测试：
 
 ```bash
 cargo test        # daemon: ipc/codex/record/diag/report(含 fixture 回放)
 swift test        # app: 中立协议 + 分行成帧 + headless 请求编码
+
+# P3.1 聚焦门禁
+cargo test -p agentdeckd --test daemon_namespace --test storage_kek \
+  --test daemon_startup -- --test-threads=1
+bash scripts/check-daemon-no-net.sh
 ```
 
 ### 门控 E2E 测试
@@ -399,20 +444,22 @@ framing（逐行 JSONL）。codex 版本固定在 `protocol/CODEX_VERSION.txt`�
 
 ### 本地数据（AgentDeck 管理，绝不进你的 git）
 
-- run record：`~/Library/Application Support/AgentDeck/runs/*.jsonl`
+- stable run record：`<OS account home>/Library/Application Support/AgentDeck/runs/*.jsonl`
   - 每次 turn 的中立 `AgentItem` 留痕，可按 `runId` 回放和排查。
-- diagnostic log：`~/Library/Application Support/AgentDeck/diagnostic.log`
+- stable diagnostic log：`<OS account home>/Library/Application Support/AgentDeck/diagnostic.log`
   - 结构化 JSONL，记录进程、IPC、adapter、run record 写入和自检异常。
   - Codex app-server 断连时会附带其 stderr 尾部摘要，便于定位启动失败或崩溃根因。
-- dev profile 数据：`~/Library/Application Support/AgentDeck-Dev/`
-  - 用于快速迭代和调试，避免污染 stable 的工作记录。
+- P3.1 stdio 开发实例：位于 OS temp root 下随机的 0700 `ad-<instance-id>/`，每次
+  spawn 独立，且 remote disabled；旧 `AgentDeck-Dev/` 只可能被 diagnostics one-shot
+  作为历史 profile 读取，不再是 daemon 启动 namespace。
 
 Agent 自查流程见 [docs/AGENT_DIAGNOSTICS.md](docs/AGENT_DIAGNOSTICS.md)。
 质量门禁和文档结构检查见 [docs/QUALITY.md](docs/QUALITY.md)。
 
 写入前做 best-effort 密钥脱敏。写失败不阻塞会话，但会在界面可见
-警告（绝不静默）。`AGENTDECK_DATA_DIR` 只用于测试/诊断时覆盖数据目录，
-不是普通用户配置；它优先于 `--profile` / `AGENTDECK_PROFILE`。
+警告（绝不静默）。`AGENTDECK_DATA_DIR` / `AGENTDECK_PROFILE` 只用于尚未启动
+daemon 的 diagnostics one-shot；daemon startup 不读取它们，也不允许它们改变
+stable ownership。
 
 ### 回滚
 

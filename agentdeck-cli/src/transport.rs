@@ -111,9 +111,24 @@ pub fn run_daemon_diagnostics_report(
     )))
 }
 
+const STDIO_DAEMON_ARGS: [&str; 4] = ["--ephemeral", "--no-remote", "--profile", "dev"];
+
+fn configure_sync_stdio_daemon(command: &mut Command) {
+    command.args(STDIO_DAEMON_ARGS);
+    command.env_remove("AGENTDECK_DATA_DIR");
+    command.env_remove("AGENTDECK_PROFILE");
+}
+
+fn configure_async_stdio_daemon(command: &mut TokioCommand) {
+    command.args(STDIO_DAEMON_ARGS);
+    command.env_remove("AGENTDECK_DATA_DIR");
+    command.env_remove("AGENTDECK_PROFILE");
+}
+
 // ── Synchronous ProcessTransport (blocking I/O, used for admin commands) ─────
 
-/// 真实传输：spawn agentdeckd，走其 stdin/stdout JSONL。
+/// 过渡传输：spawn 隔离、无远程能力的 dev agentdeckd，走 stdin/stdout JSONL。
+/// `profile` / `data_dir` 仅为兼容旧调用签名保留，不会进入 stable namespace。
 /// A1：Drop 时杀子进程，daemon 自身 Drop 级联杀 codex 进程组。
 pub struct ProcessTransport {
     child: Child,
@@ -122,7 +137,7 @@ pub struct ProcessTransport {
 }
 
 impl ProcessTransport {
-    pub fn spawn(profile: &str, data_dir: Option<&str>) -> std::io::Result<Self> {
+    pub fn spawn(_profile: &str, _data_dir: Option<&str>) -> std::io::Result<Self> {
         let path = locate_daemon().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -131,10 +146,7 @@ impl ProcessTransport {
         })?;
         let mut cmd = Command::new(path);
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
-        cmd.env("AGENTDECK_PROFILE", profile);
-        if let Some(d) = data_dir {
-            cmd.env("AGENTDECK_DATA_DIR", d);
-        }
+        configure_sync_stdio_daemon(&mut cmd);
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
@@ -177,7 +189,8 @@ impl Drop for ProcessTransport {
 
 // ── Async streaming transport (used for session run/continue) ─────────────────
 
-/// Spawns agentdeckd as a child process and provides async send/recv.
+/// Spawns an isolated, no-remote dev agentdeckd child and provides async send/recv.
+/// The legacy profile/data-dir inputs are intentionally not forwarded.
 /// Used for session streaming where we need a tokio mpsc receiver.
 ///
 /// Call `into_parts()` to split into a writer (keeps child alive) and
@@ -195,7 +208,7 @@ struct AsyncTransportInner {
 }
 
 impl AsyncProcessTransport {
-    pub async fn spawn(profile: &str, data_dir: Option<&str>) -> std::io::Result<Self> {
+    pub async fn spawn(_profile: &str, _data_dir: Option<&str>) -> std::io::Result<Self> {
         let path = locate_daemon().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -206,10 +219,7 @@ impl AsyncProcessTransport {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        cmd.env("AGENTDECK_PROFILE", profile);
-        if let Some(d) = data_dir {
-            cmd.env("AGENTDECK_DATA_DIR", d);
-        }
+        configure_async_stdio_daemon(&mut cmd);
         let mut child = cmd.spawn()?;
         let writer = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
@@ -306,6 +316,19 @@ impl Drop for AsyncTransportWriter {
 mod tests {
     use super::*;
 
+    fn command_args(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn command_env(command: &Command, key: &str) -> Option<Option<String>> {
+        command.get_envs().find_map(|(name, value)| {
+            (name == key).then(|| value.map(|value| value.to_string_lossy().into_owned()))
+        })
+    }
+
     #[test]
     fn fake_records_sent_and_replays_incoming() {
         let mut t = FakeTransport::new(vec![r#"{"reply":"pong"}"#.to_string()]);
@@ -323,5 +346,37 @@ mod tests {
     fn locate_daemon_returns_some_or_none_without_panic() {
         // Just ensure it doesn't panic; actual path depends on build state.
         let _ = locate_daemon();
+    }
+
+    #[test]
+    fn sync_stdio_child_is_explicit_ephemeral_dev_and_drops_legacy_namespace_env() {
+        let mut command = Command::new("agentdeckd");
+        configure_sync_stdio_daemon(&mut command);
+
+        assert_eq!(
+            command_args(&command),
+            ["--ephemeral", "--no-remote", "--profile", "dev"]
+        );
+        assert_eq!(command_env(&command, "AGENTDECK_DATA_DIR"), Some(None));
+        assert_eq!(command_env(&command, "AGENTDECK_PROFILE"), Some(None));
+    }
+
+    #[test]
+    fn async_stdio_child_uses_the_same_isolated_startup_contract() {
+        let mut command = TokioCommand::new("agentdeckd");
+        configure_async_stdio_daemon(&mut command);
+
+        assert_eq!(
+            command_args(command.as_std()),
+            ["--ephemeral", "--no-remote", "--profile", "dev"]
+        );
+        assert_eq!(
+            command_env(command.as_std(), "AGENTDECK_DATA_DIR"),
+            Some(None)
+        );
+        assert_eq!(
+            command_env(command.as_std(), "AGENTDECK_PROFILE"),
+            Some(None)
+        );
     }
 }

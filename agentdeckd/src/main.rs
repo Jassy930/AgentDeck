@@ -1,93 +1,160 @@
 //! agentdeckd — AgentDeck daemon (v2 protocol).
 //!
-//! Architecture (Eng D2): the IPC protocol IS the agent-neutral boundary.
-//! `agentdeck-protocol` defines the neutral wire types; `codex` is the
-//! ONLY module that knows Codex exists (N3). The Swift app and the CLI
-//! speak only the protocol crate; future ClaudeCodeAdapter / SSH
-//! adapters are siblings of `codex`.
-//!
-//!   Swift / CLI ──JSONL──▶ agentdeckd ─┬─ agentdeck-protocol (neutral wire)
-//!                ◀─JSONL───             ├─ runtime::router (per-AgentKind)
-//!                                       └─ codex ──▶ codex app-server child
-//!                                                  ◀── JSON-RPC (newline)
-//!
-//! Process boundary (Eng A1): every Codex child runs in its own process
-//! group (`process_group(0)`) so cancel / drop SIGKILLs the whole subtree
-//! (MCP servers, sandbox helpers) without orphans. See codex/adapter.rs.
-//!
-//! Phase 3 / Task 3C scope: this main is a thin CLI shell around
-//! `RuntimeHub::run(stdin, stdout)`. Admin flags (`--selfcheck`,
-//! `--diagnostics-report`, `--profile`, `--data-dir`) are handled before
-//! the loop starts.
+//! P3.1 起，真正的 daemon 入口先建立唯一 namespace、进程锁和 StorageKEK，
+//! 再进入 selfcheck 或 compatibility stdio loop。stable helper 只接受构建时注入
+//! 的 daemon-only Keychain access group；开发实例必须显式使用
+//! `--ephemeral --no-remote`。
 
+use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use agentdeckd::claude_code::ClaudeCodeAdapter;
 use agentdeckd::codex::CodexAdapter;
+use agentdeckd::config::{
+    DaemonConfig, DaemonProfile, DaemonStartupOptions, compiled_stable_keychain_access_group,
+};
 use agentdeckd::diag;
 use agentdeckd::record;
+use agentdeckd::runtime::singleton::SingletonGuard;
 use agentdeckd::runtime::{AgentRouter, RuntimeHub};
+use agentdeckd::security::{key_store_for_config, load_or_create_storage_kek};
 
 #[derive(Debug, Default)]
 struct CliArgs {
-    /// "stable" or "dev" — selects `Application Support/{AgentDeck,AgentDeck-Dev}`.
-    profile: Option<String>,
-    /// Absolute path; overrides profile-based data dir entirely.
+    profile: Option<DaemonProfile>,
+    /// 只保留给 diagnostics-report 的旧数据目录读取；不能改变 daemon ownership。
     data_dir: Option<PathBuf>,
-    /// One-shot mode: print "OK" + protocol version, exit 0.
+    ephemeral: bool,
+    no_remote: bool,
     selfcheck: bool,
-    /// One-shot mode: emit JSONL summary of diagnostic.log to stdout, exit 0.
     diagnostics_report: bool,
-    /// Print --version and exit.
     show_version: bool,
-    /// Print --help and exit.
     show_help: bool,
 }
 
-fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<CliArgs, String> {
+#[derive(Debug)]
+enum CliError {
+    MissingValue { flag: &'static str },
+    InvalidProfile { value: OsString },
+    UnknownArgument { value: OsString },
+    DataDirForbidden,
+    ConflictingOneShotModes,
+    DiagnosticsStartupFlagsForbidden,
+}
+
+impl CliError {
+    const fn code(&self) -> &'static str {
+        match self {
+            Self::MissingValue { .. } => "daemon.cli.missing_value",
+            Self::InvalidProfile { .. } => "daemon.cli.invalid_profile",
+            Self::UnknownArgument { .. } => "daemon.cli.unknown_argument",
+            Self::DataDirForbidden => "daemon.cli.data_dir_forbidden",
+            Self::ConflictingOneShotModes => "daemon.cli.conflicting_one_shot_modes",
+            Self::DiagnosticsStartupFlagsForbidden => {
+                "daemon.cli.diagnostics_startup_flags_forbidden"
+            }
+        }
+    }
+}
+
+impl fmt::Display for CliError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingValue { flag } => write!(formatter, "{flag} requires a value"),
+            Self::InvalidProfile { value } => write!(
+                formatter,
+                "invalid --profile value {:?}; expected stable or dev",
+                value.to_string_lossy()
+            ),
+            Self::UnknownArgument { value } => {
+                write!(formatter, "unknown argument: {:?}", value.to_string_lossy())
+            }
+            Self::DataDirForbidden => formatter
+                .write_str("--data-dir is diagnostics-only and cannot override a daemon namespace"),
+            Self::ConflictingOneShotModes => {
+                formatter.write_str("--selfcheck and --diagnostics-report are mutually exclusive")
+            }
+            Self::DiagnosticsStartupFlagsForbidden => formatter.write_str(
+                "--ephemeral/--no-remote are daemon startup flags, not diagnostics options",
+            ),
+        }
+    }
+}
+
+fn parse_args<I>(args: I) -> Result<CliArgs, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
     let mut out = CliArgs::default();
     let mut it = args.into_iter();
-    // Skip argv[0]
     let _ = it.next();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--profile" => {
-                let v = it.next().ok_or("--profile requires a value")?;
-                out.profile = Some(v);
-            }
-            "--data-dir" => {
-                let v = it.next().ok_or("--data-dir requires a value")?;
-                out.data_dir = Some(PathBuf::from(v));
-            }
-            "--selfcheck" => out.selfcheck = true,
-            "--diagnostics-report" => out.diagnostics_report = true,
-            "--version" | "-V" => out.show_version = true,
-            "--help" | "-h" => out.show_help = true,
-            other => return Err(format!("unknown argument: {other}")),
+    while let Some(argument) = it.next() {
+        if argument == OsStr::new("--profile") {
+            let value = it
+                .next()
+                .ok_or(CliError::MissingValue { flag: "--profile" })?;
+            out.profile = Some(match value.as_os_str() {
+                value if value == OsStr::new("stable") => DaemonProfile::Stable,
+                value if value == OsStr::new("dev") => DaemonProfile::Dev,
+                _ => return Err(CliError::InvalidProfile { value }),
+            });
+        } else if argument == OsStr::new("--data-dir") {
+            out.data_dir = Some(PathBuf::from(
+                it.next()
+                    .ok_or(CliError::MissingValue { flag: "--data-dir" })?,
+            ));
+        } else if argument == OsStr::new("--ephemeral") {
+            out.ephemeral = true;
+        } else if argument == OsStr::new("--no-remote") {
+            out.no_remote = true;
+        } else if argument == OsStr::new("--selfcheck") {
+            out.selfcheck = true;
+        } else if argument == OsStr::new("--diagnostics-report") {
+            out.diagnostics_report = true;
+        } else if argument == OsStr::new("--version") || argument == OsStr::new("-V") {
+            out.show_version = true;
+        } else if argument == OsStr::new("--help") || argument == OsStr::new("-h") {
+            out.show_help = true;
+        } else {
+            return Err(CliError::UnknownArgument { value: argument });
         }
     }
     Ok(out)
 }
 
-fn apply_data_dir_env(args: &CliArgs) {
-    // Both record::app_data_dir and diag::diagnostic_log_path read these
-    // env vars at every call; setting them here for the lifetime of this
-    // process is the minimum-surface plumbing for `--profile` /
-    // `--data-dir` without threading config through every module.
+fn validate_cli_args(args: &CliArgs) -> Result<(), CliError> {
+    if args.selfcheck && args.diagnostics_report {
+        return Err(CliError::ConflictingOneShotModes);
+    }
+    if args.data_dir.is_some() && !args.diagnostics_report {
+        return Err(CliError::DataDirForbidden);
+    }
+    if args.diagnostics_report && (args.ephemeral || args.no_remote) {
+        return Err(CliError::DiagnosticsStartupFlagsForbidden);
+    }
+    Ok(())
+}
+
+fn apply_legacy_diagnostics_env(args: &CliArgs) {
     if let Some(dir) = &args.data_dir {
-        // SAFETY: we are single-threaded at this point (before tokio
-        // runtime starts) and no other code reads these env vars yet.
-        unsafe {
-            std::env::set_var("AGENTDECK_DATA_DIR", dir);
-        }
+        // SAFETY: diagnostics-report 是启动时的单线程 one-shot，尚未创建 runtime。
+        unsafe { std::env::set_var("AGENTDECK_DATA_DIR", dir) }
     }
-    if let Some(profile) = &args.profile {
-        unsafe {
-            std::env::set_var("AGENTDECK_PROFILE", profile);
-        }
+    if let Some(profile) = args.profile {
+        let value = match profile {
+            DaemonProfile::Stable => "stable",
+            DaemonProfile::Dev => "dev",
+        };
+        // SAFETY: 同上；该 legacy override 不会进入 daemon startup 路径。
+        unsafe { std::env::set_var("AGENTDECK_PROFILE", value) }
     }
+}
+
+fn print_typed_error(code: &str, error: impl fmt::Display) {
+    eprintln!("agentdeckd: [{code}] {error}");
 }
 
 fn print_version() {
@@ -102,155 +169,155 @@ fn print_help() {
          Usage: agentdeckd [OPTIONS]\n\
          \n\
          Options:\n\
-           --profile <stable|dev>    Pick Application Support directory variant.\n\
-           --data-dir <path>         Override data dir entirely (takes precedence).\n\
-           --selfcheck               Run plumbing self-check and exit 0/1.\n\
-           --diagnostics-report      Emit diagnostic.log summary as JSON and exit.\n\
+           --profile <stable|dev>    Select the strict startup profile.\n\
+           --ephemeral               Use a fresh isolated test namespace.\n\
+           --no-remote               Required together with --ephemeral.\n\
+           --data-dir <path>         Legacy diagnostics-report override only.\n\
+           --selfcheck               Bootstrap daemon security plumbing, then exit.\n\
+           --diagnostics-report      Emit diagnostic.log summary without starting daemon.\n\
            --version, -V             Print version and exit.\n\
            --help, -h                Show this help and exit.\n\
          \n\
-         With no options, reads ClientCommand JSONL from stdin and writes\n\
-         ServerEvent JSONL to stdout until stdin closes.\n"
+         The stable mode requires a release-signed helper with the compiled daemon-only\n\
+         Keychain access group. Development/compatibility processes must pass\n\
+         --ephemeral --no-remote explicitly.\n"
     );
 }
 
-/// Self-check: confirm the daemon's own plumbing works without spawning
-/// a real agent process. Verifies:
-///   1. record::app_data_dir() resolves (HOME present or override set)
-///   2. diag::diagnostic_log_path() resolves to a writable directory
-///   3. diag::log() round-trips through writeln to disk
-///   4. record::try_append() round-trips through writeln + redact
-///
-/// Returns process exit code (0 = OK, 1 = fail). v1 selfcheck spawned a
-/// real Codex turn; v2 simplifies to "daemon plumbing works" — exercising
-/// codex requires login and is not appropriate for a CI smoke test. The
-/// gated E2E (`AGENTDECK_E2E=1 cargo test ... e2e_codex`) covers that.
-fn run_selfcheck() -> ExitCode {
+fn run_selfcheck(config: &DaemonConfig) -> ExitCode {
     let app_dir = match record::app_data_dir() {
-        Some(d) => d,
+        Some(dir) if dir == config.paths().data_dir => dir,
+        Some(dir) => {
+            eprintln!(
+                "selfcheck: [daemon.selfcheck.namespace_mismatch] configured {} but resolved {}",
+                config.paths().data_dir.display(),
+                dir.display()
+            );
+            return ExitCode::from(1);
+        }
         None => {
-            eprintln!("selfcheck: FAIL — record::app_data_dir() returned None (HOME unset?)");
+            eprintln!("selfcheck: [daemon.selfcheck.namespace_unavailable] no data directory");
             return ExitCode::from(1);
         }
     };
-    if let Err(e) = std::fs::create_dir_all(&app_dir) {
+    if !app_dir.is_dir() {
         eprintln!(
-            "selfcheck: FAIL — cannot create data dir {}: {e}",
+            "selfcheck: [daemon.selfcheck.namespace_unavailable] {} is not a directory",
             app_dir.display()
         );
         return ExitCode::from(1);
     }
     let diag_path = match diag::diagnostic_log_path() {
-        Some(p) => p,
+        Some(path) => path,
         None => {
-            eprintln!("selfcheck: FAIL — diag::diagnostic_log_path() returned None");
+            eprintln!("selfcheck: [daemon.selfcheck.diagnostics_unavailable] no log path");
             return ExitCode::from(1);
         }
     };
 
     let run_id = format!("selfcheck-{}", std::process::id());
-    if let Err(e) = record::try_append(&run_id, r#"{"selfcheck":true}"#) {
-        eprintln!("selfcheck: FAIL — record::try_append: {e}");
+    if let Err(error) = record::try_append(&run_id, r#"{"selfcheck":true}"#) {
+        eprintln!("selfcheck: [daemon.selfcheck.record_failed] {error}");
         return ExitCode::from(1);
     }
     diag::log("selfcheck", "agentdeckd self-check ok");
 
     println!("OK");
     println!(
-        "{{\"protocolVersion\":{},\"dataDir\":{:?},\"diagLog\":{:?}}}",
-        agentdeck_protocol::PROTOCOL_VERSION,
-        app_dir,
-        diag_path
+        "{}",
+        serde_json::json!({
+            "protocolVersion": agentdeck_protocol::PROTOCOL_VERSION,
+            "dataDir": app_dir,
+            "diagLog": diag_path,
+            "remoteEnabled": config.remote_enabled(),
+        })
     );
     ExitCode::SUCCESS
 }
 
-/// Diagnostics report: read diagnostic.log line-by-line, parse each as
-/// JSON, emit an aggregated summary JSON to stdout. Simplified from v1
-/// (no `--json`, no `--run-id` filter, no `--since-seconds`); Phase 5+
-/// can re-add those once the CLI has matching flags.
 fn run_diagnostics_report() -> ExitCode {
     let path = match diag::diagnostic_log_path() {
-        Some(p) => p,
+        Some(path) => path,
         None => {
-            eprintln!("diagnostics-report: FAIL — diag path unavailable");
+            eprintln!("diagnostics-report: [daemon.diagnostics.path_unavailable] no log path");
             return ExitCode::from(1);
         }
     };
     let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) => {
-            // Missing log is not an error — just empty report.
-            let summary = serde_json::json!({
-                "path": path,
-                "lineCount": 0,
-                "notice": format!("could not read {}: {}", path.display(), e),
-            });
-            println!("{}", summary);
+        Ok(text) => text,
+        Err(error) => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "path": path,
+                    "lineCount": 0,
+                    "notice": format!("could not read {}: {error}", path.display()),
+                })
+            );
             return ExitCode::SUCCESS;
         }
     };
-    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    let mut parsed = 0u64;
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let mut parsed = 0_u64;
     let mut by_level: std::collections::BTreeMap<String, u64> = Default::default();
     let mut by_event: std::collections::BTreeMap<String, u64> = Default::default();
     let mut last_lines: Vec<serde_json::Value> = Vec::new();
     for line in &lines {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
             parsed += 1;
-            if let Some(level) = v.get("level").and_then(|x| x.as_str()) {
-                *by_level.entry(level.to_string()).or_default() += 1;
+            if let Some(level) = value.get("level").and_then(|entry| entry.as_str()) {
+                *by_level.entry(level.to_owned()).or_default() += 1;
             }
-            if let Some(event) = v.get("event").and_then(|x| x.as_str()) {
-                *by_event.entry(event.to_string()).or_default() += 1;
+            if let Some(event) = value.get("event").and_then(|entry| entry.as_str()) {
+                *by_event.entry(event.to_owned()).or_default() += 1;
             }
-            last_lines.push(v);
+            last_lines.push(value);
         }
     }
-    // Keep only tail (most recent 20) — full log is on disk.
     let tail_start = last_lines.len().saturating_sub(20);
     let tail: Vec<_> = last_lines.into_iter().skip(tail_start).collect();
-    let report = serde_json::json!({
-        "path": path,
-        "lineCount": lines.len(),
-        "parsedCount": parsed,
-        "byLevel": by_level,
-        "byEvent": by_event,
-        "tail": tail,
-    });
-    println!("{}", report);
+    println!(
+        "{}",
+        serde_json::json!({
+            "path": path,
+            "lineCount": lines.len(),
+            "parsedCount": parsed,
+            "byLevel": by_level,
+            "byEvent": by_event,
+            "tail": tail,
+        })
+    );
     ExitCode::SUCCESS
 }
 
 fn run_main_loop() -> std::io::Result<()> {
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 
-    rt.block_on(async {
+    runtime.block_on(async {
         diag::log("daemon_start", "agentdeckd main loop starting");
         let mut router = AgentRouter::new();
         router.register(Arc::new(CodexAdapter::new()));
-        // Task 4C — Phase 4 finalization: CC adapter now registered
-        // alongside Codex. Both kinds route through the same hub and
-        // cross-agent History List merges results from both.
         router.register(Arc::new(ClaudeCodeAdapter::new()));
         let hub = RuntimeHub::new(Arc::new(router));
-        let res = hub.run(tokio::io::stdin(), tokio::io::stdout()).await;
+        let result = hub.run(tokio::io::stdin(), tokio::io::stdout()).await;
         diag::log(
             "daemon_stop",
-            &format!("agentdeckd main loop exited: {res:?}"),
+            &format!("agentdeckd main loop exited: {result:?}"),
         );
-        res
+        result
     })
 }
 
 fn main() -> ExitCode {
-    let argv: Vec<String> = std::env::args().collect();
-    let args = match parse_args(argv) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("agentdeckd: {e}");
+    let args = match parse_args(std::env::args_os()) {
+        Ok(args) => args,
+        Err(error) => {
+            print_typed_error(error.code(), &error);
             return ExitCode::from(2);
         }
     };
@@ -263,58 +330,148 @@ fn main() -> ExitCode {
         print_version();
         return ExitCode::SUCCESS;
     }
-
-    apply_data_dir_env(&args);
-
-    if args.selfcheck {
-        return run_selfcheck();
+    if let Err(error) = validate_cli_args(&args) {
+        print_typed_error(error.code(), &error);
+        return ExitCode::from(2);
     }
     if args.diagnostics_report {
+        apply_legacy_diagnostics_env(&args);
         return run_diagnostics_report();
     }
 
-    match run_main_loop() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("agentdeckd: main loop error: {e}");
-            ExitCode::from(1)
+    // 固定启动顺序：config → private namespace/singleton → keystore → StorageKEK
+    // → record namespace → selfcheck/main loop。
+    let config = match DaemonConfig::resolve(DaemonStartupOptions {
+        ephemeral: args.ephemeral,
+        no_remote: args.no_remote,
+        profile: args.profile,
+        stable_keychain_access_group: compiled_stable_keychain_access_group(),
+    }) {
+        Ok(config) => config,
+        Err(error) => {
+            print_typed_error(error.code(), &error);
+            return ExitCode::from(2);
         }
+    };
+    let singleton_guard = match SingletonGuard::acquire(config.paths()) {
+        Ok(guard) => guard,
+        Err(error) => {
+            print_typed_error(error.code(), &error);
+            return ExitCode::from(1);
+        }
+    };
+    let key_store = match key_store_for_config(&config) {
+        Ok(store) => store,
+        Err(error) => {
+            print_typed_error(error.code(), &error);
+            return ExitCode::from(1);
+        }
+    };
+    let storage_kek = match load_or_create_storage_kek(&*key_store, &config.paths().runtime_db) {
+        Ok(key) => key,
+        Err(error) => {
+            print_typed_error(error.code(), &error);
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(error) = record::configure_app_data_dir(config.paths().data_dir.clone()) {
+        print_typed_error(error.code(), &error);
+        return ExitCode::from(1);
     }
+
+    let exit = if args.selfcheck {
+        run_selfcheck(&config)
+    } else {
+        match run_main_loop() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                print_typed_error("daemon.runtime.main_loop_failed", error);
+                ExitCode::from(1)
+            }
+        }
+    };
+
+    // 这三个 owner 必须覆盖完整 runtime 生命周期：lock fd、Keychain backend 与
+    // 已清零 Drop 的 StorageKEK 都不能在进入 loop 前被释放。
+    drop((storage_kek, key_store, singleton_guard));
+    exit
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_args_handles_profile_and_data_dir() {
-        let args = parse_args(vec![
-            "agentdeckd".into(),
-            "--profile".into(),
-            "dev".into(),
-            "--data-dir".into(),
-            "/tmp/xx".into(),
-        ])
-        .unwrap();
-        assert_eq!(args.profile.as_deref(), Some("dev"));
-        assert_eq!(
-            args.data_dir.as_deref(),
-            Some(std::path::Path::new("/tmp/xx"))
-        );
+    fn os_args(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
     }
 
     #[test]
-    fn parse_args_flags_selfcheck_and_diagnostics() {
-        let args = parse_args(vec!["agentdeckd".into(), "--selfcheck".into()]).unwrap();
+    fn parse_args_handles_strict_profiles_and_startup_flags() {
+        let args = parse_args(os_args(&[
+            "agentdeckd",
+            "--profile",
+            "dev",
+            "--ephemeral",
+            "--no-remote",
+            "--selfcheck",
+        ]))
+        .expect("parse args");
+        assert_eq!(args.profile, Some(DaemonProfile::Dev));
+        assert!(args.ephemeral);
+        assert!(args.no_remote);
         assert!(args.selfcheck);
-
-        let args = parse_args(vec!["agentdeckd".into(), "--diagnostics-report".into()]).unwrap();
-        assert!(args.diagnostics_report);
     }
 
     #[test]
-    fn parse_args_rejects_unknown_flag() {
-        let err = parse_args(vec!["agentdeckd".into(), "--not-a-flag".into()]).unwrap_err();
-        assert!(err.contains("--not-a-flag"));
+    fn parse_args_rejects_invalid_profile_and_unknown_flag_with_codes() {
+        let error = parse_args(os_args(&["agentdeckd", "--profile", "preview"]))
+            .expect_err("invalid profile");
+        assert_eq!(error.code(), "daemon.cli.invalid_profile");
+
+        let error = parse_args(os_args(&["agentdeckd", "--not-a-flag"])).expect_err("unknown flag");
+        assert_eq!(error.code(), "daemon.cli.unknown_argument");
+    }
+
+    #[test]
+    fn data_dir_is_only_valid_for_diagnostics() {
+        let selfcheck = parse_args(os_args(&[
+            "agentdeckd",
+            "--selfcheck",
+            "--data-dir",
+            "/tmp/xx",
+        ]))
+        .expect("parse selfcheck");
+        assert!(matches!(
+            validate_cli_args(&selfcheck),
+            Err(CliError::DataDirForbidden)
+        ));
+
+        let diagnostics = parse_args(os_args(&[
+            "agentdeckd",
+            "--diagnostics-report",
+            "--data-dir",
+            "/tmp/xx",
+        ]))
+        .expect("parse diagnostics");
+        assert!(validate_cli_args(&diagnostics).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn args_os_preserves_non_utf8_diagnostics_path() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let path = OsString::from_vec(b"/tmp/agentdeck-\xff".to_vec());
+        let args = parse_args(vec![
+            OsString::from("agentdeckd"),
+            OsString::from("--diagnostics-report"),
+            OsString::from("--data-dir"),
+            path.clone(),
+        ])
+        .expect("parse non-UTF-8 path");
+        assert_eq!(
+            args.data_dir.expect("data dir").as_os_str().as_bytes(),
+            path.as_os_str().as_bytes()
+        );
     }
 }

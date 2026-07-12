@@ -80,8 +80,8 @@ agentdeckd
 - **K2**：`RuntimeHub` 必须按 `sessionId` 阻止同一 runtime 并发 turn；session 创建时 `agentKind` 不可变，整个生命周期固定到一个 adapter。
 - **K3**：turn 成功完成时，worker 必须先释放 session 占用，再向 Swift 发出可触发下一条 prompt 的 ready / `turnComplete` 事件。
 - **K4**（加强）：所有事件主干消息必须带 `agentKind` 字段。
-- **K5**：run record 与 diagnostic log 写入 `~/Library/Application Support/AgentDeck/`（stable）或 `AgentDeck-Dev/`（dev），不得写入用户项目 git。
-- **K6**：`AGENTDECK_DATA_DIR` / `--profile` / `AGENTDECK_PROFILE` 控制数据目录隔离，不影响 vendor 登录状态或 vendor 历史。
+- **K5**：stable run record 与 diagnostic log 固定写入当前 EUID 的 OS account home 下 `Library/Application Support/AgentDeck/`；ephemeral 实例写入自己的随机 0700 temp namespace；两者都不得写入用户项目 git。
+- **K6**：daemon ownership 只由严格的 stable/ephemeral mode matrix 决定。`AGENTDECK_DATA_DIR` / `AGENTDECK_PROFILE` 只允许 diagnostics one-shot 读取旧数据，不能覆盖 daemon namespace；profile 隔离始终不影响 vendor 登录状态或 vendor 历史。
 - **K7**：写入前做 best-effort 密钥脱敏；写失败不能静默，必须在可诊断位置暴露。
 - **K8**：vendor schema 不手写，Codex 协议来自官方 `codex app-server generate-json-schema`。
 - **K9**：AgentDeck 不读取、不保存、不转发任何 vendor token（Codex 或 Claude Code）。
@@ -401,6 +401,39 @@ agentdeckd
   应用明文。`scripts/check-daemon-no-net.sh` 继续守护
   `agentdeckd` 无网络依赖，P2.10 不越界声称 daemon/iOS 已接入。
 
+### Relay Companion MVP P3.1 daemon ownership 与 StorageKEK 边界
+
+- stable 是唯一 remote-enabled mode。其 data root 固定为当前 EUID 通过 `getpwuid_r`
+  取得的 OS account home 下 `Library/Application Support/AgentDeck`；不读取可变 `HOME`，
+  也不允许 `--data-dir` 或环境变量改名规避 singleton。开发实例必须完整选择
+  `--ephemeral --no-remote`，`--profile dev` 单独出现即 typed fail-close。
+- `DaemonPaths` 是 data root、`runtime.db`、UDS、lock、Keychain service/access group 的
+  不可拆分事实源。ephemeral 五类资源共享同一随机 instance ID，使用 memory keystore，
+  remote 永远关闭；stable 使用固定 service `com.agentdeck.agentdeckd.stable`。
+- data root 以 0700 原子建立。ephemeral 既有目录不是当前 UID、不是实体目录或不是 0700
+  都拒绝；只有固定 stable 目录可把当前 UID 拥有且权限精确为旧版 0755 的 entry，在
+  `O_NOFOLLOW` 打开的 directory fd 上用 `fchmod` 收紧到 0700；0775、0777、01755 等
+  其他宽权限拒绝。singleton lock 只通过
+  该 dirfd 的 `openat` 建立/打开，并在 nonblocking `flock` 前后同时复核目录与 lock 的
+  owner、mode、nlink、dev/ino；dirfd 与 lock fd 由 guard 持有到 runtime 退出。
+- stable Keychain access group 只能由构建/签名流程在编译时注入已经展开的
+  `<实际 TeamIdentifier>.com.agentdeck.agentdeckd.stable`，运行时环境不能替换。
+  `MacOsKeychainStore` 还会验证它与编译值一致，使用 protected Keychain、
+  non-synchronizable、`AccessibleAfterFirstUnlockThisDeviceOnly` 和空 access-control flags。
+  access group、entitlement、backend 或平台不满足即 fail-close；禁止 memory/明文文件回退。
+- `storage-kek.v1` 固定 32 bytes，Debug 脱敏、Drop 清零。只有 Runtime DB/WAL/SHM 都没有
+  非空或非 regular artifact 时才允许生成；store 后立即 reload 并逐字节校验。既有 state
+  缺 key、非法长度、entropy/backend 失败或持久化读回变化都在打开 RuntimeStore 前终止。
+- daemon main 固定按 `config → namespace/singleton → keystore → StorageKEK → record
+  namespace → selfcheck/stdio loop` 启动，record/diagnostics 一次性绑定已验证 data root。
+  P3.9 前 Swift/Rust stdio transport 是显式隔离的兼容路径：固定传
+  `--ephemeral --no-remote --profile dev` 并清除旧 namespace env。它不触碰 stable 信任域，
+  也尚不提供多个客户端共享 singleton RuntimeCore。
+- 已有 ignored、唯一 service/account、RAII 清理的真实 Keychain roundtrip，但 P3.1 的签名
+  门禁尚未通过：当前机器无匹配 provisioning profile；Apple Development 与本地
+  self-signed helper 虽通过 `codesign --verify`，均被 AMFI 以 exit 137 拒绝启动。因此本节
+  只描述实现边界，不构成 P3.1/P3 完成声明。
+
 ### R1a 隐含约束（历史参考）
 
 - **R1a machine_id ≡ device_id**：`server/ws.rs::connect` 用 `device.device_id` 作 `ConnRole::Machine.machine_id`，`router.rs` RegisterMachine 授权强制 `machine.machine_id == connection.machine_id`——**enrolled 的 machine 设备的 `machine_id` 严格等于 `device_id`**。CLI 生成的随机 `device_id = "cli-<profile>-<random>"` 会锁定 R2 daemon remote-mode 里对应 machine 的 identifier；R2 设计需评估是否解耦 machine_id 与 device_id（例如 machine 元数据里显式携带独立 machine_id）。
@@ -415,6 +448,7 @@ Swift UI
   -> daemon stdio
 
 daemon main
+  -> config → namespace / singleton → KeyStore / StorageKEK
   -> ipc（re-export agentdeck-protocol）
   -> AgentRouter → CodexAdapter / ClaudeCodeAdapter
   -> record / diag
@@ -422,8 +456,8 @@ daemon main
 
 agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
   -> agentdeck-protocol（共享类型）
-  -> Transport trait（ProcessTransport → daemon stdio）
-  -> daemon child process
+  -> Transport trait（P3.1 compatibility ProcessTransport → explicit ephemeral/no-remote stdio）
+  -> isolated daemon child process；P3.9 后改为 stable daemon UDS
 ```
 
 允许的跨层访问应沿上图向下：

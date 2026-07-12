@@ -137,11 +137,17 @@ dependencies = [
  "agentdeck-protocol",
  "async-trait",
  "criterion",
+ "getrandom 0.4.3",
+ "libc",
+ "security-framework",
+ "security-framework-sys",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "uuid",
  "which",
+ "zeroize",
 ]
 
 [[package]]

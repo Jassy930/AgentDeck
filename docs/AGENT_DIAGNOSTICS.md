@@ -9,14 +9,16 @@ swift run AgentDeck -- --selfcheck
 swift run AgentDeck -- --diagnostics-report --json
 swift run AgentDeck -- --selfcheck --profile dev
 swift run AgentDeck -- --diagnostics-report --json --profile dev
+cargo run -p agentdeckd -- --ephemeral --no-remote --profile dev --selfcheck
 ```
 
 ## 日志位置
 
-- run record: `~/Library/Application Support/AgentDeck/runs/*.jsonl`
-- diagnostic log: `~/Library/Application Support/AgentDeck/diagnostic.log`
-- dev profile: `~/Library/Application Support/AgentDeck-Dev/`
-- 测试覆盖目录: 设置 `AGENTDECK_DATA_DIR=/tmp/agentdeck-diag`
+- stable run record: `<OS account home>/Library/Application Support/AgentDeck/runs/*.jsonl`
+- stable diagnostic log: `<OS account home>/Library/Application Support/AgentDeck/diagnostic.log`
+- P3.1 stdio 开发实例: OS temp root 下随机的 0700 `ad-<instance-id>/`
+- 旧 dev profile / 测试覆盖目录: 只允许 diagnostics one-shot 通过
+  `--profile dev` 或 `--data-dir /absolute/path` 读取；不能覆盖 daemon startup namespace
 
 ## 关联规则
 
@@ -32,9 +34,11 @@ swift run AgentDeck -- --diagnostics-report --json --profile dev
 4. 查看 `byLevel` / `byEvent` 和 `tail` 中最近的错误或告警。
 5. 按 `tail` 里的事件上下文继续执行只读检查。
 
-排查开发调试实例时，在 selfcheck 和 diagnostics report 后加 `--profile dev`。
-SwiftPM/debug 构建未显式传 `--profile` 时也会默认使用 dev profile。
-`AGENTDECK_DATA_DIR` 仍优先于 profile，主要用于一次性测试覆盖目录。
+排查 P3.1 过渡 stdio 实例时，Swift/Rust transport 已固定把 child 启动为
+`--ephemeral --no-remote --profile dev`，并删除继承的 `AGENTDECK_DATA_DIR` /
+`AGENTDECK_PROFILE`；每次 spawn 都是新的 temp namespace。diagnostics report 不启动
+daemon，仍可用 `--profile dev` 或 `--data-dir` 读取旧日志。不要把 diagnostics override
+当成 stable ownership 配置。
 
 ## Relay v1 历史 marker 与显式 reset
 
@@ -427,6 +431,74 @@ P2.10 hardening suite 还必须证明 restart byte-identical replay、retention 
 disk-low、Store fault 与 deterministic shutdown；`agentdeckd` 同时继续通过
 `scripts/check-daemon-no-net.sh`。这些证据只收口 Relay，不代表 daemon/iOS Companion
 持久链路已经完成。
+
+## Daemon namespace / singleton / StorageKEK 诊断（Companion MVP P3.1）
+
+daemon 正常启动顺序固定为 `config → private namespace/singleton → keystore →
+StorageKEK → record namespace → selfcheck/stdio loop`。前一步失败时不得继续打开下一层。
+stable data root 来自当前 EUID 的 `getpwuid_r`，不读取 `HOME`；stable access group 只接受
+编译时注入且与签名 entitlement 一致的展开值，运行时同名环境变量不能补齐 unsigned
+helper。unsigned 开发构建应使用：
+
+```bash
+cargo run -p agentdeckd -- --ephemeral --no-remote --profile dev --selfcheck
+```
+
+看到 singleton/namespace 错误时，先只读检查 data root 与 lock 的 type、UID、mode、nlink、
+dev/ino。不要先 `rm` lock：guard 锁的是保持打开的 fd，删除 pathname 可能让第二个进程
+锁住另一个 inode。固定 stable 旧目录若由当前 UID 拥有且是实体目录，daemon 只迁移历史
+精确 0755，并在 `O_NOFOLLOW` directory fd 上收紧为 0700；0775、0777、01755 等其他宽权限
+一律拒绝。ephemeral 权限不精确为 0700 时也直接拒绝，不会自动修复。
+
+StorageKEK 缺失时先检查 `runtime.db`、`runtime.db-wal`、`runtime.db-shm` 是否存在或不是
+普通空文件。任一既有 state 都意味着不能生成替代 key；不要删除 DB 以绕过错误，也不要
+把 key 写入文件。stable Keychain backend 不可用时只修复 signing/provisioning/entitlement，
+禁止切换到 memory store。P3.1 真实签名 roundtrip 当前仍 gated/BLOCKED：本机无匹配
+provisioning profile，两个已通过 `codesign --verify` 的尝试均被 AMFI 以 exit 137 终止；
+ignored 测试不是通过证据。
+
+| P3.1 code | 含义 | 下一步 |
+| --- | --- | --- |
+| `daemon.cli.missing_value` | `--profile` 或 `--data-dir` 缺值 | 补齐参数值，不要用环境变量替代 stable ownership |
+| `daemon.cli.invalid_profile` | profile 不是 `stable` / `dev` | 使用受支持值，并同时满足下面的 mode matrix |
+| `daemon.cli.unknown_argument` | daemon 收到未知参数 | 核对调用方版本；不要把 Relay/client 参数传给 daemon |
+| `daemon.cli.data_dir_forbidden` | daemon serve/selfcheck 尝试使用 `--data-dir` | 移除 override；它只允许 diagnostics one-shot |
+| `daemon.cli.conflicting_one_shot_modes` | 同时传 selfcheck 与 diagnostics-report | 每次只运行一个 one-shot |
+| `daemon.cli.diagnostics_startup_flags_forbidden` | diagnostics-report 带了 ephemeral/no-remote startup flag | diagnostics 不启动 daemon，移除 startup flags |
+| `daemon.config.ephemeral_requires_no_remote` | 只启用了 ephemeral | 同时显式加 `--no-remote` |
+| `daemon.config.no_remote_requires_ephemeral` | stable 尝试单独关闭 remote | 开发实例同时加 `--ephemeral`；stable 不允许半隔离 |
+| `daemon.config.ephemeral_access_group_forbidden` | ephemeral config 携带 stable access group | 移除 access group；ephemeral 只能用独立 memory store |
+| `daemon.config.dev_requires_ephemeral` | `--profile dev` 没有完整 ephemeral pair | 加 `--ephemeral --no-remote` |
+| `daemon.config.stable_forbids_ephemeral` | stable profile 与 ephemeral 混用 | 二选一；不得把 stable 信任域当测试夹具 |
+| `daemon.config.home_unavailable` | 当前 OS account home 缺失、为空或非绝对路径 | 修复系统账号记录；不要设置 `HOME` 绕过 |
+| `daemon.config.home_lookup_failed` | `getpwuid_r` 查询 OS account 失败 | 记录系统 status，检查账号目录服务后重试 |
+| `daemon.namespace.root_not_absolute` | hermetic/ephemeral root 不是绝对路径 | 使用 canonical absolute root |
+| `daemon.namespace.invalid_instance` | instance ID 为空、过长或含非法字符 | 只用 1–64 位 ASCII 字母、数字、`-`、`_` |
+| `daemon.namespace.socket_path_too_long` | UDS 路径超过平台 `sun_path` 上限 | 缩短 temp root；不要把 socket 移到 0700 namespace 外 |
+| `daemon.namespace.socket_path_invalid` | UDS 路径含 NUL | 修复路径来源，禁止 lossy 转换后继续 |
+| `daemon.namespace.unsafe_data_directory` | data root 不是当前 UID 的实体目录，ephemeral 不是 0700，或 stable 旧权限不是精确 0755 | 核对 type/UID/mode；不要自动跟随 symlink 或放宽迁移范围 |
+| `daemon.namespace.io_failed` | 建立或检查 data root 的文件系统操作失败 | 检查父目录、权限、磁盘与具体 operation/path |
+| `daemon.singleton.already_running` | 同一 namespace 的 lock 已被其他进程持有 | 连接既有 daemon；若怀疑僵尸，先核对 owner 进程，不要删 lock pathname |
+| `daemon.singleton.unsafe_lock` | directory fd/path 或 lock fd/entry 的 type、UID、mode、nlink、dev/ino 不一致 | 视为路径替换/权限安全错误；停止并人工检查，不要自动修复 lock |
+| `daemon.singleton.unsupported_platform` | 平台不支持 Unix singleton lock | stable daemon 仅在受支持 Unix/macOS helper 上运行 |
+| `daemon.singleton.io_failed` | `open/openat/fstatat/flock/fchmod` 等失败 | 按 operation/path 检查 errno、文件系统与并发进程 |
+| `daemon.keystore.access_group_unconfigured` | stable build 没有编译进真实 access group，或 Keychain adapter 未获得配置 | 使用匹配 provisioning/entitlement 的 release-signed helper；运行时 env 无效 |
+| `daemon.keystore.access_group_invalid` | access group 格式错误、文档占位符、前后空白或与编译值不一致 | 注入实际 TeamIdentifier 展开值并保证 codesign entitlement 完全一致 |
+| `daemon.keystore.unsupported_platform` | stable Keychain backend 在当前平台不可用 | 不得回退明文/memory；改在受支持的 macOS helper 运行 |
+| `daemon.keystore.unavailable` | Keychain backend set/get/delete 或 memory test lock 失败 | stable 检查 entitlement、Keychain status 与签名；保留原 Runtime state |
+| `daemon.storage.key_missing` | Keychain 无 `storage-kek.v1`，但 DB/WAL/SHM 已有 state | fail-close；恢复同一 Keychain item/签名环境，禁止生成替代 key 或删库绕过 |
+| `daemon.storage.key_invalid` | 读出的 StorageKEK 不是 32 bytes | 视为损坏/错误 entitlement domain；停止打开 Runtime DB |
+| `daemon.storage.state_check_failed` | 检查 DB/WAL/SHM metadata 失败 | 修复路径/权限/I/O 后重试；检查完成前不能 mint key |
+| `daemon.storage.entropy_unavailable` | OS CSPRNG 无法生成 fresh 32-byte key | 停止启动，修复系统 entropy source；禁止弱随机替代 |
+| `daemon.storage.key_persistence_failed` | Keychain store 成功返回后无法读回，或读回 bytes 改变 | 视为 backend/并发安全故障；不要打开 DB，检查 Keychain domain |
+| `daemon.record.namespace_not_absolute` | record/diagnostics 绑定到非绝对路径 | 只绑定已验证的 absolute daemon data root |
+| `daemon.record.namespace_already_configured` | 同进程尝试把 record namespace 改到另一目录 | 视为 ownership bug；进程退出后按正确 config 重启 |
+| `daemon.selfcheck.namespace_mismatch` | record namespace 与 resolved daemon namespace 不一致 | 检查 startup 顺序和调用方是否绕过 config |
+| `daemon.selfcheck.namespace_unavailable` | selfcheck 未取得 data root 或目录消失 | 检查 singleton guard 与 namespace 生命周期 |
+| `daemon.selfcheck.diagnostics_unavailable` | 已验证 namespace 中无法解析 diagnostic path | 检查 record/diag namespace 绑定 |
+| `daemon.selfcheck.record_failed` | selfcheck run record 写入失败 | 检查 0700 data root、runs 目录、磁盘与权限 |
+| `daemon.diagnostics.path_unavailable` | diagnostics one-shot 无可用日志路径 | 提供合法 profile/absolute data-dir，或先创建一次诊断日志 |
+| `daemon.runtime.main_loop_failed` | security bootstrap 已完成，但 stdio RuntimeHub 主循环失败 | 按同一 diagnostic log 检查 IPC I/O；guard/KEK 会随进程退出释放/清零 |
 
 ## Failure Codes
 

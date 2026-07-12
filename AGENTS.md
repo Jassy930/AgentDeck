@@ -10,7 +10,7 @@
 4. `docs/index.md`：文档记录系统导航。
 5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code（含 CC adapter failure codes）。
 6. `docs/QUALITY.md`：验证命令、质量门禁和文档结构检查（含 v0.2 手动 QA 清单）。
-7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单，P2.10 已完成，继续执行 P3–P6。
+7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单。P2.10 已完成；P3.1 代码已准备，但真实 provisioned signed Keychain roundtrip 仍 gated BLOCKED，因此不得宣称 P3.1/P3 完成，继续按计划执行 P3–P6。
 8. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
 
 ## 项目边界
@@ -22,7 +22,7 @@
 - Codex 细节只能留在 `agentdeckd/src/codex/` 子模块；CC 细节只能留在 `agentdeckd/src/claude_code/` 子模块；两者互不知晓（N3）。
 - `protocol/` 中 Codex schema 必须来自官方 `codex app-server generate-json-schema`，不要手写或逆向猜测协议（K8）。
 - AgentDeck 不读取、不保存、不转发任何 vendor token（Codex 或 Claude Code）；CC 历史走 CC 原生接口，不建 `cc-meta/` 目录（K9、N8）。
-- AgentDeck 管理的 run record 与 diagnostic log 写入 `~/Library/Application Support/AgentDeck/`，不得写入用户项目 git（K5）。
+- AgentDeck stable run record 与 diagnostic log 固定写入当前 EUID 的 OS account home 下 `Library/Application Support/AgentDeck/`；ephemeral 实例写入随机 0700 temp namespace，均不得写入用户项目 git（K5）。
 - `Sources/AgentDeckCore/` 是 macOS/iOS 共享的平台无关层，禁止 import AppKit/UIKit；`ios/` 是 fixture 驱动的 UIKit companion 前端，唯一数据入口是 `MobileSessionSource`，本期不含网络代码（设计见 `docs/plans/2026-07-03-ios-uikit-frontend-design.md`）。
 
 ## 工作规则
@@ -129,6 +129,24 @@ agentdeck remote synthetic --bundle /secure/path/machine-enrollment-bundle.json
 
 改动任一协议轴后，使用对应的 `UPDATE_*_SCHEMA=1` 测试更新快照，并确认以下
 四条导出都与仓库快照逐字节一致：本地 IPC、Runtime、Relay v2、E2EE。
+
+### Relay Companion MVP P3.1（尚有 gated 签名门禁）
+
+```bash
+cargo test -p agentdeckd --test daemon_namespace --test storage_kek \
+  --test daemon_startup -- --test-threads=1
+cargo test -p agentdeckd
+cargo test -p agentdeck-cli
+swift test
+cargo run -q -p agentdeck-cli -- selfcheck
+bash scripts/check-daemon-no-net.sh
+```
+
+unsigned 开发实例必须显式使用 `--ephemeral --no-remote --profile dev`；stable daemon
+不接受 `HOME`、`AGENTDECK_DATA_DIR`、`AGENTDECK_PROFILE` 或运行时 access-group override。
+真实 Keychain `set → load → delete` ignored test 只有在编译值、codesign entitlement 与
+provisioning profile 一致的 helper 上实际运行后才算通过；当前本机无匹配 provisioning
+profile，已签名尝试均被 AMFI 以 exit 137 终止。ignored 不能计作 PASS，也不能据此完成 P3.1。
 
 ## 浏览与外部资料
 

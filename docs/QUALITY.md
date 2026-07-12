@@ -15,6 +15,9 @@ swift run AgentDeck -- --diagnostics-report --json --profile dev
 scripts/verify-agent-docs.sh
 bash scripts/verify-relay-companion-mvp.sh p0
 bash scripts/verify-relay-companion-mvp.sh p2
+cargo test -p agentdeckd --test daemon_namespace --test storage_kek \
+  --test daemon_startup -- --test-threads=1
+cargo run -p agentdeckd -- --ephemeral --no-remote --profile dev --selfcheck
 ```
 
 ## Relay Companion MVP P0 门禁
@@ -477,6 +480,65 @@ daemon no-net、四份 schema、文档门禁、依赖边界与 v1 生产符号�
 `agentdeck-relay` server、axum 或 rusqlite。`DataEnvelope::Plaintext`、`bootstrap_secret`、
 `RelayCredentials`、`FakeRelay`、`req_origin` 任一旧生产符号命中均使门禁失败。
 
+## Relay Companion MVP P3.1 namespace / singleton / StorageKEK 门禁
+
+P3.1 的聚焦门禁只证明 daemon startup ownership、文件系统边界和可注入 keystore
+contract；它不证明 P3 RuntimeCore、UDS、LaunchAgent 或远程链路完成。unsigned 开发构建
+必须使用完整 `--ephemeral --no-remote` pair；stable 需要真实 provisioned daemon-only
+Keychain entitlement，不能通过运行时环境变量模拟。
+
+```bash
+# namespace、binary startup、StorageKEK（真实签名 roundtrip 默认 gated ignored）
+cargo test -p agentdeckd --test daemon_namespace --test storage_kek \
+  --test daemon_startup -- --test-threads=1
+
+# daemon crate 与两个过渡 stdio 调用方
+cargo test -p agentdeckd
+cargo test -p agentdeck-cli
+swift test
+
+# unsigned 开发环境的真实 child/selfcheck
+cargo run -q -p agentdeck-cli -- selfcheck
+cargo run -p agentdeckd -- --ephemeral --no-remote --profile dev --selfcheck
+
+# 边界与静态质量
+cargo fmt --all --check
+bash scripts/check-daemon-no-net.sh
+git diff --check
+scripts/verify-agent-docs.sh
+```
+
+当前聚焦结果为 `daemon_namespace` 18/18、`daemon_startup` 4/4、`storage_kek`
+14 PASS + 1 ignored signed gate；CLI 27/27、Swift 243 XCTest + 35 Swift Testing、no-net、
+fmt/diff-check 通过。scoped clippy 在显式允许仓库既有 7 类 baseline lint 后再以
+`-D warnings` 通过；不要把这句话解读为已清理全仓既有 lint。真实
+`agentdeck-cli selfcheck` 返回 `ok`、`protocolVersion=2` 与 Codex/Claude Code 两个
+adapter，测试 temp namespace 已清理。
+
+真实 Keychain gate 仍是 **BLOCKED，不是 PASS**：
+`macos_keychain_signed_set_load_delete_roundtrip` 已使用唯一 service/account 与 RAII cleanup，
+但必须在编译值、codesign entitlement 与 provisioning profile 三者完全一致的 helper 上去掉
+ignore 后运行。本机没有匹配 access group 的 provisioning profile；Apple Development 与
+本地 self-signed helper 都能通过 `codesign --verify`，启动却被 AMFI 以 exit 137 终止。
+取得该外部条件前不得勾选计划 P3.1 Step 4，不得宣称 P3.1/P3 完成。
+
+该门禁重点守护：
+
+- stable home 来自当前 EUID 的 `getpwuid_r`，不接受 `HOME`/data-dir/runtime access-group
+  override；ephemeral/no-remote 与 profile 组合必须严格匹配。
+- data root 原子 0700；stable 旧目录只允许当前 UID、实体目录且权限精确 0755 时在
+  directory fd 上收紧到 0700；0775/0777/01755、ephemeral 宽权限、symlink、非当前 UID
+  entry 都拒绝。
+- lock 经持有的 directory fd `openat`，在 `flock` 前后复核 owner/mode/nlink/dev/ino；
+  第二 owner 必须立即得到 `daemon.singleton.already_running`。
+- stable 只能选择 macOS protected Keychain，ephemeral 只能选择 memory store；没有任何
+  stable memory/明文 fallback。
+- Runtime DB、`-wal` 或 `-shm` 任一已存在 state 而 `storage-kek.v1` 缺失时拒绝生成替代 key；
+  fresh 生成后必须 reload byte-identical，secret Debug 脱敏、Drop 清零。
+- Swift/Rust stdio compatibility transport 必须固定传
+  `--ephemeral --no-remote --profile dev`，并从 child environment 删除
+  `AGENTDECK_DATA_DIR` / `AGENTDECK_PROFILE`；P3.9 UDS cutover 前不触碰 stable namespace。
+
 ## AppKit 重写后的验证清单
 
 前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。
@@ -593,6 +655,7 @@ cargo install cargo-llvm-cov
 | agentdeck-protocol 类型变更 | `cargo test`（漂移测试自动运行）；若漂移测试失败须先重新生成快照（见下） |
 | 参考客户端 CLI（agentdeck-cli）、Transport、Client | `cargo test -p agentdeck-cli`；再跑完整 `cargo test` |
 | Relay Companion MVP P0 基线或 v1 reset | 迭代时跑 `bash scripts/tests/reset-relay-v1-dev-state.sh`；提交前跑一次 `bash scripts/verify-relay-companion-mvp.sh p0` |
+| Relay Companion MVP P3.1 daemon namespace / singleton / StorageKEK | 运行本页 P3.1 聚焦矩阵、`cargo test -p agentdeckd`、CLI/Swift transport tests、daemon no-net；stable Keychain 必须另有真实 provisioned signed helper 证据，ignored 不算通过 |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

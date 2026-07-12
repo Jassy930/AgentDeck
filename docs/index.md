@@ -47,7 +47,7 @@
 ### Relay Companion MVP（2026-07-10）
 
 - `plans/2026-07-10-relay-companion-mvp-design.md`：已批准的目标架构；固定 singleton daemon、多读者/多写者串行裁决、按机器独立配对、Relay 严格最小可见与真实 iOS Companion 边界。
-- `plans/2026-07-10-relay-companion-mvp-implementation.md`：P0–P6、48 个逐文件 TDD task；当前已完成 P2.10：production 仅 Relay v2、真实 Direct TLS/SPKI synthetic、admin UDS、一次性 machine enrollment、v1 物理移除与安全/故障门禁。后续覆盖 RuntimeCore、UDS/LaunchAgent、E2EE/Keychain、持久远程 CLI、iOS/远程 macOS 与真实跨网 DoD。
+- `plans/2026-07-10-relay-companion-mvp-implementation.md`：P0–P6、48 个逐文件 TDD task；P2.10 已完成，P3.1 的 strict stable/ephemeral namespace、dirfd/openat singleton、StorageKEK 与过渡 stdio 隔离代码已准备。真实 provisioned signed Keychain roundtrip 仍因本机缺 provisioning profile / AMFI exit 137 gated BLOCKED，P3.1/P3 尚未完成；后续继续 RuntimeCore、UDS/LaunchAgent、持久远程 CLI、iOS/远程 macOS 与真实跨网 DoD。
 
 ## 协议资料
 

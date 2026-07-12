@@ -17,18 +17,26 @@ path = "src/main.rs"
 [dependencies]
 agentdeck-protocol = { path = "../agentdeck-protocol" }
 async-trait = "0.1"
+getrandom = "0.4"
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "process", "io-util", "time", "io-std", "signal"] }
 uuid = { version = "1", features = ["v4"] }
 # Used by claude_code adapter preflight (spec § 5.8 cc-not-installed
 # check). Kept as a runtime dep — also re-exported for tests via the
 # same crate version (no dev-dep duplication needed).
 which = "6"
+zeroize = "1.9"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3.7", features = ["OSX_10_15"] }
+security-framework-sys = "2.17"
 
 [dev-dependencies]
-which = "6"
 criterion = { version = "0.5", features = ["html_reports"] }
+which = "6"
 
 [[bench]]
 name = "cc_streaming_throughput"

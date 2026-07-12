@@ -1,13 +1,23 @@
 import Foundation
 
-/// Concrete `DaemonTransport` that spawns the real `agentdeckd` binary and
-/// shuttles raw JSONL lines in/out over its stdin/stdout.
+/// Transitional `DaemonTransport` that spawns an isolated, no-remote dev
+/// `agentdeckd` and shuttles raw JSONL lines in/out over its stdin/stdout.
 ///
 /// v2 redesign (Task 6A): the reader loop no longer attempts to decode each
 /// line — it forwards strings to the incoming handler. `DaemonClient` parses
 /// `ServerEvent` vs admin `{"reply":...}` shapes.
 final class ProcessDaemonTransport: DaemonTransport, @unchecked Sendable {
-    private let profile: AgentDeckProfile
+    static let stdioDaemonArguments = ["--ephemeral", "--no-remote", "--profile", "dev"]
+
+    static func stdioDaemonEnvironment(
+        base: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [String: String] {
+        var environment = base
+        environment.removeValue(forKey: "AGENTDECK_DATA_DIR")
+        environment.removeValue(forKey: "AGENTDECK_PROFILE")
+        return environment
+    }
+
     private let process = Process()
     private let toDaemon = Pipe()
     private let fromDaemon = Pipe()
@@ -19,7 +29,8 @@ final class ProcessDaemonTransport: DaemonTransport, @unchecked Sendable {
     private var disconnectHandler: (() -> Void)?
 
     init(profile: AgentDeckProfile = .stable) {
-        self.profile = profile
+        // 保留参数以兼容现有调用点；stdio 过渡链路始终使用隔离 dev namespace。
+        _ = profile
     }
 
     deinit {
@@ -60,9 +71,10 @@ final class ProcessDaemonTransport: DaemonTransport, @unchecked Sendable {
             throw DaemonError.binaryNotFound("target/{debug,release}/agentdeckd or PATH")
         }
         process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = Self.stdioDaemonArguments
         process.standardInput = toDaemon
         process.standardOutput = fromDaemon
-        process.environment = DaemonClient.daemonEnvironment(profile: profile)
+        process.environment = Self.stdioDaemonEnvironment()
         do {
             try process.run()
         } catch {

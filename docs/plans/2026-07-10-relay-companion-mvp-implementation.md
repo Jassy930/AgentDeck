@@ -500,9 +500,15 @@ impl RelayPairingClient {
 **Files:**
 - Create: `agentdeckd/src/{config,security/mod,security/key_store,security/macos_keychain}.rs`
 - Create: `agentdeckd/src/runtime/{namespace,singleton}.rs`
-- Create: `agentdeckd/tests/{daemon_namespace,storage_kek}.rs`
+- Create: `agentdeckd/tests/{daemon_namespace,daemon_startup,storage_kek}.rs`
 - Modify: `agentdeckd/src/{lib,main,record}.rs`
 - Modify: `agentdeckd/Cargo.toml`
+- Modify: `Cargo.lock`
+- Modify: `agentdeck-cli/src/transport.rs`
+- Modify: `Sources/AgentDeck/ProcessDaemonTransport.swift`
+- Create: `Tests/AgentDeckTests/ProcessDaemonTransportTests.swift`
+- Modify: `README.md`, `ARCHITECTURE.md`, `AGENTS.md`
+- Modify: `docs/{QUALITY,AGENT_DIAGNOSTICS,index}.md`
 
 **Core interface:**
 ```rust
@@ -511,14 +517,14 @@ pub struct DaemonPaths { pub data_dir: PathBuf, pub runtime_db: PathBuf, pub soc
 pub trait KeyStore: Send + Sync { fn load(&self, account: &str) -> Result<Option<SecretBytes>, KeyStoreError>; fn store(&self, account: &str, value: &SecretBytes) -> Result<(), KeyStoreError>; fn delete(&self, account: &str) -> Result<(), KeyStoreError>; }
 ```
 
-**Stable paths:** data root=`~/Library/Application Support/AgentDeck`，DB=`runtime.db`，UDS=`agentdeckd.sock`，lock=`agentdeckd.lock`，Keychain service=`com.agentdeck.agentdeckd.stable`；release helper的daemon-only access group固定为签名entitlement中的`TEAMID.com.agentdeck.agentdeckd.stable`，主App/CLI不持有该entitlement；ephemeral四类路径/service都包含同一随机instance ID且位于temp namespace。
+**Stable paths:** data root=`<OS account home>/Library/Application Support/AgentDeck`，DB=`runtime.db`，UDS=`agentdeckd.sock`，lock=`agentdeckd.lock`，Keychain service=`com.agentdeck.agentdeckd.stable`；home 通过当前 EUID 的 `getpwuid_r` 取得，不信任可变 `HOME`。release helper 的 daemon-only access group 必须是 entitlement 中展开后的`<实际 TeamIdentifier>.com.agentdeck.agentdeckd.stable`，并在编译时通过`AGENTDECK_DAEMON_KEYCHAIN_ACCESS_GROUP`注入；运行时环境不能替换，主App/CLI不持有该 entitlement。ephemeral 的 data root/DB/socket/lock/service 共享同一随机 instance ID 并位于私有 temp namespace。
 
-- [ ] Step 1: 写namespace/lock/Keychain tests。 固定stable路径与service；第二stable lock失败；dev未带`--ephemeral --no-remote`失败；ephemeral的DB/socket/lock/service四项全隔离；fresh namespace可生成一次`storage-kek.v1`，但已有非空Runtime DB而StorageKEK缺失时必须`StorageKeyMissing`并拒绝生成替代key；secret Debug redacted。
-- [ ] Step 2: 运行 `cargo test -p agentdeckd --test daemon_namespace`。 Expected: FAIL，配置与security module不存在；实现后再单独运行`--test storage_kek`。
-- [ ] Step 3: 实现路径解析、原子进程锁、memory keystore与macOS generic-password adapter。 target-specific依赖固定`security-framework = { version = "3.7", features = ["OSX_10_15"] }`；release set/get/delete调用`use_protected_keychain()`、`set_access_synchronized(Some(false))`、`set_access_group(TEAMID.com.agentdeck.agentdeckd.stable)`并使用`AccessibleAfterFirstUnlockThisDeviceOnly`且无user-presence，保证LaunchAgent无交互；ephemeral测试使用独立memory/test group，stable非macOStyped unsupported且不回退明文key file。
-- [ ] Step 4: 重跑 tests并确认 Keychain测试用唯一 service/account后清理。 Expected: PASS且输出不含 key bytes。
-- [ ] Step 5: 运行 `cargo fmt/clippy` 与 `git status --short`。
-- [ ] Step 6: 提交。 `git add agentdeckd Cargo.lock && git commit -m "feat(daemon): 建立 singleton namespace 与 StorageKEK"`
+- [x] Step 1: 已先写 namespace/lock/Keychain 与 binary startup tests。覆盖 stable 固定路径与 OS home、不完整 mode matrix、ephemeral 全资源隔离、第二进程锁拒绝、symlink/hardlink/宽权限拒绝、stable 旧目录仅精确 0755→0700 安全迁移（0775/0777/01755 拒绝）、fresh StorageKEK、DB/WAL/SHM 已存在时缺 key fail-close、持久化读回不一致和 secret Debug redaction。
+- [x] Step 2: 已保留 TDD RED（缺少 config/security/namespace API），再运行聚焦矩阵；当前 `daemon_namespace` 18/18、`daemon_startup` 4/4、`storage_kek` 14 PASS，另有 1 个真实签名 Keychain roundtrip 按预期 gated ignored。
+- [x] Step 3: 已实现固定启动序列 `config → private namespace/singleton → keystore → StorageKEK → record namespace → selfcheck/stdio loop`。data root 以 0700 原子创建；只对当前 UID 拥有、权限精确为旧版 0755 的固定 stable 目录，在已 `O_NOFOLLOW` 打开的 directory fd 上收紧到 0700，其他宽权限拒绝；lock 只经该 dirfd 的 `openat` 建立，并在 `flock` 前后核对 owner/mode/nlink/dev/ino。stable Keychain 使用 protected、non-synchronizable、`AccessibleAfterFirstUnlockThisDeviceOnly`、空 access-control flags，缺 entitlement/backend 失败即关闭且无 memory/明文回退；ephemeral 才使用独立 memory store。过渡 stdio 调用方显式传 `--ephemeral --no-remote --profile dev` 并移除继承的旧 namespace env，等待 P3.9 切换 UDS。
+- [ ] Step 4: **GATED / BLOCKED（不是 PASS）**。唯一 service/account、RAII 清理的 ignored roundtrip 已存在，但本机没有匹配 access group 的 provisioning profile；Apple Development 与本地 self-signed helper 均可通过 `codesign --verify`，实际启动都被 AMFI 以 exit 137 终止。因此尚无真实 `set → load → delete` Keychain 读回证据，不能勾选本步，也不能据此宣布 P3.1/P3 完成；须在具备匹配 provisioning/entitlement 的已签名 helper 上重跑。
+- [x] Step 5: 已运行聚焦 Rust tests、CLI tests、Swift tests、daemon no-net、`cargo fmt --check`、`git diff --check` 与 scoped clippy；结果为 CLI 27/27、Swift 243 XCTest + 35 Swift Testing、no-net/diff-check 通过，scoped clippy 在显式允许仓库既有 7 类 baseline lint 后以 `-D warnings` 通过。真实 `cargo run -q -p agentdeck-cli -- selfcheck` 返回 `ok`、`protocolVersion=2` 与双 adapter，临时 namespace 已清理；阶段收口前仍须由主执行者重跑完整范围并核对最终 `git status --short`。
+- [ ] Step 6: 核对本 task 的 daemon、两个 stdio transport、测试与文档精确 pathspec 后提交；不得 `git add -A`。commit message：`feat(daemon): 建立 singleton namespace 与 StorageKEK`
 
 ### Task P3.2：实现 Runtime SQLite journal、稳定身份与存储上界
 
