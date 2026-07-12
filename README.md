@@ -205,9 +205,9 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（P2.7）
+## Relay Companion MVP 实施状态（P2.8）
 
-P0 已冻结既有 Relay v1 行为并建立实施门禁；P2.1–P2.7 已并列完成 Relay v2 SQLite
+P0 已冻结既有 Relay v1 行为并建立实施门禁；P2.1–P2.8 已并列完成 Relay v2 SQLite
 store、challenge/auth、stream core、内存 PairRoute、在线 Send/Reply，以及 root-signed
 grant/revoke/machine retirement 和 TLS server lifecycle library contract。
 PairRoute 默认受每 machine 8、全局 1,024、每 route 32 frames / 1 MiB / 300 秒及独立
@@ -244,9 +244,16 @@ machine insert、canonical request hash、冻结 response/receipt 在同一 tran
 readback、purge 仍完全不进入网络 listener。root-lost purge 在 Core FIFO 中裁决，错误 fingerprint
 零写入，COMMIT 不确定则全 Core fail-closed。操作命令与边界见
 [`docs/RELAY_RUNBOOK.md`](docs/RELAY_RUNBOOK.md)。
+P2.8 新增默认不依赖 Relay server/store 的 Rust v2 outbound client：principal 严格执行
+`Hello → Challenge → Authenticate → Authenticated`，重连使用 fresh challenge；pairing 使用独立
+`Hello → PairingHello → Authenticated` 状态机并只暴露 route-bound typed API；enrollment 在
+TLS/hostname/CA或SPKI pin验证成功前不发送code或MachineRoot材料。后台single reader自动回复heartbeat，
+应用、control、urgent与writer分别有界；send flush超时按outcome-unknown关闭当前generation，
+signed revoke/retire terminal保留canonical原字节。旧v1 client只在P2.9切换前通过非默认
+`v1-compat` feature供历史CLI/tests显式使用，默认normal依赖树不含`agentdeck-relay`、axum或rusqlite。
 这些能力尚未在 P2.9 原子切换生产 listener，也未接通 daemon/iOS，因此不能描述为公网
 Companion 已可用。当前统一 P0 回归入口仍按批准设计 §16.5 运行 Rust、Swift、iOS、网络、
-文档和 schema 基线门禁；P2.7 专项门禁见 `docs/QUALITY.md`：
+文档和 schema 基线门禁；P2.7/P2.8 专项门禁见 `docs/QUALITY.md`：
 
 ```bash
 bash scripts/verify-relay-companion-mvp.sh p0

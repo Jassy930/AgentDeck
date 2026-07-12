@@ -378,6 +378,23 @@ purge，再以同fingerprint readback确认active/grant/revocation/stream/frame/
 只剩一个retired tombstone，之后重新enroll与重新配对。COMMIT结果不确定会让整个Core
 fail-closed；若仍观察到旧writer或PairRoute，这是P0级安全回归。
 
+## Relay v2 Rust client 诊断（Companion MVP P2.8）
+
+| code | 含义 | 下一步 |
+| --- | --- | --- |
+| `remote.transport.tls_pin_mismatch` | leaf DER SPKI不在current/next pinset | 核对证书轮换；错过窗口重新取得bundle/invite，禁止忽略pin |
+| `relay.client.tls_verification_failed` | CA、证书时间或hostname验证失败 | 修证书链/SAN/系统时间，不降级到pin-only或明文 |
+| `relay.client.server_identity_mismatch` | Challenge/PairingHello的Relay server ID与冻结配置不同 | 停止签名和重试，重新核对可信bundle |
+| `relay.client.authentication_terminal` | 收到逐字节保留的signed revoke/retire terminal | 交给P4状态机验签、持久化并进入撤销/退役终态 |
+| `relay.client.send_outcome_unknown` | frame进入sink后失败或flush超时，是否到达对端未知 | 当前generation已fail-close；只按上层幂等/outbox语义决定重试 |
+| `relay.client.lagged` | 有界入站frame/byte预算耗尽 | 关闭并从cursor/snapshot恢复；不要扩大成无界队列 |
+| `relay.client.pair_event_pending` | 兼容data helper前存在close/error/restart等control event | 改用`next_event()`先处理并持久化control结果 |
+| `relay.client.enrollment_response_invalid` | server/route/epoch/receipt回显不匹配 | 视为安全错误，保留原请求，不生成新key/route后盲重试 |
+
+P2.8 只提供client library；production binary仍在P2.9前保留旧listener/CLI dispatch。看到
+`v1-compat`被默认启用、normal依赖树出现server/store，或pairing调用方能发送Subscribe/Publish/Send，
+都属于阶段边界回归。
+
 ## Failure Codes
 
 | code | 含义 | 下一步 |

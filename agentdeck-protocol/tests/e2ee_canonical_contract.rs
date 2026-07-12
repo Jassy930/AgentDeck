@@ -462,6 +462,40 @@ fn pairing_dtos_round_trip() {
 }
 
 #[test]
+fn pairing_invite_and_request_debug_redact_secrets_and_payloads() {
+    let invite = PairInviteV1 {
+        format_version: 1,
+        relay_protocol_version: 2,
+        pair_route: PairRouteId::from_bytes([0x11; 16]),
+        invite_secret: [0x12; 32],
+        invite_hpke_pubkey: PublicKeyBytes([0x13; 32]),
+        wss_url: "wss://secret-relay.invalid/".into(),
+        relay_server_id: RelayServerId::from_bytes([0x14; 16]),
+        current_spki_pin: [0x15; 32],
+        next_spki_pin: [0x16; 32],
+        expires_at_ms: 42,
+        machine_root_pubkey: PublicKeyBytes([0x17; 32]),
+        machine_root_fingerprint: [0x18; 32],
+        data_sign_cert: cert(),
+        machine_display_name: "Secret Machine".into(),
+    };
+    let request = PairRequestV1 {
+        format_version: 1,
+        invite_secret: [0x12; 32],
+        device_sign_pubkey: PublicKeyBytes([0x19; 32]),
+        device_hpke_pubkey: PublicKeyBytes([0x1a; 32]),
+        sealed_authorization_request: b"secret-authorization".to_vec(),
+        proof_signature: Ed25519Signature([0x1b; 64]),
+    };
+    let rendered = format!("{invite:?} {request:?}");
+    assert!(rendered.contains("<redacted>"));
+    assert!(!rendered.contains("secret-relay"));
+    assert!(!rendered.contains("Secret Machine"));
+    assert!(!rendered.contains("secret-authorization"));
+    assert!(!rendered.contains("121212"));
+}
+
+#[test]
 fn pair_response_received_binds_three_hashes_and_device_sign() {
     let recv = PairResponseReceivedV1 {
         request_hash: [0x02; 32],

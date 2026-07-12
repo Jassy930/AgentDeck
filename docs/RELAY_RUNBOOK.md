@@ -1,6 +1,6 @@
 # AgentDeck Relay v2 运维手册
 
-本页只记录已经由自动化测试真实跑通的 Relay v2 管理命令与安全边界。P2.7 仍是与旧
+本页只记录已经由自动化测试真实跑通的 Relay v2 管理命令与安全边界。P2.8 仍是与旧
 Relay listener 并列的 library server；production listener 要到 P2.9 才原子切换，因此本页
 不能作为“公网 Companion 已上线”的证明。
 

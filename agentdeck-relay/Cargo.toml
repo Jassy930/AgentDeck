@@ -58,7 +58,7 @@ required-features = ["server"]
 # `[dependencies]`（对 `tests/*.rs` 同样可见），无需在此重复声明；
 # tracing-subscriber 是 `[dependencies]` 里的 optional dep，`--features server`
 # 编译本测试文件时已随 feature 一并可见，同理无需重复声明。
-agentdeck-relay-client = { path = "../agentdeck-relay-client" }
+agentdeck-relay-client = { path = "../agentdeck-relay-client", features = ["v1-compat"] }
 ureq = { version = "2", features = ["json"] }
 # 仅供 `tests/r1a_ws_e2e.rs` 里 `#[cfg(all(feature = "server", feature = "tls"))]`
 # 门内的 `wss_connect_over_tls` 测试使用：手动直连 wss（不经 `agentdeck-relay-client`
@@ -68,3 +68,4 @@ ureq = { version = "2", features = ["json"] }
 # 这里显式声明是因为测试代码要直接引用 `CertificateDer`/`ServerName` 等类型。
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 rustls-pki-types = "1"
+rcgen = "0.13"

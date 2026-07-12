@@ -42,7 +42,7 @@ pub const REMOTE_TRANSPORT_TLS_PIN_MISMATCH: &str = "remote.transport.tls_pin_mi
 
 /// Relay 外层通用失败（wire 上是稳定 `code` 字符串）。绝不携带业务明文；
 /// `in_reply_to` 只做请求关联，脱敏后关联日志（design §14）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RelayFailure {
     pub code: String,
@@ -63,5 +63,53 @@ impl RelayFailure {
     pub fn in_reply_to(mut self, reference: impl Into<String>) -> Self {
         self.in_reply_to = Some(reference.into());
         self
+    }
+
+    /// 只允许稳定failure namespace字符进入client诊断；message/reply reference永不进Debug。
+    pub fn has_safe_code(&self) -> bool {
+        !self.code.is_empty()
+            && self.code.len() <= 128
+            && (self.code.starts_with("relay.") || self.code.starts_with("remote.transport."))
+            && self.code.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+            })
+    }
+}
+
+impl std::fmt::Debug for RelayFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RelayFailure")
+            .field(
+                "code",
+                &if self.has_safe_code() {
+                    self.code.as_str()
+                } else {
+                    "<invalid>"
+                },
+            )
+            .field("message", &"<redacted>")
+            .field("in_reply_to", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_debug_redacts_message_reference_and_invalid_code() {
+        let safe = RelayFailure::new("relay.route.forbidden", "secret-message")
+            .in_reply_to("secret-reference");
+        let rendered = format!("{safe:?}");
+        assert!(rendered.contains("relay.route.forbidden"));
+        assert!(!rendered.contains("secret-message"));
+        assert!(!rendered.contains("secret-reference"));
+
+        let invalid = RelayFailure::new("relay.bad\nsecret", "message");
+        let rendered = format!("{invalid:?}");
+        assert!(rendered.contains("<invalid>"));
+        assert!(!rendered.contains("secret"));
     }
 }

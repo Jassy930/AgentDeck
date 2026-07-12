@@ -406,6 +406,9 @@ pub struct ReplayTicket { pub stream: StreamRouteId, pub generation: StreamGener
 - Create: `agentdeck-relay-client/tests/relay_v2_client.rs`
 - Modify: `agentdeck-relay-client/src/lib.rs`
 - Modify: `agentdeck-relay-client/Cargo.toml`
+- Modify: `agentdeck-protocol/src/{e2ee/pairing,relay_v2/enrollment,relay_v2/mod}.rs` 与 contract tests
+- Modify: `agentdeck-cli/Cargo.toml`、`agentdeck-relay/Cargo.toml` 与真实 TLS client E2E（仅P2.9前显式`v1-compat`构建桥）
+- Modify: `README.md`、`docs/{QUALITY,AGENT_DIAGNOSTICS,RELAY_RUNBOOK}.md`
 
 **Core interface:**
 ```rust
@@ -424,11 +427,11 @@ impl RelayPairingClient {
 }
 ```
 
-- [ ] Step 1: 写client tests。 覆盖WSS CA/pin/fixed-host、binary frame、reconnect/auth与errors；enrollment client在发送code/root material前完成TLS验证。 未配对设备的RelayPairingClient只暴露指定pair route的PairData/ClosePairRoute typed API，尝试Subscribe/Send/Publish在编译接口上不可表达且恶意raw frame在server端拒绝。
-- [ ] Step 2: 运行 `cargo test -p agentdeck-relay-client --test relay_v2_client`。 Expected: FAIL，client仍是 bearer v1。
-- [ ] Step 3: 实现纯client crate并移除对`agentdeck-relay`的生产依赖。 WS只发送/接收binary codec；已授权RelayClient、one-shot EnrollmentClient和受限RelayPairingClient共享同一rustls verifier/fixed-host policy，但API与connection state互不冒充。
-- [ ] Step 4: 重跑 client与 Relay TLS tests。 Expected: PASS，`cargo tree -p agentdeck-relay-client` 不含 axum/rusqlite/agentdeck-relay。
-- [ ] Step 5: fmt/clippy。
+- [x] Step 1: 已写9个网络contract tests、5个supervisor单测和compile-fail API隔离；覆盖CA/pin/hostname/redirect、binary/fresh reconnect/signed terminal、TLS-before-enrollment-secret+receipt、自动Pong、control reserve/outcome-unknown/abort、typed pairing/close ACK与4MiB上限。
+- [x] Step 2: 已保留RED证据：新增测试最初因`RelayClientConfig`/`RelayTlsPolicy`不存在而编译失败；实现后focused与完整client均转绿。
+- [x] Step 3: 已实现默认纯client crate。三种TLS策略不互相降级；principal/enrollment/pairing互斥；后台single reader/writer、有界data/control/urgent预算和fresh auth reconnect均已落地。P2.9前旧调用方仅通过非默认`v1-compat`显式桥接，避免workspace红态。
+- [x] Step 4: client 5 unit + 9 integration + 1 compile-fail通过，真实Relay TLS E2E 11/11通过；默认normal tree不含`agentdeck-relay`、axum、rusqlite。receipt helper上移protocol，PairInvite/PairRequest/PairingEvent Debug脱敏。
+- [x] Step 5: focused clippy `-D warnings`、rustdoc、rustfmt、protocol/client/Relay TLS回归、dependency tree与diff gate纳入本阶段门禁；独立安全复审无剩余P0/P1/P2。
 - [ ] Step 6: 提交。 `git add agentdeck-relay-client Cargo.lock && git commit -m "feat(relay-client): 切换 v2 WSS 与 SPKI pin"`
 
 ### Task P2.9：原子切换 binary/CLI synthetic tests 并删除 Relay v1 生产代码

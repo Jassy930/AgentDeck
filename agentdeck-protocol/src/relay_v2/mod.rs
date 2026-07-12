@@ -32,7 +32,10 @@ pub use auth::{
 };
 pub use codec::{CodecError, MAX_FRAME_BYTES, RELAY_FRAME_MAGIC, decode, encode};
 pub use cursor::StreamCursor;
-pub use enrollment::{EnrollmentCode, MachineEnrollmentRequestV1, MachineEnrollmentResponseV1};
+pub use enrollment::{
+    EnrollmentCode, MachineEnrollmentRequestV1, MachineEnrollmentResponseV1,
+    enrollment_receipt_hash,
+};
 pub use failure::RelayFailure;
 pub use frame::{OpaqueRouteFrame, PairingHello, RelayFrameBody};
 pub use id::{

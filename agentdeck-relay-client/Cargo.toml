@@ -6,11 +6,29 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentdeck-relay = { path = "../agentdeck-relay" }        # 取 RelayLink（无 server feature）
+agentdeck-relay = { path = "../agentdeck-relay", optional = true }
 agentdeck-protocol = { path = "../agentdeck-protocol" }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
-tokio-tungstenite = "0.26"
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 async-trait = "0.1"
 serde_json = "1"
 thiserror = "1"
+url = "2"
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pki-types = "1"
+webpki-roots = "0.26"
+x509-parser = { version = "0.18", default-features = false }
+sha2 = "0.10"
+httparse = "1"
+
+[features]
+default = []
+# P2.8→P2.9 的短暂构建桥：旧 CLI/R1 tests 显式启用；默认 client 依赖树保持纯
+# outbound client。P2.9 原子删除 Relay v1 时同步删除本 feature。
+v1-compat = ["dep:agentdeck-relay"]
+
+[dev-dependencies]
+rcgen = "0.13"

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 /// 被控机器创建的配对邀请（design §6.2）。含 §6.2 列出的全部内容；`machine_display_name`
 /// 仅存在于带外邀请，**不属于 Relay wire/schema**。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PairInviteV1 {
     pub format_version: u16,
@@ -48,8 +48,17 @@ pub struct PairInviteV1 {
     pub machine_display_name: String,
 }
 
+impl std::fmt::Debug for PairInviteV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PairInviteV1")
+            .field("pairing_material", &"<redacted>")
+            .finish()
+    }
+}
+
 /// 设备封装在 HPKE 内的 PairRequest（design §6.3 step 2）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PairRequestV1 {
     pub format_version: u16,
@@ -64,6 +73,15 @@ pub struct PairRequestV1 {
     pub sealed_authorization_request: Vec<u8>,
     /// DeviceSign possession proof（对 invite transcript + HPKE enc + ciphertext hash）。
     pub proof_signature: Ed25519Signature,
+}
+
+impl std::fmt::Debug for PairRequestV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PairRequestV1")
+            .field("pairing_material", &"<redacted>")
+            .finish()
+    }
 }
 
 /// 与 requestHash 绑定的待确认状态（design §6.3 step 4）；MachineDataSign 签名，无 grant。

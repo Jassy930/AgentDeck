@@ -3,6 +3,7 @@
 use agentdeck_crypto::{SignatureBytes, VerifyingKey, sha256, verify_tbs};
 use agentdeck_protocol::relay_v2::{
     CertRole, MachineEnrollmentRequestV1, MachineEnrollmentResponseV1, RelayServerId,
+    enrollment_receipt_hash,
 };
 
 use crate::v2::auth::AuthorizationCoordinator;
@@ -135,21 +136,6 @@ fn validate_request(
         &SignatureBytes::from(request.data_cert.signature),
     )
     .map_err(|_| EnrollmentError::Rejected)
-}
-
-fn enrollment_receipt_hash(
-    relay_server_id: RelayServerId,
-    machine_route: agentdeck_protocol::relay_v2::MachineRouteId,
-    trust_epoch: u64,
-    request_hash: [u8; 32],
-) -> [u8; 32] {
-    let mut bytes = Vec::with_capacity(96);
-    bytes.extend_from_slice(b"AgentDeck/MachineEnrollmentReceiptV1\0");
-    bytes.extend_from_slice(relay_server_id.as_bytes());
-    bytes.extend_from_slice(machine_route.as_bytes());
-    bytes.extend_from_slice(&trust_epoch.to_be_bytes());
-    bytes.extend_from_slice(&request_hash);
-    sha256(&bytes)
 }
 
 fn map_store_error(error: StoreError) -> EnrollmentError {

@@ -30,12 +30,18 @@ use agentdeck_relay::v2::store::{
     EnrollmentCodeSeed, InstallGrantRecord, PersistRevocation, RegisterMachine, RelayStoreHandle,
     StoreError,
 };
+use agentdeck_relay_client::{
+    LinkAuthenticator, RelayClient as RelayV2Client, RelayClientConfig as RelayV2ClientConfig,
+    RelayClientError as RelayV2ClientError, RelayTlsPolicy,
+};
+use async_trait::async_trait;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -46,6 +52,7 @@ use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
 };
 use tracing_subscriber::fmt::MakeWriter;
+use x509_parser::prelude::{FromDer, X509Certificate};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
 const TEST_CERT_PEM: &[u8] = include_bytes!("fixtures/test_cert.pem");
@@ -109,6 +116,27 @@ impl SeededRealm {
             },
             signature: sign_authentication_transcript(&self.device, &transcript).into(),
         }
+    }
+}
+
+struct ClientMachineAuthenticator {
+    realm: Arc<SeededRealm>,
+}
+
+#[async_trait]
+impl LinkAuthenticator for ClientMachineAuthenticator {
+    fn proof(&self) -> AuthProof {
+        AuthProof::MachineLink {
+            machine_route: self.realm.machine_route,
+            link_cert: self.realm.link_cert.clone(),
+        }
+    }
+
+    async fn authenticate(
+        &self,
+        challenge: &agentdeck_protocol::relay_v2::frame::Challenge,
+    ) -> Result<Authenticate, RelayV2ClientError> {
+        Ok(self.realm.machine_authenticate(challenge))
     }
 }
 
@@ -608,6 +636,71 @@ async fn wss_uses_the_exact_pinned_certificate_and_binary_hello_yields_challenge
 
     socket.close(None).await.expect("close WSS client");
     handle.shutdown().await.expect("shutdown TLS server");
+}
+
+#[tokio::test]
+async fn production_v2_client_authenticates_against_the_real_relay_listener() {
+    let temp = TempDir::new().expect("tempdir");
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+        .expect("generate localhost TLS certificate");
+    let cert_path = temp.path().join("client-e2e-cert.pem");
+    let key_path = temp.path().join("client-e2e-key.pem");
+    std::fs::write(&cert_path, certified.cert.pem()).expect("write test certificate");
+    std::fs::write(&key_path, certified.key_pair.serialize_pem()).expect("write test key");
+    let certificate_der = certified.cert.der().to_vec();
+    let (_, certificate) =
+        X509Certificate::from_der(&certificate_der).expect("parse test certificate");
+    let spki_pin: [u8; 32] = Sha256::digest(certificate.tbs_certificate.subject_pki.raw).into();
+
+    let (mut config, _) = server_config(&temp);
+    config.transport = RelayV2TransportMode::DirectTls(RelayV2TlsPaths {
+        cert: cert_path,
+        key: key_path,
+    });
+    let realm = Arc::new(seed_realm(&config, false).await);
+    let handle = RelayV2ServerHandle::start(config)
+        .await
+        .expect("start real Relay listener");
+    let client_config = RelayV2ClientConfig::new(
+        &format!("wss://localhost:{}/", handle.public_addr().port()),
+        realm.relay_server_id,
+        RelayTlsPolicy::pinned_spki(vec![spki_pin]).expect("pinned policy"),
+    )
+    .expect("client config");
+    let authenticator: Arc<dyn LinkAuthenticator> = Arc::new(ClientMachineAuthenticator {
+        realm: Arc::clone(&realm),
+    });
+    let mut client = RelayV2Client::connect(client_config, authenticator)
+        .await
+        .expect("authenticate production client");
+    let pair_route = PairRouteId::from_bytes([0xa7; 16]);
+    client
+        .send(OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::OpenPairRoute(OpenPairRoute {
+                machine_route: realm.machine_route,
+                pair_route,
+                absolute_expiry_ms: unix_now_ms().saturating_add(60_000),
+            }),
+        })
+        .await
+        .expect("flush OpenPairRoute through production client");
+    let opened = timeout(IO_TIMEOUT, client.recv())
+        .await
+        .expect("production client receive timeout")
+        .expect("production client receive")
+        .expect("production listener frame");
+    let RelayFrameBody::PairRouteOpened(opened) = opened.body else {
+        panic!("production client must decode PairRouteOpened");
+    };
+    assert_eq!(opened.machine_route, realm.machine_route);
+    assert_eq!(opened.pair_route, pair_route);
+
+    drop(client);
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown real Relay listener");
 }
 
 #[tokio::test]

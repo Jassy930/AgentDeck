@@ -94,3 +94,20 @@ impl std::fmt::Debug for MachineEnrollmentResponseV1 {
             .finish()
     }
 }
+
+/// Relay 与 client 共用的 enrollment receipt hash。它绑定 Relay identity、machine
+/// route、trust epoch 与完整 canonical request hash，避免 client 只信任 JSON 回显。
+pub fn enrollment_receipt_hash(
+    relay_server_id: RelayServerId,
+    machine_route: MachineRouteId,
+    trust_epoch: u64,
+    request_hash: [u8; 32],
+) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(108);
+    bytes.extend_from_slice(b"AgentDeck/MachineEnrollmentReceiptV1\0");
+    bytes.extend_from_slice(relay_server_id.as_bytes());
+    bytes.extend_from_slice(machine_route.as_bytes());
+    bytes.extend_from_slice(&trust_epoch.to_be_bytes());
+    bytes.extend_from_slice(&request_hash);
+    Sha256::digest(bytes).into()
+}

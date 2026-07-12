@@ -409,6 +409,36 @@ timeout、其他错误或 inode 变化一律视为已有/不确定实例。
 把配置第一 pin 与真实 leaf DER SPKI SHA-256 比较；proxy 模式由可信部署显式提供一至两个 pin；
 insecure loopback 禁止 admin/enrollment。公网 unknown/admin path 固定 404，不 redirect。
 
+## Relay Companion MVP P2.8 Rust v2 client 门禁
+
+P2.8 仍通过临时非默认 `v1-compat` feature维持P2.9前的旧CLI/历史测试编译；默认client必须是
+纯outbound依赖树。改动WSS、TLS verifier、heartbeat、reconnect、enrollment或pairing API后运行：
+
+```bash
+cargo test -p agentdeck-relay-client -- --test-threads=1
+cargo test -p agentdeck-relay-client --features v1-compat --lib
+cargo test -p agentdeck-relay --features server,tls \
+  --test relay_v2_tls_e2e -- --test-threads=1
+cargo test -p agentdeck-protocol --test e2ee_canonical_contract
+
+# 命中即失败；默认normal client不得带server/store stack。
+if cargo tree -p agentdeck-relay-client -e normal \
+  | rg -q 'agentdeck-relay v|axum|rusqlite'; then exit 1; fi
+
+cargo clippy -p agentdeck-relay-client --all-targets --no-deps -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc -p agentdeck-relay-client --no-deps
+cargo fmt --all --check
+git diff --check
+```
+
+测试必须证明：Public CA、CA+current/next pin与pinned-SPKI三种策略不机会式降级；错pin使用
+`remote.transport.tls_pin_mismatch`，hostname/CA错在调用signer前失败；redirect不跟随；enrollment
+只有TLS完成后才写HTTP，响应同时核对server/route/epoch/receipt。principal每次reconnect重签fresh
+challenge；signed revoke/retire terminal逐字节返回。active supervisor必须保留独立1MiB control预算，
+自动Pong不被15MiB data预算饿死；send进入sink后失败或flush超时都标记outcome-unknown并取消
+generation，stalled child在join deadline后abort而非detach。PairingClient没有raw principal send，
+close ACK走urgent槽，所有PairingEvent与PairInvite/PairRequest Debug都脱敏。
+
 ## AppKit 重写后的验证清单
 
 前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。
