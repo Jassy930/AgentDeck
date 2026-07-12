@@ -1,11 +1,10 @@
 //! RuntimeEnvelope v1 —— UDS 与解密后远程链路的共同**中立业务 wire**（design §8.2）。
 //!
-//! 本模块与现有 local IPC（`PROTOCOL_VERSION = 2`，见 crate 根）以及 Relay v1
-//! （`src/remote/`）**并列**存在，彼此独立、版本轴不联动：`RUNTIME_PROTOCOL_VERSION`
-//! 与 `PROTOCOL_VERSION` 不得联动 bump（design §15 P0 / 实施计划 Global Constraints）。
+//! 本模块与 local IPC（`PROTOCOL_VERSION = 2`，见 crate 根）及 Relay v2
+//! 彼此独立、版本轴不联动：`RUNTIME_PROTOCOL_VERSION` 与
+//! `PROTOCOL_VERSION` / `relay_v2::RELAY_PROTOCOL_VERSION` 不得联动 bump。
 //!
-//! 本 task（P1.1）只定义契约与构造校验，不接线任何运行时行为；现有 local IPC 与
-//! Relay v1 路径原样保留。
+//! Runtime 只定义中立业务契约与构造校验，不承载 Relay 运输细节。
 //!
 //! 关键不变量（由 `tests/runtime_*` 守护）：
 //! - 稳定中立身份 newtypes（`identity`）——禁止 vendor thread/session 身份（RC-9）。

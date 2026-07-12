@@ -1,12 +1,10 @@
 //! P1.2 Relay v2 opaque contract —— types / codec / monotonic-version / id 契约。
 //!
-//! Relay v2 是严格最小可见的外层路由 wire（design §10）。本 task 只定义并列契约：
+//! Relay v2 是严格最小可见的唯一生产外层路由 wire（design §10）：
 //! - 128-bit 随机 route/generation ID（不可比较、不可复用）。
 //! - u64 单调值（trust epoch / link generation / grant serial / key revision）到 MAX 拒绝 wrap。
 //! - 30 个通用 frame family variant 的 `ADRV2` 二进制 codec round-trip + 固定字节 fixture。
 //! - 公开授权对象（RelayGrant / SignedCertificate / DeviceRevocation）与 enrollment DTO。
-//!
-//! 现有 Relay v1 namespace（`remote::`）本 task 原样保留、彼此独立。
 
 use agentdeck_protocol::e2ee::{
     DeviceAuthorizationV1, E2EE_FORMAT_VERSION, EpochBarrierV1, KeyDirectoryEntry, KeyDirectoryV1,
@@ -479,9 +477,8 @@ fn relay_v2_wire_fixture_is_rust_produced_and_in_sync() {
 fn relay_protocol_version_is_two_and_independent() {
     assert_eq!(RELAY_PROTOCOL_VERSION, 2);
     assert_eq!(E2EE_FORMAT_VERSION, 1);
-    // 版本轴彼此独立：local IPC=2、Relay v1 namespace=1、Runtime=1。
+    // 版本轴彼此独立：local IPC=2、Relay=2、Runtime=1、E2EE=1。
     assert_eq!(agentdeck_protocol::PROTOCOL_VERSION, 2);
-    assert_eq!(agentdeck_protocol::remote::RELAY_PROTOCOL_VERSION, 1);
     assert_eq!(agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION, 1);
 }
 
@@ -658,7 +655,7 @@ fn random_route_ids_are_distinct_and_hashable() {
 #[test]
 fn route_id_json_wire_round_trips() {
     let id = StreamGenerationId::from_bytes([0xAB; 16]);
-    let json = serde_json::to_value(&id).unwrap();
+    let json = serde_json::to_value(id).unwrap();
     assert!(
         json.is_string(),
         "128-bit id encodes as a single wire string"

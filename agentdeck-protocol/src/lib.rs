@@ -44,12 +44,8 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// Aggregate JSON Schema for the local IPC v2 wire types (CLI/Swift ⇄
 /// daemon). Snapshot-tested against `protocol/agentdeck/agentdeck-protocol.schema.json`.
 ///
-/// Relay v1 (`crate::remote`) entries were removed here in P1.3: Relay is now
-/// its own independent version axis (see `relay_v2_schema()` /
-/// `RELAY_PROTOCOL_VERSION`) and no longer rides on the local IPC schema.
-/// `crate::remote` itself is unchanged and keeps compiling/testing on its own
-/// (R0/R1a/R1b behavior is unaffected); only its presence in this aggregate
-/// export was removed.
+/// Relay 有独立的 v2 版本轴与 schema（见 `relay_v2_schema()` /
+/// `relay_v2::RELAY_PROTOCOL_VERSION`），不进入 local IPC aggregate schema。
 pub fn protocol_schema() -> serde_json::Value {
     use schemars::schema_for;
     use serde_json::json;
@@ -74,11 +70,6 @@ pub fn protocol_schema() -> serde_json::Value {
 
 pub mod e2ee;
 pub mod relay_v2;
-pub mod remote;
-pub use remote::{
-    ClientRole, CommandTarget, DataEnvelope, DeviceDescriptor, DeviceKind, MachineDescriptor,
-    RELAY_PROTOCOL_VERSION, RelayControlMsg, RemoteFrame, SessionDescriptor, SubTarget,
-};
 
 #[cfg(test)]
 mod neutrality_tests;

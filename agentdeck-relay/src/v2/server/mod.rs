@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use agentdeck_protocol::relay_v2::failure::RELAY_VERSION_UNSUPPORTED;
 use agentdeck_protocol::relay_v2::frame::ServerRestarting;
 use agentdeck_protocol::relay_v2::{OpaqueRouteFrame, RELAY_PROTOCOL_VERSION, RelayFrameBody};
 use axum::body::Bytes;
@@ -20,7 +21,7 @@ use axum::http::header::CONNECTION;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use rand::RngCore;
 use serde::Serialize;
@@ -75,6 +76,23 @@ pub enum RelayV2ServerError {
     Task,
     #[error("Relay v2 drain deadline elapsed")]
     DrainTimeout,
+}
+
+impl RelayV2ServerError {
+    /// 二进制只向 stderr 暴露稳定 failure code，不回显路径、证书或 Store 细节。
+    pub fn code(&self) -> &str {
+        match self {
+            Self::Config(error) => error.code(),
+            Self::Tls(error) => error.code(),
+            Self::Admin(error) => error.code(),
+            Self::Store(error) => error.diagnostic_code(),
+            Self::Core { code } => code,
+            Self::Io(_) => "relay.server.io",
+            Self::Signal => "relay.server.signal_failed",
+            Self::Task => "relay.server.task_failed",
+            Self::DrainTimeout => "relay.server.drain_timeout",
+        }
+    }
 }
 
 fn core_error(error: agentdeck_protocol::relay_v2::RelayFailure) -> RelayV2ServerError {
@@ -256,6 +274,19 @@ fn enrollment_rejection(status: StatusCode, code: &'static str) -> Response {
     (status, Json(Rejection { code })).into_response()
 }
 
+/// 已删除的 v1 固定入口只保留无状态 HTTP tombstone：不升级 WebSocket、不读取
+/// Authorization，也不触达 challenge/auth/store。旧客户端因此能在拨号边界得到稳定
+/// reset 信号，而不是被误导为临时网络故障。
+async fn legacy_v1_tombstone() -> Response {
+    (
+        StatusCode::UPGRADE_REQUIRED,
+        Json(Rejection {
+            code: RELAY_VERSION_UNSUPPORTED,
+        }),
+    )
+        .into_response()
+}
+
 /// 公开 listener 不是通用 HTTP 服务。只有成功的 WebSocket 101 可以把物理连接 permit
 /// 转成长期 WS 生命周期；所有 400/404/405 与 extractor rejection 都必须显式关闭，避免
 /// 完整 HTTP/1.1 keep-alive 在完成 header 后、101 deadline 到达前持续占住 permit。
@@ -272,6 +303,7 @@ async fn close_non_switching_response(request: Request, next: Next) -> Response 
 fn public_router(state: PublicState) -> Router {
     // health/readiness 故意不挂到公开 listener；未知 path 只返回 404，不 redirect。
     Router::new()
+        .route("/v1/connect", any(legacy_v1_tombstone))
         .route("/v2/connect", get(connect_principal))
         .route("/v2/pair", get(connect_pairing))
         .route("/v2/machine-enroll", post(enroll_machine))

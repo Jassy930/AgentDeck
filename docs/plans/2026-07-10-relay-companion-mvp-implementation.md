@@ -438,9 +438,9 @@ impl RelayPairingClient {
 
 **Files:**
 - Modify: `agentdeck-cli/src/{main,remote}.rs`, `agentdeck-cli/Cargo.toml`
-- Modify: `agentdeck-protocol/src/lib.rs`, `agentdeck-protocol/src/neutrality_tests.rs`, `agentdeck-protocol/Cargo.toml`
-- Modify: `agentdeck-relay/src/{lib,main,config}.rs`, `agentdeck-relay/Cargo.toml`
-- Modify: `agentdeck-relay-client/src/lib.rs`, `agentdeck-relay-client/Cargo.toml`
+- Modify: `agentdeck-protocol/src/{lib,neutrality_tests}.rs`, `agentdeck-protocol/src/{relay_v2/enrollment,runtime/{command,mod}}.rs`, `agentdeck-protocol/tests/relay_v2_contract.rs`, `agentdeck-protocol/Cargo.toml`
+- Modify: `agentdeck-relay/src/{lib,main,config}.rs`, `agentdeck-relay/src/v2/{admin/command,server/mod}.rs`, `agentdeck-relay/tests/{relay_v2_admin_e2e,relay_v2_route_e2e}.rs`, `agentdeck-relay/Cargo.toml`
+- Modify: `agentdeck-relay-client/src/{lib,v2/connection}.rs`, `agentdeck-relay-client/tests/relay_v2_client.rs`, `agentdeck-relay-client/Cargo.toml`
 - Modify: `agentdeckd/Cargo.toml`
 - Modify: `Cargo.lock`
 - Delete: `agentdeck-protocol/src/remote/`
@@ -451,12 +451,14 @@ impl RelayPairingClient {
 - Delete: `agentdeck-relay/tests/{r0_composition,r1a_ws_e2e,r1b_hardening_e2e}.rs`
 - Delete: `agentdeckd/tests/{relay_r0_bridge,relay_r0_e2e}.rs`
 - Create: `agentdeck-cli/tests/remote_v2_synthetic.rs`
+- Create: `agentdeck-relay/tests/relay_v2_cutover.rs`
+- Modify: `protocol/agentdeck/runtime-protocol.schema.json`
 
-- [ ] Step 1: 先写 synthetic v2 CLI smoke。 用 ephemeral keys 完成 machine/device auth、register/publish/subscribe/send/reply/revoke；断言旧 bearer credential JSON、`--bootstrap-secret` 与 v1 wire都返回 typed unsupported/reset-required。
-- [ ] Step 2: 运行 synthetic test。 Expected: FAIL，CLI仍调用 v1 API。
-- [ ] Step 3: 切CLI与Relay binary/config/dependencies默认dispatch到v2，清除bootstrap/bearer/plaintext/req_origin配置并删除上述v1代码和测试。 P2 CLI只支持ephemeral synthetic device、受限pairing smoke与admin；persistent remote pair在P4前typed unsupported。
-- [ ] Step 4: 运行 `cargo test`、四份schema diff和 `rg -n 'DataEnvelope::Plaintext|bootstrap_secret|RelayCredentials|FakeRelay|req_origin' --glob '*.rs'`。 Expected: tests PASS；生产Rust源无命中，允许历史docs/plan命中。
-- [ ] Step 5: 运行 `bash scripts/check-daemon-no-net.sh`，确认 daemon尚未引入网络。
+- [x] Step 1: 已先写真实 DirectTLS/SPKI synthetic CLI E2E：一次性 enrollment、machine/device fresh challenge auth、InstallGrant、publish-before-subscribe byte-exact replay、Send/Reply、root-signed revoke terminal及重连 canonical bytes；SQLite/readback 与 AEAD sentinel 同时证明 opaque payload。
+- [x] Step 2: 已保留 RED：旧 CLI 无 `synthetic --bundle` 且仍依赖 v1 surface；依赖切割后编译器进一步暴露所有旧 protocol/relay/client/daemon 引用。
+- [x] Step 3: CLI 与 Relay binary/config/dependencies 已原子切到 v2；旧 protocol、server/router/store、client、daemon bridge 和测试已删除。旧 credential marker 只做 no-follow metadata 探测且零写/零拨号；旧 flag/env fail-close，persistent remote 在 P4 前返回 typed unsupported。
+- [x] Step 4: `cargo test --locked` 全 workspace 通过；四份 schema byte-identical diff 通过；v1 production sentinel `rg` 零命中。Runtime 描述去除旧 seen-map 术语后已同步 schema 快照；Rustls 双 provider feature-unification 回归也已修复。
+- [x] Step 5: `bash scripts/check-daemon-no-net.sh` 通过；CLI 与 relay-client normal dependency tree 均不含 Relay server/axum/rusqlite。
 - [ ] Step 6: 精确stage并提交。 stage上述modified files与Cargo.lock；删除项只用精确pathspec：三个old protocol/relay/client source目录、`r0_composition.rs`、`r1a_ws_e2e.rs`、`r1b_hardening_e2e.rs`、`relay_r0_bridge.rs`、`relay_r0_e2e.rs`。 核对`git diff --cached --name-status`与task Files完全相同后执行`git commit -m "feat(relay): 原子切换 Relay v2 并移除 v1 生产路径"`，不得stage整个tests目录。
 
 ### Task P2.10：Relay v2 hardening E2E、sentinel 与阶段文档收口

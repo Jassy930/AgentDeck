@@ -1885,7 +1885,7 @@ async fn pair_route_default_capacity_lifetime_bytes_rate_and_ttl_are_hard_bounds
 }
 
 #[tokio::test]
-async fn send_reply_are_online_role_bound_trust_bound_and_do_not_require_req_origin() {
+async fn send_reply_are_online_role_bound_trust_bound_and_do_not_require_a_seen_map() {
     let mut fixture = Fixture::new().await;
     let device_a_route = fixture.realms[0].devices[0].route;
     let device_a2_route = fixture.realms[0].devices[1].route;
@@ -1932,7 +1932,7 @@ async fn send_reply_are_online_role_bound_trust_bound_and_do_not_require_req_ori
             .core
             .handle(&machine_a.access, reply.clone())
             .await
-            .expect("Reply routes explicitly without any req_origin seen-map"),
+            .expect("Reply routes explicitly without any request-origin seen-map"),
         arbitrary_unseen_route,
     );
     assert_eq!(recv_frame(&mut device_a).await, reply);

@@ -4069,7 +4069,7 @@
             },
             {
               "additionalProperties": false,
-              "description": "查询原始回执（断线重取；不复用 Relay req_origin）。",
+              "description": "查询原始回执（断线重取；不依赖 Relay 请求来源缓存）。",
               "properties": {
                 "commandId": {
                   "default": null,
@@ -8255,7 +8255,7 @@
             },
             {
               "additionalProperties": false,
-              "description": "查询原始回执（断线重取；不复用 Relay req_origin）。",
+              "description": "查询原始回执（断线重取；不依赖 Relay 请求来源缓存）。",
               "properties": {
                 "commandId": {
                   "default": null,
@@ -10792,7 +10792,7 @@
         },
         {
           "additionalProperties": false,
-          "description": "查询原始回执（断线重取；不复用 Relay req_origin）。",
+          "description": "查询原始回执（断线重取；不依赖 Relay 请求来源缓存）。",
           "properties": {
             "commandId": {
               "default": null,

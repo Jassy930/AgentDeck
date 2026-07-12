@@ -17,6 +17,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
 use super::transport::{
     BinarySocket, Socket, encode_checked, is_protocol_ping, post_enrollment, protocol_pong,
@@ -563,8 +564,10 @@ impl RelayEnrollmentClient {
         config: EnrollmentClientConfig,
         request: MachineEnrollmentRequestV1,
     ) -> Result<MachineEnrollmentResponseV1, RelayClientError> {
-        let request_bytes = serde_json::to_vec(&request)
-            .map_err(|_| RelayClientError::new("relay.client.enrollment_request_invalid"))?;
+        let request_bytes = Zeroizing::new(
+            serde_json::to_vec(&request)
+                .map_err(|_| RelayClientError::new("relay.client.enrollment_request_invalid"))?,
+        );
         let response_bytes = post_enrollment(&config.relay, &request_bytes).await?;
         let response: MachineEnrollmentResponseV1 = serde_json::from_slice(&response_bytes)
             .map_err(|_| RelayClientError::new("relay.client.enrollment_response_invalid"))?;

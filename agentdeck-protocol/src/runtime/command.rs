@@ -196,7 +196,7 @@ pub enum RuntimeRequest {
         #[serde(default)]
         turn_id: Option<TurnId>,
     },
-    /// 查询原始回执（断线重取；不复用 Relay req_origin）。
+    /// 查询原始回执（断线重取；不依赖 Relay 请求来源缓存）。
     QueryReceipt(QueryReceiptRequest),
     /// 创建 PairInvite —— local-only administration。
     CreatePairInvite(CreatePairInviteRequest),

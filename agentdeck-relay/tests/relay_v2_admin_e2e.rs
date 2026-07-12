@@ -295,7 +295,8 @@ async fn admin_uds_and_tls_enrollment_are_one_shot_exact_and_fingerprint_bound()
     assert_eq!(stored_hash, sha256(&bundle.code.0));
     assert_ne!(stored_hash, bundle.code.0);
 
-    let (request, root_fingerprint) = enrollment_request(bundle.code, bundle.relay_server_id, 0x31);
+    let (request, root_fingerprint) =
+        enrollment_request(bundle.code.clone(), bundle.relay_server_id, 0x31);
     let encoded = serde_json::to_vec(&request).expect("encode enrollment request");
     let (status, first_body) =
         https_request(handle.public_addr(), "POST", "/v2/machine-enroll", &encoded).await;
@@ -524,7 +525,11 @@ async fn admin_uds_and_tls_enrollment_are_one_shot_exact_and_fingerprint_bound()
     assert_eq!(status, 200, "invalid signature cannot consume the code");
 
     let raced_bundle = create_bundle(&client).await;
-    let (raced_a, _) = enrollment_request(raced_bundle.code, raced_bundle.relay_server_id, 0x61);
+    let (raced_a, _) = enrollment_request(
+        raced_bundle.code.clone(),
+        raced_bundle.relay_server_id,
+        0x61,
+    );
     let (raced_b, _) = enrollment_request(raced_bundle.code, raced_bundle.relay_server_id, 0x62);
     let address = handle.public_addr();
     let encoded_a = serde_json::to_vec(&raced_a).unwrap();

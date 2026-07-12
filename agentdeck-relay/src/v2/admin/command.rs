@@ -124,14 +124,14 @@ impl AdminCommandExecutor {
     }
 
     async fn create_enrollment_bundle(&self) -> Result<AdminResult, &'static str> {
-        let mut code = [0_u8; 32];
+        let mut code = EnrollmentCode([0_u8; 32]);
         rand::rngs::OsRng
-            .try_fill_bytes(&mut code)
+            .try_fill_bytes(&mut code.0)
             .map_err(|_| "relay.admin.random_unavailable")?;
         let expires_at_ms = unix_now_ms().saturating_add(ENROLLMENT_CODE_TTL_MS);
         self.authorization
             .seed_enrollment_code(EnrollmentCodeSeed {
-                code_hash: sha256(&code),
+                code_hash: sha256(&code.0),
                 expires_at_ms,
             })
             .await
@@ -141,7 +141,7 @@ impl AdminCommandExecutor {
                 version: ADMIN_PROTOCOL_VERSION,
                 public_wss_url: self.runtime.public_wss_url.clone(),
                 relay_server_id: self.store.relay_server_id(),
-                code: EnrollmentCode(code),
+                code,
                 spki_pins: self
                     .runtime
                     .spki_pins

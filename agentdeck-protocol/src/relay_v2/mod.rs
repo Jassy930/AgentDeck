@@ -1,8 +1,7 @@
 //! Relay v2 opaque wire 契约（design §10，严格最小可见 RC-6）。
 //!
-//! 本模块与现有 Relay v1 namespace（`crate::remote`，`RELAY_PROTOCOL_VERSION = 1`）
-//! **并列**存在、彼此独立、版本轴不联动：Relay v2 固定 `RELAY_PROTOCOL_VERSION = 2`；
-//! P1.2 只定义并列契约，不触碰 v1 路径（design §15 P1 / 实施计划 Global Constraints）。
+//! Relay v2 是唯一生产 Relay namespace，固定
+//! `RELAY_PROTOCOL_VERSION = 2`，并与 local IPC、Runtime 及 E2EE 版本轴独立。
 //!
 //! Relay 只理解通用 opaque route/stream/request 语义；wire/schema/日志中不存在机器名、
 //! session title、cwd、agent kind、conversation/thread/turn/approval/vendor 业务字段
@@ -22,8 +21,8 @@ pub mod frame;
 pub mod id;
 pub mod schema;
 
-/// Relay 目标线协议版本；独立于 local IPC `PROTOCOL_VERSION`、Relay v1
-/// `remote::RELAY_PROTOCOL_VERSION` 与 `runtime::RUNTIME_PROTOCOL_VERSION`。
+/// Relay 协议版本；独立于 local IPC `PROTOCOL_VERSION`、
+/// `runtime::RUNTIME_PROTOCOL_VERSION` 与 `e2ee::E2EE_FORMAT_VERSION`。
 pub const RELAY_PROTOCOL_VERSION: u16 = 2;
 
 pub use auth::{

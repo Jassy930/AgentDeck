@@ -49,10 +49,14 @@ fn test_identity() -> TestIdentity {
     let certificate_der = certified.cert.der().to_vec();
     let private_key =
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
-    let server_config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![certified.cert.der().clone()], private_key)
-        .expect("test TLS identity");
+    let server_config = ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("test TLS protocol versions")
+    .with_no_client_auth()
+    .with_single_cert(vec![certified.cert.der().clone()], private_key)
+    .expect("test TLS identity");
     let (_, certificate) =
         X509Certificate::from_der(&certificate_der).expect("parse generated certificate");
     let spki_pin: [u8; 32] = Sha256::digest(certificate.tbs_certificate.subject_pki.raw).into();

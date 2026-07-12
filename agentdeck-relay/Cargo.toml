@@ -9,25 +9,20 @@ description = "AgentDeck self-hostable opaque relay transport and routing servic
 [dependencies]
 agentdeck-crypto = { path = "../agentdeck-crypto" }
 agentdeck-protocol = { path = "../agentdeck-protocol" }
-async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "process", "io-util", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "1"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-x25519-dalek = "2"
 sha2 = "0.10"
 fs2 = "0.4.3"
 tempfile = "3"
 libc = "0.2"
 rand = "0.8"
-rand_core = "0.6"
 base64 = "0.22"
 url = "2"
 clap = { version = "4", features = ["derive"] }
-dotenvy = "0.15"
 axum = { version = "0.8", features = ["ws"], optional = true }
 futures-util = { version = "0.3", optional = true }
 tracing = { version = "0.1", optional = true }
@@ -53,19 +48,9 @@ path = "src/main.rs"
 required-features = ["server"]
 
 [dev-dependencies]
-# R1a Task 10 e2e（tests/r1a_ws_e2e.rs，`#[cfg(feature = "server")]`）：真 loopback
-# WS 客户端 + 阻塞 REST enroll 客户端。ed25519-dalek/base64/serde_json/rand 已在
-# `[dependencies]`（对 `tests/*.rs` 同样可见），无需在此重复声明；
-# tracing-subscriber 是 `[dependencies]` 里的 optional dep，`--features server`
-# 编译本测试文件时已随 feature 一并可见，同理无需重复声明。
-agentdeck-relay-client = { path = "../agentdeck-relay-client", features = ["v1-compat"] }
+async-trait = "0.1"
+agentdeck-relay-client = { path = "../agentdeck-relay-client" }
 ureq = { version = "2", features = ["json"] }
-# 仅供 `tests/r1a_ws_e2e.rs` 里 `#[cfg(all(feature = "server", feature = "tls"))]`
-# 门内的 `wss_connect_over_tls` 测试使用：手动直连 wss（不经 `agentdeck-relay-client`
-# 的 `WsRelayClient`——它 R1a 只支持 `ws://`），用自定义 rustls
-# `ServerCertVerifier`（信任测试自签证书）绕开证书链校验。
-# `rustls-pki-types` 是 `[dependencies]` 里 `rustls`（optional）的传递依赖，
-# 这里显式声明是因为测试代码要直接引用 `CertificateDer`/`ServerName` 等类型。
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 rustls-pki-types = "1"
 rcgen = "0.13"
