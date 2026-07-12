@@ -53,7 +53,11 @@ pub enum RuntimeEventBody {
     ApprovalResolved {
         turn_id: TurnId,
         approval_id: ApprovalId,
-        decision: ActionDecisionKind,
+        /// `Pending -> Expired` 尚无 first-wins winner，因此必须为 `null`；
+        /// Claimed 之后的所有状态都携带不可变赢家决定。
+        #[serde(deserialize_with = "deserialize_required_optional_decision")]
+        #[schemars(required)]
+        decision: Option<ActionDecisionKind>,
         state: ApprovalDeliveryState,
     },
     /// turn 正常完成。
@@ -65,4 +69,13 @@ pub enum RuntimeEventBody {
     TurnInterrupted { turn_id: TurnId },
     /// 业务失败事件。
     Error { failure: RuntimeFailure },
+}
+
+fn deserialize_required_optional_decision<'de, D>(
+    deserializer: D,
+) -> Result<Option<ActionDecisionKind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<ActionDecisionKind>::deserialize(deserializer)
 }

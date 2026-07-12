@@ -212,7 +212,7 @@ pub struct ProtocolError {
 
 // ── T1.7: ActionKind / ActionRequestVendor / ActionRequest / ActionDecision ──
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum ActionKind {
     ExecuteCommand,

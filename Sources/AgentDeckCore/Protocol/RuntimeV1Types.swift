@@ -2028,7 +2028,7 @@ public enum RuntimeEventBodyV1: Codable, Sendable {
     case approvalResolved(
         turnID: RuntimeTurnID,
         approvalID: RuntimeApprovalID,
-        decision: ActionDecisionKind,
+        decision: ActionDecisionKind?,
         state: ApprovalDeliveryStateV1
     )
     case turnCompleted(turnID: RuntimeTurnID, summary: RuntimeTurnSummaryV1)
@@ -2083,7 +2083,7 @@ public enum RuntimeEventBodyV1: Codable, Sendable {
                     forKey: key("approval_id")
                 ),
                 decision: try container.decode(
-                    ActionDecisionKind.self,
+                    ActionDecisionKind?.self,
                     forKey: key("decision")
                 ),
                 state: try container.decode(

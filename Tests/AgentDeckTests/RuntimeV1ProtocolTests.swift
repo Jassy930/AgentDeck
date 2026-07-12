@@ -3,6 +3,46 @@ import XCTest
 @testable import AgentDeckCore
 
 final class RuntimeV1ProtocolTests: XCTestCase {
+    func testApprovalResolvedRequiresExplicitDecisionEvenWhenWinnerIsAbsent() throws {
+        func event(_ decision: Any?) throws -> Data {
+            var body: [String: Any] = [
+                "kind": "approvalResolved",
+                "turn_id": "turn-expired-without-winner",
+                "approval_id": "approval-expired-without-winner",
+                "state": "expired",
+            ]
+            if let decision {
+                body["decision"] = decision
+            }
+            return try JSONSerialization.data(withJSONObject: [
+                "version": 1,
+                "messageId": "message-expired-without-winner",
+                "body": [
+                    "message": "stream",
+                    "payload": [
+                        "stream": "event",
+                        "conversationId": "conversation-expired-without-winner",
+                        "eventId": "event-expired-without-winner",
+                        "eventSeq": 1,
+                        "itemId": NSNull(),
+                        "entityId": NSNull(),
+                        "body": body,
+                    ],
+                ],
+            ])
+        }
+
+        guard case let .stream(.event(runtimeEvent)) = try RuntimeV1WireCodec.decodeEnvelope(
+            event(NSNull())
+        ).body,
+            case let .approvalResolved(_, _, decision, .expired) = runtimeEvent.body
+        else {
+            return XCTFail("expected explicit null decision to decode as a winner-less expiry")
+        }
+        XCTAssertNil(decision)
+        XCTAssertThrowsError(try RuntimeV1WireCodec.decodeEnvelope(event(nil)))
+    }
+
     func testRuntimeCoreContractUsesPureStartAndExactCancelAndReceiptTargets() throws {
         let fixtures = try loadFixtures()
 

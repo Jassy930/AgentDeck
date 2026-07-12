@@ -412,8 +412,17 @@ fn render_runtime_wire_fixture() -> String {
             RuntimeEventBody::ApprovalResolved {
                 turn_id: TurnId::new("turn-event-resolved-1"),
                 approval_id: ApprovalId::new("approval-event-resolved-1"),
-                decision: ActionDecisionKind::Deny,
+                decision: Some(ActionDecisionKind::Deny),
                 state: ApprovalDeliveryState::Applied,
+            },
+        ),
+        (
+            "eventApprovalExpiredWithoutWinner",
+            RuntimeEventBody::ApprovalResolved {
+                turn_id: TurnId::new("turn-event-expired-1"),
+                approval_id: ApprovalId::new("approval-event-expired-1"),
+                decision: None,
+                state: ApprovalDeliveryState::Expired,
             },
         ),
         (
@@ -1273,6 +1282,27 @@ fn approval_receipt_carries_five_delivery_states() {
         let json = serde_json::to_value(&r).unwrap();
         let _back: ApprovalReceipt = serde_json::from_value(json).unwrap();
     }
+}
+
+#[test]
+fn pending_approval_can_expire_without_fabricating_a_winner_decision() {
+    // P3.5: Pending -> Expired has no first-wins decision. The canonical event must
+    // represent that absence explicitly instead of inventing approve/deny.
+    let json = serde_json::json!({
+        "kind": "approvalResolved",
+        "turn_id": "turn-expired-without-winner",
+        "approval_id": "approval-expired-without-winner",
+        "decision": null,
+        "state": "expired",
+    });
+    let decoded: RuntimeEventBody =
+        serde_json::from_value(json.clone()).expect("pending expiry has no winner");
+    assert_eq!(serde_json::to_value(decoded).unwrap(), json);
+
+    let mut missing = json;
+    missing.as_object_mut().unwrap().remove("decision");
+    serde_json::from_value::<RuntimeEventBody>(missing)
+        .expect_err("decision must stay explicitly present even when its value is null");
 }
 
 #[test]

@@ -153,13 +153,6 @@
       "$schema": "http://json-schema.org/draft-07/schema#",
       "additionalProperties": false,
       "definitions": {
-        "ActionDecisionKind": {
-          "enum": [
-            "approve",
-            "deny"
-          ],
-          "type": "string"
-        },
         "ActionKind": {
           "enum": [
             "executeCommand",
@@ -851,7 +844,12 @@
                   "type": "string"
                 },
                 "decision": {
-                  "$ref": "#/definitions/ActionDecisionKind"
+                  "description": "`Pending -> Expired` 尚无 first-wins winner，因此必须为 `null`； Claimed 之后的所有状态都携带不可变赢家决定。",
+                  "enum": [
+                    "approve",
+                    "deny"
+                  ],
+                  "type": "string"
                 },
                 "kind": {
                   "enum": [
@@ -3405,7 +3403,12 @@
                   "type": "string"
                 },
                 "decision": {
-                  "$ref": "#/definitions/ActionDecisionKind"
+                  "description": "`Pending -> Expired` 尚无 first-wins winner，因此必须为 `null`； Claimed 之后的所有状态都携带不可变赢家决定。",
+                  "enum": [
+                    "approve",
+                    "deny"
+                  ],
+                  "type": "string"
                 },
                 "kind": {
                   "enum": [
@@ -5035,13 +5038,6 @@
       "$schema": "http://json-schema.org/draft-07/schema#",
       "additionalProperties": false,
       "definitions": {
-        "ActionDecisionKind": {
-          "enum": [
-            "approve",
-            "deny"
-          ],
-          "type": "string"
-        },
         "ActionKind": {
           "enum": [
             "executeCommand",
@@ -5692,7 +5688,12 @@
                   "type": "string"
                 },
                 "decision": {
-                  "$ref": "#/definitions/ActionDecisionKind"
+                  "description": "`Pending -> Expired` 尚无 first-wins winner，因此必须为 `null`； Claimed 之后的所有状态都携带不可变赢家决定。",
+                  "enum": [
+                    "approve",
+                    "deny"
+                  ],
+                  "type": "string"
                 },
                 "kind": {
                   "enum": [
@@ -5994,13 +5995,6 @@
     "RuntimeEventBody": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "definitions": {
-        "ActionDecisionKind": {
-          "enum": [
-            "approve",
-            "deny"
-          ],
-          "type": "string"
-        },
         "ActionKind": {
           "enum": [
             "executeCommand",
@@ -6819,7 +6813,12 @@
               "type": "string"
             },
             "decision": {
-              "$ref": "#/definitions/ActionDecisionKind"
+              "description": "`Pending -> Expired` 尚无 first-wins winner，因此必须为 `null`； Claimed 之后的所有状态都携带不可变赢家决定。",
+              "enum": [
+                "approve",
+                "deny"
+              ],
+              "type": "string"
             },
             "kind": {
               "enum": [
@@ -7846,7 +7845,12 @@
                   "type": "string"
                 },
                 "decision": {
-                  "$ref": "#/definitions/ActionDecisionKind"
+                  "description": "`Pending -> Expired` 尚无 first-wins winner，因此必须为 `null`； Claimed 之后的所有状态都携带不可变赢家决定。",
+                  "enum": [
+                    "approve",
+                    "deny"
+                  ],
+                  "type": "string"
                 },
                 "kind": {
                   "enum": [
@@ -10235,7 +10239,12 @@
                   "type": "string"
                 },
                 "decision": {
-                  "$ref": "#/definitions/ActionDecisionKind"
+                  "description": "`Pending -> Expired` 尚无 first-wins winner，因此必须为 `null`； Claimed 之后的所有状态都携带不可变赢家决定。",
+                  "enum": [
+                    "approve",
+                    "deny"
+                  ],
+                  "type": "string"
                 },
                 "kind": {
                   "enum": [
@@ -11787,13 +11796,6 @@
     "RuntimeStreamItem": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "definitions": {
-        "ActionDecisionKind": {
-          "enum": [
-            "approve",
-            "deny"
-          ],
-          "type": "string"
-        },
         "ActionKind": {
           "enum": [
             "executeCommand",
@@ -12533,7 +12535,12 @@
                   "type": "string"
                 },
                 "decision": {
-                  "$ref": "#/definitions/ActionDecisionKind"
+                  "description": "`Pending -> Expired` 尚无 first-wins winner，因此必须为 `null`； Claimed 之后的所有状态都携带不可变赢家决定。",
+                  "enum": [
+                    "approve",
+                    "deny"
+                  ],
+                  "type": "string"
                 },
                 "kind": {
                   "enum": [
