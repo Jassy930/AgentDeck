@@ -487,7 +487,9 @@ impl RelayPairingClient {
   `0 plaintext matches in outer + logs + HTTP/metrics + SQLite DB/WAL`。门禁首轮还真实抓到
   macOS `TMPDIR` 尾斜线形成非 canonical storage path，脚本改为 `pwd -P` 后完整重跑通过。
 - [x] Step 5: 已执行 `git status --short --branch` 与 artifact 扫描；工作树只含本 task 的两套测试、verifier 与入口文档，无 Relay DB、证书私钥副本或日志产物。`.build/build.db` 是既有 gitignored Swift 构建缓存，不纳入 stage。
-- [ ] Step 6: 提交。 `git add README.md ARCHITECTURE.md AGENTS.md docs protocol scripts agentdeck-relay/tests && git commit -m "test(relay): 收口 v2 安全与故障门禁"`
+- [x] Step 6: 已精确暂存本 task 的 12 个文件并提交为
+  `db74261 test(relay): 收口 v2 安全与故障门禁`；验证脚本的 executable bit 在随后的
+  阶段记录提交中恢复，未提交 build/DB/log/secret 或本地 SDD ledger。
 
 ---
 
