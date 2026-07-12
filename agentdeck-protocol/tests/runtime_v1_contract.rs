@@ -4,15 +4,17 @@
 //! 本 task 只定义中立契约与构造校验，不接线任何运行时行为。
 
 use agentdeck_protocol::runtime::command::{
-    LocalOnlyAdministration, MAX_PROMPT_BYTES, PromptPayload, SendPromptRequest,
+    LocalOnlyAdministration, MAX_PROMPT_BYTES, PromptPayload, QueryReceiptSelector,
+    SendPromptRequest,
 };
 use agentdeck_protocol::runtime::failure::{self, RuntimeFailure};
 use agentdeck_protocol::runtime::identity::{
-    ApprovalId, CommandId, ConversationId, EntityId, EventId, IdempotencyKey, ItemId, MessageId,
-    PairingId, StreamGeneration, TransferId, TurnId,
+    AdapterStateKey, ApprovalId, CommandId, ConversationId, EntityId, EventId, IdempotencyKey,
+    ItemId, MessageId, PairingId, StreamGeneration, TransferId, TurnId,
 };
 use agentdeck_protocol::runtime::receipt::{
-    ApprovalDeliveryState, ApprovalReceipt, CommandReceipt, RevocationReceipt,
+    ApprovalDeliveryState, ApprovalReceipt, CancellationReceipt, CommandReceipt, CommandStatus,
+    CommandStatusReceipt, ConversationStartReceipt, RevocationReceipt,
 };
 use agentdeck_protocol::runtime::sync::{
     ConversationSnapshot, SnapshotError, SnapshotItem, StreamCursor,
@@ -139,7 +141,9 @@ fn render_runtime_wire_fixture() -> String {
             "requestStart",
             RuntimeRequest::Start(runtime::command::ConversationStart {
                 agent_kind: AgentKind::Codex,
-                prompt: None,
+                idempotency_key: IdempotencyKey::new("start-key-request-1"),
+                cwd: PathBuf::from("/tmp/runtime-request-1"),
+                title: Some("fixture conversation".into()),
             }),
         ),
         ("requestSendPrompt", sample_send_prompt()),
@@ -164,18 +168,31 @@ fn render_runtime_wire_fixture() -> String {
             },
         ),
         (
-            "requestCancel",
-            RuntimeRequest::Cancel {
+            "requestCancelQueued",
+            RuntimeRequest::CancelQueued {
                 conversation_id: request_conversation.clone(),
-                turn_id: None,
+                command_id: CommandId::new("command-request-queued-1"),
             },
         ),
         (
-            "requestQueryReceipt",
-            RuntimeRequest::QueryReceipt(runtime::command::QueryReceiptRequest {
-                conversation_id: None,
-                command_id: None,
-                idempotency_key: None,
+            "requestCancelActive",
+            RuntimeRequest::CancelActive {
+                conversation_id: request_conversation.clone(),
+                turn_id: TurnId::new("turn-request-active-1"),
+            },
+        ),
+        (
+            "requestQueryReceiptCommand",
+            RuntimeRequest::QueryReceipt(QueryReceiptSelector::Command {
+                conversation_id: request_conversation.clone(),
+                command_id: CommandId::new("command-query-1"),
+            }),
+        ),
+        (
+            "requestQueryReceiptIdempotency",
+            RuntimeRequest::QueryReceipt(QueryReceiptSelector::Idempotency {
+                conversation_id: request_conversation.clone(),
+                idempotency_key: IdempotencyKey::new("idempotency-query-1"),
             }),
         ),
         (
@@ -579,6 +596,84 @@ fn render_runtime_wire_fixture() -> String {
         cases.push(fixture_case(name, "runtimeEnvelope", &value));
     }
 
+    let command_status_receipts = [
+        (
+            "commandStatusAccepted",
+            CommandStatusReceipt {
+                conversation_id: ConversationId::new("conversation-status-1"),
+                command_id: CommandId::new("command-status-accepted-1"),
+                status: CommandStatus::Accepted,
+                turn_id: None,
+            },
+        ),
+        (
+            "commandStatusStarted",
+            CommandStatusReceipt {
+                conversation_id: ConversationId::new("conversation-status-1"),
+                command_id: CommandId::new("command-status-started-1"),
+                status: CommandStatus::Started,
+                turn_id: Some(TurnId::new("turn-status-started-1")),
+            },
+        ),
+    ];
+    for (index, (name, receipt)) in command_status_receipts.into_iter().enumerate() {
+        let value = envelope_with_id(
+            &format!("message-command-status-{index}"),
+            RuntimeMessage::Reply(RuntimeReply::CommandStatus(receipt)),
+        );
+        cases.push(fixture_case(name, "runtimeEnvelope", &value));
+    }
+
+    let conversation_start_receipts = [
+        (
+            "conversationStartCreated",
+            ConversationStartReceipt {
+                conversation_id: ConversationId::new("conversation-created-1"),
+                adapter_state_key: AdapterStateKey::new("adapter-state-created-1"),
+                replayed: false,
+            },
+        ),
+        (
+            "conversationStartReplayed",
+            ConversationStartReceipt {
+                conversation_id: ConversationId::new("conversation-created-1"),
+                adapter_state_key: AdapterStateKey::new("adapter-state-created-1"),
+                replayed: true,
+            },
+        ),
+    ];
+    for (index, (name, receipt)) in conversation_start_receipts.into_iter().enumerate() {
+        let value = envelope_with_id(
+            &format!("message-conversation-start-{index}"),
+            RuntimeMessage::Reply(RuntimeReply::ConversationStart(receipt)),
+        );
+        cases.push(fixture_case(name, "runtimeEnvelope", &value));
+    }
+
+    let cancellation_receipts = [
+        (
+            "cancellationQueuedCanceled",
+            CancellationReceipt::QueuedCanceled {
+                conversation_id: ConversationId::new("conversation-cancel-1"),
+                command_id: CommandId::new("command-cancel-1"),
+            },
+        ),
+        (
+            "cancellationActiveCancelRequested",
+            CancellationReceipt::ActiveCancelRequested {
+                conversation_id: ConversationId::new("conversation-cancel-1"),
+                turn_id: TurnId::new("turn-cancel-1"),
+            },
+        ),
+    ];
+    for (index, (name, receipt)) in cancellation_receipts.into_iter().enumerate() {
+        let value = envelope_with_id(
+            &format!("message-cancellation-{index}"),
+            RuntimeMessage::Reply(RuntimeReply::Cancellation(receipt)),
+        );
+        cases.push(fixture_case(name, "runtimeEnvelope", &value));
+    }
+
     let approval_outcomes = [
         (
             "approvalClaimed",
@@ -798,7 +893,7 @@ fn stream_cursor_next_semantics() {
 #[test]
 fn runtime_request_covers_all_brief_variants() {
     // brief Step 3: hello/catalog/subscribe/start/sendPrompt/resolveApproval/
-    // retryApproval/cancel/queryReceipt/createPairInvite/listPendingPairings/
+    // retryApproval/cancelQueued/cancelActive/queryReceipt/createPairInvite/listPendingPairings/
     // confirmPairing/cancelPairing/revoke/trust-reset。
     let convo = ConversationId::new("c1");
     let variants = vec![
@@ -815,7 +910,9 @@ fn runtime_request_covers_all_brief_variants() {
         },
         RuntimeRequest::Start(runtime::command::ConversationStart {
             agent_kind: AgentKind::Codex,
-            prompt: Some(PromptPayload::new("go").unwrap()),
+            idempotency_key: IdempotencyKey::new("start-1"),
+            cwd: PathBuf::from("/tmp/runtime-contract"),
+            title: None,
         }),
         sample_send_prompt(),
         RuntimeRequest::ResolveApproval {
@@ -832,14 +929,17 @@ fn runtime_request_covers_all_brief_variants() {
             conversation_id: convo.clone(),
             approval_id: ApprovalId::new("a1"),
         },
-        RuntimeRequest::Cancel {
+        RuntimeRequest::CancelQueued {
             conversation_id: convo.clone(),
-            turn_id: Some(TurnId::new("t1")),
+            command_id: CommandId::new("cmd1"),
         },
-        RuntimeRequest::QueryReceipt(runtime::command::QueryReceiptRequest {
-            conversation_id: Some(convo.clone()),
-            command_id: Some(CommandId::new("cmd1")),
-            idempotency_key: None,
+        RuntimeRequest::CancelActive {
+            conversation_id: convo.clone(),
+            turn_id: TurnId::new("t1"),
+        },
+        RuntimeRequest::QueryReceipt(QueryReceiptSelector::Command {
+            conversation_id: convo.clone(),
+            command_id: CommandId::new("cmd1"),
         }),
         RuntimeRequest::CreatePairInvite(runtime::command::CreatePairInviteRequest {
             display_name: "MacBook".into(),
@@ -864,7 +964,7 @@ fn runtime_request_covers_all_brief_variants() {
             scope: LocalOnlyAdministration::LocalOnly,
         },
     ];
-    assert_eq!(variants.len(), 15);
+    assert_eq!(variants.len(), 16);
     for v in variants {
         let json = serde_json::to_value(&v).unwrap();
         assert!(
@@ -874,6 +974,128 @@ fn runtime_request_covers_all_brief_variants() {
         // wire round-trip (RuntimeRequest embeds non-PartialEq trunk ActionDecision).
         let back: RuntimeRequest = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(serde_json::to_value(&back).unwrap(), json);
+    }
+}
+
+#[test]
+fn conversation_start_is_pure_idempotent_creation_with_explicit_context() {
+    let request = RuntimeRequest::Start(runtime::command::ConversationStart {
+        agent_kind: AgentKind::ClaudeCode,
+        idempotency_key: IdempotencyKey::new("create-conversation-1"),
+        cwd: PathBuf::from("/tmp/runtime-start"),
+        title: Some("runtime title".into()),
+    });
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "request": "start",
+            "agentKind": "claude_code",
+            "idempotencyKey": "create-conversation-1",
+            "cwd": "/tmp/runtime-start",
+            "title": "runtime title",
+        })
+    );
+    assert!(
+        json.get("prompt").is_none(),
+        "Start must never carry a prompt"
+    );
+
+    for required in ["idempotencyKey", "cwd"] {
+        let mut missing = json.clone();
+        missing.as_object_mut().unwrap().remove(required);
+        assert!(
+            serde_json::from_value::<RuntimeRequest>(missing).is_err(),
+            "missing {required} must fail closed"
+        );
+    }
+
+    let without_title = serde_json::json!({
+        "request": "start",
+        "agentKind": "codex",
+        "idempotencyKey": "create-conversation-2",
+        "cwd": "/tmp/runtime-start-2",
+    });
+    assert!(serde_json::from_value::<RuntimeRequest>(without_title).is_ok());
+}
+
+#[test]
+fn cancellation_requests_have_explicit_non_optional_targets() {
+    let conversation_id = ConversationId::new("conversation-cancel-1");
+    let queued = RuntimeRequest::CancelQueued {
+        conversation_id: conversation_id.clone(),
+        command_id: CommandId::new("command-cancel-1"),
+    };
+    let active = RuntimeRequest::CancelActive {
+        conversation_id,
+        turn_id: TurnId::new("turn-cancel-1"),
+    };
+    assert_eq!(
+        serde_json::to_value(queued).unwrap(),
+        serde_json::json!({
+            "request": "cancelQueued",
+            "conversationId": "conversation-cancel-1",
+            "commandId": "command-cancel-1",
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(active).unwrap(),
+        serde_json::json!({
+            "request": "cancelActive",
+            "conversationId": "conversation-cancel-1",
+            "turnId": "turn-cancel-1",
+        })
+    );
+    for legacy_or_incomplete in [
+        serde_json::json!({"request":"cancel","conversationId":"conversation-cancel-1"}),
+        serde_json::json!({"request":"cancelQueued","conversationId":"conversation-cancel-1"}),
+        serde_json::json!({"request":"cancelActive","conversationId":"conversation-cancel-1"}),
+    ] {
+        assert!(serde_json::from_value::<RuntimeRequest>(legacy_or_incomplete).is_err());
+    }
+}
+
+#[test]
+fn query_receipt_requires_one_tagged_selector() {
+    let command = RuntimeRequest::QueryReceipt(QueryReceiptSelector::Command {
+        conversation_id: ConversationId::new("conversation-query-1"),
+        command_id: CommandId::new("command-query-1"),
+    });
+    let idempotency = RuntimeRequest::QueryReceipt(QueryReceiptSelector::Idempotency {
+        conversation_id: ConversationId::new("conversation-query-1"),
+        idempotency_key: IdempotencyKey::new("idempotency-query-1"),
+    });
+    assert_eq!(
+        serde_json::to_value(command).unwrap(),
+        serde_json::json!({
+            "request": "queryReceipt",
+            "selector": "command",
+            "conversationId": "conversation-query-1",
+            "commandId": "command-query-1",
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(idempotency).unwrap(),
+        serde_json::json!({
+            "request": "queryReceipt",
+            "selector": "idempotency",
+            "conversationId": "conversation-query-1",
+            "idempotencyKey": "idempotency-query-1",
+        })
+    );
+    for invalid in [
+        serde_json::json!({"request":"queryReceipt","conversationId":"conversation-query-1"}),
+        serde_json::json!({
+            "request":"queryReceipt", "selector":"command",
+            "conversationId":"conversation-query-1", "commandId":"command-query-1",
+            "idempotencyKey":"unexpected"
+        }),
+        serde_json::json!({
+            "request":"queryReceipt", "selector":"idempotency",
+            "conversationId":"conversation-query-1"
+        }),
+    ] {
+        assert!(serde_json::from_value::<RuntimeRequest>(invalid).is_err());
     }
 }
 
@@ -917,6 +1139,96 @@ fn command_receipt_has_accepted_replayed_failed() {
         let json = serde_json::to_value(&r).unwrap();
         let back: CommandReceipt = serde_json::from_value(json).unwrap();
         assert_eq!(back, r);
+    }
+}
+
+#[test]
+fn command_status_receipt_preserves_exact_journal_state_and_turn() {
+    let statuses = [
+        (CommandStatus::Accepted, "accepted"),
+        (CommandStatus::Started, "started"),
+        (CommandStatus::Completed, "completed"),
+        (CommandStatus::Failed, "failed"),
+        (CommandStatus::Interrupted, "interrupted"),
+        (CommandStatus::Expired, "expired"),
+        (CommandStatus::Canceled, "canceled"),
+        (CommandStatus::RevokedBeforeStart, "revokedBeforeStart"),
+    ];
+    for (index, (status, wire_status)) in statuses.into_iter().enumerate() {
+        let turn_id = (status != CommandStatus::Accepted)
+            .then(|| TurnId::new(format!("turn-status-{index}")));
+        let reply = RuntimeReply::CommandStatus(CommandStatusReceipt {
+            conversation_id: ConversationId::new("conversation-status-1"),
+            command_id: CommandId::new(format!("command-status-{index}")),
+            status,
+            turn_id: turn_id.clone(),
+        });
+        let json = serde_json::to_value(&reply).unwrap();
+        assert_eq!(json["reply"], "commandStatus");
+        assert_eq!(json["conversationId"], "conversation-status-1");
+        assert_eq!(json["commandId"], format!("command-status-{index}"));
+        assert_eq!(json["status"], wire_status);
+        assert_eq!(
+            json["turnId"],
+            turn_id
+                .as_ref()
+                .map_or(serde_json::Value::Null, |value| serde_json::json!(value))
+        );
+        let decoded: RuntimeReply = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), json);
+    }
+}
+
+#[test]
+fn conversation_start_receipt_returns_daemon_ids_and_replay_state() {
+    for replayed in [false, true] {
+        let reply = RuntimeReply::ConversationStart(ConversationStartReceipt {
+            conversation_id: ConversationId::new("conversation-started-1"),
+            adapter_state_key: AdapterStateKey::new("adapter-state-started-1"),
+            replayed,
+        });
+        let json = serde_json::to_value(&reply).unwrap();
+        assert_eq!(json["reply"], "conversationStart");
+        assert_eq!(json["conversationId"], "conversation-started-1");
+        assert_eq!(json["adapterStateKey"], "adapter-state-started-1");
+        assert_eq!(json["replayed"], replayed);
+        let decoded: RuntimeReply = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), json);
+    }
+}
+
+#[test]
+fn cancellation_receipt_distinguishes_terminal_queued_from_active_request() {
+    let queued = RuntimeReply::Cancellation(CancellationReceipt::QueuedCanceled {
+        conversation_id: ConversationId::new("conversation-cancel-1"),
+        command_id: CommandId::new("command-cancel-1"),
+    });
+    let active = RuntimeReply::Cancellation(CancellationReceipt::ActiveCancelRequested {
+        conversation_id: ConversationId::new("conversation-cancel-1"),
+        turn_id: TurnId::new("turn-cancel-1"),
+    });
+    assert_eq!(
+        serde_json::to_value(&queued).unwrap(),
+        serde_json::json!({
+            "reply": "cancellation",
+            "status": "queuedCanceled",
+            "conversationId": "conversation-cancel-1",
+            "commandId": "command-cancel-1",
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(&active).unwrap(),
+        serde_json::json!({
+            "reply": "cancellation",
+            "status": "activeCancelRequested",
+            "conversationId": "conversation-cancel-1",
+            "turnId": "turn-cancel-1",
+        })
+    );
+    for reply in [queued, active] {
+        let json = serde_json::to_value(&reply).unwrap();
+        let decoded: RuntimeReply = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), json);
     }
 }
 

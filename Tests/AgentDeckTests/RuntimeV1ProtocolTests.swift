@@ -3,6 +3,132 @@ import XCTest
 @testable import AgentDeckCore
 
 final class RuntimeV1ProtocolTests: XCTestCase {
+    func testRuntimeCoreContractUsesPureStartAndExactCancelAndReceiptTargets() throws {
+        let fixtures = try loadFixtures()
+
+        let start = try XCTUnwrap(fixtures.first { $0.name == "requestStart" })
+        guard case let .request(.start(agentKind, idempotencyKey, cwd, title)) =
+            try RuntimeV1WireCodec.decodeEnvelope(start.value).body
+        else {
+            return XCTFail("expected pure conversation start request")
+        }
+        XCTAssertEqual(agentKind, .codex)
+        XCTAssertEqual(idempotencyKey.rawValue, "start-key-request-1")
+        XCTAssertEqual(cwd, "/tmp/runtime-request-1")
+        XCTAssertEqual(title, "fixture conversation")
+
+        let queued = try XCTUnwrap(fixtures.first { $0.name == "requestCancelQueued" })
+        guard case let .request(.cancelQueued(conversationID, commandID)) =
+            try RuntimeV1WireCodec.decodeEnvelope(queued.value).body
+        else {
+            return XCTFail("expected queued cancellation request")
+        }
+        XCTAssertEqual(conversationID.rawValue, "conversation-request-1")
+        XCTAssertEqual(commandID.rawValue, "command-request-queued-1")
+
+        let active = try XCTUnwrap(fixtures.first { $0.name == "requestCancelActive" })
+        guard case let .request(.cancelActive(_, turnID)) =
+            try RuntimeV1WireCodec.decodeEnvelope(active.value).body
+        else {
+            return XCTFail("expected active cancellation request")
+        }
+        XCTAssertEqual(turnID.rawValue, "turn-request-active-1")
+
+        let query = try XCTUnwrap(fixtures.first { $0.name == "requestQueryReceiptCommand" })
+        guard case let .request(.queryReceipt(.command(_, commandID))) =
+            try RuntimeV1WireCodec.decodeEnvelope(query.value).body
+        else {
+            return XCTFail("expected command receipt selector")
+        }
+        XCTAssertEqual(commandID.rawValue, "command-query-1")
+
+        let created = try XCTUnwrap(fixtures.first { $0.name == "conversationStartCreated" })
+        guard case let .reply(.conversationStart(receipt)) =
+            try RuntimeV1WireCodec.decodeEnvelope(created.value).body
+        else {
+            return XCTFail("expected conversation start receipt")
+        }
+        XCTAssertEqual(receipt.conversationID.rawValue, "conversation-created-1")
+        XCTAssertEqual(receipt.adapterStateKey.rawValue, "adapter-state-created-1")
+        XCTAssertFalse(receipt.replayed)
+
+        let cancellation = try XCTUnwrap(
+            fixtures.first { $0.name == "cancellationActiveCancelRequested" }
+        )
+        guard case let .reply(.cancellation(.activeCancelRequested(_, turnID))) =
+            try RuntimeV1WireCodec.decodeEnvelope(cancellation.value).body
+        else {
+            return XCTFail("expected active cancel requested receipt")
+        }
+        XCTAssertEqual(turnID.rawValue, "turn-cancel-1")
+    }
+
+    func testRuntimeCoreContractRejectsLegacyAmbiguousCancelAndReceiptSelectors() throws {
+        let invalidPayloads: [[String: Any]] = [
+            ["request": "cancel", "conversationId": "c1", "turnId": NSNull()],
+            ["request": "cancelQueued", "conversationId": "c1"],
+            ["request": "cancelActive", "conversationId": "c1"],
+            ["request": "queryReceipt", "conversationId": "c1"],
+            [
+                "request": "queryReceipt", "selector": "command",
+                "conversationId": "c1", "commandId": "cmd1", "idempotencyKey": "k1",
+            ],
+        ]
+        for payload in invalidPayloads {
+            let value: [String: Any] = [
+                "version": 1,
+                "messageId": "invalid-contract",
+                "body": ["message": "request", "payload": payload],
+            ]
+            XCTAssertThrowsError(
+                try RuntimeV1WireCodec.decodeEnvelope(
+                    JSONSerialization.data(withJSONObject: value)
+                )
+            )
+        }
+    }
+
+    func testCommandStatusReplyPreservesExactJournalStateAndOptionalTurn() throws {
+        func envelopeData(_ payload: [String: Any]) throws -> Data {
+            try JSONSerialization.data(withJSONObject: [
+                "version": 1,
+                "messageId": "message-command-status",
+                "body": ["message": "reply", "payload": payload],
+            ])
+        }
+
+        let accepted = try envelopeData([
+            "reply": "commandStatus",
+            "conversationId": "conversation-status-1",
+            "commandId": "command-status-accepted-1",
+            "status": "accepted",
+            "turnId": NSNull(),
+        ])
+        guard case let .reply(.commandStatus(receipt)) =
+            try RuntimeV1WireCodec.decodeEnvelope(accepted).body
+        else {
+            return XCTFail("expected exact command status receipt")
+        }
+        XCTAssertEqual(receipt.conversationID.rawValue, "conversation-status-1")
+        XCTAssertEqual(receipt.commandID.rawValue, "command-status-accepted-1")
+        XCTAssertEqual(receipt.status, .accepted)
+        XCTAssertNil(receipt.turnID)
+
+        for status in CommandStatusV1.allCases {
+            let turnID = status == .accepted ? nil : "turn-\(status.rawValue)"
+            let data = try envelopeData([
+                "reply": "commandStatus",
+                "conversationId": "conversation-status-1",
+                "commandId": "command-\(status.rawValue)",
+                "status": status.rawValue,
+                "turnId": turnID ?? NSNull(),
+            ])
+            let envelope = try RuntimeV1WireCodec.decodeEnvelope(data)
+            let encoded = try RuntimeV1WireCodec.encode(envelope)
+            XCTAssertEqual(try normalizedJSON(encoded), try normalizedJSON(data))
+        }
+    }
+
     func testBackfillBareEventRejectsInjectedStreamContextTag() throws {
         let fixtures = try loadRawFixtureObjects()
         var backfill = try fixtureValue(named: "replyBackfill", in: fixtures)
@@ -161,7 +287,8 @@ final class RuntimeV1ProtocolTests: XCTestCase {
             }),
             [
                 "hello", "catalog", "subscribe", "start", "sendPrompt",
-                "resolveApproval", "retryApproval", "cancel", "queryReceipt",
+                "resolveApproval", "retryApproval", "cancelQueued", "cancelActive",
+                "queryReceipt",
                 "createPairInvite", "listPendingPairings", "confirmPairing",
                 "cancelPairing", "revoke", "trustReset",
             ]
@@ -171,8 +298,9 @@ final class RuntimeV1ProtocolTests: XCTestCase {
                 (body["payload"] as? [String: Any])?["reply"] as? String
             }),
             [
-                "hello", "command", "approval", "revocation", "catalog", "snapshot",
-                "backfill", "syncComplete", "pairInvite", "pendingPairings", "failure",
+                "hello", "command", "commandStatus", "conversationStart", "cancellation", "approval",
+                "revocation", "catalog", "snapshot", "backfill", "syncComplete",
+                "pairInvite", "pendingPairings", "failure",
             ]
         )
         XCTAssertEqual(

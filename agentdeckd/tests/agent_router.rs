@@ -86,6 +86,14 @@ fn router_rejects_unregistered_kind() {
 }
 
 #[tokio::test]
+async fn release_unknown_session_is_idempotent_and_does_not_create_ownership() {
+    let router = AgentRouter::new();
+    let session_id = SessionId("missing-session".to_owned());
+    assert!(!router.release_session(&session_id).await);
+    assert_eq!(router.active_session_count().await, 0);
+}
+
+#[tokio::test]
 async fn canonical_continue_routes_only_the_neutral_adapter_state_key() {
     let mut router = AgentRouter::new();
     router.register(Arc::new(StubAgent {

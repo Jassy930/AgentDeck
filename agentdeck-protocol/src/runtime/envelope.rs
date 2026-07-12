@@ -9,7 +9,10 @@ use crate::runtime::command::{HelloParams, RuntimeRequest};
 use crate::runtime::event::RuntimeEvent;
 use crate::runtime::failure::RuntimeFailure;
 use crate::runtime::identity::{MessageId, PairingId};
-use crate::runtime::receipt::{ApprovalReceipt, CommandReceipt, RevocationReceipt};
+use crate::runtime::receipt::{
+    ApprovalReceipt, CancellationReceipt, CommandReceipt, CommandStatusReceipt,
+    ConversationStartReceipt, RevocationReceipt,
+};
 use crate::runtime::sync::{BackfillChunk, ConversationSnapshot, RuntimeSyncComplete};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -76,8 +79,14 @@ pub enum RuntimeMessage {
 pub enum RuntimeReply {
     /// 版本/能力握手回执。
     Hello(HelloParams),
-    /// sendPrompt/start 等有副作用命令回执。
+    /// sendPrompt 有副作用命令回执。
     Command(CommandReceipt),
+    /// queryReceipt 返回 command journal 的精确持久化状态。
+    CommandStatus(CommandStatusReceipt),
+    /// 纯幂等 conversation 创建回执。
+    ConversationStart(ConversationStartReceipt),
+    /// queued/active cancel 精确回执。
+    Cancellation(CancellationReceipt),
     /// resolveApproval/retryApproval 回执。
     Approval(ApprovalReceipt),
     /// revoke 回执。

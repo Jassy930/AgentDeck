@@ -14,6 +14,7 @@ use crate::runtime::sync::StreamCursor;
 use crate::trunk::{ActionDecision, AgentKind};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// prompt 明文 UTF-8 最大字节数（design §8.8：256 KiB）。
 pub const MAX_PROMPT_BYTES: usize = 256 * 1024;
@@ -95,8 +96,10 @@ pub struct CatalogRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConversationStart {
     pub agent_kind: AgentKind,
+    pub idempotency_key: IdempotencyKey,
+    pub cwd: PathBuf,
     #[serde(default)]
-    pub prompt: Option<PromptPayload>,
+    pub title: Option<String>,
 }
 
 /// 发送 prompt。
@@ -108,16 +111,25 @@ pub struct SendPromptRequest {
     pub prompt: PromptPayload,
 }
 
-/// 按 command/idempotency 查询原始回执状态。
+/// 按 command 或 conversation-scoped idempotency key 精确查询原始回执。
+///
+/// internally-tagged 形态排除“全空、两种 selector 同时出现、字段互相矛盾”的
+/// 歧义；两种 selector 都必须绑定 conversation。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct QueryReceiptRequest {
-    #[serde(default)]
-    pub conversation_id: Option<ConversationId>,
-    #[serde(default)]
-    pub command_id: Option<CommandId>,
-    #[serde(default)]
-    pub idempotency_key: Option<IdempotencyKey>,
+#[serde(tag = "selector", rename_all = "camelCase", deny_unknown_fields)]
+pub enum QueryReceiptSelector {
+    Command {
+        #[serde(rename = "conversationId")]
+        conversation_id: ConversationId,
+        #[serde(rename = "commandId")]
+        command_id: CommandId,
+    },
+    Idempotency {
+        #[serde(rename = "conversationId")]
+        conversation_id: ConversationId,
+        #[serde(rename = "idempotencyKey")]
+        idempotency_key: IdempotencyKey,
+    },
 }
 
 /// 创建 PairInvite —— local-only administration（design §6.2）。
@@ -190,14 +202,22 @@ pub enum RuntimeRequest {
         conversation_id: ConversationId,
         approval_id: ApprovalId,
     },
-    /// 取消排队 prompt 或明确 cancel 当前 turn。
-    Cancel {
+    /// 精确取消尚未 Started 的 queued command。
+    CancelQueued {
+        #[serde(rename = "conversationId")]
         conversation_id: ConversationId,
-        #[serde(default)]
-        turn_id: Option<TurnId>,
+        #[serde(rename = "commandId")]
+        command_id: CommandId,
+    },
+    /// 明确请求取消当前 active turn；缺失/stale turnId 必须 fail-close。
+    CancelActive {
+        #[serde(rename = "conversationId")]
+        conversation_id: ConversationId,
+        #[serde(rename = "turnId")]
+        turn_id: TurnId,
     },
     /// 查询原始回执（断线重取；不依赖 Relay 请求来源缓存）。
-    QueryReceipt(QueryReceiptRequest),
+    QueryReceipt(QueryReceiptSelector),
     /// 创建 PairInvite —— local-only administration。
     CreatePairInvite(CreatePairInviteRequest),
     /// 列出待本地确认的 pending pairing —— local-only administration。

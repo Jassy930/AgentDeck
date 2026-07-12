@@ -16,6 +16,17 @@ pub const DAEMON_COMMAND_INTERRUPTED: &str = "daemon.command.interrupted";
 // —— daemon.runtime.* ——
 pub const DAEMON_RUNTIME_RECOVERY_BLOCKED: &str = "daemon.runtime.recovery_blocked";
 pub const DAEMON_RUNTIME_DISK_LOW: &str = "daemon.runtime.disk_low";
+pub const DAEMON_RUNTIME_NOT_READY: &str = "daemon.runtime.not_ready";
+pub const DAEMON_RUNTIME_PROTOCOL_MISMATCH: &str = "daemon.runtime.protocol_mismatch";
+pub const DAEMON_RUNTIME_INVALID_REQUEST: &str = "daemon.runtime.invalid_request";
+pub const DAEMON_RUNTIME_FEATURE_UNAVAILABLE: &str = "daemon.runtime.feature_unavailable";
+pub const DAEMON_RUNTIME_IDENTITY_UNAVAILABLE: &str = "daemon.runtime.identity_unavailable";
+pub const DAEMON_RUNTIME_ACTOR_UNAVAILABLE: &str = "daemon.runtime.actor_unavailable";
+pub const DAEMON_RUNTIME_CONNECTION_UNAVAILABLE: &str = "daemon.runtime.connection_unavailable";
+pub const DAEMON_RUNTIME_READ_UNAVAILABLE: &str = "daemon.runtime.read_unavailable";
+
+// —— daemon.authorization.* ——
+pub const DAEMON_AUTHORIZATION_REVOKED: &str = "daemon.authorization.revoked";
 
 // —— daemon.approval.* / daemon.turn.* ——
 pub const DAEMON_APPROVAL_ALREADY_HANDLED: &str = "daemon.approval.already_handled";

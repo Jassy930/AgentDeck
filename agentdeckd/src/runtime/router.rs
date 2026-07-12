@@ -206,6 +206,18 @@ impl AgentRouter {
         Ok(())
     }
 
+    /// Canonical execution 正常终止后的显式 ownership release。P3.7 coordinator
+    /// 在 terminal journal COMMIT 后调用；与 `cancel` 不同，这里不再次向 adapter
+    /// 发送副作用，只释放 router 的 transient session ownership。
+    pub async fn release_session(&self, session_id: &SessionId) -> bool {
+        self.sessions.lock().await.remove(session_id).is_some()
+    }
+
+    /// 诊断/泄漏门禁使用的当前 transient session 数。
+    pub async fn active_session_count(&self) -> usize {
+        self.sessions.lock().await.len()
+    }
+
     /// 旧 IPC v2/stdin compatibility：route a raw `HistoryRequest` to the
     /// matching adapter. RuntimeCore canonical history must use adapterStateKey
     /// and the adapter-private managed-history helpers. For `List` with

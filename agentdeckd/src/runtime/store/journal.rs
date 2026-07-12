@@ -10,16 +10,20 @@ use zeroize::Zeroizing;
 
 use crate::runtime::adapter_state::AdapterStateNamespace;
 use crate::runtime::model::{
-    AcceptCommand, AcceptOutcome, AuthorizeExecutionRelease, COMMAND_LEDGER_RETENTION_MS,
-    COMMAND_QUEUE_TTL_MS, CommandRecord, CommandState, CompleteCommand, CompleteOutcome,
+    AcceptCommand, AcceptOutcome, AcceptedTerminationReason, AuthorizeExecutionRelease,
+    COMMAND_LEDGER_RETENTION_MS, COMMAND_QUEUE_TTL_MS, CommandReceiptRecord,
+    CommandReceiptSelector, CommandRecord, CommandState, CompleteCommand, CompleteOutcome,
     ConversationDescriptor, ConversationLifecycle, ConversationRecord, ConversationRecoveryRecord,
-    EventRecord, ExecutionFence, ExecutionFenceRecord, ExecutionIntentRecord, IdempotencyOwner,
+    CreateConversationOutcome, EventRecord, ExecutionFence, ExecutionFenceRecord,
+    ExecutionIntentRecord, IdempotencyOwner, MAX_ACCEPTED_TERMINATION_EVENT_BYTES,
     MAX_ADAPTER_STATE_REFERENCE_BYTES, MAX_COMMAND_PAYLOAD_BYTES, MAX_COMMAND_RESULT_BYTES,
     MAX_CONVERSATION_DESCRIPTOR_BYTES, MAX_EXECUTION_FENCE_BYTES, MAX_EXECUTION_INTENT_BYTES,
     MAX_EXECUTION_NONCE_BYTES, MAX_IDEMPOTENCY_KEY_BYTES, MAX_RECOVERY_PAGE_RETAINED_BYTES,
-    MAX_RUNTIME_EVENT_BYTES, NewConversation, RecoveryCompletion, RecoveryCursor, RecoveryPage,
-    RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreOperation,
-    StartCommand, StartOutcome, StartedRecoveryRecord, TerminalState,
+    MAX_RUNTIME_EVENT_BYTES, NewConversation, QueryCommandReceipt, RecoveryCompletion,
+    RecoveryCursor, RecoveryPage, RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError,
+    RuntimeStoreOperation, StartCommand, StartOutcome, StartedRecoveryRecord, TerminalState,
+    TerminateAcceptedCommand, TerminateAcceptedOutcome, TerminateStartedBeforeRelease,
+    TerminateStartedBeforeReleaseOutcome,
 };
 use crate::security::SecretBytes;
 
@@ -41,6 +45,8 @@ const COMMAND_MAGIC: &[u8; 4] = b"ADC1";
 const INTENT_MAGIC: &[u8; 4] = b"ADI1";
 const FENCE_MAGIC: &[u8; 4] = b"ADF2";
 const EXPIRY_EVENT_MAGIC: &[u8; 4] = b"ADX1";
+const CANCELED_BEFORE_START_TOKEN_DOMAIN: &[u8] = b"command.canceled-before-start.v1";
+const REVOKED_BEFORE_START_TOKEN_DOMAIN: &[u8] = b"command.revoked-before-start.v1";
 const MAX_SEALED_INTENT_BYTES: usize = MAX_EXECUTION_INTENT_BYTES + MAX_EXECUTION_NONCE_BYTES + 128;
 const MAX_SEALED_FENCE_BYTES: usize = MAX_EXECUTION_FENCE_BYTES + MAX_EXECUTION_NONCE_BYTES + 128;
 
@@ -454,7 +460,7 @@ pub(crate) fn create_conversation(
     config: &RuntimeStoreConfig,
     input: NewConversation,
     descriptor_bytes: Zeroizing<Vec<u8>>,
-) -> Result<ConversationRecord, RuntimeStoreError> {
+) -> Result<CreateConversationOutcome, RuntimeStoreError> {
     ensure_kind(input.conversation_id, RuntimeIdKind::Conversation)?;
     ensure_kind(input.adapter_state_key, RuntimeIdKind::AdapterState)?;
     validate_payload_len(descriptor_bytes.len(), MAX_CONVERSATION_DESCRIPTOR_BYTES)?;
@@ -467,7 +473,9 @@ pub(crate) fn create_conversation(
         if existing.adapter_state_key == input.adapter_state_key
             && existing.descriptor == input.descriptor
         {
-            return Ok(existing);
+            return Ok(CreateConversationOutcome::Replayed {
+                conversation: existing,
+            });
         }
         return Err(RuntimeStoreError::ConversationConflict);
     }
@@ -481,7 +489,11 @@ pub(crate) fn create_conversation(
     if preflight_catalog.adapter_owner.is_some() {
         return Err(RuntimeStoreError::ConversationConflict);
     }
-    sqlite::load_runtime_ledger(&state.connection, &state.key_bundle, state.database_id)?;
+    let preflight_ledger =
+        sqlite::load_runtime_ledger(&state.connection, &state.key_bundle, state.database_id)?;
+    if preflight_ledger.conversation_count >= config.conversation_capacity {
+        return Err(RuntimeStoreError::ConversationLimit);
+    }
     let created_at_ms = config.clock.now_ms()?;
     if preflight_catalog
         .latest_updated_at_ms
@@ -510,6 +522,9 @@ pub(crate) fn create_conversation(
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     let ledger = sqlite::load_runtime_ledger(&transaction, key_bundle, database_id)?;
+    if ledger.conversation_count >= config.conversation_capacity {
+        return Err(RuntimeStoreError::ConversationLimit);
+    }
     if load_optional_conversation(&transaction, key_bundle, database_id, input.conversation_id)?
         .is_some()
     {
@@ -525,13 +540,13 @@ pub(crate) fn create_conversation(
     if catalog.adapter_owner.is_some() {
         return Err(RuntimeStoreError::ConversationConflict);
     }
-    if let Some(latest_updated_at) = catalog.latest_updated_at_ms {
-        if created_at_ms < latest_updated_at {
-            return Err(RuntimeStoreError::ClockRegressed {
-                persisted_ms: latest_updated_at,
-                observed_ms: created_at_ms,
-            });
-        }
+    if let Some(latest_updated_at) = catalog.latest_updated_at_ms
+        && created_at_ms < latest_updated_at
+    {
+        return Err(RuntimeStoreError::ClockRegressed {
+            persisted_ms: latest_updated_at,
+            observed_ms: created_at_ms,
+        });
     }
     let revision = next_sequence(
         SequenceScope::CatalogRevision,
@@ -591,17 +606,19 @@ pub(crate) fn create_conversation(
         RuntimeStoreOperation::CreateConversationAfterCommit,
         RuntimeCommitOperation::CreateConversation,
     )?;
-    Ok(ConversationRecord {
-        conversation_id: input.conversation_id,
-        adapter_state_key: input.adapter_state_key,
-        catalog_revision: revision.value,
-        command_high_water: None,
-        event_high_water: None,
-        accepted_command_count: 0,
-        lifecycle: ConversationLifecycle::Active,
-        created_at_ms,
-        updated_at_ms: created_at_ms,
-        descriptor: input.descriptor,
+    Ok(CreateConversationOutcome::Created {
+        conversation: ConversationRecord {
+            conversation_id: input.conversation_id,
+            adapter_state_key: input.adapter_state_key,
+            catalog_revision: revision.value,
+            command_high_water: None,
+            event_high_water: None,
+            accepted_command_count: 0,
+            lifecycle: ConversationLifecycle::Active,
+            created_at_ms,
+            updated_at_ms: created_at_ms,
+            descriptor: input.descriptor,
+        },
     })
 }
 
@@ -631,7 +648,7 @@ pub(crate) fn accept_command(
     let projected_write_bytes =
         projected_write_bytes(&[input.idempotency_key.len(), input.payload.len()])?;
 
-    let owner_bytes = Zeroizing::new(canonical_owner(&input.owner));
+    let owner_bytes = Zeroizing::new(canonical_owner_v1(&input.owner));
     let owner_token = state
         .key_bundle
         .blind_index(b"command.owner.v1", owner_bytes.as_ref())?;
@@ -833,6 +850,7 @@ pub(crate) fn accept_command(
             conversation_id: input.conversation_id,
             command_id,
             command_seq: command_seq.value,
+            owner: input.owner,
             state: CommandState::Accepted,
             accepted_at_ms,
             expires_at_ms,
@@ -1221,6 +1239,7 @@ pub(crate) fn persist_execution_fence(
     ensure_kind(input.daemon_boot_id, RuntimeIdKind::DaemonBoot)?;
     if input.process_group_id <= 0
         || input.leader_pid <= 0
+        || input.leader_start_time == 0
         || input.execution_nonce.is_empty()
         || input.execution_nonce.len() > MAX_EXECUTION_NONCE_BYTES
     {
@@ -1346,6 +1365,7 @@ pub(crate) fn persist_execution_fence(
     Ok(ExecutionFenceRecord {
         command_id: input.command_id,
         daemon_boot_id: input.daemon_boot_id,
+        execution_nonce: input.execution_nonce,
         process_group_id: input.process_group_id,
         leader_pid: input.leader_pid,
         leader_start_time: input.leader_start_time,
@@ -1725,6 +1745,551 @@ pub(crate) fn complete_command_with_event(
             payload: input.event_payload,
         },
     })
+}
+
+pub(crate) fn terminate_started_before_release(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    input: TerminateStartedBeforeRelease,
+) -> Result<TerminateStartedBeforeReleaseOutcome, RuntimeStoreError> {
+    ensure_kind(input.conversation_id, RuntimeIdKind::Conversation)?;
+    ensure_kind(input.command_id, RuntimeIdKind::Command)?;
+    ensure_kind(input.turn_id, RuntimeIdKind::Turn)?;
+    ensure_kind(input.daemon_boot_id, RuntimeIdKind::DaemonBoot)?;
+    if input.execution_nonce.is_empty() || input.execution_nonce.len() > MAX_EXECUTION_NONCE_BYTES {
+        return Err(RuntimeStoreError::InvalidConfig(
+            "execution nonce must contain 1 to 1024 bytes",
+        ));
+    }
+    validate_payload_len(input.terminal_payload.len(), MAX_COMMAND_RESULT_BYTES)?;
+    validate_payload_len(input.event_payload.len(), MAX_RUNTIME_EVENT_BYTES)?;
+
+    let terminal_state = input.reason.terminal_state();
+    let terminal_bytes = Zeroizing::new(canonical_fields(&[
+        input.conversation_id.as_bytes(),
+        input.command_id.as_bytes(),
+        input.turn_id.as_bytes(),
+        &[terminal_state_tag(terminal_state)],
+        &input.terminal_payload,
+        &input.event_payload,
+    ])?);
+    let terminal_token = state
+        .key_bundle
+        .blind_index(b"command.terminal.v1", terminal_bytes.as_ref())?;
+    let database_id = state.database_id;
+    let key_bundle = &state.key_bundle;
+    let transaction = state
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let ledger = sqlite::load_runtime_ledger(&transaction, key_bundle, database_id)?;
+    let command = load_command(&transaction, key_bundle, database_id, input.command_id)?;
+    if command.conversation_id != input.conversation_id {
+        return Err(RuntimeStoreError::CommandNotFound);
+    }
+    let intent = load_intent(&transaction, key_bundle, database_id, input.command_id)?;
+    let started_event = load_event(
+        &transaction,
+        key_bundle,
+        database_id,
+        intent.started_event_id,
+    )?;
+    validate_started_linkage(&command, &intent, &started_event)?;
+    if intent.turn_id != input.turn_id
+        || intent.daemon_boot_id != input.daemon_boot_id
+        || intent.execution_nonce != input.execution_nonce
+    {
+        return Err(RuntimeStoreError::StartConflict);
+    }
+    let fence = load_optional_fence(&transaction, key_bundle, database_id, input.command_id)?;
+    if fence
+        .as_ref()
+        .is_some_and(|persisted| persisted.daemon_boot_id != input.daemon_boot_id)
+    {
+        return Err(RuntimeStoreError::FenceConflict);
+    }
+    if fence
+        .as_ref()
+        .is_some_and(|persisted| persisted.release_authorized_at_ms.is_some())
+    {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+
+    let state_value = terminal_to_command_state(terminal_state);
+    if command.state.is_terminal() {
+        if command.state != state_value || command.turn_id != Some(input.turn_id) {
+            return Err(RuntimeStoreError::InvalidStateTransition);
+        }
+        let (persisted_token, event_id): (Option<Vec<u8>>, Option<Vec<u8>>) = transaction
+            .query_row(
+                "SELECT terminal_token, terminal_event_id FROM commands WHERE command_id = ?1",
+                [&input.command_id.as_bytes()[..]],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+        let persisted_token = persisted_token.ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        if persisted_token.as_slice() != terminal_token.as_bytes() {
+            return Err(RuntimeStoreError::TerminalConflict);
+        }
+        let event_id = runtime_id(
+            RuntimeIdKind::Event,
+            event_id.ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?,
+        )?;
+        let event = load_event(&transaction, key_bundle, database_id, event_id)?;
+        return Ok(TerminateStartedBeforeReleaseOutcome::Replayed { command, event });
+    }
+    if command.state != CommandState::Started || command.turn_id != Some(input.turn_id) {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+
+    let terminal_at_ms = config.clock.now_ms()?;
+    let started_at_ms = command
+        .started_at_ms
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let conversation =
+        load_conversation(&transaction, key_bundle, database_id, input.conversation_id)?;
+    let persisted_boundary = started_at_ms.max(conversation.updated_at_ms);
+    if terminal_at_ms < persisted_boundary {
+        return Err(RuntimeStoreError::ClockRegressed {
+            persisted_ms: persisted_boundary,
+            observed_ms: terminal_at_ms,
+        });
+    }
+    sqlite::admit_safety_write(
+        &transaction,
+        key_bundle,
+        database_id,
+        &state.storage_path,
+        config.capacity_probe.as_ref(),
+    )?;
+
+    let terminal_at = sqlite_time(terminal_at_ms)?;
+    let previous = conversation
+        .event_high_water
+        .map(super::sequence::encode_sequence);
+    let event_seq = next_sequence(SequenceScope::EventSeq, previous.as_deref())?;
+    let event_id = allocate_id(&transaction, config, RuntimeIdKind::Event)?;
+    let sealed_result = seal(
+        key_bundle,
+        database_id,
+        b"commands",
+        input.command_id.as_bytes(),
+        b"sealed_result",
+        &input.terminal_payload,
+        MAX_COMMAND_RESULT_BYTES,
+    )?;
+    let sealed_event = seal(
+        key_bundle,
+        database_id,
+        b"event_journal",
+        event_id.as_bytes(),
+        b"sealed_event",
+        &input.event_payload,
+        MAX_RUNTIME_EVENT_BYTES,
+    )?;
+    let retain_until_ms = command.retain_until_ms.max(
+        terminal_at_ms
+            .checked_add(COMMAND_LEDGER_RETENTION_MS)
+            .ok_or(RuntimeStoreError::TimeOutOfRange)?,
+    );
+    let index_tokens = load_command_index_tokens(&transaction, input.command_id)?;
+    let command_metadata = command_metadata_token(
+        key_bundle,
+        command.conversation_id,
+        command.command_id,
+        command.command_seq,
+        &index_tokens.owner_token,
+        &index_tokens.idempotency_token,
+        &index_tokens.payload_token,
+        Some(terminal_token.as_bytes()),
+        state_value,
+        u64::try_from(command.payload.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+        command.accepted_at_ms,
+        command.expires_at_ms,
+        retain_until_ms,
+        command.started_at_ms,
+        Some(terminal_at_ms),
+        command.turn_id,
+        command.started_event_id,
+        Some(event_id),
+    )?;
+    if transaction.execute(
+        "UPDATE commands
+         SET state = ?1, terminal_token = ?2, terminal_event_id = ?3,
+             terminal_at_ms = ?4, retain_until_ms = ?5, sealed_result = ?6,
+             metadata_token = ?7
+         WHERE command_id = ?8 AND state = 'started' AND turn_id = ?9
+           AND metadata_token = ?10",
+        params![
+            terminal_state_text(terminal_state),
+            &terminal_token.as_bytes()[..],
+            &event_id.as_bytes()[..],
+            terminal_at,
+            sqlite_time(retain_until_ms)?,
+            sealed_result,
+            &command_metadata[..],
+            &input.command_id.as_bytes()[..],
+            &input.turn_id.as_bytes()[..],
+            &index_tokens.metadata_token,
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    transaction.execute(
+        "INSERT INTO event_journal (
+             conversation_id, event_seq, event_id, command_id,
+             logical_event_bytes, created_at_ms, metadata_token, sealed_event
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            &input.conversation_id.as_bytes()[..],
+            event_seq.encoded,
+            &event_id.as_bytes()[..],
+            &input.command_id.as_bytes()[..],
+            i64::try_from(input.event_payload.len())
+                .map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+            terminal_at,
+            &event_metadata_token(
+                key_bundle,
+                input.conversation_id,
+                event_id,
+                event_seq.value,
+                Some(input.command_id),
+                u64::try_from(input.event_payload.len())
+                    .map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+                terminal_at_ms,
+            )?[..],
+            sealed_event,
+        ],
+    )?;
+    update_conversation_high_water(
+        &transaction,
+        input.conversation_id,
+        "event_high_water",
+        &event_seq.encoded,
+        previous.as_deref(),
+        terminal_at,
+        key_bundle,
+        database_id,
+        ConversationQueueDelta::Unchanged,
+    )?;
+    let mut next_ledger = ledger.clone();
+    next_ledger.event_count = next_ledger
+        .event_count
+        .checked_add(1)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if fence.is_some() {
+        next_ledger.started_without_release_count = next_ledger
+            .started_without_release_count
+            .checked_sub(1)
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    } else {
+        next_ledger.started_without_fence_count = next_ledger
+            .started_without_fence_count
+            .checked_sub(1)
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    }
+    sqlite::update_runtime_ledger(&transaction, key_bundle, database_id, &ledger, &next_ledger)?;
+    config
+        .fault_injector
+        .before_operation(RuntimeStoreOperation::TerminateStartedBeforeReleaseBeforeCommit)?;
+    commit_transaction(
+        transaction,
+        RuntimeCommitOperation::TerminateStartedBeforeRelease,
+    )?;
+    sqlite::latch_post_commit_capacity(state, config);
+    after_commit(
+        config,
+        RuntimeStoreOperation::TerminateStartedBeforeReleaseAfterCommit,
+        RuntimeCommitOperation::TerminateStartedBeforeRelease,
+    )?;
+
+    let command = CommandRecord {
+        state: state_value,
+        terminal_at_ms: Some(terminal_at_ms),
+        terminal_event_id: Some(event_id),
+        retain_until_ms,
+        result: Some(input.terminal_payload),
+        ..command
+    };
+    Ok(TerminateStartedBeforeReleaseOutcome::Transitioned {
+        command,
+        event: EventRecord {
+            conversation_id: input.conversation_id,
+            event_id,
+            event_seq: event_seq.value,
+            command_id: Some(input.command_id),
+            created_at_ms: terminal_at_ms,
+            payload: input.event_payload,
+        },
+    })
+}
+
+pub(crate) fn terminate_accepted_command(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    input: TerminateAcceptedCommand,
+) -> Result<TerminateAcceptedOutcome, RuntimeStoreError> {
+    ensure_kind(input.conversation_id, RuntimeIdKind::Conversation)?;
+    ensure_kind(input.command_id, RuntimeIdKind::Command)?;
+    validate_payload_len(
+        input.event_payload.len(),
+        MAX_ACCEPTED_TERMINATION_EVENT_BYTES,
+    )?;
+
+    let database_id = state.database_id;
+    let key_bundle = &state.key_bundle;
+    let transaction = state
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let command = load_command(&transaction, key_bundle, database_id, input.command_id)?;
+    if command.conversation_id != input.conversation_id {
+        return Err(RuntimeStoreError::CommandNotFound);
+    }
+    if command.owner != input.expected_owner {
+        return Err(RuntimeStoreError::CommandOwnerMismatch);
+    }
+    if command.state == CommandState::Started {
+        return Ok(TerminateAcceptedOutcome::AlreadyStarted { command });
+    }
+    let terminal_state = input.reason.command_state();
+    if command.state == terminal_state
+        && command.started_at_ms.is_none()
+        && command.turn_id.is_none()
+    {
+        let event_id = command
+            .terminal_event_id
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        let event = load_event(&transaction, key_bundle, database_id, event_id)?;
+        if event.payload != input.event_payload {
+            return Err(RuntimeStoreError::TerminalConflict);
+        }
+        return Ok(TerminateAcceptedOutcome::Replayed { command, event });
+    }
+    if command.state != CommandState::Accepted {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+
+    let terminal_at_ms = config.clock.now_ms()?;
+    let conversation =
+        load_conversation(&transaction, key_bundle, database_id, input.conversation_id)?;
+    let persisted_ms = command.accepted_at_ms.max(conversation.updated_at_ms);
+    if terminal_at_ms < persisted_ms {
+        return Err(RuntimeStoreError::ClockRegressed {
+            persisted_ms,
+            observed_ms: terminal_at_ms,
+        });
+    }
+    sqlite::admit_safety_write(
+        &transaction,
+        key_bundle,
+        database_id,
+        &state.storage_path,
+        config.capacity_probe.as_ref(),
+    )?;
+
+    let ledger = sqlite::load_runtime_ledger(&transaction, key_bundle, database_id)?;
+    let previous = conversation
+        .event_high_water
+        .map(super::sequence::encode_sequence);
+    let event_seq = next_sequence(SequenceScope::EventSeq, previous.as_deref())?;
+    let event_id = allocate_id(&transaction, config, RuntimeIdKind::Event)?;
+    let terminal_token = accepted_termination_token(
+        key_bundle,
+        input.reason,
+        input.conversation_id,
+        input.command_id,
+        &input.event_payload,
+    )?;
+    let sealed_event = seal(
+        key_bundle,
+        database_id,
+        b"event_journal",
+        event_id.as_bytes(),
+        b"sealed_event",
+        &input.event_payload,
+        MAX_ACCEPTED_TERMINATION_EVENT_BYTES,
+    )?;
+    let index_tokens = load_command_index_tokens(&transaction, input.command_id)?;
+    let logical_payload_bytes =
+        u64::try_from(command.payload.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    let metadata_token = command_metadata_token(
+        key_bundle,
+        input.conversation_id,
+        input.command_id,
+        command.command_seq,
+        &index_tokens.owner_token,
+        &index_tokens.idempotency_token,
+        &index_tokens.payload_token,
+        Some(terminal_token.as_bytes()),
+        terminal_state,
+        logical_payload_bytes,
+        command.accepted_at_ms,
+        command.expires_at_ms,
+        command.retain_until_ms,
+        None,
+        Some(terminal_at_ms),
+        None,
+        None,
+        Some(event_id),
+    )?;
+    if transaction.execute(
+        "UPDATE commands
+         SET state = ?1, terminal_token = ?2, terminal_event_id = ?3,
+             terminal_at_ms = ?4, metadata_token = ?5
+         WHERE command_id = ?6 AND state = 'accepted' AND metadata_token = ?7",
+        params![
+            command_state_text(terminal_state),
+            &terminal_token.as_bytes()[..],
+            &event_id.as_bytes()[..],
+            sqlite_time(terminal_at_ms)?,
+            &metadata_token[..],
+            &input.command_id.as_bytes()[..],
+            &index_tokens.metadata_token,
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    let event_metadata = event_metadata_token(
+        key_bundle,
+        input.conversation_id,
+        event_id,
+        event_seq.value,
+        Some(input.command_id),
+        u64::try_from(input.event_payload.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+        terminal_at_ms,
+    )?;
+    transaction.execute(
+        "INSERT INTO event_journal (
+             conversation_id, event_seq, event_id, command_id,
+             logical_event_bytes, created_at_ms, metadata_token, sealed_event
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            &input.conversation_id.as_bytes()[..],
+            event_seq.encoded,
+            &event_id.as_bytes()[..],
+            &input.command_id.as_bytes()[..],
+            i64::try_from(input.event_payload.len())
+                .map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+            sqlite_time(terminal_at_ms)?,
+            &event_metadata[..],
+            sealed_event,
+        ],
+    )?;
+    update_conversation_high_water(
+        &transaction,
+        input.conversation_id,
+        "event_high_water",
+        &event_seq.encoded,
+        previous.as_deref(),
+        sqlite_time(terminal_at_ms)?,
+        key_bundle,
+        database_id,
+        ConversationQueueDelta::Decrement,
+    )?;
+    let mut next_ledger = ledger.clone();
+    next_ledger.accepted_count = next_ledger
+        .accepted_count
+        .checked_sub(1)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    next_ledger.accepted_payload_bytes = next_ledger
+        .accepted_payload_bytes
+        .checked_sub(logical_payload_bytes)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    next_ledger.event_count = next_ledger
+        .event_count
+        .checked_add(1)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    sqlite::update_runtime_ledger(&transaction, key_bundle, database_id, &ledger, &next_ledger)?;
+    config
+        .fault_injector
+        .before_operation(RuntimeStoreOperation::TerminateAcceptedCommandBeforeCommit)?;
+    commit_transaction(
+        transaction,
+        RuntimeCommitOperation::TerminateAcceptedCommand,
+    )?;
+    sqlite::latch_post_commit_capacity(state, config);
+    after_commit(
+        config,
+        RuntimeStoreOperation::TerminateAcceptedCommandAfterCommit,
+        RuntimeCommitOperation::TerminateAcceptedCommand,
+    )?;
+
+    let command = CommandRecord {
+        state: terminal_state,
+        terminal_at_ms: Some(terminal_at_ms),
+        terminal_event_id: Some(event_id),
+        ..command
+    };
+    Ok(TerminateAcceptedOutcome::Transitioned {
+        command,
+        event: EventRecord {
+            conversation_id: input.conversation_id,
+            event_id,
+            event_seq: event_seq.value,
+            command_id: Some(input.command_id),
+            created_at_ms: terminal_at_ms,
+            payload: input.event_payload,
+        },
+    })
+}
+
+pub(crate) fn query_command_receipt(
+    state: &RuntimeSqlite,
+    input: QueryCommandReceipt,
+) -> Result<CommandReceiptRecord, RuntimeStoreError> {
+    let owner_bytes = Zeroizing::new(canonical_owner_v1(&input.expected_owner));
+    let expected_owner_token = state
+        .key_bundle
+        .blind_index(b"command.owner.v1", owner_bytes.as_ref())?;
+    let (conversation_id, command_id) = match input.selector {
+        CommandReceiptSelector::Command {
+            conversation_id,
+            command_id,
+        } => {
+            ensure_kind(conversation_id, RuntimeIdKind::Conversation)?;
+            ensure_kind(command_id, RuntimeIdKind::Command)?;
+            (conversation_id, command_id)
+        }
+        CommandReceiptSelector::Idempotency {
+            conversation_id,
+            idempotency_key,
+        } => {
+            ensure_kind(conversation_id, RuntimeIdKind::Conversation)?;
+            if idempotency_key.is_empty() || idempotency_key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
+                return Err(RuntimeStoreError::InvalidConfig(
+                    "idempotency key must contain 1 to 1024 UTF-8 bytes",
+                ));
+            }
+            let idempotency_plaintext = Zeroizing::new(canonical_fields(&[
+                conversation_id.as_bytes(),
+                owner_bytes.as_ref(),
+                idempotency_key.as_bytes(),
+            ])?);
+            let idempotency_token = state
+                .key_bundle
+                .blind_index(b"command.idempotency.v1", idempotency_plaintext.as_ref())?;
+            let command_id = state
+                .connection
+                .query_row(
+                    "SELECT command_id FROM commands WHERE idempotency_token = ?1",
+                    [&idempotency_token.as_bytes()[..]],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()?
+                .ok_or(RuntimeStoreError::CommandNotFound)?;
+            (
+                conversation_id,
+                runtime_id(RuntimeIdKind::Command, command_id)?,
+            )
+        }
+    };
+    load_compact_command_receipt(
+        &state.connection,
+        &state.key_bundle,
+        conversation_id,
+        command_id,
+        expected_owner_token.as_bytes(),
+    )
 }
 
 fn expire_accepted_commands(
@@ -2477,6 +3042,148 @@ fn load_conversation(
     Ok(record)
 }
 
+fn load_compact_command_receipt(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    expected_conversation_id: RuntimeId,
+    command_id: RuntimeId,
+    expected_owner_token: &[u8; 32],
+) -> Result<CommandReceiptRecord, RuntimeStoreError> {
+    struct RawReceipt {
+        conversation_id: Vec<u8>,
+        command_seq: String,
+        state: String,
+        logical_payload_bytes: i64,
+        accepted_at_ms: i64,
+        expires_at_ms: i64,
+        retain_until_ms: i64,
+        started_at_ms: Option<i64>,
+        terminal_at_ms: Option<i64>,
+        turn_id: Option<Vec<u8>>,
+        started_event_id: Option<Vec<u8>>,
+        terminal_event_id: Option<Vec<u8>>,
+        owner_token: Vec<u8>,
+        idempotency_token: Vec<u8>,
+        payload_token: Vec<u8>,
+        terminal_token: Option<Vec<u8>>,
+        metadata_token: Vec<u8>,
+        result_present: bool,
+    }
+
+    ensure_kind(expected_conversation_id, RuntimeIdKind::Conversation)?;
+    ensure_kind(command_id, RuntimeIdKind::Command)?;
+    let raw = connection
+        .query_row(
+            "SELECT conversation_id, command_seq, state, logical_payload_bytes,
+                    accepted_at_ms, expires_at_ms, retain_until_ms,
+                    started_at_ms, terminal_at_ms, turn_id,
+                    started_event_id, terminal_event_id,
+                    owner_token, idempotency_token, payload_token, terminal_token,
+                    metadata_token, sealed_result IS NOT NULL
+             FROM commands WHERE command_id = ?1 AND conversation_id = ?2",
+            params![
+                &command_id.as_bytes()[..],
+                &expected_conversation_id.as_bytes()[..]
+            ],
+            |row| {
+                Ok(RawReceipt {
+                    conversation_id: row.get(0)?,
+                    command_seq: row.get(1)?,
+                    state: row.get(2)?,
+                    logical_payload_bytes: row.get(3)?,
+                    accepted_at_ms: row.get(4)?,
+                    expires_at_ms: row.get(5)?,
+                    retain_until_ms: row.get(6)?,
+                    started_at_ms: row.get(7)?,
+                    terminal_at_ms: row.get(8)?,
+                    turn_id: row.get(9)?,
+                    started_event_id: row.get(10)?,
+                    terminal_event_id: row.get(11)?,
+                    owner_token: row.get(12)?,
+                    idempotency_token: row.get(13)?,
+                    payload_token: row.get(14)?,
+                    terminal_token: row.get(15)?,
+                    metadata_token: row.get(16)?,
+                    result_present: row.get::<_, i64>(17)? != 0,
+                })
+            },
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => RuntimeStoreError::CommandNotFound,
+            other => RuntimeStoreError::Sqlite(other),
+        })?;
+    let conversation_id = runtime_id(RuntimeIdKind::Conversation, raw.conversation_id)?;
+    if conversation_id != expected_conversation_id {
+        return Err(RuntimeStoreError::CommandNotFound);
+    }
+    let command_seq = decode_sequence(SequenceScope::CommandSeq, &raw.command_seq)?;
+    let state = parse_command_state(&raw.state)?;
+    let logical_payload_bytes = u64::try_from(raw.logical_payload_bytes)
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let accepted_at_ms = runtime_time(raw.accepted_at_ms)?;
+    let expires_at_ms = runtime_time(raw.expires_at_ms)?;
+    let retain_until_ms = runtime_time(raw.retain_until_ms)?;
+    let started_at_ms = raw.started_at_ms.map(runtime_time).transpose()?;
+    let terminal_at_ms = raw.terminal_at_ms.map(runtime_time).transpose()?;
+    let turn_id = raw
+        .turn_id
+        .map(|value| runtime_id(RuntimeIdKind::Turn, value))
+        .transpose()?;
+    let started_event_id = raw
+        .started_event_id
+        .map(|value| runtime_id(RuntimeIdKind::Event, value))
+        .transpose()?;
+    let terminal_event_id = raw
+        .terminal_event_id
+        .map(|value| runtime_id(RuntimeIdKind::Event, value))
+        .transpose()?;
+    let metadata_token = command_metadata_token(
+        key_bundle,
+        conversation_id,
+        command_id,
+        command_seq,
+        &raw.owner_token,
+        &raw.idempotency_token,
+        &raw.payload_token,
+        raw.terminal_token.as_deref(),
+        state,
+        logical_payload_bytes,
+        accepted_at_ms,
+        expires_at_ms,
+        retain_until_ms,
+        started_at_ms,
+        terminal_at_ms,
+        turn_id,
+        started_event_id,
+        terminal_event_id,
+    )?;
+    if raw.metadata_token.as_slice() != metadata_token {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let result_marker: Option<&[u8]> = raw.result_present.then_some(&[]);
+    validate_command_invariants(
+        state,
+        accepted_at_ms,
+        expires_at_ms,
+        retain_until_ms,
+        started_at_ms,
+        terminal_at_ms,
+        turn_id,
+        started_event_id,
+        terminal_event_id,
+        raw.terminal_token.as_deref(),
+        result_marker,
+    )?;
+    if raw.owner_token.as_slice() != expected_owner_token {
+        return Err(RuntimeStoreError::CommandOwnerMismatch);
+    }
+    Ok(CommandReceiptRecord {
+        command_id,
+        state,
+        turn_id,
+    })
+}
+
 fn load_command(
     connection: &Connection,
     key_bundle: &super::cipher::RuntimeKeyBundle,
@@ -2561,6 +3268,7 @@ fn load_command(
     {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
+    let owner = decode_canonical_owner(fields[0])?;
     let conversation_id = runtime_id(RuntimeIdKind::Conversation, raw.conversation_id)?;
     let expected_owner_token = key_bundle.blind_index(b"command.owner.v1", fields[0])?;
     let idempotency_plaintext = Zeroizing::new(canonical_fields(&[
@@ -2661,6 +3369,7 @@ fn load_command(
         command_id,
         state,
         expires_at_ms,
+        terminal_at_ms,
         turn_id,
         terminal_event_id,
         raw.terminal_token.as_deref(),
@@ -2670,6 +3379,7 @@ fn load_command(
         conversation_id,
         command_id,
         command_seq,
+        owner,
         state,
         accepted_at_ms,
         expires_at_ms,
@@ -2943,6 +3653,7 @@ fn load_optional_fence(
         Ok(ExecutionFenceRecord {
             command_id,
             daemon_boot_id,
+            execution_nonce: fields[1].to_vec(),
             process_group_id,
             leader_pid,
             leader_start_time,
@@ -3282,7 +3993,11 @@ fn decode_fields<'a>(
     Ok(fields)
 }
 
-fn canonical_owner(owner: &IdempotencyOwner) -> Vec<u8> {
+/// Runtime store 与 Start identity derivation 共用的 owner v1 canonical codec。
+///
+/// 这是 blind-index、sealed command 与稳定 Start ID 的共同安全边界；禁止在调用点复制
+/// 编码规则，否则一次字段/version 漂移会让两条持久化身份路径静默分叉。
+pub(super) fn canonical_owner_v1(owner: &IdempotencyOwner) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(96);
     encoded.extend_from_slice(b"ADO1");
     match owner {
@@ -3308,6 +4023,43 @@ fn canonical_owner(owner: &IdempotencyOwner) -> Vec<u8> {
         }
     }
     encoded
+}
+
+fn decode_canonical_owner(encoded: &[u8]) -> Result<IdempotencyOwner, RuntimeStoreError> {
+    if encoded.get(..4) != Some(b"ADO1") {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let owner = match encoded.get(4).copied() {
+        Some(1) if encoded.len() == 57 => IdempotencyOwner::Local {
+            machine_trust_domain: encoded[5..37]
+                .try_into()
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            uid: u32::from_be_bytes(
+                encoded[37..41]
+                    .try_into()
+                    .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            ),
+            client_installation_id: encoded[41..57]
+                .try_into()
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+        },
+        Some(2) if encoded.len() == 85 => IdempotencyOwner::Remote {
+            machine_trust_domain: encoded[5..37]
+                .try_into()
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            device_route: encoded[37..53]
+                .try_into()
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            device_sign_fingerprint: encoded[53..85]
+                .try_into()
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+        },
+        _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
+    };
+    if canonical_owner_v1(&owner) != encoded {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(owner)
 }
 
 fn load_command_index_tokens(
@@ -3722,21 +4474,61 @@ fn validate_store_integrity_against_ledger(
                     }
                 }
             }
-            CommandState::Completed
-            | CommandState::Failed
-            | CommandState::Interrupted
-            | CommandState::Canceled => {
+            CommandState::Completed | CommandState::Failed => {
                 expected_intent_count += 1;
                 expected_fence_count += 1;
                 expected_event_count += 2;
                 let intent = load_intent(connection, key_bundle, database_id, command_id)?;
-                let event =
+                let started_event =
                     load_event(connection, key_bundle, database_id, intent.started_event_id)?;
-                validate_started_linkage(&command, &intent, &event)?;
+                let terminal_event = load_event(
+                    connection,
+                    key_bundle,
+                    database_id,
+                    command
+                        .terminal_event_id
+                        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?,
+                )?;
+                validate_started_terminal_linkage(
+                    &command,
+                    &intent,
+                    &started_event,
+                    &terminal_event,
+                )?;
                 let fence = load_optional_fence(connection, key_bundle, database_id, command_id)?
                     .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
                 if fence.release_authorized_at_ms.is_none() {
                     return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+                }
+            }
+            CommandState::Interrupted | CommandState::Canceled => {
+                if command.turn_id.is_none() {
+                    expected_event_count += 1;
+                } else {
+                    expected_intent_count += 1;
+                    expected_event_count += 2;
+                    let intent = load_intent(connection, key_bundle, database_id, command_id)?;
+                    let started_event =
+                        load_event(connection, key_bundle, database_id, intent.started_event_id)?;
+                    let terminal_event = load_event(
+                        connection,
+                        key_bundle,
+                        database_id,
+                        command
+                            .terminal_event_id
+                            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?,
+                    )?;
+                    validate_started_terminal_linkage(
+                        &command,
+                        &intent,
+                        &started_event,
+                        &terminal_event,
+                    )?;
+                    if load_optional_fence(connection, key_bundle, database_id, command_id)?
+                        .is_some()
+                    {
+                        expected_fence_count += 1;
+                    }
                 }
             }
             CommandState::Expired | CommandState::RevokedBeforeStart => {
@@ -4257,10 +5049,7 @@ fn validate_command_invariants(
                 && terminal_token.is_none()
                 && result.is_none()
         }
-        CommandState::Completed
-        | CommandState::Failed
-        | CommandState::Interrupted
-        | CommandState::Canceled => {
+        CommandState::Completed | CommandState::Failed | CommandState::Interrupted => {
             started_at_ms.is_some()
                 && terminal_at_ms.is_some()
                 && turn_id.is_some()
@@ -4268,6 +5057,23 @@ fn validate_command_invariants(
                 && terminal_event_id.is_some()
                 && terminal_token.is_some()
                 && result.is_some()
+        }
+        CommandState::Canceled => {
+            let started_terminal = started_at_ms.is_some()
+                && terminal_at_ms.is_some()
+                && turn_id.is_some()
+                && started_event_id.is_some()
+                && terminal_event_id.is_some()
+                && terminal_token.is_some()
+                && result.is_some();
+            let accepted_terminal = started_at_ms.is_none()
+                && terminal_at_ms.is_some()
+                && turn_id.is_none()
+                && started_event_id.is_none()
+                && terminal_event_id.is_some()
+                && terminal_token.is_some()
+                && result.is_none();
+            started_terminal || accepted_terminal
         }
         CommandState::Expired | CommandState::RevokedBeforeStart => {
             started_at_ms.is_none()
@@ -4296,6 +5102,40 @@ const fn is_completion_terminal(state: CommandState) -> bool {
     )
 }
 
+fn accepted_termination_reason(
+    state: CommandState,
+    turn_id: Option<RuntimeId>,
+) -> Option<AcceptedTerminationReason> {
+    if turn_id.is_some() {
+        return None;
+    }
+    match state {
+        CommandState::Canceled => Some(AcceptedTerminationReason::Canceled),
+        CommandState::RevokedBeforeStart => Some(AcceptedTerminationReason::RevokedBeforeStart),
+        _ => None,
+    }
+}
+
+fn accepted_termination_token(
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    reason: AcceptedTerminationReason,
+    conversation_id: RuntimeId,
+    command_id: RuntimeId,
+    event_payload: &[u8],
+) -> Result<super::cipher::BlindIndex, RuntimeStoreError> {
+    let (domain, tag) = match reason {
+        AcceptedTerminationReason::Canceled => (CANCELED_BEFORE_START_TOKEN_DOMAIN, 1_u8),
+        AcceptedTerminationReason::RevokedBeforeStart => (REVOKED_BEFORE_START_TOKEN_DOMAIN, 2_u8),
+    };
+    let plaintext = Zeroizing::new(canonical_fields(&[
+        conversation_id.as_bytes(),
+        command_id.as_bytes(),
+        &[tag],
+        event_payload,
+    ])?);
+    Ok(key_bundle.blind_index(domain, plaintext.as_ref())?)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn verify_terminal_integrity(
     connection: &Connection,
@@ -4305,6 +5145,7 @@ fn verify_terminal_integrity(
     command_id: RuntimeId,
     state: CommandState,
     expires_at_ms: u64,
+    terminal_at_ms: Option<u64>,
     turn_id: Option<RuntimeId>,
     terminal_event_id: Option<RuntimeId>,
     terminal_token: Option<&[u8]>,
@@ -4318,7 +5159,21 @@ fn verify_terminal_integrity(
     if event.conversation_id != conversation_id || event.command_id != Some(command_id) {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
-    let expected = if is_completion_terminal(state) {
+    let expected = if let Some(reason) = accepted_termination_reason(state, turn_id) {
+        if result.is_some()
+            || event.created_at_ms
+                != terminal_at_ms.ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?
+        {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        accepted_termination_token(
+            key_bundle,
+            reason,
+            conversation_id,
+            command_id,
+            &event.payload,
+        )?
+    } else if is_completion_terminal(state) {
         let turn_id = turn_id.ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
         let result = result.ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
         let state_tag =
@@ -4376,6 +5231,29 @@ fn validate_started_linkage(
         || event.conversation_id != command.conversation_id
         || event.command_id != Some(command.command_id)
         || event.created_at_ms != intent.created_at_ms
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(())
+}
+
+fn validate_started_terminal_linkage(
+    command: &CommandRecord,
+    intent: &ExecutionIntentRecord,
+    started_event: &EventRecord,
+    terminal_event: &EventRecord,
+) -> Result<(), RuntimeStoreError> {
+    validate_started_linkage(command, intent, started_event)?;
+    if terminal_event.event_id
+        != command
+            .terminal_event_id
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?
+        || terminal_event.conversation_id != command.conversation_id
+        || terminal_event.command_id != Some(command.command_id)
+        || terminal_event.created_at_ms
+            != command
+                .terminal_at_ms
+                .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?
     {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }

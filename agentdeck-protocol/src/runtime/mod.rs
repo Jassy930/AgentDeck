@@ -29,7 +29,8 @@ pub const RUNTIME_PROTOCOL_VERSION: u16 = 1;
 
 pub use catalog::{CatalogChange, CatalogDelta, CatalogError, CatalogSnapshot, ConversationEntry};
 pub use command::{
-    LocalOnlyAdministration, MAX_PROMPT_BYTES, PromptError, PromptPayload, RuntimeRequest,
+    ConversationStart, LocalOnlyAdministration, MAX_PROMPT_BYTES, PromptError, PromptPayload,
+    QueryReceiptSelector, RuntimeRequest, SendPromptRequest,
 };
 pub use envelope::{
     MAX_RUNTIME_REQUEST_BYTES, PairInvite, PendingPairing, RuntimeEnvelope, RuntimeMessage,
@@ -37,7 +38,10 @@ pub use envelope::{
 };
 pub use event::{RuntimeEvent, RuntimeEventBody};
 pub use failure::RuntimeFailure;
-pub use receipt::{ApprovalDeliveryState, ApprovalReceipt, CommandReceipt, RevocationReceipt};
+pub use receipt::{
+    ApprovalDeliveryState, ApprovalReceipt, CancellationReceipt, CommandReceipt, CommandStatus,
+    CommandStatusReceipt, ConversationStartReceipt, RevocationReceipt,
+};
 pub use schema::runtime_schema;
 pub use sync::{
     BackfillChunk, ConversationSnapshot, RuntimeSyncComplete, SnapshotError, SnapshotItem,

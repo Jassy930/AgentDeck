@@ -1129,6 +1129,59 @@
       "title": "BackfillChunk",
       "type": "object"
     },
+    "CancellationReceipt": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "queued 与 active cancel 的精确成功回执。\n\n`QueuedCanceled` 已把 Accepted command 终止；`ActiveCancelRequested` 只表示 对精确 turn 的取消请求已被 daemon 接受，不能冒充 turn 已经终止。",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "commandId": {
+              "type": "string"
+            },
+            "conversationId": {
+              "type": "string"
+            },
+            "status": {
+              "enum": [
+                "queuedCanceled"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "commandId",
+            "conversationId",
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "conversationId": {
+              "type": "string"
+            },
+            "status": {
+              "enum": [
+                "activeCancelRequested"
+              ],
+              "type": "string"
+            },
+            "turnId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "conversationId",
+            "status",
+            "turnId"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "CancellationReceipt"
+    },
     "CatalogDelta": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "additionalProperties": false,
@@ -1432,6 +1485,68 @@
         }
       ],
       "title": "CommandReceipt"
+    },
+    "CommandStatus": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "command journal 的中立精确状态。\n\n`QueryReceipt` 必须返回持久化状态，不能把查询结果压缩成 `CommandReceipt::Replayed`，否则断线客户端无法区分排队、执行中与各终态。",
+      "enum": [
+        "accepted",
+        "started",
+        "completed",
+        "failed",
+        "interrupted",
+        "expired",
+        "canceled",
+        "revokedBeforeStart"
+      ],
+      "title": "CommandStatus",
+      "type": "string"
+    },
+    "CommandStatusReceipt": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "CommandStatus": {
+          "description": "command journal 的中立精确状态。\n\n`QueryReceipt` 必须返回持久化状态，不能把查询结果压缩成 `CommandReceipt::Replayed`，否则断线客户端无法区分排队、执行中与各终态。",
+          "enum": [
+            "accepted",
+            "started",
+            "completed",
+            "failed",
+            "interrupted",
+            "expired",
+            "canceled",
+            "revokedBeforeStart"
+          ],
+          "type": "string"
+        }
+      },
+      "description": "`QueryReceipt` 返回的精确 command journal 记录。",
+      "properties": {
+        "commandId": {
+          "type": "string"
+        },
+        "conversationId": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/CommandStatus"
+        },
+        "turnId": {
+          "description": "`Accepted` 等尚未分配 turn 的状态为 `null`。",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "commandId",
+        "conversationId",
+        "status"
+      ],
+      "title": "CommandStatusReceipt",
+      "type": "object"
     },
     "ConversationEntry": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -2123,6 +2238,68 @@
       "title": "ConversationSnapshot",
       "type": "object"
     },
+    "ConversationStart": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "AgentKind": {
+          "enum": [
+            "codex",
+            "claude_code"
+          ],
+          "type": "string"
+        }
+      },
+      "description": "新建 conversation（daemon 在 adapter 启动前生成 conversationId）。",
+      "properties": {
+        "agentKind": {
+          "$ref": "#/definitions/AgentKind"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "idempotencyKey": {
+          "type": "string"
+        },
+        "title": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "agentKind",
+        "cwd",
+        "idempotencyKey"
+      ],
+      "title": "ConversationStart",
+      "type": "object"
+    },
+    "ConversationStartReceipt": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "description": "幂等创建 conversation 的精确回执。\n\nStart 只创建 catalog，不携带 prompt；daemon 返回稳定 `conversationId` 与中立 `adapterStateKey`。相同 owner/conversation-scope key 重试时 `replayed=true`， 客户端随后使用独立 key 发送 `SendPrompt`。",
+      "properties": {
+        "adapterStateKey": {
+          "type": "string"
+        },
+        "conversationId": {
+          "type": "string"
+        },
+        "replayed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "adapterStateKey",
+        "conversationId",
+        "replayed"
+      ],
+      "title": "ConversationStartReceipt",
+      "type": "object"
+    },
     "LocalOnlyAdministration": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "description": "local-only administration 信任边界标记。\n\n携带此标记的请求是 **local-only administration**：daemon 必须拒绝任何不是来自 same-UID UDS `LocalPrincipal` 的调用。它显式记录在类型、文档与 schema 中， 让客户端与审阅者都能确认该请求永不允许远端或 Relay 管理员发起。",
@@ -2188,6 +2365,59 @@
       "description": "已校验的 prompt 明文（≤ 256 KiB UTF-8）。构造与 wire 反序列化都强制上限。",
       "title": "PromptPayload",
       "type": "string"
+    },
+    "QueryReceiptSelector": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "按 command 或 conversation-scoped idempotency key 精确查询原始回执。\n\ninternally-tagged 形态排除“全空、两种 selector 同时出现、字段互相矛盾”的 歧义；两种 selector 都必须绑定 conversation。",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "commandId": {
+              "type": "string"
+            },
+            "conversationId": {
+              "type": "string"
+            },
+            "selector": {
+              "enum": [
+                "command"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "commandId",
+            "conversationId",
+            "selector"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "conversationId": {
+              "type": "string"
+            },
+            "idempotencyKey": {
+              "type": "string"
+            },
+            "selector": {
+              "enum": [
+                "idempotency"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "conversationId",
+            "idempotencyKey",
+            "selector"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "QueryReceiptSelector"
     },
     "RevocationReceipt": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -2823,6 +3053,20 @@
           ],
           "type": "string"
         },
+        "CommandStatus": {
+          "description": "command journal 的中立精确状态。\n\n`QueryReceipt` 必须返回持久化状态，不能把查询结果压缩成 `CommandReceipt::Replayed`，否则断线客户端无法区分排队、执行中与各终态。",
+          "enum": [
+            "accepted",
+            "started",
+            "completed",
+            "failed",
+            "interrupted",
+            "expired",
+            "canceled",
+            "revokedBeforeStart"
+          ],
+          "type": "string"
+        },
         "ConversationEntry": {
           "additionalProperties": false,
           "description": "一个会话目录条目（中立业务内容）。",
@@ -3364,7 +3608,7 @@
             },
             {
               "additionalProperties": false,
-              "description": "sendPrompt/start 等有副作用命令回执。",
+              "description": "sendPrompt 有副作用命令回执。",
               "oneOf": [
                 {
                   "additionalProperties": false,
@@ -3437,6 +3681,133 @@
                 "reply": {
                   "enum": [
                     "command"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "reply"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "queryReceipt 返回 command journal 的精确持久化状态。",
+              "properties": {
+                "commandId": {
+                  "type": "string"
+                },
+                "conversationId": {
+                  "type": "string"
+                },
+                "reply": {
+                  "enum": [
+                    "commandStatus"
+                  ],
+                  "type": "string"
+                },
+                "status": {
+                  "$ref": "#/definitions/CommandStatus"
+                },
+                "turnId": {
+                  "description": "`Accepted` 等尚未分配 turn 的状态为 `null`。",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "commandId",
+                "conversationId",
+                "reply",
+                "status"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "纯幂等 conversation 创建回执。",
+              "properties": {
+                "adapterStateKey": {
+                  "type": "string"
+                },
+                "conversationId": {
+                  "type": "string"
+                },
+                "replayed": {
+                  "type": "boolean"
+                },
+                "reply": {
+                  "enum": [
+                    "conversationStart"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "adapterStateKey",
+                "conversationId",
+                "replayed",
+                "reply"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "queued/active cancel 精确回执。",
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "commandId": {
+                      "type": "string"
+                    },
+                    "conversationId": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "enum": [
+                        "queuedCanceled"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "commandId",
+                    "conversationId",
+                    "status"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "conversationId": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "enum": [
+                        "activeCancelRequested"
+                      ],
+                      "type": "string"
+                    },
+                    "turnId": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "conversationId",
+                    "status",
+                    "turnId"
+                  ],
+                  "type": "object"
+                }
+              ],
+              "properties": {
+                "reply": {
+                  "enum": [
+                    "cancellation"
                   ],
                   "type": "string"
                 }
@@ -3932,26 +4303,30 @@
                 "agentKind": {
                   "$ref": "#/definitions/AgentKind"
                 },
-                "prompt": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/definitions/PromptPayload"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ],
-                  "default": null
+                "cwd": {
+                  "type": "string"
+                },
+                "idempotencyKey": {
+                  "type": "string"
                 },
                 "request": {
                   "enum": [
                     "start"
                   ],
                   "type": "string"
+                },
+                "title": {
+                  "default": null,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               },
               "required": [
                 "agentKind",
+                "cwd",
+                "idempotencyKey",
                 "request"
               ],
               "type": "object"
@@ -4042,56 +4417,104 @@
             },
             {
               "additionalProperties": false,
-              "description": "取消排队 prompt 或明确 cancel 当前 turn。",
+              "description": "精确取消尚未 Started 的 queued command。",
               "properties": {
-                "conversation_id": {
+                "commandId": {
+                  "type": "string"
+                },
+                "conversationId": {
                   "type": "string"
                 },
                 "request": {
                   "enum": [
-                    "cancel"
+                    "cancelQueued"
                   ],
                   "type": "string"
-                },
-                "turn_id": {
-                  "default": null,
-                  "type": [
-                    "string",
-                    "null"
-                  ]
                 }
               },
               "required": [
-                "conversation_id",
+                "commandId",
+                "conversationId",
                 "request"
               ],
               "type": "object"
             },
             {
               "additionalProperties": false,
-              "description": "查询原始回执（断线重取；不依赖 Relay 请求来源缓存）。",
+              "description": "明确请求取消当前 active turn；缺失/stale turnId 必须 fail-close。",
               "properties": {
-                "commandId": {
-                  "default": null,
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
                 "conversationId": {
-                  "default": null,
-                  "type": [
-                    "string",
-                    "null"
-                  ]
+                  "type": "string"
                 },
-                "idempotencyKey": {
-                  "default": null,
-                  "type": [
-                    "string",
-                    "null"
-                  ]
+                "request": {
+                  "enum": [
+                    "cancelActive"
+                  ],
+                  "type": "string"
                 },
+                "turnId": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "conversationId",
+                "request",
+                "turnId"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "查询原始回执（断线重取；不依赖 Relay 请求来源缓存）。",
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "commandId": {
+                      "type": "string"
+                    },
+                    "conversationId": {
+                      "type": "string"
+                    },
+                    "selector": {
+                      "enum": [
+                        "command"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "commandId",
+                    "conversationId",
+                    "selector"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "conversationId": {
+                      "type": "string"
+                    },
+                    "idempotencyKey": {
+                      "type": "string"
+                    },
+                    "selector": {
+                      "enum": [
+                        "idempotency"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "conversationId",
+                    "idempotencyKey",
+                    "selector"
+                  ],
+                  "type": "object"
+                }
+              ],
+              "properties": {
                 "request": {
                   "enum": [
                     "queryReceipt"
@@ -7071,6 +7494,20 @@
           ],
           "type": "string"
         },
+        "CommandStatus": {
+          "description": "command journal 的中立精确状态。\n\n`QueryReceipt` 必须返回持久化状态，不能把查询结果压缩成 `CommandReceipt::Replayed`，否则断线客户端无法区分排队、执行中与各终态。",
+          "enum": [
+            "accepted",
+            "started",
+            "completed",
+            "failed",
+            "interrupted",
+            "expired",
+            "canceled",
+            "revokedBeforeStart"
+          ],
+          "type": "string"
+        },
         "ConversationEntry": {
           "additionalProperties": false,
           "description": "一个会话目录条目（中立业务内容）。",
@@ -7550,7 +7987,7 @@
             },
             {
               "additionalProperties": false,
-              "description": "sendPrompt/start 等有副作用命令回执。",
+              "description": "sendPrompt 有副作用命令回执。",
               "oneOf": [
                 {
                   "additionalProperties": false,
@@ -7623,6 +8060,133 @@
                 "reply": {
                   "enum": [
                     "command"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "reply"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "queryReceipt 返回 command journal 的精确持久化状态。",
+              "properties": {
+                "commandId": {
+                  "type": "string"
+                },
+                "conversationId": {
+                  "type": "string"
+                },
+                "reply": {
+                  "enum": [
+                    "commandStatus"
+                  ],
+                  "type": "string"
+                },
+                "status": {
+                  "$ref": "#/definitions/CommandStatus"
+                },
+                "turnId": {
+                  "description": "`Accepted` 等尚未分配 turn 的状态为 `null`。",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "commandId",
+                "conversationId",
+                "reply",
+                "status"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "纯幂等 conversation 创建回执。",
+              "properties": {
+                "adapterStateKey": {
+                  "type": "string"
+                },
+                "conversationId": {
+                  "type": "string"
+                },
+                "replayed": {
+                  "type": "boolean"
+                },
+                "reply": {
+                  "enum": [
+                    "conversationStart"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "adapterStateKey",
+                "conversationId",
+                "replayed",
+                "reply"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "queued/active cancel 精确回执。",
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "commandId": {
+                      "type": "string"
+                    },
+                    "conversationId": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "enum": [
+                        "queuedCanceled"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "commandId",
+                    "conversationId",
+                    "status"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "conversationId": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "enum": [
+                        "activeCancelRequested"
+                      ],
+                      "type": "string"
+                    },
+                    "turnId": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "conversationId",
+                    "status",
+                    "turnId"
+                  ],
+                  "type": "object"
+                }
+              ],
+              "properties": {
+                "reply": {
+                  "enum": [
+                    "cancellation"
                   ],
                   "type": "string"
                 }
@@ -8118,26 +8682,30 @@
                 "agentKind": {
                   "$ref": "#/definitions/AgentKind"
                 },
-                "prompt": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/definitions/PromptPayload"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ],
-                  "default": null
+                "cwd": {
+                  "type": "string"
+                },
+                "idempotencyKey": {
+                  "type": "string"
                 },
                 "request": {
                   "enum": [
                     "start"
                   ],
                   "type": "string"
+                },
+                "title": {
+                  "default": null,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               },
               "required": [
                 "agentKind",
+                "cwd",
+                "idempotencyKey",
                 "request"
               ],
               "type": "object"
@@ -8228,56 +8796,104 @@
             },
             {
               "additionalProperties": false,
-              "description": "取消排队 prompt 或明确 cancel 当前 turn。",
+              "description": "精确取消尚未 Started 的 queued command。",
               "properties": {
-                "conversation_id": {
+                "commandId": {
+                  "type": "string"
+                },
+                "conversationId": {
                   "type": "string"
                 },
                 "request": {
                   "enum": [
-                    "cancel"
+                    "cancelQueued"
                   ],
                   "type": "string"
-                },
-                "turn_id": {
-                  "default": null,
-                  "type": [
-                    "string",
-                    "null"
-                  ]
                 }
               },
               "required": [
-                "conversation_id",
+                "commandId",
+                "conversationId",
                 "request"
               ],
               "type": "object"
             },
             {
               "additionalProperties": false,
-              "description": "查询原始回执（断线重取；不依赖 Relay 请求来源缓存）。",
+              "description": "明确请求取消当前 active turn；缺失/stale turnId 必须 fail-close。",
               "properties": {
-                "commandId": {
-                  "default": null,
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
                 "conversationId": {
-                  "default": null,
-                  "type": [
-                    "string",
-                    "null"
-                  ]
+                  "type": "string"
                 },
-                "idempotencyKey": {
-                  "default": null,
-                  "type": [
-                    "string",
-                    "null"
-                  ]
+                "request": {
+                  "enum": [
+                    "cancelActive"
+                  ],
+                  "type": "string"
                 },
+                "turnId": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "conversationId",
+                "request",
+                "turnId"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "查询原始回执（断线重取；不依赖 Relay 请求来源缓存）。",
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "commandId": {
+                      "type": "string"
+                    },
+                    "conversationId": {
+                      "type": "string"
+                    },
+                    "selector": {
+                      "enum": [
+                        "command"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "commandId",
+                    "conversationId",
+                    "selector"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "conversationId": {
+                      "type": "string"
+                    },
+                    "idempotencyKey": {
+                      "type": "string"
+                    },
+                    "selector": {
+                      "enum": [
+                        "idempotency"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "conversationId",
+                    "idempotencyKey",
+                    "selector"
+                  ],
+                  "type": "object"
+                }
+              ],
+              "properties": {
                 "request": {
                   "enum": [
                     "queryReceipt"
@@ -9329,6 +9945,20 @@
           ],
           "type": "string"
         },
+        "CommandStatus": {
+          "description": "command journal 的中立精确状态。\n\n`QueryReceipt` 必须返回持久化状态，不能把查询结果压缩成 `CommandReceipt::Replayed`，否则断线客户端无法区分排队、执行中与各终态。",
+          "enum": [
+            "accepted",
+            "started",
+            "completed",
+            "failed",
+            "interrupted",
+            "expired",
+            "canceled",
+            "revokedBeforeStart"
+          ],
+          "type": "string"
+        },
         "ConversationEntry": {
           "additionalProperties": false,
           "description": "一个会话目录条目（中立业务内容）。",
@@ -9962,7 +10592,7 @@
         },
         {
           "additionalProperties": false,
-          "description": "sendPrompt/start 等有副作用命令回执。",
+          "description": "sendPrompt 有副作用命令回执。",
           "oneOf": [
             {
               "additionalProperties": false,
@@ -10035,6 +10665,133 @@
             "reply": {
               "enum": [
                 "command"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "reply"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "queryReceipt 返回 command journal 的精确持久化状态。",
+          "properties": {
+            "commandId": {
+              "type": "string"
+            },
+            "conversationId": {
+              "type": "string"
+            },
+            "reply": {
+              "enum": [
+                "commandStatus"
+              ],
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/definitions/CommandStatus"
+            },
+            "turnId": {
+              "description": "`Accepted` 等尚未分配 turn 的状态为 `null`。",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "commandId",
+            "conversationId",
+            "reply",
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "纯幂等 conversation 创建回执。",
+          "properties": {
+            "adapterStateKey": {
+              "type": "string"
+            },
+            "conversationId": {
+              "type": "string"
+            },
+            "replayed": {
+              "type": "boolean"
+            },
+            "reply": {
+              "enum": [
+                "conversationStart"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "adapterStateKey",
+            "conversationId",
+            "replayed",
+            "reply"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "queued/active cancel 精确回执。",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "commandId": {
+                  "type": "string"
+                },
+                "conversationId": {
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "queuedCanceled"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "commandId",
+                "conversationId",
+                "status"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "conversationId": {
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "activeCancelRequested"
+                  ],
+                  "type": "string"
+                },
+                "turnId": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "conversationId",
+                "status",
+                "turnId"
+              ],
+              "type": "object"
+            }
+          ],
+          "properties": {
+            "reply": {
+              "enum": [
+                "cancellation"
               ],
               "type": "string"
             }
@@ -10655,26 +11412,30 @@
             "agentKind": {
               "$ref": "#/definitions/AgentKind"
             },
-            "prompt": {
-              "anyOf": [
-                {
-                  "$ref": "#/definitions/PromptPayload"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null
+            "cwd": {
+              "type": "string"
+            },
+            "idempotencyKey": {
+              "type": "string"
             },
             "request": {
               "enum": [
                 "start"
               ],
               "type": "string"
+            },
+            "title": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
             "agentKind",
+            "cwd",
+            "idempotencyKey",
             "request"
           ],
           "type": "object"
@@ -10765,56 +11526,104 @@
         },
         {
           "additionalProperties": false,
-          "description": "取消排队 prompt 或明确 cancel 当前 turn。",
+          "description": "精确取消尚未 Started 的 queued command。",
           "properties": {
-            "conversation_id": {
+            "commandId": {
+              "type": "string"
+            },
+            "conversationId": {
               "type": "string"
             },
             "request": {
               "enum": [
-                "cancel"
+                "cancelQueued"
               ],
               "type": "string"
-            },
-            "turn_id": {
-              "default": null,
-              "type": [
-                "string",
-                "null"
-              ]
             }
           },
           "required": [
-            "conversation_id",
+            "commandId",
+            "conversationId",
             "request"
           ],
           "type": "object"
         },
         {
           "additionalProperties": false,
-          "description": "查询原始回执（断线重取；不依赖 Relay 请求来源缓存）。",
+          "description": "明确请求取消当前 active turn；缺失/stale turnId 必须 fail-close。",
           "properties": {
-            "commandId": {
-              "default": null,
-              "type": [
-                "string",
-                "null"
-              ]
-            },
             "conversationId": {
-              "default": null,
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             },
-            "idempotencyKey": {
-              "default": null,
-              "type": [
-                "string",
-                "null"
-              ]
+            "request": {
+              "enum": [
+                "cancelActive"
+              ],
+              "type": "string"
             },
+            "turnId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "conversationId",
+            "request",
+            "turnId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "查询原始回执（断线重取；不依赖 Relay 请求来源缓存）。",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "commandId": {
+                  "type": "string"
+                },
+                "conversationId": {
+                  "type": "string"
+                },
+                "selector": {
+                  "enum": [
+                    "command"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "commandId",
+                "conversationId",
+                "selector"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "conversationId": {
+                  "type": "string"
+                },
+                "idempotencyKey": {
+                  "type": "string"
+                },
+                "selector": {
+                  "enum": [
+                    "idempotency"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "conversationId",
+                "idempotencyKey",
+                "selector"
+              ],
+              "type": "object"
+            }
+          ],
+          "properties": {
             "request": {
               "enum": [
                 "queryReceipt"

@@ -202,11 +202,83 @@ public enum RuntimeRevokeTargetV1: Codable, Sendable {
     }
 }
 
+public enum RuntimeReceiptSelectorV1: Codable, Sendable {
+    case command(conversationID: RuntimeConversationID, commandID: RuntimeCommandID)
+    case idempotency(
+        conversationID: RuntimeConversationID,
+        idempotencyKey: RuntimeIdempotencyKey
+    )
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: RuntimeV1CodingKey.self)
+        let selector = try container.decode(String.self, forKey: key("selector"))
+        switch selector {
+        case "command":
+            try rejectUnknownKeys(
+                decoder,
+                allowed: ["request", "selector", "conversationId", "commandId"]
+            )
+            self = .command(
+                conversationID: try container.decode(
+                    RuntimeConversationID.self,
+                    forKey: key("conversationId")
+                ),
+                commandID: try container.decode(
+                    RuntimeCommandID.self,
+                    forKey: key("commandId")
+                )
+            )
+        case "idempotency":
+            try rejectUnknownKeys(
+                decoder,
+                allowed: ["request", "selector", "conversationId", "idempotencyKey"]
+            )
+            self = .idempotency(
+                conversationID: try container.decode(
+                    RuntimeConversationID.self,
+                    forKey: key("conversationId")
+                ),
+                idempotencyKey: try container.decode(
+                    RuntimeIdempotencyKey.self,
+                    forKey: key("idempotencyKey")
+                )
+            )
+        default:
+            throw invalidTag(selector, field: "selector", in: container)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: RuntimeV1CodingKey.self)
+        try encodeFields(into: &container)
+    }
+
+    fileprivate func encodeFields(
+        into container: inout KeyedEncodingContainer<RuntimeV1CodingKey>
+    ) throws {
+        switch self {
+        case .command(let conversationID, let commandID):
+            try container.encode("command", forKey: key("selector"))
+            try container.encode(conversationID, forKey: key("conversationId"))
+            try container.encode(commandID, forKey: key("commandId"))
+        case .idempotency(let conversationID, let idempotencyKey):
+            try container.encode("idempotency", forKey: key("selector"))
+            try container.encode(conversationID, forKey: key("conversationId"))
+            try container.encode(idempotencyKey, forKey: key("idempotencyKey"))
+        }
+    }
+}
+
 public enum RuntimeRequestV1: Codable, Sendable {
     case hello(runtimeProtocolVersion: UInt16)
     case catalog(subscribe: Bool, sinceRevision: UInt64?)
     case subscribe(conversationID: RuntimeConversationID, cursor: RuntimeStreamCursorV1)
-    case start(agentKind: AgentKind, prompt: RuntimePromptPayloadV1?)
+    case start(
+        agentKind: AgentKind,
+        idempotencyKey: RuntimeIdempotencyKey,
+        cwd: String,
+        title: String?
+    )
     case sendPrompt(
         conversationID: RuntimeConversationID,
         idempotencyKey: RuntimeIdempotencyKey,
@@ -219,12 +291,9 @@ public enum RuntimeRequestV1: Codable, Sendable {
         decision: RuntimeActionDecisionV1
     )
     case retryApproval(conversationID: RuntimeConversationID, approvalID: RuntimeApprovalID)
-    case cancel(conversationID: RuntimeConversationID, turnID: RuntimeTurnID?)
-    case queryReceipt(
-        conversationID: RuntimeConversationID?,
-        commandID: RuntimeCommandID?,
-        idempotencyKey: RuntimeIdempotencyKey?
-    )
+    case cancelQueued(conversationID: RuntimeConversationID, commandID: RuntimeCommandID)
+    case cancelActive(conversationID: RuntimeConversationID, turnID: RuntimeTurnID)
+    case queryReceipt(RuntimeReceiptSelectorV1)
     case createPairInvite(
         displayName: String,
         ttlSecs: UInt32,
@@ -267,13 +336,18 @@ public enum RuntimeRequestV1: Codable, Sendable {
                 cursor: try container.decode(RuntimeStreamCursorV1.self, forKey: key("cursor"))
             )
         case "start":
-            try rejectUnknownKeys(decoder, allowed: ["request", "agentKind", "prompt"])
+            try rejectUnknownKeys(
+                decoder,
+                allowed: ["request", "agentKind", "idempotencyKey", "cwd", "title"]
+            )
             self = .start(
                 agentKind: try container.decode(AgentKind.self, forKey: key("agentKind")),
-                prompt: try container.decodeIfPresent(
-                    RuntimePromptPayloadV1.self,
-                    forKey: key("prompt")
-                )
+                idempotencyKey: try container.decode(
+                    RuntimeIdempotencyKey.self,
+                    forKey: key("idempotencyKey")
+                ),
+                cwd: try container.decode(String.self, forKey: key("cwd")),
+                title: try container.decodeIfPresent(String.self, forKey: key("title"))
             )
         case "sendPrompt":
             try rejectUnknownKeys(
@@ -328,37 +402,32 @@ public enum RuntimeRequestV1: Codable, Sendable {
                     forKey: key("approval_id")
                 )
             )
-        case "cancel":
+        case "cancelQueued":
             try rejectUnknownKeys(
                 decoder,
-                allowed: ["request", "conversation_id", "turn_id"]
+                allowed: ["request", "conversationId", "commandId"]
             )
-            self = .cancel(
+            self = .cancelQueued(
                 conversationID: try container.decode(
-                    RuntimeConversationID.self,
-                    forKey: key("conversation_id")
-                ),
-                turnID: try container.decodeIfPresent(RuntimeTurnID.self, forKey: key("turn_id"))
-            )
-        case "queryReceipt":
-            try rejectUnknownKeys(
-                decoder,
-                allowed: ["request", "conversationId", "commandId", "idempotencyKey"]
-            )
-            self = .queryReceipt(
-                conversationID: try container.decodeIfPresent(
                     RuntimeConversationID.self,
                     forKey: key("conversationId")
                 ),
-                commandID: try container.decodeIfPresent(
+                commandID: try container.decode(
                     RuntimeCommandID.self,
                     forKey: key("commandId")
-                ),
-                idempotencyKey: try container.decodeIfPresent(
-                    RuntimeIdempotencyKey.self,
-                    forKey: key("idempotencyKey")
                 )
             )
+        case "cancelActive":
+            try rejectUnknownKeys(decoder, allowed: ["request", "conversationId", "turnId"])
+            self = .cancelActive(
+                conversationID: try container.decode(
+                    RuntimeConversationID.self,
+                    forKey: key("conversationId")
+                ),
+                turnID: try container.decode(RuntimeTurnID.self, forKey: key("turnId"))
+            )
+        case "queryReceipt":
+            self = .queryReceipt(try RuntimeReceiptSelectorV1(from: decoder))
         case "createPairInvite":
             try rejectUnknownKeys(
                 decoder,
@@ -428,10 +497,12 @@ public enum RuntimeRequestV1: Codable, Sendable {
             try container.encode("subscribe", forKey: key("request"))
             try container.encode(conversationID, forKey: key("conversation_id"))
             try container.encode(cursor, forKey: key("cursor"))
-        case .start(let agentKind, let prompt):
+        case .start(let agentKind, let idempotencyKey, let cwd, let title):
             try container.encode("start", forKey: key("request"))
             try container.encode(agentKind, forKey: key("agentKind"))
-            try container.encode(prompt, forKey: key("prompt"))
+            try container.encode(idempotencyKey, forKey: key("idempotencyKey"))
+            try container.encode(cwd, forKey: key("cwd"))
+            try container.encode(title, forKey: key("title"))
         case .sendPrompt(let conversationID, let idempotencyKey, let prompt):
             try container.encode("sendPrompt", forKey: key("request"))
             try container.encode(conversationID, forKey: key("conversationId"))
@@ -447,15 +518,17 @@ public enum RuntimeRequestV1: Codable, Sendable {
             try container.encode("retryApproval", forKey: key("request"))
             try container.encode(conversationID, forKey: key("conversation_id"))
             try container.encode(approvalID, forKey: key("approval_id"))
-        case .cancel(let conversationID, let turnID):
-            try container.encode("cancel", forKey: key("request"))
-            try container.encode(conversationID, forKey: key("conversation_id"))
-            try container.encode(turnID, forKey: key("turn_id"))
-        case .queryReceipt(let conversationID, let commandID, let idempotencyKey):
-            try container.encode("queryReceipt", forKey: key("request"))
+        case .cancelQueued(let conversationID, let commandID):
+            try container.encode("cancelQueued", forKey: key("request"))
             try container.encode(conversationID, forKey: key("conversationId"))
             try container.encode(commandID, forKey: key("commandId"))
-            try container.encode(idempotencyKey, forKey: key("idempotencyKey"))
+        case .cancelActive(let conversationID, let turnID):
+            try container.encode("cancelActive", forKey: key("request"))
+            try container.encode(conversationID, forKey: key("conversationId"))
+            try container.encode(turnID, forKey: key("turnId"))
+        case .queryReceipt(let selector):
+            try container.encode("queryReceipt", forKey: key("request"))
+            try selector.encodeFields(into: &container)
         case .createPairInvite(let displayName, let ttlSecs, let scope):
             try container.encode("createPairInvite", forKey: key("request"))
             try container.encode(displayName, forKey: key("displayName"))
@@ -784,6 +857,9 @@ public struct RuntimePendingPairingV1: Codable, Sendable {
 public enum RuntimeReplyV1: Codable, Sendable {
     case hello(runtimeProtocolVersion: UInt16)
     case command(CommandReceiptV1)
+    case commandStatus(CommandStatusReceiptV1)
+    case conversationStart(ConversationStartReceiptV1)
+    case cancellation(CancellationReceiptV1)
     case approval(ApprovalReceiptV1)
     case revocation(RevocationReceiptV1)
     case snapshot(ConversationSnapshotV1)
@@ -807,6 +883,12 @@ public enum RuntimeReplyV1: Codable, Sendable {
                 )
             )
         case "command": self = .command(try CommandReceiptV1(from: decoder))
+        case "commandStatus":
+            self = .commandStatus(try CommandStatusReceiptV1(from: decoder))
+        case "conversationStart":
+            self = .conversationStart(try ConversationStartReceiptV1(from: decoder))
+        case "cancellation":
+            self = .cancellation(try CancellationReceiptV1(from: decoder))
         case "approval": self = .approval(try ApprovalReceiptV1(from: decoder))
         case "revocation": self = .revocation(try RevocationReceiptV1(from: decoder))
         case "snapshot": self = .snapshot(try ConversationSnapshotV1(from: decoder))
@@ -877,6 +959,15 @@ public enum RuntimeReplyV1: Codable, Sendable {
             try container.encode(version, forKey: key("runtimeProtocolVersion"))
         case .command(let receipt):
             try container.encode("command", forKey: key("reply"))
+            try receipt.encodeFields(into: &container)
+        case .commandStatus(let receipt):
+            try container.encode("commandStatus", forKey: key("reply"))
+            try receipt.encodeFields(into: &container)
+        case .conversationStart(let receipt):
+            try container.encode("conversationStart", forKey: key("reply"))
+            try receipt.encodeFields(into: &container)
+        case .cancellation(let receipt):
+            try container.encode("cancellation", forKey: key("reply"))
             try receipt.encodeFields(into: &container)
         case .approval(let receipt):
             try container.encode("approval", forKey: key("reply"))
@@ -992,6 +1083,178 @@ public enum CommandReceiptV1: Codable, Sendable {
         case .failed(let failure):
             try container.encode("failed", forKey: key("status"))
             try container.encode(failure, forKey: key("failure"))
+        }
+    }
+}
+
+public enum CommandStatusV1: String, Codable, Sendable, CaseIterable {
+    case accepted
+    case started
+    case completed
+    case failed
+    case interrupted
+    case expired
+    case canceled
+    case revokedBeforeStart
+}
+
+public struct CommandStatusReceiptV1: Codable, Sendable {
+    public let conversationID: RuntimeConversationID
+    public let commandID: RuntimeCommandID
+    public let status: CommandStatusV1
+    public let turnID: RuntimeTurnID?
+
+    public init(
+        conversationID: RuntimeConversationID,
+        commandID: RuntimeCommandID,
+        status: CommandStatusV1,
+        turnID: RuntimeTurnID?
+    ) {
+        self.conversationID = conversationID
+        self.commandID = commandID
+        self.status = status
+        self.turnID = turnID
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectUnknownKeys(
+            decoder,
+            allowed: ["reply", "conversationId", "commandId", "status", "turnId"]
+        )
+        let container = try decoder.container(keyedBy: RuntimeV1CodingKey.self)
+        conversationID = try container.decode(
+            RuntimeConversationID.self,
+            forKey: key("conversationId")
+        )
+        commandID = try container.decode(RuntimeCommandID.self, forKey: key("commandId"))
+        status = try container.decode(CommandStatusV1.self, forKey: key("status"))
+        turnID = try container.decodeIfPresent(RuntimeTurnID.self, forKey: key("turnId"))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: RuntimeV1CodingKey.self)
+        try encodeFields(into: &container)
+    }
+
+    fileprivate func encodeFields(
+        into container: inout KeyedEncodingContainer<RuntimeV1CodingKey>
+    ) throws {
+        try container.encode(conversationID, forKey: key("conversationId"))
+        try container.encode(commandID, forKey: key("commandId"))
+        try container.encode(status, forKey: key("status"))
+        try container.encode(turnID, forKey: key("turnId"))
+    }
+}
+
+public struct ConversationStartReceiptV1: Codable, Sendable {
+    public let conversationID: RuntimeConversationID
+    public let adapterStateKey: RuntimeAdapterStateKey
+    public let replayed: Bool
+
+    public init(
+        conversationID: RuntimeConversationID,
+        adapterStateKey: RuntimeAdapterStateKey,
+        replayed: Bool
+    ) {
+        self.conversationID = conversationID
+        self.adapterStateKey = adapterStateKey
+        self.replayed = replayed
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectUnknownKeys(
+            decoder,
+            allowed: ["reply", "conversationId", "adapterStateKey", "replayed"]
+        )
+        let container = try decoder.container(keyedBy: RuntimeV1CodingKey.self)
+        conversationID = try container.decode(
+            RuntimeConversationID.self,
+            forKey: key("conversationId")
+        )
+        adapterStateKey = try container.decode(
+            RuntimeAdapterStateKey.self,
+            forKey: key("adapterStateKey")
+        )
+        replayed = try container.decode(Bool.self, forKey: key("replayed"))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: RuntimeV1CodingKey.self)
+        try encodeFields(into: &container)
+    }
+
+    fileprivate func encodeFields(
+        into container: inout KeyedEncodingContainer<RuntimeV1CodingKey>
+    ) throws {
+        try container.encode(conversationID, forKey: key("conversationId"))
+        try container.encode(adapterStateKey, forKey: key("adapterStateKey"))
+        try container.encode(replayed, forKey: key("replayed"))
+    }
+}
+
+public enum CancellationReceiptV1: Codable, Sendable {
+    case queuedCanceled(
+        conversationID: RuntimeConversationID,
+        commandID: RuntimeCommandID
+    )
+    case activeCancelRequested(
+        conversationID: RuntimeConversationID,
+        turnID: RuntimeTurnID
+    )
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: RuntimeV1CodingKey.self)
+        let status = try container.decode(String.self, forKey: key("status"))
+        switch status {
+        case "queuedCanceled":
+            try rejectUnknownKeys(
+                decoder,
+                allowed: ["reply", "status", "conversationId", "commandId"]
+            )
+            self = .queuedCanceled(
+                conversationID: try container.decode(
+                    RuntimeConversationID.self,
+                    forKey: key("conversationId")
+                ),
+                commandID: try container.decode(
+                    RuntimeCommandID.self,
+                    forKey: key("commandId")
+                )
+            )
+        case "activeCancelRequested":
+            try rejectUnknownKeys(
+                decoder,
+                allowed: ["reply", "status", "conversationId", "turnId"]
+            )
+            self = .activeCancelRequested(
+                conversationID: try container.decode(
+                    RuntimeConversationID.self,
+                    forKey: key("conversationId")
+                ),
+                turnID: try container.decode(RuntimeTurnID.self, forKey: key("turnId"))
+            )
+        default:
+            throw invalidTag(status, field: "status", in: container)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: RuntimeV1CodingKey.self)
+        try encodeFields(into: &container)
+    }
+
+    fileprivate func encodeFields(
+        into container: inout KeyedEncodingContainer<RuntimeV1CodingKey>
+    ) throws {
+        switch self {
+        case .queuedCanceled(let conversationID, let commandID):
+            try container.encode("queuedCanceled", forKey: key("status"))
+            try container.encode(conversationID, forKey: key("conversationId"))
+            try container.encode(commandID, forKey: key("commandId"))
+        case .activeCancelRequested(let conversationID, let turnID):
+            try container.encode("activeCancelRequested", forKey: key("status"))
+            try container.encode(conversationID, forKey: key("conversationId"))
+            try container.encode(turnID, forKey: key("turnId"))
         }
     }
 }

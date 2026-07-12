@@ -31,12 +31,16 @@ pub const RUNTIME_STORE_SHUTDOWN_GRACE_MS: u64 = 5_000;
 pub const MAX_CONVERSATION_QUEUED_COMMANDS: u32 = 32;
 pub const MAX_GLOBAL_QUEUED_COMMANDS: u32 = 1_024;
 pub const MAX_GLOBAL_QUEUED_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
+/// Durable catalog 与恢复时 actor fan-out 的共同硬上界。
+pub const MAX_RUNTIME_CONVERSATIONS: u64 = 1_024;
 pub const MAX_COMMAND_PAYLOAD_BYTES: usize = 256 * 1024;
 pub const MAX_CONVERSATION_DESCRIPTOR_BYTES: usize = 1024 * 1024;
 pub const MAX_ADAPTER_STATE_REFERENCE_BYTES: usize = 4 * 1024;
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 1024;
 pub const MAX_EXECUTION_INTENT_BYTES: usize = 1024 * 1024;
 pub const MAX_RUNTIME_EVENT_BYTES: usize = 64 * 1024 * 1024;
+/// Accepted 终止事件必须落在每条 Accepted 已预留的 64 KiB safety tail 内。
+pub const MAX_ACCEPTED_TERMINATION_EVENT_BYTES: usize = 32 * 1024;
 pub const MAX_EXECUTION_FENCE_BYTES: usize = 1024 * 1024;
 pub const MAX_COMMAND_RESULT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_EXECUTION_NONCE_BYTES: usize = 1024;
@@ -65,6 +69,10 @@ pub enum RuntimeStoreOperation {
     StartCommandAfterCommit,
     ExpireCommandsBeforeCommit,
     ExpireCommandsAfterCommit,
+    TerminateAcceptedCommandBeforeCommit,
+    TerminateAcceptedCommandAfterCommit,
+    TerminateStartedBeforeReleaseBeforeCommit,
+    TerminateStartedBeforeReleaseAfterCommit,
     PersistFenceBeforeCommit,
     PersistFenceAfterCommit,
     AuthorizeExecutionReleaseBeforeCommit,
@@ -121,6 +129,7 @@ pub enum RuntimeClockError {
 pub struct RuntimeStoreConfig {
     pub storage_path: PathBuf,
     pub command_capacity: usize,
+    pub conversation_capacity: u64,
     pub lane_byte_capacity: usize,
     pub busy_timeout_ms: u64,
     pub fault_injector: Arc<dyn RuntimeStoreFaultInjector>,
@@ -135,6 +144,7 @@ impl RuntimeStoreConfig {
         Self {
             storage_path,
             command_capacity: DEFAULT_RUNTIME_STORE_COMMAND_CAPACITY,
+            conversation_capacity: MAX_RUNTIME_CONVERSATIONS,
             lane_byte_capacity: DEFAULT_RUNTIME_STORE_LANE_BYTE_CAPACITY,
             busy_timeout_ms: DEFAULT_RUNTIME_BUSY_TIMEOUT_MS,
             fault_injector: Arc::new(NoRuntimeStoreFaults),
@@ -147,6 +157,12 @@ impl RuntimeStoreConfig {
     #[must_use]
     pub fn with_command_capacity(mut self, command_capacity: usize) -> Self {
         self.command_capacity = command_capacity;
+        self
+    }
+
+    #[must_use]
+    pub fn with_conversation_capacity(mut self, conversation_capacity: u64) -> Self {
+        self.conversation_capacity = conversation_capacity;
         self
     }
 
@@ -193,6 +209,7 @@ impl std::fmt::Debug for RuntimeStoreConfig {
             .debug_struct("RuntimeStoreConfig")
             .field("storage_path", &self.storage_path)
             .field("command_capacity", &self.command_capacity)
+            .field("conversation_capacity", &self.conversation_capacity)
             .field("lane_byte_capacity", &self.lane_byte_capacity)
             .field("busy_timeout_ms", &self.busy_timeout_ms)
             .finish_non_exhaustive()
@@ -273,13 +290,15 @@ pub enum RuntimeCommitOperation {
     AcceptCommand,
     StartCommand,
     ExpireCommands,
+    TerminateAcceptedCommand,
+    TerminateStartedBeforeRelease,
     PersistFence,
     AuthorizeExecutionRelease,
     CompleteCommand,
     BindAdapterState,
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub enum IdempotencyOwner {
     Local {
         machine_trust_domain: [u8; 32],
@@ -359,6 +378,12 @@ impl std::fmt::Debug for ConversationRecord {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CreateConversationOutcome {
+    Created { conversation: ConversationRecord },
+    Replayed { conversation: ConversationRecord },
+}
+
 #[derive(Clone)]
 pub struct AcceptCommand {
     pub conversation_id: RuntimeId,
@@ -372,6 +397,7 @@ pub struct CommandRecord {
     pub conversation_id: RuntimeId,
     pub command_id: RuntimeId,
     pub command_seq: u64,
+    pub owner: IdempotencyOwner,
     pub state: CommandState,
     pub accepted_at_ms: u64,
     pub expires_at_ms: u64,
@@ -412,6 +438,115 @@ pub enum AcceptOutcome {
     Replayed {
         command: CommandRecord,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcceptedTerminationReason {
+    Canceled,
+    RevokedBeforeStart,
+}
+
+impl AcceptedTerminationReason {
+    #[must_use]
+    pub const fn command_state(self) -> CommandState {
+        match self {
+            Self::Canceled => CommandState::Canceled,
+            Self::RevokedBeforeStart => CommandState::RevokedBeforeStart,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct TerminateAcceptedCommand {
+    pub conversation_id: RuntimeId,
+    pub command_id: RuntimeId,
+    pub expected_owner: IdempotencyOwner,
+    pub reason: AcceptedTerminationReason,
+    pub event_payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TerminateAcceptedOutcome {
+    Transitioned {
+        command: CommandRecord,
+        event: EventRecord,
+    },
+    Replayed {
+        command: CommandRecord,
+        event: EventRecord,
+    },
+    AlreadyStarted {
+        command: CommandRecord,
+    },
+}
+
+/// 已经 Started、但 gate release 尚未授权时的安全终止原因。
+///
+/// 只有 execution control 已确认整个 process group fenced 后才能调用对应 store
+/// transaction；普通成功/失败 completion 仍走 `CompleteCommand`。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartedBeforeReleaseTermination {
+    Canceled,
+    Interrupted,
+}
+
+impl StartedBeforeReleaseTermination {
+    #[must_use]
+    pub const fn terminal_state(self) -> TerminalState {
+        match self {
+            Self::Canceled => TerminalState::Canceled,
+            Self::Interrupted => TerminalState::Interrupted,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct TerminateStartedBeforeRelease {
+    pub conversation_id: RuntimeId,
+    pub command_id: RuntimeId,
+    pub turn_id: RuntimeId,
+    pub daemon_boot_id: RuntimeId,
+    pub execution_nonce: Vec<u8>,
+    pub reason: StartedBeforeReleaseTermination,
+    pub terminal_payload: Vec<u8>,
+    pub event_payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TerminateStartedBeforeReleaseOutcome {
+    Transitioned {
+        command: CommandRecord,
+        event: EventRecord,
+    },
+    Replayed {
+        command: CommandRecord,
+        event: EventRecord,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommandReceiptSelector {
+    Command {
+        conversation_id: RuntimeId,
+        command_id: RuntimeId,
+    },
+    Idempotency {
+        conversation_id: RuntimeId,
+        idempotency_key: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryCommandReceipt {
+    pub expected_owner: IdempotencyOwner,
+    pub selector: CommandReceiptSelector,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommandReceiptRecord {
+    pub command_id: RuntimeId,
+    pub state: CommandState,
+    pub turn_id: Option<RuntimeId>,
 }
 
 #[derive(Clone)]
@@ -508,6 +643,7 @@ pub struct AuthorizeExecutionRelease {
 pub struct ExecutionFenceRecord {
     pub command_id: RuntimeId,
     pub daemon_boot_id: RuntimeId,
+    pub execution_nonce: Vec<u8>,
     pub process_group_id: i64,
     pub leader_pid: i64,
     pub leader_start_time: u64,
@@ -521,6 +657,7 @@ impl std::fmt::Debug for ExecutionFenceRecord {
             .debug_struct("ExecutionFenceRecord")
             .field("command_id", &self.command_id)
             .field("daemon_boot_id", &self.daemon_boot_id)
+            .field("execution_nonce", &"[REDACTED]")
             .field("process_group_id", &self.process_group_id)
             .field("leader_pid", &self.leader_pid)
             .field("leader_start_time", &self.leader_start_time)
@@ -707,6 +844,8 @@ pub enum RuntimeStoreError {
     ConversationNotFound,
     #[error("runtime conversation stable identity conflicts with an existing record")]
     ConversationConflict,
+    #[error("runtime conversation catalog reached its hard limit")]
+    ConversationLimit,
     #[error("runtime adapter state reference conflicts with the existing binding")]
     AdapterStateConflict,
     #[error("runtime adapter state key belongs to the other private namespace")]
@@ -715,6 +854,8 @@ pub enum RuntimeStoreError {
     CommandNotFound,
     #[error("runtime command idempotency key was reused with a different payload")]
     IdempotencyConflict,
+    #[error("runtime command belongs to a different idempotency owner")]
+    CommandOwnerMismatch,
     #[error("runtime command queue is full for {scope:?}")]
     QueueFull { scope: QueueScope },
     #[error("runtime payload exceeds the operation-specific limit")]
@@ -812,6 +953,7 @@ impl RuntimeStoreError {
             | Self::AdapterStateConflict
             | Self::AdapterStateNamespaceMismatch
             | Self::CommandNotFound
+            | Self::CommandOwnerMismatch
             | Self::TimeOutOfRange
             | Self::ClockRegressed { .. }
             | Self::InvalidStateTransition
@@ -826,6 +968,7 @@ impl RuntimeStoreError {
             | Self::RecoveryNotReady
             | Self::IdGeneration(_)
             | Self::Sequence(_) => "daemon.runtime.invalid_state",
+            Self::ConversationLimit => "daemon.runtime.actor_unavailable",
             Self::IdempotencyConflict => "daemon.command.idempotency_conflict",
             Self::QueueFull { .. } => "daemon.command.queue_full",
             Self::PayloadTooLarge => "daemon.payload.item_too_large",

@@ -5,7 +5,9 @@
 //! - `resolveApproval → ApprovalReceipt::Claimed/Applied/AlreadyHandled(state)/DeliveryFailed/Expired`。
 
 use crate::runtime::failure::RuntimeFailure;
-use crate::runtime::identity::{ApprovalId, CommandId, GrantSerial};
+use crate::runtime::identity::{
+    AdapterStateKey, ApprovalId, CommandId, ConversationId, GrantSerial, TurnId,
+};
 use crate::trunk::ActionDecisionKind;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -23,6 +25,68 @@ pub enum CommandReceipt {
     Replayed { command_id: CommandId },
     /// 类型化业务失败（含 `daemon.command.idempotency_conflict` 等）。
     Failed { failure: RuntimeFailure },
+}
+
+/// command journal 的中立精确状态。
+///
+/// `QueryReceipt` 必须返回持久化状态，不能把查询结果压缩成
+/// `CommandReceipt::Replayed`，否则断线客户端无法区分排队、执行中与各终态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum CommandStatus {
+    Accepted,
+    Started,
+    Completed,
+    Failed,
+    Interrupted,
+    Expired,
+    Canceled,
+    RevokedBeforeStart,
+}
+
+/// `QueryReceipt` 返回的精确 command journal 记录。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CommandStatusReceipt {
+    pub conversation_id: ConversationId,
+    pub command_id: CommandId,
+    pub status: CommandStatus,
+    /// `Accepted` 等尚未分配 turn 的状态为 `null`。
+    pub turn_id: Option<TurnId>,
+}
+
+/// 幂等创建 conversation 的精确回执。
+///
+/// Start 只创建 catalog，不携带 prompt；daemon 返回稳定 `conversationId` 与中立
+/// `adapterStateKey`。相同 owner/conversation-scope key 重试时 `replayed=true`，
+/// 客户端随后使用独立 key 发送 `SendPrompt`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationStartReceipt {
+    pub conversation_id: ConversationId,
+    pub adapter_state_key: AdapterStateKey,
+    pub replayed: bool,
+}
+
+/// queued 与 active cancel 的精确成功回执。
+///
+/// `QueuedCanceled` 已把 Accepted command 终止；`ActiveCancelRequested` 只表示
+/// 对精确 turn 的取消请求已被 daemon 接受，不能冒充 turn 已经终止。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "camelCase", deny_unknown_fields)]
+pub enum CancellationReceipt {
+    QueuedCanceled {
+        #[serde(rename = "conversationId")]
+        conversation_id: ConversationId,
+        #[serde(rename = "commandId")]
+        command_id: CommandId,
+    },
+    ActiveCancelRequested {
+        #[serde(rename = "conversationId")]
+        conversation_id: ConversationId,
+        #[serde(rename = "turnId")]
+        turn_id: TurnId,
+    },
 }
 
 /// approval delivery 状态机的精确状态（design §8.5）。

@@ -8,27 +8,138 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::runtime::adapter_state::AdapterStateNamespace;
 use crate::runtime::model::{
-    AcceptCommand, AcceptOutcome, AuthorizeExecutionRelease, CompleteCommand, CompleteOutcome,
-    ConversationRecord, ExecutionFence, ExecutionFenceRecord, MAX_ADAPTER_STATE_REFERENCE_BYTES,
+    AcceptCommand, AcceptOutcome, AuthorizeExecutionRelease, CommandReceiptRecord,
+    CommandReceiptSelector, CompleteCommand, CompleteOutcome, ConversationRecord,
+    CreateConversationOutcome, ExecutionFence, ExecutionFenceRecord,
+    MAX_ACCEPTED_TERMINATION_EVENT_BYTES, MAX_ADAPTER_STATE_REFERENCE_BYTES,
     MAX_COMMAND_PAYLOAD_BYTES, MAX_COMMAND_RESULT_BYTES, MAX_CONVERSATION_DESCRIPTOR_BYTES,
     MAX_EXECUTION_FENCE_BYTES, MAX_EXECUTION_INTENT_BYTES, MAX_EXECUTION_NONCE_BYTES,
     MAX_IDEMPOTENCY_KEY_BYTES, MAX_RUNTIME_BUSY_TIMEOUT_MS, MAX_RUNTIME_EVENT_BYTES,
     MAX_RUNTIME_STORE_COMMAND_CAPACITY, MAX_RUNTIME_STORE_LANE_BYTE_CAPACITY,
-    MachineEnrollmentReceiptRecord, NewConversation, RUNTIME_STORE_SHUTDOWN_GRACE_MS,
-    RecoveryCompletion, RecoveryCursor, RecoveryPage, RuntimeStoreConfig, RuntimeStoreError,
-    RuntimeStoreLane, RuntimeStoreOperation, RuntimeStoreSnapshot, StartCommand, StartOutcome,
+    MachineEnrollmentReceiptRecord, NewConversation, QueryCommandReceipt,
+    RUNTIME_STORE_SHUTDOWN_GRACE_MS, RecoveryCompletion, RecoveryCursor, RecoveryPage,
+    RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreLane, RuntimeStoreOperation,
+    RuntimeStoreSnapshot, StartCommand, StartOutcome, TerminateAcceptedCommand,
+    TerminateAcceptedOutcome, TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
 };
 use crate::security::{SecretBytes, StorageKek};
 
+use super::identity::{
+    MAX_RUNTIME_ID_COLLISION_ATTEMPTS, RuntimeId, RuntimeIdError, RuntimeIdKind,
+};
 use super::{journal, sqlite};
 
 const LIFECYCLE_RUNNING: u8 = 0;
 const LIFECYCLE_SHUTTING_DOWN: u8 = 1;
 const LIFECYCLE_STOPPED: u8 = 2;
+
+const IDENTITY_DERIVATION_ROOT_DOMAIN: &[u8] =
+    b"agentdeck.runtime.storage-kek.identity-derivation.v1";
+const CONVERSATION_ID_DOMAIN: &[u8] = b"agentdeck.runtime.conversation-id.v1";
+const ADAPTER_STATE_KEY_DOMAIN: &[u8] = b"agentdeck.runtime.adapter-state-key.v1";
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// 由 StorageKEK 域分离得到的稳定身份派生能力。
+///
+/// capability 不实现 `Debug`，克隆的 store handle 只共享同一份 `Arc`，不会复制
+/// 裸密钥；最后一个 handle 销毁时固定 32-byte key 会清零。
+struct RuntimeIdentityDerivationCapability {
+    key: [u8; 32],
+}
+
+impl RuntimeIdentityDerivationCapability {
+    fn from_storage_kek(storage_kek: &StorageKek) -> Result<Self, RuntimeStoreError> {
+        let mut mac = HmacSha256::new_from_slice(storage_kek.expose_secret()).map_err(|_| {
+            RuntimeStoreError::InvalidConfig("runtime identity derivation root is unavailable")
+        })?;
+        update_length_prefixed(&mut mac, IDENTITY_DERIVATION_ROOT_DOMAIN)?;
+        let mut digest = mac.finalize().into_bytes();
+        let mut key = [0_u8; 32];
+        key.copy_from_slice(&digest);
+        digest.zeroize();
+        if key == [0; 32] {
+            key.zeroize();
+            return Err(RuntimeStoreError::InvalidConfig(
+                "runtime identity derivation root is invalid",
+            ));
+        }
+        Ok(Self { key })
+    }
+
+    fn derive_start_identity(
+        &self,
+        owner: &crate::runtime::model::IdempotencyOwner,
+        idempotency_key: &str,
+    ) -> Result<(RuntimeId, RuntimeId), RuntimeStoreError> {
+        let owner = Zeroizing::new(journal::canonical_owner_v1(owner));
+        let conversation_id = self.derive_id(
+            RuntimeIdKind::Conversation,
+            CONVERSATION_ID_DOMAIN,
+            owner.as_ref(),
+            idempotency_key.as_bytes(),
+        )?;
+        let adapter_state_key = self.derive_id(
+            RuntimeIdKind::AdapterState,
+            ADAPTER_STATE_KEY_DOMAIN,
+            owner.as_ref(),
+            idempotency_key.as_bytes(),
+        )?;
+        Ok((conversation_id, adapter_state_key))
+    }
+
+    fn derive_id(
+        &self,
+        kind: RuntimeIdKind,
+        domain: &[u8],
+        owner: &[u8],
+        idempotency_key: &[u8],
+    ) -> Result<RuntimeId, RuntimeStoreError> {
+        for attempt in 0..MAX_RUNTIME_ID_COLLISION_ATTEMPTS {
+            let mut mac = HmacSha256::new_from_slice(&self.key).map_err(|_| {
+                RuntimeStoreError::InvalidConfig("runtime identity derivation is unavailable")
+            })?;
+            update_length_prefixed(&mut mac, domain)?;
+            update_length_prefixed(&mut mac, owner)?;
+            update_length_prefixed(&mut mac, idempotency_key)?;
+            mac.update(&[u8::try_from(attempt).map_err(|_| {
+                RuntimeStoreError::InvalidConfig("runtime identity derivation attempt overflow")
+            })?]);
+            let mut digest = mac.finalize().into_bytes();
+            let mut bytes = [0_u8; 16];
+            bytes.copy_from_slice(&digest[..16]);
+            digest.zeroize();
+            if let Ok(id) = RuntimeId::from_bytes(kind, bytes) {
+                return Ok(id);
+            }
+        }
+        Err(RuntimeIdError::CollisionExhausted {
+            kind,
+            attempts: MAX_RUNTIME_ID_COLLISION_ATTEMPTS,
+        }
+        .into())
+    }
+}
+
+impl Drop for RuntimeIdentityDerivationCapability {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+fn update_length_prefixed(mac: &mut HmacSha256, value: &[u8]) -> Result<(), RuntimeStoreError> {
+    let length = u32::try_from(value.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    mac.update(&length.to_be_bytes());
+    mac.update(value);
+    Ok(())
+}
 
 pub(crate) struct StoreOpenLease;
 
@@ -57,6 +168,7 @@ pub struct RuntimeStoreHandle {
     safety_budget: Arc<Semaphore>,
     lifecycle: Arc<AtomicU8>,
     interrupt: Arc<rusqlite::InterruptHandle>,
+    identity_derivation: Arc<RuntimeIdentityDerivationCapability>,
     shutdown_timeout: Duration,
 }
 
@@ -145,6 +257,13 @@ impl RuntimeStoreHandle {
                 "command capacity must be between 1 and 1024",
             ));
         }
+        if config.conversation_capacity == 0
+            || config.conversation_capacity > crate::runtime::model::MAX_RUNTIME_CONVERSATIONS
+        {
+            return Err(RuntimeStoreError::InvalidConfig(
+                "conversation capacity must be between 1 and 1024",
+            ));
+        }
         if config.busy_timeout_ms == 0 || config.busy_timeout_ms > MAX_RUNTIME_BUSY_TIMEOUT_MS {
             return Err(RuntimeStoreError::InvalidConfig(
                 "busy timeout must be between 1 and 30000 milliseconds",
@@ -164,6 +283,9 @@ impl RuntimeStoreHandle {
         );
         let normalized = sqlite::normalize_storage_path(&config.storage_path)?;
         let lease = claim_store_path(&normalized)?;
+        let identity_derivation = Arc::new(RuntimeIdentityDerivationCapability::from_storage_kek(
+            &storage_kek,
+        )?);
         let (normal_tx, normal_rx) = mpsc::channel(config.command_capacity);
         let (safety_tx, safety_rx) = mpsc::channel(config.command_capacity);
         let (read_tx, read_rx) = mpsc::channel(config.command_capacity);
@@ -200,11 +322,26 @@ impl RuntimeStoreHandle {
                 safety_budget,
                 lifecycle,
                 interrupt,
+                identity_derivation,
                 shutdown_timeout,
             }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(RuntimeStoreError::WorkerStopped),
         }
+    }
+
+    pub(in crate::runtime) fn derive_start_identity(
+        &self,
+        owner: &crate::runtime::model::IdempotencyOwner,
+        idempotency_key: &str,
+    ) -> Result<(RuntimeId, RuntimeId), RuntimeStoreError> {
+        if idempotency_key.is_empty() || idempotency_key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
+            return Err(RuntimeStoreError::InvalidConfig(
+                "idempotency key must contain 1 to 1024 UTF-8 bytes",
+            ));
+        }
+        self.identity_derivation
+            .derive_start_identity(owner, idempotency_key)
     }
 
     pub async fn inspect(&self) -> Result<RuntimeStoreSnapshot, RuntimeStoreError> {
@@ -250,6 +387,16 @@ impl RuntimeStoreHandle {
         &self,
         input: NewConversation,
     ) -> Result<ConversationRecord, RuntimeStoreError> {
+        match self.create_conversation_idempotent(input).await? {
+            CreateConversationOutcome::Created { conversation }
+            | CreateConversationOutcome::Replayed { conversation } => Ok(conversation),
+        }
+    }
+
+    pub async fn create_conversation_idempotent(
+        &self,
+        input: NewConversation,
+    ) -> Result<CreateConversationOutcome, RuntimeStoreError> {
         let descriptor_bytes = journal::canonical_conversation_descriptor(&input.descriptor)?;
         validate_maximum(descriptor_bytes.len(), MAX_CONVERSATION_DESCRIPTOR_BYTES)?;
         let charge = memory_charge(
@@ -383,6 +530,77 @@ impl RuntimeStoreHandle {
             RuntimeStoreLane::Normal,
             charge,
             |reply| NormalCommand::StartCommand { input, reply },
+        )
+        .await?
+    }
+
+    pub async fn terminate_accepted_command(
+        &self,
+        input: TerminateAcceptedCommand,
+    ) -> Result<TerminateAcceptedOutcome, RuntimeStoreError> {
+        validate_maximum(
+            input.event_payload.len(),
+            MAX_ACCEPTED_TERMINATION_EVENT_BYTES,
+        )?;
+        let charge = memory_charge(
+            size_of::<SafetyCommand>(),
+            &[input.event_payload.capacity()],
+        )?;
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            charge,
+            |reply| SafetyCommand::TerminateAccepted { input, reply },
+        )
+        .await?
+    }
+
+    pub async fn terminate_started_before_release(
+        &self,
+        input: TerminateStartedBeforeRelease,
+    ) -> Result<TerminateStartedBeforeReleaseOutcome, RuntimeStoreError> {
+        validate_nonempty_maximum(&input.execution_nonce, MAX_EXECUTION_NONCE_BYTES)?;
+        validate_maximum(input.terminal_payload.len(), MAX_COMMAND_RESULT_BYTES)?;
+        validate_maximum(input.event_payload.len(), MAX_RUNTIME_EVENT_BYTES)?;
+        let charge = memory_charge(
+            size_of::<SafetyCommand>(),
+            &[
+                input.execution_nonce.capacity(),
+                input.terminal_payload.capacity(),
+                input.event_payload.capacity(),
+            ],
+        )?;
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            charge,
+            |reply| SafetyCommand::TerminateStartedBeforeRelease { input, reply },
+        )
+        .await?
+    }
+
+    pub async fn query_command_receipt(
+        &self,
+        input: QueryCommandReceipt,
+    ) -> Result<CommandReceiptRecord, RuntimeStoreError> {
+        if let CommandReceiptSelector::Idempotency {
+            idempotency_key, ..
+        } = &input.selector
+            && (idempotency_key.is_empty() || idempotency_key.len() > MAX_IDEMPOTENCY_KEY_BYTES)
+        {
+            return Err(RuntimeStoreError::InvalidConfig(
+                "idempotency key must contain 1 to 1024 UTF-8 bytes",
+            ));
+        }
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::QueryCommandReceipt { input, reply },
         )
         .await?
     }
@@ -597,7 +815,7 @@ enum NormalCommand {
     CreateConversation {
         input: NewConversation,
         descriptor_bytes: zeroize::Zeroizing<Vec<u8>>,
-        reply: oneshot::Sender<Result<ConversationRecord, RuntimeStoreError>>,
+        reply: oneshot::Sender<Result<CreateConversationOutcome, RuntimeStoreError>>,
     },
     AcceptCommand {
         input: AcceptCommand,
@@ -632,6 +850,14 @@ enum SafetyCommand {
         input: CompleteCommand,
         reply: oneshot::Sender<Result<CompleteOutcome, RuntimeStoreError>>,
     },
+    TerminateAccepted {
+        input: TerminateAcceptedCommand,
+        reply: oneshot::Sender<Result<TerminateAcceptedOutcome, RuntimeStoreError>>,
+    },
+    TerminateStartedBeforeRelease {
+        input: TerminateStartedBeforeRelease,
+        reply: oneshot::Sender<Result<TerminateStartedBeforeReleaseOutcome, RuntimeStoreError>>,
+    },
 }
 
 enum ReadCommand {
@@ -653,6 +879,10 @@ enum ReadCommand {
         namespace: AdapterStateNamespace,
         adapter_state_key: super::RuntimeId,
         reply: oneshot::Sender<Result<Option<SecretBytes>, RuntimeStoreError>>,
+    },
+    QueryCommandReceipt {
+        input: QueryCommandReceipt,
+        reply: oneshot::Sender<Result<CommandReceiptRecord, RuntimeStoreError>>,
     },
 }
 
@@ -844,6 +1074,12 @@ fn handle_safety(
             SafetyCommand::CompleteCommand { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
+            SafetyCommand::TerminateAccepted { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::TerminateStartedBeforeRelease { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
         }
         drop(memory_permit);
         return;
@@ -862,6 +1098,14 @@ fn handle_safety(
         }
         SafetyCommand::CompleteCommand { input, reply } => {
             let _ = reply.send(journal::complete_command_with_event(state, config, input));
+        }
+        SafetyCommand::TerminateAccepted { input, reply } => {
+            let _ = reply.send(journal::terminate_accepted_command(state, config, input));
+        }
+        SafetyCommand::TerminateStartedBeforeRelease { input, reply } => {
+            let _ = reply.send(journal::terminate_started_before_release(
+                state, config, input,
+            ));
         }
     }
     drop(memory_permit);
@@ -899,6 +1143,9 @@ fn handle_read(
                 namespace,
                 adapter_state_key,
             ));
+        }
+        ReadCommand::QueryCommandReceipt { input, reply } => {
+            let _ = reply.send(journal::query_command_receipt(state, input));
         }
     }
 }

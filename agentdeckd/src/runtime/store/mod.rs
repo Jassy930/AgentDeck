@@ -12,16 +12,19 @@ mod sqlite;
 mod worker;
 
 pub use crate::runtime::model::{
-    AcceptCommand, AcceptOutcome, AuthorizeExecutionRelease, CommandRecord, CommandState,
-    CompleteCommand, CompleteOutcome, ConversationDescriptor, ConversationLifecycle,
-    ConversationRecord, ConversationRecoveryRecord, EventRecord, ExecutionFence,
+    AcceptCommand, AcceptOutcome, AcceptedTerminationReason, AuthorizeExecutionRelease,
+    CommandReceiptRecord, CommandReceiptSelector, CommandRecord, CommandState, CompleteCommand,
+    CompleteOutcome, ConversationDescriptor, ConversationLifecycle, ConversationRecord,
+    ConversationRecoveryRecord, CreateConversationOutcome, EventRecord, ExecutionFence,
     ExecutionFenceRecord, ExecutionIntentRecord, IdempotencyOwner,
-    MAX_CONVERSATION_DESCRIPTOR_BYTES, MAX_RECOVERY_PAGE_RETAINED_BYTES,
-    MachineEnrollmentReceiptRecord, NewConversation, QueueScope, RecoveryCompletion,
-    RecoveryCursor, RecoveryPage, RecoveryState, RuntimeClock, RuntimeClockError,
-    RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreFaultInjector,
-    RuntimeStoreLane, RuntimeStoreOperation, RuntimeStoreSnapshot, StartCommand, StartOutcome,
-    StartedRecoveryRecord, SystemRuntimeClock, TerminalState,
+    MAX_CONVERSATION_DESCRIPTOR_BYTES, MAX_RECOVERY_PAGE_RETAINED_BYTES, MAX_RUNTIME_CONVERSATIONS,
+    MachineEnrollmentReceiptRecord, NewConversation, QueryCommandReceipt, QueueScope,
+    RecoveryCompletion, RecoveryCursor, RecoveryPage, RecoveryState, RuntimeClock,
+    RuntimeClockError, RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError,
+    RuntimeStoreFaultInjector, RuntimeStoreLane, RuntimeStoreOperation, RuntimeStoreSnapshot,
+    StartCommand, StartOutcome, StartedBeforeReleaseTermination, StartedRecoveryRecord,
+    SystemRuntimeClock, TerminalState, TerminateAcceptedCommand, TerminateAcceptedOutcome,
+    TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
 };
 pub use identity::{RuntimeId, RuntimeIdKind, RuntimeIdSource};
 pub use recovery::RuntimeRescueIndex;
