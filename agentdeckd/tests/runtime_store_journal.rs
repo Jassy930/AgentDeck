@@ -1,3 +1,5 @@
+#[path = "support/runtime_descriptor.rs"]
+mod runtime_descriptor;
 #[path = "support/runtime_recovery.rs"]
 mod runtime_recovery;
 
@@ -79,7 +81,7 @@ fn conversation_input(seed: u8, descriptor: &[u8]) -> NewConversation {
     NewConversation {
         conversation_id: runtime_id(RuntimeIdKind::Conversation, seed),
         adapter_state_key: runtime_id(RuntimeIdKind::AdapterState, seed.wrapping_add(0x40)),
-        descriptor: descriptor.to_vec(),
+        descriptor: runtime_descriptor::descriptor(descriptor),
     }
 }
 
@@ -251,7 +253,7 @@ async fn catalog_command_sequences_and_idempotency_survive_restart() {
     assert_eq!(recovery.conversations.len(), 1);
     assert_eq!(
         recovery.conversations[0].descriptor,
-        b"private-title-and-cwd"
+        runtime_descriptor::descriptor(b"private-title-and-cwd")
     );
     assert_eq!(recovery.accepted.len(), 2);
     assert_eq!(recovery.accepted[0].payload, b"prompt-sentinel-alpha");

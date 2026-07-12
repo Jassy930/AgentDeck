@@ -47,7 +47,7 @@
 ### Relay Companion MVP（2026-07-10）
 
 - `plans/2026-07-10-relay-companion-mvp-design.md`：已批准的目标架构；固定 singleton daemon、多读者/多写者串行裁决、按机器独立配对、Relay 严格最小可见与真实 iOS Companion 边界。
-- `plans/2026-07-10-relay-companion-mvp-implementation.md`：P0–P6、48 个逐文件 TDD task；P2.10 已完成，P3.1 namespace/singleton/StorageKEK 代码已提交但真实 provisioned signed Keychain roundtrip 仍因本机缺 provisioning profile / AMFI exit 137 gated BLOCKED。P3.2 已建立严格七表 Runtime journal、stable IDs、认证 metadata/ledger、事务重放、TTL/fence、真实 256 MiB 容量门禁与逐 conversation paged recovery 的可验证组件边界；当前 stdio RuntimeHub 尚未接入，后续继续 P3.3 adapter 私表、P3.4 RuntimeCore、UDS/LaunchAgent、持久远程 CLI、iOS/远程 macOS 与真实跨网 DoD。
+- `plans/2026-07-10-relay-companion-mvp-implementation.md`：P0–P6、48 个逐文件 TDD task；P2.10 已完成，P3.1 namespace/singleton/StorageKEK 代码已提交但真实 provisioned signed Keychain roundtrip 仍因本机缺 provisioning profile / AMFI exit 137 gated BLOCKED。P3.2 已建立严格七表 Runtime journal、stable IDs、认证 metadata/ledger、事务重放、TTL/fence、真实 256 MiB 容量门禁与逐 conversation paged recovery；P3.3 已把 schema 原子迁移为九表，建立 typed canonical adapter contract、两个 StorageKEK 私有 namespace、sealed vault composition、Codex/CC authoritative identity 与 CC native-history fail-close 重建。当前 stdio RuntimeHub 尚未接入，下一项是 P3.4 RuntimeCore，之后继续 UDS/LaunchAgent、持久远程 CLI、iOS/远程 macOS 与真实跨网 DoD。
 
 ## 协议资料
 

@@ -1,3 +1,5 @@
+#[path = "support/runtime_descriptor.rs"]
+mod runtime_descriptor;
 #[path = "support/runtime_recovery.rs"]
 mod runtime_recovery;
 
@@ -8,8 +10,10 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use agentdeck_protocol::AgentKind;
 use agentdeckd::runtime::store::{
-    MachineEnrollmentReceiptRecord, RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION,
+    ConversationDescriptor, MAX_CONVERSATION_DESCRIPTOR_BYTES, MachineEnrollmentReceiptRecord,
+    NewConversation, RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION, RuntimeId, RuntimeIdKind,
     RuntimeRescueIndex, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreFaultInjector,
     RuntimeStoreHandle, RuntimeStoreOperation,
 };
@@ -53,6 +57,96 @@ impl Drop for TestRoot {
     }
 }
 
+#[test]
+fn conversation_descriptor_is_canonical_typed_and_rejects_vendor_identity_fields() {
+    let descriptor = ConversationDescriptor {
+        agent_kind: AgentKind::Codex,
+        title: Some("neutral title".to_owned()),
+        cwd: PathBuf::from("/tmp/neutral-project"),
+    };
+    let canonical = serde_json::to_vec(&descriptor).expect("serialize neutral descriptor");
+    assert_eq!(
+        canonical,
+        br#"{"agentKind":"codex","title":"neutral title","cwd":"/tmp/neutral-project"}"#
+    );
+
+    for forbidden in ["threadId", "sessionId", "resumeReference", "vendorRef"] {
+        let mut value = serde_json::to_value(&descriptor).expect("descriptor JSON value");
+        value
+            .as_object_mut()
+            .expect("descriptor object")
+            .insert(forbidden.to_owned(), serde_json::json!("private-sentinel"));
+        assert!(
+            serde_json::from_value::<ConversationDescriptor>(value).is_err(),
+            "descriptor must reject {forbidden}"
+        );
+    }
+
+    let input = NewConversation {
+        conversation_id: RuntimeId::from_bytes(RuntimeIdKind::Conversation, [0x21; 16])
+            .expect("conversation id"),
+        adapter_state_key: RuntimeId::from_bytes(RuntimeIdKind::AdapterState, [0x22; 16])
+            .expect("adapter state key"),
+        descriptor: descriptor.clone(),
+    };
+    let _: &ConversationDescriptor = &input.descriptor;
+    assert_eq!(input.descriptor, descriptor);
+}
+
+#[tokio::test]
+async fn conversation_descriptor_canonical_bytes_have_an_exact_one_mib_limit() {
+    let root = TestRoot::new("descriptor-size");
+    let keys = MemoryKeyStore::new();
+    let store = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(root.database()),
+        root.storage_kek(&keys),
+    )
+    .await
+    .expect("open descriptor size store");
+    let mut descriptor = ConversationDescriptor {
+        agent_kind: AgentKind::Codex,
+        title: Some(String::new()),
+        cwd: PathBuf::from("/tmp/descriptor-size"),
+    };
+    let fixed_bytes = serde_json::to_vec(&descriptor)
+        .expect("serialize empty descriptor")
+        .len();
+    descriptor.title = Some("x".repeat(MAX_CONVERSATION_DESCRIPTOR_BYTES - fixed_bytes));
+    assert_eq!(
+        serde_json::to_vec(&descriptor)
+            .expect("serialize exact descriptor")
+            .len(),
+        MAX_CONVERSATION_DESCRIPTOR_BYTES
+    );
+    store
+        .create_conversation(NewConversation {
+            conversation_id: RuntimeId::from_bytes(RuntimeIdKind::Conversation, [0x31; 16])
+                .expect("exact descriptor conversation id"),
+            adapter_state_key: RuntimeId::from_bytes(RuntimeIdKind::AdapterState, [0x32; 16])
+                .expect("exact descriptor state key"),
+            descriptor: descriptor.clone(),
+        })
+        .await
+        .expect("exact one MiB descriptor is accepted");
+
+    descriptor.title.as_mut().expect("title").push('x');
+    let error = store
+        .create_conversation(NewConversation {
+            conversation_id: RuntimeId::from_bytes(RuntimeIdKind::Conversation, [0x33; 16])
+                .expect("oversized descriptor conversation id"),
+            adapter_state_key: RuntimeId::from_bytes(RuntimeIdKind::AdapterState, [0x34; 16])
+                .expect("oversized descriptor state key"),
+            descriptor,
+        })
+        .await
+        .expect_err("one MiB plus one byte descriptor must be rejected");
+    assert!(matches!(error, RuntimeStoreError::PayloadTooLarge));
+    store
+        .shutdown()
+        .await
+        .expect("shutdown descriptor size store");
+}
+
 fn conversation_input(seed: u8, descriptor: &[u8]) -> agentdeckd::runtime::store::NewConversation {
     agentdeckd::runtime::store::NewConversation {
         conversation_id: agentdeckd::runtime::store::RuntimeId::from_bytes(
@@ -65,7 +159,7 @@ fn conversation_input(seed: u8, descriptor: &[u8]) -> agentdeckd::runtime::store
             [seed.wrapping_add(0x40); 16],
         )
         .expect("adapter state key"),
-        descriptor: descriptor.to_vec(),
+        descriptor: runtime_descriptor::descriptor(descriptor),
     }
 }
 
@@ -181,6 +275,8 @@ async fn fresh_store_is_ready_only_after_exact_schema_and_pragmas_read_back() {
     assert_eq!(
         snapshot.table_names,
         [
+            "claude_code_adapter_state",
+            "codex_adapter_state",
             "commands",
             "conversations",
             "event_journal",
@@ -195,7 +291,7 @@ async fn fresh_store_is_ready_only_after_exact_schema_and_pragmas_read_back() {
 }
 
 #[tokio::test]
-async fn schema_v1_contains_the_durable_idempotency_and_execution_linkage_contract() {
+async fn schema_v2_contains_the_durable_idempotency_and_execution_linkage_contract() {
     let root = TestRoot::new("journal-schema-contract");
     let keys = MemoryKeyStore::new();
     let database = root.database();
@@ -583,33 +679,38 @@ async fn safety_and_read_lanes_bypass_normal_saturation_in_priority_order() {
     .await
     .expect("all queued lanes are serviced");
 
-    let observed = injector.observed.lock().expect("read observed operations");
-    let first = observed
-        .iter()
-        .position(|operation| *operation == RuntimeStoreOperation::CreateConversationBeforeCommit)
-        .expect("first normal observation");
-    let safety_index = observed
-        .iter()
-        .position(|operation| {
-            *operation == RuntimeStoreOperation::RecordEnrollmentReceiptBeforeCommit
-        })
-        .expect("safety observation");
-    let read_index = observed
-        .iter()
-        .position(|operation| *operation == RuntimeStoreOperation::Inspect)
-        .expect("read observation");
-    let second_normal = observed
-        .iter()
-        .enumerate()
-        .skip(first + 1)
-        .find_map(|(index, operation)| {
-            (*operation == RuntimeStoreOperation::CreateConversationBeforeCommit).then_some(index)
-        })
-        .expect("second normal observation");
+    let (first, safety_index, read_index, second_normal) = {
+        let observed = injector.observed.lock().expect("read observed operations");
+        let first = observed
+            .iter()
+            .position(|operation| {
+                *operation == RuntimeStoreOperation::CreateConversationBeforeCommit
+            })
+            .expect("first normal observation");
+        let safety_index = observed
+            .iter()
+            .position(|operation| {
+                *operation == RuntimeStoreOperation::RecordEnrollmentReceiptBeforeCommit
+            })
+            .expect("safety observation");
+        let read_index = observed
+            .iter()
+            .position(|operation| *operation == RuntimeStoreOperation::Inspect)
+            .expect("read observation");
+        let second_normal = observed
+            .iter()
+            .enumerate()
+            .skip(first + 1)
+            .find_map(|(index, operation)| {
+                (*operation == RuntimeStoreOperation::CreateConversationBeforeCommit)
+                    .then_some(index)
+            })
+            .expect("second normal observation");
+        (first, safety_index, read_index, second_normal)
+    };
     assert!(first < safety_index);
     assert!(safety_index < read_index, "safety is preferred over read");
     assert!(read_index < second_normal, "read is preferred over normal");
-    drop(observed);
     store.shutdown().await.expect("shutdown store");
 }
 
@@ -684,7 +785,10 @@ async fn shutdown_control_lane_remains_available_when_the_normal_queue_is_full()
         .await
         .expect("read shutdown result");
     assert_eq!(recovery.conversations.len(), 1);
-    assert_eq!(recovery.conversations[0].descriptor, b"first");
+    assert_eq!(
+        recovery.conversations[0].descriptor,
+        runtime_descriptor::descriptor(b"first")
+    );
     reopened.shutdown().await.expect("shutdown reopened store");
 }
 
@@ -752,11 +856,15 @@ async fn queued_memory_is_bounded_independently_from_command_count() {
     .await
     .expect("open store");
 
-    let mut oversized_allocation = Vec::with_capacity(2_048);
-    oversized_allocation.extend_from_slice(b"x");
+    let mut oversized_allocation = String::with_capacity(2_048);
+    oversized_allocation.push('x');
     let error = store
         .create_conversation(agentdeckd::runtime::store::NewConversation {
-            descriptor: oversized_allocation,
+            descriptor: ConversationDescriptor {
+                agent_kind: AgentKind::Codex,
+                title: Some(oversized_allocation),
+                cwd: PathBuf::from("/tmp/agentdeck-runtime-test"),
+            },
             ..conversation_input(32, b"")
         })
         .await

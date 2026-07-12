@@ -1,3 +1,5 @@
+#[path = "support/runtime_descriptor.rs"]
+mod runtime_descriptor;
 #[path = "support/runtime_recovery.rs"]
 mod runtime_recovery;
 
@@ -81,7 +83,7 @@ async fn unknown_commit_reply_is_recovered_by_an_identical_retry() {
     let input = NewConversation {
         conversation_id: runtime_id(RuntimeIdKind::Conversation, 1),
         adapter_state_key: runtime_id(RuntimeIdKind::AdapterState, 2),
-        descriptor: b"stable conversation descriptor".to_vec(),
+        descriptor: runtime_descriptor::descriptor(b"stable conversation descriptor"),
     };
     let store = RuntimeStoreHandle::open(
         RuntimeStoreConfig::new(root.database())

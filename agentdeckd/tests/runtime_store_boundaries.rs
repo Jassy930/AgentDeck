@@ -1,3 +1,5 @@
+#[path = "support/runtime_descriptor.rs"]
+mod runtime_descriptor;
 #[path = "support/runtime_recovery.rs"]
 mod runtime_recovery;
 
@@ -13,9 +15,9 @@ use agentdeckd::runtime::store::cipher::{KeyWrapAad, RuntimeKeyBundle};
 use agentdeckd::runtime::store::identity::RuntimeIdError;
 use agentdeckd::runtime::store::{
     AcceptCommand, AcceptOutcome, IdempotencyOwner, NewConversation, QueueScope,
-    RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION, RuntimeClock, RuntimeClockError, RuntimeId,
-    RuntimeIdKind, RuntimeIdSource, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreHandle,
-    StartCommand,
+    RUNTIME_CRYPTO_CONTEXT_VERSION, RUNTIME_SCHEMA_FAMILY, RuntimeClock, RuntimeClockError,
+    RuntimeId, RuntimeIdKind, RuntimeIdSource, RuntimeStoreConfig, RuntimeStoreError,
+    RuntimeStoreHandle, StartCommand,
 };
 use agentdeckd::security::{MemoryKeyStore, StorageKek, load_or_create_storage_kek};
 use rusqlite::{Connection, params};
@@ -117,7 +119,7 @@ fn conversation_input(sequence: u32) -> NewConversation {
     NewConversation {
         conversation_id: runtime_id(RuntimeIdKind::Conversation, sequence),
         adapter_state_key: runtime_id(RuntimeIdKind::AdapterState, sequence),
-        descriptor: format!("conversation-{sequence}").into_bytes(),
+        descriptor: runtime_descriptor::descriptor(format!("conversation-{sequence}").as_bytes()),
     }
 }
 
@@ -164,7 +166,7 @@ fn load_runtime_key_bundle(
         storage_kek,
         &KeyWrapAad {
             schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
-            schema_version: RUNTIME_SCHEMA_VERSION,
+            schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
             database_id: &database_id,
         },
         &wrapped_key_bundle,
@@ -207,6 +209,51 @@ fn optional_blob_field(value: Option<&[u8]>) -> Vec<u8> {
     encoded
 }
 
+type RawConversationMetadata = (
+    Vec<u8>,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    i64,
+    i64,
+    i64,
+);
+
+type RawRuntimeLedger = (
+    Option<String>,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+);
+
+type RawCommandMetadata = (
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Option<Vec<u8>>,
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+);
+
 fn conversation_metadata_token(
     connection: &Connection,
     key_bundle: &RuntimeKeyBundle,
@@ -221,16 +268,7 @@ fn conversation_metadata_token(
         created_at_ms,
         updated_at_ms,
         accepted_count,
-    ): (
-        Vec<u8>,
-        String,
-        Option<String>,
-        Option<String>,
-        String,
-        i64,
-        i64,
-        i64,
-    ) = connection
+    ): RawConversationMetadata = connection
         .query_row(
             "SELECT adapter_state_key, catalog_revision, command_high_water,
                     event_high_water, lifecycle, created_at_ms, updated_at_ms,
@@ -291,27 +329,18 @@ fn runtime_ledger_token(
         event_count,
         intent_count,
         fence_count,
+        codex_adapter_state_count,
+        claude_code_adapter_state_count,
         accepted_count,
         accepted_payload_bytes,
         started_without_fence_count,
         started_without_release_count,
         started_released_count,
-    ): (
-        Option<String>,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-    ) = connection
+    ): RawRuntimeLedger = connection
         .query_row(
             "SELECT catalog_high_water, conversation_count, command_count, event_count,
-                    intent_count, fence_count, accepted_count, accepted_payload_bytes,
+                    intent_count, fence_count, codex_adapter_state_count,
+                    claude_code_adapter_state_count, accepted_count, accepted_payload_bytes,
                     started_without_fence_count, started_without_release_count,
                     started_released_count
              FROM runtime_meta WHERE singleton = 1",
@@ -329,11 +358,13 @@ fn runtime_ledger_token(
                     row.get(8)?,
                     row.get(9)?,
                     row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
                 ))
             },
         )
         .expect("read Runtime authenticated ledger fixture");
-    let mut message = Vec::with_capacity(117);
+    let mut message = Vec::with_capacity(133);
     message.extend_from_slice(&database_id);
     match catalog_high_water {
         None => message.push(0),
@@ -348,6 +379,8 @@ fn runtime_ledger_token(
         event_count,
         intent_count,
         fence_count,
+        codex_adapter_state_count,
+        claude_code_adapter_state_count,
         accepted_count,
         accepted_payload_bytes,
         started_without_fence_count,
@@ -361,7 +394,7 @@ fn runtime_ledger_token(
         );
     }
     *key_bundle
-        .blind_index(b"runtime.meta.ledger.v1", &message)
+        .blind_index(b"runtime.meta.ledger.v2", &message)
         .expect("authenticate Runtime boundary ledger")
         .as_bytes()
 }
@@ -405,23 +438,7 @@ fn move_accepted_command_to_sequence(
         turn_id,
         started_event_id,
         terminal_event_id,
-    ): (
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Option<Vec<u8>>,
-        String,
-        i64,
-        i64,
-        i64,
-        i64,
-        Option<i64>,
-        Option<i64>,
-        Option<Vec<u8>>,
-        Option<Vec<u8>>,
-        Option<Vec<u8>>,
-    ) = connection
+    ): RawCommandMetadata = connection
         .query_row(
             "SELECT conversation_id, owner_token, idempotency_token, payload_token,
                     terminal_token, state, logical_payload_bytes, accepted_at_ms,

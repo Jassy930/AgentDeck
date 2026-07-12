@@ -20,8 +20,54 @@
 //!      two events (N7).
 
 use agentdeck_protocol::*;
-use agentdeckd::agent::Agent;
+use agentdeckd::agent::{Agent, CanonicalAgentEvent};
 use agentdeckd::codex::adapter::CodexAdapter;
+use agentdeckd::runtime::AgentRouter;
+use agentdeckd::runtime::store::{
+    ConversationDescriptor, NewConversation, RuntimeId, RuntimeIdKind, RuntimeStoreConfig,
+    RuntimeStoreHandle,
+};
+use agentdeckd::security::{MemoryKeyStore, load_or_create_storage_kek};
+
+fn random_runtime_id(kind: RuntimeIdKind) -> RuntimeId {
+    loop {
+        let mut bytes = [0_u8; 16];
+        getrandom::fill(&mut bytes).expect("read OS entropy");
+        if let Ok(id) = RuntimeId::from_bytes(kind, bytes) {
+            return id;
+        }
+    }
+}
+
+fn live_e2e_enabled() -> bool {
+    std::env::var("AGENTDECK_E2E").as_deref() == Ok("1")
+}
+
+struct CanonicalTestRoot(std::path::PathBuf);
+
+impl CanonicalTestRoot {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "agentdeckd-codex-canonical-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&path).expect("create canonical Codex test root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .expect("secure canonical Codex test root");
+        }
+        Self(path)
+    }
+}
+
+impl Drop for CanonicalTestRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 #[test]
 fn codex_adapter_impls_agent_trait() {
@@ -144,16 +190,42 @@ async fn cancel_on_unknown_session_is_idempotent_ok() {
 /// the test asserts the N7 invariant: SessionStarted + SessionCapabilities
 /// are the first two events on the wire, before any AgentItem.
 #[tokio::test]
-async fn real_codex_emits_started_then_capabilities() {
+async fn real_codex_canonical_start_binds_private_state_then_emits_capabilities() {
+    if !live_e2e_enabled() {
+        eprintln!("SKIP real_codex_canonical_start: set AGENTDECK_E2E=1");
+        return;
+    }
     if which::which("codex").is_err() {
         eprintln!("SKIP real_codex_emits_started_then_capabilities: codex binary not in PATH");
         return;
     }
-    let a = CodexAdapter::new_for_test();
+    let root = CanonicalTestRoot::new();
+    let database = root.0.join("runtime.db");
+    let key_store = MemoryKeyStore::new();
+    let storage_kek =
+        load_or_create_storage_kek(&key_store, &database).expect("create canonical test KEK");
+    let store = RuntimeStoreHandle::open(RuntimeStoreConfig::new(database), storage_kek)
+        .await
+        .expect("open canonical Codex store");
+    let adapter_state_key = random_runtime_id(RuntimeIdKind::AdapterState);
+    let cwd = std::env::current_dir().unwrap();
+    store
+        .create_conversation(NewConversation {
+            conversation_id: random_runtime_id(RuntimeIdKind::Conversation),
+            adapter_state_key,
+            descriptor: ConversationDescriptor {
+                agent_kind: AgentKind::Codex,
+                title: Some("canonical Codex smoke".into()),
+                cwd: cwd.clone(),
+            },
+        })
+        .await
+        .expect("create canonical Codex conversation");
+    let router = AgentRouter::with_runtime_store(store.clone());
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let start = SessionStart {
         agent_kind: AgentKind::Codex,
-        cwd: std::env::current_dir().unwrap(),
+        cwd,
         prompt: None,
         vendor_options: VendorSessionOptions::Codex(CodexSessionOptions {
             approval_policy: CodexApprovalPolicy::Never,
@@ -166,33 +238,22 @@ async fn real_codex_emits_started_then_capabilities() {
     };
     let handle = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        a.start_session(start, tx),
+        router.start_adapter_state(adapter_state_key, start, tx),
     )
     .await
-    .expect("start_session timed out")
-    .expect("start_session failed");
+    .expect("canonical start timed out")
+    .expect("canonical start failed");
+    assert_eq!(handle.adapter_state_key, adapter_state_key);
     let e1 = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
         .await
         .expect("recv timeout")
         .expect("channel closed");
-    assert!(matches!(
-        e1,
-        ServerEvent::SessionStarted {
-            agent_kind: AgentKind::Codex,
-            ..
-        }
-    ));
-    let e2 = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
-        .await
-        .expect("recv timeout")
-        .expect("channel closed");
-    assert!(matches!(
-        e2,
-        ServerEvent::SessionCapabilities {
-            agent_kind: AgentKind::Codex,
-            ..
-        }
-    ));
+    assert!(matches!(e1, CanonicalAgentEvent::Capabilities(_)));
     // Clean up: cancel the session so the codex child process dies.
-    a.cancel(&handle.session_id).await.expect("cancel ok");
+    router.cancel(&handle.session_id).await.expect("cancel ok");
+    drop(rx);
+    store
+        .shutdown()
+        .await
+        .expect("shutdown canonical Codex store");
 }

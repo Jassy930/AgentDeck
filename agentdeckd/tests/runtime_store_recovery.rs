@@ -75,7 +75,7 @@ fn conversation_input(seed: u8) -> NewConversation {
     NewConversation {
         conversation_id: runtime_id(RuntimeIdKind::Conversation, seed),
         adapter_state_key: runtime_id(RuntimeIdKind::AdapterState, seed.wrapping_add(0x40)),
-        descriptor: vec![seed; 1024],
+        descriptor: runtime_descriptor::descriptor(format!("recovery-{seed}").as_bytes()),
     }
 }
 
@@ -374,3 +374,5 @@ async fn a_cursor_from_another_scan_is_rejected_without_advancing_the_valid_scan
     first.shutdown().await.expect("shutdown first store");
     second.shutdown().await.expect("shutdown second store");
 }
+#[path = "support/runtime_descriptor.rs"]
+mod runtime_descriptor;

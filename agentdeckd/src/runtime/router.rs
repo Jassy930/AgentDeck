@@ -2,7 +2,10 @@
 //! AgentKind, and holds per-session locks (K2: same sessionId cannot
 //! run concurrent turns; agentKind is immutable per session).
 
-use crate::agent::{AgentEventSender, AgentSessionHandle, DynAgent};
+use crate::agent::{
+    AgentEventSender, AgentSessionHandle, CanonicalAgentEventSender, CanonicalAgentSessionHandle,
+    CanonicalHistoryRead, DynAgent,
+};
 use agentdeck_protocol::{
     ActionDecision, AgentKind, HistoryRequest, HistoryResponse, ProtocolError, SessionCapabilities,
     SessionId, SessionStart, ThreadId, VendorControlPayload, effective_history_list_limit,
@@ -10,6 +13,10 @@ use agentdeck_protocol::{
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+use crate::runtime::store::RuntimeId;
+use crate::runtime::store::RuntimeStoreHandle;
+use crate::{claude_code::ClaudeCodeAdapter, codex::CodexAdapter};
 
 /// Routes by AgentKind; holds per-session ownership to enforce K2.
 pub struct AgentRouter {
@@ -25,6 +32,21 @@ impl AgentRouter {
         }
     }
 
+    /// 构造 canonical Runtime router，并在 `runtime` 边界内把 singleton store
+    /// 分裂为两个不可伪造、固定 namespace 的 vault。具体 adapter 只收到自身
+    /// capability，不能从 `RuntimeStoreHandle` 获取另一私有映射域。
+    #[must_use]
+    pub fn with_runtime_store(store: RuntimeStoreHandle) -> Self {
+        let mut router = Self::new();
+        router.register(Arc::new(CodexAdapter::with_state_vault(
+            store.codex_adapter_state_vault(),
+        )));
+        router.register(Arc::new(ClaudeCodeAdapter::with_state_vault(
+            store.claude_code_adapter_state_vault(),
+        )));
+        router
+    }
+
     pub fn register(&mut self, agent: DynAgent) {
         let kind = agent.kind();
         self.agents.insert(kind, agent);
@@ -38,7 +60,8 @@ impl AgentRouter {
         self.agents.get(&kind).map(|a| a.capabilities())
     }
 
-    pub async fn start_session(
+    /// 旧 IPC v2/stdin compatibility：不持久化 neutral adapterStateKey。
+    pub async fn start_session_stdio_compat(
         &self,
         start: SessionStart,
         events: AgentEventSender,
@@ -59,7 +82,36 @@ impl AgentRouter {
         Ok(handle)
     }
 
-    pub async fn continue_thread(
+    /// Canonical Runtime entry: the caller owns the stable neutral
+    /// adapterStateKey. The adapter persists its vendor resume reference only in
+    /// its typed private namespace before returning success.
+    pub async fn start_adapter_state(
+        &self,
+        adapter_state_key: RuntimeId,
+        start: SessionStart,
+        events: CanonicalAgentEventSender,
+    ) -> Result<CanonicalAgentSessionHandle, ProtocolError> {
+        let agent = self
+            .agents
+            .get(&start.agent_kind)
+            .ok_or_else(|| ProtocolError {
+                code: "agent-not-registered".into(),
+                message: format!("no adapter registered for agentKind={:?}", start.agent_kind),
+                diagnostic_ref: None,
+            })?;
+        let handle = agent
+            .start_adapter_state(adapter_state_key, start, events)
+            .await?;
+        self.sessions
+            .lock()
+            .await
+            .insert(handle.session_id.clone(), handle.agent_kind);
+        Ok(handle)
+    }
+
+    /// 旧 IPC v2/stdin compatibility：raw vendor ThreadId 只允许由
+    /// RuntimeHub 的 legacy command surface 调用，RuntimeCore 禁止使用。
+    pub async fn continue_thread_stdio_compat(
         &self,
         thread_id: ThreadId,
         agent_kind: AgentKind,
@@ -80,6 +132,45 @@ impl AgentRouter {
             .await
             .insert(handle.session_id.clone(), handle.agent_kind);
         Ok(handle)
+    }
+
+    /// Canonical Runtime entry: raw vendor ThreadId never crosses this boundary.
+    pub async fn continue_adapter_state(
+        &self,
+        adapter_state_key: RuntimeId,
+        agent_kind: AgentKind,
+        cwd: std::path::PathBuf,
+        prompt: String,
+        events: CanonicalAgentEventSender,
+    ) -> Result<CanonicalAgentSessionHandle, ProtocolError> {
+        let agent = self.agents.get(&agent_kind).ok_or_else(|| ProtocolError {
+            code: "agent-not-registered".into(),
+            message: format!("no adapter registered for agentKind={agent_kind:?}"),
+            diagnostic_ref: None,
+        })?;
+        let handle = agent
+            .continue_adapter_state(adapter_state_key, cwd, prompt, events)
+            .await?;
+        self.sessions
+            .lock()
+            .await
+            .insert(handle.session_id.clone(), handle.agent_kind);
+        Ok(handle)
+    }
+
+    /// Canonical Runtime history read；raw vendor ThreadId 在具体 adapter 私域
+    /// resolve，router 只接收 neutral adapterStateKey 与中立 turns。
+    pub async fn read_adapter_history(
+        &self,
+        adapter_state_key: RuntimeId,
+        agent_kind: AgentKind,
+    ) -> Result<CanonicalHistoryRead, ProtocolError> {
+        let agent = self.agents.get(&agent_kind).ok_or_else(|| ProtocolError {
+            code: "agent-not-registered".into(),
+            message: format!("no adapter registered for agentKind={agent_kind:?}"),
+            diagnostic_ref: None,
+        })?;
+        agent.read_adapter_history(adapter_state_key).await
     }
 
     pub async fn submit_decision(
@@ -115,7 +206,9 @@ impl AgentRouter {
         Ok(())
     }
 
-    /// Route a `HistoryRequest` to the matching adapter. For `List` with
+    /// 旧 IPC v2/stdin compatibility：route a raw `HistoryRequest` to the
+    /// matching adapter. RuntimeCore canonical history must use adapterStateKey
+    /// and the adapter-private managed-history helpers. For `List` with
     /// `agent_kind = None` we fan out to every registered adapter and
     /// merge the resulting `HistoryListItem`s (newest first by
     /// `last_active_ms`). A single adapter's failure during cross-agent
@@ -124,7 +217,7 @@ impl AgentRouter {
     /// always carry an explicit `agent_kind` and route to one adapter.
     ///
     /// Added by Task 4C — Phase 4 finalization.
-    pub async fn handle_history(
+    pub async fn handle_history_stdio_compat(
         &self,
         request: HistoryRequest,
     ) -> Result<HistoryResponse, ProtocolError> {

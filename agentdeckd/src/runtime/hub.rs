@@ -282,7 +282,10 @@ impl RuntimeHub {
                 let sessions = Arc::clone(&self.sessions);
                 let events_tx = events_tx.clone();
                 tokio::spawn(async move {
-                    match router.start_session(start, events_tx.clone()).await {
+                    match router
+                        .start_session_stdio_compat(start, events_tx.clone())
+                        .await
+                    {
                         Ok(handle) => {
                             sessions
                                 .lock()
@@ -311,7 +314,13 @@ impl RuntimeHub {
                 let events_tx = events_tx.clone();
                 tokio::spawn(async move {
                     match router
-                        .continue_thread(thread_id, agent_kind, cwd, prompt, events_tx.clone())
+                        .continue_thread_stdio_compat(
+                            thread_id,
+                            agent_kind,
+                            cwd,
+                            prompt,
+                            events_tx.clone(),
+                        )
                         .await
                     {
                         Ok(handle) => {
@@ -351,7 +360,7 @@ impl RuntimeHub {
                 let events_tx = events_tx.clone();
                 let admin_tx = admin_tx.clone();
                 tokio::spawn(async move {
-                    match router.handle_history(req).await {
+                    match router.handle_history_stdio_compat(req).await {
                         Ok(response) => {
                             let line = serde_json::json!({
                                 "reply": "history",

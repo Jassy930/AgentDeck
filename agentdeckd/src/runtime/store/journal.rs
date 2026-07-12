@@ -8,25 +8,27 @@ use std::mem::size_of;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use zeroize::Zeroizing;
 
+use crate::runtime::adapter_state::AdapterStateNamespace;
 use crate::runtime::model::{
     AcceptCommand, AcceptOutcome, AuthorizeExecutionRelease, COMMAND_LEDGER_RETENTION_MS,
     COMMAND_QUEUE_TTL_MS, CommandRecord, CommandState, CompleteCommand, CompleteOutcome,
-    ConversationLifecycle, ConversationRecord, ConversationRecoveryRecord, EventRecord,
-    ExecutionFence, ExecutionFenceRecord, ExecutionIntentRecord, IdempotencyOwner,
-    MAX_COMMAND_PAYLOAD_BYTES, MAX_COMMAND_RESULT_BYTES, MAX_CONVERSATION_DESCRIPTOR_BYTES,
-    MAX_EXECUTION_FENCE_BYTES, MAX_EXECUTION_INTENT_BYTES, MAX_EXECUTION_NONCE_BYTES,
-    MAX_IDEMPOTENCY_KEY_BYTES, MAX_RECOVERY_PAGE_RETAINED_BYTES, MAX_RUNTIME_EVENT_BYTES,
-    NewConversation, RecoveryCompletion, RecoveryCursor, RecoveryPage, RuntimeCommitOperation,
-    RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreOperation, StartCommand, StartOutcome,
-    StartedRecoveryRecord, TerminalState,
+    ConversationDescriptor, ConversationLifecycle, ConversationRecord, ConversationRecoveryRecord,
+    EventRecord, ExecutionFence, ExecutionFenceRecord, ExecutionIntentRecord, IdempotencyOwner,
+    MAX_ADAPTER_STATE_REFERENCE_BYTES, MAX_COMMAND_PAYLOAD_BYTES, MAX_COMMAND_RESULT_BYTES,
+    MAX_CONVERSATION_DESCRIPTOR_BYTES, MAX_EXECUTION_FENCE_BYTES, MAX_EXECUTION_INTENT_BYTES,
+    MAX_EXECUTION_NONCE_BYTES, MAX_IDEMPOTENCY_KEY_BYTES, MAX_RECOVERY_PAGE_RETAINED_BYTES,
+    MAX_RUNTIME_EVENT_BYTES, NewConversation, RecoveryCompletion, RecoveryCursor, RecoveryPage,
+    RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreOperation,
+    StartCommand, StartOutcome, StartedRecoveryRecord, TerminalState,
 };
+use crate::security::SecretBytes;
 
 use super::cipher::RowAad;
 use super::identity::{
     MAX_RUNTIME_ID_COLLISION_ATTEMPTS, RuntimeId, RuntimeIdError, RuntimeIdKind,
 };
 use super::queue::{QueueAdmission, evaluate_queue_admission};
-use super::schema::{RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION};
+use super::schema::{RUNTIME_CRYPTO_CONTEXT_VERSION, RUNTIME_SCHEMA_FAMILY};
 use super::sequence::{SequenceScope, decode_sequence, next_sequence};
 use super::sqlite::{
     self, RecoveryScanCounts, RecoveryScanState, RuntimeSqlite, SafetyReserveProjection,
@@ -48,6 +50,364 @@ struct CommandIndexTokens {
     payload_token: Vec<u8>,
     terminal_token: Option<Vec<u8>>,
     metadata_token: Vec<u8>,
+}
+
+struct RawAdapterStateBinding {
+    state_key_token: Vec<u8>,
+    conversation_id: Vec<u8>,
+    state_reference_token: Vec<u8>,
+    sealed_state_reference: Vec<u8>,
+}
+
+pub(super) fn bind_adapter_state(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    namespace: AdapterStateNamespace,
+    adapter_state_key: RuntimeId,
+    state_reference: SecretBytes,
+) -> Result<(), RuntimeStoreError> {
+    ensure_kind(adapter_state_key, RuntimeIdKind::AdapterState)?;
+    if state_reference.expose_secret().is_empty()
+        || state_reference.expose_secret().len() > MAX_ADAPTER_STATE_REFERENCE_BYTES
+    {
+        return Err(RuntimeStoreError::InvalidConfig(
+            "adapter state reference must contain 1 to 4096 bytes",
+        ));
+    }
+
+    let conversation = load_conversation_for_adapter_state(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        adapter_state_key,
+    )?;
+    ensure_adapter_state_namespace(&conversation, namespace)?;
+    if let Some(existing) = load_adapter_state_binding_for_conversation(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        namespace,
+        &conversation,
+    )? {
+        return if existing.expose_secret() == state_reference.expose_secret() {
+            Ok(())
+        } else {
+            Err(RuntimeStoreError::AdapterStateConflict)
+        };
+    }
+    if load_adapter_state_binding_for_conversation(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        namespace.other(),
+        &conversation,
+    )?
+    .is_some()
+    {
+        return Err(RuntimeStoreError::AdapterStateNamespaceMismatch);
+    }
+
+    let projected = projected_write_bytes(&[
+        state_reference.expose_secret().len(),
+        state_reference.expose_secret().len(),
+    ])?;
+    sqlite::admit_ordinary_write(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        &state.storage_path,
+        &mut state.admission_state,
+        config.capacity_probe.as_ref(),
+        projected,
+        SafetyReserveProjection::Current,
+    )?;
+
+    let database_id = state.database_id;
+    let key_bundle = &state.key_bundle;
+    let transaction = state
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let conversation = load_conversation_for_adapter_state(
+        &transaction,
+        key_bundle,
+        database_id,
+        adapter_state_key,
+    )?;
+    ensure_adapter_state_namespace(&conversation, namespace)?;
+    if let Some(existing) = load_adapter_state_binding_for_conversation(
+        &transaction,
+        key_bundle,
+        database_id,
+        namespace,
+        &conversation,
+    )? {
+        return if existing.expose_secret() == state_reference.expose_secret() {
+            Ok(())
+        } else {
+            Err(RuntimeStoreError::AdapterStateConflict)
+        };
+    }
+    if load_adapter_state_binding_for_conversation(
+        &transaction,
+        key_bundle,
+        database_id,
+        namespace.other(),
+        &conversation,
+    )?
+    .is_some()
+    {
+        return Err(RuntimeStoreError::AdapterStateNamespaceMismatch);
+    }
+
+    let state_key_token =
+        key_bundle.blind_index(namespace.key_token_domain(), adapter_state_key.as_bytes())?;
+    let state_reference_token = key_bundle.blind_index(
+        namespace.reference_token_domain(),
+        state_reference.expose_secret(),
+    )?;
+    if adapter_reference_token_exists(&transaction, namespace, state_reference_token.as_bytes())? {
+        return Err(RuntimeStoreError::AdapterStateConflict);
+    }
+    let primary_key = adapter_state_primary_key(
+        state_key_token.as_bytes(),
+        conversation.conversation_id.as_bytes(),
+        state_reference_token.as_bytes(),
+    );
+    let sealed_state_reference = seal(
+        key_bundle,
+        database_id,
+        namespace.table_bytes(),
+        &primary_key,
+        b"sealed_state_reference",
+        state_reference.expose_secret(),
+        MAX_ADAPTER_STATE_REFERENCE_BYTES,
+    )?;
+    let sql = match namespace {
+        AdapterStateNamespace::Codex => {
+            "INSERT INTO codex_adapter_state (
+                 state_key_token, conversation_id, state_reference_token, sealed_state_reference
+             ) VALUES (?1, ?2, ?3, ?4)"
+        }
+        AdapterStateNamespace::ClaudeCode => {
+            "INSERT INTO claude_code_adapter_state (
+                 state_key_token, conversation_id, state_reference_token, sealed_state_reference
+             ) VALUES (?1, ?2, ?3, ?4)"
+        }
+    };
+    transaction.execute(
+        sql,
+        params![
+            &state_key_token.as_bytes()[..],
+            &conversation.conversation_id.as_bytes()[..],
+            &state_reference_token.as_bytes()[..],
+            sealed_state_reference,
+        ],
+    )?;
+    let ledger = sqlite::load_runtime_ledger(&transaction, key_bundle, database_id)?;
+    let mut next_ledger = ledger.clone();
+    match namespace {
+        AdapterStateNamespace::Codex => {
+            next_ledger.codex_adapter_state_count = next_ledger
+                .codex_adapter_state_count
+                .checked_add(1)
+                .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        }
+        AdapterStateNamespace::ClaudeCode => {
+            next_ledger.claude_code_adapter_state_count = next_ledger
+                .claude_code_adapter_state_count
+                .checked_add(1)
+                .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        }
+    }
+    sqlite::update_runtime_ledger(&transaction, key_bundle, database_id, &ledger, &next_ledger)?;
+    config
+        .fault_injector
+        .before_operation(RuntimeStoreOperation::BindAdapterStateBeforeCommit)?;
+    commit_transaction(transaction, RuntimeCommitOperation::BindAdapterState)?;
+    sqlite::latch_post_commit_capacity(state, config);
+    after_commit(
+        config,
+        RuntimeStoreOperation::BindAdapterStateAfterCommit,
+        RuntimeCommitOperation::BindAdapterState,
+    )?;
+    Ok(())
+}
+
+pub(super) fn resolve_adapter_state(
+    state: &RuntimeSqlite,
+    namespace: AdapterStateNamespace,
+    adapter_state_key: RuntimeId,
+) -> Result<Option<SecretBytes>, RuntimeStoreError> {
+    ensure_kind(adapter_state_key, RuntimeIdKind::AdapterState)?;
+    let conversation = load_conversation_for_adapter_state(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        adapter_state_key,
+    )?;
+    ensure_adapter_state_namespace(&conversation, namespace)?;
+    let requested = load_adapter_state_binding_for_conversation(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        namespace,
+        &conversation,
+    )?;
+    let other = load_adapter_state_binding_for_conversation(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        namespace.other(),
+        &conversation,
+    )?;
+    match (requested, other) {
+        (Some(_), Some(_)) => Err(RuntimeStoreError::UnknownOrCorruptSchema),
+        (Some(reference), None) => Ok(Some(reference)),
+        (None, Some(_)) => Err(RuntimeStoreError::AdapterStateNamespaceMismatch),
+        (None, None) => Ok(None),
+    }
+}
+
+fn ensure_adapter_state_namespace(
+    conversation: &ConversationRecord,
+    namespace: AdapterStateNamespace,
+) -> Result<(), RuntimeStoreError> {
+    if conversation.descriptor.agent_kind != namespace.agent_kind() {
+        return Err(RuntimeStoreError::AdapterStateNamespaceMismatch);
+    }
+    Ok(())
+}
+
+fn load_conversation_for_adapter_state(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    adapter_state_key: RuntimeId,
+) -> Result<ConversationRecord, RuntimeStoreError> {
+    let raw: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT conversation_id FROM conversations WHERE adapter_state_key = ?1",
+            [&adapter_state_key.as_bytes()[..]],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let conversation_id = raw
+        .map(|value| runtime_id(RuntimeIdKind::Conversation, value))
+        .transpose()?
+        .ok_or(RuntimeStoreError::ConversationNotFound)?;
+    let conversation = load_conversation(connection, key_bundle, database_id, conversation_id)?;
+    if conversation.adapter_state_key != adapter_state_key {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(conversation)
+}
+
+fn load_adapter_state_binding_for_conversation(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    namespace: AdapterStateNamespace,
+    conversation: &ConversationRecord,
+) -> Result<Option<SecretBytes>, RuntimeStoreError> {
+    let expected_key_token = key_bundle.blind_index(
+        namespace.key_token_domain(),
+        conversation.adapter_state_key.as_bytes(),
+    )?;
+    let sql = match namespace {
+        AdapterStateNamespace::Codex => {
+            "SELECT state_key_token, conversation_id, state_reference_token,
+                    sealed_state_reference
+             FROM codex_adapter_state
+             WHERE state_key_token = ?1 OR conversation_id = ?2"
+        }
+        AdapterStateNamespace::ClaudeCode => {
+            "SELECT state_key_token, conversation_id, state_reference_token,
+                    sealed_state_reference
+             FROM claude_code_adapter_state
+             WHERE state_key_token = ?1 OR conversation_id = ?2"
+        }
+    };
+    let raw: Option<RawAdapterStateBinding> = connection
+        .query_row(
+            sql,
+            params![
+                &expected_key_token.as_bytes()[..],
+                &conversation.conversation_id.as_bytes()[..],
+            ],
+            |row| {
+                Ok(RawAdapterStateBinding {
+                    state_key_token: row.get(0)?,
+                    conversation_id: row.get(1)?,
+                    state_reference_token: row.get(2)?,
+                    sealed_state_reference: row.get(3)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if raw.state_key_token.as_slice() != expected_key_token.as_bytes()
+        || raw.conversation_id.as_slice() != conversation.conversation_id.as_bytes()
+        || raw.state_reference_token.len() != 32
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let primary_key = adapter_state_primary_key(
+        expected_key_token.as_bytes(),
+        conversation.conversation_id.as_bytes(),
+        &raw.state_reference_token,
+    );
+    let reference = open(
+        key_bundle,
+        database_id,
+        namespace.table_bytes(),
+        &primary_key,
+        b"sealed_state_reference",
+        &raw.sealed_state_reference,
+        MAX_ADAPTER_STATE_REFERENCE_BYTES,
+    )?;
+    if reference.expose_secret().is_empty() {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let expected_reference_token = key_bundle.blind_index(
+        namespace.reference_token_domain(),
+        reference.expose_secret(),
+    )?;
+    if raw.state_reference_token.as_slice() != expected_reference_token.as_bytes() {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(Some(reference))
+}
+
+fn adapter_reference_token_exists(
+    connection: &Connection,
+    namespace: AdapterStateNamespace,
+    token: &[u8; 32],
+) -> Result<bool, RuntimeStoreError> {
+    let sql = match namespace {
+        AdapterStateNamespace::Codex => {
+            "SELECT EXISTS(SELECT 1 FROM codex_adapter_state WHERE state_reference_token = ?1)"
+        }
+        AdapterStateNamespace::ClaudeCode => {
+            "SELECT EXISTS(SELECT 1 FROM claude_code_adapter_state WHERE state_reference_token = ?1)"
+        }
+    };
+    let exists: i64 = connection.query_row(sql, [&token[..]], |row| row.get(0))?;
+    Ok(exists != 0)
+}
+
+fn adapter_state_primary_key(
+    state_key_token: &[u8; 32],
+    conversation_id: &[u8; 16],
+    state_reference_token: &[u8],
+) -> Vec<u8> {
+    let mut primary_key = Vec::with_capacity(84);
+    primary_key.extend_from_slice(b"ADS1");
+    primary_key.extend_from_slice(state_key_token);
+    primary_key.extend_from_slice(conversation_id);
+    primary_key.extend_from_slice(state_reference_token);
+    primary_key
 }
 
 struct RawCommandMetadata {
@@ -93,10 +453,11 @@ pub(crate) fn create_conversation(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
     input: NewConversation,
+    descriptor_bytes: Zeroizing<Vec<u8>>,
 ) -> Result<ConversationRecord, RuntimeStoreError> {
     ensure_kind(input.conversation_id, RuntimeIdKind::Conversation)?;
     ensure_kind(input.adapter_state_key, RuntimeIdKind::AdapterState)?;
-    validate_payload_len(input.descriptor.len(), MAX_CONVERSATION_DESCRIPTOR_BYTES)?;
+    validate_payload_len(descriptor_bytes.len(), MAX_CONVERSATION_DESCRIPTOR_BYTES)?;
     if let Some(existing) = load_optional_conversation(
         &state.connection,
         &state.key_bundle,
@@ -132,7 +493,7 @@ pub(crate) fn create_conversation(
         });
     }
     let created_at = sqlite_time(created_at_ms)?;
-    let projected_write_bytes = projected_write_bytes(&[input.descriptor.len()])?;
+    let projected_write_bytes = projected_write_bytes(&[descriptor_bytes.len()])?;
     sqlite::admit_ordinary_write(
         &state.connection,
         &state.key_bundle,
@@ -194,7 +555,7 @@ pub(crate) fn create_conversation(
         b"conversations",
         input.conversation_id.as_bytes(),
         b"sealed_descriptor",
-        &input.descriptor,
+        descriptor_bytes.as_ref(),
         MAX_CONVERSATION_DESCRIPTOR_BYTES,
     )?;
     transaction.execute(
@@ -1971,7 +2332,13 @@ fn recovery_page_retained_bytes(page: &RecoveryPage) -> Result<u64, RuntimeStore
         Ok(())
     };
     add(size_of::<ConversationRecoveryRecord>())?;
-    add(record.conversation.descriptor.capacity())?;
+    add(record
+        .conversation
+        .descriptor
+        .title
+        .as_ref()
+        .map_or(0, String::capacity))?;
+    add(record.conversation.descriptor.cwd.capacity())?;
     add(record
         .accepted
         .capacity()
@@ -2090,7 +2457,7 @@ fn load_conversation(
         lifecycle: parse_lifecycle(&raw.4)?,
         created_at_ms: runtime_time(raw.5)?,
         updated_at_ms: runtime_time(raw.6)?,
-        descriptor: descriptor.expose_secret().to_vec(),
+        descriptor: parse_canonical_conversation_descriptor(descriptor.expose_secret())?,
     };
     let expected = conversation_metadata_token(
         key_bundle,
@@ -2648,7 +3015,7 @@ fn seal(
     Ok(key_bundle.row_cipher().seal_bounded(
         &RowAad {
             schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
-            schema_version: RUNTIME_SCHEMA_VERSION,
+            schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
             database_id: &database_id,
             table,
             primary_key,
@@ -2671,7 +3038,7 @@ fn open(
     Ok(key_bundle.row_cipher().open_bounded(
         &RowAad {
             schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
-            schema_version: RUNTIME_SCHEMA_VERSION,
+            schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
             database_id: &database_id,
             table,
             primary_key,
@@ -2691,6 +3058,34 @@ fn encode_fields(magic: &[u8; 4], fields: &[&[u8]]) -> Result<Vec<u8>, RuntimeSt
         encoded.extend_from_slice(field);
     }
     Ok(encoded)
+}
+
+pub(crate) fn canonical_conversation_descriptor(
+    descriptor: &ConversationDescriptor,
+) -> Result<Zeroizing<Vec<u8>>, RuntimeStoreError> {
+    let encoded = serde_json::to_vec(descriptor).map_err(|_| {
+        RuntimeStoreError::InvalidConfig(
+            "conversation descriptor must serialize as canonical neutral JSON",
+        )
+    })?;
+    validate_payload_len(encoded.len(), MAX_CONVERSATION_DESCRIPTOR_BYTES)?;
+    Ok(Zeroizing::new(encoded))
+}
+
+fn parse_canonical_conversation_descriptor(
+    encoded: &[u8],
+) -> Result<ConversationDescriptor, RuntimeStoreError> {
+    validate_payload_len(encoded.len(), MAX_CONVERSATION_DESCRIPTOR_BYTES)
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let descriptor: ConversationDescriptor =
+        serde_json::from_slice(encoded).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let canonical = Zeroizing::new(
+        serde_json::to_vec(&descriptor).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+    );
+    if canonical.as_slice() != encoded {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(descriptor)
 }
 
 fn canonical_fields(fields: &[&[u8]]) -> Result<Vec<u8>, RuntimeStoreError> {
@@ -3013,7 +3408,7 @@ fn validate_conversation_catalog(
             return Err(RuntimeStoreError::UnknownOrCorruptSchema);
         }
         if full_integrity {
-            let _descriptor = open(
+            let descriptor = open(
                 key_bundle,
                 database_id,
                 b"conversations",
@@ -3024,6 +3419,7 @@ fn validate_conversation_catalog(
                     .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?,
                 MAX_CONVERSATION_DESCRIPTOR_BYTES,
             )?;
+            parse_canonical_conversation_descriptor(descriptor.expose_secret())?;
             let actual_command_high_water: Option<String> = connection.query_row(
                 "SELECT MAX(command_seq) FROM commands WHERE conversation_id = ?1",
                 [&conversation_id.as_bytes()[..]],
@@ -3264,6 +3660,25 @@ pub(crate) fn validate_store_integrity(
     database_id: [u8; 16],
 ) -> Result<(), RuntimeStoreError> {
     let ledger = sqlite::load_runtime_ledger(connection, key_bundle, database_id)?;
+    validate_store_integrity_against_ledger(connection, key_bundle, database_id, &ledger, true)
+}
+
+pub(crate) fn validate_store_integrity_v1(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    ledger: &sqlite::RuntimeLedger,
+) -> Result<(), RuntimeStoreError> {
+    validate_store_integrity_against_ledger(connection, key_bundle, database_id, ledger, false)
+}
+
+fn validate_store_integrity_against_ledger(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    ledger: &sqlite::RuntimeLedger,
+    validate_adapter_state: bool,
+) -> Result<(), RuntimeStoreError> {
     let catalog = validate_conversation_catalog(connection, key_bundle, database_id, None, true)?;
     let commands = validate_all_command_metadata(connection, key_bundle, database_id)?;
     validate_all_event_metadata(connection, key_bundle)?;
@@ -3372,6 +3787,73 @@ pub(crate) fn validate_store_integrity(
         || ledger.started_without_fence_count != started_without_fence_count
         || ledger.started_without_release_count != started_without_release_count
         || ledger.started_released_count != started_released_count
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    if validate_adapter_state {
+        validate_adapter_state_integrity(connection, key_bundle, database_id, ledger)?;
+    } else if ledger.codex_adapter_state_count != 0 || ledger.claude_code_adapter_state_count != 0 {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(())
+}
+
+fn validate_adapter_state_integrity(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    ledger: &sqlite::RuntimeLedger,
+) -> Result<(), RuntimeStoreError> {
+    let mut counts = [0_u64; 2];
+    for (index, namespace) in [
+        AdapterStateNamespace::Codex,
+        AdapterStateNamespace::ClaudeCode,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let sql = match namespace {
+            AdapterStateNamespace::Codex => {
+                "SELECT conversation_id FROM codex_adapter_state ORDER BY conversation_id"
+            }
+            AdapterStateNamespace::ClaudeCode => {
+                "SELECT conversation_id FROM claude_code_adapter_state ORDER BY conversation_id"
+            }
+        };
+        let mut statement = connection.prepare(sql)?;
+        let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        for row in rows {
+            let conversation_id = runtime_id(RuntimeIdKind::Conversation, row?)?;
+            let conversation =
+                load_conversation(connection, key_bundle, database_id, conversation_id)?;
+            if conversation.descriptor.agent_kind != namespace.agent_kind() {
+                return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+            }
+            load_adapter_state_binding_for_conversation(
+                connection,
+                key_bundle,
+                database_id,
+                namespace,
+                &conversation,
+            )?
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+            counts[index] = counts[index]
+                .checked_add(1)
+                .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        }
+    }
+    let cross_namespace_rows: i64 = connection.query_row(
+        "SELECT COUNT(*)
+         FROM codex_adapter_state AS codex
+         JOIN claude_code_adapter_state AS claude
+           ON codex.conversation_id = claude.conversation_id
+           OR codex.state_key_token = claude.state_key_token",
+        [],
+        |row| row.get(0),
+    )?;
+    if cross_namespace_rows != 0
+        || counts[0] != ledger.codex_adapter_state_count
+        || counts[1] != ledger.claude_code_adapter_state_count
     {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }

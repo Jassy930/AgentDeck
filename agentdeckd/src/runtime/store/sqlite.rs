@@ -25,8 +25,9 @@ use super::admission::{
 };
 use super::cipher::{KeyWrapAad, RuntimeKeyBundle, WRAPPED_KEY_BUNDLE_V1_LEN};
 use super::schema::{
-    EXPECTED_TABLES, RUNTIME_DDL, RUNTIME_KEY_GENERATION, RUNTIME_SCHEMA_FAMILY,
-    RUNTIME_SCHEMA_VERSION, schema_signature,
+    EXPECTED_TABLES, EXPECTED_TABLES_V1, RUNTIME_CRYPTO_CONTEXT_VERSION, RUNTIME_DDL_V1,
+    RUNTIME_KEY_GENERATION, RUNTIME_MIGRATION_V2, RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION,
+    schema_signature, schema_signature_v1,
 };
 
 const DATABASE_MODE: u32 = 0o600;
@@ -49,6 +50,730 @@ pub(crate) enum SafetyReserveProjection {
     Current,
     AcceptCommand,
     StartCommand,
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    use rusqlite::{Connection, params};
+
+    use super::*;
+    use crate::runtime::model::{
+        AcceptCommand, AcceptOutcome, ConversationDescriptor, ExecutionFence, IdempotencyOwner,
+        MachineEnrollmentReceiptRecord, NewConversation, RuntimeCapacityObservation,
+        RuntimeCapacityProbe, RuntimeCapacityProbeError, RuntimeStoreFaultInjector, StartCommand,
+    };
+    use crate::runtime::store::cipher::RowAad;
+    use crate::runtime::store::identity::{RuntimeId, RuntimeIdKind};
+    use crate::runtime::store::worker::RuntimeStoreHandle;
+    use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new(name: &str) -> Self {
+            let sequence = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "agentdeckd-runtime-v1-migration-{name}-{}-{sequence}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir(&path).expect("create migration test root");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                    .expect("secure migration test root");
+            }
+            Self(path)
+        }
+
+        fn source(&self) -> PathBuf {
+            self.0.join("source-v2.db")
+        }
+
+        fn database(&self) -> PathBuf {
+            self.0.join("runtime.db")
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn runtime_id(kind: RuntimeIdKind, byte: u8) -> RuntimeId {
+        RuntimeId::from_bytes(kind, [byte; 16]).expect("valid stable RuntimeId")
+    }
+
+    fn conversation(seed: u8, descriptor: &[u8]) -> NewConversation {
+        NewConversation {
+            conversation_id: runtime_id(RuntimeIdKind::Conversation, seed),
+            adapter_state_key: runtime_id(RuntimeIdKind::AdapterState, seed.wrapping_add(0x20)),
+            descriptor: ConversationDescriptor {
+                agent_kind: agentdeck_protocol::AgentKind::Codex,
+                title: Some(
+                    String::from_utf8(descriptor.to_vec()).expect("migration descriptor UTF-8"),
+                ),
+                cwd: PathBuf::from("/tmp/agentdeck-runtime-migration"),
+            },
+        }
+    }
+
+    fn owner(seed: u8) -> IdempotencyOwner {
+        IdempotencyOwner::Local {
+            machine_trust_domain: [0x71; 32],
+            uid: 501,
+            client_installation_id: [seed; 16],
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct CipherEvidence {
+        wrapped_key_bundle: Vec<u8>,
+        descriptors: Vec<Vec<u8>>,
+        commands: Vec<Vec<u8>>,
+        intents: Vec<Vec<u8>>,
+        fences: Vec<Vec<u8>>,
+        events: Vec<Vec<u8>>,
+    }
+
+    fn collect_blobs(connection: &Connection, sql: &str) -> Vec<Vec<u8>> {
+        connection
+            .prepare(sql)
+            .expect("prepare ciphertext evidence query")
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .expect("query ciphertext evidence")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect ciphertext evidence")
+    }
+
+    fn cipher_evidence(path: &Path) -> CipherEvidence {
+        let connection = Connection::open(path).expect("open ciphertext evidence database");
+        CipherEvidence {
+            wrapped_key_bundle: connection
+                .query_row(
+                    "SELECT wrapped_key_bundle FROM runtime_meta WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read wrapped key evidence"),
+            descriptors: collect_blobs(
+                &connection,
+                "SELECT sealed_descriptor FROM conversations ORDER BY conversation_id",
+            ),
+            commands: collect_blobs(
+                &connection,
+                "SELECT sealed_command FROM commands ORDER BY conversation_id, command_seq",
+            ),
+            intents: collect_blobs(
+                &connection,
+                "SELECT sealed_intent FROM execution_intents ORDER BY command_id",
+            ),
+            fences: collect_blobs(
+                &connection,
+                "SELECT sealed_fence FROM execution_fences ORDER BY command_id",
+            ),
+            events: collect_blobs(
+                &connection,
+                "SELECT sealed_event FROM event_journal ORDER BY conversation_id, event_seq",
+            ),
+        }
+    }
+
+    fn artifact_evidence(database: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        [
+            database.to_path_buf(),
+            PathBuf::from(format!("{}-wal", database.display())),
+            PathBuf::from(format!("{}-shm", database.display())),
+            PathBuf::from(format!("{}-journal", database.display())),
+        ]
+        .into_iter()
+        .map(|path| {
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("read {}: {error}", path.display()),
+            };
+            (path, bytes)
+        })
+        .collect()
+    }
+
+    fn replace_first_descriptor_with_authenticated_bytes(
+        root: &TestRoot,
+        keys: &MemoryKeyStore,
+        plaintext: &[u8],
+    ) {
+        let connection = Connection::open(root.database()).expect("open v1 descriptor fixture");
+        let meta = read_meta_v1(&connection)
+            .expect("read v1 descriptor meta")
+            .expect("v1 descriptor meta exists");
+        let storage_kek =
+            load_or_create_storage_kek(keys, &root.database()).expect("reload descriptor KEK");
+        let key_bundle = RuntimeKeyBundle::unwrap(
+            &storage_kek,
+            &KeyWrapAad {
+                schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
+                schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
+                database_id: &meta.database_id,
+            },
+            &meta.wrapped_key_bundle,
+        )
+        .expect("unwrap descriptor row keys");
+        let conversation_id: Vec<u8> = connection
+            .query_row(
+                "SELECT conversation_id FROM conversations ORDER BY conversation_id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read descriptor conversation id");
+        let sealed = key_bundle
+            .row_cipher()
+            .seal_bounded(
+                &RowAad {
+                    schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
+                    schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
+                    database_id: &meta.database_id,
+                    table: b"conversations",
+                    primary_key: &conversation_id,
+                    column: b"sealed_descriptor",
+                },
+                plaintext,
+                crate::runtime::model::MAX_CONVERSATION_DESCRIPTOR_BYTES,
+            )
+            .expect("seal authenticated malformed descriptor");
+        connection
+            .execute(
+                "UPDATE conversations SET sealed_descriptor = ?1 WHERE conversation_id = ?2",
+                params![sealed, conversation_id],
+            )
+            .expect("replace descriptor with authenticated malformed plaintext");
+    }
+
+    async fn build_strict_v1_fixture(root: &TestRoot, keys: &MemoryKeyStore) -> CipherEvidence {
+        let source = root.source();
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(source.clone()),
+            load_or_create_storage_kek(keys, &source).expect("create migration test KEK"),
+        )
+        .await
+        .expect("open source v2 journal");
+        let accepted_conversation = store
+            .create_conversation(conversation(0x11, b"legacy accepted descriptor"))
+            .await
+            .expect("create accepted legacy conversation");
+        let started_conversation = store
+            .create_conversation(conversation(0x12, b"legacy started descriptor"))
+            .await
+            .expect("create started legacy conversation");
+        store
+            .accept_command(AcceptCommand {
+                conversation_id: accepted_conversation.conversation_id,
+                owner: owner(1),
+                idempotency_key: "legacy-accepted".to_owned(),
+                payload: b"legacy accepted payload".to_vec(),
+            })
+            .await
+            .expect("persist legacy Accepted command");
+        let started_command = match store
+            .accept_command(AcceptCommand {
+                conversation_id: started_conversation.conversation_id,
+                owner: owner(2),
+                idempotency_key: "legacy-started".to_owned(),
+                payload: b"legacy started payload".to_vec(),
+            })
+            .await
+            .expect("accept command to start")
+        {
+            AcceptOutcome::Accepted { command, .. } => command,
+            AcceptOutcome::Replayed { .. } => panic!("fresh legacy command cannot replay"),
+        };
+        let daemon_boot_id = runtime_id(RuntimeIdKind::DaemonBoot, 0x41);
+        let execution_nonce = b"legacy-execution-nonce".to_vec();
+        store
+            .mark_started_with_event(StartCommand {
+                conversation_id: started_conversation.conversation_id,
+                command_id: started_command.command_id,
+                daemon_boot_id,
+                execution_nonce: execution_nonce.clone(),
+                intent_payload: b"legacy intent payload".to_vec(),
+                event_payload: b"legacy started event".to_vec(),
+            })
+            .await
+            .expect("persist legacy intent and event");
+        store
+            .persist_execution_fence(ExecutionFence {
+                command_id: started_command.command_id,
+                daemon_boot_id,
+                execution_nonce,
+                process_group_id: 71,
+                leader_pid: 72,
+                leader_start_time: 73,
+                payload: b"legacy fence payload".to_vec(),
+            })
+            .await
+            .expect("persist legacy fence");
+        store
+            .record_machine_enrollment_receipt(MachineEnrollmentReceiptRecord {
+                relay_server_id: [0x81; 16],
+                machine_route: [0x82; 16],
+                root_fingerprint: [0x83; 32],
+            })
+            .await
+            .expect("persist legacy rescue receipt");
+        store.shutdown().await.expect("shutdown source journal");
+
+        let source_connection = Connection::open(&source).expect("open source journal");
+        let meta = read_meta(&source_connection)
+            .expect("read source meta")
+            .expect("source meta exists");
+        let storage_kek = load_or_create_storage_kek(keys, &source).expect("reload migration KEK");
+        let key_bundle = RuntimeKeyBundle::unwrap(
+            &storage_kek,
+            &KeyWrapAad {
+                schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
+                schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
+                database_id: &meta.database_id,
+            },
+            &meta.wrapped_key_bundle,
+        )
+        .expect("unwrap source Runtime keys");
+        let legacy_token = runtime_ledger_token_v1(&key_bundle, meta.database_id, &meta.ledger)
+            .expect("authenticate frozen v1 ledger");
+
+        let destination = root.database();
+        let legacy = Connection::open(&destination).expect("create strict v1 fixture");
+        legacy
+            .execute_batch(RUNTIME_DDL_V1)
+            .expect("create exact v1 schema");
+        legacy
+            .execute(
+                "INSERT INTO runtime_meta (
+                     singleton, schema_family, schema_version, schema_signature, database_id,
+                     key_generation, wrapped_key_bundle, catalog_high_water,
+                     conversation_count, command_count, event_count, intent_count, fence_count,
+                     accepted_count, accepted_payload_bytes, started_without_fence_count,
+                     started_without_release_count, started_released_count, metadata_token
+                 ) VALUES (1, ?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                           ?12, ?13, ?14, ?15, ?16, ?17)",
+                params![
+                    RUNTIME_SCHEMA_FAMILY,
+                    &schema_signature_v1()[..],
+                    &meta.database_id[..],
+                    i64::from(meta.key_generation),
+                    &meta.wrapped_key_bundle,
+                    meta.ledger.catalog_high_water.as_deref(),
+                    i64::try_from(meta.ledger.conversation_count).unwrap(),
+                    i64::try_from(meta.ledger.command_count).unwrap(),
+                    i64::try_from(meta.ledger.event_count).unwrap(),
+                    i64::try_from(meta.ledger.intent_count).unwrap(),
+                    i64::try_from(meta.ledger.fence_count).unwrap(),
+                    i64::try_from(meta.ledger.accepted_count).unwrap(),
+                    i64::try_from(meta.ledger.accepted_payload_bytes).unwrap(),
+                    i64::try_from(meta.ledger.started_without_fence_count).unwrap(),
+                    i64::try_from(meta.ledger.started_without_release_count).unwrap(),
+                    i64::try_from(meta.ledger.started_released_count).unwrap(),
+                    &legacy_token[..],
+                ],
+            )
+            .expect("insert authenticated v1 meta");
+        let source_path = source.to_string_lossy();
+        legacy
+            .execute("ATTACH DATABASE ?1 AS source", [source_path.as_ref()])
+            .expect("attach source journal");
+        for table in [
+            "conversations",
+            "commands",
+            "execution_intents",
+            "execution_fences",
+            "event_journal",
+            "machine_enrollment_receipts",
+        ] {
+            legacy
+                .execute_batch(&format!(
+                    "INSERT INTO main.{table} SELECT * FROM source.{table};"
+                ))
+                .unwrap_or_else(|error| panic!("copy {table} into v1 fixture: {error}"));
+        }
+        legacy
+            .execute_batch("DETACH DATABASE source")
+            .expect("detach source journal");
+        drop(legacy);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o600))
+                .expect("secure v1 fixture");
+        }
+        cipher_evidence(&destination)
+    }
+
+    #[tokio::test]
+    async fn strict_v1_migrates_without_rewrapping_or_reencrypting_existing_rows() {
+        let root = TestRoot::new("full");
+        let keys = MemoryKeyStore::new();
+        let before = build_strict_v1_fixture(&root, &keys).await;
+        assert_eq!(before.descriptors.len(), 2);
+        assert_eq!(before.commands.len(), 2);
+        assert_eq!(before.intents.len(), 1);
+        assert_eq!(before.fences.len(), 1);
+        assert_eq!(before.events.len(), 1);
+        assert_eq!(
+            read_rescue_index(&root.database()).expect("read v1 rescue locator without KEK"),
+            vec![MachineEnrollmentReceiptRecord {
+                relay_server_id: [0x81; 16],
+                machine_route: [0x82; 16],
+                root_fingerprint: [0x83; 32],
+            }]
+        );
+
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload v1 KEK"),
+        )
+        .await
+        .expect("migrate strict v1 fixture");
+        let migrated_snapshot = store.inspect().await.expect("inspect migrated schema");
+        assert_eq!(migrated_snapshot.schema_version, RUNTIME_SCHEMA_VERSION);
+        assert_eq!(migrated_snapshot.journal_mode.to_ascii_lowercase(), "wal");
+        let mut cursor = store
+            .begin_recovery_scan()
+            .await
+            .expect("begin migrated recovery");
+        let mut accepted_seen = false;
+        let mut started_seen = false;
+        let completion = loop {
+            let page = store
+                .load_recovery_page(cursor.clone())
+                .await
+                .expect("load migrated recovery page");
+            if let Some(record) = page.conversation {
+                accepted_seen |= record
+                    .accepted
+                    .iter()
+                    .any(|command| command.payload == b"legacy accepted payload");
+                if let Some(started) = record.started {
+                    started_seen = started.command.payload == b"legacy started payload"
+                        && started.intent.payload == b"legacy intent payload"
+                        && started.event.payload == b"legacy started event"
+                        && started
+                            .fence
+                            .is_some_and(|fence| fence.payload == b"legacy fence payload");
+                }
+            }
+            match (page.next_cursor, page.completion) {
+                (Some(next), None) => cursor = next,
+                (None, Some(completion)) => break completion,
+                _ => panic!("recovery page cursor contract"),
+            }
+        };
+        assert!(accepted_seen);
+        assert!(started_seen);
+        store
+            .finish_recovery_scan(completion)
+            .await
+            .expect("finish migrated recovery");
+        store.shutdown().await.expect("shutdown migrated store");
+        let artifacts = artifact_evidence(&root.database());
+        assert!(
+            artifacts[1].1.is_some(),
+            "successful migration must leave the persistent WAL artifact"
+        );
+        assert!(
+            artifacts[3].1.is_none(),
+            "successful migration must not leave a rollback journal"
+        );
+        let after = cipher_evidence(&root.database());
+        assert_eq!(
+            after, before,
+            "migration must not rewrite key bundle or rows"
+        );
+    }
+
+    struct FailMigrationAfterCommit {
+        failed: AtomicBool,
+    }
+
+    struct FailMigrationBeforeCommit {
+        failed: AtomicBool,
+    }
+
+    struct MigrationLowDisk;
+
+    impl RuntimeCapacityProbe for MigrationLowDisk {
+        fn observe(
+            &self,
+            _database_path: &Path,
+        ) -> Result<RuntimeCapacityObservation, RuntimeCapacityProbeError> {
+            Ok(RuntimeCapacityObservation {
+                main_bytes: 1024 * 1024,
+                wal_bytes: 0,
+                shm_bytes: 0,
+                filesystem_total_bytes: 4 * 1024 * 1024 * 1024,
+                filesystem_available_bytes: 1,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_capacity_rejection_leaves_the_exact_v1_database_untouched() {
+        let root = TestRoot::new("capacity");
+        let keys = MemoryKeyStore::new();
+        let cipher_before = build_strict_v1_fixture(&root, &keys).await;
+        let artifacts_before = artifact_evidence(&root.database());
+        let error = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationLowDisk),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload v1 KEK"),
+        )
+        .await
+        .expect_err("migration must pass capacity admission before DDL");
+        assert!(matches!(error, RuntimeStoreError::DiskLow { .. }));
+        assert_eq!(
+            artifact_evidence(&root.database()),
+            artifacts_before,
+            "capacity rejection must not rewrite main or create/change WAL/SHM"
+        );
+        let legacy = Connection::open(root.database()).expect("inspect capacity-rejected v1");
+        assert_eq!(
+            table_names(&legacy).expect("read capacity-rejected manifest"),
+            EXPECTED_TABLES_V1
+        );
+        drop(legacy);
+        assert_eq!(cipher_evidence(&root.database()), cipher_before);
+    }
+
+    impl RuntimeStoreFaultInjector for FailMigrationBeforeCommit {
+        fn before_operation(
+            &self,
+            operation: RuntimeStoreOperation,
+        ) -> Result<(), RuntimeStoreError> {
+            if operation == RuntimeStoreOperation::MigrateSchemaBeforeCommit
+                && !self.failed.swap(true, Ordering::SeqCst)
+            {
+                return Err(RuntimeStoreError::WorkerStopped);
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_before_commit_fault_rolls_back_to_exact_v1_then_retries_cleanly() {
+        let root = TestRoot::new("before-commit");
+        let keys = MemoryKeyStore::new();
+        let before = build_strict_v1_fixture(&root, &keys).await;
+        let artifacts_before = artifact_evidence(&root.database());
+        let error = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_fault_injector(Arc::new(
+                FailMigrationBeforeCommit {
+                    failed: AtomicBool::new(false),
+                },
+            )),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload v1 KEK"),
+        )
+        .await
+        .expect_err("before-commit hook must abort migration");
+        assert!(matches!(error, RuntimeStoreError::WorkerStopped));
+        assert_eq!(
+            artifact_evidence(&root.database()),
+            artifacts_before,
+            "before-COMMIT rollback must restore main/WAL/SHM/journal exactly"
+        );
+        let legacy = Connection::open(root.database()).expect("inspect rolled back v1");
+        let version: i64 = legacy
+            .query_row(
+                "SELECT schema_version FROM runtime_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read rolled back schema version");
+        assert_eq!(version, 1);
+        assert_eq!(
+            table_names(&legacy).expect("read rolled back table manifest"),
+            EXPECTED_TABLES_V1
+        );
+        drop(legacy);
+        assert_eq!(cipher_evidence(&root.database()), before);
+
+        let reopened = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()),
+            load_or_create_storage_kek(&keys, &root.database()).expect("retry migration KEK"),
+        )
+        .await
+        .expect("retry rolled back migration");
+        assert_eq!(
+            reopened
+                .inspect()
+                .await
+                .expect("inspect retried migration")
+                .schema_version,
+            RUNTIME_SCHEMA_VERSION
+        );
+        reopened
+            .shutdown()
+            .await
+            .expect("shutdown retried migration");
+        assert_eq!(cipher_evidence(&root.database()), before);
+    }
+
+    #[tokio::test]
+    async fn corrupt_v1_payload_is_rejected_before_any_schema_migration_write() {
+        let root = TestRoot::new("corrupt");
+        let keys = MemoryKeyStore::new();
+        build_strict_v1_fixture(&root, &keys).await;
+        let connection = Connection::open(root.database()).expect("open v1 tamper fixture");
+        connection
+            .execute(
+                "UPDATE conversations
+                 SET sealed_descriptor = zeroblob(length(sealed_descriptor))
+                 WHERE conversation_id = (SELECT MIN(conversation_id) FROM conversations)",
+                [],
+            )
+            .expect("tamper v1 descriptor");
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint v1 tamper");
+        drop(connection);
+        let tampered = cipher_evidence(&root.database());
+        let artifacts_before = artifact_evidence(&root.database());
+        RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload v1 KEK"),
+        )
+        .await
+        .expect_err("corrupt v1 row must fail before migration");
+        assert_eq!(
+            artifact_evidence(&root.database()),
+            artifacts_before,
+            "integrity rejection must not rewrite main or create/change WAL/SHM"
+        );
+        let legacy = Connection::open(root.database()).expect("inspect rejected corrupt v1");
+        assert_eq!(
+            table_names(&legacy).expect("read rejected corrupt manifest"),
+            EXPECTED_TABLES_V1
+        );
+        drop(legacy);
+        assert_eq!(cipher_evidence(&root.database()), tampered);
+    }
+
+    #[tokio::test]
+    async fn authenticated_v1_descriptor_with_vendor_identity_is_rejected_before_migration() {
+        let root = TestRoot::new("descriptor-shape");
+        let keys = MemoryKeyStore::new();
+        build_strict_v1_fixture(&root, &keys).await;
+        replace_first_descriptor_with_authenticated_bytes(
+            &root,
+            &keys,
+            br#"{"agentKind":"codex","title":"legacy","cwd":"/tmp","threadId":"private"}"#,
+        );
+        let before = artifact_evidence(&root.database());
+
+        RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload v1 KEK"),
+        )
+        .await
+        .expect_err("vendor identity in authenticated descriptor must fail before migration");
+
+        assert_eq!(artifact_evidence(&root.database()), before);
+        let legacy = Connection::open(root.database()).expect("inspect rejected v1 descriptor");
+        assert_eq!(
+            table_names(&legacy).expect("read rejected descriptor manifest"),
+            EXPECTED_TABLES_V1
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_kek_rejects_strict_v1_before_rw_open_or_migration() {
+        let root = TestRoot::new("wrong-kek");
+        let keys = MemoryKeyStore::new();
+        build_strict_v1_fixture(&root, &keys).await;
+        let before = artifact_evidence(&root.database());
+        let wrong_keys = MemoryKeyStore::new();
+        let wrong_namespace = root.0.join("wrong-key-namespace.db");
+        let wrong_kek = load_or_create_storage_kek(&wrong_keys, &wrong_namespace)
+            .expect("create independent wrong KEK");
+        RuntimeStoreHandle::open(RuntimeStoreConfig::new(root.database()), wrong_kek)
+            .await
+            .expect_err("wrong KEK must reject strict v1 before migration");
+        assert_eq!(artifact_evidence(&root.database()), before);
+        let legacy = Connection::open(root.database()).expect("inspect wrong-KEK v1");
+        assert_eq!(
+            table_names(&legacy).expect("read wrong-KEK table manifest"),
+            EXPECTED_TABLES_V1
+        );
+    }
+
+    impl RuntimeStoreFaultInjector for FailMigrationAfterCommit {
+        fn before_operation(
+            &self,
+            operation: RuntimeStoreOperation,
+        ) -> Result<(), RuntimeStoreError> {
+            if operation == RuntimeStoreOperation::MigrateSchemaAfterCommit
+                && !self.failed.swap(true, Ordering::SeqCst)
+            {
+                return Err(RuntimeStoreError::WorkerStopped);
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_after_commit_unknown_converges_on_reopen_without_second_rewrite() {
+        let root = TestRoot::new("after-commit");
+        let keys = MemoryKeyStore::new();
+        let before = build_strict_v1_fixture(&root, &keys).await;
+        let error = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_fault_injector(Arc::new(
+                FailMigrationAfterCommit {
+                    failed: AtomicBool::new(false),
+                },
+            )),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload v1 KEK"),
+        )
+        .await
+        .expect_err("after-commit hook must surface unknown migration outcome");
+        assert!(matches!(
+            error,
+            RuntimeStoreError::CommitOutcomeUnknown {
+                operation: RuntimeCommitOperation::MigrateSchema
+            }
+        ));
+
+        let reopened = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload migrated KEK"),
+        )
+        .await
+        .expect("reopen committed migration");
+        let reopened_snapshot = reopened
+            .inspect()
+            .await
+            .expect("inspect reopened migration");
+        assert_eq!(reopened_snapshot.schema_version, RUNTIME_SCHEMA_VERSION);
+        assert_eq!(reopened_snapshot.journal_mode.to_ascii_lowercase(), "wal");
+        reopened
+            .shutdown()
+            .await
+            .expect("shutdown reopened migration");
+        let artifacts = artifact_evidence(&root.database());
+        assert!(
+            artifacts[1].1.is_some(),
+            "reopen must restore persistent WAL"
+        );
+        assert!(
+            artifacts[3].1.is_none(),
+            "after-COMMIT reopen must not leave a rollback journal"
+        );
+        assert_eq!(cipher_evidence(&root.database()), before);
+    }
 }
 
 pub(crate) struct RuntimeSqlite {
@@ -126,6 +851,8 @@ pub(crate) struct RuntimeLedger {
     pub event_count: u64,
     pub intent_count: u64,
     pub fence_count: u64,
+    pub codex_adapter_state_count: u64,
+    pub claude_code_adapter_state_count: u64,
     pub accepted_count: u64,
     pub accepted_payload_bytes: u64,
     pub started_without_fence_count: u64,
@@ -135,6 +862,7 @@ pub(crate) struct RuntimeLedger {
 
 enum SchemaState {
     Fresh,
+    LegacyV1(MetaRow, StoreFileIdentity),
     Current(MetaRow, StoreFileIdentity),
 }
 
@@ -199,6 +927,9 @@ pub(crate) fn open(
     let state = inspect_schema(&storage_path)?;
     match state {
         SchemaState::Fresh => open_fresh(config, storage_path, &storage_kek),
+        SchemaState::LegacyV1(meta, identity) => {
+            open_legacy_v1(config, storage_path, &storage_kek, meta, identity)
+        }
         SchemaState::Current(meta, identity) => {
             open_current(config, storage_path, &storage_kek, meta, identity)
         }
@@ -225,7 +956,7 @@ fn open_fresh(
         let key_bundle = RuntimeKeyBundle::fresh(RUNTIME_KEY_GENERATION)?;
         let key_context = KeyWrapAad {
             schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
-            schema_version: RUNTIME_SCHEMA_VERSION,
+            schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
             database_id: &database_id,
         };
         let wrapped = key_bundle.wrap(storage_kek, &key_context)?;
@@ -237,6 +968,8 @@ fn open_fresh(
             event_count: 0,
             intent_count: 0,
             fence_count: 0,
+            codex_adapter_state_count: 0,
+            claude_code_adapter_state_count: 0,
             accepted_count: 0,
             accepted_payload_bytes: 0,
             started_without_fence_count: 0,
@@ -246,7 +979,8 @@ fn open_fresh(
         let metadata_token = runtime_ledger_token(&key_bundle, database_id, &ledger)?;
 
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute_batch(RUNTIME_DDL)?;
+        transaction.execute_batch(RUNTIME_DDL_V1)?;
+        transaction.execute_batch(RUNTIME_MIGRATION_V2)?;
         transaction.execute(
             "INSERT INTO runtime_meta (
                  singleton, schema_family, schema_version, schema_signature,
@@ -266,7 +1000,7 @@ fn open_fresh(
             ],
         )?;
         transaction.commit()?;
-        if schema_manifest(&connection)? != expected_schema_manifest()? {
+        if schema_manifest(&connection)? != expected_schema_manifest(RUNTIME_SCHEMA_VERSION)? {
             return Err(RuntimeStoreError::UnknownOrCorruptSchema);
         }
         drop(connection);
@@ -316,7 +1050,7 @@ fn open_current(
     // KEK 绝不能以 RW 模式碰原始 DB，也不能触发 crash WAL 的 SHM 重建。
     let key_context = KeyWrapAad {
         schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
-        schema_version: RUNTIME_SCHEMA_VERSION,
+        schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
         database_id: &inspected.database_id,
     };
     let key_bundle =
@@ -354,6 +1088,141 @@ fn open_current(
     })
 }
 
+fn open_legacy_v1(
+    config: &RuntimeStoreConfig,
+    storage_path: PathBuf,
+    storage_kek: &StorageKek,
+    inspected: MetaRow,
+    inspected_identity: StoreFileIdentity,
+) -> Result<RuntimeSqlite, RuntimeStoreError> {
+    ensure_store_identity(&storage_path, &inspected_identity)?;
+    let key_context = KeyWrapAad {
+        schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
+        schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
+        database_id: &inspected.database_id,
+    };
+    let key_bundle =
+        RuntimeKeyBundle::unwrap(storage_kek, &key_context, &inspected.wrapped_key_bundle)?;
+    if key_bundle.generation() != inspected.key_generation {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    verify_runtime_ledger_token_v1(&key_bundle, &inspected)?;
+
+    validate_database_file(&storage_path)?;
+    let mut connection = open_read_write(&storage_path)?;
+    let after_open = capture_store_identity(&storage_path)?;
+    if after_open.database != inspected_identity.database {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    configure_defensive_limits(&connection)?;
+    let current = read_and_validate_legacy_v1_schema(&connection)?;
+    if !same_meta(&inspected, &current) {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    validate_store_files(&storage_path)?;
+    // migration 前先用 v1 authenticated ledger 与 stable crypto context 完整认证既有行；
+    // corrupt legacy DB 不得被“升级”成可识别的新 schema。
+    super::journal::validate_store_integrity_v1(
+        &connection,
+        &key_bundle,
+        current.database_id,
+        &current.ledger,
+    )?;
+
+    let migration_reserve = safety_reserve_bytes_for_ledger(&current.ledger)?
+        .checked_add(RUNTIME_WRITE_SAFETY_MARGIN_BYTES)
+        .ok_or(RuntimeStoreError::CapacityArithmeticOverflow {
+            field: "migration_safety_reserve_bytes",
+        })?;
+    // migration 的所有拒绝门禁必须先于 journal_mode/max_page_count 等持久化
+    // PRAGMA。这里用当前只读 page_size/page_count 与最终目标 page limit 做纯
+    // admission；v1 migration 不执行 checkpoint，避免在返回 capacity error 前
+    // 改写 main/WAL/SHM。
+    evaluate_migration_capacity_before_wal(
+        &connection,
+        &storage_path,
+        config.capacity_probe.as_ref(),
+        2 * 1024 * 1024,
+        migration_reserve,
+    )?;
+    configure_migration_connection(&connection, config.busy_timeout_ms)?;
+    let signature_v1 = schema_signature_v1();
+    let signature_v2 = schema_signature();
+    let old_token = runtime_ledger_token_v1(&key_bundle, current.database_id, &current.ledger)?;
+    let new_token = runtime_ledger_token(&key_bundle, current.database_id, &current.ledger)?;
+    let mut transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(RUNTIME_MIGRATION_V2)?;
+    if transaction.execute(
+        "UPDATE runtime_meta
+         SET schema_version = ?1, schema_signature = ?2,
+             codex_adapter_state_count = 0, claude_code_adapter_state_count = 0,
+             metadata_token = ?3
+         WHERE singleton = 1 AND schema_version = 1 AND schema_signature = ?4
+           AND metadata_token = ?5",
+        params![
+            i64::from(RUNTIME_SCHEMA_VERSION),
+            &signature_v2[..],
+            &new_token[..],
+            &signature_v1[..],
+            &old_token[..],
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    if let Err(injected_error) = config
+        .fault_injector
+        .before_operation(RuntimeStoreOperation::MigrateSchemaBeforeCommit)
+    {
+        let rollback_succeeded = transaction.execute_batch("ROLLBACK").is_ok();
+        let definitely_rolled_back = rollback_succeeded && transaction.is_autocommit();
+        transaction.set_drop_behavior(DropBehavior::Ignore);
+        return if definitely_rolled_back {
+            Err(injected_error)
+        } else {
+            Err(RuntimeStoreError::CommitOutcomeUnknown {
+                operation: RuntimeCommitOperation::MigrateSchema,
+            })
+        };
+    }
+    commit_transaction(transaction, RuntimeCommitOperation::MigrateSchema)?;
+    configure_connection(&connection, config.busy_timeout_ms, true).map_err(|_| {
+        RuntimeStoreError::CommitOutcomeUnknown {
+            operation: RuntimeCommitOperation::MigrateSchema,
+        }
+    })?;
+    if config
+        .fault_injector
+        .before_operation(RuntimeStoreOperation::MigrateSchemaAfterCommit)
+        .is_err()
+    {
+        return Err(RuntimeStoreError::CommitOutcomeUnknown {
+            operation: RuntimeCommitOperation::MigrateSchema,
+        });
+    }
+
+    let migrated = read_and_validate_current_schema(&connection)?;
+    if migrated.database_id != current.database_id
+        || migrated.key_generation != current.key_generation
+        || migrated.wrapped_key_bundle != current.wrapped_key_bundle
+        || migrated.ledger != current.ledger
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    validate_store_files(&storage_path)?;
+    super::journal::validate_store_integrity(&connection, &key_bundle, migrated.database_id)?;
+    snapshot(&connection, config.busy_timeout_ms)?;
+    Ok(RuntimeSqlite {
+        connection,
+        key_bundle,
+        storage_path,
+        database_id: migrated.database_id,
+        admission_state: RuntimeAdmissionState::Normal,
+        recovery_scan: None,
+        last_finished_recovery: None,
+    })
+}
+
 fn inspect_schema(path: &Path) -> Result<SchemaState, RuntimeStoreError> {
     match preflight_store_files(path)? {
         None => Ok(SchemaState::Fresh),
@@ -373,12 +1242,63 @@ fn inspect_schema(path: &Path) -> Result<SchemaState, RuntimeStoreError> {
             connection
                 .pragma_update(None, "trusted_schema", false)
                 .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
-            let meta = read_and_validate_current_schema(connection)?;
+            let (family, version) = read_schema_header(connection)?;
+            if family == RUNTIME_SCHEMA_FAMILY && version > RUNTIME_SCHEMA_VERSION {
+                return Err(RuntimeStoreError::SchemaTooNew {
+                    found: version,
+                    supported: RUNTIME_SCHEMA_VERSION,
+                });
+            }
+            let state = match version {
+                1 if family == RUNTIME_SCHEMA_FAMILY => SchemaState::LegacyV1(
+                    read_and_validate_legacy_v1_schema(connection)?,
+                    identity.clone(),
+                ),
+                RUNTIME_SCHEMA_VERSION if family == RUNTIME_SCHEMA_FAMILY => SchemaState::Current(
+                    read_and_validate_current_schema(connection)?,
+                    identity.clone(),
+                ),
+                _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
+            };
             validate_store_files(path)?;
             ensure_store_identity(path, &identity)?;
-            Ok(SchemaState::Current(meta, identity))
+            Ok(state)
         }
     }
+}
+
+fn read_schema_header(connection: &Connection) -> Result<(String, u32), RuntimeStoreError> {
+    let (family, version): (String, i64) = connection
+        .query_row(
+            "SELECT schema_family, schema_version FROM runtime_meta WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let version = u32::try_from(version).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    Ok((family, version))
+}
+
+fn read_and_validate_legacy_v1_schema(
+    connection: &Connection,
+) -> Result<MetaRow, RuntimeStoreError> {
+    let Some(meta) =
+        read_meta_v1(connection).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
+    else {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    };
+    if meta.family != RUNTIME_SCHEMA_FAMILY
+        || meta.version != 1
+        || meta.signature != schema_signature_v1()
+        || meta.key_generation != RUNTIME_KEY_GENERATION
+        || meta.wrapped_key_bundle.len() != WRAPPED_KEY_BUNDLE_V1_LEN
+        || meta.metadata_token.len() != 32
+        || table_names(connection)? != EXPECTED_TABLES_V1
+        || schema_manifest(connection)? != expected_schema_manifest(1)?
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(meta)
 }
 
 fn read_and_validate_current_schema(connection: &Connection) -> Result<MetaRow, RuntimeStoreError> {
@@ -400,7 +1320,7 @@ fn read_and_validate_current_schema(connection: &Connection) -> Result<MetaRow, 
         || meta.wrapped_key_bundle.len() != WRAPPED_KEY_BUNDLE_V1_LEN
         || meta.metadata_token.len() != 32
         || table_names(connection)? != EXPECTED_TABLES
-        || schema_manifest(connection)? != expected_schema_manifest()?
+        || schema_manifest(connection)? != expected_schema_manifest(RUNTIME_SCHEMA_VERSION)?
     {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
@@ -461,6 +1381,19 @@ fn configure_connection(
         }
         configure_persistent_wal(connection)?;
     }
+    Ok(())
+}
+
+fn configure_migration_connection(
+    connection: &Connection,
+    busy_timeout_ms: u64,
+) -> Result<(), RuntimeStoreError> {
+    configure_defensive_limits(connection)?;
+    connection.busy_timeout(Duration::from_millis(busy_timeout_ms))?;
+    connection.pragma_update(None, "foreign_keys", true)?;
+    connection.pragma_update(None, "trusted_schema", false)?;
+    connection.pragma_update(None, "temp_store", "MEMORY")?;
+    connection.pragma_update(None, "synchronous", "FULL")?;
     Ok(())
 }
 
@@ -750,6 +1683,19 @@ fn safety_reserve_bytes(
             )?;
         }
     }
+    safety_reserve_bytes_for_counts(counts)
+}
+
+fn safety_reserve_bytes_for_ledger(ledger: &RuntimeLedger) -> Result<u64, RuntimeStoreError> {
+    safety_reserve_bytes_for_counts(SafetyCounts {
+        accepted: ledger.accepted_count,
+        started_without_fence: ledger.started_without_fence_count,
+        started_without_release: ledger.started_without_release_count,
+        started_released: ledger.started_released_count,
+    })
+}
+
+fn safety_reserve_bytes_for_counts(counts: SafetyCounts) -> Result<u64, RuntimeStoreError> {
     let accepted = counts
         .accepted
         .checked_mul(ACCEPTED_EXPIRY_RESERVE_BYTES)
@@ -837,6 +1783,43 @@ fn evaluate_current_capacity(
         projected_write_bytes,
         safety_margin_bytes,
     )
+}
+
+fn evaluate_migration_capacity_before_wal(
+    connection: &Connection,
+    storage_path: &Path,
+    capacity_probe: &dyn RuntimeCapacityProbe,
+    projected_write_bytes: u64,
+    safety_margin_bytes: u64,
+) -> Result<(), RuntimeStoreError> {
+    let observed = capacity_probe.observe(storage_path)?;
+    let page_size_bytes = read_u64_pragma(connection, "page_size")?;
+    if page_size_bytes == 0 {
+        return Err(RuntimeStoreError::InvalidCapacityBudget {
+            reason: "page_size_zero",
+        });
+    }
+    let max_page_count = RUNTIME_DB_HARD_LIMIT_BYTES / page_size_bytes;
+    if max_page_count == 0 {
+        return Err(RuntimeStoreError::InvalidCapacityBudget {
+            reason: "page_size_above_hard_limit",
+        });
+    }
+    let page_count = read_u64_pragma(connection, "page_count")?;
+    evaluate_runtime_admission(RuntimeAdmissionInput {
+        main_bytes: observed.main_bytes,
+        wal_bytes: observed.wal_bytes,
+        shm_bytes: observed.shm_bytes,
+        projected_write_bytes,
+        safety_margin_bytes,
+        filesystem_total_bytes: observed.filesystem_total_bytes,
+        filesystem_available_bytes: observed.filesystem_available_bytes,
+        page_size_bytes,
+        page_count,
+        max_page_count,
+    })
+    .map(|_| ())
+    .map_err(map_admission_rejection)
 }
 
 fn evaluate_ordinary_capacity_with_checkpoint(
@@ -1024,42 +2007,64 @@ fn map_admission_rejection(rejection: AdmissionRejection) -> RuntimeStoreError {
 }
 
 fn read_meta(connection: &Connection) -> Result<Option<MetaRow>, rusqlite::Error> {
+    read_meta_with_sql(
+        connection,
+        "SELECT schema_family, schema_version, schema_signature, database_id,
+                key_generation, wrapped_key_bundle, catalog_high_water,
+                conversation_count, command_count, event_count, intent_count, fence_count,
+                accepted_count, accepted_payload_bytes, started_without_fence_count,
+                started_without_release_count, started_released_count, metadata_token,
+                codex_adapter_state_count, claude_code_adapter_state_count
+         FROM runtime_meta WHERE singleton = 1",
+    )
+}
+
+fn read_meta_v1(connection: &Connection) -> Result<Option<MetaRow>, rusqlite::Error> {
+    read_meta_with_sql(
+        connection,
+        "SELECT schema_family, schema_version, schema_signature, database_id,
+                key_generation, wrapped_key_bundle, catalog_high_water,
+                conversation_count, command_count, event_count, intent_count, fence_count,
+                accepted_count, accepted_payload_bytes, started_without_fence_count,
+                started_without_release_count, started_released_count, metadata_token,
+                0, 0
+         FROM runtime_meta WHERE singleton = 1",
+    )
+}
+
+fn read_meta_with_sql(
+    connection: &Connection,
+    sql: &str,
+) -> Result<Option<MetaRow>, rusqlite::Error> {
     connection
-        .query_row(
-            "SELECT schema_family, schema_version, schema_signature, database_id,
-                    key_generation, wrapped_key_bundle, catalog_high_water,
-                    conversation_count, command_count, event_count, intent_count, fence_count,
-                    accepted_count, accepted_payload_bytes, started_without_fence_count,
-                    started_without_release_count, started_released_count, metadata_token
-             FROM runtime_meta WHERE singleton = 1",
-            [],
-            |row| {
-                let version: i64 = row.get(1)?;
-                let signature: Vec<u8> = row.get(2)?;
-                let database_id: Vec<u8> = row.get(3)?;
-                let generation: i64 = row.get(4)?;
-                Ok((
-                    row.get::<_, String>(0)?,
-                    version,
-                    signature,
-                    database_id,
-                    generation,
-                    row.get::<_, Vec<u8>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, i64>(9)?,
-                    row.get::<_, i64>(10)?,
-                    row.get::<_, i64>(11)?,
-                    row.get::<_, i64>(12)?,
-                    row.get::<_, i64>(13)?,
-                    row.get::<_, i64>(14)?,
-                    row.get::<_, i64>(15)?,
-                    row.get::<_, i64>(16)?,
-                    row.get::<_, Vec<u8>>(17)?,
-                ))
-            },
-        )
+        .query_row(sql, [], |row| {
+            let version: i64 = row.get(1)?;
+            let signature: Vec<u8> = row.get(2)?;
+            let database_id: Vec<u8> = row.get(3)?;
+            let generation: i64 = row.get(4)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                version,
+                signature,
+                database_id,
+                generation,
+                row.get::<_, Vec<u8>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, i64>(11)?,
+                row.get::<_, i64>(12)?,
+                row.get::<_, i64>(13)?,
+                row.get::<_, i64>(14)?,
+                row.get::<_, i64>(15)?,
+                row.get::<_, i64>(16)?,
+                row.get::<_, Vec<u8>>(17)?,
+                row.get::<_, i64>(18)?,
+                row.get::<_, i64>(19)?,
+            ))
+        })
         .optional()?
         .map(
             |(
@@ -1081,6 +2086,8 @@ fn read_meta(connection: &Connection) -> Result<Option<MetaRow>, rusqlite::Error
                 started_without_release_count,
                 started_released_count,
                 metadata_token,
+                codex_adapter_state_count,
+                claude_code_adapter_state_count,
             )| {
                 let version = u32::try_from(version)
                     .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, version))?;
@@ -1112,6 +2119,10 @@ fn read_meta(connection: &Connection) -> Result<Option<MetaRow>, rusqlite::Error
                 let started_without_release_count =
                     sqlite_nonnegative_u64(15, started_without_release_count)?;
                 let started_released_count = sqlite_nonnegative_u64(16, started_released_count)?;
+                let codex_adapter_state_count =
+                    sqlite_nonnegative_u64(18, codex_adapter_state_count)?;
+                let claude_code_adapter_state_count =
+                    sqlite_nonnegative_u64(19, claude_code_adapter_state_count)?;
                 Ok(MetaRow {
                     family,
                     version,
@@ -1126,6 +2137,8 @@ fn read_meta(connection: &Connection) -> Result<Option<MetaRow>, rusqlite::Error
                         event_count,
                         intent_count,
                         fence_count,
+                        codex_adapter_state_count,
+                        claude_code_adapter_state_count,
                         accepted_count,
                         accepted_payload_bytes,
                         started_without_fence_count,
@@ -1171,9 +2184,14 @@ fn schema_manifest(connection: &Connection) -> Result<Vec<SchemaObject>, Runtime
         .collect::<Result<Vec<_>, _>>()?)
 }
 
-fn expected_schema_manifest() -> Result<Vec<SchemaObject>, RuntimeStoreError> {
+fn expected_schema_manifest(version: u32) -> Result<Vec<SchemaObject>, RuntimeStoreError> {
     let connection = Connection::open_in_memory()?;
-    connection.execute_batch(RUNTIME_DDL)?;
+    connection.execute_batch(RUNTIME_DDL_V1)?;
+    if version == RUNTIME_SCHEMA_VERSION {
+        connection.execute_batch(RUNTIME_MIGRATION_V2)?;
+    } else if version != 1 {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
     schema_manifest(&connection)
 }
 
@@ -1201,6 +2219,36 @@ fn same_meta(left: &MetaRow, right: &MetaRow) -> bool {
 }
 
 fn runtime_ledger_token(
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    ledger: &RuntimeLedger,
+) -> Result<[u8; 32], RuntimeStoreError> {
+    let mut message = Vec::with_capacity(133);
+    message.extend_from_slice(&database_id);
+    match ledger.catalog_high_water.as_deref() {
+        None => message.push(0),
+        Some(value) => {
+            message.push(1);
+            message.extend_from_slice(value.as_bytes());
+        }
+    }
+    message.extend_from_slice(&ledger.conversation_count.to_be_bytes());
+    message.extend_from_slice(&ledger.command_count.to_be_bytes());
+    message.extend_from_slice(&ledger.event_count.to_be_bytes());
+    message.extend_from_slice(&ledger.intent_count.to_be_bytes());
+    message.extend_from_slice(&ledger.fence_count.to_be_bytes());
+    message.extend_from_slice(&ledger.codex_adapter_state_count.to_be_bytes());
+    message.extend_from_slice(&ledger.claude_code_adapter_state_count.to_be_bytes());
+    message.extend_from_slice(&ledger.accepted_count.to_be_bytes());
+    message.extend_from_slice(&ledger.accepted_payload_bytes.to_be_bytes());
+    message.extend_from_slice(&ledger.started_without_fence_count.to_be_bytes());
+    message.extend_from_slice(&ledger.started_without_release_count.to_be_bytes());
+    message.extend_from_slice(&ledger.started_released_count.to_be_bytes());
+    let token = key_bundle.blind_index(b"runtime.meta.ledger.v2", &message)?;
+    Ok(*token.as_bytes())
+}
+
+fn runtime_ledger_token_v1(
     key_bundle: &RuntimeKeyBundle,
     database_id: [u8; 16],
     ledger: &RuntimeLedger,
@@ -1239,6 +2287,17 @@ fn verify_runtime_ledger_token(
     Ok(())
 }
 
+fn verify_runtime_ledger_token_v1(
+    key_bundle: &RuntimeKeyBundle,
+    meta: &MetaRow,
+) -> Result<(), RuntimeStoreError> {
+    let expected = runtime_ledger_token_v1(key_bundle, meta.database_id, &meta.ledger)?;
+    if meta.metadata_token.as_slice() != expected {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(())
+}
+
 pub(crate) fn load_runtime_ledger(
     connection: &Connection,
     key_bundle: &RuntimeKeyBundle,
@@ -1265,10 +2324,11 @@ pub(crate) fn update_runtime_ledger(
         "UPDATE runtime_meta
          SET catalog_high_water = ?1, conversation_count = ?2, command_count = ?3,
              event_count = ?4, intent_count = ?5, fence_count = ?6,
-             accepted_count = ?7, accepted_payload_bytes = ?8,
-             started_without_fence_count = ?9, started_without_release_count = ?10,
-             started_released_count = ?11, metadata_token = ?12
-         WHERE singleton = 1 AND metadata_token = ?13",
+             codex_adapter_state_count = ?7, claude_code_adapter_state_count = ?8,
+             accepted_count = ?9, accepted_payload_bytes = ?10,
+             started_without_fence_count = ?11, started_without_release_count = ?12,
+             started_released_count = ?13, metadata_token = ?14
+         WHERE singleton = 1 AND metadata_token = ?15",
         params![
             next.catalog_high_water.as_deref(),
             i64::try_from(next.conversation_count)
@@ -1280,6 +2340,10 @@ pub(crate) fn update_runtime_ledger(
             i64::try_from(next.intent_count)
                 .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
             i64::try_from(next.fence_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.codex_adapter_state_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.claude_code_adapter_state_count)
                 .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
             i64::try_from(next.accepted_count)
                 .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
@@ -1415,7 +2479,16 @@ pub(crate) fn read_rescue_index(
     connection
         .pragma_update(None, "trusted_schema", false)
         .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
-    read_and_validate_current_schema(connection)?;
+    let (family, version) = read_schema_header(connection)?;
+    match (family.as_str(), version) {
+        (RUNTIME_SCHEMA_FAMILY, 1) => {
+            read_and_validate_legacy_v1_schema(connection)?;
+        }
+        (RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION) => {
+            read_and_validate_current_schema(connection)?;
+        }
+        _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
+    }
     let mut statement = connection.prepare(
         "SELECT relay_server_id, machine_route, root_fingerprint
          FROM machine_enrollment_receipts

@@ -59,7 +59,10 @@ async fn router_cross_agent_history_list_merges_without_error() {
         cwd_filter: None,
         limit: None,
     };
-    let result = r.handle_history(req).await.expect("merge must not error");
+    let result = r
+        .handle_history_stdio_compat(req)
+        .await
+        .expect("merge must not error");
     let items = match result {
         HistoryResponse::List(v) => v,
         other => panic!("expected List variant, got {other:?}"),
@@ -93,7 +96,7 @@ async fn router_codex_list_returns_empty_stub() {
         limit: None,
     };
     let result = r
-        .handle_history(req)
+        .handle_history_stdio_compat(req)
         .await
         .expect("codex stub must not error");
     match result {
@@ -117,7 +120,10 @@ async fn router_codex_read_surfaces_not_implemented_error() {
         thread_id: ThreadId("nonexistent".into()),
         agent_kind: AgentKind::Codex,
     };
-    let err = r.handle_history(req).await.expect_err("codex stub errors");
+    let err = r
+        .handle_history_stdio_compat(req)
+        .await
+        .expect_err("codex stub errors");
     assert_eq!(err.code, "codex-history-read-not-implemented");
 }
 
@@ -131,7 +137,10 @@ async fn router_cc_unarchive_is_noop_ack() {
         thread_id: ThreadId("anything".into()),
         agent_kind: AgentKind::ClaudeCode,
     };
-    let result = r.handle_history(req).await.expect("cc unarchive must Ack");
+    let result = r
+        .handle_history_stdio_compat(req)
+        .await
+        .expect("cc unarchive must Ack");
     assert!(matches!(result, HistoryResponse::Ack));
 }
 
@@ -146,7 +155,7 @@ async fn router_unregistered_kind_returns_structured_error() {
         limit: None,
     };
     let err = r
-        .handle_history(req)
+        .handle_history_stdio_compat(req)
         .await
         .expect_err("empty router errors");
     assert_eq!(err.code, "agent-not-registered");

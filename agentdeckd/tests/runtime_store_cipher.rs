@@ -5,6 +5,7 @@ use agentdeckd::runtime::store::cipher::{
     CipherError, KeyWrapAad, ROW_BLOB_V1_HEADER_LEN, RowAad, RuntimeKeyBundle,
     WRAPPED_KEY_BUNDLE_V1_LEN,
 };
+use agentdeckd::runtime::store::{RUNTIME_CRYPTO_CONTEXT_VERSION, RUNTIME_SCHEMA_VERSION};
 use agentdeckd::security::{MemoryKeyStore, StorageKek, load_or_create_storage_kek};
 
 fn storage_kek(label: &str) -> StorageKek {
@@ -419,4 +420,10 @@ fn secret_bearing_types_have_redacted_debug_output() {
         format!("{key_context:?}"),
         "KeyWrapAad { schema_version: 1, fields: [REDACTED] }"
     );
+}
+
+#[test]
+fn physical_schema_upgrade_does_not_rotate_the_crypto_context() {
+    assert_eq!(RUNTIME_SCHEMA_VERSION, 2);
+    assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
 }

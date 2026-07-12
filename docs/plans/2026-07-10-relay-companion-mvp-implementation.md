@@ -613,17 +613,45 @@ ignored/GATED。独立安全复核与容量/恢复/关停复核均未发现 P0/P
 - Create: `agentdeckd/src/codex/state.rs`
 - Create: `agentdeckd/src/claude_code/state.rs`
 - Create: `agentdeckd/tests/adapter_state_boundary.rs`
+- Create: `agentdeckd/tests/support/runtime_descriptor.rs`
 - Modify: `agentdeckd/src/{agent,runtime/router}.rs`
+- Modify: `agentdeckd/src/runtime/{hub,model,mod}.rs`
+- Modify: `agentdeckd/src/runtime/store/{journal,mod,schema,sqlite,worker}.rs`
 - Modify: `agentdeckd/src/codex/{mod,adapter,history}.rs`
 - Modify: `agentdeckd/src/claude_code/{mod,adapter,history}.rs`
-- Modify: `ARCHITECTURE.md`, `AGENTS.md`, `README.md`
+- Modify: `agentdeckd/tests/{agent_router,cc_adapter_shape,codex_adapter_shape,router_both_agents,runtime_store*}.rs`
+- Modify: `ARCHITECTURE.md`, `AGENTS.md`, `README.md`, `docs/{AGENT_DIAGNOSTICS,QUALITY,index}.md`
 
-- [ ] Step 1: 写 boundary tests。 common catalog序列化只含随机 AdapterStateKey；Codex模块只能读 `codex_adapter_state` namespace，CC只能读 `claude_code_adapter_state`；跨模块读取失败；CC index可从原生 history重建；任何路径不创建 `cc-meta/`。
-- [ ] Step 2: 运行 adapter boundary test。 Expected: FAIL，当前 router仍以 SessionId/ThreadId为 canonical map。
-- [ ] Step 3: 实现 typed private state repositories并迁移 history/continue lookup。 旧 `ThreadId` 只留 stdio compatibility；vendor resume ref先用 StorageKEK包装，再写对应私有表；common层拿不到明文API。
-- [ ] Step 4: 重跑测试与 `rg -n 'thread_id|session_id' agentdeckd/src/runtime`。 Expected: 仅 compatibility/迁移注释允许命中，RuntimeCore key不含 vendor identity。
-- [ ] Step 5: 同步 N8：允许 adapter私有、派生、可重建映射，仍禁止新 CC 元数据事实源；运行 docs gate。
+- [x] Step 1: 写 boundary tests。 common catalog序列化只含随机 AdapterStateKey；Codex模块只能读 `codex_adapter_state` namespace，CC只能读 `claude_code_adapter_state`；跨模块读取失败；CC index可从原生 history重建；任何路径不创建 `cc-meta/`。
+- [x] Step 2: 运行 adapter boundary test。 Expected: FAIL，当前 router仍以 SessionId/ThreadId为 canonical map。
+- [x] Step 3: 实现 typed private state repositories并迁移 history/continue lookup。 旧 `ThreadId` 只留 stdio compatibility；vendor resume ref先用 StorageKEK包装，再写对应私有表；common层拿不到明文API。
+- [x] Step 4: 重跑测试与 `rg -n 'thread_id|session_id' agentdeckd/src/runtime`。 Expected: 仅 compatibility/迁移注释允许命中，RuntimeCore key不含 vendor identity。
+- [x] Step 5: 同步 N8：允许 adapter私有、派生、可重建映射，仍禁止新 CC 元数据事实源；运行 docs gate。
 - [ ] Step 6: 提交。 `git add agentdeckd README.md ARCHITECTURE.md AGENTS.md && git commit -m "refactor(daemon): 隔离 adapter 私有 resume 映射"`
+
+执行记录（2026-07-11）：
+
+- RED 先后固定了 canonical contract 泄漏 vendor `ThreadId`、CC authoritative init 时序、
+  descriptor 任意 bytes、agentKind/namespace 错绑、migration 零写边界、fresh-home retry、空/
+  malformed native JSONL、Codex resume 缺 ID 与默认真实 E2E 副作用；实现后逐项转绿。
+- Runtime physical schema 从严格 v1 七表原子迁移到严格 v2 九表，但冻结
+  `RUNTIME_CRYPTO_CONTEXT_VERSION = 1`，既有 wrapped key/ciphertext 不重写。common catalog
+  只接受 deny-unknown `ConversationDescriptor(agentKind,title,cwd)`；open/recovery/migration
+  都做 canonical byte-for-byte readback。
+- 通用 adapter-state bind/resolve 保持 worker 私有；namespace factory 仅 `runtime` 可见，
+  `AgentRouter::with_runtime_store` 是唯一生产 composition，分别向 Codex/CC 注入固定 namespace
+  typed vault。两张私表强制 descriptor agentKind、互斥 key、AEAD/blind token、authenticated
+  totals、exact retry/conflict/cross-table tamper fail-close。
+- Codex `thread/start` 在首个 turn 前绑定，`thread/resume` response 与后续 frame 均要求 exact
+  persisted thread id。CC 首次先持久化 UUID 并用 `--session-id`；仅唯一 regular/non-memory
+  JSONL 经 `O_NOFOLLOW`、inode 对齐、有界有效 JSONL readback 后才 `--resume`，fresh home
+  缺 projects root 继续复用原 ID；authoritative `system.init.session_id` 匹配前不发布事件。
+- 默认 `cargo test` 在任何 binary probe/spawn 前跳过真实 Codex/Claude model/history smoke；只有
+  显式 `AGENTDECK_E2E=1` 才运行。真实 canonical Codex/CC smoke 分别 1/1 PASS（2.40s/5.61s）。
+- 完整 `env -u AGENTDECK_E2E cargo test -p agentdeckd -- --test-threads=1` exit 0：lib
+  114/114，真实 1,024 × 256 KiB/精确 256 MiB 边界 5/5（慢项 261.07s），StorageKEK
+  14 PASS + 1 ignored signed Keychain gate；该 ignored 仍是 P3.1 外部 provisioning BLOCKED，
+  不计作通过。两轮独立 architecture/security review 均无剩余 P0/P1/P2。
 
 ### Task P3.4：实现 transport-neutral RuntimeCore、principal 与 prompt actors
 

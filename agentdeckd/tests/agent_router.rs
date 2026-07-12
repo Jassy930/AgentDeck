@@ -1,6 +1,7 @@
 use agentdeck_protocol::*;
 use agentdeckd::agent::{Agent, AgentEventSender, AgentSessionHandle};
 use agentdeckd::runtime::router::AgentRouter;
+use agentdeckd::runtime::store::{RuntimeId, RuntimeIdKind};
 use std::sync::Arc;
 
 struct StubAgent {
@@ -82,4 +83,30 @@ fn router_returns_capabilities_for_known_kind() {
 fn router_rejects_unregistered_kind() {
     let r = AgentRouter::new();
     assert!(r.capabilities(AgentKind::Codex).is_none());
+}
+
+#[tokio::test]
+async fn canonical_continue_routes_only_the_neutral_adapter_state_key() {
+    let mut router = AgentRouter::new();
+    router.register(Arc::new(StubAgent {
+        kind: AgentKind::Codex,
+    }));
+    let (events, _receiver) = tokio::sync::mpsc::channel(1);
+    let key = RuntimeId::from_bytes(RuntimeIdKind::AdapterState, [0x91; 16])
+        .expect("neutral adapter state key");
+
+    let result = router
+        .continue_adapter_state(
+            key,
+            AgentKind::Codex,
+            "/tmp".into(),
+            "continue".to_owned(),
+            events,
+        )
+        .await;
+    let error = match result {
+        Ok(_) => panic!("stub has no private repository"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, "adapter-state-not-configured");
 }

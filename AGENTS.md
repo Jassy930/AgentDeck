@@ -10,7 +10,7 @@
 4. `docs/index.md`：文档记录系统导航。
 5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code（含 CC adapter failure codes）。
 6. `docs/QUALITY.md`：验证命令、质量门禁和文档结构检查（含 v0.2 手动 QA 清单）。
-7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单。P2.10 已完成；P3.1 代码已提交为 `835a7b3`，但真实 provisioned signed Keychain roundtrip 仍 gated BLOCKED，因此不得宣称 P3.1/P3 完成，继续按计划执行 P3–P6。
+7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单。P2.10 已完成；P3.1/P3.2 代码分别提交为 `835a7b3`/`8744750`，P3.3 正在收口 canonical adapter 私域。真实 provisioned signed Keychain roundtrip 仍 gated BLOCKED，因此不得宣称 P3.1/P3 完成，继续按计划执行 P3–P6。
 8. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
 
 ## 项目边界
@@ -21,7 +21,7 @@
 - IPC 主干类型严禁出现 vendor 字样；vendor 字段只能出现在 `capabilities.*` / `vendorControl.*` / `vendorPanel.*` 命名空间（N1）。
 - Codex 细节只能留在 `agentdeckd/src/codex/` 子模块；CC 细节只能留在 `agentdeckd/src/claude_code/` 子模块；两者互不知晓（N3）。
 - `protocol/` 中 Codex schema 必须来自官方 `codex app-server generate-json-schema`，不要手写或逆向猜测协议（K8）。
-- AgentDeck 不读取、不保存、不转发任何 vendor token（Codex 或 Claude Code）；CC 历史走 CC 原生接口，不建 `cc-meta/` 目录（K9、N8）。
+- AgentDeck 不读取、不保存、不转发任何 vendor token（Codex 或 Claude Code）；CC 原生 history/session 文件仍是唯一权威事实源。仅允许 Runtime DB 的 `claude_code_adapter_state` 保存 StorageKEK 保护、可从本机唯一 regular/non-memory native JSONL 明确重建的 `adapterStateKey → session id` 派生索引；不按 title/cwd/mtime 猜旧 key，不保存 title/archive/status/transcript，不建 `cc-meta/`，不进入 common catalog、日志、Relay 或客户端 wire（K9、N8）。
 - AgentDeck stable run record 与 diagnostic log 固定写入当前 EUID 的 OS account home 下 `Library/Application Support/AgentDeck/`；ephemeral 实例写入随机 0700 temp namespace，均不得写入用户项目 git（K5）。
 - `Sources/AgentDeckCore/` 是 macOS/iOS 共享的平台无关层，禁止 import AppKit/UIKit；`ios/` 是 fixture 驱动的 UIKit companion 前端，唯一数据入口是 `MobileSessionSource`，本期不含网络代码（设计见 `docs/plans/2026-07-03-ios-uikit-frontend-design.md`）。
 
@@ -170,6 +170,32 @@ unknown、认证 metadata/ledger、三业务 lane count/byte bound、paged recov
 conversation、80MiB、exact cursor/finish、恢复期 mutation fence）和 shutdown
 优先级。该组件尚未接入 compatibility RuntimeHub；P3.4 前不得把 store 测试表述为 UDS、
 远程或 Companion E2E。标准 SQLite 无 custom quota VFS，不能声称 active WAL 瞬时零超冲。
+
+### Relay Companion MVP P3.3（typed catalog + adapter 私域门禁）
+
+```bash
+cargo test -p agentdeckd --lib -- --test-threads=1
+cargo test -p agentdeckd --test adapter_state_boundary --test agent_router \
+  --test cc_adapter_shape --test codex_adapter_shape -- --test-threads=1
+cargo test -p agentdeckd --lib runtime::store::sqlite::migration_tests -- --test-threads=1
+cargo test -p agentdeckd -- --test-threads=1
+AGENTDECK_E2E=1 cargo test -p agentdeckd --test codex_adapter_shape \
+  real_codex_canonical_start_binds_private_state_then_emits_capabilities -- --exact
+AGENTDECK_E2E=1 cargo test -p agentdeckd --test cc_adapter_shape \
+  real_claude_streams_at_least_one_assistant_or_turn_complete -- --exact
+bash scripts/check-daemon-no-net.sh
+```
+
+P3.3 必须证明 common catalog 只接受 canonical typed `ConversationDescriptor`，未知 vendor
+identity 字段在 migration 前零写拒绝；v1→v2 before-COMMIT rollback 对 main/WAL/SHM/journal
+逐字节无副作用，COMMIT 后才启用 persistent WAL。canonical Agent handle/event/history 禁止
+`ThreadId`，Raw vendor frame fail-close；Codex bind 位于首个 turn 前，CC 必须区分首次
+`--session-id` 与已 materialized native history 的 `--resume`，并在 authoritative init 匹配前
+不返回/不发布。Codex resume response 必须返回 exact thread id；CC private history 只有经
+`O_NOFOLLOW` 有界读回有效 JSONL 才算 materialized，fresh home 重试继续复用原 session id。
+state repository 不公开，adapter 不拿通用 store/另一 namespace vault，不创建 `cc-meta/`。
+所有真实 CLI/model/history smoke 必须先检查 `AGENTDECK_E2E=1`。这些仍是 P3.4 RuntimeCore 前的
+组件门禁，不能表述为 UDS、远程或 Companion E2E。
 
 ## 浏览与外部资料
 

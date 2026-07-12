@@ -33,14 +33,19 @@
 //!     succeed; clients route this back to the user as "restart the
 //!     session to apply the new setting".
 
-use crate::agent::{Agent, AgentEventSender, AgentSessionHandle};
+use crate::agent::{
+    Agent, AgentEventSender, AgentSessionHandle, CanonicalAgentEvent, CanonicalAgentEventSender,
+    CanonicalAgentSessionHandle, CanonicalHistoryRead,
+};
 use crate::codex::capabilities::{build_codex_capabilities, probe_codex_version};
+use crate::codex::state::CodexStateRepository;
 use crate::codex::translate::CodexTranslator;
+use crate::runtime::store::{CodexAdapterStateVault, RuntimeId, RuntimeIdKind, RuntimeStoreError};
 use agentdeck_protocol::{
-    ActionDecision, ActionDecisionKind, AgentKind, CodexApprovalPolicy, CodexReasoningEffort,
-    CodexSandboxMode, CodexSessionOptions, HistoryRequest, HistoryResponse, ProtocolError,
-    ServerEvent, SessionCapabilities, SessionId, SessionStart, ThreadId, VendorControlPayload,
-    VendorSessionOptions,
+    ActionDecision, ActionDecisionKind, AgentItem, AgentKind, CodexApprovalPolicy,
+    CodexReasoningEffort, CodexSandboxMode, CodexSessionOptions, HistoryRequest, HistoryResponse,
+    ProtocolError, ServerEvent, SessionCapabilities, SessionId, SessionStart, ThreadId,
+    VendorControlPayload, VendorSessionOptions,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -50,7 +55,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 
 /// One approval-routing entry. Carries everything `submit_decision` needs
 /// to build the right JSON-RPC response body (the body shape differs by
@@ -97,6 +102,7 @@ struct SessionHandle {
 pub struct CodexAdapter {
     cli_version: OnceLock<String>,
     sessions: Arc<Mutex<HashMap<SessionId, SessionHandle>>>,
+    state_repository: Option<CodexStateRepository>,
 }
 
 impl CodexAdapter {
@@ -104,6 +110,18 @@ impl CodexAdapter {
         Self {
             cli_version: OnceLock::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            state_repository: None,
+        }
+    }
+
+    /// P3 canonical Runtime constructor。只有 `runtime::AgentRouter` 能从 singleton
+    /// store 构造对应 vault；adapter 本身拿不到另一 vendor 的 capability。
+    #[must_use]
+    pub(crate) fn with_state_vault(vault: CodexAdapterStateVault) -> Self {
+        Self {
+            cli_version: OnceLock::new(),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            state_repository: Some(CodexStateRepository::new(vault)),
         }
     }
 
@@ -246,7 +264,7 @@ impl CodexAdapter {
         }
         let v = serde_json::from_str(line_buf.trim()).map_err(|e| ProtocolError {
             code: "codex-malformed-json".into(),
-            message: format!("malformed codex frame: {e}: {}", line_buf.trim()),
+            message: format!("malformed codex frame: {e}"),
             diagnostic_ref: None,
         })?;
         Ok(Some(v))
@@ -366,6 +384,7 @@ impl CodexAdapter {
         prompt: Option<String>,
         resume_thread_id: Option<ThreadId>,
         events: AgentEventSender,
+        bind_adapter_state: Option<(RuntimeId, CodexStateRepository)>,
     ) -> Result<AgentSessionHandle, ProtocolError> {
         let session_id = SessionId(uuid::Uuid::new_v4().to_string());
 
@@ -427,7 +446,7 @@ impl CodexAdapter {
         let thread_id = if let Some(tid) = resume_thread_id.clone() {
             let resume_id = next_rpc_id;
             next_rpc_id += 1;
-            Self::request_response(
+            let result = Self::request_response(
                 &mut stdin,
                 &mut reader,
                 &mut line_buf,
@@ -437,6 +456,7 @@ impl CodexAdapter {
                 HANDSHAKE_TIMEOUT,
             )
             .await?;
+            validate_resume_result_thread_id(&result, &tid)?;
             tid
         } else {
             let start_id = next_rpc_id;
@@ -465,6 +485,16 @@ impl CodexAdapter {
                 })?;
             ThreadId(id)
         };
+
+        // Canonical new-conversation path: persist the vendor ref after
+        // thread/start returns it but before the first prompt/turn can cross the
+        // side-effect boundary. Exact retry is handled by the private store row.
+        if let Some((adapter_state_key, repository)) = bind_adapter_state {
+            repository
+                .bind(adapter_state_key, thread_id.clone())
+                .await
+                .map_err(adapter_state_error)?;
+        }
 
         // 3. Send initial turn/start if a prompt was provided. We do
         //    this BEFORE handing stdout to the pump so the request id is
@@ -581,6 +611,24 @@ async fn stdout_pump(
                 break;
             }
         }
+        if observed_codex_thread_id(&line_buf)
+            .as_deref()
+            .is_some_and(|observed| observed != state.thread_id.0.as_str())
+        {
+            let _ = events
+                .send(ServerEvent::Error {
+                    session_id: Some(session_id.clone()),
+                    error: ProtocolError {
+                        code: "codex-thread-id-mismatch".into(),
+                        message: "Codex reported a thread id that does not match the persisted private mapping".into(),
+                        diagnostic_ref: None,
+                    },
+                })
+                .await;
+            let mut child = state.child.lock().await;
+            let _ = child.start_kill();
+            return;
+        }
         let outputs = {
             let mut t = translator.lock().await;
             t.translate_line_with_routes(&line_buf)
@@ -608,6 +656,90 @@ async fn stdout_pump(
     }
 }
 
+fn observed_codex_thread_id(line: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    let params = value.get("params");
+    params
+        .and_then(|params| params.get("threadId"))
+        .or_else(|| params?.get("item")?.get("threadId"))
+        .or_else(|| value.get("result")?.get("thread")?.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn validate_resume_result_thread_id(
+    result: &Value,
+    expected: &ThreadId,
+) -> Result<(), ProtocolError> {
+    let observed = result
+        .get("thread")
+        .and_then(|thread| thread.get("id"))
+        .and_then(Value::as_str);
+    if observed != Some(expected.0.as_str()) {
+        return Err(ProtocolError {
+            code: "codex-thread-id-mismatch".into(),
+            message: "Codex resume result does not match the persisted private mapping".into(),
+            diagnostic_ref: None,
+        });
+    }
+    Ok(())
+}
+
+/// 把旧 translator 的 `ServerEvent` 收窄为 canonical adapter event。所有
+/// session/thread/agent routing 字段都在 Codex 私域丢弃；未经建模的 Raw frame
+/// 可能含 `threadId`，因此 fail-close 为 typed error，绝不透传 payload。
+fn canonicalize_event(event: ServerEvent) -> Option<CanonicalAgentEvent> {
+    match event {
+        ServerEvent::SessionStarted { .. } => None,
+        ServerEvent::SessionCapabilities { capabilities, .. } => {
+            Some(CanonicalAgentEvent::Capabilities(capabilities))
+        }
+        ServerEvent::AgentItem {
+            item: AgentItem::Raw { .. },
+            ..
+        } => Some(CanonicalAgentEvent::Error(ProtocolError {
+            code: "adapter-raw-event-blocked".into(),
+            message: "Codex emitted an unmodeled frame that is unavailable on canonical Runtime"
+                .into(),
+            diagnostic_ref: None,
+        })),
+        ServerEvent::AgentItem { item, .. } => Some(CanonicalAgentEvent::Item(item)),
+        ServerEvent::ActionRequest { request, .. } => {
+            Some(CanonicalAgentEvent::ActionRequest(request))
+        }
+        ServerEvent::TurnComplete { summary, .. } => {
+            Some(CanonicalAgentEvent::TurnComplete(summary))
+        }
+        ServerEvent::Error { error, .. } => Some(CanonicalAgentEvent::Error(ProtocolError {
+            code: error.code,
+            message: "Codex adapter reported a private failure; see local diagnostics".into(),
+            diagnostic_ref: None,
+        })),
+        ServerEvent::VendorControl { payload, .. } => {
+            Some(CanonicalAgentEvent::VendorControl(payload))
+        }
+        ServerEvent::VendorPanelEvent { payload, .. } => {
+            Some(CanonicalAgentEvent::VendorPanelEvent(payload))
+        }
+    }
+}
+
+fn spawn_canonical_event_bridge(
+    mut compatibility_events: mpsc::Receiver<ServerEvent>,
+    canonical_events: CanonicalAgentEventSender,
+) {
+    tokio::spawn(async move {
+        while let Some(event) = compatibility_events.recv().await {
+            let Some(event) = canonicalize_event(event) else {
+                continue;
+            };
+            if canonical_events.send(event).await.is_err() {
+                return;
+            }
+        }
+    });
+}
+
 #[async_trait::async_trait]
 impl Agent for CodexAdapter {
     fn kind(&self) -> AgentKind {
@@ -633,8 +765,61 @@ impl Agent for CodexAdapter {
                 });
             }
         };
-        self.start_inner(&start.cwd, &codex_options, start.prompt, None, events)
+        self.start_inner(&start.cwd, &codex_options, start.prompt, None, events, None)
             .await
+    }
+
+    async fn start_adapter_state(
+        &self,
+        adapter_state_key: RuntimeId,
+        start: SessionStart,
+        events: CanonicalAgentEventSender,
+    ) -> Result<CanonicalAgentSessionHandle, ProtocolError> {
+        ensure_adapter_state_key(adapter_state_key)?;
+        let repository = self.state_repository.clone().ok_or_else(|| ProtocolError {
+            code: "adapter-state-not-configured".into(),
+            message: "Codex private state repository is not configured".into(),
+            diagnostic_ref: None,
+        })?;
+        let codex_options = match start.vendor_options {
+            VendorSessionOptions::Codex(options) => options,
+            _ => {
+                return Err(ProtocolError {
+                    code: "wrong-vendor".into(),
+                    message: "CodexAdapter received non-Codex vendor options".into(),
+                    diagnostic_ref: None,
+                });
+            }
+        };
+        let existing = repository
+            .resolve(adapter_state_key)
+            .await
+            .map_err(adapter_state_error)?;
+        let binding = if existing.is_some() {
+            None
+        } else {
+            Some((adapter_state_key, repository))
+        };
+        // 旧 translator 仍产出带 ThreadId 的 ServerEvent；先在 adapter 私域
+        // 有界缓冲，只有 private bind/handshake 全部成功后才启动净化 bridge。
+        let (compatibility_events, compatibility_receiver) = mpsc::channel(512);
+        let handle = self
+            .start_inner(
+                &start.cwd,
+                &codex_options,
+                start.prompt,
+                existing,
+                compatibility_events,
+                binding,
+            )
+            .await?;
+        spawn_canonical_event_bridge(compatibility_receiver, events);
+        Ok(CanonicalAgentSessionHandle {
+            session_id: handle.session_id,
+            adapter_state_key,
+            agent_kind: handle.agent_kind,
+            abort_handle: handle.abort_handle,
+        })
     }
 
     async fn continue_thread(
@@ -658,8 +843,93 @@ impl Agent for CodexAdapter {
             reasoning_effort: CodexReasoningEffort::Medium,
             mcp_overrides: vec![],
         };
-        self.start_inner(&cwd, &opts, Some(prompt), Some(thread_id), events)
+        self.start_inner(&cwd, &opts, Some(prompt), Some(thread_id), events, None)
             .await
+    }
+
+    async fn continue_adapter_state(
+        &self,
+        adapter_state_key: RuntimeId,
+        cwd: std::path::PathBuf,
+        prompt: String,
+        events: CanonicalAgentEventSender,
+    ) -> Result<CanonicalAgentSessionHandle, ProtocolError> {
+        ensure_adapter_state_key(adapter_state_key)?;
+        let repository = self
+            .state_repository
+            .as_ref()
+            .ok_or_else(|| ProtocolError {
+                code: "adapter-state-not-configured".into(),
+                message: "Codex private state repository is not configured".into(),
+                diagnostic_ref: None,
+            })?;
+        let thread_id = repository
+            .resolve(adapter_state_key)
+            .await
+            .map_err(adapter_state_error)?
+            .ok_or_else(|| ProtocolError {
+                code: "adapter-state-not-found".into(),
+                message: "Codex resume mapping was not found".into(),
+                diagnostic_ref: None,
+            })?;
+        let opts = CodexSessionOptions {
+            sandbox: CodexSandboxMode::WorkspaceWrite,
+            approval_policy: CodexApprovalPolicy::OnRequest,
+            persist_approval: false,
+            reasoning_effort: CodexReasoningEffort::Medium,
+            mcp_overrides: vec![],
+        };
+        let (compatibility_events, compatibility_receiver) = mpsc::channel(512);
+        let handle = self
+            .start_inner(
+                &cwd,
+                &opts,
+                Some(prompt),
+                Some(thread_id),
+                compatibility_events,
+                None,
+            )
+            .await?;
+        spawn_canonical_event_bridge(compatibility_receiver, events);
+        Ok(CanonicalAgentSessionHandle {
+            session_id: handle.session_id,
+            adapter_state_key,
+            agent_kind: handle.agent_kind,
+            abort_handle: handle.abort_handle,
+        })
+    }
+
+    async fn read_adapter_history(
+        &self,
+        adapter_state_key: RuntimeId,
+    ) -> Result<CanonicalHistoryRead, ProtocolError> {
+        ensure_adapter_state_key(adapter_state_key)?;
+        let repository = self
+            .state_repository
+            .as_ref()
+            .ok_or_else(|| ProtocolError {
+                code: "adapter-state-not-configured".into(),
+                message: "Codex private state repository is not configured".into(),
+                diagnostic_ref: None,
+            })?;
+        let response =
+            crate::codex::history::read_managed_history(repository, adapter_state_key).await?;
+        if response
+            .turns
+            .iter()
+            .flat_map(|turn| &turn.items)
+            .any(|item| matches!(item, AgentItem::Raw { .. }))
+        {
+            return Err(ProtocolError {
+                code: "adapter-raw-history-blocked".into(),
+                message: "Codex history contains an unmodeled vendor frame".into(),
+                diagnostic_ref: None,
+            });
+        }
+        Ok(CanonicalHistoryRead {
+            agent_kind: AgentKind::Codex,
+            turns: response.turns,
+        })
     }
 
     async fn submit_decision(
@@ -823,6 +1093,25 @@ impl Drop for CodexAdapter {
     }
 }
 
+fn ensure_adapter_state_key(adapter_state_key: RuntimeId) -> Result<(), ProtocolError> {
+    if adapter_state_key.kind() != RuntimeIdKind::AdapterState {
+        return Err(ProtocolError {
+            code: "adapter-state-invalid-key".into(),
+            message: "canonical Codex continue requires an adapterStateKey".into(),
+            diagnostic_ref: None,
+        });
+    }
+    Ok(())
+}
+
+fn adapter_state_error(error: RuntimeStoreError) -> ProtocolError {
+    ProtocolError {
+        code: error.code().into(),
+        message: format!("Codex private state operation failed: {error}"),
+        diagnostic_ref: None,
+    }
+}
+
 // ── Codex approval response builders ────────────────────────────────────────
 //
 // Mirrors v1_legacy::approval_response_for_decision (mod.rs ~1830).
@@ -919,4 +1208,99 @@ const SIGKILL: i32 = 9;
 unsafe extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, sig: i32) -> i32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{canonicalize_event, observed_codex_thread_id, validate_resume_result_thread_id};
+    use crate::agent::CanonicalAgentEvent;
+    use agentdeck_protocol::{
+        AgentItem, AgentItemMeta, AgentKind, ProtocolError, ServerEvent, SessionId, ThreadId,
+    };
+
+    #[test]
+    fn thread_id_extraction_covers_notification_item_and_resume_result_shapes() {
+        assert_eq!(
+            observed_codex_thread_id(
+                r#"{"method":"turn/started","params":{"threadId":"direct"}}"#,
+            )
+            .as_deref(),
+            Some("direct")
+        );
+        assert_eq!(
+            observed_codex_thread_id(
+                r#"{"method":"item/started","params":{"item":{"threadId":"nested"}}}"#,
+            )
+            .as_deref(),
+            Some("nested")
+        );
+        assert_eq!(
+            observed_codex_thread_id(r#"{"id":2,"result":{"thread":{"id":"resume"}}}"#).as_deref(),
+            Some("resume")
+        );
+        assert_eq!(observed_codex_thread_id("not-json"), None);
+    }
+
+    #[test]
+    fn resume_result_requires_the_exact_persisted_thread_id() {
+        let expected = ThreadId("persisted-private-thread".into());
+        validate_resume_result_thread_id(
+            &serde_json::json!({"thread": {"id": expected.0}}),
+            &expected,
+        )
+        .expect("exact authoritative resume id");
+        for result in [
+            serde_json::json!({}),
+            serde_json::json!({"thread": {}}),
+            serde_json::json!({"thread": {"id": "different-thread"}}),
+        ] {
+            let error = validate_resume_result_thread_id(&result, &expected)
+                .expect_err("missing or mismatched resume identity must fail closed");
+            assert_eq!(error.code, "codex-thread-id-mismatch");
+        }
+    }
+
+    #[test]
+    fn canonical_boundary_drops_routing_ids_and_blocks_raw_vendor_frames() {
+        assert!(
+            canonicalize_event(ServerEvent::SessionStarted {
+                session_id: SessionId("transient".into()),
+                thread_id: Some(ThreadId("private-thread".into())),
+                agent_kind: AgentKind::Codex,
+            })
+            .is_none()
+        );
+        let event = canonicalize_event(ServerEvent::AgentItem {
+            session_id: SessionId("transient".into()),
+            thread_id: ThreadId("private-thread".into()),
+            agent_kind: AgentKind::Codex,
+            item: AgentItem::Raw {
+                raw_kind: "unknown".into(),
+                raw_payload: r#"{"threadId":"private-thread"}"#.into(),
+                meta: AgentItemMeta::default(),
+            },
+        })
+        .expect("raw frame becomes a typed failure");
+        assert!(matches!(
+            event,
+            CanonicalAgentEvent::Error(error) if error.code == "adapter-raw-event-blocked"
+        ));
+        let error = canonicalize_event(ServerEvent::Error {
+            session_id: Some(SessionId("transient".into())),
+            error: ProtocolError {
+                code: "codex-malformed-json".into(),
+                message: "malformed frame with threadId=private-thread".into(),
+                diagnostic_ref: Some("private-thread".into()),
+            },
+        })
+        .expect("private error becomes canonical error");
+        match error {
+            CanonicalAgentEvent::Error(error) => {
+                assert_eq!(error.code, "codex-malformed-json");
+                assert!(!error.message.contains("private-thread"));
+                assert!(error.diagnostic_ref.is_none());
+            }
+            other => panic!("expected canonical error, got {other:?}"),
+        }
+    }
 }

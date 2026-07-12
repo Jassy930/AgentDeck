@@ -1,10 +1,11 @@
-//! Claude Code cross-agent history layer (N8 守护：CC 原生接口为事实唯一来源).
+//! Claude Code cross-agent history layer (N8 守护：CC 原生接口为唯一权威事实源).
 //!
-//! Phase 4 Task 4B. **No AgentDeck-side metadata layer** — list /
+//! Phase 4 Task 4B. **No AgentDeck-side history metadata layer** — list /
 //! read / archive / rename all go through CC's native artefacts
 //! (`~/.claude/projects/<encoded_cwd>/*.jsonl`, `claude rm`,
-//! `claude --resume --name`). No `cc-meta/` directory exists; this
-//! file does not create one.
+//! `claude --resume --name`). P3.3 的 `claude_code_adapter_state` 只是一份
+//! StorageKEK 保护的 resume 派生索引，不保存本文件负责的任何历史元数据；没有
+//! `cc-meta/` 目录，本文件也不会创建它。
 //!
 //! ## Wire-shape findings vs spec § 5.6
 //!
@@ -33,7 +34,7 @@
 //! `HistoryListItem::title`. Verified live against `claude 2.1.191`.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -44,6 +45,136 @@ use agentdeck_protocol::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+
+use crate::claude_code::state::ClaudeCodeStateRepository;
+#[cfg(test)]
+use crate::runtime::store::ConversationDescriptor;
+use crate::runtime::store::{RuntimeId, RuntimeStoreError};
+
+/// 只由本模块在本机 CC projects root 中读回实体 JSONL 后签发的 opaque entry。
+/// Debug 不输出 native session id/path，客户端 wire 也无法构造。
+pub(super) struct VerifiedNativeHistoryEntry {
+    thread_id: ThreadId,
+}
+
+impl VerifiedNativeHistoryEntry {
+    pub(super) fn into_thread_id(self) -> ThreadId {
+        self.thread_id
+    }
+}
+
+impl std::fmt::Debug for VerifiedNativeHistoryEntry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("VerifiedNativeHistoryEntry([REDACTED])")
+    }
+}
+
+/// Canonical Runtime history lookup：common 只给 neutral adapterStateKey，raw
+/// CC session id 在本模块内解析后立即交给 native JSONL backend。
+pub(super) async fn read_managed_history(
+    repository: &ClaudeCodeStateRepository,
+    adapter_state_key: RuntimeId,
+) -> Result<HistoryReadResponse, ProtocolError> {
+    let thread_id = repository
+        .resolve(adapter_state_key)
+        .await
+        .map_err(adapter_state_protocol_error)?
+        .ok_or_else(|| ProtocolError {
+            code: "adapter-state-not-found".into(),
+            message: "Claude Code history mapping was not found".into(),
+            diagnostic_ref: None,
+        })?;
+    read_history(&thread_id)
+        .await
+        .map_err(|error| ProtocolError {
+            code: error.code,
+            message: "Claude Code private history read failed".into(),
+            diagnostic_ref: None,
+        })
+}
+
+/// 只从调用方明确选定的 native history entry 重建派生索引；不按
+/// title/cwd/mtime 猜测随机 adapterStateKey 的旧归属。
+pub(super) async fn rebuild_managed_index(
+    repository: &ClaudeCodeStateRepository,
+    adapter_state_key: RuntimeId,
+    native: &HistoryListItem,
+) -> Result<(), ProtocolError> {
+    let root = claude_projects_root().ok_or_else(|| ProtocolError {
+        code: "cc-history-root-unavailable".into(),
+        message: "cannot resolve the current user's Claude Code history root".into(),
+        diagnostic_ref: None,
+    })?;
+    rebuild_managed_index_at(repository, adapter_state_key, native, root).await
+}
+
+async fn rebuild_managed_index_at(
+    repository: &ClaudeCodeStateRepository,
+    adapter_state_key: RuntimeId,
+    native: &HistoryListItem,
+    root: PathBuf,
+) -> Result<(), ProtocolError> {
+    let native = native.clone();
+    let verified =
+        tokio::task::spawn_blocking(move || verify_native_history_entry_at(&root, &native))
+            .await
+            .map_err(|error| ProtocolError {
+                code: "cc-history-task-join".into(),
+                message: format!("native history verification task failed: {error}"),
+                diagnostic_ref: None,
+            })??;
+    repository
+        .bind_verified_native_history(adapter_state_key, verified)
+        .await
+        .map_err(adapter_state_protocol_error)
+}
+
+/// Adapter canonical retry 只据已持久化 private ref 判断 native session 是否已经
+/// 真正落成。恰好一个 regular/non-memory JSONL 才返回 true；不存在返回 false，
+/// 歧义与其他 IO/安全错误 fail-close。
+pub(super) async fn native_session_is_materialized(
+    thread_id: &ThreadId,
+) -> Result<bool, ProtocolError> {
+    let root = claude_projects_root().ok_or_else(|| ProtocolError {
+        code: "cc-history-root-unavailable".into(),
+        message: "cannot resolve the current user's Claude Code history root".into(),
+        diagnostic_ref: None,
+    })?;
+    native_session_is_materialized_at(root, thread_id).await
+}
+
+async fn native_session_is_materialized_at(
+    root: PathBuf,
+    thread_id: &ThreadId,
+) -> Result<bool, ProtocolError> {
+    let native = HistoryListItem {
+        thread_id: thread_id.clone(),
+        agent_kind: AgentKind::ClaudeCode,
+        title: None,
+        cwd: PathBuf::new(),
+        last_active_ms: 0,
+        archived: false,
+    };
+    match tokio::task::spawn_blocking(move || verify_native_history_entry_at(&root, &native))
+        .await
+        .map_err(|error| ProtocolError {
+            code: "cc-history-task-join".into(),
+            message: format!("native history verification task failed: {error}"),
+            diagnostic_ref: None,
+        })? {
+        Ok(_) => Ok(true),
+        Err(error) if error.code == "cc-history-native-entry-not-found" => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn adapter_state_protocol_error(error: RuntimeStoreError) -> ProtocolError {
+    ProtocolError {
+        code: error.code().into(),
+        message: format!("Claude Code private history mapping failed: {error}"),
+        diagnostic_ref: None,
+    }
+}
 
 // ── Path encoding (CC convention) ───────────────────────────────────────────
 
@@ -68,6 +199,227 @@ pub fn decode_cwd(dirname: &str) -> PathBuf {
 fn claude_projects_root() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join(".claude").join("projects"))
+}
+
+fn verify_native_history_entry_at(
+    root: &Path,
+    native: &HistoryListItem,
+) -> Result<VerifiedNativeHistoryEntry, ProtocolError> {
+    if native.agent_kind != AgentKind::ClaudeCode {
+        return Err(ProtocolError {
+            code: "cc-history-wrong-agent".into(),
+            message: "native history entry is not owned by Claude Code".into(),
+            diagnostic_ref: None,
+        });
+    }
+    let id = native.thread_id.0.as_str();
+    if id.len() < 8
+        || id.len() > 128
+        || !id.contains('-')
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(ProtocolError {
+            code: "cc-history-invalid-session-id".into(),
+            message: "Claude Code native session id has an unsafe shape".into(),
+            diagnostic_ref: None,
+        });
+    }
+    let filename = format!("{id}.jsonl");
+    let mut match_count = 0_u8;
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(native_history_not_found());
+        }
+        Err(error) => {
+            return Err(ProtocolError {
+                code: "cc-history-read".into(),
+                message: format!("read native history root: {error}"),
+                diagnostic_ref: None,
+            });
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| ProtocolError {
+            code: "cc-history-read".into(),
+            message: format!("read native history directory entry: {error}"),
+            diagnostic_ref: None,
+        })?;
+        let project = entry.path();
+        let project_meta = std::fs::symlink_metadata(&project).map_err(|error| ProtocolError {
+            code: "cc-history-read".into(),
+            message: format!("inspect native history project directory: {error}"),
+            diagnostic_ref: None,
+        })?;
+        if !project_meta.file_type().is_dir() || project_meta.file_type().is_symlink() {
+            continue;
+        }
+        let candidate = project.join(&filename);
+        let metadata = match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(ProtocolError {
+                    code: "cc-history-read".into(),
+                    message: format!("inspect native history entry: {error}"),
+                    diagnostic_ref: None,
+                });
+            }
+        };
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        if is_memory_agent_project_path(&candidate) {
+            continue;
+        }
+        if inspect_native_history_jsonl(&candidate, &metadata)? {
+            continue;
+        }
+        match_count = match_count.saturating_add(1);
+    }
+    if match_count != 1 {
+        return if match_count == 0 {
+            Err(native_history_not_found())
+        } else {
+            Err(ProtocolError {
+                code: "cc-history-native-entry-ambiguous".into(),
+                message:
+                    "Claude Code native history entry did not resolve to exactly one JSONL file"
+                        .into(),
+                diagnostic_ref: None,
+            })
+        };
+    }
+    Ok(VerifiedNativeHistoryEntry {
+        thread_id: native.thread_id.clone(),
+    })
+}
+
+fn native_history_not_found() -> ProtocolError {
+    ProtocolError {
+        code: "cc-history-native-entry-not-found".into(),
+        message: "Claude Code native history entry did not resolve to exactly one JSONL file"
+            .into(),
+        diagnostic_ref: None,
+    }
+}
+
+/// 在签发 `VerifiedNativeHistoryEntry` 前，从已检查的 regular file descriptor
+/// 有界读回 JSONL。打开、读取、JSON 解析或 metadata identity 任一失败都
+/// fail-close；返回值只表示该实体是否属于 memory/observer session。
+fn inspect_native_history_jsonl(
+    candidate: &Path,
+    expected_metadata: &std::fs::Metadata,
+) -> Result<bool, ProtocolError> {
+    const MAX_VERIFY_BYTES: u64 = 256 * 1024;
+    const MAX_VERIFY_LINES: usize = 256;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let file = options.open(candidate).map_err(|error| ProtocolError {
+        code: "cc-history-read".into(),
+        message: format!("open native history entry: {error}"),
+        diagnostic_ref: None,
+    })?;
+    let opened_metadata = file.metadata().map_err(|error| ProtocolError {
+        code: "cc-history-read".into(),
+        message: format!("inspect opened native history entry: {error}"),
+        diagnostic_ref: None,
+    })?;
+    if !opened_metadata.file_type().is_file() {
+        return Err(invalid_native_history());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if expected_metadata.dev() != opened_metadata.dev()
+            || expected_metadata.ino() != opened_metadata.ino()
+        {
+            return Err(ProtocolError {
+                code: "cc-history-read".into(),
+                message: "native history entry changed while it was being verified".into(),
+                diagnostic_ref: None,
+            });
+        }
+    }
+
+    let mut reader = BufReader::new(file).take(MAX_VERIFY_BYTES + 1);
+    let mut line = String::new();
+    let mut total_bytes = 0_u64;
+    let mut line_count = 0_usize;
+    let mut saw_json_object = false;
+    loop {
+        if total_bytes == MAX_VERIFY_BYTES || line_count == MAX_VERIFY_LINES {
+            break;
+        }
+        line.clear();
+        let read = reader.read_line(&mut line).map_err(|error| ProtocolError {
+            code: "cc-history-read".into(),
+            message: format!("read native history entry: {error}"),
+            diagnostic_ref: None,
+        })?;
+        if read == 0 {
+            break;
+        }
+        total_bytes = total_bytes
+            .checked_add(u64::try_from(read).map_err(|_| invalid_native_history())?)
+            .ok_or_else(invalid_native_history)?;
+        line_count = line_count
+            .checked_add(1)
+            .ok_or_else(invalid_native_history)?;
+        if total_bytes > MAX_VERIFY_BYTES || line_count > MAX_VERIFY_LINES {
+            return Err(invalid_native_history());
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(trimmed).map_err(|_| invalid_native_history())?;
+        if !value.is_object() {
+            return Err(invalid_native_history());
+        }
+        saw_json_object = true;
+        if json_value_is_memory_agent(&value) {
+            return Ok(true);
+        }
+    }
+    if !saw_json_object {
+        return Err(invalid_native_history());
+    }
+    Ok(false)
+}
+
+fn json_value_is_memory_agent(value: &Value) -> bool {
+    if value
+        .get("content")
+        .and_then(Value::as_str)
+        .map(is_memory_agent_prompt)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    value.get("type").and_then(Value::as_str) == Some("user")
+        && value
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .map(is_memory_agent_prompt)
+            .unwrap_or(false)
+}
+
+fn invalid_native_history() -> ProtocolError {
+    ProtocolError {
+        code: "cc-history-native-entry-invalid".into(),
+        message: "Claude Code native history entry was not readable, bounded valid JSONL".into(),
+        diagnostic_ref: None,
+    }
 }
 
 // ── claude agents --json parser (best-effort live-agent enrichment) ─────────
@@ -1165,6 +1517,254 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].thread_id.0, "00000000-0000-0000-0000-000000000100");
 
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn native_history_verification_requires_one_regular_non_memory_jsonl() {
+        let home = tempdir_unique();
+        let root = home.join(".claude").join("projects");
+        let project = root.join(encode_cwd(Path::new("/tmp/verified-native")));
+        std::fs::create_dir_all(&project).unwrap();
+        let session_id = "10000000-0000-0000-0000-000000000001";
+        std::fs::write(
+            project.join(format!("{session_id}.jsonl")),
+            r#"{"type":"user","message":{"role":"user","content":"real prompt"}}"#,
+        )
+        .unwrap();
+        let native = HistoryListItem {
+            thread_id: ThreadId(session_id.to_owned()),
+            agent_kind: AgentKind::ClaudeCode,
+            title: Some("wire title is not trusted for identity".to_owned()),
+            cwd: PathBuf::from("/intentionally/not/used/as/identity"),
+            last_active_ms: 0,
+            archived: false,
+        };
+
+        let verified =
+            verify_native_history_entry_at(&root, &native).expect("one native JSONL verifies");
+        assert_eq!(
+            format!("{verified:?}"),
+            "VerifiedNativeHistoryEntry([REDACTED])"
+        );
+        assert_eq!(verified.into_thread_id(), native.thread_id);
+        assert!(!home.join("cc-meta").exists());
+
+        let duplicate_project = root.join("-tmp-duplicate");
+        std::fs::create_dir_all(&duplicate_project).unwrap();
+        std::fs::write(
+            duplicate_project.join(format!("{session_id}.jsonl")),
+            r#"{"type":"user","message":{"role":"user","content":"duplicate"}}"#,
+        )
+        .unwrap();
+        let error = verify_native_history_entry_at(&root, &native)
+            .expect_err("duplicate native ids are ambiguous");
+        assert_eq!(error.code, "cc-history-native-entry-ambiguous");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn native_history_verification_rejects_wire_only_and_memory_entries() {
+        let home = tempdir_unique();
+        let root = home.join(".claude").join("projects");
+        let observer = root.join("-Users-user--claude-mem-observer-sessions");
+        std::fs::create_dir_all(&observer).unwrap();
+        let session_id = "20000000-0000-0000-0000-000000000002";
+        std::fs::write(
+            observer.join(format!("{session_id}.jsonl")),
+            r#"{"type":"user","message":{"role":"user","content":"internal observer"}}"#,
+        )
+        .unwrap();
+        let mut native = HistoryListItem {
+            thread_id: ThreadId(session_id.to_owned()),
+            agent_kind: AgentKind::ClaudeCode,
+            title: None,
+            cwd: PathBuf::new(),
+            last_active_ms: 0,
+            archived: false,
+        };
+        let error = verify_native_history_entry_at(&root, &native)
+            .expect_err("observer sessions are not importable");
+        assert_eq!(error.code, "cc-history-native-entry-not-found");
+
+        native.agent_kind = AgentKind::Codex;
+        let error = verify_native_history_entry_at(&root, &native)
+            .expect_err("client cannot relabel another agent as native CC history");
+        assert_eq!(error.code, "cc-history-wrong-agent");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn native_history_missing_projects_root_is_not_materialized() {
+        let home = tempdir_unique();
+        let root = home.join(".claude").join("projects");
+        let native = HistoryListItem {
+            thread_id: ThreadId("21000000-0000-0000-0000-000000000002".to_owned()),
+            agent_kind: AgentKind::ClaudeCode,
+            title: None,
+            cwd: PathBuf::new(),
+            last_active_ms: 0,
+            archived: false,
+        };
+
+        let error = verify_native_history_entry_at(&root, &native)
+            .expect_err("a fresh home has no materialized native session");
+        assert_eq!(error.code, "cc-history-native-entry-not-found");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn canonical_retry_treats_missing_projects_root_as_not_materialized() {
+        let home = tempdir_unique();
+        let root = home.join(".claude").join("projects");
+        let thread_id = ThreadId("21500000-0000-0000-0000-000000000002".to_owned());
+
+        assert!(
+            !native_session_is_materialized_at(root, &thread_id)
+                .await
+                .expect("fresh home should allow retry with the persisted --session-id")
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn native_history_verification_rejects_empty_and_malformed_jsonl() {
+        let home = tempdir_unique();
+        let root = home.join(".claude").join("projects");
+        let project = root.join(encode_cwd(Path::new("/tmp/invalid-native")));
+        std::fs::create_dir_all(&project).unwrap();
+        let session_id = "22000000-0000-0000-0000-000000000002";
+        let candidate = project.join(format!("{session_id}.jsonl"));
+        let native = HistoryListItem {
+            thread_id: ThreadId(session_id.to_owned()),
+            agent_kind: AgentKind::ClaudeCode,
+            title: None,
+            cwd: PathBuf::new(),
+            last_active_ms: 0,
+            archived: false,
+        };
+
+        for content in ["", "not-json\n"] {
+            std::fs::write(&candidate, content).unwrap();
+            let error = verify_native_history_entry_at(&root, &native)
+                .expect_err("candidate must contain readable JSONL");
+            assert_eq!(error.code, "cc-history-native-entry-invalid");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn managed_index_rebuild_verifies_native_jsonl_persists_and_never_creates_cc_meta() {
+        use crate::claude_code::state::ClaudeCodeStateRepository;
+        use crate::runtime::store::{
+            NewConversation, RuntimeId, RuntimeIdKind, RuntimeStoreConfig, RuntimeStoreHandle,
+        };
+        use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
+
+        let home = tempdir_unique();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let projects = home.join(".claude").join("projects");
+        let project = projects.join(encode_cwd(Path::new("/tmp/rebuild-managed")));
+        std::fs::create_dir_all(&project).unwrap();
+        let native_id = "30000000-0000-0000-0000-000000000003";
+        std::fs::write(
+            project.join(format!("{native_id}.jsonl")),
+            r#"{"type":"user","message":{"role":"user","content":"native"}}"#,
+        )
+        .unwrap();
+        let native = HistoryListItem {
+            thread_id: ThreadId(native_id.into()),
+            agent_kind: AgentKind::ClaudeCode,
+            title: Some("untrusted wire title".into()),
+            cwd: PathBuf::from("/untrusted/wire/cwd"),
+            last_active_ms: 0,
+            archived: false,
+        };
+
+        let database = home.join("runtime.db");
+        let keys = MemoryKeyStore::new();
+        let storage_kek =
+            load_or_create_storage_kek(&keys, &database).expect("create rebuild StorageKEK");
+        let store =
+            RuntimeStoreHandle::open(RuntimeStoreConfig::new(database.clone()), storage_kek)
+                .await
+                .expect("open rebuild store");
+        let adapter_state_key =
+            RuntimeId::from_bytes(RuntimeIdKind::AdapterState, [0x93; 16]).unwrap();
+        store
+            .create_conversation(NewConversation {
+                conversation_id: RuntimeId::from_bytes(RuntimeIdKind::Conversation, [0x92; 16])
+                    .unwrap(),
+                adapter_state_key,
+                descriptor: ConversationDescriptor {
+                    agent_kind: AgentKind::ClaudeCode,
+                    title: Some("rebuild".to_owned()),
+                    cwd: PathBuf::from("/tmp/agentdeck-cc-history"),
+                },
+            })
+            .await
+            .expect("create managed conversation");
+        let repository = ClaudeCodeStateRepository::new_for_test(store.clone());
+        rebuild_managed_index_at(&repository, adapter_state_key, &native, projects.clone())
+            .await
+            .expect("verified native rebuild");
+        assert_eq!(
+            repository
+                .resolve(adapter_state_key)
+                .await
+                .expect("resolve rebuilt mapping"),
+            Some(native.thread_id.clone())
+        );
+        store.shutdown().await.expect("shutdown rebuild store");
+
+        let storage_kek =
+            load_or_create_storage_kek(&keys, &database).expect("reload rebuild StorageKEK");
+        let reopened =
+            RuntimeStoreHandle::open(RuntimeStoreConfig::new(database.clone()), storage_kek)
+                .await
+                .expect("reopen rebuild store");
+        assert_eq!(
+            ClaudeCodeStateRepository::new_for_test(reopened.clone())
+                .resolve(adapter_state_key)
+                .await
+                .expect("resolve rebuilt mapping after restart"),
+            Some(native.thread_id.clone())
+        );
+
+        let duplicate = projects.join("-tmp-rebuild-duplicate");
+        std::fs::create_dir_all(&duplicate).unwrap();
+        std::fs::write(
+            duplicate.join(format!("{native_id}.jsonl")),
+            r#"{"type":"user","message":{"role":"user","content":"duplicate"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rebuild_managed_index_at(
+                &ClaudeCodeStateRepository::new_for_test(reopened.clone()),
+                adapter_state_key,
+                &native,
+                projects.clone(),
+            )
+            .await
+            .expect_err("ambiguous native history must fail before bind")
+            .code,
+            "cc-history-native-entry-ambiguous"
+        );
+        reopened.shutdown().await.expect("shutdown reopened store");
+
+        assert!(!home.join("cc-meta").exists());
+        assert!(
+            !home
+                .join("Library")
+                .join("Application Support")
+                .join("AgentDeck")
+                .join("cc-meta")
+                .exists()
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

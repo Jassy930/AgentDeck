@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use agentdeck_protocol::AgentKind;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::store::admission::SystemRuntimeCapacityProbe;
@@ -31,6 +33,7 @@ pub const MAX_GLOBAL_QUEUED_COMMANDS: u32 = 1_024;
 pub const MAX_GLOBAL_QUEUED_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_COMMAND_PAYLOAD_BYTES: usize = 256 * 1024;
 pub const MAX_CONVERSATION_DESCRIPTOR_BYTES: usize = 1024 * 1024;
+pub const MAX_ADAPTER_STATE_REFERENCE_BYTES: usize = 4 * 1024;
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 1024;
 pub const MAX_EXECUTION_INTENT_BYTES: usize = 1024 * 1024;
 pub const MAX_RUNTIME_EVENT_BYTES: usize = 64 * 1024 * 1024;
@@ -49,6 +52,8 @@ pub const COMMAND_LEDGER_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeStoreOperation {
     InitializeBeforePublish,
+    MigrateSchemaBeforeCommit,
+    MigrateSchemaAfterCommit,
     Inspect,
     RecordEnrollmentReceiptBeforeCommit,
     RecordEnrollmentReceiptAfterCommit,
@@ -66,6 +71,8 @@ pub enum RuntimeStoreOperation {
     AuthorizeExecutionReleaseAfterCommit,
     CompleteCommandBeforeCommit,
     CompleteCommandAfterCommit,
+    BindAdapterStateBeforeCommit,
+    BindAdapterStateAfterCommit,
 }
 
 pub trait RuntimeStoreFaultInjector: Send + Sync {
@@ -260,6 +267,7 @@ pub enum QueueScope {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeCommitOperation {
+    MigrateSchema,
     RecordEnrollmentReceipt,
     CreateConversation,
     AcceptCommand,
@@ -268,6 +276,7 @@ pub enum RuntimeCommitOperation {
     PersistFence,
     AuthorizeExecutionRelease,
     CompleteCommand,
+    BindAdapterState,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -290,11 +299,34 @@ impl std::fmt::Debug for IdempotencyOwner {
     }
 }
 
+/// Common catalog 中唯一允许持久化的中立 conversation 描述。
+///
+/// vendor resume reference、ThreadId/SessionId 与任意扩展字段都不能进入此类型；
+/// store 只接受该类型并以固定字段顺序的 canonical JSON 加密落盘。
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationDescriptor {
+    pub agent_kind: AgentKind,
+    pub title: Option<String>,
+    pub cwd: PathBuf,
+}
+
+impl std::fmt::Debug for ConversationDescriptor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConversationDescriptor")
+            .field("agent_kind", &self.agent_kind)
+            .field("title", &self.title.as_ref().map(|_| "[REDACTED]"))
+            .field("cwd", &"[REDACTED]")
+            .finish()
+    }
+}
+
 #[derive(Clone)]
 pub struct NewConversation {
     pub conversation_id: RuntimeId,
     pub adapter_state_key: RuntimeId,
-    pub descriptor: Vec<u8>,
+    pub descriptor: ConversationDescriptor,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -308,7 +340,7 @@ pub struct ConversationRecord {
     pub lifecycle: ConversationLifecycle,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
-    pub descriptor: Vec<u8>,
+    pub descriptor: ConversationDescriptor,
 }
 
 impl std::fmt::Debug for ConversationRecord {
@@ -322,7 +354,7 @@ impl std::fmt::Debug for ConversationRecord {
             .field("event_high_water", &self.event_high_water)
             .field("accepted_command_count", &self.accepted_command_count)
             .field("lifecycle", &self.lifecycle)
-            .field("descriptor_bytes", &self.descriptor.len())
+            .field("descriptor", &self.descriptor)
             .finish()
     }
 }
@@ -675,6 +707,10 @@ pub enum RuntimeStoreError {
     ConversationNotFound,
     #[error("runtime conversation stable identity conflicts with an existing record")]
     ConversationConflict,
+    #[error("runtime adapter state reference conflicts with the existing binding")]
+    AdapterStateConflict,
+    #[error("runtime adapter state key belongs to the other private namespace")]
+    AdapterStateNamespaceMismatch,
     #[error("runtime command was not found")]
     CommandNotFound,
     #[error("runtime command idempotency key was reused with a different payload")]
@@ -773,6 +809,8 @@ impl RuntimeStoreError {
             Self::IdKindMismatch { .. }
             | Self::ConversationNotFound
             | Self::ConversationConflict
+            | Self::AdapterStateConflict
+            | Self::AdapterStateNamespaceMismatch
             | Self::CommandNotFound
             | Self::TimeOutOfRange
             | Self::ClockRegressed { .. }

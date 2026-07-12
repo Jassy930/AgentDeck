@@ -25,6 +25,41 @@
 use agentdeck_protocol::{HistoryListItem, HistoryReadResponse, ProtocolError, ThreadId};
 use std::path::Path;
 
+use crate::codex::state::CodexStateRepository;
+use crate::runtime::store::{RuntimeId, RuntimeStoreError};
+
+/// Canonical Runtime history lookup：common 只给 neutral adapterStateKey，raw
+/// Codex thread id 在本模块内解析后立即交给 compatibility history backend。
+pub(super) async fn read_managed_history(
+    repository: &CodexStateRepository,
+    adapter_state_key: RuntimeId,
+) -> Result<HistoryReadResponse, ProtocolError> {
+    let thread_id = repository
+        .resolve(adapter_state_key)
+        .await
+        .map_err(adapter_state_protocol_error)?
+        .ok_or_else(|| ProtocolError {
+            code: "adapter-state-not-found".into(),
+            message: "Codex history mapping was not found".into(),
+            diagnostic_ref: None,
+        })?;
+    read_history(&thread_id)
+        .await
+        .map_err(|error| ProtocolError {
+            code: error.code,
+            message: "Codex private history read failed".into(),
+            diagnostic_ref: None,
+        })
+}
+
+fn adapter_state_protocol_error(error: RuntimeStoreError) -> ProtocolError {
+    ProtocolError {
+        code: error.code().into(),
+        message: format!("Codex private history mapping failed: {error}"),
+        diagnostic_ref: None,
+    }
+}
+
 /// List Codex history. v0.2 stub: returns an empty list. The router's
 /// cross-agent List merger silently absorbs this (one adapter returning
 /// nothing is fine) so CC history still surfaces alongside.

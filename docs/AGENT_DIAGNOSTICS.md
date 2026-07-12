@@ -500,9 +500,9 @@ ignored 测试不是通过证据。
 | `daemon.diagnostics.path_unavailable` | diagnostics one-shot 无可用日志路径 | 提供合法 profile/absolute data-dir，或先创建一次诊断日志 |
 | `daemon.runtime.main_loop_failed` | security bootstrap 已完成，但 stdio RuntimeHub 主循环失败 | 按同一 diagnostic log 检查 IPC I/O；guard/KEK 会随进程退出释放/清零 |
 
-## Runtime SQLite / journal 诊断（Companion MVP P3.2）
+## Runtime SQLite / journal / adapter 私表诊断（Companion MVP P3.2/P3.3）
 
-P3.2 error code 是 store 内部精确错误的稳定诊断归类；P3.4 才负责映射成 wire
+P3.2/P3.3 error code 是 store 内部精确错误的稳定诊断归类；P3.4 才负责映射成 wire
 `RuntimeFailure`。排查时保留 DB/WAL/SHM 原件，先运行 diagnostics/read-only inspection，
 不要用删除 sidecar、生成新 KEK 或直接改 high-water 的方式“修复”。
 
@@ -534,10 +534,10 @@ scan active 时 inspect 与 shutdown 仍可用；create/accept/start、fence/rel
 cursor/单 outstanding scan 限制。若 scan 无法结束，保留 DB/WAL/SHM 与 Keychain 原件后让
 daemon fail-closed 退出，不要跳页、伪造 cursor 或删除 sidecar。
 
-| P3.2 code | 常见内部原因 | 下一步 |
+| P3.2/P3.3 code | 常见内部原因 | 下一步 |
 | --- | --- | --- |
 | `daemon.runtime.store_invalid` | path/type/owner/mode/nlink、busy/count/byte config 或 operation input 不合法 | 核对 0700 namespace、0600 artifacts 和固定 config；拒绝 symlink/hardlink，不自动放宽 |
-| `daemon.runtime.schema_incompatible` | schema family/version/signature/live manifest、descriptor/row linkage、逐 conversation HWM、authenticated metadata 或五类 table total 不一致 | 停止写入并保留三文件；核对版本和 tamper，不能原地猜测 migration |
+| `daemon.runtime.schema_incompatible` | schema family/version/signature/live manifest、typed canonical descriptor/row linkage、逐 conversation HWM、authenticated metadata、五类 journal total 或两类 adapter-state total 不一致 | 停止写入并保留 main/WAL/SHM/journal；v1→v2 只能走内置原子 migration，不能原地猜测/手改 schema |
 | `daemon.runtime.store_unavailable` | worker/shutdown/commit outcome、clock/capacity probe、SQLite/I/O、sequence coordination，或 bounded checkpoint 被 reader pin 住 | 对 unknown outcome 用完全相同 stable ID/idempotency input 重试；checkpoint blocked 时停止新副作用、释放 reader 并保留 WAL，其他错误保留 evidence 后重启/修复底层 I/O |
 | `daemon.runtime.store_busy` | normal/safety/read lane 的 count 或 retained-allocation byte permit 已满 | 客户端退避并保持同一 idempotency key；不要并发重发新 key |
 | `daemon.runtime.recovering` | 已冻结 paged recovery barrier，终页尚未核账并 finish | 继续使用上一页返回的 exact cursor；RuntimeCore 逐页消费，终页 finish 后再开放请求，不得并行 mutation |
@@ -545,18 +545,29 @@ daemon fail-closed 退出，不要跳页、伪造 cursor 或删除 sidecar。
 | `daemon.runtime.disk_low` | projected transaction 后无法保留 `max(512 MiB, filesystem 5%)` | 释放同一文件系统空间后以相同请求重试；该错误本身不永久 latch |
 | `daemon.runtime.store_full` | main+WAL+SHM projected footprint、SQLite page budget，或剩余 safety obligation 接近/超过 2 GiB | 停止普通写；仅在安全写自身复核通过时完成终态并导出诊断，不要手工删除 WAL |
 | `daemon.runtime.crypto_failed` | StorageKEK unwrap、row AEAD、blind token 或 generation 校验失败 | 视为 key/domain/tamper 故障；恢复原 Keychain item 和正确签名环境，禁止新建 KEK |
-| `daemon.runtime.invalid_state` | stable ID/kind、clock monotonicity、queue head、fence/release、terminal/sequence 状态冲突 | 读取 canonical command/recovery state；错误 turn/nonce/fence 不能强制覆盖 |
+| `daemon.runtime.invalid_state` | stable ID/kind、clock monotonicity、queue head、fence/release、terminal/sequence 状态冲突，或 adapterStateKey 已绑定另一 namespace/不同 resume ref | 读取 canonical command/recovery/private-state 状态；错误 turn/nonce/fence 或 vendor ref 不能强制覆盖；CC 映射只能从明确 native history entry 重建，不按 title/cwd 猜测 |
 | `daemon.command.idempotency_conflict` | 同 conversation + stable owner + key 被不同 payload 重用 | 使用原 payload 查询原 command；新意图必须换新 key |
 | `daemon.command.queue_full` | conversation 32、全机 1,024 或 queued payload 256 MiB 任一先到 | 等待/取消已有 Accepted 后以同一请求重试；满载时 exact replay 仍应成功 |
 | `daemon.payload.item_too_large` | prompt、descriptor、intent/event/fence/result 超过各自硬上界 | 在进入 store 前缩小对应 item；不能切片成多个同 key 请求规避 |
 | `daemon.runtime.recovery_too_large` | 单个 conversation recovery page 的 retained projection 超过固定 80 MiB | 视为 schema/cap 漂移或损坏并 fail-close；不能改用全库物化或复用 async lane budget，保留证据后核对 item hard limits |
 | `daemon.command.queue_expired` | Accepted 到达 24 小时边界，已事务化为 Expired 并写 canonical event | 不自动重放旧 vendor 副作用；用新 idempotency key 发起新命令 |
 
+P3.3 canonical adapter 边界的错误不会携带 raw resume reference：
+
+| code | 含义 | 下一步 |
+| --- | --- | --- |
+| `adapter-state-not-configured` / `adapter-state-invalid-key` / `adapter-state-not-found` | canonical adapter 未注入 singleton store、key kind 错误或私有映射不存在 | 核对 daemon composition 与 catalog；禁止退回客户端提供 ThreadId |
+| `adapter-state-vendor-id-forbidden` | canonical CC start 收到客户端指定 native session id | 删除该字段，让 daemon 生成并先持久化随机 UUID |
+| `adapter-state-native-not-materialized` | CC 私有映射存在，但本机没有唯一、可 `O_NOFOLLOW` 打开并有界读回的 regular/non-memory 有效 JSONL | fresh home 缺少 projects root 时继续复用原 `--session-id`；歧义、打不开、空或 malformed JSONL 均 fail-close，不按 title/cwd/mtime 猜测，必要时走显式 native import 或新 conversation |
+| `codex-thread-id-mismatch` | Codex resume response 或后续 frame 缺失/携带与私有映射不同的 thread id | kill 当前 child 并保留原映射；不得接受缺 ID response，也不得用观察到的新值覆盖 |
+| `adapter-state-initial-prompt-required` | canonical CC 新建没有首个 prompt，无法形成 authoritative native init | 只创建 catalog；首个 prompt 到达后再启动 adapter |
+| `adapter-raw-event-blocked` / `adapter-raw-history-blocked` | vendor translator/history 产生未建模 Raw frame | 不向 Runtime/Relay 透传；先补 typed translator/schema 与脱敏测试 |
+
 `machine_enrollment_receipts` 仅用于 root-lost 时定位 old route/root fingerprint；它是刻意保持
 非秘密、未加 MAC 的 rescue locator，不是授权凭据。P4 trust-reset/purge 必须另验
 Relay/admin-signed receipt；该表被改写时不得据此直接删除远端状态。行 MAC/ledger 能检测局部
 篡改，但整套 main+WAL 回滚到更早且内部自洽的快照，要等 P4 Keychain CounterGuard 绑定后才
-能检测；P3.2 诊断不能声称覆盖该攻击。
+能检测；P3.2/P3.3 诊断不能声称覆盖该攻击。
 
 ## Failure Codes
 
@@ -624,6 +635,9 @@ Codex 的命令执行、文件变更和额外权限审批会先在 daemon adapte
 | `cc-rename-failed` | `claude --resume <id> --name <title>` 执行失败 | 确认 session_id 存在且 `claude` 版本支持 `--name` 参数 |
 | `cc-vendor-control-requires-new-turn` | CC 的 permission mode 等 vendor 控件变更需通过新 turn 生效，不支持会话内即时切换 | 下次启动新 session 或新 turn 时携带更新后的 `ClaudeCodeSessionOptions` |
 | `cc-vendor-control-not-supported` | 收到不支持的 ClaudeCodeVendorControl variant | 检查 client 与 daemon 协议版本是否匹配（v2）；升级 client 到最新版 |
+| `cc-session-id-mismatch` / `cc-session-id-missing` | startup/init 的 native session 与私有映射不同，或 authoritative init 缺 ID | daemon 会 kill child 并 fail-close；保留本机诊断，检查 CC CLI 版本/参数语义，不覆盖私表 |
+| `cc-session-identity-eof` / `cc-session-identity-timeout` / `cc-session-identity-read` / `cc-session-identity-too-large` | CC 在 authoritative init 前退出、超时、I/O 失败或超过 256 lines/2 MiB handshake 上界 | 不接受该 turn；检查 hooks/CLI stderr/资源状态，再以原 idempotency input 由 RuntimeCore 裁决是否可重试 |
+| `cc-session-startup-status` | daemon 无法读取 CC child 的早期退出状态 | 按本机进程/权限故障处理，不发布 canonical started/capabilities |
 
 ## v0.2 双 adapter 探测
 

@@ -1,13 +1,28 @@
-//! Runtime SQLite schema v1 与只读识别标记。
+//! Runtime SQLite physical schema 与稳定 crypto context。
 
 use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
 
 pub const RUNTIME_SCHEMA_FAMILY: &str = "agentdeck-runtime";
-pub const RUNTIME_SCHEMA_VERSION: u32 = 1;
+pub const RUNTIME_SCHEMA_VERSION: u32 = 2;
+/// 行密文与 wrapped key bundle 的 AAD context 版本。
+///
+/// physical schema migration 只增表/增认证计数，不得让既有行重新加密或重新包装。
+pub const RUNTIME_CRYPTO_CONTEXT_VERSION: u32 = 1;
 pub const RUNTIME_KEY_GENERATION: u32 = 1;
-pub const EXPECTED_TABLES: [&str; 7] = [
+pub const EXPECTED_TABLES_V1: [&str; 7] = [
+    "commands",
+    "conversations",
+    "event_journal",
+    "execution_fences",
+    "execution_intents",
+    "machine_enrollment_receipts",
+    "runtime_meta",
+];
+pub const EXPECTED_TABLES: [&str; 9] = [
+    "claude_code_adapter_state",
+    "codex_adapter_state",
     "commands",
     "conversations",
     "event_journal",
@@ -19,10 +34,20 @@ pub const EXPECTED_TABLES: [&str; 7] = [
 
 pub fn schema_signature() -> [u8; 32] {
     static SIGNATURE: OnceLock<[u8; 32]> = OnceLock::new();
-    *SIGNATURE.get_or_init(|| Sha256::digest(RUNTIME_DDL.as_bytes()).into())
+    *SIGNATURE.get_or_init(|| {
+        let mut digest = Sha256::new();
+        digest.update(RUNTIME_DDL_V1.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V2.as_bytes());
+        digest.finalize().into()
+    })
 }
 
-pub const RUNTIME_DDL: &str = r#"
+pub fn schema_signature_v1() -> [u8; 32] {
+    static SIGNATURE: OnceLock<[u8; 32]> = OnceLock::new();
+    *SIGNATURE.get_or_init(|| Sha256::digest(RUNTIME_DDL_V1.as_bytes()).into())
+}
+
+pub const RUNTIME_DDL_V1: &str = r#"
 CREATE TABLE runtime_meta (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     schema_family TEXT NOT NULL CHECK(schema_family = 'agentdeck-runtime'),
@@ -182,5 +207,41 @@ CREATE TABLE machine_enrollment_receipts (
     machine_route BLOB NOT NULL CHECK(typeof(machine_route) = 'blob' AND length(machine_route) = 16),
     root_fingerprint BLOB NOT NULL CHECK(typeof(root_fingerprint) = 'blob' AND length(root_fingerprint) = 32),
     PRIMARY KEY(relay_server_id, machine_route)
+);
+"#;
+
+/// v1 -> v2 只增两个 adapter 私有表与其 authenticated ledger totals。
+///
+/// `ALTER TABLE` 使用固定 default 让 migration 可以在单事务里先扩 schema，再以
+/// v1 ledger token 为 compare-and-swap 前提更新 v2 token；既有 wrapped key/ciphertext
+/// 均保持逐字节不变。
+pub const RUNTIME_MIGRATION_V2: &str = r#"
+ALTER TABLE runtime_meta ADD COLUMN codex_adapter_state_count INTEGER NOT NULL DEFAULT 0
+    CHECK(codex_adapter_state_count >= 0);
+ALTER TABLE runtime_meta ADD COLUMN claude_code_adapter_state_count INTEGER NOT NULL DEFAULT 0
+    CHECK(claude_code_adapter_state_count >= 0);
+CREATE TABLE codex_adapter_state (
+    state_key_token BLOB PRIMARY KEY
+        CHECK(typeof(state_key_token) = 'blob' AND length(state_key_token) = 32),
+    conversation_id BLOB NOT NULL UNIQUE
+        CHECK(typeof(conversation_id) = 'blob' AND length(conversation_id) = 16),
+    state_reference_token BLOB NOT NULL UNIQUE
+        CHECK(typeof(state_reference_token) = 'blob' AND length(state_reference_token) = 32),
+    sealed_state_reference BLOB NOT NULL
+        CHECK(typeof(sealed_state_reference) = 'blob' AND length(sealed_state_reference) >= 40),
+    FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+CREATE TABLE claude_code_adapter_state (
+    state_key_token BLOB PRIMARY KEY
+        CHECK(typeof(state_key_token) = 'blob' AND length(state_key_token) = 32),
+    conversation_id BLOB NOT NULL UNIQUE
+        CHECK(typeof(conversation_id) = 'blob' AND length(conversation_id) = 16),
+    state_reference_token BLOB NOT NULL UNIQUE
+        CHECK(typeof(state_reference_token) = 'blob' AND length(state_reference_token) = 32),
+    sealed_state_reference BLOB NOT NULL
+        CHECK(typeof(sealed_state_reference) = 'blob' AND length(sealed_state_reference) >= 40),
+    FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
 );
 "#;

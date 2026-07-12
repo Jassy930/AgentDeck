@@ -79,7 +79,7 @@ fn conversation_input() -> NewConversation {
             .expect("conversation id"),
         adapter_state_key: RuntimeId::from_bytes(RuntimeIdKind::AdapterState, [0x52; 16])
             .expect("adapter state key"),
-        descriptor: b"shutdown-cancellation".to_vec(),
+        descriptor: runtime_descriptor::descriptor(b"shutdown-cancellation"),
     }
 }
 
@@ -159,3 +159,5 @@ async fn dropped_shutdown_waiter_keeps_singleton_until_the_worker_really_exits()
         .await
         .expect("shutdown the single explicitly reopened worker");
 }
+#[path = "support/runtime_descriptor.rs"]
+mod runtime_descriptor;

@@ -10,18 +10,19 @@ use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
+use crate::runtime::adapter_state::AdapterStateNamespace;
 use crate::runtime::model::{
     AcceptCommand, AcceptOutcome, AuthorizeExecutionRelease, CompleteCommand, CompleteOutcome,
-    ConversationRecord, ExecutionFence, ExecutionFenceRecord, MAX_COMMAND_PAYLOAD_BYTES,
-    MAX_COMMAND_RESULT_BYTES, MAX_CONVERSATION_DESCRIPTOR_BYTES, MAX_EXECUTION_FENCE_BYTES,
-    MAX_EXECUTION_INTENT_BYTES, MAX_EXECUTION_NONCE_BYTES, MAX_IDEMPOTENCY_KEY_BYTES,
-    MAX_RUNTIME_BUSY_TIMEOUT_MS, MAX_RUNTIME_EVENT_BYTES, MAX_RUNTIME_STORE_COMMAND_CAPACITY,
-    MAX_RUNTIME_STORE_LANE_BYTE_CAPACITY, MachineEnrollmentReceiptRecord, NewConversation,
-    RUNTIME_STORE_SHUTDOWN_GRACE_MS, RecoveryCompletion, RecoveryCursor, RecoveryPage,
-    RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreLane, RuntimeStoreOperation,
-    RuntimeStoreSnapshot, StartCommand, StartOutcome,
+    ConversationRecord, ExecutionFence, ExecutionFenceRecord, MAX_ADAPTER_STATE_REFERENCE_BYTES,
+    MAX_COMMAND_PAYLOAD_BYTES, MAX_COMMAND_RESULT_BYTES, MAX_CONVERSATION_DESCRIPTOR_BYTES,
+    MAX_EXECUTION_FENCE_BYTES, MAX_EXECUTION_INTENT_BYTES, MAX_EXECUTION_NONCE_BYTES,
+    MAX_IDEMPOTENCY_KEY_BYTES, MAX_RUNTIME_BUSY_TIMEOUT_MS, MAX_RUNTIME_EVENT_BYTES,
+    MAX_RUNTIME_STORE_COMMAND_CAPACITY, MAX_RUNTIME_STORE_LANE_BYTE_CAPACITY,
+    MachineEnrollmentReceiptRecord, NewConversation, RUNTIME_STORE_SHUTDOWN_GRACE_MS,
+    RecoveryCompletion, RecoveryCursor, RecoveryPage, RuntimeStoreConfig, RuntimeStoreError,
+    RuntimeStoreLane, RuntimeStoreOperation, RuntimeStoreSnapshot, StartCommand, StartOutcome,
 };
-use crate::security::StorageKek;
+use crate::security::{SecretBytes, StorageKek};
 
 use super::{journal, sqlite};
 
@@ -57,6 +58,71 @@ pub struct RuntimeStoreHandle {
     lifecycle: Arc<AtomicU8>,
     interrupt: Arc<rusqlite::InterruptHandle>,
     shutdown_timeout: Duration,
+}
+
+/// 固定绑定到 Codex 私有 namespace 的能力句柄。
+///
+/// adapter 只能拿到与自身类型对应的 vault；namespace 枚举和通用明文入口不跨出
+/// runtime/store 边界。
+#[derive(Clone, Debug)]
+pub(crate) struct CodexAdapterStateVault {
+    store: RuntimeStoreHandle,
+}
+
+impl CodexAdapterStateVault {
+    pub(crate) async fn bind(
+        &self,
+        adapter_state_key: super::RuntimeId,
+        state_reference: SecretBytes,
+    ) -> Result<(), RuntimeStoreError> {
+        self.store
+            .bind_adapter_state(
+                AdapterStateNamespace::Codex,
+                adapter_state_key,
+                state_reference,
+            )
+            .await
+    }
+
+    pub(crate) async fn resolve(
+        &self,
+        adapter_state_key: super::RuntimeId,
+    ) -> Result<Option<SecretBytes>, RuntimeStoreError> {
+        self.store
+            .resolve_adapter_state(AdapterStateNamespace::Codex, adapter_state_key)
+            .await
+    }
+}
+
+/// 固定绑定到 Claude Code 私有 namespace 的能力句柄。
+#[derive(Clone, Debug)]
+pub(crate) struct ClaudeCodeAdapterStateVault {
+    store: RuntimeStoreHandle,
+}
+
+impl ClaudeCodeAdapterStateVault {
+    pub(crate) async fn bind(
+        &self,
+        adapter_state_key: super::RuntimeId,
+        state_reference: SecretBytes,
+    ) -> Result<(), RuntimeStoreError> {
+        self.store
+            .bind_adapter_state(
+                AdapterStateNamespace::ClaudeCode,
+                adapter_state_key,
+                state_reference,
+            )
+            .await
+    }
+
+    pub(crate) async fn resolve(
+        &self,
+        adapter_state_key: super::RuntimeId,
+    ) -> Result<Option<SecretBytes>, RuntimeStoreError> {
+        self.store
+            .resolve_adapter_state(AdapterStateNamespace::ClaudeCode, adapter_state_key)
+            .await
+    }
 }
 
 impl fmt::Debug for RuntimeStoreHandle {
@@ -151,6 +217,20 @@ impl RuntimeStoreHandle {
         .await?
     }
 
+    pub(in crate::runtime) fn codex_adapter_state_vault(&self) -> CodexAdapterStateVault {
+        CodexAdapterStateVault {
+            store: self.clone(),
+        }
+    }
+
+    pub(in crate::runtime) fn claude_code_adapter_state_vault(
+        &self,
+    ) -> ClaudeCodeAdapterStateVault {
+        ClaudeCodeAdapterStateVault {
+            store: self.clone(),
+        }
+    }
+
     pub async fn record_machine_enrollment_receipt(
         &self,
         receipt: MachineEnrollmentReceiptRecord,
@@ -170,15 +250,86 @@ impl RuntimeStoreHandle {
         &self,
         input: NewConversation,
     ) -> Result<ConversationRecord, RuntimeStoreError> {
-        validate_maximum(input.descriptor.len(), MAX_CONVERSATION_DESCRIPTOR_BYTES)?;
-        let charge = memory_charge(size_of::<NormalCommand>(), &[input.descriptor.capacity()])?;
+        let descriptor_bytes = journal::canonical_conversation_descriptor(&input.descriptor)?;
+        validate_maximum(descriptor_bytes.len(), MAX_CONVERSATION_DESCRIPTOR_BYTES)?;
+        let charge = memory_charge(
+            size_of::<NormalCommand>(),
+            &[
+                input.descriptor.title.as_ref().map_or(0, String::capacity),
+                input.descriptor.cwd.capacity(),
+                descriptor_bytes.capacity(),
+            ],
+        )?;
         dispatch_with_budget(
             &self.normal_tx,
             &self.normal_budget,
             &self.lifecycle,
             RuntimeStoreLane::Normal,
             charge,
-            |reply| NormalCommand::CreateConversation { input, reply },
+            |reply| NormalCommand::CreateConversation {
+                input,
+                descriptor_bytes,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    async fn bind_adapter_state(
+        &self,
+        namespace: AdapterStateNamespace,
+        adapter_state_key: super::RuntimeId,
+        state_reference: SecretBytes,
+    ) -> Result<(), RuntimeStoreError> {
+        if state_reference.expose_secret().is_empty()
+            || state_reference.expose_secret().len() > MAX_ADAPTER_STATE_REFERENCE_BYTES
+        {
+            return Err(RuntimeStoreError::InvalidConfig(
+                "adapter state reference must contain 1 to 4096 bytes",
+            ));
+        }
+        // SecretBytes 不暴露原 Vec capacity；先复制到本调用自有的 exact-reserve
+        // buffer 并立即销毁调用方 allocation，避免 short-len/huge-capacity 绕过
+        // normal lane retained-allocation 预算。
+        let mut canonical_reference = Vec::new();
+        canonical_reference
+            .try_reserve_exact(state_reference.expose_secret().len())
+            .map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+        canonical_reference.extend_from_slice(state_reference.expose_secret());
+        drop(state_reference);
+        let retained_capacity = canonical_reference.capacity();
+        let state_reference = SecretBytes::new(canonical_reference);
+        let charge = memory_charge(size_of::<NormalCommand>(), &[retained_capacity])?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::BindAdapterState {
+                namespace,
+                adapter_state_key,
+                state_reference,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    async fn resolve_adapter_state(
+        &self,
+        namespace: AdapterStateNamespace,
+        adapter_state_key: super::RuntimeId,
+    ) -> Result<Option<SecretBytes>, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::ResolveAdapterState {
+                namespace,
+                adapter_state_key,
+                reply,
+            },
         )
         .await?
     }
@@ -445,6 +596,7 @@ struct Queued<C> {
 enum NormalCommand {
     CreateConversation {
         input: NewConversation,
+        descriptor_bytes: zeroize::Zeroizing<Vec<u8>>,
         reply: oneshot::Sender<Result<ConversationRecord, RuntimeStoreError>>,
     },
     AcceptCommand {
@@ -454,6 +606,12 @@ enum NormalCommand {
     StartCommand {
         input: StartCommand,
         reply: oneshot::Sender<Result<StartOutcome, RuntimeStoreError>>,
+    },
+    BindAdapterState {
+        namespace: AdapterStateNamespace,
+        adapter_state_key: super::RuntimeId,
+        state_reference: SecretBytes,
+        reply: oneshot::Sender<Result<(), RuntimeStoreError>>,
     },
 }
 
@@ -490,6 +648,11 @@ enum ReadCommand {
     FinishRecoveryScan {
         completion: RecoveryCompletion,
         reply: oneshot::Sender<Result<(), RuntimeStoreError>>,
+    },
+    ResolveAdapterState {
+        namespace: AdapterStateNamespace,
+        adapter_state_key: super::RuntimeId,
+        reply: oneshot::Sender<Result<Option<SecretBytes>, RuntimeStoreError>>,
     },
 }
 
@@ -614,19 +777,45 @@ fn handle_normal(
             NormalCommand::StartCommand { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
+            NormalCommand::BindAdapterState { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
         }
         drop(memory_permit);
         return;
     }
     match command {
-        NormalCommand::CreateConversation { input, reply } => {
-            let _ = reply.send(journal::create_conversation(state, config, input));
+        NormalCommand::CreateConversation {
+            input,
+            descriptor_bytes,
+            reply,
+        } => {
+            let _ = reply.send(journal::create_conversation(
+                state,
+                config,
+                input,
+                descriptor_bytes,
+            ));
         }
         NormalCommand::AcceptCommand { input, reply } => {
             let _ = reply.send(journal::accept_command(state, config, input));
         }
         NormalCommand::StartCommand { input, reply } => {
             let _ = reply.send(journal::mark_started_with_event(state, config, input));
+        }
+        NormalCommand::BindAdapterState {
+            namespace,
+            adapter_state_key,
+            state_reference,
+            reply,
+        } => {
+            let _ = reply.send(journal::bind_adapter_state(
+                state,
+                config,
+                namespace,
+                adapter_state_key,
+                state_reference,
+            ));
         }
     }
     drop(memory_permit);
@@ -699,6 +888,17 @@ fn handle_read(
         }
         ReadCommand::FinishRecoveryScan { completion, reply } => {
             let _ = reply.send(journal::finish_recovery_scan(state, completion));
+        }
+        ReadCommand::ResolveAdapterState {
+            namespace,
+            adapter_state_key,
+            reply,
+        } => {
+            let _ = reply.send(journal::resolve_adapter_state(
+                state,
+                namespace,
+                adapter_state_key,
+            ));
         }
     }
 }
@@ -814,7 +1014,11 @@ mod shutdown_tests {
                 .expect("conversation id"),
             adapter_state_key: RuntimeId::from_bytes(RuntimeIdKind::AdapterState, [0x42; 16])
                 .expect("adapter state key"),
-            descriptor: b"shutdown-timeout".to_vec(),
+            descriptor: crate::runtime::model::ConversationDescriptor {
+                agent_kind: agentdeck_protocol::AgentKind::Codex,
+                title: Some("shutdown-timeout".to_owned()),
+                cwd: PathBuf::from("/tmp/agentdeck-runtime-test"),
+            },
         }
     }
 

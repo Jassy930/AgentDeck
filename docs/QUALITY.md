@@ -522,9 +522,10 @@ ignore 后运行。本机没有匹配 access group 的 provisioning profile；Ap
 本地 self-signed helper 都能通过 `codesign --verify`，启动却被 AMFI 以 exit 137 终止。
 取得该外部条件前不得勾选计划 P3.1 Step 4，不得宣称 P3.1/P3 完成。
 
-## Relay Companion MVP P3.2 Runtime store 门禁
+## Relay Companion MVP P3.2/P3.3 Runtime store 与 adapter 私表门禁
 
-P3.2 只验证 Runtime SQLite 组件，不表示 RuntimeCore/UDS/RemoteLink 已接入。所有 store tests
+P3.2/P3.3 只验证 Runtime SQLite 与 adapter-private repository/canonical bridge 组件，不表示
+RuntimeCore/UDS/RemoteLink 已接入。所有 store tests
 必须串行运行，避免 raw SQLite exhaustion/tamper fixture 与 path lease 相互干扰：
 
 ```bash
@@ -542,12 +543,30 @@ cargo test -p agentdeckd \
   --test runtime_store_commit_outcome \
   --test runtime_store_recovery \
   --test runtime_store_shutdown \
+  --test adapter_state_boundary \
   -- --test-threads=1
+
+# canonical Agent/adapter contract；默认绝不运行真实 CLI/model/history smoke
+cargo test -p agentdeckd --test agent_router \
+  --test cc_adapter_shape --test codex_adapter_shape -- --test-threads=1
+
+# 真实 canonical smoke 只能显式 opt-in；会调用本机已登录的 vendor CLI
+AGENTDECK_E2E=1 cargo test -p agentdeckd --test codex_adapter_shape \
+  real_codex_canonical_start_binds_private_state_then_emits_capabilities \
+  -- --exact --test-threads=1
+AGENTDECK_E2E=1 cargo test -p agentdeckd --test cc_adapter_shape \
+  real_claude_streams_at_least_one_assistant_or_turn_complete \
+  -- --exact --test-threads=1
 
 # daemon crate 回归与静态边界
 cargo test -p agentdeckd -- --test-threads=1
 bash scripts/check-daemon-no-net.sh
 cargo fmt --all -- --check
+cargo clippy -p agentdeckd --all-targets --no-deps -- \
+  -A clippy::collapsible_if -A clippy::collapsible_str_replace \
+  -A clippy::derivable_impls -A clippy::unwrap_or_default \
+  -A clippy::needless_borrows_for_generic_args \
+  -A clippy::doc_lazy_continuation -D warnings
 git diff --check
 scripts/verify-agent-docs.sh
 ```
@@ -562,7 +581,9 @@ cargo test -p agentdeckd --test runtime_store_boundaries \
   -- --exact --test-threads=1
 ```
 
-门禁至少证明：严格七表/live manifest；错误 KEK 零写；无 KEK rescue index；caller-owned
+门禁至少证明：v1 严格七表可原子迁移到 v2 严格九表/live manifest，physical schema 与冻结的
+crypto context v1 解耦且既有 wrapped key/row ciphertext 不重写；错误 KEK 零写；无 KEK
+rescue index；caller-owned
 stable IDs；catalog/command/event u64 exhaustion；32/1,024/256 MiB/24h 精确边界；全部
 before-COMMIT rollback 与 after-COMMIT exact retry（含 rescue receipt 与 expiry outer retry）；
 TTL expiry event；blind-token 重算；command/conversation/event metadata MAC、authenticated
@@ -573,8 +594,17 @@ byte bound；真实 COMMIT failure 分类；shutdown timeout 不释放 singleton
 `max_page_count`、`wal_autocheckpoint=0` + persistent WAL 读回、checkpoint copy peak、
 post-COMMIT DiskLow 不 latch、safety tail reserve、bounded PASSIVE checkpoint 与 SafetyOnly；
 paged recovery 的 expiry-before-freeze、exact keyset cursor、单页一个 conversation/80 MiB、
-mutation fence、begin/page/finish response-loss retry、累计 ledger 核账与 finish 再验证。标准 SQLite 没有 custom
-quota VFS，因此不得把这些门禁表述成 active WAL 任意瞬间的 2 GiB 零超冲证明。
+mutation fence、begin/page/finish response-loss retry、累计 ledger 核账与 finish 再验证；两个
+adapter 私表 namespace 互斥、resume ref AEAD/盲索引无明文、exact retry/conflict、authenticated
+row totals、CC native history 显式重建且全程不创建 `cc-meta/`；common descriptor 只有 typed
+canonical shape，unknown vendor identity 在 migration 前零写拒绝；before-COMMIT fault 显式
+rollback 后 main/WAL/SHM/journal 逐字节恢复，COMMIT 后才启用 persistent WAL；canonical
+handle/event/history 不含 ThreadId，Raw frame fail-close，Codex resume exact thread id、CC
+authoritative init match 与首次 `--session-id`/已 materialized `--resume` 分支均有门禁；CC
+materialization/rebuild 还必须 `O_NOFOLLOW` 有界读回有效 JSONL，fresh home 可继续复用已持久化
+session id。未设置 `AGENTDECK_E2E=1` 时，真实 CLI/model/history smoke 必须在 binary probe/spawn
+前安全跳过。标准 SQLite 没有 custom quota VFS，因此不得把这些门禁表述成 active WAL 任意
+瞬间的 2 GiB 零超冲证明。
 
 该门禁重点守护：
 
@@ -710,7 +740,7 @@ cargo install cargo-llvm-cov
 | 参考客户端 CLI（agentdeck-cli）、Transport、Client | `cargo test -p agentdeck-cli`；再跑完整 `cargo test` |
 | Relay Companion MVP P0 基线或 v1 reset | 迭代时跑 `bash scripts/tests/reset-relay-v1-dev-state.sh`；提交前跑一次 `bash scripts/verify-relay-companion-mvp.sh p0` |
 | Relay Companion MVP P3.1 daemon namespace / singleton / StorageKEK | 运行本页 P3.1 聚焦矩阵、`cargo test -p agentdeckd`、CLI/Swift transport tests、daemon no-net；stable Keychain 必须另有真实 provisioned signed helper 证据，ignored 不算通过 |
-| Relay Companion MVP P3.2 Runtime SQLite / journal / admission | 运行本页 P3.2 十三组 store tests（含真实 256 MiB 与 paged recovery）、`cargo test -p agentdeckd -- --test-threads=1`、daemon no-net、fmt/diff/docs；只证明组件，不冒充 RuntimeCore/UDS/Companion E2E |
+| Relay Companion MVP P3.2/P3.3 Runtime SQLite / journal / adapter 私表 | 运行本页十四组 store/boundary tests（含真实 256 MiB、paged recovery 与 v1→v2 migration）、canonical router/双 adapter tests、`cargo test -p agentdeckd -- --test-threads=1`、daemon no-net、fmt/clippy/diff/docs；只证明组件，不冒充 RuntimeCore/UDS/Companion E2E |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

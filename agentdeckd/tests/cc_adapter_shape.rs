@@ -6,10 +6,52 @@
 //! on PATH) to verify the N7 invariant end-to-end.
 
 use agentdeck_protocol::*;
-use agentdeckd::agent::Agent;
+use agentdeckd::agent::{Agent, CanonicalAgentEvent};
 use agentdeckd::claude_code::ClaudeCodeAdapter;
 use agentdeckd::claude_code::auth::{AuthState, probe_auth_status};
 use agentdeckd::claude_code::history;
+use agentdeckd::runtime::AgentRouter;
+use agentdeckd::runtime::store::{
+    ConversationDescriptor, NewConversation, RuntimeId, RuntimeIdKind, RuntimeStoreConfig,
+    RuntimeStoreHandle,
+};
+use agentdeckd::security::{MemoryKeyStore, load_or_create_storage_kek};
+
+fn random_runtime_id(kind: RuntimeIdKind) -> RuntimeId {
+    loop {
+        let mut bytes = [0_u8; 16];
+        getrandom::fill(&mut bytes).expect("read OS entropy");
+        if let Ok(id) = RuntimeId::from_bytes(kind, bytes) {
+            return id;
+        }
+    }
+}
+
+struct CanonicalTestRoot(std::path::PathBuf);
+
+impl CanonicalTestRoot {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "agentdeckd-cc-canonical-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&path).expect("create canonical CC test root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .expect("secure canonical CC test root");
+        }
+        Self(path)
+    }
+}
+
+impl Drop for CanonicalTestRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 fn cc_opts() -> ClaudeCodeSessionOptions {
     ClaudeCodeSessionOptions {
@@ -26,6 +68,10 @@ fn cc_opts() -> ClaudeCodeSessionOptions {
         session_name: None,
         session_id: None,
     }
+}
+
+fn live_e2e_enabled() -> bool {
+    std::env::var("AGENTDECK_E2E").as_deref() == Ok("1")
 }
 
 #[test]
@@ -165,6 +211,10 @@ async fn cancel_on_unknown_session_is_idempotent_ok() {
 /// are the first two events on the wire, before any AgentItem.
 #[tokio::test]
 async fn real_claude_emits_started_then_capabilities() {
+    if !live_e2e_enabled() {
+        println!("SKIP real_claude_emits_started_then_capabilities: set AGENTDECK_E2E=1");
+        return;
+    }
     // Use `which` to skip cleanly on CI / contributor machines that
     // don't have `claude` installed. The events we assert on
     // (SessionStarted + SessionCapabilities) are emitted synchronously
@@ -236,6 +286,10 @@ async fn real_claude_emits_started_then_capabilities() {
 /// developers can run the suite.
 #[test]
 fn real_claude_auth_status_probe_returns_known_state() {
+    if !live_e2e_enabled() {
+        println!("SKIP real_claude_auth_status_probe: set AGENTDECK_E2E=1");
+        return;
+    }
     if which::which("claude").is_err() {
         println!("SKIP real_claude_auth_status_probe: `claude` not in PATH");
         return;
@@ -259,6 +313,10 @@ fn real_claude_auth_status_probe_returns_known_state() {
 /// acceptable. Should never panic / hang.
 #[tokio::test]
 async fn real_claude_list_history_returns_or_empty() {
+    if !live_e2e_enabled() {
+        println!("SKIP real_claude_list_history: set AGENTDECK_E2E=1");
+        return;
+    }
     if which::which("claude").is_err() {
         println!("SKIP real_claude_list_history: `claude` not in PATH");
         return;
@@ -280,28 +338,56 @@ async fn real_claude_list_history_returns_or_empty() {
 /// shape. Skipped when `claude` is not on PATH.
 #[tokio::test]
 async fn real_claude_streams_at_least_one_assistant_or_turn_complete() {
+    if !live_e2e_enabled() {
+        println!("SKIP real_claude_streams_*: set AGENTDECK_E2E=1");
+        return;
+    }
     if which::which("claude").is_err() {
         println!("SKIP real_claude_streams_*: `claude` not in PATH");
         return;
     }
-    let a = ClaudeCodeAdapter::new_for_test();
+    let root = CanonicalTestRoot::new();
+    let database = root.0.join("runtime.db");
+    let key_store = MemoryKeyStore::new();
+    let storage_kek =
+        load_or_create_storage_kek(&key_store, &database).expect("create canonical test KEK");
+    let store = RuntimeStoreHandle::open(RuntimeStoreConfig::new(database), storage_kek)
+        .await
+        .expect("open canonical CC store");
+    let adapter_state_key = random_runtime_id(RuntimeIdKind::AdapterState);
+    let cwd = std::env::current_dir().unwrap();
+    store
+        .create_conversation(NewConversation {
+            conversation_id: random_runtime_id(RuntimeIdKind::Conversation),
+            adapter_state_key,
+            descriptor: ConversationDescriptor {
+                agent_kind: AgentKind::ClaudeCode,
+                title: Some("canonical CC smoke".into()),
+                cwd: cwd.clone(),
+            },
+        })
+        .await
+        .expect("create canonical CC conversation");
+    let router = AgentRouter::with_runtime_store(store.clone());
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     let start = SessionStart {
         agent_kind: AgentKind::ClaudeCode,
-        cwd: std::env::current_dir().unwrap(),
+        cwd,
         prompt: Some("reply with the single word: pong".into()),
         vendor_options: VendorSessionOptions::ClaudeCode(cc_opts()),
         runtime_options: Default::default(),
     };
     let handle = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        a.start_session(start, tx),
+        std::time::Duration::from_secs(30),
+        router.start_adapter_state(adapter_state_key, start, tx),
     )
     .await
-    .expect("start_session timed out")
-    .expect("start_session failed");
+    .expect("canonical start timed out")
+    .expect("canonical start failed");
+    assert_eq!(handle.adapter_state_key, adapter_state_key);
 
     let mut saw_assistant_or_complete = false;
+    let mut saw_capabilities = false;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -310,11 +396,13 @@ async fn real_claude_streams_at_least_one_assistant_or_turn_complete() {
         };
         let Some(ev) = maybe_ev else { break };
         match ev {
-            ServerEvent::AgentItem {
-                item: AgentItem::AssistantMessage { .. },
-                ..
-            }
-            | ServerEvent::TurnComplete { .. } => {
+            CanonicalAgentEvent::Capabilities(_) => saw_capabilities = true,
+            CanonicalAgentEvent::Item(AgentItem::AssistantMessage { .. })
+            | CanonicalAgentEvent::TurnComplete(_) => {
+                assert!(
+                    saw_capabilities,
+                    "canonical Runtime must receive capabilities before items"
+                );
                 saw_assistant_or_complete = true;
                 break;
             }
@@ -322,8 +410,9 @@ async fn real_claude_streams_at_least_one_assistant_or_turn_complete() {
         }
     }
 
-    a.cancel(&handle.session_id).await.expect("cancel ok");
+    router.cancel(&handle.session_id).await.expect("cancel ok");
     drop(rx);
+    store.shutdown().await.expect("shutdown canonical CC store");
 
     assert!(
         saw_assistant_or_complete,

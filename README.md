@@ -108,8 +108,12 @@ app-server 的 `thread/list` / `thread/read(includeTurns: true)` 接入留到 v0
 文档和 UI 不应把 Codex 历史回放说成已接通。
 
 **Claude Code 历史**：通过 `claude agents --json` 及直读
-`~/.claude/projects/<encoded_cwd>/<id>.jsonl` 获取，事实唯一来源在 CC 原生
-接口（N8 不变量：AgentDeck 不建 `cc-meta/` 目录）。Archive 走 `claude rm`
+`~/.claude/projects/<encoded_cwd>/<id>.jsonl` 获取，事实唯一来源仍在 CC 原生
+接口。Runtime DB 只允许在 `claude_code_adapter_state` 私有 namespace 保存 StorageKEK
+保护的 `adapterStateKey → session id` 派生索引；它不保存 title/archive/status/transcript，
+不进入 common catalog、日志、Relay 或客户端 wire，也不创建 `cc-meta/`。重建只接受本机
+projects root 中恰好一个 regular、非 memory-agent JSONL；不会按 title/cwd/mtime 猜回旧随机
+key。无法确认旧映射时 fail-close 或导入为新 conversation。Archive 走 `claude rm`
 （软删，`--resume` 仍能找回）；Rename 走 `claude --resume <id> --name`；
 Unarchive 等同 no-op（CC 不区分 unarchive）。历史列表默认返回最新 500 条；
 daemon 先按 `.jsonl` mtime 排序并截断，再只为最终返回条目扫描标题，避免大型
@@ -314,6 +318,30 @@ lease 全部释放后才返回。
 conversation + stable principal owner + key；本地 owner 不含临时 connection，远程 owner
 不含可续期 grant serial。
 
+Runtime schema v2 在 v1 七表基础上只新增 `codex_adapter_state` 与
+`claude_code_adapter_state` 两张互斥私表。resume reference 以 namespace-specific blind
+index + row AEAD 保存，整行删除由 authenticated table totals 检测；同 key/ref 重试幂等，
+跨 namespace 或改写 ref fail-close。物理 schema 升级不会改变冻结的 crypto context v1，
+因此 v1 journal 无需重加密或重包 key bundle。
+
+common catalog 不再接受调用方任意 `Vec<u8>` descriptor；`NewConversation` 只能携带固定字段的
+`ConversationDescriptor(agentKind,title,cwd)`，并以 deny-unknown canonical JSON 加密。open、
+recovery 和 v1→v2 migration 都会解密后逐字节重编码；带 `threadId`/`sessionId`/resume 扩展的
+authenticated v1 row 也会在零写入阶段拒绝。migration 在 legacy journal mode 中做 DDL，
+before-COMMIT fault 显式 rollback 并核对 main/WAL/SHM/`-journal` 原件；只有 schema COMMIT 后
+才切换并读回 WAL/PERSIST_WAL，post-COMMIT 配置错误按 unknown outcome 重开收敛。
+
+P3.3 同时把 adapter 的 canonical contract 与 stdio compatibility 分开：canonical handle/event/
+history 只携带 neutral `adapterStateKey` 和中立业务内容，不含 `ThreadId`；旧 translator 产生的
+`ServerEvent` 只在各 vendor 模块内部经过 bridge，routing identity 被剥离，未建模 Raw frame
+直接变成 typed failure。Codex 在首个 turn 前绑定 `thread/start` 结果，resume response 也必须
+返回与私有映射完全一致的 `thread.id`；CC 首次使用已持久化的 `--session-id`，只有唯一、经
+`O_NOFOLLOW` 打开并有界读回为有效 JSONL 的 native history 已存在时才 `--resume`，fresh home
+缺少 projects root 视为尚未 materialize。CC 在 authoritative `system.init.session_id` 匹配前不
+返回 canonical handle、不发布事件。state repository/module 不再公开；只有 runtime
+composition 能把 singleton store 分裂成固定 namespace 的 typed vault，具体 adapter 不持有
+`RuntimeStoreHandle`，也无法构造另一 adapter 的 vault。
+
 Accepted、Started + ExecutionIntent + started event、ExecutionFence、release authorization、
 terminal state + event 都以事务为边界。任何 before-COMMIT failure 完整回滚；任何
 真实 COMMIT 失败若无法确认 rollback、以及任何 after-COMMIT response loss，都返回
@@ -359,9 +387,9 @@ fence、release、terminal
 由 P4 的 Keychain `CounterGuard` / generation high-water 绑定后才能检测。该门禁属于 P4/P6，
 P3.2 不能宣称已防住整库历史回滚。
 
-本节描述已经验证的持久化组件契约，不表示当前 stdio `RuntimeHub` 已改走该 store。
-P3.3 先接 adapter 私有映射，P3.4 再由 `RuntimeCore` 把真实本地/远程请求接入 journal；在此之前
-不能把 store unit/integration tests 当成 Companion 端到端完成证据。
+本节描述已经验证的持久化与 adapter-private 组件契约，不表示当前 stdio `RuntimeHub` 已改走
+该 store。P3.4 才由 `RuntimeCore` 把真实本地/远程请求接入 journal；在此之前不能把
+store/adapter unit、integration 或本机 vendor smoke 当成 Companion 端到端完成证据。
 
 ## agentdeck CLI（参考客户端 / E2E 驱动）
 

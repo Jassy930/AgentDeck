@@ -36,21 +36,29 @@
 //!   - `cancel()` — aborts the pump and best-effort group-kills the
 //!     child subprocess tree (unchanged from 4A).
 
-use crate::agent::{Agent, AgentEventSender, AgentSessionHandle};
+use crate::agent::{
+    Agent, AgentEventSender, AgentSessionHandle, CanonicalAgentEvent, CanonicalAgentEventSender,
+    CanonicalAgentSessionHandle, CanonicalHistoryRead,
+};
+use crate::claude_code::state::ClaudeCodeStateRepository;
 use crate::claude_code::translate::ClaudeCodeTranslator;
+use crate::runtime::store::{
+    ClaudeCodeAdapterStateVault, RuntimeId, RuntimeIdKind, RuntimeStoreError,
+};
 use agentdeck_protocol::{
-    ActionDecision, ActionDecisionKind, AgentKind, ClaudeCodePermissionMode,
-    ClaudeCodeSessionOptions, ClaudeCodeVendorControl, HistoryRequest, HistoryResponse,
-    ProtocolError, ServerEvent, SessionCapabilities, SessionId, SessionStart, ThreadId,
-    VendorControlPayload, VendorSessionOptions,
+    ActionDecision, ActionDecisionKind, AgentItem, AgentKind, ClaudeCodePermissionMode,
+    ClaudeCodeSessionOptions, ClaudeCodeVendorControl, HistoryListItem, HistoryRequest,
+    HistoryResponse, ProtocolError, ServerEvent, SessionCapabilities, SessionId, SessionStart,
+    ThreadId, VendorControlPayload, VendorSessionOptions,
 };
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::time::Duration;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 
 /// Shared routing table for permission responses. Cloned into both
 /// the stdout pump (writer side) and `SessionEntry` (reader side
@@ -60,7 +68,7 @@ type PermissionRoutes = Arc<Mutex<HashMap<String, String>>>;
 /// Per-session bag of mutable state the adapter keeps alive for
 /// `submit_decision` / `cancel`.
 struct SessionEntry {
-    child: Mutex<Child>,
+    child: Arc<Mutex<Child>>,
     stdin: Mutex<ChildStdin>,
     /// `request_id` (= `tool_use_id` from the translator) → the
     /// underlying CC `tool_use_id` we must echo back in the
@@ -75,6 +83,7 @@ struct SessionEntry {
 pub struct ClaudeCodeAdapter {
     cli_version: OnceLock<String>,
     sessions: Arc<Mutex<HashMap<SessionId, Arc<SessionEntry>>>>,
+    state_repository: Option<ClaudeCodeStateRepository>,
 }
 
 impl ClaudeCodeAdapter {
@@ -82,7 +91,40 @@ impl ClaudeCodeAdapter {
         Self {
             cli_version: OnceLock::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            state_repository: None,
         }
+    }
+
+    /// P3 canonical Runtime constructor。只有 `runtime::AgentRouter` 能从 singleton
+    /// store 构造对应 vault；adapter 本身拿不到另一 vendor 的 capability。
+    #[must_use]
+    pub(crate) fn with_state_vault(vault: ClaudeCodeAdapterStateVault) -> Self {
+        Self {
+            cli_version: OnceLock::new(),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            state_repository: Some(ClaudeCodeStateRepository::new(vault)),
+        }
+    }
+
+    /// 本机显式 import/reconciliation 入口。调用方只能提交 native history
+    /// candidate；本模块会读回唯一 regular/non-memory JSONL 后才绑定，且不返回
+    /// native session id。该入口不是 Runtime/Relay wire command。
+    pub async fn rebuild_managed_index_from_native_history(
+        &self,
+        adapter_state_key: RuntimeId,
+        native: &HistoryListItem,
+    ) -> Result<(), ProtocolError> {
+        ensure_adapter_state_key(adapter_state_key)?;
+        let repository = self
+            .state_repository
+            .as_ref()
+            .ok_or_else(|| ProtocolError {
+                code: "adapter-state-not-configured".into(),
+                message: "Claude Code private state repository is not configured".into(),
+                diagnostic_ref: None,
+            })?;
+        crate::claude_code::history::rebuild_managed_index(repository, adapter_state_key, native)
+            .await
     }
 
     /// Test convenience constructor — functionally identical to `new`.
@@ -279,6 +321,7 @@ impl ClaudeCodeAdapter {
         events: AgentEventSender,
         resume_thread_id: Option<ThreadId>,
         prompt_override: Option<String>,
+        canonical_expected_thread_id: Option<ThreadId>,
     ) -> Result<AgentSessionHandle, ProtocolError> {
         // Preflight per spec § 5.8 — run BEFORE we mint a session id
         // or emit SessionStarted, so a missing binary / bad version /
@@ -288,13 +331,16 @@ impl ClaudeCodeAdapter {
 
         let (mut cmd, permission_mode) = Self::build_command(&start, resume_thread_id.as_ref())?;
         let session_id = SessionId(uuid::Uuid::new_v4().to_string());
+        let compatibility_thread_id = resume_thread_id
+            .clone()
+            .or_else(|| canonical_expected_thread_id.clone());
 
         // N7: SessionStarted + SessionCapabilities BEFORE any AgentItem.
         let caps = self.capabilities_for_v2();
         let _ = events
             .send(ServerEvent::SessionStarted {
                 session_id: session_id.clone(),
-                thread_id: resume_thread_id.clone(),
+                thread_id: compatibility_thread_id.clone(),
                 agent_kind: AgentKind::ClaudeCode,
             })
             .await;
@@ -322,6 +368,29 @@ impl ClaudeCodeAdapter {
             diagnostic_ref: None,
         })?;
         let _ = child.stderr.take();
+        let mut reader = BufReader::new(stdout);
+        let mut buffered_lines: Vec<String> = Vec::new();
+
+        // clean/safe-mode CC 在首个 prompt 前不会发 frame，不能把用户 hooks 当作
+        // identity handshake。canonical 路径先让 CLI 完成参数解析并确认进程没有
+        // 早退；真正 authoritative `system.init` 在 prompt 后同步校验，校验前既不
+        // 返回 handle，也不发布 canonical 事件。
+        if canonical_expected_thread_id.is_some() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Some(status) = child.try_wait().map_err(|error| ProtocolError {
+                code: "cc-session-startup-status".into(),
+                message: format!("inspect Claude Code startup status: {error}"),
+                diagnostic_ref: None,
+            })? {
+                return Err(ProtocolError {
+                    code: "cc-session-identity-eof".into(),
+                    message: format!(
+                        "Claude Code exited before accepting the persisted native session: {status}"
+                    ),
+                    diagnostic_ref: None,
+                });
+            }
+        }
 
         // Write the initial prompt (if any) as a stream-json user line.
         let prompt = prompt_override.or(start.prompt.clone());
@@ -331,39 +400,97 @@ impl ClaudeCodeAdapter {
                 "message": { "role": "user", "content": prompt },
             }))
             .unwrap_or_default();
-            if stdin.write_all(line.as_bytes()).await.is_err() {
+            let write_result = async {
+                stdin.write_all(line.as_bytes()).await?;
+                stdin.write_all(b"\n").await?;
+                stdin.flush().await
+            }
+            .await;
+            if let Err(error) = write_result {
+                let protocol_error = ProtocolError {
+                    code: "cc-stdin-write-failed".into(),
+                    message: format!("claude child closed stdin before initial prompt: {error}"),
+                    diagnostic_ref: None,
+                };
                 let _ = events
                     .send(ServerEvent::Error {
                         session_id: Some(session_id.clone()),
-                        error: ProtocolError {
-                            code: "cc-stdin-write-failed".into(),
-                            message: "claude child closed stdin before initial prompt".into(),
-                            diagnostic_ref: None,
-                        },
+                        error: protocol_error.clone(),
                     })
                     .await;
+                let _ = child.start_kill();
+                return Err(protocol_error);
             }
-            let _ = stdin.write_all(b"\n").await;
-            let _ = stdin.flush().await;
         }
+
+        // init 是 CC 对本次 native session 的 authoritative frame。canonical
+        // start/continue 在它匹配前不返回 handle，也不向 Runtime 发布任何事件。
+        if let Some(expected) = canonical_expected_thread_id.as_ref()
+            && !buffered_lines
+                .iter()
+                .any(|line| is_authoritative_init(line, expected))
+        {
+            match read_authoritative_identity(&mut reader, expected).await {
+                Ok(lines) => buffered_lines.extend(lines),
+                Err(error) => {
+                    let _ = child.start_kill();
+                    return Err(error);
+                }
+            }
+        }
+        let child = Arc::new(Mutex::new(child));
 
         // Build the per-session shared routes up front so the pump
         // and the entry hold the same Arc.
         let permission_routes: PermissionRoutes = Arc::new(Mutex::new(HashMap::new()));
 
-        let translator_thread_id = resume_thread_id.clone();
+        let translator_thread_id = compatibility_thread_id.clone();
+        let expected_native_session = compatibility_thread_id.clone();
         let pump_session = session_id.clone();
         let pump_events = events.clone();
         let pump_routes = Arc::clone(&permission_routes);
+        let pump_child = Arc::clone(&child);
         let pump_handle = tokio::spawn(async move {
             let mut translator = ClaudeCodeTranslator::new(pump_session.clone(), permission_mode);
             if let Some(tid) = translator_thread_id {
                 translator.set_thread_id(tid);
             }
-            let mut lines = BufReader::new(stdout).lines();
+            let mut buffered_lines = buffered_lines.into_iter();
             loop {
-                match lines.next_line().await {
+                let next_line = match buffered_lines.next() {
+                    Some(line) => Ok(Some(line)),
+                    None => {
+                        let mut line = String::new();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) => Ok(None),
+                            Ok(_) => Ok(Some(line)),
+                            Err(error) => Err(error),
+                        }
+                    }
+                };
+                match next_line {
                     Ok(Some(line)) => {
+                        if let Some(expected) = expected_native_session.as_ref() {
+                            let observed = observed_native_session_id(&line);
+                            if observed
+                                .as_deref()
+                                .is_some_and(|observed| observed != expected.0.as_str())
+                            {
+                                let _ = pump_events
+                                    .send(ServerEvent::Error {
+                                        session_id: Some(pump_session.clone()),
+                                        error: ProtocolError {
+                                            code: "cc-session-id-mismatch".into(),
+                                            message: "Claude Code reported a session id that does not match the persisted private mapping".into(),
+                                            diagnostic_ref: None,
+                                        },
+                                    })
+                                    .await;
+                                let mut child = pump_child.lock().await;
+                                let _ = child.start_kill();
+                                return;
+                            }
+                        }
                         let out = translator.translate_line(&line);
                         // Record permission routing BEFORE forwarding
                         // the event downstream so a racing
@@ -404,7 +531,7 @@ impl ClaudeCodeAdapter {
         let pump_abort = pump_handle.abort_handle();
 
         let entry = Arc::new(SessionEntry {
-            child: Mutex::new(child),
+            child,
             stdin: Mutex::new(stdin),
             permission_routes,
             pump_abort: pump_abort.clone(),
@@ -416,7 +543,7 @@ impl ClaudeCodeAdapter {
 
         Ok(AgentSessionHandle {
             session_id,
-            thread_id: resume_thread_id,
+            thread_id: compatibility_thread_id,
             agent_kind: AgentKind::ClaudeCode,
             abort_handle: pump_abort,
         })
@@ -452,6 +579,208 @@ impl Drop for ClaudeCodeAdapter {
     }
 }
 
+fn ensure_adapter_state_key(adapter_state_key: RuntimeId) -> Result<(), ProtocolError> {
+    if adapter_state_key.kind() != RuntimeIdKind::AdapterState {
+        return Err(ProtocolError {
+            code: "adapter-state-invalid-key".into(),
+            message: "canonical Claude Code continue requires an adapterStateKey".into(),
+            diagnostic_ref: None,
+        });
+    }
+    Ok(())
+}
+
+fn adapter_state_error(error: RuntimeStoreError) -> ProtocolError {
+    ProtocolError {
+        code: error.code().into(),
+        message: format!("Claude Code private state operation failed: {error}"),
+        diagnostic_ref: None,
+    }
+}
+
+const CC_IDENTITY_TIMEOUT: Duration = Duration::from_secs(20);
+const CC_IDENTITY_MAX_LINES: usize = 256;
+const CC_IDENTITY_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// 同步读取 CC startup identity，整个 phase 共用一个 deadline 与固定 bytes/lines
+/// 上界。任何观察到的不同 session id 都立即 fail-close；EOF/缺 init 不能被当作成功。
+async fn read_authoritative_identity<R>(
+    reader: &mut R,
+    expected: &ThreadId,
+) -> Result<Vec<String>, ProtocolError>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + CC_IDENTITY_TIMEOUT;
+    let mut lines = Vec::new();
+    let mut bytes = 0_usize;
+    loop {
+        if lines.len() >= CC_IDENTITY_MAX_LINES || bytes >= CC_IDENTITY_MAX_BYTES {
+            return Err(ProtocolError {
+                code: "cc-session-identity-too-large".into(),
+                message: "Claude Code session identity handshake exceeded its bounded buffer"
+                    .into(),
+                diagnostic_ref: None,
+            });
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(identity_timeout_error());
+        }
+        let mut line = String::new();
+        let read = tokio::time::timeout(remaining, reader.read_line(&mut line))
+            .await
+            .map_err(|_| identity_timeout_error())?
+            .map_err(|error| ProtocolError {
+                code: "cc-session-identity-read".into(),
+                message: format!("read Claude Code session identity frame: {error}"),
+                diagnostic_ref: None,
+            })?;
+        if read == 0 {
+            return Err(ProtocolError {
+                code: "cc-session-identity-eof".into(),
+                message: "Claude Code exited before confirming the expected native session".into(),
+                diagnostic_ref: None,
+            });
+        }
+        bytes = bytes.checked_add(read).ok_or_else(|| ProtocolError {
+            code: "cc-session-identity-too-large".into(),
+            message: "Claude Code session identity handshake size overflow".into(),
+            diagnostic_ref: None,
+        })?;
+        if bytes > CC_IDENTITY_MAX_BYTES {
+            return Err(ProtocolError {
+                code: "cc-session-identity-too-large".into(),
+                message: "Claude Code session identity handshake exceeded its bounded buffer"
+                    .into(),
+                diagnostic_ref: None,
+            });
+        }
+
+        let parsed = serde_json::from_str::<serde_json::Value>(&line).ok();
+        let observed = parsed
+            .as_ref()
+            .and_then(|value| value.get("session_id"))
+            .and_then(serde_json::Value::as_str);
+        if observed.is_some_and(|observed| observed != expected.0.as_str()) {
+            return Err(ProtocolError {
+                code: "cc-session-id-mismatch".into(),
+                message:
+                    "Claude Code reported a session id that does not match the persisted private mapping"
+                        .into(),
+                diagnostic_ref: None,
+            });
+        }
+        let is_system = parsed
+            .as_ref()
+            .and_then(|value| value.get("type"))
+            .and_then(serde_json::Value::as_str)
+            == Some("system");
+        let subtype = parsed
+            .as_ref()
+            .and_then(|value| value.get("subtype"))
+            .and_then(serde_json::Value::as_str);
+        let qualifies =
+            observed == Some(expected.0.as_str()) && is_system && subtype == Some("init");
+        let init_missing_id = is_system && subtype == Some("init") && observed.is_none();
+        lines.push(line);
+        if init_missing_id {
+            return Err(ProtocolError {
+                code: "cc-session-id-missing".into(),
+                message: "Claude Code init frame omitted the expected native session id".into(),
+                diagnostic_ref: None,
+            });
+        }
+        if qualifies {
+            return Ok(lines);
+        }
+    }
+}
+
+fn identity_timeout_error() -> ProtocolError {
+    ProtocolError {
+        code: "cc-session-identity-timeout".into(),
+        message: "Claude Code did not emit an authoritative init frame for the expected session"
+            .into(),
+        diagnostic_ref: None,
+    }
+}
+
+fn observed_native_session_id(line: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()?
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+fn is_authoritative_init(line: &str, expected: &ThreadId) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .is_some_and(|value| {
+            value.get("type").and_then(serde_json::Value::as_str) == Some("system")
+                && value.get("subtype").and_then(serde_json::Value::as_str) == Some("init")
+                && value.get("session_id").and_then(serde_json::Value::as_str)
+                    == Some(expected.0.as_str())
+        })
+}
+
+/// `ServerEvent` 属于 stdio compatibility wire，会反复附带 raw ThreadId。
+/// canonical bridge 在 CC 私域剥离 routing identity，并拒绝可能包含 session id 的
+/// unmodeled Raw payload。
+fn canonicalize_event(event: ServerEvent) -> Option<CanonicalAgentEvent> {
+    match event {
+        ServerEvent::SessionStarted { .. } => None,
+        ServerEvent::SessionCapabilities { capabilities, .. } => {
+            Some(CanonicalAgentEvent::Capabilities(capabilities))
+        }
+        ServerEvent::AgentItem {
+            item: AgentItem::Raw { .. },
+            ..
+        } => Some(CanonicalAgentEvent::Error(ProtocolError {
+            code: "adapter-raw-event-blocked".into(),
+            message:
+                "Claude Code emitted an unmodeled frame that is unavailable on canonical Runtime"
+                    .into(),
+            diagnostic_ref: None,
+        })),
+        ServerEvent::AgentItem { item, .. } => Some(CanonicalAgentEvent::Item(item)),
+        ServerEvent::ActionRequest { request, .. } => {
+            Some(CanonicalAgentEvent::ActionRequest(request))
+        }
+        ServerEvent::TurnComplete { summary, .. } => {
+            Some(CanonicalAgentEvent::TurnComplete(summary))
+        }
+        ServerEvent::Error { error, .. } => Some(CanonicalAgentEvent::Error(ProtocolError {
+            code: error.code,
+            message: "Claude Code adapter reported a private failure; see local diagnostics".into(),
+            diagnostic_ref: None,
+        })),
+        ServerEvent::VendorControl { payload, .. } => {
+            Some(CanonicalAgentEvent::VendorControl(payload))
+        }
+        ServerEvent::VendorPanelEvent { payload, .. } => {
+            Some(CanonicalAgentEvent::VendorPanelEvent(payload))
+        }
+    }
+}
+
+fn spawn_canonical_event_bridge(
+    mut compatibility_events: mpsc::Receiver<ServerEvent>,
+    canonical_events: CanonicalAgentEventSender,
+) {
+    tokio::spawn(async move {
+        while let Some(event) = compatibility_events.recv().await {
+            let Some(event) = canonicalize_event(event) else {
+                continue;
+            };
+            if canonical_events.send(event).await.is_err() {
+                return;
+            }
+        }
+    });
+}
+
 #[async_trait::async_trait]
 impl Agent for ClaudeCodeAdapter {
     fn kind(&self) -> AgentKind {
@@ -474,7 +803,103 @@ impl Agent for ClaudeCodeAdapter {
                 diagnostic_ref: None,
             });
         }
-        self.start_inner(start, events, None, None).await
+        self.start_inner(start, events, None, None, None).await
+    }
+
+    async fn start_adapter_state(
+        &self,
+        adapter_state_key: RuntimeId,
+        start: SessionStart,
+        events: CanonicalAgentEventSender,
+    ) -> Result<CanonicalAgentSessionHandle, ProtocolError> {
+        ensure_adapter_state_key(adapter_state_key)?;
+        if start.prompt.is_none() {
+            return Err(ProtocolError {
+                code: "adapter-state-initial-prompt-required".into(),
+                message: "canonical Claude Code start requires the first prompt".into(),
+                diagnostic_ref: None,
+            });
+        }
+        let repository = self
+            .state_repository
+            .as_ref()
+            .ok_or_else(|| ProtocolError {
+                code: "adapter-state-not-configured".into(),
+                message: "Claude Code private state repository is not configured".into(),
+                diagnostic_ref: None,
+            })?;
+        let mut options = match start.vendor_options {
+            VendorSessionOptions::ClaudeCode(options) => options,
+            _ => {
+                return Err(ProtocolError {
+                    code: "wrong-vendor".into(),
+                    message: "ClaudeCodeAdapter received non-ClaudeCode vendor options".into(),
+                    diagnostic_ref: None,
+                });
+            }
+        };
+        if options.session_id.is_some() {
+            return Err(ProtocolError {
+                code: "adapter-state-vendor-id-forbidden".into(),
+                message: "canonical Claude Code start does not accept a client-supplied session id"
+                    .into(),
+                diagnostic_ref: None,
+            });
+        }
+
+        // CC supports caller-supplied --session-id, so bind the random native id
+        // before spawn. A crash/retry reuses the exact persisted id instead of
+        // creating an unaddressable native history row.
+        let (native_session, was_already_bound) = match repository
+            .resolve(adapter_state_key)
+            .await
+            .map_err(adapter_state_error)?
+        {
+            Some(existing) => (existing, true),
+            None => {
+                let generated = ThreadId(uuid::Uuid::new_v4().to_string());
+                repository
+                    .bind(adapter_state_key, generated.clone())
+                    .await
+                    .map_err(adapter_state_error)?;
+                (generated, false)
+            }
+        };
+        // A retry after the native JSONL was materialized must resume; a retry
+        // after bind-but-before-spawn reuses the same --session-id. Never create
+        // a second native identity for one adapterStateKey.
+        let resume_thread_id = if was_already_bound
+            && crate::claude_code::history::native_session_is_materialized(&native_session).await?
+        {
+            Some(native_session.clone())
+        } else {
+            None
+        };
+        options.session_id = resume_thread_id.is_none().then(|| native_session.0.clone());
+        let canonical_start = SessionStart {
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: start.cwd,
+            prompt: start.prompt,
+            vendor_options: VendorSessionOptions::ClaudeCode(options),
+            runtime_options: start.runtime_options,
+        };
+        let (compatibility_events, compatibility_receiver) = mpsc::channel(512);
+        let handle = self
+            .start_inner(
+                canonical_start,
+                compatibility_events,
+                resume_thread_id,
+                None,
+                Some(native_session),
+            )
+            .await?;
+        spawn_canonical_event_bridge(compatibility_receiver, events);
+        Ok(CanonicalAgentSessionHandle {
+            session_id: handle.session_id,
+            adapter_state_key,
+            agent_kind: handle.agent_kind,
+            abort_handle: handle.abort_handle,
+        })
     }
 
     async fn continue_thread(
@@ -513,8 +938,114 @@ impl Agent for ClaudeCodeAdapter {
             vendor_options: VendorSessionOptions::ClaudeCode(opts),
             runtime_options: Default::default(),
         };
-        self.start_inner(synth_start, events, Some(thread_id), Some(prompt))
+        self.start_inner(synth_start, events, Some(thread_id), Some(prompt), None)
             .await
+    }
+
+    async fn continue_adapter_state(
+        &self,
+        adapter_state_key: RuntimeId,
+        cwd: std::path::PathBuf,
+        prompt: String,
+        events: CanonicalAgentEventSender,
+    ) -> Result<CanonicalAgentSessionHandle, ProtocolError> {
+        ensure_adapter_state_key(adapter_state_key)?;
+        let repository = self
+            .state_repository
+            .as_ref()
+            .ok_or_else(|| ProtocolError {
+                code: "adapter-state-not-configured".into(),
+                message: "Claude Code private state repository is not configured".into(),
+                diagnostic_ref: None,
+            })?;
+        let thread_id = repository
+            .resolve(adapter_state_key)
+            .await
+            .map_err(adapter_state_error)?
+            .ok_or_else(|| ProtocolError {
+                code: "adapter-state-not-found".into(),
+                message: "Claude Code resume mapping was not found".into(),
+                diagnostic_ref: None,
+            })?;
+        if !crate::claude_code::history::native_session_is_materialized(&thread_id).await? {
+            return Err(ProtocolError {
+                code: "adapter-state-native-not-materialized".into(),
+                message: "Claude Code private mapping has no unique native history session".into(),
+                diagnostic_ref: None,
+            });
+        }
+        let opts = ClaudeCodeSessionOptions {
+            permission_mode: ClaudeCodePermissionMode::BypassPermissions,
+            model: None,
+            effort: None,
+            hooks: vec![],
+            output_style: None,
+            allowed_tools: None,
+            disallowed_tools: None,
+            mcp_config_path: None,
+            plugin_dirs: vec![],
+            worktree: None,
+            session_name: None,
+            session_id: None,
+        };
+        let synth_start = SessionStart {
+            agent_kind: AgentKind::ClaudeCode,
+            cwd,
+            prompt: Some(prompt.clone()),
+            vendor_options: VendorSessionOptions::ClaudeCode(opts),
+            runtime_options: Default::default(),
+        };
+        let (compatibility_events, compatibility_receiver) = mpsc::channel(512);
+        let handle = self
+            .start_inner(
+                synth_start,
+                compatibility_events,
+                Some(thread_id.clone()),
+                Some(prompt),
+                Some(thread_id),
+            )
+            .await?;
+        spawn_canonical_event_bridge(compatibility_receiver, events);
+        Ok(CanonicalAgentSessionHandle {
+            session_id: handle.session_id,
+            adapter_state_key,
+            agent_kind: handle.agent_kind,
+            abort_handle: handle.abort_handle,
+        })
+    }
+
+    async fn read_adapter_history(
+        &self,
+        adapter_state_key: RuntimeId,
+    ) -> Result<CanonicalHistoryRead, ProtocolError> {
+        ensure_adapter_state_key(adapter_state_key)?;
+        let repository = self
+            .state_repository
+            .as_ref()
+            .ok_or_else(|| ProtocolError {
+                code: "adapter-state-not-configured".into(),
+                message: "Claude Code private state repository is not configured".into(),
+                diagnostic_ref: None,
+            })?;
+        let response =
+            crate::claude_code::history::read_managed_history(repository, adapter_state_key)
+                .await?;
+        if response
+            .turns
+            .iter()
+            .flat_map(|turn| &turn.items)
+            .any(|item| matches!(item, AgentItem::Raw { .. }))
+        {
+            return Err(ProtocolError {
+                code: "adapter-raw-history-blocked".into(),
+                message: "Claude Code history contains an unmodeled vendor frame".into(),
+                diagnostic_ref: None,
+            });
+        }
+        Ok(CanonicalHistoryRead {
+            agent_kind: AgentKind::ClaudeCode,
+            turns: response.turns,
+        })
     }
 
     async fn submit_decision(
@@ -708,6 +1239,9 @@ fn _path_import_marker(_p: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::CanonicalAgentEvent;
+    use agentdeck_protocol::{AgentItem, AgentItemMeta, ServerEvent};
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn permission_mode_cli_strings_cover_all_six_variants() {
@@ -724,6 +1258,173 @@ mod tests {
         ];
         for (m, expected) in modes {
             assert_eq!(permission_mode_to_cli(m), expected);
+        }
+    }
+
+    #[test]
+    fn canonical_retry_uses_resume_only_after_private_native_materialization() {
+        let native = ThreadId("10000000-0000-0000-0000-000000000001".into());
+        let options = ClaudeCodeSessionOptions {
+            permission_mode: ClaudeCodePermissionMode::BypassPermissions,
+            model: None,
+            effort: None,
+            hooks: vec![],
+            output_style: None,
+            allowed_tools: None,
+            disallowed_tools: None,
+            mcp_config_path: None,
+            plugin_dirs: vec![],
+            worktree: None,
+            session_name: None,
+            session_id: Some(native.0.clone()),
+        };
+        let start = SessionStart {
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: std::env::current_dir().unwrap(),
+            prompt: Some("prompt".into()),
+            vendor_options: VendorSessionOptions::ClaudeCode(options),
+            runtime_options: Default::default(),
+        };
+
+        let (new_command, _) = ClaudeCodeAdapter::build_command(&start, None).unwrap();
+        let new_args: Vec<_> = new_command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(new_args.iter().any(|arg| arg == "--session-id"));
+        assert!(!new_args.iter().any(|arg| arg == "--resume"));
+
+        let (resume_command, _) = ClaudeCodeAdapter::build_command(&start, Some(&native)).unwrap();
+        let resume_args: Vec<_> = resume_command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(resume_args.iter().any(|arg| arg == "--resume"));
+        assert!(!resume_args.iter().any(|arg| arg == "--session-id"));
+    }
+
+    #[test]
+    fn native_session_id_extraction_is_strict_and_ignores_unrelated_lines() {
+        assert_eq!(
+            observed_native_session_id(r#"{"type":"system","session_id":"expected"}"#).as_deref(),
+            Some("expected")
+        );
+        assert_eq!(
+            observed_native_session_id(r#"{"type":"system","sessionId":"wrong-key"}"#),
+            None
+        );
+        assert_eq!(observed_native_session_id("not-json"), None);
+    }
+
+    async fn identity_reader(input: &str) -> BufReader<tokio::io::DuplexStream> {
+        let (mut writer, reader) = tokio::io::duplex(16 * 1024);
+        writer
+            .write_all(input.as_bytes())
+            .await
+            .expect("write identity fixture");
+        drop(writer);
+        BufReader::new(reader)
+    }
+
+    #[tokio::test]
+    async fn canonical_identity_handshake_requires_authoritative_init_match() {
+        let expected = ThreadId("10000000-0000-0000-0000-000000000001".into());
+        let mut reader = identity_reader(
+            r#"{"type":"system","subtype":"init","session_id":"10000000-0000-0000-0000-000000000001"}
+"#,
+        )
+        .await;
+        assert_eq!(
+            read_authoritative_identity(&mut reader, &expected)
+                .await
+                .expect("matching authoritative init")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_identity_handshake_rejects_mismatch_missing_id_and_eof() {
+        let expected = ThreadId("10000000-0000-0000-0000-000000000001".into());
+        let mut mismatch = identity_reader(
+            r#"{"type":"system","subtype":"hook_started","session_id":"20000000-0000-0000-0000-000000000002"}
+"#,
+        )
+        .await;
+        assert_eq!(
+            read_authoritative_identity(&mut mismatch, &expected)
+                .await
+                .expect_err("mismatched session must fail")
+                .code,
+            "cc-session-id-mismatch"
+        );
+
+        let mut missing = identity_reader(
+            r#"{"type":"system","subtype":"init"}
+"#,
+        )
+        .await;
+        assert_eq!(
+            read_authoritative_identity(&mut missing, &expected)
+                .await
+                .expect_err("init without session id must fail")
+                .code,
+            "cc-session-id-missing"
+        );
+
+        let mut eof = identity_reader("").await;
+        assert_eq!(
+            read_authoritative_identity(&mut eof, &expected)
+                .await
+                .expect_err("EOF before evidence must fail")
+                .code,
+            "cc-session-identity-eof"
+        );
+    }
+
+    #[test]
+    fn canonical_boundary_drops_routing_ids_and_blocks_raw_vendor_frames() {
+        assert!(
+            canonicalize_event(ServerEvent::SessionStarted {
+                session_id: SessionId("transient".into()),
+                thread_id: Some(ThreadId("private-session".into())),
+                agent_kind: AgentKind::ClaudeCode,
+            })
+            .is_none()
+        );
+        let event = canonicalize_event(ServerEvent::AgentItem {
+            session_id: SessionId("transient".into()),
+            thread_id: ThreadId("private-session".into()),
+            agent_kind: AgentKind::ClaudeCode,
+            item: AgentItem::Raw {
+                raw_kind: "unknown".into(),
+                raw_payload: r#"{"session_id":"private-session"}"#.into(),
+                meta: AgentItemMeta::default(),
+            },
+        })
+        .expect("raw frame becomes a typed failure");
+        assert!(matches!(
+            event,
+            CanonicalAgentEvent::Error(error) if error.code == "adapter-raw-event-blocked"
+        ));
+        let error = canonicalize_event(ServerEvent::Error {
+            session_id: Some(SessionId("transient".into())),
+            error: ProtocolError {
+                code: "cc-private-error".into(),
+                message: "failed session_id=private-session".into(),
+                diagnostic_ref: Some("private-session".into()),
+            },
+        })
+        .expect("private error becomes canonical error");
+        match error {
+            CanonicalAgentEvent::Error(error) => {
+                assert_eq!(error.code, "cc-private-error");
+                assert!(!error.message.contains("private-session"));
+                assert!(error.diagnostic_ref.is_none());
+            }
+            other => panic!("expected canonical error, got {other:?}"),
         }
     }
 }

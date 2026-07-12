@@ -246,7 +246,7 @@ impl CodexTranslator {
                 return vec![TranslateOutput {
                     event: self.error_event(
                         "codex-malformed-json",
-                        format!("malformed codex frame: {e}: {trimmed}"),
+                        format!("malformed codex frame: {e}"),
                     ),
                     rpc_route_hint: None,
                 }];

@@ -13,9 +13,10 @@ mod worker;
 
 pub use crate::runtime::model::{
     AcceptCommand, AcceptOutcome, AuthorizeExecutionRelease, CommandRecord, CommandState,
-    CompleteCommand, CompleteOutcome, ConversationLifecycle, ConversationRecord,
-    ConversationRecoveryRecord, EventRecord, ExecutionFence, ExecutionFenceRecord,
-    ExecutionIntentRecord, IdempotencyOwner, MAX_RECOVERY_PAGE_RETAINED_BYTES,
+    CompleteCommand, CompleteOutcome, ConversationDescriptor, ConversationLifecycle,
+    ConversationRecord, ConversationRecoveryRecord, EventRecord, ExecutionFence,
+    ExecutionFenceRecord, ExecutionIntentRecord, IdempotencyOwner,
+    MAX_CONVERSATION_DESCRIPTOR_BYTES, MAX_RECOVERY_PAGE_RETAINED_BYTES,
     MachineEnrollmentReceiptRecord, NewConversation, QueueScope, RecoveryCompletion,
     RecoveryCursor, RecoveryPage, RecoveryState, RuntimeClock, RuntimeClockError,
     RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreFaultInjector,
@@ -24,5 +25,13 @@ pub use crate::runtime::model::{
 };
 pub use identity::{RuntimeId, RuntimeIdKind, RuntimeIdSource};
 pub use recovery::RuntimeRescueIndex;
-pub use schema::{RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION};
+pub use schema::{RUNTIME_CRYPTO_CONTEXT_VERSION, RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION};
 pub use worker::RuntimeStoreHandle;
+pub(crate) use worker::{ClaudeCodeAdapterStateVault, CodexAdapterStateVault};
+
+#[cfg(test)]
+pub(crate) fn claude_code_adapter_state_vault_for_test(
+    store: &RuntimeStoreHandle,
+) -> ClaudeCodeAdapterStateVault {
+    store.claude_code_adapter_state_vault()
+}

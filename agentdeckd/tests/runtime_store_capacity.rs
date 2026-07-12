@@ -1,3 +1,5 @@
+#[path = "support/runtime_descriptor.rs"]
+mod runtime_descriptor;
 #[path = "support/runtime_recovery.rs"]
 mod runtime_recovery;
 
@@ -160,7 +162,7 @@ fn conversation_input(seed: u8, descriptor: &[u8]) -> NewConversation {
             [seed.wrapping_add(0x40); 16],
         )
         .expect("adapter state key"),
-        descriptor: descriptor.to_vec(),
+        descriptor: runtime_descriptor::descriptor(descriptor),
     }
 }
 

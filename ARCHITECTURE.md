@@ -98,7 +98,12 @@ agentdeckd
 | **N5** | **一等公民对称约束**：`CodexAdapter` 实现的每个非独有 capability，`ClaudeCodeAdapter` 必须有等价实现或文档化"不适用"原因 | capability 矩阵文档 + cargo test |
 | **N6** | **Transport trait 远程预留**：v0.2 实现 `Transport` trait（仅 stdio），但 trait 必须能支持 remote（异步、可重连、可携带 auth context） | 编译期 trait 定义 |
 | **N7** | **`SessionCapabilities` 必须先于该 session 任何 `AgentItem`** | 集成测试断言序 |
-| **N8** | **CC 数据事实唯一来源**：AgentDeck 不为 CC 维护任何元数据层；不在 `~/Library/Application Support/AgentDeck/` 下创建 `cc-meta/` 目录 | code review + 文件存在性断言 |
+| **N8** | **CC 原生历史是唯一权威事实源**：只允许 Runtime DB 的 `claude_code_adapter_state` 保存 StorageKEK 保护、可重建的 `adapterStateKey → native session id` 派生索引；不得保存 title/archive/status/transcript，不创建 `cc-meta/`，不得进入 common catalog、日志、Relay 或客户端 wire | typed namespace + 密文/目录边界测试 |
+
+“可重建”不表示按 title/cwd/mtime 猜回一个既有随机 `adapterStateKey`。只有本机 native
+projects root 中恰好一个 regular、非 memory-agent JSONL 被读回，并由本地流程明确选定 neutral
+key 时才可重新绑定；原映射丢失且无法确认时必须 fail-close/RecoveryBlocked，或导入成新的
+conversation/key，不能伪造身份连续性。
 
 ### Relay R1a 不变量（传输 + 鉴权骨架，历史）
 
@@ -443,7 +448,35 @@ agentdeckd
   当前数据库调用。
 - stable `conversationId` / `adapterStateKey` 必须在 adapter 启动前、进入 store 事务前由
   daemon 生成。store 以 caller-owned ID 实现 create COMMIT-unknown 的精确重放；vendor
-  resume reference 仍不能进入 common `conversations` 表，P3.3 只把它写入 adapter 私表。
+  resume reference 仍不能进入 common `conversations` 表，只能写入
+  `codex_adapter_state` / `claude_code_adapter_state` 两个互斥私有 namespace。数据库物理
+  schema version 与 row/key-wrap crypto context version 分离：P3.3 schema v2 仍使用冻结的
+  crypto context v1，因此 v1→v2 只增加空私表和 authenticated totals，不重加密既有最多
+  2 GiB 的 journal。
+- common catalog descriptor 不是任意 bytes：唯一入口是 deny-unknown 的 typed
+  `ConversationDescriptor(agentKind,title,cwd)`，store 只接受其固定字段顺序 canonical JSON。
+  open/recovery/v1→v2 migration 都会解密、解析并逐字节重编码核对；即使攻击者用正确 BIK/AEAD
+  写入 `threadId`/`sessionId`/resume 扩展字段，也必须在任何 migration 写入前 fail-close。
+- v1→v2 migration 的 KEK、全库 integrity 与容量门禁全部先于持久化 PRAGMA；DDL 在 legacy
+  journal mode 内执行。before-COMMIT error 只有显式 `ROLLBACK` 且确认 autocommit 后才返回原
+  error，main/WAL/SHM/rollback-journal 必须逐字节恢复；完整 COMMIT 后才切换并读回
+  WAL/PERSIST_WAL。post-COMMIT 配置失败只能报告 unknown outcome，由重开识别 v2 后收敛。
+- canonical adapter contract 与 stdio compatibility 已分型。`CanonicalAgentSessionHandle` 只含
+  transient daemon `sessionId`、neutral `adapterStateKey`、agent kind 与 abort handle；
+  `CanonicalAgentEvent`/canonical history 均没有 `ThreadId`。旧 translator 仍可在各 vendor
+  模块私域产生 `ServerEvent`，但私域 bridge 会剥离 routing identity，并把可能内嵌 resume ref
+  的未建模 Raw frame 改成 typed failure，不能进入 RuntimeCore。
+- Codex 在 `thread/start` 后、首个 `turn/start` 前 COMMIT 私有映射；resume response 必须返回与
+  私有映射精确相同的 `thread.id`，缺失或不一致都 kill/fail-close。CC 先 COMMIT 随机 UUID，
+  首次用 `--session-id`，只在唯一 regular/non-memory native JSONL 经 `O_NOFOLLOW` 打开、inode
+  对齐并在固定 byte/line 上界内读回有效 JSON object 后用 `--resume`；fresh home 缺少 projects
+  root 只表示尚未 materialize，不会把同一 key 永久卡死。
+  clean/safe-mode CC 在 prompt 前没有 frame，因此 canonical 路径先确认 CLI 参数解析后未早退，
+  再发 prompt，但在 authoritative `system.init.session_id` 精确匹配前不返回 handle、不发布事件；
+  mismatch、缺 ID、EOF 与 timeout 均 kill/fail-close。两家 state module/repository 均为 adapter
+  私有；`RuntimeStoreHandle` 的 namespace factory 仅在 `runtime` 可见，composition 生成两个
+  固定 namespace 的 typed vault 后分别注入 adapter。通用明文 bind/resolve 是 store worker
+  私有方法，任一 adapter 都不能构造或取得另一方 vault。
 - catalogRevision、commandSeq、eventSeq 是三个独立 u64 high-water，SQLite 中使用固定 20 位
   十进制文本；分配 ID、推进 high-water、改变 command state 与插入对应 event 必须位于同一
   `BEGIN IMMEDIATE`。所有 after-COMMIT failure 只能返回 unknown outcome，不能把已提交事实
@@ -493,9 +526,9 @@ agentdeckd
 - `machine_enrollment_receipts` 只是 MachineRoot 丢失后仍可读的非秘密 locator，不带 MAC、
   也不是 purge authorization。P4 trust-reset 必须用 Relay/admin-signed receipt 独立验证 old
   route/root fingerprint；不得仅凭该表执行远端删除。
-- P3.2 只建立并验证 store boundary；当前 compatibility `RuntimeHub` 尚未依赖它。P3.3 的
-  adapter 私有映射和 P3.4 的 RuntimeCore actor 才能把业务请求接入，因此本节不是本地/远程
-  端到端可用声明。
+- P3.2/P3.3 只建立并验证 store + adapter private boundary；当前 compatibility `RuntimeHub`
+  尚未依赖它。P3.4 的 RuntimeCore actor 才能把业务请求接入，因此本节不是本地/远程端到端
+  可用声明。
 
 ### R1a 隐含约束（历史参考）
 
