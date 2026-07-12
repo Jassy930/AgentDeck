@@ -378,7 +378,7 @@ pub struct ReplayTicket { pub stream: StreamRouteId, pub generation: StreamGener
 - [x] Step 3: 实现并列的v2 WS server library。WS只接受canonical binary v2，listener/codec前4MiB拒绝oversize/text；direct TLS在bind/DB前校验且不fallback，明文/代理仅显式loopback；公开TCP受1,024物理连接、5s accept→成功101 deadline和64KiB header上界约束，只有101解除deadline并让permit穿过upgrade，非101强制close；可信proxy必须覆写单个canonical source IP。用`CancellationToken + JoinSet`管理tasks。固定 `/v2/connect` 与 `/v2/pair`，PairRoute只由TLS后kind29 `PairingHello`携带；Auth/Core FIFO drain、cached readiness、60s maintenance、zero-copy writer和OS process lock均闭环。此task不切换binary默认listener。
 - [x] Step 4: TLS E2E 10/10、lifecycle 5/5、pre-upgrade 3/3、config三feature矩阵、Store 101/101、Auth 25/25、Route 12/12及 `server`/`server,tls` 全量通过。selfcheck直接消费fixture相对cert/key，真实打开绝对临时DB、迁移/readiness/Core，并用同一套Store配置shutdown/reopen；真实SIGTERM、正常运行慢header deadline、完整普通HTTP饱和恢复与5s forced drain后DB均可立即重开。binary默认切换仍留到P2.9。
 - [x] Step 5: 日志positive-event sentinel零敏感命中；TLS E2E串行10轮+默认并行10轮（共200 case）全绿。P0总门禁、Protocol全量、Swift RelayV2Wire 15/15与client 23/23、full Rust两套feature、focused clippy/rustdoc/rustfmt、四份schema diff、docs gate、daemon-no-net与diff check全部通过。独立复审发现的Store锁回执顺序、Core错误清理、proxy来源隔离、pre-upgrade Slowloris、普通HTTP keep-alive占满permit与selfcheck配置漂移均已逐项red→green闭环；最终质量复审无P0/P1。
-- [ ] Step 6: 精确暂存本task的 Relay、protocol/schema、Swift wire、依赖锁和文档改动并提交。 `git commit -m "feat(relay): 强制 v2 TLS 与可控服务生命周期"`
+- [x] Step 6: 已精确暂存本task的 Relay、protocol/schema、Swift wire、依赖锁和文档改动并提交为 `4764f8c feat(relay): 强制 v2 TLS 与可控服务生命周期`；未包含构建产物、运行数据或本地 SDD ledger。
 
 ### Task P2.7：实现本机 admin UDS、enrollment bundle 与 purge CLI
 
