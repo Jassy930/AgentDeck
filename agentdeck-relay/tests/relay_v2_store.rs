@@ -80,6 +80,28 @@ fn retained_bytes_for_probe(path: &Path, stream_route: StreamRouteId) -> i64 {
         .expect("read maintenance probe sentinel")
 }
 
+fn durable_business_row_counts(path: &Path) -> Vec<i64> {
+    let connection = Connection::open(path).expect("open readiness readback connection");
+    [
+        "machine_routes",
+        "device_grants",
+        "revocations",
+        "streams",
+        "frames",
+        "subscriptions",
+        "enrollment_codes",
+    ]
+    .into_iter()
+    .map(|table| {
+        connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("read readiness business row count")
+    })
+    .collect()
+}
+
 fn device_grant_counts(path: &Path) -> (u64, u64) {
     Connection::open(path)
         .expect("open device grant count connection")
@@ -769,6 +791,198 @@ async fn fresh_migration_creates_marker_and_exact_eight_table_family() {
     );
 
     store.shutdown().await.expect("shutdown fresh store");
+}
+
+#[tokio::test]
+async fn readiness_probe_checks_the_live_store_without_creating_business_rows() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let store = RelayStoreHandle::open(fixed_config(&path).with_disk_space_probe(Arc::new(
+        FixedDiskProbe(DiskSpace {
+            available_bytes: 2 * GIB,
+            total_bytes: 20 * GIB,
+        }),
+    )))
+    .await
+    .expect("open readiness store");
+    let before = durable_business_row_counts(&path);
+
+    store
+        .probe_readiness()
+        .await
+        .expect("healthy schema, pragmas, writer and reserve must be ready");
+
+    assert_eq!(durable_business_row_counts(&path), before);
+    store.shutdown().await.expect("shutdown readiness store");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn live_store_holds_an_os_process_lock_until_worker_shutdown() {
+    const CHILD_PATH: &str = "AGENTDECK_RELAY_STORE_LOCK_CHILD_PATH";
+    const CHILD_EXPECT_OPEN: &str = "AGENTDECK_RELAY_STORE_LOCK_EXPECT_OPEN";
+    if let Some(path) = std::env::var_os(CHILD_PATH) {
+        let path = PathBuf::from(path);
+        let opened = RelayStoreHandle::open(fixed_config(&path)).await;
+        if std::env::var_os(CHILD_EXPECT_OPEN).is_some() {
+            let store = opened.expect("child must open Store after parent shutdown");
+            store.shutdown().await.expect("child shutdown Store");
+        } else {
+            assert!(
+                matches!(opened, Err(StoreError::StoreAlreadyOpen)),
+                "second process must receive StoreAlreadyOpen"
+            );
+        }
+        return;
+    }
+
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let store = open_production(&path).await;
+
+    let current_test = std::env::current_exe().expect("current integration test binary");
+    let run_child = |expect_open: bool| {
+        let mut command = std::process::Command::new(&current_test);
+        command
+            .arg("--exact")
+            .arg("live_store_holds_an_os_process_lock_until_worker_shutdown")
+            .arg("--nocapture")
+            .env(CHILD_PATH, &path);
+        if expect_open {
+            command.env(CHILD_EXPECT_OPEN, "1");
+        }
+        command.status().expect("run lock child")
+    };
+    assert!(
+        run_child(false).success(),
+        "child must observe the live cross-process lock"
+    );
+
+    store.shutdown().await.expect("shutdown locked Store");
+    assert!(
+        run_child(true).success(),
+        "child must open after worker releases the process lock"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_ack_happens_only_after_the_os_process_lock_is_released() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let (entered_tx, entered_rx) = std_mpsc::channel();
+    let (release_tx, release_rx) = std_mpsc::channel();
+    let injector = Arc::new(BlockingFaultInjector::new(
+        FaultPoint::ShutdownAfterReply,
+        entered_tx,
+        release_rx,
+    ));
+    let store = RelayStoreHandle::open(fixed_config(&path).with_fault_injector(injector))
+        .await
+        .expect("open shutdown-order Store");
+
+    let shutdown_store = store.clone();
+    let shutdown = tokio::spawn(async move { shutdown_store.shutdown().await });
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(std::time::Duration::from_secs(5)))
+        .await
+        .expect("join shutdown reply boundary")
+        .expect("worker reached post-reply boundary");
+    tokio::time::timeout(std::time::Duration::from_secs(1), shutdown)
+        .await
+        .expect("shutdown reply must already be observable")
+        .expect("join shutdown caller")
+        .expect("shutdown caller succeeds");
+
+    // worker 仍被测试栅栏阻塞，只有 reply 前已释放 OS lock 才能在此重开。
+    let reopened = RelayStoreHandle::open(fixed_config(&path)).await;
+    release_tx.send(()).expect("release old worker return");
+    let reopened = reopened.expect("shutdown ACK must happen after process-lock release");
+    reopened.shutdown().await.expect("shutdown reopened Store");
+}
+
+#[tokio::test]
+async fn readiness_probe_tracks_disk_low_and_recovers_without_reopening() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let disk = Arc::new(MutableDiskProbe::new(GIB, 20 * GIB));
+    let store = RelayStoreHandle::open(fixed_config(&path).with_disk_space_probe(disk.clone()))
+        .await
+        .expect("open mutable readiness store");
+
+    assert!(matches!(
+        store.probe_readiness().await,
+        Err(StoreError::DiskSpaceLow)
+    ));
+    disk.set_available(GIB + 64 * 1024 - 1);
+    assert!(matches!(
+        store.probe_readiness().await,
+        Err(StoreError::DiskSpaceLow)
+    ));
+    disk.set_available(GIB + 64 * 1024);
+    store
+        .probe_readiness()
+        .await
+        .expect("readiness must recover when free space recovers");
+
+    store
+        .shutdown()
+        .await
+        .expect("shutdown mutable readiness store");
+}
+
+#[tokio::test]
+async fn readiness_probe_rejects_live_schema_drift() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let store = RelayStoreHandle::open(fixed_config(&path).with_disk_space_probe(Arc::new(
+        FixedDiskProbe(DiskSpace {
+            available_bytes: 2 * GIB,
+            total_bytes: 20 * GIB,
+        }),
+    )))
+    .await
+    .expect("open schema-drift readiness store");
+    Connection::open(&path)
+        .expect("open schema tamper connection")
+        .execute_batch("DROP TABLE frames")
+        .expect("tamper schema fixture");
+
+    assert!(matches!(
+        store.probe_readiness().await,
+        Err(StoreError::UnknownOrCorruptSchema)
+    ));
+
+    store
+        .shutdown()
+        .await
+        .expect("shutdown schema-drift readiness store");
+}
+
+#[tokio::test]
+async fn readiness_probe_fails_closed_after_worker_shutdown() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let store = RelayStoreHandle::open(fixed_config(&path))
+        .await
+        .expect("open stopped-worker readiness store");
+    let stale = store.clone();
+    store.shutdown().await.expect("shutdown readiness worker");
+
+    let error = stale
+        .probe_readiness()
+        .await
+        .expect_err("stopped worker must never report ready");
+    assert!(matches!(
+        error,
+        StoreError::WorkerUnavailable | StoreError::WorkerStopped
+    ));
+    assert_eq!(error.diagnostic_code(), "relay.store.unavailable");
 }
 
 #[tokio::test]
@@ -4888,7 +5102,7 @@ async fn worker_queue_rejects_excess_command_without_retaining_waiting_requests(
         queued.push(tokio::spawn(async move { queued_store.inspect().await }));
         tokio::task::yield_now().await;
     }
-    let excess = store.inspect().await;
+    let excess = store.probe_readiness().await;
     let shutdown_busy = store.shutdown().await;
     release_tx.send(()).expect("release blocked worker");
     assert!(matches!(excess, Err(StoreError::WorkerBusy)));

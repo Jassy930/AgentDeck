@@ -118,7 +118,7 @@ pub struct RuntimeEvent { pub conversation_id: ConversationId, pub event_id: Eve
 pub const RELAY_PROTOCOL_VERSION: u16 = 2;
 pub const E2EE_FORMAT_VERSION: u16 = 1;
 pub struct OpaqueRouteFrame { pub version: u16, pub body: RelayFrameBody }
-pub enum RelayFrameBody { Hello(Hello), Challenge(Challenge), Authenticate(Authenticate), Authenticated(Authenticated), OpenPairRoute(OpenPairRoute), PairRouteOpened(PairRouteOpened), PairData(PairData), ClosePairRoute(ClosePairRoute), PairRouteClosed(PairRouteClosed), RegisterStream(RegisterStream), Publish(Publish), Subscribe(Subscribe), Unsubscribe(Unsubscribe), Ack(Ack), Gap(Gap), ReplayComplete(ReplayComplete), Send(Send), Reply(Reply), InstallGrant(InstallGrant), GrantCommitted(GrantCommitted), RevokeDevice(RevokeDevice), RevocationCommitted(RevocationCommitted), RetireMachine(RetireMachine), Ping(Ping), Pong(Pong), RouteAccepted(RouteAccepted), Error(RelayFailure), ServerRestarting(ServerRestarting), RetirementCommitted(RetirementCommitted) }
+pub enum RelayFrameBody { Hello(Hello), Challenge(Challenge), Authenticate(Authenticate), Authenticated(Authenticated), OpenPairRoute(OpenPairRoute), PairRouteOpened(PairRouteOpened), PairData(PairData), ClosePairRoute(ClosePairRoute), PairRouteClosed(PairRouteClosed), RegisterStream(RegisterStream), Publish(Publish), Subscribe(Subscribe), Unsubscribe(Unsubscribe), Ack(Ack), Gap(Gap), ReplayComplete(ReplayComplete), Send(Send), Reply(Reply), InstallGrant(InstallGrant), GrantCommitted(GrantCommitted), RevokeDevice(RevokeDevice), RevocationCommitted(RevocationCommitted), RetireMachine(RetireMachine), Ping(Ping), Pong(Pong), RouteAccepted(RouteAccepted), Error(RelayFailure), ServerRestarting(ServerRestarting), RetirementCommitted(RetirementCommitted), PairingHello(PairingHello) }
 pub struct MachineEnrollmentRequestV1 { pub code: EnrollmentCode, pub machine_route: MachineRouteId, pub root_pubkey: PublicKeyBytes, pub link_cert: SignedCertificate, pub data_cert: SignedCertificate }
 pub struct MachineEnrollmentResponseV1 { pub relay_server_id: RelayServerId, pub machine_route: MachineRouteId, pub trust_epoch: u64, pub receipt_hash: [u8; 32] }
 ```
@@ -363,18 +363,22 @@ pub struct ReplayTicket { pub stream: StreamRouteId, pub generation: StreamGener
 ### Task P2.6：实现 TLS fail-closed、server lifecycle、health/readiness 与 redacted telemetry
 
 **Files:**
-- Create: `agentdeck-relay/src/v2/server/{mod,ws,tls,health,connection}.rs`
-- Create: `agentdeck-relay/tests/relay_v2_tls_e2e.rs`
+- Create: `agentdeck-relay/src/v2/server/{mod,tls,health,connection,preupgrade}.rs`
+- Create: `agentdeck-relay/tests/{relay_v2_config,relay_v2_tls_e2e,relay_v2_lifecycle_e2e}.rs`
 - Create: `agentdeck-relay/tests/fixtures/relay-selfcheck.toml`
-- Modify: `agentdeck-relay/src/config.rs`
+- Modify: `agentdeck-relay/src/{config,v2/mod}.rs`
+- Modify: `agentdeck-relay/src/v2/{auth/coordinator,core/{router,writer},store/{sqlite,worker}}.rs`
 - Modify: `agentdeck-relay/Cargo.toml`
+- Modify: `agentdeck-protocol/src/relay_v2/{frame,codec,mod}.rs`、Relay v2 schema/golden/contract
+- Modify: `Sources/AgentDeckRelayClient/Wire/RelayV2Types.swift` 与 Swift wire tests
+- Modify: `README.md`、`ARCHITECTURE.md`、`docs/{QUALITY,AGENT_DIAGNOSTICS,index}.md`
 
-- [ ] Step 1: 写config/TLS/lifecycle tests。 覆盖CLI>env>config>dev-default优先级、非loopback无TLS、TLS args但feature缺失、cert/key不匹配、相对storage、明文未显式opt-in、proxy mode非loopback、redirect/host/scheme降级、SIGTERM drain、仅loopback healthz/readyz、disk-low readiness、sentinel不入日志。
-- [ ] Step 2: 运行 TLS e2e。 Expected: 当前实现至少在 feature fallback 测试失败。
-- [ ] Step 3: 实现并列的v2 WS server library。 WS只接受`RelayWireCodecV2` binary message，listener/websocket config在decode和业务分配前以4MiB max-message拒绝oversize并拒绝text frame；删除v2配置中的`allow_plaintext`语义，改为`allow_insecure_loopback`；用`CancellationToken + JoinSet`管理tasks，SIGTERM停止accept、发ServerRestarting、最多5s drain；此task不切换binary默认listener。
-- [ ] Step 4: 运行 `cargo test -p agentdeck-relay --features server,tls --test relay_v2_tls_e2e` 和library-level selfcheck test。 Expected: 全部 PASS；selfcheck真打开临时绝对路径DB、迁移、校验keypair并构造Store/Core后退出；binary默认切换留到P2.9。
-- [ ] Step 5: 运行日志 sentinel scan与 clippy。
-- [ ] Step 6: 提交。 `git add agentdeck-relay && git commit -m "feat(relay): 强制 v2 TLS 与可控服务生命周期"`
+- [x] Step 1: 写config/TLS/lifecycle tests。覆盖 CLI>env>TOML>defaults、全部 Store tunable、非loopback无TLS、TLS feature缺失、cert/key不匹配、相对storage、明文显式opt-in、proxy loopback、固定public path无redirect/query carrier、真实SIGTERM子进程、pre-upgrade deadline/header/物理连接上界、1,024普通HTTP keep-alive饱和恢复、slow partial HTTP drain、真实proxy source header、loopback health/readiness、disk-low、handle Drop与日志sentinel；另补 Auth/Core drain fence、Store shutdown回执顺序和真实OS子进程Store lock。
+- [x] Step 2: 运行红测。旧实现精确失败于 `/v2/pair` 404/query pairing carrier、TLS feature fallback/配置门禁、缺少readiness/lifecycle与进程锁；PairingHello contract先红在缺variant/kind，auth/core测试先红在缺drain API；最终资源回归在1,024个完整非升级keep-alive后精确红于第1,025个合法WS超时。保留先红后绿证据。
+- [x] Step 3: 实现并列的v2 WS server library。WS只接受canonical binary v2，listener/codec前4MiB拒绝oversize/text；direct TLS在bind/DB前校验且不fallback，明文/代理仅显式loopback；公开TCP受1,024物理连接、5s accept→成功101 deadline和64KiB header上界约束，只有101解除deadline并让permit穿过upgrade，非101强制close；可信proxy必须覆写单个canonical source IP。用`CancellationToken + JoinSet`管理tasks。固定 `/v2/connect` 与 `/v2/pair`，PairRoute只由TLS后kind29 `PairingHello`携带；Auth/Core FIFO drain、cached readiness、60s maintenance、zero-copy writer和OS process lock均闭环。此task不切换binary默认listener。
+- [x] Step 4: TLS E2E 10/10、lifecycle 5/5、pre-upgrade 3/3、config三feature矩阵、Store 101/101、Auth 25/25、Route 12/12及 `server`/`server,tls` 全量通过。selfcheck直接消费fixture相对cert/key，真实打开绝对临时DB、迁移/readiness/Core，并用同一套Store配置shutdown/reopen；真实SIGTERM、正常运行慢header deadline、完整普通HTTP饱和恢复与5s forced drain后DB均可立即重开。binary默认切换仍留到P2.9。
+- [x] Step 5: 日志positive-event sentinel零敏感命中；TLS E2E串行10轮+默认并行10轮（共200 case）全绿。P0总门禁、Protocol全量、Swift RelayV2Wire 15/15与client 23/23、full Rust两套feature、focused clippy/rustdoc/rustfmt、四份schema diff、docs gate、daemon-no-net与diff check全部通过。独立复审发现的Store锁回执顺序、Core错误清理、proxy来源隔离、pre-upgrade Slowloris、普通HTTP keep-alive占满permit与selfcheck配置漂移均已逐项red→green闭环；最终质量复审无P0/P1。
+- [ ] Step 6: 精确暂存本task的 Relay、protocol/schema、Swift wire、依赖锁和文档改动并提交。 `git commit -m "feat(relay): 强制 v2 TLS 与可控服务生命周期"`
 
 ### Task P2.7：实现本机 admin UDS、enrollment bundle 与 purge CLI
 

@@ -381,18 +381,27 @@ impl AuthorizationCoordinator {
     /// 排在本命令前的授权状态转换全部完成、Store ownership 已释放后才返回。
     pub async fn shutdown(&self) -> Result<(), RelayFailure> {
         let (reply, response) = oneshot::channel();
-        match self.tx.try_send(AuthorizationCommand::Shutdown { reply }) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                return Err(RelayFailure::new(
-                    RELAY_QUOTA_EXCEEDED,
-                    "authorization command capacity is exhausted",
-                ));
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => return Err(unavailable()),
-        }
+        self.tx
+            .send(AuthorizationCommand::Shutdown { reply })
+            .await
+            .map_err(|_| unavailable())?;
         response.await.map_err(|_| unavailable())??;
         Ok(())
+    }
+
+    /// 在 authorization actor FIFO 中建立 shutdown fence。返回后不再执行新的
+    /// authenticate/register/grant/revoke/retire Store mutation；既有 active 状态留给
+    /// Relay Core 的 drain/shutdown 顺序统一关闭。
+    pub async fn begin_drain(&self) -> Result<(), RelayFailure> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(unavailable());
+        }
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(AuthorizationCommand::BeginDrain { reply })
+            .await
+            .map_err(|_| unavailable())?;
+        response.await.map_err(|_| unavailable())?
     }
 
     async fn dispatch_store<T>(
@@ -463,6 +472,9 @@ enum AuthorizationCommand {
         retirement: RetireMachine,
         reply: oneshot::Sender<Result<AuthorizationMutation<RetirementCommit>, RelayFailure>>,
     },
+    BeginDrain {
+        reply: oneshot::Sender<Result<(), RelayFailure>>,
+    },
     Shutdown {
         reply: oneshot::Sender<Result<(), RelayFailure>>,
     },
@@ -482,6 +494,7 @@ async fn run(
     service: AuthenticationService,
 ) {
     let mut shutdown_reply = None;
+    let mut draining = false;
     while let Some(command) = rx.recv().await {
         if lifecycle.poisoned.load(Ordering::Acquire)
             && !matches!(command, AuthorizationCommand::Shutdown { .. })
@@ -495,12 +508,19 @@ async fn run(
                 now_ms,
                 reply,
             } => {
-                let result =
-                    authenticate(&service, &active, &lifecycle, frame, challenge, now_ms).await;
+                let result = if draining {
+                    Err(draining_failure())
+                } else {
+                    authenticate(&service, &active, &lifecycle, frame, challenge, now_ms).await
+                };
                 let _ = reply.send(result);
             }
             AuthorizationCommand::RegisterMachine { request, reply } => {
-                let result = register_machine(&service, &active, &lifecycle, request).await;
+                let result = if draining {
+                    Err(StoreError::WorkerUnavailable)
+                } else {
+                    register_machine(&service, &active, &lifecycle, request).await
+                };
                 let _ = reply.send(result);
             }
             AuthorizationCommand::InstallGrantFrom {
@@ -508,7 +528,11 @@ async fn run(
                 grant,
                 reply,
             } => {
-                let result = install_grant_from(&service, &active, &lifecycle, origin, grant).await;
+                let result = if draining {
+                    Err(draining_failure())
+                } else {
+                    install_grant_from(&service, &active, &lifecycle, origin, grant).await
+                };
                 let _ = reply.send(result);
             }
             AuthorizationCommand::RevokeFrom {
@@ -516,7 +540,11 @@ async fn run(
                 revocation,
                 reply,
             } => {
-                let result = revoke_from(&service, &active, &lifecycle, origin, revocation).await;
+                let result = if draining {
+                    Err(draining_failure())
+                } else {
+                    revoke_from(&service, &active, &lifecycle, origin, revocation).await
+                };
                 let _ = reply.send(result);
             }
             AuthorizationCommand::RetireMachineFrom {
@@ -524,9 +552,16 @@ async fn run(
                 retirement,
                 reply,
             } => {
-                let result =
-                    retire_machine_from(&service, &active, &lifecycle, origin, retirement).await;
+                let result = if draining {
+                    Err(draining_failure())
+                } else {
+                    retire_machine_from(&service, &active, &lifecycle, origin, retirement).await
+                };
                 let _ = reply.send(result);
+            }
+            AuthorizationCommand::BeginDrain { reply } => {
+                draining = true;
+                let _ = reply.send(Ok(()));
             }
             AuthorizationCommand::Shutdown { reply } => {
                 let result = shutdown_active(&active, &lifecycle);
@@ -881,5 +916,12 @@ fn unavailable() -> RelayFailure {
     RelayFailure::new(
         RELAY_STORE_UNAVAILABLE,
         "authentication state is unavailable",
+    )
+}
+
+fn draining_failure() -> RelayFailure {
+    RelayFailure::new(
+        "relay.server.draining",
+        "Relay server is draining and no longer accepts authorization mutations",
     )
 }

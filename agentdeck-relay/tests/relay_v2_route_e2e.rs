@@ -2158,3 +2158,166 @@ async fn pairing_cannot_publish_or_register_even_with_well_formed_outer_frames()
 
     fixture.shutdown().await;
 }
+
+#[tokio::test]
+async fn drain_fence_rejects_later_mutations_attach_and_activate_without_state_change() {
+    let mut fixture = Fixture::new().await;
+    let machine_route = fixture.realms[0].machine_route;
+    let route = pair_route(500);
+    let expiry = NOW_MS + PAIR_TTL_MS;
+    let machine = fixture.connect_machine(0).await;
+    let readonly = open_readonly_db(&fixture.db_path);
+    let sqlite_before = sqlite_route_snapshot(&readonly);
+    let route_before = fixture
+        .core
+        .pair_route_view(route)
+        .await
+        .expect("route view before drain");
+    let writer_before = format!("{:?}", machine.writer);
+
+    fixture
+        .core
+        .begin_drain()
+        .await
+        .expect("install drain fence");
+    let rejected = fixture
+        .core
+        .handle(
+            &machine.access,
+            open_pair_frame(machine_route, route, expiry),
+        )
+        .await
+        .expect_err("post-fence route mutation must fail");
+    assert_eq!(rejected.code, "relay.server.draining");
+    let activate = fixture
+        .core
+        .activate(machine.access.clone())
+        .await
+        .expect_err("post-fence activation must fail");
+    assert_eq!(activate.code, "relay.server.draining");
+
+    let (rejected_writer, _rejected_receiver) =
+        OutboundWriter::new(OutboundWriterConfig::default());
+    let attach = fixture
+        .core
+        .attach_pending(connection(9_999), rejected_writer.clone())
+        .await
+        .expect_err("post-fence attach must fail");
+    assert_eq!(attach.code, "relay.server.draining");
+    assert_eq!(
+        rejected_writer.close_reason(),
+        Some(WriterCloseReason::Shutdown)
+    );
+
+    assert_eq!(
+        fixture
+            .core
+            .pair_route_view(route)
+            .await
+            .expect("route view after rejected mutation"),
+        route_before
+    );
+    assert_eq!(sqlite_route_snapshot(&readonly), sqlite_before);
+    assert_eq!(format!("{:?}", machine.writer), writer_before);
+    assert!(!machine.writer.is_closed());
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn concurrent_drain_and_route_mutation_linearize_as_full_commit_or_full_rejection() {
+    const ITERATIONS: u16 = 32;
+
+    let mut fixture = Fixture::new().await;
+    let mut committed = 0_u16;
+    let mut rejected = 0_u16;
+    for iteration in 0..ITERATIONS {
+        if iteration != 0 {
+            fixture.restart_core().await;
+        }
+        let machine_route = fixture.realms[0].machine_route;
+        let route = pair_route(600 + iteration);
+        let expiry = NOW_MS + PAIR_TTL_MS;
+        let mut machine = fixture.connect_machine(0).await;
+        let readonly = open_readonly_db(&fixture.db_path);
+        let sqlite_before = sqlite_route_snapshot(&readonly);
+        let writer_before = format!("{:?}", machine.writer);
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+        let mutation_core = fixture.core.clone();
+        let mutation_access = machine.access.clone();
+        let mutation_barrier = Arc::clone(&barrier);
+        let mutation = tokio::spawn(async move {
+            mutation_barrier.wait().await;
+            if iteration % 2 == 0 {
+                tokio::task::yield_now().await;
+            }
+            mutation_core
+                .handle(
+                    &mutation_access,
+                    open_pair_frame(machine_route, route, expiry),
+                )
+                .await
+        });
+        let drain_core = fixture.core.clone();
+        let drain_barrier = Arc::clone(&barrier);
+        let drain = tokio::spawn(async move {
+            drain_barrier.wait().await;
+            if iteration % 2 != 0 {
+                tokio::task::yield_now().await;
+            }
+            drain_core.begin_drain().await
+        });
+        barrier.wait().await;
+
+        let mutation = mutation.await.expect("join mutation race");
+        drain
+            .await
+            .expect("join drain race")
+            .expect("drain fence installs");
+        let route_after = fixture
+            .core
+            .pair_route_view(route)
+            .await
+            .expect("route view after drain race");
+
+        match mutation {
+            Ok(outcome) => {
+                committed += 1;
+                assert_applied(outcome);
+                assert_eq!(
+                    route_after.active_route,
+                    Some(agentdeck_relay::v2::auth::ActivePairRoute {
+                        relay_server_id: fixture.store.relay_server_id(),
+                        machine_route,
+                        pair_route: route,
+                        absolute_expiry_ms: expiry,
+                    }),
+                    "pre-fence winner must commit the complete in-memory route"
+                );
+                assert_opened(&mut machine, machine_route, route, expiry).await;
+                assert_eq!(format!("{:?}", machine.writer), writer_before);
+            }
+            Err(error) => {
+                rejected += 1;
+                assert_eq!(error.code, "relay.server.draining");
+                assert!(
+                    route_after.active_route.is_none(),
+                    "post-fence loser must not leave a half-created route"
+                );
+                assert_eq!(format!("{:?}", machine.writer), writer_before);
+            }
+        }
+        assert_eq!(
+            sqlite_route_snapshot(&readonly),
+            sqlite_before,
+            "PairRoute race must never produce a partial SQLite commit"
+        );
+        assert!(!machine.writer.is_closed());
+    }
+
+    assert!(committed > 0, "race matrix must cover a pre-fence winner");
+    assert!(rejected > 0, "race matrix must cover a post-fence loser");
+
+    fixture.shutdown().await;
+}

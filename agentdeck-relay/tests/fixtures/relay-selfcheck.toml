@@ -1,0 +1,7 @@
+# Relay v2 library selfcheck fixture。测试通过 CLI 覆盖 storage，避免共享临时 DB。
+bind = "127.0.0.1:0"
+health_bind = "127.0.0.1:0"
+storage = "/tmp/agentdeck-relay-selfcheck-placeholder.db"
+tls_cert = "test_cert.pem"
+tls_key = "test_key.pem"
+log_level = "info"

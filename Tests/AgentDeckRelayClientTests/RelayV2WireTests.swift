@@ -6,7 +6,7 @@ final class RelayV2WireTests: XCTestCase {
     func testEveryRustOuterVectorMatchesBinaryCodecAndRoundTrips() throws {
         let vectors = try loadRelayVectors()
         let outer = try XCTUnwrap(vectors["outerFrames"] as? [[String: Any]])
-        XCTAssertEqual(outer.count, 29)
+        XCTAssertEqual(outer.count, 30)
         XCTAssertEqual(
             Set(outer.compactMap { $0["family"] as? String }),
             ["handshake", "pairing", "stream", "request", "authControl", "runtime"]
@@ -30,6 +30,53 @@ final class RelayV2WireTests: XCTestCase {
                 "Swift binary round-trip drift for \(name)"
             )
         }
+    }
+
+    func testPairingHelloMirrorsKind29StrictJSONAndTypedOutbound() throws {
+        let outer = try XCTUnwrap(
+            try loadRelayVectors()["outerFrames"] as? [[String: Any]]
+        )
+        let vector = try XCTUnwrap(
+            outer.first { ($0["case"] as? String) == "pairingHello" }
+        )
+        let input = try XCTUnwrap(vector["input"] as? [String: Any])
+        let inputData = try JSONSerialization.data(withJSONObject: input)
+        let expected = Data(hex: try XCTUnwrap(vector["expectedHex"] as? String))
+        let relayServerID = Data(repeating: 0x88, count: 16)
+        let pairRoute = Data(repeating: 0x55, count: 16)
+
+        let decoded = try RelayV2JSONCodec.decodeFrame(inputData)
+        guard case let .pairingHello(serverID, route) = decoded.body else {
+            return XCTFail("expected PairingHello")
+        }
+        XCTAssertEqual(serverID, relayServerID)
+        XCTAssertEqual(route, pairRoute)
+        XCTAssertEqual(try RelayWireCodecV2.encodeFixture(decoded), expected)
+        XCTAssertEqual(try RelayWireCodecV2.decode(expected), decoded)
+        XCTAssertEqual(expected[7], 0)
+        XCTAssertEqual(expected[8], 29)
+
+        XCTAssertEqual(
+            try RelayWireCodecV2.encode(
+                .control(
+                    .pairingHello(
+                        relayServerId: relayServerID,
+                        pairRoute: pairRoute
+                    )
+                )
+            ),
+            expected
+        )
+
+        var unknownInput = input
+        var body = try XCTUnwrap(unknownInput["body"] as? [String: Any])
+        var frame = try XCTUnwrap(body["frame"] as? [String: Any])
+        frame["unexpected"] = true
+        body["frame"] = frame
+        unknownInput["body"] = body
+        let unknownData = try JSONSerialization.data(withJSONObject: unknownInput)
+        XCTAssertThrowsError(try RelayV2JSONCodec.decodeFrame(unknownData))
+        XCTAssertThrowsError(try JSONDecoder().decode(RelayV2Frame.self, from: unknownData))
     }
 
     func testRetirementControlFramesMirrorFrozenRustKindsAndPayloads() throws {

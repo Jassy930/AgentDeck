@@ -662,6 +662,22 @@
         "version": 2
       },
       "kind": 27
+    },
+    {
+      "case": "pairingHello",
+      "expectedHex": "41445256320002001d8888888888888888888888888888888855555555555555555555555555555555",
+      "family": "pairing",
+      "input": {
+        "body": {
+          "frame": {
+            "pairRoute": "VVVVVVVVVVVVVVVVVVVVVQ==",
+            "relayServerId": "iIiIiIiIiIiIiIiIiIiIiA=="
+          },
+          "frameKind": "pairingHello"
+        },
+        "version": 2
+      },
+      "kind": 29
     }
   ],
   "relayProtocolVersion": 2

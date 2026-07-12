@@ -104,8 +104,9 @@ P2.1 的 v2 配置面是独立 `RelayV2StoreSettings`，没有复用或改变 v1
 `RelayConfig`。它显式承载 storage path、stream count/bytes/age、machine/global
 bytes、replay page count/bytes 与磁盘 reserve bytes/percent；转换为
 `RelayV2StoreConfig` 时还带入 enrollment code count，并先拒绝相对路径和
-无效/越界配额。CLI、env 与 config file
-优先级要到 P2.6 接入，当前不要把 v1 `--storage` 当成已启用的 v2 配置入口。
+无效/越界配额。P2.6 的并列 v2 library config 已按 CLI > env > TOML > defaults
+接入全部字段；v1 `--storage` 仍不是 v2 配置入口，production binary 的默认 dispatch 要到
+P2.9 才原子切换。
 
 | v2 Store diagnostic code | 含义 | 下一步 |
 | --- | --- | --- |
@@ -152,8 +153,9 @@ caller future 取消不取消转换；普通 lifecycle channel 满时独立 emer
 与当前受影响 connection IDs 合并为 terminal `FailClosedAll`。收到 terminal 后必须关闭 Core
 拥有的全部列出 writer 且不再处理旧 lifecycle backlog。receiver Drop 会立即 poison/清空
 active；coordinator shutdown 先投递失效并释放 owner，随后才允许 Store shutdown。相同
-platform-normalized DB path 的第二个进程内 Store worker 会被拒绝；跨进程 lock 留给 P2.6
-server lifecycle。
+platform-normalized DB path 的第二个进程内 Store worker 会被拒绝；P2.6 server lifecycle
+已在 DB 同目录增加 `<db>.agentdeck.lock` 的 OS 排他锁，覆盖不同进程，production binary
+默认使用仍随 P2.9 cutover 生效。
 
 对外错误故意不报告“哪一段签名/哪个字段错误”，避免把 Relay 变成 trust inventory
 oracle。诊断日志同样只能记录 failure code、脱敏 route 短标识和阶段，不得格式化完整
@@ -292,6 +294,64 @@ frame伪造。
 禁止打印 root pubkey、link hash、terminal bytes或完整 route。P2.5 schema signature因新增最小
 retirement tombstone列而更新；旧的未发布 v2 开发 DB会被严格 schema signature拒绝，应按开发
 环境 reset流程清理并重新配对，不能手改 SQLite schema。
+
+## Relay v2 TLS / readiness / shutdown 诊断（Companion MVP P2.6）
+
+P2.6 仍未切换 `agentdeck-relay` production binary 的默认 listener；当前可验证对象是并列 v2
+library server。不要把 library TLS E2E 或 selfcheck 通过描述为现网 WSS 已部署。public listener
+只应暴露固定 `/v2/connect` 与 `/v2/pair`，`/healthz`、`/readyz` 只能从单独 loopback health
+listener读取；public 上这些 path、未知 path 与旧 query pairing 都不应 redirect 到其他 host/scheme。
+
+启动顺序是 config validate → TLS identity validate → Store open → bind。direct TLS 的证书或
+私钥缺失、超过 1 MiB、PEM 无效、keypair 不匹配或 binary 没有 `tls` feature 时，必须在公开
+listener bind 前失败，不能观察到临时明文端口。配置失败使用 `RelayV2ConfigError::code()`，TLS
+identity失败使用 `TlsIdentityError::code()`；这些 code 不包含 path 或 PEM 内容：
+
+| code | 含义 | 下一步 |
+| --- | --- | --- |
+| `relay.transport.tls_feature_missing` | 配置了 direct TLS，但 binary 未编译 TLS | 用带 `server,tls` features 的受控构建，禁止改成明文绕过 |
+| `relay.config.tls_partial` | cert/key 只配置一项，或高优先级层只覆盖一半 | 在同一 CLI/env/TOML 层提供完整 pair |
+| `relay.transport.tls_required` | 非 loopback 未配置 direct TLS | 配置有效 cert/key；不能启用 insecure loopback |
+| `relay.transport.insecure_loopback_opt_in_required` | loopback 明文未显式 opt-in | 只在本机开发明确启用；生产选 direct TLS/proxy loopback |
+| `relay.transport.proxy_requires_loopback` | proxy backend 尝试监听非 loopback | 将 backend 收回 loopback，由可信反代终止 TLS |
+| `relay.proxy.source_required` | proxy 请求缺少可信来源 header | 配置反代始终覆写单个 `x-agentdeck-client-ip` |
+| `relay.proxy.source_invalid` | proxy 来源 header 重复、列表化或不是 canonical IP | 删除外部同名 header，并以实际 TCP peer IP 覆写单值 |
+| `relay.transport.mode_conflict` | direct/insecure/proxy 模式冲突 | 只保留一种 transport mode |
+| `relay.config.health_non_loopback` | health listener 不是 loopback | 改为 loopback；不要向公网暴露 readiness |
+| `relay.tls.certificate_read` / `relay.tls.private_key_read` | identity 文件不可读 | 检查 owner、0600/目录权限与部署路径，不打印文件内容 |
+| `relay.tls.certificate_too_large` / `relay.tls.private_key_too_large` | PEM 超过启动硬上界 | 修复证书链或私钥文件，禁止调大到无界 |
+| `relay.tls.identity_invalid` | PEM 解析失败或 cert/key 不匹配 | 在离线安全环境校验 keypair并原子替换两文件 |
+
+公开 listener 还在 accept 前执行三层 pre-upgrade 边界：最多 1,024 个物理连接；从 TCP accept
+到 TLS handshake、完整 HTTP/1 header 与成功 101 upgrade 共用 5 秒 deadline；解密后的
+request line + headers 最多 64 KiB。只有确认返回 101 才解除 deadline，permit 随 WebSocket
+持有到关闭；所有 400/404/405、extractor rejection 与其他非 101 响应都必须带
+`Connection: close` 并立即释放 permit。超过期限或大小的连接应直接关闭且不产生 protocol
+frame；1,024 个完整普通 HTTP keep-alive 也不能阻塞下一个合法 WS upgrade。
+
+`ProxyLoopback` 把 loopback backend 与反代作为同一个部署信任边界。反代必须先删除互联网
+客户端携带的全部 `x-agentdeck-client-ip`，再用它实际看到的 TCP peer IP 覆写为恰好一个纯
+IPv4/IPv6 值；不能追加、传逗号列表或转发未经清洗的 header。Relay backend 只能绑定 loopback，
+同主机进程因此属于受信/DoS 边界。direct TLS 与 insecure loopback 模式会忽略此 header，始终
+使用直接 TCP peer，避免远端自行伪造来源 bucket。
+
+`/healthz` 返回 `200 {"status":"ok"}` 只表示进程存活；`/readyz` 的 200 才表示最新缓存探针
+通过。`relay.disk.low`、`relay.store.unavailable`、`relay.quota.exceeded` 或
+`relay.server.draining` 时 readyz 返回 503。HTTP handler 不直接请求 Store；若高频 readyz 导致
+Store busy，属于回归。磁盘恢复后等待至多一个 5 秒 readiness 周期；不要通过删除 WAL/lock
+文件制造假恢复。
+
+Store 会在 DB 同目录保留 `<db>.agentdeck.lock`。文件存在本身不是“另一个 Relay 正在运行”；
+判断依据是 OS 排他锁。第二进程得到 `StoreAlreadyOpen` 时先确认原进程和配置路径，不能删除仍被
+持有的 lock/DB/WAL。正常 SIGTERM 应先停止 accept、发送 `ServerRestarting`，网络最多 drain
+5 秒；进程退出后立即可重新打开 DB。超过网络 deadline 可返回 typed `DrainTimeout`，但若随后
+仍不能取得 DB lock，说明 Core/Auth/Store 未真正 quiesce，必须作为 lifecycle bug 处理。
+Store shutdown 成功回执只允许在 SQLite connection、OS 排他锁与进程内 path lease 均已释放后
+发送；即使 Core shutdown 已报错，server 也必须继续等待 Store shutdown，不能提前返回漏锁。
+
+日志排查只搜索 `event`、`failure_code` 与计数。完整 URL query、route、source IP、证书路径、
+public key/signature、terminal/sealed bytes或输入 sentinel 出现在日志中均是安全回归。P2.6 的
+真实 SIGTERM 子进程测试和 positive-event sentinel scan 命令见 `docs/QUALITY.md`。
 
 ## Failure Codes
 

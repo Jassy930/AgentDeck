@@ -91,6 +91,15 @@ pub enum WriterCloseReason {
     Retired,
 }
 
+/// 普通连接退出尝试关闭 writer 时的原子结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriterCloseResult {
+    Closed,
+    AlreadyClosed(WriterCloseReason),
+    /// revoke/retirement terminal 已接管 writer；普通 reader/socket 退出不得清掉它。
+    TerminalInProgress,
+}
+
 /// 独立 terminal slot 的幂等 admission 结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalAdmission {
@@ -335,6 +344,27 @@ impl Shared {
             self.closed.notify_waiters();
         }
         changed
+    }
+
+    fn close_unless_terminalizing(&self, reason: WriterCloseReason) -> WriterCloseResult {
+        let result = {
+            let mut inner = self.lock();
+            if let Some(existing) = inner.close_reason {
+                WriterCloseResult::AlreadyClosed(existing)
+            } else if inner.terminal_state.is_some() {
+                WriterCloseResult::TerminalInProgress
+            } else {
+                let _ = inner.close(reason);
+                WriterCloseResult::Closed
+            }
+        };
+        if result == WriterCloseResult::Closed {
+            self.item_ready.notify_waiters();
+            self.normal_budget_changed.notify_waiters();
+            self.control_budget_changed.notify_waiters();
+            self.closed.notify_waiters();
+        }
+        result
     }
 
     fn release(&self, class: OutboundClass, bytes: usize) {
@@ -1090,6 +1120,12 @@ impl OutboundWriter {
         self.shared.close(reason)
     }
 
+    /// 普通 transport 退出使用的原子关闭：terminal 已开始时不覆盖、不清空 terminal。
+    /// 强制 shutdown 仍可显式调用 [`Self::close`]。
+    pub fn close_unless_terminalizing(&self, reason: WriterCloseReason) -> WriterCloseResult {
+        self.shared.close_unless_terminalizing(reason)
+    }
+
     pub fn is_closed(&self) -> bool {
         self.shared.lock().close_reason.is_some()
     }
@@ -1239,6 +1275,18 @@ pub struct OutboundDelivery {
 impl OutboundDelivery {
     pub fn encoded(&self) -> &[u8] {
         self.encoded.as_deref().unwrap_or_default()
+    }
+
+    /// 共享 canonical wire bytes；只克隆 [`Arc`] 控制块，不复制 payload。
+    ///
+    /// writer 的 frame/byte permit 仍由本 [`OutboundDelivery`] 持有，直到调用
+    /// [`Self::mark_flushed`] 或 delivery 被 drop；返回的共享 bytes 不改变结算时点。
+    #[cfg(any(feature = "server", test))]
+    pub(crate) fn shared_encoded(&self) -> Arc<[u8]> {
+        self.encoded
+            .as_ref()
+            .map(Arc::clone)
+            .unwrap_or_else(|| Arc::from([]))
     }
 
     pub fn encoded_len(&self) -> usize {
@@ -1437,6 +1485,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_canonical_bytes_are_zero_copy_and_do_not_release_in_flight_permit() {
+        let encoded_len = encode(&ping(41)).len();
+        let config = OutboundWriterConfig {
+            normal: WriterBudget::new(1, encoded_len),
+            control: WriterBudget::new(1, 1024),
+        };
+        let (writer, mut receiver) = OutboundWriter::new(config);
+        writer.try_enqueue_data(ping(41)).expect("queued");
+        let delivery = receiver.recv().await.expect("delivery");
+
+        let shared = delivery.shared_encoded();
+        assert_eq!(shared.as_ptr(), delivery.encoded().as_ptr());
+        assert_eq!(shared.len(), delivery.encoded_len());
+        assert_eq!(writer.usage(OutboundClass::Data).frames, 1);
+        assert_eq!(writer.usage(OutboundClass::Data).bytes, encoded_len);
+
+        delivery.mark_flushed();
+        assert_eq!(writer.usage(OutboundClass::Data), Usage::default());
+        assert!(matches!(
+            decode(&shared)
+                .expect("shared canonical bytes remain valid")
+                .body,
+            RelayFrameBody::Ping(Ping { nonce: 41 })
+        ));
+    }
+
+    #[tokio::test]
     async fn global_budget_bounds_aggregate_writers_until_socket_flush() {
         let frame_len = encode(&ping(1)).len();
         let control_len = encode(&replay_complete()).len();
@@ -1573,6 +1648,47 @@ mod tests {
             Some(WriterCloseReason::DeliveryDropped)
         );
         assert_eq!(writer.usage(OutboundClass::Data), Usage::default());
+    }
+
+    #[tokio::test]
+    async fn conditional_close_preserves_an_in_progress_terminal() {
+        let (writer, mut receiver) = OutboundWriter::channel();
+        writer
+            .try_begin_terminal(replay_complete(), WriterCloseReason::Revoked)
+            .expect("stage terminal");
+
+        assert_eq!(
+            writer.close_unless_terminalizing(WriterCloseReason::Disconnected),
+            WriterCloseResult::TerminalInProgress
+        );
+        assert!(writer.is_terminalizing());
+        assert_eq!(writer.close_reason(), None);
+
+        let terminal = receiver
+            .recv()
+            .await
+            .expect("terminal survives reader exit");
+        assert!(terminal.is_terminal());
+        terminal.mark_flushed();
+        assert_eq!(writer.close_reason(), Some(WriterCloseReason::Revoked));
+    }
+
+    #[tokio::test]
+    async fn conditional_close_normally_closes_and_preserves_the_first_reason() {
+        let (writer, mut receiver) = OutboundWriter::channel();
+        writer.try_enqueue_data(ping(1)).expect("queued");
+
+        assert_eq!(
+            writer.close_unless_terminalizing(WriterCloseReason::Disconnected),
+            WriterCloseResult::Closed
+        );
+        assert_eq!(writer.queued_len(), 0);
+        assert_eq!(writer.close_reason(), Some(WriterCloseReason::Disconnected));
+        assert_eq!(
+            writer.close_unless_terminalizing(WriterCloseReason::Shutdown),
+            WriterCloseResult::AlreadyClosed(WriterCloseReason::Disconnected)
+        );
+        assert!(receiver.recv().await.is_none());
     }
 
     #[tokio::test]

@@ -461,6 +461,8 @@ pub enum FaultPoint {
     PurgeAfterCommit,
     InstallGrantAfterCommit,
     MaintenanceBeforeCommit,
+    /// 测试专用生命周期栅栏：shutdown reply 已发送、worker 函数尚未返回。
+    ShutdownAfterReply,
 }
 
 pub trait FaultInjector: Send + Sync + 'static {

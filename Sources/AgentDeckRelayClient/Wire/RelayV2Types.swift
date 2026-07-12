@@ -615,6 +615,7 @@ public enum RelayV2FrameBody: Codable, Equatable, Sendable {
     case routeAccepted(accepted: RelayV2AcceptedRef)
     case error(RelayV2Failure)
     case serverRestarting(drainDeadlineMs: UInt64)
+    case pairingHello(relayServerId: Data, pairRoute: Data)
 
     fileprivate var kind: UInt16 {
         switch self {
@@ -647,6 +648,7 @@ public enum RelayV2FrameBody: Codable, Equatable, Sendable {
         case .error: 26
         case .serverRestarting: 27
         case .retirementCommitted: 28
+        case .pairingHello: 29
         }
     }
 
@@ -815,6 +817,12 @@ public enum RelayV2FrameBody: Codable, Equatable, Sendable {
                     ServerRestartingWire.self,
                     forKey: .frame
                 ).drainDeadlineMs
+            )
+        case "pairingHello":
+            let value = try container.decode(PairingHelloWire.self, forKey: .frame)
+            self = .pairingHello(
+                relayServerId: value.relayServerId,
+                pairRoute: value.pairRoute
             )
         case let value:
             throw DecodingError.dataCorruptedError(
@@ -1007,6 +1015,12 @@ public enum RelayV2FrameBody: Codable, Equatable, Sendable {
                 ServerRestartingWire(drainDeadlineMs: drainDeadlineMs),
                 forKey: .frame
             )
+        case .pairingHello(let relayServerId, let pairRoute):
+            try container.encode("pairingHello", forKey: .frameKind)
+            try container.encode(
+                PairingHelloWire(relayServerId: relayServerId, pairRoute: pairRoute),
+                forKey: .frame
+            )
         }
     }
 }
@@ -1043,6 +1057,7 @@ public enum RelayV2OutboundControlFrame: Sendable {
     case routeAccepted(accepted: RelayV2AcceptedRef)
     case error(RelayV2Failure)
     case serverRestarting(drainDeadlineMs: UInt64)
+    case pairingHello(relayServerId: Data, pairRoute: Data)
 
     fileprivate var body: RelayV2FrameBody {
         switch self {
@@ -1125,6 +1140,8 @@ public enum RelayV2OutboundControlFrame: Sendable {
         case .routeAccepted(let accepted): .routeAccepted(accepted: accepted)
         case .error(let failure): .error(failure)
         case .serverRestarting(let deadline): .serverRestarting(drainDeadlineMs: deadline)
+        case .pairingHello(let relayServerId, let pairRoute):
+            .pairingHello(relayServerId: relayServerId, pairRoute: pairRoute)
         }
     }
 }
@@ -1429,6 +1446,10 @@ private struct RetirementCommittedWire: Codable {
 private struct NonceWire: Codable { let nonce: UInt64 }
 private struct RouteAcceptedWire: Codable { let accepted: RelayV2AcceptedRef }
 private struct ServerRestartingWire: Codable { let drainDeadlineMs: UInt64 }
+private struct PairingHelloWire: Codable {
+    let relayServerId: Data
+    let pairRoute: Data
+}
 private struct MachineLinkProofWire: Codable {
     let machine_route: Data
     let link_cert: RelayV2SignedCertificate
@@ -1505,6 +1526,12 @@ public enum RelayV2JSONCodec {
             try exactKeys(
                 payload,
                 allowed: ["drainDeadlineMs"],
+                path: "frame.body.frame"
+            )
+        case "pairingHello":
+            try exactKeys(
+                payload,
+                allowed: ["relayServerId", "pairRoute"],
                 path: "frame.body.frame"
             )
         case "send", "reply":
@@ -2096,6 +2123,9 @@ public enum RelayWireCodecV2 {
             try writer.optionalString(failure.inReplyTo)
         case .serverRestarting(let drainDeadlineMs):
             writer.u64(drainDeadlineMs)
+        case .pairingHello(let relayServerId, let pairRoute):
+            try writer.fixed(relayServerId, count: 16, field: "relayServerId")
+            try writer.fixed(pairRoute, count: 16, field: "pairRoute")
         }
         let data = writer.finish()
         guard data.count <= maxFrameBytes else {
@@ -2275,6 +2305,11 @@ public enum RelayWireCodecV2 {
                 machineRoute: try reader.raw(count: 16),
                 trustEpoch: try reader.u64(),
                 retireHash: try reader.raw(count: 32)
+            )
+        case 29:
+            body = .pairingHello(
+                relayServerId: try reader.raw(count: 16),
+                pairRoute: try reader.raw(count: 16)
             )
         default: throw RelayWireCodecError.unknownKind(kind)
         }
@@ -2623,4 +2658,5 @@ private let relayFramePayloadKeys: [String: Set<String>] = [
     "routeAccepted": ["accepted"],
     "error": ["code", "message", "inReplyTo"],
     "serverRestarting": ["drainDeadlineMs"],
+    "pairingHello": ["relayServerId", "pairRoute"],
 ]

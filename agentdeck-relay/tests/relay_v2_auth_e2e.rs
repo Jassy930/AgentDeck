@@ -1,8 +1,11 @@
 //! Relay v2 challenge / MachineLink / DeviceLink / PairingAccess 端到端契约。
 
+use std::future::{Future, poll_fn};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::task::Poll;
 use std::time::Duration;
 
 use agentdeck_crypto::{
@@ -18,7 +21,7 @@ use agentdeck_protocol::relay_v2::failure::{
 };
 use agentdeck_protocol::relay_v2::frame::{
     AuthProof, Authenticate, ClosePairRoute, InstallGrant, OpenPairRoute, PairData, Publish,
-    SealedBlob, Send, Subscribe,
+    RetireMachine, SealedBlob, Send, Subscribe,
 };
 use agentdeck_protocol::relay_v2::{
     ConnectionInstanceId, DeviceRevocation, DeviceRouteId, Ed25519Signature, GrantSerial,
@@ -37,6 +40,7 @@ use agentdeck_relay::v2::store::{
     InstallGrantRecord, MAX_CONTROL_BLOB_BYTES, PersistRevocation, PurgeMachine, RegisterMachine,
     RelayStoreHandle, RelayV2StoreConfig, StoreError,
 };
+use rusqlite::{Connection, OpenFlags};
 use tempfile::TempDir;
 
 const NOW_MS: u64 = 1_726_000_000_000;
@@ -213,6 +217,102 @@ fn store_path(temp: &TempDir) -> PathBuf {
 
 fn store_config(path: &Path) -> RelayV2StoreConfig {
     RelayV2StoreConfig::new(path.to_path_buf()).with_clock(Arc::new(FixedStoreClock))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AuthorizationStoreSnapshot {
+    data_version: i64,
+    table_counts: Vec<(&'static str, u64)>,
+    machine_rows: Vec<String>,
+    device_rows: Vec<String>,
+    revocation_rows: Vec<String>,
+    enrollment_rows: Vec<String>,
+}
+
+fn authorization_store_snapshot(path: &Path) -> AuthorizationStoreSnapshot {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("open authorization snapshot DB");
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .expect("set authorization snapshot timeout");
+    let table_counts = [
+        "relay_meta",
+        "machine_routes",
+        "device_grants",
+        "revocations",
+        "streams",
+        "frames",
+        "subscriptions",
+        "enrollment_codes",
+    ]
+    .into_iter()
+    .map(|table| {
+        connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, u64>(0)
+            })
+            .map(|count| (table, count))
+            .expect("count authorization table")
+    })
+    .collect();
+    let rows = |sql: &str| {
+        let mut statement = connection.prepare(sql).expect("prepare trust snapshot");
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query trust snapshot")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect trust snapshot")
+    };
+    AuthorizationStoreSnapshot {
+        data_version: connection
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .expect("read authorization data version"),
+        table_counts,
+        machine_rows: rows(
+            "SELECT hex(machine_route) || ':' || hex(root_key_id) || ':' || hex(root_pubkey)
+                    || ':' || hex(trust_epoch) || ':' || hex(highest_link_generation)
+                    || ':' || hex(link_cert_hash) || ':' || hex(data_cert_hash)
+                    || ':' || COALESCE(hex(retirement_hash), 'NULL')
+                    || ':' || COALESCE(hex(retirement_terminal_blob), 'NULL') || ':' || status
+             FROM machine_routes ORDER BY machine_route",
+        ),
+        device_rows: rows(
+            "SELECT hex(machine_route) || ':' || hex(device_route) || ':' || hex(auth_pubkey)
+                    || ':' || hex(auth_fingerprint) || ':' || hex(grant_serial)
+                    || ':' || hex(grant_hash) || ':' || COALESCE(CAST(revoked_at AS TEXT), 'NULL')
+                    || ':' || CAST(tombstone AS TEXT)
+             FROM device_grants ORDER BY machine_route, device_route",
+        ),
+        revocation_rows: rows(
+            "SELECT hex(machine_route) || ':' || hex(device_route) || ':' || hex(grant_serial)
+                    || ':' || hex(revocation_hash) || ':' || hex(signed_revocation_blob)
+                    || ':' || CAST(committed_at AS TEXT)
+             FROM revocations ORDER BY machine_route, device_route, grant_serial",
+        ),
+        enrollment_rows: rows(
+            "SELECT hex(code_hash) || ':' || CAST(expires_at AS TEXT)
+                    || ':' || COALESCE(CAST(consumed_at AS TEXT), 'NULL')
+                    || ':' || COALESCE(hex(request_hash), 'NULL')
+                    || ':' || COALESCE(hex(response_blob), 'NULL')
+                    || ':' || COALESCE(hex(receipt_hash), 'NULL')
+             FROM enrollment_codes ORDER BY code_hash",
+        ),
+    }
+}
+
+async fn assert_future_pending<F: Future>(mut future: Pin<&mut F>, context: &'static str) {
+    poll_fn(|task_context| match future.as_mut().poll(task_context) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(_) => panic!("{context} must remain pending at the concurrency fence"),
+    })
+    .await;
+}
+
+fn uppercase_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
 }
 
 fn machine(seed: u8) -> MachineRouteId {
@@ -1719,6 +1819,451 @@ async fn lifecycle_overflow_uses_terminal_emergency_close_all_slot() {
             .code,
         RELAY_STORE_UNAVAILABLE
     );
+    fixture.store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn begin_drain_fences_all_authorization_mutations_without_state_change() {
+    let fixture = Fixture::new().await;
+
+    let registered_machine = machine(0x96);
+    let registered_root_key_id = RootKeyId::from_bytes([0x97; 16]);
+    let registered_trust_epoch = TrustEpoch::new(1);
+    let registered_root = SigningKey::from_seed(&[0x98; 32]);
+    let registered_link = SigningKey::from_seed(&[0x99; 32]);
+    let registered_data = SigningKey::from_seed(&[0x9a; 32]);
+    let registered_link_cert = signed_certificate(
+        &registered_root,
+        &registered_link,
+        fixture.server,
+        registered_machine,
+        registered_root_key_id,
+        registered_trust_epoch,
+        LinkGeneration::new(1),
+        CertRole::Link,
+        Some(NOW_MS + 60_000),
+    );
+    let registered_data_cert = signed_certificate(
+        &registered_root,
+        &registered_data,
+        fixture.server,
+        registered_machine,
+        registered_root_key_id,
+        registered_trust_epoch,
+        LinkGeneration::new(1),
+        CertRole::Data,
+        Some(NOW_MS + 60_000),
+    );
+    let registered_code_hash = [0x9b; 32];
+    fixture
+        .store
+        .seed_enrollment_code(EnrollmentCodeSeed {
+            code_hash: registered_code_hash,
+            expires_at_ms: NOW_MS + 60_000,
+        })
+        .await
+        .expect("seed fenced registration enrollment");
+    let registration = RegisterMachine {
+        code_hash: registered_code_hash,
+        request_hash: [0x9c; 32],
+        response_blob: vec![0x9d],
+        receipt_hash: [0x9e; 32],
+        machine_route: registered_machine,
+        root_pubkey: PublicKeyBytes(registered_root.verifying_key().to_bytes()),
+        link_cert_hash: registered_link_cert.canonical_sha256(),
+        data_cert_hash: registered_data_cert.canonical_sha256(),
+        link_cert: registered_link_cert,
+        data_cert: registered_data_cert,
+    };
+
+    let (_clock, registry) = fixture.registry();
+    let (coordinator, mut lifecycle) = AuthorizationCoordinator::start(fixture.store.clone(), 32)
+        .expect("authorization coordinator");
+    let active_instance = connection(60_000);
+    let machine_access =
+        authenticate_machine_access(&fixture, &registry, &coordinator, active_instance, 60).await;
+    assert!(matches!(
+        lifecycle.recv().await,
+        Some(AuthorizationLifecycleEvent::Activated(activation))
+            if activation.connection_instance == active_instance
+    ));
+
+    let rejected_instance = connection(60_001);
+    let challenge = registry
+        .issue(rejected_instance, source(61))
+        .expect("issue fenced authentication");
+    let rejected_auth = fixture.machine_frame(&challenge, fixture.link_cert.clone(), &fixture.link);
+    let consumed = registry
+        .consume(
+            rejected_instance,
+            source(61),
+            ChallengeRoute::Machine(fixture.machine_route),
+        )
+        .expect("consume fenced authentication");
+
+    let added_device_route = device(0xa1);
+    let added_device = SigningKey::from_seed(&[0xa2; 32]);
+    let added_grant = signed_grant(
+        &fixture.root,
+        &added_device,
+        fixture.server,
+        fixture.machine_route,
+        added_device_route,
+        fixture.root_key_id,
+        fixture.trust_epoch,
+        GrantSerial::new(2),
+    );
+    let revocation = fixture.signed_revocation();
+    let mut retirement = RetireMachine {
+        machine_route: fixture.machine_route,
+        root_key_id: fixture.root_key_id,
+        trust_epoch: fixture.trust_epoch,
+        signature: Ed25519Signature([0; 64]),
+    };
+    retirement.signature = sign_tbs(
+        &fixture.root,
+        &retirement.to_be_signed_v1(
+            fixture.server,
+            sha256(&fixture.root.verifying_key().to_bytes()),
+        ),
+    )
+    .into();
+
+    let store_before = authorization_store_snapshot(&fixture.path);
+    let machine_before = fixture
+        .store
+        .machine_trust(fixture.machine_route)
+        .await
+        .expect("machine trust before drain");
+    let device_before = fixture
+        .store
+        .device_trust(fixture.machine_route, fixture.device_route)
+        .await
+        .expect("device trust before drain");
+    assert!(
+        coordinator
+            .is_current(&machine_access)
+            .expect("active before drain")
+    );
+
+    coordinator.begin_drain().await.expect("begin drain fence");
+
+    assert_eq!(
+        coordinator
+            .authenticate(rejected_auth, consumed, NOW_MS)
+            .await
+            .expect_err("authenticate after drain must fail")
+            .code,
+        "relay.server.draining"
+    );
+    let registration_error = coordinator
+        .register_machine(registration)
+        .await
+        .expect_err("registration after drain must fail");
+    assert!(matches!(registration_error, StoreError::WorkerUnavailable));
+    assert_eq!(
+        registration_error.diagnostic_code(),
+        RELAY_STORE_UNAVAILABLE
+    );
+    assert_eq!(
+        coordinator
+            .install_grant_from(machine_access.clone(), added_grant)
+            .await
+            .expect_err("grant install after drain must fail")
+            .code,
+        "relay.server.draining"
+    );
+    assert_eq!(
+        coordinator
+            .revoke_from(machine_access.clone(), revocation)
+            .await
+            .expect_err("revoke after drain must fail")
+            .code,
+        "relay.server.draining"
+    );
+    assert_eq!(
+        coordinator
+            .retire_machine_from(machine_access.clone(), retirement)
+            .await
+            .expect_err("retirement after drain must fail")
+            .code,
+        "relay.server.draining"
+    );
+
+    assert_eq!(authorization_store_snapshot(&fixture.path), store_before);
+    assert_eq!(
+        fixture
+            .store
+            .machine_trust(fixture.machine_route)
+            .await
+            .expect("machine trust after rejected mutations"),
+        machine_before
+    );
+    assert_eq!(
+        fixture
+            .store
+            .device_trust(fixture.machine_route, fixture.device_route)
+            .await
+            .expect("device trust after rejected mutations"),
+        device_before
+    );
+    assert!(matches!(
+        fixture.store.machine_trust(registered_machine).await,
+        Err(StoreError::MachineNotFound)
+    ));
+    assert!(matches!(
+        fixture
+            .store
+            .device_trust(fixture.machine_route, added_device_route)
+            .await,
+        Err(StoreError::GrantNotFound)
+    ));
+    assert_eq!(
+        coordinator
+            .current(PrincipalRoute::Machine(fixture.machine_route))
+            .expect("current machine after drain"),
+        Some(active_instance)
+    );
+    assert!(
+        coordinator
+            .is_current(&machine_access)
+            .expect("active after drain")
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), lifecycle.recv())
+            .await
+            .is_err(),
+        "rejected post-drain mutations must not emit lifecycle events"
+    );
+
+    coordinator.shutdown().await.expect("shutdown coordinator");
+    fixture.store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn concurrent_real_authenticate_and_begin_drain_are_fully_linearized_across_rounds() {
+    let (fixture, fault) =
+        Fixture::with_blocking_fault(FaultPoint::MachineLinkAuthBeforeCommit).await;
+    let mut committed_rounds = 0;
+    let mut drained_rounds = 0;
+
+    for round in 0..8_u64 {
+        let trust_before = fixture
+            .store
+            .machine_trust(fixture.machine_route)
+            .await
+            .expect("machine trust before concurrent round");
+        let current_certificate = signed_certificate(
+            &fixture.root,
+            &fixture.link,
+            fixture.server,
+            fixture.machine_route,
+            fixture.root_key_id,
+            fixture.trust_epoch,
+            trust_before.highest_link_generation,
+            CertRole::Link,
+            Some(NOW_MS + 60_000),
+        );
+        assert_eq!(
+            current_certificate.canonical_sha256(),
+            trust_before.link_cert_hash,
+            "round {round} must start from a reproducible current certificate"
+        );
+        let next_generation = LinkGeneration::new(
+            trust_before
+                .highest_link_generation
+                .value()
+                .checked_add(1)
+                .expect("test generation range"),
+        );
+        let higher_certificate = signed_certificate(
+            &fixture.root,
+            &fixture.link,
+            fixture.server,
+            fixture.machine_route,
+            fixture.root_key_id,
+            fixture.trust_epoch,
+            next_generation,
+            CertRole::Link,
+            Some(NOW_MS + 60_000),
+        );
+        let higher_hash = higher_certificate.canonical_sha256();
+        let (_clock, registry) = fixture.registry();
+        let (coordinator, mut lifecycle) =
+            AuthorizationCoordinator::start(fixture.store.clone(), 16)
+                .expect("authorization coordinator");
+        let store_before = authorization_store_snapshot(&fixture.path);
+
+        let target_instance = connection(70_000 + u128::from(round) * 10 + 1);
+        let target_challenge = registry
+            .issue(target_instance, source(700 + round))
+            .expect("issue target concurrent authentication");
+        let target_frame =
+            fixture.machine_frame(&target_challenge, higher_certificate, &fixture.link);
+        let target_consumed = registry
+            .consume(
+                target_instance,
+                source(700 + round),
+                ChallengeRoute::Machine(fixture.machine_route),
+            )
+            .expect("consume target concurrent authentication");
+
+        if round % 2 == 0 {
+            let release = fault.arm();
+            let auth_coordinator = coordinator.clone();
+            let mut authenticate =
+                Box::pin(auth_coordinator.authenticate(target_frame, target_consumed, NOW_MS));
+            assert_future_pending(authenticate.as_mut(), "authenticate before drain").await;
+            fault.wait_until_entered().await;
+
+            let drain_coordinator = coordinator.clone();
+            let mut begin_drain = Box::pin(drain_coordinator.begin_drain());
+            assert_future_pending(begin_drain.as_mut(), "drain behind authenticate").await;
+            release.release();
+
+            begin_drain
+                .await
+                .expect("drain waits for the preceding authentication commit");
+            let activation = authenticate
+                .await
+                .expect("authentication admitted before drain commits fully");
+            committed_rounds += 1;
+            assert_eq!(activation.activation.connection_instance, target_instance);
+            assert_eq!(
+                coordinator
+                    .current(PrincipalRoute::Machine(fixture.machine_route))
+                    .expect("current after committed race"),
+                Some(target_instance)
+            );
+            assert!(
+                coordinator
+                    .is_current(&activation.access)
+                    .expect("committed access")
+            );
+            assert!(matches!(
+                lifecycle.recv().await,
+                Some(AuthorizationLifecycleEvent::Activated(event))
+                    if event.connection_instance == target_instance
+            ));
+
+            let mut expected_trust = trust_before.clone();
+            expected_trust.highest_link_generation = next_generation;
+            expected_trust.link_cert_hash = higher_hash;
+            assert_eq!(
+                fixture
+                    .store
+                    .machine_trust(fixture.machine_route)
+                    .await
+                    .expect("trust after committed race"),
+                expected_trust
+            );
+            let store_after = authorization_store_snapshot(&fixture.path);
+            assert_eq!(store_after.table_counts, store_before.table_counts);
+            assert_eq!(store_after.device_rows, store_before.device_rows);
+            assert_eq!(store_after.revocation_rows, store_before.revocation_rows);
+            assert_eq!(store_after.enrollment_rows, store_before.enrollment_rows);
+            assert_eq!(store_before.machine_rows.len(), 1);
+            assert_eq!(store_after.machine_rows.len(), 1);
+            let before_fields = store_before.machine_rows[0].split(':').collect::<Vec<_>>();
+            let after_fields = store_after.machine_rows[0].split(':').collect::<Vec<_>>();
+            assert_eq!(before_fields.len(), 10);
+            assert_eq!(after_fields.len(), 10);
+            for unchanged_index in [0, 1, 2, 3, 6, 7, 8, 9] {
+                assert_eq!(
+                    after_fields[unchanged_index], before_fields[unchanged_index],
+                    "round {round} changed unexpected machine column {unchanged_index}"
+                );
+            }
+            assert_eq!(
+                after_fields[4],
+                uppercase_hex(&next_generation.value().to_be_bytes())
+            );
+            assert_eq!(after_fields[5], uppercase_hex(&higher_hash));
+        } else {
+            let lead_instance = connection(70_000 + u128::from(round) * 10);
+            let lead_challenge = registry
+                .issue(lead_instance, source(800 + round))
+                .expect("issue actor-blocking authentication");
+            let lead_frame =
+                fixture.machine_frame(&lead_challenge, current_certificate, &fixture.link);
+            let lead_consumed = registry
+                .consume(
+                    lead_instance,
+                    source(800 + round),
+                    ChallengeRoute::Machine(fixture.machine_route),
+                )
+                .expect("consume actor-blocking authentication");
+
+            let release = fault.arm();
+            let lead_coordinator = coordinator.clone();
+            let mut lead =
+                Box::pin(lead_coordinator.authenticate(lead_frame, lead_consumed, NOW_MS));
+            assert_future_pending(lead.as_mut(), "lead authentication").await;
+            fault.wait_until_entered().await;
+
+            let drain_coordinator = coordinator.clone();
+            let mut begin_drain = Box::pin(drain_coordinator.begin_drain());
+            assert_future_pending(begin_drain.as_mut(), "drain before target authenticate").await;
+            let auth_coordinator = coordinator.clone();
+            let mut authenticate =
+                Box::pin(auth_coordinator.authenticate(target_frame, target_consumed, NOW_MS));
+            assert_future_pending(authenticate.as_mut(), "authenticate behind drain").await;
+            release.release();
+
+            begin_drain
+                .await
+                .expect("drain linearizes after the lead authentication");
+            let lead_activation = lead.await.expect("lead authentication commits fully");
+            assert_eq!(
+                lead_activation.activation.connection_instance,
+                lead_instance
+            );
+            assert_eq!(
+                authenticate
+                    .await
+                    .expect_err("authentication admitted after drain must not commit")
+                    .code,
+                "relay.server.draining"
+            );
+            drained_rounds += 1;
+            assert_eq!(
+                coordinator
+                    .current(PrincipalRoute::Machine(fixture.machine_route))
+                    .expect("current after drained race"),
+                Some(lead_instance)
+            );
+            assert!(
+                coordinator
+                    .is_current(&lead_activation.access)
+                    .expect("lead remains current")
+            );
+            assert!(matches!(
+                lifecycle.recv().await,
+                Some(AuthorizationLifecycleEvent::Activated(event))
+                    if event.connection_instance == lead_instance
+            ));
+            assert_eq!(
+                fixture
+                    .store
+                    .machine_trust(fixture.machine_route)
+                    .await
+                    .expect("trust after drained race"),
+                trust_before
+            );
+            assert_eq!(authorization_store_snapshot(&fixture.path), store_before);
+        }
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), lifecycle.recv())
+                .await
+                .is_err(),
+            "round {round} emitted a partial or duplicate lifecycle transition"
+        );
+        coordinator.shutdown().await.expect("shutdown coordinator");
+    }
+
+    assert_eq!(committed_rounds, 4);
+    assert_eq!(drained_rounds, 4);
     fixture.store.shutdown().await.expect("shutdown store");
 }
 

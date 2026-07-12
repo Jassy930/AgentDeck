@@ -205,11 +205,11 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（P2.5）
+## Relay Companion MVP 实施状态（P2.6）
 
-P0 已冻结既有 Relay v1 行为并建立实施门禁；P2.1–P2.5 已并列完成 Relay v2 SQLite
+P0 已冻结既有 Relay v1 行为并建立实施门禁；P2.1–P2.6 已并列完成 Relay v2 SQLite
 store、challenge/auth、stream core、内存 PairRoute、在线 Send/Reply，以及 root-signed
-grant/revoke/machine retirement library contract。
+grant/revoke/machine retirement 和 TLS server lifecycle library contract。
 PairRoute 默认受每 machine 8、全局 1,024、每 route 32 frames / 1 MiB / 300 秒及独立
 token bucket 约束；Send/Reply 只投递 current bounded writer，不建离线队列或 `req_origin`。
 Revoke/Retire 先建立 authorization transition fence，再执行 SQLite COMMIT；COMMIT 后普通
@@ -220,9 +220,23 @@ Install/Revoke/Retire 的 COMMIT 回执丢失时 Store 以同一 canonical reque
 仍不确定则保持 target/整机 fail-closed；
 production coordinator 不再暴露未验签的 raw grant/revoke/purge 入口。device route 元数据同时受
 每 machine 256、全局 65,536 的启动与运行时硬上限约束。
+P2.6 的公开 listener 只接受 canonical binary v2 frame，WebSocket message/frame 都在
+4 MiB 上界拒绝 text/oversize；非 loopback 必须在 bind 前验证 TLS certificate/key，缺少
+`tls` feature、证书私钥不匹配或配置不完整均 fail-closed。明文只允许显式选择 loopback
+开发模式，反向代理模式也只能监听 loopback。公开端从 TCP accept 起同时受 1,024 个物理连接、
+5 秒 TLS+完整 HTTP header+成功 101 upgrade deadline 和 64 KiB header 上界约束；只有成功
+WebSocket 才解除 deadline 并把 permit 持有到真正关闭，全部非 101 响应强制
+`Connection: close`，慢握手、慢 header 或普通 HTTP keep-alive 都不能绕过 Core 上界。proxy 模式要求可信反代删除客户端
+传入的 `x-agentdeck-client-ip` 后，以实际 TCP peer IP 覆写且只传一个 canonical IP 值；backend
+必须保持 loopback，主机上的本地进程属于同一受信部署边界。`healthz`/`readyz` 位于独立 loopback listener，
+readiness 只读取周期探针缓存，HTTP 洪泛不会进入 Store actor；磁盘 reserve、Store 不可用或
+drain 时返回 typed not-ready。SIGTERM/取消统一执行：停止 accept、向已登记 writer 发送
+`ServerRestarting`、网络最多 drain 5 秒，再确定性回收 Core/Auth/Store。Store 同时持有同目录
+`<db>.agentdeck.lock` 的 OS 排他锁，Store shutdown 回执只能在连接、OS 锁和进程内 lease 均已
+释放后返回，server 退出后才允许另一个进程打开同一 DB。
 这些能力尚未在 P2.9 原子切换生产 listener，也未接通 daemon/iOS，因此不能描述为公网
 Companion 已可用。当前统一 P0 回归入口仍按批准设计 §16.5 运行 Rust、Swift、iOS、网络、
-文档和 schema 基线门禁；P2.5 专项门禁见 `docs/QUALITY.md`：
+文档和 schema 基线门禁；P2.6 专项门禁见 `docs/QUALITY.md`：
 
 ```bash
 bash scripts/verify-relay-companion-mvp.sh p0

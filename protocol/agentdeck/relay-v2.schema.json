@@ -579,6 +579,23 @@
           ],
           "type": "object"
         },
+        "PairingHello": {
+          "additionalProperties": false,
+          "description": "TLS 建立后，未配对 endpoint 选择唯一 PairRoute 的最小握手帧。\n\nconnection instance 与 protocol version 均由 server 已建立的连接上下文绑定，不能由 endpoint 重复声明；route 只在 binary body 中出现，禁止放入 URL/query/access log。",
+          "properties": {
+            "pairRoute": {
+              "type": "string"
+            },
+            "relayServerId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pairRoute",
+            "relayServerId"
+          ],
+          "type": "object"
+        },
         "Ping": {
           "additionalProperties": false,
           "properties": {
@@ -678,7 +695,7 @@
           "type": "object"
         },
         "RelayFrameBody": {
-          "description": "通用 frame body：六组共 29 个 variant（P2.5 追加 retirement commit ACK）。",
+          "description": "通用 frame body：六组共 30 个 variant（P2.6 追加 binary PairingHello）。",
           "oneOf": [
             {
               "properties": {
@@ -1193,6 +1210,25 @@
                 "frameKind": {
                   "enum": [
                     "retirementCommitted"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "frame",
+                "frameKind"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "追加到 kind 29，既有 0..=28 判别码保持冻结。",
+              "properties": {
+                "frame": {
+                  "$ref": "#/definitions/PairingHello"
+                },
+                "frameKind": {
+                  "enum": [
+                    "pairingHello"
                   ],
                   "type": "string"
                 }
@@ -1993,6 +2029,23 @@
           ],
           "type": "object"
         },
+        "PairingHello": {
+          "additionalProperties": false,
+          "description": "TLS 建立后，未配对 endpoint 选择唯一 PairRoute 的最小握手帧。\n\nconnection instance 与 protocol version 均由 server 已建立的连接上下文绑定，不能由 endpoint 重复声明；route 只在 binary body 中出现，禁止放入 URL/query/access log。",
+          "properties": {
+            "pairRoute": {
+              "type": "string"
+            },
+            "relayServerId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pairRoute",
+            "relayServerId"
+          ],
+          "type": "object"
+        },
         "Ping": {
           "additionalProperties": false,
           "properties": {
@@ -2419,7 +2472,7 @@
           "type": "object"
         }
       },
-      "description": "通用 frame body：六组共 29 个 variant（P2.5 追加 retirement commit ACK）。",
+      "description": "通用 frame body：六组共 30 个 variant（P2.6 追加 binary PairingHello）。",
       "oneOf": [
         {
           "properties": {
@@ -2934,6 +2987,25 @@
             "frameKind": {
               "enum": [
                 "retirementCommitted"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "frame",
+            "frameKind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "追加到 kind 29，既有 0..=28 判别码保持冻结。",
+          "properties": {
+            "frame": {
+              "$ref": "#/definitions/PairingHello"
+            },
+            "frameKind": {
+              "enum": [
+                "pairingHello"
               ],
               "type": "string"
             }

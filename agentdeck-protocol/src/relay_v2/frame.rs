@@ -54,6 +54,27 @@ pub struct Hello {
     pub protocol_version: u16,
 }
 
+/// TLS 建立后，未配对 endpoint 选择唯一 PairRoute 的最小握手帧。
+///
+/// connection instance 与 protocol version 均由 server 已建立的连接上下文绑定，不能由
+/// endpoint 重复声明；route 只在 binary body 中出现，禁止放入 URL/query/access log。
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PairingHello {
+    pub relay_server_id: RelayServerId,
+    pub pair_route: PairRouteId,
+}
+
+impl std::fmt::Debug for PairingHello {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PairingHello")
+            .field("relay_server", &self.relay_server_id.redacted())
+            .field("pair_route", &self.pair_route.redacted())
+            .finish()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Challenge {
@@ -407,7 +428,7 @@ pub struct ServerRestarting {
     pub drain_deadline_ms: u64,
 }
 
-/// 通用 frame body：六组共 29 个 variant（P2.5 追加 retirement commit ACK）。
+/// 通用 frame body：六组共 30 个 variant（P2.6 追加 binary PairingHello）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "frameKind", content = "frame", rename_all = "camelCase")]
 pub enum RelayFrameBody {
@@ -447,10 +468,12 @@ pub enum RelayFrameBody {
     ServerRestarting(ServerRestarting),
     /// 追加到 kind 28，既有 0..=27 判别码保持冻结。
     RetirementCommitted(RetirementCommitted),
+    /// 追加到 kind 29，既有 0..=28 判别码保持冻结。
+    PairingHello(PairingHello),
 }
 
 impl RelayFrameBody {
-    /// 二进制 codec 的稳定 frame kind 判别码（`0..=28`，与 wire 契约绑定）。
+    /// 二进制 codec 的稳定 frame kind 判别码（`0..=29`，与 wire 契约绑定）。
     pub fn kind(&self) -> u16 {
         match self {
             RelayFrameBody::Hello(_) => 0,
@@ -482,6 +505,7 @@ impl RelayFrameBody {
             RelayFrameBody::Error(_) => 26,
             RelayFrameBody::ServerRestarting(_) => 27,
             RelayFrameBody::RetirementCommitted(_) => 28,
+            RelayFrameBody::PairingHello(_) => 29,
         }
     }
 }

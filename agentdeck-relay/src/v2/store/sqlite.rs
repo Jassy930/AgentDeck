@@ -42,7 +42,7 @@ const METADATA_GROWTH_RESERVE_BYTES: u64 = 64 * 1024;
 /// 目标 DB 的第一次打开始终是只读 schema inspection。只有 fresh/current
 /// 才会继续检查权限、创建文件和打开读写连接；fresh schema 先在 rollback
 /// journal 下原子迁移，再切到 WAL，避免把初始 schema 只留在 WAL sidecar。
-pub(crate) fn open(config: &RelayV2StoreConfig) -> Result<Connection, StoreError> {
+pub(crate) fn open(config: &RelayV2StoreConfig) -> Result<(Connection, File), StoreError> {
     config.retention.validate()?;
     config.metadata_limits.validate()?;
     if config.max_enrollment_codes == 0 || config.max_enrollment_codes > MAX_ENROLLMENT_CODES {
@@ -86,6 +86,10 @@ pub(crate) fn open(config: &RelayV2StoreConfig) -> Result<Connection, StoreError
 
     prepare_secure_path(path)?;
     reject_symlink_components(path)?;
+    // SQLite 的 WAL 锁允许多进程正常并发，但 Relay 的 authorization/Core 必须是
+    // 全局单裁决者；因此另持有安全 sibling lock file 到 worker 退出。不能直接 flock
+    // DB inode：macOS 会与 SQLite 自身的 fcntl 锁冲突。
+    let process_lock = acquire_process_lock(path)?;
 
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -101,7 +105,31 @@ pub(crate) fn open(config: &RelayV2StoreConfig) -> Result<Connection, StoreError
     snapshot(&conn)?;
     validate_existing_metadata_limits(&conn, config)?;
     run_maintenance(&mut conn, config)?;
-    Ok(conn)
+    Ok((conn, process_lock))
+}
+
+fn acquire_process_lock(path: &Path) -> Result<File, StoreError> {
+    let file_name = path.file_name().ok_or(StoreError::InvalidValue {
+        field: "storage_path",
+        reason: "database path must have a file name",
+    })?;
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".agentdeck.lock");
+    let lock_path = path.with_file_name(lock_name);
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(DATABASE_MODE).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(&lock_path)?;
+    validate_database(&lock_path, &file.metadata()?)?;
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(file),
+        Err(error) if error.kind() == ErrorKind::WouldBlock => Err(StoreError::StoreAlreadyOpen),
+        Err(error) => Err(StoreError::Io(error)),
+    }
 }
 
 /// 配置下调或旧版本遗留数据也必须受当前 hard bound 约束。这里不静默删除 durable
@@ -278,6 +306,80 @@ pub(crate) fn snapshot(conn: &Connection) -> Result<StoreSnapshot, StoreError> {
         foreign_keys,
         busy_timeout_ms,
     })
+}
+
+/// 在 worker 独占连接上验证当前 Store 是否可接纳新业务写。
+///
+/// 本探针不执行 maintenance，也不创建/修改业务行：先重新验证 schema 与连接级
+/// PRAGMA，再为一次最小 metadata 写预留 64 KiB，最后在 `BEGIN IMMEDIATE` 中对
+/// schema marker 做 self-assignment 并 COMMIT。逻辑 bytes 不变，但 SQLite 必须走完
+/// WAL commit/fsync，才能证明当前 Store 真正可写；业务行与 schema marker 均不改变。
+pub(crate) fn probe_readiness(
+    conn: &mut Connection,
+    config: &RelayV2StoreConfig,
+) -> Result<(), StoreError> {
+    let current = snapshot(conn)?;
+    ensure_readiness_pragma(
+        current.journal_mode.eq_ignore_ascii_case("wal"),
+        "journal_mode",
+        "wal",
+        &current.journal_mode,
+    )?;
+    ensure_readiness_pragma(
+        current.synchronous == 2,
+        "synchronous",
+        "2 (FULL)",
+        &current.synchronous.to_string(),
+    )?;
+    ensure_readiness_pragma(
+        current.foreign_keys,
+        "foreign_keys",
+        "1 (ON)",
+        if current.foreign_keys { "1" } else { "0" },
+    )?;
+    ensure_readiness_pragma(
+        current.busy_timeout_ms == 5_000,
+        "busy_timeout",
+        "5000",
+        &current.busy_timeout_ms.to_string(),
+    )?;
+
+    let disk = config.disk_space_probe.space(&config.storage_path)?;
+    let reserve = config.retention.disk_reserve_for(disk.total_bytes);
+    let readiness_floor = reserve
+        .checked_add(METADATA_GROWTH_RESERVE_BYTES)
+        .ok_or(StoreError::DiskSpaceLow)?;
+    if disk.available_bytes < readiness_floor {
+        return Err(StoreError::DiskSpaceLow);
+    }
+
+    let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let changed = transaction.execute(
+        "UPDATE relay_meta SET schema_signature = schema_signature WHERE singleton = 1",
+        [],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::UnknownOrCorruptSchema);
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn ensure_readiness_pragma(
+    matches: bool,
+    name: &'static str,
+    expected: &str,
+    actual: &str,
+) -> Result<(), StoreError> {
+    if matches {
+        Ok(())
+    } else {
+        Err(StoreError::PragmaMismatch {
+            name,
+            expected: expected.to_owned(),
+            actual: actual.to_owned(),
+        })
+    }
 }
 
 pub(crate) fn seed_enrollment_code(

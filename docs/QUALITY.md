@@ -218,7 +218,7 @@ done
 cargo test -p agentdeck-relay --features server \
   --test relay_v2_revocation_e2e -- --test-threads=1
 
-# 两种 root-signed object 的 canonical/TBS golden、29种 outer family与最小可见 schema
+# 两种 root-signed object 的 canonical/TBS golden、当前30种 outer family与最小可见 schema
 cargo test -p agentdeck-protocol --test relay_v2_revocation_canonical_contract
 cargo test -p agentdeck-protocol --test relay_v2_contract
 cargo test -p agentdeck-protocol --test relay_v2_neutrality
@@ -267,6 +267,96 @@ duplicate/higher serial、tombstone占容量与降低限额 reopen fail-closed�
 for _ in {1..10}; do
   cargo test -q -p agentdeck-relay --features server \
     --test relay_v2_revocation_e2e -- --test-threads=1 || exit 1
+done
+```
+
+## Relay Companion MVP P2.6 TLS / lifecycle / readiness 门禁
+
+P2.6 仍是并列 v2 library server，不能把这些命令通过解释为 production binary 已从 v1
+切换。改动 v2 config、TLS、WebSocket、readiness、进程锁、monitor 或 shutdown 后至少运行：
+
+```bash
+# 同一 config suite 在三种 feature surface 下都必须成立；server-only 必须证明
+# “配置 TLS 但未编译 tls”稳定失败，不能 fallback 明文。
+cargo test -p agentdeck-relay --test relay_v2_config
+cargo test -p agentdeck-relay --features server --test relay_v2_config
+cargo test -p agentdeck-relay --features server,tls --test relay_v2_config
+
+# exact cert pin、binary-only/4 MiB、固定 public path、独立 health、disk-low、
+# typed recoverable error、terminal-only reauth、drain、Drop reap、日志 sentinel、selfcheck。
+cargo test -p agentdeck-relay --features server,tls \
+  --test relay_v2_tls_e2e -- --test-threads=1
+
+# 真实 SIGTERM 子进程、无 shutdown 时的 5 秒 pre-upgrade deadline、1,024 个完整普通
+# HTTP keep-alive 饱和/恢复、slow partial HTTP drain，以及真实 proxy WS source contract。
+cargo test -p agentdeck-relay --features server \
+  --test relay_v2_lifecycle_e2e -- --test-threads=1
+
+# accept permit、TLS/HTTP header deadline 与 64 KiB header limit 的 focused unit contract。
+cargo test -p agentdeck-relay --features server,tls preupgrade::tests --lib
+
+# Store readiness/process lock 与 Core/Auth drain fence 回归。
+cargo test -p agentdeck-relay --features server \
+  --test relay_v2_store -- --test-threads=1
+cargo test -p agentdeck-relay --features server \
+  --test relay_v2_auth_e2e -- --test-threads=1
+cargo test -p agentdeck-relay --features server \
+  --test relay_v2_route_e2e -- --test-threads=1
+cargo test -p agentdeck-relay --features server
+cargo test -p agentdeck-relay --features server,tls
+
+# PairingHello canonical binary kind、schema 与 Swift mirror。
+cargo test -p agentdeck-protocol --test relay_v2_contract
+cargo test -p agentdeck-protocol --test relay_v2_neutrality
+swift test --filter RelayV2WireTests
+cargo run -q -p agentdeck-cli -- protocol schema \
+  | diff - protocol/agentdeck/agentdeck-protocol.schema.json
+
+# production lint、API docs与静态门禁。
+cargo clippy -p agentdeck-relay --features server,tls --lib --no-deps -- -D warnings \
+  -A clippy::large-enum-variant -A clippy::needless-return \
+  -A clippy::collapsible-if -A clippy::doc-lazy-continuation
+RUSTDOCFLAGS="-D warnings" cargo doc -p agentdeck-relay --features server,tls --no-deps
+cargo fmt --all --check
+bash scripts/check-daemon-no-net.sh
+bash scripts/verify-agent-docs.sh
+git diff --check
+```
+
+TLS E2E 的 redaction case 必须先观察到预期 `relay.frame.rejected` 正向事件，再断言 route、
+frame sentinel、key/signature 等敏感输入零命中；完全没有日志不能算通过。public listener 必须
+对 health、未知 path 和旧 query pairing不提供 redirect，PairRoute只能在 TLS 后 binary
+`PairingHello` 出现。selfcheck必须直接读取 fixture 内 cert/key相对路径、真实迁移绝对临时 DB、
+readiness/Core 构造并 shutdown/reopen，不能由测试 CLI 覆盖坏 fixture。
+
+AuthorizationCoordinator 与 RelayCore 的 drain fence 测试必须证明：fence 返回后 Authenticate、
+InstallGrant、RevokeDevice、RetireMachine、attach/activate/route返回 `relay.server.draining`；
+尚未暴露为网络 endpoint 的内部 RegisterMachine同样拒绝且不进入 Store。SQLite
+`PRAGMA data_version` 与八表语义快照不变；与 fence 并发的操作只能完整 COMMIT 或完整
+draining，不能半提交。Store process-lock测试必须使用真实子进程，不能只依赖进程内 path
+registry。
+
+`ProxyLoopback` 的测试必须证明缺失、重复、逗号列表、非 IP 的
+`x-agentdeck-client-ip` 都在 HTTP upgrade 前以 400 拒绝，两个合法来源进入不同 challenge
+bucket；direct 模式必须忽略该 header。部署时可信反代必须删除外部同名 header 后，以实际
+TCP peer IP 覆写单个 canonical 值，并保持 Relay backend 仅绑定 loopback。
+
+公开连接测试还必须真实发送 1,024 个完整的未知 path HTTP/1.1 请求，并证明每个非 101 响应
+显式返回 `Connection: close`、server 端及时 EOF，随后第 1,025 个合法 WebSocket 在期限内收到
+101。底层 focused test 必须证明“完整 header”本身不会解除 deadline，只有 handler 标记成功
+upgrade 后长连接才能越过 5 秒边界。
+
+阶段收口把 TLS E2E 同时按串行与默认并行调度重复 10 轮，排除 tracing subscriber、terminal
+flush、drain与 readiness tick 的时序 flake：
+
+```bash
+for _ in {1..10}; do
+  cargo test -q -p agentdeck-relay --features server,tls \
+    --test relay_v2_tls_e2e -- --test-threads=1 || exit 1
+done
+for _ in {1..10}; do
+  cargo test -q -p agentdeck-relay --features server,tls \
+    --test relay_v2_tls_e2e || exit 1
 done
 ```
 

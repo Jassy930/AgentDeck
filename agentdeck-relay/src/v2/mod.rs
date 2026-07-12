@@ -2,4 +2,6 @@
 
 pub mod auth;
 pub mod core;
+#[cfg(feature = "server")]
+pub mod server;
 pub mod store;

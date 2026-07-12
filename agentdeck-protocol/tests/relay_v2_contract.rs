@@ -3,7 +3,7 @@
 //! Relay v2 是严格最小可见的外层路由 wire（design §10）。本 task 只定义并列契约：
 //! - 128-bit 随机 route/generation ID（不可比较、不可复用）。
 //! - u64 单调值（trust epoch / link generation / grant serial / key revision）到 MAX 拒绝 wrap。
-//! - 29 个通用 frame family variant 的 `ADRV2` 二进制 codec round-trip + 固定字节 fixture。
+//! - 30 个通用 frame family variant 的 `ADRV2` 二进制 codec round-trip + 固定字节 fixture。
 //! - 公开授权对象（RelayGrant / SignedCertificate / DeviceRevocation）与 enrollment DTO。
 //!
 //! 现有 Relay v1 namespace（`remote::`）本 task 原样保留、彼此独立。
@@ -24,9 +24,10 @@ use agentdeck_protocol::relay_v2::failure::RELAY_REPLAY_CURSOR_INVALID;
 use agentdeck_protocol::relay_v2::frame::{
     AcceptedRef, Ack, AuthProof, Authenticate, Authenticated, Challenge, ClosePairRoute, Gap,
     GrantCommitted, Hello, InstallGrant, OpaqueRouteFrame, OpenPairRoute, PairData,
-    PairRouteCloseOutcome, PairRouteClosed, PairRouteOpened, Ping, Pong, Publish, RegisterStream,
-    RelayFrameBody, ReplayComplete, Reply, RetireMachine, RetirementCommitted, RevocationCommitted,
-    RevokeDevice, RouteAccepted, SealedBlob, Send, ServerRestarting, Subscribe, Unsubscribe,
+    PairRouteCloseOutcome, PairRouteClosed, PairRouteOpened, PairingHello, Ping, Pong, Publish,
+    RegisterStream, RelayFrameBody, ReplayComplete, Reply, RetireMachine, RetirementCommitted,
+    RevocationCommitted, RevokeDevice, RouteAccepted, SealedBlob, Send, ServerRestarting,
+    Subscribe, Unsubscribe,
 };
 use agentdeck_protocol::relay_v2::id::{
     ConnectionInstanceId, DeviceRouteId, GrantSerial, KeyDirectoryRevision, LinkGeneration,
@@ -152,7 +153,7 @@ fn key_directory() -> KeyDirectoryV1 {
     }
 }
 
-/// 每个 frame family 至少一个代表帧，按 RelayFrameBody 定义顺序覆盖全部 29 variant。
+/// 每个 frame family 至少一个代表帧，按 RelayFrameBody 定义顺序覆盖全部 30 variant。
 fn all_bodies() -> Vec<RelayFrameBody> {
     vec![
         // Handshake
@@ -284,6 +285,11 @@ fn all_bodies() -> Vec<RelayFrameBody> {
         RelayFrameBody::ServerRestarting(ServerRestarting {
             drain_deadline_ms: 5000,
         }),
+        // P2.6 追加，既有 0..=28 kind 不移动；TLS 后配对 route 不进入 URL/query。
+        RelayFrameBody::PairingHello(PairingHello {
+            relay_server_id: rs(),
+            pair_route: pr(),
+        }),
     ]
 }
 
@@ -295,7 +301,7 @@ fn relay_fixture_path() -> PathBuf {
 fn outer_family(kind: u16) -> &'static str {
     match kind {
         0..=3 => "handshake",
-        4..=8 => "pairing",
+        4..=8 | 29 => "pairing",
         9..=15 => "stream",
         16..=17 => "request",
         18..=22 | 28 => "authControl",
@@ -480,17 +486,17 @@ fn relay_protocol_version_is_two_and_independent() {
 }
 
 #[test]
-fn all_twenty_nine_variants_covered_with_unique_kinds() {
+fn all_thirty_variants_covered_with_unique_kinds() {
     let bodies = all_bodies();
     assert_eq!(
         bodies.len(),
-        29,
-        "P2.5 contract lists exactly 29 RelayFrameBody variants"
+        30,
+        "P2.6 contract lists exactly 30 RelayFrameBody variants"
     );
     let kinds: BTreeSet<u16> = bodies.iter().map(|b| b.kind()).collect();
     assert_eq!(
         kinds.len(),
-        29,
+        30,
         "every variant must map to a distinct codec kind"
     );
     assert_eq!(
@@ -510,6 +516,15 @@ fn all_twenty_nine_variants_covered_with_unique_kinds() {
         })
         .kind(),
         27
+    );
+    assert_eq!(
+        RelayFrameBody::PairingHello(PairingHello {
+            relay_server_id: rs(),
+            pair_route: pr(),
+        })
+        .kind(),
+        29,
+        "PairingHello is appended so frozen kinds 0..=28 never move"
     );
 }
 
@@ -736,6 +751,8 @@ const GOLDEN_PUBLISH: &str = "41445256320002000a33333333333333333333333333333333
 const GOLDEN_SEND: &str = "414452563200020010222222222222222222222222222222224444444444444444444444444444444400000004deadbeef";
 const GOLDEN_INSTALL_GRANT: &str = "4144525632000200121111111111111111111111111111111122222222222222222222222222222222a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a00000000000000009777777777777777777777777777777770000000000000003b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0";
 const GOLDEN_RETIREMENT_COMMITTED: &str = "41445256320002001c111111111111111111111111111111110000000000000004251660b89c346510f961d588109a333495af462064cb7557b35ed2ebecb5e9a4";
+const GOLDEN_PAIRING_HELLO: &str =
+    "41445256320002001d8888888888888888888888888888888855555555555555555555555555555555";
 const GOLDEN_PING: &str = "4144525632000200170102030405060708";
 
 fn encode_hex(body: RelayFrameBody) -> String {
@@ -779,6 +796,33 @@ fn fixture_pairing_pairdata() {
         })),
         GOLDEN_PAIRDATA,
     );
+}
+
+#[test]
+fn fixture_pairing_hello() {
+    check_golden(
+        "pairingHello",
+        &encode_hex(RelayFrameBody::PairingHello(PairingHello {
+            relay_server_id: rs(),
+            pair_route: pr(),
+        })),
+        GOLDEN_PAIRING_HELLO,
+    );
+}
+
+#[test]
+fn pairing_hello_debug_never_exposes_raw_route_or_server_id() {
+    let rendered = format!(
+        "{:?}",
+        PairingHello {
+            relay_server_id: rs(),
+            pair_route: pr(),
+        }
+    );
+    assert!(!rendered.contains(&format!("{:?}", [0x88_u8; 16])));
+    assert!(!rendered.contains(&format!("{:?}", [0x55_u8; 16])));
+    assert!(!rendered.contains("iIiIiIiIiIiIiIiIiIiIiA=="));
+    assert!(!rendered.contains("VVVVVVVVVVVVVVVVVVVVVQ=="));
 }
 
 #[test]

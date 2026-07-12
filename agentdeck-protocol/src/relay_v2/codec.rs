@@ -447,6 +447,10 @@ fn encode_body(w: &mut W, body: &RelayFrameBody) {
             w.u64(x.trust_epoch.0);
             w.raw(&x.retire_hash);
         }
+        RelayFrameBody::PairingHello(x) => {
+            w.raw(&x.relay_server_id.0);
+            w.raw(&x.pair_route.0);
+        }
     }
 }
 
@@ -628,6 +632,10 @@ fn decode_body(kind: u16, r: &mut R) -> Result<RelayFrameBody, CodecError> {
             machine_route: MachineRouteId::from_bytes(r.arr16()?),
             trust_epoch: TrustEpoch::new(r.u64()?),
             retire_hash: r.arr32()?,
+        }),
+        29 => RelayFrameBody::PairingHello(PairingHello {
+            relay_server_id: RelayServerId::from_bytes(r.arr16()?),
+            pair_route: PairRouteId::from_bytes(r.arr16()?),
         }),
         other => return Err(CodecError::UnknownKind(other)),
     })

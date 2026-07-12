@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::sync::{mpsc, oneshot};
 
 use super::model::{
-    CommitMachineLinkAuth, ConfirmDeviceAuth, DeviceTrustView, EnrollmentCodeSeed, GrantCommit,
-    InstallGrantRecord, MAX_CONTROL_BLOB_BYTES, MachineLinkAuthCommit, MachineRecord,
+    CommitMachineLinkAuth, ConfirmDeviceAuth, DeviceTrustView, EnrollmentCodeSeed, FaultPoint,
+    GrantCommit, InstallGrantRecord, MAX_CONTROL_BLOB_BYTES, MachineLinkAuthCommit, MachineRecord,
     MachineTrustView, MaintenanceReport, PersistAck, PersistPublish, PersistRetirement,
     PersistRevocation, PersistSubscription, PersistUnsubscribe, PublishCommit, PurgeMachine,
     PurgeReadback, RegisterMachine, RelayV2StoreConfig, ReplayPage, ReplayPageRequest,
@@ -109,6 +109,15 @@ impl RelayStoreHandle {
 
     pub async fn inspect(&self) -> Result<StoreSnapshot, StoreError> {
         self.dispatch(|reply| StoreCommand::Inspect { reply }).await
+    }
+
+    /// 从唯一 worker 持有的生产连接执行 readiness 探针。
+    ///
+    /// 探针与所有 Store 命令共享同一有界队列：队列满、worker 停止、schema/PRAGMA
+    /// 漂移、磁盘低水位或无法取得短写事务时一律 fail-closed。
+    pub async fn probe_readiness(&self) -> Result<(), StoreError> {
+        self.dispatch(|reply| StoreCommand::ProbeReadiness { reply })
+            .await
     }
 
     pub async fn machine_trust(
@@ -422,6 +431,9 @@ enum StoreCommand {
     Inspect {
         reply: oneshot::Sender<Result<StoreSnapshot, StoreError>>,
     },
+    ProbeReadiness {
+        reply: oneshot::Sender<Result<(), StoreError>>,
+    },
     MachineTrust {
         machine_route: MachineRouteId,
         reply: oneshot::Sender<Result<MachineTrustView, StoreError>>,
@@ -501,8 +513,8 @@ fn run(
     ready: oneshot::Sender<Result<RelayServerId, StoreError>>,
     open_lease: Arc<StoreOpenLease>,
 ) {
-    let mut conn = match sqlite::open(&config) {
-        Ok(conn) => conn,
+    let (mut conn, process_lock) = match sqlite::open(&config) {
+        Ok(opened) => opened,
         Err(error) => {
             let _ = ready.send(Err(error));
             return;
@@ -524,6 +536,9 @@ fn run(
         match command {
             StoreCommand::Inspect { reply } => {
                 let _ = reply.send(sqlite::snapshot(&conn));
+            }
+            StoreCommand::ProbeReadiness { reply } => {
+                let _ = reply.send(sqlite::probe_readiness(&mut conn, &config));
             }
             StoreCommand::MachineTrust {
                 machine_route,
@@ -587,8 +602,12 @@ fn run(
             }
             StoreCommand::Shutdown { reply } => {
                 drop(conn);
+                // shutdown ACK 是“同一 DB 可立即由另一个进程打开”的 happens-before。
+                // 不能依赖函数 return 后的局部析构，因为 oneshot 会先唤醒多线程 runtime。
+                drop(process_lock);
                 drop(open_lease);
                 let _ = reply.send(Ok(()));
+                let _ = config.fault_injector.check(FaultPoint::ShutdownAfterReply);
                 return;
             }
         }

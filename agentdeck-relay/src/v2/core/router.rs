@@ -275,6 +275,9 @@ enum CoreCommand {
         connection: ConnectionInstanceId,
         token: TerminalToken,
     },
+    BeginDrain {
+        reply: oneshot::Sender<Result<(), RelayFailure>>,
+    },
     Shutdown {
         reply: oneshot::Sender<Result<(), RelayFailure>>,
     },
@@ -308,6 +311,7 @@ impl RelayCore {
             lifecycle,
             connections: ConnectionRegistry::new(config.max_subscriptions_per_connection),
             pair_routes: PairRouteRegistry::new(relay_server_id, config.pair_route_limits)?,
+            draining: false,
             config,
             now_ms: config.initial_now_ms,
             next_nonce: config.nonce_seed,
@@ -442,9 +446,26 @@ impl RelayCore {
             .map_err(|_| unavailable("Relay Core stopped"))?
     }
 
+    /// 与所有 attach/activate/route 命令在同一 actor FIFO 中线性化 Core shutdown
+    /// fence。server 必须先等待 AuthorizationCoordinator 的独立 fence；本方法返回后，
+    /// 后续 Core 命令不再建立连接或产生 route Store/Core mutation。
+    pub async fn begin_drain(&self) -> Result<(), RelayFailure> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(CoreCommand::BeginDrain { reply })
+            .await
+            .map_err(|_| unavailable("Relay Core stopped"))?;
+        response
+            .await
+            .map_err(|_| unavailable("Relay Core stopped"))?
+    }
+
     pub async fn shutdown(&self) -> Result<(), RelayFailure> {
         let (reply, response) = oneshot::channel();
-        self.try_send(CoreCommand::Shutdown { reply })?;
+        self.tx
+            .send(CoreCommand::Shutdown { reply })
+            .await
+            .map_err(|_| unavailable("Relay Core stopped"))?;
         response
             .await
             .map_err(|_| unavailable("Relay Core stopped"))?
@@ -464,6 +485,7 @@ struct RelayCoreActor {
     lifecycle: AuthorizationLifecycle,
     connections: ConnectionRegistry,
     pair_routes: PairRouteRegistry,
+    draining: bool,
     config: CoreConfig,
     now_ms: u64,
     next_nonce: u64,
@@ -524,7 +546,10 @@ impl RelayCoreActor {
                 writer,
                 reply,
             } => {
-                let result = if !self.connections.contains(connection)
+                let result = if self.draining {
+                    writer.close(WriterCloseReason::Shutdown);
+                    Err(draining_failure())
+                } else if !self.connections.contains(connection)
                     && self.connections.len() >= self.config.max_connections
                 {
                     writer.close(WriterCloseReason::Disconnected);
@@ -546,11 +571,19 @@ impl RelayCoreActor {
                 let _ = reply.send(result);
             }
             CoreCommand::Activate { access, reply } => {
-                let result = self.activate(access);
+                let result = if self.draining {
+                    Err(draining_failure())
+                } else {
+                    self.activate(access)
+                };
                 let _ = reply.send(result);
             }
             CoreCommand::ActivateAuthentication { outcome, reply } => {
-                let result = self.activate_authentication(outcome);
+                let result = if self.draining {
+                    Err(draining_failure())
+                } else {
+                    self.activate_authentication(outcome)
+                };
                 let _ = reply.send(result);
             }
             CoreCommand::PairRouteView { pair_route, reply } => {
@@ -562,7 +595,11 @@ impl RelayCoreActor {
                 _permit,
                 reply,
             } => {
-                let result = self.route(access, frame).await;
+                let result = if self.draining {
+                    Err(draining_failure())
+                } else {
+                    self.route(access, frame).await
+                };
                 let _ = reply.send(result);
             }
             CoreCommand::ReplayReady {
@@ -570,9 +607,15 @@ impl RelayCoreActor {
                 result,
                 reservation,
                 _staging,
-            } => self.handle_replay_ready(ticket, result, reservation),
+            } => {
+                if !self.draining {
+                    self.handle_replay_ready(ticket, result, reservation);
+                }
+            }
             CoreCommand::InitialTerminalReady { ticket, result } => {
-                self.handle_initial_terminal_ready(ticket, result)
+                if !self.draining {
+                    self.handle_initial_terminal_ready(ticket, result)
+                }
             }
             CoreCommand::Tick { now_ms, reply } => {
                 let result = self.tick(now_ms);
@@ -586,6 +629,10 @@ impl RelayCoreActor {
                 if let Some(cleanup) = self.connections.finish_terminal(connection, token) {
                     self.finish_cleanup(cleanup);
                 }
+            }
+            CoreCommand::BeginDrain { reply } => {
+                self.draining = true;
+                let _ = reply.send(Ok(()));
             }
             CoreCommand::Shutdown { reply } => {
                 let result = self.graceful_shutdown().await;
@@ -2509,6 +2556,13 @@ fn invalid_access() -> RelayFailure {
     )
 }
 
+fn draining_failure() -> RelayFailure {
+    RelayFailure::new(
+        "relay.server.draining",
+        "Relay server is draining and no longer accepts mutations",
+    )
+}
+
 fn quota(message: &'static str) -> RelayFailure {
     failure(RELAY_QUOTA_EXCEEDED, message)
 }
@@ -2544,6 +2598,7 @@ mod tests {
             connections: ConnectionRegistry::new(config.max_subscriptions_per_connection),
             pair_routes: PairRouteRegistry::new(store.relay_server_id(), config.pair_route_limits)
                 .expect("pair registry"),
+            draining: false,
             config,
             now_ms: config.initial_now_ms,
             next_nonce: config.nonce_seed,

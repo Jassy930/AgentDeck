@@ -189,8 +189,9 @@ agentdeckd
   Store worker FIFO 顺序。owner 存活期间，raw register/install/auth-confirm/revoke/purge
   mutator 与 raw Store shutdown 固定 fail-closed；P2.3/P2.5 Core 必须把所有 trust mutation
   送入该 coordinator。相同 platform-normalized DB path 在同一进程只能有一个 live Store
-  worker，第二次 `open` 直接拒绝，避免多 worker 破坏 admission FIFO；P2.6 再负责跨进程
-  server lock。
+  worker，第二次 `open` 直接拒绝，避免多 worker 破坏 admission FIFO。P2.6 又在数据库同目录
+  持有 `<db>.agentdeck.lock` 的 0600、`O_NOFOLLOW` OS 排他锁，覆盖不同进程；锁文件可持久存在，
+  锁的所有权只随 Store worker 生命周期持有和释放。
 - active replacement / invalidation 还必须先写入独立 bounded lifecycle channel，再回复
   caller oneshot。普通槽 512；overflow 使用不依赖普通队列的单独 emergency slot，并把普通
   backlog 中的 connection IDs 去重合并成 terminal `FailClosedAll`，之后不再返回 stale
@@ -204,9 +205,11 @@ agentdeckd
   + same credential 可重连替换，lower 或 same/different 均拒绝。旧连接退出只能
   `remove_if_current`；P2.3 Core 还必须在 command 出队时调用 `is_current`，防止 replacement
   前排队的旧 frame 污染新 connection 状态。
-- `PairingHello` 是后续 pairing transport 传给 auth library 的连接元数据，不是新增
-  ADRV2 frame；P2.2 不提前写死 URL/path carrier。`PairingAccess` 仅允许 active、未过期
-  route 上的同 route `PairData` / `ClosePairRoute`，其他 frame 统一拒绝。
+- P2.2 的 `PairingHello` 起初只定义 auth library 元数据而未固定 carrier；P2.6 将最小
+  `relayServerId + pairRoute` 追加为 TLS 建立后的 canonical binary frame。route 不进入
+  URL/query/access log；server 自行绑定 connection instance 与 protocol version。
+  `PairingAccess` 仅允许 active、未过期 route 上的同 route `PairData` /
+  `ClosePairRoute`，其他 frame 统一拒绝。
 - auth access、challenge、credential、public key/signature 等 `Debug` 输出必须脱敏；route
   关联标识使用带类型域 SHA-256 的 32-bit 截断，不得直接打印 route 原始前缀。failure 只
   返回稳定通用 code/message，不泄漏完整 route、key、hash、signature 或验签步骤。
@@ -326,6 +329,43 @@ agentdeckd
   PairRoute。未知 route
   不是成功。admin root-lost purge沿用同一 primitive但 terminal hash为空，详细 authority 与
   root fingerprint确认留在 P2.7 本机 0600 admin UDS。
+
+### Relay Companion MVP P2.6 TLS、可用性与生命周期边界
+
+- P2.6 仍是与 v1 production binary 并列的 v2 library server；默认 dispatch 只在 P2.9
+  原子切换。公开面只有固定 `/v2/connect` 与 `/v2/pair` WebSocket path；配对 route 由
+  TLS 后 canonical binary `PairingHello` 传入，query 不承载 route。public listener 不挂
+  health、inventory、purge 或 redirect。
+- WebSocket 聚合前先受 4 MiB max-frame/max-message 限制，协议层只接受 binary canonical
+  v2 frame。全服务另有 64 MiB ingress semaphore；每次 poll 前预留 raw+decoded 最坏预算，
+  得到小 frame 后缩到实际 encoded size 的两倍，并持有到 Core 完成本次处理。公开 accept
+  queue、连接、Core command、writer 与 Store 都保持独立 hard bound。TCP accept 前还必须
+  取得全局 1,024 物理连接 permit；permit 随底层 IO 穿过 HTTP upgrade 到 WebSocket 关闭。
+  从 accept 起 5 秒内必须完成 TLS handshake、完整 HTTP/1 header 与成功 101 upgrade，解密后
+  request line + headers 最多 64 KiB。只有 handler 确认返回 101 才解除 deadline；全部非 101
+  响应强制 `Connection: close`，避免慢连接或普通 HTTP keep-alive 绕过已认证连接上界。
+- direct 模式在任何 bind 和 DB side effect 前读取最多 1 MiB 的 cert/key PEM、校验 keypair，
+  并要求 binary 含 `tls` feature；任一失败都不回退明文。明文只允许显式
+  `InsecureLoopback`，proxy 模式也只允许 loopback backend；health listener 永远 loopback。
+  config 逐字段遵循 CLI > env > TOML > defaults，TLS pair 按层原子选择，storage 必须绝对路径。
+  `ProxyLoopback` 唯一接受的来源元数据是恰好一个 canonical
+  `x-agentdeck-client-ip: <IP>`；可信反代必须先删除外部同名 header，再用实际 TCP peer IP
+  覆写。backend 只绑定 loopback，因此同主机进程属于部署信任/DoS 边界；direct 模式忽略该
+  header 并始终采用 TCP peer。
+- `/healthz` 只表达进程存活；`/readyz` 只读周期探针缓存。Store readiness 会验证 schema/
+  PRAGMA、磁盘 reserve，并用 metadata no-op COMMIT 实际经过 WAL/FULL 写路径；disk-low、
+  Store fault、Core tick压力或 drain 均使 readiness typed fail-closed，HTTP 请求本身不占 Store
+  queue。full maintenance 每 60 秒调度，readiness 每 5 秒，Core tick 每 1 秒。
+- drain fence 顺序固定为：原子停止新 accept/connection登记，向 snapshot 中所有 writer 发送
+  `ServerRestarting`，再对 AuthorizationCoordinator 与 RelayCore 建立 FIFO drain fence。
+  网络最多等待 5 秒，超时强制 abort listener/connection；随后仍必须真正 shutdown
+  Core/Auth/Store并释放 OS process lock，不能用超时返回伪装 quiesce。Core shutdown 即使
+  返回错误也不得跳过 Store shutdown；Store shutdown 回执必须晚于 DB connection、OS lock
+  与进程内 lease 的释放。SIGTERM、Ctrl-C、显式
+  cancellation 和 handle Drop 最终进入同一资源回收路径。
+- 日志只允许稳定 event/failure code和计数；source 只保存进程随机 key 的 hash，TLS path、
+  route、key、signature、sealed bytes 与输入 sentinel 不进入日志。测试必须同时覆盖正向事件
+  存在与敏感值零命中，不能用“完全没有日志”冒充 redaction。
 
 ### R1a 隐含约束（供 R2 参考）
 

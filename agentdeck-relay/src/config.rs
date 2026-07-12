@@ -3,8 +3,11 @@
 //! 本模块只产出配置数据结构与门禁校验逻辑，不含任何网络监听/绑定动作（Task 9 消费）。
 
 use clap::Parser;
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::v2::store::{
     MAX_ENROLLMENT_CODES, RelayV2StoreConfig, RetentionLimits, StoreError, validate_store_path,
@@ -126,6 +129,529 @@ impl TryFrom<RelayV2StoreSettings> for RelayV2StoreConfig {
         Ok(RelayV2StoreConfig::new(settings.storage_path)
             .with_retention(retention)
             .with_max_enrollment_codes(settings.max_enrollment_codes))
+    }
+}
+
+/// Relay v2 公开 listener 的三种、且仅三种传输模式。
+///
+/// `InsecureLoopback` 只供显式本机开发；`ProxyLoopback` 表示 TLS 在反向代理终止，
+/// Relay 自身仍只能监听 loopback；生产直连必须使用 `DirectTls`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayV2TransportMode {
+    DirectTls(RelayV2TlsPaths),
+    InsecureLoopback,
+    ProxyLoopback,
+}
+
+/// Relay v2 TLS preflight 的输入路径。证书存在性、PEM 解析与 keypair 匹配由
+/// `v2::server::tls` 在 bind 前校验；配置层只负责来源合并与 feature fail-closed。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayV2TlsPaths {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+}
+
+/// P2.6 并列 v2 server 配置。
+///
+/// 本类型刻意不复用 v1 的 bootstrap secret、`allow_plaintext`、conversation buffer
+/// 或 `req_origin`；v1 binary 在 P2.9 原子切换前继续使用上方 [`RelayConfig`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayV2ServerConfig {
+    pub bind: SocketAddr,
+    pub health_bind: SocketAddr,
+    pub store: RelayV2StoreSettings,
+    pub transport: RelayV2TransportMode,
+    pub log_level: String,
+}
+
+const V2_DEFAULT_BIND: &str = "127.0.0.1:8443";
+const V2_DEFAULT_HEALTH_BIND: &str = "127.0.0.1:8444";
+const V2_DEFAULT_STORAGE_RELATIVE: &str = "agentdeck-relay-data/relay-v2.db";
+
+#[derive(clap::Parser, Debug)]
+struct RelayV2RawArgs {
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    bind: Option<String>,
+    #[arg(long)]
+    health_bind: Option<String>,
+    #[arg(long)]
+    storage: Option<PathBuf>,
+    #[arg(long)]
+    max_frames_per_stream: Option<u64>,
+    #[arg(long)]
+    max_bytes_per_stream: Option<u64>,
+    #[arg(long)]
+    max_age_ms: Option<u64>,
+    #[arg(long)]
+    max_bytes_per_machine: Option<u64>,
+    #[arg(long)]
+    max_bytes_global: Option<u64>,
+    #[arg(long)]
+    replay_page_max_frames: Option<u64>,
+    #[arg(long)]
+    replay_page_max_bytes: Option<u64>,
+    #[arg(long)]
+    disk_reserve_bytes: Option<u64>,
+    #[arg(long)]
+    disk_reserve_percent: Option<u8>,
+    #[arg(long)]
+    max_enrollment_codes: Option<u64>,
+    #[arg(long)]
+    tls_cert: Option<PathBuf>,
+    #[arg(long)]
+    tls_key: Option<PathBuf>,
+    #[arg(long)]
+    allow_insecure_loopback: bool,
+    #[arg(long)]
+    proxy_mode: bool,
+    #[arg(long)]
+    log_level: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RelayV2FileConfig {
+    bind: Option<String>,
+    health_bind: Option<String>,
+    storage: Option<PathBuf>,
+    max_frames_per_stream: Option<u64>,
+    max_bytes_per_stream: Option<u64>,
+    max_age_ms: Option<u64>,
+    max_bytes_per_machine: Option<u64>,
+    max_bytes_global: Option<u64>,
+    replay_page_max_frames: Option<u64>,
+    replay_page_max_bytes: Option<u64>,
+    disk_reserve_bytes: Option<u64>,
+    disk_reserve_percent: Option<u8>,
+    max_enrollment_codes: Option<u64>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    allow_insecure_loopback: Option<bool>,
+    proxy_mode: Option<bool>,
+    log_level: Option<String>,
+}
+
+/// Relay v2 配置加载和传输门禁失败。
+#[derive(thiserror::Error, Debug)]
+pub enum RelayV2ConfigError {
+    #[error("Relay v2 command-line parse failed: {0}")]
+    Cli(#[from] clap::error::Error),
+    #[error("Relay v2 config path from {key} is invalid")]
+    InvalidEnvironment { key: &'static str },
+    #[error("failed to read Relay v2 config file {path}: {source}")]
+    ConfigFileRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to parse Relay v2 config file {path}: {source}")]
+    ConfigFileParse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("Relay v2 config value is invalid: {field}")]
+    InvalidValue { field: &'static str },
+    #[error("Relay v2 storage configuration is invalid: {0}")]
+    StorageInvalid(#[source] StoreError),
+    #[error("TLS certificate and key must be configured together")]
+    TlsPartial,
+    #[error("configured TLS requires the binary tls feature")]
+    TlsFeatureMissing,
+    #[error("non-loopback Relay v2 listener requires direct TLS")]
+    TlsRequired,
+    #[error("loopback plaintext requires explicit --allow-insecure-loopback")]
+    InsecureLoopbackOptInRequired,
+    #[error("proxy mode requires a loopback Relay listener")]
+    ProxyNonLoopback,
+    #[error("Relay v2 transport modes are mutually exclusive")]
+    TransportConflict,
+    #[error("Relay health listener must bind loopback")]
+    HealthNonLoopback,
+}
+
+impl RelayV2ConfigError {
+    /// 稳定诊断码；不得包含路径、证书或配置内容。
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Cli(_) => "relay.config.cli_parse",
+            Self::InvalidEnvironment { .. } => "relay.config.env_invalid",
+            Self::ConfigFileRead { .. } => "relay.config.file_read",
+            Self::ConfigFileParse { .. } => "relay.config.file_parse",
+            Self::InvalidValue { .. } => "relay.config.invalid_value",
+            Self::StorageInvalid(_) => "relay.config.storage_invalid",
+            Self::TlsPartial => "relay.config.tls_partial",
+            Self::TlsFeatureMissing => "relay.transport.tls_feature_missing",
+            Self::TlsRequired => "relay.transport.tls_required",
+            Self::InsecureLoopbackOptInRequired => {
+                "relay.transport.insecure_loopback_opt_in_required"
+            }
+            Self::ProxyNonLoopback => "relay.transport.proxy_requires_loopback",
+            Self::TransportConflict => "relay.transport.mode_conflict",
+            Self::HealthNonLoopback => "relay.config.health_non_loopback",
+        }
+    }
+}
+
+impl RelayV2ServerConfig {
+    /// 复核所有可由公共字段手工构造绕过的启动门禁。
+    ///
+    /// server preflight 必须在读取 TLS identity 或绑定任何 listener 前调用；loader
+    /// 同样在返回前调用，保证两条构造路径共享相同不变量。
+    pub fn validate(&self) -> Result<(), RelayV2ConfigError> {
+        if !self.health_bind.ip().is_loopback() {
+            return Err(RelayV2ConfigError::HealthNonLoopback);
+        }
+        self.store
+            .validate()
+            .map_err(RelayV2ConfigError::StorageInvalid)?;
+        if self.log_level.trim().is_empty()
+            || self.log_level.len() > 128
+            || self.log_level.contains(['\r', '\n'])
+        {
+            return Err(RelayV2ConfigError::InvalidValue { field: "log_level" });
+        }
+        match &self.transport {
+            RelayV2TransportMode::DirectTls(_) => {
+                if !cfg!(feature = "tls") {
+                    return Err(RelayV2ConfigError::TlsFeatureMissing);
+                }
+            }
+            RelayV2TransportMode::InsecureLoopback => {
+                if !self.bind.ip().is_loopback() {
+                    return Err(RelayV2ConfigError::TlsRequired);
+                }
+            }
+            RelayV2TransportMode::ProxyLoopback => {
+                if !self.bind.ip().is_loopback() {
+                    return Err(RelayV2ConfigError::ProxyNonLoopback);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 生产入口：只读取真实 argv/env/cwd，不加载 `.env`，避免额外隐式优先级和
+    /// process-global 环境突变。
+    pub fn load() -> Result<Self, RelayV2ConfigError> {
+        let environment = std::env::vars().collect::<BTreeMap<_, _>>();
+        let cwd = std::env::current_dir().map_err(|_| RelayV2ConfigError::InvalidValue {
+            field: "current_dir",
+        })?;
+        Self::load_from(std::env::args_os(), &environment, &cwd)
+    }
+
+    /// 可测试的确定性加载入口：逐字段执行 CLI > env > TOML > dev defaults。
+    pub fn load_from<I, T>(
+        args: I,
+        environment: &BTreeMap<String, String>,
+        cwd: &Path,
+    ) -> Result<Self, RelayV2ConfigError>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        if !cwd.is_absolute() {
+            return Err(RelayV2ConfigError::InvalidValue {
+                field: "current_dir",
+            });
+        }
+        let raw = RelayV2RawArgs::try_parse_from(args)?;
+        let config_path = match raw.config {
+            Some(path) => Some(resolve_from_cwd(path, cwd)),
+            None => environment
+                .get("AGENTDECK_RELAY_CONFIG")
+                .map(|value| {
+                    if value.trim().is_empty() {
+                        Err(RelayV2ConfigError::InvalidEnvironment {
+                            key: "AGENTDECK_RELAY_CONFIG",
+                        })
+                    } else {
+                        Ok(resolve_from_cwd(PathBuf::from(value), cwd))
+                    }
+                })
+                .transpose()?,
+        };
+        let file = load_v2_file_config(config_path.as_deref())?;
+
+        let bind = parse_socket_addr(
+            raw.bind
+                .or_else(|| environment.get("AGENTDECK_RELAY_BIND").cloned())
+                .or(file.bind)
+                .unwrap_or_else(|| V2_DEFAULT_BIND.to_owned()),
+            "bind",
+        )?;
+        let health_bind = parse_socket_addr(
+            raw.health_bind
+                .or_else(|| environment.get("AGENTDECK_RELAY_HEALTH_BIND").cloned())
+                .or(file.health_bind)
+                .unwrap_or_else(|| V2_DEFAULT_HEALTH_BIND.to_owned()),
+            "health_bind",
+        )?;
+        if !health_bind.ip().is_loopback() {
+            return Err(RelayV2ConfigError::HealthNonLoopback);
+        }
+
+        let storage_path = raw
+            .storage
+            .or_else(|| {
+                environment
+                    .get("AGENTDECK_RELAY_STORAGE")
+                    .map(PathBuf::from)
+            })
+            .or(file.storage)
+            .unwrap_or_else(|| cwd.join(V2_DEFAULT_STORAGE_RELATIVE));
+        let mut store = RelayV2StoreSettings::new(storage_path);
+        store.max_frames_per_stream = layered_numeric(
+            raw.max_frames_per_stream,
+            environment,
+            "AGENTDECK_RELAY_MAX_FRAMES_PER_STREAM",
+            file.max_frames_per_stream,
+            store.max_frames_per_stream,
+        )?;
+        store.max_bytes_per_stream = layered_numeric(
+            raw.max_bytes_per_stream,
+            environment,
+            "AGENTDECK_RELAY_MAX_BYTES_PER_STREAM",
+            file.max_bytes_per_stream,
+            store.max_bytes_per_stream,
+        )?;
+        store.max_age_ms = layered_numeric(
+            raw.max_age_ms,
+            environment,
+            "AGENTDECK_RELAY_MAX_AGE_MS",
+            file.max_age_ms,
+            store.max_age_ms,
+        )?;
+        store.max_bytes_per_machine = layered_numeric(
+            raw.max_bytes_per_machine,
+            environment,
+            "AGENTDECK_RELAY_MAX_BYTES_PER_MACHINE",
+            file.max_bytes_per_machine,
+            store.max_bytes_per_machine,
+        )?;
+        store.max_bytes_global = layered_numeric(
+            raw.max_bytes_global,
+            environment,
+            "AGENTDECK_RELAY_MAX_BYTES_GLOBAL",
+            file.max_bytes_global,
+            store.max_bytes_global,
+        )?;
+        store.replay_page_max_frames = layered_numeric(
+            raw.replay_page_max_frames,
+            environment,
+            "AGENTDECK_RELAY_REPLAY_PAGE_MAX_FRAMES",
+            file.replay_page_max_frames,
+            store.replay_page_max_frames,
+        )?;
+        store.replay_page_max_bytes = layered_numeric(
+            raw.replay_page_max_bytes,
+            environment,
+            "AGENTDECK_RELAY_REPLAY_PAGE_MAX_BYTES",
+            file.replay_page_max_bytes,
+            store.replay_page_max_bytes,
+        )?;
+        store.disk_reserve_bytes = layered_numeric(
+            raw.disk_reserve_bytes,
+            environment,
+            "AGENTDECK_RELAY_DISK_RESERVE_BYTES",
+            file.disk_reserve_bytes,
+            store.disk_reserve_bytes,
+        )?;
+        store.disk_reserve_percent = layered_numeric(
+            raw.disk_reserve_percent,
+            environment,
+            "AGENTDECK_RELAY_DISK_RESERVE_PERCENT",
+            file.disk_reserve_percent,
+            store.disk_reserve_percent,
+        )?;
+        store.max_enrollment_codes = layered_numeric(
+            raw.max_enrollment_codes,
+            environment,
+            "AGENTDECK_RELAY_MAX_ENROLLMENT_CODES",
+            file.max_enrollment_codes,
+            store.max_enrollment_codes,
+        )?;
+        store
+            .validate()
+            .map_err(RelayV2ConfigError::StorageInvalid)?;
+
+        let tls = select_v2_tls_paths(
+            (raw.tls_cert, raw.tls_key),
+            (
+                environment
+                    .get("AGENTDECK_RELAY_TLS_CERT")
+                    .map(PathBuf::from),
+                environment
+                    .get("AGENTDECK_RELAY_TLS_KEY")
+                    .map(PathBuf::from),
+            ),
+            (file.tls_cert, file.tls_key),
+        )?;
+
+        let allow_insecure_loopback = if raw.allow_insecure_loopback {
+            true
+        } else {
+            parse_optional_env_bool(environment, "AGENTDECK_RELAY_ALLOW_INSECURE_LOOPBACK")?
+                .or(file.allow_insecure_loopback)
+                .unwrap_or(false)
+        };
+        let proxy_mode = if raw.proxy_mode {
+            true
+        } else {
+            parse_optional_env_bool(environment, "AGENTDECK_RELAY_PROXY_MODE")?
+                .or(file.proxy_mode)
+                .unwrap_or(false)
+        };
+
+        let transport = select_v2_transport(bind, tls, allow_insecure_loopback, proxy_mode)?;
+
+        let log_level = raw
+            .log_level
+            .or_else(|| environment.get("AGENTDECK_RELAY_LOG").cloned())
+            .or(file.log_level)
+            .unwrap_or_else(|| "info".to_owned());
+        if log_level.trim().is_empty() || log_level.len() > 128 || log_level.contains(['\r', '\n'])
+        {
+            return Err(RelayV2ConfigError::InvalidValue { field: "log_level" });
+        }
+
+        let config = Self {
+            bind,
+            health_bind,
+            store,
+            transport,
+            log_level,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+fn resolve_from_cwd(path: PathBuf, cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn load_v2_file_config(path: Option<&Path>) -> Result<RelayV2FileConfig, RelayV2ConfigError> {
+    let Some(path) = path else {
+        return Ok(RelayV2FileConfig::default());
+    };
+    let source =
+        std::fs::read_to_string(path).map_err(|source| RelayV2ConfigError::ConfigFileRead {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut config: RelayV2FileConfig =
+        toml::from_str(&source).map_err(|source| RelayV2ConfigError::ConfigFileParse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let parent = path.parent().ok_or(RelayV2ConfigError::InvalidValue {
+        field: "config_path",
+    })?;
+    config.tls_cert = config.tls_cert.map(|value| resolve_from_cwd(value, parent));
+    config.tls_key = config.tls_key.map(|value| resolve_from_cwd(value, parent));
+    Ok(config)
+}
+
+fn select_v2_tls_paths(
+    cli: (Option<PathBuf>, Option<PathBuf>),
+    environment: (Option<PathBuf>, Option<PathBuf>),
+    file: (Option<PathBuf>, Option<PathBuf>),
+) -> Result<Option<RelayV2TlsPaths>, RelayV2ConfigError> {
+    for (cert, key) in [cli, environment, file] {
+        match (cert, key) {
+            (Some(cert), Some(key)) => return Ok(Some(RelayV2TlsPaths { cert, key })),
+            (None, None) => {}
+            _ => return Err(RelayV2ConfigError::TlsPartial),
+        }
+    }
+    Ok(None)
+}
+
+fn parse_socket_addr(value: String, field: &'static str) -> Result<SocketAddr, RelayV2ConfigError> {
+    value
+        .parse()
+        .map_err(|_| RelayV2ConfigError::InvalidValue { field })
+}
+
+fn layered_numeric<T>(
+    cli: Option<T>,
+    environment: &BTreeMap<String, String>,
+    key: &'static str,
+    file: Option<T>,
+    default: T,
+) -> Result<T, RelayV2ConfigError>
+where
+    T: Copy + std::str::FromStr,
+{
+    if let Some(value) = cli {
+        return Ok(value);
+    }
+    if let Some(value) = environment.get(key) {
+        return value
+            .parse::<T>()
+            .map_err(|_| RelayV2ConfigError::InvalidEnvironment { key });
+    }
+    Ok(file.unwrap_or(default))
+}
+
+fn parse_optional_env_bool(
+    environment: &BTreeMap<String, String>,
+    key: &'static str,
+) -> Result<Option<bool>, RelayV2ConfigError> {
+    let Some(value) = environment.get(key) else {
+        return Ok(None);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" => Ok(Some(true)),
+        "0" | "false" => Ok(Some(false)),
+        _ => Err(RelayV2ConfigError::InvalidEnvironment { key }),
+    }
+}
+
+fn select_v2_transport(
+    bind: SocketAddr,
+    tls: Option<RelayV2TlsPaths>,
+    allow_insecure_loopback: bool,
+    proxy_mode: bool,
+) -> Result<RelayV2TransportMode, RelayV2ConfigError> {
+    if allow_insecure_loopback && proxy_mode {
+        return Err(RelayV2ConfigError::TransportConflict);
+    }
+    if let Some(tls) = tls {
+        if allow_insecure_loopback || proxy_mode {
+            return Err(RelayV2ConfigError::TransportConflict);
+        }
+        if !cfg!(feature = "tls") {
+            return Err(RelayV2ConfigError::TlsFeatureMissing);
+        }
+        return Ok(RelayV2TransportMode::DirectTls(tls));
+    }
+    if proxy_mode {
+        return if bind.ip().is_loopback() {
+            Ok(RelayV2TransportMode::ProxyLoopback)
+        } else {
+            Err(RelayV2ConfigError::ProxyNonLoopback)
+        };
+    }
+    if allow_insecure_loopback {
+        return if bind.ip().is_loopback() {
+            Ok(RelayV2TransportMode::InsecureLoopback)
+        } else {
+            Err(RelayV2ConfigError::TlsRequired)
+        };
+    }
+    if bind.ip().is_loopback() {
+        Err(RelayV2ConfigError::InsecureLoopbackOptInRequired)
+    } else {
+        Err(RelayV2ConfigError::TlsRequired)
     }
 }
 
