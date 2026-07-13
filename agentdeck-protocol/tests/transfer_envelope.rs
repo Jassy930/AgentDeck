@@ -9,8 +9,9 @@
 
 use agentdeck_protocol::runtime::identity::TransferId;
 use agentdeck_protocol::runtime::transfer::{
-    MAX_PART_BYTES, MAX_REASSEMBLY_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_PARTS, TRANSFER_TTL_MS,
-    TransferEnvelope, TransferProgress, TransferReassembler,
+    MAX_PART_BYTES, MAX_REASSEMBLY_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_PARTS,
+    RuntimeTransferChannel, TRANSFER_TTL_MS, TransferEnvelope, TransferError, TransferProgress,
+    TransferReassembler,
 };
 use sha2::{Digest, Sha256};
 
@@ -63,7 +64,10 @@ fn single_part_transfer_completes() {
     let payload = b"hello world".to_vec();
     let mut r = TransferReassembler::new();
     let parts = split(&payload, 1);
-    match r.accept(parts[0].clone(), 0).unwrap() {
+    match r
+        .accept(RuntimeTransferChannel::Reply, parts[0].clone(), 0)
+        .unwrap()
+    {
         TransferProgress::Complete(bytes) => assert_eq!(bytes, payload),
         other => panic!("expected complete, got {other:?}"),
     }
@@ -78,9 +82,10 @@ fn sixty_four_parts_reassemble_out_of_order() {
     // feed in reverse order
     let mut done = None;
     for env in parts.into_iter().rev() {
-        match r.accept(env, 10).unwrap() {
+        match r.accept(RuntimeTransferChannel::Reply, env, 10).unwrap() {
             TransferProgress::Complete(bytes) => done = Some(bytes),
             TransferProgress::InProgress { .. } => {}
+            TransferProgress::AlreadyComplete => panic!("fresh parts cannot already be complete"),
         }
     }
     assert_eq!(done.unwrap(), payload);
@@ -133,9 +138,13 @@ fn duplicate_same_part_is_idempotent() {
     let payload = vec![7u8; 300];
     let parts = split(&payload, 3);
     let mut r = TransferReassembler::new();
-    r.accept(parts[0].clone(), 0).unwrap();
+    r.accept(RuntimeTransferChannel::Reply, parts[0].clone(), 0)
+        .unwrap();
     // re-send part 0 verbatim → idempotent, no error, still in progress
-    match r.accept(parts[0].clone(), 0).unwrap() {
+    match r
+        .accept(RuntimeTransferChannel::Reply, parts[0].clone(), 0)
+        .unwrap()
+    {
         TransferProgress::InProgress {
             received_parts,
             part_count,
@@ -152,7 +161,8 @@ fn duplicate_index_conflicting_content_errors() {
     let payload = vec![1u8; 300];
     let parts = split(&payload, 3);
     let mut r = TransferReassembler::new();
-    r.accept(parts[0].clone(), 0).unwrap();
+    r.accept(RuntimeTransferChannel::Reply, parts[0].clone(), 0)
+        .unwrap();
     // same transferId/index but different bytes → conflict
     let conflict = TransferEnvelope::new(
         parts[0].transfer_id.clone(),
@@ -163,7 +173,9 @@ fn duplicate_index_conflicting_content_errors() {
         vec![9u8; parts[0].part.len()],
     )
     .unwrap();
-    let err = r.accept(conflict, 0).unwrap_err();
+    let err = r
+        .accept(RuntimeTransferChannel::Reply, conflict, 0)
+        .unwrap_err();
     assert_eq!(err.code(), "remote.transfer.hash_mismatch");
 }
 
@@ -172,7 +184,8 @@ fn changed_metadata_after_first_part_errors() {
     let payload = vec![1u8; 300];
     let parts = split(&payload, 3);
     let mut r = TransferReassembler::new();
-    r.accept(parts[0].clone(), 0).unwrap();
+    r.accept(RuntimeTransferChannel::Reply, parts[0].clone(), 0)
+        .unwrap();
     // part 1 claims a different partCount → metadata changed
     let bad = TransferEnvelope::new(
         parts[1].transfer_id.clone(),
@@ -183,7 +196,7 @@ fn changed_metadata_after_first_part_errors() {
         parts[1].part.clone(),
     )
     .unwrap();
-    let err = r.accept(bad, 0).unwrap_err();
+    let err = r.accept(RuntimeTransferChannel::Reply, bad, 0).unwrap_err();
     assert_eq!(err.code(), "remote.transfer.hash_mismatch");
 }
 
@@ -207,8 +220,72 @@ fn wrong_total_hash_detected_on_completion() {
     )
     .unwrap();
     let mut r = TransferReassembler::new();
-    let err = r.accept(env, 0).unwrap_err();
+    let err = r.accept(RuntimeTransferChannel::Reply, env, 0).unwrap_err();
     assert_eq!(err.code(), "remote.transfer.hash_mismatch");
+}
+
+#[test]
+fn declared_length_mismatch_aborts_and_releases_budget_before_assembly() {
+    let mut reassembler = TransferReassembler::new();
+    for index in 0..MAX_TRANSFER_PARTS {
+        let envelope = TransferEnvelope::new(
+            TransferId::new("declared-length-mismatch"),
+            index,
+            MAX_TRANSFER_PARTS,
+            [0xAB; 32],
+            MAX_TRANSFER_BYTES,
+            vec![index as u8],
+        )
+        .unwrap();
+        let result = reassembler.accept(RuntimeTransferChannel::Reply, envelope, 0);
+        if index + 1 == MAX_TRANSFER_PARTS {
+            assert_eq!(result.unwrap_err(), TransferError::HashMismatch);
+        } else {
+            assert!(matches!(
+                result.unwrap(),
+                TransferProgress::InProgress { .. }
+            ));
+        }
+    }
+    assert_eq!(reassembler.buffered_bytes(), 0);
+}
+
+#[test]
+fn final_assembly_reserves_declared_bytes_or_aborts_and_releases_budget() {
+    let payload = vec![0x5A; 8];
+    let parts = split(&payload, 2);
+    // 两个 4-byte part 可以进入 12-byte connection budget，但最终 assembly 还需额外
+    // 预留完整 8 bytes；峰值 16 bytes 必须 fail-close，不能产生未记账 allocation。
+    let mut reassembler = TransferReassembler::with_limits(12, TRANSFER_TTL_MS);
+
+    assert!(matches!(
+        reassembler
+            .accept(RuntimeTransferChannel::Reply, parts[0].clone(), 0)
+            .unwrap(),
+        TransferProgress::InProgress { .. }
+    ));
+    assert_eq!(reassembler.buffered_bytes(), 4);
+
+    assert_eq!(
+        reassembler
+            .accept(RuntimeTransferChannel::Reply, parts[1].clone(), 1)
+            .unwrap_err(),
+        TransferError::ReassemblyFull
+    );
+    assert_eq!(reassembler.buffered_bytes(), 0);
+
+    // abort 后相同 transfer 可在足够预算下由新的 reassembler 正常完成。
+    let mut sufficient = TransferReassembler::with_limits(16, TRANSFER_TTL_MS);
+    sufficient
+        .accept(RuntimeTransferChannel::Reply, parts[0].clone(), 0)
+        .unwrap();
+    assert!(matches!(
+        sufficient
+            .accept(RuntimeTransferChannel::Reply, parts[1].clone(), 1)
+            .unwrap(),
+        TransferProgress::Complete(bytes) if bytes == payload
+    ));
+    assert_eq!(sufficient.buffered_bytes(), 0);
 }
 
 #[test]
@@ -216,10 +293,15 @@ fn ttl_expiry_aborts_transfer() {
     let payload = vec![3u8; 300];
     let parts = split(&payload, 3);
     let mut r = TransferReassembler::new();
-    r.accept(parts[0].clone(), 1_000).unwrap();
+    r.accept(RuntimeTransferChannel::Reply, parts[0].clone(), 1_000)
+        .unwrap();
     // part 1 arrives after TTL window
     let err = r
-        .accept(parts[1].clone(), 1_000 + TRANSFER_TTL_MS + 1)
+        .accept(
+            RuntimeTransferChannel::Reply,
+            parts[1].clone(),
+            1_000 + TRANSFER_TTL_MS,
+        )
         .unwrap_err();
     assert_eq!(err.code(), "remote.transfer.expired");
 }
@@ -232,7 +314,8 @@ fn reassembly_cap_enforced_across_transfers() {
     let payload_a = vec![1u8; 600];
     let a = split(&payload_a, 2);
     assert_eq!(a[0].part.len(), 300);
-    r.accept(a[0].clone(), 0).unwrap();
+    r.accept(RuntimeTransferChannel::Reply, a[0].clone(), 0)
+        .unwrap();
 
     // t2：另一个 transfer 的首片 250 字节。
     let payload_b = vec![2u8; 500];
@@ -240,7 +323,7 @@ fn reassembly_cap_enforced_across_transfers() {
     let b0 =
         TransferEnvelope::new(TransferId::new("t2"), 0, 2, hash_b, 500, vec![2u8; 250]).unwrap();
     // 300 (t1) + 250 (t2) = 550 > 500 cap
-    let err = r.accept(b0, 0).unwrap_err();
+    let err = r.accept(RuntimeTransferChannel::Reply, b0, 0).unwrap_err();
     assert_eq!(err.code(), "remote.transfer.reassembly_full");
 }
 
@@ -261,4 +344,80 @@ fn envelope_round_trips_with_base64_wire() {
     assert!(json["totalSha256"].is_string());
     let back: TransferEnvelope = serde_json::from_value(json).unwrap();
     assert_eq!(back, env);
+}
+
+#[test]
+fn conflict_aborts_active_transfer_and_releases_buffer() {
+    let payload = vec![1u8; 300];
+    let parts = split(&payload, 3);
+    let mut r = TransferReassembler::new();
+    r.accept(RuntimeTransferChannel::Reply, parts[0].clone(), 0)
+        .unwrap();
+    assert!(r.buffered_bytes() > 0);
+
+    let conflict = TransferEnvelope::new(
+        parts[1].transfer_id.clone(),
+        1,
+        3,
+        [0xFF; 32],
+        parts[1].total_bytes,
+        parts[1].part.clone(),
+    )
+    .unwrap();
+    assert!(
+        r.accept(RuntimeTransferChannel::Reply, conflict, 1)
+            .is_err()
+    );
+    assert_eq!(r.buffered_bytes(), 0);
+}
+
+#[test]
+fn completed_tombstone_prevents_double_complete_and_binds_channel() {
+    let payload = b"complete once".to_vec();
+    let part = split(&payload, 1).remove(0);
+    let mut r = TransferReassembler::new();
+    assert!(matches!(
+        r.accept(RuntimeTransferChannel::Reply, part.clone(), 0)
+            .unwrap(),
+        TransferProgress::Complete(_)
+    ));
+    assert!(matches!(
+        r.accept(RuntimeTransferChannel::Reply, part.clone(), 1)
+            .unwrap(),
+        TransferProgress::AlreadyComplete
+    ));
+    assert!(r.accept(RuntimeTransferChannel::Stream, part, 2).is_err());
+}
+
+#[test]
+fn at_most_sixty_four_transfers_may_be_active() {
+    let mut r = TransferReassembler::new();
+    for index in 0..64u32 {
+        let payload = vec![index as u8; 2];
+        let hash = sha256(&payload);
+        let first = TransferEnvelope::new(
+            TransferId::new(format!("active-{index}")),
+            0,
+            2,
+            hash,
+            2,
+            vec![index as u8],
+        )
+        .unwrap();
+        r.accept(RuntimeTransferChannel::Reply, first, 0).unwrap();
+    }
+    let payload = vec![9u8; 2];
+    let overflow = TransferEnvelope::new(
+        TransferId::new("active-overflow"),
+        0,
+        2,
+        sha256(&payload),
+        2,
+        vec![9],
+    )
+    .unwrap();
+    assert!(
+        r.accept(RuntimeTransferChannel::Reply, overflow, 0)
+            .is_err()
+    );
 }

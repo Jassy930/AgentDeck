@@ -509,16 +509,56 @@ public struct RelayKeyUpdateV1: Codable, Sendable {
     }
 }
 
+public enum RelayRuntimeInnerCursorV1: Codable, Sendable {
+    case catalog(cursor: StreamCursor)
+    case conversation(conversationID: String, cursor: StreamCursor)
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: RelayJSONCodingKey.self)
+        let scope = try container.decode(String.self, forKey: relayKey("scope"))
+        switch scope {
+        case "catalog":
+            try rejectRelayUnknownKeys(decoder, allowed: ["scope", "cursor"])
+            self = .catalog(
+                cursor: try container.decode(StreamCursor.self, forKey: relayKey("cursor"))
+            )
+        case "conversation":
+            try rejectRelayUnknownKeys(decoder, allowed: ["scope", "conversationId", "cursor"])
+            self = .conversation(
+                conversationID: try container.decode(String.self, forKey: relayKey("conversationId")),
+                cursor: try container.decode(StreamCursor.self, forKey: relayKey("cursor"))
+            )
+        default:
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: decoder.codingPath, debugDescription: "invalid inner cursor scope")
+            )
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: RelayJSONCodingKey.self)
+        switch self {
+        case .catalog(let cursor):
+            try container.encode("catalog", forKey: relayKey("scope"))
+            try container.encode(cursor, forKey: relayKey("cursor"))
+        case .conversation(let conversationID, let cursor):
+            try container.encode("conversation", forKey: relayKey("scope"))
+            try container.encode(conversationID, forKey: relayKey("conversationId"))
+            try container.encode(cursor, forKey: relayKey("cursor"))
+        }
+    }
+}
+
 public struct RelayEpochBarrierV1: Codable, Sendable {
     public var streamGeneration: Data
     public var streamCursor: StreamCursor
-    public var eventSeq: UInt64
+    public var innerCursor: RelayRuntimeInnerCursorV1
     public var oldEpoch: UInt64
     public var newEpoch: UInt64
     public var keyDirectoryRevision: UInt64
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
-        case streamGeneration, streamCursor, eventSeq, oldEpoch, newEpoch, keyDirectoryRevision
+        case streamGeneration, streamCursor, innerCursor, oldEpoch, newEpoch, keyDirectoryRevision
     }
 
     public init(from decoder: Decoder) throws {
@@ -526,7 +566,7 @@ public struct RelayEpochBarrierV1: Codable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         streamGeneration = try container.decode(Data.self, forKey: .streamGeneration)
         streamCursor = try container.decode(StreamCursor.self, forKey: .streamCursor)
-        eventSeq = try container.decode(UInt64.self, forKey: .eventSeq)
+        innerCursor = try container.decode(RelayRuntimeInnerCursorV1.self, forKey: .innerCursor)
         oldEpoch = try container.decode(UInt64.self, forKey: .oldEpoch)
         newEpoch = try container.decode(UInt64.self, forKey: .newEpoch)
         keyDirectoryRevision = try container.decode(UInt64.self, forKey: .keyDirectoryRevision)
@@ -536,9 +576,16 @@ public struct RelayEpochBarrierV1: Codable, Sendable {
 public struct RelaySealedPayloadV1: Codable, Sendable {
     public var formatVersion: UInt16
     public var payloadKind: SealedPayloadKind
+    public var payload: Data
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
-        case formatVersion, payloadKind
+        case formatVersion, payloadKind, payload
+    }
+
+    public init(formatVersion: UInt16, payloadKind: SealedPayloadKind, payload: Data) {
+        self.formatVersion = formatVersion
+        self.payloadKind = payloadKind
+        self.payload = payload
     }
 
     public init(from decoder: Decoder) throws {
@@ -546,6 +593,7 @@ public struct RelaySealedPayloadV1: Codable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         formatVersion = try container.decode(UInt16.self, forKey: .formatVersion)
         payloadKind = try container.decode(SealedPayloadKind.self, forKey: .payloadKind)
+        payload = try container.decode(Data.self, forKey: .payload)
     }
 }
 
@@ -1277,7 +1325,7 @@ private enum RelayV2SignedSealedBlobCodec {
             throw RelayWireCodecError.lengthOutOfBounds
         }
 
-        let fixedCapacity = domain.count + 2 + 1 + 1 + 8 + 8 + 8 + 4 + 12 + 4 + 64
+        let fixedCapacity = domain.count + 2 + 1 + 8 + 8 + 8 + 4 + 12 + 4 + 64
         let (capacity, capacityOverflow) = fixedCapacity.addingReportingOverflow(
             value.inner.ciphertext.count
         )
@@ -1291,7 +1339,6 @@ private enum RelayV2SignedSealedBlobCodec {
         output.reserveCapacity(capacity)
         output.append(domain)
         appendBigEndian(value.inner.formatVersion, to: &output)
-        output.append(value.inner.payloadKind.canonicalTag)
         output.append(value.inner.keyID.purpose.canonicalTag)
         appendBigEndian(value.inner.keyID.epoch, to: &output)
         appendBigEndian(value.inner.keyEpoch, to: &output)
@@ -1802,7 +1849,7 @@ public enum RelayV2JSONCodec {
             try exactKeys(
                 object,
                 allowed: [
-                    "streamGeneration", "streamCursor", "eventSeq", "oldEpoch", "newEpoch",
+                    "streamGeneration", "streamCursor", "innerCursor", "oldEpoch", "newEpoch",
                     "keyDirectoryRevision",
                 ],
                 path: path
@@ -1810,10 +1857,31 @@ public enum RelayV2JSONCodec {
             if let cursor = object["streamCursor"] as? [String: Any] {
                 try exactKeys(cursor, allowed: ["at"], path: "\(path).streamCursor")
             }
+            guard let innerCursor = object["innerCursor"] as? [String: Any],
+                  let scope = innerCursor["scope"] as? String
+            else {
+                throw RelayWireCodecError.unknownField("\(path).innerCursor")
+            }
+            switch scope {
+            case "catalog":
+                try exactKeys(
+                    innerCursor,
+                    allowed: ["scope", "cursor"],
+                    path: "\(path).innerCursor"
+                )
+            case "conversation":
+                try exactKeys(
+                    innerCursor,
+                    allowed: ["scope", "conversationId", "cursor"],
+                    path: "\(path).innerCursor"
+                )
+            default:
+                throw RelayWireCodecError.unknownField("\(path).innerCursor.scope")
+            }
         case .sealedPayload:
             try exactKeys(
                 object,
-                allowed: ["formatVersion", "payloadKind"],
+                allowed: ["formatVersion", "payloadKind", "payload"],
                 path: path
             )
         }

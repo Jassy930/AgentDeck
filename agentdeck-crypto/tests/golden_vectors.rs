@@ -21,7 +21,8 @@ use agentdeck_crypto::rand_core::{TryCryptoRng, TryRng};
 use agentdeck_crypto::{
     AeadReceivingKey, AeadSendingKey, CryptoError, HpkeEnvelopeV1, HpkePrivateKey, SecretAeadKey,
     SenderCounter, SignatureBytes, SigningKey, VerifyingKey, hpke_open_base, hpke_seal_base,
-    open_symmetric, seal_symmetric, sha256, sign_sealed, sign_tbs, verify_sealed, verify_tbs,
+    open_sealed_payload, open_symmetric, seal_symmetric, sha256, sign_sealed, sign_tbs,
+    verify_sealed, verify_tbs,
 };
 use agentdeck_protocol::e2ee::context::{OuterContextV1, OuterFrameKind};
 use agentdeck_protocol::e2ee::keys::{KeyId, KeyPurpose, KeyUpdateInfoV1};
@@ -488,8 +489,9 @@ fn seal_open_round_trip() {
     .unwrap();
     let signed = sign_sealed(unsigned, &signing, &outer_sample());
     let verified = verify_sealed(signed, &signing.verifying_key(), &outer_sample()).unwrap();
-    let plaintext = open_symmetric(&receiving_key(), &outer_sample(), verified).unwrap();
-    assert_eq!(plaintext, AEAD_PLAINTEXT);
+    let opened = open_sealed_payload(&receiving_key(), &outer_sample(), verified).unwrap();
+    assert_eq!(opened.payload_kind, SealedPayloadKind::ConversationEvent);
+    assert_eq!(opened.payload, AEAD_PLAINTEXT);
 }
 
 #[test]

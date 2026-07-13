@@ -24,6 +24,7 @@ final class RuntimeV1ProtocolTests: XCTestCase {
                         "conversationId": "conversation-expired-without-winner",
                         "eventId": "event-expired-without-winner",
                         "eventSeq": 1,
+                        "commandId": "command-expired-without-winner",
                         "itemId": NSNull(),
                         "entityId": NSNull(),
                         "body": body,
@@ -101,6 +102,334 @@ final class RuntimeV1ProtocolTests: XCTestCase {
             return XCTFail("expected active cancel requested receipt")
         }
         XCTAssertEqual(turnID.rawValue, "turn-cancel-1")
+    }
+
+    func testP36TaggedSubscriptionSyncAndSnapshotIdentityContract() throws {
+        let fixtures = try loadFixtures()
+
+        let subscribe = try XCTUnwrap(fixtures.first { $0.name == "requestSubscribe" })
+        guard case let .request(.subscribe(.conversation(conversationID, .beforeFirst))) =
+            try RuntimeV1WireCodec.decodeEnvelope(subscribe.value).body
+        else {
+            return XCTFail("subscribe must carry tagged conversation inner cursor")
+        }
+        XCTAssertEqual(conversationID.rawValue, "conversation-request-1")
+
+        let unsubscribe = try XCTUnwrap(fixtures.first { $0.name == "requestUnsubscribe" })
+        guard case let .request(.unsubscribe(.conversation(unsubscribedID))) =
+            try RuntimeV1WireCodec.decodeEnvelope(unsubscribe.value).body
+        else {
+            return XCTFail("unsubscribe must carry a tagged target")
+        }
+        XCTAssertEqual(unsubscribedID.rawValue, conversationID.rawValue)
+
+        let sync = try XCTUnwrap(fixtures.first { $0.name == "replySyncComplete" })
+        guard case let .reply(.syncComplete(value)) =
+            try RuntimeV1WireCodec.decodeEnvelope(sync.value).body,
+            case let .conversation(syncConversationID, .at(innerSequence)) = value.innerCursor
+        else {
+            return XCTFail("SyncComplete must be a reply with tagged inner cursor")
+        }
+        XCTAssertEqual(syncConversationID.rawValue, "conversation-sync-1")
+        XCTAssertEqual(innerSequence, 7)
+
+        let receipt = try XCTUnwrap(
+            fixtures.first { $0.name == "replySubscriptionSubscribed" }
+        )
+        guard case let .reply(.subscription(.subscribed(generation))) =
+            try RuntimeV1WireCodec.decodeEnvelope(receipt.value).body
+        else {
+            return XCTFail("subscribe receipt must be typed")
+        }
+        XCTAssertEqual(generation.rawValue, "generation-subscribed-1")
+
+        let snapshotFixture = try XCTUnwrap(
+            fixtures.first { $0.name == "capabilitiesFirstSnapshot" }
+        )
+        guard case let .reply(.snapshot(snapshot)) =
+            try RuntimeV1WireCodec.decodeEnvelope(snapshotFixture.value).body,
+            case let .at(baseSequence) = snapshot.baseEventCursor,
+            case let .item(itemID, entityID, commandID, _) = snapshot.items[1]
+        else {
+            return XCTFail("snapshot must use cursor and stable item/entity identity")
+        }
+        XCTAssertEqual(itemID.rawValue, "item-snapshot-1")
+        XCTAssertEqual(entityID.rawValue, "entity-snapshot-1")
+        XCTAssertNil(commandID)
+        XCTAssertEqual(baseSequence, 6)
+    }
+
+    func testCheckedCursorAndTransportSpecificTransferLimits() throws {
+        XCTAssertEqual(try RuntimeStreamCursorV1.beforeFirst.checkedNext(), 0)
+        XCTAssertEqual(try RuntimeStreamCursorV1.at(41).checkedNext(), 42)
+        XCTAssertThrowsError(try RuntimeStreamCursorV1.at(UInt64.max).checkedNext())
+        XCTAssertEqual(TransferEnvelopeV1.maxJSONPartBytes, 700 * 1024)
+        XCTAssertEqual(RuntimeV1WireCodec.maxJSONFrameBytes, 1024 * 1024)
+        XCTAssertLessThan(
+            TransferEnvelopeV1.maxJSONPartBytes,
+            TransferEnvelopeV1.maxRemotePartBytes
+        )
+
+        let fixtures = try loadRawFixtureObjects()
+        var value = try fixtureValue(named: "streamTransferPart", in: fixtures)
+        value["messageId"] = String(repeating: "m", count: 1024)
+        var body = try XCTUnwrap(value["body"] as? [String: Any])
+        var payload = try XCTUnwrap(body["payload"] as? [String: Any])
+        payload["transferId"] = String(repeating: "t", count: 1024)
+        payload["partIndex"] = 63
+        payload["partCount"] = 64
+        payload["totalBytes"] = Int(TransferEnvelopeV1.maxPartCount)
+            * TransferEnvelopeV1.maxJSONPartBytes
+        payload["part"] = Data(
+            repeating: 0xA5,
+            count: TransferEnvelopeV1.maxJSONPartBytes
+        ).base64EncodedString()
+        body["payload"] = payload
+        value["body"] = body
+        let worstCase = try JSONSerialization.data(withJSONObject: value)
+        XCTAssertLessThan(worstCase.count, RuntimeV1WireCodec.maxJSONFrameBytes)
+        let reencoded = try RuntimeV1WireCodec.encode(
+            RuntimeV1WireCodec.decodeEnvelope(worstCase)
+        )
+        XCTAssertLessThan(reencoded.count, RuntimeV1WireCodec.maxJSONFrameBytes)
+
+        var oversizedMessage = value
+        oversizedMessage["messageId"] = String(repeating: "m", count: 1025)
+        XCTAssertThrowsError(
+            try RuntimeV1WireCodec.decodeEnvelope(
+                JSONSerialization.data(withJSONObject: oversizedMessage)
+            )
+        )
+
+        var impossibleTotal = value
+        var impossibleBody = try XCTUnwrap(impossibleTotal["body"] as? [String: Any])
+        var impossiblePayload = try XCTUnwrap(impossibleBody["payload"] as? [String: Any])
+        impossiblePayload["part"] = Data([0x01]).base64EncodedString()
+        impossiblePayload["partCount"] = Int(TransferEnvelopeV1.maxPartCount)
+        impossiblePayload["totalBytes"] = Int(TransferEnvelopeV1.maxTotalBytes)
+        impossibleBody["payload"] = impossiblePayload
+        impossibleTotal["body"] = impossibleBody
+        XCTAssertThrowsError(
+            try RuntimeV1WireCodec.decodeEnvelope(
+                JSONSerialization.data(withJSONObject: impossibleTotal)
+            )
+        )
+
+        XCTAssertThrowsError(
+            try JSONEncoder().encode(
+                RuntimeMessageID(rawValue: String(repeating: "m", count: 1025))
+            )
+        )
+        XCTAssertThrowsError(
+            try JSONEncoder().encode(
+                RuntimeTransferID(rawValue: String(repeating: "t", count: 1025))
+            )
+        )
+        XCTAssertNoThrow(
+            try JSONEncoder().encode(
+                RuntimeMessageID(rawValue: String(repeating: "中", count: 341))
+            )
+        )
+        for invalid in ["", String(repeating: "中", count: 342)] {
+            XCTAssertThrowsError(
+                try JSONEncoder().encode(RuntimeMessageID(rawValue: invalid))
+            )
+            XCTAssertThrowsError(
+                try JSONEncoder().encode(RuntimeTransferID(rawValue: invalid))
+            )
+        }
+    }
+
+    func testRuntimeJSONFrameRejectsExactlyOneMiBOnIngressAndEgress() throws {
+        func envelope(displayName: String) -> RuntimeEnvelopeV1 {
+            RuntimeEnvelopeV1(
+                version: runtimeProtocolVersionV1,
+                messageID: RuntimeMessageID(rawValue: "message-frame-boundary"),
+                body: .request(
+                    .createPairInvite(
+                        displayName: displayName,
+                        ttlSecs: 300,
+                        scope: .localOnly
+                    )
+                )
+            )
+        }
+
+        let fixedBytes = try JSONEncoder().encode(envelope(displayName: "")).count
+        let exact = envelope(
+            displayName: String(
+                repeating: "x",
+                count: RuntimeV1WireCodec.maxJSONFrameBytes - fixedBytes
+            )
+        )
+        let exactData = try JSONEncoder().encode(exact)
+        XCTAssertEqual(exactData.count, RuntimeV1WireCodec.maxJSONFrameBytes)
+
+        XCTAssertThrowsError(try RuntimeV1WireCodec.decodeEnvelope(exactData)) { error in
+            XCTAssertEqual(error as? RuntimeV1MirrorError, .frameTooLarge)
+        }
+        XCTAssertThrowsError(try RuntimeV1WireCodec.encode(exact)) { error in
+            XCTAssertEqual(error as? RuntimeV1MirrorError, .frameTooLarge)
+        }
+    }
+
+    func testCatalogSnapshotEnforces64MiBEncodedGateOnIngressAndFlattenedEgress() throws {
+        XCTAssertEqual(RuntimeCatalogSnapshotV1.maxEncodedBytes, 64 * 1024 * 1024)
+        let oversizedTitle = String(
+            repeating: "x",
+            count: RuntimeCatalogSnapshotV1.maxEncodedBytes
+        )
+        let entryObject: [String: Any] = [
+            "conversationId": "conversation-catalog-oversized",
+            "adapterStateKey": "adapter-catalog-oversized",
+            "agentKind": "codex",
+            "title": oversizedTitle,
+            "cwd": NSNull(),
+            "lastActiveMs": 0,
+            "archived": false,
+        ]
+        let snapshotObject: [String: Any] = [
+            "baseCatalogCursor": "beforeFirst",
+            "entries": [entryObject],
+            "nextPageCursor": NSNull(),
+        ]
+        let oversizedWire = try JSONSerialization.data(withJSONObject: snapshotObject)
+        XCTAssertGreaterThan(oversizedWire.count, RuntimeCatalogSnapshotV1.maxEncodedBytes)
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(RuntimeCatalogSnapshotV1.self, from: oversizedWire)
+        ) { error in
+            XCTAssertEqual(error as? RuntimeV1MirrorError, .catalogTooLarge)
+        }
+
+        let entry = try JSONDecoder().decode(
+            RuntimeConversationEntryV1.self,
+            from: JSONSerialization.data(withJSONObject: entryObject)
+        )
+        let snapshot = RuntimeCatalogSnapshotV1(
+            baseCatalogCursor: .beforeFirst,
+            entries: [entry],
+            nextPageCursor: nil
+        )
+        let envelope = RuntimeEnvelopeV1(
+            version: runtimeProtocolVersionV1,
+            messageID: RuntimeMessageID(rawValue: "message-catalog-oversized"),
+            body: .reply(.catalog(snapshot))
+        )
+        XCTAssertThrowsError(try JSONEncoder().encode(envelope)) { error in
+            XCTAssertEqual(error as? RuntimeV1MirrorError, .catalogTooLarge)
+        }
+    }
+
+    func testCompactTransferCarrierMirrorsRustAndRejectsFramingCorruption() throws {
+        let fixtures = try loadRawFixtureObjects()
+        let fixture = try XCTUnwrap(
+            fixtures.first { ($0["case"] as? String) == "compactTransferCarrier" }
+        )
+        let hex = try XCTUnwrap(fixture["value"] as? String)
+        let rustBytes = try XCTUnwrap(Data(hexString: hex))
+        let decoded = try RuntimeV1WireCodec.decodeTransferCarrier(rustBytes)
+        XCTAssertEqual(decoded.runtimeVersion, 1)
+        XCTAssertEqual(decoded.channel, .stream)
+        XCTAssertEqual(decoded.messageID.rawValue, "message-transfer-compact-1")
+        XCTAssertEqual(try RuntimeV1WireCodec.encode(decoded), rustBytes)
+
+        var trailing = rustBytes
+        trailing.append(0)
+        XCTAssertThrowsError(try RuntimeV1WireCodec.decodeTransferCarrier(trailing))
+        var badChannel = rustBytes
+        badChannel[7] = 0xFF
+        XCTAssertThrowsError(try RuntimeV1WireCodec.decodeTransferCarrier(badChannel))
+
+        let originalMessageLength = (Int(rustBytes[8]) << 8) | Int(rustBytes[9])
+        var oversizedIngress = Data(rustBytes.prefix(8))
+        oversizedIngress.append(contentsOf: [0x04, 0x01]) // 1025 bytes
+        oversizedIngress.append(contentsOf: Data(repeating: 0x6D, count: 1025))
+        oversizedIngress.append(
+            rustBytes.subdata(in: (10 + originalMessageLength)..<rustBytes.count)
+        )
+        XCTAssertThrowsError(try RuntimeV1WireCodec.decodeTransferCarrier(oversizedIngress))
+
+        let rawPart = Data(repeating: 0x5A, count: TransferEnvelopeV1.maxRemotePartBytes)
+        let maximum = try TransferEnvelopeV1(
+            transferID: RuntimeTransferID(rawValue: "transfer-swift-max"),
+            partIndex: 0,
+            partCount: 1,
+            totalSHA256: Data(repeating: 0, count: 32),
+            totalBytes: UInt64(rawPart.count),
+            part: rawPart,
+            maximumPartBytes: TransferEnvelopeV1.maxRemotePartBytes
+        )
+        let maximumCarrier = RuntimeTransferCarrierV1(
+            messageID: RuntimeMessageID(rawValue: "message-swift-max"),
+            channel: .reply,
+            transfer: maximum
+        )
+        let maximumBytes = try RuntimeV1WireCodec.encode(maximumCarrier)
+        XCTAssertLessThan(maximumBytes.count, RuntimeTransferCarrierV1.maxBytes)
+        XCTAssertEqual(
+            try RuntimeV1WireCodec.encode(
+                RuntimeV1WireCodec.decodeTransferCarrier(maximumBytes)
+            ),
+            maximumBytes
+        )
+
+        let oversizedIdentity = RuntimeTransferCarrierV1(
+            messageID: RuntimeMessageID(rawValue: String(repeating: "m", count: 1025)),
+            channel: .stream,
+            transfer: decoded.transfer
+        )
+        XCTAssertThrowsError(try RuntimeV1WireCodec.encode(oversizedIdentity))
+    }
+
+    func testRuntimeEnvelopeVersionIsRejectedOnIngressAndEgress() throws {
+        let fixture = try XCTUnwrap(loadFixtures().first { $0.name == "requestHello" })
+        let decoded = try RuntimeV1WireCodec.decodeEnvelope(fixture.value)
+
+        var wrongWire = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: fixture.value) as? [String: Any]
+        )
+        wrongWire["version"] = 2
+        XCTAssertThrowsError(
+            try RuntimeV1WireCodec.decodeEnvelope(
+                JSONSerialization.data(withJSONObject: wrongWire)
+            )
+        )
+
+        let wrongValue = RuntimeEnvelopeV1(
+            version: 2,
+            messageID: decoded.messageID,
+            body: decoded.body
+        )
+        XCTAssertThrowsError(try RuntimeV1WireCodec.encode(wrongValue))
+    }
+
+    func testBackfillEncodedSizeIsBoundedOnEgress() throws {
+        let range = try RuntimeBackfillRangeV1(after: .beforeFirst, through: .at(0))
+        let invalid = RuntimeBackfillChunkV1.catalog(range: range, deltas: [])
+        let invalidEnvelope = RuntimeEnvelopeV1(
+            version: runtimeProtocolVersionV1,
+            messageID: RuntimeMessageID(rawValue: "message-invalid-backfill"),
+            body: .reply(.backfill(invalid))
+        )
+        XCTAssertThrowsError(try RuntimeV1WireCodec.encode(invalidEnvelope))
+
+        let hugeID = RuntimeConversationID(
+            rawValue: String(repeating: "x", count: 64 * 1024 * 1024)
+        )
+        let delta = try JSONDecoder().decode(
+            RuntimeCatalogDeltaV1.self,
+            from: JSONSerialization.data(withJSONObject: [
+                "catalogRevision": 0,
+                "changes": [
+                    ["kind": "removed", "conversation_id": hugeID.rawValue],
+                ],
+            ])
+        )
+        let chunk = RuntimeBackfillChunkV1.catalog(
+            range: range,
+            deltas: [delta]
+        )
+        XCTAssertThrowsError(try JSONEncoder().encode(chunk))
     }
 
     func testRuntimeCoreContractRejectsLegacyAmbiguousCancelAndReceiptSelectors() throws {
@@ -190,12 +519,12 @@ final class RuntimeV1ProtocolTests: XCTestCase {
         )
     }
 
-    func testStreamSyncCompleteRejectsInjectedReplyContextTag() throws {
+    func testSyncCompleteIsReplyOnlyAndRejectsInjectedStreamContextTag() throws {
         let fixtures = try loadRawFixtureObjects()
-        var value = try fixtureValue(named: "streamSyncComplete", in: fixtures)
+        var value = try fixtureValue(named: "replySyncComplete", in: fixtures)
         var body = try XCTUnwrap(value["body"] as? [String: Any])
         var payload = try XCTUnwrap(body["payload"] as? [String: Any])
-        payload["reply"] = "syncComplete"
+        payload["stream"] = "syncComplete"
         body["payload"] = payload
         value["body"] = body
 
@@ -294,6 +623,14 @@ final class RuntimeV1ProtocolTests: XCTestCase {
                 encoded = try RuntimeV1WireCodec.encode(
                     RuntimeV1WireCodec.decodeTransferEnvelope(fixture.value)
                 )
+            case "runtimeTransferCarrierV1":
+                let hex = try JSONDecoder().decode(String.self, from: fixture.value)
+                let bytes = try XCTUnwrap(Data(hexString: hex))
+                encoded = try RuntimeV1WireCodec.encode(
+                    RuntimeV1WireCodec.decodeTransferCarrier(bytes)
+                )
+                XCTAssertEqual(encoded, bytes, "Rust/Swift compact carrier drift for \(fixture.name)")
+                continue
             default:
                 return XCTFail("unknown fixture wire type \(fixture.wireType)")
             }
@@ -327,6 +664,7 @@ final class RuntimeV1ProtocolTests: XCTestCase {
             }),
             [
                 "hello", "catalog", "subscribe", "start", "sendPrompt",
+                "unsubscribe", "backfill",
                 "resolveApproval", "retryApproval", "cancelQueued", "cancelActive",
                 "queryReceipt",
                 "createPairInvite", "listPendingPairings", "confirmPairing",
@@ -340,14 +678,14 @@ final class RuntimeV1ProtocolTests: XCTestCase {
             [
                 "hello", "command", "commandStatus", "conversationStart", "cancellation", "approval",
                 "revocation", "catalog", "snapshot", "backfill", "syncComplete",
-                "pairInvite", "pendingPairings", "failure",
+                "subscription", "transferPart", "pairInvite", "pendingPairings", "failure",
             ]
         )
         XCTAssertEqual(
             Set(payloads.compactMap { body in
                 (body["payload"] as? [String: Any])?["stream"] as? String
             }),
-            ["event", "catalogDelta", "syncComplete"]
+            ["event", "catalogDelta", "transferPart"]
         )
     }
 
@@ -505,7 +843,8 @@ final class RuntimeV1ProtocolTests: XCTestCase {
         var maximums = source
         maximums["partIndex"] = Int(TransferEnvelopeV1.maxPartCount - 1)
         maximums["partCount"] = Int(TransferEnvelopeV1.maxPartCount)
-        maximums["totalBytes"] = Int(TransferEnvelopeV1.maxTotalBytes)
+        maximums["totalBytes"] = Int(TransferEnvelopeV1.maxPartCount)
+            * TransferEnvelopeV1.maxJSONPartBytes
         XCTAssertNoThrow(
             try RuntimeV1WireCodec.decodeTransferEnvelope(
                 JSONSerialization.data(withJSONObject: maximums)
@@ -515,6 +854,7 @@ final class RuntimeV1ProtocolTests: XCTestCase {
         var maximumPart = source
         maximumPart["part"] = Data(repeating: 0xA5, count: TransferEnvelopeV1.maxPartBytes)
             .base64EncodedString()
+        maximumPart["totalBytes"] = TransferEnvelopeV1.maxPartBytes
         XCTAssertNoThrow(
             try RuntimeV1WireCodec.decodeTransferEnvelope(
                 JSONSerialization.data(withJSONObject: maximumPart)
@@ -551,16 +891,15 @@ final class RuntimeV1ProtocolTests: XCTestCase {
         let envelope = try RuntimeV1WireCodec.decodeEnvelope(stable.value)
         XCTAssertEqual(envelope.messageID.rawValue, "message-stable-1")
         guard case let .stream(.event(event)) = envelope.body,
-              case let .turnStarted(turnID, commandID) = event.body
+              case .item(.userMessage) = event.body
         else {
-            return XCTFail("stableIds must be a typed turnStarted stream event")
+            return XCTFail("stableIds must be a typed user-message stream event")
         }
         XCTAssertEqual(event.conversationID.rawValue, "conversation-stable-1")
         XCTAssertEqual(event.eventID.rawValue, "event-stable-1")
         XCTAssertEqual(event.itemID?.rawValue, "item-stable-1")
         XCTAssertEqual(event.entityID?.rawValue, "entity-stable-1")
-        XCTAssertEqual(turnID.rawValue, "turn-stable-1")
-        XCTAssertEqual(commandID.rawValue, "command-stable-1")
+        XCTAssertEqual(event.commandID?.rawValue, "command-stable-1")
 
         let snapshotFixture = try XCTUnwrap(
             fixtures.first { $0.name == "capabilitiesFirstSnapshot" }
@@ -758,7 +1097,8 @@ final class RuntimeV1ProtocolTests: XCTestCase {
                 name: try XCTUnwrap(object["case"] as? String),
                 wireType: try XCTUnwrap(object["wireType"] as? String),
                 value: try JSONSerialization.data(
-                    withJSONObject: XCTUnwrap(object["value"])
+                    withJSONObject: XCTUnwrap(object["value"]),
+                    options: [.fragmentsAllowed]
                 )
             )
         }
@@ -792,5 +1132,21 @@ final class RuntimeV1ProtocolTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
+    }
+}
+
+private extension Data {
+    init?(hexString: String) {
+        guard hexString.count.isMultiple(of: 2) else { return nil }
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(hexString.count / 2)
+        var index = hexString.startIndex
+        while index < hexString.endIndex {
+            let next = hexString.index(index, offsetBy: 2)
+            guard let byte = UInt8(hexString[index..<next], radix: 16) else { return nil }
+            bytes.append(byte)
+            index = next
+        }
+        self = Data(bytes)
     }
 }

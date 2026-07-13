@@ -1,16 +1,19 @@
-//! Runtime v1 订阅、cursor、snapshot barrier（design §9.1 / §9.2 / RC-16）。
+//! Runtime v1 订阅、cursor、snapshot barrier 与定向 backfill。
 
 use crate::capabilities::SessionCapabilities;
-use crate::runtime::identity::{ConversationId, ItemId, StreamGeneration};
+use crate::runtime::catalog::CatalogDelta;
+use crate::runtime::event::RuntimeEvent;
+use crate::runtime::identity::{CommandId, ConversationId, EntityId, ItemId, StreamGeneration};
 use crate::trunk::AgentItem;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// 两层 sequence 的外层订阅 cursor（design §9.1）。
-///
-/// 统一使用 `BeforeFirst | At(u64)`，**绝不把 SQLite `-1` 编进 unsigned wire**：
-/// `Subscribe(BeforeFirst)` 表示从 frame 0 开始。wire 表示：
-/// `BeforeFirst → "beforeFirst"`，`At(n) → { "at": n }`。
+/// 单个 backfill reply 最多包含 512 条 canonical entry。
+pub const MAX_BACKFILL_ENTRIES: usize = 512;
+/// 单个 backfill wire payload 最大 64 MiB。
+pub const MAX_BACKFILL_BYTES: usize = 64 * 1024 * 1024;
+
+/// zero-based stream/canonical sequence cursor。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum StreamCursor {
@@ -18,47 +21,252 @@ pub enum StreamCursor {
     At(u64),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum StreamCursorError {
+    #[error("stream cursor is exhausted")]
+    Exhausted,
+}
+
 impl StreamCursor {
-    /// 下一帧的 streamSeq：`next(BeforeFirst)=0`、`next(At(n))=n+1`（design §9.1）。
-    ///
-    /// 注意：streamSeq 接近 `u64::MAX` 时上层必须以新随机 route/generation 建 stream
-    /// 并做 signed barrier，禁止整数 wrap；本 helper 只承载正常推进语义。
-    pub fn next(&self) -> u64 {
+    /// `BeforeFirst -> 0`、`At(n) -> n+1`；到 `u64::MAX` 时 typed fail，不 wrap。
+    pub fn checked_next(self) -> Result<u64, StreamCursorError> {
         match self {
-            StreamCursor::BeforeFirst => 0,
-            StreamCursor::At(n) => n + 1,
+            StreamCursor::BeforeFirst => Ok(0),
+            StreamCursor::At(value) => value.checked_add(1).ok_or(StreamCursorError::Exhausted),
+        }
+    }
+
+    /// 兼容旧调用名；语义改为 checked。
+    pub fn next(self) -> Result<u64, StreamCursorError> {
+        self.checked_next()
+    }
+
+    pub fn from_high_water(value: Option<u64>) -> Self {
+        value.map_or(StreamCursor::BeforeFirst, StreamCursor::At)
+    }
+
+    pub fn high_water(self) -> Option<u64> {
+        match self {
+            StreamCursor::BeforeFirst => None,
+            StreamCursor::At(value) => Some(value),
         }
     }
 }
 
-/// 首次订阅/backfill 完成 barrier（design §9.2）。
+/// Runtime 内层 canonical cursor；tag 阻止 catalog/event 混用。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "scope", rename_all = "camelCase", deny_unknown_fields)]
+pub enum RuntimeInnerCursor {
+    Catalog {
+        cursor: StreamCursor,
+    },
+    Conversation {
+        #[serde(rename = "conversationId")]
+        conversation_id: ConversationId,
+        cursor: StreamCursor,
+    },
+}
+
+/// Unsubscribe 的显式目标；不携带无意义 cursor。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "scope", rename_all = "camelCase", deny_unknown_fields)]
+pub enum RuntimeSubscriptionTarget {
+    Catalog,
+    Conversation {
+        #[serde(rename = "conversationId")]
+        conversation_id: ConversationId,
+    },
+}
+
+/// Subscribe/Unsubscribe typed receipt。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "camelCase", deny_unknown_fields)]
+pub enum SubscriptionReceipt {
+    Subscribed {
+        #[serde(rename = "streamGeneration")]
+        stream_generation: StreamGeneration,
+    },
+    Unsubscribed,
+}
+
+/// 首次订阅/backfill 完成的设备定向 barrier。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RuntimeSyncComplete {
     pub stream_generation: StreamGeneration,
     pub stream_cursor: StreamCursor,
-    pub event_seq: u64,
+    pub inner_cursor: RuntimeInnerCursor,
     pub key_directory_revision: u64,
 }
 
-/// snapshot barrier 内的一项：capabilities 或 agent item。
-///
-/// 未派生 `PartialEq`：内嵌的中立 trunk 类型（`SessionCapabilities`/`AgentItem`）
-/// 本身未派生 `PartialEq`，本 task 不改动 trunk；契约测试以 wire round-trip 覆盖。
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// snapshot barrier 内的一项。
+#[derive(Debug, Clone, JsonSchema)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum SnapshotItem {
-    Capabilities { capabilities: SessionCapabilities },
-    Item { item_id: ItemId, item: AgentItem },
+    Capabilities {
+        #[serde(rename = "commandId")]
+        command_id: (),
+        #[serde(rename = "itemId")]
+        item_id: (),
+        #[serde(rename = "entityId")]
+        entity_id: (),
+        capabilities: SessionCapabilities,
+    },
+    Item {
+        #[serde(rename = "itemId")]
+        item_id: ItemId,
+        #[serde(rename = "entityId")]
+        entity_id: EntityId,
+        #[serde(
+            rename = "commandId",
+            deserialize_with = "deserialize_required_optional_command_id"
+        )]
+        #[schemars(with = "crate::runtime::schema::RequiredNullable<CommandId>")]
+        command_id: Option<CommandId>,
+        item: AgentItem,
+    },
 }
 
-impl SnapshotItem {
-    fn is_capabilities(&self) -> bool {
-        matches!(self, SnapshotItem::Capabilities { .. })
+impl Serialize for SnapshotItem {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        #[derive(Serialize)]
+        #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+        enum Wire<'a> {
+            Capabilities {
+                #[serde(rename = "commandId")]
+                command_id: (),
+                #[serde(rename = "itemId")]
+                item_id: (),
+                #[serde(rename = "entityId")]
+                entity_id: (),
+                capabilities: &'a SessionCapabilities,
+            },
+            Item {
+                #[serde(rename = "itemId")]
+                item_id: &'a ItemId,
+                #[serde(rename = "entityId")]
+                entity_id: &'a EntityId,
+                #[serde(rename = "commandId")]
+                command_id: &'a Option<CommandId>,
+                item: &'a AgentItem,
+            },
+        }
+        match self {
+            Self::Capabilities { capabilities, .. } => Wire::Capabilities {
+                command_id: (),
+                item_id: (),
+                entity_id: (),
+                capabilities,
+            }
+            .serialize(serializer),
+            Self::Item {
+                item_id,
+                entity_id,
+                command_id,
+                item,
+            } => Wire::Item {
+                item_id,
+                entity_id,
+                command_id,
+                item,
+            }
+            .serialize(serializer),
+        }
     }
 }
 
-/// snapshot 构造/wire 校验失败（RC-16 能力先行不变量）。
+impl<'de> Deserialize<'de> for SnapshotItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+        enum Wire {
+            Capabilities {
+                #[serde(rename = "commandId")]
+                command_id: (),
+                #[serde(rename = "itemId")]
+                item_id: (),
+                #[serde(rename = "entityId")]
+                entity_id: (),
+                capabilities: SessionCapabilities,
+            },
+            Item {
+                #[serde(rename = "itemId")]
+                item_id: ItemId,
+                #[serde(rename = "entityId")]
+                entity_id: EntityId,
+                #[serde(
+                    rename = "commandId",
+                    deserialize_with = "deserialize_required_optional_command_id"
+                )]
+                command_id: Option<CommandId>,
+                item: AgentItem,
+            },
+        }
+        match Wire::deserialize(deserializer)? {
+            Wire::Capabilities {
+                command_id,
+                item_id,
+                entity_id,
+                capabilities,
+            } => Ok(Self::Capabilities {
+                command_id,
+                item_id,
+                entity_id,
+                capabilities,
+            }),
+            Wire::Item {
+                item_id,
+                entity_id,
+                command_id,
+                item,
+            } => {
+                let value = Self::Item {
+                    item_id,
+                    entity_id,
+                    command_id,
+                    item,
+                };
+                value.validate().map_err(serde::de::Error::custom)?;
+                Ok(value)
+            }
+        }
+    }
+}
+
+impl SnapshotItem {
+    pub fn capabilities(capabilities: SessionCapabilities) -> Self {
+        Self::Capabilities {
+            command_id: (),
+            item_id: (),
+            entity_id: (),
+            capabilities,
+        }
+    }
+
+    fn is_capabilities(&self) -> bool {
+        matches!(self, SnapshotItem::Capabilities { .. })
+    }
+
+    fn validate(&self) -> Result<(), SnapshotError> {
+        match self {
+            SnapshotItem::Capabilities { .. } => Ok(()),
+            SnapshotItem::Item {
+                command_id, item, ..
+            } if matches!(item, AgentItem::UserMessage { .. }) && command_id.is_none() => {
+                Err(SnapshotError::InvalidIdentity)
+            }
+            SnapshotItem::Item { .. } => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SnapshotError {
     #[error("snapshot must contain SessionCapabilities")]
@@ -67,31 +275,29 @@ pub enum SnapshotError {
     CapabilitiesNotFirst,
     #[error("snapshot must contain SessionCapabilities exactly once")]
     DuplicateCapabilities,
+    #[error("snapshot item identity matrix is invalid")]
+    InvalidIdentity,
 }
 
-/// 首次订阅 canonical snapshot（design §9.2）。
-///
-/// RC-16：snapshot 必须先交付 `SessionCapabilities`，再交付任何 `AgentItem`。
-/// `new()` 与 wire 反序列化都强制该不变量（空 conversation 也必须先带 capabilities）。
+/// 首次订阅 canonical snapshot。空 high-water 必须是 `BeforeFirst`。
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConversationSnapshot {
     pub conversation_id: ConversationId,
-    pub base_event_seq: u64,
+    pub base_event_cursor: StreamCursor,
     items: Vec<SnapshotItem>,
 }
 
 impl ConversationSnapshot {
-    /// 构造并校验 capabilities-before-items 不变量。
     pub fn new(
         conversation_id: ConversationId,
-        base_event_seq: u64,
+        base_event_cursor: StreamCursor,
         items: Vec<SnapshotItem>,
     ) -> Result<Self, SnapshotError> {
         Self::validate_items(&items)?;
         Ok(Self {
             conversation_id,
-            base_event_seq,
+            base_event_cursor,
             items,
         })
     }
@@ -101,16 +307,18 @@ impl ConversationSnapshot {
     }
 
     fn validate_items(items: &[SnapshotItem]) -> Result<(), SnapshotError> {
+        for item in items {
+            item.validate()?;
+        }
         let first = items.first().ok_or(SnapshotError::CapabilitiesMissing)?;
         if !first.is_capabilities() {
-            // 缺失还是不在首位：若完全没有 capabilities 报 missing，否则报 not-first。
-            if items.iter().any(SnapshotItem::is_capabilities) {
-                return Err(SnapshotError::CapabilitiesNotFirst);
-            }
-            return Err(SnapshotError::CapabilitiesMissing);
+            return if items.iter().any(SnapshotItem::is_capabilities) {
+                Err(SnapshotError::CapabilitiesNotFirst)
+            } else {
+                Err(SnapshotError::CapabilitiesMissing)
+            };
         }
-        let extra = items.iter().skip(1).filter(|i| i.is_capabilities()).count();
-        if extra > 0 {
+        if items.iter().skip(1).any(SnapshotItem::is_capabilities) {
             return Err(SnapshotError::DuplicateCapabilities);
         }
         Ok(())
@@ -126,19 +334,284 @@ impl<'de> Deserialize<'de> for ConversationSnapshot {
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct Wire {
             conversation_id: ConversationId,
-            base_event_seq: u64,
+            base_event_cursor: StreamCursor,
             items: Vec<SnapshotItem>,
         }
-        let w = Wire::deserialize(deserializer)?;
-        ConversationSnapshot::new(w.conversation_id, w.base_event_seq, w.items)
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(wire.conversation_id, wire.base_event_cursor, wire.items)
             .map_err(serde::de::Error::custom)
     }
 }
 
-/// backfill 批次（design §9.4）：daemon journal 有完整区间时定向下发缺失事件。
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// 客户端 inner HWM 后的定向 backfill 请求。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "scope", rename_all = "camelCase", deny_unknown_fields)]
+pub enum BackfillRequest {
+    Catalog {
+        after: StreamCursor,
+    },
+    Conversation {
+        #[serde(rename = "conversationId")]
+        conversation_id: ConversationId,
+        after: StreamCursor,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BackfillError {
+    #[error("backfill range must be non-empty and increasing")]
+    InvalidRange,
+    #[error("backfill chunk entries are not contiguous or scoped")]
+    InvalidEntries,
+    #[error("backfill chunk exceeds 512 entries or 64 MiB")]
+    TooLarge,
+}
+
+/// `after` exclusive、`through` inclusive 的非空连续范围。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct BackfillChunk {
-    pub conversation_id: ConversationId,
-    pub events: Vec<crate::runtime::event::RuntimeEvent>,
+pub struct BackfillRange {
+    after: StreamCursor,
+    through: StreamCursor,
+}
+
+impl BackfillRange {
+    pub fn new(after: StreamCursor, through: StreamCursor) -> Result<Self, BackfillError> {
+        let first = after
+            .checked_next()
+            .map_err(|_| BackfillError::InvalidRange)?;
+        let Some(last) = through.high_water() else {
+            return Err(BackfillError::InvalidRange);
+        };
+        if first > last {
+            return Err(BackfillError::InvalidRange);
+        }
+        let count = last
+            .checked_sub(first)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(BackfillError::InvalidRange)?;
+        if count > MAX_BACKFILL_ENTRIES as u64 {
+            return Err(BackfillError::TooLarge);
+        }
+        Ok(Self { after, through })
+    }
+
+    pub fn after(self) -> StreamCursor {
+        self.after
+    }
+
+    pub fn through(self) -> StreamCursor {
+        self.through
+    }
+
+    fn expected_len(self) -> Result<usize, BackfillError> {
+        let first = self
+            .after
+            .checked_next()
+            .map_err(|_| BackfillError::InvalidRange)?;
+        let last = self
+            .through
+            .high_water()
+            .ok_or(BackfillError::InvalidRange)?;
+        usize::try_from(last - first + 1).map_err(|_| BackfillError::TooLarge)
+    }
+}
+
+impl<'de> Deserialize<'de> for BackfillRange {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            after: StreamCursor,
+            through: StreamCursor,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(wire.after, wire.through).map_err(serde::de::Error::custom)
+    }
+}
+
+/// 定向 backfill chunk；conversation variant 的 capabilities 在 events 前应用。
+#[derive(Debug, Clone, JsonSchema)]
+#[serde(tag = "scope", rename_all = "camelCase", deny_unknown_fields)]
+pub enum BackfillChunk {
+    Catalog {
+        range: BackfillRange,
+        deltas: Vec<CatalogDelta>,
+    },
+    Conversation {
+        #[serde(rename = "conversationId")]
+        conversation_id: ConversationId,
+        #[serde(rename = "capabilitiesPreamble")]
+        capabilities_preamble: SessionCapabilities,
+        range: BackfillRange,
+        events: Vec<RuntimeEvent>,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "scope", rename_all = "camelCase", deny_unknown_fields)]
+enum BackfillChunkWire<'a> {
+    Catalog {
+        range: &'a BackfillRange,
+        deltas: &'a [CatalogDelta],
+    },
+    Conversation {
+        #[serde(rename = "conversationId")]
+        conversation_id: &'a ConversationId,
+        #[serde(rename = "capabilitiesPreamble")]
+        capabilities_preamble: &'a SessionCapabilities,
+        range: &'a BackfillRange,
+        events: &'a [RuntimeEvent],
+    },
+}
+
+impl BackfillChunk {
+    pub fn catalog(range: BackfillRange, deltas: Vec<CatalogDelta>) -> Result<Self, BackfillError> {
+        let chunk = Self::Catalog { range, deltas };
+        chunk.validate()?;
+        Ok(chunk)
+    }
+
+    pub fn conversation(
+        conversation_id: ConversationId,
+        capabilities_preamble: SessionCapabilities,
+        range: BackfillRange,
+        events: Vec<RuntimeEvent>,
+    ) -> Result<Self, BackfillError> {
+        let chunk = Self::Conversation {
+            conversation_id,
+            capabilities_preamble,
+            range,
+            events,
+        };
+        chunk.validate()?;
+        Ok(chunk)
+    }
+
+    fn wire(&self) -> BackfillChunkWire<'_> {
+        match self {
+            Self::Catalog { range, deltas } => BackfillChunkWire::Catalog { range, deltas },
+            Self::Conversation {
+                conversation_id,
+                capabilities_preamble,
+                range,
+                events,
+            } => BackfillChunkWire::Conversation {
+                conversation_id,
+                capabilities_preamble,
+                range,
+                events,
+            },
+        }
+    }
+
+    fn validate(&self) -> Result<(), BackfillError> {
+        match self {
+            BackfillChunk::Catalog { range, deltas } => {
+                if deltas.len() != range.expected_len()? || deltas.is_empty() {
+                    return Err(BackfillError::InvalidEntries);
+                }
+                let mut expected = range
+                    .after()
+                    .checked_next()
+                    .map_err(|_| BackfillError::InvalidRange)?;
+                for delta in deltas {
+                    if delta.catalog_revision != expected {
+                        return Err(BackfillError::InvalidEntries);
+                    }
+                    expected = expected.checked_add(1).unwrap_or(expected);
+                }
+            }
+            BackfillChunk::Conversation {
+                conversation_id,
+                range,
+                events,
+                ..
+            } => {
+                if events.len() != range.expected_len()? || events.is_empty() {
+                    return Err(BackfillError::InvalidEntries);
+                }
+                let mut expected = range
+                    .after()
+                    .checked_next()
+                    .map_err(|_| BackfillError::InvalidRange)?;
+                for event in events {
+                    if &event.conversation_id != conversation_id || event.event_seq != expected {
+                        return Err(BackfillError::InvalidEntries);
+                    }
+                    event
+                        .validate()
+                        .map_err(|_| BackfillError::InvalidEntries)?;
+                    expected = expected.checked_add(1).unwrap_or(expected);
+                }
+            }
+        }
+        let encoded = serde_json::to_vec(&self.wire()).map_err(|_| BackfillError::TooLarge)?;
+        if encoded.len() > MAX_BACKFILL_BYTES {
+            return Err(BackfillError::TooLarge);
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for BackfillChunk {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        self.wire().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for BackfillChunk {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "scope", rename_all = "camelCase", deny_unknown_fields)]
+        enum Wire {
+            Catalog {
+                range: BackfillRange,
+                deltas: Vec<CatalogDelta>,
+            },
+            Conversation {
+                #[serde(rename = "conversationId")]
+                conversation_id: ConversationId,
+                #[serde(rename = "capabilitiesPreamble")]
+                capabilities_preamble: SessionCapabilities,
+                range: BackfillRange,
+                events: Vec<RuntimeEvent>,
+            },
+        }
+        let chunk = match Wire::deserialize(deserializer)? {
+            Wire::Catalog { range, deltas } => Self::Catalog { range, deltas },
+            Wire::Conversation {
+                conversation_id,
+                capabilities_preamble,
+                range,
+                events,
+            } => Self::Conversation {
+                conversation_id,
+                capabilities_preamble,
+                range,
+                events,
+            },
+        };
+        chunk.validate().map_err(serde::de::Error::custom)?;
+        Ok(chunk)
+    }
+}
+
+fn deserialize_required_optional_command_id<'de, D>(
+    deserializer: D,
+) -> Result<Option<CommandId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<CommandId>::deserialize(deserializer)
 }

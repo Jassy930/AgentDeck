@@ -24,6 +24,7 @@ use super::cipher::{RowAad, RuntimeKeyBundle};
 use super::identity::{
     MAX_RUNTIME_ID_COLLISION_ATTEMPTS, RuntimeId, RuntimeIdError, RuntimeIdKind,
 };
+use super::persisted_event::{PersistedRuntimeEvent, decode_persisted_runtime_event};
 use super::schema::{RUNTIME_CRYPTO_CONTEXT_VERSION, RUNTIME_SCHEMA_FAMILY};
 use super::sequence::{AllocatedSequence, SequenceScope, decode_sequence, next_sequence};
 use super::sqlite::{self, RuntimeLedger, RuntimeSqlite, SafetyReserveProjection};
@@ -243,6 +244,7 @@ pub(crate) fn register_approval(
         input.conversation_id,
         event_id,
         event_seq.value,
+        input.command_id,
         input.turn_id,
         approval_id,
         &input.request,
@@ -625,6 +627,7 @@ pub(crate) fn claim_approval(
         approval.conversation_id,
         event_id,
         event_seq.value,
+        approval.command_id,
         approval.turn_id,
         approval.approval_id,
         input.decision.decision,
@@ -1741,6 +1744,7 @@ fn apply_approval_transition_in_transaction(
         approval.conversation_id,
         event_id,
         event_seq.value,
+        approval.command_id,
         approval.turn_id,
         approval.approval_id,
         decision,
@@ -2117,17 +2121,10 @@ fn validate_approval_conversation(
         let event_id = runtime_id(RuntimeIdKind::Event, row?)?;
         let event = load_event(connection, key_bundle, database_id, event_id)
             .map_err(map_integrity_error)?;
-        let Ok(decoded) = serde_json::from_slice::<RuntimeEvent>(&event.payload) else {
-            continue;
+        let decoded = match decode_persisted_runtime_event(&event)? {
+            PersistedRuntimeEvent::Canonical(decoded) => decoded,
+            PersistedRuntimeEvent::NonCanonical => continue,
         };
-        if serde_json::to_vec(&decoded).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
-            != event.payload
-            || decoded.conversation_id.as_str() != event.conversation_id.to_canonical_string()
-            || decoded.event_id.as_str() != event.event_id.to_canonical_string()
-            || decoded.event_seq != event.event_seq
-        {
-            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
-        }
         let (approval_index, turn_id, kind) = match decoded.body {
             RuntimeEventBody::ActionRequest {
                 turn_id,
@@ -2516,6 +2513,7 @@ fn canonical_action_request_event(
     conversation_id: RuntimeId,
     event_id: RuntimeId,
     event_seq: u64,
+    command_id: RuntimeId,
     turn_id: RuntimeId,
     approval_id: RuntimeId,
     request: &ActionRequest,
@@ -2524,6 +2522,9 @@ fn canonical_action_request_event(
         conversation_id: ConversationId::new(conversation_id.to_canonical_string()),
         event_id: EventId::new(event_id.to_canonical_string()),
         event_seq,
+        command_id: Some(agentdeck_protocol::runtime::identity::CommandId::new(
+            command_id.to_canonical_string(),
+        )),
         item_id: None,
         entity_id: None,
         body: RuntimeEventBody::ActionRequest {
@@ -2541,6 +2542,7 @@ fn canonical_claimed_event(
     conversation_id: RuntimeId,
     event_id: RuntimeId,
     event_seq: u64,
+    command_id: RuntimeId,
     turn_id: RuntimeId,
     approval_id: RuntimeId,
     decision: agentdeck_protocol::ActionDecisionKind,
@@ -2549,6 +2551,7 @@ fn canonical_claimed_event(
         conversation_id,
         event_id,
         event_seq,
+        command_id,
         turn_id,
         approval_id,
         Some(decision),
@@ -2561,6 +2564,7 @@ fn canonical_resolved_event(
     conversation_id: RuntimeId,
     event_id: RuntimeId,
     event_seq: u64,
+    command_id: RuntimeId,
     turn_id: RuntimeId,
     approval_id: RuntimeId,
     decision: Option<agentdeck_protocol::ActionDecisionKind>,
@@ -2570,6 +2574,9 @@ fn canonical_resolved_event(
         conversation_id: ConversationId::new(conversation_id.to_canonical_string()),
         event_id: EventId::new(event_id.to_canonical_string()),
         event_seq,
+        command_id: Some(agentdeck_protocol::runtime::identity::CommandId::new(
+            command_id.to_canonical_string(),
+        )),
         item_id: None,
         entity_id: None,
         body: RuntimeEventBody::ApprovalResolved {
@@ -3864,6 +3871,9 @@ mod tests {
             conversation_id: ConversationId::new(conversation_id.to_canonical_string()),
             event_id: EventId::new(event_id.to_canonical_string()),
             event_seq,
+            command_id: Some(agentdeck_protocol::runtime::identity::CommandId::new(
+                command_id.to_canonical_string(),
+            )),
             item_id: None,
             entity_id: None,
             body: RuntimeEventBody::ActionRequest {

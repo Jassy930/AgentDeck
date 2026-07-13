@@ -4,6 +4,38 @@ import XCTest
 @testable import AgentDeckRelayClient
 
 final class RelayCryptoVectorTests: XCTestCase {
+    func testSealedPayloadInnerCodecRejectsMalformedCorpus() throws {
+        let valid = try RelayCrypto.encodeSealedPayload(
+            RelaySealedPayloadV1(
+                formatVersion: 1,
+                payloadKind: .transferPart,
+                payload: Data([0xCA, 0xFE])
+            )
+        )
+        XCTAssertEqual(try RelayCrypto.decodeSealedPayload(valid).payloadKind, .transferPart)
+
+        var badMagic = valid
+        badMagic[0] ^= 0xFF
+        var badVersion = valid
+        badVersion[6] = 2
+        var badKind = valid
+        badKind[7] = 0xFF
+        var declaredShort = valid
+        declaredShort[11] = 1
+        var declaredLong = valid
+        declaredLong[11] = 3
+        var trailing = valid
+        trailing.append(0)
+
+        for malformed in [
+            Data(), badMagic, badVersion, badKind, declaredShort, declaredLong, trailing,
+        ] {
+            XCTAssertThrowsError(try RelayCrypto.decodeSealedPayload(malformed)) { error in
+                XCTAssertEqual(error as? RelayCryptoError, .badCiphertext)
+            }
+        }
+    }
+
     func testCanonicalTBSAADAndSHA256MatchSharedVectors() throws {
         let vectors = try loadVectors()
         let tbsVector = try section("tbs_canonical", in: vectors)
@@ -77,10 +109,13 @@ final class RelayCryptoVectorTests: XCTestCase {
             context: sampleOuterContext()
         )
         let receivingKey = try sampleReceivingKey(rawKey: data("keyHex", in: aead))
-        XCTAssertEqual(
-            try RelayCrypto.openSymmetric(verified, key: receivingKey, context: sampleOuterContext()),
-            try data("plaintextHex", in: aead)
+        let opened = try RelayCrypto.openSealedPayload(
+            verified,
+            key: receivingKey,
+            context: sampleOuterContext()
         )
+        XCTAssertEqual(opened.payloadKind, .conversationEvent)
+        XCTAssertEqual(opened.payload, try data("plaintextHex", in: aead))
 
         let swiftSigned = try RelayCrypto.signSealed(
             unsigned,
@@ -124,7 +159,6 @@ final class RelayCryptoVectorTests: XCTestCase {
         badCiphertext[0] ^= 1
         let selfConsistentTamper = UnsignedSealedBlobV1(
             formatVersion: unsigned.formatVersion,
-            payloadKind: unsigned.payloadKind,
             keyID: unsigned.keyID,
             keyEpoch: unsigned.keyEpoch,
             keyDirectoryRevision: unsigned.keyDirectoryRevision,

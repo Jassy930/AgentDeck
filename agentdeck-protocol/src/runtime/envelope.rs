@@ -13,25 +13,32 @@ use crate::runtime::receipt::{
     ApprovalReceipt, CancellationReceipt, CommandReceipt, CommandStatusReceipt,
     ConversationStartReceipt, RevocationReceipt,
 };
-use crate::runtime::sync::{BackfillChunk, ConversationSnapshot, RuntimeSyncComplete};
+use crate::runtime::sync::{
+    BackfillChunk, ConversationSnapshot, RuntimeSyncComplete, SubscriptionReceipt,
+};
+use crate::runtime::transfer::TransferEnvelope;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// 解密后单个 `RuntimeRequest` 的最大字节数（design §8.8：1 MiB）。
 pub const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024;
+/// Runtime JSONL/UDS 完整 frame hard cap。remote compact-binary 使用独立 4 MiB carrier 上限。
+pub const MAX_RUNTIME_JSON_FRAME_BYTES: usize = 1024 * 1024;
 
 /// 请求大小校验失败。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeSizeError {
     #[error("runtime request exceeds {MAX_RUNTIME_REQUEST_BYTES} bytes (1 MiB)")]
     TooLarge,
+    #[error("runtime JSON/UDS frame exceeds {MAX_RUNTIME_JSON_FRAME_BYTES} bytes (1 MiB)")]
+    FrameTooLarge,
     #[error("failed to encode runtime envelope: {0}")]
     Encode(String),
 }
 
 /// 校验一个已编码 `RuntimeRequest` 的字节数不超过 1 MiB（不 panic）。
 pub fn ensure_request_within_limit(encoded_len: usize) -> Result<(), RuntimeSizeError> {
-    if encoded_len > MAX_RUNTIME_REQUEST_BYTES {
+    if encoded_len >= MAX_RUNTIME_REQUEST_BYTES {
         return Err(RuntimeSizeError::TooLarge);
     }
     Ok(())
@@ -41,7 +48,7 @@ pub fn ensure_request_within_limit(encoded_len: usize) -> Result<(), RuntimeSize
 ///
 /// 未派生 `PartialEq`：`RuntimeMessage` 传递内嵌未派生 `PartialEq` 的中立 trunk 类型；
 /// 本 task 不改动 trunk，契约测试以 wire round-trip 覆盖。
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RuntimeEnvelope {
     pub version: u16,
@@ -50,12 +57,78 @@ pub struct RuntimeEnvelope {
 }
 
 impl RuntimeEnvelope {
+    fn validate_version(&self) -> Result<(), &'static str> {
+        if self.version == crate::runtime::RUNTIME_PROTOCOL_VERSION {
+            Ok(())
+        } else {
+            Err("unsupported Runtime protocol version")
+        }
+    }
+
     /// 序列化并校验大小；返回编码字节数或 typed error（design §8.8：超限拒绝，不 panic）。
     pub fn check_encoded_size(&self) -> Result<usize, RuntimeSizeError> {
+        Ok(self.to_json_bytes_checked()?.len())
+    }
+
+    /// Runtime JSON/UDS 唯一受检编码入口；daemon writer 必须消费这里返回的 exact bytes，
+    /// 不能先绕过 hard cap 自行 `serde_json::to_vec`。
+    pub fn to_json_bytes_checked(&self) -> Result<Vec<u8>, RuntimeSizeError> {
         let bytes =
             serde_json::to_vec(self).map_err(|e| RuntimeSizeError::Encode(e.to_string()))?;
-        ensure_request_within_limit(bytes.len())?;
-        Ok(bytes.len())
+        if matches!(&self.body, RuntimeMessage::Request(_)) {
+            ensure_request_within_limit(bytes.len())?;
+        }
+        if bytes.len() >= MAX_RUNTIME_JSON_FRAME_BYTES {
+            return Err(RuntimeSizeError::FrameTooLarge);
+        }
+        Ok(bytes)
+    }
+}
+
+impl Serialize for RuntimeEnvelope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.validate_version().map_err(serde::ser::Error::custom)?;
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire<'a> {
+            version: u16,
+            message_id: &'a MessageId,
+            body: &'a RuntimeMessage,
+        }
+        Wire {
+            version: self.version,
+            message_id: &self.message_id,
+            body: &self.body,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RuntimeEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            version: u16,
+            message_id: MessageId,
+            body: RuntimeMessage,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let envelope = Self {
+            version: wire.version,
+            message_id: wire.message_id,
+            body: wire.body,
+        };
+        envelope
+            .validate_version()
+            .map_err(serde::de::Error::custom)?;
+        Ok(envelope)
     }
 }
 
@@ -91,6 +164,8 @@ pub enum RuntimeReply {
     Approval(ApprovalReceipt),
     /// revoke 回执。
     Revocation(RevocationReceipt),
+    /// Subscribe/Unsubscribe typed 回执。
+    Subscription(SubscriptionReceipt),
     /// catalog snapshot（分页，每页 ≤ 500 rows）。
     Catalog(CatalogSnapshot),
     /// conversation snapshot（capabilities 先行）。
@@ -99,6 +174,8 @@ pub enum RuntimeReply {
     Backfill(BackfillChunk),
     /// 首次订阅/backfill 完成 barrier。
     SyncComplete(RuntimeSyncComplete),
+    /// 大 reply 的 compact-binary 分片模型；远程链路不使用 JSON base64 载荷。
+    TransferPart(TransferEnvelope),
     /// createPairInvite 回执 —— local-only administration。
     PairInvite(PairInvite),
     /// listPendingPairings 回执 —— local-only administration。
@@ -115,8 +192,8 @@ pub enum RuntimeStreamItem {
     Event(RuntimeEvent),
     /// catalog 增量。
     CatalogDelta(CatalogDelta),
-    /// 订阅 barrier 完成。
-    SyncComplete(RuntimeSyncComplete),
+    /// 大 live item 的 compact-binary 分片模型。
+    TransferPart(TransferEnvelope),
 }
 
 /// createPairInvite 回执中的邀请引用（不含 P1.1 不涉及的 crypto secret/relay 材料）。

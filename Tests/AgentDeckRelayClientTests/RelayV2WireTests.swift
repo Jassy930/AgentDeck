@@ -518,7 +518,7 @@ final class RelayV2WireTests: XCTestCase {
     func testEveryEndpointVariantDecodesStrictlyAndReencodesSemantically() throws {
         let vectors = try loadRelayVectors()
         let endpoints = try XCTUnwrap(vectors["endpointTypes"] as? [[String: Any]])
-        XCTAssertEqual(endpoints.count, 8)
+        XCTAssertEqual(endpoints.count, 9)
         XCTAssertEqual(
             Set(endpoints.compactMap { $0["wireType"] as? String }),
             [
@@ -542,6 +542,42 @@ final class RelayV2WireTests: XCTestCase {
                 "Rust/Swift endpoint JSON drift for \(wireType.rawValue)"
             )
         }
+    }
+
+    func testEpochBarrierInnerCursorAndTransferPartKindMirrorRust() throws {
+        let endpoints = try XCTUnwrap(
+            try loadRelayVectors()["endpointTypes"] as? [[String: Any]]
+        )
+        let barrierVector = try XCTUnwrap(
+            endpoints.first { ($0["case"] as? String) == "epochBarrier" }
+        )
+        let barrierData = try JSONSerialization.data(
+            withJSONObject: XCTUnwrap(barrierVector["value"])
+        )
+        guard case let .epochBarrier(barrier) = try RelayV2JSONCodec.decodeEndpoint(
+            .epochBarrier,
+            from: barrierData
+        ),
+            case let .conversation(conversationID, .at(cursor)) = barrier.innerCursor
+        else {
+            return XCTFail("EpochBarrier must carry a tagged conversation inner cursor")
+        }
+        XCTAssertEqual(conversationID, "conversation-epoch-barrier")
+        XCTAssertEqual(cursor, 41)
+
+        let transferVector = try XCTUnwrap(
+            endpoints.first { ($0["case"] as? String) == "sealedPayloadTransferPart" }
+        )
+        let transferData = try JSONSerialization.data(
+            withJSONObject: XCTUnwrap(transferVector["value"])
+        )
+        guard case let .sealedPayload(payload) = try RelayV2JSONCodec.decodeEndpoint(
+            .sealedPayload,
+            from: transferData
+        ) else {
+            return XCTFail("expected sealed payload endpoint")
+        }
+        XCTAssertEqual(payload.payloadKind, .transferPart)
     }
 
     func testRealJSONDecodeEntriesRejectUnknownFields() throws {
@@ -653,7 +689,6 @@ final class RelayV2WireTests: XCTestCase {
         let sealedVector = try XCTUnwrap(cryptoVectors["sealed_blob"] as? [String: Any])
         let unsigned = UnsignedSealedBlobV1(
             formatVersion: header.formatVersion,
-            payloadKind: header.payloadKind,
             keyID: KeyIDV1(purpose: .conversationDEK, epoch: 4),
             keyEpoch: 4,
             keyDirectoryRevision: 2,
@@ -701,7 +736,6 @@ final class RelayV2WireTests: XCTestCase {
         return SignedSealedBlobV1(
             inner: UnsignedSealedBlobV1(
                 formatVersion: 1,
-                payloadKind: .conversationEvent,
                 keyID: KeyIDV1(purpose: .conversationDEK, epoch: 4),
                 keyEpoch: 4,
                 keyDirectoryRevision: 2,

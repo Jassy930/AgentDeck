@@ -6,48 +6,98 @@
 //! `schema_matches_committed_snapshot`）。
 
 use crate::runtime::{catalog, command, envelope, event, receipt, sync, transfer};
-use schemars::schema_for;
+use schemars::{JsonSchema, r#gen::SchemaGenerator, schema::Schema, schema_for};
 use serde_json::json;
+use std::borrow::Cow;
+use std::marker::PhantomData;
+
+/// 只用于 schemars derive：wire key 必须存在，但其值允许是 `null`。
+///
+/// 直接在 `Option<T>` 上写 `#[schemars(required)]` 会调用 schemars 的
+/// non-optional schema，错误地把 `null` 从 schema 中删掉。这个 marker 对 derive
+/// 表现为非 Option（因此 key 进入 `required`），实际 property schema 则仍委托
+/// `Option<T>` 生成 nullable union。
+pub(crate) struct RequiredNullable<T>(PhantomData<T>);
+
+impl<T: JsonSchema> JsonSchema for RequiredNullable<T> {
+    fn is_referenceable() -> bool {
+        false
+    }
+
+    fn schema_name() -> String {
+        format!("RequiredNullable_{}", T::schema_name())
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Owned(format!("RequiredNullable<{}>", T::schema_id()))
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        <Option<T>>::json_schema(generator)
+    }
+}
 
 /// Runtime v1 所有公共 wire 类型的聚合 schema。
 pub fn runtime_schema() -> serde_json::Value {
+    let mut properties = serde_json::Map::new();
+    macro_rules! add {
+        ($name:literal, $ty:ty) => {
+            properties.insert(
+                $name.to_owned(),
+                serde_json::to_value(schema_for!($ty)).unwrap(),
+            );
+        };
+    }
+    add!("RuntimeEnvelope", envelope::RuntimeEnvelope);
+    add!("RuntimeMessage", envelope::RuntimeMessage);
+    add!("RuntimeRequest", command::RuntimeRequest);
+    add!("RuntimeReply", envelope::RuntimeReply);
+    add!("RuntimeStreamItem", envelope::RuntimeStreamItem);
+    add!("RuntimeEvent", event::RuntimeEvent);
+    add!("RuntimeEventBody", event::RuntimeEventBody);
+    add!("StreamCursor", sync::StreamCursor);
+    add!("RuntimeInnerCursor", sync::RuntimeInnerCursor);
+    add!("RuntimeSubscriptionTarget", sync::RuntimeSubscriptionTarget);
+    add!("SubscriptionReceipt", sync::SubscriptionReceipt);
+    add!("ConversationSnapshot", sync::ConversationSnapshot);
+    add!("SnapshotItem", sync::SnapshotItem);
+    add!("RuntimeSyncComplete", sync::RuntimeSyncComplete);
+    add!("BackfillChunk", sync::BackfillChunk);
+    add!("BackfillRequest", sync::BackfillRequest);
+    add!("BackfillRange", sync::BackfillRange);
+    add!("CatalogSnapshot", catalog::CatalogSnapshot);
+    add!("CatalogDelta", catalog::CatalogDelta);
+    add!("ConversationEntry", catalog::ConversationEntry);
+    add!("CommandReceipt", receipt::CommandReceipt);
+    add!("CommandStatus", receipt::CommandStatus);
+    add!("CommandStatusReceipt", receipt::CommandStatusReceipt);
+    add!(
+        "ConversationStartReceipt",
+        receipt::ConversationStartReceipt
+    );
+    add!("CancellationReceipt", receipt::CancellationReceipt);
+    add!("ApprovalReceipt", receipt::ApprovalReceipt);
+    add!("ApprovalDeliveryState", receipt::ApprovalDeliveryState);
+    add!("RevocationReceipt", receipt::RevocationReceipt);
+    add!("TransferEnvelope", transfer::TransferEnvelope);
+    add!("RuntimeTransferChannel", transfer::RuntimeTransferChannel);
+    add!("PromptPayload", command::PromptPayload);
+    add!("ConversationStart", command::ConversationStart);
+    add!("QueryReceiptSelector", command::QueryReceiptSelector);
+    add!("LocalOnlyAdministration", command::LocalOnlyAdministration);
+    add!("RuntimeFailure", crate::runtime::failure::RuntimeFailure);
+    add!("PairInvite", envelope::PairInvite);
+    add!("PendingPairing", envelope::PendingPairing);
+    add!(
+        "CatalogPageCursor",
+        crate::runtime::identity::CatalogPageCursor
+    );
+
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": format!("AgentDeck Runtime Protocol v{}", super::RUNTIME_PROTOCOL_VERSION),
         "type": "object",
-        "properties": {
-            "RuntimeEnvelope": serde_json::to_value(schema_for!(envelope::RuntimeEnvelope)).unwrap(),
-            "RuntimeMessage": serde_json::to_value(schema_for!(envelope::RuntimeMessage)).unwrap(),
-            "RuntimeRequest": serde_json::to_value(schema_for!(command::RuntimeRequest)).unwrap(),
-            "RuntimeReply": serde_json::to_value(schema_for!(envelope::RuntimeReply)).unwrap(),
-            "RuntimeStreamItem": serde_json::to_value(schema_for!(envelope::RuntimeStreamItem)).unwrap(),
-            "RuntimeEvent": serde_json::to_value(schema_for!(event::RuntimeEvent)).unwrap(),
-            "RuntimeEventBody": serde_json::to_value(schema_for!(event::RuntimeEventBody)).unwrap(),
-            "StreamCursor": serde_json::to_value(schema_for!(sync::StreamCursor)).unwrap(),
-            "ConversationSnapshot": serde_json::to_value(schema_for!(sync::ConversationSnapshot)).unwrap(),
-            "SnapshotItem": serde_json::to_value(schema_for!(sync::SnapshotItem)).unwrap(),
-            "RuntimeSyncComplete": serde_json::to_value(schema_for!(sync::RuntimeSyncComplete)).unwrap(),
-            "BackfillChunk": serde_json::to_value(schema_for!(sync::BackfillChunk)).unwrap(),
-            "CatalogSnapshot": serde_json::to_value(schema_for!(catalog::CatalogSnapshot)).unwrap(),
-            "CatalogDelta": serde_json::to_value(schema_for!(catalog::CatalogDelta)).unwrap(),
-            "ConversationEntry": serde_json::to_value(schema_for!(catalog::ConversationEntry)).unwrap(),
-            "CommandReceipt": serde_json::to_value(schema_for!(receipt::CommandReceipt)).unwrap(),
-            "CommandStatus": serde_json::to_value(schema_for!(receipt::CommandStatus)).unwrap(),
-            "CommandStatusReceipt": serde_json::to_value(schema_for!(receipt::CommandStatusReceipt)).unwrap(),
-            "ConversationStartReceipt": serde_json::to_value(schema_for!(receipt::ConversationStartReceipt)).unwrap(),
-            "CancellationReceipt": serde_json::to_value(schema_for!(receipt::CancellationReceipt)).unwrap(),
-            "ApprovalReceipt": serde_json::to_value(schema_for!(receipt::ApprovalReceipt)).unwrap(),
-            "ApprovalDeliveryState": serde_json::to_value(schema_for!(receipt::ApprovalDeliveryState)).unwrap(),
-            "RevocationReceipt": serde_json::to_value(schema_for!(receipt::RevocationReceipt)).unwrap(),
-            "TransferEnvelope": serde_json::to_value(schema_for!(transfer::TransferEnvelope)).unwrap(),
-            "PromptPayload": serde_json::to_value(schema_for!(command::PromptPayload)).unwrap(),
-            "ConversationStart": serde_json::to_value(schema_for!(command::ConversationStart)).unwrap(),
-            "QueryReceiptSelector": serde_json::to_value(schema_for!(command::QueryReceiptSelector)).unwrap(),
-            "LocalOnlyAdministration": serde_json::to_value(schema_for!(command::LocalOnlyAdministration)).unwrap(),
-            "RuntimeFailure": serde_json::to_value(schema_for!(crate::runtime::failure::RuntimeFailure)).unwrap(),
-            "PairInvite": serde_json::to_value(schema_for!(envelope::PairInvite)).unwrap(),
-            "PendingPairing": serde_json::to_value(schema_for!(envelope::PendingPairing)).unwrap(),
-        }
+        "properties": serde_json::Value::Object(properties)
     })
 }
 

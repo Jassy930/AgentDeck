@@ -582,7 +582,15 @@ pub struct EncodedRuntimeFrame {
 
 impl EncodedRuntimeFrame {
     pub fn from_envelope(envelope: &RuntimeEnvelope) -> Result<Self, ConnectionError> {
-        let bytes = serde_json::to_vec(envelope).map_err(|_| ConnectionError::Encode)?;
+        let bytes = envelope
+            .to_json_bytes_checked()
+            .map_err(|error| match error {
+                agentdeck_protocol::runtime::RuntimeSizeError::TooLarge
+                | agentdeck_protocol::runtime::RuntimeSizeError::FrameTooLarge => {
+                    ConnectionError::FrameTooLarge
+                }
+                agentdeck_protocol::runtime::RuntimeSizeError::Encode(_) => ConnectionError::Encode,
+            })?;
         Ok(Self {
             bytes: Arc::from(bytes),
         })
@@ -941,6 +949,8 @@ pub enum ConnectionError {
     WriterTaskFailed,
     #[error("runtime envelope encoding failed")]
     Encode,
+    #[error("runtime JSON/UDS frame exceeds its hard limit")]
+    FrameTooLarge,
 }
 
 #[cfg(test)]
@@ -948,9 +958,10 @@ mod tests {
     use super::*;
 
     use agentdeck_protocol::runtime::command::HelloParams;
-    use agentdeck_protocol::runtime::identity::MessageId;
+    use agentdeck_protocol::runtime::identity::{ConversationId, EventId, MessageId};
     use agentdeck_protocol::runtime::{
-        RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeMessage, RuntimeReply,
+        MAX_RUNTIME_JSON_FRAME_BYTES, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeEvent,
+        RuntimeEventBody, RuntimeFailure, RuntimeMessage, RuntimeReply, RuntimeStreamItem,
     };
 
     fn principal(seed: u8) -> AuthenticatedPrincipal {
@@ -978,6 +989,45 @@ mod tests {
             RuntimeMessage::Reply(RuntimeReply::Hello(HelloParams {
                 runtime_protocol_version: RUNTIME_PROTOCOL_VERSION
             }))
+        ));
+    }
+
+    #[test]
+    fn encoded_frame_rejects_oversized_reply_and_stream_before_writer_admission() {
+        let failure = || {
+            RuntimeFailure::new(
+                "daemon.test.oversized",
+                "x".repeat(MAX_RUNTIME_JSON_FRAME_BYTES),
+            )
+        };
+        let reply = RuntimeEnvelope {
+            version: RUNTIME_PROTOCOL_VERSION,
+            message_id: MessageId::new("message-oversized-reply"),
+            body: RuntimeMessage::Reply(RuntimeReply::Failure(failure())),
+        };
+        assert!(matches!(
+            EncodedRuntimeFrame::from_envelope(&reply),
+            Err(ConnectionError::FrameTooLarge)
+        ));
+
+        let event = RuntimeEvent::new(
+            ConversationId::new("conversation-oversized-stream"),
+            EventId::new("event-oversized-stream"),
+            0,
+            None,
+            None,
+            None,
+            RuntimeEventBody::Error { failure: failure() },
+        )
+        .unwrap();
+        let stream = RuntimeEnvelope {
+            version: RUNTIME_PROTOCOL_VERSION,
+            message_id: MessageId::new("message-oversized-stream"),
+            body: RuntimeMessage::Stream(RuntimeStreamItem::Event(event)),
+        };
+        assert!(matches!(
+            EncodedRuntimeFrame::from_envelope(&stream),
+            Err(ConnectionError::FrameTooLarge)
         ));
     }
 

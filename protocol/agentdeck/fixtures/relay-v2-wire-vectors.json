@@ -127,7 +127,13 @@
     {
       "case": "epochBarrier",
       "value": {
-        "eventSeq": 41,
+        "innerCursor": {
+          "conversationId": "conversation-epoch-barrier",
+          "cursor": {
+            "at": 41
+          },
+          "scope": "conversation"
+        },
         "keyDirectoryRevision": 3,
         "newEpoch": 5,
         "oldEpoch": 4,
@@ -142,7 +148,17 @@
       "case": "sealedPayload",
       "value": {
         "formatVersion": 1,
+        "payload": "yv4=",
         "payloadKind": "conversationEvent"
+      },
+      "wireType": "SealedPayloadV1"
+    },
+    {
+      "case": "sealedPayloadTransferPart",
+      "value": {
+        "formatVersion": 1,
+        "payload": "QURSVDE=",
+        "payloadKind": "transferPart"
       },
       "wireType": "SealedPayloadV1"
     }

@@ -423,6 +423,8 @@ impl RuntimeCore {
             }
             RuntimeRequest::Catalog(_)
             | RuntimeRequest::Subscribe { .. }
+            | RuntimeRequest::Unsubscribe { .. }
+            | RuntimeRequest::Backfill(_)
             | RuntimeRequest::CreatePairInvite(_)
             | RuntimeRequest::ListPendingPairings { .. }
             | RuntimeRequest::ConfirmPairing { .. }
@@ -714,6 +716,10 @@ impl RuntimeCoreError {
                     "runtime conversation actor limit is reached",
                 ),
             },
+            Self::Connection(ConnectionError::FrameTooLarge) => RuntimeFailure::new(
+                agentdeck_protocol::runtime::failure::DAEMON_PAYLOAD_ITEM_TOO_LARGE,
+                "runtime JSON/UDS frame exceeds its hard limit",
+            ),
             Self::Connection(_) => RuntimeFailure::new(
                 DAEMON_RUNTIME_CONNECTION_UNAVAILABLE,
                 "runtime connection is unavailable or lagged",
@@ -818,9 +824,12 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use agentdeck_protocol::runtime::identity::{ApprovalId, IdempotencyKey};
+    use agentdeck_protocol::runtime::identity::{
+        ApprovalId, ConversationId, EventId, IdempotencyKey, MessageId,
+    };
     use agentdeck_protocol::runtime::{
-        ConversationStart, PromptPayload, QueryReceiptSelector, RuntimeMessage, SendPromptRequest,
+        ConversationStart, MAX_RUNTIME_JSON_FRAME_BYTES, PromptPayload, QueryReceiptSelector,
+        RuntimeEvent, RuntimeEventBody, RuntimeMessage, RuntimeStreamItem, SendPromptRequest,
     };
     use agentdeck_protocol::{ActionDecision, ActionDecisionKind, AgentKind};
     use tokio::sync::mpsc;
@@ -1333,6 +1342,65 @@ mod tests {
             }))
         ));
         write.acknowledge().expect("ack transport write");
+        core.shutdown().await.expect("shutdown core");
+    }
+
+    #[tokio::test]
+    async fn enqueue_rejects_oversized_reply_and_stream_before_connection_writer() {
+        let root = TestRoot::new("oversized-egress-frame");
+        let core = core(&root).await;
+        core.recover().await.expect("recover");
+        let principal = core
+            .issue_verified_local_principal(501, [5; 16])
+            .expect("issue local principal");
+        let (sink, mut receiver) = mpsc::channel::<crate::runtime::ConnectionWrite>(2);
+        let connection = core
+            .connect(principal, ConnectionSink::new(sink))
+            .expect("connect local");
+
+        let oversized_failure = || {
+            RuntimeFailure::new(
+                "daemon.test.oversized",
+                "x".repeat(MAX_RUNTIME_JSON_FRAME_BYTES),
+            )
+        };
+        let reply = RuntimeEnvelope {
+            version: RUNTIME_PROTOCOL_VERSION,
+            message_id: MessageId::new("message-core-oversized-reply"),
+            body: RuntimeMessage::Reply(RuntimeReply::Failure(oversized_failure())),
+        };
+        let failure = core.enqueue(connection, &reply).unwrap_err();
+        assert_eq!(
+            failure.code,
+            agentdeck_protocol::runtime::failure::DAEMON_PAYLOAD_ITEM_TOO_LARGE
+        );
+
+        let event = RuntimeEvent::new(
+            ConversationId::new("conversation-core-oversized-stream"),
+            EventId::new("event-core-oversized-stream"),
+            0,
+            None,
+            None,
+            None,
+            RuntimeEventBody::Error {
+                failure: oversized_failure(),
+            },
+        )
+        .unwrap();
+        let stream = RuntimeEnvelope {
+            version: RUNTIME_PROTOCOL_VERSION,
+            message_id: MessageId::new("message-core-oversized-stream"),
+            body: RuntimeMessage::Stream(RuntimeStreamItem::Event(event)),
+        };
+        let failure = core.enqueue(connection, &stream).unwrap_err();
+        assert_eq!(
+            failure.code,
+            agentdeck_protocol::runtime::failure::DAEMON_PAYLOAD_ITEM_TOO_LARGE
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
         core.shutdown().await.expect("shutdown core");
     }
 }

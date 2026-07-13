@@ -8,7 +8,7 @@
 use agentdeck_protocol::e2ee::context::OuterContextV1;
 use agentdeck_protocol::e2ee::keys::KeyId;
 use agentdeck_protocol::e2ee::payload::{
-    SealedPayloadKind, UnsignedSealedBlobV1, VerifiedSealedBlobV1,
+    SealedPayloadKind, SealedPayloadV1, UnsignedSealedBlobV1, VerifiedSealedBlobV1,
 };
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
@@ -139,8 +139,8 @@ fn open(
 }
 
 /// 对称封装明文，产出未签名 sealed blob（design §7.3/§7.4）。AAD 绑定 `context`，nonce 由
-/// key prefix + counter 组装。`payload_kind` 是每条消息的业务类型引用（只在密文外壳头，供
-/// endpoint 解析），`key_directory_revision` 来自发送 key 的目录状态。
+/// key prefix + counter 组装。`payload_kind` 与业务 bytes 先编码进 `SealedPayloadV1`，再整体
+/// AEAD 加密；外层 sealed blob 不暴露业务类型。`key_directory_revision` 来自发送 key 的目录状态。
 ///
 /// # 安全（调用方契约）
 ///
@@ -157,9 +157,9 @@ pub fn seal_symmetric(
 ) -> Result<UnsignedSealedBlobV1, CryptoError> {
     let nonce = assemble_nonce(&key.nonce_prefix, counter);
     let aad = context.encode_aad();
-    let ciphertext = seal(key.key.as_bytes(), &nonce, &aad, plaintext)?;
+    let inner = SealedPayloadV1::new(payload_kind, plaintext.to_vec()).to_plaintext_bytes()?;
+    let ciphertext = seal(key.key.as_bytes(), &nonce, &aad, &inner)?;
     Ok(UnsignedSealedBlobV1::new(
-        payload_kind,
         key.key_id,
         key.epoch,
         key.key_directory_revision,
@@ -177,12 +177,23 @@ pub fn seal_symmetric(
 /// （`key_id`/`key_epoch`/`key_directory_revision`）的一致性——按 blob 头选取正确接收 key
 /// 属上层（key directory / replay state，design §7.2/§7.5）职责；传错 key 由 AEAD tag
 /// 校验失败兜底（[`CryptoError::BadCiphertext`]），不会静默解出错误明文。
+pub fn open_sealed_payload(
+    key: &AeadReceivingKey,
+    context: &OuterContextV1,
+    blob: VerifiedSealedBlobV1,
+) -> Result<SealedPayloadV1, CryptoError> {
+    let inner = &blob.sealed().inner;
+    let aad = context.encode_aad();
+    let plaintext = open(key.key.as_bytes(), &inner.nonce, &aad, &inner.ciphertext)?;
+    SealedPayloadV1::from_plaintext_bytes(&plaintext).map_err(CryptoError::from)
+}
+
+/// 兼容只消费业务 bytes 的调用点；新 runtime dispatch 应使用 [`open_sealed_payload`] 先读取
+/// 密文内 kind，再按 endpoint schema 分派。
 pub fn open_symmetric(
     key: &AeadReceivingKey,
     context: &OuterContextV1,
     blob: VerifiedSealedBlobV1,
 ) -> Result<Vec<u8>, CryptoError> {
-    let inner = &blob.sealed().inner;
-    let aad = context.encode_aad();
-    open(key.key.as_bytes(), &inner.nonce, &aad, &inner.ciphertext)
+    Ok(open_sealed_payload(key, context, blob)?.payload)
 }

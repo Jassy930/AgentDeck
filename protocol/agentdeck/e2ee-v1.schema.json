@@ -54,8 +54,55 @@
       "$schema": "http://json-schema.org/draft-07/schema#",
       "additionalProperties": false,
       "definitions": {
+        "RuntimeInnerCursor": {
+          "description": "Runtime 内层 canonical cursor；tag 阻止 catalog/event 混用。",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "cursor": {
+                  "$ref": "#/definitions/StreamCursor"
+                },
+                "scope": {
+                  "enum": [
+                    "catalog"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "cursor",
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "conversationId": {
+                  "type": "string"
+                },
+                "cursor": {
+                  "$ref": "#/definitions/StreamCursor"
+                },
+                "scope": {
+                  "enum": [
+                    "conversation"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "conversationId",
+                "cursor",
+                "scope"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "StreamCursor": {
-          "description": "两层 sequence 的外层订阅 cursor（design §9.1）。\n\n统一使用 `BeforeFirst | At(u64)`，**绝不把 SQLite `-1` 编进 unsigned wire**： `Subscribe(BeforeFirst)` 表示从 frame 0 开始。wire 表示： `BeforeFirst → \"beforeFirst\"`，`At(n) → { \"at\": n }`。",
+          "description": "zero-based stream/canonical sequence cursor。",
           "oneOf": [
             {
               "enum": [
@@ -80,12 +127,10 @@
           ]
         }
       },
-      "description": "成员/epoch 变化时在每个 active stream 记录的 epoch barrier（design §7.2 / §9.2）。 同时含外层 generation/cursor 与内层 `eventSeq`；剩余设备从 `next(C)` 使用新 key。",
+      "description": "成员/epoch 变化时在每个 active stream 记录的 epoch barrier（design §7.2 / §9.2）。 同时含外层 generation/cursor 与 tagged inner cursor；剩余设备从 `next(C)` 使用新 key。",
       "properties": {
-        "eventSeq": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
+        "innerCursor": {
+          "$ref": "#/definitions/RuntimeInnerCursor"
         },
         "keyDirectoryRevision": {
           "format": "uint64",
@@ -110,7 +155,7 @@
         }
       },
       "required": [
-        "eventSeq",
+        "innerCursor",
         "keyDirectoryRevision",
         "newEpoch",
         "oldEpoch",
@@ -486,7 +531,7 @@
           "type": "string"
         },
         "StreamCursor": {
-          "description": "两层 sequence 的外层订阅 cursor（design §9.1）。\n\n统一使用 `BeforeFirst | At(u64)`，**绝不把 SQLite `-1` 编进 unsigned wire**： `Subscribe(BeforeFirst)` 表示从 frame 0 开始。wire 表示： `BeforeFirst → \"beforeFirst\"`，`At(n) → { \"at\": n }`。",
+          "description": "zero-based stream/canonical sequence cursor。",
           "oneOf": [
             {
               "enum": [
@@ -1104,7 +1149,8 @@
         "approvalReceipt",
         "backfillChunk",
         "keyUpdate",
-        "pairingMessage"
+        "pairingMessage",
+        "transferPart"
       ],
       "title": "SealedPayloadKind",
       "type": "string"
@@ -1126,17 +1172,21 @@
             "approvalReceipt",
             "backfillChunk",
             "keyUpdate",
-            "pairingMessage"
+            "pairingMessage",
+            "transferPart"
           ],
           "type": "string"
         }
       },
-      "description": "密文内 payload 头（引用业务类型，AEAD 保护）。",
+      "description": "密文内 payload（业务类型 + 原始业务 bytes，整体由 AEAD 保护）。",
       "properties": {
         "formatVersion": {
           "format": "uint16",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "payload": {
+          "type": "string"
         },
         "payloadKind": {
           "$ref": "#/definitions/SealedPayloadKind"
@@ -1144,6 +1194,7 @@
       },
       "required": [
         "formatVersion",
+        "payload",
         "payloadKind"
       ],
       "title": "SealedPayloadV1",
@@ -1205,23 +1256,6 @@
             }
           ]
         },
-        "SealedPayloadKind": {
-          "description": "业务 payload 类型引用（endpoint 契约，只在密文内）。这些词允许出现在 e2ee schema， **禁止**出现在 Relay outer schema（两份 schema 独立，见 `relay_v2_neutrality`）。",
-          "enum": [
-            "catalogSnapshot",
-            "catalogDelta",
-            "conversationSnapshot",
-            "conversationEvent",
-            "commandRequest",
-            "commandReceipt",
-            "approvalDecision",
-            "approvalReceipt",
-            "backfillChunk",
-            "keyUpdate",
-            "pairingMessage"
-          ],
-          "type": "string"
-        },
         "UnsignedSealedBlobV1": {
           "additionalProperties": false,
           "description": "未签名 sealed blob（outer 结构：format / keyId / epoch / revision / nonce / ciphertext）。 无法发布（无 `to_wire_bytes`）。",
@@ -1249,9 +1283,6 @@
             },
             "nonce": {
               "type": "string"
-            },
-            "payloadKind": {
-              "$ref": "#/definitions/SealedPayloadKind"
             }
           },
           "required": [
@@ -1260,8 +1291,7 @@
             "keyDirectoryRevision",
             "keyEpoch",
             "keyId",
-            "nonce",
-            "payloadKind"
+            "nonce"
           ],
           "type": "object"
         }
@@ -1302,7 +1332,7 @@
           "type": "string"
         },
         "StreamCursor": {
-          "description": "两层 sequence 的外层订阅 cursor（design §9.1）。\n\n统一使用 `BeforeFirst | At(u64)`，**绝不把 SQLite `-1` 编进 unsigned wire**： `Subscribe(BeforeFirst)` 表示从 frame 0 开始。wire 表示： `BeforeFirst → \"beforeFirst\"`，`At(n) → { \"at\": n }`。",
+          "description": "zero-based stream/canonical sequence cursor。",
           "oneOf": [
             {
               "enum": [
@@ -1497,23 +1527,6 @@
               "type": "string"
             }
           ]
-        },
-        "SealedPayloadKind": {
-          "description": "业务 payload 类型引用（endpoint 契约，只在密文内）。这些词允许出现在 e2ee schema， **禁止**出现在 Relay outer schema（两份 schema 独立，见 `relay_v2_neutrality`）。",
-          "enum": [
-            "catalogSnapshot",
-            "catalogDelta",
-            "conversationSnapshot",
-            "conversationEvent",
-            "commandRequest",
-            "commandReceipt",
-            "approvalDecision",
-            "approvalReceipt",
-            "backfillChunk",
-            "keyUpdate",
-            "pairingMessage"
-          ],
-          "type": "string"
         }
       },
       "description": "未签名 sealed blob（outer 结构：format / keyId / epoch / revision / nonce / ciphertext）。 无法发布（无 `to_wire_bytes`）。",
@@ -1541,9 +1554,6 @@
         },
         "nonce": {
           "type": "string"
-        },
-        "payloadKind": {
-          "$ref": "#/definitions/SealedPayloadKind"
         }
       },
       "required": [
@@ -1552,8 +1562,7 @@
         "keyDirectoryRevision",
         "keyEpoch",
         "keyId",
-        "nonce",
-        "payloadKind"
+        "nonce"
       ],
       "title": "UnsignedSealedBlobV1",
       "type": "object"
@@ -1614,23 +1623,6 @@
             }
           ]
         },
-        "SealedPayloadKind": {
-          "description": "业务 payload 类型引用（endpoint 契约，只在密文内）。这些词允许出现在 e2ee schema， **禁止**出现在 Relay outer schema（两份 schema 独立，见 `relay_v2_neutrality`）。",
-          "enum": [
-            "catalogSnapshot",
-            "catalogDelta",
-            "conversationSnapshot",
-            "conversationEvent",
-            "commandRequest",
-            "commandReceipt",
-            "approvalDecision",
-            "approvalReceipt",
-            "backfillChunk",
-            "keyUpdate",
-            "pairingMessage"
-          ],
-          "type": "string"
-        },
         "SignedSealedBlobV1": {
           "additionalProperties": false,
           "description": "已签名 sealed blob。Publish/outbound 只接收本类型。",
@@ -1675,9 +1667,6 @@
             },
             "nonce": {
               "type": "string"
-            },
-            "payloadKind": {
-              "$ref": "#/definitions/SealedPayloadKind"
             }
           },
           "required": [
@@ -1686,8 +1675,7 @@
             "keyDirectoryRevision",
             "keyEpoch",
             "keyId",
-            "nonce",
-            "payloadKind"
+            "nonce"
           ],
           "type": "object"
         }

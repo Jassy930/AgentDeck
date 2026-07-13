@@ -7,10 +7,10 @@
 //! 本 task 只定义契约与标注，不实现执行语义。
 
 use crate::runtime::identity::{
-    ApprovalId, CommandId, ConversationId, DeviceHandle, GrantSerial, IdempotencyKey, PairingId,
-    TurnId,
+    ApprovalId, CatalogPageCursor, CommandId, ConversationId, DeviceHandle, GrantSerial,
+    IdempotencyKey, PairingId, TurnId,
 };
-use crate::runtime::sync::StreamCursor;
+use crate::runtime::sync::{BackfillRequest, RuntimeInnerCursor, RuntimeSubscriptionTarget};
 use crate::trunk::{ActionDecision, AgentKind};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -86,9 +86,9 @@ pub struct HelloParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CatalogRequest {
-    pub subscribe: bool,
-    #[serde(default)]
-    pub since_revision: Option<u64>,
+    #[serde(deserialize_with = "deserialize_required_optional_page_cursor")]
+    #[schemars(with = "crate::runtime::schema::RequiredNullable<CatalogPageCursor>")]
+    pub page_cursor: Option<CatalogPageCursor>,
 }
 
 /// 新建 conversation（daemon 在 adapter 启动前生成 conversationId）。
@@ -183,9 +183,13 @@ pub enum RuntimeRequest {
     Catalog(CatalogRequest),
     /// 订阅某 conversation 的事件流，从 cursor 之后开始。
     Subscribe {
-        conversation_id: ConversationId,
-        cursor: StreamCursor,
+        #[serde(rename = "innerCursor")]
+        inner_cursor: RuntimeInnerCursor,
     },
+    /// 释放 catalog/conversation watcher；对相同 target 幂等。
+    Unsubscribe { target: RuntimeSubscriptionTarget },
+    /// Relay gap 后按 inner HWM 请求定向 backfill/snapshot。
+    Backfill(BackfillRequest),
     /// 新建 conversation。
     Start(ConversationStart),
     /// 发送 prompt（有副作用；receipt Accepted/Replayed/Failed）。
@@ -242,4 +246,13 @@ pub enum RuntimeRequest {
     Revoke(RevokeRequest),
     /// machine trust reset —— local-only administration。
     TrustReset { scope: LocalOnlyAdministration },
+}
+
+fn deserialize_required_optional_page_cursor<'de, D>(
+    deserializer: D,
+) -> Result<Option<CatalogPageCursor>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<CatalogPageCursor>::deserialize(deserializer)
 }

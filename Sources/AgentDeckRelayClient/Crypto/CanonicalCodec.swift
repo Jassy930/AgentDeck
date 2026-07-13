@@ -104,6 +104,7 @@ public enum SealedPayloadKind: String, Codable, Sendable {
     case backfillChunk
     case keyUpdate
     case pairingMessage
+    case transferPart
 
     var canonicalTag: UInt8 {
         switch self {
@@ -118,6 +119,25 @@ public enum SealedPayloadKind: String, Codable, Sendable {
         case .backfillChunk: 8
         case .keyUpdate: 9
         case .pairingMessage: 10
+        case .transferPart: 11
+        }
+    }
+
+    init?(canonicalTag: UInt8) {
+        switch canonicalTag {
+        case 0: self = .catalogSnapshot
+        case 1: self = .catalogDelta
+        case 2: self = .conversationSnapshot
+        case 3: self = .conversationEvent
+        case 4: self = .commandRequest
+        case 5: self = .commandReceipt
+        case 6: self = .approvalDecision
+        case 7: self = .approvalReceipt
+        case 8: self = .backfillChunk
+        case 9: self = .keyUpdate
+        case 10: self = .pairingMessage
+        case 11: self = .transferPart
+        default: return nil
         }
     }
 }
@@ -238,7 +258,6 @@ public struct HPKEEnvelopeV1: Equatable, Sendable {
 
 public struct UnsignedSealedBlobV1: Equatable, Sendable {
     public var formatVersion: UInt16
-    public var payloadKind: SealedPayloadKind
     public var keyID: KeyIDV1
     public var keyEpoch: UInt64
     public var keyDirectoryRevision: UInt64
@@ -247,7 +266,6 @@ public struct UnsignedSealedBlobV1: Equatable, Sendable {
 
     public init(
         formatVersion: UInt16,
-        payloadKind: SealedPayloadKind,
         keyID: KeyIDV1,
         keyEpoch: UInt64,
         keyDirectoryRevision: UInt64,
@@ -255,7 +273,6 @@ public struct UnsignedSealedBlobV1: Equatable, Sendable {
         ciphertext: Data
     ) {
         self.formatVersion = formatVersion
-        self.payloadKind = payloadKind
         self.keyID = keyID
         self.keyEpoch = keyEpoch
         self.keyDirectoryRevision = keyDirectoryRevision
@@ -338,7 +355,6 @@ public enum CanonicalCodec {
         encoder.domain("AgentDeck/SealedBlobTbsV1\0")
         try encoder.bytes(encodeAAD(context), field: "outerContextAAD")
         encoder.u16(blob.formatVersion)
-        encoder.u8(blob.payloadKind.canonicalTag)
         encoder.u8(blob.keyID.purpose.canonicalTag)
         encoder.u64(blob.keyID.epoch)
         encoder.u64(blob.keyEpoch)

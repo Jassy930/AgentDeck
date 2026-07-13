@@ -1508,7 +1508,7 @@
           "type": "object"
         },
         "StreamCursor": {
-          "description": "两层 sequence 的外层订阅 cursor（design §9.1）。\n\n统一使用 `BeforeFirst | At(u64)`，**绝不把 SQLite `-1` 编进 unsigned wire**： `Subscribe(BeforeFirst)` 表示从 frame 0 开始。wire 表示： `BeforeFirst → \"beforeFirst\"`，`At(n) → { \"at\": n }`。",
+          "description": "zero-based stream/canonical sequence cursor。",
           "oneOf": [
             {
               "enum": [
@@ -2411,7 +2411,7 @@
           "type": "object"
         },
         "StreamCursor": {
-          "description": "两层 sequence 的外层订阅 cursor（design §9.1）。\n\n统一使用 `BeforeFirst | At(u64)`，**绝不把 SQLite `-1` 编进 unsigned wire**： `Subscribe(BeforeFirst)` 表示从 frame 0 开始。wire 表示： `BeforeFirst → \"beforeFirst\"`，`At(n) → { \"at\": n }`。",
+          "description": "zero-based stream/canonical sequence cursor。",
           "oneOf": [
             {
               "enum": [
@@ -3132,7 +3132,7 @@
     },
     "StreamCursor": {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "description": "两层 sequence 的外层订阅 cursor（design §9.1）。\n\n统一使用 `BeforeFirst | At(u64)`，**绝不把 SQLite `-1` 编进 unsigned wire**： `Subscribe(BeforeFirst)` 表示从 frame 0 开始。wire 表示： `BeforeFirst → \"beforeFirst\"`，`At(n) → { \"at\": n }`。",
+      "description": "zero-based stream/canonical sequence cursor。",
       "oneOf": [
         {
           "enum": [

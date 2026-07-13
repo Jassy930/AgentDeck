@@ -33,10 +33,11 @@ pub use command::{
     QueryReceiptSelector, RuntimeRequest, SendPromptRequest,
 };
 pub use envelope::{
-    MAX_RUNTIME_REQUEST_BYTES, PairInvite, PendingPairing, RuntimeEnvelope, RuntimeMessage,
-    RuntimeReply, RuntimeSizeError, RuntimeStreamItem, ensure_request_within_limit,
+    MAX_RUNTIME_JSON_FRAME_BYTES, MAX_RUNTIME_REQUEST_BYTES, PairInvite, PendingPairing,
+    RuntimeEnvelope, RuntimeMessage, RuntimeReply, RuntimeSizeError, RuntimeStreamItem,
+    ensure_request_within_limit,
 };
-pub use event::{RuntimeEvent, RuntimeEventBody};
+pub use event::{RuntimeEvent, RuntimeEventBody, RuntimeEventError};
 pub use failure::RuntimeFailure;
 pub use receipt::{
     ApprovalDeliveryState, ApprovalReceipt, CancellationReceipt, CommandReceipt, CommandStatus,
@@ -44,10 +45,13 @@ pub use receipt::{
 };
 pub use schema::runtime_schema;
 pub use sync::{
-    BackfillChunk, ConversationSnapshot, RuntimeSyncComplete, SnapshotError, SnapshotItem,
-    StreamCursor,
+    BackfillChunk, BackfillError, BackfillRange, BackfillRequest, ConversationSnapshot,
+    RuntimeInnerCursor, RuntimeSubscriptionTarget, RuntimeSyncComplete, SnapshotError,
+    SnapshotItem, StreamCursor, StreamCursorError, SubscriptionReceipt,
 };
 pub use transfer::{
-    MAX_PART_BYTES, MAX_REASSEMBLY_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_PARTS, TRANSFER_TTL_MS,
+    MAX_ACTIVE_TRANSFERS, MAX_COMPLETED_TRANSFER_TOMBSTONES, MAX_JSON_PART_BYTES, MAX_PART_BYTES,
+    MAX_REASSEMBLY_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_CARRIER_BYTES, MAX_TRANSFER_PARTS,
+    RuntimeTransferCarrierError, RuntimeTransferCarrierV1, RuntimeTransferChannel, TRANSFER_TTL_MS,
     TransferEnvelope, TransferError, TransferProgress, TransferReassembler,
 };

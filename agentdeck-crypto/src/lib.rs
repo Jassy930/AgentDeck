@@ -27,7 +27,8 @@ pub mod signature;
 pub use ::hpke::rand_core;
 
 pub use aead::{
-    AeadReceivingKey, AeadSendingKey, SecretAeadKey, SenderCounter, open_symmetric, seal_symmetric,
+    AeadReceivingKey, AeadSendingKey, SecretAeadKey, SenderCounter, open_sealed_payload,
+    open_symmetric, seal_symmetric,
 };
 pub use canonical::sha256;
 pub use error::CryptoError;

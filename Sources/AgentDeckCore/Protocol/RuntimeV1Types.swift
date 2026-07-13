@@ -5,11 +5,24 @@ public let runtimeProtocolVersionV1: UInt16 = 1
 public enum RuntimeV1MirrorError: Error, Equatable, Sendable {
     case promptTooLarge
     case duplicateCapability
+    case cursorExhausted
+    case invalidIdentity
+    case invalidTransferCarrier
+    case transferTooLarge
+    case frameTooLarge
+    case backfillTooLarge
+    case catalogTooLarge
 }
 
 // MARK: - Stable IDs
 
-public protocol RuntimeV1IDKind: Sendable {}
+public protocol RuntimeV1IDKind: Sendable {
+    static var maximumWireUTF8Bytes: Int? { get }
+}
+
+public extension RuntimeV1IDKind {
+    static var maximumWireUTF8Bytes: Int? { nil }
+}
 
 public struct RuntimeV1ID<Kind: RuntimeV1IDKind>: RawRepresentable, Codable, Hashable, Sendable {
     public let rawValue: String
@@ -20,15 +33,27 @@ public struct RuntimeV1ID<Kind: RuntimeV1IDKind>: RawRepresentable, Codable, Has
 
     public init(from decoder: Decoder) throws {
         rawValue = try decoder.singleValueContainer().decode(String.self)
+        try validateWireValue()
     }
 
     public func encode(to encoder: Encoder) throws {
+        try validateWireValue()
         var container = encoder.singleValueContainer()
         try container.encode(rawValue)
     }
+
+    private func validateWireValue() throws {
+        guard let maximum = Kind.maximumWireUTF8Bytes else { return }
+        let count = rawValue.utf8.count
+        guard count > 0, count <= maximum else {
+            throw RuntimeV1MirrorError.invalidIdentity
+        }
+    }
 }
 
-public enum RuntimeMessageIDKind: RuntimeV1IDKind {}
+public enum RuntimeMessageIDKind: RuntimeV1IDKind {
+    public static let maximumWireUTF8Bytes: Int? = 1024
+}
 public enum RuntimeConversationIDKind: RuntimeV1IDKind {}
 public enum RuntimeTurnIDKind: RuntimeV1IDKind {}
 public enum RuntimeEventIDKind: RuntimeV1IDKind {}
@@ -38,10 +63,13 @@ public enum RuntimeCommandIDKind: RuntimeV1IDKind {}
 public enum RuntimeApprovalIDKind: RuntimeV1IDKind {}
 public enum RuntimeAdapterStateKeyKind: RuntimeV1IDKind {}
 public enum RuntimeIdempotencyKeyKind: RuntimeV1IDKind {}
-public enum RuntimeTransferIDKind: RuntimeV1IDKind {}
+public enum RuntimeTransferIDKind: RuntimeV1IDKind {
+    public static let maximumWireUTF8Bytes: Int? = 1024
+}
 public enum RuntimePairingIDKind: RuntimeV1IDKind {}
 public enum RuntimeDeviceHandleKind: RuntimeV1IDKind {}
 public enum RuntimeStreamGenerationKind: RuntimeV1IDKind {}
+public enum RuntimeCatalogPageCursorKind: RuntimeV1IDKind {}
 
 public typealias RuntimeMessageID = RuntimeV1ID<RuntimeMessageIDKind>
 public typealias RuntimeConversationID = RuntimeV1ID<RuntimeConversationIDKind>
@@ -57,6 +85,7 @@ public typealias RuntimeTransferID = RuntimeV1ID<RuntimeTransferIDKind>
 public typealias RuntimePairingID = RuntimeV1ID<RuntimePairingIDKind>
 public typealias RuntimeDeviceHandle = RuntimeV1ID<RuntimeDeviceHandleKind>
 public typealias RuntimeStreamGeneration = RuntimeV1ID<RuntimeStreamGenerationKind>
+public typealias RuntimeCatalogPageCursor = RuntimeV1ID<RuntimeCatalogPageCursorKind>
 
 public struct RuntimeGrantSerial: RawRepresentable, Codable, Hashable, Sendable {
     public let rawValue: UInt64
@@ -125,6 +154,143 @@ public enum RuntimeStreamCursorV1: Codable, Equatable, Sendable {
         case .at(let value):
             var container = encoder.container(keyedBy: RuntimeV1CodingKey.self)
             try container.encode(value, forKey: key("at"))
+        }
+    }
+
+    public func checkedNext() throws -> UInt64 {
+        switch self {
+        case .beforeFirst:
+            return 0
+        case .at(let value):
+            guard value < UInt64.max else { throw RuntimeV1MirrorError.cursorExhausted }
+            return value + 1
+        }
+    }
+}
+
+public enum RuntimeInnerCursorV1: Codable, Equatable, Sendable {
+    case catalog(cursor: RuntimeStreamCursorV1)
+    case conversation(conversationID: RuntimeConversationID, cursor: RuntimeStreamCursorV1)
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: RuntimeV1CodingKey.self)
+        let scope = try container.decode(String.self, forKey: key("scope"))
+        switch scope {
+        case "catalog":
+            try rejectUnknownKeys(decoder, allowed: ["scope", "cursor"])
+            self = .catalog(
+                cursor: try container.decode(RuntimeStreamCursorV1.self, forKey: key("cursor"))
+            )
+        case "conversation":
+            try rejectUnknownKeys(decoder, allowed: ["scope", "conversationId", "cursor"])
+            self = .conversation(
+                conversationID: try container.decode(
+                    RuntimeConversationID.self,
+                    forKey: key("conversationId")
+                ),
+                cursor: try container.decode(RuntimeStreamCursorV1.self, forKey: key("cursor"))
+            )
+        default:
+            throw invalidTag(scope, field: "scope", in: container)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: RuntimeV1CodingKey.self)
+        switch self {
+        case .catalog(let cursor):
+            try container.encode("catalog", forKey: key("scope"))
+            try container.encode(cursor, forKey: key("cursor"))
+        case .conversation(let conversationID, let cursor):
+            try container.encode("conversation", forKey: key("scope"))
+            try container.encode(conversationID, forKey: key("conversationId"))
+            try container.encode(cursor, forKey: key("cursor"))
+        }
+    }
+}
+
+public enum RuntimeSubscriptionTargetV1: Codable, Sendable {
+    case catalog
+    case conversation(conversationID: RuntimeConversationID)
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: RuntimeV1CodingKey.self)
+        let scope = try container.decode(String.self, forKey: key("scope"))
+        switch scope {
+        case "catalog":
+            try rejectUnknownKeys(decoder, allowed: ["scope"])
+            self = .catalog
+        case "conversation":
+            try rejectUnknownKeys(decoder, allowed: ["scope", "conversationId"])
+            self = .conversation(
+                conversationID: try container.decode(
+                    RuntimeConversationID.self,
+                    forKey: key("conversationId")
+                )
+            )
+        default:
+            throw invalidTag(scope, field: "scope", in: container)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: RuntimeV1CodingKey.self)
+        switch self {
+        case .catalog:
+            try container.encode("catalog", forKey: key("scope"))
+        case .conversation(let conversationID):
+            try container.encode("conversation", forKey: key("scope"))
+            try container.encode(conversationID, forKey: key("conversationId"))
+        }
+    }
+}
+
+public enum RuntimeBackfillRequestV1: Codable, Sendable {
+    case catalog(after: RuntimeStreamCursorV1)
+    case conversation(conversationID: RuntimeConversationID, after: RuntimeStreamCursorV1)
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: RuntimeV1CodingKey.self)
+        let scope = try container.decode(String.self, forKey: key("scope"))
+        switch scope {
+        case "catalog":
+            try rejectUnknownKeys(decoder, allowed: ["request", "scope", "after"])
+            self = .catalog(
+                after: try container.decode(RuntimeStreamCursorV1.self, forKey: key("after"))
+            )
+        case "conversation":
+            try rejectUnknownKeys(
+                decoder,
+                allowed: ["request", "scope", "conversationId", "after"]
+            )
+            self = .conversation(
+                conversationID: try container.decode(
+                    RuntimeConversationID.self,
+                    forKey: key("conversationId")
+                ),
+                after: try container.decode(RuntimeStreamCursorV1.self, forKey: key("after"))
+            )
+        default:
+            throw invalidTag(scope, field: "scope", in: container)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: RuntimeV1CodingKey.self)
+        try encodeFields(into: &container)
+    }
+
+    fileprivate func encodeFields(
+        into container: inout KeyedEncodingContainer<RuntimeV1CodingKey>
+    ) throws {
+        switch self {
+        case .catalog(let after):
+            try container.encode("catalog", forKey: key("scope"))
+            try container.encode(after, forKey: key("after"))
+        case .conversation(let conversationID, let after):
+            try container.encode("conversation", forKey: key("scope"))
+            try container.encode(conversationID, forKey: key("conversationId"))
+            try container.encode(after, forKey: key("after"))
         }
     }
 }
@@ -271,8 +437,10 @@ public enum RuntimeReceiptSelectorV1: Codable, Sendable {
 
 public enum RuntimeRequestV1: Codable, Sendable {
     case hello(runtimeProtocolVersion: UInt16)
-    case catalog(subscribe: Bool, sinceRevision: UInt64?)
-    case subscribe(conversationID: RuntimeConversationID, cursor: RuntimeStreamCursorV1)
+    case catalog(pageCursor: RuntimeCatalogPageCursor?)
+    case subscribe(innerCursor: RuntimeInnerCursorV1)
+    case unsubscribe(target: RuntimeSubscriptionTargetV1)
+    case backfill(RuntimeBackfillRequestV1)
     case start(
         agentKind: AgentKind,
         idempotencyKey: RuntimeIdempotencyKey,
@@ -318,23 +486,37 @@ public enum RuntimeRequestV1: Codable, Sendable {
                 )
             )
         case "catalog":
-            try rejectUnknownKeys(decoder, allowed: ["request", "subscribe", "sinceRevision"])
+            try rejectUnknownKeys(decoder, allowed: ["request", "pageCursor"])
+            guard container.contains(key("pageCursor")) else {
+                throw DecodingError.keyNotFound(
+                    key("pageCursor"),
+                    .init(codingPath: decoder.codingPath, debugDescription: "pageCursor is required")
+                )
+            }
             self = .catalog(
-                subscribe: try container.decode(Bool.self, forKey: key("subscribe")),
-                sinceRevision: try container.decodeIfPresent(
-                    UInt64.self,
-                    forKey: key("sinceRevision")
+                pageCursor: try container.decodeIfPresent(
+                    RuntimeCatalogPageCursor.self,
+                    forKey: key("pageCursor")
                 )
             )
         case "subscribe":
-            try rejectUnknownKeys(decoder, allowed: ["request", "conversation_id", "cursor"])
+            try rejectUnknownKeys(decoder, allowed: ["request", "innerCursor"])
             self = .subscribe(
-                conversationID: try container.decode(
-                    RuntimeConversationID.self,
-                    forKey: key("conversation_id")
-                ),
-                cursor: try container.decode(RuntimeStreamCursorV1.self, forKey: key("cursor"))
+                innerCursor: try container.decode(
+                    RuntimeInnerCursorV1.self,
+                    forKey: key("innerCursor")
+                )
             )
+        case "unsubscribe":
+            try rejectUnknownKeys(decoder, allowed: ["request", "target"])
+            self = .unsubscribe(
+                target: try container.decode(
+                    RuntimeSubscriptionTargetV1.self,
+                    forKey: key("target")
+                )
+            )
+        case "backfill":
+            self = .backfill(try RuntimeBackfillRequestV1(from: decoder))
         case "start":
             try rejectUnknownKeys(
                 decoder,
@@ -489,14 +671,18 @@ public enum RuntimeRequestV1: Codable, Sendable {
         case .hello(let version):
             try container.encode("hello", forKey: key("request"))
             try container.encode(version, forKey: key("runtimeProtocolVersion"))
-        case .catalog(let subscribe, let sinceRevision):
+        case .catalog(let pageCursor):
             try container.encode("catalog", forKey: key("request"))
-            try container.encode(subscribe, forKey: key("subscribe"))
-            try container.encode(sinceRevision, forKey: key("sinceRevision"))
-        case .subscribe(let conversationID, let cursor):
+            try container.encode(pageCursor, forKey: key("pageCursor"))
+        case .subscribe(let innerCursor):
             try container.encode("subscribe", forKey: key("request"))
-            try container.encode(conversationID, forKey: key("conversation_id"))
-            try container.encode(cursor, forKey: key("cursor"))
+            try container.encode(innerCursor, forKey: key("innerCursor"))
+        case .unsubscribe(let target):
+            try container.encode("unsubscribe", forKey: key("request"))
+            try container.encode(target, forKey: key("target"))
+        case .backfill(let request):
+            try container.encode("backfill", forKey: key("request"))
+            try request.encodeFields(into: &container)
         case .start(let agentKind, let idempotencyKey, let cwd, let title):
             try container.encode("start", forKey: key("request"))
             try container.encode(agentKind, forKey: key("agentKind"))
@@ -588,6 +774,22 @@ public struct RuntimeEnvelopeV1: Codable, Sendable {
         messageID = try container.decode(RuntimeMessageID.self, forKey: .messageID)
         body = try container.decode(RuntimeMessageV1.self, forKey: .body)
     }
+
+    public func encode(to encoder: Encoder) throws {
+        guard version == runtimeProtocolVersionV1 else {
+            throw EncodingError.invalidValue(
+                version,
+                .init(
+                    codingPath: encoder.codingPath,
+                    debugDescription: "unsupported Runtime protocol version \(version)"
+                )
+            )
+        }
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(version, forKey: .version)
+        try container.encode(messageID, forKey: .messageID)
+        try container.encode(body, forKey: .body)
+    }
 }
 
 public enum RuntimeMessageV1: Codable, Sendable {
@@ -675,41 +877,85 @@ public struct RuntimeConversationEntryV1: Codable, Sendable {
 
 public struct RuntimeCatalogSnapshotV1: Codable, Sendable {
     public static let maxEntries = 500
-    public let catalogRevision: UInt64
+    public static let maxEncodedBytes = 64 * 1024 * 1024
+    public let baseCatalogCursor: RuntimeStreamCursorV1
     public let entries: [RuntimeConversationEntryV1]
-    public let hasMore: Bool
+    public let nextPageCursor: RuntimeCatalogPageCursor?
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
-        case catalogRevision, entries, hasMore
+        case baseCatalogCursor, entries, nextPageCursor
+    }
+
+    init(
+        baseCatalogCursor: RuntimeStreamCursorV1,
+        entries: [RuntimeConversationEntryV1],
+        nextPageCursor: RuntimeCatalogPageCursor?
+    ) {
+        self.baseCatalogCursor = baseCatalogCursor
+        self.entries = entries
+        self.nextPageCursor = nextPageCursor
     }
 
     public init(from decoder: Decoder) throws {
         try rejectUnknownKeys(decoder, allowed: CodingKeys.all.union(["reply"]))
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        catalogRevision = try container.decode(UInt64.self, forKey: .catalogRevision)
+        baseCatalogCursor = try container.decode(
+            RuntimeStreamCursorV1.self,
+            forKey: .baseCatalogCursor
+        )
         entries = try container.decode([RuntimeConversationEntryV1].self, forKey: .entries)
-        hasMore = try container.decode(Bool.self, forKey: .hasMore)
-        guard entries.count <= Self.maxEntries else {
-            throw DecodingError.dataCorruptedError(
-                forKey: .entries,
-                in: container,
-                debugDescription: "catalog page exceeds 500 rows"
+        guard container.contains(.nextPageCursor) else {
+            throw DecodingError.keyNotFound(
+                CodingKeys.nextPageCursor,
+                .init(codingPath: decoder.codingPath, debugDescription: "nextPageCursor is required")
             )
         }
+        nextPageCursor = try container.decodeIfPresent(
+            RuntimeCatalogPageCursor.self,
+            forKey: .nextPageCursor
+        )
+        try validate(codingPath: decoder.codingPath)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: RuntimeV1CodingKey.self)
+        try encodeFields(into: &container)
     }
 
     fileprivate func encodeFields(
         into container: inout KeyedEncodingContainer<RuntimeV1CodingKey>
     ) throws {
-        guard entries.count <= Self.maxEntries else {
-            throw EncodingError.invalidValue(
-                entries,
-                .init(codingPath: container.codingPath, debugDescription: "catalog page too large")
-            )
-        }
-        try container.encode(catalogRevision, forKey: key("catalogRevision"))
+        try validate(codingPath: container.codingPath)
+        try encodeUncheckedFields(into: &container)
+    }
+
+    fileprivate func encodeUncheckedFields(
+        into container: inout KeyedEncodingContainer<RuntimeV1CodingKey>
+    ) throws {
+        try container.encode(baseCatalogCursor, forKey: key("baseCatalogCursor"))
         try container.encode(entries, forKey: key("entries"))
-        try container.encode(hasMore, forKey: key("hasMore"))
+        try container.encode(nextPageCursor, forKey: key("nextPageCursor"))
+    }
+
+    private func validate(codingPath: [CodingKey]) throws {
+        guard entries.count <= Self.maxEntries else {
+            throw RuntimeV1MirrorError.catalogTooLarge
+        }
+        let encoded = try JSONEncoder().encode(RuntimeCatalogSnapshotSizeProbe(value: self))
+        guard encoded.count <= Self.maxEncodedBytes else {
+            throw RuntimeV1MirrorError.catalogTooLarge
+        }
+    }
+}
+
+/// 避免 catalog snapshot 在 64 MiB egress gate 中递归调用自身 encoder。
+/// probe 只编码与 direct/flatten wire 相同的 catalog fields。
+private struct RuntimeCatalogSnapshotSizeProbe: Encodable {
+    let value: RuntimeCatalogSnapshotV1
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: RuntimeV1CodingKey.self)
+        try value.encodeUncheckedFields(into: &container)
     }
 }
 
@@ -778,11 +1024,11 @@ public struct RuntimeCatalogDeltaV1: Codable, Sendable {
 public struct RuntimeSyncCompleteV1: Codable, Sendable {
     public let streamGeneration: RuntimeStreamGeneration
     public let streamCursor: RuntimeStreamCursorV1
-    public let eventSeq: UInt64
+    public let innerCursor: RuntimeInnerCursorV1
     public let keyDirectoryRevision: UInt64
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
-        case streamGeneration, streamCursor, eventSeq, keyDirectoryRevision
+        case streamGeneration, streamCursor, innerCursor, keyDirectoryRevision
     }
 
     public init(from decoder: Decoder) throws {
@@ -794,7 +1040,7 @@ public struct RuntimeSyncCompleteV1: Codable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         streamGeneration = try container.decode(RuntimeStreamGeneration.self, forKey: .streamGeneration)
         streamCursor = try container.decode(RuntimeStreamCursorV1.self, forKey: .streamCursor)
-        eventSeq = try container.decode(UInt64.self, forKey: .eventSeq)
+        innerCursor = try container.decode(RuntimeInnerCursorV1.self, forKey: .innerCursor)
         keyDirectoryRevision = try container.decode(UInt64.self, forKey: .keyDirectoryRevision)
     }
 
@@ -803,8 +1049,227 @@ public struct RuntimeSyncCompleteV1: Codable, Sendable {
     ) throws {
         try container.encode(streamGeneration, forKey: key("streamGeneration"))
         try container.encode(streamCursor, forKey: key("streamCursor"))
-        try container.encode(eventSeq, forKey: key("eventSeq"))
+        try container.encode(innerCursor, forKey: key("innerCursor"))
         try container.encode(keyDirectoryRevision, forKey: key("keyDirectoryRevision"))
+    }
+}
+
+public enum RuntimeSubscriptionReceiptV1: Codable, Sendable {
+    case subscribed(streamGeneration: RuntimeStreamGeneration)
+    case unsubscribed
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: RuntimeV1CodingKey.self)
+        let status = try container.decode(String.self, forKey: key("status"))
+        switch status {
+        case "subscribed":
+            try rejectUnknownKeys(decoder, allowed: ["reply", "status", "streamGeneration"])
+            self = .subscribed(
+                streamGeneration: try container.decode(
+                    RuntimeStreamGeneration.self,
+                    forKey: key("streamGeneration")
+                )
+            )
+        case "unsubscribed":
+            try rejectUnknownKeys(decoder, allowed: ["reply", "status"])
+            self = .unsubscribed
+        default:
+            throw invalidTag(status, field: "status", in: container)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: RuntimeV1CodingKey.self)
+        try encodeFields(into: &container)
+    }
+
+    fileprivate func encodeFields(
+        into container: inout KeyedEncodingContainer<RuntimeV1CodingKey>
+    ) throws {
+        switch self {
+        case .subscribed(let streamGeneration):
+            try container.encode("subscribed", forKey: key("status"))
+            try container.encode(streamGeneration, forKey: key("streamGeneration"))
+        case .unsubscribed:
+            try container.encode("unsubscribed", forKey: key("status"))
+        }
+    }
+}
+
+public struct RuntimeBackfillRangeV1: Codable, Sendable {
+    public static let maxEntries = 512
+    public let after: RuntimeStreamCursorV1
+    public let through: RuntimeStreamCursorV1
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case after, through
+    }
+
+    public init(after: RuntimeStreamCursorV1, through: RuntimeStreamCursorV1) throws {
+        self.after = after
+        self.through = through
+        try validate(codingPath: [])
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectUnknownKeys(decoder, allowed: CodingKeys.all)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        after = try container.decode(RuntimeStreamCursorV1.self, forKey: .after)
+        through = try container.decode(RuntimeStreamCursorV1.self, forKey: .through)
+        try validate(codingPath: decoder.codingPath)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        try validate(codingPath: encoder.codingPath)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(after, forKey: .after)
+        try container.encode(through, forKey: .through)
+    }
+
+    fileprivate func bounds(codingPath: [CodingKey]) throws -> (first: UInt64, last: UInt64, count: Int) {
+        let first = try after.checkedNext()
+        guard case .at(let last) = through, last >= first else {
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: codingPath, debugDescription: "backfill range must be non-empty")
+            )
+        }
+        let distance = last - first
+        guard distance < UInt64(Self.maxEntries) else {
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: codingPath, debugDescription: "backfill range exceeds 512 entries")
+            )
+        }
+        return (first, last, Int(distance + 1))
+    }
+
+    private func validate(codingPath: [CodingKey]) throws {
+        _ = try bounds(codingPath: codingPath)
+    }
+}
+
+public enum RuntimeBackfillChunkV1: Codable, Sendable {
+    public static let maxEncodedBytes = 64 * 1024 * 1024
+
+    case catalog(range: RuntimeBackfillRangeV1, deltas: [RuntimeCatalogDeltaV1])
+    case conversation(
+        conversationID: RuntimeConversationID,
+        capabilitiesPreamble: RuntimeSessionCapabilitiesV1,
+        range: RuntimeBackfillRangeV1,
+        events: [RuntimeEventV1]
+    )
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: RuntimeV1CodingKey.self)
+        let scope = try container.decode(String.self, forKey: key("scope"))
+        switch scope {
+        case "catalog":
+            try rejectUnknownKeys(decoder, allowed: ["reply", "scope", "range", "deltas"])
+            self = .catalog(
+                range: try container.decode(RuntimeBackfillRangeV1.self, forKey: key("range")),
+                deltas: try container.decode(
+                    [RuntimeCatalogDeltaV1].self,
+                    forKey: key("deltas")
+                )
+            )
+        case "conversation":
+            try rejectUnknownKeys(
+                decoder,
+                allowed: [
+                    "reply", "scope", "conversationId", "capabilitiesPreamble", "range",
+                    "events",
+                ]
+            )
+            self = .conversation(
+                conversationID: try container.decode(
+                    RuntimeConversationID.self,
+                    forKey: key("conversationId")
+                ),
+                capabilitiesPreamble: try container.decode(
+                    RuntimeSessionCapabilitiesV1.self,
+                    forKey: key("capabilitiesPreamble")
+                ),
+                range: try container.decode(RuntimeBackfillRangeV1.self, forKey: key("range")),
+                events: try container.decode([RuntimeEventV1].self, forKey: key("events"))
+            )
+        default:
+            throw invalidTag(scope, field: "scope", in: container)
+        }
+        try validate(codingPath: decoder.codingPath)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: RuntimeV1CodingKey.self)
+        try encodeFields(into: &container)
+    }
+
+    fileprivate func encodeFields(
+        into container: inout KeyedEncodingContainer<RuntimeV1CodingKey>
+    ) throws {
+        try validate(codingPath: container.codingPath)
+        try encodeUncheckedFields(into: &container)
+    }
+
+    fileprivate func encodeUncheckedFields(
+        into container: inout KeyedEncodingContainer<RuntimeV1CodingKey>
+    ) throws {
+        switch self {
+        case .catalog(let range, let deltas):
+            try container.encode("catalog", forKey: key("scope"))
+            try container.encode(range, forKey: key("range"))
+            try container.encode(deltas, forKey: key("deltas"))
+        case .conversation(let conversationID, let capabilities, let range, let events):
+            try container.encode("conversation", forKey: key("scope"))
+            try container.encode(conversationID, forKey: key("conversationId"))
+            try container.encode(capabilities, forKey: key("capabilitiesPreamble"))
+            try container.encode(range, forKey: key("range"))
+            try container.encode(events, forKey: key("events"))
+        }
+    }
+
+    private func validate(codingPath: [CodingKey]) throws {
+        switch self {
+        case .catalog(let range, let deltas):
+            let bounds = try range.bounds(codingPath: codingPath)
+            guard deltas.count == bounds.count else {
+                throw invalidBackfill(codingPath)
+            }
+            for (offset, delta) in deltas.enumerated()
+            where delta.catalogRevision != bounds.first + UInt64(offset) {
+                throw invalidBackfill(codingPath)
+            }
+        case .conversation(let conversationID, _, let range, let events):
+            let bounds = try range.bounds(codingPath: codingPath)
+            guard events.count == bounds.count else {
+                throw invalidBackfill(codingPath)
+            }
+            for (offset, event) in events.enumerated()
+            where event.conversationID != conversationID
+                || event.eventSeq != bounds.first + UInt64(offset) {
+                throw invalidBackfill(codingPath)
+            }
+        }
+
+        let encoded = try JSONEncoder().encode(RuntimeBackfillChunkSizeProbe(value: self))
+        guard encoded.count <= Self.maxEncodedBytes else {
+            throw RuntimeV1MirrorError.backfillTooLarge
+        }
+    }
+
+    private func invalidBackfill(_ codingPath: [CodingKey]) -> DecodingError {
+        .dataCorrupted(
+            .init(codingPath: codingPath, debugDescription: "backfill entries are not contiguous")
+        )
+    }
+}
+
+/// 避免 `RuntimeBackfillChunkV1.encode` 在执行 64 MiB egress gate 时递归调用自己。
+/// probe 只编码同一组 wire fields，不重复执行 validate。
+private struct RuntimeBackfillChunkSizeProbe: Encodable {
+    let value: RuntimeBackfillChunkV1
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: RuntimeV1CodingKey.self)
+        try value.encodeUncheckedFields(into: &container)
     }
 }
 
@@ -862,10 +1327,12 @@ public enum RuntimeReplyV1: Codable, Sendable {
     case cancellation(CancellationReceiptV1)
     case approval(ApprovalReceiptV1)
     case revocation(RevocationReceiptV1)
+    case subscription(RuntimeSubscriptionReceiptV1)
     case snapshot(ConversationSnapshotV1)
     case catalog(RuntimeCatalogSnapshotV1)
-    case backfill(conversationID: RuntimeConversationID, events: [RuntimeEventV1])
+    case backfill(RuntimeBackfillChunkV1)
     case syncComplete(RuntimeSyncCompleteV1)
+    case transferPart(TransferEnvelopeV1)
     case pairInvite(RuntimePairInviteV1)
     case pendingPairings([RuntimePendingPairingV1])
     case failure(RuntimeFailureV1)
@@ -891,31 +1358,28 @@ public enum RuntimeReplyV1: Codable, Sendable {
             self = .cancellation(try CancellationReceiptV1(from: decoder))
         case "approval": self = .approval(try ApprovalReceiptV1(from: decoder))
         case "revocation": self = .revocation(try RevocationReceiptV1(from: decoder))
+        case "subscription":
+            self = .subscription(try RuntimeSubscriptionReceiptV1(from: decoder))
         case "snapshot": self = .snapshot(try ConversationSnapshotV1(from: decoder))
         case "catalog":
             try rejectUnknownKeys(
                 decoder,
-                allowed: ["reply", "catalogRevision", "entries", "hasMore"]
+                allowed: ["reply", "baseCatalogCursor", "entries", "nextPageCursor"]
             )
             self = .catalog(try RuntimeCatalogSnapshotV1(from: decoder))
         case "backfill":
-            try rejectUnknownKeys(decoder, allowed: ["reply", "conversationId", "events"])
-            self = .backfill(
-                conversationID: try container.decode(
-                    RuntimeConversationID.self,
-                    forKey: key("conversationId")
-                ),
-                events: try container.decode([RuntimeEventV1].self, forKey: key("events"))
-            )
+            self = .backfill(try RuntimeBackfillChunkV1(from: decoder))
         case "syncComplete":
             try rejectUnknownKeys(
                 decoder,
                 allowed: [
-                    "reply", "streamGeneration", "streamCursor", "eventSeq",
+                    "reply", "streamGeneration", "streamCursor", "innerCursor",
                     "keyDirectoryRevision",
                 ]
             )
             self = .syncComplete(try RuntimeReplySyncCompleteV1(from: decoder).value)
+        case "transferPart":
+            self = .transferPart(try RuntimeReplyTransferPartV1(from: decoder).value)
         case "pairInvite":
             try rejectUnknownKeys(
                 decoder,
@@ -975,19 +1439,24 @@ public enum RuntimeReplyV1: Codable, Sendable {
         case .revocation(let receipt):
             try container.encode("revocation", forKey: key("reply"))
             try receipt.encodeFields(into: &container)
+        case .subscription(let receipt):
+            try container.encode("subscription", forKey: key("reply"))
+            try receipt.encodeFields(into: &container)
         case .snapshot(let snapshot):
             try container.encode("snapshot", forKey: key("reply"))
             try snapshot.encodeFields(into: &container)
         case .catalog(let catalog):
             try container.encode("catalog", forKey: key("reply"))
             try catalog.encodeFields(into: &container)
-        case .backfill(let conversationID, let events):
+        case .backfill(let backfill):
             try container.encode("backfill", forKey: key("reply"))
-            try container.encode(conversationID, forKey: key("conversationId"))
-            try container.encode(events, forKey: key("events"))
+            try backfill.encodeFields(into: &container)
         case .syncComplete(let value):
             try container.encode("syncComplete", forKey: key("reply"))
             try value.encodeFields(into: &container)
+        case .transferPart(let transfer):
+            try container.encode("transferPart", forKey: key("reply"))
+            try transfer.encodeFields(into: &container)
         case .pairInvite(let value):
             try container.encode("pairInvite", forKey: key("reply"))
             try value.encodeFields(into: &container)
@@ -1873,7 +2342,7 @@ public struct RuntimeTurnSummaryV1: Codable, Sendable {
 public enum RuntimeStreamItemV1: Codable, Sendable {
     case event(RuntimeEventV1)
     case catalogDelta(RuntimeCatalogDeltaV1)
-    case syncComplete(RuntimeSyncCompleteV1)
+    case transferPart(TransferEnvelopeV1)
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
         case stream
@@ -1884,8 +2353,8 @@ public enum RuntimeStreamItemV1: Codable, Sendable {
         switch try container.decode(String.self, forKey: .stream) {
         case "event": self = .event(try RuntimeStreamEventV1(from: decoder).value)
         case "catalogDelta": self = .catalogDelta(try RuntimeCatalogDeltaV1(from: decoder))
-        case "syncComplete":
-            self = .syncComplete(try RuntimeStreamSyncCompleteV1(from: decoder).value)
+        case "transferPart":
+            self = .transferPart(try RuntimeStreamTransferPartV1(from: decoder).value)
         case let value:
             throw DecodingError.dataCorruptedError(
                 forKey: .stream,
@@ -1905,9 +2374,9 @@ public enum RuntimeStreamItemV1: Codable, Sendable {
             var container = encoder.container(keyedBy: RuntimeV1CodingKey.self)
             try container.encode("catalogDelta", forKey: key("stream"))
             try delta.encodeFields(into: &container)
-        case .syncComplete(let value):
+        case .transferPart(let value):
             var container = encoder.container(keyedBy: RuntimeV1CodingKey.self)
-            try container.encode("syncComplete", forKey: key("stream"))
+            try container.encode("transferPart", forKey: key("stream"))
             try value.encodeFields(into: &container)
         }
     }
@@ -1917,6 +2386,7 @@ public struct RuntimeEventV1: Codable, Sendable {
     public let conversationID: RuntimeConversationID
     public let eventID: RuntimeEventID
     public let eventSeq: UInt64
+    public let commandID: RuntimeCommandID?
     public let itemID: RuntimeItemID?
     public let entityID: RuntimeEntityID?
     public let body: RuntimeEventBodyV1
@@ -1924,7 +2394,10 @@ public struct RuntimeEventV1: Codable, Sendable {
     public init(from decoder: Decoder) throws {
         try rejectUnknownKeys(
             decoder,
-            allowed: ["conversationId", "eventId", "eventSeq", "itemId", "entityId", "body"]
+            allowed: [
+                "conversationId", "eventId", "eventSeq", "commandId", "itemId", "entityId",
+                "body",
+            ]
         )
         try self.init(decodingFieldsFrom: decoder)
     }
@@ -1934,9 +2407,21 @@ public struct RuntimeEventV1: Codable, Sendable {
         conversationID = try container.decode(RuntimeConversationID.self, forKey: key("conversationId"))
         eventID = try container.decode(RuntimeEventID.self, forKey: key("eventId"))
         eventSeq = try container.decode(UInt64.self, forKey: key("eventSeq"))
+        for requiredNullable in ["commandId", "itemId", "entityId"]
+        where !container.contains(key(requiredNullable)) {
+            throw DecodingError.keyNotFound(
+                key(requiredNullable),
+                .init(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "\(requiredNullable) is required even when null"
+                )
+            )
+        }
+        commandID = try container.decodeIfPresent(RuntimeCommandID.self, forKey: key("commandId"))
         itemID = try container.decodeIfPresent(RuntimeItemID.self, forKey: key("itemId"))
         entityID = try container.decodeIfPresent(RuntimeEntityID.self, forKey: key("entityId"))
         body = try container.decode(RuntimeEventBodyV1.self, forKey: key("body"))
+        try validate(codingPath: decoder.codingPath)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -1947,12 +2432,37 @@ public struct RuntimeEventV1: Codable, Sendable {
     fileprivate func encodeFields(
         into container: inout KeyedEncodingContainer<RuntimeV1CodingKey>
     ) throws {
+        try validate(codingPath: container.codingPath)
         try container.encode(conversationID, forKey: key("conversationId"))
         try container.encode(eventID, forKey: key("eventId"))
         try container.encode(eventSeq, forKey: key("eventSeq"))
+        try container.encode(commandID, forKey: key("commandId"))
         try container.encode(itemID, forKey: key("itemId"))
         try container.encode(entityID, forKey: key("entityId"))
         try container.encode(body, forKey: key("body"))
+    }
+
+    private func validate(codingPath: [CodingKey]) throws {
+        let hasItemIdentity = itemID != nil && entityID != nil
+        let hasNoItemIdentity = itemID == nil && entityID == nil
+        let valid: Bool
+        switch body {
+        case .capabilities:
+            valid = commandID == nil && hasNoItemIdentity
+        case .item(let item):
+            let isUserMessage: Bool
+            if case .userMessage = item { isUserMessage = true } else { isUserMessage = false }
+            valid = hasItemIdentity && (!isUserMessage || commandID != nil)
+        case .turnStarted, .actionRequest, .approvalResolved, .turnCompleted, .turnInterrupted:
+            valid = commandID != nil && hasNoItemIdentity
+        case .error:
+            valid = hasNoItemIdentity
+        }
+        guard valid else {
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: codingPath, debugDescription: "runtime event identity mismatch")
+            )
+        }
     }
 }
 
@@ -1963,7 +2473,7 @@ private struct RuntimeReplySyncCompleteV1: Decodable {
         try rejectUnknownKeys(
             decoder,
             allowed: [
-                "reply", "streamGeneration", "streamCursor", "eventSeq",
+                "reply", "streamGeneration", "streamCursor", "innerCursor",
                 "keyDirectoryRevision",
             ]
         )
@@ -1976,26 +2486,6 @@ private struct RuntimeReplySyncCompleteV1: Decodable {
     }
 }
 
-private struct RuntimeStreamSyncCompleteV1: Decodable {
-    let value: RuntimeSyncCompleteV1
-
-    init(from decoder: Decoder) throws {
-        try rejectUnknownKeys(
-            decoder,
-            allowed: [
-                "stream", "streamGeneration", "streamCursor", "eventSeq",
-                "keyDirectoryRevision",
-            ]
-        )
-        let container = try decoder.container(keyedBy: RuntimeV1CodingKey.self)
-        let tag = try container.decode(String.self, forKey: key("stream"))
-        guard tag == "syncComplete" else {
-            throw invalidTag(tag, field: "stream", in: container)
-        }
-        value = try RuntimeSyncCompleteV1(decodingFieldsFrom: decoder)
-    }
-}
-
 private struct RuntimeStreamEventV1: Decodable {
     let value: RuntimeEventV1
 
@@ -2003,8 +2493,8 @@ private struct RuntimeStreamEventV1: Decodable {
         try rejectUnknownKeys(
             decoder,
             allowed: [
-                "stream", "conversationId", "eventId", "eventSeq", "itemId", "entityId",
-                "body",
+                "stream", "conversationId", "eventId", "eventSeq", "commandId", "itemId",
+                "entityId", "body",
             ]
         )
         let container = try decoder.container(keyedBy: RuntimeV1CodingKey.self)
@@ -2019,7 +2509,7 @@ private struct RuntimeStreamEventV1: Decodable {
 public enum RuntimeEventBodyV1: Codable, Sendable {
     case capabilities(RuntimeSessionCapabilitiesV1)
     case item(RuntimeAgentItemV1)
-    case turnStarted(turnID: RuntimeTurnID, commandID: RuntimeCommandID)
+    case turnStarted(turnID: RuntimeTurnID)
     case actionRequest(
         turnID: RuntimeTurnID,
         approvalID: RuntimeApprovalID,
@@ -2053,10 +2543,9 @@ public enum RuntimeEventBodyV1: Codable, Sendable {
                 try container.decode(RuntimeAgentItemV1.self, forKey: key("item"))
             )
         case "turnStarted":
-            try rejectUnknownKeys(decoder, allowed: ["kind", "turn_id", "command_id"])
+            try rejectUnknownKeys(decoder, allowed: ["kind", "turn_id"])
             self = .turnStarted(
-                turnID: try container.decode(RuntimeTurnID.self, forKey: key("turn_id")),
-                commandID: try container.decode(RuntimeCommandID.self, forKey: key("command_id"))
+                turnID: try container.decode(RuntimeTurnID.self, forKey: key("turn_id"))
             )
         case "actionRequest":
             try rejectUnknownKeys(
@@ -2121,10 +2610,9 @@ public enum RuntimeEventBodyV1: Codable, Sendable {
         case .item(let item):
             try container.encode("item", forKey: key("kind"))
             try container.encode(item, forKey: key("item"))
-        case .turnStarted(let turnID, let commandID):
+        case .turnStarted(let turnID):
             try container.encode("turnStarted", forKey: key("kind"))
             try container.encode(turnID, forKey: key("turn_id"))
-            try container.encode(commandID, forKey: key("command_id"))
         case .actionRequest(let turnID, let approvalID, let request):
             try container.encode("actionRequest", forKey: key("kind"))
             try container.encode(turnID, forKey: key("turn_id"))
@@ -2154,14 +2642,31 @@ public enum RuntimeEventBodyV1: Codable, Sendable {
 
 public enum SnapshotItemV1: Codable, Sendable {
     case capabilities(RuntimeSessionCapabilitiesV1)
-    case item(itemID: RuntimeItemID, item: RuntimeAgentItemV1)
+    case item(
+        itemID: RuntimeItemID,
+        entityID: RuntimeEntityID,
+        commandID: RuntimeCommandID?,
+        item: RuntimeAgentItemV1
+    )
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: RuntimeV1CodingKey.self)
         let kindValue = try container.decode(String.self, forKey: key("kind"))
         switch kindValue {
         case "capabilities":
-            try rejectUnknownKeys(decoder, allowed: ["kind", "capabilities"])
+            try rejectUnknownKeys(
+                decoder,
+                allowed: ["kind", "commandId", "itemId", "entityId", "capabilities"]
+            )
+            for identity in ["commandId", "itemId", "entityId"] {
+                guard container.contains(key(identity)), try container.decodeNil(forKey: key(identity)) else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: key(identity),
+                        in: container,
+                        debugDescription: "capabilities identity must be explicit null"
+                    )
+                }
+            }
             self = .capabilities(
                 try container.decode(
                     RuntimeSessionCapabilitiesV1.self,
@@ -2169,10 +2674,33 @@ public enum SnapshotItemV1: Codable, Sendable {
                 )
             )
         case "item":
-            try rejectUnknownKeys(decoder, allowed: ["kind", "item_id", "item"])
+            try rejectUnknownKeys(
+                decoder,
+                allowed: ["kind", "commandId", "itemId", "entityId", "item"]
+            )
+            guard container.contains(key("commandId")) else {
+                throw DecodingError.keyNotFound(
+                    key("commandId"),
+                    .init(codingPath: decoder.codingPath, debugDescription: "commandId is required")
+                )
+            }
+            let commandID = try container.decodeIfPresent(
+                RuntimeCommandID.self,
+                forKey: key("commandId")
+            )
+            let item = try container.decode(RuntimeAgentItemV1.self, forKey: key("item"))
+            if case .userMessage = item, commandID == nil {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key("commandId"),
+                    in: container,
+                    debugDescription: "snapshot UserMessage requires commandId"
+                )
+            }
             self = .item(
-                itemID: try container.decode(RuntimeItemID.self, forKey: key("item_id")),
-                item: try container.decode(RuntimeAgentItemV1.self, forKey: key("item"))
+                itemID: try container.decode(RuntimeItemID.self, forKey: key("itemId")),
+                entityID: try container.decode(RuntimeEntityID.self, forKey: key("entityId")),
+                commandID: commandID,
+                item: item
             )
         default:
             throw invalidTag(kindValue, field: "kind", in: container)
@@ -2184,10 +2712,21 @@ public enum SnapshotItemV1: Codable, Sendable {
         switch self {
         case .capabilities(let capabilities):
             try container.encode("capabilities", forKey: key("kind"))
+            try container.encodeNil(forKey: key("commandId"))
+            try container.encodeNil(forKey: key("itemId"))
+            try container.encodeNil(forKey: key("entityId"))
             try container.encode(capabilities, forKey: key("capabilities"))
-        case .item(let itemID, let item):
+        case .item(let itemID, let entityID, let commandID, let item):
+            if case .userMessage = item, commandID == nil {
+                throw EncodingError.invalidValue(
+                    item,
+                    .init(codingPath: encoder.codingPath, debugDescription: "UserMessage requires commandId")
+                )
+            }
             try container.encode("item", forKey: key("kind"))
-            try container.encode(itemID, forKey: key("item_id"))
+            try container.encode(commandID, forKey: key("commandId"))
+            try container.encode(itemID, forKey: key("itemId"))
+            try container.encode(entityID, forKey: key("entityId"))
             try container.encode(item, forKey: key("item"))
         }
     }
@@ -2195,17 +2734,20 @@ public enum SnapshotItemV1: Codable, Sendable {
 
 public struct ConversationSnapshotV1: Codable, Sendable {
     public let conversationID: RuntimeConversationID
-    public let baseEventSeq: UInt64
+    public let baseEventCursor: RuntimeStreamCursorV1
     public let items: [SnapshotItemV1]
 
     public init(from decoder: Decoder) throws {
         try rejectUnknownKeys(
             decoder,
-            allowed: ["reply", "conversationId", "baseEventSeq", "items"]
+            allowed: ["reply", "conversationId", "baseEventCursor", "items"]
         )
         let container = try decoder.container(keyedBy: RuntimeV1CodingKey.self)
         conversationID = try container.decode(RuntimeConversationID.self, forKey: key("conversationId"))
-        baseEventSeq = try container.decode(UInt64.self, forKey: key("baseEventSeq"))
+        baseEventCursor = try container.decode(
+            RuntimeStreamCursorV1.self,
+            forKey: key("baseEventCursor")
+        )
         items = try container.decode([SnapshotItemV1].self, forKey: key("items"))
         try Self.validate(items, codingPath: decoder.codingPath)
     }
@@ -2219,7 +2761,7 @@ public struct ConversationSnapshotV1: Codable, Sendable {
         into container: inout KeyedEncodingContainer<RuntimeV1CodingKey>
     ) throws {
         try container.encode(conversationID, forKey: key("conversationId"))
-        try container.encode(baseEventSeq, forKey: key("baseEventSeq"))
+        try container.encode(baseEventCursor, forKey: key("baseEventCursor"))
         try container.encode(items, forKey: key("items"))
     }
 
@@ -2243,7 +2785,9 @@ public struct ConversationSnapshotV1: Codable, Sendable {
 // MARK: - Transfer envelope
 
 public struct TransferEnvelopeV1: Codable, Sendable {
-    public static let maxPartBytes = 3_670_016
+    public static let maxRemotePartBytes = 3_670_016
+    public static let maxJSONPartBytes = 700 * 1024
+    public static let maxPartBytes = maxJSONPartBytes
     public static let maxPartCount: UInt32 = 64
     public static let maxTotalBytes: UInt64 = 64 * 1024 * 1024
 
@@ -2263,6 +2807,13 @@ public struct TransferEnvelopeV1: Codable, Sendable {
 
     public init(from decoder: Decoder) throws {
         try rejectUnknownKeys(decoder, allowed: CodingKeys.all)
+        try self.init(decodingFieldsFrom: decoder, maximumPartBytes: Self.maxJSONPartBytes)
+    }
+
+    fileprivate init(
+        decodingFieldsFrom decoder: Decoder,
+        maximumPartBytes: Int
+    ) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         transferID = try container.decode(RuntimeTransferID.self, forKey: .transferID)
         partIndex = try container.decode(UInt32.self, forKey: .partIndex)
@@ -2270,37 +2821,315 @@ public struct TransferEnvelopeV1: Codable, Sendable {
         totalSHA256 = try container.decode(Data.self, forKey: .totalSHA256)
         totalBytes = try container.decode(UInt64.self, forKey: .totalBytes)
         part = try container.decode(Data.self, forKey: .part)
+        try validate(maximumPartBytes: maximumPartBytes, codingPath: decoder.codingPath)
+    }
+
+    init(
+        transferID: RuntimeTransferID,
+        partIndex: UInt32,
+        partCount: UInt32,
+        totalSHA256: Data,
+        totalBytes: UInt64,
+        part: Data,
+        maximumPartBytes: Int
+    ) throws {
+        self.transferID = transferID
+        self.partIndex = partIndex
+        self.partCount = partCount
+        self.totalSHA256 = totalSHA256
+        self.totalBytes = totalBytes
+        self.part = part
+        try validate(maximumPartBytes: maximumPartBytes, codingPath: [])
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        try validate(maximumPartBytes: Self.maxJSONPartBytes, codingPath: encoder.codingPath)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(transferID, forKey: .transferID)
+        try container.encode(partIndex, forKey: .partIndex)
+        try container.encode(partCount, forKey: .partCount)
+        try container.encode(totalSHA256, forKey: .totalSHA256)
+        try container.encode(totalBytes, forKey: .totalBytes)
+        try container.encode(part, forKey: .part)
+    }
+
+    fileprivate func encodeFields(
+        into container: inout KeyedEncodingContainer<RuntimeV1CodingKey>
+    ) throws {
+        try validate(maximumPartBytes: Self.maxJSONPartBytes, codingPath: container.codingPath)
+        try container.encode(transferID, forKey: key("transferId"))
+        try container.encode(partIndex, forKey: key("partIndex"))
+        try container.encode(partCount, forKey: key("partCount"))
+        try container.encode(totalSHA256, forKey: key("totalSha256"))
+        try container.encode(totalBytes, forKey: key("totalBytes"))
+        try container.encode(part, forKey: key("part"))
+    }
+
+    fileprivate func validate(maximumPartBytes: Int, codingPath: [CodingKey]) throws {
+        let maximumRepresentable = UInt64(partCount) * UInt64(maximumPartBytes)
         guard partCount > 0,
               partCount <= Self.maxPartCount,
               partIndex < partCount,
               totalSHA256.count == 32,
               totalBytes <= Self.maxTotalBytes,
-              part.count <= Self.maxPartBytes
+              totalBytes <= maximumRepresentable,
+              part.count <= maximumPartBytes,
+              UInt64(part.count) <= totalBytes
         else {
             throw DecodingError.dataCorrupted(
-                .init(codingPath: decoder.codingPath, debugDescription: "invalid transfer bounds")
+                .init(codingPath: codingPath, debugDescription: "invalid transfer bounds")
             )
         }
+    }
+}
+
+private struct RuntimeReplyTransferPartV1: Decodable {
+    let value: TransferEnvelopeV1
+
+    init(from decoder: Decoder) throws {
+        try rejectUnknownKeys(
+            decoder,
+            allowed: [
+                "reply", "transferId", "partIndex", "partCount", "totalSha256", "totalBytes",
+                "part",
+            ]
+        )
+        let container = try decoder.container(keyedBy: RuntimeV1CodingKey.self)
+        let tag = try container.decode(String.self, forKey: key("reply"))
+        guard tag == "transferPart" else { throw invalidTag(tag, field: "reply", in: container) }
+        value = try TransferEnvelopeV1(
+            decodingFieldsFrom: decoder,
+            maximumPartBytes: TransferEnvelopeV1.maxJSONPartBytes
+        )
+    }
+}
+
+private struct RuntimeStreamTransferPartV1: Decodable {
+    let value: TransferEnvelopeV1
+
+    init(from decoder: Decoder) throws {
+        try rejectUnknownKeys(
+            decoder,
+            allowed: [
+                "stream", "transferId", "partIndex", "partCount", "totalSha256", "totalBytes",
+                "part",
+            ]
+        )
+        let container = try decoder.container(keyedBy: RuntimeV1CodingKey.self)
+        let tag = try container.decode(String.self, forKey: key("stream"))
+        guard tag == "transferPart" else { throw invalidTag(tag, field: "stream", in: container) }
+        value = try TransferEnvelopeV1(
+            decodingFieldsFrom: decoder,
+            maximumPartBytes: TransferEnvelopeV1.maxJSONPartBytes
+        )
+    }
+}
+
+public enum RuntimeTransferChannelV1: UInt8, Sendable {
+    case reply = 0
+    case stream = 1
+}
+
+public struct RuntimeTransferCarrierV1: Sendable {
+    public static let maxBytes = 4 * 1024 * 1024
+    public let runtimeVersion: UInt16
+    public let messageID: RuntimeMessageID
+    public let channel: RuntimeTransferChannelV1
+    public let transfer: TransferEnvelopeV1
+
+    public init(
+        messageID: RuntimeMessageID,
+        channel: RuntimeTransferChannelV1,
+        transfer: TransferEnvelopeV1
+    ) {
+        runtimeVersion = runtimeProtocolVersionV1
+        self.messageID = messageID
+        self.channel = channel
+        self.transfer = transfer
+    }
+
+    fileprivate init(
+        runtimeVersion: UInt16,
+        messageID: RuntimeMessageID,
+        channel: RuntimeTransferChannelV1,
+        transfer: TransferEnvelopeV1
+    ) {
+        self.runtimeVersion = runtimeVersion
+        self.messageID = messageID
+        self.channel = channel
+        self.transfer = transfer
     }
 }
 
 // MARK: - Actual JSON entry points
 
 public enum RuntimeV1WireCodec {
+    public static let maxRequestBytes = 1024 * 1024
+    public static let maxJSONFrameBytes = 1024 * 1024
+
     public static func decodeEnvelope(_ data: Data) throws -> RuntimeEnvelopeV1 {
-        try JSONDecoder().decode(RuntimeEnvelopeV1.self, from: data)
+        guard data.count < maxJSONFrameBytes else { throw RuntimeV1MirrorError.frameTooLarge }
+        let value = try JSONDecoder().decode(RuntimeEnvelopeV1.self, from: data)
+        if case .request = value.body, data.count >= maxRequestBytes {
+            throw RuntimeV1MirrorError.frameTooLarge
+        }
+        return value
     }
 
     public static func decodeTransferEnvelope(_ data: Data) throws -> TransferEnvelopeV1 {
-        try JSONDecoder().decode(TransferEnvelopeV1.self, from: data)
+        guard data.count < maxJSONFrameBytes else { throw RuntimeV1MirrorError.frameTooLarge }
+        return try JSONDecoder().decode(TransferEnvelopeV1.self, from: data)
     }
 
     public static func encode(_ value: RuntimeEnvelopeV1) throws -> Data {
-        try JSONEncoder().encode(value)
+        let data = try JSONEncoder().encode(value)
+        guard data.count < maxJSONFrameBytes else { throw RuntimeV1MirrorError.frameTooLarge }
+        if case .request = value.body, data.count >= maxRequestBytes {
+            throw RuntimeV1MirrorError.frameTooLarge
+        }
+        return data
     }
 
     public static func encode(_ value: TransferEnvelopeV1) throws -> Data {
-        try JSONEncoder().encode(value)
+        let data = try JSONEncoder().encode(value)
+        guard data.count < maxJSONFrameBytes else { throw RuntimeV1MirrorError.frameTooLarge }
+        return data
+    }
+
+    public static func decodeTransferCarrier(_ data: Data) throws -> RuntimeTransferCarrierV1 {
+        guard data.count < RuntimeTransferCarrierV1.maxBytes else {
+            throw RuntimeV1MirrorError.transferTooLarge
+        }
+        var reader = RuntimeTransferCarrierReader(data: data)
+        guard try reader.take(5) == Data("ADRT1".utf8) else {
+            throw RuntimeV1MirrorError.invalidTransferCarrier
+        }
+        let version = try reader.readUInt16()
+        guard version == runtimeProtocolVersionV1 else {
+            throw RuntimeV1MirrorError.invalidTransferCarrier
+        }
+        guard let channel = RuntimeTransferChannelV1(rawValue: try reader.readUInt8()) else {
+            throw RuntimeV1MirrorError.invalidTransferCarrier
+        }
+        let messageID = try reader.readUTF8UInt16()
+        let transferID = try reader.readUTF8UInt16()
+        guard !messageID.isEmpty,
+              !transferID.isEmpty,
+              messageID.utf8.count <= RuntimeMessageIDKind.maximumWireUTF8Bytes!,
+              transferID.utf8.count <= RuntimeTransferIDKind.maximumWireUTF8Bytes!
+        else {
+            throw RuntimeV1MirrorError.invalidTransferCarrier
+        }
+        let partIndex = try reader.readUInt32()
+        let partCount = try reader.readUInt32()
+        let totalSHA256 = try reader.take(32)
+        let totalBytes = try reader.readUInt64()
+        let partLength = Int(try reader.readUInt32())
+        let part = try reader.take(partLength)
+        guard reader.isAtEnd else { throw RuntimeV1MirrorError.invalidTransferCarrier }
+        let transfer = try TransferEnvelopeV1(
+            transferID: RuntimeTransferID(rawValue: transferID),
+            partIndex: partIndex,
+            partCount: partCount,
+            totalSHA256: totalSHA256,
+            totalBytes: totalBytes,
+            part: part,
+            maximumPartBytes: TransferEnvelopeV1.maxRemotePartBytes
+        )
+        return RuntimeTransferCarrierV1(
+            runtimeVersion: version,
+            messageID: RuntimeMessageID(rawValue: messageID),
+            channel: channel,
+            transfer: transfer
+        )
+    }
+
+    public static func encode(_ value: RuntimeTransferCarrierV1) throws -> Data {
+        guard value.runtimeVersion == runtimeProtocolVersionV1 else {
+            throw RuntimeV1MirrorError.invalidTransferCarrier
+        }
+        try value.transfer.validate(
+            maximumPartBytes: TransferEnvelopeV1.maxRemotePartBytes,
+            codingPath: []
+        )
+        let message = Data(value.messageID.rawValue.utf8)
+        let transferID = Data(value.transfer.transferID.rawValue.utf8)
+        guard !message.isEmpty,
+              !transferID.isEmpty,
+              message.count <= RuntimeMessageIDKind.maximumWireUTF8Bytes!,
+              transferID.count <= RuntimeTransferIDKind.maximumWireUTF8Bytes!,
+              value.transfer.part.count <= Int(UInt32.max)
+        else {
+            throw RuntimeV1MirrorError.invalidTransferCarrier
+        }
+
+        var data = Data("ADRT1".utf8)
+        appendBigEndian(value.runtimeVersion, to: &data)
+        data.append(value.channel.rawValue)
+        appendBigEndian(UInt16(message.count), to: &data)
+        data.append(message)
+        appendBigEndian(UInt16(transferID.count), to: &data)
+        data.append(transferID)
+        appendBigEndian(value.transfer.partIndex, to: &data)
+        appendBigEndian(value.transfer.partCount, to: &data)
+        data.append(value.transfer.totalSHA256)
+        appendBigEndian(value.transfer.totalBytes, to: &data)
+        appendBigEndian(UInt32(value.transfer.part.count), to: &data)
+        data.append(value.transfer.part)
+        guard data.count < RuntimeTransferCarrierV1.maxBytes else {
+            throw RuntimeV1MirrorError.transferTooLarge
+        }
+        return data
+    }
+
+    private static func appendBigEndian<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
+        var bigEndian = value.bigEndian
+        withUnsafeBytes(of: &bigEndian) { data.append(contentsOf: $0) }
+    }
+}
+
+private struct RuntimeTransferCarrierReader {
+    let data: Data
+    var offset = 0
+
+    var isAtEnd: Bool { offset == data.count }
+
+    mutating func take(_ count: Int) throws -> Data {
+        guard count >= 0, offset <= data.count, count <= data.count - offset else {
+            throw RuntimeV1MirrorError.invalidTransferCarrier
+        }
+        defer { offset += count }
+        return data.subdata(in: offset..<(offset + count))
+    }
+
+    mutating func readUInt8() throws -> UInt8 {
+        guard let value = try take(1).first else {
+            throw RuntimeV1MirrorError.invalidTransferCarrier
+        }
+        return value
+    }
+
+    mutating func readUInt16() throws -> UInt16 {
+        let bytes = [UInt8](try take(2))
+        return (UInt16(bytes[0]) << 8) | UInt16(bytes[1])
+    }
+
+    mutating func readUInt32() throws -> UInt32 {
+        let bytes = [UInt8](try take(4))
+        return bytes.reduce(0) { ($0 << 8) | UInt32($1) }
+    }
+
+    mutating func readUInt64() throws -> UInt64 {
+        let bytes = [UInt8](try take(8))
+        return bytes.reduce(0) { ($0 << 8) | UInt64($1) }
+    }
+
+    mutating func readUTF8UInt16() throws -> String {
+        let length = Int(try readUInt16())
+        guard let value = String(data: try take(length), encoding: .utf8) else {
+            throw RuntimeV1MirrorError.invalidTransferCarrier
+        }
+        return value
     }
 }
 

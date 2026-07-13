@@ -10,7 +10,9 @@
 //! gate，同时防止实现只留下同名空测试、把安全事务拆开，或悄悄改变公开 receipt 语义。
 
 use agentdeck_protocol::ActionDecisionKind;
-use agentdeck_protocol::runtime::identity::{ApprovalId, ConversationId, EventId, TurnId};
+use agentdeck_protocol::runtime::identity::{
+    ApprovalId, CommandId, ConversationId, EventId, TurnId,
+};
 use agentdeck_protocol::runtime::{
     ApprovalDeliveryState, ApprovalReceipt, RuntimeEvent, RuntimeEventBody, RuntimeRequest,
 };
@@ -467,6 +469,7 @@ fn default_deadline_is_request_time_plus_thirty_minutes() {
         conversation_id: ConversationId::new("conversation-gate-0001"),
         event_id: EventId::new("event-gate-expired"),
         event_seq: 7,
+        command_id: Some(CommandId::new("command-gate-expired")),
         item_id: None,
         entity_id: None,
         body: RuntimeEventBody::ApprovalResolved {

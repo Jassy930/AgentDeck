@@ -48,6 +48,7 @@ pub enum SealedPayloadKind {
     BackfillChunk,
     KeyUpdate,
     PairingMessage,
+    TransferPart,
 }
 
 impl SealedPayloadKind {
@@ -64,16 +65,87 @@ impl SealedPayloadKind {
             SealedPayloadKind::BackfillChunk => 8,
             SealedPayloadKind::KeyUpdate => 9,
             SealedPayloadKind::PairingMessage => 10,
+            SealedPayloadKind::TransferPart => 11,
         }
+    }
+
+    fn from_tag(tag: u8) -> Option<Self> {
+        Some(match tag {
+            0 => Self::CatalogSnapshot,
+            1 => Self::CatalogDelta,
+            2 => Self::ConversationSnapshot,
+            3 => Self::ConversationEvent,
+            4 => Self::CommandRequest,
+            5 => Self::CommandReceipt,
+            6 => Self::ApprovalDecision,
+            7 => Self::ApprovalReceipt,
+            8 => Self::BackfillChunk,
+            9 => Self::KeyUpdate,
+            10 => Self::PairingMessage,
+            11 => Self::TransferPart,
+            _ => return None,
+        })
     }
 }
 
-/// 密文内 payload 头（引用业务类型，AEAD 保护）。
+const SEALED_PAYLOAD_MAGIC: &[u8; 5] = b"ADSP1";
+
+/// 密文内 payload（业务类型 + 原始业务 bytes，整体由 AEAD 保护）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SealedPayloadV1 {
     pub format_version: u16,
     pub payload_kind: SealedPayloadKind,
+    #[serde(with = "crate::e2ee::b64_vec")]
+    #[schemars(with = "String")]
+    pub payload: Vec<u8>,
+}
+
+impl SealedPayloadV1 {
+    pub fn new(payload_kind: SealedPayloadKind, payload: Vec<u8>) -> Self {
+        Self {
+            format_version: super::E2EE_FORMAT_VERSION,
+            payload_kind,
+            payload,
+        }
+    }
+
+    /// AEAD plaintext 的 compact canonical bytes：`ADSP1 | version | kind | len | payload`。
+    pub fn to_plaintext_bytes(&self) -> Result<Vec<u8>, E2eeError> {
+        if self.format_version != super::E2EE_FORMAT_VERSION {
+            return Err(E2eeError::BadCiphertext);
+        }
+        let payload_len =
+            u32::try_from(self.payload.len()).map_err(|_| E2eeError::BadCiphertext)?;
+        let mut out = Vec::with_capacity(12 + self.payload.len());
+        out.extend_from_slice(SEALED_PAYLOAD_MAGIC);
+        out.extend_from_slice(&self.format_version.to_be_bytes());
+        out.push(self.payload_kind.tag());
+        out.extend_from_slice(&payload_len.to_be_bytes());
+        out.extend_from_slice(&self.payload);
+        Ok(out)
+    }
+
+    /// 只在 AEAD open 成功后调用；wrong magic/version/kind/length/trailing 都 fail-close。
+    pub fn from_plaintext_bytes(bytes: &[u8]) -> Result<Self, E2eeError> {
+        if bytes.len() < 12 || &bytes[..5] != SEALED_PAYLOAD_MAGIC {
+            return Err(E2eeError::BadCiphertext);
+        }
+        let format_version = u16::from_be_bytes([bytes[5], bytes[6]]);
+        if format_version != super::E2EE_FORMAT_VERSION {
+            return Err(E2eeError::BadCiphertext);
+        }
+        let payload_kind = SealedPayloadKind::from_tag(bytes[7]).ok_or(E2eeError::BadCiphertext)?;
+        let payload_len = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+        if payload_len != bytes.len() - 12 {
+            return Err(E2eeError::BadCiphertext);
+        }
+        Ok(Self {
+            format_version,
+            payload_kind,
+            payload: bytes[12..].to_vec(),
+        })
+    }
 }
 
 /// 未签名 sealed blob（outer 结构：format / keyId / epoch / revision / nonce / ciphertext）。
@@ -82,7 +154,6 @@ pub struct SealedPayloadV1 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UnsignedSealedBlobV1 {
     pub format_version: u16,
-    pub payload_kind: SealedPayloadKind,
     pub key_id: KeyId,
     pub key_epoch: u64,
     pub key_directory_revision: u64,
@@ -96,7 +167,6 @@ pub struct UnsignedSealedBlobV1 {
 
 impl UnsignedSealedBlobV1 {
     pub fn new(
-        payload_kind: SealedPayloadKind,
         key_id: KeyId,
         key_epoch: u64,
         key_directory_revision: u64,
@@ -105,7 +175,6 @@ impl UnsignedSealedBlobV1 {
     ) -> Self {
         Self {
             format_version: super::E2EE_FORMAT_VERSION,
-            payload_kind,
             key_id,
             key_epoch,
             key_directory_revision,
@@ -119,7 +188,6 @@ impl UnsignedSealedBlobV1 {
         let mut e = Enc::new();
         e.domain(b"AgentDeck/SealedBlobV1\0");
         e.u16(self.format_version);
-        e.u8(self.payload_kind.tag());
         e.u8(self.key_id.purpose.tag());
         e.u64(self.key_id.epoch);
         e.u64(self.key_epoch);
@@ -133,7 +201,7 @@ impl UnsignedSealedBlobV1 {
     /// （MachineDataSign / DeviceSign）签名与验签。
     ///
     /// 绑定：outer machine/device/stream/request route、outer stream generation +
-    /// streamSeq/cursor、key epoch、inner format version + payload kind + key id +
+    /// streamSeq/cursor、key epoch、inner format version + key id +
     /// key-directory revision、nonce（含 sender counter，design §7.4）与 encrypted-section
     /// （ciphertext）的 SHA-256。**排除**签名本身，避免循环 preimage。
     ///
@@ -146,7 +214,6 @@ impl UnsignedSealedBlobV1 {
         e.bytes(&context.encode_aad());
         // inner 头部字段。
         e.u16(self.format_version);
-        e.u8(self.payload_kind.tag());
         e.u8(self.key_id.purpose.tag());
         e.u64(self.key_id.epoch);
         e.u64(self.key_epoch);

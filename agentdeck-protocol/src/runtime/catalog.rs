@@ -4,7 +4,8 @@
 //! 只存在于各 adapter 私有 namespace，**永不进入 catalog bytes 或客户端 wire**。
 //! `catalog_revision` 是独立于 `event_seq` 的 canonical revision。
 
-use crate::runtime::identity::{AdapterStateKey, ConversationId};
+use crate::runtime::identity::{AdapterStateKey, CatalogPageCursor, ConversationId};
+use crate::runtime::sync::StreamCursor;
 use crate::trunk::AgentKind;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -12,12 +13,16 @@ use std::path::PathBuf;
 
 /// Catalog 每页最多 500 rows（design §9.5）。
 pub const MAX_CATALOG_PAGE_ROWS: usize = 500;
+/// 冻结 catalog page 的最大 encoded 大小（64 MiB）。
+pub const MAX_CATALOG_PAGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// catalog 校验失败。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CatalogError {
     #[error("catalog page exceeds {MAX_CATALOG_PAGE_ROWS} rows")]
     PageTooLarge,
+    #[error("catalog page exceeds {MAX_CATALOG_PAGE_BYTES} encoded bytes")]
+    EncodedTooLarge,
 }
 
 /// 一个会话目录条目（中立业务内容）。
@@ -40,29 +45,42 @@ pub struct ConversationEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CatalogSnapshot {
-    pub catalog_revision: u64,
+    pub base_catalog_cursor: StreamCursor,
     entries: Vec<ConversationEntry>,
-    pub has_more: bool,
+    #[schemars(with = "crate::runtime::schema::RequiredNullable<CatalogPageCursor>")]
+    next_page_cursor: Option<CatalogPageCursor>,
 }
 
 impl CatalogSnapshot {
     pub fn new(
-        catalog_revision: u64,
+        base_catalog_cursor: StreamCursor,
         entries: Vec<ConversationEntry>,
-        has_more: bool,
+        next_page_cursor: Option<CatalogPageCursor>,
     ) -> Result<Self, CatalogError> {
         if entries.len() > MAX_CATALOG_PAGE_ROWS {
             return Err(CatalogError::PageTooLarge);
         }
-        Ok(Self {
-            catalog_revision,
+        let snapshot = Self {
+            base_catalog_cursor,
             entries,
-            has_more,
-        })
+            next_page_cursor,
+        };
+        if serde_json::to_vec(&snapshot)
+            .map_err(|_| CatalogError::EncodedTooLarge)?
+            .len()
+            > MAX_CATALOG_PAGE_BYTES
+        {
+            return Err(CatalogError::EncodedTooLarge);
+        }
+        Ok(snapshot)
     }
 
     pub fn entries(&self) -> &[ConversationEntry] {
         &self.entries
+    }
+
+    pub fn next_page_cursor(&self) -> Option<&CatalogPageCursor> {
+        self.next_page_cursor.as_ref()
     }
 }
 
@@ -74,14 +92,24 @@ impl<'de> Deserialize<'de> for CatalogSnapshot {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct Wire {
-            catalog_revision: u64,
+            base_catalog_cursor: StreamCursor,
             entries: Vec<ConversationEntry>,
-            has_more: bool,
+            #[serde(deserialize_with = "deserialize_required_optional_page_cursor")]
+            next_page_cursor: Option<CatalogPageCursor>,
         }
         let w = Wire::deserialize(deserializer)?;
-        CatalogSnapshot::new(w.catalog_revision, w.entries, w.has_more)
+        CatalogSnapshot::new(w.base_catalog_cursor, w.entries, w.next_page_cursor)
             .map_err(serde::de::Error::custom)
     }
+}
+
+fn deserialize_required_optional_page_cursor<'de, D>(
+    deserializer: D,
+) -> Result<Option<CatalogPageCursor>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<CatalogPageCursor>::deserialize(deserializer)
 }
 
 /// catalog 增量。

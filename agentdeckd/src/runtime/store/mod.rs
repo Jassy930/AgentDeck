@@ -5,6 +5,7 @@ mod approval;
 pub mod cipher;
 pub mod identity;
 mod journal;
+mod persisted_event;
 pub mod queue;
 mod recovery;
 mod schema;

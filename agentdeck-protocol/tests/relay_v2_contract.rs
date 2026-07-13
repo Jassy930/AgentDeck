@@ -9,7 +9,7 @@
 use agentdeck_protocol::e2ee::{
     DeviceAuthorizationV1, E2EE_FORMAT_VERSION, EpochBarrierV1, KeyDirectoryEntry, KeyDirectoryV1,
     KeyId, KeyPurpose, KeyUpdateV1, PairInviteV1, PairRequestV1, PairResponseV1, SealedPayloadKind,
-    SealedPayloadV1,
+    SealedPayloadV1, UnsignedSealedBlobV1,
 };
 use agentdeck_protocol::relay_v2::auth::{
     CertRole, DeviceRevocation, Ed25519Signature, PublicKeyBytes, RelayGrant, SignedCertificate,
@@ -33,6 +33,11 @@ use agentdeck_protocol::relay_v2::id::{
     StreamGenerationId, StreamRouteId, TrustEpoch,
 };
 use agentdeck_protocol::relay_v2::{RELAY_PROTOCOL_VERSION, StreamCursor};
+use agentdeck_protocol::runtime::identity::{ConversationId, MessageId, TransferId};
+use agentdeck_protocol::runtime::{
+    RuntimeInnerCursor, RuntimeTransferCarrierV1, RuntimeTransferChannel, TransferEnvelope,
+};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
@@ -364,7 +369,10 @@ fn endpoint_wire_vectors() -> Vec<serde_json::Value> {
     let barrier = EpochBarrierV1 {
         stream_generation: sg(),
         stream_cursor: StreamCursor::At(42),
-        event_seq: 41,
+        inner_cursor: RuntimeInnerCursor::Conversation {
+            conversation_id: ConversationId::new("conversation-epoch-barrier"),
+            cursor: StreamCursor::At(41),
+        },
         old_epoch: 4,
         new_epoch: 5,
         key_directory_revision: KeyDirectoryRevision::new(3),
@@ -372,6 +380,7 @@ fn endpoint_wire_vectors() -> Vec<serde_json::Value> {
     let sealed_payload = SealedPayloadV1 {
         format_version: E2EE_FORMAT_VERSION,
         payload_kind: SealedPayloadKind::ConversationEvent,
+        payload: vec![0xCA, 0xFE],
     };
 
     vec![
@@ -414,6 +423,15 @@ fn endpoint_wire_vectors() -> Vec<serde_json::Value> {
             "case": "sealedPayload",
             "wireType": "SealedPayloadV1",
             "value": serde_json::to_value(sealed_payload).unwrap(),
+        }),
+        serde_json::json!({
+            "case": "sealedPayloadTransferPart",
+            "wireType": "SealedPayloadV1",
+            "value": serde_json::to_value(SealedPayloadV1 {
+                format_version: E2EE_FORMAT_VERSION,
+                payload_kind: SealedPayloadKind::TransferPart,
+                payload: b"ADRT1".to_vec(),
+            }).unwrap(),
         }),
     ]
 }
@@ -556,13 +574,45 @@ fn codec_rejects_oversize_before_parsing_any_field() {
 #[test]
 fn full_frame_with_3_5_mib_part_stays_within_4_mib() {
     let part = vec![0x5A; 3_670_016]; // 3.5 MiB
+    let transfer = TransferEnvelope::new(
+        TransferId::new("transfer-max-remote"),
+        0,
+        1,
+        Sha256::digest(&part).into(),
+        part.len() as u64,
+        part,
+    )
+    .expect("remote raw part is within 3.5 MiB limit");
+    let carrier = RuntimeTransferCarrierV1::new(
+        MessageId::new("message-max-remote"),
+        RuntimeTransferChannel::Stream,
+        transfer,
+    )
+    .encode()
+    .expect("compact carrier must fit");
+    let mut ciphertext = SealedPayloadV1::new(SealedPayloadKind::TransferPart, carrier)
+        .to_plaintext_bytes()
+        .expect("inner sealed payload must encode");
+    ciphertext.extend_from_slice(&[0_u8; 16]); // AEAD tag overhead
+    let sealed = UnsignedSealedBlobV1::new(
+        KeyId {
+            purpose: KeyPurpose::ConversationDek,
+            epoch: 1,
+        },
+        1,
+        1,
+        [0_u8; 12],
+        ciphertext,
+    )
+    .attach_signature(sig())
+    .to_wire_bytes();
     let frame = OpaqueRouteFrame {
         version: RELAY_PROTOCOL_VERSION,
         body: RelayFrameBody::Publish(Publish {
             stream_route: sr(),
             generation: sg(),
             stream_seq: 1,
-            sealed_blob: SealedBlob(part),
+            sealed_blob: SealedBlob(sealed),
         }),
     };
     let bytes = codec::encode(&frame);

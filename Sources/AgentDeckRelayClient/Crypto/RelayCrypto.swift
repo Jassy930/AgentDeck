@@ -135,8 +135,15 @@ public enum RelayCrypto {
         appendBigEndian(counter, to: &nonce)
         let aad = try CanonicalCodec.encodeAAD(context)
         do {
+            let sealedPayload = try encodeSealedPayload(
+                RelaySealedPayloadV1(
+                    formatVersion: 1,
+                    payloadKind: key.payloadKind,
+                    payload: plaintext
+                )
+            )
             let sealed = try ChaChaPoly.seal(
-                plaintext,
+                sealedPayload,
                 using: key.symmetricKey,
                 nonce: ChaChaPoly.Nonce(data: nonce),
                 authenticating: aad
@@ -149,7 +156,6 @@ public enum RelayCrypto {
             ciphertext.append(sealed.tag)
             return UnsignedSealedBlobV1(
                 formatVersion: 1,
-                payloadKind: key.payloadKind,
                 keyID: key.keyID,
                 keyEpoch: key.epoch,
                 keyDirectoryRevision: key.keyDirectoryRevision,
@@ -191,6 +197,14 @@ public enum RelayCrypto {
         key: AeadReceivingKey,
         context: OuterContextV1
     ) throws -> Data {
+        try openSealedPayload(blob, key: key, context: context).payload
+    }
+
+    public static func openSealedPayload(
+        _ blob: VerifiedSealedBlobV1,
+        key: AeadReceivingKey,
+        context: OuterContextV1
+    ) throws -> RelaySealedPayloadV1 {
         let sealed = blob.inner.inner
         guard sealed.nonce.count == 12, sealed.ciphertext.count >= 16 else {
             throw RelayCryptoError.badCiphertext
@@ -205,7 +219,8 @@ public enum RelayCrypto {
                 ciphertext: ciphertext,
                 tag: tag
             )
-            return try ChaChaPoly.open(box, using: key.symmetricKey, authenticating: aad)
+            let plaintext = try ChaChaPoly.open(box, using: key.symmetricKey, authenticating: aad)
+            return try decodeSealedPayload(plaintext)
         } catch {
             throw RelayCryptoError.badCiphertext
         }
@@ -239,6 +254,45 @@ public enum RelayCrypto {
         Swift.withUnsafeBytes(of: &bigEndian) { bytes in
             data.append(contentsOf: bytes)
         }
+    }
+
+    static func encodeSealedPayload(_ value: RelaySealedPayloadV1) throws -> Data {
+        guard value.formatVersion == 1,
+              let payloadLength = UInt32(exactly: value.payload.count)
+        else {
+            throw RelayCryptoError.sealFailure
+        }
+        var data = Data("ADSP1".utf8)
+        appendBigEndian(value.formatVersion, to: &data)
+        data.append(value.payloadKind.canonicalTag)
+        appendBigEndian(payloadLength, to: &data)
+        data.append(value.payload)
+        return data
+    }
+
+    static func decodeSealedPayload(_ data: Data) throws -> RelaySealedPayloadV1 {
+        guard data.count >= 12,
+              data.prefix(5) == Data("ADSP1".utf8)
+        else {
+            throw RelayCryptoError.badCiphertext
+        }
+        let bytes = [UInt8](data.prefix(12))
+        let version = (UInt16(bytes[5]) << 8) | UInt16(bytes[6])
+        let payloadLength = (UInt32(bytes[8]) << 24)
+            | (UInt32(bytes[9]) << 16)
+            | (UInt32(bytes[10]) << 8)
+            | UInt32(bytes[11])
+        guard version == 1,
+              let kind = SealedPayloadKind(canonicalTag: bytes[7]),
+              Int(payloadLength) == data.count - 12
+        else {
+            throw RelayCryptoError.badCiphertext
+        }
+        return RelaySealedPayloadV1(
+            formatVersion: version,
+            payloadKind: kind,
+            payload: Data(data.dropFirst(12))
+        )
     }
 
     private static func normalized(_ data: Data) -> Data {

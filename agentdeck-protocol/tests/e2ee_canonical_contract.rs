@@ -29,6 +29,8 @@ use agentdeck_protocol::relay_v2::id::{
     DeviceRouteId, GrantSerial, KeyDirectoryRevision, LinkGeneration, MachineRouteId, PairRouteId,
     RelayServerId, RootKeyId, StreamGenerationId, StreamRouteId, TrustEpoch,
 };
+use agentdeck_protocol::runtime::identity::ConversationId;
+use agentdeck_protocol::runtime::sync::RuntimeInnerCursor;
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -73,7 +75,6 @@ fn e2ee_format_version_is_one() {
 
 fn unsigned() -> UnsignedSealedBlobV1 {
     UnsignedSealedBlobV1::new(
-        SealedPayloadKind::ConversationEvent,
         KeyId {
             purpose: KeyPurpose::ConversationDek,
             epoch: 4,
@@ -103,6 +104,23 @@ fn type_state_progresses_unsigned_signed_verified() {
     assert_eq!(
         signed.verify(&pk()).unwrap_err(),
         E2eeError::CryptoNotAvailable
+    );
+}
+
+#[test]
+fn sealed_blob_outer_exposes_only_generic_crypto_header() {
+    let value = unsigned();
+    let json = serde_json::to_value(&value).unwrap();
+    assert!(
+        json.get("payloadKind").is_none(),
+        "business payload kind must remain inside AEAD plaintext"
+    );
+
+    let wire = value.attach_signature(sig()).to_wire_bytes();
+    let first_header_tag = b"AgentDeck/SealedBlobV1\0".len() + 2;
+    assert_eq!(
+        wire[first_header_tag], 1,
+        "first tag after formatVersion must be generic ConversationDEK key purpose"
     );
 }
 
@@ -172,11 +190,42 @@ fn sealed_payload_kind_names_business_payload_types() {
     let p = SealedPayloadV1 {
         format_version: E2EE_FORMAT_VERSION,
         payload_kind: SealedPayloadKind::ApprovalDecision,
+        payload: vec![0xCA, 0xFE],
     };
     let jv = serde_json::to_value(&p).unwrap();
     assert_eq!(jv["payloadKind"], "approvalDecision");
     let back: SealedPayloadV1 = serde_json::from_value(jv).unwrap();
     assert_eq!(back, p);
+
+    let encoded = p.to_plaintext_bytes().unwrap();
+    assert_eq!(SealedPayloadV1::from_plaintext_bytes(&encoded).unwrap(), p);
+
+    let mut malformed = Vec::new();
+    malformed.push(Vec::new());
+    let mut bad_magic = encoded.clone();
+    bad_magic[0] ^= 0xFF;
+    malformed.push(bad_magic);
+    let mut bad_version = encoded.clone();
+    bad_version[6] = 2;
+    malformed.push(bad_version);
+    let mut bad_kind = encoded.clone();
+    bad_kind[7] = 0xFF;
+    malformed.push(bad_kind);
+    let mut declared_short = encoded.clone();
+    declared_short[11] = 1;
+    malformed.push(declared_short);
+    let mut declared_long = encoded.clone();
+    declared_long[11] = 3;
+    malformed.push(declared_long);
+    let mut trailing = encoded;
+    trailing.push(0);
+    malformed.push(trailing);
+    for bytes in malformed {
+        assert_eq!(
+            SealedPayloadV1::from_plaintext_bytes(&bytes),
+            Err(E2eeError::BadCiphertext)
+        );
+    }
 }
 
 // —— ToBeSignedV1 确定性编码 + golden ——
@@ -537,7 +586,10 @@ fn key_dtos_round_trip() {
     let barrier = EpochBarrierV1 {
         stream_generation: StreamGenerationId::from_bytes([0x66; 16]),
         stream_cursor: StreamCursor::At(9),
-        event_seq: 9,
+        inner_cursor: RuntimeInnerCursor::Conversation {
+            conversation_id: ConversationId::new("conversation-epoch-barrier"),
+            cursor: StreamCursor::At(9),
+        },
         old_epoch: 3,
         new_epoch: 4,
         key_directory_revision: KeyDirectoryRevision::new(2),
@@ -546,7 +598,7 @@ fn key_dtos_round_trip() {
     for key in [
         "streamGeneration",
         "streamCursor",
-        "eventSeq",
+        "innerCursor",
         "oldEpoch",
         "newEpoch",
         "keyDirectoryRevision",

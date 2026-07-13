@@ -1,7 +1,4 @@
-//! Runtime v1 canonical 事件流（design §8.1 / §9）。
-//!
-//! `RuntimeEvent` 是 daemon canonical event stream 的中立业务 wire。稳定聚合靠
-//! `item_id`/`entity_id`，去重靠 `event_id`，排序靠 conversation-单调 `event_seq`。
+//! Runtime v1 canonical 事件流与稳定聚合身份。
 
 use crate::capabilities::SessionCapabilities;
 use crate::runtime::failure::RuntimeFailure;
@@ -13,62 +10,177 @@ use crate::trunk::{ActionDecisionKind, ActionRequest, AgentItem, TurnSummary};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// 一条 canonical 事件（design core interface）。
-///
-/// 未派生 `PartialEq`：`RuntimeEventBody` 内嵌未派生 `PartialEq` 的中立 trunk 类型；
-/// 本 task 不改动 trunk，契约测试以 wire round-trip 覆盖。
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RuntimeEventError {
+    #[error("runtime event identity fields do not match its body")]
+    InvalidIdentity,
+}
+
+/// 一条 canonical event。三个 nullable identity key 在 wire 上必须显式存在。
+#[derive(Debug, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RuntimeEvent {
     pub conversation_id: ConversationId,
     pub event_id: EventId,
     pub event_seq: u64,
-    #[serde(default)]
+    #[schemars(with = "crate::runtime::schema::RequiredNullable<CommandId>")]
+    pub command_id: Option<CommandId>,
+    #[schemars(with = "crate::runtime::schema::RequiredNullable<ItemId>")]
     pub item_id: Option<ItemId>,
-    #[serde(default)]
+    #[schemars(with = "crate::runtime::schema::RequiredNullable<EntityId>")]
     pub entity_id: Option<EntityId>,
     pub body: RuntimeEventBody,
 }
 
-/// 事件体。全部中立：不承载 vendor thread/turn 身份，只用中立稳定 ID。
+impl RuntimeEvent {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        conversation_id: ConversationId,
+        event_id: EventId,
+        event_seq: u64,
+        command_id: Option<CommandId>,
+        item_id: Option<ItemId>,
+        entity_id: Option<EntityId>,
+        body: RuntimeEventBody,
+    ) -> Result<Self, RuntimeEventError> {
+        let event = Self {
+            conversation_id,
+            event_id,
+            event_seq,
+            command_id,
+            item_id,
+            entity_id,
+            body,
+        };
+        event.validate()?;
+        Ok(event)
+    }
+
+    pub fn validate(&self) -> Result<(), RuntimeEventError> {
+        let item_identity = self.item_id.is_some() && self.entity_id.is_some();
+        let no_item_identity = self.item_id.is_none() && self.entity_id.is_none();
+        let valid = match &self.body {
+            RuntimeEventBody::Capabilities { .. } => no_item_identity && self.command_id.is_none(),
+            RuntimeEventBody::Item { item } => {
+                item_identity
+                    && (!matches!(item, AgentItem::UserMessage { .. }) || self.command_id.is_some())
+            }
+            RuntimeEventBody::TurnStarted { .. }
+            | RuntimeEventBody::ActionRequest { .. }
+            | RuntimeEventBody::ApprovalResolved { .. }
+            | RuntimeEventBody::TurnCompleted { .. }
+            | RuntimeEventBody::TurnInterrupted { .. } => {
+                no_item_identity && self.command_id.is_some()
+            }
+            RuntimeEventBody::Error { .. } => no_item_identity,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(RuntimeEventError::InvalidIdentity)
+        }
+    }
+}
+
+impl Serialize for RuntimeEvent {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire<'a> {
+            conversation_id: &'a ConversationId,
+            event_id: &'a EventId,
+            event_seq: u64,
+            command_id: &'a Option<CommandId>,
+            item_id: &'a Option<ItemId>,
+            entity_id: &'a Option<EntityId>,
+            body: &'a RuntimeEventBody,
+        }
+        Wire {
+            conversation_id: &self.conversation_id,
+            event_id: &self.event_id,
+            event_seq: self.event_seq,
+            command_id: &self.command_id,
+            item_id: &self.item_id,
+            entity_id: &self.entity_id,
+            body: &self.body,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RuntimeEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            conversation_id: ConversationId,
+            event_id: EventId,
+            event_seq: u64,
+            #[serde(deserialize_with = "deserialize_required_optional_command_id")]
+            command_id: Option<CommandId>,
+            #[serde(deserialize_with = "deserialize_required_optional_item_id")]
+            item_id: Option<ItemId>,
+            #[serde(deserialize_with = "deserialize_required_optional_entity_id")]
+            entity_id: Option<EntityId>,
+            body: RuntimeEventBody,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        RuntimeEvent::new(
+            wire.conversation_id,
+            wire.event_id,
+            wire.event_seq,
+            wire.command_id,
+            wire.item_id,
+            wire.entity_id,
+            wire.body,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+/// 事件体。command/item/entity identity 只在 RuntimeEvent 外层出现一次。
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum RuntimeEventBody {
-    /// 会话能力先行（RC-16：snapshot/live 都必须先于 AgentItem 交付）。
-    Capabilities { capabilities: SessionCapabilities },
-    /// 一条 agent item 的新增/更新（聚合 ID 在外层 `item_id`/`entity_id`）。
-    Item { item: AgentItem },
-    /// 一个 turn 开始，绑定触发它的 command。
+    Capabilities {
+        capabilities: SessionCapabilities,
+    },
+    Item {
+        item: AgentItem,
+    },
     TurnStarted {
         turn_id: TurnId,
-        command_id: CommandId,
     },
-    /// 需要审批的动作请求。
     ActionRequest {
         turn_id: TurnId,
         approval_id: ApprovalId,
         request: ActionRequest,
     },
-    /// 审批 first-wins 结果广播（含精确 delivery state）。
     ApprovalResolved {
         turn_id: TurnId,
         approval_id: ApprovalId,
-        /// `Pending -> Expired` 尚无 first-wins winner，因此必须为 `null`；
-        /// Claimed 之后的所有状态都携带不可变赢家决定。
         #[serde(deserialize_with = "deserialize_required_optional_decision")]
-        #[schemars(required)]
+        #[schemars(with = "crate::runtime::schema::RequiredNullable<ActionDecisionKind>")]
         decision: Option<ActionDecisionKind>,
         state: ApprovalDeliveryState,
     },
-    /// turn 正常完成。
     TurnCompleted {
         turn_id: TurnId,
         summary: TurnSummary,
     },
-    /// turn 中断（crash/cancel/中断，unknown outcome）。
-    TurnInterrupted { turn_id: TurnId },
-    /// 业务失败事件。
-    Error { failure: RuntimeFailure },
+    TurnInterrupted {
+        turn_id: TurnId,
+    },
+    Error {
+        failure: RuntimeFailure,
+    },
 }
 
 fn deserialize_required_optional_decision<'de, D>(
@@ -78,4 +190,31 @@ where
     D: serde::Deserializer<'de>,
 {
     Option::<ActionDecisionKind>::deserialize(deserializer)
+}
+
+fn deserialize_required_optional_command_id<'de, D>(
+    deserializer: D,
+) -> Result<Option<CommandId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<CommandId>::deserialize(deserializer)
+}
+
+fn deserialize_required_optional_item_id<'de, D>(
+    deserializer: D,
+) -> Result<Option<ItemId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<ItemId>::deserialize(deserializer)
+}
+
+fn deserialize_required_optional_entity_id<'de, D>(
+    deserializer: D,
+) -> Result<Option<EntityId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<EntityId>::deserialize(deserializer)
 }

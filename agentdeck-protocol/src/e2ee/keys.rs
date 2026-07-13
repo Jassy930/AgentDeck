@@ -10,6 +10,7 @@ use crate::relay_v2::id::{
     DeviceRouteId, GrantSerial, KeyDirectoryRevision, MachineRouteId, StreamGenerationId,
     TrustEpoch, b64_vec,
 };
+use crate::runtime::sync::RuntimeInnerCursor;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -86,13 +87,13 @@ pub struct KeyUpdateV1 {
 }
 
 /// 成员/epoch 变化时在每个 active stream 记录的 epoch barrier（design §7.2 / §9.2）。
-/// 同时含外层 generation/cursor 与内层 `eventSeq`；剩余设备从 `next(C)` 使用新 key。
+/// 同时含外层 generation/cursor 与 tagged inner cursor；剩余设备从 `next(C)` 使用新 key。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EpochBarrierV1 {
     pub stream_generation: StreamGenerationId,
     pub stream_cursor: StreamCursor,
-    pub event_seq: u64,
+    pub inner_cursor: RuntimeInnerCursor,
     pub old_epoch: u64,
     pub new_epoch: u64,
     pub key_directory_revision: KeyDirectoryRevision,
