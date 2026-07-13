@@ -102,6 +102,16 @@ pub enum RuntimeStoreOperation {
     RetryApprovalDeliveryAfterCommit,
     ExpireApprovalBeforeCommit,
     ExpireApprovalAfterCommit,
+    StoreSnapshotBeforeCommit,
+    StoreSnapshotAfterCommit,
+    CreatePublicationStreamBeforeCommit,
+    CreatePublicationStreamAfterCommit,
+    FreezePublicationBeforeCommit,
+    FreezePublicationAfterCommit,
+    CommitPublicationBeforeCommit,
+    CommitPublicationAfterCommit,
+    AcknowledgePublicationBeforeCommit,
+    AcknowledgePublicationAfterCommit,
 }
 
 pub trait RuntimeStoreFaultInjector: Send + Sync {
@@ -324,6 +334,11 @@ pub enum RuntimeCommitOperation {
     MarkApprovalDeliveryFailed,
     RetryApprovalDelivery,
     ExpireApproval,
+    StoreSnapshot,
+    CreatePublicationStream,
+    FreezePublication,
+    CommitPublication,
+    AcknowledgePublication,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -1103,6 +1118,16 @@ pub enum RuntimeStoreError {
     InvalidRecoveryCursor,
     #[error("runtime recovery scan has not reached and accounted for its terminal page")]
     RecoveryNotReady,
+    #[error("runtime requested backfill begins before the retained logical suffix")]
+    BackfillNeedSnapshot,
+    #[error("runtime requested backfill cursor is ahead of the target high-water")]
+    BackfillCursorAhead,
+    #[error("runtime backfill pin is missing, expired, or does not match the requested range")]
+    InvalidBackfillPin,
+    #[error("runtime publication stream requires a fresh snapshot before more rows can be frozen")]
+    PublicationNeedsSnapshot,
+    #[error("runtime publication generation, sequence, range, or blob hash does not match")]
+    PublicationMismatch,
     #[error("runtime timestamp or derived deadline is outside SQLite i64 range")]
     TimeOutOfRange,
     #[error(
@@ -1194,6 +1219,9 @@ impl RuntimeStoreError {
             | Self::RecoveryNotActive
             | Self::InvalidRecoveryCursor
             | Self::RecoveryNotReady
+            | Self::BackfillCursorAhead
+            | Self::InvalidBackfillPin
+            | Self::PublicationMismatch
             | Self::IdGeneration(_)
             | Self::Sequence(_) => "daemon.runtime.invalid_state",
             Self::ConversationLimit => "daemon.runtime.actor_unavailable",
@@ -1201,6 +1229,9 @@ impl RuntimeStoreError {
             Self::QueueFull { .. } => "daemon.command.queue_full",
             Self::PayloadTooLarge => "daemon.payload.item_too_large",
             Self::RecoveryPageTooLarge { .. } => "daemon.runtime.recovery_too_large",
+            Self::BackfillNeedSnapshot | Self::PublicationNeedsSnapshot => {
+                "daemon.runtime.snapshot_required"
+            }
             Self::CommandExpired => "daemon.command.queue_expired",
         }
     }

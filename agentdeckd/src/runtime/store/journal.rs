@@ -506,7 +506,8 @@ pub(crate) fn create_conversation(
         });
     }
     let created_at = sqlite_time(created_at_ms)?;
-    let projected_write_bytes = projected_write_bytes(&[descriptor_bytes.len()])?;
+    let projected_write_bytes =
+        projected_write_bytes(&[descriptor_bytes.len(), descriptor_bytes.len(), 4 * 1024])?;
     sqlite::admit_ordinary_write(
         &state.connection,
         &state.key_bundle,
@@ -3016,7 +3017,7 @@ fn load_optional_conversation(
     }
 }
 
-fn load_conversation(
+pub(super) fn load_conversation(
     connection: &Connection,
     key_bundle: &super::cipher::RuntimeKeyBundle,
     database_id: [u8; 16],
@@ -3528,7 +3529,7 @@ fn load_intent(
     })
 }
 
-fn load_event(
+pub(super) fn load_event(
     connection: &Connection,
     key_bundle: &super::cipher::RuntimeKeyBundle,
     database_id: [u8; 16],
@@ -3590,6 +3591,84 @@ fn load_event(
         created_at_ms,
     )?;
     if raw.5.as_slice() != expected_metadata_token {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(EventRecord {
+        conversation_id,
+        event_id,
+        event_seq,
+        command_id,
+        created_at_ms,
+        payload: payload.expose_secret().to_vec(),
+    })
+}
+
+pub(super) fn load_event_read(
+    connection: &Connection,
+    read_crypto: &super::cipher::RuntimeReadCryptoCapability,
+    database_id: [u8; 16],
+    event_id: RuntimeId,
+) -> Result<EventRecord, RuntimeStoreError> {
+    let raw = connection
+        .query_row(
+            "SELECT conversation_id, event_seq, command_id, logical_event_bytes,
+                    created_at_ms, metadata_token, sealed_event
+             FROM event_journal WHERE event_id = ?1",
+            [&event_id.as_bytes()[..]],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                ))
+            },
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => RuntimeStoreError::UnknownOrCorruptSchema,
+            other => RuntimeStoreError::Sqlite(other),
+        })?;
+    let payload = read_crypto.open_bounded(
+        &RowAad {
+            schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
+            schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
+            database_id: &database_id,
+            table: b"event_journal",
+            primary_key: event_id.as_bytes(),
+            column: b"sealed_event",
+        },
+        &raw.6,
+        MAX_RUNTIME_EVENT_BYTES,
+    )?;
+    let logical_event_bytes =
+        u64::try_from(raw.3).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if logical_event_bytes
+        != u64::try_from(payload.expose_secret().len())
+            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let conversation_id = runtime_id(RuntimeIdKind::Conversation, raw.0)?;
+    let event_seq = decode_sequence(SequenceScope::EventSeq, &raw.1)?;
+    let command_id = raw
+        .2
+        .map(|value| runtime_id(RuntimeIdKind::Command, value))
+        .transpose()?;
+    let created_at_ms = runtime_time(raw.4)?;
+    let event_seq_encoded = super::sequence::encode_sequence(event_seq);
+    let command = optional_field(command_id.as_ref().map(|value| &value.as_bytes()[..]));
+    let encoded = Zeroizing::new(canonical_fields(&[
+        conversation_id.as_bytes(),
+        event_id.as_bytes(),
+        event_seq_encoded.as_bytes(),
+        &command,
+        &logical_event_bytes.to_be_bytes(),
+        &created_at_ms.to_be_bytes(),
+    ])?);
+    if !read_crypto.verify_blind_index(b"event.metadata.v1", encoded.as_ref(), &raw.5)? {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
     Ok(EventRecord {
@@ -3918,6 +3997,34 @@ fn conversation_metadata_token(
             &created_at_ms,
             &updated_at_ms,
         ],
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn conversation_metadata_token_for_test(
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    conversation_id: RuntimeId,
+    adapter_state_key: RuntimeId,
+    catalog_revision: u64,
+    command_high_water: Option<u64>,
+    event_high_water: Option<u64>,
+    accepted_command_count: u32,
+    lifecycle: ConversationLifecycle,
+    created_at_ms: u64,
+    updated_at_ms: u64,
+) -> Result<[u8; 32], RuntimeStoreError> {
+    conversation_metadata_token(
+        key_bundle,
+        conversation_id,
+        adapter_state_key,
+        catalog_revision,
+        command_high_water,
+        event_high_water,
+        accepted_command_count,
+        lifecycle,
+        created_at_ms,
+        updated_at_ms,
     )
 }
 
@@ -4651,6 +4758,7 @@ fn validate_store_integrity_against_ledger(
     } else if ledger.codex_adapter_state_count != 0 || ledger.claude_code_adapter_state_count != 0 {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
+    super::stream::validate_v4_integrity(connection, key_bundle, database_id, ledger)?;
     Ok(())
 }
 

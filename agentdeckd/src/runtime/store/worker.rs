@@ -32,12 +32,25 @@ use crate::runtime::model::{
     StartOutcome, TerminateAcceptedCommand, TerminateAcceptedOutcome,
     TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
 };
+use crate::runtime::read_pool::{
+    DEFAULT_RUNTIME_READ_CONCURRENCY, MAX_RUNTIME_READ_PAGE_BYTES, ReadPool, ReadPoolError,
+};
 use crate::security::{SecretBytes, StorageKek};
 
+use super::cipher::RuntimeReadCryptoCapability;
 use super::identity::{
     MAX_RUNTIME_ID_COLLISION_ATTEMPTS, RuntimeId, RuntimeIdError, RuntimeIdKind,
 };
-use super::{approval, journal, sqlite};
+use super::publication::{
+    FreezePublicationRequest, FrozenPublication, PublicationAcknowledgement, PublicationBarrierCut,
+    PublicationScope, PublicationStreamRecord,
+};
+use super::snapshot::StoredConversationSnapshot;
+use super::stream::{
+    RuntimeBackfillPin, RuntimeBackfillPlan, RuntimeBackfillTarget, RuntimeCatalogBackfillPage,
+    RuntimeEventBackfillPage, RuntimeSnapshotBuildPin,
+};
+use super::{approval, journal, sqlite, stream};
 
 const LIFECYCLE_RUNNING: u8 = 0;
 const LIFECYCLE_SHUTTING_DOWN: u8 = 1;
@@ -171,6 +184,9 @@ pub struct RuntimeStoreHandle {
     safety_budget: Arc<Semaphore>,
     lifecycle: Arc<AtomicU8>,
     interrupt: Arc<rusqlite::InterruptHandle>,
+    read_pool: ReadPool,
+    read_crypto: RuntimeReadCryptoCapability,
+    database_id: [u8; 16],
     identity_derivation: Arc<RuntimeIdentityDerivationCapability>,
     shutdown_timeout: Duration,
 }
@@ -316,7 +332,7 @@ impl RuntimeStoreHandle {
                 );
             })?;
         match ready_rx.await {
-            Ok(Ok(interrupt)) => Ok(Self {
+            Ok(Ok(ready)) => Ok(Self {
                 normal_tx,
                 safety_tx,
                 read_tx,
@@ -324,7 +340,10 @@ impl RuntimeStoreHandle {
                 normal_budget,
                 safety_budget,
                 lifecycle,
-                interrupt,
+                interrupt: ready.interrupt,
+                read_pool: ready.read_pool,
+                read_crypto: ready.read_crypto,
+                database_id: ready.database_id,
                 identity_derivation,
                 shutdown_timeout,
             }),
@@ -736,6 +755,357 @@ impl RuntimeStoreHandle {
         .await?
     }
 
+    /// 短 store operation 内冻结 retained range 并建立 TEMP pin；返回后不持有
+    /// SQLite transaction，调用方可跨多页/网络 flush 使用 pin。
+    pub async fn acquire_backfill_pin(
+        &self,
+        target: RuntimeBackfillTarget,
+        after: Option<u64>,
+    ) -> Result<RuntimeBackfillPlan, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::AcquireBackfillPin {
+                target,
+                after,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    /// 每个 SQLite page 最多复制 64 events / 8 MiB；wire backfill 可在 P3.6-C
+    /// 聚合多个已释放 transaction 的 page，但不能把 512/64 MiB wire cap 下推成 DB 长读。
+    pub async fn load_event_backfill_page(
+        &self,
+        pin: RuntimeBackfillPin,
+        after: Option<u64>,
+    ) -> Result<RuntimeEventBackfillPage, RuntimeStoreError> {
+        let plan = dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::PrepareBackfillPage { pin, after, reply },
+        )
+        .await??;
+        let read_crypto = self.read_crypto.clone();
+        let database_id = self.database_id;
+        let read_plan = plan.clone();
+        let retained = self
+            .read_pool
+            .run_sqlite_page(MAX_RUNTIME_READ_PAGE_BYTES, move |connection| {
+                stream::read_event_backfill_page(connection, &read_crypto, database_id, &read_plan)
+                    .map_err(ReadPoolError::Operation)
+            })
+            .await
+            .map_err(map_read_pool_error)?;
+        let (mut page, lease) = retained.into_parts();
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::FinishBackfillPage {
+                plan,
+                next_after: page.next_after,
+                complete: page.complete,
+                reply,
+            },
+        )
+        .await??;
+        page.memory_lease = Some(lease);
+        Ok(page)
+    }
+
+    /// Catalog 使用与 conversation 相同的 pin/cursor/TTL 算法。
+    pub async fn load_catalog_backfill_page(
+        &self,
+        pin: RuntimeBackfillPin,
+        after: Option<u64>,
+    ) -> Result<RuntimeCatalogBackfillPage, RuntimeStoreError> {
+        let plan = dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::PrepareBackfillPage { pin, after, reply },
+        )
+        .await??;
+        let read_crypto = self.read_crypto.clone();
+        let database_id = self.database_id;
+        let read_plan = plan.clone();
+        let retained = self
+            .read_pool
+            .run_sqlite_page(MAX_RUNTIME_READ_PAGE_BYTES, move |connection| {
+                stream::read_catalog_backfill_page(
+                    connection,
+                    &read_crypto,
+                    database_id,
+                    &read_plan,
+                )
+                .map_err(ReadPoolError::Operation)
+            })
+            .await
+            .map_err(map_read_pool_error)?;
+        let (mut page, lease) = retained.into_parts();
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::FinishBackfillPage {
+                plan,
+                next_after: page.next_after,
+                complete: page.complete,
+                reply,
+            },
+        )
+        .await??;
+        page.memory_lease = Some(lease);
+        Ok(page)
+    }
+
+    /// disconnect/unsubscribe 清理幂等；已完成或已过期 pin 也返回成功。
+    pub async fn release_backfill_pin(&self, pin_id: [u8; 16]) -> Result<(), RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::ReleaseBackfillPin { pin_id, reply },
+        )
+        .await?
+    }
+
+    /// 在单 worker 的短 operation 内冻结当前 conversation H，并建立 tagged TEMP
+    /// snapshot pin。snapshot build 期间 writer/retention 可继续推进；pin 只证明 reducer
+    /// 已在该 cut 开始 capture，绝不把慢 build 变成 writer/checkpoint 的长事务。
+    pub async fn acquire_snapshot_build_pin(
+        &self,
+        conversation_id: super::RuntimeId,
+    ) -> Result<RuntimeSnapshotBuildPin, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::AcquireSnapshotBuildPin {
+                conversation_id,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub async fn release_snapshot_build_pin(
+        &self,
+        pin: RuntimeSnapshotBuildPin,
+    ) -> Result<(), RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::ReleaseSnapshotBuildPin { pin, reply },
+        )
+        .await?
+    }
+
+    /// 原子替换某 conversation 的唯一 ready snapshot；base 必须等于 transaction
+    /// 内再次读取的当前 event high-water。
+    pub async fn store_conversation_snapshot_from_pin(
+        &self,
+        pin: RuntimeSnapshotBuildPin,
+        item_count: u64,
+        payload: Vec<u8>,
+    ) -> Result<StoredConversationSnapshot, RuntimeStoreError> {
+        validate_maximum(payload.len(), super::snapshot::MAX_SNAPSHOT_BYTES)?;
+        let charge = memory_charge(size_of::<NormalCommand>(), &[payload.capacity()])?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::StoreConversationSnapshot {
+                pin,
+                item_count,
+                payload,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub async fn load_conversation_snapshot(
+        &self,
+        conversation_id: super::RuntimeId,
+    ) -> Result<Option<StoredConversationSnapshot>, RuntimeStoreError> {
+        ensure_running(&self.lifecycle)?;
+        let read_crypto = self.read_crypto.clone();
+        let database_id = self.database_id;
+        let retained = self
+            .read_pool
+            .run_sqlite_snapshot(move |connection| {
+                super::snapshot::load_conversation_snapshot_read(
+                    connection,
+                    &read_crypto,
+                    database_id,
+                    conversation_id,
+                )
+                .map_err(ReadPoolError::Operation)
+            })
+            .await
+            .map_err(map_read_pool_error)?;
+        let (mut snapshot, lease) = retained.into_parts();
+        if let Some(snapshot) = &mut snapshot {
+            snapshot.memory_lease = Some(lease);
+        }
+        Ok(snapshot)
+    }
+
+    pub async fn create_publication_stream(
+        &self,
+        publication_stream_id: [u8; 16],
+        scope: PublicationScope,
+        stream_route: [u8; 16],
+        generation: [u8; 16],
+    ) -> Result<PublicationStreamRecord, RuntimeStoreError> {
+        let charge = memory_charge(size_of::<NormalCommand>(), &[])?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::CreatePublicationStream {
+                publication_stream_id,
+                scope,
+                stream_route,
+                generation,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub async fn freeze_publication(
+        &self,
+        request: FreezePublicationRequest,
+    ) -> Result<FrozenPublication, RuntimeStoreError> {
+        validate_maximum(
+            request.blob.len(),
+            super::publication::MAX_PUBLICATION_BLOB_BYTES,
+        )?;
+        let charge = memory_charge(size_of::<NormalCommand>(), &[request.blob.capacity()])?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::FreezePublication { request, reply },
+        )
+        .await?
+    }
+
+    /// Relay durable commit receipt；走 safety lane，容量水位下仍可删除 outbox 并推进 cut。
+    pub async fn acknowledge_publication_commit(
+        &self,
+        publication_stream_id: [u8; 16],
+        generation: [u8; 16],
+        stream_seq: u64,
+        blob_sha256: [u8; 32],
+    ) -> Result<PublicationBarrierCut, RuntimeStoreError> {
+        let charge = memory_charge(size_of::<SafetyCommand>(), &[])?;
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            charge,
+            |reply| SafetyCommand::AcknowledgePublicationCommit {
+                publication_stream_id,
+                generation,
+                stream_seq,
+                blob_sha256,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    /// device consumption ACK；与 Relay COMMIT 分离。只有 exact ACK 成功才删除
+    /// frozen outbox row并推进 acknowledged cursor。
+    pub async fn acknowledge_publication_delivery(
+        &self,
+        publication_stream_id: [u8; 16],
+        generation: [u8; 16],
+        stream_seq: u64,
+        blob_sha256: [u8; 32],
+    ) -> Result<PublicationAcknowledgement, RuntimeStoreError> {
+        let charge = memory_charge(size_of::<SafetyCommand>(), &[])?;
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            charge,
+            |reply| SafetyCommand::AcknowledgePublicationDelivery {
+                publication_stream_id,
+                generation,
+                stream_seq,
+                blob_sha256,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub async fn load_pending_publications(
+        &self,
+        publication_stream_id: [u8; 16],
+    ) -> Result<Vec<FrozenPublication>, RuntimeStoreError> {
+        ensure_running(&self.lifecycle)?;
+        let read_crypto = self.read_crypto.clone();
+        let database_id = self.database_id;
+        let retained = self
+            .read_pool
+            .run_sqlite_page(MAX_RUNTIME_READ_PAGE_BYTES, move |connection| {
+                super::publication::load_pending_publications_read(
+                    connection,
+                    &read_crypto,
+                    database_id,
+                    publication_stream_id,
+                )
+                .map_err(ReadPoolError::Operation)
+            })
+            .await
+            .map_err(map_read_pool_error)?;
+        let (mut publications, lease) = retained.into_parts();
+        for publication in &mut publications {
+            publication.memory_lease = Some(lease.clone());
+        }
+        Ok(publications)
+    }
+
+    pub async fn load_publication_barrier(
+        &self,
+        publication_stream_id: [u8; 16],
+    ) -> Result<PublicationBarrierCut, RuntimeStoreError> {
+        ensure_running(&self.lifecycle)?;
+        let read_crypto = self.read_crypto.clone();
+        let retained = self
+            .read_pool
+            .run_sqlite_page(64 * 1024, move |connection| {
+                super::publication::load_publication_barrier_read(
+                    connection,
+                    &read_crypto,
+                    publication_stream_id,
+                )
+                .map_err(ReadPoolError::Operation)
+            })
+            .await
+            .map_err(map_read_pool_error)?;
+        let (barrier, _lease) = retained.into_parts();
+        Ok(barrier)
+    }
+
     pub async fn persist_execution_fence(
         &self,
         input: ExecutionFence,
@@ -867,7 +1237,9 @@ impl RuntimeStoreHandle {
 }
 
 /// 只为 shutdown 调用方设置等待上界；deadline 到达不会改变 worker 生命周期，
-/// 也不会释放仍由 worker 持有的 SQLite connection、row keys 或 path lease。
+/// 也不会取消 dedicated store worker 自己持有的 finalizer。worker 会继续等待 read
+/// pool quiesce，随后关闭 read crypto；SQLite connection、row keys 与 path lease 在此
+/// 之前都保持有效，即使调用方 Tokio runtime 已销毁也不受影响。
 async fn await_shutdown_quiescence(
     result: oneshot::Receiver<()>,
     timeout: Duration,
@@ -891,6 +1263,24 @@ async fn dispatch<T, C>(
         .try_send(build(reply))
         .map_err(|error| map_try_send(error, lane))?;
     result.await.map_err(|_| RuntimeStoreError::WorkerStopped)
+}
+
+fn map_read_pool_error(error: ReadPoolError) -> RuntimeStoreError {
+    match error {
+        ReadPoolError::Busy => RuntimeStoreError::WorkerBusy {
+            lane: RuntimeStoreLane::Read,
+        },
+        ReadPoolError::Closed | ReadPoolError::WorkerStopped => RuntimeStoreError::WorkerStopped,
+        ReadPoolError::Sqlite(error) => RuntimeStoreError::Sqlite(error),
+        ReadPoolError::Operation(error) => error,
+        ReadPoolError::InvalidCapacity
+        | ReadPoolError::CapacityUnavailable
+        | ReadPoolError::SqliteNotConfigured
+        | ReadPoolError::PageBudgetOutOfRange
+        | ReadPoolError::PragmaMismatch => {
+            RuntimeStoreError::InvalidConfig("runtime read-only WAL pool is unavailable")
+        }
+    }
 }
 
 async fn dispatch_with_budget<T, C>(
@@ -978,6 +1368,23 @@ enum NormalCommand {
         input: RetryApprovalDelivery,
         reply: oneshot::Sender<Result<ApprovalMutationOutcome, RuntimeStoreError>>,
     },
+    StoreConversationSnapshot {
+        pin: RuntimeSnapshotBuildPin,
+        item_count: u64,
+        payload: Vec<u8>,
+        reply: oneshot::Sender<Result<StoredConversationSnapshot, RuntimeStoreError>>,
+    },
+    CreatePublicationStream {
+        publication_stream_id: [u8; 16],
+        scope: PublicationScope,
+        stream_route: [u8; 16],
+        generation: [u8; 16],
+        reply: oneshot::Sender<Result<PublicationStreamRecord, RuntimeStoreError>>,
+    },
+    FreezePublication {
+        request: FreezePublicationRequest,
+        reply: oneshot::Sender<Result<FrozenPublication, RuntimeStoreError>>,
+    },
 }
 
 enum SafetyCommand {
@@ -1017,6 +1424,20 @@ enum SafetyCommand {
         input: ExpireApproval,
         reply: oneshot::Sender<Result<ApprovalMutationOutcome, RuntimeStoreError>>,
     },
+    AcknowledgePublicationCommit {
+        publication_stream_id: [u8; 16],
+        generation: [u8; 16],
+        stream_seq: u64,
+        blob_sha256: [u8; 32],
+        reply: oneshot::Sender<Result<PublicationBarrierCut, RuntimeStoreError>>,
+    },
+    AcknowledgePublicationDelivery {
+        publication_stream_id: [u8; 16],
+        generation: [u8; 16],
+        stream_seq: u64,
+        blob_sha256: [u8; 32],
+        reply: oneshot::Sender<Result<PublicationAcknowledgement, RuntimeStoreError>>,
+    },
 }
 
 enum ReadCommand {
@@ -1043,6 +1464,34 @@ enum ReadCommand {
         input: QueryCommandReceipt,
         reply: oneshot::Sender<Result<CommandReceiptRecord, RuntimeStoreError>>,
     },
+    AcquireBackfillPin {
+        target: RuntimeBackfillTarget,
+        after: Option<u64>,
+        reply: oneshot::Sender<Result<RuntimeBackfillPlan, RuntimeStoreError>>,
+    },
+    PrepareBackfillPage {
+        pin: RuntimeBackfillPin,
+        after: Option<u64>,
+        reply: oneshot::Sender<Result<stream::RuntimeBackfillReadPlan, RuntimeStoreError>>,
+    },
+    FinishBackfillPage {
+        plan: stream::RuntimeBackfillReadPlan,
+        next_after: u64,
+        complete: bool,
+        reply: oneshot::Sender<Result<(), RuntimeStoreError>>,
+    },
+    ReleaseBackfillPin {
+        pin_id: [u8; 16],
+        reply: oneshot::Sender<Result<(), RuntimeStoreError>>,
+    },
+    AcquireSnapshotBuildPin {
+        conversation_id: super::RuntimeId,
+        reply: oneshot::Sender<Result<RuntimeSnapshotBuildPin, RuntimeStoreError>>,
+    },
+    ReleaseSnapshotBuildPin {
+        pin: RuntimeSnapshotBuildPin,
+        reply: oneshot::Sender<Result<(), RuntimeStoreError>>,
+    },
 }
 
 enum ControlCommand {
@@ -1054,7 +1503,14 @@ struct WorkerReceivers {
     safety: mpsc::Receiver<Queued<SafetyCommand>>,
     read: mpsc::Receiver<ReadCommand>,
     control: mpsc::Receiver<ControlCommand>,
-    ready: oneshot::Sender<Result<Arc<rusqlite::InterruptHandle>, RuntimeStoreError>>,
+    ready: oneshot::Sender<Result<RuntimeStoreReady, RuntimeStoreError>>,
+}
+
+struct RuntimeStoreReady {
+    interrupt: Arc<rusqlite::InterruptHandle>,
+    read_pool: ReadPool,
+    read_crypto: RuntimeReadCryptoCapability,
+    database_id: [u8; 16],
 }
 
 fn run(
@@ -1088,7 +1544,29 @@ fn run(
         }
     };
     let interrupt = Arc::new(state.connection.get_interrupt_handle());
-    if ready.send(Ok(interrupt)).is_err() {
+    let read_crypto = state.key_bundle.read_only_capability();
+    let read_pool = match ReadPool::open_sqlite(
+        &state.storage_path,
+        DEFAULT_RUNTIME_READ_CONCURRENCY,
+        config.busy_timeout_ms,
+    ) {
+        Ok(read_pool) => read_pool,
+        Err(_) => {
+            let _ = ready.send(Err(RuntimeStoreError::InvalidConfig(
+                "failed to initialize runtime read-only WAL pool",
+            )));
+            return;
+        }
+    };
+    if ready
+        .send(Ok(RuntimeStoreReady {
+            interrupt,
+            read_pool: read_pool.clone(),
+            read_crypto: read_crypto.clone(),
+            database_id: state.database_id,
+        }))
+        .is_err()
+    {
         return;
     }
 
@@ -1138,6 +1616,11 @@ fn run(
     while safety_commands.try_recv().is_ok() {}
     while read_commands.try_recv().is_ok() {}
     controls.close();
+    // Finalization lives on the dedicated store thread/runtime, never on an arbitrary caller
+    // runtime. This makes caller timeout, future cancellation, and caller runtime teardown mere
+    // observation failures: cleanup still waits for every active read before zeroizing its keys.
+    runtime.block_on(read_pool.close_and_wait());
+    read_crypto.close();
     drop(state);
     drop(lease);
     lifecycle.store(LIFECYCLE_STOPPED, Ordering::Release);
@@ -1179,6 +1662,15 @@ fn handle_normal(
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
             NormalCommand::RetryApprovalDelivery { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::StoreConversationSnapshot { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::CreatePublicationStream { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::FreezePublication { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
         }
@@ -1230,6 +1722,57 @@ fn handle_normal(
         NormalCommand::RetryApprovalDelivery { input, reply } => {
             let _ = reply.send(approval::retry_approval_delivery(state, config, input));
         }
+        NormalCommand::StoreConversationSnapshot {
+            pin,
+            item_count,
+            payload,
+            reply,
+        } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    super::snapshot::store_conversation_snapshot(
+                        state, config, pin, item_count, payload, now,
+                    )
+                });
+            let _ = reply.send(result);
+        }
+        NormalCommand::CreatePublicationStream {
+            publication_stream_id,
+            scope,
+            stream_route,
+            generation,
+            reply,
+        } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    super::publication::create_publication_stream(
+                        state,
+                        config,
+                        publication_stream_id,
+                        scope,
+                        stream_route,
+                        generation,
+                        now,
+                    )
+                });
+            let _ = reply.send(result);
+        }
+        NormalCommand::FreezePublication { request, reply } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    super::publication::freeze_publication(state, config, request, now)
+                });
+            let _ = reply.send(result);
+        }
     }
     drop(memory_permit);
 }
@@ -1272,6 +1815,12 @@ fn handle_safety(
             SafetyCommand::ExpireApproval { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
+            SafetyCommand::AcknowledgePublicationCommit { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::AcknowledgePublicationDelivery { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
         }
         drop(memory_permit);
         return;
@@ -1309,6 +1858,54 @@ fn handle_safety(
         }
         SafetyCommand::ExpireApproval { input, reply } => {
             let _ = reply.send(approval::expire_approval(state, config, input));
+        }
+        SafetyCommand::AcknowledgePublicationCommit {
+            publication_stream_id,
+            generation,
+            stream_seq,
+            blob_sha256,
+            reply,
+        } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    super::publication::acknowledge_publication_commit(
+                        state,
+                        config,
+                        publication_stream_id,
+                        generation,
+                        stream_seq,
+                        blob_sha256,
+                        now,
+                    )
+                });
+            let _ = reply.send(result);
+        }
+        SafetyCommand::AcknowledgePublicationDelivery {
+            publication_stream_id,
+            generation,
+            stream_seq,
+            blob_sha256,
+            reply,
+        } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    super::publication::acknowledge_publication_delivery(
+                        state,
+                        config,
+                        publication_stream_id,
+                        generation,
+                        stream_seq,
+                        blob_sha256,
+                        now,
+                    )
+                });
+            let _ = reply.send(result);
         }
     }
     drop(memory_permit);
@@ -1349,6 +1946,58 @@ fn handle_read(
         }
         ReadCommand::QueryCommandReceipt { input, reply } => {
             let _ = reply.send(journal::query_command_receipt(state, input));
+        }
+        ReadCommand::AcquireBackfillPin {
+            target,
+            after,
+            reply,
+        } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| stream::acquire_backfill_pin(state, target, after, now));
+            let _ = reply.send(result);
+        }
+        ReadCommand::PrepareBackfillPage { pin, after, reply } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| stream::prepare_backfill_page(state, &pin, after, now));
+            let _ = reply.send(result);
+        }
+        ReadCommand::FinishBackfillPage {
+            plan,
+            next_after,
+            complete,
+            reply,
+        } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    stream::finish_backfill_page(state, &plan, next_after, complete, now)
+                });
+            let _ = reply.send(result);
+        }
+        ReadCommand::ReleaseBackfillPin { pin_id, reply } => {
+            let _ = reply.send(stream::release_backfill_pin(state, pin_id));
+        }
+        ReadCommand::AcquireSnapshotBuildPin {
+            conversation_id,
+            reply,
+        } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| stream::acquire_snapshot_build_pin(state, conversation_id, now));
+            let _ = reply.send(result);
+        }
+        ReadCommand::ReleaseSnapshotBuildPin { pin, reply } => {
+            let _ = reply.send(stream::release_snapshot_build_pin(state, &pin));
         }
     }
 }
@@ -1392,6 +2041,8 @@ mod shutdown_tests {
 
     use crate::runtime::store::{RuntimeId, RuntimeIdKind};
     use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
+
+    use super::super::cipher::{CipherError, RowAad};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -1481,6 +2132,228 @@ mod shutdown_tests {
             .expect_err("held reply must cross the observation deadline");
 
         assert!(matches!(error, RuntimeStoreError::ShutdownTimedOut));
+    }
+
+    #[tokio::test]
+    async fn shutdown_timeout_cannot_cancel_read_crypto_finalization() {
+        let root = TestRoot::new();
+        let keys = MemoryKeyStore::new();
+        let (worker_entered_tx, worker_entered_rx) = sync_channel(1);
+        let (worker_release_tx, worker_release_rx) = sync_channel(1);
+        let mut store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_fault_injector(Arc::new(
+                BlockingAfterCommit {
+                    blocked: AtomicBool::new(false),
+                    entered: worker_entered_tx,
+                    release: Mutex::new(worker_release_rx),
+                },
+            )),
+            root.storage_kek(&keys),
+        )
+        .await
+        .expect("open runtime store");
+        store.shutdown_timeout = Duration::from_millis(10);
+        let surviving = store.clone();
+        let in_flight = tokio::spawn({
+            let store = store.clone();
+            async move { store.create_conversation(conversation_input()).await }
+        });
+        tokio::task::spawn_blocking(move || {
+            worker_entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("worker blocks after commit");
+        })
+        .await
+        .expect("join worker entered observer");
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let blocked_read = tokio::spawn({
+            let read_pool = store.read_pool.clone();
+            async move {
+                read_pool
+                    .run(async move {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                    })
+                    .await
+            }
+        });
+        entered_rx.await.expect("read becomes active");
+
+        assert!(
+            surviving
+                .read_crypto
+                .verify_blind_index(b"shutdown-finalizer", b"before", &[0; 32])
+                .is_ok(),
+            "surviving handle starts with a live read capability"
+        );
+        let error = store
+            .shutdown()
+            .await
+            .expect_err("active read must cross the short observation deadline");
+        assert!(matches!(error, RuntimeStoreError::ShutdownTimedOut));
+
+        let reopen_error = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()),
+            root.storage_kek(&keys),
+        )
+        .await
+        .expect_err("blocked worker must retain its path lease");
+        assert!(matches!(reopen_error, RuntimeStoreError::StoreAlreadyOpen));
+
+        release_tx.send(()).expect("release active read");
+        blocked_read
+            .await
+            .expect("join active read")
+            .expect("active read completes during shutdown");
+        assert!(
+            surviving
+                .read_crypto
+                .verify_blind_index(b"shutdown-finalizer", b"between", &[0; 32])
+                .is_ok(),
+            "worker still using its row keys prevents early read-key zeroization"
+        );
+
+        worker_release_tx.send(()).expect("release blocked worker");
+        in_flight
+            .await
+            .expect("join in-flight operation")
+            .expect("operation committed before shutdown won arbitration");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while surviving
+            .read_crypto
+            .verify_blind_index(b"shutdown-finalizer", b"after", &[0; 32])
+            .is_ok()
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let aad = RowAad {
+            schema_family: b"agentdeck.runtime",
+            schema_version: 1,
+            database_id: &[0x11; 16],
+            table: b"fixture",
+            primary_key: b"row",
+            column: b"payload",
+        };
+        assert!(matches!(
+            surviving.read_crypto.open_bounded(&aad, &[], 64),
+            Err(CipherError::InvalidContext(
+                "read crypto capability is closed"
+            ))
+        ));
+        assert!(matches!(
+            surviving
+                .read_crypto
+                .verify_blind_index(b"shutdown-finalizer", b"after", &[0; 32]),
+            Err(CipherError::InvalidContext(
+                "read crypto capability is closed"
+            ))
+        ));
+
+        drop(surviving);
+        let reopened = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()),
+            root.storage_kek(&keys),
+        )
+        .await
+        .expect("worker releases its path lease after finalization");
+        reopened
+            .shutdown()
+            .await
+            .expect("shutdown explicitly reopened worker");
+    }
+
+    #[test]
+    fn shutdown_finalization_survives_caller_runtime_drop() {
+        let root = TestRoot::new();
+        let keys = MemoryKeyStore::new();
+        let (worker_entered_tx, worker_entered_rx) = sync_channel(1);
+        let (worker_release_tx, worker_release_rx) = sync_channel(1);
+        let caller_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("caller runtime");
+        let surviving = caller_runtime.block_on(async {
+            let mut store = RuntimeStoreHandle::open(
+                RuntimeStoreConfig::new(root.database()).with_fault_injector(Arc::new(
+                    BlockingAfterCommit {
+                        blocked: AtomicBool::new(false),
+                        entered: worker_entered_tx,
+                        release: Mutex::new(worker_release_rx),
+                    },
+                )),
+                root.storage_kek(&keys),
+            )
+            .await
+            .expect("open runtime store");
+            store.shutdown_timeout = Duration::from_millis(10);
+            let surviving = store.clone();
+            let in_flight = tokio::spawn({
+                let store = store.clone();
+                async move { store.create_conversation(conversation_input()).await }
+            });
+            tokio::task::spawn_blocking(move || {
+                worker_entered_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("worker blocks after commit");
+            })
+            .await
+            .expect("join worker entered observer");
+            let error = store
+                .shutdown()
+                .await
+                .expect_err("blocked worker crosses the observation deadline");
+            assert!(matches!(error, RuntimeStoreError::ShutdownTimedOut));
+            drop(in_flight);
+            surviving
+        });
+
+        // Tokio runtime shutdown aborts ordinary spawned async tasks. Store finalization must
+        // therefore be owned by the dedicated store worker, not this caller runtime.
+        drop(caller_runtime);
+        worker_release_tx.send(()).expect("release blocked worker");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while surviving
+            .read_crypto
+            .verify_blind_index(b"runtime-drop-finalizer", b"after", &[0; 32])
+            .is_ok()
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(
+            surviving
+                .read_crypto
+                .verify_blind_index(b"runtime-drop-finalizer", b"after", &[0; 32]),
+            Err(CipherError::InvalidContext(
+                "read crypto capability is closed"
+            ))
+        ));
+
+        drop(surviving);
+        let verification_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("verification runtime");
+        let reopen_deadline = Instant::now() + Duration::from_secs(2);
+        let reopened = loop {
+            match verification_runtime.block_on(RuntimeStoreHandle::open(
+                RuntimeStoreConfig::new(root.database()),
+                root.storage_kek(&keys),
+            )) {
+                Ok(store) => break store,
+                Err(RuntimeStoreError::StoreAlreadyOpen) if Instant::now() < reopen_deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("worker must eventually release path lease: {error}"),
+            }
+        };
+        verification_runtime
+            .block_on(reopened.shutdown())
+            .expect("shutdown reopened worker");
     }
 
     #[tokio::test]

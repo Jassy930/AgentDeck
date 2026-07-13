@@ -2,15 +2,19 @@
 
 pub(crate) mod admission;
 mod approval;
+mod catalog;
 pub mod cipher;
 pub mod identity;
 mod journal;
 mod persisted_event;
+mod publication;
 pub mod queue;
 mod recovery;
 mod schema;
 pub(crate) mod sequence;
+mod snapshot;
 mod sqlite;
+mod stream;
 mod worker;
 
 pub use crate::runtime::model::{
@@ -29,8 +33,17 @@ pub use crate::runtime::model::{
     TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
 };
 pub use identity::{RuntimeId, RuntimeIdKind, RuntimeIdSource};
+pub use publication::{
+    FreezePublicationRequest, FrozenPublication, PublicationAcknowledgement, PublicationBarrierCut,
+    PublicationPayloadKind, PublicationScope, PublicationStreamRecord, PublicationStreamState,
+};
 pub use recovery::RuntimeRescueIndex;
 pub use schema::{RUNTIME_CRYPTO_CONTEXT_VERSION, RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION};
+pub use snapshot::StoredConversationSnapshot;
+pub use stream::{
+    RuntimeBackfillPin, RuntimeBackfillPlan, RuntimeBackfillTarget, RuntimeCatalogBackfillPage,
+    RuntimeEventBackfillPage, RuntimeSnapshotBuildPin,
+};
 pub use worker::RuntimeStoreHandle;
 pub(crate) use worker::{ClaudeCodeAdapterStateVault, CodexAdapterStateVault};
 

@@ -5,6 +5,7 @@
 //! 长度前缀 AAD 绑定，因而跨行、跨列或跨数据库搬运密文都会认证失败。
 
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
@@ -230,6 +231,80 @@ impl RuntimeKeyBundle {
         let output = mac.finalize().into_bytes();
         let bytes: [u8; KEY_LEN] = output.into();
         Ok(BlindIndex(bytes))
+    }
+
+    pub(crate) fn read_only_capability(&self) -> RuntimeReadCryptoCapability {
+        RuntimeReadCryptoCapability {
+            inner: Arc::new(RuntimeReadCryptoInner {
+                key_bundle: Mutex::new(Some(Self {
+                    generation: self.generation,
+                    row_dek: self.row_dek,
+                    blind_index_key: self.blind_index_key,
+                })),
+            }),
+        }
+    }
+}
+
+/// 只允许 open/verify 的共享读能力。它不暴露 `RuntimeKeyBundle`、RowCipher seal
+/// 或 HMAC 输出；daemon shutdown 会 `close()` 并从共享 slot 取走 key material，
+/// 即使仍有 `RuntimeStoreHandle` clone，所有 clone 也只观察 closed capability。
+#[derive(Clone)]
+pub(crate) struct RuntimeReadCryptoCapability {
+    inner: Arc<RuntimeReadCryptoInner>,
+}
+
+struct RuntimeReadCryptoInner {
+    key_bundle: Mutex<Option<RuntimeKeyBundle>>,
+}
+
+impl RuntimeReadCryptoCapability {
+    pub(crate) fn open_bounded(
+        &self,
+        context: &RowAad<'_>,
+        blob: &[u8],
+        maximum_plaintext_len: usize,
+    ) -> Result<SecretBytes, CipherError> {
+        let key = self
+            .inner
+            .key_bundle
+            .lock()
+            .map_err(|_| CipherError::InvalidEncoding)?;
+        let key = key.as_ref().ok_or(CipherError::InvalidContext(
+            "read crypto capability is closed",
+        ))?;
+        key.row_cipher()
+            .open_bounded(context, blob, maximum_plaintext_len)
+    }
+
+    pub(crate) fn verify_blind_index(
+        &self,
+        domain: &[u8],
+        value: &[u8],
+        expected: &[u8],
+    ) -> Result<bool, CipherError> {
+        let key = self
+            .inner
+            .key_bundle
+            .lock()
+            .map_err(|_| CipherError::InvalidEncoding)?;
+        let key = key.as_ref().ok_or(CipherError::InvalidContext(
+            "read crypto capability is closed",
+        ))?;
+        Ok(key.blind_index(domain, value)?.as_bytes() == expected)
+    }
+
+    pub(crate) fn close(&self) {
+        if let Ok(mut key) = self.inner.key_bundle.lock() {
+            // `RuntimeKeyBundle::drop` zeroizes both copied read keys here.
+            let _zeroized_on_drop = key.take();
+        }
+    }
+}
+
+impl fmt::Debug for RuntimeReadCryptoCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RuntimeReadCryptoCapability([REDACTED])")
     }
 }
 
@@ -527,5 +602,49 @@ fn validate_plaintext_length(actual: usize, configured_maximum: usize) -> Result
         Err(CipherError::InputTooLarge)
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod read_capability_tests {
+    use super::*;
+
+    #[test]
+    fn close_zeroizes_shared_read_slot_even_while_clones_exist() {
+        let key = RuntimeKeyBundle::fresh(1).expect("fresh key");
+        let aad = RowAad {
+            schema_family: b"agentdeck.runtime",
+            schema_version: 1,
+            database_id: &[0x11; 16],
+            table: b"fixture",
+            primary_key: b"row",
+            column: b"payload",
+        };
+        let sealed = key
+            .row_cipher()
+            .seal_bounded(&aad, b"read-only", 64)
+            .expect("seal fixture");
+        let capability = key.read_only_capability();
+        let surviving_clone = capability.clone();
+        assert_eq!(
+            surviving_clone
+                .open_bounded(&aad, &sealed, 64)
+                .expect("read before close")
+                .expose_secret(),
+            b"read-only"
+        );
+        capability.close();
+        assert!(matches!(
+            surviving_clone.open_bounded(&aad, &sealed, 64),
+            Err(CipherError::InvalidContext(
+                "read crypto capability is closed"
+            ))
+        ));
+        assert!(matches!(
+            surviving_clone.verify_blind_index(b"fixture", b"value", &[0; 32]),
+            Err(CipherError::InvalidContext(
+                "read crypto capability is closed"
+            ))
+        ));
     }
 }

@@ -2,6 +2,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rusqlite::limits::Limit;
@@ -26,10 +27,10 @@ use super::admission::{
 };
 use super::cipher::{KeyWrapAad, RuntimeKeyBundle, WRAPPED_KEY_BUNDLE_V1_LEN};
 use super::schema::{
-    EXPECTED_TABLES, EXPECTED_TABLES_V1, EXPECTED_TABLES_V2, RUNTIME_CRYPTO_CONTEXT_VERSION,
-    RUNTIME_DDL_V1, RUNTIME_KEY_GENERATION, RUNTIME_MIGRATION_V2, RUNTIME_MIGRATION_V3,
-    RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION, schema_signature, schema_signature_v1,
-    schema_signature_v2,
+    EXPECTED_TABLES, EXPECTED_TABLES_V1, EXPECTED_TABLES_V2, EXPECTED_TABLES_V3,
+    RUNTIME_CRYPTO_CONTEXT_VERSION, RUNTIME_DDL_V1, RUNTIME_KEY_GENERATION, RUNTIME_MIGRATION_V2,
+    RUNTIME_MIGRATION_V3, RUNTIME_MIGRATION_V4, RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION,
+    schema_signature, schema_signature_v1, schema_signature_v2, schema_signature_v3,
 };
 
 const DATABASE_MODE: u32 = 0o600;
@@ -536,6 +537,87 @@ mod migration_tests {
         cipher_evidence(&destination)
     }
 
+    async fn build_strict_v3_fixture(root: &TestRoot, keys: &MemoryKeyStore) -> CipherEvidence {
+        build_strict_v2_fixture(root, keys).await;
+        let destination = root.database();
+        let connection = Connection::open(&destination).expect("open strict v2 fixture for v3");
+        connection
+            .execute_batch(RUNTIME_MIGRATION_V3)
+            .expect("apply exact v3 migration");
+        let meta = read_meta_v3(&connection)
+            .expect("read strict v3 fixture meta")
+            .expect("strict v3 fixture meta exists");
+        let storage_kek =
+            load_or_create_storage_kek(keys, &destination).expect("reload strict v3 KEK");
+        let key_bundle = RuntimeKeyBundle::unwrap(
+            &storage_kek,
+            &KeyWrapAad {
+                schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
+                schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
+                database_id: &meta.database_id,
+            },
+            &meta.wrapped_key_bundle,
+        )
+        .expect("unwrap strict v3 key bundle");
+        let token = runtime_ledger_token_v3(&key_bundle, meta.database_id, &meta.ledger)
+            .expect("authenticate strict v3 ledger");
+        connection
+            .execute(
+                "UPDATE runtime_meta
+                 SET schema_version = 3, schema_signature = ?1, metadata_token = ?2
+                 WHERE singleton = 1 AND schema_version = 2",
+                params![&schema_signature_v3()[..], &token[..]],
+            )
+            .expect("publish authenticated strict v3 meta");
+        drop(connection);
+        cipher_evidence(&destination)
+    }
+
+    fn assert_ready_catalog_baseline(path: &Path) {
+        let connection = Connection::open(path).expect("open migrated catalog baseline");
+        let (catalog_high_water, catalog_retention_floor, catalog_delta_count): (
+            Option<String>,
+            Option<String>,
+            i64,
+        ) = connection
+            .query_row(
+                "SELECT catalog_high_water, catalog_retention_floor, catalog_delta_count
+                 FROM runtime_meta WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read migrated catalog retention state");
+        assert_eq!(catalog_retention_floor, None);
+        assert_eq!(catalog_delta_count, 0);
+        let (count, base_cursor, state, conversation_target_count): (
+            i64,
+            Option<String>,
+            String,
+            i64,
+        ) = connection
+            .query_row(
+                "SELECT COUNT(*), MIN(base_cursor), MIN(build_state),
+                        SUM(CASE WHEN conversation_id IS NOT NULL THEN 1 ELSE 0 END)
+                 FROM snapshots WHERE target_scope = 'catalog'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read catalog snapshot baseline");
+        assert_eq!(count, 1);
+        assert_eq!(base_cursor, catalog_high_water);
+        assert_eq!(state, "ready");
+        assert_eq!(conversation_target_count, 0);
+        let (ledger_count, ledger_bytes): (i64, i64) = connection
+            .query_row(
+                "SELECT snapshot_count, snapshot_bytes FROM runtime_meta WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read migrated snapshot ledger");
+        assert_eq!(ledger_count, 1);
+        assert!(ledger_bytes > 0);
+    }
+
     #[test]
     fn v3_ledger_token_authenticates_both_approval_totals_without_changing_v2_domain() {
         let key_bundle = RuntimeKeyBundle::fresh(RUNTIME_KEY_GENERATION).expect("fresh test keys");
@@ -556,8 +638,9 @@ mod migration_tests {
             started_without_fence_count: 0,
             started_without_release_count: 0,
             started_released_count: 0,
+            ..RuntimeLedger::default()
         };
-        let baseline_v3 = runtime_ledger_token(&key_bundle, database_id, &ledger)
+        let baseline_v3 = runtime_ledger_token_v3(&key_bundle, database_id, &ledger)
             .expect("authenticate baseline v3 ledger");
         let baseline_v2 = runtime_ledger_token_v2(&key_bundle, database_id, &ledger)
             .expect("authenticate baseline v2 ledger");
@@ -566,7 +649,7 @@ mod migration_tests {
         approval_changed.approval_count = 2;
         approval_changed.active_approval_count = 1;
         assert_ne!(
-            runtime_ledger_token(&key_bundle, database_id, &approval_changed)
+            runtime_ledger_token_v3(&key_bundle, database_id, &approval_changed)
                 .expect("authenticate changed v3 ledger"),
             baseline_v3
         );
@@ -576,6 +659,56 @@ mod migration_tests {
             baseline_v2,
             "legacy v2 token ignores approval fields and is only used while authenticating migration"
         );
+    }
+
+    #[test]
+    fn v4_ledger_token_authenticates_every_stream_count_bytes_and_floor() {
+        let key_bundle = RuntimeKeyBundle::fresh(RUNTIME_KEY_GENERATION).expect("fresh test keys");
+        let database_id = [0x43; 16];
+        let ledger = RuntimeLedger::default();
+        let baseline = runtime_ledger_token(&key_bundle, database_id, &ledger)
+            .expect("authenticate baseline v4 ledger");
+        let mut variants = Vec::new();
+        let mut changed = ledger.clone();
+        changed.audit_event_logical_bytes = 1;
+        variants.push(changed);
+        let mut changed = ledger.clone();
+        changed.event_stream_count = 1;
+        variants.push(changed);
+        let mut changed = ledger.clone();
+        changed.event_stream_bytes = 1;
+        variants.push(changed);
+        let mut changed = ledger.clone();
+        changed.catalog_delta_count = 1;
+        variants.push(changed);
+        let mut changed = ledger.clone();
+        changed.catalog_delta_bytes = 1;
+        variants.push(changed);
+        let mut changed = ledger.clone();
+        changed.catalog_retention_floor = Some(super::super::sequence::encode_sequence(0));
+        variants.push(changed);
+        let mut changed = ledger.clone();
+        changed.snapshot_count = 1;
+        variants.push(changed);
+        let mut changed = ledger.clone();
+        changed.snapshot_bytes = 1;
+        variants.push(changed);
+        let mut changed = ledger.clone();
+        changed.publication_stream_count = 1;
+        variants.push(changed);
+        let mut changed = ledger.clone();
+        changed.publication_outbox_count = 1;
+        variants.push(changed);
+        let mut changed = ledger;
+        changed.publication_outbox_bytes = 1;
+        variants.push(changed);
+        for changed in variants {
+            assert_ne!(
+                runtime_ledger_token(&key_bundle, database_id, &changed)
+                    .expect("authenticate changed v4 ledger"),
+                baseline
+            );
+        }
     }
 
     #[tokio::test]
@@ -658,6 +791,7 @@ mod migration_tests {
             after, before,
             "migration must not rewrite key bundle or rows"
         );
+        assert_ready_catalog_baseline(&root.database());
     }
 
     #[tokio::test]
@@ -674,11 +808,12 @@ mod migration_tests {
         .await
         .expect("migrate strict v2 fixture");
         let snapshot = store.inspect().await.expect("inspect migrated v2 schema");
-        assert_eq!(snapshot.schema_version, 3);
+        assert_eq!(snapshot.schema_version, 4);
         assert_eq!(snapshot.table_names, EXPECTED_TABLES);
         store.shutdown().await.expect("shutdown migrated v2 store");
 
         assert_eq!(cipher_evidence(&root.database()), before);
+        assert_ready_catalog_baseline(&root.database());
         let connection = Connection::open(root.database()).expect("inspect migrated v3 meta");
         let (approval_count, active_approval_count): (i64, i64) = connection
             .query_row(
@@ -689,6 +824,38 @@ mod migration_tests {
             )
             .expect("read migrated approval totals");
         assert_eq!((approval_count, active_approval_count), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn strict_v3_migrates_to_v4_without_rewrapping_or_reencrypting_existing_rows() {
+        let root = TestRoot::new("v3-full");
+        let keys = MemoryKeyStore::new();
+        let before = build_strict_v3_fixture(&root, &keys).await;
+        assert_eq!(
+            read_rescue_index(&root.database()).expect("read strict v3 rescue locator"),
+            vec![MachineEnrollmentReceiptRecord {
+                relay_server_id: [0x81; 16],
+                machine_route: [0x82; 16],
+                root_fingerprint: [0x83; 32],
+            }]
+        );
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload v3 KEK"),
+        )
+        .await
+        .expect("migrate strict v3 fixture");
+        assert_eq!(
+            store
+                .inspect()
+                .await
+                .expect("inspect migrated v3")
+                .schema_version,
+            4
+        );
+        store.shutdown().await.expect("shutdown migrated v3 store");
+        assert_eq!(cipher_evidence(&root.database()), before);
+        assert_ready_catalog_baseline(&root.database());
     }
 
     #[tokio::test]
@@ -900,7 +1067,7 @@ mod migration_tests {
                 .await
                 .expect("inspect retried v2 migration")
                 .schema_version,
-            3
+            4
         );
         reopened
             .shutdown()
@@ -1095,7 +1262,7 @@ mod migration_tests {
                 .await
                 .expect("inspect reopened v2 migration")
                 .schema_version,
-            3
+            4
         );
         reopened
             .shutdown()
@@ -1107,7 +1274,7 @@ mod migration_tests {
 
 pub(crate) struct RuntimeSqlite {
     pub connection: Connection,
-    pub key_bundle: RuntimeKeyBundle,
+    pub key_bundle: Arc<RuntimeKeyBundle>,
     pub storage_path: PathBuf,
     pub database_id: [u8; 16],
     pub admission_state: RuntimeAdmissionState,
@@ -1172,7 +1339,7 @@ struct MetaRow {
     metadata_token: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RuntimeLedger {
     pub catalog_high_water: Option<String>,
     pub conversation_count: u64,
@@ -1184,6 +1351,17 @@ pub(crate) struct RuntimeLedger {
     pub claude_code_adapter_state_count: u64,
     pub approval_count: u64,
     pub active_approval_count: u64,
+    pub audit_event_logical_bytes: u64,
+    pub event_stream_count: u64,
+    pub event_stream_bytes: u64,
+    pub catalog_delta_count: u64,
+    pub catalog_delta_bytes: u64,
+    pub catalog_retention_floor: Option<String>,
+    pub snapshot_count: u64,
+    pub snapshot_bytes: u64,
+    pub publication_stream_count: u64,
+    pub publication_outbox_count: u64,
+    pub publication_outbox_bytes: u64,
     pub accepted_count: u64,
     pub accepted_payload_bytes: u64,
     pub started_without_fence_count: u64,
@@ -1195,6 +1373,7 @@ enum SchemaState {
     Fresh,
     LegacyV1(MetaRow, StoreFileIdentity),
     LegacyV2(MetaRow, StoreFileIdentity),
+    LegacyV3(MetaRow, StoreFileIdentity),
     Current(MetaRow, StoreFileIdentity),
 }
 
@@ -1202,6 +1381,7 @@ enum SchemaState {
 enum LegacySchemaVersion {
     V1,
     V2,
+    V3,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1281,6 +1461,14 @@ pub(crate) fn open(
             identity,
             LegacySchemaVersion::V2,
         ),
+        SchemaState::LegacyV3(meta, identity) => open_legacy(
+            config,
+            storage_path,
+            &storage_kek,
+            meta,
+            identity,
+            LegacySchemaVersion::V3,
+        ),
         SchemaState::Current(meta, identity) => {
             open_current(config, storage_path, &storage_kek, meta, identity)
         }
@@ -1328,6 +1516,7 @@ fn open_fresh(
             started_without_fence_count: 0,
             started_without_release_count: 0,
             started_released_count: 0,
+            ..RuntimeLedger::default()
         };
         let metadata_token = runtime_ledger_token(&key_bundle, database_id, &ledger)?;
 
@@ -1335,6 +1524,7 @@ fn open_fresh(
         transaction.execute_batch(RUNTIME_DDL_V1)?;
         transaction.execute_batch(RUNTIME_MIGRATION_V2)?;
         transaction.execute_batch(RUNTIME_MIGRATION_V3)?;
+        transaction.execute_batch(RUNTIME_MIGRATION_V4)?;
         transaction.execute(
             "INSERT INTO runtime_meta (
                  singleton, schema_family, schema_version, schema_signature,
@@ -1379,9 +1569,10 @@ fn open_fresh(
         super::journal::validate_store_integrity(&connection, &key_bundle, database_id)?;
         snapshot(&connection, config.busy_timeout_ms)?;
         sync_parent_directory(&storage_path)?;
+        super::stream::initialize_ephemeral_state(&connection)?;
         Ok(RuntimeSqlite {
             connection,
-            key_bundle,
+            key_bundle: Arc::new(key_bundle),
             storage_path: storage_path.clone(),
             database_id,
             admission_state: RuntimeAdmissionState::Normal,
@@ -1434,9 +1625,10 @@ fn open_current(
     validate_store_files(&storage_path)?;
     super::journal::validate_store_integrity(&connection, &key_bundle, current.database_id)?;
     snapshot(&connection, config.busy_timeout_ms)?;
+    super::stream::initialize_ephemeral_state(&connection)?;
     Ok(RuntimeSqlite {
         connection,
-        key_bundle,
+        key_bundle: Arc::new(key_bundle),
         storage_path,
         database_id: current.database_id,
         admission_state: RuntimeAdmissionState::Normal,
@@ -1467,6 +1659,7 @@ fn open_legacy(
     match legacy_version {
         LegacySchemaVersion::V1 => verify_runtime_ledger_token_v1(&key_bundle, &inspected)?,
         LegacySchemaVersion::V2 => verify_runtime_ledger_token_v2(&key_bundle, &inspected)?,
+        LegacySchemaVersion::V3 => verify_runtime_ledger_token_v3(&key_bundle, &inspected)?,
     }
 
     validate_database_file(&storage_path)?;
@@ -1479,6 +1672,7 @@ fn open_legacy(
     let current = match legacy_version {
         LegacySchemaVersion::V1 => read_and_validate_legacy_v1_schema(&connection)?,
         LegacySchemaVersion::V2 => read_and_validate_legacy_v2_schema(&connection)?,
+        LegacySchemaVersion::V3 => read_and_validate_legacy_v3_schema(&connection)?,
     };
     if !same_meta(&inspected, &current) {
         return Err(RuntimeStoreError::SchemaInspectionRaced);
@@ -1493,7 +1687,7 @@ fn open_legacy(
             current.database_id,
             &current.ledger,
         )?,
-        LegacySchemaVersion::V2 => {
+        LegacySchemaVersion::V2 | LegacySchemaVersion::V3 => {
             super::journal::validate_store_integrity(
                 &connection,
                 &key_bundle,
@@ -1511,17 +1705,19 @@ fn open_legacy(
     // PRAGMA。这里用当前只读 page_size/page_count 与最终目标 page limit 做纯
     // admission；v1 migration 不执行 checkpoint，避免在返回 capacity error 前
     // 改写 main/WAL/SHM。
+    let migration_projection = super::stream::migration_projection_bytes(&connection)?;
     evaluate_migration_capacity_before_wal(
         &connection,
         &storage_path,
         config.capacity_probe.as_ref(),
-        2 * 1024 * 1024,
+        migration_projection,
         migration_reserve,
     )?;
     configure_migration_connection(&connection, config.busy_timeout_ms)?;
     let old_signature = match legacy_version {
         LegacySchemaVersion::V1 => schema_signature_v1(),
         LegacySchemaVersion::V2 => schema_signature_v2(),
+        LegacySchemaVersion::V3 => schema_signature_v3(),
     };
     let new_signature = schema_signature();
     let old_token = match legacy_version {
@@ -1531,21 +1727,43 @@ fn open_legacy(
         LegacySchemaVersion::V2 => {
             runtime_ledger_token_v2(&key_bundle, current.database_id, &current.ledger)?
         }
+        LegacySchemaVersion::V3 => {
+            runtime_ledger_token_v3(&key_bundle, current.database_id, &current.ledger)?
+        }
     };
-    let new_token = runtime_ledger_token(&key_bundle, current.database_id, &current.ledger)?;
     let mut transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if legacy_version == LegacySchemaVersion::V1 {
         transaction.execute_batch(RUNTIME_MIGRATION_V2)?;
     }
-    transaction.execute_batch(RUNTIME_MIGRATION_V3)?;
+    if matches!(
+        legacy_version,
+        LegacySchemaVersion::V1 | LegacySchemaVersion::V2
+    ) {
+        transaction.execute_batch(RUNTIME_MIGRATION_V3)?;
+    }
+    transaction.execute_batch(RUNTIME_MIGRATION_V4)?;
+    let migrated_ledger = super::stream::migrate_v4_rows(
+        &transaction,
+        &key_bundle,
+        current.database_id,
+        &current.ledger,
+    )?;
+    let new_token = runtime_ledger_token(&key_bundle, current.database_id, &migrated_ledger)?;
     if transaction.execute(
         "UPDATE runtime_meta
          SET schema_version = ?1, schema_signature = ?2,
              codex_adapter_state_count = ?3, claude_code_adapter_state_count = ?4,
-             approval_count = 0, active_approval_count = 0,
-             metadata_token = ?5
-         WHERE singleton = 1 AND schema_version = ?6 AND schema_signature = ?7
-           AND metadata_token = ?8",
+             approval_count = ?5, active_approval_count = ?6,
+             audit_event_logical_bytes = ?7,
+             event_stream_count = ?8, event_stream_bytes = ?9,
+             catalog_delta_count = ?10, catalog_delta_bytes = ?11,
+             catalog_retention_floor = ?12,
+             snapshot_count = ?13, snapshot_bytes = ?14,
+             publication_stream_count = ?15,
+             publication_outbox_count = ?16, publication_outbox_bytes = ?17,
+             metadata_token = ?18
+         WHERE singleton = 1 AND schema_version = ?19 AND schema_signature = ?20
+           AND metadata_token = ?21",
         params![
             i64::from(RUNTIME_SCHEMA_VERSION),
             &new_signature[..],
@@ -1553,10 +1771,36 @@ fn open_legacy(
                 .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
             i64::try_from(current.ledger.claude_code_adapter_state_count)
                 .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(migrated_ledger.approval_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(migrated_ledger.active_approval_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(migrated_ledger.audit_event_logical_bytes)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(migrated_ledger.event_stream_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(migrated_ledger.event_stream_bytes)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(migrated_ledger.catalog_delta_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(migrated_ledger.catalog_delta_bytes)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            migrated_ledger.catalog_retention_floor.as_deref(),
+            i64::try_from(migrated_ledger.snapshot_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(migrated_ledger.snapshot_bytes)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(migrated_ledger.publication_stream_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(migrated_ledger.publication_outbox_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(migrated_ledger.publication_outbox_bytes)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
             &new_token[..],
             match legacy_version {
                 LegacySchemaVersion::V1 => 1_i64,
                 LegacySchemaVersion::V2 => 2_i64,
+                LegacySchemaVersion::V3 => 3_i64,
             },
             &old_signature[..],
             &old_token[..],
@@ -1600,16 +1844,17 @@ fn open_legacy(
     if migrated.database_id != current.database_id
         || migrated.key_generation != current.key_generation
         || migrated.wrapped_key_bundle != current.wrapped_key_bundle
-        || migrated.ledger != current.ledger
+        || migrated.ledger != migrated_ledger
     {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
     validate_store_files(&storage_path)?;
     super::journal::validate_store_integrity(&connection, &key_bundle, migrated.database_id)?;
     snapshot(&connection, config.busy_timeout_ms)?;
+    super::stream::initialize_ephemeral_state(&connection)?;
     Ok(RuntimeSqlite {
         connection,
-        key_bundle,
+        key_bundle: Arc::new(key_bundle),
         storage_path,
         database_id: migrated.database_id,
         admission_state: RuntimeAdmissionState::Normal,
@@ -1651,6 +1896,10 @@ fn inspect_schema(path: &Path) -> Result<SchemaState, RuntimeStoreError> {
                 ),
                 2 if family == RUNTIME_SCHEMA_FAMILY => SchemaState::LegacyV2(
                     read_and_validate_legacy_v2_schema(connection)?,
+                    identity.clone(),
+                ),
+                3 if family == RUNTIME_SCHEMA_FAMILY => SchemaState::LegacyV3(
+                    read_and_validate_legacy_v3_schema(connection)?,
                     identity.clone(),
                 ),
                 RUNTIME_SCHEMA_VERSION if family == RUNTIME_SCHEMA_FAMILY => SchemaState::Current(
@@ -1742,6 +1991,28 @@ fn read_and_validate_legacy_v2_schema(
         || meta.metadata_token.len() != 32
         || table_names(connection)? != EXPECTED_TABLES_V2
         || schema_manifest(connection)? != expected_schema_manifest(2)?
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(meta)
+}
+
+fn read_and_validate_legacy_v3_schema(
+    connection: &Connection,
+) -> Result<MetaRow, RuntimeStoreError> {
+    let Some(meta) =
+        read_meta_v3(connection).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
+    else {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    };
+    if meta.family != RUNTIME_SCHEMA_FAMILY
+        || meta.version != 3
+        || meta.signature != schema_signature_v3()
+        || meta.key_generation != RUNTIME_KEY_GENERATION
+        || meta.wrapped_key_bundle.len() != WRAPPED_KEY_BUNDLE_V1_LEN
+        || meta.metadata_token.len() != 32
+        || table_names(connection)? != EXPECTED_TABLES_V3
+        || schema_manifest(connection)? != expected_schema_manifest(3)?
     {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
@@ -2459,7 +2730,26 @@ fn read_meta(connection: &Connection) -> Result<Option<MetaRow>, rusqlite::Error
                 accepted_count, accepted_payload_bytes, started_without_fence_count,
                 started_without_release_count, started_released_count, metadata_token,
                 codex_adapter_state_count, claude_code_adapter_state_count,
-                approval_count, active_approval_count
+                approval_count, active_approval_count,
+                audit_event_logical_bytes, event_stream_count, event_stream_bytes,
+                catalog_delta_count, catalog_delta_bytes, catalog_retention_floor,
+                snapshot_count, snapshot_bytes, publication_stream_count,
+                publication_outbox_count, publication_outbox_bytes
+         FROM runtime_meta WHERE singleton = 1",
+    )
+}
+
+fn read_meta_v3(connection: &Connection) -> Result<Option<MetaRow>, rusqlite::Error> {
+    read_meta_with_sql(
+        connection,
+        "SELECT schema_family, schema_version, schema_signature, database_id,
+                key_generation, wrapped_key_bundle, catalog_high_water,
+                conversation_count, command_count, event_count, intent_count, fence_count,
+                accepted_count, accepted_payload_bytes, started_without_fence_count,
+                started_without_release_count, started_released_count, metadata_token,
+                codex_adapter_state_count, claude_code_adapter_state_count,
+                approval_count, active_approval_count,
+                0, 0, 0, 0, 0, NULL, 0, 0, 0, 0, 0
          FROM runtime_meta WHERE singleton = 1",
     )
 }
@@ -2472,7 +2762,8 @@ fn read_meta_v2(connection: &Connection) -> Result<Option<MetaRow>, rusqlite::Er
                 conversation_count, command_count, event_count, intent_count, fence_count,
                 accepted_count, accepted_payload_bytes, started_without_fence_count,
                 started_without_release_count, started_released_count, metadata_token,
-                codex_adapter_state_count, claude_code_adapter_state_count, 0, 0
+                codex_adapter_state_count, claude_code_adapter_state_count, 0, 0,
+                0, 0, 0, 0, 0, NULL, 0, 0, 0, 0, 0
          FROM runtime_meta WHERE singleton = 1",
     )
 }
@@ -2485,7 +2776,7 @@ fn read_meta_v1(connection: &Connection) -> Result<Option<MetaRow>, rusqlite::Er
                 conversation_count, command_count, event_count, intent_count, fence_count,
                 accepted_count, accepted_payload_bytes, started_without_fence_count,
                 started_without_release_count, started_released_count, metadata_token,
-                0, 0, 0, 0
+                0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, 0, 0, 0, 0, 0
          FROM runtime_meta WHERE singleton = 1",
     )
 }
@@ -2523,6 +2814,17 @@ fn read_meta_with_sql(
                 row.get::<_, i64>(19)?,
                 row.get::<_, i64>(20)?,
                 row.get::<_, i64>(21)?,
+                row.get::<_, i64>(22)?,
+                row.get::<_, i64>(23)?,
+                row.get::<_, i64>(24)?,
+                row.get::<_, i64>(25)?,
+                row.get::<_, i64>(26)?,
+                row.get::<_, Option<String>>(27)?,
+                row.get::<_, i64>(28)?,
+                row.get::<_, i64>(29)?,
+                row.get::<_, i64>(30)?,
+                row.get::<_, i64>(31)?,
+                row.get::<_, i64>(32)?,
             ))
         })
         .optional()?
@@ -2550,6 +2852,17 @@ fn read_meta_with_sql(
                 claude_code_adapter_state_count,
                 approval_count,
                 active_approval_count,
+                audit_event_logical_bytes,
+                event_stream_count,
+                event_stream_bytes,
+                catalog_delta_count,
+                catalog_delta_bytes,
+                catalog_retention_floor,
+                snapshot_count,
+                snapshot_bytes,
+                publication_stream_count,
+                publication_outbox_count,
+                publication_outbox_bytes,
             )| {
                 let version = u32::try_from(version)
                     .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, version))?;
@@ -2587,6 +2900,20 @@ fn read_meta_with_sql(
                     sqlite_nonnegative_u64(19, claude_code_adapter_state_count)?;
                 let approval_count = sqlite_nonnegative_u64(20, approval_count)?;
                 let active_approval_count = sqlite_nonnegative_u64(21, active_approval_count)?;
+                let audit_event_logical_bytes =
+                    sqlite_nonnegative_u64(22, audit_event_logical_bytes)?;
+                let event_stream_count = sqlite_nonnegative_u64(23, event_stream_count)?;
+                let event_stream_bytes = sqlite_nonnegative_u64(24, event_stream_bytes)?;
+                let catalog_delta_count = sqlite_nonnegative_u64(25, catalog_delta_count)?;
+                let catalog_delta_bytes = sqlite_nonnegative_u64(26, catalog_delta_bytes)?;
+                let snapshot_count = sqlite_nonnegative_u64(28, snapshot_count)?;
+                let snapshot_bytes = sqlite_nonnegative_u64(29, snapshot_bytes)?;
+                let publication_stream_count =
+                    sqlite_nonnegative_u64(30, publication_stream_count)?;
+                let publication_outbox_count =
+                    sqlite_nonnegative_u64(31, publication_outbox_count)?;
+                let publication_outbox_bytes =
+                    sqlite_nonnegative_u64(32, publication_outbox_bytes)?;
                 if active_approval_count > approval_count {
                     return Err(rusqlite::Error::IntegralValueOutOfRange(
                         21,
@@ -2611,6 +2938,17 @@ fn read_meta_with_sql(
                         claude_code_adapter_state_count,
                         approval_count,
                         active_approval_count,
+                        audit_event_logical_bytes,
+                        event_stream_count,
+                        event_stream_bytes,
+                        catalog_delta_count,
+                        catalog_delta_bytes,
+                        catalog_retention_floor,
+                        snapshot_count,
+                        snapshot_bytes,
+                        publication_stream_count,
+                        publication_outbox_count,
+                        publication_outbox_bytes,
                         accepted_count,
                         accepted_payload_bytes,
                         started_without_fence_count,
@@ -2662,9 +3000,14 @@ fn expected_schema_manifest(version: u32) -> Result<Vec<SchemaObject>, RuntimeSt
     match version {
         1 => {}
         2 => connection.execute_batch(RUNTIME_MIGRATION_V2)?,
+        3 => {
+            connection.execute_batch(RUNTIME_MIGRATION_V2)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V3)?;
+        }
         RUNTIME_SCHEMA_VERSION => {
             connection.execute_batch(RUNTIME_MIGRATION_V2)?;
             connection.execute_batch(RUNTIME_MIGRATION_V3)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V4)?;
         }
         _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
     }
@@ -2694,7 +3037,7 @@ fn same_meta(left: &MetaRow, right: &MetaRow) -> bool {
         && left.metadata_token == right.metadata_token
 }
 
-fn runtime_ledger_token(
+fn runtime_ledger_token_v3(
     key_bundle: &RuntimeKeyBundle,
     database_id: [u8; 16],
     ledger: &RuntimeLedger,
@@ -2724,6 +3067,53 @@ fn runtime_ledger_token(
     message.extend_from_slice(&ledger.started_released_count.to_be_bytes());
     let token = key_bundle.blind_index(b"runtime.meta.ledger.v3", &message)?;
     Ok(*token.as_bytes())
+}
+
+fn runtime_ledger_token(
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    ledger: &RuntimeLedger,
+) -> Result<[u8; 32], RuntimeStoreError> {
+    let mut message = Vec::with_capacity(256);
+    message.extend_from_slice(&database_id);
+    encode_optional_ledger_sequence(&mut message, ledger.catalog_high_water.as_deref());
+    message.extend_from_slice(&ledger.conversation_count.to_be_bytes());
+    message.extend_from_slice(&ledger.command_count.to_be_bytes());
+    message.extend_from_slice(&ledger.event_count.to_be_bytes());
+    message.extend_from_slice(&ledger.intent_count.to_be_bytes());
+    message.extend_from_slice(&ledger.fence_count.to_be_bytes());
+    message.extend_from_slice(&ledger.codex_adapter_state_count.to_be_bytes());
+    message.extend_from_slice(&ledger.claude_code_adapter_state_count.to_be_bytes());
+    message.extend_from_slice(&ledger.approval_count.to_be_bytes());
+    message.extend_from_slice(&ledger.active_approval_count.to_be_bytes());
+    message.extend_from_slice(&ledger.audit_event_logical_bytes.to_be_bytes());
+    message.extend_from_slice(&ledger.event_stream_count.to_be_bytes());
+    message.extend_from_slice(&ledger.event_stream_bytes.to_be_bytes());
+    message.extend_from_slice(&ledger.catalog_delta_count.to_be_bytes());
+    message.extend_from_slice(&ledger.catalog_delta_bytes.to_be_bytes());
+    encode_optional_ledger_sequence(&mut message, ledger.catalog_retention_floor.as_deref());
+    message.extend_from_slice(&ledger.snapshot_count.to_be_bytes());
+    message.extend_from_slice(&ledger.snapshot_bytes.to_be_bytes());
+    message.extend_from_slice(&ledger.publication_stream_count.to_be_bytes());
+    message.extend_from_slice(&ledger.publication_outbox_count.to_be_bytes());
+    message.extend_from_slice(&ledger.publication_outbox_bytes.to_be_bytes());
+    message.extend_from_slice(&ledger.accepted_count.to_be_bytes());
+    message.extend_from_slice(&ledger.accepted_payload_bytes.to_be_bytes());
+    message.extend_from_slice(&ledger.started_without_fence_count.to_be_bytes());
+    message.extend_from_slice(&ledger.started_without_release_count.to_be_bytes());
+    message.extend_from_slice(&ledger.started_released_count.to_be_bytes());
+    let token = key_bundle.blind_index(b"runtime.meta.ledger.v4", &message)?;
+    Ok(*token.as_bytes())
+}
+
+fn encode_optional_ledger_sequence(message: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        None => message.push(0),
+        Some(value) => {
+            message.push(1);
+            message.extend_from_slice(value.as_bytes());
+        }
+    }
 }
 
 fn runtime_ledger_token_v2(
@@ -2817,6 +3207,17 @@ fn verify_runtime_ledger_token_v2(
     Ok(())
 }
 
+fn verify_runtime_ledger_token_v3(
+    key_bundle: &RuntimeKeyBundle,
+    meta: &MetaRow,
+) -> Result<(), RuntimeStoreError> {
+    let expected = runtime_ledger_token_v3(key_bundle, meta.database_id, &meta.ledger)?;
+    if meta.metadata_token.as_slice() != expected {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(())
+}
+
 pub(crate) fn load_runtime_ledger(
     connection: &Connection,
     key_bundle: &RuntimeKeyBundle,
@@ -2828,6 +3229,7 @@ pub(crate) fn load_runtime_ledger(
     }
     let meta = match version {
         2 => read_meta_v2(connection)?,
+        3 => read_meta_v3(connection)?,
         RUNTIME_SCHEMA_VERSION => read_meta(connection)?,
         _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
     }
@@ -2837,6 +3239,7 @@ pub(crate) fn load_runtime_ledger(
     }
     match version {
         2 => verify_runtime_ledger_token_v2(key_bundle, &meta)?,
+        3 => verify_runtime_ledger_token_v3(key_bundle, &meta)?,
         RUNTIME_SCHEMA_VERSION => verify_runtime_ledger_token(key_bundle, &meta)?,
         _ => unreachable!("version matched above"),
     }
@@ -2850,6 +3253,21 @@ pub(crate) fn update_runtime_ledger(
     previous: &RuntimeLedger,
     next: &RuntimeLedger,
 ) -> Result<(), RuntimeStoreError> {
+    let reconciled_next = super::stream::reconcile_event_stream(
+        transaction,
+        key_bundle,
+        database_id,
+        previous,
+        next,
+    )?;
+    let reconciled_next = super::catalog::reconcile_catalog_journal(
+        transaction,
+        key_bundle,
+        database_id,
+        previous,
+        &reconciled_next,
+    )?;
+    let next = &reconciled_next;
     let previous_token = runtime_ledger_token(key_bundle, database_id, previous)?;
     let next_token = runtime_ledger_token(key_bundle, database_id, next)?;
     if transaction.execute(
@@ -2858,10 +3276,17 @@ pub(crate) fn update_runtime_ledger(
              event_count = ?4, intent_count = ?5, fence_count = ?6,
              codex_adapter_state_count = ?7, claude_code_adapter_state_count = ?8,
              approval_count = ?9, active_approval_count = ?10,
-             accepted_count = ?11, accepted_payload_bytes = ?12,
-             started_without_fence_count = ?13, started_without_release_count = ?14,
-             started_released_count = ?15, metadata_token = ?16
-         WHERE singleton = 1 AND metadata_token = ?17",
+             audit_event_logical_bytes = ?11,
+             event_stream_count = ?12, event_stream_bytes = ?13,
+             catalog_delta_count = ?14, catalog_delta_bytes = ?15,
+             catalog_retention_floor = ?16,
+             snapshot_count = ?17, snapshot_bytes = ?18,
+             publication_stream_count = ?19,
+             publication_outbox_count = ?20, publication_outbox_bytes = ?21,
+             accepted_count = ?22, accepted_payload_bytes = ?23,
+             started_without_fence_count = ?24, started_without_release_count = ?25,
+             started_released_count = ?26, metadata_token = ?27
+         WHERE singleton = 1 AND metadata_token = ?28",
         params![
             next.catalog_high_water.as_deref(),
             i64::try_from(next.conversation_count)
@@ -2881,6 +3306,27 @@ pub(crate) fn update_runtime_ledger(
             i64::try_from(next.approval_count)
                 .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
             i64::try_from(next.active_approval_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.audit_event_logical_bytes)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.event_stream_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.event_stream_bytes)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.catalog_delta_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.catalog_delta_bytes)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            next.catalog_retention_floor.as_deref(),
+            i64::try_from(next.snapshot_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.snapshot_bytes)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.publication_stream_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.publication_outbox_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.publication_outbox_bytes)
                 .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
             i64::try_from(next.accepted_count)
                 .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
@@ -3023,6 +3469,9 @@ pub(crate) fn read_rescue_index(
         }
         (RUNTIME_SCHEMA_FAMILY, 2) => {
             read_and_validate_legacy_v2_schema(connection)?;
+        }
+        (RUNTIME_SCHEMA_FAMILY, 3) => {
+            read_and_validate_legacy_v3_schema(connection)?;
         }
         (RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION) => {
             read_and_validate_current_schema(connection)?;
@@ -3586,6 +4035,7 @@ mod tests {
             started_without_fence_count: 0,
             started_without_release_count: 0,
             started_released_count: 0,
+            ..RuntimeLedger::default()
         }
     }
 

@@ -237,6 +237,17 @@ type RawRuntimeLedger = (
     i64,
     i64,
     i64,
+    Option<String>,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
 );
 
 type RawCommandMetadata = (
@@ -336,6 +347,17 @@ fn runtime_ledger_token(
         claude_code_adapter_state_count,
         approval_count,
         active_approval_count,
+        audit_event_logical_bytes,
+        event_stream_count,
+        event_stream_bytes,
+        catalog_delta_count,
+        catalog_delta_bytes,
+        catalog_retention_floor,
+        snapshot_count,
+        snapshot_bytes,
+        publication_stream_count,
+        publication_outbox_count,
+        publication_outbox_bytes,
         accepted_count,
         accepted_payload_bytes,
         started_without_fence_count,
@@ -346,6 +368,10 @@ fn runtime_ledger_token(
             "SELECT catalog_high_water, conversation_count, command_count, event_count,
                     intent_count, fence_count, codex_adapter_state_count,
                     claude_code_adapter_state_count, approval_count, active_approval_count,
+                    audit_event_logical_bytes, event_stream_count, event_stream_bytes,
+                    catalog_delta_count, catalog_delta_bytes, catalog_retention_floor,
+                    snapshot_count, snapshot_bytes, publication_stream_count,
+                    publication_outbox_count, publication_outbox_bytes,
                     accepted_count, accepted_payload_bytes,
                     started_without_fence_count, started_without_release_count,
                     started_released_count
@@ -368,6 +394,17 @@ fn runtime_ledger_token(
                     row.get(12)?,
                     row.get(13)?,
                     row.get(14)?,
+                    row.get(15)?,
+                    row.get(16)?,
+                    row.get(17)?,
+                    row.get(18)?,
+                    row.get(19)?,
+                    row.get(20)?,
+                    row.get(21)?,
+                    row.get(22)?,
+                    row.get(23)?,
+                    row.get(24)?,
+                    row.get(25)?,
                 ))
             },
         )
@@ -391,6 +428,31 @@ fn runtime_ledger_token(
         claude_code_adapter_state_count,
         approval_count,
         active_approval_count,
+        audit_event_logical_bytes,
+        event_stream_count,
+        event_stream_bytes,
+        catalog_delta_count,
+        catalog_delta_bytes,
+    ] {
+        message.extend_from_slice(
+            &u64::try_from(value)
+                .expect("fixture ledger counter is non-negative")
+                .to_be_bytes(),
+        );
+    }
+    match catalog_retention_floor {
+        None => message.push(0),
+        Some(value) => {
+            message.push(1);
+            message.extend_from_slice(value.as_bytes());
+        }
+    }
+    for value in [
+        snapshot_count,
+        snapshot_bytes,
+        publication_stream_count,
+        publication_outbox_count,
+        publication_outbox_bytes,
         accepted_count,
         accepted_payload_bytes,
         started_without_fence_count,
@@ -404,7 +466,7 @@ fn runtime_ledger_token(
         );
     }
     *key_bundle
-        .blind_index(b"runtime.meta.ledger.v3", &message)
+        .blind_index(b"runtime.meta.ledger.v4", &message)
         .expect("authenticate Runtime boundary ledger")
         .as_bytes()
 }
@@ -422,6 +484,62 @@ fn reauthenticate_conversation(
                 params![&token[..], &conversation_id.as_bytes()[..]],
             )
             .expect("persist authenticated conversation boundary metadata"),
+        1
+    );
+}
+
+fn move_event_retention_through(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    conversation_id: RuntimeId,
+    indexed_through: &str,
+) {
+    let (oldest, retained_count, retained_bytes, range_digest): (
+        Option<String>,
+        i64,
+        i64,
+        Vec<u8>,
+    ) = connection
+        .query_row(
+            "SELECT oldest_retained_event_seq, retained_event_count, retained_logical_bytes,
+                    range_digest
+             FROM event_retention WHERE conversation_id = ?1",
+            [&conversation_id.as_bytes()[..]],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("read event retention fixture");
+    assert!(
+        oldest.is_none(),
+        "opaque boundary fixture has no replay row"
+    );
+    assert_eq!(retained_count, 0);
+    assert_eq!(retained_bytes, 0);
+    let indexed = optional_text_field(Some(indexed_through));
+    let oldest = optional_text_field(None);
+    let encoded = canonical_fields(&[
+        conversation_id.as_bytes(),
+        &indexed,
+        &oldest,
+        &0_u64.to_be_bytes(),
+        &0_u64.to_be_bytes(),
+        &range_digest,
+    ]);
+    let token = key_bundle
+        .blind_index(b"event.retention.v1", &encoded)
+        .expect("authenticate event retention boundary");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE event_retention
+                 SET indexed_through_event_seq = ?1, metadata_token = ?2
+                 WHERE conversation_id = ?3",
+                params![
+                    indexed_through,
+                    &token.as_bytes()[..],
+                    &conversation_id.as_bytes()[..],
+                ],
+            )
+            .expect("move event retention through boundary"),
         1
     );
 }
@@ -819,6 +937,18 @@ async fn catalog_hwm_u64_max_returns_typed_exhaustion_and_inserts_no_additional_
         let mut raw = raw_connection(&root.database());
         let (key_bundle, database_id) = load_runtime_key_bundle(&raw, &storage_kek);
         let transaction = raw.transaction().expect("begin catalog boundary fixture");
+        let stored_token: Vec<u8> = transaction
+            .query_row(
+                "SELECT metadata_token FROM runtime_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read baseline v4 ledger token");
+        assert_eq!(
+            runtime_ledger_token(&transaction, &key_bundle, database_id).as_slice(),
+            stored_token,
+            "fixture v4 ledger encoder must match the store"
+        );
         assert_eq!(
             transaction
                 .execute(
@@ -832,12 +962,20 @@ async fn catalog_hwm_u64_max_returns_typed_exhaustion_and_inserts_no_additional_
         assert_eq!(
             transaction
                 .execute(
-                    "UPDATE runtime_meta SET catalog_high_water = ?1 WHERE singleton = 1",
+                    "UPDATE runtime_meta
+                     SET catalog_high_water = ?1,
+                         catalog_delta_count = 0,
+                         catalog_delta_bytes = 0,
+                         catalog_retention_floor = NULL
+                     WHERE singleton = 1",
                     [MAX_SEQUENCE],
                 )
                 .expect("set legal maximum catalog HWM"),
             1
         );
+        transaction
+            .execute("DELETE FROM catalog_journal", [])
+            .expect("turn old catalog delta into a snapshot boundary");
         reauthenticate_runtime_ledger(&transaction, &key_bundle, database_id);
         transaction
             .commit()
@@ -1047,6 +1185,12 @@ async fn event_hwm_u64_max_returns_typed_exhaustion_and_keeps_command_accepted()
             1
         );
         reauthenticate_conversation(&transaction, &key_bundle, conversation.conversation_id);
+        move_event_retention_through(
+            &transaction,
+            &key_bundle,
+            conversation.conversation_id,
+            MAX_SEQUENCE,
+        );
         transaction
             .commit()
             .expect("commit authenticated event HWM boundary fixture");
