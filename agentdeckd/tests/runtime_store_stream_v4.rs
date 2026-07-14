@@ -14,12 +14,21 @@ use agentdeckd::runtime::store::{
 };
 use agentdeckd::security::{MemoryKeyStore, StorageKek, load_or_create_storage_kek};
 
+#[path = "support/store_admission.rs"]
+mod store_admission;
+mod support;
+use support::snapshot::{prepare_canonical_snapshot_write, store_canonical_snapshot};
+
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
-struct TestRoot(PathBuf);
+struct TestRoot {
+    path: PathBuf,
+    _permit: store_admission::Permit,
+}
 
 impl TestRoot {
     fn new(label: &str) -> Self {
+        let permit = store_admission::acquire();
         let sequence = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let path = Path::new("/tmp").join(format!(
             "agentdeckd-runtime-stream-v4-{label}-{}-{sequence}",
@@ -33,21 +42,24 @@ impl TestRoot {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
                 .expect("secure test root");
         }
-        Self(path)
+        Self {
+            path,
+            _permit: permit,
+        }
     }
 
     fn database(&self) -> PathBuf {
-        self.0.join("runtime.db")
+        self.path.join("runtime.db")
     }
 
     fn storage_kek(&self, keys: &MemoryKeyStore) -> StorageKek {
-        load_or_create_storage_kek(keys, &self.0.join("key-state.db")).expect("load StorageKEK")
+        load_or_create_storage_kek(keys, &self.path.join("key-state.db")).expect("load StorageKEK")
     }
 }
 
 impl Drop for TestRoot {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
@@ -161,21 +173,21 @@ async fn catalog_pin_snapshot_and_publication_have_one_durable_cut() {
         .load_catalog_backfill_page(catalog_pin, None)
         .await
         .expect("load catalog page");
+    let catalog_completion = catalog_page.completion().clone();
     assert!(catalog_page.complete);
     assert_eq!(catalog_page.next_after, 0);
     assert_eq!(catalog_page.deltas[0].catalog_revision, 0);
+    store
+        .complete_backfill_page(catalog_completion)
+        .await
+        .expect("ACK catalog page completion");
     drop(catalog_page);
 
     let snapshot_pin = store
-        .acquire_snapshot_build_pin(conversation_id)
+        .acquire_snapshot_build_source(conversation_id)
         .await
         .expect("capture empty conversation snapshot");
-    let snapshot = store
-        .store_conversation_snapshot_from_pin(
-            snapshot_pin,
-            1,
-            b"capabilities-only-snapshot".to_vec(),
-        )
+    let snapshot = store_canonical_snapshot(&store, snapshot_pin, "capabilities-only-snapshot")
         .await
         .expect("store empty-conversation snapshot");
     assert_eq!(
@@ -531,18 +543,19 @@ async fn publication_counter_high_water_survives_daemon_reopen_after_ack() {
         .create_publication_stream(stream_id, PublicationScope::Catalog, [0xE4; 16], generation)
         .await
         .expect("create publication stream");
+    let acknowledged_request = FreezePublicationRequest {
+        publication_id: [0xE5; 16],
+        publication_stream_id: stream_id,
+        generation,
+        counter_scope_token: counter_scope,
+        sender_counter: 9,
+        inner_after: None,
+        inner_through: None,
+        payload_kind: PublicationPayloadKind::Control,
+        blob: b"persist-counter-high-water".to_vec(),
+    };
     let frozen = store
-        .freeze_publication(FreezePublicationRequest {
-            publication_id: [0xE5; 16],
-            publication_stream_id: stream_id,
-            generation,
-            counter_scope_token: counter_scope,
-            sender_counter: 9,
-            inner_after: None,
-            inner_through: None,
-            payload_kind: PublicationPayloadKind::Control,
-            blob: b"persist-counter-high-water".to_vec(),
-        })
+        .freeze_publication(acknowledged_request.clone())
         .await
         .expect("freeze publication");
     store
@@ -571,6 +584,18 @@ async fn publication_counter_high_water_survives_daemon_reopen_after_ack() {
     )
     .await
     .expect("reopen store");
+    assert!(matches!(
+        reopened
+            .freeze_publication(acknowledged_request.clone())
+            .await,
+        Err(RuntimeStoreError::PublicationAlreadyAcknowledged)
+    ));
+    let mut conflicting_reuse = acknowledged_request;
+    conflicting_reuse.blob = b"same-id-different-request".to_vec();
+    assert!(matches!(
+        reopened.freeze_publication(conflicting_reuse).await,
+        Err(RuntimeStoreError::PublicationMismatch)
+    ));
     assert!(matches!(
         reopened
             .freeze_publication(FreezePublicationRequest {
@@ -887,7 +912,12 @@ async fn catalog_backfill_pin_rejects_clock_rollback_before_its_issue_time() {
         .load_catalog_backfill_page(pin, None)
         .await
         .expect("clock rollback does not consume the pin");
+    let completion = page.completion().clone();
     assert!(page.complete);
+    store
+        .complete_backfill_page(completion)
+        .await
+        .expect("ACK catalog page after clock recovery");
     store.shutdown().await.expect("shutdown store");
 }
 
@@ -909,26 +939,24 @@ async fn snapshot_build_pin_rejects_clock_rollback_before_its_issue_time() {
         .await
         .expect("create conversation");
     let pin = store
-        .acquire_snapshot_build_pin(conversation_id)
+        .acquire_snapshot_build_source(conversation_id)
         .await
         .expect("capture snapshot pin");
 
     clock.set(1_999);
-    assert!(matches!(
-        store
-            .store_conversation_snapshot_from_pin(pin.clone(), 1, b"clock-safe-snapshot".to_vec(),)
-            .await,
-        Err(RuntimeStoreError::ClockRegressed {
-            persisted_ms: 2_000,
-            observed_ms: 1_999,
-        })
-    ));
+    let error = store_canonical_snapshot(&store, pin, "clock-safe-snapshot")
+        .await
+        .expect_err("clock regression rejects safe snapshot preparation");
+    assert_eq!(error.code(), "daemon.runtime.invalid_state");
 
     clock.set(2_000);
-    store
-        .store_conversation_snapshot_from_pin(pin, 1, b"clock-safe-snapshot".to_vec())
+    let replacement_pin = store
+        .acquire_snapshot_build_source(conversation_id)
         .await
-        .expect("clock rollback does not consume the snapshot pin");
+        .expect("acquire fresh pin after failed preparation cleanup");
+    store_canonical_snapshot(&store, replacement_pin, "clock-safe-snapshot")
+        .await
+        .expect("fresh exact pin succeeds after clock recovers");
     store.shutdown().await.expect("shutdown store");
 }
 
@@ -949,11 +977,10 @@ async fn snapshot_hash_or_metadata_tamper_fails_closed_on_reopen() {
         .await
         .expect("create conversation");
     let snapshot_pin = store
-        .acquire_snapshot_build_pin(conversation_id)
+        .acquire_snapshot_build_source(conversation_id)
         .await
         .expect("capture snapshot tamper fixture");
-    store
-        .store_conversation_snapshot_from_pin(snapshot_pin, 1, b"snapshot".to_vec())
+    store_canonical_snapshot(&store, snapshot_pin, "snapshot")
         .await
         .expect("store snapshot");
     store.shutdown().await.expect("shutdown before tamper");
@@ -1211,14 +1238,19 @@ async fn snapshot_build_pin_allows_frozen_base_while_writer_advances_high_water(
         .await
         .expect("persist unreleased fence");
     let pin = store
-        .acquire_snapshot_build_pin(conversation_id)
+        .acquire_snapshot_build_source(conversation_id)
         .await
         .expect("freeze snapshot base at event zero");
     let sibling_pin = store
-        .acquire_snapshot_build_pin(conversation_id)
+        .acquire_snapshot_build_source(conversation_id)
         .await
         .expect("second opaque capability at same base");
-    assert_eq!(pin.base_event_seq(), Some(0));
+    assert_eq!(
+        pin.build_pin()
+            .expect("direct acquire returns build source")
+            .base_event_seq(),
+        Some(0)
+    );
 
     clock.set(1_400);
     store
@@ -1236,29 +1268,11 @@ async fn snapshot_build_pin_allows_frozen_base_while_writer_advances_high_water(
         .expect("advance event high-water to one while snapshot builds");
 
     clock.set(1_500);
-    let stored = store
-        .store_conversation_snapshot_from_pin(
-            pin.clone(),
-            1,
-            b"snapshot frozen at event zero".to_vec(),
-        )
+    let stored = store_canonical_snapshot(&store, pin, "snapshot frozen at event zero")
         .await
         .expect("commit pinned stale-base snapshot");
     assert_eq!(stored.base_event_seq, Some(0));
-    assert!(matches!(
-        store
-            .store_conversation_snapshot_from_pin(
-                pin.clone(),
-                1,
-                b"consumed pin cannot borrow sibling at same base".to_vec(),
-            )
-            .await,
-        Err(RuntimeStoreError::InvalidStateTransition)
-    ));
-    store
-        .release_snapshot_build_pin(sibling_pin)
-        .await
-        .expect("sibling pin remains independently releasable");
+    drop(sibling_pin);
     assert_eq!(
         store
             .load_conversation_snapshot(conversation_id)
@@ -1287,33 +1301,21 @@ async fn exact_snapshot_replay_consumes_each_new_valid_build_pin() {
         .await
         .expect("create conversation");
     let source_pin = store
-        .acquire_snapshot_build_pin(conversation_id)
+        .acquire_snapshot_build_source(conversation_id)
         .await
         .expect("acquire source snapshot pin");
-    let stored = store
-        .store_conversation_snapshot_from_pin(source_pin, 1, b"exact-snapshot".to_vec())
+    let stored = store_canonical_snapshot(&store, source_pin, "exact-snapshot")
         .await
         .expect("store source snapshot");
 
     let replay_pin = store
-        .acquire_snapshot_build_pin(conversation_id)
+        .acquire_snapshot_build_source(conversation_id)
         .await
         .expect("acquire a distinct pin for exact replay");
-    let replayed = store
-        .store_conversation_snapshot_from_pin(replay_pin.clone(), 1, b"exact-snapshot".to_vec())
+    let replayed = store_canonical_snapshot(&store, replay_pin, "exact-snapshot")
         .await
         .expect("exact replay consumes the new pin");
     assert_eq!(replayed, stored);
-    assert!(matches!(
-        store
-            .store_conversation_snapshot_from_pin(
-                replay_pin,
-                1,
-                b"unconsumed-pin-would-replace-snapshot".to_vec(),
-            )
-            .await,
-        Err(RuntimeStoreError::InvalidStateTransition)
-    ));
     store.shutdown().await.expect("shutdown store");
 }
 
@@ -1335,40 +1337,40 @@ async fn exact_snapshot_replay_rejects_released_and_expired_build_pins() {
         .await
         .expect("create conversation");
     let source_pin = store
-        .acquire_snapshot_build_pin(conversation_id)
+        .acquire_snapshot_build_source(conversation_id)
         .await
         .expect("acquire source snapshot pin");
-    store
-        .store_conversation_snapshot_from_pin(source_pin, 1, b"stable-snapshot".to_vec())
+    store_canonical_snapshot(&store, source_pin, "stable-snapshot")
         .await
         .expect("store source snapshot");
 
     let released = store
-        .acquire_snapshot_build_pin(conversation_id)
+        .acquire_snapshot_build_source(conversation_id)
         .await
         .expect("acquire pin to release");
     store
-        .release_snapshot_build_pin(released.clone())
+        .release_snapshot_build_pin(
+            released
+                .build_pin()
+                .expect("direct acquire returns build source")
+                .clone(),
+        )
         .await
         .expect("release pin before replay");
-    assert!(matches!(
-        store
-            .store_conversation_snapshot_from_pin(released, 1, b"stable-snapshot".to_vec())
-            .await,
-        Err(RuntimeStoreError::InvalidStateTransition)
-    ));
+    let error = store_canonical_snapshot(&store, released, "stable-snapshot")
+        .await
+        .expect_err("released pin cannot replay safe snapshot");
+    assert_eq!(error.code(), "daemon.runtime.invalid_state");
 
     let expired = store
-        .acquire_snapshot_build_pin(conversation_id)
+        .acquire_snapshot_build_source(conversation_id)
         .await
         .expect("acquire pin to expire");
     clock.set(301_000);
-    assert!(matches!(
-        store
-            .store_conversation_snapshot_from_pin(expired, 1, b"stable-snapshot".to_vec())
-            .await,
-        Err(RuntimeStoreError::InvalidStateTransition)
-    ));
+    let error = store_canonical_snapshot(&store, expired, "stable-snapshot")
+        .await
+        .expect_err("expired pin cannot replay safe snapshot");
+    assert_eq!(error.code(), "daemon.runtime.invalid_state");
     store.shutdown().await.expect("shutdown store");
 }
 
@@ -1390,26 +1392,103 @@ async fn snapshot_commit_unknown_replays_only_the_persisted_source_pin() {
         .await
         .expect("create conversation");
     let source_pin = store
-        .acquire_snapshot_build_pin(conversation_id)
+        .acquire_snapshot_build_source(conversation_id)
         .await
         .expect("acquire source snapshot pin");
+    let write = prepare_canonical_snapshot_write(&store, source_pin, "commit-unknown-snapshot")
+        .await
+        .expect("prepare exact opaque snapshot write");
+    let failure = store
+        .store_conversation_snapshot(write)
+        .await
+        .expect_err("post-COMMIT fault returns the same opaque write");
     assert!(matches!(
-        store
-            .store_conversation_snapshot_from_pin(
-                source_pin.clone(),
-                1,
-                b"commit-unknown-snapshot".to_vec(),
-            )
-            .await,
-        Err(RuntimeStoreError::CommitOutcomeUnknown {
+        failure.error(),
+        RuntimeStoreError::CommitOutcomeUnknown {
             operation: RuntimeCommitOperation::StoreSnapshot
-        })
+        }
     ));
+    let write = failure
+        .into_retry_write()
+        .expect("COMMIT-unknown retains exact opaque write for replay");
     let replayed = store
-        .store_conversation_snapshot_from_pin(source_pin, 1, b"commit-unknown-snapshot".to_vec())
+        .store_conversation_snapshot(write)
         .await
         .expect("same persisted source pin replays COMMIT-unknown outcome");
-    assert_eq!(replayed.payload, b"commit-unknown-snapshot");
+    assert!(
+        replayed
+            .payload
+            .windows("commit-unknown-snapshot".len())
+            .any(|window| { window == b"commit-unknown-snapshot" })
+    );
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn exact_snapshot_candidate_corruption_returns_no_consumed_retry_write() {
+    let root = TestRoot::new("snapshot-exact-corrupt-no-retry");
+    let keys = MemoryKeyStore::new();
+    let store = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(root.database()),
+        root.storage_kek(&keys),
+    )
+    .await
+    .expect("open store");
+    let input = conversation(0xDE);
+    let conversation_id = input.conversation_id;
+    store
+        .create_conversation(input)
+        .await
+        .expect("create conversation");
+    let source = store
+        .acquire_snapshot_build_source(conversation_id)
+        .await
+        .expect("acquire source snapshot pin");
+    store_canonical_snapshot(&store, source, "exact-corrupt-candidate")
+        .await
+        .expect("store source snapshot");
+    let replay_source = store
+        .acquire_snapshot_build_source(conversation_id)
+        .await
+        .expect("acquire replay snapshot pin");
+    let write = prepare_canonical_snapshot_write(&store, replay_source, "exact-corrupt-candidate")
+        .await
+        .expect("prepare exact replay write");
+
+    let connection = rusqlite::Connection::open(root.database()).expect("open corruption handle");
+    let mut sealed: Vec<u8> = connection
+        .query_row(
+            "SELECT sealed_snapshot FROM snapshots
+             WHERE target_scope = 'conversation' AND conversation_id = ?1",
+            [&conversation_id.as_bytes()[..]],
+            |row| row.get(0),
+        )
+        .expect("read exact candidate ciphertext");
+    let last = sealed
+        .last_mut()
+        .expect("sealed snapshot always contains an authentication tag");
+    *last ^= 0x01;
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE snapshots SET sealed_snapshot = ?1
+                 WHERE target_scope = 'conversation' AND conversation_id = ?2",
+                rusqlite::params![sealed, &conversation_id.as_bytes()[..]],
+            )
+            .expect("tamper exact candidate ciphertext"),
+        1
+    );
+    drop(connection);
+
+    let failure = store
+        .store_conversation_snapshot(write)
+        .await
+        .expect_err("corrupt exact candidate must fail closed");
+    assert_eq!(failure.code(), "daemon.runtime.crypto_failed");
+    assert!(
+        failure.into_retry_write().is_none(),
+        "incoming payload was consumed before old ciphertext authentication failed"
+    );
     store.shutdown().await.expect("shutdown store");
 }
 
@@ -1430,11 +1509,10 @@ async fn snapshot_source_build_pin_is_authenticated_on_reopen() {
         .await
         .expect("create conversation");
     let source_pin = store
-        .acquire_snapshot_build_pin(conversation_id)
+        .acquire_snapshot_build_source(conversation_id)
         .await
         .expect("acquire source snapshot pin");
-    store
-        .store_conversation_snapshot_from_pin(source_pin, 1, b"source-pin-auth".to_vec())
+    store_canonical_snapshot(&store, source_pin, "source-pin-auth")
         .await
         .expect("store snapshot");
     store.shutdown().await.expect("shutdown before tamper");
@@ -1572,10 +1650,16 @@ async fn before_first_snapshot_capability_survives_event_zero_writer_progress() 
         .await
         .expect("create empty conversation");
     let before_first = store
-        .acquire_snapshot_build_pin(conversation_id)
+        .acquire_snapshot_build_source(conversation_id)
         .await
         .expect("capture BeforeFirst snapshot capability");
-    assert_eq!(before_first.base_event_seq(), None);
+    assert_eq!(
+        before_first
+            .build_pin()
+            .expect("direct acquire returns build source")
+            .base_event_seq(),
+        None
+    );
     clock.set(2_100);
     let command = match store
         .accept_command(AcceptCommand {
@@ -1608,12 +1692,7 @@ async fn before_first_snapshot_capability_survives_event_zero_writer_progress() 
         .await
         .expect("advance event H to zero");
     clock.set(2_300);
-    let snapshot = store
-        .store_conversation_snapshot_from_pin(
-            before_first,
-            1,
-            b"capabilities-only-before-first".to_vec(),
-        )
+    let snapshot = store_canonical_snapshot(&store, before_first, "capabilities-only-before-first")
         .await
         .expect("commit captured BeforeFirst snapshot after H advanced");
     assert_eq!(snapshot.base_event_seq, None);

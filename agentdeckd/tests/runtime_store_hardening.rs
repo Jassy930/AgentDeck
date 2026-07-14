@@ -2,6 +2,8 @@
 mod runtime_descriptor;
 #[path = "support/runtime_recovery.rs"]
 mod runtime_recovery;
+#[path = "support/store_admission.rs"]
+mod store_admission;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -25,10 +27,14 @@ use rusqlite::{Connection, OpenFlags, params};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
-struct TestRoot(PathBuf);
+struct TestRoot {
+    path: PathBuf,
+    _permit: store_admission::Permit,
+}
 
 impl TestRoot {
     fn new(label: &str) -> Self {
+        let permit = store_admission::acquire();
         let sequence = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let path = Path::new("/tmp").join(format!(
             "agentdeckd-runtime-hardening-{label}-{}-{sequence}",
@@ -42,22 +48,25 @@ impl TestRoot {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
                 .expect("secure hardening root");
         }
-        Self(path)
+        Self {
+            path,
+            _permit: permit,
+        }
     }
 
     fn database(&self) -> PathBuf {
-        self.0.join("runtime.db")
+        self.path.join("runtime.db")
     }
 
     fn storage_kek(&self, keys: &MemoryKeyStore) -> StorageKek {
-        load_or_create_storage_kek(keys, &self.0.join("key-state.db"))
+        load_or_create_storage_kek(keys, &self.path.join("key-state.db"))
             .expect("load hardening StorageKEK")
     }
 }
 
 impl Drop for TestRoot {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir_all(&self.path);
     }
 }
 

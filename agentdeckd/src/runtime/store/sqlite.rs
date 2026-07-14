@@ -3252,8 +3252,8 @@ pub(crate) fn update_runtime_ledger(
     database_id: [u8; 16],
     previous: &RuntimeLedger,
     next: &RuntimeLedger,
-) -> Result<(), RuntimeStoreError> {
-    let reconciled_next = super::stream::reconcile_event_stream(
+) -> Result<crate::runtime::events::PendingStreamTargets, RuntimeStoreError> {
+    let (reconciled_next, mut pending_targets) = super::stream::reconcile_event_stream(
         transaction,
         key_bundle,
         database_id,
@@ -3268,6 +3268,9 @@ pub(crate) fn update_runtime_ledger(
         &reconciled_next,
     )?;
     let next = &reconciled_next;
+    if previous.catalog_high_water != next.catalog_high_water {
+        pending_targets.insert(crate::runtime::events::RuntimeStreamTarget::Catalog);
+    }
     let previous_token = runtime_ledger_token(key_bundle, database_id, previous)?;
     let next_token = runtime_ledger_token(key_bundle, database_id, next)?;
     if transaction.execute(
@@ -3345,7 +3348,7 @@ pub(crate) fn update_runtime_ledger(
     {
         return Err(RuntimeStoreError::SchemaInspectionRaced);
     }
-    Ok(())
+    Ok(pending_targets)
 }
 
 pub(crate) fn commit_transaction(

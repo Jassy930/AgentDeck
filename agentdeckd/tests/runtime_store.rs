@@ -2,6 +2,8 @@
 mod runtime_descriptor;
 #[path = "support/runtime_recovery.rs"]
 mod runtime_recovery;
+#[path = "support/store_admission.rs"]
+mod store_admission;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,10 +23,14 @@ use agentdeckd::security::{MemoryKeyStore, StorageKek, load_or_create_storage_ke
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
-struct TestRoot(PathBuf);
+struct TestRoot {
+    path: PathBuf,
+    _permit: store_admission::Permit,
+}
 
 impl TestRoot {
     fn new(label: &str) -> Self {
+        let permit = store_admission::acquire();
         let sequence = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let path = Path::new("/tmp").join(format!(
             "agentdeckd-runtime-store-{label}-{}-{sequence}",
@@ -38,22 +44,25 @@ impl TestRoot {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
                 .expect("secure runtime store root");
         }
-        Self(path)
+        Self {
+            path,
+            _permit: permit,
+        }
     }
 
     fn database(&self) -> PathBuf {
-        self.0.join("runtime.db")
+        self.path.join("runtime.db")
     }
 
     fn storage_kek(&self, store: &MemoryKeyStore) -> StorageKek {
-        load_or_create_storage_kek(store, &self.0.join("key-state.db"))
+        load_or_create_storage_kek(store, &self.path.join("key-state.db"))
             .expect("create or reload test StorageKEK")
     }
 }
 
 impl Drop for TestRoot {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
@@ -497,7 +506,7 @@ async fn database_symlink_is_rejected_before_sqlite_follows_it() {
 
     let root = TestRoot::new("symlink");
     let keys = MemoryKeyStore::new();
-    let target = root.0.join("target.db");
+    let target = root.path.join("target.db");
     fs::write(&target, []).expect("create symlink target");
     symlink(&target, root.database()).expect("create runtime DB symlink");
 
@@ -944,7 +953,7 @@ async fn failed_fresh_initialization_never_publishes_a_partial_database() {
     assert!(matches!(error, RuntimeStoreError::InvalidConfig(_)));
     assert!(!root.database().exists());
     assert!(
-        fs::read_dir(&root.0)
+        fs::read_dir(&root.path)
             .expect("read runtime root")
             .all(|entry| !entry
                 .expect("read runtime root entry")
@@ -971,7 +980,7 @@ async fn fresh_open_cleans_only_valid_private_crash_initializer_artifacts() {
     let root = TestRoot::new("stale-initializer");
     let keys = MemoryKeyStore::new();
     let stale = root
-        .0
+        .path
         .join(".runtime.db.init-0123456789abcdef0123456789abcdef");
     let stale_wal = PathBuf::from(format!("{}-wal", stale.display()));
     for path in [&stale, &stale_wal] {
@@ -979,7 +988,7 @@ async fn fresh_open_cleans_only_valid_private_crash_initializer_artifacts() {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .expect("secure stale initializer artifact");
     }
-    let unrelated = root.0.join(".runtime.db.init-not-ours");
+    let unrelated = root.path.join(".runtime.db.init-not-ours");
     fs::write(&unrelated, b"keep").expect("create unrelated file");
 
     let store = RuntimeStoreHandle::open(
@@ -1135,7 +1144,7 @@ async fn unsafe_database_mode_and_hardlinks_are_rejected() {
 
     fs::set_permissions(&database, fs::Permissions::from_mode(0o600))
         .expect("restore database mode");
-    let alias = root.0.join("runtime-alias.db");
+    let alias = root.path.join("runtime-alias.db");
     fs::hard_link(&database, &alias).expect("create hardlink");
     let error = RuntimeStoreHandle::open(
         RuntimeStoreConfig::new(database.clone()),
@@ -1168,7 +1177,7 @@ async fn preexisting_sidecar_symlink_is_rejected_before_any_sqlite_open() {
         "fixture only replaces the store-created regular WAL"
     );
     fs::remove_file(&wal).expect("remove store-created WAL before hostile fixture");
-    let target = root.0.join("sidecar-target");
+    let target = root.path.join("sidecar-target");
     fs::write(&target, b"must-not-be-touched").expect("create sidecar target");
     symlink(&target, &wal).expect("create WAL symlink");
 

@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, Weak};
 
 use agentdeck_protocol::runtime::RuntimeEnvelope;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use zeroize::Zeroizing;
 
 use crate::runtime::store::IdempotencyOwner;
@@ -117,6 +117,39 @@ impl AuthenticatedPrincipal {
 
     pub(crate) fn authorization_key(&self) -> PrincipalAuthorizationKey {
         PrincipalAuthorizationKey(self.identity.clone())
+    }
+
+    /// 向调用方自己的 domain-separated buffer 写入完整 authorization identity。
+    /// remote 必含 machine route 与 grant serial；不能退化成故意跨 renewal 稳定的
+    /// idempotency owner。
+    pub(crate) fn append_authorization_identity_binding(&self, target: &mut Vec<u8>) {
+        append_canonical_field(target, b"principal.authorization.v1");
+        match self.identity.as_ref() {
+            PrincipalIdentity::Local {
+                machine_trust_domain,
+                uid,
+                client_installation_id,
+            } => {
+                append_canonical_field(target, &[1]);
+                append_canonical_field(target, machine_trust_domain);
+                append_canonical_field(target, &uid.to_be_bytes());
+                append_canonical_field(target, client_installation_id);
+            }
+            PrincipalIdentity::Remote {
+                machine_trust_domain,
+                machine_route,
+                device_route,
+                grant_serial,
+                device_sign_fingerprint,
+            } => {
+                append_canonical_field(target, &[2]);
+                append_canonical_field(target, machine_trust_domain);
+                append_canonical_field(target, machine_route);
+                append_canonical_field(target, device_route);
+                append_canonical_field(target, &grant_serial.to_be_bytes());
+                append_canonical_field(target, device_sign_fingerprint);
+            }
+        }
     }
 
     pub(crate) fn try_enter(&self) -> Result<AuthorizationGuard, PrincipalAccessError> {
@@ -334,7 +367,7 @@ impl fmt::Debug for ApprovalClaimantBinding {
     }
 }
 
-#[allow(dead_code)] // 仅由 P3.5 claimant binding 构造路径调用。
+/// daemon-private authorization identity 的 length-delimited canonical field。
 fn append_canonical_field(target: &mut Vec<u8>, field: &[u8]) {
     let length = u32::try_from(field.len()).expect("approval claimant field length is fixed");
     target.extend_from_slice(&length.to_be_bytes());
@@ -521,6 +554,11 @@ impl ConnectionId {
         }
         Ok(Self(bytes))
     }
+
+    #[cfg(test)]
+    pub(super) const fn from_test_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
 }
 
 impl fmt::Debug for ConnectionId {
@@ -575,6 +613,29 @@ impl fmt::Debug for ConnectionWrite {
     }
 }
 
+/// connection-owned reply pump 在 transport write/flush ACK 后完成的回执。
+///
+/// barrier/backfill job 可以等待此回执后再推进 store pin；RuntimeCore 的普通请求
+/// 处理只负责入队，不等待此回执或 socket。
+#[must_use = "flush receipt must be awaited before advancing paced state"]
+pub struct FlushReceipt {
+    completion: oneshot::Receiver<Result<(), ConnectionError>>,
+}
+
+impl FlushReceipt {
+    pub async fn wait(self) -> Result<(), ConnectionError> {
+        self.completion
+            .await
+            .unwrap_or(Err(ConnectionError::Lagged))
+    }
+}
+
+impl fmt::Debug for FlushReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FlushReceipt([PENDING])")
+    }
+}
+
 #[derive(Clone)]
 pub struct EncodedRuntimeFrame {
     bytes: Arc<[u8]>,
@@ -609,49 +670,180 @@ struct QueuedFrame {
     frame: EncodedRuntimeFrame,
     _bytes: OwnedSemaphorePermit,
     _frame: OwnedSemaphorePermit,
+    flush_completion: Option<oneshot::Sender<Result<(), ConnectionError>>>,
+}
+
+struct ConnectionIncarnation;
+
+#[must_use = "paced reservation must be committed or dropped to release its budgets"]
+pub(super) struct PacedFrameReservation {
+    id: ConnectionId,
+    incarnation: Arc<ConnectionIncarnation>,
+    writer: mpsc::Sender<QueuedFrame>,
+    frame: EncodedRuntimeFrame,
+    byte_permit: OwnedSemaphorePermit,
+    frame_permit: OwnedSemaphorePermit,
+    reservation_slot: OwnedSemaphorePermit,
 }
 
 struct ConnectionEntry {
+    incarnation: Arc<ConnectionIncarnation>,
     principal: AuthenticatedPrincipal,
     writer: mpsc::Sender<QueuedFrame>,
     byte_budget: Arc<Semaphore>,
     frame_budget: Arc<Semaphore>,
+    paced_reservation_slot: Arc<Semaphore>,
 }
 
 type ConnectionEntries = Mutex<HashMap<ConnectionId, ConnectionEntry>>;
-type WriterTasks = Mutex<HashMap<ConnectionId, tokio::task::JoinHandle<()>>>;
 
-/// task 正常退出或被 abort 时都会执行，先移除 registry/task handle，再释放
-/// connection slot；因此新 writer 不会与尚未完成清理的旧 writer 越过硬上界。
+struct TrackedWriterTask {
+    incarnation: Arc<ConnectionIncarnation>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+    exit: Arc<WriterTaskExit>,
+}
+
+const WRITER_TASK_RUNNING: u8 = 0;
+const WRITER_TASK_EXITED_OK: u8 = 1;
+const WRITER_TASK_EXITED_FAILED: u8 = 2;
+
+struct WriterTaskExit {
+    terminal: std::sync::atomic::AtomicU8,
+    notified: Notify,
+}
+
+impl WriterTaskExit {
+    fn new() -> Self {
+        Self {
+            terminal: std::sync::atomic::AtomicU8::new(WRITER_TASK_RUNNING),
+            notified: Notify::new(),
+        }
+    }
+
+    fn publish_terminal(&self, terminal: u8) {
+        self.terminal
+            .store(terminal, std::sync::atomic::Ordering::Release);
+        self.notified.notify_waiters();
+    }
+
+    async fn wait(&self) -> Result<(), ConnectionError> {
+        loop {
+            let notified = self.notified.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.terminal.load(std::sync::atomic::Ordering::Acquire) {
+                WRITER_TASK_RUNNING => notified.await,
+                WRITER_TASK_EXITED_OK => return Ok(()),
+                WRITER_TASK_EXITED_FAILED => return Err(ConnectionError::WriterTaskFailed),
+                _ => return Err(ConnectionError::WriterTaskFailed),
+            }
+        }
+    }
+}
+
+type WriterTasks = Mutex<HashMap<ConnectionId, TrackedWriterTask>>;
+
+enum DisconnectWriter {
+    Owner(tokio::task::JoinHandle<()>),
+    Wait(Arc<WriterTaskExit>),
+    Absent,
+}
+
+struct ShutdownWriter {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    exit: Arc<WriterTaskExit>,
+}
+
+fn connection_id_is_available(
+    entries: &HashMap<ConnectionId, ConnectionEntry>,
+    tasks: &HashMap<ConnectionId, TrackedWriterTask>,
+    id: ConnectionId,
+) -> bool {
+    !entries.contains_key(&id) && !tasks.contains_key(&id)
+}
+
+/// task 正常退出、panic 或被 abort 时都会执行。在同一个 task-map 临界区内先释放
+/// connection slot、再 exact 删除 tombstone、随后发布 terminal outcome；调用方观察
+/// 到 terminal 时，writer 的 entry/task/slot 资源已经完成清理。
 struct WriterTaskLifetime {
     id: ConnectionId,
+    incarnation: Arc<ConnectionIncarnation>,
     entries: Weak<ConnectionEntries>,
     tasks: Weak<WriterTasks>,
     connection_slot: Option<OwnedSemaphorePermit>,
+    exit: Arc<WriterTaskExit>,
+}
+
+impl WriterTaskLifetime {
+    fn fail_close_entry(&self) {
+        if let Some(entries) = self.entries.upgrade()
+            && let Ok(mut entries) = entries.lock()
+            && entries
+                .get(&self.id)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.incarnation, &self.incarnation))
+        {
+            entries.remove(&self.id);
+        }
+    }
+
+    fn fail_close_entry_and_complete(
+        &self,
+        completion: Option<oneshot::Sender<Result<(), ConnectionError>>>,
+        result: Result<(), ConnectionError>,
+    ) {
+        let mut completion = completion;
+        if let Some(entries) = self.entries.upgrade()
+            && let Ok(mut entries) = entries.lock()
+        {
+            if entries
+                .get(&self.id)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.incarnation, &self.incarnation))
+            {
+                entries.remove(&self.id);
+            }
+            if let Some(completion) = completion.take() {
+                let _ = completion.send(result);
+            }
+            return;
+        }
+        if let Some(completion) = completion {
+            let _ = completion.send(result);
+        }
+    }
 }
 
 impl Drop for WriterTaskLifetime {
     fn drop(&mut self) {
-        if let Some(entries) = self.entries.upgrade()
-            && let Ok(mut entries) = entries.lock()
-        {
-            entries.remove(&self.id);
-        }
+        let terminal = if std::thread::panicking() {
+            WRITER_TASK_EXITED_FAILED
+        } else {
+            WRITER_TASK_EXITED_OK
+        };
+        self.fail_close_entry();
         if let Some(tasks) = self.tasks.upgrade()
             && let Ok(mut tasks) = tasks.lock()
         {
             // 在 task-map 锁内先释放 slot 再移除 handle：新 connect 即使取得
             // permit，也必须等待同一把锁，不能在旧 task 完成登记清理前 spawn。
             self.connection_slot.take();
-            tasks.remove(&self.id);
-            return;
+            if tasks
+                .get(&self.id)
+                .is_some_and(|task| Arc::ptr_eq(&task.incarnation, &self.incarnation))
+            {
+                tasks.remove(&self.id);
+            }
+            self.exit.publish_terminal(terminal);
+        } else {
+            // registry 已经 Drop、无法再接入新连接时只需释放剩余 slot。
+            self.connection_slot.take();
+            self.exit.publish_terminal(terminal);
         }
-        // registry 已经 Drop、无法再接入新连接时只需释放剩余 slot。
-        self.connection_slot.take();
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct ConnectionRegistry {
+    clone_lifetime: Arc<()>,
     entries: Arc<ConnectionEntries>,
     tasks: Arc<WriterTasks>,
     connection_slots: Arc<Semaphore>,
@@ -662,6 +854,7 @@ pub(crate) struct ConnectionRegistry {
 impl ConnectionRegistry {
     pub(crate) fn new(frame_capacity: usize, byte_capacity: usize) -> Self {
         Self {
+            clone_lifetime: Arc::new(()),
             entries: Arc::new(Mutex::new(HashMap::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
             connection_slots: Arc::new(Semaphore::new(DEFAULT_RUNTIME_CONNECTION_CAPACITY)),
@@ -708,31 +901,36 @@ impl ConnectionRegistry {
             return Err(ConnectionError::ShuttingDown);
         }
         let id = ConnectionId::random()?;
-        if entries.contains_key(&id) {
+        if !connection_id_is_available(&entries, &tasks, id) {
             return Err(ConnectionError::EntropyUnavailable);
         }
         let (writer, mut receiver) = mpsc::channel::<QueuedFrame>(self.frame_capacity);
+        let incarnation = Arc::new(ConnectionIncarnation);
         let byte_budget = Arc::new(Semaphore::new(self.byte_capacity));
         let frame_budget = Arc::new(Semaphore::new(self.frame_capacity));
+        let paced_reservation_slot = Arc::new(Semaphore::new(1));
+        let exit = Arc::new(WriterTaskExit::new());
         let weak_entries = Arc::downgrade(&self.entries);
         let weak_tasks = Arc::downgrade(&self.tasks);
         let lifetime = WriterTaskLifetime {
             id,
+            incarnation: incarnation.clone(),
             entries: weak_entries,
             tasks: weak_tasks,
             connection_slot: Some(connection_slot),
+            exit: exit.clone(),
         };
         let (published, published_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
             // lifetime 在 spawn 前已构造；即使 task 从未 poll 就被 abort，future Drop
             // 仍会执行 registry cleanup 并释放 slot。
-            let _lifetime = lifetime;
+            let lifetime = lifetime;
             if published_rx.await.is_err() {
                 return;
             }
-            while let Some(queued) = receiver.recv().await {
+            while let Some(mut queued) = receiver.recv().await {
                 let (acknowledged, acknowledgement) = oneshot::channel();
-                if sink
+                let transport_result = if sink
                     .sender
                     .send(ConnectionWrite {
                         bytes: queued.frame.bytes.clone(),
@@ -740,22 +938,45 @@ impl ConnectionRegistry {
                     })
                     .await
                     .is_err()
-                    || acknowledgement.await.is_err()
                 {
+                    Err(ConnectionError::Lagged)
+                } else {
+                    acknowledgement.await.map_err(|_| ConnectionError::Lagged)
+                };
+                let completion = queued.flush_completion.take();
+                drop(queued);
+                if transport_result.is_err() {
+                    // 先让新业务入口 fail-close；JoinHandle 与 connection slot 仍由
+                    // live writer 持有，直到 async future 真正返回并执行 Drop。entry
+                    // removal 与 error completion 在同一临界区排序，调用方不会观察到
+                    // “connection 已消失但 flush error 尚不可见”的中间态。
+                    lifetime.fail_close_entry_and_complete(completion, transport_result);
+                } else if let Some(completion) = completion {
+                    let _ = completion.send(Ok(()));
+                }
+                if transport_result.is_err() {
                     break;
                 }
-                drop(queued);
             }
         });
         let entry = ConnectionEntry {
+            incarnation: incarnation.clone(),
             principal,
             writer,
             byte_budget,
             frame_budget,
+            paced_reservation_slot,
         };
         let replaced = entries.insert(id, entry);
         debug_assert!(replaced.is_none());
-        let replaced = tasks.insert(id, task);
+        let replaced = tasks.insert(
+            id,
+            TrackedWriterTask {
+                incarnation,
+                handle: Some(task),
+                exit,
+            },
+        );
         debug_assert!(replaced.is_none());
         drop(tasks);
         drop(entries);
@@ -788,11 +1009,12 @@ impl ConnectionRegistry {
             .lock()
             .map_err(|_| ConnectionError::RegistryPoisoned)?;
         let entry = entries.get(&id).ok_or(ConnectionError::NotFound)?;
+        let incarnation = entry.incarnation.clone();
         if encoded_len == 0 || encoded_len > self.byte_capacity {
             let removed = entries.remove(&id).is_some();
             drop(entries);
             if removed {
-                self.abort_tracked_writer(id)?;
+                self.abort_tracked_writer(id, &incarnation)?;
             }
             return Err(ConnectionError::Lagged);
         }
@@ -815,6 +1037,7 @@ impl ConnectionRegistry {
                     frame,
                     _bytes: bytes,
                     _frame: frame_permit,
+                    flush_completion: None,
                 })
                 .map_err(|_| ConnectionError::Lagged)
         });
@@ -822,27 +1045,146 @@ impl ConnectionRegistry {
             let removed = entries.remove(&id).is_some();
             drop(entries);
             if removed {
-                self.abort_tracked_writer(id)?;
+                self.abort_tracked_writer(id, &incarnation)?;
             }
         }
         queued
     }
 
+    /// paced producer 使用的异步 reservation。它只等待本 connection 的 frame/byte
+    /// permit，不发送 frame；调用方可在等待后重新检查自己的 lifecycle admission。
+    pub(super) async fn reserve_paced(
+        &self,
+        id: ConnectionId,
+        frame: EncodedRuntimeFrame,
+    ) -> Result<PacedFrameReservation, ConnectionError> {
+        let encoded_len = frame.bytes.len();
+        if encoded_len == 0 || encoded_len > self.byte_capacity {
+            self.fail_connection(id)?;
+            return Err(ConnectionError::Lagged);
+        }
+        let permits = u32::try_from(encoded_len).map_err(|_| ConnectionError::Lagged)?;
+        let (incarnation, writer, byte_budget, frame_budget, paced_reservation_slot) = {
+            let entries = self
+                .entries
+                .lock()
+                .map_err(|_| ConnectionError::RegistryPoisoned)?;
+            let entry = entries.get(&id).ok_or(ConnectionError::NotFound)?;
+            (
+                entry.incarnation.clone(),
+                entry.writer.clone(),
+                entry.byte_budget.clone(),
+                entry.frame_budget.clone(),
+                entry.paced_reservation_slot.clone(),
+            )
+        };
+        let reservation_slot = paced_reservation_slot
+            .try_acquire_owned()
+            .map_err(|_| ConnectionError::Lagged)?;
+        let frame_permit = frame_budget
+            .acquire_owned()
+            .await
+            .map_err(|_| ConnectionError::Lagged)?;
+        let byte_permit = byte_budget
+            .acquire_many_owned(permits)
+            .await
+            .map_err(|_| ConnectionError::Lagged)?;
+        Ok(PacedFrameReservation {
+            id,
+            incarnation,
+            writer,
+            frame,
+            byte_permit,
+            frame_permit,
+            reservation_slot,
+        })
+    }
+
+    /// 已取得 Core admission 后同步提交 reservation。permit 与 flush completion
+    /// 一起进入 reply pump，并持续持有到 transport flush ACK。
+    pub(super) fn commit_paced(
+        &self,
+        reservation: PacedFrameReservation,
+    ) -> Result<FlushReceipt, ConnectionError> {
+        let PacedFrameReservation {
+            id,
+            incarnation,
+            writer,
+            frame,
+            byte_permit,
+            frame_permit,
+            reservation_slot: _reservation_slot,
+        } = reservation;
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| ConnectionError::RegistryPoisoned)?;
+        if !entries
+            .get(&id)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.incarnation, &incarnation))
+        {
+            return Err(ConnectionError::NotFound);
+        }
+        let (completion, receipt) = oneshot::channel();
+        if writer
+            .try_send(QueuedFrame {
+                frame,
+                _bytes: byte_permit,
+                _frame: frame_permit,
+                flush_completion: Some(completion),
+            })
+            .is_err()
+        {
+            entries.remove(&id);
+            drop(entries);
+            self.abort_tracked_writer(id, &incarnation)?;
+            return Err(ConnectionError::Lagged);
+        }
+        drop(entries);
+        Ok(FlushReceipt {
+            completion: receipt,
+        })
+    }
+
     pub(crate) async fn disconnect(&self, id: ConnectionId) -> Result<(), ConnectionError> {
-        self.entries
-            .lock()
-            .map_err(|_| ConnectionError::RegistryPoisoned)?
-            .remove(&id);
-        let task = self
-            .tasks
-            .lock()
-            .map_err(|_| ConnectionError::RegistryPoisoned)?
-            .remove(&id);
-        if let Some(task) = task {
-            task.abort();
-            join_writer(task).await?;
+        match self.begin_disconnect(id)? {
+            DisconnectWriter::Owner(task) => {
+                task.abort();
+                join_writer(task).await?;
+            }
+            DisconnectWriter::Wait(exit) => exit.wait().await?,
+            DisconnectWriter::Absent => {}
         }
         Ok(())
+    }
+
+    fn begin_disconnect(&self, id: ConnectionId) -> Result<DisconnectWriter, ConnectionError> {
+        let incarnation = self
+            .entries
+            .lock()
+            .map_err(|_| ConnectionError::RegistryPoisoned)?
+            .remove(&id)
+            .map(|entry| entry.incarnation);
+        let writer = {
+            let mut tasks = self
+                .tasks
+                .lock()
+                .map_err(|_| ConnectionError::RegistryPoisoned)?;
+            let Some(task) = tasks.get_mut(&id) else {
+                return Ok(DisconnectWriter::Absent);
+            };
+            let matches = incarnation
+                .as_ref()
+                .is_none_or(|incarnation| Arc::ptr_eq(&task.incarnation, incarnation));
+            if !matches {
+                DisconnectWriter::Absent
+            } else if let Some(handle) = task.handle.take() {
+                DisconnectWriter::Owner(handle)
+            } else {
+                DisconnectWriter::Wait(task.exit.clone())
+            }
+        };
+        Ok(writer)
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), ConnectionError> {
@@ -853,20 +1195,23 @@ impl ConnectionRegistry {
                 .lock()
                 .map_err(|_| ConnectionError::RegistryPoisoned)?,
         );
-        let tasks = std::mem::take(
-            &mut *self
-                .tasks
-                .lock()
-                .map_err(|_| ConnectionError::RegistryPoisoned)?,
-        );
+        let tasks = self.claim_writers_for_shutdown()?;
         drop(entries);
-        for task in tasks.values() {
-            task.abort();
+        for task in &tasks {
+            if let Some(handle) = task.handle.as_ref() {
+                handle.abort();
+            }
         }
         let mut failed = false;
-        for (_, task) in tasks {
-            if join_writer(task).await.is_err() {
-                failed = true;
+        for task in tasks {
+            if let Some(handle) = task.handle {
+                if join_writer(handle).await.is_err() {
+                    failed = true;
+                }
+            } else {
+                if task.exit.wait().await.is_err() {
+                    failed = true;
+                }
             }
         }
         if failed {
@@ -875,16 +1220,56 @@ impl ConnectionRegistry {
         Ok(())
     }
 
-    fn abort_tracked_writer(&self, id: ConnectionId) -> Result<(), ConnectionError> {
+    fn claim_writers_for_shutdown(&self) -> Result<Vec<ShutdownWriter>, ConnectionError> {
+        let mut tasks = self
+            .tasks
+            .lock()
+            .map_err(|_| ConnectionError::RegistryPoisoned)?;
+        Ok(tasks
+            .values_mut()
+            .map(|task| ShutdownWriter {
+                handle: task.handle.take(),
+                exit: task.exit.clone(),
+            })
+            .collect())
+    }
+
+    fn abort_tracked_writer(
+        &self,
+        id: ConnectionId,
+        incarnation: &Arc<ConnectionIncarnation>,
+    ) -> Result<(), ConnectionError> {
         if let Some(task) = self
             .tasks
             .lock()
             .map_err(|_| ConnectionError::RegistryPoisoned)?
             .get(&id)
+            .filter(|task| Arc::ptr_eq(&task.incarnation, incarnation))
+            && let Some(handle) = task.handle.as_ref()
         {
-            task.abort();
+            handle.abort();
         }
         Ok(())
+    }
+
+    fn fail_connection(&self, id: ConnectionId) -> Result<(), ConnectionError> {
+        let incarnation = self
+            .entries
+            .lock()
+            .map_err(|_| ConnectionError::RegistryPoisoned)?
+            .remove(&id)
+            .map(|entry| entry.incarnation);
+        if let Some(incarnation) = incarnation {
+            self.abort_tracked_writer(id, &incarnation)?;
+        }
+        Ok(())
+    }
+
+    /// 威胁场景：客户端已收到 subscription 的部分 snapshot/backfill 后，daemon
+    /// 无法再生成连续终态；继续复用连接会让客户端把残缺 reducer 当成可恢复状态。
+    /// production reply pump 只能在这种已部分交付的错误上 fail-close 当前连接。
+    pub(crate) fn fail_close(&self, id: ConnectionId) -> Result<(), ConnectionError> {
+        self.fail_connection(id)
     }
 
     #[cfg(test)]
@@ -905,6 +1290,11 @@ impl ConnectionRegistry {
 
 impl Drop for ConnectionRegistry {
     fn drop(&mut self) {
+        // detached reply pump 只持一个 registry clone；该 capability 结束时不能把
+        // RuntimeCore 仍在使用的共享 writer 全部关闭。最后一个 owner 才执行兜底清理。
+        if Arc::strong_count(&self.clone_lifetime) != 1 {
+            return;
+        }
         self.connection_slots.close();
         let entries = match self.entries.lock() {
             Ok(mut entries) => std::mem::take(&mut *entries),
@@ -916,7 +1306,9 @@ impl Drop for ConnectionRegistry {
             Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
         };
         for (_, task) in tasks {
-            task.abort();
+            if let Some(handle) = task.handle {
+                handle.abort();
+            }
         }
     }
 }
@@ -954,599 +1346,5 @@ pub enum ConnectionError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    use agentdeck_protocol::runtime::command::HelloParams;
-    use agentdeck_protocol::runtime::identity::{ConversationId, EventId, MessageId};
-    use agentdeck_protocol::runtime::{
-        MAX_RUNTIME_JSON_FRAME_BYTES, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeEvent,
-        RuntimeEventBody, RuntimeFailure, RuntimeMessage, RuntimeReply, RuntimeStreamItem,
-    };
-
-    fn principal(seed: u8) -> AuthenticatedPrincipal {
-        PrincipalIssuer::local_only([0xA1; 32])
-            .issue_verified_local(501, [seed; 16])
-            .expect("issue test local principal")
-    }
-
-    #[test]
-    fn encoded_frame_contains_the_complete_runtime_envelope() {
-        let envelope = RuntimeEnvelope {
-            version: RUNTIME_PROTOCOL_VERSION,
-            message_id: MessageId::new("message-connection-test"),
-            body: RuntimeMessage::Reply(RuntimeReply::Hello(HelloParams {
-                runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
-            })),
-        };
-        let frame = EncodedRuntimeFrame::from_envelope(&envelope).expect("encode envelope");
-        let decoded: RuntimeEnvelope =
-            serde_json::from_slice(&frame.bytes).expect("decode complete envelope");
-        assert_eq!(decoded.version, RUNTIME_PROTOCOL_VERSION);
-        assert_eq!(decoded.message_id.as_str(), "message-connection-test");
-        assert!(matches!(
-            decoded.body,
-            RuntimeMessage::Reply(RuntimeReply::Hello(HelloParams {
-                runtime_protocol_version: RUNTIME_PROTOCOL_VERSION
-            }))
-        ));
-    }
-
-    #[test]
-    fn encoded_frame_rejects_oversized_reply_and_stream_before_writer_admission() {
-        let failure = || {
-            RuntimeFailure::new(
-                "daemon.test.oversized",
-                "x".repeat(MAX_RUNTIME_JSON_FRAME_BYTES),
-            )
-        };
-        let reply = RuntimeEnvelope {
-            version: RUNTIME_PROTOCOL_VERSION,
-            message_id: MessageId::new("message-oversized-reply"),
-            body: RuntimeMessage::Reply(RuntimeReply::Failure(failure())),
-        };
-        assert!(matches!(
-            EncodedRuntimeFrame::from_envelope(&reply),
-            Err(ConnectionError::FrameTooLarge)
-        ));
-
-        let event = RuntimeEvent::new(
-            ConversationId::new("conversation-oversized-stream"),
-            EventId::new("event-oversized-stream"),
-            0,
-            None,
-            None,
-            None,
-            RuntimeEventBody::Error { failure: failure() },
-        )
-        .unwrap();
-        let stream = RuntimeEnvelope {
-            version: RUNTIME_PROTOCOL_VERSION,
-            message_id: MessageId::new("message-oversized-stream"),
-            body: RuntimeMessage::Stream(RuntimeStreamItem::Event(event)),
-        };
-        assert!(matches!(
-            EncodedRuntimeFrame::from_envelope(&stream),
-            Err(ConnectionError::FrameTooLarge)
-        ));
-    }
-
-    #[tokio::test]
-    async fn slow_writer_is_disconnected_without_affecting_fast_writer() {
-        let registry = ConnectionRegistry::new(2, 8);
-        let (slow_tx, mut slow_rx) = mpsc::channel(1);
-        let (fast_tx, mut fast_rx) = mpsc::channel(8);
-        let slow = registry
-            .connect(principal(1), ConnectionSink::new(slow_tx))
-            .expect("connect slow");
-        let fast = registry
-            .connect(principal(2), ConnectionSink::new(fast_tx))
-            .expect("connect fast");
-
-        let mut accepted = 0_usize;
-        let mut lagged = false;
-        for _ in 0..16 {
-            match registry.try_enqueue(slow, EncodedRuntimeFrame::from_bytes(&b"aa"[..])) {
-                Ok(()) => accepted += 1,
-                Err(ConnectionError::Lagged) => {
-                    lagged = true;
-                    break;
-                }
-                Err(other) => panic!("unexpected slow writer error: {other:?}"),
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(accepted > 0);
-        assert!(lagged, "bounded slow writer must eventually lag");
-        assert!(matches!(
-            registry.principal(slow),
-            Err(ConnectionError::NotFound)
-        ));
-
-        registry
-            .try_enqueue(fast, EncodedRuntimeFrame::from_bytes(&b"ok"[..]))
-            .expect("fast writer remains connected");
-        let write = fast_rx.recv().await.expect("fast transport write");
-        assert_eq!(write.bytes(), b"ok");
-        write.acknowledge().expect("ack fast socket flush");
-        drop(slow_rx.recv().await);
-        registry.shutdown().await.expect("shutdown registry");
-    }
-
-    #[tokio::test]
-    async fn byte_budget_is_reserved_atomically_and_disconnect_is_idempotent() {
-        let registry = Arc::new(ConnectionRegistry::new(32, 4));
-        let (tx, _rx) = mpsc::channel(1);
-        let id = registry
-            .connect(principal(3), ConnectionSink::new(tx))
-            .expect("connect");
-        let first = registry.clone();
-        let second = registry.clone();
-        let (left, right) = tokio::join!(
-            async move { first.try_enqueue(id, EncodedRuntimeFrame::from_bytes(&b"aaa"[..])) },
-            async move { second.try_enqueue(id, EncodedRuntimeFrame::from_bytes(&b"bbb"[..])) }
-        );
-        assert!(
-            (left.is_ok() && right == Err(ConnectionError::Lagged))
-                || (right.is_ok() && left == Err(ConnectionError::Lagged))
-        );
-        registry.disconnect(id).await.expect("first disconnect");
-        registry
-            .disconnect(id)
-            .await
-            .expect("idempotent disconnect");
-        assert_eq!(registry.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn revocation_waits_for_inflight_guard_and_new_work_fails_closed() {
-        let principal = principal(4);
-        let guard = principal.try_enter().expect("active guard");
-        let revoking = principal.clone();
-        let task = tokio::spawn(async move { revoking.begin_revoke().await });
-        tokio::task::yield_now().await;
-        assert_eq!(
-            principal.try_enter().err(),
-            Some(PrincipalAccessError::Revoked)
-        );
-        assert!(!task.is_finished());
-        drop(guard);
-        task.await.expect("join revoke").expect("begin revoke");
-        principal.finish_revoke();
-        assert!(!principal.is_active());
-    }
-
-    #[tokio::test]
-    async fn same_authorization_identity_shares_one_revocation_lease() {
-        let issuer = PrincipalIssuer::local_only([0xC3; 32]);
-        let first = issuer
-            .issue_verified_local(501, [9; 16])
-            .expect("first capability");
-        let second = issuer
-            .issue_verified_local(501, [9; 16])
-            .expect("second capability");
-        let guard = second.try_enter().expect("shared lease guard");
-        let revoking = first.clone();
-        let revoke = tokio::spawn(async move { revoking.begin_revoke().await });
-        tokio::task::yield_now().await;
-        assert_eq!(
-            second.try_enter().err(),
-            Some(PrincipalAccessError::Revoked)
-        );
-        drop(guard);
-        revoke.await.expect("join revoke").expect("begin revoke");
-        first.finish_revoke();
-        assert_eq!(
-            second.try_enter().err(),
-            Some(PrincipalAccessError::Revoked)
-        );
-        drop(second);
-        drop(first);
-        let reissued = issuer
-            .issue_verified_local(501, [9; 16])
-            .expect("reissue identical capability");
-        assert_eq!(
-            reissued.try_enter().err(),
-            Some(PrincipalAccessError::Revoked),
-            "issuer lifetime must retain the revoked lease"
-        );
-    }
-
-    #[test]
-    fn approval_permissions_are_explicit_and_fail_closed_per_operation() {
-        let issuer = PrincipalIssuer::local_only([0xC4; 32]);
-        let none = issuer
-            .issue_verified_local(501, [1; 16])
-            .expect("principal without approval permission");
-        assert!(matches!(
-            none.try_enter_approval(),
-            Err(PrincipalAccessError::PermissionDenied)
-        ));
-
-        let resolve_only = issuer
-            .issue_verified_local_with_approval_permissions(
-                501,
-                [2; 16],
-                ApprovalPermissionGrant::ResolveOnly,
-            )
-            .expect("resolve-only principal");
-        let resolve = resolve_only
-            .try_enter_approval()
-            .expect("enter resolve capability");
-        resolve.require_resolve().expect("resolve permission");
-        assert_eq!(
-            resolve.require_retry(),
-            Err(PrincipalAccessError::PermissionDenied)
-        );
-
-        let retry_only = issuer
-            .issue_verified_local_with_approval_permissions(
-                501,
-                [3; 16],
-                ApprovalPermissionGrant::RetryOnly,
-            )
-            .expect("retry-only principal");
-        let retry = retry_only
-            .try_enter_approval()
-            .expect("enter retry capability");
-        retry.require_retry().expect("retry permission");
-        assert_eq!(
-            retry.require_resolve(),
-            Err(PrincipalAccessError::PermissionDenied)
-        );
-    }
-
-    #[test]
-    fn verified_remote_can_resolve_without_an_is_local_shortcut() {
-        let issuer = PrincipalIssuer::local_only([0xC5; 32]);
-        let remote = issuer
-            .issue_test_remote_with_approval_permissions(
-                [4; 16],
-                [5; 16],
-                7,
-                [6; 32],
-                ApprovalPermissionGrant::ResolveOnly,
-            )
-            .expect("verified remote approval principal");
-        assert!(!remote.is_local());
-        remote
-            .try_enter_approval()
-            .expect("remote approval guard")
-            .require_resolve()
-            .expect("issuer-granted remote resolve");
-    }
-
-    #[tokio::test]
-    async fn approval_guard_holds_the_shared_lease_through_revoking() {
-        let issuer = PrincipalIssuer::local_only([0xC6; 32]);
-        let first = issuer
-            .issue_verified_local_with_approval_permissions(
-                501,
-                [7; 16],
-                ApprovalPermissionGrant::ResolveAndRetry,
-            )
-            .expect("first approval principal");
-        let second = issuer
-            .issue_verified_local_with_approval_permissions(
-                501,
-                [7; 16],
-                ApprovalPermissionGrant::ResolveAndRetry,
-            )
-            .expect("same identity reuses approval grant");
-        let guard = second.try_enter_approval().expect("shared approval guard");
-        guard.require_resolve().expect("resolve permission");
-        let revoking = first.clone();
-        let revoke = tokio::spawn(async move { revoking.begin_revoke().await });
-        tokio::task::yield_now().await;
-        assert!(matches!(
-            second.try_enter_approval(),
-            Err(PrincipalAccessError::Revoked)
-        ));
-        assert!(!revoke.is_finished(), "approval guard must cover the CAS");
-        drop(guard);
-        revoke.await.expect("join revoke").expect("begin revoke");
-        first.finish_revoke();
-    }
-
-    #[test]
-    fn same_full_identity_cannot_be_reissued_with_different_approval_bits() {
-        let issuer = PrincipalIssuer::local_only([0xC7; 32]);
-        issuer
-            .issue_verified_local_with_approval_permissions(
-                501,
-                [8; 16],
-                ApprovalPermissionGrant::ResolveOnly,
-            )
-            .expect("first signed permission set");
-        assert!(matches!(
-            issuer.issue_verified_local_with_approval_permissions(
-                501,
-                [8; 16],
-                ApprovalPermissionGrant::RetryOnly,
-            ),
-            Err(PrincipalAccessError::PermissionConflict)
-        ));
-        assert!(matches!(
-            issuer.issue_verified_local(501, [8; 16]),
-            Err(PrincipalAccessError::PermissionConflict)
-        ));
-    }
-
-    #[test]
-    fn claimant_binding_is_canonical_full_identity_and_debug_redacted() {
-        let issuer = PrincipalIssuer::local_only([0xC8; 32]);
-        let first = issuer
-            .issue_test_remote_with_approval_permissions(
-                [9; 16],
-                [10; 16],
-                11,
-                [12; 32],
-                ApprovalPermissionGrant::ResolveAndRetry,
-            )
-            .expect("first remote claimant");
-        let replay = issuer
-            .issue_test_remote_with_approval_permissions(
-                [9; 16],
-                [10; 16],
-                11,
-                [12; 32],
-                ApprovalPermissionGrant::ResolveAndRetry,
-            )
-            .expect("same full identity");
-        let renewed = issuer
-            .issue_test_remote_with_approval_permissions(
-                [9; 16],
-                [10; 16],
-                12,
-                [12; 32],
-                ApprovalPermissionGrant::ResolveAndRetry,
-            )
-            .expect("new grant serial is a new full identity");
-        let first_binding = first
-            .try_enter_approval()
-            .expect("first approval guard")
-            .claimant_binding();
-        let replay_binding = replay
-            .try_enter_approval()
-            .expect("replay approval guard")
-            .claimant_binding();
-        let renewed_binding = renewed
-            .try_enter_approval()
-            .expect("renewed approval guard")
-            .claimant_binding();
-        assert_eq!(first_binding.as_bytes(), replay_binding.as_bytes());
-        assert_ne!(first_binding.as_bytes(), renewed_binding.as_bytes());
-        assert_eq!(
-            format!("{first_binding:?}"),
-            "ApprovalClaimantBinding([REDACTED])"
-        );
-        assert!(!format!("{first_binding:?}").contains("090909"));
-    }
-
-    #[tokio::test]
-    async fn dropped_unacknowledged_transport_write_removes_registry_entry() {
-        let registry = ConnectionRegistry::new(2, 8);
-        let (tx, mut rx) = mpsc::channel(1);
-        let id = registry
-            .connect(principal(7), ConnectionSink::new(tx))
-            .expect("connect");
-        registry
-            .try_enqueue(id, EncodedRuntimeFrame::from_bytes(&b"lost"[..]))
-            .expect("enqueue");
-        drop(rx.recv().await.expect("transport work without ACK"));
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while registry.len() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("writer cleanup");
-        assert!(matches!(
-            registry.principal(id),
-            Err(ConnectionError::NotFound)
-        ));
-        assert_eq!(registry.active_writer_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn total_connection_count_saturates_at_the_hard_limit() {
-        let registry = ConnectionRegistry::new(1, 8);
-        for seed in 0_u16..128 {
-            let (tx, _rx) = mpsc::channel(1);
-            registry
-                .connect(
-                    principal(u8::try_from(seed).expect("test seed")),
-                    ConnectionSink::new(tx),
-                )
-                .expect("connection below hard limit");
-        }
-        let (overflow_tx, _overflow_rx) = mpsc::channel(1);
-        assert!(
-            registry
-                .connect(principal(255), ConnectionSink::new(overflow_tx))
-                .is_err(),
-            "the 129th writer must fail before allocating an untracked task"
-        );
-        registry.shutdown().await.expect("join saturated writers");
-        assert_eq!(registry.active_writer_count(), 0);
-        assert_eq!(registry.tracked_task_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn principal_lease_count_saturates_without_evicting_reuse_or_revoked_tombstone() {
-        let issuer = PrincipalIssuer::local_only([0xD4; 32]);
-        let first_id = 0_u128.to_be_bytes();
-        let first = issuer
-            .issue_verified_local(501, first_id)
-            .expect("first principal");
-        for index in 1_u128..1_024 {
-            issuer
-                .issue_verified_local(501, index.to_be_bytes())
-                .expect("principal below hard limit");
-        }
-
-        issuer
-            .issue_verified_local(501, first_id)
-            .expect("same identity reuses a lease at capacity");
-        first.begin_revoke().await.expect("begin revoke");
-        first.finish_revoke();
-        assert!(
-            issuer
-                .issue_verified_local(501, 1_024_u128.to_be_bytes())
-                .is_err(),
-            "a new identity must fail closed at capacity"
-        );
-        let tombstone = issuer
-            .issue_verified_local(501, first_id)
-            .expect("revoked tombstone remains addressable");
-        assert_eq!(
-            tombstone.try_enter().err(),
-            Some(PrincipalAccessError::Revoked),
-            "capacity pressure must not evict a revoked tombstone"
-        );
-    }
-
-    #[tokio::test]
-    async fn dropping_registry_breaks_writer_registry_ownership() {
-        let registry = ConnectionRegistry::new(1, 8);
-        let entries = Arc::downgrade(&registry.entries);
-        let tasks = Arc::downgrade(&registry.tasks);
-        let slots = registry.connection_slots.clone();
-        let (tx, mut rx) = mpsc::channel(1);
-        registry
-            .connect(principal(8), ConnectionSink::new(tx))
-            .expect("connect");
-        drop(registry);
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while entries.upgrade().is_some() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("writer task must not retain the registry after Drop");
-        assert!(tasks.upgrade().is_none());
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while slots.available_permits() != DEFAULT_RUNTIME_CONNECTION_CAPACITY {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("Drop must abort every writer task");
-        assert!(rx.recv().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn disconnect_and_shutdown_join_writers_before_returning() {
-        let registry = ConnectionRegistry::new(2, 16);
-        let (first_tx, mut first_rx) = mpsc::channel(1);
-        let first = registry
-            .connect(principal(9), ConnectionSink::new(first_tx))
-            .expect("first connection");
-        assert_eq!(registry.active_writer_count(), 1);
-        registry.disconnect(first).await.expect("disconnect first");
-        assert_eq!(registry.active_writer_count(), 0);
-        assert_eq!(registry.tracked_task_count(), 0);
-        assert!(first_rx.recv().await.is_none());
-
-        let (second_tx, mut second_rx) = mpsc::channel(1);
-        let (third_tx, mut third_rx) = mpsc::channel(1);
-        registry
-            .connect(principal(10), ConnectionSink::new(second_tx))
-            .expect("second connection");
-        registry
-            .connect(principal(11), ConnectionSink::new(third_tx))
-            .expect("third connection");
-        assert_eq!(registry.active_writer_count(), 2);
-        registry.shutdown().await.expect("shutdown writers");
-        assert_eq!(registry.active_writer_count(), 0);
-        assert_eq!(registry.len(), 0);
-        assert_eq!(registry.tracked_task_count(), 0);
-        assert!(second_rx.recv().await.is_none());
-        assert!(third_rx.recv().await.is_none());
-        registry.shutdown().await.expect("idempotent shutdown");
-    }
-
-    #[tokio::test]
-    async fn repeated_lag_abort_reclaims_task_map_and_slots_without_churn_growth() {
-        let registry = ConnectionRegistry::new(1, 1);
-        for index in 0_u16..512 {
-            let (tx, _rx) = mpsc::channel(1);
-            let id = registry
-                .connect(
-                    principal(u8::try_from(index % 251).expect("principal seed")),
-                    ConnectionSink::new(tx),
-                )
-                .expect("connect churn writer");
-            assert_eq!(
-                registry.try_enqueue(id, EncodedRuntimeFrame::from_bytes(&b"xx"[..])),
-                Err(ConnectionError::Lagged)
-            );
-            tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                while registry.active_writer_count() != 0 || registry.tracked_task_count() != 0 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("lagged writer cleanup");
-            assert_eq!(registry.len(), 0);
-        }
-        registry.shutdown().await.expect("shutdown after churn");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_connect_and_shutdown_leave_no_writer_outside_the_join_fence() {
-        let registry = Arc::new(ConnectionRegistry::new(1, 8));
-        let barrier = Arc::new(tokio::sync::Barrier::new(33));
-        let mut connects = Vec::new();
-        for seed in 0_u8..32 {
-            let registry = registry.clone();
-            let barrier = barrier.clone();
-            connects.push(tokio::spawn(async move {
-                let (tx, _rx) = mpsc::channel(1);
-                barrier.wait().await;
-                registry.connect(principal(seed), ConnectionSink::new(tx))
-            }));
-        }
-        let shutting_down = {
-            let registry = registry.clone();
-            let barrier = barrier.clone();
-            tokio::spawn(async move {
-                barrier.wait().await;
-                registry.shutdown().await
-            })
-        };
-
-        for connect in connects {
-            match connect.await.expect("join connect racer") {
-                Ok(_) | Err(ConnectionError::ShuttingDown) => {}
-                Err(other) => panic!("unexpected connect race result: {other:?}"),
-            }
-        }
-        shutting_down
-            .await
-            .expect("join shutdown racer")
-            .expect("shutdown race");
-        assert_eq!(registry.len(), 0);
-        assert_eq!(registry.tracked_task_count(), 0);
-        assert_eq!(registry.active_writer_count(), 0);
-
-        let (tx, _rx) = mpsc::channel(1);
-        assert_eq!(
-            registry.connect(principal(250), ConnectionSink::new(tx)),
-            Err(ConnectionError::ShuttingDown)
-        );
-    }
-
-    #[test]
-    fn grant_renewal_changes_authorization_key_but_not_idempotency_owner() {
-        let issuer = PrincipalIssuer::local_only([0xB2; 32]);
-        let first = issuer
-            .issue_test_remote([1; 16], [2; 16], 7, [3; 32])
-            .expect("issue old grant");
-        let renewed = issuer
-            .issue_test_remote([1; 16], [2; 16], 8, [3; 32])
-            .expect("issue renewed grant");
-        assert_eq!(first.idempotency_owner(), renewed.idempotency_owner());
-        assert_ne!(first.authorization_key(), renewed.authorization_key());
-    }
-}
+#[path = "connection/tests.rs"]
+mod tests;

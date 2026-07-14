@@ -3,15 +3,12 @@
 //! `event_journal` 仍是 P3.2/P3.5 authenticated audit；本模块只裁剪
 //! `event_stream_index` membership，绝不删除或改写 audit ciphertext。
 
-use agentdeck_protocol::runtime::{CatalogDelta, RuntimeEvent};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::runtime::model::RuntimeStoreError;
-use crate::runtime::read_pool::{
-    MAX_RUNTIME_READ_PAGE_BYTES, MAX_RUNTIME_READ_PAGE_ROWS, ReadMemoryLease,
-};
+use crate::runtime::events::{PendingStreamTargets, RuntimeStreamTarget};
+use crate::runtime::model::{MAX_RUNTIME_CONVERSATIONS, RuntimeStoreError};
 
 use super::cipher::{RowAad, RuntimeKeyBundle};
 use super::persisted_event::{PersistedRuntimeEvent, decode_persisted_runtime_event};
@@ -69,9 +66,129 @@ pub struct RuntimeSnapshotBuildPin {
     expires_at_ms: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct AuthenticatedTargetCut {
+    pub high_water: agentdeck_protocol::runtime::StreamCursor,
+    pub retained_floor: Option<u64>,
+}
+
+/// StoreCommitHub 在唯一 worker 上使用的短 authenticated readback。
+pub(super) fn load_authenticated_target_cut(
+    state: &super::sqlite::RuntimeSqlite,
+    target: crate::runtime::events::RuntimeStreamTarget,
+) -> Result<AuthenticatedTargetCut, RuntimeStoreError> {
+    let ledger = super::sqlite::load_runtime_ledger(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+    )?;
+    load_authenticated_target_cut_in(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        &ledger,
+        target,
+    )
+}
+
+/// Barrier capture 在调用方持有的同一个 Deferred transaction/ledger cut 内读取。
+pub(super) fn load_authenticated_target_cut_in(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    ledger: &RuntimeLedger,
+    target: crate::runtime::events::RuntimeStreamTarget,
+) -> Result<AuthenticatedTargetCut, RuntimeStoreError> {
+    match target {
+        crate::runtime::events::RuntimeStreamTarget::Catalog => {
+            let high_water = ledger
+                .catalog_high_water
+                .as_deref()
+                .map(|value| decode_sequence(SequenceScope::CatalogRevision, value))
+                .transpose()?;
+            let retained_floor = ledger
+                .catalog_retention_floor
+                .as_deref()
+                .map(|value| decode_sequence(SequenceScope::CatalogRevision, value))
+                .transpose()?;
+            Ok(AuthenticatedTargetCut {
+                high_water: agentdeck_protocol::runtime::StreamCursor::from_high_water(high_water),
+                retained_floor,
+            })
+        }
+        crate::runtime::events::RuntimeStreamTarget::Conversation(conversation_id) => {
+            let conversation = super::journal::load_conversation(
+                connection,
+                key_bundle,
+                database_id,
+                conversation_id,
+            )?;
+            let retention = connection.query_row(
+                "SELECT oldest_retained_event_seq, indexed_through_event_seq,
+                        retained_event_count, retained_logical_bytes, range_digest,
+                        metadata_token
+                 FROM event_retention WHERE conversation_id = ?1",
+                [&conversation_id.as_bytes()[..]],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                    ))
+                },
+            )?;
+            let indexed_through = retention
+                .1
+                .as_deref()
+                .map(|value| decode_sequence(SequenceScope::EventSeq, value))
+                .transpose()?;
+            if indexed_through != conversation.event_high_water {
+                return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+            }
+            let retained_count = u64::try_from(retention.2)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+            let retained_bytes = u64::try_from(retention.3)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+            let range_digest = fixed_digest(&retention.4)?;
+            let expected = event_retention_token(
+                key_bundle,
+                conversation_id.as_bytes(),
+                retention.1.as_deref(),
+                retention.0.as_deref(),
+                retained_count,
+                retained_bytes,
+                &range_digest,
+            )?;
+            if retention.5.as_slice() != expected {
+                return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+            }
+            let retained_floor = retention
+                .0
+                .as_deref()
+                .map(|value| decode_sequence(SequenceScope::EventSeq, value))
+                .transpose()?;
+            Ok(AuthenticatedTargetCut {
+                high_water: agentdeck_protocol::runtime::StreamCursor::from_high_water(
+                    conversation.event_high_water,
+                ),
+                retained_floor,
+            })
+        }
+    }
+}
+
 impl RuntimeSnapshotBuildPin {
     pub(super) const fn pin_id(&self) -> [u8; 16] {
         self.pin_id
+    }
+
+    #[cfg(test)]
+    #[cfg(test)]
+    pub(super) const fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
     }
 
     #[must_use]
@@ -83,32 +200,29 @@ impl RuntimeSnapshotBuildPin {
     pub const fn base_event_seq(&self) -> Option<u64> {
         self.base_event_seq
     }
+
+    /// Snapshot materializer 的 crate-private exact binding identity。不会暴露到
+    /// integration/public API；只用于防止同 conversation/base 的另一枚 pin 错绑。
+    pub(crate) const fn build_binding_id(&self) -> [u8; 16] {
+        self.pin_id
+    }
 }
 
-#[derive(Debug)]
-pub struct RuntimeEventBackfillPage {
-    pub events: Vec<RuntimeEvent>,
-    pub next_after: u64,
-    pub through: u64,
-    pub complete: bool,
-    pub(crate) memory_lease: Option<ReadMemoryLease>,
-}
+mod page;
 
-#[derive(Debug, PartialEq)]
-pub struct RuntimeCatalogBackfillPage {
-    pub deltas: Vec<CatalogDelta>,
-    pub next_after: u64,
-    pub through: u64,
-    pub complete: bool,
-    pub(crate) memory_lease: Option<ReadMemoryLease>,
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct RuntimeBackfillReadPlan {
-    pin: RuntimeBackfillPin,
-    requested_after: Option<u64>,
-    first: u64,
-}
+#[allow(unused_imports)]
+pub(super) use page::RuntimeSnapshotEventPage;
+pub use page::{
+    RuntimeBackfillPageCompletion, RuntimeCatalogBackfillPage, RuntimeEventBackfillPage,
+};
+pub(super) use page::{
+    RuntimeBackfillReadPlan, complete_backfill_page, prepare_backfill_page,
+    read_catalog_backfill_page, read_event_backfill_page, read_oversized_event_backfill_page,
+    read_oversized_snapshot_event_page, read_snapshot_event_page, release_backfill_pin,
+    validate_backfill_page,
+};
+#[cfg(test)]
+pub(super) use page::{load_catalog_backfill_page, load_event_backfill_page};
 
 /// v4 migration 的写入 projection 随实际 conversation/event 数量增长，禁止继续使用
 /// 固定 2 MiB 伪预算。这里按最终 retained membership 上界计算 B-tree/WAL 闭包；
@@ -275,12 +389,12 @@ pub(super) fn migrate_v4_rows(
         // 都物化后才做 global trim，否则容量预检只投影 global cap 却可能
         // 短暂写入数百万个 index row。每个 conversation 完成后立即裁剪，
         // 中间态最多只比 global cap 多一个已有 per-conversation cap 的批次。
-        trim_global_event_window(transaction, key_bundle, false)?;
+        trim_global_event_window(transaction, key_bundle, false, 0)?;
     }
     drop(conversation_statement);
 
     // 保留终态校验式 trim，便于未来调整批次时仍不依赖循环细节。
-    trim_global_event_window(transaction, key_bundle, false)?;
+    trim_global_event_window(transaction, key_bundle, false, 0)?;
     let (event_stream_count, event_stream_bytes): (i64, i64) = transaction.query_row(
         "SELECT COUNT(*), COALESCE(SUM(logical_event_bytes), 0)
          FROM event_stream_index",
@@ -319,8 +433,9 @@ pub(super) fn reconcile_event_stream(
     database_id: [u8; 16],
     previous: &RuntimeLedger,
     requested_next: &RuntimeLedger,
-) -> Result<RuntimeLedger, RuntimeStoreError> {
+) -> Result<(RuntimeLedger, PendingStreamTargets), RuntimeStoreError> {
     let mut next = requested_next.clone();
+    let mut pending_targets = PendingStreamTargets::default();
     let event_delta = requested_next
         .event_count
         .checked_sub(previous.event_count)
@@ -358,7 +473,7 @@ pub(super) fn reconcile_event_stream(
     }
 
     if event_delta == 0 {
-        return Ok(next);
+        return Ok((next, pending_targets));
     }
 
     let mut changed = Vec::new();
@@ -388,7 +503,9 @@ pub(super) fn reconcile_event_stream(
 
     let mut processed_delta = 0_u64;
     let mut audit_bytes_delta = 0_u64;
+    let mut global_trim_now_ms = 0_u64;
     for (conversation_id, high_water, indexed_through) in changed {
+        let mut conversation_trim_now_ms = 0_u64;
         let high_water = high_water.ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
         let mut statement = transaction.prepare(
             "SELECT event_seq, event_id, logical_event_bytes, created_at_ms
@@ -421,6 +538,7 @@ pub(super) fn reconcile_event_stream(
                 database_id,
                 runtime_event_id(&event_id)?,
             )?;
+            conversation_trim_now_ms = conversation_trim_now_ms.max(created_at_ms);
             processed_delta = processed_delta.checked_add(1).ok_or(
                 RuntimeStoreError::CapacityArithmeticOverflow {
                     field: "event stream processed delta",
@@ -470,17 +588,28 @@ pub(super) fn reconcile_event_stream(
         drop(statement);
         trim_unrecorded_conversation_window(
             transaction,
+            key_bundle,
             &conversation_id,
             true,
+            conversation_trim_now_ms,
             MAX_EVENT_STREAM_EVENTS_PER_CONVERSATION,
             MAX_EVENT_STREAM_BYTES_PER_CONVERSATION,
         )?;
         refresh_retention(transaction, key_bundle, &conversation_id)?;
+        global_trim_now_ms = global_trim_now_ms.max(conversation_trim_now_ms);
+        let conversation_id = super::RuntimeId::from_bytes(
+            super::RuntimeIdKind::Conversation,
+            conversation_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+        )?;
+        pending_targets.insert(RuntimeStreamTarget::Conversation(conversation_id));
     }
     if processed_delta != event_delta {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
-    trim_global_event_window(transaction, key_bundle, true)?;
+    trim_global_event_window(transaction, key_bundle, true, global_trim_now_ms)?;
     let (stream_count, stream_bytes): (i64, i64) = transaction.query_row(
         "SELECT COUNT(*), COALESCE(SUM(logical_event_bytes), 0)
          FROM event_stream_index",
@@ -497,13 +626,35 @@ pub(super) fn reconcile_event_stream(
         u64::try_from(stream_count).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
     next.event_stream_bytes =
         u64::try_from(stream_bytes).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
-    Ok(next)
+    Ok((next, pending_targets))
 }
 
 pub(super) fn acquire_backfill_pin(
     state: &super::sqlite::RuntimeSqlite,
     target: RuntimeBackfillTarget,
     after: Option<u64>,
+    now_ms: u64,
+) -> Result<RuntimeBackfillPlan, RuntimeStoreError> {
+    acquire_backfill_pin_through(state, target, after, None, now_ms)
+}
+
+/// StoreCommitHub barrier capture 在同一个 worker command 内固定 exact through，
+/// 防止 capture 后的新 COMMIT 被误并入旧 generation 的 snapshot/backfill。
+pub(super) fn acquire_backfill_pin_at(
+    state: &super::sqlite::RuntimeSqlite,
+    target: RuntimeBackfillTarget,
+    after: Option<u64>,
+    through: u64,
+    now_ms: u64,
+) -> Result<RuntimeBackfillPlan, RuntimeStoreError> {
+    acquire_backfill_pin_through(state, target, after, Some(through), now_ms)
+}
+
+fn acquire_backfill_pin_through(
+    state: &super::sqlite::RuntimeSqlite,
+    target: RuntimeBackfillTarget,
+    after: Option<u64>,
+    exact_through: Option<u64>,
     now_ms: u64,
 ) -> Result<RuntimeBackfillPlan, RuntimeStoreError> {
     state.connection.execute(
@@ -578,13 +729,17 @@ pub(super) fn acquire_backfill_pin(
             )
         }
     };
-    let Some(through) = high_water else {
+    let Some(current_high_water) = high_water else {
         return if after.is_none() {
             Ok(RuntimeBackfillPlan::Current { high_water: None })
         } else {
             Err(RuntimeStoreError::BackfillCursorAhead)
         };
     };
+    let through = exact_through.unwrap_or(current_high_water);
+    if through > current_high_water {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
     if after == Some(through) {
         return Ok(RuntimeBackfillPlan::Current {
             high_water: Some(through),
@@ -693,10 +848,6 @@ pub(super) fn acquire_snapshot_build_pin(
             actual: conversation_id.kind(),
         });
     }
-    state.connection.execute(
-        "DELETE FROM temp.active_stream_pins WHERE expires_at_ms <= ?1",
-        [sqlite_u64(now_ms)?],
-    )?;
     let high_water: Option<String> = state
         .connection
         .query_row(
@@ -712,10 +863,33 @@ pub(super) fn acquire_snapshot_build_pin(
         .as_deref()
         .map(|value| decode_sequence(SequenceScope::EventSeq, value))
         .transpose()?;
+    acquire_snapshot_build_pin_at(&state.connection, conversation_id, base_event_seq, now_ms)
+}
+
+/// 使用调用方已认证的 explicit H 创建 snapshot TEMP pin；本函数绝不重读
+/// conversation 当前 high-water。StoreCommitHub barrier capture 与普通 acquire
+/// 共用同一插入/配额实现，但只有后者会在调用前读取最新 H。
+pub(super) fn acquire_snapshot_build_pin_at(
+    connection: &Connection,
+    conversation_id: super::RuntimeId,
+    base_event_seq: Option<u64>,
+    now_ms: u64,
+) -> Result<RuntimeSnapshotBuildPin, RuntimeStoreError> {
+    if conversation_id.kind() != super::RuntimeIdKind::Conversation {
+        return Err(RuntimeStoreError::IdKindMismatch {
+            expected: super::RuntimeIdKind::Conversation,
+            actual: conversation_id.kind(),
+        });
+    }
+    connection.execute(
+        "DELETE FROM temp.active_stream_pins WHERE expires_at_ms <= ?1",
+        [sqlite_u64(now_ms)?],
+    )?;
+    let base_encoded = base_event_seq.map(super::sequence::encode_sequence);
     let expires_at_ms = now_ms
         .checked_add(BACKFILL_PIN_TTL_MS)
         .ok_or(RuntimeStoreError::TimeOutOfRange)?;
-    let active_pin_count: i64 = state.connection.query_row(
+    let active_pin_count: i64 = connection.query_row(
         "SELECT COUNT(*) FROM temp.active_stream_pins WHERE state = 'active'",
         [],
         |row| row.get(0),
@@ -734,7 +908,7 @@ pub(super) fn acquire_snapshot_build_pin(
         if pin_id == [0; 16] {
             continue;
         }
-        let inserted = state.connection.execute(
+        let inserted = connection.execute(
             "INSERT OR IGNORE INTO temp.active_stream_pins (
                  pin_id, scope, target_id, first_seq, through_seq, next_after_seq,
                  expires_at_ms, state
@@ -742,8 +916,8 @@ pub(super) fn acquire_snapshot_build_pin(
             params![
                 &pin_id[..],
                 &conversation_id.as_bytes()[..],
-                high_water.as_deref(),
-                high_water.as_deref(),
+                base_encoded.as_deref(),
+                base_encoded.as_deref(),
                 sqlite_u64(expires_at_ms)?,
             ],
         )?;
@@ -771,6 +945,19 @@ pub(super) fn release_snapshot_build_pin(
         params![&pin.pin_id[..], &pin.conversation_id.as_bytes()[..]],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn active_snapshot_build_pin_count(
+    state: &super::sqlite::RuntimeSqlite,
+) -> Result<u64, RuntimeStoreError> {
+    let count: i64 = state.connection.query_row(
+        "SELECT COUNT(*) FROM temp.active_stream_pins
+         WHERE scope = 'snapshot' AND state = 'active'",
+        [],
+        |row| row.get(0),
+    )?;
+    u64::try_from(count).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)
 }
 
 pub(super) fn validate_snapshot_build_pin(
@@ -811,6 +998,19 @@ pub(super) fn validate_snapshot_build_pin(
     }
     validate_pin_clock_lower_bound(now_ms, stored_expiry)?;
     if now_ms >= stored_expiry {
+        if connection.execute(
+            "DELETE FROM temp.active_stream_pins
+             WHERE pin_id = ?1 AND scope = 'snapshot' AND target_id = ?2
+               AND expires_at_ms = ?3 AND state = 'active'",
+            params![
+                &pin.pin_id[..],
+                &pin.conversation_id.as_bytes()[..],
+                sqlite_u64(stored_expiry)?,
+            ],
+        )? != 1
+        {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
         return Err(RuntimeStoreError::InvalidStateTransition);
     }
     Ok(())
@@ -831,317 +1031,6 @@ pub(super) fn consume_snapshot_build_pin(
     Ok(())
 }
 
-#[cfg(test)]
-pub(super) fn load_event_backfill_page(
-    state: &super::sqlite::RuntimeSqlite,
-    pin: &RuntimeBackfillPin,
-    requested_after: Option<u64>,
-    now_ms: u64,
-) -> Result<RuntimeEventBackfillPage, RuntimeStoreError> {
-    let plan = prepare_backfill_page(state, pin, requested_after, now_ms)?;
-    let read_crypto = state.key_bundle.read_only_capability();
-    let page = read_event_backfill_page(&state.connection, &read_crypto, state.database_id, &plan)?;
-    finish_backfill_page(state, &plan, page.next_after, page.complete, now_ms)?;
-    Ok(page)
-}
-
-pub(super) fn prepare_backfill_page(
-    state: &super::sqlite::RuntimeSqlite,
-    pin: &RuntimeBackfillPin,
-    requested_after: Option<u64>,
-    now_ms: u64,
-) -> Result<RuntimeBackfillReadPlan, RuntimeStoreError> {
-    validate_active_pin(state, pin, requested_after, now_ms)?;
-    let first = requested_after
-        .map_or(Some(0), |value| value.checked_add(1))
-        .ok_or(RuntimeStoreError::InvalidBackfillPin)?;
-    Ok(RuntimeBackfillReadPlan {
-        pin: pin.clone(),
-        requested_after,
-        first,
-    })
-}
-
-pub(super) fn read_event_backfill_page(
-    connection: &Connection,
-    read_crypto: &super::cipher::RuntimeReadCryptoCapability,
-    database_id: [u8; 16],
-    plan: &RuntimeBackfillReadPlan,
-) -> Result<RuntimeEventBackfillPage, RuntimeStoreError> {
-    debug_assert_eq!(MAX_RUNTIME_READ_PAGE_ROWS, 64);
-    let RuntimeBackfillTarget::Conversation(conversation_id) = plan.pin.target else {
-        return Err(RuntimeStoreError::InvalidBackfillPin);
-    };
-    let first = super::sequence::encode_sequence(plan.first);
-    let through = super::sequence::encode_sequence(plan.pin.through);
-    let mut compact = Vec::new();
-    let mut total_bytes = 0_u64;
-    let mut statement = connection.prepare(
-        "SELECT event_seq, event_id, logical_event_bytes
-         FROM event_stream_index
-         WHERE conversation_id = ?1 AND event_seq BETWEEN ?2 AND ?3
-         ORDER BY event_seq LIMIT 64",
-    )?;
-    let rows = statement.query_map(
-        params![&conversation_id.as_bytes()[..], &first, &through],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        },
-    )?;
-    for row in rows {
-        let row = row?;
-        let logical_bytes =
-            u64::try_from(row.2).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
-        if logical_bytes > u64::from(MAX_RUNTIME_READ_PAGE_BYTES) {
-            return Err(RuntimeStoreError::BackfillNeedSnapshot);
-        }
-        if !compact.is_empty()
-            && total_bytes
-                .checked_add(logical_bytes)
-                .ok_or(RuntimeStoreError::PayloadTooLarge)?
-                > u64::from(MAX_RUNTIME_READ_PAGE_BYTES)
-        {
-            break;
-        }
-        total_bytes = total_bytes
-            .checked_add(logical_bytes)
-            .ok_or(RuntimeStoreError::PayloadTooLarge)?;
-        compact.push((row.0, row.1));
-    }
-    drop(statement);
-    if compact.is_empty() {
-        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
-    }
-    let mut events = Vec::new();
-    events
-        .try_reserve_exact(compact.len())
-        .map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
-    let mut expected = decode_sequence(SequenceScope::EventSeq, &first)?;
-    for (event_seq, event_id) in compact {
-        let actual = decode_sequence(SequenceScope::EventSeq, &event_seq)?;
-        if actual != expected {
-            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
-        }
-        let event = super::journal::load_event_read(
-            connection,
-            read_crypto,
-            database_id,
-            runtime_event_id(&event_id)?,
-        )?;
-        let PersistedRuntimeEvent::Canonical(event) = decode_persisted_runtime_event(&event)?
-        else {
-            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
-        };
-        events.push(*event);
-        expected = expected
-            .checked_add(1)
-            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-    }
-    let next_after = expected
-        .checked_sub(1)
-        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-    let complete = next_after == plan.pin.through;
-    Ok(RuntimeEventBackfillPage {
-        events,
-        next_after,
-        through: plan.pin.through,
-        complete,
-        memory_lease: None,
-    })
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-pub(super) fn load_catalog_backfill_page(
-    state: &super::sqlite::RuntimeSqlite,
-    pin: &RuntimeBackfillPin,
-    requested_after: Option<u64>,
-    now_ms: u64,
-) -> Result<RuntimeCatalogBackfillPage, RuntimeStoreError> {
-    let plan = prepare_backfill_page(state, pin, requested_after, now_ms)?;
-    let read_crypto = state.key_bundle.read_only_capability();
-    let page =
-        read_catalog_backfill_page(&state.connection, &read_crypto, state.database_id, &plan)?;
-    finish_backfill_page(state, &plan, page.next_after, page.complete, now_ms)?;
-    Ok(page)
-}
-
-pub(super) fn read_catalog_backfill_page(
-    connection: &Connection,
-    read_crypto: &super::cipher::RuntimeReadCryptoCapability,
-    database_id: [u8; 16],
-    plan: &RuntimeBackfillReadPlan,
-) -> Result<RuntimeCatalogBackfillPage, RuntimeStoreError> {
-    debug_assert_eq!(MAX_RUNTIME_READ_PAGE_ROWS, 64);
-    if plan.pin.target != RuntimeBackfillTarget::Catalog {
-        return Err(RuntimeStoreError::InvalidBackfillPin);
-    }
-    let first_value = plan.first;
-    let first = super::sequence::encode_sequence(first_value);
-    let through = super::sequence::encode_sequence(plan.pin.through);
-    let mut revisions = Vec::new();
-    let mut total_bytes = 0_u64;
-    let mut statement = connection.prepare(
-        "SELECT catalog_revision, logical_delta_bytes
-         FROM catalog_journal
-         WHERE catalog_revision BETWEEN ?1 AND ?2
-         ORDER BY catalog_revision LIMIT 64",
-    )?;
-    let rows = statement.query_map(params![&first, &through], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })?;
-    for row in rows {
-        let (revision, logical_bytes) = row?;
-        let logical_bytes =
-            u64::try_from(logical_bytes).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
-        if logical_bytes > u64::from(MAX_RUNTIME_READ_PAGE_BYTES) {
-            return Err(RuntimeStoreError::BackfillNeedSnapshot);
-        }
-        if !revisions.is_empty()
-            && total_bytes
-                .checked_add(logical_bytes)
-                .ok_or(RuntimeStoreError::PayloadTooLarge)?
-                > u64::from(MAX_RUNTIME_READ_PAGE_BYTES)
-        {
-            break;
-        }
-        total_bytes = total_bytes
-            .checked_add(logical_bytes)
-            .ok_or(RuntimeStoreError::PayloadTooLarge)?;
-        revisions.push(revision);
-    }
-    drop(statement);
-    if revisions.is_empty() {
-        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
-    }
-    let mut deltas = Vec::new();
-    deltas
-        .try_reserve_exact(revisions.len())
-        .map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
-    let mut expected = first_value;
-    for revision in revisions {
-        let actual = decode_sequence(SequenceScope::CatalogRevision, &revision)?;
-        if actual != expected {
-            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
-        }
-        deltas.push(super::catalog::load_delta(
-            connection,
-            read_crypto,
-            database_id,
-            &revision,
-        )?);
-        expected = expected
-            .checked_add(1)
-            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-    }
-    let next_after = expected
-        .checked_sub(1)
-        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-    let complete = next_after == plan.pin.through;
-    Ok(RuntimeCatalogBackfillPage {
-        deltas,
-        next_after,
-        through: plan.pin.through,
-        complete,
-        memory_lease: None,
-    })
-}
-
-pub(super) fn finish_backfill_page(
-    state: &super::sqlite::RuntimeSqlite,
-    plan: &RuntimeBackfillReadPlan,
-    next_after: u64,
-    complete: bool,
-    now_ms: u64,
-) -> Result<(), RuntimeStoreError> {
-    // writer/GC 可在 read transaction 期间 revoke pin；必须在把 page 交给调用方前
-    // 重新验证。revoked page 直接丢弃并要求 snapshot，绝不把过期 range 冒充 live。
-    validate_active_pin(state, &plan.pin, plan.requested_after, now_ms)?;
-    if next_after < plan.first || next_after > plan.pin.through {
-        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
-    }
-    if complete != (next_after == plan.pin.through) {
-        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
-    }
-    advance_or_release_pin(state, &plan.pin, next_after, complete)
-}
-
-pub(super) fn release_backfill_pin(
-    state: &super::sqlite::RuntimeSqlite,
-    pin_id: [u8; 16],
-) -> Result<(), RuntimeStoreError> {
-    state.connection.execute(
-        "DELETE FROM temp.active_stream_pins WHERE pin_id = ?1",
-        [&pin_id[..]],
-    )?;
-    Ok(())
-}
-
-fn validate_active_pin(
-    state: &super::sqlite::RuntimeSqlite,
-    pin: &RuntimeBackfillPin,
-    requested_after: Option<u64>,
-    now_ms: u64,
-) -> Result<(), RuntimeStoreError> {
-    let raw = state
-        .connection
-        .query_row(
-            "SELECT scope, target_id, through_seq, next_after_seq, expires_at_ms, state
-             FROM temp.active_stream_pins WHERE pin_id = ?1",
-            [&pin.pin_id[..]],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<Vec<u8>>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            },
-        )
-        .optional()?
-        .ok_or(RuntimeStoreError::InvalidBackfillPin)?;
-    let expected_target: (&str, Option<[u8; 16]>) = match pin.target {
-        RuntimeBackfillTarget::Catalog => ("catalog", None),
-        RuntimeBackfillTarget::Conversation(conversation_id) => {
-            ("event", Some(*conversation_id.as_bytes()))
-        }
-    };
-    let stored_after = raw
-        .3
-        .as_deref()
-        .map(|value| decode_sequence(sequence_scope(pin.target), value))
-        .transpose()?;
-    let stored_expiry =
-        u64::try_from(raw.4).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
-    if raw.5 == "revoked" {
-        return Err(RuntimeStoreError::BackfillNeedSnapshot);
-    }
-    if raw.5 != "active"
-        || raw.0 != expected_target.0
-        || raw.1.as_deref() != expected_target.1.as_ref().map(<[u8; 16]>::as_slice)
-        || decode_sequence(sequence_scope(pin.target), &raw.2)? != pin.through
-        || stored_expiry != pin.expires_at_ms
-        || requested_after != stored_after
-    {
-        return Err(RuntimeStoreError::InvalidBackfillPin);
-    }
-    validate_pin_clock_lower_bound(now_ms, stored_expiry)?;
-    if now_ms >= stored_expiry {
-        state.connection.execute(
-            "DELETE FROM temp.active_stream_pins WHERE pin_id = ?1",
-            [&pin.pin_id[..]],
-        )?;
-        return Err(RuntimeStoreError::InvalidBackfillPin);
-    }
-    Ok(())
-}
-
 fn validate_pin_clock_lower_bound(
     now_ms: u64,
     expires_at_ms: u64,
@@ -1158,44 +1047,12 @@ fn validate_pin_clock_lower_bound(
     Ok(())
 }
 
-fn advance_or_release_pin(
-    state: &super::sqlite::RuntimeSqlite,
-    pin: &RuntimeBackfillPin,
-    next_after: u64,
-    complete: bool,
-) -> Result<(), RuntimeStoreError> {
-    let changed = if complete {
-        state.connection.execute(
-            "DELETE FROM temp.active_stream_pins WHERE pin_id = ?1 AND state = 'active'",
-            [&pin.pin_id[..]],
-        )?
-    } else {
-        state.connection.execute(
-            "UPDATE temp.active_stream_pins SET next_after_seq = ?1
-             WHERE pin_id = ?2 AND state = 'active'",
-            params![
-                super::sequence::encode_sequence(next_after),
-                &pin.pin_id[..]
-            ],
-        )?
-    };
-    if changed != 1 {
-        return Err(RuntimeStoreError::InvalidBackfillPin);
-    }
-    Ok(())
-}
-
-const fn sequence_scope(target: RuntimeBackfillTarget) -> SequenceScope {
-    match target {
-        RuntimeBackfillTarget::Catalog => SequenceScope::CatalogRevision,
-        RuntimeBackfillTarget::Conversation(_) => SequenceScope::EventSeq,
-    }
-}
-
 fn trim_unrecorded_conversation_window(
     transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
     conversation_id: &[u8],
     respect_pins: bool,
+    now_ms: u64,
     max_events: u64,
     max_bytes: u64,
 ) -> Result<(), RuntimeStoreError> {
@@ -1218,7 +1075,13 @@ fn trim_unrecorded_conversation_window(
             |row| row.get(0),
         )?;
         if respect_pins {
-            revoke_stream_pins_covering(transaction, "event", Some(conversation_id), &oldest)?;
+            super::retention::authorize_trim(
+                transaction,
+                key_bundle,
+                super::retention::RetentionTarget::Conversation(conversation_id),
+                &oldest,
+                now_ms,
+            )?;
         }
         if transaction.execute(
             "DELETE FROM event_stream_index
@@ -1514,6 +1377,25 @@ fn trim_global_event_window(
     transaction: &Transaction<'_>,
     key_bundle: &RuntimeKeyBundle,
     respect_pins: bool,
+    now_ms: u64,
+) -> Result<(), RuntimeStoreError> {
+    trim_global_event_window_with_limits(
+        transaction,
+        key_bundle,
+        respect_pins,
+        now_ms,
+        MAX_EVENT_STREAM_EVENTS_GLOBAL,
+        MAX_EVENT_STREAM_BYTES_GLOBAL,
+    )
+}
+
+fn trim_global_event_window_with_limits(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    respect_pins: bool,
+    now_ms: u64,
+    max_events: u64,
+    max_bytes: u64,
 ) -> Result<(), RuntimeStoreError> {
     loop {
         let (count, bytes): (i64, i64) = transaction.query_row(
@@ -1524,44 +1406,79 @@ fn trim_global_event_window(
         )?;
         let count = u64::try_from(count).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
         let bytes = u64::try_from(bytes).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
-        if count <= MAX_EVENT_STREAM_EVENTS_GLOBAL && bytes <= MAX_EVENT_STREAM_BYTES_GLOBAL {
+        if count <= max_events && bytes <= max_bytes {
             return Ok(());
         }
-        let victim = transaction
-            .query_row(
-                "SELECT i.conversation_id, i.event_seq, i.logical_event_bytes
-                 FROM event_stream_index i
-                 JOIN event_retention r
-                   ON r.conversation_id = i.conversation_id
-                  AND r.oldest_retained_event_seq = i.event_seq
-                 ORDER BY i.created_at_ms, i.conversation_id, i.event_seq
-                 LIMIT 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
-            )
-            .optional()?
-            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-        if respect_pins {
-            revoke_stream_pins_covering(transaction, "event", Some(&victim.0), &victim.1)?;
+        // 最多每个 conversation 只看 oldest retained row，因此候选数量由生产
+        // conversation cap 严格约束。不能让全局最老但被 pin/缺 replacement 的
+        // conversation 阻塞其它已有 durable replacement 的 eligible target。
+        let candidate_limit = i64::try_from(MAX_RUNTIME_CONVERSATIONS)
+            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+        let mut statement = transaction.prepare(
+            "SELECT i.conversation_id, i.event_seq
+             FROM event_stream_index i
+             JOIN event_retention r
+               ON r.conversation_id = i.conversation_id
+              AND r.oldest_retained_event_seq = i.event_seq
+             ORDER BY i.created_at_ms, i.conversation_id, i.event_seq
+             LIMIT ?1",
+        )?;
+        let candidates = statement
+            .query_map([candidate_limit], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        if candidates.is_empty() {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
         }
-        transaction.execute(
+
+        let mut first_block = None;
+        let mut victim = None;
+        for candidate in candidates {
+            if !respect_pins {
+                victim = Some(candidate);
+                break;
+            }
+            match super::retention::authorize_trim(
+                transaction,
+                key_bundle,
+                super::retention::RetentionTarget::Conversation(&candidate.0),
+                &candidate.1,
+                now_ms,
+            ) {
+                Ok(()) => {
+                    victim = Some(candidate);
+                    break;
+                }
+                Err(error @ RuntimeStoreError::WorkerBusy { .. })
+                | Err(error @ RuntimeStoreError::PublicationNeedsSnapshot) => {
+                    if first_block.is_none() {
+                        first_block = Some(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let victim = match victim {
+            Some(victim) => victim,
+            None => return Err(first_block.unwrap_or(RuntimeStoreError::UnknownOrCorruptSchema)),
+        };
+        if transaction.execute(
             "DELETE FROM event_stream_index
              WHERE conversation_id = ?1 AND event_seq = ?2",
             params![&victim.0, &victim.1],
-        )?;
+        )? != 1
+        {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
         refresh_retention(transaction, key_bundle, &victim.0)?;
     }
 }
 
-/// active backfill pin 只存在于本进程 TEMP schema；daemon restart 后客户端必须
-/// 重新建立 barrier。GC 遇到覆盖 victim 的 pin 时先原子标记 revoked 再继续
-/// trim；后续 page 读取以 NeedSnapshot fail-closed，但 writer 不阻塞。
+/// active backfill/snapshot pin 只存在于本进程 TEMP schema；daemon restart 后客户端
+/// 必须重新建立 barrier。Retention 只读这些 pin，绝不把撤销 reader 当成获得 trim
+/// 授权的手段。
 pub(super) fn initialize_ephemeral_state(connection: &Connection) -> Result<(), RuntimeStoreError> {
     connection.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS active_stream_pins (
@@ -1587,23 +1504,6 @@ pub(super) fn initialize_ephemeral_state(connection: &Connection) -> Result<(), 
              ON active_stream_pins(scope, target_id, first_seq, through_seq);",
     )?;
     Ok(())
-}
-
-pub(super) fn revoke_stream_pins_covering(
-    connection: &Connection,
-    scope: &str,
-    target_id: Option<&[u8]>,
-    sequence: &str,
-) -> Result<u64, RuntimeStoreError> {
-    let changed = connection.execute(
-        "UPDATE temp.active_stream_pins SET state = 'revoked'
-         WHERE scope = ?1
-           AND ((?2 IS NULL AND target_id IS NULL) OR target_id = ?2)
-           AND state = 'active'
-           AND first_seq <= ?3 AND through_seq >= ?3",
-        params![scope, target_id, sequence],
-    )?;
-    u64::try_from(changed).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)
 }
 
 fn revoke_all_stream_pins(
@@ -1914,666 +1814,5 @@ pub(super) fn open_v4_row_read(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use agentdeck_protocol::AgentKind;
-    use agentdeck_protocol::runtime::event::RuntimeEventBody;
-    use agentdeck_protocol::runtime::identity::{ConversationId, EventId};
-    use agentdeck_protocol::runtime::{RuntimeEvent, RuntimeFailure};
-    use rusqlite::{Connection, TransactionBehavior, params};
-
-    use super::*;
-    use crate::runtime::model::{
-        ConversationDescriptor, MAX_CONVERSATION_DESCRIPTOR_BYTES, MAX_RUNTIME_EVENT_BYTES,
-    };
-    use crate::runtime::store::schema::{
-        RUNTIME_DDL_V1, RUNTIME_MIGRATION_V2, RUNTIME_MIGRATION_V3, RUNTIME_MIGRATION_V4,
-    };
-    use crate::runtime::store::sequence::encode_sequence;
-
-    fn fixture() -> (
-        Connection,
-        RuntimeKeyBundle,
-        [u8; 16],
-        super::super::RuntimeId,
-    ) {
-        let connection = Connection::open_in_memory().expect("open fixture");
-        connection
-            .execute_batch("PRAGMA foreign_keys = ON;")
-            .expect("enable FKs");
-        connection.execute_batch(RUNTIME_DDL_V1).expect("v1 DDL");
-        connection
-            .execute_batch(RUNTIME_MIGRATION_V2)
-            .expect("v2 DDL");
-        connection
-            .execute_batch(RUNTIME_MIGRATION_V3)
-            .expect("v3 DDL");
-        connection
-            .execute_batch(RUNTIME_MIGRATION_V4)
-            .expect("v4 DDL");
-        initialize_ephemeral_state(&connection).expect("TEMP pins");
-        let key_bundle = RuntimeKeyBundle::fresh(1).expect("row keys");
-        let database_id = [0x91; 16];
-        let conversation_id = super::super::RuntimeId::from_bytes(
-            super::super::RuntimeIdKind::Conversation,
-            [0x11; 16],
-        )
-        .expect("conversation id");
-        let adapter_state_key = super::super::RuntimeId::from_bytes(
-            super::super::RuntimeIdKind::AdapterState,
-            [0x22; 16],
-        )
-        .expect("adapter state key");
-        let descriptor = ConversationDescriptor {
-            agent_kind: AgentKind::Codex,
-            title: Some("stream fixture".into()),
-            cwd: PathBuf::from("/tmp/stream-fixture"),
-        };
-        let descriptor_bytes =
-            super::super::journal::canonical_conversation_descriptor(&descriptor)
-                .expect("canonical descriptor");
-        let catalog_revision = encode_sequence(0);
-        let metadata_token = super::super::journal::conversation_metadata_token_for_test(
-            &key_bundle,
-            conversation_id,
-            adapter_state_key,
-            0,
-            None,
-            None,
-            0,
-            crate::runtime::model::ConversationLifecycle::Active,
-            1,
-            1,
-        )
-        .expect("conversation metadata token");
-        let sealed_descriptor = seal_v4_row(
-            &key_bundle,
-            database_id,
-            b"conversations",
-            conversation_id.as_bytes(),
-            b"sealed_descriptor",
-            &descriptor_bytes,
-            MAX_CONVERSATION_DESCRIPTOR_BYTES,
-        )
-        .expect("sealed conversation descriptor");
-        connection
-            .execute(
-                "INSERT INTO conversations (
-                     conversation_id, adapter_state_key, catalog_revision,
-                     command_high_water, event_high_water, lifecycle,
-                     created_at_ms, updated_at_ms, accepted_count,
-                     metadata_token, sealed_descriptor
-                 ) VALUES (?1, ?2, ?3, NULL, NULL, 'active', 1, 1, 0, ?4, ?5)",
-                params![
-                    &conversation_id.as_bytes()[..],
-                    &adapter_state_key.as_bytes()[..],
-                    &catalog_revision,
-                    &metadata_token[..],
-                    sealed_descriptor,
-                ],
-            )
-            .expect("conversation row");
-        super::super::journal::load_conversation(
-            &connection,
-            &key_bundle,
-            database_id,
-            conversation_id,
-        )
-        .expect("fixture conversation must satisfy the production authenticated decoder");
-        {
-            let transaction = connection
-                .unchecked_transaction()
-                .expect("retention transaction");
-            insert_or_replace_retention(
-                &transaction,
-                &key_bundle,
-                conversation_id.as_bytes(),
-                None,
-                None,
-                0,
-                0,
-            )
-            .expect("empty retention row");
-            transaction.commit().expect("commit retention row");
-        }
-        (connection, key_bundle, database_id, conversation_id)
-    }
-
-    fn canonical_event(
-        conversation_id: super::super::RuntimeId,
-        event_id: super::super::RuntimeId,
-        event_seq: u64,
-    ) -> Vec<u8> {
-        let event = RuntimeEvent::new(
-            ConversationId::new(conversation_id.to_canonical_string()),
-            EventId::new(event_id.to_canonical_string()),
-            event_seq,
-            None,
-            None,
-            None,
-            RuntimeEventBody::Error {
-                failure: RuntimeFailure::new("daemon.test", "fixture"),
-            },
-        )
-        .expect("canonical event");
-        serde_json::to_vec(&event).expect("encode canonical event")
-    }
-
-    fn legacy_event(
-        conversation_id: super::super::RuntimeId,
-        event_id: super::super::RuntimeId,
-        event_seq: u64,
-    ) -> Vec<u8> {
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&canonical_event(conversation_id, event_id, event_seq))
-                .expect("event value");
-        let object = value.as_object_mut().expect("event object");
-        object.remove("commandId");
-        object.remove("itemId");
-        object.remove("entityId");
-        serde_json::to_vec(&value).expect("legacy bytes")
-    }
-
-    fn insert_audit_event(
-        connection: &Connection,
-        key_bundle: &RuntimeKeyBundle,
-        database_id: [u8; 16],
-        conversation_id: super::super::RuntimeId,
-        event_seq: u64,
-        payload: &[u8],
-    ) -> super::super::RuntimeId {
-        let mut id = [0x60; 16];
-        id[15] = u8::try_from(event_seq + 1).expect("small event seq");
-        let event_id = super::super::RuntimeId::from_bytes(super::super::RuntimeIdKind::Event, id)
-            .expect("event id");
-        let event_seq_encoded = encode_sequence(event_seq);
-        let logical_bytes = u64::try_from(payload.len()).expect("payload length");
-        let created_at_ms = 10 + event_seq;
-        let sealed = seal_v4_row(
-            key_bundle,
-            database_id,
-            b"event_journal",
-            event_id.as_bytes(),
-            b"sealed_event",
-            payload,
-            MAX_RUNTIME_EVENT_BYTES,
-        )
-        .expect("seal audit event");
-        let command = optional_field(None);
-        let token = metadata_mac(
-            key_bundle,
-            b"event.metadata.v1",
-            &[
-                conversation_id.as_bytes(),
-                event_id.as_bytes(),
-                event_seq_encoded.as_bytes(),
-                &command,
-                &logical_bytes.to_be_bytes(),
-                &created_at_ms.to_be_bytes(),
-            ],
-        )
-        .expect("audit event token");
-        connection
-            .execute(
-                "INSERT INTO event_journal (
-                     conversation_id, event_seq, event_id, command_id,
-                     logical_event_bytes, created_at_ms, metadata_token, sealed_event
-                 ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7)",
-                params![
-                    &conversation_id.as_bytes()[..],
-                    &event_seq_encoded,
-                    &event_id.as_bytes()[..],
-                    sqlite_u64(logical_bytes).expect("logical bytes"),
-                    sqlite_u64(created_at_ms).expect("created time"),
-                    &token[..],
-                    sealed,
-                ],
-            )
-            .expect("audit event row");
-        let adapter_state_key = super::super::RuntimeId::from_bytes(
-            super::super::RuntimeIdKind::AdapterState,
-            [0x22; 16],
-        )
-        .expect("adapter state key");
-        let conversation_token = super::super::journal::conversation_metadata_token_for_test(
-            key_bundle,
-            conversation_id,
-            adapter_state_key,
-            0,
-            None,
-            Some(event_seq),
-            0,
-            crate::runtime::model::ConversationLifecycle::Active,
-            1,
-            1,
-        )
-        .expect("conversation metadata token");
-        connection
-            .execute(
-                "UPDATE conversations
-                 SET event_high_water = ?1, metadata_token = ?2
-                 WHERE conversation_id = ?3",
-                params![
-                    &event_seq_encoded,
-                    &conversation_token[..],
-                    &conversation_id.as_bytes()[..],
-                ],
-            )
-            .expect("advance audit HWM");
-        event_id
-    }
-
-    fn sealed_audit_bytes(connection: &Connection) -> Vec<Vec<u8>> {
-        connection
-            .prepare("SELECT sealed_event FROM event_journal ORDER BY event_seq")
-            .expect("prepare audit evidence")
-            .query_map([], |row| row.get::<_, Vec<u8>>(0))
-            .expect("query audit evidence")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect audit evidence")
-    }
-
-    #[test]
-    fn migration_indexes_only_maximum_publishable_suffix_across_legacy_and_fixed_rows() {
-        let (mut connection, key_bundle, database_id, conversation_id) = fixture();
-        let id0 = {
-            let mut id = [0x60; 16];
-            id[15] = 1;
-            super::super::RuntimeId::from_bytes(super::super::RuntimeIdKind::Event, id)
-                .expect("legacy id shape")
-        };
-        insert_audit_event(
-            &connection,
-            &key_bundle,
-            database_id,
-            conversation_id,
-            0,
-            &legacy_event(conversation_id, id0, 0),
-        );
-        insert_audit_event(
-            &connection,
-            &key_bundle,
-            database_id,
-            conversation_id,
-            1,
-            b"opaque-fixed-event",
-        );
-        let id2 = super::super::RuntimeId::from_bytes(super::super::RuntimeIdKind::Event, {
-            let mut id = [0x60; 16];
-            id[15] = 3;
-            id
-        })
-        .expect("canonical id shape");
-        insert_audit_event(
-            &connection,
-            &key_bundle,
-            database_id,
-            conversation_id,
-            2,
-            &canonical_event(conversation_id, id2, 2),
-        );
-        let before = sealed_audit_bytes(&connection);
-        let current = RuntimeLedger {
-            catalog_high_water: Some(encode_sequence(0)),
-            conversation_count: 1,
-            event_count: 3,
-            ..RuntimeLedger::default()
-        };
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .expect("migration transaction");
-        let migrated = migrate_v4_rows(&transaction, &key_bundle, database_id, &current)
-            .expect("migrate v4 rows");
-        transaction.commit().expect("commit migration fixture");
-        let indexed: Vec<String> = connection
-            .prepare("SELECT event_seq FROM event_stream_index ORDER BY event_seq")
-            .expect("prepare index")
-            .query_map([], |row| row.get(0))
-            .expect("query index")
-            .collect::<Result<_, _>>()
-            .expect("collect index");
-        assert_eq!(indexed, [encode_sequence(2)]);
-        assert_eq!(migrated.event_stream_count, 1);
-        assert_eq!(sealed_audit_bytes(&connection), before);
-    }
-
-    #[test]
-    fn opaque_last_event_migrates_to_empty_suffix_without_rewriting_audit() {
-        let (mut connection, key_bundle, database_id, conversation_id) = fixture();
-        let id0 = {
-            let mut id = [0x60; 16];
-            id[15] = 1;
-            super::super::RuntimeId::from_bytes(super::super::RuntimeIdKind::Event, id)
-                .expect("event id")
-        };
-        insert_audit_event(
-            &connection,
-            &key_bundle,
-            database_id,
-            conversation_id,
-            0,
-            &canonical_event(conversation_id, id0, 0),
-        );
-        insert_audit_event(
-            &connection,
-            &key_bundle,
-            database_id,
-            conversation_id,
-            1,
-            b"opaque-last",
-        );
-        let before = sealed_audit_bytes(&connection);
-        let current = RuntimeLedger {
-            catalog_high_water: Some(encode_sequence(0)),
-            conversation_count: 1,
-            event_count: 2,
-            ..RuntimeLedger::default()
-        };
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .expect("migration transaction");
-        let migrated = migrate_v4_rows(&transaction, &key_bundle, database_id, &current)
-            .expect("migrate v4 rows");
-        transaction.commit().expect("commit migration fixture");
-        assert_eq!(migrated.event_stream_count, 0);
-        assert_eq!(sealed_audit_bytes(&connection), before);
-    }
-
-    #[test]
-    fn canonical_event_after_opaque_break_starts_a_new_contiguous_suffix() {
-        let (mut connection, key_bundle, database_id, conversation_id) = fixture();
-        insert_audit_event(
-            &connection,
-            &key_bundle,
-            database_id,
-            conversation_id,
-            0,
-            b"opaque-zero",
-        );
-        let requested = RuntimeLedger {
-            catalog_high_water: Some(encode_sequence(0)),
-            conversation_count: 1,
-            event_count: 1,
-            ..RuntimeLedger::default()
-        };
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .expect("first writer transaction");
-        let first = reconcile_event_stream(
-            &transaction,
-            &key_bundle,
-            database_id,
-            &RuntimeLedger::default(),
-            &requested,
-        )
-        .expect("reconcile opaque row");
-        transaction.commit().expect("commit opaque row");
-        assert_eq!(first.event_stream_count, 0);
-
-        let id1 = {
-            let mut id = [0x60; 16];
-            id[15] = 2;
-            super::super::RuntimeId::from_bytes(super::super::RuntimeIdKind::Event, id)
-                .expect("event id")
-        };
-        insert_audit_event(
-            &connection,
-            &key_bundle,
-            database_id,
-            conversation_id,
-            1,
-            &canonical_event(conversation_id, id1, 1),
-        );
-        let mut requested = first.clone();
-        requested.event_count = 2;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .expect("second writer transaction");
-        let second =
-            reconcile_event_stream(&transaction, &key_bundle, database_id, &first, &requested)
-                .expect("reconcile canonical suffix");
-        transaction.commit().expect("commit canonical suffix");
-        assert_eq!(second.event_stream_count, 1);
-        let only: String = connection
-            .query_row("SELECT event_seq FROM event_stream_index", [], |row| {
-                row.get(0)
-            })
-            .expect("new suffix row");
-        assert_eq!(only, encode_sequence(1));
-
-        let state = super::super::sqlite::RuntimeSqlite {
-            connection,
-            key_bundle: std::sync::Arc::new(key_bundle),
-            storage_path: PathBuf::from("/tmp/stream-unit-fixture.db"),
-            database_id,
-            admission_state: super::super::admission::RuntimeAdmissionState::Normal,
-            recovery_scan: None,
-            last_finished_recovery: None,
-        };
-        assert!(matches!(
-            acquire_backfill_pin(
-                &state,
-                RuntimeBackfillTarget::Conversation(conversation_id),
-                None,
-                100,
-            ),
-            Err(RuntimeStoreError::BackfillNeedSnapshot)
-        ));
-        let RuntimeBackfillPlan::Pinned(pin) = acquire_backfill_pin(
-            &state,
-            RuntimeBackfillTarget::Conversation(conversation_id),
-            Some(0),
-            100,
-        )
-        .expect("pin suffix after opaque boundary") else {
-            panic!("event one is a non-empty retained suffix");
-        };
-        let page = load_event_backfill_page(&state, &pin, Some(0), 100)
-            .expect("load retained canonical suffix");
-        assert!(page.complete);
-        assert_eq!(page.next_after, 1);
-        assert_eq!(page.events.len(), 1);
-        assert_eq!(page.events[0].event_seq, 1);
-    }
-
-    #[test]
-    fn pinned_reader_is_revoked_before_writer_trim_commits() {
-        let (mut connection, key_bundle, database_id, conversation_id) = fixture();
-        let mut ledger = RuntimeLedger {
-            catalog_high_water: Some(encode_sequence(0)),
-            conversation_count: 1,
-            ..RuntimeLedger::default()
-        };
-        for seq in 0..2 {
-            let event_id = {
-                let mut id = [0x60; 16];
-                id[15] = u8::try_from(seq + 1).expect("small seq");
-                super::super::RuntimeId::from_bytes(super::super::RuntimeIdKind::Event, id)
-                    .expect("event id")
-            };
-            insert_audit_event(
-                &connection,
-                &key_bundle,
-                database_id,
-                conversation_id,
-                seq,
-                &canonical_event(conversation_id, event_id, seq),
-            );
-            let mut requested = ledger.clone();
-            requested.event_count += 1;
-            let transaction = connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .expect("append transaction");
-            ledger =
-                reconcile_event_stream(&transaction, &key_bundle, database_id, &ledger, &requested)
-                    .expect("reconcile canonical event");
-            transaction.commit().expect("commit canonical event");
-        }
-        let pin_id = [0x77; 16];
-        connection
-            .execute(
-                "INSERT INTO temp.active_stream_pins (
-                     pin_id, scope, target_id, first_seq, through_seq,
-                     next_after_seq, expires_at_ms, state
-                 ) VALUES (?1, 'event', ?2, ?3, ?4, NULL, 999999, 'active')",
-                params![
-                    &pin_id[..],
-                    &conversation_id.as_bytes()[..],
-                    encode_sequence(0),
-                    encode_sequence(1),
-                ],
-            )
-            .expect("active reader pin");
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .expect("writer trim transaction");
-        trim_unrecorded_conversation_window(
-            &transaction,
-            conversation_id.as_bytes(),
-            true,
-            1,
-            MAX_EVENT_STREAM_BYTES_PER_CONVERSATION,
-        )
-        .expect("writer revokes reader and trims");
-        refresh_retention(&transaction, &key_bundle, conversation_id.as_bytes())
-            .expect("refresh retention");
-        transaction.commit().expect("writer commit is not blocked");
-        let state: String = connection
-            .query_row(
-                "SELECT state FROM temp.active_stream_pins WHERE pin_id = ?1",
-                [&pin_id[..]],
-                |row| row.get(0),
-            )
-            .expect("revoked pin tombstone");
-        assert_eq!(state, "revoked");
-        let retained: Vec<String> = connection
-            .prepare("SELECT event_seq FROM event_stream_index ORDER BY event_seq")
-            .expect("prepare retained rows")
-            .query_map([], |row| row.get(0))
-            .expect("query retained rows")
-            .collect::<Result<_, _>>()
-            .expect("collect retained rows");
-        assert_eq!(retained, [encode_sequence(1)]);
-    }
-
-    #[test]
-    fn event_stream_index_token_tamper_is_rejected_by_v4_integrity_scan() {
-        let (mut connection, key_bundle, database_id, conversation_id) = fixture();
-        let event_id = {
-            let mut id = [0x60; 16];
-            id[15] = 1;
-            super::super::RuntimeId::from_bytes(super::super::RuntimeIdKind::Event, id)
-                .expect("event id")
-        };
-        insert_audit_event(
-            &connection,
-            &key_bundle,
-            database_id,
-            conversation_id,
-            0,
-            &canonical_event(conversation_id, event_id, 0),
-        );
-        let current = RuntimeLedger {
-            catalog_high_water: Some(encode_sequence(0)),
-            conversation_count: 1,
-            event_count: 1,
-            ..RuntimeLedger::default()
-        };
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .expect("migration transaction");
-        let migrated = migrate_v4_rows(&transaction, &key_bundle, database_id, &current)
-            .expect("migrate event index");
-        transaction.commit().expect("commit event index");
-        connection
-            .execute(
-                "UPDATE event_stream_index SET metadata_token = zeroblob(32)",
-                [],
-            )
-            .expect("tamper index token");
-        assert!(matches!(
-            validate_v4_integrity(&connection, &key_bundle, database_id, &migrated),
-            Err(RuntimeStoreError::UnknownOrCorruptSchema)
-        ));
-    }
-
-    #[test]
-    fn every_v4_ledger_count_bytes_and_floor_is_recomputed() {
-        let (mut connection, key_bundle, database_id, conversation_id) = fixture();
-        let event_id = {
-            let mut id = [0x60; 16];
-            id[15] = 1;
-            super::super::RuntimeId::from_bytes(super::super::RuntimeIdKind::Event, id)
-                .expect("event id")
-        };
-        insert_audit_event(
-            &connection,
-            &key_bundle,
-            database_id,
-            conversation_id,
-            0,
-            &canonical_event(conversation_id, event_id, 0),
-        );
-        let current = RuntimeLedger {
-            catalog_high_water: Some(encode_sequence(0)),
-            conversation_count: 1,
-            event_count: 1,
-            ..RuntimeLedger::default()
-        };
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .expect("migration transaction");
-        let ledger = migrate_v4_rows(&transaction, &key_bundle, database_id, &current)
-            .expect("migrate v4 ledger");
-        transaction.commit().expect("commit v4 ledger");
-        assert_eq!(
-            ledger.catalog_retention_floor, None,
-            "legacy catalog state is represented by the ready baseline snapshot, not a retained delta"
-        );
-        validate_v4_integrity(&connection, &key_bundle, database_id, &ledger)
-            .expect("baseline ledger is coherent");
-
-        let mut corruptions = Vec::new();
-        let mut corrupted = ledger.clone();
-        corrupted.audit_event_logical_bytes += 1;
-        corruptions.push(corrupted);
-        let mut corrupted = ledger.clone();
-        corrupted.event_stream_count += 1;
-        corruptions.push(corrupted);
-        let mut corrupted = ledger.clone();
-        corrupted.event_stream_bytes += 1;
-        corruptions.push(corrupted);
-        let mut corrupted = ledger.clone();
-        corrupted.catalog_delta_count += 1;
-        corruptions.push(corrupted);
-        let mut corrupted = ledger.clone();
-        corrupted.catalog_delta_bytes += 1;
-        corruptions.push(corrupted);
-        let mut corrupted = ledger.clone();
-        corrupted.catalog_retention_floor = Some(encode_sequence(0));
-        corruptions.push(corrupted);
-        let mut corrupted = ledger.clone();
-        corrupted.snapshot_count += 1;
-        corruptions.push(corrupted);
-        let mut corrupted = ledger.clone();
-        corrupted.snapshot_bytes += 1;
-        corruptions.push(corrupted);
-        let mut corrupted = ledger.clone();
-        corrupted.publication_stream_count += 1;
-        corruptions.push(corrupted);
-        let mut corrupted = ledger.clone();
-        corrupted.publication_outbox_count += 1;
-        corruptions.push(corrupted);
-        let mut corrupted = ledger.clone();
-        corrupted.publication_outbox_bytes += 1;
-        corruptions.push(corrupted);
-
-        for corrupted in corruptions {
-            assert!(matches!(
-                validate_v4_integrity(&connection, &key_bundle, database_id, &corrupted),
-                Err(RuntimeStoreError::UnknownOrCorruptSchema)
-            ));
-        }
-    }
-}
+#[path = "stream/tests.rs"]
+mod tests;

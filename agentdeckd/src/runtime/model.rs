@@ -66,6 +66,7 @@ pub enum RuntimeStoreOperation {
     MigrateSchemaBeforeCommit,
     MigrateSchemaAfterCommit,
     Inspect,
+    StreamNotificationReadback,
     RecordEnrollmentReceiptBeforeCommit,
     RecordEnrollmentReceiptAfterCommit,
     CreateConversationBeforeCommit,
@@ -106,6 +107,8 @@ pub enum RuntimeStoreOperation {
     StoreSnapshotAfterCommit,
     CreatePublicationStreamBeforeCommit,
     CreatePublicationStreamAfterCommit,
+    RotatePublicationStreamBeforeCommit,
+    RotatePublicationStreamAfterCommit,
     FreezePublicationBeforeCommit,
     FreezePublicationAfterCommit,
     CommitPublicationBeforeCommit,
@@ -336,6 +339,7 @@ pub enum RuntimeCommitOperation {
     ExpireApproval,
     StoreSnapshot,
     CreatePublicationStream,
+    RotatePublicationStream,
     FreezePublication,
     CommitPublication,
     AcknowledgePublication,
@@ -1038,6 +1042,8 @@ pub enum RuntimeStoreError {
     WorkerBusy { lane: RuntimeStoreLane },
     #[error("runtime store worker stopped before replying")]
     WorkerStopped,
+    #[error("runtime store watch incarnation entropy is unavailable")]
+    WatchIncarnationEntropyUnavailable,
     #[error("runtime store worker did not shut down before its hard deadline")]
     ShutdownTimedOut,
     #[error("runtime store shutdown is already in progress")]
@@ -1128,6 +1134,10 @@ pub enum RuntimeStoreError {
     PublicationNeedsSnapshot,
     #[error("runtime publication generation, sequence, range, or blob hash does not match")]
     PublicationMismatch,
+    #[error("runtime publication sender counter is exhausted and requires key/scope rotation")]
+    PublicationCounterExhausted,
+    #[error("runtime publication was already durably acknowledged and must not be resent")]
+    PublicationAlreadyAcknowledged,
     #[error("runtime timestamp or derived deadline is outside SQLite i64 range")]
     TimeOutOfRange,
     #[error(
@@ -1184,6 +1194,7 @@ impl RuntimeStoreError {
             | Self::StoreAlreadyOpen
             | Self::RescueReceiptConflict
             | Self::WorkerStopped
+            | Self::WatchIncarnationEntropyUnavailable
             | Self::ShutdownTimedOut
             | Self::ShutdownInProgress
             | Self::CommitOutcomeUnknown { .. }
@@ -1193,7 +1204,11 @@ impl RuntimeStoreError {
             | Self::CapacityProbe(_)
             | Self::Clock(_)
             | Self::Io(_)
-            | Self::Sqlite(_) => "daemon.runtime.store_unavailable",
+            | Self::Sqlite(_)
+            | Self::Cipher(CipherError::ReadCapabilityClosed)
+            | Self::Cipher(CipherError::ReadCapabilityPoisoned) => {
+                "daemon.runtime.store_unavailable"
+            }
             Self::SafetyOnly => "daemon.runtime.safety_only",
             Self::DiskLow { .. } => "daemon.runtime.disk_low",
             Self::StoreFull { .. } | Self::PageLimit { .. } => "daemon.runtime.store_full",
@@ -1232,6 +1247,8 @@ impl RuntimeStoreError {
             Self::BackfillNeedSnapshot | Self::PublicationNeedsSnapshot => {
                 "daemon.runtime.snapshot_required"
             }
+            Self::PublicationAlreadyAcknowledged => "daemon.runtime.publication_acknowledged",
+            Self::PublicationCounterExhausted => "daemon.runtime.publication_counter_exhausted",
             Self::CommandExpired => "daemon.command.queue_expired",
         }
     }

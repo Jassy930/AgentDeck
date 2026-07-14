@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::runtime::model::{ConversationLifecycle, RuntimeStoreError};
 
-use super::cipher::RuntimeKeyBundle;
+use super::cipher::{ROW_BLOB_V1_OVERHEAD_LEN, RuntimeKeyBundle};
 use super::identity::{RuntimeId, RuntimeIdKind};
 use super::sequence::{SequenceScope, decode_sequence, encode_sequence};
 use super::sqlite::RuntimeLedger;
@@ -18,6 +18,104 @@ pub(crate) const MAX_CATALOG_DELTAS: u64 = 10_000;
 pub(crate) const MAX_CATALOG_DELTA_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CATALOG_DELTA_ITEM_BYTES: usize = 64 * 1024 * 1024;
 const CATALOG_TOKEN_DOMAIN: &[u8] = b"catalog.journal.v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct AuthenticatedCatalogDeltaRange {
+    pub(super) count: u64,
+    pub(super) logical_bytes: u64,
+}
+
+/// 只读取并认证 refresh 所需区间的 delta metadata，不 materialize sealed/plaintext
+/// payload。威胁场景：旧 catalog cursor cache 已占住 build budget 时，若先打开完整
+/// snapshot/delta 再决定 overload，会让两个合法请求把瞬时 retained memory 推过全局
+/// 128 MiB 上界。
+pub(super) fn summarize_authenticated_delta_range(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    first: u64,
+    through: u64,
+) -> Result<AuthenticatedCatalogDeltaRange, RuntimeStoreError> {
+    let expected_count = through
+        .checked_sub(first)
+        .and_then(|count| count.checked_add(1))
+        .ok_or(RuntimeStoreError::InvalidStateTransition)?;
+    if expected_count > MAX_CATALOG_DELTAS {
+        return Err(RuntimeStoreError::BackfillNeedSnapshot);
+    }
+    let first_encoded = encode_sequence(first);
+    let through_encoded = encode_sequence(through);
+    let mut statement = connection.prepare(
+        "SELECT catalog_revision, conversation_id, change_kind, logical_delta_bytes,
+                created_at_ms, metadata_token, length(sealed_delta)
+         FROM catalog_journal
+         WHERE catalog_revision >= ?1 AND catalog_revision <= ?2
+         ORDER BY catalog_revision",
+    )?;
+    let rows = statement.query_map(params![first_encoded, through_encoded], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, Vec<u8>>(5)?,
+            row.get::<_, i64>(6)?,
+        ))
+    })?;
+    let mut count = 0_u64;
+    let mut logical_bytes = 0_u64;
+    for row in rows {
+        let (revision, conversation_id, change_kind, row_bytes, created_at_ms, token, blob_len) =
+            row?;
+        let expected_revision = first
+            .checked_add(count)
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        if decode_sequence(SequenceScope::CatalogRevision, &revision)? != expected_revision
+            || !matches!(change_kind.as_str(), "upserted" | "removed")
+        {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        runtime_conversation_id(&conversation_id)?;
+        let row_bytes =
+            u64::try_from(row_bytes).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+        let created_at_ms =
+            u64::try_from(created_at_ms).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+        if row_bytes == 0 || row_bytes > MAX_CATALOG_DELTA_ITEM_BYTES as u64 {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        let expected_blob_len = usize::try_from(row_bytes)
+            .ok()
+            .and_then(|bytes| bytes.checked_add(ROW_BLOB_V1_OVERHEAD_LEN))
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        if usize::try_from(blob_len).ok() != Some(expected_blob_len) {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        let expected_token = catalog_token(
+            key_bundle,
+            &revision,
+            &conversation_id,
+            change_kind.as_bytes(),
+            row_bytes,
+            created_at_ms,
+        )?;
+        if token.as_slice() != expected_token {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        count = count
+            .checked_add(1)
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        logical_bytes = logical_bytes
+            .checked_add(row_bytes)
+            .ok_or(RuntimeStoreError::PayloadTooLarge)?;
+    }
+    if count != expected_count {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(AuthenticatedCatalogDeltaRange {
+        count,
+        logical_bytes,
+    })
+}
 
 /// `runtime_meta.catalog_high_water` 的推进与 delta 冻结共享同一 transaction。
 /// v1/v2/v3 migration 的 high-water 不推进，因此不会伪造历史 delta。
@@ -75,6 +173,7 @@ pub(super) fn reconcile_catalog_journal(
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
 
+    let mut trim_now_ms = 0_u64;
     for (offset, (conversation_id, revision)) in rows.into_iter().enumerate() {
         let revision_value = decode_sequence(SequenceScope::CatalogRevision, &revision)?;
         if revision_value
@@ -96,6 +195,7 @@ pub(super) fn reconcile_catalog_journal(
         if conversation.catalog_revision != revision_value {
             return Err(RuntimeStoreError::UnknownOrCorruptSchema);
         }
+        trim_now_ms = trim_now_ms.max(conversation.updated_at_ms);
         let delta = CatalogDelta {
             catalog_revision: revision_value,
             changes: vec![CatalogChange::Upserted {
@@ -155,7 +255,7 @@ pub(super) fn reconcile_catalog_journal(
     }
 
     let mut floor = previous.catalog_retention_floor.clone();
-    trim_catalog_window(transaction, &mut floor)?;
+    trim_catalog_window(transaction, key_bundle, &mut floor, trim_now_ms)?;
     let (count, bytes): (i64, i64) = transaction.query_row(
         "SELECT COUNT(*), COALESCE(SUM(logical_delta_bytes), 0) FROM catalog_journal",
         [],
@@ -172,11 +272,15 @@ pub(super) fn reconcile_catalog_journal(
 
 fn trim_catalog_window(
     transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
     floor: &mut Option<String>,
+    now_ms: u64,
 ) -> Result<(), RuntimeStoreError> {
     trim_catalog_window_with_limits(
         transaction,
+        key_bundle,
         floor,
+        now_ms,
         MAX_CATALOG_DELTAS,
         MAX_CATALOG_DELTA_BYTES,
     )
@@ -184,7 +288,9 @@ fn trim_catalog_window(
 
 fn trim_catalog_window_with_limits(
     transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
     floor: &mut Option<String>,
+    now_ms: u64,
     max_deltas: u64,
     max_bytes: u64,
 ) -> Result<(), RuntimeStoreError> {
@@ -208,7 +314,13 @@ fn trim_catalog_window_with_limits(
             )
             .optional()?
             .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-        super::stream::revoke_stream_pins_covering(transaction, "catalog", None, &victim)?;
+        super::retention::authorize_trim(
+            transaction,
+            key_bundle,
+            super::retention::RetentionTarget::Catalog,
+            &victim,
+            now_ms,
+        )?;
         if transaction.execute(
             "DELETE FROM catalog_journal WHERE catalog_revision = ?1",
             [&victim],
@@ -467,7 +579,7 @@ mod tests {
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 
     #[test]
-    fn catalog_gc_revokes_covering_pin_before_trimming_writer_transaction() {
+    fn catalog_gc_preserves_pin_and_rows_without_durable_replacement() {
         let root = std::env::temp_dir().join(format!(
             "agentdeck-catalog-pin-{}-{}",
             std::process::id(),
@@ -504,8 +616,15 @@ mod tests {
             let descriptor =
                 super::super::journal::canonical_conversation_descriptor(&input.descriptor)
                     .expect("canonical descriptor");
-            super::super::journal::create_conversation(&mut state, &config, input, descriptor)
-                .expect("create catalog row");
+            let mut effects = crate::runtime::events::CommandStreamEffects::default();
+            super::super::journal::create_conversation(
+                &mut state,
+                &config,
+                input,
+                descriptor,
+                &mut effects,
+            )
+            .expect("create catalog row");
         }
         let initial_ledger = super::super::sqlite::load_runtime_ledger(
             &state.connection,
@@ -534,10 +653,21 @@ mod tests {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .expect("catalog GC transaction");
         let mut floor = None;
-        trim_catalog_window_with_limits(&transaction, &mut floor, 1, MAX_CATALOG_DELTA_BYTES)
-            .expect("catalog writer revokes pin and trims");
-        transaction.commit().expect("commit catalog trim");
-        assert_eq!(floor, Some(encode_sequence(1)));
+        assert!(matches!(
+            trim_catalog_window_with_limits(
+                &transaction,
+                state.key_bundle.as_ref(),
+                &mut floor,
+                10,
+                1,
+                MAX_CATALOG_DELTA_BYTES,
+            ),
+            Err(RuntimeStoreError::WorkerBusy {
+                lane: crate::runtime::model::RuntimeStoreLane::Normal,
+            })
+        ));
+        drop(transaction);
+        assert_eq!(floor, None);
         let state_text: String = state
             .connection
             .query_row(
@@ -545,24 +675,99 @@ mod tests {
                 [&pin_id[..]],
                 |row| row.get(0),
             )
-            .expect("pin tombstone");
-        assert_eq!(state_text, "revoked");
-        let revision: String = state
+            .expect("active pin");
+        assert_eq!(state_text, "active");
+        let revisions: Vec<String> = state
             .connection
-            .query_row("SELECT catalog_revision FROM catalog_journal", [], |row| {
-                row.get(0)
-            })
-            .expect("retained catalog row");
-        assert_eq!(revision, encode_sequence(1));
+            .prepare("SELECT catalog_revision FROM catalog_journal ORDER BY catalog_revision")
+            .expect("prepare retained catalog rows")
+            .query_map([], |row| row.get(0))
+            .expect("query retained catalog rows")
+            .collect::<Result<_, _>>()
+            .expect("collect retained catalog rows");
+        assert_eq!(revisions, [encode_sequence(0), encode_sequence(1)]);
+
+        state
+            .connection
+            .execute(
+                "DELETE FROM temp.active_stream_pins WHERE pin_id = ?1",
+                [&pin_id[..]],
+            )
+            .expect("release catalog pin");
+
+        let publication_stream_id = [0x71; 16];
+        let publication_generation = [0x72; 16];
+        super::super::publication::create_publication_stream(
+            &mut state,
+            &config,
+            publication_stream_id,
+            super::super::publication::PublicationScope::Catalog,
+            [0x73; 16],
+            publication_generation,
+            10,
+        )
+        .expect("create still-unfrozen catalog publication stream");
 
         let transaction = state
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .expect("empty catalog GC transaction");
-        trim_catalog_window_with_limits(&transaction, &mut floor, 0, 0)
-            .expect("trim final catalog row");
-        transaction.commit().expect("commit empty catalog trim");
-        assert_eq!(floor, None);
+            .expect("uncovered catalog GC transaction");
+        assert!(matches!(
+            trim_catalog_window_with_limits(
+                &transaction,
+                state.key_bundle.as_ref(),
+                &mut floor,
+                10,
+                1,
+                MAX_CATALOG_DELTA_BYTES,
+            ),
+            Err(RuntimeStoreError::PublicationNeedsSnapshot)
+        ));
+        drop(transaction);
+        let retained_count: i64 = state
+            .connection
+            .query_row("SELECT COUNT(*) FROM catalog_journal", [], |row| row.get(0))
+            .expect("count catalog rows after rejected trim");
+        assert_eq!(retained_count, 2);
+
+        super::super::publication::freeze_publication(
+            &mut state,
+            &config,
+            super::super::publication::FreezePublicationRequest {
+                publication_id: [0x74; 16],
+                publication_stream_id,
+                generation: publication_generation,
+                counter_scope_token: [0x75; 32],
+                sender_counter: 1,
+                inner_after: None,
+                inner_through: Some(0),
+                payload_kind: super::super::publication::PublicationPayloadKind::Catalog,
+                blob: b"exact-catalog-victim-zero".to_vec(),
+            },
+            11,
+        )
+        .expect("freeze exact replacement for catalog victim zero");
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("covered catalog GC transaction");
+        assert!(matches!(
+            trim_catalog_window_with_limits(
+                &transaction,
+                state.key_bundle.as_ref(),
+                &mut floor,
+                11,
+                1,
+                MAX_CATALOG_DELTA_BYTES,
+            ),
+            Err(RuntimeStoreError::PublicationNeedsSnapshot)
+        ));
+        drop(transaction);
+        let retained_count: i64 = state
+            .connection
+            .query_row("SELECT COUNT(*) FROM catalog_journal", [], |row| row.get(0))
+            .expect("count catalog rows after outbox-only rejected trim");
+        assert_eq!(retained_count, 2);
         drop(state);
         let _ = fs::remove_dir_all(root);
     }
@@ -605,10 +810,54 @@ mod tests {
             let descriptor =
                 super::super::journal::canonical_conversation_descriptor(&input.descriptor)
                     .expect("canonical descriptor");
-            super::super::journal::create_conversation(&mut state, &config, input, descriptor)
-                .expect("create catalog row");
+            let mut effects = crate::runtime::events::CommandStreamEffects::default();
+            super::super::journal::create_conversation(
+                &mut state,
+                &config,
+                input,
+                descriptor,
+                &mut effects,
+            )
+            .expect("create catalog row");
         }
 
+        let publication_stream_id = [0x37; 16];
+        let publication_generation = [0x38; 16];
+        super::super::publication::create_publication_stream(
+            &mut state,
+            &config,
+            publication_stream_id,
+            super::super::publication::PublicationScope::Catalog,
+            [0x39; 16],
+            publication_generation,
+            10,
+        )
+        .expect("create catalog replacement stream");
+        super::super::publication::freeze_publication(
+            &mut state,
+            &config,
+            super::super::publication::FreezePublicationRequest {
+                publication_id: [0x3a; 16],
+                publication_stream_id,
+                generation: publication_generation,
+                counter_scope_token: [0x3b; 32],
+                sender_counter: 1,
+                inner_after: None,
+                inner_through: Some(4),
+                payload_kind: super::super::publication::PublicationPayloadKind::Catalog,
+                blob: b"catalog-retention-boundary-replacement".to_vec(),
+            },
+            11,
+        )
+        .expect("freeze replacement for catalog revisions zero through four");
+
+        super::super::snapshot::refresh_catalog_snapshot(
+            &mut state,
+            &config,
+            None,
+            agentdeck_protocol::runtime::StreamCursor::At(6),
+        )
+        .expect("ready catalog snapshot covers revisions zero through six");
         let previous = super::super::sqlite::load_runtime_ledger(
             &state.connection,
             state.key_bundle.as_ref(),
@@ -623,8 +872,15 @@ mod tests {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .expect("catalog floor transaction");
         let mut floor = previous.catalog_retention_floor.clone();
-        trim_catalog_window_with_limits(&transaction, &mut floor, 2, MAX_CATALOG_DELTA_BYTES)
-            .expect("retain catalog revisions five and six");
+        trim_catalog_window_with_limits(
+            &transaction,
+            key_bundle.as_ref(),
+            &mut floor,
+            11,
+            2,
+            MAX_CATALOG_DELTA_BYTES,
+        )
+        .expect("retain catalog revisions five and six");
         assert_eq!(floor, Some(encode_sequence(5)));
         let (count, bytes): (i64, i64) = transaction
             .query_row(
@@ -638,7 +894,7 @@ mod tests {
         next.catalog_delta_count = u64::try_from(count).expect("catalog count");
         next.catalog_delta_bytes = u64::try_from(bytes).expect("catalog bytes");
         next.catalog_retention_floor = floor;
-        super::super::sqlite::update_runtime_ledger(
+        let _pending_targets = super::super::sqlite::update_runtime_ledger(
             &transaction,
             key_bundle.as_ref(),
             database_id,
@@ -669,6 +925,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             [5, 6]
         );
+        super::super::stream::complete_backfill_page(&state, page.completion(), 100)
+            .expect("ACK retained catalog page");
 
         drop(state);
         let _ = fs::remove_dir_all(root);

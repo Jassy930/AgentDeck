@@ -3,12 +3,14 @@
 //! 所有 ID/high-water 分配、command 状态变化和 canonical event 都只在单一
 //! `BEGIN IMMEDIATE` 中发生；公开 outcome 只在 COMMIT 成功后返回。
 
+use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use zeroize::Zeroizing;
 
 use crate::runtime::adapter_state::AdapterStateNamespace;
+use crate::runtime::events::{CommandStreamEffects, PendingStreamTargets};
 use crate::runtime::model::{
     AcceptCommand, AcceptOutcome, AcceptedTerminationReason, AuthorizeExecutionRelease,
     COMMAND_LEDGER_RETENTION_MS, COMMAND_QUEUE_TTL_MS, CommandReceiptRecord,
@@ -226,7 +228,13 @@ pub(super) fn bind_adapter_state(
                 .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
         }
     }
-    sqlite::update_runtime_ledger(&transaction, key_bundle, database_id, &ledger, &next_ledger)?;
+    let _pending_targets = sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next_ledger,
+    )?;
     config
         .fault_injector
         .before_operation(RuntimeStoreOperation::BindAdapterStateBeforeCommit)?;
@@ -461,6 +469,7 @@ pub(crate) fn create_conversation(
     config: &RuntimeStoreConfig,
     input: NewConversation,
     descriptor_bytes: Zeroizing<Vec<u8>>,
+    effects: &mut CommandStreamEffects,
 ) -> Result<CreateConversationOutcome, RuntimeStoreError> {
     ensure_kind(input.conversation_id, RuntimeIdKind::Conversation)?;
     ensure_kind(input.adapter_state_key, RuntimeIdKind::AdapterState)?;
@@ -597,11 +606,22 @@ pub(crate) fn create_conversation(
         .conversation_count
         .checked_add(1)
         .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-    sqlite::update_runtime_ledger(&transaction, key_bundle, database_id, &ledger, &next_ledger)?;
+    let pending_targets = sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next_ledger,
+    )?;
     config
         .fault_injector
         .before_operation(RuntimeStoreOperation::CreateConversationBeforeCommit)?;
-    commit_transaction(transaction, RuntimeCommitOperation::CreateConversation)?;
+    commit_transaction_with_effects(
+        transaction,
+        RuntimeCommitOperation::CreateConversation,
+        pending_targets,
+        effects,
+    )?;
     sqlite::latch_post_commit_capacity(state, config);
     after_commit(
         config,
@@ -628,6 +648,7 @@ pub(crate) fn accept_command(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
     input: AcceptCommand,
+    effects: &mut CommandStreamEffects,
 ) -> Result<AcceptOutcome, RuntimeStoreError> {
     ensure_kind(input.conversation_id, RuntimeIdKind::Conversation)?;
     validate_payload_len(input.payload.len(), MAX_COMMAND_PAYLOAD_BYTES)?;
@@ -637,7 +658,7 @@ pub(crate) fn accept_command(
         ));
     }
     let accepted_at_ms = config.clock.now_ms()?;
-    expire_accepted_commands(state, config, accepted_at_ms)?;
+    expire_accepted_commands(state, config, accepted_at_ms, effects)?;
     let accepted_at = sqlite_time(accepted_at_ms)?;
     let expires_at_ms = accepted_at_ms
         .checked_add(COMMAND_QUEUE_TTL_MS)
@@ -836,11 +857,22 @@ pub(crate) fn accept_command(
         .accepted_payload_bytes
         .checked_add(logical_payload_bytes)
         .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-    sqlite::update_runtime_ledger(&transaction, key_bundle, database_id, &ledger, &next_ledger)?;
+    let pending_targets = sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next_ledger,
+    )?;
     config
         .fault_injector
         .before_operation(RuntimeStoreOperation::AcceptCommandBeforeCommit)?;
-    commit_transaction(transaction, RuntimeCommitOperation::AcceptCommand)?;
+    commit_transaction_with_effects(
+        transaction,
+        RuntimeCommitOperation::AcceptCommand,
+        pending_targets,
+        effects,
+    )?;
     sqlite::latch_post_commit_capacity(state, config);
     after_commit(
         config,
@@ -873,6 +905,7 @@ pub(crate) fn mark_started_with_event(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
     input: StartCommand,
+    effects: &mut CommandStreamEffects,
 ) -> Result<StartOutcome, RuntimeStoreError> {
     ensure_kind(input.conversation_id, RuntimeIdKind::Conversation)?;
     ensure_kind(input.command_id, RuntimeIdKind::Command)?;
@@ -890,7 +923,7 @@ pub(crate) fn mark_started_with_event(
         input.event_payload.len(),
     ])?;
     let started_at_ms = config.clock.now_ms()?;
-    expire_accepted_commands(state, config, started_at_ms)?;
+    expire_accepted_commands(state, config, started_at_ms, effects)?;
     let started_at = sqlite_time(started_at_ms)?;
     let nonce_bytes = Zeroizing::new(canonical_fields(&[
         input.command_id.as_bytes(),
@@ -1192,11 +1225,22 @@ pub(crate) fn mark_started_with_event(
         .started_without_fence_count
         .checked_add(1)
         .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-    sqlite::update_runtime_ledger(&transaction, key_bundle, database_id, &ledger, &next_ledger)?;
+    let pending_targets = sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next_ledger,
+    )?;
     config
         .fault_injector
         .before_operation(RuntimeStoreOperation::StartCommandBeforeCommit)?;
-    commit_transaction(transaction, RuntimeCommitOperation::StartCommand)?;
+    commit_transaction_with_effects(
+        transaction,
+        RuntimeCommitOperation::StartCommand,
+        pending_targets,
+        effects,
+    )?;
     sqlite::latch_post_commit_capacity(state, config);
     after_commit(
         config,
@@ -1353,7 +1397,13 @@ pub(crate) fn persist_execution_fence(
         .started_without_release_count
         .checked_add(1)
         .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-    sqlite::update_runtime_ledger(&transaction, key_bundle, database_id, &ledger, &next_ledger)?;
+    let _pending_targets = sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next_ledger,
+    )?;
     config
         .fault_injector
         .before_operation(RuntimeStoreOperation::PersistFenceBeforeCommit)?;
@@ -1485,7 +1535,13 @@ pub(crate) fn authorize_execution_release(
         .started_released_count
         .checked_add(1)
         .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-    sqlite::update_runtime_ledger(&transaction, key_bundle, database_id, &ledger, &next_ledger)?;
+    let _pending_targets = sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next_ledger,
+    )?;
     config
         .fault_injector
         .before_operation(RuntimeStoreOperation::AuthorizeExecutionReleaseBeforeCommit)?;
@@ -1509,6 +1565,7 @@ pub(crate) fn complete_command_with_event(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
     input: CompleteCommand,
+    effects: &mut CommandStreamEffects,
 ) -> Result<CompleteOutcome, RuntimeStoreError> {
     ensure_kind(input.conversation_id, RuntimeIdKind::Conversation)?;
     ensure_kind(input.command_id, RuntimeIdKind::Command)?;
@@ -1744,11 +1801,19 @@ pub(crate) fn complete_command_with_event(
         .started_released_count
         .checked_sub(1)
         .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-    sqlite::update_runtime_ledger(&transaction, key_bundle, database_id, &ledger, &next_ledger)?;
+    let pending_targets = sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next_ledger,
+    )?;
     config
         .fault_injector
         .before_operation(RuntimeStoreOperation::CompleteCommandBeforeCommit)?;
-    commit_transaction(transaction, RuntimeCommitOperation::CompleteCommand)?;
+    let commit_result = commit_transaction(transaction, RuntimeCommitOperation::CompleteCommand);
+    effects.record_commit_result(pending_targets, &commit_result);
+    commit_result?;
     sqlite::latch_post_commit_capacity(state, config);
     after_commit(
         config,
@@ -1780,6 +1845,7 @@ pub(crate) fn terminate_started_before_release(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
     input: TerminateStartedBeforeRelease,
+    effects: &mut CommandStreamEffects,
 ) -> Result<TerminateStartedBeforeReleaseOutcome, RuntimeStoreError> {
     ensure_kind(input.conversation_id, RuntimeIdKind::Conversation)?;
     ensure_kind(input.command_id, RuntimeIdKind::Command)?;
@@ -2043,13 +2109,21 @@ pub(crate) fn terminate_started_before_release(
             .checked_sub(1)
             .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
     }
-    sqlite::update_runtime_ledger(&transaction, key_bundle, database_id, &ledger, &next_ledger)?;
+    let pending_targets = sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next_ledger,
+    )?;
     config
         .fault_injector
         .before_operation(RuntimeStoreOperation::TerminateStartedBeforeReleaseBeforeCommit)?;
-    commit_transaction(
+    commit_transaction_with_effects(
         transaction,
         RuntimeCommitOperation::TerminateStartedBeforeRelease,
+        pending_targets,
+        effects,
     )?;
     sqlite::latch_post_commit_capacity(state, config);
     after_commit(
@@ -2083,6 +2157,7 @@ pub(crate) fn terminate_accepted_command(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
     input: TerminateAcceptedCommand,
+    effects: &mut CommandStreamEffects,
 ) -> Result<TerminateAcceptedOutcome, RuntimeStoreError> {
     ensure_kind(input.conversation_id, RuntimeIdKind::Conversation)?;
     ensure_kind(input.command_id, RuntimeIdKind::Command)?;
@@ -2255,13 +2330,21 @@ pub(crate) fn terminate_accepted_command(
         .event_count
         .checked_add(1)
         .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-    sqlite::update_runtime_ledger(&transaction, key_bundle, database_id, &ledger, &next_ledger)?;
+    let pending_targets = sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next_ledger,
+    )?;
     config
         .fault_injector
         .before_operation(RuntimeStoreOperation::TerminateAcceptedCommandBeforeCommit)?;
-    commit_transaction(
+    commit_transaction_with_effects(
         transaction,
         RuntimeCommitOperation::TerminateAcceptedCommand,
+        pending_targets,
+        effects,
     )?;
     sqlite::latch_post_commit_capacity(state, config);
     after_commit(
@@ -2352,6 +2435,7 @@ fn expire_accepted_commands(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
     observed_at_ms: u64,
+    effects: &mut CommandStreamEffects,
 ) -> Result<(), RuntimeStoreError> {
     let observed_at = sqlite_time(observed_at_ms)?;
     let database_id = state.database_id;
@@ -2509,11 +2593,22 @@ fn expire_accepted_commands(
             .checked_add(1)
             .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
     }
-    sqlite::update_runtime_ledger(&transaction, key_bundle, database_id, &ledger, &next_ledger)?;
+    let pending_targets = sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next_ledger,
+    )?;
     config
         .fault_injector
         .before_operation(RuntimeStoreOperation::ExpireCommandsBeforeCommit)?;
-    commit_transaction(transaction, RuntimeCommitOperation::ExpireCommands)?;
+    commit_transaction_with_effects(
+        transaction,
+        RuntimeCommitOperation::ExpireCommands,
+        pending_targets,
+        effects,
+    )?;
     sqlite::latch_post_commit_capacity(state, config);
     after_commit(
         config,
@@ -2525,6 +2620,7 @@ fn expire_accepted_commands(
 pub(crate) fn begin_recovery_scan(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
+    effects: &mut CommandStreamEffects,
 ) -> Result<RecoveryCursor, RuntimeStoreError> {
     if let Some(scan) = state.recovery_scan.as_ref() {
         if scan.last_cursor.is_none() {
@@ -2538,7 +2634,7 @@ pub(crate) fn begin_recovery_scan(
     // until finish_recovery_scan verifies the cumulative authenticated ledger counts.
     validate_store_integrity(&state.connection, &state.key_bundle, state.database_id)?;
     let observed_at_ms = config.clock.now_ms()?;
-    expire_accepted_commands(state, config, observed_at_ms)?;
+    expire_accepted_commands(state, config, observed_at_ms, effects)?;
     validate_store_integrity(&state.connection, &state.key_bundle, state.database_id)?;
 
     let ledger =
@@ -3017,6 +3113,198 @@ fn load_optional_conversation(
     }
 }
 
+const AUTHENTICATED_EVENT_HIGH_WATER_QUERY: &str =
+    "SELECT adapter_state_key, catalog_revision, command_high_water,
+            event_high_water, lifecycle, created_at_ms, updated_at_ms,
+            accepted_count, metadata_token
+     FROM conversations WHERE conversation_id = ?1";
+
+#[cfg(test)]
+std::thread_local! {
+    static AUTHENTICATED_EVENT_HIGH_WATER_QUERY_COUNT: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn reset_authenticated_event_high_water_query_count() {
+    AUTHENTICATED_EVENT_HIGH_WATER_QUERY_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn authenticated_event_high_water_query_count() -> u64 {
+    AUTHENTICATED_EVENT_HIGH_WATER_QUERY_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn observe_authenticated_event_high_water_query() {
+    AUTHENTICATED_EVENT_HIGH_WATER_QUERY_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(not(test))]
+fn observe_authenticated_event_high_water_query() {}
+
+struct RawConversationEventHighWaterMetadata {
+    adapter_state_key: Vec<u8>,
+    catalog_revision: String,
+    command_high_water: Option<String>,
+    event_high_water: Option<String>,
+    lifecycle: String,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    accepted_count: i64,
+    metadata_token: Vec<u8>,
+}
+
+fn read_conversation_event_high_water_metadata(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<RawConversationEventHighWaterMetadata> {
+    Ok(RawConversationEventHighWaterMetadata {
+        adapter_state_key: row.get(offset)?,
+        catalog_revision: row.get(offset + 1)?,
+        command_high_water: row.get(offset + 2)?,
+        event_high_water: row.get(offset + 3)?,
+        lifecycle: row.get(offset + 4)?,
+        created_at_ms: row.get(offset + 5)?,
+        updated_at_ms: row.get(offset + 6)?,
+        accepted_count: row.get(offset + 7)?,
+        metadata_token: row.get(offset + 8)?,
+    })
+}
+
+fn authenticate_conversation_event_high_water_metadata(
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    conversation_id: RuntimeId,
+    raw: RawConversationEventHighWaterMetadata,
+) -> Result<Option<u64>, RuntimeStoreError> {
+    let adapter_state_key = runtime_id(RuntimeIdKind::AdapterState, raw.adapter_state_key)?;
+    let catalog_revision = decode_sequence(SequenceScope::CatalogRevision, &raw.catalog_revision)?;
+    let command_high_water = raw
+        .command_high_water
+        .as_deref()
+        .map(|value| decode_sequence(SequenceScope::CommandSeq, value))
+        .transpose()?;
+    let event_high_water = raw
+        .event_high_water
+        .as_deref()
+        .map(|value| decode_sequence(SequenceScope::EventSeq, value))
+        .transpose()?;
+    let lifecycle = parse_lifecycle(&raw.lifecycle)?;
+    let created_at_ms = runtime_time(raw.created_at_ms)?;
+    let updated_at_ms = runtime_time(raw.updated_at_ms)?;
+    let accepted_command_count =
+        u32::try_from(raw.accepted_count).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let expected = conversation_metadata_token(
+        key_bundle,
+        conversation_id,
+        adapter_state_key,
+        catalog_revision,
+        command_high_water,
+        event_high_water,
+        accepted_command_count,
+        lifecycle,
+        created_at_ms,
+        updated_at_ms,
+    )?;
+    if raw.metadata_token.as_slice() != expected {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(event_high_water)
+}
+
+/// Snapshot directory 只需要 parent 的 authenticated event HWM。该读取复用
+/// conversation metadata MAC，但不选择、复制或解密 `sealed_descriptor`；请求
+/// target 的完整 cut 仍由 `load_conversation` 认证。
+pub(super) fn load_authenticated_conversation_event_high_water(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    conversation_id: RuntimeId,
+) -> Result<Option<u64>, RuntimeStoreError> {
+    ensure_kind(conversation_id, RuntimeIdKind::Conversation)?;
+    observe_authenticated_event_high_water_query();
+    let raw = connection
+        .query_row(
+            AUTHENTICATED_EVENT_HIGH_WATER_QUERY,
+            [&conversation_id.as_bytes()[..]],
+            |row| read_conversation_event_high_water_metadata(row, 0),
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => RuntimeStoreError::ConversationNotFound,
+            other => RuntimeStoreError::Sqlite(other),
+        })?;
+    authenticate_conversation_event_high_water_metadata(key_bundle, conversation_id, raw)
+}
+
+/// Snapshot directory 的 conversation parents 已经受 1,024 行硬上界约束；
+/// 用一个 bounded `IN` query 读回并逐行认证 metadata MAC，避免唯一 worker
+/// 对同一 directory 执行 N 次独立 SELECT。
+pub(super) fn load_authenticated_conversation_event_high_waters(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    conversation_ids: &[RuntimeId],
+) -> Result<HashMap<RuntimeId, Option<u64>>, RuntimeStoreError> {
+    if conversation_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut expected_ids = HashSet::with_capacity(conversation_ids.len());
+    for conversation_id in conversation_ids {
+        ensure_kind(*conversation_id, RuntimeIdKind::Conversation)?;
+        if !expected_ids.insert(*conversation_id) {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+    }
+    let placeholders = std::iter::repeat_n("?", conversation_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT conversation_id, adapter_state_key, catalog_revision, command_high_water,
+                event_high_water, lifecycle, created_at_ms, updated_at_ms,
+                accepted_count, metadata_token
+         FROM conversations
+         WHERE conversation_id IN ({placeholders})
+         ORDER BY conversation_id"
+    );
+    observe_authenticated_event_high_water_query();
+    let mut statement = connection.prepare(&query)?;
+    let rows = statement.query_map(
+        rusqlite::params_from_iter(
+            conversation_ids
+                .iter()
+                .map(|conversation_id| &conversation_id.as_bytes()[..]),
+        ),
+        |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                read_conversation_event_high_water_metadata(row, 1)?,
+            ))
+        },
+    )?;
+    let mut high_waters = HashMap::with_capacity(conversation_ids.len());
+    for row in rows {
+        let (conversation_id, raw) = row?;
+        let conversation_id = runtime_id(RuntimeIdKind::Conversation, conversation_id)?;
+        if !expected_ids.contains(&conversation_id)
+            || high_waters
+                .insert(
+                    conversation_id,
+                    authenticate_conversation_event_high_water_metadata(
+                        key_bundle,
+                        conversation_id,
+                        raw,
+                    )?,
+                )
+                .is_some()
+        {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+    }
+    if high_waters.len() != expected_ids.len() {
+        return Err(RuntimeStoreError::ConversationNotFound);
+    }
+    Ok(high_waters)
+}
+
 pub(super) fn load_conversation(
     connection: &Connection,
     key_bundle: &super::cipher::RuntimeKeyBundle,
@@ -3096,6 +3384,24 @@ pub(super) fn load_conversation(
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
     Ok(record)
+}
+
+/// Snapshot materialization 的最小 authenticated parent context。必须复用
+/// `load_conversation`，从而同时验证 metadata MAC、descriptor AEAD 与 canonical
+/// descriptor re-encode；禁止只读明文列或从 actor cache 猜 agent kind。
+pub(super) fn load_authenticated_conversation_snapshot_context(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    conversation_id: RuntimeId,
+) -> Result<super::AuthenticatedConversationSnapshotContext, RuntimeStoreError> {
+    let conversation = load_conversation(connection, key_bundle, database_id, conversation_id)?;
+    Ok(super::AuthenticatedConversationSnapshotContext {
+        conversation_id: conversation.conversation_id,
+        adapter_state_key: conversation.adapter_state_key,
+        agent_kind: conversation.descriptor.agent_kind,
+        event_high_water: conversation.event_high_water,
+    })
 }
 
 fn load_compact_command_receipt(
@@ -5063,6 +5369,17 @@ fn commit_transaction(
     sqlite::commit_transaction(transaction, operation)
 }
 
+fn commit_transaction_with_effects(
+    transaction: Transaction<'_>,
+    operation: RuntimeCommitOperation,
+    pending_targets: PendingStreamTargets,
+    effects: &mut CommandStreamEffects,
+) -> Result<(), RuntimeStoreError> {
+    let result = sqlite::commit_transaction(transaction, operation);
+    effects.record_commit_result(pending_targets, &result);
+    result
+}
+
 fn after_commit(
     config: &RuntimeStoreConfig,
     operation: RuntimeStoreOperation,
@@ -5462,6 +5779,13 @@ const fn terminal_to_command_state(state: TerminalState) -> CommandState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authenticated_event_high_water_query_is_metadata_only() {
+        assert!(AUTHENTICATED_EVENT_HIGH_WATER_QUERY.contains("metadata_token"));
+        assert!(AUTHENTICATED_EVENT_HIGH_WATER_QUERY.contains("event_high_water"));
+        assert!(!AUTHENTICATED_EVENT_HIGH_WATER_QUERY.contains("sealed_descriptor"));
+    }
 
     #[test]
     fn recovery_page_budget_accepts_exact_limit_and_rejects_plus_one() {

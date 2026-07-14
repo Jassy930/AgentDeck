@@ -569,6 +569,9 @@ CREATE TABLE snapshots (
         CHECK(logical_snapshot_bytes BETWEEN 1 AND 67108864),
     content_sha256 BLOB NOT NULL
         CHECK(typeof(content_sha256) = 'blob' AND length(content_sha256) = 32),
+    sealed_snapshot_sha256 BLOB NOT NULL
+        CHECK(typeof(sealed_snapshot_sha256) = 'blob'
+              AND length(sealed_snapshot_sha256) = 32),
     created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
     metadata_token BLOB NOT NULL
         CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
@@ -658,6 +661,29 @@ CREATE TABLE publication_streams (
             AND length(last_acknowledged_blob_hash) = 32
         )
     ),
+    last_acknowledged_publication_id BLOB CHECK(
+        last_acknowledged_publication_id IS NULL OR (
+            typeof(last_acknowledged_publication_id) = 'blob'
+            AND length(last_acknowledged_publication_id) = 16
+        )
+    ),
+    last_acknowledged_request_digest BLOB CHECK(
+        last_acknowledged_request_digest IS NULL OR (
+            typeof(last_acknowledged_request_digest) = 'blob'
+            AND length(last_acknowledged_request_digest) = 32
+        )
+    ),
+    last_rotation_request_digest BLOB CHECK(
+        last_rotation_request_digest IS NULL OR (
+            typeof(last_rotation_request_digest) = 'blob'
+            AND length(last_rotation_request_digest) = 32
+        )
+    ),
+    rotation_serial TEXT NOT NULL CHECK(
+        typeof(rotation_serial) = 'text' AND length(rotation_serial) = 20
+        AND rotation_serial NOT GLOB '*[^0-9]*'
+        AND rotation_serial <= '18446744073709551615'
+    ),
     last_committed_blob_hash BLOB CHECK(
         last_committed_blob_hash IS NULL OR (
             typeof(last_committed_blob_hash) = 'blob'
@@ -687,6 +713,10 @@ CREATE TABLE publication_streams (
            AND last_acknowledged_blob_hash IS NOT NULL)),
     CHECK((counter_scope_token IS NULL AND sender_counter_high_water IS NULL)
        OR (counter_scope_token IS NOT NULL AND sender_counter_high_water IS NOT NULL)),
+    CHECK((last_acknowledged_publication_id IS NULL
+           AND last_acknowledged_request_digest IS NULL)
+       OR (last_acknowledged_publication_id IS NOT NULL
+           AND last_acknowledged_request_digest IS NOT NULL)),
     UNIQUE(publication_stream_id, generation),
     UNIQUE(stream_route, generation),
     UNIQUE(counter_scope_token),
@@ -915,6 +945,23 @@ mod tests {
                 "publication_stream_count",
                 "publication_outbox_count",
                 "publication_outbox_bytes",
+            ]
+        );
+        let snapshot_columns = connection
+            .prepare("SELECT name FROM pragma_table_info('snapshots') ORDER BY cid")
+            .expect("prepare snapshot columns")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query snapshot columns")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect snapshot columns");
+        assert_eq!(
+            &snapshot_columns[snapshot_columns.len() - 5..],
+            [
+                "content_sha256",
+                "sealed_snapshot_sha256",
+                "created_at_ms",
+                "metadata_token",
+                "sealed_snapshot",
             ]
         );
     }

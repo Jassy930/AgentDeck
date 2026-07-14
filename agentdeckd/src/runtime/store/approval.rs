@@ -9,6 +9,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use zeroize::Zeroizing;
 
 use crate::runtime::approval::ApprovalPolicySnapshot;
+use crate::runtime::events::CommandStreamEffects;
 use crate::runtime::model::{
     ApprovalMutationOutcome, ApprovalRecord, ApprovalRequestEnvelope, ApprovalState,
     BeginApprovalAttempt, BeginApprovalAttemptOutcome, ClaimApproval, ConversationLifecycle,
@@ -139,6 +140,7 @@ pub(crate) fn register_approval(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
     input: RegisterApproval,
+    effects: &mut CommandStreamEffects,
 ) -> Result<RegisterApprovalOutcome, RuntimeStoreError> {
     ensure_kind(input.conversation_id, RuntimeIdKind::Conversation)?;
     ensure_kind(input.command_id, RuntimeIdKind::Command)?;
@@ -376,11 +378,20 @@ pub(crate) fn register_approval(
         .active_approval_count
         .checked_add(1)
         .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-    sqlite::update_runtime_ledger(&transaction, key_bundle, database_id, &ledger, &next_ledger)?;
+    let pending_targets = sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next_ledger,
+    )?;
     config
         .fault_injector
         .before_operation(RuntimeStoreOperation::RegisterApprovalBeforeCommit)?;
-    sqlite::commit_transaction(transaction, RuntimeCommitOperation::RegisterApproval)?;
+    let commit_result =
+        sqlite::commit_transaction(transaction, RuntimeCommitOperation::RegisterApproval);
+    effects.record_commit_result(pending_targets, &commit_result);
+    commit_result?;
     sqlite::latch_post_commit_capacity(state, config);
     if config
         .fault_injector
@@ -427,6 +438,7 @@ pub(crate) fn claim_approval(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
     input: ClaimApproval,
+    effects: &mut CommandStreamEffects,
 ) -> Result<ApprovalMutationOutcome, RuntimeStoreError> {
     ensure_kind(input.conversation_id, RuntimeIdKind::Conversation)?;
     ensure_kind(input.turn_id, RuntimeIdKind::Turn)?;
@@ -569,6 +581,7 @@ pub(crate) fn claim_approval(
             transition,
             RuntimeStoreOperation::ClaimApprovalBeforeCommit,
             RuntimeCommitOperation::ClaimApproval,
+            effects,
         )?;
         finish_approval_commit(
             state,
@@ -751,11 +764,20 @@ pub(crate) fn claim_approval(
         .event_count
         .checked_add(1)
         .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-    sqlite::update_runtime_ledger(&transaction, key_bundle, database_id, &ledger, &next_ledger)?;
+    let pending_targets = sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next_ledger,
+    )?;
     config
         .fault_injector
         .before_operation(RuntimeStoreOperation::ClaimApprovalBeforeCommit)?;
-    sqlite::commit_transaction(transaction, RuntimeCommitOperation::ClaimApproval)?;
+    let commit_result =
+        sqlite::commit_transaction(transaction, RuntimeCommitOperation::ClaimApproval);
+    effects.record_commit_result(pending_targets, &commit_result);
+    commit_result?;
     sqlite::latch_post_commit_capacity(state, config);
     if config
         .fault_injector
@@ -793,6 +815,7 @@ pub(crate) fn begin_approval_attempt(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
     input: BeginApprovalAttempt,
+    effects: &mut CommandStreamEffects,
 ) -> Result<BeginApprovalAttemptOutcome, RuntimeStoreError> {
     ensure_kind(input.approval_id, RuntimeIdKind::Approval)?;
     if input.expected_attempts_in_round > 8 {
@@ -824,7 +847,7 @@ pub(crate) fn begin_approval_attempt(
             preflight.turn_id,
         )?
     {
-        return expire_for_begin(state, config, preflight);
+        return expire_for_begin(state, config, preflight, effects);
     }
     if begin_is_exact_replay(&preflight, &input) {
         return Ok(BeginApprovalAttemptOutcome::Permitted {
@@ -857,7 +880,7 @@ pub(crate) fn begin_approval_attempt(
                 preflight.turn_id,
             )?
         {
-            return expire_for_begin(state, config, preflight);
+            return expire_for_begin(state, config, preflight, effects);
         }
         return Err(error);
     }
@@ -907,6 +930,7 @@ pub(crate) fn begin_approval_attempt(
             transition,
             RuntimeStoreOperation::ExpireApprovalBeforeCommit,
             RuntimeCommitOperation::ExpireApproval,
+            effects,
         )?;
         finish_approval_commit(
             state,
@@ -947,6 +971,7 @@ pub(crate) fn begin_approval_attempt(
                 },
                 RuntimeStoreOperation::BeginApprovalAttemptBeforeCommit,
                 RuntimeCommitOperation::BeginApprovalAttempt,
+                effects,
             )?;
             (next, Some(event))
         }
@@ -987,6 +1012,7 @@ pub(crate) fn mark_approval_applied(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
     input: MarkApprovalApplied,
+    effects: &mut CommandStreamEffects,
 ) -> Result<ApprovalMutationOutcome, RuntimeStoreError> {
     ensure_kind(input.approval_id, RuntimeIdKind::Approval)?;
     validate_attempt_coordinates(input.delivery_round, input.attempt)?;
@@ -1049,6 +1075,7 @@ pub(crate) fn mark_approval_applied(
         transition,
         RuntimeStoreOperation::MarkApprovalAppliedBeforeCommit,
         RuntimeCommitOperation::MarkApprovalApplied,
+        effects,
     )?;
     finish_approval_commit(
         state,
@@ -1063,6 +1090,7 @@ pub(crate) fn mark_approval_delivery_failed(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
     input: MarkApprovalDeliveryFailed,
+    effects: &mut CommandStreamEffects,
 ) -> Result<ApprovalMutationOutcome, RuntimeStoreError> {
     ensure_kind(input.approval_id, RuntimeIdKind::Approval)?;
     validate_attempt_coordinates(input.delivery_round, input.attempt)?;
@@ -1127,6 +1155,7 @@ pub(crate) fn mark_approval_delivery_failed(
         transition,
         RuntimeStoreOperation::MarkApprovalDeliveryFailedBeforeCommit,
         RuntimeCommitOperation::MarkApprovalDeliveryFailed,
+        effects,
     )?;
     finish_approval_commit(
         state,
@@ -1141,6 +1170,7 @@ pub(crate) fn retry_approval_delivery(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
     input: RetryApprovalDelivery,
+    effects: &mut CommandStreamEffects,
 ) -> Result<ApprovalMutationOutcome, RuntimeStoreError> {
     ensure_kind(input.conversation_id, RuntimeIdKind::Conversation)?;
     ensure_kind(input.approval_id, RuntimeIdKind::Approval)?;
@@ -1276,6 +1306,7 @@ pub(crate) fn retry_approval_delivery(
             transition,
             RuntimeStoreOperation::RetryApprovalDeliveryBeforeCommit,
             RuntimeCommitOperation::RetryApprovalDelivery,
+            effects,
         )?;
         finish_approval_commit(
             state,
@@ -1328,6 +1359,7 @@ pub(crate) fn retry_approval_delivery(
         transition,
         RuntimeStoreOperation::RetryApprovalDeliveryBeforeCommit,
         RuntimeCommitOperation::RetryApprovalDelivery,
+        effects,
     )?;
     finish_approval_commit(
         state,
@@ -1342,6 +1374,7 @@ pub(crate) fn expire_approval(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
     input: ExpireApproval,
+    effects: &mut CommandStreamEffects,
 ) -> Result<ApprovalMutationOutcome, RuntimeStoreError> {
     ensure_kind(input.conversation_id, RuntimeIdKind::Conversation)?;
     ensure_kind(input.approval_id, RuntimeIdKind::Approval)?;
@@ -1413,6 +1446,7 @@ pub(crate) fn expire_approval(
         transition,
         RuntimeStoreOperation::ExpireApprovalBeforeCommit,
         RuntimeCommitOperation::ExpireApproval,
+        effects,
     )?;
     finish_approval_commit(
         state,
@@ -1427,6 +1461,7 @@ fn expire_for_begin(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
     current: ApprovalRecord,
+    effects: &mut CommandStreamEffects,
 ) -> Result<BeginApprovalAttemptOutcome, RuntimeStoreError> {
     match expire_approval(
         state,
@@ -1435,6 +1470,7 @@ fn expire_for_begin(
             conversation_id: current.conversation_id,
             approval_id: current.approval_id,
         },
+        effects,
     )? {
         ApprovalMutationOutcome::Transitioned { approval, .. }
         | ApprovalMutationOutcome::Replayed { approval, .. }
@@ -1651,6 +1687,7 @@ fn commit_approval_transition(
     transition: ApprovalTransition,
     before_operation: RuntimeStoreOperation,
     commit_operation: RuntimeCommitOperation,
+    effects: &mut CommandStreamEffects,
 ) -> Result<(ApprovalRecord, EventRecord), RuntimeStoreError> {
     if observed_at_ms < approval.state_changed_at_ms {
         return Err(RuntimeStoreError::ClockRegressed {
@@ -1708,9 +1745,17 @@ fn commit_approval_transition(
             .checked_sub(1)
             .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
     }
-    sqlite::update_runtime_ledger(&transaction, key_bundle, database_id, &ledger, &next_ledger)?;
+    let pending_targets = sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next_ledger,
+    )?;
     config.fault_injector.before_operation(before_operation)?;
-    sqlite::commit_transaction(transaction, commit_operation)?;
+    let commit_result = sqlite::commit_transaction(transaction, commit_operation);
+    effects.record_commit_result(pending_targets, &commit_result);
+    commit_result?;
     Ok((next, event))
 }
 
@@ -3548,9 +3593,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use agentdeck_protocol::runtime::identity::{ApprovalId, ConversationId, EventId, TurnId};
-    use agentdeck_protocol::runtime::{RuntimeEvent, RuntimeEventBody};
+    use agentdeck_protocol::runtime::{RuntimeEvent, RuntimeEventBody, StreamCursor};
     use agentdeck_protocol::{
         ActionDecision, ActionDecisionKind, ActionKind, ActionRequest, ActionRequestVendor,
         AgentKind, CodexApprovalPolicy, CodexSandboxMode,
@@ -3559,7 +3605,9 @@ mod tests {
     use crate::runtime::approval::{
         ApprovalPermissionGrant, ApprovalPolicySnapshot, ApprovalPrincipalCapability,
     };
+    use crate::runtime::backfill::BarrierRequest;
     use crate::runtime::connection::PrincipalIssuer;
+    use crate::runtime::events::{RegisterStreamBarrier, RuntimeStreamTarget, WatchGeneration};
     use crate::runtime::model::{
         AcceptCommand, AcceptOutcome, ApprovalMutationOutcome, ApprovalRecord, ApprovalState,
         AuthorizeExecutionRelease, BeginApprovalAttempt, BeginApprovalAttemptOutcome,
@@ -5785,6 +5833,139 @@ mod tests {
         assert_eq!(after.3, before.3, "ledger eventCount changed on rejection");
         assert_eq!(after.4, before.4, "event journal changed on rejection");
         store.shutdown().await.expect("shutdown approval store");
+    }
+
+    #[tokio::test]
+    async fn begin_after_commit_unknown_notifies_watched_conversation_from_authenticated_readback()
+    {
+        let (_root, _keys, clock, store, conversation_id, claimed) = open_claimed_with_fault(
+            "fault-begin-after-commit-watch-readback",
+            RuntimeStoreOperation::BeginApprovalAttemptAfterCommit,
+            68_000,
+        )
+        .await;
+        let mut registration = store
+            .register_stream_barrier(RegisterStreamBarrier {
+                target: RuntimeStreamTarget::Conversation(conversation_id),
+                generation: WatchGeneration::new(1).expect("nonzero watch generation"),
+                request: BarrierRequest::Subscribe {
+                    cursor: StreamCursor::BeforeFirst,
+                },
+            })
+            .await
+            .expect("register claimed conversation watch");
+        assert_eq!(registration.high_water, StreamCursor::At(2));
+        assert_eq!(registration.watch.latest(), StreamCursor::At(2));
+        assert_eq!(
+            registration.watch.take_coalesced(),
+            None,
+            "captured high-water must not remain as a pending change"
+        );
+
+        let unrelated_id = runtime_id(RuntimeIdKind::Conversation, 0x72);
+        store
+            .create_conversation(NewConversation {
+                conversation_id: unrelated_id,
+                adapter_state_key: runtime_id(RuntimeIdKind::AdapterState, 0x73),
+                descriptor: ConversationDescriptor {
+                    agent_kind: AgentKind::Codex,
+                    title: Some("approval-unrelated".to_owned()),
+                    cwd: PathBuf::from("/approval-unrelated"),
+                },
+            })
+            .await
+            .expect("create unrelated approval conversation");
+        let mut unrelated = store
+            .register_stream_barrier(RegisterStreamBarrier {
+                target: RuntimeStreamTarget::Conversation(unrelated_id),
+                generation: WatchGeneration::new(3).expect("unrelated generation"),
+                request: BarrierRequest::Subscribe {
+                    cursor: StreamCursor::BeforeFirst,
+                },
+            })
+            .await
+            .expect("watch unrelated approval conversation");
+        rusqlite::Connection::open(_root.database())
+            .expect("open unrelated approval tamper database")
+            .execute(
+                "UPDATE event_retention SET metadata_token = zeroblob(32)
+                 WHERE conversation_id = ?1",
+                [&unrelated_id.as_bytes()[..]],
+            )
+            .expect("tamper unrelated approval retention");
+
+        clock.set(68_002);
+        assert!(matches!(
+            store
+                .begin_approval_attempt(BeginApprovalAttempt {
+                    approval_id: claimed.approval_id,
+                    delivery_round: 0,
+                    expected_attempts_in_round: 0,
+                })
+                .await,
+            Err(RuntimeStoreError::CommitOutcomeUnknown {
+                operation: RuntimeCommitOperation::BeginApprovalAttempt,
+            })
+        ));
+        assert_eq!(
+            registration.watch.take_coalesced(),
+            Some(StreamCursor::At(3)),
+            "after-COMMIT unknown must notify the authenticated conversation high-water"
+        );
+        assert_eq!(registration.watch.latest(), StreamCursor::At(3));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), unrelated.watch.next_committed())
+                .await
+                .is_err(),
+            "approval-id-only mutation must not read or close an unrelated watcher"
+        );
+        store.shutdown().await.expect("shutdown begin watch store");
+    }
+
+    #[tokio::test]
+    async fn begin_before_commit_rollback_does_not_notify_watched_conversation() {
+        let (_root, _keys, clock, store, conversation_id, claimed) = open_claimed_with_fault(
+            "fault-begin-before-commit-watch-readback",
+            RuntimeStoreOperation::BeginApprovalAttemptBeforeCommit,
+            69_000,
+        )
+        .await;
+        let mut registration = store
+            .register_stream_barrier(RegisterStreamBarrier {
+                target: RuntimeStreamTarget::Conversation(conversation_id),
+                generation: WatchGeneration::new(2).expect("nonzero watch generation"),
+                request: BarrierRequest::Subscribe {
+                    cursor: StreamCursor::BeforeFirst,
+                },
+            })
+            .await
+            .expect("register claimed conversation watch");
+        assert_eq!(registration.high_water, StreamCursor::At(2));
+        assert_eq!(registration.watch.latest(), StreamCursor::At(2));
+        assert_eq!(
+            registration.watch.take_coalesced(),
+            None,
+            "captured high-water must not remain as a pending change"
+        );
+
+        clock.set(69_002);
+        assert!(matches!(
+            store
+                .begin_approval_attempt(BeginApprovalAttempt {
+                    approval_id: claimed.approval_id,
+                    delivery_round: 0,
+                    expected_attempts_in_round: 0,
+                })
+                .await,
+            Err(RuntimeStoreError::InvalidStateTransition)
+        ));
+        assert_eq!(
+            registration.watch.take_coalesced(),
+            None,
+            "rolled-back attempt must not advance the watched conversation"
+        );
+        assert_eq!(registration.watch.latest(), StreamCursor::At(2));
+        store.shutdown().await.expect("shutdown begin watch store");
     }
 
     #[tokio::test]

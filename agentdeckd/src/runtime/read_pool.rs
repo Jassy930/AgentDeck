@@ -19,6 +19,7 @@ pub(crate) const DEFAULT_RUNTIME_READ_CONCURRENCY: usize = 8;
 pub(crate) const MAX_RUNTIME_READ_RETAINED_BYTES: u32 = 128 * 1024 * 1024;
 pub(crate) const MAX_RUNTIME_READ_PAGE_ROWS: usize = 64;
 pub(crate) const MAX_RUNTIME_READ_PAGE_BYTES: u32 = 8 * 1024 * 1024;
+pub(crate) const MAX_RUNTIME_BACKFILL_EGRESS_RETAINED_BYTES: u32 = MAX_RUNTIME_READ_PAGE_BYTES * 2;
 pub(crate) const MAX_RUNTIME_READ_SNAPSHOT_BYTES: u32 = 128 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -107,6 +108,20 @@ impl ReadPool {
             return Err(ReadPoolError::PageBudgetOutOfRange);
         }
         self.run_sqlite_retained(retained_bytes, operation).await
+    }
+
+    /// Backfill page 会在 SQLite DTO 仍存活时生成一份 canonical egress payload。
+    /// 本入口的 retained charge 必须覆盖两者，并一直由返回页持有。
+    pub(crate) async fn run_sqlite_backfill_page<T, F>(
+        &self,
+        operation: F,
+    ) -> Result<RetainedReadPage<T>, ReadPoolError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T, ReadPoolError> + Send + 'static,
+    {
+        self.run_sqlite_retained(MAX_RUNTIME_BACKFILL_EGRESS_RETAINED_BYTES, operation)
+            .await
     }
 
     /// 单个 sealed snapshot 可达 64 MiB，不把它伪装成 8 MiB page。调用方必须
@@ -545,6 +560,44 @@ mod tests {
             .await
             .expect("released snapshot budget is reusable");
         drop(replacement);
+        pool.close_and_wait().await;
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn eight_slow_backfill_pages_charge_dto_and_canonical_payload_atomically() {
+        let path = wal_database();
+        let pool = ReadPool::open_sqlite(&path, DEFAULT_RUNTIME_READ_CONCURRENCY, 100)
+            .expect("open SQLite read pool");
+        let mut held = Vec::new();
+        for _ in 0..8 {
+            held.push(
+                pool.run_sqlite_backfill_page(|_| Ok(()))
+                    .await
+                    .expect("eight combined backfill leases fit exactly"),
+            );
+        }
+        assert_eq!(
+            pool.inner.retained_bytes.available_permits(),
+            0,
+            "slow ACK pages must charge both the near-8-MiB DTO and canonical payload"
+        );
+        assert!(matches!(
+            pool.run_sqlite_backfill_page(|_| Ok(())).await,
+            Err(ReadPoolError::Busy)
+        ));
+
+        drop(held.pop());
+        let replacement = pool
+            .run_sqlite_backfill_page(|_| Ok(()))
+            .await
+            .expect("flush/cancel release makes one combined slot reusable");
+        drop(replacement);
+        drop(held);
+        assert_eq!(
+            pool.inner.retained_bytes.available_permits(),
+            usize::try_from(MAX_RUNTIME_READ_RETAINED_BYTES).expect("permit count")
+        );
         pool.close_and_wait().await;
         let _ = fs::remove_file(path);
     }

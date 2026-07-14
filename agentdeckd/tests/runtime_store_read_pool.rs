@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use agentdeck_protocol::AgentKind;
 use agentdeckd::runtime::store::{
     ConversationDescriptor, NewConversation, RuntimeBackfillPlan, RuntimeBackfillTarget, RuntimeId,
-    RuntimeIdKind, RuntimeStoreConfig, RuntimeStoreHandle,
+    RuntimeIdKind, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreHandle,
 };
 use agentdeckd::security::{MemoryKeyStore, StorageKek, load_or_create_storage_kek};
 
@@ -94,6 +94,20 @@ async fn frozen_catalog_pages_use_64_row_short_reads_and_never_block_writer() {
     assert_eq!(first.deltas.len(), 64);
     assert_eq!(first.next_after, 63);
     assert!(!first.complete);
+    let first_completion = first.completion().clone();
+
+    assert!(matches!(
+        store
+            .load_catalog_backfill_page(pin.clone(), Some(first.next_after))
+            .await,
+        Err(RuntimeStoreError::InvalidBackfillPin)
+    ));
+    let replayed_first = store
+        .load_catalog_backfill_page(pin.clone(), None)
+        .await
+        .expect("page load alone keeps the pin at its original cursor");
+    let stale_completion = replayed_first.completion().clone();
+    assert_eq!(replayed_first.next_after, first.next_after);
 
     // `first` 故意继续持有 page memory lease，模拟慢 reply consumer。writer 不等
     // 这个 lease，也不持有跨网络 read transaction。
@@ -105,14 +119,38 @@ async fn frozen_catalog_pages_use_64_row_short_reads_and_never_block_writer() {
     .expect("slow page consumer must not block writer")
     .expect("writer commits new catalog delta");
 
+    store
+        .complete_backfill_page(first_completion)
+        .await
+        .expect("flush ACK advances the frozen page cursor");
+    assert!(matches!(
+        store.complete_backfill_page(stale_completion).await,
+        Err(RuntimeStoreError::InvalidBackfillPin)
+    ));
+
     let second = store
-        .load_catalog_backfill_page(pin, Some(first.next_after))
+        .load_catalog_backfill_page(pin.clone(), Some(first.next_after))
         .await
         .expect("read final frozen page");
     assert_eq!(second.deltas.len(), 1);
     assert_eq!(second.deltas[0].catalog_revision, 64);
     assert_eq!(second.next_after, 64);
     assert!(second.complete);
+    let final_completion = second.completion().clone();
+    store
+        .complete_backfill_page(final_completion.clone())
+        .await
+        .expect("final flush ACK releases the completed pin");
+    assert!(matches!(
+        store.complete_backfill_page(final_completion).await,
+        Err(RuntimeStoreError::InvalidBackfillPin)
+    ));
+    assert!(matches!(
+        store
+            .load_catalog_backfill_page(pin, Some(second.next_after))
+            .await,
+        Err(RuntimeStoreError::InvalidBackfillPin)
+    ));
     // revision 65 was committed after the frozen cut and cannot leak into either page.
     assert!(
         first
@@ -122,6 +160,7 @@ async fn frozen_catalog_pages_use_64_row_short_reads_and_never_block_writer() {
             .all(|delta| delta.catalog_revision <= 64)
     );
     drop(first);
+    drop(replayed_first);
     drop(second);
     store
         .shutdown()

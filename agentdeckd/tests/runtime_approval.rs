@@ -19,8 +19,10 @@ use agentdeck_protocol::runtime::{
 
 const APPROVAL_SOURCE: &str = include_str!("../src/runtime/approval.rs");
 const CONNECTION_SOURCE: &str = include_str!("../src/runtime/connection.rs");
+const CONNECTION_TEST_SOURCE: &str = include_str!("../src/runtime/connection/tests.rs");
 const CONVERSATION_SOURCE: &str = include_str!("../src/runtime/conversation.rs");
 const CORE_SOURCE: &str = include_str!("../src/runtime/core.rs");
+const CORE_TEST_SOURCE: &str = include_str!("../src/runtime/core/tests.rs");
 const STORE_APPROVAL_SOURCE: &str = include_str!("../src/runtime/store/approval.rs");
 const STORE_JOURNAL_SOURCE: &str = include_str!("../src/runtime/store/journal.rs");
 const STORE_SCHEMA_SOURCE: &str = include_str!("../src/runtime/store/schema.rs");
@@ -136,12 +138,18 @@ fn principal_without_approval_permission_cannot_claim() {
             "pub(crate) struct ApprovalAuthorizationGuard",
             "_authorization: AuthorizationGuard",
             "Err(PrincipalAccessError::PermissionDenied)",
-            "fn approval_permissions_are_explicit_and_fail_closed_per_operation()",
         ],
+    );
+    // 威胁场景：production connection contract 机械拆分后，如果 gate 仍要求 unit
+    // test 名出现在主文件，会把结构卫生误报成授权缺失并掩盖真正的行为回归。
+    assert_contract(
+        "approval permission owner test",
+        CONNECTION_TEST_SOURCE,
+        &["fn approval_permissions_are_explicit_and_fail_closed_per_operation()"],
     );
     assert_contract(
         "permission integration owner test",
-        CORE_SOURCE,
+        CORE_TEST_SOURCE,
         &[
             "async fn principal_without_approval_permission_cannot_claim()",
             "DAEMON_AUTHORIZATION_PERMISSION_DENIED",
@@ -617,7 +625,7 @@ fn turn_terminal_expires_every_non_applied_approval_atomically() {
         STORE_WORKER_SOURCE,
         &[
             "SafetyCommand::CompleteCommand",
-            "journal::complete_command_with_event(state, config, input)",
+            "journal::complete_command_with_event(state, config, input, &mut effects)",
             "SafetyCommand::TerminateStartedBeforeRelease",
             "journal::terminate_started_before_release(",
         ],

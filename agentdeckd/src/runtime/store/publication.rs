@@ -1,5 +1,8 @@
 //! Runtime v4 transport-neutral durable publication outbox。
 
+mod directory;
+mod rotation;
+
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
@@ -14,6 +17,9 @@ use super::sequence::{SequenceScope, decode_sequence, encode_sequence, next_sequ
 use super::sqlite::{RuntimeLedger, RuntimeSqlite};
 use super::stream::{metadata_mac, open_v4_row, optional_field, seal_v4_row, sqlite_u64};
 
+pub(super) use directory::{authenticate_directory, load_pending_publication_stream_ids};
+pub(super) use rotation::rotate_publication_stream;
+
 pub(crate) const MAX_PUBLICATION_BLOB_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_PUBLICATION_ROWS_PER_STREAM: u64 = 2_000;
 pub(crate) const MAX_PUBLICATION_BYTES_PER_STREAM: u64 = 64 * 1024 * 1024;
@@ -22,6 +28,7 @@ pub(crate) const MAX_PUBLICATION_BYTES_GLOBAL: u64 = 512 * 1024 * 1024;
 pub(crate) const MAX_PENDING_PUBLICATION_PAGE_BYTES: u64 = 8 * 1024 * 1024;
 const STREAM_TOKEN_DOMAIN: &[u8] = b"publication.stream.v1";
 const OUTBOX_TOKEN_DOMAIN: &[u8] = b"publication.outbox.v1";
+const FREEZE_REQUEST_DIGEST_DOMAIN: &[u8] = b"publication.freeze-request.v1";
 
 #[derive(Clone, Copy)]
 struct PublicationLimits {
@@ -38,7 +45,7 @@ const PRODUCTION_LIMITS: PublicationLimits = PublicationLimits {
     bytes_global: MAX_PUBLICATION_BYTES_GLOBAL,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PublicationScope {
     Catalog,
     Conversation(RuntimeId),
@@ -74,6 +81,15 @@ pub struct PublicationStreamRecord {
     pub acknowledged_high_water: Option<u64>,
     pub acknowledged_inner_cursor: Option<u64>,
     pub last_acknowledged_blob_hash: Option<[u8; 32]>,
+    /// 威胁场景：dispatcher 在 ACK 后因 COMMIT unknown 重放同一 publicationId，若删除
+    /// outbox 后没有认证 tombstone，就会把已消费 frame 当成新发布再次发送。
+    /// 有界 MVP 只保留最新一次 delivery ACK 的 publication identity。
+    pub last_acknowledged_publication_id: Option<[u8; 16]>,
+    pub last_acknowledged_request_digest: Option<[u8; 32]>,
+    /// 只保留最近一次原地 rollover 请求，用于 COMMIT unknown exact retry。
+    pub last_rotation_request_digest: Option<[u8; 32]>,
+    /// store-authenticated 单调 lineage；0 表示 caller 提供的初始 identity。
+    pub rotation_serial: u64,
     pub state: PublicationStreamState,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -93,6 +109,12 @@ pub struct FreezePublicationRequest {
     pub payload_kind: PublicationPayloadKind,
     /// P3 可注入 fake sealed blob；P4 只传已 seal 一次的 exact bytes。
     pub blob: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RotatePublicationStreamRequest {
+    pub publication_stream_id: [u8; 16],
+    pub expected_generation: [u8; 16],
 }
 
 #[derive(Debug)]
@@ -218,6 +240,10 @@ pub(super) fn create_publication_stream(
         acknowledged_high_water: None,
         acknowledged_inner_cursor: None,
         last_acknowledged_blob_hash: None,
+        last_acknowledged_publication_id: None,
+        last_acknowledged_request_digest: None,
+        last_rotation_request_digest: None,
+        rotation_serial: 0,
         state: PublicationStreamState::Active,
         created_at_ms: now_ms,
         updated_at_ms: now_ms,
@@ -225,7 +251,13 @@ pub(super) fn create_publication_stream(
     insert_stream(&transaction, key_bundle, &record)?;
     let mut next = ledger.clone();
     next.publication_stream_count = next_count;
-    super::sqlite::update_runtime_ledger(&transaction, key_bundle, database_id, &ledger, &next)?;
+    let _pending_targets = super::sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next,
+    )?;
     commit_with_faults(
         transaction,
         config,
@@ -271,6 +303,27 @@ fn freeze_publication_with_limits(
         request.inner_through,
         request.payload_kind,
     )?;
+    let blob_sha256: [u8; 32] = Sha256::digest(&request.blob).into();
+    let logical_bytes =
+        u64::try_from(request.blob.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    let request_digest = freeze_request_digest(
+        request.publication_stream_id,
+        request.generation,
+        request.counter_scope_token,
+        request.sender_counter,
+        request.inner_after,
+        request.inner_through,
+        request.payload_kind,
+        blob_sha256,
+        logical_bytes,
+    );
+    if let Some(stream) = load_optional_stream(
+        &state.connection,
+        &state.key_bundle,
+        request.publication_stream_id,
+    )? {
+        reject_acknowledged_freeze(&stream, request.publication_id, request_digest)?;
+    }
     if let Some(existing) = load_optional_outbox(
         &state.connection,
         &state.key_bundle,
@@ -304,6 +357,7 @@ fn freeze_publication_with_limits(
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut stream = load_stream(&transaction, key_bundle, request.publication_stream_id)?;
+    reject_acknowledged_freeze(&stream, request.publication_id, request_digest)?;
     if stream.generation != request.generation || stream.state != PublicationStreamState::Active {
         return Err(if stream.state == PublicationStreamState::NeedsSnapshot {
             RuntimeStoreError::PublicationNeedsSnapshot
@@ -344,8 +398,6 @@ fn freeze_publication_with_limits(
     if request.inner_through.is_some() && request.inner_after != expected_inner_after {
         return Err(RuntimeStoreError::PublicationMismatch);
     }
-    let logical_bytes =
-        u64::try_from(request.blob.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
     let (stream_count, stream_bytes): (i64, i64) = transaction.query_row(
         "SELECT COUNT(*), COALESCE(SUM(logical_blob_bytes), 0)
          FROM publication_outbox WHERE publication_stream_id = ?1",
@@ -376,7 +428,7 @@ fn freeze_publication_with_limits(
         stream.state = PublicationStreamState::NeedsSnapshot;
         stream.updated_at_ms = now_ms;
         update_stream(&transaction, key_bundle, &stream)?;
-        super::sqlite::update_runtime_ledger(
+        let _pending_targets = super::sqlite::update_runtime_ledger(
             &transaction,
             key_bundle,
             database_id,
@@ -397,7 +449,6 @@ fn freeze_publication_with_limits(
         )?;
         return Err(RuntimeStoreError::PublicationNeedsSnapshot);
     }
-    let blob_sha256: [u8; 32] = Sha256::digest(&request.blob).into();
     let stream_seq_encoded = stream_seq.encoded.clone();
     let inner_after = request.inner_after.map(encode_sequence);
     let inner_through = request.inner_through.map(encode_sequence);
@@ -452,12 +503,21 @@ fn freeze_publication_with_limits(
     stream.counter_scope_token = Some(request.counter_scope_token);
     stream.sender_counter_high_water = Some(request.sender_counter);
     stream.reserved_high_water = Some(stream_seq.value);
+    if stream_seq.value == u64::MAX || request.sender_counter == u64::MAX {
+        stream.state = PublicationStreamState::NeedsSnapshot;
+    }
     stream.updated_at_ms = now_ms;
     update_stream(&transaction, key_bundle, &stream)?;
     let mut next = ledger.clone();
     next.publication_outbox_count = projected_global_count;
     next.publication_outbox_bytes = projected_global_bytes;
-    super::sqlite::update_runtime_ledger(&transaction, key_bundle, database_id, &ledger, &next)?;
+    let _pending_targets = super::sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next,
+    )?;
     commit_with_faults(
         transaction,
         config,
@@ -620,6 +680,7 @@ pub(super) fn acknowledge_publication_delivery(
     if publication.blob_sha256 != blob_sha256 {
         return Err(RuntimeStoreError::PublicationMismatch);
     }
+    let request_digest = frozen_request_digest(&publication)?;
     let acknowledged_inner_cursor = match publication.inner_through {
         Some(through) if publication.inner_after == stream.acknowledged_inner_cursor => {
             Some(through)
@@ -642,6 +703,8 @@ pub(super) fn acknowledge_publication_delivery(
     stream.acknowledged_high_water = Some(stream_seq);
     stream.acknowledged_inner_cursor = acknowledged_inner_cursor;
     stream.last_acknowledged_blob_hash = Some(blob_sha256);
+    stream.last_acknowledged_publication_id = Some(publication.publication_id);
+    stream.last_acknowledged_request_digest = Some(request_digest);
     stream.updated_at_ms = now_ms;
     update_stream(&transaction, key_bundle, &stream)?;
     let logical_bytes = u64::try_from(publication.blob.len())
@@ -655,7 +718,13 @@ pub(super) fn acknowledge_publication_delivery(
         .publication_outbox_bytes
         .checked_sub(logical_bytes)
         .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-    super::sqlite::update_runtime_ledger(&transaction, key_bundle, database_id, &ledger, &next)?;
+    let _pending_targets = super::sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next,
+    )?;
     commit_with_faults(
         transaction,
         config,
@@ -870,7 +939,6 @@ pub(super) fn validate_integrity(
                 .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
         }
         if stream.reserved_high_water != last_outer
-            || stream.reserved_high_water.is_some() != stream.sender_counter_high_water.is_some()
             || previous_pending_counter
                 .is_some_and(|counter| Some(counter) != stream.sender_counter_high_water)
             || stream_bytes > MAX_PUBLICATION_BYTES_PER_STREAM
@@ -912,9 +980,12 @@ fn insert_stream(
              reserved_high_water, committed_high_water, committed_inner_cursor,
              last_committed_blob_hash, acknowledged_high_water,
              acknowledged_inner_cursor, last_acknowledged_blob_hash,
-             state, created_at_ms, updated_at_ms, metadata_token
+             last_acknowledged_publication_id, last_acknowledged_request_digest,
+             last_rotation_request_digest, rotation_serial, state, created_at_ms,
+             updated_at_ms, metadata_token
          ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL, NULL,
-                   NULL, NULL, NULL, ?6, ?7, ?7, ?8)",
+                   NULL, NULL, NULL, NULL, NULL, NULL, '00000000000000000000',
+                   ?6, ?7, ?7, ?8)",
         params![
             &stream.publication_stream_id[..],
             scope_text(stream.scope),
@@ -942,8 +1013,12 @@ fn update_stream(
              committed_inner_cursor = ?5, last_committed_blob_hash = ?6,
              acknowledged_high_water = ?7, acknowledged_inner_cursor = ?8,
              last_acknowledged_blob_hash = ?9,
-             state = ?10, updated_at_ms = ?11, metadata_token = ?12
-         WHERE publication_stream_id = ?13 AND generation = ?14",
+             last_acknowledged_publication_id = ?10,
+             last_acknowledged_request_digest = ?11,
+             last_rotation_request_digest = ?12,
+             rotation_serial = ?13,
+             state = ?14, updated_at_ms = ?15, metadata_token = ?16
+         WHERE publication_stream_id = ?17 AND generation = ?18",
         params![
             stream
                 .counter_scope_token
@@ -963,6 +1038,19 @@ fn update_stream(
                 .last_acknowledged_blob_hash
                 .as_ref()
                 .map(<[u8; 32]>::as_slice),
+            stream
+                .last_acknowledged_publication_id
+                .as_ref()
+                .map(<[u8; 16]>::as_slice),
+            stream
+                .last_acknowledged_request_digest
+                .as_ref()
+                .map(<[u8; 32]>::as_slice),
+            stream
+                .last_rotation_request_digest
+                .as_ref()
+                .map(<[u8; 32]>::as_slice),
+            encode_sequence(stream.rotation_serial),
             stream_state_text(stream.state),
             sqlite_u64(stream.updated_at_ms)?,
             &token[..],
@@ -1003,8 +1091,10 @@ fn load_stream(
             "SELECT scope, conversation_id, stream_route, generation, counter_scope_token,
                     sender_counter_high_water, reserved_high_water, committed_high_water,
                     committed_inner_cursor, last_committed_blob_hash, acknowledged_high_water,
-                    acknowledged_inner_cursor, last_acknowledged_blob_hash, state,
-                    created_at_ms, updated_at_ms, metadata_token
+                    acknowledged_inner_cursor, last_acknowledged_blob_hash,
+                    last_acknowledged_publication_id, last_acknowledged_request_digest,
+                    last_rotation_request_digest, rotation_serial, state, created_at_ms,
+                    updated_at_ms, metadata_token
              FROM publication_streams WHERE publication_stream_id = ?1",
             [&publication_stream_id[..]],
             |row| {
@@ -1022,10 +1112,14 @@ fn load_stream(
                     row.get::<_, Option<String>>(10)?,
                     row.get::<_, Option<String>>(11)?,
                     row.get::<_, Option<Vec<u8>>>(12)?,
-                    row.get::<_, String>(13)?,
-                    row.get::<_, i64>(14)?,
-                    row.get::<_, i64>(15)?,
-                    row.get::<_, Vec<u8>>(16)?,
+                    row.get::<_, Option<Vec<u8>>>(13)?,
+                    row.get::<_, Option<Vec<u8>>>(14)?,
+                    row.get::<_, Option<Vec<u8>>>(15)?,
+                    row.get::<_, String>(16)?,
+                    row.get::<_, String>(17)?,
+                    row.get::<_, i64>(18)?,
+                    row.get::<_, i64>(19)?,
+                    row.get::<_, Vec<u8>>(20)?,
                 ))
             },
         )
@@ -1048,14 +1142,18 @@ fn load_stream(
         acknowledged_high_water: decode_optional(&raw.10)?,
         acknowledged_inner_cursor: decode_optional(&raw.11)?,
         last_acknowledged_blob_hash: raw.12.as_deref().map(fixed::<32>).transpose()?,
-        state: parse_stream_state(&raw.13)?,
-        created_at_ms: u64::try_from(raw.14)
+        last_acknowledged_publication_id: raw.13.as_deref().map(fixed::<16>).transpose()?,
+        last_acknowledged_request_digest: raw.14.as_deref().map(fixed::<32>).transpose()?,
+        last_rotation_request_digest: raw.15.as_deref().map(fixed::<32>).transpose()?,
+        rotation_serial: decode_sequence(SequenceScope::EventSeq, &raw.16)?,
+        state: parse_stream_state(&raw.17)?,
+        created_at_ms: u64::try_from(raw.18)
             .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
-        updated_at_ms: u64::try_from(raw.15)
+        updated_at_ms: u64::try_from(raw.19)
             .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
     };
     let expected = stream_token(key_bundle, &record)?;
-    if raw.16.as_slice() != expected
+    if raw.20.as_slice() != expected
         || record.counter_scope_token.is_some() != record.sender_counter_high_water.is_some()
         || record.counter_scope_token == Some([0; 32])
         || record.updated_at_ms < record.created_at_ms
@@ -1063,6 +1161,9 @@ fn load_stream(
         || record.committed_high_water.is_some() != record.last_committed_blob_hash.is_some()
         || record.acknowledged_high_water > record.committed_high_water
         || record.acknowledged_high_water.is_some() != record.last_acknowledged_blob_hash.is_some()
+        || record.last_acknowledged_publication_id.is_some()
+            != record.last_acknowledged_request_digest.is_some()
+        || (record.rotation_serial == 0) != record.last_rotation_request_digest.is_none()
     {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
@@ -1079,8 +1180,10 @@ fn load_stream_read(
             "SELECT scope, conversation_id, stream_route, generation, counter_scope_token,
                     sender_counter_high_water, reserved_high_water, committed_high_water,
                     committed_inner_cursor, last_committed_blob_hash, acknowledged_high_water,
-                    acknowledged_inner_cursor, last_acknowledged_blob_hash, state,
-                    created_at_ms, updated_at_ms, metadata_token
+                    acknowledged_inner_cursor, last_acknowledged_blob_hash,
+                    last_acknowledged_publication_id, last_acknowledged_request_digest,
+                    last_rotation_request_digest, rotation_serial, state, created_at_ms,
+                    updated_at_ms, metadata_token
              FROM publication_streams WHERE publication_stream_id = ?1",
             [&publication_stream_id[..]],
             |row| {
@@ -1098,10 +1201,14 @@ fn load_stream_read(
                     row.get::<_, Option<String>>(10)?,
                     row.get::<_, Option<String>>(11)?,
                     row.get::<_, Option<Vec<u8>>>(12)?,
-                    row.get::<_, String>(13)?,
-                    row.get::<_, i64>(14)?,
-                    row.get::<_, i64>(15)?,
-                    row.get::<_, Vec<u8>>(16)?,
+                    row.get::<_, Option<Vec<u8>>>(13)?,
+                    row.get::<_, Option<Vec<u8>>>(14)?,
+                    row.get::<_, Option<Vec<u8>>>(15)?,
+                    row.get::<_, String>(16)?,
+                    row.get::<_, String>(17)?,
+                    row.get::<_, i64>(18)?,
+                    row.get::<_, i64>(19)?,
+                    row.get::<_, Vec<u8>>(20)?,
                 ))
             },
         )
@@ -1124,13 +1231,17 @@ fn load_stream_read(
         acknowledged_high_water: decode_optional(&raw.10)?,
         acknowledged_inner_cursor: decode_optional(&raw.11)?,
         last_acknowledged_blob_hash: raw.12.as_deref().map(fixed::<32>).transpose()?,
-        state: parse_stream_state(&raw.13)?,
-        created_at_ms: u64::try_from(raw.14)
+        last_acknowledged_publication_id: raw.13.as_deref().map(fixed::<16>).transpose()?,
+        last_acknowledged_request_digest: raw.14.as_deref().map(fixed::<32>).transpose()?,
+        last_rotation_request_digest: raw.15.as_deref().map(fixed::<32>).transpose()?,
+        rotation_serial: decode_sequence(SequenceScope::EventSeq, &raw.16)?,
+        state: parse_stream_state(&raw.17)?,
+        created_at_ms: u64::try_from(raw.18)
             .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
-        updated_at_ms: u64::try_from(raw.15)
+        updated_at_ms: u64::try_from(raw.19)
             .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
     };
-    if !verify_stream_token(read_crypto, &record, &raw.16)?
+    if !verify_stream_token(read_crypto, &record, &raw.20)?
         || record.counter_scope_token.is_some() != record.sender_counter_high_water.is_some()
         || record.counter_scope_token == Some([0; 32])
         || record.updated_at_ms < record.created_at_ms
@@ -1138,6 +1249,9 @@ fn load_stream_read(
         || record.committed_high_water.is_some() != record.last_committed_blob_hash.is_some()
         || record.acknowledged_high_water > record.committed_high_water
         || record.acknowledged_high_water.is_some() != record.last_acknowledged_blob_hash.is_some()
+        || record.last_acknowledged_publication_id.is_some()
+            != record.last_acknowledged_request_digest.is_some()
+        || (record.rotation_serial == 0) != record.last_rotation_request_digest.is_none()
     {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
@@ -1411,6 +1525,82 @@ fn frozen_matches_request(frozen: &FrozenPublication, request: &FreezePublicatio
         && frozen.blob == request.blob
 }
 
+fn reject_acknowledged_freeze(
+    stream: &PublicationStreamRecord,
+    publication_id: [u8; 16],
+    request_digest: [u8; 32],
+) -> Result<(), RuntimeStoreError> {
+    if stream.last_acknowledged_publication_id != Some(publication_id) {
+        return Ok(());
+    }
+    if stream.last_acknowledged_request_digest == Some(request_digest) {
+        Err(RuntimeStoreError::PublicationAlreadyAcknowledged)
+    } else {
+        Err(RuntimeStoreError::PublicationMismatch)
+    }
+}
+
+fn frozen_request_digest(publication: &FrozenPublication) -> Result<[u8; 32], RuntimeStoreError> {
+    let logical_bytes = u64::try_from(publication.blob.len())
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    Ok(freeze_request_digest(
+        publication.publication_stream_id,
+        publication.generation,
+        publication.counter_scope_token,
+        publication.sender_counter,
+        publication.inner_after,
+        publication.inner_through,
+        publication.payload_kind,
+        publication.blob_sha256,
+        logical_bytes,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn freeze_request_digest(
+    publication_stream_id: [u8; 16],
+    generation: [u8; 16],
+    counter_scope_token: [u8; 32],
+    sender_counter: u64,
+    inner_after: Option<u64>,
+    inner_through: Option<u64>,
+    payload_kind: PublicationPayloadKind,
+    blob_sha256: [u8; 32],
+    logical_blob_bytes: u64,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(FREEZE_REQUEST_DIGEST_DOMAIN);
+    digest.update(publication_stream_id);
+    digest.update(generation);
+    digest.update(counter_scope_token);
+    digest.update(sender_counter.to_be_bytes());
+    update_optional_cursor_digest(&mut digest, inner_after);
+    update_optional_cursor_digest(&mut digest, inner_through);
+    digest.update([payload_kind_tag(payload_kind)]);
+    digest.update(blob_sha256);
+    digest.update(logical_blob_bytes.to_be_bytes());
+    digest.finalize().into()
+}
+
+fn update_optional_cursor_digest(digest: &mut Sha256, cursor: Option<u64>) {
+    match cursor {
+        Some(value) => {
+            digest.update([1]);
+            digest.update(value.to_be_bytes());
+        }
+        None => digest.update([0]),
+    }
+}
+
+const fn payload_kind_tag(kind: PublicationPayloadKind) -> u8 {
+    match kind {
+        PublicationPayloadKind::Event => 1,
+        PublicationPayloadKind::Catalog => 2,
+        PublicationPayloadKind::Snapshot => 3,
+        PublicationPayloadKind::Control => 4,
+    }
+}
+
 fn barrier_cut(stream: &PublicationStreamRecord) -> PublicationBarrierCut {
     PublicationBarrierCut {
         publication_stream_id: stream.publication_stream_id,
@@ -1468,6 +1658,24 @@ fn stream_token(
             .as_ref()
             .map(<[u8; 32]>::as_slice),
     );
+    let acknowledged_publication_id = optional_field(
+        stream
+            .last_acknowledged_publication_id
+            .as_ref()
+            .map(<[u8; 16]>::as_slice),
+    );
+    let acknowledged_request_digest = optional_field(
+        stream
+            .last_acknowledged_request_digest
+            .as_ref()
+            .map(<[u8; 32]>::as_slice),
+    );
+    let rotation_request_digest = optional_field(
+        stream
+            .last_rotation_request_digest
+            .as_ref()
+            .map(<[u8; 32]>::as_slice),
+    );
     metadata_mac(
         key_bundle,
         STREAM_TOKEN_DOMAIN,
@@ -1486,6 +1694,10 @@ fn stream_token(
             &acknowledged,
             &acknowledged_inner,
             &acknowledged_hash,
+            &acknowledged_publication_id,
+            &acknowledged_request_digest,
+            &rotation_request_digest,
+            &stream.rotation_serial.to_be_bytes(),
             stream_state_text(stream.state).as_bytes(),
             &stream.created_at_ms.to_be_bytes(),
             &stream.updated_at_ms.to_be_bytes(),
@@ -1533,6 +1745,24 @@ fn verify_stream_token(
             .as_ref()
             .map(<[u8; 32]>::as_slice),
     );
+    let acknowledged_publication_id = optional_field(
+        stream
+            .last_acknowledged_publication_id
+            .as_ref()
+            .map(<[u8; 16]>::as_slice),
+    );
+    let acknowledged_request_digest = optional_field(
+        stream
+            .last_acknowledged_request_digest
+            .as_ref()
+            .map(<[u8; 32]>::as_slice),
+    );
+    let rotation_request_digest = optional_field(
+        stream
+            .last_rotation_request_digest
+            .as_ref()
+            .map(<[u8; 32]>::as_slice),
+    );
     super::stream::verify_metadata_mac(
         read_crypto,
         STREAM_TOKEN_DOMAIN,
@@ -1551,6 +1781,10 @@ fn verify_stream_token(
             &acknowledged,
             &acknowledged_inner,
             &acknowledged_hash,
+            &acknowledged_publication_id,
+            &acknowledged_request_digest,
+            &rotation_request_digest,
+            &stream.rotation_serial.to_be_bytes(),
             stream_state_text(stream.state).as_bytes(),
             &stream.created_at_ms.to_be_bytes(),
             &stream.updated_at_ms.to_be_bytes(),
@@ -1725,116 +1959,4 @@ fn after_commit(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::fs;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    use super::*;
-    use crate::runtime::store::RuntimeStoreConfig;
-    use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
-
-    static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
-
-    #[test]
-    fn publication_outbox_cap_marks_stream_needs_snapshot_without_dropping_unacked_row() {
-        let root = std::env::temp_dir().join(format!(
-            "agentdeck-publication-cap-{}-{}",
-            std::process::id(),
-            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).expect("create publication cap root");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
-                .expect("secure publication cap root");
-        }
-        let database = root.join("runtime.db");
-        let keys = MemoryKeyStore::new();
-        let kek =
-            load_or_create_storage_kek(&keys, &root.join("key-state.db")).expect("create test KEK");
-        let config = RuntimeStoreConfig::new(database);
-        let mut state = super::super::sqlite::open(&config, kek).expect("open test store");
-        let stream_id = [0x71; 16];
-        let generation = [0x72; 16];
-        create_publication_stream(
-            &mut state,
-            &config,
-            stream_id,
-            PublicationScope::Catalog,
-            [0x73; 16],
-            generation,
-            1,
-        )
-        .expect("create catalog publication stream");
-        let request = |publication_id: [u8; 16], after, through| FreezePublicationRequest {
-            publication_id,
-            publication_stream_id: stream_id,
-            generation,
-            counter_scope_token: [0x76; 32],
-            sender_counter: u64::from(publication_id[0]),
-            inner_after: after,
-            inner_through: through,
-            payload_kind: PublicationPayloadKind::Catalog,
-            blob: vec![publication_id[0]],
-        };
-        let first_request = request([0x74; 16], None, Some(0));
-        let first = freeze_publication_with_limits(
-            &mut state,
-            &config,
-            first_request.clone(),
-            2,
-            PublicationLimits {
-                rows_per_stream: 1,
-                bytes_per_stream: MAX_PUBLICATION_BYTES_PER_STREAM,
-                rows_global: MAX_PUBLICATION_ROWS_GLOBAL,
-                bytes_global: MAX_PUBLICATION_BYTES_GLOBAL,
-            },
-        )
-        .expect("freeze first row");
-        let error = freeze_publication_with_limits(
-            &mut state,
-            &config,
-            request([0x75; 16], Some(0), Some(1)),
-            3,
-            PublicationLimits {
-                rows_per_stream: 1,
-                bytes_per_stream: MAX_PUBLICATION_BYTES_PER_STREAM,
-                rows_global: MAX_PUBLICATION_ROWS_GLOBAL,
-                bytes_global: MAX_PUBLICATION_BYTES_GLOBAL,
-            },
-        )
-        .expect_err("cap must stop new publication");
-        assert!(matches!(error, RuntimeStoreError::PublicationNeedsSnapshot));
-        assert_eq!(
-            load_stream(&state.connection, &state.key_bundle, stream_id)
-                .expect("load capped stream")
-                .state,
-            PublicationStreamState::NeedsSnapshot
-        );
-        assert_eq!(
-            load_pending_publications(&state, stream_id).expect("load retained outbox"),
-            std::slice::from_ref(&first),
-            "unacked row must never be evicted"
-        );
-        assert_eq!(
-            freeze_publication_with_limits(
-                &mut state,
-                &config,
-                first_request,
-                4,
-                PublicationLimits {
-                    rows_per_stream: 1,
-                    bytes_per_stream: MAX_PUBLICATION_BYTES_PER_STREAM,
-                    rows_global: MAX_PUBLICATION_ROWS_GLOBAL,
-                    bytes_global: MAX_PUBLICATION_BYTES_GLOBAL,
-                },
-            )
-            .expect("exact retry remains available after cap"),
-            first
-        );
-        drop(state);
-        let _ = fs::remove_dir_all(root);
-    }
-}
+mod tests;
