@@ -47,7 +47,7 @@
 ### Relay Companion MVP（2026-07-10）
 
 - `plans/2026-07-10-relay-companion-mvp-design.md`：已批准的目标架构；固定 singleton daemon、多读者/多写者串行裁决、按机器独立配对、Relay 严格最小可见与真实 iOS Companion 边界。
-- `plans/2026-07-10-relay-companion-mvp-implementation.md`：P0–P6 的逐文件 TDD 执行清单。P2.10 与 P3.5 已完成；P3.6-A Runtime/transfer contract、P3.6-B Runtime store v4、P3.6-C StoreCommitHub/barrier/backfill/snapshot/bounded transfer/fake sealed publication 组件分别提交为 `7731d1e` / `02cc640` / `694f2d9`，默认并发完整 daemon gate 已 exit 0，当前只待 P3.6-D 独立 docs commit。P3.1 的真实 provisioned signed Keychain roundtrip 仍因本机缺 provisioning profile / AMFI exit 137 而保留 1 项 ignored/gated BLOCKED；production execution、singleton UDS、transfer/publication production remote owner、真实 E2EE/Relay Publish 与远程 Companion 均未完成，docs commit 后的下一项是 P3.7 exec gate。
+- `plans/2026-07-10-relay-companion-mvp-implementation.md`：P0–P6 的逐文件 TDD 执行清单。P2.10 与 P3.5 已完成；P3.6-A Runtime/transfer contract、P3.6-B Runtime store v4、P3.6-C StoreCommitHub/barrier/backfill/snapshot/bounded transfer/fake sealed publication 与 P3.6-D 文档收口分别提交为 `7731d1e` / `02cc640` / `694f2d9` / `b668d8f`，默认并发完整 daemon gate 已 exit 0，当前进入 P3.7 exec gate。P3.1 的真实 provisioned signed Keychain roundtrip 仍因本机缺 provisioning profile / AMFI exit 137 而保留 1 项 ignored/gated BLOCKED；production execution、singleton UDS、transfer/publication production remote owner、真实 E2EE/Relay Publish 与远程 Companion 均未完成。
 
 ## 协议资料
 

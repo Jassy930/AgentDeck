@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P2.10、P3.5 已完成，P3.6-A/B/C 已分别提交为 `7731d1e`/`02cc640`/`694f2d9`，当前只待 P3.6-D docs commit；P3.1 签名 Keychain 仍有 1 项 ignored/BLOCKED，P3 整体未完成（2026-07-15） |
+| 状态 | Approved target；P2.10、P3.5 与 P3.6-A/B/C/D 已完成，P3.6 分别提交为 `7731d1e`/`02cc640`/`694f2d9`/`b668d8f`，当前进入 P3.7；P3.1 签名 Keychain 仍有 1 项 ignored/BLOCKED，P3 整体未完成（2026-07-15） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-01-agentdeck-mobile-relay-design.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -760,7 +760,7 @@ P3.6 的 `TransferStateMachine` 目前没有 production remote ingress owner；P
   P3.6-B 已由 `02cc640` 落地 Runtime store v4 与 read-only WAL pool。
 - P3.6-C 已由 `694f2d9` 提交 StoreCommitHub、Catalog/Conversation 共用 barrier、paced egress gate、
   authenticated backfill/snapshot、bounded transfer reducer 与 publication freeze/COMMIT/ACK/restart
-  状态机；当前只待独立 P3.6-D docs commit，尚未在本文把整个 P3 标为完成。
+  状态机；P3.6-D 已由 `b668d8f` 完成独立文档收口，当前进入 P3.7，但整个 P3 仍未完成。
 - 已读回的 scoped 证据是 `runtime_stream` 45/45、`runtime_transfer` 17/17、subscription 36/36、
   daemon lib 464/464（`runtime::` 366 项），默认并发 `cargo test -p agentdeckd` exit 0；Swift
   256 XCTest + 35 Swift Testing，protocol/schema、fmt、clippy、daemon no-net 与 diff gate 均通过。

@@ -10,7 +10,7 @@
 4. `docs/index.md`：文档记录系统导航。
 5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code（含 CC adapter failure codes）。
 6. `docs/QUALITY.md`：验证命令、质量门禁和文档结构检查（含 v0.2 手动 QA 清单）。
-7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单。P2.10 与 P3.5 已完成；P3.6-A protocol contract / P3.6-B Runtime store v4 / P3.6-C transport-neutral stream、barrier、snapshot、transfer 与 publication 组件分别提交为 `7731d1e` / `02cc640` / `694f2d9`，当前只待 P3.6-D 独立文档提交，随后进入 P3.7 exec gate。真实 provisioned signed Keychain roundtrip 仍有 1 项 ignored 且 gated BLOCKED，App/CLI 也尚未迁到 singleton UDS，transfer/publication 也没有 production remote owner，因此不得宣称 P3.1/P3、远程 Companion 或 P4 E2EE 完成。
+7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单。P2.10 与 P3.5 已完成；P3.6-A protocol contract / P3.6-B Runtime store v4 / P3.6-C transport-neutral stream、barrier、snapshot、transfer 与 publication / P3.6-D 文档收口分别提交为 `7731d1e` / `02cc640` / `694f2d9` / `b668d8f`，当前进入 P3.7 exec gate。真实 provisioned signed Keychain roundtrip 仍有 1 项 ignored 且 gated BLOCKED，App/CLI 也尚未迁到 singleton UDS，transfer/publication 也没有 production remote owner，因此不得宣称 P3.1/P3、远程 Companion 或 P4 E2EE 完成。
 8. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
 
 ## 项目边界

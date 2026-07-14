@@ -1015,7 +1015,7 @@ terminal+expiry transaction 写 Interrupted+Expired。任何 Started turn 尚未
 P3.5 recovery 都保持 RecoveryBlocked、绝不恢复 approval delivery 或后续 Accepted command。
 
 **P3.6 当前状态（2026-07-15）：** P3.6-A=`7731d1e`、P3.6-B=`02cc640`、
-P3.6-C=`694f2d9` 已提交；当前只待 P3.6-D 独立 docs commit。已读回 `runtime_stream` 45/45、
+P3.6-C=`694f2d9`、P3.6-D=`b668d8f` 已提交；当前进入 P3.7。已读回 `runtime_stream` 45/45、
 `runtime_transfer` 17/17、subscription 36/36、daemon lib 464/464（`runtime::` 366 项）、默认并发
 `cargo test -p agentdeckd` exit 0，Swift 256 XCTest + 35 Swift Testing，以及 protocol/schema、fmt、
 clippy、daemon no-net 与 diff gate 全通过。P3.1 provisioned signed Keychain roundtrip 仍有 1 项
@@ -1234,7 +1234,7 @@ roundtrip 的 1 项 ignored 继续记为 P3.1 外部 BLOCKED，不能据此宣�
 - [x] Step 2: 运行 `scripts/verify-agent-docs.sh`、`git diff --check`，并对 design §9、schema snapshot、
   Runtime constants 与 tests 做名称/数值交叉扫描。
 - [x] Step 3: `git status --short --branch` 与 `git diff --name-only --cached` 证明 staged 仅上述 docs，
-  提交 `git commit -m "docs(relay): 收口 P3.6 stream 与 barrier 事实"`。
+  提交 `b668d8f`：`git commit -m "docs(relay): 收口 P3.6 stream 与 barrier 事实"`。
 
 ### Task P3.7：实现两阶段 exec gate、ExecutionFence 与 orphan recovery
 
