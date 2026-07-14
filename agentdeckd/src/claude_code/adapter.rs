@@ -187,15 +187,15 @@ impl ClaudeCodeAdapter {
         if let Some(s) = &opts.output_style {
             cmd.arg("--output-style").arg(s);
         }
-        if let Some(tools) = &opts.allowed_tools {
-            if !tools.is_empty() {
-                cmd.arg("--tools").arg(tools.join(","));
-            }
+        if let Some(tools) = &opts.allowed_tools
+            && !tools.is_empty()
+        {
+            cmd.arg("--tools").arg(tools.join(","));
         }
-        if let Some(tools) = &opts.disallowed_tools {
-            if !tools.is_empty() {
-                cmd.arg("--disallowedTools").arg(tools.join(","));
-            }
+        if let Some(tools) = &opts.disallowed_tools
+            && !tools.is_empty()
+        {
+            cmd.arg("--disallowedTools").arg(tools.join(","));
         }
         if let Some(p) = &opts.mcp_config_path {
             cmd.arg("--mcp-config").arg(p);

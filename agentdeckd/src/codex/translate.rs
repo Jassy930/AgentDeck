@@ -342,10 +342,10 @@ impl CodexTranslator {
             "turn/started" => {
                 // Pure lifecycle, no neutral counterpart in v2. Capture
                 // the threadId opportunistically.
-                if let Some(id) = params.get("threadId").and_then(Value::as_str) {
-                    if self.thread_id.is_none() {
-                        self.thread_id = Some(ThreadId(id.to_string()));
-                    }
+                if let Some(id) = params.get("threadId").and_then(Value::as_str)
+                    && self.thread_id.is_none()
+                {
+                    self.thread_id = Some(ThreadId(id.to_string()));
                 }
                 Vec::new()
             }

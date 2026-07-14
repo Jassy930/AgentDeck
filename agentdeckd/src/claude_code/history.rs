@@ -182,7 +182,7 @@ fn adapter_state_protocol_error(error: RuntimeStoreError) -> ProtocolError {
 /// `-`, also `.`). Round-trip-tested below.
 pub fn encode_cwd(cwd: &Path) -> String {
     let s = cwd.to_string_lossy();
-    s.replace('/', "-").replace('.', "-")
+    s.replace(['/', '.'], "-")
 }
 
 /// Decode a CC project-directory name back into an absolute path.
@@ -428,7 +428,7 @@ fn invalid_native_history() -> ProtocolError {
 /// many more (sessionId, kind, status, state, pid, …). We keep only
 /// the fields the v0.2 sidebar needs, all optional, so a future CC
 /// shape change lands soft.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 struct AgentsJsonRow {
     session_id: Option<String>,
@@ -439,20 +439,6 @@ struct AgentsJsonRow {
     kind: Option<String>,
     state: Option<String>,
     status: Option<String>,
-}
-
-impl Default for AgentsJsonRow {
-    fn default() -> Self {
-        Self {
-            session_id: None,
-            cwd: None,
-            name: None,
-            started_at: None,
-            kind: None,
-            state: None,
-            status: None,
-        }
-    }
 }
 
 /// Parse a `claude agents --json` payload. Tolerant: each row's
@@ -492,7 +478,7 @@ pub fn parse_agents_json_array(raw: &str) -> Result<Vec<HistoryListItem>, Protoc
         let Some(session_id) = row.session_id else {
             continue;
         };
-        let cwd = row.cwd.map(PathBuf::from).unwrap_or_else(PathBuf::new);
+        let cwd = row.cwd.map(PathBuf::from).unwrap_or_default();
         // CC `agents` `state ∈ {stopped, failed, done, blocked}` are
         // "no longer live"; we surface those as `archived=false` (the
         // catalogue still owns them) so the UI sidebar shows them
@@ -548,7 +534,7 @@ fn list_history_from_jsonl_root(
         let p = root.join(encode_cwd(cwd));
         if p.is_dir() { vec![p] } else { vec![] }
     } else {
-        match std::fs::read_dir(&root) {
+        match std::fs::read_dir(root) {
             Ok(rd) => rd
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
@@ -826,14 +812,14 @@ pub fn parse_session_jsonl(
                             }
                         } else if block.get("type").and_then(Value::as_str) == Some("text") {
                             // Plain user prompt that arrived as a block array.
-                            if let Some(t) = block.get("text").and_then(Value::as_str) {
-                                if !t.is_empty() {
-                                    flush(&mut current, &mut turns);
-                                    current.push(AgentItem::UserMessage {
-                                        text: t.to_string(),
-                                        meta: AgentItemMeta::default(),
-                                    });
-                                }
+                            if let Some(t) = block.get("text").and_then(Value::as_str)
+                                && !t.is_empty()
+                            {
+                                flush(&mut current, &mut turns);
+                                current.push(AgentItem::UserMessage {
+                                    text: t.to_string(),
+                                    meta: AgentItemMeta::default(),
+                                });
                             }
                         }
                     }
@@ -850,13 +836,13 @@ pub fn parse_session_jsonl(
                     let bk = block.get("type").and_then(Value::as_str).unwrap_or("");
                     match bk {
                         "text" => {
-                            if let Some(t) = block.get("text").and_then(Value::as_str) {
-                                if !t.is_empty() {
-                                    current.push(AgentItem::AssistantMessage {
-                                        text: t.to_string(),
-                                        meta: AgentItemMeta::default(),
-                                    });
-                                }
+                            if let Some(t) = block.get("text").and_then(Value::as_str)
+                                && !t.is_empty()
+                            {
+                                current.push(AgentItem::AssistantMessage {
+                                    text: t.to_string(),
+                                    meta: AgentItemMeta::default(),
+                                });
                             }
                         }
                         "thinking" => {
@@ -864,13 +850,12 @@ pub fn parse_session_jsonl(
                                 .get("thinking")
                                 .or_else(|| block.get("text"))
                                 .and_then(Value::as_str)
+                                && !t.is_empty()
                             {
-                                if !t.is_empty() {
-                                    current.push(AgentItem::Reasoning {
-                                        text: t.to_string(),
-                                        meta: AgentItemMeta::default(),
-                                    });
-                                }
+                                current.push(AgentItem::Reasoning {
+                                    text: t.to_string(),
+                                    meta: AgentItemMeta::default(),
+                                });
                             }
                         }
                         "tool_use" => {

@@ -145,10 +145,10 @@ fn bash_tool_use_fixture_emits_shell_item_when_present() {
         }
         let out = translator.translate_line(line);
         for ev in &out.events {
-            if let ServerEvent::AgentItem { item, .. } = ev {
-                if matches!(item, agentdeck_protocol::AgentItem::Shell { .. }) {
-                    saw_shell = true;
-                }
+            if let ServerEvent::AgentItem { item, .. } = ev
+                && matches!(item, agentdeck_protocol::AgentItem::Shell { .. })
+            {
+                saw_shell = true;
             }
         }
     }

@@ -145,12 +145,11 @@ impl CodexAdapter {
         if let Ok(out) = std::process::Command::new("/usr/bin/which")
             .arg("codex")
             .output()
+            && out.status.success()
         {
-            if out.status.success() {
-                let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !p.is_empty() {
-                    return Ok(p);
-                }
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !p.is_empty() {
+                return Ok(p);
             }
         }
         for cand in [

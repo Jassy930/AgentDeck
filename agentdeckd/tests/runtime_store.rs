@@ -235,18 +235,17 @@ fn assert_artifacts_unchanged(
             "artifact length changed: {}",
             before_path.display()
         );
-        if let (Some(before_bytes), Some(after_bytes)) = (before_bytes, after_bytes) {
-            if let Some((offset, (before_byte, after_byte))) = before_bytes
+        if let (Some(before_bytes), Some(after_bytes)) = (before_bytes, after_bytes)
+            && let Some((offset, (before_byte, after_byte))) = before_bytes
                 .iter()
                 .zip(after_bytes)
                 .enumerate()
                 .find(|(_, (before_byte, after_byte))| before_byte != after_byte)
-            {
-                panic!(
-                    "artifact changed at {} offset {offset}: {before_byte} -> {after_byte}",
-                    before_path.display()
-                );
-            }
+        {
+            panic!(
+                "artifact changed at {} offset {offset}: {before_byte} -> {after_byte}",
+                before_path.display()
+            );
         }
     }
 }

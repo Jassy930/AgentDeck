@@ -51,6 +51,10 @@ pub struct RuntimeOptions {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "agentKind", rename_all = "camelCase", deny_unknown_fields)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "stable IPC DTO mirror; boxing would churn Rust call sites without changing bounded JSON wire size"
+)]
 pub enum VendorSessionOptions {
     #[serde(rename = "codex")]
     Codex(CodexSessionOptions),
@@ -394,6 +398,10 @@ pub enum HistoryResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "command", rename_all = "camelCase", deny_unknown_fields)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "stable IPC command mirror; boxing would churn public constructors without changing bounded JSON wire size"
+)]
 pub enum ClientCommand {
     Ping,
     Selfcheck,

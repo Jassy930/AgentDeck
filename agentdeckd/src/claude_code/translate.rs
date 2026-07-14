@@ -48,6 +48,7 @@
 //!   1. emit a Shell{Running} / Diff / ToolCall snapshot,
 //!   2. record `tool_use.id → (tool_name, input, started_ms)` in
 //!      `in_flight_tools`.
+//!
 //! When the next `"user"` snapshot brings a `tool_result` with that
 //! `tool_use_id`, we
 //!   1. consume the in-flight record,
@@ -142,10 +143,10 @@ impl ClaudeCodeTranslator {
         // Opportunistic threadId capture — every CC line carries
         // `session_id`, so we keep our cache fresh even if we missed
         // `system.subtype=init`.
-        if self.thread_id.is_none() {
-            if let Some(sid) = parsed.get("session_id").and_then(Value::as_str) {
-                self.thread_id = Some(ThreadId(sid.to_string()));
-            }
+        if self.thread_id.is_none()
+            && let Some(sid) = parsed.get("session_id").and_then(Value::as_str)
+        {
+            self.thread_id = Some(ThreadId(sid.to_string()));
         }
 
         let kind = parsed.get("type").and_then(Value::as_str).unwrap_or("");
