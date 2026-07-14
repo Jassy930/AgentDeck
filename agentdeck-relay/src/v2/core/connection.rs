@@ -918,6 +918,22 @@ impl ConnectionRegistry {
             .collect()
     }
 
+    /// 返回已越过 root-signed MachineLink absolute expiry 的 active connections。
+    /// `None` 代表证书没有 absolute expiry，不参与此清理。
+    pub(crate) fn expired_machine_links(&self, now_ms: u64) -> Vec<ConnectionInstanceId> {
+        self.entries
+            .iter()
+            .filter_map(|(connection, entry)| {
+                (entry.terminal.is_none()
+                    && entry
+                        .access
+                        .as_ref()
+                        .is_some_and(|access| access.machine_link_is_expired_at(now_ms)))
+                .then_some(*connection)
+            })
+            .collect()
+    }
+
     pub(crate) fn record_ping(
         &mut self,
         connection: ConnectionInstanceId,
@@ -1219,6 +1235,7 @@ mod tests {
             trust_epoch: TrustEpoch::new(1),
             link_generation: LinkGeneration::new(1),
             cert_hash: [0x11; 32],
+            absolute_expiry_ms: None,
         })
     }
 
@@ -1572,6 +1589,36 @@ mod tests {
         );
         assert!(registry.timed_out(89_999, 60_000).is_empty());
         assert_eq!(registry.timed_out(90_000, 60_000), vec![connection(5)]);
+    }
+
+    #[test]
+    fn machine_link_expiry_boundary_is_exact_and_none_remains_unbounded() {
+        let mut registry = ConnectionRegistry::new(1);
+        let expiring = AccessContext::Machine(MachineAccess {
+            machine_route: machine(6),
+            connection_instance: connection(6),
+            trust_epoch: TrustEpoch::new(1),
+            link_generation: LinkGeneration::new(1),
+            cert_hash: [0x61; 32],
+            absolute_expiry_ms: Some(100),
+        });
+        let permanent = machine_access(7, 7);
+        for access in [&expiring, &permanent] {
+            let (writer, _receiver) = WriterHandle::channel();
+            registry
+                .attach_pending(access.connection_instance(), writer, 0)
+                .expect("attach");
+            registry
+                .activate(access.clone(), 0, WriterCloseReason::Explicit)
+                .expect("activate");
+        }
+
+        assert!(registry.expired_machine_links(99).is_empty());
+        assert_eq!(registry.expired_machine_links(100), vec![connection(6)]);
+        assert_eq!(
+            registry.expired_machine_links(u64::MAX),
+            vec![connection(6)]
+        );
     }
 
     #[test]

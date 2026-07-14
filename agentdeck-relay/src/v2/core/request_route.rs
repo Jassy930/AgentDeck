@@ -127,6 +127,7 @@ mod tests {
             trust_epoch: TrustEpoch::new(3),
             link_generation: LinkGeneration::new(5),
             cert_hash: [0x41; 32],
+            absolute_expiry_ms: None,
         })
     }
 

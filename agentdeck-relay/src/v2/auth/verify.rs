@@ -158,6 +158,7 @@ fn verify_authentication_endpoint(
                 trust_epoch: machine.trust_epoch,
                 link_generation: link_cert.generation,
                 cert_hash,
+                absolute_expiry_ms: link_cert.not_after_ms,
             };
             if machine.retired {
                 let terminal = decode_retirement_terminal(machine)?;

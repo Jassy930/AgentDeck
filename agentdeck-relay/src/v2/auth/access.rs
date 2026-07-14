@@ -22,6 +22,8 @@ pub struct MachineAccess {
     pub(crate) trust_epoch: TrustEpoch,
     pub(crate) link_generation: LinkGeneration,
     pub(crate) cert_hash: [u8; 32],
+    /// root-signed MachineLink 证书的 absolute expiry；`None` 沿用永久证书语义。
+    pub(crate) absolute_expiry_ms: Option<u64>,
 }
 
 impl fmt::Debug for MachineAccess {
@@ -30,7 +32,15 @@ impl fmt::Debug for MachineAccess {
             .debug_struct("MachineAccess")
             .field("machine", &self.machine_route.redacted())
             .field("generation", &self.link_generation.value())
+            .field("has_absolute_expiry", &self.absolute_expiry_ms.is_some())
             .finish_non_exhaustive()
+    }
+}
+
+impl MachineAccess {
+    pub(crate) fn is_expired_at(&self, now_ms: u64) -> bool {
+        self.absolute_expiry_ms
+            .is_some_and(|expiry| now_ms >= expiry)
     }
 }
 
@@ -148,6 +158,10 @@ impl AccessContext {
             }),
             Self::Pairing(_) => None,
         }
+    }
+
+    pub(crate) fn machine_link_is_expired_at(&self, now_ms: u64) -> bool {
+        matches!(self, Self::Machine(access) if access.is_expired_at(now_ms))
     }
 }
 
@@ -829,6 +843,7 @@ mod tests {
             trust_epoch: TrustEpoch::new(1),
             link_generation: LinkGeneration::new(generation),
             cert_hash: [hash; 32],
+            absolute_expiry_ms: None,
         })
     }
 

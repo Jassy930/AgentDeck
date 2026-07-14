@@ -2377,6 +2377,66 @@ async fn heartbeat_requires_matching_nonce_and_times_out_at_sixty_seconds() {
 }
 
 #[tokio::test]
+async fn machine_link_connection_expires_even_when_matching_pongs_keep_it_alive() {
+    // 威胁场景：攻击者在短期 MachineLink 证书到期前建连并持续回复 Pong，若连接生命
+    // 周期不复核 absolute expiry，就能在证书到期后继续保有完整 machine 权限。
+    let core_config = CoreConfig {
+        initial_now_ms: NOW_MS,
+        ..CoreConfig::default()
+    };
+    let mut fixture = Fixture::new_with_core_config(2_000, None, core_config).await;
+    let mut machine = fixture.connect_machine(0).await;
+
+    for now_ms in [NOW_MS + 20_000, NOW_MS + 40_000] {
+        fixture.core.tick(now_ms).await.expect("heartbeat tick");
+        let RelayFrameBody::Ping(ping) = recv_frame(&mut machine).await.body else {
+            panic!("active machine must receive heartbeat Ping");
+        };
+        assert_applied(
+            fixture
+                .core
+                .handle(
+                    &machine.access,
+                    outer(RelayFrameBody::Pong(Pong { nonce: ping.nonce })),
+                )
+                .await
+                .expect("matching Pong keeps only the heartbeat lease alive"),
+        );
+        assert!(!machine.writer.is_closed());
+    }
+
+    fixture
+        .core
+        .tick(NOW_MS + 60_000)
+        .await
+        .expect("certificate absolute-expiry boundary");
+    assert_receiver_closed(&mut machine).await;
+    assert!(machine.writer.is_closed());
+    assert!(
+        !fixture
+            .auth
+            .is_current(&machine.access)
+            .expect("read expired principal state")
+    );
+    let rejected = fixture
+        .core
+        .handle(
+            &machine.access,
+            register_frame(
+                fixture.realms[0].machine_route,
+                stream(0xee),
+                generation(0xef),
+            ),
+        )
+        .await
+        .expect_err("expired MachineAccess cannot authorize a later frame");
+    assert_eq!(rejected.code, RELAY_AUTH_INVALID_GRANT);
+
+    drop(machine);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn active_generation_replacement_closes_old_writer_and_rejects_stale_access() {
     let mut fixture = Fixture::new(2_000, None).await;
     let mut old = fixture.connect_machine(0).await;

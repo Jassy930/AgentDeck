@@ -676,6 +676,13 @@ impl RelayCoreActor {
     }
 
     fn activate(&mut self, access: AccessContext) -> Result<(), RelayFailure> {
+        if access.machine_link_is_expired_at(self.now_ms) {
+            self.close_connection(
+                access.connection_instance(),
+                WriterCloseReason::AuthorizationInvalidated,
+            );
+            return Err(invalid_access());
+        }
         if let AccessContext::Pairing(pairing) = access.clone() {
             if let Err(error) = self.pair_routes.bind_pairing(&pairing, self.now_ms) {
                 self.close_connection(
@@ -806,6 +813,13 @@ impl RelayCoreActor {
         access: AccessContext,
         frame: OpaqueRouteFrame,
     ) -> Result<RouteOutcome, RelayFailure> {
+        if access.machine_link_is_expired_at(self.now_ms) {
+            self.close_connection(
+                access.connection_instance(),
+                WriterCloseReason::AuthorizationInvalidated,
+            );
+            return Err(invalid_access());
+        }
         if frame.version != RELAY_PROTOCOL_VERSION {
             return Err(failure(
                 RELAY_VERSION_UNSUPPORTED,
@@ -2280,6 +2294,12 @@ impl RelayCoreActor {
             return Err(unavailable("heartbeat clock moved backwards"));
         }
         self.now_ms = now_ms;
+
+        // 威胁场景：被窃取的短期 MachineLink 私钥在证书到期前建连，并用持续 Pong
+        // 绕过 heartbeat timeout；absolute expiry 必须先于下一轮 heartbeat 强制断连。
+        for connection in self.connections.expired_machine_links(now_ms) {
+            self.close_connection(connection, WriterCloseReason::AuthorizationInvalidated);
+        }
 
         let expired = self.pair_routes.tick(now_ms);
         for connection in expired.detached_pairings {
