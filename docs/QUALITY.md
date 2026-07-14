@@ -559,7 +559,7 @@ AGENTDECK_E2E=1 cargo test -p agentdeckd --test cc_adapter_shape \
   -- --exact --test-threads=1
 
 # daemon crate 回归与静态边界
-cargo test -p agentdeckd -- --test-threads=1
+cargo test -p agentdeckd
 bash scripts/check-daemon-no-net.sh
 cargo fmt --all -- --check
 cargo clippy -p agentdeckd --all-targets --no-deps -- \
@@ -703,7 +703,7 @@ cargo test -p agentdeckd --test codex_adapter_shape \
 # Runtime receipt/schema/fixture 与 daemon 全回归；显式禁止误入 live vendor smoke
 cargo test -p agentdeck-protocol -- --test-threads=1
 swift test --filter RuntimeV1ProtocolTests
-env -u AGENTDECK_E2E cargo test -p agentdeckd -- --test-threads=1
+env -u AGENTDECK_E2E cargo test -p agentdeckd
 
 # 静态边界与文档
 cargo fmt --all -- --check
@@ -753,6 +753,106 @@ P3.5 没有真实 vendor 或 UI 手动 QA 退出项：production coordinator、
 `RuntimeExecutionEvent` 与 `agentdeckd --exec-gate` 的真实接线属于 P3.7。未设置 live gate、没有
 Codex/CC 登录或没有公开 WSS 时，结果只能记为 GATED/BLOCKED，不能用 fake delivery、shape test
 或本地 compatibility stdio 冒充端到端通过。
+
+## Relay Companion MVP P3.6 canonical stream / snapshot / transfer 门禁
+
+P3.6 的退出证据分三层：P3.6-A 的 Rust/Swift/wire contract、P3.6-B 的 Runtime store v4/read-only
+WAL pool，以及 P3.6-C 的 StoreCommitHub/subscription/snapshot/transfer/publication component。
+任何一层通过都不能替代后两层，更不能冒充 P4 E2EE/Relay Publish 或 P5 Simulator/物理设备 E2E。
+
+```bash
+# P3.6-A：Runtime/transfer/E2EE kind 与 Rust↔Swift wire
+cargo test -p agentdeck-protocol -- --test-threads=1
+swift test
+cargo run -q -p agentdeck-cli -- protocol schema \
+  | diff - protocol/agentdeck/agentdeck-protocol.schema.json
+
+# P3.6-B/P3.6-C：固定 integration contract 与真实 store/read-pool/snapshot 路径
+cargo test -p agentdeckd --test runtime_stream -- --test-threads=1
+cargo test -p agentdeckd --test runtime_transfer -- --test-threads=1
+cargo test -p agentdeckd --test runtime_store_stream_v4 \
+  --test runtime_store_read_pool --test runtime_snapshot -- --test-threads=1
+
+# daemon-private race/resource/fault matrix与完整 daemon 回归
+cargo test -p agentdeckd --lib runtime:: -- --test-threads=1
+cargo test -p agentdeckd
+
+# 静态边界与文档
+cargo fmt --all -- --check
+cargo clippy -p agentdeckd --all-targets -- -D warnings
+bash scripts/check-daemon-no-net.sh
+git diff --check
+scripts/verify-agent-docs.sh
+```
+
+当前 scoped 证据（2026-07-15）：P3.6-A=`7731d1e`，P3.6-B=`02cc640`，P3.6-C=`694f2d9`。
+`runtime_stream` 45/45、`runtime_transfer` 17/17、subscription 串行门禁 36/36、daemon lib
+464/464（`runtime::` filter 366 项）均通过；默认并发 `cargo test -p agentdeckd` 已读回 exit 0。
+Swift 为 256 XCTest + 35 Swift Testing；`agentdeck-protocol`、CLI protocol schema diff、fmt、
+clippy `-D warnings`、daemon no-net 与 `git diff --check` 全通过。真实 codesigned Keychain
+roundtrip 仍有 1 项 ignored/BLOCKED；ignored 不计 PASS，也不影响“P3.6 component 已收口、P3.1
+仍未完成”的分层结论。
+
+完整 daemon 门禁必须保持上面的默认并发命令；`--test-threads=1` 只用于聚焦 suite 的可重复 race/
+资源时序，不得替代默认调度。威胁场景是 macOS `libtest` 在 soft FD limit 256 下并发创建多份各含
+1 个 writer + 8 个 WAL readers 的真实 RuntimeStore，在业务断言前耗尽 FD。为此 unit
+`cfg(test)` worker 与 integration fixture 各自在单个 test binary 把同时存活的 Store 限为 4；permit
+覆盖 ReadPool/path lease 的完整 teardown。它只稳定测试 harness，production Store、固定 8-reader
+ReadPool、配额与调度完全不变。
+
+门禁至少逐项证明：
+
+- Runtime cursor 的 BeforeFirst/checked-next/u64 exhaustion、tagged Catalog/Conversation inner target、
+  required-null identity matrix、directed SyncComplete、连续非空 Backfill 与 JSON/UDS 700 KiB / remote
+  3.5 MiB carrier 分界在 Rust/Swift/schema/fixture 一致；既有 event ciphertext/nonce/wrapped key 不因
+  legacy bridge 重写。
+- schema v4 只新增六张 stream 表，event audit append-only；v1/v2/v3 migration、每行 token、v4
+  ledger count/bytes/floor、range digest、snapshot hash、publication inner/outer gap/overlap 与
+  FK/orphan 任一 tamper 都 fail-close。logical retention 不得写成物理 audit 回收承诺。
+- ReadPool 固定 8 个 `mode=ro/query_only=ON` WAL connection、128 MiB retained pages、每页
+  64 rows/8 MiB；慢 page/snapshot consumer 持有 memory lease 但不持有 SQLite read transaction，
+  writer/checkpoint 仍可推进。槽/byte cap 满立即 typed overload，不排无界 waiter。
+- StoreCommitHub 先注册 H+1 watch，再在线性化短 operation 捕获 inner H、Relay-committed outer cut、
+  retained floor 与 snapshot source；所有 event COMMIT（含 approval/expiry safety path）只在 durable
+  outcome 后 coalesce HWM。before-COMMIT 不通知，after-COMMIT unknown 必须 readback 后通知，坏 target
+  bucket fail-close 不能改变原 mutation 或阻断健康 target。
+- backfill/snapshot pin 必须在 oneshot send 前绑定 cleanup owner；receiver drop/caller cancellation 不能
+  留下 orphan pin。worker 初始化/migration 的 ready error 必须在 path lease release 后才可见，随后
+  exact reopen 不需要 polling 且不能返回短暂 `StoreAlreadyOpen`。
+- 单 reply pump 严格 `snapshot/backfill → SyncComplete → catchup/live`；Catalog 与 conversation 共用
+  barrier 算法，空流从 BeforeFirst 精确交付 0。disconnect/Unsubscribe/5 分钟 absolute TTL/stale
+  generation 幂等释放 watch/pin/task/count/bytes；partial TransferPart 或任一 send outcome unknown
+  fail-close connection，不补发矛盾 terminal。TTL/前置错误进入无 deadline terminal Failure wait 前
+  必须先 exact release live/barrier/snapshot-sender registry quota；测试在 terminal ACK 前读回 quota=0，
+  同时允许 terminal writer job 保留到 ACK/disconnect；focused core subscription suite 共 36 项并覆盖
+  ACK 前 `(live, barrier, snapshotSender, job)=(0,0,0,1)`、ACK 后 `(0,0,0,0)`。另须覆盖旧 unacked
+  terminal Failure 被 resubscribe 取消后，新 generation 保持 connected 并完成 receipt/snapshot/sync；
+  control cancellation 是正常 handoff，真实 writer/connection error 仍 fail-close。
+- terminal gate 的 6 项专门回归还必须覆盖：disconnect 无 coordination/egress 锁环；pending sibling
+  Unsubscribe/shutdown 不等 Failure ACK；同 target replacement 只让最新 generation 出帧；gate wait
+  超时立即释放 snapshot pin；第五个 pending capture 在 Store capture/spawn 前拒绝；disconnect 胜出
+  后 stale prepare 不重建 per-connection slot。`commit` 必须先登记可取消 job 再返回，激活锁序固定为
+  `egress → coordination`，teardown 在 coordination 内只 detach/cancel、释放锁后再 await handle。
+- pre-delivery error 必须持有 per-connection egress gate 直到 terminal Failure flush ACK/cancel；在此期间
+  sibling job 不得撞单槽 paced reservation，也不得因此 fail-close 健康 connection。同 target 被
+  supersede 的 pending job 不发 stale receipt；未来客户端发 replacement 时必须同步取消旧 waiter。
+  pending capture 硬上界为 4/connection、128/global，且在 Store capture/spawn 前准入。
+- snapshot single-item/10,000 items/64 MiB、global 128 MiB build permit 与 512 MiB ready cap均在真实
+  payload 上验证；caller cancel 后已入队 Store command继续持 shared permit/TEMP pin，error 在 terminal
+  writer wait 前先压缩并释放 retry payload。Catalog frozen cache 计入同一预算，旧 expiry version 不
+  删除续期 cache，每 snapshot 至多一个 sleeper。
+- transfer 的 active count、connection/global bytes、64 parts/64 MiB、5 分钟 TTL、metadata/duplicate
+  conflict、hash/length、stale generation 与 completed tombstone 使用 checked accounting；只有 clone
+  reducer 完整验证后才原子推进 inner cursor 一次，失败/重试不产生部分 apply。
+- publication 只验证注入 opaque/fake sealed blob 的 generation/seq/counter/hash/inner range、
+  COMMIT-unknown byte-identical retry、ACK、restart 与 per-stream fairness。真实 seal、MachineDataSign、
+  CounterGuard、Relay network publish、设备 open/readback 都必须保持未执行状态；Simulator fixture 也
+  不能计入本门禁。`TransferStateMachine` 与 publication dispatcher 目前没有 production remote
+  owner，component test outcome 不能写成 WSS ingress/egress 证据。
+
+P3.1 provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate；P3.7 exec gate、P3.8/P3.9 UDS
+和 P4 remote 尚未完成。因此即使本节全绿，也只能收口 P3.6 component，不得宣称 P3、Companion MVP
+或真实跨网链路完成。
 
 ## AppKit 重写后的验证清单
 
@@ -871,9 +971,10 @@ cargo install cargo-llvm-cov
 | 参考客户端 CLI（agentdeck-cli）、Transport、Client | `cargo test -p agentdeck-cli`；再跑完整 `cargo test` |
 | Relay Companion MVP P0 基线或 v1 reset | 迭代时跑 `bash scripts/tests/reset-relay-v1-dev-state.sh`；提交前跑一次 `bash scripts/verify-relay-companion-mvp.sh p0` |
 | Relay Companion MVP P3.1 daemon namespace / singleton / StorageKEK | 运行本页 P3.1 聚焦矩阵、`cargo test -p agentdeckd`、CLI/Swift transport tests、daemon no-net；stable Keychain 必须另有真实 provisioned signed helper 证据，ignored 不算通过 |
-| Relay Companion MVP P3.2/P3.3 Runtime SQLite / journal / adapter 私表 | 运行本页十四组 store/boundary tests（含真实 256 MiB、paged recovery 与 v1→v2 migration）、canonical router/双 adapter tests、`cargo test -p agentdeckd -- --test-threads=1`、daemon no-net、fmt/clippy/diff/docs；只证明组件，不冒充 RuntimeCore/UDS/Companion E2E |
+| Relay Companion MVP P3.2/P3.3 Runtime SQLite / journal / adapter 私表 | 运行本页十四组 store/boundary tests（含真实 256 MiB、paged recovery 与 v1→v2 migration）、canonical router/双 adapter tests、默认并发 `cargo test -p agentdeckd`、daemon no-net、fmt/clippy/diff/docs；只证明组件，不冒充 RuntimeCore/UDS/Companion E2E |
 | Relay Companion MVP P3.4 RuntimeCore / principal / actor | 运行本页 P3.4 Core+Store+Rust/Swift contract 矩阵、100 路 Start 竞态、daemon 全回归、no-net/fmt/clippy/diff/docs；production execution 必须 disabled，不能冒充 P3.7 exec-gate 或 P3.8/P3.9 UDS E2E |
 | Relay Companion MVP P3.5 approval CAS / delivery | 运行本页 P3.5 固定 16 项聚合 gate，并以 private schema/sqlite/store/permission/worker/actor fault tests 作为行为证据；补跑 adapter shape、Rust/Swift contract、daemon 全回归与静态边界。CC Approval 仍隐藏，fake delivery 不冒充 P3.7 exec-gate/live vendor E2E |
+| Relay Companion MVP P3.6 canonical stream / snapshot / transfer | 运行本页 P3.6 Rust/Swift contract、`runtime_stream`、`runtime_transfer`、store v4/read-pool/snapshot、daemon-private `runtime::` 与完整 daemon 回归；补跑 fmt/no-net/diff/docs。fake sealed publication 只证明状态机，不冒充 P4 E2EE/Relay Publish、UDS 或 Companion E2E |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

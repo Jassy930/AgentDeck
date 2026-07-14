@@ -37,6 +37,14 @@
 
 现有计划暂时保留在 `docs/plans/` 根目录，避免为了归档制造大规模文件移动。后续当计划数量继续增长时，再引入：
 
+当前 active Relay 事实源是 `2026-07-10-relay-companion-mvp-design.md` 与
+`2026-07-10-relay-companion-mvp-implementation.md`。P3.6-A/P3.6-B/P3.6-C 已分别提交为
+`7731d1e`/`02cc640`/`694f2d9`，默认并发完整 daemon gate 已 exit 0；当前只待 P3.6-D 独立 docs
+commit，完成后进入 P3.7 exec gate。
+P3.1 的 provisioned signed Keychain 外部门禁仍有 1 项 ignored/BLOCKED，P3.8/P3.9 UDS、P4 E2EE/Relay Publish
+和 P5 真实 Companion 均未完成；transfer/publication 也尚无 production remote owner。不能因 fake
+publication、store tests 或 Simulator fixture 改写状态。
+
 ```text
 docs/plans/
   active/

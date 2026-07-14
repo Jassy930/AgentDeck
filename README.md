@@ -212,7 +212,7 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（P2.10 完成，P3.1 进行中）
+## Relay Companion MVP 实施状态（P3.6-C 已收口，P3 整体未完成）
 
 Relay production binary 已原子切换到 **Relay v2**。公开数据面只接受
 `/v2/connect`、`/v2/pair` 与 enrollment 所需的 `POST /v2/machine-enroll`；
@@ -318,7 +318,7 @@ lease 全部释放后才返回。
 conversation + stable principal owner + key；本地 owner 不含临时 connection，远程 owner
 不含可续期 grant serial。
 
-Runtime schema v2 在 v1 七表基础上只新增 `codex_adapter_state` 与
+P3.3 的 Runtime schema v2 在最初七表基础上新增 `codex_adapter_state` 与
 `claude_code_adapter_state` 两张互斥私表。resume reference 以 namespace-specific blind
 index + row AEAD 保存，整行删除由 authenticated table totals 检测；同 key/ref 重试幂等，
 跨 namespace 或改写 ref fail-close。物理 schema 升级不会改变冻结的 crypto context v1，
@@ -351,7 +351,7 @@ terminal state + event 都以事务为边界。任何 before-COMMIT failure 完�
 Accepted command 由可注入 daemon clock 在 accept/start/recovery 前 sweep 为 Expired，并写入
 同 conversation 的 canonical expiry event；idempotency ledger 至少保留 30 天。
 
-schema v1 仍严格只有七张表。descriptor、owner/idempotency key、prompt、execution nonce/
+P3.2 最初的 schema v1 严格只有七张表。descriptor、owner/idempotency key、prompt、execution nonce/
 intent、fence payload、event 与 terminal result 都使用 StorageKEK 包装的行密钥加密；blind
 token 会从已认证明文重算。command/conversation/event 的 canonical 明文元数据另有行 MAC，
 `runtime_meta` 保存经过 MAC 的 queue/safety ledger；open 与 recovery begin 都以常量峰值内存
@@ -416,6 +416,55 @@ reap/fence。关停会先用内部 Closing 拒绝新请求并封住 actor start 
 Draining 后不会新增 durable Started。真实 vendor 进程仍必须等 P3.7 `--exec-gate`；当前 stdio
 `RuntimeHub`、App/CLI 也尚未迁到 singleton UDS，
 所以这些单元/集成测试仍不是本地或远程 Companion 端到端完成证据。
+
+### P3.5 approval 与 P3.6 canonical stream 当前边界
+
+P3.5 已把 approval ledger、SQLite first-wins CAS、Applied/DeliveryFailed/Expired 精确回执、
+daemon-owned delivery single-flight 与 terminal+expiry Safety transaction 接入 RuntimeCore；
+对应提交为 `0609152`。Claude Code Approval capability 仍保持隐藏，真实 vendor 执行、
+`RuntimeExecutionEvent` 和 orphan process-group fencing 要等 P3.7 `--exec-gate`，不能用
+side-effect-free fake 或 adapter shape test 冒充 live approval。
+
+P3.6-A 已由 `7731d1e` 冻结 Runtime stream/transfer 的 Rust、Swift、schema 与 fixture contract；
+P3.6-B 已由 `02cc640` 把 Runtime DB 迁到 schema v4。v4 在 v3 approval schema 上增加
+`event_stream_index`、`event_retention`、`catalog_journal`、`snapshots`、
+`publication_streams`、`publication_outbox` 六表，既有 `event_journal` 继续作为 append-only
+authenticated audit，不承诺物理删除历史 audit row。独立 ReadPool 使用 8 个
+`mode=ro/query_only=ON` WAL connection，整个池保留页内存 128 MiB，单页 64 rows/8 MiB；
+短事务复制完成后才把页交给 reply pump。
+
+P3.6-C 已由 `694f2d9` 提交 transport-neutral StoreCommitHub、Catalog/conversation 共用的
+SubscriptionBarrier、连续 backfill/snapshot-required、authenticated snapshot、paced JSON
+TransferPart、transfer reducer 与 publication freeze/COMMIT/ACK 状态机。每个 connection 的 egress
+gate 串行化所有 directed snapshot/backfill/sync 与 live catchup，顺序固定为
+`snapshot/backfill → SyncComplete → catchup/live`；watch 只 coalesce durable HWM，不缓存
+payload，actor/Core/SQLite transaction 都不跨 transport flush wait。subscription `commit` 只登记
+可取消后台 job 并立即返回；terminal Failure 持有 gate 到 flush ACK/cancel，disconnect/Unsubscribe/
+shutdown 仍可从 registry 精确取消 sibling job，不等待该 ACK。
+subscription、barrier、snapshot sender/build、transfer、read page、writer 与 publication outbox
+均有代码固定的 count/byte/absolute-TTL 上界，满载返回 typed failure，不扩成无界队列。
+同 target replacement 只有最新 generation 发 receipt/snapshot/sync，superseded pending job 不发 stale
+receipt；未来客户端发起 replacement 时必须取消旧 request waiter。pending capture 在 Store capture/
+spawn 前受 4/connection、128/global 硬上界，disconnect 胜出后的 stale prepare 不能重建 slot。
+
+本阶段 publication 测试使用注入的 fake sealed blob，只证明 exact blob/hash/inner range 的冻结、
+COMMIT-unknown 逐字节重试、ACK 和重启恢复算法；transfer 测试只证明 Runtime DTO 的 bounded
+重组与 inner cursor 单次推进。`TransferStateMachine` 与 publication dispatcher 尚无 production
+remote owner。真实 MachineDataSign/E2EE seal、Keychain CounterGuard、Relay
+Publish 和远程设备解密属于 P4；iOS 仍是 fixture 驱动 Simulator 前端，不是当前链路证据。
+App/CLI 仍未迁到 singleton UDS，production execution 也仍 disabled，因此 P3、Companion MVP
+和 P3.1 的 provisioned signed Keychain 外部门禁都不能声明完成。
+
+当前 P3.6 组件门禁已确认 `runtime_stream` 45/45、`runtime_transfer` 17/17、subscription
+36/36、daemon lib 464/464（其中 `runtime::` 366 项）、默认并发 `cargo test -p agentdeckd` exit 0，
+Swift 256 XCTest + 35 Swift Testing，以及 protocol/schema、fmt、clippy、daemon no-net 和 diff gate
+全通过。真实签名 Keychain roundtrip 仍有 1 项 ignored/BLOCKED，ignored 不计 PASS。
+
+为让默认并发门禁在 macOS soft FD limit 256 下稳定复现业务行为，test-only admission 将每个 unit/
+integration test 进程同时存活的真实 RuntimeStore fixture 限为 4；每份 Store 仍真实打开 1 个 writer
+与 8 个只读 WAL reader。该限制只防止测试进程在断言前耗尽 FD，不改变 production Store、ReadPool
+或运行时配额。
+具体命令与资源矩阵见 [docs/QUALITY.md](docs/QUALITY.md)。
 
 ## agentdeck CLI（参考客户端 / E2E 驱动）
 

@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved - 六节设计与书面 spec 已确认（2026-07-10）；实施计划已建立，尚未进入代码实现 |
+| 状态 | Approved target；P2.10、P3.5 已完成，P3.6-A/B/C 已分别提交为 `7731d1e`/`02cc640`/`694f2d9`，当前只待 P3.6-D docs commit；P3.1 签名 Keychain 仍有 1 项 ignored/BLOCKED，P3 整体未完成（2026-07-15） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-01-agentdeck-mobile-relay-design.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -21,7 +21,11 @@
 - 取代 `CommandDelivered` 被 UI/CLI 当作业务成功的语义。
 - 取代生产 TLS 配置失败时回退明文的行为。
 
-本文不宣称当前代码已经具备这些能力；当前代码仍停留在 R1b 及 fixture 驱动 iOS 骨架。实施完成必须满足 §17 的 Definition of Done。
+本文不宣称当前代码已经具备全部目标能力。截至 2026-07-15，Relay v2 cutover/P2.10、RuntimeCore/
+approval 与 P3.6 transport-neutral stream component（`694f2d9`）已落地；App/CLI singleton UDS、P3.7 exec gate、
+P4 Machine identity/E2EE/Relay Publish 和真实 Companion 仍未完成，iOS 仍只有 fixture 驱动骨架。
+P3.1 provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate。完整实施仍必须满足 §17 的
+Definition of Done。
 
 ## 1. 背景与当前问题
 
@@ -333,7 +337,7 @@ daemon Keychain：
 
 HPKE 只封装这些小型 keys；事件/命令内容使用对称 AEAD。每个对称 key 只有一个发送方向。新增或撤销设备时轮换 catalog 与 active conversation epoch。新设备不取得旧 epoch；需要历史时由 daemon 以当前 epoch 重新生成 snapshot/history。
 
-所有 key directory/update 都有 MachineDataSign 签名和单调 `keyDirectoryRevision`。成员变化时 daemon 在每个 active stream 记录 `EpochBarrier(streamGeneration, streamCursor=C, eventSeq=H, oldEpoch, newEpoch, keyDirectoryRevision)`：剩余设备从 `next(C)` 使用新 key；新设备的 subscription 从同一 generation/cursor C 接续，先取得以该设备 `DeviceReplyTxKey` 加密的 snapshot，再接共享 `ConversationDEK(newEpoch)` 保护的 `next(C)`。其中 `next(BeforeFirst)=0`、`next(At(n))=n+1`。Relay 不向新设备重放 barrier 之前的旧-key frames。
+所有 key directory/update 都有 MachineDataSign 签名和单调 `keyDirectoryRevision`。成员变化时 daemon 在每个 active stream 记录 `EpochBarrier(streamGeneration, streamCursor=C, innerCursor=H, oldEpoch, newEpoch, keyDirectoryRevision)`：`innerCursor` 是 tagged catalog/conversation cursor，`C/H` 必须来自同一个已提交 publication cut，不能使用尚未提交的 reserved/frozen outer sequence。剩余设备从 checked `next(C)` 使用新 key；新设备的 subscription 从同一 generation/cursor C 接续，先取得以该设备 `DeviceReplyTxKey` 加密的 snapshot，再接共享 `ConversationDEK(newEpoch)` 保护的 `next(C)`。其中 `next(BeforeFirst)=0`，`next(At(n))` 只在 checked-add 成功时成立；到 `u64::MAX` 必须轮换 generation。Relay 不向新设备重放 barrier 之前的旧-key frames。
 
 设备看到已签名的未知更高 epoch/revision 时暂停应用该 stream，发起有界 `KeySync`（最多 3 次、总计 30 秒），不能立刻把正常 key rotation 当作攻击隔离；低于本地最高 revision、签名无效或超出重试窗口才进入 security error。
 
@@ -347,6 +351,11 @@ Relay 可见 `OpaqueRouteFrame` 仅保留：
 - 一段 canonical `sealedBlob` bytes。
 
 `receivedAt` 与 `size` 由 Relay 从实际接收结果计算，不由 sender 声明，也不是加密安全前提。`sealedBlob` 对 Relay 是不可解析字段；endpoint 的 E2EE codec 才解析其中的 E2EE format、key ID/epoch、counter/nonce、key-directory revision、ciphertext 与 endpoint signature。Relay SQLite 必须原样保存完整 canonical blob，不能只留 ciphertext 或把 crypto header 拆成可解释列。
+
+业务 `payloadKind` 不属于上述明文 crypto header，也不进入 sealed-blob TBS/canonical outer。endpoint
+先把 `ADSP1 | E2EE version | payloadKind | payload length | payload bytes` 作为 AEAD plaintext 整体
+加密；只有验签与 AEAD open 成功后才能按 kind 分派。bad magic/version/kind/length/trailing 全部按
+bad-ciphertext fail-close，Relay 或被动观察者不能据公开格式区分 event/backfill/approval/transfer。
 
 Relay v2 的生产 WebSocket outer frame 使用固定、长度前缀的二进制 codec（magic/version/kind/typed fields），`sealedBlob` 直接作为 bytes 携带；不使用 JSON base64 承载生产数据帧。这样 3.5 MiB transfer part 加上 AEAD/outer overhead 后仍可落在 4 MiB WebSocket message 硬上限内。Runtime UDS 与本机 admin socket 仍可使用各自有界 JSONL framing；binary codec 不参与签名 canonicalization，TBS/AAD 继续使用本节定义的独立确定性编码。
 
@@ -431,8 +440,10 @@ idempotency owner 近似授权。
 - Prompt lane：严格按 daemon journal 分配的 `commandSeq` FIFO；一个 active turn；默认最多 32 个 queued prompts。
 - Control lane：approval、cancel、当前 turn vendor control；以有界优先批次领先 prompt/runner，
   但必须保留公平点，禁止持续 control refill 永久饿死 completion/admission。
-- ReadPool：catalog/history/snapshot 进入独立有界读池，不阻塞 prompt/approval；并发槽满时立即
-  返回 typed overload，不允许在 semaphore 后形成无界等待 future。
+- ReadPool：catalog/history/snapshot 进入真正 read-only 的 SQLite WAL 读池；固定 8 个连接、全池
+  retained page memory 128 MiB、单页最多 64 rows/8 MiB。连接使用 read-only/query-only 模式，
+  每页查询结束就释放事务与连接，不能跨网络发送持有 read transaction；槽满时立即返回 typed
+  overload，不允许在 semaphore 后形成无界等待 future，也不能让长读阻塞唯一 store writer。
 - 不同 conversation 可以并行，由全局 adapter semaphore 控制资源上界。
 
 客户端时间、Relay 到达时间和“本地/远程”身份都不能改变排序。
@@ -506,63 +517,261 @@ conversation-scoped command ledger 与 conversation catalog 同生命周期；ar
   必须关闭并清理该 connection。
 - writer 满时标记 Lagged 并断连/重连，禁止静默丢 event。
 - command reply 已在 journal 中，连接丢失后可按 commandId/idempotency 重取。
-- per-conversation event journal 默认 10,000 events 或 64 MiB取先到者；全局默认 512 MiB。
+- event replay logical index 每 conversation 默认 10,000 events 或 64 MiB取先到者；全局同时受
+  131,072 events 与 512 MiB 约束。`event_journal` 继续是 append-only authenticated audit，P3.6
+  只裁剪 logical replay index，不宣称回收其物理页；main+WAL+SHM 仍受 2 GiB 硬上界。
 - event high-water 永不因裁剪或重启回退。
-- prompt 明文 UTF-8 最大 256 KiB，解密后的单个 `RuntimeRequest` 最大 1 MiB；超限在 journal 前拒绝。
+- prompt 明文 UTF-8 最大 256 KiB，解密后的单个 `RuntimeRequest` 业务载荷最大 1 MiB；该业务载荷
+  检查只适用 `RuntimeMessage::Request`，超限在 journal 前拒绝。它与 transport framing 是两条独立
+  约束：JSON/UDS 的完整 `RuntimeEnvelope`（Request/Reply/Stream）统一受 1 MiB hard cap，超过该 cap
+  的 snapshot、backfill 或 TransferPart 必须使用 700 KiB raw part 分片，不能把 request-only 判断当成
+  Reply/Stream 绕过 framing cap 的理由；remote `ADRT1` carrier 另用严格小于 4 MiB 的二进制上限。
 - queued prompt 上界同时受每 conversation 32 条、全机 1,024 条、全机 queued payload 256 MiB 和默认 24 小时 queue TTL 约束，任一先到即返回 typed queue-full/expired。
 - Runtime DB 默认硬上界 2 GiB，并始终保留 512 MiB 或文件系统 5% 可用空间（取较大者）；低于磁盘水位或达到 DB cap 时拒绝新有副作用命令，但继续允许读取、ACK、撤销和导出诊断。
 
 ## 9. Event stream、重放与 snapshot
 
-### 9.1 两层 sequence
+### 9.1 Cursor 与 canonical identity contract
 
-- `RuntimeEvent.eventSeq` 是 daemon canonical sequence，按 conversation 单调。
-- `CatalogSnapshot/CatalogDelta.catalogRevision` 是 daemon catalog 的独立 canonical revision。
-- Relay 外壳 `streamSeq` 是每个随机 **stream generation** 自己的传输序号，与 eventSeq/catalogRevision 完全独立；新 `RegisterStream` 的 SQLite high-water sentinel 初始化为 `-1`，第一帧固定为 `0`。
-- sender counter 用于 nonce uniqueness，不能由 streamSeq 替代。
-- wire/Swift/Rust 统一使用 `StreamCursor::BeforeFirst | At(u64)`，绝不把 SQLite `-1` 编进 unsigned wire；`Subscribe(BeforeFirst)` 表示从 frame 0 开始。
-- `next(BeforeFirst)=0`、`next(At(n))=n+1`；streamSeq 接近 `u64::MAX` 时必须以新随机 route/generation 建 stream 并做 signed barrier，禁止整数 wrap。
-- 客户端必须分别持久化 Relay `streamCursor(streamRoute, generation, BeforeFirst|At(streamSeq))` 与解密后的 `eventSeq/catalogRevision`。外层连续不代表内层业务完整，内层去重也不能代替 Relay ACK。
+- `RuntimeEvent.eventSeq` 按 conversation 单调；`CatalogDelta.catalogRevision` 是完全独立的 catalog
+  revision；Relay `streamSeq` 又是随机 stream generation 内的外层传输序号。三者不得互换。
+- Rust/Swift wire 统一使用 checked `StreamCursor::BeforeFirst | At(u64)`。`checkedNext(BeforeFirst)=0`；
+  `checkedNext(At(n))` 返回 checked 结果，到 `At(u64::MAX)` 必须 typed fail 并轮换随机
+  route/generation，任何层都不得 wrap、saturating advance 或把 SQLite `-1` 编进 unsigned wire。
+- 新增 tagged `RuntimeInnerCursor::Catalog { cursor } | Conversation { conversationId, cursor }`。
+  客户端分别持久化 Relay outer cursor 与解密后的 inner cursor；outer 连续不证明 inner 完整，inner
+  去重也不能代替 Relay ACK。
+- `RuntimeEvent` wire 的 `itemId/entityId/commandId` 三个 key 都是 required-null：缺字段拒绝，
+  `null` 与不存在不是同一契约。语义矩阵固定为：Capabilities=`null/null/null`；Item 必须
+  `itemId+entityId`，若 item 是 UserMessage 还必须有 `commandId`；TurnStarted、ActionRequest、
+  ApprovalResolved、TurnCompleted、TurnInterrupted 都必须 `commandId` 且 item/entity 为 null；Error
+  的 item/entity 必须为 null、command 可 null；body 若仍携带 command identity，必须与外层逐字匹配。
+  `SnapshotItem` 采用同一 identity matrix；构造、Rust decode 与 Swift decode 都执行同一校验。
+- `RuntimeEnvelope.version` 在 Rust/Swift ingress 与 egress 都必须精确等于
+  `RUNTIME_PROTOCOL_VERSION=1`；Hello 内的协商字段不替代 envelope 版本校验。
+- `messageId` 与 `transferId` 的 wire 值必须非空且最多 1,024 UTF-8 bytes。JSON Schema 的
+  `maxLength` 只提供字符数必要上界，并用 `x-maxUtf8Bytes: 1024` 记录真正由双端 codec 强制的
+  byte cap；不能把 1,024 个 Unicode code points 当作 1,024 bytes。
+- Runtime DB v3 已有 event ciphertext 不因 contract 收紧而重写。daemon-private compatibility bridge
+  必须先 strict decode 当前 DTO；仅 strict decode 失败时，才接受一份完整 legacy RuntimeEvent JSON，
+  从 authenticated `event_journal.command_id` 注入并核验 command identity，且 legacy body 内已有
+  command 必须与 journal 一致；补齐全部 required-null key 后再次走 strict decoder。opaque
+  `sealed_event`/fixed event ciphertext、nonce 与 wrapped key byte-identical；bridge 不导出到
+  protocol/Swift，也不形成第二套公开 Runtime v1 wire。
 
-### 9.2 首次订阅与 SubscriptionBarrier
+### 9.2 Runtime wire 最终形状
 
-为避免 snapshot 与 live subscription 之间丢事件：
+- `RuntimeRequest::Subscribe { innerCursor }`、tagged
+  `BackfillRequest::Catalog { after } | Conversation { conversationId, after }` 与
+  `Unsubscribe { target: Catalog | Conversation(conversationId) }` 都使用显式 target；不再用
+  `CatalogRequest.subscribe/sinceRevision` 或 conversation-only cursor 暗示另一套算法。
+- Subscribe/Unsubscribe 返回定向
+  `SubscriptionReceipt::Subscribed { streamGeneration } | Unsubscribed`；target 由原 request messageId
+  关联。Subscribed 只表示预算、generation 与 watcher 已建立，不表示 snapshot/sync 已交付。
+- `RuntimeSyncComplete` 只允许出现在 `RuntimeReply`，不得作为 `RuntimeStreamItem` 广播；它携带
+  outer `streamGeneration/streamCursor`、tagged `innerCursor` 与
+  `keyDirectoryRevision`。
+- `ConversationSnapshot.baseEventCursor` 与 `CatalogSnapshot.baseCatalogCursor` 都是 checked
+  `StreamCursor`，可表达空流 BeforeFirst。Catalog snapshot 的 `nextPageCursor` 是 daemon 签发的
+  opaque frozen cursor，绑定 snapshot ID、冻结 revision、下一 keyset position、principal、绝对
+  expiry；客户端不能自行构造或把 live catalog revision 当分页游标。
+- `BackfillChunk` 是 tagged Catalog/Conversation union。每个 chunk 的 `after/through` 描述连续、
+  非空区间，首条必须等于 checked `next(after)`、尾条必须等于 `through`；空区间用 SyncComplete，
+  不发送空 chunk。Conversation backfill 序列必须先有 SessionCapabilities preamble，再有事件；
+  Catalog 只携带连续 delta。
+- Backfill 的构造、decode 与所有 egress 路径（包括 enum variant 直接构造及 Swift reply flatten）
+  都执行相同的非空、连续、512 entries 与 compact JSON 64 MiB 上限，禁止只在 convenience
+  constructor 校验后由 serializer 绕过。
+- `TransferPart` 是 `RuntimeReply` 与 `RuntimeStreamItem` 的显式 variant；Request 不接受 TransferPart。
+  `RuntimeMessage::Request` 的 1 MiB 业务载荷检查不得冒充 Reply/Stream 业务大小上限；但三类消息在
+  JSON/UDS 上都必须通过独立的完整 frame 1 MiB hard cap，Reply/Stream 超限时走 TransferPart 分片。
 
-1. daemon 在 actor 内锁定 canonical event high-water `H`，同时读取当前 Relay stream cursor `C=BeforeFirst|At(S)`。
-2. 注册只接收 `H+1...` canonical events 的 live watcher；publisher 会把后续 event 编成从 `next(C)` 开始的独立 stream frames。
-3. 通过该设备 `DeviceReplyTxKey` 保护、MachineDataSign 签名的定向 encrypted Reply 发送 `ConversationSnapshot(baseEventSeq=H)`；snapshot 必须先含 SessionCapabilities，再含 AgentItem。共享 ConversationDEK 只用于 barrier 后的 Publish，不用于新设备 bootstrap reply。
-4. 发送 encrypted `RuntimeSyncComplete(streamGeneration, streamCursor=C, eventSeq=H, keyDirectoryRevision)`，随后释放 live buffered events。
+### 9.3 StoreCommitHub 与 SubscriptionBarrier
 
-Catalog 使用同一算法，只把 `eventSeq=H` 换成 `catalogRevision=R`。成员/key epoch 变化记录的 barrier 同时包含外层 generation/cursor 与内层 `H/R`，不能拿 eventSeq 直接当 subscription cursor。空 catalog/conversation 的首次同步必须返回 BeforeFirst，并由测试证明下一帧 0 不丢失。
+唯一 store worker 同时充当 StoreCommitHub：watch 注册、inner high-water `H` 捕获和 commit 通知在
+该 worker 上线性化；所有写事件路径，包括 approval delivery worker，都只能在 event transaction
+COMMIT 后推进 watcher。watcher 只 coalesce 最新 HWM，不缓存 event payload，catchup 始终从 durable
+logical replay index 分页读取。
 
-### 9.3 Relay 快速重放
+每个 `(connection, target, streamGeneration)` 固定执行：
 
-客户端以 tagged `StreamCursor C` 订阅：
+1. 在 Store capture/spawn 前先预留 pending capture（4/connection、128/global），再一次性预留
+   subscription、barrier、snapshot sender、read-page 与 writer 预算；任一不足直接 typed overload，
+   零 Store capture/后台 task。disconnect 已移除 connection slot 后，迟到 prepare 不得重建该 slot。
+2. StoreCommitHub 先注册 `H+1` watcher，再在同一个短 store operation 捕获 inner `H`、其对应的
+   outer `C`、retained floor 与 snapshot base，随后立即释放 writer/SQLite transaction。`C` 只能是
+   Relay 已 COMMIT 且 publication row 已记录其 inner through 的对应 cut；reserved streamSeq、仅本地
+   frozen outbox 或尚未 Relay COMMIT 的 blob 都不能进入 barrier。backfill/snapshot pin 在 oneshot
+   send 前即绑定 cleanup owner，caller/receiver cancellation 不得留下 orphan pin。
+3. 单个 connection-owned egress gate 串行化各 target 的 reply job；每个 job 严格发送 snapshot 或
+   backfill，随后发送 directed SyncComplete，再分页 catchup `H+1...latest`，最后进入 live。
+   `commit` 必须先把可取消后台 job 登记进 jobs map 并立即返回，actor/Core 不 await socket；后台
+   激活锁序固定为 `egress → coordination`。第二个 job 不得越过该 gate，snapshot/backfill/sync/live
+   不会互相 overtaking。
+4. disconnect、显式 Unsubscribe、absolute barrier TTL、lagged writer 或 generation 替换都幂等取消
+   pump/watch/read job 并释放全部预算；旧 generation 即使迟到完成也不能 enqueue 或推进 reducer。
+   前置错误需要发送 terminal Failure 时，进入无 deadline writer wait 前先 exact release
+   live/barrier/snapshot-sender registry quota，terminal writer job 独立保留到 flush ACK/disconnect。
+   quota release 后，resubscribe/Unsubscribe/disconnect 对旧 terminal wait 的 control cancellation 是
+   正常 generation handoff，不得误杀新 generation；真实 writer/connection error 仍 fail-close。
+   pre-delivery error 必须继续持有 per-connection egress gate，直到 terminal Failure flush ACK/cancel，
+   sibling job 不得撞单槽 paced reservation。teardown 在 coordination 内只同步 detach/cancel，释放锁
+   后才 await handle；disconnect/Unsubscribe/shutdown 都不能等待 terminal ACK 或形成反向锁环。
+5. 同 target replacement 只让最新 generation 发送 receipt/snapshot/sync；superseded pending job 被
+   取消且不发送 stale receipt。未来客户端发 replacement 时必须同时取消旧 request waiter，不能等待
+   daemon 为按 contract 撤销的 request 补 terminal receipt。
 
-- Relay 缓存连续包含 `next(C)...current`：按序重放、outer `ReplayComplete(streamGeneration, currentCursor)`、接 live；空 stream 返回 ReplayComplete(BeforeFirst)。
-- Relay 最早帧大于 `next(C)`：返回 `Gap(needStreamSeq=next(C), oldestStreamSeq)` 并暂停该订阅 live；客户端通过 encrypted `Send{BackfillRequest(lastEventSeq/catalogRevision)}` 向 MachineLink 请求 canonical backfill/snapshot。
-- Relay 不得先发送 gap 后面的帧让客户端越过缺口渲染。
+Catalog 与 conversation 使用完全相同的状态机。空流的 `H=BeforeFirst`：conversation 仍发送只含
+SessionCapabilities 的空 snapshot，catalog 发送空 snapshot；SyncComplete inner cursor 保持
+BeforeFirst，之后 event/revision 0 由 watcher/catchup 精确交付。
 
-### 9.4 daemon backfill 与 snapshot
+### 9.4 Backfill、snapshot-required 与分页
 
-- daemon journal 有完整区间：通过 `DeviceReplyTxKey` 保护的定向 encrypted `Reply{BackfillChunk}` 把缺失 eventSeq/catalogRevision 批次发给请求 device，最后发 encrypted `RuntimeSyncComplete(streamGeneration, streamCursor=C, eventSeq=H)`；每个 reply 同样带 MachineDataSign。
-- journal 已裁剪：通过定向 encrypted Reply 发送 `ConversationSnapshot(baseEventSeq=H)` 或 paginated CatalogSnapshot，客户端原子替换 reducer state。
-- Backfill/Snapshot reply 不重新插入 Relay `frames` 表，也不修改 stream high-water；否则旧 seq 会与 Publish 的 `high_water+1` 不变量冲突。
-- 客户端应用 inner state 到 H/R 后，以 sync response 中的 **outer generation/cursor C** 重新 `Subscribe(stream, cursor=C)`（或等价 ResumeLive），Relay 才解除 pause 并从 cursor 下一帧投递；BeforeFirst 的下一帧是 0。
-- ACK 只管理 Relay retention，不决定 daemon journal 裁剪。
-- 客户端先按 sealed-frame replay tuple 去重，再按 eventId/eventSeq reducer 去重；重复密文不能产生重复 UI item 或副作用。item/entity 更新仍使用稳定 itemId/entityId 合并。
+- 首次 Subscribe(BeforeFirst) 走 snapshot；已有 cursor 的显式 Backfill 仅在
+  `checkedNext(cursor)...H` 全区间仍连续保留时走 backfill。cursor 等于 H 只发 SyncComplete；cursor
+  大于 H 返回 cursor-ahead；起点早于 retained floor 进入内部 `NeedSnapshot` decision，当前 egress
+  使用 `daemon.runtime.read_unavailable` + `retained range requires a new snapshot`，不得先发部分
+  backfill，也不得虚构独立 `daemon.stream.*` code。retained range 内部有洞属于 authenticated
+  corruption，不能降级伪装 snapshot-required。
+- Backfill chunk 最多 512 events/deltas 或 64 MiB，取先到者；ConversationSnapshot 最多 10,000
+  items/64 MiB；Catalog 每页最多 500 rows，所有 frozen pages 使用同一 baseCatalogCursor。
+- Backfill/Snapshot 都是定向 reply，不进入 Relay `frames`，不改变 outer HWM。客户端完整应用到
+  SyncComplete.innerCursor 后才从其 outer C resume；ACK 只管理 Relay retention，不决定 daemon
+  logical replay 裁剪。
+- snapshot capture、page read 与网络 flush 之间不持有 conversation actor lock 或 SQLite
+  transaction。单个 reply pump 可以等待 writer permit，但 Core 只保留一个有界 waiter；慢读者只
+  lag/disconnect 自己，不阻塞 store worker、conversation actor 或其他连接。
 
-### 9.5 有界分页与分片
+### 9.5 Runtime store schema v4 与 read pool
 
-Relay 单 frame 硬上限为 4 MiB，因此 E2EE payload 使用统一：
+v4 精确新增六表，`event_journal` 继续作为 append-only authenticated audit：
 
-`TransferEnvelope { transferId, partIndex, partCount, totalSha256, totalBytes, part }`
+- `event_stream_index`：指向 audit event 的连续 logical replay suffix，不复制/重写 sealed event。
+- `event_retention`：每 target 的 retained floor/through、logical count/bytes、active snapshot/barrier/
+  publication pins 与 authenticated range digest。
+- `catalog_journal`：连续 catalog delta 与独立 catalog HWM；默认最多 10,000 deltas/64 MiB。
+- `snapshots`：冻结 target/base cursor、item count/bytes/hash、sealed payload 与 build/ready 状态。
+- `publication_streams`：generation、最后 Relay-committed outer cursor、与其严格对应的 committed
+  inner cursor，以及 ACK cursor。
+- `publication_outbox`：stream generation/seq/counter、inner after/through、payload kind/hash、exact
+  frozen blob、Relay commit/ACK 状态；同一 stream 任一时刻最多一个 in-flight。
 
-- 每个加密前 part 最大 3.5 MiB，单 transfer 最大 64 parts / 64 MiB、TTL 5 分钟；partCount/totalBytes/hash 在首 part 后不可改变。
-- 每 connection 同时重组内存最大 128 MiB；超限、重复 index 不同内容、hash 不符或超时都中止 transfer 并返回 typed error。
-- Catalog 每页最多 500 rows；snapshot、history page 和长 tool output 使用 TransferEnvelope。backfill 仍按 event range 分批，每批内部同样服从上限。
-- 单个不可拆分 AgentItem 在规范化后仍超过 64 MiB 时返回 `daemon.payload.item_too_large`，不得截断后伪装完整。
-- transfer part 占用各自独立 streamSeq 或 request/reply frame；`eventSeq`/`catalogRevision` 只在完整重组并校验总 hash 后推进。
+event logical suffix 每 conversation 10,000/64 MiB、全局 131,072/512 MiB；这些上界只约束
+`event_stream_index`，物理 audit rows 仍受 Runtime DB main+WAL+SHM 2 GiB cap。snapshot 单个最多
+64 MiB、每 conversation 仅一个 ready snapshot、全局 512 MiB；publication outbox 每 stream
+2,000 rows/64 MiB、全局 10,000 rows/512 MiB，未 ACK row 永不删除，达到上界即停止新 publication。
+
+六表每行都有 domain-separated authenticated token；`runtime_meta` v4 ledger 新增并认证
+`audit_event_logical_bytes`、`event_stream_count/bytes`、`catalog_delta_count/bytes`、
+`catalog_retention_floor`、`snapshot_count/bytes`、`publication_stream_count`、
+`publication_outbox_count/bytes`；`event_retention` row 的 retained count/bytes/floor 由自己的 token
+认证。open/recovery 还逐 target 复算 floor/through/HWM、连续 range digest、snapshot hash、
+publication inner/outer 无 gap/overlap 与 FK/orphan；任一 row、count、bytes、cursor、range、hash、
+state 或 ledger token fault 都 fail-close。
+
+v1/v2 直接迁 v4，v3 迁 v4；`RUNTIME_CRYPTO_CONTEXT_VERSION` 保持 1，既有 wrapped key、
+sealed event ciphertext 与 nonce byte-identical。迁移先用旧 ledger 验证完整 audit，再为每个
+conversation 建立满足预算的最大连续 logical suffix；更老部分只变成 snapshot-required boundary，不删
+audit row。catalog 从当前 authenticated HWM 建 v4 snapshot baseline，此后 delta 才入 catalog_journal。
+迁移任何 fault/AfterCommit unknown 都按原输入重开并读回，不产生半份 index。
+worker 初始化/migration 的 ready error 必须在 Runtime DB path lease 已释放后才返回 caller；随后 exact
+reopen 不依赖 polling，短暂 `StoreAlreadyOpen` 不是可接受的恢复语义。
+
+ReadPool 固定 8 个 SQLite `mode=ro`/`query_only=ON` WAL connection；全池 retained page memory
+128 MiB，单 page 64 rows/8 MiB。每次只在短 read transaction 中按 frozen H/keyset cursor 复制一页，
+随后释放 connection/transaction 才交给 reply pump；不能用跨网络长 transaction 阻塞 checkpoint/
+writer。槽或 memory cap 满立即 typed overload。
+
+测试 harness 的 Store admission 不属于生产架构。其具体威胁场景是 macOS `libtest` 在 soft FD limit
+256 下并行创建多份真实 RuntimeStore，每份固定 1 个 writer 与 8 个 WAL readers，在业务断言前耗尽
+FD。unit `cfg(test)` worker 与 integration fixture 各自在单个测试进程把同时存活的 Store 限为 4；
+unit permit 从配置/路径/密钥校验后一直由 worker 持有到 ReadPool 关闭、path lease 释放。production
+build 不含该 admission，8-reader ReadPool、Store 并发语义和全部运行时配额不变。
+
+### 9.6 Publication freeze、COMMIT、ACK 与恢复
+
+publication 先验证 `inner.after == checkedNext(lastCommittedInner)`，分配 generation/streamSeq/counter
+并 seal 一次，再在同一 `BEGIN IMMEDIATE` transaction 冻结 exact blob/hash/inner range；COMMIT 后才
+发送。Relay Publish COMMIT 回执把 outbox row 与 `publication_streams` 的 committed outer+inner cut
+原子推进；只有这个 cut 可供 SubscriptionBarrier/EpochBarrier 使用。ACK 必须精确匹配 generation、
+streamSeq 与 blob hash，错误 ACK fail-close；ACK 只改变 retention eligibility，不得覆盖/重封/删除
+未 ACK row。
+
+COMMIT outcome unknown、断线与 daemon restart 都从 frozen row 逐字节重发，不重新分配 counter 或
+seal。dispatcher 每批最多 64 rows/8 MiB、全局在内存 16 MiB，每 stream 一个 in-flight，跨 stream
+公平轮转。logical replay 只有在 durable snapshot 覆盖该 range，或 exact outbox blob 自己仍拥有该
+range，且没有 active barrier/snapshot pin 时才可裁剪。P3.6 使用 fake sealed blob 只能证明 store
+freeze/COMMIT/ACK/retry/restart 状态机；真实 E2EE seal、CounterGuard 与 Relay Publish 属于 P4，不能把
+P3 fake blob 测试记为 P4 E2EE/Relay 通过。
+P3.6 的 publication dispatcher 只有可注入 transport contract，没有 production Relay transport
+owner；P4 必须在真实 signed-sealed publisher/RemoteLink 下重新通过 crash-boundary 与 readback 门禁。
+
+### 9.7 Transfer carrier、重组与 inner HWM
+
+保留远程 raw part 3.5 MiB、单 transfer 64 parts/64 MiB、absolute TTL 5 分钟。为避免 JSON base64
+使 3.5 MiB part 超过 Relay 4 MiB，远程链路新增 compact binary
+`RuntimeTransferCarrierV1(runtimeVersion,messageId,channel,transferId,partIndex,partCount,totalSha256,totalBytes,rawPart)`；
+channel 只能 Reply/Stream，E2EE `SealedPayloadKind` 新增 `TransferPart`，Relay outer 仍只见 opaque
+sealedBlob。JSON/UDS 使用更小的 transport-specific part 常量，并用 worst-case 实际编码测试证明
+完整 frame 不超过其 framing cap，不能复用 3.5 MiB raw 常量。冻结值为 raw part 700 KiB；以
+最长合法 messageId/transferId、最大 index/count/total 与 base64 payload 实际编码后，完整
+`RuntimeEnvelope` 必须严格小于 UDS JSONL 1 MiB hard cap。3.5 MiB 仅属于 `ADRT1` remote carrier，
+其 AEAD tag、signed sealed blob 与 Relay outer 完整编码必须严格小于 4 MiB。
+transport-specific representability 同样必须校验：JSON/UDS 的 `totalBytes` 不得大于
+`partCount * 700 KiB`；remote compact carrier 则按 `partCount * 3.5 MiB`，两者仍同时受 64 MiB
+transfer 总上限。不能声明一份由该 transport 的全部 parts 永远无法组成的 totalBytes。
+
+重组完成前先比较已计入 connection budget 的 `bufferedBytes == totalBytes`，不匹配时必须在按
+`totalBytes` 预分配 assembly buffer 之前 abort 并释放预算；否则 64 个极小/零字节 parts 可诱导
+额外 64 MiB 瞬时分配并越过 128 MiB connection hard cap。
+
+每 connection 最多 64 个 active transfer、128 MiB reassembly；全局 512 MiB。completed tombstone
+每 connection 256、全局 8,192，absolute TTL 5 分钟。metadata/duplicate conflict、hash/length 错误、
+超限、到 TTL 边界或 disconnect 都必须 abort 并释放 bytes/count；全局/connection 计数使用 checked
+arithmetic，零字节 part 仍占 active-transfer 配额。
+
+part 到达绝不推进 inner cursor。只有所有 parts 齐全、length/hash 正确、canonical decode 成功、
+target/streamGeneration/after/through 匹配、Conversation capabilities preamble 校验通过，并在
+clone reducer 上完整 apply 后，才能原子 swap reducer 与持久化 inner cursor一次。completed
+tombstone/严格 reducer dedup 防止完整 retry 二次 apply；stale generation 完成也不得 commit。
+P3.6 的 `TransferStateMachine` 目前没有 production remote ingress owner；P4/P5 接线前，这些结果只
+证明 component reducer 与 accounting，不是设备端已接收、解密或应用 transfer 的证据。
+
+### 9.8 固定运行时资源上界
+
+| 资源 | 固定上界 |
+|---|---|
+| live subscriptions | 64/connection，4,096 global；connection-bound，无独立 TTL |
+| pending subscription capture | 4/connection，128 global；Store capture/spawn 前准入 |
+| active barriers | 4/connection，128 global；absolute TTL 5 分钟，不因进度续期 |
+| snapshot sender/build | 1 sender/connection，2 global；build retained memory 128 MiB global |
+| snapshots | 10,000 items/64 MiB each；1 ready/conversation；512 MiB global |
+| backfill chunk | 512 events/deltas 或 64 MiB，取先到者 |
+| transfer | 64 active/connection；128 MiB/connection、512 MiB global reassembly |
+| completed transfer tombstone | 256/connection、8,192 global；absolute TTL 5 分钟 |
+| read-only WAL pool | 8 connections；128 MiB retained pages；64 rows/8 MiB per page |
+| publication dispatcher | 64 rows/8 MiB per page；16 MiB global memory |
+| publication outbox | 2,000 rows/64 MiB per stream；10,000 rows/512 MiB global；unacked no-evict |
+| connection writer | 512 frames/16 MiB，transport flush ACK 后释放 |
+
+### 9.9 P3.6 当前实现与验证边界（2026-07-15）
+
+- P3.6-A 已由 `7731d1e` 冻结 Runtime stream/transfer 的 Rust、Swift、schema 与 fixture contract；
+  P3.6-B 已由 `02cc640` 落地 Runtime store v4 与 read-only WAL pool。
+- P3.6-C 已由 `694f2d9` 提交 StoreCommitHub、Catalog/Conversation 共用 barrier、paced egress gate、
+  authenticated backfill/snapshot、bounded transfer reducer 与 publication freeze/COMMIT/ACK/restart
+  状态机；当前只待独立 P3.6-D docs commit，尚未在本文把整个 P3 标为完成。
+- 已读回的 scoped 证据是 `runtime_stream` 45/45、`runtime_transfer` 17/17、subscription 36/36、
+  daemon lib 464/464（`runtime::` 366 项），默认并发 `cargo test -p agentdeckd` exit 0；Swift
+  256 XCTest + 35 Swift Testing，protocol/schema、fmt、clippy、daemon no-net 与 diff gate 均通过。
+  真实签名 Keychain roundtrip 的 1 项 ignored 仍是外部 BLOCKED，不计 PASS。
+- publication 仍使用注入的 opaque/fake sealed blob；transfer 仍只证明 Runtime component 的 bounded
+  reassembly/apply；两者都没有 production remote owner。这里没有真实 MachineDataSign/E2EE seal、
+  Keychain CounterGuard、Relay Publish、
+  设备 open/readback、UDS 或 iOS network E2E；这些分别保留给 P3.7–P5 与 §17 门禁。
+- 设计信任根仍是流程外提供的正确 OS account/Keychain entitlement、初始 StorageKEK 与真实 Relay
+  TLS identity。P3.6 证明不了 provisioned signed Keychain roundtrip，不能消除 P3.1 的外部 BLOCKED
+  状态，也不能证明整库历史回滚防护。
 
 ## 10. Relay Protocol v2
 
@@ -747,7 +956,7 @@ macOS executable 侧增加 `LocalDaemonSessionSource`（RuntimeEnvelope v1 over 
 
 conversation stream 返回：
 
-- `snapshot(baseSeq)`。
+- `snapshot(baseEventCursor)`；空 conversation 保持 BeforeFirst，不用 0 冒充 snapshot base。
 - `event(RuntimeEvent)`。
 - `commandState`。
 - `connectionState`。
@@ -810,6 +1019,9 @@ Relay 外层错误只描述通用路由/传输失败；daemon 业务错误必须
 - `remote.crypto.bad_ciphertext`、`remote.crypto.key_epoch_missing`、`remote.crypto.key_revision_rollback`、`remote.crypto.counter_replay`、`remote.crypto.nonce_reuse`、`remote.crypto.bad_sender_signature`。
 - `remote.transport.tls_pin_mismatch`、`remote.machine.offline`。
 - `remote.transfer.too_large`、`remote.transfer.hash_mismatch`、`remote.transfer.expired`、`remote.transfer.reassembly_full`。
+- P3.6 stream/barrier 当前复用已冻结的 `daemon.runtime.read_unavailable`、
+  `daemon.runtime.connection_unavailable`、`daemon.runtime.invalid_state` 与 store-specific
+  `daemon.runtime.*` code；没有另造 `daemon.stream.*` wire family。
 - `daemon.command.idempotency_conflict`、`daemon.command.queue_full`、`daemon.command.queue_expired`、`daemon.command.interrupted`、`daemon.runtime.recovery_blocked`、`daemon.runtime.disk_low`。
 - `daemon.approval.already_handled`、`daemon.approval.delivery_failed`、`daemon.approval.expired`、`daemon.turn.stale`。
 - `daemon.payload.item_too_large`。
@@ -1034,7 +1246,7 @@ MVP 完成不扩展到 APNs、后台常驻、离线 transcript、附件、多租
 | 多写者让用户误以为本地端优先 | 所有端显示 daemon queue/approval canonical 状态，不引入本地特权 |
 | 共享 stream key 被恶意设备用于伪造 daemon 事件 | AEAD 之外强制 MachineDataSign，设备验证 root-signed data cert 与单调 generation |
 | SQLite/备份回滚造成 nonce 重用 | Keychain CounterGuard 先预留 block；检测 DB 落后即退休 epoch/rekey，无法协调时 remote fail-closed |
-| 大 snapshot/tool result 超过 Relay frame cap | 500-row catalog page + 3.5 MiB TransferEnvelope parts，限制总 parts/bytes/TTL/reassembly memory |
+| 大 snapshot/tool result 超过 Relay frame cap | 500-row catalog page；远程 compact binary carrier 才使用 3.5 MiB raw part，JSON/UDS 使用更小 part；统一限制 parts/bytes/TTL/reassembly memory |
 
 ## 20. 明确拒绝的替代方案
 

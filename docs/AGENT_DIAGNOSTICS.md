@@ -500,11 +500,13 @@ ignored 测试不是通过证据。
 | `daemon.diagnostics.path_unavailable` | diagnostics one-shot 无可用日志路径 | 提供合法 profile/absolute data-dir，或先创建一次诊断日志 |
 | `daemon.runtime.main_loop_failed` | security bootstrap 已完成，但 stdio RuntimeHub 主循环失败 | 按同一 diagnostic log 检查 IPC I/O；guard/KEK 会随进程退出释放/清零 |
 
-## Runtime SQLite / journal / adapter 私表 / Core 诊断（Companion MVP P3.2–P3.5）
+## Runtime SQLite / journal / adapter 私表 / Core 诊断（Companion MVP P3.2–P3.6）
 
-P3.2/P3.3 error code 是 store 内部精确错误的稳定诊断归类；P3.4/P3.5 已负责映射成 wire
-`RuntimeFailure`，并增加 Core/principal/connection/read overload、approval authorization 与
-delivery 分类。排查时保留 DB/WAL/SHM 原件，先运行 diagnostics/read-only inspection，
+P3.2/P3.3 error code 是 store 内部精确错误的稳定诊断归类；P3.4–P3.6 已把接入 RuntimeCore 的
+路径映射成 wire `RuntimeFailure`，并增加 Core/principal/connection/read overload、approval
+authorization、delivery 与 stream/snapshot 分类。transfer reducer 仍只有 component-local typed
+error，没有 production wire owner。排查时保留 DB/WAL/SHM 原件，先运行 diagnostics/read-only
+inspection，
 不要用删除 sidecar、生成新 KEK 或直接改 high-water 的方式“修复”。
 
 ### Store shutdown deadline 语义
@@ -535,10 +537,21 @@ scan active 时 inspect 与 shutdown 仍可用；create/accept/start、fence/rel
 cursor/单 outstanding scan 限制。若 scan 无法结束，保留 DB/WAL/SHM 与 Keychain 原件后让
 daemon fail-closed 退出，不要跳页、伪造 cursor 或删除 sidecar。
 
+worker 初始化或 migration 通过 ready channel 返回错误前，必须先释放 Runtime DB path lease；caller
+收到错误后可直接 exact reopen。若此时仍得到 `daemon.runtime.store_unavailable`/`StoreAlreadyOpen`，
+保留进程与 path-owner 证据，不要用轮询掩盖 lease ownership 错误。
+
+测试进程里的 `failed to initialize runtime read-only WAL pool` 还要先区分 harness FD 耗尽：macOS
+默认 soft FD limit 256，而每份真实 RuntimeStore fixture 固定打开 1 个 writer 与 8 个 WAL readers。
+当前 unit `cfg(test)` worker 与 integration fixture admission 都把单个测试进程同时存活的 Store 限为
+4，permit 一直持有到 ReadPool 关闭/path lease 释放。该机制防御的是默认并行 `libtest` 在业务断言前
+耗尽 FD，并非 production 限流；不要据此把 production ReadPool 从 8 降低、提高系统 FD 上限来掩盖
+fixture 泄漏，或把 test-only admission 暴露为运行时配置。
+
 | P3.2/P3.3 code | 常见内部原因 | 下一步 |
 | --- | --- | --- |
 | `daemon.runtime.store_invalid` | path/type/owner/mode/nlink、busy/count/byte config 或 operation input 不合法 | 核对 0700 namespace、0600 artifacts 和固定 config；拒绝 symlink/hardlink，不自动放宽 |
-| `daemon.runtime.schema_incompatible` | schema family/version/signature/live manifest、typed canonical descriptor/row linkage、逐 conversation HWM、authenticated metadata、command/execution/event/approval totals 或两类 adapter-state total 不一致 | 停止写入并保留 main/WAL/SHM/journal；v1/v2→v3 只能走内置原子 migration，不能原地猜测/手改 schema |
+| `daemon.runtime.schema_incompatible` | schema family/version/signature/live manifest、typed canonical descriptor/row linkage、逐 conversation HWM、authenticated metadata、command/execution/event/approval/stream/snapshot/publication totals 或两类 adapter-state total 不一致 | 停止写入并保留 main/WAL/SHM/journal；v1/v2/v3→v4 只能走内置原子 migration，不能原地猜测/手改 schema |
 | `daemon.runtime.store_unavailable` | worker/shutdown/commit outcome、clock/capacity probe、SQLite/I/O、sequence coordination，或 bounded checkpoint 被 reader pin 住 | 对 unknown outcome 用完全相同 stable ID/idempotency input 重试；checkpoint blocked 时停止新副作用、释放 reader 并保留 WAL，其他错误保留 evidence 后重启/修复底层 I/O |
 | `daemon.runtime.store_busy` | normal/safety/read lane 的 count 或 retained-allocation byte permit 已满 | 客户端退避并保持同一 idempotency key；不要并发重发新 key |
 | `daemon.runtime.recovering` | 已冻结 paged recovery barrier，终页尚未核账并 finish | 继续使用上一页返回的 exact cursor；RuntimeCore 逐页消费，终页 finish 后再开放请求，不得并行 mutation |
@@ -560,7 +573,7 @@ P3.4 RuntimeCore 的 transport-neutral failure：
 | `daemon.runtime.not_ready` | Core 尚未完成 paged recovery，或正在 draining/stopped | 等待 daemon readiness；若 recovery 无法完成，按上节保留 DB/Keychain 证据并 fail-close |
 | `daemon.runtime.protocol_mismatch` | Runtime v1 版本不兼容 | 升级客户端/daemon 到同一 Runtime protocol；不能回退 Relay/IPC 业务字段 |
 | `daemon.runtime.invalid_request` | ID 非 canonical UUID、Start key/cwd 或其他规范化输入非法 | 修正原请求；不得由 daemon 猜 ID/path 或替客户端补目标 |
-| `daemon.runtime.feature_unavailable` | 请求属于尚未接线的后续 phase（P3.6–P4），或依赖尚未启用的 production execution | 读取 capabilities/实施状态后等待对应 phase；不得用 compatibility path 或 fake coordinator 假成功 |
+| `daemon.runtime.feature_unavailable` | 请求属于尚未接线的后续 phase（P3.7–P4，例如 pairing/revoke/trust reset），或依赖尚未启用的 production execution | 读取 capabilities/实施状态后等待对应 phase；Catalog/Subscribe/Backfill 已进入 P3.6，不应再用该 code 代替其真实错误；不得用 compatibility path 或 fake coordinator 假成功 |
 | `daemon.authorization.revoked` | opaque principal lease 已 Revoking/Revoked 或 issuer registry 不可用 | 停止该 connection；remote 设备按 durable revocation/re-pair 流程处理，本地重新认证 peer credential |
 | `daemon.runtime.identity_unavailable` | machine trust/ID derivation domain 非法或 OS entropy 不可用 | 停止启动并检查 machine identity/系统熵；不得生成零 ID 或使用时间/PID 回退 |
 | `daemon.runtime.actor_unavailable` | conversation actor/execution control 已损坏或 recovery-blocked | 不自动重放 Started；保留 command/fence 证据，P3.7 按 orphan fencing 处理 |
@@ -612,6 +625,63 @@ Codex route 只有完整 flush 后才算 Applied，失败时保留精确 route�
 capability 目前仍隐藏，直到 P3.7 recorded fixture/live gate 完成。P3.5 的 private fake
 delivery 测试不是 live vendor 证据；看到 production CC approval 或未经过 exec-gate 的真实投递，
 应视为 capability exposure/接线错误并立即 fail-close。
+
+### P3.6 stream / snapshot / transfer 诊断
+
+Catalog、Subscribe、Backfill 与 Unsubscribe 已由 P3.6-C 提交 `694f2d9` 接入 transport-neutral
+RuntimeCore，不再返回 P3.6 `FeatureUnavailable`。正常 barrier 顺序固定为
+`snapshot/backfill → SyncComplete → catchup/live`；若已经 flush 任一 snapshot/backfill/TransferPart
+后发生错误，daemon 会 fail-close 当前 connection，绝不再发送可能与客户端已见前缀矛盾的 terminal
+Failure。客户端必须重连，并用 durable inner cursor/新的 snapshot 重新建立 generation，不能在原
+connection 猜测续传成功。
+
+| failure code / 状态 | 常见原因 | 下一步 |
+| --- | --- | --- |
+| `daemon.runtime.read_unavailable` | subscription/barrier/snapshot sender、pending capture（4/connection、128/global）或 one-shot Catalog quota 已满；absolute 5 分钟 barrier/cursor TTL 到达；catalog cursor 无效/跨 principal/跨进程；cursor ahead、snapshot-required、stale generation；read-only WAL pool 或 snapshot build 128 MiB 不可用；authenticated snapshot/backfill decode 失败 | 对 overload 有界退避；expired/invalid cursor 重新发 fresh Catalog/Subscribe；reply message 为 `retained range requires a new snapshot` 时重新取 fresh snapshot，不能要求 partial backfill，也不要虚构独立 `daemon.stream.*` code；保留同一 durable inner cursor，不增加无界 waiter。若相同 frozen reference 持续失败，保留 DB/WAL/SHM 并按 schema/crypto corruption 处理 |
+| `daemon.runtime.connection_unavailable` | paced writer reserve/commit/flush 失败，或 TransferPart 已部分交付、客户端未 ACK | 只关闭并重连当前 connection；从最后已完整应用并持久化的 inner cursor/snapshot 恢复。不得把 transport close 当作 command 未执行或 transfer 已完整应用 |
+| `daemon.runtime.store_unavailable` | StoreCommitHub authenticated readback、snapshot store、backfill pin completion、publication freeze/COMMIT/ACK 或 cleanup 的 SQLite outcome 不可确认 | 对带 stable input 的 store mutation只重试原输入；subscription 重新建 barrier。不要手工删除 TEMP/stream/snapshot/publication row，也不要把 frozen-but-uncommitted outer cut 当成 Relay-committed |
+| `daemon.runtime.invalid_state` / `daemon.runtime.invalid_request` | Runtime request 的 ID/target/shape 非法，或 authenticated store state 与请求绑定不一致 | 修正原 request；不得由 daemon 猜 target/ID，也不能手工改 store state 强行接受。snapshot-required/cursor/stale generation 属于上面的 read failure，不要合并成通用 invalid request |
+
+Catalog page cursor 使用进程内随机 HMAC key，绑定 snapshot、principal、下一 keyset position 与 absolute
+5 分钟 expiry；daemon 重启后旧 cursor 必然失效，这是恢复语义，不是 durable cursor 损坏。每个 frozen
+catalog cache 只保留一个可替换 expiry task；反复读取不会为同一 snapshot 累积 sleeper。若 cache/budget
+在失败后没有释放，优先核对 disconnect/expiry job 与全局 128 MiB shared snapshot budget，不要延长 TTL
+或改成无界缓存。
+
+conversation snapshot 的 exact TEMP build pin 与 shared build permit 会跨已入队 Store command 保存。
+caller disconnect/cancel 只停止观察，不会让 worker 尚持大 payload 时提前归还预算；store failure 进入
+无 deadline terminal flush wait 前必须先丢弃 retry payload、pin 与 permit。看到 barrier 卡住时，应区分
+“worker 仍在完成已接管 store”与“terminal frame 未 ACK”；不要并行启动第二个大 snapshot 绕过全局
+128 MiB 上界。barrier TTL/前置错误进入 terminal wait 前还会 exact release live/barrier/
+snapshot-sender registry quota；若 terminal Failure 一直未 ACK，保留的只能是 terminal writer job，
+不能继续占用上述 registry quota。若出现 `runtime_subscription_quota_release_failed`，说明 exact lease
+release 的 registry mutex/状态异常，daemon 会 fail-close 当前 connection；保留该诊断与同进程 DB/WAL/
+SHM，不要绕过 registry 手工释放计数。quota 已释放后，resubscribe/Unsubscribe/disconnect 取消旧
+terminal wait 是正常 generation handoff，不应产生 `daemon.runtime.connection_unavailable` 或误杀新
+generation；若仍出现，保留 subscription generation 与 writer flush 诊断按 race 处理。
+pre-delivery error 的 terminal Failure 在 flush ACK/cancel 前继续持有 per-connection egress gate；若
+同 connection 的 sibling 在 terminal 未 ACK 时出现 paced reservation slot conflict，说明 gate
+ownership 提前释放，应按并发 race 保留 writer/flush 证据，不能简单扩大 writer slot。
+subscription `commit` 应在登记可取消后台 job 后立即返回；激活锁序是 `egress → coordination`，
+teardown 只在 coordination 内 detach/cancel，释放锁后再等待 handle。若 disconnect、Unsubscribe 或
+shutdown 卡在未 ACK terminal 上，或 Core operation 自身等 socket gate，应按 job registration/锁序
+回归处理，不能用 terminal flush deadline 或 detached task 规避。
+
+同 target replacement 只给最新 generation 发 receipt/snapshot/sync；被 supersede 的 pending request
+不会收到 stale receipt。未来 P3.8/P4 客户端发出 replacement 时必须同步取消旧 request waiter，否则
+旧 waiter 会永久等待一个按 contract 不再发送的回执。若日志出现旧 messageId 的迟到 receipt，或
+disconnect 已胜出后 pending-slot map 被 stale prepare 重建，应保留 generation/messageId 与
+coordination gate 时序；不要提高 4/connection、128/global 上界来掩盖 race。
+StoreCommitHub 同样在 oneshot reply 前把 backfill/snapshot pin 交给 cleanup owner；receiver/caller
+在 reply 交接窗口取消时，pin 应由该 owner 自动释放。出现 pin 长期占用时不要手工删 row，先核对
+`pin created -> cleanup bound -> oneshot send` 的顺序与对应 worker diagnostic。
+
+P3.6 publication 只接受测试注入的 opaque/fake sealed blob，验证 freeze/COMMIT/ACK/restart 算法。
+当前 daemon 没有真实 MachineDataSign/E2EE seal、CounterGuard 或 Relay Publish；任何日志/报告把
+fake blob、Runtime TransferPart 或 Simulator fixture 写成远程密文已发布，都属于阶段状态错误。
+transfer reassembly 当前仍是 bounded component API，duplicate/metadata/hash/length/TTL/配额冲突返回
+typed `TransferError`；`TransferStateMachine` 与 publication dispatcher 都没有 production remote owner。
+在 P4/P5 把它们接入真实远程收发前，不要虚构新的 production wire failure code 或 WSS 诊断。
 
 P3.3 canonical adapter 边界的错误不会携带 raw resume reference：
 

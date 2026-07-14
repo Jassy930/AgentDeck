@@ -10,7 +10,7 @@
 4. `docs/index.md`：文档记录系统导航。
 5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code（含 CC adapter failure codes）。
 6. `docs/QUALITY.md`：验证命令、质量门禁和文档结构检查（含 v0.2 手动 QA 清单）。
-7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单。P2.10 已完成；P3.1/P3.2/P3.3/P3.4 代码分别提交为 `835a7b3`/`8744750`/`3c58f2a`/`a58d84e`，下一项是 P3.5 approval first-wins。真实 provisioned signed Keychain roundtrip 仍 gated BLOCKED，因此不得宣称 P3.1/P3 完成，继续按计划执行 P3–P6。
+7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单。P2.10 与 P3.5 已完成；P3.6-A protocol contract / P3.6-B Runtime store v4 / P3.6-C transport-neutral stream、barrier、snapshot、transfer 与 publication 组件分别提交为 `7731d1e` / `02cc640` / `694f2d9`，当前只待 P3.6-D 独立文档提交，随后进入 P3.7 exec gate。真实 provisioned signed Keychain roundtrip 仍有 1 项 ignored 且 gated BLOCKED，App/CLI 也尚未迁到 singleton UDS，transfer/publication 也没有 production remote owner，因此不得宣称 P3.1/P3、远程 Companion 或 P4 E2EE 完成。
 8. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
 
 ## 项目边界
@@ -160,7 +160,7 @@ cargo test -p agentdeckd \
   --test runtime_store_commit_outcome --test runtime_store_recovery \
   --test runtime_store_shutdown \
   -- --test-threads=1
-cargo test -p agentdeckd -- --test-threads=1
+cargo test -p agentdeckd
 bash scripts/check-daemon-no-net.sh
 ```
 
@@ -179,7 +179,7 @@ cargo test -p agentdeckd --lib -- --test-threads=1
 cargo test -p agentdeckd --test adapter_state_boundary --test agent_router \
   --test cc_adapter_shape --test codex_adapter_shape -- --test-threads=1
 cargo test -p agentdeckd --lib runtime::store::sqlite::migration_tests -- --test-threads=1
-cargo test -p agentdeckd -- --test-threads=1
+cargo test -p agentdeckd
 AGENTDECK_E2E=1 cargo test -p agentdeckd --test codex_adapter_shape \
   real_codex_canonical_start_binds_private_state_then_emits_capabilities -- --exact
 AGENTDECK_E2E=1 cargo test -p agentdeckd --test cc_adapter_shape \
@@ -205,7 +205,7 @@ cargo test -p agentdeckd --lib runtime:: -- --test-threads=1
 cargo test -p agentdeckd --test runtime_core --test runtime_store_p34 -- --test-threads=1
 cargo test -p agentdeck-protocol -- --test-threads=1
 swift test --filter RuntimeV1ProtocolTests
-cargo test -p agentdeckd -- --test-threads=1
+cargo test -p agentdeckd
 bash scripts/check-daemon-no-net.sh
 ```
 
@@ -221,6 +221,48 @@ writer 最多 128，principal lease（含 revoked tombstone）最多 1,024；fra
 队列同样必须有硬上界。Core 先 Closing 并等待 operation/start lease 静默，再公开 Draining；
 shutdown/Drop 后不得残留自持有 writer 或 detached actor 子任务。P3.7 前 production
 execution coordinator 固定 disabled，side-effect-free fake 不是真实 vendor exec 证据。
+
+### Relay Companion MVP P3.6（canonical stream / snapshot / transfer 门禁）
+
+```bash
+# P3.6-C 固定 integration contract
+cargo test -p agentdeckd --test runtime_stream -- --test-threads=1
+cargo test -p agentdeckd --test runtime_transfer -- --test-threads=1
+
+# Store v4、snapshot/read-pool 与全部 daemon-private Runtime 行为
+cargo test -p agentdeckd --test runtime_store_stream_v4 \
+  --test runtime_store_read_pool --test runtime_snapshot -- --test-threads=1
+cargo test -p agentdeckd --lib runtime:: -- --test-threads=1
+
+# Rust/Swift contract、完整 daemon 回归与静态边界
+cargo test -p agentdeck-protocol -- --test-threads=1
+swift test
+cargo run -q -p agentdeck-cli -- protocol schema \
+  | diff - protocol/agentdeck/agentdeck-protocol.schema.json
+cargo test -p agentdeckd
+cargo fmt --all -- --check
+cargo clippy -p agentdeckd --all-targets -- -D warnings
+bash scripts/check-daemon-no-net.sh
+git diff --check
+scripts/verify-agent-docs.sh
+```
+
+该门禁只证明 StoreCommitHub、Catalog/Conversation 共用 barrier、连续 backfill/snapshot-required、
+authenticated snapshot、paced JSON TransferPart、bounded reducer 与 fake sealed publication
+freeze/COMMIT/ACK/restart。P3.6-C 已由 `694f2d9` 收口；最终回归包含 daemon lib 464/464、
+`runtime::` 366 项、默认并发 `cargo test -p agentdeckd` exit 0，以及 Swift 256 XCTest +
+35 Swift Testing。真实签名 Keychain roundtrip 的 1 项 ignored 仍是外部 BLOCKED，不得计入 PASS。
+
+subscription `commit` 只登记可取消后台 job，不等待 socket egress gate。terminal Failure 会持有
+per-connection gate 到 flush ACK/cancel；同 target 被新 generation 取代时旧 job 不发迟到 receipt，
+未来客户端发起 replacement 时必须同步取消旧 request waiter。pending capture 在 Store capture/spawn
+前受 4/connection、128/global 硬上界。测试 harness 为防 macOS 默认并行测试用多个真实 Store
+（每个 1 writer + 8 WAL readers）耗尽 soft FD，仅在 unit/integration test 进程把并发 Store fixture
+限制为 4；production Store、8-reader ReadPool 和所有运行时配额不变。
+
+P3.6 不执行真实 E2EE seal、MachineDataSign、Keychain CounterGuard 或 Relay Publish，
+transfer/publication 也尚无 production remote owner；Simulator fixture 不是远程链路。P3.7 exec gate、
+P3.8/P3.9 UDS 与 P4 remote 仍是后续任务。
 
 ## 浏览与外部资料
 

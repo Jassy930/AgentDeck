@@ -13,7 +13,7 @@
 
 - `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、Relay v2 failure code、v1 marker
   显式 reset 和排查流程。
-- `QUALITY.md`：按变更范围选择验证命令，以及 Companion MVP P2 与文档结构检查入口。
+- `QUALITY.md`：按变更范围选择验证命令，以及 Companion MVP P2、P3.1–P3.6 与文档结构检查入口。
 - `RELAY_RUNBOOK.md`：production Relay v2 Direct TLS、本机 admin UDS、machine
   enrollment、fingerprint-bound readback/purge 与 root-lost 重新配对操作手册。
 
@@ -47,7 +47,7 @@
 ### Relay Companion MVP（2026-07-10）
 
 - `plans/2026-07-10-relay-companion-mvp-design.md`：已批准的目标架构；固定 singleton daemon、多读者/多写者串行裁决、按机器独立配对、Relay 严格最小可见与真实 iOS Companion 边界。
-- `plans/2026-07-10-relay-companion-mvp-implementation.md`：P0–P6、48 个逐文件 TDD task；P2.10 已完成，P3.1 namespace/singleton/StorageKEK 代码已提交但真实 provisioned signed Keychain roundtrip 仍因本机缺 provisioning profile / AMFI exit 137 gated BLOCKED。P3.2 已建立严格七表 Runtime journal、stable IDs、认证 metadata/ledger、事务重放、TTL/fence、真实 256 MiB 容量门禁与逐 conversation paged recovery；P3.3 已把 schema 原子迁移为九表，建立 typed canonical adapter contract、两个 StorageKEK 私有 namespace、sealed vault composition、Codex/CC authoritative identity 与 CC native-history fail-close 重建；P3.4 已接入 transport-neutral RuntimeCore、opaque principal/shared lease、per-conversation actor、精确 Start/cancel/query contract、flush-ACK writer 与 cold release capability。production execution 仍严格 disabled，当前 stdio App/CLI 也尚未迁到 singleton UDS；下一项是 P3.5 approval first-wins，之后继续 UDS/LaunchAgent、持久远程 CLI、iOS/远程 macOS 与真实跨网 DoD。
+- `plans/2026-07-10-relay-companion-mvp-implementation.md`：P0–P6 的逐文件 TDD 执行清单。P2.10 与 P3.5 已完成；P3.6-A Runtime/transfer contract、P3.6-B Runtime store v4、P3.6-C StoreCommitHub/barrier/backfill/snapshot/bounded transfer/fake sealed publication 组件分别提交为 `7731d1e` / `02cc640` / `694f2d9`，默认并发完整 daemon gate 已 exit 0，当前只待 P3.6-D 独立 docs commit。P3.1 的真实 provisioned signed Keychain roundtrip 仍因本机缺 provisioning profile / AMFI exit 137 而保留 1 项 ignored/gated BLOCKED；production execution、singleton UDS、transfer/publication production remote owner、真实 E2EE/Relay Publish 与远程 Companion 均未完成，docs commit 后的下一项是 P3.7 exec gate。
 
 ## 协议资料
 

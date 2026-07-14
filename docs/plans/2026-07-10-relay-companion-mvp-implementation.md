@@ -24,7 +24,16 @@
 - `conversationId` 必须在 adapter 启动前由 daemon 生成；vendor resume reference 只能存在于各 adapter 私有 namespace，不能进入 common catalog、Relay 或客户端 wire。继续遵守 N1/N2/N3/N7/N8/K9。
 - MachineDataSign 必须签 daemon→device catalog/event/snapshot/key update；DeviceSign 必须签 device→daemon RuntimeRequest。共享 AEAD key 不能替代发送方身份签名。
 - Keychain/DB counter 顺序固定为“先提升 CounterGuard high-water，再提交可消费 block”；检测 DB rollback、nonce reuse、key revision rollback 时 remote fail-closed。
-- 资源硬上界：Relay frame 4 MiB；part 3.5 MiB；transfer 64 parts/64 MiB/5 分钟；每连接 reassembly 128 MiB；prompt 256 KiB；RuntimeRequest 1 MiB；每 conversation 32 个 queued prompt；全机 1,024 个/256 MiB/24 小时；Runtime DB 2 GiB。
+- 资源硬上界：Relay frame 4 MiB；compact remote raw part 3.5 MiB；JSON/UDS raw part 固定
+  700 KiB，并以 worst-case 实际编码证明完整 `RuntimeEnvelope` 严格小于 JSONL/UDS 1 MiB hard
+  cap；transfer 64 parts/64 MiB/5 分钟；prompt 256 KiB；每 conversation
+  32 个 queued prompt；全机 1,024 个/256 MiB/24 小时；Runtime DB 2 GiB。
+- P3.6 固定配额：subscription 64/connection、4,096 global；pending capture 4/connection、
+  128 global（Store capture/spawn 前准入）；barrier 4/connection、128 global、
+  absolute TTL 5 分钟；snapshot sender 1/connection、2 global、build memory 128 MiB；transfer active
+  64/connection，reassembly 128 MiB/connection+512 MiB global，completed tombstone 256/connection+
+  8,192 global/5 分钟；read-only WAL pool 8、128 MiB、64 rows/8 MiB；publication dispatch
+  64 rows/8 MiB、16 MiB；backfill 512 rows/64 MiB；snapshot 10,000 items/64 MiB。
 - writer 默认 512 frames/16 MiB；Relay retention 默认每 stream 2,000 frames/64 MiB/24h、每 machine 512 MiB、全局 4 GiB；receive replay window 每 key 4,096 个 counter。
 - Machine enrollment code与PairInvite secret均为256-bit随机值、5分钟单次；challenge nonce为32 bytes、30秒单次；approval自动投递每轮最多8次且60秒，默认deadline 30分钟；revoke terminal flush上限2秒。
 - `AgentDeckCore` 继续只依赖平台无关 Foundation/Observation，不 import AppKit/UIKit/CryptoKit/网络。Swift 网络与 crypto 只在 `AgentDeckRelayClient`；UI 不拼 wire/crypto bytes。
@@ -80,6 +89,9 @@
 ## Phase P1：Protocol + Crypto
 
 ### Task P1.1：定义 RuntimeEnvelope v1 中立 contract
+
+> 本 task 记录 P1 的初始 contract；P3 stream 实现前必须先执行 P3.6-A contract finalization，
+> P3.6-A 冻结的 cursor/identity/backfill/transfer 形状是后续唯一事实源。
 
 **Files:**
 - Create: `agentdeck-protocol/src/runtime/{mod,identity,envelope,catalog,command,event,receipt,sync,transfer,failure,schema}.rs`
@@ -559,7 +571,9 @@ Accepted/Replayed/Failed，因此 completion 必须返回内部 `CompleteOutcome
 `event_journal`，以及不经 StorageKEK 包装的非秘密 rescue index
 `machine_enrollment_receipts(relay_server_id, machine_route, root_fingerprint)`。P3.3 直接新增
 两个 adapter 私有 namespace，不先创建再拆通用 `adapter_state_index`；P3.5 添加
-`approval_ledger`；P3.6 添加 `snapshots`/publication 表；P4 由各自 task migration 添加
+`approval_ledger`；P3.6 schema v4 精确添加 `event_stream_index`、`event_retention`、
+`catalog_journal`、`snapshots`、`publication_streams`、`publication_outbox` 六表，`event_journal`
+继续作为 authenticated audit；P4 由各自 task migration 添加
 auth/key/counter/replay/pair/revoke/retirement 表。machine-wide admin idempotency 使用独立
 `admin_commands` 表，由真正拥有 admin 语义的后续 task 添加，不塞入 nullable command rows。
 
@@ -1000,19 +1014,227 @@ Codex/Claude Code gated approval，并在 orphan process group 已确认 fenced 
 terminal+expiry transaction 写 Interrupted+Expired。任何 Started turn 尚未证明 fenced 时，
 P3.5 recovery 都保持 RecoveryBlocked、绝不恢复 approval delivery 或后续 Accepted command。
 
-### Task P3.6：实现 canonical event/catalog、SubscriptionBarrier、backfill/snapshot
+**P3.6 当前状态（2026-07-15）：** P3.6-A=`7731d1e`、P3.6-B=`02cc640`、
+P3.6-C=`694f2d9` 已提交；当前只待 P3.6-D 独立 docs commit。已读回 `runtime_stream` 45/45、
+`runtime_transfer` 17/17、subscription 36/36、daemon lib 464/464（`runtime::` 366 项）、默认并发
+`cargo test -p agentdeckd` exit 0，Swift 256 XCTest + 35 Swift Testing，以及 protocol/schema、fmt、
+clippy、daemon no-net 与 diff gate 全通过。P3.1 provisioned signed Keychain roundtrip 仍有 1 项
+ignored/BLOCKED；P3.7 exec gate、P3.8/P3.9 UDS 与 P4 E2EE/Relay Publish 均未完成。
+
+### Task P3.6-A：先冻结 Runtime/E2EE contract 与跨语言 wire
+
+P3.6 后续代码只能消费本 task 冻结的类型；禁止在 store/barrier 实现中继续临时改 wire。
 
 **Files:**
-- Create: `agentdeckd/src/runtime/{events,snapshot,backfill,publication}.rs`
-- Create: `agentdeckd/tests/{runtime_stream,runtime_transfer}.rs`
-- Modify: `agentdeckd/src/runtime/{core,conversation,store}.rs`
+- Modify: `agentdeck-protocol/src/runtime/{catalog,command,envelope,event,identity,mod,schema,sync,transfer}.rs`
+- Modify: `agentdeck-protocol/src/e2ee/{keys,payload,schema}.rs`
+- Modify: `agentdeck-protocol/tests/{runtime_v1_contract,runtime_neutrality,transfer_envelope,e2ee_canonical_contract,relay_v2_contract}.rs`
+- Modify: `agentdeck-crypto/src/{aead,lib}.rs`
+- Modify: `agentdeck-crypto/tests/golden_vectors.rs`
+- Modify: `Sources/AgentDeckCore/Protocol/RuntimeV1Types.swift`
+- Modify: `Sources/AgentDeckRelayClient/Crypto/{CanonicalCodec,RelayCrypto}.swift`
+- Modify: `Sources/AgentDeckRelayClient/Wire/RelayV2Types.swift`
+- Modify: `Tests/AgentDeckTests/RuntimeV1ProtocolTests.swift`
+- Modify: `Tests/AgentDeckRelayClientTests/RelayCryptoVectorTests.swift`
+- Modify: `Tests/AgentDeckRelayClientTests/RelayV2WireTests.swift`
+- Modify: `protocol/agentdeck/{runtime-protocol.schema.json,e2ee-v1.schema.json,crypto-vectors-v1.json}`
+- Modify: `protocol/agentdeck/fixtures/{runtime-v1-wire.jsonl,relay-v2-wire-vectors.json}`
 
-- [ ] Step 1: 写stream tests。 eventSeq/catalogRevision独立单调；eventId/itemId/entityId/commandId稳定；首次订阅锁H/C、注册H+1 watcher、先snapshot后sync/live；空流BeforeFirst→0；journal完整走backfill、裁剪走snapshot；per-conversation journal硬上界为10,000 events或64MiB先到者、全局512MiB；SessionCapabilities在任何AgentItem前；transfer完整hash后才推进inner HWM；publication store可冻结stream generation/seq/counter/exact blob/event range并跨重启逐字节读回。
-- [ ] Step 2: 运行两套 tests。 Expected: FAIL，canonical journal/barrier接口缺失。
-- [ ] Step 3: 实现event journal、catalog reducer、barrier、bounded transfer assembler和transport-neutral publication outbox API。 P3测试用fake sealed blob验证冻结/ACK/重试；真实seal/counter/Relay publish留P4.5。 Backfill/Snapshot作为定向reply，不写Relay frames、不改变outer stream HWM。
-- [ ] Step 4: 重跑 tests并注入 duplicate/out-of-order/65 parts/hash mismatch。 Expected: 正常路径PASS，非法输入typed failure且state不推进。
-- [ ] Step 5: fmt/clippy。
-- [ ] Step 6: 提交。 `git add agentdeckd && git commit -m "feat(daemon): 加入 canonical stream 与 snapshot barrier"`
+**Contract freeze:**
+
+- `StreamCursor::checked_next()` 返回 checked result；`At(u64::MAX)` typed fail 并要求 generation
+  rotation。新增 tagged `RuntimeInnerCursor::Catalog/Conversation` 与 tagged
+  `RuntimeSubscriptionTarget`。
+- `RuntimeEnvelope.version` 双端 ingress/egress 必须精确为 1；`messageId/transferId` 非空且最多
+  1,024 UTF-8 bytes，schema 同时记录 `x-maxUtf8Bytes`，Rust/Swift/ADRT1 统一执行 byte gate。
+- `RuntimeRequest` 固定为 `Subscribe(innerCursor)`、tagged
+  `BackfillRequest::Catalog(after)|Conversation(conversationId,after)`、`Unsubscribe(target)`；新增
+  directed `SubscriptionReceipt::Subscribed(streamGeneration)|Unsubscribed`，target 由原 request
+  messageId 关联。`RuntimeSyncComplete` 只在 Reply，携带 outer generation/cursor 与 tagged inner
+  cursor。
+- `ConversationSnapshot.baseEventCursor`；`CatalogSnapshot.baseCatalogCursor` 与 opaque frozen
+  `nextPageCursor`；`BackfillChunk::Catalog/Conversation` 的 `after/through` 必须连续非空，conversation
+  序列有 capabilities preamble。
+- `RuntimeEvent.itemId/entityId/commandId` 三键 required-null，矩阵固定为：Capabilities 三空；Item
+  必须 itemId+entityId，UserMessage 还必须 commandId；TurnStarted/ActionRequest/ApprovalResolved/
+  TurnCompleted/TurnInterrupted 必须 commandId；Error 的 item/entity 为空、command 可空。
+  body 若仍携带 command identity 必须与外层逐字匹配；`SnapshotItem` 使用同一矩阵，Rust/Swift
+  constructor 与 decoder 都拒绝违规组合。
+- `TransferPart` 进入 Reply/Stream，Request 不接受。E2EE kind 新增 TransferPart；compact remote binary
+  `RuntimeTransferCarrierV1` 固定包含 runtimeVersion/messageId/channel/transferId/index/count/total hash/
+  total bytes/raw part。只有该 carrier 保留 3.5 MiB raw part；JSON/UDS raw part 固定 700 KiB，完整
+  JSON/UDS frame 受 1 MiB hard cap；binary carrier worst-case AEAD+signed sealed+Relay outer 必须
+  小于 Relay 4 MiB。JSON/UDS 的 `totalBytes <= partCount * 700 KiB`，remote carrier 则按
+  `partCount * 3.5 MiB` 校验，二者仍受 64 MiB 总上限。
+- `SealedPayloadKind` 只存在于 AEAD plaintext `ADSP1` carrier；Unsigned/Signed/Verified sealed-blob
+  outer、canonical bytes 与 TBS 均不得携带业务 kind。Rust/Swift 共同拒绝 bad
+  magic/version/kind/declared-length/trailing。
+- transfer parts 全齐后必须先用已记账 `bufferedBytes` 核验声明 `totalBytes`，再分配 assembly
+  buffer；length mismatch 先 abort/释放，不能产生未计入 128 MiB reassembly cap 的瞬时分配。
+- required-null schema 必须同时把 key 放入 `required` 并允许 `null`；Backfill Rust/Swift 的 decode、
+  direct enum egress、flatten reply egress 都执行连续/非空/512 entries/64 MiB 同一组 gate。
+- daemon `EncodedRuntimeFrame` 必须消费 protocol 的 checked JSON bytes；实际 Core enqueue 对超 1 MiB
+  Reply/Stream 在进入 16 MiB writer budget 前返回 `daemon.payload.item_too_large`，禁止只在 protocol
+  convenience API 测试 framing cap。
+- `EpochBarrierV1.eventSeq` 替换为 tagged inner cursor；Rust/Swift fixture 与 E2EE schema 同步。
+
+- [x] Step 1: 先补 contract/negative/fixture tests，覆盖 max cursor、required-null matrix、错误 target、
+  空/不连续 backfill、SyncComplete stream variant 拒绝、remote carrier 4 MiB 边界与 Swift parity。
+- [x] Step 2: 运行 Rust/Swift 定向 tests。Expected: FAIL，现有 wire 仍是 unchecked cursor、
+  conversation-only Subscribe、eventSeq-only sync/barrier 与 JSON 3.5 MiB part。
+- [x] Step 3: 最小实现上述 contract；运行
+  `UPDATE_RUNTIME_SCHEMA=1 UPDATE_E2EE_SCHEMA=1 UPDATE_WIRE_FIXTURES=1 cargo test -p agentdeck-protocol`
+  更新 schema/fixtures，再以无 update env 重跑确认 byte-stable。
+- [x] Step 4: 运行 `swift test --filter RuntimeV1ProtocolTests`、
+  `swift test --filter RelayV2WireTests`、四份 schema diff 与 fixture `git diff --exit-code` 二次生成门禁。
+- [x] Step 5: 已提交 `7731d1e`；除 protocol/crypto/Swift/schema/fixture 外，提交还包含冻结
+  contract 所需的 daemon compatibility 与 persisted-event 配套调整，但未夹 P3.6-B store v4、
+  P3.6-C stream/barrier 或本阶段 docs：
+  `git commit -m "feat(protocol): 冻结 Runtime stream 与 transfer contract"`。
+
+### Task P3.6-B：迁移 Runtime store v4 并建立真正 read-only WAL pool
+
+**Files（`02cc640` 最终提交范围）:**
+- Create: `agentdeckd/src/runtime/store/{stream,catalog,snapshot,publication}.rs`
+- Modify: `agentdeckd/src/runtime/{model,read_pool}.rs`
+- Modify: `agentdeckd/src/runtime/store/{mod,schema,sqlite,worker,approval,journal,cipher}.rs`
+- Modify: `agentdeckd/tests/{runtime_store,runtime_store_boundaries,runtime_store_cipher}.rs`
+- Create: `agentdeckd/tests/{runtime_store_stream_v4,runtime_store_read_pool}.rs`
+
+**Schema/migration freeze:**
+
+- schema v4 只新增 `event_stream_index`、`event_retention`、`catalog_journal`、`snapshots`、
+  `publication_streams`、`publication_outbox` 六表；`event_journal` 保持 append-only audit。logical event
+  suffix 每 conversation 10,000/64 MiB、global 131,072/512 MiB；catalog journal 10,000/64 MiB。
+  这些不是物理回收承诺，main+WAL+SHM 仍受 2 GiB cap。
+- snapshot 64 MiB/每 conversation 一个 ready/global 512 MiB；outbox 每 stream 2,000 rows/64 MiB、
+  global 10,000/512 MiB，未 ACK 不删。publication row 记录 exact blob/hash/counter/inner range 与
+  reserved/frozen/Relay-committed/ACK 状态；barrier 只能读取 Relay-committed outer+inner cut。
+- v4 `runtime_meta` authenticated ledger 精确新增
+  `audit_event_logical_bytes,event_stream_count/bytes,catalog_delta_count/bytes,`
+  `catalog_retention_floor,snapshot_count/bytes,publication_stream_count,publication_outbox_count/bytes`；
+  `event_retention` row 的 retained count/bytes/floor 由自己的 token 认证；逐 target 还要复算
+  floor/through/HWM、range digest、snapshot hash、publication gap/overlap、FK/orphan。
+- `RUNTIME_CRYPTO_CONTEXT_VERSION=1` 不变；v1/v2 直接到 v4，v3 到 v4，wrapped key、nonce、
+  `sealed_event`/fixed event ciphertext byte-identical。event index 只物化经完整旧 ledger 验证后的最大
+  连续 suffix；catalog 建当前 HWM snapshot baseline。
+- worker 初始化/migration ready error 在对 caller 可见前必须释放 Runtime DB path lease；随后 exact
+  reopen 不需要 polling，不能接受短暂 `StoreAlreadyOpen`。
+- legacy event bridge 先 strict decode 新 DTO；失败后才接受完整 legacy RuntimeEvent JSON，从
+  authenticated `event_journal.command_id` 注入/核验 command identity，旧 body command 必须匹配；
+  补齐 required-null keys 后再次 strict decode。任何 opaque fixed event bytes 都不改写。
+- ReadPool 固定 8 个 `mode=ro/query_only=ON` WAL connections、128 MiB retained page memory、每页
+  64 rows/8 MiB；page 复制后先结束 read transaction/释放 connection，再交 reply pump。
+
+- [x] Step 1: 写 schema/migration/ledger/read-pool RED tests。固定 fault 覆盖六表 row token、上述每个
+  count/bytes、floor/through/HWM/range/hash/state、gap/overlap/FK/orphan；另覆盖 v1/v2/v3 migration、
+  COMMIT unknown、legacy bridge command mismatch 与原 ciphertext/wrapped key byte identity。
+- [x] Step 2: 运行三套新 integration tests及既有 store hardening/recovery。Expected: FAIL，schema
+  仍为 v3，ReadPool 还不是独立 read-only WAL connections。
+- [x] Step 3: 实现 v4 migration、logical suffix/retention pins、catalog/snapshot/publication repository
+  与 read-only page API；禁止跨网络/await 持有 read transaction，禁止 DELETE audit rows。
+- [x] Step 4: 重跑 fault matrix、真实 WAL checkpoint pressure 与容量 tests。Expected: writer 在慢 page
+  consumer 下继续提交；任一 tamper fail-close；cap 满时拒绝新 logical row/outbox 而不删 unacked。
+- [x] Step 5: 已按 store/read-pool 精确 pathspec 提交 `02cc640`：
+  `git commit -m "feat(daemon): 建立 Runtime v4 stream store"`。
+
+### Task P3.6-C：实现 StoreCommitHub、barrier/backfill/snapshot、transfer 与 publication 状态机
+
+**Files（`694f2d9` 最终提交范围；目录项包含 private 子模块与 tests）:**
+- Modify: `agentdeckd/Cargo.toml`
+- Create: `agentdeckd/src/runtime/{backfill,catalog_snapshot,events,publication,snapshot,subscription,transfer}.rs`
+- Create: `agentdeckd/src/runtime/{catalog_snapshot,publication,snapshot,subscription}/`
+- Modify: `agentdeckd/src/runtime/{connection,core,mod,model,read_pool}.rs`
+- Create: `agentdeckd/src/runtime/{connection,core}/` 下的 subscription/private tests
+- Modify: `agentdeckd/src/runtime/store/{approval,catalog,cipher,journal,mod,publication,schema,snapshot,sqlite,stream,worker}.rs`
+- Create: `agentdeckd/src/runtime/store/retention.rs` 与
+  `agentdeckd/src/runtime/store/{publication,snapshot,stream,worker}/` private 模块/tests
+- Create: `agentdeckd/src/runtime/store/worker/test_admission.rs`
+- Create/Modify: `agentdeckd/tests/{runtime_approval,runtime_snapshot,runtime_store_read_pool,`
+  `runtime_store_stream_v4,runtime_stream,runtime_transfer}.rs`
+- Create: `agentdeckd/tests/runtime_stream/` 与 `agentdeckd/tests/support/` 下的共享测试模块（含
+  integration `store_admission.rs`）
+
+**Actor/state-machine freeze:**
+
+- 唯一 store worker 作为 StoreCommitHub，线性化 watcher 注册与 H capture，并在所有 event COMMIT
+  （含 approval worker）后 coalesce HWM；watch 不缓存 payload。first subscribe 在同一个 store
+  operation 中先注册 watcher、再捕获对应 committed H/C cut，使 watcher 从 H+1 生效；随后由单
+  connection egress gate 严格串行化 `snapshot/backfill → SyncComplete → catchup/live`。
+- retained 连续区间才 backfill；裁剪进入内部 NeedSnapshot decision，当前 wire 返回
+  `daemon.runtime.read_unavailable` 的 snapshot-required failure，不发 partial；空 inner 是 BeforeFirst，
+  下一条 0 不丢。Catalog 使用同一算法。disconnect/Unsubscribe/absolute TTL/stale generation 幂等清理全部
+  watch/task/memory/count；前置错误进入无 deadline terminal Failure wait 前先 exact release
+  live/barrier/snapshot-sender registry quota，terminal writer job 自身保留到 ACK/disconnect；
+  resubscribe/Unsubscribe/disconnect 对旧 terminal wait 的 control cancellation 属正常 generation
+  handoff，不得 fail-close 新 generation；Core/actor/SQLite transaction 都不跨 writer wait。
+- `commit` 必须立即把可取消后台 job 登记进 jobs map 并返回，不能让 Core operation 等 socket gate；
+  job 激活锁序固定为 `egress → coordination`。teardown 在 coordination 内只 detach/cancel，释放锁后
+  再 await handle，因此 disconnect/Unsubscribe/shutdown 都不等 terminal ACK、不形成反向锁环。
+- pre-delivery error 的 terminal Failure 必须持有 per-connection egress gate 到 flush ACK/cancel，避免
+  sibling job 撞单槽 paced reservation 并误 fail-close。gate wait 到 TTL 后必须先释放 registration、
+  watch 与 TEMP pin，再进入无 deadline terminal wait。
+- 同 target replacement 只让最新 generation 出帧；superseded pending job 不发 stale receipt，未来
+  客户端必须在 replacement 时取消旧 request waiter。pending capture 在 Store capture/spawn 前受
+  4/connection、128/global 硬上界；disconnect 胜出后 stale prepare 不得重建 per-connection slot。
+- backfill/snapshot pin 必须在 oneshot send 前绑定 cleanup owner；receiver/caller 在 reply handoff
+  窗口取消时由 owner 自动释放，不能留下 orphan pin。
+- caps 固定为 Global Constraints/设计 §9.8；预算必须在 spawn task 前一次性 reserve。snapshot capture
+  不跨 I/O 持 actor lock/SQLite transaction；同 connection 的 reply jobs 经同一 egress gate 串行，
+  慢读者只 lag 自己。
+- Transfer 只有 full parts+length/hash+canonical decode+target/generation/range+capabilities 校验，并在
+  clone reducer 成功后，才原子 swap reducer/inner cursor一次；conflict/TTL/disconnect abort 释放预算，
+  tombstone 防完整 retry 二次 apply。
+- publication freeze exact fake blob/seq/counter/inner range，Relay COMMIT 后才推进 barrier 可见 cut；
+  ACK 精确匹配 generation/seq/hash；重启逐字节 retry、每 stream 一个 in-flight、公平 dispatch。P3 fake
+  blob 只证明 transport-neutral store algorithm，不算 P4 E2EE seal/counter/Relay Publish 证据。
+  `TransferStateMachine` 与 publication dispatcher 均无 production remote owner。
+
+固定 integration contract 以 test runner 的 `--list` 输出为事实源：`runtime_stream` 当前 45 项，
+分为 `barrier_integrity` 14 项、`contract` 7 项与 `store_commit_hub` 24 项；`runtime_transfer` 当前
+17 项。前者覆盖 authenticated snapshot/publication cut、StoreCommitHub COMMIT race、空流、
+retention 与 identity contract；后者覆盖 JSON/remote carrier profile、64-part/64 MiB、TTL、
+duplicate/metadata/hash/length、stale generation、checked accounting 与 reducer single-apply。
+subscription egress ordering、quota、disconnect/TTL cleanup、snapshot permit/pin ownership、catalog
+expiry timer 与 publication dispatcher 的 private behavior 由 `cargo test -p agentdeckd --lib runtime::`
+共同锁定，当前 subscription 串行门禁为 36 项。新增 terminal gate 6 项精确覆盖 disconnect 无锁环、
+pending sibling Unsubscribe/shutdown 不等 Failure ACK、同 target 只发布最新 generation、gate wait
+超时释放 snapshot pin、第五个 pending capture pre-spawn 拒绝，以及 disconnect 后 stale prepare 不
+重建 slot；不得把计划中的旧候选测试名当成已存在的单独 integration test。
+
+默认并发 daemon 回归另使用两层 test-only Store admission。威胁场景是 macOS `libtest` 在 soft FD
+limit 256 下并发创建多份各含 1 writer + 8 WAL readers 的真实 Store，在业务断言前耗尽 FD；unit
+`cfg(test)` worker 与 integration fixture 各自把单 test binary 同时存活 Store 限为 4，permit 覆盖
+ReadPool/path lease teardown。production Store、固定 8-reader ReadPool 与运行时配额不变。
+
+- [x] Step 1: 先加入上述固定 tests，运行两套 gate。Expected: FAIL，Core 对 Catalog/Subscribe 仍返回
+  FeatureUnavailable，StoreCommitHub/reply pump/publication/transfer reducer 尚不存在。
+- [x] Step 2: 实现最小 state machines 与预算 registry；使用 deterministic clock、manual writer ACK、
+  commit hooks 和 fake sealed blob 注入所有 race/crash boundary。
+- [x] Step 3: 已运行两套固定 gate、全部 runtime store tests、
+  `cargo test -p agentdeckd --lib runtime:: -- --test-threads=1`、默认并发完整
+  `cargo test -p agentdeckd` 与 protocol/Swift contract tests。
+- [x] Step 4: fmt/clippy/no-net/schema/diff-check 全通过；已按 daemon runtime/store/tests 精确 pathspec
+  提交 `694f2d9`：`git commit -m "feat(daemon): 实现 canonical stream 与 snapshot barrier"`。
+
+最终读回：`runtime_stream` 45/45、`runtime_transfer` 17/17、subscription 36/36、daemon lib
+464/464（`runtime::` 366 项）、默认并发整包 exit 0；Swift 256 XCTest + 35 Swift Testing，
+`agentdeck-protocol`、schema diff、fmt、clippy、no-net 与 diff-check 全 PASS。codesigned Keychain
+roundtrip 的 1 项 ignored 继续记为 P3.1 外部 BLOCKED，不能据此宣称 P3.1、P3 或 Companion 完成。
+
+### Task P3.6-D：同步文档并做独立 scoped docs commit
+
+**Files:**
+- Modify: `README.md`, `ARCHITECTURE.md`, `AGENTS.md`
+- Modify: `docs/{AGENT_DIAGNOSTICS,QUALITY,index}.md`
+- Modify: `docs/plans/{README,2026-07-10-relay-companion-mvp-design,2026-07-10-relay-companion-mvp-implementation}.md`
+
+- [x] Step 1: 只按已落地事实同步 Runtime wire、v4 migration、资源上限、failure code、诊断和验证入口；
+  不把 P3 fake blob 写成 P4 E2EE/Relay 已完成，不写物理 event audit 回收承诺。
+- [x] Step 2: 运行 `scripts/verify-agent-docs.sh`、`git diff --check`，并对 design §9、schema snapshot、
+  Runtime constants 与 tests 做名称/数值交叉扫描。
+- [x] Step 3: `git status --short --branch` 与 `git diff --name-only --cached` 证明 staged 仅上述 docs，
+  提交 `git commit -m "docs(relay): 收口 P3.6 stream 与 barrier 事实"`。
 
 ### Task P3.7：实现两阶段 exec gate、ExecutionFence 与 orphan recovery
 
@@ -1056,7 +1278,7 @@ pub trait PreparedAgentTurn: Send { fn exec_spec(&self) -> &ExecSpec; async fn a
 - Modify: `ARCHITECTURE.md`, `docs/QUALITY.md`, `AGENTS.md`
 - Delete: `scripts/check-daemon-no-net.sh`
 
-- [ ] Step 1: 写UDS tests。 0600、same effective UID、1MiB frame、malformed/oversize close、两个connection独立writer、typed version mismatch、disconnect不终止core；recovery人为阻塞时listener尚未bind，完成分类后Recovering/RecoveryBlocked conversation只读且不能Started，其他已确认安全conversation可恢复；stdio compatibility只支持旧子集并声明不支持multi-client/remote admin/full receipt replay。
+- [ ] Step 1: 写UDS tests。 0600、same effective UID、仅 Request payload 1 MiB、Reply/Stream 使用独立有界 framing 与较小 JSON TransferPart、malformed/oversize close、两个connection独立writer、typed version mismatch、disconnect不终止core；recovery人为阻塞时listener尚未bind，完成分类后Recovering/RecoveryBlocked conversation只读且不能Started，其他已确认安全conversation可恢复；stdio compatibility只支持旧子集并声明不支持multi-client/remote admin/full receipt replay。
 - [ ] Step 2: 运行 local_uds test与新 guard。 Expected: FAIL，tokio net未启用且guard/script不存在。
 - [ ] Step 3: 实现 JSONL RuntimeEnvelope listener与peer UID校验。 macOS用 `getpeereid`/安全等价API，不把clientInstallationId当认证；stable默认UDS，stdio仅显式 compatibility/ephemeral。
 - [ ] Step 4: 重跑 tests和 `bash scripts/check-daemon-network-boundary.sh`。 Expected: P3 guard只允许 `agentdeckd/src/local/` 使用 UnixListener/UnixStream；全daemon无TCP/WSS/reqwest/axum。
@@ -1206,7 +1428,7 @@ sealed frame -> Relay v2 outer validation -> DeviceSign/AAD/replay/AEAD verifica
 - Modify: `agentdeckd/src/runtime/{core,connection,store}.rs`
 - Modify: `agentdeckd/src/remote/{dispatch,link}.rs`
 
-- [ ] Step 1: 写crypto/replay/publication tests。 CatalogKey/ConversationDEK/DeviceCommandTxKey/DeviceReplyTxKey方向；MachineDataSign来源；新增/撤销设备轮换catalog与active conversation epoch，新设备拿不到旧epoch且从barrier定向snapshot接续；EpochBarrier绑定generation/cursor/H/revision；unknown higher revision 3次/30s KeySync；lower revision隔离；CounterGuard先于DB、DB备份rollback、nonce reuse、4,096 window、retired key 24h+1h。 对catalog/event/barrier分别注入四个publish边界，重启只允许逐字节重发冻结blob。
+- [ ] Step 1: 写crypto/replay/publication tests。 CatalogKey/ConversationDEK/DeviceCommandTxKey/DeviceReplyTxKey方向；MachineDataSign来源；新增/撤销设备轮换catalog与active conversation epoch，新设备拿不到旧epoch且从barrier定向snapshot接续；EpochBarrier绑定generation/outer cursor/tagged inner cursor/key revision，且只使用Relay-committed outer+inner对应cut；unknown higher revision 3次/30s KeySync；lower revision隔离；CounterGuard先于DB、DB备份rollback、nonce reuse、4,096 window、retired key 24h+1h。 对catalog/event/barrier分别注入四个publish边界，重启只允许逐字节重发冻结blob。
 - [ ] Step 2: 运行两套 tests。 Expected: FAIL，publisher/key directory不存在。
 - [ ] Step 3: 实现wrapped key directory、counter allocator、signed sealed publisher、durable publication outbox/ACK与receive replay。 固定顺序为`Keychain guard reserve → seal一次 → Runtime DB冻结exact blob/streamSeq/counter/event range → Relay Publish COMMIT → local ACK`；第一步后失败只跳号，第二步后所有retry复用同一blob。 Backfill/Snapshot用DeviceReplyTxKey定向reply且不进outbox/Relay frames；shared ConversationDEK只用于barrier后publish。
 - [ ] Step 4: 重跑tests并替换Runtime DB为旧备份。 Expected: publication crash gap无事件永久缺口、无同seq不同blob；自动退休旧epoch并rekey，无法协调时remote fail-closed，绝不发送旧counter。

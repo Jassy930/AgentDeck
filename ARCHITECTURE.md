@@ -498,11 +498,13 @@ conversation/key，不能伪造身份连续性。
   删整组 terminal audit 或
   密文/元数据不一致都映射为 corrupt state；P4 仍须用 Keychain CounterGuard 绑定整库
   generation/HWM，才能检测回滚到更早但内部自洽的完整 DB/WAL 快照。
-- Runtime DB schema v1 只含 `runtime_meta`、`conversations`、`commands`、
-  `execution_intents`、`execution_fences`、`event_journal`、
-  `machine_enrollment_receipts`。最后一张表是 root-lost rescue 所需的非秘密 index；其余敏感
-  payload 均使用 StorageKEK 包装的 DEK/BIK。P3.3/P3.5/P3.6/P4 只能由各自 migration 增表，
-  不能预建 nullable 通用表。
+- Runtime DB 的物理 schema 按 phase 单调迁移：P3.2 的 v1 七表、P3.3 的 v2 两张 adapter 私表、
+  P3.5 的 v3 `approval_ledger`，以及 P3.6 的 v4 六张 stream 表。v4 当前精确包含
+  `event_stream_index`、`event_retention`、`catalog_journal`、`snapshots`、
+  `publication_streams` 与 `publication_outbox`；`event_journal` 仍是 append-only authenticated
+  audit。`machine_enrollment_receipts` 继续只是 root-lost rescue 所需的非秘密 index；其余敏感
+  payload 使用 StorageKEK 包装的 DEK/BIK。后续 P4 只能用独立 migration 增表，不能预建
+  nullable 通用表，也不能把 logical retention 误写成物理 audit row 回收。
 - 普通副作用准入同时检查 main/WAL/SHM、projected growth、文件系统
   `max(512 MiB, 5%)` reserve、`page_count/max_page_count`，并在每次 COMMIT 后重新观测。
   Accepted/Started 在普通准入时分别预留 expiry 与 fence/release/最大 terminal safety tail；
@@ -616,6 +618,70 @@ conversation/key，不能伪造身份连续性。
   `RuntimeExecutionEvent`、exec-gate 与 Codex/Claude Code live vendor approval 仍属于 P3.7，不能
   作为本阶段已完成能力宣传。
 
+### Relay Companion MVP P3.6 canonical stream 不变量
+
+- `RuntimeEnvelope v1` 的 stream contract 已由 `7731d1e` 冻结：cursor 使用 checked
+  `BeforeFirst/At`，Catalog/Conversation 使用 tagged inner cursor 与 subscription target；
+  `RuntimeEvent.itemId/entityId/commandId` 是 required-null identity matrix；Backfill 必须连续非空，
+  `RuntimeSyncComplete` 只能是 directed Reply。JSON/UDS raw part 固定 700 KiB，remote compact
+  carrier 才允许 3.5 MiB；两者都受 64 parts/64 MiB 总上界。
+- P3.6-C transport-neutral stream/barrier/snapshot/transfer/publication 组件已由 `694f2d9`
+  收口；本节描述的是该组件 contract，不表示 P3/P4 或远程 Companion 已完成。
+- schema v4 与 read-only WAL pool 已由 `02cc640` 落地。logical event suffix 每 conversation
+  10,000 events/64 MiB、全局 131,072/512 MiB；snapshot 单份 10,000 items/64 MiB、每
+  conversation 一个 ready、全局 512 MiB；publication outbox 每 stream 2,000 rows/64 MiB、
+  全局 10,000 rows/512 MiB，未 ACK row 不驱逐。ReadPool 固定 8 个只读连接、128 MiB retained
+  pages、64 rows/8 MiB per page，所有 page 在交给异步 writer 前结束 SQLite read transaction。
+- 唯一 store worker 同时是 StoreCommitHub。watch 注册、inner HWM capture 与所有 event COMMIT
+  notification 在同一 worker 线性化；watch 只 coalesce HWM，不持 payload。barrier 先注册
+  `H+1` watcher，再在同一短 operation 捕获 inner H、Relay-committed outer cut、retained floor 与
+  snapshot source；reserved/frozen 但未 Relay COMMIT 的 publication 不可进入 barrier。worker 在
+  oneshot send 前就把 backfill/snapshot pin 绑定到 cleanup owner，receiver/caller cancellation 不能在
+  “pin 已创建、source 尚未接管”窗口留下 orphan pin。
+- 每个 connection 的 egress gate 串行化各 target/generation 的 paced reply job，单个 job 顺序固定为
+  `snapshot/backfill → SyncComplete → catchup/live`。`commit` 必须先把可取消后台 job 登记进 jobs map
+  后立即返回，不能让 Core operation 等待 socket gate；job 激活时的锁序固定为
+  `egress → coordination`，teardown 在 coordination 内只同步 detach/cancel，释放锁后才 await handle，
+  disconnect/Unsubscribe/shutdown 不得被未 ACK terminal 锁住。disconnect、Unsubscribe、absolute
+  5 分钟 barrier TTL、writer failure 与 generation 替换会幂等取消 exact job/watch/pin/budget；partial
+  TransferPart 或任何 send outcome unknown 都 fail-close 当前 connection，不再发送可能矛盾的
+  terminal reply。前置错误进入无 deadline terminal Failure wait 前，必须先 exact release 本 generation
+  的 live/barrier/snapshot-sender registry quota，并丢弃 watch/TEMP pin/retry payload；terminal writer
+  job 自身仍保留并持有该 connection 的 egress gate 到 flush ACK 或 disconnect，慢读者不能借此占满
+  全局 snapshot-sender quota，也不能让 sibling 撞单槽 paced reservation。quota 已 exact release 后，
+  resubscribe/Unsubscribe/disconnect 对旧 terminal wait 的 control cancellation 属正常 generation
+  handoff，不得把该 `Cancelled` 误判为 writer failure 并 fail-close 新 generation；真实
+  writer/connection error 仍必须 fail-close。
+- 同 target 连续 replacement 只允许最新 generation 发送 receipt/snapshot/sync；被 supersede 的 pending
+  job 直接取消且不发送 stale receipt。未来 P3.8/P4 客户端在发出同 target replacement 时必须同时取消
+  旧 request waiter，不能依赖 daemon 为已撤销 request 补 terminal receipt。每 connection 最多 4 个、
+  全局最多 128 个 pending capture，并且必须在 Store capture 与 spawn 前取得 permit；disconnect 已胜出
+  后，迟到 prepare 不得重建空的 per-connection pending slot。
+- snapshot build 使用全局 128 MiB shared permit。caller disconnect/cancel 后，已入队 Store command
+  继续共同持有 permit 与 exact TEMP build pin，直到 payload/store outcome 被 worker 处理；错误进入
+  terminal writer wait 前必须丢弃 retry payload/pin。Catalog frozen cache 同样计入该共享预算，
+  absolute cursor TTL 的可替换 task 每 snapshot 最多一个，旧 version 不得删除已续期 cache。
+- transfer 只有在 parts 全齐、buffered length/hash、canonical DTO、target/generation/range 与
+  capabilities preamble 全部通过，并在 clone reducer 上成功 apply 后，才能原子推进 inner cursor
+  一次。metadata/duplicate conflict、TTL、disconnect 或 stale generation 都先释放 count/bytes；
+  completed tombstone 防止完整 retry 二次 apply。
+- P3.6 publication 只冻结调用方注入的 opaque/fake sealed blob，证明 exact blob/hash/counter/inner
+  range、COMMIT-unknown byte-identical retry、ACK 与 restart state machine。它没有执行真实 E2EE
+  seal、MachineDataSign、Keychain CounterGuard 或 Relay Publish；这些仍属于 P4，不能从本节推出
+  远程 Companion 已接通。
+- P3.6 仍是 transport-neutral component layer。`TransferStateMachine` 与 publication dispatcher
+  尚无 production remote owner；App/CLI 尚未通过 P3.8/P3.9 singleton UDS 连接该 Core，production
+  coordinator 仍 disabled，P3.1 provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate；
+  Simulator fixture、fake publication 与本地 store tests 都不是 P4/P5/P6 证据。
+- Store worker 初始化/migration 的 ready error 必须在 path lease 已释放后才对 caller 可见；同进程
+  exact reopen 不依赖 polling，也不能把短暂 `StoreAlreadyOpen` 伪装成 migration recovery 结果。
+- 测试 harness 另有刻意的 test-only Store admission：威胁场景是 macOS `libtest` 在默认 soft FD
+  limit 256 下并行创建多份真实 RuntimeStore，每份固定 1 个 writer + 8 个 WAL readers，在业务断言前
+  耗尽文件描述符并把 harness 失败误报为 ReadPool 行为。`cfg(test)` unit worker 与 integration fixture
+  各自在单个测试进程把同时存活的 Store 限为 4；unit permit 在配置/路径/密钥校验后取得，并由 worker
+  持有到 ReadPool 关闭、path lease 释放。该 admission 不编入 production，不改变 production Store、
+  固定 8-reader ReadPool 或任何运行时资源配额。
+
 ### R1a 隐含约束（历史参考）
 
 - **R1a machine_id ≡ device_id**：`server/ws.rs::connect` 用 `device.device_id` 作 `ConnRole::Machine.machine_id`，`router.rs` RegisterMachine 授权强制 `machine.machine_id == connection.machine_id`——**enrolled 的 machine 设备的 `machine_id` 严格等于 `device_id`**。CLI 生成的随机 `device_id = "cli-<profile>-<random>"` 会锁定 R2 daemon remote-mode 里对应 machine 的 identifier；R2 设计需评估是否解耦 machine_id 与 device_id（例如 machine 元数据里显式携带独立 machine_id）。
@@ -632,6 +698,8 @@ Swift UI
 daemon main
   -> config → namespace / singleton → KeyStore / StorageKEK
   -> ipc（re-export agentdeck-protocol）
+  -> RuntimeCore → StoreCommitHub / subscription / snapshot
+  -> transport-neutral P3.6 component → transfer / publication（production owner 待 P4）
   -> AgentRouter → CodexAdapter / ClaudeCodeAdapter
   -> record / diag
   -> codex app-server child process / claude CLI child process
