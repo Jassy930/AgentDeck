@@ -2910,7 +2910,7 @@ fn random_execution_nonce() -> Result<Vec<u8>, getrandom::Error> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -3664,7 +3664,7 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct FakeCoordinator {
+    pub(crate) struct FakeCoordinator {
         inner: Arc<FakeCoordinatorInner>,
     }
 
@@ -3835,7 +3835,7 @@ mod tests {
     }
 
     impl FakeCoordinator {
-        fn held() -> Self {
+        pub(crate) fn held() -> Self {
             Self::new(true, false, FakeBehavior::default())
         }
 
@@ -4062,7 +4062,7 @@ mod tests {
             self.inner.peak.load(Ordering::SeqCst)
         }
 
-        fn active(&self) -> usize {
+        pub(crate) fn active(&self) -> usize {
             self.inner.active.load(Ordering::SeqCst)
         }
 
@@ -4112,7 +4112,7 @@ mod tests {
                 .store(false, Ordering::SeqCst);
         }
 
-        async fn wait_for_starts(&self, expected: usize) {
+        pub(crate) async fn wait_for_starts(&self, expected: usize) {
             wait_until(|| self.starts().len() >= expected).await;
         }
 

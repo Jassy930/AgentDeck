@@ -87,6 +87,7 @@ pub struct RuntimeCore {
     connections: ConnectionRegistry,
     subscriptions: SubscriptionCoordinator,
     conversations: ConversationRegistry,
+    recovery_identity: Arc<()>,
     recovery: RuntimeRecoveryCoordinator,
     read_pool: ReadPool,
     #[allow(dead_code)] // P3.8 UDS peer credential adapter 才会成为 production caller。
@@ -153,13 +154,15 @@ impl RuntimeCore {
             daemon_boot_id,
             adapter_concurrency,
         )?;
-        let recovery = RuntimeRecoveryCoordinator::new(
+        let recovery_identity = Arc::new(());
+        let recovery = RuntimeRecoveryCoordinator::new_with_core_identity(
             store.clone(),
             Arc::new(SystemProcessGroupController),
             RecoveryOptions {
                 term_grace: DEFAULT_RECOVERY_TERM_GRACE,
                 kill_grace: DEFAULT_RECOVERY_KILL_GRACE,
             },
+            recovery_identity.clone(),
         );
         let connections = ConnectionRegistry::new(
             DEFAULT_CONNECTION_WRITER_FRAMES,
@@ -184,6 +187,7 @@ impl RuntimeCore {
             connections,
             subscriptions,
             conversations,
+            recovery_identity,
             recovery,
             read_pool: ReadPool::new(DEFAULT_RUNTIME_READ_CONCURRENCY)?,
             principal_issuer: PrincipalIssuer::local_only(machine_trust_domain),
@@ -193,6 +197,28 @@ impl RuntimeCore {
             recovery_lock: Mutex::new(()),
             shutdown_lock: Mutex::new(()),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_test_execution_coordinator(
+        store: RuntimeStoreHandle,
+        router: Arc<AgentRouter>,
+        machine_trust_domain: [u8; 32],
+        execution: Arc<dyn RuntimeExecutionCoordinator>,
+    ) -> Result<Self, RuntimeCoreError> {
+        Self::with_execution_coordinator(
+            store,
+            router,
+            machine_trust_domain,
+            execution,
+            DEFAULT_ADAPTER_CONCURRENCY,
+        )
+    }
+
+    /// 只允许 transport 用本 Core 完成 recovery 时签发的 capability
+    /// 开放入口；其他 Core 的 permit 即使同样已恢复也不可以混用。
+    pub(crate) fn owns_recovery_ready_permit(&self, permit: &RecoveryReadyPermit) -> bool {
+        permit.belongs_to(&self.recovery_identity)
     }
 
     /// 只允许 UDS peer credential 已验证为同 UID 后由 transport adapter 调用。

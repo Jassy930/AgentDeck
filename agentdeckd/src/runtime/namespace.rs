@@ -58,6 +58,10 @@ pub enum NamespaceError {
     SocketPathContainsNul {
         path: PathBuf,
     },
+    UnsafeTempRoot {
+        path: PathBuf,
+        reason: &'static str,
+    },
     UnsafeDataDirectory {
         path: PathBuf,
         reason: &'static str,
@@ -98,6 +102,13 @@ impl fmt::Display for NamespaceError {
                     path.display()
                 )
             }
+            Self::UnsafeTempRoot { path, reason } => {
+                write!(
+                    formatter,
+                    "unsafe ephemeral temp root {}: {reason}",
+                    path.display()
+                )
+            }
             Self::UnsafeDataDirectory { path, reason } => {
                 write!(
                     formatter,
@@ -131,6 +142,7 @@ impl NamespaceError {
             Self::InvalidInstanceId => "daemon.namespace.invalid_instance",
             Self::SocketPathTooLong { .. } => "daemon.namespace.socket_path_too_long",
             Self::SocketPathContainsNul { .. } => "daemon.namespace.socket_path_invalid",
+            Self::UnsafeTempRoot { .. } => "daemon.namespace.unsafe_temp_root",
             Self::UnsafeDataDirectory { .. } => "daemon.namespace.unsafe_data_directory",
             Self::Io { .. } => "daemon.namespace.io_failed",
         }
@@ -179,11 +191,26 @@ impl DaemonPaths {
             });
         }
         validate_instance_id(instance_id)?;
+        // 先在调用方提供的字节路径上执行内核 path-shape 校验。这样恶意 NUL 或
+        // 超长 sun_path 不会被后续 metadata/canonicalize 折叠成泛化 I/O 错误。
+        let untrusted_paths = Self::ephemeral_from_root(temp_root.as_ref(), instance_id);
+        untrusted_paths.validate_socket_path()?;
+
+        // 威胁场景：环境可控的 TMPDIR 指向 symlink、共享目录或其他用户目录时，
+        // daemon 会在攻击者可替换的父目录下创建 DB、lock 与控制 socket。
+        let canonical_temp_root = canonical_private_temp_root(temp_root.as_ref())?;
+        let paths = Self::ephemeral_from_root(&canonical_temp_root, instance_id);
+        // canonical path 可能比输入路径更长，最终交给 bind 的路径也必须独立通过。
+        paths.validate_socket_path()?;
+        Ok(paths)
+    }
+
+    fn ephemeral_from_root(temp_root: &Path, instance_id: &str) -> Self {
         // macOS `sun_path` 只有 104 bytes；TMPDIR 本身常已接近 50 bytes，因此
         // 临时目录与 socket basename 都保持紧凑。socket 仍放在 0700 namespace
         // 内，不能为了缩短路径而暴露到 world-writable temp root。
-        let data_dir = temp_root.as_ref().join(format!("ad-{instance_id}"));
-        let paths = Self {
+        let data_dir = temp_root.join(format!("ad-{instance_id}"));
+        Self {
             runtime_db: data_dir.join("runtime.db"),
             socket: data_dir.join("s"),
             lock: data_dir.join("agentdeckd.lock"),
@@ -192,9 +219,7 @@ impl DaemonPaths {
             // 临时实例使用独立 memory/test keystore，不持有 daemon release entitlement。
             keychain_access_group: None,
             namespace_kind: DaemonNamespaceKind::Ephemeral,
-        };
-        paths.validate_socket_path()?;
-        Ok(paths)
+        }
     }
 
     pub fn validate_socket_path(&self) -> Result<(), NamespaceError> {
@@ -277,6 +302,93 @@ fn validate_instance_id(instance_id: &str) -> Result<(), NamespaceError> {
     {
         return Err(NamespaceError::InvalidInstanceId);
     }
+    Ok(())
+}
+
+fn canonical_private_temp_root(path: &Path) -> Result<PathBuf, NamespaceError> {
+    let initial_metadata = fs::symlink_metadata(path).map_err(|source| NamespaceError::Io {
+        operation: "inspect ephemeral temp root",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    validate_temp_root_metadata(path, &initial_metadata)?;
+
+    let canonical = fs::canonicalize(path).map_err(|source| NamespaceError::Io {
+        operation: "canonicalize ephemeral temp root",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let canonical_metadata =
+        fs::symlink_metadata(&canonical).map_err(|source| NamespaceError::Io {
+            operation: "inspect canonical ephemeral temp root",
+            path: canonical.clone(),
+            source,
+        })?;
+    validate_temp_root_metadata(&canonical, &canonical_metadata)?;
+    validate_same_temp_root(path, &initial_metadata, &canonical_metadata)?;
+    Ok(canonical)
+}
+
+#[cfg(unix)]
+fn validate_temp_root_metadata(path: &Path, metadata: &fs::Metadata) -> Result<(), NamespaceError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(NamespaceError::UnsafeTempRoot {
+            path: path.to_path_buf(),
+            reason: "path is not a real directory",
+        });
+    }
+    // SAFETY: geteuid has no preconditions and only reads process identity.
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(NamespaceError::UnsafeTempRoot {
+            path: path.to_path_buf(),
+            reason: "directory is not owned by the current user",
+        });
+    }
+    if metadata.permissions().mode() & 0o7777 != 0o700 {
+        return Err(NamespaceError::UnsafeTempRoot {
+            path: path.to_path_buf(),
+            reason: "directory permissions are not exact 0700",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_temp_root_metadata(path: &Path, metadata: &fs::Metadata) -> Result<(), NamespaceError> {
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(NamespaceError::UnsafeTempRoot {
+            path: path.to_path_buf(),
+            reason: "path is not a real directory",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_same_temp_root(
+    path: &Path,
+    initial: &fs::Metadata,
+    canonical: &fs::Metadata,
+) -> Result<(), NamespaceError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if initial.dev() != canonical.dev() || initial.ino() != canonical.ino() {
+        return Err(NamespaceError::UnsafeTempRoot {
+            path: path.to_path_buf(),
+            reason: "directory identity changed during canonicalization",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_same_temp_root(
+    _path: &Path,
+    _initial: &fs::Metadata,
+    _canonical: &fs::Metadata,
+) -> Result<(), NamespaceError> {
     Ok(())
 }
 

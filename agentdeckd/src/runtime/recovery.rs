@@ -69,7 +69,13 @@ impl ConversationRecoveryOutcome {
 /// 只能由一次完整 reconciliation 产生的启动许可。
 #[derive(Debug)]
 pub struct RecoveryReadyPermit {
-    _private: (),
+    core_identity: Arc<()>,
+}
+
+impl RecoveryReadyPermit {
+    pub(crate) fn belongs_to(&self, core_identity: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.core_identity, core_identity)
+    }
 }
 
 #[derive(Debug)]
@@ -122,6 +128,7 @@ pub struct RuntimeRecoveryCoordinator {
     store: RuntimeStoreHandle,
     processes: Arc<dyn ProcessGroupController>,
     options: RecoveryOptions,
+    core_identity: Arc<()>,
 }
 
 impl RuntimeRecoveryCoordinator {
@@ -131,10 +138,20 @@ impl RuntimeRecoveryCoordinator {
         processes: Arc<dyn ProcessGroupController>,
         options: RecoveryOptions,
     ) -> Self {
+        Self::new_with_core_identity(store, processes, options, Arc::new(()))
+    }
+
+    pub(crate) fn new_with_core_identity(
+        store: RuntimeStoreHandle,
+        processes: Arc<dyn ProcessGroupController>,
+        options: RecoveryOptions,
+        core_identity: Arc<()>,
+    ) -> Self {
         Self {
             store,
             processes,
             options,
+            core_identity,
         }
     }
 
@@ -198,7 +215,9 @@ impl RuntimeRecoveryCoordinator {
         }
         Ok((
             RuntimeRecoveryReport { conversations },
-            RecoveryReadyPermit { _private: () },
+            RecoveryReadyPermit {
+                core_identity: self.core_identity.clone(),
+            },
         ))
     }
 

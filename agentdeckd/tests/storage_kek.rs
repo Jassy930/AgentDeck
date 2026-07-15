@@ -38,6 +38,12 @@ impl TestDir {
             &unique[..8]
         ));
         fs::create_dir_all(&path).expect("create test directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .expect("make test directory private");
+        }
         Self(path)
     }
 

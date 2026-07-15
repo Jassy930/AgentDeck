@@ -22,12 +22,22 @@ impl TestRoot {
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).expect("create isolated test root");
+        create_private_dir(&path);
         Self(path)
     }
 
     fn path(&self) -> &Path {
         &self.0
+    }
+}
+
+fn create_private_dir(path: &Path) {
+    fs::create_dir_all(path).expect("create isolated private directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("make isolated directory private");
     }
 }
 
@@ -106,7 +116,7 @@ fn ephemeral_namespace_isolates_all_four_filesystem_resources_and_keychain_servi
     let home = root.path().join("home");
     let temp = root.path().join("tmp");
     fs::create_dir(&home).expect("create home");
-    fs::create_dir(&temp).expect("create temp");
+    create_private_dir(&temp);
 
     let first = DaemonConfig::resolve_with_roots(options(true, true), &home, &temp)
         .expect("first ephemeral config");
@@ -147,6 +157,7 @@ fn ephemeral_and_no_remote_must_be_enabled_together() {
     let root = TestRoot::new("matrix");
     let home = root.path().join("home");
     let temp = root.path().join("tmp");
+    create_private_dir(&temp);
 
     assert!(DaemonConfig::resolve_with_roots(stable_options(), &home, &temp).is_ok());
     assert!(DaemonConfig::resolve_with_roots(options(true, true), &home, &temp).is_ok());
@@ -202,6 +213,97 @@ fn namespace_rejects_a_socket_path_that_does_not_fit_sockaddr_un() {
     assert!(matches!(
         DaemonPaths::ephemeral_with_instance_id(&temp, "instance-1"),
         Err(NamespaceError::SocketPathTooLong { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn ephemeral_temp_root_must_have_exact_private_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // 威胁场景：group/world 可写或可遍历的 TMPDIR 允许其他用户替换 daemon
+    // namespace entry，进而劫持 DB、lock 或控制 socket。
+    let root = TestRoot::new("wide-temp-root");
+    let wide = root.path().join("wide");
+    fs::create_dir(&wide).expect("create wide temp root");
+    fs::set_permissions(&wide, fs::Permissions::from_mode(0o755))
+        .expect("set wide temp root permissions");
+
+    let error = DaemonPaths::ephemeral_with_instance_id(&wide, "instance-1")
+        .expect_err("wide temp root must fail closed");
+    assert!(matches!(error, NamespaceError::UnsafeTempRoot { .. }));
+    assert_eq!(error.code(), "daemon.namespace.unsafe_temp_root");
+}
+
+#[cfg(unix)]
+#[test]
+fn ephemeral_temp_root_rejects_symlink_and_regular_file_entries() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    // 威胁场景：TMPDIR final entry 是 symlink 或普通文件时，canonicalize 会把
+    // 审计路径与实际 namespace root 分离，或让后续创建落到非目录对象。
+    let root = TestRoot::new("typed-temp-root");
+    let actual = root.path().join("actual");
+    create_private_dir(&actual);
+    let link = root.path().join("link");
+    symlink(&actual, &link).expect("create temp root symlink");
+    let file = root.path().join("file");
+    fs::write(&file, []).expect("create regular-file temp root");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o700))
+        .expect("set regular file permissions");
+
+    for unsafe_root in [&link, &file] {
+        let error = DaemonPaths::ephemeral_with_instance_id(unsafe_root, "instance-1")
+            .expect_err("non-directory temp root must fail closed");
+        assert!(matches!(error, NamespaceError::UnsafeTempRoot { .. }));
+        assert_eq!(error.code(), "daemon.namespace.unsafe_temp_root");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn ephemeral_temp_root_rejects_a_different_owner_when_observable() {
+    // `/` 是 real directory；普通用户运行测试时它由 root 拥有，可无副作用地
+    // 覆盖 owner 门禁。root CI 无法在不 chown 共享目录的情况下安全构造该样本。
+    // SAFETY: geteuid has no preconditions and only reads process identity.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let error = DaemonPaths::ephemeral_with_instance_id(Path::new("/"), "wrong-owner")
+        .expect_err("wrong-owner temp root must fail closed");
+    assert!(matches!(
+        error,
+        NamespaceError::UnsafeTempRoot {
+            reason: "directory is not owned by the current user",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn ephemeral_paths_are_derived_from_the_canonical_temp_root() {
+    let root = TestRoot::new("canonical-temp-root");
+    let canonical = fs::canonicalize(root.path()).expect("canonical test root");
+
+    let paths = DaemonPaths::ephemeral_with_instance_id(root.path(), "instance-1")
+        .expect("canonical ephemeral paths");
+
+    assert_eq!(paths.data_dir, canonical.join("ad-instance-1"));
+    assert_eq!(paths.socket, canonical.join("ad-instance-1/s"));
+}
+
+#[cfg(unix)]
+#[test]
+fn namespace_rejects_a_canonical_socket_path_that_contains_nul() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    // 威胁场景：canonical TMPDIR 含内嵌 NUL 时，内核 sockaddr 路径会被截断并
+    // 绑定到与审计路径不同的 endpoint。
+    let temp = Path::new("/tmp").join(OsString::from_vec(b"agentdeck\0tmp".to_vec()));
+    assert!(matches!(
+        DaemonPaths::ephemeral_with_instance_id(temp, "instance-1"),
+        Err(NamespaceError::SocketPathContainsNul { .. })
     ));
 }
 

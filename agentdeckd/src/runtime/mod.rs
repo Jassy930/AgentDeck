@@ -30,6 +30,8 @@ pub mod transfer;
 pub use connection::{
     AuthenticatedPrincipal, ConnectionId, ConnectionSink, ConnectionWrite, FlushReceipt,
 };
+#[cfg(test)]
+pub(crate) use conversation::tests::FakeCoordinator;
 pub use core::{RecoveryReport, RuntimeCore};
 pub use hub::RuntimeHub;
 pub use router::AgentRouter;

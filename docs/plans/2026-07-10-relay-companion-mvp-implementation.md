@@ -1435,11 +1435,11 @@ approval 继续只使用 P3.5 的 exact transient `BoundApprovalDelivery`；不�
 
 ### Task P3.8：接入 RuntimeEnvelope v1 UDS 与 stdio compatibility
 
-**阶段状态（2026-07-15）：** P3.8-A 已完成 accepted-stream transport primitives、显式
+**阶段状态（2026-07-16）：** P3.8-A 已完成 accepted-stream transport primitives、显式
 local-control principal、真实 backpressure cancellation 与用途感知 network guard；两轮独立终审无剩余
-P0/P1/P2。fresh `cargo test -p agentdeckd`（lib 629/629、全部 integration/doc tests）、clippy/fmt、
-真实 UDS 4/4、network/docs/diff 均通过。production secure bind、permit 链、stdio allowlist 与 bootstrap
-仍只属于 P3.8-B，尚未实现；P3.1 provisioned signed Keychain 外部门禁继续 BLOCKED。
+P0/P1/P2。P3.8-B 按单任务代码不超过 2,000 行的刹车线拆为 B1/B2：B1 已形成 secure listener
+primitives 候选切片；production config/stdio/main/client 原子切换仍属于 B2，尚未提交。P3.1 provisioned
+signed Keychain 外部门禁继续 BLOCKED。
 
 #### Task P3.8-A：transport primitives、local-control principal 与精确 network guard
 
@@ -1478,6 +1478,16 @@ P0/P1/P2。fresh `cargo test -p agentdeckd`（lib 629/629、全部 integration/d
   `feat(local): 建立 RuntimeEnvelope UDS 传输原语`；禁止目录级 `git add agentdeckd`，不 push。
 
 #### Task P3.8-B：production bootstrap、RemoteStartPermit 与 stdio 收窄
+
+**切片状态（2026-07-16）：**
+
+- [x] B1 secure listener primitives 候选：绑定具体 `RuntimeCore` 的 recovery permit、单次
+  `LocalReadyPermit → RemoteStartPermit`、私有 canonical `TMPDIR`、retained-dirfd stale cleanup、
+  Darwin FD/path 独立 readback、graceful connection supervisor，以及真实 active-turn/backpressure
+  组合测试。此切片不包含 `config.rs` / `main.rs`、stdio compatibility 或客户端 cutover；提交后的
+  clean-HEAD 独立门禁结果在本阶段账本中回填。
+- [ ] B2 原子 cutover：config mode、stdio exhaustive allowlist、production main、Rust/Swift compatibility
+  参数、binary smoke 与最终文档必须同一切片落地。
 
 **Files:**
 - Create: `agentdeckd/src/local/{listener,stdio_compat}.rs`

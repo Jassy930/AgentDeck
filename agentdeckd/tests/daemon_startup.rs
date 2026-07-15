@@ -202,12 +202,17 @@ fn unsigned_stable_daemon_cannot_be_provisioned_by_runtime_environment() {
 #[test]
 fn ephemeral_selfcheck_uses_a_fresh_private_namespace_each_time() {
     let root = TestRoot::new("ephemeral");
+    let canonical_root = fs::canonicalize(root.path()).expect("canonical selfcheck temp root");
     let first = run_ephemeral_selfcheck(root.path());
     let second = run_ephemeral_selfcheck(root.path());
 
     assert_ne!(first, second);
     for data_dir in [first, second] {
-        assert!(data_dir.starts_with(root.path()), "{}", data_dir.display());
+        assert!(
+            data_dir.starts_with(&canonical_root),
+            "{}",
+            data_dir.display()
+        );
         assert!(data_dir.join("agentdeckd.lock").is_file());
         assert!(data_dir.join("diagnostic.log").is_file());
         let runs = data_dir.join("runs");

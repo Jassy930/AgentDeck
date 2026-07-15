@@ -91,7 +91,7 @@ pub struct SingletonGuard {
     lock_path: PathBuf,
     file: File,
     /// 固定通过验证的数据目录 inode，并确保 lock openat 的父目录 fd 活到退出。
-    _data_dir: File,
+    data_dir: File,
 }
 
 impl fmt::Debug for SingletonGuard {
@@ -152,13 +152,45 @@ impl SingletonGuard {
             Ok(Self {
                 lock_path: paths.lock.clone(),
                 file,
-                _data_dir: data_dir,
+                data_dir,
             })
         }
     }
 
     pub fn lock_path(&self) -> &Path {
         &self.lock_path
+    }
+
+    /// 在后续安全边界前重新核对 retained dirfd、当前 pathname 与固定 namespace。
+    ///
+    /// singleton acquire 时的检查不能覆盖 daemon 长生命周期内的目录 rename/swap；
+    /// listener bind 等后续入口必须在产生 typed readiness 前再次调用本方法。
+    pub(crate) fn revalidate_data_dir(&self, paths: &DaemonPaths) -> Result<(), SingletonError> {
+        #[cfg(not(unix))]
+        {
+            let _ = paths;
+            Err(SingletonError::UnsupportedPlatform)
+        }
+
+        #[cfg(unix)]
+        validate_data_dir(paths, &self.data_dir)
+    }
+
+    /// 为需要 `*at` 操作的后续边界复制 retained data-dir fd。复制前后都复核
+    /// pathname 与 inode，避免把路径替换窗口转交给调用方。
+    pub(crate) fn clone_data_dir(&self, paths: &DaemonPaths) -> Result<File, SingletonError> {
+        self.revalidate_data_dir(paths)?;
+        let data_dir = self
+            .data_dir
+            .try_clone()
+            .map_err(|source| SingletonError::Io {
+                operation: "clone retained daemon data directory",
+                path: paths.data_dir.clone(),
+                source,
+            })?;
+        #[cfg(unix)]
+        validate_data_dir(paths, &data_dir)?;
+        Ok(data_dir)
     }
 }
 
@@ -257,8 +289,8 @@ fn validate_data_dir(paths: &DaemonPaths, directory: &File) -> Result<(), Single
         || !entry.file_type().is_dir()
         || opened.uid() != uid
         || entry.uid() != uid
-        || opened.permissions().mode() & 0o777 != 0o700
-        || entry.permissions().mode() & 0o777 != 0o700
+        || opened.permissions().mode() & 0o7777 != 0o700
+        || entry.permissions().mode() & 0o7777 != 0o700
         || opened.dev() != entry.dev()
         || opened.ino() != entry.ino()
     {
