@@ -114,7 +114,7 @@ conversation/key，不能伪造身份连续性。
 本节只记录 v1 探索期约束；相关协议、server/client 与生产路径已在 P2.9 物理删除，
 不得据此实现兼容或启动当前 Relay。
 
-- **R1a-1**：历史阶段要求 `agentdeckd` 依赖树无 `tokio net` 或 `axum`。P3.8-A 为本机 UDS 启用 Tokio `net` 后，该约束已由用途感知的 `scripts/check-daemon-network-boundary.sh` 取代；旧 no-net guard 已删除，仍禁止 TCP/UDP/HTTP/WSS server/client 栈。
+- **R1a-1**：历史阶段要求 `agentdeckd` 依赖树无 `tokio net` 或 `axum`。P3.8-A 为本机 UDS 启用 Tokio `net` 后，权威约束改为用途感知的 `scripts/check-daemon-network-boundary.sh`；旧 `check-daemon-no-net.sh` 仅保留为执行该权威入口的兼容 wrapper，仍禁止 TCP/UDP/HTTP/WSS server/client 栈。
 - **R1a-2**：`agentdeck-cli` 依赖树无 `axum`——CLI 只走 WS client 不做 server
 - **R1a-3**：net/axum 仅限 `agentdeck-relay` 的 `server` feature + `agentdeck-relay-client` crate
 - **R1a-4**：`relay` 数据目录独立于 daemon/CLI，只存不透明数据 + 公钥材料 + credential 哈希（**不**存明文 credential）

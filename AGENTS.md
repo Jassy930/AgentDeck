@@ -336,8 +336,9 @@ Runtime frame 固定 `<1 MiB`，outer version mismatch 只在 header 可信时�
 malformed/duplicate/incomplete/exact-cap 零回复。首帧必须 Hello，inner mismatch 仍由 Core 返回。
 local-control grant 固定 `ResolveAndRetry`，不得以 `is_local()` 提权。writer 只有 socket write+flush 成功
 才 ACK，并把该过程与 Core cancellation 竞争。`local_uds` 必须使用测试自己持有的真实 listener；
-P3.8-A 不得暴露 production bind、`LocalReadyPermit` 或 `RemoteStartPermit`。旧 no-net 脚本已由
-`check-daemon-network-boundary.sh` 替换并删除。A 阶段 connection actor 必须被 poll/join；
+P3.8-A 不得暴露 production bind、`LocalReadyPermit` 或 `RemoteStartPermit`。用途感知的
+`check-daemon-network-boundary.sh` 是权威 guard；旧 `check-daemon-no-net.sh` 仅保留为兼容 wrapper。
+A 阶段 connection actor 必须被 poll/join；
 P3.8-B supervisor 必须 graceful cancel + join，禁止用 detached cleanup 掩盖任意 task abort。
 
 ## 浏览与外部资料

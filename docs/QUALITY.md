@@ -1069,7 +1069,8 @@ UDS principal 只能经显式 local-control issuer 获得 `ResolveAndRetry`，re
 P3.8-A 调用方必须 poll/join connection actor，不能用 arbitrary task abort 制造无 owner 的异步收割；
 P3.8-B listener supervisor 必须用 graceful cancel + join 收口所有连接后再 shutdown Core。
 新 guard 检查 daemon normal dependency tree 与 source allowlist：只放行本机 Unix transport 和 P3.7
-私有 socketpair，仍禁止 TCP/UDP/HTTP/WSS stack；旧 no-net 脚本已由该入口替换并删除。
+私有 socketpair，仍禁止 TCP/UDP/HTTP/WSS stack；`check-daemon-network-boundary.sh` 是权威实现，
+旧 `check-daemon-no-net.sh` 仅保留为兼容 wrapper。
 
 ## AppKit 重写后的验证清单
 

@@ -190,16 +190,20 @@ flowchart LR
 
 - 产品语义中的“唯一 daemon”是：每个登录用户/被控机器只有一个 **stable、remote-enabled** 的生产实例。`launchd` 以 `com.agentdeck.agentdeckd` LaunchAgent 维持它，daemon 自身再持有 stable namespace 进程锁，防止手工启动第二实例。MVP 把一个 macOS 登录用户 profile 定义为一台逻辑被控机器；同一物理 Mac 的不同 OS 用户是互相隔离的机器信任域，不能共享 vendor runtime。
 - macOS App 从 `ProcessDaemonTransport` 切换为 `UnixSocketDaemonTransport`；退出 App 不关闭 daemon 或 vendor child。
-- CLI 默认也连接 UDS。stdio 只保留为迁移/测试 transport，不是生产 ownership 模型。
+- CLI 默认也连接 UDS。stdio 只在显式同时传入
+  `--stdio-compat --ephemeral --no-remote` 时保留为迁移/测试 transport，不是生产 ownership 模型。
 - daemon 与 Relay 维持一条 machine WSS，复用多个 remote device 和 stream route。
-- dev/test 只允许显式 `--ephemeral --no-remote` 实例：使用临时或 `.dev` DB/UDS/Keychain namespace，不注册 LaunchAgent、不连接生产 socket、不读取生产 MachineRoot，也不能成为真实远程被控端。它可以与 stable daemon 共存，但只是测试 harness，不构成第二个产品 daemon。
+- dev/test 只允许显式 `--ephemeral --no-remote` 实例：使用临时或 `.dev` DB/UDS/Keychain namespace，不注册 LaunchAgent、不连接生产 socket、不读取生产 MachineRoot，也不能成为真实远程被控端。production daemon CLI 不提供 `--socket` 或 socket path 环境变量覆盖；ephemeral smoke 只能提供私有 `TMPDIR`，再消费 daemon 派生的 endpoint discovery。它可以与 stable daemon 共存，但只是测试 harness，不构成第二个产品 daemon。
 - stable UDS 固定为 `~/Library/Application Support/AgentDeck/agentdeckd.sock`；Runtime DB、锁和 Keychain access group 都使用 stable namespace。测试实例必须把上述四类资源全部隔离，继续满足现有 K6。
 
 安装与升级固定为：
 
 1. macOS App bundle 携带经过同一发布签名的 daemon helper，并通过 `agentdeck-cli daemon install`（或等价 App 安装入口）复制到 `~/Library/Application Support/AgentDeck/bin/<version>/agentdeckd`。
 2. 安装器完整校验签名/版本后原子更新 `bin/current`，生成 `~/Library/LaunchAgents/com.agentdeck.agentdeckd.plist`，再对当前 GUI user 执行 `launchctl bootstrap/kickstart`。
-3. active turn 存在时只 stage 新版本；daemon 空闲或下一次明确重启才切换。客户端与 daemon 协议不兼容时显示 typed mismatch，不静默 spawn 私有旧 daemon。
+3. active turn 存在时只 stage 新版本；daemon 空闲或下一次明确重启才切换。P3.10 写 installer 与
+   coordinator 前必须先冻结 local-only typed `StageUpgrade` request/reply wire 及其授权、错误语义，
+   remote principal/Relay 路径不能构造或执行它。客户端与 daemon 协议不兼容时显示 typed mismatch，
+   不静默 spawn 私有旧 daemon。
 4. `agentdeck-cli daemon uninstall` 卸载 LaunchAgent 并删除已安装 binary/plist，但默认保留 Runtime DB 与 Keychain；只有显式 `--purge` 才进入 trust-reset/purge 流程，不能边卸载边遗留可连接的旧 machine route。
 
 ### 5.2 Relay
@@ -478,19 +482,28 @@ decode 前丢失 typed failure、慢 socket 在 Core fail-close 后继续持有 
    writer，不终止 RuntimeCore 或 active turn。
 6. listener 只能在 `RecoveryReadyPermit` 后 bind。bind 复刻 Relay admin UDS 的 inode-aware stale cleanup，
    但不抽共享 crate：parent 必须 current UID、exact 0700 real directory；active socket、symlink、regular
-   file 或 inode swap 全部拒绝；bind 后 chmod 0600，再读回 socket type、current UID、exact mode、nlink、
-   dev/ino。RAII guard 只 unlink 自己记录的 dev/ino。所有模式完成这些 readback 后只产生字段/构造器
+   file 或 inode swap 全部拒绝；bind 后 chmod 0600。Darwin 的 listener FD `fstat` 身份与 pathname
+   `lstat` 身份天然不同（真实样本为 FD `nlink=0`、pathname `nlink=1`），因此禁止要求两者 dev/ino
+   相等：FD 只独立验证为 socket；pathname 必须通过 retained parent dirfd 的 no-follow `fstatat`
+   独立验证 socket type、current UID、exact 0600、exact `nlink=1`，并捕获 pathname dev/ino。RAII guard 只在同一
+   parent dirfd 下复核 pathname 仍匹配所捕获的 dev/ino/nlink 后 unlink。该 readback 证明的是 listener
+   FD 类型与受控目录项各自成立；信任根是内核 `bind/fstat/fstatat/unlinkat` 语义、current EUID 与
+   retained parent dirfd，不把 Darwin 不成立的 FD/path inode 相等关系当作证明。所有 UDS 模式完成
+   这些 readback 后只产生字段/构造器
    私有的 `LocalReadyPermit`；只有 `DaemonMode::Stable + remote_enabled=true + canonical socket` 才能再
    派生单次消费的 `RemoteStartPermit`。ephemeral/no-remote 即使安全绑定 UDS 也永远不能 mint remote
    permit；P4 `RemoteTransport` 没有该 permit 不得启动。其证明边界只是“recovery 完成且 same-UID 本地
    管理面已安全绑定，并且 stable remote mode 已获配置许可”，不证明 remote 已连接。
-7. stable 只能使用 canonical `DaemonPaths.socket`，不接受 path/env override。测试 `--socket PATH` 仅允许
-   `--ephemeral --no-remote`，其 canonical parent 必须位于 canonical OS temp root 下、属于 current UID、
-   exact 0700，作为本次 ephemeral socket namespace；home/stable 路径拒绝。该 flag 选择 UDS daemon
-   mode。没有 `--socket` 的显式 ephemeral/no-remote 继续运行 stdio compatibility；stable 生命周期
-   由 UDS + signal 驱动，不能因 stdin EOF 退出。shutdown 顺序固定为未来 remote stop → listener/所有
-   local connections stop → `RuntimeCore::shutdown()`。
-8. 所有 CLI 可选择的 stdio compatibility（包括 ephemeral/no-remote）统一使用显式 allowlist：只允许
+7. stable 只能使用 canonical `DaemonPaths.socket`。production `agentdeckd` binary 对 stable/ephemeral
+   都不提供 `--socket`，也不读取任何 socket path 环境变量覆盖；显式路径只允许进入 test-only bind
+   helper。ephemeral UDS 由 private、current-UID、exact 0700 的 `TMPDIR` 与随机 instance ID 派生为
+   唯一 `ad-*/s`。smoke 必须发现并验证恰好一个该 endpoint，再把 discovery 结果交给测试客户端；
+   不得向 daemon 注入 socket path。stable 生命周期由 UDS + signal 驱动，不能因 stdin EOF 退出。
+   shutdown 顺序固定为未来 remote stop → listener/所有 local connections stop →
+   `RuntimeCore::shutdown()`。
+8. stdio compatibility 只有完整显式组合
+   `--stdio-compat --ephemeral --no-remote` 才能启动，缺少任一项都 fail-close；未传
+   `--stdio-compat` 的 ephemeral/no-remote 走派生 UDS。该路径统一使用显式 allowlist：只允许
    Ping、Selfcheck、ProtocolSchema/Version、
    AgentList/Capabilities 与 History List/Read；Start/Continue、History mutation、SessionCancel、
    ActionDecision、VendorControl 及未来新增的未列举命令全部 typed reject。它不支持 multi-client、remote
@@ -502,6 +515,8 @@ decode 前丢失 typed failure、慢 socket 在 Core fail-close 后继续持有 
 `exec_gate/parent.rs` 与 `runtime/execution.rs` 的 test-only pair。全 daemon 继续禁止 TCP listener/stream、
 UDP、reqwest、axum、hyper server 与 tungstenite；Codex/CC adapter 不能 import local/remote transport。
 guard 同时检查 Cargo dependency tree，禁止仅靠 source grep 漏掉 reqwest/axum/hyper/tungstenite 等依赖。
+`scripts/check-daemon-network-boundary.sh` 是权威实现；历史
+`scripts/check-daemon-no-net.sh` 继续保留为无额外逻辑的兼容 wrapper，只 `exec` 权威入口。
 
 ### 8.3 Per-conversation actor
 
@@ -1233,7 +1248,7 @@ swift test
 cd ios && xcodegen generate && \
   xcodebuild -project AgentDeckMobile.xcodeproj -scheme AgentDeckMobile \
     -destination 'platform=iOS Simulator,name=iPhone 17' test
-bash scripts/check-daemon-no-net.sh
+bash scripts/check-daemon-network-boundary.sh
 scripts/verify-agent-docs.sh
 cargo run -q -p agentdeck-cli -- protocol schema \
   | diff - protocol/agentdeck/agentdeck-protocol.schema.json
@@ -1269,8 +1284,9 @@ bash scripts/verify-relay-companion-mvp.sh
 
 `scripts/verify-relay-companion-mvp.sh` 是实施期统一编排入口。真实 vendor 和物理设备测试保持 gated，不能把合成/Simulator 通过冒充真机闭环。
 
-网络 guard 的阶段边界固定为：P0–P2 使用历史 `check-daemon-no-net.sh`；P3 引入 UDS 的同一提交替换为
-`check-daemon-network-boundary.sh`。该 guard 只允许 `agentdeckd/src/local/` 使用 pathname Tokio
+网络 guard 的阶段边界固定为：P0–P2 历史记录使用 `check-daemon-no-net.sh`；P3 引入 UDS 后由
+`check-daemon-network-boundary.sh` 成为权威实现，旧名字保留为只 `exec` 新入口的兼容 wrapper。
+该 guard 只允许 `agentdeckd/src/local/` 使用 pathname Tokio
 UnixListener/UnixStream，同时精确保留 P3.7 exec-gate 私有继承 FD/socketpair allowlist；仍禁止
 TCP/WSS/UDP/reqwest/axum/hyper server/tungstenite。P4 再把 allowlist 扩展到
 `agentdeckd/src/remote/`（或独立 remote client crate）的 outbound WSS；daemon 始终不得依赖

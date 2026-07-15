@@ -1451,7 +1451,7 @@ P0/P1/P2。fresh `cargo test -p agentdeckd`（lib 629/629、全部 integration/d
 - Modify: `agentdeckd/src/runtime/{connection,core,mod}.rs`
 - Modify: `agentdeckd/Cargo.toml`, `scripts/verify-relay-companion-mvp.sh`
 - Modify: `ARCHITECTURE.md`, `docs/QUALITY.md`, `AGENTS.md`
-- Delete: `scripts/check-daemon-no-net.sh`
+- Modify: `scripts/check-daemon-no-net.sh`（只保留 `exec` 权威 network-boundary guard 的兼容 wrapper）
 
 - [x] Step 1: 先写 RED tests。覆盖 same-EUID 必须先于 preface read；strict
   `LocalClientPrefaceV1` 的 canonical non-nil UUID、4 KiB bound、reconnect owner 稳定；wrong envelope
@@ -1470,7 +1470,8 @@ P0/P1/P2。fresh `cargo test -p agentdeckd`（lib 629/629、全部 integration/d
 - [x] Step 4: 实现 source/path guard：pathname Tokio Unix 只允许 `src/local/`；std Unix socketpair 只精确
   allowlist `exec_gate.rs`、`exec_gate/parent.rs` 与 execution test pair；全 daemon 禁 TCP/UDP/WSS/
   reqwest/axum/hyper server/tungstenite；同时检查 Cargo dependency tree 中的 banned crates/features，
-  不能只靠 source grep。更新 verifier，删除旧 guard。
+  不能只靠 source grep。更新 verifier，并保留旧 `check-daemon-no-net.sh` 作为只 `exec`
+  `check-daemon-network-boundary.sh` 的兼容 wrapper；后者才是权威实现。
 - [x] Step 5: 跑 local/connection/core tests、daemon package、fmt/clippy、new guard、docs/diff；至少对一条
   真实本机 UDS Hello + request/reply 样本读回，不以 synthetic codec 单测代替。
 - [x] Step 6: 独立 spec/security review 后精确暂存本切片并提交
@@ -1479,30 +1480,40 @@ P0/P1/P2。fresh `cargo test -p agentdeckd`（lib 629/629、全部 integration/d
 #### Task P3.8-B：production bootstrap、RemoteStartPermit 与 stdio 收窄
 
 **Files:**
-- Create: `agentdeckd/src/local/stdio_compat.rs`
+- Create: `agentdeckd/src/local/{listener,stdio_compat}.rs`
 - Modify: `agentdeckd/src/{main,config}.rs`
 - Modify: `agentdeckd/src/runtime/{hub,namespace}.rs`
 - Modify: `agentdeckd/src/local/{mod,unix}.rs`
 - Modify: `agentdeckd/tests/{daemon_startup,local_uds,typed_spawn_ownership}.rs`
+- Modify: `agentdeck-cli/src/transport.rs`, `Sources/AgentDeck/ProcessDaemonTransport.swift`
+- Modify: 对应 Rust/Swift transport 参数测试
 - Modify: `README.md`, `ARCHITECTURE.md`, `docs/{QUALITY,AGENT_DIAGNOSTICS,index}.md`, `AGENTS.md`
 
 - [ ] Step 1: 先写 RED production tests。listener 在 `RecoveryReadyPermit` 前不存在；stale cleanup 与 bind
-  必须验证 owned 0700 parent、socket 0600/current UID/nlink/dev/ino，active/symlink/regular/inode swap
-  均不 mint permit，guard 只删 exact inode；完整 readback 后所有模式产生不可构造
+  必须验证 owned 0700 parent。Darwin 真实样本中 listener FD 为 `nlink=0`、pathname 为 `nlink=1`，
+  dev/ino 也不同，因此禁止断言 FD/path dev/ino 相等：FD `fstat` 只独立验证为 socket；pathname 通过
+  retained parent dirfd 的 no-follow `fstatat` 独立验证 socket type、0600/current UID/exact `nlink=1` 并捕获
+  dev/ino，cleanup 只在 pathname exact identity 仍匹配时 unlink。active/symlink/regular/inode swap
+  均不 mint permit；完整 readback 后所有 UDS 模式产生不可构造
   `LocalReadyPermit`，只有 stable+remote-enabled+canonical socket 才再产生单次消费
-  `RemoteStartPermit`，ephemeral/no-remote 永不产生。覆盖 stable canonical socket、stable override
-  拒绝、`--socket` 仅 `--ephemeral --no-remote` 且 canonical parent 位于 canonical OS temp root 下并为
-  owned 0700；readiness 是 preface+Hello reply；stable stdin EOF 不退出，signal shutdown 顺序正确。
-- [ ] Step 2: 为 `RuntimeHub::admin_only` 写 exhaustive allowlist tests：仅 Ping/Selfcheck/ProtocolSchema/
+  `RemoteStartPermit`，ephemeral/no-remote 永不产生。production parser 必须拒绝 `--socket`，daemon
+  不读取 socket path env override；显式 path 仅留 test helper。覆盖 stable canonical socket、私有
+  `TMPDIR` 下自动派生且唯一的 `ad-*/s`；readiness 是 preface+Hello reply；stable stdin EOF 不退出，
+  signal shutdown 顺序正确。
+- [ ] Step 2: 为 `RuntimeHub::admin_only` 写 exhaustive allowlist tests：stdio 仅接受完整显式组合
+  `--stdio-compat --ephemeral --no-remote`，缺一项均 fail-close；Rust/Swift 兼容 transport 必须同批
+  补传 `--stdio-compat`。allowlist 仅含 Ping/Selfcheck/ProtocolSchema/
   Version、AgentList/Capabilities、History List/Read；Start/Continue、三种 History mutation、SessionCancel、
   ActionDecision、VendorControl 与未来未列举 variant typed reject 且不进 router。所有可选 stdio 模式都
   构造同一 allowlist hub；完整 `RuntimeHub::new` 只能 `cfg(test)`。
 - [ ] Step 3: 接线 production main：`singleton → Keychain/DB → recovery permit → secure UDS bind/readback →
-  LocalReadyPermit → stable-only RemoteStartPermit → run`；stable 由 UDS+signal 驱动，显式 ephemeral 无
-  `--socket` 才保留 admin/read stdio compatibility。shutdown 固定 future remote → local
+  LocalReadyPermit → stable-only RemoteStartPermit → run`；stable 由 UDS+signal 驱动，ephemeral 默认走
+  private `TMPDIR` 派生 UDS，只有显式 `--stdio-compat --ephemeral --no-remote` 才走 admin/read stdio。
+  shutdown 固定 future remote → local
   listener/connections → Core。
 - [ ] Step 4: 跑 daemon startup/local UDS/stdio/typed ownership tests、完整 daemon package、fmt/clippy、
-  schema、network guard、ephemeral UDS binary smoke、docs/diff。确认 malformed/oversize/slow client 只关闭
+  schema、两条 guard、ephemeral UDS binary smoke、docs/diff。smoke 使用 private exact 0700 `TMPDIR`，
+  发现并验证恰好一个 `ad-*/s`，不向 daemon 注入 path。确认 malformed/oversize/slow client 只关闭
   自身，Core/active turn/PID 不变。
 - [ ] Step 5: 独立 spec/security/quality review，修完 P0/P1/P2 后同步 README/ARCHITECTURE/QUALITY/
   DIAGNOSTICS/AGENTS 与本计划；P3.1 signed Keychain 仍保持外部 BLOCKED。
@@ -1520,14 +1531,19 @@ P0/P1/P2。fresh `cargo test -p agentdeckd`（lib 629/629、全部 integration/d
 - Modify: `agentdeck-cli/src/{transport,client,main}.rs`
 - Modify: `Sources/AgentDeck/{DaemonTransport,ProcessDaemonTransport,DaemonClient,SessionModel,WorkbenchModel,ThreadRuntimeModel,AppDelegate,main}.swift`
 
-- [ ] Step 1: 写 shared-daemon tests。 Rust CLI与Swift transport连接同一temp UDS，看到同conversation/queue；关闭App连接后daemon PID/turn不变；protocol mismatch可见；默认代码路径不spawn；ProcessDaemonTransport只允许`--ephemeral --no-remote`。App/CLI 各自安装首次生成独立 canonical non-nil `clientInstallationId`，两个真实客户端进程重启后必须读回各自同一 ID/idempotency owner；只有显式删除 client installation record 才轮换，daemon 不生成兜底 ID。
+- [ ] Step 1: 写 shared-daemon tests。 Rust CLI与Swift transport连接同一temp UDS，看到同conversation/queue；关闭App连接后daemon PID/turn不变；protocol mismatch可见；默认代码路径不spawn；ProcessDaemonTransport只允许`--stdio-compat --ephemeral --no-remote`完整组合。App/CLI 各自安装首次生成独立 canonical non-nil `clientInstallationId`，两个真实客户端进程重启后必须读回各自同一 ID/idempotency owner；只有显式删除 client installation record 才轮换，daemon 不生成兜底 ID。
 - [ ] Step 2: 运行 `cargo test -p agentdeck-cli --test shared_daemon` 与 `swift test --filter RuntimeEnvelopeClientTests`。 Expected: FAIL，默认仍spawn私有daemon/讲IPC v2。
 - [ ] Step 3: 实现 Rust/Swift Runtime v1 UDS client并迁移模型主键到conversationId/eventId/itemId/entityId/commandId。App 与 CLI 使用独立、0700/0600、原子写入且 O_NOFOLLOW 的 client installation record 持久化各自 UUID；它不是 secret/认证材料。删除synthetic agentItem序号；本地进程退出只close socket。
-- [ ] Step 4: 重跑tests与`swift test`，再运行`bash scripts/run-local-runtime-smoke.sh`。 脚本必须在tempdir启动`agentdeckd --ephemeral --no-remote --socket "$AGENTDECK_TEST_SOCKET"`、等待socket ready、把同一`AGENTDECK_DAEMON_SOCKET`传给Rust CLI与`swift run AgentDeck -- --selfcheck`，最后trap清理进程/socket/DB。 Expected: 全部PASS，两个本地writer FIFO/approval结果一致。
+- [ ] Step 4: 重跑tests与`swift test`，再运行`bash scripts/run-local-runtime-smoke.sh`。脚本必须创建并 canonicalize private、current-UID、exact 0700 的 `TMPDIR`，只以 `agentdeckd --ephemeral --no-remote` 启动 daemon；随后发现并验证恰好一个 `TMPDIR/ad-*/s`，将 endpoint discovery 结果交给 Rust/Swift 测试客户端，绝不以 `--socket` 或 socket path env override 向 daemon 注入路径，最后 trap 清理进程/socket/DB。 Expected: 全部PASS，两个本地writer FIFO/approval结果一致。
 - [ ] Step 5: 运行 network guard与git状态清理。
 - [ ] Step 6: 提交。 `git add agentdeck-cli Sources Tests scripts/run-local-runtime-smoke.sh && git commit -m "feat(local): App 与 CLI 共用 singleton daemon UDS"`
 
 ### Task P3.10：实现 LaunchAgent 安装、versioned upgrade 与保留数据的 uninstall
+
+**前置冻结：** 在创建 installer/upgrade coordinator 之前，先以独立 protocol contract + schema snapshot
+冻结 local-only typed `StageUpgrade` request/reply wire、授权与错误语义；remote principal/Relay 路径必须
+typed reject。该 wire 未完成 review 与快照门禁前，不得开始 P3.10 实现，也不得临时复用 generic
+command/vendor control。
 
 **Files:**
 - Create: `agentdeck-cli/src/daemon.rs`
