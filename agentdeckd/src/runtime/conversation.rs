@@ -2541,7 +2541,7 @@ async fn execute_command(
         .await
         .is_err()
     {
-        let _ = cancel_control(control).await;
+        let _ = request_active_cancel(&execution_gate, Some(control)).await;
         return;
     }
     match prepared_ready.await {
@@ -2568,7 +2568,7 @@ async fn execute_command(
             return;
         }
         Ok(Err(_)) | Err(_) => {
-            let _ = cancel_control(control).await;
+            let _ = request_active_cancel(&execution_gate, Some(control)).await;
             let _ = runner_tx
                 .send(RunnerEvent::RecoveryBlocked {
                     command_id: command.command_id,
@@ -2629,7 +2629,7 @@ async fn execute_command(
     let fence = match fence {
         Ok(fence) => fence,
         Err(_) => {
-            let _ = cancel_control(control).await;
+            let _ = request_active_cancel(&execution_gate, Some(control)).await;
             let _ = runner_tx
                 .send(RunnerEvent::RecoveryBlocked {
                     command_id: command.command_id,
@@ -2650,7 +2650,7 @@ async fn execute_command(
         .is_err()
         || !matches!(fence_ready.await, Ok(Ok(())))
     {
-        let _ = cancel_control(control).await;
+        let _ = request_active_cancel(&execution_gate, Some(control)).await;
         return;
     }
 
@@ -2711,7 +2711,7 @@ async fn execute_command(
             }
             Err(_) => {
                 drop(gate);
-                let _ = cancel_control(control).await;
+                let _ = request_active_cancel(&execution_gate, Some(control)).await;
                 let _ = runner_tx
                     .send(RunnerEvent::RecoveryBlocked {
                         command_id: command.command_id,
@@ -2733,14 +2733,14 @@ async fn execute_command(
         .is_err()
         || !matches!(release_ready.await, Ok(Ok(())))
     {
-        let _ = cancel_control(control).await;
+        let _ = request_active_cancel(&execution_gate, Some(control)).await;
         return;
     }
     let permit =
         match ExecutionReleasePermit::from_committed_store(&release_request, &release_record) {
             Ok(permit) => permit,
             Err(_) => {
-                let _ = cancel_control(control).await;
+                let _ = request_active_cancel(&execution_gate, Some(control)).await;
                 let _ = runner_tx
                     .send(RunnerEvent::RecoveryBlocked {
                         command_id: command.command_id,
@@ -2805,7 +2805,7 @@ async fn execute_command(
         None => Ok(Ok(())),
     };
     if !matches!(forwarding, Ok(Ok(()))) {
-        let _ = cancel_control(control.clone()).await;
+        let _ = request_active_cancel(&execution_gate, Some(control.clone())).await;
         let _ = runner_tx
             .send(RunnerEvent::RecoveryBlocked {
                 command_id: command.command_id,

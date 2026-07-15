@@ -33,6 +33,7 @@ struct CliArgs {
     diagnostics_report: bool,
     exec_gate: bool,
     production_execution_probe: bool,
+    production_execution_cancel_probe: bool,
     show_version: bool,
     show_help: bool,
 }
@@ -160,6 +161,10 @@ where
             out.exec_gate = true;
         } else if cfg!(debug_assertions) && argument == OsStr::new("--production-execution-probe") {
             out.production_execution_probe = true;
+        } else if cfg!(debug_assertions)
+            && argument == OsStr::new("--production-execution-cancel-probe")
+        {
+            out.production_execution_cancel_probe = true;
         } else if argument == OsStr::new("--version") || argument == OsStr::new("-V") {
             out.show_version = true;
         } else if argument == OsStr::new("--help") || argument == OsStr::new("-h") {
@@ -180,6 +185,7 @@ fn validate_cli_args(args: &CliArgs) -> Result<(), CliError> {
             || args.selfcheck
             || args.diagnostics_report
             || args.production_execution_probe
+            || args.production_execution_cancel_probe
             || args.show_version
             || args.show_help)
     {
@@ -188,7 +194,7 @@ fn validate_cli_args(args: &CliArgs) -> Result<(), CliError> {
     if args.selfcheck && args.diagnostics_report {
         return Err(CliError::ConflictingOneShotModes);
     }
-    if args.production_execution_probe
+    if (args.production_execution_probe || args.production_execution_cancel_probe)
         && (args.profile.is_some()
             || args.data_dir.is_some()
             || args.ephemeral
@@ -196,6 +202,7 @@ fn validate_cli_args(args: &CliArgs) -> Result<(), CliError> {
             || args.selfcheck
             || args.diagnostics_report
             || args.exec_gate
+            || (args.production_execution_probe && args.production_execution_cancel_probe)
             || args.show_version
             || args.show_help)
     {
@@ -366,7 +373,7 @@ fn run_diagnostics_report() -> ExitCode {
 }
 
 #[cfg(debug_assertions)]
-fn run_production_execution_probe() -> ExitCode {
+fn run_production_execution_probe(cancel_before_release: bool) -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -377,9 +384,17 @@ fn run_production_execution_probe() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    match runtime
-        .block_on(agentdeckd::runtime::production_execution_probe::run_production_execution_probe())
-    {
+    let outcome = if cancel_before_release {
+        runtime.block_on(
+            agentdeckd::runtime::production_execution_probe::run_production_execution_cancel_probe(
+            ),
+        )
+    } else {
+        runtime.block_on(
+            agentdeckd::runtime::production_execution_probe::run_production_execution_probe(),
+        )
+    };
+    match outcome {
         Ok(evidence) => match serde_json::to_string(&evidence) {
             Ok(encoded) => {
                 println!("{encoded}");
@@ -483,12 +498,12 @@ fn main() -> ExitCode {
     }
 
     #[cfg(debug_assertions)]
-    if args.production_execution_probe {
+    if args.production_execution_probe || args.production_execution_cancel_probe {
         if let Err(error) = validate_cli_args(&args) {
             print_typed_error(error.code(), &error);
             return ExitCode::from(2);
         }
-        return run_production_execution_probe();
+        return run_production_execution_probe(args.production_execution_cancel_probe);
     }
 
     if args.show_help {
