@@ -440,6 +440,69 @@ P4 durable auth ledger 接入前 production issuer 不提供 remote capability�
 重新绑定精确 grant serial 的 remote Accepted，RuntimeCore 必须 `RecoveryBlocked`，不能只按
 idempotency owner 近似授权。
 
+#### 8.2.1 P3.8 本地传输契约冻结（2026-07-15）
+
+本节的具体威胁场景是：same-UID 协作式客户端意外轮换/复用 installation identity、错误版本在 strict
+decode 前丢失 typed failure、慢 socket 在 Core fail-close 后继续持有 frame，以及远程链路早于本地
+恢复面启动，都会造成幂等身份混淆、恢复不可见或控制面在本机失联时仍开放。P3.8 固定以下边界：
+
+1. UDS accept 后必须先从内核 peer credential 验证 **same effective UID**，再读取任何 client bytes。
+   随后读取 local-only `LocalClientPrefaceV1`：strict JSONL 只含
+   `localProtocolVersion=1` 与 canonical lowercase、非 nil UUID `clientInstallationId`；JSON bytes 最多
+   4,095，连同换行最多 4 KiB，缺字段、重复字段、unknown field、无效 UUID 或超限立即关闭。preface
+   不进入共享 `RuntimeEnvelope`/remote wire；daemon 禁止按连接随机兜底。installation ID 仅进入审计、
+   配额和 idempotency namespace，认证信任根始终是内核 peer credential；恶意 same-UID 进程若已知该
+   UUID 仍可声明它，本机制不证明安装来源。每个 App/CLI 安装各自生成并持久化独立 ID，进程重启必须
+   复用，只有显式删除该 client installation record/重装才生成新值；具体存储与跨进程重启门禁归 P3.9。
+2. preface 后的第一条 Runtime frame 必须是 `RuntimeRequest::Hello`。framing 先在完整、受限 raw JSON 上
+   strict probe 顶层 `version/messageId/body`，其中 body 暂存为 raw JSON，再做 `RuntimeEnvelope` 完整
+   反序列化：header 合法但 version≠1 时，
+   daemon 用当前 version=1、原 messageId flush 一条
+   `daemon.runtime.protocol_mismatch` 后关闭；header 缺失/重复/类型错误、malformed JSON 或 oversize
+   直接关闭，不伪造 reply。version=1 后才进入 strict envelope decoder；首帧若不是 Request/Hello，flush
+   一条同 messageId `daemon.runtime.invalid_request` 后关闭，绝不执行该请求。Hello 内层版本不匹配仍是
+   普通 typed reply，不绕过 Core。readiness 必须完成 connect → preface → Hello → Hello reply，socket
+   pathname 存在不构成 ready。
+3. UDS 签发显式 `LocalControlPrincipal`，approval grant 固定 `ResolveAndRetry`；read-only local issuer 保持
+   `None`。`ResolveApproval/RetryApproval` 继续只消费 capability，不允许在请求处理时用 `is_local()`
+   绕过权限。同一完整 identity 若已以不同 approval grant 建立 lease，必须 `PermissionConflict`，不能
+   静默升级。
+4. `ConnectionWrite` 暴露 cloneable shared bytes 与基于 ACK receiver drop 的 cancellation observation。
+   local writer 固定 `select(write+flush, write.cancelled())`；只有 write+flush 成功才 ACK，Core 取消获胜时
+   立即关闭该 socket。慢连接只释放自己的 writer/frame/byte budget，不影响 sibling connection；Core
+   从不 await socket。
+5. UDS raw JSON frame 与现有 checked encoder 使用同一 `<1 MiB` hard cap；exact 1 MiB、malformed、
+   incomplete 或额外 trailing bytes 都关闭。P3.8 沿用现有 encoder 对完整 Request envelope bytes 的
+   `<1 MiB` 检查，不另造“仅 payload bytes”算法；Reply/Stream 超限必须先走 700 KiB raw
+   `TransferPart`，不能在 transport 临时放宽。disconnect 只清理该 connection、subscription/job/pin 与
+   writer，不终止 RuntimeCore 或 active turn。
+6. listener 只能在 `RecoveryReadyPermit` 后 bind。bind 复刻 Relay admin UDS 的 inode-aware stale cleanup，
+   但不抽共享 crate：parent 必须 current UID、exact 0700 real directory；active socket、symlink、regular
+   file 或 inode swap 全部拒绝；bind 后 chmod 0600，再读回 socket type、current UID、exact mode、nlink、
+   dev/ino。RAII guard 只 unlink 自己记录的 dev/ino。所有模式完成这些 readback 后只产生字段/构造器
+   私有的 `LocalReadyPermit`；只有 `DaemonMode::Stable + remote_enabled=true + canonical socket` 才能再
+   派生单次消费的 `RemoteStartPermit`。ephemeral/no-remote 即使安全绑定 UDS 也永远不能 mint remote
+   permit；P4 `RemoteTransport` 没有该 permit 不得启动。其证明边界只是“recovery 完成且 same-UID 本地
+   管理面已安全绑定，并且 stable remote mode 已获配置许可”，不证明 remote 已连接。
+7. stable 只能使用 canonical `DaemonPaths.socket`，不接受 path/env override。测试 `--socket PATH` 仅允许
+   `--ephemeral --no-remote`，其 canonical parent 必须位于 canonical OS temp root 下、属于 current UID、
+   exact 0700，作为本次 ephemeral socket namespace；home/stable 路径拒绝。该 flag 选择 UDS daemon
+   mode。没有 `--socket` 的显式 ephemeral/no-remote 继续运行 stdio compatibility；stable 生命周期
+   由 UDS + signal 驱动，不能因 stdin EOF 退出。shutdown 顺序固定为未来 remote stop → listener/所有
+   local connections stop → `RuntimeCore::shutdown()`。
+8. 所有 CLI 可选择的 stdio compatibility（包括 ephemeral/no-remote）统一使用显式 allowlist：只允许
+   Ping、Selfcheck、ProtocolSchema/Version、
+   AgentList/Capabilities 与 History List/Read；Start/Continue、History mutation、SessionCancel、
+   ActionDecision、VendorControl 及未来新增的未列举命令全部 typed reject。它不支持 multi-client、remote
+   admin/pairing 或完整 receipt replay。完整 legacy `RuntimeHub::new` 若保留只能是 test-only，不能连接
+   production router/Core。
+
+网络 guard 也按用途而不是字符串粗禁：pathname `tokio::net::UnixListener/UnixStream` 只允许
+`agentdeckd/src/local/`；P3.7 私有继承 FD/socketpair 只精确 allowlist `exec_gate.rs`、
+`exec_gate/parent.rs` 与 `runtime/execution.rs` 的 test-only pair。全 daemon 继续禁止 TCP listener/stream、
+UDP、reqwest、axum、hyper server 与 tungstenite；Codex/CC adapter 不能 import local/remote transport。
+guard 同时检查 Cargo dependency tree，禁止仅靠 source grep 漏掉 reqwest/axum/hyper/tungstenite 等依赖。
+
 ### 8.3 Per-conversation actor
 
 每个 conversation 有一个逻辑 actor：
@@ -1206,7 +1269,12 @@ bash scripts/verify-relay-companion-mvp.sh
 
 `scripts/verify-relay-companion-mvp.sh` 是实施期统一编排入口。真实 vendor 和物理设备测试保持 gated，不能把合成/Simulator 通过冒充真机闭环。
 
-网络 guard 的阶段边界固定为：P0–P2 继续运行当前 `check-daemon-no-net.sh`；P3 引入 UDS 的同一提交就替换为 `check-daemon-network-boundary.sh`，只允许 `agentdeckd/src/local/` 使用 UnixListener/UnixStream，仍禁止 TCP/WSS/reqwest。P4 再把 allowlist 扩展到 `agentdeckd/src/remote/`（或独立 remote client crate）的 outbound WSS；daemon 始终不得依赖 axum/server/TCP listener 栈，Codex/CC adapters 也不得接触 Relay 网络类型。
+网络 guard 的阶段边界固定为：P0–P2 使用历史 `check-daemon-no-net.sh`；P3 引入 UDS 的同一提交替换为
+`check-daemon-network-boundary.sh`。该 guard 只允许 `agentdeckd/src/local/` 使用 pathname Tokio
+UnixListener/UnixStream，同时精确保留 P3.7 exec-gate 私有继承 FD/socketpair allowlist；仍禁止
+TCP/WSS/UDP/reqwest/axum/hyper server/tungstenite。P4 再把 allowlist 扩展到
+`agentdeckd/src/remote/`（或独立 remote client crate）的 outbound WSS；daemon 始终不得依赖
+axum/server/TCP listener 栈，Codex/CC adapters 也不得接触 Relay 网络类型。
 
 ## 17. Companion MVP Definition of Done
 

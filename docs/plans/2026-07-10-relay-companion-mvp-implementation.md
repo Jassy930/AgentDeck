@@ -1,6 +1,8 @@
 # AgentDeck Relay Companion MVP 实施计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **执行 harness：** 按 task TDD、独立 spec/security/quality review、scoped commit 推进。旧计划提到的
+> `superpowers:*` skill 在当前 harness 不可用，不得声称已调用；使用当前可用的独立 subagent review 与
+> controller fresh gates 等价执行。Steps 使用 checkbox（`- [ ]`）追踪。
 
 **Goal:** 交付一个真实可用的端到端 Companion MVP：每个被控 macOS 登录用户只有一个 `launchd` 常驻 `agentdeckd`，本地 App/CLI 与多个远程 macOS/iOS/CLI 客户端共享同一 RuntimeCore；Relay 严格最小可见，Codex 与 Claude Code 均通过真实链路完成浏览、prompt、审批、重连与多写者裁决。
 
@@ -41,6 +43,9 @@
 - 不读取、不保存、不转发 Codex 或 Claude Code token；不创建 `cc-meta/`；不把 Runtime DB、Relay DB、日志、invite、证书私钥、Keychain 导出或用户项目数据提交进 git。
 - 每个 task 都执行“新增失败测试→确认预期失败→最小实现→确认通过→文档/工作区检查→scoped commit”。不带 co-author，不执行 `git push`。
 - 每个commit前先用`git status --short`和`git diff --name-only`核对当前task的Files；文中的目录级`git add`必须在执行时展开为本task实际变更的精确pathspec，任何用户既有/并行无关改动保持unstaged；禁止`git add -A`。
+- Phase 状态分为“实现/自动门禁 candidate”与“真实退出门禁”两层。外部 provisioning、vendor login、
+  公网 WSS、物理设备或第二台机器缺失时，可以在代码依赖已满足后继续后续自动实现，但对应 gated step、
+  Phase exit 与 DoD 必须保持 BLOCKED；不得把 synthetic/Simulator/loopback 结果改写成真实完成。
 
 ## Phase 依赖与交付
 
@@ -1430,22 +1435,79 @@ approval 继续只使用 P3.5 的 exact transient `BoundApprovalDelivery`；不�
 
 ### Task P3.8：接入 RuntimeEnvelope v1 UDS 与 stdio compatibility
 
+**契约已冻结，代码未开始（2026-07-15）：** 编码前审查确认 5 个 blocking gap：稳定
+`clientInstallationId` 无 transport 来源、strict `RuntimeEnvelope` decode 让真实 JSON version mismatch
+无法 typed reply、same-UID principal 没有 approval capability、慢 socket writer 看不到 Core cancellation、
+计划引用的 `RemoteStartPermit` 不存在。另确认 admin-only stdio 仍放行三条 legacy control，以及旧 guard
+会误杀 P3.7 私有 socketpair。按设计 §8.2.1 分成两个独立全绿提交，任一切片接近 2,000 行即停止复核范围。
+
+#### Task P3.8-A：transport primitives、local-control principal 与精确 network guard
+
 **Files:**
-- Create: `agentdeckd/src/local/{mod,framing,peer,unix,stdio_compat}.rs`
+- Create: `agentdeckd/src/local/{mod,framing,peer,unix}.rs`
 - Create: `agentdeckd/tests/local_uds.rs`
 - Create: `scripts/check-daemon-network-boundary.sh`
-- Modify: `agentdeckd/src/{lib,main}.rs`
-- Modify: `agentdeckd/src/runtime/hub.rs`
-- Modify: `agentdeckd/Cargo.toml`
+- Modify: `agentdeckd/src/{lib}.rs`
+- Modify: `agentdeckd/src/runtime/{connection,core,mod}.rs`
+- Modify: `agentdeckd/Cargo.toml`, `scripts/verify-relay-companion-mvp.sh`
 - Modify: `ARCHITECTURE.md`, `docs/QUALITY.md`, `AGENTS.md`
 - Delete: `scripts/check-daemon-no-net.sh`
 
-- [ ] Step 1: 写UDS tests。 0600、same effective UID、仅 Request payload 1 MiB、Reply/Stream 使用独立有界 framing 与较小 JSON TransferPart、malformed/oversize close、两个connection独立writer、typed version mismatch、disconnect不终止core；recovery人为阻塞时listener尚未bind，完成分类后Recovering/RecoveryBlocked conversation只读且不能Started，其他已确认安全conversation可恢复；stdio compatibility只支持旧子集并声明不支持multi-client/remote admin/full receipt replay。
-- [ ] Step 2: 运行 local_uds test与新 guard。 Expected: FAIL，tokio net未启用且guard/script不存在。
-- [ ] Step 3: 实现 JSONL RuntimeEnvelope listener与peer UID校验。 macOS用 `getpeereid`/安全等价API，不把clientInstallationId当认证；stable默认UDS，stdio仅显式 compatibility/ephemeral。
-- [ ] Step 4: 重跑 tests和 `bash scripts/check-daemon-network-boundary.sh`。 Expected: P3 guard只允许 `agentdeckd/src/local/` 使用 UnixListener/UnixStream；全daemon无TCP/WSS/reqwest/axum。
-- [ ] Step 5: 更新 ARCHITECTURE/QUALITY/AGENTS 的网络边界，运行 docs gate。
-- [ ] Step 6: 提交。 运行`git add -- agentdeckd scripts/check-daemon-network-boundary.sh ARCHITECTURE.md docs/QUALITY.md AGENTS.md`和`git add -u -- scripts/check-daemon-no-net.sh`，核对staged diff后执行`git commit -m "feat(daemon): 以 UDS 暴露 RuntimeEnvelope v1"`。
+- [ ] Step 1: 先写 RED tests。覆盖 same-EUID 必须先于 preface read；strict
+  `LocalClientPrefaceV1` 的 canonical non-nil UUID、4 KiB bound、reconnect owner 稳定；wrong envelope
+  version flush 一条同 messageId typed failure 后 EOF，malformed/duplicate/oversize 零 reply；首帧必须
+  Hello，inner mismatch 仍走 Core typed reply；exact 1 MiB 拒绝。覆盖显式 local-control
+  `ResolveAndRetry`、read-only local 无 approval、lease permission conflict；`ConnectionWrite` shared bytes、
+  Core abort cancellation、ACK-after-cancel、慢 writer 与 sibling 隔离；真实 UDS 两连接、disconnect 不停 Core。
+- [ ] Step 2: 运行 `cargo test -p agentdeckd --test local_uds`、connection/core focused tests 与新 guard。
+  Expected: FAIL，local module、Tokio net、writer cancellation 与 guard 尚不存在。
+- [ ] Step 3: 最小实现 bounded JSONL framing、header-first version probe、same-UID peer gate、首帧 Hello、
+  per-connection reader/writer、local-control issuer 与 ConnectionWrite cancellation。所有 socket write/flush
+  成功后才 ACK；Core cancellation 获胜时只关当前连接。A 只实现已 accept/已验证 stream 的 connection
+  actor；pathname listener 只能由 `cfg(test)` fixture/测试直接持有的 Tokio listener 提供，不得暴露
+  production `bind(path)`。production secure bind 与唯一 permit constructor 全部留到 B，确保 A 自身不
+  产生 recovery 前可达的 listener。
+- [ ] Step 4: 实现 source/path guard：pathname Tokio Unix 只允许 `src/local/`；std Unix socketpair 只精确
+  allowlist `exec_gate.rs`、`exec_gate/parent.rs` 与 execution test pair；全 daemon 禁 TCP/UDP/WSS/
+  reqwest/axum/hyper server/tungstenite；同时检查 Cargo dependency tree 中的 banned crates/features，
+  不能只靠 source grep。更新 verifier，删除旧 guard。
+- [ ] Step 5: 跑 local/connection/core tests、daemon package、fmt/clippy、new guard、docs/diff；至少对一条
+  真实本机 UDS Hello + request/reply 样本读回，不以 synthetic codec 单测代替。
+- [ ] Step 6: 独立 spec/security review 后精确暂存本切片并提交
+  `feat(local): 建立 RuntimeEnvelope UDS 传输原语`；禁止目录级 `git add agentdeckd`，不 push。
+
+#### Task P3.8-B：production bootstrap、RemoteStartPermit 与 stdio 收窄
+
+**Files:**
+- Create: `agentdeckd/src/local/stdio_compat.rs`
+- Modify: `agentdeckd/src/{main,config}.rs`
+- Modify: `agentdeckd/src/runtime/{hub,namespace}.rs`
+- Modify: `agentdeckd/src/local/{mod,unix}.rs`
+- Modify: `agentdeckd/tests/{daemon_startup,local_uds,typed_spawn_ownership}.rs`
+- Modify: `README.md`, `ARCHITECTURE.md`, `docs/{QUALITY,AGENT_DIAGNOSTICS,index}.md`, `AGENTS.md`
+
+- [ ] Step 1: 先写 RED production tests。listener 在 `RecoveryReadyPermit` 前不存在；stale cleanup 与 bind
+  必须验证 owned 0700 parent、socket 0600/current UID/nlink/dev/ino，active/symlink/regular/inode swap
+  均不 mint permit，guard 只删 exact inode；完整 readback 后所有模式产生不可构造
+  `LocalReadyPermit`，只有 stable+remote-enabled+canonical socket 才再产生单次消费
+  `RemoteStartPermit`，ephemeral/no-remote 永不产生。覆盖 stable canonical socket、stable override
+  拒绝、`--socket` 仅 `--ephemeral --no-remote` 且 canonical parent 位于 canonical OS temp root 下并为
+  owned 0700；readiness 是 preface+Hello reply；stable stdin EOF 不退出，signal shutdown 顺序正确。
+- [ ] Step 2: 为 `RuntimeHub::admin_only` 写 exhaustive allowlist tests：仅 Ping/Selfcheck/ProtocolSchema/
+  Version、AgentList/Capabilities、History List/Read；Start/Continue、三种 History mutation、SessionCancel、
+  ActionDecision、VendorControl 与未来未列举 variant typed reject 且不进 router。所有可选 stdio 模式都
+  构造同一 allowlist hub；完整 `RuntimeHub::new` 只能 `cfg(test)`。
+- [ ] Step 3: 接线 production main：`singleton → Keychain/DB → recovery permit → secure UDS bind/readback →
+  LocalReadyPermit → stable-only RemoteStartPermit → run`；stable 由 UDS+signal 驱动，显式 ephemeral 无
+  `--socket` 才保留 admin/read stdio compatibility。shutdown 固定 future remote → local
+  listener/connections → Core。
+- [ ] Step 4: 跑 daemon startup/local UDS/stdio/typed ownership tests、完整 daemon package、fmt/clippy、
+  schema、network guard、ephemeral UDS binary smoke、docs/diff。确认 malformed/oversize/slow client 只关闭
+  自身，Core/active turn/PID 不变。
+- [ ] Step 5: 独立 spec/security/quality review，修完 P0/P1/P2 后同步 README/ARCHITECTURE/QUALITY/
+  DIAGNOSTICS/AGENTS 与本计划；P3.1 signed Keychain 仍保持外部 BLOCKED。
+- [ ] Step 6: 精确暂存并提交 `feat(daemon): 以 UDS 暴露 RuntimeEnvelope v1`；不得把 P3.9 App/CLI
+  cutover、P4 remote start 或外部签名证据写成已完成，不 push。
 
 ### Task P3.9：macOS App 与 CLI 默认连接同一 UDS
 
@@ -1458,9 +1520,9 @@ approval 继续只使用 P3.5 的 exact transient `BoundApprovalDelivery`；不�
 - Modify: `agentdeck-cli/src/{transport,client,main}.rs`
 - Modify: `Sources/AgentDeck/{DaemonTransport,ProcessDaemonTransport,DaemonClient,SessionModel,WorkbenchModel,ThreadRuntimeModel,AppDelegate,main}.swift`
 
-- [ ] Step 1: 写 shared-daemon tests。 Rust CLI与Swift transport连接同一temp UDS，看到同conversation/queue；关闭App连接后daemon PID/turn不变；protocol mismatch可见；默认代码路径不spawn；ProcessDaemonTransport只允许`--ephemeral --no-remote`。
+- [ ] Step 1: 写 shared-daemon tests。 Rust CLI与Swift transport连接同一temp UDS，看到同conversation/queue；关闭App连接后daemon PID/turn不变；protocol mismatch可见；默认代码路径不spawn；ProcessDaemonTransport只允许`--ephemeral --no-remote`。App/CLI 各自安装首次生成独立 canonical non-nil `clientInstallationId`，两个真实客户端进程重启后必须读回各自同一 ID/idempotency owner；只有显式删除 client installation record 才轮换，daemon 不生成兜底 ID。
 - [ ] Step 2: 运行 `cargo test -p agentdeck-cli --test shared_daemon` 与 `swift test --filter RuntimeEnvelopeClientTests`。 Expected: FAIL，默认仍spawn私有daemon/讲IPC v2。
-- [ ] Step 3: 实现 Rust/Swift Runtime v1 UDS client并迁移模型主键到conversationId/eventId/itemId/entityId/commandId。 删除synthetic agentItem序号；本地进程退出只close socket。
+- [ ] Step 3: 实现 Rust/Swift Runtime v1 UDS client并迁移模型主键到conversationId/eventId/itemId/entityId/commandId。App 与 CLI 使用独立、0700/0600、原子写入且 O_NOFOLLOW 的 client installation record 持久化各自 UUID；它不是 secret/认证材料。删除synthetic agentItem序号；本地进程退出只close socket。
 - [ ] Step 4: 重跑tests与`swift test`，再运行`bash scripts/run-local-runtime-smoke.sh`。 脚本必须在tempdir启动`agentdeckd --ephemeral --no-remote --socket "$AGENTDECK_TEST_SOCKET"`、等待socket ready、把同一`AGENTDECK_DAEMON_SOCKET`传给Rust CLI与`swift run AgentDeck -- --selfcheck`，最后trap清理进程/socket/DB。 Expected: 全部PASS，两个本地writer FIFO/approval结果一致。
 - [ ] Step 5: 运行 network guard与git状态清理。
 - [ ] Step 6: 提交。 `git add agentdeck-cli Sources Tests scripts/run-local-runtime-smoke.sh && git commit -m "feat(local): App 与 CLI 共用 singleton daemon UDS"`
