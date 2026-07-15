@@ -671,7 +671,17 @@ async fn kill_exact_group(
     match processes.probe(identity).await {
         Ok(ProcessObservation::Exited) => return Ok(()),
         Ok(ProcessObservation::ExactAlive) => {}
-        Ok(ProcessObservation::IdentityMismatch | ProcessObservation::Unknown) | Err(_) => {
+        // 威胁场景：sentinel leader 在 normal completion 与 direct-KILL probe 之间自然
+        // 退出，而 cooperative tool child 仍短暂持有 PGID；此时身份只能是 Unknown。
+        // 不能向失去 exact leader proof 的整数 PGID 发信号，但也不能把短暂退出窗口
+        // 立即升级为 RecoveryBlocked，因此只在既有 KILL grace 内等待 group 自然消失。
+        Ok(ProcessObservation::Unknown) => {
+            return match processes.wait_for_exit(identity, kill_grace).await {
+                Ok(ProcessObservation::Exited) => Ok(()),
+                _ => Err(RuntimeExecutionError::CancelFailed),
+            };
+        }
+        Ok(ProcessObservation::IdentityMismatch) | Err(_) => {
             return Err(RuntimeExecutionError::CancelFailed);
         }
     }
@@ -1140,6 +1150,37 @@ mod tests {
         );
         assert_eq!(processes.probe_count.load(Ordering::SeqCst), 1);
         assert_eq!(processes.signals(), vec![ProcessSignal::Kill]);
+    }
+
+    #[tokio::test]
+    async fn normal_completion_waits_when_leader_exits_before_group() {
+        let processes = Arc::new(SingleFlightFenceController::new(
+            ProcessObservation::Unknown,
+        ));
+        let control = Arc::new(GatedExecutionControl {
+            identity: ProcessIdentity::new(57, 57, 58).expect("valid exited-leader identity"),
+            processes: processes.clone(),
+            fence_state: Mutex::new(ExecutionFenceState::Unclaimed),
+        });
+        let normal = tokio::spawn({
+            let control = control.clone();
+            async move {
+                control
+                    .fence_and_wait(ExecutionFenceMode::NormalCompletion)
+                    .await
+            }
+        });
+        processes.wait_entered.notified().await;
+        assert!(
+            processes.signals().is_empty(),
+            "Unknown identity must never authorize an integer-PGID signal"
+        );
+        processes.release_wait.notify_one();
+        assert_eq!(
+            normal.await.expect("normal unknown fence task"),
+            Ok(ExecutionFenceMode::NormalCompletion)
+        );
+        assert!(processes.signals().is_empty());
     }
 
     #[tokio::test]

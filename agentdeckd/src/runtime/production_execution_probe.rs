@@ -42,6 +42,7 @@ use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
 
 const HELPER_RESPONSE: &str = "production-helper-response";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+const PROBE_HARD_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -166,14 +167,25 @@ impl Drop for ProbeRoot {
 /// 威胁场景：gate/driver/store 各层测试都可能通过，但普通接线仍可能绑错 execution、漏转 ACK，
 /// 或在 current-binary child 越过已提交 release barrier 前就完成。本 probe 覆盖这条组合路径。
 pub async fn run_production_execution_probe() -> Result<ProductionExecutionProbeEvidence, String> {
-    run_production_execution_probe_mode(ProbeMode::Complete).await
+    tokio::time::timeout(
+        PROBE_HARD_TIMEOUT,
+        run_production_execution_probe_mode(ProbeMode::Complete),
+    )
+    .await
+    .map_err(|_| "production execution probe exceeded its hard deadline".to_owned())?
 }
 
 /// 让真实 current-binary gate 停在 Ready→release 之间，再经 RuntimeCore 发起用户取消。
-/// gate sentinel 忽略 TERM，因此成功回执同时覆盖 production owner 的 KILL/reap 路径。
+/// 该阶段 sentinel 仍使用默认 TERM disposition，因此本 probe 证明 production owner 的
+/// current-binary TERM/reap；TERM-resistant KILL escalation 由 execution 层独立真实组测试覆盖。
 pub async fn run_production_execution_cancel_probe()
 -> Result<ProductionExecutionProbeEvidence, String> {
-    run_production_execution_probe_mode(ProbeMode::CancelBeforeRelease).await
+    tokio::time::timeout(
+        PROBE_HARD_TIMEOUT,
+        run_production_execution_probe_mode(ProbeMode::CancelBeforeRelease),
+    )
+    .await
+    .map_err(|_| "production execution cancel probe exceeded its hard deadline".to_owned())?
 }
 
 async fn run_production_execution_probe_mode(

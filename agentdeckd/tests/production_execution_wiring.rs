@@ -1,16 +1,52 @@
 #![cfg(debug_assertions)]
 
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const PROBE_PROCESS_TIMEOUT: Duration = Duration::from_secs(35);
+const PROBE_PROCESS_POLL: Duration = Duration::from_millis(10);
+
+fn run_probe(flag: &str) -> Output {
+    // 威胁场景：debug probe 的 failpoint/control wiring 回归为挂死时，无界
+    // Command::output 会把测试进程、Store worker 与 current-binary gate 永久留在 CI。
+    // subprocess deadline 必须 kill+wait，内部 async deadline 则负责先 drop blocker guard。
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentdeckd"))
+        .arg(flag)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn current-binary production probe");
+    let deadline = Instant::now() + PROBE_PROCESS_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait().expect("poll production probe") {
+            let output = child
+                .wait_with_output()
+                .expect("read completed production probe output");
+            assert_eq!(output.status, status);
+            return output;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .expect("reap timed-out production probe");
+            panic!(
+                "production probe {flag} exceeded {:?}: {}",
+                PROBE_PROCESS_TIMEOUT,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(PROBE_PROCESS_POLL);
+    }
+}
 
 #[test]
 fn runtime_core_recovery_drives_current_binary_gate_typed_driver_and_durable_terminal() {
     // 威胁场景：integration test 注入 binary 路径时只覆盖 spawn_with_binary，production
     // `spawn_current` 分支即使损坏仍会绿灯。probe 必须在真实 daemon binary 内构造 Core，
     // 再由该 binary 以 current_exe 启动自己的 --exec-gate 子模式。
-    let output = Command::new(env!("CARGO_BIN_EXE_agentdeckd"))
-        .arg("--production-execution-probe")
-        .output()
-        .expect("spawn current-binary production execution probe");
+    let output = run_probe("--production-execution-probe");
     assert!(
         output.status.success(),
         "production probe failed: {}",
@@ -31,11 +67,9 @@ fn runtime_core_recovery_drives_current_binary_gate_typed_driver_and_durable_ter
 fn runtime_core_cancel_reaps_current_binary_gate_before_release_without_vendor_side_effect() {
     // 威胁场景：prepare-time owner 若只在手造 GatedChild 测试里存在，production
     // spawn_current 路径可能在 Ready 后丢失唯一 reaper；用户取消会返回成功，却留下
-    // TERM-resistant gate/PGID 或让 vendor 越过 release 前边界产生副作用。
-    let output = Command::new(env!("CARGO_BIN_EXE_agentdeckd"))
-        .arg("--production-execution-cancel-probe")
-        .output()
-        .expect("spawn current-binary production cancel probe");
+    // pre-release gate/PGID，或让 vendor 越过 release 前边界产生副作用。该阶段
+    // current-binary sentinel 由 TERM 收口；KILL escalation 有独立 TERM-resistant 组测试。
+    let output = run_probe("--production-execution-cancel-probe");
     assert!(
         output.status.success(),
         "production cancel probe failed: {}",
