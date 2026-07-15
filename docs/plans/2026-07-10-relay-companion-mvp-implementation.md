@@ -1021,7 +1021,8 @@ P3.6-C=`694f2d9`、P3.6-D=`b668d8f` 已提交；当前进入 P3.7。已读回 `r
 `cargo test -p agentdeckd` exit 0，Swift 256 XCTest + 35 Swift Testing，以及 protocol/schema、fmt、
 clippy、daemon no-net 与 diff gate 全通过。P3.1 provisioned signed Keychain roundtrip 仍有 1 项
 ignored/BLOCKED；P3.7 exec gate 主体、边界裁决、两个 prepare finding 与 translator 阻断项已收口并通过
-聚焦门禁，最终完整自动门禁与独立终审均已通过，并由 `5568e93` 完成 scoped commit；P3.8/P3.9 UDS
+聚焦门禁，最终完整自动门禁与独立终审均已通过，并由 `5568e93` 完成主体 scoped commit、
+`c9d2146` / `5713be4` 补齐真实 release 前取消与 sentinel 退出窗口门禁；P3.8/P3.9 UDS
 与 P4 E2EE/Relay Publish 均未完成。
 
 ### Task P3.6-A：先冻结 Runtime/E2EE contract 与跨语言 wire
@@ -1241,7 +1242,7 @@ roundtrip 的 1 项 ignored 继续记为 P3.1 外部 BLOCKED，不能据此宣�
 
 ### Task P3.7：实现两阶段 exec gate、ExecutionFence 与 orphan recovery
 
-**完成（2026-07-15，commit `5568e93`）：** 边界已裁决，完整门禁与独立终审已通过。前置分片已建立 typed `ExecutionId`、
+**完成（2026-07-15，commits `5568e93` + `c9d2146` + `5713be4`）：** 边界已裁决，完整门禁与独立终审已通过。前置分片已建立 typed `ExecutionId`、
 `AgentTurnRequest`、`AdapterStateHandle`、bounded/redacted `ExecSpec` 与 daemon-owned
 `PreparedAgentTurnHandle`；daemon 在 prepare 返回时与 handle consumption 时两次校验虚 getter 的 exact
 execution/state binding。
@@ -1425,6 +1426,7 @@ approval 继续只使用 P3.5 的 exact transient `BoundApprovalDelivery`；不�
 - [x] Step 4: 真实无副作用 helper 已覆盖 PGID 清理与固定启动顺序 `singleton lock → Keychain/DB reconcile → fence classification/RecoveryBlocked → emit RecoveryReadyPermit`。blocked gate 从 Ready 起由唯一 reaper 持有；release 前 cancel/attach cleanup 只有 exact KILL 与 owner reap 都成功才可 clean。调用 Tokio spawn 前且证明无 child 的失败直接 Interrupted；从调用 Tokio spawn 起、identity 或清理不确定全部 RecoveryBlocked。execution/actor/COMMIT-unknown 聚焦回归已通过，不在文档固化易漂移的测试计数。P3.8 仍须在 permit 后 bind UDS，再产生 `RemoteStartPermit`。
 - [x] Step 5: 两份真实 Claude Code execution fixture、真实 `can_use_tool` 筛选 fixture 与真实脱敏 Codex fixture 已覆盖私有 typed translator、production append/reopen/backfill 和 durable approval response；canonical CC Approval capability 已接通但 live vendor evidence 仍 gated。最终稳定树已读回 canonical translators 43/43、driver 25/25、CC legacy 16/16、permission response 2/2、daemon lib 601/601 与完整 package exit 0（既有外部 signed Keychain gate 1 ignored）；all-target check/clippy、fmt、schema、ephemeral daemon 启动、Swift 256 XCTest + 35 Swift Testing、App selfcheck、no-net、docs 与 diff 全绿。独立终审 Approved，无剩余 P0/P1/P2。
 - [x] Step 6: 已逐文件暂存当前 60 个路径（Git 将 delete+create 识别为 1 条 rename/59 条 change record），`git diff --cached --check` 通过，unstaged/untracked 均为 0；提交 `5568e93`：`feat(daemon): 用两阶段 exec gate 封住副作用边界`。未使用目录级 `git add agentdeckd`，未 push。
+- [x] Follow-up: `c9d2146` 用真实 current-binary probe 卡住 Ready→release 窗口并经 RuntimeCore 发起 Cancel，读回 Canceled、零 vendor side effect、exact PGID 退出与唯一 Interrupted terminal；内部故障清理统一写入 active gate 的 cancel/fence bookkeeping。`5713be4` 对 sentinel leader 已退出、同组 child 短暂存活的 Unknown 只在既有 grace 内只读等待 PGID absence，持续 Unknown/error/identity mismatch 仍 fail-close；两种 probe 增加 30 秒内部清理 deadline 与 35 秒 subprocess watchdog。聚焦 production wiring 2/2、execution 12/12、conversation 50/50、exec-gate 6/6、daemon lib 603/603、完整 package exit 0、fmt/clippy/diff 与两轮独立 review 均通过；既有 signed Keychain 1 项仍 ignored/BLOCKED。
 
 ### Task P3.8：接入 RuntimeEnvelope v1 UDS 与 stdio compatibility
 

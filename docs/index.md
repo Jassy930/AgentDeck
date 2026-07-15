@@ -47,7 +47,7 @@
 ### Relay Companion MVP（2026-07-10）
 
 - `plans/2026-07-10-relay-companion-mvp-design.md`：已批准的目标架构；固定 singleton daemon、多读者/多写者串行裁决、按机器独立配对、Relay 严格最小可见与真实 iOS Companion 边界。
-- `plans/2026-07-10-relay-companion-mvp-implementation.md`：P0–P6 的逐文件 TDD 执行清单。P2.10、P3.5、P3.6-A/B/C/D 已完成；P3.7 在 `819aa5e` / `1acf8b8` / `3f22cf0` 前置分片之上已实现 current-binary exec-gate、typed driver/durable ACK、cooperative-descendant PGID recovery、production bootstrap、prepare 唯一 reaper 与 typed clean/unknown disposition，fresh 完整门禁和独立终审均已通过，并由 `5568e93` 完成 scoped commit。P3.1 的真实 provisioned signed Keychain roundtrip 仍因本机缺 provisioning profile / AMFI exit 137 而保留 1 项 ignored/gated BLOCKED；P3.8/P3.9 singleton UDS、P3.10 LaunchAgent、transfer/publication production remote owner、真实 E2EE/Relay Publish 与远程 Companion 均未完成。
+- `plans/2026-07-10-relay-companion-mvp-implementation.md`：P0–P6 的逐文件 TDD 执行清单。P2.10、P3.5、P3.6-A/B/C/D 已完成；P3.7 在 `819aa5e` / `1acf8b8` / `3f22cf0` 前置分片之上已实现 current-binary exec-gate、typed driver/durable ACK、cooperative-descendant PGID recovery、production bootstrap、prepare 唯一 reaper 与 typed clean/unknown disposition，fresh 完整门禁和独立终审均已通过，并由 `5568e93` 完成主体 scoped commit、`c9d2146` / `5713be4` 补齐真实 release 前取消与 sentinel 退出窗口门禁。P3.1 的真实 provisioned signed Keychain roundtrip 仍因本机缺 provisioning profile / AMFI exit 137 而保留 1 项 ignored/gated BLOCKED；P3.8/P3.9 singleton UDS、P3.10 LaunchAgent、transfer/publication production remote owner、真实 E2EE/Relay Publish 与远程 Companion 均未完成。
 
 ## 协议资料
 

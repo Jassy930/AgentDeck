@@ -853,7 +853,8 @@ ReadPool、配额与调度完全不变。
   owner，component test outcome 不能写成 WSS ingress/egress 证据。
 
 P3.1 provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate；P3.7 exec gate 边界、prepare findings、
-fresh 完整门禁与独立终审已收口，并由 `5568e93` 完成 scoped commit；P3.8/P3.9 UDS 和 P4 remote 尚未完成。
+fresh 完整门禁与独立终审已收口，并由 `5568e93` 完成主体 scoped commit、`c9d2146` / `5713be4`
+补齐真实 current-binary release 前取消门禁与 sentinel leader 退出窗口；P3.8/P3.9 UDS 和 P4 remote 尚未完成。
 因此即使本节全绿，也只能收口 P3.6 component，不得宣称 P3、Companion MVP 或真实跨网链路完成。
 
 ## Relay Companion MVP P3.7 exec-gate 与 production execution 门禁
@@ -983,9 +984,14 @@ successor 会在唯一 `Interrupted` terminal 后自动启动。若 fence 已成
 与 queued Accepted，不得伪造 terminal 或继续执行后续命令。
 
 `production_execution_wiring` 调用真实 daemon binary 内部的 debug-only production probe，并用
-`/bin/sh` 无副作用 helper，
-贯穿 RuntimeCore recovery/actor、production coordinator、typed router/driver、current-binary gate、
-durable event ACK 与 terminal；关闭并 reopen Store 后必须读回 1 条 canonical item 和 1 条 terminal。
+`/bin/sh` 无副作用 helper，贯穿 RuntimeCore recovery/actor、production coordinator、typed
+router/driver、current-binary gate、durable event ACK 与 terminal；完成路径关闭并 reopen Store 后必须
+读回 1 条 canonical item 和 1 条 terminal。取消路径把唯一 Store writer 卡在
+`PersistFenceBeforeCommit`，通过 probe 自建临时 DB 的独立 read-only WAL 连接只读已提交 Started/turnId，
+再经 RuntimeCore 发起 Cancel；必须读回 Canceled、零 vendor side effect、exact gate PGID 已退出和唯一
+Interrupted terminal。两种 probe 都有 30 秒内部 async deadline，先 drop Core/gate owner，再由 35 秒
+subprocess watchdog 兜底，不能遗留独立 gate PGID。该只读旁路只存在于 debug probe，不进入 production
+RuntimeCore。
 probe 不接受 binary/root 注入，内部原子创建随机临时目录并 RAII 清理；release build 不暴露该 CLI。
 此门禁证明组合 wiring，不证明 Codex/Claude Code 登录态、live vendor CC approval、UDS、RemoteLink
 或物理设备。canonical CC builder 当前已广告 Approval，并把 recorded
@@ -1010,7 +1016,8 @@ authoritative item 的行为也要由 schema 行为测试锁定，但不能写�
 该 OAuth flow 的撤销/过期读回证据；因此完整 Git history 的 credential 处置仍是明确 security debt，
 不能用当前树扫描结果宣称历史已清理。
 
-P3.7 主体代码与 translator 终审修复已由 `5568e93` 提交；fresh 完整门禁与独立终审已通过。P3.1
+P3.7 主体代码与 translator 终审修复已由 `5568e93` 提交，真实 release 前取消与 sentinel 退出窗口
+补充由 `c9d2146` / `5713be4` 提交；fresh 完整门禁与独立终审已通过。P3.1
 provisioned signed Keychain 仍外部 BLOCKED；
 P3.8/P3.9 UDS、P3.10 LaunchAgent、P4 RemoteLink/E2EE 与 P5/P6 实机证据必须继续保持未完成。
 

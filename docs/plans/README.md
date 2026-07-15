@@ -43,7 +43,9 @@
 `819aa5e` / `1acf8b8` / `3f22cf0` 前置分片之上实现 current-binary exec-gate、typed driver/durable
 ACK、cooperative-descendant PGID fencing、两遍 recovery 与 production bootstrap；边界已裁决排除显式
 `setsid`/`setpgid`/launch service 自守护或逃逸。release 前唯一 reaper、typed clean/unknown prepare
-failure 分类、fresh 完整门禁和独立终审已经完成，并由 `5568e93` 完成 scoped commit。
+failure 分类、fresh 完整门禁和独立终审已经完成，并由 `5568e93` 完成主体 scoped commit；
+`c9d2146` / `5713be4` 又补齐真实 current-binary release 前取消、内部故障 bookkeeping 与 sentinel
+leader 退出窗口门禁。
 P3.1 的 provisioned signed Keychain 外部门禁仍有 1 项 ignored/BLOCKED，P3.8/P3.9/P3.10、P4 E2EE/Relay Publish
 和 P5 真实 Companion 均未完成；transfer/publication 也尚无 production remote owner。不能因 fake
 publication、store tests 或 Simulator fixture 改写状态。

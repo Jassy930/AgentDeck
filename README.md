@@ -534,7 +534,10 @@ Codex 与 Claude Code 回归使用当前树内的筛选脱敏真实录制片段�
 
 P3.7 的主体代码、prepare disposition 与 translator 终审修复已经落到候选树；fresh 完整 package、
 all-target check/clippy、schema、Swift、自检、no-net/docs/fmt/diff 门禁均已通过，独立终审 Approved，
-并由 `5568e93` 完成 scoped commit。production wiring probe 会真实穿过
+并由 `5568e93` 完成主体 scoped commit；`c9d2146` / `5713be4` 进一步让同一 production probe 在
+真实 current-binary gate 的 Ready→release 窗口发起 RuntimeCore Cancel，读回 Canceled、零 vendor
+副作用与 exact PGID 退出，并统一内部故障取消 bookkeeping；sentinel leader 已退出但同组 child 仍在的
+短窗口只等待 PGID 自然消失，持续 Unknown 仍 fail-close。production wiring probe 会真实穿过
 `RuntimeCore/actor → GatedExecutionCoordinator → AgentRouter → current-binary gate → typed driver →`
 durable event ACK → terminal，并在 reopen/backfill 后读回 canonical item 与唯一 terminal。probe 不接受
 binary/root 注入，内部原子创建随机临时目录并 RAII 清理；它使用
