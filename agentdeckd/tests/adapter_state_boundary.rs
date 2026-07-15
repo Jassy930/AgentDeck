@@ -121,8 +121,11 @@ fn common_adapter_state_module_has_no_vendor_identity_type() {
     assert!(runtime_router.contains("adapter_state_key"));
     assert!(runtime_router.contains("continue_thread_stdio_compat"));
     assert!(runtime_router.contains("handle_history_stdio_compat"));
+    assert!(runtime_router.contains("pub(crate) async fn prepare_turn("));
     assert!(!runtime_router.contains("pub async fn continue_thread("));
     assert!(!runtime_router.contains("pub async fn handle_history("));
+    assert!(!runtime_router.contains("pub(crate) async fn resolve_approval("));
+    assert!(!runtime_router.contains("execution_id: &ExecutionId"));
 
     let worker = fs::read_to_string(root.join("src/runtime/store/worker.rs"))
         .expect("read Runtime store worker");

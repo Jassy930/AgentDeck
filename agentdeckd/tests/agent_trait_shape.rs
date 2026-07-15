@@ -3,19 +3,23 @@
 //! compile, breaking the build.
 
 use agentdeck_protocol::*;
-use agentdeckd::agent::{Agent, AgentEventSender, AgentSessionHandle};
+use agentdeckd::agent::{Agent, AgentEventSender, AgentSessionHandle, PreparedAgentTurn};
 
 #[allow(dead_code)]
-fn assert_send_sync_static<T: Agent>() {}
+fn assert_send_sync_static<T: Agent>() {
+    fn require<T: Send + Sync + 'static>() {}
+    require::<T>();
+}
 
 #[allow(dead_code)]
 fn capability_signature_present(a: &dyn Agent) -> SessionCapabilities {
     a.capabilities()
 }
 
-#[test]
-fn agent_trait_is_send_sync_static() {
-    // Type-only check; no body needed.
+#[allow(dead_code)]
+fn assert_prepared_turn_is_send_static<T: PreparedAgentTurn>() {
+    fn require<T: Send + 'static>() {}
+    require::<T>();
 }
 
 /// An adapter that opts into the default `handle_history` impl must

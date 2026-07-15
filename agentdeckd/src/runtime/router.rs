@@ -1,10 +1,13 @@
-//! Routes incoming session requests to the appropriate adapter by
-//! AgentKind, and holds per-session locks (K2: same sessionId cannot
-//! run concurrent turns; agentKind is immutable per session).
+//! Routes requests to the appropriate adapter by `AgentKind`.
+//!
+//! The `SessionId` ownership map exists only for the legacy IPC v2/stdin
+//! compatibility surface. Canonical P3.7 typed turn preparation selects an
+//! adapter without creating or consulting compatibility session ownership.
 
 use crate::agent::{
-    AgentEventSender, AgentSessionHandle, CanonicalAgentEventSender, CanonicalAgentSessionHandle,
-    CanonicalHistoryRead, DynAgent,
+    AdapterStateHandle, AgentEventSender, AgentSessionHandle, AgentTurnRequest,
+    CanonicalAgentEventSender, CanonicalAgentSessionHandle, CanonicalHistoryRead, DynAgent,
+    PreparedAgentTurnHandle, prepare_turn as prepare_agent_turn,
 };
 use agentdeck_protocol::{
     ActionDecision, AgentKind, HistoryRequest, HistoryResponse, ProtocolError, SessionCapabilities,
@@ -18,7 +21,8 @@ use crate::runtime::store::RuntimeId;
 use crate::runtime::store::RuntimeStoreHandle;
 use crate::{claude_code::ClaudeCodeAdapter, codex::CodexAdapter};
 
-/// Routes by AgentKind; holds per-session ownership to enforce K2.
+/// Routes by `AgentKind`; legacy compatibility calls additionally retain
+/// transient `SessionId` ownership for their existing control surface.
 pub struct AgentRouter {
     agents: BTreeMap<AgentKind, DynAgent>,
     sessions: Arc<Mutex<HashMap<SessionId, AgentKind>>>,
@@ -60,6 +64,28 @@ impl AgentRouter {
         self.agents.get(&kind).map(|a| a.capabilities())
     }
 
+    /// Canonical P3.7 cold-prepare route. This method only selects the typed
+    /// adapter and delegates to the daemon-owned binding helper; it deliberately
+    /// does not create compatibility `SessionId` ownership or expose approval /
+    /// cancellation lookup by execution identity.
+    #[allow(
+        dead_code,
+        reason = "P3.7 coordinator wiring consumes the typed router entry"
+    )]
+    pub(crate) async fn prepare_turn(
+        &self,
+        agent_kind: AgentKind,
+        request: AgentTurnRequest,
+        state: AdapterStateHandle,
+    ) -> Result<PreparedAgentTurnHandle, ProtocolError> {
+        let agent = self.agents.get(&agent_kind).ok_or_else(|| ProtocolError {
+            code: "agent-not-registered".into(),
+            message: format!("no adapter registered for agentKind={agent_kind:?}"),
+            diagnostic_ref: None,
+        })?;
+        prepare_agent_turn(agent.as_ref(), request, state).await
+    }
+
     /// 旧 IPC v2/stdin compatibility：不持久化 neutral adapterStateKey。
     pub async fn start_session_stdio_compat(
         &self,
@@ -82,9 +108,9 @@ impl AgentRouter {
         Ok(handle)
     }
 
-    /// Canonical Runtime entry: the caller owns the stable neutral
-    /// adapterStateKey. The adapter persists its vendor resume reference only in
-    /// its typed private namespace before returning success.
+    /// 旧 adapter-state compatibility/testing entry：调用方持有 stable neutral
+    /// adapterStateKey，但返回值仍建立 transient `SessionId` ownership。P3.7
+    /// canonical execution 必须改走 typed `prepare_turn`，不得依赖此映射。
     pub async fn start_adapter_state(
         &self,
         adapter_state_key: RuntimeId,
@@ -134,7 +160,9 @@ impl AgentRouter {
         Ok(handle)
     }
 
-    /// Canonical Runtime entry: raw vendor ThreadId never crosses this boundary.
+    /// 旧 adapter-state compatibility/testing entry：raw vendor ThreadId 不跨越
+    /// 此边界，但返回值仍建立 transient `SessionId` ownership。P3.7 canonical
+    /// execution 必须改走 typed `prepare_turn`。
     pub async fn continue_adapter_state(
         &self,
         adapter_state_key: RuntimeId,
@@ -206,14 +234,14 @@ impl AgentRouter {
         Ok(())
     }
 
-    /// Canonical execution 正常终止后的显式 ownership release。P3.7 coordinator
-    /// 在 terminal journal COMMIT 后调用；与 `cancel` 不同，这里不再次向 adapter
-    /// 发送副作用，只释放 router 的 transient session ownership。
+    /// 旧 compatibility session 正常终止后的显式 ownership release。typed P3.7
+    /// execution 不登记 `SessionId`，因此不得调用本入口。与 compatibility
+    /// `cancel` 不同，这里不再次向 adapter 发送副作用。
     pub async fn release_session(&self, session_id: &SessionId) -> bool {
         self.sessions.lock().await.remove(session_id).is_some()
     }
 
-    /// 诊断/泄漏门禁使用的当前 transient session 数。
+    /// 诊断/泄漏门禁使用的当前 compatibility transient session 数。
     pub async fn active_session_count(&self) -> usize {
         self.sessions.lock().await.len()
     }
@@ -314,5 +342,157 @@ impl std::fmt::Debug for AgentRouter {
         f.debug_struct("AgentRouter")
             .field("agent_kinds", &self.agents.keys().collect::<Vec<_>>())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod typed_prepare_tests {
+    use super::*;
+    use crate::agent::{
+        AdapterStateHandle, Agent, AgentTurnRequest, ExecSpec, ExecutionId, PreparedAgentTurn,
+    };
+    use agentdeck_protocol::runtime::PromptPayload;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct StubPreparedTurn {
+        spec: ExecSpec,
+    }
+
+    impl PreparedAgentTurn for StubPreparedTurn {
+        fn exec_spec(&self) -> &ExecSpec {
+            &self.spec
+        }
+    }
+
+    struct PrepareProbeAgent {
+        kind: AgentKind,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Agent for PrepareProbeAgent {
+        fn kind(&self) -> AgentKind {
+            self.kind
+        }
+
+        fn capabilities(&self) -> SessionCapabilities {
+            unreachable!("typed prepare route does not probe capabilities")
+        }
+
+        async fn prepare_adapter_turn(
+            &self,
+            _capability: &mut crate::agent::PrepareAdapterTurnCapability,
+            request: AgentTurnRequest,
+            state: AdapterStateHandle,
+        ) -> Result<Box<dyn PreparedAgentTurn>, ProtocolError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(StubPreparedTurn {
+                spec: ExecSpec::new(
+                    &request,
+                    state,
+                    "/usr/bin/true",
+                    Vec::<OsString>::new(),
+                    "/tmp",
+                )
+                .expect("valid probe exec spec"),
+            }))
+        }
+
+        async fn start_session(
+            &self,
+            _start: SessionStart,
+            _events: AgentEventSender,
+        ) -> Result<AgentSessionHandle, ProtocolError> {
+            unreachable!("typed prepare route does not start compatibility sessions")
+        }
+
+        async fn continue_thread(
+            &self,
+            _thread_id: ThreadId,
+            _cwd: PathBuf,
+            _prompt: String,
+            _events: AgentEventSender,
+        ) -> Result<AgentSessionHandle, ProtocolError> {
+            unreachable!("typed prepare route does not continue compatibility sessions")
+        }
+
+        async fn submit_decision(
+            &self,
+            _session_id: &SessionId,
+            _decision: ActionDecision,
+        ) -> Result<(), ProtocolError> {
+            unreachable!("typed prepare route does not resolve compatibility approvals")
+        }
+
+        async fn submit_vendor_control(
+            &self,
+            _session_id: &SessionId,
+            _payload: VendorControlPayload,
+        ) -> Result<(), ProtocolError> {
+            unreachable!("typed prepare route does not submit compatibility controls")
+        }
+
+        async fn cancel(&self, _session_id: &SessionId) -> Result<(), ProtocolError> {
+            unreachable!("typed prepare route does not cancel compatibility sessions")
+        }
+    }
+
+    fn runtime_id(kind: crate::runtime::store::RuntimeIdKind, seed: u8) -> RuntimeId {
+        RuntimeId::from_bytes(kind, [seed; 16]).expect("non-zero runtime id")
+    }
+
+    fn request(seed: u8) -> AgentTurnRequest {
+        let execution_id = ExecutionId::from_command_id(runtime_id(
+            crate::runtime::store::RuntimeIdKind::Command,
+            seed,
+        ))
+        .expect("command execution id");
+        AgentTurnRequest::new(
+            execution_id,
+            std::env::current_dir().expect("current directory"),
+            PromptPayload::new("typed router probe").expect("bounded prompt"),
+        )
+        .expect("absolute request cwd")
+    }
+
+    fn adapter_state(seed: u8) -> AdapterStateHandle {
+        AdapterStateHandle::new(runtime_id(
+            crate::runtime::store::RuntimeIdKind::AdapterState,
+            seed,
+        ))
+        .expect("adapter state handle")
+    }
+
+    #[tokio::test]
+    async fn routes_typed_prepare_only_to_the_selected_adapter_without_session_ownership() {
+        let codex_calls = Arc::new(AtomicUsize::new(0));
+        let claude_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = AgentRouter::new();
+        router.register(Arc::new(PrepareProbeAgent {
+            kind: AgentKind::Codex,
+            calls: Arc::clone(&codex_calls),
+        }));
+        router.register(Arc::new(PrepareProbeAgent {
+            kind: AgentKind::ClaudeCode,
+            calls: Arc::clone(&claude_calls),
+        }));
+
+        let prepared: PreparedAgentTurnHandle = router
+            .prepare_turn(AgentKind::ClaudeCode, request(0x41), adapter_state(0x42))
+            .await
+            .expect("selected adapter prepares the turn");
+
+        assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(claude_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            prepared
+                .exec_spec()
+                .expect("validated prepared spec")
+                .program(),
+            Path::new("/usr/bin/true")
+        );
+        assert_eq!(router.active_session_count().await, 0);
     }
 }
