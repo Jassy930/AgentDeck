@@ -45,8 +45,11 @@ ACK、cooperative-descendant PGID fencing、两遍 recovery 与 production boots
 `setsid`/`setpgid`/launch service 自守护或逃逸。release 前唯一 reaper、typed clean/unknown prepare
 failure 分类、fresh 完整门禁和独立终审已经完成，并由 `5568e93` 完成主体 scoped commit；
 `c9d2146` / `5713be4` 又补齐真实 current-binary release 前取消、内部故障 bookkeeping 与 sentinel
-leader 退出窗口门禁。
-P3.1 的 provisioned signed Keychain 外部门禁仍有 1 项 ignored/BLOCKED，P3.8/P3.9/P3.10、P4 E2EE/Relay Publish
+leader 退出窗口门禁。P3.8-A 已由 `eb97f7f` 完成 accepted-stream UDS 原语；P3.8-B1 已由
+`1e7f9ea` 完成 recovery 后 secure listener/permit/supervisor，并从 clean detached HEAD 独立复验；
+P3.8-B2 production config/main、stdio exhaustive allowlist、真实 binary lifecycle 和 Rust/Swift
+compatibility 参数已通过全部自动门禁，当前为精确暂存的提交候选。P3.9 shared-daemon client cutover 尚未开始。
+P3.1 的 provisioned signed Keychain 外部门禁仍有 1 项 ignored/BLOCKED，P3.9/P3.10、P4 E2EE/Relay Publish
 和 P5 真实 Companion 均未完成；transfer/publication 也尚无 production remote owner。不能因 fake
 publication、store tests 或 Simulator fixture 改写状态。
 

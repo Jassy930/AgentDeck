@@ -286,6 +286,7 @@ fn config_factory_uses_memory_only_for_ephemeral_and_rejects_uncompiled_stable()
         DaemonStartupOptions {
             ephemeral: true,
             no_remote: true,
+            stdio_compat: false,
             profile: None,
             stable_keychain_access_group: None,
         },
@@ -307,6 +308,7 @@ fn config_factory_uses_memory_only_for_ephemeral_and_rejects_uncompiled_stable()
         DaemonStartupOptions {
             ephemeral: false,
             no_remote: false,
+            stdio_compat: false,
             profile: None,
             stable_keychain_access_group: Some(stable_group),
         },

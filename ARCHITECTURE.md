@@ -33,7 +33,7 @@ AgentDeck 不做 IDE，不做通用多 agent 聊天界面，不是 Codex Desktop
 │  agentdeckd (Rust daemon)                                       │
 │  RuntimeHub（admin/read stdio compatibility）                   │
 │       └─ production 拒绝 SessionStart / SessionContinue          │
-│  local::unix（accepted stream；production bind 待 P3.8-B）       │
+│  local::listener（retained-dirfd canonical UDS + supervisor）    │
 │       └─ same-EUID → preface → RuntimeEnvelope v1              │
 │  RuntimeCore（exec-gate + local connection actor 已就绪）        │
 │       └─→ AgentRouter（按 conversation.agentKind 路由）           │
@@ -56,7 +56,9 @@ agentdeckd
 - `Sources/AgentDeck/`：macOS 原生 UI、会话模型、历史回放和本地交互。UI 只能通过 `CapabilityRouter` 消费 `SessionCapabilities` 决定渲染路径，禁止直接读 vendor 字段或硬编码 `if agentKind == .codex` 分支。
 - `agentdeck-protocol/`：IPC 协议事实源 crate。分 trunk / capabilities / vendor / transport 四个模块，`PROTOCOL_VERSION` = 2，`protocol_schema()` 聚合所有 v2 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
-- `agentdeckd/src/local/`：本地 Runtime v1 framing、same-EUID peer gate 与每连接 Unix actor。P3.8-A 不拥有 pathname bind；secure bind/readback/permit 与 stdio compatibility 属于 P3.8-B。
+- `agentdeckd/src/local/`：本地 Runtime v1 framing、same-EUID peer gate、每连接 Unix actor、retained-dirfd
+  secure listener 与显式 stdio compatibility wrapper。listener 在 bind 时持有完成 recovery 的 Core，
+  supervisor 停止 accept 后 graceful cancel/join 全部连接。
 - `agentdeckd/src/agent.rs`：`Agent` trait + `AgentKind` 枚举。两个 adapter 共享的逻辑在此，不得让 adapter 相互引用。
 - `agentdeckd/src/runtime/`：`RuntimeHub`（stdin loop + stdout writer）+ `AgentRouter`（sessionId → agentKind → adapter）。
 - `agentdeckd/src/codex/`：Codex app-server adapter。Codex vendor JSON、方法名和 schema 翻译只能留在此子模块。
@@ -433,13 +435,13 @@ conversation/key，不能伪造身份连续性。
 - `storage-kek.v1` 固定 32 bytes，Debug 脱敏、Drop 清零。只有 Runtime DB/WAL/SHM 都没有
   非空或非 regular artifact 时才允许生成；store 后立即 reload 并逐字节校验。既有 state
   缺 key、非法长度、entropy/backend 失败或持久化读回变化都在打开 RuntimeStore 前终止。
-- daemon main 固定按 `config → namespace/singleton → keystore → StorageKEK → record
-  namespace → selfcheck/admin-only stdio compatibility loop` 启动，record/diagnostics 一次性绑定已验证
-  data root。
+- daemon main 固定按 `config → namespace/singleton → keystore → StorageKEK → record namespace →
+  RuntimeCore → recovery permit → local ingress` 启动，record/diagnostics 一次性绑定已验证 data root。
+  默认 ingress 是 canonical UDS；只有完整显式 stdio 三 flag 才进入 admin/read compatibility。
   P3.9 前 Swift/Rust stdio transport 是显式隔离的兼容路径：固定传
-  `--ephemeral --no-remote --profile dev` 并清除旧 namespace env。它不触碰 stable 信任域，
+  `--stdio-compat --ephemeral --no-remote --profile dev` 并清除旧 namespace env。它不触碰 stable 信任域，
   也尚不提供多个客户端共享 singleton RuntimeCore；production main 明确拒绝旧
-  `SessionStart/SessionContinue`，真实本地会话必须等待 P3.8/P3.9 RuntimeEnvelope UDS。
+  `SessionStart/SessionContinue`，真实本地会话必须等待 P3.9 shared-daemon RuntimeEnvelope client cutover。
 - 已有 ignored、唯一 service/account、RAII 清理的真实 Keychain roundtrip，但 P3.1 的签名
   门禁尚未通过：当前机器无匹配 provisioning profile；Apple Development 与本地
   self-signed helper 虽通过 `codesign --verify`，均被 AMFI 以 exit 137 拒绝启动。因此本节
@@ -535,9 +537,9 @@ conversation/key，不能伪造身份连续性。
   也不是 purge authorization。P4 trust-reset 必须用 Relay/admin-signed receipt 独立验证 old
   route/root fingerprint；不得仅凭该表执行远端删除。
 - P3.2/P3.3 只建立并验证 store + adapter private boundary；P3.4 已由 RuntimeCore actor 把
-  Runtime v1 的 Start/SendPrompt/cancel/query 接入，P3.8-A 又增加已 accept stream 的 UDS actor；
-  production secure bind、bootstrap 与 App/CLI 默认连接仍分别待 P3.8-B/P3.9，因此本节仍不是
-  stable singleton 或远程端到端可用声明。
+  Runtime v1 的 Start/SendPrompt/cancel/query 接入，P3.8 已完成 accepted-stream actor 与 recovery 后
+  production secure bind/bootstrap；App/CLI 默认连接仍待 P3.9，因此本节仍不是 shared local client
+  或远程端到端可用声明。
 
 ### Relay Companion MVP P3.4 RuntimeCore 不变量
 
@@ -595,6 +597,24 @@ conversation/key，不能伪造身份连续性。
   P3.8-B listener supervisor 必须实现 graceful cancel + join，再关闭 RuntimeCore。
   network guard 只允许 `src/local/` 使用 Tokio Unix transport，精确保留 exec-gate 私有 socketpair，
   并继续禁止 daemon TCP/UDP/HTTP/WSS stack 与 vendor adapter transport import。
+
+### Relay Companion MVP P3.8-B production 本地入口不变量
+
+- stable 与默认 ephemeral/no-remote 都只能绑定 `DaemonPaths.socket`；production parser 拒绝 `--socket`，
+  也不读取 socket path 环境变量。ephemeral endpoint 只从 current-UID、exact 0700 的 private `TMPDIR`
+  与随机 instance ID 派生；stdio 只允许完整 `--stdio-compat --ephemeral --no-remote`。
+- `BoundLocalListener::bind_after_recovery` 按值消费 `RecoveryReadyPermit`，同时持有该 Core 与 retained
+  singleton data-dir fd。stale cleanup 只接受同 UID、single-link socket；active、symlink、regular、
+  dir/path identity mismatch 与二次 readback inode replacement 全部 fail-closed。0700 parent 内允许清理
+  bind 后、chmod 前崩溃留下的宽 mode stale socket；新 listener 在 mint permit 前仍必须 exact 0600。
+- Darwin 的 listener FD 与 pathname 是不同 identity：FD 只独立 `fstat` 为 owned socket，pathname 通过
+  retained dirfd 的 no-follow `fstatat` 验证 type/UID/0600/nlink=1 并捕获 dev/ino，禁止比较二者 inode。
+  RAII cleanup 只对 retained dirfd 下仍匹配捕获 identity 的 entry 调用 `unlinkat`。同 UID 主动 mutation
+  是本地认证信任根之外的行为；POSIX 不提供原子 compare-and-unlink，文档不宣称数学式防竞态。
+- secure readback 后产生不可构造的 `LocalReadyPermit`；只有 stable + remote-enabled + canonical namespace
+  能单次取得 `RemoteStartPermit`。UDS 生命周期不读取 stdin；SIGINT/SIGTERM 后先停止 accept、广播取消并
+  join accepted actors，再由 main shutdown Core。stdio wrapper 二次核验 ephemeral/no-remote/config，且
+  只能构造无 wildcard 的 admin/read allowlist hub。
 
 ### Relay Companion MVP P3.5 approval 不变量
 
@@ -707,7 +727,7 @@ conversation/key，不能伪造身份连续性。
   seal、MachineDataSign、Keychain CounterGuard 或 Relay Publish；这些仍属于 P4，不能从本节推出
   远程 Companion 已接通。
 - P3.6 仍是 transport-neutral component layer。`TransferStateMachine` 与 publication dispatcher
-  尚无 production remote owner；App/CLI 尚未通过 P3.8/P3.9 singleton UDS 连接该 Core，P3.1
+  尚无 production remote owner；App/CLI 尚未通过 P3.9 shared-daemon client 连接该 Core，P3.1
   provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate；
   Simulator fixture、fake publication 与本地 store tests 都不是 P4/P5/P6 证据。
 - Store worker 初始化/migration 的 ready error 必须在 path lease 已释放后才对 caller 可见；同进程
@@ -812,7 +832,7 @@ Swift UI
 daemon main
   -> config → namespace / singleton → KeyStore / StorageKEK
   -> ipc（re-export agentdeck-protocol）
-  -> P3.8-A local accepted-stream actor（production secure bind/readiness 待 P3.8-B）
+  -> P3.8-B local listener（recovery permit → canonical UDS → graceful join）
   -> RuntimeCore → StoreCommitHub / subscription / snapshot
   -> P3.7 exec-gate / typed driver（RuntimeEnvelope ingress 原语已接通，App/CLI cutover 待 P3.9）
   -> transport-neutral P3.6 component → transfer / publication（production owner 待 P4）
@@ -822,8 +842,8 @@ daemon main
 
 agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
   -> agentdeck-protocol（共享类型）
-  -> Transport trait（P3.1 explicit ephemeral/no-remote stdio compatibility，仅 admin/read）
-  -> isolated daemon child process；真实会话入口与 stable daemon UDS 待 P3.8/P3.9
+  -> Transport trait（显式 stdio-compat + ephemeral/no-remote，仅 admin/read）
+  -> isolated daemon child process；默认 singleton UDS client 与真实会话入口待 P3.9
 ```
 
 允许的跨层访问应沿上图向下：

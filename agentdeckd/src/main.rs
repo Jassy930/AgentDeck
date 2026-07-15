@@ -13,13 +13,16 @@ use std::sync::Arc;
 
 use agentdeck_protocol::runtime::RuntimeFailure;
 use agentdeckd::config::{
-    DaemonConfig, DaemonProfile, DaemonStartupOptions, compiled_stable_keychain_access_group,
+    DaemonConfig, DaemonProfile, DaemonStartupOptions, LocalIngressMode,
+    compiled_stable_keychain_access_group,
 };
 use agentdeckd::diag;
+use agentdeckd::local::listener::{BoundLocalListener, LocalListenerError};
+use agentdeckd::local::stdio_compat::{self, StdioCompatError};
 use agentdeckd::record;
 use agentdeckd::runtime::singleton::SingletonGuard;
 use agentdeckd::runtime::store::{RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreHandle};
-use agentdeckd::runtime::{AgentRouter, RuntimeCore, RuntimeHub};
+use agentdeckd::runtime::{AgentRouter, RuntimeCore};
 use agentdeckd::security::{StorageKek, key_store_for_config, load_or_create_storage_kek};
 
 #[derive(Debug, Default)]
@@ -29,6 +32,7 @@ struct CliArgs {
     data_dir: Option<PathBuf>,
     ephemeral: bool,
     no_remote: bool,
+    stdio_compat: bool,
     selfcheck: bool,
     diagnostics_report: bool,
     exec_gate: bool,
@@ -73,6 +77,20 @@ impl MainLoopFailure {
     fn io(error: std::io::Error) -> Self {
         Self {
             code: "daemon.runtime.main_loop_failed".to_owned(),
+            message: error.to_string(),
+        }
+    }
+
+    fn local(error: LocalListenerError) -> Self {
+        Self {
+            code: error.code().to_owned(),
+            message: error.to_string(),
+        }
+    }
+
+    fn stdio(error: StdioCompatError) -> Self {
+        Self {
+            code: error.code().to_owned(),
             message: error.to_string(),
         }
     }
@@ -153,6 +171,8 @@ where
             out.ephemeral = true;
         } else if argument == OsStr::new("--no-remote") {
             out.no_remote = true;
+        } else if argument == OsStr::new("--stdio-compat") {
+            out.stdio_compat = true;
         } else if argument == OsStr::new("--selfcheck") {
             out.selfcheck = true;
         } else if argument == OsStr::new("--diagnostics-report") {
@@ -182,6 +202,7 @@ fn validate_cli_args(args: &CliArgs) -> Result<(), CliError> {
             || args.data_dir.is_some()
             || args.ephemeral
             || args.no_remote
+            || args.stdio_compat
             || args.selfcheck
             || args.diagnostics_report
             || args.production_execution_probe
@@ -199,6 +220,7 @@ fn validate_cli_args(args: &CliArgs) -> Result<(), CliError> {
             || args.data_dir.is_some()
             || args.ephemeral
             || args.no_remote
+            || args.stdio_compat
             || args.selfcheck
             || args.diagnostics_report
             || args.exec_gate
@@ -211,7 +233,7 @@ fn validate_cli_args(args: &CliArgs) -> Result<(), CliError> {
     if args.data_dir.is_some() && !args.diagnostics_report {
         return Err(CliError::DataDirForbidden);
     }
-    if args.diagnostics_report && (args.ephemeral || args.no_remote) {
+    if args.diagnostics_report && (args.ephemeral || args.no_remote || args.stdio_compat) {
         return Err(CliError::DiagnosticsStartupFlagsForbidden);
     }
     Ok(())
@@ -251,6 +273,7 @@ fn print_help() {
            --profile <stable|dev>    Select the strict startup profile.\n\
            --ephemeral               Use a fresh isolated test namespace.\n\
            --no-remote               Required together with --ephemeral.\n\
+           --stdio-compat             Admin/read stdio; requires --ephemeral --no-remote.\n\
            --data-dir <path>         Legacy diagnostics-report override only.\n\
            --selfcheck               Bootstrap daemon security plumbing, then exit.\n\
            --diagnostics-report      Emit diagnostic.log summary without starting daemon.\n\
@@ -259,7 +282,7 @@ fn print_help() {
          \n\
          The stable mode requires a release-signed helper with the compiled daemon-only\n\
          Keychain access group. Development/compatibility processes must pass\n\
-         --ephemeral --no-remote explicitly.\n"
+         --ephemeral --no-remote explicitly; stdio additionally requires --stdio-compat.\n"
     );
 }
 
@@ -412,7 +435,30 @@ fn run_production_execution_probe(cancel_before_release: bool) -> ExitCode {
     }
 }
 
-fn run_main_loop(config: &DaemonConfig, storage_kek: StorageKek) -> Result<(), MainLoopFailure> {
+async fn wait_for_shutdown_signal() -> Result<(), LocalListenerError> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(LocalListenerError::Signal)?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.map_err(LocalListenerError::Signal),
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(LocalListenerError::Signal)
+    }
+}
+
+fn run_main_loop(
+    config: &DaemonConfig,
+    singleton: &SingletonGuard,
+    storage_kek: StorageKek,
+) -> Result<(), MainLoopFailure> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -426,7 +472,7 @@ fn run_main_loop(config: &DaemonConfig, storage_kek: StorageKek) -> Result<(), M
             .map_err(MainLoopFailure::store)?;
         let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
         let core = match RuntimeCore::new_production(store.clone(), router.clone()) {
-            Ok(core) => core,
+            Ok(core) => Arc::new(core),
             Err(error) => {
                 drop(router);
                 let shutdown = store.shutdown().await;
@@ -440,10 +486,11 @@ fn run_main_loop(config: &DaemonConfig, storage_kek: StorageKek) -> Result<(), M
                 return Err(MainLoopFailure::runtime(error));
             }
         };
+        drop(router);
         drop(store);
 
         let run_result = async {
-            let (report, _recovery_ready_permit) = core
+            let (report, recovery_ready_permit) = core
                 .recover_for_startup()
                 .await
                 .map_err(MainLoopFailure::runtime)?;
@@ -455,13 +502,43 @@ fn run_main_loop(config: &DaemonConfig, storage_kek: StorageKek) -> Result<(), M
                 ),
             );
 
-            // P3.8 将在 RecoveryReadyPermit 后绑定 RuntimeEnvelope UDS。此前保留的
-            // stdio compatibility 与 production RuntimeCore 共用同一 typed router，
-            // 但 canonical execution 只由 core 的 GatedExecutionCoordinator 驱动。
-            let hub = RuntimeHub::admin_only(router);
-            hub.run(tokio::io::stdin(), tokio::io::stdout())
+            match config.local_ingress_mode() {
+                LocalIngressMode::Uds => {
+                    let mut listener = BoundLocalListener::bind_after_recovery(
+                        recovery_ready_permit,
+                        config,
+                        singleton,
+                        core.clone(),
+                    )
+                    .await
+                    .map_err(MainLoopFailure::local)?;
+                    let socket = listener.local_ready_permit().socket_path().to_path_buf();
+                    // P4 将按值消费该 capability 启动唯一 RemoteTransport；P3.8 先把
+                    // stable-only mint 边界接入真实 bootstrap，并保持到 local stop 后。
+                    let remote_start_permit = listener.take_remote_start_permit();
+                    diag::log(
+                        "runtime_local_ready",
+                        &format!(
+                            "socket={} remotePermit={}",
+                            socket.display(),
+                            remote_start_permit.is_some()
+                        ),
+                    );
+                    listener
+                        .serve_until(wait_for_shutdown_signal())
+                        .await
+                        .map_err(MainLoopFailure::local)
+                }
+                LocalIngressMode::StdioCompat => stdio_compat::run_after_recovery(
+                    config,
+                    recovery_ready_permit,
+                    &core,
+                    tokio::io::stdin(),
+                    tokio::io::stdout(),
+                )
                 .await
-                .map_err(MainLoopFailure::io)
+                .map_err(MainLoopFailure::stdio),
+            }
         }
         .await;
         let shutdown = core.shutdown().await;
@@ -528,6 +605,7 @@ fn main() -> ExitCode {
     let config = match DaemonConfig::resolve(DaemonStartupOptions {
         ephemeral: args.ephemeral,
         no_remote: args.no_remote,
+        stdio_compat: args.stdio_compat,
         profile: args.profile,
         stable_keychain_access_group: compiled_stable_keychain_access_group(),
     }) {
@@ -567,7 +645,7 @@ fn main() -> ExitCode {
         drop(storage_kek);
         run_selfcheck(&config)
     } else {
-        match run_main_loop(&config, storage_kek) {
+        match run_main_loop(&config, &singleton_guard, storage_kek) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 print_typed_error(&error.code, &error);
@@ -598,12 +676,14 @@ mod tests {
             "dev",
             "--ephemeral",
             "--no-remote",
+            "--stdio-compat",
             "--selfcheck",
         ]))
         .expect("parse args");
         assert_eq!(args.profile, Some(DaemonProfile::Dev));
         assert!(args.ephemeral);
         assert!(args.no_remote);
+        assert!(args.stdio_compat);
         assert!(args.selfcheck);
     }
 
@@ -614,6 +694,10 @@ mod tests {
         assert_eq!(error.code(), "daemon.cli.invalid_profile");
 
         let error = parse_args(os_args(&["agentdeckd", "--not-a-flag"])).expect_err("unknown flag");
+        assert_eq!(error.code(), "daemon.cli.unknown_argument");
+
+        let error = parse_args(os_args(&["agentdeckd", "--socket", "/tmp/injected.sock"]))
+            .expect_err("production socket override must stay unknown");
         assert_eq!(error.code(), "daemon.cli.unknown_argument");
     }
 

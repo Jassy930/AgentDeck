@@ -20,7 +20,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
-use crate::config::DaemonConfig;
+use crate::config::{DaemonConfig, LocalIngressMode};
 use crate::diag;
 use crate::runtime::RuntimeCore;
 use crate::runtime::namespace::{DaemonMode, DaemonPaths};
@@ -36,6 +36,8 @@ const LOCAL_CONNECTION_CAPACITY: usize = 128;
 pub enum LocalListenerError {
     #[error("recovery readiness permit does not belong to this RuntimeCore")]
     RecoveryPermitMismatch,
+    #[error("stdio compatibility does not select a local Runtime socket")]
+    StdioSelected,
     #[error("daemon singleton/data directory validation failed: {0}")]
     Singleton(#[from] SingletonError),
     #[error("unsafe local Runtime socket {path}: {reason}")]
@@ -60,6 +62,7 @@ impl LocalListenerError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::RecoveryPermitMismatch => "daemon.local.recovery_permit_mismatch",
+            Self::StdioSelected => "daemon.local.stdio_selected",
             Self::Singleton(error) => error.code(),
             Self::UnsafeSocket { .. } => "daemon.local.socket_unsafe",
             Self::SocketInUse { .. } => "daemon.local.socket_in_use",
@@ -237,6 +240,9 @@ impl BoundLocalListener {
     ) -> Result<Self, LocalListenerError> {
         if !core.owns_recovery_ready_permit(&recovery_ready) {
             return Err(LocalListenerError::RecoveryPermitMismatch);
+        }
+        if config.local_ingress_mode() != LocalIngressMode::Uds {
+            return Err(LocalListenerError::StdioSelected);
         }
         let paths = config.paths();
         singleton.revalidate_data_dir(paths)?;
@@ -721,6 +727,7 @@ mod tests {
                 DaemonStartupOptions {
                     ephemeral: true,
                     no_remote: true,
+                    stdio_compat: false,
                     profile: None,
                     stable_keychain_access_group: None,
                 },

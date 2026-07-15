@@ -620,7 +620,7 @@ session id。未设置 `AGENTDECK_E2E=1` 时，真实 CLI/model/history smoke �
 - Runtime DB、`-wal` 或 `-shm` 任一已存在 state 而 `storage-kek.v1` 缺失时拒绝生成替代 key；
   fresh 生成后必须 reload byte-identical，secret Debug 脱敏、Drop 清零。
 - Swift/Rust stdio compatibility transport 必须固定传
-  `--ephemeral --no-remote --profile dev`，并从 child environment 删除
+  `--stdio-compat --ephemeral --no-remote --profile dev`，并从 child environment 删除
   `AGENTDECK_DATA_DIR` / `AGENTDECK_PROFILE`；P3.9 UDS cutover 前不触碰 stable namespace。
 
 ## Relay Companion MVP P3.4 RuntimeCore 门禁
@@ -854,7 +854,8 @@ ReadPool、配额与调度完全不变。
 
 P3.1 provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate；P3.7 exec gate 边界、prepare findings、
 fresh 完整门禁与独立终审已收口，并由 `5568e93` 完成主体 scoped commit、`c9d2146` / `5713be4`
-补齐真实 current-binary release 前取消门禁与 sentinel leader 退出窗口；P3.8/P3.9 UDS 和 P4 remote 尚未完成。
+补齐真实 current-binary release 前取消门禁与 sentinel leader 退出窗口；P3.8-B production UDS 当前为
+已通过自动门禁的提交候选，P3.9 shared-daemon client 和 P4 remote 尚未完成。
 因此即使本节全绿，也只能收口 P3.6 component，不得宣称 P3、Companion MVP 或真实跨网链路完成。
 
 ## Relay Companion MVP P3.7 exec-gate 与 production execution 门禁
@@ -913,7 +914,7 @@ cargo clippy -p agentdeckd --all-targets -- -D warnings
 cargo run -q -p agentdeck-cli -- protocol schema \
   | diff - protocol/agentdeck/agentdeck-protocol.schema.json
 bash scripts/check-daemon-network-boundary.sh
-cargo run -p agentdeckd -- --ephemeral --no-remote </dev/null
+cargo run -p agentdeckd -- --stdio-compat --ephemeral --no-remote --profile dev </dev/null
 swift test
 git diff --check
 scripts/verify-agent-docs.sh
@@ -1019,8 +1020,9 @@ authoritative item 的行为也要由 schema 行为测试锁定，但不能写�
 P3.7 主体代码与 translator 终审修复已由 `5568e93` 提交，真实 release 前取消与 sentinel 退出窗口
 补充由 `c9d2146` / `5713be4` 提交；fresh 完整门禁与独立终审已通过。P3.1
 provisioned signed Keychain 仍外部 BLOCKED；
-P3.8-A 只增加 accepted-stream UDS transport primitives；production secure bind/permit 属于 P3.8-B，
-App/CLI 默认 UDS 属于 P3.9。P3.10 LaunchAgent、P4 RemoteLink/E2EE 与 P5/P6 实机证据也必须继续保持未完成。
+P3.8-A 增加 accepted-stream UDS transport primitives，P3.8-B production secure bind/permit、默认 UDS
+lifecycle 与 stdio compatibility 收窄当前为已通过自动门禁的提交候选；App/CLI 默认连接 shared daemon 属于 P3.9。P3.10
+LaunchAgent、P4 RemoteLink/E2EE 与 P5/P6 实机证据也必须继续保持未完成。
 
 ## Relay Companion MVP P3.8-A local Runtime UDS transport primitives 门禁
 
@@ -1071,6 +1073,45 @@ P3.8-B listener supervisor 必须用 graceful cancel + join 收口所有连接�
 新 guard 检查 daemon normal dependency tree 与 source allowlist：只放行本机 Unix transport 和 P3.7
 私有 socketpair，仍禁止 TCP/UDP/HTTP/WSS stack；`check-daemon-network-boundary.sh` 是权威实现，
 旧 `check-daemon-no-net.sh` 仅保留为兼容 wrapper。
+
+## Relay Companion MVP P3.8-B production UDS/bootstrap 门禁
+
+本门禁防御的具体场景是：daemon 在 recovery 前开放入口、stale/pathname replacement 被误删、
+Darwin FD/path inode 被错误等同、stdin EOF 误杀共享 daemon，或 stdio compatibility 漏放
+execution/control 命令。P3.8-B 只证明本机 production ingress 与生命周期；App/CLI 默认连接同一
+singleton、LaunchAgent、RemoteLink 和实机 Companion 仍分别属于 P3.9 以后。
+
+```bash
+# retained-dirfd bind、stale/inode replacement、Darwin identity 与 graceful supervisor
+cargo test -p agentdeckd --lib local::listener::tests:: -- --test-threads=1
+cargo test -p agentdeckd --test local_listener -- --test-threads=1
+cargo test -p agentdeckd --lib local::unix::tests:: -- --test-threads=1
+cargo test -p agentdeckd --test local_uds -- --test-threads=1
+
+# config/stdio allowlist/bootstrap ownership 与真实 binary 生命周期
+cargo test -p agentdeckd --test daemon_namespace --test storage_kek \
+  --test typed_spawn_ownership -- --test-threads=1
+cargo test -p agentdeckd --test daemon_startup -- --test-threads=1
+cargo test -p agentdeckd
+
+# P3.9 前的 Rust/Swift 进程兼容 transport 必须显式选择 stdio
+cargo test -p agentdeck-cli --bin agentdeck transport::tests::
+swift test --filter ProcessDaemonTransportTests
+
+# 静态与文档边界
+cargo fmt --all -- --check
+cargo clippy -p agentdeckd --all-targets -- -D warnings
+bash scripts/check-daemon-network-boundary.sh
+bash scripts/check-daemon-no-net.sh
+scripts/verify-agent-docs.sh
+git diff --check
+```
+
+真实 binary 测试必须在 private exact-0700 `TMPDIR` 下发现且只发现一个 `ad-*/s`，完成
+preface + Hello reply 后才算 ready；stdin 为 `/dev/null` 时 PID 继续存活，SIGTERM 后 exit 0 且
+exact socket 消失。`AGENTDECK_DAEMON_SOCKET` 不得改变 endpoint，`--socket` 必须 typed unknown。
+显式 stdio 三 flag 在 EOF 后退出且不创建 socket，Ping 可用而 SessionCancel 等 control 返回
+`daemon.runtime.stdio_command_forbidden`。P3.1 provisioned signed Keychain roundtrip 继续单列外部门禁。
 
 ## AppKit 重写后的验证清单
 
@@ -1195,6 +1236,7 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P3.6 canonical stream / snapshot / transfer | 运行本页 P3.6 Rust/Swift contract、`runtime_stream`、`runtime_transfer`、store v4/read-pool/snapshot、daemon-private `runtime::` 与完整 daemon 回归；补跑 fmt/network-boundary/diff/docs。fake sealed publication 只证明状态机，不冒充 P4 E2EE/Relay Publish、UDS 或 Companion E2E |
 | Relay Companion MVP P3.7 exec-gate / typed production execution | 运行本页 prepare disposition、gate/recovery/driver/typed fixture/production wiring 矩阵、完整 daemon package、clippy/fmt/network-boundary/schema/docs/diff；固定 PATH、私有 FD、唯一 reaper、cooperative-descendant PGID fencing、COMMIT-unknown 与 reopen/backfill 必须有行为证据。显式自守护/逃逸不受支持，helper/fixture 不冒充 live vendor approval、UDS 或实机 E2E |
 | Relay Companion MVP P3.8-A local Runtime UDS primitives | 运行本页 framing/peer、local-control/cancellation、真实双连接 `local_uds`、完整 daemon、fmt/clippy/network-boundary/docs/diff；只证明 accepted stream actor，不冒充 P3.8-B secure bind/permit、P3.9 App/CLI cutover 或 remote E2E |
+| Relay Companion MVP P3.8-B production UDS/bootstrap | 运行本页 secure listener/permit/supervisor、config/stdio exhaustive allowlist、真实 binary lifecycle、Rust/Swift compatibility、完整 daemon、fmt/clippy/network-boundary/schema/docs/diff；只证明 production 本地入口，不冒充 P3.9 shared-daemon client、LaunchAgent 或 remote E2E |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

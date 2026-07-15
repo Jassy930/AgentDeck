@@ -51,6 +51,7 @@ fn ephemeral_config(root: &TestRoot) -> DaemonConfig {
         DaemonStartupOptions {
             ephemeral: true,
             no_remote: true,
+            stdio_compat: false,
             profile: None,
             stable_keychain_access_group: None,
         },
@@ -69,6 +70,7 @@ fn stable_config(root: &TestRoot) -> DaemonConfig {
         DaemonStartupOptions {
             ephemeral: false,
             no_remote: false,
+            stdio_compat: false,
             profile: None,
             stable_keychain_access_group: Some(
                 "A1B2C3D4E5.com.agentdeck.agentdeckd.stable".to_owned(),

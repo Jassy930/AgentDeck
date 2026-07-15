@@ -5,7 +5,7 @@ final class ProcessDaemonTransportTests: XCTestCase {
     func testStdioChildArgumentsAreExplicitEphemeralNoRemoteDev() {
         XCTAssertEqual(
             ProcessDaemonTransport.stdioDaemonArguments,
-            ["--ephemeral", "--no-remote", "--profile", "dev"]
+            ["--stdio-compat", "--ephemeral", "--no-remote", "--profile", "dev"]
         )
     }
 

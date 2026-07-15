@@ -148,12 +148,17 @@ fn canonical_runtime_capabilities_use_preseeded_versions_without_vendor_spawn() 
 }
 
 #[test]
-fn main_recovers_production_core_before_compatibility_ingress() {
+fn main_recovers_before_either_local_ingress_and_orders_uds_permits() {
     let main = include_str!("../src/main.rs");
     let production = position(main, "RuntimeCore::new_production");
     let recovery = position(main, ".recover_for_startup()");
-    let compatibility = position(main, "RuntimeHub::admin_only(router)");
-    assert!(production < recovery && recovery < compatibility);
+    let bind = position(main, "BoundLocalListener::bind_after_recovery(");
+    let remote = position(main, ".take_remote_start_permit()");
+    let listener = position(main, ".serve_until(");
+    let compatibility = position(main, "stdio_compat::run_after_recovery(");
+    assert!(production < recovery);
+    assert!(recovery < bind && bind < remote && remote < listener);
+    assert!(recovery < compatibility);
     let production_main = between(main, "fn run_main_loop(", "fn main()");
     assert!(
         !production_main.contains("RuntimeHub::new(router)"),
@@ -162,31 +167,48 @@ fn main_recovers_production_core_before_compatibility_ingress() {
 }
 
 #[test]
-fn production_admin_only_rejects_history_writes_before_vendor_routing() {
+fn production_stdio_allowlist_runs_before_any_router_dispatch() {
     let hub = include_str!("../src/runtime/hub.rs");
     let dispatch = between(hub, "async fn dispatch(", "/// Single-owner stdout writer");
-    let rejection = position(dispatch, "history_request_has_side_effect(&request)");
+    let rejection = position(dispatch, "stdio_compatibility_allows(&cmd)");
     let routing = position(dispatch, "ClientCommand::History(req) =>");
     assert!(
         rejection < routing,
-        "production history write rejection must precede adapter routing"
+        "stdio rejection must precede every command-specific router branch"
     );
 
     let predicate = between(
         hub,
-        "fn history_request_has_side_effect(",
+        "fn stdio_compatibility_allows(",
         "/// Single-owner stdout writer",
     );
-    for mutation in [
+    for classified in [
+        "ClientCommand::Ping",
+        "ClientCommand::Selfcheck",
+        "ClientCommand::ProtocolSchema",
+        "ClientCommand::ProtocolVersion",
+        "ClientCommand::AgentList",
+        "ClientCommand::AgentCapabilities",
+        "HistoryRequest::List",
+        "HistoryRequest::Read",
         "HistoryRequest::Archive",
         "HistoryRequest::Unarchive",
         "HistoryRequest::Rename",
+        "ClientCommand::SessionStart",
+        "ClientCommand::SessionContinue",
+        "ClientCommand::SessionCancel",
+        "ClientCommand::ActionDecision",
+        "ClientCommand::VendorControl",
     ] {
         assert!(
-            predicate.contains(mutation),
-            "production admin-only history predicate must reject {mutation}"
+            predicate.contains(classified),
+            "stdio policy must explicitly classify {classified}"
         );
     }
+    assert!(
+        !predicate.contains("_ =>"),
+        "future commands must fail compilation until stdio policy is reviewed"
+    );
 }
 
 fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {

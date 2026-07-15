@@ -221,6 +221,10 @@ impl RuntimeCore {
         permit.belongs_to(&self.recovery_identity)
     }
 
+    pub(crate) fn stdio_compatibility_router(&self) -> Arc<AgentRouter> {
+        self._router.clone()
+    }
+
     /// 只允许 UDS peer credential 已验证为同 UID 后由 transport adapter 调用。
     #[allow(dead_code)] // 只有验证过 SO_PEERCRED/getpeereid 的 P3.8 adapter 可调用。
     pub(crate) fn issue_verified_local_principal(

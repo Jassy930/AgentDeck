@@ -538,7 +538,7 @@ pub trait KeyStore: Send + Sync { fn load(&self, account: &str) -> Result<Option
 
 - [x] Step 1: 已先写 namespace/lock/Keychain 与 binary startup tests。覆盖 stable 固定路径与 OS home、不完整 mode matrix、ephemeral 全资源隔离、第二进程锁拒绝、symlink/hardlink/宽权限拒绝、stable 旧目录仅精确 0755→0700 安全迁移（0775/0777/01755 拒绝）、fresh StorageKEK、DB/WAL/SHM 已存在时缺 key fail-close、持久化读回不一致和 secret Debug redaction。
 - [x] Step 2: 已保留 TDD RED（缺少 config/security/namespace API），再运行聚焦矩阵；当前 `daemon_namespace` 18/18、`daemon_startup` 4/4、`storage_kek` 14 PASS，另有 1 个真实签名 Keychain roundtrip 按预期 gated ignored。
-- [x] Step 3: 已实现固定启动序列 `config → private namespace/singleton → keystore → StorageKEK → record namespace → selfcheck/stdio loop`。data root 以 0700 原子创建；只对当前 UID 拥有、权限精确为旧版 0755 的固定 stable 目录，在已 `O_NOFOLLOW` 打开的 directory fd 上收紧到 0700，其他宽权限拒绝；lock 只经该 dirfd 的 `openat` 建立，并在 `flock` 前后核对 owner/mode/nlink/dev/ino。stable Keychain 使用 protected、non-synchronizable、`AccessibleAfterFirstUnlockThisDeviceOnly`、空 access-control flags，缺 entitlement/backend 失败即关闭且无 memory/明文回退；ephemeral 才使用独立 memory store。过渡 stdio 调用方显式传 `--ephemeral --no-remote --profile dev` 并移除继承的旧 namespace env，等待 P3.9 切换 UDS。
+- [x] Step 3: 已实现 P3.1 当时的固定启动序列 `config → private namespace/singleton → keystore → StorageKEK → record namespace → selfcheck/stdio loop`。data root 以 0700 原子创建；只对当前 UID 拥有、权限精确为旧版 0755 的固定 stable 目录，在已 `O_NOFOLLOW` 打开的 directory fd 上收紧到 0700，其他宽权限拒绝；lock 只经该 dirfd 的 `openat` 建立，并在 `flock` 前后核对 owner/mode/nlink/dev/ino。stable Keychain 使用 protected、non-synchronizable、`AccessibleAfterFirstUnlockThisDeviceOnly`、空 access-control flags，缺 entitlement/backend 失败即关闭且无 memory/明文回退；ephemeral 才使用独立 memory store。P3.8 后过渡 stdio 调用方显式传 `--stdio-compat --ephemeral --no-remote --profile dev` 并移除继承的旧 namespace env；默认 shared-daemon client 切换仍属于 P3.9。
 - [ ] Step 4: **GATED / BLOCKED（不是 PASS）**。唯一 service/account、RAII 清理的 ignored roundtrip 已存在，但本机没有匹配 access group 的 provisioning profile；Apple Development 与本地 self-signed helper 均可通过 `codesign --verify`，实际启动都被 AMFI 以 exit 137 终止。因此尚无真实 `set → load → delete` Keychain 读回证据，不能勾选本步，也不能据此宣布 P3.1/P3 完成；须在具备匹配 provisioning/entitlement 的已签名 helper 上重跑。
 - [x] Step 5: 已运行聚焦 Rust tests、CLI tests、Swift tests、daemon no-net、`cargo fmt --check`、`git diff --check` 与 scoped clippy；结果为 CLI 27/27、Swift 243 XCTest + 35 Swift Testing、no-net/diff-check 通过，scoped clippy 在显式允许仓库既有 7 类 baseline lint 后以 `-D warnings` 通过。真实 `cargo run -q -p agentdeck-cli -- selfcheck` 返回 `ok`、`protocolVersion=2` 与双 adapter，临时 namespace 已清理；主执行者提交前又重跑完整 `cargo test`，全 workspace 通过（只有本 task 明确记录的真实签名 Keychain gate ignored）。
 - [x] Step 6: 已核对 daemon、两个 stdio transport、测试与文档精确 pathspec，未使用 `git add -A`；提交为 `835a7b3 feat(daemon): 建立 singleton namespace 与 StorageKEK`。Step 4 仍是外部签名条件 gated，故该提交不构成 P3.1/P3 完成声明。
@@ -1027,8 +1027,8 @@ P3.6-C=`694f2d9`、P3.6-D=`b668d8f` 已提交；当前进入 P3.7。已读回 `r
 clippy、daemon no-net 与 diff gate 全通过。P3.1 provisioned signed Keychain roundtrip 仍有 1 项
 ignored/BLOCKED；P3.7 exec gate 主体、边界裁决、两个 prepare finding 与 translator 阻断项已收口并通过
 聚焦门禁，最终完整自动门禁与独立终审均已通过，并由 `5568e93` 完成主体 scoped commit、
-`c9d2146` / `5713be4` 补齐真实 release 前取消与 sentinel 退出窗口门禁；P3.8/P3.9 UDS
-与 P4 E2EE/Relay Publish 均未完成。
+`c9d2146` / `5713be4` 补齐真实 release 前取消与 sentinel 退出窗口门禁；P3.8 production UDS 已完成，
+P3.9 shared-daemon client 与 P4 E2EE/Relay Publish 均未完成。
 
 ### Task P3.6-A：先冻结 Runtime/E2EE contract 与跨语言 wire
 
@@ -1437,9 +1437,10 @@ approval 继续只使用 P3.5 的 exact transient `BoundApprovalDelivery`；不�
 
 **阶段状态（2026-07-16）：** P3.8-A 已完成 accepted-stream transport primitives、显式
 local-control principal、真实 backpressure cancellation 与用途感知 network guard；两轮独立终审无剩余
-P0/P1/P2。P3.8-B 按单任务代码不超过 2,000 行的刹车线拆为 B1/B2：B1 已形成 secure listener
-primitives 候选切片；production config/stdio/main/client 原子切换仍属于 B2，尚未提交。P3.1 provisioned
-signed Keychain 外部门禁继续 BLOCKED。
+P0/P1/P2。P3.8-B 按单任务代码不超过 2,000 行的刹车线拆为 B1/B2：B1 secure listener
+primitives 已完成并从 clean detached HEAD 独立复验；B2 config/stdio/main 与 Rust/Swift stdio
+compatibility 参数的原子切换已通过全部自动门禁，当前为精确暂存的提交候选。P3.9 shared-daemon
+client cutover 尚未开始；P3.1 provisioned signed Keychain 外部门禁继续 BLOCKED。
 
 #### Task P3.8-A：transport primitives、local-control principal 与精确 network guard
 
@@ -1481,25 +1482,28 @@ signed Keychain 外部门禁继续 BLOCKED。
 
 **切片状态（2026-07-16）：**
 
-- [x] B1 secure listener primitives 候选：绑定具体 `RuntimeCore` 的 recovery permit、单次
+- [x] B1 secure listener primitives：绑定具体 `RuntimeCore` 的 recovery permit、单次
   `LocalReadyPermit → RemoteStartPermit`、私有 canonical `TMPDIR`、retained-dirfd stale cleanup、
   Darwin FD/path 独立 readback、graceful connection supervisor，以及真实 active-turn/backpressure
-  组合测试。此切片不包含 `config.rs` / `main.rs`、stdio compatibility 或客户端 cutover；提交后的
-  clean-HEAD 独立门禁结果在本阶段账本中回填。
-- [ ] B2 原子 cutover：config mode、stdio exhaustive allowlist、production main、Rust/Swift compatibility
-  参数、binary smoke 与最终文档必须同一切片落地。
+  组合测试。此切片不包含 `config.rs` / `main.rs`、stdio compatibility 或客户端 cutover；commit
+  `1e7f9ea` 的 clean detached HEAD 已通过 listener 4/4、local listener 7/7、真实 UDS 4/4、namespace
+  23/23、StorageKEK 14 passed + 1 个既有 signed gate ignored、全目标编译、Clippy、fmt、两条 network
+  guard、docs 与 clean status。
+- [ ] B2 原子 cutover 提交候选：config mode、stdio exhaustive allowlist、production main、Rust/Swift
+  stdio compatibility 参数、binary smoke 与候选文档已精确暂存；不包含 P3.9 shared-daemon client。
 
-**Files:**
-- Create: `agentdeckd/src/local/{listener,stdio_compat}.rs`
+**Files（按 B1/B2 实际切片校准）：**
+- B1 Create: `agentdeckd/src/local/listener.rs`、`agentdeckd/tests/local_listener.rs`
+- B1 Modify: `agentdeckd/src/local/{mod,unix}.rs`、`agentdeckd/src/runtime/{conversation,core,mod,namespace,recovery,singleton}.rs`、`agentdeckd/tests/{daemon_namespace,daemon_startup,storage_kek}.rs`
+- B2 Create: `agentdeckd/src/local/stdio_compat.rs`
 - Modify: `agentdeckd/src/{main,config}.rs`
-- Modify: `agentdeckd/src/runtime/{hub,namespace}.rs`
-- Modify: `agentdeckd/src/local/{mod,unix}.rs`
-- Modify: `agentdeckd/tests/{daemon_startup,local_uds,typed_spawn_ownership}.rs`
+- B2 Modify: `agentdeckd/src/runtime/{core,hub}.rs`、`agentdeckd/src/local/{listener,mod}.rs`
+- B2 Modify: `agentdeckd/tests/{daemon_namespace,daemon_startup,local_listener,storage_kek,typed_spawn_ownership}.rs`
 - Modify: `agentdeck-cli/src/transport.rs`, `Sources/AgentDeck/ProcessDaemonTransport.swift`
 - Modify: 对应 Rust/Swift transport 参数测试
-- Modify: `README.md`, `ARCHITECTURE.md`, `docs/{QUALITY,AGENT_DIAGNOSTICS,index}.md`, `AGENTS.md`
+- Modify: `README.md`, `ARCHITECTURE.md`, `docs/{QUALITY,AGENT_DIAGNOSTICS,index}.md`、`docs/plans/{README,2026-07-10-relay-companion-mvp-implementation}.md`、`AGENTS.md`
 
-- [ ] Step 1: 先写 RED production tests。listener 在 `RecoveryReadyPermit` 前不存在；stale cleanup 与 bind
+- [x] Step 1: 先写 RED production tests。listener 在 `RecoveryReadyPermit` 前不存在；stale cleanup 与 bind
   必须验证 owned 0700 parent。Darwin 真实样本中 listener FD 为 `nlink=0`、pathname 为 `nlink=1`，
   dev/ino 也不同，因此禁止断言 FD/path dev/ino 相等：FD `fstat` 只独立验证为 socket；pathname 通过
   retained parent dirfd 的 no-follow `fstatat` 独立验证 socket type、0600/current UID/exact `nlink=1` 并捕获
@@ -1510,23 +1514,29 @@ signed Keychain 外部门禁继续 BLOCKED。
   不读取 socket path env override；显式 path 仅留 test helper。覆盖 stable canonical socket、私有
   `TMPDIR` 下自动派生且唯一的 `ad-*/s`；readiness 是 preface+Hello reply；stable stdin EOF 不退出，
   signal shutdown 顺序正确。
-- [ ] Step 2: 为 `RuntimeHub::admin_only` 写 exhaustive allowlist tests：stdio 仅接受完整显式组合
+- [x] Step 2: 为 `RuntimeHub::admin_only` 写 exhaustive allowlist tests：stdio 仅接受完整显式组合
   `--stdio-compat --ephemeral --no-remote`，缺一项均 fail-close；Rust/Swift 兼容 transport 必须同批
   补传 `--stdio-compat`。allowlist 仅含 Ping/Selfcheck/ProtocolSchema/
   Version、AgentList/Capabilities、History List/Read；Start/Continue、三种 History mutation、SessionCancel、
   ActionDecision、VendorControl 与未来未列举 variant typed reject 且不进 router。所有可选 stdio 模式都
   构造同一 allowlist hub；完整 `RuntimeHub::new` 只能 `cfg(test)`。
-- [ ] Step 3: 接线 production main：`singleton → Keychain/DB → recovery permit → secure UDS bind/readback →
+- [x] Step 3: 接线 production main：`singleton → Keychain/DB → recovery permit → secure UDS bind/readback →
   LocalReadyPermit → stable-only RemoteStartPermit → run`；stable 由 UDS+signal 驱动，ephemeral 默认走
   private `TMPDIR` 派生 UDS，只有显式 `--stdio-compat --ephemeral --no-remote` 才走 admin/read stdio。
   shutdown 固定 future remote → local
   listener/connections → Core。
-- [ ] Step 4: 跑 daemon startup/local UDS/stdio/typed ownership tests、完整 daemon package、fmt/clippy、
+- [x] Step 4: 跑 daemon startup/local UDS/stdio/typed ownership tests、完整 daemon package、fmt/clippy、
   schema、两条 guard、ephemeral UDS binary smoke、docs/diff。smoke 使用 private exact 0700 `TMPDIR`，
   发现并验证恰好一个 `ad-*/s`，不向 daemon 注入 path。确认 malformed/oversize/slow client 只关闭
-  自身，Core/active turn/PID 不变。
-- [ ] Step 5: 独立 spec/security/quality review，修完 P0/P1/P2 后同步 README/ARCHITECTURE/QUALITY/
-  DIAGNOSTICS/AGENTS 与本计划；P3.1 signed Keychain 仍保持外部 BLOCKED。
+  自身，Core/active turn/PID 不变。fresh 默认并发 daemon package 已读回 lib 636/636 与全部
+  integration/doc tests exit 0；StorageKEK 14 passed + 1 个既有 signed gate ignored。Hub 10/10、
+  namespace 24/24、binary startup 8/8、listener 7/7、ownership 7/7、Rust transport 4/4、Swift
+  256 XCTest + 35 Swift Testing、App selfcheck、schema、Clippy/fmt/network/docs/diff 均通过。首次完整
+  回归因 49 GiB incremental cache 把可用空间压到准入线而触发 `DiskLow`；仅删除可再生缓存后，
+  同一默认并发与真实 1,024 × 256 MiB 数据规模在 253.52 秒内通过，未改产品准入或测试 fixture。
+- [x] Step 5: 独立 spec/security/quality review，修完 P0/P1/P2 后同步 README/ARCHITECTURE/QUALITY/
+  DIAGNOSTICS/AGENTS 与本计划；代码终审无 P0/P1/P2，文档旧参数、状态矩阵与文件账本 findings 已
+  修复并复跑 docs gate。P3.1 signed Keychain 仍保持外部 BLOCKED。
 - [ ] Step 6: 精确暂存并提交 `feat(daemon): 以 UDS 暴露 RuntimeEnvelope v1`；不得把 P3.9 App/CLI
   cutover、P4 remote start 或外部签名证据写成已完成，不 push。
 

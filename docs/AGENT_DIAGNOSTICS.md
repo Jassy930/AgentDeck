@@ -35,7 +35,7 @@ cargo run -p agentdeckd -- --ephemeral --no-remote --profile dev --selfcheck
 5. 按 `tail` 里的事件上下文继续执行只读检查。
 
 排查 P3.1 过渡 stdio 实例时，Swift/Rust transport 已固定把 child 启动为
-`--ephemeral --no-remote --profile dev`，并删除继承的 `AGENTDECK_DATA_DIR` /
+`--stdio-compat --ephemeral --no-remote --profile dev`，并删除继承的 `AGENTDECK_DATA_DIR` /
 `AGENTDECK_PROFILE`；每次 spawn 都是新的 temp namespace。diagnostics report 不启动
 daemon，仍可用 `--profile dev` 或 `--data-dir` 读取旧日志。不要把 diagnostics override
 当成 stable ownership 配置。
@@ -435,7 +435,8 @@ disk-low、Store fault 与 deterministic shutdown；`agentdeckd` 同时继续通
 ## Daemon namespace / singleton / StorageKEK 诊断（Companion MVP P3.1）
 
 daemon 正常启动顺序固定为 `config → private namespace/singleton → keystore →
-StorageKEK → record namespace → selfcheck/stdio loop`。前一步失败时不得继续打开下一层。
+StorageKEK → record namespace → RuntimeCore → recovery permit → secure UDS`；只有完整显式 stdio
+compatibility 三 flag 才以 admin/read loop 替代 UDS。前一步失败时不得继续打开下一层。
 stable data root 来自当前 EUID 的 `getpwuid_r`，不读取 `HOME`；stable access group 只接受
 编译时注入且与签名 entitlement 一致的展开值，运行时同名环境变量不能补齐 unsigned
 helper。unsigned 开发构建应使用：
@@ -461,13 +462,14 @@ ignored 测试不是通过证据。
 | --- | --- | --- |
 | `daemon.cli.missing_value` | `--profile` 或 `--data-dir` 缺值 | 补齐参数值，不要用环境变量替代 stable ownership |
 | `daemon.cli.invalid_profile` | profile 不是 `stable` / `dev` | 使用受支持值，并同时满足下面的 mode matrix |
-| `daemon.cli.unknown_argument` | daemon 收到未知参数 | 核对调用方版本；不要把 Relay/client 参数传给 daemon |
+| `daemon.cli.unknown_argument` | daemon 收到未知参数；production `--socket` 也固定走此拒绝 | 核对调用方版本；不要把 Relay/client 参数或 socket path 注入 daemon |
 | `daemon.cli.data_dir_forbidden` | daemon serve/selfcheck 尝试使用 `--data-dir` | 移除 override；它只允许 diagnostics one-shot |
 | `daemon.cli.conflicting_one_shot_modes` | 同时传 selfcheck 与 diagnostics-report | 每次只运行一个 one-shot |
-| `daemon.cli.diagnostics_startup_flags_forbidden` | diagnostics-report 带了 ephemeral/no-remote startup flag | diagnostics 不启动 daemon，移除 startup flags |
+| `daemon.cli.diagnostics_startup_flags_forbidden` | diagnostics-report 带了 ephemeral/no-remote/stdio startup flag | diagnostics 不启动 daemon，移除 startup flags |
 | `daemon.config.ephemeral_requires_no_remote` | 只启用了 ephemeral | 同时显式加 `--no-remote` |
 | `daemon.config.no_remote_requires_ephemeral` | stable 尝试单独关闭 remote | 开发实例同时加 `--ephemeral`；stable 不允许半隔离 |
 | `daemon.config.ephemeral_access_group_forbidden` | ephemeral config 携带 stable access group | 移除 access group；ephemeral 只能用独立 memory store |
+| `daemon.config.stdio_compat_requires_ephemeral_no_remote` | `--stdio-compat` 没有同时显式携带完整 ephemeral/no-remote pair | 只允许 `--stdio-compat --ephemeral --no-remote`；默认 ephemeral 入口仍是 UDS |
 | `daemon.config.dev_requires_ephemeral` | `--profile dev` 没有完整 ephemeral pair | 加 `--ephemeral --no-remote` |
 | `daemon.config.stable_forbids_ephemeral` | stable profile 与 ephemeral 混用 | 二选一；不得把 stable 信任域当测试夹具 |
 | `daemon.config.home_unavailable` | 当前 OS account home 缺失、为空或非绝对路径 | 修复系统账号记录；不要设置 `HOME` 绕过 |
@@ -476,6 +478,7 @@ ignored 测试不是通过证据。
 | `daemon.namespace.invalid_instance` | instance ID 为空、过长或含非法字符 | 只用 1–64 位 ASCII 字母、数字、`-`、`_` |
 | `daemon.namespace.socket_path_too_long` | UDS 路径超过平台 `sun_path` 上限 | 缩短 temp root；不要把 socket 移到 0700 namespace 外 |
 | `daemon.namespace.socket_path_invalid` | UDS 路径含 NUL | 修复路径来源，禁止 lossy 转换后继续 |
+| `daemon.namespace.unsafe_temp_root` | ephemeral `TMPDIR` final entry 不是实体目录、不是当前 UID、权限不是精确 0700，或 canonical identity 改变 | 创建并 canonicalize 当前用户独占的 0700 temp root；不要用 symlink、普通文件或共享 `/tmp` 直接启动 |
 | `daemon.namespace.unsafe_data_directory` | data root 不是当前 UID 的实体目录，ephemeral 不是 0700，或 stable 旧权限不是精确 0755 | 核对 type/UID/mode；不要自动跟随 symlink 或放宽迁移范围 |
 | `daemon.namespace.io_failed` | 建立或检查 data root 的文件系统操作失败 | 检查父目录、权限、磁盘与具体 operation/path |
 | `daemon.singleton.already_running` | 同一 namespace 的 lock 已被其他进程持有 | 连接既有 daemon；若怀疑僵尸，先核对 owner 进程，不要删 lock pathname |
@@ -498,7 +501,7 @@ ignored 测试不是通过证据。
 | `daemon.selfcheck.diagnostics_unavailable` | 已验证 namespace 中无法解析 diagnostic path | 检查 record/diag namespace 绑定 |
 | `daemon.selfcheck.record_failed` | selfcheck run record 写入失败 | 检查 0700 data root、runs 目录、磁盘与权限 |
 | `daemon.diagnostics.path_unavailable` | diagnostics one-shot 无可用日志路径 | 提供合法 profile/absolute data-dir，或先创建一次诊断日志 |
-| `daemon.runtime.main_loop_failed` | security bootstrap 已完成，但 stdio RuntimeHub 主循环失败 | 按同一 diagnostic log 检查 IPC I/O；guard/KEK 会随进程退出释放/清零 |
+| `daemon.runtime.main_loop_failed` | security bootstrap 已完成，但 UDS listener 或显式 stdio compatibility 主循环失败 | 先按下方 `daemon.local.*` 子码检查入口/信号/I/O；guard/KEK 会随进程退出释放/清零 |
 
 ## Runtime SQLite / journal / adapter 私表 / Core 诊断（Companion MVP P3.2–P3.6）
 
@@ -574,7 +577,7 @@ P3.4 RuntimeCore 的 transport-neutral failure：
 | `daemon.runtime.not_ready` | Core 尚未完成 paged recovery，或正在 draining/stopped | 等待 daemon readiness；若 recovery 无法完成，按上节保留 DB/Keychain 证据并 fail-close |
 | `daemon.runtime.protocol_mismatch` | Runtime v1 版本不兼容 | 升级客户端/daemon 到同一 Runtime protocol；不能回退 Relay/IPC 业务字段 |
 | `daemon.runtime.invalid_request` | ID 非 canonical UUID、Start key/cwd 或其他规范化输入非法 | 修正原请求；不得由 daemon 猜 ID/path 或替客户端补目标 |
-| `daemon.runtime.feature_unavailable` | 请求属于尚未接线的后续 phase（P3.8–P4，例如 local transport/pairing/revoke/trust reset） | 读取 capabilities/实施状态后等待对应 phase；production execution 已进入 P3.7，Catalog/Subscribe/Backfill 已进入 P3.6，不应再用该 code 代替其真实错误；不得用 compatibility path 或 fake coordinator 假成功 |
+| `daemon.runtime.feature_unavailable` | 请求属于尚未接线的后续 phase（P3.9–P4，例如 shared-daemon client、upgrade、pairing/revoke/trust reset） | 读取 capabilities/实施状态后等待对应 phase；production local transport 已进入 P3.8，production execution 已进入 P3.7，Catalog/Subscribe/Backfill 已进入 P3.6，不应再用该 code 代替其真实错误；不得用 compatibility path 或 fake coordinator 假成功 |
 | `daemon.authorization.revoked` | opaque principal lease 已 Revoking/Revoked 或 issuer registry 不可用 | 停止该 connection；remote 设备按 durable revocation/re-pair 流程处理，本地重新认证 peer credential |
 | `daemon.runtime.identity_unavailable` | machine trust/ID derivation domain 非法或 OS entropy 不可用 | 停止启动并检查 machine identity/系统熵；不得生成零 ID 或使用时间/PID 回退 |
 | `daemon.runtime.actor_unavailable` | conversation actor/execution control 已损坏或 recovery-blocked | 不自动重放 Started；保留 command/fence 证据，P3.7 按 orphan fencing 处理 |
@@ -582,8 +585,26 @@ P3.4 RuntimeCore 的 transport-neutral failure：
 | `daemon.runtime.read_unavailable` | 独立 ReadPool 已满或关闭 | 有界退避后重试读取；不要创建更多等待 task，副作用请求仍以 durable receipt 为准 |
 | `daemon.runtime.recovery_blocked` | Started 的已知 PGID 内 cooperative descendants 无法在 TERM→KILL/reap 后证明退出，binding/fence readback 不一致，或 P4 前存在 remote Accepted | 只隔离对应 damaged conversation；保留 DB/fence/process 证据并人工清理。remote Accepted 属全局启动拒绝，P4 durable auth readback 前不得安装任何 actor。该 code 不表示 daemon 已检测到流程外自守护/逃逸进程 |
 | `daemon.turn.stale` | CancelQueued 已输给 Started，或 CancelActive 的 turnId 不是当前 turn | 查询精确 CommandStatus；对 Started 只使用返回的当前 turnId 明确 cancel |
-| `daemon.runtime.legacy_execution_disabled` | production stdio 收到旧 `SessionStart`/`SessionContinue`，该路径会绕开 typed RuntimeCore/exec-gate | 改用 P3.8 RuntimeEnvelope v1；P3.7 过渡期 production stdio 只保留 admin/read compatibility |
-| `daemon.runtime.legacy_history_mutation_disabled` | production stdio 收到旧 rename/archive/history write | 等待对应操作迁入 typed RuntimeEnvelope；不得回退 legacy adapter spawn 或私有 vendor history mutation |
+| `daemon.runtime.stdio_command_forbidden` | 显式 compatibility stdio 收到 allowlist 外的 execution/control/history mutation 命令 | 改用 RuntimeEnvelope UDS；stdio 只保留 Ping/Selfcheck/schema/version、agent list/capabilities 与 history list/read |
+
+P3.8 production 本地入口在 recovery 后才建立。若 socket 尚未完成 retained-dirfd/pathname
+readback，或 recovery permit 不属于同一 `RuntimeCore`，不得通过改路径、降级 stdio 或重启循环
+绕过：
+
+| code | 含义 | 下一步 |
+| --- | --- | --- |
+| `daemon.local.recovery_permit_mismatch` | UDS/stdio 拿到另一 `RuntimeCore` 的 recovery capability | 视为 bootstrap ownership bug；停止进程，不能创建 socket 或启动 remote transport |
+| `daemon.local.stdio_selected` / `daemon.local.stdio_config_invalid` | UDS 与 stdio mode 混用，或 stdio 缺少完整隔离配置 | 按 config 只选一个入口；stdio 必须完整显式三 flag |
+| `daemon.local.socket_unsafe` | canonical pathname 的 type、UID、mode、nlink、dirfd/path identity 或 listener address readback 不符合不变量 | 保留现场并检查 0700 parent 与 stale/replacement entry；不要自动 unlink 非精确匹配对象 |
+| `daemon.local.socket_in_use` | endpoint 已有 active listener，或 stale probe/二次 inode readback不能证明可安全清理 | 连接既有 daemon；若怀疑 stale，先核对 PID、lock 和 pathname identity |
+| `daemon.local.socket_io_failed` | bind/chmod/fstatat/unlinkat/accept 等本地 socket 操作失败 | 按 operation/path/errno 检查权限、路径长度和文件系统状态 |
+| `daemon.local.connection_task_failed` | accepted connection actor panic/异常 join | 保留 diagnostic log；listener 会停止并 graceful join 其余连接后再关闭 Core |
+| `daemon.local.signal_failed` | SIGINT/SIGTERM handler 无法建立或读取 | 停止启动并检查平台 signal 支持，不回退 stdin EOF 生命周期 |
+| `daemon.local.peer_credential_failed` / `daemon.local.peer_uid_mismatch` | 无法在读帧前验证 peer EUID，或 peer 不是 daemon 当前 UID | 拒绝该连接；修复本机调用身份，不跳过 credential gate |
+| `daemon.local.preface_missing` / `daemon.local.preface_invalid` | 连接未先发 strict bounded preface，或 client installation ID/version 非法 | 客户端先发送 canonical LocalClientPrefaceV1，再发送 Hello |
+| `daemon.local.frame_read_failed` / `daemon.local.runtime_rejected` | JSONL malformed/oversize，或 RuntimeCore 拒绝 envelope | 只重连该客户端并修正 frame/version；sibling 与 Core 不应被停止 |
+| `daemon.local.write_failed` / `daemon.local.writer_failed` / `daemon.local.writer_cancelled` / `daemon.local.hello_not_flushed` | 当前连接写/flush/ACK 或 cancellation 失败 | 只关闭当前连接；用原 messageId/commandId 查询 durable receipt，不假定未执行 |
+| `daemon.local.stdio_io_failed` | 显式 compatibility stdio read/write 失败 | 仅重启隔离的 compatibility 子进程；不得影响 stable singleton daemon |
 
 P3.7 exec-gate 的以下 code 是内部 typed 分类码。`--exec-gate` one-shot 自身失败时会把 code 写到
 stderr，私有 ADGX abort frame 也可携带 code；但当前 parent/runtime 不保证把每个子码写入

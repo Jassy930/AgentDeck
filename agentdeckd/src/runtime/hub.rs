@@ -63,8 +63,9 @@ pub struct RuntimeHub {
 }
 
 impl RuntimeHub {
-    /// 显式 stdin compatibility 构造。该路径仍保留旧 SessionStart/Continue，
-    /// production main 不得使用；P3.8 会把 compatibility 收紧到 ephemeral 模式。
+    /// 测试专用 legacy 构造，保留旧 SessionStart/Continue/control 行为。
+    /// production 只能使用正向 allowlist 的 [`Self::admin_only`]。
+    #[cfg(test)]
     pub fn new(router: Arc<AgentRouter>) -> Self {
         Self {
             router,
@@ -73,9 +74,9 @@ impl RuntimeHub {
         }
     }
 
-    /// production P3.7 过渡入口只保留无 vendor spawn 的管理/只读命令。
-    /// SessionStart/Continue 必须等待 P3.8 RuntimeEnvelope transport，经同一 RuntimeCore
-    /// 与 exec gate 执行，不能回落到 legacy adapter spawn。
+    /// 显式 `--stdio-compat --ephemeral --no-remote` compatibility 只保留固定
+    /// 管理/只读 allowlist。所有 execution/control 命令必须走 RuntimeEnvelope v1，
+    /// 经同一 RuntimeCore 与 exec gate 执行，不能回落到 legacy adapter/router surface。
     pub fn admin_only(router: Arc<AgentRouter>) -> Self {
         Self {
             router,
@@ -168,37 +169,22 @@ impl RuntimeHub {
         events_tx: &AgentEventSender,
         admin_tx: &mpsc::Sender<String>,
     ) {
+        if !self.legacy_execution_enabled && !stdio_compatibility_allows(&cmd) {
+            let _ = events_tx
+                .send(ServerEvent::Error {
+                    session_id: None,
+                    error: ProtocolError {
+                        code: "daemon.runtime.stdio_command_forbidden".into(),
+                        message: "command is not available through admin/read stdio compatibility"
+                            .into(),
+                        diagnostic_ref: None,
+                    },
+                })
+                .await;
+            return;
+        }
+
         match cmd {
-            ClientCommand::SessionStart(_) | ClientCommand::SessionContinue { .. }
-                if !self.legacy_execution_enabled =>
-            {
-                let _ = events_tx
-                    .send(ServerEvent::Error {
-                        session_id: None,
-                        error: ProtocolError {
-                            code: "daemon.runtime.legacy_execution_disabled".into(),
-                            message: "legacy session execution is disabled; use RuntimeEnvelope v1"
-                                .into(),
-                            diagnostic_ref: None,
-                        },
-                    })
-                    .await;
-            }
-            ClientCommand::History(request)
-                if !self.legacy_execution_enabled && history_request_has_side_effect(&request) =>
-            {
-                let _ = events_tx
-                    .send(ServerEvent::Error {
-                        session_id: None,
-                        error: ProtocolError {
-                            code: "daemon.runtime.legacy_history_mutation_disabled".into(),
-                            message: "legacy history mutations are disabled until they use the typed execution gate"
-                                .into(),
-                            diagnostic_ref: None,
-                        },
-                    })
-                    .await;
-            }
             // ── Cheap / admin commands: handle inline ──────────────────
             ClientCommand::Ping => {
                 let reply = serde_json::json!({ "reply": "ping", "ok": true });
@@ -431,13 +417,26 @@ impl RuntimeHub {
     }
 }
 
-fn history_request_has_side_effect(request: &HistoryRequest) -> bool {
-    matches!(
-        request,
-        HistoryRequest::Archive { .. }
+fn stdio_compatibility_allows(command: &ClientCommand) -> bool {
+    match command {
+        ClientCommand::Ping
+        | ClientCommand::Selfcheck
+        | ClientCommand::ProtocolSchema
+        | ClientCommand::ProtocolVersion
+        | ClientCommand::AgentList
+        | ClientCommand::AgentCapabilities { .. } => true,
+        ClientCommand::History(request) => match request {
+            HistoryRequest::List { .. } | HistoryRequest::Read { .. } => true,
+            HistoryRequest::Archive { .. }
             | HistoryRequest::Unarchive { .. }
-            | HistoryRequest::Rename { .. }
-    )
+            | HistoryRequest::Rename { .. } => false,
+        },
+        ClientCommand::SessionStart(_)
+        | ClientCommand::SessionContinue { .. }
+        | ClientCommand::SessionCancel { .. }
+        | ClientCommand::ActionDecision { .. }
+        | ClientCommand::VendorControl { .. } => false,
+    }
 }
 
 /// Single-owner stdout writer. Drains the per-session events stream and
@@ -517,10 +516,148 @@ mod tests {
     use std::time::Duration;
     use tokio::io::duplex;
 
+    #[test]
+    fn admin_stdio_policy_exhaustively_classifies_current_command_variants() {
+        // 威胁场景：stdio compatibility 使用 blacklist 时，现有 control 或未来新增命令
+        // 会绕过 RuntimeEnvelope/Core；正向穷举 policy 必须只放行固定 admin/read surface。
+        let thread_id = ThreadId("stdio-policy-thread".into());
+        let session_id = SessionId("stdio-policy-session".into());
+        let start = SessionStart {
+            agent_kind: AgentKind::Codex,
+            cwd: std::path::PathBuf::from("/tmp"),
+            prompt: Some("must be rejected".into()),
+            vendor_options: VendorSessionOptions::Codex(CodexSessionOptions {
+                approval_policy: CodexApprovalPolicy::OnRequest,
+                sandbox: CodexSandboxMode::WorkspaceWrite,
+                persist_approval: false,
+                reasoning_effort: CodexReasoningEffort::Medium,
+                mcp_overrides: vec![],
+            }),
+            runtime_options: Default::default(),
+        };
+
+        let allowed = [
+            ClientCommand::Ping,
+            ClientCommand::Selfcheck,
+            ClientCommand::ProtocolSchema,
+            ClientCommand::ProtocolVersion,
+            ClientCommand::AgentList,
+            ClientCommand::AgentCapabilities {
+                agent_kind: AgentKind::Codex,
+            },
+            ClientCommand::History(HistoryRequest::List {
+                agent_kind: None,
+                cwd_filter: None,
+                limit: None,
+            }),
+            ClientCommand::History(HistoryRequest::Read {
+                thread_id: thread_id.clone(),
+                agent_kind: AgentKind::Codex,
+            }),
+        ];
+        for command in &allowed {
+            assert!(
+                stdio_compatibility_allows(command),
+                "admin/read command must stay allowed: {command:?}"
+            );
+        }
+
+        let denied = [
+            ClientCommand::SessionStart(start),
+            ClientCommand::SessionContinue {
+                thread_id: thread_id.clone(),
+                agent_kind: AgentKind::Codex,
+                cwd: std::path::PathBuf::from("/tmp"),
+                prompt: "must be rejected".into(),
+            },
+            ClientCommand::SessionCancel {
+                session_id: session_id.clone(),
+            },
+            ClientCommand::ActionDecision {
+                session_id: session_id.clone(),
+                decision: ActionDecision {
+                    request_id: "stdio-policy-action".into(),
+                    decision: ActionDecisionKind::Deny,
+                    persist: false,
+                },
+            },
+            ClientCommand::VendorControl {
+                session_id,
+                payload: VendorControlPayload::Codex(CodexVendorControl::UpdateSandbox(
+                    CodexSandboxMode::ReadOnly,
+                )),
+            },
+            ClientCommand::History(HistoryRequest::Archive {
+                thread_id: thread_id.clone(),
+                agent_kind: AgentKind::Codex,
+            }),
+            ClientCommand::History(HistoryRequest::Unarchive {
+                thread_id: thread_id.clone(),
+                agent_kind: AgentKind::Codex,
+            }),
+            ClientCommand::History(HistoryRequest::Rename {
+                thread_id,
+                agent_kind: AgentKind::Codex,
+                title: "must be rejected".into(),
+            }),
+        ];
+        for command in &denied {
+            assert!(
+                !stdio_compatibility_allows(command),
+                "execution/control command must be rejected: {command:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_only_hub_rejects_control_commands_before_router_dispatch() {
+        let hub = RuntimeHub::admin_only(Arc::new(AgentRouter::new()));
+        let (events_tx, mut events_rx) = mpsc::channel(3);
+        let (admin_tx, mut admin_rx) = mpsc::channel(1);
+        let session_id = SessionId("stdio-control-must-not-route".into());
+        let commands = [
+            ClientCommand::SessionCancel {
+                session_id: session_id.clone(),
+            },
+            ClientCommand::ActionDecision {
+                session_id: session_id.clone(),
+                decision: ActionDecision {
+                    request_id: "stdio-control-action".into(),
+                    decision: ActionDecisionKind::Deny,
+                    persist: false,
+                },
+            },
+            ClientCommand::VendorControl {
+                session_id,
+                payload: VendorControlPayload::Codex(CodexVendorControl::UpdateSandbox(
+                    CodexSandboxMode::ReadOnly,
+                )),
+            },
+        ];
+
+        for command in commands {
+            let event = tokio::time::timeout(Duration::from_secs(1), async {
+                hub.dispatch(command, &events_tx, &admin_tx).await;
+                events_rx.recv().await
+            })
+            .await
+            .expect("forbidden control dispatch and rejection must not block")
+            .expect("typed rejection event");
+            assert!(matches!(
+                event,
+                ServerEvent::Error { error, .. }
+                    if error.code == "daemon.runtime.stdio_command_forbidden"
+            ));
+        }
+        assert!(admin_rx.try_recv().is_err());
+        assert!(hub.sessions.lock().await.is_empty());
+    }
+
     #[tokio::test]
     async fn admin_only_hub_rejects_history_mutations_before_router_dispatch() {
-        // 威胁场景：production compatibility ingress 接收 Archive/Rename 后直接启动
-        // vendor CLI；该副作用没有 Started/Fence/release，也不受 orphan recovery 约束。
+        // 威胁场景：显式 ephemeral stdio compatibility ingress 接收 Archive/Rename
+        // 后直接启动 vendor CLI；该副作用没有 Started/Fence/release，也不受
+        // orphan recovery 约束。
         let hub = RuntimeHub::admin_only(Arc::new(AgentRouter::new()));
         let (events_tx, mut events_rx) = mpsc::channel(3);
         let (admin_tx, mut admin_rx) = mpsc::channel(3);
@@ -542,13 +679,18 @@ mod tests {
         ];
 
         for request in requests {
-            hub.dispatch(ClientCommand::History(request), &events_tx, &admin_tx)
-                .await;
-            match events_rx.recv().await.expect("typed rejection") {
-                ServerEvent::Error { error, .. } => assert_eq!(
-                    error.code,
-                    "daemon.runtime.legacy_history_mutation_disabled"
-                ),
+            let event = tokio::time::timeout(Duration::from_secs(1), async {
+                hub.dispatch(ClientCommand::History(request), &events_tx, &admin_tx)
+                    .await;
+                events_rx.recv().await
+            })
+            .await
+            .expect("history mutation dispatch and rejection must not block")
+            .expect("typed rejection");
+            match event {
+                ServerEvent::Error { error, .. } => {
+                    assert_eq!(error.code, "daemon.runtime.stdio_command_forbidden")
+                }
                 other => panic!("expected history mutation rejection, got {other:?}"),
             }
         }
@@ -890,12 +1032,17 @@ mod tests {
             runtime_options: Default::default(),
         });
 
-        hub.dispatch(start, &events_tx, &admin_tx).await;
-        let event = events_rx.recv().await.expect("typed rejection event");
+        let event = tokio::time::timeout(Duration::from_secs(1), async {
+            hub.dispatch(start, &events_tx, &admin_tx).await;
+            events_rx.recv().await
+        })
+        .await
+        .expect("legacy SessionStart dispatch and rejection must not block")
+        .expect("typed rejection event");
         assert!(matches!(
             event,
             ServerEvent::Error { error, .. }
-                if error.code == "daemon.runtime.legacy_execution_disabled"
+                if error.code == "daemon.runtime.stdio_command_forbidden"
         ));
         assert!(hub.sessions.lock().await.is_empty());
     }

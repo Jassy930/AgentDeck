@@ -28,10 +28,21 @@ pub enum DaemonProfile {
 pub struct DaemonStartupOptions {
     pub ephemeral: bool,
     pub no_remote: bool,
+    pub stdio_compat: bool,
     pub profile: Option<DaemonProfile>,
     /// 构建/签名流程注入已经展开 TeamIdentifier 的 daemon-only access group。
     /// namespace 只携带它；安全模块负责验证 entitlement 并 fail-closed。
     pub stable_keychain_access_group: Option<String>,
+}
+
+/// daemon 本地 Runtime 的唯一入口模式。
+///
+/// UDS 始终使用 [`DaemonPaths::socket`] 派生的 canonical 路径；stdio 只允许
+/// 显式 `--stdio-compat --ephemeral --no-remote` 测试实例。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalIngressMode {
+    Uds,
+    StdioCompat,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,6 +50,7 @@ pub struct DaemonConfig {
     mode: DaemonMode,
     paths: DaemonPaths,
     remote_enabled: bool,
+    local_ingress_mode: LocalIngressMode,
 }
 
 #[derive(Debug)]
@@ -46,6 +58,7 @@ pub enum DaemonConfigError {
     EphemeralRequiresNoRemote,
     NoRemoteRequiresEphemeral,
     StableAccessGroupNotAllowedForEphemeral,
+    StdioCompatRequiresEphemeralNoRemote,
     DevProfileRequiresEphemeral,
     StableProfileForbidsEphemeral,
     StableAccessGroupMissing,
@@ -66,6 +79,9 @@ impl fmt::Display for DaemonConfigError {
             }
             Self::StableAccessGroupNotAllowedForEphemeral => formatter
                 .write_str("stable Keychain access group cannot be used by an ephemeral daemon"),
+            Self::StdioCompatRequiresEphemeralNoRemote => {
+                formatter.write_str("--stdio-compat requires --ephemeral --no-remote")
+            }
             Self::DevProfileRequiresEphemeral => {
                 formatter.write_str("dev profile requires --ephemeral --no-remote")
             }
@@ -108,6 +124,9 @@ impl DaemonConfigError {
             Self::StableAccessGroupNotAllowedForEphemeral => {
                 "daemon.config.ephemeral_access_group_forbidden"
             }
+            Self::StdioCompatRequiresEphemeralNoRemote => {
+                "daemon.config.stdio_compat_requires_ephemeral_no_remote"
+            }
             Self::DevProfileRequiresEphemeral => "daemon.config.dev_requires_ephemeral",
             Self::StableProfileForbidsEphemeral => "daemon.config.stable_forbids_ephemeral",
             Self::StableAccessGroupMissing => "daemon.keystore.access_group_unconfigured",
@@ -147,6 +166,11 @@ impl DaemonConfig {
         temp_root: impl AsRef<Path>,
     ) -> Result<Self, DaemonConfigError> {
         validate_mode_matrix(&options)?;
+        let local_ingress_mode = if options.stdio_compat {
+            LocalIngressMode::StdioCompat
+        } else {
+            LocalIngressMode::Uds
+        };
         if options.ephemeral {
             if options.stable_keychain_access_group.is_some() {
                 return Err(DaemonConfigError::StableAccessGroupNotAllowedForEphemeral);
@@ -157,6 +181,7 @@ impl DaemonConfig {
                 mode: DaemonMode::Ephemeral { instance_id },
                 paths,
                 remote_enabled: false,
+                local_ingress_mode,
             })
         } else {
             if options.stable_keychain_access_group.is_none() {
@@ -167,6 +192,7 @@ impl DaemonConfig {
                 mode: DaemonMode::Stable,
                 paths,
                 remote_enabled: true,
+                local_ingress_mode,
             })
         }
     }
@@ -181,6 +207,10 @@ impl DaemonConfig {
 
     pub fn remote_enabled(&self) -> bool {
         self.remote_enabled
+    }
+
+    pub fn local_ingress_mode(&self) -> LocalIngressMode {
+        self.local_ingress_mode
     }
 }
 
@@ -250,6 +280,9 @@ pub(crate) fn current_user_home() -> Result<PathBuf, DaemonConfigError> {
 }
 
 fn validate_mode_matrix(options: &DaemonStartupOptions) -> Result<(), DaemonConfigError> {
+    if options.stdio_compat && !(options.ephemeral && options.no_remote) {
+        return Err(DaemonConfigError::StdioCompatRequiresEphemeralNoRemote);
+    }
     match (options.ephemeral, options.no_remote) {
         (false, false) | (true, true) => Ok(()),
         (true, false) => Err(DaemonConfigError::EphemeralRequiresNoRemote),

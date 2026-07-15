@@ -60,7 +60,8 @@ v0.2 在 macOS AppKit 上端到端验证「统一壳」架构：
 │  agentdeckd (Rust daemon)                                       │
 │  RuntimeHub（admin/read stdio compatibility）                   │
 │       └─ production 拒绝 SessionStart / SessionContinue          │
-│  RuntimeCore（exec-gate 已就绪；本地入口待 P3.8/P3.9）            │
+│  local::listener（recovery 后 canonical UDS + graceful join）    │
+│  RuntimeCore（exec-gate + RuntimeEnvelope UDS 已接线）            │
 │       └─→ AgentRouter（按 conversation.agentKind 路由）           │
 │            ├─ CodexAdapter      (capabilities = {...})          │
 │            └─ ClaudeCodeAdapter (capabilities = {...})          │
@@ -83,11 +84,12 @@ Layer B Vendor 控件命名空间允许 vendor 前缀但类型化（禁 `serde_j
 
 目标架构由每个 macOS 登录用户唯一的 stable `agentdeckd` 作为 runtime hub。P3.1
 已经建立固定 namespace、进程锁与 StorageKEK 启动边界；P3.7 已把 production execution 收口到
-`RuntimeCore → per-conversation actor → exec-gate → typed driver`。当前 Swift/Rust 客户端仍会显式启动
-一个 `--ephemeral --no-remote --profile dev` stdio compatibility 子进程，但 production main 只暴露
-`RuntimeHub::admin_only`，明确拒绝旧 `SessionStart/SessionContinue`。因此当前 App/CLI 的真实新建/继续
-会话入口不可用；preview、自检、诊断与 admin/read compatibility 仍可使用。本地 RuntimeEnvelope UDS
-要到 P3.8 接入，App/CLI 共用 singleton daemon 要到 P3.9 cutover 后才成立。
+`RuntimeCore → per-conversation actor → exec-gate → typed driver`。当前 P3.8-B 提交候选把 production bootstrap 固定为
+`recovery permit → retained-dirfd secure bind/readback → canonical RuntimeEnvelope UDS → signal-driven graceful join`；
+默认 ephemeral/no-remote 也从私有 `TMPDIR/ad-*/s` 派生 UDS，stdin EOF 不再结束 daemon。Swift/Rust 的
+旧进程 transport 只有显式 `--stdio-compat --ephemeral --no-remote --profile dev` 才能继续走
+admin/read allowlist，并明确拒绝 execution/control 命令。因此当前 App/CLI 的真实新建/继续会话仍不可用；
+两者默认连接同一个 singleton daemon 要到 P3.9 cutover 后才成立。
 
 流式性能边界：Swift 端的 `SessionModel` 按约 30fps 合并待渲染 delta，并把
 message / reasoning / shell / diff 长文本交给 AppKit `NSTextView` +
@@ -414,7 +416,8 @@ P3.4 的 side-effect-free fake 仍只用于 contract tests；production 构造�
 authorization 都 durable COMMIT 后才 exec vendor。permit 精确绑定 command、daemon boot、nonce、
 PID/start-time、token commitment；completion 成功还必须证明整个进程组已经 reap/fence。关停会先用
 内部 Closing 拒绝新请求并封住 actor start lease，再公开 Draining，因而 Draining 后不会新增 durable
-Started。当前 stdio `RuntimeHub` 只保留 admin/compatibility 面，App/CLI 尚未迁到 singleton UDS，
+Started。显式 stdio `RuntimeHub` 只保留 admin/read compatibility 面；默认 daemon 已走 UDS，但 App/CLI
+尚未迁到 singleton UDS，
 所以 production exec-gate 通过不等于本地或远程 Companion 已端到端完成。
 
 ### P3.5 approval、P3.6 canonical stream 与 P3.7 exec-gate 当前边界
@@ -543,16 +546,17 @@ all-target check/clippy、schema、Swift、自检、no-net/docs/fmt/diff 门禁�
 durable event ACK → terminal，并在 reopen/backfill 后读回 canonical item 与唯一 terminal。probe 不接受
 binary/root 注入，内部原子创建随机临时目录并 RAII 清理；它使用
 `/bin/sh` 无副作用 helper，不替代真实 Codex/Claude Code 登录、真实 approval 或 P6 跨设备证据。
-P3.8 UDS、P3.9 App/CLI cutover、P3.10 LaunchAgent、P4 RemoteLink、P5/P6 客户端与实机证据仍未完成；
+P3.8-B production UDS/bootstrap 已通过自动门禁并精确暂存为提交候选；P3.9 App/CLI 默认 UDS cutover、P3.10 LaunchAgent、
+P4 RemoteLink、P5/P6 客户端与实机证据仍未完成；
 P3.1 provisioned signed Keychain roundtrip 也仍是外部 BLOCKED gate。
 具体命令与资源矩阵见 [docs/QUALITY.md](docs/QUALITY.md)。
 
 ## agentdeck CLI（参考客户端 / E2E 驱动）
 
-`agentdeck` 是一个 Rust 二进制参考客户端，**不在 Swift GUI 的实时通路上**。Swift app 与 CLI 当前都
-只连接 ephemeral stdio compatibility daemon；该 production 入口拒绝 `SessionStart/SessionContinue`，
-不能执行真实会话。`agentdeck` 现阶段用于 admin/read 脚本、本地验证和门控 E2E 驱动，真实本地会话
-要等 P3.8/P3.9 UDS cutover。
+`agentdeck` 是一个 Rust 二进制参考客户端，**不在 Swift GUI 的实时通路上**。P3.9 前 Swift app 与 CLI
+仍由过渡 `ProcessDaemonTransport` 显式启动 stdio compatibility daemon；该入口拒绝全部
+execution/control 命令，不能执行真实会话。`agentdeck` 现阶段用于 admin/read 脚本、本地验证和门控
+E2E 驱动；默认连接 stable singleton UDS 与真实本地会话属于 P3.9。
 
 ### 全局标志
 
@@ -623,7 +627,7 @@ agentdeck protocol version
 ```
 
 运行（会构建/启动 App 或执行自检；当前自动 spawn 的仅是 ephemeral stdio compatibility daemon，真实
-会话启动会返回 `daemon.runtime.legacy_execution_disabled`，须等待 P3.8/P3.9 UDS cutover）：
+会话启动会返回 `daemon.runtime.stdio_command_forbidden`；默认 shared-daemon UDS client cutover 属于 P3.9）：
 
 ```bash
 ./script/build_and_run.sh        # 构建 SwiftPM 产物，临时打包 dist/AgentDeck.app 并启动
@@ -656,7 +660,7 @@ swift run AgentDeck -- --diagnostics-report --json --profile dev
 - 在 P3.9 UDS cutover 前，Swift `ProcessDaemonTransport` 与 Rust CLI 的 sync/async
   stdio transport 都忽略旧 profile/data-dir spawn 参数，移除继承的
   `AGENTDECK_PROFILE` / `AGENTDECK_DATA_DIR`，固定传
-  `--ephemeral --no-remote --profile dev`。因此这些子进程不会读取或创建 stable Runtime
+  `--stdio-compat --ephemeral --no-remote --profile dev`。因此这些子进程不会读取或创建 stable Runtime
   信任域，也还不能让多个客户端共享同一 daemon；production `RuntimeHub::admin_only` 会拒绝
   `SessionStart/SessionContinue`，这条 compatibility path 不能用于真实会话执行。
 - stable 模式只面向带 daemon-only entitlement、编译进真实 access group 的 release-signed

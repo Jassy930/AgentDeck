@@ -10,7 +10,7 @@
 4. `docs/index.md`：文档记录系统导航。
 5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code（含 CC adapter failure codes）。
 6. `docs/QUALITY.md`：验证命令、质量门禁和文档结构检查（含 v0.2 手动 QA 清单）。
-7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单。P2.10、P3.5、P3.6-A/B/C/D 已完成；P3.7 已裁决采用 cooperative-descendant PGID 边界，主体实现、prepare 唯一 reaper、typed clean/unknown disposition、fresh 完整门禁与独立终审均已完成，并由 `5568e93` 完成主体 scoped commit、`c9d2146` / `5713be4` 补齐真实 release 前取消门禁、内部故障 gate bookkeeping 与 sentinel leader 退出窗口。P3.8-A 已接入 same-EUID/preface/RuntimeEnvelope accepted-stream actor、显式 local-control principal、writer cancellation 与用途感知 network guard；production secure bind/permit 仍属于 P3.8-B，App/CLI 默认 UDS 属于 P3.9。真实 provisioned signed Keychain roundtrip 仍有 1 项 ignored 且 gated BLOCKED，P3.10 LaunchAgent、P4 remote owner/E2EE、P5/P6 客户端与实机证据仍未完成，因此不得宣称 P3.1/P3、远程 Companion 或整个方案完成。
+7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单。P2.10、P3.5、P3.6-A/B/C/D 已完成；P3.7 已裁决采用 cooperative-descendant PGID 边界，主体实现、prepare 唯一 reaper、typed clean/unknown disposition、fresh 完整门禁与独立终审均已完成，并由 `5568e93` 完成主体 scoped commit、`c9d2146` / `5713be4` 补齐真实 release 前取消门禁、内部故障 gate bookkeeping 与 sentinel leader 退出窗口。P3.8-A 已接入 accepted-stream actor；P3.8-B 已形成 recovery 后 retained-dirfd secure bind、permit、signal/graceful supervisor 与显式 stdio allowlist 的实现候选，P3.9 App/CLI 默认 UDS 仍未开始。真实 provisioned signed Keychain roundtrip 仍有 1 项 ignored 且 gated BLOCKED，P3.10 LaunchAgent、P4 remote owner/E2EE、P5/P6 客户端与实机证据仍未完成，因此不得宣称 P3.1/P3、远程 Companion 或整个方案完成。
 8. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
 
 ## 项目边界
@@ -340,6 +340,31 @@ P3.8-A 不得暴露 production bind、`LocalReadyPermit` 或 `RemoteStartPermit`
 `check-daemon-network-boundary.sh` 是权威 guard；旧 `check-daemon-no-net.sh` 仅保留为兼容 wrapper。
 A 阶段 connection actor 必须被 poll/join；
 P3.8-B supervisor 必须 graceful cancel + join，禁止用 detached cleanup 掩盖任意 task abort。
+
+### Relay Companion MVP P3.8-B（production UDS/bootstrap）
+
+```bash
+cargo test -p agentdeckd --lib local::listener::tests:: -- --test-threads=1
+cargo test -p agentdeckd --test local_listener -- --test-threads=1
+cargo test -p agentdeckd --test daemon_startup -- --test-threads=1
+cargo test -p agentdeckd --test typed_spawn_ownership -- --test-threads=1
+cargo test -p agentdeckd
+cargo test -p agentdeck-cli --bin agentdeck transport::tests::
+swift test --filter ProcessDaemonTransportTests
+cargo fmt --all -- --check
+cargo clippy -p agentdeckd --all-targets -- -D warnings
+bash scripts/check-daemon-network-boundary.sh
+bash scripts/check-daemon-no-net.sh
+scripts/verify-agent-docs.sh
+git diff --check
+```
+
+production parser 必须拒绝 `--socket` 和 socket path env override；stable 与默认 ephemeral/no-remote
+都只绑定 canonical `DaemonPaths.socket`，后者从 private `TMPDIR/ad-*/s` 派生。stdio 只有完整
+`--stdio-compat --ephemeral --no-remote` 才可启动，并只允许 admin/read 命令。listener 必须按值消费
+`RecoveryReadyPermit`、持有同一 Core 与 retained singleton dirfd；Darwin FD/path identity 分开验证，
+stale/inode replacement fail-closed，shutdown 停止 accept 后 graceful cancel/join 全部连接，再关闭 Core。
+该阶段不等于 P3.9 shared-daemon client cutover，也不替代 signed Keychain、真实 vendor 或远程实机门禁。
 
 ## 浏览与外部资料
 

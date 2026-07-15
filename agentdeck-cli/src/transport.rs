@@ -111,7 +111,13 @@ pub fn run_daemon_diagnostics_report(
     )))
 }
 
-const STDIO_DAEMON_ARGS: [&str; 4] = ["--ephemeral", "--no-remote", "--profile", "dev"];
+const STDIO_DAEMON_ARGS: [&str; 5] = [
+    "--stdio-compat",
+    "--ephemeral",
+    "--no-remote",
+    "--profile",
+    "dev",
+];
 
 fn configure_sync_stdio_daemon(command: &mut Command) {
     command.args(STDIO_DAEMON_ARGS);
@@ -355,7 +361,13 @@ mod tests {
 
         assert_eq!(
             command_args(&command),
-            ["--ephemeral", "--no-remote", "--profile", "dev"]
+            [
+                "--stdio-compat",
+                "--ephemeral",
+                "--no-remote",
+                "--profile",
+                "dev"
+            ]
         );
         assert_eq!(command_env(&command, "AGENTDECK_DATA_DIR"), Some(None));
         assert_eq!(command_env(&command, "AGENTDECK_PROFILE"), Some(None));
@@ -368,7 +380,13 @@ mod tests {
 
         assert_eq!(
             command_args(command.as_std()),
-            ["--ephemeral", "--no-remote", "--profile", "dev"]
+            [
+                "--stdio-compat",
+                "--ephemeral",
+                "--no-remote",
+                "--profile",
+                "dev"
+            ]
         );
         assert_eq!(
             command_env(command.as_std(), "AGENTDECK_DATA_DIR"),

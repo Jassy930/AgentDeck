@@ -2,7 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agentdeckd::config::{DaemonConfig, DaemonConfigError, DaemonProfile, DaemonStartupOptions};
+use agentdeckd::config::{
+    DaemonConfig, DaemonConfigError, DaemonProfile, DaemonStartupOptions, LocalIngressMode,
+};
 use agentdeckd::runtime::namespace::{DaemonMode, DaemonPaths, NamespaceError};
 use agentdeckd::runtime::singleton::{SingletonError, SingletonGuard};
 
@@ -51,6 +53,7 @@ fn options(ephemeral: bool, no_remote: bool) -> DaemonStartupOptions {
     DaemonStartupOptions {
         ephemeral,
         no_remote,
+        stdio_compat: false,
         profile: None,
         stable_keychain_access_group: None,
     }
@@ -58,6 +61,7 @@ fn options(ephemeral: bool, no_remote: bool) -> DaemonStartupOptions {
 
 fn stable_options() -> DaemonStartupOptions {
     DaemonStartupOptions {
+        stdio_compat: false,
         stable_keychain_access_group: Some("A1B2C3D4E5.com.agentdeck.agentdeckd.stable".to_owned()),
         ..options(false, false)
     }
@@ -176,6 +180,55 @@ fn ephemeral_and_no_remote_must_be_enabled_together() {
     assert_eq!(
         DaemonConfigError::NoRemoteRequiresEphemeral.code(),
         "daemon.config.no_remote_requires_ephemeral"
+    );
+}
+
+#[test]
+fn local_ingress_follows_the_approved_stable_and_ephemeral_matrix() {
+    // stable socket basename 较长；夹具 root 保持短路径，避免先耗尽 sun_path。
+    let root = TestRoot::new("ingress");
+    let home = root.path().join("home");
+    let temp = root.path().join("tmp");
+    fs::create_dir(&home).expect("create home");
+    create_private_dir(&temp);
+
+    let stable =
+        DaemonConfig::resolve_with_roots(stable_options(), &home, &temp).expect("stable config");
+    assert_eq!(stable.local_ingress_mode(), LocalIngressMode::Uds);
+
+    let ephemeral = DaemonConfig::resolve_with_roots(options(true, true), &home, &temp)
+        .expect("ephemeral UDS config");
+    assert_eq!(ephemeral.local_ingress_mode(), LocalIngressMode::Uds);
+    assert_eq!(
+        ephemeral.paths().socket,
+        ephemeral.paths().data_dir.join("s")
+    );
+
+    let mut stdio_options = options(true, true);
+    stdio_options.stdio_compat = true;
+    let stdio = DaemonConfig::resolve_with_roots(stdio_options, &home, &temp)
+        .expect("explicit ephemeral stdio config");
+    assert_eq!(stdio.local_ingress_mode(), LocalIngressMode::StdioCompat);
+
+    let mut stable_stdio = stable_options();
+    stable_stdio.stdio_compat = true;
+    // 威胁场景：compatibility flag 未绑定完整隔离模式时，legacy stdio 会误入
+    // stable 或 remote-enabled 生命周期。
+    assert!(matches!(
+        DaemonConfig::resolve_with_roots(stable_stdio, &home, &temp),
+        Err(DaemonConfigError::StdioCompatRequiresEphemeralNoRemote)
+    ));
+    for (ephemeral, no_remote) in [(true, false), (false, true)] {
+        let mut partial = options(ephemeral, no_remote);
+        partial.stdio_compat = true;
+        assert!(matches!(
+            DaemonConfig::resolve_with_roots(partial, &home, &temp),
+            Err(DaemonConfigError::StdioCompatRequiresEphemeralNoRemote)
+        ));
+    }
+    assert_eq!(
+        DaemonConfigError::StdioCompatRequiresEphemeralNoRemote.code(),
+        "daemon.config.stdio_compat_requires_ephemeral_no_remote"
     );
 }
 
@@ -334,6 +387,7 @@ fn namespace_rejects_instance_id_traversal_and_ephemeral_access_group() {
     let startup = DaemonStartupOptions {
         ephemeral: true,
         no_remote: true,
+        stdio_compat: false,
         profile: None,
         stable_keychain_access_group: Some("A1B2C3D4E5.com.agentdeck.agentdeckd.stable".to_owned()),
     };
@@ -347,6 +401,7 @@ fn namespace_rejects_instance_id_traversal_and_ephemeral_access_group() {
 fn dev_profile_requires_the_fully_isolated_ephemeral_mode() {
     let root = TestRoot::new("dev-profile");
     let dev_stable = DaemonStartupOptions {
+        stdio_compat: false,
         profile: Some(DaemonProfile::Dev),
         ..options(false, false)
     };
@@ -356,12 +411,14 @@ fn dev_profile_requires_the_fully_isolated_ephemeral_mode() {
     ));
 
     let dev_ephemeral = DaemonStartupOptions {
+        stdio_compat: false,
         profile: Some(DaemonProfile::Dev),
         ..options(true, true)
     };
     assert!(DaemonConfig::resolve_with_roots(dev_ephemeral, root.path(), root.path()).is_ok());
 
     let stable_ephemeral = DaemonStartupOptions {
+        stdio_compat: false,
         profile: Some(DaemonProfile::Stable),
         ..options(true, true)
     };

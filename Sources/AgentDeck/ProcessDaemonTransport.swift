@@ -7,7 +7,9 @@ import Foundation
 /// line — it forwards strings to the incoming handler. `DaemonClient` parses
 /// `ServerEvent` vs admin `{"reply":...}` shapes.
 final class ProcessDaemonTransport: DaemonTransport, @unchecked Sendable {
-    static let stdioDaemonArguments = ["--ephemeral", "--no-remote", "--profile", "dev"]
+    static let stdioDaemonArguments = [
+        "--stdio-compat", "--ephemeral", "--no-remote", "--profile", "dev",
+    ]
 
     static func stdioDaemonEnvironment(
         base: [String: String] = ProcessInfo.processInfo.environment
