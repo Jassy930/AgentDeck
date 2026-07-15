@@ -1,7 +1,7 @@
 # 协议 Spike 发现（Step 0,Eng D7）
 
-实测日期：2026-05-19
-codex 版本：codex-cli 0.130.0（已固定在 `CODEX_VERSION.txt`）
+首次实测日期：2026-05-19；schema 最近刷新：2026-07-15
+codex 版本：codex-cli 0.144.1（已固定在 `CODEX_VERSION.txt`）
 
 ## D7 核心问题：wire framing 是什么？
 
@@ -24,6 +24,12 @@ fixture：`../spike/initialize-response.jsonl`（initialize 真实响应）。
 `codex app-server generate-json-schema --out DIR` 生成完整官方协议
 schema（35 个 JSON + v1/v2 目录）。`generate-ts --out DIR` 生成
 TypeScript binding。**不需要逆向协议。**
+
+2026-07-15 使用本机实际执行的 `codex-cli 0.144.1` 重新生成以下固化
+schema，并以一次真实、只含 `initialize` 的 stdio JSONL probe 复核 framing：
+响应仍为单行 JSON、带 `id/result` 且不含 `method`，4 秒观察窗内未收到额外
+notification。该 probe 只证明当前本机 initialize 形状；可选通知仍以官方 schema
+和 `optOutNotificationMethods` 为边界，不能把“本次未观察到”解释为永不发送。
 
 固化进项目的关键 schema（`protocol/`）：
 - `JSONRPCMessage.json` — 消息信封（Request/Notification/Response/Error）
