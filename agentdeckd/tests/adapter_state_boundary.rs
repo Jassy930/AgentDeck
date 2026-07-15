@@ -141,8 +141,8 @@ fn common_adapter_state_module_has_no_vendor_identity_type() {
     assert!(worker.contains("pub(crate) struct ClaudeCodeAdapterStateVault"));
     assert!(worker.contains("pub(in crate::runtime) fn codex_adapter_state_vault"));
     assert!(worker.contains("pub(in crate::runtime) fn claude_code_adapter_state_vault"));
-    assert!(!worker.contains("pub(crate) fn codex_adapter_state_vault"));
-    assert!(!worker.contains("pub(crate) fn claude_code_adapter_state_vault"));
+    assert!(!worker.contains("pub(crate) fn codex_adapter_state_vault("));
+    assert!(!worker.contains("pub(crate) fn claude_code_adapter_state_vault("));
 
     let agent_contract =
         fs::read_to_string(root.join("src/agent.rs")).expect("read canonical Agent contract");

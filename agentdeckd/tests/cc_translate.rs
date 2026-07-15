@@ -133,7 +133,9 @@ fn tool_result_after_bash_emits_shell_completion() {
         } => {
             assert_eq!(command, "echo ok");
             assert!(matches!(status, ShellStatus::Completed));
-            assert_eq!(*exit_code, Some(0));
+            // stream-json tool_result 只提供 is_error=false；它能证明 typed
+            // status，但没有权威进程退出码，不能伪造成 0。
+            assert_eq!(*exit_code, None);
         }
         other => panic!("expected Shell(Completed), got {other:?}"),
     }
@@ -173,7 +175,8 @@ fn tool_result_with_error_emits_shell_failed() {
             ..
         } => {
             assert!(matches!(status, ShellStatus::Failed));
-            assert_eq!(*exit_code, Some(1));
+            // is_error=true 不是进程 exit(1)；真实值也可能是 2/126/127/130。
+            assert_eq!(*exit_code, None);
         }
         other => panic!("expected Shell(Failed), got {other:?}"),
     }

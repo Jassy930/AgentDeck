@@ -64,14 +64,10 @@ impl AgentRouter {
         self.agents.get(&kind).map(|a| a.capabilities())
     }
 
-    /// Canonical P3.7 cold-prepare route. This method only selects the typed
+    /// Canonical production cold-prepare route. This method only selects the typed
     /// adapter and delegates to the daemon-owned binding helper; it deliberately
     /// does not create compatibility `SessionId` ownership or expose approval /
     /// cancellation lookup by execution identity.
-    #[allow(
-        dead_code,
-        reason = "P3.7 coordinator wiring consumes the typed router entry"
-    )]
     pub(crate) async fn prepare_turn(
         &self,
         agent_kind: AgentKind,

@@ -941,7 +941,8 @@ fn tool_result_to_agent_item(
                 } else {
                     ShellStatus::Completed
                 },
-                exit_code: Some(if is_error { 1 } else { 0 }),
+                // Native JSONL 的 tool_result 只携带 is_error；没有权威进程退出码。
+                exit_code: None,
                 duration_ms: None,
                 meta: AgentItemMeta::default(),
             }
@@ -1319,7 +1320,7 @@ mod tests {
             } => {
                 assert_eq!(command, "ls");
                 assert!(matches!(status, ShellStatus::Completed));
-                assert_eq!(*exit_code, Some(0));
+                assert_eq!(*exit_code, None);
             }
             other => panic!("expected Shell tool_result, got {other:?}"),
         }

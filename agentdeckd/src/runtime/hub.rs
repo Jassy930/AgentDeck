@@ -26,7 +26,9 @@
 
 use crate::agent::{AgentEventSender, AgentSessionHandle};
 use crate::runtime::router::AgentRouter;
-use agentdeck_protocol::{ClientCommand, PROTOCOL_VERSION, ProtocolError, ServerEvent, SessionId};
+use agentdeck_protocol::{
+    ClientCommand, HistoryRequest, PROTOCOL_VERSION, ProtocolError, ServerEvent, SessionId,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -57,13 +59,28 @@ pub struct RuntimeHub {
     /// per-session lock (the router's map is keyed by `SessionId` →
     /// `AgentKind` and is purely for routing).
     sessions: Arc<Mutex<HashMap<SessionId, AgentSessionHandle>>>,
+    legacy_execution_enabled: bool,
 }
 
 impl RuntimeHub {
+    /// 显式 stdin compatibility 构造。该路径仍保留旧 SessionStart/Continue，
+    /// production main 不得使用；P3.8 会把 compatibility 收紧到 ephemeral 模式。
     pub fn new(router: Arc<AgentRouter>) -> Self {
         Self {
             router,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            legacy_execution_enabled: true,
+        }
+    }
+
+    /// production P3.7 过渡入口只保留无 vendor spawn 的管理/只读命令。
+    /// SessionStart/Continue 必须等待 P3.8 RuntimeEnvelope transport，经同一 RuntimeCore
+    /// 与 exec gate 执行，不能回落到 legacy adapter spawn。
+    pub fn admin_only(router: Arc<AgentRouter>) -> Self {
+        Self {
+            router,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            legacy_execution_enabled: false,
         }
     }
 
@@ -152,6 +169,36 @@ impl RuntimeHub {
         admin_tx: &mpsc::Sender<String>,
     ) {
         match cmd {
+            ClientCommand::SessionStart(_) | ClientCommand::SessionContinue { .. }
+                if !self.legacy_execution_enabled =>
+            {
+                let _ = events_tx
+                    .send(ServerEvent::Error {
+                        session_id: None,
+                        error: ProtocolError {
+                            code: "daemon.runtime.legacy_execution_disabled".into(),
+                            message: "legacy session execution is disabled; use RuntimeEnvelope v1"
+                                .into(),
+                            diagnostic_ref: None,
+                        },
+                    })
+                    .await;
+            }
+            ClientCommand::History(request)
+                if !self.legacy_execution_enabled && history_request_has_side_effect(&request) =>
+            {
+                let _ = events_tx
+                    .send(ServerEvent::Error {
+                        session_id: None,
+                        error: ProtocolError {
+                            code: "daemon.runtime.legacy_history_mutation_disabled".into(),
+                            message: "legacy history mutations are disabled until they use the typed execution gate"
+                                .into(),
+                            diagnostic_ref: None,
+                        },
+                    })
+                    .await;
+            }
             // ── Cheap / admin commands: handle inline ──────────────────
             ClientCommand::Ping => {
                 let reply = serde_json::json!({ "reply": "ping", "ok": true });
@@ -384,6 +431,15 @@ impl RuntimeHub {
     }
 }
 
+fn history_request_has_side_effect(request: &HistoryRequest) -> bool {
+    matches!(
+        request,
+        HistoryRequest::Archive { .. }
+            | HistoryRequest::Unarchive { .. }
+            | HistoryRequest::Rename { .. }
+    )
+}
+
 /// Single-owner stdout writer. Drains the per-session events stream and
 /// the admin reply stream into a single newline-delimited byte stream.
 async fn writer_task<W>(
@@ -460,6 +516,44 @@ mod tests {
     use agentdeck_protocol::*;
     use std::time::Duration;
     use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn admin_only_hub_rejects_history_mutations_before_router_dispatch() {
+        // 威胁场景：production compatibility ingress 接收 Archive/Rename 后直接启动
+        // vendor CLI；该副作用没有 Started/Fence/release，也不受 orphan recovery 约束。
+        let hub = RuntimeHub::admin_only(Arc::new(AgentRouter::new()));
+        let (events_tx, mut events_rx) = mpsc::channel(3);
+        let (admin_tx, mut admin_rx) = mpsc::channel(3);
+        let thread_id = ThreadId("history-write-must-not-spawn".into());
+        let requests = [
+            HistoryRequest::Archive {
+                thread_id: thread_id.clone(),
+                agent_kind: AgentKind::ClaudeCode,
+            },
+            HistoryRequest::Unarchive {
+                thread_id: thread_id.clone(),
+                agent_kind: AgentKind::ClaudeCode,
+            },
+            HistoryRequest::Rename {
+                thread_id,
+                agent_kind: AgentKind::ClaudeCode,
+                title: "must stay local".into(),
+            },
+        ];
+
+        for request in requests {
+            hub.dispatch(ClientCommand::History(request), &events_tx, &admin_tx)
+                .await;
+            match events_rx.recv().await.expect("typed rejection") {
+                ServerEvent::Error { error, .. } => assert_eq!(
+                    error.code,
+                    "daemon.runtime.legacy_history_mutation_disabled"
+                ),
+                other => panic!("expected history mutation rejection, got {other:?}"),
+            }
+        }
+        assert!(admin_rx.try_recv().is_err(), "rejected writes have no Ack");
+    }
 
     /// Sanity: parse errors come back as ServerEvent::Error not a panic
     /// or a silent drop.
@@ -775,6 +869,35 @@ mod tests {
         // Best-effort wait for hub to exit; the slow stub finishes its
         // sleep then emits an Error event, which the writer drains.
         let _ = tokio::time::timeout(Duration::from_secs(2), hub_task).await;
+    }
+
+    #[tokio::test]
+    async fn admin_only_hub_rejects_legacy_session_start_before_router_dispatch() {
+        let hub = RuntimeHub::admin_only(Arc::new(AgentRouter::new()));
+        let (events_tx, mut events_rx) = mpsc::channel(1);
+        let (admin_tx, _admin_rx) = mpsc::channel(1);
+        let start = ClientCommand::SessionStart(SessionStart {
+            agent_kind: AgentKind::Codex,
+            cwd: std::path::PathBuf::from("/tmp"),
+            prompt: Some("must-not-spawn".into()),
+            vendor_options: VendorSessionOptions::Codex(CodexSessionOptions {
+                approval_policy: CodexApprovalPolicy::OnRequest,
+                sandbox: CodexSandboxMode::WorkspaceWrite,
+                persist_approval: false,
+                reasoning_effort: CodexReasoningEffort::Medium,
+                mcp_overrides: vec![],
+            }),
+            runtime_options: Default::default(),
+        });
+
+        hub.dispatch(start, &events_tx, &admin_tx).await;
+        let event = events_rx.recv().await.expect("typed rejection event");
+        assert!(matches!(
+            event,
+            ServerEvent::Error { error, .. }
+                if error.code == "daemon.runtime.legacy_execution_disabled"
+        ));
+        assert!(hub.sessions.lock().await.is_empty());
     }
 
     /// Selfcheck reports protocolVersion + registered agent kinds.

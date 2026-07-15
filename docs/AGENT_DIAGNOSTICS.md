@@ -574,14 +574,45 @@ P3.4 RuntimeCore 的 transport-neutral failure：
 | `daemon.runtime.not_ready` | Core 尚未完成 paged recovery，或正在 draining/stopped | 等待 daemon readiness；若 recovery 无法完成，按上节保留 DB/Keychain 证据并 fail-close |
 | `daemon.runtime.protocol_mismatch` | Runtime v1 版本不兼容 | 升级客户端/daemon 到同一 Runtime protocol；不能回退 Relay/IPC 业务字段 |
 | `daemon.runtime.invalid_request` | ID 非 canonical UUID、Start key/cwd 或其他规范化输入非法 | 修正原请求；不得由 daemon 猜 ID/path 或替客户端补目标 |
-| `daemon.runtime.feature_unavailable` | 请求属于尚未接线的后续 phase（P3.7–P4，例如 pairing/revoke/trust reset），或依赖尚未启用的 production execution | 读取 capabilities/实施状态后等待对应 phase；Catalog/Subscribe/Backfill 已进入 P3.6，不应再用该 code 代替其真实错误；不得用 compatibility path 或 fake coordinator 假成功 |
+| `daemon.runtime.feature_unavailable` | 请求属于尚未接线的后续 phase（P3.8–P4，例如 local transport/pairing/revoke/trust reset） | 读取 capabilities/实施状态后等待对应 phase；production execution 已进入 P3.7，Catalog/Subscribe/Backfill 已进入 P3.6，不应再用该 code 代替其真实错误；不得用 compatibility path 或 fake coordinator 假成功 |
 | `daemon.authorization.revoked` | opaque principal lease 已 Revoking/Revoked 或 issuer registry 不可用 | 停止该 connection；remote 设备按 durable revocation/re-pair 流程处理，本地重新认证 peer credential |
 | `daemon.runtime.identity_unavailable` | machine trust/ID derivation domain 非法或 OS entropy 不可用 | 停止启动并检查 machine identity/系统熵；不得生成零 ID 或使用时间/PID 回退 |
 | `daemon.runtime.actor_unavailable` | conversation actor/execution control 已损坏或 recovery-blocked | 不自动重放 Started；保留 command/fence 证据，P3.7 按 orphan fencing 处理 |
 | `daemon.runtime.connection_unavailable` | connection 不存在、writer lagged、transport 未 ACK flush 或编码失败 | 仅重连当前客户端，并按 commandId/idempotency 查询 durable receipt；不得假定未执行 |
 | `daemon.runtime.read_unavailable` | 独立 ReadPool 已满或关闭 | 有界退避后重试读取；不要创建更多等待 task，副作用请求仍以 durable receipt 为准 |
-| `daemon.runtime.recovery_blocked` | 恢复页存在 Started，或 P4 前存在无法绑定精确 grant 的 remote Accepted | 保持 execution disabled；P3.7/P4 完成 fencing/auth readback 前不得 finish recovery |
+| `daemon.runtime.recovery_blocked` | Started 的已知 PGID 内 cooperative descendants 无法在 TERM→KILL/reap 后证明退出，binding/fence readback 不一致，或 P4 前存在 remote Accepted | 只隔离对应 damaged conversation；保留 DB/fence/process 证据并人工清理。remote Accepted 属全局启动拒绝，P4 durable auth readback 前不得安装任何 actor。该 code 不表示 daemon 已检测到流程外自守护/逃逸进程 |
 | `daemon.turn.stale` | CancelQueued 已输给 Started，或 CancelActive 的 turnId 不是当前 turn | 查询精确 CommandStatus；对 Started 只使用返回的当前 turnId 明确 cancel |
+| `daemon.runtime.legacy_execution_disabled` | production stdio 收到旧 `SessionStart`/`SessionContinue`，该路径会绕开 typed RuntimeCore/exec-gate | 改用 P3.8 RuntimeEnvelope v1；P3.7 过渡期 production stdio 只保留 admin/read compatibility |
+| `daemon.runtime.legacy_history_mutation_disabled` | production stdio 收到旧 rename/archive/history write | 等待对应操作迁入 typed RuntimeEnvelope；不得回退 legacy adapter spawn 或私有 vendor history mutation |
+
+P3.7 exec-gate 的以下 code 是内部 typed 分类码。`--exec-gate` one-shot 自身失败时会把 code 写到
+stderr，私有 ADGX abort frame 也可携带 code；但当前 parent/runtime 不保证把每个子码写入
+`diagnostic.log`，部分路径只对上层暴露 `daemon.exec_gate.rejected` 或统一的
+`daemon.runtime.execution_failed`。因此不能把下表描述成“结构化本机日志已完整覆盖”。Runtime event
+不得写入 program/path/token/原始 stderr：
+
+| code | 含义 | 下一步 |
+| --- | --- | --- |
+| `daemon.exec_gate.control_unavailable` | 固定私有 FD 不存在、读写/flush 失败 | 停止 execution；核对 current-binary spawner 的 FD3 dup/close-on-exec，不回退 argv/env 传 secret |
+| `daemon.exec_gate.invalid_frame` / `daemon.exec_gate.version_mismatch` | ADGX magic/version/tag/长度/trailing 或字段上界非法 | 视为 binary/version mismatch 或内部篡改；升级为同一 daemon candidate，不尝试宽松 JSON/stdio fallback |
+| `daemon.exec_gate.invalid_binding` / `daemon.exec_gate.release_mismatch` | command/boot/nonce、PID/start-time、PGID、release token/commitment 或时间不精确匹配 | 不发送第二次 release；关闭 control FD、清理 exact group，并按 Interrupted/RecoveryBlocked 收口 |
+| `daemon.exec_gate.process_group_failed` / `daemon.exec_gate.process_group_not_exited` | 无法建立独立 PGID，或 TERM→KILL/reap 后仍不能证明已知 PGID 内进程退出 | 禁止恢复同 conversation 的 Accepted queue；保留 PID/start-time/PGID 证据，人工清理后再恢复 |
+| `daemon.exec_gate.entropy_unavailable` | release token 随机源不可用 | 停止启动 vendor；检查系统熵，禁止常量/时间/PID 回退 |
+| `daemon.exec_gate.spawn_failed` / `daemon.exec_gate.handshake_timeout` / `daemon.exec_gate.rejected` | current daemon binary 无法 spawn，5 秒 handshake 超时，或 child 明确拒绝 prepare | 核对当前签名 binary、固定 vendor 安装目录、daemon version 与资源上限；不要调用 legacy adapter spawn。typed disposition 确认未创建 child 时直接 Interrupted，不能误标 RecoveryBlocked；只有 identity/清理不确定时才 fail-close |
+| `daemon.exec_gate.exec_failed` | release 后最终 `execve` vendor 失败 | 该 turn 按已越过 release 的 unknown outcome 处理；查询本机诊断并修复固定目录中的 vendor binary，不自动重放 prompt |
+| `daemon.exec_gate.wait_failed` | child wait/reap 失败 | 先按 exact PID/start-time 复核已知进程组；无法证明同组进程退出则 RecoveryBlocked，不把 terminal event 当作已 fenced。release 前也必须由 prepare 起唯一 reaper 消费 child，不能把 zombie sentinel 当成存活进程 |
+| `daemon.cli.exec_gate_mode_conflict` | `--exec-gate` 与 profile/data-dir/ephemeral/diagnostics/probe/help/version 等普通 CLI flag 混用 | 只允许 current-binary spawner 以独占 `--exec-gate` + 私有 FD 启动；不要手工拼普通 daemon 参数 |
+
+vendor program 只从 `/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin`，以及 macOS
+由 `getpwuid_r(geteuid())` 取得的当前 OS account `~/.local/bin` 解析 basename；不读取继承 HOME/PATH。
+该集合及其中预期 binary 是流程外信任根；同一 OS account 主动替换被信任 binary 超出 exec-gate 的
+证明边界。`claude` 只装在其他目录时，production typed prepare 会返回 `cc-binary-not-found`；应把
+发行所需 binary 安装/链接到受信目录，不能临时把项目目录加回 PATH。
+
+PGID 诊断只覆盖不主动 `setsid`/`setpgid`、不通过 `launchd`/launch service 或其他 supervisor 脱离
+继承 PGID 的 cooperative vendor/tool descendants；此边界内仍保证 release 前零 vendor/tool 副作用与
+同组 TERM→KILL/reap。显式自守护/逃逸是流程外不支持行为，当前机制不声称检测、枚举、收割或以
+`RecoveryBlocked` 报告它。若工具必须采用这类执行模型，应停用当前执行路径并另行使用真正执行域隔离。
 
 ### P3.5 approval / authorization / delivery 诊断
 
@@ -597,9 +628,9 @@ P3.5 的正常状态转换以 `ApprovalReceipt` 为主，不应把业务回执�
 | `daemon.authorization.permission_denied` | principal 仍 Active，但没有本次 Resolve 或 Retry 的显式 approval permission；本地 transport 也不自动获得权限 | 保持原 approval 不变；核对 issuer capability/grant，不要用 `is_local`、connection 类型或 owner 绕过 |
 | `daemon.approval.already_handled` / `AlreadyHandled` | 另一个 writer 已先 COMMIT winner，或同一 winner 的 exact retry 读到后续状态 | 以回执中的 winner+state 为准；不要换 idempotency key 或提交对立 decision 争抢第二次 |
 | `daemon.approval.delivery_failed` / `DeliveryFailed` | 8 次/60 秒预算耗尽、明确永久拒绝，或 write/flush/route 结果为 `OutcomeUnknown` | 不自动重投；查询 durable receipt 后，只能调用 `RetryApproval` 重用 sealed winner 开新 round |
-| `daemon.approval.expired` / `Expired` | 默认 30 分钟或更短 capability deadline 到达，或 turn terminal 原子关闭 active approval | Pending 无 winner；已 claim 必须读回原 winner+Expired。重新执行用户意图需要新 ActionRequest，不能复活旧 approval |
+| `daemon.approval.expired` / `Expired` | 默认 30 分钟或更短 capability deadline 到达，或 turn terminal 原子关闭 active approval | Pending 无 winner；已 claim 必须读回原 winner+Expired。deadline 不会向 vendor 合成 Deny；matching active turn 经 exact fence 后以 Interrupted 收口。重新执行用户意图需要新 ActionRequest，不能复活旧 approval |
 | `daemon.runtime.store_unavailable`（approval/terminal COMMIT unknown） | Register/Claim/Retry/Begin/Applied/DeliveryFailed/Expired 或 terminal+expiry 的 after-COMMIT 回执丢失、SQLite outcome 不明 | 只在回报的 operation 与当前 mutation 匹配时，用完全相同的 approval/attempt/decision/completion stable input 精确重试；不匹配或其他错误直接 fail-close。AppliedAck 后禁止再次调用 adapter；已提交 terminal 必须重放为 Completed/Replayed 后再清 route 与启动 successor |
-| `daemon.runtime.recovery_blocked` | 重启读到 Started turn 及 Applying/DeliveryFailed approval，但 process group 尚未被 P3.7 exec fence 证明退出；或当前 delivery generation 在 adapter 已返回后无法 durable 写入唯一终态，产生 `FatalClosure` | 停止并清理全部进程内 delivery/deadline task，但保留 durable Started/approval 原状；不得自动恢复投递、写 Expired/Interrupted 或启动后续 Accepted。`FatalClosure` 也不得把仍为 Applying 的 row 当作可重投 route |
+| `daemon.runtime.recovery_blocked` | 重启读到 Started turn 及 Applying/DeliveryFailed approval，但 process group 尚未被 P3.7 exec fence 证明退出；当前 delivery generation 在 adapter 已返回后无法 durable 写入唯一终态，产生 `FatalClosure`；或 approval expiry 已 fence 但 10 秒内 daemon terminal pipeline 仍未收口 | 停止并清理全部进程内 delivery/deadline/execution task，但保留 durable Started/approval 原状；不得自动恢复投递、写伪造的 Interrupted 或启动后续 Accepted。`FatalClosure` 也不得把仍为 Applying 的 row 当作可重投 route |
 
 schema v3 的 `approval_ledger`、row AEAD/metadata MAC、`approval_count` 与
 `active_approval_count` ledger MAC 会在 open/recovery/readback 时一起验证。deadline、attempt、
@@ -622,10 +653,29 @@ BeginApprovalAttempt COMMIT 成功或 exact replay 并不自动授权 adapter �
 签发 permit。排查“deadline 附近仍执行一次”的问题时，优先保留 Begin event 与这些时间坐标，
 不要只看 COMMIT 前的内存时钟。
 
-Codex route 只有完整 flush 后才算 Applied，失败时保留精确 route；Claude Code Approval
-capability 目前仍隐藏，直到 P3.7 recorded fixture/live gate 完成。P3.5 的 private fake
-delivery 测试不是 live vendor 证据；看到 production CC approval 或未经过 exec-gate 的真实投递，
-应视为 capability exposure/接线错误并立即 fail-close。
+Codex route 只有完整 flush 后才算 Applied，失败时保留精确 route。P3.7 canonical Claude Code driver
+使用 `--permission-prompt-tool stdio`，只接受已录制验证的 stdio
+`control_request/control_response`，并只通过 canonical capability builder
+广告 Approval；legacy compatibility builder 对 speculative permission wire 仍隐藏该能力。P3.5 的
+private fake 与 P3.7 筛选 fixture 都不是 live vendor 证据；未经 exec-gate 或不符合 recorded control
+shape 的 CC approval 必须 fail-close。
+
+approval 卡必须显示可判别的最小动作摘要，而不是只显示“请求执行命令/编辑文件”。摘要只允许来自
+translator 已验证的动作字段，并经过固定 source pre-cap、secret redaction 与 UTF-8 限长。Codex 自由
+文本必须显示为保留换行/控制符边界的 JSON 字符串，无法完整显示时拒绝；CC 才折叠控制字符并截断。
+若看到 permission suggestion、blocked path、未选中的 CC input 或完整 vendor JSON，立即按 durable data
+boundary 泄漏处理。Codex file approval 必须能用 `itemId` 关联同一 in-flight fileChange 的非空 proposed
+changes；`grantRoot/reason` 只是可选上下文。Codex `codex-item-kind-mismatch` 表示 completed frame 与
+started kind 漂移，
+`codex-shell-terminal-status-invalid` 表示 `inProgress`、未知或缺失 terminal status；两者都必须保留
+in-flight state，不能降级为 Completed。Claude Code Shell 的 `exitCode=null` 是“wire 未提供权威退出码”，
+不是成功码 0；成功/失败只看 typed `ShellStatus`。
+
+`codex-approval-action-missing`、`codex-approval-summary-too-large`、`cc-control-action-invalid` 与
+`cc-control-tool-unmodeled` 都表示 daemon 无法向用户完整展示将被批准的具体动作；这类请求不会注册
+durable approval，也不能退回泛化 summary。Codex permission profile 必须先通过与 response builder
+相同的官方字段 validator，再以完整 compact profile 进入脱敏 summary；只含 scan depth、空对象、未知
+字段或超过 1 KiB 都拒绝。排查时不要把 raw params 打进日志；route/output Debug 已固定脱敏。
 
 ### P3.6 stream / snapshot / transfer 诊断
 
@@ -740,6 +790,16 @@ CC `stream-json` 中 `system.subtype=init` 只用于抓取原生 `session_id`。
 `attempt`、`error`、`errorStatus`、`maxRetries` 和 `retryDelayMs`，不进入
 中立 `AgentItem` 主干，也不透传原始 vendor JSON。
 
+上段描述的是 legacy compatibility translator。P3.7 typed production driver 的 durable Runtime 路径更
+严格：`init`、hook 生命周期，以及 2.1.207 已核实的 `status`、`task_started/task_progress/`
+`task_notification/task_updated`、`background_tasks_changed` 和 top-level `tool_progress` 先校验当前
+shape，再作为非持久化控制/进度帧消费；未知 subtype 或已知 method 的 shape 漂移仍 fail-close。它不产出
+Raw、VendorPanel 或原始 stderr event。typed CC Bash `tool_result` 没有权威工具耗时，因此 canonical Shell
+固定 `duration_ms=None`；本机解析间隔和 turn-level `result.duration_ms` 都不能冒充单个工具 duration。
+`result` 只有在 `subtype=success`、`is_error=false`、`duration_ms` 为有效非负整数、
+`terminal_reason=completed` 且没有非空 `deferred_tool_use` 时才产生 TurnComplete；`tool_deferred` 等结果
+不会被伪造成 Completed。
+
 ## Approval 卡住排查
 
 Codex 的命令执行、文件变更和额外权限审批会先在 daemon adapter 层映射为中立
@@ -770,6 +830,10 @@ Codex 的命令执行、文件变更和额外权限审批会先在 daemon adapte
 | `cc-session-id-mismatch` / `cc-session-id-missing` | startup/init 的 native session 与私有映射不同，或 authoritative init 缺 ID | daemon 会 kill child 并 fail-close；保留本机诊断，检查 CC CLI 版本/参数语义，不覆盖私表 |
 | `cc-session-identity-eof` / `cc-session-identity-timeout` / `cc-session-identity-read` / `cc-session-identity-too-large` | CC 在 authoritative init 前退出、超时、I/O 失败或超过 256 lines/2 MiB handshake 上界 | 不接受该 turn；检查 hooks/CLI stderr/资源状态，再以原 idempotency input 由 RuntimeCore 裁决是否可重试 |
 | `cc-session-startup-status` | daemon 无法读取 CC child 的早期退出状态 | 按本机进程/权限故障处理，不发布 canonical started/capabilities |
+| `cc-binary-not-found` | typed prepare 在固定系统目录和当前 OS account `~/.local/bin` 都找不到 `claude` | 把官方 CLI 安装/链接到上述受信目录；不要修改 daemon 继承 PATH 或从项目目录执行同名文件 |
+| `cc-system-frame-unmodeled` | typed Runtime 收到当前封闭 allowlist 之外的 system subtype | 保留筛选后的本机诊断并核对 CC 版本；在 typed schema/持久化建模前不得回退 Raw/VendorPanel 透传 |
+| `cc-system-frame-invalid` / `cc-tool-progress-invalid` | 已知 lifecycle/progress method 缺少 2.1.207 必需字段、类型或使用未知 task patch 字段 | 视为 vendor wire 漂移并终止该 turn；先用脱敏真实样本和当前 SDK contract 更新封闭 validator，不能直接静默忽略 |
+| `cc-turn-terminal-invalid` / `cc-turn-not-completed` | success result 缺精确布尔/耗时/terminal reason，或仍带 deferred tool work | 不写 Completed；保留本机脱敏 shape 诊断，确认 CLI 是否仍有后台工作或协议已升级 |
 
 ## v0.2 双 adapter 探测
 

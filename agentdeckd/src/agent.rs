@@ -12,10 +12,14 @@ use agentdeck_protocol::{
 };
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
+use crate::exec_gate::{GatedChild, GatedChildIo};
+use crate::runtime::approval::SharedApprovalDelivery;
 use crate::runtime::store::{RuntimeId, RuntimeIdKind};
 
 /// exec-gate control frame 内的 program/cwd 单路径原始平台编码字节上界。
@@ -28,7 +32,24 @@ pub const MAX_EXEC_SINGLE_ARGUMENT_BYTES: usize = 16 * 1024;
 pub const MAX_EXEC_ARGUMENT_BYTES: usize = 256 * 1024;
 /// program、cwd、argv 内容与长度前缀合计的完整结构上界。
 pub const MAX_EXEC_CONTROL_FRAME_BYTES: usize = 288 * 1024;
+pub const MAX_ADAPTER_ITEM_KEY_BYTES: usize = 1024;
+const ADAPTER_EVENT_CAPACITY: usize = 64;
+const ADAPTER_APPROVAL_CAPACITY: usize = 64;
 const EXEC_SPEC_LENGTH_PREFIX_BYTES: usize = std::mem::size_of::<u64>();
+
+pub(crate) fn exec_spec_control_frame_bytes(
+    program_bytes: usize,
+    cwd_bytes: usize,
+    argument_count: usize,
+    argument_bytes: usize,
+) -> Option<usize> {
+    3_usize
+        .checked_add(argument_count)
+        .and_then(|field_count| EXEC_SPEC_LENGTH_PREFIX_BYTES.checked_mul(field_count))
+        .and_then(|overhead| overhead.checked_add(program_bytes))
+        .and_then(|total| total.checked_add(cwd_bytes))
+        .and_then(|total| total.checked_add(argument_bytes))
+}
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum AgentTurnContractError {
@@ -261,13 +282,13 @@ impl ExecSpec {
                 return Err(AgentTurnContractError::ArgumentsTooLarge);
             }
         }
-        let control_frame_bytes = 3_usize
-            .checked_add(non_sensitive_args.len())
-            .and_then(|field_count| EXEC_SPEC_LENGTH_PREFIX_BYTES.checked_mul(field_count))
-            .and_then(|overhead| overhead.checked_add(program_bytes))
-            .and_then(|total| total.checked_add(cwd_bytes))
-            .and_then(|total| total.checked_add(argument_bytes))
-            .ok_or(AgentTurnContractError::ControlFrameTooLarge)?;
+        let control_frame_bytes = exec_spec_control_frame_bytes(
+            program_bytes,
+            cwd_bytes,
+            non_sensitive_args.len(),
+            argument_bytes,
+        )
+        .ok_or(AgentTurnContractError::ControlFrameTooLarge)?;
         if control_frame_bytes > MAX_EXEC_CONTROL_FRAME_BYTES {
             return Err(AgentTurnContractError::ControlFrameTooLarge);
         }
@@ -301,17 +322,18 @@ impl ExecSpec {
         &self.cwd
     }
 
-    #[must_use]
-    #[allow(
-        dead_code,
-        reason = "P3.7 exec gate takes ownership of the validated spec"
-    )]
-    pub(crate) fn into_parts(self) -> (PathBuf, Vec<OsString>, PathBuf) {
-        (self.program, self.non_sensitive_args, self.cwd)
-    }
-
     fn is_bound_to(&self, execution_id: ExecutionId, adapter_state: AdapterStateHandle) -> bool {
         self.execution_id == execution_id && self.adapter_state == adapter_state
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checked_for_test(&self) -> CheckedExecSpec<'_> {
+        CheckedExecSpec {
+            execution_id: self.execution_id,
+            program: &self.program,
+            non_sensitive_args: &self.non_sensitive_args,
+            cwd: &self.cwd,
+        }
     }
 }
 
@@ -334,9 +356,26 @@ fn encoded_bytes(value: &OsStr) -> Result<usize, AgentTurnContractError> {
     Ok(bytes.len())
 }
 
-/// P3.7-A 的 cold prepare capability。后续 attach contract 在 gate 切片落地。
+pub type AdapterCompletionFuture =
+    Pin<Box<dyn Future<Output = Result<TurnSummary, ProtocolError>> + Send + 'static>>;
+
+/// P3.7 cold prepare + blocked-gate attach capability。adapter 只能消费私有 stdio
+/// 并向 daemon ACK sink 发送中立事件；release token 与 child owner 不跨越该边界。
 pub trait PreparedAgentTurn: Send + 'static {
     fn exec_spec(&self) -> &ExecSpec;
+
+    fn attach(
+        self: Box<Self>,
+        _child: GatedChildIo,
+        _events: AdapterEventSink,
+        _approvals: AdapterApprovalSink,
+    ) -> Result<AdapterCompletionFuture, ProtocolError> {
+        Err(ProtocolError {
+            code: "adapter-attach-not-migrated".to_owned(),
+            message: "adapter has not implemented the blocked exec-gate attach contract".to_owned(),
+            diagnostic_ref: None,
+        })
+    }
 }
 
 /// daemon 调用 adapter cold-prepare hook 时借出的不可构造 capability。
@@ -360,12 +399,55 @@ impl PrepareAdapterTurnCapability {
 /// identity 在进入 adapter 前由 daemon 保存，并与 `ExecSpec` 内不可由 crate 外构造的
 /// binding 逐项复核，禁止信任 adapter 回传或重建 identity。
 ///
-/// 后续 attach 必须消费整个 handle，并核对 `GatedChild.execution_id` 与这里保存的
-/// identity 完全一致；在 GatedChild 尚未落地前不提供拆出 inner 的入口。
+/// attach 必须消费整个 handle，并核对 `GatedChild.execution_id` 与这里保存的 identity
+/// 完全一致；exec spawn 只能借用下方 checked capability，不能拆出或 clone 原始 spec。
 pub(crate) struct PreparedAgentTurnHandle {
     execution_id: ExecutionId,
     adapter_state: AdapterStateHandle,
     inner: Box<dyn PreparedAgentTurn>,
+}
+
+/// daemon-only、借用自完整 prepared handle 的二次校验后 exec capability。
+///
+/// 威胁场景：若 gate 分开接受 caller 提供的 `ExecutionId` 与任意 `ExecSpec`，一次普通
+/// wiring 错误就能把 execution A 的 vendor argv 绑定到 execution B 的 durable journal。
+/// capability 因此只能从 handle 的 consumption-time 虚 getter 复核后产生，并借用而不
+/// 消费 handle；后续 attach 仍可消费原 handle，不能用本类型替代 adapter continuation。
+pub(crate) struct CheckedExecSpec<'a> {
+    execution_id: ExecutionId,
+    program: &'a Path,
+    non_sensitive_args: &'a [OsString],
+    cwd: &'a Path,
+}
+
+impl<'a> CheckedExecSpec<'a> {
+    pub(crate) const fn execution_id(&self) -> ExecutionId {
+        self.execution_id
+    }
+
+    pub(crate) const fn program(&self) -> &'a Path {
+        self.program
+    }
+
+    pub(crate) const fn non_sensitive_args(&self) -> &'a [OsString] {
+        self.non_sensitive_args
+    }
+
+    pub(crate) const fn cwd(&self) -> &'a Path {
+        self.cwd
+    }
+}
+
+impl fmt::Debug for CheckedExecSpec<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CheckedExecSpec")
+            .field("execution_id", &"[REDACTED]")
+            .field("program", &"[REDACTED]")
+            .field("cwd", &"[REDACTED]")
+            .field("argument_count", &self.non_sensitive_args.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl PreparedAgentTurnHandle {
@@ -386,6 +468,40 @@ impl PreparedAgentTurnHandle {
         } else {
             Err(adapter_prepare_binding_mismatch())
         }
+    }
+
+    pub(crate) fn attach(
+        self,
+        child: &mut GatedChild,
+        events: AdapterEventSink,
+        approvals: AdapterApprovalSink,
+    ) -> Result<AdapterCompletionFuture, ProtocolError> {
+        if child.execution_id() != self.execution_id
+            || !self
+                .inner
+                .exec_spec()
+                .is_bound_to(self.execution_id, self.adapter_state)
+        {
+            return Err(adapter_prepare_binding_mismatch());
+        }
+        let io = child.take_io().map_err(|_| ProtocolError {
+            code: "adapter-gate-stdio-unavailable".to_owned(),
+            message: "blocked exec gate did not expose the complete private stdio set".to_owned(),
+            diagnostic_ref: None,
+        })?;
+        self.inner.attach(io, events, approvals)
+    }
+
+    /// 对 adapter 的虚 getter 做 consumption-time 二次校验，并借出唯一可交给 exec gate
+    /// 的 capability。该调用不消费 handle，确保后续 `attach` 仍拥有完整 adapter 状态。
+    pub(crate) fn checked_exec_spec(&self) -> Result<CheckedExecSpec<'_>, ProtocolError> {
+        let spec = self.exec_spec()?;
+        Ok(CheckedExecSpec {
+            execution_id: self.execution_id,
+            program: spec.program(),
+            non_sensitive_args: spec.non_sensitive_args(),
+            cwd: spec.cwd(),
+        })
     }
 }
 
@@ -437,8 +553,43 @@ fn adapter_prepare_binding_mismatch() -> ProtocolError {
 /// approval 继续只走 P3.5 daemon-owned bound delivery，禁止退回 execution-id lookup。
 /// `Error` 也只是一条 transient adapter 信号；Store 端必须先映射到固定 allowlist，
 /// 禁止直接持久化 adapter message 或 diagnostic reference。
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct AdapterItemKey(String);
+
+impl AdapterItemKey {
+    pub fn new(value: impl Into<String>) -> Result<Self, ProtocolError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > MAX_ADAPTER_ITEM_KEY_BYTES
+            || value.as_bytes().contains(&0)
+        {
+            return Err(ProtocolError {
+                code: "adapter-item-key-invalid".to_owned(),
+                message: "adapter item correlation key is empty or exceeds its fixed bound"
+                    .to_owned(),
+                diagnostic_ref: None,
+            });
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for AdapterItemKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AdapterItemKey([REDACTED])")
+    }
+}
+
 pub enum AdapterEvent {
-    Item(AgentItem),
+    Item {
+        key: AdapterItemKey,
+        item: AgentItem,
+    },
     TurnComplete(TurnSummary),
     Error(ProtocolError),
     VendorControl(VendorControlPayload),
@@ -448,7 +599,7 @@ pub enum AdapterEvent {
 impl fmt::Debug for AdapterEvent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let variant = match self {
-            Self::Item(_) => "Item",
+            Self::Item { .. } => "Item",
             Self::TurnComplete(_) => "TurnComplete",
             Self::Error(_) => "Error",
             Self::VendorControl(_) => "VendorControl",
@@ -462,7 +613,170 @@ impl fmt::Debug for AdapterEvent {
     }
 }
 
-pub type AdapterEventSender = mpsc::Sender<AdapterEvent>;
+pub struct AdapterEventSink {
+    sender: mpsc::Sender<AdapterEventDelivery>,
+}
+
+impl Clone for AdapterEventSink {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+        }
+    }
+}
+
+impl AdapterEventSink {
+    /// 只有 daemon 确认 exact Store COMMIT 后才返回；channel close 或 negative ACK
+    /// 都会让 adapter completion fail-close，禁止 terminal 越过未落盘事件。
+    pub async fn send(&self, event: AdapterEvent) -> Result<(), ProtocolError> {
+        let (acknowledge, committed) = oneshot::channel();
+        self.sender
+            .send(AdapterEventDelivery { event, acknowledge })
+            .await
+            .map_err(|_| adapter_event_commit_failed())?;
+        match committed.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(())) | Err(_) => Err(adapter_event_commit_failed()),
+        }
+    }
+}
+
+pub(crate) struct AdapterEventDelivery {
+    pub(crate) event: AdapterEvent,
+    acknowledge: oneshot::Sender<Result<(), ()>>,
+}
+
+impl AdapterEventDelivery {
+    pub(crate) fn into_parts(self) -> (AdapterEvent, AdapterEventAcknowledgement) {
+        (self.event, AdapterEventAcknowledgement(self.acknowledge))
+    }
+}
+
+pub(crate) struct AdapterEventAcknowledgement(oneshot::Sender<Result<(), ()>>);
+
+impl AdapterEventAcknowledgement {
+    pub(crate) fn acknowledge(self, result: Result<(), ()>) {
+        let _ = self.0.send(result);
+    }
+}
+
+pub(crate) struct AdapterEventReceiver {
+    receiver: mpsc::Receiver<AdapterEventDelivery>,
+}
+
+impl AdapterEventReceiver {
+    pub(crate) async fn recv(&mut self) -> Option<AdapterEventDelivery> {
+        self.receiver.recv().await
+    }
+}
+
+pub(crate) fn adapter_event_channel() -> (AdapterEventSink, AdapterEventReceiver) {
+    let (sender, receiver) = mpsc::channel(ADAPTER_EVENT_CAPACITY);
+    (
+        AdapterEventSink { sender },
+        AdapterEventReceiver { receiver },
+    )
+}
+
+fn adapter_event_commit_failed() -> ProtocolError {
+    ProtocolError {
+        code: "adapter-event-commit-failed".to_owned(),
+        message: "daemon did not durably commit the adapter event".to_owned(),
+        diagnostic_ref: None,
+    }
+}
+
+/// approval 与普通 AdapterEvent 分离；只有 conversation actor 完成 exact durable
+/// registration 后 `register` 才返回，terminal barrier 因而覆盖所有已接收 approval。
+pub struct AdapterApprovalSink {
+    sender: mpsc::Sender<AdapterApprovalDelivery>,
+}
+
+impl Clone for AdapterApprovalSink {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+        }
+    }
+}
+
+impl AdapterApprovalSink {
+    pub(crate) async fn register(
+        &self,
+        request: ActionRequest,
+        delivery: SharedApprovalDelivery,
+    ) -> Result<(), ProtocolError> {
+        let (acknowledge, registered) = oneshot::channel();
+        self.sender
+            .send(AdapterApprovalDelivery {
+                request,
+                delivery,
+                acknowledge,
+            })
+            .await
+            .map_err(|_| adapter_approval_registration_failed())?;
+        match registered.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(())) | Err(_) => Err(adapter_approval_registration_failed()),
+        }
+    }
+}
+
+pub(crate) struct AdapterApprovalDelivery {
+    request: ActionRequest,
+    delivery: SharedApprovalDelivery,
+    acknowledge: oneshot::Sender<Result<(), ()>>,
+}
+
+impl AdapterApprovalDelivery {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ActionRequest,
+        SharedApprovalDelivery,
+        AdapterApprovalAcknowledgement,
+    ) {
+        (
+            self.request,
+            self.delivery,
+            AdapterApprovalAcknowledgement(self.acknowledge),
+        )
+    }
+}
+
+pub(crate) struct AdapterApprovalAcknowledgement(oneshot::Sender<Result<(), ()>>);
+
+impl AdapterApprovalAcknowledgement {
+    pub(crate) fn acknowledge(self, result: Result<(), ()>) {
+        let _ = self.0.send(result);
+    }
+}
+
+pub(crate) struct AdapterApprovalReceiver {
+    receiver: mpsc::Receiver<AdapterApprovalDelivery>,
+}
+
+impl AdapterApprovalReceiver {
+    pub(crate) async fn recv(&mut self) -> Option<AdapterApprovalDelivery> {
+        self.receiver.recv().await
+    }
+}
+
+pub(crate) fn adapter_approval_channel() -> (AdapterApprovalSink, AdapterApprovalReceiver) {
+    let (sender, receiver) = mpsc::channel(ADAPTER_APPROVAL_CAPACITY);
+    (
+        AdapterApprovalSink { sender },
+        AdapterApprovalReceiver { receiver },
+    )
+}
+
+fn adapter_approval_registration_failed() -> ProtocolError {
+    ProtocolError {
+        code: "adapter-approval-registration-failed".to_owned(),
+        message: "daemon did not durably register the adapter approval".to_owned(),
+        diagnostic_ref: None,
+    }
+}
 
 pub type AgentEventSender = mpsc::Sender<ServerEvent>;
 
@@ -1113,17 +1427,20 @@ mod typed_boundary_tests {
     }
 
     #[tokio::test]
-    async fn both_adapters_fail_closed_before_any_typed_spawn_path() {
+    async fn both_adapters_without_runtime_vault_fail_before_any_typed_spawn_path() {
         let codex = CodexAdapter::new_for_test();
         let claude_code = ClaudeCodeAdapter::new_for_test();
 
-        for agent in [&codex as &dyn Agent, &claude_code as &dyn Agent] {
+        for (agent, expected) in [
+            (&codex as &dyn Agent, "codex-state-vault-unavailable"),
+            (&claude_code as &dyn Agent, "cc-state-vault-unavailable"),
+        ] {
             let prepare_error =
                 match prepare_turn(agent, request(7, "never spawn"), adapter_state(8)).await {
                     Err(error) => error,
-                    Ok(_) => panic!("unmigrated adapter must not prepare a typed turn"),
+                    Ok(_) => panic!("adapter without runtime vault must not prepare a typed turn"),
                 };
-            assert_eq!(prepare_error.code, "adapter-turn-not-migrated");
+            assert_eq!(prepare_error.code, expected);
         }
     }
 }

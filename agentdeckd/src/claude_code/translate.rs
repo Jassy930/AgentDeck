@@ -62,7 +62,6 @@
 //! field as fallback.
 
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
@@ -103,7 +102,6 @@ pub struct ClaudeCodeTranslator {
 #[derive(Debug, Clone)]
 struct ToolUseRecord {
     name: String,
-    started_at_ms: u64,
     input: Value,
 }
 
@@ -351,14 +349,8 @@ impl ClaudeCodeTranslator {
             }
         };
 
-        self.in_flight_tools.insert(
-            id,
-            ToolUseRecord {
-                name,
-                started_at_ms: now_ms(),
-                input,
-            },
-        );
+        self.in_flight_tools
+            .insert(id, ToolUseRecord { name, input });
         Some(event)
     }
 
@@ -396,7 +388,6 @@ impl ClaudeCodeTranslator {
                 .get("is_error")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let duration_ms = now_ms().saturating_sub(record.started_at_ms);
             let result_text = extract_tool_result_text(block);
 
             let event = match record.name.as_str() {
@@ -412,12 +403,15 @@ impl ClaudeCodeTranslator {
                     } else {
                         ShellStatus::Completed
                     };
-                    let exit_code = if is_error { Some(1) } else { Some(0) };
                     self.agent_item_event(AgentItem::Shell {
                         command,
                         status,
-                        exit_code,
-                        duration_ms: Some(duration_ms),
+                        // tool_result 没有 authoritative process exit code；legacy
+                        // projection 与 canonical/history 必须都保留 unknown。
+                        exit_code: None,
+                        // stream-json tool_result 没有 authoritative duration；两次
+                        // snapshot 的本机解析间隔不是工具执行时间，不能持久化成 0ms。
+                        duration_ms: None,
                         meta: AgentItemMeta::default(),
                     })
                 }
@@ -556,13 +550,6 @@ impl ClaudeCodeTranslator {
 }
 
 // ── field-extraction helpers ────────────────────────────────────────────────
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 fn system_status_message(parsed: &Value) -> Option<String> {
     parsed

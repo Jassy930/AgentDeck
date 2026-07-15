@@ -192,7 +192,7 @@ pub fn compiled_stable_keychain_access_group() -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn current_user_home() -> Result<PathBuf, DaemonConfigError> {
+pub(crate) fn current_user_home() -> Result<PathBuf, DaemonConfigError> {
     use std::os::unix::ffi::OsStringExt;
 
     // SAFETY: geteuid has no preconditions and only reads process identity.

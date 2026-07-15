@@ -9,12 +9,17 @@ mod connection;
 mod conversation;
 mod core;
 pub mod events;
-mod execution;
+pub(crate) mod execution;
 pub mod hub;
 pub mod model;
 pub mod namespace;
+pub mod process_identity;
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub mod production_execution_probe;
 pub(crate) mod publication;
 mod read_pool;
+pub mod recovery;
 pub mod router;
 pub mod singleton;
 pub mod snapshot;

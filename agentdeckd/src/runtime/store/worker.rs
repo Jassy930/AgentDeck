@@ -32,12 +32,12 @@ use crate::runtime::model::{
     MAX_EXECUTION_FENCE_BYTES, MAX_EXECUTION_NONCE_BYTES, MAX_IDEMPOTENCY_KEY_BYTES,
     MAX_RUNTIME_BUSY_TIMEOUT_MS, MAX_RUNTIME_STORE_COMMAND_CAPACITY,
     MAX_RUNTIME_STORE_LANE_BYTE_CAPACITY, MachineEnrollmentReceiptRecord, MarkApprovalApplied,
-    MarkApprovalDeliveryFailed, NewConversation, QueryCommandReceipt,
-    RUNTIME_STORE_SHUTDOWN_GRACE_MS, RecoveryCompletion, RecoveryCursor, RecoveryPage,
-    RegisterApproval, RegisterApprovalOutcome, RetryApprovalDelivery, RuntimeStoreConfig,
-    RuntimeStoreError, RuntimeStoreLane, RuntimeStoreOperation, RuntimeStoreSnapshot, StartCommand,
-    StartOutcome, TerminateAcceptedCommand, TerminateAcceptedOutcome,
-    TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
+    MarkApprovalDeliveryFailed, MarkConversationRecoveryBlocked, NewConversation,
+    QueryCommandReceipt, RUNTIME_STORE_SHUTDOWN_GRACE_MS, RecoveryCompletion, RecoveryCursor,
+    RecoveryPage, RegisterApproval, RegisterApprovalOutcome, RetryApprovalDelivery,
+    RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreLane, RuntimeStoreOperation,
+    RuntimeStoreSnapshot, StartCommand, StartOutcome, TerminateAcceptedCommand,
+    TerminateAcceptedOutcome, TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
 };
 use crate::runtime::read_pool::{
     DEFAULT_RUNTIME_READ_CONCURRENCY, MAX_RUNTIME_READ_PAGE_BYTES, ReadMemoryLease, ReadPool,
@@ -87,6 +87,7 @@ const IDENTITY_DERIVATION_ROOT_DOMAIN: &[u8] =
     b"agentdeck.runtime.storage-kek.identity-derivation.v1";
 const CONVERSATION_ID_DOMAIN: &[u8] = b"agentdeck.runtime.conversation-id.v1";
 const ADAPTER_STATE_KEY_DOMAIN: &[u8] = b"agentdeck.runtime.adapter-state-key.v1";
+const MACHINE_TRUST_DOMAIN: &[u8] = b"agentdeck.runtime.machine-trust-domain.v1";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -136,6 +137,24 @@ impl RuntimeIdentityDerivationCapability {
             idempotency_key.as_bytes(),
         )?;
         Ok((conversation_id, adapter_state_key))
+    }
+
+    fn derive_machine_trust_domain(&self) -> Result<[u8; 32], RuntimeStoreError> {
+        let mut mac = HmacSha256::new_from_slice(&self.key).map_err(|_| {
+            RuntimeStoreError::InvalidConfig("runtime machine trust domain is unavailable")
+        })?;
+        update_length_prefixed(&mut mac, MACHINE_TRUST_DOMAIN)?;
+        let mut digest = mac.finalize().into_bytes();
+        let mut domain = [0_u8; 32];
+        domain.copy_from_slice(&digest);
+        digest.zeroize();
+        if domain == [0; 32] {
+            domain.zeroize();
+            return Err(RuntimeStoreError::InvalidConfig(
+                "runtime machine trust domain is invalid",
+            ));
+        }
+        Ok(domain)
     }
 
     fn derive_id(
@@ -386,6 +405,10 @@ impl RuntimeStoreHandle {
         }
     }
 
+    pub(in crate::runtime) fn machine_trust_domain(&self) -> Result<[u8; 32], RuntimeStoreError> {
+        self.identity_derivation.derive_machine_trust_domain()
+    }
+
     pub(in crate::runtime) fn derive_start_identity(
         &self,
         owner: &crate::runtime::model::IdempotencyOwner,
@@ -414,6 +437,11 @@ impl RuntimeStoreHandle {
         CodexAdapterStateVault {
             store: self.clone(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn codex_adapter_state_vault_for_test(&self) -> CodexAdapterStateVault {
+        self.codex_adapter_state_vault()
     }
 
     pub(in crate::runtime) fn claude_code_adapter_state_vault(
@@ -817,6 +845,53 @@ impl RuntimeStoreHandle {
         .await?
     }
 
+    pub async fn recover_started_command_with_event(
+        &self,
+        input: super::RecoverStartedCommand,
+    ) -> Result<CompleteOutcome, RuntimeStoreError> {
+        let retained = recovery_binding_retained_allocations(&input.expected_started);
+        let charge = memory_charge(
+            size_of::<SafetyCommand>(),
+            &[
+                MAX_CRITICAL_COMMAND_RECORD_BYTES,
+                MAX_CRITICAL_COMMAND_RECORD_BYTES,
+                retained[0],
+                retained[1],
+                retained[2],
+            ],
+        )?;
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            charge,
+            |reply| SafetyCommand::RecoverStartedCommand { input, reply },
+        )
+        .await?
+    }
+
+    pub async fn mark_conversation_recovery_blocked(
+        &self,
+        input: MarkConversationRecoveryBlocked,
+    ) -> Result<ConversationRecord, RuntimeStoreError> {
+        let retained = input
+            .expected_command
+            .as_ref()
+            .map(recovery_binding_retained_allocations)
+            .unwrap_or([0; 3]);
+        let charge = memory_charge(size_of::<SafetyCommand>(), &retained)?;
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            charge,
+            |reply| SafetyCommand::MarkConversationRecoveryBlocked { input, reply },
+        )
+        .await?
+    }
+
     /// 校验全库、先清扫过期 Accepted，再冻结本次 recovery catalog high-water。
     ///
     /// begin reply 丢失且尚未读取任何页时，重复调用会返回同一 opaque cursor。
@@ -826,6 +901,18 @@ impl RuntimeStoreHandle {
             &self.lifecycle,
             RuntimeStoreLane::Read,
             |reply| ReadCommand::BeginRecoveryScan { reply },
+        )
+        .await?
+    }
+
+    pub(crate) async fn begin_recovery_verification_scan(
+        &self,
+    ) -> Result<RecoveryCursor, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::BeginRecoveryVerificationScan { reply },
         )
         .await?
     }
@@ -879,6 +966,116 @@ impl RuntimeStoreHandle {
             .try_send(ControlCommand::Shutdown { reply })
             .map_err(|_| RuntimeStoreError::WorkerStopped)?;
         await_shutdown_quiescence(result, self.shutdown_timeout).await
+    }
+}
+
+/// 计算 recovery binding 随 SafetyCommand 一起留在队列中的全部堆分配。
+///
+/// 威胁场景：攻击者或异常恢复记录把大 capacity nonce 放进 boxed fence；若只计算
+/// 外层 binding nonce，它可以绕过 safety-lane byte cap，并让队列实际内存超过门禁。
+fn recovery_binding_retained_allocations(
+    binding: &super::RecoveryBlockedCommandBinding,
+) -> [usize; 3] {
+    match binding {
+        super::RecoveryBlockedCommandBinding::Started {
+            execution_nonce,
+            fence,
+            ..
+        } => {
+            let fence = fence.as_deref();
+            [
+                execution_nonce.capacity(),
+                fence.map_or(0, |_| size_of::<super::RecoveryFenceBinding>()),
+                fence.map_or(0, |fence| fence.execution_nonce.capacity()),
+            ]
+        }
+        super::RecoveryBlockedCommandBinding::Accepted { .. } => [0; 3],
+    }
+}
+
+#[cfg(test)]
+mod recovery_binding_memory_tests {
+    use super::*;
+
+    fn nonce_with_capacity(capacity: usize, value: u8) -> Vec<u8> {
+        let mut nonce = Vec::with_capacity(capacity);
+        nonce.push(value);
+        nonce
+    }
+
+    #[test]
+    fn boxed_fence_charge_includes_object_and_both_nonce_allocations() {
+        // 威胁场景：异常记录让 fence 内部 nonce 的 capacity 远大于长度；计费必须覆盖
+        // Box heap object 与内外两份 nonce，而不是只看外层 Vec。
+        let outer_nonce = nonce_with_capacity(17, 0x11);
+        let fence_nonce = nonce_with_capacity(4_097, 0x12);
+        let binding = super::super::RecoveryBlockedCommandBinding::Started {
+            command_id: RuntimeId::from_bytes(RuntimeIdKind::Command, [0x21; 16])
+                .expect("valid command id"),
+            turn_id: RuntimeId::from_bytes(RuntimeIdKind::Turn, [0x22; 16]).expect("valid turn id"),
+            daemon_boot_id: RuntimeId::from_bytes(RuntimeIdKind::DaemonBoot, [0x23; 16])
+                .expect("valid daemon boot id"),
+            execution_nonce: outer_nonce,
+            fence: Some(Box::new(super::super::RecoveryFenceBinding {
+                command_id: RuntimeId::from_bytes(RuntimeIdKind::Command, [0x21; 16])
+                    .expect("valid fence command id"),
+                daemon_boot_id: RuntimeId::from_bytes(RuntimeIdKind::DaemonBoot, [0x23; 16])
+                    .expect("valid fence boot id"),
+                execution_nonce: fence_nonce,
+                process_group_id: 4_201,
+                leader_pid: 4_201,
+                leader_start_time: 77,
+                release_authorized_at_ms: Some(88),
+                payload_bytes: 32,
+                payload_sha256: [0x24; 32],
+            })),
+        };
+
+        let super::super::RecoveryBlockedCommandBinding::Started {
+            execution_nonce,
+            fence: Some(fence),
+            ..
+        } = &binding
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            recovery_binding_retained_allocations(&binding),
+            [
+                execution_nonce.capacity(),
+                size_of::<super::super::RecoveryFenceBinding>(),
+                fence.execution_nonce.capacity(),
+            ]
+        );
+    }
+
+    #[test]
+    fn accepted_or_unfenced_binding_has_no_hidden_box_charge() {
+        let accepted = super::super::RecoveryBlockedCommandBinding::Accepted {
+            command_id: RuntimeId::from_bytes(RuntimeIdKind::Command, [0x31; 16])
+                .expect("valid accepted command id"),
+        };
+        assert_eq!(recovery_binding_retained_allocations(&accepted), [0; 3]);
+
+        let unfenced = super::super::RecoveryBlockedCommandBinding::Started {
+            command_id: RuntimeId::from_bytes(RuntimeIdKind::Command, [0x32; 16])
+                .expect("valid command id"),
+            turn_id: RuntimeId::from_bytes(RuntimeIdKind::Turn, [0x33; 16]).expect("valid turn id"),
+            daemon_boot_id: RuntimeId::from_bytes(RuntimeIdKind::DaemonBoot, [0x34; 16])
+                .expect("valid daemon boot id"),
+            execution_nonce: nonce_with_capacity(19, 0x35),
+            fence: None,
+        };
+        let super::super::RecoveryBlockedCommandBinding::Started {
+            execution_nonce, ..
+        } = &unfenced
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            recovery_binding_retained_allocations(&unfenced),
+            [execution_nonce.capacity(), 0, 0]
+        );
     }
 }
 
@@ -1071,6 +1268,14 @@ enum SafetyCommand {
         input: CompleteCommand,
         reply: oneshot::Sender<Result<CompleteOutcome, RuntimeStoreError>>,
     },
+    RecoverStartedCommand {
+        input: super::RecoverStartedCommand,
+        reply: oneshot::Sender<Result<CompleteOutcome, RuntimeStoreError>>,
+    },
+    MarkConversationRecoveryBlocked {
+        input: MarkConversationRecoveryBlocked,
+        reply: oneshot::Sender<Result<ConversationRecord, RuntimeStoreError>>,
+    },
     TerminateAccepted {
         input: TerminateAcceptedCommand,
         reply: oneshot::Sender<Result<TerminateAcceptedOutcome, RuntimeStoreError>>,
@@ -1112,6 +1317,9 @@ enum ReadCommand {
         reply: oneshot::Sender<Result<RuntimeStoreSnapshot, RuntimeStoreError>>,
     },
     BeginRecoveryScan {
+        reply: oneshot::Sender<Result<RecoveryCursor, RuntimeStoreError>>,
+    },
+    BeginRecoveryVerificationScan {
         reply: oneshot::Sender<Result<RecoveryCursor, RuntimeStoreError>>,
     },
     LoadRecoveryPage {
@@ -1659,6 +1867,12 @@ fn handle_safety(
             SafetyCommand::CompleteCommand { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
+            SafetyCommand::RecoverStartedCommand { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::MarkConversationRecoveryBlocked { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
             SafetyCommand::TerminateAccepted { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
@@ -1701,6 +1915,18 @@ fn handle_safety(
             let result = journal::complete_command_with_event(state, config, input, &mut effects);
             let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
             let _ = reply.send(result);
+        }
+        SafetyCommand::RecoverStartedCommand { input, reply } => {
+            let mut effects = CommandStreamEffects::default();
+            let result =
+                journal::recover_started_command_with_event(state, config, input, &mut effects);
+            let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
+            let _ = reply.send(result);
+        }
+        SafetyCommand::MarkConversationRecoveryBlocked { input, reply } => {
+            let _ = reply.send(journal::mark_conversation_recovery_blocked(
+                state, config, input,
+            ));
         }
         SafetyCommand::TerminateAccepted { input, reply } => {
             let mut effects = CommandStreamEffects::default();
@@ -1804,6 +2030,12 @@ fn handle_read(
         ReadCommand::BeginRecoveryScan { reply } => {
             let mut effects = CommandStreamEffects::default();
             let result = journal::begin_recovery_scan(state, config, &mut effects);
+            let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
+            let _ = reply.send(result);
+        }
+        ReadCommand::BeginRecoveryVerificationScan { reply } => {
+            let mut effects = CommandStreamEffects::default();
+            let result = journal::begin_recovery_verification_scan(state, config, &mut effects);
             let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
             let _ = reply.send(result);
         }

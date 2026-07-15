@@ -5,6 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentdeckd::config::compiled_stable_keychain_access_group;
 
+const MAIN_SOURCE: &str = include_str!("../src/main.rs");
+
 struct TestRoot(PathBuf);
 
 impl TestRoot {
@@ -61,6 +63,63 @@ fn assert_rejected(args: &[&str], code: &str) {
         String::from_utf8_lossy(&output.stderr).contains(code),
         "args {args:?} did not expose {code}: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_source_order(label: &str, source: &str, needles: &[&str]) {
+    let mut cursor = 0;
+    for needle in needles {
+        let offset = source[cursor..]
+            .find(needle)
+            .unwrap_or_else(|| panic!("{label}: missing {needle:?}"));
+        cursor += offset + needle.len();
+    }
+}
+
+#[test]
+fn runtime_bootstrap_quiesces_owned_resources_before_releasing_singleton() {
+    // 威胁场景：Store 已打开后 Core 构造或 recovery 失败，启动路径提前返回；
+    // SQLite worker/lock 未收到 shutdown 回执，singleton 却已释放，下一实例会撞上残留资源。
+    let loop_start = MAIN_SOURCE
+        .find("fn run_main_loop(")
+        .expect("run_main_loop source");
+    let loop_end = MAIN_SOURCE[loop_start..]
+        .find("\nfn main()")
+        .map(|offset| loop_start + offset)
+        .expect("main source");
+    let loop_source = &MAIN_SOURCE[loop_start..loop_end];
+
+    assert_source_order(
+        "store construction failure cleanup",
+        loop_source,
+        &[
+            "RuntimeStoreHandle::open",
+            "RuntimeCore::new_production(store.clone(), router.clone())",
+            "store.shutdown().await",
+            "return Err(MainLoopFailure::runtime(error))",
+        ],
+    );
+    assert_source_order(
+        "core-owned cleanup",
+        loop_source,
+        &[
+            "let run_result = async",
+            ".recover_for_startup()",
+            "hub.run(",
+            "let shutdown = core.shutdown().await",
+            "run_result?",
+            "shutdown.map_err(MainLoopFailure::runtime)",
+        ],
+    );
+
+    let main_source = &MAIN_SOURCE[loop_end..];
+    assert_source_order(
+        "singleton lifetime",
+        main_source,
+        &[
+            "match run_main_loop(&config, storage_kek)",
+            "drop((key_store, singleton_guard))",
+        ],
     );
 }
 

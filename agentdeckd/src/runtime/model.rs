@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentdeck_protocol::{ActionDecision, ActionRequest, AgentKind, TurnSummary};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::approval::{ApprovalClaimantBinding, ApprovalPolicySnapshot};
@@ -71,6 +72,8 @@ pub enum RuntimeStoreOperation {
     RecordEnrollmentReceiptAfterCommit,
     CreateConversationBeforeCommit,
     CreateConversationAfterCommit,
+    MarkConversationRecoveryBlockedBeforeCommit,
+    MarkConversationRecoveryBlockedAfterCommit,
     AcceptCommandBeforeCommit,
     AcceptCommandAfterCommit,
     StartCommandBeforeCommit,
@@ -323,6 +326,7 @@ pub enum RuntimeCommitOperation {
     MigrateSchema,
     RecordEnrollmentReceipt,
     CreateConversation,
+    MarkConversationRecoveryBlocked,
     AcceptCommand,
     StartCommand,
     AppendExecutionEvent,
@@ -432,6 +436,60 @@ impl std::fmt::Debug for ConversationRecord {
 pub enum CreateConversationOutcome {
     Created { conversation: ConversationRecord },
     Replayed { conversation: ConversationRecord },
+}
+
+/// 把一个 conversation 持久化为 fail-closed recovery 状态的精确绑定。
+///
+/// Accepted 绑定只允许在副作用尚未开始时阻断队列；Started 绑定必须携带 exact
+/// boot/nonce/fence readback，避免陈旧 actor 或 recovery plan 阻断另一个 execution。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryFenceBinding {
+    pub command_id: RuntimeId,
+    pub daemon_boot_id: RuntimeId,
+    pub execution_nonce: Vec<u8>,
+    pub process_group_id: i64,
+    pub leader_pid: i64,
+    pub leader_start_time: u64,
+    pub release_authorized_at_ms: Option<u64>,
+    pub payload_bytes: usize,
+    pub payload_sha256: [u8; 32],
+}
+
+impl RecoveryFenceBinding {
+    #[must_use]
+    pub fn from_record(record: &ExecutionFenceRecord) -> Self {
+        Self {
+            command_id: record.command_id,
+            daemon_boot_id: record.daemon_boot_id,
+            execution_nonce: record.execution_nonce.clone(),
+            process_group_id: record.process_group_id,
+            leader_pid: record.leader_pid,
+            leader_start_time: record.leader_start_time,
+            release_authorized_at_ms: record.release_authorized_at_ms,
+            payload_bytes: record.payload.len(),
+            payload_sha256: Sha256::digest(&record.payload).into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RecoveryBlockedCommandBinding {
+    Accepted {
+        command_id: RuntimeId,
+    },
+    Started {
+        command_id: RuntimeId,
+        turn_id: RuntimeId,
+        daemon_boot_id: RuntimeId,
+        execution_nonce: Vec<u8>,
+        fence: Option<Box<RecoveryFenceBinding>>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkConversationRecoveryBlocked {
+    pub conversation_id: RuntimeId,
+    pub expected_command: Option<RecoveryBlockedCommandBinding>,
 }
 
 #[derive(Clone)]
@@ -836,6 +894,14 @@ pub struct CompleteCommand {
     pub command_id: RuntimeId,
     pub turn_id: RuntimeId,
     pub terminal: CommandTerminal,
+}
+
+/// startup recovery 专用 terminal mutation；除普通 command/turn CAS 外，还要求
+/// readback 的 Started intent 与完整 fence/release 记录逐字段匹配第一遍计划。
+#[derive(Clone)]
+pub struct RecoverStartedCommand {
+    pub completion: CompleteCommand,
+    pub expected_started: RecoveryBlockedCommandBinding,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

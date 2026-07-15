@@ -39,14 +39,21 @@ use super::conversation::{
     ActiveCancelResult, ConversationError, ConversationRegistry, PromptAcceptResult,
     QueuedCancelResult,
 };
-use super::execution::{DisabledExecutionCoordinator, RuntimeExecutionCoordinator};
+use super::execution::{
+    DisabledExecutionCoordinator, GatedExecutionCoordinator, RuntimeExecutionCoordinator,
+};
+use super::process_identity::SystemProcessGroupController;
 use super::read_pool::{DEFAULT_RUNTIME_READ_CONCURRENCY, ReadPool, ReadPoolError};
+use super::recovery::{
+    RecoveryOptions, RecoveryReadyPermit, RuntimeRecoveryCoordinator, RuntimeRecoveryError,
+    RuntimeRecoveryInstallError,
+};
 use super::router::AgentRouter;
 use super::snapshot::SNAPSHOT_BUILD_MEMORY_BYTES;
 use super::store::{
     CommandReceiptSelector, CommandState, ConversationDescriptor, CreateConversationOutcome,
-    IdempotencyOwner, NewConversation, QueryCommandReceipt, RuntimeId, RuntimeIdKind,
-    RuntimeStoreError, RuntimeStoreHandle,
+    NewConversation, QueryCommandReceipt, RuntimeId, RuntimeIdKind, RuntimeStoreError,
+    RuntimeStoreHandle,
 };
 use super::subscription::coordinator::SubscriptionCoordinator;
 
@@ -61,6 +68,8 @@ const CORE_DRAINING: u8 = 4;
 const CORE_STOPPED: u8 = 5;
 
 const DEFAULT_ADAPTER_CONCURRENCY: usize = 8;
+const DEFAULT_RECOVERY_TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+const DEFAULT_RECOVERY_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 const ID_DERIVATION_ATTEMPTS: u8 = 16;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 1024;
 
@@ -78,6 +87,7 @@ pub struct RuntimeCore {
     connections: ConnectionRegistry,
     subscriptions: SubscriptionCoordinator,
     conversations: ConversationRegistry,
+    recovery: RuntimeRecoveryCoordinator,
     read_pool: ReadPool,
     #[allow(dead_code)] // P3.8 UDS peer credential adapter 才会成为 production caller。
     principal_issuer: PrincipalIssuer,
@@ -89,8 +99,8 @@ pub struct RuntimeCore {
 }
 
 impl RuntimeCore {
-    /// P3.4 production 构造固定安装 fail-closed coordinator。P3.7 才会把真实
-    /// `--exec-gate` coordinator 注入这里。
+    /// Side-effect-free/test 构造固定安装 fail-closed coordinator；它只验证 Core
+    /// contract，不会把 Accepted 推进为真实 Started。production 必须使用 `new_production`。
     pub fn new(
         store: RuntimeStoreHandle,
         router: Arc<AgentRouter>,
@@ -101,6 +111,26 @@ impl RuntimeCore {
             router,
             machine_trust_domain,
             Arc::new(DisabledExecutionCoordinator),
+            DEFAULT_ADAPTER_CONCURRENCY,
+        )
+        .map_err(RuntimeCoreError::into_failure)
+    }
+
+    /// production daemon 的 exec-gate execution 构造。调用方仍必须先执行
+    /// `recover_for_startup` 取得 RecoveryReadyPermit；constructor 本身不会开放调度。
+    pub fn new_production(
+        store: RuntimeStoreHandle,
+        router: Arc<AgentRouter>,
+    ) -> Result<Self, RuntimeFailure> {
+        let machine_trust_domain = store
+            .machine_trust_domain()
+            .map_err(|error| RuntimeCoreError::Store(error).into_failure())?;
+        let execution = Arc::new(GatedExecutionCoordinator::new(router.clone()));
+        Self::with_execution_coordinator(
+            store,
+            router,
+            machine_trust_domain,
+            execution,
             DEFAULT_ADAPTER_CONCURRENCY,
         )
         .map_err(RuntimeCoreError::into_failure)
@@ -123,6 +153,14 @@ impl RuntimeCore {
             daemon_boot_id,
             adapter_concurrency,
         )?;
+        let recovery = RuntimeRecoveryCoordinator::new(
+            store.clone(),
+            Arc::new(SystemProcessGroupController),
+            RecoveryOptions {
+                term_grace: DEFAULT_RECOVERY_TERM_GRACE,
+                kill_grace: DEFAULT_RECOVERY_KILL_GRACE,
+            },
+        );
         let connections = ConnectionRegistry::new(
             DEFAULT_CONNECTION_WRITER_FRAMES,
             DEFAULT_CONNECTION_WRITER_BYTES,
@@ -146,6 +184,7 @@ impl RuntimeCore {
             connections,
             subscriptions,
             conversations,
+            recovery,
             read_pool: ReadPool::new(DEFAULT_RUNTIME_READ_CONCURRENCY)?,
             principal_issuer: PrincipalIssuer::local_only(machine_trust_domain),
             lifecycle: AtomicU8::new(CORE_COLD),
@@ -715,10 +754,19 @@ impl RuntimeCore {
         }
     }
 
-    /// 逐页消费 frozen recovery catalog；在 store `finish` 返回前 actor scheduling
-    /// gate 始终关闭。P3.7 未实现 Started orphan fencing，因此发现 Started 时明确
-    /// recovery-blocked，绝不把后续 Accepted 自动执行。
+    /// 完成 authenticated 两遍 recovery 与 Started orphan fencing；在 typed permit
+    /// 产生前 actor scheduling gate 始终关闭。
     pub async fn recover(&self) -> Result<RecoveryReport, RuntimeFailure> {
+        self.recover_for_startup()
+            .await
+            .map(|(report, _permit)| report)
+    }
+
+    /// daemon bootstrap 使用的 typed recovery 边界。P3.8 listener 与 P4 remote
+    /// transport 只能在取得该 permit 后继续各自的 bind/start 序列。
+    pub async fn recover_for_startup(
+        &self,
+    ) -> Result<(RecoveryReport, RecoveryReadyPermit), RuntimeFailure> {
         let _guard = self.recovery_lock.lock().await;
         self.lifecycle
             .compare_exchange(
@@ -728,60 +776,38 @@ impl RuntimeCore {
                 Ordering::Acquire,
             )
             .map_err(|_| RuntimeCoreError::InvalidLifecycle.into_failure())?;
-        let result = self.recover_inner().await;
-        match result {
-            Ok(report) => {
-                self.lifecycle.store(CORE_READY, Ordering::Release);
-                Ok(report)
-            }
-            Err(error) => Err(error.into_failure()),
-        }
+        self.recover_inner()
+            .await
+            .map_err(RuntimeCoreError::into_failure)
     }
 
-    async fn recover_inner(&self) -> Result<RecoveryReport, RuntimeCoreError> {
-        let mut report = RecoveryReport::default();
-        let mut cursor = self.store.begin_recovery_scan().await?;
-        loop {
-            let page = self.store.load_recovery_page(cursor).await?;
-            if let Some(recovery) = page.conversation {
-                if recovery.started.is_some() {
-                    return Err(RuntimeCoreError::RecoveryBlocked);
+    async fn recover_inner(
+        &self,
+    ) -> Result<(RecoveryReport, RecoveryReadyPermit), RuntimeCoreError> {
+        let (recovered, permit) = self
+            .recovery
+            .reconcile_and_install(|conversation, accepted| {
+                self.conversations.install(conversation, accepted)
+            })
+            .await
+            .map_err(|error| match error {
+                RuntimeRecoveryInstallError::Recovery(error) => map_runtime_recovery_error(error),
+                RuntimeRecoveryInstallError::Install(error) => {
+                    RuntimeCoreError::Conversation(error)
                 }
-                // P4 durable auth ledger 尚未接线，无法把恢复出的 remote owner 重新
-                // 绑定到精确 grant serial/authorization lease。发现这类记录必须阻断
-                // 整个 startup recovery，禁止以 owner 近似代替授权。
-                if recovery
-                    .accepted
-                    .iter()
-                    .any(|command| matches!(&command.owner, IdempotencyOwner::Remote { .. }))
-                {
-                    return Err(RuntimeCoreError::RecoveryBlocked);
-                }
-                report.conversations = report
-                    .conversations
-                    .checked_add(1)
-                    .ok_or(RuntimeCoreError::RecoveryBlocked)?;
-                report.accepted_commands = report
-                    .accepted_commands
-                    .checked_add(
-                        u64::try_from(recovery.accepted.len())
-                            .map_err(|_| RuntimeCoreError::RecoveryBlocked)?,
-                    )
-                    .ok_or(RuntimeCoreError::RecoveryBlocked)?;
-                self.conversations
-                    .install(recovery.conversation, recovery.accepted)
-                    .await?;
-            }
-            if let Some(next) = page.next_cursor {
-                cursor = next;
-                continue;
-            }
-            self.store
-                .finish_recovery_scan(page.completion.ok_or(RuntimeCoreError::RecoveryBlocked)?)
-                .await?;
-            self.conversations.enable_scheduling().await?;
-            return Ok(report);
-        }
+            })?;
+        let report = RecoveryReport {
+            conversations: u64::try_from(recovered.conversation_count())
+                .map_err(|_| RuntimeCoreError::RecoveryBlocked)?,
+            accepted_commands: u64::try_from(recovered.ready_accepted_count())
+                .map_err(|_| RuntimeCoreError::RecoveryBlocked)?,
+        };
+        self.conversations
+            .publish_ready_and_enable_scheduling(&permit, || {
+                self.lifecycle.store(CORE_READY, Ordering::Release);
+            })
+            .await?;
+        Ok((report, permit))
     }
 
     pub async fn disconnect(&self, connection_id: ConnectionId) {
@@ -938,6 +964,13 @@ impl Drop for RuntimeOperationGuard<'_> {
         if self.core.operation_inflight.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.core.operation_quiesced.notify_waiters();
         }
+    }
+}
+
+fn map_runtime_recovery_error(error: RuntimeRecoveryError) -> RuntimeCoreError {
+    match error {
+        RuntimeRecoveryError::Store(error) => RuntimeCoreError::Store(error),
+        RuntimeRecoveryError::ReconciliationInvariant => RuntimeCoreError::RecoveryBlocked,
     }
 }
 

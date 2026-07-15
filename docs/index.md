@@ -13,7 +13,7 @@
 
 - `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、Relay v2 failure code、v1 marker
   显式 reset 和排查流程。
-- `QUALITY.md`：按变更范围选择验证命令，以及 Companion MVP P2、P3.1–P3.7 typed journal 前置分片与文档结构检查入口。
+- `QUALITY.md`：按变更范围选择验证命令，以及 Companion MVP P2、P3.1–P3.7 exec-gate/production execution 与文档结构检查入口。
 - `RELAY_RUNBOOK.md`：production Relay v2 Direct TLS、本机 admin UDS、machine
   enrollment、fingerprint-bound readback/purge 与 root-lost 重新配对操作手册。
 
@@ -47,7 +47,7 @@
 ### Relay Companion MVP（2026-07-10）
 
 - `plans/2026-07-10-relay-companion-mvp-design.md`：已批准的目标架构；固定 singleton daemon、多读者/多写者串行裁决、按机器独立配对、Relay 严格最小可见与真实 iOS Companion 边界。
-- `plans/2026-07-10-relay-companion-mvp-implementation.md`：P0–P6 的逐文件 TDD 执行清单。P2.10 与 P3.5 已完成；P3.6-A Runtime/transfer contract、P3.6-B Runtime store v4、P3.6-C StoreCommitHub/barrier/backfill/snapshot/bounded transfer/fake sealed publication 与 P3.6-D 文档收口分别提交为 `7731d1e` / `02cc640` / `694f2d9` / `b668d8f`。P3.7 S1 fixture / typed adapter prepare / typed execution journal 已分别提交为 `819aa5e` / `1acf8b8` / `3f22cf0`，OS exec-gate、attach/ACK、PGID recovery 仍未实现。P3.1 的真实 provisioned signed Keychain roundtrip 仍因本机缺 provisioning profile / AMFI exit 137 而保留 1 项 ignored/gated BLOCKED；production execution、singleton UDS、transfer/publication production remote owner、真实 E2EE/Relay Publish 与远程 Companion 均未完成。
+- `plans/2026-07-10-relay-companion-mvp-implementation.md`：P0–P6 的逐文件 TDD 执行清单。P2.10、P3.5、P3.6-A/B/C/D 已完成；P3.7 在 `819aa5e` / `1acf8b8` / `3f22cf0` 前置分片之上已实现 current-binary exec-gate、typed driver/durable ACK、cooperative-descendant PGID recovery、production bootstrap、prepare 唯一 reaper 与 typed clean/unknown disposition，fresh 完整门禁和独立终审均已通过，现只待 scoped commit。P3.1 的真实 provisioned signed Keychain roundtrip 仍因本机缺 provisioning profile / AMFI exit 137 而保留 1 项 ignored/gated BLOCKED；P3.8/P3.9 singleton UDS、P3.10 LaunchAgent、transfer/publication production remote owner、真实 E2EE/Relay Publish 与远程 Companion 均未完成。
 
 ## 协议资料
 

@@ -34,10 +34,12 @@
 //!     session to apply the new setting".
 
 use crate::agent::{
-    Agent, AgentEventSender, AgentSessionHandle, CanonicalAgentEvent, CanonicalAgentEventSender,
-    CanonicalAgentSessionHandle, CanonicalHistoryRead,
+    AdapterStateHandle, Agent, AgentEventSender, AgentSessionHandle, AgentTurnRequest,
+    CanonicalAgentEvent, CanonicalAgentEventSender, CanonicalAgentSessionHandle,
+    CanonicalHistoryRead, ExecSpec, PrepareAdapterTurnCapability, PreparedAgentTurn,
 };
 use crate::codex::capabilities::{build_codex_capabilities, probe_codex_version};
+use crate::codex::driver::CodexPreparedTurn;
 use crate::codex::state::CodexStateRepository;
 use crate::codex::translate::CodexTranslator;
 use crate::runtime::store::{CodexAdapterStateVault, RuntimeId, RuntimeIdKind, RuntimeStoreError};
@@ -56,6 +58,9 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc};
+
+pub(super) const CANONICAL_CODEX_CLI_VERSION: &str = "0.144.1";
+const CANONICAL_CODEX_VERSION: &str = "codex-cli 0.144.1";
 
 /// One approval-routing entry. Carries everything `submit_decision` needs
 /// to build the right JSON-RPC response body (the body shape differs by
@@ -97,8 +102,9 @@ struct SessionHandle {
 
 /// CodexAdapter — the v2 `Agent` implementation for the Codex CLI.
 ///
-/// Cheap to construct; capability probe is cached behind `OnceLock` so
-/// the `codex --version` shell-out happens at most once per process.
+/// Cheap to construct。Legacy compatibility 实例最多 probe 一次 `codex --version`；
+/// canonical Runtime 实例预置与官方 schema 同步的固定版本，真实 app-server 在
+/// release 后 initialize 响应中做 exact readback；capability read 禁止绕过 exec gate。
 pub struct CodexAdapter {
     cli_version: OnceLock<String>,
     sessions: Arc<Mutex<HashMap<SessionId, SessionHandle>>>,
@@ -118,8 +124,10 @@ impl CodexAdapter {
     /// store 构造对应 vault；adapter 本身拿不到另一 vendor 的 capability。
     #[must_use]
     pub(crate) fn with_state_vault(vault: CodexAdapterStateVault) -> Self {
+        // 威胁场景：canonical snapshot 若在 Fence/release 外 lazy probe PATH 中的
+        // vendor binary，恶意或有副作用的 binary 会绕过唯一 spawn owner。
         Self {
-            cli_version: OnceLock::new(),
+            cli_version: OnceLock::from(CANONICAL_CODEX_VERSION.to_owned()),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             state_repository: Some(CodexStateRepository::new(vault)),
         }
@@ -752,6 +760,46 @@ impl Agent for CodexAdapter {
         self.capabilities_for_v2()
     }
 
+    async fn prepare_adapter_turn(
+        &self,
+        _capability: &mut PrepareAdapterTurnCapability,
+        request: AgentTurnRequest,
+        state: AdapterStateHandle,
+    ) -> Result<Box<dyn PreparedAgentTurn>, ProtocolError> {
+        let repository = self
+            .state_repository
+            .clone()
+            .ok_or_else(|| typed_prepare_error("codex-state-vault-unavailable"))?;
+        let resume_thread_id = repository
+            .resolve(state.key())
+            .await
+            .map_err(|_| typed_prepare_error("codex-state-resolve-failed"))?;
+
+        // 威胁场景：typed prepare 若从 daemon 继承 PATH 选择 vendor，项目目录中的同名
+        // 程序可在 gate 清空环境前被固化为绝对路径。解析必须与 gate 的固定 SAFE_PATH
+        // 使用同一信任根，且真正的 vendor process 仍只能由 exec gate 启动。
+        let program = crate::exec_gate::resolve_trusted_program("codex")
+            .ok_or_else(|| typed_prepare_error("codex-binary-not-found"))?;
+        let cwd = request.cwd().to_path_buf();
+        let exec_spec = ExecSpec::new(
+            &request,
+            state,
+            program,
+            [std::ffi::OsString::from("app-server")],
+            cwd.clone(),
+        )
+        .map_err(|_| typed_prepare_error("codex-exec-spec-invalid"))?;
+        let (_, _, prompt) = request.into_parts();
+        Ok(Box::new(CodexPreparedTurn {
+            exec_spec,
+            repository,
+            adapter_state_key: state.key(),
+            resume_thread_id,
+            cwd,
+            prompt: prompt.into_string(),
+        }))
+    }
+
     async fn start_session(
         &self,
         start: SessionStart,
@@ -1090,6 +1138,14 @@ fn adapter_state_error(error: RuntimeStoreError) -> ProtocolError {
     }
 }
 
+fn typed_prepare_error(code: &str) -> ProtocolError {
+    ProtocolError {
+        code: code.to_owned(),
+        message: "Codex typed execution preparation failed".to_owned(),
+        diagnostic_ref: None,
+    }
+}
+
 async fn deliver_approval_decision<W>(
     approval_routes: &Mutex<HashMap<String, ApprovalRoute>>,
     stdin: &Mutex<W>,
@@ -1125,7 +1181,7 @@ where
 // Body shape and persistence representation differ per approval method;
 // centralised here so the complete neutral decision is audited once.
 
-fn approval_response_body(
+pub(super) fn approval_response_body(
     method: &str,
     params: &Value,
     decision: &ActionDecision,
@@ -1184,7 +1240,7 @@ fn approval_response_body(
     }
 }
 
-fn validated_permission_profile(params: &Value) -> Result<Value, ProtocolError> {
+pub(super) fn validated_permission_profile(params: &Value) -> Result<Value, ProtocolError> {
     let profile = params
         .get("permissions")
         .and_then(Value::as_object)
@@ -1370,7 +1426,7 @@ fn validate_optional_string(value: Option<&Value>, field: &str) -> Result<(), Pr
     Ok(())
 }
 
-fn validate_absolute_normal_path(value: &str, field: &str) -> Result<(), ProtocolError> {
+pub(super) fn validate_absolute_normal_path(value: &str, field: &str) -> Result<(), ProtocolError> {
     use std::path::{Component, Path};
 
     let path = Path::new(value);

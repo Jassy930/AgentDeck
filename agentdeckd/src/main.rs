@@ -11,16 +11,16 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use agentdeckd::claude_code::ClaudeCodeAdapter;
-use agentdeckd::codex::CodexAdapter;
+use agentdeck_protocol::runtime::RuntimeFailure;
 use agentdeckd::config::{
     DaemonConfig, DaemonProfile, DaemonStartupOptions, compiled_stable_keychain_access_group,
 };
 use agentdeckd::diag;
 use agentdeckd::record;
 use agentdeckd::runtime::singleton::SingletonGuard;
-use agentdeckd::runtime::{AgentRouter, RuntimeHub};
-use agentdeckd::security::{key_store_for_config, load_or_create_storage_kek};
+use agentdeckd::runtime::store::{RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreHandle};
+use agentdeckd::runtime::{AgentRouter, RuntimeCore, RuntimeHub};
+use agentdeckd::security::{StorageKek, key_store_for_config, load_or_create_storage_kek};
 
 #[derive(Debug, Default)]
 struct CliArgs {
@@ -31,6 +31,8 @@ struct CliArgs {
     no_remote: bool,
     selfcheck: bool,
     diagnostics_report: bool,
+    exec_gate: bool,
+    production_execution_probe: bool,
     show_version: bool,
     show_help: bool,
 }
@@ -43,6 +45,42 @@ enum CliError {
     DataDirForbidden,
     ConflictingOneShotModes,
     DiagnosticsStartupFlagsForbidden,
+    ExecGateModeConflict,
+}
+
+#[derive(Debug)]
+struct MainLoopFailure {
+    code: String,
+    message: String,
+}
+
+impl MainLoopFailure {
+    fn store(error: RuntimeStoreError) -> Self {
+        Self {
+            code: error.code().to_owned(),
+            message: "runtime durable store bootstrap failed".to_owned(),
+        }
+    }
+
+    fn runtime(error: RuntimeFailure) -> Self {
+        Self {
+            code: error.code,
+            message: error.message,
+        }
+    }
+
+    fn io(error: std::io::Error) -> Self {
+        Self {
+            code: "daemon.runtime.main_loop_failed".to_owned(),
+            message: error.to_string(),
+        }
+    }
+}
+
+impl fmt::Display for MainLoopFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
 }
 
 impl CliError {
@@ -56,6 +94,7 @@ impl CliError {
             Self::DiagnosticsStartupFlagsForbidden => {
                 "daemon.cli.diagnostics_startup_flags_forbidden"
             }
+            Self::ExecGateModeConflict => "daemon.cli.exec_gate_mode_conflict",
         }
     }
 }
@@ -75,11 +114,14 @@ impl fmt::Display for CliError {
             Self::DataDirForbidden => formatter
                 .write_str("--data-dir is diagnostics-only and cannot override a daemon namespace"),
             Self::ConflictingOneShotModes => {
-                formatter.write_str("--selfcheck and --diagnostics-report are mutually exclusive")
+                formatter.write_str("one-shot modes are mutually exclusive")
             }
             Self::DiagnosticsStartupFlagsForbidden => formatter.write_str(
                 "--ephemeral/--no-remote are daemon startup flags, not diagnostics options",
             ),
+            Self::ExecGateModeConflict => {
+                formatter.write_str("--exec-gate is an internal exclusive submode")
+            }
         }
     }
 }
@@ -114,6 +156,10 @@ where
             out.selfcheck = true;
         } else if argument == OsStr::new("--diagnostics-report") {
             out.diagnostics_report = true;
+        } else if argument == OsStr::new("--exec-gate") {
+            out.exec_gate = true;
+        } else if cfg!(debug_assertions) && argument == OsStr::new("--production-execution-probe") {
+            out.production_execution_probe = true;
         } else if argument == OsStr::new("--version") || argument == OsStr::new("-V") {
             out.show_version = true;
         } else if argument == OsStr::new("--help") || argument == OsStr::new("-h") {
@@ -126,7 +172,33 @@ where
 }
 
 fn validate_cli_args(args: &CliArgs) -> Result<(), CliError> {
+    if args.exec_gate
+        && (args.profile.is_some()
+            || args.data_dir.is_some()
+            || args.ephemeral
+            || args.no_remote
+            || args.selfcheck
+            || args.diagnostics_report
+            || args.production_execution_probe
+            || args.show_version
+            || args.show_help)
+    {
+        return Err(CliError::ExecGateModeConflict);
+    }
     if args.selfcheck && args.diagnostics_report {
+        return Err(CliError::ConflictingOneShotModes);
+    }
+    if args.production_execution_probe
+        && (args.profile.is_some()
+            || args.data_dir.is_some()
+            || args.ephemeral
+            || args.no_remote
+            || args.selfcheck
+            || args.diagnostics_report
+            || args.exec_gate
+            || args.show_version
+            || args.show_help)
+    {
         return Err(CliError::ConflictingOneShotModes);
     }
     if args.data_dir.is_some() && !args.diagnostics_report {
@@ -293,23 +365,97 @@ fn run_diagnostics_report() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_main_loop() -> std::io::Result<()> {
+#[cfg(debug_assertions)]
+fn run_production_execution_probe() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            print_typed_error("daemon.debug.production_probe_runtime_failed", error);
+            return ExitCode::from(1);
+        }
+    };
+    match runtime
+        .block_on(agentdeckd::runtime::production_execution_probe::run_production_execution_probe())
+    {
+        Ok(evidence) => match serde_json::to_string(&evidence) {
+            Ok(encoded) => {
+                println!("{encoded}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                print_typed_error("daemon.debug.production_probe_encode_failed", error);
+                ExitCode::from(1)
+            }
+        },
+        Err(error) => {
+            print_typed_error("daemon.debug.production_probe_failed", error);
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_main_loop(config: &DaemonConfig, storage_kek: StorageKek) -> Result<(), MainLoopFailure> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?;
+        .build()
+        .map_err(MainLoopFailure::io)?;
+    let runtime_db = config.paths().runtime_db.clone();
 
-    runtime.block_on(async {
+    runtime.block_on(async move {
         diag::log("daemon_start", "agentdeckd main loop starting");
-        let mut router = AgentRouter::new();
-        router.register(Arc::new(CodexAdapter::new()));
-        router.register(Arc::new(ClaudeCodeAdapter::new()));
-        let hub = RuntimeHub::new(Arc::new(router));
-        let result = hub.run(tokio::io::stdin(), tokio::io::stdout()).await;
+        let store = RuntimeStoreHandle::open(RuntimeStoreConfig::new(runtime_db), storage_kek)
+            .await
+            .map_err(MainLoopFailure::store)?;
+        let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+        let core = match RuntimeCore::new_production(store.clone(), router.clone()) {
+            Ok(core) => core,
+            Err(error) => {
+                drop(router);
+                let shutdown = store.shutdown().await;
+                diag::log(
+                    "daemon_stop",
+                    &format!(
+                        "agentdeckd bootstrap failed before RuntimeCore ownership: \
+                         error={error:?} storeShutdown={shutdown:?}"
+                    ),
+                );
+                return Err(MainLoopFailure::runtime(error));
+            }
+        };
+        drop(store);
+
+        let run_result = async {
+            let (report, _recovery_ready_permit) = core
+                .recover_for_startup()
+                .await
+                .map_err(MainLoopFailure::runtime)?;
+            diag::log(
+                "runtime_recovery_ready",
+                &format!(
+                    "conversations={} acceptedCommands={}",
+                    report.conversations, report.accepted_commands
+                ),
+            );
+
+            // P3.8 将在 RecoveryReadyPermit 后绑定 RuntimeEnvelope UDS。此前保留的
+            // stdio compatibility 与 production RuntimeCore 共用同一 typed router，
+            // 但 canonical execution 只由 core 的 GatedExecutionCoordinator 驱动。
+            let hub = RuntimeHub::admin_only(router);
+            hub.run(tokio::io::stdin(), tokio::io::stdout())
+                .await
+                .map_err(MainLoopFailure::io)
+        }
+        .await;
+        let shutdown = core.shutdown().await;
         diag::log(
             "daemon_stop",
-            &format!("agentdeckd main loop exited: {result:?}"),
+            &format!("agentdeckd main loop exited: run={run_result:?} shutdown={shutdown:?}"),
         );
-        result
+        run_result?;
+        shutdown.map_err(MainLoopFailure::runtime)
     })
 }
 
@@ -321,6 +467,29 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    if args.exec_gate {
+        if let Err(error) = validate_cli_args(&args) {
+            print_typed_error(error.code(), &error);
+            return ExitCode::from(2);
+        }
+        return match agentdeckd::exec_gate::run_from_private_fd() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                print_typed_error(error.code(), error);
+                ExitCode::from(1)
+            }
+        };
+    }
+
+    #[cfg(debug_assertions)]
+    if args.production_execution_probe {
+        if let Err(error) = validate_cli_args(&args) {
+            print_typed_error(error.code(), &error);
+            return ExitCode::from(2);
+        }
+        return run_production_execution_probe();
+    }
 
     if args.show_help {
         print_help();
@@ -380,20 +549,21 @@ fn main() -> ExitCode {
     }
 
     let exit = if args.selfcheck {
+        drop(storage_kek);
         run_selfcheck(&config)
     } else {
-        match run_main_loop() {
+        match run_main_loop(&config, storage_kek) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                print_typed_error("daemon.runtime.main_loop_failed", error);
+                print_typed_error(&error.code, &error);
                 ExitCode::from(1)
             }
         }
     };
 
-    // 这三个 owner 必须覆盖完整 runtime 生命周期：lock fd、Keychain backend 与
-    // 已清零 Drop 的 StorageKEK 都不能在进入 loop 前被释放。
-    drop((storage_kek, key_store, singleton_guard));
+    // lock fd 与 Keychain backend 覆盖完整 runtime 生命周期；StorageKEK 已被
+    // RuntimeStore 消费并在派生完成后清零，selfcheck 分支则在执行前显式 drop。
+    drop((key_store, singleton_guard));
     exit
 }
 

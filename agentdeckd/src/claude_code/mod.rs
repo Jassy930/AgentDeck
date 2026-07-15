@@ -26,8 +26,50 @@
 pub mod adapter;
 pub mod auth;
 pub mod capabilities;
+mod driver;
+#[cfg(test)]
+mod driver_tests;
 pub mod history;
+mod runtime_translate;
+#[cfg(test)]
+mod runtime_translate_tests;
 mod state;
 pub mod translate;
 
 pub use adapter::ClaudeCodeAdapter;
+
+/// 真实录制 fixture 的 crate-unit-test 入口。保持 typed translator 私有，测试只取得
+/// 中立 AdapterEvent 与 terminal；integration/public API 不暴露 vendor wire parser。
+#[cfg(test)]
+pub(crate) fn translate_runtime_fixture_for_test(
+    content: &str,
+) -> Result<
+    (
+        Vec<crate::agent::AdapterEvent>,
+        Vec<agentdeck_protocol::TurnSummary>,
+    ),
+    agentdeck_protocol::ProtocolError,
+> {
+    use runtime_translate::{ClaudeCodeRuntimeOutput, ClaudeCodeRuntimeTranslator};
+
+    let mut translator = ClaudeCodeRuntimeTranslator::new();
+    let mut events = Vec::new();
+    let mut terminals = Vec::new();
+    for line in content.lines().filter(|line| !line.trim().is_empty()) {
+        for output in translator.translate_line(line)? {
+            match output {
+                ClaudeCodeRuntimeOutput::Event(event) => events.push(event),
+                ClaudeCodeRuntimeOutput::Approval { .. } => {
+                    return Err(agentdeck_protocol::ProtocolError {
+                        code: "cc-fixture-approval-unhandled".to_owned(),
+                        message: "recorded execution fixture requires an approval decision"
+                            .to_owned(),
+                        diagnostic_ref: None,
+                    });
+                }
+                ClaudeCodeRuntimeOutput::TurnComplete(summary) => terminals.push(summary),
+            }
+        }
+    }
+    Ok((events, terminals))
+}

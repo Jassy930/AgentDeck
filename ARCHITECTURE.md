@@ -27,13 +27,14 @@ AgentDeck 不做 IDE，不做通用多 agent 聊天界面，不是 Codex Desktop
 └──────────────────────────┬──────────────────────────────────────┘
                            │ Layer A 中立事件主干（AgentItem）
                            │ Layer B Vendor 控件命名空间
-                           │ Layer C 启动配置（SessionStart）
+                           │ Layer C 旧 SessionStart 模型（production stdio 拒绝）
                            ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  agentdeckd (Rust daemon)                                       │
-│  RuntimeHub（stdin loop, stdout writer, per-session lock）       │
-│       │                                                         │
-│       └─→ AgentRouter（按 sessionId.agentKind 路由）              │
+│  RuntimeHub（admin/read stdio compatibility）                   │
+│       └─ production 拒绝 SessionStart / SessionContinue          │
+│  RuntimeCore（exec-gate 已就绪；本地入口待 P3.8/P3.9）            │
+│       └─→ AgentRouter（按 conversation.agentKind 路由）           │
 │            ├─ CodexAdapter      (capabilities = {...})          │
 │            └─ ClaudeCodeAdapter (capabilities = {...})          │
 │                                                                 │
@@ -43,7 +44,7 @@ AgentDeck 不做 IDE，不做通用多 agent 聊天界面，不是 Codex Desktop
 codex app-server                       claude CLI (--print --stream-json)
 
 agentdeck-cli  (参考客户端 / 门控 E2E 驱动，不在 GUI 实时通路上)
-      │  通过 stdio JSONL 与 agentdeckd 交互（Transport trait）
+      │  stdio compatibility 仅 admin/read/selfcheck；不执行真实会话
       ▼
 agentdeckd
 ```
@@ -430,10 +431,12 @@ conversation/key，不能伪造身份连续性。
   非空或非 regular artifact 时才允许生成；store 后立即 reload 并逐字节校验。既有 state
   缺 key、非法长度、entropy/backend 失败或持久化读回变化都在打开 RuntimeStore 前终止。
 - daemon main 固定按 `config → namespace/singleton → keystore → StorageKEK → record
-  namespace → selfcheck/stdio loop` 启动，record/diagnostics 一次性绑定已验证 data root。
+  namespace → selfcheck/admin-only stdio compatibility loop` 启动，record/diagnostics 一次性绑定已验证
+  data root。
   P3.9 前 Swift/Rust stdio transport 是显式隔离的兼容路径：固定传
   `--ephemeral --no-remote --profile dev` 并清除旧 namespace env。它不触碰 stable 信任域，
-  也尚不提供多个客户端共享 singleton RuntimeCore。
+  也尚不提供多个客户端共享 singleton RuntimeCore；production main 明确拒绝旧
+  `SessionStart/SessionContinue`，真实本地会话必须等待 P3.8/P3.9 RuntimeEnvelope UDS。
 - 已有 ignored、唯一 service/account、RAII 清理的真实 Keychain roundtrip，但 P3.1 的签名
   门禁尚未通过：当前机器无匹配 provisioning profile；Apple Development 与本地
   self-signed helper 虽通过 `codesign --verify`，均被 AMFI 以 exit 137 拒绝启动。因此本节
@@ -548,8 +551,9 @@ conversation/key，不能伪造身份连续性。
   idempotency selector 都绑定 conversation，并再次校验 owner。
 - 每 conversation 一个 admission worker + actor。SQLite `commandSeq` 是 prompt FIFO 的唯一
   顺序；一个 active turn；control 最多连续优先 8 个后进入公平点；ReadPool 使用 try-acquire，
-  满载立即返回 overload。恢复页在 store finish 前只安装不调度；P4 前遇到 remote Accepted 或
-  P3.7 前遇到 Started 都 RecoveryBlocked。
+  满载立即返回 overload。恢复页在 store finish 前只安装不调度；P4 前遇到 remote Accepted 会全局
+  拒绝恢复，Started 则必须完成 exact process-group fencing/terminal reconciliation，无法证明退出的
+  conversation 才进入 RecoveryBlocked。
 - durable conversation 与常驻 actor 都以 1,024 为硬上界；connection registry 最多 128 个
   writer，principal issuer 最多保留 1,024 个 lease（含 revoked tombstone）。命中任一上界都
   fail-closed，不驱逐活跃身份、conversation 或 writer，也不创建 detached task。
@@ -562,8 +566,9 @@ conversation/key，不能伪造身份连续性。
   completion future；permit 必须同时匹配 command、daemon boot 与 committed execution nonce。
   completion 的成功值本身是 safety capability，表示精确 process group 已 reap/fence，不能只表示
   收到 vendor terminal event。Core shutdown 先进入内部 Closing、等待前台 operation 静默并封住
-  actor start lease，之后才公开 Draining；因此 Draining 可见后 durable Started 不再增长。P3.7
-  前 production coordinator 固定 disabled，不得用 fake PID/fence 把 Accepted 伪装成真实执行。
+  actor start lease，之后才公开 Draining；因此 Draining 可见后 durable Started 不再增长。普通
+  production 构造固定使用 current-binary exec-gate coordinator；disabled/fake coordinator 只允许
+  side-effect-free contract tests，不得用 fake PID/fence 把 Accepted 伪装成真实执行。
 
 ### Relay Companion MVP P3.5 approval 不变量
 
@@ -608,15 +613,21 @@ conversation/key，不能伪造身份连续性。
   high-water 和 ledger 更新必须在一个 Safety transaction 内提交；先 durable terminal+expiry，后
   cancel/await delivery worker。terminal COMMIT outcome unknown 只能以同一 completion input 精确
   重放到 `Completed/Replayed`，不得把已提交完成的 conversation 永久误锁为 RecoveryBlocked。
+  approval deadline 自己先 durable 写入 Expired 时，不得向 vendor 合成 Deny；actor 只对 exact active
+  execution 做 fence，并在同一个 terminal race gate 中预占 `Interrupted`（已成功的用户 Cancel 仍是
+  `Canceled`）。fence 后 daemon terminal pipeline 还有 10 秒有界窗口；若仍未产生 durable terminal，
+  watchdog 必须保留 Started、把 conversation 标为 RecoveryBlocked 并停止后续 Accepted，不能伪造
+  Interrupted COMMIT。
   P3.5 recovery 只认证 active approval；只要 Started process group
   尚无 fencing 证据，就保持 RecoveryBlocked、停止 delivery 且不伪造 Expired/Interrupted，也不
   恢复后续 Accepted。
 - Codex approval route 已按精确 active session/request 绑定，kind/persist 完整映射，只有整帧
-  newline+flush 后才移除 route；错误或不明 outcome 保留 route 并 fail-close。Claude Code 的
-  speculative permission wire 尚无 recorded fixture/live gate，因此 production capabilities 仍
-  隐藏 Approval。P3.5 仅用 side-effect-free fake 验证 common store/actor/worker；真实
-  `RuntimeExecutionEvent`、exec-gate 与 Codex/Claude Code live vendor approval 仍属于 P3.7，不能
-  作为本阶段已完成能力宣传。
+  newline+flush 后才移除 route；错误或不明 outcome 保留 route 并 fail-close。P3.7 canonical Claude
+  Code driver 使用 `--permission-prompt-tool stdio`，只接受已录制验证的 stdio
+  `control_request/control_response`，typed capability builder
+  广告 Approval；legacy compatibility builder 对 speculative permission wire 继续隐藏 Approval。
+  P3.5 仅用 side-effect-free fake 验证 common store/actor/worker；已登录 Codex/Claude Code live
+  approval 仍需独立 gated evidence，不能反写为 P3.5 的完成能力。
 
 ### Relay Companion MVP P3.6 canonical stream 不变量
 
@@ -670,8 +681,8 @@ conversation/key，不能伪造身份连续性。
   seal、MachineDataSign、Keychain CounterGuard 或 Relay Publish；这些仍属于 P4，不能从本节推出
   远程 Companion 已接通。
 - P3.6 仍是 transport-neutral component layer。`TransferStateMachine` 与 publication dispatcher
-  尚无 production remote owner；App/CLI 尚未通过 P3.8/P3.9 singleton UDS 连接该 Core，production
-  coordinator 仍 disabled，P3.1 provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate；
+  尚无 production remote owner；App/CLI 尚未通过 P3.8/P3.9 singleton UDS 连接该 Core，P3.1
+  provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate；
   Simulator fixture、fake publication 与本地 store tests 都不是 P4/P5/P6 证据。
 - Store worker 初始化/migration 的 ready error 必须在 path lease 已释放后才对 caller 可见；同进程
   exact reopen 不依赖 polling，也不能把短暂 `StoreAlreadyOpen` 伪装成 migration recovery 结果。
@@ -682,7 +693,7 @@ conversation/key，不能伪造身份连续性。
   持有到 ReadPool 关闭、path lease 释放。该 admission 不编入 production，不改变 production Store、
   固定 8-reader ReadPool 或任何运行时资源配额。
 
-### Relay Companion MVP P3.7 typed execution journal 前置不变量
+### Relay Companion MVP P3.7 exec-gate 与 orphan recovery 不变量
 
 - `ExecutionId` 只包装 durable command identity；`AgentTurnRequest` 只携 exact execution、绝对 cwd
   与已过 Runtime 上界的 prompt；`AdapterStateHandle` 只接受 AdapterState kind。`ExecSpec` 同时绑定
@@ -700,9 +711,64 @@ conversation/key，不能伪造身份连续性。
   COMMIT；COMMIT-unknown 只允许 exact eventId replay。open-time audit 验证 event seq/time、
   Started/terminal 区间、command/turn binding 与 approval totals；即使 release MAC 有效，也必须满足
   `startedAt <= releaseAuthorizedAt <= terminalAt`（无 terminal 时只验下界），schema 仍为 v4。
-- 该分片尚未实现 `GatedChild/attach`、私有 FD、PGID/start-time、terminal 前 durable AdapterEvent ACK
-  join 或两遍 orphan recovery。production coordinator 必须继续 disabled，P3.8 也不得在
-  `RecoveryReadyPermit` 之前 bind UDS。
+- adapter 只可从与 gate 最终环境相同的固定绝对目录集合解析 basename vendor program：系统目录固定，
+  macOS 追加由 `getpwuid_r(geteuid())` 获取的当前 OS account `~/.local/bin`；不读取继承 HOME/PATH。
+  相对路径与带 `/` 的 program name 都不能参与选择。gate 与 vendor `env_clear` 后只恢复固定非秘密
+  allowlist，program/cwd/argv、prompt、nonce、release token 均不进入 gate argv/env。信任根是正确的
+  OS account、当前签名 daemon binary、固定 vendor 安装目录及其中预期的 vendor binary；同一 account
+  主动替换被信任 binary 超出本 gate 的证明边界。
+- PGID fence 防御的具体场景是 daemon 在 Started 后崩溃、取消或丢失 execution owner，而仍留在继承
+  PGID 的 cooperative vendor/tool descendants 继续产生副作用。MVP 要求这些子孙不主动 `setsid`/
+  `setpgid`，也不通过 `launchd`/launch service 或其他 supervisor 脱离；显式自守护/逃逸是流程外
+  不支持行为，当前机制不声称检测、枚举或收割，也不得声称它会触发 `RecoveryBlocked`。该类工具需要
+  另行采用真正执行域隔离。
+- current-binary `--exec-gate` 只经固定私有 FD 接收有界 ADGX frame，先建立独立 PGID，再回报
+  leader PID/start-time、nonce 与随机 token commitment。daemon 只有在 ExecutionFence 与 release
+  authorization exact COMMIT 后才能消费一次性 permit；adapter 只取得私有 stdin/stdout/stderr，拿不到
+  release capability 或 child owner。release 前 vendor 尚未 exec，任何 vendor/tool 副作用必须为零。
+- Codex/Claude Code typed driver 的 attach 保持 cold；prompt 只在 release 后写入私有 stdin。
+  `AdapterItemKey` 是 vendor-neutral correlation；每个已接收 event 必须等 exact Store COMMIT ACK，
+  completion 必须 join event/approval bridge、验证整个 PGID 已退出后才允许 terminal。blocked gate 从
+  prepare 成功起必须由唯一 reaper 持有 `Child`；release 前 cancel/cleanup 也必须 TERM→KILL 后 await/reap，
+  不能让 zombie sentinel 被误判为仍存活。completion/actor owner 使用 abort-on-drop ownership，任何
+  owner 被丢弃都必须收割同组 cooperative descendants；忽略 TERM 的 group 在 4 秒内层预算升级 KILL，
+  actor 的 6 秒外层预算必须覆盖该过程、reap 与 readback。
+- typed driver 与 legacy stdio translator 是两条明确边界：typed Runtime 不持久化 Raw、VendorPanel 或
+  原始 stderr；Claude Code 2.1.207 已核实的 status/hook/task/tool lifecycle/progress 先校验封闭 shape，
+  再作为非持久化控制帧消费，未知 subtype/patch 继续 fail-close。
+  canonical approval summary 只能从已验证的最小动作 allowlist 生成，并先做 source pre-cap 与 secret
+  redaction。Codex 自由文本使用可见 JSON 编码保留换行/控制符边界，固定上限内无法完整展示就
+  fail-close；CC 折叠控制字符并做 UTF-8 安全截断。完整 raw frame、CC permission suggestions、未选中的
+  input 与 blocked path 禁止进入 durable `ActionRequest`。Codex command 缺少具体 command、完整
+  commandActions 或已验证 network target，file request 未绑定同一 in-flight fileChange 的非空 proposed
+  changes，CC 缺 tool-specific path/command 或 tool 未建模，以及 permission profile 为空/过大时都必须
+  fail-close；可选 grantRoot/reason 不能单独构成 file action。Codex permission
+  summary 必须复用 adapter 的官方 profile validation，并展示实际回送的 read/write/entries/glob/network
+  profile 的完整字段结构与脱敏投影；adapter 响应仍回送已验证的原始字段值。Codex route/output Debug
+  必须隐藏 raw request/params。Codex completed item 必须与 started kind
+  exact 一致，shell terminal 只接受 `completed/failed/declined`，其余状态拒绝且不消费 in-flight state。
+  CC `tool_result` 没有权威单工具耗时或进程退出码，canonical/legacy/history Shell 固定
+  `duration_ms=None`、`exit_code=None`，不能拿 turn 总耗时、本机解析间隔或 `is_error` 伪造精确值。
+  CC `result` 只有精确的 success、`is_error=false`、有效 `duration_ms`、
+  `terminal_reason=completed` 且没有 deferred tool 时才能形成 TurnComplete。
+- approval durable Expired 不向 vendor 合成 Deny，也不设置用户 cancel；只调用 exact execution fence。
+  正常收口是 Interrupted，已有成功用户取消则保留 Canceled。若 fence 已成功但 driver/forwarder/
+  terminal pipeline 仍不返回，10 秒 watchdog 把 exact conversation 标 RecoveryBlocked、abort active
+  task 且不启动 queued work，不能伪造 durable terminal。
+- 启动 recovery 固定两遍 authenticated cut。第一遍分类并清理 Started orphan，第二遍按同一 cut 逐页
+  复核/安装；任何 remote Accepted 在安装 actor 前全局拒绝。release 前 crash 关闭 gate group，release
+  后 crash 标 Interrupted/unknown outcome 且不重放；PID start-time mismatch 不发 signal，TERM→KILL 后
+  仍无法证明已知 PGID 内 cooperative descendants 退出则只把该 conversation 标 RecoveryBlocked。
+  `execution.prepare` 必须返回 typed disposition：确认没有创建 child 的普通失败直接写 Interrupted，
+  不能升级为 RecoveryBlocked；只有 gate identity 或同组清理结果不确定时才 fail-close。
+- `RecoveryBlocked` lifecycle CAS 对 Accepted 绑定 exact command；对 Started 绑定 exact
+  command/turn/boot/nonce 与 compact fence（process identity、release time、payload length/SHA-256），
+  不在内存复制完整 fence payload。recovery 完成才产生不可构造的 `RecoveryReadyPermit`；P3.8 仍不得
+  在该 permit 之前 bind UDS。
+- debug-only production wiring probe 由真实 daemon binary 内部调用 `spawn_current`，不接受 binary/root
+  注入；它原子创建并 RAII 清理随机临时目录，用 `/bin/sh` 无副作用 helper 贯穿
+  Core/actor→coordinator→current-binary gate→typed driver→durable ACK→terminal，并在 reopen/backfill
+  后读回 item/terminal。该 CLI 不编入 release，也不是已登录 vendor 或跨设备证据。
 
 ### R1a 隐含约束（历史参考）
 
@@ -715,12 +781,13 @@ Swift UI
   -> CapabilityRouter（按 SessionCapabilities 派发）
   -> WorkbenchModel / ThreadRuntimeModel / SessionModel / HistoryModel
   -> AgentDeck IPC models（来自 agentdeck-protocol v2）
-  -> daemon stdio
+  -> daemon stdio compatibility（admin/read；SessionStart/Continue 被拒绝）
 
 daemon main
   -> config → namespace / singleton → KeyStore / StorageKEK
   -> ipc（re-export agentdeck-protocol）
   -> RuntimeCore → StoreCommitHub / subscription / snapshot
+  -> P3.7 exec-gate / typed driver（local RuntimeEnvelope ingress 待 P3.8/P3.9）
   -> transport-neutral P3.6 component → transfer / publication（production owner 待 P4）
   -> AgentRouter → CodexAdapter / ClaudeCodeAdapter
   -> record / diag
@@ -728,8 +795,8 @@ daemon main
 
 agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
   -> agentdeck-protocol（共享类型）
-  -> Transport trait（P3.1 compatibility ProcessTransport → explicit ephemeral/no-remote stdio）
-  -> isolated daemon child process；P3.9 后改为 stable daemon UDS
+  -> Transport trait（P3.1 explicit ephemeral/no-remote stdio compatibility，仅 admin/read）
+  -> isolated daemon child process；真实会话入口与 stable daemon UDS 待 P3.8/P3.9
 ```
 
 允许的跨层访问应沿上图向下：

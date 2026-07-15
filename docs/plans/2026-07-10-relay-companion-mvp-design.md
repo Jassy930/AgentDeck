@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P2.10、P3.5 与 P3.6-A/B/C/D 已完成，P3.6 分别提交为 `7731d1e`/`02cc640`/`694f2d9`/`b668d8f`；P3.7 S1 fixture/typed adapter prepare/typed execution journal 已分别提交为 `819aa5e`/`1acf8b8`/`3f22cf0`，OS exec-gate/recovery 仍未完成；P3.1 签名 Keychain 仍有 1 项 ignored/BLOCKED，P3 整体未完成（2026-07-15） |
+| 状态 | Approved target；P2.10、P3.5 与 P3.6-A/B/C/D 已完成；P3.7 已裁决采用 cooperative-descendant PGID 边界，current-binary exec-gate、typed driver/durable ACK、PGID fencing、两遍 recovery、prepare 唯一 reaper 与 typed clean/unknown disposition 均已实现；最终完整自动门禁与独立终审已通过，当前只待 scoped commit；前置分片为 `819aa5e`/`1acf8b8`/`3f22cf0`；P3.1 签名 Keychain 仍有 1 项 ignored/BLOCKED，P3.8–P6 仍未完成（2026-07-15） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-01-agentdeck-mobile-relay-design.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -22,9 +22,14 @@
 - 取代生产 TLS 配置失败时回退明文的行为。
 
 本文不宣称当前代码已经具备全部目标能力。截至 2026-07-15，Relay v2 cutover/P2.10、RuntimeCore/
-approval 与 P3.6 transport-neutral stream component（`694f2d9`）已落地；P3.7 typed journal/adapter
-前置分片已按 `819aa5e` / `1acf8b8` / `3f22cf0` 收口，但 App/CLI singleton UDS、P3.7 OS exec gate/recovery、
-P4 Machine identity/E2EE/Relay Publish 和真实 Companion 仍未完成，iOS 仍只有 fixture 驱动骨架。
+approval 与 P3.6 transport-neutral stream component（`694f2d9`）已落地；P3.7 current-binary
+exec-gate/recovery 已实现，cooperative-descendant PGID 边界已裁决；release 前唯一 reaper、调用 Tokio
+`Command::spawn()` 前可证明无 child 的 clean prepare failure，以及从调用 Tokio spawn 起的 unknown
+failure 分类已经修复；最终完整自动门禁与独立终审均已通过，当前只待 scoped commit。
+fixture/typed adapter/typed journal 前置分片为 `819aa5e` / `1acf8b8` /
+`3f22cf0`。
+App/CLI singleton UDS、LaunchAgent、P4 Machine identity/E2EE/Relay Publish 和真实 Companion 仍未完成，
+iOS 仍只有 fixture 驱动骨架。
 P3.1 provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate。完整实施仍必须满足 §17 的
 Definition of Done。
 
@@ -461,10 +466,14 @@ create 与首 prompt 拼成一个无法原子重放的请求。
 2. 在 command journal 中写入 principal、idempotency key、payload hash、commandSeq 和 `Accepted` 状态。
 3. 事务提交后返回 `CommandReceipt::Accepted(queuePosition)`。
 4. actor 取到队首后，在 **同一个 SQLite 事务** 把 command 状态写为 `Started(executionNonce)`、写入 `ExecutionIntent(daemonBootId, executionNonce)`，并把 canonical `CommandStarted` event 写入 event journal；事务提交完成前不得 spawn/调用 adapter。
-5. 事务提交后 spawn 同一已签名 `agentdeckd --exec-gate` 子模式：gate 先建立独立 process group 并在 exec vendor 前阻塞，通过私有 pipe 回报 `processGroupId/leaderPid/leaderStartTime/executionNonce`。`prepare` 只能返回 blocked gate 的 control 与 **cold release capability**，不能返回已热启动的 completion future；daemon 在第二个事务把进程值提升为 `ExecutionFence`，再把 `authorizeExecutionRelease` 的 COMMIT 回执封装为不可伪造、单次消费的 release permit。gate 只有 capability 消费该 permit 且 token/nonce 匹配才 exec vendor，随后才产生 completion future。adapter 参数准备可以在 release 前完成，但任何 vendor/tool 副作用都不能越过 gate。
+5. 事务提交后 spawn 同一已签名 `agentdeckd --exec-gate` 子模式：gate 先建立独立 process group 并在 exec vendor 前阻塞，通过私有 pipe 回报 `processGroupId/leaderPid/leaderStartTime/executionNonce`。`prepare` 只能返回 blocked gate 的 control 与 **cold release capability**，不能返回已热启动的 completion future；daemon 在第二个事务把进程值提升为 `ExecutionFence`，再把 `authorizeExecutionRelease` 的 COMMIT 回执封装为不可伪造、单次消费的 release permit。gate 只有 capability 消费该 permit 且 token/nonce 匹配才 exec vendor，随后才产生 completion future。adapter 参数准备可以在 release 前完成，但任何 vendor/tool 副作用都不能越过 gate。blocked gate 从创建起必须由唯一 reaper 持有并等待；release 前 cancel/cleanup 也必须 TERM→KILL 后消费该 child，不能让 zombie sentinel 被误判成未退出进程组。vendor program 只从与 gate 最终环境相同的固定绝对目录集合解析 basename，不读取继承 PATH；正确 OS account、当前签名 daemon binary、固定 vendor 安装目录及其中预期 binary 是本机制的流程外信任根，同一 account 主动替换被信任 binary 不在 gate 的证明边界内。
 6. 结果先写 journal/event journal，再广播 `Completed/Failed/Interrupted`。
 
 排队 prompt 可以在 Started 前取消；已经 Started 的 turn 只能走明确 cancel，不允许删除 journal 伪装未发生。四个 crash gap 固定为：Started COMMIT 前无 child、COMMIT 后未 spawn 为 Interrupted；gate ready 但 Fence COMMIT 前或 Fence COMMIT 后未 release 时 pipe 关闭使 gate 自退，启动时仍清理该 group；release 后崩溃按可能已有 vendor 副作用处理并 fencing。所有 Started crash 都保守标 `Interrupted/unknown outcome` 而不自动重放。
+
+`execution.prepare` 的失败必须携带 typed disposition：若能确认没有创建任何 child，直接以
+Interrupted 收口并允许队列继续；只有 gate identity 已不确定或已知 PGID 无法完成同组清理时，才进入
+`RecoveryBlocked`。不得把普通 program-not-found/参数准备失败永久冻结 conversation。
 
 ### 8.5 Approval first-wins
 
@@ -478,6 +487,11 @@ create 与首 prompt 拼成一个无法原子重放的请求。
 状态为 `Pending → Claimed(decision, request) → Applying → Applied | DeliveryFailed ↗ Applying | Expired`。`DeliveryFailed` 是保留赢家决定的可重试状态，不是“已应用”终态；赢家先持久化再投递 adapter，一旦 Claimed，另一决定永远不能覆盖。
 
 delivery 由 daemon 拥有而不是由赢家客户端拥有：每个自动 retry budget 最多 8 次且总计不超过 60 秒，使用有界指数退避；action capability 没有给 approval deadline 时，daemon 使用 request 创建后 30 分钟的默认 deadline。达到 retry budget 但 deadline 未到则进入 DeliveryFailed 并停止自动循环；任一仍有审批权限的客户端都可以调用 `RetryApprovalDelivery(approvalId)` 启动 **同一已 claim 决定** 的新一轮 8 次/60 秒 budget，不能提交新决定。后到客户端收到 `ApprovalReceipt::AlreadyHandled(decision, state)`，其中 state 精确为 `claimed/applying/applied/deliveryFailed/expired`，不能把 DeliveryFailed 冒充最终 Applied。deadline、turn 结束或中断时未投递成功的 claim 进入 Expired 并产生 canonical event；默认不会无限占用 actor。
+
+Claude Code canonical typed driver 使用 `--permission-prompt-tool stdio`，只对已验证的 stdio
+`control_request(can_use_tool)` 广告 Approval，并在 durable registration 后写 `control_response`；
+legacy compatibility builder 与 hook/lifecycle 控制帧都不广告该能力。
+筛选录制只能证明 wire/持久化 contract，已登录 live vendor approval 仍是 gated 验收项。
 
 iOS/macOS 不得在 daemon receipt 前把卡片写成 approved/denied。
 
@@ -502,11 +516,13 @@ conversation-scoped command ledger 与 conversation catalog 同生命周期；ar
 
 本机 Runtime DB 使用 SQLite WAL，存：conversation catalog 与中立 `adapterStateKey`、各 adapter 私有映射 namespace、command journal、approval ledger、event journal/index、snapshots、stream/key epochs、设备 HPKE 公钥目录、wrapped DEK、counter reservations、receive replay state、auth/revocation ledger 和短期 pairing state。MachineRoot、endpoint 私钥、StorageKEK 与 CounterGuard 只在 Keychain；所有敏感 DB rows 用 StorageKEK 包装。
 
-每个 Started turn 先持久化不含 PID 的 `ExecutionIntent(daemonBootId, executionNonce)`，再按 §8.4 的 blocked exec-gate 两阶段协议持久化 `ExecutionFence(daemonBootId, executionNonce, processGroupId, leaderPid, leaderStartTime, releaseAuthorizedAt)`。`releaseAuthorizedAt` 只表示 daemon 已提交“允许 release”的安全边界，不证明 token 已送达或 vendor 已 exec，因此 crash 后仍按 unknown outcome。adapter 必须把 vendor child/tool subprocess 放入该独立 process group/job，默认继承同一 fence；daemon crash/restart 后，在恢复任何同 conversation 的 Accepted queue 前，先按 PID start time 校验并 TERM→KILL 已知 orphan group。若无法证明整个 group 已退出（例如 vendor 逃逸/权限错误），该 conversation 进入 `RecoveryBlocked`，不恢复后续命令，直到本地用户完成诊断/清理；绝不能一边把旧 turn 标 Interrupted、一边启动新 turn。
+每个 Started turn 先持久化不含 PID 的 `ExecutionIntent(daemonBootId, executionNonce)`，再按 §8.4 的 blocked exec-gate 两阶段协议持久化 `ExecutionFence(daemonBootId, executionNonce, processGroupId, leaderPid, leaderStartTime, releaseAuthorizedAt)`。`releaseAuthorizedAt` 只表示 daemon 已提交“允许 release”的安全边界，不证明 token 已送达或 vendor 已 exec，因此 crash 后仍按 unknown outcome。adapter 必须把 vendor child/tool subprocess 放入该独立 process group，并要求 cooperative descendants 不主动 `setsid`/`setpgid`、不通过 `launchd`/launch service 或其他 supervisor 脱离继承 PGID。daemon crash/restart 后，在恢复任何同 conversation 的 Accepted queue 前，先按 PID start time 校验并 TERM→KILL 已知 orphan group；无法证明该 PGID 内进程全部退出时，conversation 进入 `RecoveryBlocked`，不恢复后续命令。
+
+P3.7 的具体威胁场景是：daemon 在 Started 后崩溃、被取消或丢失 execution owner，仍留在继承 PGID 的 vendor 及其子孙可能继续产生重复副作用；exec-gate 用 release 前零 vendor 副作用、同组 TERM→KILL/reap 与后续 queue fencing 防止这种并行执行。显式自守护，或主动使用 `setsid`/`setpgid`、launch service 逃离 PGID，属于流程外不支持的 vendor/tool 行为；MVP 不声称检测、枚举或收割该类逃逸，也不得把原 PGID 已退出解释为逃逸进程不存在，或声称逃逸会触发 `RecoveryBlocked`。需要运行此类工具时必须另行设计 VM/container、专用执行身份或具备系统级进程约束的执行域。
 
 - 已 Accepted 但未 Started 的命令：按 commandSeq 恢复执行。
 - 已 Started 且无终态：重启后标 `Interrupted/unknown outcome`，绝不自动重放 vendor 副作用。
-- 只有 ExecutionFence 证明旧 vendor process group 已退出后，才恢复该 conversation 的 Accepted queue；无法 fencing 时保持 RecoveryBlocked。
+- 只有 ExecutionFence 证明旧 vendor process group 内的 cooperative descendants 已退出后，才恢复该 conversation 的 Accepted queue；无法 fencing 该已知 PGID 时保持 RecoveryBlocked。
 - active approval 随中断 turn 失效。
 - vendor history 继续是完成会话真相；daemon snapshot 合并 vendor history 与 active runtime state。
 - 普通重启恢复 grant/key directory、counter guard、receive replay state、Accepted queue、catalog/event high-water 与 backfill journal；随后 UDS/WSS 重连，配对不变。
@@ -761,7 +777,10 @@ P3.6 的 `TransferStateMachine` 目前没有 production remote ingress owner；P
   P3.6-B 已由 `02cc640` 落地 Runtime store v4 与 read-only WAL pool。
 - P3.6-C 已由 `694f2d9` 提交 StoreCommitHub、Catalog/Conversation 共用 barrier、paced egress gate、
   authenticated backfill/snapshot、bounded transfer reducer 与 publication freeze/COMMIT/ACK/restart
-  状态机；P3.6-D 已由 `b668d8f` 完成独立文档收口，当前进入 P3.7，但整个 P3 仍未完成。
+  状态机；P3.6-D 已由 `b668d8f` 完成独立文档收口。P3.7 exec-gate/recovery 边界已裁决，两个
+  prepare finding 与 translator 阻断项已修复，完整自动门禁与独立终审均已通过，当前只待 scoped
+  commit；整个 P3 也仍因 P3.1
+  外部门禁与 P3.8–P3.10 未完成而保持未完成。
 - 已读回的 scoped 证据是 `runtime_stream` 45/45、`runtime_transfer` 17/17、subscription 36/36、
   daemon lib 464/464（`runtime::` 366 项），默认并发 `cargo test -p agentdeckd` exit 0；Swift
   256 XCTest + 35 Swift Testing，protocol/schema、fmt、clippy、daemon no-net 与 diff gate 均通过。
@@ -1128,7 +1147,7 @@ Relay 外层错误只描述通用路由/传输失败；daemon 业务错误必须
 - Relay 在 SQLite COMMIT 前/后崩溃。
 - daemon 在 Accepted 前、Accepted 后未 Started、Started 后崩溃。
 - daemon 分别在 Started COMMIT 后未 spawn、gate ready/Fence COMMIT 前、Fence COMMIT 后/release 前、release 后四个边界崩溃。
-- daemon 父进程崩溃但 vendor process group 仍存活；验证新 daemon 要么清理并确认退出，要么进入 RecoveryBlocked，绝不启动同 conversation 后续 Accepted command。
+- daemon 父进程崩溃但 cooperative vendor process group 仍存活；验证新 daemon 要么清理并确认同组进程退出，要么进入 RecoveryBlocked，绝不启动同 conversation 后续 Accepted command。另用显式 `setsid`/`setpgid`/launch service 样本证明其属于不支持边界，测试不得把它写成可检测或会触发 RecoveryBlocked。
 - counter guard 更新后、DB reservation 写入前崩溃；Runtime DB 回滚到旧备份。
 - Store 返回 IO/full/busy/migration error。
 - 单个 slow device writer 满、恶意 oversized/rate flood。
@@ -1197,7 +1216,7 @@ bash scripts/verify-relay-companion-mvp.sh
 3. **真实独立配对**：iPhone 用 5 分钟单次邀请发起配对，被控机器本地 App/CLI 必须显示并确认 DeviceSign fingerprint，远端与 Relay 管理员均不能自批；keys 落 ThisDeviceOnly Keychain；第二台机器必须单独配对；完全相同 PairRequest 丢响应后只取回同一 grant。
 4. **真实双 agent 控制**：iPhone 能查看、继续并审批真实 Codex 和 Claude Code 会话，收到完整 canonical stream。
 5. **多写者确定性**：本地 macOS App、远程 macOS、iPhone、远程 CLI 同时写同一 conversation；prompt FIFO；审批只有一个不可变赢家，所有端读到精确 delivery state。
-6. **普通重启连续**：clean daemon restart 后恢复 grant/key directory、counter/replay guard、Accepted queue、catalog/event high-water 和 daemon backfill；iOS 前后台、网络切换、Relay restart 都不需重配、不复用 nonce、不重复副作用。Started command crash 明确为 `Interrupted`；故意让 vendor child 在父进程崩溃后存活时，新 daemon 必须先 fencing 成功或 RecoveryBlocked，不能并行启动下一 turn。
+6. **普通重启连续**：clean daemon restart 后恢复 grant/key directory、counter/replay guard、Accepted queue、catalog/event high-water 和 daemon backfill；iOS 前后台、网络切换、Relay restart 都不需重配、不复用 nonce、不重复副作用。Started command crash 明确为 `Interrupted`；故意让仍留在继承 PGID 的 cooperative vendor child 在父进程崩溃后存活时，新 daemon 必须先 fencing 成功或 RecoveryBlocked，不能并行启动下一 turn。显式自守护/逃逸不在此完成标准内，也不能据此声称已检测或收割。
 7. **撤销与 reset 闭环**：以 Relay 提交 revocation 事务为计时点，2 秒内发送/尝试发送 signed terminal state 并关闭连接；后续 challenge/frame 被拒，剩余设备完成 key rotation。另有两条演练：有 root 的 RetireMachine purge，以及 root 丢失的 admin purge；两者都证明旧 grant、route、retained ciphertext 已删除/不可访问，再重新配对。
 8. **daemon 来源可验证**：恶意 paired device 与主动恶意 Relay 都不能伪造 MachineDataSign 保护的 catalog/event/snapshot；link/grant/key revision 回退、nonce reuse 与 DB rollback 都 fail-closed。
 9. **Relay 严格最小可见**：sentinel machine/session/prompt/output/approval/vendor reference 在 Relay DB、日志、metrics 和外壳中均无明文；只出现 §2.3 明列的元数据。
@@ -1241,7 +1260,7 @@ MVP 完成不扩展到 APNs、后台常驻、离线 transcript、附件、多租
 | UDS/launchd 迁移破坏现有 App/CLI | RuntimeCore 先 transport-neutral；stdio compatibility 保留到 P6；两个本地 client E2E 作为 P3 gate |
 | Relay SQLite 写延迟或磁盘耗尽 | store task、硬 count/bytes/disk caps、disk-low readiness、合成负载和 fault injection |
 | vendor command 在 crash 边界结果不明 | Accepted/Started 分界持久化；Started 后 crash 标 Interrupted，禁止自动重放 |
-| vendor child 在 daemon crash 后继续运行 | blocked exec-gate + persisted ExecutionFence + process-group TERM/KILL；无法证明退出则 RecoveryBlocked，不恢复同 conversation queue |
+| cooperative vendor child 在 daemon crash 后继续运行 | blocked exec-gate + persisted ExecutionFence + process-group TERM/KILL/reap；无法证明已知 PGID 退出则 RecoveryBlocked，不恢复同 conversation queue。显式 `setsid`/`setpgid`/launch service 逃逸是流程外不支持行为，不声称检测或收割 |
 | 自签 Relay 证书更新导致 pin 失效 | enrollment/invite/key directory 携带 current+next SPKI pinset，先分发 next 再切换；错过窗口重新取得 PairInvite，不提供绕过按钮 |
 | iOS 后台限制被误解为通知能力 | UI/文档明确“前台在线、后台暂停”；APNs 留到独立设计 |
 | 多写者让用户误以为本地端优先 | 所有端显示 daemon queue/approval canonical 状态，不引入本地特权 |

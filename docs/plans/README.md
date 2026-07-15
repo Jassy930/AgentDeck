@@ -39,9 +39,11 @@
 
 当前 active Relay 事实源是 `2026-07-10-relay-companion-mvp-design.md` 与
 `2026-07-10-relay-companion-mvp-implementation.md`。P3.6-A/P3.6-B/P3.6-C/P3.6-D 已分别提交为
-`7731d1e`/`02cc640`/`694f2d9`/`b668d8f`，默认并发完整 daemon gate 已 exit 0。P3.7 S1 的
-fixture / typed adapter prepare / typed execution journal 已分别提交为 `819aa5e` / `1acf8b8` /
-`3f22cf0`；OS exec-gate、attach/ACK 与 orphan recovery 仍未完成。
+`7731d1e`/`02cc640`/`694f2d9`/`b668d8f`，默认并发完整 daemon gate 已 exit 0。P3.7 已在
+`819aa5e` / `1acf8b8` / `3f22cf0` 前置分片之上实现 current-binary exec-gate、typed driver/durable
+ACK、cooperative-descendant PGID fencing、两遍 recovery 与 production bootstrap；边界已裁决排除显式
+`setsid`/`setpgid`/launch service 自守护或逃逸。release 前唯一 reaper、typed clean/unknown prepare
+failure 分类、fresh 完整门禁和独立终审已经完成，现只待 scoped commit。
 P3.1 的 provisioned signed Keychain 外部门禁仍有 1 项 ignored/BLOCKED，P3.8/P3.9/P3.10、P4 E2EE/Relay Publish
 和 P5 真实 Companion 均未完成；transfer/publication 也尚无 production remote owner。不能因 fake
 publication、store tests 或 Simulator fixture 改写状态。

@@ -7,11 +7,11 @@
 //!
 //! `features` is a typed `BTreeSet<CapabilityId>` (deterministic
 //! serialization). Shared capability 只有在对应 production wire 已验证后才广告；
-//! Claude Code approval response 仍缺 recorded fixture/live gate，因此唯一 builder
-//! 必须暂时隐藏 `Approval`。其余 shared 与 CC-only capabilities 按 spec § 4.4
-//! 构造。vendor block carries the 6 permission modes, a small
-//! curated `output_styles` list, and the hook names CC accepts on
-//! `--include-hook-events` lifecycle output.
+//! canonical Runtime 通过已验证的 stdio `control_request/control_response` 广告
+//! `Approval`，legacy compatibility constructor 仍隐藏它。canonical typed argv 未接通
+//! hook control/事件交付，因此暂时隐藏 `ClaudeCodeHooks`；legacy compatibility surface
+//! 保留既有广告。vendor block carries the 6 permission modes, a small curated
+//! `output_styles` list, and the hook names CC accepts in user settings.
 //!
 //! ## Version probe
 //!
@@ -33,8 +33,16 @@ use agentdeck_protocol::{
 /// echoed both at `agent_version` (UI-facing) and inside the vendor
 /// block (for vendor-specific routing / debugging).
 pub fn build_claude_code_capabilities(cli_version: String) -> SessionCapabilities {
-    let features: BTreeSet<CapabilityId> = [
-        // —— Shared（Approval 在 recorded fixture/live gate 前 fail-close 隐藏）——
+    build_capabilities(cli_version, false)
+}
+
+pub(super) fn build_canonical_claude_code_capabilities(cli_version: String) -> SessionCapabilities {
+    build_capabilities(cli_version, true)
+}
+
+fn build_capabilities(cli_version: String, canonical_approval: bool) -> SessionCapabilities {
+    let mut features: BTreeSet<CapabilityId> = [
+        // —— Shared ——
         CapabilityId::StreamingMessages,
         CapabilityId::StreamingReasoning,
         CapabilityId::Shell,
@@ -47,7 +55,6 @@ pub fn build_claude_code_capabilities(cli_version: String) -> SessionCapabilitie
         CapabilityId::Worktree,
         // —— Claude-Code-only ——
         CapabilityId::ClaudeCodePermissionMode,
-        CapabilityId::ClaudeCodeHooks,
         CapabilityId::ClaudeCodeOutputStyle,
         CapabilityId::ClaudeCodeSlashCommands,
         CapabilityId::ClaudeCodePlanMode,
@@ -57,6 +64,11 @@ pub fn build_claude_code_capabilities(cli_version: String) -> SessionCapabilitie
     ]
     .into_iter()
     .collect();
+    if canonical_approval {
+        features.insert(CapabilityId::Approval);
+    } else {
+        features.insert(CapabilityId::ClaudeCodeHooks);
+    }
 
     SessionCapabilities {
         agent_kind: AgentKind::ClaudeCode,
@@ -75,8 +87,9 @@ pub fn build_claude_code_capabilities(cli_version: String) -> SessionCapabilitie
             // advertises the built-ins; user-defined output styles
             // discovered via `~/.claude/output-styles/` scan are v0.3+).
             output_styles: vec!["default".into(), "explanatory".into(), "concise".into()],
-            // Hook lifecycle names CC emits on `--include-hook-events`
-            // and accepts in `settings.json`. Surfaced so the UI can
+            // Hook lifecycle names CC accepts in `settings.json`; configured user hooks may
+            // emit lifecycle frames even when canonical argv does not request hook opt-in.
+            // Surfaced so the UI can
             // present a picker for `AddHook` vendor control.
             hooks_supported: vec![
                 "PreToolUse".into(),
@@ -167,6 +180,24 @@ mod tests {
         );
         assert!(!caps.features.contains(&CapabilityId::CodexSkills));
         assert!(!caps.features.contains(&CapabilityId::CodexCustomPrompts));
+    }
+
+    #[test]
+    fn only_canonical_builder_advertises_verified_stdio_approval() {
+        let legacy = build_claude_code_capabilities("legacy".into());
+        let canonical = build_canonical_claude_code_capabilities("canonical".into());
+        assert!(!legacy.features.contains(&CapabilityId::Approval));
+        assert!(canonical.features.contains(&CapabilityId::Approval));
+        assert!(
+            !canonical.features.contains(&CapabilityId::ClaudeCodeHooks),
+            "canonical typed argv has no verified hook control/delivery path"
+        );
+        assert!(
+            !canonical
+                .features
+                .contains(&CapabilityId::CodexApprovalPersistence),
+            "Claude Code P3.5 decisions remain persist=false"
+        );
     }
 
     #[test]

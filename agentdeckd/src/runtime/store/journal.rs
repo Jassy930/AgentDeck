@@ -21,11 +21,13 @@ use crate::runtime::model::{
     MAX_COMMAND_PAYLOAD_BYTES, MAX_COMMAND_RESULT_BYTES, MAX_CONVERSATION_DESCRIPTOR_BYTES,
     MAX_EXECUTION_FENCE_BYTES, MAX_EXECUTION_INTENT_BYTES, MAX_EXECUTION_NONCE_BYTES,
     MAX_IDEMPOTENCY_KEY_BYTES, MAX_RECOVERY_PAGE_RETAINED_BYTES, MAX_RUNTIME_EVENT_BYTES,
-    NewConversation, QueryCommandReceipt, RecoveryCompletion, RecoveryCursor, RecoveryPage,
-    RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreOperation,
-    SanitizedTerminalFailure, StartCommand, StartOutcome, StartedBeforeReleaseTermination,
-    StartedRecoveryRecord, TerminalState, TerminateAcceptedCommand, TerminateAcceptedOutcome,
-    TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
+    MarkConversationRecoveryBlocked, NewConversation, QueryCommandReceipt, RecoverStartedCommand,
+    RecoveryBlockedCommandBinding, RecoveryCompletion, RecoveryCursor, RecoveryFenceBinding,
+    RecoveryPage, RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError,
+    RuntimeStoreOperation, SanitizedTerminalFailure, StartCommand, StartOutcome,
+    StartedBeforeReleaseTermination, StartedRecoveryRecord, TerminalState,
+    TerminateAcceptedCommand, TerminateAcceptedOutcome, TerminateStartedBeforeRelease,
+    TerminateStartedBeforeReleaseOutcome,
 };
 use crate::security::SecretBytes;
 
@@ -646,6 +648,185 @@ pub(crate) fn create_conversation(
             updated_at_ms: created_at_ms,
             descriptor: input.descriptor,
         },
+    })
+}
+
+/// 威胁场景：daemon 已确认某个旧 execution 无法安全 fencing，却在仅内存阻断后再次
+/// 崩溃；若该状态没有写入 authenticated conversation row，下次启动会把同一队列重新
+/// 安装并与未知旧进程并发。该 safety transaction 先验证当前 metadata MAC 与可选的
+/// command/turn 绑定，再用旧 token 做 CAS，把 lifecycle 原子推进为 RecoveryBlocked。
+pub(crate) fn mark_conversation_recovery_blocked(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    input: MarkConversationRecoveryBlocked,
+) -> Result<ConversationRecord, RuntimeStoreError> {
+    ensure_kind(input.conversation_id, RuntimeIdKind::Conversation)?;
+
+    let database_id = state.database_id;
+    let key_bundle = &state.key_bundle;
+    let transaction = state
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let conversation =
+        load_conversation(&transaction, key_bundle, database_id, input.conversation_id)?;
+
+    match &input.expected_command {
+        None => {
+            if authenticated_started_command(
+                &transaction,
+                key_bundle,
+                database_id,
+                input.conversation_id,
+            )?
+            .is_some()
+            {
+                return Err(RuntimeStoreError::StartConflict);
+            }
+        }
+        Some(RecoveryBlockedCommandBinding::Accepted { command_id }) => {
+            ensure_kind(*command_id, RuntimeIdKind::Command)?;
+            let command = load_command(&transaction, key_bundle, database_id, *command_id)?;
+            if command.conversation_id != input.conversation_id {
+                return Err(RuntimeStoreError::CommandNotFound);
+            }
+            if command.state != CommandState::Accepted || command.turn_id.is_some() {
+                return Err(RuntimeStoreError::StartConflict);
+            }
+            if authenticated_started_command(
+                &transaction,
+                key_bundle,
+                database_id,
+                input.conversation_id,
+            )?
+            .is_some()
+            {
+                return Err(RuntimeStoreError::StartConflict);
+            }
+        }
+        Some(RecoveryBlockedCommandBinding::Started {
+            command_id,
+            turn_id,
+            daemon_boot_id,
+            execution_nonce,
+            fence,
+        }) => {
+            ensure_kind(*command_id, RuntimeIdKind::Command)?;
+            ensure_kind(*turn_id, RuntimeIdKind::Turn)?;
+            ensure_kind(*daemon_boot_id, RuntimeIdKind::DaemonBoot)?;
+            if execution_nonce.is_empty() || execution_nonce.len() > MAX_EXECUTION_NONCE_BYTES {
+                return Err(RuntimeStoreError::InvalidConfig(
+                    "recovery-blocked execution nonce must contain 1 to 1024 bytes",
+                ));
+            }
+            let command = load_command(&transaction, key_bundle, database_id, *command_id)?;
+            if command.conversation_id != input.conversation_id {
+                return Err(RuntimeStoreError::CommandNotFound);
+            }
+            if command.state != CommandState::Started || command.turn_id != Some(*turn_id) {
+                return Err(RuntimeStoreError::StartConflict);
+            }
+            let intent = load_intent(&transaction, key_bundle, database_id, *command_id)?;
+            let started_event = load_event(
+                &transaction,
+                key_bundle,
+                database_id,
+                intent.started_event_id,
+            )?;
+            validate_started_linkage(&command, &intent, &started_event)?;
+            if intent.turn_id != *turn_id
+                || intent.daemon_boot_id != *daemon_boot_id
+                || intent.execution_nonce != *execution_nonce
+            {
+                return Err(RuntimeStoreError::StartConflict);
+            }
+            let observed_fence =
+                load_optional_fence(&transaction, key_bundle, database_id, *command_id)?;
+            let observed_binding = observed_fence
+                .as_ref()
+                .map(RecoveryFenceBinding::from_record);
+            if observed_binding.as_ref() != fence.as_deref() {
+                return Err(RuntimeStoreError::FenceConflict);
+            }
+            if fence.as_ref().is_some_and(|fence| {
+                fence.command_id != *command_id
+                    || fence.daemon_boot_id != *daemon_boot_id
+                    || fence.execution_nonce != *execution_nonce
+            }) {
+                return Err(RuntimeStoreError::FenceConflict);
+            }
+        }
+    }
+
+    if conversation.lifecycle == ConversationLifecycle::RecoveryBlocked {
+        return Ok(conversation);
+    }
+    if conversation.lifecycle != ConversationLifecycle::Active {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+
+    sqlite::admit_safety_write(
+        &transaction,
+        key_bundle,
+        database_id,
+        &state.storage_path,
+        config.capacity_probe.as_ref(),
+    )?;
+    let updated_at_ms = config.clock.now_ms()?.max(conversation.updated_at_ms);
+    let old_token = conversation_metadata_token(
+        key_bundle,
+        conversation.conversation_id,
+        conversation.adapter_state_key,
+        conversation.catalog_revision,
+        conversation.command_high_water,
+        conversation.event_high_water,
+        conversation.accepted_command_count,
+        conversation.lifecycle,
+        conversation.created_at_ms,
+        conversation.updated_at_ms,
+    )?;
+    let new_token = conversation_metadata_token(
+        key_bundle,
+        conversation.conversation_id,
+        conversation.adapter_state_key,
+        conversation.catalog_revision,
+        conversation.command_high_water,
+        conversation.event_high_water,
+        conversation.accepted_command_count,
+        ConversationLifecycle::RecoveryBlocked,
+        conversation.created_at_ms,
+        updated_at_ms,
+    )?;
+    if transaction.execute(
+        "UPDATE conversations
+         SET lifecycle = 'recoveryBlocked', updated_at_ms = ?1, metadata_token = ?2
+         WHERE conversation_id = ?3 AND lifecycle = 'active' AND metadata_token = ?4",
+        params![
+            sqlite_time(updated_at_ms)?,
+            &new_token[..],
+            &input.conversation_id.as_bytes()[..],
+            &old_token[..],
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    config
+        .fault_injector
+        .before_operation(RuntimeStoreOperation::MarkConversationRecoveryBlockedBeforeCommit)?;
+    commit_transaction(
+        transaction,
+        RuntimeCommitOperation::MarkConversationRecoveryBlocked,
+    )?;
+    sqlite::latch_post_commit_capacity(state, config);
+    after_commit(
+        config,
+        RuntimeStoreOperation::MarkConversationRecoveryBlockedAfterCommit,
+        RuntimeCommitOperation::MarkConversationRecoveryBlocked,
+    )?;
+    Ok(ConversationRecord {
+        lifecycle: ConversationLifecycle::RecoveryBlocked,
+        updated_at_ms,
+        ..conversation
     })
 }
 
@@ -1904,6 +2085,41 @@ pub(crate) fn complete_command_with_event(
     input: CompleteCommand,
     effects: &mut CommandStreamEffects,
 ) -> Result<CompleteOutcome, RuntimeStoreError> {
+    complete_command_with_event_inner(state, config, input, None, effects)
+}
+
+pub(crate) fn recover_started_command_with_event(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    input: RecoverStartedCommand,
+    effects: &mut CommandStreamEffects,
+) -> Result<CompleteOutcome, RuntimeStoreError> {
+    if input.completion.terminal.terminal_state() != TerminalState::Interrupted
+        || !matches!(
+            &input.expected_started,
+            RecoveryBlockedCommandBinding::Started { .. }
+        )
+    {
+        return Err(RuntimeStoreError::InvalidConfig(
+            "recovery completion requires an exact Started binding and Interrupted terminal",
+        ));
+    }
+    complete_command_with_event_inner(
+        state,
+        config,
+        input.completion,
+        Some(&input.expected_started),
+        effects,
+    )
+}
+
+fn complete_command_with_event_inner(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    input: CompleteCommand,
+    expected_started: Option<&RecoveryBlockedCommandBinding>,
+    effects: &mut CommandStreamEffects,
+) -> Result<CompleteOutcome, RuntimeStoreError> {
     ensure_kind(input.conversation_id, RuntimeIdKind::Conversation)?;
     ensure_kind(input.command_id, RuntimeIdKind::Command)?;
     ensure_kind(input.turn_id, RuntimeIdKind::Turn)?;
@@ -1917,6 +2133,15 @@ pub(crate) fn complete_command_with_event(
     let command = load_command(&transaction, key_bundle, database_id, input.command_id)?;
     if command.conversation_id != input.conversation_id {
         return Err(RuntimeStoreError::CommandNotFound);
+    }
+    if let Some(expected_started) = expected_started {
+        validate_exact_recovery_started_binding(
+            &transaction,
+            key_bundle,
+            database_id,
+            &command,
+            expected_started,
+        )?;
     }
     if command.state.is_terminal() {
         if !is_completion_terminal(command.state) || command.turn_id != Some(input.turn_id) {
@@ -3029,6 +3254,26 @@ pub(crate) fn begin_recovery_scan(
     config: &RuntimeStoreConfig,
     effects: &mut CommandStreamEffects,
 ) -> Result<RecoveryCursor, RuntimeStoreError> {
+    begin_recovery_scan_inner(state, config, effects, true)
+}
+
+/// 第二遍 recovery verification 只冻结并校验上一遍已经选定的 durable cut，不再次
+/// 推进 Accepted expiry。否则合法 command 在两遍之间恰好到期会让 daemon 被自己的
+/// 时间推进击穿，无法完成启动。
+pub(crate) fn begin_recovery_verification_scan(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    effects: &mut CommandStreamEffects,
+) -> Result<RecoveryCursor, RuntimeStoreError> {
+    begin_recovery_scan_inner(state, config, effects, false)
+}
+
+fn begin_recovery_scan_inner(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    effects: &mut CommandStreamEffects,
+    sweep_expired: bool,
+) -> Result<RecoveryCursor, RuntimeStoreError> {
     if let Some(scan) = state.recovery_scan.as_ref() {
         if scan.last_cursor.is_none() {
             return Ok(scan.initial_cursor.clone());
@@ -3040,8 +3285,10 @@ pub(crate) fn begin_recovery_scan(
     // mutation before the catalog barrier freezes; afterwards the worker rejects every mutation
     // until finish_recovery_scan verifies the cumulative authenticated ledger counts.
     validate_store_integrity(&state.connection, &state.key_bundle, state.database_id)?;
-    let observed_at_ms = config.clock.now_ms()?;
-    expire_accepted_commands(state, config, observed_at_ms, effects)?;
+    if sweep_expired {
+        let observed_at_ms = config.clock.now_ms()?;
+        expire_accepted_commands(state, config, observed_at_ms, effects)?;
+    }
     validate_store_integrity(&state.connection, &state.key_bundle, state.database_id)?;
 
     let ledger =
@@ -6492,6 +6739,56 @@ fn validate_started_linkage(
         || event.created_at_ms != intent.created_at_ms
     {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(())
+}
+
+fn validate_exact_recovery_started_binding(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    command: &CommandRecord,
+    expected: &RecoveryBlockedCommandBinding,
+) -> Result<(), RuntimeStoreError> {
+    let RecoveryBlockedCommandBinding::Started {
+        command_id,
+        turn_id,
+        daemon_boot_id,
+        execution_nonce,
+        fence,
+    } = expected
+    else {
+        return Err(RuntimeStoreError::InvalidConfig(
+            "exact recovery Started validation requires a Started binding",
+        ));
+    };
+    if command.command_id != *command_id
+        || command.turn_id != Some(*turn_id)
+        || !(command.state == CommandState::Started || is_completion_terminal(command.state))
+    {
+        return Err(RuntimeStoreError::StartConflict);
+    }
+    let intent = load_intent(connection, key_bundle, database_id, *command_id)?;
+    let started_event = load_event(connection, key_bundle, database_id, intent.started_event_id)?;
+    validate_started_linkage(command, &intent, &started_event)?;
+    if intent.turn_id != *turn_id
+        || intent.daemon_boot_id != *daemon_boot_id
+        || intent.execution_nonce != *execution_nonce
+    {
+        return Err(RuntimeStoreError::StartConflict);
+    }
+    let observed_fence = load_optional_fence(connection, key_bundle, database_id, *command_id)?;
+    let observed_binding = observed_fence
+        .as_ref()
+        .map(RecoveryFenceBinding::from_record);
+    if observed_binding.as_ref() != fence.as_deref()
+        || fence.as_ref().is_some_and(|fence| {
+            fence.command_id != *command_id
+                || fence.daemon_boot_id != *daemon_boot_id
+                || fence.execution_nonce != *execution_nonce
+        })
+    {
+        return Err(RuntimeStoreError::FenceConflict);
     }
     Ok(())
 }

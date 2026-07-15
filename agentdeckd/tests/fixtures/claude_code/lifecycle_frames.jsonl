@@ -1,0 +1,5 @@
+{"type":"system","subtype":"hook_started","hook_event":"UserPromptSubmit","hook_id":"hook-fixture-1","hook_name":"fixture-hook","session_id":"cc-lifecycle-session","uuid":"cc-lifecycle-hook-start"}
+{"type":"system","subtype":"hook_response","exit_code":0,"hook_event":"UserPromptSubmit","hook_id":"hook-fixture-1","hook_name":"fixture-hook","outcome":"success","output":"","session_id":"cc-lifecycle-session","stderr":"","stdout":"","uuid":"cc-lifecycle-hook-response"}
+{"type":"system","subtype":"status","session_id":"cc-lifecycle-session","status":"requesting","uuid":"cc-lifecycle-status"}
+{"type":"system","subtype":"task_started","description":"fixture background command","session_id":"cc-lifecycle-session","task_id":"task-fixture-1","task_type":"local_bash","tool_use_id":"toolu-fixture-1","uuid":"cc-lifecycle-task-start"}
+{"type":"system","subtype":"task_notification","output_file":"/private/tmp/agentdeck-fixture-output","session_id":"cc-lifecycle-session","status":"completed","summary":"fixture command completed","task_id":"task-fixture-1","tool_use_id":"toolu-fixture-1","uuid":"cc-lifecycle-task-complete"}

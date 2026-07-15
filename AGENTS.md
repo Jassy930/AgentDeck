@@ -10,7 +10,7 @@
 4. `docs/index.md`：文档记录系统导航。
 5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code（含 CC adapter failure codes）。
 6. `docs/QUALITY.md`：验证命令、质量门禁和文档结构检查（含 v0.2 手动 QA 清单）。
-7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单。P2.10 与 P3.5 已完成；P3.6-A protocol contract / P3.6-B Runtime store v4 / P3.6-C transport-neutral stream、barrier、snapshot、transfer 与 publication / P3.6-D 文档收口分别提交为 `7731d1e` / `02cc640` / `694f2d9` / `b668d8f`。P3.7 S1 fixture / typed adapter prepare / typed execution journal 已分别提交为 `819aa5e` / `1acf8b8` / `3f22cf0`；OS exec-gate、attach/ACK 与 orphan recovery 仍未完成。真实 provisioned signed Keychain roundtrip 仍有 1 项 ignored 且 gated BLOCKED，App/CLI 也尚未迁到 singleton UDS，transfer/publication 也没有 production remote owner，因此不得宣称 P3.1/P3、远程 Companion 或 P4 E2EE 完成。
+7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单。P2.10、P3.5、P3.6-A/B/C/D 已完成；P3.7 已裁决采用 cooperative-descendant PGID 边界，主体实现、prepare 唯一 reaper、typed clean/unknown disposition、fresh 完整门禁与独立终审均已完成，现只待 scoped commit。fixture / typed adapter prepare / typed execution journal 的前置提交为 `819aa5e` / `1acf8b8` / `3f22cf0`。真实 provisioned signed Keychain roundtrip 仍有 1 项 ignored 且 gated BLOCKED，P3.8/P3.9 singleton UDS、P3.10 LaunchAgent、P4 remote owner/E2EE、P5/P6 客户端与实机证据仍未完成，因此不得宣称 P3.1/P3、远程 Companion 或整个方案完成。
 8. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
 
 ## 项目边界
@@ -219,8 +219,9 @@ abort 已 dispatch 的 admission 而丢 outcome。取消或 completion channel �
 必须证明精确 process group 已 reap/fence。durable conversation/actor 最多 1,024，connection
 writer 最多 128，principal lease（含 revoked tombstone）最多 1,024；frame/byte/read/control
 队列同样必须有硬上界。Core 先 Closing 并等待 operation/start lease 静默，再公开 Draining；
-shutdown/Drop 后不得残留自持有 writer 或 detached actor 子任务。P3.7 前 production
-execution coordinator 固定 disabled，side-effect-free fake 不是真实 vendor exec 证据。
+shutdown/Drop 后不得残留自持有 writer 或 detached actor 子任务。P3.4 的阶段测试继续使用
+disabled/side-effect-free coordinator，只证明 Core contract；当前 production exec 必须另跑 P3.7
+current-binary gate 门禁，fake 仍不是真实 vendor exec 证据。
 
 ### Relay Companion MVP P3.6（canonical stream / snapshot / transfer 门禁）
 
@@ -261,10 +262,11 @@ per-connection gate 到 flush ACK/cancel；同 target 被新 generation 取代�
 限制为 4；production Store、8-reader ReadPool 和所有运行时配额不变。
 
 P3.6 不执行真实 E2EE seal、MachineDataSign、Keychain CounterGuard 或 Relay Publish，
-transfer/publication 也尚无 production remote owner；Simulator fixture 不是远程链路。P3.7 exec gate、
-P3.8/P3.9 UDS 与 P4 remote 仍是后续任务。
+transfer/publication 也尚无 production remote owner；Simulator fixture 不是远程链路。P3.7 exec gate
+已完成 fresh 完整门禁和独立终审，仍待 scoped commit；P3.8/P3.9 UDS、P3.10 LaunchAgent 与 P4 remote
+仍是后续任务。
 
-### Relay Companion MVP P3.7（typed journal 前置分片）
+### Relay Companion MVP P3.7（exec-gate + typed production execution）
 
 ```bash
 cargo test -p agentdeckd --lib runtime::store::execution_event::tests -- --test-threads=1
@@ -272,7 +274,13 @@ cargo test -p agentdeckd --test runtime_store_execution_event -- --test-threads=
 cargo test -p agentdeckd --test runtime_store_execution_event_commit -- --test-threads=1
 cargo test -p agentdeckd --test runtime_store_execution_event_tamper -- --test-threads=1
 cargo test -p agentdeckd --test runtime_store_legacy_terminal -- --test-threads=1
-cargo test -p agentdeckd --test runtime_execution_fixture -- --test-threads=1
+cargo test -p agentdeckd --lib runtime::conversation::runtime_execution_fixture_tests -- --test-threads=1
+cargo test -p agentdeckd --test exec_gate -- --test-threads=1
+cargo test -p agentdeckd --test runtime_crash_recovery -- --test-threads=1
+cargo test -p agentdeckd --test runtime_store_recovery -- --test-threads=1
+cargo test -p agentdeckd --test runtime_approval -- --test-threads=1
+cargo test -p agentdeckd --test typed_spawn_ownership -- --test-threads=1
+cargo test -p agentdeckd --test production_execution_wiring -- --test-threads=1
 cargo test -p agentdeckd --lib -- --test-threads=1
 cargo test -p agentdeckd --tests -- --test-threads=1
 cargo fmt --all -- --check
@@ -284,9 +292,28 @@ scripts/verify-agent-docs.sh
 
 fresh Item/Error/approval 必须匹配 authenticated Started/turn 与 released Fence；release 失败必须
 丢弃 prepared event receiver，不能注册预排 approval。`ExecSpec` 必须绑定 exact execution/state，
-daemon handle 在 consumption 时重新校验虚 getter。adapter fixture 只允许筛选脱敏帧，来源/hash/
-历史 security debt 见 `agentdeckd/tests/fixtures/README.md`。本节不证明私有 FD gate、PGID/start-time、
-attach terminal ACK barrier、orphan recovery 或 live vendor；production coordinator 继续 disabled。
+daemon handle 在 consumption 时重新校验虚 getter。adapter 只能从 exec-gate 固定目录集合解析
+vendor basename，不得使用继承 PATH。adapter fixture 只允许筛选脱敏帧，来源/hash/历史 security debt
+见 `agentdeckd/tests/fixtures/README.md`。`production_execution_wiring` 的 `/bin/sh` helper 只证明真实
+current-binary gate 与 durable ACK/terminal 接线，不是已登录 Codex/Claude Code、真机或远程链路证据。
+
+P3.7 的 PGID 保证只覆盖不主动 `setsid`/`setpgid`、不另起 `launchd`/launch service 脱离继承
+PGID 的 cooperative vendor/tool descendants。显式自守护/逃逸是流程外不支持行为，当前机制不声称
+检测、枚举、收割或把它分类为 RecoveryBlocked；仍必须保证 release 前零 vendor/tool 副作用，并在
+cancel、崩溃、owner drop 或 vendor 先退出时 TERM→KILL/reap 全部同组子孙。blocked gate 从 prepare 起
+必须有唯一 reaper；确认没有创建 child 的普通 prepare failure 直接 Interrupted，只有 gate identity/
+同组清理不确定时才 RecoveryBlocked。canonical CC Approval 已由 recorded
+`control_request(can_use_tool)` 接通并广告，legacy compatibility 与未建模 Hooks 继续隐藏；fixture 不是
+live vendor evidence。Codex/CC approval summary 只能持久化经 source pre-cap、secret redaction、控制字符
+边界显式处理与 UTF-8 限长后的最小动作字段，不能退化为盲签或保存完整 raw frame：Codex 用可见 JSON
+编码保留换行/控制符且超界 fail-close，CC 才折叠控制字符并截断。Codex completed kind/status
+必须严格校验，`declined` 为 Canceled；CC wire 没有权威退出码时 canonical/legacy/history 都写
+`exit_code=None`，不能由 `is_error` 伪造 0/1。Codex command 缺具体 command/完整 commandActions/已验证
+network target，file request 未绑定同一 in-flight fileChange 的非空 proposed changes，CC 缺具体动作或
+tool 未建模，以及 permission profile 为空/过大时必须 fail-close；可选 grantRoot/reason 不能单独构成
+file action。Codex permission summary 必须展示 response builder 同一 validator 接受的完整 profile，
+但字段值使用脱敏投影，response builder 仍回送已验证的原始字段值；approval route/output Debug 不得
+展开 raw params。
 
 ## 浏览与外部资料
 

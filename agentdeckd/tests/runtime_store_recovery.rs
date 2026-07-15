@@ -5,8 +5,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use agentdeckd::runtime::model::{COMMAND_QUEUE_TTL_MS, RuntimeClock, RuntimeClockError};
 use agentdeckd::runtime::store::{
-    AcceptCommand, AcceptOutcome, IdempotencyOwner, NewConversation, RuntimeId, RuntimeIdKind,
-    RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreHandle,
+    AcceptCommand, AcceptOutcome, AuthorizeExecutionRelease, CommandTerminal, CompleteCommand,
+    ConversationLifecycle, ExecutionFence, IdempotencyOwner, MarkConversationRecoveryBlocked,
+    NewConversation, RecoverStartedCommand, RecoveryBlockedCommandBinding, RecoveryFenceBinding,
+    RuntimeId, RuntimeIdKind, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreHandle,
+    RuntimeStoreLane, StartCommand,
 };
 use agentdeckd::security::{MemoryKeyStore, StorageKek, load_or_create_storage_kek};
 
@@ -95,6 +98,119 @@ fn owner(seed: u8) -> IdempotencyOwner {
         uid: 501,
         client_installation_id: [seed; 16],
     }
+}
+
+const SMALL_SAFETY_LANE_BYTES: usize = 64 * 1024;
+const OVERSIZED_FENCE_NONCE_CAPACITY: usize = 128 * 1024;
+
+fn oversized_boxed_started_binding(
+    command_id: RuntimeId,
+    turn_id: RuntimeId,
+    daemon_boot_id: RuntimeId,
+) -> RecoveryBlockedCommandBinding {
+    let execution_nonce = vec![0x51];
+    assert_eq!(execution_nonce.capacity(), 1, "outer nonce sample capacity");
+    let mut fence_nonce = Vec::with_capacity(OVERSIZED_FENCE_NONCE_CAPACITY);
+    fence_nonce.push(0x52);
+    RecoveryBlockedCommandBinding::Started {
+        command_id,
+        turn_id,
+        daemon_boot_id,
+        execution_nonce,
+        fence: Some(Box::new(RecoveryFenceBinding {
+            command_id,
+            daemon_boot_id,
+            execution_nonce: fence_nonce,
+            process_group_id: 5_201,
+            leader_pid: 5_201,
+            leader_start_time: 91,
+            release_authorized_at_ms: Some(92),
+            payload_bytes: 32,
+            payload_sha256: [0x53; 32],
+        })),
+    }
+}
+
+fn assert_safety_lane_busy(error: RuntimeStoreError) {
+    assert!(matches!(
+        error,
+        RuntimeStoreError::WorkerBusy {
+            lane: RuntimeStoreLane::Safety
+        }
+    ));
+}
+
+#[tokio::test]
+async fn recover_started_charges_boxed_fence_nonce_before_safety_dispatch() {
+    // 威胁场景：异常 recovery plan 把超大 allocation 藏进 boxed fence nonce；若漏计，
+    // RecoverStartedCommand 会越过 64 KiB safety-lane cap 并进入 worker。
+    let root = TestRoot::new("recover-started-box-charge");
+    let keys = MemoryKeyStore::new();
+    let store = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(root.database()).with_lane_byte_capacity(SMALL_SAFETY_LANE_BYTES),
+        root.storage_kek(&keys),
+    )
+    .await
+    .expect("open recover-started box charge store");
+    let conversation_id = runtime_id(RuntimeIdKind::Conversation, 0x51);
+    let command_id = runtime_id(RuntimeIdKind::Command, 0x52);
+    let turn_id = runtime_id(RuntimeIdKind::Turn, 0x53);
+    let daemon_boot_id = runtime_id(RuntimeIdKind::DaemonBoot, 0x54);
+
+    let error = store
+        .recover_started_command_with_event(RecoverStartedCommand {
+            completion: CompleteCommand {
+                conversation_id,
+                command_id,
+                turn_id,
+                terminal: CommandTerminal::interrupted(),
+            },
+            expected_started: oversized_boxed_started_binding(command_id, turn_id, daemon_boot_id),
+        })
+        .await
+        .expect_err("boxed fence nonce must exceed the Safety lane budget");
+    assert_safety_lane_busy(error);
+    store.inspect().await.expect("read lane remains available");
+    store
+        .shutdown()
+        .await
+        .expect("shutdown recovery charge store");
+}
+
+#[tokio::test]
+async fn mark_recovery_blocked_charges_boxed_fence_nonce_before_safety_dispatch() {
+    // 威胁场景：异常 Started binding 用短 nonce 长度配超大 fence nonce capacity；若漏计，
+    // RecoveryBlocked lifecycle CAS 可绕过 safety-lane byte cap。
+    let root = TestRoot::new("mark-blocked-box-charge");
+    let keys = MemoryKeyStore::new();
+    let store = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(root.database()).with_lane_byte_capacity(SMALL_SAFETY_LANE_BYTES),
+        root.storage_kek(&keys),
+    )
+    .await
+    .expect("open mark-blocked box charge store");
+    let conversation_id = runtime_id(RuntimeIdKind::Conversation, 0x61);
+    let command_id = runtime_id(RuntimeIdKind::Command, 0x62);
+    let turn_id = runtime_id(RuntimeIdKind::Turn, 0x63);
+    let daemon_boot_id = runtime_id(RuntimeIdKind::DaemonBoot, 0x64);
+
+    let error = store
+        .mark_conversation_recovery_blocked(MarkConversationRecoveryBlocked {
+            conversation_id,
+            expected_command: Some(oversized_boxed_started_binding(
+                command_id,
+                turn_id,
+                daemon_boot_id,
+            )),
+        })
+        .await
+        .expect_err("boxed fence nonce must exceed the Safety lane budget");
+    assert_safety_lane_busy(error);
+    store.inspect().await.expect("read lane remains available");
+    store
+        .shutdown()
+        .await
+        .expect("shutdown blocked charge store");
 }
 
 async fn accept(
@@ -262,6 +378,222 @@ async fn recovery_sweeps_expired_commands_before_freezing_the_page_counts() {
         .shutdown()
         .await
         .expect("shutdown expiry recovery store");
+}
+
+#[tokio::test]
+async fn recovery_blocked_cas_rejects_every_stale_started_binding_field() {
+    // 威胁场景：陈旧 recovery/actor 只命中 command+turn，却携带另一次 boot、nonce、
+    // process identity 或 release record；宽松 CAS 会把错误 execution 永久标成已阻断。
+    let root = TestRoot::new("exact-blocked-binding");
+    let keys = MemoryKeyStore::new();
+    let store = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(root.database()),
+        root.storage_kek(&keys),
+    )
+    .await
+    .expect("open exact blocked store");
+    let conversation = store
+        .create_conversation(conversation_input(0x31))
+        .await
+        .expect("create exact blocked conversation");
+    let command = match store
+        .accept_command(AcceptCommand {
+            conversation_id: conversation.conversation_id,
+            owner: owner(0x32),
+            idempotency_key: "exact-blocked".to_owned(),
+            payload: b"exact blocked binding".to_vec(),
+        })
+        .await
+        .expect("accept exact blocked command")
+    {
+        AcceptOutcome::Accepted { command, .. } => command,
+        AcceptOutcome::Replayed { .. } => panic!("fresh exact blocked command replayed"),
+    };
+    let daemon_boot_id = runtime_id(RuntimeIdKind::DaemonBoot, 0x33);
+    let execution_nonce = b"exact-blocked-nonce".to_vec();
+    let started = store
+        .mark_started_with_event(StartCommand {
+            conversation_id: conversation.conversation_id,
+            command_id: command.command_id,
+            daemon_boot_id,
+            execution_nonce: execution_nonce.clone(),
+        })
+        .await
+        .expect("start exact blocked command");
+    let turn_id = match started {
+        agentdeckd::runtime::store::StartOutcome::Started { intent, .. } => intent.turn_id,
+        agentdeckd::runtime::store::StartOutcome::Replayed { .. } => {
+            panic!("fresh exact blocked start replayed")
+        }
+    };
+    store
+        .persist_execution_fence(ExecutionFence {
+            command_id: command.command_id,
+            daemon_boot_id,
+            execution_nonce: execution_nonce.clone(),
+            process_group_id: 4_201,
+            leader_pid: 4_201,
+            leader_start_time: 77,
+            payload: vec![0x34; 32],
+        })
+        .await
+        .expect("persist exact blocked fence");
+    store
+        .authorize_execution_release(AuthorizeExecutionRelease {
+            command_id: command.command_id,
+            daemon_boot_id,
+            execution_nonce: execution_nonce.clone(),
+        })
+        .await
+        .expect("authorize exact blocked release");
+
+    let cursor = store
+        .begin_recovery_scan()
+        .await
+        .expect("scan exact blocked record");
+    let page = store
+        .load_recovery_page(cursor)
+        .await
+        .expect("load exact blocked record");
+    let started = page
+        .conversation
+        .as_ref()
+        .and_then(|recovery| recovery.started.as_ref())
+        .expect("exact blocked Started readback")
+        .clone();
+    store
+        .finish_recovery_scan(page.completion.expect("single exact blocked page"))
+        .await
+        .expect("finish exact blocked scan");
+    let exact = RecoveryBlockedCommandBinding::Started {
+        command_id: command.command_id,
+        turn_id,
+        daemon_boot_id,
+        execution_nonce,
+        fence: started
+            .fence
+            .as_ref()
+            .map(RecoveryFenceBinding::from_record)
+            .map(Box::new),
+    };
+
+    let mut stale = Vec::new();
+    let mut wrong = exact.clone();
+    let RecoveryBlockedCommandBinding::Started { command_id, .. } = &mut wrong else {
+        unreachable!()
+    };
+    *command_id = runtime_id(RuntimeIdKind::Command, 0x41);
+    stale.push(("command", wrong));
+    let mut wrong = exact.clone();
+    let RecoveryBlockedCommandBinding::Started {
+        turn_id: wrong_turn_id,
+        ..
+    } = &mut wrong
+    else {
+        unreachable!()
+    };
+    *wrong_turn_id = runtime_id(RuntimeIdKind::Turn, 0x42);
+    stale.push(("turn", wrong));
+    let mut wrong = exact.clone();
+    let RecoveryBlockedCommandBinding::Started {
+        daemon_boot_id: wrong_boot_id,
+        ..
+    } = &mut wrong
+    else {
+        unreachable!()
+    };
+    *wrong_boot_id = runtime_id(RuntimeIdKind::DaemonBoot, 0x43);
+    stale.push(("boot", wrong));
+    let mut wrong = exact.clone();
+    let RecoveryBlockedCommandBinding::Started {
+        execution_nonce, ..
+    } = &mut wrong
+    else {
+        unreachable!()
+    };
+    execution_nonce[0] ^= 1;
+    stale.push(("nonce", wrong));
+    for label in [
+        "pgid",
+        "pid",
+        "start-time",
+        "release-time",
+        "payload-bytes",
+        "payload-hash",
+    ] {
+        let mut wrong = exact.clone();
+        let RecoveryBlockedCommandBinding::Started {
+            fence: Some(fence), ..
+        } = &mut wrong
+        else {
+            unreachable!()
+        };
+        match label {
+            "pgid" => fence.process_group_id += 1,
+            "pid" => fence.leader_pid += 1,
+            "start-time" => fence.leader_start_time += 1,
+            "release-time" => {
+                fence.release_authorized_at_ms =
+                    fence.release_authorized_at_ms.map(|value| value + 1)
+            }
+            "payload-bytes" => fence.payload_bytes += 1,
+            "payload-hash" => fence.payload_sha256[0] ^= 1,
+            _ => unreachable!(),
+        }
+        stale.push((label, wrong));
+    }
+    stale.push((
+        "missing-fence",
+        RecoveryBlockedCommandBinding::Started {
+            command_id: command.command_id,
+            turn_id,
+            daemon_boot_id,
+            execution_nonce: started.intent.execution_nonce.clone(),
+            fence: None,
+        },
+    ));
+
+    for (label, expected_command) in stale {
+        assert!(
+            store
+                .mark_conversation_recovery_blocked(MarkConversationRecoveryBlocked {
+                    conversation_id: conversation.conversation_id,
+                    expected_command: Some(expected_command),
+                })
+                .await
+                .is_err(),
+            "stale {label} binding unexpectedly won the lifecycle CAS"
+        );
+    }
+    for expected_command in [
+        None,
+        Some(RecoveryBlockedCommandBinding::Accepted {
+            command_id: command.command_id,
+        }),
+    ] {
+        assert!(
+            store
+                .mark_conversation_recovery_blocked(MarkConversationRecoveryBlocked {
+                    conversation_id: conversation.conversation_id,
+                    expected_command,
+                })
+                .await
+                .is_err(),
+            "non-Started binding unexpectedly blocked a Started command"
+        );
+    }
+    let blocked = store
+        .mark_conversation_recovery_blocked(MarkConversationRecoveryBlocked {
+            conversation_id: conversation.conversation_id,
+            expected_command: Some(exact),
+        })
+        .await
+        .expect("exact Started binding wins lifecycle CAS");
+    assert_eq!(blocked.lifecycle, ConversationLifecycle::RecoveryBlocked);
+    store
+        .shutdown()
+        .await
+        .expect("shutdown exact blocked store");
 }
 
 #[tokio::test]

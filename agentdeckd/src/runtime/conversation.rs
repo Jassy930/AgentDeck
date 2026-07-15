@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
-use agentdeck_protocol::runtime::identity::ApprovalId;
+use agentdeck_protocol::runtime::identity::{ApprovalId, EntityId, ItemId};
 use agentdeck_protocol::runtime::{ApprovalDeliveryState, ApprovalReceipt};
 use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinError, JoinHandle};
@@ -25,30 +25,45 @@ use super::connection::{
     PrincipalAuthorizationKey,
 };
 use super::execution::{
-    ExecutionReleasePermit, RuntimeCompletionFuture, RuntimeExecutionCompletion,
-    RuntimeExecutionContext, RuntimeExecutionControl, RuntimeExecutionCoordinator,
-    RuntimeExecutionError, RuntimeExecutionEvent, RuntimeExecutionEventReceiver,
+    EXECUTION_CANCEL_FENCE_BUDGET, ExecutionReleasePermit, RuntimeCancelDisposition,
+    RuntimeCompletionFuture, RuntimeExecutionCompletion, RuntimeExecutionContext,
+    RuntimeExecutionControl, RuntimeExecutionCoordinator, RuntimeExecutionError,
+    RuntimeExecutionEvent, RuntimeExecutionEventReceiver,
 };
 use super::model::{
     ApprovalMutationOutcome, ApprovalRecord, ApprovalState, ClaimApproval, ExpireApproval,
     RegisterApproval, RegisterApprovalOutcome, RetryApprovalDelivery,
 };
+use super::recovery::RecoveryReadyPermit;
 use super::store::{
     AcceptCommand, AcceptOutcome, AcceptedTerminationReason, AuthorizeExecutionRelease,
     CommandRecord, CommandState, CommandTerminal, CompleteCommand, ConversationRecord,
-    ExecutionFence, RuntimeId, RuntimeStoreError, RuntimeStoreHandle, StartCommand, StartOutcome,
+    ExecutionFence, ExecutionFenceRecord, MarkConversationRecoveryBlocked,
+    RecoveryBlockedCommandBinding, RecoveryFenceBinding, RuntimeCommitOperation, RuntimeId,
+    RuntimeIdKind, RuntimeStoreError, RuntimeStoreHandle, StartCommand, StartOutcome,
     StartedBeforeReleaseTermination, SystemRuntimeClock, TerminateAcceptedCommand,
     TerminateAcceptedOutcome, TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
 };
+use crate::agent::{AdapterEvent, AdapterItemKey};
 
 const PROMPT_MAILBOX_CAPACITY: usize = 32;
 const CONTROL_MAILBOX_CAPACITY: usize = 64;
 const RUNNER_MAILBOX_CAPACITY: usize = 8;
 const EXECUTION_NONCE_BYTES: usize = 32;
 const ACTOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
-const CONTROL_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
+// 威胁场景：vendor/tool 忽略 TERM 时，若 actor 的外层 timeout 不覆盖完整
+// TERM grace -> KILL grace -> readback，cancel 会在发出 KILL 前被取消并错误进入
+// RecoveryBlocked。保留两秒调度/readback 余量，并用 execution 层预算防止两处漂移。
+const CONTROL_CANCEL_TIMEOUT: Duration = Duration::from_secs(6);
+const _: () = assert!(CONTROL_CANCEL_TIMEOUT.as_secs() > EXECUTION_CANCEL_FENCE_BUDGET.as_secs());
+// 威胁场景：approval 已 durable Expired 且 exact group 已 fenced，但 driver/forwarder/
+// terminal pipeline 因内部故障不返回；若没有有界监督，当前 actor 与后续 Accepted queue
+// 会再次无限占用。watchdog 只把该 conversation fail-close，不伪造 vendor decision。
+const APPROVAL_EXPIRY_TERMINAL_GRACE: Duration = Duration::from_secs(10);
+const _: () = assert!(APPROVAL_EXPIRY_TERMINAL_GRACE.as_secs() > CONTROL_CANCEL_TIMEOUT.as_secs());
 const CONTROL_PRIORITY_BURST: usize = 8;
 const MAX_RUNTIME_CONVERSATION_ACTORS: usize = 1024;
+const MAX_ADAPTER_ITEM_KEYS_PER_TURN: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PromptAcceptResult {
@@ -103,6 +118,7 @@ pub(crate) struct ConversationRegistry {
     approval_clock: Arc<dyn super::store::RuntimeClock>,
     approval_sleeper: Arc<dyn ApprovalSleeper>,
     approval_backoff: Arc<dyn ApprovalBackoff>,
+    approval_expiry_terminal_grace: Duration,
     actor_limit: usize,
     shutdown_grace: Duration,
 }
@@ -262,6 +278,7 @@ impl ConversationRegistry {
             approval_clock: Arc::new(SystemRuntimeClock),
             approval_sleeper: Arc::new(TokioApprovalSleeper),
             approval_backoff: Arc::new(FixedApprovalBackoff),
+            approval_expiry_terminal_grace: APPROVAL_EXPIRY_TERMINAL_GRACE,
             actor_limit,
             shutdown_grace,
         })
@@ -277,6 +294,16 @@ impl ConversationRegistry {
         self.approval_clock = clock;
         self.approval_sleeper = sleeper;
         self.approval_backoff = backoff;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_approval_expiry_terminal_grace(mut self, grace: Duration) -> Self {
+        assert!(
+            !grace.is_zero(),
+            "approval expiry watchdog grace must be positive"
+        );
+        self.approval_expiry_terminal_grace = grace;
         self
     }
 
@@ -325,6 +352,7 @@ impl ConversationRegistry {
             approval_clock: self.approval_clock.clone(),
             approval_sleeper: self.approval_sleeper.clone(),
             approval_backoff: self.approval_backoff.clone(),
+            approval_expiry_terminal_grace: self.approval_expiry_terminal_grace,
             prompt_ingress,
             shutdown_rx,
             shutdown_requested: false,
@@ -537,9 +565,31 @@ impl ConversationRegistry {
     }
 
     /// RuntimeCore 只有在逐页 recovery 完成并由 store 确认 `finish` 后才调用。
-    /// retained watch gate 原子发布且不丢 wake；不存在“部分 actor 已唤醒、Core
-    /// 仍处于 RECOVERING”的 fail-open 窗口。
-    pub(crate) async fn enable_scheduling(&self) -> Result<(), ConversationError> {
+    /// 获取 actor registry 锁可能 await，但锁取得后 `publish_core_ready` 与 retained
+    /// scheduling gate 在同一次不可取消 poll 中依次发布；actor 绝不能先于 Core READY
+    /// 被唤醒。
+    pub(crate) async fn publish_ready_and_enable_scheduling(
+        &self,
+        _permit: &RecoveryReadyPermit,
+        publish_core_ready: impl FnOnce(),
+    ) -> Result<(), ConversationError> {
+        let actors = self.actors.lock().await;
+        if self.adapter_permits.is_closed() {
+            return Err(ConversationError::ActorUnavailable);
+        }
+        publish_core_ready();
+        self.scheduling_gate.send_replace(true);
+        drop(actors);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn enable_scheduling(&self) -> Result<(), ConversationError> {
+        self.enable_scheduling_inner().await
+    }
+
+    #[cfg(test)]
+    async fn enable_scheduling_inner(&self) -> Result<(), ConversationError> {
         let actors = self.actors.lock().await;
         if self.adapter_permits.is_closed() {
             return Err(ConversationError::ActorUnavailable);
@@ -646,8 +696,10 @@ struct ActiveCommand {
     command: CommandRecord,
     authorization_key: Option<PrincipalAuthorizationKey>,
     turn_id: Option<RuntimeId>,
+    recovery_binding: RecoveryBlockedCommandBinding,
     control: Option<Arc<dyn RuntimeExecutionControl>>,
     execution_gate: Arc<Mutex<ActiveExecutionGate>>,
+    approval_expiry_watchdog: Option<AbortOnDropTask<()>>,
     task: AbortOnDropTask<()>,
 }
 
@@ -663,7 +715,11 @@ struct ApprovalRoute {
 struct ActiveExecutionGate {
     cancel_requested: bool,
     cancel_fenced: bool,
+    user_cancel_accepted: bool,
+    user_cancel_fenced: bool,
+    completion_won: bool,
     release_authorized: bool,
+    claimed_terminal: Option<CommandTerminal>,
 }
 
 enum RunnerEvent {
@@ -680,10 +736,22 @@ enum RunnerEvent {
         generation: u64,
         result: ApprovalWorkerResult,
     },
+    ApprovalExpiryTerminalWatchdog {
+        command_id: RuntimeId,
+        turn_id: RuntimeId,
+    },
     Started {
         command_id: RuntimeId,
         turn_id: RuntimeId,
+        daemon_boot_id: RuntimeId,
+        execution_nonce: Vec<u8>,
         acknowledged: oneshot::Sender<()>,
+    },
+    FenceUpdated {
+        command_id: RuntimeId,
+        turn_id: RuntimeId,
+        fence: ExecutionFenceRecord,
+        acknowledged: oneshot::Sender<Result<(), RuntimeExecutionError>>,
     },
     Prepared {
         command_id: RuntimeId,
@@ -732,6 +800,7 @@ struct ConversationActor {
     approval_clock: Arc<dyn super::store::RuntimeClock>,
     approval_sleeper: Arc<dyn ApprovalSleeper>,
     approval_backoff: Arc<dyn ApprovalBackoff>,
+    approval_expiry_terminal_grace: Duration,
     prompt_ingress: Arc<PromptIngress>,
     shutdown_rx: watch::Receiver<bool>,
     shutdown_requested: bool,
@@ -946,9 +1015,15 @@ impl ConversationActor {
             ControlCommand::CancelActive { turn_id, reply } => {
                 let result = match self.active.as_mut() {
                     Some(active) if active.turn_id == Some(turn_id) => {
-                        request_active_cancel(&active.execution_gate, active.control.clone())
+                        request_user_active_cancel(&active.execution_gate, active.control.clone())
                             .await
-                            .map(|()| ActiveCancelResult::Requested)
+                            .map(|accepted| {
+                                if accepted {
+                                    ActiveCancelResult::Requested
+                                } else {
+                                    ActiveCancelResult::Stale
+                                }
+                            })
                             .map_err(ConversationError::Execution)
                     }
                     _ => Ok(ActiveCancelResult::Stale),
@@ -965,14 +1040,30 @@ impl ConversationActor {
         }
     }
 
-    fn enter_recovery_blocked(&mut self) {
+    /// 威胁场景：actor 已遇到无法确认 durable completion 或 process fencing 的 fatal
+    /// failure，而一个已派发给 SQLite worker 的 Accept 正阻塞 durable lifecycle mutation；
+    /// 若等待 store 后才关入口，新 prompt 仍可在未知 execution outcome 下进入队列。因此先
+    /// 同步关闭进程内 admission，再 exact 持久化当前 command/turn；持久化失败则升级为
+    /// actor shutdown，不能重新开放入口。
+    async fn enter_recovery_blocked(&mut self) {
         self.recovery_blocked = true;
         self.prompt_ingress.close();
+        let input = MarkConversationRecoveryBlocked {
+            conversation_id: self.conversation.conversation_id,
+            expected_command: self
+                .active
+                .as_ref()
+                .map(|active| active.recovery_binding.clone()),
+        };
+        match mark_conversation_recovery_blocked_exact(&self.store, input).await {
+            Ok(conversation) => self.conversation = conversation,
+            Err(_) => self.begin_shutdown().await,
+        }
     }
 
     async fn enter_recovery_blocked_and_stop_approvals(&mut self) {
         let turn_id = self.active.as_ref().and_then(|active| active.turn_id);
-        self.enter_recovery_blocked();
+        self.enter_recovery_blocked().await;
         if let Some(turn_id) = turn_id {
             // RecoveryBlocked 尚无 process fence 证据，不能伪造 durable Expired；但必须先
             // 移除 bound route 并停止所有 adapter delivery，防止未知 execution 继续副作用。
@@ -1065,11 +1156,15 @@ impl ConversationActor {
             runner_tx,
         )));
         self.active = Some(ActiveCommand {
+            recovery_binding: RecoveryBlockedCommandBinding::Accepted {
+                command_id: command.command_id,
+            },
             command,
             authorization_key: queued.authorization_key,
             turn_id: None,
             control: None,
             execution_gate,
+            approval_expiry_watchdog: None,
             task,
         });
     }
@@ -1107,9 +1202,28 @@ impl ConversationActor {
                 self.finish_approval_task(approval_id, task_kind, generation, result)
                     .await;
             }
+            RunnerEvent::ApprovalExpiryTerminalWatchdog {
+                command_id,
+                turn_id,
+            } => {
+                let exact_active = self.active.as_ref().is_some_and(|active| {
+                    active.command.command_id == command_id && active.turn_id == Some(turn_id)
+                });
+                if exact_active {
+                    self.enter_recovery_blocked().await;
+                    self.finish_approval_turn(turn_id).await;
+                    if let Some(mut active) = self.active.take() {
+                        stop_approval_expiry_watchdog(&mut active).await;
+                        active.task.abort();
+                        let _ = active.task.join().await;
+                    }
+                }
+            }
             RunnerEvent::Started {
                 command_id,
                 turn_id,
+                daemon_boot_id,
+                execution_nonce,
                 acknowledged,
             } => {
                 if let Some(active) = self
@@ -1118,8 +1232,47 @@ impl ConversationActor {
                     .filter(|active| active.command.command_id == command_id)
                 {
                     active.turn_id = Some(turn_id);
+                    active.recovery_binding = RecoveryBlockedCommandBinding::Started {
+                        command_id,
+                        turn_id,
+                        daemon_boot_id,
+                        execution_nonce,
+                        fence: None,
+                    };
                     let _ = acknowledged.send(());
                 }
+            }
+            RunnerEvent::FenceUpdated {
+                command_id,
+                turn_id,
+                fence,
+                acknowledged,
+            } => {
+                let result = if let Some(active) = self.active.as_mut().filter(|active| {
+                    active.command.command_id == command_id && active.turn_id == Some(turn_id)
+                }) {
+                    match &mut active.recovery_binding {
+                        RecoveryBlockedCommandBinding::Started {
+                            command_id: bound_command_id,
+                            turn_id: bound_turn_id,
+                            daemon_boot_id,
+                            execution_nonce,
+                            fence: bound_fence,
+                        } if *bound_command_id == command_id
+                            && *bound_turn_id == turn_id
+                            && *daemon_boot_id == fence.daemon_boot_id
+                            && *execution_nonce == fence.execution_nonce =>
+                        {
+                            *bound_fence =
+                                Some(Box::new(RecoveryFenceBinding::from_record(&fence)));
+                            Ok(())
+                        }
+                        _ => Err(RuntimeExecutionError::ReleaseAuthorizationInvalid),
+                    }
+                } else {
+                    Err(RuntimeExecutionError::ReleaseAuthorizationInvalid)
+                };
+                let _ = acknowledged.send(result);
             }
             RunnerEvent::Prepared {
                 command_id,
@@ -1152,6 +1305,7 @@ impl ConversationActor {
                     .is_some_and(|active| active.command.command_id == command_id)
                     && let Some(mut active) = self.active.take()
                 {
+                    stop_approval_expiry_watchdog(&mut active).await;
                     if let Some(turn_id) = active.turn_id {
                         // CompleteCommand 的 safety transaction 已先把所有 non-Applied
                         // approvals durable Expired；此处才取消/等待 daemon workers。
@@ -1167,12 +1321,13 @@ impl ConversationActor {
                     .is_some_and(|active| active.command.command_id == command_id)
                 {
                     let turn_id = self.active.as_ref().and_then(|active| active.turn_id);
-                    self.enter_recovery_blocked();
+                    self.enter_recovery_blocked().await;
                     if let Some(turn_id) = turn_id {
                         self.finish_approval_turn(turn_id).await;
                     }
                     if let Some(active) = self.active.take() {
                         let mut active = active;
+                        stop_approval_expiry_watchdog(&mut active).await;
                         let _ = active.task.join().await;
                     }
                 }
@@ -1184,11 +1339,12 @@ impl ConversationActor {
                     .is_some_and(|active| active.command.command_id == command_id)
                 {
                     let turn_id = self.active.as_ref().and_then(|active| active.turn_id);
-                    self.enter_recovery_blocked();
+                    self.enter_recovery_blocked().await;
                     if let Some(turn_id) = turn_id {
                         self.finish_approval_turn(turn_id).await;
                     }
                     if let Some(mut active) = self.active.take() {
+                        stop_approval_expiry_watchdog(&mut active).await;
                         let _ = active.task.join().await;
                     }
                 }
@@ -1200,6 +1356,7 @@ impl ConversationActor {
         let Some(mut active) = self.active.take() else {
             return;
         };
+        stop_approval_expiry_watchdog(&mut active).await;
         let _ = request_active_cancel(&active.execution_gate, active.control.take()).await;
         if tokio::time::timeout(self.shutdown_grace, active.task.join())
             .await
@@ -1407,6 +1564,44 @@ impl ConversationActor {
             }
             ApprovalTaskCompletionDisposition::Continue => {}
         }
+        if result == ApprovalWorkerResult::Expired {
+            let expired_turn_id = self
+                .approval_deliveries
+                .get(&approval_id)
+                .map(|route| route.turn_id);
+            let active_expiry = expired_turn_id.and_then(|turn_id| {
+                self.active
+                    .as_ref()
+                    .filter(|active| active.turn_id == Some(turn_id))
+                    .map(|active| {
+                        (
+                            active.command.command_id,
+                            turn_id,
+                            active.execution_gate.clone(),
+                            active.control.clone(),
+                        )
+                    })
+            });
+            if let Some((command_id, turn_id, execution_gate, control)) = active_expiry {
+                if interrupt_active_for_approval_expiry(&execution_gate, control)
+                    .await
+                    .is_err()
+                {
+                    self.enter_recovery_blocked_and_stop_approvals().await;
+                    return;
+                }
+                let runner_tx = self.runner_tx.clone();
+                let grace = self.approval_expiry_terminal_grace;
+                if let Some(active) = self.active.as_mut().filter(|active| {
+                    active.command.command_id == command_id && active.turn_id == Some(turn_id)
+                }) && active.approval_expiry_watchdog.is_none()
+                {
+                    active.approval_expiry_watchdog = Some(spawn_approval_expiry_watchdog(
+                        command_id, turn_id, grace, runner_tx,
+                    ));
+                }
+            }
+        }
         if matches!(
             result,
             ApprovalWorkerResult::Applied | ApprovalWorkerResult::Expired
@@ -1588,14 +1783,37 @@ fn classify_approval_task_completion(
 }
 
 async fn forward_execution_events(
+    conversation_id: RuntimeId,
     command_id: RuntimeId,
     turn_id: RuntimeId,
+    store: RuntimeStoreHandle,
     mut events: RuntimeExecutionEventReceiver,
     runner_tx: mpsc::Sender<RunnerEvent>,
-) {
+) -> Result<(), ExecutionEventForwardError> {
+    let mut item_identities = HashMap::<AdapterItemKey, (ItemId, EntityId)>::new();
     while let Some(event) = events.recv().await {
         match event {
-            RuntimeExecutionEvent::ActionRequest { request, delivery } => {
+            RuntimeExecutionEvent::Adapter { delivery } => {
+                let (event, acknowledge) = delivery.into_parts();
+                let committed = append_adapter_event(
+                    &store,
+                    conversation_id,
+                    command_id,
+                    turn_id,
+                    &mut item_identities,
+                    event,
+                )
+                .await;
+                acknowledge.acknowledge(committed);
+                if committed.is_err() {
+                    return Err(ExecutionEventForwardError::EventDurabilityLost);
+                }
+            }
+            RuntimeExecutionEvent::ActionRequest {
+                request,
+                delivery,
+                registration_ack,
+            } => {
                 let (acknowledged, registered) = oneshot::channel();
                 if runner_tx
                     .send(RunnerEvent::ApprovalRequested {
@@ -1608,13 +1826,126 @@ async fn forward_execution_events(
                     .await
                     .is_err()
                 {
-                    return;
+                    if let Some(registration_ack) = registration_ack {
+                        registration_ack.acknowledge(Err(()));
+                    }
+                    return Err(ExecutionEventForwardError::ApprovalBridgeClosed);
                 }
-                if !matches!(registered.await, Ok(Ok(()))) {
-                    return;
+                let registration = match registered.await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(_)) | Err(_) => Err(()),
+                };
+                if let Some(registration_ack) = registration_ack {
+                    registration_ack.acknowledge(registration);
+                }
+                if registration.is_err() {
+                    return Err(ExecutionEventForwardError::ApprovalDurabilityLost);
                 }
             }
         }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecutionEventForwardError {
+    EventDurabilityLost,
+    ApprovalDurabilityLost,
+    ApprovalBridgeClosed,
+}
+
+async fn append_adapter_event(
+    store: &RuntimeStoreHandle,
+    conversation_id: RuntimeId,
+    command_id: RuntimeId,
+    turn_id: RuntimeId,
+    item_identities: &mut HashMap<AdapterItemKey, (ItemId, EntityId)>,
+    event: AdapterEvent,
+) -> Result<(), ()> {
+    let event_id = random_event_id()?;
+    let input = match event {
+        AdapterEvent::Item { key, item } => {
+            let (item_id, entity_id) = match item_identities.get(&key) {
+                Some(identity) => identity.clone(),
+                None => {
+                    if item_identities.len() >= MAX_ADAPTER_ITEM_KEYS_PER_TURN {
+                        return Err(());
+                    }
+                    let item_id = ItemId::new(random_event_id()?.to_canonical_string());
+                    let entity_id = EntityId::new(random_event_id()?.to_canonical_string());
+                    item_identities.insert(key, (item_id.clone(), entity_id.clone()));
+                    (item_id, entity_id)
+                }
+            };
+            super::store::AppendExecutionEvent::item(
+                conversation_id,
+                command_id,
+                turn_id,
+                event_id,
+                item_id,
+                entity_id,
+                item,
+            )
+        }
+        AdapterEvent::Error(_) => super::store::AppendExecutionEvent::execution_failed(
+            conversation_id,
+            command_id,
+            turn_id,
+            event_id,
+        ),
+        AdapterEvent::TurnComplete(_)
+        | AdapterEvent::VendorControl(_)
+        | AdapterEvent::VendorPanelEvent(_) => return Err(()),
+    };
+    match store.append_execution_event(input.clone()).await {
+        Ok(_) => Ok(()),
+        Err(RuntimeStoreError::CommitOutcomeUnknown {
+            operation: RuntimeCommitOperation::AppendExecutionEvent,
+        }) => store
+            .append_execution_event(input)
+            .await
+            .map(|_| ())
+            .map_err(|_| ()),
+        Err(_) => Err(()),
+    }
+}
+
+fn random_event_id() -> Result<RuntimeId, ()> {
+    for _ in 0..16 {
+        let mut bytes = [0_u8; 16];
+        getrandom::fill(&mut bytes).map_err(|_| ())?;
+        if let Ok(id) = RuntimeId::from_bytes(RuntimeIdKind::Event, bytes) {
+            return Ok(id);
+        }
+    }
+    Err(())
+}
+
+#[cfg(test)]
+#[path = "runtime_execution_fixture_tests.rs"]
+mod runtime_execution_fixture_tests;
+
+fn spawn_approval_expiry_watchdog(
+    command_id: RuntimeId,
+    turn_id: RuntimeId,
+    grace: Duration,
+    runner_tx: mpsc::Sender<RunnerEvent>,
+) -> AbortOnDropTask<()> {
+    AbortOnDropTask::new(tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+        let _ = runner_tx
+            .send(RunnerEvent::ApprovalExpiryTerminalWatchdog {
+                command_id,
+                turn_id,
+            })
+            .await;
+    }))
+}
+
+async fn stop_approval_expiry_watchdog(active: &mut ActiveCommand) {
+    if let Some(mut watchdog) = active.approval_expiry_watchdog.take() {
+        watchdog.abort();
+        let _ = watchdog.join().await;
     }
 }
 
@@ -1778,7 +2109,7 @@ async fn supervise_execution_task(
 
 async fn cancel_control(
     control: Arc<dyn RuntimeExecutionControl>,
-) -> Result<(), RuntimeExecutionError> {
+) -> Result<RuntimeCancelDisposition, RuntimeExecutionError> {
     tokio::time::timeout(CONTROL_CANCEL_TIMEOUT, control.cancel_and_wait_fenced())
         .await
         .map_err(|_| RuntimeExecutionError::CancelFailed)?
@@ -1791,10 +2122,121 @@ async fn request_active_cancel(
     let mut gate = execution_gate.lock().await;
     gate.cancel_requested = true;
     if let Some(control) = control {
-        cancel_control(control).await?;
+        let disposition = cancel_control(control).await?;
         gate.cancel_fenced = true;
+        match disposition {
+            RuntimeCancelDisposition::UserCancelWon => {
+                if gate.user_cancel_accepted {
+                    gate.user_cancel_fenced = true;
+                }
+            }
+            RuntimeCancelDisposition::AlreadyCompleting => {
+                gate.completion_won = true;
+            }
+        }
     }
     Ok(())
+}
+
+async fn request_user_active_cancel(
+    execution_gate: &Mutex<ActiveExecutionGate>,
+    control: Option<Arc<dyn RuntimeExecutionControl>>,
+) -> Result<bool, RuntimeExecutionError> {
+    let mut gate = execution_gate.lock().await;
+    if gate.claimed_terminal.is_some() || gate.completion_won {
+        return Ok(false);
+    }
+    gate.cancel_requested = true;
+    if gate.cancel_fenced {
+        return Ok(gate.user_cancel_accepted && gate.user_cancel_fenced);
+    }
+    if let Some(control) = control {
+        match cancel_control(control).await? {
+            RuntimeCancelDisposition::UserCancelWon => {
+                gate.cancel_fenced = true;
+                gate.user_cancel_fenced = true;
+            }
+            RuntimeCancelDisposition::AlreadyCompleting => {
+                gate.cancel_fenced = true;
+                gate.completion_won = true;
+                return Ok(false);
+            }
+        }
+    }
+    gate.user_cancel_accepted = true;
+    Ok(true)
+}
+
+async fn interrupt_active_for_approval_expiry(
+    execution_gate: &Mutex<ActiveExecutionGate>,
+    control: Option<Arc<dyn RuntimeExecutionControl>>,
+) -> Result<(), RuntimeExecutionError> {
+    // 威胁场景：approval durable Expired 后若只删除 route，Codex/CC 仍在等待一个
+    // daemon 永远不会投递的决定并永久占用 actor。expiry 不能伪造用户 Deny；它必须
+    // fence exact execution group，并让同一 command 以 Interrupted 正常收口。
+    claim_interrupted_after_exact_fence(execution_gate, control)
+        .await
+        .map(|_| ())
+}
+
+async fn claim_interrupted_after_exact_fence(
+    execution_gate: &Mutex<ActiveExecutionGate>,
+    control: Option<Arc<dyn RuntimeExecutionControl>>,
+) -> Result<Option<CommandTerminal>, RuntimeExecutionError> {
+    let mut gate = execution_gate.lock().await;
+    if let Some(claimed_terminal) = &gate.claimed_terminal {
+        return Ok(Some(claimed_terminal.clone()));
+    }
+    if gate.completion_won {
+        return Ok(None);
+    }
+    if !gate.release_authorized {
+        return Err(RuntimeExecutionError::CancelFailed);
+    }
+    gate.cancel_requested = true;
+    if !gate.cancel_fenced {
+        match cancel_control(control.ok_or(RuntimeExecutionError::CancelFailed)?).await? {
+            RuntimeCancelDisposition::UserCancelWon => {
+                gate.cancel_fenced = true;
+            }
+            RuntimeCancelDisposition::AlreadyCompleting => {
+                gate.cancel_fenced = true;
+                gate.completion_won = true;
+                return Ok(None);
+            }
+        }
+    }
+    let terminal = if gate.user_cancel_accepted && gate.user_cancel_fenced {
+        CommandTerminal::canceled()
+    } else {
+        CommandTerminal::interrupted()
+    };
+    gate.claimed_terminal = Some(terminal.clone());
+    Ok(Some(terminal))
+}
+
+async fn claim_clean_prepare_failure_terminal(
+    execution_gate: &Mutex<ActiveExecutionGate>,
+) -> Result<StartedBeforeReleaseTermination, RuntimeExecutionError> {
+    // 威胁场景：用户在 prepare 阻塞期间已收到 Requested，随后 prepare 以
+    // PrepareFailedClean 返回；若 clean failure 不与 Cancel 共用同一个 claim，
+    // durable terminal 会错误写成 Interrupted，且 COMMIT 窗口内的晚到 Cancel
+    // 还会再次返回 Requested。clean disposition 已证明没有存活 child，因此可在
+    // 同一 gate 下把已接受的用户取消视为 exact fence，并先 claim terminal。
+    let mut gate = execution_gate.lock().await;
+    if gate.claimed_terminal.is_some() || gate.completion_won || gate.release_authorized {
+        return Err(RuntimeExecutionError::PrepareFailed);
+    }
+    if gate.user_cancel_accepted {
+        gate.cancel_requested = true;
+        gate.cancel_fenced = true;
+        gate.user_cancel_fenced = true;
+        gate.claimed_terminal = Some(CommandTerminal::canceled());
+        Ok(StartedBeforeReleaseTermination::Canceled)
+    } else {
+        gate.claimed_terminal = Some(CommandTerminal::interrupted());
+        Ok(StartedBeforeReleaseTermination::Interrupted)
+    }
 }
 
 async fn fence_pre_release_cancel_if_requested(
@@ -1805,8 +2247,13 @@ async fn fence_pre_release_cancel_if_requested(
     if !gate.cancel_requested {
         return Ok(false);
     }
-    cancel_control(control).await?;
+    if cancel_control(control).await? != RuntimeCancelDisposition::UserCancelWon {
+        return Err(RuntimeExecutionError::CancelFailed);
+    }
     gate.cancel_fenced = true;
+    if gate.user_cancel_accepted {
+        gate.user_cancel_fenced = true;
+    }
     Ok(true)
 }
 
@@ -1821,6 +2268,24 @@ async fn pre_release_cancel_won(
         return Err(RuntimeExecutionError::CancelFailed);
     }
     Ok(true)
+}
+
+async fn claim_post_release_terminal(
+    execution_gate: &Mutex<ActiveExecutionGate>,
+    terminal: CommandTerminal,
+) -> CommandTerminal {
+    let mut gate = execution_gate.lock().await;
+    if let Some(claimed) = &gate.claimed_terminal {
+        return claimed.clone();
+    }
+    let claimed = if gate.release_authorized && gate.user_cancel_accepted && gate.user_cancel_fenced
+    {
+        CommandTerminal::canceled()
+    } else {
+        terminal
+    };
+    gate.claimed_terminal = Some(claimed.clone());
+    claimed
 }
 
 async fn prompt_admission_worker(
@@ -1991,6 +2456,8 @@ async fn execute_command(
         .send(RunnerEvent::Started {
             command_id: command.command_id,
             turn_id,
+            daemon_boot_id,
+            execution_nonce: execution_nonce.clone(),
             acknowledged: started_ack,
         })
         .await
@@ -2011,20 +2478,54 @@ async fn execute_command(
         .await
     {
         Ok(prepared) => prepared,
-        Err(_) => {
-            let _ = runner_tx
-                .send(RunnerEvent::RecoveryBlocked {
+        Err(error) => {
+            // 威胁场景：固定 vendor binary 不存在，prepare 在 release 前失败且已证明
+            // 没有存活 gate/vendor child；若仍无条件 RecoveryBlocked，同一 conversation
+            // 会被永久封死。只有 typed clean failure 可复用 pre-release terminal；任何
+            // child outcome/cleanup 未知的错误继续 fail-close。
+            let event = if error == RuntimeExecutionError::PrepareFailedClean {
+                let reason = match claim_clean_prepare_failure_terminal(&execution_gate).await {
+                    Ok(reason) => reason,
+                    Err(_) => {
+                        let _ = runner_tx
+                            .send(RunnerEvent::RecoveryBlocked {
+                                command_id: command.command_id,
+                            })
+                            .await;
+                        return;
+                    }
+                };
+                let termination = TerminateStartedBeforeRelease {
+                    conversation_id: conversation.conversation_id,
                     command_id: command.command_id,
-                })
-                .await;
+                    turn_id,
+                    daemon_boot_id,
+                    execution_nonce: execution_nonce.clone(),
+                    reason,
+                };
+                if terminate_started_before_release_exact(&store, termination).await {
+                    RunnerEvent::Finished {
+                        command_id: command.command_id,
+                    }
+                } else {
+                    RunnerEvent::RecoveryBlocked {
+                        command_id: command.command_id,
+                    }
+                }
+            } else {
+                RunnerEvent::RecoveryBlocked {
+                    command_id: command.command_id,
+                }
+            };
+            let _ = runner_tx.send(event).await;
             return;
         }
     };
 
-    // Prepared adapters may hand us a bounded receiver before the durable release boundary,
-    // but no event is allowed to reach the actor/store until release has committed and the
-    // cold release capability has been consumed successfully. P3.7 attach will replace this
-    // seam with an explicit durable-ACK channel and terminal join barrier.
+    // Prepared adapters hand us a bounded receiver before the durable release boundary, but
+    // no event reaches the actor/store until release has committed and the cold capability has
+    // been consumed. The production attach path then holds every AdapterEvent on an explicit
+    // durable-ACK barrier, and terminal completion joins both event and approval bridges.
     let execution_events = prepared.events;
     let process = prepared.process;
     let control = prepared.control;
@@ -2110,24 +2611,46 @@ async fn execute_command(
         }
     }
 
-    let fence = store
-        .persist_execution_fence(ExecutionFence {
+    let fence_input = ExecutionFence {
+        command_id: command.command_id,
+        daemon_boot_id,
+        execution_nonce: execution_nonce.clone(),
+        process_group_id: process.process_group_id,
+        leader_pid: process.leader_pid,
+        leader_start_time: process.leader_start_time,
+        payload: process.fence_payload,
+    };
+    let fence = match store.persist_execution_fence(fence_input.clone()).await {
+        Err(RuntimeStoreError::CommitOutcomeUnknown {
+            operation: RuntimeCommitOperation::PersistFence,
+        }) => store.persist_execution_fence(fence_input).await,
+        outcome => outcome,
+    };
+    let fence = match fence {
+        Ok(fence) => fence,
+        Err(_) => {
+            let _ = cancel_control(control).await;
+            let _ = runner_tx
+                .send(RunnerEvent::RecoveryBlocked {
+                    command_id: command.command_id,
+                })
+                .await;
+            return;
+        }
+    };
+    let (fence_ack, fence_ready) = oneshot::channel();
+    if runner_tx
+        .send(RunnerEvent::FenceUpdated {
             command_id: command.command_id,
-            daemon_boot_id,
-            execution_nonce: execution_nonce.clone(),
-            process_group_id: process.process_group_id,
-            leader_pid: process.leader_pid,
-            leader_start_time: process.leader_start_time,
-            payload: process.fence_payload,
+            turn_id,
+            fence,
+            acknowledged: fence_ack,
         })
-        .await;
-    if fence.is_err() {
+        .await
+        .is_err()
+        || !matches!(fence_ready.await, Ok(Ok(())))
+    {
         let _ = cancel_control(control).await;
-        let _ = runner_tx
-            .send(RunnerEvent::RecoveryBlocked {
-                command_id: command.command_id,
-            })
-            .await;
         return;
     }
 
@@ -2168,10 +2691,20 @@ async fn execute_command(
             let _ = runner_tx.send(event).await;
             return;
         }
-        match store
+        let authorization = match store
             .authorize_execution_release(release_request.clone())
             .await
         {
+            Err(RuntimeStoreError::CommitOutcomeUnknown {
+                operation: RuntimeCommitOperation::AuthorizeExecutionRelease,
+            }) => {
+                store
+                    .authorize_execution_release(release_request.clone())
+                    .await
+            }
+            outcome => outcome,
+        };
+        match authorization {
             Ok(record) => {
                 gate.release_authorized = true;
                 record
@@ -2188,6 +2721,21 @@ async fn execute_command(
             }
         }
     };
+    let (release_ack, release_ready) = oneshot::channel();
+    if runner_tx
+        .send(RunnerEvent::FenceUpdated {
+            command_id: command.command_id,
+            turn_id,
+            fence: release_record.clone(),
+            acknowledged: release_ack,
+        })
+        .await
+        .is_err()
+        || !matches!(release_ready.await, Ok(Ok(())))
+    {
+        let _ = cancel_control(control).await;
+        return;
+    }
     let permit =
         match ExecutionReleasePermit::from_committed_store(&release_request, &release_record) {
             Ok(permit) => permit,
@@ -2201,11 +2749,13 @@ async fn execute_command(
                 return;
             }
         };
-    let (completion_future, _execution_events) = match release.release(permit).await {
+    let (completion_future, mut execution_events_task) = match release.release(permit).await {
         Ok(completion) => {
             let forwarder = AbortOnDropTask::new(tokio::spawn(forward_execution_events(
+                conversation.conversation_id,
                 command.command_id,
                 turn_id,
+                store.clone(),
                 execution_events,
                 runner_tx.clone(),
             )));
@@ -2215,7 +2765,10 @@ async fn execute_command(
             // Release 未成功消费 cold capability 时，prepared receiver 中即使已有
             // adapter 预排事件也必须丢弃，不能把未越过 gate 的 approval 持久化。
             drop(execution_events);
-            if cancel_control(control.clone()).await.is_err() {
+            if request_active_cancel(&execution_gate, Some(control.clone()))
+                .await
+                .is_err()
+            {
                 let _ = runner_tx
                     .send(RunnerEvent::RecoveryBlocked {
                         command_id: command.command_id,
@@ -2223,29 +2776,60 @@ async fn execute_command(
                     .await;
                 return;
             }
+            let interrupted =
+                claim_post_release_terminal(&execution_gate, CommandTerminal::interrupted()).await;
             let completion: RuntimeCompletionFuture = Box::pin(async move {
                 Ok(RuntimeExecutionCompletion {
-                    terminal: CommandTerminal::interrupted(),
+                    terminal: interrupted,
                 })
             });
             (completion, None)
         }
     };
 
-    // completion future 只有消费 committed release permit 后才能取得。
-    let completion = match completion_future.await {
-        Ok(completion) => completion,
-        Err(_) => {
-            if cancel_control(control).await.is_err() {
-                let _ = runner_tx
-                    .send(RunnerEvent::RecoveryBlocked {
-                        command_id: command.command_id,
-                    })
-                    .await;
-                return;
-            }
-            RuntimeExecutionCompletion {
-                terminal: CommandTerminal::interrupted(),
+    // completion future 只有消费 committed release permit 后才能取得。terminal 还必须
+    // 等待 durable forwarder 自然 drain；negative ACK/bridge close 不能伪装成 Failed
+    // 或 Interrupted，而要由 actor 写入 exact RecoveryBlocked。
+    let completion = completion_future.await;
+    // vendor completion 一旦返回就先 claim terminal，阻止随后在 durable ACK 排空窗口
+    // 到达的用户 Cancel 改写已经发生的结果；真正的 Store terminal 仍在 forwarder
+    // 完全 drain 后才提交。
+    let claimed_terminal = match &completion {
+        Ok(completion) => {
+            Some(claim_post_release_terminal(&execution_gate, completion.terminal.clone()).await)
+        }
+        Err(_) => None,
+    };
+    let forwarding = match execution_events_task.as_mut() {
+        Some(forwarder) => forwarder.join().await,
+        None => Ok(Ok(())),
+    };
+    if !matches!(forwarding, Ok(Ok(()))) {
+        let _ = cancel_control(control.clone()).await;
+        let _ = runner_tx
+            .send(RunnerEvent::RecoveryBlocked {
+                command_id: command.command_id,
+            })
+            .await;
+        return;
+    }
+    let terminal = match claimed_terminal {
+        Some(terminal) => terminal,
+        None => {
+            // 威胁场景：vendor completion channel 已失败，但 durable event forwarder 已
+            // 完整排空；若不先 exact fence process group 就写 Interrupted，残留子进程仍可
+            // 继续产生副作用。只有取得 fence 证明后才允许该 terminal 收口。
+            match claim_interrupted_after_exact_fence(&execution_gate, Some(control.clone())).await
+            {
+                Ok(Some(terminal)) => terminal,
+                Ok(None) | Err(_) => {
+                    let _ = runner_tx
+                        .send(RunnerEvent::RecoveryBlocked {
+                            command_id: command.command_id,
+                        })
+                        .await;
+                    return;
+                }
             }
         }
     };
@@ -2253,7 +2837,7 @@ async fn execute_command(
         conversation_id: conversation.conversation_id,
         command_id: command.command_id,
         turn_id,
-        terminal: completion.terminal,
+        terminal,
     };
     if !complete_command_with_event_exact(&store, completion).await {
         let _ = runner_tx
@@ -2268,6 +2852,22 @@ async fn execute_command(
             command_id: command.command_id,
         })
         .await;
+}
+
+async fn mark_conversation_recovery_blocked_exact(
+    store: &RuntimeStoreHandle,
+    input: MarkConversationRecoveryBlocked,
+) -> Result<ConversationRecord, RuntimeStoreError> {
+    match store
+        .mark_conversation_recovery_blocked(input.clone())
+        .await
+    {
+        Ok(conversation) => Ok(conversation),
+        Err(RuntimeStoreError::CommitOutcomeUnknown {
+            operation: RuntimeCommitOperation::MarkConversationRecoveryBlocked,
+        }) => store.mark_conversation_recovery_blocked(input).await,
+        Err(error) => Err(error),
+    }
 }
 
 async fn complete_command_with_event_exact(
@@ -2316,13 +2916,14 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex as StdMutex, OnceLock};
 
-    use crate::runtime::store::TerminalState;
+    use crate::runtime::store::{SanitizedTerminalFailure, TerminalState};
     use agentdeck_protocol::{
-        ActionDecision, ActionKind, ActionRequest, ActionRequestVendor, AgentKind,
-        CodexApprovalPolicy, CodexSandboxMode, TurnSummary,
+        ActionDecision, ActionKind, ActionRequest, ActionRequestVendor, AgentItem, AgentItemMeta,
+        AgentKind, CodexApprovalPolicy, CodexSandboxMode, TurnSummary,
     };
 
     use super::*;
+    use crate::agent::adapter_event_channel;
     use crate::runtime::approval::{
         ApprovalAttemptKey, ApprovalDeliveryOutcome, ApprovalPolicySnapshot,
         ApprovalPrincipalCapability, BoundApprovalDelivery,
@@ -2344,6 +2945,11 @@ mod tests {
 
     struct NoopApprovalDelivery {
         policy: ApprovalPolicySnapshot,
+    }
+
+    struct DeadlineApprovalDelivery {
+        policy: ApprovalPolicySnapshot,
+        deliver_calls: AtomicUsize,
     }
 
     struct GatedApprovalDelivery {
@@ -2527,6 +3133,22 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl BoundApprovalDelivery for DeadlineApprovalDelivery {
+        fn policy(&self) -> &ApprovalPolicySnapshot {
+            &self.policy
+        }
+
+        async fn deliver(
+            &self,
+            _key: ApprovalAttemptKey,
+            _decision: &ActionDecision,
+        ) -> ApprovalDeliveryOutcome {
+            self.deliver_calls.fetch_add(1, Ordering::SeqCst);
+            ApprovalDeliveryOutcome::AppliedAck
+        }
+    }
+
     fn approval_request() -> ActionRequest {
         approval_request_with_id("actor-request-1")
     }
@@ -2635,13 +3257,18 @@ mod tests {
 
     #[tokio::test]
     async fn execution_action_request_is_forwarded_to_the_bounded_actor_lane() {
+        let root = TestRoot::new("execution-action-forwarder");
+        let store = root.open().await;
+        let conversation_id = runtime_id(RuntimeIdKind::Conversation, 0x30);
         let command_id = runtime_id(RuntimeIdKind::Command, 0x31);
         let turn_id = runtime_id(RuntimeIdKind::Turn, 0x32);
         let (execution_tx, execution_rx) = runtime_execution_event_channel();
         let (runner_tx, mut runner_rx) = mpsc::channel(1);
         let forwarder = tokio::spawn(forward_execution_events(
+            conversation_id,
             command_id,
             turn_id,
+            store.clone(),
             execution_rx,
             runner_tx,
         ));
@@ -2650,6 +3277,7 @@ mod tests {
             .send(RuntimeExecutionEvent::ActionRequest {
                 request: approval_request(),
                 delivery: approval_delivery(),
+                registration_ack: None,
             })
             .await
             .expect("send bounded execution event");
@@ -2670,7 +3298,52 @@ mod tests {
             _ => panic!("expected approval request runner event"),
         }
         drop(execution_tx);
-        forwarder.await.expect("join event forwarder");
+        assert_eq!(forwarder.await.expect("join event forwarder"), Ok(()));
+        store.shutdown().await.expect("shutdown forwarder store");
+    }
+
+    #[tokio::test]
+    async fn execution_event_store_failure_is_a_negative_ack_and_forwarder_failure() {
+        // 威胁场景：event append 失败后 adapter 只看到普通 completion error；若 daemon
+        // 不保留独立 forwarder barrier，仍可能把同一 turn 写成 Failed/Interrupted terminal。
+        let root = TestRoot::new("execution-event-negative-ack");
+        let store = root.open().await;
+        let (execution_tx, execution_rx) = runtime_execution_event_channel();
+        let (runner_tx, _runner_rx) = mpsc::channel(1);
+        let forwarder = tokio::spawn(forward_execution_events(
+            runtime_id(RuntimeIdKind::Conversation, 0x70),
+            runtime_id(RuntimeIdKind::Command, 0x71),
+            runtime_id(RuntimeIdKind::Turn, 0x72),
+            store.clone(),
+            execution_rx,
+            runner_tx,
+        ));
+        let (sink, mut adapter_rx) = adapter_event_channel();
+        let adapter = tokio::spawn(async move {
+            sink.send(AdapterEvent::Item {
+                key: AdapterItemKey::new("negative-ack-item").unwrap(),
+                item: AgentItem::AssistantMessage {
+                    text: "must not become a terminal".to_owned(),
+                    meta: AgentItemMeta::default(),
+                },
+            })
+            .await
+        });
+        let delivery = adapter_rx.recv().await.expect("adapter event delivery");
+        execution_tx
+            .send(RuntimeExecutionEvent::Adapter { delivery })
+            .await
+            .expect("forward failing adapter event");
+        drop(execution_tx);
+        assert_eq!(
+            forwarder.await.expect("join failed event forwarder"),
+            Err(ExecutionEventForwardError::EventDurabilityLost)
+        );
+        assert!(
+            adapter.await.expect("join negative ACK adapter").is_err(),
+            "store failure must be observed by the adapter sink"
+        );
+        store.shutdown().await.expect("shutdown negative ACK store");
     }
 
     #[test]
@@ -2749,6 +3422,15 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    struct ZeroApprovalBackoff;
+
+    impl ApprovalBackoff for ZeroApprovalBackoff {
+        fn delay_before_attempt(&self, _attempt: u8) -> Option<Duration> {
+            Some(Duration::ZERO)
+        }
+    }
+
     #[derive(Debug)]
     struct FailAcceptReplyOnce(AtomicBool);
 
@@ -2805,15 +3487,17 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct BlockFenceCommit {
+    struct BlockStoreOperation {
+        operation: RuntimeStoreOperation,
         entered: AtomicBool,
         released: StdMutex<bool>,
         released_changed: Condvar,
     }
 
-    impl BlockFenceCommit {
-        fn new() -> Self {
+    impl BlockStoreOperation {
+        fn new(operation: RuntimeStoreOperation) -> Self {
             Self {
+                operation,
                 entered: AtomicBool::new(false),
                 released: StdMutex::new(false),
                 released_changed: Condvar::new(),
@@ -2826,12 +3510,12 @@ mod tests {
         }
     }
 
-    impl RuntimeStoreFaultInjector for BlockFenceCommit {
+    impl RuntimeStoreFaultInjector for BlockStoreOperation {
         fn before_operation(
             &self,
             operation: RuntimeStoreOperation,
         ) -> Result<(), RuntimeStoreError> {
-            if operation == RuntimeStoreOperation::PersistFenceBeforeCommit {
+            if operation == self.operation {
                 self.entered.store(true, Ordering::SeqCst);
                 let mut released = self.released.lock().expect("fence blocker lock");
                 while !*released {
@@ -2999,6 +3683,9 @@ mod tests {
         releases: AtomicUsize,
         approval_delivery: StdMutex<Option<SharedApprovalDelivery>>,
         approval_events: StdMutex<Option<mpsc::Sender<RuntimeExecutionEvent>>>,
+        approval_emission_enabled: AtomicBool,
+        prepare_failed_clean_once: AtomicBool,
+        prepare_failed_once: AtomicBool,
     }
 
     struct FakeControl {
@@ -3006,6 +3693,10 @@ mod tests {
         canceled: AtomicBool,
         cancel_count: AtomicUsize,
         cancel_fails: bool,
+    }
+
+    struct AlreadyCompletingControl {
+        cancel_count: AtomicUsize,
     }
 
     #[derive(Clone, Copy, Default)]
@@ -3016,12 +3707,16 @@ mod tests {
         panic_prepare: bool,
         emit_approval: bool,
         block_release: bool,
+        stall_completion_after_fence: bool,
+        prepare_failed_clean_once: bool,
+        prepare_failed_once: bool,
     }
 
     struct FakeRelease {
         expected_command_id: RuntimeId,
         expected_daemon_boot_id: RuntimeId,
         expected_execution_nonce: Vec<u8>,
+        expected_process: RuntimeProcessIdentity,
         control: Arc<FakeControl>,
         inner: Arc<FakeCoordinatorInner>,
         active_guard: Option<ActiveCounterGuard>,
@@ -3029,14 +3724,26 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RuntimeExecutionControl for FakeControl {
-        async fn cancel_and_wait_fenced(&self) -> Result<(), RuntimeExecutionError> {
+        async fn cancel_and_wait_fenced(
+            &self,
+        ) -> Result<RuntimeCancelDisposition, RuntimeExecutionError> {
             self.canceled.store(true, Ordering::SeqCst);
             self.cancel_count.fetch_add(1, Ordering::SeqCst);
             if self.cancel_fails {
                 return Err(RuntimeExecutionError::CancelFailed);
             }
             self.gate.add_permits(1);
-            Ok(())
+            Ok(RuntimeCancelDisposition::UserCancelWon)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeExecutionControl for AlreadyCompletingControl {
+        async fn cancel_and_wait_fenced(
+            &self,
+        ) -> Result<RuntimeCancelDisposition, RuntimeExecutionError> {
+            self.cancel_count.fetch_add(1, Ordering::SeqCst);
+            Ok(RuntimeCancelDisposition::AlreadyCompleting)
         }
     }
 
@@ -3058,6 +3765,10 @@ mod tests {
             if permit.command_id() != self.expected_command_id
                 || permit.daemon_boot_id() != self.expected_daemon_boot_id
                 || permit.execution_nonce() != self.expected_execution_nonce
+                || permit.process_group_id() != self.expected_process.process_group_id
+                || permit.leader_pid() != self.expected_process.leader_pid
+                || permit.leader_start_time() != self.expected_process.leader_start_time
+                || permit.fence_payload() != self.expected_process.fence_payload
                 || permit.release_authorized_at_ms() == 0
             {
                 return Err(RuntimeExecutionError::ReleaseAuthorizationInvalid);
@@ -3087,11 +3798,24 @@ mod tests {
                     .acquire_owned()
                     .await
                     .map_err(|_| RuntimeExecutionError::CompletionClosed)?;
+                // Fake completion mirrors production adapter drop: the execution event sender
+                // must close so the durable forwarder can drain before terminal COMMIT.
+                inner
+                    .approval_events
+                    .lock()
+                    .expect("approval events lock")
+                    .take();
+                if inner.behavior.stall_completion_after_fence {
+                    std::future::pending::<()>().await;
+                }
                 if inner.behavior.completion_error {
                     return Err(RuntimeExecutionError::CompletionClosed);
                 }
                 let terminal = if completion_control.canceled.load(Ordering::SeqCst) {
-                    CommandTerminal::canceled()
+                    // Production driver 在 exact-group cancel 后从 vendor stdout 读到 EOF，
+                    // release owner 只能先给出 Failed；用户取消语义必须由 actor 的 typed
+                    // race state 覆盖，fake 不能替 production 偷做这个判断。
+                    CommandTerminal::failed(SanitizedTerminalFailure::execution_failed())
                 } else {
                     CommandTerminal::completed(TurnSummary {
                         total_input_tokens: None,
@@ -3123,12 +3847,63 @@ mod tests {
             Self::new(true, true, FakeBehavior::default())
         }
 
+        fn clean_prepare_failure_once() -> Self {
+            Self::new(
+                false,
+                false,
+                FakeBehavior {
+                    prepare_failed_clean_once: true,
+                    ..FakeBehavior::default()
+                },
+            )
+        }
+
+        fn blocked_clean_prepare_failure_once() -> Self {
+            Self::new(
+                false,
+                true,
+                FakeBehavior {
+                    prepare_failed_clean_once: true,
+                    ..FakeBehavior::default()
+                },
+            )
+        }
+
+        fn prepare_failure_once() -> Self {
+            Self::new(
+                false,
+                false,
+                FakeBehavior {
+                    prepare_failed_once: true,
+                    ..FakeBehavior::default()
+                },
+            )
+        }
+
         fn held_with_approval(delivery: SharedApprovalDelivery) -> Self {
             let fake = Self::new(
                 true,
                 false,
                 FakeBehavior {
                     emit_approval: true,
+                    ..FakeBehavior::default()
+                },
+            );
+            *fake
+                .inner
+                .approval_delivery
+                .lock()
+                .expect("approval delivery lock") = Some(delivery);
+            fake
+        }
+
+        fn held_with_approval_stalled_after_fence(delivery: SharedApprovalDelivery) -> Self {
+            let fake = Self::new(
+                true,
+                false,
+                FakeBehavior {
+                    emit_approval: true,
+                    stall_completion_after_fence: true,
                     ..FakeBehavior::default()
                 },
             );
@@ -3246,6 +4021,9 @@ mod tests {
                     releases: AtomicUsize::new(0),
                     approval_delivery: StdMutex::new(None),
                     approval_events: StdMutex::new(None),
+                    approval_emission_enabled: AtomicBool::new(behavior.emit_approval),
+                    prepare_failed_clean_once: AtomicBool::new(behavior.prepare_failed_clean_once),
+                    prepare_failed_once: AtomicBool::new(behavior.prepare_failed_once),
                 }),
             }
         }
@@ -3259,7 +4037,11 @@ mod tests {
                 .clone()
                 .expect("approval execution stream is installed");
             sender
-                .send(RuntimeExecutionEvent::ActionRequest { request, delivery })
+                .send(RuntimeExecutionEvent::ActionRequest {
+                    request,
+                    delivery,
+                    registration_ack: None,
+                })
                 .await
                 .expect("send fake approval event");
         }
@@ -3324,6 +4106,12 @@ mod tests {
                 .add_permits(1);
         }
 
+        fn disable_approval_emission(&self) {
+            self.inner
+                .approval_emission_enabled
+                .store(false, Ordering::SeqCst);
+        }
+
         async fn wait_for_starts(&self, expected: usize) {
             wait_until(|| self.starts().len() >= expected).await;
         }
@@ -3343,6 +4131,22 @@ mod tests {
             &self,
             context: RuntimeExecutionContext,
         ) -> Result<PreparedRuntimeExecution, RuntimeExecutionError> {
+            if self
+                .inner
+                .prepare_failed_clean_once
+                .swap(false, Ordering::SeqCst)
+            {
+                if let Some(gate) = &self.inner.prepare_gate {
+                    let _permit = gate
+                        .acquire()
+                        .await
+                        .map_err(|_| RuntimeExecutionError::PrepareFailed)?;
+                }
+                return Err(RuntimeExecutionError::PrepareFailedClean);
+            }
+            if self.inner.prepare_failed_once.swap(false, Ordering::SeqCst) {
+                return Err(RuntimeExecutionError::PrepareFailed);
+            }
             let now = self.inner.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.inner.peak.fetch_max(now, Ordering::SeqCst);
             let control = Arc::new(FakeControl {
@@ -3379,7 +4183,7 @@ mod tests {
             assert!(!self.inner.behavior.panic_prepare, "injected prepare panic");
 
             let process_id = self.inner.next_pid.fetch_add(1, Ordering::SeqCst);
-            let events = if self.inner.behavior.emit_approval {
+            let events = if self.inner.approval_emission_enabled.load(Ordering::SeqCst) {
                 let (sender, receiver) = runtime_execution_event_channel();
                 sender
                     .try_send(RuntimeExecutionEvent::ActionRequest {
@@ -3391,6 +4195,7 @@ mod tests {
                             .expect("approval delivery lock")
                             .clone()
                             .unwrap_or_else(approval_delivery),
+                        registration_ack: None,
                     })
                     .expect("fake approval event fits bounded channel");
                 *self
@@ -3402,18 +4207,20 @@ mod tests {
             } else {
                 crate::runtime::execution::closed_execution_events()
             };
+            let process = RuntimeProcessIdentity {
+                process_group_id: process_id,
+                leader_pid: process_id,
+                leader_start_time: u64::try_from(process_id).expect("positive fake pid"),
+                fence_payload: b"side-effect-free-test-fence".to_vec(),
+            };
             Ok(PreparedRuntimeExecution {
-                process: RuntimeProcessIdentity {
-                    process_group_id: process_id,
-                    leader_pid: process_id,
-                    leader_start_time: u64::try_from(process_id).expect("positive fake pid"),
-                    fence_payload: b"side-effect-free-test-fence".to_vec(),
-                },
+                process: process.clone(),
                 control,
                 release: Box::new(FakeRelease {
                     expected_command_id: context.command.command_id,
                     expected_daemon_boot_id: context.daemon_boot_id,
                     expected_execution_nonce: context.execution_nonce,
+                    expected_process: process,
                     control: self
                         .inner
                         .controls
@@ -3525,6 +4332,24 @@ mod tests {
         .expect("valid approval id")
     }
 
+    fn read_only_command_turn_id(path: &Path, command_id: RuntimeId) -> RuntimeId {
+        let connection =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open runtime DB read-only");
+        let bytes: Vec<u8> = connection
+            .query_row(
+                "SELECT turn_id FROM commands WHERE command_id = ?1",
+                rusqlite::params![command_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("read command turn id");
+        RuntimeId::from_bytes(
+            RuntimeIdKind::Turn,
+            <[u8; 16]>::try_from(bytes.as_slice()).expect("turn id is 16 bytes"),
+        )
+        .expect("valid turn id")
+    }
+
     async fn wait_for_approval_state(path: &Path, expected: &str) {
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
@@ -3561,6 +4386,19 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("read approval state")
+    }
+
+    fn read_only_conversation_lifecycle(path: &Path) -> String {
+        let connection =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open runtime DB read-only");
+        connection
+            .query_row(
+                "SELECT lifecycle FROM conversations ORDER BY created_at_ms LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read conversation lifecycle")
     }
 
     #[tokio::test]
@@ -4755,6 +5593,369 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_approval_deadline_fences_vendor_and_releases_actor_for_successor() {
+        // 威胁场景：真实 vendor 在等待 Pending approval 时 deadline 到达；若 actor 只删除
+        // durable route 而不 fence execution，vendor 与 actor 会永久占用且后续 prompt 不会启动。
+        const NOW_MS: u64 = 70_000;
+        const DEADLINE_MS: u64 = NOW_MS + 50;
+        let root = TestRoot::new("approval-deadline-fences-turn");
+        let database = root.0.join("runtime.db");
+        let clock = ManualClock::new(NOW_MS);
+        let keys = MemoryKeyStore::new();
+        let kek = load_or_create_storage_kek(&keys, &root.0.join("key-state.db"))
+            .expect("approval expiry StorageKEK");
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(database.clone()).with_clock(clock.clone()),
+            kek,
+        )
+        .await
+        .expect("open approval expiry store");
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 37).await;
+        let delivery = Arc::new(DeadlineApprovalDelivery {
+            policy: ApprovalPolicySnapshot {
+                agent_kind: AgentKind::Codex,
+                action_kind: ActionKind::ExecuteCommand,
+                allow_approve: true,
+                allow_deny: true,
+                allow_persist: false,
+                deadline_at_ms: Some(DEADLINE_MS),
+            },
+            deliver_calls: AtomicUsize::new(0),
+        });
+        let fake = FakeCoordinator::held_with_approval(delivery.clone());
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xA7),
+            1,
+        )
+        .expect("registry")
+        .with_approval_runtime(
+            Arc::new(clock.clone()),
+            Arc::new(TokioApprovalSleeper),
+            Arc::new(FixedApprovalBackoff),
+        );
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        let principal = local_principal(37);
+        let first = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "approval-deadline-first",
+                "must be interrupted at approval deadline",
+            )
+            .await,
+        );
+        fake.wait_for_starts(1).await;
+        wait_for_approval_count(&database, 1).await;
+
+        // successor 必须在 deadline 前已经 durable queued；这样才能证明 expiry 自动
+        // 释放 actor，而不是只证明 terminal 之后还能接受一个全新的 prompt。
+        fake.disable_approval_emission();
+        let successor = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "approval-deadline-successor",
+                "must already be queued when the approval expires",
+            )
+            .await,
+        );
+        assert_eq!(fake.starts().len(), 1);
+
+        clock.set(DEADLINE_MS);
+        wait_for_approval_state(&database, "expired").await;
+        wait_for_receipt_state(
+            &store,
+            conversation.conversation_id,
+            first.command_id,
+            &principal,
+            CommandState::Interrupted,
+        )
+        .await;
+        assert_eq!(fake.cancel_count(first.command_id), 1);
+        assert_eq!(
+            delivery.deliver_calls.load(Ordering::SeqCst),
+            0,
+            "deadline expiry must not fabricate a vendor Deny delivery"
+        );
+        fake.wait_for_starts(2).await;
+        fake.release(successor.command_id);
+        wait_for_receipt_state(
+            &store,
+            conversation.conversation_id,
+            successor.command_id,
+            &principal,
+            CommandState::Completed,
+        )
+        .await;
+
+        registry.shutdown().await.expect("shutdown actors");
+        store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test]
+    async fn approval_expiry_watchdog_fail_closes_a_stalled_terminal_pipeline() {
+        // 威胁场景：expiry 已 exact fence vendor，但 daemon 内部 completion future 永久
+        // pending；watchdog 必须释放进程内 task，并把 exact conversation 标记
+        // RecoveryBlocked，而不是让 active/queued command 永久卡住或伪造 Interrupted COMMIT。
+        const NOW_MS: u64 = 80_000;
+        const DEADLINE_MS: u64 = NOW_MS + 30;
+        let root = TestRoot::new("approval-expiry-terminal-watchdog");
+        let database = root.0.join("runtime.db");
+        let clock = ManualClock::new(NOW_MS);
+        let keys = MemoryKeyStore::new();
+        let kek = load_or_create_storage_kek(&keys, &root.0.join("key-state.db"))
+            .expect("approval watchdog StorageKEK");
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(database.clone()).with_clock(clock.clone()),
+            kek,
+        )
+        .await
+        .expect("open approval watchdog store");
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 38).await;
+        let delivery = Arc::new(DeadlineApprovalDelivery {
+            policy: ApprovalPolicySnapshot {
+                agent_kind: AgentKind::Codex,
+                action_kind: ActionKind::ExecuteCommand,
+                allow_approve: true,
+                allow_deny: true,
+                allow_persist: false,
+                deadline_at_ms: Some(DEADLINE_MS),
+            },
+            deliver_calls: AtomicUsize::new(0),
+        });
+        let fake = FakeCoordinator::held_with_approval_stalled_after_fence(delivery.clone());
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xA8),
+            1,
+        )
+        .expect("registry")
+        .with_approval_runtime(
+            Arc::new(clock.clone()),
+            Arc::new(TokioApprovalSleeper),
+            Arc::new(FixedApprovalBackoff),
+        )
+        .with_approval_expiry_terminal_grace(Duration::from_millis(50));
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        let principal = local_principal(38);
+        let first = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "approval-watchdog-first",
+                "stall after expiry fence",
+            )
+            .await,
+        );
+        fake.wait_for_starts(1).await;
+        wait_for_approval_count(&database, 1).await;
+        fake.disable_approval_emission();
+        let queued = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "approval-watchdog-queued",
+                "must remain queued after fail-close",
+            )
+            .await,
+        );
+
+        clock.set(DEADLINE_MS);
+        wait_for_approval_state(&database, "expired").await;
+        wait_until(|| fake.cancel_count(first.command_id) == 1).await;
+        wait_until(|| {
+            read_only_conversation_lifecycle(&database) == "recoveryBlocked" && fake.active() == 0
+        })
+        .await;
+        assert_eq!(
+            fake.starts().len(),
+            1,
+            "fail-close must not start queued work"
+        );
+        let first_receipt = store
+            .query_command_receipt(QueryCommandReceipt {
+                expected_owner: principal.idempotency_owner(),
+                selector: CommandReceiptSelector::Command {
+                    conversation_id: conversation.conversation_id,
+                    command_id: first.command_id,
+                },
+            })
+            .await
+            .expect("query watchdog command");
+        assert_eq!(first_receipt.state, CommandState::Started);
+        let queued_receipt = store
+            .query_command_receipt(QueryCommandReceipt {
+                expected_owner: principal.idempotency_owner(),
+                selector: CommandReceiptSelector::Command {
+                    conversation_id: conversation.conversation_id,
+                    command_id: queued.command_id,
+                },
+            })
+            .await
+            .expect("query queued watchdog command");
+        assert_eq!(queued_receipt.state, CommandState::Accepted);
+        assert_eq!(delivery.deliver_calls.load(Ordering::SeqCst), 0);
+
+        registry.shutdown().await.expect("shutdown actors");
+        store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test]
+    async fn outcome_unknown_approve_expiry_never_sends_a_synthetic_deny() {
+        // 威胁场景：Approve 已写入 durable winner，但 adapter 返回 OutcomeUnknown；deadline
+        // 到达后若 daemon 合成 Deny，会让 vendor 同时观察互相冲突的决定。expiry 只能
+        // exact fence turn，不能调用 transient route 第二次。
+        const NOW_MS: u64 = 90_000;
+        const DEADLINE_MS: u64 = NOW_MS + 200;
+        let root = TestRoot::new("approval-outcome-unknown-expiry");
+        let database = root.0.join("runtime.db");
+        let clock = ManualClock::new(NOW_MS);
+        let keys = MemoryKeyStore::new();
+        let kek = load_or_create_storage_kek(&keys, &root.0.join("key-state.db"))
+            .expect("outcome-unknown expiry StorageKEK");
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(database.clone()).with_clock(clock.clone()),
+            kek,
+        )
+        .await
+        .expect("open outcome-unknown expiry store");
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 39).await;
+        let delivery = Arc::new(SequencedApprovalDelivery {
+            policy: ApprovalPolicySnapshot {
+                agent_kind: AgentKind::Codex,
+                action_kind: ActionKind::ExecuteCommand,
+                allow_approve: true,
+                allow_deny: true,
+                allow_persist: false,
+                deadline_at_ms: Some(DEADLINE_MS),
+            },
+            outcomes: StdMutex::new(VecDeque::from([ApprovalDeliveryOutcome::OutcomeUnknown])),
+            decisions: StdMutex::new(Vec::new()),
+        });
+        let fake = FakeCoordinator::held_with_approval(delivery.clone());
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xA9),
+            1,
+        )
+        .expect("registry")
+        .with_approval_runtime(
+            Arc::new(clock.clone()),
+            Arc::new(TokioApprovalSleeper),
+            Arc::new(ZeroApprovalBackoff),
+        );
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        let prompt_principal = local_principal(39);
+        let command = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &prompt_principal,
+                "approval-outcome-unknown",
+                "approve delivery becomes outcome unknown",
+            )
+            .await,
+        );
+        fake.wait_for_starts(1).await;
+        wait_for_approval_count(&database, 1).await;
+        let approval_id = read_only_approval_id(&database);
+        let turn_id = fake.starts()[0].turn_id;
+        let resolver = PrincipalIssuer::local_only([0xC9; 32])
+            .issue_verified_local_with_approval_permissions(
+                501,
+                [0xC9; 16],
+                ApprovalPermissionGrant::ResolveOnly,
+            )
+            .expect("outcome-unknown resolver");
+        let receipt = registry
+            .resolve_approval(
+                conversation.conversation_id,
+                turn_id,
+                approval_id,
+                ActionDecision {
+                    request_id: "actor-request-1".to_owned(),
+                    decision: agentdeck_protocol::ActionDecisionKind::Approve,
+                    persist: false,
+                },
+                resolver
+                    .try_enter_approval()
+                    .expect("enter outcome-unknown resolve"),
+            )
+            .await
+            .expect("claim outcome-unknown approval");
+        assert!(matches!(receipt, ApprovalReceipt::Claimed { .. }));
+        wait_for_approval_state(&database, "deliveryFailed").await;
+        assert_eq!(
+            delivery
+                .decisions
+                .lock()
+                .expect("outcome-unknown decisions lock")
+                .as_slice(),
+            &[(
+                "actor-request-1".to_owned(),
+                agentdeck_protocol::ActionDecisionKind::Approve,
+                false,
+            )]
+        );
+
+        clock.set(DEADLINE_MS);
+        wait_for_approval_state(&database, "expired").await;
+        wait_for_receipt_state(
+            &store,
+            conversation.conversation_id,
+            command.command_id,
+            &prompt_principal,
+            CommandState::Interrupted,
+        )
+        .await;
+        assert_eq!(fake.cancel_count(command.command_id), 1);
+        assert_eq!(
+            delivery
+                .decisions
+                .lock()
+                .expect("post-expiry decisions lock")
+                .len(),
+            1,
+            "expiry must never send a synthetic Deny after OutcomeUnknown Approve"
+        );
+
+        registry.shutdown().await.expect("shutdown actors");
+        store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test]
     async fn complete_after_commit_unknown_replays_terminal_cleanup_and_starts_successor() {
         let root = TestRoot::new("complete-after-commit");
         let database = root.0.join("runtime.db");
@@ -5002,6 +6203,10 @@ mod tests {
 
     #[tokio::test]
     async fn queued_and_active_cancel_use_exact_distinct_targets() {
+        // 威胁场景：release 后用户 Cancel 已成功 fence exact PGID，但 production driver
+        // 随后 EOF→Failed；若 fake coordinator 直接返回 Canceled，durable terminal 断裂
+        // 会被掩盖。这里要求 fake 保留 production Failed，actor 再凭 typed user-cancel
+        // state 写出唯一 Canceled terminal。
         let root = TestRoot::new("cancel");
         let store = root.open().await;
         finish_recovery(&store).await;
@@ -5082,7 +6287,7 @@ mod tests {
             ActiveCancelResult::Requested
         );
         fake.wait_for_completions(1).await;
-        assert_eq!(fake.completions()[0].1, TerminalState::Canceled);
+        assert_eq!(fake.completions()[0].1, TerminalState::Failed);
         tokio::time::sleep(Duration::from_millis(25)).await;
         assert_eq!(
             fake.starts().len(),
@@ -5115,6 +6320,171 @@ mod tests {
 
         registry.shutdown().await.expect("shutdown actors");
         store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test]
+    async fn post_release_terminal_claim_only_user_cancel_with_fence_can_override() {
+        let internal_gate = Mutex::new(ActiveExecutionGate {
+            release_authorized: true,
+            ..ActiveExecutionGate::default()
+        });
+        let internal_control = Arc::new(FakeControl {
+            gate: Arc::new(Semaphore::new(0)),
+            canceled: AtomicBool::new(false),
+            cancel_count: AtomicUsize::new(0),
+            cancel_fails: false,
+        });
+        request_active_cancel(&internal_gate, Some(internal_control))
+            .await
+            .expect("shutdown/recovery exact-group fence");
+        let late_user_control = Arc::new(FakeControl {
+            gate: Arc::new(Semaphore::new(0)),
+            canceled: AtomicBool::new(false),
+            cancel_count: AtomicUsize::new(0),
+            cancel_fails: false,
+        });
+        assert!(
+            !request_user_active_cancel(&internal_gate, Some(late_user_control.clone()))
+                .await
+                .expect("an internal fence cannot be retroactively claimed by a user cancel")
+        );
+        assert_eq!(late_user_control.cancel_count.load(Ordering::SeqCst), 0);
+        let internal_terminal = claim_post_release_terminal(
+            &internal_gate,
+            CommandTerminal::failed(SanitizedTerminalFailure::execution_failed()),
+        )
+        .await;
+        assert_eq!(internal_terminal.terminal_state(), TerminalState::Failed);
+
+        let failed_user_gate = Mutex::new(ActiveExecutionGate {
+            release_authorized: true,
+            ..ActiveExecutionGate::default()
+        });
+        let failing_control = Arc::new(FakeControl {
+            gate: Arc::new(Semaphore::new(0)),
+            canceled: AtomicBool::new(false),
+            cancel_count: AtomicUsize::new(0),
+            cancel_fails: true,
+        });
+        assert!(
+            request_user_active_cancel(&failed_user_gate, Some(failing_control))
+                .await
+                .is_err()
+        );
+        let failed_user_terminal = claim_post_release_terminal(
+            &failed_user_gate,
+            CommandTerminal::failed(SanitizedTerminalFailure::execution_failed()),
+        )
+        .await;
+        assert_eq!(
+            failed_user_terminal.terminal_state(),
+            TerminalState::Failed,
+            "a user request without exact fence proof must not become Canceled"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_claim_wins_before_late_user_cancel() {
+        let gate = Mutex::new(ActiveExecutionGate {
+            release_authorized: true,
+            ..ActiveExecutionGate::default()
+        });
+        let completed = claim_post_release_terminal(
+            &gate,
+            CommandTerminal::completed(TurnSummary {
+                total_input_tokens: None,
+                total_output_tokens: None,
+                elapsed_ms: 1,
+            }),
+        )
+        .await;
+        assert_eq!(completed.terminal_state(), TerminalState::Completed);
+        let replayed = claim_post_release_terminal(
+            &gate,
+            CommandTerminal::failed(SanitizedTerminalFailure::execution_failed()),
+        )
+        .await;
+        assert_eq!(
+            replayed.terminal_state(),
+            TerminalState::Completed,
+            "the first terminal claim remains authoritative"
+        );
+
+        let late_control = Arc::new(FakeControl {
+            gate: Arc::new(Semaphore::new(0)),
+            canceled: AtomicBool::new(false),
+            cancel_count: AtomicUsize::new(0),
+            cancel_fails: false,
+        });
+        assert!(
+            !request_user_active_cancel(&gate, Some(late_control.clone()))
+                .await
+                .expect("late cancel is classified without touching the process group")
+        );
+        assert_eq!(late_control.cancel_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn normal_completion_fence_winner_makes_preclaim_cancel_stale() {
+        // 威胁场景：adapter 已返回 Completed，但 normal process-group cleanup 仍在进行；
+        // 此时用户 Cancel 若只复用一个无类型的 fence Ok，会在 completion claim 前抢写
+        // user flags 并把真实 Completed 改成 Canceled。typed winner 必须让该 Cancel stale。
+        let gate = Mutex::new(ActiveExecutionGate {
+            release_authorized: true,
+            ..ActiveExecutionGate::default()
+        });
+        let control = Arc::new(AlreadyCompletingControl {
+            cancel_count: AtomicUsize::new(0),
+        });
+
+        assert!(
+            !request_user_active_cancel(&gate, Some(control.clone()))
+                .await
+                .expect("normal completion winner is a safe stale cancel")
+        );
+        assert_eq!(control.cancel_count.load(Ordering::SeqCst), 1);
+        {
+            let state = gate.lock().await;
+            assert!(state.completion_won);
+            assert!(state.cancel_fenced);
+            assert!(!state.user_cancel_accepted);
+            assert!(!state.user_cancel_fenced);
+        }
+
+        request_active_cancel(&gate, Some(control.clone()))
+            .await
+            .expect("shutdown accepts an already-fenced normal completion");
+        assert_eq!(control.cancel_count.load(Ordering::SeqCst), 2);
+        interrupt_active_for_approval_expiry(&gate, Some(control.clone()))
+            .await
+            .expect("approval expiry leaves an already-completing terminal authoritative");
+        assert_eq!(
+            control.cancel_count.load(Ordering::SeqCst),
+            2,
+            "completion winner makes expiry a no-op without another control call"
+        );
+
+        let completed = claim_post_release_terminal(
+            &gate,
+            CommandTerminal::completed(TurnSummary {
+                total_input_tokens: Some(2),
+                total_output_tokens: Some(3),
+                elapsed_ms: 5,
+            }),
+        )
+        .await;
+        assert_eq!(completed.terminal_state(), TerminalState::Completed);
+
+        assert!(
+            !request_user_active_cancel(&gate, Some(control.clone()))
+                .await
+                .expect("claimed completion remains stale")
+        );
+        assert_eq!(
+            control.cancel_count.load(Ordering::SeqCst),
+            2,
+            "claimed completion must reject without another control call"
+        );
     }
 
     #[tokio::test]
@@ -5389,7 +6759,9 @@ mod tests {
     async fn cancel_after_prepared_proceed_but_before_authorize_stays_pre_release() {
         let root = TestRoot::new("cancel-between-prepare-and-authorize");
         let keys = MemoryKeyStore::new();
-        let blocker = Arc::new(BlockFenceCommit::new());
+        let blocker = Arc::new(BlockStoreOperation::new(
+            RuntimeStoreOperation::PersistFenceBeforeCommit,
+        ));
         let kek = load_or_create_storage_kek(&keys, &root.0.join("key-state.db"))
             .expect("actor test StorageKEK");
         let store = RuntimeStoreHandle::open(
@@ -5667,11 +7039,7 @@ mod tests {
         wait_until(|| blocker.entered.load(Ordering::SeqCst)).await;
         fake.allow_prepare();
         wait_until(|| fake.active() == 0).await;
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        assert!(
-            !*prompt_ingress.open.borrow(),
-            "runner exit must close prompt ingress before admission completes"
-        );
+        wait_until(|| !*prompt_ingress.open.borrow()).await;
         blocker.release();
         let admitted = tokio::time::timeout(Duration::from_secs(1), submit)
             .await
@@ -5745,6 +7113,409 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clean_prepare_failure_writes_interrupted_and_starts_queued_successor() {
+        // 威胁场景：固定 vendor binary 不存在，prepare 尚未创建 child 或产生副作用便
+        // 返回已证明 clean 的错误；若 actor 把它当 RecoveryBlocked，会永久封死 durable
+        // queue。它必须以 exact pre-release Interrupted 收口，并继续 FIFO successor。
+        let root = TestRoot::new("clean-prepare-failure");
+        let store = root.open().await;
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 46).await;
+        let fake = FakeCoordinator::clean_prepare_failure_once();
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xE4),
+            1,
+        )
+        .expect("registry");
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        let principal = local_principal(46);
+        let failed = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "clean-prepare-failure",
+                "fixed vendor binary is absent",
+            )
+            .await,
+        );
+        let successor = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "clean-prepare-successor",
+                "must execute after clean failure",
+            )
+            .await,
+        );
+
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        wait_for_receipt_state(
+            &store,
+            conversation.conversation_id,
+            failed.command_id,
+            &principal,
+            CommandState::Interrupted,
+        )
+        .await;
+        wait_for_receipt_state(
+            &store,
+            conversation.conversation_id,
+            successor.command_id,
+            &principal,
+            CommandState::Completed,
+        )
+        .await;
+        assert_eq!(
+            fake.starts().len(),
+            1,
+            "clean failure creates no fake child"
+        );
+        assert_eq!(fake.starts()[0].command_id, successor.command_id);
+        assert_eq!(fake.release_count(), 1);
+
+        registry.shutdown().await.expect("shutdown actors");
+        store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test]
+    async fn accepted_cancel_during_clean_prepare_failure_writes_canceled() {
+        // 威胁场景：用户在尚无 control 的 blocked prepare 期间收到 Requested，随后
+        // adapter 证明 prepare clean failure；durable terminal 必须保持用户取消赢家，
+        // 不能降级成 Interrupted。
+        let root = TestRoot::new("clean-prepare-user-cancel");
+        let store = root.open().await;
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 49).await;
+        let fake = FakeCoordinator::blocked_clean_prepare_failure_once();
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xE7),
+            1,
+        )
+        .expect("registry");
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        let principal = local_principal(49);
+        let command = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "clean-prepare-user-cancel",
+                "cancel must win the clean failure race",
+            )
+            .await,
+        );
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        wait_for_receipt_state(
+            &store,
+            conversation.conversation_id,
+            command.command_id,
+            &principal,
+            CommandState::Started,
+        )
+        .await;
+        let turn_id = read_only_command_turn_id(&root.0.join("runtime.db"), command.command_id);
+        assert_eq!(
+            registry
+                .cancel_active(
+                    conversation.conversation_id,
+                    turn_id,
+                    principal.try_enter().expect("cancel guard"),
+                )
+                .await
+                .expect("cancel accepted during prepare"),
+            ActiveCancelResult::Requested
+        );
+        fake.allow_prepare();
+        wait_for_receipt_state(
+            &store,
+            conversation.conversation_id,
+            command.command_id,
+            &principal,
+            CommandState::Canceled,
+        )
+        .await;
+        assert!(
+            fake.starts().is_empty(),
+            "clean failure creates no fake child"
+        );
+
+        registry.shutdown().await.expect("shutdown actors");
+        store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test]
+    async fn late_cancel_after_clean_prepare_terminal_claim_is_stale() {
+        // 威胁场景：clean failure 已 claim Interrupted、但 SQLite terminal COMMIT 仍阻塞；
+        // 若 claim 发生在 COMMIT 之后，晚到 Cancel 会错误返回 Requested，随后却读到
+        // Interrupted。terminal 必须先在 execution gate 线性化。
+        let root = TestRoot::new("clean-prepare-late-cancel");
+        let keys = MemoryKeyStore::new();
+        let blocker = Arc::new(BlockStoreOperation::new(
+            RuntimeStoreOperation::TerminateStartedBeforeReleaseBeforeCommit,
+        ));
+        let kek = load_or_create_storage_kek(&keys, &root.0.join("key-state.db"))
+            .expect("late cancel StorageKEK");
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.0.join("runtime.db")).with_fault_injector(blocker.clone()),
+            kek,
+        )
+        .await
+        .expect("open late cancel store");
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 50).await;
+        let fake = FakeCoordinator::blocked_clean_prepare_failure_once();
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xE8),
+            1,
+        )
+        .expect("registry");
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        let principal = local_principal(50);
+        let command = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "clean-prepare-late-cancel",
+                "late cancel must observe the terminal claim",
+            )
+            .await,
+        );
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        wait_for_receipt_state(
+            &store,
+            conversation.conversation_id,
+            command.command_id,
+            &principal,
+            CommandState::Started,
+        )
+        .await;
+        let turn_id = read_only_command_turn_id(&root.0.join("runtime.db"), command.command_id);
+        fake.allow_prepare();
+        wait_until(|| blocker.entered.load(Ordering::SeqCst)).await;
+        assert_eq!(
+            registry
+                .cancel_active(
+                    conversation.conversation_id,
+                    turn_id,
+                    principal.try_enter().expect("late cancel guard"),
+                )
+                .await
+                .expect("late cancel result"),
+            ActiveCancelResult::Stale
+        );
+        blocker.release();
+        wait_for_receipt_state(
+            &store,
+            conversation.conversation_id,
+            command.command_id,
+            &principal,
+            CommandState::Interrupted,
+        )
+        .await;
+
+        registry.shutdown().await.expect("shutdown actors");
+        store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test]
+    async fn clean_prepare_failure_commit_unknown_retries_exact_terminal_and_starts_successor() {
+        // 威胁场景：clean prepare failure 的 Interrupted 已 COMMIT，但 SQLite worker 在
+        // 回复前停止；actor 必须只用同一 TerminateStartedBeforeRelease 输入重试，不能
+        // 把已落盘 terminal 误判为 RecoveryBlocked，也不能重复启动首命令。
+        let root = TestRoot::new("clean-prepare-commit-unknown");
+        let database = root.0.join("runtime.db");
+        let keys = MemoryKeyStore::new();
+        let kek = load_or_create_storage_kek(&keys, &root.0.join("key-state.db"))
+            .expect("clean prepare commit-unknown StorageKEK");
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(database).with_fault_injector(Arc::new(
+                FailStoreOperationOnce::new(
+                    RuntimeStoreOperation::TerminateStartedBeforeReleaseAfterCommit,
+                    InjectedStoreFailure::WorkerStopped,
+                ),
+            )),
+            kek,
+        )
+        .await
+        .expect("open clean prepare commit-unknown store");
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 47).await;
+        let fake = FakeCoordinator::clean_prepare_failure_once();
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xE5),
+            1,
+        )
+        .expect("registry");
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        let principal = local_principal(47);
+        let failed = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "clean-prepare-commit-unknown-first",
+                "must converge through exact terminal retry",
+            )
+            .await,
+        );
+        let successor = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "clean-prepare-commit-unknown-successor",
+                "must execute exactly once",
+            )
+            .await,
+        );
+
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        wait_for_receipt_state(
+            &store,
+            conversation.conversation_id,
+            failed.command_id,
+            &principal,
+            CommandState::Interrupted,
+        )
+        .await;
+        wait_for_receipt_state(
+            &store,
+            conversation.conversation_id,
+            successor.command_id,
+            &principal,
+            CommandState::Completed,
+        )
+        .await;
+        assert_eq!(fake.starts().len(), 1);
+        assert_eq!(fake.starts()[0].command_id, successor.command_id);
+        assert_eq!(fake.release_count(), 1);
+
+        registry.shutdown().await.expect("shutdown actors");
+        store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test]
+    async fn uncertain_prepare_failure_blocks_conversation_and_keeps_successor_accepted() {
+        // 威胁场景：gate spawn/handshake 已开始但 cleanup outcome 不确定；若 actor 把
+        // 普通 PrepareFailed 当 clean Interrupted，queued successor 可能与残留 PGID 并行。
+        let root = TestRoot::new("uncertain-prepare-failure");
+        let database = root.0.join("runtime.db");
+        let store = root.open().await;
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 48).await;
+        let fake = FakeCoordinator::prepare_failure_once();
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xE6),
+            1,
+        )
+        .expect("registry");
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        let principal = local_principal(48);
+        let blocked = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "uncertain-prepare-first",
+                "must remain Started",
+            )
+            .await,
+        );
+        let successor = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "uncertain-prepare-successor",
+                "must remain Accepted",
+            )
+            .await,
+        );
+
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        wait_until(|| read_only_conversation_lifecycle(&database) == "recoveryBlocked").await;
+        wait_for_receipt_state(
+            &store,
+            conversation.conversation_id,
+            blocked.command_id,
+            &principal,
+            CommandState::Started,
+        )
+        .await;
+        wait_for_receipt_state(
+            &store,
+            conversation.conversation_id,
+            successor.command_id,
+            &principal,
+            CommandState::Accepted,
+        )
+        .await;
+        assert!(
+            fake.starts().is_empty(),
+            "uncertain prepare creates no fake owner"
+        );
+        assert_eq!(fake.release_count(), 0);
+        assert!(matches!(
+            registry
+                .submit_prompt(
+                    conversation.conversation_id,
+                    principal.clone(),
+                    principal.try_enter().expect("blocked ingress guard"),
+                    "must-be-rejected".to_owned(),
+                    b"must stay closed".to_vec(),
+                )
+                .await,
+            Err(ConversationError::ActorUnavailable)
+        ));
+
+        registry.shutdown().await.expect("shutdown actors");
+        store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test]
     async fn completion_error_without_fence_proof_blocks_recovery_and_keeps_started() {
         let root = TestRoot::new("completion-error-unfenced");
         let store = root.open().await;
@@ -5810,7 +7581,18 @@ mod tests {
     #[tokio::test]
     async fn release_error_after_authorization_fences_then_writes_interrupted() {
         let root = TestRoot::new("release-error-fenced");
-        let store = root.open().await;
+        let keys = MemoryKeyStore::new();
+        let blocker = Arc::new(BlockStoreOperation::new(
+            RuntimeStoreOperation::CompleteCommandBeforeCommit,
+        ));
+        let kek = load_or_create_storage_kek(&keys, &root.0.join("key-state.db"))
+            .expect("release error StorageKEK");
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.0.join("runtime.db")).with_fault_injector(blocker.clone()),
+            kek,
+        )
+        .await
+        .expect("open release error store");
         finish_recovery(&store).await;
         let conversation = create_conversation(&store, 11).await;
         let fake = FakeCoordinator::release_error_with_approval(approval_delivery());
@@ -5840,6 +7622,23 @@ mod tests {
             )
             .await,
         );
+        fake.wait_for_starts(1).await;
+        wait_until(|| blocker.entered.load(Ordering::SeqCst)).await;
+        assert_eq!(
+            registry
+                .cancel_active(
+                    conversation.conversation_id,
+                    fake.starts()[0].turn_id,
+                    principal
+                        .try_enter()
+                        .expect("late release-error cancel guard"),
+                )
+                .await
+                .expect("late release-error cancel"),
+            ActiveCancelResult::Stale,
+            "an internal release-error fence cannot be retroactively claimed by user cancel"
+        );
+        blocker.release();
         wait_for_receipt_state(
             &store,
             conversation.conversation_id,

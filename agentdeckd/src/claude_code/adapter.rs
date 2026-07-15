@@ -5,10 +5,10 @@
 //! Phase 4 Task 4B completes the v2 `Agent` trait surface scaffolded
 //! in 4A:
 //!
-//!   - `capabilities()` — real probe via `claude --version` cached in
-//!     a `OnceLock`; builds typed `SessionCapabilities` for the verified
-//!     shared and CC-only features. Approval remains hidden while its
-//!     response wire shape is speculative.
+//!   - `capabilities()` — legacy compatibility 实例缓存一次真实 `claude --version`
+//!     probe；canonical Runtime 实例固定使用预置 unknown 版本，避免 capability read
+//!     绕过 exec gate。只有 state-vault canonical 实例广告已验证的 stdio Approval；
+//!     legacy compatibility 实例仍隐藏 speculative legacy response wire。
 //!
 //!   - `start_session()` / `continue_thread()` — unchanged from 4A;
 //!     spawns CC, emits `SessionStarted` + `SessionCapabilities`
@@ -37,9 +37,11 @@
 //!     child subprocess tree (unchanged from 4A).
 
 use crate::agent::{
-    Agent, AgentEventSender, AgentSessionHandle, CanonicalAgentEvent, CanonicalAgentEventSender,
-    CanonicalAgentSessionHandle, CanonicalHistoryRead,
+    AdapterStateHandle, Agent, AgentEventSender, AgentSessionHandle, AgentTurnRequest,
+    CanonicalAgentEvent, CanonicalAgentEventSender, CanonicalAgentSessionHandle,
+    CanonicalHistoryRead, ExecSpec, PrepareAdapterTurnCapability, PreparedAgentTurn,
 };
+use crate::claude_code::driver::ClaudeCodePreparedTurn;
 use crate::claude_code::state::ClaudeCodeStateRepository;
 use crate::claude_code::translate::ClaudeCodeTranslator;
 use crate::runtime::store::{
@@ -52,6 +54,7 @@ use agentdeck_protocol::{
     ThreadId, VendorControlPayload, VendorSessionOptions,
 };
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
@@ -59,6 +62,8 @@ use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc};
+
+const CANONICAL_CLAUDE_CODE_VERSION: &str = "claude unknown";
 
 /// Shared routing table for permission responses. Cloned into both
 /// the stdout pump (writer side) and `SessionEntry` (reader side
@@ -99,8 +104,10 @@ impl ClaudeCodeAdapter {
     /// store 构造对应 vault；adapter 本身拿不到另一 vendor 的 capability。
     #[must_use]
     pub(crate) fn with_state_vault(vault: ClaudeCodeAdapterStateVault) -> Self {
+        // 威胁场景：canonical snapshot 若在 Fence/release 外 lazy probe PATH 中的
+        // vendor binary，恶意或有副作用的 binary 会绕过唯一 spawn owner。
         Self {
-            cli_version: OnceLock::new(),
+            cli_version: OnceLock::from(CANONICAL_CLAUDE_CODE_VERSION.to_owned()),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             state_repository: Some(ClaudeCodeStateRepository::new(vault)),
         }
@@ -137,15 +144,18 @@ impl ClaudeCodeAdapter {
     /// per process).
     fn capabilities_for_v2(&self) -> SessionCapabilities {
         use crate::claude_code::capabilities::{
-            build_claude_code_capabilities, probe_claude_code_version,
+            build_canonical_claude_code_capabilities, build_claude_code_capabilities,
+            probe_claude_code_version,
         };
         let version = self
             .cli_version
             .get_or_init(probe_claude_code_version)
             .clone();
-        // Canonical builder is the single capability fact source. It keeps
-        // speculative Approval hidden until a recorded fixture/live gate.
-        build_claude_code_capabilities(version)
+        if self.state_repository.is_some() {
+            build_canonical_claude_code_capabilities(version)
+        } else {
+            build_claude_code_capabilities(version)
+        }
     }
 
     /// Build the `claude` command line from a `SessionStart`. Wraps the
@@ -600,6 +610,49 @@ fn adapter_state_error(error: RuntimeStoreError) -> ProtocolError {
     }
 }
 
+async fn bind_and_verify_typed_state(
+    repository: &ClaudeCodeStateRepository,
+    adapter_state_key: RuntimeId,
+    native_session: &ThreadId,
+) -> Result<(), ProtocolError> {
+    let first = repository
+        .bind(adapter_state_key, native_session.clone())
+        .await;
+    let mut observed = repository
+        .resolve(adapter_state_key)
+        .await
+        .map_err(|_| typed_prepare_error("cc-state-readback-failed"))?;
+    if observed.as_ref() == Some(native_session) {
+        return Ok(());
+    }
+    if observed.is_some() {
+        return Err(typed_prepare_error("cc-state-readback-mismatch"));
+    }
+    if first.is_err() {
+        repository
+            .bind(adapter_state_key, native_session.clone())
+            .await
+            .map_err(|_| typed_prepare_error("cc-state-bind-failed"))?;
+        observed = repository
+            .resolve(adapter_state_key)
+            .await
+            .map_err(|_| typed_prepare_error("cc-state-readback-failed"))?;
+    }
+    if observed.as_ref() == Some(native_session) {
+        Ok(())
+    } else {
+        Err(typed_prepare_error("cc-state-readback-mismatch"))
+    }
+}
+
+fn typed_prepare_error(code: &str) -> ProtocolError {
+    ProtocolError {
+        code: code.to_owned(),
+        message: "Claude Code typed execution preparation failed".to_owned(),
+        diagnostic_ref: None,
+    }
+}
+
 const CC_IDENTITY_TIMEOUT: Duration = Duration::from_secs(20);
 const CC_IDENTITY_MAX_LINES: usize = 256;
 const CC_IDENTITY_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -791,6 +844,70 @@ impl Agent for ClaudeCodeAdapter {
 
     fn capabilities(&self) -> SessionCapabilities {
         self.capabilities_for_v2()
+    }
+
+    async fn prepare_adapter_turn(
+        &self,
+        _capability: &mut PrepareAdapterTurnCapability,
+        request: AgentTurnRequest,
+        state: AdapterStateHandle,
+    ) -> Result<Box<dyn PreparedAgentTurn>, ProtocolError> {
+        let repository = self
+            .state_repository
+            .clone()
+            .ok_or_else(|| typed_prepare_error("cc-state-vault-unavailable"))?;
+        let existing = repository
+            .resolve(state.key())
+            .await
+            .map_err(|_| typed_prepare_error("cc-state-resolve-failed"))?;
+        let (native_session, was_already_bound) = match existing {
+            Some(existing) => (existing, true),
+            None => {
+                let generated = ThreadId(uuid::Uuid::new_v4().to_string());
+                bind_and_verify_typed_state(&repository, state.key(), &generated).await?;
+                (generated, false)
+            }
+        };
+        let use_resume = was_already_bound
+            && crate::claude_code::history::native_session_is_materialized(&native_session).await?;
+
+        // 威胁场景：typed prepare 若从 daemon 继承 PATH 选择 vendor，项目目录中的同名
+        // 程序可在 gate 清空环境前被固化为绝对路径。解析必须与 gate 的固定 SAFE_PATH
+        // 使用同一信任根，且 vendor 首次执行仍由 current-binary exec gate 独占。
+        let program = crate::exec_gate::resolve_trusted_program("claude")
+            .ok_or_else(|| typed_prepare_error("cc-binary-not-found"))?;
+        let mut args = [
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--permission-prompt-tool",
+            "stdio",
+            "--verbose",
+            "--permission-mode",
+            permission_mode_to_cli(ClaudeCodePermissionMode::Default),
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+        args.push(OsString::from(if use_resume {
+            "--resume"
+        } else {
+            "--session-id"
+        }));
+        args.push(OsString::from(&native_session.0));
+        let cwd = request.cwd().to_path_buf();
+        let exec_spec = ExecSpec::new(&request, state, program, args, cwd)
+            .map_err(|_| typed_prepare_error("cc-exec-spec-invalid"))?;
+        let (_, _, prompt) = request.into_parts();
+        Ok(Box::new(ClaudeCodePreparedTurn {
+            exec_spec,
+            repository,
+            adapter_state_key: state.key(),
+            expected_native_session: native_session,
+            prompt: prompt.into_string(),
+        }))
     }
 
     async fn start_session(

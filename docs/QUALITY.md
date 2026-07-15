@@ -625,8 +625,8 @@ session id。未设置 `AGENTDECK_E2E=1` 时，真实 CLI/model/history smoke �
 
 ## Relay Companion MVP P3.4 RuntimeCore 门禁
 
-P3.4 证明 transport-neutral Core、journal actor 与 Runtime v1 精确契约；production execution
-仍固定 fail-closed，不能把 fake coordinator 当作 P3.7 vendor exec 证据：
+P3.4 证明 transport-neutral Core、journal actor 与 Runtime v1 精确契约；该阶段的 execution
+固定 fail-closed，不能把 fake coordinator 当作后续 P3.7 vendor exec 证据：
 
 ```bash
 # Core/actor/connection/read pool + 100路Start single-flight
@@ -665,8 +665,9 @@ COMMIT permit 后产生 completion future；permit 精确绑定 command/boot/non
 硬上界；Core 先 Closing+operation/start-lease quiescence、后发布 Draining，且 shutdown 后
 actor/writer/router ownership 归零。
 
-P3.4 production coordinator 必须保持 disabled，因此测试中 fake process identity 只用于验证
-store/actor ordering，不能作为真实 vendor 运行证据。真实 `agentdeckd --exec-gate` 属于 P3.7；
+P3.4 的阶段门禁刻意使用 disabled coordinator，因此其中 fake process identity 只验证
+store/actor ordering，不能作为真实 vendor 运行证据。当前 production `agentdeckd --exec-gate` 必须
+另跑下方 P3.7 门禁；
 stable Keychain signed roundtrip 仍受 P3.1 provisioning 外部门禁阻塞。
 
 ## Relay Companion MVP P3.5 approval 门禁
@@ -746,11 +747,12 @@ scripts/verify-agent-docs.sh
   completion input 精确重放后正常清 route/启动 successor；route 不存在或 generation 不匹配的迟到
   FatalClosure 必须忽略，不能污染已经 terminal 的 conversation。
 - RecoveryBlocked 只停止进程内 worker，不恢复 active delivery，也不在缺少 process fencing 证据
-  时伪造 Expired/Interrupted。Codex adapter shape 证明精确 route 和 kind/persist/flush；CC
-  production Approval capability 必须继续隐藏。
+  时伪造 Expired/Interrupted。Codex adapter shape 证明精确 route 和 kind/persist/flush；P3.5 时 CC
+  Approval 必须隐藏，P3.7 只有 canonical typed builder 可基于 recorded `control_request` fixture 广告，
+  legacy compatibility builder 继续隐藏。
 
 P3.5 没有真实 vendor 或 UI 手动 QA 退出项：production coordinator、
-`RuntimeExecutionEvent` 与 `agentdeckd --exec-gate` 的真实接线属于 P3.7。未设置 live gate、没有
+`RuntimeExecutionEvent` 与 `agentdeckd --exec-gate` 的真实接线由 P3.7 单独验证。没有
 Codex/CC 登录或没有公开 WSS 时，结果只能记为 GATED/BLOCKED，不能用 fake delivery、shape test
 或本地 compatibility stdio 冒充端到端通过。
 
@@ -850,15 +852,15 @@ ReadPool、配额与调度完全不变。
   不能计入本门禁。`TransferStateMachine` 与 publication dispatcher 目前没有 production remote
   owner，component test outcome 不能写成 WSS ingress/egress 证据。
 
-P3.1 provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate；P3.7 exec gate、P3.8/P3.9 UDS
-和 P4 remote 尚未完成。因此即使本节全绿，也只能收口 P3.6 component，不得宣称 P3、Companion MVP
-或真实跨网链路完成。
+P3.1 provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate；P3.7 exec gate 边界、prepare findings、
+fresh 完整门禁与独立终审已收口，但 scoped commit 仍待完成；P3.8/P3.9 UDS 和 P4 remote 尚未完成。
+因此即使本节全绿，也只能收口 P3.6 component，不得宣称 P3、Companion MVP 或真实跨网链路完成。
 
-## Relay Companion MVP P3.7 typed execution 前置分片门禁
+## Relay Companion MVP P3.7 exec-gate 与 production execution 门禁
 
-P3.7 先把 adapter 输入、canonical Item/Error、Fence/release 与 dynamic audit 收紧为 daemon-owned
-contract，再实现真实 `agentdeckd --exec-gate`。本节只验证该前置分片；即使全部通过，也不能替代
-私有 FD gate、真实 PGID/start-time、TERM→KILL orphan recovery、adapter attach 或 live vendor 登录。
+本节同时验证 typed journal 前置 contract、真实 current-binary `agentdeckd --exec-gate`、私有 FD、
+PGID/start-time、TERM→KILL orphan recovery、typed driver attach 与 durable ACK terminal barrier。
+筛选录制和 `/bin/sh` 无副作用 helper 仍不能替代已登录 vendor、真实 approval 或跨设备证据。
 
 ```bash
 # typed builder、release gate、exact replay、竞态与真实 byte boundary
@@ -878,8 +880,8 @@ cargo test -p agentdeckd --test runtime_store_legacy_terminal -- --test-threads=
 cargo test -p agentdeckd --test runtime_store_hardening -- --test-threads=1
 cargo test -p agentdeckd --lib runtime::store::sqlite::migration_tests -- --test-threads=1
 
-# 真实 adapter 录制 → typed Item/terminal → reopen/backfill，以及 terminal reserve 样本
-cargo test -p agentdeckd --test runtime_execution_fixture
+# 真实 adapter 录制 → typed RuntimeTranslator/AdapterItemKey → reopen/backfill，以及 terminal reserve 样本
+cargo test -p agentdeckd --lib runtime::conversation::runtime_execution_fixture_tests -- --test-threads=1
 cargo test -p agentdeckd --test runtime_store_capacity \
   released_terminal_closes_on_fragmented_real_sqlite_with_a_pinned_wal_reader
 cargo test -p agentdeckd --lib \
@@ -890,6 +892,19 @@ cargo test -p agentdeckd --lib nine_mib_canonical_event_replays_through_backfill
 cargo test -p agentdeckd --lib regular_near_limit_backfill_pages_charge_dto_and_payload_in_one_pool -- --test-threads=1
 cargo test -p agentdeckd --lib oversized_backfill_payload_holds_exclusive_read_lease_until_flush_and_cancel -- --test-threads=1
 
+# current-binary gate、production owner、driver/ACK 与两遍 recovery
+cargo test -p agentdeckd --lib exec_gate::tests::trusted_program_resolution_ignores_arbitrary_paths_and_stays_in_safe_path
+cargo test -p agentdeckd --lib dropping_registered_approval_route_does_not_complete_the_waiting_driver -- --test-threads=1
+cargo test -p agentdeckd --lib runtime::conversation::tests::pending_approval_deadline_fences_vendor_and_releases_actor_for_successor -- --exact --test-threads=1
+cargo test -p agentdeckd --lib runtime::conversation::tests::approval_expiry_watchdog_fail_closes_a_stalled_terminal_pipeline -- --exact --test-threads=1
+cargo test -p agentdeckd --lib runtime::conversation::tests::outcome_unknown_approve_expiry_never_sends_a_synthetic_deny -- --exact --test-threads=1
+cargo test -p agentdeckd --test exec_gate -- --test-threads=1
+cargo test -p agentdeckd --test runtime_crash_recovery -- --test-threads=1
+cargo test -p agentdeckd --test runtime_store_recovery -- --test-threads=1
+cargo test -p agentdeckd --test runtime_approval -- --test-threads=1
+cargo test -p agentdeckd --test typed_spawn_ownership -- --test-threads=1
+cargo test -p agentdeckd --test production_execution_wiring -- --test-threads=1
+
 # 分片 merge gate；默认并发 daemon 回归不可被串行 focused suites 替代
 cargo test -p agentdeckd
 cargo fmt --all -- --check
@@ -897,12 +912,13 @@ cargo clippy -p agentdeckd --all-targets -- -D warnings
 cargo run -q -p agentdeck-cli -- protocol schema \
   | diff - protocol/agentdeck/agentdeck-protocol.schema.json
 bash scripts/check-daemon-no-net.sh
+cargo run -p agentdeckd -- --ephemeral --no-remote </dev/null
 swift test
 git diff --check
 scripts/verify-agent-docs.sh
 ```
 
-该分片至少证明：adapter 不能提交 raw `RuntimeEvent`/bytes/`ProtocolError`；fresh Item/Error 只在
+typed journal 分片至少证明：adapter 不能提交 raw `RuntimeEvent`/bytes/`ProtocolError`；fresh Item/Error 只在
 authenticated Started、精确 turn 与 durable release 之后写入；Error 只能使用固定
 `daemon.runtime.execution_failed`；eventId 撞 Started/terminal pointer、错 command/turn、terminal 后
 fresh append 全部拒绝，而 COMMIT-unknown、disk-low、clock regression 与 terminal 后的同 eventId
@@ -935,16 +951,68 @@ Code fixture 也已从 2.1.191 真实录制收窄为 assistant/result 与 Bash t
 移除用户环境、插件清单、绝对路径、思考签名和随机身份；未被测试消费且含短期授权材料的旧
 `plan_mode.jsonl` 已删除。capture、筛选、hash 与原始临时文件清理边界见
 `agentdeckd/tests/fixtures/README.md`。门禁要求 Raw 立即失败，并逐字节读回 daemon event/item/entity/
-command identity、modeled Item 与唯一 terminal；它仍不替代 live exec-gate/vendor 登录。
+command identity、modeled Item 与唯一 terminal；它不替代 live vendor 登录。
+
+exec-gate 门禁必须另外证明：adapter 只从与 gate 相同的固定目录集合（系统目录加 macOS 当前 OS
+account 的 `~/.local/bin`，后者由 `getpwuid_r(geteuid())` 获取而非继承 HOME）解析 vendor basename，
+继承 PATH 和带 `/` 名称均不能选中 program；gate spec、prompt、nonce/release token 不进 argv/env；exact
+release 前 vendor side effect 为零；control FD 关闭会收割 blocked group；release 后所有 child 仍在同一
+PGID，completion/actor owner drop 与 vendor 先退出都必须继续清理同组 child；忽略 TERM 的真实 group
+必须升级 KILL 并 reap。五个 crash cut、PID start-time mismatch、TERM→KILL 仍失败、healthy/blocked
+conversation 隔离、P4 前 remote Accepted 全局拒绝与两遍 recovery cut 都必须通过。
+
+P3.7 已裁决只覆盖始终留在继承 sentinel PGID 内的 cooperative descendants：release 前 vendor/tool
+副作用必须为零，cancel、owner drop、vendor 先退出与 crash recovery 都必须 TERM→KILL/reap 全部同组
+子孙。主动 `setsid`/`setpgid`，或另起 `launchd`/launch service 等 supervisor 的显式自守护/逃逸是
+流程外不支持行为；当前机制不声称检测、枚举或收割，也不得声称逃逸会触发 `RecoveryBlocked`。真实
+逃逸样本只作为边界证据保留，不计入受支持的清理用例。
+
+两个 prepare finding 已关闭：blocked gate 从 Ready 起由唯一并行 reaper 持有 `Child`，release 前
+cancel/cleanup 必须 KILL 后 await/reap；只有 pre-spawn 且确认无 child 的失败可返回
+`PrepareFailedClean`；`current_exe`、socketpair/timeout 配置等调用 Tokio `Command::spawn()` 前的错误可
+进入该分类，从调用 Tokio spawn 起的所有错误以及任一无法证明 exact kill/reap 的 attach cleanup
+都保持 `PrepareFailed` 并进入 RecoveryBlocked。execution unit、actor queue、clean terminal
+COMMIT-unknown exact retry 均有聚焦回归；最终树的完整 package 退出码仍须由本轮门禁读回，不能复用旧的
+lib 计数。33 MiB 真实 snapshot 测试只把 harness deadlock deadline 对齐为 120 秒，
+未改变预算、flush ACK 或产品超时语义。
+
+approval deadline 组合门禁还必须证明：Codex/Claude Code transient route 被 drop 时，等待中的 driver
+不会自行完成或写 response；durable Expired 只能触发 exact fence，不能生成 synthetic Deny；已排队
+successor 会在唯一 `Interrupted` terminal 后自动启动。若 fence 已成功但 daemon completion pipeline
+仍永久 pending，10 秒 watchdog 必须把 exact conversation fail-close 为 RecoveryBlocked、保留 Started
+与 queued Accepted，不得伪造 terminal 或继续执行后续命令。
+
+`production_execution_wiring` 调用真实 daemon binary 内部的 debug-only production probe，并用
+`/bin/sh` 无副作用 helper，
+贯穿 RuntimeCore recovery/actor、production coordinator、typed router/driver、current-binary gate、
+durable event ACK 与 terminal；关闭并 reopen Store 后必须读回 1 条 canonical item 和 1 条 terminal。
+probe 不接受 binary/root 注入，内部原子创建随机临时目录并 RAII 清理；release build 不暴露该 CLI。
+此门禁证明组合 wiring，不证明 Codex/Claude Code 登录态、live vendor CC approval、UDS、RemoteLink
+或物理设备。canonical CC builder 当前已广告 Approval，并把 recorded
+`control_request(can_use_tool)` 接到 durable `control_response`；legacy compatibility 与未建模 Hooks
+继续隐藏 Approval。canonical CC 2.1.207 status/hook/task/tool lifecycle 必须以封闭 shape 校验后
+非持久化消费，未知 subtype/patch fail-close；deferred 或缺失精确 terminal 字段的 result 不得写
+TurnComplete。translator 终审门禁还必须覆盖：Codex/CC 两条可区分动作产生不同的有界、脱敏、UTF-8
+安全 summary；Codex 自由文本以 JSON 可见转义保留控制边界且超界拒绝，CC 控制字符折叠并截断；非选中
+raw 字段不落盘；Codex completed kind 漂移、`inProgress`、未知/缺失 terminal
+status 拒绝且保留 in-flight，`declined` 为 Canceled；CC canonical/legacy/history 对无权威退出码的
+`tool_result` 均写 `exit_code=None`，fixture byte-equivalence 不漂移。还必须覆盖 command 缺 concrete
+command/完整 commandActions/已验证 network target、file request 未绑定同一 in-flight fileChange 的
+非空 proposed changes、CC tool 缺具体动作或未知，以及空/过大 permission profile 均不产生 Approval；
+file 的 proposed patch 必须先于 approval 可见，optional grantRoot/reason 不能单独授权；permission summary 与
+adapter 实际返回的 validated profile 复用同一 validator，并完整保留字段结构；summary 中字段值使用
+脱敏投影，adapter 响应仍回送已验证的原始字段值；Debug 不含 request/raw params。Codex 官方
+PatchChangeKind object、memoryCitation identity 过滤与 non-authoritative notification 只影响最终
+authoritative item 的行为也要由 schema 行为测试锁定，但不能写成 live fixture 证据。
 
 当前树的 credential/用户绝对路径 scan 为空，但祖先提交 `68b6cfd` 仍可读到原
 `plan_mode.jsonl`。未经明确授权不得在本 task 用 rebase/filter-repo 改写已共享历史，且当前没有
 该 OAuth flow 的撤销/过期读回证据；因此完整 Git history 的 credential 处置仍是明确 security debt，
 不能用当前树扫描结果宣称历史已清理。
 
-当前仍未完成 `GatedChild/PreparedAgentTurn::attach`、私有 FD codec、current-binary gate submode、
-process identity/fencing、真实 coordinator、neutral adapter correlation key 与两遍 orphan recovery。
-在这些门禁全绿前，production coordinator 必须保持 disabled，P3.7 状态只能是实施中。
+P3.7 主体代码与 translator 终审修复已落到候选树；fresh 完整门禁与独立终审已通过，当前只待 scoped
+commit。P3.1 provisioned signed Keychain 仍外部 BLOCKED；
+P3.8/P3.9 UDS、P3.10 LaunchAgent、P4 RemoteLink/E2EE 与 P5/P6 实机证据必须继续保持未完成。
 
 ## AppKit 重写后的验证清单
 
@@ -1064,9 +1132,10 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P0 基线或 v1 reset | 迭代时跑 `bash scripts/tests/reset-relay-v1-dev-state.sh`；提交前跑一次 `bash scripts/verify-relay-companion-mvp.sh p0` |
 | Relay Companion MVP P3.1 daemon namespace / singleton / StorageKEK | 运行本页 P3.1 聚焦矩阵、`cargo test -p agentdeckd`、CLI/Swift transport tests、daemon no-net；stable Keychain 必须另有真实 provisioned signed helper 证据，ignored 不算通过 |
 | Relay Companion MVP P3.2/P3.3 Runtime SQLite / journal / adapter 私表 | 运行本页十四组 store/boundary tests（含真实 256 MiB、paged recovery 与 v1→v2 migration）、canonical router/双 adapter tests、默认并发 `cargo test -p agentdeckd`、daemon no-net、fmt/clippy/diff/docs；只证明组件，不冒充 RuntimeCore/UDS/Companion E2E |
-| Relay Companion MVP P3.4 RuntimeCore / principal / actor | 运行本页 P3.4 Core+Store+Rust/Swift contract 矩阵、100 路 Start 竞态、daemon 全回归、no-net/fmt/clippy/diff/docs；production execution 必须 disabled，不能冒充 P3.7 exec-gate 或 P3.8/P3.9 UDS E2E |
-| Relay Companion MVP P3.5 approval CAS / delivery | 运行本页 P3.5 固定 16 项聚合 gate，并以 private schema/sqlite/store/permission/worker/actor fault tests 作为行为证据；补跑 adapter shape、Rust/Swift contract、daemon 全回归与静态边界。CC Approval 仍隐藏，fake delivery 不冒充 P3.7 exec-gate/live vendor E2E |
+| Relay Companion MVP P3.4 RuntimeCore / principal / actor | 运行本页 P3.4 Core+Store+Rust/Swift contract 矩阵、100 路 Start 竞态、daemon 全回归、no-net/fmt/clippy/diff/docs；该历史阶段用 disabled coordinator，只证明 Core contract，不能替代 P3.7 exec-gate 或 P3.8/P3.9 UDS E2E |
+| Relay Companion MVP P3.5 approval CAS / delivery | 运行本页 P3.5 固定 16 项聚合 gate，并以 private schema/sqlite/store/permission/worker/actor fault tests 作为行为证据；补跑 adapter shape、Rust/Swift contract、daemon 全回归与静态边界。P3.5/legacy CC Approval 隐藏；P3.7 canonical typed builder 的 recorded fixture 也不冒充 live vendor E2E |
 | Relay Companion MVP P3.6 canonical stream / snapshot / transfer | 运行本页 P3.6 Rust/Swift contract、`runtime_stream`、`runtime_transfer`、store v4/read-pool/snapshot、daemon-private `runtime::` 与完整 daemon 回归；补跑 fmt/no-net/diff/docs。fake sealed publication 只证明状态机，不冒充 P4 E2EE/Relay Publish、UDS 或 Companion E2E |
+| Relay Companion MVP P3.7 exec-gate / typed production execution | 运行本页 prepare disposition、gate/recovery/driver/typed fixture/production wiring 矩阵、完整 daemon package、clippy/fmt/no-net/schema/docs/diff；固定 PATH、私有 FD、唯一 reaper、cooperative-descendant PGID fencing、COMMIT-unknown 与 reopen/backfill 必须有行为证据。显式自守护/逃逸不受支持，helper/fixture 不冒充 live vendor approval、UDS 或实机 E2E |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

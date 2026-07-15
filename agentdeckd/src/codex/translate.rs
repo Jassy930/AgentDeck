@@ -135,8 +135,8 @@ struct InFlightItem {
     last_payload: Value,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum InFlightKind {
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) enum InFlightKind {
     AssistantMessage,
     Reasoning,
     Shell,
@@ -468,12 +468,39 @@ impl CodexTranslator {
             .map(str::to_string)
             .unwrap_or_default();
         // If we never saw `started`, classify on the fly so completed-only
-        // streams (some panel-style items) still surface.
-        let prior = self.in_flight.remove(&id);
-        let kind = prior
-            .as_ref()
+        // streams (some panel-style items) still surface. Validate shell
+        // status before removing state so a rejected terminal cannot turn a
+        // later authoritative completion into a completed-only item.
+        let completed_kind = classify(item);
+        if self
+            .in_flight
+            .get(&id)
+            .is_some_and(|prior| prior.kind != completed_kind)
+        {
+            return vec![self.error_event(
+                "codex-item-kind-mismatch",
+                "Codex changed an in-flight item kind".to_owned(),
+            )];
+        }
+        let kind = self
+            .in_flight
+            .get(&id)
             .map(|p| p.kind)
-            .unwrap_or_else(|| classify(item));
+            .unwrap_or(completed_kind);
+        if matches!(kind, InFlightKind::Shell) {
+            let status = match shell_status_from(item) {
+                Ok(status) => status,
+                Err(error) => {
+                    return vec![ServerEvent::Error {
+                        session_id: Some(self.session_id.clone()),
+                        error,
+                    }];
+                }
+            };
+            self.in_flight.remove(&id);
+            return vec![self.shell_event(item, status)];
+        }
+        let prior = self.in_flight.remove(&id);
         let accumulated = prior
             .as_ref()
             .map(|p| p.accumulated_text.clone())
@@ -508,7 +535,7 @@ impl CodexTranslator {
                     meta: AgentItemMeta::default(),
                 }
             }
-            InFlightKind::Shell => return vec![self.shell_event(item, shell_status_from(item))],
+            InFlightKind::Shell => unreachable!("shell completion returned above"),
             InFlightKind::Diff => {
                 let files = diff_files(item);
                 AgentItem::Diff {
@@ -807,7 +834,7 @@ fn thread_id_from_params(params: &Value) -> Option<&str> {
 
 // ── classification + field extraction helpers ───────────────────────────────
 
-fn classify(item: &Value) -> InFlightKind {
+pub(super) fn classify(item: &Value) -> InFlightKind {
     match item.get("type").and_then(Value::as_str).unwrap_or("") {
         "agentMessage" => InFlightKind::AssistantMessage,
         "reasoning" => InFlightKind::Reasoning,
@@ -823,20 +850,20 @@ fn classify(item: &Value) -> InFlightKind {
     }
 }
 
-fn assistant_meta(item: &Value) -> AgentItemMeta {
+pub(super) fn assistant_meta(item: &Value) -> AgentItemMeta {
     let mut meta = AgentItemMeta::default();
     if let Some(phase) = item.get("phase") {
         meta.vendor_extensions
             .insert("phase".to_string(), phase.clone());
     }
-    if let Some(citation) = item.get("memoryCitation") {
+    if let Some(citation) = item.get("memoryCitation").filter(|value| !value.is_null()) {
         meta.vendor_extensions
             .insert("memoryCitation".to_string(), citation.clone());
     }
     meta
 }
 
-fn tool_meta(item: &Value) -> AgentItemMeta {
+pub(super) fn tool_meta(item: &Value) -> AgentItemMeta {
     let mut meta = AgentItemMeta::default();
     for key in [
         "server",
@@ -857,7 +884,7 @@ fn tool_meta(item: &Value) -> AgentItemMeta {
     meta
 }
 
-fn tool_name(item: &Value) -> String {
+pub(super) fn tool_name(item: &Value) -> String {
     item.get("tool")
         .and_then(Value::as_str)
         .map(str::to_string)
@@ -870,7 +897,7 @@ fn tool_name(item: &Value) -> String {
         })
 }
 
-fn reasoning_text(item: &Value) -> String {
+pub(super) fn reasoning_text(item: &Value) -> String {
     fn join(arr: Option<&Value>) -> String {
         arr.and_then(Value::as_array)
             .map(|a| {
@@ -888,7 +915,7 @@ fn reasoning_text(item: &Value) -> String {
     join(item.get("content"))
 }
 
-fn user_message_text(item: &Value) -> String {
+pub(super) fn user_message_text(item: &Value) -> String {
     item.get("content")
         .and_then(Value::as_array)
         .map(|content| {
@@ -907,24 +934,26 @@ fn user_message_text(item: &Value) -> String {
         .unwrap_or_default()
 }
 
-fn shell_status_from(item: &Value) -> ShellStatus {
-    let status = item.get("status").and_then(Value::as_str).unwrap_or("");
-    match status {
-        "completed" | "success" => ShellStatus::Completed,
-        "failed" | "error" => ShellStatus::Failed,
-        "canceled" | "cancelled" => ShellStatus::Canceled,
-        _ => {
-            // Fall back to exit code when status is missing/unknown.
-            match item.get("exitCode").and_then(Value::as_i64) {
-                Some(0) => ShellStatus::Completed,
-                Some(_) => ShellStatus::Failed,
-                None => ShellStatus::Completed,
-            }
-        }
+pub(super) fn shell_status_from(item: &Value) -> Result<ShellStatus, ProtocolError> {
+    match item.get("status").and_then(Value::as_str) {
+        Some("completed") => Ok(ShellStatus::Completed),
+        Some("failed") => Ok(ShellStatus::Failed),
+        Some("declined") => Ok(ShellStatus::Canceled),
+        Some("inProgress") => Err(ProtocolError {
+            code: "codex-shell-terminal-status-invalid".to_owned(),
+            message: "Codex completed a command with a non-terminal status".to_owned(),
+            diagnostic_ref: None,
+        }),
+        Some(_) | None => Err(ProtocolError {
+            code: "codex-shell-terminal-status-invalid".to_owned(),
+            message: "Codex completed a command without an authoritative terminal status"
+                .to_owned(),
+            diagnostic_ref: None,
+        }),
     }
 }
 
-fn diff_files(item: &Value) -> Vec<DiffFile> {
+pub(super) fn diff_files(item: &Value) -> Vec<DiffFile> {
     item.get("changes")
         .and_then(Value::as_array)
         .map(|arr| {
@@ -955,7 +984,7 @@ fn diff_files(item: &Value) -> Vec<DiffFile> {
         .unwrap_or_default()
 }
 
-fn plan_steps(item: &Value, accumulated: &str) -> Vec<PlanStep> {
+pub(super) fn plan_steps(item: &Value, accumulated: &str) -> Vec<PlanStep> {
     // Codex's `plan` item carries a single freeform `text` field. Split on
     // lines as a minimal v0.2 surface (UI can render the raw text via the
     // single-step title if that's all we get).
@@ -982,7 +1011,7 @@ fn plan_steps(item: &Value, accumulated: &str) -> Vec<PlanStep> {
 
 /// Minimal standard-base64 decoder (boring, no extra crate). Matches the v1
 /// helper byte-for-byte so a future audit catches drift.
-fn decode_base64(s: &str) -> Option<String> {
+pub(super) fn decode_base64(s: &str) -> Option<String> {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut rev = [255u8; 256];
     for (i, &c) in T.iter().enumerate() {
@@ -1175,6 +1204,149 @@ mod tests {
             }
             other => panic!("expected Shell(Completed), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn compatibility_shell_terminal_status_is_exact_and_rejection_keeps_state() {
+        // 威胁场景：compatibility adapter 若继续把 declined/未知状态降级成成功，
+        // 同一官方 frame 会在 canonical 与旧入口产生相反的用户可见结果。
+        for (status, expected) in [
+            ("completed", "completed"),
+            ("failed", "failed"),
+            ("declined", "canceled"),
+        ] {
+            let mut t = tr();
+            t.translate_value(&json!({
+                "method": "item/started",
+                "params": {"item": {
+                    "id": "compat-shell",
+                    "type": "commandExecution",
+                    "command": "pwd"
+                }}
+            }));
+            let events = t.translate_value(&json!({
+                "method": "item/completed",
+                "params": {"item": {
+                    "id": "compat-shell",
+                    "type": "commandExecution",
+                    "command": "pwd",
+                    "status": status
+                }}
+            }));
+            let [
+                ServerEvent::AgentItem {
+                    item: AgentItem::Shell { status, .. },
+                    ..
+                },
+            ] = events.as_slice()
+            else {
+                panic!("expected compatibility shell terminal")
+            };
+            assert!(match expected {
+                "completed" => matches!(status, ShellStatus::Completed),
+                "failed" => matches!(status, ShellStatus::Failed),
+                "canceled" => matches!(status, ShellStatus::Canceled),
+                other => panic!("unmodeled expected shell status: {other}"),
+            });
+        }
+
+        for status in [Some("inProgress"), Some("success"), None] {
+            let mut t = tr();
+            t.translate_value(&json!({
+                "method": "item/started",
+                "params": {"item": {
+                    "id": "compat-invalid",
+                    "type": "commandExecution",
+                    "command": "pwd"
+                }}
+            }));
+            let mut terminal = json!({
+                "method": "item/completed",
+                "params": {"item": {
+                    "id": "compat-invalid",
+                    "type": "commandExecution",
+                    "command": "pwd"
+                }}
+            });
+            if let Some(status) = status {
+                terminal["params"]["item"]["status"] = json!(status);
+            }
+            let rejected = t.translate_value(&terminal);
+            assert!(matches!(
+                rejected.as_slice(),
+                [ServerEvent::Error { error, .. }]
+                    if error.code == "codex-shell-terminal-status-invalid"
+            ));
+            assert!(t.in_flight.contains_key("compat-invalid"));
+
+            let recovered = t.translate_value(&json!({
+                "method": "item/completed",
+                "params": {"item": {
+                    "id": "compat-invalid",
+                    "type": "commandExecution",
+                    "command": "pwd",
+                    "status": "completed"
+                }}
+            }));
+            assert!(matches!(
+                recovered.as_slice(),
+                [ServerEvent::AgentItem {
+                    item: AgentItem::Shell {
+                        status: ShellStatus::Completed,
+                        ..
+                    },
+                    ..
+                }]
+            ));
+        }
+    }
+
+    #[test]
+    fn compatibility_completion_kind_mismatch_preserves_the_started_item() {
+        let mut t = tr();
+        t.translate_value(&json!({
+            "method": "item/started",
+            "params": {"item": {
+                "id": "compat-kind",
+                "type": "commandExecution",
+                "command": "pwd"
+            }}
+        }));
+
+        let rejected = t.translate_value(&json!({
+            "method": "item/completed",
+            "params": {"item": {
+                "id": "compat-kind",
+                "type": "agentMessage",
+                "text": "fabricated type flip"
+            }}
+        }));
+        assert!(matches!(
+            rejected.as_slice(),
+            [ServerEvent::Error { error, .. }] if error.code == "codex-item-kind-mismatch"
+        ));
+        assert!(t.in_flight.contains_key("compat-kind"));
+
+        let recovered = t.translate_value(&json!({
+            "method": "item/completed",
+            "params": {"item": {
+                "id": "compat-kind",
+                "type": "commandExecution",
+                "command": "pwd",
+                "status": "declined"
+            }}
+        }));
+        assert!(matches!(
+            recovered.as_slice(),
+            [ServerEvent::AgentItem {
+                item: AgentItem::Shell {
+                    status: ShellStatus::Canceled,
+                    ..
+                },
+                ..
+            }]
+        ));
+        assert!(!t.in_flight.contains_key("compat-kind"));
     }
 
     #[test]

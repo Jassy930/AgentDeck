@@ -23,6 +23,7 @@ const CONNECTION_TEST_SOURCE: &str = include_str!("../src/runtime/connection/tes
 const CONVERSATION_SOURCE: &str = include_str!("../src/runtime/conversation.rs");
 const CORE_SOURCE: &str = include_str!("../src/runtime/core.rs");
 const CORE_TEST_SOURCE: &str = include_str!("../src/runtime/core/tests.rs");
+const RECOVERY_SOURCE: &str = include_str!("../src/runtime/recovery.rs");
 const STORE_APPROVAL_SOURCE: &str = include_str!("../src/runtime/store/approval.rs");
 const STORE_JOURNAL_SOURCE: &str = include_str!("../src/runtime/store/journal.rs");
 const STORE_SCHEMA_SOURCE: &str = include_str!("../src/runtime/store/schema.rs");
@@ -667,19 +668,42 @@ fn applied_commit_unknown_retries_store_only() {
 
 #[test]
 fn restart_never_resumes_active_approval_delivery() {
-    let recovery = section(
+    let core_recovery = section(
         CORE_SOURCE,
         "async fn recover_inner(",
         "pub async fn disconnect(",
     );
     assert_ordered(
-        "started recovery fail-closed",
-        recovery,
+        "core publishes ready only after bounded install",
+        core_recovery,
         &[
-            "if recovery.started.is_some()",
-            "return Err(RuntimeCoreError::RecoveryBlocked)",
-            ".install(recovery.conversation, recovery.accepted)",
+            ".recovery",
+            ".reconcile_and_install(",
+            "self.conversations.install(conversation, accepted)",
+            ".publish_ready_and_enable_scheduling(&permit",
         ],
+    );
+    let coordinator = section(
+        RECOVERY_SOURCE,
+        "async fn reconcile_with_install",
+        "async fn classify_first_pass(",
+    );
+    assert_ordered(
+        "remote Accepted is rejected before any actor installation",
+        coordinator,
+        &[
+            "let mut plans = self.classify_first_pass().await?",
+            "plan.contains_remote_accepted",
+            "self.persist_safe_interruptions(&plans).await?",
+            ".verify_second_pass_and_install(&mut plans, install, !remote_accepted_unsupported)",
+            "if remote_accepted_unsupported",
+            "RuntimeRecoveryError::ReconciliationInvariant",
+        ],
+    );
+    assert_contract(
+        "remote Accepted rejection persists safe recovery work before returning",
+        RECOVERY_SOURCE,
+        &["async fn remote_accepted_rejection_persists_other_sticky_block_before_reopen()"],
     );
     let blocked = section(
         CONVERSATION_SOURCE,
@@ -695,8 +719,53 @@ fn restart_never_resumes_active_approval_delivery() {
             "停止所有 adapter delivery",
         ],
     );
-    assert!(!recovery.contains("run_approval_delivery_round"));
-    assert!(!recovery.contains("start_approval_delivery"));
+    assert!(!core_recovery.contains("run_approval_delivery_round"));
+    assert!(!core_recovery.contains("start_approval_delivery"));
+}
+
+#[test]
+fn recovery_keeps_a_compact_audit_and_installs_before_loading_the_next_page() {
+    // 威胁场景：合法的多 conversation Accepted queue 在恢复时被再次全库物化；
+    // sealed payload 与 actor queue 同时驻留会突破单页 80 MiB 边界并触发 OOM。
+    let outcome = section(
+        RECOVERY_SOURCE,
+        "pub struct ConversationRecoveryOutcome {",
+        "impl ConversationRecoveryOutcome {",
+    );
+    assert_contract(
+        "compact recovery audit",
+        outcome,
+        &[
+            "durable_accepted_command_ids: Vec<RuntimeId>",
+            "expected_started_command_id: Option<RuntimeId>",
+            "expected_lifecycle: ConversationLifecycle",
+        ],
+    );
+    assert!(!outcome.contains("conversation: ConversationRecord"));
+    assert!(!outcome.contains("durable_accepted: Vec<CommandRecord>"));
+
+    let install = section(
+        RECOVERY_SOURCE,
+        "async fn verify_second_pass_and_install",
+        "struct ConversationPlan {",
+    );
+    assert_ordered(
+        "bounded recovery page install",
+        install,
+        &[
+            ".begin_recovery_verification_scan()",
+            ".load_recovery_page(cursor)",
+            "if let Some(recovery) = page.conversation",
+            "verify_conversation(recovery, plan)",
+            "install(conversation, accepted)",
+            "if let Some(next) = page.next_cursor",
+            ".finish_recovery_scan(",
+        ],
+    );
+    assert!(
+        !install.contains(".collect"),
+        "逐页安装路径不得恢复为全库 collect"
+    );
 }
 
 #[test]

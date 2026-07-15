@@ -503,6 +503,9 @@ async fn sync_complete_cannot_overtake_snapshot_transfer_completion() {
 
 #[tokio::test]
 async fn unacked_conversation_snapshot_holds_global_build_budget_until_flush() {
+    // 威胁场景：默认并发回归同时运行多份真实大快照时，纯测试 harness 的短 deadline
+    // 会在预算不变量尚未被观察前误杀用例；该 deadline 只约束死锁，不是产品延迟承诺。
+    const REAL_SNAPSHOT_BUILD_TIMEOUT: Duration = Duration::from_secs(120);
     let root = TestRoot::new("subscription-global-snapshot-build-budget");
     let first_command =
         RuntimeId::from_bytes(RuntimeIdKind::Command, [0x61; 16]).expect("first command id");
@@ -592,7 +595,7 @@ async fn unacked_conversation_snapshot_holds_global_build_budget_until_flush() {
         .expect("flush first subscription receipt");
     // 这个用例故意走真实 33 MiB snapshot 的解密、归约、canonical 编码与持久化，
     // 首个 part 的准备时间不应沿用小 fixture 的 2 秒交互超时。
-    let first_part_write = timeout(Duration::from_secs(30), first_receiver.recv())
+    let first_part_write = timeout(REAL_SNAPSHOT_BUILD_TIMEOUT, first_receiver.recv())
         .await
         .expect("first build TransferPart timeout")
         .expect("first build TransferPart");
@@ -671,7 +674,7 @@ async fn unacked_conversation_snapshot_holds_global_build_budget_until_flush() {
         write.acknowledge().expect("flush first build TransferPart");
     }
 
-    let second_part_write = timeout(Duration::from_secs(30), second_receiver.recv())
+    let second_part_write = timeout(REAL_SNAPSHOT_BUILD_TIMEOUT, second_receiver.recv())
         .await
         .expect("second build must resume after first transfer flush")
         .expect("second build TransferPart after budget release");
