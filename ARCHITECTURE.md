@@ -682,6 +682,28 @@ conversation/key，不能伪造身份连续性。
   持有到 ReadPool 关闭、path lease 释放。该 admission 不编入 production，不改变 production Store、
   固定 8-reader ReadPool 或任何运行时资源配额。
 
+### Relay Companion MVP P3.7 typed execution journal 前置不变量
+
+- `ExecutionId` 只包装 durable command identity；`AgentTurnRequest` 只携 exact execution、绝对 cwd
+  与已过 Runtime 上界的 prompt；`AdapterStateHandle` 只接受 AdapterState kind。`ExecSpec` 同时绑定
+  execution/state，且只允许绝对 program/cwd 和有界非敏感 argv，不提供环境变量面。
+- adapter 的 cold prepare hook 必须借用不可由 safe external code 构造的
+  `PrepareAdapterTurnCapability`。daemon-owned handle 保存 exact binding，并在 consumption 时对虚
+  `exec_spec()` 返回值重新核对，不能只信任 prepare 时的一次 getter 调用。
+- dynamic Item/Error 只有 Store-owned typed constructor；adapter/caller 不能写 raw RuntimeEvent、bytes
+  或原始 ProtocolError。Fresh append/approval 必须匹配 authenticated Started/turn 和 released Fence；
+  Error 只能映射到固定 `daemon.runtime.execution_failed`，不持久化 vendor stderr/path/token。
+- prepared event receiver 只有在 durable release permit 已提交且 cold release 调用成功后才开始转发；
+  release 失败必须先丢弃 receiver，再 fence control 并写 Interrupted。该顺序防止 prepare 阶段预排的
+  approval 越过 gate 失败边界。
+- dynamic event row、conversation HWM、retention/index、runtime ledger 与 StoreCommitHub watcher 在同一
+  COMMIT；COMMIT-unknown 只允许 exact eventId replay。open-time audit 验证 event seq/time、
+  Started/terminal 区间、command/turn binding 与 approval totals；即使 release MAC 有效，也必须满足
+  `startedAt <= releaseAuthorizedAt <= terminalAt`（无 terminal 时只验下界），schema 仍为 v4。
+- 该分片尚未实现 `GatedChild/attach`、私有 FD、PGID/start-time、terminal 前 durable AdapterEvent ACK
+  join 或两遍 orphan recovery。production coordinator 必须继续 disabled，P3.8 也不得在
+  `RecoveryReadyPermit` 之前 bind UDS。
+
 ### R1a 隐含约束（历史参考）
 
 - **R1a machine_id ≡ device_id**：`server/ws.rs::connect` 用 `device.device_id` 作 `ConnRole::Machine.machine_id`，`router.rs` RegisterMachine 授权强制 `machine.machine_id == connection.machine_id`——**enrolled 的 machine 设备的 `machine_id` 严格等于 `device_id`**。CLI 生成的随机 `device_id = "cli-<profile>-<random>"` 会锁定 R2 daemon remote-mode 里对应 machine 的 identifier；R2 设计需评估是否解耦 machine_id 与 device_id（例如 machine 元数据里显式携带独立 machine_id）。

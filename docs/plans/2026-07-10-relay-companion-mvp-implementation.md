@@ -1238,7 +1238,60 @@ roundtrip 的 1 项 ignored 继续记为 P3.1 外部 BLOCKED，不能据此宣�
 
 ### Task P3.7：实现两阶段 exec gate、ExecutionFence 与 orphan recovery
 
+**前置分片 S1 状态（2026-07-15，已收口但 P3.7 仍未完成）：** 已建立 typed `ExecutionId`、
+`AgentTurnRequest`、`AdapterStateHandle`、bounded/redacted `ExecSpec` 与 daemon-owned
+`PreparedAgentTurnHandle`；daemon 在 prepare 返回时与 handle consumption 时两次校验虚 getter 的 exact
+execution/state binding。
+canonical Item/Error 已改为 Store-owned typed append。fresh dynamic
+event 与 approval 必须绑定 authenticated Started/turn 与 released Fence，且
+`createdAt >= releaseAuthorizedAt`；caller 不能提交 raw event/bytes/error，
+失败只落固定 `daemon.runtime.execution_failed`。canonical template 在单 build permit 下构造、按实际
+retained allocation 计费，并在 transaction 内按真实 eventSeq 原地 finalize；event row/HWM/index/
+ledger/watcher 同一 COMMIT，open-time audit 对真实 dynamic rows fail-close。prepared event receiver 只在
+cold release 调用成功后转发，release 失败先丢弃 receiver，不能注册预排 approval。legacy terminal 已按
+`command.terminal.v1/v2` token domain 分流，不按 payload shape 猜版本。audit 也明确拒绝 Raw、空
+item/entity identity、orphan/gap 与错误 command/turn binding，不能把未建模或不可聚合事件放行。
+open-time command integrity 另对有效 MAC 的 release 时间统一验证
+`startedAt <= releaseAuthorizedAt <= terminalAt`（Started-only 只验下界）。
+
+该分片已有 builder、COMMIT-unknown、disk/clock replay、append-vs-terminal、eventId pointer collision、
+seq 9→10、64 MiB/+1、oversized backfill、dynamic audit 与 v1 terminal fence matrix 证据；完整命令见
+`docs/QUALITY.md`。它不包含下面 Step 1–5 的 OS exec gate：`GatedChild/attach`、私有 FD codec、
+PGID/start-time、neutral `AdapterItemKey`、adapter spawn ownership、真实 coordinator、两遍 orphan
+recovery 与 main bootstrap仍为未完成项，production execution 继续 disabled。terminal safety reserve
+继续保留旧版精确 132 MiB；fragmented SQLite + pinned WAL 已分别覆盖无 approval terminal，以及单 turn
+32 条最大 approval 的真实样本，但未授权收窄 reserve。当前树的三份 adapter fixture 已筛选脱敏并记录
+provenance/hash；祖先 `68b6cfd` 的旧 CC fixture 历史处置仍需另行授权，不能宣称完整 Git history 已清理。
+S1 fixture、typed adapter prepare 与 typed execution journal 已分别提交为 `819aa5e`、
+`1acf8b8` 与 `3f22cf0`。默认并发 daemon gate 已完整跑到 doc-test；本轮另读回 doc-test 1/1、
+clippy、Swift 256 XCTest + 35 Swift Testing、fmt、schema diff、no-net、docs 与 diff-check 全 PASS。
+这些证据只收口 S1，不能替代下面 Step 1–5 的 OS gate/recovery 验收。
+
+已提交 fixture SHA-256 分别为 Codex
+`78a40e4cce9952818021cf1626f02619eb6a19cdcfd5c62e938d016e86029f05`、CC simple
+`2c4438598bd25a653987aae034f893da79cf4d8b425d0cb7c56f42e5eb30682b`、CC Bash
+`92d973335697759d2e8e4024988303d73188755be0105520739426ec2300c84a`。
+
 **Files:**
+- Create (typed journal 前置分片): `agentdeckd/src/runtime/store/{command_event,execution_event}.rs`
+- Create (typed journal 前置分片): `agentdeckd/src/runtime/store/worker/{critical_command,execution_event}.rs`
+- Create (typed journal 前置分片): `agentdeckd/tests/{runtime_execution_fixture,runtime_store_execution_event,runtime_store_execution_event_commit,runtime_store_execution_event_tamper,runtime_store_legacy_terminal}.rs`
+- Create/Modify (typed journal 前置分片): `agentdeckd/tests/support/runtime_event_tamper.rs`、
+  `agentdeckd/tests/fixtures/{README.md,claude_code/{simple_turn,bash_tool_use}.jsonl,`
+  `codex/simple_turn.jsonl}`；删除未消费且含不适合入库材料的 `claude_code/plan_mode.jsonl`
+  （祖先历史处置另行授权）
+- Modify (typed journal 前置分片): `agentdeck-protocol/{src/runtime/failure.rs,tests/runtime_v1_contract.rs}`、
+  `agentdeckd/src/{agent.rs,codex/translate.rs}`、
+  `agentdeckd/src/runtime/{conversation,execution,model,router}.rs`、
+  `agentdeckd/src/runtime/core/subscription_tests.rs`、`agentdeckd/src/runtime/store/**`
+- Modify (typed journal 前置分片):
+  `agentdeckd/tests/{adapter_state_boundary,agent_router,agent_trait_shape,runtime_snapshot,`
+  `runtime_store_boundaries,runtime_store_capacity,runtime_store_hardening,runtime_store_journal,`
+  `runtime_store_p34,runtime_store_stream_v4,runtime_stream}.rs`、
+  `agentdeckd/tests/runtime_stream/{barrier_integrity,contract,store_commit_hub}.rs`
+- Modify (typed journal 前置分片): `AGENTS.md`、`ARCHITECTURE.md`、`README.md`、
+  `docs/{AGENT_DIAGNOSTICS,QUALITY,index}.md`、
+  `docs/plans/{README,2026-07-10-relay-companion-mvp-design,2026-07-10-relay-companion-mvp-implementation}.md`
 - Create: `agentdeckd/src/{exec_gate,runtime/recovery}.rs`
 - Create: `agentdeckd/src/runtime/process_identity.rs`
 - Create: `agentdeckd/tests/{exec_gate,runtime_crash_recovery}.rs`
@@ -1249,22 +1302,42 @@ roundtrip 的 1 项 ignored 继续记为 P3.1 外部 BLOCKED，不能据此宣�
 
 **Adapter interface:**
 ```rust
+impl AgentRouter {
+    pub(crate) async fn prepare_turn(
+        &self,
+        agent_kind: AgentKind,
+        request: AgentTurnRequest,
+        state: AdapterStateHandle,
+    ) -> Result<PreparedAgentTurnHandle, ProtocolError>;
+}
+
 #[async_trait]
 pub trait Agent: Send + Sync + 'static {
-    async fn prepare_turn(&self, request: AgentTurnRequest, state: AdapterStateHandle) -> Result<Box<dyn PreparedAgentTurn>, ProtocolError>;
-    async fn resolve_approval(&self, execution_id: &ExecutionId, decision: ActionDecision) -> Result<(), ProtocolError>;
-    async fn cancel(&self, execution_id: &ExecutionId) -> Result<(), ProtocolError>;
+    async fn prepare_adapter_turn(
+        &self,
+        capability: &mut PrepareAdapterTurnCapability,
+        request: AgentTurnRequest,
+        state: AdapterStateHandle,
+    ) -> Result<Box<dyn PreparedAgentTurn>, ProtocolError>;
 }
-#[async_trait]
-pub trait PreparedAgentTurn: Send { fn exec_spec(&self) -> &ExecSpec; async fn attach(self: Box<Self>, child: GatedChild, events: AdapterEventSender) -> Result<RunningAgentTurn, ProtocolError>; }
+
+pub trait PreparedAgentTurn: Send + 'static {
+    fn exec_spec(&self) -> &ExecSpec;
+}
 ```
+
+approval 继续只使用 P3.5 的 exact transient `BoundApprovalDelivery`；不得新增
+`Agent::resolve_approval(&ExecutionId, ...)`。cancel 继续消费 exact
+`RuntimeExecutionControl::cancel_and_wait_fenced()`，不得新增按 `ExecutionId` 查找 session/process 的
+控制面。`PreparedAgentTurn::attach` 仅在 gate child 与 durable AdapterEvent COMMIT ACK 屏障一并实现时
+加入；join/terminal 必须等待所有已接收 AdapterEvent 的 ACK，不能在前置 typed contract 中先暴露半套 API。
 
 - [ ] Step 1: 写五个crash-boundary tests。 Started COMMIT后未spawn、gate ready/Fence前、Fence后/release前、release后、父死但vendor group存活；`releaseAuthorizedAt`只表示允许release而不证明token送达/exec；PID复用/start-time不匹配；TERM→KILL失败→RecoveryBlocked；Accepted queue不得在旧group未证实退出时恢复。
 - [ ] Step 2: 运行 gate/recovery tests。 Expected: FAIL，两个adapter当前直接spawn vendor。
-- [ ] Step 3: 实现当前运行binary的`--exec-gate`子模式、继承私有FD handshake、独立process group、nonce/release token与Fence事务。 gate control/spec、prompt和secret不放`agentdeckd --exec-gate` argv/env；gate通过私有FD取得ExecSpec后，vendor必需的非敏感flags才进入最终exec argv；不经`bin/current`，所有adapter spawn ownership移入gate。 adapter translator只产中立AdapterEvent/approval，不再mint SessionId/RuntimeEvent，conversation/turn/event IDs统一由RuntimeCore包装。
-- [ ] Step 4: 重跑tests并用真实无副作用helper验证PGID清理与启动顺序。 Expected: P3固定`singleton lock → Keychain/DB reconcile → fence classification/RecoveryBlocked → bind UDS → emit RemoteStartPermit`；P4.2只能在该permit后启动RemoteTransport。 recovery未完成时不接受新Started，crash前无越过gate副作用，release后crash标Interrupted且不自动重放。
-- [ ] Step 5: 运行两个现有adapter fixture suites与clippy。
-- [ ] Step 6: 提交。 `git add agentdeckd && git commit -m "feat(daemon): 用两阶段 exec gate 封住副作用边界"`
+- [ ] Step 3: 实现当前运行binary的`--exec-gate`子模式、继承私有FD handshake、独立process group、nonce/release token与Fence事务。 gate control/spec、prompt和secret不放`agentdeckd --exec-gate` argv/env；gate通过私有FD取得ExecSpec后，vendor必需的非敏感flags才进入最终exec argv；不经`bin/current`，所有adapter spawn ownership移入gate。 adapter translator只产带 neutral `AdapterItemKey` correlation 的中立AdapterEvent；approval 继续走 exact `BoundApprovalDelivery`，不混入普通 AdapterEvent。adapter 不再mint SessionId/RuntimeEvent，conversation/turn/event/item/entity IDs统一由RuntimeCore包装；`attach`/join/terminal 必须等待所有已接收 AdapterEvent 的 durable COMMIT ACK。
+- [ ] Step 4: 重跑tests并用真实无副作用helper验证PGID清理与启动顺序。 Expected: P3.7固定`singleton lock → Keychain/DB reconcile → fence classification/RecoveryBlocked → emit RecoveryReadyPermit`。recovery未完成时不接受新Started，crash前无越过gate副作用，release后crash标Interrupted且不自动重放。P3.8 在该 permit 后 bind UDS，成功后才 emit `RemoteStartPermit`；P4.2只能消费该 RemoteStartPermit 启动 RemoteTransport。
+- [ ] Step 5: 运行两份真实 Claude Code fixture（`simple_turn.jsonl`、`bash_tool_use.jsonl`）与真实脱敏 Codex turn fixture的 translator → typed append → reopen/backfill 门禁，再运行两个 adapter fixture suites、gate/recovery、clippy 与文档门禁。
+- [ ] Step 6: 精确列出并 stage 本 task 实际实现、测试、fixture 与文档 pathspec，核对 cached diff 不含其他工作区改动后执行 `git commit -m "feat(daemon): 用两阶段 exec gate 封住副作用边界"`；禁止目录级 `git add agentdeckd`。
 
 ### Task P3.8：接入 RuntimeEnvelope v1 UDS 与 stdio compatibility
 

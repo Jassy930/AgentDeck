@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P2.10、P3.5 与 P3.6-A/B/C/D 已完成，P3.6 分别提交为 `7731d1e`/`02cc640`/`694f2d9`/`b668d8f`，当前进入 P3.7；P3.1 签名 Keychain 仍有 1 项 ignored/BLOCKED，P3 整体未完成（2026-07-15） |
+| 状态 | Approved target；P2.10、P3.5 与 P3.6-A/B/C/D 已完成，P3.6 分别提交为 `7731d1e`/`02cc640`/`694f2d9`/`b668d8f`；P3.7 S1 fixture/typed adapter prepare/typed execution journal 已分别提交为 `819aa5e`/`1acf8b8`/`3f22cf0`，OS exec-gate/recovery 仍未完成；P3.1 签名 Keychain 仍有 1 项 ignored/BLOCKED，P3 整体未完成（2026-07-15） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-01-agentdeck-mobile-relay-design.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -22,7 +22,8 @@
 - 取代生产 TLS 配置失败时回退明文的行为。
 
 本文不宣称当前代码已经具备全部目标能力。截至 2026-07-15，Relay v2 cutover/P2.10、RuntimeCore/
-approval 与 P3.6 transport-neutral stream component（`694f2d9`）已落地；App/CLI singleton UDS、P3.7 exec gate、
+approval 与 P3.6 transport-neutral stream component（`694f2d9`）已落地；P3.7 typed journal/adapter
+前置分片已按 `819aa5e` / `1acf8b8` / `3f22cf0` 收口，但 App/CLI singleton UDS、P3.7 OS exec gate/recovery、
 P4 Machine identity/E2EE/Relay Publish 和真实 Companion 仍未完成，iOS 仍只有 fixture 驱动骨架。
 P3.1 provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate。完整实施仍必须满足 §17 的
 Definition of Done。

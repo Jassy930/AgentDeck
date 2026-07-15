@@ -212,7 +212,7 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（P3.6-C 已收口，P3 整体未完成）
+## Relay Companion MVP 实施状态（P3.7 typed journal S1 已收口，P3 整体未完成）
 
 Relay production binary 已原子切换到 **Relay v2**。公开数据面只接受
 `/v2/connect`、`/v2/pair` 与 enrollment 所需的 `POST /v2/machine-enroll`；
@@ -417,7 +417,7 @@ Draining 后不会新增 durable Started。真实 vendor 进程仍必须等 P3.7
 `RuntimeHub`、App/CLI 也尚未迁到 singleton UDS，
 所以这些单元/集成测试仍不是本地或远程 Companion 端到端完成证据。
 
-### P3.5 approval 与 P3.6 canonical stream 当前边界
+### P3.5 approval、P3.6 canonical stream 与 P3.7 typed journal 当前边界
 
 P3.5 已把 approval ledger、SQLite first-wins CAS、Applied/DeliveryFailed/Expired 精确回执、
 daemon-owned delivery single-flight 与 terminal+expiry Safety transaction 接入 RuntimeCore；
@@ -464,6 +464,25 @@ Swift 256 XCTest + 35 Swift Testing，以及 protocol/schema、fmt、clippy、da
 integration test 进程同时存活的真实 RuntimeStore fixture 限为 4；每份 Store 仍真实打开 1 个 writer
 与 8 个只读 WAL reader。该限制只防止测试进程在断言前耗尽 FD，不改变 production Store、ReadPool
 或运行时配额。
+
+P3.7 的 typed journal 前置分片已把 `ExecutionId`、`AgentTurnRequest`、
+`AdapterStateHandle` 和有界脱敏 `ExecSpec` 绑定到 daemon-owned cold prepare。adapter hook 只能由
+不可构造的 daemon capability 调用；prepared handle 在真正读取 spec 时再次核对 exact execution/state，
+恶意虚 getter 不能在首次校验后切换到另一 execution。fresh Item/Error/approval 只允许在 matching
+Started + Fence + durable release 之后由 Store-owned builder 写入；release 失败会丢弃整个 prepared
+event receiver，不会把未越过 gate 的 approval 持久化。event row、HWM、stream index、ledger 和 watcher
+在同一 COMMIT，open-time audit 会验证 dynamic rows 与
+`startedAt <= releaseAuthorizedAt <= terminalAt`，Error 只保存固定脱敏 failure。
+该前置分片的 fixture、typed adapter prepare 与 typed execution journal 已分别提交为
+`819aa5e` / `1acf8b8` / `3f22cf0`；它们是 OS gate 的前置事实，不代表 P3.7 完成。
+
+Codex 与 Claude Code 回归使用当前树内的筛选脱敏真实录制片段；来源、筛选、hash 和边界见
+`agentdeckd/tests/fixtures/README.md`。未消费且含不适合入库材料的 CC `plan_mode.jsonl` 已从当前树
+删除，但祖先 `68b6cfd` 仍有历史 security debt，不能宣称完整 Git history 已清理。
+
+这仍不是 P3.7 完成：current-binary `--exec-gate`、私有 FD codec、PGID/start-time、cold release
+token、adapter attach/durable ACK terminal barrier、两遍 orphan recovery 和 `RecoveryReadyPermit`
+尚未实现，production coordinator 继续 disabled。
 具体命令与资源矩阵见 [docs/QUALITY.md](docs/QUALITY.md)。
 
 ## agentdeck CLI（参考客户端 / E2E 驱动）

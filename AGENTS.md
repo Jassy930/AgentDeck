@@ -10,7 +10,7 @@
 4. `docs/index.md`：文档记录系统导航。
 5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code（含 CC adapter failure codes）。
 6. `docs/QUALITY.md`：验证命令、质量门禁和文档结构检查（含 v0.2 手动 QA 清单）。
-7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单。P2.10 与 P3.5 已完成；P3.6-A protocol contract / P3.6-B Runtime store v4 / P3.6-C transport-neutral stream、barrier、snapshot、transfer 与 publication / P3.6-D 文档收口分别提交为 `7731d1e` / `02cc640` / `694f2d9` / `b668d8f`，当前进入 P3.7 exec gate。真实 provisioned signed Keychain roundtrip 仍有 1 项 ignored 且 gated BLOCKED，App/CLI 也尚未迁到 singleton UDS，transfer/publication 也没有 production remote owner，因此不得宣称 P3.1/P3、远程 Companion 或 P4 E2EE 完成。
+7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单。P2.10 与 P3.5 已完成；P3.6-A protocol contract / P3.6-B Runtime store v4 / P3.6-C transport-neutral stream、barrier、snapshot、transfer 与 publication / P3.6-D 文档收口分别提交为 `7731d1e` / `02cc640` / `694f2d9` / `b668d8f`。P3.7 S1 fixture / typed adapter prepare / typed execution journal 已分别提交为 `819aa5e` / `1acf8b8` / `3f22cf0`；OS exec-gate、attach/ACK 与 orphan recovery 仍未完成。真实 provisioned signed Keychain roundtrip 仍有 1 项 ignored 且 gated BLOCKED，App/CLI 也尚未迁到 singleton UDS，transfer/publication 也没有 production remote owner，因此不得宣称 P3.1/P3、远程 Companion 或 P4 E2EE 完成。
 8. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
 
 ## 项目边界
@@ -263,6 +263,30 @@ per-connection gate 到 flush ACK/cancel；同 target 被新 generation 取代�
 P3.6 不执行真实 E2EE seal、MachineDataSign、Keychain CounterGuard 或 Relay Publish，
 transfer/publication 也尚无 production remote owner；Simulator fixture 不是远程链路。P3.7 exec gate、
 P3.8/P3.9 UDS 与 P4 remote 仍是后续任务。
+
+### Relay Companion MVP P3.7（typed journal 前置分片）
+
+```bash
+cargo test -p agentdeckd --lib runtime::store::execution_event::tests -- --test-threads=1
+cargo test -p agentdeckd --test runtime_store_execution_event -- --test-threads=1
+cargo test -p agentdeckd --test runtime_store_execution_event_commit -- --test-threads=1
+cargo test -p agentdeckd --test runtime_store_execution_event_tamper -- --test-threads=1
+cargo test -p agentdeckd --test runtime_store_legacy_terminal -- --test-threads=1
+cargo test -p agentdeckd --test runtime_execution_fixture -- --test-threads=1
+cargo test -p agentdeckd --lib -- --test-threads=1
+cargo test -p agentdeckd --tests -- --test-threads=1
+cargo fmt --all -- --check
+cargo clippy -p agentdeckd --all-targets -- -D warnings
+bash scripts/check-daemon-no-net.sh
+git diff --check
+scripts/verify-agent-docs.sh
+```
+
+fresh Item/Error/approval 必须匹配 authenticated Started/turn 与 released Fence；release 失败必须
+丢弃 prepared event receiver，不能注册预排 approval。`ExecSpec` 必须绑定 exact execution/state，
+daemon handle 在 consumption 时重新校验虚 getter。adapter fixture 只允许筛选脱敏帧，来源/hash/
+历史 security debt 见 `agentdeckd/tests/fixtures/README.md`。本节不证明私有 FD gate、PGID/start-time、
+attach terminal ACK barrier、orphan recovery 或 live vendor；production coordinator 继续 disabled。
 
 ## 浏览与外部资料
 

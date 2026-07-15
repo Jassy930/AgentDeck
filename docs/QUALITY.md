@@ -854,6 +854,98 @@ P3.1 provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate；P3.7 exec
 和 P4 remote 尚未完成。因此即使本节全绿，也只能收口 P3.6 component，不得宣称 P3、Companion MVP
 或真实跨网链路完成。
 
+## Relay Companion MVP P3.7 typed execution 前置分片门禁
+
+P3.7 先把 adapter 输入、canonical Item/Error、Fence/release 与 dynamic audit 收紧为 daemon-owned
+contract，再实现真实 `agentdeckd --exec-gate`。本节只验证该前置分片；即使全部通过，也不能替代
+私有 FD gate、真实 PGID/start-time、TERM→KILL orphan recovery、adapter attach 或 live vendor 登录。
+
+```bash
+# typed builder、release gate、exact replay、竞态与真实 byte boundary
+cargo test -p agentdeckd --lib runtime::store::execution_event::tests -- --test-threads=1
+cargo test -p agentdeckd --test runtime_store_execution_event -- --test-threads=1
+cargo test -p agentdeckd --test runtime_store_execution_event_commit -- --test-threads=1
+cargo test -p agentdeckd --test runtime_store_execution_event_tamper
+
+# typed prepare binding 与 crate 外 UFCS compile-fail
+cargo test -p agentdeckd --lib typed_boundary_tests
+cargo test -p agentdeckd --test agent_router
+cargo test -p agentdeckd --test agent_trait_shape
+cargo test -p agentdeckd --doc
+
+# v1 terminal 兼容、open-time dynamic audit、schema migration
+cargo test -p agentdeckd --test runtime_store_legacy_terminal -- --test-threads=1
+cargo test -p agentdeckd --test runtime_store_hardening -- --test-threads=1
+cargo test -p agentdeckd --lib runtime::store::sqlite::migration_tests -- --test-threads=1
+
+# 真实 adapter 录制 → typed Item/terminal → reopen/backfill，以及 terminal reserve 样本
+cargo test -p agentdeckd --test runtime_execution_fixture
+cargo test -p agentdeckd --test runtime_store_capacity \
+  released_terminal_closes_on_fragmented_real_sqlite_with_a_pinned_wal_reader
+cargo test -p agentdeckd --lib \
+  released_terminal_expires_maximum_approvals_on_fragmented_sqlite_with_pinned_wal
+
+# 真实 oversized replay/backfill 与 subscription resource path
+cargo test -p agentdeckd --lib nine_mib_canonical_event_replays_through_backfill_and_snapshot_pages -- --test-threads=1
+cargo test -p agentdeckd --lib regular_near_limit_backfill_pages_charge_dto_and_payload_in_one_pool -- --test-threads=1
+cargo test -p agentdeckd --lib oversized_backfill_payload_holds_exclusive_read_lease_until_flush_and_cancel -- --test-threads=1
+
+# 分片 merge gate；默认并发 daemon 回归不可被串行 focused suites 替代
+cargo test -p agentdeckd
+cargo fmt --all -- --check
+cargo clippy -p agentdeckd --all-targets -- -D warnings
+cargo run -q -p agentdeck-cli -- protocol schema \
+  | diff - protocol/agentdeck/agentdeck-protocol.schema.json
+bash scripts/check-daemon-no-net.sh
+swift test
+git diff --check
+scripts/verify-agent-docs.sh
+```
+
+该分片至少证明：adapter 不能提交 raw `RuntimeEvent`/bytes/`ProtocolError`；fresh Item/Error 只在
+authenticated Started、精确 turn 与 durable release 之后写入；Error 只能使用固定
+`daemon.runtime.execution_failed`；eventId 撞 Started/terminal pointer、错 command/turn、terminal 后
+fresh append 全部拒绝，而 COMMIT-unknown、disk-low、clock regression 与 terminal 后的同 eventId
+exact replay仍逐字节返回原 event。canonicalization 使用单 build permit，并在已按 retained capacity
+计费的 template 上原地写入真实 transactional eventSeq；seq 9→10、`u64::MAX`、最终 64 MiB/+1、
+小 payload/巨大 caller capacity 都有直接证据。
+
+event row、conversation HWM、retention/index、runtime ledger 与 live watcher 必须同一 COMMIT；
+before-COMMIT 零推进/零通知，after-COMMIT unknown 已推进且只通知一次。open-time audit 遍历真实
+authenticated event rows，逐 conversation 验连续 seq、时间单调、command/turn/start/terminal 区间、
+approval event totals 与 ledger totals，并拒绝 Raw、空 item/entity identity、orphan/gap 与错误 binding。
+持有旧 row key 的旧进程或错误迁移即使能为 release 时间重算有效 MAC，reopen 也必须同时验证
+`startedAt <= releaseAuthorizedAt <= terminalAt`（无 terminal 时只验下界）；Started-only 与 released
+terminal 各有独立 authenticated tamper case。
+legacy v1/v2 terminal 只能由 token domain 选择，不能按 payload shape sniff；Completed/Failed 继续要求
+released fence，Interrupted/Canceled 保留历史三种 fence shape。
+
+terminal safety tail 本分片不做未经校准的优化，继续保留旧版 132 MiB 保守 reserve。无 active
+approval 的真实 fragmented SQLite + pinned WAL 样本已完成 released terminal 并读回：
+`page_count=1141`、`freelist=1057`、checkpoint `log=1116/checkpointed=52`、terminal WAL 增量
+74,160 bytes。另一个样本在同样的 fragmentation/pinned-reader 条件下注册每 turn 上限 32 条、
+每条精确 256 KiB 的 active approval；terminal 后 32 条全部 Expired、active ledger 清零并成功
+reopen/inspect，读回 `page_count=5247`、`freelist=1057`、checkpoint
+`log=5798/checkpointed=4734`，WAL 从 23,887,792 增至 32,473,872 bytes。两者仍未覆盖接近 2 GiB
+主库的最坏页分配，因此只作为真实基线，不足以授权收窄 reserve；不能用 typed payload 的结构上限
+代替近容量上限的实测。
+
+Codex `simple_turn.jsonl` 是一次真实 app-server 运行筛选、固定脱敏后的 6 帧片段；两份 Claude
+Code fixture 也已从 2.1.191 真实录制收窄为 assistant/result 与 Bash tool_use/tool_result 最小片段，
+移除用户环境、插件清单、绝对路径、思考签名和随机身份；未被测试消费且含短期授权材料的旧
+`plan_mode.jsonl` 已删除。capture、筛选、hash 与原始临时文件清理边界见
+`agentdeckd/tests/fixtures/README.md`。门禁要求 Raw 立即失败，并逐字节读回 daemon event/item/entity/
+command identity、modeled Item 与唯一 terminal；它仍不替代 live exec-gate/vendor 登录。
+
+当前树的 credential/用户绝对路径 scan 为空，但祖先提交 `68b6cfd` 仍可读到原
+`plan_mode.jsonl`。未经明确授权不得在本 task 用 rebase/filter-repo 改写已共享历史，且当前没有
+该 OAuth flow 的撤销/过期读回证据；因此完整 Git history 的 credential 处置仍是明确 security debt，
+不能用当前树扫描结果宣称历史已清理。
+
+当前仍未完成 `GatedChild/PreparedAgentTurn::attach`、私有 FD codec、current-binary gate submode、
+process identity/fencing、真实 coordinator、neutral adapter correlation key 与两遍 orphan recovery。
+在这些门禁全绿前，production coordinator 必须保持 disabled，P3.7 状态只能是实施中。
+
 ## AppKit 重写后的验证清单
 
 前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。
