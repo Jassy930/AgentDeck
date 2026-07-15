@@ -1439,8 +1439,8 @@ approval 继续只使用 P3.5 的 exact transient `BoundApprovalDelivery`；不�
 local-control principal、真实 backpressure cancellation 与用途感知 network guard；两轮独立终审无剩余
 P0/P1/P2。P3.8-B 按单任务代码不超过 2,000 行的刹车线拆为 B1/B2：B1 secure listener
 primitives 已完成并从 clean detached HEAD 独立复验；B2 config/stdio/main 与 Rust/Swift stdio
-compatibility 参数的原子切换已通过全部自动门禁，当前为精确暂存的提交候选。P3.9 shared-daemon
-client cutover 尚未开始；P3.1 provisioned signed Keychain 外部门禁继续 BLOCKED。
+compatibility 参数的原子切换已由 `459f32a` 提交。P3.9 shared-daemon client cutover 尚未开始；P3.1
+provisioned signed Keychain 外部门禁继续 BLOCKED。
 
 #### Task P3.8-A：transport primitives、local-control principal 与精确 network guard
 
@@ -1489,8 +1489,8 @@ client cutover 尚未开始；P3.1 provisioned signed Keychain 外部门禁继�
   `1e7f9ea` 的 clean detached HEAD 已通过 listener 4/4、local listener 7/7、真实 UDS 4/4、namespace
   23/23、StorageKEK 14 passed + 1 个既有 signed gate ignored、全目标编译、Clippy、fmt、两条 network
   guard、docs 与 clean status。
-- [ ] B2 原子 cutover 提交候选：config mode、stdio exhaustive allowlist、production main、Rust/Swift
-  stdio compatibility 参数、binary smoke 与候选文档已精确暂存；不包含 P3.9 shared-daemon client。
+- [x] B2 原子 cutover：config mode、stdio exhaustive allowlist、production main、Rust/Swift stdio
+  compatibility 参数、binary smoke 与候选文档由 `459f32a` 提交；不包含 P3.9 shared-daemon client。
 
 **Files（按 B1/B2 实际切片校准）：**
 - B1 Create: `agentdeckd/src/local/listener.rs`、`agentdeckd/tests/local_listener.rs`
@@ -1537,8 +1537,9 @@ client cutover 尚未开始；P3.1 provisioned signed Keychain 外部门禁继�
 - [x] Step 5: 独立 spec/security/quality review，修完 P0/P1/P2 后同步 README/ARCHITECTURE/QUALITY/
   DIAGNOSTICS/AGENTS 与本计划；代码终审无 P0/P1/P2，文档旧参数、状态矩阵与文件账本 findings 已
   修复并复跑 docs gate。P3.1 signed Keychain 仍保持外部 BLOCKED。
-- [ ] Step 6: 精确暂存并提交 `feat(daemon): 以 UDS 暴露 RuntimeEnvelope v1`；不得把 P3.9 App/CLI
-  cutover、P4 remote start 或外部签名证据写成已完成，不 push。
+- [x] Step 6: B2 精确暂存 23 个计划内路径（`+1141/-160`），cached diff 终审无 P0/P1/P2 后以
+  `459f32a feat(daemon): 以 UDS 暴露 RuntimeEnvelope v1` 提交；未把 P3.9 App/CLI cutover、P4 remote
+  start 或外部签名证据写成已完成，未 push。
 
 ### Task P3.9：macOS App 与 CLI 默认连接同一 UDS
 

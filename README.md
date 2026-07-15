@@ -84,7 +84,7 @@ Layer B Vendor 控件命名空间允许 vendor 前缀但类型化（禁 `serde_j
 
 目标架构由每个 macOS 登录用户唯一的 stable `agentdeckd` 作为 runtime hub。P3.1
 已经建立固定 namespace、进程锁与 StorageKEK 启动边界；P3.7 已把 production execution 收口到
-`RuntimeCore → per-conversation actor → exec-gate → typed driver`。当前 P3.8-B 提交候选把 production bootstrap 固定为
+`RuntimeCore → per-conversation actor → exec-gate → typed driver`。P3.8-B（`1e7f9ea` / `459f32a`）把 production bootstrap 固定为
 `recovery permit → retained-dirfd secure bind/readback → canonical RuntimeEnvelope UDS → signal-driven graceful join`；
 默认 ephemeral/no-remote 也从私有 `TMPDIR/ad-*/s` 派生 UDS，stdin EOF 不再结束 daemon。Swift/Rust 的
 旧进程 transport 只有显式 `--stdio-compat --ephemeral --no-remote --profile dev` 才能继续走
@@ -546,7 +546,7 @@ all-target check/clippy、schema、Swift、自检、no-net/docs/fmt/diff 门禁�
 durable event ACK → terminal，并在 reopen/backfill 后读回 canonical item 与唯一 terminal。probe 不接受
 binary/root 注入，内部原子创建随机临时目录并 RAII 清理；它使用
 `/bin/sh` 无副作用 helper，不替代真实 Codex/Claude Code 登录、真实 approval 或 P6 跨设备证据。
-P3.8-B production UDS/bootstrap 已通过自动门禁并精确暂存为提交候选；P3.9 App/CLI 默认 UDS cutover、P3.10 LaunchAgent、
+P3.8-B production UDS/bootstrap 已由 `1e7f9ea` / `459f32a` 完成；P3.9 App/CLI 默认 UDS cutover、P3.10 LaunchAgent、
 P4 RemoteLink、P5/P6 客户端与实机证据仍未完成；
 P3.1 provisioned signed Keychain roundtrip 也仍是外部 BLOCKED gate。
 具体命令与资源矩阵见 [docs/QUALITY.md](docs/QUALITY.md)。

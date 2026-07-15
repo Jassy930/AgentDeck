@@ -854,8 +854,8 @@ ReadPool、配额与调度完全不变。
 
 P3.1 provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate；P3.7 exec gate 边界、prepare findings、
 fresh 完整门禁与独立终审已收口，并由 `5568e93` 完成主体 scoped commit、`c9d2146` / `5713be4`
-补齐真实 current-binary release 前取消门禁与 sentinel leader 退出窗口；P3.8-B production UDS 当前为
-已通过自动门禁的提交候选，P3.9 shared-daemon client 和 P4 remote 尚未完成。
+补齐真实 current-binary release 前取消门禁与 sentinel leader 退出窗口；P3.8-B production UDS 已由
+`1e7f9ea` / `459f32a` 完成，P3.9 shared-daemon client 和 P4 remote 尚未完成。
 因此即使本节全绿，也只能收口 P3.6 component，不得宣称 P3、Companion MVP 或真实跨网链路完成。
 
 ## Relay Companion MVP P3.7 exec-gate 与 production execution 门禁
@@ -1021,7 +1021,7 @@ P3.7 主体代码与 translator 终审修复已由 `5568e93` 提交，真实 rel
 补充由 `c9d2146` / `5713be4` 提交；fresh 完整门禁与独立终审已通过。P3.1
 provisioned signed Keychain 仍外部 BLOCKED；
 P3.8-A 增加 accepted-stream UDS transport primitives，P3.8-B production secure bind/permit、默认 UDS
-lifecycle 与 stdio compatibility 收窄当前为已通过自动门禁的提交候选；App/CLI 默认连接 shared daemon 属于 P3.9。P3.10
+lifecycle 与 stdio compatibility 收窄已由 `1e7f9ea` / `459f32a` 完成；App/CLI 默认连接 shared daemon 属于 P3.9。P3.10
 LaunchAgent、P4 RemoteLink/E2EE 与 P5/P6 实机证据也必须继续保持未完成。
 
 ## Relay Companion MVP P3.8-A local Runtime UDS transport primitives 门禁
