@@ -7,11 +7,15 @@ async fn stable_event_item_entity_and_command_ids_survive_replay() {
     let command_id = runtime_id(RuntimeIdKind::Command, 0x31);
     let turn_id = runtime_id(RuntimeIdKind::Turn, 0x32);
     let event_id = runtime_id(RuntimeIdKind::Event, 0x33);
+    let started_event_id = runtime_id(RuntimeIdKind::Event, 0x34);
     let item_id = ItemId::new("stable-item-id");
     let entity_id = EntityId::new("stable-entity-id");
     let store = RuntimeStoreHandle::open(
-        RuntimeStoreConfig::new(root.database())
-            .with_id_source(SequenceIdSource::new([command_id, turn_id, event_id])),
+        RuntimeStoreConfig::new(root.database()).with_id_source(SequenceIdSource::new([
+            command_id,
+            turn_id,
+            started_event_id,
+        ])),
         root.storage_kek(&keys),
     )
     .await
@@ -23,36 +27,48 @@ async fn stable_event_item_entity_and_command_ids_survive_replay() {
         .await
         .expect("create conversation");
     assert_eq!(accept_one(&store, conversation_id).await, command_id);
-    let canonical = RuntimeEvent::new(
-        ConversationId::new(conversation_id.to_canonical_string()),
-        EventId::new(event_id.to_canonical_string()),
-        0,
-        Some(CommandId::new(command_id.to_canonical_string())),
-        Some(item_id),
-        Some(entity_id),
-        RuntimeEventBody::Item {
-            item: AgentItem::UserMessage {
-                text: "stable identity replay".to_owned(),
-                meta: AgentItemMeta::default(),
-            },
-        },
-    )
-    .expect("canonical started event");
     store
         .mark_started_with_event(StartCommand {
             conversation_id,
             command_id,
             daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 0x73),
             execution_nonce: b"stable-id-nonce".to_vec(),
-            intent_payload: b"stable-id-intent".to_vec(),
-            event_payload: serde_json::to_vec(&canonical).expect("encode canonical event"),
         })
         .await
-        .expect("commit canonical event");
+        .expect("commit canonical TurnStarted");
+    authorize_test_execution_release(
+        &store,
+        command_id,
+        runtime_id(RuntimeIdKind::DaemonBoot, 0x73),
+        b"stable-id-nonce",
+        7_301,
+    )
+    .await;
+    let appended = store
+        .append_execution_event(AppendExecutionEvent::item(
+            conversation_id,
+            command_id,
+            turn_id,
+            event_id,
+            item_id,
+            entity_id,
+            AgentItem::UserMessage {
+                text: "stable identity replay".to_owned(),
+                meta: AgentItemMeta::default(),
+            },
+        ))
+        .await
+        .expect("append canonical item event");
+    let canonical: RuntimeEvent = match appended {
+        AppendExecutionEventOutcome::Appended { event } => {
+            serde_json::from_slice(&event.payload).expect("decode appended item")
+        }
+        AppendExecutionEventOutcome::Replayed { .. } => panic!("fresh item cannot replay"),
+    };
     let agentdeckd::runtime::store::RuntimeBackfillPlan::Pinned(pin) = store
         .acquire_backfill_pin(
             agentdeckd::runtime::store::RuntimeBackfillTarget::Conversation(conversation_id),
-            None,
+            Some(0),
         )
         .await
         .expect("pin canonical event")
@@ -60,7 +76,7 @@ async fn stable_event_item_entity_and_command_ids_survive_replay() {
         panic!("event zero must be retained");
     };
     let page = store
-        .load_event_backfill_page(pin.clone(), None)
+        .load_event_backfill_page(pin.clone(), Some(0))
         .await
         .expect("replay canonical event");
     let completion = page.completion().clone();
@@ -73,7 +89,7 @@ async fn stable_event_item_entity_and_command_ids_survive_replay() {
     assert_eq!(replayed.item_id, canonical.item_id);
     assert_eq!(replayed.entity_id, canonical.entity_id);
     let replayed_page = store
-        .load_event_backfill_page(pin.clone(), None)
+        .load_event_backfill_page(pin.clone(), Some(0))
         .await
         .expect("unacknowledged page keeps the event pin at its original cursor");
     let stale_completion = replayed_page.completion().clone();
@@ -86,7 +102,7 @@ async fn stable_event_item_entity_and_command_ids_survive_replay() {
         Err(RuntimeStoreError::InvalidBackfillPin)
     ));
     assert!(matches!(
-        store.load_event_backfill_page(pin, None).await,
+        store.load_event_backfill_page(pin, Some(0)).await,
         Err(RuntimeStoreError::InvalidBackfillPin)
     ));
     store.shutdown().await.expect("shutdown store");
@@ -166,9 +182,13 @@ async fn snapshot_and_backfill_emit_capabilities_before_any_agent_item() {
     let command_id = runtime_id(RuntimeIdKind::Command, 0x41);
     let turn_id = runtime_id(RuntimeIdKind::Turn, 0x42);
     let event_id = runtime_id(RuntimeIdKind::Event, 0x43);
+    let started_event_id = runtime_id(RuntimeIdKind::Event, 0x45);
     let store = RuntimeStoreHandle::open(
-        RuntimeStoreConfig::new(root.database())
-            .with_id_source(SequenceIdSource::new([command_id, turn_id, event_id])),
+        RuntimeStoreConfig::new(root.database()).with_id_source(SequenceIdSource::new([
+            command_id,
+            turn_id,
+            started_event_id,
+        ])),
         root.storage_kek(&keys),
     )
     .await
@@ -189,46 +209,61 @@ async fn snapshot_and_backfill_emit_capabilities_before_any_agent_item() {
     };
     let item_id = ItemId::new("capabilities-first-item");
     let entity_id = EntityId::new("capabilities-first-entity");
-    let canonical = RuntimeEvent::new(
-        ConversationId::new(conversation_id.to_canonical_string()),
-        EventId::new(event_id.to_canonical_string()),
-        0,
-        Some(CommandId::new(command_id.to_canonical_string())),
-        Some(item_id.clone()),
-        Some(entity_id.clone()),
-        RuntimeEventBody::Item {
-            item: AgentItem::UserMessage {
-                text: "canonical item after capabilities".to_owned(),
-                meta: AgentItemMeta::default(),
-            },
-        },
-    )
-    .expect("canonical item event");
     store
         .mark_started_with_event(StartCommand {
             conversation_id,
             command_id,
             daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 0x44),
             execution_nonce: b"capabilities-first-nonce".to_vec(),
-            intent_payload: b"capabilities-first-intent".to_vec(),
-            event_payload: serde_json::to_vec(&canonical).expect("encode canonical item event"),
         })
         .await
-        .expect("commit canonical item event");
+        .expect("commit canonical TurnStarted");
+    authorize_test_execution_release(
+        &store,
+        command_id,
+        runtime_id(RuntimeIdKind::DaemonBoot, 0x44),
+        b"capabilities-first-nonce",
+        7_302,
+    )
+    .await;
+    let canonical: RuntimeEvent = match store
+        .append_execution_event(AppendExecutionEvent::item(
+            conversation_id,
+            command_id,
+            turn_id,
+            event_id,
+            item_id.clone(),
+            entity_id.clone(),
+            AgentItem::UserMessage {
+                text: "canonical item after capabilities".to_owned(),
+                meta: AgentItemMeta::default(),
+            },
+        ))
+        .await
+        .expect("append canonical item event")
+    {
+        AppendExecutionEventOutcome::Appended { event } => {
+            serde_json::from_slice(&event.payload).expect("decode canonical item event")
+        }
+        AppendExecutionEventOutcome::Replayed { .. } => panic!("fresh item cannot replay"),
+    };
 
     let snapshot_source = store
         .acquire_snapshot_build_source(conversation_id)
         .await
         .expect("capture exact snapshot source");
     let RuntimeBackfillPlan::Pinned(backfill_pin) = store
-        .acquire_backfill_pin(RuntimeBackfillTarget::Conversation(conversation_id), None)
+        .acquire_backfill_pin(
+            RuntimeBackfillTarget::Conversation(conversation_id),
+            Some(0),
+        )
         .await
         .expect("pin production backfill")
     else {
         panic!("event zero must produce a pinned backfill range");
     };
     let page = store
-        .load_event_backfill_page(backfill_pin, None)
+        .load_event_backfill_page(backfill_pin, Some(0))
         .await
         .expect("load production backfill page");
     assert_eq!(page.events.len(), 1);
@@ -242,7 +277,7 @@ async fn snapshot_and_backfill_emit_capabilities_before_any_agent_item() {
         RuntimeEventBody::Item { .. }
     ));
 
-    let range = BackfillRange::new(StreamCursor::BeforeFirst, StreamCursor::At(0))
+    let range = BackfillRange::new(StreamCursor::At(0), StreamCursor::At(1))
         .expect("single event backfill range");
     let backfill = BackfillChunk::conversation(
         ConversationId::new(conversation_id.to_canonical_string()),
@@ -377,8 +412,6 @@ async fn snapshot_capture_holds_no_actor_lock_or_sqlite_transaction_during_io() 
             command_id,
             daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 0x54),
             execution_nonce: b"snapshot-no-lock-nonce".to_vec(),
-            intent_payload: b"snapshot-no-lock-intent".to_vec(),
-            event_payload: b"snapshot-no-lock-event".to_vec(),
         }),
     )
     .await

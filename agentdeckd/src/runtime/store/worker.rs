@@ -27,11 +27,10 @@ use crate::runtime::model::{
     BeginApprovalAttempt, BeginApprovalAttemptOutcome, ClaimApproval, CommandReceiptRecord,
     CommandReceiptSelector, CompleteCommand, CompleteOutcome, ConversationRecord,
     CreateConversationOutcome, ExecutionFence, ExecutionFenceRecord, ExpireApproval,
-    MAX_ACCEPTED_TERMINATION_EVENT_BYTES, MAX_ADAPTER_STATE_REFERENCE_BYTES,
-    MAX_APPROVAL_STATUS_DETAIL_BYTES, MAX_COMMAND_PAYLOAD_BYTES, MAX_COMMAND_RESULT_BYTES,
-    MAX_CONVERSATION_DESCRIPTOR_BYTES, MAX_EXECUTION_FENCE_BYTES, MAX_EXECUTION_INTENT_BYTES,
-    MAX_EXECUTION_NONCE_BYTES, MAX_IDEMPOTENCY_KEY_BYTES, MAX_RUNTIME_BUSY_TIMEOUT_MS,
-    MAX_RUNTIME_EVENT_BYTES, MAX_RUNTIME_STORE_COMMAND_CAPACITY,
+    MAX_ADAPTER_STATE_REFERENCE_BYTES, MAX_APPROVAL_STATUS_DETAIL_BYTES, MAX_COMMAND_PAYLOAD_BYTES,
+    MAX_CONVERSATION_DESCRIPTOR_BYTES, MAX_CRITICAL_COMMAND_RECORD_BYTES,
+    MAX_EXECUTION_FENCE_BYTES, MAX_EXECUTION_NONCE_BYTES, MAX_IDEMPOTENCY_KEY_BYTES,
+    MAX_RUNTIME_BUSY_TIMEOUT_MS, MAX_RUNTIME_STORE_COMMAND_CAPACITY,
     MAX_RUNTIME_STORE_LANE_BYTE_CAPACITY, MachineEnrollmentReceiptRecord, MarkApprovalApplied,
     MarkApprovalDeliveryFailed, NewConversation, QueryCommandReceipt,
     RUNTIME_STORE_SHUTDOWN_GRACE_MS, RecoveryCompletion, RecoveryCursor, RecoveryPage,
@@ -48,6 +47,8 @@ use crate::runtime::snapshot::SharedSnapshotBuildPermit;
 use crate::security::{SecretBytes, StorageKek};
 
 use super::cipher::RuntimeReadCryptoCapability;
+use super::command_event::StartEventSource;
+use super::execution_event::PreparedExecutionEvent;
 use super::identity::{
     MAX_RUNTIME_ID_COLLISION_ATTEMPTS, RuntimeId, RuntimeIdError, RuntimeIdKind,
 };
@@ -208,6 +209,7 @@ pub struct RuntimeStoreHandle {
     control_tx: mpsc::Sender<ControlCommand>,
     normal_budget: Arc<Semaphore>,
     safety_budget: Arc<Semaphore>,
+    execution_event_build_permit: Arc<Semaphore>,
     lifecycle: Arc<AtomicU8>,
     interrupt: Arc<rusqlite::InterruptHandle>,
     read_pool: ReadPool,
@@ -339,6 +341,7 @@ impl RuntimeStoreHandle {
         let (control_tx, control_rx) = mpsc::channel(1);
         let normal_budget = Arc::new(Semaphore::new(config.lane_byte_capacity));
         let safety_budget = Arc::new(Semaphore::new(config.lane_byte_capacity));
+        let execution_event_build_permit = Arc::new(Semaphore::new(1));
         let lifecycle = Arc::new(AtomicU8::new(LIFECYCLE_RUNNING));
         let worker_lifecycle = lifecycle.clone();
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -369,6 +372,7 @@ impl RuntimeStoreHandle {
                 control_tx,
                 normal_budget,
                 safety_budget,
+                execution_event_build_permit,
                 lifecycle,
                 interrupt: ready.interrupt,
                 read_pool: ready.read_pool,
@@ -560,32 +564,6 @@ impl RuntimeStoreHandle {
         .await?
     }
 
-    pub async fn mark_started_with_event(
-        &self,
-        input: StartCommand,
-    ) -> Result<StartOutcome, RuntimeStoreError> {
-        validate_nonempty_maximum(&input.execution_nonce, MAX_EXECUTION_NONCE_BYTES)?;
-        validate_maximum(input.intent_payload.len(), MAX_EXECUTION_INTENT_BYTES)?;
-        validate_maximum(input.event_payload.len(), MAX_RUNTIME_EVENT_BYTES)?;
-        let charge = memory_charge(
-            size_of::<NormalCommand>(),
-            &[
-                input.execution_nonce.capacity(),
-                input.intent_payload.capacity(),
-                input.event_payload.capacity(),
-            ],
-        )?;
-        dispatch_with_budget(
-            &self.normal_tx,
-            &self.normal_budget,
-            &self.lifecycle,
-            RuntimeStoreLane::Normal,
-            charge,
-            |reply| NormalCommand::StartCommand { input, reply },
-        )
-        .await?
-    }
-
     pub(in crate::runtime) async fn register_approval(
         &self,
         input: RegisterApproval,
@@ -718,13 +696,9 @@ impl RuntimeStoreHandle {
         &self,
         input: TerminateAcceptedCommand,
     ) -> Result<TerminateAcceptedOutcome, RuntimeStoreError> {
-        validate_maximum(
-            input.event_payload.len(),
-            MAX_ACCEPTED_TERMINATION_EVENT_BYTES,
-        )?;
         let charge = memory_charge(
             size_of::<SafetyCommand>(),
-            &[input.event_payload.capacity()],
+            &[MAX_CRITICAL_COMMAND_RECORD_BYTES],
         )?;
         dispatch_with_budget(
             &self.safety_tx,
@@ -742,14 +716,12 @@ impl RuntimeStoreHandle {
         input: TerminateStartedBeforeRelease,
     ) -> Result<TerminateStartedBeforeReleaseOutcome, RuntimeStoreError> {
         validate_nonempty_maximum(&input.execution_nonce, MAX_EXECUTION_NONCE_BYTES)?;
-        validate_maximum(input.terminal_payload.len(), MAX_COMMAND_RESULT_BYTES)?;
-        validate_maximum(input.event_payload.len(), MAX_RUNTIME_EVENT_BYTES)?;
         let charge = memory_charge(
             size_of::<SafetyCommand>(),
             &[
                 input.execution_nonce.capacity(),
-                input.terminal_payload.capacity(),
-                input.event_payload.capacity(),
+                MAX_CRITICAL_COMMAND_RECORD_BYTES,
+                MAX_CRITICAL_COMMAND_RECORD_BYTES,
             ],
         )?;
         dispatch_with_budget(
@@ -830,14 +802,9 @@ impl RuntimeStoreHandle {
         &self,
         input: CompleteCommand,
     ) -> Result<CompleteOutcome, RuntimeStoreError> {
-        validate_maximum(input.terminal_payload.len(), MAX_COMMAND_RESULT_BYTES)?;
-        validate_maximum(input.event_payload.len(), MAX_RUNTIME_EVENT_BYTES)?;
         let charge = memory_charge(
             size_of::<SafetyCommand>(),
-            &[
-                input.terminal_payload.capacity(),
-                input.event_payload.capacity(),
-            ],
+            &[MAX_CRITICAL_COMMAND_RECORD_BYTES; 2],
         )?;
         dispatch_with_budget(
             &self.safety_tx,
@@ -1023,7 +990,12 @@ enum NormalCommand {
     },
     StartCommand {
         input: StartCommand,
+        event_source: StartEventSource,
         reply: oneshot::Sender<Result<StartOutcome, RuntimeStoreError>>,
+    },
+    AppendExecutionEvent {
+        input: PreparedExecutionEvent,
+        reply: oneshot::Sender<Result<super::AppendExecutionEventOutcome, RuntimeStoreError>>,
     },
     BindAdapterState {
         namespace: AdapterStateNamespace,
@@ -1450,6 +1422,9 @@ fn handle_normal(
             NormalCommand::StartCommand { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
+            NormalCommand::AppendExecutionEvent { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
             NormalCommand::BindAdapterState { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
@@ -1518,9 +1493,20 @@ fn handle_normal(
             let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
             let _ = reply.send(result);
         }
-        NormalCommand::StartCommand { input, reply } => {
+        NormalCommand::StartCommand {
+            input,
+            event_source,
+            reply,
+        } => {
             let mut effects = CommandStreamEffects::default();
-            let result = journal::mark_started_with_event(state, config, input, &mut effects);
+            let result =
+                journal::mark_started_with_event(state, config, input, event_source, &mut effects);
+            let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
+            let _ = reply.send(result);
+        }
+        NormalCommand::AppendExecutionEvent { input, reply } => {
+            let mut effects = CommandStreamEffects::default();
+            let result = journal::append_execution_event(state, config, input, &mut effects);
             let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
             let _ = reply.send(result);
         }
@@ -1983,6 +1969,9 @@ fn notify_after_durable_outcome<T>(
     }
     result
 }
+
+mod critical_command;
+mod execution_event;
 
 #[cfg(test)]
 mod oversized_event_page_tests;

@@ -2069,3 +2069,23 @@ fn json_transfer_total_must_be_representable_by_json_parts() {
     );
     assert!(remote.encode().is_ok());
 }
+
+#[test]
+fn terminal_execution_failure_code_is_stable_and_distinct_from_actor_failure() {
+    assert_eq!(
+        failure::DAEMON_RUNTIME_EXECUTION_FAILED,
+        "daemon.runtime.execution_failed"
+    );
+    assert_ne!(
+        failure::DAEMON_RUNTIME_EXECUTION_FAILED,
+        failure::DAEMON_RUNTIME_ACTOR_UNAVAILABLE
+    );
+    let value = RuntimeFailure::new(
+        failure::DAEMON_RUNTIME_EXECUTION_FAILED,
+        "agent execution failed",
+    );
+    let encoded = serde_json::to_vec(&value).expect("encode runtime failure");
+    let decoded: RuntimeFailure = serde_json::from_slice(&encoded).expect("decode runtime failure");
+    assert_eq!(decoded, value);
+    assert_eq!(decoded.diagnostic_ref, None);
+}

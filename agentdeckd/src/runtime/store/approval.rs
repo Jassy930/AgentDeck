@@ -164,6 +164,22 @@ pub(crate) fn register_approval(
         APPROVAL_REQUEST_TOKEN_DOMAIN,
         input.request.request_id.as_bytes(),
     )?;
+    ensure_exact_started_turn(
+        &state.connection,
+        key_bundle,
+        database_id,
+        input.conversation_id,
+        input.command_id,
+        input.turn_id,
+        requested_at_ms,
+    )?;
+    super::journal::require_execution_released_at(
+        &state.connection,
+        key_bundle,
+        database_id,
+        input.command_id,
+        requested_at_ms,
+    )?;
     sqlite::admit_ordinary_write(
         &state.connection,
         key_bundle,
@@ -180,9 +196,18 @@ pub(crate) fn register_approval(
     let ledger = sqlite::load_runtime_ledger(&transaction, key_bundle, database_id)?;
     ensure_exact_started_turn(
         &transaction,
+        key_bundle,
+        database_id,
         input.conversation_id,
         input.command_id,
         input.turn_id,
+        requested_at_ms,
+    )?;
+    super::journal::require_execution_released_at(
+        &transaction,
+        key_bundle,
+        database_id,
+        input.command_id,
         requested_at_ms,
     )?;
     if let Some(existing_id) =
@@ -480,6 +505,8 @@ pub(crate) fn claim_approval(
     let preflight_stale = preflight_at_ms >= preflight.deadline_at_ms
         || !is_exact_started_turn(
             &state.connection,
+            key_bundle,
+            database_id,
             preflight.conversation_id,
             preflight.command_id,
             preflight.turn_id,
@@ -552,6 +579,8 @@ pub(crate) fn claim_approval(
     if claimed_at_ms >= approval.deadline_at_ms
         || !is_exact_started_turn(
             &transaction,
+            key_bundle,
+            database_id,
             approval.conversation_id,
             approval.command_id,
             approval.turn_id,
@@ -842,6 +871,8 @@ pub(crate) fn begin_approval_attempt(
     if observed_at_ms >= preflight.deadline_at_ms
         || !is_exact_started_turn(
             &state.connection,
+            key_bundle,
+            database_id,
             preflight.conversation_id,
             preflight.command_id,
             preflight.turn_id,
@@ -875,6 +906,8 @@ pub(crate) fn begin_approval_attempt(
         if now_ms >= preflight.deadline_at_ms
             || !is_exact_started_turn(
                 &state.connection,
+                key_bundle,
+                database_id,
                 preflight.conversation_id,
                 preflight.command_id,
                 preflight.turn_id,
@@ -904,6 +937,8 @@ pub(crate) fn begin_approval_attempt(
     if observed_at_ms >= approval.deadline_at_ms
         || !is_exact_started_turn(
             &transaction,
+            key_bundle,
+            database_id,
             approval.conversation_id,
             approval.command_id,
             approval.turn_id,
@@ -1195,6 +1230,8 @@ pub(crate) fn retry_approval_delivery(
     let preflight_stale = preflight_at_ms >= preflight.deadline_at_ms
         || !is_exact_started_turn(
             &state.connection,
+            key_bundle,
+            database_id,
             preflight.conversation_id,
             preflight.command_id,
             preflight.turn_id,
@@ -1277,6 +1314,8 @@ pub(crate) fn retry_approval_delivery(
     let stale = observed_at_ms >= approval.deadline_at_ms
         || !is_exact_started_turn(
             &transaction,
+            key_bundle,
+            database_id,
             approval.conversation_id,
             approval.command_id,
             approval.turn_id,
@@ -1418,6 +1457,8 @@ pub(crate) fn expire_approval(
     if observed_at_ms < approval.deadline_at_ms
         && is_exact_started_turn(
             &transaction,
+            key_bundle,
+            database_id,
             approval.conversation_id,
             approval.command_id,
             approval.turn_id,
@@ -2638,88 +2679,40 @@ fn canonical_resolved_event(
 
 fn ensure_exact_started_turn(
     connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
     conversation_id: RuntimeId,
     command_id: RuntimeId,
     turn_id: RuntimeId,
     observed_at_ms: u64,
 ) -> Result<(), RuntimeStoreError> {
-    let row = connection
-        .query_row(
-            "SELECT conversation_id, state, turn_id, started_at_ms
-             FROM commands WHERE command_id = ?1",
-            [&command_id.as_bytes()[..]],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<Vec<u8>>>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                ))
-            },
-        )
-        .map_err(|error| match error {
-            rusqlite::Error::QueryReturnedNoRows => RuntimeStoreError::CommandNotFound,
-            other => RuntimeStoreError::Sqlite(other),
-        })?;
-    let persisted_conversation = runtime_id(RuntimeIdKind::Conversation, row.0)?;
-    let persisted_turn = row
-        .2
-        .map(|value| runtime_id(RuntimeIdKind::Turn, value))
-        .transpose()?;
-    if persisted_conversation != conversation_id
-        || row.1 != "started"
-        || persisted_turn != Some(turn_id)
-    {
-        return Err(RuntimeStoreError::InvalidStateTransition);
-    }
-    let started_at_ms = row
-        .3
-        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)
-        .and_then(runtime_time)?;
-    if observed_at_ms < started_at_ms {
-        return Err(RuntimeStoreError::ClockRegressed {
-            persisted_ms: started_at_ms,
-            observed_ms: observed_at_ms,
-        });
-    }
-    let linked_command: Vec<u8> = connection
-        .query_row(
-            "SELECT command_id FROM execution_intents WHERE turn_id = ?1",
-            [&turn_id.as_bytes()[..]],
-            |row| row.get(0),
-        )
-        .map_err(|_| RuntimeStoreError::InvalidStateTransition)?;
-    if runtime_id(RuntimeIdKind::Command, linked_command)? != command_id {
-        return Err(RuntimeStoreError::InvalidStateTransition);
-    }
-    Ok(())
+    super::journal::require_authenticated_started_turn(
+        connection,
+        key_bundle,
+        database_id,
+        conversation_id,
+        command_id,
+        turn_id,
+        observed_at_ms,
+    )
 }
 
 fn is_exact_started_turn(
     connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
     conversation_id: RuntimeId,
     command_id: RuntimeId,
     turn_id: RuntimeId,
 ) -> Result<bool, RuntimeStoreError> {
-    let exists: i64 = connection.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM commands AS command
-             JOIN execution_intents AS intent
-               ON intent.command_id = command.command_id
-              AND intent.turn_id = command.turn_id
-             WHERE command.command_id = ?1
-               AND command.conversation_id = ?2
-               AND command.turn_id = ?3
-               AND command.state = 'started'
-         )",
-        params![
-            &command_id.as_bytes()[..],
-            &conversation_id.as_bytes()[..],
-            &turn_id.as_bytes()[..],
-        ],
-        |row| row.get(0),
-    )?;
-    Ok(exists == 1)
+    super::journal::is_authenticated_exact_started_turn(
+        connection,
+        key_bundle,
+        database_id,
+        conversation_id,
+        command_id,
+        turn_id,
+    )
 }
 
 fn approval_id_for_request(
@@ -3599,7 +3592,7 @@ mod tests {
     use agentdeck_protocol::runtime::{RuntimeEvent, RuntimeEventBody, StreamCursor};
     use agentdeck_protocol::{
         ActionDecision, ActionDecisionKind, ActionKind, ActionRequest, ActionRequestVendor,
-        AgentKind, CodexApprovalPolicy, CodexSandboxMode,
+        AgentKind, CodexApprovalPolicy, CodexSandboxMode, TurnSummary,
     };
 
     use crate::runtime::approval::{
@@ -3611,14 +3604,14 @@ mod tests {
     use crate::runtime::model::{
         AcceptCommand, AcceptOutcome, ApprovalMutationOutcome, ApprovalRecord, ApprovalState,
         AuthorizeExecutionRelease, BeginApprovalAttempt, BeginApprovalAttemptOutcome,
-        ClaimApproval, CompleteCommand, CompleteOutcome, ConversationDescriptor, ExecutionFence,
-        ExpireApproval, IdempotencyOwner, MarkApprovalApplied, MarkApprovalDeliveryFailed,
+        ClaimApproval, CommandTerminal, CompleteCommand, CompleteOutcome, ConversationDescriptor,
+        ExecutionFence, ExpireApproval, IdempotencyOwner, MAX_ACTIVE_APPROVALS_PER_TURN,
+        MAX_APPROVAL_REQUEST_BYTES, MarkApprovalApplied, MarkApprovalDeliveryFailed,
         NewConversation, RegisterApproval, RegisterApprovalOutcome, RetryApprovalDelivery,
         RuntimeCapacityObservation, RuntimeCapacityProbe, RuntimeCapacityProbeError, RuntimeClock,
         RuntimeClockError, RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError,
         RuntimeStoreFaultInjector, RuntimeStoreOperation, StartCommand, StartOutcome,
-        StartedBeforeReleaseTermination, TerminalState, TerminateStartedBeforeRelease,
-        TerminateStartedBeforeReleaseOutcome,
+        StartedBeforeReleaseTermination, TerminateStartedBeforeRelease,
     };
     use crate::runtime::store::cipher::{KeyWrapAad, RuntimeKeyBundle};
     use crate::runtime::store::schema::{RUNTIME_CRYPTO_CONTEXT_VERSION, RUNTIME_SCHEMA_FAMILY};
@@ -4050,6 +4043,29 @@ mod tests {
         keys: &MemoryKeyStore,
         config: RuntimeStoreConfig,
     ) -> (RuntimeStoreHandle, RuntimeId, RuntimeId, RuntimeId) {
+        let started = open_started_unreleased_with_config(root, keys, config).await;
+        release_started_execution(&started.0, started.2).await;
+        started
+    }
+
+    async fn open_started_unreleased(
+        root: &TestRoot,
+        keys: &MemoryKeyStore,
+        clock: &ManualClock,
+    ) -> (RuntimeStoreHandle, RuntimeId, RuntimeId, RuntimeId) {
+        open_started_unreleased_with_config(
+            root,
+            keys,
+            RuntimeStoreConfig::new(root.database()).with_clock(clock.clone()),
+        )
+        .await
+    }
+
+    async fn open_started_unreleased_with_config(
+        root: &TestRoot,
+        keys: &MemoryKeyStore,
+        config: RuntimeStoreConfig,
+    ) -> (RuntimeStoreHandle, RuntimeId, RuntimeId, RuntimeId) {
         let store = RuntimeStoreHandle::open(config, root.storage_kek(keys))
             .await
             .expect("open approval store");
@@ -4090,8 +4106,6 @@ mod tests {
                 command_id: command.command_id,
                 daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 5),
                 execution_nonce: b"approval-execution-nonce".to_vec(),
-                intent_payload: b"approval-intent-sentinel".to_vec(),
-                event_payload: b"approval-started-event".to_vec(),
             })
             .await
             .expect("start approval command");
@@ -4100,6 +4114,129 @@ mod tests {
             StartOutcome::Replayed { .. } => panic!("fresh start cannot replay"),
         };
         (store, conversation_id, command.command_id, turn_id)
+    }
+
+    async fn persist_started_execution_fence(store: &RuntimeStoreHandle, command_id: RuntimeId) {
+        store
+            .persist_execution_fence(ExecutionFence {
+                command_id,
+                daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 5),
+                execution_nonce: b"approval-execution-nonce".to_vec(),
+                process_group_id: 70,
+                leader_pid: 71,
+                leader_start_time: 72,
+                payload: b"approval-test-execution-fence".to_vec(),
+            })
+            .await
+            .expect("persist approval test execution fence");
+    }
+
+    async fn authorize_started_execution_release(
+        store: &RuntimeStoreHandle,
+        command_id: RuntimeId,
+    ) {
+        store
+            .authorize_execution_release(AuthorizeExecutionRelease {
+                command_id,
+                daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 5),
+                execution_nonce: b"approval-execution-nonce".to_vec(),
+            })
+            .await
+            .expect("authorize approval test execution release");
+    }
+
+    async fn release_started_execution(store: &RuntimeStoreHandle, command_id: RuntimeId) {
+        persist_started_execution_fence(store, command_id).await;
+        authorize_started_execution_release(store, command_id).await;
+    }
+
+    fn raw_event_approval_counts(database: &std::path::Path) -> (u64, u64, u64, u64) {
+        let connection = rusqlite::Connection::open(database).expect("open approval count DB");
+        let counts: (i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM event_journal),
+                     event_count,
+                     approval_count,
+                     active_approval_count
+                 FROM runtime_meta WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read approval count snapshot");
+        (
+            u64::try_from(counts.0).expect("nonnegative event row count"),
+            u64::try_from(counts.1).expect("nonnegative event ledger count"),
+            u64::try_from(counts.2).expect("nonnegative approval ledger count"),
+            u64::try_from(counts.3).expect("nonnegative active approval count"),
+        )
+    }
+
+    fn load_test_key_bundle(
+        root: &TestRoot,
+        keys: &MemoryKeyStore,
+        connection: &rusqlite::Connection,
+    ) -> ([u8; 16], RuntimeKeyBundle) {
+        let (database_id, wrapped_key_bundle): (Vec<u8>, Vec<u8>) = connection
+            .query_row(
+                "SELECT database_id, wrapped_key_bundle
+                 FROM runtime_meta WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read approval test runtime key metadata");
+        let database_id: [u8; 16] = database_id.try_into().expect("fixed database id");
+        let storage_kek = root.storage_kek(keys);
+        let key_bundle = RuntimeKeyBundle::unwrap(
+            &storage_kek,
+            &KeyWrapAad {
+                schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
+                schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
+                database_id: &database_id,
+            },
+            &wrapped_key_bundle,
+        )
+        .expect("unwrap approval test runtime keys");
+        (database_id, key_bundle)
+    }
+
+    fn forge_authenticated_release_time(
+        root: &TestRoot,
+        keys: &MemoryKeyStore,
+        command_id: RuntimeId,
+        authorized_at_ms: u64,
+    ) -> ([u8; 16], RuntimeKeyBundle) {
+        let connection = rusqlite::Connection::open(root.database())
+            .expect("open pre-release approval fixture DB");
+        let (database_id, key_bundle) = load_test_key_bundle(root, keys, &connection);
+        let daemon_boot_id = runtime_id(RuntimeIdKind::DaemonBoot, 5);
+        let authorized_at_bytes = authorized_at_ms.to_be_bytes();
+        let release_plaintext = super::encode_fields(
+            b"ADF1",
+            &[
+                command_id.as_bytes(),
+                daemon_boot_id.as_bytes(),
+                b"approval-execution-nonce",
+                &authorized_at_bytes,
+            ],
+        )
+        .expect("encode authenticated forged release");
+        let release_token = key_bundle
+            .blind_index(b"execution.release.v1", &release_plaintext)
+            .expect("authenticate forged release time");
+        connection
+            .execute(
+                "UPDATE execution_fences
+                 SET release_authorized_at_ms = ?1, release_token = ?2
+                 WHERE command_id = ?3",
+                rusqlite::params![
+                    i64::try_from(authorized_at_ms).expect("SQLite release time"),
+                    &release_token.as_bytes()[..],
+                    &command_id.as_bytes()[..],
+                ],
+            )
+            .expect("persist authenticated forged release time");
+        (database_id, key_bundle)
     }
 
     async fn register_and_claim(
@@ -4254,37 +4391,17 @@ mod tests {
             other => panic!("fixture must become Applied, got {other:?}"),
         };
 
-        clock.set(40_006);
-        store
-            .persist_execution_fence(ExecutionFence {
-                command_id,
-                daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 5),
-                execution_nonce: b"approval-execution-nonce".to_vec(),
-                process_group_id: 70,
-                leader_pid: 71,
-                leader_start_time: 72,
-                payload: b"terminal-expiry-fence".to_vec(),
-            })
-            .await
-            .expect("persist completion fence");
-        clock.set(40_007);
-        store
-            .authorize_execution_release(AuthorizeExecutionRelease {
-                command_id,
-                daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 5),
-                execution_nonce: b"approval-execution-nonce".to_vec(),
-            })
-            .await
-            .expect("authorize completion release");
         clock.set(40_008);
         let terminal = match store
             .complete_command_with_event(CompleteCommand {
                 conversation_id,
                 command_id,
                 turn_id,
-                terminal_state: TerminalState::Completed,
-                terminal_payload: b"terminal-expiry-result".to_vec(),
-                event_payload: b"terminal-expiry-command-event".to_vec(),
+                terminal: CommandTerminal::completed(TurnSummary {
+                    total_input_tokens: None,
+                    total_output_tokens: None,
+                    elapsed_ms: 0,
+                }),
             })
             .await
             .expect("complete command and expire approvals")
@@ -4365,7 +4482,7 @@ mod tests {
         .await
         .expect("shutdown reopened terminal store");
 
-        // started-before-release 的取消/中断必须复用同一事务原语，并覆盖所有 active state。
+        // released Interrupted terminal 复用同一事务原语，并覆盖所有 active state。
         let terminate_root = TestRoot::new("terminal-expiry-before-release");
         let terminate_keys = MemoryKeyStore::new();
         let terminate_clock = ManualClock::new(50_000);
@@ -4524,22 +4641,18 @@ mod tests {
 
         terminate_clock.set(50_015);
         let terminal = match terminate_store
-            .terminate_started_before_release(TerminateStartedBeforeRelease {
+            .complete_command_with_event(CompleteCommand {
                 conversation_id: terminate_conversation,
                 command_id: terminate_command,
                 turn_id: terminate_turn,
-                daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 5),
-                execution_nonce: b"approval-execution-nonce".to_vec(),
-                reason: StartedBeforeReleaseTermination::Interrupted,
-                terminal_payload: b"terminate-before-release-result".to_vec(),
-                event_payload: b"terminate-before-release-event".to_vec(),
+                terminal: CommandTerminal::interrupted(),
             })
             .await
-            .expect("terminate started command and expire approvals")
+            .expect("interrupt released command and expire approvals")
         {
-            TerminateStartedBeforeReleaseOutcome::Transitioned { event, .. } => event,
-            TerminateStartedBeforeReleaseOutcome::Replayed { .. } => {
-                panic!("fresh started termination cannot replay")
+            CompleteOutcome::Completed { event, .. } => event,
+            CompleteOutcome::Replayed { .. } => {
+                panic!("fresh released interruption cannot replay")
             }
         };
         terminate_store
@@ -4616,6 +4729,236 @@ mod tests {
         .expect("shutdown reopened started terminal store");
     }
 
+    #[tokio::test]
+    async fn released_terminal_expires_maximum_approvals_on_fragmented_sqlite_with_pinned_wal() {
+        // 威胁场景：同一已 release turn 持有 32 条最大合法 approval 时，碎片化
+        // free-list 与旧读事务钉住的 WAL 会放大 terminal+expiry 事务；若每条
+        // approval 的 safety obligation 或 terminal closure reserve 被低估，daemon
+        // 会留下 durable Started 或仍 active 的审批，无法安全收口已发生的副作用。
+        let root = TestRoot::new("released-terminal-max-approvals-real-sqlite");
+        let keys = MemoryKeyStore::new();
+        let clock = ManualClock::new(80_000);
+        let database = root.database();
+        let (store, conversation_id, command_id, turn_id) =
+            open_started(&root, &keys, &clock).await;
+
+        let expected_approval_count = usize::try_from(MAX_ACTIVE_APPROVALS_PER_TURN)
+            .expect("per-turn approval limit fits usize");
+        let mut approval_ids = Vec::with_capacity(expected_approval_count);
+        let mut maximum_envelope_bytes = 0_usize;
+        for index in 0..MAX_ACTIVE_APPROVALS_PER_TURN {
+            clock.set(80_010 + u64::from(index));
+            let mut request = request_named(&format!("maximum-{index:02}"));
+            let initial_envelope = super::canonical_request_envelope(&request, &policy())
+                .expect("measure approval envelope");
+            let summary_growth = MAX_APPROVAL_REQUEST_BYTES
+                .checked_sub(initial_envelope.len())
+                .expect("fixed approval envelope fits the public limit");
+            request.summary.push_str(&"x".repeat(summary_growth));
+            let envelope = super::canonical_request_envelope(&request, &policy())
+                .expect("maximum approval envelope remains legal");
+            assert_eq!(
+                envelope.len(),
+                MAX_APPROVAL_REQUEST_BYTES,
+                "fixture must exercise the exact legal approval request limit"
+            );
+            maximum_envelope_bytes = maximum_envelope_bytes.max(envelope.len());
+            drop(envelope);
+
+            let approval = match store
+                .register_approval(RegisterApproval {
+                    conversation_id,
+                    command_id,
+                    turn_id,
+                    request,
+                    policy: policy(),
+                })
+                .await
+                .expect("register maximum legal approval")
+            {
+                RegisterApprovalOutcome::Registered { approval, .. } => approval,
+                RegisterApprovalOutcome::Replayed { .. } => {
+                    panic!("unique maximum approval cannot replay")
+                }
+            };
+            assert_eq!(approval.state, ApprovalState::Pending);
+            approval_ids.push(approval.approval_id);
+        }
+        assert_eq!(approval_ids.len(), expected_approval_count);
+
+        let pinned_reader = rusqlite::Connection::open(&database).expect("open pinned WAL reader");
+        pinned_reader
+            .execute_batch("BEGIN DEFERRED")
+            .expect("begin pinned approval snapshot");
+        let pinned_approval_count: i64 = pinned_reader
+            .query_row("SELECT COUNT(*) FROM approval_ledger", [], |row| row.get(0))
+            .expect("establish pinned approval snapshot");
+        assert_eq!(
+            pinned_approval_count,
+            i64::from(MAX_ACTIVE_APPROVALS_PER_TURN)
+        );
+
+        let mut fragmenter =
+            rusqlite::Connection::open(&database).expect("open fragmentation writer");
+        fragmenter
+            .busy_timeout(Duration::from_secs(5))
+            .expect("set fragmentation busy timeout");
+        fragmenter
+            .execute_batch("PRAGMA wal_autocheckpoint = 0")
+            .expect("disable fragmentation auto-checkpoint");
+        {
+            let transaction = fragmenter
+                .transaction()
+                .expect("begin approval fragmentation transaction");
+            transaction
+                .execute_batch(
+                    "CREATE TABLE approval_capacity_fragment_fixture (
+                         fragment_id INTEGER PRIMARY KEY,
+                         payload BLOB NOT NULL
+                     )",
+                )
+                .expect("create approval fragmentation table");
+            for fragment_id in 0_i64..256 {
+                transaction
+                    .execute(
+                        "INSERT INTO approval_capacity_fragment_fixture
+                         (fragment_id, payload) VALUES (?1, zeroblob(?2))",
+                        rusqlite::params![fragment_id, 16 * 1024_i64],
+                    )
+                    .expect("insert approval fragmentation row");
+            }
+            transaction
+                .commit()
+                .expect("commit approval fragmentation rows");
+        }
+        fragmenter
+            .execute_batch("DROP TABLE approval_capacity_fragment_fixture")
+            .expect("drop approval fragmentation table");
+
+        let page_count_before: u64 = fragmenter
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .expect("read fragmented approval page count");
+        let freelist_before: u64 = fragmenter
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .expect("read fragmented approval free-list");
+        assert!(
+            freelist_before > 0,
+            "fixture must retain real SQLite free-list fragmentation"
+        );
+        let (checkpoint_busy, wal_frames, checkpointed_frames): (i64, i64, i64) = fragmenter
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .expect("measure approval pinned WAL checkpoint");
+        assert!(
+            wal_frames > 0,
+            "fixture must produce real approval WAL frames"
+        );
+        assert!(
+            checkpoint_busy != 0 || checkpointed_frames < wal_frames,
+            "reader must prevent complete checkpoint: busy={checkpoint_busy}, \
+             log={wal_frames}, checkpointed={checkpointed_frames}"
+        );
+        let wal_path = PathBuf::from(format!("{}-wal", database.display()));
+        let wal_bytes_before = fs::metadata(&wal_path)
+            .expect("approval WAL exists before terminal")
+            .len();
+
+        clock.set(81_000);
+        let terminal = store
+            .complete_command_with_event(CompleteCommand {
+                conversation_id,
+                command_id,
+                turn_id,
+                terminal: CommandTerminal::interrupted(),
+            })
+            .await
+            .expect("maximum approval terminal must close on fragmented SQLite");
+        assert!(matches!(terminal, CompleteOutcome::Completed { .. }));
+        let wal_bytes_after = fs::metadata(&wal_path)
+            .expect("approval WAL remains observable after terminal")
+            .len();
+
+        let durable =
+            rusqlite::Connection::open(&database).expect("open maximum approval terminal readback");
+        let (approval_count, expired_count, applied_count, distinct_terminal_events): (
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = durable
+            .query_row(
+                "SELECT COUNT(*),
+                        SUM(CASE WHEN state = 'expired' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN state = 'applied' THEN 1 ELSE 0 END),
+                        COUNT(DISTINCT last_event_id)
+                 FROM approval_ledger WHERE turn_id = ?1",
+                [&turn_id.as_bytes()[..]],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read maximum approval terminal states");
+        let (ledger_approval_count, active_approval_count): (i64, i64) = durable
+            .query_row(
+                "SELECT approval_count, active_approval_count
+                 FROM runtime_meta WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read maximum approval terminal ledger");
+        let (command_state, terminal_event_present): (String, bool) = durable
+            .query_row(
+                "SELECT state, terminal_event_id IS NOT NULL
+                 FROM commands WHERE command_id = ?1",
+                [&command_id.as_bytes()[..]],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read maximum approval command terminal");
+        let expected_approval_count = i64::from(MAX_ACTIVE_APPROVALS_PER_TURN);
+        assert_eq!(approval_count, expected_approval_count);
+        assert_eq!(expired_count, expected_approval_count);
+        assert_eq!(applied_count, 0);
+        assert_eq!(distinct_terminal_events, expected_approval_count);
+        assert_eq!(ledger_approval_count, expected_approval_count);
+        assert_eq!(active_approval_count, 0);
+        assert_eq!(command_state, "interrupted");
+        assert!(terminal_event_present);
+        drop(durable);
+
+        pinned_reader
+            .execute_batch("ROLLBACK")
+            .expect("release pinned approval snapshot");
+        drop(pinned_reader);
+        drop(fragmenter);
+        store
+            .shutdown()
+            .await
+            .expect("shutdown maximum approval reserve store");
+
+        let reopened = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(database).with_clock(clock),
+            root.storage_kek(&keys),
+        )
+        .await
+        .expect("reopen maximum approval terminal store");
+        reopened
+            .inspect()
+            .await
+            .expect("authenticate maximum approval terminal store");
+        reopened
+            .shutdown()
+            .await
+            .expect("shutdown reopened maximum approval terminal store");
+
+        eprintln!(
+            "maximum approval terminal real SQLite evidence: approvals={}, \
+             envelope_bytes={maximum_envelope_bytes}, page_count={page_count_before}, \
+             freelist={freelist_before}, checkpoint=({checkpoint_busy},{wal_frames},\
+             {checkpointed_frames}), wal_before={wal_bytes_before}, \
+             wal_after={wal_bytes_after}, active_approvals=0",
+            MAX_ACTIVE_APPROVALS_PER_TURN
+        );
+    }
+
     async fn open_claimed_with_fault(
         label: &str,
         operation: RuntimeStoreOperation,
@@ -4659,7 +5002,7 @@ mod tests {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum TerminalFaultPath {
         Complete,
-        TerminateStartedBeforeRelease,
+        Interrupted,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4675,46 +5018,30 @@ mod tests {
         command_id: RuntimeId,
         turn_id: RuntimeId,
     ) -> Result<TerminalFaultOutcome, RuntimeStoreError> {
-        match path {
-            TerminalFaultPath::Complete => store
-                .complete_command_with_event(CompleteCommand {
-                    conversation_id,
-                    command_id,
-                    turn_id,
-                    terminal_state: TerminalState::Completed,
-                    terminal_payload: b"terminal-fault-result".to_vec(),
-                    event_payload: b"terminal-fault-event".to_vec(),
-                })
-                .await
-                .map(|outcome| match outcome {
-                    CompleteOutcome::Completed { event, .. } => {
-                        TerminalFaultOutcome::Transitioned(event.event_id)
-                    }
-                    CompleteOutcome::Replayed { event, .. } => {
-                        TerminalFaultOutcome::Replayed(event.event_id)
-                    }
-                }),
-            TerminalFaultPath::TerminateStartedBeforeRelease => store
-                .terminate_started_before_release(TerminateStartedBeforeRelease {
-                    conversation_id,
-                    command_id,
-                    turn_id,
-                    daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 5),
-                    execution_nonce: b"approval-execution-nonce".to_vec(),
-                    reason: StartedBeforeReleaseTermination::Interrupted,
-                    terminal_payload: b"terminal-fault-result".to_vec(),
-                    event_payload: b"terminal-fault-event".to_vec(),
-                })
-                .await
-                .map(|outcome| match outcome {
-                    TerminateStartedBeforeReleaseOutcome::Transitioned { event, .. } => {
-                        TerminalFaultOutcome::Transitioned(event.event_id)
-                    }
-                    TerminateStartedBeforeReleaseOutcome::Replayed { event, .. } => {
-                        TerminalFaultOutcome::Replayed(event.event_id)
-                    }
-                }),
-        }
+        let terminal = match path {
+            TerminalFaultPath::Complete => CommandTerminal::completed(TurnSummary {
+                total_input_tokens: None,
+                total_output_tokens: None,
+                elapsed_ms: 0,
+            }),
+            TerminalFaultPath::Interrupted => CommandTerminal::interrupted(),
+        };
+        store
+            .complete_command_with_event(CompleteCommand {
+                conversation_id,
+                command_id,
+                turn_id,
+                terminal,
+            })
+            .await
+            .map(|outcome| match outcome {
+                CompleteOutcome::Completed { event, .. } => {
+                    TerminalFaultOutcome::Transitioned(event.event_id)
+                }
+                CompleteOutcome::Replayed { event, .. } => {
+                    TerminalFaultOutcome::Replayed(event.event_id)
+                }
+            })
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4797,16 +5124,16 @@ mod tests {
             ),
             (
                 2,
-                TerminalFaultPath::TerminateStartedBeforeRelease,
-                RuntimeStoreOperation::TerminateStartedBeforeReleaseBeforeCommit,
-                RuntimeCommitOperation::TerminateStartedBeforeRelease,
+                TerminalFaultPath::Interrupted,
+                RuntimeStoreOperation::CompleteCommandBeforeCommit,
+                RuntimeCommitOperation::CompleteCommand,
                 false,
             ),
             (
                 3,
-                TerminalFaultPath::TerminateStartedBeforeRelease,
-                RuntimeStoreOperation::TerminateStartedBeforeReleaseAfterCommit,
-                RuntimeCommitOperation::TerminateStartedBeforeRelease,
+                TerminalFaultPath::Interrupted,
+                RuntimeStoreOperation::CompleteCommandAfterCommit,
+                RuntimeCommitOperation::CompleteCommand,
                 true,
             ),
         ] {
@@ -4828,30 +5155,6 @@ mod tests {
                 &format!("fault-{index}"),
             )
             .await;
-            if path == TerminalFaultPath::Complete {
-                clock.set(base_ms + 2);
-                store
-                    .persist_execution_fence(ExecutionFence {
-                        command_id,
-                        daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 5),
-                        execution_nonce: b"approval-execution-nonce".to_vec(),
-                        process_group_id: 80,
-                        leader_pid: 81,
-                        leader_start_time: 82,
-                        payload: b"terminal-fault-fence".to_vec(),
-                    })
-                    .await
-                    .expect("persist fault completion fence");
-                clock.set(base_ms + 3);
-                store
-                    .authorize_execution_release(AuthorizeExecutionRelease {
-                        command_id,
-                        daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 5),
-                        execution_nonce: b"approval-execution-nonce".to_vec(),
-                    })
-                    .await
-                    .expect("authorize fault completion release");
-            }
             let before = read_raw_terminal_snapshot(
                 &root.database(),
                 conversation_id,
@@ -4927,7 +5230,7 @@ mod tests {
                 final_snapshot.command_state,
                 match path {
                     TerminalFaultPath::Complete => "completed",
-                    TerminalFaultPath::TerminateStartedBeforeRelease => "interrupted",
+                    TerminalFaultPath::Interrupted => "interrupted",
                 }
             );
             assert_eq!(final_snapshot.approval_state, "expired");
@@ -4997,35 +5300,15 @@ mod tests {
                 )
                 .expect("capture authenticated Pending fields")
         };
-        clock.set(61_002);
-        store
-            .persist_execution_fence(ExecutionFence {
-                command_id,
-                daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 5),
-                execution_nonce: b"approval-execution-nonce".to_vec(),
-                process_group_id: 90,
-                leader_pid: 91,
-                leader_start_time: 92,
-                payload: b"terminal-replay-gap-fence".to_vec(),
-            })
-            .await
-            .expect("persist replay-gap fence");
-        clock.set(61_003);
-        store
-            .authorize_execution_release(AuthorizeExecutionRelease {
-                command_id,
-                daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 5),
-                execution_nonce: b"approval-execution-nonce".to_vec(),
-            })
-            .await
-            .expect("authorize replay-gap release");
         let input = || CompleteCommand {
             conversation_id,
             command_id,
             turn_id,
-            terminal_state: TerminalState::Completed,
-            terminal_payload: b"terminal-replay-gap-result".to_vec(),
-            event_payload: b"terminal-replay-gap-event".to_vec(),
+            terminal: CommandTerminal::completed(TurnSummary {
+                total_input_tokens: None,
+                total_output_tokens: None,
+                elapsed_ms: 0,
+            }),
         };
         clock.set(61_004);
         store
@@ -5115,19 +5398,15 @@ mod tests {
         clock.set(62_002);
         assert!(matches!(
             store
-                .terminate_started_before_release(TerminateStartedBeforeRelease {
+                .complete_command_with_event(CompleteCommand {
                     conversation_id,
                     command_id,
                     turn_id,
-                    daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 5),
-                    execution_nonce: b"approval-execution-nonce".to_vec(),
-                    reason: StartedBeforeReleaseTermination::Canceled,
-                    terminal_payload: b"safety-only-terminal-result".to_vec(),
-                    event_payload: b"safety-only-terminal-event".to_vec(),
+                    terminal: CommandTerminal::canceled(),
                 })
                 .await
                 .expect("reserved Safety lane closes terminal turn"),
-            TerminateStartedBeforeReleaseOutcome::Transitioned { .. }
+            CompleteOutcome::Completed { .. }
         ));
         store
             .shutdown()
@@ -5157,28 +5436,6 @@ mod tests {
         let (store, conversation_id, command_id, turn_id) =
             open_started(&root, &keys, &clock).await;
 
-        clock.set(63_001);
-        store
-            .persist_execution_fence(ExecutionFence {
-                command_id,
-                daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 5),
-                execution_nonce: b"approval-execution-nonce".to_vec(),
-                process_group_id: 101,
-                leader_pid: 102,
-                leader_start_time: 103,
-                payload: b"clock-regression-fence".to_vec(),
-            })
-            .await
-            .expect("persist clock-regression fence");
-        clock.set(63_002);
-        store
-            .authorize_execution_release(AuthorizeExecutionRelease {
-                command_id,
-                daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 5),
-                execution_nonce: b"approval-execution-nonce".to_vec(),
-            })
-            .await
-            .expect("authorize clock-regression release");
         clock.set(63_003);
         let claimed = register_and_claim(&store, conversation_id, command_id, turn_id).await;
         clock.set(63_004);
@@ -5222,9 +5479,11 @@ mod tests {
                     conversation_id,
                     command_id,
                     turn_id,
-                    terminal_state: TerminalState::Completed,
-                    terminal_payload: b"clock-regression-result".to_vec(),
-                    event_payload: b"clock-regression-terminal-event".to_vec(),
+                    terminal: CommandTerminal::completed(TurnSummary {
+                        total_input_tokens: None,
+                        total_output_tokens: None,
+                        elapsed_ms: 0,
+                    }),
                 })
                 .await,
             Err(RuntimeStoreError::ClockRegressed {
@@ -5249,50 +5508,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminate_before_release_rolls_back_when_clock_precedes_the_last_delivery_attempt() {
-        let root = TestRoot::new("terminate-terminal-attempt-clock-regression");
+    async fn terminate_before_release_rolls_back_when_clock_precedes_the_started_turn() {
+        let root = TestRoot::new("terminate-before-release-clock-regression");
         let keys = MemoryKeyStore::new();
         let clock = ManualClock::new(64_000);
         let (store, conversation_id, command_id, turn_id) =
-            open_started(&root, &keys, &clock).await;
-
+            open_started_unreleased(&root, &keys, &clock).await;
         clock.set(64_001);
-        let claimed = register_and_claim(&store, conversation_id, command_id, turn_id).await;
-        clock.set(64_002);
-        let first_attempt = match store
-            .begin_approval_attempt(BeginApprovalAttempt {
-                approval_id: claimed.approval_id,
-                delivery_round: 0,
-                expected_attempts_in_round: 0,
-            })
-            .await
-            .expect("begin first termination attempt")
-        {
-            BeginApprovalAttemptOutcome::Permitted { approval, .. } => approval,
-            other => panic!("first termination attempt must be permitted, got {other:?}"),
-        };
-        clock.set(64_004);
-        let second_attempt = match store
-            .begin_approval_attempt(BeginApprovalAttempt {
-                approval_id: claimed.approval_id,
-                delivery_round: first_attempt.delivery_round,
-                expected_attempts_in_round: first_attempt.attempts_in_round,
-            })
-            .await
-            .expect("begin second termination attempt")
-        {
-            BeginApprovalAttemptOutcome::Permitted { approval, .. } => approval,
-            other => panic!("second termination attempt must be permitted, got {other:?}"),
-        };
-        assert_eq!(second_attempt.last_attempt_at_ms, Some(64_004));
-        let before = read_raw_terminal_snapshot(
-            &root.database(),
-            conversation_id,
-            command_id,
-            claimed.approval_id,
-        );
+        persist_started_execution_fence(&store, command_id).await;
+        let before = raw_event_approval_counts(&root.database());
 
-        clock.set(64_003);
+        clock.set(63_999);
         assert!(matches!(
             store
                 .terminate_started_before_release(TerminateStartedBeforeRelease {
@@ -5302,25 +5528,23 @@ mod tests {
                     daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 5),
                     execution_nonce: b"approval-execution-nonce".to_vec(),
                     reason: StartedBeforeReleaseTermination::Interrupted,
-                    terminal_payload: b"terminate-clock-regression-result".to_vec(),
-                    event_payload: b"terminate-clock-regression-event".to_vec(),
                 })
                 .await,
             Err(RuntimeStoreError::ClockRegressed {
-                persisted_ms: 64_004,
-                observed_ms: 64_003,
-            })
+                persisted_ms,
+                observed_ms: 63_999,
+            }) if persisted_ms >= 64_000
         ));
-        let after = read_raw_terminal_snapshot(
-            &root.database(),
-            conversation_id,
-            command_id,
-            claimed.approval_id,
-        );
-        assert_eq!(
-            after, before,
-            "clock regression must roll back the entire Safety transaction"
-        );
+        assert_eq!(raw_event_approval_counts(&root.database()), before);
+        let command_state: String = rusqlite::Connection::open(root.database())
+            .expect("open pre-release clock regression DB")
+            .query_row(
+                "SELECT state FROM commands WHERE command_id = ?1",
+                [&command_id.as_bytes()[..]],
+                |row| row.get(0),
+            )
+            .expect("read pre-release command state");
+        assert_eq!(command_state, "started");
         store
             .shutdown()
             .await
@@ -6439,6 +6663,199 @@ mod tests {
         .shutdown()
         .await
         .expect("shutdown reopened retry deadline closure");
+    }
+
+    #[tokio::test]
+    async fn approval_registration_requires_release_without_advancing_event_or_ledger() {
+        // 威胁场景：adapter 在 execution release 前提交 ActionRequest；若注册能落盘，用户会
+        // 看到一条来自从未获准执行进程的伪造 approval，并且 durable ledger 已被推进。
+        let root = TestRoot::new("registration-release-boundary");
+        let keys = MemoryKeyStore::new();
+        let clock = ManualClock::new(100_000);
+        let (store, conversation_id, command_id, turn_id) =
+            open_started_unreleased(&root, &keys, &clock).await;
+        clock.set(100_001);
+        persist_started_execution_fence(&store, command_id).await;
+        let before = raw_event_approval_counts(&root.database());
+
+        clock.set(100_002);
+        assert!(matches!(
+            store
+                .register_approval(RegisterApproval {
+                    conversation_id,
+                    command_id,
+                    turn_id,
+                    request: request(),
+                    policy: policy(),
+                })
+                .await,
+            Err(RuntimeStoreError::ExecutionReleaseMissing)
+        ));
+        assert_eq!(raw_event_approval_counts(&root.database()), before);
+
+        clock.set(100_003);
+        authorize_started_execution_release(&store, command_id).await;
+        clock.set(100_004);
+        let registered = store
+            .register_approval(RegisterApproval {
+                conversation_id,
+                command_id,
+                turn_id,
+                request: request(),
+                policy: policy(),
+            })
+            .await
+            .expect("released execution may register approval");
+        assert!(matches!(
+            registered,
+            RegisterApprovalOutcome::Registered { approval, event }
+                if approval.requested_at_ms == 100_004
+                    && event.created_at_ms == 100_004
+        ));
+        let after = raw_event_approval_counts(&root.database());
+        assert_eq!(after.0, before.0 + 1);
+        assert_eq!(after.1, before.1 + 1);
+        assert_eq!(after.2, before.2 + 1);
+        assert_eq!(after.3, before.3 + 1);
+
+        store
+            .shutdown()
+            .await
+            .expect("shutdown release boundary store");
+        RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_clock(clock),
+            root.storage_kek(&keys),
+        )
+        .await
+        .expect("released approval store reopens")
+        .shutdown()
+        .await
+        .expect("shutdown reopened release boundary store");
+    }
+
+    #[tokio::test]
+    async fn approval_registration_rejects_live_command_metadata_tamper_without_writes() {
+        // 威胁场景：同一用户下仍持有数据库写权限的旧进程把已 terminal command 的裸
+        // state 改回 started、却无法同步伪造 metadata MAC；若 fresh approval 只看裸列，
+        // 它会在下一次 open fail-close 之前写入并广播一条未经认证执行所产生的请求。
+        let root = TestRoot::new("registration-live-command-metadata-tamper");
+        let keys = MemoryKeyStore::new();
+        let clock = ManualClock::new(100_100);
+        let (store, conversation_id, command_id, turn_id) =
+            open_started(&root, &keys, &clock).await;
+        clock.set(100_101);
+        store
+            .complete_command_with_event(CompleteCommand {
+                conversation_id,
+                command_id,
+                turn_id,
+                terminal: CommandTerminal::completed(TurnSummary {
+                    total_input_tokens: Some(1),
+                    total_output_tokens: Some(2),
+                    elapsed_ms: 3,
+                }),
+            })
+            .await
+            .expect("complete approval tamper target");
+
+        let before = raw_event_approval_counts(&root.database());
+        let connection = rusqlite::Connection::open(root.database())
+            .expect("open live command metadata tamper DB");
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE commands SET state = 'started' WHERE command_id = ?1",
+                    [&command_id.as_bytes()[..]],
+                )
+                .expect("tamper raw command state without its metadata MAC"),
+            1
+        );
+        drop(connection);
+
+        clock.set(100_102);
+        assert!(matches!(
+            store
+                .register_approval(RegisterApproval {
+                    conversation_id,
+                    command_id,
+                    turn_id,
+                    request: request(),
+                    policy: policy(),
+                })
+                .await,
+            Err(RuntimeStoreError::UnknownOrCorruptSchema)
+        ));
+        assert_eq!(raw_event_approval_counts(&root.database()), before);
+        store
+            .shutdown()
+            .await
+            .expect("shutdown tampered approval store");
+    }
+
+    #[tokio::test]
+    async fn authenticated_pre_release_approval_events_fail_closed_on_open() {
+        // 威胁场景：本机数据库写入者同时伪造 release timestamp 与其 MAC，使已认证的
+        // ActionRequest/ApprovalResolved 看似发生在 release 前；open-time audit 必须拒绝。
+        for (index, resolved) in [false, true].into_iter().enumerate() {
+            let base_ms = 101_000 + u64::try_from(index).expect("small index") * 100;
+            let root = TestRoot::new(if resolved {
+                "pre-release-approval-resolved"
+            } else {
+                "pre-release-action-request"
+            });
+            let keys = MemoryKeyStore::new();
+            let clock = ManualClock::new(base_ms);
+            let (store, conversation_id, command_id, turn_id) =
+                open_started(&root, &keys, &clock).await;
+            clock.set(base_ms + 1);
+            let approval = match store
+                .register_approval(RegisterApproval {
+                    conversation_id,
+                    command_id,
+                    turn_id,
+                    request: request(),
+                    policy: policy(),
+                })
+                .await
+                .expect("register pre-release tamper target")
+            {
+                RegisterApprovalOutcome::Registered { approval, .. } => approval,
+                RegisterApprovalOutcome::Replayed { .. } => {
+                    panic!("fresh pre-release target cannot replay")
+                }
+            };
+            if resolved {
+                clock.set(base_ms + 2);
+                claim_named(&store, conversation_id, turn_id, approval).await;
+            }
+            store
+                .shutdown()
+                .await
+                .expect("shutdown before release timestamp tamper");
+
+            let (database_id, key_bundle) =
+                forge_authenticated_release_time(&root, &keys, command_id, base_ms + 3);
+            let connection = rusqlite::Connection::open(root.database())
+                .expect("open authenticated pre-release event fixture");
+            let approval_summary =
+                super::validate_all_approval_metadata(&connection, &key_bundle, database_id)
+                    .expect("approval row/event chain remains independently authenticated");
+            assert_eq!(approval_summary.approval_count, 1);
+            assert_eq!(
+                approval_summary.approval_event_count,
+                if resolved { 2 } else { 1 }
+            );
+            drop(connection);
+
+            clock.set(base_ms + 4);
+            let error = RuntimeStoreHandle::open(
+                RuntimeStoreConfig::new(root.database()).with_clock(clock),
+                root.storage_kek(&keys),
+            )
+            .await
+            .expect_err("pre-release approval event must fail closed on open");
+            assert!(matches!(error, RuntimeStoreError::UnknownOrCorruptSchema));
+        }
     }
 
     #[tokio::test]

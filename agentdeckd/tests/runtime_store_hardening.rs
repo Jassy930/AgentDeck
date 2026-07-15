@@ -12,15 +12,16 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use agentdeck_protocol::TurnSummary;
 use agentdeckd::runtime::model::{
     AuthorizeExecutionRelease, COMMAND_QUEUE_TTL_MS, RuntimeClock, RuntimeClockError,
 };
 use agentdeckd::runtime::store::{
-    AcceptCommand, AcceptOutcome, CommandRecord, CommandState, CompleteCommand, CompleteOutcome,
-    ExecutionFence, ExecutionIntentRecord, IdempotencyOwner, MachineEnrollmentReceiptRecord,
-    NewConversation, RuntimeCommitOperation, RuntimeId, RuntimeIdKind, RuntimeStoreConfig,
-    RuntimeStoreError, RuntimeStoreFaultInjector, RuntimeStoreHandle, RuntimeStoreOperation,
-    StartCommand, StartOutcome, TerminalState,
+    AcceptCommand, AcceptOutcome, CommandRecord, CommandState, CommandTerminal, CompleteCommand,
+    CompleteOutcome, ExecutionFence, ExecutionIntentRecord, IdempotencyOwner,
+    MachineEnrollmentReceiptRecord, NewConversation, RuntimeCommitOperation, RuntimeId,
+    RuntimeIdKind, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreFaultInjector,
+    RuntimeStoreHandle, RuntimeStoreOperation, StartCommand, StartOutcome,
 };
 use agentdeckd::security::{MemoryKeyStore, StorageKek, load_or_create_storage_kek};
 use rusqlite::{Connection, OpenFlags, params};
@@ -148,8 +149,6 @@ async fn start_new(
     command_id: RuntimeId,
     daemon_boot_id: RuntimeId,
     nonce: &[u8],
-    intent_payload: &[u8],
-    event_payload: &[u8],
 ) -> ExecutionIntentRecord {
     match store
         .mark_started_with_event(StartCommand {
@@ -157,8 +156,6 @@ async fn start_new(
             command_id,
             daemon_boot_id,
             execution_nonce: nonce.to_vec(),
-            intent_payload: intent_payload.to_vec(),
-            event_payload: event_payload.to_vec(),
         })
         .await
         .expect("start command")
@@ -202,16 +199,16 @@ fn complete_input(
     conversation_id: RuntimeId,
     command_id: RuntimeId,
     turn_id: RuntimeId,
-    terminal_payload: &[u8],
-    event_payload: &[u8],
 ) -> CompleteCommand {
     CompleteCommand {
         conversation_id,
         command_id,
         turn_id,
-        terminal_state: TerminalState::Completed,
-        terminal_payload: terminal_payload.to_vec(),
-        event_payload: event_payload.to_vec(),
+        terminal: CommandTerminal::completed(TurnSummary {
+            total_input_tokens: None,
+            total_output_tokens: None,
+            elapsed_ms: 0,
+        }),
     }
 }
 
@@ -241,8 +238,6 @@ async fn create_completed_audit_fixture(root: &TestRoot, keys: &MemoryKeyStore, 
         command.command_id,
         daemon_boot_id,
         b"audit-nonce",
-        b"audit-intent",
-        b"audit-start-event",
     )
     .await;
     store
@@ -270,8 +265,6 @@ async fn create_completed_audit_fixture(root: &TestRoot, keys: &MemoryKeyStore, 
             conversation.conversation_id,
             command.command_id,
             intent.turn_id,
-            b"audit-result",
-            b"audit-terminal-event",
         ))
         .await
         .expect("complete audit fixture");
@@ -550,20 +543,18 @@ async fn every_side_effect_after_commit_unknown_has_an_exact_retry() {
         command_id: command.command_id,
         daemon_boot_id,
         execution_nonce: b"after-commit-nonce".to_vec(),
-        intent_payload: b"after-commit-intent".to_vec(),
-        event_payload: b"after-commit-start-event".to_vec(),
     };
     let error = store
         .mark_started_with_event(start())
         .await
         .expect_err("start commit reply is unknown");
     assert_commit_unknown(error, RuntimeCommitOperation::StartCommand);
-    let intent = match store
+    let (intent, started_event_payload) = match store
         .mark_started_with_event(start())
         .await
         .expect("start exact retry")
     {
-        StartOutcome::Replayed { intent, .. } => intent,
+        StartOutcome::Replayed { intent, event, .. } => (intent, event.payload),
         StartOutcome::Started { .. } => panic!("committed start must replay"),
     };
 
@@ -606,8 +597,6 @@ async fn every_side_effect_after_commit_unknown_has_an_exact_retry() {
             conversation.conversation_id,
             command.command_id,
             intent.turn_id,
-            b"after-commit-result",
-            b"after-commit-terminal-event",
         )
     };
     let error = store
@@ -615,14 +604,36 @@ async fn every_side_effect_after_commit_unknown_has_an_exact_retry() {
         .await
         .expect_err("completion commit reply is unknown");
     assert_commit_unknown(error, RuntimeCommitOperation::CompleteCommand);
+    let completion = store
+        .complete_command_with_event(complete())
+        .await
+        .expect("completion exact retry");
+    let (completed_event_id, completed_event_payload) = match completion {
+        CompleteOutcome::Replayed { command, event }
+            if command.command_id == persisted_fence.command_id =>
+        {
+            (event.event_id, event.payload)
+        }
+        other => panic!("completion must replay exact records, got {other:?}"),
+    };
+    let second_start = store
+        .mark_started_with_event(start())
+        .await
+        .expect_err("terminal command cannot start again");
     assert!(matches!(
-        store
-            .complete_command_with_event(complete())
-            .await
-            .expect("completion exact retry"),
-        CompleteOutcome::Replayed { command, .. }
-            if command.command_id == persisted_fence.command_id
+        second_start,
+        RuntimeStoreError::InvalidStateTransition
     ));
+    let second_completion = store
+        .complete_command_with_event(complete())
+        .await
+        .expect("second completion replay");
+    assert!(matches!(
+        second_completion,
+        CompleteOutcome::Replayed { event, .. }
+            if event.event_id == completed_event_id && event.payload == completed_event_payload
+    ));
+    assert!(!started_event_payload.is_empty());
     store.shutdown().await.expect("shutdown store");
 }
 
@@ -769,8 +780,6 @@ async fn every_before_commit_fault_rolls_back_and_first_retry_commits_once() {
         command_id: command.command_id,
         daemon_boot_id,
         execution_nonce: b"rollback-nonce".to_vec(),
-        intent_payload: b"rollback-intent".to_vec(),
-        event_payload: b"rollback-start-event".to_vec(),
     };
     assert!(matches!(
         store.mark_started_with_event(start()).await,
@@ -834,8 +843,6 @@ async fn every_before_commit_fault_rolls_back_and_first_retry_commits_once() {
             conversation.conversation_id,
             command.command_id,
             intent.turn_id,
-            b"rollback-result",
-            b"rollback-terminal-event",
         )
     };
     assert!(matches!(
@@ -885,8 +892,6 @@ async fn completion_requires_matching_fence_and_persisted_release_authorization(
         command.command_id,
         daemon_boot_id,
         b"release-gate-nonce",
-        b"intent",
-        b"start event",
     )
     .await;
 
@@ -896,8 +901,6 @@ async fn completion_requires_matching_fence_and_persisted_release_authorization(
             conversation.conversation_id,
             command.command_id,
             intent.turn_id,
-            b"result",
-            b"terminal event",
         )
     };
     let without_fence = store
@@ -987,8 +990,6 @@ async fn forged_release_time_and_shape_valid_token_fail_closed() {
         command.command_id,
         daemon_boot_id,
         b"forged-release-nonce",
-        b"intent",
-        b"started",
     )
     .await;
     store
@@ -1053,8 +1054,6 @@ async fn intent_and_fence_plain_metadata_tamper_fail_closed_against_sealed_field
             command.command_id,
             runtime_id(RuntimeIdKind::DaemonBoot, 0x71),
             b"intent-metadata-nonce",
-            b"intent",
-            b"started",
         )
         .await;
         store.shutdown().await.expect("shutdown intent store");
@@ -1106,8 +1105,6 @@ async fn intent_and_fence_plain_metadata_tamper_fail_closed_against_sealed_field
             command.command_id,
             daemon_boot_id,
             b"fence-metadata-nonce",
-            b"intent",
-            b"started",
         )
         .await;
         store
@@ -1243,8 +1240,6 @@ async fn authenticated_command_conversation_event_and_runtime_ledger_metadata_ta
             command.command_id,
             runtime_id(RuntimeIdKind::DaemonBoot, 0x73),
             b"event-nonce",
-            b"intent",
-            b"event",
         )
         .await;
         store
@@ -1252,6 +1247,9 @@ async fn authenticated_command_conversation_event_and_runtime_ledger_metadata_ta
             .await
             .expect("shutdown before event tamper");
         let connection = Connection::open(root.database()).expect("open event tamper DB");
+        connection
+            .execute_batch("PRAGMA foreign_keys = OFF")
+            .expect("disable FK only for authenticated metadata tamper fixture");
         connection
             .execute(
                 "UPDATE event_journal SET event_seq = '00000000000000000001'",
@@ -1481,8 +1479,6 @@ async fn an_older_valid_conversation_metadata_mac_cannot_roll_back_event_high_wa
         command.command_id,
         daemon_boot_id,
         b"hwm-nonce",
-        b"intent",
-        b"started",
     )
     .await;
     let old_metadata: (Option<String>, i64, Vec<u8>) = Connection::open(&database)
@@ -1520,8 +1516,6 @@ async fn an_older_valid_conversation_metadata_mac_cannot_roll_back_event_high_wa
             conversation.conversation_id,
             command.command_id,
             intent.turn_id,
-            b"result",
-            b"terminal",
         ))
         .await
         .expect("complete HWM fixture");
@@ -1585,8 +1579,6 @@ async fn recovery_finish_revalidates_external_changes_before_reopening_mutations
         command.command_id,
         daemon_boot_id,
         b"finish-nonce",
-        b"intent",
-        b"started",
     )
     .await;
     store
@@ -1614,8 +1606,6 @@ async fn recovery_finish_revalidates_external_changes_before_reopening_mutations
             conversation.conversation_id,
             command.command_id,
             intent.turn_id,
-            b"result",
-            b"terminal",
         ))
         .await
         .expect("complete finish fixture");
@@ -1697,8 +1687,6 @@ async fn release_authorization_uses_safety_lane_when_normal_lane_is_full() {
         command.command_id,
         daemon_boot_id,
         b"safety-nonce",
-        b"intent",
-        b"event",
     )
     .await;
     store
@@ -1839,8 +1827,6 @@ async fn terminal_replay_and_token_bind_conversation_command_and_turn() {
         first_command.command_id,
         daemon_boot_id,
         b"terminal-nonce-one",
-        b"same intent",
-        b"same start event",
     )
     .await;
     let second_intent = start_new(
@@ -1849,8 +1835,6 @@ async fn terminal_replay_and_token_bind_conversation_command_and_turn() {
         second_command.command_id,
         daemon_boot_id,
         b"terminal-nonce-two",
-        b"same intent",
-        b"same start event",
     )
     .await;
     for (command, nonce, seed) in [
@@ -1887,13 +1871,7 @@ async fn terminal_replay_and_token_bind_conversation_command_and_turn() {
         ),
     ] {
         store
-            .complete_command_with_event(complete_input(
-                conversation_id,
-                command_id,
-                turn_id,
-                b"identical terminal payload",
-                b"identical terminal event",
-            ))
+            .complete_command_with_event(complete_input(conversation_id, command_id, turn_id))
             .await
             .expect("complete command");
     }
@@ -1903,8 +1881,6 @@ async fn terminal_replay_and_token_bind_conversation_command_and_turn() {
             first_conversation.conversation_id,
             first_command.command_id,
             second_intent.turn_id,
-            b"identical terminal payload",
-            b"identical terminal event",
         ))
         .await
         .expect_err("terminal replay with another turn must conflict");
@@ -2044,8 +2020,6 @@ async fn recovery_sweeps_expiry_with_event_and_expired_completion_is_typed() {
             conversation.conversation_id,
             command.command_id,
             runtime_id(RuntimeIdKind::Turn, 0x55),
-            b"impossible result",
-            b"impossible event",
         ))
         .await
         .expect_err("expired completion is rejected without SQLite type leakage");
@@ -2085,8 +2059,6 @@ async fn reverse_start_and_terminal_times_return_typed_errors_without_mutation()
             command_id: command.command_id,
             daemon_boot_id,
             execution_nonce: b"time-order-nonce".to_vec(),
-            intent_payload: b"intent".to_vec(),
-            event_payload: b"event".to_vec(),
         })
         .await
         .expect_err("clock before accepted state must be rejected before SQLite");
@@ -2105,8 +2077,6 @@ async fn reverse_start_and_terminal_times_return_typed_errors_without_mutation()
         command.command_id,
         daemon_boot_id,
         b"time-order-nonce",
-        b"intent",
-        b"event",
     )
     .await;
     store
@@ -2135,8 +2105,6 @@ async fn reverse_start_and_terminal_times_return_typed_errors_without_mutation()
             conversation.conversation_id,
             command.command_id,
             intent.turn_id,
-            b"result",
-            b"terminal event",
         ))
         .await
         .expect_err("terminal clock before release must be rejected before SQLite");
@@ -2212,11 +2180,7 @@ async fn every_sensitive_journal_field_stays_out_of_db_wal_shm_and_debug() {
     const IDEMPOTENCY_KEY: &str = "idempotency-plaintext-sentinel-9a02";
     const PROMPT: &[u8] = b"prompt-plaintext-sentinel-ab13";
     const NONCE: &[u8] = b"nonce-plaintext-sentinel-bc24";
-    const INTENT: &[u8] = b"intent-plaintext-sentinel-cd35";
-    const START_EVENT: &[u8] = b"start-event-plaintext-sentinel-de46";
     const FENCE: &[u8] = b"fence-plaintext-sentinel-ef57";
-    const RESULT: &[u8] = b"result-plaintext-sentinel-f068";
-    const TERMINAL_EVENT: &[u8] = b"terminal-event-plaintext-sentinel-0179";
     const REMOTE_KEY: &str = "remote-idempotency-plaintext-128a";
     const REMOTE_PROMPT: &[u8] = b"remote-prompt-plaintext-sentinel-239b";
     const LOCAL_MACHINE_DOMAIN: [u8; 32] = [0xD3; 32];
@@ -2263,13 +2227,15 @@ async fn every_sensitive_journal_field_stays_out_of_db_wal_shm_and_debug() {
             command_id: command.command_id,
             daemon_boot_id,
             execution_nonce: NONCE.to_vec(),
-            intent_payload: INTENT.to_vec(),
-            event_payload: START_EVENT.to_vec(),
         })
         .await
         .expect("start sentinel command");
-    let turn_id = match &started {
-        StartOutcome::Started { intent, .. } => intent.turn_id,
+    let (turn_id, canonical_intent, canonical_start_event) = match &started {
+        StartOutcome::Started { intent, event, .. } => (
+            intent.turn_id,
+            intent.payload.clone(),
+            event.payload.clone(),
+        ),
         StartOutcome::Replayed { .. } => panic!("sentinel start cannot replay"),
     };
     let fence = store
@@ -2293,11 +2259,16 @@ async fn every_sensitive_journal_field_stays_out_of_db_wal_shm_and_debug() {
             conversation.conversation_id,
             command.command_id,
             turn_id,
-            RESULT,
-            TERMINAL_EVENT,
         ))
         .await
         .expect("complete sentinel command");
+    let (canonical_result, canonical_terminal_event) = match &completed {
+        CompleteOutcome::Completed { command, event } => (
+            command.result.clone().expect("completed result"),
+            event.payload.clone(),
+        ),
+        CompleteOutcome::Replayed { .. } => panic!("fresh completion cannot replay"),
+    };
 
     let remote = store
         .accept_command(AcceptCommand {
@@ -2318,11 +2289,11 @@ async fn every_sensitive_journal_field_stays_out_of_db_wal_shm_and_debug() {
         IDEMPOTENCY_KEY.as_bytes(),
         PROMPT,
         NONCE,
-        INTENT,
-        START_EVENT,
+        &canonical_intent,
+        &canonical_start_event,
         FENCE,
-        RESULT,
-        TERMINAL_EVENT,
+        &canonical_result,
+        &canonical_terminal_event,
         REMOTE_KEY.as_bytes(),
         REMOTE_PROMPT,
         &LOCAL_MACHINE_DOMAIN,

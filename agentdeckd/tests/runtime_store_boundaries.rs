@@ -497,62 +497,6 @@ fn reauthenticate_conversation(
     );
 }
 
-fn move_event_retention_through(
-    connection: &Connection,
-    key_bundle: &RuntimeKeyBundle,
-    conversation_id: RuntimeId,
-    indexed_through: &str,
-) {
-    let (oldest, retained_count, retained_bytes, range_digest): (
-        Option<String>,
-        i64,
-        i64,
-        Vec<u8>,
-    ) = connection
-        .query_row(
-            "SELECT oldest_retained_event_seq, retained_event_count, retained_logical_bytes,
-                    range_digest
-             FROM event_retention WHERE conversation_id = ?1",
-            [&conversation_id.as_bytes()[..]],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .expect("read event retention fixture");
-    assert!(
-        oldest.is_none(),
-        "opaque boundary fixture has no replay row"
-    );
-    assert_eq!(retained_count, 0);
-    assert_eq!(retained_bytes, 0);
-    let indexed = optional_text_field(Some(indexed_through));
-    let oldest = optional_text_field(None);
-    let encoded = canonical_fields(&[
-        conversation_id.as_bytes(),
-        &indexed,
-        &oldest,
-        &0_u64.to_be_bytes(),
-        &0_u64.to_be_bytes(),
-        &range_digest,
-    ]);
-    let token = key_bundle
-        .blind_index(b"event.retention.v1", &encoded)
-        .expect("authenticate event retention boundary");
-    assert_eq!(
-        connection
-            .execute(
-                "UPDATE event_retention
-                 SET indexed_through_event_seq = ?1, metadata_token = ?2
-                 WHERE conversation_id = ?3",
-                params![
-                    indexed_through,
-                    &token.as_bytes()[..],
-                    &conversation_id.as_bytes()[..],
-                ],
-            )
-            .expect("move event retention through boundary"),
-        1
-    );
-}
-
 fn move_accepted_command_to_sequence(
     connection: &Connection,
     key_bundle: &RuntimeKeyBundle,
@@ -658,56 +602,6 @@ fn move_accepted_command_to_sequence(
                 ],
             )
             .expect("move accepted command to boundary sequence"),
-        1
-    );
-}
-
-fn move_event_to_sequence(
-    connection: &Connection,
-    key_bundle: &RuntimeKeyBundle,
-    conversation_id: RuntimeId,
-    event_id: RuntimeId,
-    command_id: RuntimeId,
-    next_sequence: &str,
-) {
-    let (logical_event_bytes, created_at_ms): (i64, i64) = connection
-        .query_row(
-            "SELECT logical_event_bytes, created_at_ms
-             FROM event_journal WHERE event_id = ?1",
-            [&event_id.as_bytes()[..]],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("read event metadata fixture");
-    let logical_event_bytes = u64::try_from(logical_event_bytes)
-        .expect("event bytes are non-negative")
-        .to_be_bytes();
-    let created_at_ms = u64::try_from(created_at_ms)
-        .expect("event time is non-negative")
-        .to_be_bytes();
-    let command_id = optional_blob_field(Some(command_id.as_bytes()));
-    let encoded = canonical_fields(&[
-        conversation_id.as_bytes(),
-        event_id.as_bytes(),
-        next_sequence.as_bytes(),
-        &command_id,
-        &logical_event_bytes,
-        &created_at_ms,
-    ]);
-    let token = key_bundle
-        .blind_index(b"event.metadata.v1", &encoded)
-        .expect("authenticate event boundary metadata");
-    assert_eq!(
-        connection
-            .execute(
-                "UPDATE event_journal SET event_seq = ?1, metadata_token = ?2
-                 WHERE event_id = ?3",
-                params![
-                    next_sequence,
-                    &token.as_bytes()[..],
-                    &event_id.as_bytes()[..],
-                ],
-            )
-            .expect("move event to boundary sequence"),
         1
     );
 }
@@ -1130,7 +1024,7 @@ async fn event_hwm_u64_max_returns_typed_exhaustion_and_keeps_command_accepted()
         .await
         .expect("create event HWM fixture conversation");
     clock.set(2_000);
-    let expiring_command = match store
+    let _expiring_command = match store
         .accept_command(accept_input(
             conversation.conversation_id,
             "event-max-expiring-command",
@@ -1155,34 +1049,26 @@ async fn event_hwm_u64_max_returns_typed_exhaustion_and_keeps_command_accepted()
         AcceptOutcome::Accepted { command, .. } => command,
         AcceptOutcome::Replayed { .. } => panic!("target command cannot replay"),
     };
-    store.shutdown().await.expect("close event HWM fixture");
-
+    // 完整 open-time audit 要求物理 event journal 从 0 连续到 HWM，因此不存在一个
+    // 可实际物化、同时把 HWM 推到 u64::MAX 的小型合法数据库。这里只在已打开且空闲的
+    // test Store 后门写入 authenticated HWM，精确触发 allocator 边界；断言零写后立刻
+    // 恢复 production event row 对应的原 HWM，再用正常 reopen 证明 fixture 没被带坏。
+    let original_event_high_water: Option<String>;
     {
         let storage_kek = root.storage_kek(&keys);
         let mut raw = raw_connection(&root.database());
         let (key_bundle, _) = load_runtime_key_bundle(&raw, &storage_kek);
         let transaction = raw.transaction().expect("begin event HWM boundary fixture");
-        let raw_event_id: Vec<u8> = transaction
+        original_event_high_water = transaction
             .query_row(
-                "SELECT event_id FROM event_journal WHERE command_id = ?1",
-                [&expiring_command.command_id.as_bytes()[..]],
+                "SELECT event_high_water FROM conversations WHERE conversation_id = ?1",
+                [&conversation.conversation_id.as_bytes()[..]],
                 |row| row.get(0),
             )
-            .expect("read reachable initial event id");
-        let event_id = RuntimeId::from_bytes(
-            RuntimeIdKind::Event,
-            raw_event_id
-                .try_into()
-                .expect("event id has authenticated fixed length"),
-        )
-        .expect("event id is non-zero");
-        move_event_to_sequence(
-            &transaction,
-            &key_bundle,
-            conversation.conversation_id,
-            event_id,
-            expiring_command.command_id,
-            MAX_SEQUENCE,
+            .expect("read production event HWM before boundary injection");
+        assert_eq!(
+            original_event_high_water.as_deref(),
+            Some("00000000000000000000")
         );
         assert_eq!(
             transaction
@@ -1194,54 +1080,77 @@ async fn event_hwm_u64_max_returns_typed_exhaustion_and_keeps_command_accepted()
             1
         );
         reauthenticate_conversation(&transaction, &key_bundle, conversation.conversation_id);
-        move_event_retention_through(
-            &transaction,
-            &key_bundle,
-            conversation.conversation_id,
-            MAX_SEQUENCE,
-        );
         transaction
             .commit()
             .expect("commit authenticated event HWM boundary fixture");
     }
 
     clock.set(3_000 + COMMAND_QUEUE_TTL_MS);
-    let reopened = RuntimeStoreHandle::open(config, root.storage_kek(&keys))
-        .await
-        .expect("reopen event HWM fixture");
-    let error = reopened
+    let error = store
         .mark_started_with_event(StartCommand {
             conversation_id: conversation.conversation_id,
             command_id: command.command_id,
             daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 1),
             execution_nonce: b"event-max-nonce".to_vec(),
-            intent_payload: b"must-not-persist-intent".to_vec(),
-            event_payload: b"must-not-persist-event".to_vec(),
         })
         .await
         .expect_err("event HWM at u64::MAX must exhaust");
     assert_sequence_exhausted(&error, "EventSeq");
+
+    {
+        let storage_kek = root.storage_kek(&keys);
+        let mut raw = raw_connection(&root.database());
+        let (state, event_count, intent_count, event_high_water): (String, i64, i64, String) = raw
+            .query_row(
+                "SELECT state,
+                        (SELECT COUNT(*) FROM event_journal),
+                        (SELECT COUNT(*) FROM execution_intents),
+                        (SELECT event_high_water FROM conversations WHERE conversation_id = ?2)
+                 FROM commands WHERE command_id = ?1",
+                params![
+                    &command.command_id.as_bytes()[..],
+                    &conversation.conversation_id.as_bytes()[..]
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read event zero-write evidence");
+        assert_eq!(state, "accepted");
+        assert_eq!(event_count, 1);
+        assert_eq!(intent_count, 0);
+        assert_eq!(event_high_water, MAX_SEQUENCE);
+
+        let (key_bundle, _) = load_runtime_key_bundle(&raw, &storage_kek);
+        let transaction = raw
+            .transaction()
+            .expect("begin event HWM fixture restoration");
+        assert_eq!(
+            transaction
+                .execute(
+                    "UPDATE conversations SET event_high_water = ?1 WHERE conversation_id = ?2",
+                    params![
+                        original_event_high_water,
+                        &conversation.conversation_id.as_bytes()[..]
+                    ],
+                )
+                .expect("restore production event HWM"),
+            1
+        );
+        reauthenticate_conversation(&transaction, &key_bundle, conversation.conversation_id);
+        transaction.commit().expect("commit event HWM restoration");
+    }
+    store.shutdown().await.expect("shutdown event HWM store");
+    let reopened = RuntimeStoreHandle::open(config, root.storage_kek(&keys))
+        .await
+        .expect("restored event HWM fixture reopens");
     let recovery = runtime_recovery::load_recovery_state(&reopened)
         .await
-        .expect("read state after event HWM exhaustion");
+        .expect("read restored state after event HWM exhaustion");
     assert_eq!(recovery.accepted.len(), 1);
     assert!(recovery.started.is_empty());
     assert_eq!(recovery.accepted[0].command_id, command.command_id);
-    assert_eq!(recovery.conversations[0].event_high_water, Some(u64::MAX));
-    reopened.shutdown().await.expect("shutdown event HWM store");
-
-    let raw = raw_connection(&root.database());
-    let (state, event_count, intent_count): (String, i64, i64) = raw
-        .query_row(
-            "SELECT state,
-                    (SELECT COUNT(*) FROM event_journal),
-                    (SELECT COUNT(*) FROM execution_intents)
-             FROM commands WHERE command_id = ?1",
-            [&command.command_id.as_bytes()[..]],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .expect("read event zero-write evidence");
-    assert_eq!(state, "accepted");
-    assert_eq!(event_count, 1);
-    assert_eq!(intent_count, 0);
+    assert_eq!(recovery.conversations[0].event_high_water, Some(0));
+    reopened
+        .shutdown()
+        .await
+        .expect("shutdown restored event HWM fixture");
 }

@@ -15,12 +15,13 @@ use agentdeckd::runtime::model::{
     RuntimeCapacityObservation, RuntimeCapacityProbe, RuntimeCapacityProbeError,
 };
 use agentdeckd::runtime::store::{
-    AcceptCommand, AcceptOutcome, AuthorizeExecutionRelease, CompleteCommand, CompleteOutcome,
-    ExecutionFence, IdempotencyOwner, MachineEnrollmentReceiptRecord, NewConversation, RuntimeId,
-    RuntimeIdKind, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreHandle, StartCommand,
-    StartOutcome, TerminalState,
+    AcceptCommand, AcceptOutcome, AuthorizeExecutionRelease, CommandTerminal, CompleteCommand,
+    CompleteOutcome, ExecutionFence, IdempotencyOwner, MachineEnrollmentReceiptRecord,
+    NewConversation, RuntimeId, RuntimeIdKind, RuntimeStoreConfig, RuntimeStoreError,
+    RuntimeStoreHandle, StartCommand, StartOutcome,
 };
 use agentdeckd::security::{MemoryKeyStore, StorageKek, load_or_create_storage_kek};
+use rusqlite::{Connection, params};
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
@@ -143,9 +144,13 @@ fn over_limit_observation() -> RuntimeCapacityObservation {
 }
 
 fn insufficient_terminal_tail_observation() -> RuntimeCapacityObservation {
+    terminal_tail_observation(520 * MIB)
+}
+
+fn terminal_tail_observation(filesystem_available_bytes: u64) -> RuntimeCapacityObservation {
     RuntimeCapacityObservation {
         filesystem_total_bytes: 4 * GIB,
-        filesystem_available_bytes: 600 * MIB,
+        filesystem_available_bytes,
         ..healthy_observation()
     }
 }
@@ -294,8 +299,6 @@ async fn accepted_and_started_replays_bypass_disk_low_admission() {
         command_id: command.command_id,
         daemon_boot_id: daemon_boot_id(),
         execution_nonce: b"same-nonce".to_vec(),
-        intent_payload: b"same-intent".to_vec(),
-        event_payload: b"same-event".to_vec(),
     };
     let turn_id = match store
         .mark_started_with_event(start_input())
@@ -363,8 +366,6 @@ async fn new_accept_and_start_are_rejected_before_their_first_durable_write() {
         command_id: command.command_id,
         daemon_boot_id: daemon_boot_id(),
         execution_nonce: b"gated-nonce".to_vec(),
-        intent_payload: b"intent".to_vec(),
-        event_payload: b"started".to_vec(),
     };
 
     probe.set(low_disk_observation());
@@ -419,24 +420,54 @@ async fn start_reserves_the_complete_fence_release_and_max_terminal_tail() {
         AcceptOutcome::Replayed { .. } => panic!("first accept cannot replay"),
     };
 
+    let start = StartCommand {
+        conversation_id: conversation.conversation_id,
+        command_id: command.command_id,
+        daemon_boot_id: daemon_boot_id(),
+        execution_nonce: vec![0xA5; 1024],
+    };
     probe.set(insufficient_terminal_tail_observation());
     let error = store
-        .mark_started_with_event(StartCommand {
-            conversation_id: conversation.conversation_id,
-            command_id: command.command_id,
-            daemon_boot_id: daemon_boot_id(),
-            execution_nonce: b"reserve-nonce".to_vec(),
-            intent_payload: b"intent".to_vec(),
-            event_payload: b"started".to_vec(),
-        })
+        .mark_started_with_event(start.clone())
         .await
         .expect_err("start must reserve all remaining safety writes before COMMIT");
-    assert!(matches!(error, RuntimeStoreError::DiskLow { .. }));
+    let required_available_bytes = match error {
+        RuntimeStoreError::DiskLow {
+            available_bytes,
+            required_available_bytes,
+        } => {
+            assert_eq!(available_bytes, 520 * MIB);
+            assert!(required_available_bytes > available_bytes);
+            required_available_bytes
+        }
+        other => panic!("expected DiskLow, got {other:?}"),
+    };
     let recovery = runtime_recovery::load_recovery_state(&store)
         .await
         .expect("reservation rejection leaves recovery readable");
     assert_eq!(recovery.accepted.len(), 1);
     assert!(recovery.started.is_empty());
+
+    probe.set(terminal_tail_observation(required_available_bytes - 1));
+    assert!(matches!(
+        store
+            .mark_started_with_event(start.clone())
+            .await
+            .expect_err("one byte below the exact reserve must still reject"),
+        RuntimeStoreError::DiskLow {
+            required_available_bytes: observed,
+            ..
+        } if observed == required_available_bytes
+    ));
+
+    probe.set(terminal_tail_observation(required_available_bytes));
+    assert!(matches!(
+        store
+            .mark_started_with_event(start)
+            .await
+            .expect("the exact required capacity admits the same start"),
+        StartOutcome::Started { .. }
+    ));
     store.shutdown().await.expect("shutdown runtime store");
 }
 
@@ -482,8 +513,6 @@ async fn safety_only_revalidates_reserved_tail_before_fence_release_and_terminal
             command_id: command.command_id,
             daemon_boot_id: daemon_boot_id(),
             execution_nonce: b"safety-nonce".to_vec(),
-            intent_payload: b"intent".to_vec(),
-            event_payload: b"started".to_vec(),
         })
         .await
         .expect("start commits before the post-commit over-limit readback");
@@ -548,9 +577,7 @@ async fn safety_only_revalidates_reserved_tail_before_fence_release_and_terminal
             conversation_id: conversation.conversation_id,
             command_id: command.command_id,
             turn_id,
-            terminal_state: TerminalState::Interrupted,
-            terminal_payload: b"interrupted".to_vec(),
-            event_payload: b"terminal".to_vec(),
+            terminal: CommandTerminal::interrupted(),
         })
         .await
         .expect("SafetyOnly permits terminal completion while the reserved tail validates");
@@ -599,4 +626,206 @@ async fn rescue_receipt_replay_bypasses_capacity_but_a_new_receipt_revalidates_s
 
     probe.set(healthy_observation());
     store.shutdown().await.expect("shutdown runtime store");
+}
+
+#[tokio::test]
+async fn released_terminal_closes_on_fragmented_real_sqlite_with_a_pinned_wal_reader() {
+    // 威胁场景：vendor 已越过 release gate 后，SQLite free-list 已碎片化且旧读事务
+    // pin 住 WAL；若 safety reserve 低估 terminal transaction 的真实写入需求，daemon
+    // 会无法持久化终态并留下仍可能产生副作用的 durable Started。
+    //
+    // 这是不注入 synthetic capacity probe 的真实 SQLite 基线。approval 注册能力是
+    // daemon-private，integration test 无法伪造；因此本样本覆盖的 active approval 数为
+    // 0，不冒充 `MAX_ACTIVE_APPROVALS_PER_TURN` 上限证据。完整 32 条上限仍须放在可调用
+    // typed approval API 的 crate-private store test 中验证。
+    let root = TestRoot::new("released-terminal-real-sqlite");
+    let keys = MemoryKeyStore::new();
+    let database = root.database();
+    let store = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(database.clone()),
+        root.storage_kek(&keys),
+    )
+    .await
+    .expect("open real-capacity runtime store");
+
+    let conversation = store
+        .create_conversation(conversation_input(0x31, b"real sqlite terminal capacity"))
+        .await
+        .expect("create terminal capacity conversation");
+    let command = match store
+        .accept_command(AcceptCommand {
+            conversation_id: conversation.conversation_id,
+            owner: local_owner(),
+            idempotency_key: "released-terminal-real-sqlite".to_owned(),
+            payload: b"terminal capacity prompt".to_vec(),
+        })
+        .await
+        .expect("accept terminal capacity command")
+    {
+        AcceptOutcome::Accepted { command, .. } => command,
+        AcceptOutcome::Replayed { .. } => panic!("fresh terminal capacity command cannot replay"),
+    };
+    let execution_nonce = b"released-terminal-real-sqlite-nonce".to_vec();
+    let turn_id = match store
+        .mark_started_with_event(StartCommand {
+            conversation_id: conversation.conversation_id,
+            command_id: command.command_id,
+            daemon_boot_id: daemon_boot_id(),
+            execution_nonce: execution_nonce.clone(),
+        })
+        .await
+        .expect("start terminal capacity command")
+    {
+        StartOutcome::Started { intent, .. } => intent.turn_id,
+        StartOutcome::Replayed { .. } => panic!("fresh terminal capacity start cannot replay"),
+    };
+    store
+        .persist_execution_fence(ExecutionFence {
+            command_id: command.command_id,
+            daemon_boot_id: daemon_boot_id(),
+            execution_nonce: execution_nonce.clone(),
+            process_group_id: 73_001,
+            leader_pid: 73_001,
+            leader_start_time: 73_001,
+            payload: b"released terminal real sqlite fence".to_vec(),
+        })
+        .await
+        .expect("persist terminal capacity fence");
+    store
+        .authorize_execution_release(AuthorizeExecutionRelease {
+            command_id: command.command_id,
+            daemon_boot_id: daemon_boot_id(),
+            execution_nonce,
+        })
+        .await
+        .expect("authorize terminal capacity release");
+
+    let pinned_reader = Connection::open(&database).expect("open pinned WAL reader");
+    pinned_reader
+        .execute_batch("BEGIN DEFERRED")
+        .expect("begin pinned read transaction");
+    let _: i64 = pinned_reader
+        .query_row("SELECT COUNT(*) FROM event_journal", [], |row| row.get(0))
+        .expect("establish pinned WAL snapshot");
+
+    let mut fragmenter = Connection::open(&database).expect("open fragmentation writer");
+    fragmenter
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .expect("set fragmentation busy timeout");
+    fragmenter
+        .execute_batch("PRAGMA wal_autocheckpoint = 0")
+        .expect("disable fragmenter auto-checkpoint");
+    {
+        let transaction = fragmenter
+            .transaction()
+            .expect("begin real fragmentation transaction");
+        transaction
+            .execute_batch(
+                "CREATE TABLE capacity_fragment_fixture (
+                     fragment_id INTEGER PRIMARY KEY,
+                     payload BLOB NOT NULL
+                 )",
+            )
+            .expect("create fragmentation fixture table");
+        for fragment_id in 0_i64..256 {
+            transaction
+                .execute(
+                    "INSERT INTO capacity_fragment_fixture (fragment_id, payload)
+                     VALUES (?1, zeroblob(?2))",
+                    params![fragment_id, 16 * 1024_i64],
+                )
+                .expect("insert fragmentation fixture row");
+        }
+        transaction
+            .commit()
+            .expect("commit fragmentation fixture rows");
+    }
+    fragmenter
+        .execute_batch("DROP TABLE capacity_fragment_fixture")
+        .expect("drop fixture while retaining real free-list fragmentation");
+
+    let page_count_before: u64 = fragmenter
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .expect("read fragmented page count");
+    let freelist_before: u64 = fragmenter
+        .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+        .expect("read fragmented free-list count");
+    assert!(
+        freelist_before > 0,
+        "fixture must leave real SQLite free-list pages"
+    );
+    let (checkpoint_busy, wal_frames, checkpointed_frames): (i64, i64, i64) = fragmenter
+        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .expect("measure pinned WAL checkpoint");
+    assert!(wal_frames > 0, "fixture must produce real WAL frames");
+    assert!(
+        checkpoint_busy != 0 || checkpointed_frames < wal_frames,
+        "reader must prevent a complete WAL checkpoint: busy={checkpoint_busy}, \
+         log={wal_frames}, checkpointed={checkpointed_frames}"
+    );
+    let wal_path = PathBuf::from(format!("{}-wal", database.display()));
+    let wal_bytes_before = fs::metadata(&wal_path)
+        .expect("fragmented WAL file exists")
+        .len();
+
+    let completed = store
+        .complete_command_with_event(CompleteCommand {
+            conversation_id: conversation.conversation_id,
+            command_id: command.command_id,
+            turn_id,
+            terminal: CommandTerminal::interrupted(),
+        })
+        .await
+        .expect("released terminal must close on real fragmented SQLite");
+    assert!(matches!(completed, CompleteOutcome::Completed { .. }));
+
+    let wal_bytes_after = fs::metadata(&wal_path)
+        .expect("terminal WAL file remains observable")
+        .len();
+    let durable = Connection::open(&database).expect("open terminal durable readback");
+    let (state, terminal_event_present, active_approvals): (String, bool, i64) = durable
+        .query_row(
+            "SELECT c.state, c.terminal_event_id IS NOT NULL,
+                    (SELECT active_approval_count FROM runtime_meta WHERE singleton = 1)
+             FROM commands AS c WHERE c.command_id = ?1",
+            [&command.command_id.as_bytes()[..]],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read back released terminal row");
+    assert_eq!(state, "interrupted");
+    assert!(terminal_event_present);
+    assert_eq!(
+        active_approvals, 0,
+        "this honest baseline does not claim active-approval coverage"
+    );
+    drop(durable);
+
+    pinned_reader
+        .execute_batch("ROLLBACK")
+        .expect("release pinned read transaction");
+    drop(pinned_reader);
+    drop(fragmenter);
+    store.shutdown().await.expect("shutdown measured store");
+
+    let reopened =
+        RuntimeStoreHandle::open(RuntimeStoreConfig::new(database), root.storage_kek(&keys))
+            .await
+            .expect("reopen and authenticate measured terminal store");
+    reopened
+        .inspect()
+        .await
+        .expect("inspect measured terminal store");
+    reopened
+        .shutdown()
+        .await
+        .expect("shutdown reopened measured store");
+
+    eprintln!(
+        "released terminal real SQLite evidence: page_count={page_count_before}, \
+         freelist={freelist_before}, checkpoint=({checkpoint_busy},{wal_frames},\
+         {checkpointed_frames}), wal_before={wal_bytes_before}, \
+         wal_after={wal_bytes_after}, active_approvals=0"
+    );
 }

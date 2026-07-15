@@ -17,23 +17,26 @@ use crate::runtime::model::{
     CommandReceiptSelector, CommandRecord, CommandState, CompleteCommand, CompleteOutcome,
     ConversationDescriptor, ConversationLifecycle, ConversationRecord, ConversationRecoveryRecord,
     CreateConversationOutcome, EventRecord, ExecutionFence, ExecutionFenceRecord,
-    ExecutionIntentRecord, IdempotencyOwner, MAX_ACCEPTED_TERMINATION_EVENT_BYTES,
-    MAX_ADAPTER_STATE_REFERENCE_BYTES, MAX_COMMAND_PAYLOAD_BYTES, MAX_COMMAND_RESULT_BYTES,
-    MAX_CONVERSATION_DESCRIPTOR_BYTES, MAX_EXECUTION_FENCE_BYTES, MAX_EXECUTION_INTENT_BYTES,
-    MAX_EXECUTION_NONCE_BYTES, MAX_IDEMPOTENCY_KEY_BYTES, MAX_RECOVERY_PAGE_RETAINED_BYTES,
-    MAX_RUNTIME_EVENT_BYTES, NewConversation, QueryCommandReceipt, RecoveryCompletion,
-    RecoveryCursor, RecoveryPage, RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError,
-    RuntimeStoreOperation, StartCommand, StartOutcome, StartedRecoveryRecord, TerminalState,
-    TerminateAcceptedCommand, TerminateAcceptedOutcome, TerminateStartedBeforeRelease,
-    TerminateStartedBeforeReleaseOutcome,
+    ExecutionIntentRecord, IdempotencyOwner, MAX_ADAPTER_STATE_REFERENCE_BYTES,
+    MAX_COMMAND_PAYLOAD_BYTES, MAX_COMMAND_RESULT_BYTES, MAX_CONVERSATION_DESCRIPTOR_BYTES,
+    MAX_EXECUTION_FENCE_BYTES, MAX_EXECUTION_INTENT_BYTES, MAX_EXECUTION_NONCE_BYTES,
+    MAX_IDEMPOTENCY_KEY_BYTES, MAX_RECOVERY_PAGE_RETAINED_BYTES, MAX_RUNTIME_EVENT_BYTES,
+    NewConversation, QueryCommandReceipt, RecoveryCompletion, RecoveryCursor, RecoveryPage,
+    RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreOperation,
+    SanitizedTerminalFailure, StartCommand, StartOutcome, StartedBeforeReleaseTermination,
+    StartedRecoveryRecord, TerminalState, TerminateAcceptedCommand, TerminateAcceptedOutcome,
+    TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
 };
 use crate::security::SecretBytes;
 
 use super::approval;
 use super::cipher::RowAad;
+use super::command_event::{self, CommandEventIdentity, StartEventSource};
+use super::execution_event::{AppendExecutionEventOutcome, PreparedExecutionEvent};
 use super::identity::{
     MAX_RUNTIME_ID_COLLISION_ATTEMPTS, RuntimeId, RuntimeIdError, RuntimeIdKind,
 };
+use super::persisted_event::{PersistedRuntimeEvent, decode_persisted_runtime_event};
 use super::queue::{QueueAdmission, evaluate_queue_admission};
 use super::schema::{RUNTIME_CRYPTO_CONTEXT_VERSION, RUNTIME_SCHEMA_FAMILY};
 use super::sequence::{SequenceScope, decode_sequence, next_sequence};
@@ -48,8 +51,10 @@ const COMMAND_MAGIC: &[u8; 4] = b"ADC1";
 const INTENT_MAGIC: &[u8; 4] = b"ADI1";
 const FENCE_MAGIC: &[u8; 4] = b"ADF2";
 const EXPIRY_EVENT_MAGIC: &[u8; 4] = b"ADX1";
-const CANCELED_BEFORE_START_TOKEN_DOMAIN: &[u8] = b"command.canceled-before-start.v1";
-const REVOKED_BEFORE_START_TOKEN_DOMAIN: &[u8] = b"command.revoked-before-start.v1";
+const CANCELED_BEFORE_START_TOKEN_DOMAIN_V1: &[u8] = b"command.canceled-before-start.v1";
+const REVOKED_BEFORE_START_TOKEN_DOMAIN_V1: &[u8] = b"command.revoked-before-start.v1";
+const CANCELED_BEFORE_START_TOKEN_DOMAIN_V2: &[u8] = b"command.canceled-before-start.v2";
+const REVOKED_BEFORE_START_TOKEN_DOMAIN_V2: &[u8] = b"command.revoked-before-start.v2";
 const MAX_SEALED_INTENT_BYTES: usize = MAX_EXECUTION_INTENT_BYTES + MAX_EXECUTION_NONCE_BYTES + 128;
 const MAX_SEALED_FENCE_BYTES: usize = MAX_EXECUTION_FENCE_BYTES + MAX_EXECUTION_NONCE_BYTES + 128;
 
@@ -905,6 +910,7 @@ pub(crate) fn mark_started_with_event(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
     input: StartCommand,
+    event_source: StartEventSource,
     effects: &mut CommandStreamEffects,
 ) -> Result<StartOutcome, RuntimeStoreError> {
     ensure_kind(input.conversation_id, RuntimeIdKind::Conversation)?;
@@ -915,12 +921,10 @@ pub(crate) fn mark_started_with_event(
             "execution nonce must contain 1 to 1024 bytes",
         ));
     }
-    validate_payload_len(input.intent_payload.len(), MAX_EXECUTION_INTENT_BYTES)?;
-    validate_payload_len(input.event_payload.len(), MAX_RUNTIME_EVENT_BYTES)?;
     let projected_write_bytes = projected_write_bytes(&[
         input.execution_nonce.len(),
-        input.intent_payload.len(),
-        input.event_payload.len(),
+        crate::runtime::model::MAX_CRITICAL_COMMAND_RECORD_BYTES,
+        event_source.retained_capacity(),
     ])?;
     let started_at_ms = config.clock.now_ms()?;
     expire_accepted_commands(state, config, started_at_ms, effects)?;
@@ -950,10 +954,21 @@ pub(crate) fn mark_started_with_event(
             intent.started_event_id,
         )?;
         validate_started_linkage(&preflight_command, &intent, &event)?;
+        let expected = command_event::start_records(
+            &preflight_command,
+            CommandEventIdentity {
+                conversation_id: preflight_command.conversation_id,
+                command_id: preflight_command.command_id,
+                turn_id: intent.turn_id,
+                event_id: event.event_id,
+                event_seq: event.event_seq,
+            },
+            &event_source,
+        )?;
         if intent.daemon_boot_id != input.daemon_boot_id
             || intent.execution_nonce != input.execution_nonce
-            || intent.payload != input.intent_payload
-            || event.payload != input.event_payload
+            || intent.payload != expected.intent
+            || event.payload != expected.event
         {
             return Err(RuntimeStoreError::StartConflict);
         }
@@ -1033,10 +1048,21 @@ pub(crate) fn mark_started_with_event(
             intent.started_event_id,
         )?;
         validate_started_linkage(&command, &intent, &event)?;
+        let expected = command_event::start_records(
+            &command,
+            CommandEventIdentity {
+                conversation_id: command.conversation_id,
+                command_id: command.command_id,
+                turn_id: intent.turn_id,
+                event_id: event.event_id,
+                event_seq: event.event_seq,
+            },
+            &event_source,
+        )?;
         if intent.daemon_boot_id != input.daemon_boot_id
             || intent.execution_nonce != input.execution_nonce
-            || intent.payload != input.intent_payload
-            || event.payload != input.event_payload
+            || intent.payload != expected.intent
+            || event.payload != expected.event
         {
             return Err(RuntimeStoreError::StartConflict);
         }
@@ -1082,6 +1108,17 @@ pub(crate) fn mark_started_with_event(
     let event_seq = next_sequence(SequenceScope::EventSeq, previous.as_deref())?;
     let turn_id = allocate_id(&transaction, config, RuntimeIdKind::Turn)?;
     let event_id = allocate_id(&transaction, config, RuntimeIdKind::Event)?;
+    let critical_records = command_event::start_records(
+        &command,
+        CommandEventIdentity {
+            conversation_id: input.conversation_id,
+            command_id: input.command_id,
+            turn_id,
+            event_id,
+            event_seq: event_seq.value,
+        },
+        &event_source,
+    )?;
     let started_at_bytes = started_at_ms.to_be_bytes();
     let intent_plaintext = Zeroizing::new(encode_fields(
         INTENT_MAGIC,
@@ -1091,7 +1128,7 @@ pub(crate) fn mark_started_with_event(
             input.daemon_boot_id.as_bytes(),
             &started_at_bytes,
             &input.execution_nonce,
-            &input.intent_payload,
+            &critical_records.intent,
         ],
     )?);
     let sealed_intent = seal(
@@ -1109,7 +1146,7 @@ pub(crate) fn mark_started_with_event(
         b"event_journal",
         event_id.as_bytes(),
         b"sealed_event",
-        &input.event_payload,
+        &critical_records.event,
         MAX_RUNTIME_EVENT_BYTES,
     )?;
     let index_tokens = load_command_index_tokens(&transaction, input.command_id)?;
@@ -1175,7 +1212,7 @@ pub(crate) fn mark_started_with_event(
             event_seq.encoded,
             &event_id.as_bytes()[..],
             &input.command_id.as_bytes()[..],
-            i64::try_from(input.event_payload.len())
+            i64::try_from(critical_records.event.len())
                 .map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
             started_at,
             &event_metadata_token(
@@ -1184,7 +1221,7 @@ pub(crate) fn mark_started_with_event(
                 event_id,
                 event_seq.value,
                 Some(input.command_id),
-                u64::try_from(input.event_payload.len())
+                u64::try_from(critical_records.event.len())
                     .map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
                 started_at_ms,
             )?[..],
@@ -1263,7 +1300,7 @@ pub(crate) fn mark_started_with_event(
             daemon_boot_id: input.daemon_boot_id,
             execution_nonce: input.execution_nonce,
             created_at_ms: started_at_ms,
-            payload: input.intent_payload,
+            payload: critical_records.intent,
         },
         event: EventRecord {
             conversation_id: input.conversation_id,
@@ -1271,9 +1308,309 @@ pub(crate) fn mark_started_with_event(
             event_seq: event_seq.value,
             command_id: Some(input.command_id),
             created_at_ms: started_at_ms,
-            payload: input.event_payload,
+            payload: critical_records.event,
         },
     })
+}
+
+pub(crate) fn append_execution_event(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    input: PreparedExecutionEvent,
+    effects: &mut CommandStreamEffects,
+) -> Result<AppendExecutionEventOutcome, RuntimeStoreError> {
+    let database_id = state.database_id;
+    let key_bundle = &state.key_bundle;
+    let conversation_id = input.conversation_id();
+    let command_id = input.command_id();
+    let turn_id = input.turn_id();
+    let event_id = input.event_id();
+    sqlite::load_runtime_ledger(&state.connection, key_bundle, database_id)?;
+    if event_id_exists(&state.connection, event_id)? {
+        let event = replay_execution_event(&state.connection, key_bundle, database_id, input)?;
+        return Ok(AppendExecutionEventOutcome::Replayed { event });
+    }
+
+    let preflight_command = load_command(&state.connection, key_bundle, database_id, command_id)?;
+    validate_fresh_execution_event_command(&preflight_command, &input)?;
+    let preflight_intent = load_intent(&state.connection, key_bundle, database_id, command_id)?;
+    let preflight_started_event = load_event(
+        &state.connection,
+        key_bundle,
+        database_id,
+        preflight_intent.started_event_id,
+    )?;
+    validate_started_linkage(
+        &preflight_command,
+        &preflight_intent,
+        &preflight_started_event,
+    )?;
+    if preflight_intent.turn_id != turn_id {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    require_execution_release(&state.connection, key_bundle, database_id, command_id)?;
+    let preflight_conversation =
+        load_conversation(&state.connection, key_bundle, database_id, conversation_id)?;
+    let projected_event_seq = next_sequence(
+        SequenceScope::EventSeq,
+        preflight_conversation
+            .event_high_water
+            .map(super::sequence::encode_sequence)
+            .as_deref(),
+    )?;
+    let projected_event_len = input.canonical_len_for_seq(projected_event_seq.value)?;
+    let projected_write_bytes = projected_write_bytes(&[projected_event_len])?;
+    sqlite::admit_ordinary_write(
+        &state.connection,
+        key_bundle,
+        database_id,
+        &state.storage_path,
+        &mut state.admission_state,
+        config.capacity_probe.as_ref(),
+        projected_write_bytes,
+        SafetyReserveProjection::Current,
+    )?;
+
+    let transaction = state
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if event_id_exists(&transaction, event_id)? {
+        let event = replay_execution_event(&transaction, key_bundle, database_id, input)?;
+        return Ok(AppendExecutionEventOutcome::Replayed { event });
+    }
+    let ledger = sqlite::load_runtime_ledger(&transaction, key_bundle, database_id)?;
+    let command = load_command(&transaction, key_bundle, database_id, command_id)?;
+    validate_fresh_execution_event_command(&command, &input)?;
+    let intent = load_intent(&transaction, key_bundle, database_id, command_id)?;
+    let started_event = load_event(
+        &transaction,
+        key_bundle,
+        database_id,
+        intent.started_event_id,
+    )?;
+    validate_started_linkage(&command, &intent, &started_event)?;
+    if intent.turn_id != turn_id {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    let conversation = load_conversation(&transaction, key_bundle, database_id, conversation_id)?;
+    let created_at_ms = config.clock.now_ms()?;
+    let release_authorized_at_ms = require_execution_released_at(
+        &transaction,
+        key_bundle,
+        database_id,
+        command_id,
+        created_at_ms,
+    )?;
+    let persisted_boundary = conversation
+        .updated_at_ms
+        .max(intent.created_at_ms)
+        .max(release_authorized_at_ms);
+    if created_at_ms < persisted_boundary {
+        return Err(RuntimeStoreError::ClockRegressed {
+            persisted_ms: persisted_boundary,
+            observed_ms: created_at_ms,
+        });
+    }
+    let created_at = sqlite_time(created_at_ms)?;
+    let previous = conversation
+        .event_high_water
+        .map(super::sequence::encode_sequence);
+    let event_seq = next_sequence(SequenceScope::EventSeq, previous.as_deref())?;
+    let payload = input.into_canonical_bytes_for_seq(event_seq.value)?;
+    let sealed_event = seal(
+        key_bundle,
+        database_id,
+        b"event_journal",
+        event_id.as_bytes(),
+        b"sealed_event",
+        &payload,
+        MAX_RUNTIME_EVENT_BYTES,
+    )?;
+    let logical_event_bytes =
+        u64::try_from(payload.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    let metadata_token = event_metadata_token(
+        key_bundle,
+        conversation_id,
+        event_id,
+        event_seq.value,
+        Some(command_id),
+        logical_event_bytes,
+        created_at_ms,
+    )?;
+    transaction.execute(
+        "INSERT INTO event_journal (
+             conversation_id, event_seq, event_id, command_id,
+             logical_event_bytes, created_at_ms, metadata_token, sealed_event
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            &conversation_id.as_bytes()[..],
+            event_seq.encoded,
+            &event_id.as_bytes()[..],
+            &command_id.as_bytes()[..],
+            i64::try_from(logical_event_bytes).map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+            created_at,
+            &metadata_token[..],
+            sealed_event,
+        ],
+    )?;
+    update_conversation_high_water(
+        &transaction,
+        conversation_id,
+        "event_high_water",
+        &event_seq.encoded,
+        previous.as_deref(),
+        created_at,
+        key_bundle,
+        database_id,
+        ConversationQueueDelta::Unchanged,
+    )?;
+    let mut next_ledger = ledger.clone();
+    next_ledger.event_count = next_ledger
+        .event_count
+        .checked_add(1)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let pending_targets = sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next_ledger,
+    )?;
+    config
+        .fault_injector
+        .before_operation(RuntimeStoreOperation::AppendExecutionEventBeforeCommit)?;
+    commit_transaction_with_effects(
+        transaction,
+        RuntimeCommitOperation::AppendExecutionEvent,
+        pending_targets,
+        effects,
+    )?;
+    sqlite::latch_post_commit_capacity(state, config);
+    after_commit(
+        config,
+        RuntimeStoreOperation::AppendExecutionEventAfterCommit,
+        RuntimeCommitOperation::AppendExecutionEvent,
+    )?;
+    Ok(AppendExecutionEventOutcome::Appended {
+        event: EventRecord {
+            conversation_id,
+            event_id,
+            event_seq: event_seq.value,
+            command_id: Some(command_id),
+            created_at_ms,
+            payload,
+        },
+    })
+}
+
+fn event_id_exists(
+    connection: &Connection,
+    event_id: RuntimeId,
+) -> Result<bool, RuntimeStoreError> {
+    ensure_kind(event_id, RuntimeIdKind::Event)?;
+    let exists: i64 = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM event_journal WHERE event_id = ?1)",
+        [&event_id.as_bytes()[..]],
+        |row| row.get(0),
+    )?;
+    Ok(exists == 1)
+}
+
+fn validate_fresh_execution_event_command(
+    command: &CommandRecord,
+    input: &PreparedExecutionEvent,
+) -> Result<(), RuntimeStoreError> {
+    if command.conversation_id != input.conversation_id() {
+        return Err(RuntimeStoreError::CommandNotFound);
+    }
+    if command.state != CommandState::Started || command.turn_id != Some(input.turn_id()) {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    Ok(())
+}
+
+fn require_execution_release(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    command_id: RuntimeId,
+) -> Result<u64, RuntimeStoreError> {
+    load_optional_fence(connection, key_bundle, database_id, command_id)?
+        .ok_or(RuntimeStoreError::ExecutionFenceMissing)?
+        .release_authorized_at_ms
+        .ok_or(RuntimeStoreError::ExecutionReleaseMissing)
+}
+
+pub(super) fn require_execution_released_at(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    command_id: RuntimeId,
+    observed_at_ms: u64,
+) -> Result<u64, RuntimeStoreError> {
+    // 威胁场景：失控 adapter 若能在 Fence/release 前写 Item/Error/approval 事件，会为
+    // 从未获准执行的 vendor 伪造 durable output；所有动态事件 writer 与 open-time audit
+    // 因此共用同一条 released fence + createdAt 边界。
+    let release_authorized_at_ms =
+        require_execution_release(connection, key_bundle, database_id, command_id)?;
+    if observed_at_ms < release_authorized_at_ms {
+        return Err(RuntimeStoreError::ClockRegressed {
+            persisted_ms: release_authorized_at_ms,
+            observed_ms: observed_at_ms,
+        });
+    }
+    Ok(release_authorized_at_ms)
+}
+
+fn replay_execution_event(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    input: PreparedExecutionEvent,
+) -> Result<EventRecord, RuntimeStoreError> {
+    let event = load_event(connection, key_bundle, database_id, input.event_id())?;
+    if event.conversation_id != input.conversation_id()
+        || event.command_id != Some(input.command_id())
+    {
+        return Err(RuntimeStoreError::ExecutionEventConflict);
+    }
+    let command = load_command(connection, key_bundle, database_id, input.command_id())?;
+    if command.conversation_id != input.conversation_id()
+        || command.turn_id != Some(input.turn_id())
+        || command.started_event_id == Some(event.event_id)
+        || command.terminal_event_id == Some(event.event_id)
+    {
+        return Err(RuntimeStoreError::ExecutionEventConflict);
+    }
+    let intent = load_intent(connection, key_bundle, database_id, input.command_id())?;
+    let started = load_event(connection, key_bundle, database_id, intent.started_event_id)?;
+    validate_started_linkage(&command, &intent, &started)?;
+    let release_authorized_at_ms = require_execution_released_at(
+        connection,
+        key_bundle,
+        database_id,
+        input.command_id(),
+        event.created_at_ms,
+    )?;
+    if intent.turn_id != input.turn_id()
+        || event.event_seq <= started.event_seq
+        || event.created_at_ms < started.created_at_ms.max(release_authorized_at_ms)
+    {
+        return Err(RuntimeStoreError::ExecutionEventConflict);
+    }
+    if let Some(terminal_event_id) = command.terminal_event_id {
+        let terminal = load_event(connection, key_bundle, database_id, terminal_event_id)?;
+        if event.event_seq >= terminal.event_seq || event.created_at_ms > terminal.created_at_ms {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+    } else if command.state != CommandState::Started {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let expected = input.into_canonical_bytes_for_seq(event.event_seq)?;
+    if event.payload != expected {
+        return Err(RuntimeStoreError::ExecutionEventConflict);
+    }
+    Ok(event)
 }
 
 pub(crate) fn persist_execution_fence(
@@ -1570,19 +1907,7 @@ pub(crate) fn complete_command_with_event(
     ensure_kind(input.conversation_id, RuntimeIdKind::Conversation)?;
     ensure_kind(input.command_id, RuntimeIdKind::Command)?;
     ensure_kind(input.turn_id, RuntimeIdKind::Turn)?;
-    validate_payload_len(input.terminal_payload.len(), MAX_COMMAND_RESULT_BYTES)?;
-    validate_payload_len(input.event_payload.len(), MAX_RUNTIME_EVENT_BYTES)?;
-    let terminal_bytes = Zeroizing::new(canonical_fields(&[
-        input.conversation_id.as_bytes(),
-        input.command_id.as_bytes(),
-        input.turn_id.as_bytes(),
-        &[terminal_state_tag(input.terminal_state)],
-        &input.terminal_payload,
-        &input.event_payload,
-    ])?);
-    let terminal_token = state
-        .key_bundle
-        .blind_index(b"command.terminal.v1", terminal_bytes.as_ref())?;
+    let terminal_state = input.terminal.terminal_state();
     let database_id = state.database_id;
     let key_bundle = &state.key_bundle;
     let transaction = state
@@ -1597,6 +1922,15 @@ pub(crate) fn complete_command_with_event(
         if !is_completion_terminal(command.state) || command.turn_id != Some(input.turn_id) {
             return Err(RuntimeStoreError::InvalidStateTransition);
         }
+        let released_fence =
+            load_optional_fence(&transaction, key_bundle, database_id, input.command_id)?;
+        if released_fence
+            .as_ref()
+            .and_then(|fence| fence.release_authorized_at_ms)
+            .is_none()
+        {
+            return Err(RuntimeStoreError::TerminalConflict);
+        }
         let (persisted_token, event_id): (Option<Vec<u8>>, Option<Vec<u8>>) = transaction
             .query_row(
                 "SELECT terminal_token, terminal_event_id FROM commands WHERE command_id = ?1",
@@ -1605,9 +1939,6 @@ pub(crate) fn complete_command_with_event(
             )?;
         let persisted_token = persisted_token.ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
         let event_id = event_id.ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-        if persisted_token.as_slice() != terminal_token.as_bytes() {
-            return Err(RuntimeStoreError::TerminalConflict);
-        }
         approval::ensure_terminal_turn_has_no_active_approvals(
             &transaction,
             key_bundle,
@@ -1618,6 +1949,31 @@ pub(crate) fn complete_command_with_event(
         )?;
         let event_id = runtime_id(RuntimeIdKind::Event, event_id)?;
         let event = load_event(&transaction, key_bundle, database_id, event_id)?;
+        let records = command_event::terminal_records(
+            CommandEventIdentity {
+                conversation_id: input.conversation_id,
+                command_id: input.command_id,
+                turn_id: input.turn_id,
+                event_id,
+                event_seq: event.event_seq,
+            },
+            &input.terminal,
+        )?;
+        let terminal_token = command_terminal_token(
+            key_bundle,
+            input.conversation_id,
+            input.command_id,
+            input.turn_id,
+            terminal_state,
+            &records.result,
+            &records.event,
+        )?;
+        if persisted_token.as_slice() != terminal_token.as_bytes()
+            || command.result.as_deref() != Some(records.result.as_slice())
+            || event.payload != records.event
+        {
+            return Err(RuntimeStoreError::TerminalConflict);
+        }
         return Ok(CompleteOutcome::Replayed { command, event });
     }
     if command.state != CommandState::Started || command.turn_id != Some(input.turn_id) {
@@ -1682,13 +2038,32 @@ pub(crate) fn complete_command_with_event(
         approval_expiry.final_event_high_water.as_deref(),
     )?;
     let event_id = allocate_id(&transaction, config, RuntimeIdKind::Event)?;
+    let records = command_event::terminal_records(
+        CommandEventIdentity {
+            conversation_id: input.conversation_id,
+            command_id: input.command_id,
+            turn_id: input.turn_id,
+            event_id,
+            event_seq: event_seq.value,
+        },
+        &input.terminal,
+    )?;
+    let terminal_token = command_terminal_token(
+        key_bundle,
+        input.conversation_id,
+        input.command_id,
+        input.turn_id,
+        terminal_state,
+        &records.result,
+        &records.event,
+    )?;
     let sealed_result = seal(
         key_bundle,
         database_id,
         b"commands",
         input.command_id.as_bytes(),
         b"sealed_result",
-        &input.terminal_payload,
+        &records.result,
         MAX_COMMAND_RESULT_BYTES,
     )?;
     let sealed_event = seal(
@@ -1697,7 +2072,7 @@ pub(crate) fn complete_command_with_event(
         b"event_journal",
         event_id.as_bytes(),
         b"sealed_event",
-        &input.event_payload,
+        &records.event,
         MAX_RUNTIME_EVENT_BYTES,
     )?;
     let retain_until_ms = command.retain_until_ms.max(
@@ -1706,7 +2081,7 @@ pub(crate) fn complete_command_with_event(
             .ok_or(RuntimeStoreError::TimeOutOfRange)?,
     );
     let index_tokens = load_command_index_tokens(&transaction, input.command_id)?;
-    let state_value = terminal_to_command_state(input.terminal_state);
+    let state_value = terminal_to_command_state(terminal_state);
     let command_metadata_token = command_metadata_token(
         key_bundle,
         command.conversation_id,
@@ -1735,7 +2110,7 @@ pub(crate) fn complete_command_with_event(
          WHERE command_id = ?8 AND state = 'started' AND turn_id = ?9
            AND metadata_token = ?10",
         params![
-            terminal_state_text(input.terminal_state),
+            terminal_state_text(terminal_state),
             &terminal_token.as_bytes()[..],
             &event_id.as_bytes()[..],
             terminal_at,
@@ -1760,8 +2135,7 @@ pub(crate) fn complete_command_with_event(
             event_seq.encoded,
             &event_id.as_bytes()[..],
             &input.command_id.as_bytes()[..],
-            i64::try_from(input.event_payload.len())
-                .map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+            i64::try_from(records.event.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
             terminal_at,
             &event_metadata_token(
                 key_bundle,
@@ -1769,7 +2143,7 @@ pub(crate) fn complete_command_with_event(
                 event_id,
                 event_seq.value,
                 Some(input.command_id),
-                u64::try_from(input.event_payload.len())
+                u64::try_from(records.event.len())
                     .map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
                 terminal_at_ms,
             )?[..],
@@ -1825,7 +2199,7 @@ pub(crate) fn complete_command_with_event(
         terminal_at_ms: Some(terminal_at_ms),
         terminal_event_id: Some(event_id),
         retain_until_ms,
-        result: Some(input.terminal_payload),
+        result: Some(records.result),
         ..command
     };
     Ok(CompleteOutcome::Completed {
@@ -1836,7 +2210,7 @@ pub(crate) fn complete_command_with_event(
             event_seq: event_seq.value,
             command_id: Some(input.command_id),
             created_at_ms: terminal_at_ms,
-            payload: input.event_payload,
+            payload: records.event,
         },
     })
 }
@@ -1856,21 +2230,7 @@ pub(crate) fn terminate_started_before_release(
             "execution nonce must contain 1 to 1024 bytes",
         ));
     }
-    validate_payload_len(input.terminal_payload.len(), MAX_COMMAND_RESULT_BYTES)?;
-    validate_payload_len(input.event_payload.len(), MAX_RUNTIME_EVENT_BYTES)?;
-
     let terminal_state = input.reason.terminal_state();
-    let terminal_bytes = Zeroizing::new(canonical_fields(&[
-        input.conversation_id.as_bytes(),
-        input.command_id.as_bytes(),
-        input.turn_id.as_bytes(),
-        &[terminal_state_tag(terminal_state)],
-        &input.terminal_payload,
-        &input.event_payload,
-    ])?);
-    let terminal_token = state
-        .key_bundle
-        .blind_index(b"command.terminal.v1", terminal_bytes.as_ref())?;
     let database_id = state.database_id;
     let key_bundle = &state.key_bundle;
     let transaction = state
@@ -1921,9 +2281,6 @@ pub(crate) fn terminate_started_before_release(
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
         let persisted_token = persisted_token.ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-        if persisted_token.as_slice() != terminal_token.as_bytes() {
-            return Err(RuntimeStoreError::TerminalConflict);
-        }
         approval::ensure_terminal_turn_has_no_active_approvals(
             &transaction,
             key_bundle,
@@ -1937,6 +2294,31 @@ pub(crate) fn terminate_started_before_release(
             event_id.ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?,
         )?;
         let event = load_event(&transaction, key_bundle, database_id, event_id)?;
+        let records = command_event::before_release_terminal_records(
+            CommandEventIdentity {
+                conversation_id: input.conversation_id,
+                command_id: input.command_id,
+                turn_id: input.turn_id,
+                event_id,
+                event_seq: event.event_seq,
+            },
+            input.reason,
+        )?;
+        let terminal_token = command_terminal_token(
+            key_bundle,
+            input.conversation_id,
+            input.command_id,
+            input.turn_id,
+            terminal_state,
+            &records.result,
+            &records.event,
+        )?;
+        if persisted_token.as_slice() != terminal_token.as_bytes()
+            || command.result.as_deref() != Some(records.result.as_slice())
+            || event.payload != records.event
+        {
+            return Err(RuntimeStoreError::TerminalConflict);
+        }
         return Ok(TerminateStartedBeforeReleaseOutcome::Replayed { command, event });
     }
     if command.state != CommandState::Started || command.turn_id != Some(input.turn_id) {
@@ -1984,13 +2366,32 @@ pub(crate) fn terminate_started_before_release(
         approval_expiry.final_event_high_water.as_deref(),
     )?;
     let event_id = allocate_id(&transaction, config, RuntimeIdKind::Event)?;
+    let records = command_event::before_release_terminal_records(
+        CommandEventIdentity {
+            conversation_id: input.conversation_id,
+            command_id: input.command_id,
+            turn_id: input.turn_id,
+            event_id,
+            event_seq: event_seq.value,
+        },
+        input.reason,
+    )?;
+    let terminal_token = command_terminal_token(
+        key_bundle,
+        input.conversation_id,
+        input.command_id,
+        input.turn_id,
+        terminal_state,
+        &records.result,
+        &records.event,
+    )?;
     let sealed_result = seal(
         key_bundle,
         database_id,
         b"commands",
         input.command_id.as_bytes(),
         b"sealed_result",
-        &input.terminal_payload,
+        &records.result,
         MAX_COMMAND_RESULT_BYTES,
     )?;
     let sealed_event = seal(
@@ -1999,7 +2400,7 @@ pub(crate) fn terminate_started_before_release(
         b"event_journal",
         event_id.as_bytes(),
         b"sealed_event",
-        &input.event_payload,
+        &records.event,
         MAX_RUNTIME_EVENT_BYTES,
     )?;
     let retain_until_ms = command.retain_until_ms.max(
@@ -2061,8 +2462,7 @@ pub(crate) fn terminate_started_before_release(
             event_seq.encoded,
             &event_id.as_bytes()[..],
             &input.command_id.as_bytes()[..],
-            i64::try_from(input.event_payload.len())
-                .map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+            i64::try_from(records.event.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
             terminal_at,
             &event_metadata_token(
                 key_bundle,
@@ -2070,7 +2470,7 @@ pub(crate) fn terminate_started_before_release(
                 event_id,
                 event_seq.value,
                 Some(input.command_id),
-                u64::try_from(input.event_payload.len())
+                u64::try_from(records.event.len())
                     .map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
                 terminal_at_ms,
             )?[..],
@@ -2137,7 +2537,7 @@ pub(crate) fn terminate_started_before_release(
         terminal_at_ms: Some(terminal_at_ms),
         terminal_event_id: Some(event_id),
         retain_until_ms,
-        result: Some(input.terminal_payload),
+        result: Some(records.result),
         ..command
     };
     Ok(TerminateStartedBeforeReleaseOutcome::Transitioned {
@@ -2148,7 +2548,7 @@ pub(crate) fn terminate_started_before_release(
             event_seq: event_seq.value,
             command_id: Some(input.command_id),
             created_at_ms: terminal_at_ms,
-            payload: input.event_payload,
+            payload: records.event,
         },
     })
 }
@@ -2161,10 +2561,7 @@ pub(crate) fn terminate_accepted_command(
 ) -> Result<TerminateAcceptedOutcome, RuntimeStoreError> {
     ensure_kind(input.conversation_id, RuntimeIdKind::Conversation)?;
     ensure_kind(input.command_id, RuntimeIdKind::Command)?;
-    validate_payload_len(
-        input.event_payload.len(),
-        MAX_ACCEPTED_TERMINATION_EVENT_BYTES,
-    )?;
+    let event_payload = command_event::accepted_terminal_event(input.command_id, input.reason)?;
 
     let database_id = state.database_id;
     let key_bundle = &state.key_bundle;
@@ -2190,7 +2587,18 @@ pub(crate) fn terminate_accepted_command(
             .terminal_event_id
             .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
         let event = load_event(&transaction, key_bundle, database_id, event_id)?;
-        if event.payload != input.event_payload {
+        let expected_token = accepted_termination_token(
+            key_bundle,
+            input.reason,
+            input.conversation_id,
+            input.command_id,
+            &event_payload,
+        )?;
+        let persisted_token = load_command_index_tokens(&transaction, input.command_id)?
+            .terminal_token
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        if event.payload != event_payload || persisted_token.as_slice() != expected_token.as_bytes()
+        {
             return Err(RuntimeStoreError::TerminalConflict);
         }
         return Ok(TerminateAcceptedOutcome::Replayed { command, event });
@@ -2228,7 +2636,7 @@ pub(crate) fn terminate_accepted_command(
         input.reason,
         input.conversation_id,
         input.command_id,
-        &input.event_payload,
+        &event_payload,
     )?;
     let sealed_event = seal(
         key_bundle,
@@ -2236,8 +2644,8 @@ pub(crate) fn terminate_accepted_command(
         b"event_journal",
         event_id.as_bytes(),
         b"sealed_event",
-        &input.event_payload,
-        MAX_ACCEPTED_TERMINATION_EVENT_BYTES,
+        &event_payload,
+        crate::runtime::model::MAX_CRITICAL_COMMAND_RECORD_BYTES,
     )?;
     let index_tokens = load_command_index_tokens(&transaction, input.command_id)?;
     let logical_payload_bytes =
@@ -2286,7 +2694,7 @@ pub(crate) fn terminate_accepted_command(
         event_id,
         event_seq.value,
         Some(input.command_id),
-        u64::try_from(input.event_payload.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+        u64::try_from(event_payload.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
         terminal_at_ms,
     )?;
     transaction.execute(
@@ -2299,8 +2707,7 @@ pub(crate) fn terminate_accepted_command(
             event_seq.encoded,
             &event_id.as_bytes()[..],
             &input.command_id.as_bytes()[..],
-            i64::try_from(input.event_payload.len())
-                .map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+            i64::try_from(event_payload.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
             sqlite_time(terminal_at_ms)?,
             &event_metadata[..],
             sealed_event,
@@ -2367,7 +2774,7 @@ pub(crate) fn terminate_accepted_command(
             event_seq: event_seq.value,
             command_id: Some(input.command_id),
             created_at_ms: terminal_at_ms,
-            payload: input.event_payload,
+            payload: event_payload,
         },
     })
 }
@@ -4877,6 +5284,177 @@ fn validate_all_event_metadata(
     Ok(())
 }
 
+/// 动态审计真实 authenticated event rows，而不是从 command state 固定推导每条命令
+/// 必须恰有一或两条事件。这样 Item/Error/approval 事件可以增长，同时 orphan、gap、
+/// 错 command/turn 与 pointer body 漂移仍然 fail-close。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DynamicEventIntegritySummary {
+    event_count: u64,
+    approval_event_count: u64,
+}
+
+fn validate_dynamic_event_ledger(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+) -> Result<DynamicEventIntegritySummary, RuntimeStoreError> {
+    let mut statement = connection.prepare(
+        "SELECT conversation_id, event_seq, event_id
+         FROM event_journal
+         ORDER BY conversation_id, event_seq",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
+    })?;
+    let mut current_conversation = None;
+    let mut next_event_seq = 0_u64;
+    let mut last_created_at_ms = None;
+    let mut summary = DynamicEventIntegritySummary::default();
+    for row in rows {
+        let (conversation, encoded_seq, event) = row?;
+        let conversation_id = runtime_id(RuntimeIdKind::Conversation, conversation)?;
+        let event_seq = decode_sequence(SequenceScope::EventSeq, &encoded_seq)?;
+        let event_id = runtime_id(RuntimeIdKind::Event, event)?;
+        if current_conversation != Some(conversation_id) {
+            current_conversation = Some(conversation_id);
+            next_event_seq = 0;
+            last_created_at_ms = None;
+        }
+        if event_seq != next_event_seq {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        next_event_seq = next_event_seq
+            .checked_add(1)
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        summary.event_count = summary
+            .event_count
+            .checked_add(1)
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+
+        let event = load_event(connection, key_bundle, database_id, event_id)?;
+        if last_created_at_ms.is_some_and(|previous| event.created_at_ms < previous) {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        last_created_at_ms = Some(event.created_at_ms);
+        let command_id = event
+            .command_id
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        let command = load_command(connection, key_bundle, database_id, command_id)?;
+        if event.conversation_id != conversation_id
+            || command.conversation_id != conversation_id
+            || event.event_seq != event_seq
+        {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+
+        if command.started_event_id == Some(event_id) {
+            let intent = load_intent(connection, key_bundle, database_id, command_id)?;
+            validate_started_linkage(&command, &intent, &event)?;
+            match decode_persisted_runtime_event(&event)? {
+                PersistedRuntimeEvent::Canonical(decoded) => match decoded.body {
+                    agentdeck_protocol::runtime::RuntimeEventBody::TurnStarted { turn_id }
+                        if turn_id.as_str() == intent.turn_id.to_canonical_string() => {}
+                    _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
+                },
+                // v1 允许 authenticated noncanonical Started payload；migration/readback
+                // 不改写旧 ciphertext。所有当前 writer 只会产生 canonical TurnStarted。
+                PersistedRuntimeEvent::NonCanonical => {}
+            }
+            continue;
+        }
+
+        if command.terminal_event_id == Some(event_id) {
+            if let Some(turn_id) = command.turn_id {
+                let intent = load_intent(connection, key_bundle, database_id, command_id)?;
+                let started =
+                    load_event(connection, key_bundle, database_id, intent.started_event_id)?;
+                if turn_id != intent.turn_id || event_seq <= started.event_seq {
+                    return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+                }
+            }
+            // load_command 已对 accepted/expired/started terminal 的 fixed body、state、
+            // turn、origin、result 与 terminal token 做逐字节验证。
+            continue;
+        }
+
+        let turn_id = command
+            .turn_id
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        let intent = load_intent(connection, key_bundle, database_id, command_id)?;
+        let started = load_event(connection, key_bundle, database_id, intent.started_event_id)?;
+        if intent.turn_id != turn_id
+            || event_seq <= started.event_seq
+            || event.created_at_ms < intent.created_at_ms
+        {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        if let Some(terminal_event_id) = command.terminal_event_id {
+            let terminal = load_event(connection, key_bundle, database_id, terminal_event_id)?;
+            if event_seq >= terminal.event_seq || event.created_at_ms > terminal.created_at_ms {
+                return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+            }
+        } else if command.state != CommandState::Started {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+
+        let PersistedRuntimeEvent::Canonical(decoded) = decode_persisted_runtime_event(&event)?
+        else {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        };
+        require_execution_released_at(
+            connection,
+            key_bundle,
+            database_id,
+            command_id,
+            event.created_at_ms,
+        )
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+        if matches!(
+            &decoded.body,
+            agentdeck_protocol::runtime::RuntimeEventBody::ActionRequest { .. }
+                | agentdeck_protocol::runtime::RuntimeEventBody::ApprovalResolved { .. }
+        ) {
+            summary.approval_event_count = summary
+                .approval_event_count
+                .checked_add(1)
+                .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        }
+        match decoded.body {
+            agentdeck_protocol::runtime::RuntimeEventBody::Item { item } => {
+                let item_id = decoded
+                    .item_id
+                    .as_ref()
+                    .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+                let entity_id = decoded
+                    .entity_id
+                    .as_ref()
+                    .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+                super::execution_event::validate_durable_item(item_id, entity_id, &item)
+                    .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+            }
+            agentdeck_protocol::runtime::RuntimeEventBody::Error { failure }
+                if failure.code
+                    == agentdeck_protocol::runtime::failure::DAEMON_RUNTIME_EXECUTION_FAILED
+                    && failure.message == "agent execution failed"
+                    && failure.diagnostic_ref.is_none() => {}
+            agentdeck_protocol::runtime::RuntimeEventBody::ActionRequest {
+                turn_id: event_turn,
+                ..
+            }
+            | agentdeck_protocol::runtime::RuntimeEventBody::ApprovalResolved {
+                turn_id: event_turn,
+                ..
+            } if event_turn.as_str() == turn_id.to_canonical_string() => {}
+            _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
+        }
+    }
+    Ok(summary)
+}
+
 pub(crate) fn validate_store_integrity(
     connection: &Connection,
     key_bundle: &super::cipher::RuntimeKeyBundle,
@@ -4914,7 +5492,6 @@ fn validate_store_integrity_against_ledger(
     let mut started_released_count = 0_u64;
     let mut expected_intent_count = 0_u64;
     let mut expected_fence_count = 0_u64;
-    let mut expected_event_count = approvals.approval_event_count;
     let mut statement = connection.prepare("SELECT command_id FROM commands")?;
     let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
     for row in rows {
@@ -4924,7 +5501,6 @@ fn validate_store_integrity_against_ledger(
             CommandState::Accepted => {}
             CommandState::Started => {
                 expected_intent_count += 1;
-                expected_event_count += 1;
                 let intent = load_intent(connection, key_bundle, database_id, command_id)?;
                 let event =
                     load_event(connection, key_bundle, database_id, intent.started_event_id)?;
@@ -4941,7 +5517,8 @@ fn validate_store_integrity_against_ledger(
                             .checked_add(1)
                             .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
                     }
-                    Some(_) => {
+                    Some(fence) => {
+                        validate_release_time_window(&fence, &event, None)?;
                         expected_fence_count += 1;
                         started_released_count = started_released_count
                             .checked_add(1)
@@ -4952,7 +5529,6 @@ fn validate_store_integrity_against_ledger(
             CommandState::Completed | CommandState::Failed => {
                 expected_intent_count += 1;
                 expected_fence_count += 1;
-                expected_event_count += 2;
                 let intent = load_intent(connection, key_bundle, database_id, command_id)?;
                 let started_event =
                     load_event(connection, key_bundle, database_id, intent.started_event_id)?;
@@ -4975,13 +5551,11 @@ fn validate_store_integrity_against_ledger(
                 if fence.release_authorized_at_ms.is_none() {
                     return Err(RuntimeStoreError::UnknownOrCorruptSchema);
                 }
+                validate_release_time_window(&fence, &started_event, Some(&terminal_event))?;
             }
             CommandState::Interrupted | CommandState::Canceled => {
-                if command.turn_id.is_none() {
-                    expected_event_count += 1;
-                } else {
+                if command.turn_id.is_some() {
                     expected_intent_count += 1;
-                    expected_event_count += 2;
                     let intent = load_intent(connection, key_bundle, database_id, command_id)?;
                     let started_event =
                         load_event(connection, key_bundle, database_id, intent.started_event_id)?;
@@ -4999,17 +5573,24 @@ fn validate_store_integrity_against_ledger(
                         &started_event,
                         &terminal_event,
                     )?;
-                    if load_optional_fence(connection, key_bundle, database_id, command_id)?
-                        .is_some()
+                    if let Some(fence) =
+                        load_optional_fence(connection, key_bundle, database_id, command_id)?
                     {
+                        validate_release_time_window(
+                            &fence,
+                            &started_event,
+                            Some(&terminal_event),
+                        )?;
                         expected_fence_count += 1;
                     }
                 }
             }
-            CommandState::Expired | CommandState::RevokedBeforeStart => {
-                expected_event_count += 1;
-            }
+            CommandState::Expired | CommandState::RevokedBeforeStart => {}
         }
+    }
+    let authenticated_events = validate_dynamic_event_ledger(connection, key_bundle, database_id)?;
+    if authenticated_events.approval_event_count != approvals.approval_event_count {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
     let (actual_intent_count, actual_fence_count, actual_event_count): (i64, i64, i64) = connection
         .query_row(
@@ -5027,7 +5608,7 @@ fn validate_store_integrity_against_ledger(
             != expected_fence_count
         || u64::try_from(actual_event_count)
             .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
-            != expected_event_count
+            != authenticated_events.event_count
     {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
@@ -5065,6 +5646,22 @@ fn validate_store_integrity_against_ledger(
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
     super::stream::validate_v4_integrity(connection, key_bundle, database_id, ledger)?;
+    Ok(())
+}
+
+fn validate_release_time_window(
+    fence: &ExecutionFenceRecord,
+    started_event: &EventRecord,
+    terminal_event: Option<&EventRecord>,
+) -> Result<(), RuntimeStoreError> {
+    let Some(release_authorized_at_ms) = fence.release_authorized_at_ms else {
+        return Ok(());
+    };
+    if release_authorized_at_ms < started_event.created_at_ms
+        || terminal_event.is_some_and(|terminal| release_authorized_at_ms > terminal.created_at_ms)
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
     Ok(())
 }
 
@@ -5613,8 +6210,32 @@ fn accepted_termination_token(
     event_payload: &[u8],
 ) -> Result<super::cipher::BlindIndex, RuntimeStoreError> {
     let (domain, tag) = match reason {
-        AcceptedTerminationReason::Canceled => (CANCELED_BEFORE_START_TOKEN_DOMAIN, 1_u8),
-        AcceptedTerminationReason::RevokedBeforeStart => (REVOKED_BEFORE_START_TOKEN_DOMAIN, 2_u8),
+        AcceptedTerminationReason::Canceled => (CANCELED_BEFORE_START_TOKEN_DOMAIN_V2, 1_u8),
+        AcceptedTerminationReason::RevokedBeforeStart => {
+            (REVOKED_BEFORE_START_TOKEN_DOMAIN_V2, 2_u8)
+        }
+    };
+    let plaintext = Zeroizing::new(canonical_fields(&[
+        conversation_id.as_bytes(),
+        command_id.as_bytes(),
+        &[tag],
+        event_payload,
+    ])?);
+    Ok(key_bundle.blind_index(domain, plaintext.as_ref())?)
+}
+
+fn legacy_accepted_termination_token_v1(
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    reason: AcceptedTerminationReason,
+    conversation_id: RuntimeId,
+    command_id: RuntimeId,
+    event_payload: &[u8],
+) -> Result<super::cipher::BlindIndex, RuntimeStoreError> {
+    let (domain, tag) = match reason {
+        AcceptedTerminationReason::Canceled => (CANCELED_BEFORE_START_TOKEN_DOMAIN_V1, 1_u8),
+        AcceptedTerminationReason::RevokedBeforeStart => {
+            (REVOKED_BEFORE_START_TOKEN_DOMAIN_V1, 2_u8)
+        }
     };
     let plaintext = Zeroizing::new(canonical_fields(&[
         conversation_id.as_bytes(),
@@ -5655,27 +6276,144 @@ fn verify_terminal_integrity(
         {
             return Err(RuntimeStoreError::UnknownOrCorruptSchema);
         }
-        accepted_termination_token(
+        let expected_event = command_event::accepted_terminal_event(command_id, reason)?;
+        let typed_token = accepted_termination_token(
             key_bundle,
             reason,
             conversation_id,
             command_id,
-            &event.payload,
-        )?
+            &expected_event,
+        )?;
+        if terminal_token == Some(typed_token.as_bytes().as_slice()) {
+            if event.payload != expected_event {
+                return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+            }
+            typed_token
+        } else {
+            let legacy_token = legacy_accepted_termination_token_v1(
+                key_bundle,
+                reason,
+                conversation_id,
+                command_id,
+                &event.payload,
+            )?;
+            if terminal_token != Some(legacy_token.as_bytes().as_slice())
+                || matches!(
+                    decode_persisted_runtime_event(&event)?,
+                    PersistedRuntimeEvent::Canonical(_)
+                )
+            {
+                return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+            }
+            legacy_token
+        }
     } else if is_completion_terminal(state) {
         let turn_id = turn_id.ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
         let result = result.ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-        let state_tag =
-            command_state_terminal_tag(state).ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-        let plaintext = Zeroizing::new(canonical_fields(&[
-            conversation_id.as_bytes(),
-            command_id.as_bytes(),
-            turn_id.as_bytes(),
-            &[state_tag],
+        let legacy_token = legacy_command_terminal_token_v1(
+            key_bundle,
+            conversation_id,
+            command_id,
+            turn_id,
+            state,
             result,
             &event.payload,
-        ])?);
-        key_bundle.blind_index(b"command.terminal.v1", plaintext.as_ref())?
+        )?;
+        if terminal_token == Some(legacy_token.as_bytes().as_slice()) {
+            let released_fence =
+                load_optional_fence(connection, key_bundle, database_id, command_id)?;
+            if matches!(state, CommandState::Completed | CommandState::Failed)
+                && released_fence
+                    .as_ref()
+                    .and_then(|fence| fence.release_authorized_at_ms)
+                    .is_none()
+            {
+                return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+            }
+            validate_legacy_canonical_terminal_body(state, turn_id, &event)?;
+            legacy_token
+        } else {
+            let identity = CommandEventIdentity {
+                conversation_id,
+                command_id,
+                turn_id,
+                event_id,
+                event_seq: event.event_seq,
+            };
+            let fence = load_optional_fence(connection, key_bundle, database_id, command_id)?;
+            let expected_records = match fence
+                .as_ref()
+                .and_then(|record| record.release_authorized_at_ms)
+            {
+                Some(_) => {
+                    let decoded: agentdeck_protocol::runtime::RuntimeEvent =
+                        serde_json::from_slice(&event.payload)
+                            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+                    let terminal = match (state, decoded.body) {
+                        (
+                            CommandState::Completed,
+                            agentdeck_protocol::runtime::RuntimeEventBody::TurnCompleted {
+                                turn_id: decoded_turn,
+                                summary,
+                            },
+                        ) if decoded_turn.as_str() == turn_id.to_canonical_string() => {
+                            crate::runtime::model::CommandTerminal::completed(summary)
+                        }
+                        (
+                            CommandState::Failed,
+                            agentdeck_protocol::runtime::RuntimeEventBody::Error { failure },
+                        ) if failure.code
+                            == agentdeck_protocol::runtime::failure::DAEMON_RUNTIME_EXECUTION_FAILED
+                            && failure.message == "agent execution failed"
+                            && failure.diagnostic_ref.is_none() =>
+                        {
+                            crate::runtime::model::CommandTerminal::failed(
+                                SanitizedTerminalFailure::execution_failed(),
+                            )
+                        }
+                        (
+                            CommandState::Interrupted,
+                            agentdeck_protocol::runtime::RuntimeEventBody::TurnInterrupted {
+                                turn_id: decoded_turn,
+                            },
+                        ) if decoded_turn.as_str() == turn_id.to_canonical_string() => {
+                            crate::runtime::model::CommandTerminal::interrupted()
+                        }
+                        (
+                            CommandState::Canceled,
+                            agentdeck_protocol::runtime::RuntimeEventBody::TurnInterrupted {
+                                turn_id: decoded_turn,
+                            },
+                        ) if decoded_turn.as_str() == turn_id.to_canonical_string() => {
+                            crate::runtime::model::CommandTerminal::canceled()
+                        }
+                        _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
+                    };
+                    command_event::terminal_records(identity, &terminal)?
+                }
+                None => {
+                    let reason = match state {
+                        CommandState::Interrupted => StartedBeforeReleaseTermination::Interrupted,
+                        CommandState::Canceled => StartedBeforeReleaseTermination::Canceled,
+                        _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
+                    };
+                    command_event::before_release_terminal_records(identity, reason)?
+                }
+            };
+            if expected_records.result != result || expected_records.event != event.payload {
+                return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+            }
+            command_terminal_token(
+                key_bundle,
+                conversation_id,
+                command_id,
+                turn_id,
+                command_state_to_terminal(state)
+                    .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?,
+                result,
+                &event.payload,
+            )?
+        }
     } else if state == CommandState::Expired {
         let fields = decode_fields(EXPIRY_EVENT_MAGIC, &event.payload, 2)?;
         if fields[0] != command_id.as_bytes() || fields[1] != expires_at_ms.to_be_bytes() {
@@ -5697,13 +6435,45 @@ fn verify_terminal_integrity(
     Ok(())
 }
 
-const fn command_state_terminal_tag(state: CommandState) -> Option<u8> {
+const fn command_state_to_terminal(state: CommandState) -> Option<TerminalState> {
     match state {
-        CommandState::Completed => Some(1),
-        CommandState::Failed => Some(2),
-        CommandState::Interrupted => Some(3),
-        CommandState::Canceled => Some(4),
+        CommandState::Completed => Some(TerminalState::Completed),
+        CommandState::Failed => Some(TerminalState::Failed),
+        CommandState::Interrupted => Some(TerminalState::Interrupted),
+        CommandState::Canceled => Some(TerminalState::Canceled),
         _ => None,
+    }
+}
+
+fn validate_legacy_canonical_terminal_body(
+    state: CommandState,
+    turn_id: RuntimeId,
+    event: &EventRecord,
+) -> Result<(), RuntimeStoreError> {
+    let PersistedRuntimeEvent::Canonical(decoded) = decode_persisted_runtime_event(event)? else {
+        return Ok(());
+    };
+    let valid = match (state, decoded.body) {
+        (
+            CommandState::Completed,
+            agentdeck_protocol::runtime::RuntimeEventBody::TurnCompleted {
+                turn_id: event_turn,
+                ..
+            },
+        )
+        | (
+            CommandState::Interrupted | CommandState::Canceled,
+            agentdeck_protocol::runtime::RuntimeEventBody::TurnInterrupted {
+                turn_id: event_turn,
+            },
+        ) => event_turn.as_str() == turn_id.to_canonical_string(),
+        (CommandState::Failed, agentdeck_protocol::runtime::RuntimeEventBody::Error { .. }) => true,
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(RuntimeStoreError::UnknownOrCorruptSchema)
     }
 }
 
@@ -5724,6 +6494,65 @@ fn validate_started_linkage(
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
     Ok(())
+}
+
+fn load_authenticated_started_linkage(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    command_id: RuntimeId,
+) -> Result<(CommandRecord, ExecutionIntentRecord), RuntimeStoreError> {
+    let command = load_command(connection, key_bundle, database_id, command_id)?;
+    let intent = load_intent(connection, key_bundle, database_id, command_id)?;
+    let started_event = load_event(connection, key_bundle, database_id, intent.started_event_id)?;
+    validate_started_linkage(&command, &intent, &started_event)?;
+    Ok((command, intent))
+}
+
+pub(super) fn require_authenticated_started_turn(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    conversation_id: RuntimeId,
+    command_id: RuntimeId,
+    turn_id: RuntimeId,
+    observed_at_ms: u64,
+) -> Result<(), RuntimeStoreError> {
+    let (command, intent) =
+        load_authenticated_started_linkage(connection, key_bundle, database_id, command_id)?;
+    if command.conversation_id != conversation_id
+        || command.state != CommandState::Started
+        || command.turn_id != Some(turn_id)
+        || intent.turn_id != turn_id
+    {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    let started_at_ms = command
+        .started_at_ms
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if observed_at_ms < started_at_ms {
+        return Err(RuntimeStoreError::ClockRegressed {
+            persisted_ms: started_at_ms,
+            observed_ms: observed_at_ms,
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn is_authenticated_exact_started_turn(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    conversation_id: RuntimeId,
+    command_id: RuntimeId,
+    turn_id: RuntimeId,
+) -> Result<bool, RuntimeStoreError> {
+    let (command, intent) =
+        load_authenticated_started_linkage(connection, key_bundle, database_id, command_id)?;
+    Ok(command.conversation_id == conversation_id
+        && command.state == CommandState::Started
+        && command.turn_id == Some(turn_id)
+        && intent.turn_id == turn_id)
 }
 
 fn validate_started_terminal_linkage(
@@ -5747,6 +6576,49 @@ fn validate_started_terminal_linkage(
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
     Ok(())
+}
+
+fn command_terminal_token(
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    conversation_id: RuntimeId,
+    command_id: RuntimeId,
+    turn_id: RuntimeId,
+    terminal_state: TerminalState,
+    result: &[u8],
+    event: &[u8],
+) -> Result<super::cipher::BlindIndex, RuntimeStoreError> {
+    let terminal_bytes = Zeroizing::new(canonical_fields(&[
+        conversation_id.as_bytes(),
+        command_id.as_bytes(),
+        turn_id.as_bytes(),
+        &[terminal_state_tag(terminal_state)],
+        result,
+        event,
+    ])?);
+    Ok(key_bundle.blind_index(b"command.terminal.v2", terminal_bytes.as_ref())?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn legacy_command_terminal_token_v1(
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    conversation_id: RuntimeId,
+    command_id: RuntimeId,
+    turn_id: RuntimeId,
+    state: CommandState,
+    result: &[u8],
+    event: &[u8],
+) -> Result<super::cipher::BlindIndex, RuntimeStoreError> {
+    let terminal =
+        command_state_to_terminal(state).ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let terminal_bytes = Zeroizing::new(canonical_fields(&[
+        conversation_id.as_bytes(),
+        command_id.as_bytes(),
+        turn_id.as_bytes(),
+        &[terminal_state_tag(terminal)],
+        result,
+        event,
+    ])?);
+    Ok(key_bundle.blind_index(b"command.terminal.v1", terminal_bytes.as_ref())?)
 }
 
 const fn terminal_state_text(state: TerminalState) -> &'static str {

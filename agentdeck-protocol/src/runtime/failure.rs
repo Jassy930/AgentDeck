@@ -22,6 +22,7 @@ pub const DAEMON_RUNTIME_INVALID_REQUEST: &str = "daemon.runtime.invalid_request
 pub const DAEMON_RUNTIME_FEATURE_UNAVAILABLE: &str = "daemon.runtime.feature_unavailable";
 pub const DAEMON_RUNTIME_IDENTITY_UNAVAILABLE: &str = "daemon.runtime.identity_unavailable";
 pub const DAEMON_RUNTIME_ACTOR_UNAVAILABLE: &str = "daemon.runtime.actor_unavailable";
+pub const DAEMON_RUNTIME_EXECUTION_FAILED: &str = "daemon.runtime.execution_failed";
 pub const DAEMON_RUNTIME_CONNECTION_UNAVAILABLE: &str = "daemon.runtime.connection_unavailable";
 pub const DAEMON_RUNTIME_READ_UNAVAILABLE: &str = "daemon.runtime.read_unavailable";
 

@@ -5,10 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use agentdeck_protocol::runtime::identity::{CommandId, ConversationId, EntityId, EventId, ItemId};
+use agentdeck_protocol::runtime::identity::{ConversationId, EntityId, ItemId};
 use agentdeck_protocol::runtime::{
     BackfillChunk, BackfillRange, ConversationSnapshot, RuntimeEvent, RuntimeEventBody,
-    RuntimeFailure, SnapshotItem, StreamCursor,
+    SnapshotItem, StreamCursor,
 };
 use agentdeck_protocol::{
     AgentItem, AgentItemMeta, AgentKind, SessionCapabilities, VendorCapabilities,
@@ -23,7 +23,8 @@ use agentdeckd::runtime::events::{
 use agentdeckd::runtime::model::COMMAND_QUEUE_TTL_MS;
 use agentdeckd::runtime::store::identity::RuntimeIdError;
 use agentdeckd::runtime::store::{
-    AcceptCommand, AcceptOutcome, AcceptedTerminationReason, ConversationDescriptor,
+    AcceptCommand, AcceptOutcome, AcceptedTerminationReason, AppendExecutionEvent,
+    AppendExecutionEventOutcome, AuthorizeExecutionRelease, ConversationDescriptor, ExecutionFence,
     FreezePublicationRequest, IdempotencyOwner, NewConversation, PublicationPayloadKind,
     PublicationScope, RuntimeBackfillPlan, RuntimeBackfillTarget, RuntimeClock, RuntimeClockError,
     RuntimeCommitOperation, RuntimeId, RuntimeIdKind, RuntimeIdSource, RuntimeStoreConfig,
@@ -235,6 +236,35 @@ fn conversation_id(seed: u8) -> RuntimeId {
 
 fn runtime_id(kind: RuntimeIdKind, seed: u8) -> RuntimeId {
     RuntimeId::from_bytes(kind, [seed; 16]).expect("runtime id")
+}
+
+async fn authorize_test_execution_release(
+    store: &RuntimeStoreHandle,
+    command_id: RuntimeId,
+    daemon_boot_id: RuntimeId,
+    execution_nonce: &[u8],
+    process_seed: i64,
+) {
+    store
+        .persist_execution_fence(ExecutionFence {
+            command_id,
+            daemon_boot_id,
+            execution_nonce: execution_nonce.to_vec(),
+            process_group_id: process_seed,
+            leader_pid: process_seed,
+            leader_start_time: u64::try_from(process_seed).expect("positive process seed"),
+            payload: b"runtime-stream-test-fence".to_vec(),
+        })
+        .await
+        .expect("persist stream test execution fence");
+    store
+        .authorize_execution_release(AuthorizeExecutionRelease {
+            command_id,
+            daemon_boot_id,
+            execution_nonce: execution_nonce.to_vec(),
+        })
+        .await
+        .expect("authorize stream test execution release");
 }
 
 fn conversation(seed: u8) -> NewConversation {

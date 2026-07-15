@@ -624,7 +624,6 @@ async fn build_source_keeps_captured_base_when_current_high_water_advances() {
             command_id,
             expected_owner: owner(0x90),
             reason: AcceptedTerminationReason::Canceled,
-            event_payload: b"event committed after snapshot capture".to_vec(),
         })
         .await
         .expect("advance authenticated event high-water");

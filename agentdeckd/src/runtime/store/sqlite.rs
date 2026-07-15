@@ -45,6 +45,11 @@ const ACCEPTED_EXPIRY_RESERVE_BYTES: u64 = 64 * 1024;
 const FENCE_RESERVE_BYTES: u64 =
     (MAX_EXECUTION_FENCE_BYTES + MAX_EXECUTION_NONCE_BYTES) as u64 + 1024 * 1024;
 const RELEASE_RESERVE_BYTES: u64 = 64 * 1024;
+/// 继续保留旧版“最大 result + 最大 event + 4 MiB closure”的保守尾部。
+///
+/// typed critical terminal 当前实际更小，但 fragmented DB + pinned WAL 的真实样本尚未同时
+/// 覆盖近 2 GiB page tree 与每 turn 32 个 active approvals；在完整量化前不能用结构上限猜测
+/// 更小 reserve。锁产物而非锁过程：后续若收窄，必须先记录真实 WAL/page 增量上界。
 const TERMINAL_RESERVE_BYTES: u64 =
     (MAX_COMMAND_RESULT_BYTES + MAX_RUNTIME_EVENT_BYTES) as u64 + 4 * 1024 * 1024;
 /// Approval terminal transition 的 canonical event 不携带原始 request，只携带稳定
@@ -351,14 +356,16 @@ mod migration_tests {
         let daemon_boot_id = runtime_id(RuntimeIdKind::DaemonBoot, 0x41);
         let execution_nonce = b"legacy-execution-nonce".to_vec();
         store
-            .mark_started_with_event(StartCommand {
-                conversation_id: started_conversation.conversation_id,
-                command_id: started_command.command_id,
-                daemon_boot_id,
-                execution_nonce: execution_nonce.clone(),
-                intent_payload: b"legacy intent payload".to_vec(),
-                event_payload: b"legacy started event".to_vec(),
-            })
+            .mark_started_with_legacy_v1_fixture_for_test(
+                StartCommand {
+                    conversation_id: started_conversation.conversation_id,
+                    command_id: started_command.command_id,
+                    daemon_boot_id,
+                    execution_nonce: execution_nonce.clone(),
+                },
+                b"legacy intent payload".to_vec(),
+                b"legacy started event".to_vec(),
+            )
             .await
             .expect("persist legacy intent and event");
         store
@@ -4040,6 +4047,57 @@ mod tests {
             started_released_count: 0,
             ..RuntimeLedger::default()
         }
+    }
+
+    #[test]
+    fn terminal_reserve_remains_conservative_until_full_real_sqlite_calibration() {
+        assert_eq!(TERMINAL_RESERVE_BYTES, 132 * 1024 * 1024);
+    }
+
+    #[test]
+    fn command_lifecycle_reserves_are_exact_and_non_overlapping() {
+        let mut ledger = ledger_with_active_approvals(0);
+        ledger.accepted_count = 1;
+        assert_eq!(
+            safety_reserve_bytes_for_ledger(&ledger).expect("accepted reserve"),
+            FIXED_SAFETY_RESERVE_BYTES + ACCEPTED_EXPIRY_RESERVE_BYTES
+        );
+
+        ledger.accepted_count = 0;
+        ledger.started_without_fence_count = 1;
+        assert_eq!(
+            safety_reserve_bytes_for_ledger(&ledger).expect("without-fence reserve"),
+            FIXED_SAFETY_RESERVE_BYTES
+                + FENCE_RESERVE_BYTES
+                + RELEASE_RESERVE_BYTES
+                + TERMINAL_RESERVE_BYTES
+        );
+
+        ledger.started_without_fence_count = 0;
+        ledger.started_without_release_count = 1;
+        assert_eq!(
+            safety_reserve_bytes_for_ledger(&ledger).expect("without-release reserve"),
+            FIXED_SAFETY_RESERVE_BYTES + RELEASE_RESERVE_BYTES + TERMINAL_RESERVE_BYTES
+        );
+
+        ledger.started_without_release_count = 0;
+        ledger.started_released_count = 1;
+        assert_eq!(
+            safety_reserve_bytes_for_ledger(&ledger).expect("released reserve"),
+            FIXED_SAFETY_RESERVE_BYTES + TERMINAL_RESERVE_BYTES
+        );
+    }
+
+    #[test]
+    fn released_terminal_reserve_overflow_fails_closed() {
+        let mut ledger = ledger_with_active_approvals(0);
+        ledger.started_released_count = u64::MAX;
+        assert!(matches!(
+            safety_reserve_bytes_for_ledger(&ledger),
+            Err(RuntimeStoreError::CapacityArithmeticOverflow {
+                field: "started_released_reserve"
+            })
+        ));
     }
 
     #[test]

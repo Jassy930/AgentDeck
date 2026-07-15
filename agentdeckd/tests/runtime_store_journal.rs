@@ -10,11 +10,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use agentdeck_protocol::TurnSummary;
+use agentdeck_protocol::runtime::{RuntimeEvent, RuntimeEventBody};
 use agentdeckd::runtime::store::{
-    AcceptCommand, AcceptOutcome, AuthorizeExecutionRelease, CommandState, CompleteCommand,
-    CompleteOutcome, ExecutionFence, IdempotencyOwner, NewConversation, RuntimeClock,
-    RuntimeClockError, RuntimeId, RuntimeIdKind, RuntimeStoreConfig, RuntimeStoreError,
-    RuntimeStoreHandle, StartCommand, StartOutcome, TerminalState,
+    AcceptCommand, AcceptOutcome, AuthorizeExecutionRelease, CommandState, CommandTerminal,
+    CompleteCommand, CompleteOutcome, ExecutionFence, IdempotencyOwner, NewConversation,
+    RuntimeClock, RuntimeClockError, RuntimeId, RuntimeIdKind, RuntimeStoreConfig,
+    RuntimeStoreError, RuntimeStoreHandle, StartCommand, StartOutcome,
 };
 use agentdeckd::security::{MemoryKeyStore, StorageKek, load_or_create_storage_kek};
 
@@ -446,8 +448,6 @@ async fn start_fence_and_complete_are_atomic_idempotent_transitions() {
             command_id: second_command.command_id,
             daemon_boot_id,
             execution_nonce: b"nonce-second".to_vec(),
-            intent_payload: b"intent second".to_vec(),
-            event_payload: b"event second".to_vec(),
         })
         .await
         .expect_err("only queue head can start");
@@ -458,8 +458,6 @@ async fn start_fence_and_complete_are_atomic_idempotent_transitions() {
         command_id: command.command_id,
         daemon_boot_id,
         execution_nonce: b"nonce-first".to_vec(),
-        intent_payload: b"intent-private".to_vec(),
-        event_payload: b"started-event-private".to_vec(),
     };
     let started = store
         .mark_started_with_event(start_input())
@@ -476,6 +474,22 @@ async fn start_fence_and_complete_are_atomic_idempotent_transitions() {
     assert_eq!(started_command.state, CommandState::Started);
     assert_eq!(intent.turn_id.kind(), RuntimeIdKind::Turn);
     assert_eq!(started_event.event_seq, 0);
+    let intent_json: serde_json::Value =
+        serde_json::from_slice(&intent.payload).expect("decode Store-owned intent");
+    assert_eq!(intent_json["kind"], "runtimeExecutionIntent");
+    assert!(intent_json.get("prompt").is_none() && intent_json.get("vendor").is_none());
+    let started_wire: RuntimeEvent =
+        serde_json::from_slice(&started_event.payload).expect("decode Store-owned TurnStarted");
+    assert_eq!(
+        started_wire.command_id.as_ref().map(|id| id.as_str()),
+        Some(command.command_id.to_canonical_string()).as_deref()
+    );
+    assert!(started_wire.item_id.is_none() && started_wire.entity_id.is_none());
+    assert!(matches!(
+        started_wire.body,
+        RuntimeEventBody::TurnStarted { ref turn_id }
+            if turn_id.as_str() == intent.turn_id.to_canonical_string()
+    ));
     let replay = store
         .mark_started_with_event(start_input())
         .await
@@ -491,8 +505,6 @@ async fn start_fence_and_complete_are_atomic_idempotent_transitions() {
             command_id: second_command.command_id,
             daemon_boot_id,
             execution_nonce: b"nonce-second-after-head".to_vec(),
-            intent_payload: b"intent second after head".to_vec(),
-            event_payload: b"event second after head".to_vec(),
         })
         .await
         .expect_err("one conversation cannot own two Started turns");
@@ -555,32 +567,50 @@ async fn start_fence_and_complete_are_atomic_idempotent_transitions() {
         conversation_id: conversation.conversation_id,
         command_id: command.command_id,
         turn_id: intent.turn_id,
-        terminal_state: TerminalState::Completed,
-        terminal_payload: b"result-private".to_vec(),
-        event_payload: b"completed-event-private".to_vec(),
+        terminal: CommandTerminal::completed(TurnSummary {
+            total_input_tokens: None,
+            total_output_tokens: None,
+            elapsed_ms: 7,
+        }),
     };
     let completed = store
         .complete_command_with_event(complete_input())
         .await
         .expect("complete command");
-    let completed_event_id = match completed {
+    let (completed_event_id, completed_event_payload) = match completed {
         CompleteOutcome::Completed { command, event } => {
             assert_eq!(command.state, CommandState::Completed);
             assert_eq!(event.event_seq, 1);
-            event.event_id
+            let wire: RuntimeEvent =
+                serde_json::from_slice(&event.payload).expect("decode Store-owned TurnCompleted");
+            assert!(matches!(
+                wire.body,
+                RuntimeEventBody::TurnCompleted { summary, .. }
+                    if summary.elapsed_ms == 7
+                        && summary.total_input_tokens.is_none()
+                        && summary.total_output_tokens.is_none()
+            ));
+            (event.event_id, event.payload)
         }
         CompleteOutcome::Replayed { .. } => panic!("first complete cannot replay"),
     };
+    let replayed = store
+        .complete_command_with_event(complete_input())
+        .await
+        .expect("exact terminal retry");
     assert!(matches!(
-        store
-            .complete_command_with_event(complete_input())
-            .await
-            .expect("exact terminal retry"),
-        CompleteOutcome::Replayed { event, .. } if event.event_id == completed_event_id
+        replayed,
+        CompleteOutcome::Replayed { ref event, .. }
+            if event.event_id == completed_event_id
+                && event.payload == completed_event_payload
     ));
     let terminal_conflict = store
         .complete_command_with_event(CompleteCommand {
-            terminal_payload: b"different result".to_vec(),
+            terminal: CommandTerminal::completed(TurnSummary {
+                total_input_tokens: Some(1),
+                total_output_tokens: None,
+                elapsed_ms: 7,
+            }),
             ..complete_input()
         })
         .await
@@ -637,8 +667,6 @@ async fn command_expires_exactly_at_the_24_hour_boundary() {
             command_id: command.command_id,
             daemon_boot_id,
             execution_nonce: b"nonce".to_vec(),
-            intent_payload: b"intent".to_vec(),
-            event_payload: b"event".to_vec(),
         })
         .await
         .expect_err("expiry boundary is exclusive");

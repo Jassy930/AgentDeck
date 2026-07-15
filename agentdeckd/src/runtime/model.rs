@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agentdeck_protocol::{ActionDecision, ActionRequest, AgentKind};
+use agentdeck_protocol::{ActionDecision, ActionRequest, AgentKind, TurnSummary};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -40,8 +40,8 @@ pub const MAX_ADAPTER_STATE_REFERENCE_BYTES: usize = 4 * 1024;
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 1024;
 pub const MAX_EXECUTION_INTENT_BYTES: usize = 1024 * 1024;
 pub const MAX_RUNTIME_EVENT_BYTES: usize = 64 * 1024 * 1024;
-/// Accepted 终止事件必须落在每条 Accepted 已预留的 64 KiB safety tail 内。
-pub const MAX_ACCEPTED_TERMINATION_EVENT_BYTES: usize = 32 * 1024;
+/// Store-owned Started/terminal record 的独立小上限；任意大 Item/Error 走普通事件事务。
+pub const MAX_CRITICAL_COMMAND_RECORD_BYTES: usize = 4 * 1024;
 pub const MAX_EXECUTION_FENCE_BYTES: usize = 1024 * 1024;
 pub const MAX_COMMAND_RESULT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_EXECUTION_NONCE_BYTES: usize = 1024;
@@ -75,6 +75,8 @@ pub enum RuntimeStoreOperation {
     AcceptCommandAfterCommit,
     StartCommandBeforeCommit,
     StartCommandAfterCommit,
+    AppendExecutionEventBeforeCommit,
+    AppendExecutionEventAfterCommit,
     ExpireCommandsBeforeCommit,
     ExpireCommandsAfterCommit,
     TerminateAcceptedCommandBeforeCommit,
@@ -323,6 +325,7 @@ pub enum RuntimeCommitOperation {
     CreateConversation,
     AcceptCommand,
     StartCommand,
+    AppendExecutionEvent,
     ExpireCommands,
     TerminateAcceptedCommand,
     TerminateStartedBeforeRelease,
@@ -509,7 +512,6 @@ pub struct TerminateAcceptedCommand {
     pub command_id: RuntimeId,
     pub expected_owner: IdempotencyOwner,
     pub reason: AcceptedTerminationReason,
-    pub event_payload: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -555,8 +557,6 @@ pub struct TerminateStartedBeforeRelease {
     pub daemon_boot_id: RuntimeId,
     pub execution_nonce: Vec<u8>,
     pub reason: StartedBeforeReleaseTermination,
-    pub terminal_payload: Vec<u8>,
-    pub event_payload: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -602,8 +602,6 @@ pub struct StartCommand {
     pub command_id: RuntimeId,
     pub daemon_boot_id: RuntimeId,
     pub execution_nonce: Vec<u8>,
-    pub intent_payload: Vec<u8>,
-    pub event_payload: Vec<u8>,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -714,14 +712,130 @@ impl std::fmt::Debug for ExecutionFenceRecord {
     }
 }
 
+/// 可写入 Failed terminal 的唯一脱敏 failure。
+///
+/// 该零载荷 allowlist 不接受 adapter 原始 message/code/diagnostic reference；新增失败语义必须先在
+/// Runtime failure registry 与诊断文档中登记，再显式扩展这里。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SanitizedTerminalFailure {
+    kind: SanitizedTerminalFailureKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SanitizedTerminalFailureKind {
+    ExecutionFailed,
+}
+
+impl SanitizedTerminalFailure {
+    #[must_use]
+    pub const fn execution_failed() -> Self {
+        Self {
+            kind: SanitizedTerminalFailureKind::ExecutionFailed,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn code(self) -> &'static str {
+        match self.kind {
+            SanitizedTerminalFailureKind::ExecutionFailed => {
+                agentdeck_protocol::runtime::failure::DAEMON_RUNTIME_EXECUTION_FAILED
+            }
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn message(self) -> &'static str {
+        match self.kind {
+            SanitizedTerminalFailureKind::ExecutionFailed => "agent execution failed",
+        }
+    }
+}
+
+/// command terminal 的唯一 typed 输入；wire event 与 sealed result 由 Store 构造。
+#[derive(Clone)]
+pub struct CommandTerminal {
+    kind: CommandTerminalKind,
+}
+
+#[derive(Clone)]
+enum CommandTerminalKind {
+    Completed(TurnSummary),
+    Failed(SanitizedTerminalFailure),
+    Interrupted,
+    Canceled,
+}
+
+impl CommandTerminal {
+    #[must_use]
+    pub const fn completed(summary: TurnSummary) -> Self {
+        Self {
+            kind: CommandTerminalKind::Completed(summary),
+        }
+    }
+
+    #[must_use]
+    pub const fn failed(failure: SanitizedTerminalFailure) -> Self {
+        Self {
+            kind: CommandTerminalKind::Failed(failure),
+        }
+    }
+
+    #[must_use]
+    pub const fn interrupted() -> Self {
+        Self {
+            kind: CommandTerminalKind::Interrupted,
+        }
+    }
+
+    #[must_use]
+    pub const fn canceled() -> Self {
+        Self {
+            kind: CommandTerminalKind::Canceled,
+        }
+    }
+
+    #[must_use]
+    pub const fn terminal_state(&self) -> TerminalState {
+        match self.kind {
+            CommandTerminalKind::Completed(_) => TerminalState::Completed,
+            CommandTerminalKind::Failed(_) => TerminalState::Failed,
+            CommandTerminalKind::Interrupted => TerminalState::Interrupted,
+            CommandTerminalKind::Canceled => TerminalState::Canceled,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn completed_summary(&self) -> Option<&TurnSummary> {
+        match &self.kind {
+            CommandTerminalKind::Completed(summary) => Some(summary),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn failure(&self) -> Option<SanitizedTerminalFailure> {
+        match self.kind {
+            CommandTerminalKind::Failed(failure) => Some(failure),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Debug for CommandTerminal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CommandTerminal")
+            .field("state", &self.terminal_state())
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone)]
 pub struct CompleteCommand {
     pub conversation_id: RuntimeId,
     pub command_id: RuntimeId,
     pub turn_id: RuntimeId,
-    pub terminal_state: TerminalState,
-    pub terminal_payload: Vec<u8>,
-    pub event_payload: Vec<u8>,
+    pub terminal: CommandTerminal,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1162,6 +1276,8 @@ pub enum RuntimeStoreError {
     ExecutionReleaseMissing,
     #[error("runtime terminal retry conflicts with the persisted terminal result")]
     TerminalConflict,
+    #[error("runtime execution event retry conflicts with the persisted event")]
+    ExecutionEventConflict,
     #[error("runtime {operation:?} commit outcome is unknown; retry the identical operation")]
     CommitOutcomeUnknown { operation: RuntimeCommitOperation },
     #[error("runtime stable id generation failed: {0}")]
@@ -1231,6 +1347,7 @@ impl RuntimeStoreError {
             | Self::ExecutionFenceMissing
             | Self::ExecutionReleaseMissing
             | Self::TerminalConflict
+            | Self::ExecutionEventConflict
             | Self::RecoveryNotActive
             | Self::InvalidRecoveryCursor
             | Self::RecoveryNotReady

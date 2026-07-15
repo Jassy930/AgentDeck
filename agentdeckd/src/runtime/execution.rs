@@ -14,8 +14,8 @@ use tokio::sync::mpsc;
 
 use crate::runtime::approval::SharedApprovalDelivery;
 use crate::runtime::store::{
-    AuthorizeExecutionRelease, CommandRecord, ConversationRecord, ExecutionFenceRecord, RuntimeId,
-    TerminalState,
+    AuthorizeExecutionRelease, CommandRecord, CommandTerminal, ConversationRecord,
+    ExecutionFenceRecord, RuntimeId,
 };
 
 #[allow(dead_code)] // P3.5 conversation ApprovalSupervisor 接线后成为 production path。
@@ -75,11 +75,9 @@ pub(crate) struct RuntimeProcessIdentity {
     pub(crate) fence_payload: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct RuntimeExecutionCompletion {
-    pub(crate) terminal_state: TerminalState,
-    pub(crate) terminal_payload: Vec<u8>,
-    pub(crate) event_payload: Vec<u8>,
+    pub(crate) terminal: CommandTerminal,
 }
 
 #[async_trait::async_trait]

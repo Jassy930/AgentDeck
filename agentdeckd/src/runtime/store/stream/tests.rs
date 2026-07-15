@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use agentdeck_protocol::AgentKind;
 use agentdeck_protocol::runtime::event::RuntimeEventBody;
-use agentdeck_protocol::runtime::identity::{CommandId, ConversationId, EventId};
+use agentdeck_protocol::runtime::identity::{ConversationId, EventId};
 use agentdeck_protocol::runtime::{RuntimeEvent, RuntimeFailure};
 use rusqlite::{Connection, TransactionBehavior, params};
 
@@ -240,18 +240,6 @@ fn create_conversation_with_event(
         [expected_event_seed; 16],
     )
     .expect("expected event id");
-    let event = RuntimeEvent::new(
-        ConversationId::new(conversation_id.to_canonical_string()),
-        EventId::new(expected_event_id.to_canonical_string()),
-        0,
-        Some(CommandId::new(command_id.to_canonical_string())),
-        None,
-        None,
-        RuntimeEventBody::Error {
-            failure: RuntimeFailure::new("daemon.retention", "production gate"),
-        },
-    )
-    .expect("canonical retention event");
     match super::super::journal::mark_started_with_event(
         state,
         config,
@@ -264,14 +252,13 @@ fn create_conversation_with_event(
             )
             .expect("daemon boot id"),
             execution_nonce: vec![seed; 16],
-            intent_payload: b"retention intent".to_vec(),
-            event_payload: serde_json::to_vec(&event).expect("encode retention event"),
         },
+        super::super::command_event::StartEventSource::Canonical,
         &mut effects,
     )
     .expect("append retention event")
     {
-        StartOutcome::Started { .. } => {}
+        StartOutcome::Started { event, .. } => assert_eq!(event.event_id, expected_event_id),
         StartOutcome::Replayed { .. } => panic!("first retention start cannot replay"),
     }
     conversation_id

@@ -16,9 +16,9 @@ use agentdeckd::runtime::model::{
 };
 use agentdeckd::runtime::store::{
     AcceptCommand, AcceptOutcome, AcceptedTerminationReason, CommandReceiptSelector, CommandState,
-    CreateConversationOutcome, ExecutionFence, IdempotencyOwner, NewConversation,
-    QueryCommandReceipt, RuntimeClock, RuntimeClockError, RuntimeCommitOperation, RuntimeId,
-    RuntimeIdKind, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreFaultInjector,
+    CommandTerminal, CompleteCommand, CreateConversationOutcome, ExecutionFence, IdempotencyOwner,
+    NewConversation, QueryCommandReceipt, RuntimeClock, RuntimeClockError, RuntimeCommitOperation,
+    RuntimeId, RuntimeIdKind, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreFaultInjector,
     RuntimeStoreHandle, RuntimeStoreOperation, StartCommand, StartOutcome,
     StartedBeforeReleaseTermination, TerminateAcceptedCommand, TerminateAcceptedOutcome,
     TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
@@ -402,7 +402,6 @@ async fn accepted_cancel_commits_event_and_replays_without_double_decrement() {
         command_id: command.command_id,
         expected_owner: owner.clone(),
         reason: AcceptedTerminationReason::Canceled,
-        event_payload: b"queued-canceled".to_vec(),
     };
 
     let (terminated, event) = match store
@@ -419,7 +418,13 @@ async fn accepted_cancel_commits_event_and_replays_without_double_decrement() {
     assert_eq!(terminated.turn_id, None);
     assert_eq!(terminated.terminal_event_id, Some(event.event_id));
     assert_eq!(event.event_seq, 0);
-    assert_eq!(event.payload, b"queued-canceled");
+    assert_eq!(
+        String::from_utf8(event.payload.clone()).expect("accepted terminal event utf8"),
+        format!(
+            "{{\"commandId\":\"{}\",\"kind\":\"commandCanceledBeforeStart\"}}",
+            command.command_id.to_canonical_string()
+        )
+    );
 
     assert!(matches!(
         store
@@ -430,13 +435,13 @@ async fn accepted_cancel_commits_event_and_replays_without_double_decrement() {
             if replay.command_id == command.command_id && replay_event.event_id == event.event_id
     ));
     let mut conflict = input();
-    conflict.event_payload = b"different-cancel-event".to_vec();
+    conflict.reason = AcceptedTerminationReason::RevokedBeforeStart;
     assert!(matches!(
         store
             .terminate_accepted_command(conflict)
             .await
-            .expect_err("different replay payload must conflict"),
-        RuntimeStoreError::TerminalConflict
+            .expect_err("a different typed terminal reason cannot replay"),
+        RuntimeStoreError::InvalidStateTransition
     ));
 
     let recovery = runtime_recovery::load_recovery_state(&store)
@@ -465,7 +470,6 @@ async fn revoked_before_start_reopens_and_replays_with_its_own_terminal_domain()
         command_id: command.command_id,
         expected_owner: owner.clone(),
         reason: AcceptedTerminationReason::RevokedBeforeStart,
-        event_payload: b"principal-revoked".to_vec(),
     };
     let event_id = match store
         .terminate_accepted_command(input())
@@ -513,7 +517,6 @@ async fn accepted_termination_checks_owner_and_reports_a_started_race() {
         command_id: command.command_id,
         expected_owner,
         reason: AcceptedTerminationReason::Canceled,
-        event_payload: b"cancel-race".to_vec(),
     };
     assert!(matches!(
         store
@@ -531,8 +534,6 @@ async fn accepted_termination_checks_owner_and_reports_a_started_race() {
                 command_id: command.command_id,
                 daemon_boot_id: daemon_boot_id(0x61),
                 execution_nonce: b"start-race-nonce".to_vec(),
-                intent_payload: b"start-race-intent".to_vec(),
-                event_payload: b"start-race-event".to_vec(),
             })
             .await
             .expect("start wins race"),
@@ -571,7 +572,6 @@ async fn accepted_termination_after_commit_unknown_converges_by_exact_retry() {
         command_id: command.command_id,
         expected_owner: owner.clone(),
         reason: AcceptedTerminationReason::RevokedBeforeStart,
-        event_payload: b"unknown-revocation".to_vec(),
     };
     assert!(matches!(
         store
@@ -612,7 +612,6 @@ async fn accepted_termination_is_fenced_during_recovery() {
         command_id: command.command_id,
         expected_owner: owner,
         reason: AcceptedTerminationReason::Canceled,
-        event_payload: b"recovery-fenced-cancel".to_vec(),
     };
     let cursor = store.begin_recovery_scan().await.expect("begin recovery");
     assert!(matches!(
@@ -672,7 +671,6 @@ async fn accepted_termination_consumes_reserved_capacity_while_safety_only() {
                 command_id: command.command_id,
                 expected_owner: owner,
                 reason: AcceptedTerminationReason::Canceled,
-                event_payload: b"safety-tail-cancel".to_vec(),
             })
             .await
             .expect("reserved safety tail permits accepted termination"),
@@ -770,8 +768,6 @@ async fn compact_receipt_query_supports_both_selectors_and_verifies_owner() {
             command_id: command.command_id,
             daemon_boot_id: daemon_boot_id(0x73),
             execution_nonce: b"receipt-query-nonce".to_vec(),
-            intent_payload: b"receipt-query-intent".to_vec(),
-            event_payload: b"receipt-query-event".to_vec(),
         })
         .await
         .expect("start queried command")
@@ -826,8 +822,6 @@ async fn fenced_started_command_can_terminate_before_release_and_exactly_replay(
             command_id: command.command_id,
             daemon_boot_id: boot_id,
             execution_nonce: nonce.clone(),
-            intent_payload: b"pre-release-cancel-intent".to_vec(),
-            event_payload: b"pre-release-cancel-started".to_vec(),
         })
         .await
         .expect("start command")
@@ -870,8 +864,6 @@ async fn fenced_started_command_can_terminate_before_release_and_exactly_replay(
         daemon_boot_id: boot_id,
         execution_nonce: nonce.clone(),
         reason: StartedBeforeReleaseTermination::Canceled,
-        terminal_payload: b"canceled before release".to_vec(),
-        event_payload: b"pre-release-canceled-event".to_vec(),
     };
 
     let (terminal, event_id) = match store
@@ -893,6 +885,18 @@ async fn fenced_started_command_can_terminate_before_release_and_exactly_replay(
             .expect("exact retry"),
         TerminateStartedBeforeReleaseOutcome::Replayed { command, event }
             if command.command_id == terminal.command_id && event.event_id == event_id
+    ));
+    assert!(matches!(
+        store
+            .complete_command_with_event(CompleteCommand {
+                conversation_id: conversation.conversation_id,
+                command_id: command.command_id,
+                turn_id,
+                terminal: CommandTerminal::canceled(),
+            })
+            .await
+            .expect_err("released completion cannot alias a before-release terminal"),
+        RuntimeStoreError::TerminalConflict
     ));
 
     let mut conflict = input();
@@ -940,8 +944,6 @@ async fn started_before_release_commit_unknown_converges_by_exact_retry() {
             command_id: command.command_id,
             daemon_boot_id: boot_id,
             execution_nonce: nonce.clone(),
-            intent_payload: b"pre-release-unknown-intent".to_vec(),
-            event_payload: b"pre-release-unknown-started".to_vec(),
         })
         .await
         .expect("start command")
@@ -957,8 +959,6 @@ async fn started_before_release_commit_unknown_converges_by_exact_retry() {
         daemon_boot_id: boot_id,
         execution_nonce: nonce.clone(),
         reason: StartedBeforeReleaseTermination::Interrupted,
-        terminal_payload: b"interrupted before release".to_vec(),
-        event_payload: b"pre-release-interrupted-event".to_vec(),
     };
 
     assert!(matches!(

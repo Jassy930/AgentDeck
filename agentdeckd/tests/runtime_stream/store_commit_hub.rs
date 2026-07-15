@@ -67,8 +67,6 @@ async fn event_seq_and_catalog_revision_are_independent_and_start_at_zero() {
             command_id: first_command,
             daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 0x21),
             execution_nonce: b"first-independent-nonce".to_vec(),
-            intent_payload: b"first-independent-intent".to_vec(),
-            event_payload: b"first-independent-event".to_vec(),
         })
         .await
         .expect("commit first event zero");
@@ -86,8 +84,6 @@ async fn event_seq_and_catalog_revision_are_independent_and_start_at_zero() {
             command_id: second_command,
             daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 0x22),
             execution_nonce: b"second-independent-nonce".to_vec(),
-            intent_payload: b"second-independent-intent".to_vec(),
-            event_payload: b"second-independent-event".to_vec(),
         })
         .await
         .expect("commit second event zero");
@@ -470,8 +466,6 @@ async fn event_committed_while_snapshot_is_sending_is_caught_up_exactly_once() {
             command_id,
             daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 0x70),
             execution_nonce: b"snapshot-catchup-nonce".to_vec(),
-            intent_payload: b"snapshot-catchup-intent".to_vec(),
-            event_payload: b"snapshot-catchup-event".to_vec(),
         })
         .await
         .expect("commit event while snapshot is sending");
@@ -651,8 +645,6 @@ async fn after_commit_unknown_notifies_durable_event_high_water() {
             command_id,
             daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 0x71),
             execution_nonce: b"unknown-nonce".to_vec(),
-            intent_payload: b"unknown-intent".to_vec(),
-            event_payload: b"unknown-event".to_vec(),
         })
         .await
         .expect_err("after-COMMIT response loss");
@@ -709,8 +701,6 @@ async fn before_commit_rollback_does_not_notify_event_high_water() {
                 command_id,
                 daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 0x72),
                 execution_nonce: b"rollback-nonce".to_vec(),
-                intent_payload: b"rollback-intent".to_vec(),
-                event_payload: b"rollback-event".to_vec(),
             })
             .await
             .is_err()
@@ -750,8 +740,6 @@ async fn no_watcher_preserves_after_commit_unknown_when_target_readback_would_fa
             command_id,
             daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 0x73),
             execution_nonce: b"unwatched-unknown-nonce".to_vec(),
-            intent_payload: b"unwatched-unknown-intent".to_vec(),
-            event_payload: b"unwatched-unknown-event".to_vec(),
         })
         .await
         .expect_err("after-COMMIT response loss remains the mutation outcome");
@@ -788,8 +776,6 @@ async fn no_watcher_performs_zero_authenticated_notification_readbacks() {
             command_id,
             daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 0x76),
             execution_nonce: b"zero-readback-nonce".to_vec(),
-            intent_payload: b"zero-readback-intent".to_vec(),
-            event_payload: b"zero-readback-event".to_vec(),
         })
         .await
         .expect("commit unwatched event");
@@ -863,8 +849,6 @@ async fn expiry_and_main_commit_same_target_union_reads_back_once() {
             command_id: fresh_command,
             daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 0x77),
             execution_nonce: b"same-target-union-nonce".to_vec(),
-            intent_payload: b"same-target-union-intent".to_vec(),
-            event_payload: b"same-target-union-event".to_vec(),
         })
         .await
         .expect("expiry and main start both commit");
@@ -928,8 +912,6 @@ async fn unrelated_watcher_target_is_not_read_or_closed() {
             command_id,
             daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 0x74),
             execution_nonce: b"unrelated-watch-nonce".to_vec(),
-            intent_payload: b"unrelated-watch-intent".to_vec(),
-            event_payload: b"unrelated-watch-event".to_vec(),
         })
         .await
         .expect("unrelated readback corruption must not affect mutation");
@@ -1015,8 +997,6 @@ async fn expiry_commit_survives_main_rollback_without_touching_unrelated_watcher
                 command_id: trigger_command,
                 daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 0x75),
                 execution_nonce: b"expiry-main-rollback-nonce".to_vec(),
-                intent_payload: b"expiry-main-rollback-intent".to_vec(),
-                event_payload: b"expiry-main-rollback-event".to_vec(),
             })
             .await,
         Err(RuntimeStoreError::InvalidConfig(
@@ -1252,7 +1232,6 @@ async fn safety_termination_notifies_conversation_high_water() {
                 command_id,
                 expected_owner: owner(0x90),
                 reason: AcceptedTerminationReason::Canceled,
-                event_payload: b"safety termination".to_vec(),
             })
             .await
             .expect("terminate accepted command on safety lane"),

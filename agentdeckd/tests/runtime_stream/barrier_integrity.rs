@@ -5,10 +5,14 @@ async fn ready_snapshot_authenticated_base_is_captured_with_later_high_water() {
     let root = TestRoot::new("ready-snapshot-barrier-capture");
     let keys = MemoryKeyStore::new();
     let command_id = runtime_id(RuntimeIdKind::Command, 0x47);
-    let event_id = runtime_id(RuntimeIdKind::Event, 0x48);
+    let turn_id = runtime_id(RuntimeIdKind::Turn, 0x48);
+    let started_event_id = runtime_id(RuntimeIdKind::Event, 0x49);
     let store = RuntimeStoreHandle::open(
-        RuntimeStoreConfig::new(root.database())
-            .with_id_source(SequenceIdSource::new([command_id, event_id])),
+        RuntimeStoreConfig::new(root.database()).with_id_source(SequenceIdSource::new([
+            command_id,
+            turn_id,
+            started_event_id,
+        ])),
         root.storage_kek(&keys),
     )
     .await
@@ -29,31 +33,15 @@ async fn ready_snapshot_authenticated_base_is_captured_with_later_high_water() {
         .await
         .expect("store ready snapshot");
 
-    let canonical = RuntimeEvent::new(
-        ConversationId::new(conversation_id.to_canonical_string()),
-        EventId::new(event_id.to_canonical_string()),
-        0,
-        Some(CommandId::new(command_id.to_canonical_string())),
-        None,
-        None,
-        RuntimeEventBody::Error {
-            failure: RuntimeFailure::new(
-                "daemon.command.interrupted",
-                "event committed after the frozen snapshot base",
-            ),
-        },
-    )
-    .expect("canonical post-snapshot event");
     store
-        .terminate_accepted_command(TerminateAcceptedCommand {
+        .mark_started_with_event(StartCommand {
             conversation_id,
             command_id,
-            expected_owner: owner(0x90),
-            reason: AcceptedTerminationReason::Canceled,
-            event_payload: serde_json::to_vec(&canonical).expect("encode canonical event"),
+            daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 0x4A),
+            execution_nonce: b"ready-snapshot-canonical-start".to_vec(),
         })
         .await
-        .expect("advance event high-water after snapshot");
+        .expect("advance event high-water with canonical TurnStarted after snapshot");
 
     let registration = store
         .register_stream_barrier(RegisterStreamBarrier {
@@ -126,7 +114,6 @@ async fn snapshot_build_pin_is_bound_to_barrier_captured_h() {
             command_id,
             expected_owner: owner(0x90),
             reason: AcceptedTerminationReason::Canceled,
-            event_payload: b"event committed after exact-H capture".to_vec(),
         })
         .await
         .expect("advance high-water after barrier capture");
@@ -594,7 +581,6 @@ async fn authenticated_base_newer_than_historical_parent_cut_is_rejected() {
             command_id,
             expected_owner: owner(0x90),
             reason: AcceptedTerminationReason::Canceled,
-            event_payload: b"advance snapshot base to event zero".to_vec(),
         })
         .await
         .expect("advance event high-water");

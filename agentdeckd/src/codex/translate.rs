@@ -325,7 +325,7 @@ impl CodexTranslator {
 
         let events: Vec<ServerEvent> = match m {
             "thread/started" => {
-                if let Some(id) = params.get("threadId").and_then(Value::as_str) {
+                if let Some(id) = thread_id_from_params(&params) {
                     let tid = ThreadId(id.to_string());
                     if self.thread_id.is_none() {
                         self.thread_id = Some(tid.clone());
@@ -342,7 +342,7 @@ impl CodexTranslator {
             "turn/started" => {
                 // Pure lifecycle, no neutral counterpart in v2. Capture
                 // the threadId opportunistically.
-                if let Some(id) = params.get("threadId").and_then(Value::as_str)
+                if let Some(id) = thread_id_from_params(&params)
                     && self.thread_id.is_none()
                 {
                     self.thread_id = Some(ThreadId(id.to_string()));
@@ -599,6 +599,7 @@ impl CodexTranslator {
     // ── turn complete ──────────────────────────────────────────────────────
 
     fn turn_complete_event(&self, params: &Value) -> ServerEvent {
+        let turn = params.get("turn");
         let usage = params.get("usage");
         let summary = TurnSummary {
             total_input_tokens: usage
@@ -610,6 +611,10 @@ impl CodexTranslator {
             elapsed_ms: params
                 .get("durationMs")
                 .and_then(Value::as_u64)
+                .or_else(|| {
+                    turn.and_then(|value| value.get("durationMs"))
+                        .and_then(Value::as_u64)
+                })
                 .unwrap_or(0),
         };
         ServerEvent::TurnComplete {
@@ -748,14 +753,7 @@ impl CodexTranslator {
     // ── helpers ────────────────────────────────────────────────────────────
 
     fn resolve_thread_id(&self, params: &Value) -> ThreadId {
-        if let Some(id) = params.get("threadId").and_then(Value::as_str) {
-            return ThreadId(id.to_string());
-        }
-        if let Some(id) = params
-            .get("item")
-            .and_then(|i| i.get("threadId"))
-            .and_then(Value::as_str)
-        {
+        if let Some(id) = thread_id_from_params(params) {
             return ThreadId(id.to_string());
         }
         self.thread_id
@@ -787,6 +785,24 @@ impl CodexTranslator {
             },
         }
     }
+}
+
+fn thread_id_from_params(params: &Value) -> Option<&str> {
+    params
+        .get("threadId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            params
+                .get("thread")
+                .and_then(|thread| thread.get("id"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            params
+                .get("item")
+                .and_then(|item| item.get("threadId"))
+                .and_then(Value::as_str)
+        })
 }
 
 // ── classification + field extraction helpers ───────────────────────────────
@@ -1273,6 +1289,24 @@ mod tests {
     }
 
     #[test]
+    fn current_thread_started_nested_shape_captures_thread_id() {
+        let mut t = CodexTranslator::new(SessionId("s-current".into()), None);
+        let events = t.translate_value(&json!({
+            "method": "thread/started",
+            "params": {"thread": {"id": "thread_current", "status": "idle"}}
+        }));
+        assert!(matches!(
+            events.as_slice(),
+            [ServerEvent::SessionStarted { thread_id: Some(thread_id), .. }]
+                if thread_id.0 == "thread_current"
+        ));
+        assert_eq!(
+            t.thread_id().map(|thread| thread.0.as_str()),
+            Some("thread_current")
+        );
+    }
+
+    #[test]
     fn turn_completed_emits_turn_complete_with_usage() {
         let mut t = tr();
         let events = t.translate_value(&json!({
@@ -1292,6 +1326,29 @@ mod tests {
             }
             other => panic!("expected TurnComplete, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn current_turn_completed_nested_shape_preserves_recorded_duration_only() {
+        let mut t = tr();
+        let events = t.translate_value(&json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread_1",
+                "turn": {
+                    "id": "turn_1",
+                    "status": "completed",
+                    "durationMs": 123
+                }
+            }
+        }));
+        assert!(matches!(
+            events.as_slice(),
+            [ServerEvent::TurnComplete { summary, .. }]
+                if summary.elapsed_ms == 123
+                    && summary.total_input_tokens.is_none()
+                    && summary.total_output_tokens.is_none()
+        ));
     }
 
     #[test]

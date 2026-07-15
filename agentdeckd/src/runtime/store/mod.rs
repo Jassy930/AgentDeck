@@ -4,6 +4,8 @@ pub(crate) mod admission;
 mod approval;
 mod catalog;
 pub mod cipher;
+mod command_event;
+mod execution_event;
 pub mod identity;
 mod journal;
 mod persisted_event;
@@ -22,19 +24,20 @@ use crate::runtime::events::SnapshotBuildPinCleanup;
 
 pub use crate::runtime::model::{
     AcceptCommand, AcceptOutcome, AcceptedTerminationReason, AuthorizeExecutionRelease,
-    CommandReceiptRecord, CommandReceiptSelector, CommandRecord, CommandState, CompleteCommand,
-    CompleteOutcome, ConversationDescriptor, ConversationLifecycle, ConversationRecord,
-    ConversationRecoveryRecord, CreateConversationOutcome, EventRecord, ExecutionFence,
-    ExecutionFenceRecord, ExecutionIntentRecord, IdempotencyOwner,
+    CommandReceiptRecord, CommandReceiptSelector, CommandRecord, CommandState, CommandTerminal,
+    CompleteCommand, CompleteOutcome, ConversationDescriptor, ConversationLifecycle,
+    ConversationRecord, ConversationRecoveryRecord, CreateConversationOutcome, EventRecord,
+    ExecutionFence, ExecutionFenceRecord, ExecutionIntentRecord, IdempotencyOwner,
     MAX_CONVERSATION_DESCRIPTOR_BYTES, MAX_RECOVERY_PAGE_RETAINED_BYTES, MAX_RUNTIME_CONVERSATIONS,
     MachineEnrollmentReceiptRecord, NewConversation, QueryCommandReceipt, QueueScope,
     RecoveryCompletion, RecoveryCursor, RecoveryPage, RecoveryState, RuntimeClock,
     RuntimeClockError, RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError,
     RuntimeStoreFaultInjector, RuntimeStoreLane, RuntimeStoreOperation, RuntimeStoreSnapshot,
-    StartCommand, StartOutcome, StartedBeforeReleaseTermination, StartedRecoveryRecord,
-    SystemRuntimeClock, TerminalState, TerminateAcceptedCommand, TerminateAcceptedOutcome,
-    TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
+    SanitizedTerminalFailure, StartCommand, StartOutcome, StartedBeforeReleaseTermination,
+    StartedRecoveryRecord, SystemRuntimeClock, TerminalState, TerminateAcceptedCommand,
+    TerminateAcceptedOutcome, TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
 };
+pub use execution_event::{AppendExecutionEvent, AppendExecutionEventOutcome};
 pub use identity::{RuntimeId, RuntimeIdKind, RuntimeIdSource};
 pub use publication::{
     FreezePublicationRequest, FrozenPublication, PublicationAcknowledgement, PublicationBarrierCut,

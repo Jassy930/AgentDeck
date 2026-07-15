@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use agentdeck_protocol::runtime::identity::ApprovalId;
 use agentdeck_protocol::runtime::{ApprovalDeliveryState, ApprovalReceipt};
-use serde_json::json;
 use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinError, JoinHandle};
 
@@ -26,9 +25,9 @@ use super::connection::{
     PrincipalAuthorizationKey,
 };
 use super::execution::{
-    ExecutionReleasePermit, RuntimeExecutionCompletion, RuntimeExecutionContext,
-    RuntimeExecutionControl, RuntimeExecutionCoordinator, RuntimeExecutionError,
-    RuntimeExecutionEvent, RuntimeExecutionEventReceiver,
+    ExecutionReleasePermit, RuntimeCompletionFuture, RuntimeExecutionCompletion,
+    RuntimeExecutionContext, RuntimeExecutionControl, RuntimeExecutionCoordinator,
+    RuntimeExecutionError, RuntimeExecutionEvent, RuntimeExecutionEventReceiver,
 };
 use super::model::{
     ApprovalMutationOutcome, ApprovalRecord, ApprovalState, ClaimApproval, ExpireApproval,
@@ -36,9 +35,9 @@ use super::model::{
 };
 use super::store::{
     AcceptCommand, AcceptOutcome, AcceptedTerminationReason, AuthorizeExecutionRelease,
-    CommandRecord, CommandState, CompleteCommand, ConversationRecord, ExecutionFence, RuntimeId,
-    RuntimeStoreError, RuntimeStoreHandle, StartCommand, StartOutcome,
-    StartedBeforeReleaseTermination, SystemRuntimeClock, TerminalState, TerminateAcceptedCommand,
+    CommandRecord, CommandState, CommandTerminal, CompleteCommand, ConversationRecord,
+    ExecutionFence, RuntimeId, RuntimeStoreError, RuntimeStoreHandle, StartCommand, StartOutcome,
+    StartedBeforeReleaseTermination, SystemRuntimeClock, TerminateAcceptedCommand,
     TerminateAcceptedOutcome, TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
 };
 
@@ -926,7 +925,6 @@ impl ConversationActor {
                         command_id,
                         expected_owner: principal.idempotency_owner(),
                         reason: AcceptedTerminationReason::Canceled,
-                        event_payload: cancellation_event(command_id),
                     })
                     .await
                     .map_err(ConversationError::Store)
@@ -1018,7 +1016,6 @@ impl ConversationActor {
                     command_id: target.command_id,
                     expected_owner: target.owner,
                     reason: AcceptedTerminationReason::RevokedBeforeStart,
-                    event_payload: revocation_event(target.command_id),
                 })
                 .await?
             {
@@ -1906,7 +1903,6 @@ async fn execute_command(
                         command_id: accepted.command_id,
                         expected_owner: accepted.owner.clone(),
                         reason: AcceptedTerminationReason::RevokedBeforeStart,
-                        event_payload: revocation_event(accepted.command_id),
                     })
                     .await;
                 let event = if matches!(
@@ -1948,16 +1944,18 @@ async fn execute_command(
             .await;
         return;
     }
-    let started = store
-        .mark_started_with_event(StartCommand {
-            conversation_id: conversation.conversation_id,
-            command_id: accepted.command_id,
-            daemon_boot_id,
-            execution_nonce: execution_nonce.clone(),
-            intent_payload: execution_intent(&conversation, &accepted),
-            event_payload: started_event(accepted.command_id),
-        })
-        .await;
+    let start_input = StartCommand {
+        conversation_id: conversation.conversation_id,
+        command_id: accepted.command_id,
+        daemon_boot_id,
+        execution_nonce: execution_nonce.clone(),
+    };
+    let started = match store.mark_started_with_event(start_input.clone()).await {
+        Err(RuntimeStoreError::CommitOutcomeUnknown {
+            operation: super::store::RuntimeCommitOperation::StartCommand,
+        }) => store.mark_started_with_event(start_input).await,
+        outcome => outcome,
+    };
     drop(start_guard);
     // begin_revoke 只有在 Accepted→Started durable transition 完成后才可继续；
     // 若 revoke CAS 先赢，try_enter 已在上方 fail-closed。
@@ -2023,13 +2021,11 @@ async fn execute_command(
         }
     };
 
-    let execution_events = AbortOnDropTask::new(tokio::spawn(forward_execution_events(
-        command.command_id,
-        turn_id,
-        prepared.events,
-        runner_tx.clone(),
-    )));
-    let _execution_events = execution_events;
+    // Prepared adapters may hand us a bounded receiver before the durable release boundary,
+    // but no event is allowed to reach the actor/store until release has committed and the
+    // cold release capability has been consumed successfully. P3.7 attach will replace this
+    // seam with an explicit durable-ACK channel and terminal join barrier.
+    let execution_events = prepared.events;
     let process = prepared.process;
     let control = prepared.control;
     let release = prepared.release;
@@ -2057,8 +2053,6 @@ async fn execute_command(
                 daemon_boot_id,
                 execution_nonce: execution_nonce.clone(),
                 reason: StartedBeforeReleaseTermination::Canceled,
-                terminal_payload: b"execution canceled before release".to_vec(),
-                event_payload: canceled_before_release_event(command.command_id),
             };
             let event = if terminate_started_before_release_exact(&store, termination).await {
                 RunnerEvent::Finished {
@@ -2092,8 +2086,6 @@ async fn execute_command(
                 daemon_boot_id,
                 execution_nonce: execution_nonce.clone(),
                 reason: StartedBeforeReleaseTermination::Canceled,
-                terminal_payload: b"execution canceled before release".to_vec(),
-                event_payload: canceled_before_release_event(command.command_id),
             };
             let event = if terminate_started_before_release_exact(&store, termination).await {
                 RunnerEvent::Finished {
@@ -2163,8 +2155,6 @@ async fn execute_command(
                 daemon_boot_id,
                 execution_nonce: release_request.execution_nonce.clone(),
                 reason: StartedBeforeReleaseTermination::Canceled,
-                terminal_payload: b"execution canceled before release".to_vec(),
-                event_payload: canceled_before_release_event(command.command_id),
             };
             let event = if terminate_started_before_release_exact(&store, termination).await {
                 RunnerEvent::Finished {
@@ -2211,9 +2201,20 @@ async fn execute_command(
                 return;
             }
         };
-    let completion_future = match release.release(permit).await {
-        Ok(completion) => completion,
+    let (completion_future, _execution_events) = match release.release(permit).await {
+        Ok(completion) => {
+            let forwarder = AbortOnDropTask::new(tokio::spawn(forward_execution_events(
+                command.command_id,
+                turn_id,
+                execution_events,
+                runner_tx.clone(),
+            )));
+            (completion, Some(forwarder))
+        }
         Err(_) => {
+            // Release 未成功消费 cold capability 时，prepared receiver 中即使已有
+            // adapter 预排事件也必须丢弃，不能把未越过 gate 的 approval 持久化。
+            drop(execution_events);
             if cancel_control(control.clone()).await.is_err() {
                 let _ = runner_tx
                     .send(RunnerEvent::RecoveryBlocked {
@@ -2222,13 +2223,12 @@ async fn execute_command(
                     .await;
                 return;
             }
-            Box::pin(async move {
+            let completion: RuntimeCompletionFuture = Box::pin(async move {
                 Ok(RuntimeExecutionCompletion {
-                    terminal_state: TerminalState::Interrupted,
-                    terminal_payload: b"execution release failed after authorization".to_vec(),
-                    event_payload: interrupted_event(command.command_id),
+                    terminal: CommandTerminal::interrupted(),
                 })
-            })
+            });
+            (completion, None)
         }
     };
 
@@ -2245,9 +2245,7 @@ async fn execute_command(
                 return;
             }
             RuntimeExecutionCompletion {
-                terminal_state: TerminalState::Interrupted,
-                terminal_payload: b"execution completion unavailable".to_vec(),
-                event_payload: interrupted_event(command.command_id),
+                terminal: CommandTerminal::interrupted(),
             }
         }
     };
@@ -2255,9 +2253,7 @@ async fn execute_command(
         conversation_id: conversation.conversation_id,
         command_id: command.command_id,
         turn_id,
-        terminal_state: completion.terminal_state,
-        terminal_payload: completion.terminal_payload,
-        event_payload: completion.event_payload,
+        terminal: completion.terminal,
     };
     if !complete_command_with_event_exact(&store, completion).await {
         let _ = runner_tx
@@ -2313,45 +2309,6 @@ fn random_execution_nonce() -> Result<Vec<u8>, getrandom::Error> {
     Ok(nonce)
 }
 
-fn execution_intent(conversation: &ConversationRecord, command: &CommandRecord) -> Vec<u8> {
-    serde_json::to_vec(&json!({
-        "kind": "runtimeExecutionIntent",
-        "version": 1,
-        "conversationId": conversation.conversation_id.to_canonical_string(),
-        "commandId": command.command_id.to_canonical_string(),
-        "commandSeq": command.command_seq,
-    }))
-    .expect("fixed runtime intent is serializable")
-}
-
-fn started_event(command_id: RuntimeId) -> Vec<u8> {
-    fixed_event("commandStarted", command_id)
-}
-
-fn cancellation_event(command_id: RuntimeId) -> Vec<u8> {
-    fixed_event("commandCanceledBeforeStart", command_id)
-}
-
-fn revocation_event(command_id: RuntimeId) -> Vec<u8> {
-    fixed_event("commandRevokedBeforeStart", command_id)
-}
-
-fn interrupted_event(command_id: RuntimeId) -> Vec<u8> {
-    fixed_event("commandInterrupted", command_id)
-}
-
-fn canceled_before_release_event(command_id: RuntimeId) -> Vec<u8> {
-    fixed_event("commandCanceledBeforeRelease", command_id)
-}
-
-fn fixed_event(kind: &str, command_id: RuntimeId) -> Vec<u8> {
-    serde_json::to_vec(&json!({
-        "kind": kind,
-        "commandId": command_id.to_canonical_string(),
-    }))
-    .expect("fixed runtime event is serializable")
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -2359,9 +2316,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex as StdMutex, OnceLock};
 
+    use crate::runtime::store::TerminalState;
     use agentdeck_protocol::{
         ActionDecision, ActionKind, ActionRequest, ActionRequestVendor, AgentKind,
-        CodexApprovalPolicy, CodexSandboxMode,
+        CodexApprovalPolicy, CodexSandboxMode, TurnSummary,
     };
 
     use super::*;
@@ -3029,6 +2987,7 @@ mod tests {
     struct FakeCoordinatorInner {
         held: bool,
         prepare_gate: Option<Arc<Semaphore>>,
+        release_gate: Option<Arc<Semaphore>>,
         behavior: FakeBehavior,
         starts: StdMutex<Vec<StartObservation>>,
         completions: StdMutex<Vec<(RuntimeId, TerminalState)>>,
@@ -3056,6 +3015,7 @@ mod tests {
         cancel_fails: bool,
         panic_prepare: bool,
         emit_approval: bool,
+        block_release: bool,
     }
 
     struct FakeRelease {
@@ -3103,6 +3063,12 @@ mod tests {
                 return Err(RuntimeExecutionError::ReleaseAuthorizationInvalid);
             }
             self.inner.releases.fetch_add(1, Ordering::SeqCst);
+            if let Some(gate) = &self.inner.release_gate {
+                let _permit = gate
+                    .acquire()
+                    .await
+                    .map_err(|_| RuntimeExecutionError::ReleaseFailed)?;
+            }
             if self.inner.behavior.release_error {
                 return Err(RuntimeExecutionError::ReleaseFailed);
             }
@@ -3124,22 +3090,22 @@ mod tests {
                 if inner.behavior.completion_error {
                     return Err(RuntimeExecutionError::CompletionClosed);
                 }
-                let terminal_state = if completion_control.canceled.load(Ordering::SeqCst) {
-                    TerminalState::Canceled
+                let terminal = if completion_control.canceled.load(Ordering::SeqCst) {
+                    CommandTerminal::canceled()
                 } else {
-                    TerminalState::Completed
+                    CommandTerminal::completed(TurnSummary {
+                        total_input_tokens: None,
+                        total_output_tokens: None,
+                        elapsed_ms: 0,
+                    })
                 };
                 inner
                     .completions
                     .lock()
                     .expect("completions lock")
-                    .push((command_id, terminal_state));
+                    .push((command_id, terminal.terminal_state()));
                 inner.changed.notify_waiters();
-                Ok(RuntimeExecutionCompletion {
-                    terminal_state,
-                    terminal_payload: b"fake-result".to_vec(),
-                    event_payload: fixed_event("fakeTerminal", command_id),
-                })
+                Ok(RuntimeExecutionCompletion { terminal })
             }))
         }
     }
@@ -3163,6 +3129,24 @@ mod tests {
                 false,
                 FakeBehavior {
                     emit_approval: true,
+                    ..FakeBehavior::default()
+                },
+            );
+            *fake
+                .inner
+                .approval_delivery
+                .lock()
+                .expect("approval delivery lock") = Some(delivery);
+            fake
+        }
+
+        fn held_with_approval_and_blocked_release(delivery: SharedApprovalDelivery) -> Self {
+            let fake = Self::new(
+                true,
+                false,
+                FakeBehavior {
+                    emit_approval: true,
+                    block_release: true,
                     ..FakeBehavior::default()
                 },
             );
@@ -3205,16 +3189,22 @@ mod tests {
             )
         }
 
-        fn release_error(cancel_fails: bool) -> Self {
-            Self::new(
+        fn release_error_with_approval(delivery: SharedApprovalDelivery) -> Self {
+            let fake = Self::new(
                 false,
                 false,
                 FakeBehavior {
                     release_error: true,
-                    cancel_fails,
+                    emit_approval: true,
                     ..FakeBehavior::default()
                 },
-            )
+            );
+            *fake
+                .inner
+                .approval_delivery
+                .lock()
+                .expect("approval delivery lock") = Some(delivery);
+            fake
         }
 
         fn panicking() -> Self {
@@ -3244,6 +3234,7 @@ mod tests {
                 inner: Arc::new(FakeCoordinatorInner {
                     held,
                     prepare_gate: block_prepare.then(|| Arc::new(Semaphore::new(0))),
+                    release_gate: behavior.block_release.then(|| Arc::new(Semaphore::new(0))),
                     behavior,
                     starts: StdMutex::new(Vec::new()),
                     completions: StdMutex::new(Vec::new()),
@@ -3311,6 +3302,14 @@ mod tests {
                 .prepare_gate
                 .as_ref()
                 .expect("blocked prepare coordinator")
+                .add_permits(1);
+        }
+
+        fn allow_release(&self) {
+            self.inner
+                .release_gate
+                .as_ref()
+                .expect("blocked release coordinator")
                 .add_permits(1);
         }
 
@@ -3495,6 +3494,19 @@ mod tests {
         .expect("approval count reaches expected value");
     }
 
+    fn read_only_approval_count(path: &Path) -> i64 {
+        let connection =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open runtime DB read-only");
+        connection
+            .query_row(
+                "SELECT approval_count FROM runtime_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read approval count")
+    }
+
     fn read_only_approval_id(path: &Path) -> RuntimeId {
         let connection =
             rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -3557,7 +3569,7 @@ mod tests {
         let store = root.open().await;
         finish_recovery(&store).await;
         let conversation = create_conversation(&store, 33).await;
-        let fake = FakeCoordinator::held_with_approval(approval_delivery());
+        let fake = FakeCoordinator::held_with_approval_and_blocked_release(approval_delivery());
         let registry = ConversationRegistry::new(
             store.clone(),
             Arc::new(fake.clone()),
@@ -3590,7 +3602,13 @@ mod tests {
             .await,
         );
         fake.wait_for_starts(1).await;
-
+        wait_until(|| fake.release_count() == 1).await;
+        assert_eq!(
+            read_only_approval_count(&root.0.join("runtime.db")),
+            0,
+            "a prepared adapter event cannot cross the cold-release consumption boundary"
+        );
+        fake.allow_release();
         wait_for_approval_count(&root.0.join("runtime.db"), 1).await;
         assert_eq!(fake.cancel_count(command.command_id), 0);
 
@@ -5795,7 +5813,7 @@ mod tests {
         let store = root.open().await;
         finish_recovery(&store).await;
         let conversation = create_conversation(&store, 11).await;
-        let fake = FakeCoordinator::release_error(false);
+        let fake = FakeCoordinator::release_error_with_approval(approval_delivery());
         let registry = ConversationRegistry::new(
             store.clone(),
             Arc::new(fake.clone()),
@@ -5833,6 +5851,11 @@ mod tests {
         assert_eq!(fake.release_count(), 1);
         assert_eq!(fake.cancel_count(command.command_id), 1);
         assert_eq!(fake.active(), 0);
+        assert_eq!(
+            read_only_approval_count(&root.0.join("runtime.db")),
+            0,
+            "release failure must discard every prepared approval event"
+        );
 
         registry.shutdown().await.expect("shutdown actors");
         store.shutdown().await.expect("shutdown store");

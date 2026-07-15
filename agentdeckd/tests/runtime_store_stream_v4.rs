@@ -1215,8 +1215,6 @@ async fn snapshot_build_pin_allows_frozen_base_while_writer_advances_high_water(
             command_id: command.command_id,
             daemon_boot_id,
             execution_nonce: execution_nonce.clone(),
-            intent_payload: b"snapshot intent".to_vec(),
-            event_payload: b"opaque-started-audit-event".to_vec(),
         })
         .await
         .expect("start command")
@@ -1261,8 +1259,6 @@ async fn snapshot_build_pin_allows_frozen_base_while_writer_advances_high_water(
             daemon_boot_id,
             execution_nonce,
             reason: StartedBeforeReleaseTermination::Canceled,
-            terminal_payload: b"canceled after snapshot capture".to_vec(),
-            event_payload: b"opaque-terminal-audit-event".to_vec(),
         })
         .await
         .expect("advance event high-water to one while snapshot builds");
@@ -1686,8 +1682,6 @@ async fn before_first_snapshot_capability_survives_event_zero_writer_progress() 
             daemon_boot_id: RuntimeId::from_bytes(RuntimeIdKind::DaemonBoot, [0xB3; 16])
                 .expect("daemon boot id"),
             execution_nonce: b"before-first-nonce".to_vec(),
-            intent_payload: b"before-first-intent".to_vec(),
-            event_payload: b"opaque-event-zero".to_vec(),
         })
         .await
         .expect("advance event H to zero");

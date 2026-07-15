@@ -12,7 +12,8 @@ use agentdeck_protocol::{AgentItem, AgentItemMeta};
 use tokio::time::{Duration, timeout};
 
 use crate::runtime::store::{
-    RuntimeBackfillPlan, RuntimeBackfillTarget, RuntimeStoreError, RuntimeStoreLane,
+    AuthorizeExecutionRelease, ExecutionFence, RuntimeBackfillPlan, RuntimeBackfillTarget,
+    RuntimeStoreError, RuntimeStoreLane,
 };
 
 async fn connect_recording(
@@ -42,13 +43,17 @@ fn backfill_envelope(message: &str) -> RuntimeEnvelope {
     }
 }
 
-fn conversation_backfill_envelope(message: &str, conversation_id: RuntimeId) -> RuntimeEnvelope {
+fn conversation_backfill_after_envelope(
+    message: &str,
+    conversation_id: RuntimeId,
+    after: StreamCursor,
+) -> RuntimeEnvelope {
     RuntimeEnvelope {
         version: RUNTIME_PROTOCOL_VERSION,
         message_id: MessageId::new(message),
         body: RuntimeMessage::Request(RuntimeRequest::Backfill(BackfillRequest::Conversation {
             conversation_id: WireConversationId::new(conversation_id.to_canonical_string()),
-            after: StreamCursor::BeforeFirst,
+            after,
         })),
     }
 }
@@ -155,43 +160,69 @@ async fn append_large_snapshot_event(
         crate::runtime::store::AcceptOutcome::Accepted { ref command, .. }
             if command.command_id == command_id
     ));
-    let event = RuntimeEvent::new(
-        WireConversationId::new(conversation_id.to_canonical_string()),
-        agentdeck_protocol::runtime::identity::EventId::new(event_id.to_canonical_string()),
-        0,
-        Some(agentdeck_protocol::runtime::identity::CommandId::new(
-            command_id.to_canonical_string(),
-        )),
-        Some(ItemId::new(format!("large-item-{owner_seed}"))),
-        Some(EntityId::new(format!("large-entity-{owner_seed}"))),
-        RuntimeEventBody::Item {
-            item: AgentItem::AssistantMessage {
-                text: "x".repeat(text_bytes),
-                meta: AgentItemMeta::default(),
-            },
-        },
-    )
-    .expect("construct large canonical snapshot event");
+    let daemon_boot_id =
+        RuntimeId::from_bytes(RuntimeIdKind::DaemonBoot, [owner_seed.wrapping_add(2); 16])
+            .expect("large snapshot daemon boot id");
+    let execution_nonce = vec![owner_seed; 16];
     let started = core
         .store
         .mark_started_with_event(crate::runtime::store::StartCommand {
             conversation_id,
             command_id,
-            daemon_boot_id: RuntimeId::from_bytes(
-                RuntimeIdKind::DaemonBoot,
-                [owner_seed.wrapping_add(2); 16],
-            )
-            .expect("large snapshot daemon boot id"),
-            execution_nonce: vec![owner_seed; 16],
-            intent_payload: b"large snapshot intent".to_vec(),
-            event_payload: serde_json::to_vec(&event).expect("encode large canonical event"),
+            daemon_boot_id,
+            execution_nonce: execution_nonce.clone(),
         })
         .await
-        .expect("commit large canonical snapshot event");
+        .expect("commit canonical TurnStarted");
     assert!(matches!(
         started,
         crate::runtime::store::StartOutcome::Started { ref intent, ref event, .. }
-            if intent.turn_id == turn_id && event.event_id == event_id
+            if intent.turn_id == turn_id
+                && event.event_id == event_id
+                && intent.daemon_boot_id == daemon_boot_id
+                && intent.execution_nonce == execution_nonce
+    ));
+    core.store
+        .persist_execution_fence(ExecutionFence {
+            command_id,
+            daemon_boot_id,
+            execution_nonce: execution_nonce.clone(),
+            process_group_id: i64::from(owner_seed) + 8_000,
+            leader_pid: i64::from(owner_seed) + 8_000,
+            leader_start_time: u64::from(owner_seed) + 8_000,
+            payload: b"large-snapshot-test-fence".to_vec(),
+        })
+        .await
+        .expect("persist large snapshot execution fence");
+    core.store
+        .authorize_execution_release(AuthorizeExecutionRelease {
+            command_id,
+            daemon_boot_id,
+            execution_nonce,
+        })
+        .await
+        .expect("authorize large snapshot execution release");
+    let item_event_id =
+        RuntimeId::from_bytes(RuntimeIdKind::Event, [owner_seed.wrapping_add(3); 16])
+            .expect("large snapshot item event id");
+    assert!(matches!(
+        core.store
+            .append_execution_event(crate::runtime::store::AppendExecutionEvent::item(
+                conversation_id,
+                command_id,
+                turn_id,
+                item_event_id,
+                ItemId::new(format!("large-item-{owner_seed}")),
+                EntityId::new(format!("large-entity-{owner_seed}")),
+                AgentItem::AssistantMessage {
+                    text: "x".repeat(text_bytes),
+                    meta: AgentItemMeta::default(),
+                },
+            ))
+            .await
+            .expect("append large canonical snapshot item"),
+        crate::runtime::store::AppendExecutionEventOutcome::Appended { event }
+            if event.event_id == item_event_id && event.event_seq == 1
     ));
 }
 
@@ -714,7 +745,10 @@ async fn regular_near_limit_backfill_pages_charge_dto_and_payload_in_one_pool() 
 
     let RuntimeBackfillPlan::Pinned(pin) = core
         .store
-        .acquire_backfill_pin(RuntimeBackfillTarget::Conversation(conversation_id), None)
+        .acquire_backfill_pin(
+            RuntimeBackfillTarget::Conversation(conversation_id),
+            Some(0),
+        )
         .await
         .expect("pin regular near-limit backfill")
     else {
@@ -724,14 +758,16 @@ async fn regular_near_limit_backfill_pages_charge_dto_and_payload_in_one_pool() 
     for _ in 0..8 {
         let page = core
             .store
-            .load_event_backfill_page(pin.clone(), None)
+            .load_event_backfill_page(pin.clone(), Some(0))
             .await
             .expect("eight DTO+payload leases fit the shared 128 MiB pool");
         assert_eq!(page.events.len(), 1);
         held.push(page);
     }
     assert!(matches!(
-        core.store.load_event_backfill_page(pin.clone(), None).await,
+        core.store
+            .load_event_backfill_page(pin.clone(), Some(0))
+            .await,
         Err(RuntimeStoreError::WorkerBusy {
             lane: RuntimeStoreLane::Read
         })
@@ -740,7 +776,7 @@ async fn regular_near_limit_backfill_pages_charge_dto_and_payload_in_one_pool() 
     drop(held.pop());
     let replacement = core
         .store
-        .load_event_backfill_page(pin.clone(), None)
+        .load_event_backfill_page(pin.clone(), Some(0))
         .await
         .expect("dropping one slow page returns exactly one combined lease");
     drop(replacement);
@@ -796,7 +832,11 @@ async fn oversized_backfill_payload_holds_exclusive_read_lease_until_flush_and_c
     let (connection, mut receiver) = connect_recording(&core, 0x97).await;
     core.handle_envelope(
         connection,
-        conversation_backfill_envelope("oversized-backfill-flush", conversation_id),
+        conversation_backfill_after_envelope(
+            "oversized-backfill-flush",
+            conversation_id,
+            StreamCursor::At(0),
+        ),
     )
     .await
     .expect("start oversized directed backfill");
@@ -813,7 +853,10 @@ async fn oversized_backfill_payload_holds_exclusive_read_lease_until_flush_and_c
 
     let RuntimeBackfillPlan::Pinned(probe_pin) = core
         .store
-        .acquire_backfill_pin(RuntimeBackfillTarget::Conversation(conversation_id), None)
+        .acquire_backfill_pin(
+            RuntimeBackfillTarget::Conversation(conversation_id),
+            Some(0),
+        )
         .await
         .expect("acquire competing oversized probe pin")
     else {
@@ -821,7 +864,7 @@ async fn oversized_backfill_payload_holds_exclusive_read_lease_until_flush_and_c
     };
     assert!(matches!(
         core.store
-            .load_event_backfill_page(probe_pin.clone(), None)
+            .load_event_backfill_page(probe_pin.clone(), Some(0))
             .await,
         Err(RuntimeStoreError::WorkerBusy {
             lane: RuntimeStoreLane::Read
@@ -860,7 +903,7 @@ async fn oversized_backfill_payload_holds_exclusive_read_lease_until_flush_and_c
 
     let replayed = core
         .store
-        .load_event_backfill_page(probe_pin.clone(), None)
+        .load_event_backfill_page(probe_pin.clone(), Some(0))
         .await
         .expect("final FlushReceipt releases the oversized read lease");
     assert_eq!(replayed.events.len(), 1);
@@ -875,7 +918,11 @@ async fn oversized_backfill_payload_holds_exclusive_read_lease_until_flush_and_c
     let (cancelled_connection, mut cancelled_receiver) = connect_recording(&core, 0x98).await;
     core.handle_envelope(
         cancelled_connection,
-        conversation_backfill_envelope("oversized-backfill-cancel", conversation_id),
+        conversation_backfill_after_envelope(
+            "oversized-backfill-cancel",
+            conversation_id,
+            StreamCursor::At(0),
+        ),
     )
     .await
     .expect("start cancellable oversized backfill");
@@ -889,7 +936,10 @@ async fn oversized_backfill_payload_holds_exclusive_read_lease_until_flush_and_c
     ));
     let RuntimeBackfillPlan::Pinned(cancel_probe) = core
         .store
-        .acquire_backfill_pin(RuntimeBackfillTarget::Conversation(conversation_id), None)
+        .acquire_backfill_pin(
+            RuntimeBackfillTarget::Conversation(conversation_id),
+            Some(0),
+        )
         .await
         .expect("acquire cancellation probe pin")
     else {
@@ -897,7 +947,7 @@ async fn oversized_backfill_payload_holds_exclusive_read_lease_until_flush_and_c
     };
     assert!(matches!(
         core.store
-            .load_event_backfill_page(cancel_probe.clone(), None)
+            .load_event_backfill_page(cancel_probe.clone(), Some(0))
             .await,
         Err(RuntimeStoreError::WorkerBusy {
             lane: RuntimeStoreLane::Read
@@ -912,7 +962,7 @@ async fn oversized_backfill_payload_holds_exclusive_read_lease_until_flush_and_c
     drop(held);
     let replayed = core
         .store
-        .load_event_backfill_page(cancel_probe.clone(), None)
+        .load_event_backfill_page(cancel_probe.clone(), Some(0))
         .await
         .expect("cancellation releases the oversized read lease");
     assert_eq!(replayed.events.len(), 1);
@@ -1340,7 +1390,6 @@ async fn asynchronous_snapshot_failure_emits_a_directed_terminal_failure() {
             reason: crate::runtime::store::AcceptedTerminationReason::Canceled,
             // P3.5 fixed audit bytes are intentionally not a canonical RuntimeEvent;
             // the v4 replay index therefore requires a new snapshot boundary.
-            event_payload: b"noncanonical fixed audit event".to_vec(),
         })
         .await
         .expect("commit noncanonical audit event");
@@ -1418,11 +1467,12 @@ async fn failure_after_flushed_snapshot_fail_closes_the_connection() {
 
     let root = TestRoot::new("subscription-partial-failure-close");
     let command_id = RuntimeId::from_bytes(RuntimeIdKind::Command, [0x51; 16]).expect("command id");
+    let turn_id = RuntimeId::from_bytes(RuntimeIdKind::Turn, [0x53; 16]).expect("turn id");
     let event_id = RuntimeId::from_bytes(RuntimeIdKind::Event, [0x52; 16]).expect("event id");
     let store = RuntimeStoreHandle::open(
         crate::runtime::store::RuntimeStoreConfig::new(root.path.join("runtime.db"))
             .with_command_capacity(1_024)
-            .with_id_source(SequenceIdSource::new([command_id, event_id])),
+            .with_id_source(SequenceIdSource::new([command_id, turn_id, event_id])),
         root.kek(),
     )
     .await
@@ -1482,35 +1532,22 @@ async fn failure_after_flushed_snapshot_fail_closes_the_connection() {
         crate::runtime::store::AcceptOutcome::Accepted { ref command, .. }
             if command.command_id == command_id
     ));
-    let canonical = RuntimeEvent::new(
-        agentdeck_protocol::runtime::identity::ConversationId::new(
-            conversation_id.to_canonical_string(),
-        ),
-        agentdeck_protocol::runtime::identity::EventId::new(event_id.to_canonical_string()),
-        0,
-        Some(agentdeck_protocol::runtime::identity::CommandId::new(
-            command_id.to_canonical_string(),
-        )),
-        None,
-        None,
-        RuntimeEventBody::Error {
-            failure: RuntimeFailure::new(
-                "daemon.command.interrupted",
-                "canonical event after ready snapshot",
-            ),
-        },
-    )
-    .expect("canonical event zero");
-    core.store
-        .terminate_accepted_command(crate::runtime::store::TerminateAcceptedCommand {
+    let started = core
+        .store
+        .mark_started_with_event(crate::runtime::store::StartCommand {
             conversation_id,
             command_id,
-            expected_owner: owner,
-            reason: crate::runtime::store::AcceptedTerminationReason::Canceled,
-            event_payload: serde_json::to_vec(&canonical).expect("encode canonical event"),
+            daemon_boot_id: RuntimeId::from_bytes(RuntimeIdKind::DaemonBoot, [0x54; 16])
+                .expect("daemon boot id"),
+            execution_nonce: b"partial-failure-start".to_vec(),
         })
         .await
-        .expect("commit canonical event after snapshot");
+        .expect("commit canonical TurnStarted after snapshot");
+    assert!(matches!(
+        started,
+        crate::runtime::store::StartOutcome::Started { ref intent, ref event, .. }
+            if intent.turn_id == turn_id && event.event_id == event_id
+    ));
 
     core.handle_envelope(
         connection,
