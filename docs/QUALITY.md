@@ -853,7 +853,7 @@ ReadPool、配额与调度完全不变。
   owner，component test outcome 不能写成 WSS ingress/egress 证据。
 
 P3.1 provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate；P3.7 exec gate 边界、prepare findings、
-fresh 完整门禁与独立终审已收口，但 scoped commit 仍待完成；P3.8/P3.9 UDS 和 P4 remote 尚未完成。
+fresh 完整门禁与独立终审已收口，并由 `5568e93` 完成 scoped commit；P3.8/P3.9 UDS 和 P4 remote 尚未完成。
 因此即使本节全绿，也只能收口 P3.6 component，不得宣称 P3、Companion MVP 或真实跨网链路完成。
 
 ## Relay Companion MVP P3.7 exec-gate 与 production execution 门禁
@@ -1010,8 +1010,8 @@ authoritative item 的行为也要由 schema 行为测试锁定，但不能写�
 该 OAuth flow 的撤销/过期读回证据；因此完整 Git history 的 credential 处置仍是明确 security debt，
 不能用当前树扫描结果宣称历史已清理。
 
-P3.7 主体代码与 translator 终审修复已落到候选树；fresh 完整门禁与独立终审已通过，当前只待 scoped
-commit。P3.1 provisioned signed Keychain 仍外部 BLOCKED；
+P3.7 主体代码与 translator 终审修复已由 `5568e93` 提交；fresh 完整门禁与独立终审已通过。P3.1
+provisioned signed Keychain 仍外部 BLOCKED；
 P3.8/P3.9 UDS、P3.10 LaunchAgent、P4 RemoteLink/E2EE 与 P5/P6 实机证据必须继续保持未完成。
 
 ## AppKit 重写后的验证清单

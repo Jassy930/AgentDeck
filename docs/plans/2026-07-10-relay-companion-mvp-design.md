@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P2.10、P3.5 与 P3.6-A/B/C/D 已完成；P3.7 已裁决采用 cooperative-descendant PGID 边界，current-binary exec-gate、typed driver/durable ACK、PGID fencing、两遍 recovery、prepare 唯一 reaper 与 typed clean/unknown disposition 均已实现；最终完整自动门禁与独立终审已通过，当前只待 scoped commit；前置分片为 `819aa5e`/`1acf8b8`/`3f22cf0`；P3.1 签名 Keychain 仍有 1 项 ignored/BLOCKED，P3.8–P6 仍未完成（2026-07-15） |
+| 状态 | Approved target；P2.10、P3.5 与 P3.6-A/B/C/D 已完成；P3.7 已裁决采用 cooperative-descendant PGID 边界，current-binary exec-gate、typed driver/durable ACK、PGID fencing、两遍 recovery、prepare 唯一 reaper 与 typed clean/unknown disposition 均已实现；最终完整自动门禁与独立终审已通过，并由 `5568e93` 完成 scoped commit；前置分片为 `819aa5e`/`1acf8b8`/`3f22cf0`；P3.1 签名 Keychain 仍有 1 项 ignored/BLOCKED，P3.8–P6 仍未完成（2026-07-15） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-01-agentdeck-mobile-relay-design.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -25,7 +25,7 @@
 approval 与 P3.6 transport-neutral stream component（`694f2d9`）已落地；P3.7 current-binary
 exec-gate/recovery 已实现，cooperative-descendant PGID 边界已裁决；release 前唯一 reaper、调用 Tokio
 `Command::spawn()` 前可证明无 child 的 clean prepare failure，以及从调用 Tokio spawn 起的 unknown
-failure 分类已经修复；最终完整自动门禁与独立终审均已通过，当前只待 scoped commit。
+failure 分类已经修复；最终完整自动门禁与独立终审均已通过，并由 `5568e93` 完成 scoped commit。
 fixture/typed adapter/typed journal 前置分片为 `819aa5e` / `1acf8b8` /
 `3f22cf0`。
 App/CLI singleton UDS、LaunchAgent、P4 Machine identity/E2EE/Relay Publish 和真实 Companion 仍未完成，
@@ -778,8 +778,8 @@ P3.6 的 `TransferStateMachine` 目前没有 production remote ingress owner；P
 - P3.6-C 已由 `694f2d9` 提交 StoreCommitHub、Catalog/Conversation 共用 barrier、paced egress gate、
   authenticated backfill/snapshot、bounded transfer reducer 与 publication freeze/COMMIT/ACK/restart
   状态机；P3.6-D 已由 `b668d8f` 完成独立文档收口。P3.7 exec-gate/recovery 边界已裁决，两个
-  prepare finding 与 translator 阻断项已修复，完整自动门禁与独立终审均已通过，当前只待 scoped
-  commit；整个 P3 也仍因 P3.1
+  prepare finding 与 translator 阻断项已修复，完整自动门禁与独立终审均已通过，并由 `5568e93`
+  完成 scoped commit；整个 P3 也仍因 P3.1
   外部门禁与 P3.8–P3.10 未完成而保持未完成。
 - 已读回的 scoped 证据是 `runtime_stream` 45/45、`runtime_transfer` 17/17、subscription 36/36、
   daemon lib 464/464（`runtime::` 366 项），默认并发 `cargo test -p agentdeckd` exit 0；Swift

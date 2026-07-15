@@ -211,7 +211,7 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（P3.7 exec-gate 门禁已收口，P3 整体未完成）
+## Relay Companion MVP 实施状态（P3.7 exec-gate 已完成，P3 整体未完成）
 
 Relay production binary 已原子切换到 **Relay v2**。公开数据面只接受
 `/v2/connect`、`/v2/pair` 与 enrollment 所需的 `POST /v2/machine-enroll`；
@@ -534,7 +534,7 @@ Codex 与 Claude Code 回归使用当前树内的筛选脱敏真实录制片段�
 
 P3.7 的主体代码、prepare disposition 与 translator 终审修复已经落到候选树；fresh 完整 package、
 all-target check/clippy、schema、Swift、自检、no-net/docs/fmt/diff 门禁均已通过，独立终审 Approved，
-当前只待 scoped commit。production wiring probe 会真实穿过
+并由 `5568e93` 完成 scoped commit。production wiring probe 会真实穿过
 `RuntimeCore/actor → GatedExecutionCoordinator → AgentRouter → current-binary gate → typed driver →`
 durable event ACK → terminal，并在 reopen/backfill 后读回 canonical item 与唯一 terminal。probe 不接受
 binary/root 注入，内部原子创建随机临时目录并 RAII 清理；它使用

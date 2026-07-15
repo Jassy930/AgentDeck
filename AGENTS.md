@@ -10,7 +10,7 @@
 4. `docs/index.md`：文档记录系统导航。
 5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code（含 CC adapter failure codes）。
 6. `docs/QUALITY.md`：验证命令、质量门禁和文档结构检查（含 v0.2 手动 QA 清单）。
-7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单。P2.10、P3.5、P3.6-A/B/C/D 已完成；P3.7 已裁决采用 cooperative-descendant PGID 边界，主体实现、prepare 唯一 reaper、typed clean/unknown disposition、fresh 完整门禁与独立终审均已完成，现只待 scoped commit。fixture / typed adapter prepare / typed execution journal 的前置提交为 `819aa5e` / `1acf8b8` / `3f22cf0`。真实 provisioned signed Keychain roundtrip 仍有 1 项 ignored 且 gated BLOCKED，P3.8/P3.9 singleton UDS、P3.10 LaunchAgent、P4 remote owner/E2EE、P5/P6 客户端与实机证据仍未完成，因此不得宣称 P3.1/P3、远程 Companion 或整个方案完成。
+7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单。P2.10、P3.5、P3.6-A/B/C/D 已完成；P3.7 已裁决采用 cooperative-descendant PGID 边界，主体实现、prepare 唯一 reaper、typed clean/unknown disposition、fresh 完整门禁与独立终审均已完成，并由 `5568e93` 完成 scoped commit。fixture / typed adapter prepare / typed execution journal 的前置提交为 `819aa5e` / `1acf8b8` / `3f22cf0`。真实 provisioned signed Keychain roundtrip 仍有 1 项 ignored 且 gated BLOCKED，P3.8/P3.9 singleton UDS、P3.10 LaunchAgent、P4 remote owner/E2EE、P5/P6 客户端与实机证据仍未完成，因此不得宣称 P3.1/P3、远程 Companion 或整个方案完成。
 8. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
 
 ## 项目边界
@@ -263,8 +263,8 @@ per-connection gate 到 flush ACK/cancel；同 target 被新 generation 取代�
 
 P3.6 不执行真实 E2EE seal、MachineDataSign、Keychain CounterGuard 或 Relay Publish，
 transfer/publication 也尚无 production remote owner；Simulator fixture 不是远程链路。P3.7 exec gate
-已完成 fresh 完整门禁和独立终审，仍待 scoped commit；P3.8/P3.9 UDS、P3.10 LaunchAgent 与 P4 remote
-仍是后续任务。
+已完成 fresh 完整门禁、独立终审与 `5568e93` scoped commit；P3.8/P3.9 UDS、P3.10 LaunchAgent 与 P4
+remote 仍是后续任务。
 
 ### Relay Companion MVP P3.7（exec-gate + typed production execution）
 
