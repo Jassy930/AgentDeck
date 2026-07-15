@@ -847,6 +847,50 @@ fn approval_permissions_are_explicit_and_fail_closed_per_operation() {
 }
 
 #[test]
+fn verified_local_control_has_fixed_approval_permissions_and_cannot_upgrade_a_lease() {
+    let issuer = PrincipalIssuer::local_only([0xC9; 32]);
+    let control = issuer
+        .issue_verified_local_control(501, [4; 16])
+        .expect("issue verified local-control principal");
+    let approval = control
+        .try_enter_approval()
+        .expect("local-control approval capability");
+    approval
+        .require_resolve()
+        .expect("local-control resolve permission");
+    approval
+        .require_retry()
+        .expect("local-control retry permission");
+    drop(approval);
+
+    let reconnect = issuer
+        .issue_verified_local_control(501, [4; 16])
+        .expect("reconnect reuses local-control identity");
+    assert_eq!(
+        reconnect.idempotency_owner(),
+        control.idempotency_owner(),
+        "stable installation identity must preserve the idempotency owner across reconnects"
+    );
+
+    assert!(matches!(
+        issuer.issue_verified_local(501, [4; 16]),
+        Err(PrincipalAccessError::PermissionConflict)
+    ));
+
+    let read_only = issuer
+        .issue_verified_local(501, [5; 16])
+        .expect("issue verified read-only local principal");
+    assert!(matches!(
+        read_only.try_enter_approval(),
+        Err(PrincipalAccessError::PermissionDenied)
+    ));
+    assert!(matches!(
+        issuer.issue_verified_local_control(501, [5; 16]),
+        Err(PrincipalAccessError::PermissionConflict)
+    ));
+}
+
+#[test]
 fn verified_remote_can_resolve_without_an_is_local_shortcut() {
     let issuer = PrincipalIssuer::local_only([0xC5; 32]);
     let remote = issuer
@@ -996,6 +1040,35 @@ async fn dropped_unacknowledged_transport_write_removes_registry_entry() {
         Err(ConnectionError::NotFound)
     ));
     assert_eq!(registry.active_writer_count(), 0);
+}
+
+#[tokio::test]
+async fn connection_write_exposes_shared_bytes_and_observes_core_side_cancellation() {
+    let registry = Arc::new(ConnectionRegistry::new(1, 8));
+    let (tx, mut rx) = mpsc::channel(1);
+    let id = registry
+        .connect(principal(27), ConnectionSink::new(tx))
+        .expect("connect cancellable writer");
+    registry
+        .try_enqueue(id, EncodedRuntimeFrame::from_bytes(&b"shared"[..]))
+        .expect("enqueue cancellable write");
+    let mut write = rx.recv().await.expect("transport write");
+    let shared = write.shared_bytes();
+    assert_eq!(shared.as_ref(), b"shared");
+
+    let disconnect = tokio::spawn({
+        let registry = registry.clone();
+        async move { registry.disconnect(id).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), write.cancelled())
+        .await
+        .expect("writer must observe ACK receiver cancellation");
+    disconnect
+        .await
+        .expect("join disconnect")
+        .expect("disconnect writer");
+    assert_eq!(write.acknowledge(), Err(ConnectionError::Lagged));
+    assert_eq!(shared.as_ref(), b"shared", "shared bytes outlive the write");
 }
 
 #[tokio::test]

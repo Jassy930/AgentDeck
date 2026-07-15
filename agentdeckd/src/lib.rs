@@ -13,6 +13,7 @@ pub mod config;
 pub mod diag;
 pub mod exec_gate;
 pub mod ipc;
+pub mod local;
 pub mod record;
 pub mod runtime;
 pub mod security;

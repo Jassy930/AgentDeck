@@ -33,7 +33,9 @@ AgentDeck 不做 IDE，不做通用多 agent 聊天界面，不是 Codex Desktop
 │  agentdeckd (Rust daemon)                                       │
 │  RuntimeHub（admin/read stdio compatibility）                   │
 │       └─ production 拒绝 SessionStart / SessionContinue          │
-│  RuntimeCore（exec-gate 已就绪；本地入口待 P3.8/P3.9）            │
+│  local::unix（accepted stream；production bind 待 P3.8-B）       │
+│       └─ same-EUID → preface → RuntimeEnvelope v1              │
+│  RuntimeCore（exec-gate + local connection actor 已就绪）        │
 │       └─→ AgentRouter（按 conversation.agentKind 路由）           │
 │            ├─ CodexAdapter      (capabilities = {...})          │
 │            └─ ClaudeCodeAdapter (capabilities = {...})          │
@@ -54,6 +56,7 @@ agentdeckd
 - `Sources/AgentDeck/`：macOS 原生 UI、会话模型、历史回放和本地交互。UI 只能通过 `CapabilityRouter` 消费 `SessionCapabilities` 决定渲染路径，禁止直接读 vendor 字段或硬编码 `if agentKind == .codex` 分支。
 - `agentdeck-protocol/`：IPC 协议事实源 crate。分 trunk / capabilities / vendor / transport 四个模块，`PROTOCOL_VERSION` = 2，`protocol_schema()` 聚合所有 v2 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
+- `agentdeckd/src/local/`：本地 Runtime v1 framing、same-EUID peer gate 与每连接 Unix actor。P3.8-A 不拥有 pathname bind；secure bind/readback/permit 与 stdio compatibility 属于 P3.8-B。
 - `agentdeckd/src/agent.rs`：`Agent` trait + `AgentKind` 枚举。两个 adapter 共享的逻辑在此，不得让 adapter 相互引用。
 - `agentdeckd/src/runtime/`：`RuntimeHub`（stdin loop + stdout writer）+ `AgentRouter`（sessionId → agentKind → adapter）。
 - `agentdeckd/src/codex/`：Codex app-server adapter。Codex vendor JSON、方法名和 schema 翻译只能留在此子模块。
@@ -111,7 +114,7 @@ conversation/key，不能伪造身份连续性。
 本节只记录 v1 探索期约束；相关协议、server/client 与生产路径已在 P2.9 物理删除，
 不得据此实现兼容或启动当前 Relay。
 
-- **R1a-1**：`agentdeckd` 依赖树无 `tokio net` 或 `axum`——保证 daemon 至 R2 前始终无网络代码；guard `scripts/check-daemon-no-net.sh`
+- **R1a-1**：历史阶段要求 `agentdeckd` 依赖树无 `tokio net` 或 `axum`。P3.8-A 为本机 UDS 启用 Tokio `net` 后，该约束已由用途感知的 `scripts/check-daemon-network-boundary.sh` 取代；旧 no-net guard 已删除，仍禁止 TCP/UDP/HTTP/WSS server/client 栈。
 - **R1a-2**：`agentdeck-cli` 依赖树无 `axum`——CLI 只走 WS client 不做 server
 - **R1a-3**：net/axum 仅限 `agentdeck-relay` 的 `server` feature + `agentdeck-relay-client` crate
 - **R1a-4**：`relay` 数据目录独立于 daemon/CLI，只存不透明数据 + 公钥材料 + credential 哈希（**不**存明文 credential）
@@ -404,8 +407,8 @@ conversation/key，不能伪造身份连续性。
 - P2.10 hardening/security suites 以真实 Store/Core/server 证明跨重启逐字节 replay、gap、
   quota、disk-low、fault、drain/shutdown、撤销/退役和多 sentinel 密文扫描；Relay 可见
   outer/response、tracing、health/ready/metrics HTTP surface 与 SQLite DB/WAL 均不得出现
-  应用明文。`scripts/check-daemon-no-net.sh` 继续守护
-  `agentdeckd` 无网络依赖，P2.10 不越界声称 daemon/iOS 已接入。
+  应用明文。P2.10 当时由 no-net guard 守护；P3.8-A 后统一由 network-boundary guard 只放行
+  `agentdeckd/src/local/` 的本机 UDS，P2.10 仍不越界声称 daemon/iOS 已接入远程链路。
 
 ### Relay Companion MVP P3.1 daemon ownership 与 StorageKEK 边界
 
@@ -532,8 +535,9 @@ conversation/key，不能伪造身份连续性。
   也不是 purge authorization。P4 trust-reset 必须用 Relay/admin-signed receipt 独立验证 old
   route/root fingerprint；不得仅凭该表执行远端删除。
 - P3.2/P3.3 只建立并验证 store + adapter private boundary；P3.4 已由 RuntimeCore actor 把
-  Runtime v1 的 Start/SendPrompt/cancel/query 接入，但当前 compatibility `RuntimeHub` 与 App/CLI
-  尚未迁到 singleton UDS，因此本节仍不是本地/远程端到端可用声明。
+  Runtime v1 的 Start/SendPrompt/cancel/query 接入，P3.8-A 又增加已 accept stream 的 UDS actor；
+  production secure bind、bootstrap 与 App/CLI 默认连接仍分别待 P3.8-B/P3.9，因此本节仍不是
+  stable singleton 或远程端到端可用声明。
 
 ### Relay Companion MVP P3.4 RuntimeCore 不变量
 
@@ -569,6 +573,28 @@ conversation/key，不能伪造身份连续性。
   actor start lease，之后才公开 Draining；因此 Draining 可见后 durable Started 不再增长。普通
   production 构造固定使用 current-binary exec-gate coordinator；disabled/fake coordinator 只允许
   side-effect-free contract tests，不得用 fake PID/fence 把 Accepted 伪装成真实执行。
+
+### Relay Companion MVP P3.8-A 本地传输原语不变量
+
+- kernel peer credential 必须在读取任何 client byte 前验证为 same effective UID。随后唯一允许的
+  local preface 是 strict JSONL `localProtocolVersion=1 + clientInstallationId`；UUID 必须 canonical
+  lowercase、non-nil，JSON payload 最多 4,095 bytes。installation ID 只进入审计/幂等 owner，不是认证。
+- Runtime JSONL payload 固定 `<1 MiB`。reader 先 strict probe 顶层 `version/messageId/body(raw)`：
+  header 可信但 outer version 错误时以同 messageId flush typed mismatch 后关闭；malformed、重复字段、
+  incomplete 或 exact-cap frame 零回复关闭。首帧非 `Request::Hello` 同样 typed close；Hello 内层版本仍
+  进入 RuntimeCore，不能由 transport 猜测结果。
+- same-EUID UDS 只能通过显式 local-control issuer 获得固定 `ResolveAndRetry` approval grant；read-only
+  local issuer 仍为 `None`。同一完整 identity 已建立不同 grant 的 lease 时返回 PermissionConflict，
+  请求处理不得使用 `is_local()` 临时升级。
+- 每条已 accept stream 各有 reader/writer。`ConnectionWrite` 提供共享 encoded bytes 与 ACK receiver
+  drop cancellation；writer 固定竞争 `write+flush` 和 Core cancellation，只有实际 flush 成功才 ACK。
+  当前连接断开只回收自己的 subscription/job/pin/writer，不关闭 RuntimeCore 或 sibling connection。
+  A 阶段调用方必须把 connection actor poll/join 到正常清理完成，不能任意 abort 后依赖 detached cleanup。
+- P3.8-A 没有 pathname listener/bind API，也不能生成 `LocalReadyPermit`/`RemoteStartPermit`。production
+  secure bind、inode readback、permit 链和启动/关闭顺序只能由 P3.8-B 在 RecoveryReadyPermit 后建立。
+  P3.8-B listener supervisor 必须实现 graceful cancel + join，再关闭 RuntimeCore。
+  network guard 只允许 `src/local/` 使用 Tokio Unix transport，精确保留 exec-gate 私有 socketpair，
+  并继续禁止 daemon TCP/UDP/HTTP/WSS stack 与 vendor adapter transport import。
 
 ### Relay Companion MVP P3.5 approval 不变量
 
@@ -763,8 +789,8 @@ conversation/key，不能伪造身份连续性。
   不能升级为 RecoveryBlocked；只有 gate identity 或同组清理结果不确定时才 fail-close。
 - `RecoveryBlocked` lifecycle CAS 对 Accepted 绑定 exact command；对 Started 绑定 exact
   command/turn/boot/nonce 与 compact fence（process identity、release time、payload length/SHA-256），
-  不在内存复制完整 fence payload。recovery 完成才产生不可构造的 `RecoveryReadyPermit`；P3.8 仍不得
-  在该 permit 之前 bind UDS。
+  不在内存复制完整 fence payload。recovery 完成才产生不可构造的 `RecoveryReadyPermit`；P3.8-A
+  只提供 accepted-stream actor，P3.8-B 仍不得在该 permit 之前 bind UDS。
 - debug-only production wiring probe 由真实 daemon binary 内部调用 `spawn_current`，不接受 binary/root
   注入；它原子创建并 RAII 清理随机临时目录，用 `/bin/sh` 无副作用 helper 贯穿
   Core/actor→coordinator→current-binary gate→typed driver→durable ACK→terminal，并在 reopen/backfill
@@ -786,8 +812,9 @@ Swift UI
 daemon main
   -> config → namespace / singleton → KeyStore / StorageKEK
   -> ipc（re-export agentdeck-protocol）
+  -> P3.8-A local accepted-stream actor（production secure bind/readiness 待 P3.8-B）
   -> RuntimeCore → StoreCommitHub / subscription / snapshot
-  -> P3.7 exec-gate / typed driver（local RuntimeEnvelope ingress 待 P3.8/P3.9）
+  -> P3.7 exec-gate / typed driver（RuntimeEnvelope ingress 原语已接通，App/CLI cutover 待 P3.9）
   -> transport-neutral P3.6 component → transfer / publication（production owner 待 P4）
   -> AgentRouter → CodexAdapter / ClaudeCodeAdapter
   -> record / diag

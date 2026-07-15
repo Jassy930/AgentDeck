@@ -451,6 +451,23 @@ impl PrincipalIssuer {
         )
     }
 
+    /// 只供完成 same-EUID peer credential 验证的本地控制面签发。
+    /// installation identity 只参与审计与幂等命名空间，不是认证凭据。
+    pub(crate) fn issue_verified_local_control(
+        &self,
+        uid: u32,
+        client_installation_id: [u8; 16],
+    ) -> Result<AuthenticatedPrincipal, PrincipalAccessError> {
+        self.issue(
+            PrincipalIdentity::Local {
+                machine_trust_domain: self.machine_trust_domain,
+                uid,
+                client_installation_id,
+            },
+            ApprovalPermissionGrant::ResolveAndRetry,
+        )
+    }
+
     #[allow(dead_code)] // P3.5 Core principal issuance 接线后调用。
     pub(crate) fn issue_verified_local_with_approval_permissions(
         &self,
@@ -593,6 +610,32 @@ impl ConnectionWrite {
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// 返回可与 `cancelled` 的可变借用并行使用的共享 encoded frame。
+    #[must_use]
+    pub fn shared_bytes(&self) -> Arc<[u8]> {
+        self.bytes.clone()
+    }
+
+    /// 等待 Core 侧 ACK receiver 被 drop。transport 应把这个 future 与实际
+    /// write+flush 竞争；取消获胜时关闭当前连接且不得 ACK。
+    pub async fn cancelled(&mut self) {
+        if let Some(acknowledged) = self.acknowledged.as_mut() {
+            acknowledged.closed().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_transport_test(bytes: impl Into<Arc<[u8]>>) -> (Self, oneshot::Receiver<()>) {
+        let (acknowledged, acknowledgement) = oneshot::channel();
+        (
+            Self {
+                bytes: bytes.into(),
+                acknowledged: Some(acknowledged),
+            },
+            acknowledgement,
+        )
     }
 
     pub fn acknowledge(mut self) -> Result<(), ConnectionError> {

@@ -10,7 +10,7 @@
 4. `docs/index.md`：文档记录系统导航。
 5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code（含 CC adapter failure codes）。
 6. `docs/QUALITY.md`：验证命令、质量门禁和文档结构检查（含 v0.2 手动 QA 清单）。
-7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单。P2.10、P3.5、P3.6-A/B/C/D 已完成；P3.7 已裁决采用 cooperative-descendant PGID 边界，主体实现、prepare 唯一 reaper、typed clean/unknown disposition、fresh 完整门禁与独立终审均已完成，并由 `5568e93` 完成主体 scoped commit、`c9d2146` / `5713be4` 补齐真实 release 前取消门禁、内部故障 gate bookkeeping 与 sentinel leader 退出窗口。fixture / typed adapter prepare / typed execution journal 的前置提交为 `819aa5e` / `1acf8b8` / `3f22cf0`。真实 provisioned signed Keychain roundtrip 仍有 1 项 ignored 且 gated BLOCKED，P3.8/P3.9 singleton UDS、P3.10 LaunchAgent、P4 remote owner/E2EE、P5/P6 客户端与实机证据仍未完成，因此不得宣称 P3.1/P3、远程 Companion 或整个方案完成。
+7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单。P2.10、P3.5、P3.6-A/B/C/D 已完成；P3.7 已裁决采用 cooperative-descendant PGID 边界，主体实现、prepare 唯一 reaper、typed clean/unknown disposition、fresh 完整门禁与独立终审均已完成，并由 `5568e93` 完成主体 scoped commit、`c9d2146` / `5713be4` 补齐真实 release 前取消门禁、内部故障 gate bookkeeping 与 sentinel leader 退出窗口。P3.8-A 已接入 same-EUID/preface/RuntimeEnvelope accepted-stream actor、显式 local-control principal、writer cancellation 与用途感知 network guard；production secure bind/permit 仍属于 P3.8-B，App/CLI 默认 UDS 属于 P3.9。真实 provisioned signed Keychain roundtrip 仍有 1 项 ignored 且 gated BLOCKED，P3.10 LaunchAgent、P4 remote owner/E2EE、P5/P6 客户端与实机证据仍未完成，因此不得宣称 P3.1/P3、远程 Companion 或整个方案完成。
 8. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
 
 ## 项目边界
@@ -111,8 +111,8 @@ cargo run -p agentdeck-relay --features server,tls -- \
   --storage "$relay_selfcheck_dir/relay.db"
 rm -rf "$relay_selfcheck_dir"
 
-# daemon 仍无网络依赖
-bash scripts/check-daemon-no-net.sh
+# daemon 只允许 local UDS；仍禁止 TCP/UDP/HTTP/WSS stack
+bash scripts/check-daemon-network-boundary.sh
 ```
 
 真实外部 Direct TLS/SPKI synthetic 由本机 admin UDS 先生成一次性 bundle，再执行：
@@ -139,7 +139,7 @@ cargo test -p agentdeckd
 cargo test -p agentdeck-cli
 swift test
 cargo run -q -p agentdeck-cli -- selfcheck
-bash scripts/check-daemon-no-net.sh
+bash scripts/check-daemon-network-boundary.sh
 ```
 
 unsigned 开发实例必须显式使用 `--ephemeral --no-remote --profile dev`；stable daemon
@@ -161,7 +161,7 @@ cargo test -p agentdeckd \
   --test runtime_store_shutdown \
   -- --test-threads=1
 cargo test -p agentdeckd
-bash scripts/check-daemon-no-net.sh
+bash scripts/check-daemon-network-boundary.sh
 ```
 
 P3.2 必须保持 caller-owned stable conversation/adapter IDs、全部事务精确重试、24h TTL、
@@ -184,7 +184,7 @@ AGENTDECK_E2E=1 cargo test -p agentdeckd --test codex_adapter_shape \
   real_codex_canonical_start_binds_private_state_then_emits_capabilities -- --exact
 AGENTDECK_E2E=1 cargo test -p agentdeckd --test cc_adapter_shape \
   real_claude_streams_at_least_one_assistant_or_turn_complete -- --exact
-bash scripts/check-daemon-no-net.sh
+bash scripts/check-daemon-network-boundary.sh
 ```
 
 P3.3 必须证明 common catalog 只接受 canonical typed `ConversationDescriptor`，未知 vendor
@@ -206,7 +206,7 @@ cargo test -p agentdeckd --test runtime_core --test runtime_store_p34 -- --test-
 cargo test -p agentdeck-protocol -- --test-threads=1
 swift test --filter RuntimeV1ProtocolTests
 cargo test -p agentdeckd
-bash scripts/check-daemon-no-net.sh
+bash scripts/check-daemon-network-boundary.sh
 ```
 
 P3.4 的 Start 必须与首 prompt 分离，并由 StorageKEK 域分离 capability 生成跨重启稳定 ID；
@@ -243,7 +243,7 @@ cargo run -q -p agentdeck-cli -- protocol schema \
 cargo test -p agentdeckd
 cargo fmt --all -- --check
 cargo clippy -p agentdeckd --all-targets -- -D warnings
-bash scripts/check-daemon-no-net.sh
+bash scripts/check-daemon-network-boundary.sh
 git diff --check
 scripts/verify-agent-docs.sh
 ```
@@ -263,8 +263,9 @@ per-connection gate 到 flush ACK/cancel；同 target 被新 generation 取代�
 
 P3.6 不执行真实 E2EE seal、MachineDataSign、Keychain CounterGuard 或 Relay Publish，
 transfer/publication 也尚无 production remote owner；Simulator fixture 不是远程链路。P3.7 exec gate
-已完成 fresh 完整门禁、独立终审、`5568e93` 主体提交与 `c9d2146` / `5713be4` 取消边界补充；P3.8/P3.9 UDS、P3.10 LaunchAgent 与 P4
-remote 仍是后续任务。
+已完成 fresh 完整门禁、独立终审、`5568e93` 主体提交与 `c9d2146` / `5713be4` 取消边界补充；
+P3.8-A 只接入 accepted-stream primitives，P3.8-B secure bind/permit、P3.9 App/CLI cutover、
+P3.10 LaunchAgent 与 P4 remote 仍是后续任务。
 
 ### Relay Companion MVP P3.7（exec-gate + typed production execution）
 
@@ -285,7 +286,7 @@ cargo test -p agentdeckd --lib -- --test-threads=1
 cargo test -p agentdeckd --tests -- --test-threads=1
 cargo fmt --all -- --check
 cargo clippy -p agentdeckd --all-targets -- -D warnings
-bash scripts/check-daemon-no-net.sh
+bash scripts/check-daemon-network-boundary.sh
 git diff --check
 scripts/verify-agent-docs.sh
 ```
@@ -314,6 +315,30 @@ tool 未建模，以及 permission profile 为空/过大时必须 fail-close；�
 file action。Codex permission summary 必须展示 response builder 同一 validator 接受的完整 profile，
 但字段值使用脱敏投影，response builder 仍回送已验证的原始字段值；approval route/output Debug 不得
 展开 raw params。
+
+### Relay Companion MVP P3.8-A（local Runtime UDS transport primitives）
+
+```bash
+cargo test -p agentdeckd --lib local::framing -- --test-threads=1
+cargo test -p agentdeckd --lib local::peer -- --test-threads=1
+cargo test -p agentdeckd --lib local::unix -- --test-threads=1
+cargo test -p agentdeckd --test local_uds -- --test-threads=1
+cargo test -p agentdeckd
+cargo fmt --all -- --check
+cargo clippy -p agentdeckd --all-targets -- -D warnings
+bash scripts/check-daemon-network-boundary.sh
+scripts/verify-agent-docs.sh
+git diff --check
+```
+
+same effective UID 必须先于任何 client read；preface 只含版本与 canonical non-nil installation UUID。
+Runtime frame 固定 `<1 MiB`，outer version mismatch 只在 header 可信时保留 messageId 并 typed close；
+malformed/duplicate/incomplete/exact-cap 零回复。首帧必须 Hello，inner mismatch 仍由 Core 返回。
+local-control grant 固定 `ResolveAndRetry`，不得以 `is_local()` 提权。writer 只有 socket write+flush 成功
+才 ACK，并把该过程与 Core cancellation 竞争。`local_uds` 必须使用测试自己持有的真实 listener；
+P3.8-A 不得暴露 production bind、`LocalReadyPermit` 或 `RemoteStartPermit`。旧 no-net 脚本已由
+`check-daemon-network-boundary.sh` 替换并删除。A 阶段 connection actor 必须被 poll/join；
+P3.8-B supervisor 必须 graceful cancel + join，禁止用 detached cleanup 掩盖任意 task abort。
 
 ## 浏览与外部资料
 

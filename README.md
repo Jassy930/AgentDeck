@@ -240,8 +240,9 @@ Relay，严格校验 CA/hostname/SPKI，并以临时 machine/device key 完成 e
 challenge 鉴权、InstallGrant、register/publish/subscribe replay、Send/Reply、signed revoke
 以及终态重连验证。测试同时扫描 SQLite/outer wire，证明应用 sentinel 只以真实 AEAD 密文
 存在。这个命令不会建立持久配对；P4 完成前，`remote pair/machines/sessions/watch/send/...`
-统一返回 typed `remote.persistent.unsupported`。`agentdeckd` 仍由 no-net guard 保证不含
-网络依赖，因此 P2.10 不能被描述为 daemon/iOS Companion 已经接通。
+统一返回 typed `remote.persistent.unsupported`。`agentdeckd` 当前只放行 same-UID local UDS，
+network-boundary guard 仍禁止 TCP/UDP/HTTP/WSS stack，因此 P2.10 不能被描述为 daemon/iOS
+Companion 已经接通。
 
 P2.10 的完整安全/故障门禁覆盖真实 Direct TLS/SPKI 链路、跨重启逐字节 replay、gap、
 quota、disk-low、fault injection、shutdown、撤销/退役和多 sentinel 持久化扫描。统一验证入口：
@@ -480,7 +481,7 @@ App/CLI 仍未迁到 singleton UDS，RemoteLink 也没有 production owner，因
 
 当前 P3.6 组件门禁已确认 `runtime_stream` 45/45、`runtime_transfer` 17/17、subscription
 36/36、daemon lib 464/464（其中 `runtime::` 366 项）、默认并发 `cargo test -p agentdeckd` exit 0，
-Swift 256 XCTest + 35 Swift Testing，以及 protocol/schema、fmt、clippy、daemon no-net 和 diff gate
+Swift 256 XCTest + 35 Swift Testing，以及 protocol/schema、fmt、clippy、daemon network-boundary 和 diff gate
 全通过。真实签名 Keychain roundtrip 仍有 1 项 ignored/BLOCKED，ignored 不计 PASS。
 
 为让默认并发门禁在 macOS soft FD limit 256 下稳定复现业务行为，test-only admission 将每个 unit/
@@ -671,7 +672,7 @@ swift test        # app: 中立协议 + 分行成帧 + headless 请求编码
 # P3.1 聚焦门禁
 cargo test -p agentdeckd --test daemon_namespace --test storage_kek \
   --test daemon_startup -- --test-threads=1
-bash scripts/check-daemon-no-net.sh
+bash scripts/check-daemon-network-boundary.sh
 ```
 
 ### 门控 E2E 测试

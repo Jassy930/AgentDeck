@@ -112,7 +112,7 @@ run_common_rust_gates() {
   run_gate 'agentdeck-relay server,tls complete matrix' \
     cargo test -p agentdeck-relay --features server,tls --locked
   run_gate 'agentdeck-relay v2 config selfcheck' verify_relay_selfcheck
-  run_gate 'daemon no-net guard' bash scripts/check-daemon-no-net.sh
+  run_gate 'daemon network boundary guard' bash scripts/check-daemon-network-boundary.sh
   run_gate 'four protocol schema snapshots' verify_schema_snapshots
   run_gate 'agent docs gate' scripts/verify-agent-docs.sh
   run_gate 'agentdeck-relay-data git-status guard' verify_relay_data_not_in_status

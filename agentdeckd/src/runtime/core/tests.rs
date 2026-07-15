@@ -192,6 +192,45 @@ async fn connect_local_with_approval_permissions(
         .expect("connect approval principal")
 }
 
+#[tokio::test]
+async fn runtime_core_issues_explicit_local_control_without_upgrading_read_only_identity() {
+    let root = TestRoot::new("local-control-principal");
+    let core = core(&root).await;
+
+    let control = core
+        .issue_verified_local_control_principal(501, [0x21; 16])
+        .expect("issue local-control principal");
+    let approval = control
+        .try_enter_approval()
+        .expect("local-control approval capability");
+    approval
+        .require_resolve()
+        .expect("local-control resolve permission");
+    approval
+        .require_retry()
+        .expect("local-control retry permission");
+    drop(approval);
+    assert!(
+        core.issue_verified_local_principal(501, [0x21; 16])
+            .is_err(),
+        "a local-control lease cannot be downgraded to read-only"
+    );
+
+    let read_only = core
+        .issue_verified_local_principal(501, [0x22; 16])
+        .expect("issue read-only local principal");
+    assert!(matches!(
+        read_only.try_enter_approval(),
+        Err(crate::runtime::connection::PrincipalAccessError::PermissionDenied)
+    ));
+    assert!(
+        core.issue_verified_local_control_principal(501, [0x22; 16])
+            .is_err(),
+        "a read-only lease cannot be upgraded to local-control"
+    );
+    core.shutdown().await.expect("shutdown cold core");
+}
+
 fn synthetic_wire_id(kind: RuntimeIdKind, seed: u8) -> String {
     RuntimeId::from_bytes(kind, [seed; 16])
         .expect("synthetic runtime id")
@@ -614,6 +653,63 @@ async fn enqueue_writes_a_complete_runtime_envelope() {
         }))
     ));
     write.acknowledge().expect("ack transport write");
+    core.shutdown().await.expect("shutdown core");
+}
+
+#[tokio::test]
+async fn core_disconnect_cancels_only_the_slow_writer_and_rejects_ack_after_cancel() {
+    // 威胁场景：一条 UDS socket write 永久阻塞时，Core fail-close 若不能被 transport
+    // 观察，会让该连接继续持有 frame/byte budget；取消必须只命中该连接，不能伤及 sibling。
+    let root = TestRoot::new("disconnect-cancels-slow-writer");
+    let core = core(&root).await;
+    core.recover().await.expect("recover");
+    let (slow_tx, mut slow_rx) = mpsc::channel::<crate::runtime::ConnectionWrite>(1);
+    let slow = core
+        .connect(
+            core.issue_verified_local_principal(501, [0x31; 16])
+                .expect("issue slow principal"),
+            ConnectionSink::new(slow_tx),
+        )
+        .expect("connect slow writer");
+    let (sibling_tx, mut sibling_rx) = mpsc::channel::<crate::runtime::ConnectionWrite>(1);
+    let sibling = core
+        .connect(
+            core.issue_verified_local_principal(501, [0x32; 16])
+                .expect("issue sibling principal"),
+            ConnectionSink::new(sibling_tx),
+        )
+        .expect("connect sibling writer");
+    let envelope = RuntimeEnvelope {
+        version: RUNTIME_PROTOCOL_VERSION,
+        message_id: MessageId::new("message-core-writer-cancellation"),
+        body: RuntimeMessage::Reply(RuntimeReply::Hello(HelloParams {
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+        })),
+    };
+
+    core.enqueue(slow, &envelope).expect("enqueue slow write");
+    let mut slow_write = slow_rx.recv().await.expect("slow transport write");
+    let disconnect = tokio::spawn({
+        let core = core.clone();
+        async move { core.disconnect(slow).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), slow_write.cancelled())
+        .await
+        .expect("Core disconnect must cancel the slow transport write");
+    disconnect.await.expect("join slow disconnect");
+    assert!(
+        slow_write.acknowledge().is_err(),
+        "ACK after cancel must fail"
+    );
+
+    core.enqueue(sibling, &envelope)
+        .expect("sibling remains connected");
+    sibling_rx
+        .recv()
+        .await
+        .expect("sibling transport write")
+        .acknowledge()
+        .expect("ACK sibling write");
     core.shutdown().await.expect("shutdown core");
 }
 

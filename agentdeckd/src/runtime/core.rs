@@ -207,6 +207,18 @@ impl RuntimeCore {
             .map_err(RuntimeCoreError::from)
     }
 
+    /// 只允许 UDS peer credential 已验证为 same effective UID 后由本地控制面调用。
+    /// 与 read-only issuer 分离，禁止请求处理路径按 `is_local()` 临时升级权限。
+    pub(crate) fn issue_verified_local_control_principal(
+        &self,
+        uid: u32,
+        client_installation_id: [u8; 16],
+    ) -> Result<AuthenticatedPrincipal, RuntimeCoreError> {
+        self.principal_issuer
+            .issue_verified_local_control(uid, client_installation_id)
+            .map_err(RuntimeCoreError::from)
+    }
+
     /// 连接只接收不可伪造的认证 capability；raw route/uid 字段不是本接口输入。
     pub fn connect(
         &self,

@@ -23,10 +23,10 @@ hmac = "0.12"
 libc = "0.2"
 rusqlite = { version = "0.32", features = ["blob", "bundled", "limits"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "process", "io-util", "time", "io-std", "signal"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "process", "io-util", "time", "io-std", "signal", "net"] }
 uuid = { version = "1", features = ["v4"] }
 # Used by claude_code adapter preflight (spec § 5.8 cc-not-installed
 # check). Kept as a runtime dep — also re-exported for tests via the

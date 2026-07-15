@@ -1435,11 +1435,11 @@ approval 继续只使用 P3.5 的 exact transient `BoundApprovalDelivery`；不�
 
 ### Task P3.8：接入 RuntimeEnvelope v1 UDS 与 stdio compatibility
 
-**契约已冻结，代码未开始（2026-07-15）：** 编码前审查确认 5 个 blocking gap：稳定
-`clientInstallationId` 无 transport 来源、strict `RuntimeEnvelope` decode 让真实 JSON version mismatch
-无法 typed reply、same-UID principal 没有 approval capability、慢 socket writer 看不到 Core cancellation、
-计划引用的 `RemoteStartPermit` 不存在。另确认 admin-only stdio 仍放行三条 legacy control，以及旧 guard
-会误杀 P3.7 私有 socketpair。按设计 §8.2.1 分成两个独立全绿提交，任一切片接近 2,000 行即停止复核范围。
+**阶段状态（2026-07-15）：** P3.8-A 已完成 accepted-stream transport primitives、显式
+local-control principal、真实 backpressure cancellation 与用途感知 network guard；两轮独立终审无剩余
+P0/P1/P2。fresh `cargo test -p agentdeckd`（lib 629/629、全部 integration/doc tests）、clippy/fmt、
+真实 UDS 4/4、network/docs/diff 均通过。production secure bind、permit 链、stdio allowlist 与 bootstrap
+仍只属于 P3.8-B，尚未实现；P3.1 provisioned signed Keychain 外部门禁继续 BLOCKED。
 
 #### Task P3.8-A：transport primitives、local-control principal 与精确 network guard
 
@@ -1453,27 +1453,27 @@ approval 继续只使用 P3.5 的 exact transient `BoundApprovalDelivery`；不�
 - Modify: `ARCHITECTURE.md`, `docs/QUALITY.md`, `AGENTS.md`
 - Delete: `scripts/check-daemon-no-net.sh`
 
-- [ ] Step 1: 先写 RED tests。覆盖 same-EUID 必须先于 preface read；strict
+- [x] Step 1: 先写 RED tests。覆盖 same-EUID 必须先于 preface read；strict
   `LocalClientPrefaceV1` 的 canonical non-nil UUID、4 KiB bound、reconnect owner 稳定；wrong envelope
   version flush 一条同 messageId typed failure 后 EOF，malformed/duplicate/oversize 零 reply；首帧必须
   Hello，inner mismatch 仍走 Core typed reply；exact 1 MiB 拒绝。覆盖显式 local-control
   `ResolveAndRetry`、read-only local 无 approval、lease permission conflict；`ConnectionWrite` shared bytes、
   Core abort cancellation、ACK-after-cancel、慢 writer 与 sibling 隔离；真实 UDS 两连接、disconnect 不停 Core。
-- [ ] Step 2: 运行 `cargo test -p agentdeckd --test local_uds`、connection/core focused tests 与新 guard。
+- [x] Step 2: 运行 `cargo test -p agentdeckd --test local_uds`、connection/core focused tests 与新 guard。
   Expected: FAIL，local module、Tokio net、writer cancellation 与 guard 尚不存在。
-- [ ] Step 3: 最小实现 bounded JSONL framing、header-first version probe、same-UID peer gate、首帧 Hello、
+- [x] Step 3: 最小实现 bounded JSONL framing、header-first version probe、same-UID peer gate、首帧 Hello、
   per-connection reader/writer、local-control issuer 与 ConnectionWrite cancellation。所有 socket write/flush
   成功后才 ACK；Core cancellation 获胜时只关当前连接。A 只实现已 accept/已验证 stream 的 connection
   actor；pathname listener 只能由 `cfg(test)` fixture/测试直接持有的 Tokio listener 提供，不得暴露
   production `bind(path)`。production secure bind 与唯一 permit constructor 全部留到 B，确保 A 自身不
   产生 recovery 前可达的 listener。
-- [ ] Step 4: 实现 source/path guard：pathname Tokio Unix 只允许 `src/local/`；std Unix socketpair 只精确
+- [x] Step 4: 实现 source/path guard：pathname Tokio Unix 只允许 `src/local/`；std Unix socketpair 只精确
   allowlist `exec_gate.rs`、`exec_gate/parent.rs` 与 execution test pair；全 daemon 禁 TCP/UDP/WSS/
   reqwest/axum/hyper server/tungstenite；同时检查 Cargo dependency tree 中的 banned crates/features，
   不能只靠 source grep。更新 verifier，删除旧 guard。
-- [ ] Step 5: 跑 local/connection/core tests、daemon package、fmt/clippy、new guard、docs/diff；至少对一条
+- [x] Step 5: 跑 local/connection/core tests、daemon package、fmt/clippy、new guard、docs/diff；至少对一条
   真实本机 UDS Hello + request/reply 样本读回，不以 synthetic codec 单测代替。
-- [ ] Step 6: 独立 spec/security review 后精确暂存本切片并提交
+- [x] Step 6: 独立 spec/security review 后精确暂存本切片并提交
   `feat(local): 建立 RuntimeEnvelope UDS 传输原语`；禁止目录级 `git add agentdeckd`，不 push。
 
 #### Task P3.8-B：production bootstrap、RemoteStartPermit 与 stdio 收窄

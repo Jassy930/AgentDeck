@@ -137,5 +137,5 @@ bash scripts/verify-relay-companion-mvp.sh p2
 ```
 
 该门禁包含 workspace Rust 回归、Relay v2 hardening/security E2E、client、Direct TLS
-selfcheck、daemon no-net、四份 schema 快照、文档与运行数据 git-status guard。R0/R1
+selfcheck、daemon network-boundary、四份 schema 快照、文档与运行数据 git-status guard。R0/R1
 命令和 `--bootstrap-secret` 只属于历史记录，不得用于当前部署或验收。

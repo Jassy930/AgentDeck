@@ -429,7 +429,7 @@ sentinel；出现应用明文、key、签名或 enrollment code 均是安全回�
 
 P2.10 hardening suite 还必须证明 restart byte-identical replay、retention gap、quota、
 disk-low、Store fault 与 deterministic shutdown；`agentdeckd` 同时继续通过
-`scripts/check-daemon-no-net.sh`。这些证据只收口 Relay，不代表 daemon/iOS Companion
+`scripts/check-daemon-network-boundary.sh`。这些证据只收口 Relay，不代表 daemon/iOS Companion
 持久链路已经完成。
 
 ## Daemon namespace / singleton / StorageKEK 诊断（Companion MVP P3.1）

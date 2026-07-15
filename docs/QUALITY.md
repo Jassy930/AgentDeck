@@ -34,7 +34,7 @@ bash scripts/tests/reset-relay-v1-dev-state.sh
 ```
 
 统一入口依次覆盖完整 Cargo、Relay v2 server+TLS 全矩阵、v2 配置自检、Swift、
-iOS Simulator、daemon no-net、文档与四份协议 schema snapshot，并检查
+iOS Simulator、daemon network-boundary、文档与四份协议 schema snapshot，并检查
 `agentdeck-relay-data/` 不出现在 `git status --short`。真实 vendor、公网 WSS 和
 物理 iPhone 仍是后续 gated E2E，不属于 P0 通过声明。
 
@@ -326,7 +326,7 @@ cargo clippy -p agentdeck-relay --features server,tls --lib --no-deps -- -D warn
   -A clippy::collapsible-if -A clippy::doc-lazy-continuation
 RUSTDOCFLAGS="-D warnings" cargo doc -p agentdeck-relay --features server,tls --no-deps
 cargo fmt --all --check
-bash scripts/check-daemon-no-net.sh
+bash scripts/check-daemon-network-boundary.sh
 bash scripts/verify-agent-docs.sh
 git diff --check
 ```
@@ -400,7 +400,7 @@ cargo clippy -p agentdeck-relay --features server,tls --lib --no-deps -- -D warn
   -A clippy::collapsible-if -A clippy::doc-lazy-continuation
 RUSTDOCFLAGS="-D warnings" cargo doc -p agentdeck-relay --features server,tls --no-deps
 cargo fmt --all --check
-bash scripts/check-daemon-no-net.sh
+bash scripts/check-daemon-network-boundary.sh
 bash scripts/verify-agent-docs.sh
 git diff --check
 ```
@@ -458,7 +458,7 @@ bash scripts/verify-relay-companion-mvp.sh p2
 
 入口会运行完整 workspace、`agentdeck-relay --features server,tls` 全矩阵、两个阶段级
 组合测试、outbound client、真实 CLI DirectTLS/SPKI synthetic、Relay v2 config selfcheck、
-daemon no-net、四份 schema、文档门禁、依赖边界与 v1 生产符号扫描。完整故障矩阵由以下
+daemon network-boundary、四份 schema、文档门禁、依赖边界与 v1 生产符号扫描。完整故障矩阵由以下
 测试共同承担，不能把新建的单个 hardening 文件写成全部证据：
 
 - `relay_v2_store`：COMMIT 前回滚、COMMIT 后响应丢失的逐字节重试、restart、quota、gap、disk-low。
@@ -503,7 +503,7 @@ cargo run -p agentdeckd -- --ephemeral --no-remote --profile dev --selfcheck
 
 # 边界与静态质量
 cargo fmt --all --check
-bash scripts/check-daemon-no-net.sh
+bash scripts/check-daemon-network-boundary.sh
 git diff --check
 scripts/verify-agent-docs.sh
 ```
@@ -560,7 +560,7 @@ AGENTDECK_E2E=1 cargo test -p agentdeckd --test cc_adapter_shape \
 
 # daemon crate 回归与静态边界
 cargo test -p agentdeckd
-bash scripts/check-daemon-no-net.sh
+bash scripts/check-daemon-network-boundary.sh
 cargo fmt --all -- --check
 cargo clippy -p agentdeckd --all-targets --no-deps -- \
   -A clippy::collapsible_if -A clippy::collapsible_str_replace \
@@ -648,7 +648,7 @@ cargo clippy -p agentdeckd --all-targets -- -D warnings \
   -A clippy::doc-lazy-continuation
 
 cargo fmt --all -- --check
-bash scripts/check-daemon-no-net.sh
+bash scripts/check-daemon-network-boundary.sh
 git diff --check
 scripts/verify-agent-docs.sh
 ```
@@ -713,7 +713,7 @@ cargo clippy -p agentdeckd --all-targets -- -D warnings \
   -A clippy::collapsible-str-replace -A clippy::derivable-impls \
   -A clippy::unwrap-or-default -A clippy::needless-borrows-for-generic-args \
   -A clippy::doc-lazy-continuation
-bash scripts/check-daemon-no-net.sh
+bash scripts/check-daemon-network-boundary.sh
 git diff --check
 scripts/verify-agent-docs.sh
 ```
@@ -782,7 +782,7 @@ cargo test -p agentdeckd
 # 静态边界与文档
 cargo fmt --all -- --check
 cargo clippy -p agentdeckd --all-targets -- -D warnings
-bash scripts/check-daemon-no-net.sh
+bash scripts/check-daemon-network-boundary.sh
 git diff --check
 scripts/verify-agent-docs.sh
 ```
@@ -791,7 +791,7 @@ scripts/verify-agent-docs.sh
 `runtime_stream` 45/45、`runtime_transfer` 17/17、subscription 串行门禁 36/36、daemon lib
 464/464（`runtime::` filter 366 项）均通过；默认并发 `cargo test -p agentdeckd` 已读回 exit 0。
 Swift 为 256 XCTest + 35 Swift Testing；`agentdeck-protocol`、CLI protocol schema diff、fmt、
-clippy `-D warnings`、daemon no-net 与 `git diff --check` 全通过。真实 codesigned Keychain
+clippy `-D warnings`、daemon network-boundary 与 `git diff --check` 全通过。真实 codesigned Keychain
 roundtrip 仍有 1 项 ignored/BLOCKED；ignored 不计 PASS，也不影响“P3.6 component 已收口、P3.1
 仍未完成”的分层结论。
 
@@ -912,7 +912,7 @@ cargo fmt --all -- --check
 cargo clippy -p agentdeckd --all-targets -- -D warnings
 cargo run -q -p agentdeck-cli -- protocol schema \
   | diff - protocol/agentdeck/agentdeck-protocol.schema.json
-bash scripts/check-daemon-no-net.sh
+bash scripts/check-daemon-network-boundary.sh
 cargo run -p agentdeckd -- --ephemeral --no-remote </dev/null
 swift test
 git diff --check
@@ -1019,7 +1019,57 @@ authoritative item 的行为也要由 schema 行为测试锁定，但不能写�
 P3.7 主体代码与 translator 终审修复已由 `5568e93` 提交，真实 release 前取消与 sentinel 退出窗口
 补充由 `c9d2146` / `5713be4` 提交；fresh 完整门禁与独立终审已通过。P3.1
 provisioned signed Keychain 仍外部 BLOCKED；
-P3.8/P3.9 UDS、P3.10 LaunchAgent、P4 RemoteLink/E2EE 与 P5/P6 实机证据必须继续保持未完成。
+P3.8-A 只增加 accepted-stream UDS transport primitives；production secure bind/permit 属于 P3.8-B，
+App/CLI 默认 UDS 属于 P3.9。P3.10 LaunchAgent、P4 RemoteLink/E2EE 与 P5/P6 实机证据也必须继续保持未完成。
+
+## Relay Companion MVP P3.8-A local Runtime UDS transport primitives 门禁
+
+本门禁防御的具体场景是：其他 UID、错误版本、超长/歧义 JSON 或慢 socket 在本地控制面获得权限、
+拖住 Core budget，或把单连接故障扩散到 sibling。P3.8-A 只验证测试 listener accept 后的连接 actor，
+不证明 production pathname bind、stable daemon readiness、App/CLI cutover 或 RemoteLink 已完成。
+
+```bash
+# strict preface/header/framing 与 kernel peer gate
+cargo test -p agentdeckd --lib local::framing -- --test-threads=1
+cargo test -p agentdeckd --lib local::peer -- --test-threads=1
+cargo test -p agentdeckd --lib local::unix -- --test-threads=1
+
+# 显式 local-control grant、ConnectionWrite cancellation 与 sibling isolation
+cargo test -p agentdeckd --lib \
+  verified_local_control_has_fixed_approval_permissions_and_cannot_upgrade_a_lease \
+  -- --test-threads=1
+cargo test -p agentdeckd --lib \
+  connection_write_exposes_shared_bytes_and_observes_core_side_cancellation \
+  -- --test-threads=1
+cargo test -p agentdeckd --lib \
+  core_disconnect_cancels_only_the_slow_writer_and_rejects_ack_after_cancel \
+  -- --test-threads=1
+
+# 真实本机 Tokio UDS：双连接、Hello reply、typed close、exact-cap 零回复
+cargo test -p agentdeckd --test local_uds -- --test-threads=1
+
+# 完整回归与用途感知 network boundary
+cargo test -p agentdeckd
+cargo fmt --all -- --check
+cargo clippy -p agentdeckd --all-targets -- -D warnings
+bash scripts/check-daemon-network-boundary.sh
+scripts/verify-agent-docs.sh
+git diff --check
+```
+
+same-EUID 必须先于 preface 的任何 read；preface payload 最多 4,095 bytes，只含版本与 canonical non-nil
+installation UUID。Runtime frame 固定 `<1 MiB`；可信 header 的 outer version mismatch 必须保留原
+messageId 并 flush typed failure 后 EOF，malformed/duplicate/incomplete/exact-cap 零回复关闭。首帧只允许
+`Request::Hello`，inner version mismatch 仍由 Core 给普通 typed reply。
+
+UDS principal 只能经显式 local-control issuer 获得 `ResolveAndRetry`，read-only issuer 仍为 `None`，
+同 identity 不得静默换 grant。transport writer 必须把共享 bytes 的 `write+flush` 与
+`ConnectionWrite::cancelled()` 竞争；取消获胜不得 ACK，单连接 EOF/lag 不能停止 Core 或 sibling。
+真实 UDS test listener 由测试直接持有；`agentdeckd/src/local/` 在本阶段不得提供 production bind。
+P3.8-A 调用方必须 poll/join connection actor，不能用 arbitrary task abort 制造无 owner 的异步收割；
+P3.8-B listener supervisor 必须用 graceful cancel + join 收口所有连接后再 shutdown Core。
+新 guard 检查 daemon normal dependency tree 与 source allowlist：只放行本机 Unix transport 和 P3.7
+私有 socketpair，仍禁止 TCP/UDP/HTTP/WSS stack；旧 no-net 脚本已由该入口替换并删除。
 
 ## AppKit 重写后的验证清单
 
@@ -1137,12 +1187,13 @@ cargo install cargo-llvm-cov
 | agentdeck-protocol 类型变更 | `cargo test`（漂移测试自动运行）；若漂移测试失败须先重新生成快照（见下） |
 | 参考客户端 CLI（agentdeck-cli）、Transport、Client | `cargo test -p agentdeck-cli`；再跑完整 `cargo test` |
 | Relay Companion MVP P0 基线或 v1 reset | 迭代时跑 `bash scripts/tests/reset-relay-v1-dev-state.sh`；提交前跑一次 `bash scripts/verify-relay-companion-mvp.sh p0` |
-| Relay Companion MVP P3.1 daemon namespace / singleton / StorageKEK | 运行本页 P3.1 聚焦矩阵、`cargo test -p agentdeckd`、CLI/Swift transport tests、daemon no-net；stable Keychain 必须另有真实 provisioned signed helper 证据，ignored 不算通过 |
-| Relay Companion MVP P3.2/P3.3 Runtime SQLite / journal / adapter 私表 | 运行本页十四组 store/boundary tests（含真实 256 MiB、paged recovery 与 v1→v2 migration）、canonical router/双 adapter tests、默认并发 `cargo test -p agentdeckd`、daemon no-net、fmt/clippy/diff/docs；只证明组件，不冒充 RuntimeCore/UDS/Companion E2E |
-| Relay Companion MVP P3.4 RuntimeCore / principal / actor | 运行本页 P3.4 Core+Store+Rust/Swift contract 矩阵、100 路 Start 竞态、daemon 全回归、no-net/fmt/clippy/diff/docs；该历史阶段用 disabled coordinator，只证明 Core contract，不能替代 P3.7 exec-gate 或 P3.8/P3.9 UDS E2E |
+| Relay Companion MVP P3.1 daemon namespace / singleton / StorageKEK | 运行本页 P3.1 聚焦矩阵、`cargo test -p agentdeckd`、CLI/Swift transport tests、daemon network-boundary；stable Keychain 必须另有真实 provisioned signed helper 证据，ignored 不算通过 |
+| Relay Companion MVP P3.2/P3.3 Runtime SQLite / journal / adapter 私表 | 运行本页十四组 store/boundary tests（含真实 256 MiB、paged recovery 与 v1→v2 migration）、canonical router/双 adapter tests、默认并发 `cargo test -p agentdeckd`、daemon network-boundary、fmt/clippy/diff/docs；只证明组件，不冒充 RuntimeCore/UDS/Companion E2E |
+| Relay Companion MVP P3.4 RuntimeCore / principal / actor | 运行本页 P3.4 Core+Store+Rust/Swift contract 矩阵、100 路 Start 竞态、daemon 全回归、network-boundary/fmt/clippy/diff/docs；该历史阶段用 disabled coordinator，只证明 Core contract，不能替代 P3.7 exec-gate 或 P3.8/P3.9 UDS E2E |
 | Relay Companion MVP P3.5 approval CAS / delivery | 运行本页 P3.5 固定 16 项聚合 gate，并以 private schema/sqlite/store/permission/worker/actor fault tests 作为行为证据；补跑 adapter shape、Rust/Swift contract、daemon 全回归与静态边界。P3.5/legacy CC Approval 隐藏；P3.7 canonical typed builder 的 recorded fixture 也不冒充 live vendor E2E |
-| Relay Companion MVP P3.6 canonical stream / snapshot / transfer | 运行本页 P3.6 Rust/Swift contract、`runtime_stream`、`runtime_transfer`、store v4/read-pool/snapshot、daemon-private `runtime::` 与完整 daemon 回归；补跑 fmt/no-net/diff/docs。fake sealed publication 只证明状态机，不冒充 P4 E2EE/Relay Publish、UDS 或 Companion E2E |
-| Relay Companion MVP P3.7 exec-gate / typed production execution | 运行本页 prepare disposition、gate/recovery/driver/typed fixture/production wiring 矩阵、完整 daemon package、clippy/fmt/no-net/schema/docs/diff；固定 PATH、私有 FD、唯一 reaper、cooperative-descendant PGID fencing、COMMIT-unknown 与 reopen/backfill 必须有行为证据。显式自守护/逃逸不受支持，helper/fixture 不冒充 live vendor approval、UDS 或实机 E2E |
+| Relay Companion MVP P3.6 canonical stream / snapshot / transfer | 运行本页 P3.6 Rust/Swift contract、`runtime_stream`、`runtime_transfer`、store v4/read-pool/snapshot、daemon-private `runtime::` 与完整 daemon 回归；补跑 fmt/network-boundary/diff/docs。fake sealed publication 只证明状态机，不冒充 P4 E2EE/Relay Publish、UDS 或 Companion E2E |
+| Relay Companion MVP P3.7 exec-gate / typed production execution | 运行本页 prepare disposition、gate/recovery/driver/typed fixture/production wiring 矩阵、完整 daemon package、clippy/fmt/network-boundary/schema/docs/diff；固定 PATH、私有 FD、唯一 reaper、cooperative-descendant PGID fencing、COMMIT-unknown 与 reopen/backfill 必须有行为证据。显式自守护/逃逸不受支持，helper/fixture 不冒充 live vendor approval、UDS 或实机 E2E |
+| Relay Companion MVP P3.8-A local Runtime UDS primitives | 运行本页 framing/peer、local-control/cancellation、真实双连接 `local_uds`、完整 daemon、fmt/clippy/network-boundary/docs/diff；只证明 accepted stream actor，不冒充 P3.8-B secure bind/permit、P3.9 App/CLI cutover 或 remote E2E |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试
