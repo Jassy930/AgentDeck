@@ -395,9 +395,9 @@ transport-neutral `RuntimeCore` 与 production UDS framing 当前使用 Runtime 
 冻结 additive configuration/metadata/upgrade DTO，A1a2 main cutover 与真实 v1/schema v4 reader
 分别由 `c28a968` / `c36a4f9` 收口；`ef830cd` 又证明 Runtime v1 TBS 签发的 persisted cert/grant、
 control grant/revocation/retirement 与 enrollment Link/Data cert 均在 v2 verifier 写 Store 前拒绝。
-Swift 共享层已由 `bea4c13` / `3e019ed` 完成 configuration/metadata/upgrade/receipt 与
-catalog/strict vendor-panel/canonical event 的 v2 strict mirror；snapshot/backfill、outer codec/current
-facade 和真实 UDS Swift readback 仍属于 A2b2/A2c，因此这里不宣称 App/UDS client 已 cutover。
+Swift 共享层已由 `bea4c13` / `3e019ed` / `0dd58de` 完成 configuration/metadata/upgrade/receipt、
+catalog/strict vendor-panel/canonical event 与 snapshot/backfill 的 v2 strict mirror；outer codec/current
+facade、98-fixture 全量和真实 UDS Swift readback 仍属于 A2c，因此这里不宣称 App/UDS client 已 cutover。
 已落地的纯幂等 Start、显式
 CancelQueued/CancelActive 与精确 QueryReceipt 接到 Runtime journal。Start 不再携带首 prompt；
 相同 owner+start key 由 StorageKEK 域分离 capability 稳定派生，跨重启返回同一
@@ -557,8 +557,8 @@ durable event ACK → terminal，并在 reopen/backfill 后读回 canonical item
 binary/root 注入，内部原子创建随机临时目录并 RAII 清理；它使用
 `/bin/sh` 无副作用 helper，不替代真实 Codex/Claude Code 登录、真实 approval 或 P6 跨设备证据。
 P3.8-B production UDS/bootstrap 已由 `1e7f9ea` / `459f32a` 完成；P3.9-C0-A1 Runtime v2 Rust
-cutover 与旧签名材料拒绝门禁已完成，A2a/A2b1 Swift v2 strict mirror 也已由 `bea4c13` / `3e019ed`
-收口；但 A2b2/A2c、App/CLI 默认 UDS cutover、P3.10 LaunchAgent、
+cutover 与旧签名材料拒绝门禁已完成，A2a/A2b Swift v2 strict mirror 也已由 `bea4c13` / `3e019ed` /
+`0dd58de` 收口；但 A2c、App/CLI 默认 UDS cutover、P3.10 LaunchAgent、
 P4 RemoteLink、P5/P6 客户端与实机证据仍未完成；
 P3.1 provisioned signed Keychain roundtrip 也仍是外部 BLOCKED gate。
 具体命令与资源矩阵见 [docs/QUALITY.md](docs/QUALITY.md)。

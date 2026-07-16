@@ -1751,7 +1751,7 @@ P3.9 固定以下迁移边界：
     `RuntimeV2FlattenedPayload`、真实 discriminator round-trip、distinct 17-row error 与 success revision
     正向 ingress/egress；spec/quality 两路终审均 Approved。source 1,313 行 + tests 675 行，低于但接近
     2,000 行刹车线，A2a 不再扩 scope。
-  - [ ] **A2b stream projection types（重估约 1,750–2,250 行，预拆两片）：** 首次源码/测试映射证明
+  - [x] **A2b stream projection types（实际分片 1,252 + 871 行）：** 首次源码/测试映射证明
     catalog/event/vendor-panel 与 snapshot/backfill/compat gate 合并后可能越过 2,000 行刹车，故在落代码前
     拆为 A2b1/A2b2；两片仍共同完成原 A2b 范围，不删行为门禁。
     - [x] **A2b1 catalog + strict vendor-panel + event（实际 1,252 行）：** Catalog reply
@@ -1770,7 +1770,7 @@ P3.9 固定以下迁移边界：
       flattened egress 假绿后补齐 exact round-trip；spec/quality 终审均 Approved，quality 的 3 个非阻断
       P2（CC 非空 optional、`toolUseId` 命名、Removed unknown）亦已最小收口。完整 Swift 275 XCTest +
       35 Swift Testing、iOS 20/20、docs/diff gate 全绿；本片不代表 snapshot/backfill 或 App/UDS cutover。
-    - [ ] **A2b2 snapshot + backfill + compatibility gate（约 850–1,100 行）：** Snapshot 必须非空、
+    - [x] **A2b2 snapshot + backfill + compatibility gate（实际 871 行）：** Snapshot 必须非空、
       capabilities first 且恰好一次，configuration 非空时 agent 必须匹配。Backfill 是
       after-exclusive/through-inclusive 的 1…512 连续范围，拒绝第 513 entry、空/非连续 range、delta/event
       sequence 或 conversation scope 不匹配、bare encoded bytes `>64 MiB`；standalone/flattened 双向共用
@@ -1782,7 +1782,14 @@ P3.9 固定以下迁移边界：
       `RuntimeAdapterStateKeyV1CompatibilityKind` exact token 为 2、
       `RuntimeAdapterStateKeyV1Compatibility` exact token 为 6，且 compatibility tests 以外其他 Swift source
       为 0；不能因整文件排除而漏过旧 public alias。提交前运行 focused A2b2 tests、完整 `swift test`、
-      既定 iOS XcodeGen + `xcodebuild test`、docs/diff gate并独立复审；任何 0-test filter 不算通过。
+      既定 iOS XcodeGen + `xcodebuild test`、docs/diff gate并独立复审；任何 0-test filter 不算通过。commit
+      `0dd58de`；先由 current Rust serializer 1/1 证明 98-line fixture 与生成器 byte-identical（35,090 bytes，
+      SHA-256 `664133f65474cbdefc6c46d59d64e90d92107c528e678af44f7adb711e2fb6a8`），再选三条
+      snapshot/backfill payload 做 Swift readback。TDD compile-red→focused 7/7 green；production 270 行、
+      compatibility rename 11 additions/7 deletions、tests 590 行，共 871 additions，低于 2,000 行刹车线。
+      spec/quality 终审 Approved；source gate 扫描范围与 2/6 token 分段定位两个 P2 已复核 Closed。
+      frozen v1 compatibility 26/26、完整 Swift 282 XCTest + 35 Swift Testing、iOS 20/20、docs/diff 全绿。
+      A2b complete；outer/current codec 与真实 UDS Swift readback 仍只属于 A2c。
   - [ ] **A2c outer/codec/current gate（约 1,150–1,400 行）：** request/reply/message/stream/envelope、
     JSON/UDS 700 KiB × 94 parts、compact 3.5 MiB × 64 parts、共同 64 MiB 与 `ADRT1` carrier version 2；
     Catalog request `pageCursor` 必须 present、可为 null；`ttlSecs` missing 固定默认 300、显式 null 拒绝；
