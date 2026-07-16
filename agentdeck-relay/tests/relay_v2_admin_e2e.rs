@@ -6,12 +6,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agentdeck_crypto::{SigningKey, VerifyingKey, sha256, sign_tbs};
+use agentdeck_crypto::{SignatureBytes, SigningKey, VerifyingKey, sha256, sign_tbs, verify_tbs};
 use agentdeck_protocol::relay_v2::{
     CertRole, Ed25519Signature, EnrollmentCode, LinkGeneration, MachineEnrollmentRequestV1,
     MachineEnrollmentResponseV1, MachineRouteId, PublicKeyBytes, RelayServerId, RootKeyId,
     SignedCertificate, TrustEpoch,
 };
+use agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION;
 use agentdeck_relay::config::{
     RelayV2AdminConfig, RelayV2ServerConfig, RelayV2StoreSettings, RelayV2TlsPaths,
     RelayV2TransportMode,
@@ -34,6 +35,7 @@ use tokio_rustls::TlsConnector;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const TEST_CERT_PEM: &[u8] = include_bytes!("fixtures/test_cert.pem");
+const LEGACY_RUNTIME_PROTOCOL_VERSION: u16 = 1;
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -193,6 +195,39 @@ fn signed_certificate(
     )
     .into();
     certificate
+}
+
+fn replace_with_runtime_v1_signature(
+    root: &SigningKey,
+    server: RelayServerId,
+    route: MachineRouteId,
+    certificate: &mut SignedCertificate,
+) {
+    let root_fingerprint = sha256(&root.verifying_key().to_bytes());
+    let current_tbs = certificate.to_be_signed_v1(server, route, root_fingerprint);
+    assert_eq!(
+        current_tbs.runtime_protocol_version, RUNTIME_PROTOCOL_VERSION,
+        "production certificate builder must use the current Runtime contract"
+    );
+    let current_signature = SignatureBytes::from(certificate.signature);
+    verify_tbs(&root.verifying_key(), &current_tbs, &current_signature)
+        .expect("current certificate signature verifies against current TBS");
+
+    let mut legacy_tbs = current_tbs.clone();
+    legacy_tbs.runtime_protocol_version = LEGACY_RUNTIME_PROTOCOL_VERSION;
+    assert_ne!(legacy_tbs, current_tbs);
+    assert!(
+        verify_tbs(&root.verifying_key(), &legacy_tbs, &current_signature).is_err(),
+        "current signature must not verify against the Runtime v1 TBS"
+    );
+    let legacy_signature = sign_tbs(root, &legacy_tbs);
+    verify_tbs(&root.verifying_key(), &legacy_tbs, &legacy_signature)
+        .expect("Runtime v1 certificate signature verifies against legacy TBS");
+    assert!(
+        verify_tbs(&root.verifying_key(), &current_tbs, &legacy_signature).is_err(),
+        "Runtime v1 signature must not verify against the current TBS"
+    );
+    certificate.signature = legacy_signature.into();
 }
 
 fn enrollment_request(
@@ -587,6 +622,63 @@ async fn admin_uds_and_tls_enrollment_are_one_shot_exact_and_fingerprint_bound()
         !socket.exists(),
         "admin socket is removed on clean shutdown"
     );
+}
+
+/// 威胁场景：enrollment 若接受任一 Runtime v1 根签证书，旧 machine 可绕过
+/// reset/re-enroll；拒绝还必须发生在消费一次性 code 之前。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn runtime_v1_signed_enrollment_certificates_are_rejected_without_consuming_code() {
+    let temp = TempDir::new().expect("tempdir");
+    let (handle, _storage, socket, _pin) = start_server(&temp).await;
+    let client = AdminClient::new(&socket);
+
+    for (route_seed, legacy_role) in [(0x71, CertRole::Link), (0x81, CertRole::Data)] {
+        let bundle = create_bundle(&client).await;
+        let (valid_request, _) =
+            enrollment_request(bundle.code, bundle.relay_server_id, route_seed);
+        let mut legacy_request = valid_request.clone();
+        let root = SigningKey::from_seed(&[route_seed.wrapping_add(1); 32]);
+        let certificate = match legacy_role {
+            CertRole::Link => &mut legacy_request.link_cert,
+            CertRole::Data => &mut legacy_request.data_cert,
+        };
+        replace_with_runtime_v1_signature(
+            &root,
+            bundle.relay_server_id,
+            legacy_request.machine_route,
+            certificate,
+        );
+
+        let (status, rejection_body) = https_request(
+            handle.public_addr(),
+            "POST",
+            "/v2/machine-enroll",
+            &serde_json::to_vec(&legacy_request).expect("encode Runtime v1 enrollment request"),
+        )
+        .await;
+        assert_eq!(status, 403, "mixed {legacy_role:?} bundle must reject");
+        let rejection: serde_json::Value =
+            serde_json::from_slice(&rejection_body).expect("decode enrollment rejection");
+        assert_eq!(rejection["code"], "relay.enrollment.rejected");
+
+        let (status, response_body) = https_request(
+            handle.public_addr(),
+            "POST",
+            "/v2/machine-enroll",
+            &serde_json::to_vec(&valid_request).expect("encode valid Runtime v2 retry"),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "Runtime v1 {legacy_role:?} rejection must not consume the code"
+        );
+        let response: MachineEnrollmentResponseV1 =
+            serde_json::from_slice(&response_body).expect("decode valid Runtime v2 enrollment");
+        assert_eq!(response.relay_server_id, bundle.relay_server_id);
+        assert_eq!(response.machine_route, valid_request.machine_route);
+    }
+
+    handle.shutdown().await.expect("shutdown Relay");
 }
 
 #[tokio::test]

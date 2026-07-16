@@ -9,8 +9,9 @@ use std::task::Poll;
 use std::time::Duration;
 
 use agentdeck_crypto::{
-    SigningKey, VerifyingKey, sha256, sign_authentication_transcript, sign_tbs,
+    SigningKey, VerifyingKey, sha256, sign_authentication_transcript, sign_tbs, verify_tbs,
 };
+use agentdeck_protocol::e2ee::ToBeSignedV1;
 use agentdeck_protocol::relay_v2::auth::{
     AuthenticationRole, AuthenticationTranscriptV1, CertRole,
 };
@@ -29,6 +30,7 @@ use agentdeck_protocol::relay_v2::{
     RELAY_PROTOCOL_VERSION, RelayFrameBody, RelayGrant, RelayServerId, RequestRouteId, RootKeyId,
     SignedCertificate, StreamCursor, StreamGenerationId, StreamRouteId, TrustEpoch,
 };
+use agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION;
 use agentdeck_relay::v2::auth::{
     AccessContext, ActivePairRoute, AuthenticationTrust, AuthenticationTrustView,
     AuthorizationCoordinator, AuthorizationLifecycleEvent, ChallengeLimits, ChallengeRegistry,
@@ -44,6 +46,7 @@ use rusqlite::{Connection, OpenFlags};
 use tempfile::TempDir;
 
 const NOW_MS: u64 = 1_726_000_000_000;
+const LEGACY_RUNTIME_PROTOCOL_VERSION: u16 = 1;
 
 #[derive(Default)]
 struct ManualMonotonicClock(AtomicU64);
@@ -111,6 +114,53 @@ impl FaultInjector for ArmedLinkAuthFault {
 impl Default for ArmedLinkAuthFault {
     fn default() -> Self {
         Self::new(FaultPoint::MachineLinkAuthBeforeCommit)
+    }
+}
+
+#[derive(Debug, Default)]
+struct AuthorizationCommitCounter {
+    machine_link_auth: AtomicU64,
+    device_auth: AtomicU64,
+    install_grant: AtomicU64,
+    revoke: AtomicU64,
+    purge: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AuthorizationCommitCount {
+    machine_link_auth: u64,
+    device_auth: u64,
+    install_grant: u64,
+    revoke: u64,
+    purge: u64,
+}
+
+impl AuthorizationCommitCounter {
+    fn snapshot(&self) -> AuthorizationCommitCount {
+        AuthorizationCommitCount {
+            machine_link_auth: self.machine_link_auth.load(Ordering::SeqCst),
+            device_auth: self.device_auth.load(Ordering::SeqCst),
+            install_grant: self.install_grant.load(Ordering::SeqCst),
+            revoke: self.revoke.load(Ordering::SeqCst),
+            purge: self.purge.load(Ordering::SeqCst),
+        }
+    }
+}
+
+impl FaultInjector for AuthorizationCommitCounter {
+    fn check(&self, point: FaultPoint) -> Result<(), StoreError> {
+        let counter = match point {
+            FaultPoint::MachineLinkAuthBeforeCommit => Some(&self.machine_link_auth),
+            FaultPoint::DeviceAuthBeforeConfirm => Some(&self.device_auth),
+            FaultPoint::InstallGrantBeforeCommit => Some(&self.install_grant),
+            FaultPoint::RevokeBeforeCommit => Some(&self.revoke),
+            FaultPoint::PurgeBeforeCommit => Some(&self.purge),
+            _ => None,
+        };
+        if let Some(counter) = counter {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
     }
 }
 
@@ -229,7 +279,7 @@ struct AuthorizationStoreSnapshot {
     enrollment_rows: Vec<String>,
 }
 
-fn authorization_store_snapshot(path: &Path) -> AuthorizationStoreSnapshot {
+fn open_authorization_snapshot_db(path: &Path) -> Connection {
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -238,6 +288,10 @@ fn authorization_store_snapshot(path: &Path) -> AuthorizationStoreSnapshot {
     connection
         .busy_timeout(Duration::from_secs(5))
         .expect("set authorization snapshot timeout");
+    connection
+}
+
+fn authorization_store_snapshot_from(connection: &Connection) -> AuthorizationStoreSnapshot {
     let table_counts = [
         "relay_meta",
         "machine_routes",
@@ -301,6 +355,11 @@ fn authorization_store_snapshot(path: &Path) -> AuthorizationStoreSnapshot {
              FROM enrollment_codes ORDER BY code_hash",
         ),
     }
+}
+
+fn authorization_store_snapshot(path: &Path) -> AuthorizationStoreSnapshot {
+    let connection = open_authorization_snapshot_db(path);
+    authorization_store_snapshot_from(&connection)
 }
 
 async fn assert_future_pending<F: Future>(mut future: Pin<&mut F>, context: &'static str) {
@@ -394,6 +453,89 @@ fn signed_grant(
     grant
 }
 
+fn sign_runtime_v1_tbs(root: &SigningKey, mut tbs: ToBeSignedV1) -> Ed25519Signature {
+    assert_eq!(
+        tbs.runtime_protocol_version, RUNTIME_PROTOCOL_VERSION,
+        "production builder must start from the current Runtime contract"
+    );
+    let current_tbs = tbs.clone();
+    tbs.runtime_protocol_version = LEGACY_RUNTIME_PROTOCOL_VERSION;
+    assert_ne!(
+        tbs, current_tbs,
+        "legacy and current TBS must differ on the Runtime version axis"
+    );
+    let signature = sign_tbs(root, &tbs);
+    verify_tbs(&root.verifying_key(), &tbs, &signature)
+        .expect("real Runtime v1 TBS signature verifies before cutover rejection");
+    assert!(
+        verify_tbs(&root.verifying_key(), &current_tbs, &signature).is_err(),
+        "the same legacy signature must fail against the current Runtime v2 TBS"
+    );
+    signature.into()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn runtime_v1_signed_certificate(
+    root: &SigningKey,
+    subject: &SigningKey,
+    server: RelayServerId,
+    machine_route: MachineRouteId,
+    root_key_id: RootKeyId,
+    trust_epoch: TrustEpoch,
+    generation: LinkGeneration,
+    role: CertRole,
+    not_after_ms: Option<u64>,
+) -> SignedCertificate {
+    let mut certificate = signed_certificate(
+        root,
+        subject,
+        server,
+        machine_route,
+        root_key_id,
+        trust_epoch,
+        generation,
+        role,
+        not_after_ms,
+    );
+    certificate.signature = sign_runtime_v1_tbs(
+        root,
+        certificate.to_be_signed_v1(
+            server,
+            machine_route,
+            sha256(&root.verifying_key().to_bytes()),
+        ),
+    );
+    certificate
+}
+
+#[allow(clippy::too_many_arguments)]
+fn runtime_v1_signed_grant(
+    root: &SigningKey,
+    device_key: &SigningKey,
+    server: RelayServerId,
+    machine_route: MachineRouteId,
+    device_route: DeviceRouteId,
+    root_key_id: RootKeyId,
+    trust_epoch: TrustEpoch,
+    serial: GrantSerial,
+) -> RelayGrant {
+    let mut grant = signed_grant(
+        root,
+        device_key,
+        server,
+        machine_route,
+        device_route,
+        root_key_id,
+        trust_epoch,
+        serial,
+    );
+    grant.signature = sign_runtime_v1_tbs(
+        root,
+        grant.to_be_signed_v1(server, sha256(&root.verifying_key().to_bytes())),
+    );
+    grant
+}
+
 struct Fixture {
     _temp: TempDir,
     path: PathBuf,
@@ -434,6 +576,12 @@ impl Fixture {
         let fault = Arc::new(BlockingFault::new(point));
         let fixture = Self::new_inner(None, Some(fault.clone())).await;
         (fixture, fault)
+    }
+
+    async fn with_commit_counter() -> (Self, Arc<AuthorizationCommitCounter>) {
+        let counter = Arc::new(AuthorizationCommitCounter::default());
+        let fixture = Self::new_inner(None, Some(counter.clone())).await;
+        (fixture, counter)
     }
 
     async fn new_inner(
@@ -552,24 +700,7 @@ impl Fixture {
         certificate: SignedCertificate,
         signer: &SigningKey,
     ) -> Authenticate {
-        let transcript = AuthenticationTranscriptV1 {
-            role: AuthenticationRole::MachineLink,
-            challenge_nonce: challenge.challenge_nonce,
-            connection_instance: challenge.connection_instance,
-            relay_server_id: challenge.relay_server_id,
-            relay_protocol_version: RELAY_PROTOCOL_VERSION,
-            machine_route: self.machine_route,
-            device_route: None,
-            serial_or_generation: certificate.generation.value(),
-            credential_sha256: certificate.canonical_sha256(),
-        };
-        Authenticate {
-            proof: AuthProof::MachineLink {
-                machine_route: self.machine_route,
-                link_cert: certificate,
-            },
-            signature: sign_authentication_transcript(signer, &transcript).into(),
-        }
+        machine_authenticate_frame(self.machine_route, challenge, certificate, signer)
     }
 
     fn device_frame(
@@ -578,21 +709,7 @@ impl Fixture {
         grant: RelayGrant,
         signer: &SigningKey,
     ) -> Authenticate {
-        let transcript = AuthenticationTranscriptV1 {
-            role: AuthenticationRole::Device,
-            challenge_nonce: challenge.challenge_nonce,
-            connection_instance: challenge.connection_instance,
-            relay_server_id: challenge.relay_server_id,
-            relay_protocol_version: RELAY_PROTOCOL_VERSION,
-            machine_route: grant.machine_route,
-            device_route: Some(grant.device_route),
-            serial_or_generation: grant.grant_serial.value(),
-            credential_sha256: grant.canonical_sha256(),
-        };
-        Authenticate {
-            proof: AuthProof::Device { relay_grant: grant },
-            signature: sign_authentication_transcript(signer, &transcript).into(),
-        }
+        device_authenticate_frame(challenge, grant, signer)
     }
 
     fn signed_revocation(&self) -> DeviceRevocation {
@@ -610,6 +727,175 @@ impl Fixture {
         )
         .into();
         revocation
+    }
+}
+
+struct RuntimeV1Credentials {
+    machine_route: MachineRouteId,
+    device_route: DeviceRouteId,
+    link: SigningKey,
+    device: SigningKey,
+    link_cert: SignedCertificate,
+    grant: RelayGrant,
+}
+
+impl RuntimeV1Credentials {
+    async fn install(store: &RelayStoreHandle, server: RelayServerId) -> Self {
+        let machine_route = machine(0xa1);
+        let device_route = device(0xa2);
+        let root_key_id = RootKeyId::from_bytes([0xa3; 16]);
+        let trust_epoch = TrustEpoch::new(7);
+        let root = SigningKey::from_seed(&[0xa4; 32]);
+        let link = SigningKey::from_seed(&[0xa5; 32]);
+        let data = SigningKey::from_seed(&[0xa6; 32]);
+        let device = SigningKey::from_seed(&[0xa7; 32]);
+        let link_cert = runtime_v1_signed_certificate(
+            &root,
+            &link,
+            server,
+            machine_route,
+            root_key_id,
+            trust_epoch,
+            LinkGeneration::new(1),
+            CertRole::Link,
+            Some(NOW_MS + 60_000),
+        );
+        let data_cert = runtime_v1_signed_certificate(
+            &root,
+            &data,
+            server,
+            machine_route,
+            root_key_id,
+            trust_epoch,
+            LinkGeneration::new(1),
+            CertRole::Data,
+            Some(NOW_MS + 60_000),
+        );
+        let code_hash = [0xa8; 32];
+        store
+            .seed_enrollment_code(EnrollmentCodeSeed {
+                code_hash,
+                expires_at_ms: NOW_MS + 60_000,
+            })
+            .await
+            .expect("seed Runtime v1 enrollment record");
+        store
+            .register_machine(RegisterMachine {
+                code_hash,
+                request_hash: [0xa9; 32],
+                response_blob: vec![0xaa],
+                receipt_hash: [0xab; 32],
+                machine_route,
+                root_pubkey: PublicKeyBytes(root.verifying_key().to_bytes()),
+                link_cert_hash: link_cert.canonical_sha256(),
+                data_cert_hash: data_cert.canonical_sha256(),
+                link_cert: link_cert.clone(),
+                data_cert,
+            })
+            .await
+            .expect("persist Runtime v1 certificate hashes");
+        let grant = runtime_v1_signed_grant(
+            &root,
+            &device,
+            server,
+            machine_route,
+            device_route,
+            root_key_id,
+            trust_epoch,
+            GrantSerial::new(1),
+        );
+        store
+            .install_grant(InstallGrantRecord {
+                grant_hash: grant.canonical_sha256(),
+                grant: grant.clone(),
+            })
+            .await
+            .expect("persist Runtime v1 grant hash");
+        Self {
+            machine_route,
+            device_route,
+            link,
+            device,
+            link_cert,
+            grant,
+        }
+    }
+}
+
+fn machine_authenticate_frame(
+    machine_route: MachineRouteId,
+    challenge: &agentdeck_protocol::relay_v2::frame::Challenge,
+    certificate: SignedCertificate,
+    signer: &SigningKey,
+) -> Authenticate {
+    let transcript = AuthenticationTranscriptV1 {
+        role: AuthenticationRole::MachineLink,
+        challenge_nonce: challenge.challenge_nonce,
+        connection_instance: challenge.connection_instance,
+        relay_server_id: challenge.relay_server_id,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        machine_route,
+        device_route: None,
+        serial_or_generation: certificate.generation.value(),
+        credential_sha256: certificate.canonical_sha256(),
+    };
+    Authenticate {
+        proof: AuthProof::MachineLink {
+            machine_route,
+            link_cert: certificate,
+        },
+        signature: sign_authentication_transcript(signer, &transcript).into(),
+    }
+}
+
+fn device_authenticate_frame(
+    challenge: &agentdeck_protocol::relay_v2::frame::Challenge,
+    grant: RelayGrant,
+    signer: &SigningKey,
+) -> Authenticate {
+    let transcript = AuthenticationTranscriptV1 {
+        role: AuthenticationRole::Device,
+        challenge_nonce: challenge.challenge_nonce,
+        connection_instance: challenge.connection_instance,
+        relay_server_id: challenge.relay_server_id,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        machine_route: grant.machine_route,
+        device_route: Some(grant.device_route),
+        serial_or_generation: grant.grant_serial.value(),
+        credential_sha256: grant.canonical_sha256(),
+    };
+    Authenticate {
+        proof: AuthProof::Device { relay_grant: grant },
+        signature: sign_authentication_transcript(signer, &transcript).into(),
+    }
+}
+
+fn assert_zero_commit_and_current(
+    observer: &Connection,
+    baseline: &AuthorizationStoreSnapshot,
+    commit_counter: &AuthorizationCommitCounter,
+    commit_baseline: AuthorizationCommitCount,
+    coordinator: &AuthorizationCoordinator,
+    current_accesses: &[&AccessContext],
+    context: &str,
+) {
+    assert_eq!(
+        authorization_store_snapshot_from(observer),
+        *baseline,
+        "{context} must not change data_version or semantic Store state"
+    );
+    assert_eq!(
+        commit_counter.snapshot(),
+        commit_baseline,
+        "{context} must not reach any authorization Store commit point"
+    );
+    for access in current_accesses {
+        assert!(
+            coordinator
+                .is_current(access)
+                .expect("read current access after Runtime v1 rejection"),
+            "{context} must abort every authorization transition"
+        );
     }
 }
 
@@ -636,6 +922,322 @@ async fn authenticate_machine_access(
         .await
         .expect("machine control origin authenticates")
         .access
+}
+
+async fn authenticate_device_access(
+    fixture: &Fixture,
+    registry: &ChallengeRegistry,
+    coordinator: &AuthorizationCoordinator,
+    instance: ConnectionInstanceId,
+    source_id: u64,
+) -> AccessContext {
+    let challenge = registry
+        .issue(instance, source(source_id))
+        .expect("issue device challenge");
+    let frame = fixture.device_frame(&challenge, fixture.grant.clone(), &fixture.device);
+    let consumed = registry
+        .consume(
+            instance,
+            source(source_id),
+            ChallengeRoute::Device {
+                machine_route: fixture.machine_route,
+                device_route: fixture.device_route,
+            },
+        )
+        .expect("consume device challenge");
+    coordinator
+        .authenticate(frame, consumed, NOW_MS)
+        .await
+        .expect("current Runtime v2 device authenticates")
+        .access
+}
+
+/// 威胁场景：升级前已持久化的 Runtime v1 credential 若能在 v2 重连，会绕过强制
+/// reset/re-enroll/re-pair，并把旧信任继续带入当前 Relay。
+#[tokio::test]
+async fn persisted_runtime_v1_cert_and_grant_cannot_reconnect_to_runtime_v2() {
+    let (mut fixture, commit_counter) = Fixture::with_commit_counter().await;
+    let legacy = RuntimeV1Credentials::install(&fixture.store, fixture.server).await;
+
+    fixture
+        .store
+        .shutdown()
+        .await
+        .expect("stop pre-cutover Store");
+    fixture.store = RelayStoreHandle::open(
+        store_config(&fixture.path).with_fault_injector(commit_counter.clone()),
+    )
+    .await
+    .expect("reopen Store under Runtime v2");
+    assert_eq!(
+        fixture
+            .store
+            .inspect()
+            .await
+            .expect("inspect reopened Store")
+            .relay_server_id,
+        fixture.server,
+        "cutover must reopen the same Relay realm"
+    );
+    let persisted_machine = fixture
+        .store
+        .machine_trust(legacy.machine_route)
+        .await
+        .expect("read persisted Runtime v1 machine trust");
+    assert_eq!(
+        persisted_machine.link_cert_hash,
+        legacy.link_cert.canonical_sha256(),
+        "old certificate canonical hash must be the persisted reconnect credential"
+    );
+    let persisted_device = fixture
+        .store
+        .device_trust(legacy.machine_route, legacy.device_route)
+        .await
+        .expect("read persisted Runtime v1 device trust");
+    assert_eq!(
+        persisted_device.grant_hash,
+        legacy.grant.canonical_sha256(),
+        "old grant canonical hash must be the persisted reconnect credential"
+    );
+
+    let (_clock, registry) = fixture.registry();
+    let (coordinator, _lifecycle) = AuthorizationCoordinator::start(fixture.store.clone(), 16)
+        .expect("start Runtime v2 authorization coordinator");
+    let current_machine =
+        authenticate_machine_access(&fixture, &registry, &coordinator, connection(10_000), 100)
+            .await;
+    let current_device =
+        authenticate_device_access(&fixture, &registry, &coordinator, connection(10_001), 101)
+            .await;
+
+    let observer = open_authorization_snapshot_db(&fixture.path);
+    let baseline = authorization_store_snapshot_from(&observer);
+    let commit_baseline = commit_counter.snapshot();
+    assert_eq!(
+        commit_baseline,
+        AuthorizationCommitCount {
+            machine_link_auth: 1,
+            device_auth: 1,
+            install_grant: 2,
+            revoke: 0,
+            purge: 0,
+        },
+        "counter must observe real setup and current Runtime v2 authentication"
+    );
+
+    let machine_instance = connection(10_002);
+    let machine_source = source(102);
+    let machine_challenge = registry
+        .issue(machine_instance, machine_source)
+        .expect("issue current Relay v2 challenge for old certificate");
+    let machine_frame = machine_authenticate_frame(
+        legacy.machine_route,
+        &machine_challenge,
+        legacy.link_cert.clone(),
+        &legacy.link,
+    );
+    let machine_consumed = registry
+        .consume(
+            machine_instance,
+            machine_source,
+            ChallengeRoute::Machine(legacy.machine_route),
+        )
+        .expect("consume current Relay v2 certificate challenge");
+    assert_eq!(
+        coordinator
+            .authenticate(machine_frame, machine_consumed, NOW_MS)
+            .await
+            .expect_err("Runtime v1 certificate must fail under the v2 root verifier")
+            .code,
+        RELAY_AUTH_INVALID_GRANT
+    );
+    assert_zero_commit_and_current(
+        &observer,
+        &baseline,
+        &commit_counter,
+        commit_baseline,
+        &coordinator,
+        &[&current_machine, &current_device],
+        "Runtime v1 certificate reconnect rejection",
+    );
+
+    let device_instance = connection(10_003);
+    let device_source = source(103);
+    let device_challenge = registry
+        .issue(device_instance, device_source)
+        .expect("issue current Relay v2 challenge for old grant");
+    let device_frame =
+        device_authenticate_frame(&device_challenge, legacy.grant.clone(), &legacy.device);
+    let device_consumed = registry
+        .consume(
+            device_instance,
+            device_source,
+            ChallengeRoute::Device {
+                machine_route: legacy.machine_route,
+                device_route: legacy.device_route,
+            },
+        )
+        .expect("consume current Relay v2 grant challenge");
+    assert_eq!(
+        coordinator
+            .authenticate(device_frame, device_consumed, NOW_MS)
+            .await
+            .expect_err("Runtime v1 grant must fail under the v2 root verifier")
+            .code,
+        RELAY_AUTH_INVALID_GRANT
+    );
+    assert_zero_commit_and_current(
+        &observer,
+        &baseline,
+        &commit_counter,
+        commit_baseline,
+        &coordinator,
+        &[&current_machine, &current_device],
+        "Runtime v1 grant reconnect rejection",
+    );
+
+    drop(observer);
+    coordinator
+        .shutdown()
+        .await
+        .expect("shutdown authorization coordinator");
+    fixture.store.shutdown().await.expect("shutdown Store");
+}
+
+/// 威胁场景：Runtime v1 根签 control material 若能由当前 MachineAccess 提交，会在
+/// v2 Store 中重新建立旧授权、撤销当前设备或退役整机。
+#[tokio::test]
+async fn runtime_v1_control_material_is_zero_commit_and_aborts_current_transitions() {
+    let (fixture, commit_counter) = Fixture::with_commit_counter().await;
+    let (_clock, registry) = fixture.registry();
+    let (coordinator, mut lifecycle) = AuthorizationCoordinator::start(fixture.store.clone(), 16)
+        .expect("start Runtime v2 authorization coordinator");
+    let current_machine =
+        authenticate_machine_access(&fixture, &registry, &coordinator, connection(11_000), 110)
+            .await;
+    let current_device =
+        authenticate_device_access(&fixture, &registry, &coordinator, connection(11_001), 111)
+            .await;
+    for expected_instance in [connection(11_000), connection(11_001)] {
+        assert!(matches!(
+            lifecycle.recv().await,
+            Some(AuthorizationLifecycleEvent::Activated(activation))
+                if activation.connection_instance == expected_instance
+        ));
+    }
+
+    let observer = open_authorization_snapshot_db(&fixture.path);
+    let baseline = authorization_store_snapshot_from(&observer);
+    let commit_baseline = commit_counter.snapshot();
+    assert_eq!(
+        commit_baseline,
+        AuthorizationCommitCount {
+            machine_link_auth: 1,
+            device_auth: 1,
+            install_grant: 1,
+            revoke: 0,
+            purge: 0,
+        },
+        "counter must observe real setup and current Runtime v2 authentication"
+    );
+
+    let replacement_grant = runtime_v1_signed_grant(
+        &fixture.root,
+        &fixture.device,
+        fixture.server,
+        fixture.machine_route,
+        fixture.device_route,
+        fixture.root_key_id,
+        fixture.trust_epoch,
+        GrantSerial::new(fixture.grant.grant_serial.value() + 1),
+    );
+    assert_eq!(
+        coordinator
+            .install_grant_from(current_machine.clone(), replacement_grant)
+            .await
+            .expect_err("Runtime v1 grant install must fail under the v2 root verifier")
+            .code,
+        RELAY_AUTH_INVALID_GRANT
+    );
+    assert_zero_commit_and_current(
+        &observer,
+        &baseline,
+        &commit_counter,
+        commit_baseline,
+        &coordinator,
+        &[&current_machine, &current_device],
+        "Runtime v1 grant control rejection",
+    );
+
+    let mut revocation = fixture.signed_revocation();
+    revocation.signature = sign_runtime_v1_tbs(
+        &fixture.root,
+        revocation.to_be_signed_v1(
+            fixture.server,
+            sha256(&fixture.root.verifying_key().to_bytes()),
+        ),
+    );
+    assert_eq!(
+        coordinator
+            .revoke_from(current_machine.clone(), revocation)
+            .await
+            .expect_err("Runtime v1 revocation must fail under the v2 root verifier")
+            .code,
+        RELAY_AUTH_INVALID_GRANT
+    );
+    assert_zero_commit_and_current(
+        &observer,
+        &baseline,
+        &commit_counter,
+        commit_baseline,
+        &coordinator,
+        &[&current_machine, &current_device],
+        "Runtime v1 revocation control rejection",
+    );
+
+    let mut retirement = RetireMachine {
+        machine_route: fixture.machine_route,
+        root_key_id: fixture.root_key_id,
+        trust_epoch: fixture.trust_epoch,
+        signature: Ed25519Signature([0; 64]),
+    };
+    retirement.signature = sign_runtime_v1_tbs(
+        &fixture.root,
+        retirement.to_be_signed_v1(
+            fixture.server,
+            sha256(&fixture.root.verifying_key().to_bytes()),
+        ),
+    );
+    assert_eq!(
+        coordinator
+            .retire_machine_from(current_machine.clone(), retirement)
+            .await
+            .expect_err("Runtime v1 retirement must fail under the v2 root verifier")
+            .code,
+        RELAY_AUTH_INVALID_GRANT
+    );
+    assert_zero_commit_and_current(
+        &observer,
+        &baseline,
+        &commit_counter,
+        commit_baseline,
+        &coordinator,
+        &[&current_machine, &current_device],
+        "Runtime v1 retirement control rejection",
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), lifecycle.recv())
+            .await
+            .is_err(),
+        "rejected Runtime v1 control material must emit no lifecycle invalidation"
+    );
+
+    drop(observer);
+    coordinator
+        .shutdown()
+        .await
+        .expect("shutdown authorization coordinator");
+    fixture.store.shutdown().await.expect("shutdown Store");
 }
 
 #[test]
