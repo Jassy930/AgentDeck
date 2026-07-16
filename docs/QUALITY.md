@@ -1217,6 +1217,38 @@ swift test --filter RelayCryptoVectorTests
 v2 request 必须 200 并完成 typed server/route readback。最终 spec/security/quality 三路 Approved，无
 P0/P1/P2；A1 complete。真实 P4 凭据仍必须在投产前按 runbook 受控 reset/re-enroll/re-pair。
 
+## Relay Companion MVP P3.9-C0-A2 Swift Runtime v2 mirror 门禁
+
+本门禁防御的具体场景是：daemon 已发送 Runtime v2 canonical wire，但 Swift 共享层仍宽松接受未知字段、
+把 required-null 当成可缺省，或按错误的 identity/discriminator 解释事件，最终让 App 与 daemon 的
+catalog/stream 状态静默分叉。
+
+A2a 已冻结 configuration/metadata/upgrade/agent/changed receipt；A2b1 已冻结 catalog、Runtime 专用
+strict vendor-panel 与 canonical event。A2b2 的 snapshot/backfill/compatibility gate 和 A2c 的
+outer/current codec、98 fixtures、compact carrier 与真实 UDS Swift readback 尚未完成；当前通过不代表
+App/CLI 默认 UDS client 已 cutover。
+
+```bash
+# A2a strict changed DTO 与 A2b1 stream projection focused gate
+swift test --filter RuntimeV2ProtocolTests
+swift test --filter RuntimeV2StreamProtocolTests
+
+# 共享 Core 完整回归与 iOS 编译/单测
+swift test
+cd ios
+xcodegen generate
+xcodebuild -project AgentDeckMobile.xcodeproj -scheme AgentDeckMobile \
+  -destination 'platform=iOS Simulator,name=iPhone 17' test
+
+# 文档与补丁卫生
+scripts/verify-agent-docs.sh
+git diff --check
+```
+
+A2b1 focused 必须实际执行 6 个 XCTest，不能接受 0-test filter；同时证明 500/501 row、bare encoded
+exact 64 MiB、Removed 的 `conversation_id`、CC optional missing/null/non-null、全部 event body identity、
+standalone/flattened exact round-trip。阶段记录为完整 Swift 275 XCTest + 35 Swift Testing、iOS 20/20。
+
 ## AppKit 重写后的验证清单
 
 前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。
@@ -1341,6 +1373,7 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P3.7 exec-gate / typed production execution | 运行本页 prepare disposition、gate/recovery/driver/typed fixture/production wiring 矩阵、完整 daemon package、clippy/fmt/network-boundary/schema/docs/diff；固定 PATH、私有 FD、唯一 reaper、cooperative-descendant PGID fencing、COMMIT-unknown 与 reopen/backfill 必须有行为证据。显式自守护/逃逸不受支持，helper/fixture 不冒充 live vendor approval、UDS 或实机 E2E |
 | Relay Companion MVP P3.8-A local Runtime UDS primitives | 运行本页 framing/peer、local-control/cancellation、真实双连接 `local_uds`、完整 daemon、fmt/clippy/network-boundary/docs/diff；只证明 accepted stream actor，不冒充 P3.8-B secure bind/permit、P3.9 App/CLI cutover 或 remote E2E |
 | Relay Companion MVP P3.8-B production UDS/bootstrap | 运行本页 secure listener/permit/supervisor、config/stdio exhaustive allowlist、真实 binary lifecycle、Rust/Swift compatibility、完整 daemon、fmt/clippy/network-boundary/schema/docs/diff；只证明 production 本地入口，不冒充 P3.9 shared-daemon client、LaunchAgent 或 remote E2E |
+| Relay Companion MVP P3.9-C0-A2 Swift Runtime v2 mirror | 运行本页 A2a/A2b1 focused、完整 `swift test`、iOS XcodeGen + Simulator、docs/diff；A2b2/A2c 完成前不得宣称 outer/current codec、真实 UDS Swift readback或 App/CLI 默认 UDS cutover |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

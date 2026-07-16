@@ -1754,7 +1754,7 @@ P3.9 固定以下迁移边界：
   - [ ] **A2b stream projection types（重估约 1,750–2,250 行，预拆两片）：** 首次源码/测试映射证明
     catalog/event/vendor-panel 与 snapshot/backfill/compat gate 合并后可能越过 2,000 行刹车，故在落代码前
     拆为 A2b1/A2b2；两片仍共同完成原 A2b 范围，不删行为门禁。
-    - [ ] **A2b1 catalog + strict vendor-panel + event（约 900–1,150 行）：** Catalog reply
+    - [x] **A2b1 catalog + strict vendor-panel + event（实际 1,252 行）：** Catalog reply
       `nextPageCursor` 必须 present、可为 null；entry 的 `title/cwd` 允许 missing 或 null 并统一为 `nil`、
       egress 显式 null，`entryRevision/lastActiveMs/catalogRevision` 均允许 0；Catalog 拒绝第 501 row 与
       bare encoded bytes `>64 MiB`，Removed change 保持 Rust wire 的 `conversation_id` key。Runtime 专用
@@ -1763,7 +1763,13 @@ P3.9 固定以下迁移边界：
       ApprovalResolved `decision` 必须 present、可为 null，`eventSeq=0` 合法；按 body 执行
       command/item/entity identity 矩阵。Catalog snapshot/delta 与 event 的 standalone/flattened 编解码共用
       同一 validation，不复制宽松旁路。提交前运行 focused A2b1 tests、完整 `swift test`、既定 iOS
-      XcodeGen + `xcodebuild test`、docs/diff gate并独立复审；任何 0-test filter 不算通过。
+      XcodeGen + `xcodebuild test`、docs/diff gate并独立复审；任何 0-test filter 不算通过。commit
+      `3e019ed`；TDD 从缺少 `RuntimeConversationEntryV2` 的 compile-red 到 focused 6/6 green，新增
+      727 行 production、524 行 tests，并只把既有 discriminator helper 放宽 1 行为 module-internal，
+      合计 1,252 行，低于 2,000 行刹车线。首轮测试审查发现 upsert/hookFired、event identity 与
+      flattened egress 假绿后补齐 exact round-trip；spec/quality 终审均 Approved，quality 的 3 个非阻断
+      P2（CC 非空 optional、`toolUseId` 命名、Removed unknown）亦已最小收口。完整 Swift 275 XCTest +
+      35 Swift Testing、iOS 20/20、docs/diff gate 全绿；本片不代表 snapshot/backfill 或 App/UDS cutover。
     - [ ] **A2b2 snapshot + backfill + compatibility gate（约 850–1,100 行）：** Snapshot 必须非空、
       capabilities first 且恰好一次，configuration 非空时 agent 必须匹配。Backfill 是
       after-exclusive/through-inclusive 的 1…512 连续范围，拒绝第 513 entry、空/非连续 range、delta/event

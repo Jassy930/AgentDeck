@@ -543,6 +543,9 @@ conversation/key，不能伪造身份连续性。
   `c28a968` / `c36a4f9` 完成 public Runtime v2 wire、真实 v1/schema v4 样本读回与独立终审；`ef830cd`
   又固定旧 Runtime v1 root-signed cert/grant/revocation/retirement/enrollment 在 current verifier 下通用拒绝、
   Store 零提交且不保留 production 双栈；
+  Swift 共享层的 A2a/A2b1 已由 `bea4c13` / `3e019ed` 建立 strict changed DTO 与
+  catalog/vendor-panel/event mirror，但 A2b2 snapshot/backfill、A2c outer/current codec 和真实 UDS
+  Swift readback 尚未完成；这些 mirror 不等于 App/UDS client cutover；
   P3.8 已完成 accepted-stream actor 与 recovery 后
   production secure bind/bootstrap；App/CLI 默认连接仍待 P3.9，因此本节仍不是 shared local client
   或远程端到端可用声明。
