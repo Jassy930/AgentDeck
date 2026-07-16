@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P2.10、P3.5、P3.6-A/B/C/D、P3.7 与 P3.8 已完成；P3.9-C0-A0 与 A1 已由 `d4057f1` / `3b83391` / `c28a968` / `c36a4f9` / `ef830cd` 完成；Swift A2 以后未开始；P3.1 签名 Keychain 仍有 1 项 ignored/BLOCKED（2026-07-16） |
+| 状态 | Approved target；P2.10、P3.5、P3.6-A/B/C/D、P3.7 与 P3.8 已完成；P3.9-C0-A0/A1/A2 已由 `d4057f1` / `3b83391` / `c28a968` / `c36a4f9` / `ef830cd` / `bea4c13` / `3e019ed` / `0dd58de` / `c2d2c28` / `e419d84` 完成；C0-B 以后未开始；P3.1 签名 Keychain 仍有 1 项 ignored/BLOCKED（2026-07-16） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-01-agentdeck-mobile-relay-design.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -31,7 +31,9 @@ fixture/typed adapter/typed journal 前置分片为 `819aa5e` / `1acf8b8` /
 `3f22cf0`。P3.8 production UDS 已完成；P3.9-C0-A0 与 additive DTO 切片 A1a1 已提交，Runtime v2
 outer/callsite/schema/vector 与真实 v1/schema v4 readback 又分别由 `c28a968` / `c36a4f9` 完成；
 `ef830cd` 以 persisted cert/grant、control grant/revoke/retire 与真实 TLS enrollment 关闭 signed-material
-hard cutover，A1 complete。A2 与 shared-daemon client 尚未完成。
+hard cutover，A1 complete。Swift A2 又由 `bea4c13` / `3e019ed` / `0dd58de` / `c2d2c28` / `e419d84`
+完成 strict Runtime v2 mirror、current/compact codec、98-fixture 与真实 UDS Swift readback；shared-daemon
+client 仍未完成。
 App/CLI shared-daemon cutover、LaunchAgent、P4 Machine identity/E2EE/Relay Publish 和真实 Companion 仍未完成，
 iOS 仍只有 fixture 驱动骨架。
 P3.1 provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate。完整实施仍必须满足 §17 的

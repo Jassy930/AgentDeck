@@ -440,10 +440,11 @@ conversation/key，不能伪造身份连续性。
 - daemon main 固定按 `config → namespace/singleton → keystore → StorageKEK → record namespace →
   RuntimeCore → recovery permit → local ingress` 启动，record/diagnostics 一次性绑定已验证 data root。
   默认 ingress 是 canonical UDS；只有完整显式 stdio 三 flag 才进入 admin/read compatibility。
-  P3.9 前 Swift/Rust stdio transport 是显式隔离的兼容路径：固定传
+  P3.9 shared-daemon client cutover 完成前，Swift/Rust stdio transport 是显式隔离的兼容路径：固定传
   `--stdio-compat --ephemeral --no-remote --profile dev` 并清除旧 namespace env。它不触碰 stable 信任域，
   也尚不提供多个客户端共享 singleton RuntimeCore；production main 明确拒绝旧
-  `SessionStart/SessionContinue`，真实本地会话必须等待 P3.9 shared-daemon RuntimeEnvelope client cutover。
+  `SessionStart/SessionContinue`，真实本地会话必须等待 P3.9 后续 shared-daemon RuntimeEnvelope
+  client cutover。
 - 已有 ignored、唯一 service/account、RAII 清理的真实 Keychain roundtrip，但 P3.1 的签名
   门禁尚未通过：当前机器无匹配 provisioning profile；Apple Development 与本地
   self-signed helper 虽通过 `codesign --verify`，均被 AMFI 以 exit 137 拒绝启动。因此本节
@@ -545,8 +546,9 @@ conversation/key，不能伪造身份连续性。
   Store 零提交且不保留 production 双栈；
   Swift 共享层的 A2a/A2b 已由 `bea4c13` / `3e019ed` / `0dd58de` 建立 strict changed DTO 与
   catalog/vendor-panel/event/snapshot/backfill mirror；A2c1 又由 `c2d2c28` 建立 outer 与 JSON/UDS
-  94-part transfer model，并对 97 条 JSON fixture 做 typed readback。A2c2 的 compact/current codec、
-  98-fixture 全量和真实 UDS Swift readback 仍未完成；这些 mirror 不等于 App/UDS client cutover；
+  94-part transfer model，并对 97 条 JSON fixture 做 typed readback；`e419d84` 完成 current facade、
+  `ADRT1` version 2 compact codec 与 98-fixture 全量，并让同一 0600/128-byte 真实 UDS Hello 样本经
+  Swift current codec 非跳过读回后删除。A2 的共享 mirror/current API 不等于 App/UDS client cutover；
   P3.8 已完成 accepted-stream actor 与 recovery 后
   production secure bind/bootstrap；App/CLI 默认连接仍待 P3.9，因此本节仍不是 shared local client
   或远程端到端可用声明。

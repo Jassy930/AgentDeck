@@ -213,7 +213,7 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（P3.8 与 P3.9-C0-A1 已完成，P3 整体未完成）
+## Relay Companion MVP 实施状态（P3.8 与 P3.9-C0-A0–A2 已完成，P3 整体未完成）
 
 Relay production binary 已原子切换到 **Relay v2**。公开数据面只接受
 `/v2/connect`、`/v2/pair` 与 enrollment 所需的 `POST /v2/machine-enroll`；
@@ -398,8 +398,10 @@ control grant/revocation/retirement 与 enrollment Link/Data cert 均在 v2 veri
 Swift 共享层已由 `bea4c13` / `3e019ed` / `0dd58de` 完成 configuration/metadata/upgrade/receipt、
 catalog/strict vendor-panel/canonical event 与 snapshot/backfill 的 v2 strict mirror；`c2d2c28` 又完成
 request/reply/message/stream/envelope 与 JSON/UDS 94-part transfer model，并对 97 条 JSON fixture 做 typed
-readback。compact carrier、current facade、98-fixture 全量和真实 UDS Swift readback 仍属于 A2c2，因此这里
-不宣称 App/UDS client 已 cutover。
+readback；`e419d84` 再完成 `ADRT1` version 2 compact carrier、current facade、98-fixture 全量、严格
+`<1 MiB` JSON 与 `<4 MiB` compact frame gate。A2-0 的 0600/128-byte 真实 UDS Hello 样本也已由
+current Swift codec 以 1 test / 0 skipped 读回并删除。A2 只冻结共享 wire/API，仍不代表 App/CLI 默认
+UDS client 已 cutover。
 已落地的纯幂等 Start、显式
 CancelQueued/CancelActive 与精确 QueryReceipt 接到 Runtime journal。Start 不再携带首 prompt；
 相同 owner+start key 由 StorageKEK 域分离 capability 稳定派生，跨重启返回同一
@@ -560,18 +562,19 @@ binary/root 注入，内部原子创建随机临时目录并 RAII 清理；它�
 `/bin/sh` 无副作用 helper，不替代真实 Codex/Claude Code 登录、真实 approval 或 P6 跨设备证据。
 P3.8-B production UDS/bootstrap 已由 `1e7f9ea` / `459f32a` 完成；P3.9-C0-A1 Runtime v2 Rust
 cutover 与旧签名材料拒绝门禁已完成，A2a/A2b Swift v2 strict mirror 也已由 `bea4c13` / `3e019ed` /
-`0dd58de` 收口，A2c1 outer + JSON/UDS model 已由 `c2d2c28` 收口；但 A2c2 compact/current gate、
-App/CLI 默认 UDS cutover、P3.10 LaunchAgent、
+`0dd58de` 收口，A2c outer + JSON/UDS/compact/current codec 已由 `c2d2c28` / `e419d84` 收口；但
+P3.9-C0-B/C、App/CLI 默认 UDS cutover、P3.10 LaunchAgent、
 P4 RemoteLink、P5/P6 客户端与实机证据仍未完成；
 P3.1 provisioned signed Keychain roundtrip 也仍是外部 BLOCKED gate。
 具体命令与资源矩阵见 [docs/QUALITY.md](docs/QUALITY.md)。
 
 ## agentdeck CLI（参考客户端 / E2E 驱动）
 
-`agentdeck` 是一个 Rust 二进制参考客户端，**不在 Swift GUI 的实时通路上**。P3.9 前 Swift app 与 CLI
+`agentdeck` 是一个 Rust 二进制参考客户端，**不在 Swift GUI 的实时通路上**。在 P3.9 shared-daemon
+client cutover 完成前，Swift app 与 CLI
 仍由过渡 `ProcessDaemonTransport` 显式启动 stdio compatibility daemon；该入口拒绝全部
 execution/control 命令，不能执行真实会话。`agentdeck` 现阶段用于 admin/read 脚本、本地验证和门控
-E2E 驱动；默认连接 stable singleton UDS 与真实本地会话属于 P3.9。
+E2E 驱动；默认连接 stable singleton UDS 与真实本地会话属于 P3.9 后续 client cutover。
 
 ### 全局标志
 

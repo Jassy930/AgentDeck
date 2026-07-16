@@ -1707,7 +1707,7 @@ P3.9 固定以下迁移边界：
     终审发现的 2 个 P1 与 2 个 P2 均已 red→green，最终 spec/security/quality 三路 Approved；代码与
     测试新增 730 行，低于 2,000 行刹车线。P4 投产前的开发凭据必须执行受控
     reset/re-enroll/re-pair；当前不新增 production 双栈或 legacy verifier。A1a/A1b 均完成，故 A1 complete。
-- [ ] **P3.9-C0-A2 Swift v2 mirror：** 具体威胁场景是：若直接复用 Swift synthesized `Codable`、现有
+- [x] **P3.9-C0-A2 Swift v2 mirror：** 具体威胁场景是：若直接复用 Swift synthesized `Codable`、现有
   宽松 `VendorPanelPayload` 或 Runtime v1 transfer codec，Rust 已拒绝的 unknown/missing/null 输入会被
   Swift 接受或重编码漂移，JSON/UDS 的 64-part 旧上限还会截断合法 64 MiB v2 transfer。故 A2 必须使用
   strict exact-key decoder、required-null presence check 与独立 v2 carrier profile；不把 fixture 正向
@@ -1728,8 +1728,9 @@ P3.9 固定以下迁移边界：
     path，也不得把运行记录、用户路径或临时样本提交进仓库。2026-07-16 已从 current HEAD 构建 daemon，
     真实 reply 为 128 bytes、SHA-256
     `393a3201225ef18ae13d4238ba99ea3db612ded4aa86b5819bfab54f01d3421e`；current Rust v2 codec 对同一
-    raw bytes 解码成功并完成语义等价重编码。一次性 reader 已退役，仓库内零残留；0600 外部样本保留到
-    A2c Swift readback。
+    raw bytes 解码成功并完成语义等价重编码。A2c2 又由 current Swift codec 对同一 0600 样本实际执行
+    1 test、0 skipped、0 failures，读回 version/message ID/Hello 并完成 JSON 语义等价重编码；随后外部
+    样本已删除且确认不存在，Rust/Swift 一次性 reader/test 均已退役，仓库内零残留。
   - [x] **A2a strict DTO/receipt primitives（实际 1,988 行）：** configuration、metadata、upgrade、
     agent descriptions 与 changed receipt；手写 deny-unknown、missing/null/default、文本/agent/revision
     validation，禁止改宽 IPC v2 公共 vendor 类型。Codex 三个 configuration 字段全部 required；CC
@@ -1790,7 +1791,7 @@ P3.9 固定以下迁移边界：
       spec/quality 终审 Approved；source gate 扫描范围与 2/6 token 分段定位两个 P2 已复核 Closed。
       frozen v1 compatibility 26/26、完整 Swift 282 XCTest + 35 Swift Testing、iOS 20/20、docs/diff 全绿。
       A2b complete；outer/current codec 与真实 UDS Swift readback 仍只属于 A2c。
-  - [ ] **A2c outer/codec/current gate（实际预拆 A2c1/A2c2）：** request/reply/message/stream/envelope、
+  - [x] **A2c outer/codec/current gate（实际预拆 A2c1/A2c2）：** request/reply/message/stream/envelope、
     JSON/UDS 700 KiB × 94 parts、compact 3.5 MiB × 64 parts、共同 64 MiB 与 `ADRT1` carrier version 2；
     Catalog request `pageCursor` 必须 present、可为 null；`ttlSecs` missing 固定默认 300、显式 null 拒绝；
     message/transfer ID 必须为 1…1024 UTF-8 bytes。
@@ -1819,10 +1820,15 @@ P3.9 固定以下迁移边界：
       focused 8/8、完整 Swift 290 XCTest + 35 Swift Testing、Rust fixture generator 1/1、iOS 20/20、
       docs/diff gate 全绿。本片不含 compact/current/frame source gate 或真实 UDS Swift readback，不代表
       A2 complete。
-    - [ ] **A2c2 compact + current gate：** 实现 `ADRT1` version 2 compact carrier、严格 `<4 MiB`、
-      JSON/UDS/current codec 的 `<1 MiB` gate、public v2/current constants 与 `RuntimeWireCodec` alias；补齐
-      第 98 条 compact byte-exact、v1/v2 ingress/egress mismatch、production no-v1/source/import gate 与
-      A2-0 真实 UDS Hello Swift readback。A2c2 完成并通过 App selfcheck 前不标 A2/A2c complete。
+    - [x] **A2c2 compact + current gate（实际 945 additions / 3 deletions）：** commit `e419d84`；实现
+      `ADRT1` version 2 compact carrier、严格 `<4 MiB`、JSON/UDS/current codec 的 `<1 MiB` gate、public
+      v2/current constants、`RuntimeWireCodec` alias 与非 `@testable` compact public constructor。测试锁定
+      第 98 条 compact byte-exact、96/1/1 与 25/45/26 分布、v1/v2 ingress/egress mismatch、18/19-part
+      representability、Reply/Stream/非零 index、UTF-8 identity、index/count/hash/part/total 双向负向、三类
+      JSON exact frame 与 production no-v1/source/import boundary。A2-0 同一 0600/128-byte/SHA-256 样本已由
+      Swift 1 test / 0 skipped 读回后删除；spec/quality 终审 Approved，无残留 P0/P1/P2。focused 7/7、
+      public API 1/1、frozen v1 26/26、完整 Swift 298 XCTest + 35 Swift Testing、iOS 20/20、App selfcheck、
+      docs/diff gate 全绿。A2/A2c complete；App/CLI 默认 UDS cutover 仍属于后续 P3.9，不在本片冒充完成。
     任一切片超过 2,000 行立即停下再拆，不以删除/机械 rename 抵消新增行。
 - [ ] **P3.9-C0-B configuration store/execution：** Runtime DB v5 增加 append-only sealed
   configuration versions、conversation/command revision 与 idempotency/token ledger；Configure CAS 与 metadata

@@ -50,10 +50,11 @@ leader 退出窗口门禁。P3.8-A 已由 `eb97f7f` 完成 accepted-stream UDS �
 P3.8-B2 production config/main、stdio exhaustive allowlist、真实 binary lifecycle 和 Rust/Swift
 compatibility 参数已由 `459f32a` 完成。P3.9-C0-A0/A1 已由
 `d4057f1` / `3b83391` / `c28a968` / `c36a4f9` / `ef830cd` 完成，Runtime v2 Rust contract 与
-signed-material hard cutover 的 A1 complete；Swift A2a/A2b 与 A2c1 已由
-`bea4c13` / `3e019ed` / `0dd58de` / `c2d2c28` 完成，A2c2 current/compact gate 与 shared-daemon client
-cutover 尚未完成。
-P3.1 的 provisioned signed Keychain 外部门禁仍有 1 项 ignored/BLOCKED，P3.9/P3.10、P4 E2EE/Relay Publish
+signed-material hard cutover 的 A1 complete；Swift A2 已由
+`bea4c13` / `3e019ed` / `0dd58de` / `c2d2c28` / `e419d84` 完成 strict mirror、outer、JSON/compact
+current codec、98-fixture 与真实 UDS Swift readback，A2 complete；shared-daemon client cutover 尚未完成。
+P3.1 的 provisioned signed Keychain 外部门禁仍有 1 项 ignored/BLOCKED，P3.9-C0-B/C 与后续 client
+cutover、P3.10、P4 E2EE/Relay Publish
 和 P5 真实 Companion 均未完成；transfer/publication 也尚无 production remote owner。不能因 fake
 publication、store tests 或 Simulator fixture 改写状态。
 
