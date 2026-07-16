@@ -1900,11 +1900,13 @@ P3.9 固定以下迁移边界：
       hardening matrix 会触及 1,800 行预拆线，因此在提交前拆为两片；idempotency namespace 固定为
       `(conversationId, canonical owner, raw key)`，expected revision 与 canonical configuration 进入 full
       request token，同一 namespace 下 exact request replay、不同 request conflict：
-      - [ ] **B2a1 writer/open integrity：** configuration CAS writer、authenticated row/event/ledger integrity、
-        单一 commandless `ConfigurationChanged`、零 catalog/activity 漂移与 apply→reopen→exact replay；
-        pin/metadata 表继续 zero fail-close。`ConfigurationChanged.createdAt` 固定复用已认证的 conversation
-        `updatedAt`；新时钟只供事务内 replay-window trim 判定 TEMP pin 是否过期，不写入 event/activity，
-        防止 idle conversation 的已过期 pin 因旧 event 时间被永久误判 active、令 Configure 持续回滚。
+      - [x] **B2a1 writer/open integrity（commit `9330f78`，实际 1,772 additions）：** configuration CAS
+        writer、authenticated row/event/state/ledger 双向完整性、单一 commandless `ConfigurationChanged`、
+        conversation-scoped exact replay 与零 catalog/activity 漂移已落地；apply→shutdown→reopen→replay 使用
+        production writer 的真实非空 DB 通过。pin/metadata 表继续 zero fail-close；`createdAt` 固定复用已认证
+        `updatedAt`，新时钟仅供 replay-window trim 判定 TEMP pin 过期，不写入 event/activity。两轮独立
+        security/quality 终审 Approved；daemon lib 659 passed + 1 ignored、完整 package（含 254.83 秒
+        1,024 × 256 MiB 边界）、stream 45/45、transfer 17/17、Clippy/fmt/no-net/docs/App selfcheck 全绿。
       - [ ] **B2a2 hardening matrix：** 并发 writer、stale/future revision、same-key conflict、agent/input
         reject、before/after-COMMIT、tamper/orphan/head/ledger 与 quota exact boundary；所有 reject/replay
         验证零重复 event/ledger charge。
