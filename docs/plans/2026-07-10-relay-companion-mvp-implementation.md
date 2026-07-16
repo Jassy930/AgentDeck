@@ -1896,7 +1896,7 @@ P3.9 固定以下迁移边界：
   - [ ] **B2 configuration CAS/snapshot：** 只读重估会超过 1,800 additions，动代码前预拆为三片；三片
     共同收口 owner-scoped CAS/replay/conflict、sealed full request、单一 ConfigurationChanged、
     cursor-consistent snapshot、DescribeAgents/default configuration 与零 catalog 漂移：
-    - [ ] **B2a store CAS/integrity：** 初始 production + 基础测试已达约 1,619 additions，继续加入
+    - [x] **B2a store CAS/integrity：** 初始 production + 基础测试已达约 1,619 additions，继续加入
       hardening matrix 会触及 1,800 行预拆线，因此在提交前拆为两片；idempotency namespace 固定为
       `(conversationId, canonical owner, raw key)`，expected revision 与 canonical configuration 进入 full
       request token，同一 namespace 下 exact request replay、不同 request conflict：
@@ -1907,9 +1907,16 @@ P3.9 固定以下迁移边界：
         `updatedAt`，新时钟仅供 replay-window trim 判定 TEMP pin 过期，不写入 event/activity。两轮独立
         security/quality 终审 Approved；daemon lib 659 passed + 1 ignored、完整 package（含 254.83 秒
         1,024 × 256 MiB 边界）、stream 45/45、transfer 17/17、Clippy/fmt/no-net/docs/App selfcheck 全绿。
-      - [ ] **B2a2 hardening matrix：** 并发 writer、stale/future revision、same-key conflict、agent/input
-        reject、before/after-COMMIT、tamper/orphan/head/ledger 与 quota exact boundary；所有 reject/replay
-        验证零重复 event/ledger charge。
+      - [x] **B2a2 hardening matrix（commit `fa24782`，实际 965 additions / 17 deletions）：** 并发
+        writer、stale/future revision、same-key conflict、owner namespace、agent/input reject、before/after-
+        COMMIT、8 类 tamper/orphan/head/ledger/AAD、recovery frozen cut 与 quota exact boundary 已闭环；所有
+        reject/replay 均以 event HWM、configuration head、物理行/bytes 和 authenticated ledger 全量证据验证
+        零写。真实 production writer 4,096 版 exact limit→one-past typed reject→reopen 慢门禁 1/1（58.10 秒），
+        默认 matrix 7 passed + 1 ignored，quota/retained-memory 私有用例 2/2；configuration 密文/AAD 错误继续
+        保留稳定 `daemon.runtime.crypto_failed`，event tamper 服从既有全库完整性边界。daemon lib 661 passed +
+        1 ignored、完整 package 与真实 1,024 × 256 MiB 边界（255.81 秒）、Clippy/fmt/no-net/docs/App
+        selfcheck/diff 全绿，两轮独立复审 Approved、无剩余 P0/P1/P2。P3.1 signed Keychain 外部门禁继续
+        BLOCKED。
     - [ ] **B2b cursor snapshot：** 按 frozen base event cursor 选择配置，覆盖 BeforeFirst/rev0、两次 Configure
       之间的普通 event、ready/build/legacy path 与 retained-memory estimator，禁止读取 current head。
     - [ ] **B2c Core cutover/defaults：** DescribeAgents 稳定 defaults、RuntimeCore Configure production route、
