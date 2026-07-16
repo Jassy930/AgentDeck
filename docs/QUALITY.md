@@ -625,7 +625,8 @@ session id。未设置 `AGENTDECK_E2E=1` 时，真实 CLI/model/history smoke �
 
 ## Relay Companion MVP P3.4 RuntimeCore 门禁
 
-P3.4 证明 transport-neutral Core、journal actor 与 Runtime v1 精确契约；该阶段的 execution
+P3.4 证明当时的 transport-neutral Core、journal actor 与 Runtime v1 精确契约；当前 wire 已由
+P3.9-C0-A1a2 的 `c28a968` / `c36a4f9` 升为 Runtime v2 并完成阶段门禁。P3.4 的 execution
 固定 fail-closed，不能把 fake coordinator 当作后续 P3.7 vendor exec 证据：
 
 ```bash
@@ -843,7 +844,8 @@ ReadPool、配额与调度完全不变。
   payload 上验证；caller cancel 后已入队 Store command继续持 shared permit/TEMP pin，error 在 terminal
   writer wait 前先压缩并释放 retry payload。Catalog frozen cache 计入同一预算，旧 expiry version 不
   删除续期 cache，每 snapshot 至多一个 sleeper。
-- transfer 的 active count、connection/global bytes、64 parts/64 MiB、5 分钟 TTL、metadata/duplicate
+- transfer 的 active count、connection/global bytes、JSON/UDS 94 parts、compact 64 parts、共同
+  64 MiB、5 分钟 TTL、metadata/duplicate
   conflict、hash/length、stale generation 与 completed tombstone 使用 checked accounting；只有 clone
   reducer 完整验证后才原子推进 inner cursor 一次，失败/重试不产生部分 apply。
 - publication 只验证注入 opaque/fake sealed blob 的 generation/seq/counter/hash/inner range、
@@ -1112,6 +1114,72 @@ preface + Hello reply 后才算 ready；stdin 为 `/dev/null` 时 PID 继续存�
 exact socket 消失。`AGENTDECK_DAEMON_SOCKET` 不得改变 endpoint，`--socket` 必须 typed unknown。
 显式 stdio 三 flag 在 EOF 后退出且不创建 socket，Ping 可用而 SessionCancel 等 control 返回
 `daemon.runtime.stdio_command_forbidden`。P3.1 provisioned signed Keychain roundtrip 继续单列外部门禁。
+
+## Relay Companion MVP P3.9-C0-A1a2 Runtime v2 cutover 门禁
+
+本门禁防御的具体场景是：真实 DB v4 里的 Runtime v1 catalog/snapshot ciphertext 在 schema version
+未变化时被新 daemon 误判损坏、启动期 reseal，或经 UDS 仍发送缺少 v2 必填字段的旧 plaintext。
+
+A1a2 因新增行口径达到 2,143 行，拆成 1,748 行 main cutover `c28a968` 与 395 行真实 reader
+`c36a4f9`；两者均低于 2,000 行刹车线。独立 spec/security/quality review 的 1 个 P1 与 4 个 P2
+均已修复并复核，无残留 P0/P1/P2。A1a complete，A1 仍等待 A1b。
+
+标准回归至少运行：
+
+```bash
+# Runtime v2 contract、deny-unknown、neutrality/private-handle、schema drift 与 current fixture
+cargo test -p agentdeck-protocol -- --test-threads=1
+cargo test -p agentdeck-cli --test protocol_schema_exports
+cargo run -q -p agentdeck-cli -- protocol runtime-schema \
+  | diff - protocol/agentdeck/runtime-protocol.schema.json
+
+# Runtime-bound TBS/HPKE 与 Relay fixture metadata 的 Rust/Swift 共享向量
+cargo test -p agentdeck-crypto -- --test-threads=1
+swift test --filter RelayCryptoVectorTests
+cargo test -p agentdeckd --test adapter_state_boundary -- --test-threads=1
+
+cargo test -p agentdeckd --lib \
+  runtime::store::snapshot::tests::legacy_runtime_v1_catalog_baseline_dual_decodes_without_rewrite \
+  -- --exact
+cargo test -p agentdeckd --lib \
+  runtime::snapshot::tests::canonical_legacy_v4_snapshot_dual_decodes_to_v2_wire -- --exact
+cargo test -p agentdeckd --lib \
+  runtime::subscription::egress::tests::production_egress_sends_the_sixty_fifth_json_part \
+  -- --exact
+cargo test -p agentdeckd --lib \
+  runtime::subscription::pump::tests::legacy_v1_snapshot_expansion_keeps_payload_too_large_wire_code \
+  -- --exact
+```
+
+真实样本门禁固定由 cutover 前 `3b83391`（Runtime v1/schema v4/crypto context v1）的真实 writer 在
+exact-0700 临时目录生成 `runtime.db`/WAL/SHM 与 exact-0600 临时 KEK；当前 reader 用显式
+`AGENTDECK_A1A2_FIXTURE_DIR` 运行 ignored test，完成 catalog delta、既有 catalog baseline、conversation
+snapshot `TransferPart`/逐帧 ACK/`SyncComplete` readback，并比较 authenticated ciphertext manifest：
+
+```bash
+AGENTDECK_A1A2_FIXTURE_DIR=/absolute/private/artifact \
+cargo test --locked -p agentdeckd --lib \
+  'runtime::core::tests::subscription_tests::a1a2_legacy_readback::reads_runtime_v1_v4_sample_as_v2_without_rewrite' \
+  -- --ignored --exact --nocapture --test-threads=1
+```
+
+2026-07-16 实跑 manifest before/after 均为
+`488193ed84b3c777fb0cf394845e5068ff0f6b21f8d782a13bf2ebffa7ad779a`；legacy plaintext 与 v2 wire
+分别为 `e48db4fcec7a42edf6b2d94de719216cc9bfc1f65d9cdb9f88237727cc139491`、
+`d5607fa2d85ea9ee97f0359761c7bd442d15456b40419ce47ff4b6788f013e5e`。临时 artifact/KEK 与 archive
+target 必须在记录非秘密哈希后删除，不能提交。该证据不替代 production Keychain entitlement、live vendor
+或 crash durability gate。
+
+```text
+wrapped_key_bundle_sha256=bebfaca607960649843eb31d340b388d83d9079cb40c980f4c0a9e29dc9edf76
+catalog_delta_ciphertext_sha256=6b9042a0ef4f24dc7de3ace24bd76f3acb24583197bd446317c6953c76f8ce11
+catalog_snapshot_ciphertext_sha256=2d820488043f7cfb27d88bf3011fa12777065db0618edd84863d646fd437e3eb
+conversation_snapshot_ciphertext_sha256=9198f808c44e90bf160d411bd18638b1926ea3a7fca5c730aee70fcfe41eadcb
+legacy_snapshot_plaintext_sha256=e48db4fcec7a42edf6b2d94de719216cc9bfc1f65d9cdb9f88237727cc139491
+v2_snapshot_wire_sha256=d5607fa2d85ea9ee97f0359761c7bd442d15456b40419ce47ff4b6788f013e5e
+logical_manifest_before=488193ed84b3c777fb0cf394845e5068ff0f6b21f8d782a13bf2ebffa7ad779a
+logical_manifest_after=488193ed84b3c777fb0cf394845e5068ff0f6b21f8d782a13bf2ebffa7ad779a
+```
 
 ## AppKit 重写后的验证清单
 

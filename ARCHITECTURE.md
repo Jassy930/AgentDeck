@@ -34,7 +34,7 @@ AgentDeck 不做 IDE，不做通用多 agent 聊天界面，不是 Codex Desktop
 │  RuntimeHub（admin/read stdio compatibility）                   │
 │       └─ production 拒绝 SessionStart / SessionContinue          │
 │  local::listener（retained-dirfd canonical UDS + supervisor）    │
-│       └─ same-EUID → preface → RuntimeEnvelope v1              │
+│       └─ same-EUID → preface → RuntimeEnvelope v2               │
 │  RuntimeCore（exec-gate + local connection actor 已就绪）        │
 │       └─→ AgentRouter（按 conversation.agentKind 路由）           │
 │            ├─ CodexAdapter      (capabilities = {...})          │
@@ -56,7 +56,9 @@ agentdeckd
 - `Sources/AgentDeck/`：macOS 原生 UI、会话模型、历史回放和本地交互。UI 只能通过 `CapabilityRouter` 消费 `SessionCapabilities` 决定渲染路径，禁止直接读 vendor 字段或硬编码 `if agentKind == .codex` 分支。
 - `agentdeck-protocol/`：IPC 协议事实源 crate。分 trunk / capabilities / vendor / transport 四个模块，`PROTOCOL_VERSION` = 2，`protocol_schema()` 聚合所有 v2 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
-- `agentdeckd/src/local/`：本地 Runtime v1 framing、same-EUID peer gate、每连接 Unix actor、retained-dirfd
+- `agentdeckd/src/local/`：当前为本地 Runtime v2 framing；A1a main cutover / real-data reader 分别由
+  `c28a968` / `c36a4f9` 收口。
+  same-EUID peer gate、每连接 Unix actor、retained-dirfd
   secure listener 与显式 stdio compatibility wrapper。listener 在 bind 时持有完成 recovery 的 Core，
   supervisor 停止 accept 后 graceful cancel/join 全部连接。
 - `agentdeckd/src/agent.rs`：`Agent` trait + `AgentKind` 枚举。两个 adapter 共享的逻辑在此，不得让 adapter 相互引用。
@@ -536,8 +538,10 @@ conversation/key，不能伪造身份连续性。
 - `machine_enrollment_receipts` 只是 MachineRoot 丢失后仍可读的非秘密 locator，不带 MAC、
   也不是 purge authorization。P4 trust-reset 必须用 Relay/admin-signed receipt 独立验证 old
   route/root fingerprint；不得仅凭该表执行远端删除。
-- P3.2/P3.3 只建立并验证 store + adapter private boundary；P3.4 已由 RuntimeCore actor 把
-  Runtime v1 的 Start/SendPrompt/cancel/query 接入，P3.8 已完成 accepted-stream actor 与 recovery 后
+- P3.2/P3.3 只建立并验证 store + adapter private boundary；P3.4 当时由 RuntimeCore actor 把
+  Runtime v1 的 Start/SendPrompt/cancel/query 接入；P3.9-C0-A1a1 已提交 additive DTO，A1a2 又由
+  `c28a968` / `c36a4f9` 完成 public Runtime v2 wire、真实 v1/schema v4 样本读回与独立终审；
+  P3.8 已完成 accepted-stream actor 与 recovery 后
   production secure bind/bootstrap；App/CLI 默认连接仍待 P3.9，因此本节仍不是 shared local client
   或远程端到端可用声明。
 
@@ -677,11 +681,15 @@ conversation/key，不能伪造身份连续性。
 
 ### Relay Companion MVP P3.6 canonical stream 不变量
 
-- `RuntimeEnvelope v1` 的 stream contract 已由 `7731d1e` 冻结：cursor 使用 checked
+- stream contract 最初以 `RuntimeEnvelope v1` 由 `7731d1e` 冻结；P3.9-C0-A1a 已由
+  `c28a968` / `c36a4f9` 将它原子承载到 v2 并完成阶段门禁：
+  cursor 使用 checked
   `BeforeFirst/At`，Catalog/Conversation 使用 tagged inner cursor 与 subscription target；
   `RuntimeEvent.itemId/entityId/commandId` 是 required-null identity matrix；Backfill 必须连续非空，
   `RuntimeSyncComplete` 只能是 directed Reply。JSON/UDS raw part 固定 700 KiB，remote compact
-  carrier 才允许 3.5 MiB；两者都受 64 parts/64 MiB 总上界。
+  carrier 才允许 3.5 MiB；JSON/UDS 最多 94 parts，compact 最多 64 parts，两者都受 64 MiB
+  总上界。恰好占满旧 64 MiB 的 v1 snapshot 若因 v2 必填字段扩张而超限，返回 typed
+  `PayloadTooLarge`，不截断或改写旧 ciphertext。
 - P3.6-C transport-neutral stream/barrier/snapshot/transfer/publication 组件已由 `694f2d9`
   收口；本节描述的是该组件 contract，不表示 P3/P4 或远程 Companion 已完成。
 - schema v4 与 read-only WAL pool 已由 `02cc640` 落地。logical event suffix 每 conversation

@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P2.10、P3.5 与 P3.6-A/B/C/D 已完成；P3.7 已裁决采用 cooperative-descendant PGID 边界，current-binary exec-gate、typed driver/durable ACK、PGID fencing、两遍 recovery、prepare 唯一 reaper 与 typed clean/unknown disposition 均已实现；最终完整自动门禁与独立终审已通过，并由 `5568e93` 完成主体 scoped commit、`c9d2146`/`5713be4` 补齐真实 release 前取消与 sentinel 退出窗口门禁；前置分片为 `819aa5e`/`1acf8b8`/`3f22cf0`；P3.1 签名 Keychain 仍有 1 项 ignored/BLOCKED，P3.8–P6 仍未完成（2026-07-15） |
+| 状态 | Approved target；P2.10、P3.5、P3.6-A/B/C/D、P3.7 与 P3.8 已完成；P3.9-C0-A0、A1a1、A1a2a、A1a2b 已分别由 `d4057f1`、`3b83391`、`c28a968`、`c36a4f9` 完成，A1a complete；A1b 与 A2 以后未开始；P3.1 签名 Keychain 仍有 1 项 ignored/BLOCKED（2026-07-16） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-01-agentdeck-mobile-relay-design.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -21,15 +21,17 @@
 - 取代 `CommandDelivered` 被 UI/CLI 当作业务成功的语义。
 - 取代生产 TLS 配置失败时回退明文的行为。
 
-本文不宣称当前代码已经具备全部目标能力。截至 2026-07-15，Relay v2 cutover/P2.10、RuntimeCore/
+本文不宣称当前代码已经具备全部目标能力。截至 2026-07-16，Relay v2 cutover/P2.10、RuntimeCore/
 approval 与 P3.6 transport-neutral stream component（`694f2d9`）已落地；P3.7 current-binary
 exec-gate/recovery 已实现，cooperative-descendant PGID 边界已裁决；release 前唯一 reaper、调用 Tokio
 `Command::spawn()` 前可证明无 child 的 clean prepare failure，以及从调用 Tokio spawn 起的 unknown
 failure 分类已经修复；最终完整自动门禁与独立终审均已通过，并由 `5568e93` 完成主体 scoped commit、
 `c9d2146` / `5713be4` 补齐真实 release 前取消与 sentinel 退出窗口门禁。
 fixture/typed adapter/typed journal 前置分片为 `819aa5e` / `1acf8b8` /
-`3f22cf0`。
-App/CLI singleton UDS、LaunchAgent、P4 Machine identity/E2EE/Relay Publish 和真实 Companion 仍未完成，
+`3f22cf0`。P3.8 production UDS 已完成；P3.9-C0-A0 与 additive DTO 切片 A1a1 已提交，Runtime v2
+outer/callsite/schema/vector 与真实 v1/schema v4 readback 又分别由 `c28a968` / `c36a4f9` 完成，
+A1a complete；A1b/A2 与 shared-daemon client 尚未完成。
+App/CLI shared-daemon cutover、LaunchAgent、P4 Machine identity/E2EE/Relay Publish 和真实 Companion 仍未完成，
 iOS 仍只有 fixture 驱动骨架。
 P3.1 provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate。完整实施仍必须满足 §17 的
 Definition of Done。
@@ -534,6 +536,10 @@ history 时直接切到 UDS，会让用户选择静默回落默认值、历史�
 
 - `RUNTIME_PROTOCOL_VERSION` 从 1 升到 2。所有绑定 Runtime version 的 schema、Rust/Swift fixture、Relay
   cert/TBS、revocation 与 vectors 同步重生成；旧 v1 production client typed mismatch，不保留双栈 parser。
+  `ToBeSignedV1` 与 pairing/key-update HPKE info 会绑定当前 Runtime version，而 signed DTO 不重复携带签发时
+  版本；因此本次在 P4 production pairing 落地前做一次 hard cutover：P2/P3 synthetic Relay DB、cert、grant、
+  revocation 与 retirement fixture 不允许跨版本复用，开发环境必须 reset/re-enroll/re-pair。A1b 用旧 v1 TBS
+  真实签名在 v2 verifier 下拒绝且 Store 零提交的门禁固定该边界，不能只重跑 dummy-signature wire fixture。
 - 新会话固定 `Start → ConfigureConversation(rev0) → Subscribe → SendPrompt(expected rev1)`。
   configuration append-only；Configure 以 expected revision + idempotency 做 CAS，Accepted command 同事务 pin
   exact revision，重启恢复按该 revision 构造 driver。之后的 Configure 只影响之后 Accepted 的 prompt。
@@ -1023,7 +1029,7 @@ owner；P4 必须在真实 signed-sealed publisher/RemoteLink 下重新通过 cr
 
 ### 9.7 Transfer carrier、重组与 inner HWM
 
-保留远程 raw part 3.5 MiB、单 transfer 64 parts/64 MiB、absolute TTL 5 分钟。为避免 JSON base64
+保留远程 raw part 3.5 MiB、compact 单 transfer 64 parts、总量 64 MiB、absolute TTL 5 分钟。为避免 JSON base64
 使 3.5 MiB part 超过 Relay 4 MiB，远程链路新增 compact binary
 `RuntimeTransferCarrierV1(runtimeVersion,messageId,channel,transferId,partIndex,partCount,totalSha256,totalBytes,rawPart)`；
 channel 只能 Reply/Stream，E2EE `SealedPayloadKind` 新增 `TransferPart`，Relay outer 仍只见 opaque
@@ -1033,8 +1039,9 @@ sealedBlob。JSON/UDS 使用更小的 transport-specific part 常量，并用 wo
 `RuntimeEnvelope` 必须严格小于 UDS JSONL 1 MiB hard cap。3.5 MiB 仅属于 `ADRT1` remote carrier，
 其 AEAD tag、signed sealed blob 与 Relay outer 完整编码必须严格小于 4 MiB。
 transport-specific representability 同样必须校验：JSON/UDS 的 `totalBytes` 不得大于
-`partCount * 700 KiB`；remote compact carrier 则按 `partCount * 3.5 MiB`，两者仍同时受 64 MiB
-transfer 总上限。不能声明一份由该 transport 的全部 parts 永远无法组成的 totalBytes。
+`partCount * 700 KiB`，并用独立 94-part ceiling 覆盖完整 64 MiB；remote compact carrier 则按
+`partCount * 3.5 MiB` 且保持 64-part ceiling。两者仍同时受 64 MiB transfer 总上限；part 数增加不
+扩大 reassembly memory 或 TTL。不能声明一份由该 transport 的全部 parts 永远无法组成的 totalBytes。
 
 重组完成前先比较已计入 connection budget 的 `bufferedBytes == totalBytes`，不匹配时必须在按
 `totalBytes` 预分配 assembly buffer 之前 abort 并释放预算；否则 64 个极小/零字节 parts 可诱导

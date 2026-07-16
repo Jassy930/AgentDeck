@@ -213,7 +213,7 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（P3.7 exec-gate 已完成，P3 整体未完成）
+## Relay Companion MVP 实施状态（P3.8 与 P3.9-C0-A1a 已完成，P3 整体未完成）
 
 Relay production binary 已原子切换到 **Relay v2**。公开数据面只接受
 `/v2/connect`、`/v2/pair` 与 enrollment 所需的 `POST /v2/machine-enroll`；
@@ -391,10 +391,15 @@ P3.2 不能宣称已防住整库历史回滚。
 
 ### P3.4 RuntimeCore 当前边界
 
-transport-neutral `RuntimeCore` 已把 Runtime v1 的纯幂等 Start、SendPrompt、显式
+transport-neutral `RuntimeCore` 与 production UDS framing 当前使用 Runtime v2：A1a1 由 `3b83391`
+冻结 additive configuration/metadata/upgrade DTO，A1a2 main cutover 与真实 v1/schema v4 reader
+分别由 `c28a968` / `c36a4f9` 收口。已落地的纯幂等 Start、显式
 CancelQueued/CancelActive 与精确 QueryReceipt 接到 Runtime journal。Start 不再携带首 prompt；
 相同 owner+start key 由 StorageKEK 域分离 capability 稳定派生，跨重启返回同一
-`conversationId/adapterStateKey` 和准确 replay bit。prompt
+公共 `conversationId` 和准确 replay bit；Start receipt、Catalog 与 snapshot wire 已删除
+daemon-private adapter handle。C0-B configuration store 落地前，production `SendPrompt` 对所有 revision
+typed `feature_unavailable`；只有 `#[cfg(test)]` legacy harness 可使用显式 revision 0，新增 mutation
+同样 fail-closed。prompt
 actor 以 journal `commandSeq` 为唯一 FIFO，同 conversation 只有一个 active，不同 conversation
 可由全局 semaphore 并行；control 使用有界优先批次，ReadPool 满时立即 overload，不排无界
 waiter。
@@ -546,7 +551,8 @@ all-target check/clippy、schema、Swift、自检、no-net/docs/fmt/diff 门禁�
 durable event ACK → terminal，并在 reopen/backfill 后读回 canonical item 与唯一 terminal。probe 不接受
 binary/root 注入，内部原子创建随机临时目录并 RAII 清理；它使用
 `/bin/sh` 无副作用 helper，不替代真实 Codex/Claude Code 登录、真实 approval 或 P6 跨设备证据。
-P3.8-B production UDS/bootstrap 已由 `1e7f9ea` / `459f32a` 完成；P3.9 App/CLI 默认 UDS cutover、P3.10 LaunchAgent、
+P3.8-B production UDS/bootstrap 已由 `1e7f9ea` / `459f32a` 完成；P3.9-C0-A1a Runtime v2 Rust
+cutover 已完成，但 A1b 旧签名材料拒绝门禁、A2 Swift v2 mirror、App/CLI 默认 UDS cutover、P3.10 LaunchAgent、
 P4 RemoteLink、P5/P6 客户端与实机证据仍未完成；
 P3.1 provisioned signed Keychain roundtrip 也仍是外部 BLOCKED gate。
 具体命令与资源矩阵见 [docs/QUALITY.md](docs/QUALITY.md)。

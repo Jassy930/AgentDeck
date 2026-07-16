@@ -566,7 +566,7 @@ fixture 泄漏，或把 test-only admission 暴露为运行时配置。
 | `daemon.runtime.execution_failed` | 已获 durable release 的 turn 在 adapter/vendor 执行期失败；event journal 只保存固定 `agent execution failed`，不持久化 vendor stderr、token、路径或 diagnostic reference | 以原 commandId/eventId 查询 durable Error 并按同 eventId exact replay；详细原因只查本机脱敏 diagnostic log，不把原始 vendor 错误补写进 Runtime event |
 | `daemon.command.idempotency_conflict` | 同 conversation + stable owner + key 被不同 payload 重用 | 使用原 payload 查询原 command；新意图必须换新 key |
 | `daemon.command.queue_full` | conversation 32、全机 1,024 或 queued payload 256 MiB 任一先到 | 等待/取消已有 Accepted 后以同一请求重试；满载时 exact replay 仍应成功 |
-| `daemon.payload.item_too_large` | prompt、descriptor、intent/event/fence/result 超过各自硬上界 | 在进入 store 前缩小对应 item；不能切片成多个同 key 请求规避 |
+| `daemon.payload.item_too_large` | prompt、descriptor、intent/event/fence/result 超过各自硬上界，或已认证 Runtime v1 snapshot 加入 v2 必填字段后超过 64 MiB | 新输入须在进入 store 前缩小，不能切片成多个同 key 请求规避；旧 snapshot 保留原 ciphertext 证据并走显式恢复，禁止截断、重建或 reseal |
 | `daemon.runtime.recovery_too_large` | 单个 conversation recovery page 的 retained projection 超过固定 80 MiB | 视为 schema/cap 漂移或损坏并 fail-close；不能改用全库物化或复用 async lane budget，保留证据后核对 item hard limits |
 | `daemon.command.queue_expired` | Accepted 到达 24 小时边界，已事务化为 Expired 并写 canonical event | 不自动重放旧 vendor 副作用；用新 idempotency key 发起新命令 |
 
@@ -575,7 +575,7 @@ P3.4 RuntimeCore 的 transport-neutral failure：
 | code | 含义 | 下一步 |
 | --- | --- | --- |
 | `daemon.runtime.not_ready` | Core 尚未完成 paged recovery，或正在 draining/stopped | 等待 daemon readiness；若 recovery 无法完成，按上节保留 DB/Keychain 证据并 fail-close |
-| `daemon.runtime.protocol_mismatch` | Runtime v1 版本不兼容 | 升级客户端/daemon 到同一 Runtime protocol；不能回退 Relay/IPC 业务字段 |
+| `daemon.runtime.protocol_mismatch` | Runtime protocol 版本不兼容 | 升级客户端/daemon 到同一 Runtime protocol；不能回退 Relay/IPC 业务字段 |
 | `daemon.runtime.invalid_request` | ID 非 canonical UUID、Start key/cwd 或其他规范化输入非法 | 修正原请求；不得由 daemon 猜 ID/path 或替客户端补目标 |
 | `daemon.runtime.feature_unavailable` | 请求属于尚未接线的后续 phase（P3.9–P4，例如 shared-daemon client、upgrade、pairing/revoke/trust reset） | 读取 capabilities/实施状态后等待对应 phase；production local transport 已进入 P3.8，production execution 已进入 P3.7，Catalog/Subscribe/Backfill 已进入 P3.6，不应再用该 code 代替其真实错误；不得用 compatibility path 或 fake coordinator 假成功 |
 | `daemon.authorization.revoked` | opaque principal lease 已 Revoking/Revoked 或 issuer registry 不可用 | 停止该 connection；remote 设备按 durable revocation/re-pair 流程处理，本地重新认证 peer credential |

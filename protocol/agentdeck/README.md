@@ -8,9 +8,14 @@
 | 版本轴 | 版本常量 | 快照文件 | 聚合 schema 函数 | CLI 导出命令 | 重生成命令 |
 | --- | --- | --- | --- | --- | --- |
 | 本地 IPC（CLI/Swift ⇄ daemon） | `agentdeck_protocol::PROTOCOL_VERSION` = 2 | `agentdeck-protocol.schema.json` | `agentdeck_protocol::protocol_schema()` | `agentdeck protocol schema` | `UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot` |
-| Runtime（daemon ⇄ 远端 Runtime 端点） | `agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION` = 1 | `runtime-protocol.schema.json` | `agentdeck_protocol::runtime::runtime_schema()` | `agentdeck protocol runtime-schema` | `UPDATE_RUNTIME_SCHEMA=1 cargo test -p agentdeck-protocol runtime_schema_matches_committed_snapshot` |
+| Runtime（daemon ⇄ 远端 Runtime 端点） | `agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION` = 2 | `runtime-protocol.schema.json` | `agentdeck_protocol::runtime::runtime_schema()` | `agentdeck protocol runtime-schema` | `UPDATE_RUNTIME_SCHEMA=1 cargo test -p agentdeck-protocol runtime_schema_matches_committed_snapshot` |
 | Relay v2（endpoint ⇄ relay 外层可见字段） | `agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION` = 2 | `relay-v2.schema.json` | `agentdeck_protocol::relay_v2::relay_v2_schema()` | `agentdeck protocol relay-schema` | `UPDATE_RELAY_SCHEMA=1 cargo test -p agentdeck-protocol relay_v2_schema_matches_committed_snapshot` |
 | E2EE（endpoint 侧密文/签名契约） | `agentdeck_protocol::e2ee::E2EE_FORMAT_VERSION` = 1 | `e2ee-v1.schema.json` | `agentdeck_protocol::e2ee::e2ee_schema()` | `agentdeck protocol e2ee-schema` | `UPDATE_E2EE_SCHEMA=1 cargo test -p agentdeck-protocol e2ee_schema_matches_committed_snapshot` |
+
+Runtime v2 Rust contract、schema 与 current fixture 已由 P3.9-C0-A1a2 的 `c28a968` 完成，真实
+Runtime v1/schema v4 persisted readback 由 `c36a4f9` 收口。Swift production mirror/cutover 仍属于
+P3.9-C0-A2；冻结的 `runtime-v1-wire.jsonl` 仅供 A2 前的 Swift compatibility 回归读取，不是当前
+Runtime contract gate。
 
 四个 `agentdeck protocol <op>` 子命令（连同 `protocol version`）都是纯本地
 计算：它们直接调用上表对应的聚合 schema 函数并原样打印，**不 spawn

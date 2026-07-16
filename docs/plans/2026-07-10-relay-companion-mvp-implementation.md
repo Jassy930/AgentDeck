@@ -31,7 +31,8 @@
 - Keychain/DB counter 顺序固定为“先提升 CounterGuard high-water，再提交可消费 block”；检测 DB rollback、nonce reuse、key revision rollback 时 remote fail-closed。
 - 资源硬上界：Relay frame 4 MiB；compact remote raw part 3.5 MiB；JSON/UDS raw part 固定
   700 KiB，并以 worst-case 实际编码证明完整 `RuntimeEnvelope` 严格小于 JSONL/UDS 1 MiB hard
-  cap；transfer 64 parts/64 MiB/5 分钟；prompt 256 KiB；每 conversation
+  cap；compact transfer 最多 64 parts，JSON/UDS 最多 94 parts，两者共同受 64 MiB/5 分钟
+  总上界；prompt 256 KiB；每 conversation
   32 个 queued prompt；全机 1,024 个/256 MiB/24 小时；Runtime DB 2 GiB。
 - P3.6 固定配额：subscription 64/connection、4,096 global；pending capture 4/connection、
   128 global（Store capture/spawn 前准入）；barrier 4/connection、128 global、
@@ -1205,8 +1206,9 @@ P3.6 后续代码只能消费本 task 冻结的类型；禁止在 store/barrier 
 固定 integration contract 以 test runner 的 `--list` 输出为事实源：`runtime_stream` 当前 45 项，
 分为 `barrier_integrity` 14 项、`contract` 7 项与 `store_commit_hub` 24 项；`runtime_transfer` 当前
 17 项。前者覆盖 authenticated snapshot/publication cut、StoreCommitHub COMMIT race、空流、
-retention 与 identity contract；后者覆盖 JSON/remote carrier profile、64-part/64 MiB、TTL、
-duplicate/metadata/hash/length、stale generation、checked accounting 与 reducer single-apply。
+retention 与 identity contract；后者覆盖 JSON/UDS 94 parts、remote compact 64 parts、共同
+64 MiB 与 5 分钟 TTL、duplicate/metadata/hash/length、stale generation、checked accounting
+与 reducer single-apply。
 subscription egress ordering、quota、disconnect/TTL cleanup、snapshot permit/pin ownership、catalog
 expiry timer 与 publication dispatcher 的 private behavior 由 `cargo test -p agentdeckd --lib runtime::`
 共同锁定，当前 subscription 串行门禁为 36 项。新增 terminal gate 6 项精确覆盖 disconnect 无锁环、
@@ -1614,10 +1616,11 @@ P3.9 固定以下迁移边界：
    list→import→Catalog→Snapshot/readback；合成 round-trip/fixture 不能替代真实样本。
 
 **Files:**
-- Create: `agentdeck-protocol/src/runtime/configuration.rs`
+- Create: `agentdeck-protocol/src/runtime/{configuration,metadata,upgrade}.rs`
+- Create: `agentdeck-protocol/tests/runtime_v2_dto_primitives.rs`
 - Rename/Modify: `agentdeck-protocol/tests/runtime_v1_contract.rs` → `runtime_v2_contract.rs`
-- Rename/Modify: `protocol/agentdeck/fixtures/runtime-v1-wire.jsonl` → `runtime-v2-wire.jsonl`；旧 fixture 不再
-  作为 current contract gate 保留
+- Create: `protocol/agentdeck/fixtures/runtime-v2-wire.jsonl`；既有 `runtime-v1-wire.jsonl` 在 A2 前继续
+  作为 frozen Swift compatibility artifact 保留，current Rust contract gate 原子切换到新增 v2 fixture
 - Create: `agentdeck-cli/src/unix_transport.rs`
 - Create: `agentdeck-cli/src/installation.rs`
 - Create: `agentdeck-cli/tests/shared_daemon.rs`
@@ -1659,10 +1662,42 @@ P3.9 固定以下迁移边界：
   `DescribeAgents`、`ConfigureConversation`、`UpdateConversationMetadata`、dormant local-only
   `StageUpgrade`、configuration/metadata/upgrade receipts、
   `SendPrompt.expectedConfigurationRevision`、receipt/snapshot/event revision。把 Runtime version 升到 2，
-  从 Start receipt/Catalog 删除 adapterStateKey，把 current fixture 以 `git mv` 原子升级到 v2，更新 schema
-  与 Relay-bound vectors；v1 mismatch、neutrality、deny-unknown、CAS DTO 与 private-handle scan 全绿，独立
+  从 Start receipt/Catalog 删除 adapterStateKey，保留 frozen v1 fixture 并新增 v2 fixture、原子切换
+  current Rust gate，更新 schema 与 Relay-bound vectors；v1 mismatch、neutrality、deny-unknown、CAS DTO
+  与 private-handle scan 全绿，独立
   review 后提交
   `feat(protocol): 升级 shared daemon Runtime v2 契约`。
+  - [x] **A1a1 additive validated DTO primitives：** 只增加 configuration、metadata、upgrade 与 agent
+    discovery 的 validated DTO、receipt 对称校验和行为测试；不提升 production Runtime version、不删除
+    既有 public 字段、不改 daemon callsite/schema/vector。commit `3b83391`；代码与测试共 1,373 行，
+    DTO 3/3、protocol all-target check、production lib clippy、fmt/diff 与 clean detached HEAD 独立复验
+    全绿，终审无 P0/P1/P2。
+  - [x] **A1a2 Runtime v2 outer cutover/callsite/vectors：** 已原子提升 Runtime version、接入 outer
+    request/reply/event/snapshot/catalog，删除 public private-handle，明确 daemon rev0/feature-unavailable
+    过渡语义，并同步 schema、current Runtime fixture、共享 crypto golden 与 Relay fixture metadata。
+    frozen v1 Swift compatibility fixture 继续保留；v4 persisted catalog/snapshot 使用严格 legacy
+    dual-decode/readback，`runtime_meta.schema_version` 未变化时不会把已存在状态误判损坏。
+    最终按新增行口径复算为 2,143 行，不能用删除旧 contract test 后的净增规避 2,000 行刹车线，因此拆成：
+    - [x] **A1a2a main cutover：** commit `c28a968`；Rust/Swift 代码与测试新增 1,748 行，包含 Runtime v2
+      outer/callsites、carrier-specific transfer 上限、legacy dual-decode、schema/fixture/vector 与
+      production pump typed `PayloadTooLarge` 映射。
+    - [x] **A1a2b real-data reader：** commit `c36a4f9`；新增 395 行，只接入 ignored 真实样本 reader，
+      不增加 production API 或旁路构造器。cutover 前 `3b83391` 的真实 Runtime v1 writer 生成临时 DB
+      v4/KEK，当前 reader 完成 catalog delta、既有 catalog baseline 与两段 conversation snapshot
+      transfer 的 v2 readback；该门禁发现并修复了“转换后 DTO 与旧 plaintext 做 canonical 比较”的
+      baseline bug。ciphertext logical manifest 前后均为
+      `488193ed84b3c777fb0cf394845e5068ff0f6b21f8d782a13bf2ebffa7ad779a`；legacy plaintext=
+      `e48db4fcec7a42edf6b2d94de719216cc9bfc1f65d9cdb9f88237727cc139491`，v2 wire=
+      `d5607fa2d85ea9ee97f0359761c7bd442d15456b40419ce47ff4b6788f013e5e`；临时 KEK/DB 与 1.1 GiB
+      archive target 已按 exact tempdir 删除。
+    JSON/UDS 使用独立 94-part ceiling 表达完整 64 MiB，remote compact 保持 64 parts；若合法 v1
+    plaintext 已恰好占满 64 MiB，新增必填字段后向 subscription client 返回 typed
+    `daemon.payload.item_too_large`，不截断、rebuild 或改写旧 ciphertext。独立 spec/security/quality
+    终审发现的 1 个 P1 与 4 个 P2 均已修复并复核，无残留 P0/P1/P2。A1a1+A1a2 已完成，故 A1a
+    complete；A1 仍等待下面的 A1b，不能提前勾选。
+  - [ ] **A1b signed-material hard-cutover gate：** 单独补 Runtime v1 TBS 签发的 cert/grant/revocation/
+    retirement 在 v2 verifier 下拒绝且 Store 零提交的 Relay E2E，并记录 P4 投产前开发凭据必须
+    reset/re-enroll/re-pair；独立 review/提交。只有 A1a/A1b 都完成才勾选 A1。
 - [ ] **P3.9-C0-A2 Swift v2 mirror：** 在新 `RuntimeV2Types.swift` 只实现 v2 outer/changed DTO，复用 wire
   未变的既有 leaf types，禁止一次性全文件符号替换；新增 v2 tests 并把 production client gate 切到 v2，
   Rust fixture→Swift decode/encode 语义一致，完整 Swift tests 全绿后独立 review/提交。若任一切片新增/修改
