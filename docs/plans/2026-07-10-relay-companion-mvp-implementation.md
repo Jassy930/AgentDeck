@@ -1870,9 +1870,14 @@ P3.9 固定以下迁移边界：
     `daemon.conversation.configuration_conflict` 两个稳定 failure code；不得继续用
     `feature_unavailable`/`invalid_state` 混报未配置与 revision mismatch；同片更新
     `agentdeck-protocol/src/runtime/failure.rs` 与 `docs/AGENT_DIAGNOSTICS.md` failure table。
-  - [ ] **B1a schema freeze：** 只落 v5 DDL/manifest/常量、`schema_signature_v4` 与 v4/v5 ledger domain，
-    先用 in-memory structural tests 锁 20 张表、FK/CHECK/index/totals；production schema bump 与 row migration
-    留 B1b，避免中间提交不可打开现有 DB。
+  - [x] **B1a schema freeze（commit `e48248a`，实际 +1,385/-2）：** 只落 v5 DDL/manifest/常量、
+    `schema_signature_v4` 与 v4/v5 ledger domain；in-memory structural tests 锁定 20 张表、4 张 authenticated
+    sidecar、6 个 ledger totals、FK/CHECK/index、nullable/BeforeFirst 与 sealed/charged-byte 约束。production
+    仍为 v4 16 表，`schema_signature()` 仍指向 v4，golden 为
+    `79203580f3371f0601f6f5241f634e05ef12fa4f7d47a1d145178778e88fc711`；production bump、真实 row
+    migration/authenticated materialization 与真实 v4 样本 byte-exact readback 均留 B1b。schema 12/12、
+    SQLite focused 13/13、daemon lib 652 passed + 1 ignored、Clippy/fmt/App selfcheck/docs/diff 全绿；独立
+    spec/security 终审 Approved。实际规模低于 1,800 行预拆线和 2,000 行硬停线。
   - [ ] **B1b real migration：** 完成 v1/v2/v3/v4→v5 dispatch、容量预检、v4 完整认证、最多 1,024 条
     `conversation_state` 插入、schema/token CAS、before/after-COMMIT fault 与 reopen convergence。当前 HEAD
     `28619a8` 的真实 v4 writer 已生成 1 conversation、1 Started、1 Accepted、1 event/catalog/snapshot/intent
