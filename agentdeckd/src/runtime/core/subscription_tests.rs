@@ -355,6 +355,8 @@ async fn create_indexed_catalog_rows(core: &RuntimeCore, first: u16, count: u16)
     }
 }
 
+#[path = "subscription_tests/a1a2_legacy_readback.rs"]
+mod a1a2_legacy_readback;
 #[path = "subscription_tests/catalog.rs"]
 mod catalog;
 #[path = "subscription_tests/snapshot_store.rs"]
