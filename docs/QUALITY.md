@@ -1224,15 +1224,19 @@ P0/P1/P2；A1 complete。真实 P4 凭据仍必须在投产前按 runbook 受控
 catalog/stream 状态静默分叉。
 
 A2a 已冻结 configuration/metadata/upgrade/agent/changed receipt；A2b 已冻结 catalog、Runtime 专用
-strict vendor-panel、canonical event、snapshot/backfill 与 v1 compatibility symbol boundary。A2c 的
-outer/current codec、98 fixtures 全量、compact carrier 与真实 UDS Swift readback 尚未完成；当前通过
-不代表 App/CLI 默认 UDS client 已 cutover。
+strict vendor-panel、canonical event、snapshot/backfill 与 v1 compatibility symbol boundary。A2c1 已冻结
+request/reply/message/stream/envelope 与 JSON/UDS 700 KiB × 94 parts；A2c2 的 current codec、98 fixtures
+全量、compact carrier 与真实 UDS Swift readback 尚未完成；当前通过不代表 App/CLI 默认 UDS client 已
+cutover。
 
 ```bash
 # A2a strict changed DTO 与 A2b1 stream projection focused gate
 swift test --filter RuntimeV2ProtocolTests
 swift test --filter RuntimeV2StreamProtocolTests
 swift test --filter RuntimeV2SnapshotBackfillTests
+
+# A2c1 outer + JSON transfer focused gate（必须实际执行 8 个 XCTest）
+swift test --filter RuntimeV2OuterJSONTests
 
 # 共享 Core 完整回归与 iOS 编译/单测
 swift test
@@ -1250,8 +1254,10 @@ A2b1 focused 必须实际执行 6 个 XCTest，A2b2 focused 必须实际执行 7
 filter。A2b1 证明 500/501 row、bare encoded exact 64 MiB、Removed 的 `conversation_id`、CC optional
 missing/null/non-null、全部 event body identity 与 standalone/flattened exact round-trip；A2b2 证明
 capabilities-first/config agent、backfill 1…512/sequence/scope/bare 64 MiB、Rust-produced 三条 payload
-readback与 compatibility 0/2/6 source boundary。A2b2 阶段记录为完整 Swift 282 XCTest + 35 Swift
-Testing、iOS 20/20；98 条 fixture 全量仍留给 A2c。
+readback与 compatibility 0/2/6 source boundary。A2c1 另以硬编码 typed path 锁定 97 条 JSON case、
+25/45/26 outer 分布、required-null/default、UTF-8 ID 与 standalone/reply/stream transfer 双向负向矩阵；
+阶段记录为 focused 8/8、完整 Swift 290 XCTest + 35 Swift Testing、Rust fixture generator 1/1、iOS
+20/20。compact 第 98 条、current facade、frame cap/source gate 与真实 UDS readback 仍留给 A2c2。
 
 ## AppKit 重写后的验证清单
 
@@ -1377,7 +1383,7 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P3.7 exec-gate / typed production execution | 运行本页 prepare disposition、gate/recovery/driver/typed fixture/production wiring 矩阵、完整 daemon package、clippy/fmt/network-boundary/schema/docs/diff；固定 PATH、私有 FD、唯一 reaper、cooperative-descendant PGID fencing、COMMIT-unknown 与 reopen/backfill 必须有行为证据。显式自守护/逃逸不受支持，helper/fixture 不冒充 live vendor approval、UDS 或实机 E2E |
 | Relay Companion MVP P3.8-A local Runtime UDS primitives | 运行本页 framing/peer、local-control/cancellation、真实双连接 `local_uds`、完整 daemon、fmt/clippy/network-boundary/docs/diff；只证明 accepted stream actor，不冒充 P3.8-B secure bind/permit、P3.9 App/CLI cutover 或 remote E2E |
 | Relay Companion MVP P3.8-B production UDS/bootstrap | 运行本页 secure listener/permit/supervisor、config/stdio exhaustive allowlist、真实 binary lifecycle、Rust/Swift compatibility、完整 daemon、fmt/clippy/network-boundary/schema/docs/diff；只证明 production 本地入口，不冒充 P3.9 shared-daemon client、LaunchAgent 或 remote E2E |
-| Relay Companion MVP P3.9-C0-A2 Swift Runtime v2 mirror | 运行本页 A2a/A2b focused、完整 `swift test`、iOS XcodeGen + Simulator、docs/diff；A2c 完成前不得宣称 outer/current codec、98-fixture 全量、真实 UDS Swift readback或 App/CLI 默认 UDS cutover |
+| Relay Companion MVP P3.9-C0-A2 Swift Runtime v2 mirror | 运行本页 A2a/A2b/A2c1 focused、完整 `swift test`、iOS XcodeGen + Simulator、docs/diff；A2c2 完成前不得宣称 current codec、compact/98-fixture 全量、真实 UDS Swift readback 或 App/CLI 默认 UDS cutover |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

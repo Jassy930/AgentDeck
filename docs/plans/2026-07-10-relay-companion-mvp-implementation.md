@@ -1790,7 +1790,7 @@ P3.9 固定以下迁移边界：
       spec/quality 终审 Approved；source gate 扫描范围与 2/6 token 分段定位两个 P2 已复核 Closed。
       frozen v1 compatibility 26/26、完整 Swift 282 XCTest + 35 Swift Testing、iOS 20/20、docs/diff 全绿。
       A2b complete；outer/current codec 与真实 UDS Swift readback 仍只属于 A2c。
-  - [ ] **A2c outer/codec/current gate（约 1,150–1,400 行）：** request/reply/message/stream/envelope、
+  - [ ] **A2c outer/codec/current gate（实际预拆 A2c1/A2c2）：** request/reply/message/stream/envelope、
     JSON/UDS 700 KiB × 94 parts、compact 3.5 MiB × 64 parts、共同 64 MiB 与 `ADRT1` carrier version 2；
     Catalog request `pageCursor` 必须 present、可为 null；`ttlSecs` missing 固定默认 300、显式 null 拒绝；
     message/transfer ID 必须为 1…1024 UTF-8 bytes。
@@ -1809,6 +1809,20 @@ P3.9 固定以下迁移边界：
     `swift test`、既定 iOS XcodeGen + `xcodebuild test`、App selfcheck、docs/diff gate，并独立复审；任何
     0-test filter 不算通过。A2-0 捕获的真实 UDS Hello reply 必须由 current Swift codec 成功读回后才算
     A2 complete。
+    A2c 只读重估为 1,650–2,050 行，可能越过 2,000 行刹车线，因此在落代码前拆成职责独立的两片：
+    - [x] **A2c1 outer + JSON/UDS model（实际 1,798 行）：** commit `c2d2c28`；完成 22 个 Runtime request
+      variant、20 个 reply、3 个 stream、message/envelope strict model，以及 JSON/UDS 700 KiB × 94 parts、
+      64 MiB representability 和 1…1024 UTF-8 bytes identity。测试以硬编码 97-case typed path 锁定
+      25 request / 45 reply / 26 stream + standalone transfer，并对 Catalog required-null、TTL default、
+      standalone/reply/stream invalid transfer、93/94 parts、SHA 31/33 bytes、中文 UTF-8 与 UInt32 极值做
+      双向负向。首轮 quality 的 2 个 P1/4 个 P2 全部 red→green；spec/quality 最终 Approved、无 P0/P1/P2。
+      focused 8/8、完整 Swift 290 XCTest + 35 Swift Testing、Rust fixture generator 1/1、iOS 20/20、
+      docs/diff gate 全绿。本片不含 compact/current/frame source gate 或真实 UDS Swift readback，不代表
+      A2 complete。
+    - [ ] **A2c2 compact + current gate：** 实现 `ADRT1` version 2 compact carrier、严格 `<4 MiB`、
+      JSON/UDS/current codec 的 `<1 MiB` gate、public v2/current constants 与 `RuntimeWireCodec` alias；补齐
+      第 98 条 compact byte-exact、v1/v2 ingress/egress mismatch、production no-v1/source/import gate 与
+      A2-0 真实 UDS Hello Swift readback。A2c2 完成并通过 App selfcheck 前不标 A2/A2c complete。
     任一切片超过 2,000 行立即停下再拆，不以删除/机械 rename 抵消新增行。
 - [ ] **P3.9-C0-B configuration store/execution：** Runtime DB v5 增加 append-only sealed
   configuration versions、conversation/command revision 与 idempotency/token ledger；Configure CAS 与 metadata
