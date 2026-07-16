@@ -754,6 +754,93 @@ fn configuration_count_for_conversation(
     u64::try_from(count).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)
 }
 
+/// 读取 frozen event cursor 对应的最新 configuration。每次读取都对最多 4,096
+/// 条 append-only journal 做完整有界认证；current head 只参与完整性判断，绝不能
+/// 作为 selector 的返回值。
+pub(super) fn load_configuration_state_at_event_cursor(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    conversation_id: RuntimeId,
+    base_event_seq: Option<u64>,
+) -> Result<ConversationConfigurationState, RuntimeStoreError> {
+    let conversation =
+        super::journal::load_conversation(connection, key_bundle, database_id, conversation_id)?;
+    let current_revision =
+        load_conversation_state(connection, key_bundle, conversation_id)?.current_revision()?;
+    if base_event_seq.is_some_and(|base_event_seq| {
+        conversation
+            .event_high_water
+            .is_none_or(|event_high_water| base_event_seq > event_high_water)
+    }) {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT conversation_id, configuration_revision, base_configuration_revision,
+                event_seq, owner_token, idempotency_token, request_token,
+                logical_configuration_bytes, logical_request_bytes, created_at_ms,
+                metadata_token, sealed_request
+         FROM configuration_journal
+         WHERE conversation_id = ?1
+         ORDER BY configuration_revision",
+    )?;
+    let rows = statement.query_map([&conversation_id.as_bytes()[..]], raw_configuration_row)?;
+    let mut next_revision = 1_u64;
+    let mut last_event_seq = None;
+    let mut selected = None;
+    for row in rows {
+        if next_revision > MAX_CONFIGURATIONS_PER_CONVERSATION {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        let authenticated = authenticate_configuration_row(
+            connection,
+            key_bundle,
+            database_id,
+            &conversation,
+            row?,
+        )?;
+        let record = authenticated.record;
+        if record.conversation_id != conversation_id
+            || record.configuration_revision != next_revision
+            || record.base_configuration_revision.checked_add(1) != Some(next_revision)
+            || last_event_seq.is_some_and(|previous| record.event_seq <= previous)
+        {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        last_event_seq = Some(record.event_seq);
+        if base_event_seq.is_some_and(|base| record.event_seq <= base) {
+            selected = Some((record.configuration_revision, record.configuration));
+        }
+        next_revision = next_revision
+            .checked_add(1)
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    }
+    let authenticated_count = next_revision - 1;
+    let chain_is_anchored_to_parent = match (
+        current_revision,
+        last_event_seq,
+        conversation.event_high_water,
+    ) {
+        (0, None, _) => true,
+        (0, Some(_), _) | (_, None, _) | (_, Some(_), None) => false,
+        (_, Some(last_configuration_event), Some(parent_event_high_water)) => {
+            last_configuration_event <= parent_event_high_water
+        }
+    };
+    if authenticated_count != current_revision
+        || authenticated_count > MAX_CONFIGURATIONS_PER_CONVERSATION
+        || !chain_is_anchored_to_parent
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let (revision, configuration) = selected
+        .map(|(revision, configuration)| (revision, Some(configuration)))
+        .unwrap_or((0, None));
+    ConversationConfigurationState::new(revision, configuration)
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)
+}
+
 fn ensure_configuration_capacity(
     ledger: &RuntimeLedger,
     conversation_count: u64,

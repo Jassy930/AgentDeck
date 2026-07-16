@@ -275,6 +275,26 @@ impl RuntimeStoreHandle {
         .await?
     }
 
+    /// 认证并选择 frozen event cursor 处的 configuration state。BeforeFirst 由
+    /// `None` 精确表达，不能与 event sequence 0 合并。
+    pub(crate) async fn load_configuration_state_at_event_cursor(
+        &self,
+        conversation_id: super::super::RuntimeId,
+        base_event_seq: Option<u64>,
+    ) -> Result<ConversationConfigurationState, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::LoadConfigurationStateAtEventCursor {
+                conversation_id,
+                base_event_seq,
+                reply,
+            },
+        )
+        .await?
+    }
+
     /// 在持有 TEMP pin 的同一 worker connection 上验 pin、打开完整 descriptor 并
     /// 读取当前 authenticated H。方法只借用语义上的原 pin；BuildInput 继续拥有它。
     pub(crate) async fn prepare_authenticated_snapshot_build_context(
@@ -354,8 +374,8 @@ impl RuntimeStoreHandle {
         Ok((events, next_after, complete, lease))
     }
 
-    /// 原子替换某 conversation 的唯一 ready snapshot；base 必须等于 transaction
-    /// 内再次读取的当前 event high-water。
+    /// 原子替换某 conversation 的唯一 ready snapshot；frozen base 不得高于
+    /// transaction 内再次读取的当前 event high-water，也不得倒退于已存 snapshot。
     pub async fn store_conversation_snapshot(
         &self,
         write: PreparedConversationSnapshotWrite,

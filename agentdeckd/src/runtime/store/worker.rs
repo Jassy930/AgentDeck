@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
-use agentdeck_protocol::runtime::RuntimeEvent;
+use agentdeck_protocol::runtime::{ConversationConfigurationState, RuntimeEvent};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -1412,6 +1412,11 @@ enum ReadCommand {
         conversation_id: super::RuntimeId,
         reply: oneshot::Sender<Result<AuthenticatedConversationSnapshotContext, RuntimeStoreError>>,
     },
+    LoadConfigurationStateAtEventCursor {
+        conversation_id: super::RuntimeId,
+        base_event_seq: Option<u64>,
+        reply: oneshot::Sender<Result<ConversationConfigurationState, RuntimeStoreError>>,
+    },
     PrepareAuthenticatedSnapshotBuildContext {
         pin: RuntimeSnapshotBuildPin,
         reply: oneshot::Sender<Result<AuthenticatedConversationSnapshotContext, RuntimeStoreError>>,
@@ -2173,6 +2178,19 @@ fn handle_read(
                 &state.key_bundle,
                 state.database_id,
                 conversation_id,
+            ));
+        }
+        ReadCommand::LoadConfigurationStateAtEventCursor {
+            conversation_id,
+            base_event_seq,
+            reply,
+        } => {
+            let _ = reply.send(configuration::load_configuration_state_at_event_cursor(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+                conversation_id,
+                base_event_seq,
             ));
         }
         ReadCommand::PrepareAuthenticatedSnapshotBuildContext { pin, reply } => {

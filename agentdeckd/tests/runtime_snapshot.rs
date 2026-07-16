@@ -5,10 +5,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use agentdeck_protocol::runtime::identity::{CommandId, ConversationId, EntityId, ItemId};
-use agentdeck_protocol::runtime::{ConversationSnapshot, SnapshotItem, StreamCursor};
+use agentdeck_protocol::runtime::{
+    CodexConversationConfiguration, ConversationConfiguration, ConversationSnapshot, SnapshotItem,
+    StreamCursor, VendorConfigurationSnapshot,
+};
 use agentdeck_protocol::{
-    ActionDecision, AgentItem, AgentItemMeta, AgentKind, ProtocolError, SessionCapabilities,
-    SessionId, SessionStart, ThreadId, VendorCapabilities, VendorControlPayload,
+    ActionDecision, AgentItem, AgentItemMeta, AgentKind, CodexApprovalPolicy, CodexReasoningEffort,
+    CodexSandboxMode, ProtocolError, SessionCapabilities, SessionId, SessionStart, ThreadId,
+    VendorCapabilities, VendorControlPayload,
 };
 use agentdeckd::agent::{Agent, AgentEventSender, AgentSessionHandle};
 use agentdeckd::runtime::AgentRouter;
@@ -18,12 +22,15 @@ use agentdeckd::runtime::events::{
     SnapshotMaterializationSource, WatchGeneration,
 };
 use agentdeckd::runtime::snapshot::assemble_build_snapshot;
-use agentdeckd::runtime::snapshot::{SnapshotMaterialization, SnapshotMaterializer};
+use agentdeckd::runtime::snapshot::{
+    SnapshotMaterialization, SnapshotMaterializationError, SnapshotMaterializer,
+};
 use agentdeckd::runtime::store::cipher::MAX_RUNTIME_ROW_PLAINTEXT_LEN;
 use agentdeckd::runtime::store::{
-    AcceptCommand, AcceptOutcome, AcceptedTerminationReason, ConversationDescriptor,
-    IdempotencyOwner, NewConversation, RuntimeClock, RuntimeClockError, RuntimeId, RuntimeIdKind,
-    RuntimeStoreConfig, RuntimeStoreHandle, TerminateAcceptedCommand,
+    AcceptCommand, AcceptOutcome, AcceptedTerminationReason, ConfigurationRecord,
+    ConfigureConversation, ConfigureConversationOutcome, ConversationDescriptor, IdempotencyOwner,
+    NewConversation, RuntimeClock, RuntimeClockError, RuntimeId, RuntimeIdKind, RuntimeStoreConfig,
+    RuntimeStoreError, RuntimeStoreHandle, TerminateAcceptedCommand,
 };
 use agentdeckd::security::{MemoryKeyStore, StorageKek, load_or_create_storage_kek};
 
@@ -188,6 +195,44 @@ fn owner(seed: u8) -> IdempotencyOwner {
     }
 }
 
+fn codex_configuration(reasoning: CodexReasoningEffort) -> ConversationConfiguration {
+    ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
+        CodexConversationConfiguration::new(
+            CodexApprovalPolicy::OnRequest,
+            CodexSandboxMode::WorkspaceWrite,
+            reasoning,
+        ),
+    ))
+}
+
+async fn configure_codex(
+    store: &RuntimeStoreHandle,
+    conversation_id: RuntimeId,
+    expected_revision: u64,
+    reasoning: CodexReasoningEffort,
+) -> ConfigurationRecord {
+    let outcome = store
+        .configure_conversation(ConfigureConversation {
+            conversation_id,
+            owner: owner(0xA0),
+            idempotency_key: format!("snapshot-configuration-{expected_revision}"),
+            expected_configuration_revision: expected_revision,
+            configuration: codex_configuration(reasoning),
+        })
+        .await
+        .expect("configure snapshot conversation");
+    match outcome {
+        ConfigureConversationOutcome::Applied { configuration } => configuration,
+        other => panic!("expected applied snapshot configuration, got {other:?}"),
+    }
+}
+
+fn decode_assembled_snapshot(
+    assembled: &agentdeckd::runtime::snapshot::AssembledConversationSnapshot,
+) -> ConversationSnapshot {
+    serde_json::from_slice(assembled.canonical_payload()).expect("decode assembled snapshot")
+}
+
 async fn open_store(root: &TestRoot) -> RuntimeStoreHandle {
     let keys = MemoryKeyStore::new();
     RuntimeStoreHandle::open(
@@ -304,6 +349,60 @@ fn replace_snapshot_ciphertext_with_oversized_blob(database: &Path, conversation
             .expect("replace exact snapshot ciphertext with oversized zeroblob"),
         1
     );
+}
+
+enum ConfigurationHeadTamper {
+    SealedRequest,
+    StateMetadata,
+}
+
+fn tamper_configuration_head(
+    database: &Path,
+    conversation_id: RuntimeId,
+    revision: u64,
+    tamper: ConfigurationHeadTamper,
+) {
+    let connection = rusqlite::Connection::open(database).expect("open configuration tamper DB");
+    match tamper {
+        ConfigurationHeadTamper::SealedRequest => {
+            let encoded_revision = format!("{revision:020}");
+            let mut sealed: Vec<u8> = connection
+                .query_row(
+                    "SELECT sealed_request FROM configuration_journal
+                     WHERE conversation_id = ?1 AND configuration_revision = ?2",
+                    rusqlite::params![&conversation_id.as_bytes()[..], encoded_revision],
+                    |row| row.get(0),
+                )
+                .expect("read current configuration ciphertext");
+            *sealed.last_mut().expect("configuration ciphertext tag") ^= 1;
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE configuration_journal SET sealed_request = ?1
+                         WHERE conversation_id = ?2 AND configuration_revision = ?3",
+                        rusqlite::params![
+                            sealed,
+                            &conversation_id.as_bytes()[..],
+                            format!("{revision:020}")
+                        ],
+                    )
+                    .expect("tamper current configuration ciphertext"),
+                1
+            );
+        }
+        ConfigurationHeadTamper::StateMetadata => {
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE conversation_state SET metadata_token = zeroblob(32)
+                         WHERE conversation_id = ?1",
+                        [&conversation_id.as_bytes()[..]],
+                    )
+                    .expect("tamper current configuration state metadata"),
+                1
+            );
+        }
+    }
 }
 
 async fn accept_one(store: &RuntimeStoreHandle, conversation_id: RuntimeId) -> RuntimeId {
@@ -642,6 +741,508 @@ async fn build_source_keeps_captured_base_when_current_high_water_advances() {
         .await
         .expect("release advancing build pin");
     store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn before_first_build_remains_revision_zero_after_configuration_advances() {
+    // 威胁场景：BeforeFirst 与 event 0 若被混淆，后续 rev1 会被错误投影进一个
+    // 明确冻结在首事件之前的 snapshot。
+    let root = TestRoot::new("configuration-before-first");
+    let store = open_store(&root).await;
+    let input = conversation(0x29, AgentKind::Codex);
+    let conversation_id = input.conversation_id;
+    store
+        .create_conversation(input)
+        .await
+        .expect("create BeforeFirst configuration conversation");
+    let source = capture_source(&store, conversation_id, 29).await;
+    configure_codex(&store, conversation_id, 0, CodexReasoningEffort::Low).await;
+    let materializer =
+        SnapshotMaterializer::new(store.clone(), router(AgentKind::Codex, AgentKind::Codex));
+    let SnapshotMaterialization::Build(mut build) = materializer
+        .materialize(source)
+        .await
+        .expect("materialize frozen BeforeFirst build")
+    else {
+        panic!("frozen BeforeFirst source must remain Build")
+    };
+    let assembled =
+        assemble_build_snapshot(&mut build, Vec::new()).expect("assemble BeforeFirst snapshot");
+    let snapshot = decode_assembled_snapshot(&assembled);
+    assert_eq!(snapshot.base_event_cursor, StreamCursor::BeforeFirst);
+    assert_eq!(snapshot.configuration_state.configuration_revision(), 0);
+    assert!(snapshot.configuration_state.configuration().is_none());
+    materializer
+        .release_build_input(build)
+        .await
+        .expect("release frozen BeforeFirst build");
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn build_uses_configuration_selected_at_ordinary_event_not_current_head() {
+    // 威胁场景：snapshot 若读取 current configuration head，排在 rev1 与 rev2
+    // 之间的普通 event 会在重放时被错误解释为 rev2。
+    let root = TestRoot::new("configuration-cursor-build");
+    let store = open_store(&root).await;
+    let input = conversation(0x2A, AgentKind::Codex);
+    let conversation_id = input.conversation_id;
+    store
+        .create_conversation(input)
+        .await
+        .expect("create cursor configuration conversation");
+    let first = configure_codex(&store, conversation_id, 0, CodexReasoningEffort::Low).await;
+    assert_eq!(first.event_seq, 0);
+    let command_id = accept_one(&store, conversation_id).await;
+    store
+        .terminate_accepted_command(TerminateAcceptedCommand {
+            conversation_id,
+            command_id,
+            expected_owner: owner(0x90),
+            reason: AcceptedTerminationReason::Canceled,
+        })
+        .await
+        .expect("write ordinary event between configurations");
+    let source = capture_source(&store, conversation_id, 30).await;
+    let second = configure_codex(&store, conversation_id, 1, CodexReasoningEffort::High).await;
+    assert_eq!(second.event_seq, 2);
+
+    let materializer =
+        SnapshotMaterializer::new(store.clone(), router(AgentKind::Codex, AgentKind::Codex));
+    let SnapshotMaterialization::Build(mut build) = materializer
+        .materialize(source)
+        .await
+        .expect("materialize cursor-selected build")
+    else {
+        panic!("cursor-selected source must build")
+    };
+    assert_eq!(build.base_event_cursor(), StreamCursor::At(1));
+    let assembled =
+        assemble_build_snapshot(&mut build, Vec::new()).expect("assemble cursor snapshot");
+    let snapshot = decode_assembled_snapshot(&assembled);
+    assert_eq!(snapshot.configuration_state.configuration_revision(), 1);
+    assert_eq!(
+        snapshot.configuration_state.configuration(),
+        Some(&codex_configuration(CodexReasoningEffort::Low))
+    );
+    materializer
+        .release_build_input(build)
+        .await
+        .expect("release cursor-selected build");
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn ready_snapshot_keeps_frozen_configuration_after_head_advances() {
+    // 威胁场景：Ready payload 的 base 与 current head 分离后，若只校验
+    // conversation/base/count，旧 snapshot 可携带错误配置并通过认证。
+    let root = TestRoot::new("configuration-cursor-ready");
+    let store = open_store(&root).await;
+    let input = conversation(0x2B, AgentKind::Codex);
+    let conversation_id = input.conversation_id;
+    store
+        .create_conversation(input)
+        .await
+        .expect("create ready configuration conversation");
+    configure_codex(&store, conversation_id, 0, CodexReasoningEffort::Low).await;
+    let command_id = accept_one(&store, conversation_id).await;
+    store
+        .terminate_accepted_command(TerminateAcceptedCommand {
+            conversation_id,
+            command_id,
+            expected_owner: owner(0x90),
+            reason: AcceptedTerminationReason::Canceled,
+        })
+        .await
+        .expect("write ordinary event before ready snapshot base");
+    let build_source = capture_source(&store, conversation_id, 31).await;
+    let materializer =
+        SnapshotMaterializer::new(store.clone(), router(AgentKind::Codex, AgentKind::Codex));
+    let SnapshotMaterialization::Build(mut build) = materializer
+        .materialize(build_source)
+        .await
+        .expect("prepare ready configuration build")
+    else {
+        panic!("first configuration source must build")
+    };
+    let assembled =
+        assemble_build_snapshot(&mut build, Vec::new()).expect("assemble ready configuration");
+    let write = build
+        .bind_assembled_snapshot(assembled)
+        .expect("bind ready configuration snapshot");
+    store
+        .store_conversation_snapshot(write)
+        .await
+        .expect("store ready configuration snapshot");
+    configure_codex(&store, conversation_id, 1, CodexReasoningEffort::High).await;
+
+    let ready_source = capture_source(&store, conversation_id, 32).await;
+    assert!(matches!(
+        ready_source.source(),
+        SnapshotBarrierSource::Ready(_)
+    ));
+    let SnapshotMaterialization::Ready(ready) = materializer
+        .materialize(ready_source)
+        .await
+        .expect("materialize frozen ready configuration")
+    else {
+        panic!("stored snapshot must materialize as Ready")
+    };
+    let snapshot: ConversationSnapshot =
+        serde_json::from_slice(ready.canonical_payload()).expect("decode ready snapshot");
+    assert_eq!(snapshot.base_event_cursor, StreamCursor::At(1));
+    assert_eq!(snapshot.configuration_state.configuration_revision(), 1);
+    assert_eq!(
+        snapshot.configuration_state.configuration(),
+        Some(&codex_configuration(CodexReasoningEffort::Low))
+    );
+    store.shutdown().await.expect("shutdown store");
+}
+
+async fn old_configuration_build_source(
+    root: &TestRoot,
+    seed: u8,
+) -> (
+    RuntimeStoreHandle,
+    RuntimeId,
+    SnapshotMaterializationSource,
+    SnapshotMaterializer,
+) {
+    let store = open_store(root).await;
+    let input = conversation(seed, AgentKind::Codex);
+    let conversation_id = input.conversation_id;
+    store
+        .create_conversation(input)
+        .await
+        .expect("create selector tamper conversation");
+    configure_codex(&store, conversation_id, 0, CodexReasoningEffort::Low).await;
+    let source = capture_source(&store, conversation_id, u64::from(seed)).await;
+    configure_codex(&store, conversation_id, 1, CodexReasoningEffort::High).await;
+    let materializer =
+        SnapshotMaterializer::new(store.clone(), router(AgentKind::Codex, AgentKind::Codex));
+    (store, conversation_id, source, materializer)
+}
+
+#[tokio::test]
+async fn old_build_cursor_authenticates_current_configuration_cipher_and_state_head() {
+    // 威胁场景：攻击者在旧 cursor 已冻结后篡改 current head；selector 若只认证
+    // 被选中的旧 row，会让损坏的 append-only journal 继续产出看似合法 snapshot。
+    for (label, tamper, expected_code) in [
+        (
+            "selector-current-cipher",
+            ConfigurationHeadTamper::SealedRequest,
+            "daemon.runtime.crypto_failed",
+        ),
+        (
+            "selector-state-metadata",
+            ConfigurationHeadTamper::StateMetadata,
+            "daemon.runtime.schema_incompatible",
+        ),
+    ] {
+        let root = TestRoot::new(label);
+        let (store, conversation_id, source, materializer) = old_configuration_build_source(
+            &root,
+            if expected_code.ends_with("crypto_failed") {
+                0x2C
+            } else {
+                0x2D
+            },
+        )
+        .await;
+        tamper_configuration_head(&root.database(), conversation_id, 2, tamper);
+        let error = materializer
+            .materialize(source)
+            .await
+            .expect_err("old Build cursor must authenticate current configuration head");
+        assert_eq!(error.code(), expected_code);
+        match expected_code {
+            "daemon.runtime.crypto_failed" => assert!(matches!(
+                error,
+                SnapshotMaterializationError::Store(RuntimeStoreError::Cipher(_))
+            )),
+            _ => assert!(matches!(
+                error,
+                SnapshotMaterializationError::Store(RuntimeStoreError::UnknownOrCorruptSchema)
+            )),
+        }
+        store
+            .shutdown()
+            .await
+            .expect("shutdown tampered Build store");
+    }
+}
+
+#[tokio::test]
+async fn old_build_cursor_authenticates_intermediate_configuration_ciphertext() {
+    // 威胁场景：攻击者只破坏 selected rev1 与 current rev3 之间的 rev2；若 selector
+    // 只认证两端，损坏的 append-only journal 仍会为旧 cursor 产出合法外观的快照。
+    let root = TestRoot::new("selector-intermediate-cipher");
+    let store = open_store(&root).await;
+    let input = conversation(0x36, AgentKind::Codex);
+    let conversation_id = input.conversation_id;
+    store
+        .create_conversation(input)
+        .await
+        .expect("create intermediate tamper conversation");
+    configure_codex(&store, conversation_id, 0, CodexReasoningEffort::Low).await;
+    let source = capture_source(&store, conversation_id, 54).await;
+    configure_codex(&store, conversation_id, 1, CodexReasoningEffort::Medium).await;
+    configure_codex(&store, conversation_id, 2, CodexReasoningEffort::High).await;
+    tamper_configuration_head(
+        &root.database(),
+        conversation_id,
+        2,
+        ConfigurationHeadTamper::SealedRequest,
+    );
+
+    let materializer =
+        SnapshotMaterializer::new(store.clone(), router(AgentKind::Codex, AgentKind::Codex));
+    let error = materializer
+        .materialize(source)
+        .await
+        .expect_err("old cursor must authenticate every intermediate configuration row");
+    assert_eq!(error.code(), "daemon.runtime.crypto_failed");
+    assert!(matches!(
+        error,
+        SnapshotMaterializationError::Store(RuntimeStoreError::Cipher(_))
+    ));
+    store
+        .shutdown()
+        .await
+        .expect("shutdown intermediate tamper store");
+}
+
+#[tokio::test]
+async fn old_build_cursor_rejects_configuration_gap_paired_with_valid_orphan() {
+    // 威胁场景：攻击者回放已认证 rev3 state，删除 rev2 并保留合法 rev4 orphan，
+    // 使物理 COUNT 仍等于 head=3；只比较 count/current/selected 会漏掉 gap 与 orphan。
+    let root = TestRoot::new("selector-gap-valid-orphan");
+    let store = open_store(&root).await;
+    let input = conversation(0x37, AgentKind::Codex);
+    let conversation_id = input.conversation_id;
+    store
+        .create_conversation(input)
+        .await
+        .expect("create gap/orphan tamper conversation");
+    configure_codex(&store, conversation_id, 0, CodexReasoningEffort::Low).await;
+    let source = capture_source(&store, conversation_id, 55).await;
+    configure_codex(&store, conversation_id, 1, CodexReasoningEffort::Medium).await;
+    configure_codex(&store, conversation_id, 2, CodexReasoningEffort::High).await;
+
+    let replayed_rev3_state: (String, Vec<u8>) = {
+        let connection =
+            rusqlite::Connection::open(root.database()).expect("open rev3 state capture DB");
+        connection
+            .query_row(
+                "SELECT current_configuration_revision, metadata_token
+                 FROM conversation_state WHERE conversation_id = ?1",
+                [&conversation_id.as_bytes()[..]],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("capture authenticated rev3 state")
+    };
+    configure_codex(&store, conversation_id, 3, CodexReasoningEffort::Medium).await;
+    {
+        let connection =
+            rusqlite::Connection::open(root.database()).expect("open gap/orphan tamper DB");
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE conversation_state
+                     SET current_configuration_revision = ?1, metadata_token = ?2
+                     WHERE conversation_id = ?3",
+                    rusqlite::params![
+                        replayed_rev3_state.0,
+                        replayed_rev3_state.1,
+                        &conversation_id.as_bytes()[..]
+                    ],
+                )
+                .expect("replay authenticated rev3 state"),
+            1
+        );
+        assert_eq!(
+            connection
+                .execute(
+                    "DELETE FROM configuration_journal
+                     WHERE conversation_id = ?1 AND configuration_revision = ?2",
+                    rusqlite::params![&conversation_id.as_bytes()[..], format!("{:020}", 2)],
+                )
+                .expect("delete intermediate rev2 while retaining rev4 orphan"),
+            1
+        );
+    }
+
+    let materializer =
+        SnapshotMaterializer::new(store.clone(), router(AgentKind::Codex, AgentKind::Codex));
+    let error = materializer
+        .materialize(source)
+        .await
+        .expect_err("old cursor must reject configuration gap paired with a valid orphan");
+    assert_eq!(error.code(), "daemon.runtime.schema_incompatible");
+    assert!(matches!(
+        error,
+        SnapshotMaterializationError::Store(RuntimeStoreError::UnknownOrCorruptSchema)
+    ));
+    store
+        .shutdown()
+        .await
+        .expect("shutdown gap/orphan tamper store");
+}
+
+#[tokio::test]
+async fn old_build_cursor_rejects_configuration_chain_beyond_replayed_parent_high_water() {
+    // 威胁场景：攻击者回放 rev1 时已认证的 parent H/token，同时保留合法 rev2/rev3
+    // configuration 链；若不把链尾锚到 parent H，旧 base0 仍会产出合法外观快照。
+    let root = TestRoot::new("selector-replayed-parent-high-water");
+    let clock = ManualClock::new(1_000);
+    let store = open_store_with_clock(&root, clock).await;
+    let input = conversation(0x38, AgentKind::Codex);
+    let conversation_id = input.conversation_id;
+    store
+        .create_conversation(input)
+        .await
+        .expect("create parent high-water replay conversation");
+    configure_codex(&store, conversation_id, 0, CodexReasoningEffort::Low).await;
+    let source = capture_source(&store, conversation_id, 56).await;
+    let replayed_parent: (Option<String>, i64, Vec<u8>) = {
+        let connection =
+            rusqlite::Connection::open(root.database()).expect("open parent state capture DB");
+        connection
+            .query_row(
+                "SELECT event_high_water, updated_at_ms, metadata_token
+                 FROM conversations WHERE conversation_id = ?1",
+                [&conversation_id.as_bytes()[..]],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("capture authenticated rev1 parent row")
+    };
+    configure_codex(&store, conversation_id, 1, CodexReasoningEffort::Medium).await;
+    configure_codex(&store, conversation_id, 2, CodexReasoningEffort::High).await;
+    {
+        let connection =
+            rusqlite::Connection::open(root.database()).expect("open parent high-water replay DB");
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE conversations
+                     SET event_high_water = ?1, updated_at_ms = ?2, metadata_token = ?3
+                     WHERE conversation_id = ?4",
+                    rusqlite::params![
+                        replayed_parent.0,
+                        replayed_parent.1,
+                        replayed_parent.2,
+                        &conversation_id.as_bytes()[..]
+                    ],
+                )
+                .expect("replay authenticated rev1 parent high-water"),
+            1
+        );
+    }
+
+    let materializer =
+        SnapshotMaterializer::new(store.clone(), router(AgentKind::Codex, AgentKind::Codex));
+    let error = materializer
+        .materialize(source)
+        .await
+        .expect_err("configuration chain cannot extend beyond authenticated parent high-water");
+    assert_eq!(error.code(), "daemon.runtime.schema_incompatible");
+    assert!(matches!(
+        error,
+        SnapshotMaterializationError::Store(RuntimeStoreError::UnknownOrCorruptSchema)
+    ));
+    store
+        .shutdown()
+        .await
+        .expect("shutdown parent high-water replay store");
+}
+
+#[tokio::test]
+#[ignore = "真实 production writer 写满 4,096 版后执行完整 cursor selector 的慢门禁"]
+async fn production_max_configuration_chain_materializes_at_exact_limit() {
+    // 威胁场景：合法会话达到配置硬上限时，全链认证若存在隐含较小上限或非有界
+    // 保留，会在生产最大链上拒绝、漏验或耗尽内存。
+    const CONFIGURATION_LIMIT: u64 = 4_096;
+    let root = TestRoot::new("selector-production-max-chain");
+    let store = open_store_with_clock(&root, ManualClock::new(2_000)).await;
+    let input = conversation(0x39, AgentKind::Codex);
+    let conversation_id = input.conversation_id;
+    store
+        .create_conversation(input)
+        .await
+        .expect("create production max-chain conversation");
+    for revision in 0..CONFIGURATION_LIMIT {
+        let reasoning = if revision % 2 == 0 {
+            CodexReasoningEffort::Low
+        } else {
+            CodexReasoningEffort::High
+        };
+        configure_codex(&store, conversation_id, revision, reasoning).await;
+    }
+
+    let materializer =
+        SnapshotMaterializer::new(store.clone(), router(AgentKind::Codex, AgentKind::Codex));
+    let SnapshotMaterialization::Build(build) = materializer
+        .materialize(capture_source(&store, conversation_id, 57).await)
+        .await
+        .expect("materialize production max configuration chain")
+    else {
+        panic!("conversation without a stored snapshot must build")
+    };
+    assert_eq!(
+        build
+            .configuration_state()
+            .expect("max-chain Build carries configuration state")
+            .configuration_revision(),
+        CONFIGURATION_LIMIT
+    );
+    materializer
+        .release_build_input(build)
+        .await
+        .expect("release max-chain Build input");
+    store.shutdown().await.expect("shutdown max-chain store");
+}
+
+#[tokio::test]
+async fn old_ready_cursor_preserves_configuration_cipher_error_provenance() {
+    // 威胁场景：同一 current configuration ciphertext 损坏若在 Ready 被重分类为
+    // schema、在 Build 保留 crypto，会让诊断与恢复策略依 snapshot 命中状态漂移。
+    let root = TestRoot::new("ready-selector-current-cipher");
+    let store = open_store(&root).await;
+    let input = conversation(0x2E, AgentKind::Codex);
+    let conversation_id = input.conversation_id;
+    store
+        .create_conversation(input)
+        .await
+        .expect("create ready selector tamper conversation");
+    configure_codex(&store, conversation_id, 0, CodexReasoningEffort::Low).await;
+    store_ready_empty(&store, conversation_id, AgentKind::Codex).await;
+    configure_codex(&store, conversation_id, 1, CodexReasoningEffort::High).await;
+    let ready_source = capture_source(&store, conversation_id, 46).await;
+    assert!(matches!(
+        ready_source.source(),
+        SnapshotBarrierSource::Ready(_)
+    ));
+    tamper_configuration_head(
+        &root.database(),
+        conversation_id,
+        2,
+        ConfigurationHeadTamper::SealedRequest,
+    );
+    let materializer =
+        SnapshotMaterializer::new(store.clone(), router(AgentKind::Codex, AgentKind::Codex));
+    let error = materializer
+        .materialize(ready_source)
+        .await
+        .expect_err("Ready selector must preserve configuration crypto failure");
+    assert_eq!(error.code(), "daemon.runtime.crypto_failed");
+    assert!(matches!(
+        error,
+        SnapshotMaterializationError::Store(RuntimeStoreError::Cipher(_))
+    ));
+    store
+        .shutdown()
+        .await
+        .expect("shutdown tampered Ready store");
 }
 
 #[tokio::test]

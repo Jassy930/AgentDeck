@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use agentdeck_protocol::runtime::identity::ConversationId;
 use agentdeck_protocol::runtime::{
     ConversationConfigurationState, ConversationSnapshot, RuntimeEvent, RuntimeEventBody,
-    SnapshotItem, StreamCursor,
+    SnapshotItem, StreamCursor, VendorConfigurationSnapshot,
 };
 use agentdeck_protocol::{
     AgentItem, AgentItemMeta, AgentKind, SessionCapabilities, VendorCapabilities,
@@ -23,9 +23,9 @@ use crate::runtime::events::{
 use crate::runtime::model::RuntimeStoreError;
 use crate::runtime::store::cipher::CipherError;
 use crate::runtime::store::{
-    AuthenticatedConversationSnapshotContext, PreparedConversationSnapshotWrite,
-    ReadySnapshotReference, RuntimeId, RuntimeSnapshotBuildPin, RuntimeStoreHandle,
-    StoredConversationSnapshot,
+    AuthenticatedConversationSnapshotContext, MAX_CONFIGURATION_CANONICAL_BYTES,
+    PreparedConversationSnapshotWrite, ReadySnapshotReference, RuntimeId, RuntimeSnapshotBuildPin,
+    RuntimeStoreHandle, StoredConversationSnapshot,
 };
 
 const MAX_CONVERSATION_SNAPSHOT_ITEMS: usize = 10_000;
@@ -136,6 +136,7 @@ struct SnapshotBuildBinding {
 struct SnapshotAssemblyContext {
     conversation_id: RuntimeId,
     base_event_cursor: StreamCursor,
+    configuration_state: ConversationConfigurationState,
     capabilities: SessionCapabilities,
     binding: SnapshotBuildBinding,
 }
@@ -224,11 +225,45 @@ fn estimate_typed_snapshot_retained_bytes(
             .ok_or(SnapshotMaterializationError::PayloadTooLarge)?,
     );
     retained.add(snapshot.conversation_id.0.capacity())?;
+    estimate_configuration_state_nested(&snapshot.configuration_state, &mut retained)?;
     retained
         .add_capacity::<SnapshotItem>(allocation_capacity_upper_bound(snapshot.items().len())?)?;
     for item in snapshot.items() {
         estimate_snapshot_item_nested(item, &mut retained)?;
     }
+    Ok(retained.bytes)
+}
+
+fn estimate_configuration_state_nested(
+    state: &ConversationConfigurationState,
+    retained: &mut RetainedByteCounter,
+) -> Result<(), SnapshotMaterializationError> {
+    let Some(configuration) = state.configuration() else {
+        return Ok(());
+    };
+    match configuration.vendor_control() {
+        VendorConfigurationSnapshot::Codex(_) => Ok(()),
+        VendorConfigurationSnapshot::ClaudeCode(configuration) => {
+            for value in [
+                configuration.model(),
+                configuration.effort(),
+                configuration.output_style(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                retained.add(allocation_capacity_upper_bound(value.len())?)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn configuration_state_nested_retained_bytes(
+    state: &ConversationConfigurationState,
+) -> Result<usize, SnapshotMaterializationError> {
+    let mut retained = RetainedByteCounter::new(0);
+    estimate_configuration_state_nested(state, &mut retained)?;
     Ok(retained.bytes)
 }
 
@@ -458,6 +493,7 @@ pub(crate) fn conversation_snapshot_reference_peak_bound(
     let fixed = snapshot_identity_validation_scratch_bytes()?
         .checked_add(snapshot_estimator_fixed_bytes()?)
         .and_then(|bytes| bytes.checked_add(std::mem::size_of::<ConversationSnapshot>()))
+        .and_then(|bytes| bytes.checked_add(MAX_CONFIGURATION_CANONICAL_BYTES))
         .ok_or(SnapshotMaterializationError::PayloadTooLarge)?;
     Ok(logical
         .checked_mul(MAX_DYNAMIC_EXPANSION)
@@ -486,6 +522,7 @@ impl ConversationSnapshotBudgetEstimator {
 
     pub(crate) fn new(
         capabilities: &SessionCapabilities,
+        configuration_state: &ConversationConfigurationState,
     ) -> Result<Self, SnapshotMaterializationError> {
         let mut nested = RetainedByteCounter::new(
             snapshot_identity_validation_scratch_bytes()?
@@ -496,6 +533,7 @@ impl ConversationSnapshotBudgetEstimator {
                 .ok_or(SnapshotMaterializationError::PayloadTooLarge)?,
         );
         estimate_capabilities_nested(capabilities, &mut nested)?;
+        estimate_configuration_state_nested(configuration_state, &mut nested)?;
         Ok(Self {
             nested,
             observed_item_events: 0,
@@ -579,6 +617,9 @@ impl ConversationSnapshotBudgetEstimator {
         let capabilities = input
             .capabilities()
             .ok_or(SnapshotMaterializationError::InvalidState)?;
+        let configuration_state = input
+            .configuration_state()
+            .ok_or(SnapshotMaterializationError::InvalidState)?;
         let conversation_id = input.conversation_id().to_canonical_string();
         let final_item_count = items
             .len()
@@ -595,17 +636,15 @@ impl ConversationSnapshotBudgetEstimator {
         typed.add(conversation_id.capacity())?;
         typed.add_capacity::<SnapshotItem>(allocation_capacity_upper_bound(final_item_count)?)?;
         estimate_capabilities_nested(capabilities, &mut typed)?;
+        estimate_configuration_state_nested(configuration_state, &mut typed)?;
         for item in items {
             estimate_snapshot_item_nested(item, &mut typed)?;
         }
 
-        let configuration_state = ConversationConfigurationState::new(0, None)
-            .map_err(|_| SnapshotMaterializationError::SchemaIncompatible)?;
-
         let view = BorrowedBuildSnapshot {
             conversation_id: &conversation_id,
             base_event_cursor: input.base_event_cursor(),
-            configuration_state: &configuration_state,
+            configuration_state,
             items: BorrowedBuildItems {
                 capabilities,
                 items,
@@ -849,12 +888,10 @@ fn assemble_snapshot(
     let mut items = Vec::with_capacity(agent_items.len() + 1);
     items.push(SnapshotItem::capabilities(context.capabilities));
     items.extend(agent_items);
-    let configuration_state = ConversationConfigurationState::new(0, None)
-        .map_err(|_| SnapshotMaterializationError::SchemaIncompatible)?;
     let snapshot = ConversationSnapshot::new(
         ConversationId::new(context.conversation_id.to_canonical_string()),
         context.base_event_cursor,
-        configuration_state,
+        context.configuration_state,
         items,
     )
     .map_err(|_| SnapshotMaterializationError::SchemaIncompatible)?;
@@ -882,9 +919,10 @@ struct LegacyConversationSnapshotV4 {
 }
 
 impl LegacyConversationSnapshotV4 {
-    fn into_current(self) -> Result<ConversationSnapshot, SnapshotMaterializationError> {
-        let configuration_state = ConversationConfigurationState::new(0, None)
-            .map_err(|_| SnapshotMaterializationError::SchemaIncompatible)?;
+    fn into_current(
+        self,
+        configuration_state: ConversationConfigurationState,
+    ) -> Result<ConversationSnapshot, SnapshotMaterializationError> {
         ConversationSnapshot::new(
             self.conversation_id,
             self.base_event_cursor,
@@ -900,15 +938,32 @@ struct DecodedReadySnapshot {
     legacy_v4: bool,
 }
 
+#[cfg(test)]
 fn decode_ready_snapshot_with_capacity(
     payload: &[u8],
     raw_capacity: usize,
+) -> Result<DecodedReadySnapshot, SnapshotMaterializationError> {
+    let configuration_state = ConversationConfigurationState::new(0, None)
+        .map_err(|_| SnapshotMaterializationError::SchemaIncompatible)?;
+    decode_ready_snapshot_with_configuration(payload, raw_capacity, &configuration_state)
+}
+
+fn decode_ready_snapshot_with_configuration(
+    payload: &[u8],
+    raw_capacity: usize,
+    legacy_configuration_state: &ConversationConfigurationState,
 ) -> Result<DecodedReadySnapshot, SnapshotMaterializationError> {
     if payload.len() > MAX_CONVERSATION_SNAPSHOT_BYTES {
         return Err(SnapshotMaterializationError::PayloadTooLarge);
     }
     let retained = observe_json_retained_budget_with_capacity(payload, raw_capacity)?;
-    if retained.total_retained_bytes() > SNAPSHOT_BUILD_MEMORY_BYTES {
+    let expected_nested = configuration_state_nested_retained_bytes(legacy_configuration_state)?;
+    let retained_with_expected = retained
+        .total_retained_bytes()
+        .checked_add(std::mem::size_of::<ConversationConfigurationState>())
+        .and_then(|bytes| bytes.checked_add(expected_nested))
+        .ok_or(SnapshotMaterializationError::PayloadTooLarge)?;
+    if retained_with_expected > SNAPSHOT_BUILD_MEMORY_BYTES {
         return Err(SnapshotMaterializationError::PayloadTooLarge);
     }
     if let Ok(snapshot) = serde_json::from_slice::<ConversationSnapshot>(payload) {
@@ -922,10 +977,17 @@ fn decode_ready_snapshot_with_capacity(
 
     let legacy = serde_json::from_slice::<LegacyConversationSnapshotV4>(payload)
         .map_err(|_| SnapshotMaterializationError::SchemaIncompatible)?;
+    if retained_with_expected
+        .checked_add(expected_nested)
+        .ok_or(SnapshotMaterializationError::PayloadTooLarge)?
+        > SNAPSHOT_BUILD_MEMORY_BYTES
+    {
+        return Err(SnapshotMaterializationError::PayloadTooLarge);
+    }
     let comparison = compare_canonical_value(payload, &legacy)?;
     debug_assert_eq!(comparison.bytes_compared, payload.len());
     Ok(DecodedReadySnapshot {
-        snapshot: legacy.into_current()?,
+        snapshot: legacy.into_current(legacy_configuration_state.clone())?,
         legacy_v4: true,
     })
 }
@@ -1437,6 +1499,7 @@ fn compare_canonical_value<T: Serialize>(
 fn validate_ready_snapshot(
     context: &AuthenticatedConversationSnapshotContext,
     reference: &ReadySnapshotReference,
+    expected_configuration_state: &ConversationConfigurationState,
     snapshot: &ConversationSnapshot,
 ) -> Result<(), SnapshotMaterializationError> {
     let RuntimeStreamTarget::Conversation(reference_conversation_id) = reference.target else {
@@ -1450,6 +1513,7 @@ fn validate_ready_snapshot(
         || snapshot.base_event_cursor != reference.base
         || reference.base.high_water() > context.event_high_water
         || item_count != reference.item_count
+        || &snapshot.configuration_state != expected_configuration_state
     {
         return Err(SnapshotMaterializationError::SchemaIncompatible);
     }
@@ -1574,6 +1638,7 @@ pub struct SnapshotBuildInput {
     conversation_id: RuntimeId,
     agent_kind: AgentKind,
     base_event_cursor: StreamCursor,
+    configuration_state: Option<ConversationConfigurationState>,
     capabilities: Option<SessionCapabilities>,
 }
 
@@ -1607,6 +1672,11 @@ impl SnapshotBuildInput {
     #[must_use]
     pub fn capabilities(&self) -> Option<&SessionCapabilities> {
         self.capabilities.as_ref()
+    }
+
+    #[must_use]
+    pub fn configuration_state(&self) -> Option<&ConversationConfigurationState> {
+        self.configuration_state.as_ref()
     }
 
     pub(crate) fn replay_pin(
@@ -1655,7 +1725,7 @@ impl SnapshotBuildInput {
     }
 }
 
-/// 组装 seam 只消费 capabilities，exact pin ownership 仍由 BuildInput 持有，
+/// 组装 seam 只消费 capabilities 与 cursor-selected configuration，exact pin ownership 仍由 BuildInput 持有，
 /// 直到成功 bind 或显式 release。这样 raw 分配时不会与原 input 的 typed
 /// capabilities 同时驻留；item/entity/command identity 原样进入 DTO。
 pub fn assemble_build_snapshot(
@@ -1663,14 +1733,22 @@ pub fn assemble_build_snapshot(
     agent_items: Vec<SnapshotItem>,
 ) -> Result<AssembledConversationSnapshot, SnapshotMaterializationError> {
     let binding = input.binding()?;
+    if input.capabilities.is_none() || input.configuration_state.is_none() {
+        return Err(SnapshotMaterializationError::InvalidState);
+    }
     let capabilities = input
         .capabilities
+        .take()
+        .ok_or(SnapshotMaterializationError::InvalidState)?;
+    let configuration_state = input
+        .configuration_state
         .take()
         .ok_or(SnapshotMaterializationError::InvalidState)?;
     assemble_snapshot(
         SnapshotAssemblyContext {
             conversation_id: input.conversation_id,
             base_event_cursor: input.base_event_cursor,
+            configuration_state,
             capabilities,
             binding,
         },
@@ -1679,6 +1757,10 @@ pub fn assemble_build_snapshot(
 }
 
 #[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "416-byte linear BuildInput avoids a separate heap allocation and exact memory-accounting branch"
+)]
 pub enum SnapshotMaterialization {
     Ready(MaterializedConversationSnapshot),
     Build(SnapshotBuildInput),
@@ -1754,15 +1836,34 @@ impl SnapshotMaterializer {
             .load_authenticated_conversation_snapshot_context(conversation_id)
             .await
             .map_err(map_ready_store_error)?;
+        if reference.base.high_water() > context.event_high_water {
+            return Err(SnapshotMaterializationError::SchemaIncompatible);
+        }
+        // configuration selector 的错误来源必须保留：row AEAD/generation 故障继续
+        // 是 crypto failure；只有已解码 ready DTO 与 selector 不一致才是 schema。
+        let expected_configuration_state = self
+            .store
+            .load_configuration_state_at_event_cursor(conversation_id, reference.base.high_water())
+            .await
+            .map_err(SnapshotMaterializationError::Store)?;
         let validation_reference = reference.clone();
         let mut stored = self
             .store
             .load_conversation_snapshot_by_reference(reference)
             .await
             .map_err(map_ready_store_error)?;
-        let decoded =
-            decode_ready_snapshot_with_capacity(&stored.payload, stored.payload.capacity())?;
-        validate_ready_snapshot(&context, &validation_reference, &decoded.snapshot)?;
+        let decoded = decode_ready_snapshot_with_configuration(
+            &stored.payload,
+            stored.payload.capacity(),
+            &expected_configuration_state,
+        )?;
+        validate_ready_snapshot(
+            &context,
+            &validation_reference,
+            &expected_configuration_state,
+            &decoded.snapshot,
+        )?;
+        drop(expected_configuration_state);
         let wire_payload = if decoded.legacy_v4 {
             // 威胁场景：升级后若把已认证的 v1 JSON 原样交给 v2 client，缺失的
             // configurationState 会让 client 拒绝或误用默认策略。先释放旧 raw
@@ -1803,6 +1904,22 @@ impl SnapshotMaterializer {
                     .await);
             }
         };
+        let configuration_state = match self
+            .store
+            .load_configuration_state_at_event_cursor(context.conversation_id, pin.base_event_seq())
+            .await
+        {
+            Ok(configuration_state) => configuration_state,
+            Err(error) => {
+                return Err(self
+                    .release_pin_after_error(
+                        pin,
+                        cleanup.take(),
+                        SnapshotMaterializationError::Store(error),
+                    )
+                    .await);
+            }
+        };
         let Some(capabilities) = self.router.capabilities(context.agent_kind) else {
             return Err(self
                 .release_pin_after_error(
@@ -1826,6 +1943,7 @@ impl SnapshotMaterializer {
             conversation_id: context.conversation_id,
             agent_kind: context.agent_kind,
             base_event_cursor: StreamCursor::from_high_water(pin.base_event_seq()),
+            configuration_state: Some(configuration_state),
             capabilities: Some(capabilities),
             pin: Some(pin),
             cleanup,

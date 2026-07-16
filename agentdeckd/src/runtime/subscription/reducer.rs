@@ -98,7 +98,11 @@ pub(super) async fn materialize(
         }
         SnapshotMaterialization::Build(mut input) => {
             let capabilities = input.capabilities().ok_or(SnapshotReducerError::Decode)?;
-            let mut estimator = ConversationSnapshotBudgetEstimator::new(capabilities)?;
+            let configuration_state = input
+                .configuration_state()
+                .ok_or(SnapshotReducerError::Decode)?;
+            let mut estimator =
+                ConversationSnapshotBudgetEstimator::new(capabilities, configuration_state)?;
             memory.grow_to(estimator.current_bound()?).await?;
             let items = load_stable_items(store, &input, &mut memory, &mut estimator).await?;
             memory

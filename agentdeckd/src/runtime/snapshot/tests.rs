@@ -4,11 +4,17 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
+use agentdeck_protocol::runtime::configuration::MAX_CONFIGURATION_TEXT_BYTES;
 use agentdeck_protocol::runtime::identity::{CommandId, ConversationId, EntityId, ItemId};
-use agentdeck_protocol::runtime::{ConversationSnapshot, SnapshotItem, StreamCursor};
+use agentdeck_protocol::runtime::{
+    ClaudeCodeConversationConfiguration, CodexConversationConfiguration, ConversationConfiguration,
+    ConversationSnapshot, SnapshotItem, StreamCursor, VendorConfigurationSnapshot,
+};
 use agentdeck_protocol::{
-    ActionDecision, AgentItem, AgentItemMeta, AgentKind, ProtocolError, SessionCapabilities,
-    SessionId, SessionStart, ThreadId, VendorCapabilities, VendorControlPayload,
+    ActionDecision, AgentItem, AgentItemMeta, AgentKind, ClaudeCodePermissionMode,
+    CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode, ProtocolError,
+    SessionCapabilities, SessionId, SessionStart, ThreadId, VendorCapabilities,
+    VendorControlPayload,
 };
 
 use super::*;
@@ -18,9 +24,10 @@ use crate::runtime::events::{
     RegisterStreamBarrier, RuntimeStreamTarget, SnapshotBarrierSource, WatchGeneration,
 };
 use crate::runtime::store::{
-    ConversationDescriptor, NewConversation, ReadySnapshotReference, RuntimeClock,
-    RuntimeClockError, RuntimeId, RuntimeIdKind, RuntimeStoreConfig, RuntimeStoreError,
-    RuntimeStoreFaultInjector, RuntimeStoreHandle, RuntimeStoreLane, RuntimeStoreOperation,
+    ConfigureConversation, ConfigureConversationOutcome, ConversationDescriptor, IdempotencyOwner,
+    NewConversation, ReadySnapshotReference, RuntimeClock, RuntimeClockError, RuntimeId,
+    RuntimeIdKind, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreFaultInjector,
+    RuntimeStoreHandle, RuntimeStoreLane, RuntimeStoreOperation,
 };
 use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
 
@@ -661,6 +668,7 @@ fn assembly_context(seed: u8, kind: AgentKind, base: StreamCursor) -> SnapshotAs
     SnapshotAssemblyContext {
         conversation_id,
         base_event_cursor: base,
+        configuration_state: revision_zero_configuration_state(),
         capabilities: capabilities(kind),
         binding: SnapshotBuildBinding {
             pin_id: [seed.wrapping_add(0x20); 16],
@@ -668,6 +676,75 @@ fn assembly_context(seed: u8, kind: AgentKind, base: StreamCursor) -> SnapshotAs
             base_event_cursor: base,
         },
     }
+}
+
+fn revision_zero_configuration_state() -> ConversationConfigurationState {
+    ConversationConfigurationState::new(0, None).expect("valid revision-zero configuration")
+}
+
+fn codex_configuration_state(
+    revision: u64,
+    reasoning_effort: CodexReasoningEffort,
+) -> ConversationConfigurationState {
+    ConversationConfigurationState::new(
+        revision,
+        Some(ConversationConfiguration::new(
+            VendorConfigurationSnapshot::Codex(CodexConversationConfiguration::new(
+                CodexApprovalPolicy::OnRequest,
+                CodexSandboxMode::WorkspaceWrite,
+                reasoning_effort,
+            )),
+        )),
+    )
+    .expect("valid Codex configuration state")
+}
+
+fn maximum_claude_configuration_state() -> ConversationConfigurationState {
+    let maximum = "x".repeat(MAX_CONFIGURATION_TEXT_BYTES);
+    ConversationConfigurationState::new(
+        1,
+        Some(ConversationConfiguration::new(
+            VendorConfigurationSnapshot::ClaudeCode(
+                ClaudeCodeConversationConfiguration::new(
+                    ClaudeCodePermissionMode::Default,
+                    Some(maximum.clone()),
+                    Some(maximum.clone()),
+                    Some(maximum),
+                )
+                .expect("maximum Claude configuration"),
+            ),
+        )),
+    )
+    .expect("valid Claude configuration state")
+}
+
+async fn configure_snapshot_conversation(
+    store: &RuntimeStoreHandle,
+    conversation_id: RuntimeId,
+    expected_revision: u64,
+    reasoning_effort: CodexReasoningEffort,
+) {
+    let outcome = store
+        .configure_conversation(ConfigureConversation {
+            conversation_id,
+            owner: IdempotencyOwner::Local {
+                machine_trust_domain: [0xA5; 32],
+                uid: 501,
+                client_installation_id: [0xA6; 16],
+            },
+            idempotency_key: format!("snapshot-unit-configuration-{expected_revision}"),
+            expected_configuration_revision: expected_revision,
+            configuration: codex_configuration_state(1, reasoning_effort)
+                .configuration()
+                .expect("configured state")
+                .clone(),
+        })
+        .await
+        .expect("configure snapshot unit conversation");
+    assert!(matches!(
+        outcome,
+        ConfigureConversationOutcome::Applied { .. }
+    ));
 }
 
 fn authenticated_context(seed: u8, kind: AgentKind) -> AuthenticatedConversationSnapshotContext {
@@ -712,7 +789,7 @@ fn ready_snapshot(
     ConversationSnapshot::new(
         ConversationId::new(conversation_id(seed).to_canonical_string()),
         base,
-        agentdeck_protocol::runtime::ConversationConfigurationState::new(0, None).unwrap(),
+        revision_zero_configuration_state(),
         all_items,
     )
     .expect("valid test snapshot")
@@ -757,6 +834,15 @@ fn canonical_legacy_v4_snapshot_dual_decodes_to_v2_wire() {
             .configuration()
             .is_none()
     );
+    let selected_state = codex_configuration_state(1, CodexReasoningEffort::Medium);
+    let selected = decode_ready_snapshot_with_configuration(
+        &legacy_payload,
+        legacy_payload.capacity(),
+        &selected_state,
+    )
+    .expect("legacy snapshot injects cursor-selected configuration");
+    assert!(selected.legacy_v4);
+    assert_eq!(selected.snapshot.configuration_state, selected_state);
     let v2_payload =
         serialize_build_snapshot(&decoded.snapshot, None).expect("encode canonical v2 snapshot");
     assert!(
@@ -770,6 +856,179 @@ fn canonical_legacy_v4_snapshot_dual_decodes_to_v2_wire() {
     assert!(matches!(
         decode_ready_snapshot_with_capacity(&noncanonical, noncanonical.capacity()),
         Err(SnapshotMaterializationError::SchemaIncompatible)
+    ));
+}
+
+#[tokio::test]
+async fn legacy_ready_injects_cursor_configuration_without_rewriting_stored_payload() {
+    // 威胁场景：升级后若 legacy Ready 用 current head 或在读路径改写 DB，旧 base
+    // 会获得未来配置，且一次只读订阅会产生未授权持久化副作用。
+    let root = snapshot_pin_test_root("legacy-cursor-configuration");
+    let config = RuntimeStoreConfig::new(root.join("runtime.db"));
+    let (store, conversation_id) = open_snapshot_pin_test_store(&root, config, 0x2D).await;
+    configure_snapshot_conversation(&store, conversation_id, 0, CodexReasoningEffort::Low).await;
+    let source = store
+        .acquire_snapshot_build_source(conversation_id)
+        .await
+        .expect("acquire legacy configuration source");
+    let legacy = LegacyConversationSnapshotV4 {
+        conversation_id: ConversationId::new(conversation_id.to_canonical_string()),
+        base_event_cursor: StreamCursor::At(0),
+        items: vec![SnapshotItem::capabilities(capabilities(AgentKind::Codex))],
+    };
+    let legacy_payload = serde_json::to_vec(&legacy).expect("encode production legacy payload");
+    let stored = store
+        .store_conversation_snapshot_fixture_for_test(source, 1, legacy_payload.clone())
+        .await
+        .expect("store authenticated legacy ready row");
+    let stored_snapshot_id = stored.snapshot_id;
+    let stored_hash = stored.content_sha256;
+    configure_snapshot_conversation(&store, conversation_id, 1, CodexReasoningEffort::High).await;
+
+    let ready_source = SnapshotMaterializationSource::new(
+        SnapshotBarrierSource::Ready(ReadySnapshotReference {
+            snapshot_id: stored_snapshot_id,
+            target: RuntimeStreamTarget::Conversation(conversation_id),
+            base: StreamCursor::At(0),
+            item_count: 1,
+            logical_bytes: u64::try_from(legacy_payload.len()).expect("legacy logical bytes"),
+            content_sha256: stored_hash,
+        }),
+        None,
+    );
+    let materializer = SnapshotMaterializer::new(store.clone(), snapshot_test_router());
+    let SnapshotMaterialization::Ready(ready) = materializer
+        .materialize(ready_source)
+        .await
+        .expect("materialize legacy cursor configuration")
+    else {
+        panic!("authenticated legacy row must remain Ready")
+    };
+    let current: ConversationSnapshot =
+        serde_json::from_slice(ready.canonical_payload()).expect("decode legacy v2 wire");
+    assert_eq!(current.configuration_state.configuration_revision(), 1);
+    assert_eq!(
+        current.configuration_state,
+        codex_configuration_state(1, CodexReasoningEffort::Low)
+    );
+    let (materialized_stored, wire_payload) = ready.into_parts();
+    assert!(wire_payload.is_some());
+    assert!(materialized_stored.payload.is_empty());
+    assert_eq!(materialized_stored.content_sha256, stored_hash);
+    drop(materialized_stored);
+    let persisted = store
+        .load_conversation_snapshot(conversation_id)
+        .await
+        .expect("reload legacy stored row")
+        .expect("legacy stored row remains present");
+    assert_eq!(persisted.payload, legacy_payload);
+    assert_eq!(persisted.content_sha256, stored_hash);
+    store.shutdown().await.expect("shutdown legacy store");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn current_ready_configuration_mismatch_fails_closed_in_materializer() {
+    let root = snapshot_pin_test_root("current-configuration-mismatch");
+    let config = RuntimeStoreConfig::new(root.join("runtime.db"));
+    let (store, conversation_id) = open_snapshot_pin_test_store(&root, config, 0x2F).await;
+    configure_snapshot_conversation(&store, conversation_id, 0, CodexReasoningEffort::Low).await;
+    let source = store
+        .acquire_snapshot_build_source(conversation_id)
+        .await
+        .expect("acquire current mismatch source");
+    let wrong = ready_snapshot(0x2F, AgentKind::Codex, StreamCursor::At(0), Vec::new());
+    let payload = serde_json::to_vec(&wrong).expect("encode current mismatch payload");
+    let stored = store
+        .store_conversation_snapshot_fixture_for_test(source, 1, payload)
+        .await
+        .expect("store authenticated current mismatch row");
+    let ready_source = SnapshotMaterializationSource::new(
+        SnapshotBarrierSource::Ready(ReadySnapshotReference {
+            snapshot_id: stored.snapshot_id,
+            target: RuntimeStreamTarget::Conversation(conversation_id),
+            base: StreamCursor::At(0),
+            item_count: stored.item_count,
+            logical_bytes: u64::try_from(stored.payload.len()).expect("mismatch logical bytes"),
+            content_sha256: stored.content_sha256,
+        }),
+        None,
+    );
+    let materializer = SnapshotMaterializer::new(store.clone(), snapshot_test_router());
+    let error = materializer
+        .materialize(ready_source)
+        .await
+        .expect_err("current ready configuration mismatch must fail closed");
+    assert_eq!(error.code(), "daemon.runtime.schema_incompatible");
+    store.shutdown().await.expect("shutdown mismatch store");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn configuration_nested_allocations_are_charged_in_typed_build_and_legacy_paths() {
+    // 威胁场景：Claude Code 三个短上限字段若未计入 Build/Ready/legacy 峰值，
+    // 多个并发 snapshot 可越过共享 128 MiB 内存池。
+    let configured = maximum_claude_configuration_state();
+    let rev0 = revision_zero_configuration_state();
+    let configured_snapshot = ConversationSnapshot::new(
+        ConversationId::new(conversation_id(0x2d).to_canonical_string()),
+        StreamCursor::At(0),
+        configured.clone(),
+        vec![SnapshotItem::capabilities(capabilities(
+            AgentKind::ClaudeCode,
+        ))],
+    )
+    .expect("configured typed snapshot");
+    let rev0_snapshot = ConversationSnapshot::new(
+        configured_snapshot.conversation_id.clone(),
+        StreamCursor::BeforeFirst,
+        rev0.clone(),
+        configured_snapshot.items().to_vec(),
+    )
+    .expect("revision-zero typed snapshot");
+    let configured_typed = estimate_typed_snapshot_retained_bytes(&configured_snapshot)
+        .expect("estimate configured typed snapshot");
+    let rev0_typed =
+        estimate_typed_snapshot_retained_bytes(&rev0_snapshot).expect("estimate rev0 snapshot");
+    assert!(configured_typed >= rev0_typed + 3 * MAX_CONFIGURATION_TEXT_BYTES);
+
+    let configured_estimator =
+        ConversationSnapshotBudgetEstimator::new(&capabilities(AgentKind::ClaudeCode), &configured)
+            .expect("configured reducer estimator");
+    let rev0_estimator =
+        ConversationSnapshotBudgetEstimator::new(&capabilities(AgentKind::ClaudeCode), &rev0)
+            .expect("rev0 reducer estimator");
+    assert!(
+        configured_estimator
+            .current_bound()
+            .expect("configured current bound")
+            >= rev0_estimator.current_bound().expect("rev0 current bound")
+                + 3 * MAX_CONFIGURATION_TEXT_BYTES
+    );
+
+    let legacy = LegacyConversationSnapshotV4 {
+        conversation_id: configured_snapshot.conversation_id.clone(),
+        base_event_cursor: StreamCursor::At(0),
+        items: configured_snapshot.items().to_vec(),
+    };
+    let payload = serde_json::to_vec(&legacy).expect("encode memory legacy snapshot");
+    let observation = observe_json_retained_budget(&payload).expect("scan memory legacy snapshot");
+    let nested = configuration_state_nested_retained_bytes(&configured)
+        .expect("estimate selected configuration");
+    let nonraw_peak = observation
+        .decoded_and_validation_bytes
+        .checked_add(std::mem::size_of::<ConversationConfigurationState>())
+        .and_then(|bytes| bytes.checked_add(2 * nested))
+        .expect("legacy retained peak");
+    let exact_raw = SNAPSHOT_BUILD_MEMORY_BYTES
+        .checked_sub(nonraw_peak)
+        .expect("legacy fixture fits exact memory pool");
+    assert!(exact_raw >= payload.len());
+    decode_ready_snapshot_with_configuration(&payload, exact_raw, &configured)
+        .expect("exact legacy retained peak is legal");
+    assert!(matches!(
+        decode_ready_snapshot_with_configuration(&payload, exact_raw + 1, &configured),
+        Err(SnapshotMaterializationError::PayloadTooLarge)
     ));
 }
 
@@ -810,7 +1069,7 @@ fn legacy_v4_at_the_wire_limit_has_a_typed_migration_failure() {
     drop(legacy_payload);
 
     let current = legacy
-        .into_current()
+        .into_current(revision_zero_configuration_state())
         .expect("legacy DTO itself remains valid");
     let error = serialize_build_snapshot(&current, None)
         .expect_err("v2 required field must cross the unchanged 64 MiB ceiling");
@@ -1029,6 +1288,7 @@ async fn build_handoff_clears_input_capabilities_before_raw_is_retained() {
     let assembled = assemble_build_snapshot(&mut input, vec![item(0)])
         .expect("assemble build input retention snapshot");
     assert!(input.capabilities().is_none());
+    assert!(input.configuration_state().is_none());
     let write = input
         .bind_assembled_snapshot(assembled)
         .expect("bind build input retention snapshot");
@@ -1355,6 +1615,7 @@ fn ready_validator_rejects_conversation_base_count_and_agent_kind_mismatch() {
         validate_ready_snapshot(
             &context,
             &reference(0x14, StreamCursor::BeforeFirst, 1),
+            &revision_zero_configuration_state(),
             &wrong_conversation,
         )
         .expect_err("conversation mismatch")
@@ -1367,6 +1628,7 @@ fn ready_validator_rejects_conversation_base_count_and_agent_kind_mismatch() {
         validate_ready_snapshot(
             &context,
             &reference(0x14, StreamCursor::BeforeFirst, 1),
+            &revision_zero_configuration_state(),
             &wrong_base,
         )
         .expect_err("base mismatch")
@@ -1384,6 +1646,7 @@ fn ready_validator_rejects_conversation_base_count_and_agent_kind_mismatch() {
         validate_ready_snapshot(
             &context,
             &reference(0x14, StreamCursor::BeforeFirst, 2),
+            &revision_zero_configuration_state(),
             &valid,
         )
         .expect_err("item count mismatch")
@@ -1401,12 +1664,28 @@ fn ready_validator_rejects_conversation_base_count_and_agent_kind_mismatch() {
         validate_ready_snapshot(
             &context,
             &reference(0x14, StreamCursor::BeforeFirst, 1),
+            &revision_zero_configuration_state(),
             &wrong_kind,
         )
         .expect_err("agent kind mismatch")
         .code(),
         "daemon.runtime.schema_incompatible"
     );
+}
+
+#[test]
+fn ready_validator_rejects_configuration_state_mismatch() {
+    let mut context = authenticated_context(0x15, AgentKind::Codex);
+    context.event_high_water = Some(0);
+    let snapshot = ready_snapshot(0x15, AgentKind::Codex, StreamCursor::At(0), Vec::new());
+    let error = validate_ready_snapshot(
+        &context,
+        &reference(0x15, StreamCursor::At(0), 1),
+        &codex_configuration_state(1, CodexReasoningEffort::High),
+        &snapshot,
+    )
+    .expect_err("current ready DTO cannot disagree with cursor-selected configuration");
+    assert_eq!(error.code(), "daemon.runtime.schema_incompatible");
 }
 
 #[test]
@@ -1430,6 +1709,7 @@ fn ready_validator_rejects_duplicate_final_item_id_without_repair() {
     let error = validate_ready_snapshot(
         &context,
         &reference(0x16, StreamCursor::BeforeFirst, 3),
+        &revision_zero_configuration_state(),
         &snapshot,
     )
     .expect_err("duplicate final item id must fail closed");
@@ -1467,6 +1747,7 @@ fn ready_validator_rejects_duplicate_final_entity_id_without_repair() {
     let error = validate_ready_snapshot(
         &context,
         &reference(0x19, StreamCursor::BeforeFirst, 3),
+        &revision_zero_configuration_state(),
         &snapshot,
     )
     .expect_err("duplicate final entity id must fail closed");

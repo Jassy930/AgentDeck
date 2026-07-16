@@ -41,6 +41,7 @@ pub use crate::runtime::model::{
     SystemRuntimeClock, TerminalState, TerminateAcceptedCommand, TerminateAcceptedOutcome,
     TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
 };
+pub(crate) use configuration::MAX_CONFIGURATION_CANONICAL_BYTES;
 pub use configuration::{ConfigurationRecord, ConfigureConversation, ConfigureConversationOutcome};
 pub use execution_event::{AppendExecutionEvent, AppendExecutionEventOutcome};
 pub use identity::{RuntimeId, RuntimeIdKind, RuntimeIdSource};
