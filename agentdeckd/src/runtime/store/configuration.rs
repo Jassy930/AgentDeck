@@ -1528,3 +1528,101 @@ pub(super) fn validate_v5_integrity(
     }
     Ok(authenticated_configuration_count)
 }
+
+#[cfg(test)]
+mod tests {
+    use agentdeck_protocol::ClaudeCodePermissionMode;
+    use agentdeck_protocol::runtime::{
+        ClaudeCodeConversationConfiguration, VendorConfigurationSnapshot,
+    };
+
+    use super::*;
+
+    #[test]
+    fn configuration_capacity_accepts_exact_limits_and_rejects_one_past_each_scope() {
+        let exact_new_bytes = 123;
+        let mut exact = RuntimeLedger {
+            configuration_count: MAX_CONFIGURATIONS_GLOBAL - 1,
+            configuration_sealed_bytes: MAX_CONFIGURATION_SEALED_BYTES_GLOBAL - exact_new_bytes,
+            ..RuntimeLedger::default()
+        };
+        ensure_configuration_capacity(
+            &exact,
+            MAX_CONFIGURATIONS_PER_CONVERSATION - 1,
+            exact_new_bytes,
+        )
+        .expect("last legal configuration must reach every exact cap");
+
+        assert!(matches!(
+            ensure_configuration_capacity(
+                &RuntimeLedger::default(),
+                MAX_CONFIGURATIONS_PER_CONVERSATION,
+                0,
+            ),
+            Err(RuntimeStoreError::ConfigurationLimit {
+                scope: ConfigurationLimitScope::Conversation,
+            })
+        ));
+        exact.configuration_count = MAX_CONFIGURATIONS_GLOBAL;
+        exact.configuration_sealed_bytes = 0;
+        assert!(matches!(
+            ensure_configuration_capacity(&exact, 0, 0),
+            Err(RuntimeStoreError::ConfigurationLimit {
+                scope: ConfigurationLimitScope::GlobalCount,
+            })
+        ));
+        exact.configuration_count = 0;
+        exact.configuration_sealed_bytes = MAX_CONFIGURATION_SEALED_BYTES_GLOBAL;
+        assert!(matches!(
+            ensure_configuration_capacity(&exact, 0, 1),
+            Err(RuntimeStoreError::ConfigurationLimit {
+                scope: ConfigurationLimitScope::GlobalSealedBytes,
+            })
+        ));
+        exact.configuration_sealed_bytes = u64::MAX;
+        assert!(matches!(
+            ensure_configuration_capacity(&exact, 0, 1),
+            Err(RuntimeStoreError::ConfigurationLimit {
+                scope: ConfigurationLimitScope::GlobalSealedBytes,
+            })
+        ));
+    }
+
+    #[test]
+    fn prepared_request_drops_large_caller_capacities_before_worker_admission() {
+        fn short_value_with_large_capacity(value: &str) -> String {
+            let mut retained = String::with_capacity(1024 * 1024);
+            retained.push_str(value);
+            retained
+        }
+
+        let configuration =
+            ConversationConfiguration::new(VendorConfigurationSnapshot::ClaudeCode(
+                ClaudeCodeConversationConfiguration::new(
+                    ClaudeCodePermissionMode::Default,
+                    Some(short_value_with_large_capacity("m")),
+                    Some(short_value_with_large_capacity("e")),
+                    Some(short_value_with_large_capacity("o")),
+                )
+                .expect("short Claude fields are valid"),
+            ));
+        let prepared = prepare_configuration_request(ConfigureConversation {
+            conversation_id: RuntimeId::from_bytes(RuntimeIdKind::Conversation, [0x61; 16])
+                .expect("conversation id"),
+            owner: IdempotencyOwner::Local {
+                machine_trust_domain: [0x62; 32],
+                uid: 501,
+                client_installation_id: [0x63; 16],
+            },
+            idempotency_key: short_value_with_large_capacity("k"),
+            expected_configuration_revision: 0,
+            configuration,
+        })
+        .expect("prepare canonical request");
+        assert_eq!(
+            prepared.retained_capacity().expect("retained capacity"),
+            prepared.request_plaintext.capacity()
+        );
+        assert!(prepared.request_plaintext.capacity() < MAX_CONFIGURATION_REQUEST_BYTES);
+    }
+}
