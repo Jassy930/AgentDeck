@@ -1632,7 +1632,9 @@ P3.9 固定以下迁移边界：
 - Modify: `protocol/agentdeck/runtime-protocol.schema.json`
 - Rename: `Sources/AgentDeckCore/Protocol/RuntimeV1Types.swift` → `RuntimeWireTypes.swift`（只做 version-neutral
   文件归位，不 bulk 改 3,000+ 行 leaf symbol）
-- Create: `Sources/AgentDeckCore/Protocol/RuntimeV2Types.swift`（复用 wire 未变的 leaf DTO）
+- Create: `Sources/AgentDeckCore/Protocol/RuntimeV2Types.swift`（A2a：复用 wire 未变的 leaf DTO）
+- Create: `Sources/AgentDeckCore/Protocol/RuntimeV2StreamTypes.swift`（A2b：catalog/event/snapshot/backfill）
+- Create: `Sources/AgentDeckCore/Protocol/RuntimeV2WireCodec.swift`（A2c：outer/current codec/transfer）
 - Rename: `Tests/AgentDeckTests/RuntimeV1ProtocolTests.swift` → `RuntimeProtocolCompatibilityTests.swift`
 - Create: `Tests/AgentDeckTests/RuntimeV2ProtocolTests.swift`
 - Modify: `agentdeckd/src/runtime/{core,conversation,execution,snapshot,events,model,router}.rs`
@@ -1705,10 +1707,81 @@ P3.9 固定以下迁移边界：
     终审发现的 2 个 P1 与 2 个 P2 均已 red→green，最终 spec/security/quality 三路 Approved；代码与
     测试新增 730 行，低于 2,000 行刹车线。P4 投产前的开发凭据必须执行受控
     reset/re-enroll/re-pair；当前不新增 production 双栈或 legacy verifier。A1a/A1b 均完成，故 A1 complete。
-- [ ] **P3.9-C0-A2 Swift v2 mirror：** 在新 `RuntimeV2Types.swift` 只实现 v2 outer/changed DTO，复用 wire
-  未变的既有 leaf types，禁止一次性全文件符号替换；新增 v2 tests 并把 production client gate 切到 v2，
-  Rust fixture→Swift decode/encode 语义一致，完整 Swift tests 全绿后独立 review/提交。若任一切片新增/修改
-  代码超过 2,000 行，立即停下再拆分并汇报，不以机械 rename 绕过刹车线。
+- [ ] **P3.9-C0-A2 Swift v2 mirror：** 具体威胁场景是：若直接复用 Swift synthesized `Codable`、现有
+  宽松 `VendorPanelPayload` 或 Runtime v1 transfer codec，Rust 已拒绝的 unknown/missing/null 输入会被
+  Swift 接受或重编码漂移，JSON/UDS 的 64-part 旧上限还会截断合法 64 MiB v2 transfer。故 A2 必须使用
+  strict exact-key decoder、required-null presence check 与独立 v2 carrier profile；不把 fixture 正向
+  round-trip 当成全部证据。
+  在三个职责单一的 v2 文件只实现 changed DTO/stream/codec，复用 wire 未变的既有 leaf types，禁止一次性
+  全文件符号替换。A2c 必须新增可编译、被测试直接调用的
+  `runtimeProtocolVersionV2: UInt16 = 2`、
+  `runtimeProtocolVersionCurrent: UInt16 = runtimeProtocolVersionV2` 与
+  `typealias RuntimeWireCodec = RuntimeV2WireCodec`；v1 codec 仅供 frozen compatibility tests 使用。
+  production source 静态扫描不得引用 v1；这不代表 App/CLI 已完成 UDS
+  cutover。预估完整代码与测试
+  3,100–3,800 行，按新增/修改代码口径预先拆为三片，每片独立 TDD/review/commit：
+  - [ ] **A2-0 真实 UDS 样本前置门禁（不新增 production code）：** 在写 Swift outer validator 前，启动
+    current Rust ephemeral/no-remote daemon，经其实际派生并验证的 UDS endpoint 发送 preface + Runtime v2
+    Hello，捕获一份 exact raw reply 到仓库外 0600 临时文件；记录 byte count 与 SHA-256，并先用 current
+    Rust codec 读回。A2c 必须再让 Swift `RuntimeWireCodec` 解码同一份 raw bytes 并做语义等价重编码后才可
+    删除临时样本；`runtime-v2-wire.jsonl` 或合成 socketpair 不能替代该门禁。不得向 daemon 注入任意 socket
+    path，也不得把运行记录、用户路径或临时样本提交进仓库。
+  - [ ] **A2a strict DTO/receipt primitives（约 1,100–1,300 行）：** configuration、metadata、upgrade、
+    agent descriptions 与 changed receipt；手写 deny-unknown、missing/null/default、文本/agent/revision
+    validation，禁止改宽 IPC v2 公共 vendor 类型。Codex 三个 configuration 字段全部 required；CC
+    `permissionMode` required，`model/effort/outputStyle` 均允许 missing 或 null，统一规范化为 `nil` 且
+    egress 显式 `null`，非 nil 文本必须为 1…1024 UTF-8 bytes 且不含 NUL。vendor tag、capabilities 与
+    default configuration 必须 agent 匹配；AgentDescriptions 允许空、最多 16 个且 agent kind 不重复。
+    `ConversationConfigurationState` 只允许
+    `revision=0 + configuration=null` 或 `revision>0 + configuration!=null`；Rename 的 `title` key 必须存在，
+    可为 null；非 nil title 允许空字符串、最多 4096 UTF-8 bytes 且不含 NUL。只有 configuration/metadata
+    `Applied/Replayed` revision 强制非零；configuration/metadata 的
+    expected/conflict revision、CommandReceipt/CommandStatus configuration revision 均允许 0，以读回 legacy
+    recovery；CommandStatus `turnId` 的 missing/null 都接受，不擅自按 status 加严。upgrade 必须对称校验
+    lowercase 64-hex SHA、1…128 bytes ASCII target（拒绝 `.`/`..`）、`localOnly` scope 与
+    `AwaitingIdle.activeTurns>0`。新增 ingress 与 egress 对称负向测试，不能只测 decoder。
+    提交前运行 focused A2a tests、完整 `swift test`、既定 iOS XcodeGen + `xcodebuild test`、docs/diff gate，
+    并独立复审；任何 0-test filter 不算通过。
+  - [ ] **A2b stream projection types（约 850–1,100 行）：** catalog、event、Runtime 专用 strict
+    vendor-panel、snapshot、backfill；固定 required-null identity、capabilities-first、configuration agent
+    match。Catalog reply `nextPageCursor` 必须 present、可为 null；entry 的 `title/cwd` 允许 missing 或 null
+    并统一为 `nil`、egress 显式 null，`entryRevision/lastActiveMs/catalogRevision` 均允许 0；Catalog 拒绝
+    第 501 row 与 bare encoded bytes `>64 MiB`，Removed change 保持 Rust wire 的
+    `conversation_id` key。Runtime event 的 `commandId/itemId/entityId` 及 ApprovalResolved `decision` 必须
+    present、可为 null，`eventSeq=0` 合法；按 body 执行 command/item/entity identity 矩阵。Runtime 专用
+    vendor-panel 外层与嵌套 payload 都拒绝 unknown；CC panel optional 的 missing/null 都规范化为 nil、egress
+    显式 null。Snapshot 必须非空、capabilities first 且恰好一次，configuration 非空时 agent 必须匹配。
+    Backfill 是 after-exclusive/through-inclusive 的 1…512 连续范围，拒绝第 513 entry、空/非连续 range、
+    delta/event sequence 或 conversation scope 不匹配、bare encoded bytes `>64 MiB`；所有门禁均有
+    ingress/egress 负向测试。Swift 符号
+    `RuntimeAdapterStateKey` 改为明确的 `RuntimeAdapterStateKeyV1Compatibility`，只允许出现在
+    compatibility kind/typealias 定义、`RuntimeConversationEntryV1`、`ConversationStartReceiptV1` 的字段/codec
+    与 frozen v1 compatibility tests；不改 legacy JSON key，也不删除 frozen v1 fixture。专门的 source
+    gate 必须证明 frozen `RuntimeWireTypes.swift` 中 unsuffixed `RuntimeAdapterStateKey(Kind)` exact token 为
+    0、`RuntimeAdapterStateKeyV1CompatibilityKind` exact token 为 2、
+    `RuntimeAdapterStateKeyV1Compatibility` exact token 为 6，且 compatibility tests 以外的其他 Swift source
+    为 0；不能因整文件排除而漏过旧 public alias。提交前运行 focused A2b tests、完整 `swift test`、既定
+    iOS XcodeGen + `xcodebuild test`、docs/diff gate并独立复审；任何 0-test filter 不算通过。
+  - [ ] **A2c outer/codec/current gate（约 1,150–1,400 行）：** request/reply/message/stream/envelope、
+    JSON/UDS 700 KiB × 94 parts、compact 3.5 MiB × 64 parts、共同 64 MiB 与 `ADRT1` carrier version 2；
+    Catalog request `pageCursor` 必须 present、可为 null；`ttlSecs` missing 固定默认 300、显式 null 拒绝；
+    message/transfer ID 必须为 1…1024 UTF-8 bytes。
+    JSON/UDS envelope 与 request 都严格 `<1 MiB`，exact 1 MiB ingress/egress 拒绝；compact carrier 严格
+    `<4 MiB`，并对 SHA-256 exact 32 bytes、index/count、part/total、`partCount × profilePartBytes`
+    representability 做双向负向测试，明确证明 JSON 的 64 parts 不能表达 64 MiB、94 parts 可以，而
+    compact 仍只允许 64 parts。全量 98 条 Rust fixture 必须断言 case 唯一及 96 envelope + 1 JSON transfer
+    + 1 compact carrier，逐条语义等价、compact byte-exact、v1/v2 mismatch；
+    `RuntimeWireCodec` 的测试必须证明 current constant 为 2、v1 JSON/compact ingress 与构造 version=1 的
+    egress 均拒绝，避免 no-v1 scan 在 A2 前空跑。静态 gate 精确扫描 `Sources/AgentDeck/`、
+    `Sources/AgentDeckRelayClient/`、`ios/AgentDeckMobile/` 与除 `RuntimeWireTypes.swift` 外的
+    `Sources/AgentDeckCore/`，不得引用 v1 protocol constant/error、changed outer/stream DTO、codec/transfer 或
+    `RuntimeAdapterStateKey*`；三个 v2 文件、v2 schema 与 fixture 不得出现 `adapterStateKey`。只排除 frozen
+    `RuntimeWireTypes.swift`、compatibility tests 与 v1 fixture，避免兼容工件造成假失败；Core 同时保持无
+    AppKit/UIKit/Network/CryptoKit。提交前运行 focused A2c/98-fixture/current-facade tests、完整
+    `swift test`、既定 iOS XcodeGen + `xcodebuild test`、App selfcheck、docs/diff gate，并独立复审；任何
+    0-test filter 不算通过。A2-0 捕获的真实 UDS Hello reply 必须由 current Swift codec 成功读回后才算
+    A2 complete。
+    任一切片超过 2,000 行立即停下再拆，不以删除/机械 rename 抵消新增行。
 - [ ] **P3.9-C0-B configuration store/execution：** Runtime DB v5 增加 append-only sealed
   configuration versions、conversation/command revision 与 idempotency/token ledger；Configure CAS 与 metadata
   mutation 分开提交：Configure 只推进 configuration journal + `ConfigurationChanged` conversation event，

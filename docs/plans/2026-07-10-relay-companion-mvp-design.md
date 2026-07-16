@@ -541,6 +541,30 @@ history 时直接切到 UDS，会让用户选择静默回落默认值、历史�
   版本；因此本次在 P4 production pairing 落地前做一次 hard cutover：P2/P3 synthetic Relay DB、cert、grant、
   revocation 与 retirement fixture 不允许跨版本复用，开发环境必须 reset/re-enroll/re-pair。A1b 用旧 v1 TBS
   真实签名在 v2 verifier 下拒绝且 Store 零提交的门禁固定该边界，不能只重跑 dummy-signature wire fixture。
+- Swift v2 mirror 必须手写 exact-key/unknown-tag/required-null decoder 与对称 egress validation；不能直接复用
+  synthesized `Codable` 或 IPC v2 的宽松 `VendorPanelPayload`。Runtime 专用 vendor-panel wrapper 必须拒绝
+  嵌套 unknown，并按 Rust wire 对 optional 字段显式编码 `null`。configuration state、Rename title、catalog
+  cursors 与 `ttlSecs` 的 missing/null/default 必须逐项负向测试；只对 configuration/metadata success receipt
+  强制非零 revision，不能误拒 CommandReceipt/Status 的 legacy recovery rev0。
+- Swift exact matrix 固定为：configuration state 的 `configuration`、Rename 的 `title`、Catalog request 的
+  `pageCursor`、Catalog reply 的 `nextPageCursor`、event identity 的 `commandId/itemId/entityId` 与 approval
+  `decision` 都是 required-null；CC `model/effort/outputStyle` 与 Catalog entry 的 `title/cwd` 则允许
+  missing 或 null，并统一规范化为 `nil`、egress 显式 `null`。`ttlSecs` 仅 missing→300，null 拒绝。
+  configuration/metadata 的 `Applied/Replayed` revision 必须 `>0`；configuration/metadata expected/conflict、
+  CommandReceipt/CommandStatus configuration revision、Catalog entry revision 均允许 0。
+- Swift resource gate 与 Rust 完全对称：Catalog 每页最多 500 rows、encoded bytes 最多 64 MiB；Backfill
+  最多 512 entries、range 非空连续、entry scope/sequence 匹配、encoded bytes 最多 64 MiB；JSON/UDS
+  envelope 与 request 都严格 `<1 MiB`，exact 1 MiB ingress/egress 拒绝；compact carrier 严格 `<4 MiB`，
+  message/transfer ID 为 1…1024 UTF-8 bytes，SHA-256 固定 32 bytes，并校验 index/count、part/total 与
+  `partCount × profilePartBytes` 的可表示性。
+- transfer 保持两个独立 v2 profile：JSON/UDS 700 KiB × 94 parts，compact 3.5 MiB × 64 parts，共同
+  64 MiB；compact magic 仍为 `ADRT1` 但 carrier Runtime version 必须为 2。frozen v1 JSON 64-part codec
+  不得被改宽，也不能被 current codec fallback 调用。
+- A2 的“production gate 切 v2”只表示 Swift 定义 `runtimeProtocolVersionV2 = 2`、
+  `runtimeProtocolVersionCurrent = runtimeProtocolVersionV2` 与
+  `typealias RuntimeWireCodec = RuntimeV2WireCodec`，current ingress/egress 拒绝 v1，且 production source
+  不引用 v1 outer/codec/transfer。真实 `RuntimeEnvelopeClient`、UDS 与 App model cutover 仍属于
+  P3.9-B/C3/D，A2 不得据此宣称 shared-daemon client 已完成。
 - 新会话固定 `Start → ConfigureConversation(rev0) → Subscribe → SendPrompt(expected rev1)`。
   configuration append-only；Configure 以 expected revision + idempotency 做 CAS，Accepted command 同事务 pin
   exact revision，重启恢复按该 revision 构造 driver。之后的 Configure 只影响之后 Accepted 的 prompt。
@@ -568,9 +592,13 @@ history 时直接切到 UDS，会让用户选择静默回落默认值、历史�
   conversation、累计读取 64 MiB，并在 2 秒 wall-clock budget 到达时保存 opaque continuation 后让出。
   单 transcript snapshot 仍受 64 MiB/10,000 item 上界，超限返回 typed history-too-large；不得因 bootstrap
   扫描而无限延迟 UDS readiness。
-- v2 从 `ConversationEntry` 与 `ConversationStartReceipt` 删除 `adapterStateKey`，Swift 也不再定义可供
-  client 使用的 `RuntimeAdapterStateKey`。客户端只持 `conversationId`；daemon 内部从已认证 Runtime store
-  解析 exact adapter key。schema、fixture、日志和 public Debug 输出扫描必须证明没有该私域 handle。
+- v2 从 `ConversationEntry` 与 `ConversationStartReceipt` 删除 `adapterStateKey`，current Swift v2 surface
+  不再定义可供 client 使用的 `RuntimeAdapterStateKey`。frozen v1 compatibility 类型/fixture 可保留明确
+  V1-only 的 `RuntimeAdapterStateKeyV1Compatibility` 与 legacy wire field，但 `Sources/AgentDeck/` 不得引用
+  v1 codec/handle，三个 v2 文件 `RuntimeV2Types.swift`、`RuntimeV2StreamTypes.swift`、
+  `RuntimeV2WireCodec.swift` 也不得出现 `adapterStateKey`。客户端只持
+  `conversationId`；daemon 内部从已认证 Runtime store 解析 exact adapter key。v2 schema、fixture、日志和
+  public Debug 输出扫描必须证明没有该私域 handle。
 - Runtime store 为 conversation 持久化 authenticated daemon-private
   `ConversationOrigin::Managed | NativeProjected(namespace)`；v4 migration 固定 Managed，projector import
   固定 NativeProjected。禁止用“是否已有 adapter binding”猜 origin，因为 managed conversation 首次执行后
