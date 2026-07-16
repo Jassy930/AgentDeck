@@ -35,7 +35,8 @@ use agentdeck_protocol::relay_v2::id::{
 use agentdeck_protocol::relay_v2::{RELAY_PROTOCOL_VERSION, StreamCursor};
 use agentdeck_protocol::runtime::identity::{ConversationId, MessageId, TransferId};
 use agentdeck_protocol::runtime::{
-    RuntimeInnerCursor, RuntimeTransferCarrierV1, RuntimeTransferChannel, TransferEnvelope,
+    RUNTIME_PROTOCOL_VERSION, RuntimeInnerCursor, RuntimeTransferCarrierV1, RuntimeTransferChannel,
+    TransferEnvelope,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -461,6 +462,7 @@ fn render_relay_v2_wire_vectors() -> String {
     let document = serde_json::json!({
         "fixtureFormatVersion": 1,
         "relayProtocolVersion": RELAY_PROTOCOL_VERSION,
+        "runtimeProtocolVersion": RUNTIME_PROTOCOL_VERSION,
         "outerFrames": outer_frames,
         "endpointTypes": endpoint_wire_vectors(),
     });
@@ -495,9 +497,9 @@ fn relay_v2_wire_fixture_is_rust_produced_and_in_sync() {
 fn relay_protocol_version_is_two_and_independent() {
     assert_eq!(RELAY_PROTOCOL_VERSION, 2);
     assert_eq!(E2EE_FORMAT_VERSION, 1);
-    // 版本轴彼此独立：local IPC=2、Relay=2、Runtime=1、E2EE=1。
+    // 版本轴彼此独立：local IPC=2、Relay=2、Runtime=2、E2EE=1。
     assert_eq!(agentdeck_protocol::PROTOCOL_VERSION, 2);
-    assert_eq!(agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION, 1);
+    assert_eq!(RUNTIME_PROTOCOL_VERSION, 2);
 }
 
 #[test]

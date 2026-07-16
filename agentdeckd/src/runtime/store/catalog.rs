@@ -1,8 +1,12 @@
 //! Runtime v4 authenticated catalog delta journal。
 
-use agentdeck_protocol::runtime::identity::{AdapterStateKey, ConversationId};
+use std::path::PathBuf;
+
+use agentdeck_protocol::AgentKind;
+use agentdeck_protocol::runtime::identity::ConversationId;
 use agentdeck_protocol::runtime::{CatalogChange, CatalogDelta, ConversationEntry};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde::{Deserialize, Serialize};
 
 use crate::runtime::model::{ConversationLifecycle, RuntimeStoreError};
 
@@ -18,6 +22,92 @@ pub(crate) const MAX_CATALOG_DELTAS: u64 = 10_000;
 pub(crate) const MAX_CATALOG_DELTA_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CATALOG_DELTA_ITEM_BYTES: usize = 64 * 1024 * 1024;
 const CATALOG_TOKEN_DOMAIN: &[u8] = b"catalog.journal.v1";
+
+/// Runtime DB v4 中由 Runtime v1 写入的 catalog entry。它只用于认证后的
+/// daemon-private payload 兼容读取；旧 adapter handle 在转换时丢弃，绝不重新进入 v2 wire。
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct LegacyConversationEntryV4 {
+    pub(super) conversation_id: ConversationId,
+    pub(super) adapter_state_key: String,
+    pub(super) agent_kind: AgentKind,
+    #[serde(default)]
+    pub(super) title: Option<String>,
+    #[serde(default)]
+    pub(super) cwd: Option<PathBuf>,
+    pub(super) last_active_ms: u64,
+    pub(super) archived: bool,
+}
+
+impl LegacyConversationEntryV4 {
+    pub(super) fn into_current(self) -> ConversationEntry {
+        let Self {
+            conversation_id,
+            adapter_state_key,
+            agent_kind,
+            title,
+            cwd,
+            last_active_ms,
+            archived,
+        } = self;
+        drop(adapter_state_key);
+        ConversationEntry {
+            conversation_id,
+            agent_kind,
+            title,
+            cwd,
+            last_active_ms,
+            archived,
+            // P3.9-C0-A1 只迁移 wire 形态；真实 metadata revision 由 v5 migration 建立。
+            entry_revision: 0,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacyCatalogDeltaV4 {
+    catalog_revision: u64,
+    changes: Vec<LegacyCatalogChangeV4>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+enum LegacyCatalogChangeV4 {
+    Upserted { entry: LegacyConversationEntryV4 },
+    Removed { conversation_id: ConversationId },
+}
+
+impl LegacyCatalogDeltaV4 {
+    fn into_current(self) -> CatalogDelta {
+        CatalogDelta {
+            catalog_revision: self.catalog_revision,
+            changes: self
+                .changes
+                .into_iter()
+                .map(|change| match change {
+                    LegacyCatalogChangeV4::Upserted { entry } => CatalogChange::Upserted {
+                        entry: entry.into_current(),
+                    },
+                    LegacyCatalogChangeV4::Removed { conversation_id } => {
+                        CatalogChange::Removed { conversation_id }
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+fn decode_persisted_catalog_delta(
+    payload: &[u8],
+) -> Result<(CatalogDelta, bool), RuntimeStoreError> {
+    if let Ok(delta) = serde_json::from_slice::<CatalogDelta>(payload) {
+        return Ok((delta, false));
+    }
+    let legacy = serde_json::from_slice::<LegacyCatalogDeltaV4>(payload)
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    Ok((legacy.into_current(), true))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct AuthenticatedCatalogDeltaRange {
@@ -203,14 +293,13 @@ pub(super) fn reconcile_catalog_journal(
                     conversation_id: ConversationId::new(
                         conversation.conversation_id.to_canonical_string(),
                     ),
-                    adapter_state_key: AdapterStateKey::new(
-                        conversation.adapter_state_key.to_canonical_string(),
-                    ),
                     agent_kind: conversation.descriptor.agent_kind,
                     title: conversation.descriptor.title.clone(),
                     cwd: Some(conversation.descriptor.cwd.clone()),
                     last_active_ms: conversation.updated_at_ms,
                     archived: conversation.lifecycle == ConversationLifecycle::Archived,
+                    // P3.9-C0-A1 只冻结 v2 wire；v5 metadata revision 在 C0-B 接线。
+                    entry_revision: 0,
                 },
             }],
         };
@@ -409,8 +498,7 @@ pub(super) fn validate_integrity(
         {
             return Err(RuntimeStoreError::UnknownOrCorruptSchema);
         }
-        let delta: CatalogDelta = serde_json::from_slice(plaintext.expose_secret())
-            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+        let (delta, _) = decode_persisted_catalog_delta(plaintext.expose_secret())?;
         if delta.catalog_revision != revision_value || delta.changes.len() != 1 {
             return Err(RuntimeStoreError::UnknownOrCorruptSchema);
         }
@@ -508,8 +596,7 @@ pub(super) fn load_delta(
     {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
-    let delta: CatalogDelta = serde_json::from_slice(plaintext.expose_secret())
-        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let (delta, _) = decode_persisted_catalog_delta(plaintext.expose_secret())?;
     let revision_value = decode_sequence(SequenceScope::CatalogRevision, revision)?;
     if delta.catalog_revision != revision_value || delta.changes.len() != 1 {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
@@ -577,6 +664,39 @@ mod tests {
     use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn legacy_runtime_v1_catalog_delta_dual_decodes_without_rewrite() {
+        // 威胁场景：DB schema 仍是 v4、但 sealed catalog payload 来自 Runtime v1；
+        // 新 daemon 必须丢弃 private handle 并返回 v2 entry，不能改写原 ciphertext。
+        let legacy = LegacyCatalogDeltaV4 {
+            catalog_revision: 7,
+            changes: vec![LegacyCatalogChangeV4::Upserted {
+                entry: LegacyConversationEntryV4 {
+                    conversation_id: ConversationId::new("conversation-legacy"),
+                    adapter_state_key: "adapter-private".into(),
+                    agent_kind: AgentKind::Codex,
+                    title: Some("legacy title".into()),
+                    cwd: Some(PathBuf::from("/tmp/legacy")),
+                    last_active_ms: 9,
+                    archived: false,
+                },
+            }],
+        };
+        let payload = serde_json::to_vec(&legacy).expect("encode canonical v1 catalog delta");
+        let (decoded, was_legacy) =
+            decode_persisted_catalog_delta(&payload).expect("dual decode v1 catalog delta");
+        assert!(was_legacy);
+        let [CatalogChange::Upserted { entry }] = decoded.changes.as_slice() else {
+            panic!("legacy upsert must remain one upsert")
+        };
+        assert_eq!(entry.entry_revision, 0);
+        assert!(
+            !serde_json::to_string(&decoded)
+                .unwrap()
+                .contains("adapterStateKey")
+        );
+    }
 
     #[test]
     fn catalog_gc_preserves_pin_and_rows_without_durable_replacement() {

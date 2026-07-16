@@ -4,9 +4,10 @@ use agentdeck_protocol::runtime::identity::{
     ConversationId, EntityId, EventId, ItemId, StreamGeneration, TransferId,
 };
 use agentdeck_protocol::runtime::{
-    BackfillChunk, BackfillRange, MAX_ACTIVE_TRANSFERS, MAX_JSON_PART_BYTES, MAX_PART_BYTES,
-    MAX_TRANSFER_BYTES, MAX_TRANSFER_PARTS, RuntimeEvent, RuntimeEventBody, RuntimeTransferChannel,
-    StreamCursor, TRANSFER_TTL_MS, TransferEnvelope, TransferError,
+    BackfillChunk, BackfillRange, MAX_ACTIVE_TRANSFERS, MAX_JSON_PART_BYTES,
+    MAX_JSON_TRANSFER_PARTS, MAX_PART_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_PARTS, RuntimeEvent,
+    RuntimeEventBody, RuntimeTransferChannel, StreamCursor, TRANSFER_TTL_MS, TransferEnvelope,
+    TransferError,
 };
 use agentdeck_protocol::{
     AgentItem, AgentItemMeta, AgentKind, SessionCapabilities, VendorCapabilities,
@@ -584,13 +585,14 @@ fn hash_or_length_mismatch_never_mutates_reducer() {
 }
 
 #[test]
-fn sixty_five_parts_and_oversize_payload_fail_before_allocation() {
+fn carrier_specific_part_limits_and_oversize_payload_fail_before_allocation() {
     assert_eq!(MAX_TRANSFER_PARTS, 64);
+    assert_eq!(MAX_JSON_TRANSFER_PARTS, 94);
     assert_eq!(MAX_TRANSFER_BYTES, 64 * 1024 * 1024);
     assert_eq!(
         validate_declared_transfer(
             TransferCarrierProfile::JsonUds,
-            MAX_TRANSFER_PARTS + 1,
+            MAX_JSON_TRANSFER_PARTS + 1,
             0,
             0,
         ),
@@ -624,7 +626,7 @@ fn sixty_five_parts_and_oversize_payload_fail_before_allocation() {
         .accept(CONNECTION_A, transfer_binding.clone(), parts[0].clone(), 0)
         .expect("valid partial before oversized metadata");
     let mut oversized = parts[1].clone();
-    oversized.part_count = MAX_TRANSFER_PARTS + 1;
+    oversized.part_count = MAX_JSON_TRANSFER_PARTS + 1;
     assert_eq!(
         machine
             .accept(CONNECTION_A, transfer_binding, oversized, 1)
@@ -643,6 +645,14 @@ fn carrier_profiles_enforce_json_boundary_and_exact_representability() {
     assert_eq!(
         TransferCarrierProfile::RemoteCompact.max_part_bytes(),
         MAX_PART_BYTES
+    );
+    assert_eq!(
+        TransferCarrierProfile::JsonUds.max_part_count(),
+        MAX_JSON_TRANSFER_PARTS
+    );
+    assert_eq!(
+        TransferCarrierProfile::RemoteCompact.max_part_count(),
+        MAX_TRANSFER_PARTS
     );
     assert_eq!(
         validate_declared_transfer(
@@ -696,6 +706,16 @@ fn carrier_profiles_enforce_json_boundary_and_exact_representability() {
             0,
         ),
         Ok(())
+    );
+    assert_eq!(
+        validate_declared_transfer(
+            TransferCarrierProfile::JsonUds,
+            MAX_JSON_TRANSFER_PARTS,
+            MAX_TRANSFER_BYTES,
+            0,
+        ),
+        Ok(()),
+        "94 个 JSON part 必须覆盖完整 64 MiB transfer"
     );
 }
 

@@ -1,12 +1,13 @@
-//! Runtime v1 canonical 事件流与稳定聚合身份。
+//! Runtime v2 canonical 事件流与稳定聚合身份。
 
 use crate::capabilities::SessionCapabilities;
+use crate::runtime::configuration::ConversationConfigurationState;
 use crate::runtime::failure::RuntimeFailure;
 use crate::runtime::identity::{
     ApprovalId, CommandId, ConversationId, EntityId, EventId, ItemId, TurnId,
 };
 use crate::runtime::receipt::ApprovalDeliveryState;
-use crate::trunk::{ActionDecisionKind, ActionRequest, AgentItem, TurnSummary};
+use crate::trunk::{ActionDecisionKind, ActionRequest, AgentItem, TurnSummary, VendorPanelPayload};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -60,7 +61,11 @@ impl RuntimeEvent {
         let item_identity = self.item_id.is_some() && self.entity_id.is_some();
         let no_item_identity = self.item_id.is_none() && self.entity_id.is_none();
         let valid = match &self.body {
-            RuntimeEventBody::Capabilities { .. } => no_item_identity && self.command_id.is_none(),
+            RuntimeEventBody::Capabilities { .. }
+            | RuntimeEventBody::ConfigurationChanged { .. }
+            | RuntimeEventBody::VendorPanelEvent { .. } => {
+                no_item_identity && self.command_id.is_none()
+            }
             RuntimeEventBody::Item { item } => {
                 item_identity
                     && (!matches!(item, AgentItem::UserMessage { .. }) || self.command_id.is_some())
@@ -151,6 +156,13 @@ impl<'de> Deserialize<'de> for RuntimeEvent {
 pub enum RuntimeEventBody {
     Capabilities {
         capabilities: SessionCapabilities,
+    },
+    ConfigurationChanged {
+        state: ConversationConfigurationState,
+    },
+    VendorPanelEvent {
+        #[serde(rename = "vendorPanel")]
+        vendor_panel: VendorPanelPayload,
     },
     Item {
         item: AgentItem,

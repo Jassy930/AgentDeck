@@ -1,6 +1,6 @@
 //! P1.1 中立性守护 —— 参照现有 `neutrality_tests.rs` 的属性名扫描做法。
 //!
-//! RuntimeEnvelope v1 是稳定中立身份层（design RC-9）。守护点：
+//! RuntimeEnvelope v2 是稳定中立身份层（design RC-9）。守护点：
 //! - 任何属性名都不得以 vendor 前缀开头（codex/openai/anthropic/claude）。
 //! - 任何属性名都不得使用 vendor thread/session 身份词
 //!   （threadId/sessionId/vendorThreadId/resumeReference 等）——稳定身份只能
@@ -25,6 +25,7 @@ const FORBIDDEN_IDENTITY_NAMES: &[&str] = &[
     "resumereference",
     "vendorresumereference",
     "resumehandle",
+    "adapterstatekey",
 ];
 
 fn walk_property_names(schema: &Value, mut visit: impl FnMut(&str)) {
@@ -94,7 +95,7 @@ fn neutral_stable_identity_names_are_present() {
 }
 
 #[test]
-fn pending_pairing_admin_is_marked_local_only() {
+fn local_administration_requests_are_marked_local_only() {
     // list/confirm/cancel 的 pending pairing 请求必须携带 LocalOnlyAdministration 标记，
     // 且该标记类型在 schema 中带有 "local-only administration" 描述。
     let schema = runtime_schema();
@@ -112,7 +113,12 @@ fn pending_pairing_admin_is_marked_local_only() {
     let variants = req_schema["oneOf"]
         .as_array()
         .expect("RuntimeRequest is a tagged oneOf");
-    for tag in ["listPendingPairings", "confirmPairing", "cancelPairing"] {
+    for tag in [
+        "listPendingPairings",
+        "confirmPairing",
+        "cancelPairing",
+        "stageUpgrade",
+    ] {
         let variant = variants
             .iter()
             .find(|v| v["properties"]["request"]["enum"][0] == tag)

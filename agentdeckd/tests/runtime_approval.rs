@@ -2,7 +2,7 @@
 //!
 //! approval 的 SQLite mutation、authorization capability 与 supervisor 都是 daemon-private，
 //! integration crate 不能绕过可见性直接构造它们。本文件因此只做两类跨边界检查：
-//! 1. 对公开 Runtime v1 receipt/request/event 做真实 serde round-trip；
+//! 1. 对公开 Runtime v2 receipt/request/event 做真实 serde round-trip；
 //! 2. 对 production transaction/worker/supervisor/DDL 做有语义的 shape 检查，并要求对应
 //!    daemon-private unit/store test 仍在其拥有模块内。
 //!

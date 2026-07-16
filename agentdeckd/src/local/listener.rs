@@ -943,6 +943,7 @@ mod tests {
             RuntimeRequest::SendPrompt(SendPromptRequest {
                 conversation_id: start.conversation_id.clone(),
                 idempotency_key: IdempotencyKey::new("listener-active-prompt"),
+                expected_configuration_revision: 0,
                 prompt: PromptPayload::new("hold active execution").expect("valid listener prompt"),
             }),
         )

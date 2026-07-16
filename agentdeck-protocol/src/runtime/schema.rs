@@ -1,11 +1,13 @@
-//! Runtime v1 聚合 JSON Schema（独立于 local IPC / Relay v2 / E2EE schema）。
+//! Runtime v2 聚合 JSON Schema（独立于 local IPC / Relay v2 / E2EE schema）。
 //!
-//! 通过 `runtime_schema()` 聚合所有 Runtime v1 公共类型，快照写到
+//! 通过 `runtime_schema()` 聚合所有 Runtime v2 公共类型，快照写到
 //! `protocol/agentdeck/runtime-protocol.schema.json`，由 `runtime_schema_matches_committed_snapshot`
 //! 守护，用 `UPDATE_RUNTIME_SCHEMA=1` 重生成（模式仿照 local IPC 的
 //! `schema_matches_committed_snapshot`）。
 
-use crate::runtime::{catalog, command, envelope, event, receipt, sync, transfer};
+use crate::runtime::{
+    catalog, command, configuration, envelope, event, metadata, receipt, sync, transfer, upgrade,
+};
 use schemars::{JsonSchema, r#gen::SchemaGenerator, schema::Schema, schema_for};
 use serde_json::json;
 use std::borrow::Cow;
@@ -37,7 +39,7 @@ impl<T: JsonSchema> JsonSchema for RequiredNullable<T> {
     }
 }
 
-/// Runtime v1 所有公共 wire 类型的聚合 schema。
+/// Runtime v2 所有公共 wire 类型的聚合 schema。
 pub fn runtime_schema() -> serde_json::Value {
     let mut properties = serde_json::Map::new();
     macro_rules! add {
@@ -68,6 +70,31 @@ pub fn runtime_schema() -> serde_json::Value {
     add!("CatalogSnapshot", catalog::CatalogSnapshot);
     add!("CatalogDelta", catalog::CatalogDelta);
     add!("ConversationEntry", catalog::ConversationEntry);
+    add!("AgentDescriptions", configuration::AgentDescriptions);
+    add!("AgentDescription", configuration::AgentDescription);
+    add!(
+        "ConversationConfiguration",
+        configuration::ConversationConfiguration
+    );
+    add!(
+        "ConversationConfigurationState",
+        configuration::ConversationConfigurationState
+    );
+    add!(
+        "ConfigureConversationRequest",
+        configuration::ConfigureConversationRequest
+    );
+    add!("ConfigurationReceipt", configuration::ConfigurationReceipt);
+    add!(
+        "ConversationMetadataMutationRequest",
+        metadata::ConversationMetadataMutationRequest
+    );
+    add!(
+        "ConversationMetadataReceipt",
+        metadata::ConversationMetadataReceipt
+    );
+    add!("StageUpgradeRequest", upgrade::StageUpgradeRequest);
+    add!("StageUpgradeReceipt", upgrade::StageUpgradeReceipt);
     add!("CommandReceipt", receipt::CommandReceipt);
     add!("CommandStatus", receipt::CommandStatus);
     add!("CommandStatusReceipt", receipt::CommandStatusReceipt);

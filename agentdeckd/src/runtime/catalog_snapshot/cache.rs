@@ -306,7 +306,6 @@ pub(super) fn page_memory_bound(
     for entry in entries {
         strings = strings
             .checked_add(entry.conversation_id.as_str().len())
-            .and_then(|value| value.checked_add(entry.adapter_state_key.as_str().len()))
             .and_then(|value| value.checked_add(entry.title.as_ref().map_or(0, String::len)))
             .and_then(|value| {
                 value.checked_add(

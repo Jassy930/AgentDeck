@@ -237,14 +237,14 @@ async fn real_uds_two_connections_handshake_and_disconnect_isolation() {
     let mut first = Client::connect(&root.socket(), "123e4567-e89b-12d3-a456-426614174001").await;
     let mut second = Client::connect(&root.socket(), "123e4567-e89b-12d3-a456-426614174002").await;
 
-    first.write_envelope(&hello("hello-first", 1)).await;
-    second.write_envelope(&hello("hello-second", 1)).await;
+    first.write_envelope(&hello("hello-first", 2)).await;
+    second.write_envelope(&hello("hello-second", 2)).await;
     assert_hello_reply(first.read_envelope().await, "hello-first");
     assert_hello_reply(second.read_envelope().await, "hello-second");
 
     drop(first);
     second
-        .write_envelope(&hello("hello-second-after-sibling-eof", 1))
+        .write_envelope(&hello("hello-second-after-sibling-eof", 2))
         .await;
     assert_hello_reply(
         second.read_envelope().await,
@@ -265,7 +265,7 @@ async fn outer_version_and_non_hello_flush_typed_failure_then_close() {
     let mut wrong_version =
         Client::connect(&root.socket(), "123e4567-e89b-12d3-a456-426614174010").await;
     wrong_version
-        .write_raw(br#"{"version":2,"messageId":"outer-mismatch","body":{"future":true}}"#)
+        .write_raw(br#"{"version":1,"messageId":"outer-mismatch","body":{"future":true}}"#)
         .await;
     assert_failure(
         wrong_version.read_envelope().await,
@@ -302,13 +302,13 @@ async fn inner_hello_mismatch_is_a_core_reply_and_connection_remains_usable() {
     let server = serve_n(listener, core.clone(), 1);
     let mut client = Client::connect(&root.socket(), "123e4567-e89b-12d3-a456-426614174020").await;
 
-    client.write_envelope(&hello("inner-mismatch", 2)).await;
+    client.write_envelope(&hello("inner-mismatch", 1)).await;
     assert_failure(
         client.read_envelope().await,
         "inner-mismatch",
         DAEMON_RUNTIME_PROTOCOL_MISMATCH,
     );
-    client.write_envelope(&hello("inner-retry", 1)).await;
+    client.write_envelope(&hello("inner-retry", 2)).await;
     assert_hello_reply(client.read_envelope().await, "inner-retry");
     drop(client);
 
@@ -323,8 +323,8 @@ async fn malformed_duplicate_and_exact_cap_frames_close_without_reply() {
     let server = serve_n(listener, core.clone(), 3);
 
     let cases = [
-        br#"{"version":1"#.to_vec(),
-        br#"{"version":1,"version":1,"messageId":"duplicate","body":{}}"#.to_vec(),
+        br#"{"version":2"#.to_vec(),
+        br#"{"version":2,"version":2,"messageId":"duplicate","body":{}}"#.to_vec(),
         vec![b' '; MAX_RUNTIME_JSON_FRAME_BYTES],
     ];
     for (index, frame) in cases.into_iter().enumerate() {

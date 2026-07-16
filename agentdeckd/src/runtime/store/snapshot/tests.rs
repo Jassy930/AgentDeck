@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use agentdeck_protocol::AgentKind;
+use agentdeck_protocol::runtime::StreamCursor;
+use sha2::{Digest, Sha256};
 
 use super::*;
 use crate::runtime::model::{ConversationDescriptor, NewConversation};
@@ -107,6 +109,43 @@ fn create_directory_conversation(
     super::super::journal::create_conversation(state, config, input, descriptor, &mut effects)
         .expect("create conversation");
     conversation_id
+}
+
+#[test]
+fn legacy_runtime_v1_catalog_baseline_dual_decodes_without_rewrite() {
+    let legacy = LegacyCatalogBaselineV4 {
+        version: 1,
+        base_catalog_cursor: StreamCursor::At(4),
+        entries: vec![super::super::catalog::LegacyConversationEntryV4 {
+            conversation_id: agentdeck_protocol::runtime::identity::ConversationId::new(
+                "conversation-legacy",
+            ),
+            adapter_state_key: "adapter-private".into(),
+            agent_kind: AgentKind::Codex,
+            title: Some("legacy baseline".into()),
+            cwd: Some(PathBuf::from("/tmp/legacy-baseline")),
+            last_active_ms: 5,
+            archived: false,
+        }],
+    };
+    let payload = serde_json::to_vec(&legacy).expect("encode canonical v1 catalog baseline");
+    let persisted = decode_persisted_catalog_baseline(&payload)
+        .expect("retain the authenticated baseline format until canonical validation");
+    let PersistedCatalogBaseline::Legacy(original) = &persisted else {
+        panic!("v1 baseline must retain its legacy DTO before conversion");
+    };
+    assert_eq!(serde_json::to_vec(original).unwrap(), payload);
+    let preserved = persisted.into_current();
+    assert_eq!(preserved.entries[0].entry_revision, 0);
+    let (decoded, was_legacy) =
+        decode_catalog_baseline_with_format(&payload).expect("dual decode v1 catalog baseline");
+    assert!(was_legacy);
+    assert_eq!(decoded.entries[0].entry_revision, 0);
+    assert!(
+        !serde_json::to_string(&decoded)
+            .unwrap()
+            .contains("adapterStateKey")
+    );
 }
 
 #[test]

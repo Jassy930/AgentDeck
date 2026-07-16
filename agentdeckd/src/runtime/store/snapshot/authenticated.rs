@@ -17,10 +17,10 @@ use super::super::sequence::{SequenceScope, decode_sequence};
 use super::super::sqlite::RuntimeLedger;
 use super::super::stream::optional_field;
 use super::{
-    CatalogBaselineV1, CatalogSnapshotRowMetadata, ConversationSnapshotRowMetadata,
-    MAX_DIRECTORY_ROWS, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_BYTES_GLOBAL, MAX_SNAPSHOT_ITEMS,
-    ReadySnapshotReference, SNAPSHOT_TOKEN_DOMAIN, StoredCatalogSnapshot,
-    StoredConversationSnapshot, catalog_materialization_peak_bound, load_snapshot_row_read,
+    CatalogSnapshotRowMetadata, ConversationSnapshotRowMetadata, MAX_DIRECTORY_ROWS,
+    MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_BYTES_GLOBAL, MAX_SNAPSHOT_ITEMS, ReadySnapshotReference,
+    SNAPSHOT_TOKEN_DOMAIN, StoredCatalogSnapshot, StoredConversationSnapshot,
+    catalog_materialization_peak_bound, load_snapshot_row_read,
     open_snapshot_payload_read_in_place, snapshot_token,
 };
 
@@ -697,14 +697,25 @@ pub(in crate::runtime::store) fn load_catalog_snapshot_reference_read(
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
     catalog_materialization_peak_bound(logical_bytes, item_count)?;
-    let baseline: CatalogBaselineV1 =
-        serde_json::from_slice(&payload).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    // 威胁场景：合法 v1 baseline 转为 v2 entry 后再与旧 plaintext 做 canonical
+    // 比较，必然因 adapterStateKey/entryRevision 形状不同而误报损坏。canonical
+    // 校验必须针对认证后实际解出的原始格式，随后才在内存转换。
+    let persisted = super::decode_persisted_catalog_baseline(&payload)?;
+    let canonical = match &persisted {
+        super::PersistedCatalogBaseline::Current(baseline) => {
+            canonical_json_matches(baseline, &payload)?
+        }
+        super::PersistedCatalogBaseline::Legacy(baseline) => {
+            canonical_json_matches(baseline, &payload)?
+        }
+    };
+    let baseline = persisted.into_current();
     if baseline.version != 1
         || baseline.base_catalog_cursor != base
         || u64::try_from(baseline.entries.len())
             .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
             != item_count
-        || !canonical_json_matches(&baseline, &payload)?
+        || !canonical
     {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }

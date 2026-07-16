@@ -213,6 +213,12 @@ impl PumpError {
                 DAEMON_RUNTIME_CONNECTION_UNAVAILABLE
             }
             Self::Connection(_) => DAEMON_RUNTIME_CONNECTION_UNAVAILABLE,
+            // 威胁场景：合法 Runtime v1 snapshot 恰好占满 64 MiB，补入 v2
+            // 必填字段后超限；若 pump 抹掉 materializer 的 typed code，客户端
+            // 会把确定性的 payload 边界误判为可重试 read failure。
+            Self::Snapshot(super::reducer::SnapshotReducerError::Materialize(error)) => {
+                error.code()
+            }
             _ => DAEMON_RUNTIME_READ_UNAVAILABLE,
         };
         RuntimeFailure::new(code, "runtime subscription could not complete")
@@ -381,21 +387,23 @@ async fn send_snapshot(job: &mut PumpJob) -> Result<StreamCursor, PumpError> {
                 ),
             )
             .await??;
-            let (snapshot, stored, memory_permit) = reduced.into_parts();
+            let (snapshot, stored, wire_payload, memory_permit) = reduced.into_parts();
             let base = snapshot.base_event_cursor;
+            let canonical_payload = wire_payload.as_deref().unwrap_or(stored.payload.as_slice());
             ensure_current(job)?;
             reply::reply(
                 &job.connections,
                 job.connection_id,
                 job.message_id.clone(),
                 RuntimeReply::Snapshot(snapshot),
-                Some(&stored.payload),
+                Some(canonical_payload),
                 &job.control,
             )
             .await?;
             job.flushed_business_frame = true;
             // FlushReceipt 已完成后才允许另一连接重新 materialize；`stored`
             // 的 exact plaintext 与共享 build permit 在此前始终共同存活。
+            drop(wire_payload);
             drop(stored);
             drop(memory_permit);
             Ok(base)
@@ -678,4 +686,22 @@ fn epoch_ms() -> Result<u64, PumpError> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| PumpError::Clock)?;
     u64::try_from(duration.as_millis()).map_err(|_| PumpError::Clock)
+}
+
+#[cfg(test)]
+mod tests {
+    use agentdeck_protocol::runtime::failure::DAEMON_PAYLOAD_ITEM_TOO_LARGE;
+
+    use super::*;
+    use crate::runtime::snapshot::SnapshotMaterializationError;
+    use crate::runtime::subscription::reducer::SnapshotReducerError;
+
+    #[test]
+    fn legacy_v1_snapshot_expansion_keeps_payload_too_large_wire_code() {
+        let error = PumpError::Snapshot(SnapshotReducerError::Materialize(
+            SnapshotMaterializationError::PayloadTooLarge,
+        ));
+
+        assert_eq!(error.failure().code, DAEMON_PAYLOAD_ITEM_TOO_LARGE);
+    }
 }

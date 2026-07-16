@@ -1,10 +1,11 @@
-//! Runtime v1 有界分片与重组（design §9.5）。
+//! Runtime v2 使用的 `RuntimeTransferCarrierV1` 有界分片与重组（design §9.5）。
 //!
 //! `TransferEnvelope { transferId, partIndex, partCount, totalSha256, totalBytes, part }`
 //! 用于 snapshot / history page / 长 tool output 等超过 Relay 单 frame 4 MiB 的 payload。
 //!
 //! 上界（具名常量 + 构造校验）：
-//! - 每个加密前 part ≤ 3.5 MiB；单 transfer ≤ 64 parts / 64 MiB；TTL 5 分钟。
+//! - remote compact 每个加密前 part ≤ 3.5 MiB、≤ 64 parts；JSON/UDS 每个
+//!   raw part ≤ 700 KiB、≤ 94 parts；两者的单 transfer 总量都 ≤ 64 MiB、TTL 5 分钟。
 //! - partCount/totalBytes/totalSha256 在首 part 后不可变。
 //! - 每 connection 同时重组内存 ≤ 128 MiB。
 //! - 超限、重复 index 不同内容、hash 不符、超时 → typed error（不 panic）。
@@ -26,10 +27,13 @@ pub const MAX_PART_BYTES: usize = 3_670_016; // 3.5 * 1024 * 1024
 /// JSON/UDS base64 carrier 的 raw part 上限（700 KiB）。它与 remote compact-binary
 /// 3.5 MiB 上限分离，确保最长合法 identity/metadata 下完整 JSONL frame 仍严格小于 1 MiB。
 pub const MAX_JSON_PART_BYTES: usize = 700 * 1024;
-/// 单 transfer 最大 part 数。
+/// remote compact 单 transfer 最大 part 数。
 pub const MAX_TRANSFER_PARTS: u32 = 64;
 /// 单 transfer 最大总字节数（64 MiB）。
 pub const MAX_TRANSFER_BYTES: u64 = 64 * 1024 * 1024;
+/// JSON/UDS 表达完整 64 MiB transfer 所需的最大 part 数：
+/// `ceil(64 MiB / 700 KiB) = 94`。remote compact 仍使用 64。
+pub const MAX_JSON_TRANSFER_PARTS: u32 = 94;
 /// 每 connection 同时重组内存上限（128 MiB）。
 pub const MAX_REASSEMBLY_BYTES: u64 = 128 * 1024 * 1024;
 /// transfer TTL（5 分钟，毫秒）。
@@ -100,7 +104,7 @@ pub struct TransferEnvelope {
 }
 
 impl TransferEnvelope {
-    /// 构造并校验一个分片；任何越界都返回 typed error（不 panic）。
+    /// 构造并按 remote compact 上限校验一个分片；任何越界都返回 typed error。
     pub fn new(
         transfer_id: TransferId,
         part_index: u32,
@@ -121,18 +125,44 @@ impl TransferEnvelope {
         Ok(env)
     }
 
-    /// 校验构造不变量（part≤3.5MiB、parts∈[1,64]、total≤64MiB、index<count）。
-    pub fn validate(&self) -> Result<(), TransferError> {
-        self.validate_with_part_bound(MAX_PART_BYTES)
+    /// 构造并按 JSON/UDS 上限校验一个分片。独立的 94-part ceiling 只补足
+    /// 700 KiB raw part 对完整 64 MiB transfer 的可表示性，不扩大总字节上限。
+    pub fn new_json(
+        transfer_id: TransferId,
+        part_index: u32,
+        part_count: u32,
+        total_sha256: [u8; 32],
+        total_bytes: u64,
+        part: Vec<u8>,
+    ) -> Result<Self, TransferError> {
+        let env = TransferEnvelope {
+            transfer_id,
+            part_index,
+            part_count,
+            total_sha256,
+            total_bytes,
+            part,
+        };
+        env.validate_json_part()?;
+        Ok(env)
     }
 
-    fn validate_with_part_bound(&self, maximum_part_bytes: usize) -> Result<(), TransferError> {
+    /// 校验构造不变量（part≤3.5MiB、parts∈[1,64]、total≤64MiB、index<count）。
+    pub fn validate(&self) -> Result<(), TransferError> {
+        self.validate_with_bounds(MAX_PART_BYTES, MAX_TRANSFER_PARTS)
+    }
+
+    fn validate_with_bounds(
+        &self,
+        maximum_part_bytes: usize,
+        maximum_part_count: u32,
+    ) -> Result<(), TransferError> {
         let maximum_representable = u64::from(self.part_count)
             .checked_mul(maximum_part_bytes as u64)
             .ok_or(TransferError::TooLarge)?;
         if !self.transfer_id.is_valid_wire_value()
             || self.part_count == 0
-            || self.part_count > MAX_TRANSFER_PARTS
+            || self.part_count > maximum_part_count
             || self.part_index >= self.part_count
             || self.part.len() > maximum_part_bytes
             || self.total_bytes > MAX_TRANSFER_BYTES
@@ -146,7 +176,7 @@ impl TransferEnvelope {
 
     /// JSON/UDS 额外上限；remote compact-binary carrier 不调用本校验。
     pub fn validate_json_part(&self) -> Result<(), TransferError> {
-        self.validate_with_part_bound(MAX_JSON_PART_BYTES)
+        self.validate_with_bounds(MAX_JSON_PART_BYTES, MAX_JSON_TRANSFER_PARTS)
     }
 }
 
@@ -281,7 +311,7 @@ impl TransferReassembler {
         self.buffered_bytes
     }
 
-    /// 消费一个分片。返回 `InProgress` 或重组完成的 `Complete(bytes)`。
+    /// 按 remote compact 的 64-part profile 消费一个分片。
     pub fn accept(
         &mut self,
         channel: RuntimeTransferChannel,
@@ -289,7 +319,26 @@ impl TransferReassembler {
         now_ms: u64,
     ) -> Result<TransferProgress, TransferError> {
         env.validate()?;
+        self.accept_validated(channel, env, now_ms)
+    }
 
+    /// 按 JSON/UDS 的 94-part profile 消费一个分片。
+    pub fn accept_json(
+        &mut self,
+        channel: RuntimeTransferChannel,
+        env: TransferEnvelope,
+        now_ms: u64,
+    ) -> Result<TransferProgress, TransferError> {
+        env.validate_json_part()?;
+        self.accept_validated(channel, env, now_ms)
+    }
+
+    fn accept_validated(
+        &mut self,
+        channel: RuntimeTransferChannel,
+        env: TransferEnvelope,
+        now_ms: u64,
+    ) -> Result<TransferProgress, TransferError> {
         // 已存在的 transfer：先判 TTL（超时 → typed Expired），再判 metadata 一致性。
         // 注意必须在 housekeeping purge 之前判定，否则超时分片会被误当作新 transfer 首片。
         if let Some(existing) = self.active.get(&env.transfer_id) {

@@ -673,7 +673,6 @@ fn assembly_context(seed: u8, kind: AgentKind, base: StreamCursor) -> SnapshotAs
 fn authenticated_context(seed: u8, kind: AgentKind) -> AuthenticatedConversationSnapshotContext {
     AuthenticatedConversationSnapshotContext {
         conversation_id: conversation_id(seed),
-        adapter_state_key: runtime_id(RuntimeIdKind::AdapterState, seed.wrapping_add(0x40)),
         agent_kind: kind,
         event_high_water: None,
     }
@@ -713,9 +712,112 @@ fn ready_snapshot(
     ConversationSnapshot::new(
         ConversationId::new(conversation_id(seed).to_canonical_string()),
         base,
+        agentdeck_protocol::runtime::ConversationConfigurationState::new(0, None).unwrap(),
         all_items,
     )
     .expect("valid test snapshot")
+}
+
+#[test]
+fn canonical_legacy_v4_snapshot_dual_decodes_to_v2_wire() {
+    // 威胁场景：已认证的 DB v4 ready row 仍是 Runtime v1 形状；升级后既不能
+    // 把它误判为损坏，也不能把缺少 configurationState 的旧 JSON 原样发给 v2 client。
+    let current = ready_snapshot(
+        0x2b,
+        AgentKind::Codex,
+        StreamCursor::BeforeFirst,
+        vec![item(0)],
+    );
+    let legacy = LegacyConversationSnapshotV4 {
+        conversation_id: current.conversation_id.clone(),
+        base_event_cursor: current.base_event_cursor,
+        items: current.items().to_vec(),
+    };
+    let legacy_payload = serde_json::to_vec(&legacy).expect("encode canonical v4 snapshot");
+    assert!(
+        !legacy_payload
+            .windows(18)
+            .any(|bytes| bytes == b"configurationState")
+    );
+
+    let decoded = decode_ready_snapshot_with_capacity(&legacy_payload, legacy_payload.capacity())
+        .expect("dual decode canonical v4 snapshot");
+    assert!(decoded.legacy_v4);
+    assert_eq!(
+        decoded
+            .snapshot
+            .configuration_state
+            .configuration_revision(),
+        0
+    );
+    assert!(
+        decoded
+            .snapshot
+            .configuration_state
+            .configuration()
+            .is_none()
+    );
+    let v2_payload =
+        serialize_build_snapshot(&decoded.snapshot, None).expect("encode canonical v2 snapshot");
+    assert!(
+        std::str::from_utf8(&v2_payload)
+            .expect("v2 snapshot UTF-8")
+            .contains("configurationState")
+    );
+
+    let mut noncanonical = b" ".to_vec();
+    noncanonical.extend_from_slice(&legacy_payload);
+    assert!(matches!(
+        decode_ready_snapshot_with_capacity(&noncanonical, noncanonical.capacity()),
+        Err(SnapshotMaterializationError::SchemaIncompatible)
+    ));
+}
+
+#[test]
+fn legacy_v4_at_the_wire_limit_has_a_typed_migration_failure() {
+    // 威胁场景：合法 v1 snapshot 已恰好占满 64 MiB 时，新增必填
+    // configurationState 不可能在不丢业务内容的情况下仍落入同一 64 MiB 总上限。
+    // 自动 rebuild 只会生成同一 canonical state；升级必须返回 typed payload-too-large，
+    // 不能误报 schema corruption、截断内容或改写原 ciphertext。
+    fn legacy_with_text(text: String) -> LegacyConversationSnapshotV4 {
+        LegacyConversationSnapshotV4 {
+            conversation_id: ConversationId::new(conversation_id(0x2c).to_canonical_string()),
+            base_event_cursor: StreamCursor::At(0),
+            items: vec![
+                SnapshotItem::capabilities(capabilities(AgentKind::Codex)),
+                SnapshotItem::Item {
+                    item_id: ItemId::new("legacy-limit-item"),
+                    entity_id: EntityId::new("legacy-limit-entity"),
+                    command_id: None,
+                    item: AgentItem::AssistantMessage {
+                        text,
+                        meta: AgentItemMeta::default(),
+                    },
+                },
+            ],
+        }
+    }
+
+    let fixed_bytes = serde_json::to_vec(&legacy_with_text(String::new()))
+        .expect("encode empty legacy snapshot")
+        .len();
+    let text_bytes = MAX_CONVERSATION_SNAPSHOT_BYTES
+        .checked_sub(fixed_bytes)
+        .expect("legacy fixture overhead fits snapshot limit");
+    let legacy = legacy_with_text("x".repeat(text_bytes));
+    let legacy_payload = serde_json::to_vec(&legacy).expect("encode max-size legacy snapshot");
+    assert_eq!(legacy_payload.len(), MAX_CONVERSATION_SNAPSHOT_BYTES);
+    drop(legacy_payload);
+
+    let current = legacy
+        .into_current()
+        .expect("legacy DTO itself remains valid");
+    let error = serialize_build_snapshot(&current, None)
+        .expect_err("v2 required field must cross the unchanged 64 MiB ceiling");
+    assert!(matches!(
+        error,
+        SnapshotMaterializationError::PayloadTooLarge
+    ));
 }
 
 #[tokio::test]
@@ -1209,6 +1311,7 @@ fn oversized_build_rejected_before_full_raw_allocation() {
     let snapshot = ConversationSnapshot::new(
         ConversationId::new(context.conversation_id.to_canonical_string()),
         context.base_event_cursor,
+        agentdeck_protocol::runtime::ConversationConfigurationState::new(0, None).unwrap(),
         vec![
             SnapshotItem::capabilities(context.capabilities.clone()),
             large_item,

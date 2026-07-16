@@ -421,7 +421,6 @@ impl std::fmt::Debug for ConversationRecord {
         formatter
             .debug_struct("ConversationRecord")
             .field("conversation_id", &self.conversation_id)
-            .field("adapter_state_key", &self.adapter_state_key)
             .field("catalog_revision", &self.catalog_revision)
             .field("command_high_water", &self.command_high_water)
             .field("event_high_water", &self.event_high_water)

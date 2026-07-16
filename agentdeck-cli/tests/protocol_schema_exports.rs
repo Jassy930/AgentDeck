@@ -62,7 +62,7 @@ fn protocol_runtime_schema_matches_runtime_snapshot() {
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         snapshot("runtime-protocol.schema.json"),
-        "protocol runtime-schema stdout must be byte-identical to the committed Runtime v1 snapshot"
+        "protocol runtime-schema stdout must be byte-identical to the committed Runtime v2 snapshot"
     );
 }
 

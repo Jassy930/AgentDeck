@@ -1,4 +1,4 @@
-//! Runtime v1 device/local → daemon 请求（design §8 / §13.2）。
+//! Runtime v2 device/local → daemon 请求（design §8 / §13.2）。
 //!
 //! `RuntimeRequest` 是解密后设备/本地统一规范化的业务请求（RC-2 传输平权）。
 //! pending pairing 的 list/confirm/cancel 以及 create/trust-reset/device-revoke 是
@@ -6,11 +6,14 @@
 //! 任何 `RemotePrincipal`、PairingAccess 或 Relay 管理员都无权调用（design §6.2/§6.3/§6.5）。
 //! 本 task 只定义契约与标注，不实现执行语义。
 
+use crate::runtime::configuration::ConfigureConversationRequest;
 use crate::runtime::identity::{
     ApprovalId, CatalogPageCursor, CommandId, ConversationId, DeviceHandle, GrantSerial,
     IdempotencyKey, PairingId, TurnId,
 };
+use crate::runtime::metadata::ConversationMetadataMutationRequest;
 use crate::runtime::sync::{BackfillRequest, RuntimeInnerCursor, RuntimeSubscriptionTarget};
+use crate::runtime::upgrade::StageUpgradeRequest;
 use crate::trunk::{ActionDecision, AgentKind};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -108,6 +111,7 @@ pub struct ConversationStart {
 pub struct SendPromptRequest {
     pub conversation_id: ConversationId,
     pub idempotency_key: IdempotencyKey,
+    pub expected_configuration_revision: u64,
     pub prompt: PromptPayload,
 }
 
@@ -179,6 +183,8 @@ pub enum RevokeTarget {
 pub enum RuntimeRequest {
     /// 版本/能力握手。
     Hello(HelloParams),
+    /// 枚举可用 agent、capabilities 与默认 conversation configuration。
+    DescribeAgents,
     /// 请求 catalog snapshot / 订阅。
     Catalog(CatalogRequest),
     /// 订阅某 conversation 的事件流，从 cursor 之后开始。
@@ -192,6 +198,10 @@ pub enum RuntimeRequest {
     Backfill(BackfillRequest),
     /// 新建 conversation。
     Start(ConversationStart),
+    /// 以 CAS + idempotency 追加 conversation configuration revision。
+    ConfigureConversation(ConfigureConversationRequest),
+    /// 以独立 entry revision CAS 更新 canonical metadata。
+    UpdateConversationMetadata(ConversationMetadataMutationRequest),
     /// 发送 prompt（有副作用；receipt Accepted/Replayed/Failed）。
     SendPrompt(SendPromptRequest),
     /// 提交 approval 决定（first-wins）。
@@ -246,6 +256,8 @@ pub enum RuntimeRequest {
     Revoke(RevokeRequest),
     /// machine trust reset —— local-only administration。
     TrustReset { scope: LocalOnlyAdministration },
+    /// 本机管理员 staged upgrade；P3.9 只冻结 wire，执行语义属于 P3.10。
+    StageUpgrade(StageUpgradeRequest),
 }
 
 fn deserialize_required_optional_page_cursor<'de, D>(

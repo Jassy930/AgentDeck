@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use agentdeck_protocol::runtime::ConversationEntry;
-use agentdeck_protocol::runtime::identity::{AdapterStateKey, ConversationId};
+use agentdeck_protocol::runtime::identity::ConversationId;
 use agentdeck_protocol::runtime::sync::StreamCursor;
 
 use crate::runtime::model::{
@@ -297,6 +297,63 @@ pub(crate) struct CatalogBaselineV1 {
     pub(crate) entries: Vec<ConversationEntry>,
 }
 
+/// Runtime v1 / DB v4 写入的 catalog baseline。`version` 是 baseline format 版本，
+/// 当时并未随 public Runtime protocol 升级，因此只能靠 entry 的互斥形状识别。
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacyCatalogBaselineV4 {
+    version: u8,
+    base_catalog_cursor: StreamCursor,
+    entries: Vec<super::catalog::LegacyConversationEntryV4>,
+}
+
+enum PersistedCatalogBaseline {
+    Current(CatalogBaselineV1),
+    Legacy(LegacyCatalogBaselineV4),
+}
+
+impl PersistedCatalogBaseline {
+    fn into_current(self) -> CatalogBaselineV1 {
+        match self {
+            Self::Current(baseline) => baseline,
+            Self::Legacy(legacy) => CatalogBaselineV1 {
+                version: legacy.version,
+                base_catalog_cursor: legacy.base_catalog_cursor,
+                entries: legacy
+                    .entries
+                    .into_iter()
+                    .map(super::catalog::LegacyConversationEntryV4::into_current)
+                    .collect(),
+            },
+        }
+    }
+}
+
+fn decode_persisted_catalog_baseline(
+    payload: &[u8],
+) -> Result<PersistedCatalogBaseline, RuntimeStoreError> {
+    if let Ok(baseline) = serde_json::from_slice::<CatalogBaselineV1>(payload) {
+        return Ok(PersistedCatalogBaseline::Current(baseline));
+    }
+    serde_json::from_slice::<LegacyCatalogBaselineV4>(payload)
+        .map(PersistedCatalogBaseline::Legacy)
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)
+}
+
+fn decode_catalog_baseline_with_format(
+    payload: &[u8],
+) -> Result<(CatalogBaselineV1, bool), RuntimeStoreError> {
+    let persisted = decode_persisted_catalog_baseline(payload)?;
+    let legacy = matches!(persisted, PersistedCatalogBaseline::Legacy(_));
+    Ok((persisted.into_current(), legacy))
+}
+
+pub(crate) fn decode_catalog_baseline(
+    payload: &[u8],
+) -> Result<CatalogBaselineV1, RuntimeStoreError> {
+    decode_catalog_baseline_with_format(payload).map(|(baseline, _)| baseline)
+}
+
 struct BoundedCatalogJsonCounter {
     bytes: usize,
     exceeded: bool,
@@ -521,15 +578,14 @@ pub(super) fn migrate_catalog_snapshot_baseline(
         created_at_ms = created_at_ms.max(conversation.updated_at_ms);
         entries.push(ConversationEntry {
             conversation_id: ConversationId::new(conversation_id.to_canonical_string()),
-            adapter_state_key: AdapterStateKey::new(
-                conversation.adapter_state_key.to_canonical_string(),
-            ),
             agent_kind: conversation.descriptor.agent_kind,
             title: conversation.descriptor.title,
             cwd: Some(conversation.descriptor.cwd),
             last_active_ms: conversation.updated_at_ms,
             archived: conversation.lifecycle
                 == crate::runtime::model::ConversationLifecycle::Archived,
+            // P3.9-C0-A1 transitional baseline；v5 在 C0-B 持久化真实 entry revision。
+            entry_revision: 0,
         });
         if entries.len() > MAX_SNAPSHOT_ITEMS as usize {
             return Err(RuntimeStoreError::PayloadTooLarge);
@@ -1302,8 +1358,7 @@ fn load_catalog_snapshot_row(
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
     catalog_materialization_peak_bound(metadata.logical_bytes, metadata.item_count)?;
-    let baseline: CatalogBaselineV1 = serde_json::from_slice(payload.as_slice())
-        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let baseline = decode_catalog_baseline(payload.as_slice())?;
     if baseline.version != 1
         || baseline.base_catalog_cursor.high_water() != metadata.base_catalog_revision
         || baseline.entries.len() as u64 != metadata.item_count
@@ -1444,8 +1499,7 @@ pub(super) fn refresh_catalog_snapshot(
     let previous_created_at_ms = current.as_ref().map(|current| current.created_at_ms);
 
     let baseline = match &current {
-        Some(current) => serde_json::from_slice::<CatalogBaselineV1>(&current.payload)
-            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+        Some(current) => decode_catalog_baseline(&current.payload)?,
         None => CatalogBaselineV1 {
             version: 1,
             base_catalog_cursor: StreamCursor::BeforeFirst,

@@ -10,9 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use agentdeck_protocol::runtime::identity::{MessageId, TransferId};
 use agentdeck_protocol::runtime::{
-    MAX_JSON_PART_BYTES, MAX_TRANSFER_PARTS, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope,
-    RuntimeMessage, RuntimeReply, RuntimeStreamItem, RuntimeTransferChannel, TransferEnvelope,
-    TransferError,
+    MAX_JSON_PART_BYTES, MAX_JSON_TRANSFER_PARTS, MAX_TRANSFER_BYTES, RUNTIME_PROTOCOL_VERSION,
+    RuntimeEnvelope, RuntimeMessage, RuntimeReply, RuntimeStreamItem, RuntimeTransferChannel,
+    TransferEnvelope, TransferError,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
@@ -23,8 +23,7 @@ use super::super::connection::{
 };
 
 /// 受 JSON carrier 的 part 数与 raw part 上限共同约束的真实 payload 上限。
-pub(crate) const MAX_JSON_TRANSFER_PAYLOAD_BYTES: usize =
-    MAX_JSON_PART_BYTES * MAX_TRANSFER_PARTS as usize;
+pub(crate) const MAX_JSON_TRANSFER_PAYLOAD_BYTES: usize = MAX_TRANSFER_BYTES as usize;
 
 #[derive(Debug)]
 struct CancellationState {
@@ -92,7 +91,7 @@ impl TransferEgressControl {
 pub(crate) enum TransferEgressErrorKind {
     #[error("transfer identity is empty or exceeds its UTF-8 wire bound")]
     InvalidIdentity,
-    #[error("transfer cannot be represented by at most 64 JSON parts of 700 KiB")]
+    #[error("transfer cannot be represented by at most 94 JSON parts of 700 KiB")]
     TooLarge,
     #[error("transfer egress was cancelled")]
     Cancelled,
@@ -137,6 +136,19 @@ pub(crate) struct TransferEgressReport {
     pub(crate) total_sha256: [u8; 32],
 }
 
+fn json_transfer_part_count(payload_bytes: usize) -> Result<u32, TransferEgressErrorKind> {
+    if payload_bytes > MAX_JSON_TRANSFER_PAYLOAD_BYTES {
+        return Err(TransferEgressErrorKind::TooLarge);
+    }
+    let count = payload_bytes.max(1).div_ceil(MAX_JSON_PART_BYTES);
+    let count = u32::try_from(count).map_err(|_| TransferEgressErrorKind::TooLarge)?;
+    if count == 0 || count > MAX_JSON_TRANSFER_PARTS {
+        Err(TransferEgressErrorKind::TooLarge)
+    } else {
+        Ok(count)
+    }
+}
+
 /// 将一份已经 canonical encode 的 snapshot/backfill payload 分片并串行 flush。
 ///
 /// 本函数直接调用 production `ConnectionRegistry::{reserve_paced, commit_paced}` 与
@@ -153,17 +165,9 @@ pub(crate) async fn send_json_transfer(
     if !message_id.is_valid_wire_value() || !transfer_id.is_valid_wire_value() {
         return Err(failed(TransferEgressErrorKind::InvalidIdentity, 0));
     }
-    if payload.len() > MAX_JSON_TRANSFER_PAYLOAD_BYTES {
-        return Err(failed(TransferEgressErrorKind::TooLarge, 0));
-    }
+    let part_count = json_transfer_part_count(payload.len()).map_err(|kind| failed(kind, 0))?;
     let total_bytes =
         u64::try_from(payload.len()).map_err(|_| failed(TransferEgressErrorKind::TooLarge, 0))?;
-    let part_count_usize = payload.len().max(1).div_ceil(MAX_JSON_PART_BYTES);
-    let part_count = u32::try_from(part_count_usize)
-        .map_err(|_| failed(TransferEgressErrorKind::TooLarge, 0))?;
-    if part_count == 0 || part_count > MAX_TRANSFER_PARTS {
-        return Err(failed(TransferEgressErrorKind::TooLarge, 0));
-    }
     let total_sha256: [u8; 32] = Sha256::digest(payload).into();
     let mut flushed_parts = 0_u32;
 
@@ -176,7 +180,7 @@ pub(crate) async fn send_json_transfer(
         } else {
             Vec::new()
         };
-        let transfer = TransferEnvelope::new(
+        let transfer = TransferEnvelope::new_json(
             transfer_id.clone(),
             part_index,
             part_count,

@@ -17,12 +17,13 @@ use agentdeck_protocol::runtime::failure::{
     DAEMON_RUNTIME_READ_UNAVAILABLE,
 };
 use agentdeck_protocol::runtime::identity::{
-    AdapterStateKey, ApprovalId, CommandId, ConversationId, IdempotencyKey, TurnId,
+    ApprovalId, CommandId, ConversationId, IdempotencyKey, TurnId,
 };
 use agentdeck_protocol::runtime::{
     BackfillRequest, CancellationReceipt, CommandReceipt, CommandStatus, CommandStatusReceipt,
-    ConversationStartReceipt, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeFailure,
-    RuntimeInnerCursor, RuntimeMessage, RuntimeReply, RuntimeRequest, RuntimeSubscriptionTarget,
+    ConfigurationReceipt, ConversationMetadataReceipt, ConversationStartReceipt,
+    RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeFailure, RuntimeInnerCursor, RuntimeMessage,
+    RuntimeReply, RuntimeRequest, RuntimeSubscriptionTarget, StageUpgradeReceipt,
     SubscriptionReceipt,
 };
 use tokio::sync::Semaphore;
@@ -90,6 +91,7 @@ pub struct RuntimeCore {
     recovery_identity: Arc<()>,
     recovery: RuntimeRecoveryCoordinator,
     read_pool: ReadPool,
+    allow_unconfigured_test_prompts: bool,
     #[allow(dead_code)] // P3.8 UDS peer credential adapter 才会成为 production caller。
     principal_issuer: PrincipalIssuer,
     lifecycle: AtomicU8,
@@ -100,8 +102,8 @@ pub struct RuntimeCore {
 }
 
 impl RuntimeCore {
-    /// Side-effect-free/test 构造固定安装 fail-closed coordinator；它只验证 Core
-    /// contract，不会把 Accepted 推进为真实 Started。production 必须使用 `new_production`。
+    /// Side-effect-free 构造固定安装 fail-closed coordinator；它只验证 Core
+    /// contract，不会把 Accepted 推进为真实 Started，也不会放行未配置 prompt。
     pub fn new(
         store: RuntimeStoreHandle,
         router: Arc<AgentRouter>,
@@ -113,6 +115,26 @@ impl RuntimeCore {
             machine_trust_domain,
             Arc::new(DisabledExecutionCoordinator),
             DEFAULT_ADAPTER_CONCURRENCY,
+            false,
+        )
+        .map_err(RuntimeCoreError::into_failure)
+    }
+
+    /// 只供 crate 内单元测试保留 P3.7 legacy rev0 admission；production build
+    /// 不包含这个构造入口。
+    #[cfg(test)]
+    fn new_with_unconfigured_prompts_for_test(
+        store: RuntimeStoreHandle,
+        router: Arc<AgentRouter>,
+        machine_trust_domain: [u8; 32],
+    ) -> Result<Self, RuntimeFailure> {
+        Self::with_execution_coordinator(
+            store,
+            router,
+            machine_trust_domain,
+            Arc::new(DisabledExecutionCoordinator),
+            DEFAULT_ADAPTER_CONCURRENCY,
+            true,
         )
         .map_err(RuntimeCoreError::into_failure)
     }
@@ -133,6 +155,7 @@ impl RuntimeCore {
             machine_trust_domain,
             execution,
             DEFAULT_ADAPTER_CONCURRENCY,
+            false,
         )
         .map_err(RuntimeCoreError::into_failure)
     }
@@ -143,6 +166,7 @@ impl RuntimeCore {
         machine_trust_domain: [u8; 32],
         execution: Arc<dyn RuntimeExecutionCoordinator>,
         adapter_concurrency: usize,
+        allow_unconfigured_test_prompts: bool,
     ) -> Result<Self, RuntimeCoreError> {
         if machine_trust_domain == [0; 32] {
             return Err(RuntimeCoreError::InvalidIdentityDomain);
@@ -190,6 +214,7 @@ impl RuntimeCore {
             recovery_identity,
             recovery,
             read_pool: ReadPool::new(DEFAULT_RUNTIME_READ_CONCURRENCY)?,
+            allow_unconfigured_test_prompts,
             principal_issuer: PrincipalIssuer::local_only(machine_trust_domain),
             lifecycle: AtomicU8::new(CORE_COLD),
             operation_inflight: AtomicUsize::new(0),
@@ -212,6 +237,7 @@ impl RuntimeCore {
             machine_trust_domain,
             execution,
             DEFAULT_ADAPTER_CONCURRENCY,
+            true,
         )
     }
 
@@ -301,7 +327,7 @@ impl RuntimeCore {
         }
     }
 
-    /// 所有 Runtime v1 transport 共用的完整 envelope 入口。directed reply 严格复用
+    /// 所有 Runtime v2 transport 共用的完整 envelope 入口。directed reply 严格复用
     /// 原 request messageId，并进入 connection-owned reply pump；本方法不等待 socket。
     pub async fn handle_envelope(
         &self,
@@ -566,6 +592,7 @@ impl RuntimeCore {
     ) -> Result<RuntimeReply, RuntimeCoreError> {
         match request {
             RuntimeRequest::Hello(params) => Ok(self.handle_hello(params)),
+            RuntimeRequest::DescribeAgents => Err(RuntimeCoreError::FeatureUnavailable),
             RuntimeRequest::Start(start) => {
                 let _authorization = principal.try_enter()?;
                 if validate_idempotency_key(&start.idempotency_key).is_err()
@@ -604,14 +631,41 @@ impl RuntimeCore {
                     .await?;
                 Ok(RuntimeReply::ConversationStart(ConversationStartReceipt {
                     conversation_id: wire_conversation_id(conversation.conversation_id),
-                    adapter_state_key: wire_adapter_state_key(conversation.adapter_state_key),
                     replayed,
                 }))
+            }
+            RuntimeRequest::ConfigureConversation(_) => {
+                let failure = match principal.try_enter() {
+                    Ok(_authorization) => RuntimeCoreError::FeatureUnavailable,
+                    Err(error) => RuntimeCoreError::from(error),
+                }
+                .into_failure();
+                Ok(RuntimeReply::Configuration(ConfigurationReceipt::Failed {
+                    failure,
+                }))
+            }
+            RuntimeRequest::UpdateConversationMetadata(_) => {
+                let failure = match principal.try_enter() {
+                    Ok(_authorization) => RuntimeCoreError::FeatureUnavailable,
+                    Err(error) => RuntimeCoreError::from(error),
+                }
+                .into_failure();
+                Ok(RuntimeReply::ConversationMetadata(
+                    ConversationMetadataReceipt::Failed { failure },
+                ))
             }
             RuntimeRequest::SendPrompt(request) => {
                 // SendPrompt 的所有业务拒绝都属于 CommandReceipt family；否则
                 // Companion 会把一次 command failure 误解成 envelope/control failure。
                 let receipt = match async {
+                    // 威胁场景：production Runtime v2 在 configuration store 落地前
+                    // 接受 rev0 prompt，会把用户选择静默回落为 P3.7 默认值。只有
+                    // DisabledExecutionCoordinator 的永久测试构造可保留旧 admission。
+                    if !self.allow_unconfigured_test_prompts
+                        || request.expected_configuration_revision != 0
+                    {
+                        return Err(RuntimeCoreError::FeatureUnavailable);
+                    }
                     validate_idempotency_key(&request.idempotency_key)?;
                     let conversation_id = parse_conversation_id(&request.conversation_id)?;
                     let authorization = principal.try_enter()?;
@@ -634,9 +688,11 @@ impl RuntimeCore {
                     }) => CommandReceipt::Accepted {
                         command_id: wire_command_id(command.command_id),
                         queue_position,
+                        configuration_revision: 0,
                     },
                     Ok(PromptAcceptResult::Replayed { command }) => CommandReceipt::Replayed {
                         command_id: wire_command_id(command.command_id),
+                        configuration_revision: 0,
                     },
                     Err(error) => CommandReceipt::Failed {
                         failure: error.into_failure(),
@@ -777,6 +833,7 @@ impl RuntimeCore {
                 Ok(RuntimeReply::CommandStatus(CommandStatusReceipt {
                     conversation_id,
                     command_id: wire_command_id(receipt.command_id),
+                    configuration_revision: 0,
                     status: wire_command_status(receipt.state),
                     turn_id: receipt.turn_id.map(wire_turn_id),
                 }))
@@ -793,6 +850,20 @@ impl RuntimeCore {
             | RuntimeRequest::CancelPairing { .. }
             | RuntimeRequest::Revoke(_)
             | RuntimeRequest::TrustReset { .. } => Err(RuntimeCoreError::FeatureUnavailable),
+            RuntimeRequest::StageUpgrade(_) => {
+                let failure = if !principal.is_local() {
+                    RuntimeCoreError::AuthorizationDenied.into_failure()
+                } else {
+                    match principal.try_enter() {
+                        Ok(_authorization) => RuntimeCoreError::FeatureUnavailable,
+                        Err(error) => RuntimeCoreError::from(error),
+                    }
+                    .into_failure()
+                };
+                Ok(RuntimeReply::StageUpgrade(StageUpgradeReceipt::Failed {
+                    failure,
+                }))
+            }
         }
     }
 
@@ -1271,10 +1342,6 @@ fn parse_approval_id(value: &ApprovalId) -> Result<RuntimeId, RuntimeCoreError> 
 
 fn wire_conversation_id(value: RuntimeId) -> ConversationId {
     ConversationId::new(value.to_canonical_string())
-}
-
-fn wire_adapter_state_key(value: RuntimeId) -> AdapterStateKey {
-    AdapterStateKey::new(value.to_canonical_string())
 }
 
 fn wire_command_id(value: RuntimeId) -> CommandId {

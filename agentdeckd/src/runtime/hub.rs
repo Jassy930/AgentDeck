@@ -75,7 +75,7 @@ impl RuntimeHub {
     }
 
     /// 显式 `--stdio-compat --ephemeral --no-remote` compatibility 只保留固定
-    /// 管理/只读 allowlist。所有 execution/control 命令必须走 RuntimeEnvelope v1，
+    /// 管理/只读 allowlist。所有 execution/control 命令必须走 RuntimeEnvelope v2，
     /// 经同一 RuntimeCore 与 exec gate 执行，不能回落到 legacy adapter/router surface。
     pub fn admin_only(router: Arc<AgentRouter>) -> Self {
         Self {

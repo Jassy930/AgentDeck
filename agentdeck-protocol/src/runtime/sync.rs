@@ -1,7 +1,8 @@
-//! Runtime v1 订阅、cursor、snapshot barrier 与定向 backfill。
+//! Runtime v2 订阅、cursor、snapshot barrier 与定向 backfill。
 
 use crate::capabilities::SessionCapabilities;
 use crate::runtime::catalog::CatalogDelta;
+use crate::runtime::configuration::ConversationConfigurationState;
 use crate::runtime::event::RuntimeEvent;
 use crate::runtime::identity::{CommandId, ConversationId, EntityId, ItemId, StreamGeneration};
 use crate::trunk::AgentItem;
@@ -277,14 +278,17 @@ pub enum SnapshotError {
     DuplicateCapabilities,
     #[error("snapshot item identity matrix is invalid")]
     InvalidIdentity,
+    #[error("snapshot configuration agent kind does not match SessionCapabilities")]
+    ConfigurationAgentMismatch,
 }
 
 /// 首次订阅 canonical snapshot。空 high-water 必须是 `BeforeFirst`。
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, JsonSchema)]
+#[schemars(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConversationSnapshot {
     pub conversation_id: ConversationId,
     pub base_event_cursor: StreamCursor,
+    pub configuration_state: ConversationConfigurationState,
     items: Vec<SnapshotItem>,
 }
 
@@ -292,18 +296,36 @@ impl ConversationSnapshot {
     pub fn new(
         conversation_id: ConversationId,
         base_event_cursor: StreamCursor,
+        configuration_state: ConversationConfigurationState,
         items: Vec<SnapshotItem>,
     ) -> Result<Self, SnapshotError> {
-        Self::validate_items(&items)?;
+        Self::validate(&configuration_state, &items)?;
         Ok(Self {
             conversation_id,
             base_event_cursor,
+            configuration_state,
             items,
         })
     }
 
     pub fn items(&self) -> &[SnapshotItem] {
         &self.items
+    }
+
+    fn validate(
+        configuration_state: &ConversationConfigurationState,
+        items: &[SnapshotItem],
+    ) -> Result<(), SnapshotError> {
+        Self::validate_items(items)?;
+        if let Some(configuration) = configuration_state.configuration() {
+            let SnapshotItem::Capabilities { capabilities, .. } = &items[0] else {
+                unreachable!("validate_items guarantees a capabilities-first snapshot");
+            };
+            if configuration.agent_kind() != capabilities.agent_kind {
+                return Err(SnapshotError::ConfigurationAgentMismatch);
+            }
+        }
+        Ok(())
     }
 
     fn validate_items(items: &[SnapshotItem]) -> Result<(), SnapshotError> {
@@ -325,6 +347,31 @@ impl ConversationSnapshot {
     }
 }
 
+impl Serialize for ConversationSnapshot {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        Self::validate(&self.configuration_state, &self.items)
+            .map_err(serde::ser::Error::custom)?;
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire<'a> {
+            conversation_id: &'a ConversationId,
+            base_event_cursor: StreamCursor,
+            configuration_state: &'a ConversationConfigurationState,
+            items: &'a [SnapshotItem],
+        }
+        Wire {
+            conversation_id: &self.conversation_id,
+            base_event_cursor: self.base_event_cursor,
+            configuration_state: &self.configuration_state,
+            items: &self.items,
+        }
+        .serialize(serializer)
+    }
+}
+
 impl<'de> Deserialize<'de> for ConversationSnapshot {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -335,11 +382,17 @@ impl<'de> Deserialize<'de> for ConversationSnapshot {
         struct Wire {
             conversation_id: ConversationId,
             base_event_cursor: StreamCursor,
+            configuration_state: ConversationConfigurationState,
             items: Vec<SnapshotItem>,
         }
         let wire = Wire::deserialize(deserializer)?;
-        Self::new(wire.conversation_id, wire.base_event_cursor, wire.items)
-            .map_err(serde::de::Error::custom)
+        Self::new(
+            wire.conversation_id,
+            wire.base_event_cursor,
+            wire.configuration_state,
+            wire.items,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 

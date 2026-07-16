@@ -1,4 +1,4 @@
-//! Runtime v1 稳定中立身份 newtypes（design §8.1 / RC-9）。
+//! Runtime v2 稳定中立身份 newtypes（design §8.1 / RC-9）。
 //!
 //! 所有业务身份都用中立、不含 vendor 字样的 newtype 表达：
 //! - `ConversationId`：daemon 在 adapter 启动前生成，跨 turn/设备稳定。
@@ -6,9 +6,9 @@
 //! - `EventId`：每条 canonical event 的唯一去重 ID。
 //! - `ItemId`/`EntityId`：多条 delta 更新同一 UI item/entity 时的稳定聚合 ID。
 //! - `CommandId`：关联 prompt row / receipt / canonical UserMessage。
-//! - `AdapterStateKey`：随机中立 handle；vendor resume reference **永不进入 wire**。
 //!
-//! 真实 vendor thread/session/turn 身份禁止出现在此层（由 neutrality 测试守护）。
+//! daemon-private adapter handle 与真实 vendor thread/session/turn 身份禁止出现在此层
+//! （由 neutrality 与 public-wire scan 守护）。
 
 use schemars::schema::{InstanceType, Schema, SchemaObject, StringValidation};
 use schemars::{JsonSchema, r#gen::SchemaGenerator};
@@ -186,10 +186,6 @@ string_id!(
 string_id!(
     /// approval 请求身份；first-wins 裁决基于它做 compare-and-swap。
     ApprovalId
-);
-string_id!(
-    /// daemon 生成的随机中立 adapter state handle；vendor resume ref 永不进入 wire。
-    AdapterStateKey
 );
 string_id!(
     /// 命令 idempotency key（客户端提供的去重键）。

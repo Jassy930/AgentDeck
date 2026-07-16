@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use agentdeckd::runtime::store::{
-    NewConversation, RuntimeId, RuntimeIdKind, RuntimeStoreConfig, RuntimeStoreHandle,
+    ConversationLifecycle, ConversationRecord, CreateConversationOutcome, NewConversation,
+    RuntimeId, RuntimeIdKind, RuntimeStoreConfig, RuntimeStoreHandle,
 };
 use agentdeckd::security::{MemoryKeyStore, load_or_create_storage_kek};
 use rusqlite::{Connection, OpenFlags};
@@ -51,6 +52,44 @@ fn random_runtime_id(kind: RuntimeIdKind) -> RuntimeId {
     }
 }
 
+#[test]
+fn public_conversation_debug_omits_daemon_private_adapter_state_key() {
+    // 威胁场景：若调用方把 public outcome 写入日志，私域 handle 会成为可关联 vendor
+    // resume reference 的稳定能力值；Debug 必须连字段名与值一起省略。
+    let adapter_state_key = RuntimeId::from_bytes(RuntimeIdKind::AdapterState, [0xa5; 16])
+        .expect("construct non-zero private handle");
+    let conversation = ConversationRecord {
+        conversation_id: RuntimeId::from_bytes(RuntimeIdKind::Conversation, [0x5a; 16])
+            .expect("construct conversation id"),
+        adapter_state_key,
+        catalog_revision: 1,
+        command_high_water: None,
+        event_high_water: None,
+        accepted_command_count: 0,
+        lifecycle: ConversationLifecycle::Active,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        descriptor: runtime_descriptor::descriptor(b"debug-boundary"),
+    };
+
+    for output in [
+        format!("{conversation:?}"),
+        format!(
+            "{:?}",
+            CreateConversationOutcome::Created {
+                conversation: conversation.clone(),
+            }
+        ),
+        format!("{:?}", CreateConversationOutcome::Replayed { conversation }),
+    ] {
+        assert!(!output.contains("adapter_state_key"), "{output}");
+        assert!(
+            !output.contains(&adapter_state_key.to_canonical_string()),
+            "{output}"
+        );
+    }
+}
+
 async fn open_store(root: &TestRoot, keys: &MemoryKeyStore) -> RuntimeStoreHandle {
     let storage_kek =
         load_or_create_storage_kek(keys, &root.database()).expect("load adapter state StorageKEK");
@@ -60,7 +99,7 @@ async fn open_store(root: &TestRoot, keys: &MemoryKeyStore) -> RuntimeStoreHandl
 }
 
 #[tokio::test]
-async fn common_catalog_has_only_the_neutral_adapter_state_key() {
+async fn daemon_private_store_retains_only_the_neutral_adapter_state_key() {
     let root = TestRoot::new("catalog-shape");
     let keys = MemoryKeyStore::new();
     let store = open_store(&root, &keys).await;
@@ -72,11 +111,11 @@ async fn common_catalog_has_only_the_neutral_adapter_state_key() {
             descriptor: runtime_descriptor::descriptor(b"random-key"),
         })
         .await
-        .expect("create catalog row with OS-random adapterStateKey");
+        .expect("create private row with OS-random adapterStateKey");
     store
         .shutdown()
         .await
-        .expect("shutdown catalog shape store");
+        .expect("shutdown private store shape test");
 
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let connection = Connection::open_with_flags(root.database(), flags).expect("open raw DB");
@@ -114,6 +153,16 @@ fn common_adapter_state_module_has_no_vendor_identity_type() {
             "common adapter state module leaked {forbidden}"
         );
     }
+
+    // 威胁场景：snapshot handoff 是 public Rust API；若它暴露 getter 或 Debug
+    // 字段，client/logging 层可绕过 Runtime v2 wire 取得 daemon-private handle。
+    let snapshot = fs::read_to_string(root.join("src/runtime/snapshot.rs"))
+        .expect("read snapshot materializer module");
+    assert!(!snapshot.contains("pub const fn adapter_state_key("));
+    assert!(!snapshot.contains(".field(\"adapter_state_key\""));
+    let store_surface = fs::read_to_string(root.join("src/runtime/store/mod.rs"))
+        .expect("read Runtime store public surface");
+    assert!(!store_surface.contains("pub(crate) adapter_state_key"));
 
     let runtime_router =
         fs::read_to_string(root.join("src/runtime/router.rs")).expect("read runtime router");

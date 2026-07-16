@@ -696,5 +696,6 @@
       "kind": 29
     }
   ],
-  "relayProtocolVersion": 2
+  "relayProtocolVersion": 2,
+  "runtimeProtocolVersion": 2
 }

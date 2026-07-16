@@ -82,7 +82,7 @@ enum ProtocolOp {
     Schema,
     /// Print the local IPC protocol version number (PROTOCOL_VERSION)
     Version,
-    /// Print the Runtime v1 aggregate JSON Schema (RUNTIME_PROTOCOL_VERSION)
+    /// Print the Runtime v2 aggregate JSON Schema (RUNTIME_PROTOCOL_VERSION)
     #[command(name = "runtime-schema")]
     RuntimeSchema,
     /// Print the Relay v2 aggregate JSON Schema (RELAY_PROTOCOL_VERSION=2)

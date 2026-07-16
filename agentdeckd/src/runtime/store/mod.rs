@@ -16,6 +16,7 @@ pub(crate) mod retention;
 mod schema;
 pub(crate) mod sequence;
 mod snapshot;
+pub(crate) use snapshot::decode_catalog_baseline;
 mod sqlite;
 mod stream;
 mod worker;
@@ -47,10 +48,8 @@ pub use publication::{
 };
 pub use recovery::RuntimeRescueIndex;
 pub use schema::{RUNTIME_CRYPTO_CONTEXT_VERSION, RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION};
-pub(crate) use snapshot::{
-    CatalogBaselineV1, StoredCatalogSnapshot, catalog_materialization_peak_bound,
-};
 pub use snapshot::{ReadySnapshotReference, StoredConversationSnapshot};
+pub(crate) use snapshot::{StoredCatalogSnapshot, catalog_materialization_peak_bound};
 pub use stream::{
     RuntimeBackfillPageCompletion, RuntimeBackfillPin, RuntimeBackfillPlan, RuntimeBackfillTarget,
     RuntimeCatalogBackfillPage, RuntimeEventBackfillPage, RuntimeSnapshotBuildPin,
@@ -63,7 +62,6 @@ pub(crate) use worker::{ClaudeCodeAdapterStateVault, CodexAdapterStateVault};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AuthenticatedConversationSnapshotContext {
     pub(crate) conversation_id: RuntimeId,
-    pub(crate) adapter_state_key: RuntimeId,
     pub(crate) agent_kind: agentdeck_protocol::AgentKind,
     pub(crate) event_high_water: Option<u64>,
 }

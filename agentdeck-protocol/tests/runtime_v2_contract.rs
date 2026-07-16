@@ -1,7 +1,7 @@
-//! P1.1 RuntimeEnvelope v1 中立契约 —— contract / deny-unknown / limits 测试。
+//! RuntimeEnvelope v2 中立契约 —— contract / deny-unknown / limits 测试。
 //!
-//! RuntimeEnvelope v1 是 UDS 与解密后远程链路的共同业务 wire（design §8.2）。
-//! 本 task 只定义中立契约与构造校验，不接线任何运行时行为。
+//! RuntimeEnvelope v2 是 UDS 与解密后远程链路的共同业务 wire（design §8.2.2）。
+//! 本 task 只冻结中立契约与构造校验；configuration/store 执行语义属于 P3.9-C0-B。
 
 use agentdeck_protocol::runtime::command::{
     LocalOnlyAdministration, MAX_PROMPT_BYTES, PromptPayload, QueryReceiptSelector,
@@ -9,9 +9,9 @@ use agentdeck_protocol::runtime::command::{
 };
 use agentdeck_protocol::runtime::failure::{self, RuntimeFailure};
 use agentdeck_protocol::runtime::identity::{
-    AdapterStateKey, ApprovalId, CatalogPageCursor, CommandId, ConversationId, EntityId, EventId,
-    IdempotencyKey, ItemId, MAX_MESSAGE_ID_BYTES, MAX_TRANSFER_ID_BYTES, MessageId, PairingId,
-    StreamGeneration, TransferId, TurnId,
+    ApprovalId, CatalogPageCursor, CommandId, ConversationId, EntityId, EventId, IdempotencyKey,
+    ItemId, MAX_MESSAGE_ID_BYTES, MAX_TRANSFER_ID_BYTES, MessageId, PairingId, StreamGeneration,
+    TransferId, TurnId,
 };
 use agentdeck_protocol::runtime::receipt::{
     ApprovalDeliveryState, ApprovalReceipt, CancellationReceipt, CommandReceipt, CommandStatus,
@@ -22,16 +22,22 @@ use agentdeck_protocol::runtime::sync::{
     RuntimeSubscriptionTarget, RuntimeSyncComplete, SnapshotError, SnapshotItem, StreamCursor,
 };
 use agentdeck_protocol::runtime::{
-    self, MAX_JSON_PART_BYTES, MAX_RUNTIME_JSON_FRAME_BYTES, MAX_RUNTIME_REQUEST_BYTES,
+    self, AgentDescription, AgentDescriptions, ArtifactSha256, ClaudeCodeConversationConfiguration,
+    CodexConversationConfiguration, ConfigurationReceipt, ConfigureConversationRequest,
+    ConversationConfiguration, ConversationConfigurationState, ConversationMetadataMutation,
+    ConversationMetadataMutationRequest, ConversationMetadataReceipt, MAX_JSON_PART_BYTES,
+    MAX_JSON_TRANSFER_PARTS, MAX_RUNTIME_JSON_FRAME_BYTES, MAX_RUNTIME_REQUEST_BYTES,
     RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeEvent, RuntimeEventBody, RuntimeMessage,
     RuntimeReply, RuntimeRequest, RuntimeSizeError, RuntimeStreamItem, RuntimeTransferCarrierV1,
-    RuntimeTransferChannel, SubscriptionReceipt, TransferEnvelope, ensure_request_within_limit,
+    RuntimeTransferChannel, StageUpgradeReceipt, StageUpgradeRequest, SubscriptionReceipt,
+    TransferEnvelope, VendorConfigurationSnapshot, ensure_request_within_limit,
 };
 use agentdeck_protocol::{
     ActionDecision, ActionDecisionKind, ActionKind, ActionRequest, ActionRequestVendor, AgentItem,
-    AgentItemMeta, AgentKind, CapabilityId, CodexApprovalPolicy, CodexCapabilities,
-    CodexReasoningEffort, CodexSandboxMode, DiffFile, DiffStatus, PlanStep, PlanStepStatus,
-    SessionCapabilities, ShellStatus, TurnSummary, VendorCapabilities,
+    AgentItemMeta, AgentKind, CapabilityId, ClaudeCodeCapabilities, ClaudeCodePermissionMode,
+    ClaudeCodeVendorPanelEvent, CodexApprovalPolicy, CodexCapabilities, CodexReasoningEffort,
+    CodexSandboxMode, CodexVendorPanelEvent, DiffFile, DiffStatus, PlanStep, PlanStepStatus,
+    SessionCapabilities, ShellStatus, TurnSummary, VendorCapabilities, VendorPanelPayload,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -66,12 +72,48 @@ fn sample_multi_caps() -> SessionCapabilities {
     }
 }
 
+fn sample_claude_code_caps() -> SessionCapabilities {
+    SessionCapabilities {
+        agent_kind: AgentKind::ClaudeCode,
+        agent_version: "fixture-cc-1".into(),
+        features: BTreeSet::new(),
+        vendor: VendorCapabilities::ClaudeCode(ClaudeCodeCapabilities::default()),
+    }
+}
+
 fn sample_send_prompt() -> RuntimeRequest {
     RuntimeRequest::SendPrompt(SendPromptRequest {
         conversation_id: ConversationId::new("c1"),
         idempotency_key: IdempotencyKey::new("k1"),
+        expected_configuration_revision: 1,
         prompt: PromptPayload::new("hello").unwrap(),
     })
+}
+
+fn sample_codex_configuration() -> ConversationConfiguration {
+    ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
+        CodexConversationConfiguration::new(
+            CodexApprovalPolicy::OnRequest,
+            CodexSandboxMode::WorkspaceWrite,
+            CodexReasoningEffort::High,
+        ),
+    ))
+}
+
+fn sample_claude_code_configuration() -> ConversationConfiguration {
+    ConversationConfiguration::new(VendorConfigurationSnapshot::ClaudeCode(
+        ClaudeCodeConversationConfiguration::new(
+            ClaudeCodePermissionMode::Default,
+            Some("sonnet".into()),
+            Some("high".into()),
+            Some("concise".into()),
+        )
+        .unwrap(),
+    ))
+}
+
+fn unconfigured_state() -> ConversationConfigurationState {
+    ConversationConfigurationState::new(0, None).unwrap()
 }
 
 fn envelope(body: RuntimeMessage) -> RuntimeEnvelope {
@@ -100,7 +142,7 @@ fn hex(bytes: &[u8]) -> String {
 
 fn runtime_fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../protocol/agentdeck/fixtures/runtime-v1-wire.jsonl")
+        .join("../protocol/agentdeck/fixtures/runtime-v2-wire.jsonl")
 }
 
 fn render_runtime_wire_fixture() -> String {
@@ -136,6 +178,7 @@ fn render_runtime_wire_fixture() -> String {
                 runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
             }),
         ),
+        ("requestDescribeAgents", RuntimeRequest::DescribeAgents),
         (
             "requestCatalog",
             RuntimeRequest::Catalog(runtime::command::CatalogRequest { page_cursor: None }),
@@ -171,6 +214,48 @@ fn render_runtime_wire_fixture() -> String {
                 cwd: PathBuf::from("/tmp/runtime-request-1"),
                 title: Some("fixture conversation".into()),
             }),
+        ),
+        (
+            "requestConfigureCodex",
+            RuntimeRequest::ConfigureConversation(ConfigureConversationRequest::new(
+                request_conversation.clone(),
+                IdempotencyKey::new("configure-codex-1"),
+                0,
+                sample_codex_configuration(),
+            )),
+        ),
+        (
+            "requestConfigureClaudeCode",
+            RuntimeRequest::ConfigureConversation(ConfigureConversationRequest::new(
+                request_conversation.clone(),
+                IdempotencyKey::new("configure-cc-1"),
+                1,
+                sample_claude_code_configuration(),
+            )),
+        ),
+        (
+            "requestUpdateMetadataRename",
+            RuntimeRequest::UpdateConversationMetadata(
+                ConversationMetadataMutationRequest::new(
+                    request_conversation.clone(),
+                    IdempotencyKey::new("metadata-rename-1"),
+                    4,
+                    ConversationMetadataMutation::rename(Some("renamed fixture".into())).unwrap(),
+                )
+                .unwrap(),
+            ),
+        ),
+        (
+            "requestUpdateMetadataArchive",
+            RuntimeRequest::UpdateConversationMetadata(
+                ConversationMetadataMutationRequest::new(
+                    request_conversation.clone(),
+                    IdempotencyKey::new("metadata-archive-1"),
+                    5,
+                    ConversationMetadataMutation::SetArchived { archived: true },
+                )
+                .unwrap(),
+            ),
         ),
         ("requestSendPrompt", sample_send_prompt()),
         (
@@ -261,6 +346,18 @@ fn render_runtime_wire_fixture() -> String {
                 scope: LocalOnlyAdministration::LocalOnly,
             },
         ),
+        (
+            "requestStageUpgrade",
+            RuntimeRequest::StageUpgrade(
+                StageUpgradeRequest::new(
+                    "1.2.3".into(),
+                    ArtifactSha256::new("ab".repeat(32)).unwrap(),
+                    IdempotencyKey::new("upgrade-request-1"),
+                    LocalOnlyAdministration::LocalOnly,
+                )
+                .unwrap(),
+            ),
+        ),
     ];
     for (index, (name, request)) in request_variants.into_iter().enumerate() {
         cases.push(fixture_case(
@@ -281,6 +378,141 @@ fn render_runtime_wire_fixture() -> String {
     );
     cases.push(fixture_case("replyHello", "runtimeEnvelope", &hello_reply));
 
+    let agents_reply = envelope_with_id(
+        "message-reply-agents",
+        RuntimeMessage::Reply(RuntimeReply::Agents(
+            AgentDescriptions::new(vec![
+                AgentDescription::new(
+                    AgentKind::Codex,
+                    sample_caps(),
+                    sample_codex_configuration(),
+                )
+                .unwrap(),
+                AgentDescription::new(
+                    AgentKind::ClaudeCode,
+                    sample_claude_code_caps(),
+                    sample_claude_code_configuration(),
+                )
+                .unwrap(),
+            ])
+            .unwrap(),
+        )),
+    );
+    cases.push(fixture_case(
+        "replyAgents",
+        "runtimeEnvelope",
+        &agents_reply,
+    ));
+
+    let configuration_replies = [
+        (
+            "configurationApplied",
+            ConfigurationReceipt::Applied {
+                conversation_id: ConversationId::new("conversation-configuration-1"),
+                configuration_revision: 1,
+            },
+        ),
+        (
+            "configurationReplayed",
+            ConfigurationReceipt::Replayed {
+                conversation_id: ConversationId::new("conversation-configuration-1"),
+                configuration_revision: 1,
+            },
+        ),
+        (
+            "configurationConflict",
+            ConfigurationReceipt::Conflict {
+                conversation_id: ConversationId::new("conversation-configuration-1"),
+                current_configuration_revision: 2,
+            },
+        ),
+        (
+            "configurationFailed",
+            ConfigurationReceipt::Failed {
+                failure: RuntimeFailure::new("daemon.configuration.unavailable", "fixture"),
+            },
+        ),
+    ];
+    for (index, (name, receipt)) in configuration_replies.into_iter().enumerate() {
+        let value = envelope_with_id(
+            &format!("message-configuration-{index}"),
+            RuntimeMessage::Reply(RuntimeReply::Configuration(receipt)),
+        );
+        cases.push(fixture_case(name, "runtimeEnvelope", &value));
+    }
+
+    let metadata_replies = [
+        (
+            "metadataApplied",
+            ConversationMetadataReceipt::Applied {
+                conversation_id: ConversationId::new("conversation-metadata-1"),
+                entry_revision: 8,
+            },
+        ),
+        (
+            "metadataReplayed",
+            ConversationMetadataReceipt::Replayed {
+                conversation_id: ConversationId::new("conversation-metadata-1"),
+                entry_revision: 8,
+            },
+        ),
+        (
+            "metadataConflict",
+            ConversationMetadataReceipt::Conflict {
+                conversation_id: ConversationId::new("conversation-metadata-1"),
+                current_entry_revision: 9,
+            },
+        ),
+        (
+            "metadataFailed",
+            ConversationMetadataReceipt::Failed {
+                failure: RuntimeFailure::new("daemon.metadata.unavailable", "fixture"),
+            },
+        ),
+    ];
+    for (index, (name, receipt)) in metadata_replies.into_iter().enumerate() {
+        let value = envelope_with_id(
+            &format!("message-metadata-{index}"),
+            RuntimeMessage::Reply(RuntimeReply::ConversationMetadata(receipt)),
+        );
+        cases.push(fixture_case(name, "runtimeEnvelope", &value));
+    }
+
+    let upgrade_replies = [
+        (
+            "stageUpgradeStaged",
+            StageUpgradeReceipt::Staged {
+                target_version: "1.2.3".into(),
+            },
+        ),
+        (
+            "stageUpgradeAwaitingIdle",
+            StageUpgradeReceipt::AwaitingIdle {
+                target_version: "1.2.3".into(),
+                active_turns: 2,
+            },
+        ),
+        (
+            "stageUpgradeReplayed",
+            StageUpgradeReceipt::Replayed {
+                target_version: "1.2.3".into(),
+            },
+        ),
+        (
+            "stageUpgradeFailed",
+            StageUpgradeReceipt::Failed {
+                failure: RuntimeFailure::new("daemon.upgrade.unavailable", "fixture"),
+            },
+        ),
+    ];
+    for (index, (name, receipt)) in upgrade_replies.into_iter().enumerate() {
+        let value = envelope_with_id(
+            &format!("message-upgrade-{index}"),
+            RuntimeMessage::Reply(RuntimeReply::StageUpgrade(receipt)),
+        );
+        cases.push(fixture_case(name, "runtimeEnvelope", &value));
+    }
+
     let catalog_reply = envelope_with_id(
         "message-reply-catalog",
         RuntimeMessage::Reply(RuntimeReply::Catalog(
@@ -288,14 +520,12 @@ fn render_runtime_wire_fixture() -> String {
                 StreamCursor::At(9),
                 vec![runtime::catalog::ConversationEntry {
                     conversation_id: ConversationId::new("conversation-catalog-1"),
-                    adapter_state_key: runtime::identity::AdapterStateKey::new(
-                        "adapter-state-catalog-1",
-                    ),
                     agent_kind: AgentKind::Codex,
                     title: None,
                     cwd: None,
                     last_active_ms: 123,
                     archived: false,
+                    entry_revision: 3,
                 }],
                 None,
             )
@@ -412,11 +642,38 @@ fn render_runtime_wire_fixture() -> String {
         "runtimeEnvelope",
         &catalog_delta_stream,
     ));
+    let catalog_upsert_stream = envelope_with_id(
+        "message-stream-catalog-upsert",
+        RuntimeMessage::Stream(RuntimeStreamItem::CatalogDelta(
+            runtime::catalog::CatalogDelta {
+                catalog_revision: 11,
+                changes: vec![runtime::catalog::CatalogChange::Upserted {
+                    entry: runtime::catalog::ConversationEntry {
+                        conversation_id: ConversationId::new("conversation-upserted-1"),
+                        agent_kind: AgentKind::Codex,
+                        title: Some("upserted fixture".into()),
+                        cwd: None,
+                        last_active_ms: 456,
+                        archived: false,
+                        entry_revision: 4,
+                    },
+                }],
+            },
+        )),
+    );
+    cases.push(fixture_case(
+        "streamCatalogUpsert",
+        "runtimeEnvelope",
+        &catalog_upsert_stream,
+    ));
     let event_envelope = |message_id: &str, body: RuntimeEventBody| {
         let is_item = matches!(&body, RuntimeEventBody::Item { .. });
         let needs_command = !matches!(
             &body,
-            RuntimeEventBody::Capabilities { .. } | RuntimeEventBody::Error { .. }
+            RuntimeEventBody::Capabilities { .. }
+                | RuntimeEventBody::ConfigurationChanged { .. }
+                | RuntimeEventBody::VendorPanelEvent { .. }
+                | RuntimeEventBody::Error { .. }
         );
         envelope_with_id(
             message_id,
@@ -439,6 +696,36 @@ fn render_runtime_wire_fixture() -> String {
             "eventCapabilitiesMulti",
             RuntimeEventBody::Capabilities {
                 capabilities: sample_multi_caps(),
+            },
+        ),
+        (
+            "eventConfigurationChanged",
+            RuntimeEventBody::ConfigurationChanged {
+                state: ConversationConfigurationState::new(2, Some(sample_codex_configuration()))
+                    .unwrap(),
+            },
+        ),
+        (
+            "eventCodexVendorPanel",
+            RuntimeEventBody::VendorPanelEvent {
+                vendor_panel: VendorPanelPayload::Codex(CodexVendorPanelEvent::Placeholder),
+            },
+        ),
+        (
+            "eventClaudeCodeVendorPanel",
+            RuntimeEventBody::VendorPanelEvent {
+                vendor_panel: VendorPanelPayload::ClaudeCode(
+                    ClaudeCodeVendorPanelEvent::SystemStatus {
+                        subtype: "fixture".into(),
+                        status: Some("ready".into()),
+                        message: None,
+                        attempt: None,
+                        error: None,
+                        error_status: None,
+                        max_retries: None,
+                        retry_delay_ms: None,
+                    },
+                ),
             },
         ),
         (
@@ -635,12 +922,14 @@ fn render_runtime_wire_fixture() -> String {
             CommandReceipt::Accepted {
                 command_id: CommandId::new("command-accepted-1"),
                 queue_position: 2,
+                configuration_revision: 3,
             },
         ),
         (
             "commandReplayed",
             CommandReceipt::Replayed {
                 command_id: CommandId::new("command-replayed-1"),
+                configuration_revision: 3,
             },
         ),
         (
@@ -668,6 +957,7 @@ fn render_runtime_wire_fixture() -> String {
             CommandStatusReceipt {
                 conversation_id: ConversationId::new("conversation-status-1"),
                 command_id: CommandId::new("command-status-accepted-1"),
+                configuration_revision: 3,
                 status: CommandStatus::Accepted,
                 turn_id: None,
             },
@@ -677,6 +967,7 @@ fn render_runtime_wire_fixture() -> String {
             CommandStatusReceipt {
                 conversation_id: ConversationId::new("conversation-status-1"),
                 command_id: CommandId::new("command-status-started-1"),
+                configuration_revision: 3,
                 status: CommandStatus::Started,
                 turn_id: Some(TurnId::new("turn-status-started-1")),
             },
@@ -695,7 +986,6 @@ fn render_runtime_wire_fixture() -> String {
             "conversationStartCreated",
             ConversationStartReceipt {
                 conversation_id: ConversationId::new("conversation-created-1"),
-                adapter_state_key: AdapterStateKey::new("adapter-state-created-1"),
                 replayed: false,
             },
         ),
@@ -703,7 +993,6 @@ fn render_runtime_wire_fixture() -> String {
             "conversationStartReplayed",
             ConversationStartReceipt {
                 conversation_id: ConversationId::new("conversation-created-1"),
-                adapter_state_key: AdapterStateKey::new("adapter-state-created-1"),
                 replayed: true,
             },
         ),
@@ -823,6 +1112,7 @@ fn render_runtime_wire_fixture() -> String {
     let snapshot = ConversationSnapshot::new(
         ConversationId::new("conversation-snapshot-1"),
         StreamCursor::At(6),
+        ConversationConfigurationState::new(1, Some(sample_codex_configuration())).unwrap(),
         vec![
             SnapshotItem::capabilities(sample_caps()),
             SnapshotItem::Item {
@@ -845,6 +1135,21 @@ fn render_runtime_wire_fixture() -> String {
         "capabilitiesFirstSnapshot",
         "runtimeEnvelope",
         &snapshot_envelope,
+    ));
+    let unconfigured_snapshot = ConversationSnapshot::new(
+        ConversationId::new("conversation-snapshot-unconfigured-1"),
+        StreamCursor::BeforeFirst,
+        unconfigured_state(),
+        vec![SnapshotItem::capabilities(sample_caps())],
+    )
+    .unwrap();
+    cases.push(fixture_case(
+        "unconfiguredSnapshot",
+        "runtimeEnvelope",
+        &envelope_with_id(
+            "message-snapshot-unconfigured-1",
+            RuntimeMessage::Reply(RuntimeReply::Snapshot(unconfigured_snapshot)),
+        ),
     ));
 
     let part = b"runtime-transfer-fixture".to_vec();
@@ -902,13 +1207,13 @@ fn render_runtime_wire_fixture() -> String {
 }
 
 #[test]
-fn runtime_v1_wire_fixture_is_rust_produced_and_in_sync() {
+fn runtime_v2_wire_fixture_is_rust_produced_and_in_sync() {
     let expected = render_runtime_wire_fixture();
     let path = runtime_fixture_path();
     if std::env::var("UPDATE_WIRE_FIXTURES").as_deref() == Ok("1") {
         fs::create_dir_all(path.parent().expect("runtime fixture has parent directory"))
             .expect("create runtime fixture directory");
-        fs::write(&path, expected.as_bytes()).expect("write runtime v1 wire fixture");
+        fs::write(&path, expected.as_bytes()).expect("write runtime v2 wire fixture");
     }
     let committed = fs::read(&path).unwrap_or_else(|error| {
         panic!(
@@ -921,11 +1226,18 @@ fn runtime_v1_wire_fixture_is_rust_produced_and_in_sync() {
         expected.as_bytes(),
         "runtime fixture drifted; review Rust DTO changes and regenerate with UPDATE_WIRE_FIXTURES=1"
     );
+    for line in expected.lines() {
+        let case: serde_json::Value = serde_json::from_str(line).unwrap();
+        if case["wireType"] == "runtimeEnvelope" {
+            serde_json::from_value::<RuntimeEnvelope>(case["value"].clone())
+                .unwrap_or_else(|error| panic!("fixture {} failed decode: {error}", case["case"]));
+        }
+    }
 }
 
 #[test]
-fn runtime_protocol_version_is_one_and_independent() {
-    assert_eq!(RUNTIME_PROTOCOL_VERSION, 1);
+fn runtime_protocol_version_is_two_and_independent() {
+    assert_eq!(RUNTIME_PROTOCOL_VERSION, 2);
     // 与 local IPC PROTOCOL_VERSION=2 彼此独立、不联动。
     assert_eq!(agentdeck_protocol::PROTOCOL_VERSION, 2);
 }
@@ -934,7 +1246,7 @@ fn runtime_protocol_version_is_one_and_independent() {
 fn envelope_round_trips_a_request() {
     let env = envelope(RuntimeMessage::Request(sample_send_prompt()));
     let json = serde_json::to_value(&env).unwrap();
-    assert_eq!(json["version"], 1);
+    assert_eq!(json["version"], 2);
     assert_eq!(json["messageId"], "m1");
     // wire round-trip (composite DTOs embed non-PartialEq trunk types).
     let back: RuntimeEnvelope = serde_json::from_value(json.clone()).unwrap();
@@ -986,14 +1298,16 @@ fn stream_cursor_next_semantics() {
 
 #[test]
 fn runtime_request_covers_all_brief_variants() {
-    // brief Step 3: hello/catalog/subscribe/start/sendPrompt/resolveApproval/
-    // retryApproval/cancelQueued/cancelActive/queryReceipt/createPairInvite/listPendingPairings/
-    // confirmPairing/cancelPairing/revoke/trust-reset。
+    // brief Step 3 + P3.9-C0-A1: hello/describeAgents/catalog/subscribe/start/configure/
+    // updateMetadata/sendPrompt/resolveApproval/retryApproval/cancelQueued/cancelActive/
+    // queryReceipt/stageUpgrade/createPairInvite/listPendingPairings/confirmPairing/
+    // cancelPairing/revoke/trust-reset。
     let convo = ConversationId::new("c1");
     let variants = vec![
         RuntimeRequest::Hello(runtime::command::HelloParams {
             runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
         }),
+        RuntimeRequest::DescribeAgents,
         RuntimeRequest::Catalog(runtime::command::CatalogRequest { page_cursor: None }),
         RuntimeRequest::Subscribe {
             inner_cursor: RuntimeInnerCursor::Conversation {
@@ -1014,6 +1328,21 @@ fn runtime_request_covers_all_brief_variants() {
             cwd: PathBuf::from("/tmp/runtime-contract"),
             title: None,
         }),
+        RuntimeRequest::ConfigureConversation(ConfigureConversationRequest::new(
+            convo.clone(),
+            IdempotencyKey::new("configure-1"),
+            0,
+            sample_codex_configuration(),
+        )),
+        RuntimeRequest::UpdateConversationMetadata(
+            ConversationMetadataMutationRequest::new(
+                convo.clone(),
+                IdempotencyKey::new("metadata-1"),
+                0,
+                ConversationMetadataMutation::SetArchived { archived: true },
+            )
+            .unwrap(),
+        ),
         sample_send_prompt(),
         RuntimeRequest::ResolveApproval {
             conversation_id: convo.clone(),
@@ -1041,6 +1370,15 @@ fn runtime_request_covers_all_brief_variants() {
             conversation_id: convo.clone(),
             command_id: CommandId::new("cmd1"),
         }),
+        RuntimeRequest::StageUpgrade(
+            StageUpgradeRequest::new(
+                "0.3.0".into(),
+                ArtifactSha256::new("ab".repeat(32)).unwrap(),
+                IdempotencyKey::new("upgrade-1"),
+                LocalOnlyAdministration::LocalOnly,
+            )
+            .unwrap(),
+        ),
         RuntimeRequest::CreatePairInvite(runtime::command::CreatePairInviteRequest {
             display_name: "MacBook".into(),
             ttl_secs: 300,
@@ -1064,7 +1402,7 @@ fn runtime_request_covers_all_brief_variants() {
             scope: LocalOnlyAdministration::LocalOnly,
         },
     ];
-    assert_eq!(variants.len(), 18);
+    assert_eq!(variants.len(), 22);
     for v in variants {
         let json = serde_json::to_value(&v).unwrap();
         assert!(
@@ -1253,9 +1591,11 @@ fn command_receipt_has_accepted_replayed_failed() {
     let accepted = CommandReceipt::Accepted {
         command_id: CommandId::new("cmd1"),
         queue_position: 0,
+        configuration_revision: 1,
     };
     let replayed = CommandReceipt::Replayed {
         command_id: CommandId::new("cmd1"),
+        configuration_revision: 1,
     };
     let failed = CommandReceipt::Failed {
         failure: RuntimeFailure::new(failure::DAEMON_COMMAND_IDEMPOTENCY_CONFLICT, "conflict"),
@@ -1285,6 +1625,7 @@ fn command_status_receipt_preserves_exact_journal_state_and_turn() {
         let reply = RuntimeReply::CommandStatus(CommandStatusReceipt {
             conversation_id: ConversationId::new("conversation-status-1"),
             command_id: CommandId::new(format!("command-status-{index}")),
+            configuration_revision: 1,
             status,
             turn_id: turn_id.clone(),
         });
@@ -1305,17 +1646,16 @@ fn command_status_receipt_preserves_exact_journal_state_and_turn() {
 }
 
 #[test]
-fn conversation_start_receipt_returns_daemon_ids_and_replay_state() {
+fn conversation_start_receipt_returns_public_id_and_replay_state() {
     for replayed in [false, true] {
         let reply = RuntimeReply::ConversationStart(ConversationStartReceipt {
             conversation_id: ConversationId::new("conversation-started-1"),
-            adapter_state_key: AdapterStateKey::new("adapter-state-started-1"),
             replayed,
         });
         let json = serde_json::to_value(&reply).unwrap();
         assert_eq!(json["reply"], "conversationStart");
         assert_eq!(json["conversationId"], "conversation-started-1");
-        assert_eq!(json["adapterStateKey"], "adapter-state-started-1");
+        assert!(json.get("adapterStateKey").is_none());
         assert_eq!(json["replayed"], replayed);
         let decoded: RuntimeReply = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(serde_json::to_value(decoded).unwrap(), json);
@@ -1428,6 +1768,7 @@ fn snapshot_requires_capabilities_first() {
     let ok = ConversationSnapshot::new(
         convo.clone(),
         StreamCursor::At(0),
+        unconfigured_state(),
         vec![
             SnapshotItem::capabilities(sample_caps()),
             SnapshotItem::Item {
@@ -1447,6 +1788,7 @@ fn snapshot_requires_capabilities_first() {
     let missing = ConversationSnapshot::new(
         convo.clone(),
         StreamCursor::At(0),
+        unconfigured_state(),
         vec![SnapshotItem::Item {
             item_id: agentdeck_protocol::runtime::identity::ItemId::new("i1"),
             entity_id: EntityId::new("e1"),
@@ -1463,6 +1805,7 @@ fn snapshot_requires_capabilities_first() {
     let not_first = ConversationSnapshot::new(
         convo.clone(),
         StreamCursor::At(0),
+        unconfigured_state(),
         vec![
             SnapshotItem::Item {
                 item_id: agentdeck_protocol::runtime::identity::ItemId::new("i1"),
@@ -1485,6 +1828,7 @@ fn snapshot_requires_capabilities_first() {
     let dup = ConversationSnapshot::new(
         convo,
         StreamCursor::At(0),
+        unconfigured_state(),
         vec![
             SnapshotItem::capabilities(sample_caps()),
             SnapshotItem::capabilities(sample_caps()),
@@ -1499,6 +1843,10 @@ fn snapshot_deserialize_rejects_capabilities_not_first() {
     let bad = serde_json::json!({
         "conversationId": "c1",
         "baseEventCursor": { "at": 0 },
+        "configurationState": {
+            "configurationRevision": 0,
+            "configuration": null
+        },
         "items": [
             { "kind": "item", "itemId": "i1", "entityId": "e1", "commandId": null,
               "item": { "kind": "assistantMessage", "text": "hi", "meta": { "vendorExtensions": {} } } },
@@ -1513,6 +1861,41 @@ fn snapshot_deserialize_rejects_capabilities_not_first() {
         res.is_err(),
         "wire snapshot must also enforce capabilities-first"
     );
+}
+
+#[test]
+fn snapshot_rejects_configuration_and_capabilities_agent_mismatch() {
+    // 威胁场景：configuration 与 capabilities 指向不同 agent 时，client 会按
+    // 一家的策略渲染、daemon 却按另一家执行；构造、ingress、egress 都必须拒绝。
+    let state =
+        ConversationConfigurationState::new(1, Some(sample_claude_code_configuration())).unwrap();
+    let items = vec![SnapshotItem::capabilities(sample_caps())];
+    assert!(
+        ConversationSnapshot::new(
+            "conversation-agent-mismatch".into(),
+            StreamCursor::BeforeFirst,
+            state.clone(),
+            items.clone(),
+        )
+        .is_err()
+    );
+    let wire = serde_json::json!({
+        "conversationId": "conversation-agent-mismatch",
+        "baseEventCursor": "beforeFirst",
+        "configurationState": serde_json::to_value(&state).unwrap(),
+        "items": serde_json::to_value(&items).unwrap()
+    });
+    assert!(serde_json::from_value::<ConversationSnapshot>(wire).is_err());
+
+    let mut mutated = ConversationSnapshot::new(
+        "conversation-agent-mismatch".into(),
+        StreamCursor::BeforeFirst,
+        unconfigured_state(),
+        items,
+    )
+    .unwrap();
+    mutated.configuration_state = state;
+    assert!(serde_json::to_value(mutated).is_err());
 }
 
 #[test]
@@ -1602,6 +1985,7 @@ fn empty_snapshots_use_before_first_without_fabricating_zero() {
     let snapshot = ConversationSnapshot::new(
         ConversationId::new("conversation-empty"),
         StreamCursor::BeforeFirst,
+        unconfigured_state(),
         vec![SnapshotItem::capabilities(sample_caps())],
     )
     .unwrap();
@@ -1885,11 +2269,11 @@ fn runtime_envelope_rejects_wrong_version_on_ingress_and_egress() {
         },
     )));
     let mut wire = serde_json::to_value(&valid).unwrap();
-    wire["version"] = serde_json::json!(RUNTIME_PROTOCOL_VERSION + 1);
+    wire["version"] = serde_json::json!(1);
     assert!(serde_json::from_value::<RuntimeEnvelope>(wire).is_err());
 
     let invalid = RuntimeEnvelope {
-        version: RUNTIME_PROTOCOL_VERSION + 1,
+        version: 1,
         message_id: MessageId::new("message-wrong-version"),
         body: valid.body,
     };
@@ -2013,12 +2397,12 @@ fn json_uds_transfer_part_has_separate_limit_and_fits_full_frame() {
     assert_eq!(MAX_RUNTIME_JSON_FRAME_BYTES, 1024 * 1024);
     assert!(MAX_JSON_PART_BYTES < runtime::MAX_PART_BYTES);
     let part = vec![0xA5; MAX_JSON_PART_BYTES];
-    let transfer = TransferEnvelope::new(
+    let transfer = TransferEnvelope::new_json(
         TransferId::new("t".repeat(1024)),
-        63,
-        64,
+        MAX_JSON_TRANSFER_PARTS - 1,
+        MAX_JSON_TRANSFER_PARTS,
         Sha256::digest(&part).into(),
-        (runtime::MAX_TRANSFER_PARTS as u64) * (MAX_JSON_PART_BYTES as u64),
+        runtime::MAX_TRANSFER_BYTES,
         part,
     )
     .unwrap();
@@ -2068,6 +2452,28 @@ fn json_transfer_total_must_be_representable_by_json_parts() {
         transfer,
     );
     assert!(remote.encode().is_ok());
+}
+
+#[test]
+fn json_transfer_uses_a_transport_specific_count_to_cover_64mib() {
+    assert_eq!(MAX_JSON_TRANSFER_PARTS, 94);
+    let transfer = TransferEnvelope::new_json(
+        TransferId::new("transfer-json-full-ceiling"),
+        0,
+        MAX_JSON_TRANSFER_PARTS,
+        [0x6A; 32],
+        runtime::MAX_TRANSFER_BYTES,
+        vec![0x5A],
+    )
+    .expect("full transfer total is representable over JSON/UDS");
+    serde_json::to_vec(&transfer).expect("JSON serializer accepts the transport-specific count");
+
+    let compact = RuntimeTransferCarrierV1::new(
+        MessageId::new("message-compact-keeps-64"),
+        RuntimeTransferChannel::Reply,
+        transfer,
+    );
+    assert!(compact.encode().is_err());
 }
 
 #[test]

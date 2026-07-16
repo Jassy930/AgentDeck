@@ -1,13 +1,11 @@
-//! Runtime v1 命令回执（design §8.5 / §8.6 / §13.2）。
+//! Runtime v2 命令回执（design §8.5 / §8.6 / §13.2）。
 //!
 //! 业务成功只来自 daemon（RC-5）：Relay 的 `RouteAccepted` 永远不是 command success。
 //! - `sendPrompt → CommandReceipt::Accepted/Replayed/Failed`。
 //! - `resolveApproval → ApprovalReceipt::Claimed/Applied/AlreadyHandled(state)/DeliveryFailed/Expired`。
 
 use crate::runtime::failure::RuntimeFailure;
-use crate::runtime::identity::{
-    AdapterStateKey, ApprovalId, CommandId, ConversationId, GrantSerial, TurnId,
-};
+use crate::runtime::identity::{ApprovalId, CommandId, ConversationId, GrantSerial, TurnId};
 use crate::trunk::ActionDecisionKind;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -18,11 +16,25 @@ use serde::{Deserialize, Serialize};
 pub enum CommandReceipt {
     /// 首次接受：已在 command journal 事务提交后返回，含队列位置。
     Accepted {
+        #[serde(rename = "commandId")]
+        #[schemars(rename = "commandId")]
         command_id: CommandId,
+        #[serde(rename = "queuePosition")]
+        #[schemars(rename = "queuePosition")]
         queue_position: u32,
+        #[serde(rename = "configurationRevision")]
+        #[schemars(rename = "configurationRevision")]
+        configuration_revision: u64,
     },
     /// 同 idempotency key + 同 payload：重放原结果，不再次调用 adapter。
-    Replayed { command_id: CommandId },
+    Replayed {
+        #[serde(rename = "commandId")]
+        #[schemars(rename = "commandId")]
+        command_id: CommandId,
+        #[serde(rename = "configurationRevision")]
+        #[schemars(rename = "configurationRevision")]
+        configuration_revision: u64,
+    },
     /// 类型化业务失败（含 `daemon.command.idempotency_conflict` 等）。
     Failed { failure: RuntimeFailure },
 }
@@ -50,6 +62,7 @@ pub enum CommandStatus {
 pub struct CommandStatusReceipt {
     pub conversation_id: ConversationId,
     pub command_id: CommandId,
+    pub configuration_revision: u64,
     pub status: CommandStatus,
     /// `Accepted` 等尚未分配 turn 的状态为 `null`。
     pub turn_id: Option<TurnId>,
@@ -57,14 +70,13 @@ pub struct CommandStatusReceipt {
 
 /// 幂等创建 conversation 的精确回执。
 ///
-/// Start 只创建 catalog，不携带 prompt；daemon 返回稳定 `conversationId` 与中立
-/// `adapterStateKey`。相同 owner/conversation-scope key 重试时 `replayed=true`，
-/// 客户端随后使用独立 key 发送 `SendPrompt`。
+/// Start 只创建 catalog，不携带 prompt；daemon 只返回公共稳定 `conversationId`。
+/// daemon-private adapter handle 不得进入 wire。相同 owner/conversation-scope key
+/// 重试时 `replayed=true`，客户端随后使用独立 key 配置并发送 `SendPrompt`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConversationStartReceipt {
     pub conversation_id: ConversationId,
-    pub adapter_state_key: AdapterStateKey,
     pub replayed: bool,
 }
 

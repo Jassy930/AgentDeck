@@ -232,6 +232,7 @@ fn canonical_empty_payload(conversation_id: RuntimeId, kind: AgentKind) -> Vec<u
     let snapshot = ConversationSnapshot::new(
         ConversationId::new(conversation_id.to_canonical_string()),
         StreamCursor::BeforeFirst,
+        agentdeck_protocol::runtime::ConversationConfigurationState::new(0, None).unwrap(),
         vec![SnapshotItem::capabilities(capabilities(kind))],
     )
     .expect("valid empty conversation snapshot");
@@ -327,7 +328,6 @@ async fn build_source_loads_authenticated_descriptor_and_router_capabilities() {
     let store = open_store(&root).await;
     let input = conversation(0x21, AgentKind::ClaudeCode);
     let conversation_id = input.conversation_id;
-    let adapter_state_key = input.adapter_state_key;
     store
         .create_conversation(input)
         .await
@@ -346,7 +346,6 @@ async fn build_source_loads_authenticated_descriptor_and_router_capabilities() {
         panic!("empty conversation must require a build")
     };
     assert_eq!(build.conversation_id(), conversation_id);
-    assert_eq!(build.adapter_state_key(), adapter_state_key);
     assert_eq!(build.agent_kind(), AgentKind::ClaudeCode);
     assert_eq!(build.base_event_cursor(), StreamCursor::BeforeFirst);
     assert_eq!(

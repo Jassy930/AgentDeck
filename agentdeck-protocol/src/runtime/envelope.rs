@@ -1,4 +1,4 @@
-//! Runtime v1 顶层 envelope（design §8.2）。
+//! Runtime v2 顶层 envelope（design §8.2）。
 //!
 //! `RuntimeEnvelope` 是 UDS 与解密后远程链路的共同业务 wire。它把三类业务消息
 //! （请求/回复/流）统一封装；限制值（如单个 `RuntimeRequest` ≤ 1 MiB）在契约层
@@ -6,9 +6,11 @@
 
 use crate::runtime::catalog::{CatalogDelta, CatalogSnapshot};
 use crate::runtime::command::{HelloParams, RuntimeRequest};
+use crate::runtime::configuration::{AgentDescriptions, ConfigurationReceipt};
 use crate::runtime::event::RuntimeEvent;
 use crate::runtime::failure::RuntimeFailure;
 use crate::runtime::identity::{MessageId, PairingId};
+use crate::runtime::metadata::ConversationMetadataReceipt;
 use crate::runtime::receipt::{
     ApprovalReceipt, CancellationReceipt, CommandReceipt, CommandStatusReceipt,
     ConversationStartReceipt, RevocationReceipt,
@@ -17,6 +19,7 @@ use crate::runtime::sync::{
     BackfillChunk, ConversationSnapshot, RuntimeSyncComplete, SubscriptionReceipt,
 };
 use crate::runtime::transfer::TransferEnvelope;
+use crate::runtime::upgrade::StageUpgradeReceipt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -44,7 +47,7 @@ pub fn ensure_request_within_limit(encoded_len: usize) -> Result<(), RuntimeSize
     Ok(())
 }
 
-/// Runtime v1 顶层封装。
+/// Runtime v2 顶层封装。
 ///
 /// 未派生 `PartialEq`：`RuntimeMessage` 传递内嵌未派生 `PartialEq` 的中立 trunk 类型；
 /// 本 task 不改动 trunk，契约测试以 wire round-trip 覆盖。
@@ -152,6 +155,14 @@ pub enum RuntimeMessage {
 pub enum RuntimeReply {
     /// 版本/能力握手回执。
     Hello(HelloParams),
+    /// agent discovery 与默认 configuration。
+    Agents(AgentDescriptions),
+    /// ConfigureConversation CAS 回执。
+    Configuration(ConfigurationReceipt),
+    /// UpdateConversationMetadata CAS 回执。
+    ConversationMetadata(ConversationMetadataReceipt),
+    /// StageUpgrade 本机管理回执。
+    StageUpgrade(StageUpgradeReceipt),
     /// sendPrompt 有副作用命令回执。
     Command(CommandReceipt),
     /// queryReceipt 返回 command journal 的精确持久化状态。

@@ -5,13 +5,14 @@ use std::sync::{Arc, Mutex};
 
 use agentdeck_protocol::runtime::identity::ConversationId;
 use agentdeck_protocol::runtime::{
-    ConversationSnapshot, RuntimeEvent, RuntimeEventBody, SnapshotItem, StreamCursor,
+    ConversationConfigurationState, ConversationSnapshot, RuntimeEvent, RuntimeEventBody,
+    SnapshotItem, StreamCursor,
 };
 use agentdeck_protocol::{
     AgentItem, AgentItemMeta, AgentKind, SessionCapabilities, VendorCapabilities,
 };
 use serde::ser::SerializeSeq;
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 use tokio::sync::OwnedSemaphorePermit;
 
 use crate::runtime::AgentRouter;
@@ -598,9 +599,13 @@ impl ConversationSnapshotBudgetEstimator {
             estimate_snapshot_item_nested(item, &mut typed)?;
         }
 
+        let configuration_state = ConversationConfigurationState::new(0, None)
+            .map_err(|_| SnapshotMaterializationError::SchemaIncompatible)?;
+
         let view = BorrowedBuildSnapshot {
             conversation_id: &conversation_id,
             base_event_cursor: input.base_event_cursor(),
+            configuration_state: &configuration_state,
             items: BorrowedBuildItems {
                 capabilities,
                 items,
@@ -645,6 +650,7 @@ impl ConversationSnapshotBudgetEstimator {
 struct BorrowedBuildSnapshot<'a> {
     conversation_id: &'a str,
     base_event_cursor: StreamCursor,
+    configuration_state: &'a ConversationConfigurationState,
     items: BorrowedBuildItems<'a>,
 }
 
@@ -843,9 +849,12 @@ fn assemble_snapshot(
     let mut items = Vec::with_capacity(agent_items.len() + 1);
     items.push(SnapshotItem::capabilities(context.capabilities));
     items.extend(agent_items);
+    let configuration_state = ConversationConfigurationState::new(0, None)
+        .map_err(|_| SnapshotMaterializationError::SchemaIncompatible)?;
     let snapshot = ConversationSnapshot::new(
         ConversationId::new(context.conversation_id.to_canonical_string()),
         context.base_event_cursor,
+        configuration_state,
         items,
     )
     .map_err(|_| SnapshotMaterializationError::SchemaIncompatible)?;
@@ -861,13 +870,40 @@ fn assemble_snapshot(
 fn decode_ready_snapshot(
     payload: &[u8],
 ) -> Result<ConversationSnapshot, SnapshotMaterializationError> {
-    decode_ready_snapshot_with_capacity(payload, payload.len())
+    Ok(decode_ready_snapshot_with_capacity(payload, payload.len())?.snapshot)
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacyConversationSnapshotV4 {
+    conversation_id: ConversationId,
+    base_event_cursor: StreamCursor,
+    items: Vec<SnapshotItem>,
+}
+
+impl LegacyConversationSnapshotV4 {
+    fn into_current(self) -> Result<ConversationSnapshot, SnapshotMaterializationError> {
+        let configuration_state = ConversationConfigurationState::new(0, None)
+            .map_err(|_| SnapshotMaterializationError::SchemaIncompatible)?;
+        ConversationSnapshot::new(
+            self.conversation_id,
+            self.base_event_cursor,
+            configuration_state,
+            self.items,
+        )
+        .map_err(|_| SnapshotMaterializationError::SchemaIncompatible)
+    }
+}
+
+struct DecodedReadySnapshot {
+    snapshot: ConversationSnapshot,
+    legacy_v4: bool,
 }
 
 fn decode_ready_snapshot_with_capacity(
     payload: &[u8],
     raw_capacity: usize,
-) -> Result<ConversationSnapshot, SnapshotMaterializationError> {
+) -> Result<DecodedReadySnapshot, SnapshotMaterializationError> {
     if payload.len() > MAX_CONVERSATION_SNAPSHOT_BYTES {
         return Err(SnapshotMaterializationError::PayloadTooLarge);
     }
@@ -875,11 +911,23 @@ fn decode_ready_snapshot_with_capacity(
     if retained.total_retained_bytes() > SNAPSHOT_BUILD_MEMORY_BYTES {
         return Err(SnapshotMaterializationError::PayloadTooLarge);
     }
-    let snapshot = serde_json::from_slice::<ConversationSnapshot>(payload)
+    if let Ok(snapshot) = serde_json::from_slice::<ConversationSnapshot>(payload) {
+        let comparison = compare_canonical_snapshot(payload, &snapshot)?;
+        debug_assert_eq!(comparison.bytes_compared, payload.len());
+        return Ok(DecodedReadySnapshot {
+            snapshot,
+            legacy_v4: false,
+        });
+    }
+
+    let legacy = serde_json::from_slice::<LegacyConversationSnapshotV4>(payload)
         .map_err(|_| SnapshotMaterializationError::SchemaIncompatible)?;
-    let comparison = compare_canonical_snapshot(payload, &snapshot)?;
+    let comparison = compare_canonical_value(payload, &legacy)?;
     debug_assert_eq!(comparison.bytes_compared, payload.len());
-    Ok(snapshot)
+    Ok(DecodedReadySnapshot {
+        snapshot: legacy.into_current()?,
+        legacy_v4: true,
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1365,11 +1413,18 @@ fn compare_canonical_snapshot(
     expected: &[u8],
     snapshot: &ConversationSnapshot,
 ) -> Result<CanonicalComparison, SnapshotMaterializationError> {
+    compare_canonical_value(expected, snapshot)
+}
+
+fn compare_canonical_value<T: Serialize>(
+    expected: &[u8],
+    value: &T,
+) -> Result<CanonicalComparison, SnapshotMaterializationError> {
     let mut writer = CanonicalCompareWriter {
         expected,
         position: 0,
     };
-    serde_json::to_writer(&mut writer, snapshot)
+    serde_json::to_writer(&mut writer, value)
         .map_err(|_| SnapshotMaterializationError::SchemaIncompatible)?;
     if writer.position != expected.len() {
         return Err(SnapshotMaterializationError::SchemaIncompatible);
@@ -1435,6 +1490,7 @@ fn validate_unique_agent_item_ids(
 /// 让第二个 128 MiB snapshot read 绕过全池预算。
 pub struct MaterializedConversationSnapshot {
     stored: StoredConversationSnapshot,
+    wire_payload: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for MaterializedConversationSnapshot {
@@ -1444,7 +1500,7 @@ impl std::fmt::Debug for MaterializedConversationSnapshot {
             .field("conversation_id", &self.stored.conversation_id)
             .field("snapshot_id", &self.stored.snapshot_id)
             .field("item_count", &self.stored.item_count)
-            .field("canonical_payload_bytes", &self.stored.payload.len())
+            .field("canonical_payload_bytes", &self.canonical_payload().len())
             .finish()
     }
 }
@@ -1457,20 +1513,25 @@ impl MaterializedConversationSnapshot {
 
     #[must_use]
     pub fn canonical_payload(&self) -> &[u8] {
-        &self.stored.payload
+        self.wire_payload
+            .as_deref()
+            .unwrap_or(self.stored.payload.as_slice())
     }
 
-    /// 把 exact ready row 连同 read-pool memory lease 一起移交给 egress。
-    /// 调用方必须让整个 `StoredConversationSnapshot` 活到 transport flush 完成，
-    /// 不能只取出 payload 后提前释放 lease。
-    pub(crate) fn into_stored(self) -> StoredConversationSnapshot {
-        self.stored
+    /// 把 authenticated ready row、可选 legacy→v2 wire 产物与 read-pool lease
+    /// 一起移交给 egress。三者都必须活到 transport flush 完成。
+    pub(crate) fn into_parts(self) -> (StoredConversationSnapshot, Option<Vec<u8>>) {
+        (self.stored, self.wire_payload)
     }
 
     #[cfg(test)]
     fn retained_memory_observation(&self) -> SnapshotHandoffRetentionObservation {
         SnapshotHandoffRetentionObservation {
-            raw_payload_bytes: self.stored.payload.capacity(),
+            raw_payload_bytes: self
+                .stored
+                .payload
+                .capacity()
+                .saturating_add(self.wire_payload.as_ref().map_or(0, Vec::capacity)),
             small_metadata_bytes: std::mem::size_of::<Self>(),
             decoded_dto_bytes: 0,
             has_memory_lease: self.stored.memory_lease.is_some(),
@@ -1511,7 +1572,6 @@ pub struct SnapshotBuildInput {
     pin: Option<RuntimeSnapshotBuildPin>,
     cleanup: Option<SnapshotBuildPinCleanup>,
     conversation_id: RuntimeId,
-    adapter_state_key: RuntimeId,
     agent_kind: AgentKind,
     base_event_cursor: StreamCursor,
     capabilities: Option<SessionCapabilities>,
@@ -1522,7 +1582,6 @@ impl std::fmt::Debug for SnapshotBuildInput {
         formatter
             .debug_struct("SnapshotBuildInput")
             .field("conversation_id", &self.conversation_id)
-            .field("adapter_state_key", &self.adapter_state_key)
             .field("agent_kind", &self.agent_kind)
             .field("base_event_cursor", &self.base_event_cursor)
             .finish_non_exhaustive()
@@ -1533,11 +1592,6 @@ impl SnapshotBuildInput {
     #[must_use]
     pub const fn conversation_id(&self) -> RuntimeId {
         self.conversation_id
-    }
-
-    #[must_use]
-    pub const fn adapter_state_key(&self) -> RuntimeId {
-        self.adapter_state_key
     }
 
     #[must_use]
@@ -1701,17 +1755,29 @@ impl SnapshotMaterializer {
             .await
             .map_err(map_ready_store_error)?;
         let validation_reference = reference.clone();
-        let stored = self
+        let mut stored = self
             .store
             .load_conversation_snapshot_by_reference(reference)
             .await
             .map_err(map_ready_store_error)?;
-        let snapshot =
+        let decoded =
             decode_ready_snapshot_with_capacity(&stored.payload, stored.payload.capacity())?;
-        validate_ready_snapshot(&context, &validation_reference, &snapshot)?;
-        drop(snapshot);
+        validate_ready_snapshot(&context, &validation_reference, &decoded.snapshot)?;
+        let wire_payload = if decoded.legacy_v4 {
+            // 威胁场景：升级后若把已认证的 v1 JSON 原样交给 v2 client，缺失的
+            // configurationState 会让 client 拒绝或误用默认策略。先释放旧 raw
+            // allocation，再按现有 64/128 MiB 门禁生成唯一的 v2 wire；DB 不改写。
+            drop(std::mem::take(&mut stored.payload));
+            Some(serialize_build_snapshot(&decoded.snapshot, None)?)
+        } else {
+            None
+        };
+        drop(decoded.snapshot);
         Ok(SnapshotMaterialization::Ready(
-            MaterializedConversationSnapshot { stored },
+            MaterializedConversationSnapshot {
+                stored,
+                wire_payload,
+            },
         ))
     }
 
@@ -1758,7 +1824,6 @@ impl SnapshotMaterializer {
 
         Ok(SnapshotMaterialization::Build(SnapshotBuildInput {
             conversation_id: context.conversation_id,
-            adapter_state_key: context.adapter_state_key,
             agent_kind: context.agent_kind,
             base_event_cursor: StreamCursor::from_high_water(pin.base_event_seq()),
             capabilities: Some(capabilities),

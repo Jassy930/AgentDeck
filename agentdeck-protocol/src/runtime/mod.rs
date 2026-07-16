@@ -1,4 +1,4 @@
-//! RuntimeEnvelope v1 —— UDS 与解密后远程链路的共同**中立业务 wire**（design §8.2）。
+//! RuntimeEnvelope v2 —— UDS 与解密后远程链路的共同**中立业务 wire**（design §8.2）。
 //!
 //! 本模块与 local IPC（`PROTOCOL_VERSION = 2`，见 crate 根）及 Relay v2
 //! 彼此独立、版本轴不联动：`RUNTIME_PROTOCOL_VERSION` 与
@@ -28,7 +28,7 @@ pub mod upgrade;
 
 /// Runtime 契约产物版本；独立于 local IPC `PROTOCOL_VERSION` 与 Relay
 /// `RELAY_PROTOCOL_VERSION`。改动 Runtime wire 形态时手动 +1 并重生成快照。
-pub const RUNTIME_PROTOCOL_VERSION: u16 = 1;
+pub const RUNTIME_PROTOCOL_VERSION: u16 = 2;
 
 pub use catalog::{CatalogChange, CatalogDelta, CatalogError, CatalogSnapshot, ConversationEntry};
 pub use command::{
@@ -64,9 +64,10 @@ pub use sync::{
     SnapshotItem, StreamCursor, StreamCursorError, SubscriptionReceipt,
 };
 pub use transfer::{
-    MAX_ACTIVE_TRANSFERS, MAX_COMPLETED_TRANSFER_TOMBSTONES, MAX_JSON_PART_BYTES, MAX_PART_BYTES,
-    MAX_REASSEMBLY_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_CARRIER_BYTES, MAX_TRANSFER_PARTS,
-    RuntimeTransferCarrierError, RuntimeTransferCarrierV1, RuntimeTransferChannel, TRANSFER_TTL_MS,
-    TransferEnvelope, TransferError, TransferProgress, TransferReassembler,
+    MAX_ACTIVE_TRANSFERS, MAX_COMPLETED_TRANSFER_TOMBSTONES, MAX_JSON_PART_BYTES,
+    MAX_JSON_TRANSFER_PARTS, MAX_PART_BYTES, MAX_REASSEMBLY_BYTES, MAX_TRANSFER_BYTES,
+    MAX_TRANSFER_CARRIER_BYTES, MAX_TRANSFER_PARTS, RuntimeTransferCarrierError,
+    RuntimeTransferCarrierV1, RuntimeTransferChannel, TRANSFER_TTL_MS, TransferEnvelope,
+    TransferError, TransferProgress, TransferReassembler,
 };
 pub use upgrade::{ArtifactSha256, StageUpgradeReceipt, StageUpgradeRequest, UpgradeContractError};

@@ -14,7 +14,7 @@ use super::events::{
 };
 use super::model::{RuntimeClock, RuntimeClockError, SystemRuntimeClock};
 use super::store::{
-    CatalogBaselineV1, ReadySnapshotReference, RuntimeStoreError, RuntimeStoreHandle,
+    ReadySnapshotReference, RuntimeStoreError, RuntimeStoreHandle,
     catalog_materialization_peak_bound,
 };
 
@@ -359,7 +359,7 @@ impl CatalogSnapshotProvider {
             .load_catalog_snapshot_by_reference(reference.clone())
             .await?;
         validate_stored(&stored, &reference)?;
-        let baseline: CatalogBaselineV1 = serde_json::from_slice(&stored.payload)
+        let baseline = crate::runtime::store::decode_catalog_baseline(&stored.payload)
             .map_err(|_| CatalogSnapshotProviderError::InvalidCursor)?;
         if baseline.version != 1
             || baseline.base_catalog_cursor != reference.base

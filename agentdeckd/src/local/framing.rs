@@ -1,4 +1,4 @@
-//! local Runtime v1 JSONL framing 与首帧判定。
+//! local Runtime v2 JSONL framing 与首帧判定。
 //!
 //! 威胁场景：未认证客户端可发送超长、重复字段或版本不兼容的 JSON，诱发无界内存、
 //! 请求歧义，或让 daemon 在无法解释消息体时静默断线；本层先做有界读取与严格顶层
@@ -166,7 +166,7 @@ pub(crate) fn probe_runtime_header(
 /// local reader 对一条 Runtime frame 的无歧义处理决策。
 #[derive(Debug)]
 pub(crate) enum RuntimeFrameDecision {
-    /// 完整 Runtime v1 envelope，可交给 Core。
+    /// 完整 Runtime v2 envelope，可交给 Core。
     Accept(RuntimeEnvelope),
     /// 写出类型化回复、flush 后关闭当前连接。
     ReplyThenClose(RuntimeEnvelope),
@@ -174,7 +174,7 @@ pub(crate) enum RuntimeFrameDecision {
     Close,
 }
 
-/// 顶层探测后完整解码 Runtime v1；错误版本返回同 messageId 的类型化失败。
+/// 顶层探测后完整解码 Runtime v2；错误版本返回同 messageId 的类型化失败。
 pub(crate) fn decode_runtime_frame(frame: &[u8]) -> RuntimeFrameDecision {
     if frame.len() >= MAX_RUNTIME_JSON_FRAME_BYTES {
         return RuntimeFrameDecision::Close;
@@ -464,10 +464,7 @@ mod tests {
 
     #[test]
     fn wrong_runtime_version_returns_same_message_id_protocol_mismatch() {
-        let decision = decode_runtime_frame(&hello_frame(
-            RUNTIME_PROTOCOL_VERSION + 1,
-            "wrong-version-message",
-        ));
+        let decision = decode_runtime_frame(&hello_frame(1, "wrong-version-message"));
 
         assert_eq!(
             failure_code(decision),
@@ -482,11 +479,11 @@ mod tests {
     #[test]
     fn malformed_duplicate_or_unknown_top_level_has_no_reply() {
         let invalid_frames = [
-            br#"{"version":1,"messageId":"m","body":{}"#.as_slice(),
-            br#"{"version":1,"version":1,"messageId":"m","body":{}}"#.as_slice(),
-            br#"{"version":1,"messageId":"m","messageId":"m2","body":{}}"#.as_slice(),
-            br#"{"version":1,"messageId":"m","body":{},"body":{}}"#.as_slice(),
-            br#"{"version":1,"messageId":"m","body":{},"extra":true}"#.as_slice(),
+            br#"{"version":2,"messageId":"m","body":{}"#.as_slice(),
+            br#"{"version":2,"version":2,"messageId":"m","body":{}}"#.as_slice(),
+            br#"{"version":2,"messageId":"m","messageId":"m2","body":{}}"#.as_slice(),
+            br#"{"version":2,"messageId":"m","body":{},"body":{}}"#.as_slice(),
+            br#"{"version":2,"messageId":"m","body":{},"extra":true}"#.as_slice(),
         ];
 
         for frame in invalid_frames {
@@ -498,11 +495,11 @@ mod tests {
     }
 
     #[test]
-    fn runtime_v1_performs_full_typed_envelope_decode() {
+    fn runtime_v2_performs_full_typed_envelope_decode() {
         let decision = decode_runtime_frame(&hello_frame(RUNTIME_PROTOCOL_VERSION, "hello-1"));
 
         let RuntimeFrameDecision::Accept(envelope) = decision else {
-            panic!("valid v1 envelope must be accepted");
+            panic!("valid v2 envelope must be accepted");
         };
         assert!(matches!(
             envelope.body,
@@ -512,7 +509,7 @@ mod tests {
         ));
 
         let invalid_typed_body =
-            br#"{"version":1,"messageId":"bad-body","body":{"futureShape":true}}"#;
+            br#"{"version":2,"messageId":"bad-body","body":{"futureShape":true}}"#;
         assert!(matches!(
             decode_runtime_frame(invalid_typed_body),
             RuntimeFrameDecision::Close
@@ -553,7 +550,7 @@ mod tests {
                 "message": "request",
                 "payload": {
                     "request": "hello",
-                    "runtimeProtocolVersion": RUNTIME_PROTOCOL_VERSION + 1,
+                    "runtimeProtocolVersion": 1,
                 },
             },
         }))
@@ -567,7 +564,7 @@ mod tests {
             envelope.body,
             RuntimeMessage::Request(RuntimeRequest::Hello(HelloParams {
                 runtime_protocol_version
-            })) if runtime_protocol_version == RUNTIME_PROTOCOL_VERSION + 1
+            })) if runtime_protocol_version == 1
         ));
     }
 

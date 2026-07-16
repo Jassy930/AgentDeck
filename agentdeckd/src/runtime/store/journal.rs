@@ -4052,7 +4052,6 @@ pub(super) fn load_authenticated_conversation_snapshot_context(
     let conversation = load_conversation(connection, key_bundle, database_id, conversation_id)?;
     Ok(super::AuthenticatedConversationSnapshotContext {
         conversation_id: conversation.conversation_id,
-        adapter_state_key: conversation.adapter_state_key,
         agent_kind: conversation.descriptor.agent_kind,
         event_high_water: conversation.event_high_water,
     })

@@ -38,6 +38,7 @@ pub(super) enum SnapshotReducerError {
 pub(super) struct ReducedConversationSnapshot {
     snapshot: ConversationSnapshot,
     stored: StoredConversationSnapshot,
+    wire_payload: Option<Vec<u8>>,
     memory_permit: SharedSnapshotBuildPermit,
 }
 
@@ -47,9 +48,15 @@ impl ReducedConversationSnapshot {
     ) -> (
         ConversationSnapshot,
         StoredConversationSnapshot,
+        Option<Vec<u8>>,
         SharedSnapshotBuildPermit,
     ) {
-        (self.snapshot, self.stored, self.memory_permit)
+        (
+            self.snapshot,
+            self.stored,
+            self.wire_payload,
+            self.memory_permit,
+        )
     }
 }
 
@@ -78,12 +85,14 @@ pub(super) async fn materialize(
     let materializer = SnapshotMaterializer::new(store.clone(), router);
     match materializer.materialize(source).await? {
         SnapshotMaterialization::Ready(snapshot) => {
-            let stored = snapshot.into_stored();
-            let decoded = serde_json::from_slice(&stored.payload)
+            let (stored, wire_payload) = snapshot.into_parts();
+            let canonical_payload = wire_payload.as_deref().unwrap_or(stored.payload.as_slice());
+            let decoded = serde_json::from_slice(canonical_payload)
                 .map_err(|_| SnapshotReducerError::Decode)?;
             Ok(ReducedConversationSnapshot {
                 snapshot: decoded,
                 stored,
+                wire_payload,
                 memory_permit: memory.into_permit()?,
             })
         }
@@ -107,6 +116,7 @@ pub(super) async fn materialize(
             Ok(ReducedConversationSnapshot {
                 snapshot: decoded,
                 stored,
+                wire_payload: None,
                 memory_permit,
             })
         }

@@ -1,10 +1,10 @@
-//! Runtime v1 会话目录（design §8.1 / §9.1 / §9.5）。
+//! Runtime v2 会话目录（design §8.1 / §9.1 / §9.5）。
 //!
-//! common catalog 只保存中立 `adapter_state_key` handle；vendor resume reference
-//! 只存在于各 adapter 私有 namespace，**永不进入 catalog bytes 或客户端 wire**。
+//! daemon-private adapter handle 与 vendor resume reference 只存在于各 adapter 私有
+//! namespace，**永不进入 catalog bytes 或客户端 wire**。
 //! `catalog_revision` 是独立于 `event_seq` 的 canonical revision。
 
-use crate::runtime::identity::{AdapterStateKey, CatalogPageCursor, ConversationId};
+use crate::runtime::identity::{CatalogPageCursor, ConversationId};
 use crate::runtime::sync::StreamCursor;
 use crate::trunk::AgentKind;
 use schemars::JsonSchema;
@@ -30,7 +30,6 @@ pub enum CatalogError {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConversationEntry {
     pub conversation_id: ConversationId,
-    pub adapter_state_key: AdapterStateKey,
     pub agent_kind: AgentKind,
     #[serde(default)]
     pub title: Option<String>,
@@ -39,6 +38,7 @@ pub struct ConversationEntry {
     /// epoch 毫秒，仅用于排序。
     pub last_active_ms: u64,
     pub archived: bool,
+    pub entry_revision: u64,
 }
 
 /// 分页 catalog snapshot；构造时校验每页 ≤ 500 rows。

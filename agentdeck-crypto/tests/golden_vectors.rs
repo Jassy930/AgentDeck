@@ -34,6 +34,7 @@ use agentdeck_protocol::relay_v2::id::{
     DeviceRouteId, GrantSerial, KeyDirectoryRevision, MachineRouteId, PairRouteId, RelayServerId,
     RootKeyId, StreamGenerationId, StreamRouteId, TrustEpoch,
 };
+use agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION;
 use serde_json::json;
 
 // —— 固定 seed 确定性 RNG（仅测试；非安全，只为 HPKE Base byte-for-byte KAT）——
@@ -134,7 +135,7 @@ fn tbs_sample() -> ToBeSignedV1 {
         object_type: SignedObjectType::RelayGrant,
         signature_format_version: 1,
         relay_protocol_version: 2,
-        runtime_protocol_version: 1,
+        runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
         e2ee_format_version: 1,
         relay_server_id: rs(),
         machine_route: mr(),
@@ -193,7 +194,7 @@ fn receiving_key() -> AeadReceivingKey {
 fn pair_request_info() -> PairRequestInfoV1 {
     PairRequestInfoV1 {
         e2ee_format_version: 1,
-        runtime_protocol_version: 1,
+        runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
         relay_server_id: rs(),
         pair_route: pr(),
         invite_hash: [0x01; 32],
@@ -204,7 +205,7 @@ fn pair_request_info() -> PairRequestInfoV1 {
 fn pair_response_info() -> PairResponseInfoV1 {
     PairResponseInfoV1 {
         e2ee_format_version: 1,
-        runtime_protocol_version: 1,
+        runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
         relay_server_id: rs(),
         pair_route: pr(),
         invite_hash: [0x01; 32],
@@ -219,7 +220,7 @@ fn pair_response_info() -> PairResponseInfoV1 {
 fn key_update_info() -> KeyUpdateInfoV1 {
     KeyUpdateInfoV1 {
         e2ee_format_version: 1,
-        runtime_protocol_version: 1,
+        runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
         machine_route: mr(),
         device_route: dr(),
         grant_serial: GrantSerial::new(9),

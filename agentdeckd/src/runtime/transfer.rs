@@ -7,9 +7,9 @@ use agentdeck_protocol::SessionCapabilities;
 use agentdeck_protocol::runtime::identity::{ConversationId, StreamGeneration, TransferId};
 use agentdeck_protocol::runtime::{
     BackfillChunk, BackfillRange, MAX_ACTIVE_TRANSFERS, MAX_COMPLETED_TRANSFER_TOMBSTONES,
-    MAX_JSON_PART_BYTES, MAX_PART_BYTES, MAX_REASSEMBLY_BYTES, MAX_TRANSFER_BYTES,
-    MAX_TRANSFER_PARTS, RuntimeTransferChannel, StreamCursor, TRANSFER_TTL_MS, TransferEnvelope,
-    TransferError,
+    MAX_JSON_PART_BYTES, MAX_JSON_TRANSFER_PARTS, MAX_PART_BYTES, MAX_REASSEMBLY_BYTES,
+    MAX_TRANSFER_BYTES, MAX_TRANSFER_PARTS, RuntimeTransferChannel, StreamCursor, TRANSFER_TTL_MS,
+    TransferEnvelope, TransferError,
 };
 use sha2::{Digest, Sha256};
 
@@ -29,6 +29,20 @@ impl TransferCarrierProfile {
         match self {
             Self::JsonUds => MAX_JSON_PART_BYTES,
             Self::RemoteCompact => MAX_PART_BYTES,
+        }
+    }
+
+    pub const fn max_part_count(self) -> u32 {
+        match self {
+            Self::JsonUds => MAX_JSON_TRANSFER_PARTS,
+            Self::RemoteCompact => MAX_TRANSFER_PARTS,
+        }
+    }
+
+    fn validate_envelope(self, envelope: &TransferEnvelope) -> Result<(), TransferError> {
+        match self {
+            Self::JsonUds => envelope.validate_json_part(),
+            Self::RemoteCompact => envelope.validate(),
         }
     }
 }
@@ -407,9 +421,10 @@ impl<R: TransferReducer> TransferStateMachine<R> {
         self.observe_now(now_ms)?;
         let transfer_id = envelope.transfer_id.clone();
         self.require_current_generation(connection_id, &binding)?;
-        let wire_validation = envelope.validate().and_then(|()| {
+        let carrier_profile = binding.carrier_profile();
+        let wire_validation = carrier_profile.validate_envelope(&envelope).and_then(|()| {
             validate_declared_transfer(
-                binding.carrier_profile(),
+                carrier_profile,
                 envelope.part_count,
                 envelope.total_bytes,
                 envelope.part.len() as u64,
@@ -837,7 +852,7 @@ pub fn validate_declared_transfer(
         .checked_mul(carrier_profile.max_part_bytes() as u64)
         .ok_or(TransferError::TooLarge)?;
     if part_count == 0
-        || part_count > MAX_TRANSFER_PARTS
+        || part_count > carrier_profile.max_part_count()
         || total_bytes > MAX_TRANSFER_BYTES
         || total_bytes > representable
         || part_bytes > carrier_profile.max_part_bytes() as u64

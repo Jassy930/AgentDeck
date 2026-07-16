@@ -8,10 +8,17 @@ use agentdeck_protocol::runtime::identity::{
     ApprovalId, ConversationId, EventId, IdempotencyKey, MessageId,
 };
 use agentdeck_protocol::runtime::{
-    ConversationStart, MAX_RUNTIME_JSON_FRAME_BYTES, PromptPayload, QueryReceiptSelector,
+    ArtifactSha256, CodexConversationConfiguration, ConfigurationReceipt,
+    ConfigureConversationRequest, ConversationConfiguration, ConversationMetadataMutation,
+    ConversationMetadataMutationRequest, ConversationMetadataReceipt, ConversationStart,
+    LocalOnlyAdministration, MAX_RUNTIME_JSON_FRAME_BYTES, PromptPayload, QueryReceiptSelector,
     RuntimeEvent, RuntimeEventBody, RuntimeMessage, RuntimeStreamItem, SendPromptRequest,
+    StageUpgradeReceipt, StageUpgradeRequest, VendorConfigurationSnapshot,
 };
-use agentdeck_protocol::{ActionDecision, ActionDecisionKind, AgentKind};
+use agentdeck_protocol::{
+    ActionDecision, ActionDecisionKind, AgentKind, CodexApprovalPolicy, CodexReasoningEffort,
+    CodexSandboxMode,
+};
 use tokio::sync::mpsc;
 
 use super::*;
@@ -117,7 +124,10 @@ impl Drop for TestRoot {
 async fn core(root: &TestRoot) -> Arc<RuntimeCore> {
     let store = root.open_store().await;
     let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
-    Arc::new(RuntimeCore::new(store, router, [0xA1; 32]).expect("construct RuntimeCore"))
+    Arc::new(
+        RuntimeCore::new_with_unconfigured_prompts_for_test(store, router, [0xA1; 32])
+            .expect("construct RuntimeCore test fixture"),
+    )
 }
 
 fn start_request(key: &str) -> RuntimeRequest {
@@ -261,6 +271,155 @@ async fn direct_hello_remains_available_while_core_is_cold() {
 }
 
 #[tokio::test]
+async fn runtime_v2_new_families_fail_closed_until_configuration_store_lands() {
+    let root = TestRoot::new("v2-transitional");
+    let store = root.open_store().await;
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let core =
+        Arc::new(RuntimeCore::new_production(store, router).expect("construct production v2 core"));
+    core.recover().await.expect("recover v2 transitional core");
+    let connection = connect_local(&core, 0x72).await;
+    let conversation = start_receipt(
+        core.handle(connection, start_request("v2-transitional-start"))
+            .await,
+    );
+    let configuration = ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
+        CodexConversationConfiguration::new(
+            CodexApprovalPolicy::OnRequest,
+            CodexSandboxMode::WorkspaceWrite,
+            CodexReasoningEffort::High,
+        ),
+    ));
+
+    let describe = core
+        .handle(connection, RuntimeRequest::DescribeAgents)
+        .await;
+    assert!(matches!(
+        describe,
+        RuntimeReply::Failure(RuntimeFailure { code, .. })
+            if code == DAEMON_RUNTIME_FEATURE_UNAVAILABLE
+    ));
+    let configure = core
+        .handle(
+            connection,
+            RuntimeRequest::ConfigureConversation(ConfigureConversationRequest::new(
+                conversation.conversation_id.clone(),
+                IdempotencyKey::new("v2-configure"),
+                0,
+                configuration,
+            )),
+        )
+        .await;
+    assert!(matches!(
+        configure,
+        RuntimeReply::Configuration(ConfigurationReceipt::Failed {
+            failure: RuntimeFailure { code, .. }
+        }) if code == DAEMON_RUNTIME_FEATURE_UNAVAILABLE
+    ));
+    let metadata = core
+        .handle(
+            connection,
+            RuntimeRequest::UpdateConversationMetadata(
+                ConversationMetadataMutationRequest::new(
+                    conversation.conversation_id.clone(),
+                    IdempotencyKey::new("v2-metadata"),
+                    0,
+                    ConversationMetadataMutation::SetArchived { archived: true },
+                )
+                .unwrap(),
+            ),
+        )
+        .await;
+    assert!(matches!(
+        metadata,
+        RuntimeReply::ConversationMetadata(ConversationMetadataReceipt::Failed {
+            failure: RuntimeFailure { code, .. }
+        }) if code == DAEMON_RUNTIME_FEATURE_UNAVAILABLE
+    ));
+    for expected_configuration_revision in [0, 1] {
+        let prompt = core
+            .handle(
+                connection,
+                RuntimeRequest::SendPrompt(SendPromptRequest {
+                    conversation_id: conversation.conversation_id.clone(),
+                    idempotency_key: IdempotencyKey::new(format!(
+                        "v2-prompt-{expected_configuration_revision}"
+                    )),
+                    expected_configuration_revision,
+                    prompt: PromptPayload::new("must not enter the legacy driver").unwrap(),
+                }),
+            )
+            .await;
+        assert!(matches!(
+            prompt,
+            RuntimeReply::Command(CommandReceipt::Failed {
+                failure: RuntimeFailure { code, .. }
+            }) if code == DAEMON_RUNTIME_FEATURE_UNAVAILABLE
+        ));
+    }
+    let stage = core
+        .handle(
+            connection,
+            RuntimeRequest::StageUpgrade(
+                StageUpgradeRequest::new(
+                    "1.2.3".into(),
+                    ArtifactSha256::new("ab".repeat(32)).unwrap(),
+                    IdempotencyKey::new("v2-stage"),
+                    LocalOnlyAdministration::LocalOnly,
+                )
+                .unwrap(),
+            ),
+        )
+        .await;
+    assert!(matches!(
+        stage,
+        RuntimeReply::StageUpgrade(StageUpgradeReceipt::Failed {
+            failure: RuntimeFailure { code, .. }
+        }) if code == DAEMON_RUNTIME_FEATURE_UNAVAILABLE
+    ));
+    core.shutdown()
+        .await
+        .expect("shutdown v2 transitional core");
+}
+
+#[tokio::test]
+async fn side_effect_free_public_constructor_rejects_unconfigured_prompt() {
+    let root = TestRoot::new("v2-public-constructor");
+    let store = root.open_store().await;
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let core = Arc::new(
+        RuntimeCore::new(store, router, [0xA2; 32])
+            .expect("construct side-effect-free public core"),
+    );
+    core.recover().await.expect("recover public core");
+    let connection = connect_local(&core, 0x73).await;
+    let conversation = start_receipt(
+        core.handle(connection, start_request("v2-public-constructor-start"))
+            .await,
+    );
+
+    let reply = core
+        .handle(
+            connection,
+            RuntimeRequest::SendPrompt(SendPromptRequest {
+                conversation_id: conversation.conversation_id,
+                idempotency_key: IdempotencyKey::new("v2-public-constructor-prompt"),
+                expected_configuration_revision: 0,
+                prompt: PromptPayload::new("must stay fail-closed").unwrap(),
+            }),
+        )
+        .await;
+    assert!(matches!(
+        reply,
+        RuntimeReply::Command(CommandReceipt::Failed {
+            failure: RuntimeFailure { code, .. }
+        }) if code == DAEMON_RUNTIME_FEATURE_UNAVAILABLE
+    ));
+
+    core.shutdown().await.expect("shutdown public core");
+}
+
+#[tokio::test]
 async fn principal_without_approval_permission_cannot_claim() {
     let root = TestRoot::new("approval-permission-denied");
     let core = core(&root).await;
@@ -365,7 +524,6 @@ async fn start_is_pure_durable_idempotent_then_prompt_and_query_are_separate() {
     let replayed = start_receipt(core.handle(connection, start_request("stable-start")).await);
     assert!(replayed.replayed);
     assert_eq!(created.conversation_id, replayed.conversation_id);
-    assert_eq!(created.adapter_state_key, replayed.adapter_state_key);
     assert_eq!(core.actor_count().await, 1);
 
     let invalid_prompt = core
@@ -374,6 +532,7 @@ async fn start_is_pure_durable_idempotent_then_prompt_and_query_are_separate() {
             RuntimeRequest::SendPrompt(SendPromptRequest {
                 conversation_id: created.conversation_id.clone(),
                 idempotency_key: IdempotencyKey::new(""),
+                expected_configuration_revision: 0,
                 prompt: PromptPayload::new("must be rejected before actor admission")
                     .expect("prompt"),
             }),
@@ -394,6 +553,7 @@ async fn start_is_pure_durable_idempotent_then_prompt_and_query_are_separate() {
                         .expect("synthetic missing conversation"),
                 ),
                 idempotency_key: IdempotencyKey::new("missing-conversation"),
+                expected_configuration_revision: 0,
                 prompt: PromptPayload::new("must stay in command receipt family").expect("prompt"),
             }),
         )
@@ -443,6 +603,7 @@ async fn start_is_pure_durable_idempotent_then_prompt_and_query_are_separate() {
             RuntimeRequest::SendPrompt(SendPromptRequest {
                 conversation_id: created.conversation_id.clone(),
                 idempotency_key: prompt_key.clone(),
+                expected_configuration_revision: 0,
                 prompt,
             }),
         )
@@ -527,6 +688,7 @@ async fn accepted_queue_is_recovered_paged_and_remains_unstarted_without_real_ga
             RuntimeRequest::SendPrompt(SendPromptRequest {
                 conversation_id: conversation.conversation_id.clone(),
                 idempotency_key: IdempotencyKey::new("restart-prompt"),
+                expected_configuration_revision: 0,
                 prompt: PromptPayload::new("survive restart").expect("prompt"),
             }),
         )
@@ -554,10 +716,6 @@ async fn accepted_queue_is_recovered_paged_and_remains_unstarted_without_real_ga
     );
     assert!(replayed_start.replayed);
     assert_eq!(replayed_start.conversation_id, conversation.conversation_id);
-    assert_eq!(
-        replayed_start.adapter_state_key,
-        conversation.adapter_state_key
-    );
     let status = second_core
         .handle(
             second_connection,
@@ -914,7 +1072,7 @@ async fn envelope_ingress_returns_typed_failures_for_wrong_version_and_non_reque
         (
             "wrong-version",
             RuntimeEnvelope {
-                version: RUNTIME_PROTOCOL_VERSION + 1,
+                version: 1,
                 message_id: MessageId::new("wrong-version"),
                 body: RuntimeMessage::Request(RuntimeRequest::Hello(HelloParams {
                     runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,

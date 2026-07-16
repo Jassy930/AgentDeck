@@ -1,17 +1,18 @@
 //! P1.1 TransferEnvelope 契约 + 纯重组器状态机（design §9.5）。
 //!
 //! `TransferEnvelope { transferId, partIndex, partCount, totalSha256, totalBytes, part }`
-//! - part ≤ 3.5 MiB，单 transfer ≤ 64 parts / 64 MiB，TTL 5 分钟。
+//! - compact part ≤ 3.5 MiB / 64 parts；JSON/UDS ≤ 700 KiB / 94 parts；
+//!   两者单 transfer 都 ≤ 64 MiB，TTL 5 分钟。
 //! - 首 part 后 partCount/totalBytes/hash 不可变。
 //! - 每 connection 重组 ≤ 128 MiB；重复 index 不同内容 / hash 不符 / 超时 → typed error。
 //!
 //! 重组器无 IO、时间由调用方注入（now_ms）。
 
-use agentdeck_protocol::runtime::identity::TransferId;
+use agentdeck_protocol::runtime::identity::{MessageId, TransferId};
 use agentdeck_protocol::runtime::transfer::{
-    MAX_PART_BYTES, MAX_REASSEMBLY_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_PARTS,
-    RuntimeTransferChannel, TRANSFER_TTL_MS, TransferEnvelope, TransferError, TransferProgress,
-    TransferReassembler,
+    MAX_JSON_TRANSFER_PARTS, MAX_PART_BYTES, MAX_REASSEMBLY_BYTES, MAX_TRANSFER_BYTES,
+    MAX_TRANSFER_PARTS, RuntimeTransferCarrierV1, RuntimeTransferChannel, TRANSFER_TTL_MS,
+    TransferEnvelope, TransferError, TransferProgress, TransferReassembler,
 };
 use sha2::{Digest, Sha256};
 
@@ -54,9 +55,102 @@ fn split(payload: &[u8], part_count: u32) -> Vec<TransferEnvelope> {
 fn limit_constants_match_design() {
     assert_eq!(MAX_PART_BYTES, 3_670_016); // 3.5 MiB
     assert_eq!(MAX_TRANSFER_PARTS, 64);
+    assert_eq!(MAX_JSON_TRANSFER_PARTS, 94);
     assert_eq!(MAX_TRANSFER_BYTES, 64 * 1024 * 1024);
     assert_eq!(MAX_REASSEMBLY_BYTES, 128 * 1024 * 1024);
     assert_eq!(TRANSFER_TTL_MS, 5 * 60 * 1000);
+}
+
+#[test]
+fn json_uds_can_represent_64mib_while_compact_stays_at_64_parts() {
+    let json = TransferEnvelope::new_json(
+        TransferId::new("json-full-transfer"),
+        0,
+        MAX_JSON_TRANSFER_PARTS,
+        [0xA1; 32],
+        MAX_TRANSFER_BYTES,
+        Vec::new(),
+    )
+    .expect("94 JSON parts can represent the full 64 MiB transfer");
+    let wire =
+        serde_json::to_vec(&json).expect("JSON carrier accepts its transport-specific part count");
+    assert_eq!(
+        serde_json::from_slice::<TransferEnvelope>(&wire).unwrap(),
+        json
+    );
+
+    let compact = RuntimeTransferCarrierV1::new(
+        MessageId::new("compact-part-count"),
+        RuntimeTransferChannel::Reply,
+        json,
+    );
+    assert!(
+        compact.encode().is_err(),
+        "compact carrier must retain its independent 64-part ceiling"
+    );
+    assert!(
+        TransferEnvelope::new_json(
+            TransferId::new("json-too-many-parts"),
+            0,
+            MAX_JSON_TRANSFER_PARTS + 1,
+            [0xA2; 32],
+            0,
+            Vec::new(),
+        )
+        .is_err()
+    );
+    assert!(
+        TransferEnvelope::new_json(
+            TransferId::new("json-too-many-bytes"),
+            0,
+            MAX_JSON_TRANSFER_PARTS,
+            [0xA3; 32],
+            MAX_TRANSFER_BYTES + 1,
+            Vec::new(),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn reassembler_requires_an_explicit_json_profile_above_64_parts() {
+    let payload = vec![0x5A; 65];
+    let hash = sha256(&payload);
+    let parts = (0..65)
+        .map(|index| {
+            TransferEnvelope::new_json(
+                TransferId::new("json-reassembly-profile"),
+                index,
+                65,
+                hash,
+                payload.len() as u64,
+                vec![0x5A],
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    let mut compact = TransferReassembler::new();
+    assert_eq!(
+        compact
+            .accept(RuntimeTransferChannel::Reply, parts[0].clone(), 0)
+            .unwrap_err(),
+        TransferError::TooLarge
+    );
+
+    let mut json = TransferReassembler::new();
+    let mut completed = None;
+    for part in parts {
+        match json
+            .accept_json(RuntimeTransferChannel::Reply, part, 0)
+            .unwrap()
+        {
+            TransferProgress::Complete(bytes) => completed = Some(bytes),
+            TransferProgress::InProgress { .. } => {}
+            TransferProgress::AlreadyComplete => panic!("fresh JSON transfer cannot be complete"),
+        }
+    }
+    assert_eq!(completed, Some(payload));
 }
 
 #[test]

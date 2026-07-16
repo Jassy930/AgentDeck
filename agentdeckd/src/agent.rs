@@ -115,7 +115,7 @@ impl fmt::Debug for ExecutionId {
 }
 
 /// RuntimeCore 交给 adapter 的冷准备请求。只含 exact execution、绝对 cwd 与
-/// 已通过 Runtime v1 256 KiB gate 的 prompt；不携带 agent kind、session/thread
+/// 已通过 Runtime v2 256 KiB gate 的 prompt；不携带 agent kind、session/thread
 /// 或 vendor identity。
 pub struct AgentTurnRequest {
     execution_id: ExecutionId,

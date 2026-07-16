@@ -6,8 +6,9 @@ use agentdeck_protocol::runtime::identity::{
     ConversationId, EntityId, ItemId, MessageId, TransferId,
 };
 use agentdeck_protocol::runtime::{
-    ConversationSnapshot, MAX_JSON_PART_BYTES, MAX_RUNTIME_JSON_FRAME_BYTES, RuntimeEnvelope,
-    RuntimeMessage, RuntimeReply, RuntimeTransferChannel, SnapshotItem, StreamCursor,
+    ConversationSnapshot, MAX_JSON_PART_BYTES, MAX_JSON_TRANSFER_PARTS,
+    MAX_RUNTIME_JSON_FRAME_BYTES, MAX_TRANSFER_BYTES, RuntimeEnvelope, RuntimeMessage,
+    RuntimeReply, RuntimeTransferChannel, SnapshotItem, StreamCursor,
 };
 use agentdeck_protocol::{
     AgentItem, AgentItemMeta, AgentKind, SessionCapabilities, VendorCapabilities,
@@ -56,6 +57,7 @@ fn real_snapshot_payload(text_bytes: usize) -> Vec<u8> {
     let snapshot = ConversationSnapshot::new(
         ConversationId::new("conversation-transfer-egress"),
         StreamCursor::At(0),
+        agentdeck_protocol::runtime::ConversationConfigurationState::new(0, None).unwrap(),
         vec![
             SnapshotItem::capabilities(capabilities()),
             SnapshotItem::Item {
@@ -71,6 +73,68 @@ fn real_snapshot_payload(text_bytes: usize) -> Vec<u8> {
     )
     .expect("valid real snapshot DTO");
     serde_json::to_vec(&snapshot).expect("encode real snapshot DTO")
+}
+
+#[test]
+fn json_uds_part_budget_covers_the_full_transfer_ceiling() {
+    assert_eq!(MAX_JSON_TRANSFER_PARTS, 94);
+    assert_eq!(MAX_JSON_TRANSFER_PAYLOAD_BYTES, MAX_TRANSFER_BYTES as usize);
+    assert_eq!(
+        (MAX_TRANSFER_BYTES as usize).div_ceil(MAX_JSON_PART_BYTES),
+        MAX_JSON_TRANSFER_PARTS as usize
+    );
+    assert_eq!(
+        json_transfer_part_count(MAX_TRANSFER_BYTES as usize).unwrap(),
+        MAX_JSON_TRANSFER_PARTS
+    );
+    assert!(json_transfer_part_count(MAX_TRANSFER_BYTES as usize + 1).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_egress_sends_the_sixty_fifth_json_part() {
+    let connections = registry();
+    let (connection_id, mut receiver) = connect(&connections, 0x34);
+    let payload = Arc::new(real_snapshot_payload(MAX_JSON_PART_BYTES * 64 + 1));
+    let expected_parts = json_transfer_part_count(payload.len()).unwrap();
+    assert_eq!(expected_parts, 65);
+    let control = TransferEgressControl::new(Instant::now() + Duration::from_secs(60));
+    let send_connections = connections.clone();
+    let send_payload = payload.clone();
+    let sender = tokio::spawn(async move {
+        send_json_transfer(
+            &send_connections,
+            connection_id,
+            MessageId::new("json-part-65-message"),
+            TransferId::new("json-part-65-transfer"),
+            RuntimeTransferChannel::Reply,
+            &send_payload,
+            &control,
+        )
+        .await
+    });
+
+    for expected_index in 0..expected_parts {
+        let write = timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("JSON part timed out")
+            .expect("writer closed before part 65");
+        let envelope: RuntimeEnvelope = serde_json::from_slice(write.bytes()).unwrap();
+        let RuntimeMessage::Reply(RuntimeReply::TransferPart(part)) = envelope.body else {
+            panic!("expected reply TransferPart");
+        };
+        assert_eq!(part.part_index, expected_index);
+        assert_eq!(part.part_count, expected_parts);
+        write.acknowledge().expect("ACK JSON part");
+    }
+
+    let report = timeout(Duration::from_secs(10), sender)
+        .await
+        .expect("65-part egress completion timed out")
+        .expect("egress task panicked")
+        .expect("65-part egress failed");
+    assert_eq!(report.part_count, 65);
+    assert_eq!(report.total_bytes, payload.len() as u64);
+    connections.shutdown().await.expect("shutdown registry");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

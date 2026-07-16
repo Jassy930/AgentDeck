@@ -1,4 +1,4 @@
-//! Runtime v1 类型化业务失败承载（design §14）。
+//! Runtime v2 类型化业务失败承载（design §14）。
 //!
 //! Relay 外层错误只描述通用路由/传输失败；daemon 业务错误必须在解密后的
 //! Runtime payload 中以 `RuntimeFailure` 返回。这里登记 Runtime 契约需要承载的
