@@ -6,7 +6,7 @@
 
 **Goal:** 交付一个真实可用的端到端 Companion MVP：每个被控 macOS 登录用户只有一个 `launchd` 常驻 `agentdeckd`，本地 App/CLI 与多个远程 macOS/iOS/CLI 客户端共享同一 RuntimeCore；Relay 严格最小可见，Codex 与 Claude Code 均通过真实链路完成浏览、prompt、审批、重连与多写者裁决。
 
-**Architecture:** 以 `RuntimeEnvelope v1` 作为 UDS 与解密后远程链路的共同业务契约；`agentdeckd` 持有唯一 RuntimeCore、稳定 conversation 身份、SQLite journals、per-conversation actor、approval CAS 与两阶段 exec gate；Relay v2 只持有随机 route/stream/request 元数据、公开授权材料和 opaque sealed blob；Swift 的 `AgentDeckSessionSource` 统一本地与远程数据源，`AgentDeckRelayClient` 实现 WSS、CryptoKit、Keychain、replay 和 bounded stream。
+**Architecture:** P1–P3.8 先以 `RuntimeEnvelope v1` 建立 UDS/Core 基线；P3.9-C0 因新增 configuration、agent discovery 与 canonical metadata mutation，把共同业务 wire 原子升级为 `RuntimeEnvelope v2`，不提供 production v1/v2 双栈。`agentdeckd` 持有唯一 RuntimeCore、稳定 conversation 身份、SQLite journals、per-conversation actor、approval CAS 与两阶段 exec gate；Relay v2 只持有随机 route/stream/request 元数据、公开授权材料和 opaque sealed blob；Swift 的 `AgentDeckSessionSource` 统一本地与远程数据源，`AgentDeckRelayClient` 实现 WSS、CryptoKit、Keychain、replay 和 bounded stream。
 
 **Tech Stack:** Rust 2024、Tokio、rusqlite/SQLite WAL、rustls、`hpke 0.14`、ChaCha20-Poly1305、Ed25519；Swift 6、Foundation/CryptoKit/URLSessionWebSocketTask、AppKit、UIKit、XCTest；macOS 15+、iOS 17+、XcodeGen、launchd、Linux systemd Relay。
 
@@ -14,7 +14,10 @@
 
 ## Global Constraints
 
-- 版本轴彼此独立：现有 local IPC `PROTOCOL_VERSION = 2`；新增 `RUNTIME_PROTOCOL_VERSION = 1`；Relay 目标 `RELAY_PROTOCOL_VERSION = 2`；`E2EE_FORMAT_VERSION = 1`。四者不得联动 bump。
+- 版本轴彼此独立：现有 local IPC `PROTOCOL_VERSION = 2`；Runtime 初始基线
+  `RUNTIME_PROTOCOL_VERSION = 1`，P3.9-C0 因 wire 形态变化独立升级到 2；Relay
+  `RELAY_PROTOCOL_VERSION = 2`；`E2EE_FORMAT_VERSION = 1`。Runtime bump 会进入 Relay cert/TBS 与
+  compatibility vectors，但不得顺带改变 Relay/E2EE 自身版本常量。
 - P1 只并列加入 Runtime/Relay v2/E2EE contract；P2 最后一个 cutover task 才删除 Relay v1 生产路径。生产 listener 不提供 v1/v2 双栈。
 - Relay v2 wire、schema、SQLite、日志和 metrics，以及 P2.9 cutover 后的全部生产路径，禁止出现机器名、session title、cwd、agent kind、conversation/thread/turn/approval/vendor 真实业务字段或业务 payload。P0冻结当前Relay v1 schema/行为基线；P1继续编译v1 namespace并运行历史行为测试，但P1.3会按计划从local IPC aggregate schema移除v1 entries，不另建或冒充目标v1 schema。P0–P1均不扩展v1产品能力，也不提供v1/v2双栈生产listener。
 - 生产 Relay v2 没有 plaintext data envelope；`ws://` 仅允许 loopback 且必须显式 `--allow-insecure-loopback`；非 loopback、TLS feature 缺失、证书不匹配、pin 不匹配都 fail-closed。
@@ -1543,28 +1546,170 @@ provisioned signed Keychain 外部门禁继续 BLOCKED。
 
 ### Task P3.9：macOS App 与 CLI 默认连接同一 UDS
 
+**前置冻结（P3.9-C0）：** P3.8 只证明 RuntimeEnvelope v1 可以经安全 UDS 进入
+`RuntimeCore`，尚未证明当前 App/CLI 的完整用户行为可以迁移。具体威胁场景是：若把默认 transport
+直接从 IPC v2/stdin 换成 Runtime v1，当前 `SessionStart.vendorOptions` 会被丢弃，Codex sandbox /
+approval/reasoning 与 CC permission mode 会静默回落到 daemon 默认值；history list/read/mutation、
+agent capabilities 和 vendor control 也没有对应 request/reply，最终会出现“连接成功但策略、历史和控制
+面退化”，并让 legacy `sessionId/threadId` 与 canonical `conversationId` 混用。故在任何 App/CLI 默认
+cutover 前，必须先把 wire 原子升级为 Runtime v2，并完成 contract、schema、Rust fixture、Swift mirror、
+configuration store/execution 与 native-history projection review；未完成 C0 时 P3.9 不得标 complete。
+
+P3.9 固定以下迁移边界：
+
+1. `RUNTIME_PROTOCOL_VERSION` 从 1 升到 2；新增 request/reply/event/configuration 后不提供 production
+   双栈，v1 client 收到 typed protocol mismatch。同步 Runtime schema、Rust fixture、Swift mirror，重生成
+   所有绑定 Runtime version 的 Relay cert/TBS、revocation 与 wire vectors；历史 P1–P3.8 记录仍保留为
+   v1 事实，P3.9 之后的目标统一称 Runtime v2。
+2. 新会话固定走 `Start → ConfigureConversation(expectedRevision=0) → Subscribe →
+   SendPrompt(expectedConfigurationRevision=1)`。configuration 是 append-only revision；Configure 用 CAS+
+   idempotency，Accepted command 在同一事务 pin exact revision，之后的配置更新不得改变已 Accepted/
+   queued/recovery command。crash recovery 只能按 command 引用的 revision 构造 driver，不能读取“最新值”。
+3. configuration 只能出现在 `vendorControl.*` namespace。Codex v2 冻结
+   approvalPolicy/sandbox/reasoningEffort；CC v2 冻结 permissionMode/model/effort/outputStyle。Codex
+   `persistApproval` 由每次 `ActionDecision.persist` 表达，`mcpOverrides` 无真实执行路径；CC `sessionId`
+   永不进 wire，allowed/disallowed tools、mcp path、plugin dirs/hooks 暂不承诺，worktree/sessionName 取得
+   真实首次启动+resume样本前非空 typed reject。配置变化发布 `ConfigurationChanged`；vendor panel event
+   继续只在 `vendorPanel.*` namespace。
+4. Runtime v2 增加 `DescribeAgents`，返回 capabilities 与 default configuration；任意已认证 Runtime
+   principal 可读。`ping` 映射 Hello，普通 selfcheck/agent list/capabilities 映射 Hello+DescribeAgents；完整
+   bootstrap selfcheck/diagnostics 保留显式 one-shot 运维入口，不新增 remote local-status 旁路。
+5. 旧原生 history 不得把 Codex thread id、CC session id 或 raw transcript path 返回客户端，也不开放
+   public “导入某 vendor ID” Runtime request。daemon bootstrap/reconciliation 让 adapter 私域有界扫描并
+   验证真实 entry，再以 namespace+opaque reference 域分离稳定派生 `conversationId + adapterStateKey`，
+   在一个事务提交 private binding、neutral descriptor 与 catalog delta。native transcript 不复制进 Runtime
+   DB；adapter read 返回 stable native item key，Runtime 域分离派生稳定 item/entity/command identity，重复
+   read/restart 必须 byte-stable。list/read 统一走 Catalog + Subscribe/Snapshot。managed conversation 的
+   rename/archive 走 canonical metadata CAS；native-projected conversation 继续调用原生 mutation并读回投影，
+   原生不支持时保留现有 typed unsupported，不静默改成 AgentDeck-only 行为。
+   扫描/解析在 SQLite transaction 外完成；每轮最多检查 2,000 candidates、导入 500 conversations、累计
+   读取 64 MiB、wall-clock 2 秒，达到任一上限保存 continuation 并让出。单 transcript snapshot 受
+   64 MiB/10,000 items 上界，超限 typed fail，不阻塞 UDS readiness。
+   Runtime store 明确持久化 authenticated `ConversationOrigin::Managed | NativeProjected(namespace)`：v4
+   migration=Managed，projector import=NativeProjected，不以 adapter binding 猜 origin。native mutation 先用
+   expected entry revision + idempotency key CAS claim，再由 conversation actor 串行执行 vendor/readback，并
+   durable 记录 `Claimed/Applying/Applied/OutcomeUnknown/Failed`；未 claim writer 零 vendor 副作用。
+   `NativeTurnKey` 派生 history commandId，`NativeItemKey` 派生 item/entity ID；同一 turn 共享 commandId，
+   QueryReceipt 对已验证历史 ID返回 `daemon.command.history_only`，绝不冒充 Accepted。
+   只有完整 scan generation 后确认 absent 才发布 Catalog Removed；partial page 不删除。binding/identity
+   tombstone 保留 30 天且不计 active 1,024 cap，重现复用同 conversation；达到 active cap 时 typed truncated。
+6. v2 从 `ConversationEntry`、`ConversationStartReceipt`、Swift mirror、schema 与 fixture 删除
+   `adapterStateKey`。client 只持 `conversationId`，daemon 内部从 authenticated store 解析 exact private
+   handle；全 public wire/log/Debug 扫描不得再出现它。
+7. App 与 CLI 各持一份安装级 `clientInstallationId`；App 固定
+   `~/Library/Application Support/AgentDeck/clients/macos-app/installation-id.v1`，CLI 固定
+   `~/Library/Application Support/AgentDeck/clients/cli/installation-id.v1`。parent exact 0700、record exact
+   0600、`O_NOFOLLOW`、同目录 temp + fsync，并用 Darwin
+   `renameatx_np(..., RENAME_EXCL)` no-replace 提交 final path；首次并发 loser 只读回并验证 winner，绝不
+   覆盖。损坏、symlink、hardlink、owner/mode 不符都 fail-close，不能静默轮换。该 ID 不是 secret，也
+   不能替代内核 peer credential。home 必须由当前 EUID 的 `getpwuid_r` 解析，禁止信任 `HOME`。
+8. stable App/CLI 只发现 `DaemonPaths.socket`；dev/test 只能由显式注入的已验证 endpoint 或 private
+   `TMPDIR/ad-*/s` discovery 进入。production client 不读取任意 socket path env override，也不 fallback
+   spawn。普通 App/CLI selfcheck 走 UDS Hello+DescribeAgents；`ProcessDaemonTransport` 只留 preview/test 与
+   显式 one-shot bootstrap 的 `--stdio-compat --ephemeral --no-remote` compatibility，production App 永不因
+   selfcheck 或 connect failure fallback spawn。
+9. Parser/转换逻辑遵守真实数据先行：先读回现有 `NewSessionDialogEncodingTests` 的真实 Swift
+   `SessionStart` 编码与一份真实 UDS Hello/reply；configuration parser 只接受已冻结的可验证子集。history
+   projector 在被视为可用前必须对一份真实 `~/.claude/projects/.../*.jsonl` 完成
+   list→import→Catalog→Snapshot/readback；合成 round-trip/fixture 不能替代真实样本。
+
 **Files:**
+- Create: `agentdeck-protocol/src/runtime/configuration.rs`
+- Rename/Modify: `agentdeck-protocol/tests/runtime_v1_contract.rs` → `runtime_v2_contract.rs`
+- Rename/Modify: `protocol/agentdeck/fixtures/runtime-v1-wire.jsonl` → `runtime-v2-wire.jsonl`；旧 fixture 不再
+  作为 current contract gate 保留
 - Create: `agentdeck-cli/src/unix_transport.rs`
+- Create: `agentdeck-cli/src/installation.rs`
 - Create: `agentdeck-cli/tests/shared_daemon.rs`
 - Create: `Sources/AgentDeck/{UnixSocketDaemonTransport,RuntimeEnvelopeClient}.swift`
+- Create: `Sources/AgentDeck/LocalClientInstallation.swift`
 - Create: `Tests/AgentDeckTests/{UnixSocketDaemonTransportTests,RuntimeEnvelopeClientTests}.swift`
 - Create: `scripts/run-local-runtime-smoke.sh`
-- Modify: `agentdeck-cli/src/{transport,client,main}.rs`
+- Modify: `agentdeck-protocol/src/runtime/{command,envelope,event,receipt,catalog,sync,schema,mod}.rs`
+- Modify: `protocol/agentdeck/runtime-protocol.schema.json`
+- Rename: `Sources/AgentDeckCore/Protocol/RuntimeV1Types.swift` → `RuntimeWireTypes.swift`（只做 version-neutral
+  文件归位，不 bulk 改 3,000+ 行 leaf symbol）
+- Create: `Sources/AgentDeckCore/Protocol/RuntimeV2Types.swift`（复用 wire 未变的 leaf DTO）
+- Rename: `Tests/AgentDeckTests/RuntimeV1ProtocolTests.swift` → `RuntimeProtocolCompatibilityTests.swift`
+- Create: `Tests/AgentDeckTests/RuntimeV2ProtocolTests.swift`
+- Modify: `agentdeckd/src/runtime/{core,conversation,execution,snapshot,events,model,router}.rs`
+- Modify: `agentdeckd/src/runtime/store/{schema,worker,journal,catalog}.rs`
+- Modify: `agentdeckd/src/{agent,codex/adapter,claude_code/adapter}.rs`
+- Modify: `agentdeckd/src/claude_code/{history,state}.rs`
+- Modify: `agentdeck-protocol/src/relay_v2/{auth,frame}.rs`
+- Modify: `agentdeck-protocol/tests/{relay_v2_contract,relay_v2_revocation_canonical_contract}.rs`
+- Modify: `protocol/agentdeck/fixtures/relay-v2-wire-vectors.json`
+- Create: `agentdeckd/src/runtime/store/configuration.rs`
+- Create: `agentdeckd/tests/{runtime_configuration,native_history_projection,runtime_metadata_mutation}.rs`
+- Modify: `agentdeck-cli/src/{transport,client,commands,output,main,main_types}.rs`
 - Modify: `Sources/AgentDeck/{DaemonTransport,ProcessDaemonTransport,DaemonClient,SessionModel,WorkbenchModel,ThreadRuntimeModel,AppDelegate,main}.swift`
+- Modify: `Sources/AgentDeck/session/{NewSessionDialog,AgentControlBar}.swift`
+- Modify: `Sources/AgentDeck/agent/{codex/CodexSessionOptionsForm,claudecode/ClaudeCodeSessionOptionsForm}.swift`
+- Modify: `Sources/AgentDeck/capability/CapabilityRouter.swift`
+- Modify: `Sources/AgentDeck/Preview/{MockDaemonScript,MockDaemonTransport,PreviewBootstrap}.swift`
+- Modify: `Sources/AgentDeckCore/HistoryModel.swift`
+- Modify: `Tests/AgentDeckTests/{NewSessionDialogEncodingTests,RuntimeAgentKindTests}.swift`
 
-- [ ] Step 1: 写 shared-daemon tests。 Rust CLI与Swift transport连接同一temp UDS，看到同conversation/queue；关闭App连接后daemon PID/turn不变；protocol mismatch可见；默认代码路径不spawn；ProcessDaemonTransport只允许`--stdio-compat --ephemeral --no-remote`完整组合。App/CLI 各自安装首次生成独立 canonical non-nil `clientInstallationId`，两个真实客户端进程重启后必须读回各自同一 ID/idempotency owner；只有显式删除 client installation record 才轮换，daemon 不生成兜底 ID。
-- [ ] Step 2: 运行 `cargo test -p agentdeck-cli --test shared_daemon` 与 `swift test --filter RuntimeEnvelopeClientTests`。 Expected: FAIL，默认仍spawn私有daemon/讲IPC v2。
-- [ ] Step 3: 实现 Rust/Swift Runtime v1 UDS client并迁移模型主键到conversationId/eventId/itemId/entityId/commandId。App 与 CLI 使用独立、0700/0600、原子写入且 O_NOFOLLOW 的 client installation record 持久化各自 UUID；它不是 secret/认证材料。删除synthetic agentItem序号；本地进程退出只close socket。
-- [ ] Step 4: 重跑tests与`swift test`，再运行`bash scripts/run-local-runtime-smoke.sh`。脚本必须创建并 canonicalize private、current-UID、exact 0700 的 `TMPDIR`，只以 `agentdeckd --ephemeral --no-remote` 启动 daemon；随后发现并验证恰好一个 `TMPDIR/ad-*/s`，将 endpoint discovery 结果交给 Rust/Swift 测试客户端，绝不以 `--socket` 或 socket path env override 向 daemon 注入路径，最后 trap 清理进程/socket/DB。 Expected: 全部PASS，两个本地writer FIFO/approval结果一致。
-- [ ] Step 5: 运行 network guard与git状态清理。
-- [ ] Step 6: 提交。 `git add agentdeck-cli Sources Tests scripts/run-local-runtime-smoke.sh && git commit -m "feat(local): App 与 CLI 共用 singleton daemon UDS"`
+- [ ] **P3.9-C0-A0 version-neutral 机械切片：** 只把 Swift mirror/test 文件移动到 version-neutral 名称，
+  不 bulk 重命名 3,000+ 行 leaf symbols、不改 wire；运行原 Swift contract 全绿并独立 review/提交。该切片
+  只消除文件名误导，不宣称 Runtime v2。
+- [ ] **P3.9-C0-A1 Runtime v2 Rust contract：** 先读回真实 Swift `SessionStart` 样本；冻结
+  `DescribeAgents`、`ConfigureConversation`、`UpdateConversationMetadata`、dormant local-only
+  `StageUpgrade`、configuration/metadata/upgrade receipts、
+  `SendPrompt.expectedConfigurationRevision`、receipt/snapshot/event revision。把 Runtime version 升到 2，
+  从 Start receipt/Catalog 删除 adapterStateKey，把 current fixture 以 `git mv` 原子升级到 v2，更新 schema
+  与 Relay-bound vectors；v1 mismatch、neutrality、deny-unknown、CAS DTO 与 private-handle scan 全绿，独立
+  review 后提交
+  `feat(protocol): 升级 shared daemon Runtime v2 契约`。
+- [ ] **P3.9-C0-A2 Swift v2 mirror：** 在新 `RuntimeV2Types.swift` 只实现 v2 outer/changed DTO，复用 wire
+  未变的既有 leaf types，禁止一次性全文件符号替换；新增 v2 tests 并把 production client gate 切到 v2，
+  Rust fixture→Swift decode/encode 语义一致，完整 Swift tests 全绿后独立 review/提交。若任一切片新增/修改
+  代码超过 2,000 行，立即停下再拆分并汇报，不以机械 rename 绕过刹车线。
+- [ ] **P3.9-C0-B configuration store/execution：** Runtime DB v5 增加 append-only sealed
+  configuration versions、conversation/command revision 与 idempotency/token ledger；Configure CAS 与 metadata
+  mutation 分开提交：Configure 只推进 configuration journal + `ConfigurationChanged` conversation event，
+  不改 catalog；metadata mutation 只更新 descriptor/lifecycle + entry/catalog revision + CatalogDelta，不写
+  conversation event。canonical prepare 消费 command pin 的 exact config；覆盖并发
+  writer、重放/冲突、配置后改不影响 queued command、restart/recovery、receipt/event/snapshot 一致。用
+  recorded vendor argv/control fixture 验证冻结字段，但不冒充 live login。独立 review/提交。
+- [ ] v4→v5 migration 固定：existing conversation 迁为 rev0/unconfigured；迁移前已 Accepted/Started command
+  以 command revision 0 表示 frozen P3.7 legacy defaults，且只允许 recovery 消费；所有 v5 新 command 必须
+  引用存在的非零 revision。用户继续既有 v4 conversation 前必须先 Configure；native importer 原子种入
+  DescribeAgents 对应 default rev1，避免把 native history 错当 legacy command。
+- [ ] **P3.9-C0-C native history projection：** daemon bootstrap/reconciliation 调 adapter-private
+  projector；CC 使用 OS account home、no-follow/current-UID/regular-file/有界 JSONL 读取，单事务 import
+  private reference + canonical descriptor/catalog；adapter read 返回 stable native item key，Runtime 不复制
+  transcript 而生成 byte-stable snapshot identity。真实 CC JSONL 完成 list→import→Catalog→Snapshot
+  readback；重复扫描/读取、重启、碰撞、append、原生 rename/unsupported archive 与 raw-id/path wire scan
+  全绿。Codex backend 未实现时能力明确 unavailable，不伪造对等。独立 review/提交。
+- [ ] **P3.9-A Rust client：** 写 installation record 的 symlink/hardlink/mode/owner/corrupt/concurrent
+  tests，再实现 CLI 独立 installation store、Unix transport、preface+Hello、messageId correlation、bounded
+  reply/stream pumps 与 close-only shutdown。CLI 默认 stable UDS，显式 test endpoint 只能经注入；默认路径
+  静态/动态证明不 spawn。focused tests 与 clippy/fmt 通过后独立提交。
+- [ ] **P3.9-B Swift client：** 先写 installation/Unix socket/partial write/oversize/EOF/protocol mismatch/
+  out-of-order reply/stream/backpressure tests，再实现 `LocalClientInstallation`、
+  `UnixSocketDaemonTransport` 和 actor-owned `RuntimeEnvelopeClient`。所有 request 由 client 生成 canonical
+  messageId，reply 精确相关，stream 独立有界；析构/窗口关闭只 close fd，不终止 daemon。focused 与完整
+  `swift test` 通过后独立提交。
+- [ ] **P3.9-C3 App model cutover：** 迁移 `SessionModel`/`WorkbenchModel`/`ThreadRuntimeModel` 到
+  conversationId/eventId/itemId/entityId/commandId；删除 synthetic agentItem 序号和 legacy identity adoption，
+  prompt/approval/vendor control/history 都走 `RuntimeEnvelopeClient` receipt/stream。preview/mock 可显式保留
+  compatibility fixture，production App 不得构造 `ProcessDaemonTransport`。完整 Swift tests 后独立提交。
+- [ ] **P3.9-D 默认入口与真实 smoke：** Rust CLI与Swift client连接同一 private-TMPDIR daemon，看到
+  同一 conversation/queue/receipt；关闭任一客户端后 daemon PID/active turn 不变。脚本只以
+  `agentdeckd --ephemeral --no-remote` 启动并发现/验证恰好一个 `TMPDIR/ad-*/s`，不向 daemon 注入 path；
+  两个真实 client 进程重启读回各自稳定 installation ID。再验证 stable endpoint 缺失时 typed fail、无
+  fallback spawn。运行完整 cargo/swift/selfcheck/network/schema/docs/diff gates并独立提交。
+- [ ] **P3.9-E 收口：** 独立 spec/security/quality review，修完 P0/P1/P2；同步 README、
+  ARCHITECTURE、QUALITY、DIAGNOSTICS、AGENTS、本计划与 progress。依赖真实 Codex/CC login 的 initial
+  config/control smoke 单独 gate；缺登录时保留 BLOCKED，不影响 transport synthetic 事实但 P3 phase exit
+  不得冒充全绿。最终核对精确 pathspec 和 clean git status。
 
 ### Task P3.10：实现 LaunchAgent 安装、versioned upgrade 与保留数据的 uninstall
 
-**前置冻结：** 在创建 installer/upgrade coordinator 之前，先以独立 protocol contract + schema snapshot
-冻结 local-only typed `StageUpgrade` request/reply wire、授权与错误语义；remote principal/Relay 路径必须
-typed reject。该 wire 未完成 review 与快照门禁前，不得开始 P3.10 实现，也不得临时复用 generic
-command/vendor control。
+**前置冻结：** local-only typed `StageUpgrade` request/reply、授权与错误语义已纳入 P3.9-C0-A 的 Runtime
+v2 contract；P3.9 Core 对它固定返回 typed feature-unavailable，remote principal/Relay 路径 typed reject。
+P3.10 只补执行语义，不再改变 wire 或升级 Runtime v3，也不得临时复用 generic command/vendor control。
 
 **Files:**
 - Create: `agentdeck-cli/src/daemon.rs`
@@ -1904,7 +2049,7 @@ public actor RelaySessionSource: SessionSource { /* one MachineConnection per pa
 - Modify: `Sources/AgentDeck/{SessionModel,WorkbenchModel,ThreadRuntimeModel,AppDelegate}.swift`
 - Modify: `Package.swift`
 
-**Registry rule:** local machine固定指向RuntimeEnvelope v1 UDS source；每台remote machine是独立`RelaySessionSource(.machine(id))`；UI只按machine scope取得`any SessionSource`；本机流量永不绕Relay。
+**Registry rule:** local machine固定指向RuntimeEnvelope v2 UDS source；每台remote machine是独立`RelaySessionSource(.machine(id))`；UI只按machine scope取得`any SessionSource`；本机流量永不绕Relay。
 
 - [ ] Step 1: 写registry/routing tests。local/remote同SessionSource facade、切machine取消旧observation、remote pair不影响local、local daemon offline typed state、preview显式fixture、ThreadRuntime使用canonical IDs且approval在receipt前不移除；只有local machine scope从registry取得`LocalPairingAdministration`，remote/fixture返回nil，禁止concrete downcast。
 - [ ] Step 2: 运行三套Swift tests。 Expected: FAIL，registry/source不存在。

@@ -200,10 +200,10 @@ flowchart LR
 
 1. macOS App bundle 携带经过同一发布签名的 daemon helper，并通过 `agentdeck-cli daemon install`（或等价 App 安装入口）复制到 `~/Library/Application Support/AgentDeck/bin/<version>/agentdeckd`。
 2. 安装器完整校验签名/版本后原子更新 `bin/current`，生成 `~/Library/LaunchAgents/com.agentdeck.agentdeckd.plist`，再对当前 GUI user 执行 `launchctl bootstrap/kickstart`。
-3. active turn 存在时只 stage 新版本；daemon 空闲或下一次明确重启才切换。P3.10 写 installer 与
-   coordinator 前必须先冻结 local-only typed `StageUpgrade` request/reply wire 及其授权、错误语义，
-   remote principal/Relay 路径不能构造或执行它。客户端与 daemon 协议不兼容时显示 typed mismatch，
-   不静默 spawn 私有旧 daemon。
+3. active turn 存在时只 stage 新版本；daemon 空闲或下一次明确重启才切换。local-only typed
+   `StageUpgrade` request/reply 已在 P3.9-C0-A 的 Runtime v2 contract 冻结，P3.10 只补执行语义；remote
+   principal/Relay 路径不能构造或执行它。客户端与 daemon 协议不兼容时显示 typed mismatch，不静默
+   spawn 私有旧 daemon。
 4. `agentdeck-cli daemon uninstall` 卸载 LaunchAgent 并删除已安装 binary/plist，但默认保留 Runtime DB 与 Keychain；只有显式 `--purge` 才进入 trust-reset/purge 流程，不能边卸载边遗留可连接的旧 machine route。
 
 ### 5.2 Relay
@@ -415,7 +415,9 @@ Relay 不返回包含密文内部细节的错误。TLS pin 不匹配没有绕过
 
 - `conversationId`：daemon 在调用 adapter 前生成并持久化，跨 turn/设备稳定。
 - `turnId`：每次实际执行新生成；approval/cancel 必须同时匹配 conversation + turn。
-- `adapterStateKey`：daemon 生成的随机中立 handle；common catalog 只保存这个 handle。各 adapter 在 Runtime DB 自己的私有 namespace 维护 `adapterStateKey → vendor resume reference`，该映射不会进入 common catalog bytes 或任何客户端 wire。
+- `adapterStateKey`：daemon 生成的随机中立 handle，只保存在 Runtime DB 的 daemon-private conversation row。
+  各 adapter 在自己的私有 namespace 维护 `adapterStateKey → vendor resume reference`；handle 与映射都不
+  进入 common catalog bytes、receipt、schema 或任何客户端 wire。
 - Codex 私有映射只由 `agentdeckd/src/codex/` 读写；CC 私有映射只由 `agentdeckd/src/claude_code/` 读写，属于可从 CC 原生 history 重建的非权威派生索引，不创建 `cc-meta/`，vendor 原生历史继续是事实源。P3 必须同步收窄 ARCHITECTURE/AGENTS 中 N8 的措辞以明确允许这一最小派生索引。
 - `eventId`：daemon 为每条 canonical event 生成的唯一去重 ID。
 - `itemId/entityId`：多条 delta/event 更新同一 UI item/entity 时使用的稳定聚合 ID，不能用唯一 eventId 替代。
@@ -429,7 +431,11 @@ Relay 不返回包含密文内部细节的错误。TLS pin 不匹配没有绕过
 - `LocalUnixListener`、`StdioCompatibilityAdapter`、`RemoteLink` 都把已认证请求规范化为相同 `RuntimeRequest`。
 - 本地 UDS 权限为 0600，并校验 same user peer identity。
 - 每个 connection 有独立 bounded writer task；RuntimeCore 不直接 await socket write。
-- UDS 与 RemoteLink 解密后的共同业务 wire 都是 `RuntimeEnvelope v1`。P3 将 macOS App/CLI 迁到 Runtime v1；现有 local IPC `PROTOCOL_VERSION=2` 只由 `StdioCompatibilityAdapter`/旧测试使用，adapter 把其受支持子集翻译到 RuntimeCore，并通过 capabilities 明示不支持多 client、remote admin/pairing 和完整 receipt replay。禁止让 UDS 继续携带 vendor threadId/sessionId trunk 作为 canonical identity。
+- P3.8 先用 `RuntimeEnvelope v1` 建立 UDS/Core transport；P3.9-C0 因 configuration、agent discovery 与
+  canonical metadata mutation 改变 wire 形态，UDS 与 RemoteLink 解密后的共同业务 wire 原子升级为
+  `RuntimeEnvelope v2`，不提供 production v1/v2 双栈。现有 local IPC `PROTOCOL_VERSION=2` 只由
+  `StdioCompatibilityAdapter`/旧测试使用；禁止让 UDS 继续携带 vendor threadId/sessionId trunk 作为
+  canonical identity。
 
 进入 RuntimeCore 的不是可由 transport 拼字段构造的 public enum，而是字段私有、只能由 daemon
 内部认证 issuer 签发的 `AuthenticatedPrincipal` capability。相同完整授权身份共享同一个
@@ -460,13 +466,15 @@ decode 前丢失 typed failure、慢 socket 在 Core fail-close 后继续持有 
    复用，只有显式删除该 client installation record/重装才生成新值；具体存储与跨进程重启门禁归 P3.9。
 2. preface 后的第一条 Runtime frame 必须是 `RuntimeRequest::Hello`。framing 先在完整、受限 raw JSON 上
    strict probe 顶层 `version/messageId/body`，其中 body 暂存为 raw JSON，再做 `RuntimeEnvelope` 完整
-   反序列化：header 合法但 version≠1 时，
-   daemon 用当前 version=1、原 messageId flush 一条
+   反序列化：header 合法但 version 不等于当前 `RUNTIME_PROTOCOL_VERSION` 时，
+   daemon 用当前 Runtime version、原 messageId flush 一条
    `daemon.runtime.protocol_mismatch` 后关闭；header 缺失/重复/类型错误、malformed JSON 或 oversize
-   直接关闭，不伪造 reply。version=1 后才进入 strict envelope decoder；首帧若不是 Request/Hello，flush
+   直接关闭，不伪造 reply。version 与当前常量相等后才进入 strict envelope decoder；首帧若不是
+   Request/Hello，flush
    一条同 messageId `daemon.runtime.invalid_request` 后关闭，绝不执行该请求。Hello 内层版本不匹配仍是
    普通 typed reply，不绕过 Core。readiness 必须完成 connect → preface → Hello → Hello reply，socket
-   pathname 存在不构成 ready。
+   pathname 存在不构成 ready。这里 `LocalClientPrefaceV1.localProtocolVersion=1` 是独立的本地
+   transport preface 版本，保持 1；其后的 RuntimeEnvelope 在 P3.9-C0 后固定为 version 2。
 3. UDS 签发显式 `LocalControlPrincipal`，approval grant 固定 `ResolveAndRetry`；read-only local issuer 保持
    `None`。`ResolveApproval/RetryApproval` 继续只消费 capability，不允许在请求处理时用 `is_local()`
    绕过权限。同一完整 identity 若已以不同 approval grant 建立 lease，必须 `PermissionConflict`，不能
@@ -518,6 +526,213 @@ guard 同时检查 Cargo dependency tree，禁止仅靠 source grep 漏掉 reqwe
 `scripts/check-daemon-network-boundary.sh` 是权威实现；历史
 `scripts/check-daemon-no-net.sh` 继续保留为无额外逻辑的兼容 wrapper，只 `exec` 权威入口。
 
+#### 8.2.2 P3.9 Runtime v2 与 shared-daemon client 契约补全（2026-07-16）
+
+本节防御的具体威胁场景是：App/CLI 在 Runtime v1 尚不能表达当前初始策略、vendor control 与 native
+history 时直接切到 UDS，会让用户选择静默回落默认值、历史入口消失，并让 legacy vendor identity 被迫
+重新塞进 common wire。P3.9 因此不是 transport-only task；默认 client cutover 前先冻结以下契约：
+
+- `RUNTIME_PROTOCOL_VERSION` 从 1 升到 2。所有绑定 Runtime version 的 schema、Rust/Swift fixture、Relay
+  cert/TBS、revocation 与 vectors 同步重生成；旧 v1 production client typed mismatch，不保留双栈 parser。
+- 新会话固定 `Start → ConfigureConversation(rev0) → Subscribe → SendPrompt(expected rev1)`。
+  configuration append-only；Configure 以 expected revision + idempotency 做 CAS，Accepted command 同事务 pin
+  exact revision，重启恢复按该 revision 构造 driver。之后的 Configure 只影响之后 Accepted 的 prompt。
+- configuration 位于 `vendorControl` namespace：Codex 固定 approval policy/sandbox/reasoning effort，CC
+  固定 permission mode/model/effort/output style。Codex persistence 由每次 approval decision 表达；没有真实
+  canonical 执行样本的 mcp overrides、CC tools/path/plugin/hooks 不进入 v2；CC session id 永不进 wire，
+  worktree/session name 未取得真实首次启动+resume证据时非空 typed reject。配置变化产生
+  `ConfigurationChanged`；adapter panel 仍只走 `vendorPanel` event。
+- `DescribeAgents` 返回 capabilities 与 default configuration，任意已认证 Runtime principal 可读。普通
+  selfcheck 是 Hello+DescribeAgents；完整 bootstrap selfcheck/diagnostics 保留显式 one-shot 运维入口。
+- Runtime DB v4→v5 migration 把既有 conversation 标成 rev0/unconfigured；迁移前已 Accepted/Started
+  command 的 revision 0 只表示 frozen P3.7 legacy defaults，且仅供 startup recovery 消费。所有 v5 新
+  command 必须引用存在的非零 revision；既有 conversation 再接收 prompt 前先 Configure。native importer
+  原子种入该 agent 的 default rev1，避免把刚导入的历史误当 legacy command。
+- native-history import 不是 public Runtime request。daemon bootstrap/reconciliation 让 adapter 私域验证
+  本机真实 entry，再按 namespace+opaque reference 稳定派生 conversation/adapter-state identity，并在单
+  事务写 private binding、neutral descriptor 与 catalog delta。native transcript 不复制成第二份 Runtime
+  权威正文；adapter read 必须返回真实 native item key（CC 使用 JSONL uuid，不得退回数组下标），Runtime
+  从 conversation + stable key 域分离派生稳定 item/entity/command identity，重复读取与重启得到相同
+  snapshot。客户端 history list/read 只走 Catalog+Snapshot；`UpdateConversationMetadata` 对 AgentDeck
+  managed conversation 提交 canonical mutation，对 native-projected conversation 则先调用 adapter 原生
+  operation 并在后续 reconciliation 读回；原生不支持时返回 typed unsupported，不静默改成 AgentDeck-only
+  metadata。这样继续以 CC 原生历史为事实源，也不建立 `cc-meta/` 或 transcript 副本。
+- native scan/parse 必须在 SQLite write transaction 之外完成；每轮最多检查 2,000 个候选、导入 500 个
+  conversation、累计读取 64 MiB，并在 2 秒 wall-clock budget 到达时保存 opaque continuation 后让出。
+  单 transcript snapshot 仍受 64 MiB/10,000 item 上界，超限返回 typed history-too-large；不得因 bootstrap
+  扫描而无限延迟 UDS readiness。
+- v2 从 `ConversationEntry` 与 `ConversationStartReceipt` 删除 `adapterStateKey`，Swift 也不再定义可供
+  client 使用的 `RuntimeAdapterStateKey`。客户端只持 `conversationId`；daemon 内部从已认证 Runtime store
+  解析 exact adapter key。schema、fixture、日志和 public Debug 输出扫描必须证明没有该私域 handle。
+- Runtime store 为 conversation 持久化 authenticated daemon-private
+  `ConversationOrigin::Managed | NativeProjected(namespace)`；v4 migration 固定 Managed，projector import
+  固定 NativeProjected。禁止用“是否已有 adapter binding”猜 origin，因为 managed conversation 首次执行后
+  同样会有 binding。
+
+Runtime v2 的新增公共形状固定为：
+
+```rust
+enum RuntimeRequest {
+    DescribeAgents,
+    ConfigureConversation(ConfigureConversationRequest),
+    UpdateConversationMetadata(ConversationMetadataMutationRequest),
+    StageUpgrade(StageUpgradeRequest), // local-only dormant DTO；执行语义在 P3.10
+    // 其余 v1 family 保留；SendPromptRequest 增加 expected_configuration_revision。
+}
+
+struct AgentDescriptions { agents: Vec<AgentDescription> }
+struct AgentDescription {
+    agent_kind: AgentKind,
+    capabilities: SessionCapabilities,
+    default_configuration: ConversationConfiguration,
+}
+
+struct ConversationConfiguration { vendor_control: VendorConfigurationSnapshot }
+enum VendorConfigurationSnapshot {
+    Codex(CodexConversationConfiguration),
+    ClaudeCode(ClaudeCodeConversationConfiguration),
+}
+struct CodexConversationConfiguration {
+    approval_policy: CodexApprovalPolicy,
+    sandbox: CodexSandboxMode,
+    reasoning_effort: CodexReasoningEffort,
+}
+struct ClaudeCodeConversationConfiguration {
+    permission_mode: ClaudeCodePermissionMode,
+    model: Option<String>,
+    effort: Option<String>,
+    output_style: Option<String>,
+}
+
+struct ConfigureConversationRequest {
+    conversation_id: ConversationId,
+    idempotency_key: IdempotencyKey,
+    expected_configuration_revision: u64,
+    configuration: ConversationConfiguration,
+}
+
+struct SendPromptRequest {
+    conversation_id: ConversationId,
+    idempotency_key: IdempotencyKey,
+    expected_configuration_revision: u64,
+    prompt: PromptPayload,
+}
+enum CommandReceipt {
+    Accepted { command_id: CommandId, queue_position: u32, configuration_revision: u64 },
+    Replayed { command_id: CommandId, configuration_revision: u64 },
+    Failed { failure: RuntimeFailure },
+}
+struct CommandStatusReceipt {
+    conversation_id: ConversationId,
+    command_id: CommandId,
+    configuration_revision: u64,
+    status: CommandStatus,
+    turn_id: Option<TurnId>,
+}
+struct ConversationStartReceipt { conversation_id: ConversationId, replayed: bool }
+struct ConversationEntry {
+    conversation_id: ConversationId,
+    agent_kind: AgentKind,
+    title: Option<String>,
+    cwd: Option<PathBuf>,
+    last_active_ms: u64,
+    archived: bool,
+    entry_revision: u64,
+}
+struct ConversationSnapshot {
+    conversation_id: ConversationId,
+    base_event_cursor: StreamCursor,
+    configuration_state: ConversationConfigurationState,
+    items: Vec<SnapshotItem>,
+}
+enum RuntimeEventBody {
+    ConfigurationChanged { state: ConversationConfigurationState },
+    VendorPanelEvent { vendor_panel: VendorPanelPayload },
+    // 其余 v1 canonical event family 保留。
+}
+struct ConversationConfigurationState {
+    configuration_revision: u64,
+    configuration: Option<ConversationConfiguration>, // rev0 时必须为 None
+}
+enum ConfigurationReceipt {
+    Applied { conversation_id: ConversationId, configuration_revision: u64 },
+    Replayed { conversation_id: ConversationId, configuration_revision: u64 },
+    Conflict { conversation_id: ConversationId, current_configuration_revision: u64 },
+    Failed { failure: RuntimeFailure },
+}
+
+struct ConversationMetadataMutationRequest {
+    conversation_id: ConversationId,
+    idempotency_key: IdempotencyKey,
+    expected_entry_revision: u64,
+    mutation: ConversationMetadataMutation,
+}
+enum ConversationMetadataMutation {
+    Rename { title: Option<String> },
+    SetArchived { archived: bool },
+}
+enum ConversationMetadataReceipt {
+    Applied { conversation_id: ConversationId, entry_revision: u64 },
+    Replayed { conversation_id: ConversationId, entry_revision: u64 },
+    Conflict { conversation_id: ConversationId, current_entry_revision: u64 },
+    Failed { failure: RuntimeFailure },
+}
+
+struct StageUpgradeRequest {
+    target_version: String,
+    candidate_sha256: ArtifactSha256, // canonical lowercase 64-hex；不接受任意 path
+    idempotency_key: IdempotencyKey,
+    scope: LocalOnlyAdministration,
+}
+enum StageUpgradeReceipt {
+    Staged { target_version: String },
+    AwaitingIdle { target_version: String, active_turns: u32 },
+    Replayed { target_version: String },
+    Failed { failure: RuntimeFailure },
+}
+```
+
+`StageUpgrade.idempotencyKey` 属 machine-wide local-admin namespace，并在 P3.10 进入 durable admin ledger；
+相同 key 只有 targetVersion+candidateSha256 byte-identical 才 Replayed，异 payload 必须 conflict。P3.9 仅
+冻结 DTO 并返回 feature-unavailable，不提前创建 installer 副作用。
+
+`RuntimeReply` 对应新增 `Agents`、`Configuration`、`ConversationMetadata`、`StageUpgrade`；metadata receipt 同样使用
+Applied/Replayed/Conflict/Failed。`ConversationEntry` 增加 `entryRevision`，metadata mutation 必须在同一
+SQLite transaction 更新 descriptor/lifecycle、entry revision、catalog revision 与 `CatalogDelta`；native
+operation 属流程外副作用，先成功再刷新投影，DB outcome unknown 时靠同 idempotency key + native readback
+恢复，不能声称跨 vendor/SQLite 原子提交。native mutation 在任何 vendor 副作用前，必须先以 expected
+entry revision + idempotency key 在 SQLite CAS claim；conversation actor 串行推进
+`Claimed → Applying → Applied | OutcomeUnknown | Failed`。只有 native readback 证明结果后才能 finalize
+entry/catalog revision；crash/timeout 从 durable claim 恢复，未 claim 的并发请求绝不调用 vendor。
+`CommandReceipt::Accepted/Replayed`、`CommandStatusReceipt` 都回传 command pin 的 configuration revision；
+`ConversationSnapshot` 携带当前 `ConversationConfigurationState`，`RuntimeEventBody` 增加
+`ConfigurationChanged { state: ConversationConfigurationState }` 与 namespaced `VendorPanelEvent`。
+`SendPromptRequest` 必须携带 `expectedConfigurationRevision`；`CommandReceipt::Accepted` 返回
+`commandId/queuePosition/configurationRevision`，`Replayed` 返回 `commandId/configurationRevision`，
+`CommandStatusReceipt` 返回同一 pinned revision。configuration event 不携带 command/item/entity
+identity；任一 configuration 的 agent kind 与 conversation descriptor 不匹配都 fail-close。
+- native history adapter 返回 `NativeTurnKey` 与每项 `NativeItemKey`，不能只返回扁平 items 或数组下标。
+  同一 turn 的 user/assistant/tool 共享由 turn key 派生的 history commandId；item/entity identity 由 item key
+  派生。该 commandId 不代表 command journal Accepted；`QueryReceipt` 对已由当次 native read 验证的历史
+  command 返回 typed `daemon.command.history_only`，随机/未知 ID 仍返回 not-found。
+- projector 用 scan generation 管理消失：只有完整走完一个 generation 后仍未出现的 native entry 才发布
+  `CatalogChange::Removed`；部分 page 未看到不能删除。private binding 与 identity tombstone 保留 30 天，
+  期间 entry 重现复用同一 conversationId；tombstone 不计 active 1,024 conversation cap，过期后按受限批次
+  清理。单次 import 遇到 active cap 时停止并报告 typed truncated，不绕过资源上限。
+- App 与 CLI 分别持久化 installation UUID；它只划分审计、配额与 idempotency owner，不是认证 secret。
+  信任根仍是 UDS 内核 peer credential。record parent/file 的 0700/0600、owner、no-follow、single-link、
+  atomic create/readback 任一失败都 fail-close，损坏时不自动轮换。首次创建必须用同目录 temp+fsync 后
+  `renameatx_np(..., RENAME_EXCL)` no-replace 提交；race loser 只验证 winner，绝不能普通 rename 覆盖。
+  两端都必须用当前 EUID 的 `getpwuid_r` 解析 OS account home，禁止信任可变 `HOME`。
+- stable production endpoint 只有 `DaemonPaths.socket`。dev/test endpoint 必须由测试显式注入，或从 current
+  UID、exact 0700 private `TMPDIR` 中发现并验证唯一 `ad-*/s`；客户端环境变量不能任意改写 production
+  socket。production connection failure 返回 typed error，不 spawn 私有 daemon。
+
+这里的信任根是 same-EUID peer credential、Runtime store 的 StorageKEK/identity derivation、adapter 对
+native history 的真实文件/API 验证，以及 installation record 的本机文件系统语义。它证明本地 client
+请求绑定到当前 OS user 和稳定 installation namespace，并证明 wire 不暴露 native resume identity；它不
+证明同一 UID 下恶意进程不知道 installation UUID，也不把 recorded vendor fixture 当作真实登录证据。
+
 ### 8.3 Per-conversation actor
 
 每个 conversation 有一个逻辑 actor：
@@ -538,12 +753,15 @@ guard 同时检查 Cargo dependency tree，禁止仅靠 source grep 漏掉 reqwe
 `Start` 是纯幂等 catalog create，不携带首条 prompt：请求必须给 `agentKind`、start
 idempotency key、绝对 `cwd` 与可选 title；Runtime store 从 StorageKEK 取得只在 daemon
 内部持有的域分离 capability，对 owner+key 派生稳定 `conversationId/adapterStateKey`，再返回
-`ConversationStartReceipt(replayed)`。客户端收到该回执后必须用独立 key 发送 `SendPrompt`；不得把
-create 与首 prompt 拼成一个无法原子重放的请求。
+`ConversationStartReceipt(replayed)`。客户端收到该回执后必须先用独立 key 执行
+`ConfigureConversation(expectedRevision=0)`，再 Subscribe，最后用第三个独立 key 发送
+`SendPrompt(expectedConfigurationRevision=1)`；不得把 create/config/首 prompt 拼成一个无法精确重放的
+请求。
 
-1. 校验 principal 权限、conversation 和 payload。
-2. 在 command journal 中写入 principal、idempotency key、payload hash、commandSeq 和 `Accepted` 状态。
-3. 事务提交后返回 `CommandReceipt::Accepted(queuePosition)`。
+1. 校验 principal 权限、conversation、payload 与 expected configuration revision。
+2. 在 command journal 中写入 principal、idempotency key、payload hash、commandSeq、pinned
+   configuration revision 和 `Accepted` 状态。
+3. 事务提交后返回 `CommandReceipt::Accepted(queuePosition, configurationRevision)`。
 4. actor 取到队首后，在 **同一个 SQLite 事务** 把 command 状态写为 `Started(executionNonce)`、写入 `ExecutionIntent(daemonBootId, executionNonce)`，并把 canonical `CommandStarted` event 写入 event journal；事务提交完成前不得 spawn/调用 adapter。
 5. 事务提交后 spawn 同一已签名 `agentdeckd --exec-gate` 子模式：gate 先建立独立 process group 并在 exec vendor 前阻塞，通过私有 pipe 回报 `processGroupId/leaderPid/leaderStartTime/executionNonce`。`prepare` 只能返回 blocked gate 的 control 与 **cold release capability**，不能返回已热启动的 completion future；daemon 在第二个事务把进程值提升为 `ExecutionFence`，再把 `authorizeExecutionRelease` 的 COMMIT 回执封装为不可伪造、单次消费的 release permit。gate 只有 capability 消费该 permit 且 token/nonce 匹配才 exec vendor，随后才产生 completion future。adapter 参数准备可以在 release 前完成，但任何 vendor/tool 副作用都不能越过 gate。blocked gate 从创建起必须由唯一 reaper 持有并等待；release 前 cancel/cleanup 也必须 TERM→KILL 后消费该 child，不能让 zombie sentinel 被误判成未退出进程组。vendor program 只从与 gate 最终环境相同的固定绝对目录集合解析 basename，不读取继承 PATH；正确 OS account、当前签名 daemon binary、固定 vendor 安装目录及其中预期 binary 是本机制的流程外信任根，同一 account 主动替换被信任 binary 不在 gate 的证明边界内。
 6. 结果先写 journal/event journal，再广播 `Completed/Failed/Interrupted`。
@@ -643,8 +861,9 @@ P3.7 的具体威胁场景是：daemon 在 Started 后崩溃、被取消或丢�
   ApprovalResolved、TurnCompleted、TurnInterrupted 都必须 `commandId` 且 item/entity 为 null；Error
   的 item/entity 必须为 null、command 可 null；body 若仍携带 command identity，必须与外层逐字匹配。
   `SnapshotItem` 采用同一 identity matrix；构造、Rust decode 与 Swift decode 都执行同一校验。
-- `RuntimeEnvelope.version` 在 Rust/Swift ingress 与 egress 都必须精确等于
-  `RUNTIME_PROTOCOL_VERSION=1`；Hello 内的协商字段不替代 envelope 版本校验。
+- `RuntimeEnvelope.version` 在 Rust/Swift ingress 与 egress 都必须精确等于当前
+  `RUNTIME_PROTOCOL_VERSION`；P1–P3.8 基线为 1，P3.9-C0 因 wire 形态变化原子升级到 2。Hello 内的
+  协商字段不替代 envelope 版本校验，production 不提供 v1/v2 双栈。
 - `messageId` 与 `transferId` 的 wire 值必须非空且最多 1,024 UTF-8 bytes。JSON Schema 的
   `maxLength` 只提供字符数必要上界，并用 `x-maxUtf8Bytes: 1024` 记录真正由双端 codec 强制的
   byte cap；不能把 1,024 个 Unicode code points 当作 1,024 bytes。
@@ -653,7 +872,7 @@ P3.7 的具体威胁场景是：daemon 在 Started 后崩溃、被取消或丢�
   从 authenticated `event_journal.command_id` 注入并核验 command identity，且 legacy body 内已有
   command 必须与 journal 一致；补齐全部 required-null key 后再次走 strict decoder。opaque
   `sealed_event`/fixed event ciphertext、nonce 与 wrapped key byte-identical；bridge 不导出到
-  protocol/Swift，也不形成第二套公开 Runtime v1 wire。
+  protocol/Swift，也不形成第二套公开 Runtime wire。
 
 ### 9.2 Runtime wire 最终形状
 
@@ -1042,7 +1261,11 @@ Challenge、PairRoute、connection registry、writer queues、heartbeat timers �
 
 UIKit ViewModel 保持 `@MainActor`，只消费 source 状态。
 
-macOS executable 侧增加 `LocalDaemonSessionSource`（RuntimeEnvelope v1 over UDS）与 `SessionSourceRegistry`。registry 把“本机”绑定到唯一 UDS source，把每台 paired remote machine 绑定到独立 RelaySessionSource；`WorkbenchModel`/AppKit controller 只按选中的 machine scope 消费统一 `SessionSource`，不在 UI 层写 `if agentKind` 或直接处理 Relay crypto。iOS 发行版只注册 Relay source，Fixture source 仅注入 preview/test。
+macOS executable 侧增加 `LocalDaemonSessionSource`（RuntimeEnvelope v2 over UDS）与
+`SessionSourceRegistry`。registry 把“本机”绑定到唯一 UDS source，把每台 paired remote machine 绑定到
+独立 RelaySessionSource；`WorkbenchModel`/AppKit controller 只按选中的 machine scope 消费统一
+`SessionSource`，不在 UI 层写 `if agentKind` 或直接处理 Relay crypto。iOS 发行版只注册 Relay source，
+Fixture source 仅注入 preview/test。
 
 ### 13.2 共享 SessionSource（原 MobileSessionSource）契约
 
@@ -1138,7 +1361,10 @@ Relay 外层错误只描述通用路由/传输失败；daemon 业务错误必须
 - 准备显式 trust reset 和验证脚本骨架。
 - 保证现有 cargo/swift/iOS/docs tests 仍全绿。
 - P0冻结当前Relay v1 schema与行为基线；P1继续编译v1 namespace并运行历史行为测试，但按P1.3把v1 entries从local IPC aggregate schema移除，不另建目标v1 schema。严格最小可见不变量从并列的Relay v2 contract开始生效，并在P2.9原子cutover后成为唯一生产路径。期间不扩展v1产品能力，也不提供v1/v2双栈生产listener。
-- 固定四个独立版本轴：现有 local IPC `PROTOCOL_VERSION=2` 保持不变；新增 `RUNTIME_PROTOCOL_VERSION=1`、目标 `RELAY_PROTOCOL_VERSION=2`、`E2EE_FORMAT_VERSION=1`。schema 快照与 CLI 导出入口按 IPC/Runtime/Relay 分开，禁止再用一个常量暗示四层同时升级。
+- 固定四个独立版本轴：现有 local IPC `PROTOCOL_VERSION=2` 保持不变；Runtime 初始基线
+  `RUNTIME_PROTOCOL_VERSION=1` 并在 P3.9-C0 因自身 wire 变化独立升到 2；
+  `RELAY_PROTOCOL_VERSION=2`、`E2EE_FORMAT_VERSION=1` 不随之 bump。schema 快照与 CLI 导出入口按
+  IPC/Runtime/Relay 分开，禁止再用一个常量暗示四层同时升级。
 - 每个阶段在合入代码时同步更新 README、ARCHITECTURE、QUALITY、DIAGNOSTICS、docs index/对应计划与 AGENTS 当前重点；不能把行为/架构文档全部拖到 P6。本次 design-only commit 仍保持单文件 scoped boundary，正式代码阶段再按实际落地事实更新入口文档。
 
 ### P1 Protocol + Crypto
@@ -1160,11 +1386,17 @@ Relay 外层错误只描述通用路由/传输失败；daemon 业务错误必须
 ### P3 Singleton RuntimeCore
 
 - RuntimeHub 拆成 transport-neutral core。
-- RuntimeEnvelope v1 成为 UDS canonical wire；stable conversationId、principal、per-conversation actors、journals、snapshot barrier、UDS/LaunchAgent 安装升级。
+- P3.8 以 RuntimeEnvelope v1 建立 UDS，P3.9-C0 升为 RuntimeEnvelope v2 canonical wire；stable
+  conversationId、configuration revision、principal、per-conversation actors、journals、snapshot barrier、
+  UDS/LaunchAgent 安装升级。
 - 各 adapter 私有 `adapterStateKey → vendor resume ref` 映射；同步更新 N8，明确 CC 索引为 derived/non-authoritative 且不创建 `cc-meta/`。
 - macOS App/CLI 切到同一 daemon；保留能力降级的 local IPC v2/stdin compatibility adapter 给旧测试。
 
-退出门禁：两个本地 Runtime v1 客户端共享一个真实会话且 prompt/approval 竞态符合本文；同时在干净用户环境验证 install + `launchctl print`、active-turn stage/idle switch、protocol mismatch、uninstall 保留数据，以及 `--ephemeral --no-remote` 无法读取 stable DB/Keychain/socket。P3 的 `uninstall --purge` 只验证 typed `daemon.purge.remote_not_ready` 且零删除；完整 trust-reset/purge 门禁留到 P4 RemoteTransport 存在后执行。
+退出门禁：两个本地 Runtime v2 客户端共享一个真实会话且 configuration/prompt/approval 竞态符合本文；
+同时在干净用户环境验证 install + `launchctl print`、active-turn stage/idle switch、protocol mismatch、
+uninstall 保留数据，以及 `--ephemeral --no-remote` 无法读取 stable DB/Keychain/socket。P3 的
+`uninstall --purge` 只验证 typed `daemon.purge.remote_not_ready` 且零删除；完整 trust-reset/purge 门禁留到
+P4 RemoteTransport 存在后执行。
 
 ### P4 Machine RemoteLink
 
@@ -1325,7 +1557,8 @@ MVP 完成不扩展到 APNs、后台常驻、离线 transcript、附件、多租
 
 - Codex/Claude Code 原生历史不删除、不迁入 Relay。
 - 现有 AgentDeck run record/diagnostics 按 Application Support 规则保留。
-- Runtime DB 的 common catalog 只迁移中立 conversation/adapterStateKey；vendor resume reference 只能进入对应 adapter 私有 namespace，CC 派生索引可丢弃后从原生历史重建。
+- Runtime DB 只迁移中立 conversation rows；daemon-private `adapterStateKey` 与对应 vendor resume reference
+  留在各 adapter 私有 namespace，均不进入 common catalog wire。CC 派生索引可丢弃后从原生历史重建。
 - 不提交 Relay DB、runtime DB、logs、Keychain 导出、invite、token、cert private key 或用户项目数据。
 
 ### 18.3 阶段回滚
