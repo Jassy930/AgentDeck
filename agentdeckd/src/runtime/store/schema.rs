@@ -6,11 +6,42 @@ use sha2::{Digest, Sha256};
 
 pub const RUNTIME_SCHEMA_FAMILY: &str = "agentdeck-runtime";
 pub const RUNTIME_SCHEMA_VERSION: u32 = 4;
+/// B1a 只冻结下一版物理形状；production version 在 B1b 真实 migration 闭环后切换。
+#[cfg_attr(not(test), allow(dead_code))]
+pub const RUNTIME_SCHEMA_VERSION_V5: u32 = 5;
 /// 行密文与 wrapped key bundle 的 AAD context 版本。
 ///
 /// physical schema migration 只增表/增认证计数，不得让既有行重新加密或重新包装。
 pub const RUNTIME_CRYPTO_CONTEXT_VERSION: u32 = 1;
 pub const RUNTIME_KEY_GENERATION: u32 = 1;
+#[cfg_attr(not(test), allow(dead_code))]
+pub const MAX_CONFIGURATION_BYTES: usize = 16 * 1024;
+#[cfg_attr(not(test), allow(dead_code))]
+pub const MAX_CONFIGURATION_REQUEST_BYTES: usize = 32 * 1024;
+#[cfg_attr(not(test), allow(dead_code))]
+pub const MAX_CONFIGURATION_VERSIONS_PER_CONVERSATION: u64 = 4_096;
+#[cfg_attr(not(test), allow(dead_code))]
+pub const MAX_CONFIGURATION_VERSIONS_GLOBAL: u64 = 65_536;
+#[cfg_attr(not(test), allow(dead_code))]
+pub const MAX_CONFIGURATION_SEALED_BYTES_GLOBAL: u64 = 64 * 1024 * 1024;
+#[cfg_attr(not(test), allow(dead_code))]
+pub const MAX_COMMAND_CONFIGURATION_PINS: u64 = 1_048_576;
+#[cfg_attr(not(test), allow(dead_code))]
+pub const MAX_METADATA_MUTATION_REQUEST_BYTES: usize = 16 * 1024;
+#[cfg_attr(not(test), allow(dead_code))]
+pub const MAX_METADATA_MUTATION_OUTCOME_BYTES: usize = 16 * 1024;
+#[cfg_attr(not(test), allow(dead_code))]
+pub const MAX_METADATA_MUTATIONS_PER_CONVERSATION: u64 = 4_096;
+#[cfg_attr(not(test), allow(dead_code))]
+pub const MAX_METADATA_MUTATIONS_GLOBAL: u64 = 65_536;
+#[cfg_attr(not(test), allow(dead_code))]
+pub const MAX_ACTIVE_METADATA_MUTATIONS: u64 = 1_024;
+#[cfg_attr(not(test), allow(dead_code))]
+pub const MAX_METADATA_MUTATION_CHARGED_BYTES_GLOBAL: u64 = 64 * 1024 * 1024;
+#[cfg_attr(not(test), allow(dead_code))]
+pub const RUNTIME_LEDGER_DOMAIN_V4: &[u8] = b"runtime.meta.ledger.v4";
+#[cfg_attr(not(test), allow(dead_code))]
+pub const RUNTIME_LEDGER_DOMAIN_V5: &[u8] = b"runtime.meta.ledger.v5";
 pub const EXPECTED_TABLES_V1: [&str; 7] = [
     "commands",
     "conversations",
@@ -43,7 +74,7 @@ pub const EXPECTED_TABLES_V3: [&str; 10] = [
     "machine_enrollment_receipts",
     "runtime_meta",
 ];
-pub const EXPECTED_TABLES: [&str; 16] = [
+pub const EXPECTED_TABLES_V4: [&str; 16] = [
     "approval_ledger",
     "catalog_journal",
     "claude_code_adapter_state",
@@ -61,8 +92,51 @@ pub const EXPECTED_TABLES: [&str; 16] = [
     "runtime_meta",
     "snapshots",
 ];
+/// B1a 期间 current runtime 仍严格验证 v4 manifest。
+pub const EXPECTED_TABLES: [&str; 16] = EXPECTED_TABLES_V4;
+#[cfg_attr(not(test), allow(dead_code))]
+pub const EXPECTED_TABLES_V5: [&str; 20] = [
+    "approval_ledger",
+    "catalog_journal",
+    "claude_code_adapter_state",
+    "codex_adapter_state",
+    "command_configuration_pins",
+    "commands",
+    "configuration_journal",
+    "conversation_state",
+    "conversations",
+    "event_journal",
+    "event_retention",
+    "event_stream_index",
+    "execution_fences",
+    "execution_intents",
+    "machine_enrollment_receipts",
+    "metadata_mutation_ledger",
+    "publication_outbox",
+    "publication_streams",
+    "runtime_meta",
+    "snapshots",
+];
 
 pub fn schema_signature() -> [u8; 32] {
+    schema_signature_v4()
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn schema_signature_v5() -> [u8; 32] {
+    static SIGNATURE: OnceLock<[u8; 32]> = OnceLock::new();
+    *SIGNATURE.get_or_init(|| {
+        let mut digest = Sha256::new();
+        digest.update(RUNTIME_DDL_V1.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V2.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V3.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V4.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V5.as_bytes());
+        digest.finalize().into()
+    })
+}
+
+pub fn schema_signature_v4() -> [u8; 32] {
     static SIGNATURE: OnceLock<[u8; 32]> = OnceLock::new();
     *SIGNATURE.get_or_init(|| {
         let mut digest = Sha256::new();
@@ -789,10 +863,423 @@ CREATE INDEX idx_publication_pending
     ON publication_outbox(publication_stream_id, generation, stream_seq);
 "#;
 
+/// B1a 只冻结 additive v5 physical shape；B1b 才把 current production schema
+/// version、migration dispatch 与 authenticated row materialization 原子切到 v5。
+#[cfg_attr(not(test), allow(dead_code))]
+pub const RUNTIME_MIGRATION_V5: &str = r#"
+ALTER TABLE runtime_meta ADD COLUMN configuration_count INTEGER NOT NULL DEFAULT 0
+    CHECK(configuration_count BETWEEN 0 AND 65536);
+ALTER TABLE runtime_meta ADD COLUMN configuration_sealed_bytes INTEGER NOT NULL DEFAULT 0
+    CHECK(configuration_sealed_bytes BETWEEN 0 AND 67108864)
+    CHECK((configuration_count = 0 AND configuration_sealed_bytes = 0)
+       OR (configuration_count > 0 AND configuration_sealed_bytes > 0));
+ALTER TABLE runtime_meta ADD COLUMN command_configuration_pin_count INTEGER NOT NULL DEFAULT 0
+    CHECK(command_configuration_pin_count BETWEEN 0 AND 1048576)
+    CHECK(command_configuration_pin_count <= command_count);
+ALTER TABLE runtime_meta ADD COLUMN metadata_mutation_count INTEGER NOT NULL DEFAULT 0
+    CHECK(metadata_mutation_count BETWEEN 0 AND 65536);
+ALTER TABLE runtime_meta ADD COLUMN active_metadata_mutation_count INTEGER NOT NULL DEFAULT 0
+    CHECK(active_metadata_mutation_count BETWEEN 0 AND 1024)
+    CHECK(active_metadata_mutation_count <= metadata_mutation_count);
+ALTER TABLE runtime_meta ADD COLUMN metadata_mutation_charged_bytes INTEGER NOT NULL DEFAULT 0
+    CHECK(metadata_mutation_charged_bytes BETWEEN 0 AND 67108864)
+    CHECK((metadata_mutation_count = 0 AND metadata_mutation_charged_bytes = 0)
+       OR (metadata_mutation_count > 0 AND metadata_mutation_charged_bytes > 0));
+
+CREATE TABLE configuration_journal (
+    conversation_id BLOB NOT NULL
+        CHECK(typeof(conversation_id) = 'blob' AND length(conversation_id) = 16),
+    configuration_revision TEXT NOT NULL CHECK(
+        typeof(configuration_revision) = 'text'
+        AND length(configuration_revision) = 20
+        AND configuration_revision NOT GLOB '*[^0-9]*'
+        AND configuration_revision > '00000000000000000000'
+        AND configuration_revision <= '18446744073709551615'
+    ),
+    base_configuration_revision TEXT NOT NULL CHECK(
+        typeof(base_configuration_revision) = 'text'
+        AND length(base_configuration_revision) = 20
+        AND base_configuration_revision NOT GLOB '*[^0-9]*'
+        AND base_configuration_revision <= '18446744073709551615'
+        AND base_configuration_revision < configuration_revision
+    ),
+    event_seq TEXT NOT NULL CHECK(
+        typeof(event_seq) = 'text' AND length(event_seq) = 20
+        AND event_seq NOT GLOB '*[^0-9]*'
+        AND event_seq <= '18446744073709551615'
+    ),
+    owner_token BLOB NOT NULL
+        CHECK(typeof(owner_token) = 'blob' AND length(owner_token) = 32),
+    idempotency_token BLOB NOT NULL
+        CHECK(typeof(idempotency_token) = 'blob' AND length(idempotency_token) = 32),
+    request_token BLOB NOT NULL
+        CHECK(typeof(request_token) = 'blob' AND length(request_token) = 32),
+    logical_configuration_bytes INTEGER NOT NULL
+        CHECK(logical_configuration_bytes BETWEEN 1 AND 16384),
+    logical_request_bytes INTEGER NOT NULL
+        CHECK(logical_request_bytes BETWEEN 1 AND 32768)
+        CHECK(logical_configuration_bytes <= logical_request_bytes),
+    created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+    metadata_token BLOB NOT NULL
+        CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
+    sealed_request BLOB NOT NULL CHECK(
+        typeof(sealed_request) = 'blob'
+        AND length(sealed_request) BETWEEN 40 AND 32808
+        AND length(sealed_request) = logical_request_bytes + 40
+    ),
+    PRIMARY KEY(conversation_id, configuration_revision),
+    FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY(conversation_id, event_seq)
+        REFERENCES event_journal(conversation_id, event_seq)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+CREATE UNIQUE INDEX idx_configuration_event
+    ON configuration_journal(conversation_id, event_seq);
+CREATE UNIQUE INDEX idx_configuration_idempotency
+    ON configuration_journal(idempotency_token);
+
+CREATE TABLE conversation_state (
+    conversation_id BLOB PRIMARY KEY
+        CHECK(typeof(conversation_id) = 'blob' AND length(conversation_id) = 16),
+    current_configuration_revision TEXT CHECK(
+        current_configuration_revision IS NULL OR (
+            typeof(current_configuration_revision) = 'text'
+            AND length(current_configuration_revision) = 20
+            AND current_configuration_revision NOT GLOB '*[^0-9]*'
+            AND current_configuration_revision <> '00000000000000000000'
+            AND current_configuration_revision <= '18446744073709551615'
+        )
+    ),
+    entry_revision TEXT NOT NULL CHECK(
+        typeof(entry_revision) = 'text' AND length(entry_revision) = 20
+        AND entry_revision NOT GLOB '*[^0-9]*'
+        AND entry_revision <= '18446744073709551615'
+    ),
+    origin_kind TEXT NOT NULL CHECK(origin_kind IN ('managed', 'nativeProjected')),
+    origin_namespace TEXT CHECK(
+        origin_namespace IS NULL OR (
+            typeof(origin_namespace) = 'text'
+            AND length(CAST(origin_namespace AS BLOB)) BETWEEN 1 AND 64
+            AND instr(origin_namespace, char(0)) = 0
+        )
+    ),
+    legacy_command_high_water TEXT CHECK(
+        legacy_command_high_water IS NULL OR (
+            typeof(legacy_command_high_water) = 'text'
+            AND length(legacy_command_high_water) = 20
+            AND legacy_command_high_water NOT GLOB '*[^0-9]*'
+            AND legacy_command_high_water <= '18446744073709551615'
+        )
+    ),
+    metadata_token BLOB NOT NULL
+        CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
+    CHECK((origin_kind = 'managed' AND origin_namespace IS NULL)
+       OR (origin_kind = 'nativeProjected' AND origin_namespace IS NOT NULL)),
+    FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY(conversation_id, current_configuration_revision)
+        REFERENCES configuration_journal(conversation_id, configuration_revision)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+CREATE INDEX idx_conversation_state_origin
+    ON conversation_state(origin_kind, origin_namespace);
+
+CREATE TABLE command_configuration_pins (
+    conversation_id BLOB NOT NULL
+        CHECK(typeof(conversation_id) = 'blob' AND length(conversation_id) = 16),
+    command_seq TEXT NOT NULL CHECK(
+        typeof(command_seq) = 'text' AND length(command_seq) = 20
+        AND command_seq NOT GLOB '*[^0-9]*'
+        AND command_seq <= '18446744073709551615'
+    ),
+    configuration_revision TEXT NOT NULL CHECK(
+        typeof(configuration_revision) = 'text'
+        AND length(configuration_revision) = 20
+        AND configuration_revision NOT GLOB '*[^0-9]*'
+        AND configuration_revision > '00000000000000000000'
+        AND configuration_revision <= '18446744073709551615'
+    ),
+    metadata_token BLOB NOT NULL
+        CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
+    PRIMARY KEY(conversation_id, command_seq),
+    FOREIGN KEY(conversation_id, command_seq)
+        REFERENCES commands(conversation_id, command_seq)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY(conversation_id, configuration_revision)
+        REFERENCES configuration_journal(conversation_id, configuration_revision)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+CREATE INDEX idx_command_configuration_pins_configuration
+    ON command_configuration_pins(conversation_id, configuration_revision);
+
+CREATE TABLE metadata_mutation_ledger (
+    conversation_id BLOB NOT NULL
+        CHECK(typeof(conversation_id) = 'blob' AND length(conversation_id) = 16),
+    owner_token BLOB NOT NULL
+        CHECK(typeof(owner_token) = 'blob' AND length(owner_token) = 32),
+    idempotency_token BLOB NOT NULL
+        CHECK(typeof(idempotency_token) = 'blob' AND length(idempotency_token) = 32),
+    request_token BLOB NOT NULL
+        CHECK(typeof(request_token) = 'blob' AND length(request_token) = 32),
+    expected_entry_revision TEXT NOT NULL CHECK(
+        typeof(expected_entry_revision) = 'text'
+        AND length(expected_entry_revision) = 20
+        AND expected_entry_revision NOT GLOB '*[^0-9]*'
+        AND expected_entry_revision <= '18446744073709551615'
+    ),
+    applied_entry_revision TEXT CHECK(
+        applied_entry_revision IS NULL OR (
+            typeof(applied_entry_revision) = 'text'
+            AND length(applied_entry_revision) = 20
+            AND applied_entry_revision NOT GLOB '*[^0-9]*'
+            AND applied_entry_revision > '00000000000000000000'
+            AND applied_entry_revision <= '18446744073709551615'
+        )
+    ),
+    applied_catalog_revision TEXT CHECK(
+        applied_catalog_revision IS NULL OR (
+            typeof(applied_catalog_revision) = 'text'
+            AND length(applied_catalog_revision) = 20
+            AND applied_catalog_revision NOT GLOB '*[^0-9]*'
+            AND applied_catalog_revision > '00000000000000000000'
+            AND applied_catalog_revision <= '18446744073709551615'
+        )
+    ),
+    state TEXT NOT NULL CHECK(state IN (
+        'claimed', 'applying', 'applied', 'outcomeUnknown', 'failed'
+    )),
+    logical_request_bytes INTEGER NOT NULL
+        CHECK(logical_request_bytes BETWEEN 1 AND 16384),
+    logical_outcome_bytes INTEGER NOT NULL
+        CHECK(logical_outcome_bytes BETWEEN 0 AND 16384),
+    charged_outcome_bytes INTEGER NOT NULL
+        CHECK(charged_outcome_bytes BETWEEN 40 AND 16424),
+    created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+    state_changed_at_ms INTEGER NOT NULL CHECK(state_changed_at_ms >= created_at_ms),
+    metadata_token BLOB NOT NULL
+        CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
+    sealed_request BLOB NOT NULL CHECK(
+        typeof(sealed_request) = 'blob'
+        AND length(sealed_request) BETWEEN 40 AND 16424
+        AND length(sealed_request) = logical_request_bytes + 40
+    ),
+    sealed_outcome BLOB CHECK(
+        sealed_outcome IS NULL OR (
+            typeof(sealed_outcome) = 'blob'
+            AND length(sealed_outcome) BETWEEN 40 AND 16424
+            AND length(sealed_outcome) = logical_outcome_bytes + 40
+        )
+    ),
+    PRIMARY KEY(conversation_id, idempotency_token),
+    CHECK((applied_entry_revision IS NULL AND applied_catalog_revision IS NULL)
+       OR (applied_entry_revision IS NOT NULL AND applied_catalog_revision IS NOT NULL)),
+    CHECK((state = 'applied'
+           AND applied_entry_revision IS NOT NULL
+           AND applied_catalog_revision IS NOT NULL)
+       OR (state <> 'applied'
+           AND applied_entry_revision IS NULL
+           AND applied_catalog_revision IS NULL)),
+    CHECK((sealed_outcome IS NULL AND logical_outcome_bytes = 0)
+       OR (sealed_outcome IS NOT NULL AND logical_outcome_bytes BETWEEN 1 AND 16384)),
+    CHECK((state IN ('claimed', 'applying', 'outcomeUnknown')
+           AND sealed_outcome IS NULL
+           AND logical_outcome_bytes = 0)
+       OR state NOT IN ('claimed', 'applying', 'outcomeUnknown')),
+    CHECK((state IN ('claimed', 'applying', 'outcomeUnknown')
+           AND charged_outcome_bytes = 16424)
+       OR (state IN ('applied', 'failed')
+           AND sealed_outcome IS NOT NULL
+           AND charged_outcome_bytes = length(sealed_outcome))),
+    FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+CREATE INDEX idx_metadata_mutation_active
+    ON metadata_mutation_ledger(conversation_id, state, state_changed_at_ms)
+    WHERE state IN ('claimed', 'applying', 'outcomeUnknown');
+CREATE UNIQUE INDEX idx_metadata_mutation_idempotency
+    ON metadata_mutation_ledger(idempotency_token);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
+    use rusqlite::{Connection, params};
+
+    const V4_SCHEMA_SIGNATURE_GOLDEN: [u8; 32] = [
+        0x79, 0x20, 0x35, 0x80, 0xf3, 0x37, 0x1f, 0x06, 0x01, 0xf6, 0xf5, 0x24, 0x1f, 0x63, 0x4e,
+        0x05, 0xef, 0x12, 0xfa, 0x4f, 0x7d, 0x47, 0xa1, 0xd1, 0x45, 0x17, 0x87, 0x78, 0xe8, 0x8f,
+        0xc7, 0x11,
+    ];
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct TableColumn {
+        name: String,
+        column_type: String,
+        not_null: bool,
+        default_value: Option<String>,
+        primary_key_ordinal: i64,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct IndexShape {
+        unique: bool,
+        partial: bool,
+        columns: Vec<String>,
+        sql: String,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ForeignKeyColumn {
+        id: i64,
+        seq: i64,
+        target_table: String,
+        source_column: String,
+        target_column: String,
+        on_update: String,
+        on_delete: String,
+    }
+
+    fn table_names(connection: &Connection) -> Vec<String> {
+        connection
+            .prepare(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                 ORDER BY name",
+            )
+            .expect("prepare table manifest")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query table manifest")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect table manifest")
+    }
+
+    fn table_columns(connection: &Connection, table: &str) -> Vec<String> {
+        connection
+            .prepare(&format!(
+                "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
+            ))
+            .expect("prepare table columns")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query table columns")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect table columns")
+    }
+
+    fn table_column_details(connection: &Connection, table: &str) -> Vec<TableColumn> {
+        connection
+            .prepare(&format!(
+                "SELECT name, type, \"notnull\", dflt_value, pk
+                 FROM pragma_table_info('{table}') ORDER BY cid"
+            ))
+            .expect("prepare table column details")
+            .query_map([], |row| {
+                Ok(TableColumn {
+                    name: row.get(0)?,
+                    column_type: row.get(1)?,
+                    not_null: row.get::<_, i64>(2)? != 0,
+                    default_value: row.get(3)?,
+                    primary_key_ordinal: row.get(4)?,
+                })
+            })
+            .expect("query table column details")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect table column details")
+    }
+
+    fn explicit_indexes(connection: &Connection, table: &str) -> Vec<String> {
+        connection
+            .prepare(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'index' AND tbl_name = ?1
+                   AND name NOT LIKE 'sqlite_%'
+                 ORDER BY name",
+            )
+            .expect("prepare table indexes")
+            .query_map([table], |row| row.get::<_, String>(0))
+            .expect("query table indexes")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect table indexes")
+    }
+
+    fn index_shape(connection: &Connection, table: &str, index: &str) -> IndexShape {
+        let (unique, partial): (i64, i64) = connection
+            .query_row(
+                &format!(
+                    "SELECT \"unique\", partial FROM pragma_index_list('{table}') WHERE name = ?1"
+                ),
+                [index],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read index flags");
+        let columns = connection
+            .prepare(&format!(
+                "SELECT name FROM pragma_index_info('{index}') ORDER BY seqno"
+            ))
+            .expect("prepare index columns")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query index columns")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect index columns");
+        let sql = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?1",
+                [index],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read index SQL");
+        IndexShape {
+            unique: unique != 0,
+            partial: partial != 0,
+            columns,
+            sql,
+        }
+    }
+
+    fn foreign_key_columns(connection: &Connection, table: &str) -> Vec<ForeignKeyColumn> {
+        let mut columns = connection
+            .prepare(&format!("SELECT id, seq, \"table\", \"from\", \"to\", on_update, on_delete FROM pragma_foreign_key_list('{table}')"))
+            .expect("prepare foreign keys")
+            .query_map([], |row| {
+                Ok(ForeignKeyColumn {
+                    id: row.get(0)?,
+                    seq: row.get(1)?,
+                    target_table: row.get(2)?,
+                    source_column: row.get(3)?,
+                    target_column: row.get(4)?,
+                    on_update: row.get(5)?,
+                    on_delete: row.get(6)?,
+                })
+            })
+            .expect("query foreign keys")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect foreign keys");
+        columns.sort_by(|left, right| {
+            (
+                left.target_table.as_str(),
+                left.id,
+                left.seq,
+                left.source_column.as_str(),
+            )
+                .cmp(&(
+                    right.target_table.as_str(),
+                    right.id,
+                    right.seq,
+                    right.source_column.as_str(),
+                ))
+        });
+        columns
+    }
+
+    fn table_sql(connection: &Connection, table: &str) -> String {
+        connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .expect("read table SQL")
+    }
 
     #[test]
     fn stream_schema_advances_to_v4_with_six_bounded_store_tables() {
@@ -830,6 +1317,902 @@ mod tests {
             .execute_batch(RUNTIME_MIGRATION_V3)
             .expect("apply v3 migration");
         connection
+    }
+
+    fn v4_connection() -> Connection {
+        let connection = v3_connection();
+        connection
+            .execute_batch(RUNTIME_MIGRATION_V4)
+            .expect("apply v4 migration");
+        connection
+    }
+
+    fn v5_structural_connection() -> Connection {
+        let connection = v4_connection();
+        connection
+            .execute_batch(RUNTIME_MIGRATION_V5)
+            .expect("apply v5 structural migration");
+        connection
+    }
+
+    #[test]
+    fn v5_sidecar_freeze_preserves_the_current_v4_schema_surface() {
+        assert_eq!(RUNTIME_SCHEMA_VERSION, 4);
+        assert_eq!(RUNTIME_SCHEMA_VERSION_V5, 5);
+        assert_eq!(EXPECTED_TABLES.len(), 16);
+        assert_eq!(EXPECTED_TABLES_V5.len(), 20);
+        assert_eq!(schema_signature(), schema_signature_v4());
+        assert_eq!(schema_signature_v4(), V4_SCHEMA_SIGNATURE_GOLDEN);
+        let mut expected_v5 = Sha256::new();
+        for migration in [
+            RUNTIME_DDL_V1,
+            RUNTIME_MIGRATION_V2,
+            RUNTIME_MIGRATION_V3,
+            RUNTIME_MIGRATION_V4,
+            RUNTIME_MIGRATION_V5,
+        ] {
+            expected_v5.update(migration.as_bytes());
+        }
+        assert_eq!(
+            schema_signature_v5(),
+            <[u8; 32]>::from(expected_v5.finalize())
+        );
+        assert_ne!(schema_signature_v4(), schema_signature_v5());
+        assert_eq!(RUNTIME_LEDGER_DOMAIN_V4, b"runtime.meta.ledger.v4");
+        assert_eq!(RUNTIME_LEDGER_DOMAIN_V5, b"runtime.meta.ledger.v5");
+        assert_eq!(MAX_CONFIGURATION_BYTES, 16 * 1024);
+        assert_eq!(MAX_CONFIGURATION_REQUEST_BYTES, 32 * 1024);
+        assert_eq!(MAX_CONFIGURATION_VERSIONS_PER_CONVERSATION, 4_096);
+        assert_eq!(MAX_CONFIGURATION_VERSIONS_GLOBAL, 65_536);
+        assert_eq!(MAX_CONFIGURATION_SEALED_BYTES_GLOBAL, 64 * 1024 * 1024);
+        assert_eq!(MAX_COMMAND_CONFIGURATION_PINS, 1_048_576);
+        assert_eq!(MAX_METADATA_MUTATION_REQUEST_BYTES, 16 * 1024);
+        assert_eq!(MAX_METADATA_MUTATION_OUTCOME_BYTES, 16 * 1024);
+        assert_eq!(MAX_METADATA_MUTATIONS_PER_CONVERSATION, 4_096);
+        assert_eq!(MAX_METADATA_MUTATIONS_GLOBAL, 65_536);
+        assert_eq!(MAX_ACTIVE_METADATA_MUTATIONS, 1_024);
+        assert_eq!(MAX_METADATA_MUTATION_CHARGED_BYTES_GLOBAL, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn v5_schema_has_exact_sidecar_manifest_columns_and_indexes() {
+        let connection = v5_structural_connection();
+        assert_eq!(table_names(&connection), EXPECTED_TABLES_V5);
+        assert_eq!(
+            &table_columns(&connection, "runtime_meta")
+                [table_columns(&connection, "runtime_meta").len() - 6..],
+            [
+                "configuration_count",
+                "configuration_sealed_bytes",
+                "command_configuration_pin_count",
+                "metadata_mutation_count",
+                "active_metadata_mutation_count",
+                "metadata_mutation_charged_bytes",
+            ]
+        );
+        let meta_columns = table_column_details(&connection, "runtime_meta");
+        for column in &meta_columns[meta_columns.len() - 6..] {
+            assert_eq!(column.column_type, "INTEGER", "{} type", column.name);
+            assert!(column.not_null, "{} must be NOT NULL", column.name);
+            assert_eq!(
+                column.default_value.as_deref(),
+                Some("0"),
+                "{} default",
+                column.name
+            );
+        }
+        assert_eq!(
+            table_columns(&connection, "conversation_state"),
+            [
+                "conversation_id",
+                "current_configuration_revision",
+                "entry_revision",
+                "origin_kind",
+                "origin_namespace",
+                "legacy_command_high_water",
+                "metadata_token",
+            ]
+        );
+        assert_eq!(
+            table_columns(&connection, "configuration_journal"),
+            [
+                "conversation_id",
+                "configuration_revision",
+                "base_configuration_revision",
+                "event_seq",
+                "owner_token",
+                "idempotency_token",
+                "request_token",
+                "logical_configuration_bytes",
+                "logical_request_bytes",
+                "created_at_ms",
+                "metadata_token",
+                "sealed_request",
+            ]
+        );
+        assert_eq!(
+            table_columns(&connection, "command_configuration_pins"),
+            [
+                "conversation_id",
+                "command_seq",
+                "configuration_revision",
+                "metadata_token",
+            ]
+        );
+        assert_eq!(
+            table_columns(&connection, "metadata_mutation_ledger"),
+            [
+                "conversation_id",
+                "owner_token",
+                "idempotency_token",
+                "request_token",
+                "expected_entry_revision",
+                "applied_entry_revision",
+                "applied_catalog_revision",
+                "state",
+                "logical_request_bytes",
+                "logical_outcome_bytes",
+                "charged_outcome_bytes",
+                "created_at_ms",
+                "state_changed_at_ms",
+                "metadata_token",
+                "sealed_request",
+                "sealed_outcome",
+            ]
+        );
+        assert_eq!(
+            explicit_indexes(&connection, "conversation_state"),
+            ["idx_conversation_state_origin"]
+        );
+        assert_eq!(
+            explicit_indexes(&connection, "configuration_journal"),
+            ["idx_configuration_event", "idx_configuration_idempotency"]
+        );
+        assert_eq!(
+            explicit_indexes(&connection, "command_configuration_pins"),
+            ["idx_command_configuration_pins_configuration"]
+        );
+        assert_eq!(
+            explicit_indexes(&connection, "metadata_mutation_ledger"),
+            [
+                "idx_metadata_mutation_active",
+                "idx_metadata_mutation_idempotency"
+            ]
+        );
+
+        for (table, expected_primary_key) in [
+            ("conversation_state", vec![("conversation_id", 1)]),
+            (
+                "configuration_journal",
+                vec![("conversation_id", 1), ("configuration_revision", 2)],
+            ),
+            (
+                "command_configuration_pins",
+                vec![("conversation_id", 1), ("command_seq", 2)],
+            ),
+            (
+                "metadata_mutation_ledger",
+                vec![("conversation_id", 1), ("idempotency_token", 2)],
+            ),
+        ] {
+            let actual = table_column_details(&connection, table)
+                .into_iter()
+                .filter(|column| column.primary_key_ordinal > 0)
+                .map(|column| (column.name, column.primary_key_ordinal))
+                .collect::<Vec<_>>();
+            let expected = expected_primary_key
+                .into_iter()
+                .map(|(name, ordinal)| (name.to_owned(), ordinal))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{table} primary key");
+        }
+
+        assert_eq!(
+            index_shape(&connection, "conversation_state", "idx_conversation_state_origin"),
+            IndexShape {
+                unique: false,
+                partial: false,
+                columns: vec!["origin_kind".to_owned(), "origin_namespace".to_owned()],
+                sql: "CREATE INDEX idx_conversation_state_origin\n    ON conversation_state(origin_kind, origin_namespace)".to_owned(),
+            }
+        );
+        for (name, columns) in [
+            (
+                "idx_configuration_event",
+                vec!["conversation_id".to_owned(), "event_seq".to_owned()],
+            ),
+            (
+                "idx_configuration_idempotency",
+                vec!["idempotency_token".to_owned()],
+            ),
+        ] {
+            let shape = index_shape(&connection, "configuration_journal", name);
+            assert!(shape.unique, "{name} must be UNIQUE");
+            assert!(!shape.partial, "{name} must cover every row");
+            assert_eq!(shape.columns, columns, "{name} columns");
+        }
+        let pin_index = index_shape(
+            &connection,
+            "command_configuration_pins",
+            "idx_command_configuration_pins_configuration",
+        );
+        assert!(!pin_index.unique);
+        assert!(!pin_index.partial);
+        assert_eq!(
+            pin_index.columns,
+            ["conversation_id", "configuration_revision"]
+        );
+        let metadata_idempotency = index_shape(
+            &connection,
+            "metadata_mutation_ledger",
+            "idx_metadata_mutation_idempotency",
+        );
+        assert!(metadata_idempotency.unique);
+        assert!(!metadata_idempotency.partial);
+        assert_eq!(metadata_idempotency.columns, ["idempotency_token"]);
+        let metadata_active = index_shape(
+            &connection,
+            "metadata_mutation_ledger",
+            "idx_metadata_mutation_active",
+        );
+        assert!(!metadata_active.unique);
+        assert!(metadata_active.partial);
+        assert_eq!(
+            metadata_active.columns,
+            ["conversation_id", "state", "state_changed_at_ms"]
+        );
+        assert!(
+            metadata_active
+                .sql
+                .contains("WHERE state IN ('claimed', 'applying', 'outcomeUnknown')")
+        );
+    }
+
+    #[test]
+    fn v5_schema_uses_same_conversation_composite_foreign_keys() {
+        let connection = v5_structural_connection();
+        let configuration_fks = foreign_key_columns(&connection, "configuration_journal");
+        assert_eq!(configuration_fks.len(), 3);
+        assert_composite_foreign_key(
+            &configuration_fks,
+            "conversations",
+            &[("conversation_id", "conversation_id")],
+        );
+        assert_composite_foreign_key(
+            &configuration_fks,
+            "event_journal",
+            &[
+                ("conversation_id", "conversation_id"),
+                ("event_seq", "event_seq"),
+            ],
+        );
+
+        let state_fks = foreign_key_columns(&connection, "conversation_state");
+        assert_eq!(state_fks.len(), 3);
+        assert_composite_foreign_key(
+            &state_fks,
+            "conversations",
+            &[("conversation_id", "conversation_id")],
+        );
+        assert_composite_foreign_key(
+            &state_fks,
+            "configuration_journal",
+            &[
+                ("conversation_id", "conversation_id"),
+                ("current_configuration_revision", "configuration_revision"),
+            ],
+        );
+        let pin_fks = foreign_key_columns(&connection, "command_configuration_pins");
+        assert_eq!(pin_fks.len(), 4);
+        assert_composite_foreign_key(
+            &pin_fks,
+            "commands",
+            &[
+                ("conversation_id", "conversation_id"),
+                ("command_seq", "command_seq"),
+            ],
+        );
+        assert_composite_foreign_key(
+            &pin_fks,
+            "configuration_journal",
+            &[
+                ("conversation_id", "conversation_id"),
+                ("configuration_revision", "configuration_revision"),
+            ],
+        );
+
+        let metadata_fks = foreign_key_columns(&connection, "metadata_mutation_ledger");
+        assert_eq!(metadata_fks.len(), 1);
+        assert_composite_foreign_key(
+            &metadata_fks,
+            "conversations",
+            &[("conversation_id", "conversation_id")],
+        );
+
+        for table in [
+            "conversation_state",
+            "configuration_journal",
+            "command_configuration_pins",
+            "metadata_mutation_ledger",
+        ] {
+            for column in foreign_key_columns(&connection, table) {
+                assert_eq!(column.on_update, "RESTRICT", "{table} update action");
+                assert_eq!(column.on_delete, "RESTRICT", "{table} delete action");
+            }
+        }
+    }
+
+    fn assert_composite_foreign_key(
+        columns: &[ForeignKeyColumn],
+        target_table: &str,
+        expected_columns: &[(&str, &str)],
+    ) {
+        let candidates = columns
+            .iter()
+            .filter(|column| column.target_table == target_table)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            candidates.len(),
+            expected_columns.len(),
+            "{target_table} FK"
+        );
+        let id = candidates[0].id;
+        for (seq, (source, target)) in expected_columns.iter().enumerate() {
+            let column = candidates
+                .iter()
+                .find(|column| column.id == id && column.seq == seq as i64)
+                .expect("composite FK column");
+            assert_eq!(column.source_column, *source);
+            assert_eq!(column.target_column, *target);
+        }
+    }
+
+    const SEQ_ZERO: &str = "00000000000000000000";
+    const SEQ_ONE: &str = "00000000000000000001";
+
+    fn insert_conversation(
+        connection: &Connection,
+        conversation_seed: u8,
+        catalog_revision: &str,
+        command_high_water: Option<&str>,
+        event_high_water: Option<&str>,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO conversations (
+                     conversation_id, adapter_state_key, catalog_revision,
+                     command_high_water, event_high_water, lifecycle,
+                     created_at_ms, updated_at_ms, accepted_count,
+                     metadata_token, sealed_descriptor
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', 1, 1, 0, ?6, ?7)",
+                params![
+                    &[conversation_seed; 16][..],
+                    &[conversation_seed.wrapping_add(0x40); 16][..],
+                    catalog_revision,
+                    command_high_water,
+                    event_high_water,
+                    &[conversation_seed.wrapping_add(0x50); 32][..],
+                    &[conversation_seed.wrapping_add(0x60); 40][..],
+                ],
+            )
+            .expect("insert conversation fixture");
+    }
+
+    fn insert_event(
+        connection: &Connection,
+        conversation_seed: u8,
+        event_seed: u8,
+        event_seq: &str,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO event_journal (
+                     conversation_id, event_seq, event_id, command_id,
+                     logical_event_bytes, created_at_ms, metadata_token, sealed_event
+                 ) VALUES (?1, ?2, ?3, NULL, 1, 2, ?4, ?5)",
+                params![
+                    &[conversation_seed; 16][..],
+                    event_seq,
+                    &[event_seed; 16][..],
+                    &[event_seed.wrapping_add(1); 32][..],
+                    &[event_seed.wrapping_add(2); 40][..],
+                ],
+            )
+            .expect("insert event fixture");
+    }
+
+    fn insert_command(connection: &Connection, conversation_seed: u8, command_seed: u8) {
+        connection
+            .execute(
+                "INSERT INTO commands (
+                     conversation_id, command_seq, command_id, owner_token,
+                     idempotency_token, payload_token, terminal_token, turn_id,
+                     started_event_id, terminal_event_id, state, logical_payload_bytes,
+                     accepted_at_ms, expires_at_ms, retain_until_ms, started_at_ms,
+                     terminal_at_ms, metadata_token, sealed_command, sealed_result
+                 ) VALUES (
+                     ?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, NULL,
+                     'accepted', 1, 2, 3, 4, NULL, NULL, ?7, ?8, NULL
+                 )",
+                params![
+                    &[conversation_seed; 16][..],
+                    SEQ_ZERO,
+                    &[command_seed; 16][..],
+                    &[command_seed.wrapping_add(1); 32][..],
+                    &[command_seed.wrapping_add(2); 32][..],
+                    &[command_seed.wrapping_add(3); 32][..],
+                    &[command_seed.wrapping_add(4); 32][..],
+                    &[command_seed.wrapping_add(5); 40][..],
+                ],
+            )
+            .expect("insert command fixture");
+    }
+
+    fn insert_configuration(
+        connection: &Connection,
+        conversation_seed: u8,
+        token_seed: u8,
+        event_seq: &str,
+    ) -> rusqlite::Result<usize> {
+        connection.execute(
+            "INSERT INTO configuration_journal (
+                 conversation_id, configuration_revision, base_configuration_revision,
+                 event_seq, owner_token, idempotency_token, request_token,
+                 logical_configuration_bytes, logical_request_bytes, created_at_ms,
+                 metadata_token, sealed_request
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 2, 3, ?8, ?9)",
+            params![
+                &[conversation_seed; 16][..],
+                SEQ_ONE,
+                SEQ_ZERO,
+                event_seq,
+                &[token_seed; 32][..],
+                &[token_seed.wrapping_add(1); 32][..],
+                &[token_seed.wrapping_add(2); 32][..],
+                &[token_seed.wrapping_add(3); 32][..],
+                &[token_seed.wrapping_add(4); 42][..],
+            ],
+        )
+    }
+
+    fn insert_state(
+        connection: &Connection,
+        conversation_seed: u8,
+        current_revision: Option<&str>,
+        origin_kind: &str,
+        origin_namespace: Option<&str>,
+        legacy_high_water: Option<&rusqlite::types::Value>,
+    ) -> rusqlite::Result<usize> {
+        connection.execute(
+            "INSERT INTO conversation_state (
+                 conversation_id, current_configuration_revision, entry_revision,
+                 origin_kind, origin_namespace, legacy_command_high_water, metadata_token
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                &[conversation_seed; 16][..],
+                current_revision,
+                SEQ_ZERO,
+                origin_kind,
+                origin_namespace,
+                legacy_high_water,
+                &[conversation_seed.wrapping_add(0x70); 32][..],
+            ],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_metadata_mutation(
+        connection: &Connection,
+        conversation_seed: u8,
+        token_seed: u8,
+        state: &str,
+        applied_entry_revision: Option<&str>,
+        applied_catalog_revision: Option<&str>,
+        logical_outcome_bytes: i64,
+        charged_outcome_bytes: i64,
+        sealed_outcome: Option<&[u8]>,
+        created_at_ms: i64,
+        state_changed_at_ms: i64,
+    ) -> rusqlite::Result<usize> {
+        connection.execute(
+            "INSERT INTO metadata_mutation_ledger (
+                 conversation_id, owner_token, idempotency_token, request_token,
+                 expected_entry_revision, applied_entry_revision,
+                 applied_catalog_revision, state, logical_request_bytes,
+                 logical_outcome_bytes, charged_outcome_bytes, created_at_ms,
+                 state_changed_at_ms, metadata_token, sealed_request, sealed_outcome
+             ) VALUES (
+                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12,
+                 ?13, ?14, ?15
+             )",
+            params![
+                &[conversation_seed; 16][..],
+                &[token_seed; 32][..],
+                &[token_seed.wrapping_add(1); 32][..],
+                &[token_seed.wrapping_add(2); 32][..],
+                SEQ_ZERO,
+                applied_entry_revision,
+                applied_catalog_revision,
+                state,
+                logical_outcome_bytes,
+                charged_outcome_bytes,
+                created_at_ms,
+                state_changed_at_ms,
+                &[token_seed.wrapping_add(3); 32][..],
+                &[token_seed.wrapping_add(4); 41][..],
+                sealed_outcome,
+            ],
+        )
+    }
+
+    #[test]
+    fn v5_schema_locks_nullable_head_origin_caps_and_metadata_charging() {
+        let connection = v5_structural_connection();
+        let state_sql = table_sql(&connection, "conversation_state");
+        assert!(state_sql.contains("current_configuration_revision TEXT CHECK"));
+        assert!(state_sql.contains("current_configuration_revision <> '00000000000000000000'"));
+        assert!(state_sql.contains("origin_kind IN ('managed', 'nativeProjected')"));
+        assert!(state_sql.contains("origin_kind = 'managed' AND origin_namespace IS NULL"));
+        assert!(state_sql.contains("length(CAST(origin_namespace AS BLOB)) BETWEEN 1 AND 64"));
+
+        let configuration_sql = table_sql(&connection, "configuration_journal");
+        assert!(configuration_sql.contains("logical_configuration_bytes BETWEEN 1 AND 16384"));
+        assert!(configuration_sql.contains("logical_request_bytes BETWEEN 1 AND 32768"));
+        assert!(configuration_sql.contains("length(sealed_request) BETWEEN 40 AND 32808"));
+        assert!(configuration_sql.contains("length(sealed_request) = logical_request_bytes + 40"));
+        assert!(!configuration_sql.contains("event_id"));
+        assert!(!configuration_sql.contains("sealed_event"));
+
+        let metadata_sql = table_sql(&connection, "metadata_mutation_ledger");
+        assert!(metadata_sql.contains("state IN (\n        'claimed', 'applying', 'applied', 'outcomeUnknown', 'failed'\n    )"));
+        assert!(metadata_sql.contains("charged_outcome_bytes BETWEEN 40 AND 16424"));
+        assert!(metadata_sql.contains("length(sealed_request) = logical_request_bytes + 40"));
+        assert!(metadata_sql.contains("length(sealed_outcome) = logical_outcome_bytes + 40"));
+        assert!(metadata_sql.contains("state IN ('claimed', 'applying', 'outcomeUnknown')"));
+        assert!(metadata_sql.contains("charged_outcome_bytes = 16424"));
+        assert!(metadata_sql.contains("charged_outcome_bytes = length(sealed_outcome)"));
+
+        let meta_sql = table_sql(&connection, "runtime_meta");
+        for check in [
+            "configuration_count BETWEEN 0 AND 65536",
+            "configuration_sealed_bytes BETWEEN 0 AND 67108864",
+            "command_configuration_pin_count BETWEEN 0 AND 1048576",
+            "metadata_mutation_count BETWEEN 0 AND 65536",
+            "active_metadata_mutation_count BETWEEN 0 AND 1024",
+            "metadata_mutation_charged_bytes BETWEEN 0 AND 67108864",
+        ] {
+            assert!(meta_sql.contains(check), "missing CHECK: {check}");
+        }
+        assert!(meta_sql.contains("command_configuration_pin_count <= command_count"));
+        assert!(meta_sql.contains("active_metadata_mutation_count <= metadata_mutation_count"));
+    }
+
+    #[test]
+    fn v5_state_distinguishes_null_before_first_from_real_sequence_zero() {
+        let connection = v5_structural_connection();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .expect("enable sidecar foreign keys");
+
+        insert_conversation(&connection, 0x11, SEQ_ZERO, None, None);
+        assert_eq!(
+            insert_state(&connection, 0x11, None, "managed", None, None)
+                .expect("fresh v5 state uses NULL heads"),
+            1
+        );
+
+        insert_conversation(&connection, 0x12, SEQ_ONE, Some(SEQ_ZERO), None);
+        insert_command(&connection, 0x12, 0x32);
+        let sequence_zero = rusqlite::types::Value::Text(SEQ_ZERO.to_owned());
+        assert_eq!(
+            insert_state(
+                &connection,
+                0x12,
+                None,
+                "managed",
+                None,
+                Some(&sequence_zero),
+            )
+            .expect("legacy cutoff preserves real sequence zero"),
+            1
+        );
+        insert_conversation(&connection, 0x16, "00000000000000000005", None, None);
+        assert!(
+            insert_state(
+                &connection,
+                0x16,
+                None,
+                "nativeProjected",
+                Some("bad\0namespace"),
+                None,
+            )
+            .is_err(),
+            "opaque native namespace rejects embedded NUL"
+        );
+
+        insert_conversation(&connection, 0x13, "00000000000000000002", None, None);
+        let integer_zero = rusqlite::types::Value::Integer(0);
+        assert!(
+            insert_state(
+                &connection,
+                0x13,
+                None,
+                "managed",
+                None,
+                Some(&integer_zero),
+            )
+            .is_err(),
+            "integer zero cannot impersonate the nullable BeforeFirst sentinel"
+        );
+
+        insert_conversation(&connection, 0x14, "00000000000000000003", None, None);
+        assert!(
+            insert_state(&connection, 0x14, Some(SEQ_ZERO), "managed", None, None,).is_err(),
+            "rev0 must be represented by NULL, never a non-null zero revision"
+        );
+
+        insert_conversation(&connection, 0x15, "00000000000000000004", None, None);
+        assert!(
+            insert_state(&connection, 0x15, None, "nativeProjected", None, None,).is_err(),
+            "native projection requires a namespace"
+        );
+        assert_eq!(
+            insert_state(
+                &connection,
+                0x15,
+                None,
+                "nativeProjected",
+                Some("opaque.adapter"),
+                None,
+            )
+            .expect("opaque native namespace is vendor-neutral"),
+            1
+        );
+    }
+
+    #[test]
+    fn v5_configuration_and_pin_checks_bind_the_same_conversation() {
+        let check_only = v5_structural_connection();
+        assert!(
+            check_only
+                .execute(
+                    "INSERT INTO command_configuration_pins (
+                         conversation_id, command_seq, configuration_revision, metadata_token
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    params![&[0x20_u8; 16][..], SEQ_ZERO, SEQ_ZERO, &[0x60_u8; 32][..]],
+                )
+                .is_err(),
+            "pin's own CHECK rejects revision zero even without FK enforcement"
+        );
+
+        let connection = v5_structural_connection();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .expect("enable sidecar foreign keys");
+        insert_conversation(&connection, 0x21, SEQ_ZERO, Some(SEQ_ZERO), Some(SEQ_ZERO));
+        insert_event(&connection, 0x21, 0x41, SEQ_ZERO);
+        insert_command(&connection, 0x21, 0x42);
+        assert_eq!(
+            insert_configuration(&connection, 0x21, 0x51, SEQ_ZERO)
+                .expect("configuration references the exact event row"),
+            1
+        );
+        assert_eq!(
+            insert_state(&connection, 0x21, Some(SEQ_ONE), "managed", None, None,)
+                .expect("non-zero current head references exact configuration"),
+            1
+        );
+        assert_eq!(
+            connection
+                .execute(
+                    "INSERT INTO command_configuration_pins (
+                         conversation_id, command_seq, configuration_revision, metadata_token
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    params![&[0x21_u8; 16][..], SEQ_ZERO, SEQ_ONE, &[0x61_u8; 32][..]],
+                )
+                .expect("pin exact command to exact same-conversation configuration"),
+            1
+        );
+
+        insert_conversation(&connection, 0x22, SEQ_ONE, Some(SEQ_ZERO), Some(SEQ_ZERO));
+        insert_event(&connection, 0x22, 0x43, SEQ_ZERO);
+        insert_command(&connection, 0x22, 0x44);
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO command_configuration_pins (
+                         conversation_id, command_seq, configuration_revision, metadata_token
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    params![&[0x22_u8; 16][..], SEQ_ZERO, SEQ_ONE, &[0x63_u8; 32][..]],
+                )
+                .is_err(),
+            "a command cannot point at another conversation's revision"
+        );
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO configuration_journal (
+                         conversation_id, configuration_revision, base_configuration_revision,
+                         event_seq, owner_token, idempotency_token, request_token,
+                         logical_configuration_bytes, logical_request_bytes, created_at_ms,
+                         metadata_token, sealed_request
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 1, 1, ?8, ?9)",
+                    params![
+                        &[0x22_u8; 16][..],
+                        SEQ_ZERO,
+                        SEQ_ZERO,
+                        SEQ_ZERO,
+                        &[0x71_u8; 32][..],
+                        &[0x72_u8; 32][..],
+                        &[0x73_u8; 32][..],
+                        &[0x74_u8; 32][..],
+                        &[0x75_u8; 41][..],
+                    ],
+                )
+                .is_err(),
+            "configuration revision zero is invalid"
+        );
+        assert!(
+            connection
+                .execute(
+                    "DELETE FROM configuration_journal
+                     WHERE conversation_id = ?1 AND configuration_revision = ?2",
+                    params![&[0x21_u8; 16][..], SEQ_ONE],
+                )
+                .is_err(),
+            "current heads and command pins make configuration append-only"
+        );
+    }
+
+    #[test]
+    fn v5_metadata_states_charge_reserve_before_side_effects_and_exact_outcomes_after() {
+        let connection = v5_structural_connection();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .expect("enable sidecar foreign keys");
+        insert_conversation(&connection, 0x31, SEQ_ZERO, None, None);
+
+        for (offset, state) in ["claimed", "applying", "outcomeUnknown"]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                insert_metadata_mutation(
+                    &connection,
+                    0x31,
+                    0x40 + offset as u8 * 8,
+                    state,
+                    None,
+                    None,
+                    0,
+                    16_424,
+                    None,
+                    1,
+                    1,
+                )
+                .expect("active mutation reserves terminal outcome capacity"),
+                1
+            );
+        }
+        assert!(
+            insert_metadata_mutation(
+                &connection,
+                0x31,
+                0x60,
+                "claimed",
+                None,
+                None,
+                0,
+                40,
+                None,
+                1,
+                1,
+            )
+            .is_err(),
+            "active mutation cannot under-reserve terminal outcome capacity"
+        );
+        assert!(
+            insert_metadata_mutation(
+                &connection,
+                0x31,
+                0x68,
+                "outcomeUnknown",
+                None,
+                None,
+                1,
+                16_424,
+                Some(&[0x69; 41]),
+                1,
+                1,
+            )
+            .is_err(),
+            "active state cannot masquerade a terminal outcome"
+        );
+        assert_eq!(
+            insert_metadata_mutation(
+                &connection,
+                0x31,
+                0x70,
+                "applied",
+                Some(SEQ_ONE),
+                Some(SEQ_ONE),
+                1,
+                41,
+                Some(&[0x71; 41]),
+                1,
+                2,
+            )
+            .expect("applied mutation charges exact sealed outcome"),
+            1
+        );
+        assert!(
+            insert_metadata_mutation(
+                &connection,
+                0x31,
+                0x78,
+                "applied",
+                None,
+                None,
+                1,
+                41,
+                Some(&[0x79; 41]),
+                1,
+                2,
+            )
+            .is_err(),
+            "applied state requires exact entry and catalog revisions"
+        );
+        assert_eq!(
+            insert_metadata_mutation(
+                &connection,
+                0x31,
+                0x80,
+                "failed",
+                None,
+                None,
+                1,
+                41,
+                Some(&[0x81; 41]),
+                1,
+                2,
+            )
+            .expect("failed mutation charges exact sealed outcome"),
+            1
+        );
+        assert!(
+            insert_metadata_mutation(
+                &connection,
+                0x31,
+                0x88,
+                "failed",
+                Some(SEQ_ONE),
+                Some(SEQ_ONE),
+                1,
+                41,
+                Some(&[0x89; 41]),
+                2,
+                1,
+            )
+            .is_err(),
+            "failed state cannot carry applied revisions or move time backwards"
+        );
+        assert!(
+            insert_metadata_mutation(
+                &connection,
+                0x32,
+                0x90,
+                "claimed",
+                None,
+                None,
+                0,
+                16_424,
+                None,
+                1,
+                1,
+            )
+            .is_err(),
+            "metadata ledger requires an authenticated conversation"
+        );
     }
 
     #[test]
