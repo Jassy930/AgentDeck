@@ -6,6 +6,9 @@ import Foundation
 public enum RuntimeV2StreamMirrorError: Error, Equatable, Sendable {
     case catalogTooLarge
     case invalidEventIdentity
+    case invalidSnapshot
+    case invalidBackfill
+    case backfillTooLarge
 }
 
 // MARK: - Catalog
@@ -724,4 +727,271 @@ public struct RuntimeEventV2: RuntimeV2FlattenedPayload {
     private static let wireKeys: Set<String> = [
         "conversationId", "eventId", "eventSeq", "commandId", "itemId", "entityId", "body",
     ]
+}
+
+// MARK: - Snapshot and backfill
+
+public struct ConversationSnapshotV2: RuntimeV2FlattenedPayload {
+    public let conversationID: RuntimeConversationID
+    public let baseEventCursor: RuntimeStreamCursorV1
+    public let configurationState: RuntimeConversationConfigurationStateV2
+    public let items: [SnapshotItemV1]
+
+    public init(
+        conversationID: RuntimeConversationID,
+        baseEventCursor: RuntimeStreamCursorV1,
+        configurationState: RuntimeConversationConfigurationStateV2,
+        items: [SnapshotItemV1]
+    ) throws {
+        self.conversationID = conversationID
+        self.baseEventCursor = baseEventCursor
+        self.configurationState = configurationState
+        self.items = items
+        try validate()
+    }
+
+    public init(from decoder: Decoder) throws {
+        try self.init(decodingFieldsFrom: decoder, allowed: Self.wireKeys)
+    }
+
+    init(flattenedFrom decoder: Decoder) throws {
+        try runtimeV2ValidateDiscriminator(decoder, key: "reply", expected: "snapshot")
+        try self.init(decodingFieldsFrom: decoder, allowed: Self.wireKeys.union(["reply"]))
+    }
+
+    private init(decodingFieldsFrom decoder: Decoder, allowed: Set<String>) throws {
+        try runtimeV2RejectUnknownKeys(decoder, allowed: allowed)
+        let container = try decoder.container(keyedBy: RuntimeV2CodingKey.self)
+        try self.init(
+            conversationID: container.decode(
+                RuntimeConversationID.self,
+                forKey: runtimeV2Key("conversationId")
+            ),
+            baseEventCursor: container.decode(
+                RuntimeStreamCursorV1.self,
+                forKey: runtimeV2Key("baseEventCursor")
+            ),
+            configurationState: container.decode(
+                RuntimeConversationConfigurationStateV2.self,
+                forKey: runtimeV2Key("configurationState")
+            ),
+            items: container.decode([SnapshotItemV1].self, forKey: runtimeV2Key("items"))
+        )
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        try validate()
+        var container = encoder.container(keyedBy: RuntimeV2CodingKey.self)
+        try encodeFields(into: &container)
+    }
+
+    func encodeFlattenedFields(
+        into container: inout KeyedEncodingContainer<RuntimeV2CodingKey>
+    ) throws {
+        try validate()
+        try container.encode("snapshot", forKey: runtimeV2Key("reply"))
+        try encodeFields(into: &container)
+    }
+
+    private func encodeFields(
+        into container: inout KeyedEncodingContainer<RuntimeV2CodingKey>
+    ) throws {
+        try container.encode(conversationID, forKey: runtimeV2Key("conversationId"))
+        try container.encode(baseEventCursor, forKey: runtimeV2Key("baseEventCursor"))
+        try container.encode(configurationState, forKey: runtimeV2Key("configurationState"))
+        try container.encode(items, forKey: runtimeV2Key("items"))
+    }
+
+    private func validate() throws {
+        guard case .capabilities(let capabilities)? = items.first else {
+            throw RuntimeV2StreamMirrorError.invalidSnapshot
+        }
+        var capabilityCount = 0
+        for item in items {
+            switch item {
+            case .capabilities:
+                capabilityCount += 1
+            case .item(_, _, let commandID, let item):
+                if case .userMessage = item, commandID == nil {
+                    throw RuntimeV2StreamMirrorError.invalidSnapshot
+                }
+            }
+        }
+        guard capabilityCount == 1 else {
+            throw RuntimeV2StreamMirrorError.invalidSnapshot
+        }
+        if let configuration = configurationState.configuration,
+           configuration.agentKind != capabilities.agentKind
+        {
+            throw RuntimeV2StreamMirrorError.invalidSnapshot
+        }
+    }
+
+    private static let wireKeys: Set<String> = [
+        "conversationId", "baseEventCursor", "configurationState", "items",
+    ]
+}
+
+public enum RuntimeBackfillChunkV2: RuntimeV2FlattenedPayload {
+    public static let maxEncodedBytes = 64 * 1024 * 1024
+
+    case catalog(range: RuntimeBackfillRangeV1, deltas: [RuntimeCatalogDeltaV2])
+    case conversation(
+        conversationID: RuntimeConversationID,
+        capabilitiesPreamble: RuntimeSessionCapabilitiesV1,
+        range: RuntimeBackfillRangeV1,
+        events: [RuntimeEventV2]
+    )
+
+    public init(from decoder: Decoder) throws {
+        try self.init(decodingFieldsFrom: decoder, flattened: false)
+    }
+
+    init(flattenedFrom decoder: Decoder) throws {
+        try runtimeV2ValidateDiscriminator(decoder, key: "reply", expected: "backfill")
+        try self.init(decodingFieldsFrom: decoder, flattened: true)
+    }
+
+    private init(decodingFieldsFrom decoder: Decoder, flattened: Bool) throws {
+        let container = try decoder.container(keyedBy: RuntimeV2CodingKey.self)
+        let scope = try container.decode(String.self, forKey: runtimeV2Key("scope"))
+        let outer: Set<String> = flattened ? ["reply"] : []
+        switch scope {
+        case "catalog":
+            try runtimeV2RejectUnknownKeys(
+                decoder,
+                allowed: Set(["scope", "range", "deltas"]).union(outer)
+            )
+            self = .catalog(
+                range: try container.decode(
+                    RuntimeBackfillRangeV1.self,
+                    forKey: runtimeV2Key("range")
+                ),
+                deltas: try container.decode(
+                    [RuntimeCatalogDeltaV2].self,
+                    forKey: runtimeV2Key("deltas")
+                )
+            )
+        case "conversation":
+            try runtimeV2RejectUnknownKeys(
+                decoder,
+                allowed: Set([
+                    "scope", "conversationId", "capabilitiesPreamble", "range", "events",
+                ]).union(outer)
+            )
+            self = .conversation(
+                conversationID: try container.decode(
+                    RuntimeConversationID.self,
+                    forKey: runtimeV2Key("conversationId")
+                ),
+                capabilitiesPreamble: try container.decode(
+                    RuntimeSessionCapabilitiesV1.self,
+                    forKey: runtimeV2Key("capabilitiesPreamble")
+                ),
+                range: try container.decode(
+                    RuntimeBackfillRangeV1.self,
+                    forKey: runtimeV2Key("range")
+                ),
+                events: try container.decode(
+                    [RuntimeEventV2].self,
+                    forKey: runtimeV2Key("events")
+                )
+            )
+        default:
+            throw DecodingError.dataCorruptedError(
+                forKey: runtimeV2Key("scope"),
+                in: container,
+                debugDescription: "unknown Runtime v2 backfill scope \(scope)"
+            )
+        }
+        try validate()
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        try validate()
+        var container = encoder.container(keyedBy: RuntimeV2CodingKey.self)
+        try encodeUncheckedFields(into: &container)
+    }
+
+    func encodeFlattenedFields(
+        into container: inout KeyedEncodingContainer<RuntimeV2CodingKey>
+    ) throws {
+        try validate()
+        try container.encode("backfill", forKey: runtimeV2Key("reply"))
+        try encodeUncheckedFields(into: &container)
+    }
+
+    fileprivate func encodeUncheckedFields(
+        into container: inout KeyedEncodingContainer<RuntimeV2CodingKey>
+    ) throws {
+        switch self {
+        case .catalog(let range, let deltas):
+            try container.encode("catalog", forKey: runtimeV2Key("scope"))
+            try container.encode(range, forKey: runtimeV2Key("range"))
+            try container.encode(deltas, forKey: runtimeV2Key("deltas"))
+        case .conversation(let conversationID, let capabilities, let range, let events):
+            try container.encode("conversation", forKey: runtimeV2Key("scope"))
+            try container.encode(conversationID, forKey: runtimeV2Key("conversationId"))
+            try container.encode(capabilities, forKey: runtimeV2Key("capabilitiesPreamble"))
+            try container.encode(range, forKey: runtimeV2Key("range"))
+            try container.encode(events, forKey: runtimeV2Key("events"))
+        }
+    }
+
+    private func validate() throws {
+        switch self {
+        case .catalog(let range, let deltas):
+            let bounds = try runtimeV2BackfillBounds(range)
+            guard deltas.count == bounds.count else {
+                throw RuntimeV2StreamMirrorError.invalidBackfill
+            }
+            for (offset, delta) in deltas.enumerated()
+            where delta.catalogRevision != bounds.first + UInt64(offset) {
+                throw RuntimeV2StreamMirrorError.invalidBackfill
+            }
+        case .conversation(let conversationID, _, let range, let events):
+            let bounds = try runtimeV2BackfillBounds(range)
+            guard events.count == bounds.count else {
+                throw RuntimeV2StreamMirrorError.invalidBackfill
+            }
+            for (offset, event) in events.enumerated()
+            where event.conversationID != conversationID
+                || event.eventSeq != bounds.first + UInt64(offset) {
+                throw RuntimeV2StreamMirrorError.invalidBackfill
+            }
+        }
+
+        let encoded = try JSONEncoder().encode(RuntimeV2BackfillChunkSizeProbe(value: self))
+        guard encoded.count <= Self.maxEncodedBytes else {
+            throw RuntimeV2StreamMirrorError.backfillTooLarge
+        }
+    }
+}
+
+private struct RuntimeV2BackfillChunkSizeProbe: Encodable {
+    let value: RuntimeBackfillChunkV2
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: RuntimeV2CodingKey.self)
+        try value.encodeUncheckedFields(into: &container)
+    }
+}
+
+private func runtimeV2BackfillBounds(
+    _ range: RuntimeBackfillRangeV1
+) throws -> (first: UInt64, last: UInt64, count: Int) {
+    let first: UInt64
+    do {
+        first = try range.after.checkedNext()
+    } catch {
+        throw RuntimeV2StreamMirrorError.invalidBackfill
+    }
+    guard case .at(let last) = range.through, last >= first else {
+        throw RuntimeV2StreamMirrorError.invalidBackfill
+    }
+    let distance = last - first
+    guard distance < UInt64(RuntimeBackfillRangeV1.maxEntries) else {
+        throw RuntimeV2StreamMirrorError.backfillTooLarge
+    }
+    return (first, last, Int(distance + 1))
 }

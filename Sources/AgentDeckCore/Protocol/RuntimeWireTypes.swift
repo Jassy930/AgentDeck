@@ -65,7 +65,7 @@ public enum RuntimeItemIDKind: RuntimeV1IDKind {}
 public enum RuntimeEntityIDKind: RuntimeV1IDKind {}
 public enum RuntimeCommandIDKind: RuntimeV1IDKind {}
 public enum RuntimeApprovalIDKind: RuntimeV1IDKind {}
-public enum RuntimeAdapterStateKeyKind: RuntimeV1IDKind {}
+public enum RuntimeAdapterStateKeyV1CompatibilityKind: RuntimeV1IDKind {}
 public enum RuntimeIdempotencyKeyKind: RuntimeV1IDKind {}
 public enum RuntimeTransferIDKind: RuntimeV1IDKind {
     public static let maximumWireUTF8Bytes: Int? = 1024
@@ -83,7 +83,8 @@ public typealias RuntimeItemID = RuntimeV1ID<RuntimeItemIDKind>
 public typealias RuntimeEntityID = RuntimeV1ID<RuntimeEntityIDKind>
 public typealias RuntimeCommandID = RuntimeV1ID<RuntimeCommandIDKind>
 public typealias RuntimeApprovalID = RuntimeV1ID<RuntimeApprovalIDKind>
-public typealias RuntimeAdapterStateKey = RuntimeV1ID<RuntimeAdapterStateKeyKind>
+public typealias RuntimeAdapterStateKeyV1Compatibility =
+    RuntimeV1ID<RuntimeAdapterStateKeyV1CompatibilityKind>
 public typealias RuntimeIdempotencyKey = RuntimeV1ID<RuntimeIdempotencyKeyKind>
 public typealias RuntimeTransferID = RuntimeV1ID<RuntimeTransferIDKind>
 public typealias RuntimePairingID = RuntimeV1ID<RuntimePairingIDKind>
@@ -843,7 +844,7 @@ public enum RuntimeMessageV1: Codable, Sendable {
 
 public struct RuntimeConversationEntryV1: Codable, Sendable {
     public let conversationID: RuntimeConversationID
-    public let adapterStateKey: RuntimeAdapterStateKey
+    public let adapterStateKey: RuntimeAdapterStateKeyV1Compatibility
     public let agentKind: AgentKind
     public let title: String?
     public let cwd: String?
@@ -859,7 +860,10 @@ public struct RuntimeConversationEntryV1: Codable, Sendable {
         try rejectUnknownKeys(decoder, allowed: CodingKeys.all)
         let container = try decoder.container(keyedBy: CodingKeys.self)
         conversationID = try container.decode(RuntimeConversationID.self, forKey: .conversationID)
-        adapterStateKey = try container.decode(RuntimeAdapterStateKey.self, forKey: .adapterStateKey)
+        adapterStateKey = try container.decode(
+            RuntimeAdapterStateKeyV1Compatibility.self,
+            forKey: .adapterStateKey
+        )
         agentKind = try container.decode(AgentKind.self, forKey: .agentKind)
         title = try container.decodeIfPresent(String.self, forKey: .title)
         cwd = try container.decodeIfPresent(String.self, forKey: .cwd)
@@ -1621,12 +1625,12 @@ public struct CommandStatusReceiptV1: Codable, Sendable {
 
 public struct ConversationStartReceiptV1: Codable, Sendable {
     public let conversationID: RuntimeConversationID
-    public let adapterStateKey: RuntimeAdapterStateKey
+    public let adapterStateKey: RuntimeAdapterStateKeyV1Compatibility
     public let replayed: Bool
 
     public init(
         conversationID: RuntimeConversationID,
-        adapterStateKey: RuntimeAdapterStateKey,
+        adapterStateKey: RuntimeAdapterStateKeyV1Compatibility,
         replayed: Bool
     ) {
         self.conversationID = conversationID
@@ -1645,7 +1649,7 @@ public struct ConversationStartReceiptV1: Codable, Sendable {
             forKey: key("conversationId")
         )
         adapterStateKey = try container.decode(
-            RuntimeAdapterStateKey.self,
+            RuntimeAdapterStateKeyV1Compatibility.self,
             forKey: key("adapterStateKey")
         )
         replayed = try container.decode(Bool.self, forKey: key("replayed"))
