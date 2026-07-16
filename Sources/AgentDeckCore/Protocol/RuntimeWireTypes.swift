@@ -1,5 +1,8 @@
 import Foundation
 
+// Runtime 公共 wire 的兼容 leaf 与 v1 mirror。当前文件名保持 version-neutral；
+// Runtime v2 的 changed/outer DTO 由独立 RuntimeV2Types.swift 承载，避免机械改写全部 leaf symbols。
+
 public let runtimeProtocolVersionV1: UInt16 = 1
 
 public enum RuntimeV1MirrorError: Error, Equatable, Sendable {

@@ -638,7 +638,7 @@ cargo test -p agentdeckd --test runtime_store_p34 -- --test-threads=1
 
 # Rust/Swift wire、schema、fixture
 cargo test -p agentdeck-protocol -- --test-threads=1
-swift test --filter RuntimeV1ProtocolTests
+swift test --filter RuntimeProtocolCompatibilityTests
 
 # P3.4 production新增范围 lint；allow 项是仓库既有 trunk/CC/Codex lint，不能扩展
 cargo clippy -p agentdeckd --all-targets -- -D warnings \
@@ -703,7 +703,7 @@ cargo test -p agentdeckd --test codex_adapter_shape \
 
 # Runtime receipt/schema/fixture 与 daemon 全回归；显式禁止误入 live vendor smoke
 cargo test -p agentdeck-protocol -- --test-threads=1
-swift test --filter RuntimeV1ProtocolTests
+swift test --filter RuntimeProtocolCompatibilityTests
 env -u AGENTDECK_E2E cargo test -p agentdeckd
 
 # 静态边界与文档

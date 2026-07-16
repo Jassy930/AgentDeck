@@ -204,7 +204,7 @@ state repository 不公开，adapter 不拿通用 store/另一 namespace vault�
 cargo test -p agentdeckd --lib runtime:: -- --test-threads=1
 cargo test -p agentdeckd --test runtime_core --test runtime_store_p34 -- --test-threads=1
 cargo test -p agentdeck-protocol -- --test-threads=1
-swift test --filter RuntimeV1ProtocolTests
+swift test --filter RuntimeProtocolCompatibilityTests
 cargo test -p agentdeckd
 bash scripts/check-daemon-network-boundary.sh
 ```

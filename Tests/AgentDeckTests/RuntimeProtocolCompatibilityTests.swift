@@ -2,7 +2,7 @@ import Foundation
 import XCTest
 @testable import AgentDeckCore
 
-final class RuntimeV1ProtocolTests: XCTestCase {
+final class RuntimeProtocolCompatibilityTests: XCTestCase {
     func testApprovalResolvedRequiresExplicitDecisionEvenWhenWinnerIsAbsent() throws {
         func event(_ decision: Any?) throws -> Data {
             var body: [String: Any] = [
