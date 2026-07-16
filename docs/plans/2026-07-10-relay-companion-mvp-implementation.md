@@ -1720,12 +1720,16 @@ P3.9 固定以下迁移边界：
   production source 静态扫描不得引用 v1；这不代表 App/CLI 已完成 UDS
   cutover。预估完整代码与测试
   3,100–3,800 行，按新增/修改代码口径预先拆为三片，每片独立 TDD/review/commit：
-  - [ ] **A2-0 真实 UDS 样本前置门禁（不新增 production code）：** 在写 Swift outer validator 前，启动
+  - [x] **A2-0 真实 UDS 样本前置门禁（不新增 production code）：** 在写 Swift outer validator 前，启动
     current Rust ephemeral/no-remote daemon，经其实际派生并验证的 UDS endpoint 发送 preface + Runtime v2
     Hello，捕获一份 exact raw reply 到仓库外 0600 临时文件；记录 byte count 与 SHA-256，并先用 current
     Rust codec 读回。A2c 必须再让 Swift `RuntimeWireCodec` 解码同一份 raw bytes 并做语义等价重编码后才可
     删除临时样本；`runtime-v2-wire.jsonl` 或合成 socketpair 不能替代该门禁。不得向 daemon 注入任意 socket
-    path，也不得把运行记录、用户路径或临时样本提交进仓库。
+    path，也不得把运行记录、用户路径或临时样本提交进仓库。2026-07-16 已从 current HEAD 构建 daemon，
+    真实 reply 为 128 bytes、SHA-256
+    `393a3201225ef18ae13d4238ba99ea3db612ded4aa86b5819bfab54f01d3421e`；current Rust v2 codec 对同一
+    raw bytes 解码成功并完成语义等价重编码。一次性 reader 已退役，仓库内零残留；0600 外部样本保留到
+    A2c Swift readback。
   - [ ] **A2a strict DTO/receipt primitives（约 1,100–1,300 行）：** configuration、metadata、upgrade、
     agent descriptions 与 changed receipt；手写 deny-unknown、missing/null/default、文本/agent/revision
     validation，禁止改宽 IPC v2 公共 vendor 类型。Codex 三个 configuration 字段全部 required；CC
