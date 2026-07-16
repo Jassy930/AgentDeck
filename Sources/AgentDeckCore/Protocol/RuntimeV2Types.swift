@@ -69,7 +69,7 @@ protocol RuntimeV2FlattenedPayload: Codable, Sendable {
     ) throws
 }
 
-private func runtimeV2ValidateDiscriminator(
+func runtimeV2ValidateDiscriminator(
     _ decoder: Decoder,
     key: String,
     expected: String
