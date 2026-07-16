@@ -581,6 +581,39 @@ history 时直接切到 UDS，会让用户选择静默回落默认值、历史�
   command 的 revision 0 只表示 frozen P3.7 legacy defaults，且仅供 startup recovery 消费。所有 v5 新
   command 必须引用存在的非零 revision；既有 conversation 再接收 prompt 前先 Configure。native importer
   原子种入该 agent 的 default rev1，避免把刚导入的历史误当 legacy command。
+- Runtime DB v5 的 revision 不回写既有 `conversations`/`commands` 行：以 authenticated
+  `conversation_state`、`configuration_journal`、`command_configuration_pins`、
+  `metadata_mutation_ledger` 四个 sidecar 承载，保留既有 sealed ciphertext 与除 `runtime_meta` 外的 row MAC
+  byte-exact；`runtime_meta` 只以旧 v4 token 为 CAS 更新 schema/signature/v5 ledger token。
+  `conversation_state.legacy_command_high_water` 冻结 migration 时已认证的 command cutoff；缺 pin 仅在
+  `commandSeq <= cutoff` 时表示 legacy rev0，新 command 缺 pin一律 corruption/fail-close。
+  cutoff 固定使用 nullable/BeforeFirst；fresh v5/native conversation 与 v4 空 conversation 都保持 NULL，
+  禁止用 0 作为 sentinel，首个 seq0 command 缺 pin同样 fail-close。
+  `configuration_journal` 必须绑定唯一 `ConfigurationChanged` event seq；event id/body 从该同会话 exact row
+  读回并验证。snapshot 按 frozen base event cursor 选 `eventSeq <= base` 的最新配置，不能直接读 current
+  head。Configure 不改 `updatedAtMs`，否则会在
+  不发 CatalogDelta 时制造 catalog-visible `lastActiveMs` 漂移。
+- 四个 sidecar 分别使用 domain-separated row MAC 覆盖全部明文列；sealed request/outcome 的 AEAD AAD 绑定
+  database/table 与 conversation+revision/idempotency primary identity。state head 为 nullable，NULL 当且仅当
+  rev0/unconfigured，非 NULL 才以复合 FK 指向同会话 configuration；configuration event、
+  command pin 分别以同会话复合 FK 指向 exact configuration/event/command，全部 `ON DELETE RESTRICT`；
+  open/recovery 逐行解密并重算 MAC、totals 与 event body，删除/orphan/swap/tamper 统一 fail-close。
+- v5 append-only 上限固定：configuration canonical ≤16 KiB、full request ≤32 KiB、每 conversation 4,096
+  版、全库 65,536 版/64 MiB；command pin ≤1,048,576；metadata mutation request/outcome 各 ≤16 KiB、每
+  conversation 4,096 条、全库 65,536 条/64 MiB、active ≤1,024。威胁场景是已认证 client 通过无限新 key
+  填满 Runtime DB 并阻断其它写入；因此不能只依赖 2 GiB store hard cap。configuration 64 MiB 精确累计
+  sealed full request 长度；metadata 64 MiB 计 `sealed request+charged outcome bytes`。native claim 在 vendor
+  副作用前认证预留最大合法 sealed outcome，terminal/recovery 只能消费该 reserve 并缩到实际长度，managed
+  direct-terminal 只计实际 outcome；active 只含 `claimed|applying|outcomeUnknown`，replay 不重复计费，
+  open/recovery 从物理行复算。
+- metadata managed mutation 同事务直接 `applied`；native 合法转移为
+  `claimed→applying→applied|failed|outcomeUnknown`。`outcomeUnknown` 仍计 active，只能由 authenticated native
+  readback 收敛，不能重做 vendor 副作用；active exact retry 零写并返回稳定
+  `daemon.conversation.metadata_mutation_pending`，terminal exact replay 原 outcome，同 owner+key/different
+  request conflict。
+- SendPrompt 对 rev0/unconfigured 与 expected revision mismatch 分别稳定返回
+  `daemon.conversation.configuration_required`、`daemon.conversation.configuration_conflict`；不得继续沿用
+  C0-A 过渡期的 `feature_unavailable`。
 - native-history import 不是 public Runtime request。daemon bootstrap/reconciliation 让 adapter 私域验证
   本机真实 entry，再按 namespace+opaque reference 稳定派生 conversation/adapter-state identity，并在单
   事务写 private binding、neutral descriptor 与 catalog delta。native transcript 不复制成第二份 Runtime
@@ -1385,7 +1418,8 @@ Relay 外层错误只描述通用路由/传输失败；daemon 业务错误必须
 - `daemon.command.idempotency_conflict`、`daemon.command.queue_full`、`daemon.command.queue_expired`、`daemon.command.interrupted`、`daemon.runtime.recovery_blocked`、`daemon.runtime.disk_low`。
 - `daemon.approval.already_handled`、`daemon.approval.delivery_failed`、`daemon.approval.expired`、`daemon.turn.stale`。
 - `daemon.payload.item_too_large`。
-- `daemon.conversation.not_found`。
+- `daemon.conversation.not_found`、`daemon.conversation.configuration_required`、
+  `daemon.conversation.configuration_conflict`、`daemon.conversation.metadata_mutation_pending`。
 
 所有错误必须携带可关联的 request/command/diagnostic reference，但日志关联不得泄漏完整业务 ID。
 

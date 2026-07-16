@@ -1834,13 +1834,77 @@ P3.9 固定以下迁移边界：
   configuration versions、conversation/command revision 与 idempotency/token ledger；Configure CAS 与 metadata
   mutation 分开提交：Configure 只推进 configuration journal + `ConfigurationChanged` conversation event，
   不改 catalog；metadata mutation 只更新 descriptor/lifecycle + entry/catalog revision + CatalogDelta，不写
-  conversation event。canonical prepare 消费 command pin 的 exact config；覆盖并发
-  writer、重放/冲突、配置后改不影响 queued command、restart/recovery、receipt/event/snapshot 一致。用
-  recorded vendor argv/control fixture 验证冻结字段，但不冒充 live login。独立 review/提交。
-- [ ] v4→v5 migration 固定：existing conversation 迁为 rev0/unconfigured；迁移前已 Accepted/Started command
-  以 command revision 0 表示 frozen P3.7 legacy defaults，且只允许 recovery 消费；所有 v5 新 command 必须
-  引用存在的非零 revision。用户继续既有 v4 conversation 前必须先 Configure；native importer 原子种入
-  DescribeAgents 对应 default rev1，避免把 native history 错当 legacy command。
+  conversation event。canonical prepare 消费 command pin 的 exact config；覆盖并发 writer、重放/冲突、
+  配置后改不影响 queued command、restart/recovery、receipt/event/snapshot 一致。用 recorded vendor
+  argv/control fixture 验证冻结字段，但不冒充 live login。独立 review/提交。
+  - **具体威胁场景：** 同 UID/已认证 client 可持续用新 idempotency key 写 append-only 配置，或攻击者删除
+    某个 command pin；若只靠磁盘总上限或把“缺 pin”一律解释为 rev0，会分别造成全库写入阻断，或让已排队
+    command 在重启后静默使用 latest configuration。
+  - **v5 物理形状冻结为 authenticated sidecar：** 保持既有 `conversations`、`commands` ciphertext 与行 MAC
+    不变；新增 `conversation_state`（current configuration/entry revision/origin/legacy command cutoff）、
+    `configuration_journal`（base/current revision、ConfigurationChanged event cursor、owner/idempotency/request
+    token 与 sealed full request）、`command_configuration_pins`（仅 v5 新 command 的非零 exact pin）和
+    `metadata_mutation_ledger`（`claimed|applying|applied|outcomeUnknown|failed`，供 managed 与后续 native
+    mutation 共用）。`configuration_journal.event_seq` 必须让 snapshot 按 frozen base event cursor 选择配置；
+    禁止直接读取 current head。Configure 专用事务只推进 event/config head，不改 `updated_at_ms`、catalog/
+    entry revision，也不触发 CatalogDelta。
+  - 四表每行使用独立 domain-separated metadata MAC 覆盖全部明文列；sealed request/outcome 的 AEAD AAD
+    绑定 database/table 与 conversation+revision/idempotency primary identity，sealed full request 内含 owner、
+    原始 idempotency key 与 expected revision。`conversation_state` head 固定为 nullable：NULL 当且仅当
+    rev0/unconfigured，非 NULL 才以 `(conversationId, revision)` 复合 FK 指向同会话 configuration；
+    configuration 以 `(conversationId, eventSeq)` 指向同会话 event；pin 物理键固定
+    为 `(conversationId, commandSeq)`，同时以复合 FK 指向同 command 与同会话非零 configuration。所有 FK
+    `ON DELETE RESTRICT`，不提供 pin/config delete API；open/recovery 逐行解密、重算 MAC/totals 并验证 exact
+    event body，任一 deletion/orphan/swap/tamper fail-close。
+  - `runtime_meta` 新增 authenticated totals：configuration count/sealed bytes、command pin count、metadata
+    mutation count/active count/charged bytes。configuration bytes 精确累计 `length(sealed_request)`；metadata
+    charged bytes 精确累计 `length(sealed_request)+charged_outcome_bytes`。native claim 在任何 vendor 副作用前
+    认证预留最大合法 sealed outcome，terminal/recovery 写入只能消费该 reserve 并把 charge 缩到实际长度；
+    managed 直接 terminal 只计实际 outcome。Applied/Replayed 不重复计费，open/recovery 从物理行逐项复算。
+    active metadata 固定只计 `claimed|applying|outcomeUnknown`。固定上限：
+    configuration canonical ≤16 KiB、full request plaintext ≤32 KiB、
+    每 conversation 4,096 版、全库 65,536 版/64 MiB；pin ≤1,048,576；metadata request/outcome 各 ≤16 KiB、
+    每 conversation 4,096 条、全库 65,536 条/64 MiB、active ≤1,024。达到上限 typed reject，不做 config GC、
+    rollback tree 或 receipt chain。
+  - SendPrompt 在 B3a 冻结并使用 `daemon.conversation.configuration_required` 与
+    `daemon.conversation.configuration_conflict` 两个稳定 failure code；不得继续用
+    `feature_unavailable`/`invalid_state` 混报未配置与 revision mismatch；同片更新
+    `agentdeck-protocol/src/runtime/failure.rs` 与 `docs/AGENT_DIAGNOSTICS.md` failure table。
+  - [ ] **B1a schema freeze：** 只落 v5 DDL/manifest/常量、`schema_signature_v4` 与 v4/v5 ledger domain，
+    先用 in-memory structural tests 锁 20 张表、FK/CHECK/index/totals；production schema bump 与 row migration
+    留 B1b，避免中间提交不可打开现有 DB。
+  - [ ] **B1b real migration：** 完成 v1/v2/v3/v4→v5 dispatch、容量预检、v4 完整认证、最多 1,024 条
+    `conversation_state` 插入、schema/token CAS、before/after-COMMIT fault 与 reopen convergence。当前 HEAD
+    `28619a8` 的真实 v4 writer 已生成 1 conversation、1 Started、1 Accepted、1 event/catalog/snapshot/intent
+    的仓库外 0700/0600 样本；reader 对该样本中实际非空的 descriptor/command/event/catalog/snapshot/intent
+    sealed columns、对应非 `runtime_meta` row MAC/blind token 与 wrapped key 做 byte-exact manifest。fence、
+    adapter state、approval、publication、terminal result 等未填充表只沿用各自 authenticated regression，
+    不冒充真实非空样本证据。读回后删除临时 DB/KEK；不能以手写 SQL fixture 替代。
+  - [ ] **B2 configuration CAS/snapshot：** owner-scoped CAS/replay/conflict、sealed full request、单一
+    ConfigurationChanged、cursor-consistent snapshot、DescribeAgents/default configuration 与零 catalog 漂移。
+  - [ ] **B3a admission pin：** SendPrompt expected revision、Accepted 同事务非零 pin、receipt/status/query
+    原 revision、并发 Configure/Prompt 线性化；新 command 缺 pin fail-close。
+  - [ ] **B3b exact execution：** queued/restart/recovery 按 pin load exact configuration；只有
+    `commandSeq <= legacyCommandHighWater` 的迁移前命令可在 startup recovery 消费 frozen P3.7 rev0 defaults。
+    Codex/CC recorded argv/control/translator fixture 锁定实际字段映射，不冒充 live login。
+  - [ ] **B4 metadata：** durable mutation ledger、managed rename/archive、descriptor/lifecycle + entry/catalog
+    revision + CatalogDelta 同事务，conversation event 恒为零；managed mutation 同事务直接写 terminal
+    `applied`。native 合法转移固定为 `claimed→applying→applied|failed|outcomeUnknown`；`outcomeUnknown` 保持
+    active，只能经 authenticated native readback 收敛为 applied/failed，绝不再次调用 vendor。active exact
+    retry 零写/零副作用并返回稳定 `daemon.conversation.metadata_mutation_pending`，terminal same
+    owner+key+request exact replay 原 outcome，same owner+key/different request conflict；B4 同步更新
+    `failure.rs` 与 diagnostics failure table。native claim/apply/readback 执行留 C0-C。
+  - [ ] **B5 cross-layer closeout：** 并发 writer、重放/冲突、restart/recovery、receipt/event/snapshot 一致性，
+    完整 cargo/Swift/iOS/selfcheck/docs/diff gates、独立 spec/security/quality review 与 scoped commits。
+  任一切片预估达到 1,800 additions 先继续细拆，实际超过 2,000 立即停下；不以删除旧代码抵消新增行。
+- [ ] v4→v5 migration 固定：existing conversation 在 `conversation_state` 中迁为 rev0/unconfigured、
+  `entryRevision=0`、`origin=Managed`，并把已认证 `commandHighWater` 逐字复制为 legacy cutoff；迁移前
+  command 不补 pin，只有 `commandSeq <= cutoff` 才解释为 frozen P3.7 rev0，且只允许 recovery 消费。
+  cutoff 物理表示固定为 nullable/BeforeFirst：fresh v5/native conversation 与 v4 `commandHighWater=NULL` 都
+  保持 NULL，绝不能写数值 0；因此首个 seq0 v5 command 缺 pin 必须立即 corruption/fail-close。
+  所有 v5 新 command 必须存在指向同 conversation 非零 configuration 的 pin；用户继续既有 v4
+  conversation 前必须先 Configure；native importer 原子种入 DescribeAgents 对应 default rev1，避免把
+  native history 错当 legacy command。
 - [ ] **P3.9-C0-C native history projection：** daemon bootstrap/reconciliation 调 adapter-private
   projector；CC 使用 OS account home、no-follow/current-UID/regular-file/有界 JSONL 读取，单事务 import
   private reference + canonical descriptor/catalog；adapter read 返回 stable native item key，Runtime 不复制
