@@ -1730,7 +1730,7 @@ P3.9 固定以下迁移边界：
     `393a3201225ef18ae13d4238ba99ea3db612ded4aa86b5819bfab54f01d3421e`；current Rust v2 codec 对同一
     raw bytes 解码成功并完成语义等价重编码。一次性 reader 已退役，仓库内零残留；0600 外部样本保留到
     A2c Swift readback。
-  - [ ] **A2a strict DTO/receipt primitives（约 1,100–1,300 行）：** configuration、metadata、upgrade、
+  - [x] **A2a strict DTO/receipt primitives（实际 1,988 行）：** configuration、metadata、upgrade、
     agent descriptions 与 changed receipt；手写 deny-unknown、missing/null/default、文本/agent/revision
     validation，禁止改宽 IPC v2 公共 vendor 类型。Codex 三个 configuration 字段全部 required；CC
     `permissionMode` required，`model/effort/outputStyle` 均允许 missing 或 null，统一规范化为 `nil` 且
@@ -1745,7 +1745,12 @@ P3.9 固定以下迁移边界：
     lowercase 64-hex SHA、1…128 bytes ASCII target（拒绝 `.`/`..`）、`localOnly` scope 与
     `AwaitingIdle.activeTurns>0`。新增 ingress 与 egress 对称负向测试，不能只测 decoder。
     提交前运行 focused A2a tests、完整 `swift test`、既定 iOS XcodeGen + `xcodebuild test`、docs/diff gate，
-    并独立复审；任何 0-test filter 不算通过。
+    并独立复审；任何 0-test filter 不算通过。commit `bea4c13`；TDD 从缺少 v2 symbol 的 compile-red
+    到 focused 13/13 green，完整 Swift 269 XCTest + 35 Swift Testing、iOS 20/20、docs/diff gate 全绿。
+    初审发现 flattened outer helper P1 与两个假绿 P2 后，补成 10 个 changed payload 统一 internal
+    `RuntimeV2FlattenedPayload`、真实 discriminator round-trip、distinct 17-row error 与 success revision
+    正向 ingress/egress；spec/quality 两路终审均 Approved。source 1,313 行 + tests 675 行，低于但接近
+    2,000 行刹车线，A2a 不再扩 scope。
   - [ ] **A2b stream projection types（约 850–1,100 行）：** catalog、event、Runtime 专用 strict
     vendor-panel、snapshot、backfill；固定 required-null identity、capabilities-first、configuration agent
     match。Catalog reply `nextPageCursor` 必须 present、可为 null；entry 的 `title/cwd` 允许 missing 或 null
