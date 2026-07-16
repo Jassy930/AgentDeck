@@ -1846,8 +1846,10 @@ P3.9 固定以下迁移边界：
     token 与 sealed full request）、`command_configuration_pins`（仅 v5 新 command 的非零 exact pin）和
     `metadata_mutation_ledger`（`claimed|applying|applied|outcomeUnknown|failed`，供 managed 与后续 native
     mutation 共用）。`configuration_journal.event_seq` 必须让 snapshot 按 frozen base event cursor 选择配置；
-    禁止直接读取 current head。Configure 专用事务只推进 event/config head，不改 `updated_at_ms`、catalog/
-    entry revision，也不触发 CatalogDelta。
+    禁止用 current head 选值；每次 selector 在 4,096 行硬上限内认证 revision `1...head` 的 request AEAD、
+    row metadata 与 exact event body，验证 revision/event 连续单调、physical count 等于 authenticated state
+    head，并锚定 chain tail 不高于 authenticated conversation event HWM。Configure 专用事务只推进
+    event/config head，不改 `updated_at_ms`、catalog/entry revision，也不触发 CatalogDelta。
   - 四表每行使用独立 domain-separated metadata MAC 覆盖全部明文列；sealed request/outcome 的 AEAD AAD
     绑定 database/table 与 conversation+revision/idempotency primary identity，sealed full request 内含 owner、
     原始 idempotency key 与 expected revision。`conversation_state` head 固定为 nullable：NULL 当且仅当
@@ -1917,8 +1919,18 @@ P3.9 固定以下迁移边界：
         1 ignored、完整 package 与真实 1,024 × 256 MiB 边界（255.81 秒）、Clippy/fmt/no-net/docs/App
         selfcheck/diff 全绿，两轮独立复审 Approved、无剩余 P0/P1/P2。P3.1 signed Keychain 外部门禁继续
         BLOCKED。
-    - [ ] **B2b cursor snapshot：** 按 frozen base event cursor 选择配置，覆盖 BeforeFirst/rev0、两次 Configure
-      之间的普通 event、ready/build/legacy path 与 retained-memory estimator，禁止读取 current head。
+    - [x] **B2b cursor snapshot（code commit `c54ddc8`，实际 1,169 additions / 39 deletions）：** 按 frozen
+      base event cursor 选择配置，覆盖 BeforeFirst/rev0、两次 Configure 之间的普通 event、Ready/Build/legacy
+      path 与 retained-memory estimator；禁止用 current head 选值。每次 selector 在 4,096 行硬上限内认证
+      revision `1...head` 的 request AEAD、row metadata 与 exact event body，验证 revision/event 连续单调、
+      physical count 等于 authenticated state head，并锚定 chain tail 不高于 authenticated conversation event
+      HWM；旧 cursor 下 intermediate ciphertext、gap + valid orphan 与 parent HWM rollback 均已 RED→GREEN。
+      current/legacy Ready 保持 crypto/schema provenance，legacy 只生成临时 v2 wire、不改写 DB。真实 production
+      4,096 版完整 selector 慢门禁 1/1（56.80 秒）；默认 runtime snapshot 23 passed + 1 ignored、私有 35/35、
+      configuration 7 passed + 1 ignored、daemon lib 665 passed + 1 ignored，完整 package 含 1,024 × 256 MiB
+      边界（255.14 秒）、stream 45/45、transfer 17/17、StorageKEK 14 passed + 1 ignored；Clippy/fmt/no-net/
+      docs/App selfcheck/diff 全绿。两轮独立终审 Approved、无剩余 P0/P1/P2；P3.1 signed Keychain 外部门禁
+      继续 BLOCKED。
     - [ ] **B2c Core cutover/defaults：** DescribeAgents 稳定 defaults、RuntimeCore Configure production route、
       receipt/subscriber/reconnect 一致；不夹带 B3 SendPrompt/pin 或 B4 metadata mutation。
   - [ ] **B3a admission pin：** SendPrompt expected revision、Accepted 同事务非零 pin、receipt/status/query

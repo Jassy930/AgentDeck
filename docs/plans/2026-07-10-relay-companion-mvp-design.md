@@ -590,9 +590,11 @@ history 时直接切到 UDS，会让用户选择静默回落默认值、历史�
   cutoff 固定使用 nullable/BeforeFirst；fresh v5/native conversation 与 v4 空 conversation 都保持 NULL，
   禁止用 0 作为 sentinel，首个 seq0 command 缺 pin同样 fail-close。
   `configuration_journal` 必须绑定唯一 `ConfigurationChanged` event seq；event id/body 从该同会话 exact row
-  读回并验证。snapshot 按 frozen base event cursor 选 `eventSeq <= base` 的最新配置，不能直接读 current
-  head。Configure 不改 `updatedAtMs`，否则会在
-  不发 CatalogDelta 时制造 catalog-visible `lastActiveMs` 漂移。
+  读回并验证。snapshot 按 frozen base event cursor 选 `eventSeq <= base` 的最新配置，不能用 current head
+  选值；每次 selector 在 4,096 行硬上限内认证 revision `1...head` 的 request AEAD、row metadata 与 exact
+  event body，验证 revision/event 连续单调、physical count 等于 authenticated state head，并要求 chain tail
+  不高于 authenticated conversation event HWM。Configure 不改 `updatedAtMs`，否则会在不发 CatalogDelta 时
+  制造 catalog-visible `lastActiveMs` 漂移。
 - 四个 sidecar 分别使用 domain-separated row MAC 覆盖全部明文列；sealed request/outcome 的 AEAD AAD 绑定
   database/table 与 conversation+revision/idempotency primary identity。state head 为 nullable，NULL 当且仅当
   rev0/unconfigured，非 NULL 才以复合 FK 指向同会话 configuration；configuration event、
