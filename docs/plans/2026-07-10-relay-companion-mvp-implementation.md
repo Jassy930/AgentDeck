@@ -1650,9 +1650,11 @@ P3.9 固定以下迁移边界：
 - Modify: `Sources/AgentDeckCore/HistoryModel.swift`
 - Modify: `Tests/AgentDeckTests/{NewSessionDialogEncodingTests,RuntimeAgentKindTests}.swift`
 
-- [ ] **P3.9-C0-A0 version-neutral 机械切片：** 只把 Swift mirror/test 文件移动到 version-neutral 名称，
+- [x] **P3.9-C0-A0 version-neutral 机械切片：** 只把 Swift mirror/test 文件移动到 version-neutral 名称，
   不 bulk 重命名 3,000+ 行 leaf symbols、不改 wire；运行原 Swift contract 全绿并独立 review/提交。该切片
-  只消除文件名误导，不宣称 Runtime v2。
+  只消除文件名误导，不宣称 Runtime v2。commit `d4057f1`；Swift compatibility 26/26、完整
+  256 XCTest + 35 Swift Testing 全绿。独立 review 唯一 P2 是旧 filter 会 0-test 假绿，已同步修正
+  AGENTS/QUALITY 三个可执行入口后关闭；最终无 P0/P1/P2。
 - [ ] **P3.9-C0-A1 Runtime v2 Rust contract：** 先读回真实 Swift `SessionStart` 样本；冻结
   `DescribeAgents`、`ConfigureConversation`、`UpdateConversationMetadata`、dormant local-only
   `StageUpgrade`、configuration/metadata/upgrade receipts、
