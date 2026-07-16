@@ -1,20 +1,118 @@
-//! Runtime v5 configuration sidecar 的初始状态、迁移物化与完整性门禁。
+//! Runtime v5 configuration sidecar 的初始状态、CAS writer 与完整性门禁。
 //!
-//! B1b 只允许 `conversation_state` 出现非空数据；configuration/pin/metadata
-//! writer 分别由后续 B2/B3/B4 接入。在这些 writer 落地前，任一对应物理行都
-//! 必须 fail-close，不能把未认证的手写 fixture 当作合法状态。
+//! B2a 只接入 append-only configuration writer；pin/metadata writer 仍由 B3/B4
+//! 接入。在这些 writer 落地前，任一对应物理行都必须 fail-close，不能把未认证
+//! 的手写 fixture 当作合法状态。
 
-use rusqlite::{Connection, Transaction, params};
+use agentdeck_protocol::runtime::identity::{ConversationId, EventId};
+use agentdeck_protocol::runtime::{
+    ConversationConfiguration, ConversationConfigurationState, RuntimeEvent, RuntimeEventBody,
+};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use zeroize::Zeroizing;
 
-use crate::runtime::model::{MAX_RUNTIME_CONVERSATIONS, RuntimeStoreError};
+use crate::runtime::events::CommandStreamEffects;
+use crate::runtime::model::{
+    ConfigurationLimitScope, ConversationRecord, IdempotencyOwner, MAX_IDEMPOTENCY_KEY_BYTES,
+    MAX_RUNTIME_CONVERSATIONS, MAX_RUNTIME_EVENT_BYTES, RuntimeCommitOperation, RuntimeStoreConfig,
+    RuntimeStoreError, RuntimeStoreOperation,
+};
 
-use super::cipher::RuntimeKeyBundle;
-use super::sequence::{SequenceScope, decode_sequence, encode_sequence};
-use super::sqlite::RuntimeLedger;
+use super::cipher::{ROW_BLOB_V1_OVERHEAD_LEN, RowAad, RuntimeKeyBundle};
+use super::identity::{RuntimeId, RuntimeIdKind};
+use super::schema::{RUNTIME_CRYPTO_CONTEXT_VERSION, RUNTIME_SCHEMA_FAMILY};
+use super::sequence::{SequenceScope, decode_sequence, encode_sequence, next_sequence};
+use super::sqlite::{RuntimeLedger, RuntimeSqlite, SafetyReserveProjection};
 
 const CONVERSATION_STATE_DOMAIN: &[u8] = b"conversation.state.metadata.v1";
+const CONFIGURATION_OWNER_DOMAIN: &[u8] = b"configuration.owner.v1";
+const CONFIGURATION_IDEMPOTENCY_DOMAIN: &[u8] = b"configuration.idempotency.v1";
+const CONFIGURATION_REQUEST_DOMAIN: &[u8] = b"configuration.request.v1";
+const CONFIGURATION_METADATA_DOMAIN: &[u8] = b"configuration.journal.metadata.v1";
+const CONFIGURATION_REQUEST_MAGIC: &[u8; 4] = b"ADQ1";
+const CONFIGURATION_PRIMARY_KEY_MAGIC: &[u8; 4] = b"ADP1";
+const CONFIGURATION_TABLE: &[u8] = b"configuration_journal";
+const CONFIGURATION_COLUMN: &[u8] = b"sealed_request";
+pub const MAX_CONFIGURATION_CANONICAL_BYTES: usize = 16 * 1024;
+pub const MAX_CONFIGURATION_REQUEST_BYTES: usize = 32 * 1024;
+pub const MAX_CONFIGURATIONS_PER_CONVERSATION: u64 = 4_096;
+pub const MAX_CONFIGURATIONS_GLOBAL: u64 = 65_536;
+pub const MAX_CONFIGURATION_SEALED_BYTES_GLOBAL: u64 = 64 * 1024 * 1024;
 const V5_SCHEMA_FIXED_PROJECTION_BYTES: u64 = 2 * 1024 * 1024;
 const V5_STATE_ROW_PROJECTION_BYTES: u64 = 1024;
+
+#[derive(Clone)]
+pub struct ConfigureConversation {
+    pub conversation_id: RuntimeId,
+    pub owner: IdempotencyOwner,
+    pub idempotency_key: String,
+    pub expected_configuration_revision: u64,
+    pub configuration: ConversationConfiguration,
+}
+
+impl std::fmt::Debug for ConfigureConversation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConfigureConversation")
+            .field("conversation_id", &self.conversation_id)
+            .field("owner", &self.owner)
+            .field("idempotency_key", &"[REDACTED]")
+            .field(
+                "expected_configuration_revision",
+                &self.expected_configuration_revision,
+            )
+            .field("configuration", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct ConfigurationRecord {
+    pub conversation_id: RuntimeId,
+    pub configuration_revision: u64,
+    pub base_configuration_revision: u64,
+    pub event_id: RuntimeId,
+    pub event_seq: u64,
+    pub created_at_ms: u64,
+    pub configuration: ConversationConfiguration,
+}
+
+impl std::fmt::Debug for ConfigurationRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConfigurationRecord")
+            .field("conversation_id", &self.conversation_id)
+            .field("configuration_revision", &self.configuration_revision)
+            .field(
+                "base_configuration_revision",
+                &self.base_configuration_revision,
+            )
+            .field("event_id", &self.event_id)
+            .field("event_seq", &self.event_seq)
+            .field("created_at_ms", &self.created_at_ms)
+            .field("configuration", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConfigureConversationOutcome {
+    Applied { configuration: ConfigurationRecord },
+    Replayed { configuration: ConfigurationRecord },
+    Conflict { current_configuration_revision: u64 },
+}
+
+pub(crate) struct PreparedConfigurationRequest {
+    conversation_id: RuntimeId,
+    expected_configuration_revision: u64,
+    request_plaintext: Zeroizing<Vec<u8>>,
+}
+
+impl PreparedConfigurationRequest {
+    pub(crate) fn retained_capacity(&self) -> Result<usize, RuntimeStoreError> {
+        Ok(self.request_plaintext.capacity())
+    }
+}
 
 fn append_field(message: &mut Vec<u8>, value: &[u8]) {
     message.extend_from_slice(&(value.len() as u64).to_be_bytes());
@@ -29,6 +127,218 @@ fn append_optional_field(message: &mut Vec<u8>, value: Option<&[u8]>) {
             append_field(message, value);
         }
     }
+}
+
+fn append_request_field(message: &mut Vec<u8>, value: &[u8]) -> Result<(), RuntimeStoreError> {
+    let length = u32::try_from(value.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    message.extend_from_slice(&length.to_be_bytes());
+    message.extend_from_slice(value);
+    Ok(())
+}
+
+pub(crate) fn prepare_configuration_request(
+    input: ConfigureConversation,
+) -> Result<PreparedConfigurationRequest, RuntimeStoreError> {
+    let ConfigureConversation {
+        conversation_id,
+        owner,
+        idempotency_key,
+        expected_configuration_revision,
+        configuration,
+    } = input;
+    if conversation_id.kind() != RuntimeIdKind::Conversation {
+        return Err(RuntimeStoreError::IdKindMismatch {
+            expected: RuntimeIdKind::Conversation,
+            actual: conversation_id.kind(),
+        });
+    }
+    if idempotency_key.is_empty() || idempotency_key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
+        return Err(RuntimeStoreError::InvalidConfig(
+            "idempotency key must contain 1 to 1024 UTF-8 bytes",
+        ));
+    }
+    let configuration_bytes = Zeroizing::new(serde_json::to_vec(&configuration).map_err(|_| {
+        RuntimeStoreError::InvalidConfig(
+            "conversation configuration must serialize as canonical JSON",
+        )
+    })?);
+    if configuration_bytes.is_empty()
+        || configuration_bytes.len() > MAX_CONFIGURATION_CANONICAL_BYTES
+    {
+        return Err(RuntimeStoreError::PayloadTooLarge);
+    }
+    let owner_bytes = Zeroizing::new(super::journal::canonical_owner_v1(&owner));
+    let expected_revision = encode_sequence(expected_configuration_revision);
+    let mut request_plaintext = Vec::with_capacity(
+        4 + 5 * 4
+            + conversation_id.as_bytes().len()
+            + owner_bytes.len()
+            + idempotency_key.len()
+            + expected_revision.len()
+            + configuration_bytes.len(),
+    );
+    request_plaintext.extend_from_slice(CONFIGURATION_REQUEST_MAGIC);
+    append_request_field(&mut request_plaintext, conversation_id.as_bytes())?;
+    append_request_field(&mut request_plaintext, owner_bytes.as_ref())?;
+    append_request_field(&mut request_plaintext, idempotency_key.as_bytes())?;
+    append_request_field(&mut request_plaintext, expected_revision.as_bytes())?;
+    append_request_field(&mut request_plaintext, configuration_bytes.as_ref())?;
+    if request_plaintext.len() > MAX_CONFIGURATION_REQUEST_BYTES {
+        return Err(RuntimeStoreError::PayloadTooLarge);
+    }
+    Ok(PreparedConfigurationRequest {
+        conversation_id,
+        expected_configuration_revision,
+        request_plaintext: Zeroizing::new(request_plaintext),
+    })
+}
+
+fn decode_configuration_request(plaintext: &[u8]) -> Result<[&[u8]; 5], RuntimeStoreError> {
+    if plaintext.get(..4) != Some(CONFIGURATION_REQUEST_MAGIC) {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let mut cursor = 4_usize;
+    let mut fields = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let length_end = cursor
+            .checked_add(4)
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        let length = u32::from_be_bytes(
+            plaintext
+                .get(cursor..length_end)
+                .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?
+                .try_into()
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+        );
+        cursor = length_end;
+        let length =
+            usize::try_from(length).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+        let field_end = cursor
+            .checked_add(length)
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        fields.push(
+            plaintext
+                .get(cursor..field_end)
+                .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?,
+        );
+        cursor = field_end;
+    }
+    if cursor != plaintext.len() {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    fields
+        .try_into()
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)
+}
+
+fn configuration_idempotency_token(
+    key_bundle: &RuntimeKeyBundle,
+    conversation_id: RuntimeId,
+    owner_bytes: &[u8],
+    idempotency_key: &[u8],
+) -> Result<[u8; 32], RuntimeStoreError> {
+    let mut message =
+        Vec::with_capacity(4 + 3 * 4 + 16 + owner_bytes.len() + idempotency_key.len());
+    message.extend_from_slice(b"ADF1");
+    append_request_field(&mut message, conversation_id.as_bytes())?;
+    append_request_field(&mut message, owner_bytes)?;
+    append_request_field(&mut message, idempotency_key)?;
+    Ok(*key_bundle
+        .blind_index(CONFIGURATION_IDEMPOTENCY_DOMAIN, &message)?
+        .as_bytes())
+}
+
+fn configuration_primary_key(
+    conversation_id: RuntimeId,
+    revision: &str,
+    idempotency_token: &[u8; 32],
+) -> Vec<u8> {
+    let mut primary_key = Vec::with_capacity(4 + 16 + revision.len() + 32);
+    primary_key.extend_from_slice(CONFIGURATION_PRIMARY_KEY_MAGIC);
+    primary_key.extend_from_slice(conversation_id.as_bytes());
+    primary_key.extend_from_slice(revision.as_bytes());
+    primary_key.extend_from_slice(idempotency_token);
+    primary_key
+}
+
+#[allow(clippy::too_many_arguments)]
+fn configuration_metadata_token(
+    key_bundle: &RuntimeKeyBundle,
+    conversation_id: RuntimeId,
+    revision: &str,
+    base_revision: &str,
+    event_seq: &str,
+    owner_token: &[u8; 32],
+    idempotency_token: &[u8; 32],
+    request_token: &[u8; 32],
+    logical_configuration_bytes: u64,
+    logical_request_bytes: u64,
+    sealed_request_bytes: u64,
+    created_at_ms: u64,
+) -> Result<[u8; 32], RuntimeStoreError> {
+    let configuration_bytes = logical_configuration_bytes.to_be_bytes();
+    let request_bytes = logical_request_bytes.to_be_bytes();
+    let sealed_bytes = sealed_request_bytes.to_be_bytes();
+    let created_at = created_at_ms.to_be_bytes();
+    let mut message = Vec::with_capacity(384);
+    for field in [
+        &conversation_id.as_bytes()[..],
+        revision.as_bytes(),
+        base_revision.as_bytes(),
+        event_seq.as_bytes(),
+        &owner_token[..],
+        &idempotency_token[..],
+        &request_token[..],
+        &configuration_bytes[..],
+        &request_bytes[..],
+        &sealed_bytes[..],
+        &created_at[..],
+    ] {
+        append_field(&mut message, field);
+    }
+    Ok(*key_bundle
+        .blind_index(CONFIGURATION_METADATA_DOMAIN, &message)?
+        .as_bytes())
+}
+
+fn seal_configuration_request(
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    primary_key: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, RuntimeStoreError> {
+    Ok(key_bundle.row_cipher().seal_bounded(
+        &RowAad {
+            schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
+            schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
+            database_id: &database_id,
+            table: CONFIGURATION_TABLE,
+            primary_key,
+            column: CONFIGURATION_COLUMN,
+        },
+        plaintext,
+        MAX_CONFIGURATION_REQUEST_BYTES,
+    )?)
+}
+
+fn open_configuration_request(
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    primary_key: &[u8],
+    ciphertext: &[u8],
+) -> Result<crate::security::SecretBytes, RuntimeStoreError> {
+    Ok(key_bundle.row_cipher().open_bounded(
+        &RowAad {
+            schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
+            schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
+            database_id: &database_id,
+            table: CONFIGURATION_TABLE,
+            primary_key,
+            column: CONFIGURATION_COLUMN,
+        },
+        ciphertext,
+        MAX_CONFIGURATION_REQUEST_BYTES,
+    )?)
 }
 
 fn conversation_state_metadata_token(
@@ -52,6 +362,855 @@ fn conversation_state_metadata_token(
     append_optional_field(&mut message, legacy_command_high_water.map(str::as_bytes));
     let token = key_bundle.blind_index(CONVERSATION_STATE_DOMAIN, &message)?;
     Ok(*token.as_bytes())
+}
+
+#[derive(Clone)]
+struct AuthenticatedConversationState {
+    current_configuration_revision: Option<String>,
+    entry_revision: String,
+    origin_kind: String,
+    origin_namespace: Option<String>,
+    legacy_command_high_water: Option<String>,
+    metadata_token: [u8; 32],
+}
+
+impl AuthenticatedConversationState {
+    fn current_revision(&self) -> Result<u64, RuntimeStoreError> {
+        self.current_configuration_revision
+            .as_deref()
+            .map(|value| decode_sequence(SequenceScope::ConfigurationRevision, value))
+            .transpose()
+            .map(Option::unwrap_or_default)
+            .map_err(RuntimeStoreError::from)
+    }
+}
+
+fn fixed_token(value: Vec<u8>) -> Result<[u8; 32], RuntimeStoreError> {
+    value
+        .try_into()
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)
+}
+
+fn load_conversation_state(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    conversation_id: RuntimeId,
+) -> Result<AuthenticatedConversationState, RuntimeStoreError> {
+    let raw = connection
+        .query_row(
+            "SELECT current_configuration_revision, entry_revision, origin_kind,
+                    origin_namespace, legacy_command_high_water, metadata_token
+             FROM conversation_state WHERE conversation_id = ?1",
+            [&conversation_id.as_bytes()[..]],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                ))
+            },
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => RuntimeStoreError::UnknownOrCorruptSchema,
+            other => RuntimeStoreError::Sqlite(other),
+        })?;
+    if let Some(current) = raw.0.as_deref()
+        && decode_sequence(SequenceScope::ConfigurationRevision, current)? == 0
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    decode_sequence(SequenceScope::EntryRevision, &raw.1)?;
+    if let Some(cutoff) = raw.4.as_deref() {
+        decode_sequence(SequenceScope::CommandSeq, cutoff)?;
+    }
+    if !matches!(
+        (raw.2.as_str(), raw.3.as_deref()),
+        ("managed", None) | ("nativeProjected", Some(_))
+    ) {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let token = fixed_token(raw.5)?;
+    let expected = conversation_state_metadata_token(
+        key_bundle,
+        conversation_id.as_bytes(),
+        raw.0.as_deref(),
+        &raw.1,
+        &raw.2,
+        raw.3.as_deref(),
+        raw.4.as_deref(),
+    )?;
+    if token != expected {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(AuthenticatedConversationState {
+        current_configuration_revision: raw.0,
+        entry_revision: raw.1,
+        origin_kind: raw.2,
+        origin_namespace: raw.3,
+        legacy_command_high_water: raw.4,
+        metadata_token: token,
+    })
+}
+
+#[derive(Clone)]
+struct RawConfigurationRow {
+    conversation_id: Vec<u8>,
+    configuration_revision: String,
+    base_configuration_revision: String,
+    event_seq: String,
+    owner_token: Vec<u8>,
+    idempotency_token: Vec<u8>,
+    request_token: Vec<u8>,
+    logical_configuration_bytes: i64,
+    logical_request_bytes: i64,
+    created_at_ms: i64,
+    metadata_token: Vec<u8>,
+    sealed_request: Vec<u8>,
+}
+
+fn raw_configuration_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawConfigurationRow> {
+    Ok(RawConfigurationRow {
+        conversation_id: row.get(0)?,
+        configuration_revision: row.get(1)?,
+        base_configuration_revision: row.get(2)?,
+        event_seq: row.get(3)?,
+        owner_token: row.get(4)?,
+        idempotency_token: row.get(5)?,
+        request_token: row.get(6)?,
+        logical_configuration_bytes: row.get(7)?,
+        logical_request_bytes: row.get(8)?,
+        created_at_ms: row.get(9)?,
+        metadata_token: row.get(10)?,
+        sealed_request: row.get(11)?,
+    })
+}
+
+fn query_configuration_row(
+    connection: &Connection,
+    clause: &str,
+    parameter: &[u8],
+) -> Result<Option<RawConfigurationRow>, RuntimeStoreError> {
+    let sql = format!(
+        "SELECT conversation_id, configuration_revision, base_configuration_revision,
+                event_seq, owner_token, idempotency_token, request_token,
+                logical_configuration_bytes, logical_request_bytes, created_at_ms,
+                metadata_token, sealed_request
+         FROM configuration_journal WHERE {clause}"
+    );
+    connection
+        .query_row(&sql, [parameter], raw_configuration_row)
+        .optional()
+        .map_err(RuntimeStoreError::from)
+}
+
+fn query_configuration_row_by_event(
+    connection: &Connection,
+    conversation_id: RuntimeId,
+    event_seq: &str,
+) -> Result<Option<RawConfigurationRow>, RuntimeStoreError> {
+    connection
+        .query_row(
+            "SELECT conversation_id, configuration_revision, base_configuration_revision,
+                    event_seq, owner_token, idempotency_token, request_token,
+                    logical_configuration_bytes, logical_request_bytes, created_at_ms,
+                    metadata_token, sealed_request
+             FROM configuration_journal
+             WHERE conversation_id = ?1 AND event_seq = ?2",
+            params![&conversation_id.as_bytes()[..], event_seq],
+            raw_configuration_row,
+        )
+        .optional()
+        .map_err(RuntimeStoreError::from)
+}
+
+pub(super) fn configuration_row_exists_for_event(
+    connection: &Connection,
+    conversation_id: RuntimeId,
+    event_seq: &str,
+) -> Result<bool, RuntimeStoreError> {
+    Ok(query_configuration_row_by_event(connection, conversation_id, event_seq)?.is_some())
+}
+
+struct AuthenticatedConfigurationRow {
+    record: ConfigurationRecord,
+    request_token: [u8; 32],
+    sealed_bytes: u64,
+}
+
+fn authenticate_configuration_row(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    conversation: &ConversationRecord,
+    raw: RawConfigurationRow,
+) -> Result<AuthenticatedConfigurationRow, RuntimeStoreError> {
+    let conversation_id = RuntimeId::from_bytes(
+        RuntimeIdKind::Conversation,
+        raw.conversation_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+    )?;
+    let revision = decode_sequence(
+        SequenceScope::ConfigurationRevision,
+        &raw.configuration_revision,
+    )?;
+    let base_revision = decode_sequence(
+        SequenceScope::ConfigurationRevision,
+        &raw.base_configuration_revision,
+    )?;
+    let event_seq = decode_sequence(SequenceScope::EventSeq, &raw.event_seq)?;
+    if revision == 0 || base_revision.checked_add(1) != Some(revision) {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let logical_configuration_bytes = u64::try_from(raw.logical_configuration_bytes)
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let logical_request_bytes = u64::try_from(raw.logical_request_bytes)
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let created_at_ms =
+        u64::try_from(raw.created_at_ms).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let owner_token = fixed_token(raw.owner_token)?;
+    let idempotency_token = fixed_token(raw.idempotency_token)?;
+    let request_token = fixed_token(raw.request_token)?;
+    let metadata_token = fixed_token(raw.metadata_token)?;
+    let primary_key = configuration_primary_key(
+        conversation_id,
+        &raw.configuration_revision,
+        &idempotency_token,
+    );
+    let plaintext =
+        open_configuration_request(key_bundle, database_id, &primary_key, &raw.sealed_request)?;
+    if u64::try_from(plaintext.expose_secret().len())
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
+        != logical_request_bytes
+        || raw.sealed_request.len()
+            != plaintext
+                .expose_secret()
+                .len()
+                .checked_add(ROW_BLOB_V1_OVERHEAD_LEN)
+                .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let fields = decode_configuration_request(plaintext.expose_secret())?;
+    if fields[0] != conversation_id.as_bytes()
+        || fields[2].is_empty()
+        || fields[2].len() > MAX_IDEMPOTENCY_KEY_BYTES
+        || fields[3].len() != super::sequence::SEQUENCE_TEXT_WIDTH
+        || fields[4].is_empty()
+        || fields[4].len() > MAX_CONFIGURATION_CANONICAL_BYTES
+        || u64::try_from(fields[4].len()).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
+            != logical_configuration_bytes
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let expected_revision = decode_sequence(
+        SequenceScope::ConfigurationRevision,
+        std::str::from_utf8(fields[3]).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+    )?;
+    if expected_revision != base_revision || std::str::from_utf8(fields[2]).is_err() {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let owner = super::journal::decode_canonical_owner(fields[1])?;
+    let configuration: ConversationConfiguration =
+        serde_json::from_slice(fields[4]).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let canonical = Zeroizing::new(
+        serde_json::to_vec(&configuration)
+            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+    );
+    if canonical.as_slice() != fields[4] {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    if conversation.conversation_id != conversation_id
+        || conversation.descriptor.agent_kind != configuration.agent_kind()
+        || created_at_ms < conversation.created_at_ms
+        || created_at_ms > conversation.updated_at_ms
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let expected_owner_token = key_bundle.blind_index(CONFIGURATION_OWNER_DOMAIN, fields[1])?;
+    let expected_idempotency_token =
+        configuration_idempotency_token(key_bundle, conversation_id, fields[1], fields[2])?;
+    let expected_request_token =
+        key_bundle.blind_index(CONFIGURATION_REQUEST_DOMAIN, plaintext.expose_secret())?;
+    let expected_metadata_token = configuration_metadata_token(
+        key_bundle,
+        conversation_id,
+        &raw.configuration_revision,
+        &raw.base_configuration_revision,
+        &raw.event_seq,
+        &owner_token,
+        &idempotency_token,
+        &request_token,
+        logical_configuration_bytes,
+        logical_request_bytes,
+        u64::try_from(raw.sealed_request.len())
+            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+        created_at_ms,
+    )?;
+    if owner_token != *expected_owner_token.as_bytes()
+        || idempotency_token != expected_idempotency_token
+        || request_token != *expected_request_token.as_bytes()
+        || metadata_token != expected_metadata_token
+        || super::journal::canonical_owner_v1(&owner) != fields[1]
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let event_id = connection
+        .query_row(
+            "SELECT event_id FROM event_journal
+             WHERE conversation_id = ?1 AND event_seq = ?2",
+            params![&conversation_id.as_bytes()[..], &raw.event_seq],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => RuntimeStoreError::UnknownOrCorruptSchema,
+            other => RuntimeStoreError::Sqlite(other),
+        })?;
+    let event_id = RuntimeId::from_bytes(
+        RuntimeIdKind::Event,
+        event_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+    )?;
+    let event = super::journal::load_event(connection, key_bundle, database_id, event_id)?;
+    if event.command_id.is_some()
+        || event.conversation_id != conversation_id
+        || event.event_seq != event_seq
+        || event.created_at_ms != created_at_ms
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let super::persisted_event::PersistedRuntimeEvent::Canonical(decoded) =
+        super::persisted_event::decode_persisted_runtime_event(&event)?
+    else {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    };
+    let expected_state = ConversationConfigurationState::new(revision, Some(configuration.clone()))
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    match decoded.body {
+        RuntimeEventBody::ConfigurationChanged { state } if state == expected_state => {}
+        _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
+    }
+    Ok(AuthenticatedConfigurationRow {
+        record: ConfigurationRecord {
+            conversation_id,
+            configuration_revision: revision,
+            base_configuration_revision: base_revision,
+            event_id,
+            event_seq,
+            created_at_ms,
+            configuration,
+        },
+        request_token,
+        sealed_bytes: u64::try_from(raw.sealed_request.len())
+            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+    })
+}
+
+fn try_replay_configuration(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    conversation_id: RuntimeId,
+    idempotency_token: &[u8; 32],
+    request_token: &[u8; 32],
+) -> Result<Option<ConfigurationRecord>, RuntimeStoreError> {
+    let Some(raw) =
+        query_configuration_row(connection, "idempotency_token = ?1", idempotency_token)?
+    else {
+        return Ok(None);
+    };
+    let conversation =
+        super::journal::load_conversation(connection, key_bundle, database_id, conversation_id)?;
+    let authenticated =
+        authenticate_configuration_row(connection, key_bundle, database_id, &conversation, raw)?;
+    if authenticated.request_token != *request_token {
+        return Err(RuntimeStoreError::IdempotencyConflict);
+    }
+    let current =
+        load_conversation_state(connection, key_bundle, conversation_id)?.current_revision()?;
+    if current < authenticated.record.configuration_revision
+        || configuration_count_for_conversation(connection, conversation_id)? != current
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(Some(authenticated.record))
+}
+
+fn configuration_count_for_conversation(
+    connection: &Connection,
+    conversation_id: RuntimeId,
+) -> Result<u64, RuntimeStoreError> {
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM configuration_journal WHERE conversation_id = ?1",
+        [&conversation_id.as_bytes()[..]],
+        |row| row.get(0),
+    )?;
+    u64::try_from(count).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)
+}
+
+fn ensure_configuration_capacity(
+    ledger: &RuntimeLedger,
+    conversation_count: u64,
+    new_sealed_bytes: u64,
+) -> Result<(), RuntimeStoreError> {
+    if conversation_count >= MAX_CONFIGURATIONS_PER_CONVERSATION {
+        return Err(RuntimeStoreError::ConfigurationLimit {
+            scope: ConfigurationLimitScope::Conversation,
+        });
+    }
+    if ledger.configuration_count >= MAX_CONFIGURATIONS_GLOBAL {
+        return Err(RuntimeStoreError::ConfigurationLimit {
+            scope: ConfigurationLimitScope::GlobalCount,
+        });
+    }
+    if ledger
+        .configuration_sealed_bytes
+        .checked_add(new_sealed_bytes)
+        .is_none_or(|value| value > MAX_CONFIGURATION_SEALED_BYTES_GLOBAL)
+    {
+        return Err(RuntimeStoreError::ConfigurationLimit {
+            scope: ConfigurationLimitScope::GlobalSealedBytes,
+        });
+    }
+    Ok(())
+}
+
+struct DecodedConfigurationInput {
+    conversation_id: RuntimeId,
+    expected_configuration_revision: u64,
+    configuration: ConversationConfiguration,
+}
+
+fn validate_configuration_preflight(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    input: &DecodedConfigurationInput,
+    ledger: &RuntimeLedger,
+    new_sealed_bytes: u64,
+) -> Result<Result<(ConversationRecord, AuthenticatedConversationState), u64>, RuntimeStoreError> {
+    let conversation = super::journal::load_conversation(
+        connection,
+        key_bundle,
+        database_id,
+        input.conversation_id,
+    )?;
+    if conversation.descriptor.agent_kind != input.configuration.agent_kind() {
+        return Err(RuntimeStoreError::ConfigurationAgentMismatch);
+    }
+    let state = load_conversation_state(connection, key_bundle, input.conversation_id)?;
+    let current = state.current_revision()?;
+    let conversation_count =
+        configuration_count_for_conversation(connection, input.conversation_id)?;
+    if conversation_count != current {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    if input.expected_configuration_revision != current {
+        return Ok(Err(current));
+    }
+    ensure_configuration_capacity(ledger, conversation_count, new_sealed_bytes)?;
+    if let Some(event_high_water) = conversation.event_high_water {
+        let encoded = encode_sequence(event_high_water);
+        let event_id = connection
+            .query_row(
+                "SELECT event_id FROM event_journal
+                 WHERE conversation_id = ?1 AND event_seq = ?2",
+                params![&input.conversation_id.as_bytes()[..], encoded],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => RuntimeStoreError::UnknownOrCorruptSchema,
+                other => RuntimeStoreError::Sqlite(other),
+            })?;
+        let event_id = RuntimeId::from_bytes(
+            RuntimeIdKind::Event,
+            event_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+        )?;
+        let event = super::journal::load_event(connection, key_bundle, database_id, event_id)?;
+        if event.created_at_ms > conversation.updated_at_ms {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+    }
+    Ok(Ok((conversation, state)))
+}
+
+fn update_configuration_head(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    conversation_id: RuntimeId,
+    state: &AuthenticatedConversationState,
+    next_revision: &str,
+) -> Result<(), RuntimeStoreError> {
+    let next_token = conversation_state_metadata_token(
+        key_bundle,
+        conversation_id.as_bytes(),
+        Some(next_revision),
+        &state.entry_revision,
+        &state.origin_kind,
+        state.origin_namespace.as_deref(),
+        state.legacy_command_high_water.as_deref(),
+    )?;
+    if transaction.execute(
+        "UPDATE conversation_state
+         SET current_configuration_revision = ?1, metadata_token = ?2
+         WHERE conversation_id = ?3
+           AND ((?4 IS NULL AND current_configuration_revision IS NULL)
+                OR current_configuration_revision = ?4)
+           AND metadata_token = ?5",
+        params![
+            next_revision,
+            &next_token[..],
+            &conversation_id.as_bytes()[..],
+            state.current_configuration_revision.as_deref(),
+            &state.metadata_token[..],
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    Ok(())
+}
+
+fn seal_configuration_event(
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    event_id: RuntimeId,
+    payload: &[u8],
+) -> Result<Vec<u8>, RuntimeStoreError> {
+    Ok(key_bundle.row_cipher().seal_bounded(
+        &RowAad {
+            schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
+            schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
+            database_id: &database_id,
+            table: b"event_journal",
+            primary_key: event_id.as_bytes(),
+            column: b"sealed_event",
+        },
+        payload,
+        MAX_RUNTIME_EVENT_BYTES,
+    )?)
+}
+
+pub(crate) fn configure_conversation(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    prepared: PreparedConfigurationRequest,
+    effects: &mut CommandStreamEffects,
+) -> Result<ConfigureConversationOutcome, RuntimeStoreError> {
+    let request_fields = decode_configuration_request(prepared.request_plaintext.as_ref())?;
+    if request_fields[0] != prepared.conversation_id.as_bytes() {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let encoded_expected_revision = std::str::from_utf8(request_fields[3])
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if decode_sequence(
+        SequenceScope::ConfigurationRevision,
+        encoded_expected_revision,
+    )? != prepared.expected_configuration_revision
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let input = DecodedConfigurationInput {
+        conversation_id: prepared.conversation_id,
+        expected_configuration_revision: prepared.expected_configuration_revision,
+        configuration: serde_json::from_slice(request_fields[4])
+            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+    };
+    let owner_token = state
+        .key_bundle
+        .blind_index(CONFIGURATION_OWNER_DOMAIN, request_fields[1])?;
+    let idempotency_token = configuration_idempotency_token(
+        &state.key_bundle,
+        input.conversation_id,
+        request_fields[1],
+        request_fields[2],
+    )?;
+    let request_token = state.key_bundle.blind_index(
+        CONFIGURATION_REQUEST_DOMAIN,
+        prepared.request_plaintext.as_ref(),
+    )?;
+    let projected_sealed_bytes = prepared
+        .request_plaintext
+        .len()
+        .checked_add(ROW_BLOB_V1_OVERHEAD_LEN)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or(RuntimeStoreError::CapacityArithmeticOverflow {
+            field: "configuration sealed request bytes",
+        })?;
+    let preflight_ledger = super::sqlite::load_runtime_ledger(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+    )?;
+    if let Some(configuration) = try_replay_configuration(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        input.conversation_id,
+        &idempotency_token,
+        request_token.as_bytes(),
+    )? {
+        return Ok(ConfigureConversationOutcome::Replayed { configuration });
+    }
+    if let Err(current_configuration_revision) = validate_configuration_preflight(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        &input,
+        &preflight_ledger,
+        projected_sealed_bytes,
+    )? {
+        return Ok(ConfigureConversationOutcome::Conflict {
+            current_configuration_revision,
+        });
+    }
+    let projected_write_bytes = super::journal::projected_write_bytes(&[
+        usize::try_from(projected_sealed_bytes).map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+        request_fields[4]
+            .len()
+            .checked_add(2 * 1024)
+            .ok_or(RuntimeStoreError::PayloadTooLarge)?,
+    ])?;
+    super::sqlite::admit_ordinary_write(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        &state.storage_path,
+        &mut state.admission_state,
+        config.capacity_probe.as_ref(),
+        projected_write_bytes,
+        SafetyReserveProjection::Current,
+    )?;
+    let trim_now_ms = config.clock.now_ms().map_err(RuntimeStoreError::from)?;
+
+    let transaction = state
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let ledger =
+        super::sqlite::load_runtime_ledger(&transaction, &state.key_bundle, state.database_id)?;
+    if let Some(configuration) = try_replay_configuration(
+        &transaction,
+        &state.key_bundle,
+        state.database_id,
+        input.conversation_id,
+        &idempotency_token,
+        request_token.as_bytes(),
+    )? {
+        return Ok(ConfigureConversationOutcome::Replayed { configuration });
+    }
+    let (conversation, conversation_state) = match validate_configuration_preflight(
+        &transaction,
+        &state.key_bundle,
+        state.database_id,
+        &input,
+        &ledger,
+        projected_sealed_bytes,
+    )? {
+        Ok(value) => value,
+        Err(current_configuration_revision) => {
+            return Ok(ConfigureConversationOutcome::Conflict {
+                current_configuration_revision,
+            });
+        }
+    };
+    let base_revision = conversation_state.current_revision()?;
+    let base_revision_encoded = encode_sequence(base_revision);
+    let revision =
+        base_revision
+            .checked_add(1)
+            .ok_or(super::sequence::SequenceError::Exhausted {
+                scope: SequenceScope::ConfigurationRevision,
+            })?;
+    let revision_encoded = encode_sequence(revision);
+    let previous_event = conversation.event_high_water.map(encode_sequence);
+    let event_seq = next_sequence(SequenceScope::EventSeq, previous_event.as_deref())?;
+    let event_id = super::journal::allocate_id(&transaction, config, RuntimeIdKind::Event)?;
+    let configuration_state =
+        ConversationConfigurationState::new(revision, Some(input.configuration.clone())).map_err(
+            |_| RuntimeStoreError::InvalidConfig("invalid conversation configuration state"),
+        )?;
+    let event = RuntimeEvent::new(
+        ConversationId::new(input.conversation_id.to_canonical_string()),
+        EventId::new(event_id.to_canonical_string()),
+        event_seq.value,
+        None,
+        None,
+        None,
+        RuntimeEventBody::ConfigurationChanged {
+            state: configuration_state,
+        },
+    )
+    .map_err(|_| RuntimeStoreError::InvalidConfig("invalid configuration event identity"))?;
+    let event_payload =
+        Zeroizing::new(serde_json::to_vec(&event).map_err(|_| {
+            RuntimeStoreError::InvalidConfig("configuration event is not canonical")
+        })?);
+    if event_payload.len() > MAX_RUNTIME_EVENT_BYTES {
+        return Err(RuntimeStoreError::PayloadTooLarge);
+    }
+    let sealed_event = seal_configuration_event(
+        &state.key_bundle,
+        state.database_id,
+        event_id,
+        event_payload.as_ref(),
+    )?;
+    let primary_key =
+        configuration_primary_key(input.conversation_id, &revision_encoded, &idempotency_token);
+    let sealed_request = seal_configuration_request(
+        &state.key_bundle,
+        state.database_id,
+        &primary_key,
+        prepared.request_plaintext.as_ref(),
+    )?;
+    if u64::try_from(sealed_request.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?
+        != projected_sealed_bytes
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let created_at_ms = conversation.updated_at_ms;
+    let created_at = i64::try_from(created_at_ms).map_err(|_| RuntimeStoreError::TimeOutOfRange)?;
+    let logical_event_bytes =
+        u64::try_from(event_payload.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    let logical_configuration_bytes =
+        u64::try_from(request_fields[4].len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    let logical_request_bytes = u64::try_from(prepared.request_plaintext.len())
+        .map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    let event_metadata_token = super::journal::event_metadata_token(
+        &state.key_bundle,
+        input.conversation_id,
+        event_id,
+        event_seq.value,
+        None,
+        logical_event_bytes,
+        created_at_ms,
+    )?;
+    let configuration_metadata_token = configuration_metadata_token(
+        &state.key_bundle,
+        input.conversation_id,
+        &revision_encoded,
+        &base_revision_encoded,
+        &event_seq.encoded,
+        owner_token.as_bytes(),
+        &idempotency_token,
+        request_token.as_bytes(),
+        logical_configuration_bytes,
+        logical_request_bytes,
+        projected_sealed_bytes,
+        created_at_ms,
+    )?;
+    transaction.execute(
+        "INSERT INTO event_journal (
+             conversation_id, event_seq, event_id, command_id,
+             logical_event_bytes, created_at_ms, metadata_token, sealed_event
+         ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7)",
+        params![
+            &input.conversation_id.as_bytes()[..],
+            &event_seq.encoded,
+            &event_id.as_bytes()[..],
+            i64::try_from(logical_event_bytes).map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+            created_at,
+            &event_metadata_token[..],
+            sealed_event,
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO configuration_journal (
+             conversation_id, configuration_revision, base_configuration_revision,
+             event_seq, owner_token, idempotency_token, request_token,
+             logical_configuration_bytes, logical_request_bytes, created_at_ms,
+             metadata_token, sealed_request
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            &input.conversation_id.as_bytes()[..],
+            &revision_encoded,
+            &base_revision_encoded,
+            &event_seq.encoded,
+            &owner_token.as_bytes()[..],
+            &idempotency_token[..],
+            &request_token.as_bytes()[..],
+            i64::try_from(logical_configuration_bytes)
+                .map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+            i64::try_from(logical_request_bytes).map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+            created_at,
+            &configuration_metadata_token[..],
+            sealed_request,
+        ],
+    )?;
+    super::journal::update_conversation_event_high_water_preserving_activity(
+        &transaction,
+        input.conversation_id,
+        &event_seq.encoded,
+        previous_event.as_deref(),
+        &state.key_bundle,
+        state.database_id,
+    )?;
+    update_configuration_head(
+        &transaction,
+        &state.key_bundle,
+        input.conversation_id,
+        &conversation_state,
+        &revision_encoded,
+    )?;
+    let mut next_ledger = ledger.clone();
+    next_ledger.event_count = next_ledger
+        .event_count
+        .checked_add(1)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    next_ledger.configuration_count = next_ledger
+        .configuration_count
+        .checked_add(1)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    next_ledger.configuration_sealed_bytes = next_ledger
+        .configuration_sealed_bytes
+        .checked_add(projected_sealed_bytes)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let pending_targets = super::sqlite::update_runtime_ledger_with_trim_clock(
+        &transaction,
+        &state.key_bundle,
+        state.database_id,
+        &ledger,
+        &next_ledger,
+        trim_now_ms,
+    )?;
+    config
+        .fault_injector
+        .before_operation(RuntimeStoreOperation::ConfigureConversationBeforeCommit)?;
+    let commit_result = super::sqlite::commit_transaction(
+        transaction,
+        RuntimeCommitOperation::ConfigureConversation,
+    );
+    effects.record_commit_result(pending_targets, &commit_result);
+    commit_result?;
+    super::sqlite::latch_post_commit_capacity(state, config);
+    if config
+        .fault_injector
+        .before_operation(RuntimeStoreOperation::ConfigureConversationAfterCommit)
+        .is_err()
+    {
+        return Err(RuntimeStoreError::CommitOutcomeUnknown {
+            operation: RuntimeCommitOperation::ConfigureConversation,
+        });
+    }
+    Ok(ConfigureConversationOutcome::Applied {
+        configuration: ConfigurationRecord {
+            conversation_id: input.conversation_id,
+            configuration_revision: revision,
+            base_configuration_revision: base_revision,
+            event_id,
+            event_seq: event_seq.value,
+            created_at_ms,
+            configuration: input.configuration,
+        },
+    })
 }
 
 pub(super) fn migration_projection_bytes(
@@ -149,7 +1308,7 @@ pub(super) fn materialize_legacy_v4_states(
     Ok(())
 }
 
-fn v5_totals_are_zero(ledger: &RuntimeLedger) -> bool {
+fn all_v5_totals_are_zero(ledger: &RuntimeLedger) -> bool {
     ledger.configuration_count == 0
         && ledger.configuration_sealed_bytes == 0
         && ledger.command_configuration_pin_count == 0
@@ -161,8 +1320,9 @@ fn v5_totals_are_zero(ledger: &RuntimeLedger) -> bool {
 pub(super) fn validate_v5_integrity(
     connection: &Connection,
     key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
     ledger: &RuntimeLedger,
-) -> Result<(), RuntimeStoreError> {
+) -> Result<u64, RuntimeStoreError> {
     let version: u32 = connection
         .query_row(
             "SELECT schema_version FROM runtime_meta WHERE singleton = 1",
@@ -171,57 +1331,78 @@ pub(super) fn validate_v5_integrity(
         )
         .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
     if version < 5 {
-        return if v5_totals_are_zero(ledger) {
-            Ok(())
+        return if all_v5_totals_are_zero(ledger) {
+            Ok(0)
         } else {
             Err(RuntimeStoreError::UnknownOrCorruptSchema)
         };
     }
-    if version != 5 || !v5_totals_are_zero(ledger) {
+    if version != 5
+        || ledger.command_configuration_pin_count != 0
+        || ledger.metadata_mutation_count != 0
+        || ledger.active_metadata_mutation_count != 0
+        || ledger.metadata_mutation_charged_bytes != 0
+    {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
 
-    let rows = connection
-        .prepare(
-            "SELECT conversation_id, current_configuration_revision, entry_revision,
-                    origin_kind, origin_namespace, legacy_command_high_water, metadata_token
-             FROM conversation_state ORDER BY conversation_id",
-        )?
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, Vec<u8>>(6)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut statement = connection.prepare(
+        "SELECT conversation_id, current_configuration_revision, entry_revision,
+                origin_kind, origin_namespace, legacy_command_high_water, metadata_token
+         FROM conversation_state ORDER BY conversation_id",
+    )?;
+    let mapped = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Vec<u8>>(6)?,
+        ))
+    })?;
+    let state_limit = usize::try_from(MAX_RUNTIME_CONVERSATIONS)
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let mut rows = Vec::with_capacity(state_limit);
+    for row in mapped {
+        if rows.len() == state_limit {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        rows.push(row?);
+    }
     if u64::try_from(rows.len()).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
         != ledger.conversation_count
         || ledger.conversation_count > MAX_RUNTIME_CONVERSATIONS
     {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
+    let mut authenticated_configuration_count = 0_u64;
+    let mut authenticated_sealed_bytes = 0_u64;
     for (conversation_id, current, entry, origin, namespace, cutoff, token) in rows {
         let conversation_id: [u8; 16] = conversation_id
             .try_into()
             .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
-        if let Some(current) = current.as_deref()
-            && decode_sequence(SequenceScope::CommandSeq, current)? == 0
-        {
+        let current_revision = current
+            .as_deref()
+            .map(|value| decode_sequence(SequenceScope::ConfigurationRevision, value))
+            .transpose()?
+            .unwrap_or_default();
+        if current.is_some() && current_revision == 0 {
             return Err(RuntimeStoreError::UnknownOrCorruptSchema);
         }
-        decode_sequence(SequenceScope::CommandSeq, &entry)?;
-        if let Some(cutoff) = cutoff.as_deref() {
-            decode_sequence(SequenceScope::CommandSeq, cutoff)?;
+        if decode_sequence(SequenceScope::EntryRevision, &entry)? != 0 {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
         }
+        let cutoff_value = cutoff
+            .as_deref()
+            .map(|value| decode_sequence(SequenceScope::CommandSeq, value))
+            .transpose()?;
         if !matches!(
             (origin.as_str(), namespace.as_deref()),
             ("managed", None) | ("nativeProjected", Some(_))
-        ) {
+        ) || origin == "nativeProjected" && cutoff.is_some()
+        {
             return Err(RuntimeStoreError::UnknownOrCorruptSchema);
         }
         let expected = conversation_state_metadata_token(
@@ -234,6 +1415,67 @@ pub(super) fn validate_v5_integrity(
             cutoff.as_deref(),
         )?;
         if token.as_slice() != expected {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        let conversation_id = RuntimeId::from_bytes(RuntimeIdKind::Conversation, conversation_id)?;
+        let conversation =
+            super::journal::load_conversation(connection, key_bundle, database_id, conversation_id)
+                .map_err(|error| match error {
+                    RuntimeStoreError::ConversationNotFound => {
+                        RuntimeStoreError::UnknownOrCorruptSchema
+                    }
+                    other => other,
+                })?;
+        if cutoff_value.is_some_and(|cutoff| {
+            conversation
+                .command_high_water
+                .is_none_or(|high_water| high_water < cutoff)
+        }) {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        let mut statement = connection.prepare(
+            "SELECT conversation_id, configuration_revision, base_configuration_revision,
+                    event_seq, owner_token, idempotency_token, request_token,
+                    logical_configuration_bytes, logical_request_bytes, created_at_ms,
+                    metadata_token, sealed_request
+             FROM configuration_journal
+             WHERE conversation_id = ?1
+             ORDER BY configuration_revision",
+        )?;
+        let configuration_rows =
+            statement.query_map([&conversation_id.as_bytes()[..]], raw_configuration_row)?;
+        let mut next_revision = 1_u64;
+        let mut last_event_seq = None;
+        for row in configuration_rows {
+            let authenticated = authenticate_configuration_row(
+                connection,
+                key_bundle,
+                database_id,
+                &conversation,
+                row?,
+            )?;
+            if authenticated.record.conversation_id != conversation_id
+                || authenticated.record.configuration_revision != next_revision
+                || authenticated.record.base_configuration_revision + 1 != next_revision
+                || last_event_seq.is_some_and(|previous| authenticated.record.event_seq <= previous)
+            {
+                return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+            }
+            last_event_seq = Some(authenticated.record.event_seq);
+            next_revision = next_revision
+                .checked_add(1)
+                .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+            authenticated_configuration_count = authenticated_configuration_count
+                .checked_add(1)
+                .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+            authenticated_sealed_bytes = authenticated_sealed_bytes
+                .checked_add(authenticated.sealed_bytes)
+                .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        }
+        let conversation_configuration_count = next_revision - 1;
+        if conversation_configuration_count != current_revision
+            || conversation_configuration_count > MAX_CONFIGURATIONS_PER_CONVERSATION
+        {
             return Err(RuntimeStoreError::UnknownOrCorruptSchema);
         }
     }
@@ -266,8 +1508,23 @@ pub(super) fn validate_v5_integrity(
             ))
         },
     )?;
-    if missing_states != 0 || physical != (0, 0, 0, 0, 0, 0) {
+    let physical_configuration_count =
+        u64::try_from(physical.0).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let physical_configuration_bytes =
+        u64::try_from(physical.1).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if missing_states != 0
+        || physical_configuration_count != authenticated_configuration_count
+        || physical_configuration_bytes != authenticated_sealed_bytes
+        || physical.2 != 0
+        || physical.3 != 0
+        || physical.4 != 0
+        || physical.5 != 0
+        || ledger.configuration_count != authenticated_configuration_count
+        || ledger.configuration_sealed_bytes != authenticated_sealed_bytes
+        || authenticated_configuration_count > MAX_CONFIGURATIONS_GLOBAL
+        || authenticated_sealed_bytes > MAX_CONFIGURATION_SEALED_BYTES_GLOBAL
+    {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
-    Ok(())
+    Ok(authenticated_configuration_count)
 }

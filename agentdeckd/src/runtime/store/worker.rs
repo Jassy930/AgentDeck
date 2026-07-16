@@ -48,6 +48,9 @@ use crate::security::{SecretBytes, StorageKek};
 
 use super::cipher::RuntimeReadCryptoCapability;
 use super::command_event::StartEventSource;
+use super::configuration::{
+    self, ConfigureConversation, ConfigureConversationOutcome, PreparedConfigurationRequest,
+};
 use super::execution_event::PreparedExecutionEvent;
 use super::identity::{
     MAX_RUNTIME_ID_COLLISION_ATTEMPTS, RuntimeId, RuntimeIdError, RuntimeIdKind,
@@ -502,6 +505,23 @@ impl RuntimeStoreHandle {
                 descriptor_bytes,
                 reply,
             },
+        )
+        .await?
+    }
+
+    pub async fn configure_conversation(
+        &self,
+        input: ConfigureConversation,
+    ) -> Result<ConfigureConversationOutcome, RuntimeStoreError> {
+        let prepared = configuration::prepare_configuration_request(input)?;
+        let charge = memory_charge(size_of::<NormalCommand>(), &[prepared.retained_capacity()?])?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::ConfigureConversation { prepared, reply },
         )
         .await?
     }
@@ -1181,6 +1201,10 @@ enum NormalCommand {
         descriptor_bytes: zeroize::Zeroizing<Vec<u8>>,
         reply: oneshot::Sender<Result<CreateConversationOutcome, RuntimeStoreError>>,
     },
+    ConfigureConversation {
+        prepared: PreparedConfigurationRequest,
+        reply: oneshot::Sender<Result<ConfigureConversationOutcome, RuntimeStoreError>>,
+    },
     AcceptCommand {
         input: AcceptCommand,
         reply: oneshot::Sender<Result<AcceptOutcome, RuntimeStoreError>>,
@@ -1624,6 +1648,9 @@ fn handle_normal(
             NormalCommand::CreateConversation { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
+            NormalCommand::ConfigureConversation { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
             NormalCommand::AcceptCommand { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
@@ -1692,6 +1719,13 @@ fn handle_normal(
             let mut effects = CommandStreamEffects::default();
             let result =
                 journal::create_conversation(state, config, input, descriptor_bytes, &mut effects);
+            let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
+            let _ = reply.send(result);
+        }
+        NormalCommand::ConfigureConversation { prepared, reply } => {
+            let mut effects = CommandStreamEffects::default();
+            let result =
+                configuration::configure_conversation(state, config, prepared, &mut effects);
             let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
             let _ = reply.send(result);
         }

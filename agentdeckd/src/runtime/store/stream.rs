@@ -427,12 +427,31 @@ pub(super) fn migrate_v4_rows(
 /// 所有 v4 audit event mutation 在更新 runtime ledger 前经过此处。它只把
 /// `indexed_through_event_seq` 之后的新 audit suffix 加入 replay index；已经因 retention
 /// 被裁掉的旧 membership 永远不会被重新加入。
+#[cfg(test)]
 pub(super) fn reconcile_event_stream(
     transaction: &Transaction<'_>,
     key_bundle: &RuntimeKeyBundle,
     database_id: [u8; 16],
     previous: &RuntimeLedger,
     requested_next: &RuntimeLedger,
+) -> Result<(RuntimeLedger, PendingStreamTargets), RuntimeStoreError> {
+    reconcile_event_stream_with_trim_clock(
+        transaction,
+        key_bundle,
+        database_id,
+        previous,
+        requested_next,
+        None,
+    )
+}
+
+pub(super) fn reconcile_event_stream_with_trim_clock(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    previous: &RuntimeLedger,
+    requested_next: &RuntimeLedger,
+    trim_now_ms: Option<u64>,
 ) -> Result<(RuntimeLedger, PendingStreamTargets), RuntimeStoreError> {
     let mut next = requested_next.clone();
     let mut pending_targets = PendingStreamTargets::default();
@@ -591,7 +610,7 @@ pub(super) fn reconcile_event_stream(
             key_bundle,
             &conversation_id,
             true,
-            conversation_trim_now_ms,
+            effective_trim_now_ms(conversation_trim_now_ms, trim_now_ms),
             MAX_EVENT_STREAM_EVENTS_PER_CONVERSATION,
             MAX_EVENT_STREAM_BYTES_PER_CONVERSATION,
         )?;
@@ -609,7 +628,12 @@ pub(super) fn reconcile_event_stream(
     if processed_delta != event_delta {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
-    trim_global_event_window(transaction, key_bundle, true, global_trim_now_ms)?;
+    trim_global_event_window(
+        transaction,
+        key_bundle,
+        true,
+        effective_trim_now_ms(global_trim_now_ms, trim_now_ms),
+    )?;
     let (stream_count, stream_bytes): (i64, i64) = transaction.query_row(
         "SELECT COUNT(*), COALESCE(SUM(logical_event_bytes), 0)
          FROM event_stream_index",
@@ -627,6 +651,10 @@ pub(super) fn reconcile_event_stream(
     next.event_stream_bytes =
         u64::try_from(stream_bytes).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
     Ok((next, pending_targets))
+}
+
+fn effective_trim_now_ms(event_created_at_ms: u64, trim_now_ms: Option<u64>) -> u64 {
+    trim_now_ms.unwrap_or(event_created_at_ms)
 }
 
 pub(super) fn acquire_backfill_pin(

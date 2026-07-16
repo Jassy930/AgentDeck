@@ -4762,7 +4762,7 @@ fn load_optional_fence(
     .transpose()
 }
 
-fn allocate_id(
+pub(super) fn allocate_id(
     transaction: &Transaction<'_>,
     config: &RuntimeStoreConfig,
     kind: RuntimeIdKind,
@@ -5057,7 +5057,7 @@ fn command_metadata_token(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn event_metadata_token(
+pub(super) fn event_metadata_token(
     key_bundle: &super::cipher::RuntimeKeyBundle,
     conversation_id: RuntimeId,
     event_id: RuntimeId,
@@ -5154,7 +5154,9 @@ pub(super) fn canonical_owner_v1(owner: &IdempotencyOwner) -> Vec<u8> {
     encoded
 }
 
-fn decode_canonical_owner(encoded: &[u8]) -> Result<IdempotencyOwner, RuntimeStoreError> {
+pub(super) fn decode_canonical_owner(
+    encoded: &[u8],
+) -> Result<IdempotencyOwner, RuntimeStoreError> {
     if encoded.get(..4) != Some(b"ADO1") {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
@@ -5542,6 +5544,7 @@ fn validate_all_event_metadata(
 struct DynamicEventIntegritySummary {
     event_count: u64,
     approval_event_count: u64,
+    configuration_event_count: u64,
 }
 
 fn validate_dynamic_event_ledger(
@@ -5591,14 +5594,32 @@ fn validate_dynamic_event_ledger(
             return Err(RuntimeStoreError::UnknownOrCorruptSchema);
         }
         last_created_at_ms = Some(event.created_at_ms);
-        let command_id = event
-            .command_id
-            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        if event.conversation_id != conversation_id || event.event_seq != event_seq {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        let Some(command_id) = event.command_id else {
+            let PersistedRuntimeEvent::Canonical(decoded) = decode_persisted_runtime_event(&event)?
+            else {
+                return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+            };
+            if !matches!(
+                decoded.body,
+                agentdeck_protocol::runtime::RuntimeEventBody::ConfigurationChanged { .. }
+            ) || !super::configuration::configuration_row_exists_for_event(
+                connection,
+                conversation_id,
+                &encoded_seq,
+            )? {
+                return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+            }
+            summary.configuration_event_count = summary
+                .configuration_event_count
+                .checked_add(1)
+                .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+            continue;
+        };
         let command = load_command(connection, key_bundle, database_id, command_id)?;
-        if event.conversation_id != conversation_id
-            || command.conversation_id != conversation_id
-            || event.event_seq != event_seq
-        {
+        if command.conversation_id != conversation_id {
             return Err(RuntimeStoreError::UnknownOrCorruptSchema);
         }
 
@@ -5738,6 +5759,8 @@ fn validate_store_integrity_against_ledger(
     // 严格零摘要，避免在旧 schema authentication 阶段误查 v3 表。
     let approvals =
         super::approval::validate_all_approval_metadata(connection, key_bundle, database_id)?;
+    let authenticated_configuration_count =
+        super::configuration::validate_v5_integrity(connection, key_bundle, database_id, ledger)?;
     let mut started_without_fence_count = 0_u64;
     let mut started_without_release_count = 0_u64;
     let mut started_released_count = 0_u64;
@@ -5840,7 +5863,9 @@ fn validate_store_integrity_against_ledger(
         }
     }
     let authenticated_events = validate_dynamic_event_ledger(connection, key_bundle, database_id)?;
-    if authenticated_events.approval_event_count != approvals.approval_event_count {
+    if authenticated_events.approval_event_count != approvals.approval_event_count
+        || authenticated_events.configuration_event_count != authenticated_configuration_count
+    {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
     let (actual_intent_count, actual_fence_count, actual_event_count): (i64, i64, i64) = connection
@@ -5897,7 +5922,6 @@ fn validate_store_integrity_against_ledger(
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
     super::stream::validate_v4_integrity(connection, key_bundle, database_id, ledger)?;
-    super::configuration::validate_v5_integrity(connection, key_bundle, ledger)?;
     Ok(())
 }
 
@@ -6211,6 +6235,69 @@ fn update_conversation_high_water(
     Ok(())
 }
 
+/// ConfigureConversation 只推进 conversation event HWM；它不改变 catalog-visible
+/// `updated_at_ms`、queue count 或 descriptor/lifecycle。独立窄入口防止配置写入误用
+/// 普通 command/event helper 后制造没有 CatalogDelta 的 last-active 漂移。
+pub(super) fn update_conversation_event_high_water_preserving_activity(
+    transaction: &Transaction<'_>,
+    conversation_id: RuntimeId,
+    next: &str,
+    previous: Option<&str>,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+) -> Result<(), RuntimeStoreError> {
+    let current = load_conversation(transaction, key_bundle, database_id, conversation_id)?;
+    let current_previous = current
+        .event_high_water
+        .map(super::sequence::encode_sequence);
+    if current_previous.as_deref() != previous {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    let next_value = decode_sequence(SequenceScope::EventSeq, next)?;
+    let old_token = conversation_metadata_token(
+        key_bundle,
+        current.conversation_id,
+        current.adapter_state_key,
+        current.catalog_revision,
+        current.command_high_water,
+        current.event_high_water,
+        current.accepted_command_count,
+        current.lifecycle,
+        current.created_at_ms,
+        current.updated_at_ms,
+    )?;
+    let new_token = conversation_metadata_token(
+        key_bundle,
+        current.conversation_id,
+        current.adapter_state_key,
+        current.catalog_revision,
+        current.command_high_water,
+        Some(next_value),
+        current.accepted_command_count,
+        current.lifecycle,
+        current.created_at_ms,
+        current.updated_at_ms,
+    )?;
+    if transaction.execute(
+        "UPDATE conversations
+         SET event_high_water = ?1, metadata_token = ?2
+         WHERE conversation_id = ?3
+           AND ((?4 IS NULL AND event_high_water IS NULL) OR event_high_water = ?4)
+           AND metadata_token = ?5",
+        params![
+            next,
+            &new_token[..],
+            &conversation_id.as_bytes()[..],
+            previous,
+            &old_token[..],
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    Ok(())
+}
+
 fn commit_transaction(
     transaction: Transaction<'_>,
     operation: RuntimeCommitOperation,
@@ -6277,7 +6364,7 @@ fn validate_payload_len(actual: usize, maximum: usize) -> Result<(), RuntimeStor
     }
 }
 
-fn projected_write_bytes(lengths: &[usize]) -> Result<u64, RuntimeStoreError> {
+pub(super) fn projected_write_bytes(lengths: &[usize]) -> Result<u64, RuntimeStoreError> {
     lengths
         .iter()
         .try_fold(RUNTIME_WRITE_FIXED_OVERHEAD_BYTES, |projected, length| {

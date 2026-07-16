@@ -3922,13 +3922,44 @@ pub(crate) fn update_runtime_ledger(
     previous: &RuntimeLedger,
     next: &RuntimeLedger,
 ) -> Result<crate::runtime::events::PendingStreamTargets, RuntimeStoreError> {
-    let (reconciled_next, mut pending_targets) = super::stream::reconcile_event_stream(
+    update_runtime_ledger_inner(transaction, key_bundle, database_id, previous, next, None)
+}
+
+pub(crate) fn update_runtime_ledger_with_trim_clock(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    previous: &RuntimeLedger,
+    next: &RuntimeLedger,
+    trim_now_ms: u64,
+) -> Result<crate::runtime::events::PendingStreamTargets, RuntimeStoreError> {
+    update_runtime_ledger_inner(
         transaction,
         key_bundle,
         database_id,
         previous,
         next,
-    )?;
+        Some(trim_now_ms),
+    )
+}
+
+fn update_runtime_ledger_inner(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    previous: &RuntimeLedger,
+    next: &RuntimeLedger,
+    trim_now_ms: Option<u64>,
+) -> Result<crate::runtime::events::PendingStreamTargets, RuntimeStoreError> {
+    let (reconciled_next, mut pending_targets) =
+        super::stream::reconcile_event_stream_with_trim_clock(
+            transaction,
+            key_bundle,
+            database_id,
+            previous,
+            next,
+            trim_now_ms,
+        )?;
     let reconciled_next = super::catalog::reconcile_catalog_journal(
         transaction,
         key_bundle,

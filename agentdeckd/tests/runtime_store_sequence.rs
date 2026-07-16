@@ -91,8 +91,11 @@ fn encoded_sequence_text_sorts_in_unsigned_numeric_order() {
 
 #[test]
 fn leader_start_time_uses_the_same_full_u64_codec_with_its_own_scope() {
-    assert_eq!(
-        decode_sequence(SequenceScope::LeaderStartTime, "18446744073709551615"),
-        Ok(u64::MAX)
-    );
+    for scope in [
+        SequenceScope::LeaderStartTime,
+        SequenceScope::ConfigurationRevision,
+        SequenceScope::EntryRevision,
+    ] {
+        assert_eq!(decode_sequence(scope, "18446744073709551615"), Ok(u64::MAX));
+    }
 }

@@ -11,6 +11,8 @@ pub const SEQUENCE_TEXT_WIDTH: usize = 20;
 pub enum SequenceScope {
     CatalogRevision,
     CommandSeq,
+    ConfigurationRevision,
+    EntryRevision,
     EventSeq,
     LeaderStartTime,
 }

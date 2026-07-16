@@ -72,6 +72,8 @@ pub enum RuntimeStoreOperation {
     RecordEnrollmentReceiptAfterCommit,
     CreateConversationBeforeCommit,
     CreateConversationAfterCommit,
+    ConfigureConversationBeforeCommit,
+    ConfigureConversationAfterCommit,
     MarkConversationRecoveryBlockedBeforeCommit,
     MarkConversationRecoveryBlockedAfterCommit,
     AcceptCommandBeforeCommit,
@@ -322,10 +324,18 @@ pub enum QueueScope {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigurationLimitScope {
+    Conversation,
+    GlobalCount,
+    GlobalSealedBytes,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeCommitOperation {
     MigrateSchema,
     RecordEnrollmentReceipt,
     CreateConversation,
+    ConfigureConversation,
     MarkConversationRecoveryBlocked,
     AcceptCommand,
     StartCommand,
@@ -1274,6 +1284,10 @@ pub enum RuntimeStoreError {
     ConversationConflict,
     #[error("runtime conversation catalog reached its hard limit")]
     ConversationLimit,
+    #[error("runtime conversation configuration agent kind does not match its descriptor")]
+    ConfigurationAgentMismatch,
+    #[error("runtime configuration journal is full for {scope:?}")]
+    ConfigurationLimit { scope: ConfigurationLimitScope },
     #[error("runtime adapter state reference conflicts with the existing binding")]
     AdapterStateConflict,
     #[error("runtime adapter state key belongs to the other private namespace")]
@@ -1399,6 +1413,7 @@ impl RuntimeStoreError {
             Self::IdKindMismatch { .. }
             | Self::ConversationNotFound
             | Self::ConversationConflict
+            | Self::ConfigurationAgentMismatch
             | Self::AdapterStateConflict
             | Self::AdapterStateNamespaceMismatch
             | Self::CommandNotFound
@@ -1422,6 +1437,7 @@ impl RuntimeStoreError {
             | Self::IdGeneration(_)
             | Self::Sequence(_) => "daemon.runtime.invalid_state",
             Self::ConversationLimit => "daemon.runtime.actor_unavailable",
+            Self::ConfigurationLimit { .. } => "daemon.runtime.store_full",
             Self::IdempotencyConflict => "daemon.command.idempotency_conflict",
             Self::QueueFull { .. } => "daemon.command.queue_full",
             Self::PayloadTooLarge => "daemon.payload.item_too_large",

@@ -27,19 +27,21 @@ use crate::runtime::events::SnapshotBuildPinCleanup;
 pub use crate::runtime::model::{
     AcceptCommand, AcceptOutcome, AcceptedTerminationReason, AuthorizeExecutionRelease,
     CommandReceiptRecord, CommandReceiptSelector, CommandRecord, CommandState, CommandTerminal,
-    CompleteCommand, CompleteOutcome, ConversationDescriptor, ConversationLifecycle,
-    ConversationRecord, ConversationRecoveryRecord, CreateConversationOutcome, EventRecord,
-    ExecutionFence, ExecutionFenceRecord, ExecutionIntentRecord, IdempotencyOwner,
-    MAX_CONVERSATION_DESCRIPTOR_BYTES, MAX_RECOVERY_PAGE_RETAINED_BYTES, MAX_RUNTIME_CONVERSATIONS,
-    MachineEnrollmentReceiptRecord, MarkConversationRecoveryBlocked, NewConversation,
-    QueryCommandReceipt, QueueScope, RecoverStartedCommand, RecoveryBlockedCommandBinding,
-    RecoveryCompletion, RecoveryCursor, RecoveryFenceBinding, RecoveryPage, RecoveryState,
-    RuntimeClock, RuntimeClockError, RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError,
-    RuntimeStoreFaultInjector, RuntimeStoreLane, RuntimeStoreOperation, RuntimeStoreSnapshot,
-    SanitizedTerminalFailure, StartCommand, StartOutcome, StartedBeforeReleaseTermination,
-    StartedRecoveryRecord, SystemRuntimeClock, TerminalState, TerminateAcceptedCommand,
-    TerminateAcceptedOutcome, TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
+    CompleteCommand, CompleteOutcome, ConfigurationLimitScope, ConversationDescriptor,
+    ConversationLifecycle, ConversationRecord, ConversationRecoveryRecord,
+    CreateConversationOutcome, EventRecord, ExecutionFence, ExecutionFenceRecord,
+    ExecutionIntentRecord, IdempotencyOwner, MAX_CONVERSATION_DESCRIPTOR_BYTES,
+    MAX_RECOVERY_PAGE_RETAINED_BYTES, MAX_RUNTIME_CONVERSATIONS, MachineEnrollmentReceiptRecord,
+    MarkConversationRecoveryBlocked, NewConversation, QueryCommandReceipt, QueueScope,
+    RecoverStartedCommand, RecoveryBlockedCommandBinding, RecoveryCompletion, RecoveryCursor,
+    RecoveryFenceBinding, RecoveryPage, RecoveryState, RuntimeClock, RuntimeClockError,
+    RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreFaultInjector,
+    RuntimeStoreLane, RuntimeStoreOperation, RuntimeStoreSnapshot, SanitizedTerminalFailure,
+    StartCommand, StartOutcome, StartedBeforeReleaseTermination, StartedRecoveryRecord,
+    SystemRuntimeClock, TerminalState, TerminateAcceptedCommand, TerminateAcceptedOutcome,
+    TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
 };
+pub use configuration::{ConfigurationRecord, ConfigureConversation, ConfigureConversationOutcome};
 pub use execution_event::{AppendExecutionEvent, AppendExecutionEventOutcome};
 pub use identity::{RuntimeId, RuntimeIdKind, RuntimeIdSource};
 pub use publication::{

@@ -1023,12 +1023,14 @@ fn expired_snapshot_pin_is_purged_by_trim_and_cannot_revive() {
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .expect("expired pin trim transaction");
+    let trim_now_ms = effective_trim_now_ms(issued_at_ms, Some(pin.expires_at_ms));
+    assert_eq!(trim_now_ms, pin.expires_at_ms);
     trim_unrecorded_conversation_window(
         &transaction,
         state.key_bundle.as_ref(),
         conversation_id.as_bytes(),
         true,
-        pin.expires_at_ms,
+        trim_now_ms,
         0,
         MAX_EVENT_STREAM_BYTES_PER_CONVERSATION,
     )

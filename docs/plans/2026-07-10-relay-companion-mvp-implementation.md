@@ -1896,8 +1896,18 @@ P3.9 固定以下迁移边界：
   - [ ] **B2 configuration CAS/snapshot：** 只读重估会超过 1,800 additions，动代码前预拆为三片；三片
     共同收口 owner-scoped CAS/replay/conflict、sealed full request、单一 ConfigurationChanged、
     cursor-consistent snapshot、DescribeAgents/default configuration 与零 catalog 漂移：
-    - [ ] **B2a store CAS/integrity：** configuration writer、authenticated row/event/ledger integrity、
-      owner+key exact replay/conflict、COMMIT-unknown 与 restart；pin/metadata 表继续 zero fail-close。
+    - [ ] **B2a store CAS/integrity：** 初始 production + 基础测试已达约 1,619 additions，继续加入
+      hardening matrix 会触及 1,800 行预拆线，因此在提交前拆为两片；idempotency namespace 固定为
+      `(conversationId, canonical owner, raw key)`，expected revision 与 canonical configuration 进入 full
+      request token，同一 namespace 下 exact request replay、不同 request conflict：
+      - [ ] **B2a1 writer/open integrity：** configuration CAS writer、authenticated row/event/ledger integrity、
+        单一 commandless `ConfigurationChanged`、零 catalog/activity 漂移与 apply→reopen→exact replay；
+        pin/metadata 表继续 zero fail-close。`ConfigurationChanged.createdAt` 固定复用已认证的 conversation
+        `updatedAt`；新时钟只供事务内 replay-window trim 判定 TEMP pin 是否过期，不写入 event/activity，
+        防止 idle conversation 的已过期 pin 因旧 event 时间被永久误判 active、令 Configure 持续回滚。
+      - [ ] **B2a2 hardening matrix：** 并发 writer、stale/future revision、same-key conflict、agent/input
+        reject、before/after-COMMIT、tamper/orphan/head/ledger 与 quota exact boundary；所有 reject/replay
+        验证零重复 event/ledger charge。
     - [ ] **B2b cursor snapshot：** 按 frozen base event cursor 选择配置，覆盖 BeforeFirst/rev0、两次 Configure
       之间的普通 event、ready/build/legacy path 与 retained-memory estimator，禁止读取 current head。
     - [ ] **B2c Core cutover/defaults：** DescribeAgents 稳定 defaults、RuntimeCore Configure production route、
