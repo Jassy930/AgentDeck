@@ -1751,26 +1751,32 @@ P3.9 固定以下迁移边界：
     `RuntimeV2FlattenedPayload`、真实 discriminator round-trip、distinct 17-row error 与 success revision
     正向 ingress/egress；spec/quality 两路终审均 Approved。source 1,313 行 + tests 675 行，低于但接近
     2,000 行刹车线，A2a 不再扩 scope。
-  - [ ] **A2b stream projection types（约 850–1,100 行）：** catalog、event、Runtime 专用 strict
-    vendor-panel、snapshot、backfill；固定 required-null identity、capabilities-first、configuration agent
-    match。Catalog reply `nextPageCursor` 必须 present、可为 null；entry 的 `title/cwd` 允许 missing 或 null
-    并统一为 `nil`、egress 显式 null，`entryRevision/lastActiveMs/catalogRevision` 均允许 0；Catalog 拒绝
-    第 501 row 与 bare encoded bytes `>64 MiB`，Removed change 保持 Rust wire 的
-    `conversation_id` key。Runtime event 的 `commandId/itemId/entityId` 及 ApprovalResolved `decision` 必须
-    present、可为 null，`eventSeq=0` 合法；按 body 执行 command/item/entity identity 矩阵。Runtime 专用
-    vendor-panel 外层与嵌套 payload 都拒绝 unknown；CC panel optional 的 missing/null 都规范化为 nil、egress
-    显式 null。Snapshot 必须非空、capabilities first 且恰好一次，configuration 非空时 agent 必须匹配。
-    Backfill 是 after-exclusive/through-inclusive 的 1…512 连续范围，拒绝第 513 entry、空/非连续 range、
-    delta/event sequence 或 conversation scope 不匹配、bare encoded bytes `>64 MiB`；所有门禁均有
-    ingress/egress 负向测试。Swift 符号
-    `RuntimeAdapterStateKey` 改为明确的 `RuntimeAdapterStateKeyV1Compatibility`，只允许出现在
-    compatibility kind/typealias 定义、`RuntimeConversationEntryV1`、`ConversationStartReceiptV1` 的字段/codec
-    与 frozen v1 compatibility tests；不改 legacy JSON key，也不删除 frozen v1 fixture。专门的 source
-    gate 必须证明 frozen `RuntimeWireTypes.swift` 中 unsuffixed `RuntimeAdapterStateKey(Kind)` exact token 为
-    0、`RuntimeAdapterStateKeyV1CompatibilityKind` exact token 为 2、
-    `RuntimeAdapterStateKeyV1Compatibility` exact token 为 6，且 compatibility tests 以外的其他 Swift source
-    为 0；不能因整文件排除而漏过旧 public alias。提交前运行 focused A2b tests、完整 `swift test`、既定
-    iOS XcodeGen + `xcodebuild test`、docs/diff gate并独立复审；任何 0-test filter 不算通过。
+  - [ ] **A2b stream projection types（重估约 1,750–2,250 行，预拆两片）：** 首次源码/测试映射证明
+    catalog/event/vendor-panel 与 snapshot/backfill/compat gate 合并后可能越过 2,000 行刹车，故在落代码前
+    拆为 A2b1/A2b2；两片仍共同完成原 A2b 范围，不删行为门禁。
+    - [ ] **A2b1 catalog + strict vendor-panel + event（约 900–1,150 行）：** Catalog reply
+      `nextPageCursor` 必须 present、可为 null；entry 的 `title/cwd` 允许 missing 或 null 并统一为 `nil`、
+      egress 显式 null，`entryRevision/lastActiveMs/catalogRevision` 均允许 0；Catalog 拒绝第 501 row 与
+      bare encoded bytes `>64 MiB`，Removed change 保持 Rust wire 的 `conversation_id` key。Runtime 专用
+      vendor-panel 外层与嵌套 payload 都拒绝 unknown；Codex 只接受 exact placeholder，CC panel optional
+      的 missing/null 都规范化为 nil、egress 显式 null。Runtime event 的 `commandId/itemId/entityId` 及
+      ApprovalResolved `decision` 必须 present、可为 null，`eventSeq=0` 合法；按 body 执行
+      command/item/entity identity 矩阵。Catalog snapshot/delta 与 event 的 standalone/flattened 编解码共用
+      同一 validation，不复制宽松旁路。提交前运行 focused A2b1 tests、完整 `swift test`、既定 iOS
+      XcodeGen + `xcodebuild test`、docs/diff gate并独立复审；任何 0-test filter 不算通过。
+    - [ ] **A2b2 snapshot + backfill + compatibility gate（约 850–1,100 行）：** Snapshot 必须非空、
+      capabilities first 且恰好一次，configuration 非空时 agent 必须匹配。Backfill 是
+      after-exclusive/through-inclusive 的 1…512 连续范围，拒绝第 513 entry、空/非连续 range、delta/event
+      sequence 或 conversation scope 不匹配、bare encoded bytes `>64 MiB`；standalone/flattened 双向共用
+      validation。Swift 符号 `RuntimeAdapterStateKey` 改为明确的
+      `RuntimeAdapterStateKeyV1Compatibility`，只允许出现在 compatibility kind/typealias 定义、
+      `RuntimeConversationEntryV1`、`ConversationStartReceiptV1` 的字段/codec 与 frozen v1 compatibility
+      tests；不改 legacy JSON key，也不删除 frozen v1 fixture。专门 source gate 必须证明 frozen
+      `RuntimeWireTypes.swift` 中 unsuffixed `RuntimeAdapterStateKey(Kind)` exact token 为 0、
+      `RuntimeAdapterStateKeyV1CompatibilityKind` exact token 为 2、
+      `RuntimeAdapterStateKeyV1Compatibility` exact token 为 6，且 compatibility tests 以外其他 Swift source
+      为 0；不能因整文件排除而漏过旧 public alias。提交前运行 focused A2b2 tests、完整 `swift test`、
+      既定 iOS XcodeGen + `xcodebuild test`、docs/diff gate并独立复审；任何 0-test filter 不算通过。
   - [ ] **A2c outer/codec/current gate（约 1,150–1,400 行）：** request/reply/message/stream/envelope、
     JSON/UDS 700 KiB × 94 parts、compact 3.5 MiB × 64 parts、共同 64 MiB 与 `ADRT1` carrier version 2；
     Catalog request `pageCursor` 必须 present、可为 null；`ttlSecs` missing 固定默认 300、显式 null 拒绝；
