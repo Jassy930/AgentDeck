@@ -213,7 +213,7 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（P3.8 与 P3.9-C0-A0–A2 已完成，P3 整体未完成）
+## Relay Companion MVP 实施状态（P3.8、P3.9-C0-A0–A2 与 B1a/B1b 已完成，P3 整体未完成）
 
 Relay production binary 已原子切换到 **Relay v2**。公开数据面只接受
 `/v2/connect`、`/v2/pair` 与 enrollment 所需的 `POST /v2/machine-enroll`；
@@ -406,9 +406,11 @@ UDS client 已 cutover。
 CancelQueued/CancelActive 与精确 QueryReceipt 接到 Runtime journal。Start 不再携带首 prompt；
 相同 owner+start key 由 StorageKEK 域分离 capability 稳定派生，跨重启返回同一
 公共 `conversationId` 和准确 replay bit；Start receipt、Catalog 与 snapshot wire 已删除
-daemon-private adapter handle。C0-B configuration store 落地前，production `SendPrompt` 对所有 revision
-typed `feature_unavailable`；只有 `#[cfg(test)]` legacy harness 可使用显式 revision 0，新增 mutation
-同样 fail-closed。prompt
+daemon-private adapter handle。C0-B1b 已把 production Runtime DB 升到 schema v5，并为 fresh/迁移
+conversation 物化 authenticated `conversation_state`；B2/B3/B4 writer 落地前，
+`configuration_journal`、`command_configuration_pins`、`metadata_mutation_ledger` 必须为空，非空即
+fail-close。production `SendPrompt` 对所有 revision 仍返回 typed `feature_unavailable`；只有
+`#[cfg(test)]` legacy harness 可使用显式 revision 0，新增 mutation 同样 fail-closed。prompt
 actor 以 journal `commandSeq` 为唯一 FIFO，同 conversation 只有一个 active，不同 conversation
 可由全局 semaphore 并行；control 使用有界优先批次，ReadPool 满时立即 overload，不排无界
 waiter。
@@ -473,6 +475,14 @@ P3.6-B 已由 `02cc640` 把 Runtime DB 迁到 schema v4。v4 在 v3 approval sch
 authenticated audit，不承诺物理删除历史 audit row。独立 ReadPool 使用 8 个
 `mode=ro/query_only=ON` WAL connection，整个池保留页内存 128 MiB，单页 64 rows/8 MiB；
 短事务复制完成后才把页交给 reply pump。
+
+当前 production physical schema 已由 P3.9-C0-B1b 的 `3d0002d` 单调推进到 v5/20 表。v5 新增
+`conversation_state`、`configuration_journal`、`command_configuration_pins` 与
+`metadata_mutation_ledger` 四张 authenticated sidecar，并在 Runtime ledger 增加 6 项 totals；
+crypto context 仍保持 v1。v1/v2/v3/v4 migration 在 `BEGIN IMMEDIATE` 后、任何 DDL 前重新认证
+exact legacy meta/token/全部行，只为既有 conversation 物化 rev0、`entryRevision=0`、Managed origin 与
+nullable/BeforeFirst legacy cutoff，不重封旧 ciphertext、不重包 wrapped key。fresh conversation 与
+`conversation_state` 在同一事务写入；B2–B4 未落地的三类 sidecar writer 仍保持 fail-close。
 
 P3.6-C 已由 `694f2d9` 提交 transport-neutral StoreCommitHub、Catalog/conversation 共用的
 SubscriptionBarrier、连续 backfill/snapshot-required、authenticated snapshot、paced JSON
@@ -562,8 +572,9 @@ binary/root 注入，内部原子创建随机临时目录并 RAII 清理；它�
 `/bin/sh` 无副作用 helper，不替代真实 Codex/Claude Code 登录、真实 approval 或 P6 跨设备证据。
 P3.8-B production UDS/bootstrap 已由 `1e7f9ea` / `459f32a` 完成；P3.9-C0-A1 Runtime v2 Rust
 cutover 与旧签名材料拒绝门禁已完成，A2a/A2b Swift v2 strict mirror 也已由 `bea4c13` / `3e019ed` /
-`0dd58de` 收口，A2c outer + JSON/UDS/compact/current codec 已由 `c2d2c28` / `e419d84` 收口；但
-P3.9-C0-B/C、App/CLI 默认 UDS cutover、P3.10 LaunchAgent、
+`0dd58de` 收口，A2c outer + JSON/UDS/compact/current codec 已由 `c2d2c28` / `e419d84` 收口；
+C0-B1a/B1b schema freeze 与真实 migration 已由 `e48248a` / `3d0002d` 收口；但
+P3.9-C0-B2–B5/C、App/CLI 默认 UDS cutover、P3.10 LaunchAgent、
 P4 RemoteLink、P5/P6 客户端与实机证据仍未完成；
 P3.1 provisioned signed Keychain roundtrip 也仍是外部 BLOCKED gate。
 具体命令与资源矩阵见 [docs/QUALITY.md](docs/QUALITY.md)。

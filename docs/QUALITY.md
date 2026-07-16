@@ -1278,6 +1278,64 @@ A2-0 的仓库外样本在 Swift gate 前再次核对为 0600、128 bytes、SHA-
 Hello reply 的一次性 focused gate实际执行 1 test、0 skipped、0 failures，完成 version/message ID/Hello
 语义与 JSON 等价重编码；随后外部样本已删除并确认不存在，一次性测试方法也已退役，不进入长期测试集。
 
+## Relay Companion MVP P3.9-C0-B1b Runtime DB v5 migration 门禁
+
+**具体威胁场景：** 同 UID writer 在 migration 首轮 preflight 与 DDL 之间替换 legacy meta/token/行，或
+合成 fixture 漏掉真实 WAL、sealed row 与 wrapped key 的组合，可能让损坏输入被发布为 v5，或让迁移
+静默重封/重包旧数据。
+
+本门禁的信任根是仓库外、由提交 `28619a8` 的 production v4 writer 生成并在流程外锁定的 main DB、WAL
+和 StorageKEK 文件及其 SHA-256；测试只证明这些输入在当前 reader 下通过认证、迁移和 byte-exact
+readback，不证明样本生成过程可重放，也不检测内部自洽的整库历史回滚。后者仍依赖 P4 Keychain
+CounterGuard。
+
+```bash
+# schema / migration / store 边界
+cargo test -p agentdeckd --lib runtime::store::schema::tests::
+cargo test -p agentdeckd --lib runtime::store::sqlite::migration_tests:: -- --test-threads=1
+cargo test -p agentdeckd --test runtime_store
+cargo test -p agentdeckd --test runtime_store_boundaries
+cargo test -p agentdeckd --test runtime_store_cipher
+
+# 默认完整回归与静态边界
+cargo test -p agentdeckd
+cargo clippy -p agentdeckd --all-targets -- -D warnings
+cargo fmt --all -- --check
+bash scripts/check-daemon-no-net.sh
+swift run AgentDeck -- --selfcheck
+
+# 真实 v4 writer 样本；必须实际执行 1 test / 0 ignored
+AGENTDECK_B1B_V4_FIXTURE_DIR=/tmp/agentdeck-v4-migration.GQXkAh \
+cargo test -p agentdeckd --test runtime_v4_v5_real_migration \
+  real_v4_writer_sample_migrates_to_v5_with_byte_exact_immutable_rows \
+  -- --ignored --exact --nocapture --test-threads=1
+
+# 文档与补丁卫生
+scripts/verify-agent-docs.sh
+git diff --check
+```
+
+B1b scoped code commit 为 `3d0002d`，实际 `+1,399/-64`，低于 1,800 additions 预拆线。收口读回为
+migration 21/21、schema 12/12、`runtime_store` 29/29、`runtime_store_boundaries` 5/5、
+`runtime_store_cipher` 13/13；默认 `cargo test -p agentdeckd` 的 lib 为 659 passed / 1 ignored，后续
+integration/doc tests 也 exit 0。唯一既有 ignored 是 P3.1 provisioned signed Keychain 外部门禁；真实
+migration gate 另以显式 `--ignored` 实际执行 1/1。
+
+真实样本哈希固定为 main
+`5f3546ea210f042fb06d17cc42c01cf5d35c855b7b5cd97e79a51cb663f11776`、WAL
+`7c7c4255a3b4c98edacefcbc0e3d0706ae22d3a975ec9b2c0311308272559bb9`、KEK
+`fc8b64001c5fdd0f2f40fb67dae4a865a2c5bd17836676d6d5b58b7917e33717`。它覆盖 1 conversation、
+1 Started + 1 Accepted command，以及实际非空的 intent/event/catalog/snapshot；reader 验证对应 sealed
+columns、非 `runtime_meta` MAC/blind token 与 wrapped key 迁移前后逐字节一致。未填充的 fence、adapter
+state、approval、publication、terminal result 只沿用各自 authenticated regression，不冒充真实非空样本。
+最终 1/1 gate 与代码提交完成后，`/tmp/agentdeck-v4-migration.GQXkAh` 和
+`/tmp/agentdeck-v4-real.uNbBAf` 已按一次性产物约定删除并确认不存在；长期测试保留显式 ignored reader，
+没有真实 writer 样本时不会伪造通过。
+
+本门禁只收口 production schema v5、v1–v4 authenticated migration、fresh/migrated
+`conversation_state` 与六项 ledger totals。B2 Configure CAS/snapshot、B3 pin/admission/exact execution、
+B4 metadata writer、P4 E2EE/CounterGuard、App/CLI UDS cutover 和 Companion E2E 均不在本片完成范围。
+
 ## AppKit 重写后的验证清单
 
 前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。
@@ -1403,6 +1461,7 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P3.8-A local Runtime UDS primitives | 运行本页 framing/peer、local-control/cancellation、真实双连接 `local_uds`、完整 daemon、fmt/clippy/network-boundary/docs/diff；只证明 accepted stream actor，不冒充 P3.8-B secure bind/permit、P3.9 App/CLI cutover 或 remote E2E |
 | Relay Companion MVP P3.8-B production UDS/bootstrap | 运行本页 secure listener/permit/supervisor、config/stdio exhaustive allowlist、真实 binary lifecycle、Rust/Swift compatibility、完整 daemon、fmt/clippy/network-boundary/schema/docs/diff；只证明 production 本地入口，不冒充 P3.9 shared-daemon client、LaunchAgent 或 remote E2E |
 | Relay Companion MVP P3.9-C0-A2 Swift Runtime v2 mirror | 运行本页 A2a/A2b/A2c1/A2c2 focused、public API 与 frozen v1 gate、完整 `swift test`、iOS XcodeGen + Simulator、App selfcheck、docs/diff；A2 完成只证明 current codec、compact/98-fixture 与真实 UDS Swift readback，不得宣称 App/CLI 默认 UDS cutover |
+| Relay Companion MVP P3.9-C0-B1b Runtime DB v5 migration | 运行本页 schema/migration/store/boundary/cipher、默认完整 daemon、Clippy/fmt/no-net/selfcheck/docs/diff 与真实 v4 writer byte-exact gate；只证明 schema v5、authenticated migration/materialization，不冒充 B2–B4 writer、P4 CounterGuard 或 Companion E2E |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

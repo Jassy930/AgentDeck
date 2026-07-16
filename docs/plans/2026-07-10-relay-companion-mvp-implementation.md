@@ -1878,15 +1878,30 @@ P3.9 固定以下迁移边界：
     migration/authenticated materialization 与真实 v4 样本 byte-exact readback 均留 B1b。schema 12/12、
     SQLite focused 13/13、daemon lib 652 passed + 1 ignored、Clippy/fmt/App selfcheck/docs/diff 全绿；独立
     spec/security 终审 Approved。实际规模低于 1,800 行预拆线和 2,000 行硬停线。
-  - [ ] **B1b real migration：** 完成 v1/v2/v3/v4→v5 dispatch、容量预检、v4 完整认证、最多 1,024 条
-    `conversation_state` 插入、schema/token CAS、before/after-COMMIT fault 与 reopen convergence。当前 HEAD
-    `28619a8` 的真实 v4 writer 已生成 1 conversation、1 Started、1 Accepted、1 event/catalog/snapshot/intent
-    的仓库外 0700/0600 样本；reader 对该样本中实际非空的 descriptor/command/event/catalog/snapshot/intent
-    sealed columns、对应非 `runtime_meta` row MAC/blind token 与 wrapped key 做 byte-exact manifest。fence、
-    adapter state、approval、publication、terminal result 等未填充表只沿用各自 authenticated regression，
-    不冒充真实非空样本证据。读回后删除临时 DB/KEK；不能以手写 SQL fixture 替代。
-  - [ ] **B2 configuration CAS/snapshot：** owner-scoped CAS/replay/conflict、sealed full request、单一
-    ConfigurationChanged、cursor-consistent snapshot、DescribeAgents/default configuration 与零 catalog 漂移。
+  - [x] **B1b real migration（commit `3d0002d`，实际 +1,399/-64）：** production bump 到 v5/20 表，完成
+    v1/v2/v3/v4→v5 dispatch、容量预检、v4 完整认证、最多 1,024 条 `conversation_state` 插入、schema/token
+    CAS、before/after-COMMIT fault 与 reopen convergence。migration 在 `BEGIN IMMEDIATE` 后、任何 DDL 前
+    重新认证 exact legacy meta/token/全部行，关闭 preflight→DDL TOCTOU；fresh conversation 同事务物化
+    nullable/BeforeFirst state，B2/B3/B4 writer 落地前另外三表非空 fail-close。提交 `28619a8` 的真实 v4
+    writer 样本覆盖 1 conversation、1 Started、1 Accepted、1 event/catalog/snapshot/intent；main/WAL/KEK
+    SHA-256 分别为 `5f3546ea210f042fb06d17cc42c01cf5d35c855b7b5cd97e79a51cb663f11776`、
+    `7c7c4255a3b4c98edacefcbc0e3d0706ae22d3a975ec9b2c0311308272559bb9`、
+    `fc8b64001c5fdd0f2f40fb67dae4a865a2c5bd17836676d6d5b58b7917e33717`；显式 ignored reader 1/1 对实际
+    非空 descriptor/command/event/catalog/snapshot/intent sealed columns、对应非 `runtime_meta` row
+    MAC/blind token 与 wrapped key 做迁移前后 byte-exact manifest。fence、adapter state、approval、
+    publication、terminal result 等未填充表只沿用各自 authenticated regression，不冒充真实非空样本证据；
+    一次性 DB/WAL/KEK 在最终 gate 后删除，未以手写 SQL fixture 替代。migration 21/21、schema 12/12、
+    store 29/29、boundary 5/5、cipher 13/13、daemon lib 659 passed + 1 ignored、完整 package/Clippy/fmt/
+    no-net/App selfcheck 全绿；spec/security 终审 Approved，无残留 P0/P1/P2。
+  - [ ] **B2 configuration CAS/snapshot：** 只读重估会超过 1,800 additions，动代码前预拆为三片；三片
+    共同收口 owner-scoped CAS/replay/conflict、sealed full request、单一 ConfigurationChanged、
+    cursor-consistent snapshot、DescribeAgents/default configuration 与零 catalog 漂移：
+    - [ ] **B2a store CAS/integrity：** configuration writer、authenticated row/event/ledger integrity、
+      owner+key exact replay/conflict、COMMIT-unknown 与 restart；pin/metadata 表继续 zero fail-close。
+    - [ ] **B2b cursor snapshot：** 按 frozen base event cursor 选择配置，覆盖 BeforeFirst/rev0、两次 Configure
+      之间的普通 event、ready/build/legacy path 与 retained-memory estimator，禁止读取 current head。
+    - [ ] **B2c Core cutover/defaults：** DescribeAgents 稳定 defaults、RuntimeCore Configure production route、
+      receipt/subscriber/reconnect 一致；不夹带 B3 SendPrompt/pin 或 B4 metadata mutation。
   - [ ] **B3a admission pin：** SendPrompt expected revision、Accepted 同事务非零 pin、receipt/status/query
     原 revision、并发 Configure/Prompt 线性化；新 command 缺 pin fail-close。
   - [ ] **B3b exact execution：** queued/restart/recovery 按 pin load exact configuration；只有

@@ -510,12 +510,23 @@ conversation/key，不能伪造身份连续性。
   密文/元数据不一致都映射为 corrupt state；P4 仍须用 Keychain CounterGuard 绑定整库
   generation/HWM，才能检测回滚到更早但内部自洽的完整 DB/WAL 快照。
 - Runtime DB 的物理 schema 按 phase 单调迁移：P3.2 的 v1 七表、P3.3 的 v2 两张 adapter 私表、
-  P3.5 的 v3 `approval_ledger`，以及 P3.6 的 v4 六张 stream 表。v4 当前精确包含
-  `event_stream_index`、`event_retention`、`catalog_journal`、`snapshots`、
-  `publication_streams` 与 `publication_outbox`；`event_journal` 仍是 append-only authenticated
-  audit。`machine_enrollment_receipts` 继续只是 root-lost rescue 所需的非秘密 index；其余敏感
-  payload 使用 StorageKEK 包装的 DEK/BIK。后续 P4 只能用独立 migration 增表，不能预建
-  nullable 通用表，也不能把 logical retention 误写成物理 audit row 回收。
+  P3.5 的 v3 `approval_ledger`、P3.6 的 v4 六张 stream 表，以及 P3.9-C0-B1b 的 v5 四张
+  authenticated sidecar。v5 当前精确为 20 表；在 v4 的 `event_stream_index`、`event_retention`、
+  `catalog_journal`、`snapshots`、`publication_streams`、`publication_outbox` 上增加
+  `conversation_state`、`configuration_journal`、`command_configuration_pins` 与
+  `metadata_mutation_ledger`，并给 authenticated Runtime ledger 增加 configuration/pin/metadata 六项
+  totals。物理 schema 升级不旋转 `RUNTIME_CRYPTO_CONTEXT_VERSION=1`；旧 ciphertext、row token 与
+  wrapped key 不重写。`event_journal` 仍是 append-only authenticated audit；
+  `machine_enrollment_receipts` 继续只是 root-lost rescue 所需的非秘密 index，其余敏感 payload 使用
+  StorageKEK 包装的 DEK/BIK。后续 phase 仍须用独立 migration 增表，不能预建 nullable 通用表，也不能
+  把 logical retention 误写成物理 audit row 回收。
+- v1/v2/v3/v4→v5 migration 先以只读连接认证 exact legacy meta/signature/token/全部行并做容量预检，
+  再取得 `BEGIN IMMEDIATE`，在任何 DDL 前对同一输入重新做全量认证；只有第二次认证通过才创建 sidecar、
+  物化每个既有 conversation 的 rev0/unconfigured、`entryRevision=0`、Managed origin 与 legacy cutoff，
+  最后同事务切换 schema/signature/ledger token。cutoff 逐字复制已认证 command HWM：NULL 保持
+  BeforeFirst，真实 seq0 不得折叠成 NULL。fresh v5 conversation 则在 create transaction 内同时写入
+  `conversation_state`。B2/B3/B4 writer 落地前 configuration/pin/metadata 表非空一律 fail-close；这只证明
+  migration/materialization，不证明 Configure CAS、command pin、metadata mutation 或整库历史回滚检测。
 - 普通副作用准入同时检查 main/WAL/SHM、projected growth、文件系统
   `max(512 MiB, 5%)` reserve、`page_count/max_page_count`，并在每次 COMMIT 后重新观测。
   Accepted/Started 在普通准入时分别预留 expiry 与 fence/release/最大 terminal safety tail；
@@ -700,7 +711,8 @@ conversation/key，不能伪造身份连续性。
   `PayloadTooLarge`，不截断或改写旧 ciphertext。
 - P3.6-C transport-neutral stream/barrier/snapshot/transfer/publication 组件已由 `694f2d9`
   收口；本节描述的是该组件 contract，不表示 P3/P4 或远程 Companion 已完成。
-- schema v4 与 read-only WAL pool 已由 `02cc640` 落地。logical event suffix 每 conversation
+- schema v4 与 read-only WAL pool 当时由 `02cc640` 落地；当前 physical schema 已由 `3d0002d` 推进 v5，
+  但以下 stream/read-pool 不变量不变。logical event suffix 每 conversation
   10,000 events/64 MiB、全局 131,072/512 MiB；snapshot 单份 10,000 items/64 MiB、每
   conversation 一个 ready、全局 512 MiB；publication outbox 每 stream 2,000 rows/64 MiB、
   全局 10,000 rows/512 MiB，未 ACK row 不驱逐。ReadPool 固定 8 个只读连接、128 MiB retained
