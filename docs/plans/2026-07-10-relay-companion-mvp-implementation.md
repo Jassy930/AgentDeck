@@ -1658,7 +1658,7 @@ P3.9 固定以下迁移边界：
   只消除文件名误导，不宣称 Runtime v2。commit `d4057f1`；Swift compatibility 26/26、完整
   256 XCTest + 35 Swift Testing 全绿。独立 review 唯一 P2 是旧 filter 会 0-test 假绿，已同步修正
   AGENTS/QUALITY 三个可执行入口后关闭；最终无 P0/P1/P2。
-- [ ] **P3.9-C0-A1 Runtime v2 Rust contract：** 先读回真实 Swift `SessionStart` 样本；冻结
+- [x] **P3.9-C0-A1 Runtime v2 Rust contract：** 先读回真实 Swift `SessionStart` 样本；冻结
   `DescribeAgents`、`ConfigureConversation`、`UpdateConversationMetadata`、dormant local-only
   `StageUpgrade`、configuration/metadata/upgrade receipts、
   `SendPrompt.expectedConfigurationRevision`、receipt/snapshot/event revision。把 Runtime version 升到 2，
@@ -1694,10 +1694,17 @@ P3.9 固定以下迁移边界：
     plaintext 已恰好占满 64 MiB，新增必填字段后向 subscription client 返回 typed
     `daemon.payload.item_too_large`，不截断、rebuild 或改写旧 ciphertext。独立 spec/security/quality
     终审发现的 1 个 P1 与 4 个 P2 均已修复并复核，无残留 P0/P1/P2。A1a1+A1a2 已完成，故 A1a
-    complete；A1 仍等待下面的 A1b，不能提前勾选。
-  - [ ] **A1b signed-material hard-cutover gate：** 单独补 Runtime v1 TBS 签发的 cert/grant/revocation/
-    retirement 在 v2 verifier 下拒绝且 Store 零提交的 Relay E2E，并记录 P4 投产前开发凭据必须
-    reset/re-enroll/re-pair；独立 review/提交。只有 A1a/A1b 都完成才勾选 A1。
+    complete；总 A1 由下面 A1b 一并收口。
+  - [x] **A1b signed-material hard-cutover gate：** commit `ef830cd`；以真实 Ed25519 key 从 current TBS
+    只改 `runtime_protocol_version=1`，证明旧签名对 v1 TBS 有效、对 current v2 TBS 无效。升级前已按
+    exact canonical hash 持久化的 cert/grant 在 Store reopen 后经 current challenge possession proof
+    仍统一拒绝；current MachineAccess 提交旧 grant/revocation/retirement 也全部返回
+    `relay.auth.invalid_grant`。同一 SQLite observer 的 `data_version`/授权语义快照与五个
+    pre-COMMIT/confirm tripwire 共同证明 Store 零提交且 transition 完整回滚。独立 Direct TLS enrollment
+    E2E 又分别证明旧 Link/Data cert 返回通用 403，且同一未消费 code 的原 v2 request 随后成功。
+    终审发现的 2 个 P1 与 2 个 P2 均已 red→green，最终 spec/security/quality 三路 Approved；代码与
+    测试新增 730 行，低于 2,000 行刹车线。P4 投产前的开发凭据必须执行受控
+    reset/re-enroll/re-pair；当前不新增 production 双栈或 legacy verifier。A1a/A1b 均完成，故 A1 complete。
 - [ ] **P3.9-C0-A2 Swift v2 mirror：** 在新 `RuntimeV2Types.swift` 只实现 v2 outer/changed DTO，复用 wire
   未变的既有 leaf types，禁止一次性全文件符号替换；新增 v2 tests 并把 production client gate 切到 v2，
   Rust fixture→Swift decode/encode 语义一致，完整 Swift tests 全绿后独立 review/提交。若任一切片新增/修改

@@ -57,7 +57,7 @@ agentdeckd
 - `agentdeck-protocol/`：IPC 协议事实源 crate。分 trunk / capabilities / vendor / transport 四个模块，`PROTOCOL_VERSION` = 2，`protocol_schema()` 聚合所有 v2 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
 - `agentdeckd/src/local/`：当前为本地 Runtime v2 framing；A1a main cutover / real-data reader 分别由
-  `c28a968` / `c36a4f9` 收口。
+  `c28a968` / `c36a4f9` 收口，A1b signed-material hard cutover 由 `ef830cd` 收口。
   same-EUID peer gate、每连接 Unix actor、retained-dirfd
   secure listener 与显式 stdio compatibility wrapper。listener 在 bind 时持有完成 recovery 的 Core，
   supervisor 停止 accept 后 graceful cancel/join 全部连接。
@@ -540,7 +540,9 @@ conversation/key，不能伪造身份连续性。
   route/root fingerprint；不得仅凭该表执行远端删除。
 - P3.2/P3.3 只建立并验证 store + adapter private boundary；P3.4 当时由 RuntimeCore actor 把
   Runtime v1 的 Start/SendPrompt/cancel/query 接入；P3.9-C0-A1a1 已提交 additive DTO，A1a2 又由
-  `c28a968` / `c36a4f9` 完成 public Runtime v2 wire、真实 v1/schema v4 样本读回与独立终审；
+  `c28a968` / `c36a4f9` 完成 public Runtime v2 wire、真实 v1/schema v4 样本读回与独立终审；`ef830cd`
+  又固定旧 Runtime v1 root-signed cert/grant/revocation/retirement/enrollment 在 current verifier 下通用拒绝、
+  Store 零提交且不保留 production 双栈；
   P3.8 已完成 accepted-stream actor 与 recovery 后
   production secure bind/bootstrap；App/CLI 默认连接仍待 P3.9，因此本节仍不是 shared local client
   或远程端到端可用声明。

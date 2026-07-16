@@ -116,6 +116,26 @@ actor 与连接/PairRoute 操作线性化：COMMIT 后目标 machine、device �
 fail-closed，绝不恢复旧 generation。只有再次执行带相同 fingerprint 的 readback 并确认上述
 计数后，daemon 才能删除旧本地 trust state，再重新 enroll 和重新配对。
 
+## Runtime v2 hard-cutover 开发凭据
+
+Runtime version 已绑定 MachineRoot TBS。Runtime v1 签发的 cert、RelayGrant、revocation 与 retirement
+不会跨版本复用：current verifier 只返回通用 `relay.auth.invalid_grant`，旧 Link/Data cert 的 enrollment
+只返回通用 `relay.enrollment.rejected`。这是预期 hard cutover，不是可自动迁移的数据。
+
+P4 production pairing 投产前，任何曾生成 Runtime v1 签名材料的开发 trust realm 都必须按以下顺序处理：
+
+1. 先用可信 Relay admin inventory 查询旧 route/root fingerprint。
+2. realm 存在时执行 admin purge，并用同一 fingerprint readback，确认 active、grant、revocation、stream、
+   frame、subscription 全为 0 且只剩 retired tombstone。若 inventory 可信确认 absent（例如从未 enrollment
+   或开发 Store 已受控重建），记录 absent 结果；不得为了满足流程伪造 tombstone。
+3. 只有完成 present realm 的 purge/readback，或得到可信 absent 结果后，才删除对应本地开发 trust state。
+4. 生成新的 route/key，使用 current Runtime v2 重新 enroll，再让每台设备重新 pair；禁止恢复旧
+   cert/grant 或自动降级 verifier。
+
+`scripts/reset-relay-v1-dev-state.sh` 只处理早期 Relay v1 DB/bearer credential，不处理 Relay v2 Store 中的
+Runtime v1 TBS 开发凭据。P4 本地 trust-reset 命令尚未实现时，应保持 remote blocked；不得手改 SQLite、
+Keychain 或签名版本来伪造完成。
+
 ## 常见 failure code
 
 | code | 含义 | 处理 |

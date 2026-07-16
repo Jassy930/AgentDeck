@@ -1122,7 +1122,7 @@ exact socket 消失。`AGENTDECK_DAEMON_SOCKET` 不得改变 endpoint，`--socke
 
 A1a2 因新增行口径达到 2,143 行，拆成 1,748 行 main cutover `c28a968` 与 395 行真实 reader
 `c36a4f9`；两者均低于 2,000 行刹车线。独立 spec/security/quality review 的 1 个 P1 与 4 个 P2
-均已修复并复核，无残留 P0/P1/P2。A1a complete，A1 仍等待 A1b。
+均已修复并复核，无残留 P0/P1/P2。A1a complete；总 A1 已由下节 A1b 一并收口。
 
 标准回归至少运行：
 
@@ -1180,6 +1180,42 @@ v2_snapshot_wire_sha256=d5607fa2d85ea9ee97f0359761c7bd442d15456b40419ce47ff4b678
 logical_manifest_before=488193ed84b3c777fb0cf394845e5068ff0f6b21f8d782a13bf2ebffa7ad779a
 logical_manifest_after=488193ed84b3c777fb0cf394845e5068ff0f6b21f8d782a13bf2ebffa7ad779a
 ```
+
+## Relay Companion MVP P3.9-C0-A1b signed-material hard-cutover 门禁
+
+本门禁防御的具体场景是：开发环境遗留的 Runtime v1 根签 cert/grant/revocation/retirement 若在
+Runtime v2 cutover 后仍被接受，会绕过强制 reset/re-enroll/re-pair，并把旧信任材料提交到当前
+Relay Store。测试必须使用真实 Ed25519 旧 TBS 签名；翻转签名 bit、零签名或 dummy fixture 不算证据。
+
+标准回归至少运行：
+
+```bash
+# persisted cert/grant 重连、current MachineAccess control material、五个 Store tripwire
+cargo test -p agentdeck-relay --features server \
+  --test relay_v2_auth_e2e runtime_v1 -- --test-threads=1
+
+# 独立 TLS enrollment verifier：旧 Link/Data cert 403，原 code 的 v2 request 随后成功
+cargo test -p agentdeck-relay --features server,tls \
+  --test relay_v2_admin_e2e \
+  runtime_v1_signed_enrollment_certificates_are_rejected_without_consuming_code \
+  -- --exact --test-threads=1
+
+# 相关授权/撤销回归与 Runtime-bound contract
+cargo test -p agentdeck-relay --features server,tls \
+  --test relay_v2_admin_e2e --test relay_v2_auth_e2e --test relay_v2_revocation_e2e \
+  -- --test-threads=1
+cargo test -p agentdeck-protocol -- --test-threads=1
+cargo test -p agentdeck-crypto -- --test-threads=1
+swift test --filter RelayCryptoVectorTests
+```
+
+`ef830cd` 新增 730 行 integration tests，低于单 task 2,000 行刹车线。零提交证据必须同时包含：
+同一只读 SQLite connection 的 `PRAGMA data_version`、八表计数与授权语义行全等；
+`MachineLinkAuthBeforeCommit`、`DeviceAuthBeforeConfirm`、`InstallGrantBeforeCommit`、
+`RevokeBeforeCommit`、`PurgeBeforeCommit` 五个 tripwire 不增加；current machine/device access 保持且
+无 lifecycle invalidation。Link/Data enrollment 各自使用 fresh code，legacy 403 后同一 code 的 untouched
+v2 request 必须 200 并完成 typed server/route readback。最终 spec/security/quality 三路 Approved，无
+P0/P1/P2；A1 complete。真实 P4 凭据仍必须在投产前按 runbook 受控 reset/re-enroll/re-pair。
 
 ## AppKit 重写后的验证清单
 

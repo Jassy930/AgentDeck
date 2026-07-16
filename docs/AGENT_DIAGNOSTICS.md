@@ -166,6 +166,13 @@ binary 当前默认使用这条路径。
 oracle。诊断日志同样只能记录 failure code、脱敏 route 短标识和阶段，不得格式化完整
 `Authenticate`、credential、challenge 或 access context。
 
+Runtime v2 hard cutover 后，Runtime v1 TBS 签发的 persisted cert/grant、control
+grant/revocation/retirement 都统一表现为 `relay.auth.invalid_grant`；旧 Link/Data cert 经公网
+enrollment 统一表现为 `relay.enrollment.rejected`。不要根据通用 code 猜具体失败字段，也不要自动降级。
+开发环境发现这类旧凭据时，P4 投产前先用可信 Relay admin inventory 定位 realm：存在时执行
+purge/readback，不存在时记录可信 absent 结果；随后才做本地 trust reset、重新 enroll 与重新配对。
+当前尚未实现的 P4 本地 trust-reset 入口不能用手改 SQLite/Keychain 代替。
+
 | v2 auth/route code | 含义 | 下一步 |
 | --- | --- | --- |
 | `relay.auth.invalid_grant` | cert/grant、root/trust、route、generation/serial、hash 或任一签名不满足同一 trust domain | 停止自动重试；核对本地持久 grant/cert。状态不一致或 key 丢失时按机器重新配对 |

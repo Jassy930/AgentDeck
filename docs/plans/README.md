@@ -48,9 +48,9 @@ failure 分类、fresh 完整门禁和独立终审已经完成，并由 `5568e93
 leader 退出窗口门禁。P3.8-A 已由 `eb97f7f` 完成 accepted-stream UDS 原语；P3.8-B1 已由
 `1e7f9ea` 完成 recovery 后 secure listener/permit/supervisor，并从 clean detached HEAD 独立复验；
 P3.8-B2 production config/main、stdio exhaustive allowlist、真实 binary lifecycle 和 Rust/Swift
-compatibility 参数已由 `459f32a` 完成。P3.9-C0-A0/A1a1/A1a2a/A1a2b 已由
-`d4057f1` / `3b83391` / `c28a968` / `c36a4f9` 完成，Runtime v2 Rust cutover 的 A1a complete；
-A1b、Swift A2 与 shared-daemon client cutover 尚未完成。
+compatibility 参数已由 `459f32a` 完成。P3.9-C0-A0/A1 已由
+`d4057f1` / `3b83391` / `c28a968` / `c36a4f9` / `ef830cd` 完成，Runtime v2 Rust contract 与
+signed-material hard cutover 的 A1 complete；Swift A2 与 shared-daemon client cutover 尚未完成。
 P3.1 的 provisioned signed Keychain 外部门禁仍有 1 项 ignored/BLOCKED，P3.9/P3.10、P4 E2EE/Relay Publish
 和 P5 真实 Companion 均未完成；transfer/publication 也尚无 production remote owner。不能因 fake
 publication、store tests 或 Simulator fixture 改写状态。
