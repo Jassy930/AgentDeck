@@ -5,10 +5,8 @@ use std::sync::OnceLock;
 use sha2::{Digest, Sha256};
 
 pub const RUNTIME_SCHEMA_FAMILY: &str = "agentdeck-runtime";
-pub const RUNTIME_SCHEMA_VERSION: u32 = 4;
-/// B1a 只冻结下一版物理形状；production version 在 B1b 真实 migration 闭环后切换。
-#[cfg_attr(not(test), allow(dead_code))]
 pub const RUNTIME_SCHEMA_VERSION_V5: u32 = 5;
+pub const RUNTIME_SCHEMA_VERSION: u32 = RUNTIME_SCHEMA_VERSION_V5;
 /// 行密文与 wrapped key bundle 的 AAD context 版本。
 ///
 /// physical schema migration 只增表/增认证计数，不得让既有行重新加密或重新包装。
@@ -92,9 +90,6 @@ pub const EXPECTED_TABLES_V4: [&str; 16] = [
     "runtime_meta",
     "snapshots",
 ];
-/// B1a 期间 current runtime 仍严格验证 v4 manifest。
-pub const EXPECTED_TABLES: [&str; 16] = EXPECTED_TABLES_V4;
-#[cfg_attr(not(test), allow(dead_code))]
 pub const EXPECTED_TABLES_V5: [&str; 20] = [
     "approval_ledger",
     "catalog_journal",
@@ -117,12 +112,12 @@ pub const EXPECTED_TABLES_V5: [&str; 20] = [
     "runtime_meta",
     "snapshots",
 ];
+pub const EXPECTED_TABLES: [&str; 20] = EXPECTED_TABLES_V5;
 
 pub fn schema_signature() -> [u8; 32] {
-    schema_signature_v4()
+    schema_signature_v5()
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn schema_signature_v5() -> [u8; 32] {
     static SIGNATURE: OnceLock<[u8; 32]> = OnceLock::new();
     *SIGNATURE.get_or_init(|| {
@@ -1283,7 +1278,7 @@ mod tests {
 
     #[test]
     fn stream_schema_advances_to_v4_with_six_bounded_store_tables() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, 4);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V5);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         for table in [
             "event_stream_index",
@@ -1293,13 +1288,13 @@ mod tests {
             "publication_streams",
             "publication_outbox",
         ] {
-            assert!(EXPECTED_TABLES.contains(&table), "missing {table}");
+            assert!(EXPECTED_TABLES_V4.contains(&table), "missing {table}");
         }
     }
 
     #[test]
     fn approval_physical_schema_remains_v3_compatible_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, 4);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V5);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V3.len(), 10);
         assert!(EXPECTED_TABLES_V3.contains(&"approval_ledger"));
@@ -1336,12 +1331,14 @@ mod tests {
     }
 
     #[test]
-    fn v5_sidecar_freeze_preserves_the_current_v4_schema_surface() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, 4);
+    fn v5_sidecar_freeze_becomes_current_without_changing_the_v4_surface() {
+        assert_eq!(RUNTIME_SCHEMA_VERSION, 5);
         assert_eq!(RUNTIME_SCHEMA_VERSION_V5, 5);
-        assert_eq!(EXPECTED_TABLES.len(), 16);
+        assert_eq!(EXPECTED_TABLES_V4.len(), 16);
+        assert_eq!(EXPECTED_TABLES.len(), 20);
         assert_eq!(EXPECTED_TABLES_V5.len(), 20);
-        assert_eq!(schema_signature(), schema_signature_v4());
+        assert_eq!(EXPECTED_TABLES, EXPECTED_TABLES_V5);
+        assert_eq!(schema_signature(), schema_signature_v5());
         assert_eq!(schema_signature_v4(), V4_SCHEMA_SIGNATURE_GOLDEN);
         let mut expected_v5 = Sha256::new();
         for migration in [
@@ -2291,7 +2288,7 @@ mod tests {
             .expect("query v4 tables")
             .collect::<Result<Vec<_>, _>>()
             .expect("collect v4 tables");
-        assert_eq!(tables, EXPECTED_TABLES);
+        assert_eq!(tables, EXPECTED_TABLES_V4);
 
         let event_indexes = connection
             .prepare("SELECT name FROM pragma_index_list('event_journal') ORDER BY name")

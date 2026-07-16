@@ -607,6 +607,11 @@ pub(crate) fn create_conversation(
             sealed_descriptor,
         ],
     )?;
+    super::configuration::insert_fresh_managed_state(
+        &transaction,
+        key_bundle,
+        input.conversation_id.as_bytes(),
+    )?;
     let mut next_ledger = ledger.clone();
     next_ledger.catalog_high_water = Some(revision.encoded.clone());
     next_ledger.conversation_count = next_ledger
@@ -5892,6 +5897,7 @@ fn validate_store_integrity_against_ledger(
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
     super::stream::validate_v4_integrity(connection, key_bundle, database_id, ledger)?;
+    super::configuration::validate_v5_integrity(connection, key_bundle, ledger)?;
     Ok(())
 }
 

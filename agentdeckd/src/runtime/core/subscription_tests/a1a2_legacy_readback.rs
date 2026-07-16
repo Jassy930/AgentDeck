@@ -41,6 +41,22 @@ impl CipherManifest {
         }
         hash.finalize().into()
     }
+
+    fn immutable_sha256(&self) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        for value in [
+            self.wrapped_key_bundle_sha256,
+            self.catalog_delta_ciphertext_sha256,
+            self.catalog_delta_manifest_sha256,
+            self.catalog_snapshot_ciphertext_sha256,
+            self.catalog_snapshot_manifest_sha256,
+            self.conversation_snapshot_ciphertext_sha256,
+            self.conversation_snapshot_manifest_sha256,
+        ] {
+            hash.update(value);
+        }
+        hash.finalize().into()
+    }
 }
 
 fn update_field(hash: &mut Sha256, value: &[u8]) {
@@ -84,7 +100,7 @@ fn snapshot_manifest(connection: &Connection, scope: &str) -> ([u8; 32], [u8; 32
     (ciphertext.finalize().into(), manifest.finalize().into())
 }
 
-fn cipher_manifest(database: &Path) -> CipherManifest {
+fn cipher_manifest(database: &Path, expected_schema_version: u32) -> CipherManifest {
     let connection = Connection::open_with_flags(
         database,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -98,7 +114,7 @@ fn cipher_manifest(database: &Path) -> CipherManifest {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("read runtime_meta secrets-as-ciphertext");
-    assert_eq!(schema_version, RUNTIME_SCHEMA_VERSION);
+    assert_eq!(schema_version, expected_schema_version);
     let mut runtime_meta = Sha256::new();
     update_field(&mut runtime_meta, &wrapped);
     update_field(&mut runtime_meta, &runtime_token);
@@ -171,7 +187,7 @@ async fn reads_runtime_v1_v4_sample_as_v2_without_rewrite() {
     // 威胁场景：只用合成 JSON 证明 dual-decode 会漏掉真实 v4 AEAD/AAD/token、
     // read-pool lease 与 paced transfer handoff 的组合错误，甚至在 open 时静默 reseal。
     assert_eq!(RUNTIME_PROTOCOL_VERSION, 2);
-    assert_eq!(RUNTIME_SCHEMA_VERSION, 4);
+    assert_eq!(RUNTIME_SCHEMA_VERSION, 5);
     assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
     let artifact = PathBuf::from(
         std::env::var_os("AGENTDECK_A1A2_FIXTURE_DIR")
@@ -189,7 +205,7 @@ async fn reads_runtime_v1_v4_sample_as_v2_without_rewrite() {
     let conversation_id =
         RuntimeId::parse_canonical(RuntimeIdKind::Conversation, conversation_text.trim())
             .expect("parse legacy conversation id");
-    let before = cipher_manifest(&database);
+    let before = cipher_manifest(&database, 4);
 
     let keys = MemoryKeyStore::new();
     keys.store(STORAGE_KEK_ACCOUNT, &SecretBytes::new(kek))
@@ -362,10 +378,11 @@ async fn reads_runtime_v1_v4_sample_as_v2_without_rewrite() {
     drop(core);
     drop(store);
 
-    let after = cipher_manifest(&database);
+    let after = cipher_manifest(&database, RUNTIME_SCHEMA_VERSION);
     assert_eq!(
-        after, before,
-        "current readback must not normalize or reseal v4 rows"
+        after.immutable_sha256(),
+        before.immutable_sha256(),
+        "v4→v5 migration/readback must not normalize or reseal immutable rows"
     );
     println!(
         "wrapped_key_bundle_sha256={}",

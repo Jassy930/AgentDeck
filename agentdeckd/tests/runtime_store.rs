@@ -287,7 +287,10 @@ async fn fresh_store_is_ready_only_after_exact_schema_and_pragmas_read_back() {
             "catalog_journal",
             "claude_code_adapter_state",
             "codex_adapter_state",
+            "command_configuration_pins",
             "commands",
+            "configuration_journal",
+            "conversation_state",
             "conversations",
             "event_journal",
             "event_retention",
@@ -295,6 +298,7 @@ async fn fresh_store_is_ready_only_after_exact_schema_and_pragmas_read_back() {
             "execution_fences",
             "execution_intents",
             "machine_enrollment_receipts",
+            "metadata_mutation_ledger",
             "publication_outbox",
             "publication_streams",
             "runtime_meta",
@@ -306,7 +310,7 @@ async fn fresh_store_is_ready_only_after_exact_schema_and_pragmas_read_back() {
 }
 
 #[tokio::test]
-async fn schema_v4_preserves_the_durable_idempotency_and_execution_linkage_contract() {
+async fn schema_v5_preserves_the_v4_idempotency_and_execution_linkage_contract() {
     let root = TestRoot::new("journal-schema-contract");
     let keys = MemoryKeyStore::new();
     let database = root.database();

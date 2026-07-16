@@ -257,6 +257,12 @@ type RawRuntimeLedger = (
     i64,
     i64,
     i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
 );
 
 type RawCommandMetadata = (
@@ -372,6 +378,12 @@ fn runtime_ledger_token(
         started_without_fence_count,
         started_without_release_count,
         started_released_count,
+        configuration_count,
+        configuration_sealed_bytes,
+        command_configuration_pin_count,
+        metadata_mutation_count,
+        active_metadata_mutation_count,
+        metadata_mutation_charged_bytes,
     ): RawRuntimeLedger = connection
         .query_row(
             "SELECT catalog_high_water, conversation_count, command_count, event_count,
@@ -383,7 +395,10 @@ fn runtime_ledger_token(
                     publication_outbox_count, publication_outbox_bytes,
                     accepted_count, accepted_payload_bytes,
                     started_without_fence_count, started_without_release_count,
-                    started_released_count
+                    started_released_count, configuration_count,
+                    configuration_sealed_bytes, command_configuration_pin_count,
+                    metadata_mutation_count, active_metadata_mutation_count,
+                    metadata_mutation_charged_bytes
              FROM runtime_meta WHERE singleton = 1",
             [],
             |row| {
@@ -414,6 +429,12 @@ fn runtime_ledger_token(
                     row.get(23)?,
                     row.get(24)?,
                     row.get(25)?,
+                    row.get(26)?,
+                    row.get(27)?,
+                    row.get(28)?,
+                    row.get(29)?,
+                    row.get(30)?,
+                    row.get(31)?,
                 ))
             },
         )
@@ -474,8 +495,22 @@ fn runtime_ledger_token(
                 .to_be_bytes(),
         );
     }
+    for value in [
+        configuration_count,
+        configuration_sealed_bytes,
+        command_configuration_pin_count,
+        metadata_mutation_count,
+        active_metadata_mutation_count,
+        metadata_mutation_charged_bytes,
+    ] {
+        message.extend_from_slice(
+            &u64::try_from(value)
+                .expect("fixture v5 ledger counter is non-negative")
+                .to_be_bytes(),
+        );
+    }
     *key_bundle
-        .blind_index(b"runtime.meta.ledger.v4", &message)
+        .blind_index(b"runtime.meta.ledger.v5", &message)
         .expect("authenticate Runtime boundary ledger")
         .as_bytes()
 }
@@ -850,7 +885,7 @@ async fn catalog_hwm_u64_max_returns_typed_exhaustion_and_inserts_no_additional_
         assert_eq!(
             runtime_ledger_token(&transaction, &key_bundle, database_id).as_slice(),
             stored_token,
-            "fixture v4 ledger encoder must match the store"
+            "fixture v5 ledger encoder must match the store"
         );
         assert_eq!(
             transaction

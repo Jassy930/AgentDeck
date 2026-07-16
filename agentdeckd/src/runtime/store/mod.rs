@@ -5,6 +5,7 @@ mod approval;
 mod catalog;
 pub mod cipher;
 mod command_event;
+mod configuration;
 mod execution_event;
 pub mod identity;
 mod journal;
