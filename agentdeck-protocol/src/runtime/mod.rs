@@ -14,14 +14,17 @@
 
 pub mod catalog;
 pub mod command;
+pub mod configuration;
 pub mod envelope;
 pub mod event;
 pub mod failure;
 pub mod identity;
+pub mod metadata;
 pub mod receipt;
 pub mod schema;
 pub mod sync;
 pub mod transfer;
+pub mod upgrade;
 
 /// Runtime 契约产物版本；独立于 local IPC `PROTOCOL_VERSION` 与 Relay
 /// `RELAY_PROTOCOL_VERSION`。改动 Runtime wire 形态时手动 +1 并重生成快照。
@@ -32,6 +35,12 @@ pub use command::{
     ConversationStart, LocalOnlyAdministration, MAX_PROMPT_BYTES, PromptError, PromptPayload,
     QueryReceiptSelector, RuntimeRequest, SendPromptRequest,
 };
+pub use configuration::{
+    AgentDescription, AgentDescriptions, ClaudeCodeConversationConfiguration,
+    CodexConversationConfiguration, ConfigurationError, ConfigurationReceipt,
+    ConfigureConversationRequest, ConversationConfiguration, ConversationConfigurationState,
+    VendorConfigurationSnapshot,
+};
 pub use envelope::{
     MAX_RUNTIME_JSON_FRAME_BYTES, MAX_RUNTIME_REQUEST_BYTES, PairInvite, PendingPairing,
     RuntimeEnvelope, RuntimeMessage, RuntimeReply, RuntimeSizeError, RuntimeStreamItem,
@@ -39,6 +48,11 @@ pub use envelope::{
 };
 pub use event::{RuntimeEvent, RuntimeEventBody, RuntimeEventError};
 pub use failure::RuntimeFailure;
+pub use identity::{ConversationId, IdempotencyKey};
+pub use metadata::{
+    ConversationMetadataMutation, ConversationMetadataMutationRequest, ConversationMetadataReceipt,
+    MetadataError,
+};
 pub use receipt::{
     ApprovalDeliveryState, ApprovalReceipt, CancellationReceipt, CommandReceipt, CommandStatus,
     CommandStatusReceipt, ConversationStartReceipt, RevocationReceipt,
@@ -55,3 +69,4 @@ pub use transfer::{
     RuntimeTransferCarrierError, RuntimeTransferCarrierV1, RuntimeTransferChannel, TRANSFER_TTL_MS,
     TransferEnvelope, TransferError, TransferProgress, TransferReassembler,
 };
+pub use upgrade::{ArtifactSha256, StageUpgradeReceipt, StageUpgradeRequest, UpgradeContractError};
