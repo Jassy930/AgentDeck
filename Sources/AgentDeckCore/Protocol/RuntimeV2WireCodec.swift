@@ -7,11 +7,14 @@ public enum RuntimeV2WireError: Error, Equatable, Sendable {
     case invalidIdentity
     case invalidTransferBounds
     case invalidTransferCarrier
+    case unsupportedVersion
     case frameTooLarge
     case transferTooLarge
 }
 
-private let runtimeV2OuterVersion: UInt16 = 2
+public let runtimeProtocolVersionV2: UInt16 = 2
+public let runtimeProtocolVersionCurrent: UInt16 = runtimeProtocolVersionV2
+public typealias RuntimeWireCodec = RuntimeV2WireCodec
 
 private func runtimeV2ValidateIdentity(_ value: String) throws {
     guard !value.isEmpty, value.utf8.count <= 1024 else {
@@ -230,6 +233,70 @@ public struct TransferEnvelopeV2: Codable, Sendable {
         else {
             throw RuntimeV2WireError.invalidTransferBounds
         }
+    }
+}
+
+// MARK: - Compact transfer carrier
+
+public enum RuntimeTransferChannelV2: UInt8, Sendable {
+    case reply = 0
+    case stream = 1
+}
+
+public struct RuntimeTransferCarrierV2: Sendable {
+    public static let maxBytes = 4 * 1024 * 1024
+
+    public let runtimeVersion: UInt16
+    public let messageID: RuntimeMessageID
+    public let channel: RuntimeTransferChannelV2
+    public let transfer: TransferEnvelopeV2
+
+    public init(
+        messageID: RuntimeMessageID,
+        channel: RuntimeTransferChannelV2,
+        transfer: TransferEnvelopeV2
+    ) {
+        runtimeVersion = runtimeProtocolVersionV2
+        self.messageID = messageID
+        self.channel = channel
+        self.transfer = transfer
+    }
+
+    public init(
+        messageID: RuntimeMessageID,
+        channel: RuntimeTransferChannelV2,
+        transferID: RuntimeTransferID,
+        partIndex: UInt32,
+        partCount: UInt32,
+        totalSHA256: Data,
+        totalBytes: UInt64,
+        part: Data
+    ) throws {
+        try runtimeV2ValidateIdentity(messageID.rawValue)
+        runtimeVersion = runtimeProtocolVersionV2
+        self.messageID = messageID
+        self.channel = channel
+        transfer = try TransferEnvelopeV2(
+            transferID: transferID,
+            partIndex: partIndex,
+            partCount: partCount,
+            totalSHA256: totalSHA256,
+            totalBytes: totalBytes,
+            part: part,
+            profile: .compact
+        )
+    }
+
+    init(
+        runtimeVersion: UInt16,
+        messageID: RuntimeMessageID,
+        channel: RuntimeTransferChannelV2,
+        transfer: TransferEnvelopeV2
+    ) {
+        self.runtimeVersion = runtimeVersion
+        self.messageID = messageID
+        self.channel = channel
+        self.transfer = transfer
     }
 }
 
@@ -980,7 +1047,7 @@ public struct RuntimeEnvelopeV2: Codable, Sendable {
         )
         let container = try decoder.container(keyedBy: CodingKeys.self)
         version = try container.decode(UInt16.self, forKey: .version)
-        guard version == runtimeV2OuterVersion else {
+        guard version == runtimeProtocolVersionV2 else {
             throw DecodingError.dataCorruptedError(
                 forKey: .version,
                 in: container,
@@ -1002,7 +1069,7 @@ public struct RuntimeEnvelopeV2: Codable, Sendable {
     }
 
     public func encode(to encoder: Encoder) throws {
-        guard version == runtimeV2OuterVersion else {
+        guard version == runtimeProtocolVersionV2 else {
             throw EncodingError.invalidValue(
                 version,
                 .init(
@@ -1026,5 +1093,188 @@ public struct RuntimeEnvelopeV2: Codable, Sendable {
         try container.encode(version, forKey: .version)
         try container.encode(messageID, forKey: .messageID)
         try container.encode(body, forKey: .body)
+    }
+}
+
+// MARK: - Current Runtime v2 wire entry points
+
+public enum RuntimeV2WireCodec {
+    public static let maxRequestBytes = 1024 * 1024
+    public static let maxJSONFrameBytes = 1024 * 1024
+
+    public static func decodeEnvelope(_ data: Data) throws -> RuntimeEnvelopeV2 {
+        guard data.count < maxJSONFrameBytes else {
+            throw RuntimeV2WireError.frameTooLarge
+        }
+        let value = try JSONDecoder().decode(RuntimeEnvelopeV2.self, from: data)
+        if case .request = value.body, data.count >= maxRequestBytes {
+            throw RuntimeV2WireError.frameTooLarge
+        }
+        return value
+    }
+
+    public static func decodeTransferEnvelope(_ data: Data) throws -> TransferEnvelopeV2 {
+        guard data.count < maxJSONFrameBytes else {
+            throw RuntimeV2WireError.frameTooLarge
+        }
+        return try JSONDecoder().decode(TransferEnvelopeV2.self, from: data)
+    }
+
+    public static func encode(_ value: RuntimeEnvelopeV2) throws -> Data {
+        let data = try JSONEncoder().encode(value)
+        guard data.count < maxJSONFrameBytes else {
+            throw RuntimeV2WireError.frameTooLarge
+        }
+        if case .request = value.body, data.count >= maxRequestBytes {
+            throw RuntimeV2WireError.frameTooLarge
+        }
+        return data
+    }
+
+    public static func encode(_ value: TransferEnvelopeV2) throws -> Data {
+        let data = try JSONEncoder().encode(value)
+        guard data.count < maxJSONFrameBytes else {
+            throw RuntimeV2WireError.frameTooLarge
+        }
+        return data
+    }
+
+    public static func decodeTransferCarrier(_ data: Data) throws -> RuntimeTransferCarrierV2 {
+        guard data.count < RuntimeTransferCarrierV2.maxBytes else {
+            throw RuntimeV2WireError.transferTooLarge
+        }
+
+        var reader = RuntimeV2TransferCarrierReader(data: data)
+        guard try reader.take(5) == Data("ADRT1".utf8) else {
+            throw RuntimeV2WireError.invalidTransferCarrier
+        }
+        let version = try reader.readUInt16()
+        guard version == runtimeProtocolVersionV2 else {
+            throw RuntimeV2WireError.unsupportedVersion
+        }
+        guard let channel = RuntimeTransferChannelV2(rawValue: try reader.readUInt8()) else {
+            throw RuntimeV2WireError.invalidTransferCarrier
+        }
+
+        let messageID = try reader.readUTF8UInt16()
+        let transferID = try reader.readUTF8UInt16()
+        do {
+            try runtimeV2ValidateIdentity(messageID)
+            try runtimeV2ValidateIdentity(transferID)
+        } catch {
+            throw RuntimeV2WireError.invalidTransferCarrier
+        }
+
+        let partIndex = try reader.readUInt32()
+        let partCount = try reader.readUInt32()
+        let totalSHA256 = try reader.take(32)
+        let totalBytes = try reader.readUInt64()
+        let partLength = Int(try reader.readUInt32())
+        let part = try reader.take(partLength)
+        guard reader.isAtEnd else {
+            throw RuntimeV2WireError.invalidTransferCarrier
+        }
+
+        let transfer = try TransferEnvelopeV2(
+            transferID: RuntimeTransferID(rawValue: transferID),
+            partIndex: partIndex,
+            partCount: partCount,
+            totalSHA256: totalSHA256,
+            totalBytes: totalBytes,
+            part: part,
+            profile: .compact
+        )
+        return RuntimeTransferCarrierV2(
+            runtimeVersion: version,
+            messageID: RuntimeMessageID(rawValue: messageID),
+            channel: channel,
+            transfer: transfer
+        )
+    }
+
+    public static func encode(_ value: RuntimeTransferCarrierV2) throws -> Data {
+        guard value.runtimeVersion == runtimeProtocolVersionV2 else {
+            throw RuntimeV2WireError.unsupportedVersion
+        }
+        try value.transfer.validate(profile: .compact)
+
+        let message = Data(value.messageID.rawValue.utf8)
+        let transferID = Data(value.transfer.transferID.rawValue.utf8)
+        guard !message.isEmpty,
+              !transferID.isEmpty,
+              message.count <= 1024,
+              transferID.count <= 1024,
+              value.transfer.part.count <= Int(UInt32.max)
+        else {
+            throw RuntimeV2WireError.invalidTransferCarrier
+        }
+
+        var data = Data("ADRT1".utf8)
+        appendBigEndian(value.runtimeVersion, to: &data)
+        data.append(value.channel.rawValue)
+        appendBigEndian(UInt16(message.count), to: &data)
+        data.append(message)
+        appendBigEndian(UInt16(transferID.count), to: &data)
+        data.append(transferID)
+        appendBigEndian(value.transfer.partIndex, to: &data)
+        appendBigEndian(value.transfer.partCount, to: &data)
+        data.append(value.transfer.totalSHA256)
+        appendBigEndian(value.transfer.totalBytes, to: &data)
+        appendBigEndian(UInt32(value.transfer.part.count), to: &data)
+        data.append(value.transfer.part)
+        guard data.count < RuntimeTransferCarrierV2.maxBytes else {
+            throw RuntimeV2WireError.transferTooLarge
+        }
+        return data
+    }
+
+    private static func appendBigEndian<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
+        var bigEndian = value.bigEndian
+        withUnsafeBytes(of: &bigEndian) { data.append(contentsOf: $0) }
+    }
+}
+
+private struct RuntimeV2TransferCarrierReader {
+    let data: Data
+    var offset = 0
+
+    var isAtEnd: Bool { offset == data.count }
+
+    mutating func take(_ count: Int) throws -> Data {
+        guard count >= 0, offset <= data.count, count <= data.count - offset else {
+            throw RuntimeV2WireError.invalidTransferCarrier
+        }
+        defer { offset += count }
+        return data.subdata(in: offset..<(offset + count))
+    }
+
+    mutating func readUInt8() throws -> UInt8 {
+        guard let value = try take(1).first else {
+            throw RuntimeV2WireError.invalidTransferCarrier
+        }
+        return value
+    }
+
+    mutating func readUInt16() throws -> UInt16 {
+        let bytes = [UInt8](try take(2))
+        return (UInt16(bytes[0]) << 8) | UInt16(bytes[1])
+    }
+
+    mutating func readUInt32() throws -> UInt32 {
+        let bytes = [UInt8](try take(4))
+        return bytes.reduce(0) { ($0 << 8) | UInt32($1) }
+    }
+
+    mutating func readUInt64() throws -> UInt64 {
+        let bytes = [UInt8](try take(8))
+        return bytes.reduce(0) { ($0 << 8) | UInt64($1) }
+    }
+
+    mutating func readUTF8UInt16() throws -> String {
+        let length = Int(try readUInt16())
+        guard let value = String(data: try take(length), encoding: .utf8) else {
+            throw RuntimeV2WireError.invalidTransferCarrier
+        }
+        return value
     }
 }
