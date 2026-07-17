@@ -1945,19 +1945,25 @@ P3.9 固定以下迁移边界：
       1,024 × 256 MiB 边界 255.29 秒均 exit 0；Clippy/fmt/no-net/docs/App selfcheck/diff 全绿。两路独立
       spec/security/quality 终审 Approved、无 P0/P1/P2；未夹带 B3 SendPrompt/pin 或 B4 metadata mutation，
       P3.1 signed Keychain 外部门禁继续 BLOCKED。
-  - [ ] **B3a admission pin（preflight/split freeze active；implementation 0/4）：** SendPrompt expected
+  - [ ] **B3a admission pin（preflight/split freeze active；implementation 1/4）：** SendPrompt expected
     revision、Accepted 同事务非零 pin、receipt/status/query 原 revision、并发 Configure/Prompt 线性化；新
     command 缺 pin fail-close。
     - **具体威胁场景：** 同 UID 已认证 caller 已把 fresh v5 conversation 配到 rev1，却可在当前 writer 中
       接受一个没有 durable pin 的 seq0 command；若之后配置推进或 daemon 重启，queued/recovery 路径就无法
       证明原 command 应使用哪一版配置，可能静默改用 latest configuration 并产生错误 vendor/tool 副作用。
-    - [ ] **B3a0 internal DTO/test fixture compile-neutral migration：** 只给内部 `AcceptCommand` 增加 expected
+    - [x] **B3a0 internal DTO/test fixture compile-neutral migration（code commit `a876e24`，实际
+      +57/-0）：** 只给内部 `AcceptCommand` 增加 expected
       configuration revision，并机械更新直接构造它的 test/probe fixture，保持本片行为中性；既有 literal
       可暂填 rev0，但它只是在 writer 尚未切换前的 compile placeholder，不构成 Store 测试豁免。B3a1
       完成时，只有 `commandSeq <= legacyCommandHighWater` 的真实迁移前 fixture 可继续 rev0；fresh v5
       direct-Store fixture 必须先 Configure rev1，或明确改成 configuration-required reject test。不得预先
       承诺把全部既有 fixture 改为 rev1、整体平移 event/HWM；只有后续 RED 证明某个 fixture 必须迁移时，
-      才做该处最小调整。本片不写 pin、不放开 production SendPrompt，也不宣称 B3a 已实现。
+      才做该处最小调整。本片不写 pin、不放开 production SendPrompt，也不宣称 B3a 已实现。先只加 DTO
+      字段得到 18 个编译 RED，再把 56 个 initializer 全部显式补为 rev0 placeholder；全仓 62 个词法命中
+      扣除 model/worker enum-pattern/函数签名后无漏项，新增行没有读取、分支、token 或 persistence 行为。
+      daemon lib 672 passed + 1 ignored、完整 `cargo test -p agentdeckd` exit 0，真实 1,024 × 256 MiB
+      门禁 259.29 秒、stream 45/45、transfer 17/17、StorageKEK 14 passed + 1 个既有 signed gate ignored；
+      全目标 Clippy、fmt、no-net、docs、App selfcheck 与 diff 全绿，独立复审 Approved、无 P0/P1/P2。
     - [ ] **B3a1 Store writer/reader：** 在同一个 `BEGIN IMMEDIATE` 中认证 current configuration head、比较
       expected revision、写 Accepted command + 同 conversation/commandSeq 的非零 pin，并把
       `command_configuration_pin_count` 与 command ledger 一起提交。exact retry 必须先于 current-head conflict，
