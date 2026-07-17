@@ -1945,8 +1945,60 @@ P3.9 固定以下迁移边界：
       1,024 × 256 MiB 边界 255.29 秒均 exit 0；Clippy/fmt/no-net/docs/App selfcheck/diff 全绿。两路独立
       spec/security/quality 终审 Approved、无 P0/P1/P2；未夹带 B3 SendPrompt/pin 或 B4 metadata mutation，
       P3.1 signed Keychain 外部门禁继续 BLOCKED。
-  - [ ] **B3a admission pin：** SendPrompt expected revision、Accepted 同事务非零 pin、receipt/status/query
-    原 revision、并发 Configure/Prompt 线性化；新 command 缺 pin fail-close。
+  - [ ] **B3a admission pin（preflight/split freeze active；implementation 0/4）：** SendPrompt expected
+    revision、Accepted 同事务非零 pin、receipt/status/query 原 revision、并发 Configure/Prompt 线性化；新
+    command 缺 pin fail-close。
+    - **具体威胁场景：** 同 UID 已认证 caller 已把 fresh v5 conversation 配到 rev1，却可在当前 writer 中
+      接受一个没有 durable pin 的 seq0 command；若之后配置推进或 daemon 重启，queued/recovery 路径就无法
+      证明原 command 应使用哪一版配置，可能静默改用 latest configuration 并产生错误 vendor/tool 副作用。
+    - [ ] **B3a0 internal DTO/test fixture compile-neutral migration：** 只给内部 `AcceptCommand` 增加 expected
+      configuration revision，并机械更新直接构造它的 test/probe fixture，保持本片行为中性；既有 literal
+      可暂填 rev0，但它只是在 writer 尚未切换前的 compile placeholder，不构成 Store 测试豁免。B3a1
+      完成时，只有 `commandSeq <= legacyCommandHighWater` 的真实迁移前 fixture 可继续 rev0；fresh v5
+      direct-Store fixture 必须先 Configure rev1，或明确改成 configuration-required reject test。不得预先
+      承诺把全部既有 fixture 改为 rev1、整体平移 event/HWM；只有后续 RED 证明某个 fixture 必须迁移时，
+      才做该处最小调整。本片不写 pin、不放开 production SendPrompt，也不宣称 B3a 已实现。
+    - [ ] **B3a1 Store writer/reader：** 在同一个 `BEGIN IMMEDIATE` 中认证 current configuration head、比较
+      expected revision、写 Accepted command + 同 conversation/commandSeq 的非零 pin，并把
+      `command_configuration_pin_count` 与 command ledger 一起提交。exact retry 必须先于 current-head conflict，
+      返回原 command/pin revision；same key + different expected revision 仍是 idempotency conflict。reader/open/
+      recovery 逐行验证 pin metadata MAC、复合 FK、physical/authenticated total，并只允许
+      `commandSeq <= legacyCommandHighWater` 的迁移前 command 无 pin且解释为 rev0；fresh/native 或 cutoff 之后
+      的 command 缺 pin、legacy command 被补非零 pin都 fail-close。receipt/status/query 只读回 revision；按
+      revision 解析 exact configuration、构造 adapter prepare 属 B3b，不得夹入本片。
+    - [ ] **B3a2 hardening：** 用单 Store worker 的可控 before-COMMIT barrier 固定 Configure-first 与
+      Prompt-first 两种线性化顺序；覆盖 stale/future、same-key conflict、restart/recovery、before/after-COMMIT
+      unknown、pin metadata/revision swap/delete/orphan、ledger count、legacy cutoff 与 fresh seq0 missing-pin
+      tamper。quota 以 exact-boundary 纯函数和真实 capacity zero-write 门禁证明
+      `MAX_COMMAND_CONFIGURATION_PINS=1,048,576`，不为一次性边界制造百万行证明机器。所有 reject/replay 都
+      读回 command/pin/ledger/event/catalog 零漂移。
+    - [ ] **B3a3 Core/actor/docs：** 把 expected revision 经 RuntimeCore → conversation admission worker → Store
+      完整传递，移除 production `feature_unavailable` 与 test-only unconfigured prompt 旁路；Accepted/Replayed/
+      QueryReceipt/Started/terminal status 都返回原 pinned revision，unconfigured 与 revision mismatch 分别映射
+      `daemon.conversation.configuration_required` / `daemon.conversation.configuration_conflict`。Core 专用
+      authorized Accept 必须把 authorization guard 交给 Store `NormalCommand`，由 Store 持到 durable
+      outcome、通知与 reply 完成，再随成功 reply 返给 actor并继续覆盖 queue registration；禁止 detached
+      task。除 caller cancellation 外，必须用 actor shutdown timeout/prompt-worker abort + Store barrier 的
+      RED 证明 guard 不会在 COMMIT 前释放。同步 README、ARCHITECTURE、QUALITY、DIAGNOSTICS、本计划与
+      进度账本；不得在本片加载 exact configuration、改 adapter argv/control 或消费 recorded vendor fixture，
+      这些全部属于 B3b。
+    - **真实 production preflight sample（只证明当前 RED 基线，不证明 B3a）：** preflight 前 worktree 在
+      `HEAD=56aa25d` clean；仓库外
+      `/tmp/agentdeck-b3a-preflight-20260716-30103c1` 由 B2c production Store 调用
+      `create conversation → Configure rev1 → Accept seq0` 产生，读回 `schemaVersion=5`、
+      `configurationRevision=1`、`legacyCommandHighWater=null`、`commandState=accepted`、
+      `physicalPinRows=0`、`ledgerPinRows=0`。产物内容信任根固定为 DB/WAL/KEK SHA-256：
+      `runtime.db=c47bdb35c6884d3adf17d2b4826bc51de6432382ae638ce324a6bdc09a49a138`、
+      `runtime.db-wal=86a88f062b2d6c08bbd8b6d654360b04676273b165db2bef6fd9d696e9b2bc92`、
+      `storage-kek.bin=60cb794c641460d6171bb9149e4c02067fc40411948ee3cb7eed9256d42b4829`；易随 SQLite
+      reader 生命周期变化的 `runtime.db-shm` 仅记录本次观察值
+      `66e55c496f94b1ce0f5b90806e5eaaeb59ffc6ffced6822b460e7ad484695c37`，不作为信任根。样本只保留到
+      B3a1 先证明旧 unpinned 样本 fail-close，再由新 production writer 生成合法非零 pin 并完成 reopen/query/
+      recovery readback；两项证据都取得后精确删除整个目录并读回 absent，不提交 DB/WAL/SHM/KEK。
+    - **切片刹车线：** B3a0–B3a3 各自独立 review/scoped commit；任一片在动代码前预估达到 1,800
+      additions 必须继续预拆，实际 additions 超过 2,000 立即停下汇报，删除旧代码不能抵消新增行。四片未
+      全部闭环前 B3a 保持 active，当前 docs-only split freeze 绝不冒充 admission pin 实现；P3.1 signed
+      Keychain 外部门禁继续 BLOCKED。
   - [ ] **B3b exact execution：** queued/restart/recovery 按 pin load exact configuration；只有
     `commandSeq <= legacyCommandHighWater` 的迁移前命令可在 startup recovery 消费 frozen P3.7 rev0 defaults。
     Codex/CC recorded argv/control/translator fixture 锁定实际字段映射，不冒充 live login。
