@@ -1945,7 +1945,7 @@ P3.9 固定以下迁移边界：
       1,024 × 256 MiB 边界 255.29 秒均 exit 0；Clippy/fmt/no-net/docs/App selfcheck/diff 全绿。两路独立
       spec/security/quality 终审 Approved、无 P0/P1/P2；未夹带 B3 SendPrompt/pin 或 B4 metadata mutation，
       P3.1 signed Keychain 外部门禁继续 BLOCKED。
-  - [ ] **B3a admission pin（preflight/split freeze active；implementation 1/4）：** SendPrompt expected
+  - [ ] **B3a admission pin（implementation 2/4）：** SendPrompt expected
     revision、Accepted 同事务非零 pin、receipt/status/query 原 revision、并发 Configure/Prompt 线性化；新
     command 缺 pin fail-close。
     - **具体威胁场景：** 同 UID 已认证 caller 已把 fresh v5 conversation 配到 rev1，却可在当前 writer 中
@@ -1964,20 +1964,36 @@ P3.9 固定以下迁移边界：
       daemon lib 672 passed + 1 ignored、完整 `cargo test -p agentdeckd` exit 0，真实 1,024 × 256 MiB
       门禁 259.29 秒、stream 45/45、transfer 17/17、StorageKEK 14 passed + 1 个既有 signed gate ignored；
       全目标 Clippy、fmt、no-net、docs、App selfcheck 与 diff 全绿，独立复审 Approved、无 P0/P1/P2。
-    - [ ] **B3a1 Store writer/reader：** 在同一个 `BEGIN IMMEDIATE` 中认证 current configuration head、比较
-      expected revision、写 Accepted command + 同 conversation/commandSeq 的非零 pin，并把
-      `command_configuration_pin_count` 与 command ledger 一起提交。exact retry 必须先于 current-head conflict，
-      返回原 command/pin revision；same key + different expected revision 仍是 idempotency conflict。reader/open/
-      recovery 逐行验证 pin metadata MAC、复合 FK、physical/authenticated total，并只允许
-      `commandSeq <= legacyCommandHighWater` 的迁移前 command 无 pin且解释为 rev0；fresh/native 或 cutoff 之后
-      的 command 缺 pin、legacy command 被补非零 pin都 fail-close。receipt/status/query 只读回 revision；按
-      revision 解析 exact configuration、构造 adapter prepare 属 B3b，不得夹入本片。
-    - [ ] **B3a2 hardening：** 用单 Store worker 的可控 before-COMMIT barrier 固定 Configure-first 与
+    - [x] **B3a1 Store writer/reader（code commits `494d9d7`、`e78054f`、`944e257`、`b3bc521`）：**
+      fresh direct-Store fixture 已按行为最小迁为 Configure rev1；production writer 在同一个
+      `BEGIN IMMEDIATE` 中认证 current configuration head、比较 expected revision、写 Accepted command 与同
+      conversation/commandSeq 的非零 authenticated pin，并把 pin total 与 command ledger 一起提交。exact
+      replay 先认证原 command/pin 再早于 current-head conflict 返回；same key + different expected revision
+      仍是 idempotency conflict。reader/open/recovery 逐行验证 state/cutoff MAC、pin metadata MAC、同
+      conversation revision reference、physical/authenticated/ledger total，并只允许 cutoff 内迁移前 command
+      无 pin且解释为 rev0。receipt/status/query、Started/terminal/recovery 均保留原 pinned revision；本片不加载
+      exact configuration，也未改 adapter prepare。四个小片实际 additions 分别为 664、1,257、964、429，均
+      低于 1,800 行预拆线；focused evidence 8/8，strict-v1、production writer→rev2→reopen→query/recovery 与
+      真实旧 writer non-empty-WAL fail-close/DB+WAL+SHM 零触碰门禁全绿。daemon lib 672 passed + 1 ignored、
+      完整 package（含真实 1,024 × 256 MiB，278.29 秒）、stream 45/45、transfer 17/17、StorageKEK 14 passed
+      + 1 ignored、Clippy/fmt/no-net/docs/App selfcheck/diff 全绿；两路独立终审 Approved、无 P0/P1/P2。
+    - [ ] **B3a2 hardening（split 0/3）：** 用单 Store worker 的可控 before-COMMIT barrier 固定 Configure-first 与
       Prompt-first 两种线性化顺序；覆盖 stale/future、same-key conflict、restart/recovery、before/after-COMMIT
       unknown、pin metadata/revision swap/delete/orphan、ledger count、legacy cutoff 与 fresh seq0 missing-pin
       tamper。quota 以 exact-boundary 纯函数和真实 capacity zero-write 门禁证明
       `MAX_COMMAND_CONFIGURATION_PINS=1,048,576`，不为一次性边界制造百万行证明机器。所有 reject/replay 都
-      读回 command/pin/ledger/event/catalog 零漂移。
+      读回 command/pin/ledger/event/catalog 零漂移；另以 hook 固定 rescue preflight→原库 RW open 之间的同
+      UID WAL 竞态，证明损坏状态绝不被接受，并明确该竞态下 artifact 是否保持零写。
+      - **B3a2-A linearization/COMMIT/restart：** 扩展完整 durable evidence；固定 Configure-first、Prompt-first、
+        stale/future、same-key conflict、Accept before/after-COMMIT unknown，以及 Accepted/Started/terminal 跨
+        head advance 的 restart/recovery；所有 reject/replay 逐字段证明零漂移。
+      - **B3a2-B tamper/legacy/race：** 参数化 pin metadata token、revision swap、delete/orphan、
+        cross-command/conversation、physical/authenticated/ledger total 分叉；分别证明 fresh v5 seq0 missing pin、
+        `seq > cutoff` missing pin、`seq <= cutoff` 被补非零 pin 均 fail-close，并同时覆盖 live reader 与
+        reopen/recovery。用 hook 固定 rescue preflight→原库 RW open 的同 UID WAL 竞态，证明不接受损坏状态并
+        锁定 artifact 零写边界。
+      - **B3a2-C quota/capacity：** 纯函数锁定 `MAX-1/MAX`，真实 DiskLow/StoreFull 对 Accept 与 exact replay
+        证明 command/pin/event/catalog 零漂移；不得制造 1,048,576 行一次性证明机。
     - [ ] **B3a3 Core/actor/docs：** 把 expected revision 经 RuntimeCore → conversation admission worker → Store
       完整传递，移除 production `feature_unavailable` 与 test-only unconfigured prompt 旁路；Accepted/Replayed/
       QueryReceipt/Started/terminal status 都返回原 pinned revision，unconfigured 与 revision mismatch 分别映射
@@ -1989,18 +2005,28 @@ P3.9 固定以下迁移边界：
       进度账本；不得在本片加载 exact configuration、改 adapter argv/control 或消费 recorded vendor fixture，
       这些全部属于 B3b。
     - **真实 production preflight sample（只证明当前 RED 基线，不证明 B3a）：** preflight 前 worktree 在
-      `HEAD=56aa25d` clean；仓库外
+      `HEAD=56aa25d` clean；第一份仓库外样本
       `/tmp/agentdeck-b3a-preflight-20260716-30103c1` 由 B2c production Store 调用
       `create conversation → Configure rev1 → Accept seq0` 产生，读回 `schemaVersion=5`、
       `configurationRevision=1`、`legacyCommandHighWater=null`、`commandState=accepted`、
-      `physicalPinRows=0`、`ledgerPinRows=0`。产物内容信任根固定为 DB/WAL/KEK SHA-256：
+      `physicalPinRows=0`、`ledgerPinRows=0`。第一份产物的原 DB/WAL 曾固定为 SHA-256
       `runtime.db=c47bdb35c6884d3adf17d2b4826bc51de6432382ae638ce324a6bdc09a49a138`、
       `runtime.db-wal=86a88f062b2d6c08bbd8b6d654360b04676273b165db2bef6fd9d696e9b2bc92`、
-      `storage-kek.bin=60cb794c641460d6171bb9149e4c02067fc40411948ee3cb7eed9256d42b4829`；易随 SQLite
-      reader 生命周期变化的 `runtime.db-shm` 仅记录本次观察值
-      `66e55c496f94b1ce0f5b90806e5eaaeb59ffc6ffced6822b460e7ad484695c37`，不作为信任根。样本只保留到
-      B3a1 先证明旧 unpinned 样本 fail-close，再由新 production writer 生成合法非零 pin 并完成 reopen/query/
-      recovery readback；两项证据都取得后精确删除整个目录并读回 absent，不提交 DB/WAL/SHM/KEK。
+      `storage-kek.bin=60cb794c641460d6171bb9149e4c02067fc40411948ee3cb7eed9256d42b4829`；但后续一次
+      SQLite reader 生命周期错误地对原目录触发 checkpoint，DB 变为 `874e4297...`、WAL 被清空，且
+      APFS/Time Machine/打开文件描述符与临时目录搜索均无原字节副本，因此第一份样本已退役，不能再作为
+      golden。B3a1c 随即在隔离 worktree 精确 checkout
+      `30103c14c0695d18986e6e63ef903d2c5a376dd8`，用同一份一次性 production Store generator 和
+      `rustc/cargo 1.96.0` 重建仓库外样本
+      `/tmp/agentdeck-b3a-preflight-20260717-30103c1-rebuilt`；writer 读回字段仍为上述 RED 基线，非空 WAL
+      为 `173072` bytes。新信任根固定为
+      `runtime.db=07723391e1cec48d59bafa193541ec419c93e64d5deb949d3a0ef32f212f4212`、
+      `runtime.db-wal=7d12dcd7ea22396bf0c539c704e3ba2a6e35ca26a3a6d17e85c68041471b046e`、
+      `storage-kek.bin=3bc66fd8724b93765cee591d40c088a4c5c8200ac756b8aa5af19e3abfbdaf98`；易随 SQLite
+      reader 生命周期变化的 `runtime.db-shm` 不作为信任根。`b3bc521` 已在复制后的固定 target 上再次绑定
+      DB/WAL hash、非空 WAL 与 SHM absent，证明旧 writer unpinned 样本 fail-close 且 DB/WAL/SHM 零触碰；
+      新 production writer 也已完成合法非零 pin 的 reopen/query/recovery readback。两项证据取得后，两份
+      样本目录与一次性 generator worktree 已精确删除并读回 absent；DB/WAL/SHM/KEK 均未进入仓库。
     - **切片刹车线：** B3a0–B3a3 各自独立 review/scoped commit；任一片在动代码前预估达到 1,800
       additions 必须继续预拆，实际 additions 超过 2,000 立即停下汇报，删除旧代码不能抵消新增行。四片未
       全部闭环前 B3a 保持 active，当前 docs-only split freeze 绝不冒充 admission pin 实现；P3.1 signed
