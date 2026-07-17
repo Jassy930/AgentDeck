@@ -1995,25 +1995,33 @@ P3.9 固定以下迁移边界：
         两条线性化重复 20/20、daemon lib 672 passed + 1 ignored、完整 package（含真实 1,024 × 256 MiB，
         287.80 秒）、stream 45/45、transfer 17/17、StorageKEK 14 passed + 1 ignored、Clippy/fmt/no-net/docs/
         App selfcheck/diff 全绿；spec/quality 双路终审 Approved、无 P0/P1/P2。
-      - [ ] **B3a2-B tamper/legacy/race（internal 1/3）：** 参数化 pin metadata token、revision swap、
+      - [ ] **B3a2-B tamper/legacy/race（internal 2/3）：** 参数化 pin metadata token、revision swap、
         delete/orphan、cross-command/conversation、physical/authenticated/ledger total 分叉；分别证明 fresh v5
         seq0 missing pin、`seq > cutoff` missing pin、`seq <= cutoff` 被补非零 pin 均 fail-close，并同时覆盖
         live reader 与 reopen/recovery。用 hook 固定 rescue preflight→原库 RW open 的同 UID WAL 竞态，证明
         不接受损坏状态并锁定 artifact 零写边界。
-        - [x] **B1 current-v5 pin tamper（code commit `54441e2`，实际 +1,009/-0）：** 两 conversation 的
+        - [x] **B1 current-v5 pin tamper（code commits `54441e2` / `c38f756`；主片 +1,009/-0，取证
+          follow-up +40/-23）：** 两 conversation 的
           production writer fixture 生成 rev1 seq0/seq1 pin，并让目标 conversation 推进到 rev2。target token
           bitflip、保留旧 token 的 revision swap、fresh seq0 delete、cross-command/cross-conversation token 均由
           command-id/idempotency 两种 receipt selector、live recovery 与 reopen typed fail-close；MAC-valid FK-off
           orphan 和 authenticated ledger count 分叉保持 target receipt 的 O(1) 行局部读取，只由 recovery/reopen
           全局审计拒绝。test helper 先用 production `RuntimeKeyBundle` 自证现有全部 pin 与 v5 ledger token；
-          tamper 连接在任何表读取前禁用并读回 `wal_autocheckpoint=0`。tamper 后只用 no-follow、regular-file、
-          16 MiB/件上限的 `fs::read` artifact oracle；live 比 main/WAL，shutdown 后以完整 main/WAL/SHM 为基线
-          证明 rejected reopen 零改写。revision swap 明确限定为无 KEK 的同 UID offline corruption，不冒充可重签
-          攻击者。focused 2/2 + 重复 20/20、相邻 configuration 12/12、recovery 1 passed + 1 manual ignored、
+          tamper 连接在任何表读取前禁用并读回 `wal_autocheckpoint=0`。tamper 后只用同一个 Unix
+          `O_NOFOLLOW|O_CLOEXEC` handle 做 regular-file、16 MiB metadata cap 与 `MAX+1` 有界读；live 比
+          main/WAL，shutdown 后以完整 main/WAL/SHM 为基线证明 rejected reopen 零改写。revision swap 明确限定
+          为无 KEK 的同 UID offline corruption，不冒充可重签攻击者。focused 2/2 + 重复 20/20、相邻
+          configuration 12/12、recovery 1 passed + 1 manual ignored、
           Clippy/fmt/no-net/docs/App selfcheck/diff 全绿；spec/security 终审 Approved、无 P0/P1/P2。
-        - [ ] **B2 strict-v1 legacy cutoff：** 复用真实 strict-v1 migration fixture，以有效 pin MAC 与 v5
-          authenticated ledger token 分别锁定 `seq > cutoff` 缺 pin、`seq <= cutoff` 被补非零 pin和 ledger
-          total 分叉；覆盖两 selector、live recovery、reopen 与 artifact 零写。
+        - [x] **B2 strict-v1 legacy cutoff（code commit `c819f9e`，实际 +629/-14）：** 复用真实 strict-v1
+          migration fixture：先以 production Accept 在 cutoff seq0 后生成 rev1 seq1/pin，再同事务删除 pin并把
+          ledger 1→0 用 production v5 token 重签，隔离证明 `seq > cutoff` 缺 pin；另一例先生成真实 rev1/FK，
+          再用 production `insert_pin` 给 legacy seq0 写合法非零 pin并把 ledger 0→1重签，证明 cutoff 内语义
+          不可改写；第三例只把 ledger pin count 0→1合法重签，保持 legacy 两 selector 返回 rev0，但由 live
+          recovery/reopen 拒绝 global divergence。tamper 前认证 current meta/ledger/state/pins，并读回
+          `wal_autocheckpoint=0` 与 FK；live 比 main/WAL，clean shutdown 可合法整理 WAL/SHM，随后才以完整
+          main/WAL/SHM/journal 基线约束 rejected reopen。migration 24/24、新三项重复 30/30（主线程最终再跑
+          15/15）、Clippy/fmt/no-net/diff 全绿；两路 spec/security 终审 Approved、无 P0/P1/P2。
         - [ ] **B3 current-open race：** 仅用私有 generic `open_inner<F>` hook 固定 current rescue validation→
           原库 RW open 窗口；hook 后立即再次比较完整 `StoreFileIdentity`，production 永远传 ZST no-op，不扩
           Config/env/feature/public fault surface。最后一次 stat→`sqlite3_open` 的不可消灭窗口不得宣称 SHM
