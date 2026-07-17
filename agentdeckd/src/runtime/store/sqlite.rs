@@ -83,7 +83,8 @@ pub(crate) enum SafetyReserveProjection {
 
 #[cfg(test)]
 mod migration_tests {
-    use std::fs;
+    use std::fs::{self, OpenOptions};
+    use std::io::Read;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -96,19 +97,20 @@ mod migration_tests {
 
     use super::*;
     use crate::runtime::model::{
-        AcceptCommand, AcceptOutcome, CommandState, ConversationDescriptor, ConversationLifecycle,
-        ExecutionFence, IdempotencyOwner, MachineEnrollmentReceiptRecord, NewConversation,
-        RuntimeCapacityObservation, RuntimeCapacityProbe, RuntimeCapacityProbeError,
-        RuntimeStoreFaultInjector, StartCommand, StartOutcome,
+        AcceptCommand, AcceptOutcome, CommandReceiptSelector, CommandState, ConversationDescriptor,
+        ConversationLifecycle, ExecutionFence, IdempotencyOwner, MachineEnrollmentReceiptRecord,
+        NewConversation, QueryCommandReceipt, RuntimeCapacityObservation, RuntimeCapacityProbe,
+        RuntimeCapacityProbeError, RuntimeStoreFaultInjector, StartCommand, StartOutcome,
     };
     use crate::runtime::store::cipher::RowAad;
     use crate::runtime::store::identity::{RuntimeId, RuntimeIdKind};
     use crate::runtime::store::sequence::{SequenceScope, decode_sequence, encode_sequence};
     use crate::runtime::store::worker::RuntimeStoreHandle;
     use crate::runtime::store::{ConfigureConversation, ConfigureConversationOutcome};
-    use crate::security::{MemoryKeyStore, SecretBytes, load_or_create_storage_kek};
+    use crate::security::{MemoryKeyStore, SecretBytes, StorageKek, load_or_create_storage_kek};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+    const MAX_ARTIFACT_EVIDENCE_BYTES: u64 = 64 * 1024 * 1024;
 
     struct TestRoot(PathBuf);
 
@@ -579,15 +581,506 @@ mod migration_tests {
             PathBuf::from(format!("{}-journal", database.display())),
         ]
         .into_iter()
-        .map(|path| {
-            let bytes = match fs::read(&path) {
-                Ok(bytes) => Some(bytes),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => panic!("read {}: {error}", path.display()),
-            };
-            (path, bytes)
-        })
+        .map(|path| (path.clone(), read_artifact_evidence(&path)))
         .collect()
+    }
+
+    fn read_artifact_evidence(path: &Path) -> Option<Vec<u8>> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        }
+        let file = match options.open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => panic!("open runtime artifact {}: {error}", path.display()),
+        };
+        let metadata = file
+            .metadata()
+            .unwrap_or_else(|error| panic!("inspect open artifact {}: {error}", path.display()));
+        assert!(
+            metadata.file_type().is_file(),
+            "runtime artifact must be a regular file: {}",
+            path.display()
+        );
+        assert!(
+            metadata.len() <= MAX_ARTIFACT_EVIDENCE_BYTES,
+            "runtime artifact {} has {} bytes, exceeding the {}-byte test oracle cap",
+            path.display(),
+            metadata.len(),
+            MAX_ARTIFACT_EVIDENCE_BYTES
+        );
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(metadata.len()).expect("bounded artifact length fits usize"),
+        );
+        let mut bounded = file.take(MAX_ARTIFACT_EVIDENCE_BYTES + 1);
+        bounded
+            .read_to_end(&mut bytes)
+            .unwrap_or_else(|error| panic!("read open artifact {}: {error}", path.display()));
+        assert!(
+            bytes.len() as u64 <= MAX_ARTIFACT_EVIDENCE_BYTES,
+            "runtime artifact {} grew beyond the {}-byte test oracle cap while reading",
+            path.display(),
+            MAX_ARTIFACT_EVIDENCE_BYTES
+        );
+        Some(bytes)
+    }
+
+    fn assert_main_and_wal_unchanged(
+        before: &[(PathBuf, Option<Vec<u8>>)],
+        after: &[(PathBuf, Option<Vec<u8>>)],
+        label: &str,
+    ) {
+        assert_eq!(before.len(), after.len(), "{label}: artifact arity drifted");
+        for index in 0..2 {
+            assert_eq!(
+                before[index],
+                after[index],
+                "{label}: {} drifted",
+                before[index].0.display()
+            );
+        }
+    }
+
+    #[derive(Clone)]
+    struct ReceiptIdentity {
+        conversation_id: RuntimeId,
+        command_id: RuntimeId,
+        owner: IdempotencyOwner,
+        idempotency_key: String,
+    }
+
+    struct MigratedStrictV1Fixture {
+        root: TestRoot,
+        keys: MemoryKeyStore,
+        store: Option<RuntimeStoreHandle>,
+        legacy_accepted: ReceiptIdentity,
+    }
+
+    impl MigratedStrictV1Fixture {
+        async fn create(label: &str) -> Self {
+            let root = TestRoot::new(label);
+            let keys = MemoryKeyStore::new();
+            build_strict_v1_fixture(&root, &keys).await;
+            let store = RuntimeStoreHandle::open(
+                RuntimeStoreConfig::new(root.database()),
+                load_or_create_storage_kek(&keys, &root.database())
+                    .expect("reload strict v1 tamper KEK"),
+            )
+            .await
+            .expect("migrate strict v1 tamper fixture");
+            assert_eq!(
+                store
+                    .inspect()
+                    .await
+                    .expect("inspect migrated strict v1 tamper fixture")
+                    .schema_version,
+                RUNTIME_SCHEMA_VERSION
+            );
+
+            let conversation_id = runtime_id(RuntimeIdKind::Conversation, 0x11);
+            let legacy_owner = owner(1);
+            let legacy_idempotency_key = "legacy-accepted".to_owned();
+            let receipt = store
+                .query_command_receipt(QueryCommandReceipt {
+                    expected_owner: legacy_owner.clone(),
+                    selector: CommandReceiptSelector::Idempotency {
+                        conversation_id,
+                        idempotency_key: legacy_idempotency_key.clone(),
+                    },
+                })
+                .await
+                .expect("read migrated strict v1 legacy receipt");
+            let legacy_accepted = ReceiptIdentity {
+                conversation_id,
+                command_id: receipt.command_id,
+                owner: legacy_owner,
+                idempotency_key: legacy_idempotency_key,
+            };
+            assert_receipt_revision(&store, &legacy_accepted, 0, "migrated baseline").await;
+            assert_recovery_revision(&store, legacy_accepted.command_id, 0, "migrated baseline")
+                .await;
+
+            Self {
+                root,
+                keys,
+                store: Some(store),
+                legacy_accepted,
+            }
+        }
+
+        fn store(&self) -> &RuntimeStoreHandle {
+            self.store.as_ref().expect("strict v1 fixture is live")
+        }
+
+        fn database(&self) -> PathBuf {
+            self.root.database()
+        }
+
+        fn storage_kek(&self) -> StorageKek {
+            load_or_create_storage_kek(&self.keys, &self.database())
+                .expect("reload migrated strict v1 tamper KEK")
+        }
+
+        async fn shutdown_and_assert_reopen_rejected(mut self, label: &str) {
+            self.store
+                .take()
+                .expect("take live strict v1 tamper store")
+                .shutdown()
+                .await
+                .expect("shutdown tampered strict v1 store");
+            let storage_kek = self.storage_kek();
+            // Clean shutdown 关闭最后一个 SQLite connection 时允许合法整理 WAL/SHM；
+            // 因此 full-artifact 零写契约从 shutdown 完成后开始，只约束 rejected reopen。
+            let before_reopen = artifact_evidence(&self.database());
+            let error =
+                RuntimeStoreHandle::open(RuntimeStoreConfig::new(self.database()), storage_kek)
+                    .await
+                    .expect_err("tampered migrated strict v1 store must fail closed on reopen");
+            assert_unknown_or_corrupt(error, &format!("{label}/reopen"));
+            assert_eq!(
+                artifact_evidence(&self.database()),
+                before_reopen,
+                "{label}: rejected reopen must not rewrite any runtime artifact"
+            );
+        }
+    }
+
+    async fn assert_receipt_revision(
+        store: &RuntimeStoreHandle,
+        identity: &ReceiptIdentity,
+        expected_revision: u64,
+        label: &str,
+    ) {
+        let by_command = store
+            .query_command_receipt(QueryCommandReceipt {
+                expected_owner: identity.owner.clone(),
+                selector: CommandReceiptSelector::Command {
+                    conversation_id: identity.conversation_id,
+                    command_id: identity.command_id,
+                },
+            })
+            .await
+            .unwrap_or_else(|error| panic!("{label}: command-id receipt failed: {error:?}"));
+        let by_idempotency = store
+            .query_command_receipt(QueryCommandReceipt {
+                expected_owner: identity.owner.clone(),
+                selector: CommandReceiptSelector::Idempotency {
+                    conversation_id: identity.conversation_id,
+                    idempotency_key: identity.idempotency_key.clone(),
+                },
+            })
+            .await
+            .unwrap_or_else(|error| panic!("{label}: idempotency receipt failed: {error:?}"));
+        assert_eq!(by_command, by_idempotency, "{label}: selector drift");
+        assert_eq!(
+            by_command.configuration_revision, expected_revision,
+            "{label}: frozen configuration revision drift"
+        );
+    }
+
+    async fn assert_receipts_rejected(
+        store: &RuntimeStoreHandle,
+        identity: &ReceiptIdentity,
+        label: &str,
+    ) {
+        for (selector_label, selector) in [
+            (
+                "command-id",
+                CommandReceiptSelector::Command {
+                    conversation_id: identity.conversation_id,
+                    command_id: identity.command_id,
+                },
+            ),
+            (
+                "idempotency",
+                CommandReceiptSelector::Idempotency {
+                    conversation_id: identity.conversation_id,
+                    idempotency_key: identity.idempotency_key.clone(),
+                },
+            ),
+        ] {
+            let error = store
+                .query_command_receipt(QueryCommandReceipt {
+                    expected_owner: identity.owner.clone(),
+                    selector,
+                })
+                .await
+                .expect_err("tampered strict v1 receipt must fail closed");
+            assert_unknown_or_corrupt(error, &format!("{label}/{selector_label}"));
+        }
+    }
+
+    async fn complete_recovery_revisions(
+        store: &RuntimeStoreHandle,
+    ) -> Result<Vec<(RuntimeId, u64)>, RuntimeStoreError> {
+        let mut cursor = store.begin_recovery_scan().await?;
+        let mut recovered = Vec::new();
+        let completion = loop {
+            let page = store.load_recovery_page(cursor).await?;
+            if let Some(conversation) = page.conversation {
+                recovered.extend(
+                    conversation
+                        .accepted
+                        .into_iter()
+                        .map(|command| (command.command_id, command.configuration_revision)),
+                );
+                if let Some(started) = conversation.started {
+                    recovered.push((
+                        started.command.command_id,
+                        started.command.configuration_revision,
+                    ));
+                }
+            }
+            match (page.next_cursor, page.completion) {
+                (Some(next), None) => cursor = next,
+                (None, Some(completion)) => break completion,
+                _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
+            }
+        };
+        store.finish_recovery_scan(completion).await?;
+        Ok(recovered)
+    }
+
+    async fn assert_recovery_revision(
+        store: &RuntimeStoreHandle,
+        command_id: RuntimeId,
+        expected_revision: u64,
+        label: &str,
+    ) {
+        let recovered = complete_recovery_revisions(store)
+            .await
+            .unwrap_or_else(|error| panic!("{label}: baseline recovery failed: {error:?}"));
+        assert!(
+            recovered.iter().any(|(recovered_id, revision)| {
+                *recovered_id == command_id && *revision == expected_revision
+            }),
+            "{label}: recovery lost command revision {expected_revision}"
+        );
+    }
+
+    async fn assert_live_recovery_rejected(store: &RuntimeStoreHandle, label: &str) {
+        let error = store
+            .begin_recovery_scan()
+            .await
+            .expect_err("tampered strict v1 recovery must fail closed");
+        assert_unknown_or_corrupt(error, &format!("{label}/live-recovery"));
+    }
+
+    fn assert_unknown_or_corrupt(error: RuntimeStoreError, label: &str) {
+        assert!(
+            matches!(error, RuntimeStoreError::UnknownOrCorruptSchema),
+            "{label} must return authenticated corruption, got {error:?}"
+        );
+    }
+
+    struct VerifiedV5TamperContext {
+        connection: Connection,
+        key_bundle: RuntimeKeyBundle,
+        database_id: [u8; 16],
+        ledger: RuntimeLedger,
+        ledger_token: Vec<u8>,
+    }
+
+    impl VerifiedV5TamperContext {
+        fn open(database: &Path, storage_kek: &StorageKek) -> Self {
+            let connection = Connection::open(database).expect("open strict v1 tamper connection");
+            connection
+                .pragma_update(None, "wal_autocheckpoint", 0_i64)
+                .expect("disable tamper connection WAL autocheckpoint");
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get::<_, i64>(0))
+                    .expect("read back tamper WAL autocheckpoint"),
+                0,
+                "tamper connection must not checkpoint before artifact capture"
+            );
+            connection
+                .pragma_update(None, "foreign_keys", true)
+                .expect("enable tamper connection foreign keys");
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                    .expect("read back tamper foreign keys"),
+                1
+            );
+
+            let meta = read_meta(&connection)
+                .expect("read migrated strict v1 v5 meta")
+                .expect("migrated strict v1 v5 meta exists");
+            assert_eq!(meta.version, RUNTIME_SCHEMA_VERSION);
+            let key_bundle = RuntimeKeyBundle::unwrap(
+                storage_kek,
+                &KeyWrapAad {
+                    schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
+                    schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
+                    database_id: &meta.database_id,
+                },
+                &meta.wrapped_key_bundle,
+            )
+            .expect("unwrap migrated strict v1 row keys");
+            assert_eq!(key_bundle.generation(), meta.key_generation);
+            let ledger = load_runtime_ledger(&connection, &key_bundle, meta.database_id)
+                .expect("authenticate existing migrated strict v1 ledger");
+            assert_eq!(ledger, meta.ledger);
+            let ledger_token = runtime_ledger_token(&key_bundle, meta.database_id, &ledger)
+                .expect("recompute existing migrated strict v1 ledger token");
+            assert_eq!(ledger_token.as_slice(), meta.metadata_token.as_slice());
+            assert_eq!(
+                super::super::command_configuration::validate_v5_integrity(
+                    &connection,
+                    &key_bundle,
+                    &ledger,
+                )
+                .expect("authenticate existing migrated strict v1 command pins"),
+                ledger.command_configuration_pin_count
+            );
+
+            Self {
+                connection,
+                key_bundle,
+                database_id: meta.database_id,
+                ledger,
+                ledger_token: meta.metadata_token,
+            }
+        }
+    }
+
+    fn update_resigned_pin_count(
+        transaction: &Transaction<'_>,
+        key_bundle: &RuntimeKeyBundle,
+        database_id: [u8; 16],
+        previous: &RuntimeLedger,
+        previous_token: &[u8],
+        next_pin_count: u64,
+    ) {
+        let mut next = previous.clone();
+        next.command_configuration_pin_count = next_pin_count;
+        let next_token = runtime_ledger_token(key_bundle, database_id, &next)
+            .expect("authenticate tampered strict v1 pin ledger");
+        assert_eq!(
+            transaction
+                .execute(
+                    "UPDATE runtime_meta
+                     SET command_configuration_pin_count = ?1, metadata_token = ?2
+                     WHERE singleton = 1
+                       AND command_configuration_pin_count = ?3
+                       AND metadata_token = ?4",
+                    params![
+                        i64::try_from(next_pin_count).expect("pin count fits SQLite integer"),
+                        &next_token[..],
+                        i64::try_from(previous.command_configuration_pin_count)
+                            .expect("previous pin count fits SQLite integer"),
+                        previous_token,
+                    ],
+                )
+                .expect("publish resigned strict v1 pin ledger"),
+            1
+        );
+    }
+
+    fn delete_fresh_pin_and_resign(
+        database: &Path,
+        storage_kek: &StorageKek,
+        conversation_id: RuntimeId,
+    ) {
+        let VerifiedV5TamperContext {
+            mut connection,
+            key_bundle,
+            database_id,
+            ledger,
+            ledger_token,
+        } = VerifiedV5TamperContext::open(database, storage_kek);
+        assert_eq!(ledger.command_configuration_pin_count, 1);
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin fresh pin deletion transaction");
+        assert_eq!(
+            transaction
+                .execute(
+                    "DELETE FROM command_configuration_pins
+                     WHERE conversation_id = ?1 AND command_seq = ?2",
+                    params![&conversation_id.as_bytes()[..], encode_sequence(1)],
+                )
+                .expect("delete fresh seq-one command pin"),
+            1
+        );
+        update_resigned_pin_count(
+            &transaction,
+            &key_bundle,
+            database_id,
+            &ledger,
+            &ledger_token,
+            0,
+        );
+        transaction
+            .commit()
+            .expect("commit fresh pin deletion tamper");
+    }
+
+    fn insert_cutoff_pin_and_resign(
+        database: &Path,
+        storage_kek: &StorageKek,
+        conversation_id: RuntimeId,
+    ) {
+        let VerifiedV5TamperContext {
+            mut connection,
+            key_bundle,
+            database_id,
+            ledger,
+            ledger_token,
+        } = VerifiedV5TamperContext::open(database, storage_kek);
+        assert_eq!(ledger.command_configuration_pin_count, 0);
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin cutoff pin insertion transaction");
+        super::super::command_configuration::insert_pin(
+            &transaction,
+            &key_bundle,
+            conversation_id,
+            0,
+            1,
+        )
+        .expect("insert MAC-valid cutoff pin with real configuration FK");
+        update_resigned_pin_count(
+            &transaction,
+            &key_bundle,
+            database_id,
+            &ledger,
+            &ledger_token,
+            1,
+        );
+        transaction
+            .commit()
+            .expect("commit cutoff pin insertion tamper");
+    }
+
+    fn diverge_resigned_pin_ledger(database: &Path, storage_kek: &StorageKek) {
+        let VerifiedV5TamperContext {
+            mut connection,
+            key_bundle,
+            database_id,
+            ledger,
+            ledger_token,
+        } = VerifiedV5TamperContext::open(database, storage_kek);
+        assert_eq!(ledger.command_configuration_pin_count, 0);
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin authenticated pin ledger divergence transaction");
+        update_resigned_pin_count(
+            &transaction,
+            &key_bundle,
+            database_id,
+            &ledger,
+            &ledger_token,
+            1,
+        );
+        transaction
+            .commit()
+            .expect("commit authenticated pin ledger divergence");
     }
 
     fn replace_first_descriptor_with_authenticated_bytes(
@@ -1367,6 +1860,128 @@ mod migration_tests {
             (0, 0),
             "strict v1 cutoff 内命令不得伪造 current revision pin"
         );
+    }
+
+    #[tokio::test]
+    async fn strict_v1_fresh_command_missing_pin_fails_local_and_global_reads() {
+        let fixture = MigratedStrictV1Fixture::create("fresh-command-missing-pin").await;
+        let conversation_id = fixture.legacy_accepted.conversation_id;
+        configure_source_conversation(fixture.store(), conversation_id, 0x51).await;
+        let fresh_owner = owner(0x52);
+        let fresh_idempotency_key = "strict-v1-fresh-seq-one".to_owned();
+        let fresh_command = match fixture
+            .store()
+            .accept_command(AcceptCommand {
+                conversation_id,
+                owner: fresh_owner.clone(),
+                idempotency_key: fresh_idempotency_key.clone(),
+                expected_configuration_revision: 1,
+                payload: b"strict v1 fresh command after cutoff".to_vec(),
+            })
+            .await
+            .expect("accept production fresh command after strict v1 cutoff")
+        {
+            AcceptOutcome::Accepted { command, .. } => command,
+            AcceptOutcome::Replayed { .. } => panic!("fresh seq-one command cannot replay"),
+        };
+        assert_eq!(fresh_command.command_seq, 1);
+        assert_eq!(fresh_command.configuration_revision, 1);
+        let fresh_identity = ReceiptIdentity {
+            conversation_id,
+            command_id: fresh_command.command_id,
+            owner: fresh_owner,
+            idempotency_key: fresh_idempotency_key,
+        };
+        assert_receipt_revision(fixture.store(), &fresh_identity, 1, "fresh pin baseline").await;
+        assert_recovery_revision(
+            fixture.store(),
+            fresh_identity.command_id,
+            1,
+            "fresh pin baseline",
+        )
+        .await;
+
+        let database = fixture.database();
+        let storage_kek = fixture.storage_kek();
+        delete_fresh_pin_and_resign(&database, &storage_kek, conversation_id);
+        let post_tamper = artifact_evidence(&database);
+        assert_receipts_rejected(fixture.store(), &fresh_identity, "fresh-pin-missing").await;
+        assert_live_recovery_rejected(fixture.store(), "fresh-pin-missing").await;
+        assert_main_and_wal_unchanged(
+            &post_tamper,
+            &artifact_evidence(&database),
+            "fresh-pin-missing live rejection",
+        );
+        fixture
+            .shutdown_and_assert_reopen_rejected("fresh-pin-missing")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn strict_v1_cutoff_command_rejects_authenticated_nonzero_pin() {
+        let fixture = MigratedStrictV1Fixture::create("cutoff-command-gains-pin").await;
+        let conversation_id = fixture.legacy_accepted.conversation_id;
+        configure_source_conversation(fixture.store(), conversation_id, 0x61).await;
+        assert_receipt_revision(
+            fixture.store(),
+            &fixture.legacy_accepted,
+            0,
+            "cutoff pin baseline",
+        )
+        .await;
+        assert_recovery_revision(
+            fixture.store(),
+            fixture.legacy_accepted.command_id,
+            0,
+            "cutoff pin baseline",
+        )
+        .await;
+
+        let database = fixture.database();
+        let storage_kek = fixture.storage_kek();
+        insert_cutoff_pin_and_resign(&database, &storage_kek, conversation_id);
+        let post_tamper = artifact_evidence(&database);
+        assert_receipts_rejected(
+            fixture.store(),
+            &fixture.legacy_accepted,
+            "cutoff-gains-pin",
+        )
+        .await;
+        assert_live_recovery_rejected(fixture.store(), "cutoff-gains-pin").await;
+        assert_main_and_wal_unchanged(
+            &post_tamper,
+            &artifact_evidence(&database),
+            "cutoff-gains-pin live rejection",
+        );
+        fixture
+            .shutdown_and_assert_reopen_rejected("cutoff-gains-pin")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn strict_v1_authenticated_pin_ledger_divergence_stays_local_then_fails_global_audit() {
+        let fixture = MigratedStrictV1Fixture::create("pin-ledger-divergence").await;
+        let database = fixture.database();
+        let storage_kek = fixture.storage_kek();
+        diverge_resigned_pin_ledger(&database, &storage_kek);
+        let post_tamper = artifact_evidence(&database);
+
+        assert_receipt_revision(
+            fixture.store(),
+            &fixture.legacy_accepted,
+            0,
+            "authenticated pin ledger divergence remains row-local",
+        )
+        .await;
+        assert_live_recovery_rejected(fixture.store(), "pin-ledger-divergence").await;
+        assert_main_and_wal_unchanged(
+            &post_tamper,
+            &artifact_evidence(&database),
+            "pin-ledger-divergence live rejection",
+        );
+        fixture
+            .shutdown_and_assert_reopen_rejected("pin-ledger-divergence")
+            .await;
     }
 
     #[tokio::test]
