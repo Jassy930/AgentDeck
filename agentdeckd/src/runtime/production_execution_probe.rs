@@ -14,11 +14,14 @@ use std::time::Duration;
 
 use agentdeck_protocol::runtime::identity::{ConversationId, TurnId};
 use agentdeck_protocol::runtime::{
-    CancellationReceipt, RuntimeEventBody, RuntimeReply, RuntimeRequest,
+    CancellationReceipt, CodexConversationConfiguration, ConfigurationError,
+    ConversationConfiguration, RuntimeEventBody, RuntimeReply, RuntimeRequest,
+    VendorConfigurationSnapshot,
 };
 use agentdeck_protocol::{
-    ActionDecision, AgentItem, AgentItemMeta, AgentKind, ProtocolError, SessionCapabilities,
-    SessionId, SessionStart, ThreadId, TurnSummary, VendorCapabilities, VendorControlPayload,
+    ActionDecision, AgentItem, AgentItemMeta, AgentKind, CodexApprovalPolicy, CodexReasoningEffort,
+    CodexSandboxMode, ProtocolError, SessionCapabilities, SessionId, SessionStart, ThreadId,
+    TurnSummary, VendorCapabilities, VendorControlPayload,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -602,6 +605,16 @@ impl Agent for ProbeAgent {
             features: Default::default(),
             vendor: VendorCapabilities::Codex(Default::default()),
         }
+    }
+
+    fn default_configuration(&self) -> Result<ConversationConfiguration, ConfigurationError> {
+        Ok(ConversationConfiguration::new(
+            VendorConfigurationSnapshot::Codex(CodexConversationConfiguration::new(
+                CodexApprovalPolicy::OnRequest,
+                CodexSandboxMode::WorkspaceWrite,
+                CodexReasoningEffort::Medium,
+            )),
+        ))
     }
 
     async fn prepare_adapter_turn(

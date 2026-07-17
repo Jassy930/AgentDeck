@@ -2,6 +2,10 @@
 //! Send+Sync+'static or removes a required method, this file fails to
 //! compile, breaking the build.
 
+use agentdeck_protocol::runtime::{
+    CodexConversationConfiguration, ConfigurationError, ConversationConfiguration,
+    VendorConfigurationSnapshot,
+};
 use agentdeck_protocol::*;
 use agentdeckd::agent::{Agent, AgentEventSender, AgentSessionHandle, PreparedAgentTurn};
 
@@ -14,6 +18,13 @@ fn assert_send_sync_static<T: Agent>() {
 #[allow(dead_code)]
 fn capability_signature_present(a: &dyn Agent) -> SessionCapabilities {
     a.capabilities()
+}
+
+#[allow(dead_code)]
+fn default_configuration_signature_present(
+    a: &dyn Agent,
+) -> Result<ConversationConfiguration, ConfigurationError> {
+    a.default_configuration()
 }
 
 #[allow(dead_code)]
@@ -39,6 +50,15 @@ impl Agent for DefaultHistoryStub {
             features: Default::default(),
             vendor: VendorCapabilities::Codex(Default::default()),
         }
+    }
+    fn default_configuration(&self) -> Result<ConversationConfiguration, ConfigurationError> {
+        Ok(ConversationConfiguration::new(
+            VendorConfigurationSnapshot::Codex(CodexConversationConfiguration::new(
+                CodexApprovalPolicy::OnRequest,
+                CodexSandboxMode::WorkspaceWrite,
+                CodexReasoningEffort::Medium,
+            )),
+        ))
     }
     async fn start_session(
         &self,

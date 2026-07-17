@@ -5,16 +5,34 @@ use agentdeck_protocol::runtime::identity::{
     CatalogPageCursor, ConversationId as WireConversationId, EntityId, ItemId, MessageId,
 };
 use agentdeck_protocol::runtime::{
-    BackfillRequest, ConversationSnapshot, MAX_JSON_PART_BYTES, MAX_RUNTIME_JSON_FRAME_BYTES,
-    RuntimeStreamItem, RuntimeSubscriptionTarget, SnapshotItem, StreamCursor,
+    BackfillChunk, BackfillRequest, ConversationSnapshot, MAX_JSON_PART_BYTES,
+    MAX_RUNTIME_JSON_FRAME_BYTES, RuntimeInnerCursor, RuntimeStreamItem, RuntimeSubscriptionTarget,
+    SnapshotItem, StreamCursor,
 };
 use agentdeck_protocol::{AgentItem, AgentItemMeta};
 use tokio::time::{Duration, timeout};
 
 use crate::runtime::store::{
     AuthorizeExecutionRelease, ExecutionFence, RuntimeBackfillPlan, RuntimeBackfillTarget,
-    RuntimeStoreError, RuntimeStoreLane,
+    RuntimeStoreError, RuntimeStoreFaultInjector, RuntimeStoreLane, RuntimeStoreOperation,
 };
+
+struct FailConfigureAfterCommitOnce {
+    armed: AtomicBool,
+}
+
+impl RuntimeStoreFaultInjector for FailConfigureAfterCommitOnce {
+    fn before_operation(&self, operation: RuntimeStoreOperation) -> Result<(), RuntimeStoreError> {
+        if operation == RuntimeStoreOperation::ConfigureConversationAfterCommit
+            && self.armed.swap(false, Ordering::SeqCst)
+        {
+            return Err(RuntimeStoreError::InvalidConfig(
+                "injected Configure after-COMMIT fault",
+            ));
+        }
+        Ok(())
+    }
+}
 
 async fn connect_recording(
     core: &RuntimeCore,
@@ -97,7 +115,7 @@ async fn store_ready_snapshot_with_text_bytes(
         .acquire_snapshot_build_source(conversation_id)
         .await
         .expect("capture large snapshot source");
-    let materializer = SnapshotMaterializer::new(core.store.clone(), core._router.clone());
+    let materializer = SnapshotMaterializer::new(core.store.clone(), core.router.clone());
     let SnapshotMaterialization::Build(mut build) = materializer
         .materialize(source)
         .await
@@ -302,6 +320,21 @@ fn decode(write: &crate::runtime::ConnectionWrite) -> RuntimeEnvelope {
     serde_json::from_slice(write.bytes()).expect("decode runtime writer envelope")
 }
 
+async fn receive_envelope_and_ack(
+    receiver: &mut mpsc::Receiver<crate::runtime::ConnectionWrite>,
+    label: &str,
+) -> RuntimeEnvelope {
+    let write = timeout(Duration::from_secs(2), receiver.recv())
+        .await
+        .unwrap_or_else(|_| panic!("{label} timeout"))
+        .unwrap_or_else(|| panic!("{label} writer closed"));
+    let envelope = decode(&write);
+    write
+        .acknowledge()
+        .unwrap_or_else(|_| panic!("flush {label}"));
+    envelope
+}
+
 fn catalog_conversation(seed: u8) -> NewConversation {
     NewConversation {
         conversation_id: RuntimeId::from_bytes(RuntimeIdKind::Conversation, [seed; 16])
@@ -416,6 +449,409 @@ async fn fresh_catalog_subscribe_delivers_snapshot_before_sync_complete() {
 
     core.disconnect(connection).await;
     core.shutdown().await.expect("shutdown core");
+}
+
+#[tokio::test]
+async fn configure_applied_replay_and_conflict_have_exact_stream_effects() {
+    // 威胁场景：Core 若自行广播 Configure，或 Store 把 Configure 当 catalog mutation，
+    // exact replay/conflict 会制造重复 conversation event 或无关 CatalogDelta。
+    let root = TestRoot::new("configure-exact-stream-effects");
+    let core = core(&root).await;
+    core.recover().await.expect("recover Configure stream core");
+    let (conversation_connection, mut conversation_receiver) = connect_recording(&core, 0x90).await;
+    let conversation = start_receipt(
+        core.handle(
+            conversation_connection,
+            start_request("configure-stream-start"),
+        )
+        .await,
+    );
+    let conversation_id =
+        parse_conversation_id(&conversation.conversation_id).expect("parse stream conversation");
+
+    core.handle_envelope(
+        conversation_connection,
+        subscribe_conversation_envelope("configure-conversation-live", conversation_id),
+    )
+    .await
+    .expect("subscribe Configure conversation");
+    assert!(matches!(
+        receive_envelope_and_ack(
+            &mut conversation_receiver,
+            "conversation subscription receipt"
+        )
+        .await
+        .body,
+        RuntimeMessage::Reply(RuntimeReply::Subscription(
+            SubscriptionReceipt::Subscribed { .. }
+        ))
+    ));
+    let initial_snapshot =
+        receive_envelope_and_ack(&mut conversation_receiver, "conversation initial snapshot").await;
+    assert!(matches!(
+        initial_snapshot.body,
+        RuntimeMessage::Reply(RuntimeReply::Snapshot(snapshot))
+            if snapshot.base_event_cursor == StreamCursor::BeforeFirst
+                && snapshot.configuration_state.configuration_revision() == 0
+                && snapshot.configuration_state.configuration().is_none()
+    ));
+    assert!(matches!(
+        receive_envelope_and_ack(&mut conversation_receiver, "conversation initial sync")
+            .await
+            .body,
+        RuntimeMessage::Reply(RuntimeReply::SyncComplete(sync))
+            if sync.inner_cursor == RuntimeInnerCursor::Conversation {
+                conversation_id: conversation.conversation_id.clone(),
+                cursor: StreamCursor::BeforeFirst,
+            }
+    ));
+
+    let (catalog_connection, mut catalog_receiver) = connect_recording(&core, 0x91).await;
+    core.handle_envelope(
+        catalog_connection,
+        subscribe_catalog_envelope("configure-catalog-live"),
+    )
+    .await
+    .expect("subscribe Configure catalog");
+    assert!(matches!(
+        receive_envelope_and_ack(&mut catalog_receiver, "catalog subscription receipt")
+            .await
+            .body,
+        RuntimeMessage::Reply(RuntimeReply::Subscription(
+            SubscriptionReceipt::Subscribed { .. }
+        ))
+    ));
+    assert!(matches!(
+        receive_envelope_and_ack(&mut catalog_receiver, "catalog initial snapshot")
+            .await
+            .body,
+        RuntimeMessage::Reply(RuntimeReply::Catalog(snapshot))
+            if snapshot.entries().len() == 1
+    ));
+    assert!(matches!(
+        receive_envelope_and_ack(&mut catalog_receiver, "catalog initial sync")
+            .await
+            .body,
+        RuntimeMessage::Reply(RuntimeReply::SyncComplete(_))
+    ));
+
+    let configuration = codex_configuration(CodexReasoningEffort::High);
+    let exact_request = ConfigureConversationRequest::new(
+        conversation.conversation_id.clone(),
+        IdempotencyKey::new("configure-stream-exact"),
+        0,
+        configuration.clone(),
+    );
+    assert!(matches!(
+        core.handle(
+            conversation_connection,
+            RuntimeRequest::ConfigureConversation(exact_request.clone()),
+        )
+        .await,
+        RuntimeReply::Configuration(ConfigurationReceipt::Applied {
+            configuration_revision: 1,
+            ..
+        })
+    ));
+    let live =
+        receive_envelope_and_ack(&mut conversation_receiver, "configuration live event").await;
+    let RuntimeMessage::Stream(RuntimeStreamItem::Event(event)) = live.body else {
+        panic!("Configure Applied must emit one conversation event")
+    };
+    assert_eq!(event.conversation_id, conversation.conversation_id);
+    assert_eq!(event.event_seq, 0);
+    assert!(event.command_id.is_none());
+    assert!(event.item_id.is_none());
+    assert!(event.entity_id.is_none());
+    let RuntimeEventBody::ConfigurationChanged { state } = event.body else {
+        panic!("Configure event must be ConfigurationChanged")
+    };
+    assert_eq!(state.configuration_revision(), 1);
+    assert_eq!(state.configuration(), Some(&configuration));
+    assert!(
+        timeout(Duration::from_millis(100), conversation_receiver.recv())
+            .await
+            .is_err(),
+        "Applied emitted more than one conversation event"
+    );
+    assert!(
+        timeout(Duration::from_millis(100), catalog_receiver.recv())
+            .await
+            .is_err(),
+        "Configure changed the catalog stream"
+    );
+
+    assert!(matches!(
+        core.handle(
+            conversation_connection,
+            RuntimeRequest::ConfigureConversation(exact_request),
+        )
+        .await,
+        RuntimeReply::Configuration(ConfigurationReceipt::Replayed {
+            configuration_revision: 1,
+            ..
+        })
+    ));
+    assert!(matches!(
+        core.handle(
+            conversation_connection,
+            RuntimeRequest::ConfigureConversation(ConfigureConversationRequest::new(
+                conversation.conversation_id,
+                IdempotencyKey::new("configure-stream-conflict"),
+                0,
+                codex_configuration(CodexReasoningEffort::Low),
+            )),
+        )
+        .await,
+        RuntimeReply::Configuration(ConfigurationReceipt::Conflict {
+            current_configuration_revision: 1,
+            ..
+        })
+    ));
+    assert!(
+        timeout(Duration::from_millis(100), conversation_receiver.recv())
+            .await
+            .is_err(),
+        "replay or conflict emitted a conversation event"
+    );
+    assert!(
+        timeout(Duration::from_millis(100), catalog_receiver.recv())
+            .await
+            .is_err(),
+        "replay or conflict emitted a CatalogDelta"
+    );
+
+    core.disconnect(conversation_connection).await;
+    core.disconnect(catalog_connection).await;
+    core.shutdown()
+        .await
+        .expect("shutdown Configure stream core");
+}
+
+#[tokio::test]
+async fn reconnect_uses_frozen_snapshot_then_configuration_backfill() {
+    // 威胁场景：重连若用 current configuration 覆盖旧 snapshot，客户端随后再应用
+    // ConfigurationChanged backfill 会重复或跳过 revision，失去 cursor 一致性。
+    let root = TestRoot::new("configure-reconnect-snapshot-backfill");
+    let core = core(&root).await;
+    core.recover().await.expect("recover reconnect core");
+    let (initial_connection, mut initial_receiver) = connect_recording(&core, 0x92).await;
+    let conversation = start_receipt(
+        core.handle(
+            initial_connection,
+            start_request("configure-reconnect-start"),
+        )
+        .await,
+    );
+    let conversation_id =
+        parse_conversation_id(&conversation.conversation_id).expect("parse reconnect conversation");
+    core.handle_envelope(
+        initial_connection,
+        subscribe_conversation_envelope("configure-reconnect-baseline", conversation_id),
+    )
+    .await
+    .expect("subscribe reconnect baseline");
+    assert!(matches!(
+        receive_envelope_and_ack(&mut initial_receiver, "baseline subscription receipt")
+            .await
+            .body,
+        RuntimeMessage::Reply(RuntimeReply::Subscription(
+            SubscriptionReceipt::Subscribed { .. }
+        ))
+    ));
+    assert!(matches!(
+        receive_envelope_and_ack(&mut initial_receiver, "baseline snapshot")
+            .await
+            .body,
+        RuntimeMessage::Reply(RuntimeReply::Snapshot(snapshot))
+            if snapshot.base_event_cursor == StreamCursor::BeforeFirst
+                && snapshot.configuration_state.configuration_revision() == 0
+                && snapshot.configuration_state.configuration().is_none()
+    ));
+    assert!(matches!(
+        receive_envelope_and_ack(&mut initial_receiver, "baseline sync")
+            .await
+            .body,
+        RuntimeMessage::Reply(RuntimeReply::SyncComplete(_))
+    ));
+    core.disconnect(initial_connection).await;
+
+    let configuration_connection = connect_local(&core, 0x93).await;
+    assert!(matches!(
+        core.handle(
+            configuration_connection,
+            RuntimeRequest::ConfigureConversation(ConfigureConversationRequest::new(
+                conversation.conversation_id.clone(),
+                IdempotencyKey::new("configure-reconnect-rev1"),
+                0,
+                codex_configuration(CodexReasoningEffort::High),
+            )),
+        )
+        .await,
+        RuntimeReply::Configuration(ConfigurationReceipt::Applied {
+            configuration_revision: 1,
+            ..
+        })
+    ));
+
+    let (reconnect, mut reconnect_receiver) = connect_recording(&core, 0x94).await;
+    core.handle_envelope(
+        reconnect,
+        subscribe_conversation_envelope("configure-reconnect-current", conversation_id),
+    )
+    .await
+    .expect("subscribe after offline Configure");
+    assert!(matches!(
+        receive_envelope_and_ack(&mut reconnect_receiver, "reconnect subscription receipt")
+            .await
+            .body,
+        RuntimeMessage::Reply(RuntimeReply::Subscription(
+            SubscriptionReceipt::Subscribed { .. }
+        ))
+    ));
+    assert!(matches!(
+        receive_envelope_and_ack(&mut reconnect_receiver, "reconnect frozen snapshot")
+            .await
+            .body,
+        RuntimeMessage::Reply(RuntimeReply::Snapshot(snapshot))
+            if snapshot.base_event_cursor == StreamCursor::BeforeFirst
+                && snapshot.configuration_state.configuration_revision() == 0
+                && snapshot.configuration_state.configuration().is_none()
+    ));
+    let backfill = receive_envelope_and_ack(&mut reconnect_receiver, "reconnect backfill").await;
+    let RuntimeMessage::Reply(RuntimeReply::Backfill(BackfillChunk::Conversation {
+        conversation_id: backfill_conversation,
+        range,
+        events,
+        ..
+    })) = backfill.body
+    else {
+        panic!("reconnect must backfill ConfigurationChanged after the frozen snapshot")
+    };
+    assert_eq!(backfill_conversation, conversation.conversation_id);
+    assert_eq!(range.after(), StreamCursor::BeforeFirst);
+    assert_eq!(range.through(), StreamCursor::At(0));
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_seq, 0);
+    assert_eq!(events[0].conversation_id, conversation.conversation_id);
+    assert!(matches!(
+        &events[0].body,
+        RuntimeEventBody::ConfigurationChanged { state }
+            if state.configuration_revision() == 1
+                && state.configuration().is_some()
+    ));
+    let sync = receive_envelope_and_ack(&mut reconnect_receiver, "reconnect sync").await;
+    assert!(matches!(
+        sync.body,
+        RuntimeMessage::Reply(RuntimeReply::SyncComplete(sync))
+            if sync.inner_cursor == RuntimeInnerCursor::Conversation {
+                conversation_id: conversation.conversation_id.clone(),
+                cursor: StreamCursor::At(0),
+            }
+    ));
+
+    core.disconnect(configuration_connection).await;
+    core.disconnect(reconnect).await;
+    core.shutdown().await.expect("shutdown reconnect core");
+}
+
+#[tokio::test]
+async fn configure_after_commit_unknown_notifies_once_and_exact_retry_replays() {
+    // 威胁场景：COMMIT 成功但 reply 变成 unknown 时，通知若依赖成功返回会丢事件；
+    // 若 retry 再广播，则客户端会看到同一 durable revision 两次。
+    let root = TestRoot::new("configure-after-commit-unknown-stream");
+    let store = RuntimeStoreHandle::open(
+        crate::runtime::store::RuntimeStoreConfig::new(root.path.join("runtime.db"))
+            .with_command_capacity(1_024)
+            .with_fault_injector(Arc::new(FailConfigureAfterCommitOnce {
+                armed: AtomicBool::new(true),
+            })),
+        root.kek(),
+    )
+    .await
+    .expect("open after-COMMIT unknown store");
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let core = Arc::new(RuntimeCore::new(store, router, [0xA7; 32]).expect("construct core"));
+    core.recover()
+        .await
+        .expect("recover after-COMMIT unknown core");
+    let (connection, mut receiver) = connect_recording(&core, 0x95).await;
+    let conversation = start_receipt(
+        core.handle(connection, start_request("configure-unknown-start"))
+            .await,
+    );
+    let conversation_id = parse_conversation_id(&conversation.conversation_id)
+        .expect("parse unknown-outcome conversation");
+    core.handle_envelope(
+        connection,
+        subscribe_conversation_envelope("configure-unknown-live", conversation_id),
+    )
+    .await
+    .expect("subscribe before unknown Configure");
+    for label in [
+        "unknown subscription receipt",
+        "unknown snapshot",
+        "unknown sync",
+    ] {
+        receive_envelope_and_ack(&mut receiver, label).await;
+    }
+
+    let request = ConfigureConversationRequest::new(
+        conversation.conversation_id.clone(),
+        IdempotencyKey::new("configure-unknown-exact"),
+        0,
+        codex_configuration(CodexReasoningEffort::Medium),
+    );
+    assert!(matches!(
+        core.handle(
+            connection,
+            RuntimeRequest::ConfigureConversation(request.clone()),
+        )
+        .await,
+        RuntimeReply::Configuration(ConfigurationReceipt::Failed {
+            failure: RuntimeFailure { code, .. }
+        }) if code == "daemon.runtime.store_unavailable"
+    ));
+    let live = receive_envelope_and_ack(&mut receiver, "unknown committed event").await;
+    assert!(matches!(
+        live.body,
+        RuntimeMessage::Stream(RuntimeStreamItem::Event(RuntimeEvent {
+            event_seq: 0,
+            body: RuntimeEventBody::ConfigurationChanged { ref state },
+            ..
+        })) if state.configuration_revision() == 1
+    ));
+    assert!(
+        timeout(Duration::from_millis(100), receiver.recv())
+            .await
+            .is_err(),
+        "after-COMMIT unknown emitted duplicate live events"
+    );
+    assert!(matches!(
+        core.handle(connection, RuntimeRequest::ConfigureConversation(request),)
+            .await,
+        RuntimeReply::Configuration(ConfigurationReceipt::Replayed {
+            configuration_revision: 1,
+            ..
+        })
+    ));
+    assert!(
+        timeout(Duration::from_millis(100), receiver.recv())
+            .await
+            .is_err(),
+        "exact retry emitted a second ConfigurationChanged"
+    );
+    let durable = core
+        .store
+        .load_configuration_state_at_event_cursor(conversation_id, Some(0))
+        .await
+        .expect("read durable unknown-outcome configuration");
+    assert_eq!(durable.configuration_revision(), 1);
+
+    core.disconnect(connection).await;
+    core.shutdown()
+        .await
+        .expect("shutdown after-COMMIT unknown core");
 }
 
 #[tokio::test]
@@ -1500,7 +1936,7 @@ async fn failure_after_flushed_snapshot_fail_closes_the_connection() {
         .acquire_snapshot_build_source(conversation_id)
         .await
         .expect("capture empty snapshot base");
-    let materializer = SnapshotMaterializer::new(core.store.clone(), core._router.clone());
+    let materializer = SnapshotMaterializer::new(core.store.clone(), core.router.clone());
     let SnapshotMaterialization::Build(mut build) = materializer
         .materialize(source)
         .await

@@ -16,6 +16,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::runtime::adapter_state::AdapterStateNamespace;
 use crate::runtime::backfill::{BarrierInput, plan_barrier};
+use crate::runtime::connection::AuthorizationGuard;
 use crate::runtime::events::{
     CatalogSnapshotSource, CommandStreamEffects, RegisterCaptureError, RegisterStreamBarrier,
     RelayCommittedCut, RuntimeStreamTarget, SnapshotBarrierSource, SnapshotBuildPinCleanup,
@@ -513,6 +514,25 @@ impl RuntimeStoreHandle {
         &self,
         input: ConfigureConversation,
     ) -> Result<ConfigureConversationOutcome, RuntimeStoreError> {
+        self.configure_conversation_inner(input, None).await
+    }
+
+    /// 威胁场景：transport caller 在已入队的 Configure COMMIT 前被取消时，
+    /// caller 栈上的授权会提前释放，使 revoke 与 durable mutation 失去顺序保证。
+    pub(crate) async fn configure_conversation_authorized(
+        &self,
+        input: ConfigureConversation,
+        authorization: AuthorizationGuard,
+    ) -> Result<ConfigureConversationOutcome, RuntimeStoreError> {
+        self.configure_conversation_inner(input, Some(authorization))
+            .await
+    }
+
+    async fn configure_conversation_inner(
+        &self,
+        input: ConfigureConversation,
+        authorization: Option<AuthorizationGuard>,
+    ) -> Result<ConfigureConversationOutcome, RuntimeStoreError> {
         let prepared = configuration::prepare_configuration_request(input)?;
         let charge = memory_charge(size_of::<NormalCommand>(), &[prepared.retained_capacity()?])?;
         dispatch_with_budget(
@@ -521,7 +541,11 @@ impl RuntimeStoreHandle {
             &self.lifecycle,
             RuntimeStoreLane::Normal,
             charge,
-            |reply| NormalCommand::ConfigureConversation { prepared, reply },
+            |reply| NormalCommand::ConfigureConversation {
+                prepared,
+                authorization,
+                reply,
+            },
         )
         .await?
     }
@@ -1203,6 +1227,7 @@ enum NormalCommand {
     },
     ConfigureConversation {
         prepared: PreparedConfigurationRequest,
+        authorization: Option<AuthorizationGuard>,
         reply: oneshot::Sender<Result<ConfigureConversationOutcome, RuntimeStoreError>>,
     },
     AcceptCommand {
@@ -1653,8 +1678,13 @@ fn handle_normal(
             NormalCommand::CreateConversation { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
-            NormalCommand::ConfigureConversation { reply, .. } => {
+            NormalCommand::ConfigureConversation {
+                authorization,
+                reply,
+                ..
+            } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+                drop(authorization);
             }
             NormalCommand::AcceptCommand { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
@@ -1727,12 +1757,17 @@ fn handle_normal(
             let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
             let _ = reply.send(result);
         }
-        NormalCommand::ConfigureConversation { prepared, reply } => {
+        NormalCommand::ConfigureConversation {
+            prepared,
+            authorization,
+            reply,
+        } => {
             let mut effects = CommandStreamEffects::default();
             let result =
                 configuration::configure_conversation(state, config, prepared, &mut effects);
             let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
             let _ = reply.send(result);
+            drop(authorization);
         }
         NormalCommand::AcceptCommand { input, reply } => {
             let mut effects = CommandStreamEffects::default();

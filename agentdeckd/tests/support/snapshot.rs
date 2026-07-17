@@ -2,10 +2,14 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agentdeck_protocol::runtime::SnapshotItem;
+use agentdeck_protocol::runtime::{
+    CodexConversationConfiguration, ConfigurationError, ConversationConfiguration, SnapshotItem,
+    VendorConfigurationSnapshot,
+};
 use agentdeck_protocol::{
-    ActionDecision, AgentKind, ProtocolError, SessionCapabilities, SessionId, SessionStart,
-    ThreadId, VendorCapabilities, VendorControlPayload,
+    ActionDecision, AgentKind, CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode,
+    ProtocolError, SessionCapabilities, SessionId, SessionStart, ThreadId, VendorCapabilities,
+    VendorControlPayload,
 };
 use agentdeckd::agent::{Agent, AgentEventSender, AgentSessionHandle};
 use agentdeckd::runtime::AgentRouter;
@@ -36,6 +40,16 @@ impl Agent for SnapshotStubAgent {
             features: BTreeSet::new(),
             vendor: VendorCapabilities::Codex(Default::default()),
         }
+    }
+
+    fn default_configuration(&self) -> Result<ConversationConfiguration, ConfigurationError> {
+        Ok(ConversationConfiguration::new(
+            VendorConfigurationSnapshot::Codex(CodexConversationConfiguration::new(
+                CodexApprovalPolicy::OnRequest,
+                CodexSandboxMode::WorkspaceWrite,
+                CodexReasoningEffort::Medium,
+            )),
+        ))
     }
 
     async fn start_session(

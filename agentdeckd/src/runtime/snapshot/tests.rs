@@ -7,8 +7,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use agentdeck_protocol::runtime::configuration::MAX_CONFIGURATION_TEXT_BYTES;
 use agentdeck_protocol::runtime::identity::{CommandId, ConversationId, EntityId, ItemId};
 use agentdeck_protocol::runtime::{
-    ClaudeCodeConversationConfiguration, CodexConversationConfiguration, ConversationConfiguration,
-    ConversationSnapshot, SnapshotItem, StreamCursor, VendorConfigurationSnapshot,
+    ClaudeCodeConversationConfiguration, CodexConversationConfiguration, ConfigurationError,
+    ConversationConfiguration, ConversationSnapshot, SnapshotItem, StreamCursor,
+    VendorConfigurationSnapshot,
 };
 use agentdeck_protocol::{
     ActionDecision, AgentItem, AgentItemMeta, AgentKind, ClaudeCodePermissionMode,
@@ -43,6 +44,16 @@ impl Agent for SnapshotTestAgent {
 
     fn capabilities(&self) -> SessionCapabilities {
         capabilities(AgentKind::Codex)
+    }
+
+    fn default_configuration(&self) -> Result<ConversationConfiguration, ConfigurationError> {
+        Ok(ConversationConfiguration::new(
+            VendorConfigurationSnapshot::Codex(CodexConversationConfiguration::new(
+                CodexApprovalPolicy::OnRequest,
+                CodexSandboxMode::WorkspaceWrite,
+                CodexReasoningEffort::Medium,
+            )),
+        ))
     }
 
     async fn start_session(

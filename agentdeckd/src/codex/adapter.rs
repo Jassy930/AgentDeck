@@ -43,6 +43,10 @@ use crate::codex::driver::CodexPreparedTurn;
 use crate::codex::state::CodexStateRepository;
 use crate::codex::translate::CodexTranslator;
 use crate::runtime::store::{CodexAdapterStateVault, RuntimeId, RuntimeIdKind, RuntimeStoreError};
+use agentdeck_protocol::runtime::{
+    CodexConversationConfiguration, ConfigurationError, ConversationConfiguration,
+    VendorConfigurationSnapshot,
+};
 use agentdeck_protocol::{
     ActionDecision, ActionDecisionKind, AgentItem, AgentKind, CodexApprovalPolicy,
     CodexReasoningEffort, CodexSandboxMode, CodexSessionOptions, HistoryRequest, HistoryResponse,
@@ -758,6 +762,16 @@ impl Agent for CodexAdapter {
 
     fn capabilities(&self) -> SessionCapabilities {
         self.capabilities_for_v2()
+    }
+
+    fn default_configuration(&self) -> Result<ConversationConfiguration, ConfigurationError> {
+        Ok(ConversationConfiguration::new(
+            VendorConfigurationSnapshot::Codex(CodexConversationConfiguration::new(
+                CodexApprovalPolicy::OnRequest,
+                CodexSandboxMode::WorkspaceWrite,
+                CodexReasoningEffort::Medium,
+            )),
+        ))
     }
 
     async fn prepare_adapter_turn(

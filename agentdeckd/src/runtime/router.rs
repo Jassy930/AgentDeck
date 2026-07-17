@@ -9,6 +9,7 @@ use crate::agent::{
     CanonicalAgentEventSender, CanonicalAgentSessionHandle, CanonicalHistoryRead, DynAgent,
     PreparedAgentTurnHandle, prepare_turn as prepare_agent_turn,
 };
+use agentdeck_protocol::runtime::{AgentDescription, AgentDescriptions, ConfigurationError};
 use agentdeck_protocol::{
     ActionDecision, AgentKind, HistoryRequest, HistoryResponse, ProtocolError, SessionCapabilities,
     SessionId, SessionStart, ThreadId, VendorControlPayload, effective_history_list_limit,
@@ -62,6 +63,26 @@ impl AgentRouter {
 
     pub fn capabilities(&self, kind: AgentKind) -> Option<SessionCapabilities> {
         self.agents.get(&kind).map(|a| a.capabilities())
+    }
+
+    /// 为 Runtime `DescribeAgents` 构造稳定排序的完整描述。
+    ///
+    /// `agents` 使用 `BTreeMap<AgentKind, _>`，因此输出顺序不依赖注册顺序。
+    /// 任一 adapter 返回错误、capabilities/default kind 不匹配或 vendor block
+    /// 不匹配时，整批构造直接失败；禁止 panic 或静默过滤畸形 adapter。
+    pub fn agent_descriptions(&self) -> Result<AgentDescriptions, ConfigurationError> {
+        let descriptions = self
+            .agents
+            .iter()
+            .map(|(agent_kind, agent)| {
+                AgentDescription::new(
+                    *agent_kind,
+                    agent.capabilities(),
+                    agent.default_configuration()?,
+                )
+            })
+            .collect::<Result<Vec<_>, ConfigurationError>>()?;
+        AgentDescriptions::new(descriptions)
     }
 
     /// Canonical production cold-prepare route. This method only selects the typed
@@ -347,7 +368,13 @@ mod typed_prepare_tests {
     use crate::agent::{
         AdapterStateHandle, Agent, AgentTurnRequest, ExecSpec, ExecutionId, PreparedAgentTurn,
     };
-    use agentdeck_protocol::runtime::PromptPayload;
+    use agentdeck_protocol::runtime::{
+        ClaudeCodeConversationConfiguration, CodexConversationConfiguration,
+        ConversationConfiguration, PromptPayload, VendorConfigurationSnapshot,
+    };
+    use agentdeck_protocol::{
+        ClaudeCodePermissionMode, CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode,
+    };
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -375,6 +402,26 @@ mod typed_prepare_tests {
 
         fn capabilities(&self) -> SessionCapabilities {
             unreachable!("typed prepare route does not probe capabilities")
+        }
+
+        fn default_configuration(&self) -> Result<ConversationConfiguration, ConfigurationError> {
+            match self.kind {
+                AgentKind::Codex => Ok(ConversationConfiguration::new(
+                    VendorConfigurationSnapshot::Codex(CodexConversationConfiguration::new(
+                        CodexApprovalPolicy::OnRequest,
+                        CodexSandboxMode::WorkspaceWrite,
+                        CodexReasoningEffort::Medium,
+                    )),
+                )),
+                AgentKind::ClaudeCode => ClaudeCodeConversationConfiguration::new(
+                    ClaudeCodePermissionMode::Default,
+                    None,
+                    None,
+                    None,
+                )
+                .map(VendorConfigurationSnapshot::ClaudeCode)
+                .map(ConversationConfiguration::new),
+            }
         }
 
         async fn prepare_adapter_turn(

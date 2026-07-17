@@ -6,13 +6,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use agentdeck_protocol::runtime::identity::{CommandId, ConversationId, EntityId, ItemId};
 use agentdeck_protocol::runtime::{
-    CodexConversationConfiguration, ConversationConfiguration, ConversationSnapshot, SnapshotItem,
-    StreamCursor, VendorConfigurationSnapshot,
+    ClaudeCodeConversationConfiguration, CodexConversationConfiguration, ConfigurationError,
+    ConversationConfiguration, ConversationSnapshot, SnapshotItem, StreamCursor,
+    VendorConfigurationSnapshot,
 };
 use agentdeck_protocol::{
-    ActionDecision, AgentItem, AgentItemMeta, AgentKind, CodexApprovalPolicy, CodexReasoningEffort,
-    CodexSandboxMode, ProtocolError, SessionCapabilities, SessionId, SessionStart, ThreadId,
-    VendorCapabilities, VendorControlPayload,
+    ActionDecision, AgentItem, AgentItemMeta, AgentKind, ClaudeCodePermissionMode,
+    CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode, ProtocolError,
+    SessionCapabilities, SessionId, SessionStart, ThreadId, VendorCapabilities,
+    VendorControlPayload,
 };
 use agentdeckd::agent::{Agent, AgentEventSender, AgentSessionHandle};
 use agentdeckd::runtime::AgentRouter;
@@ -113,6 +115,20 @@ impl Agent for StubAgent {
 
     fn capabilities(&self) -> SessionCapabilities {
         capabilities(self.capability_kind)
+    }
+
+    fn default_configuration(&self) -> Result<ConversationConfiguration, ConfigurationError> {
+        match self.registered_kind {
+            AgentKind::Codex => Ok(codex_configuration(CodexReasoningEffort::Medium)),
+            AgentKind::ClaudeCode => ClaudeCodeConversationConfiguration::new(
+                ClaudeCodePermissionMode::Default,
+                None,
+                None,
+                None,
+            )
+            .map(VendorConfigurationSnapshot::ClaudeCode)
+            .map(ConversationConfiguration::new),
+        }
     }
 
     async fn start_session(

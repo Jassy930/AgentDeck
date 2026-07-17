@@ -4,7 +4,7 @@
 //! N3 守护：Adapter 实现彼此不可见。共享逻辑只能下沉到此 trait 的 default
 //! 方法，或 daemon 层。
 
-use agentdeck_protocol::runtime::PromptPayload;
+use agentdeck_protocol::runtime::{ConfigurationError, ConversationConfiguration, PromptPayload};
 use agentdeck_protocol::{
     ActionDecision, ActionRequest, AgentItem, AgentKind, HistoryRequest, HistoryResponse,
     HistoryTurn, ProtocolError, ServerEvent, SessionCapabilities, SessionId, SessionStart,
@@ -837,6 +837,13 @@ pub trait Agent: Send + Sync + 'static {
     /// minimal capabilities + log a diagnostic.
     fn capabilities(&self) -> SessionCapabilities;
 
+    /// 返回该 adapter 冻结的 Runtime v2 新会话默认配置。
+    ///
+    /// 威胁场景：若 daemon 在 adapter 缺失或构造错误时回退到共享默认值，会把
+    /// 一个 vendor 的权限配置绑定给另一个 vendor。该方法因此是 required，且
+    /// 保留受检构造错误给 Router fail-close，禁止 trait fallback。
+    fn default_configuration(&self) -> Result<ConversationConfiguration, ConfigurationError>;
+
     /// Adapter-only cold prepare hook。默认 fail-closed；production coordinator
     /// 禁止直接调用，必须经 daemon-owned `prepare_turn` helper 绑定 ExecutionId。
     ///
@@ -999,6 +1006,10 @@ mod typed_boundary_tests {
     use super::*;
     use crate::claude_code::ClaudeCodeAdapter;
     use crate::codex::CodexAdapter;
+    use agentdeck_protocol::runtime::{
+        CodexConversationConfiguration, VendorConfigurationSnapshot,
+    };
+    use agentdeck_protocol::{CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1068,6 +1079,16 @@ mod typed_boundary_tests {
 
         fn capabilities(&self) -> SessionCapabilities {
             unreachable!("binding test never probes capabilities")
+        }
+
+        fn default_configuration(&self) -> Result<ConversationConfiguration, ConfigurationError> {
+            Ok(ConversationConfiguration::new(
+                VendorConfigurationSnapshot::Codex(CodexConversationConfiguration::new(
+                    CodexApprovalPolicy::OnRequest,
+                    CodexSandboxMode::WorkspaceWrite,
+                    CodexReasoningEffort::Medium,
+                )),
+            ))
         }
 
         async fn prepare_adapter_turn(

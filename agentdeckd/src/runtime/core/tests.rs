@@ -58,6 +58,28 @@ struct BlockCreateConversationAfterCommit {
     blocked: AtomicBool,
 }
 
+struct BlockConfigureConversationBeforeCommit {
+    entered: Arc<Barrier>,
+    release: Arc<Barrier>,
+    blocked: AtomicBool,
+}
+
+impl super::super::store::RuntimeStoreFaultInjector for BlockConfigureConversationBeforeCommit {
+    fn before_operation(
+        &self,
+        operation: super::super::store::RuntimeStoreOperation,
+    ) -> Result<(), RuntimeStoreError> {
+        if operation
+            == super::super::store::RuntimeStoreOperation::ConfigureConversationBeforeCommit
+            && !self.blocked.swap(true, Ordering::SeqCst)
+        {
+            self.entered.wait();
+            self.release.wait();
+        }
+        Ok(())
+    }
+}
+
 impl super::super::store::RuntimeStoreFaultInjector for BlockCreateConversationAfterCommit {
     fn before_operation(
         &self,
@@ -137,6 +159,16 @@ fn start_request(key: &str) -> RuntimeRequest {
         cwd: PathBuf::from("/tmp/agentdeck-core-test"),
         title: Some("core test".to_owned()),
     })
+}
+
+fn codex_configuration(reasoning: CodexReasoningEffort) -> ConversationConfiguration {
+    ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
+        CodexConversationConfiguration::new(
+            CodexApprovalPolicy::OnRequest,
+            CodexSandboxMode::WorkspaceWrite,
+            reasoning,
+        ),
+    ))
 }
 
 fn start_receipt(reply: RuntimeReply) -> ConversationStartReceipt {
@@ -271,7 +303,7 @@ async fn direct_hello_remains_available_while_core_is_cold() {
 }
 
 #[tokio::test]
-async fn runtime_v2_new_families_fail_closed_until_configuration_store_lands() {
+async fn runtime_v2_describe_and_configure_cut_over_without_enabling_later_families() {
     let root = TestRoot::new("v2-transitional");
     let store = root.open_store().await;
     let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
@@ -283,22 +315,23 @@ async fn runtime_v2_new_families_fail_closed_until_configuration_store_lands() {
         core.handle(connection, start_request("v2-transitional-start"))
             .await,
     );
-    let configuration = ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
-        CodexConversationConfiguration::new(
-            CodexApprovalPolicy::OnRequest,
-            CodexSandboxMode::WorkspaceWrite,
-            CodexReasoningEffort::High,
-        ),
-    ));
+    let configuration = codex_configuration(CodexReasoningEffort::High);
 
     let describe = core
         .handle(connection, RuntimeRequest::DescribeAgents)
         .await;
-    assert!(matches!(
-        describe,
-        RuntimeReply::Failure(RuntimeFailure { code, .. })
-            if code == DAEMON_RUNTIME_FEATURE_UNAVAILABLE
-    ));
+    let RuntimeReply::Agents(descriptions) = describe else {
+        panic!("DescribeAgents must return typed agent descriptions")
+    };
+    assert_eq!(descriptions.agents().len(), 2);
+    assert_eq!(
+        descriptions
+            .agents()
+            .iter()
+            .map(|description| description.agent_kind())
+            .collect::<Vec<_>>(),
+        vec![AgentKind::Codex, AgentKind::ClaudeCode]
+    );
     let configure = core
         .handle(
             connection,
@@ -312,9 +345,10 @@ async fn runtime_v2_new_families_fail_closed_until_configuration_store_lands() {
         .await;
     assert!(matches!(
         configure,
-        RuntimeReply::Configuration(ConfigurationReceipt::Failed {
-            failure: RuntimeFailure { code, .. }
-        }) if code == DAEMON_RUNTIME_FEATURE_UNAVAILABLE
+        RuntimeReply::Configuration(ConfigurationReceipt::Applied {
+            ref conversation_id,
+            configuration_revision: 1,
+        }) if conversation_id == &conversation.conversation_id
     ));
     let metadata = core
         .handle(
@@ -380,6 +414,376 @@ async fn runtime_v2_new_families_fail_closed_until_configuration_store_lands() {
     core.shutdown()
         .await
         .expect("shutdown v2 transitional core");
+}
+
+#[tokio::test]
+async fn configure_conversation_returns_exact_replay_conflict_and_typed_failures() {
+    // 威胁场景：若 Configure 的 parse/store 错误逃逸为 envelope failure，Companion
+    // 会丢失 CAS/idempotency 语义，并可能把同一请求当成可无条件重试。
+    let root = TestRoot::new("configure-receipts");
+    let store = root.open_store().await;
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let core = Arc::new(RuntimeCore::new(store, router, [0xA3; 32]).expect("construct core"));
+    core.recover()
+        .await
+        .expect("recover configure receipt core");
+    let connection = connect_local(&core, 0x74).await;
+    let conversation = start_receipt(
+        core.handle(connection, start_request("configure-receipts-start"))
+            .await,
+    );
+
+    let exact_request = ConfigureConversationRequest::new(
+        conversation.conversation_id.clone(),
+        IdempotencyKey::new("configure-exact"),
+        0,
+        codex_configuration(CodexReasoningEffort::High),
+    );
+    assert!(matches!(
+        core.handle(
+            connection,
+            RuntimeRequest::ConfigureConversation(exact_request.clone())
+        )
+        .await,
+        RuntimeReply::Configuration(ConfigurationReceipt::Applied {
+            configuration_revision: 1,
+            ..
+        })
+    ));
+    assert!(matches!(
+        core.handle(
+            connection,
+            RuntimeRequest::ConfigureConversation(exact_request)
+        )
+        .await,
+        RuntimeReply::Configuration(ConfigurationReceipt::Replayed {
+            configuration_revision: 1,
+            ..
+        })
+    ));
+
+    let same_key_different_request = core
+        .handle(
+            connection,
+            RuntimeRequest::ConfigureConversation(ConfigureConversationRequest::new(
+                conversation.conversation_id.clone(),
+                IdempotencyKey::new("configure-exact"),
+                0,
+                codex_configuration(CodexReasoningEffort::Medium),
+            )),
+        )
+        .await;
+    assert!(matches!(
+        same_key_different_request,
+        RuntimeReply::Configuration(ConfigurationReceipt::Failed {
+            failure: RuntimeFailure { code, .. }
+        }) if code == "daemon.command.idempotency_conflict"
+    ));
+
+    let stale = core
+        .handle(
+            connection,
+            RuntimeRequest::ConfigureConversation(ConfigureConversationRequest::new(
+                conversation.conversation_id.clone(),
+                IdempotencyKey::new("configure-stale"),
+                0,
+                codex_configuration(CodexReasoningEffort::Low),
+            )),
+        )
+        .await;
+    assert!(matches!(
+        stale,
+        RuntimeReply::Configuration(ConfigurationReceipt::Conflict {
+            current_configuration_revision: 1,
+            ..
+        })
+    ));
+
+    let missing = core
+        .handle(
+            connection,
+            RuntimeRequest::ConfigureConversation(ConfigureConversationRequest::new(
+                ConversationId::new("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+                IdempotencyKey::new("configure-missing"),
+                0,
+                codex_configuration(CodexReasoningEffort::Low),
+            )),
+        )
+        .await;
+    assert!(matches!(
+        missing,
+        RuntimeReply::Configuration(ConfigurationReceipt::Failed {
+            failure: RuntimeFailure { code, .. }
+        }) if code == agentdeck_protocol::runtime::failure::DAEMON_CONVERSATION_NOT_FOUND
+    ));
+
+    let malformed = core
+        .handle(
+            connection,
+            RuntimeRequest::ConfigureConversation(ConfigureConversationRequest::new(
+                ConversationId::new("not-a-canonical-runtime-id"),
+                IdempotencyKey::new("configure-malformed"),
+                0,
+                codex_configuration(CodexReasoningEffort::Low),
+            )),
+        )
+        .await;
+    assert!(matches!(
+        malformed,
+        RuntimeReply::Configuration(ConfigurationReceipt::Failed {
+            failure: RuntimeFailure { code, .. }
+        }) if code == DAEMON_RUNTIME_INVALID_REQUEST
+    ));
+
+    core.shutdown()
+        .await
+        .expect("shutdown configure receipt core");
+}
+
+#[tokio::test]
+async fn describe_and_configure_authorization_failures_keep_their_reply_families() {
+    let root = TestRoot::new("configure-revoked");
+    let store = root.open_store().await;
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let core = Arc::new(RuntimeCore::new(store, router, [0xA4; 32]).expect("construct core"));
+    core.recover()
+        .await
+        .expect("recover revoked configure core");
+    let principal = core
+        .issue_verified_local_principal(501, [0x75; 16])
+        .expect("issue retained principal");
+    let (sink, mut receiver) = mpsc::channel::<crate::runtime::ConnectionWrite>(8);
+    tokio::spawn(async move {
+        while let Some(write) = receiver.recv().await {
+            let _ = write.acknowledge();
+        }
+    });
+    let connection = core
+        .connect(principal.clone(), ConnectionSink::new(sink))
+        .expect("connect retained principal");
+    principal.begin_revoke().await.expect("begin revoke");
+    principal.finish_revoke();
+
+    assert!(matches!(
+        core.handle(connection, RuntimeRequest::DescribeAgents).await,
+        RuntimeReply::Failure(RuntimeFailure { code, .. })
+            if code == DAEMON_AUTHORIZATION_REVOKED
+    ));
+    let configure = core
+        .handle(
+            connection,
+            RuntimeRequest::ConfigureConversation(ConfigureConversationRequest::new(
+                ConversationId::new("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+                IdempotencyKey::new("configure-revoked"),
+                0,
+                codex_configuration(CodexReasoningEffort::Low),
+            )),
+        )
+        .await;
+    assert!(matches!(
+        configure,
+        RuntimeReply::Configuration(ConfigurationReceipt::Failed {
+            failure: RuntimeFailure { code, .. }
+        }) if code == DAEMON_AUTHORIZATION_REVOKED
+    ));
+    core.shutdown()
+        .await
+        .expect("shutdown revoked configure core");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_authorization_guard_covers_the_store_commit() {
+    // 威胁场景：若 Core 只用 principal 取 owner 后就释放 guard，revoke 可在
+    // Configure COMMIT 前完成，使已撤销身份仍写入 durable configuration。
+    let root = TestRoot::new("configure-authorization-commit");
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let store = RuntimeStoreHandle::open(
+        super::super::store::RuntimeStoreConfig::new(root.path.join("runtime.db"))
+            .with_command_capacity(1_024)
+            .with_fault_injector(Arc::new(BlockConfigureConversationBeforeCommit {
+                entered: entered.clone(),
+                release: release.clone(),
+                blocked: AtomicBool::new(false),
+            })),
+        root.kek(),
+    )
+    .await
+    .expect("open configure authorization store");
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let core = Arc::new(RuntimeCore::new(store, router, [0xA5; 32]).expect("construct core"));
+    core.recover()
+        .await
+        .expect("recover configure authorization core");
+    let principal = core
+        .issue_verified_local_principal(501, [0x76; 16])
+        .expect("issue configure authorization principal");
+    let (sink, mut receiver) = mpsc::channel::<crate::runtime::ConnectionWrite>(8);
+    tokio::spawn(async move {
+        while let Some(write) = receiver.recv().await {
+            let _ = write.acknowledge();
+        }
+    });
+    let connection = core
+        .connect(principal.clone(), ConnectionSink::new(sink))
+        .expect("connect configure authorization principal");
+    let conversation = start_receipt(
+        core.handle(connection, start_request("configure-authorization-start"))
+            .await,
+    );
+
+    let handling = tokio::spawn({
+        let core = core.clone();
+        async move {
+            core.handle(
+                connection,
+                RuntimeRequest::ConfigureConversation(ConfigureConversationRequest::new(
+                    conversation.conversation_id,
+                    IdempotencyKey::new("configure-authorization"),
+                    0,
+                    codex_configuration(CodexReasoningEffort::High),
+                )),
+            )
+            .await
+        }
+    });
+    tokio::task::spawn_blocking(move || entered.wait())
+        .await
+        .expect("observe Configure before COMMIT");
+    let mut revoking = tokio::spawn({
+        let principal = principal.clone();
+        async move { principal.begin_revoke().await }
+    });
+    let revoked_before_release =
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut revoking).await;
+    tokio::task::spawn_blocking(move || release.wait())
+        .await
+        .expect("release Configure before COMMIT");
+    let revoked_early = revoked_before_release.is_ok();
+    let revoke_result = match revoked_before_release {
+        Ok(result) => result,
+        Err(_) => revoking.await,
+    };
+    assert!(matches!(
+        handling.await.expect("join Configure request"),
+        RuntimeReply::Configuration(ConfigurationReceipt::Applied {
+            configuration_revision: 1,
+            ..
+        })
+    ));
+    assert!(
+        !revoked_early,
+        "revoke must wait for Configure authorization through COMMIT"
+    );
+    revoke_result
+        .expect("join principal revoke")
+        .expect("revoke after Configure COMMIT");
+    principal.finish_revoke();
+    core.shutdown()
+        .await
+        .expect("shutdown configure authorization core");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canceled_configure_caller_keeps_authorization_until_store_completion() {
+    // 威胁场景：连接断开会取消 Core caller future；若 authorization guard 仍由
+    // caller 栈持有，revoke 可在已排队的 Store COMMIT 前完成。
+    let root = TestRoot::new("configure-caller-canceled");
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let store = RuntimeStoreHandle::open(
+        super::super::store::RuntimeStoreConfig::new(root.path.join("runtime.db"))
+            .with_command_capacity(1_024)
+            .with_fault_injector(Arc::new(BlockConfigureConversationBeforeCommit {
+                entered: entered.clone(),
+                release: release.clone(),
+                blocked: AtomicBool::new(false),
+            })),
+        root.kek(),
+    )
+    .await
+    .expect("open canceled Configure store");
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let core = Arc::new(RuntimeCore::new(store, router, [0xA6; 32]).expect("construct core"));
+    core.recover()
+        .await
+        .expect("recover canceled Configure core");
+    let principal = core
+        .issue_verified_local_principal(501, [0x77; 16])
+        .expect("issue canceled Configure principal");
+    let (sink, mut receiver) = mpsc::channel::<crate::runtime::ConnectionWrite>(8);
+    tokio::spawn(async move {
+        while let Some(write) = receiver.recv().await {
+            let _ = write.acknowledge();
+        }
+    });
+    let connection = core
+        .connect(principal.clone(), ConnectionSink::new(sink))
+        .expect("connect canceled Configure principal");
+    let conversation = start_receipt(
+        core.handle(connection, start_request("configure-canceled-start"))
+            .await,
+    );
+    let internal_conversation =
+        parse_conversation_id(&conversation.conversation_id).expect("parse started conversation");
+
+    let handling = tokio::spawn({
+        let core = core.clone();
+        async move {
+            core.handle(
+                connection,
+                RuntimeRequest::ConfigureConversation(ConfigureConversationRequest::new(
+                    conversation.conversation_id,
+                    IdempotencyKey::new("configure-canceled"),
+                    0,
+                    codex_configuration(CodexReasoningEffort::High),
+                )),
+            )
+            .await
+        }
+    });
+    tokio::task::spawn_blocking(move || entered.wait())
+        .await
+        .expect("observe canceled Configure before COMMIT");
+    handling.abort();
+    assert!(
+        handling
+            .await
+            .expect_err("Configure caller must be canceled")
+            .is_cancelled(),
+        "aborted caller reports cancellation"
+    );
+    let mut revoking = tokio::spawn({
+        let principal = principal.clone();
+        async move { principal.begin_revoke().await }
+    });
+    let revoked_before_release =
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut revoking).await;
+    tokio::task::spawn_blocking(move || release.wait())
+        .await
+        .expect("release canceled Configure before COMMIT");
+    let revoked_early = revoked_before_release.is_ok();
+    let revoke_result = match revoked_before_release {
+        Ok(result) => result,
+        Err(_) => revoking.await,
+    };
+    assert!(
+        !revoked_early,
+        "detached durable Configure must retain authorization after caller cancellation"
+    );
+    revoke_result
+        .expect("join canceled Configure revoke")
+        .expect("revoke after detached Store completion");
+    let state = core
+        .store
+        .load_configuration_state_at_event_cursor(internal_conversation, Some(0))
+        .await
+        .expect("read committed configuration after caller cancellation");
+    assert_eq!(state.configuration_revision(), 1);
+    principal.finish_revoke();
+    core.shutdown()
+        .await
+        .expect("shutdown canceled Configure core");
 }
 
 #[tokio::test]

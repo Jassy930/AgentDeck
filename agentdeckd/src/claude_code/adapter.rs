@@ -47,6 +47,10 @@ use crate::claude_code::translate::ClaudeCodeTranslator;
 use crate::runtime::store::{
     ClaudeCodeAdapterStateVault, RuntimeId, RuntimeIdKind, RuntimeStoreError,
 };
+use agentdeck_protocol::runtime::{
+    ClaudeCodeConversationConfiguration, ConfigurationError, ConversationConfiguration,
+    VendorConfigurationSnapshot,
+};
 use agentdeck_protocol::{
     ActionDecision, ActionDecisionKind, AgentItem, AgentKind, ClaudeCodePermissionMode,
     ClaudeCodeSessionOptions, ClaudeCodeVendorControl, HistoryListItem, HistoryRequest,
@@ -844,6 +848,17 @@ impl Agent for ClaudeCodeAdapter {
 
     fn capabilities(&self) -> SessionCapabilities {
         self.capabilities_for_v2()
+    }
+
+    fn default_configuration(&self) -> Result<ConversationConfiguration, ConfigurationError> {
+        ClaudeCodeConversationConfiguration::new(
+            ClaudeCodePermissionMode::Default,
+            None,
+            None,
+            None,
+        )
+        .map(VendorConfigurationSnapshot::ClaudeCode)
+        .map(ConversationConfiguration::new)
     }
 
     async fn prepare_adapter_turn(

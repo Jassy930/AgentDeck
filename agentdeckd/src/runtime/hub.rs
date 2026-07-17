@@ -865,6 +865,10 @@ mod tests {
     #[tokio::test]
     async fn ping_during_slow_session_start_is_not_blocked() {
         use crate::agent::{Agent, AgentEventSender, AgentSessionHandle, DynAgent};
+        use agentdeck_protocol::runtime::{
+            CodexConversationConfiguration, ConfigurationError, ConversationConfiguration,
+            VendorConfigurationSnapshot,
+        };
         use agentdeck_protocol::{
             ActionDecision, AgentKind, CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode,
             CodexSessionOptions, ProtocolError, SessionCapabilities, SessionStart, ThreadId,
@@ -893,6 +897,17 @@ mod tests {
                         reasoning_effort_levels: vec![],
                     }),
                 }
+            }
+            fn default_configuration(
+                &self,
+            ) -> Result<ConversationConfiguration, ConfigurationError> {
+                Ok(ConversationConfiguration::new(
+                    VendorConfigurationSnapshot::Codex(CodexConversationConfiguration::new(
+                        CodexApprovalPolicy::OnRequest,
+                        CodexSandboxMode::WorkspaceWrite,
+                        CodexReasoningEffort::Medium,
+                    )),
+                ))
             }
             async fn start_session(
                 &self,

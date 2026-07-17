@@ -11,10 +11,10 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use agentdeck_protocol::runtime::command::{HelloParams, QueryReceiptSelector};
 use agentdeck_protocol::runtime::failure::{
     DAEMON_AUTHORIZATION_PERMISSION_DENIED, DAEMON_AUTHORIZATION_REVOKED,
-    DAEMON_RUNTIME_ACTOR_UNAVAILABLE, DAEMON_RUNTIME_CONNECTION_UNAVAILABLE,
-    DAEMON_RUNTIME_FEATURE_UNAVAILABLE, DAEMON_RUNTIME_IDENTITY_UNAVAILABLE,
-    DAEMON_RUNTIME_INVALID_REQUEST, DAEMON_RUNTIME_NOT_READY, DAEMON_RUNTIME_PROTOCOL_MISMATCH,
-    DAEMON_RUNTIME_READ_UNAVAILABLE,
+    DAEMON_CONVERSATION_NOT_FOUND, DAEMON_RUNTIME_ACTOR_UNAVAILABLE,
+    DAEMON_RUNTIME_CONNECTION_UNAVAILABLE, DAEMON_RUNTIME_FEATURE_UNAVAILABLE,
+    DAEMON_RUNTIME_IDENTITY_UNAVAILABLE, DAEMON_RUNTIME_INVALID_REQUEST, DAEMON_RUNTIME_NOT_READY,
+    DAEMON_RUNTIME_PROTOCOL_MISMATCH, DAEMON_RUNTIME_READ_UNAVAILABLE,
 };
 use agentdeck_protocol::runtime::identity::{
     ApprovalId, CommandId, ConversationId, IdempotencyKey, TurnId,
@@ -52,9 +52,9 @@ use super::recovery::{
 use super::router::AgentRouter;
 use super::snapshot::SNAPSHOT_BUILD_MEMORY_BYTES;
 use super::store::{
-    CommandReceiptSelector, CommandState, ConversationDescriptor, CreateConversationOutcome,
-    NewConversation, QueryCommandReceipt, RuntimeId, RuntimeIdKind, RuntimeStoreError,
-    RuntimeStoreHandle,
+    CommandReceiptSelector, CommandState, ConfigureConversation, ConfigureConversationOutcome,
+    ConversationDescriptor, CreateConversationOutcome, NewConversation, QueryCommandReceipt,
+    RuntimeId, RuntimeIdKind, RuntimeStoreError, RuntimeStoreHandle,
 };
 use super::subscription::coordinator::SubscriptionCoordinator;
 
@@ -84,7 +84,7 @@ pub struct RecoveryReport {
 /// singleton daemon 的 transport-neutral 业务内核。
 pub struct RuntimeCore {
     store: RuntimeStoreHandle,
-    _router: Arc<AgentRouter>,
+    router: Arc<AgentRouter>,
     connections: ConnectionRegistry,
     subscriptions: SubscriptionCoordinator,
     conversations: ConversationRegistry,
@@ -207,7 +207,7 @@ impl RuntimeCore {
         );
         Ok(Self {
             store,
-            _router: router,
+            router,
             connections,
             subscriptions,
             conversations,
@@ -248,7 +248,7 @@ impl RuntimeCore {
     }
 
     pub(crate) fn stdio_compatibility_router(&self) -> Arc<AgentRouter> {
-        self._router.clone()
+        self.router.clone()
     }
 
     /// 只允许 UDS peer credential 已验证为同 UID 后由 transport adapter 调用。
@@ -592,7 +592,15 @@ impl RuntimeCore {
     ) -> Result<RuntimeReply, RuntimeCoreError> {
         match request {
             RuntimeRequest::Hello(params) => Ok(self.handle_hello(params)),
-            RuntimeRequest::DescribeAgents => Err(RuntimeCoreError::FeatureUnavailable),
+            RuntimeRequest::DescribeAgents => {
+                let authorization = principal.try_enter()?;
+                let descriptions = self
+                    .router
+                    .agent_descriptions()
+                    .map_err(|_| RuntimeCoreError::AgentDescriptionsInvalid)?;
+                drop(authorization);
+                Ok(RuntimeReply::Agents(descriptions))
+            }
             RuntimeRequest::Start(start) => {
                 let _authorization = principal.try_enter()?;
                 if validate_idempotency_key(&start.idempotency_key).is_err()
@@ -634,15 +642,72 @@ impl RuntimeCore {
                     replayed,
                 }))
             }
-            RuntimeRequest::ConfigureConversation(_) => {
-                let failure = match principal.try_enter() {
-                    Ok(_authorization) => RuntimeCoreError::FeatureUnavailable,
-                    Err(error) => RuntimeCoreError::from(error),
+            RuntimeRequest::ConfigureConversation(request) => {
+                // Configure 的所有业务拒绝都属于 ConfigurationReceipt family；否则
+                // Companion 无法区分 CAS conflict、exact replay 与 envelope failure。
+                let receipt = match async {
+                    validate_idempotency_key(&request.idempotency_key)?;
+                    let conversation_id = parse_conversation_id(&request.conversation_id)?;
+                    let authorization = principal.try_enter()?;
+                    let owner = principal.idempotency_owner();
+                    let outcome = self
+                        .store
+                        .configure_conversation_authorized(
+                            ConfigureConversation {
+                                conversation_id,
+                                owner,
+                                idempotency_key: request.idempotency_key.as_str().to_owned(),
+                                expected_configuration_revision: request
+                                    .expected_configuration_revision,
+                                configuration: request.configuration,
+                            },
+                            authorization,
+                        )
+                        .await?;
+                    Ok::<_, RuntimeCoreError>((conversation_id, outcome))
                 }
-                .into_failure();
-                Ok(RuntimeReply::Configuration(ConfigurationReceipt::Failed {
-                    failure,
-                }))
+                .await
+                {
+                    Ok((
+                        conversation_id,
+                        ConfigureConversationOutcome::Applied { configuration },
+                    )) if configuration.conversation_id == conversation_id
+                        && configuration.configuration_revision > 0 =>
+                    {
+                        ConfigurationReceipt::Applied {
+                            conversation_id: wire_conversation_id(conversation_id),
+                            configuration_revision: configuration.configuration_revision,
+                        }
+                    }
+                    Ok((
+                        conversation_id,
+                        ConfigureConversationOutcome::Replayed { configuration },
+                    )) if configuration.conversation_id == conversation_id
+                        && configuration.configuration_revision > 0 =>
+                    {
+                        ConfigurationReceipt::Replayed {
+                            conversation_id: wire_conversation_id(conversation_id),
+                            configuration_revision: configuration.configuration_revision,
+                        }
+                    }
+                    Ok((
+                        conversation_id,
+                        ConfigureConversationOutcome::Conflict {
+                            current_configuration_revision,
+                        },
+                    )) => ConfigurationReceipt::Conflict {
+                        conversation_id: wire_conversation_id(conversation_id),
+                        current_configuration_revision,
+                    },
+                    Ok(_) => ConfigurationReceipt::Failed {
+                        failure: RuntimeCoreError::Store(RuntimeStoreError::UnknownOrCorruptSchema)
+                            .into_failure(),
+                    },
+                    Err(error) => ConfigurationReceipt::Failed {
+                        failure: configuration_failure(error),
+                    },
+                };
+                Ok(RuntimeReply::Configuration(receipt))
             }
             RuntimeRequest::UpdateConversationMetadata(_) => {
                 let failure = match principal.try_enter() {
@@ -1109,6 +1174,8 @@ pub(crate) enum RuntimeCoreError {
     InvalidIdentityDomain,
     #[error("runtime identity entropy is unavailable")]
     EntropyUnavailable,
+    #[error("runtime agent descriptions violate daemon invariants")]
+    AgentDescriptionsInvalid,
     #[error(transparent)]
     Store(#[from] RuntimeStoreError),
     #[error(transparent)]
@@ -1155,6 +1222,10 @@ impl RuntimeCoreError {
             Self::InvalidIdentityDomain | Self::EntropyUnavailable => RuntimeFailure::new(
                 DAEMON_RUNTIME_IDENTITY_UNAVAILABLE,
                 "runtime stable identity is unavailable",
+            ),
+            Self::AgentDescriptionsInvalid => RuntimeFailure::new(
+                "daemon.runtime.invalid_state",
+                "runtime agent descriptions violate daemon invariants",
             ),
             Self::Store(error) => {
                 RuntimeFailure::new(error.code(), "runtime durable store rejected the operation")
@@ -1309,6 +1380,22 @@ fn parse_subscription_target(
                 parse_conversation_id(&conversation_id)?,
             ))
         }
+    }
+}
+
+fn configuration_failure(error: RuntimeCoreError) -> RuntimeFailure {
+    match error {
+        RuntimeCoreError::Store(RuntimeStoreError::ConversationNotFound) => RuntimeFailure::new(
+            DAEMON_CONVERSATION_NOT_FOUND,
+            "runtime conversation was not found",
+        ),
+        RuntimeCoreError::Store(RuntimeStoreError::ConfigurationAgentMismatch) => {
+            RuntimeFailure::new(
+                DAEMON_RUNTIME_INVALID_REQUEST,
+                "configuration agent kind does not match the conversation",
+            )
+        }
+        other => other.into_failure(),
     }
 }
 
