@@ -2,10 +2,12 @@
 //!
 //! 所有 SQLite 读取都发生在 tamper 前：先用 production `RuntimeKeyBundle`
 //! 解包密钥并自证现有 pin/runtime ledger token，随后只执行一次定向写入。
-//! tamper 后的 artifact oracle 只允许 `fs::read`。
+//! tamper 后的 artifact oracle 只允许有界 filesystem handle 读取，不再打开 SQLite。
 
-use std::fs;
-use std::io::ErrorKind;
+use std::fs::OpenOptions;
+use std::io::{ErrorKind, Read};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use agentdeckd::runtime::store::cipher::{KeyWrapAad, RuntimeKeyBundle};
@@ -46,26 +48,41 @@ fn artifact_path(database: &Path, suffix: &str) -> PathBuf {
 }
 
 fn read_optional(path: &Path) -> Option<Vec<u8>> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            assert!(
-                metadata.file_type().is_file(),
-                "runtime artifact must be a regular file: {}",
-                path.display()
-            );
-            assert!(
-                metadata.len() <= MAX_ARTIFACT_BYTES,
-                "runtime artifact {} has {} bytes, exceeding the {MAX_ARTIFACT_BYTES}-byte test oracle cap",
-                path.display(),
-                metadata.len()
-            );
-            Some(fs::read(path).unwrap_or_else(|error| {
-                panic!("read runtime artifact {}: {error}", path.display())
-            }))
-        }
-        Err(error) if error.kind() == ErrorKind::NotFound => None,
-        Err(error) => panic!("inspect runtime artifact {}: {error}", path.display()),
-    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return None,
+        Err(error) => panic!("open runtime artifact {}: {error}", path.display()),
+    };
+    let metadata = file
+        .metadata()
+        .unwrap_or_else(|error| panic!("inspect runtime artifact {}: {error}", path.display()));
+    assert!(
+        metadata.file_type().is_file(),
+        "runtime artifact must be a regular file: {}",
+        path.display()
+    );
+    assert!(
+        metadata.len() <= MAX_ARTIFACT_BYTES,
+        "runtime artifact {} has {} bytes, exceeding the {MAX_ARTIFACT_BYTES}-byte test oracle cap",
+        path.display(),
+        metadata.len()
+    );
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len()).expect("bounded artifact length fits usize"),
+    );
+    file.take(MAX_ARTIFACT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .unwrap_or_else(|error| panic!("read runtime artifact {}: {error}", path.display()));
+    assert!(
+        u64::try_from(bytes.len()).expect("artifact bytes fit u64") <= MAX_ARTIFACT_BYTES,
+        "runtime artifact {} grew beyond the {MAX_ARTIFACT_BYTES}-byte test oracle cap",
+        path.display()
+    );
+    Some(bytes)
 }
 
 #[derive(Clone, Copy, Debug)]
