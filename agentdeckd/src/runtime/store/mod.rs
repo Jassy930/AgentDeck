@@ -4,6 +4,7 @@ pub(crate) mod admission;
 mod approval;
 mod catalog;
 pub mod cipher;
+mod command_configuration;
 mod command_event;
 mod configuration;
 mod execution_event;

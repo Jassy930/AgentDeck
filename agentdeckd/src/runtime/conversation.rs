@@ -398,6 +398,7 @@ impl ConversationRegistry {
         principal: AuthenticatedPrincipal,
         authorization_guard: AuthorizationGuard,
         idempotency_key: String,
+        expected_configuration_revision: u64,
         payload: Vec<u8>,
     ) -> Result<PromptAcceptResult, ConversationError> {
         let handle = self.handle(conversation_id).await?;
@@ -408,6 +409,7 @@ impl ConversationRegistry {
                 principal,
                 _authorization_guard: authorization_guard,
                 idempotency_key,
+                expected_configuration_revision,
                 payload,
                 reply,
             })
@@ -646,6 +648,7 @@ struct PromptCommand {
     principal: AuthenticatedPrincipal,
     _authorization_guard: AuthorizationGuard,
     idempotency_key: String,
+    expected_configuration_revision: u64,
     payload: Vec<u8>,
     reply: oneshot::Sender<Result<PromptAcceptResult, ConversationError>>,
 }
@@ -2317,7 +2320,7 @@ async fn prompt_admission_worker(
                 conversation_id,
                 owner: command.principal.idempotency_owner(),
                 idempotency_key: command.idempotency_key,
-                expected_configuration_revision: 0,
+                expected_configuration_revision: command.expected_configuration_revision,
                 payload: command.payload,
             })
             .await;
@@ -2918,9 +2921,12 @@ pub(crate) mod tests {
     use std::sync::{Condvar, Mutex as StdMutex, OnceLock};
 
     use crate::runtime::store::{SanitizedTerminalFailure, TerminalState};
+    use agentdeck_protocol::runtime::{
+        CodexConversationConfiguration, ConversationConfiguration, VendorConfigurationSnapshot,
+    };
     use agentdeck_protocol::{
         ActionDecision, ActionKind, ActionRequest, ActionRequestVendor, AgentItem, AgentItemMeta,
-        AgentKind, CodexApprovalPolicy, CodexSandboxMode, TurnSummary,
+        AgentKind, CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode, TurnSummary,
     };
 
     use super::*;
@@ -2935,7 +2941,8 @@ pub(crate) mod tests {
         RuntimeExecutionRelease, RuntimeProcessIdentity, runtime_execution_event_channel,
     };
     use crate::runtime::store::{
-        CommandReceiptSelector, CommandState, ConversationDescriptor, NewConversation,
+        CommandReceiptSelector, CommandState, ConfigurationRecord, ConfigureConversation,
+        ConfigureConversationOutcome, ConversationDescriptor, IdempotencyOwner, NewConversation,
         QueryCommandReceipt, RecoveryCursor, RuntimeClock, RuntimeClockError,
         RuntimeCommitOperation, RuntimeIdKind, RuntimeStoreConfig, RuntimeStoreFaultInjector,
         RuntimeStoreOperation,
@@ -4263,7 +4270,7 @@ pub(crate) mod tests {
     }
 
     async fn create_conversation(store: &RuntimeStoreHandle, seed: u8) -> ConversationRecord {
-        store
+        let conversation = store
             .create_conversation(NewConversation {
                 conversation_id: runtime_id(RuntimeIdKind::Conversation, seed),
                 adapter_state_key: runtime_id(RuntimeIdKind::AdapterState, seed.wrapping_add(0x40)),
@@ -4274,7 +4281,40 @@ pub(crate) mod tests {
                 },
             })
             .await
-            .expect("create actor conversation")
+            .expect("create actor conversation");
+        let configured = store
+            .configure_conversation(ConfigureConversation {
+                conversation_id: conversation.conversation_id,
+                owner: IdempotencyOwner::Local {
+                    machine_trust_domain: [0xA1; 32],
+                    uid: 501,
+                    client_installation_id: [seed; 16],
+                },
+                idempotency_key: format!("actor-configuration-{seed}"),
+                expected_configuration_revision: 0,
+                configuration: ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
+                    CodexConversationConfiguration::new(
+                        CodexApprovalPolicy::OnRequest,
+                        CodexSandboxMode::WorkspaceWrite,
+                        CodexReasoningEffort::Medium,
+                    ),
+                )),
+            })
+            .await
+            .expect("configure actor conversation");
+        assert!(
+            matches!(
+                configured,
+                ConfigureConversationOutcome::Applied {
+                    configuration: ConfigurationRecord {
+                        configuration_revision: 1,
+                        ..
+                    }
+                }
+            ),
+            "actor fixture must apply configuration revision one"
+        );
+        conversation
     }
 
     async fn wait_for_approval_count(path: &Path, expected: i64) {
@@ -6074,6 +6114,7 @@ pub(crate) mod tests {
                 principal.clone(),
                 principal.try_enter().expect("active principal"),
                 key.to_owned(),
+                1,
                 payload.as_bytes().to_vec(),
             )
             .await
@@ -6658,6 +6699,7 @@ pub(crate) mod tests {
                 principal.clone(),
                 principal.try_enter().expect("first prompt guard"),
                 "reply-loss".to_owned(),
+                1,
                 b"persist exactly once".to_vec(),
             )
             .await
@@ -6939,6 +6981,7 @@ pub(crate) mod tests {
                     submitting_principal.clone(),
                     submitting_principal.try_enter().expect("prompt guard"),
                     "shutdown-inflight".to_owned(),
+                    1,
                     b"must be drained".to_vec(),
                 )
                 .await
@@ -7033,6 +7076,7 @@ pub(crate) mod tests {
                     submitting_principal.clone(),
                     submitting_principal.try_enter().expect("prompt guard"),
                     "inflight-while-panic".to_owned(),
+                    1,
                     b"must be drained after recovery block".to_vec(),
                 )
                 .await
@@ -7506,6 +7550,7 @@ pub(crate) mod tests {
                     principal.clone(),
                     principal.try_enter().expect("blocked ingress guard"),
                     "must-be-rejected".to_owned(),
+                    1,
                     b"must stay closed".to_vec(),
                 )
                 .await,
@@ -7568,6 +7613,7 @@ pub(crate) mod tests {
                     principal.clone(),
                     principal.try_enter().expect("second prompt guard"),
                     "must-not-start".to_owned(),
+                    1,
                     b"must not start".to_vec(),
                 )
                 .await,
@@ -7715,6 +7761,7 @@ pub(crate) mod tests {
                     principal.clone(),
                     principal.try_enter().expect("post-panic guard"),
                     "post-panic".to_owned(),
+                    1,
                     b"must stay closed".to_vec(),
                 )
                 .await,

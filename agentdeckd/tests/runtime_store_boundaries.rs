@@ -541,6 +541,18 @@ fn move_accepted_command_to_sequence(
     command_id: RuntimeId,
     next_sequence: &str,
 ) {
+    let (current_sequence, configuration_revision): (String, String) = connection
+        .query_row(
+            "SELECT command.command_seq, pin.configuration_revision
+             FROM commands AS command
+             JOIN command_configuration_pins AS pin
+               ON pin.conversation_id = command.conversation_id
+              AND pin.command_seq = command.command_seq
+             WHERE command.command_id = ?1",
+            [&command_id.as_bytes()[..]],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read accepted command configuration pin fixture");
     let (
         conversation_id,
         owner_token,
@@ -628,6 +640,41 @@ fn move_accepted_command_to_sequence(
     let token = key_bundle
         .blind_index(b"command.metadata.v1", &encoded)
         .expect("authenticate accepted command boundary metadata");
+    let mut pin_metadata = Vec::with_capacity(128);
+    for field in [
+        conversation_id.as_slice(),
+        next_sequence.as_bytes(),
+        configuration_revision.as_bytes(),
+    ] {
+        pin_metadata.extend_from_slice(
+            &u64::try_from(field.len())
+                .expect("pin metadata field length fits u64")
+                .to_be_bytes(),
+        );
+        pin_metadata.extend_from_slice(field);
+    }
+    let pin_token = key_bundle
+        .blind_index(b"command.configuration.pin.metadata.v1", &pin_metadata)
+        .expect("authenticate command configuration pin boundary metadata");
+    connection
+        .execute_batch("PRAGMA defer_foreign_keys = ON")
+        .expect("defer command/pin composite foreign key until the boundary fixture is complete");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE command_configuration_pins
+                 SET command_seq = ?1, metadata_token = ?2
+                 WHERE conversation_id = ?3 AND command_seq = ?4",
+                params![
+                    next_sequence,
+                    &pin_token.as_bytes()[..],
+                    &conversation_id,
+                    &current_sequence,
+                ],
+            )
+            .expect("move authenticated configuration pin to boundary sequence"),
+        1
+    );
     assert_eq!(
         connection
             .execute(

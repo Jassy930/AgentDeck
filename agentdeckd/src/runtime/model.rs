@@ -515,6 +515,7 @@ pub struct CommandRecord {
     pub conversation_id: RuntimeId,
     pub command_id: RuntimeId,
     pub command_seq: u64,
+    pub configuration_revision: u64,
     pub owner: IdempotencyOwner,
     pub state: CommandState,
     pub accepted_at_ms: u64,
@@ -536,6 +537,7 @@ impl std::fmt::Debug for CommandRecord {
             .field("conversation_id", &self.conversation_id)
             .field("command_id", &self.command_id)
             .field("command_seq", &self.command_seq)
+            .field("configuration_revision", &self.configuration_revision)
             .field("state", &self.state)
             .field("turn_id", &self.turn_id)
             .field("payload_bytes", &self.payload.len())
@@ -660,6 +662,7 @@ pub struct QueryCommandReceipt {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommandReceiptRecord {
     pub command_id: RuntimeId,
+    pub configuration_revision: u64,
     pub state: CommandState,
     pub turn_id: Option<RuntimeId>,
 }
@@ -1287,8 +1290,16 @@ pub enum RuntimeStoreError {
     ConversationLimit,
     #[error("runtime conversation configuration agent kind does not match its descriptor")]
     ConfigurationAgentMismatch,
+    #[error("runtime conversation must be configured before accepting a command")]
+    ConfigurationRequired,
+    #[error(
+        "runtime command expected a different configuration revision than current revision {current_configuration_revision}"
+    )]
+    ConfigurationConflict { current_configuration_revision: u64 },
     #[error("runtime configuration journal is full for {scope:?}")]
     ConfigurationLimit { scope: ConfigurationLimitScope },
+    #[error("runtime command configuration pin journal reached its hard limit")]
+    CommandConfigurationPinLimit,
     #[error("runtime adapter state reference conflicts with the existing binding")]
     AdapterStateConflict,
     #[error("runtime adapter state key belongs to the other private namespace")]
@@ -1438,7 +1449,11 @@ impl RuntimeStoreError {
             | Self::IdGeneration(_)
             | Self::Sequence(_) => "daemon.runtime.invalid_state",
             Self::ConversationLimit => "daemon.runtime.actor_unavailable",
-            Self::ConfigurationLimit { .. } => "daemon.runtime.store_full",
+            Self::ConfigurationLimit { .. } | Self::CommandConfigurationPinLimit => {
+                "daemon.runtime.store_full"
+            }
+            Self::ConfigurationRequired => "daemon.conversation.configuration_required",
+            Self::ConfigurationConflict { .. } => "daemon.conversation.configuration_conflict",
             Self::IdempotencyConflict => "daemon.command.idempotency_conflict",
             Self::QueueFull { .. } => "daemon.command.queue_full",
             Self::PayloadTooLarge => "daemon.payload.item_too_large",

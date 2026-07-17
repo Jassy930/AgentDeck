@@ -6,16 +6,23 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agentdeck_protocol::runtime::RuntimeEventBody;
 use agentdeck_protocol::runtime::identity::{EntityId, ItemId};
-use agentdeck_protocol::{AgentItem, AgentKind, TurnSummary};
+use agentdeck_protocol::runtime::{
+    ClaudeCodeConversationConfiguration, CodexConversationConfiguration, ConversationConfiguration,
+    RuntimeEventBody, VendorConfigurationSnapshot,
+};
+use agentdeck_protocol::{
+    AgentItem, AgentKind, ClaudeCodePermissionMode, CodexApprovalPolicy, CodexReasoningEffort,
+    CodexSandboxMode, TurnSummary,
+};
 
 use super::append_adapter_event;
 use crate::agent::{AdapterEvent, AdapterItemKey};
 use crate::runtime::store::identity::OsRuntimeIdSource;
 use crate::runtime::store::{
     AcceptCommand, AcceptOutcome, AuthorizeExecutionRelease, CommandTerminal, CompleteCommand,
-    CompleteOutcome, ConversationDescriptor, ExecutionFence, IdempotencyOwner, NewConversation,
+    CompleteOutcome, ConfigurationRecord, ConfigureConversation, ConfigureConversationOutcome,
+    ConversationDescriptor, ExecutionFence, IdempotencyOwner, NewConversation,
     RUNTIME_SCHEMA_VERSION, RuntimeBackfillPlan, RuntimeBackfillTarget, RuntimeId, RuntimeIdKind,
     RuntimeIdSource, RuntimeStoreConfig, RuntimeStoreHandle, StartCommand, StartOutcome,
 };
@@ -181,26 +188,26 @@ async fn capture_backfill(
     command_id: RuntimeId,
     expected_event_count: usize,
 ) -> ReplayCapture {
-    // Store-local `Some(0)` 是 `StreamCursor::At(0)`：跳过 TurnStarted，读取
-    // translated Item updates 与唯一 terminal。
+    // Store-local `Some(1)` 是 `StreamCursor::At(1)`：跳过 ConfigurationChanged 与
+    // TurnStarted，读取 translated Item updates 与唯一 terminal。
     let RuntimeBackfillPlan::Pinned(pin) = store
         .acquire_backfill_pin(
             RuntimeBackfillTarget::Conversation(conversation_id),
-            Some(0),
+            Some(1),
         )
         .await
-        .expect("acquire At(0) fixture backfill")
+        .expect("acquire At(1) fixture backfill")
     else {
         panic!("translated fixture events must remain in the logical replay suffix");
     };
-    let mut after = Some(0);
+    let mut after = Some(1);
     let mut capture = ReplayCapture {
         event_bytes: Vec::new(),
         item_bytes: Vec::new(),
         item_identities: Vec::new(),
         terminal_count: 0,
     };
-    let mut expected_seq = 1_u64;
+    let mut expected_seq = 2_u64;
     let command_id_text = command_id.to_canonical_string();
     loop {
         let page = store
@@ -242,7 +249,7 @@ async fn capture_backfill(
                         .checked_add(1)
                         .expect("fixture terminal count remains bounded");
                 }
-                other => panic!("At(0) fixture backfill contains unexpected body: {other:?}"),
+                other => panic!("At(1) fixture backfill contains unexpected body: {other:?}"),
             }
             expected_seq = expected_seq
                 .checked_add(1)
@@ -315,12 +322,51 @@ async fn run_recorded_fixture(
         })
         .await
         .expect("create daemon-owned fixture conversation");
+    let configuration = match agent_kind {
+        AgentKind::Codex => ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
+            CodexConversationConfiguration::new(
+                CodexApprovalPolicy::OnRequest,
+                CodexSandboxMode::WorkspaceWrite,
+                CodexReasoningEffort::Medium,
+            ),
+        )),
+        AgentKind::ClaudeCode => {
+            ConversationConfiguration::new(VendorConfigurationSnapshot::ClaudeCode(
+                ClaudeCodeConversationConfiguration::new(
+                    ClaudeCodePermissionMode::Default,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("valid Claude Code fixture configuration"),
+            ))
+        }
+    };
+    assert!(matches!(
+        store
+            .configure_conversation(ConfigureConversation {
+                conversation_id,
+                owner: owner(),
+                idempotency_key: format!("recorded-fixture-configuration-{label}"),
+                expected_configuration_revision: 0,
+                configuration,
+            })
+            .await
+            .expect("configure daemon-owned fixture conversation"),
+        ConfigureConversationOutcome::Applied {
+            configuration: ConfigurationRecord {
+                configuration_revision: 1,
+                event_seq: 0,
+                ..
+            }
+        }
+    ));
     let command = match store
         .accept_command(AcceptCommand {
             conversation_id,
             owner: owner(),
             idempotency_key: format!("recorded-fixture-{label}"),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"recorded fixture prompt is not persisted from vendor output".to_vec(),
         })
         .await

@@ -848,20 +848,6 @@ pub(crate) fn accept_command(
             "idempotency key must contain 1 to 1024 UTF-8 bytes",
         ));
     }
-    let accepted_at_ms = config.clock.now_ms()?;
-    expire_accepted_commands(state, config, accepted_at_ms, effects)?;
-    let accepted_at = sqlite_time(accepted_at_ms)?;
-    let expires_at_ms = accepted_at_ms
-        .checked_add(COMMAND_QUEUE_TTL_MS)
-        .ok_or(RuntimeStoreError::TimeOutOfRange)?;
-    let retain_until_ms = expires_at_ms
-        .checked_add(COMMAND_LEDGER_RETENTION_MS)
-        .ok_or(RuntimeStoreError::TimeOutOfRange)?;
-    let expires_at = sqlite_time(expires_at_ms)?;
-    let retain_until = sqlite_time(retain_until_ms)?;
-    let projected_write_bytes =
-        projected_write_bytes(&[input.idempotency_key.len(), input.payload.len()])?;
-
     let owner_bytes = Zeroizing::new(canonical_owner_v1(&input.owner));
     let owner_token = state
         .key_bundle
@@ -874,13 +860,15 @@ pub(crate) fn accept_command(
     let idempotency_token = state
         .key_bundle
         .blind_index(b"command.idempotency.v1", idempotency_bytes.as_ref())?;
-    let payload_token = state
-        .key_bundle
-        .blind_index(b"command.payload.prompt.v1", &input.payload)?;
+    let payload_token = super::command_configuration::command_payload_token(
+        &state.key_bundle,
+        input.expected_configuration_revision,
+        &input.payload,
+    )?;
 
     let database_id = state.database_id;
-    let key_bundle = &state.key_bundle;
-    sqlite::load_runtime_ledger(&state.connection, key_bundle, database_id)?;
+    let preflight_ledger =
+        sqlite::load_runtime_ledger(&state.connection, &state.key_bundle, database_id)?;
     if let Some((command_id, persisted_payload_token)) = state
         .connection
         .query_row(
@@ -890,16 +878,42 @@ pub(crate) fn accept_command(
         )
         .optional()?
     {
-        if persisted_payload_token.as_slice() != payload_token.as_bytes() {
+        let command_id = runtime_id(RuntimeIdKind::Command, command_id)?;
+        let command = load_command(
+            &state.connection,
+            &state.key_bundle,
+            database_id,
+            command_id,
+        )?;
+        if persisted_payload_token.as_slice() != payload_token {
             return Err(RuntimeStoreError::IdempotencyConflict);
         }
-        let command_id = runtime_id(RuntimeIdKind::Command, command_id)?;
-        let command = load_command(&state.connection, key_bundle, database_id, command_id)?;
         return Ok(AcceptOutcome::Replayed { command });
     }
+    super::command_configuration::validate_fresh_admission(
+        &state.connection,
+        &state.key_bundle,
+        database_id,
+        input.conversation_id,
+        input.expected_configuration_revision,
+    )?;
+    super::command_configuration::ensure_pin_capacity(&preflight_ledger)?;
+    let accepted_at_ms = config.clock.now_ms()?;
+    expire_accepted_commands(state, config, accepted_at_ms, effects)?;
+    let accepted_at = sqlite_time(accepted_at_ms)?;
+    let expires_at_ms = accepted_at_ms
+        .checked_add(COMMAND_QUEUE_TTL_MS)
+        .ok_or(RuntimeStoreError::TimeOutOfRange)?;
+    let retain_until_ms = expires_at_ms
+        .checked_add(COMMAND_LEDGER_RETENTION_MS)
+        .ok_or(RuntimeStoreError::TimeOutOfRange)?;
+    let expires_at = sqlite_time(expires_at_ms)?;
+    let retain_until = sqlite_time(retain_until_ms)?;
+    let projected_write_bytes =
+        projected_write_bytes(&[input.idempotency_key.len(), input.payload.len(), 1024])?;
     let (preflight_conversation, _, _) = load_new_command_queue_state(
         &state.connection,
-        key_bundle,
+        &state.key_bundle,
         database_id,
         input.conversation_id,
         input.payload.len(),
@@ -920,6 +934,7 @@ pub(crate) fn accept_command(
         projected_write_bytes,
         SafetyReserveProjection::AcceptCommand,
     )?;
+    let key_bundle = &state.key_bundle;
     let transaction = state
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -931,13 +946,20 @@ pub(crate) fn accept_command(
         )
         .optional()?
     {
-        if persisted_payload_token.as_slice() != payload_token.as_bytes() {
-            return Err(RuntimeStoreError::IdempotencyConflict);
-        }
         let command_id = runtime_id(RuntimeIdKind::Command, command_id)?;
         let command = load_command(&transaction, key_bundle, database_id, command_id)?;
+        if persisted_payload_token.as_slice() != payload_token {
+            return Err(RuntimeStoreError::IdempotencyConflict);
+        }
         return Ok(AcceptOutcome::Replayed { command });
     }
+    let configuration_revision = super::command_configuration::validate_fresh_admission(
+        &transaction,
+        key_bundle,
+        database_id,
+        input.conversation_id,
+        input.expected_configuration_revision,
+    )?;
     let (conversation, ledger, queue_admission) = load_new_command_queue_state(
         &transaction,
         key_bundle,
@@ -945,6 +967,7 @@ pub(crate) fn accept_command(
         input.conversation_id,
         input.payload.len(),
     )?;
+    super::command_configuration::ensure_pin_capacity(&ledger)?;
 
     if accepted_at_ms < conversation.updated_at_ms {
         return Err(RuntimeStoreError::ClockRegressed {
@@ -984,7 +1007,7 @@ pub(crate) fn accept_command(
         command_seq.value,
         owner_token.as_bytes(),
         idempotency_token.as_bytes(),
-        payload_token.as_bytes(),
+        &payload_token,
         None,
         CommandState::Accepted,
         logical_payload_bytes,
@@ -1015,7 +1038,7 @@ pub(crate) fn accept_command(
             &command_id.as_bytes()[..],
             &owner_token.as_bytes()[..],
             &idempotency_token.as_bytes()[..],
-            &payload_token.as_bytes()[..],
+            &payload_token[..],
             i64::try_from(input.payload.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
             accepted_at,
             expires_at,
@@ -1023,6 +1046,13 @@ pub(crate) fn accept_command(
             &metadata_token[..],
             sealed_command,
         ],
+    )?;
+    super::command_configuration::insert_pin(
+        &transaction,
+        key_bundle,
+        input.conversation_id,
+        command_seq.value,
+        configuration_revision,
     )?;
     update_conversation_high_water(
         &transaction,
@@ -1038,6 +1068,10 @@ pub(crate) fn accept_command(
     let mut next_ledger = ledger.clone();
     next_ledger.command_count = next_ledger
         .command_count
+        .checked_add(1)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    next_ledger.command_configuration_pin_count = next_ledger
+        .command_configuration_pin_count
         .checked_add(1)
         .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
     next_ledger.accepted_count = next_ledger
@@ -1075,6 +1109,7 @@ pub(crate) fn accept_command(
             conversation_id: input.conversation_id,
             command_id,
             command_seq: command_seq.value,
+            configuration_revision,
             owner: input.owner,
             state: CommandState::Accepted,
             accepted_at_ms,
@@ -4137,6 +4172,12 @@ fn load_compact_command_receipt(
         return Err(RuntimeStoreError::CommandNotFound);
     }
     let command_seq = decode_sequence(SequenceScope::CommandSeq, &raw.command_seq)?;
+    let configuration_revision = super::command_configuration::load_revision(
+        connection,
+        key_bundle,
+        conversation_id,
+        command_seq,
+    )?;
     let state = parse_command_state(&raw.state)?;
     let logical_payload_bytes = u64::try_from(raw.logical_payload_bytes)
         .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
@@ -4199,6 +4240,7 @@ fn load_compact_command_receipt(
     }
     Ok(CommandReceiptRecord {
         command_id,
+        configuration_revision,
         state,
         turn_id,
     })
@@ -4290,6 +4332,13 @@ fn load_command(
     }
     let owner = decode_canonical_owner(fields[0])?;
     let conversation_id = runtime_id(RuntimeIdKind::Conversation, raw.conversation_id)?;
+    let command_seq = decode_sequence(SequenceScope::CommandSeq, &raw.command_seq)?;
+    let configuration_revision = super::command_configuration::load_revision(
+        connection,
+        key_bundle,
+        conversation_id,
+        command_seq,
+    )?;
     let expected_owner_token = key_bundle.blind_index(b"command.owner.v1", fields[0])?;
     let idempotency_plaintext = Zeroizing::new(canonical_fields(&[
         conversation_id.as_bytes(),
@@ -4298,12 +4347,16 @@ fn load_command(
     ])?);
     let expected_idempotency_token =
         key_bundle.blind_index(b"command.idempotency.v1", idempotency_plaintext.as_ref())?;
-    let expected_payload_token = key_bundle.blind_index(b"command.payload.prompt.v1", fields[2])?;
+    let expected_payload_token = super::command_configuration::command_payload_token(
+        key_bundle,
+        configuration_revision,
+        fields[2],
+    )?;
     let logical_payload_bytes = u64::try_from(raw.logical_payload_bytes)
         .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
     if raw.owner_token.as_slice() != expected_owner_token.as_bytes()
         || raw.idempotency_token.as_slice() != expected_idempotency_token.as_bytes()
-        || raw.payload_token.as_slice() != expected_payload_token.as_bytes()
+        || raw.payload_token.as_slice() != expected_payload_token
         || logical_payload_bytes
             != u64::try_from(fields[2].len())
                 .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
@@ -4327,7 +4380,6 @@ fn load_command(
         })
         .transpose()?;
     let state = parse_command_state(&raw.state)?;
-    let command_seq = decode_sequence(SequenceScope::CommandSeq, &raw.command_seq)?;
     let accepted_at_ms = runtime_time(raw.accepted_at_ms)?;
     let expires_at_ms = runtime_time(raw.expires_at_ms)?;
     let retain_until_ms = runtime_time(raw.retain_until_ms)?;
@@ -4399,6 +4451,7 @@ fn load_command(
         conversation_id,
         command_id,
         command_seq,
+        configuration_revision,
         owner,
         state,
         accepted_at_ms,
@@ -5053,6 +5106,50 @@ fn command_metadata_token(
             &started_event_id,
             &terminal_event_id,
         ],
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn command_metadata_token_for_test(
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    conversation_id: RuntimeId,
+    command_id: RuntimeId,
+    command_seq: u64,
+    owner_token: &[u8],
+    idempotency_token: &[u8],
+    payload_token: &[u8],
+    terminal_token: Option<&[u8]>,
+    state: CommandState,
+    logical_payload_bytes: u64,
+    accepted_at_ms: u64,
+    expires_at_ms: u64,
+    retain_until_ms: u64,
+    started_at_ms: Option<u64>,
+    terminal_at_ms: Option<u64>,
+    turn_id: Option<RuntimeId>,
+    started_event_id: Option<RuntimeId>,
+    terminal_event_id: Option<RuntimeId>,
+) -> Result<[u8; 32], RuntimeStoreError> {
+    command_metadata_token(
+        key_bundle,
+        conversation_id,
+        command_id,
+        command_seq,
+        owner_token,
+        idempotency_token,
+        payload_token,
+        terminal_token,
+        state,
+        logical_payload_bytes,
+        accepted_at_ms,
+        expires_at_ms,
+        retain_until_ms,
+        started_at_ms,
+        terminal_at_ms,
+        turn_id,
+        started_event_id,
+        terminal_event_id,
     )
 }
 

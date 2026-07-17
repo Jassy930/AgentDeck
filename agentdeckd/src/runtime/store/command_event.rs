@@ -289,6 +289,7 @@ mod tests {
             conversation_id: id(RuntimeIdKind::Conversation, 1),
             command_id: id(RuntimeIdKind::Command, 2),
             command_seq: 7,
+            configuration_revision: 0,
             owner: IdempotencyOwner::Local {
                 machine_trust_domain: [3; 32],
                 uid: 501,

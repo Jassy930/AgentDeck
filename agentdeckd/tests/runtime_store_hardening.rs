@@ -1149,7 +1149,7 @@ async fn intent_and_fence_plain_metadata_tamper_fail_closed_against_sealed_field
 
 #[tokio::test]
 async fn authenticated_command_conversation_event_and_runtime_ledger_metadata_tamper_fail_closed() {
-    // Command ordering metadata remains syntactically valid, but its old MAC must not authorize it.
+    // Command timing metadata remains syntactically valid, but its old MAC must not authorize it.
     {
         let root = TestRoot::new("command-metadata-token-tamper");
         let keys = MemoryKeyStore::new();
@@ -1175,10 +1175,10 @@ async fn authenticated_command_conversation_event_and_runtime_ledger_metadata_ta
         let connection = Connection::open(root.database()).expect("open command tamper DB");
         connection
             .execute(
-                "UPDATE commands SET command_seq = '00000000000000000001'",
+                "UPDATE commands SET accepted_at_ms = accepted_at_ms + 1",
                 [],
             )
-            .expect("tamper command sequence without its MAC");
+            .expect("tamper command acceptance time without its MAC");
         connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
             .expect("checkpoint command tamper");

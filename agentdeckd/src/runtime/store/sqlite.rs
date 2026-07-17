@@ -88,17 +88,24 @@ mod migration_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+    use agentdeck_protocol::runtime::{
+        CodexConversationConfiguration, ConversationConfiguration, VendorConfigurationSnapshot,
+    };
+    use agentdeck_protocol::{CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode};
     use rusqlite::{Connection, params};
 
     use super::*;
     use crate::runtime::model::{
-        AcceptCommand, AcceptOutcome, ConversationDescriptor, ExecutionFence, IdempotencyOwner,
-        MachineEnrollmentReceiptRecord, NewConversation, RuntimeCapacityObservation,
-        RuntimeCapacityProbe, RuntimeCapacityProbeError, RuntimeStoreFaultInjector, StartCommand,
+        AcceptCommand, AcceptOutcome, CommandState, ConversationDescriptor, ConversationLifecycle,
+        ExecutionFence, IdempotencyOwner, MachineEnrollmentReceiptRecord, NewConversation,
+        RuntimeCapacityObservation, RuntimeCapacityProbe, RuntimeCapacityProbeError,
+        RuntimeStoreFaultInjector, StartCommand, StartOutcome,
     };
     use crate::runtime::store::cipher::RowAad;
     use crate::runtime::store::identity::{RuntimeId, RuntimeIdKind};
+    use crate::runtime::store::sequence::{SequenceScope, decode_sequence, encode_sequence};
     use crate::runtime::store::worker::RuntimeStoreHandle;
+    use crate::runtime::store::{ConfigureConversation, ConfigureConversationOutcome};
     use crate::security::{MemoryKeyStore, SecretBytes, load_or_create_storage_kek};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
@@ -162,6 +169,324 @@ mod migration_tests {
             uid: 501,
             client_installation_id: [seed; 16],
         }
+    }
+
+    async fn configure_source_conversation(
+        store: &RuntimeStoreHandle,
+        conversation_id: RuntimeId,
+        seed: u8,
+    ) {
+        assert!(matches!(
+            store
+                .configure_conversation(ConfigureConversation {
+                    conversation_id,
+                    owner: owner(seed),
+                    idempotency_key: format!("legacy-source-configuration-{seed}"),
+                    expected_configuration_revision: 0,
+                    configuration: ConversationConfiguration::new(
+                        VendorConfigurationSnapshot::Codex(
+                            CodexConversationConfiguration::new(
+                                CodexApprovalPolicy::OnRequest,
+                                CodexSandboxMode::WorkspaceWrite,
+                                CodexReasoningEffort::Medium,
+                            ),
+                        ),
+                    ),
+                })
+                .await
+                .expect("configure current source conversation"),
+            ConfigureConversationOutcome::Applied { configuration }
+                if configuration.configuration_revision == 1 && configuration.event_seq == 0
+        ));
+    }
+
+    fn fixture_runtime_id(kind: RuntimeIdKind, raw: Vec<u8>) -> RuntimeId {
+        RuntimeId::from_bytes(
+            kind,
+            raw.try_into()
+                .expect("strict legacy RuntimeId has 16 bytes"),
+        )
+        .expect("strict legacy RuntimeId kind")
+    }
+
+    fn fixture_optional_runtime_id(kind: RuntimeIdKind, raw: Option<Vec<u8>>) -> Option<RuntimeId> {
+        raw.map(|value| fixture_runtime_id(kind, value))
+    }
+
+    fn rewrite_command_as_legacy_v1(
+        connection: &Connection,
+        key_bundle: &RuntimeKeyBundle,
+        command_id: RuntimeId,
+        payload: &[u8],
+    ) {
+        type RawCommand = (
+            (
+                Vec<u8>,
+                String,
+                String,
+                i64,
+                i64,
+                i64,
+                i64,
+                Option<i64>,
+                Option<i64>,
+            ),
+            (
+                Option<Vec<u8>>,
+                Option<Vec<u8>>,
+                Option<Vec<u8>>,
+                Vec<u8>,
+                Vec<u8>,
+                Option<Vec<u8>>,
+            ),
+        );
+        let raw: RawCommand = connection
+            .query_row(
+                "SELECT conversation_id, command_seq, state, logical_payload_bytes,
+                        accepted_at_ms, expires_at_ms, retain_until_ms,
+                        started_at_ms, terminal_at_ms, turn_id, started_event_id,
+                        terminal_event_id, owner_token, idempotency_token, terminal_token
+                 FROM commands WHERE command_id = ?1",
+                [&command_id.as_bytes()[..]],
+                |row| {
+                    Ok((
+                        (
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                        ),
+                        (
+                            row.get(9)?,
+                            row.get(10)?,
+                            row.get(11)?,
+                            row.get(12)?,
+                            row.get(13)?,
+                            row.get(14)?,
+                        ),
+                    ))
+                },
+            )
+            .expect("read current command for strict v1 projection");
+        let (
+            (
+                raw_conversation_id,
+                command_seq_encoded,
+                state,
+                logical_payload_bytes,
+                accepted_at_ms,
+                expires_at_ms,
+                retain_until_ms,
+                started_at_ms,
+                terminal_at_ms,
+            ),
+            (
+                turn_id,
+                started_event_id,
+                terminal_event_id,
+                owner_token,
+                idempotency_token,
+                terminal_token,
+            ),
+        ) = raw;
+        let conversation_id = fixture_runtime_id(RuntimeIdKind::Conversation, raw_conversation_id);
+        let command_seq = decode_sequence(SequenceScope::CommandSeq, &command_seq_encoded)
+            .expect("strict legacy command sequence");
+        let state = match state.as_str() {
+            "accepted" => CommandState::Accepted,
+            "started" => CommandState::Started,
+            other => panic!("unexpected strict legacy command state {other}"),
+        };
+        assert_eq!(
+            usize::try_from(logical_payload_bytes).expect("legacy payload length"),
+            payload.len()
+        );
+        let payload_token =
+            super::super::command_configuration::command_payload_token(key_bundle, 0, payload)
+                .expect("authenticate strict v1 payload token");
+        let logical_payload_bytes = u64::try_from(logical_payload_bytes)
+            .expect("non-negative strict v1 logical payload bytes");
+        let accepted_at_ms =
+            u64::try_from(accepted_at_ms).expect("non-negative strict v1 accepted time");
+        let expires_at_ms =
+            u64::try_from(expires_at_ms).expect("non-negative strict v1 expiry time");
+        let retain_until_ms =
+            u64::try_from(retain_until_ms).expect("non-negative strict v1 retention time");
+        let started_at_ms = started_at_ms
+            .map(|value| u64::try_from(value).expect("non-negative strict v1 started time"));
+        let terminal_at_ms = terminal_at_ms
+            .map(|value| u64::try_from(value).expect("non-negative strict v1 terminal time"));
+        let turn_id = fixture_optional_runtime_id(RuntimeIdKind::Turn, turn_id);
+        let started_event_id = fixture_optional_runtime_id(RuntimeIdKind::Event, started_event_id);
+        let terminal_event_id =
+            fixture_optional_runtime_id(RuntimeIdKind::Event, terminal_event_id);
+        let metadata_token = super::super::journal::command_metadata_token_for_test(
+            key_bundle,
+            conversation_id,
+            command_id,
+            command_seq,
+            &owner_token,
+            &idempotency_token,
+            &payload_token,
+            terminal_token.as_deref(),
+            state,
+            logical_payload_bytes,
+            accepted_at_ms,
+            expires_at_ms,
+            retain_until_ms,
+            started_at_ms,
+            terminal_at_ms,
+            turn_id,
+            started_event_id,
+            terminal_event_id,
+        )
+        .expect("authenticate strict v1 command metadata");
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE commands SET payload_token = ?1, metadata_token = ?2
+                    WHERE command_id = ?3",
+                    params![
+                        &payload_token[..],
+                        &metadata_token[..],
+                        &command_id.as_bytes()[..],
+                    ],
+                )
+                .expect("publish strict v1 command authentication"),
+            1
+        );
+    }
+
+    fn rewrite_conversation_event_high_water(
+        connection: &Connection,
+        key_bundle: &RuntimeKeyBundle,
+        conversation_id: RuntimeId,
+        event_high_water: Option<u64>,
+    ) {
+        let raw = connection
+            .query_row(
+                "SELECT adapter_state_key, catalog_revision, command_high_water,
+                        accepted_count, lifecycle, created_at_ms, updated_at_ms
+                 FROM conversations WHERE conversation_id = ?1",
+                [&conversation_id.as_bytes()[..]],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+            .expect("read current conversation for strict v1 projection");
+        let adapter_state_key = fixture_runtime_id(RuntimeIdKind::AdapterState, raw.0);
+        let catalog_revision = decode_sequence(SequenceScope::CatalogRevision, &raw.1)
+            .expect("strict legacy catalog revision");
+        let command_high_water = raw
+            .2
+            .as_deref()
+            .map(|value| decode_sequence(SequenceScope::CommandSeq, value))
+            .transpose()
+            .expect("strict legacy command high water");
+        let accepted_command_count =
+            u32::try_from(raw.3).expect("strict legacy accepted command count");
+        assert_eq!(raw.4, "active", "strict legacy conversation stays active");
+        let created_at_ms = u64::try_from(raw.5).expect("strict legacy creation time");
+        let updated_at_ms = u64::try_from(raw.6).expect("strict legacy update time");
+        let metadata_token = super::super::journal::conversation_metadata_token_for_test(
+            key_bundle,
+            conversation_id,
+            adapter_state_key,
+            catalog_revision,
+            command_high_water,
+            event_high_water,
+            accepted_command_count,
+            ConversationLifecycle::Active,
+            created_at_ms,
+            updated_at_ms,
+        )
+        .expect("authenticate strict v1 conversation metadata");
+        let event_high_water = event_high_water.map(encode_sequence);
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE conversations SET event_high_water = ?1, metadata_token = ?2
+                     WHERE conversation_id = ?3",
+                    params![
+                        event_high_water.as_deref(),
+                        &metadata_token[..],
+                        &conversation_id.as_bytes()[..],
+                    ],
+                )
+                .expect("publish strict v1 conversation metadata"),
+            1
+        );
+    }
+
+    fn rewrite_started_event_as_legacy_seq_zero(
+        connection: &Connection,
+        key_bundle: &RuntimeKeyBundle,
+        event_id: RuntimeId,
+    ) {
+        let raw = connection
+            .query_row(
+                "SELECT conversation_id, event_seq, command_id,
+                        logical_event_bytes, created_at_ms
+                 FROM event_journal WHERE event_id = ?1",
+                [&event_id.as_bytes()[..]],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .expect("read started event for strict v1 projection");
+        let conversation_id = fixture_runtime_id(RuntimeIdKind::Conversation, raw.0);
+        assert_eq!(
+            decode_sequence(SequenceScope::EventSeq, &raw.1)
+                .expect("current started event sequence"),
+            1,
+            "configuration event must be the only earlier source event"
+        );
+        let command_id = fixture_optional_runtime_id(RuntimeIdKind::Command, raw.2);
+        let logical_event_bytes = u64::try_from(raw.3).expect("strict legacy logical event bytes");
+        let created_at_ms = u64::try_from(raw.4).expect("strict legacy event time");
+        let metadata_token = super::super::journal::event_metadata_token(
+            key_bundle,
+            conversation_id,
+            event_id,
+            0,
+            command_id,
+            logical_event_bytes,
+            created_at_ms,
+        )
+        .expect("authenticate strict v1 event metadata");
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE event_journal SET event_seq = ?1, metadata_token = ?2
+                     WHERE event_id = ?3",
+                    params![
+                        encode_sequence(0),
+                        &metadata_token[..],
+                        &event_id.as_bytes()[..],
+                    ],
+                )
+                .expect("publish strict v1 event sequence"),
+            1
+        );
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -336,33 +661,39 @@ mod migration_tests {
             .create_conversation(conversation(0x13, b"legacy empty descriptor"))
             .await
             .expect("create empty legacy conversation");
-        store
+        configure_source_conversation(&store, accepted_conversation.conversation_id, 1).await;
+        configure_source_conversation(&store, started_conversation.conversation_id, 2).await;
+        let accepted_command = match store
             .accept_command(AcceptCommand {
                 conversation_id: accepted_conversation.conversation_id,
                 owner: owner(1),
                 idempotency_key: "legacy-accepted".to_owned(),
-                expected_configuration_revision: 0,
+                expected_configuration_revision: 1,
                 payload: b"legacy accepted payload".to_vec(),
             })
             .await
-            .expect("persist legacy Accepted command");
+            .expect("persist current source Accepted command")
+        {
+            AcceptOutcome::Accepted { command, .. } => command,
+            AcceptOutcome::Replayed { .. } => panic!("fresh source command cannot replay"),
+        };
         let started_command = match store
             .accept_command(AcceptCommand {
                 conversation_id: started_conversation.conversation_id,
                 owner: owner(2),
                 idempotency_key: "legacy-started".to_owned(),
-                expected_configuration_revision: 0,
+                expected_configuration_revision: 1,
                 payload: b"legacy started payload".to_vec(),
             })
             .await
-            .expect("accept command to start")
+            .expect("accept current source command to start")
         {
             AcceptOutcome::Accepted { command, .. } => command,
-            AcceptOutcome::Replayed { .. } => panic!("fresh legacy command cannot replay"),
+            AcceptOutcome::Replayed { .. } => panic!("fresh source command cannot replay"),
         };
         let daemon_boot_id = runtime_id(RuntimeIdKind::DaemonBoot, 0x41);
         let execution_nonce = b"legacy-execution-nonce".to_vec();
-        store
+        let started_event = match store
             .mark_started_with_legacy_v1_fixture_for_test(
                 StartCommand {
                     conversation_id: started_conversation.conversation_id,
@@ -374,7 +705,11 @@ mod migration_tests {
                 b"legacy started event".to_vec(),
             )
             .await
-            .expect("persist legacy intent and event");
+            .expect("persist legacy intent and event")
+        {
+            StartOutcome::Started { event, .. } => event,
+            StartOutcome::Replayed { .. } => panic!("fresh source start cannot replay"),
+        };
         store
             .persist_execution_fence(ExecutionFence {
                 command_id: started_command.command_id,
@@ -420,7 +755,58 @@ mod migration_tests {
             &meta.wrapped_key_bundle,
         )
         .expect("unwrap source Runtime keys");
-        let legacy_token = runtime_ledger_token_v1(&key_bundle, meta.database_id, &meta.ledger)
+        rewrite_command_as_legacy_v1(
+            &source_connection,
+            &key_bundle,
+            accepted_command.command_id,
+            b"legacy accepted payload",
+        );
+        rewrite_command_as_legacy_v1(
+            &source_connection,
+            &key_bundle,
+            started_command.command_id,
+            b"legacy started payload",
+        );
+        source_connection
+            .pragma_update(None, "foreign_keys", false)
+            .expect("detach current-only sidecar references for strict v1 projection");
+        assert_eq!(
+            source_connection
+                .execute(
+                    "DELETE FROM event_journal
+                     WHERE EXISTS (
+                         SELECT 1 FROM configuration_journal AS configuration
+                         WHERE configuration.conversation_id = event_journal.conversation_id
+                           AND configuration.event_seq = event_journal.event_seq
+                     )",
+                    [],
+                )
+                .expect("remove current-only configuration events from strict v1 projection"),
+            2
+        );
+        rewrite_started_event_as_legacy_seq_zero(
+            &source_connection,
+            &key_bundle,
+            started_event.event_id,
+        );
+        rewrite_conversation_event_high_water(
+            &source_connection,
+            &key_bundle,
+            accepted_conversation.conversation_id,
+            None,
+        );
+        rewrite_conversation_event_high_water(
+            &source_connection,
+            &key_bundle,
+            started_conversation.conversation_id,
+            Some(0),
+        );
+        let mut legacy_ledger = meta.ledger.clone();
+        legacy_ledger.event_count = legacy_ledger
+            .event_count
+            .checked_sub(2)
+            .expect("two current-only configuration events");
+        let legacy_token = runtime_ledger_token_v1(&key_bundle, meta.database_id, &legacy_ledger)
             .expect("authenticate frozen v1 ledger");
 
         let destination = root.database();
@@ -444,17 +830,17 @@ mod migration_tests {
                     &meta.database_id[..],
                     i64::from(meta.key_generation),
                     &meta.wrapped_key_bundle,
-                    meta.ledger.catalog_high_water.as_deref(),
-                    i64::try_from(meta.ledger.conversation_count).unwrap(),
-                    i64::try_from(meta.ledger.command_count).unwrap(),
-                    i64::try_from(meta.ledger.event_count).unwrap(),
-                    i64::try_from(meta.ledger.intent_count).unwrap(),
-                    i64::try_from(meta.ledger.fence_count).unwrap(),
-                    i64::try_from(meta.ledger.accepted_count).unwrap(),
-                    i64::try_from(meta.ledger.accepted_payload_bytes).unwrap(),
-                    i64::try_from(meta.ledger.started_without_fence_count).unwrap(),
-                    i64::try_from(meta.ledger.started_without_release_count).unwrap(),
-                    i64::try_from(meta.ledger.started_released_count).unwrap(),
+                    legacy_ledger.catalog_high_water.as_deref(),
+                    i64::try_from(legacy_ledger.conversation_count).unwrap(),
+                    i64::try_from(legacy_ledger.command_count).unwrap(),
+                    i64::try_from(legacy_ledger.event_count).unwrap(),
+                    i64::try_from(legacy_ledger.intent_count).unwrap(),
+                    i64::try_from(legacy_ledger.fence_count).unwrap(),
+                    i64::try_from(legacy_ledger.accepted_count).unwrap(),
+                    i64::try_from(legacy_ledger.accepted_payload_bytes).unwrap(),
+                    i64::try_from(legacy_ledger.started_without_fence_count).unwrap(),
+                    i64::try_from(legacy_ledger.started_without_release_count).unwrap(),
+                    i64::try_from(legacy_ledger.started_released_count).unwrap(),
                     &legacy_token[..],
                 ],
             )

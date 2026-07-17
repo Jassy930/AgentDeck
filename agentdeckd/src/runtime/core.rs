@@ -723,12 +723,10 @@ impl RuntimeCore {
                 // SendPrompt 的所有业务拒绝都属于 CommandReceipt family；否则
                 // Companion 会把一次 command failure 误解成 envelope/control failure。
                 let receipt = match async {
-                    // 威胁场景：production Runtime v2 在 configuration store 落地前
-                    // 接受 rev0 prompt，会把用户选择静默回落为 P3.7 默认值。只有
-                    // DisabledExecutionCoordinator 的永久测试构造可保留旧 admission。
-                    if !self.allow_unconfigured_test_prompts
-                        || request.expected_configuration_revision != 0
-                    {
+                    // B3a1 只让永久测试构造穿过 Store 的真实 configuration
+                    // admission；production 入口仍保持 feature-unavailable，直到
+                    // B3a3 完成 authorization ownership 与完整 failure 收口。
+                    if !self.allow_unconfigured_test_prompts {
                         return Err(RuntimeCoreError::FeatureUnavailable);
                     }
                     validate_idempotency_key(&request.idempotency_key)?;
@@ -740,6 +738,7 @@ impl RuntimeCore {
                             principal,
                             authorization,
                             request.idempotency_key.as_str().to_owned(),
+                            request.expected_configuration_revision,
                             request.prompt.into_string().into_bytes(),
                         )
                         .await
@@ -753,11 +752,11 @@ impl RuntimeCore {
                     }) => CommandReceipt::Accepted {
                         command_id: wire_command_id(command.command_id),
                         queue_position,
-                        configuration_revision: 0,
+                        configuration_revision: command.configuration_revision,
                     },
                     Ok(PromptAcceptResult::Replayed { command }) => CommandReceipt::Replayed {
                         command_id: wire_command_id(command.command_id),
-                        configuration_revision: 0,
+                        configuration_revision: command.configuration_revision,
                     },
                     Err(error) => CommandReceipt::Failed {
                         failure: error.into_failure(),
@@ -898,7 +897,7 @@ impl RuntimeCore {
                 Ok(RuntimeReply::CommandStatus(CommandStatusReceipt {
                     conversation_id,
                     command_id: wire_command_id(receipt.command_id),
-                    configuration_revision: 0,
+                    configuration_revision: receipt.configuration_revision,
                     status: wire_command_status(receipt.state),
                     turn_id: receipt.turn_id.map(wire_turn_id),
                 }))

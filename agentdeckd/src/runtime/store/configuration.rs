@@ -365,7 +365,7 @@ fn conversation_state_metadata_token(
 }
 
 #[derive(Clone)]
-struct AuthenticatedConversationState {
+pub(super) struct AuthenticatedConversationState {
     current_configuration_revision: Option<String>,
     entry_revision: String,
     origin_kind: String,
@@ -375,12 +375,20 @@ struct AuthenticatedConversationState {
 }
 
 impl AuthenticatedConversationState {
-    fn current_revision(&self) -> Result<u64, RuntimeStoreError> {
+    pub(super) fn current_revision(&self) -> Result<u64, RuntimeStoreError> {
         self.current_configuration_revision
             .as_deref()
             .map(|value| decode_sequence(SequenceScope::ConfigurationRevision, value))
             .transpose()
             .map(Option::unwrap_or_default)
+            .map_err(RuntimeStoreError::from)
+    }
+
+    pub(super) fn legacy_command_high_water(&self) -> Result<Option<u64>, RuntimeStoreError> {
+        self.legacy_command_high_water
+            .as_deref()
+            .map(|value| decode_sequence(SequenceScope::CommandSeq, value))
+            .transpose()
             .map_err(RuntimeStoreError::from)
     }
 }
@@ -391,7 +399,7 @@ fn fixed_token(value: Vec<u8>) -> Result<[u8; 32], RuntimeStoreError> {
         .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)
 }
 
-fn load_conversation_state(
+pub(super) fn load_conversation_state(
     connection: &Connection,
     key_bundle: &RuntimeKeyBundle,
     conversation_id: RuntimeId,
@@ -520,6 +528,26 @@ fn query_configuration_row_by_event(
              FROM configuration_journal
              WHERE conversation_id = ?1 AND event_seq = ?2",
             params![&conversation_id.as_bytes()[..], event_seq],
+            raw_configuration_row,
+        )
+        .optional()
+        .map_err(RuntimeStoreError::from)
+}
+
+fn query_configuration_row_by_revision(
+    connection: &Connection,
+    conversation_id: RuntimeId,
+    configuration_revision: &str,
+) -> Result<Option<RawConfigurationRow>, RuntimeStoreError> {
+    connection
+        .query_row(
+            "SELECT conversation_id, configuration_revision, base_configuration_revision,
+                    event_seq, owner_token, idempotency_token, request_token,
+                    logical_configuration_bytes, logical_request_bytes, created_at_ms,
+                    metadata_token, sealed_request
+             FROM configuration_journal
+             WHERE conversation_id = ?1 AND configuration_revision = ?2",
+            params![&conversation_id.as_bytes()[..], configuration_revision],
             raw_configuration_row,
         )
         .optional()
@@ -710,6 +738,61 @@ fn authenticate_configuration_row(
         sealed_bytes: u64::try_from(raw.sealed_request.len())
             .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
     })
+}
+
+/// 认证指定 conversation 的 exact configuration revision，并确认物理 journal
+/// 行数与该 append-only revision 一致。调用方必须在自己的 SQLite 事务内调用；
+/// 这样 admission 不会把“行存在”误当成 current head 已通过 AEAD/MAC/event 验证。
+pub(super) fn load_authenticated_configuration_revision(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    conversation_id: RuntimeId,
+    configuration_revision: u64,
+) -> Result<ConfigurationRecord, RuntimeStoreError> {
+    if configuration_revision == 0 {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let encoded_revision = encode_sequence(configuration_revision);
+    let raw = query_configuration_row_by_revision(connection, conversation_id, &encoded_revision)?
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let conversation =
+        super::journal::load_conversation(connection, key_bundle, database_id, conversation_id)?;
+    let authenticated =
+        authenticate_configuration_row(connection, key_bundle, database_id, &conversation, raw)?;
+    let (physical_count, first_revision, last_revision) = connection.query_row(
+        "SELECT COUNT(*), MIN(configuration_revision), MAX(configuration_revision)
+         FROM configuration_journal WHERE conversation_id = ?1",
+        [&conversation_id.as_bytes()[..]],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    )?;
+    let physical_count =
+        u64::try_from(physical_count).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let first_revision = first_revision
+        .as_deref()
+        .map(|value| decode_sequence(SequenceScope::ConfigurationRevision, value))
+        .transpose()?
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let last_revision = last_revision
+        .as_deref()
+        .map(|value| decode_sequence(SequenceScope::ConfigurationRevision, value))
+        .transpose()?
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if authenticated.record.conversation_id != conversation_id
+        || authenticated.record.configuration_revision != configuration_revision
+        || physical_count != configuration_revision
+        || first_revision != 1
+        || last_revision != configuration_revision
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(authenticated.record)
 }
 
 fn try_replay_configuration(
@@ -1425,7 +1508,6 @@ pub(super) fn validate_v5_integrity(
         };
     }
     if version != 5
-        || ledger.command_configuration_pin_count != 0
         || ledger.metadata_mutation_count != 0
         || ledger.active_metadata_mutation_count != 0
         || ledger.metadata_mutation_charged_bytes != 0
@@ -1566,6 +1648,8 @@ pub(super) fn validate_v5_integrity(
             return Err(RuntimeStoreError::UnknownOrCorruptSchema);
         }
     }
+    let authenticated_pin_count =
+        super::command_configuration::validate_v5_integrity(connection, key_bundle, ledger)?;
     let missing_states: i64 = connection.query_row(
         "SELECT COUNT(*) FROM conversations AS c
          LEFT JOIN conversation_state AS s USING (conversation_id)
@@ -1599,10 +1683,12 @@ pub(super) fn validate_v5_integrity(
         u64::try_from(physical.0).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
     let physical_configuration_bytes =
         u64::try_from(physical.1).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let physical_pin_count =
+        u64::try_from(physical.2).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
     if missing_states != 0
         || physical_configuration_count != authenticated_configuration_count
         || physical_configuration_bytes != authenticated_sealed_bytes
-        || physical.2 != 0
+        || physical_pin_count != authenticated_pin_count
         || physical.3 != 0
         || physical.4 != 0
         || physical.5 != 0

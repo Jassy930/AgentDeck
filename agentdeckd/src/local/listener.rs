@@ -685,14 +685,18 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use agentdeck_protocol::AgentKind;
     use agentdeck_protocol::runtime::command::{
         CatalogRequest, ConversationStart, HelloParams, QueryReceiptSelector, SendPromptRequest,
     };
     use agentdeck_protocol::runtime::identity::{IdempotencyKey, MessageId};
     use agentdeck_protocol::runtime::{
-        CommandReceipt, CommandStatus, MAX_RUNTIME_JSON_FRAME_BYTES, PromptPayload,
-        RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeMessage, RuntimeReply, RuntimeRequest,
+        CodexConversationConfiguration, CommandReceipt, CommandStatus, ConfigurationReceipt,
+        ConfigureConversationRequest, ConversationConfiguration, MAX_RUNTIME_JSON_FRAME_BYTES,
+        PromptPayload, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeMessage, RuntimeReply,
+        RuntimeRequest, VendorConfigurationSnapshot,
+    };
+    use agentdeck_protocol::{
+        AgentKind, CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -937,18 +941,47 @@ mod tests {
         let RuntimeReply::ConversationStart(start) = start else {
             panic!("expected listener conversation start")
         };
+        let configured = request(
+            &mut sibling,
+            "listener-configure",
+            RuntimeRequest::ConfigureConversation(ConfigureConversationRequest::new(
+                start.conversation_id.clone(),
+                IdempotencyKey::new("listener-active-configuration"),
+                0,
+                ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
+                    CodexConversationConfiguration::new(
+                        CodexApprovalPolicy::OnRequest,
+                        CodexSandboxMode::WorkspaceWrite,
+                        CodexReasoningEffort::Medium,
+                    ),
+                )),
+            )),
+        )
+        .await;
+        assert!(matches!(
+            configured,
+            RuntimeReply::Configuration(ConfigurationReceipt::Applied {
+                conversation_id,
+                configuration_revision: 1,
+            }) if conversation_id == start.conversation_id
+        ));
         let prompt = request(
             &mut sibling,
             "listener-prompt",
             RuntimeRequest::SendPrompt(SendPromptRequest {
                 conversation_id: start.conversation_id.clone(),
                 idempotency_key: IdempotencyKey::new("listener-active-prompt"),
-                expected_configuration_revision: 0,
+                expected_configuration_revision: 1,
                 prompt: PromptPayload::new("hold active execution").expect("valid listener prompt"),
             }),
         )
         .await;
-        let RuntimeReply::Command(CommandReceipt::Accepted { command_id, .. }) = prompt else {
+        let RuntimeReply::Command(CommandReceipt::Accepted {
+            command_id,
+            configuration_revision: 1,
+            ..
+        }) = prompt
+        else {
             panic!("expected accepted listener prompt")
         };
         tokio::time::timeout(IO_TIMEOUT, fake.wait_for_starts(1))
@@ -967,6 +1000,7 @@ mod tests {
         let RuntimeReply::CommandStatus(before) = status else {
             panic!("expected listener command status")
         };
+        assert_eq!(before.configuration_revision, 1);
         assert_eq!(before.status, CommandStatus::Started);
         let turn_id = before.turn_id.clone().expect("active listener turn id");
 
@@ -1035,6 +1069,7 @@ mod tests {
         let RuntimeReply::CommandStatus(after) = status else {
             panic!("expected post-backpressure command status")
         };
+        assert_eq!(after.configuration_revision, 1);
         assert_eq!(after.status, CommandStatus::Started);
         assert_eq!(after.command_id, command_id);
         assert_eq!(after.turn_id.as_ref(), Some(&turn_id));

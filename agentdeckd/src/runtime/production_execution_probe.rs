@@ -36,6 +36,7 @@ use crate::runtime::process_identity::{
 };
 use crate::runtime::store::{
     AcceptCommand, AcceptOutcome, CommandReceiptRecord, CommandReceiptSelector, CommandState,
+    ConfigurationRecord, ConfigureConversation, ConfigureConversationOutcome,
     ConversationDescriptor, IdempotencyOwner, NewConversation, QueryCommandReceipt,
     RuntimeBackfillPlan, RuntimeBackfillTarget, RuntimeId, RuntimeIdKind, RuntimeStoreConfig,
     RuntimeStoreError, RuntimeStoreFaultInjector, RuntimeStoreHandle, RuntimeStoreOperation,
@@ -242,13 +243,43 @@ async fn run_production_execution_probe_mode(
         })
         .await
         .map_err(|error| format!("create probe conversation: {error}"))?;
+    let configured = store
+        .configure_conversation(ConfigureConversation {
+            conversation_id,
+            owner: owner.clone(),
+            idempotency_key: "production-execution-probe-configuration".to_owned(),
+            expected_configuration_revision: 0,
+            configuration: ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
+                CodexConversationConfiguration::new(
+                    CodexApprovalPolicy::OnRequest,
+                    CodexSandboxMode::WorkspaceWrite,
+                    CodexReasoningEffort::Medium,
+                ),
+            )),
+        })
+        .await
+        .map_err(|error| format!("configure probe conversation: {error}"))?;
+    if !matches!(
+        configured,
+        ConfigureConversationOutcome::Applied {
+            configuration: ConfigurationRecord {
+                configuration_revision: 1,
+                event_seq: 0,
+                ..
+            }
+        }
+    ) {
+        return Err(format!(
+            "probe conversation did not apply configuration revision one: {configured:?}"
+        ));
+    }
     let prompt = "private production wiring prompt";
     let command = match store
         .accept_command(AcceptCommand {
             conversation_id,
             owner: owner.clone(),
             idempotency_key: "production-execution-probe".to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: prompt.as_bytes().to_vec(),
         })
         .await
@@ -257,6 +288,12 @@ async fn run_production_execution_probe_mode(
         AcceptOutcome::Accepted { command, .. } => command,
         AcceptOutcome::Replayed { .. } => return Err("fresh probe command replayed".to_owned()),
     };
+    if command.configuration_revision != 1 {
+        return Err(format!(
+            "probe command pinned unexpected configuration revision {}",
+            command.configuration_revision
+        ));
+    }
 
     let mut router = crate::runtime::AgentRouter::new();
     router.register(Arc::new(ProbeAgent {
@@ -372,6 +409,12 @@ async fn run_production_execution_probe_mode(
         })
         .await
         .map_err(|error| format!("query reopened probe command: {error}"))?;
+    if receipt.configuration_revision != 1 {
+        return Err(format!(
+            "reopened probe command reported unexpected configuration revision {}",
+            receipt.configuration_revision
+        ));
+    }
     let (item_count, terminal_count) =
         count_reopened_events(&reopened, conversation_id, command.command_id, mode).await?;
     reopened
@@ -411,6 +454,12 @@ async fn wait_for_command_state(
                 })
                 .await
                 .map_err(|error| format!("query probe command: {error}"))?;
+            if receipt.configuration_revision != 1 {
+                return Err(format!(
+                    "probe command reported unexpected configuration revision {}",
+                    receipt.configuration_revision
+                ));
+            }
             if receipt.state == expected {
                 return Ok::<CommandReceiptRecord, String>(receipt);
             }
@@ -537,14 +586,16 @@ async fn count_reopened_events(
     let RuntimeBackfillPlan::Pinned(pin) = store
         .acquire_backfill_pin(
             RuntimeBackfillTarget::Conversation(conversation_id),
-            Some(0),
+            // seq0=ConfigurationChanged，seq1=TurnStarted；本门禁只统计
+            // command output 与唯一 terminal suffix。
+            Some(1),
         )
         .await
         .map_err(|error| format!("pin reopened probe backfill: {error}"))?
     else {
         return Err("probe event suffix was unexpectedly empty".to_owned());
     };
-    let mut after = Some(0);
+    let mut after = Some(1);
     let mut item_count = 0_usize;
     let mut terminal_count = 0_usize;
     let command_id_text = command_id.to_canonical_string();

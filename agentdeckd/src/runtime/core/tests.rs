@@ -1025,6 +1025,14 @@ async fn start_is_pure_durable_idempotent_then_prompt_and_query_are_separate() {
             if code == agentdeck_protocol::runtime::failure::DAEMON_COMMAND_IDEMPOTENCY_CONFLICT
     ));
 
+    configure_codex_revision_one(
+        &core,
+        connection,
+        created.conversation_id.clone(),
+        "start-query-configuration",
+    )
+    .await;
+
     let prompt_key = IdempotencyKey::new("prompt-1");
     let prompt = PromptPayload::new("hello durable queue").expect("prompt");
     let accepted = core
@@ -1033,13 +1041,17 @@ async fn start_is_pure_durable_idempotent_then_prompt_and_query_are_separate() {
             RuntimeRequest::SendPrompt(SendPromptRequest {
                 conversation_id: created.conversation_id.clone(),
                 idempotency_key: prompt_key.clone(),
-                expected_configuration_revision: 0,
+                expected_configuration_revision: 1,
                 prompt,
             }),
         )
         .await;
     let command_id = match accepted {
-        RuntimeReply::Command(CommandReceipt::Accepted { command_id, .. }) => command_id,
+        RuntimeReply::Command(CommandReceipt::Accepted {
+            command_id,
+            configuration_revision: 1,
+            ..
+        }) => command_id,
         other => panic!("expected accepted command, got {other:?}"),
     };
     let status = core
@@ -1055,6 +1067,7 @@ async fn start_is_pure_durable_idempotent_then_prompt_and_query_are_separate() {
         RuntimeReply::CommandStatus(receipt) => {
             assert_eq!(receipt.conversation_id, created.conversation_id);
             assert_eq!(receipt.command_id, command_id);
+            assert_eq!(receipt.configuration_revision, 1);
             assert_eq!(receipt.status, CommandStatus::Accepted);
             assert_eq!(receipt.turn_id, None);
         }
@@ -1112,20 +1125,30 @@ async fn accepted_queue_is_recovered_paged_and_remains_unstarted_without_real_ga
             .handle(first_connection, start_request("restart-start"))
             .await,
     );
+    configure_codex_revision_one(
+        &first_core,
+        first_connection,
+        conversation.conversation_id.clone(),
+        "restart-configuration",
+    )
+    .await;
     let accepted = first_core
         .handle(
             first_connection,
             RuntimeRequest::SendPrompt(SendPromptRequest {
                 conversation_id: conversation.conversation_id.clone(),
                 idempotency_key: IdempotencyKey::new("restart-prompt"),
-                expected_configuration_revision: 0,
+                expected_configuration_revision: 1,
                 prompt: PromptPayload::new("survive restart").expect("prompt"),
             }),
         )
         .await;
     assert!(matches!(
         accepted,
-        RuntimeReply::Command(CommandReceipt::Accepted { .. })
+        RuntimeReply::Command(CommandReceipt::Accepted {
+            configuration_revision: 1,
+            ..
+        })
     ));
     first_core.shutdown().await.expect("first shutdown");
     drop(first_core);
@@ -1158,6 +1181,7 @@ async fn accepted_queue_is_recovered_paged_and_remains_unstarted_without_real_ga
     assert!(matches!(
         status,
         RuntimeReply::CommandStatus(CommandStatusReceipt {
+            configuration_revision: 1,
             status: CommandStatus::Accepted,
             turn_id: None,
             ..
