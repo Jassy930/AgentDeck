@@ -525,8 +525,20 @@ conversation/key，不能伪造身份连续性。
   物化每个既有 conversation 的 rev0/unconfigured、`entryRevision=0`、Managed origin 与 legacy cutoff，
   最后同事务切换 schema/signature/ledger token。cutoff 逐字复制已认证 command HWM：NULL 保持
   BeforeFirst，真实 seq0 不得折叠成 NULL。fresh v5 conversation 则在 create transaction 内同时写入
-  `conversation_state`。B2/B3/B4 writer 落地前 configuration/pin/metadata 表非空一律 fail-close；这只证明
-  migration/materialization，不证明 Configure CAS、command pin、metadata mutation 或整库历史回滚检测。
+  `conversation_state`。B2 已落地 authenticated configuration CAS writer、每次选择都认证完整
+  `1...head` 链的 frozen-cursor snapshot selector，以及 RuntimeCore Configure/DescribeAgents 路由；
+  `command_configuration_pins` / `metadata_mutation_ledger` 在 B3/B4 前仍必须为空。migration 与 B2 都不证明
+  command pin、metadata mutation 或整库历史回滚检测。
+- configuration 的幂等 namespace 固定为 conversation + canonical owner + raw key，sealed full request 同时
+  绑定 expected revision 与 canonical configuration。Applied 只推进 configuration/event head 并产生唯一
+  commandless `ConfigurationChanged`；exact replay、CAS conflict 与所有 reject 不写新 event，Catalog HWM
+  恒定。snapshot 只按 captured base event cursor 选配置，旧 Ready/Build snapshot 后再用 contiguous backfill
+  收敛到 current revision，禁止把 current head 直接塞进旧 snapshot。
+- RuntimeCore 将 Configure 的 authorization guard 移交 Store normal command；caller future 取消不影响 guard，
+  正在执行的 command 直到 COMMIT outcome、authenticated notification readback 与 reply send 后才释放。
+  recovery 拒绝、入队失败或 shutdown 丢弃未执行 command 时只释放 guard、不会 COMMIT；不允许用 detached
+  task 延长授权。`DescribeAgents` 的 defaults 由各 adapter required method 提供，Router 以稳定顺序整批校验
+  capability/default/vendor kind，任一畸形即 fail-close。
 - 普通副作用准入同时检查 main/WAL/SHM、projected growth、文件系统
   `max(512 MiB, 5%)` reserve、`page_count/max_page_count`，并在每次 COMMIT 后重新观测。
   Accepted/Started 在普通准入时分别预留 expiry 与 fence/release/最大 terminal safety tail；

@@ -1895,7 +1895,7 @@ P3.9 固定以下迁移边界：
     一次性 DB/WAL/KEK 在最终 gate 后删除，未以手写 SQL fixture 替代。migration 21/21、schema 12/12、
     store 29/29、boundary 5/5、cipher 13/13、daemon lib 659 passed + 1 ignored、完整 package/Clippy/fmt/
     no-net/App selfcheck 全绿；spec/security 终审 Approved，无残留 P0/P1/P2。
-  - [ ] **B2 configuration CAS/snapshot：** 只读重估会超过 1,800 additions，动代码前预拆为三片；三片
+  - [x] **B2 configuration CAS/snapshot：** 只读重估会超过 1,800 additions，动代码前预拆为三片；三片
     共同收口 owner-scoped CAS/replay/conflict、sealed full request、单一 ConfigurationChanged、
     cursor-consistent snapshot、DescribeAgents/default configuration 与零 catalog 漂移：
     - [x] **B2a store CAS/integrity：** 初始 production + 基础测试已达约 1,619 additions，继续加入
@@ -1931,8 +1931,20 @@ P3.9 固定以下迁移边界：
       边界（255.14 秒）、stream 45/45、transfer 17/17、StorageKEK 14 passed + 1 ignored；Clippy/fmt/no-net/
       docs/App selfcheck/diff 全绿。两轮独立终审 Approved、无剩余 P0/P1/P2；P3.1 signed Keychain 外部门禁
       继续 BLOCKED。
-    - [ ] **B2c Core cutover/defaults：** DescribeAgents 稳定 defaults、RuntimeCore Configure production route、
-      receipt/subscriber/reconnect 一致；不夹带 B3 SendPrompt/pin 或 B4 metadata mutation。
+    - [x] **B2c Core cutover/defaults（code commit `30103c1`，实际 1,333 additions / 72 deletions）：**
+      `Agent::default_configuration` 为 required method；Codex default 固定
+      `OnRequest + WorkspaceWrite + Medium`，Claude Code 固定
+      `Default + null model/effort/outputStyle`。Router 以 `BTreeMap` 稳定排序并对 adapter error、
+      capability/default/vendor kind mismatch 整批 fail-close；DescribeAgents 在 principal guard 内返回 typed
+      `Agents`。RuntimeCore Configure 已映射 Applied/Replayed/Conflict/Failed、not-found、agent mismatch 与
+      authorization family；Core 专用 Store command 持有 authorization guard 到 durable outcome、通知、reply
+      完成，caller cancellation 不会提前放行 revoke，也没有 detached task。Applied 只通知一条
+      `ConfigurationChanged`，replay/conflict 与 Catalog 均零新事件；旧 rev0 Ready snapshot 经 rev1 backfill
+      收敛，after-COMMIT unknown 仍只通知一次且 exact retry Replayed。focused Core/订阅 8/8、Router 8/8、
+      trait 1/1、runtime snapshot 23 passed + 1 ignored、daemon lib 672 passed + 1 ignored、完整 package含真实
+      1,024 × 256 MiB 边界 255.29 秒均 exit 0；Clippy/fmt/no-net/docs/App selfcheck/diff 全绿。两路独立
+      spec/security/quality 终审 Approved、无 P0/P1/P2；未夹带 B3 SendPrompt/pin 或 B4 metadata mutation，
+      P3.1 signed Keychain 外部门禁继续 BLOCKED。
   - [ ] **B3a admission pin：** SendPrompt expected revision、Accepted 同事务非零 pin、receipt/status/query
     原 revision、并发 Configure/Prompt 线性化；新 command 缺 pin fail-close。
   - [ ] **B3b exact execution：** queued/restart/recovery 按 pin load exact configuration；只有

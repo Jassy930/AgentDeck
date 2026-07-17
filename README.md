@@ -407,10 +407,18 @@ CancelQueued/CancelActive 与精确 QueryReceipt 接到 Runtime journal。Start 
 相同 owner+start key 由 StorageKEK 域分离 capability 稳定派生，跨重启返回同一
 公共 `conversationId` 和准确 replay bit；Start receipt、Catalog 与 snapshot wire 已删除
 daemon-private adapter handle。C0-B1b 已把 production Runtime DB 升到 schema v5，并为 fresh/迁移
-conversation 物化 authenticated `conversation_state`；B2/B3/B4 writer 落地前，
-`configuration_journal`、`command_configuration_pins`、`metadata_mutation_ledger` 必须为空，非空即
+conversation 物化 authenticated `conversation_state`；C0-B2 已接通 append-only
+`configuration_journal`、frozen-cursor snapshot selector 与 RuntimeCore `ConfigureConversation`，每次
+Applied 只写一条 commandless `ConfigurationChanged`，不推进 activity/catalog/entry revision，也不产生
+`CatalogDelta`。exact retry 返回 Replayed，stale/future CAS 返回 Conflict；after-COMMIT unknown 仍从
+authenticated readback 通知一次，后续 exact retry 不重复广播。caller 被取消后，authorization guard
+由 Store command 保持到 durable outcome、通知和 reply 完成，不创建 detached task。
+`DescribeAgents` 对任意已认证 Runtime principal 返回按 `AgentKind` 稳定排序的 capabilities + adapter-owned
+default configuration；Codex 默认为 `OnRequest + WorkspaceWrite + Medium`，Claude Code 默认为
+`Default + null model/effort/outputStyle`，任一 adapter 错误或 kind/vendor 不匹配整批 fail-close。
+`command_configuration_pins` 与 `metadata_mutation_ledger` 在 B3/B4 writer 落地前仍必须为空，非空即
 fail-close。production `SendPrompt` 对所有 revision 仍返回 typed `feature_unavailable`；只有
-`#[cfg(test)]` legacy harness 可使用显式 revision 0，新增 mutation 同样 fail-closed。prompt
+`#[cfg(test)]` legacy harness 可使用显式 revision 0，新增 metadata mutation 同样 fail-closed。prompt
 actor 以 journal `commandSeq` 为唯一 FIFO，同 conversation 只有一个 active，不同 conversation
 可由全局 semaphore 并行；control 使用有界优先批次，ReadPool 满时立即 overload，不排无界
 waiter。

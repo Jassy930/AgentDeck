@@ -1333,8 +1333,56 @@ state、approval、publication、terminal result 只沿用各自 authenticated r
 没有真实 writer 样本时不会伪造通过。
 
 本门禁只收口 production schema v5、v1–v4 authenticated migration、fresh/migrated
-`conversation_state` 与六项 ledger totals。B2 Configure CAS/snapshot、B3 pin/admission/exact execution、
-B4 metadata writer、P4 E2EE/CounterGuard、App/CLI UDS cutover 和 Companion E2E 均不在本片完成范围。
+`conversation_state` 与六项 ledger totals。B2 Configure CAS/snapshot 后续已由 `9330f78`、`fa24782`、
+`c54ddc8`、`30103c1` 完成；B3 pin/admission/exact execution、B4 metadata writer、P4 E2EE/CounterGuard、
+App/CLI UDS cutover 和 Companion E2E 仍不在 B1b 完成范围。
+
+## Relay Companion MVP P3.9-C0-B2 configuration / Core 门禁
+
+**具体威胁场景：** 已认证 client 在 Configure COMMIT 前断开，或对同一 configuration 做 exact retry / CAS
+conflict / reconnect；若 authorization guard 只留在 caller 栈，或 Core 与 Store 各自广播，可能出现撤销已完成
+但写入仍提交、重复 `ConfigurationChanged`、Catalog 漂移，或旧 snapshot 与 backfill revision 分叉。
+
+本门禁的信任根是 Runtime Store 已认证的 conversation/configuration/event 链、transport 签发的 opaque
+principal lease，以及两个 adapter 在代码中冻结的 default configuration。测试证明这些输入经 B2 writer、
+frozen cursor selector 与 Core route 保持一致；不证明 P3.1 provisioned signed Keychain、B3 command pin、
+B4 metadata mutation、P4 whole-database rollback detection 或 live vendor login。
+
+```bash
+# Router defaults / required trait / cursor snapshot
+cargo test -p agentdeckd --test agent_router
+cargo test -p agentdeckd --test agent_trait_shape
+cargo test -p agentdeckd --test runtime_snapshot
+
+# Core receipt、普通/取消 caller 授权与 subscriber/reconnect/unknown outcome
+cargo test -p agentdeckd --lib \
+  configure_conversation_returns_exact_replay_conflict_and_typed_failures
+cargo test -p agentdeckd --lib \
+  configure_authorization_guard_covers_the_store_commit
+cargo test -p agentdeckd --lib \
+  canceled_configure_caller_keeps_authorization_until_store_completion
+cargo test -p agentdeckd --lib \
+  configure_applied_replay_and_conflict_have_exact_stream_effects
+cargo test -p agentdeckd --lib \
+  reconnect_uses_frozen_snapshot_then_configuration_backfill
+cargo test -p agentdeckd --lib \
+  configure_after_commit_unknown_notifies_once_and_exact_retry_replays
+
+# 完整回归与静态边界
+cargo test -p agentdeckd
+cargo clippy -p agentdeckd --all-targets -- -D warnings
+cargo fmt --all -- --check
+bash scripts/check-daemon-no-net.sh
+swift run AgentDeck -- --selfcheck
+scripts/verify-agent-docs.sh
+git diff --check
+```
+
+B2c scoped code commit 为 `30103c1`，实际 `+1,333/-72`，低于 1,800 additions 预拆线。收口读回为
+Router 8/8、trait shape 1/1、runtime snapshot 23 passed / 1 ignored、daemon lib 672 passed / 1 ignored；
+完整 package 含 1,024 × 256 MiB exact boundary 255.29 秒、stream 45/45、transfer 17/17、StorageKEK
+14 passed / 1 ignored，全部 exit 0。两路独立终审均 Approved，无 P0/P1/P2。B2 只完成 configuration
+CAS/snapshot/Core/defaults；B3–B5、P4–P6 与 P3.1 signed Keychain 外部门禁仍未完成。
 
 ## AppKit 重写后的验证清单
 
