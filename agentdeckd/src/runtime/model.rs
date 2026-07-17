@@ -506,6 +506,7 @@ pub struct AcceptCommand {
     pub conversation_id: RuntimeId,
     pub owner: IdempotencyOwner,
     pub idempotency_key: String,
+    pub expected_configuration_revision: u64,
     pub payload: Vec<u8>,
 }
 

@@ -226,6 +226,7 @@ fn create_conversation_with_event(
                 client_installation_id: [seed.wrapping_add(1); 16],
             },
             idempotency_key: format!("retention-command-{seed}"),
+            expected_configuration_revision: 0,
             payload: b"retention prompt".to_vec(),
         },
         &mut effects,

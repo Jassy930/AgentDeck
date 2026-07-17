@@ -320,6 +320,7 @@ async fn run_recorded_fixture(
             conversation_id,
             owner: owner(),
             idempotency_key: format!("recorded-fixture-{label}"),
+            expected_configuration_revision: 0,
             payload: b"recorded fixture prompt is not persisted from vendor output".to_vec(),
         })
         .await

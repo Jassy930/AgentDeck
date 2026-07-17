@@ -150,6 +150,7 @@ fn accept_input(
         conversation_id,
         owner: local_owner(),
         idempotency_key: idempotency_key.into(),
+        expected_configuration_revision: 0,
         payload: payload.into(),
     }
 }

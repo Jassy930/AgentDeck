@@ -115,6 +115,7 @@ async fn nine_mib_canonical_event_replays_through_backfill_and_snapshot_pages() 
                 client_installation_id: [0x42; 16],
             },
             idempotency_key: "oversized-event".to_owned(),
+            expected_configuration_revision: 0,
             payload: b"oversized event command".to_vec(),
         })
         .await

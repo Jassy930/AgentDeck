@@ -341,6 +341,7 @@ mod migration_tests {
                 conversation_id: accepted_conversation.conversation_id,
                 owner: owner(1),
                 idempotency_key: "legacy-accepted".to_owned(),
+                expected_configuration_revision: 0,
                 payload: b"legacy accepted payload".to_vec(),
             })
             .await
@@ -350,6 +351,7 @@ mod migration_tests {
                 conversation_id: started_conversation.conversation_id,
                 owner: owner(2),
                 idempotency_key: "legacy-started".to_owned(),
+                expected_configuration_revision: 0,
                 payload: b"legacy started payload".to_vec(),
             })
             .await

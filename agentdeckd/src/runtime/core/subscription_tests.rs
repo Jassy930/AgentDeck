@@ -169,6 +169,7 @@ async fn append_large_snapshot_event(
             conversation_id,
             owner: owner.clone(),
             idempotency_key: format!("large-snapshot-{owner_seed}"),
+            expected_configuration_revision: 0,
             payload: b"large snapshot prompt".to_vec(),
         })
         .await
@@ -1815,6 +1816,7 @@ async fn asynchronous_snapshot_failure_emits_a_directed_terminal_failure() {
             conversation_id,
             owner: owner.clone(),
             idempotency_key: "noncanonical-snapshot-event".to_owned(),
+            expected_configuration_revision: 0,
             payload: b"prompt".to_vec(),
         })
         .await
@@ -1964,6 +1966,7 @@ async fn failure_after_flushed_snapshot_fail_closes_the_connection() {
             conversation_id,
             owner: owner.clone(),
             idempotency_key: "partial-failure-command".to_owned(),
+            expected_configuration_revision: 0,
             payload: b"prompt".to_vec(),
         })
         .await

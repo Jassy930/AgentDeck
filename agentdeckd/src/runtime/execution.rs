@@ -840,6 +840,7 @@ mod tests {
                     client_installation_id: [0x34; 16],
                 },
                 idempotency_key: "typed-gate-release".to_owned(),
+                expected_configuration_revision: 0,
                 payload: b"typed release prompt".to_vec(),
             })
             .await

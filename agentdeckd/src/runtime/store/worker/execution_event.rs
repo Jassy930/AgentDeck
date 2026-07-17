@@ -152,6 +152,7 @@ mod tests {
                     client_installation_id: [0x22; 16],
                 },
                 idempotency_key: "execution-event-build-gate".to_owned(),
+                expected_configuration_revision: 0,
                 payload: b"real prompt sample".to_vec(),
             })
             .await

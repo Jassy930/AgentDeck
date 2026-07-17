@@ -107,6 +107,7 @@ impl RuntimeEventTamperFixture {
                     client_installation_id: [0x22; 16],
                 },
                 idempotency_key: format!("runtime-event-tamper-{seed}"),
+                expected_configuration_revision: 0,
                 payload: b"real tamper fixture prompt".to_vec(),
             })
             .await
@@ -454,6 +455,7 @@ impl RuntimeStartedReleaseTamperFixture {
                     client_installation_id: [0x44; 16],
                 },
                 idempotency_key: format!("started-release-tamper-{seed}"),
+                expected_configuration_revision: 0,
                 payload: b"started-only tamper prompt".to_vec(),
             })
             .await

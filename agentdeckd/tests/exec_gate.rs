@@ -317,6 +317,7 @@ impl StartedFixture {
                 conversation_id,
                 owner,
                 idempotency_key: format!("exec-gate-{seed}"),
+                expected_configuration_revision: 0,
                 payload: b"exec gate fixture prompt".to_vec(),
             })
             .await

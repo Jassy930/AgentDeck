@@ -1197,6 +1197,7 @@ async fn snapshot_build_pin_allows_frozen_base_while_writer_advances_high_water(
                 client_installation_id: [0xA2; 16],
             },
             idempotency_key: "snapshot-build".to_owned(),
+            expected_configuration_revision: 0,
             payload: b"snapshot command".to_vec(),
         })
         .await
@@ -1666,6 +1667,7 @@ async fn before_first_snapshot_capability_survives_event_zero_writer_progress() 
                 client_installation_id: [0xB2; 16],
             },
             idempotency_key: "before-first".to_owned(),
+            expected_configuration_revision: 0,
             payload: b"advance to event zero".to_vec(),
         })
         .await

@@ -427,6 +427,7 @@ async fn accept_one(store: &RuntimeStoreHandle, conversation_id: RuntimeId) -> R
             conversation_id,
             owner: owner(0x90),
             idempotency_key: "snapshot-command".to_owned(),
+            expected_configuration_revision: 0,
             payload: b"snapshot prompt".to_vec(),
         })
         .await

@@ -225,6 +225,7 @@ async fn accept(
                 conversation_id,
                 owner: owner(seed),
                 idempotency_key: format!("request-{seed}"),
+                expected_configuration_revision: 0,
                 payload,
             })
             .await
@@ -401,6 +402,7 @@ async fn recovery_blocked_cas_rejects_every_stale_started_binding_field() {
             conversation_id: conversation.conversation_id,
             owner: owner(0x32),
             idempotency_key: "exact-blocked".to_owned(),
+            expected_configuration_revision: 0,
             payload: b"exact blocked binding".to_vec(),
         })
         .await

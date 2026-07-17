@@ -270,6 +270,7 @@ async fn accept(
             conversation_id,
             owner: owner(seed),
             idempotency_key: format!("recovery-{seed}-{suffix}"),
+            expected_configuration_revision: 0,
             payload: format!("recovery prompt {suffix}").into_bytes(),
         })
         .await
@@ -757,6 +758,7 @@ async fn runtime_core_rejects_remote_accepted_before_installing_any_actor() {
             conversation_id,
             owner: remote_owner(0xA3),
             idempotency_key: "remote-recovery".to_owned(),
+            expected_configuration_revision: 0,
             payload: b"remote recovery prompt".to_vec(),
         })
         .await

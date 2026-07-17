@@ -101,6 +101,7 @@ async fn create_and_accept(
             conversation_id: conversation.conversation_id,
             owner,
             idempotency_key: key.to_owned(),
+            expected_configuration_revision: 0,
             payload: format!("payload-{key}").into_bytes(),
         })
         .await
@@ -357,6 +358,7 @@ async fn accepted_and_recovered_commands_return_the_redacted_owner() {
             conversation_id: conversation.conversation_id,
             owner: owner.clone(),
             idempotency_key: "owner-recovery".to_owned(),
+            expected_configuration_revision: 0,
             payload: b"owner recovery prompt".to_vec(),
         })
         .await

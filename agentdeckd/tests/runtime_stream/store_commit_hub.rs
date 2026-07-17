@@ -813,6 +813,7 @@ async fn expiry_and_main_commit_same_target_union_reads_back_once() {
             conversation_id,
             owner: owner(0x93),
             idempotency_key: "old-expiring-command".to_owned(),
+            expected_configuration_revision: 0,
             payload: b"old expiring command".to_vec(),
         })
         .await
@@ -823,6 +824,7 @@ async fn expiry_and_main_commit_same_target_union_reads_back_once() {
             conversation_id,
             owner: owner(0x93),
             idempotency_key: "fresh-start-command".to_owned(),
+            expected_configuration_revision: 0,
             payload: b"fresh start command".to_vec(),
         })
         .await
@@ -1089,6 +1091,7 @@ async fn failed_target_readback_preserves_mutation_and_notifies_healthy_target()
                 conversation_id: trigger_id,
                 owner: owner(0x92),
                 idempotency_key: "trigger-readback-isolation".to_owned(),
+                expected_configuration_revision: 0,
                 payload: b"trigger readback isolation".to_vec(),
             })
             .await
@@ -1176,6 +1179,7 @@ async fn bulk_expiry_after_commit_unknown_notifies_every_affected_conversation()
             conversation_id: trigger_id,
             owner: owner(0x91),
             idempotency_key: "trigger-bulk-expiry".to_owned(),
+            expected_configuration_revision: 0,
             payload: b"trigger bulk expiry".to_vec(),
         })
         .await

@@ -273,6 +273,7 @@ async fn accepted_and_started_replays_bypass_disk_low_admission() {
         conversation_id: conversation.conversation_id,
         owner: local_owner(),
         idempotency_key: "same-request".to_owned(),
+        expected_configuration_revision: 0,
         payload: b"same-prompt".to_vec(),
     };
     let command = match store
@@ -339,6 +340,7 @@ async fn new_accept_and_start_are_rejected_before_their_first_durable_write() {
         conversation_id: conversation.conversation_id,
         owner: local_owner(),
         idempotency_key: "gated-command".to_owned(),
+        expected_configuration_revision: 0,
         payload: b"prompt".to_vec(),
     };
 
@@ -411,6 +413,7 @@ async fn start_reserves_the_complete_fence_release_and_max_terminal_tail() {
             conversation_id: conversation.conversation_id,
             owner: local_owner(),
             idempotency_key: "reserve-command".to_owned(),
+            expected_configuration_revision: 0,
             payload: b"prompt".to_vec(),
         })
         .await
@@ -499,6 +502,7 @@ async fn safety_only_revalidates_reserved_tail_before_fence_release_and_terminal
             conversation_id: conversation.conversation_id,
             owner: local_owner(),
             idempotency_key: "safety-command".to_owned(),
+            expected_configuration_revision: 0,
             payload: b"prompt".to_vec(),
         })
         .await
@@ -657,6 +661,7 @@ async fn released_terminal_closes_on_fragmented_real_sqlite_with_a_pinned_wal_re
             conversation_id: conversation.conversation_id,
             owner: local_owner(),
             idempotency_key: "released-terminal-real-sqlite".to_owned(),
+            expected_configuration_revision: 0,
             payload: b"terminal capacity prompt".to_vec(),
         })
         .await

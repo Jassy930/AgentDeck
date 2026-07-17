@@ -524,6 +524,7 @@ async fn started_terminal_fixture(
             conversation_id,
             owner: owner(),
             idempotency_key: "legacy-terminal".to_owned(),
+            expected_configuration_revision: 0,
             payload: b"prompt".to_vec(),
         })
         .await
@@ -633,6 +634,7 @@ async fn accepted_fixture(label: &str, reason: AcceptedTerminationReason) -> Ter
             conversation_id,
             owner: owner(),
             idempotency_key: "legacy-accepted".to_owned(),
+            expected_configuration_revision: 0,
             payload: b"prompt".to_vec(),
         })
         .await

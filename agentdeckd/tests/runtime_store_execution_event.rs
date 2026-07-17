@@ -151,6 +151,7 @@ async fn started_turn_unreleased_with_event(
             conversation_id,
             owner: owner(),
             idempotency_key: format!("execution-event-{seed}"),
+            expected_configuration_revision: 0,
             payload: b"real prompt sample".to_vec(),
         })
         .await

@@ -2317,6 +2317,7 @@ async fn prompt_admission_worker(
                 conversation_id,
                 owner: command.principal.idempotency_owner(),
                 idempotency_key: command.idempotency_key,
+                expected_configuration_revision: 0,
                 payload: command.payload,
             })
             .await;

@@ -798,6 +798,7 @@ mod tests {
                 conversation_id,
                 owner,
                 idempotency_key: key.to_owned(),
+                expected_configuration_revision: 0,
                 payload: format!("mixed recovery prompt {key}").into_bytes(),
             })
             .await

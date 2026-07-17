@@ -4098,6 +4098,7 @@ mod tests {
                 conversation_id,
                 owner,
                 idempotency_key: "approval-command".to_owned(),
+                expected_configuration_revision: 0,
                 payload: b"approval-prompt-sentinel".to_vec(),
             })
             .await
@@ -5379,6 +5380,7 @@ mod tests {
                         client_installation_id: [0xa2; 16],
                     },
                     idempotency_key: "latch-terminal-safety-only".to_owned(),
+                    expected_configuration_revision: 0,
                     payload: b"must-not-commit".to_vec(),
                 })
                 .await,
@@ -5395,6 +5397,7 @@ mod tests {
                         client_installation_id: [0xa2; 16],
                     },
                     idempotency_key: "confirm-terminal-safety-only".to_owned(),
+                    expected_configuration_revision: 0,
                     payload: b"still-must-not-commit".to_vec(),
                 })
                 .await,
@@ -7558,6 +7561,7 @@ mod tests {
                 conversation_id,
                 owner: owner.clone(),
                 idempotency_key: "latch-safety-only".to_owned(),
+                expected_configuration_revision: 0,
                 payload: b"must-not-commit".to_vec(),
             })
             .await
@@ -7569,6 +7573,7 @@ mod tests {
                     conversation_id,
                     owner,
                     idempotency_key: "confirm-safety-only".to_owned(),
+                    expected_configuration_revision: 0,
                     payload: b"still-must-not-commit".to_vec(),
                 })
                 .await,

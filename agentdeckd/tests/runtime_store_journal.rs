@@ -141,6 +141,7 @@ async fn accept(
             conversation_id,
             owner,
             idempotency_key: key.to_owned(),
+            expected_configuration_revision: 0,
             payload: payload.to_vec(),
         })
         .await
@@ -228,6 +229,7 @@ async fn catalog_command_sequences_and_idempotency_survive_restart() {
             conversation_id: conversation.conversation_id,
             owner: local_owner(1),
             idempotency_key: "request-1".to_owned(),
+            expected_configuration_revision: 0,
             payload: b"different prompt".to_vec(),
         })
         .await
@@ -370,6 +372,7 @@ async fn per_conversation_queue_limit_is_exact_and_replay_precedes_admission() {
             conversation_id: conversation.conversation_id,
             owner: local_owner(1),
             idempotency_key: "overflow".to_owned(),
+            expected_configuration_revision: 0,
             payload: b"overflow".to_vec(),
         })
         .await

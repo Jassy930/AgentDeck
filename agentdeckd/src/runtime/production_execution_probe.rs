@@ -248,6 +248,7 @@ async fn run_production_execution_probe_mode(
             conversation_id,
             owner: owner.clone(),
             idempotency_key: "production-execution-probe".to_owned(),
+            expected_configuration_revision: 0,
             payload: prompt.as_bytes().to_vec(),
         })
         .await

@@ -225,6 +225,7 @@ async fn released_started_turn(
             conversation_id,
             owner: owner(),
             idempotency_key: format!("execution-event-commit-{seed}"),
+            expected_configuration_revision: 0,
             payload: b"real prompt sample".to_vec(),
         })
         .await

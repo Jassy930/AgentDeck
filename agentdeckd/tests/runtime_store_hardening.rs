@@ -133,6 +133,7 @@ async fn accept_new(
             conversation_id,
             owner,
             idempotency_key: idempotency_key.to_owned(),
+            expected_configuration_revision: 0,
             payload: payload.to_vec(),
         })
         .await
@@ -520,6 +521,7 @@ async fn every_side_effect_after_commit_unknown_has_an_exact_retry() {
         conversation_id: conversation.conversation_id,
         owner: local_owner(1),
         idempotency_key: "after-commit-accept".to_owned(),
+        expected_configuration_revision: 0,
         payload: b"accepted payload".to_vec(),
     };
     let error = store
@@ -669,6 +671,7 @@ async fn expiry_after_commit_unknown_converges_through_the_identical_outer_accep
         conversation_id: conversation.conversation_id,
         owner: local_owner(2),
         idempotency_key: "outer-exact-retry".to_owned(),
+        expected_configuration_revision: 0,
         payload: b"new prompt".to_vec(),
     };
     let error = store
@@ -757,6 +760,7 @@ async fn every_before_commit_fault_rolls_back_and_first_retry_commits_once() {
         conversation_id: conversation.conversation_id,
         owner: local_owner(0x21),
         idempotency_key: "rollback-accept".to_owned(),
+        expected_configuration_revision: 0,
         payload: b"rollback prompt".to_vec(),
     };
     assert!(matches!(
@@ -1943,6 +1947,7 @@ async fn accept_sweeps_expired_rows_before_quota_and_writes_canonical_events() {
             conversation_id: conversation.conversation_id,
             owner: local_owner(1),
             idempotency_key: "after-expiry-sweep".to_owned(),
+            expected_configuration_revision: 0,
             payload: b"new prompt".to_vec(),
         })
         .await
@@ -2000,6 +2005,7 @@ async fn recovery_sweeps_expiry_with_event_and_expired_completion_is_typed() {
             conversation_id: conversation.conversation_id,
             owner: local_owner(1),
             idempotency_key: "recovery-expired".to_owned(),
+            expected_configuration_revision: 0,
             payload: b"expired prompt".to_vec(),
         })
         .await
@@ -2210,6 +2216,7 @@ async fn every_sensitive_journal_field_stays_out_of_db_wal_shm_and_debug() {
                 client_installation_id: LOCAL_INSTALLATION,
             },
             idempotency_key: IDEMPOTENCY_KEY.to_owned(),
+            expected_configuration_revision: 0,
             payload: PROMPT.to_vec(),
         })
         .await
@@ -2279,6 +2286,7 @@ async fn every_sensitive_journal_field_stays_out_of_db_wal_shm_and_debug() {
                 device_sign_fingerprint: REMOTE_FINGERPRINT,
             },
             idempotency_key: REMOTE_KEY.to_owned(),
+            expected_configuration_revision: 0,
             payload: REMOTE_PROMPT.to_vec(),
         })
         .await
