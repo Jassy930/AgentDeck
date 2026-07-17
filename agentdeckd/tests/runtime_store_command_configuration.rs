@@ -3,23 +3,32 @@ mod runtime_descriptor;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use agentdeck_protocol::runtime::{
     CodexConversationConfiguration, ConversationConfiguration, VendorConfigurationSnapshot,
 };
 use agentdeck_protocol::{CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode};
 use agentdeckd::runtime::store::{
-    AcceptCommand, AcceptOutcome, CommandReceiptSelector, CommandRecord, ConfigureConversation,
-    ConfigureConversationOutcome, IdempotencyOwner, NewConversation, QueryCommandReceipt,
-    RuntimeClock, RuntimeClockError, RuntimeId, RuntimeIdKind, RuntimeStoreConfig,
-    RuntimeStoreError, RuntimeStoreHandle,
+    AcceptCommand, AcceptOutcome, CommandReceiptSelector, CommandRecord, CommandState,
+    ConfigureConversation, ConfigureConversationOutcome, IdempotencyOwner, NewConversation,
+    QueryCommandReceipt, RuntimeClock, RuntimeClockError, RuntimeCommitOperation, RuntimeId,
+    RuntimeIdKind, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreFaultInjector,
+    RuntimeStoreHandle, RuntimeStoreLane, RuntimeStoreOperation, StartCommand, StartOutcome,
+    StartedBeforeReleaseTermination, TerminateStartedBeforeRelease,
+    TerminateStartedBeforeReleaseOutcome,
 };
 use agentdeckd::security::{MemoryKeyStore, StorageKek, load_or_create_storage_kek};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, OpenFlags, ToSql, Transaction};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+const EVIDENCE_MAX_ROWS_PER_TABLE: usize = 64;
+const EVIDENCE_MAX_COLUMNS_PER_TABLE: usize = 64;
+const EVIDENCE_MAX_BYTES_PER_TABLE: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 struct ArmableFailClock {
@@ -48,6 +57,101 @@ impl RuntimeClock for ArmableFailClock {
             Ok(self.now_ms.load(Ordering::SeqCst))
         }
     }
+}
+
+struct FailOperationOnce {
+    target: RuntimeStoreOperation,
+    armed: AtomicBool,
+}
+
+impl FailOperationOnce {
+    fn new(target: RuntimeStoreOperation) -> Self {
+        Self {
+            target,
+            armed: AtomicBool::new(true),
+        }
+    }
+}
+
+impl RuntimeStoreFaultInjector for FailOperationOnce {
+    fn before_operation(&self, operation: RuntimeStoreOperation) -> Result<(), RuntimeStoreError> {
+        if operation == self.target && self.armed.swap(false, Ordering::SeqCst) {
+            Err(RuntimeStoreError::InvalidConfig(
+                "injected command configuration fault",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct BlockingOperationOnce {
+    target: RuntimeStoreOperation,
+    armed: AtomicBool,
+    entered: SyncSender<()>,
+    release: Mutex<Receiver<()>>,
+}
+
+impl BlockingOperationOnce {
+    fn new(target: RuntimeStoreOperation, entered: SyncSender<()>, release: Receiver<()>) -> Self {
+        Self {
+            target,
+            armed: AtomicBool::new(false),
+            entered,
+            release: Mutex::new(release),
+        }
+    }
+
+    fn arm(&self) {
+        assert!(
+            !self.armed.swap(true, Ordering::SeqCst),
+            "blocking Store fault is already armed"
+        );
+    }
+}
+
+impl RuntimeStoreFaultInjector for BlockingOperationOnce {
+    fn before_operation(&self, operation: RuntimeStoreOperation) -> Result<(), RuntimeStoreError> {
+        if operation == self.target && self.armed.swap(false, Ordering::SeqCst) {
+            self.entered
+                .send(())
+                .map_err(|_| RuntimeStoreError::WorkerStopped)?;
+            self.release
+                .lock()
+                .map_err(|_| RuntimeStoreError::WorkerStopped)?
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|_| RuntimeStoreError::WorkerStopped)?;
+        }
+        Ok(())
+    }
+}
+
+struct FaultChain(Vec<Arc<BlockingOperationOnce>>);
+
+impl RuntimeStoreFaultInjector for FaultChain {
+    fn before_operation(&self, operation: RuntimeStoreOperation) -> Result<(), RuntimeStoreError> {
+        for fault in &self.0 {
+            fault.before_operation(operation)?;
+        }
+        Ok(())
+    }
+}
+
+async fn wait_for_blocked_worker(entered: Receiver<()>) {
+    tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(5)))
+        .await
+        .expect("join blocked Store worker observer")
+        .expect("Store worker reached the controlled before-COMMIT barrier");
+}
+
+fn assert_commit_unknown(error: RuntimeStoreError, expected: RuntimeCommitOperation) {
+    assert!(
+        matches!(
+            error,
+            RuntimeStoreError::CommitOutcomeUnknown { operation } if operation == expected
+        ),
+        "expected CommitOutcomeUnknown({expected:?}), got {error:?}"
+    );
 }
 
 struct TestRoot(PathBuf);
@@ -90,53 +194,301 @@ impl Drop for TestRoot {
 struct CommandEvidence {
     command_rows: i64,
     pin_rows: i64,
+    global_command_rows: i64,
+    global_pin_rows: i64,
+    global_accepted_rows: i64,
+    global_accepted_payload_bytes: i64,
+    conversation_accepted_rows: i64,
+    conversation_accepted_payload_bytes: i64,
+    configuration_rows: i64,
+    configuration_sealed_bytes: i64,
+    event_journal_rows: i64,
+    event_journal_logical_bytes: i64,
+    event_stream_rows: i64,
+    event_stream_logical_bytes: i64,
+    catalog_journal_rows: i64,
+    catalog_journal_logical_bytes: i64,
     ledger_command_count: i64,
     ledger_accepted_count: i64,
     ledger_accepted_payload_bytes: i64,
     ledger_pin_count: i64,
+    ledger_event_count: i64,
+    ledger_audit_event_logical_bytes: i64,
+    ledger_event_stream_count: i64,
+    ledger_event_stream_bytes: i64,
+    ledger_catalog_delta_count: i64,
+    ledger_catalog_delta_bytes: i64,
+    ledger_configuration_count: i64,
+    ledger_configuration_sealed_bytes: i64,
     conversation_accepted_count: i64,
     catalog_high_water: Option<String>,
     command_high_water: Option<String>,
     event_high_water: Option<String>,
+    configuration_head: Option<String>,
+    tables: Vec<TableSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SqlCell {
+    Null,
+    Integer(i64),
+    RealBits(u64),
+    Text(Vec<u8>),
+    Blob(Vec<u8>),
+}
+
+impl SqlCell {
+    fn from_value(value: ValueRef<'_>) -> Self {
+        match value {
+            ValueRef::Null => Self::Null,
+            ValueRef::Integer(value) => Self::Integer(value),
+            ValueRef::Real(value) => Self::RealBits(value.to_bits()),
+            ValueRef::Text(value) => Self::Text(value.to_vec()),
+            ValueRef::Blob(value) => Self::Blob(value.to_vec()),
+        }
+    }
+
+    fn retained_bytes(value: &ValueRef<'_>) -> usize {
+        match value {
+            ValueRef::Null => 1,
+            ValueRef::Integer(_) | ValueRef::Real(_) => 8,
+            ValueRef::Text(value) | ValueRef::Blob(value) => value.len(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TableSnapshot {
+    table: &'static str,
+    columns: Vec<String>,
+    rows: Vec<Vec<SqlCell>>,
+    retained_bytes: usize,
+}
+
+fn table_snapshot(
+    transaction: &Transaction<'_>,
+    table: &'static str,
+    sql: &str,
+    parameters: &[&dyn ToSql],
+) -> TableSnapshot {
+    let mut statement = transaction
+        .prepare(sql)
+        .unwrap_or_else(|error| panic!("prepare {table} evidence snapshot: {error}"));
+    let columns = statement
+        .column_names()
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let column_count = statement.column_count();
+    assert!(
+        column_count <= EVIDENCE_MAX_COLUMNS_PER_TABLE,
+        "{table} evidence exceeds {EVIDENCE_MAX_COLUMNS_PER_TABLE} columns"
+    );
+    let mut retained_bytes = table.len();
+    for column in &columns {
+        retained_bytes = retained_bytes
+            .checked_add(column.len())
+            .expect("evidence column byte count fits usize");
+    }
+    assert!(
+        retained_bytes <= EVIDENCE_MAX_BYTES_PER_TABLE,
+        "{table} evidence columns exceed {EVIDENCE_MAX_BYTES_PER_TABLE} retained bytes"
+    );
+    let mut query = statement
+        .query(parameters)
+        .unwrap_or_else(|error| panic!("query {table} evidence snapshot: {error}"));
+    let mut rows = Vec::new();
+    while let Some(row) = query
+        .next()
+        .unwrap_or_else(|error| panic!("iterate {table} evidence snapshot: {error}"))
+    {
+        assert!(
+            rows.len() < EVIDENCE_MAX_ROWS_PER_TABLE,
+            "{table} evidence exceeds {EVIDENCE_MAX_ROWS_PER_TABLE} rows"
+        );
+        let mut cells = Vec::with_capacity(column_count);
+        for index in 0..column_count {
+            let value = row
+                .get_ref(index)
+                .unwrap_or_else(|error| panic!("read {table} evidence cell: {error}"));
+            retained_bytes = retained_bytes
+                .checked_add(SqlCell::retained_bytes(&value))
+                .expect("evidence cell byte count fits usize");
+            assert!(
+                retained_bytes <= EVIDENCE_MAX_BYTES_PER_TABLE,
+                "{table} evidence exceeds {EVIDENCE_MAX_BYTES_PER_TABLE} retained bytes"
+            );
+            let cell = SqlCell::from_value(value);
+            cells.push(cell);
+        }
+        rows.push(cells);
+    }
+    TableSnapshot {
+        table,
+        columns,
+        rows,
+        retained_bytes,
+    }
 }
 
 fn command_evidence(path: &Path, conversation_id: RuntimeId) -> CommandEvidence {
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .expect("open read-only command evidence connection");
-    connection
+    let transaction = connection
+        .transaction()
+        .expect("begin consistent read-only command evidence transaction");
+    let evidence = transaction
         .query_row(
             "SELECT
                  (SELECT COUNT(*) FROM commands WHERE conversation_id = ?1),
                  (SELECT COUNT(*) FROM command_configuration_pins
                     WHERE conversation_id = ?1),
+                 (SELECT COUNT(*) FROM configuration_journal),
+                 (SELECT COALESCE(SUM(length(sealed_request)), 0)
+                    FROM configuration_journal),
+                 (SELECT COUNT(*) FROM event_journal),
+                 (SELECT COALESCE(SUM(logical_event_bytes), 0) FROM event_journal),
+                 (SELECT COUNT(*) FROM event_stream_index),
+                 (SELECT COALESCE(SUM(logical_event_bytes), 0)
+                    FROM event_stream_index),
+                 (SELECT COUNT(*) FROM catalog_journal),
+                 (SELECT COALESCE(SUM(logical_delta_bytes), 0) FROM catalog_journal),
                  m.command_count,
                  m.accepted_count,
                  m.accepted_payload_bytes,
                  m.command_configuration_pin_count,
+                 m.event_count,
+                 m.audit_event_logical_bytes,
+                 m.event_stream_count,
+                 m.event_stream_bytes,
+                 m.catalog_delta_count,
+                 m.catalog_delta_bytes,
+                 m.configuration_count,
+                 m.configuration_sealed_bytes,
                  c.accepted_count,
                  m.catalog_high_water,
                  c.command_high_water,
-                 c.event_high_water
+                 c.event_high_water,
+                 s.current_configuration_revision,
+                 (SELECT COUNT(*) FROM commands),
+                 (SELECT COUNT(*) FROM command_configuration_pins),
+                 (SELECT COUNT(*) FROM commands WHERE state = 'accepted'),
+                 (SELECT COALESCE(SUM(logical_payload_bytes), 0)
+                    FROM commands WHERE state = 'accepted'),
+                 (SELECT COUNT(*) FROM commands
+                    WHERE conversation_id = ?1 AND state = 'accepted'),
+                 (SELECT COALESCE(SUM(logical_payload_bytes), 0) FROM commands
+                    WHERE conversation_id = ?1 AND state = 'accepted')
              FROM runtime_meta AS m
              JOIN conversations AS c ON c.conversation_id = ?1
+             JOIN conversation_state AS s ON s.conversation_id = c.conversation_id
              WHERE m.singleton = 1",
             [&conversation_id.as_bytes()[..]],
             |row| {
                 Ok(CommandEvidence {
                     command_rows: row.get(0)?,
                     pin_rows: row.get(1)?,
-                    ledger_command_count: row.get(2)?,
-                    ledger_accepted_count: row.get(3)?,
-                    ledger_accepted_payload_bytes: row.get(4)?,
-                    ledger_pin_count: row.get(5)?,
-                    conversation_accepted_count: row.get(6)?,
-                    catalog_high_water: row.get(7)?,
-                    command_high_water: row.get(8)?,
-                    event_high_water: row.get(9)?,
+                    configuration_rows: row.get(2)?,
+                    configuration_sealed_bytes: row.get(3)?,
+                    event_journal_rows: row.get(4)?,
+                    event_journal_logical_bytes: row.get(5)?,
+                    event_stream_rows: row.get(6)?,
+                    event_stream_logical_bytes: row.get(7)?,
+                    catalog_journal_rows: row.get(8)?,
+                    catalog_journal_logical_bytes: row.get(9)?,
+                    ledger_command_count: row.get(10)?,
+                    ledger_accepted_count: row.get(11)?,
+                    ledger_accepted_payload_bytes: row.get(12)?,
+                    ledger_pin_count: row.get(13)?,
+                    ledger_event_count: row.get(14)?,
+                    ledger_audit_event_logical_bytes: row.get(15)?,
+                    ledger_event_stream_count: row.get(16)?,
+                    ledger_event_stream_bytes: row.get(17)?,
+                    ledger_catalog_delta_count: row.get(18)?,
+                    ledger_catalog_delta_bytes: row.get(19)?,
+                    ledger_configuration_count: row.get(20)?,
+                    ledger_configuration_sealed_bytes: row.get(21)?,
+                    conversation_accepted_count: row.get(22)?,
+                    catalog_high_water: row.get(23)?,
+                    command_high_water: row.get(24)?,
+                    event_high_water: row.get(25)?,
+                    configuration_head: row.get(26)?,
+                    global_command_rows: row.get(27)?,
+                    global_pin_rows: row.get(28)?,
+                    global_accepted_rows: row.get(29)?,
+                    global_accepted_payload_bytes: row.get(30)?,
+                    conversation_accepted_rows: row.get(31)?,
+                    conversation_accepted_payload_bytes: row.get(32)?,
+                    tables: Vec::new(),
                 })
             },
         )
-        .expect("read command write evidence")
+        .expect("read command write evidence");
+    let conversation_bytes: &[u8] = conversation_id.as_bytes();
+    let target: [&dyn ToSql; 1] = [&conversation_bytes];
+    let evidence = CommandEvidence {
+        tables: vec![
+            table_snapshot(
+                &transaction,
+                "runtime_meta",
+                "SELECT * FROM runtime_meta WHERE singleton = 1 ORDER BY singleton",
+                &[],
+            ),
+            table_snapshot(
+                &transaction,
+                "conversations",
+                "SELECT * FROM conversations WHERE conversation_id = ?1 ORDER BY conversation_id",
+                &target,
+            ),
+            table_snapshot(
+                &transaction,
+                "conversation_state",
+                "SELECT * FROM conversation_state WHERE conversation_id = ?1 ORDER BY conversation_id",
+                &target,
+            ),
+            table_snapshot(
+                &transaction,
+                "commands",
+                "SELECT * FROM commands WHERE conversation_id = ?1 ORDER BY conversation_id, command_seq",
+                &target,
+            ),
+            table_snapshot(
+                &transaction,
+                "command_configuration_pins",
+                "SELECT * FROM command_configuration_pins WHERE conversation_id = ?1 ORDER BY conversation_id, command_seq",
+                &target,
+            ),
+            table_snapshot(
+                &transaction,
+                "configuration_journal",
+                "SELECT * FROM configuration_journal WHERE conversation_id = ?1 ORDER BY conversation_id, configuration_revision",
+                &target,
+            ),
+            table_snapshot(
+                &transaction,
+                "event_journal",
+                "SELECT * FROM event_journal WHERE conversation_id = ?1 ORDER BY conversation_id, event_seq",
+                &target,
+            ),
+            table_snapshot(
+                &transaction,
+                "event_stream_index",
+                "SELECT * FROM event_stream_index WHERE conversation_id = ?1 ORDER BY conversation_id, event_seq",
+                &target,
+            ),
+            table_snapshot(
+                &transaction,
+                "catalog_journal",
+                "SELECT * FROM catalog_journal WHERE conversation_id = ?1 ORDER BY catalog_revision",
+                &target,
+            ),
+        ],
+        ..evidence
+    };
+    transaction
+        .commit()
+        .expect("commit consistent read-only command evidence transaction");
+    evidence
 }
 
 fn global_command_evidence(path: &Path) -> (i64, i64, i64, i64, i64) {
@@ -185,12 +537,141 @@ fn pinned_configuration_revision(path: &Path, command_id: RuntimeId) -> String {
 fn assert_zero_command_state(evidence: &CommandEvidence) {
     assert_eq!(evidence.command_rows, 0);
     assert_eq!(evidence.pin_rows, 0);
+    assert_eq!(evidence.global_command_rows, 0);
+    assert_eq!(evidence.global_pin_rows, 0);
+    assert_eq!(evidence.global_accepted_rows, 0);
+    assert_eq!(evidence.global_accepted_payload_bytes, 0);
+    assert_eq!(evidence.conversation_accepted_rows, 0);
+    assert_eq!(evidence.conversation_accepted_payload_bytes, 0);
     assert_eq!(evidence.ledger_command_count, 0);
     assert_eq!(evidence.ledger_accepted_count, 0);
     assert_eq!(evidence.ledger_accepted_payload_bytes, 0);
     assert_eq!(evidence.ledger_pin_count, 0);
     assert_eq!(evidence.conversation_accepted_count, 0);
     assert_eq!(evidence.command_high_water, None);
+}
+
+fn assert_physical_totals_match_ledger(evidence: &CommandEvidence) {
+    assert_eq!(evidence.global_command_rows, evidence.ledger_command_count);
+    assert_eq!(evidence.global_pin_rows, evidence.ledger_pin_count);
+    assert_eq!(
+        evidence.global_accepted_rows,
+        evidence.ledger_accepted_count
+    );
+    assert_eq!(
+        evidence.global_accepted_payload_bytes,
+        evidence.ledger_accepted_payload_bytes
+    );
+    assert_eq!(
+        evidence.conversation_accepted_rows,
+        evidence.conversation_accepted_count
+    );
+    assert_eq!(
+        i64::try_from(
+            evidence
+                .tables
+                .iter()
+                .find(|snapshot| snapshot.table == "commands")
+                .expect("commands evidence snapshot")
+                .rows
+                .len()
+        )
+        .expect("commands evidence row count fits i64"),
+        evidence.command_rows
+    );
+    assert_eq!(
+        i64::try_from(
+            evidence
+                .tables
+                .iter()
+                .find(|snapshot| snapshot.table == "command_configuration_pins")
+                .expect("pin evidence snapshot")
+                .rows
+                .len()
+        )
+        .expect("pin evidence row count fits i64"),
+        evidence.pin_rows
+    );
+    assert_eq!(
+        evidence.configuration_rows,
+        evidence.ledger_configuration_count
+    );
+    assert_eq!(
+        evidence.configuration_sealed_bytes,
+        evidence.ledger_configuration_sealed_bytes
+    );
+    assert_eq!(evidence.event_journal_rows, evidence.ledger_event_count);
+    assert_eq!(
+        evidence.event_journal_logical_bytes,
+        evidence.ledger_audit_event_logical_bytes
+    );
+    assert_eq!(
+        evidence.event_stream_rows,
+        evidence.ledger_event_stream_count
+    );
+    assert_eq!(
+        evidence.event_stream_logical_bytes,
+        evidence.ledger_event_stream_bytes
+    );
+    assert_eq!(
+        evidence.catalog_journal_rows,
+        evidence.ledger_catalog_delta_count
+    );
+    assert_eq!(
+        evidence.catalog_journal_logical_bytes,
+        evidence.ledger_catalog_delta_bytes
+    );
+}
+
+fn evidence_table<'a>(evidence: &'a CommandEvidence, table: &str) -> &'a TableSnapshot {
+    evidence
+        .tables
+        .iter()
+        .find(|snapshot| snapshot.table == table)
+        .unwrap_or_else(|| panic!("missing {table} evidence snapshot"))
+}
+
+fn assert_one_accepted_command(evidence: &CommandEvidence, payload_bytes: usize) {
+    let payload_bytes = i64::try_from(payload_bytes).expect("payload length fits i64");
+    assert_eq!(evidence.command_rows, 1);
+    assert_eq!(evidence.pin_rows, 1);
+    assert_eq!(evidence.global_command_rows, 1);
+    assert_eq!(evidence.global_pin_rows, 1);
+    assert_eq!(evidence.global_accepted_rows, 1);
+    assert_eq!(evidence.global_accepted_payload_bytes, payload_bytes);
+    assert_eq!(evidence.conversation_accepted_rows, 1);
+    assert_eq!(evidence.conversation_accepted_payload_bytes, payload_bytes);
+    assert_eq!(evidence.conversation_accepted_count, 1);
+    assert_eq!(
+        evidence.command_high_water.as_deref(),
+        Some("00000000000000000000")
+    );
+    assert_physical_totals_match_ledger(evidence);
+}
+
+fn assert_accept_delta(
+    baseline: &CommandEvidence,
+    accepted: &CommandEvidence,
+    payload_bytes: usize,
+) {
+    assert_zero_command_state(baseline);
+    assert_one_accepted_command(accepted, payload_bytes);
+    for table in [
+        "conversation_state",
+        "configuration_journal",
+        "event_journal",
+        "event_stream_index",
+        "catalog_journal",
+    ] {
+        assert_eq!(
+            evidence_table(accepted, table),
+            evidence_table(baseline, table),
+            "Accept must not change {table} content"
+        );
+    }
+    assert_eq!(accepted.catalog_high_water, baseline.catalog_high_water);
+    assert_eq!(accepted.event_high_water, baseline.event_high_water);
+    assert_eq!(accepted.configuration_head, baseline.configuration_head);
 }
 
 fn runtime_id(kind: RuntimeIdKind, seed: u8) -> RuntimeId {
@@ -428,12 +909,12 @@ async fn configured_revision_mismatch_is_typed_and_zero_write() {
         Some("00000000000000000000")
     );
 
-    for expected_revision in [0, 2] {
+    for (relationship, expected_revision) in [("stale", 0), ("future", 2)] {
         let error = store
             .accept_command(accept_request(
                 conversation_id,
                 &owner(0x33),
-                &format!("revision-mismatch-{expected_revision}"),
+                &format!("{relationship}-revision-{expected_revision}"),
                 expected_revision,
                 b"must-not-cross-configuration-cas",
             ))
@@ -444,7 +925,7 @@ async fn configured_revision_mismatch_is_typed_and_zero_write() {
                 current_configuration_revision,
             } => assert_eq!(current_configuration_revision, 1),
             other => panic!(
-                "expected ConfigurationConflict for revision {expected_revision}, got {other:?}"
+                "expected ConfigurationConflict for {relationship} revision {expected_revision}, got {other:?}"
             ),
         }
         assert_eq!(
@@ -522,6 +1003,11 @@ async fn current_configuration_head_tamper_rejects_accept_before_any_command_wri
             "tamper case {tamper} must change exactly one row"
         );
         drop(connection);
+        let tampered_evidence = command_evidence(&root.database(), conversation_id);
+        assert_ne!(
+            tampered_evidence, baseline,
+            "content evidence must observe the intentional {tamper} mutation"
+        );
 
         for expected_revision in [0, 1, 2] {
             let error = store
@@ -540,7 +1026,8 @@ async fn current_configuration_head_tamper_rejects_accept_before_any_command_wri
             );
             assert_eq!(
                 command_evidence(&root.database(), conversation_id),
-                baseline
+                tampered_evidence,
+                "rejecting tampered head must not add drift beyond the injected mutation"
             );
         }
         store
@@ -606,6 +1093,11 @@ async fn current_head_authentication_rejects_gap_plus_out_of_range_revision() {
         1
     );
     drop(connection);
+    let tampered_evidence = command_evidence(&root.database(), conversation_id);
+    assert_ne!(
+        tampered_evidence, baseline,
+        "content evidence must observe the injected revision gap"
+    );
 
     let error = store
         .accept_command(accept_request(
@@ -620,7 +1112,8 @@ async fn current_head_authentication_rejects_gap_plus_out_of_range_revision() {
     assert!(matches!(error, RuntimeStoreError::UnknownOrCorruptSchema));
     assert_eq!(
         command_evidence(&root.database(), conversation_id),
-        baseline
+        tampered_evidence,
+        "revision-gap rejection must not add drift beyond the injected mutation"
     );
 
     store
@@ -961,4 +1454,791 @@ async fn accepted_pin_replay_query_and_reopen_preserve_original_revision() {
         .shutdown()
         .await
         .expect("shutdown reopened command pin store");
+}
+
+#[tokio::test]
+async fn single_worker_linearizes_configure_before_prompt() {
+    let root = TestRoot::new("configure-before-prompt");
+    let keys = MemoryKeyStore::new();
+    let database = root.database();
+    let input = conversation(0x50);
+    let conversation_id = input.conversation_id;
+    let command_owner = owner(0x51);
+    let stale_prompt = accept_request(
+        conversation_id,
+        &command_owner,
+        "configure-first-prompt",
+        1,
+        b"prompt-must-not-cross-revision-two",
+    );
+    let current_prompt = accept_request(
+        conversation_id,
+        &command_owner,
+        "configure-first-prompt",
+        2,
+        b"prompt-must-not-cross-revision-two",
+    );
+    let (before_entered_tx, before_entered_rx) = sync_channel(1);
+    let (before_release_tx, before_release_rx) = sync_channel(1);
+    let before_commit = Arc::new(BlockingOperationOnce::new(
+        RuntimeStoreOperation::ConfigureConversationBeforeCommit,
+        before_entered_tx,
+        before_release_rx,
+    ));
+    let (after_entered_tx, after_entered_rx) = sync_channel(1);
+    let (after_release_tx, after_release_rx) = sync_channel(1);
+    let after_commit = Arc::new(BlockingOperationOnce::new(
+        RuntimeStoreOperation::ConfigureConversationAfterCommit,
+        after_entered_tx,
+        after_release_rx,
+    ));
+    let store = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(database.clone())
+            .with_command_capacity(1)
+            .with_fault_injector(Arc::new(FaultChain(vec![
+                before_commit.clone(),
+                after_commit.clone(),
+            ]))),
+        root.storage_kek(&keys),
+    )
+    .await
+    .expect("open Configure-first linearization store");
+    store
+        .create_conversation(input)
+        .await
+        .expect("create Configure-first conversation");
+    assert_eq!(
+        configure(
+            &store,
+            conversation_id,
+            0x52,
+            "configure-first-revision-one",
+            0,
+            CodexReasoningEffort::Low,
+        )
+        .await,
+        1
+    );
+    let baseline = command_evidence(&database, conversation_id);
+    assert_zero_command_state(&baseline);
+    assert_eq!(
+        baseline.configuration_head.as_deref(),
+        Some("00000000000000000001")
+    );
+    assert_physical_totals_match_ledger(&baseline);
+
+    let configure_revision_two = configure_request(
+        conversation_id,
+        0x53,
+        "configure-first-revision-two",
+        1,
+        CodexReasoningEffort::High,
+    );
+    before_commit.arm();
+    after_commit.arm();
+    let configure_task = tokio::spawn({
+        let store = store.clone();
+        let request = configure_revision_two.clone();
+        async move { store.configure_conversation(request).await }
+    });
+    wait_for_blocked_worker(before_entered_rx).await;
+
+    // biased select 先 poll stale Prompt future；dispatch 的 try_send 在首次 poll 内完成。
+    // worker 仍停在 rev2 Configure before-COMMIT，capacity=1 因而固定唯一排队顺序。
+    let mut queued_prompt = Box::pin(store.accept_command(stale_prompt.clone()));
+    tokio::select! {
+        biased;
+        result = &mut queued_prompt => {
+            panic!("queued Prompt bypassed the blocked Configure transaction: {result:?}");
+        }
+        () = tokio::task::yield_now() => {}
+    }
+    let busy = store
+        .accept_command(accept_request(
+            conversation_id,
+            &owner(0x54),
+            "configure-first-capacity-probe",
+            1,
+            b"must-not-enter-the-full-normal-lane",
+        ))
+        .await
+        .expect_err("third normal command proves stale Prompt occupies capacity-one queue");
+    assert!(matches!(
+        busy,
+        RuntimeStoreError::WorkerBusy {
+            lane: RuntimeStoreLane::Normal
+        }
+    ));
+    assert_eq!(
+        command_evidence(&database, conversation_id),
+        baseline,
+        "Configure barrier, queued Prompt and WorkerBusy probe must leave zero durable drift"
+    );
+
+    before_release_tx
+        .send(())
+        .expect("release Configure before-COMMIT barrier");
+    wait_for_blocked_worker(after_entered_rx).await;
+    let after_revision_two = command_evidence(&database, conversation_id);
+    assert_zero_command_state(&after_revision_two);
+    assert_eq!(after_revision_two.configuration_rows, 2);
+    assert_eq!(
+        after_revision_two.configuration_head.as_deref(),
+        Some("00000000000000000002")
+    );
+    assert_physical_totals_match_ledger(&after_revision_two);
+    after_release_tx
+        .send(())
+        .expect("release Configure after-COMMIT evidence barrier");
+    let configured = configure_task
+        .await
+        .expect("join Configure-first task")
+        .expect("Configure-first transaction commits");
+    assert!(matches!(
+        configured,
+        ConfigureConversationOutcome::Applied { configuration }
+            if configuration.configuration_revision == 2
+    ));
+    let stale_error = queued_prompt
+        .await
+        .expect_err("queued stale Prompt must observe committed revision two");
+    assert!(matches!(
+        stale_error,
+        RuntimeStoreError::ConfigurationConflict {
+            current_configuration_revision: 2
+        }
+    ));
+    assert_eq!(
+        command_evidence(&database, conversation_id),
+        after_revision_two,
+        "stale queued Prompt must not drift any command/pin/event/catalog evidence"
+    );
+
+    let command = accepted(
+        store
+            .accept_command(current_prompt.clone())
+            .await
+            .expect("current Prompt pins committed revision two"),
+    );
+    assert_eq!(command.configuration_revision, 2);
+    assert_eq!(
+        pinned_configuration_revision(&database, command.command_id),
+        "00000000000000000002"
+    );
+    let committed = command_evidence(&database, conversation_id);
+    assert_accept_delta(
+        &after_revision_two,
+        &committed,
+        current_prompt.payload.len(),
+    );
+    assert_eq!(committed.configuration_rows, 2);
+    assert_eq!(
+        committed.configuration_head.as_deref(),
+        Some("00000000000000000002")
+    );
+    let replayed = match store
+        .accept_command(current_prompt)
+        .await
+        .expect("exact Prompt retry after Configure-first linearization")
+    {
+        AcceptOutcome::Replayed { command } => command,
+        other => panic!("Configure-first exact retry must replay: {other:?}"),
+    };
+    assert_eq!(replayed.command_id, command.command_id);
+    assert_eq!(replayed.configuration_revision, 2);
+    assert_eq!(
+        command_evidence(&database, conversation_id),
+        committed,
+        "Configure-first exact replay must not drift any durable evidence"
+    );
+    store
+        .shutdown()
+        .await
+        .expect("shutdown Configure-first linearization store");
+}
+
+#[tokio::test]
+async fn single_worker_linearizes_prompt_before_configure() {
+    let root = TestRoot::new("prompt-before-configure");
+    let keys = MemoryKeyStore::new();
+    let database = root.database();
+    let input = conversation(0x53);
+    let conversation_id = input.conversation_id;
+    let command_owner = owner(0x54);
+    let prompt_request = accept_request(
+        conversation_id,
+        &command_owner,
+        "prompt-first-command",
+        1,
+        b"prompt-must-pin-before-revision-two",
+    );
+    let (entered_tx, entered_rx) = sync_channel(1);
+    let (release_tx, release_rx) = sync_channel(1);
+    let before_commit = Arc::new(BlockingOperationOnce::new(
+        RuntimeStoreOperation::AcceptCommandBeforeCommit,
+        entered_tx,
+        release_rx,
+    ));
+    let store = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(database.clone())
+            .with_command_capacity(1)
+            .with_fault_injector(before_commit.clone()),
+        root.storage_kek(&keys),
+    )
+    .await
+    .expect("open Prompt-first linearization store");
+    store
+        .create_conversation(input)
+        .await
+        .expect("create Prompt-first conversation");
+    assert_eq!(
+        configure(
+            &store,
+            conversation_id,
+            0x55,
+            "prompt-first-revision-one",
+            0,
+            CodexReasoningEffort::Low,
+        )
+        .await,
+        1
+    );
+    let baseline = command_evidence(&database, conversation_id);
+    assert_zero_command_state(&baseline);
+    assert_eq!(
+        baseline.configuration_head.as_deref(),
+        Some("00000000000000000001")
+    );
+    assert_physical_totals_match_ledger(&baseline);
+
+    before_commit.arm();
+    let prompt_task = tokio::spawn({
+        let store = store.clone();
+        let request = prompt_request.clone();
+        async move { store.accept_command(request).await }
+    });
+    wait_for_blocked_worker(entered_rx).await;
+
+    // 与 Configure-first 对称：先 poll Configure future，确认它已进入 capacity=1 的
+    // normal queue，再释放 Prompt 的 before-COMMIT barrier。
+    let configure_revision_two = configure_request(
+        conversation_id,
+        0x56,
+        "prompt-first-revision-two",
+        1,
+        CodexReasoningEffort::High,
+    );
+    let mut queued_configure =
+        Box::pin(store.configure_conversation(configure_revision_two.clone()));
+    tokio::select! {
+        biased;
+        result = &mut queued_configure => {
+            panic!("queued Configure bypassed the blocked Prompt transaction: {result:?}");
+        }
+        () = tokio::task::yield_now() => {}
+    }
+    let busy = store
+        .accept_command(accept_request(
+            conversation_id,
+            &owner(0x57),
+            "prompt-first-capacity-probe",
+            1,
+            b"must-not-enter-the-full-normal-lane",
+        ))
+        .await
+        .expect_err("third normal command proves Configure occupies capacity-one queue");
+    assert!(matches!(
+        busy,
+        RuntimeStoreError::WorkerBusy {
+            lane: RuntimeStoreLane::Normal
+        }
+    ));
+    assert_eq!(
+        command_evidence(&database, conversation_id),
+        baseline,
+        "Prompt barrier, queued Configure and WorkerBusy probe must leave zero durable drift"
+    );
+
+    release_tx
+        .send(())
+        .expect("release Prompt before-COMMIT barrier");
+    let command = accepted(
+        prompt_task
+            .await
+            .expect("join Prompt-first task")
+            .expect("Prompt-first transaction commits"),
+    );
+    assert_eq!(command.configuration_revision, 1);
+    let configured = queued_configure
+        .await
+        .expect("queued Configure advances the head after Prompt commit");
+    assert!(matches!(
+        configured,
+        ConfigureConversationOutcome::Applied { configuration }
+            if configuration.configuration_revision == 2
+    ));
+    assert_eq!(
+        pinned_configuration_revision(&database, command.command_id),
+        "00000000000000000001"
+    );
+
+    let committed = command_evidence(&database, conversation_id);
+    assert_one_accepted_command(&committed, prompt_request.payload.len());
+    assert_eq!(committed.configuration_rows, 2);
+    assert_eq!(
+        committed.configuration_head.as_deref(),
+        Some("00000000000000000002")
+    );
+    let configure_replay = store
+        .configure_conversation(configure_revision_two)
+        .await
+        .expect("exact Configure retry after Prompt-first linearization");
+    assert!(matches!(
+        configure_replay,
+        ConfigureConversationOutcome::Replayed { configuration }
+            if configuration.configuration_revision == 2
+    ));
+    assert_eq!(
+        command_evidence(&database, conversation_id),
+        committed,
+        "Configure exact replay must not drift any durable evidence"
+    );
+    let replayed = match store
+        .accept_command(prompt_request.clone())
+        .await
+        .expect("exact Prompt retry after head advances")
+    {
+        AcceptOutcome::Replayed { command } => command,
+        other => panic!("Prompt-first exact retry must replay: {other:?}"),
+    };
+    assert_eq!(replayed.command_id, command.command_id);
+    assert_eq!(replayed.configuration_revision, 1);
+    assert_eq!(command_evidence(&database, conversation_id), committed);
+
+    let conflict = store
+        .accept_command(accept_request(
+            conversation_id,
+            &command_owner,
+            &prompt_request.idempotency_key,
+            2,
+            &prompt_request.payload,
+        ))
+        .await
+        .expect_err("same key cannot be rebound to the newer configuration revision");
+    assert!(matches!(conflict, RuntimeStoreError::IdempotencyConflict));
+    assert_eq!(
+        command_evidence(&database, conversation_id),
+        committed,
+        "same-key conflict must not drift any command/pin/event/catalog evidence"
+    );
+    store
+        .shutdown()
+        .await
+        .expect("shutdown Prompt-first linearization store");
+}
+
+#[tokio::test]
+async fn accept_before_and_after_commit_faults_converge_to_one_command_and_pin() {
+    for (label, operation, after_commit) in [
+        (
+            "before-commit",
+            RuntimeStoreOperation::AcceptCommandBeforeCommit,
+            false,
+        ),
+        (
+            "after-commit",
+            RuntimeStoreOperation::AcceptCommandAfterCommit,
+            true,
+        ),
+    ] {
+        let root = TestRoot::new(label);
+        let keys = MemoryKeyStore::new();
+        let database = root.database();
+        let input = conversation(if after_commit { 0x58 } else { 0x57 });
+        let conversation_id = input.conversation_id;
+        let command_owner = owner(if after_commit { 0x68 } else { 0x67 });
+        let request = accept_request(
+            conversation_id,
+            &command_owner,
+            "commit-fault-command",
+            1,
+            b"commit-fault-payload",
+        );
+        let config = RuntimeStoreConfig::new(database.clone())
+            .with_fault_injector(Arc::new(FailOperationOnce::new(operation)));
+        let store = RuntimeStoreHandle::open(config.clone(), root.storage_kek(&keys))
+            .await
+            .expect("open Accept COMMIT fault store");
+        store
+            .create_conversation(input)
+            .await
+            .expect("create Accept COMMIT fault conversation");
+        assert_eq!(
+            configure(
+                &store,
+                conversation_id,
+                0x69,
+                "commit-fault-revision-one",
+                0,
+                CodexReasoningEffort::Medium,
+            )
+            .await,
+            1
+        );
+        let baseline = command_evidence(&database, conversation_id);
+        assert_zero_command_state(&baseline);
+        assert_physical_totals_match_ledger(&baseline);
+
+        let error = store
+            .accept_command(request.clone())
+            .await
+            .expect_err("injected Accept COMMIT fault must hide the first outcome");
+        if after_commit {
+            assert_commit_unknown(error, RuntimeCommitOperation::AcceptCommand);
+        } else {
+            assert!(matches!(error, RuntimeStoreError::InvalidConfig(_)));
+        }
+        let after_fault = command_evidence(&database, conversation_id);
+        if after_commit {
+            assert_accept_delta(&baseline, &after_fault, request.payload.len());
+        } else {
+            assert_eq!(
+                after_fault, baseline,
+                "Accept before-COMMIT fault must roll back command, pin, ledger, event and catalog"
+            );
+        }
+        assert_physical_totals_match_ledger(&after_fault);
+
+        let retried = store
+            .accept_command(request.clone())
+            .await
+            .expect("exact Accept retry converges after injected COMMIT fault");
+        let command = match (after_commit, retried) {
+            (false, AcceptOutcome::Accepted { command, .. })
+            | (true, AcceptOutcome::Replayed { command }) => command,
+            (false, other) => panic!("rolled-back Accept must commit on retry: {other:?}"),
+            (true, other) => panic!("committed Accept must replay on retry: {other:?}"),
+        };
+        assert_eq!(command.configuration_revision, 1);
+        assert_eq!(
+            pinned_configuration_revision(&database, command.command_id),
+            "00000000000000000001"
+        );
+        let after_retry = command_evidence(&database, conversation_id);
+        assert_accept_delta(&baseline, &after_retry, request.payload.len());
+        if after_commit {
+            assert_eq!(
+                after_retry, after_fault,
+                "after-COMMIT exact retry must not duplicate or drift any durable evidence"
+            );
+        }
+        assert_physical_totals_match_ledger(&after_retry);
+        let receipt = store
+            .query_command_receipt(receipt_by_idempotency(
+                conversation_id,
+                &request.idempotency_key,
+                &command_owner,
+            ))
+            .await
+            .expect("query converged Accept receipt");
+        assert_eq!(receipt.command_id, command.command_id);
+        assert_eq!(receipt.configuration_revision, 1);
+        assert_eq!(receipt.state, CommandState::Accepted);
+        store
+            .shutdown()
+            .await
+            .expect("shutdown Accept COMMIT fault store");
+
+        let reopened = RuntimeStoreHandle::open(config, root.storage_kek(&keys))
+            .await
+            .expect("reopen converged Accept COMMIT fault store");
+        assert_eq!(
+            command_evidence(&database, conversation_id),
+            after_retry,
+            "reopen integrity validation must preserve the complete accepted evidence"
+        );
+        let reopened_receipt = reopened
+            .query_command_receipt(receipt_by_idempotency(
+                conversation_id,
+                &request.idempotency_key,
+                &command_owner,
+            ))
+            .await
+            .expect("query converged receipt after reopen");
+        assert_eq!(reopened_receipt, receipt);
+
+        let cursor = reopened
+            .begin_recovery_scan()
+            .await
+            .expect("begin converged command recovery scan");
+        let page = reopened
+            .load_recovery_page(cursor)
+            .await
+            .expect("load converged command recovery page");
+        let recovered = page
+            .conversation
+            .expect("single converged command recovery record");
+        assert_eq!(recovered.accepted.len(), 1);
+        assert_eq!(recovered.accepted[0].command_id, command.command_id);
+        assert_eq!(recovered.accepted[0].configuration_revision, 1);
+        assert!(recovered.started.is_none());
+        assert!(page.next_cursor.is_none());
+        reopened
+            .finish_recovery_scan(page.completion.expect("single recovery page completion"))
+            .await
+            .expect("finish converged command recovery scan");
+        assert_eq!(
+            command_evidence(&database, conversation_id),
+            after_retry,
+            "recovery integrity validation must preserve the complete accepted evidence"
+        );
+        reopened
+            .shutdown()
+            .await
+            .expect("shutdown reopened Accept COMMIT fault store");
+    }
+}
+
+#[tokio::test]
+async fn restart_and_recovery_preserve_revision_one_for_accepted_started_and_terminal() {
+    let root = TestRoot::new("restart-all-command-states");
+    let keys = MemoryKeyStore::new();
+    let database = root.database();
+    let config = RuntimeStoreConfig::new(database.clone());
+    let store = RuntimeStoreHandle::open(config.clone(), root.storage_kek(&keys))
+        .await
+        .expect("open command-state restart store");
+
+    let mut conversation_ids = Vec::new();
+    let mut command_owners = Vec::new();
+    let mut commands = Vec::new();
+    for (index, seed) in [0x60_u8, 0x61, 0x62].into_iter().enumerate() {
+        let input = conversation(seed);
+        let conversation_id = input.conversation_id;
+        let command_owner = owner(seed.wrapping_add(0x10));
+        store
+            .create_conversation(input)
+            .await
+            .expect("create command-state restart conversation");
+        assert_eq!(
+            configure(
+                &store,
+                conversation_id,
+                seed.wrapping_add(0x20),
+                &format!("command-state-{index}-revision-one"),
+                0,
+                CodexReasoningEffort::Low,
+            )
+            .await,
+            1
+        );
+        let command = accepted(
+            store
+                .accept_command(accept_request(
+                    conversation_id,
+                    &command_owner,
+                    &format!("command-state-{index}"),
+                    1,
+                    format!("command-state-payload-{index}").as_bytes(),
+                ))
+                .await
+                .expect("accept command-state restart fixture"),
+        );
+        assert_eq!(command.configuration_revision, 1);
+        conversation_ids.push(conversation_id);
+        command_owners.push(command_owner);
+        commands.push(command);
+    }
+
+    let started_boot_id = runtime_id(RuntimeIdKind::DaemonBoot, 0x73);
+    let started_nonce = b"restart-started-nonce".to_vec();
+    let started = match store
+        .mark_started_with_event(StartCommand {
+            conversation_id: conversation_ids[1],
+            command_id: commands[1].command_id,
+            daemon_boot_id: started_boot_id,
+            execution_nonce: started_nonce,
+        })
+        .await
+        .expect("start revision-one command")
+    {
+        StartOutcome::Started { command, .. } => command,
+        other => panic!("fresh revision-one command must start: {other:?}"),
+    };
+    assert_eq!(started.state, CommandState::Started);
+    assert_eq!(started.configuration_revision, 1);
+    commands[1] = started;
+
+    let terminal_boot_id = runtime_id(RuntimeIdKind::DaemonBoot, 0x74);
+    let terminal_nonce = b"restart-terminal-nonce".to_vec();
+    let terminal_intent = match store
+        .mark_started_with_event(StartCommand {
+            conversation_id: conversation_ids[2],
+            command_id: commands[2].command_id,
+            daemon_boot_id: terminal_boot_id,
+            execution_nonce: terminal_nonce.clone(),
+        })
+        .await
+        .expect("start command before terminal transition")
+    {
+        StartOutcome::Started {
+            command, intent, ..
+        } => {
+            assert_eq!(command.configuration_revision, 1);
+            intent
+        }
+        other => panic!("fresh terminal fixture must start: {other:?}"),
+    };
+    let terminal = match store
+        .terminate_started_before_release(TerminateStartedBeforeRelease {
+            conversation_id: conversation_ids[2],
+            command_id: commands[2].command_id,
+            turn_id: terminal_intent.turn_id,
+            daemon_boot_id: terminal_boot_id,
+            execution_nonce: terminal_nonce,
+            reason: StartedBeforeReleaseTermination::Canceled,
+        })
+        .await
+        .expect("terminate revision-one command before release")
+    {
+        TerminateStartedBeforeReleaseOutcome::Transitioned { command, .. } => command,
+        other => panic!("fresh started command must transition to terminal: {other:?}"),
+    };
+    assert_eq!(terminal.state, CommandState::Canceled);
+    assert_eq!(terminal.configuration_revision, 1);
+    commands[2] = terminal;
+
+    for (index, conversation_id) in conversation_ids.iter().copied().enumerate() {
+        assert_eq!(
+            configure(
+                &store,
+                conversation_id,
+                0x80_u8.wrapping_add(u8::try_from(index).expect("small fixture index")),
+                &format!("command-state-{index}-revision-two"),
+                1,
+                CodexReasoningEffort::High,
+            )
+            .await,
+            2
+        );
+        assert_eq!(
+            pinned_configuration_revision(&database, commands[index].command_id),
+            "00000000000000000001"
+        );
+    }
+    store
+        .shutdown()
+        .await
+        .expect("shutdown command-state writer before restart");
+
+    let reopened = RuntimeStoreHandle::open(config, root.storage_kek(&keys))
+        .await
+        .expect("reopen accepted/started/terminal command store");
+    for (index, expected_state) in [
+        CommandState::Accepted,
+        CommandState::Started,
+        CommandState::Canceled,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let receipt = reopened
+            .query_command_receipt(receipt_by_command(
+                conversation_ids[index],
+                commands[index].command_id,
+                &command_owners[index],
+            ))
+            .await
+            .expect("query command-state receipt after restart");
+        assert_eq!(receipt.command_id, commands[index].command_id);
+        assert_eq!(receipt.configuration_revision, 1);
+        assert_eq!(receipt.state, expected_state);
+        assert_eq!(
+            pinned_configuration_revision(&database, commands[index].command_id),
+            "00000000000000000001"
+        );
+    }
+
+    let mut cursor = reopened
+        .begin_recovery_scan()
+        .await
+        .expect("begin command-state recovery scan");
+    let mut recovered = Vec::new();
+    let completion = loop {
+        let page = reopened
+            .load_recovery_page(cursor)
+            .await
+            .expect("load command-state recovery page");
+        if let Some(conversation) = page.conversation {
+            recovered.push(conversation);
+        }
+        if let Some(next_cursor) = page.next_cursor {
+            assert!(page.completion.is_none());
+            cursor = next_cursor;
+        } else {
+            break page
+                .completion
+                .expect("terminal recovery page signs completion");
+        }
+    };
+    assert_eq!(recovered.len(), 3);
+
+    let accepted_recovery = recovered
+        .iter()
+        .find(|record| record.conversation.conversation_id == conversation_ids[0])
+        .expect("recover accepted conversation");
+    assert_eq!(accepted_recovery.accepted.len(), 1);
+    assert_eq!(
+        accepted_recovery.accepted[0].command_id,
+        commands[0].command_id
+    );
+    assert_eq!(accepted_recovery.accepted[0].configuration_revision, 1);
+    assert!(accepted_recovery.started.is_none());
+
+    let started_recovery = recovered
+        .iter()
+        .find(|record| record.conversation.conversation_id == conversation_ids[1])
+        .expect("recover started conversation");
+    assert!(started_recovery.accepted.is_empty());
+    let recovered_started = started_recovery
+        .started
+        .as_ref()
+        .expect("recover started command");
+    assert_eq!(recovered_started.command.command_id, commands[1].command_id);
+    assert_eq!(recovered_started.command.configuration_revision, 1);
+
+    let terminal_recovery = recovered
+        .iter()
+        .find(|record| record.conversation.conversation_id == conversation_ids[2])
+        .expect("recover terminal conversation");
+    assert!(terminal_recovery.accepted.is_empty());
+    assert!(terminal_recovery.started.is_none());
+
+    reopened
+        .finish_recovery_scan(completion)
+        .await
+        .expect("finish accepted/started/terminal recovery scan");
+    assert_eq!(
+        global_command_evidence(&database),
+        (3, 3, 3, 1, 3),
+        "restart/recovery must preserve global command/pin physical and authenticated totals"
+    );
+    for (index, conversation_id) in conversation_ids.iter().copied().enumerate() {
+        let evidence = command_evidence(&database, conversation_id);
+        assert_eq!(evidence.command_rows, 1);
+        assert_eq!(evidence.pin_rows, 1);
+        assert_eq!(
+            evidence.configuration_head.as_deref(),
+            Some("00000000000000000002")
+        );
+        assert_physical_totals_match_ledger(&evidence);
+        assert_eq!(
+            pinned_configuration_revision(&database, commands[index].command_id),
+            "00000000000000000001"
+        );
+    }
+    reopened
+        .shutdown()
+        .await
+        .expect("shutdown reopened command-state store");
 }
