@@ -759,13 +759,19 @@ mod tests {
     use std::process::Stdio;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-    use agentdeck_protocol::{AgentKind, TurnSummary};
+    use agentdeck_protocol::runtime::{
+        CodexConversationConfiguration, ConversationConfiguration, VendorConfigurationSnapshot,
+    };
+    use agentdeck_protocol::{
+        AgentKind, CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode, TurnSummary,
+    };
     use tokio::process::Command;
 
     use crate::exec_gate::ExecGateError;
     use crate::runtime::process_identity::ProcessControlError;
     use crate::runtime::store::{
-        AcceptCommand, AcceptOutcome, ConversationDescriptor, ExecutionFence, IdempotencyOwner,
+        AcceptCommand, AcceptOutcome, ConfigurationRecord, ConfigureConversation,
+        ConfigureConversationOutcome, ConversationDescriptor, ExecutionFence, IdempotencyOwner,
         NewConversation, RuntimeIdKind, RuntimeStoreConfig, RuntimeStoreHandle, StartCommand,
     };
     use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
@@ -831,6 +837,35 @@ mod tests {
             })
             .await
             .expect("create typed gate conversation");
+        assert!(matches!(
+            store
+                .configure_conversation(ConfigureConversation {
+                    conversation_id,
+                    owner: IdempotencyOwner::Local {
+                        machine_trust_domain: [0x33; 32],
+                        uid: 501,
+                        client_installation_id: [0x34; 16],
+                    },
+                    idempotency_key: "typed-gate-release-configuration".to_owned(),
+                    expected_configuration_revision: 0,
+                    configuration: ConversationConfiguration::new(
+                        VendorConfigurationSnapshot::Codex(CodexConversationConfiguration::new(
+                            CodexApprovalPolicy::OnRequest,
+                            CodexSandboxMode::WorkspaceWrite,
+                            CodexReasoningEffort::Medium,
+                        ),),
+                    ),
+                })
+                .await
+                .expect("configure typed gate conversation"),
+            ConfigureConversationOutcome::Applied {
+                configuration: ConfigurationRecord {
+                    configuration_revision: 1,
+                    event_seq: 0,
+                    ..
+                }
+            }
+        ));
         let command = match store
             .accept_command(AcceptCommand {
                 conversation_id,
@@ -840,7 +875,7 @@ mod tests {
                     client_installation_id: [0x34; 16],
                 },
                 idempotency_key: "typed-gate-release".to_owned(),
-                expected_configuration_revision: 0,
+                expected_configuration_revision: 1,
                 payload: b"typed release prompt".to_vec(),
             })
             .await

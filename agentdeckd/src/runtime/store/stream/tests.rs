@@ -3,10 +3,13 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agentdeck_protocol::AgentKind;
 use agentdeck_protocol::runtime::event::RuntimeEventBody;
 use agentdeck_protocol::runtime::identity::{ConversationId, EventId};
-use agentdeck_protocol::runtime::{RuntimeEvent, RuntimeFailure};
+use agentdeck_protocol::runtime::{
+    CodexConversationConfiguration, ConversationConfiguration, RuntimeEvent, RuntimeFailure,
+    VendorConfigurationSnapshot,
+};
+use agentdeck_protocol::{AgentKind, CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode};
 use rusqlite::{Connection, TransactionBehavior, params};
 
 use super::*;
@@ -21,6 +24,7 @@ use crate::runtime::store::schema::{
     RUNTIME_DDL_V1, RUNTIME_MIGRATION_V2, RUNTIME_MIGRATION_V3, RUNTIME_MIGRATION_V4,
 };
 use crate::runtime::store::sequence::encode_sequence;
+use crate::runtime::store::{ConfigureConversation, ConfigureConversationOutcome};
 use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
 
 static NEXT_RETENTION_ROOT: AtomicU64 = AtomicU64::new(1);
@@ -167,9 +171,11 @@ fn open_retention_state(
             .expect("secure retention test root");
     }
     let ids = [
+        (super::super::RuntimeIdKind::Event, 0x86),
         (super::super::RuntimeIdKind::Command, 0x80),
         (super::super::RuntimeIdKind::Turn, 0x81),
         (super::super::RuntimeIdKind::Event, 0x82),
+        (super::super::RuntimeIdKind::Event, 0x87),
         (super::super::RuntimeIdKind::Command, 0x83),
         (super::super::RuntimeIdKind::Turn, 0x84),
         (super::super::RuntimeIdKind::Event, 0x85),
@@ -215,6 +221,36 @@ fn create_conversation_with_event(
     let mut effects = CommandStreamEffects::default();
     super::super::journal::create_conversation(state, config, input, descriptor, &mut effects)
         .expect("create retention conversation");
+    let prepared =
+        super::super::configuration::prepare_configuration_request(ConfigureConversation {
+            conversation_id,
+            owner: IdempotencyOwner::Local {
+                machine_trust_domain: [seed.wrapping_add(2); 32],
+                uid: 501,
+                client_installation_id: [seed.wrapping_add(3); 16],
+            },
+            idempotency_key: format!("retention-configuration-{seed}"),
+            expected_configuration_revision: 0,
+            configuration: ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
+                CodexConversationConfiguration::new(
+                    CodexApprovalPolicy::OnRequest,
+                    CodexSandboxMode::WorkspaceWrite,
+                    CodexReasoningEffort::Medium,
+                ),
+            )),
+        })
+        .expect("prepare retention configuration");
+    assert!(matches!(
+        super::super::configuration::configure_conversation(
+            state,
+            config,
+            prepared,
+            &mut effects,
+        )
+        .expect("configure retention conversation"),
+        ConfigureConversationOutcome::Applied { configuration }
+            if configuration.configuration_revision == 1 && configuration.event_seq == 0
+    ));
     let command_id = match super::super::journal::accept_command(
         state,
         config,
@@ -226,7 +262,7 @@ fn create_conversation_with_event(
                 client_installation_id: [seed.wrapping_add(1); 16],
             },
             idempotency_key: format!("retention-command-{seed}"),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"retention prompt".to_vec(),
         },
         &mut effects,
@@ -274,7 +310,7 @@ fn store_ready_snapshot(
     let now_ms = config.clock.now_ms().expect("snapshot test clock");
     let pin = acquire_snapshot_build_pin(state, conversation_id, now_ms)
         .expect("acquire production snapshot pin");
-    assert_eq!(pin.base_event_seq(), Some(0));
+    assert_eq!(pin.base_event_seq(), Some(1));
     let (cleanup_tx, _cleanup_rx) = tokio::sync::mpsc::unbounded_channel();
     let cleanup = SnapshotBuildPinCleanup::new(pin.clone(), cleanup_tx);
     let mut payload = Vec::with_capacity(32 + super::super::cipher::ROW_BLOB_V1_OVERHEAD_LEN);
@@ -313,7 +349,7 @@ fn freeze_exact_event_publication(
             counter_scope_token: [seed.wrapping_add(4); 32],
             sender_counter: 1,
             inner_after: None,
-            inner_through: Some(0),
+            inner_through: Some(1),
             payload_kind: super::super::publication::PublicationPayloadKind::Event,
             blob: vec![seed; 48],
         },
@@ -878,7 +914,8 @@ fn journal_retention_uses_10000_events_or_64mib_and_512mib_global() {
     assert_eq!(after_bytes, [encode_sequence(3)]);
 
     // 全局 helper 查询整张 logical index；两个 production conversation 各有
-    // 一条 authenticated row 时，缩放 global count=1 必须裁掉全局最老一条。
+    // ConfigurationChanged + TurnStarted 两条 authenticated row 时，缩放
+    // global count=1 必须裁掉全局最老的三条。
     let (root, config, mut state) = open_retention_state("scaled-global-cap");
     create_conversation_with_event(&mut state, &config, 0x21, 0x82);
     create_conversation_with_event(&mut state, &config, 0x22, 0x85);
@@ -993,7 +1030,7 @@ fn equal_length_snapshot_ciphertext_tamper_cannot_authorize_trim() {
             |row| row.get(0),
         )
         .expect("count index rows after tampered snapshot rejection");
-    assert_eq!(retained, 1);
+    assert_eq!(retained, 2);
     drop(state);
     let _ = fs::remove_dir_all(root);
 }
@@ -1088,7 +1125,7 @@ fn exact_authenticated_outbox_does_not_authorize_production_conversation_trim() 
             |row| row.get(0),
         )
         .expect("count rows after outbox-only trim rejection");
-    assert_eq!(retained, 1);
+    assert_eq!(retained, 2);
     drop(state);
     let _ = fs::remove_dir_all(root);
 }
@@ -1102,7 +1139,7 @@ fn active_snapshot_pin_blocks_both_replacements_and_rollback_preserves_state() {
     let now_ms = config.clock.now_ms().expect("active pin test clock");
     let pin = acquire_snapshot_build_pin(&state, conversation_id, now_ms)
         .expect("acquire active snapshot pin over victim");
-    assert_eq!(pin.base_event_seq(), Some(0));
+    assert_eq!(pin.base_event_seq(), Some(1));
     let pin_row: (String, Vec<u8>, Option<String>, String) = state
         .connection
         .query_row(
@@ -1114,7 +1151,7 @@ fn active_snapshot_pin_blocks_both_replacements_and_rollback_preserves_state() {
         .expect("read active snapshot pin before trim");
     assert_eq!(pin_row.0, "snapshot");
     assert_eq!(pin_row.1.as_slice(), conversation_id.as_bytes());
-    assert_eq!(pin_row.2, Some(encode_sequence(0)));
+    assert_eq!(pin_row.2, Some(encode_sequence(1)));
     assert_eq!(pin_row.3, "active");
 
     let transaction = state
@@ -1153,7 +1190,7 @@ fn active_snapshot_pin_blocks_both_replacements_and_rollback_preserves_state() {
         )
         .expect("read pin and rows after rejected transaction");
     assert_eq!(pin_state, "active");
-    assert_eq!(retained, 1);
+    assert_eq!(retained, 2);
     release_snapshot_build_pin(&state, &pin).expect("release retained snapshot pin");
     drop(state);
     let _ = fs::remove_dir_all(root);
@@ -1178,7 +1215,7 @@ fn global_trim_skips_blocked_oldest_and_trims_eligible_conversation() {
         state.key_bundle.as_ref(),
         true,
         now_ms,
-        1,
+        2,
         MAX_EVENT_STREAM_BYTES_GLOBAL,
     )
     .expect("skip blocked oldest and trim eligible target");
@@ -1200,7 +1237,7 @@ fn global_trim_skips_blocked_oldest_and_trims_eligible_conversation() {
             |row| row.get(0),
         )
         .expect("count eligible rows");
-    assert_eq!(blocked_rows, 1);
+    assert_eq!(blocked_rows, 2);
     assert_eq!(eligible_rows, 0);
     release_snapshot_build_pin(&state, &blocked_pin).expect("release blocked pin");
     drop(state);

@@ -178,6 +178,32 @@ fn start_receipt(reply: RuntimeReply) -> ConversationStartReceipt {
     }
 }
 
+async fn configure_codex_revision_one(
+    core: &RuntimeCore,
+    connection: ConnectionId,
+    conversation_id: ConversationId,
+    key: &str,
+) {
+    let reply = core
+        .handle(
+            connection,
+            RuntimeRequest::ConfigureConversation(ConfigureConversationRequest::new(
+                conversation_id.clone(),
+                IdempotencyKey::new(key),
+                0,
+                codex_configuration(CodexReasoningEffort::Medium),
+            )),
+        )
+        .await;
+    assert!(matches!(
+        reply,
+        RuntimeReply::Configuration(ConfigurationReceipt::Applied {
+            conversation_id: configured,
+            configuration_revision: 1,
+        }) if configured == conversation_id
+    ));
+}
+
 async fn connect_local(core: &RuntimeCore, seed: u8) -> ConnectionId {
     let principal = core
         .issue_verified_local_principal(501, [seed; 16])

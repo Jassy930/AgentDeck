@@ -51,12 +51,19 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use agentdeck_protocol::runtime::identity::{EntityId, ItemId};
-    use agentdeck_protocol::{AgentItem, AgentItemMeta, AgentKind};
+    use agentdeck_protocol::runtime::{
+        CodexConversationConfiguration, ConversationConfiguration, VendorConfigurationSnapshot,
+    };
+    use agentdeck_protocol::{
+        AgentItem, AgentItemMeta, AgentKind, CodexApprovalPolicy, CodexReasoningEffort,
+        CodexSandboxMode,
+    };
     use rusqlite::{Connection, OpenFlags, params};
 
     use crate::runtime::model::{ConversationDescriptor, IdempotencyOwner};
     use crate::runtime::store::{
-        AppendExecutionEvent, AppendExecutionEventOutcome, RuntimeId, RuntimeIdKind,
+        AppendExecutionEvent, AppendExecutionEventOutcome, ConfigureConversation,
+        ConfigureConversationOutcome, RuntimeId, RuntimeIdKind,
     };
     use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
 
@@ -143,6 +150,32 @@ mod tests {
             })
             .await
             .expect("create conversation");
+        assert!(matches!(
+            store
+                .configure_conversation(ConfigureConversation {
+                    conversation_id,
+                    owner: IdempotencyOwner::Local {
+                        machine_trust_domain: [0x31; 32],
+                        uid: 501,
+                        client_installation_id: [0x32; 16],
+                    },
+                    idempotency_key: "execution-event-build-gate-configuration".to_owned(),
+                    expected_configuration_revision: 0,
+                    configuration: ConversationConfiguration::new(
+                        VendorConfigurationSnapshot::Codex(
+                            CodexConversationConfiguration::new(
+                                CodexApprovalPolicy::OnRequest,
+                                CodexSandboxMode::WorkspaceWrite,
+                                CodexReasoningEffort::Medium,
+                            ),
+                        ),
+                    ),
+                })
+                .await
+                .expect("configure conversation"),
+            ConfigureConversationOutcome::Applied { configuration }
+                if configuration.configuration_revision == 1 && configuration.event_seq == 0
+        ));
         let command = match store
             .accept_command(AcceptCommand {
                 conversation_id,
@@ -152,7 +185,7 @@ mod tests {
                     client_installation_id: [0x22; 16],
                 },
                 idempotency_key: "execution-event-build-gate".to_owned(),
-                expected_configuration_revision: 0,
+                expected_configuration_revision: 1,
                 payload: b"real prompt sample".to_vec(),
             })
             .await
@@ -229,7 +262,7 @@ mod tests {
                 lane: RuntimeStoreLane::Normal
             })
         ));
-        assert_eq!(event_state(&root.database(), event_id), (0, 0));
+        assert_eq!(event_state(&root.database(), event_id), (0, 1));
 
         drop(held);
         assert!(matches!(
@@ -238,9 +271,9 @@ mod tests {
                 .await
                 .expect("same input appends after permit release"),
             AppendExecutionEventOutcome::Appended { event }
-                if event.event_id == event_id && event.event_seq == 1
+                if event.event_id == event_id && event.event_seq == 2
         ));
-        assert_eq!(event_state(&root.database(), event_id), (1, 1));
+        assert_eq!(event_state(&root.database(), event_id), (1, 2));
 
         store.shutdown().await.expect("shutdown runtime store");
     }

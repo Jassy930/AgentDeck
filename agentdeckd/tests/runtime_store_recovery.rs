@@ -13,6 +13,8 @@ use agentdeckd::runtime::store::{
 };
 use agentdeckd::security::{MemoryKeyStore, StorageKek, load_or_create_storage_kek};
 
+#[path = "support/runtime_configuration.rs"]
+mod runtime_configuration;
 #[path = "support/store_admission.rs"]
 mod store_admission;
 
@@ -219,13 +221,14 @@ async fn accept(
     seed: u8,
     payload: Vec<u8>,
 ) {
+    runtime_configuration::configure_codex_revision_one(store, conversation_id).await;
     assert!(matches!(
         store
             .accept_command(AcceptCommand {
                 conversation_id,
                 owner: owner(seed),
                 idempotency_key: format!("request-{seed}"),
-                expected_configuration_revision: 0,
+                expected_configuration_revision: 1,
                 payload,
             })
             .await
@@ -370,7 +373,7 @@ async fn recovery_sweeps_expired_commands_before_freezing_the_page_counts() {
     assert!(slice.accepted.is_empty());
     assert!(slice.started.is_none());
     assert_eq!(slice.conversation.accepted_command_count, 0);
-    assert_eq!(slice.conversation.event_high_water, Some(0));
+    assert_eq!(slice.conversation.event_high_water, Some(1));
     store
         .finish_recovery_scan(page.completion.expect("single page completes"))
         .await
@@ -397,12 +400,13 @@ async fn recovery_blocked_cas_rejects_every_stale_started_binding_field() {
         .create_conversation(conversation_input(0x31))
         .await
         .expect("create exact blocked conversation");
+    runtime_configuration::configure_codex_revision_one(&store, conversation.conversation_id).await;
     let command = match store
         .accept_command(AcceptCommand {
             conversation_id: conversation.conversation_id,
             owner: owner(0x32),
             idempotency_key: "exact-blocked".to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"exact blocked binding".to_vec(),
         })
         .await

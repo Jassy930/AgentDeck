@@ -25,6 +25,9 @@ use sha2::{Digest, Sha256};
 
 use super::{runtime_descriptor, store_admission};
 
+#[path = "runtime_configuration.rs"]
+mod runtime_configuration;
+
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
 struct TestRoot {
@@ -98,6 +101,7 @@ impl RuntimeEventTamperFixture {
             })
             .await
             .expect("create tamper conversation");
+        runtime_configuration::configure_codex_revision_one(&store, conversation_id).await;
         let command = match store
             .accept_command(AcceptCommand {
                 conversation_id,
@@ -107,7 +111,7 @@ impl RuntimeEventTamperFixture {
                     client_installation_id: [0x22; 16],
                 },
                 idempotency_key: format!("runtime-event-tamper-{seed}"),
-                expected_configuration_revision: 0,
+                expected_configuration_revision: 1,
                 payload: b"real tamper fixture prompt".to_vec(),
             })
             .await
@@ -192,7 +196,7 @@ impl RuntimeEventTamperFixture {
         };
         assert_eq!(
             (started.event_seq, item.event_seq, terminal.event_seq),
-            (0, 1, 2)
+            (1, 2, 3)
         );
         store.shutdown().await.expect("shutdown tamper fixture");
         Self {
@@ -326,7 +330,7 @@ impl RuntimeEventTamperFixture {
     }
 
     pub(crate) fn make_authenticated_sequence_gap(&self) {
-        const GAP_SEQ: u64 = 3;
+        const GAP_SEQ: u64 = 4;
         let encoded_gap = encode_sequence(GAP_SEQ);
         let mut wire: RuntimeEvent =
             serde_json::from_slice(&self.item.payload).expect("decode Item for gap fixture");
@@ -446,6 +450,7 @@ impl RuntimeStartedReleaseTamperFixture {
             })
             .await
             .expect("create started release tamper conversation");
+        runtime_configuration::configure_codex_revision_one(&store, conversation_id).await;
         let command = match store
             .accept_command(AcceptCommand {
                 conversation_id,
@@ -455,7 +460,7 @@ impl RuntimeStartedReleaseTamperFixture {
                     client_installation_id: [0x44; 16],
                 },
                 idempotency_key: format!("started-release-tamper-{seed}"),
-                expected_configuration_revision: 0,
+                expected_configuration_revision: 1,
                 payload: b"started-only tamper prompt".to_vec(),
             })
             .await

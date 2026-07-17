@@ -64,11 +64,18 @@ async fn disconnecting_snapshot_build_keeps_shared_budget_until_store_command_fi
     let command_id = RuntimeId::from_bytes(RuntimeIdKind::Command, [0x96; 16]).expect("command id");
     let turn_id = RuntimeId::from_bytes(RuntimeIdKind::Turn, [0x97; 16]).expect("turn id");
     let event_id = RuntimeId::from_bytes(RuntimeIdKind::Event, [0x98; 16]).expect("event id");
+    let configuration_event =
+        RuntimeId::from_bytes(RuntimeIdKind::Event, [0x95; 16]).expect("configuration event id");
     let fault = Arc::new(BlockingSubscriptionSnapshotFault::default());
     let store = RuntimeStoreHandle::open(
         crate::runtime::store::RuntimeStoreConfig::new(root.path.join("runtime.db"))
             .with_command_capacity(1_024)
-            .with_id_source(SequenceIdSource::new([command_id, turn_id, event_id]))
+            .with_id_source(SequenceIdSource::new([
+                configuration_event,
+                command_id,
+                turn_id,
+                event_id,
+            ]))
             .with_fault_injector(fault.clone()),
         root.kek(),
     )
@@ -192,11 +199,18 @@ async fn unacked_snapshot_store_failure_drops_retry_payload_and_build_pin_before
     let command_id = RuntimeId::from_bytes(RuntimeIdKind::Command, [0x91; 16]).expect("command id");
     let turn_id = RuntimeId::from_bytes(RuntimeIdKind::Turn, [0x92; 16]).expect("turn id");
     let event_id = RuntimeId::from_bytes(RuntimeIdKind::Event, [0x93; 16]).expect("event id");
+    let configuration_event =
+        RuntimeId::from_bytes(RuntimeIdKind::Event, [0x8F; 16]).expect("configuration event id");
     let fault = Arc::new(BlockingSubscriptionSnapshotFault::default());
     let store = RuntimeStoreHandle::open(
         crate::runtime::store::RuntimeStoreConfig::new(root.path.join("runtime.db"))
             .with_command_capacity(1_024)
-            .with_id_source(SequenceIdSource::new([command_id, turn_id, event_id]))
+            .with_id_source(SequenceIdSource::new([
+                configuration_event,
+                command_id,
+                turn_id,
+                event_id,
+            ]))
             .with_fault_injector(fault.clone()),
         root.kek(),
     )

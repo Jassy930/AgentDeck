@@ -1,3 +1,5 @@
+#[path = "support/runtime_configuration.rs"]
+mod runtime_configuration;
 #[path = "support/runtime_descriptor.rs"]
 mod runtime_descriptor;
 #[path = "support/store_admission.rs"]
@@ -220,12 +222,13 @@ async fn released_started_turn(
         })
         .await
         .expect("create execution event conversation");
+    runtime_configuration::configure_codex_revision_one(store, conversation_id).await;
     let command = match store
         .accept_command(AcceptCommand {
             conversation_id,
             owner: owner(),
             idempotency_key: format!("execution-event-commit-{seed}"),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"real prompt sample".to_vec(),
         })
         .await
@@ -302,12 +305,12 @@ async fn register_watch(
             target: RuntimeStreamTarget::Conversation(conversation_id),
             generation: WatchGeneration::new(generation).expect("valid watch generation"),
             request: BarrierRequest::Subscribe {
-                cursor: StreamCursor::At(0),
+                cursor: StreamCursor::At(1),
             },
         })
         .await
         .expect("register execution event watcher");
-    assert_eq!(registration.high_water, StreamCursor::At(0));
+    assert_eq!(registration.high_water, StreamCursor::At(1));
     registration
 }
 
@@ -316,14 +319,14 @@ fn assert_committed_state(
     command_id: RuntimeId,
     expected_event_bytes: usize,
 ) {
-    let seq = "00000000000000000001".to_owned();
+    let seq = "00000000000000000002".to_owned();
     assert_eq!(state.conversation_high_water.as_deref(), Some(seq.as_str()));
     assert_eq!(
         state.retention_indexed_through.as_deref(),
         Some(seq.as_str())
     );
-    assert_eq!(state.journal_count, 2);
-    assert_eq!(state.stream_count, 2);
+    assert_eq!(state.journal_count, 3);
+    assert_eq!(state.stream_count, 3);
     assert_eq!(state.ledger_event_count, state.journal_count);
     assert_eq!(state.ledger_audit_bytes, state.journal_bytes);
     assert_eq!(state.ledger_stream_count, state.stream_count);
@@ -365,7 +368,7 @@ async fn append_commit_advances_row_hwm_index_ledger_and_watcher_together() {
     };
     assert_eq!(
         registration.watch.take_coalesced(),
-        Some(StreamCursor::At(1))
+        Some(StreamCursor::At(2))
     );
     let decoded: RuntimeEvent = serde_json::from_slice(&event.payload).expect("decode typed event");
     assert!(matches!(decoded.body, RuntimeEventBody::Item { .. }));
@@ -437,7 +440,7 @@ async fn append_after_commit_unknown_notifies_and_same_event_id_replays_exactly(
     ));
     assert_eq!(
         registration.watch.take_coalesced(),
-        Some(StreamCursor::At(1))
+        Some(StreamCursor::At(2))
     );
     let committed = durable_state(&root.database(), conversation_id, event_id);
     let replay = match store
@@ -449,7 +452,7 @@ async fn append_after_commit_unknown_notifies_and_same_event_id_replays_exactly(
         AppendExecutionEventOutcome::Appended { .. } => panic!("unknown COMMIT must replay"),
     };
     assert_eq!(replay.event_id, event_id);
-    assert_eq!(replay.event_seq, 1);
+    assert_eq!(replay.event_seq, 2);
     assert_committed_state(&committed, command_id, replay.payload.len());
     assert_eq!(
         durable_state(&root.database(), conversation_id, event_id),

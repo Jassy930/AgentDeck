@@ -1,3 +1,5 @@
+#[path = "support/runtime_configuration.rs"]
+mod runtime_configuration;
 #[path = "support/runtime_descriptor.rs"]
 mod runtime_descriptor;
 #[path = "support/runtime_recovery.rs"]
@@ -269,11 +271,12 @@ async fn accepted_and_started_replays_bypass_disk_low_admission() {
         .create_conversation(conversation_input(1, b"replay"))
         .await
         .expect("create conversation");
+    runtime_configuration::configure_codex_revision_one(&store, conversation.conversation_id).await;
     let accept_input = || AcceptCommand {
         conversation_id: conversation.conversation_id,
         owner: local_owner(),
         idempotency_key: "same-request".to_owned(),
-        expected_configuration_revision: 0,
+        expected_configuration_revision: 1,
         payload: b"same-prompt".to_vec(),
     };
     let command = match store
@@ -336,11 +339,12 @@ async fn new_accept_and_start_are_rejected_before_their_first_durable_write() {
         .create_conversation(conversation_input(1, b"ordinary-gates"))
         .await
         .expect("create conversation");
+    runtime_configuration::configure_codex_revision_one(&store, conversation.conversation_id).await;
     let accept_input = || AcceptCommand {
         conversation_id: conversation.conversation_id,
         owner: local_owner(),
         idempotency_key: "gated-command".to_owned(),
-        expected_configuration_revision: 0,
+        expected_configuration_revision: 1,
         payload: b"prompt".to_vec(),
     };
 
@@ -388,7 +392,7 @@ async fn new_accept_and_start_are_rejected_before_their_first_durable_write() {
             .mark_started_with_event(start_input())
             .await
             .expect("retry start after capacity recovery"),
-        StartOutcome::Started { event, .. } if event.event_seq == 0
+        StartOutcome::Started { event, .. } if event.event_seq == 1
     ));
     store.shutdown().await.expect("shutdown runtime store");
 }
@@ -408,12 +412,13 @@ async fn start_reserves_the_complete_fence_release_and_max_terminal_tail() {
         .create_conversation(conversation_input(1, b"start-reserve"))
         .await
         .expect("create conversation");
+    runtime_configuration::configure_codex_revision_one(&store, conversation.conversation_id).await;
     let command = match store
         .accept_command(AcceptCommand {
             conversation_id: conversation.conversation_id,
             owner: local_owner(),
             idempotency_key: "reserve-command".to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"prompt".to_vec(),
         })
         .await
@@ -485,6 +490,8 @@ async fn safety_only_revalidates_reserved_tail_before_fence_release_and_terminal
         healthy_observation(),
         healthy_observation(),
         healthy_observation(),
+        healthy_observation(),
+        healthy_observation(),
         over_limit_observation(),
     ]);
     let store = RuntimeStoreHandle::open(
@@ -497,12 +504,13 @@ async fn safety_only_revalidates_reserved_tail_before_fence_release_and_terminal
         .create_conversation(conversation_input(1, b"safety"))
         .await
         .expect("create conversation");
+    runtime_configuration::configure_codex_revision_one(&store, conversation.conversation_id).await;
     let command = match store
         .accept_command(AcceptCommand {
             conversation_id: conversation.conversation_id,
             owner: local_owner(),
             idempotency_key: "safety-command".to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"prompt".to_vec(),
         })
         .await
@@ -656,12 +664,13 @@ async fn released_terminal_closes_on_fragmented_real_sqlite_with_a_pinned_wal_re
         .create_conversation(conversation_input(0x31, b"real sqlite terminal capacity"))
         .await
         .expect("create terminal capacity conversation");
+    runtime_configuration::configure_codex_revision_one(&store, conversation.conversation_id).await;
     let command = match store
         .accept_command(AcceptCommand {
             conversation_id: conversation.conversation_id,
             owner: local_owner(),
             idempotency_key: "released-terminal-real-sqlite".to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"terminal capacity prompt".to_vec(),
         })
         .await

@@ -158,6 +158,16 @@ async fn append_large_snapshot_event(
     owner_seed: u8,
     text_bytes: usize,
 ) {
+    let configuration_connection = connect_local(core, owner_seed.wrapping_add(0x40)).await;
+    let configuration_key = format!("large-snapshot-configuration-{owner_seed}");
+    configure_codex_revision_one(
+        core,
+        configuration_connection,
+        WireConversationId::new(conversation_id.to_canonical_string()),
+        &configuration_key,
+    )
+    .await;
+    core.disconnect(configuration_connection).await;
     let owner = crate::runtime::store::IdempotencyOwner::Local {
         machine_trust_domain: [owner_seed; 32],
         uid: 501,
@@ -169,7 +179,7 @@ async fn append_large_snapshot_event(
             conversation_id,
             owner: owner.clone(),
             idempotency_key: format!("large-snapshot-{owner_seed}"),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"large snapshot prompt".to_vec(),
         })
         .await
@@ -241,7 +251,7 @@ async fn append_large_snapshot_event(
             .await
             .expect("append large canonical snapshot item"),
         crate::runtime::store::AppendExecutionEventOutcome::Appended { event }
-            if event.event_id == item_event_id && event.event_seq == 1
+            if event.event_id == item_event_id && event.event_seq == 2
     ));
 }
 
@@ -951,19 +961,25 @@ async fn unacked_conversation_snapshot_holds_global_build_budget_until_flush() {
     let first_turn = RuntimeId::from_bytes(RuntimeIdKind::Turn, [0x62; 16]).expect("first turn id");
     let first_event =
         RuntimeId::from_bytes(RuntimeIdKind::Event, [0x63; 16]).expect("first event id");
+    let first_configuration_event = RuntimeId::from_bytes(RuntimeIdKind::Event, [0x60; 16])
+        .expect("first configuration event id");
     let second_command =
         RuntimeId::from_bytes(RuntimeIdKind::Command, [0x64; 16]).expect("second command id");
     let second_turn =
         RuntimeId::from_bytes(RuntimeIdKind::Turn, [0x65; 16]).expect("second turn id");
     let second_event =
         RuntimeId::from_bytes(RuntimeIdKind::Event, [0x66; 16]).expect("second event id");
+    let second_configuration_event = RuntimeId::from_bytes(RuntimeIdKind::Event, [0x6A; 16])
+        .expect("second configuration event id");
     let store = RuntimeStoreHandle::open(
         crate::runtime::store::RuntimeStoreConfig::new(root.path.join("runtime.db"))
             .with_command_capacity(1_024)
             .with_id_source(SequenceIdSource::new([
+                first_configuration_event,
                 first_command,
                 first_turn,
                 first_event,
+                second_configuration_event,
                 second_command,
                 second_turn,
                 second_event,
@@ -1154,10 +1170,17 @@ async fn regular_near_limit_backfill_pages_charge_dto_and_payload_in_one_pool() 
     let command_id = RuntimeId::from_bytes(RuntimeIdKind::Command, [0x81; 16]).expect("command id");
     let turn_id = RuntimeId::from_bytes(RuntimeIdKind::Turn, [0x82; 16]).expect("turn id");
     let event_id = RuntimeId::from_bytes(RuntimeIdKind::Event, [0x83; 16]).expect("event id");
+    let configuration_event =
+        RuntimeId::from_bytes(RuntimeIdKind::Event, [0x80; 16]).expect("configuration event id");
     let store = RuntimeStoreHandle::open(
         crate::runtime::store::RuntimeStoreConfig::new(root.path.join("runtime.db"))
             .with_command_capacity(1_024)
-            .with_id_source(SequenceIdSource::new([command_id, turn_id, event_id])),
+            .with_id_source(SequenceIdSource::new([
+                configuration_event,
+                command_id,
+                turn_id,
+                event_id,
+            ])),
         root.kek(),
     )
     .await
@@ -1189,18 +1212,18 @@ async fn regular_near_limit_backfill_pages_charge_dto_and_payload_in_one_pool() 
         .store
         .acquire_backfill_pin(
             RuntimeBackfillTarget::Conversation(conversation_id),
-            Some(0),
+            Some(1),
         )
         .await
         .expect("pin regular near-limit backfill")
     else {
-        panic!("event zero must produce a regular pinned page")
+        panic!("event one must produce a regular pinned page")
     };
     let mut held = Vec::new();
     for _ in 0..8 {
         let page = core
             .store
-            .load_event_backfill_page(pin.clone(), Some(0))
+            .load_event_backfill_page(pin.clone(), Some(1))
             .await
             .expect("eight DTO+payload leases fit the shared 128 MiB pool");
         assert_eq!(page.events.len(), 1);
@@ -1208,7 +1231,7 @@ async fn regular_near_limit_backfill_pages_charge_dto_and_payload_in_one_pool() 
     }
     assert!(matches!(
         core.store
-            .load_event_backfill_page(pin.clone(), Some(0))
+            .load_event_backfill_page(pin.clone(), Some(1))
             .await,
         Err(RuntimeStoreError::WorkerBusy {
             lane: RuntimeStoreLane::Read
@@ -1218,7 +1241,7 @@ async fn regular_near_limit_backfill_pages_charge_dto_and_payload_in_one_pool() 
     drop(held.pop());
     let replacement = core
         .store
-        .load_event_backfill_page(pin.clone(), Some(0))
+        .load_event_backfill_page(pin.clone(), Some(1))
         .await
         .expect("dropping one slow page returns exactly one combined lease");
     drop(replacement);
@@ -1238,10 +1261,17 @@ async fn oversized_backfill_payload_holds_exclusive_read_lease_until_flush_and_c
     let command_id = RuntimeId::from_bytes(RuntimeIdKind::Command, [0x91; 16]).expect("command id");
     let turn_id = RuntimeId::from_bytes(RuntimeIdKind::Turn, [0x92; 16]).expect("turn id");
     let event_id = RuntimeId::from_bytes(RuntimeIdKind::Event, [0x93; 16]).expect("event id");
+    let configuration_event =
+        RuntimeId::from_bytes(RuntimeIdKind::Event, [0x90; 16]).expect("configuration event id");
     let store = RuntimeStoreHandle::open(
         crate::runtime::store::RuntimeStoreConfig::new(root.path.join("runtime.db"))
             .with_command_capacity(1_024)
-            .with_id_source(SequenceIdSource::new([command_id, turn_id, event_id])),
+            .with_id_source(SequenceIdSource::new([
+                configuration_event,
+                command_id,
+                turn_id,
+                event_id,
+            ])),
         root.kek(),
     )
     .await
@@ -1277,7 +1307,7 @@ async fn oversized_backfill_payload_holds_exclusive_read_lease_until_flush_and_c
         conversation_backfill_after_envelope(
             "oversized-backfill-flush",
             conversation_id,
-            StreamCursor::At(0),
+            StreamCursor::At(1),
         ),
     )
     .await
@@ -1297,16 +1327,16 @@ async fn oversized_backfill_payload_holds_exclusive_read_lease_until_flush_and_c
         .store
         .acquire_backfill_pin(
             RuntimeBackfillTarget::Conversation(conversation_id),
-            Some(0),
+            Some(1),
         )
         .await
         .expect("acquire competing oversized probe pin")
     else {
-        panic!("event zero must produce a pinned probe")
+        panic!("event one must produce a pinned probe")
     };
     assert!(matches!(
         core.store
-            .load_event_backfill_page(probe_pin.clone(), Some(0))
+            .load_event_backfill_page(probe_pin.clone(), Some(1))
             .await,
         Err(RuntimeStoreError::WorkerBusy {
             lane: RuntimeStoreLane::Read
@@ -1345,7 +1375,7 @@ async fn oversized_backfill_payload_holds_exclusive_read_lease_until_flush_and_c
 
     let replayed = core
         .store
-        .load_event_backfill_page(probe_pin.clone(), Some(0))
+        .load_event_backfill_page(probe_pin.clone(), Some(1))
         .await
         .expect("final FlushReceipt releases the oversized read lease");
     assert_eq!(replayed.events.len(), 1);
@@ -1363,7 +1393,7 @@ async fn oversized_backfill_payload_holds_exclusive_read_lease_until_flush_and_c
         conversation_backfill_after_envelope(
             "oversized-backfill-cancel",
             conversation_id,
-            StreamCursor::At(0),
+            StreamCursor::At(1),
         ),
     )
     .await
@@ -1380,16 +1410,16 @@ async fn oversized_backfill_payload_holds_exclusive_read_lease_until_flush_and_c
         .store
         .acquire_backfill_pin(
             RuntimeBackfillTarget::Conversation(conversation_id),
-            Some(0),
+            Some(1),
         )
         .await
         .expect("acquire cancellation probe pin")
     else {
-        panic!("event zero must produce a cancellation probe")
+        panic!("event one must produce a cancellation probe")
     };
     assert!(matches!(
         core.store
-            .load_event_backfill_page(cancel_probe.clone(), Some(0))
+            .load_event_backfill_page(cancel_probe.clone(), Some(1))
             .await,
         Err(RuntimeStoreError::WorkerBusy {
             lane: RuntimeStoreLane::Read
@@ -1404,7 +1434,7 @@ async fn oversized_backfill_payload_holds_exclusive_read_lease_until_flush_and_c
     drop(held);
     let replayed = core
         .store
-        .load_event_backfill_page(cancel_probe.clone(), Some(0))
+        .load_event_backfill_page(cancel_probe.clone(), Some(1))
         .await
         .expect("cancellation releases the oversized read lease");
     assert_eq!(replayed.events.len(), 1);
@@ -1805,6 +1835,13 @@ async fn asynchronous_snapshot_failure_emits_a_directed_terminal_failure() {
         .create_conversation(input)
         .await
         .expect("create failure conversation");
+    configure_codex_revision_one(
+        &core,
+        connection,
+        WireConversationId::new(conversation_id.to_canonical_string()),
+        "noncanonical-snapshot-configuration",
+    )
+    .await;
     let owner = crate::runtime::store::IdempotencyOwner::Local {
         machine_trust_domain: [0xD1; 32],
         uid: 501,
@@ -1816,7 +1853,7 @@ async fn asynchronous_snapshot_failure_emits_a_directed_terminal_failure() {
             conversation_id,
             owner: owner.clone(),
             idempotency_key: "noncanonical-snapshot-event".to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"prompt".to_vec(),
         })
         .await
@@ -1912,10 +1949,17 @@ async fn failure_after_flushed_snapshot_fail_closes_the_connection() {
     let command_id = RuntimeId::from_bytes(RuntimeIdKind::Command, [0x51; 16]).expect("command id");
     let turn_id = RuntimeId::from_bytes(RuntimeIdKind::Turn, [0x53; 16]).expect("turn id");
     let event_id = RuntimeId::from_bytes(RuntimeIdKind::Event, [0x52; 16]).expect("event id");
+    let configuration_event =
+        RuntimeId::from_bytes(RuntimeIdKind::Event, [0x50; 16]).expect("configuration event id");
     let store = RuntimeStoreHandle::open(
         crate::runtime::store::RuntimeStoreConfig::new(root.path.join("runtime.db"))
             .with_command_capacity(1_024)
-            .with_id_source(SequenceIdSource::new([command_id, turn_id, event_id])),
+            .with_id_source(SequenceIdSource::new([
+                configuration_event,
+                command_id,
+                turn_id,
+                event_id,
+            ])),
         root.kek(),
     )
     .await
@@ -1954,6 +1998,13 @@ async fn failure_after_flushed_snapshot_fail_closes_the_connection() {
         .store_conversation_snapshot(write)
         .await
         .expect("store ready empty snapshot");
+    configure_codex_revision_one(
+        &core,
+        connection,
+        WireConversationId::new(conversation_id.to_canonical_string()),
+        "partial-failure-configuration",
+    )
+    .await;
 
     let owner = crate::runtime::store::IdempotencyOwner::Local {
         machine_trust_domain: [0xD3; 32],
@@ -1966,7 +2017,7 @@ async fn failure_after_flushed_snapshot_fail_closes_the_connection() {
             conversation_id,
             owner: owner.clone(),
             idempotency_key: "partial-failure-command".to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"prompt".to_vec(),
         })
         .await
@@ -2031,7 +2082,7 @@ async fn failure_after_flushed_snapshot_fail_closes_the_connection() {
         tamper
             .execute(
                 "UPDATE event_stream_index SET metadata_token = zeroblob(32)\
-                 WHERE conversation_id = ?1 AND event_seq = '00000000000000000000'",
+                 WHERE conversation_id = ?1 AND event_seq = '00000000000000000001'",
                 [&conversation_id.as_bytes()[..]],
             )
             .expect("tamper backfill row after snapshot delivery"),

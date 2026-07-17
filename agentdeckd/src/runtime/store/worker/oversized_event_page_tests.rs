@@ -2,17 +2,24 @@ use std::collections::VecDeque;
 use std::fs;
 use std::sync::atomic::AtomicU64;
 
-use agentdeck_protocol::runtime::RuntimeEvent;
 use agentdeck_protocol::runtime::event::RuntimeEventBody;
 use agentdeck_protocol::runtime::identity::{CommandId, ConversationId, EntityId, EventId, ItemId};
-use agentdeck_protocol::{AgentItem, AgentItemMeta, AgentKind};
+use agentdeck_protocol::runtime::{
+    CodexConversationConfiguration, ConversationConfiguration, RuntimeEvent,
+    VendorConfigurationSnapshot,
+};
+use agentdeck_protocol::{
+    AgentItem, AgentItemMeta, AgentKind, CodexApprovalPolicy, CodexReasoningEffort,
+    CodexSandboxMode,
+};
 
 use super::*;
 use crate::runtime::model::MAX_RUNTIME_EVENT_BYTES;
 use crate::runtime::store::identity::{RuntimeIdError, RuntimeIdSource};
 use crate::runtime::store::{
     AppendExecutionEvent, AppendExecutionEventOutcome, AuthorizeExecutionRelease,
-    ConversationDescriptor, ExecutionFence, IdempotencyOwner, NewConversation,
+    ConfigureConversation, ConfigureConversationOutcome, ConversationDescriptor, ExecutionFence,
+    IdempotencyOwner, NewConversation,
 };
 use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
 
@@ -84,10 +91,12 @@ async fn nine_mib_canonical_event_replays_through_backfill_and_snapshot_pages() 
     let command_id = runtime_id(RuntimeIdKind::Command, 0x31);
     let turn_id = runtime_id(RuntimeIdKind::Turn, 0x32);
     let event_id = runtime_id(RuntimeIdKind::Event, 0x33);
+    let configuration_event_id = runtime_id(RuntimeIdKind::Event, 0x37);
     let item_event_id = runtime_id(RuntimeIdKind::Event, 0x36);
-    let config = RuntimeStoreConfig::new(root.0.join("runtime.db")).with_id_source(
-        OrderedIdSource(VecDeque::from([command_id, turn_id, event_id])),
-    );
+    let config =
+        RuntimeStoreConfig::new(root.0.join("runtime.db")).with_id_source(OrderedIdSource(
+            VecDeque::from([configuration_event_id, command_id, turn_id, event_id]),
+        ));
     let storage_kek = load_or_create_storage_kek(&keys, &root.0.join("key-state.db"))
         .expect("create oversized event StorageKEK");
     let store = RuntimeStoreHandle::open(config, storage_kek)
@@ -106,6 +115,32 @@ async fn nine_mib_canonical_event_replays_through_backfill_and_snapshot_pages() 
         })
         .await
         .expect("create oversized event conversation");
+    assert!(matches!(
+        store
+            .configure_conversation(ConfigureConversation {
+                conversation_id,
+                owner: IdempotencyOwner::Local {
+                    machine_trust_domain: [0x43; 32],
+                    uid: 501,
+                    client_installation_id: [0x44; 16],
+                },
+                idempotency_key: "oversized-event-configuration".to_owned(),
+                expected_configuration_revision: 0,
+                configuration: ConversationConfiguration::new(
+                    VendorConfigurationSnapshot::Codex(CodexConversationConfiguration::new(
+                        CodexApprovalPolicy::OnRequest,
+                        CodexSandboxMode::WorkspaceWrite,
+                        CodexReasoningEffort::Medium,
+                    )),
+                ),
+            })
+            .await
+            .expect("configure oversized event conversation"),
+        ConfigureConversationOutcome::Applied { configuration }
+            if configuration.configuration_revision == 1
+                && configuration.event_id == configuration_event_id
+                && configuration.event_seq == 0
+    ));
     let command = match store
         .accept_command(AcceptCommand {
             conversation_id,
@@ -115,7 +150,7 @@ async fn nine_mib_canonical_event_replays_through_backfill_and_snapshot_pages() 
                 client_installation_id: [0x42; 16],
             },
             idempotency_key: "oversized-event".to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"oversized event command".to_vec(),
         })
         .await
@@ -130,7 +165,7 @@ async fn nine_mib_canonical_event_replays_through_backfill_and_snapshot_pages() 
     let canonical = RuntimeEvent::new(
         ConversationId::new(conversation_id.to_canonical_string()),
         EventId::new(item_event_id.to_canonical_string()),
-        1,
+        2,
         Some(CommandId::new(command_id.to_canonical_string())),
         Some(ItemId::new("oversized-item")),
         Some(EntityId::new("oversized-entity")),
@@ -201,13 +236,13 @@ async fn nine_mib_canonical_event_replays_through_backfill_and_snapshot_pages() 
             .await
             .expect("append 9 MiB canonical item"),
         AppendExecutionEventOutcome::Appended { event }
-            if event.event_id == item_event_id && event.event_seq == 1
+            if event.event_id == item_event_id && event.event_seq == 2
     ));
 
     let RuntimeBackfillPlan::Pinned(backfill_pin) = store
         .acquire_backfill_pin(
             RuntimeBackfillTarget::Conversation(conversation_id),
-            Some(0),
+            Some(1),
         )
         .await
         .expect("pin oversized event backfill")
@@ -215,15 +250,15 @@ async fn nine_mib_canonical_event_replays_through_backfill_and_snapshot_pages() 
         panic!("event zero requires a pinned backfill page");
     };
     let page = store
-        .load_event_backfill_page(backfill_pin.clone(), Some(0))
+        .load_event_backfill_page(backfill_pin.clone(), Some(1))
         .await
         .expect("load oversized event through snapshot-sized lease");
     assert_single_event(&page.events, &canonical);
     assert!(page.complete);
-    assert_eq!(page.next_after, 1);
+    assert_eq!(page.next_after, 2);
     assert!(matches!(
         store
-            .load_event_backfill_page(backfill_pin.clone(), Some(0))
+            .load_event_backfill_page(backfill_pin.clone(), Some(1))
             .await,
         Err(RuntimeStoreError::WorkerBusy {
             lane: RuntimeStoreLane::Read
@@ -233,7 +268,7 @@ async fn nine_mib_canonical_event_replays_through_backfill_and_snapshot_pages() 
     drop(page);
 
     let replayed = store
-        .load_event_backfill_page(backfill_pin.clone(), Some(0))
+        .load_event_backfill_page(backfill_pin.clone(), Some(1))
         .await
         .expect("dropping oversized page returns the 128 MiB lease");
     assert_single_event(&replayed.events, &canonical);
@@ -244,7 +279,7 @@ async fn nine_mib_canonical_event_replays_through_backfill_and_snapshot_pages() 
         .expect("complete oversized backfill pin");
     assert!(matches!(
         store
-            .load_event_backfill_page(backfill_pin.clone(), Some(0))
+            .load_event_backfill_page(backfill_pin.clone(), Some(1))
             .await,
         Err(RuntimeStoreError::InvalidBackfillPin)
     ));
@@ -262,15 +297,15 @@ async fn nine_mib_canonical_event_replays_through_backfill_and_snapshot_pages() 
         .expect("non-ready conversation returns a build pin")
         .clone();
     let (events, next_after, complete, lease) = store
-        .load_snapshot_event_page(snapshot_pin.clone(), Some(0))
+        .load_snapshot_event_page(snapshot_pin.clone(), Some(1))
         .await
         .expect("snapshot reducer page reaches oversized fallback");
     assert_single_event(&events, &canonical);
-    assert_eq!(next_after, 1);
+    assert_eq!(next_after, 2);
     assert!(complete);
     assert!(matches!(
         store
-            .load_snapshot_event_page(snapshot_pin.clone(), Some(0))
+            .load_snapshot_event_page(snapshot_pin.clone(), Some(1))
             .await,
         Err(RuntimeStoreError::WorkerBusy {
             lane: RuntimeStoreLane::Read
@@ -279,7 +314,7 @@ async fn nine_mib_canonical_event_replays_through_backfill_and_snapshot_pages() 
     drop(lease);
 
     let (events, _, _, lease) = store
-        .load_snapshot_event_page(snapshot_pin.clone(), Some(0))
+        .load_snapshot_event_page(snapshot_pin.clone(), Some(1))
         .await
         .expect("snapshot page lease is returned after reducer consumption");
     drop(events);

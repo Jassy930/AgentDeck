@@ -3595,10 +3595,13 @@ mod tests {
     use std::time::Duration;
 
     use agentdeck_protocol::runtime::identity::{ApprovalId, ConversationId, EventId, TurnId};
-    use agentdeck_protocol::runtime::{RuntimeEvent, RuntimeEventBody, StreamCursor};
+    use agentdeck_protocol::runtime::{
+        CodexConversationConfiguration, ConversationConfiguration, RuntimeEvent, RuntimeEventBody,
+        StreamCursor, VendorConfigurationSnapshot,
+    };
     use agentdeck_protocol::{
         ActionDecision, ActionDecisionKind, ActionKind, ActionRequest, ActionRequestVendor,
-        AgentKind, CodexApprovalPolicy, CodexSandboxMode, TurnSummary,
+        AgentKind, CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode, TurnSummary,
     };
 
     use crate::runtime::approval::{
@@ -3622,7 +3625,10 @@ mod tests {
     use crate::runtime::store::cipher::{KeyWrapAad, RuntimeKeyBundle};
     use crate::runtime::store::schema::{RUNTIME_CRYPTO_CONTEXT_VERSION, RUNTIME_SCHEMA_FAMILY};
     use crate::runtime::store::sequence::{SequenceScope, decode_sequence};
-    use crate::runtime::store::{RuntimeId, RuntimeIdKind, RuntimeStoreHandle};
+    use crate::runtime::store::{
+        ConfigureConversation, ConfigureConversationOutcome, RuntimeId, RuntimeIdKind,
+        RuntimeStoreHandle,
+    };
     use crate::security::{MemoryKeyStore, StorageKek, load_or_create_storage_kek};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
@@ -3916,7 +3922,9 @@ mod tests {
         let (event_id, event_seq, created_at_ms): (Vec<u8>, String, i64) = connection
             .query_row(
                 "SELECT event_id, event_seq, created_at_ms
-                 FROM event_journal WHERE conversation_id = ?1 ORDER BY event_seq LIMIT 1",
+                 FROM event_journal
+                 WHERE conversation_id = ?1 AND command_id IS NOT NULL
+                 ORDER BY event_seq LIMIT 1",
                 [&conversation_id.as_bytes()[..]],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -4093,12 +4101,34 @@ mod tests {
             uid: 501,
             client_installation_id: [4; 16],
         };
+        assert!(matches!(
+            store
+                .configure_conversation(ConfigureConversation {
+                    conversation_id,
+                    owner: owner.clone(),
+                    idempotency_key: "approval-configuration".to_owned(),
+                    expected_configuration_revision: 0,
+                    configuration: ConversationConfiguration::new(
+                        VendorConfigurationSnapshot::Codex(
+                            CodexConversationConfiguration::new(
+                                CodexApprovalPolicy::OnRequest,
+                                CodexSandboxMode::WorkspaceWrite,
+                                CodexReasoningEffort::Medium,
+                            ),
+                        ),
+                    ),
+                })
+                .await
+                .expect("configure approval conversation"),
+            ConfigureConversationOutcome::Applied { configuration }
+                if configuration.configuration_revision == 1
+        ));
         let command = match store
             .accept_command(AcceptCommand {
                 conversation_id,
                 owner,
                 idempotency_key: "approval-command".to_owned(),
-                expected_configuration_revision: 0,
+                expected_configuration_revision: 1,
                 payload: b"approval-prompt-sentinel".to_vec(),
             })
             .await
@@ -5380,7 +5410,7 @@ mod tests {
                         client_installation_id: [0xa2; 16],
                     },
                     idempotency_key: "latch-terminal-safety-only".to_owned(),
-                    expected_configuration_revision: 0,
+                    expected_configuration_revision: 1,
                     payload: b"must-not-commit".to_vec(),
                 })
                 .await,
@@ -5397,7 +5427,7 @@ mod tests {
                         client_installation_id: [0xa2; 16],
                     },
                     idempotency_key: "confirm-terminal-safety-only".to_owned(),
-                    expected_configuration_revision: 0,
+                    expected_configuration_revision: 1,
                     payload: b"still-must-not-commit".to_vec(),
                 })
                 .await,
@@ -6087,8 +6117,8 @@ mod tests {
             })
             .await
             .expect("register claimed conversation watch");
-        assert_eq!(registration.high_water, StreamCursor::At(2));
-        assert_eq!(registration.watch.latest(), StreamCursor::At(2));
+        assert_eq!(registration.high_water, StreamCursor::At(3));
+        assert_eq!(registration.watch.latest(), StreamCursor::At(3));
         assert_eq!(
             registration.watch.take_coalesced(),
             None,
@@ -6142,10 +6172,10 @@ mod tests {
         ));
         assert_eq!(
             registration.watch.take_coalesced(),
-            Some(StreamCursor::At(3)),
+            Some(StreamCursor::At(4)),
             "after-COMMIT unknown must notify the authenticated conversation high-water"
         );
-        assert_eq!(registration.watch.latest(), StreamCursor::At(3));
+        assert_eq!(registration.watch.latest(), StreamCursor::At(4));
         assert!(
             tokio::time::timeout(Duration::from_millis(100), unrelated.watch.next_committed())
                 .await
@@ -6173,8 +6203,8 @@ mod tests {
             })
             .await
             .expect("register claimed conversation watch");
-        assert_eq!(registration.high_water, StreamCursor::At(2));
-        assert_eq!(registration.watch.latest(), StreamCursor::At(2));
+        assert_eq!(registration.high_water, StreamCursor::At(3));
+        assert_eq!(registration.watch.latest(), StreamCursor::At(3));
         assert_eq!(
             registration.watch.take_coalesced(),
             None,
@@ -6197,7 +6227,7 @@ mod tests {
             None,
             "rolled-back attempt must not advance the watched conversation"
         );
-        assert_eq!(registration.watch.latest(), StreamCursor::At(2));
+        assert_eq!(registration.watch.latest(), StreamCursor::At(3));
         store.shutdown().await.expect("shutdown begin watch store");
     }
 
@@ -7561,7 +7591,7 @@ mod tests {
                 conversation_id,
                 owner: owner.clone(),
                 idempotency_key: "latch-safety-only".to_owned(),
-                expected_configuration_revision: 0,
+                expected_configuration_revision: 1,
                 payload: b"must-not-commit".to_vec(),
             })
             .await
@@ -7573,7 +7603,7 @@ mod tests {
                     conversation_id,
                     owner,
                     idempotency_key: "confirm-safety-only".to_owned(),
-                    expected_configuration_revision: 0,
+                    expected_configuration_revision: 1,
                     payload: b"still-must-not-commit".to_vec(),
                 })
                 .await,

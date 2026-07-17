@@ -427,7 +427,7 @@ async fn accept_one(store: &RuntimeStoreHandle, conversation_id: RuntimeId) -> R
             conversation_id,
             owner: owner(0x90),
             idempotency_key: "snapshot-command".to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"snapshot prompt".to_vec(),
         })
         .await
@@ -731,6 +731,7 @@ async fn build_source_keeps_captured_base_when_current_high_water_advances() {
         .create_conversation(input)
         .await
         .expect("create advancing conversation");
+    configure_codex(&store, conversation_id, 0, CodexReasoningEffort::Medium).await;
     let command_id = accept_one(&store, conversation_id).await;
     let source = capture_source(&store, conversation_id, 28).await;
     store
@@ -752,7 +753,7 @@ async fn build_source_keeps_captured_base_when_current_high_water_advances() {
     else {
         panic!("captured build source cannot be replaced")
     };
-    assert_eq!(build.base_event_cursor(), StreamCursor::BeforeFirst);
+    assert_eq!(build.base_event_cursor(), StreamCursor::At(0));
     materializer
         .release_build_input(build)
         .await

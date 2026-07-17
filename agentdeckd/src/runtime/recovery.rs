@@ -647,7 +647,12 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use agentdeck_protocol::AgentKind;
+    use agentdeck_protocol::runtime::{
+        CodexConversationConfiguration, ConversationConfiguration, VendorConfigurationSnapshot,
+    };
+    use agentdeck_protocol::{
+        AgentKind, CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode,
+    };
     use async_trait::async_trait;
 
     use super::*;
@@ -656,7 +661,10 @@ mod tests {
         CommandState, ConversationDescriptor, ExecutionFence, NewConversation, QueryCommandReceipt,
         StartCommand, StartOutcome,
     };
-    use crate::runtime::store::{RuntimeIdKind, RuntimeStoreConfig};
+    use crate::runtime::store::{
+        ConfigurationRecord, ConfigureConversation, ConfigureConversationOutcome, RuntimeIdKind,
+        RuntimeStoreConfig,
+    };
     use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
@@ -787,6 +795,39 @@ mod tests {
         }
     }
 
+    async fn configure(
+        store: &RuntimeStoreHandle,
+        conversation_id: RuntimeId,
+        owner: IdempotencyOwner,
+        key: &str,
+    ) {
+        assert!(matches!(
+            store
+                .configure_conversation(ConfigureConversation {
+                    conversation_id,
+                    owner,
+                    idempotency_key: key.to_owned(),
+                    expected_configuration_revision: 0,
+                    configuration: ConversationConfiguration::new(
+                        VendorConfigurationSnapshot::Codex(CodexConversationConfiguration::new(
+                            CodexApprovalPolicy::OnRequest,
+                            CodexSandboxMode::WorkspaceWrite,
+                            CodexReasoningEffort::Medium,
+                        ),),
+                    ),
+                })
+                .await
+                .expect("configure mixed recovery conversation"),
+            ConfigureConversationOutcome::Applied {
+                configuration: ConfigurationRecord {
+                    configuration_revision: 1,
+                    event_seq: 0,
+                    ..
+                }
+            }
+        ));
+    }
+
     async fn accept(
         store: &RuntimeStoreHandle,
         conversation_id: RuntimeId,
@@ -798,7 +839,7 @@ mod tests {
                 conversation_id,
                 owner,
                 idempotency_key: key.to_owned(),
-                expected_configuration_revision: 0,
+                expected_configuration_revision: 1,
                 payload: format!("mixed recovery prompt {key}").into_bytes(),
             })
             .await
@@ -846,6 +887,13 @@ mod tests {
             })
             .await
             .expect("create remote accepted conversation");
+        configure(
+            &store,
+            remote_conversation_id,
+            remote_owner.clone(),
+            "remote-accepted-configuration",
+        )
+        .await;
         let remote_command = accept(
             &store,
             remote_conversation_id,
@@ -864,6 +912,13 @@ mod tests {
             })
             .await
             .expect("create blocked conversation");
+        configure(
+            &store,
+            blocked_conversation_id,
+            blocked_owner.clone(),
+            "identity-mismatch-configuration",
+        )
+        .await;
         let started = accept(
             &store,
             blocked_conversation_id,

@@ -61,6 +61,10 @@ async fn event_seq_and_catalog_revision_are_independent_and_start_at_zero() {
     assert_eq!(second_stream.high_water, StreamCursor::BeforeFirst);
 
     let first_command = accept_one(&store, first_id).await;
+    assert_eq!(
+        first_stream.watch.take_coalesced(),
+        Some(StreamCursor::At(0))
+    );
     store
         .mark_started_with_event(StartCommand {
             conversation_id: first_id,
@@ -69,15 +73,19 @@ async fn event_seq_and_catalog_revision_are_independent_and_start_at_zero() {
             execution_nonce: b"first-independent-nonce".to_vec(),
         })
         .await
-        .expect("commit first event zero");
+        .expect("commit first started event one");
     assert_eq!(
         first_stream.watch.take_coalesced(),
-        Some(StreamCursor::At(0))
+        Some(StreamCursor::At(1))
     );
     assert_eq!(second_stream.watch.take_coalesced(), None);
     assert_eq!(catalog.watch.take_coalesced(), None);
 
     let second_command = accept_one(&store, second_id).await;
+    assert_eq!(
+        second_stream.watch.take_coalesced(),
+        Some(StreamCursor::At(0))
+    );
     store
         .mark_started_with_event(StartCommand {
             conversation_id: second_id,
@@ -86,10 +94,10 @@ async fn event_seq_and_catalog_revision_are_independent_and_start_at_zero() {
             execution_nonce: b"second-independent-nonce".to_vec(),
         })
         .await
-        .expect("commit second event zero");
+        .expect("commit second started event one");
     assert_eq!(
         second_stream.watch.take_coalesced(),
-        Some(StreamCursor::At(0))
+        Some(StreamCursor::At(1))
     );
     assert_eq!(first_stream.watch.take_coalesced(), None);
     assert_eq!(catalog.watch.take_coalesced(), None);
@@ -476,7 +484,7 @@ async fn event_committed_while_snapshot_is_sending_is_caught_up_exactly_once() {
             .next_committed()
             .await
             .expect("catch-up HWM"),
-        StreamCursor::At(0)
+        StreamCursor::At(1)
     );
     assert_eq!(registration.watch.take_coalesced(), None);
     let token = registration.watch.token();
@@ -639,6 +647,11 @@ async fn after_commit_unknown_notifies_durable_event_high_water() {
         .await
         .expect("register conversation");
     let command_id = accept_one(&store, conversation_id).await;
+    assert_eq!(
+        registration.watch.take_coalesced(),
+        Some(StreamCursor::At(0)),
+        "configuration commit must be observed before exercising after-COMMIT readback"
+    );
     let error = store
         .mark_started_with_event(StartCommand {
             conversation_id,
@@ -660,7 +673,7 @@ async fn after_commit_unknown_notifies_durable_event_high_water() {
             .next_committed()
             .await
             .expect("durable readback HWM"),
-        StreamCursor::At(0)
+        StreamCursor::At(1)
     );
     store.shutdown().await.expect("shutdown store");
 }
@@ -694,6 +707,11 @@ async fn before_commit_rollback_does_not_notify_event_high_water() {
         .await
         .expect("register conversation");
     let command_id = accept_one(&store, conversation_id).await;
+    assert_eq!(
+        registration.watch.take_coalesced(),
+        Some(StreamCursor::At(0)),
+        "configuration commit must be observed before exercising Start rollback"
+    );
     assert!(
         store
             .mark_started_with_event(StartCommand {
@@ -808,12 +826,13 @@ async fn expiry_and_main_commit_same_target_union_reads_back_once() {
         .create_conversation(input)
         .await
         .expect("create union conversation");
+    runtime_configuration::configure_codex_revision_one(&store, conversation_id).await;
     store
         .accept_command(AcceptCommand {
             conversation_id,
             owner: owner(0x93),
             idempotency_key: "old-expiring-command".to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"old expiring command".to_vec(),
         })
         .await
@@ -824,7 +843,7 @@ async fn expiry_and_main_commit_same_target_union_reads_back_once() {
             conversation_id,
             owner: owner(0x93),
             idempotency_key: "fresh-start-command".to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"fresh start command".to_vec(),
         })
         .await
@@ -856,7 +875,7 @@ async fn expiry_and_main_commit_same_target_union_reads_back_once() {
         .expect("expiry and main start both commit");
     assert_eq!(
         registration.watch.take_coalesced(),
-        Some(StreamCursor::At(1)),
+        Some(StreamCursor::At(2)),
         "one flush must expose the final durable HWM across both transactions"
     );
     assert_eq!(
@@ -1007,7 +1026,7 @@ async fn expiry_commit_survives_main_rollback_without_touching_unrelated_watcher
     ));
     assert_eq!(
         expired_stream.watch.take_coalesced(),
-        Some(StreamCursor::At(0)),
+        Some(StreamCursor::At(1)),
         "expiry COMMIT must notify even though the main transaction rolled back"
     );
     assert!(
@@ -1083,6 +1102,7 @@ async fn failed_target_readback_preserves_mutation_and_notifies_healthy_target()
         .create_conversation(trigger)
         .await
         .expect("create expiry trigger conversation");
+    runtime_configuration::configure_codex_revision_one(&store, trigger_id).await;
     clock.set(accepted_at_ms + COMMAND_QUEUE_TTL_MS);
 
     assert!(matches!(
@@ -1091,7 +1111,7 @@ async fn failed_target_readback_preserves_mutation_and_notifies_healthy_target()
                 conversation_id: trigger_id,
                 owner: owner(0x92),
                 idempotency_key: "trigger-readback-isolation".to_owned(),
-                expected_configuration_revision: 0,
+                expected_configuration_revision: 1,
                 payload: b"trigger readback isolation".to_vec(),
             })
             .await
@@ -1100,7 +1120,7 @@ async fn failed_target_readback_preserves_mutation_and_notifies_healthy_target()
     ));
     assert_eq!(
         healthy_stream.watch.take_coalesced(),
-        Some(StreamCursor::At(0)),
+        Some(StreamCursor::At(1)),
         "healthy affected target must still receive its durable HWM"
     );
     assert!(
@@ -1172,6 +1192,7 @@ async fn bulk_expiry_after_commit_unknown_notifies_every_affected_conversation()
         .create_conversation(trigger)
         .await
         .expect("create expiry trigger conversation");
+    runtime_configuration::configure_codex_revision_one(&store, trigger_id).await;
     clock.set(accepted_at_ms + COMMAND_QUEUE_TTL_MS);
 
     let error = store
@@ -1179,7 +1200,7 @@ async fn bulk_expiry_after_commit_unknown_notifies_every_affected_conversation()
             conversation_id: trigger_id,
             owner: owner(0x91),
             idempotency_key: "trigger-bulk-expiry".to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"trigger bulk expiry".to_vec(),
         })
         .await
@@ -1192,11 +1213,11 @@ async fn bulk_expiry_after_commit_unknown_notifies_every_affected_conversation()
     ));
     assert_eq!(
         first_stream.watch.take_coalesced(),
-        Some(StreamCursor::At(0))
+        Some(StreamCursor::At(1))
     );
     assert_eq!(
         second_stream.watch.take_coalesced(),
-        Some(StreamCursor::At(0))
+        Some(StreamCursor::At(1))
     );
     store.shutdown().await.expect("shutdown store");
 }
@@ -1239,11 +1260,11 @@ async fn safety_termination_notifies_conversation_high_water() {
             })
             .await
             .expect("terminate accepted command on safety lane"),
-        TerminateAcceptedOutcome::Transitioned { event, .. } if event.event_seq == 0
+        TerminateAcceptedOutcome::Transitioned { event, .. } if event.event_seq == 1
     ));
     assert_eq!(
         registration.watch.take_coalesced(),
-        Some(StreamCursor::At(0))
+        Some(StreamCursor::At(1))
     );
     store.shutdown().await.expect("shutdown store");
 }
@@ -1285,7 +1306,7 @@ async fn recovery_scan_expiry_notifies_conversation_high_water() {
         .expect("begin recovery scan after expiry boundary");
     assert_eq!(
         registration.watch.take_coalesced(),
-        Some(StreamCursor::At(0))
+        Some(StreamCursor::At(1))
     );
     let page = store
         .load_recovery_page(cursor)
@@ -1296,7 +1317,7 @@ async fn recovery_scan_expiry_notifies_conversation_high_water() {
         .as_ref()
         .expect("single recovery conversation");
     assert_eq!(recovered.conversation.conversation_id, conversation_id);
-    assert_eq!(recovered.conversation.event_high_water, Some(0));
+    assert_eq!(recovered.conversation.event_high_water, Some(1));
     assert!(recovered.accepted.is_empty());
     store
         .finish_recovery_scan(page.completion.expect("single page completion"))

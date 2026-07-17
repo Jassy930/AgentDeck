@@ -1,3 +1,5 @@
+#[path = "support/runtime_configuration.rs"]
+mod runtime_configuration;
 #[path = "support/runtime_descriptor.rs"]
 mod runtime_descriptor;
 #[path = "support/runtime_recovery.rs"]
@@ -96,12 +98,13 @@ async fn create_and_accept(
         .create_conversation(conversation_input(conversation_seed))
         .await
         .expect("create conversation");
+    runtime_configuration::configure_codex_revision_one(store, conversation.conversation_id).await;
     let command = match store
         .accept_command(AcceptCommand {
             conversation_id: conversation.conversation_id,
             owner,
             idempotency_key: key.to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: format!("payload-{key}").into_bytes(),
         })
         .await
@@ -352,13 +355,14 @@ async fn accepted_and_recovered_commands_return_the_redacted_owner() {
         .create_conversation(conversation_input(1))
         .await
         .expect("create conversation");
+    runtime_configuration::configure_codex_revision_one(&store, conversation.conversation_id).await;
     let owner = remote_owner(0x33);
     let command = match store
         .accept_command(AcceptCommand {
             conversation_id: conversation.conversation_id,
             owner: owner.clone(),
             idempotency_key: "owner-recovery".to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"owner recovery prompt".to_vec(),
         })
         .await
@@ -419,7 +423,7 @@ async fn accepted_cancel_commits_event_and_replays_without_double_decrement() {
     assert_eq!(terminated.started_at_ms, None);
     assert_eq!(terminated.turn_id, None);
     assert_eq!(terminated.terminal_event_id, Some(event.event_id));
-    assert_eq!(event.event_seq, 0);
+    assert_eq!(event.event_seq, 1);
     assert_eq!(
         String::from_utf8(event.payload.clone()).expect("accepted terminal event utf8"),
         format!(
@@ -451,7 +455,7 @@ async fn accepted_cancel_commits_event_and_replays_without_double_decrement() {
         .expect("load recovery after cancel replay");
     assert!(recovery.accepted.is_empty());
     assert_eq!(recovery.conversations[0].accepted_command_count, 0);
-    assert_eq!(recovery.conversations[0].event_high_water, Some(0));
+    assert_eq!(recovery.conversations[0].event_high_water, Some(1));
     store.shutdown().await.expect("shutdown store");
 }
 
@@ -641,6 +645,8 @@ async fn accepted_termination_consumes_reserved_capacity_while_safety_only() {
     let clock = ManualClock::new(10);
     let probe = ScriptedCapacityProbe::new(
         [
+            healthy_observation(),
+            healthy_observation(),
             healthy_observation(),
             healthy_observation(),
             healthy_observation(),

@@ -1,3 +1,5 @@
+#[path = "support/runtime_configuration.rs"]
+mod runtime_configuration;
 #[path = "support/runtime_descriptor.rs"]
 mod runtime_descriptor;
 #[path = "support/runtime_recovery.rs"]
@@ -136,12 +138,13 @@ async fn accept(
     now_ms: u64,
 ) -> AcceptOutcome {
     clock.set(now_ms);
+    runtime_configuration::configure_codex_revision_one(store, conversation_id).await;
     store
         .accept_command(AcceptCommand {
             conversation_id,
             owner,
             idempotency_key: key.to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: payload.to_vec(),
         })
         .await
@@ -229,7 +232,7 @@ async fn catalog_command_sequences_and_idempotency_survive_restart() {
             conversation_id: conversation.conversation_id,
             owner: local_owner(1),
             idempotency_key: "request-1".to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"different prompt".to_vec(),
         })
         .await
@@ -372,7 +375,7 @@ async fn per_conversation_queue_limit_is_exact_and_replay_precedes_admission() {
             conversation_id: conversation.conversation_id,
             owner: local_owner(1),
             idempotency_key: "overflow".to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"overflow".to_vec(),
         })
         .await
@@ -476,7 +479,7 @@ async fn start_fence_and_complete_are_atomic_idempotent_transitions() {
     };
     assert_eq!(started_command.state, CommandState::Started);
     assert_eq!(intent.turn_id.kind(), RuntimeIdKind::Turn);
-    assert_eq!(started_event.event_seq, 0);
+    assert_eq!(started_event.event_seq, 1);
     let intent_json: serde_json::Value =
         serde_json::from_slice(&intent.payload).expect("decode Store-owned intent");
     assert_eq!(intent_json["kind"], "runtimeExecutionIntent");
@@ -583,7 +586,7 @@ async fn start_fence_and_complete_are_atomic_idempotent_transitions() {
     let (completed_event_id, completed_event_payload) = match completed {
         CompleteOutcome::Completed { command, event } => {
             assert_eq!(command.state, CommandState::Completed);
-            assert_eq!(event.event_seq, 1);
+            assert_eq!(event.event_seq, 2);
             let wire: RuntimeEvent =
                 serde_json::from_slice(&event.payload).expect("decode Store-owned TurnCompleted");
             assert!(matches!(

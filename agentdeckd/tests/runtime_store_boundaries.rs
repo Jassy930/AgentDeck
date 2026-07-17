@@ -1,3 +1,5 @@
+#[path = "support/runtime_configuration.rs"]
+mod runtime_configuration;
 #[path = "support/runtime_descriptor.rs"]
 mod runtime_descriptor;
 #[path = "support/runtime_recovery.rs"]
@@ -150,7 +152,7 @@ fn accept_input(
         conversation_id,
         owner: local_owner(),
         idempotency_key: idempotency_key.into(),
-        expected_configuration_revision: 0,
+        expected_configuration_revision: 1,
         payload: payload.into(),
     }
 }
@@ -687,6 +689,10 @@ async fn global_queue_and_payload_accept_exact_1024_and_256_mib_then_replay_befo
                 .expect("create queue fixture conversation"),
         );
     }
+    for conversation in &conversations {
+        runtime_configuration::configure_codex_revision_one(&store, conversation.conversation_id)
+            .await;
+    }
 
     clock.set(10_000);
     let mut first_command_id = None;
@@ -799,6 +805,7 @@ async fn command_id_sixteen_collisions_exhaust_without_adding_a_row_or_advancing
         .create_conversation(conversation_input(1))
         .await
         .expect("create collision fixture conversation");
+    runtime_configuration::configure_codex_revision_one(&store, conversation.conversation_id).await;
     let first = store
         .accept_command(accept_input(
             conversation.conversation_id,
@@ -811,7 +818,7 @@ async fn command_id_sixteen_collisions_exhaust_without_adding_a_row_or_advancing
         first,
         AcceptOutcome::Accepted { command, .. } if command.command_id.as_bytes() == &collision_bytes
     ));
-    assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(first_calls.load(Ordering::SeqCst), 2);
     store.shutdown().await.expect("close collision fixture");
 
     clock.set(2_000);
@@ -966,6 +973,7 @@ async fn command_hwm_u64_max_returns_typed_exhaustion_and_inserts_no_additional_
         .create_conversation(conversation_input(1))
         .await
         .expect("create command HWM fixture conversation");
+    runtime_configuration::configure_codex_revision_one(&store, conversation.conversation_id).await;
     clock.set(1_500);
     let existing_command = match store
         .accept_command(accept_input(
@@ -1059,6 +1067,7 @@ async fn event_hwm_u64_max_returns_typed_exhaustion_and_keeps_command_accepted()
         .create_conversation(conversation_input(1))
         .await
         .expect("create event HWM fixture conversation");
+    runtime_configuration::configure_codex_revision_one(&store, conversation.conversation_id).await;
     clock.set(2_000);
     let _expiring_command = match store
         .accept_command(accept_input(
@@ -1104,7 +1113,7 @@ async fn event_hwm_u64_max_returns_typed_exhaustion_and_keeps_command_accepted()
             .expect("read production event HWM before boundary injection");
         assert_eq!(
             original_event_high_water.as_deref(),
-            Some("00000000000000000000")
+            Some("00000000000000000001")
         );
         assert_eq!(
             transaction
@@ -1151,7 +1160,7 @@ async fn event_hwm_u64_max_returns_typed_exhaustion_and_keeps_command_accepted()
             )
             .expect("read event zero-write evidence");
         assert_eq!(state, "accepted");
-        assert_eq!(event_count, 1);
+        assert_eq!(event_count, 2);
         assert_eq!(intent_count, 0);
         assert_eq!(event_high_water, MAX_SEQUENCE);
 
@@ -1184,7 +1193,7 @@ async fn event_hwm_u64_max_returns_typed_exhaustion_and_keeps_command_accepted()
     assert_eq!(recovery.accepted.len(), 1);
     assert!(recovery.started.is_empty());
     assert_eq!(recovery.accepted[0].command_id, command.command_id);
-    assert_eq!(recovery.conversations[0].event_high_water, Some(0));
+    assert_eq!(recovery.conversations[0].event_high_water, Some(1));
     reopened
         .shutdown()
         .await

@@ -2,6 +2,8 @@
 
 #[path = "support/exec_gate_wire.rs"]
 mod exec_gate_wire;
+#[path = "support/runtime_configuration.rs"]
+mod runtime_configuration;
 #[path = "support/runtime_descriptor.rs"]
 mod runtime_descriptor;
 #[path = "support/store_admission.rs"]
@@ -307,6 +309,7 @@ impl StartedFixture {
             })
             .await
             .expect("create gate fixture conversation");
+        runtime_configuration::configure_codex_revision_one(&store, conversation_id).await;
         let owner = IdempotencyOwner::Local {
             machine_trust_domain: [seed; 32],
             uid: 501,
@@ -317,7 +320,7 @@ impl StartedFixture {
                 conversation_id,
                 owner,
                 idempotency_key: format!("exec-gate-{seed}"),
-                expected_configuration_revision: 0,
+                expected_configuration_revision: 1,
                 payload: b"exec gate fixture prompt".to_vec(),
             })
             .await

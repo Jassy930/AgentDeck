@@ -36,6 +36,7 @@ use agentdeckd::security::{MemoryKeyStore, StorageKek, load_or_create_storage_ke
 #[path = "support/store_admission.rs"]
 mod store_admission;
 mod support;
+use support::runtime_configuration;
 use support::snapshot::{prepare_canonical_snapshot_write_with_items, store_canonical_snapshot};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
@@ -288,12 +289,13 @@ fn owner(seed: u8) -> IdempotencyOwner {
 }
 
 async fn accept_one(store: &RuntimeStoreHandle, conversation_id: RuntimeId) -> RuntimeId {
+    runtime_configuration::configure_codex_revision_one(store, conversation_id).await;
     match store
         .accept_command(AcceptCommand {
             conversation_id,
             owner: owner(0x90),
             idempotency_key: "stream-command".to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"stream prompt".to_vec(),
         })
         .await

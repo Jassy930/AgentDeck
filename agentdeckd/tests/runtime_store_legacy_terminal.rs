@@ -1,3 +1,5 @@
+#[path = "support/runtime_configuration.rs"]
+mod runtime_configuration;
 #[path = "support/runtime_descriptor.rs"]
 mod runtime_descriptor;
 #[path = "support/store_admission.rs"]
@@ -510,6 +512,7 @@ async fn base_store(label: &str) -> (TestRoot, MemoryKeyStore, RuntimeStoreHandl
         })
         .await
         .expect("create terminal fixture conversation");
+    runtime_configuration::configure_codex_revision_one(&store, conversation_id).await;
     (root, keys, store, conversation_id)
 }
 
@@ -524,7 +527,7 @@ async fn started_terminal_fixture(
             conversation_id,
             owner: owner(),
             idempotency_key: "legacy-terminal".to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"prompt".to_vec(),
         })
         .await
@@ -634,7 +637,7 @@ async fn accepted_fixture(label: &str, reason: AcceptedTerminationReason) -> Ter
             conversation_id,
             owner: owner(),
             idempotency_key: "legacy-accepted".to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"prompt".to_vec(),
         })
         .await

@@ -4,11 +4,13 @@ use super::*;
 async fn ready_snapshot_authenticated_base_is_captured_with_later_high_water() {
     let root = TestRoot::new("ready-snapshot-barrier-capture");
     let keys = MemoryKeyStore::new();
+    let configuration_event_id = runtime_id(RuntimeIdKind::Event, 0x45);
     let command_id = runtime_id(RuntimeIdKind::Command, 0x47);
     let turn_id = runtime_id(RuntimeIdKind::Turn, 0x48);
     let started_event_id = runtime_id(RuntimeIdKind::Event, 0x49);
     let store = RuntimeStoreHandle::open(
         RuntimeStoreConfig::new(root.database()).with_id_source(SequenceIdSource::new([
+            configuration_event_id,
             command_id,
             turn_id,
             started_event_id,
@@ -28,7 +30,7 @@ async fn ready_snapshot_authenticated_base_is_captured_with_later_high_water() {
     let snapshot_pin = store
         .acquire_snapshot_build_source(conversation_id)
         .await
-        .expect("capture BeforeFirst snapshot base");
+        .expect("capture configuration snapshot base");
     store_canonical_snapshot(&store, snapshot_pin, "capabilities-only-snapshot")
         .await
         .expect("store ready snapshot");
@@ -53,16 +55,13 @@ async fn ready_snapshot_authenticated_base_is_captured_with_later_high_water() {
         })
         .await
         .expect("capture authenticated ready snapshot base");
-    assert_eq!(registration.high_water, StreamCursor::At(0));
-    assert_eq!(
-        registration.ready_snapshot_base,
-        Some(StreamCursor::BeforeFirst)
-    );
+    assert_eq!(registration.high_water, StreamCursor::At(1));
+    assert_eq!(registration.ready_snapshot_base, Some(StreamCursor::At(0)));
     assert_eq!(
         registration.decision,
         BarrierDecision::Snapshot {
-            base: StreamCursor::BeforeFirst,
-            through: StreamCursor::At(0),
+            base: StreamCursor::At(0),
+            through: StreamCursor::At(1),
             committed_outer: StreamCursor::BeforeFirst,
         }
     );
@@ -106,7 +105,7 @@ async fn snapshot_build_pin_is_bound_to_barrier_captured_h() {
             panic!("empty conversation must capture an exact-H build source")
         }
     };
-    assert_eq!(pin.base_event_seq(), None);
+    assert_eq!(pin.base_event_seq(), Some(0));
 
     store
         .terminate_accepted_command(TerminateAcceptedCommand {
@@ -126,11 +125,11 @@ async fn snapshot_build_pin_is_bound_to_barrier_captured_h() {
             .build_pin()
             .expect("direct acquire returns build source")
             .base_event_seq(),
-        Some(0)
+        Some(1)
     );
     assert_eq!(
         pin.base_event_seq(),
-        None,
+        Some(0),
         "barrier source must not reacquire a later high-water"
     );
 

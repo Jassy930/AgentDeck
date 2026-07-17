@@ -1,3 +1,5 @@
+#[path = "support/runtime_configuration.rs"]
+mod runtime_configuration;
 #[path = "support/runtime_descriptor.rs"]
 mod runtime_descriptor;
 #[path = "support/runtime_recovery.rs"]
@@ -128,12 +130,13 @@ async fn accept_new(
     idempotency_key: &str,
     payload: &[u8],
 ) -> CommandRecord {
+    runtime_configuration::configure_codex_revision_one(store, conversation_id).await;
     match store
         .accept_command(AcceptCommand {
             conversation_id,
             owner,
             idempotency_key: idempotency_key.to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: payload.to_vec(),
         })
         .await
@@ -515,13 +518,14 @@ async fn every_side_effect_after_commit_unknown_has_an_exact_retry() {
         receipt
     );
     let conversation = create_conversation(&store, 2, b"retry conversation").await;
+    runtime_configuration::configure_codex_revision_one(&store, conversation.conversation_id).await;
 
     clock.set(10);
     let accept = || AcceptCommand {
         conversation_id: conversation.conversation_id,
         owner: local_owner(1),
         idempotency_key: "after-commit-accept".to_owned(),
-        expected_configuration_revision: 0,
+        expected_configuration_revision: 1,
         payload: b"accepted payload".to_vec(),
     };
     let error = store
@@ -671,7 +675,7 @@ async fn expiry_after_commit_unknown_converges_through_the_identical_outer_accep
         conversation_id: conversation.conversation_id,
         owner: local_owner(2),
         idempotency_key: "outer-exact-retry".to_owned(),
-        expected_configuration_revision: 0,
+        expected_configuration_revision: 1,
         payload: b"new prompt".to_vec(),
     };
     let error = store
@@ -693,10 +697,10 @@ async fn expiry_after_commit_unknown_converges_through_the_identical_outer_accep
         .expect("load canonical expiry result");
     assert_eq!(recovery.accepted.len(), 1);
     assert_eq!(recovery.accepted[0].command_id, accepted.command_id);
-    assert_eq!(recovery.conversations[0].event_high_water, Some(0));
+    assert_eq!(recovery.conversations[0].event_high_water, Some(1));
     assert_eq!(
         event_count(&database),
-        1,
+        2,
         "expiry event must be canonical once"
     );
     store.shutdown().await.expect("shutdown expiry retry store");
@@ -754,13 +758,14 @@ async fn every_before_commit_fault_rolls_back_and_first_retry_commits_once() {
         .await
         .expect("create retry commits once");
     assert_eq!(conversation.catalog_revision, 0);
+    runtime_configuration::configure_codex_revision_one(&store, conversation.conversation_id).await;
 
     clock.set(10);
     let accept = || AcceptCommand {
         conversation_id: conversation.conversation_id,
         owner: local_owner(0x21),
         idempotency_key: "rollback-accept".to_owned(),
-        expected_configuration_revision: 0,
+        expected_configuration_revision: 1,
         payload: b"rollback prompt".to_vec(),
     };
     assert!(matches!(
@@ -800,7 +805,7 @@ async fn every_before_commit_fault_rolls_back_and_first_retry_commits_once() {
         .expect("start retry commits once")
     {
         StartOutcome::Started { intent, event, .. } => {
-            assert_eq!(event.event_seq, 0);
+            assert_eq!(event.event_seq, 1);
             intent
         }
         StartOutcome::Replayed { .. } => panic!("rolled-back start cannot replay"),
@@ -862,7 +867,7 @@ async fn every_before_commit_fault_rolls_back_and_first_retry_commits_once() {
             .complete_command_with_event(complete())
             .await
             .expect("completion retry commits once"),
-        CompleteOutcome::Completed { event, .. } if event.event_seq == 1
+        CompleteOutcome::Completed { event, .. } if event.event_seq == 2
     ));
     store.shutdown().await.expect("shutdown store");
 }
@@ -1256,7 +1261,9 @@ async fn authenticated_command_conversation_event_and_runtime_ledger_metadata_ta
             .expect("disable FK only for authenticated metadata tamper fixture");
         connection
             .execute(
-                "UPDATE event_journal SET event_seq = '00000000000000000001'",
+                "UPDATE event_journal
+                 SET event_seq = '00000000000000000002'
+                 WHERE event_seq = '00000000000000000001'",
                 [],
             )
             .expect("tamper event sequence without its MAC");
@@ -1494,7 +1501,7 @@ async fn an_older_valid_conversation_metadata_mac_cannot_roll_back_event_high_wa
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("capture older valid conversation metadata");
-    assert_eq!(old_metadata.0.as_deref(), Some("00000000000000000000"));
+    assert_eq!(old_metadata.0.as_deref(), Some("00000000000000000001"));
     store
         .persist_execution_fence(fence_input(
             command.command_id,
@@ -1947,7 +1954,7 @@ async fn accept_sweeps_expired_rows_before_quota_and_writes_canonical_events() {
             conversation_id: conversation.conversation_id,
             owner: local_owner(1),
             idempotency_key: "after-expiry-sweep".to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"new prompt".to_vec(),
         })
         .await
@@ -1964,8 +1971,8 @@ async fn accept_sweeps_expired_rows_before_quota_and_writes_canonical_events() {
         .await
         .expect("load recovery");
     assert_eq!(recovery.accepted.len(), 1);
-    assert_eq!(recovery.conversations[0].event_high_water, Some(31));
-    assert_eq!(event_count(&database), 32);
+    assert_eq!(recovery.conversations[0].event_high_water, Some(32));
+    assert_eq!(event_count(&database), 33);
     store.shutdown().await.expect("shutdown store");
 }
 
@@ -1997,15 +2004,15 @@ async fn recovery_sweeps_expiry_with_event_and_expired_completion_is_typed() {
         .await
         .expect("recovery performs expiry sweep");
     assert!(recovery.accepted.is_empty());
-    assert_eq!(recovery.conversations[0].event_high_water, Some(0));
-    assert_eq!(event_count(&database), 1);
+    assert_eq!(recovery.conversations[0].event_high_water, Some(1));
+    assert_eq!(event_count(&database), 2);
 
     let replay = store
         .accept_command(AcceptCommand {
             conversation_id: conversation.conversation_id,
             owner: local_owner(1),
             idempotency_key: "recovery-expired".to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"expired prompt".to_vec(),
         })
         .await
@@ -2205,6 +2212,7 @@ async fn every_sensitive_journal_field_stays_out_of_db_wal_shm_and_debug() {
     .await
     .expect("open store");
     let conversation = create_conversation(&store, 0x30, DESCRIPTOR).await;
+    runtime_configuration::configure_codex_revision_one(&store, conversation.conversation_id).await;
 
     clock.set(10);
     let accepted = store
@@ -2216,7 +2224,7 @@ async fn every_sensitive_journal_field_stays_out_of_db_wal_shm_and_debug() {
                 client_installation_id: LOCAL_INSTALLATION,
             },
             idempotency_key: IDEMPOTENCY_KEY.to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: PROMPT.to_vec(),
         })
         .await
@@ -2286,7 +2294,7 @@ async fn every_sensitive_journal_field_stays_out_of_db_wal_shm_and_debug() {
                 device_sign_fingerprint: REMOTE_FINGERPRINT,
             },
             idempotency_key: REMOTE_KEY.to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: REMOTE_PROMPT.to_vec(),
         })
         .await

@@ -4,6 +4,7 @@ use super::*;
 async fn stable_event_item_entity_and_command_ids_survive_replay() {
     let root = TestRoot::new("stable-event-ids");
     let keys = MemoryKeyStore::new();
+    let configuration_event_id = runtime_id(RuntimeIdKind::Event, 0x30);
     let command_id = runtime_id(RuntimeIdKind::Command, 0x31);
     let turn_id = runtime_id(RuntimeIdKind::Turn, 0x32);
     let event_id = runtime_id(RuntimeIdKind::Event, 0x33);
@@ -12,6 +13,7 @@ async fn stable_event_item_entity_and_command_ids_survive_replay() {
     let entity_id = EntityId::new("stable-entity-id");
     let store = RuntimeStoreHandle::open(
         RuntimeStoreConfig::new(root.database()).with_id_source(SequenceIdSource::new([
+            configuration_event_id,
             command_id,
             turn_id,
             started_event_id,
@@ -68,15 +70,15 @@ async fn stable_event_item_entity_and_command_ids_survive_replay() {
     let agentdeckd::runtime::store::RuntimeBackfillPlan::Pinned(pin) = store
         .acquire_backfill_pin(
             agentdeckd::runtime::store::RuntimeBackfillTarget::Conversation(conversation_id),
-            Some(0),
+            Some(1),
         )
         .await
         .expect("pin canonical event")
     else {
-        panic!("event zero must be retained");
+        panic!("event two must be retained after event one");
     };
     let page = store
-        .load_event_backfill_page(pin.clone(), Some(0))
+        .load_event_backfill_page(pin.clone(), Some(1))
         .await
         .expect("replay canonical event");
     let completion = page.completion().clone();
@@ -89,7 +91,7 @@ async fn stable_event_item_entity_and_command_ids_survive_replay() {
     assert_eq!(replayed.item_id, canonical.item_id);
     assert_eq!(replayed.entity_id, canonical.entity_id);
     let replayed_page = store
-        .load_event_backfill_page(pin.clone(), Some(0))
+        .load_event_backfill_page(pin.clone(), Some(1))
         .await
         .expect("unacknowledged page keeps the event pin at its original cursor");
     let stale_completion = replayed_page.completion().clone();
@@ -102,7 +104,7 @@ async fn stable_event_item_entity_and_command_ids_survive_replay() {
         Err(RuntimeStoreError::InvalidBackfillPin)
     ));
     assert!(matches!(
-        store.load_event_backfill_page(pin, Some(0)).await,
+        store.load_event_backfill_page(pin, Some(1)).await,
         Err(RuntimeStoreError::InvalidBackfillPin)
     ));
     store.shutdown().await.expect("shutdown store");
@@ -179,12 +181,14 @@ fn catalog_and_conversation_use_the_same_barrier_algorithm() {
 async fn snapshot_and_backfill_emit_capabilities_before_any_agent_item() {
     let root = TestRoot::new("capabilities-before-item");
     let keys = MemoryKeyStore::new();
+    let configuration_event_id = runtime_id(RuntimeIdKind::Event, 0x40);
     let command_id = runtime_id(RuntimeIdKind::Command, 0x41);
     let turn_id = runtime_id(RuntimeIdKind::Turn, 0x42);
     let event_id = runtime_id(RuntimeIdKind::Event, 0x43);
     let started_event_id = runtime_id(RuntimeIdKind::Event, 0x45);
     let store = RuntimeStoreHandle::open(
         RuntimeStoreConfig::new(root.database()).with_id_source(SequenceIdSource::new([
+            configuration_event_id,
             command_id,
             turn_id,
             started_event_id,
@@ -255,15 +259,15 @@ async fn snapshot_and_backfill_emit_capabilities_before_any_agent_item() {
     let RuntimeBackfillPlan::Pinned(backfill_pin) = store
         .acquire_backfill_pin(
             RuntimeBackfillTarget::Conversation(conversation_id),
-            Some(0),
+            Some(1),
         )
         .await
         .expect("pin production backfill")
     else {
-        panic!("event zero must produce a pinned backfill range");
+        panic!("event two must produce a pinned backfill range after event one");
     };
     let page = store
-        .load_event_backfill_page(backfill_pin, Some(0))
+        .load_event_backfill_page(backfill_pin, Some(1))
         .await
         .expect("load production backfill page");
     assert_eq!(page.events.len(), 1);
@@ -277,7 +281,7 @@ async fn snapshot_and_backfill_emit_capabilities_before_any_agent_item() {
         RuntimeEventBody::Item { .. }
     ));
 
-    let range = BackfillRange::new(StreamCursor::At(0), StreamCursor::At(1))
+    let range = BackfillRange::new(StreamCursor::At(1), StreamCursor::At(2))
         .expect("single event backfill range");
     let backfill = BackfillChunk::conversation(
         ConversationId::new(conversation_id.to_canonical_string()),
@@ -362,12 +366,17 @@ async fn snapshot_and_backfill_emit_capabilities_before_any_agent_item() {
 async fn snapshot_capture_holds_no_actor_lock_or_sqlite_transaction_during_io() {
     let root = TestRoot::new("snapshot-capture-no-long-lock");
     let keys = MemoryKeyStore::new();
+    let configuration_event_id = runtime_id(RuntimeIdKind::Event, 0x50);
     let command_id = runtime_id(RuntimeIdKind::Command, 0x51);
     let turn_id = runtime_id(RuntimeIdKind::Turn, 0x52);
     let event_id = runtime_id(RuntimeIdKind::Event, 0x53);
     let store = RuntimeStoreHandle::open(
-        RuntimeStoreConfig::new(root.database())
-            .with_id_source(SequenceIdSource::new([command_id, turn_id, event_id])),
+        RuntimeStoreConfig::new(root.database()).with_id_source(SequenceIdSource::new([
+            configuration_event_id,
+            command_id,
+            turn_id,
+            event_id,
+        ])),
         root.storage_kek(&keys),
     )
     .await

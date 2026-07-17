@@ -1,3 +1,5 @@
+#[path = "support/runtime_configuration.rs"]
+mod runtime_configuration;
 #[path = "support/runtime_descriptor.rs"]
 mod runtime_descriptor;
 #[path = "support/store_admission.rs"]
@@ -146,12 +148,13 @@ async fn started_turn_unreleased_with_event(
         })
         .await
         .expect("create conversation");
+    runtime_configuration::configure_codex_revision_one(store, conversation_id).await;
     let command = match store
         .accept_command(AcceptCommand {
             conversation_id,
             owner: owner(),
             idempotency_key: format!("execution-event-{seed}"),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"real prompt sample".to_vec(),
         })
         .await
@@ -301,7 +304,7 @@ async fn execution_events_require_a_durable_release_boundary() {
             .await
             .expect("released execution can append"),
         AppendExecutionEventOutcome::Appended { event }
-            if event.event_id == event_id && event.event_seq == 1
+            if event.event_id == event_id && event.event_seq == 2
     ));
     store
         .shutdown()
@@ -462,7 +465,7 @@ async fn typed_item_append_exactly_replays_and_reopens() {
         AppendExecutionEventOutcome::Appended { event } => event,
         AppendExecutionEventOutcome::Replayed { .. } => panic!("fresh append cannot replay"),
     };
-    assert_eq!(event.event_seq, 1);
+    assert_eq!(event.event_seq, 2);
     let decoded: RuntimeEvent = serde_json::from_slice(&event.payload).expect("decode item event");
     assert!(matches!(
         decoded.body,
@@ -525,7 +528,7 @@ async fn typed_item_append_exactly_replays_and_reopens() {
             .await
             .expect("append same item/entity update"),
         AppendExecutionEventOutcome::Appended { event }
-            if event.event_id == update_event_id && event.event_seq == 2
+            if event.event_id == update_event_id && event.event_seq == 3
     ));
 
     store
@@ -649,7 +652,7 @@ async fn append_after_commit_unknown_converges_with_the_same_event_id() {
     );
     assert_eq!(failure.message, "agent execution failed");
     assert_eq!(failure.diagnostic_ref, None);
-    assert_eq!(event.event_seq, 1);
+    assert_eq!(event.event_seq, 2);
     let second_replay = match store
         .append_execution_event(input)
         .await
@@ -730,7 +733,7 @@ async fn event_sequence_crosses_nine_to_ten_and_replays_byte_exact_after_reopen(
         .await
         .expect("open sequence-boundary store");
     let (conversation_id, command_id, turn_id) = started_turn(&store, 0x81).await;
-    for offset in 0_u8..9 {
+    for offset in 0_u8..8 {
         let outcome = store
             .append_execution_event(item_input(
                 conversation_id,
@@ -744,7 +747,7 @@ async fn event_sequence_crosses_nine_to_ten_and_replays_byte_exact_after_reopen(
         assert!(matches!(
             outcome,
             AppendExecutionEventOutcome::Appended { event }
-                if event.event_seq == u64::from(offset) + 1
+                if event.event_seq == u64::from(offset) + 2
         ));
     }
 
@@ -822,7 +825,7 @@ async fn append_before_commit_fault_rolls_back_and_first_retry_appends_once() {
             .await
             .expect("first retry appends after rollback"),
         AppendExecutionEventOutcome::Appended { event }
-            if event.event_id == event_id && event.event_seq == 1
+            if event.event_id == event_id && event.event_seq == 2
     ));
     assert!(matches!(
         store
@@ -830,7 +833,7 @@ async fn append_before_commit_fault_rolls_back_and_first_retry_appends_once() {
             .await
             .expect("second retry replays"),
         AppendExecutionEventOutcome::Replayed { event }
-            if event.event_id == event_id && event.event_seq == 1
+            if event.event_id == event_id && event.event_seq == 2
     ));
     store.shutdown().await.expect("shutdown store");
 }
@@ -926,7 +929,7 @@ async fn public_append_distinguishes_exact_protocol_limit_from_one_byte_more() {
             conversation_id.to_canonical_string(),
         ),
         agentdeck_protocol::runtime::identity::EventId::new(exact_event_id.to_canonical_string()),
-        1,
+        2,
         Some(agentdeck_protocol::runtime::identity::CommandId::new(
             command_id.to_canonical_string(),
         )),
@@ -962,8 +965,8 @@ async fn public_append_distinguishes_exact_protocol_limit_from_one_byte_more() {
         ))
         .await;
     // The exact-limit payload passes the public canonical byte gate, then hits
-    // the independent 64 MiB replay-retention rule because TurnStarted already
-    // occupies the suffix and no replacement snapshot exists yet.
+    // the independent 64 MiB replay-retention rule because ConfigurationChanged
+    // and TurnStarted already occupy the suffix and no replacement snapshot exists yet.
     assert!(matches!(
         exact,
         Err(RuntimeStoreError::PublicationNeedsSnapshot)
@@ -1003,7 +1006,7 @@ async fn public_append_distinguishes_exact_protocol_limit_from_one_byte_more() {
             .await
             .expect("retention rejection leaves eventId unused"),
         AppendExecutionEventOutcome::Appended { event }
-            if event.event_id == exact_event_id && event.event_seq == 1
+            if event.event_id == exact_event_id && event.event_seq == 2
     ));
     store
         .shutdown()

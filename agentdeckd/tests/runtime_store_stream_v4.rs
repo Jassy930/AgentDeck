@@ -17,6 +17,7 @@ use agentdeckd::security::{MemoryKeyStore, StorageKek, load_or_create_storage_ke
 #[path = "support/store_admission.rs"]
 mod store_admission;
 mod support;
+use support::runtime_configuration;
 use support::snapshot::{prepare_canonical_snapshot_write, store_canonical_snapshot};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
@@ -1187,6 +1188,7 @@ async fn snapshot_build_pin_allows_frozen_base_while_writer_advances_high_water(
         .create_conversation(input)
         .await
         .expect("create conversation");
+    runtime_configuration::configure_codex_revision_one(&store, conversation_id).await;
     clock.set(1_100);
     let command = match store
         .accept_command(AcceptCommand {
@@ -1197,7 +1199,7 @@ async fn snapshot_build_pin_allows_frozen_base_while_writer_advances_high_water(
                 client_installation_id: [0xA2; 16],
             },
             idempotency_key: "snapshot-build".to_owned(),
-            expected_configuration_revision: 0,
+            expected_configuration_revision: 1,
             payload: b"snapshot command".to_vec(),
         })
         .await
@@ -1239,7 +1241,7 @@ async fn snapshot_build_pin_allows_frozen_base_while_writer_advances_high_water(
     let pin = store
         .acquire_snapshot_build_source(conversation_id)
         .await
-        .expect("freeze snapshot base at event zero");
+        .expect("freeze snapshot base at event one");
     let sibling_pin = store
         .acquire_snapshot_build_source(conversation_id)
         .await
@@ -1248,7 +1250,7 @@ async fn snapshot_build_pin_allows_frozen_base_while_writer_advances_high_water(
         pin.build_pin()
             .expect("direct acquire returns build source")
             .base_event_seq(),
-        Some(0)
+        Some(1)
     );
 
     clock.set(1_400);
@@ -1262,13 +1264,13 @@ async fn snapshot_build_pin_allows_frozen_base_while_writer_advances_high_water(
             reason: StartedBeforeReleaseTermination::Canceled,
         })
         .await
-        .expect("advance event high-water to one while snapshot builds");
+        .expect("advance event high-water to two while snapshot builds");
 
     clock.set(1_500);
-    let stored = store_canonical_snapshot(&store, pin, "snapshot frozen at event zero")
+    let stored = store_canonical_snapshot(&store, pin, "snapshot frozen at event one")
         .await
         .expect("commit pinned stale-base snapshot");
-    assert_eq!(stored.base_event_seq, Some(0));
+    assert_eq!(stored.base_event_seq, Some(1));
     drop(sibling_pin);
     assert_eq!(
         store
@@ -1658,6 +1660,7 @@ async fn before_first_snapshot_capability_survives_event_zero_writer_progress() 
         None
     );
     clock.set(2_100);
+    runtime_configuration::configure_codex_revision_one(&store, conversation_id).await;
     let command = match store
         .accept_command(AcceptCommand {
             conversation_id,
@@ -1667,8 +1670,8 @@ async fn before_first_snapshot_capability_survives_event_zero_writer_progress() 
                 client_installation_id: [0xB2; 16],
             },
             idempotency_key: "before-first".to_owned(),
-            expected_configuration_revision: 0,
-            payload: b"advance to event zero".to_vec(),
+            expected_configuration_revision: 1,
+            payload: b"advance past event zero".to_vec(),
         })
         .await
         .expect("accept command")
@@ -1686,7 +1689,7 @@ async fn before_first_snapshot_capability_survives_event_zero_writer_progress() 
             execution_nonce: b"before-first-nonce".to_vec(),
         })
         .await
-        .expect("advance event H to zero");
+        .expect("advance event H to one");
     clock.set(2_300);
     let snapshot = store_canonical_snapshot(&store, before_first, "capabilities-only-before-first")
         .await
