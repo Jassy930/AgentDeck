@@ -1977,22 +1977,30 @@ P3.9 固定以下迁移边界：
       真实旧 writer non-empty-WAL fail-close/DB+WAL+SHM 零触碰门禁全绿。daemon lib 672 passed + 1 ignored、
       完整 package（含真实 1,024 × 256 MiB，278.29 秒）、stream 45/45、transfer 17/17、StorageKEK 14 passed
       + 1 ignored、Clippy/fmt/no-net/docs/App selfcheck/diff 全绿；两路独立终审 Approved、无 P0/P1/P2。
-    - [ ] **B3a2 hardening（split 0/3）：** 用单 Store worker 的可控 before-COMMIT barrier 固定 Configure-first 与
+    - [ ] **B3a2 hardening（split 1/3）：** 用单 Store worker 的可控 before-COMMIT barrier 固定 Configure-first 与
       Prompt-first 两种线性化顺序；覆盖 stale/future、same-key conflict、restart/recovery、before/after-COMMIT
       unknown、pin metadata/revision swap/delete/orphan、ledger count、legacy cutoff 与 fresh seq0 missing-pin
       tamper。quota 以 exact-boundary 纯函数和真实 capacity zero-write 门禁证明
       `MAX_COMMAND_CONFIGURATION_PINS=1,048,576`，不为一次性边界制造百万行证明机器。所有 reject/replay 都
       读回 command/pin/ledger/event/catalog 零漂移；另以 hook 固定 rescue preflight→原库 RW open 之间的同
       UID WAL 竞态，证明损坏状态绝不被接受，并明确该竞态下 artifact 是否保持零写。
-      - **B3a2-A linearization/COMMIT/restart：** 扩展完整 durable evidence；固定 Configure-first、Prompt-first、
-        stale/future、same-key conflict、Accept before/after-COMMIT unknown，以及 Accepted/Started/terminal 跨
-        head advance 的 restart/recovery；所有 reject/replay 逐字段证明零漂移。
-      - **B3a2-B tamper/legacy/race：** 参数化 pin metadata token、revision swap、delete/orphan、
+      - [x] **B3a2-A linearization/COMMIT/restart（code commit `e4dde43`，实际 +1,303/-23）：** 在单个只读
+        transaction 中按稳定主键对九张相关表执行 conversation-scoped `SELECT *`，以保留 SQLite 原始类型的
+        canonical cell 快照覆盖全部持久列；每表固定 64 行、64 列、8 MiB 三重上限，Text/Blob 在复制前先按
+        `ValueRef` 长度 charge/reject。command/pin/accepted、configuration、event/index 与 catalog 的全局/会话
+        physical totals 已和 authenticated ledger 对位。before-COMMIT barrier、capacity=1 与第三个
+        `WorkerBusy(Normal)` 固定 Configure-first/Prompt-first 两种 FIFO；stale/future、same-key、Accept
+        before/after-COMMIT、Accepted/Started/terminal 跨 head advance 均以完整 evidence 证明 rollback、exact
+        replay、shutdown/reopen、receipt 与 recovery 零漂移，原 pinned revision 保持不变。focused 12/12、
+        两条线性化重复 20/20、daemon lib 672 passed + 1 ignored、完整 package（含真实 1,024 × 256 MiB，
+        287.80 秒）、stream 45/45、transfer 17/17、StorageKEK 14 passed + 1 ignored、Clippy/fmt/no-net/docs/
+        App selfcheck/diff 全绿；spec/quality 双路终审 Approved、无 P0/P1/P2。
+      - [ ] **B3a2-B tamper/legacy/race：** 参数化 pin metadata token、revision swap、delete/orphan、
         cross-command/conversation、physical/authenticated/ledger total 分叉；分别证明 fresh v5 seq0 missing pin、
         `seq > cutoff` missing pin、`seq <= cutoff` 被补非零 pin 均 fail-close，并同时覆盖 live reader 与
         reopen/recovery。用 hook 固定 rescue preflight→原库 RW open 的同 UID WAL 竞态，证明不接受损坏状态并
         锁定 artifact 零写边界。
-      - **B3a2-C quota/capacity：** 纯函数锁定 `MAX-1/MAX`，真实 DiskLow/StoreFull 对 Accept 与 exact replay
+      - [ ] **B3a2-C quota/capacity：** 纯函数锁定 `MAX-1/MAX`，真实 DiskLow/StoreFull 对 Accept 与 exact replay
         证明 command/pin/event/catalog 零漂移；不得制造 1,048,576 行一次性证明机。
     - [ ] **B3a3 Core/actor/docs：** 把 expected revision 经 RuntimeCore → conversation admission worker → Store
       完整传递，移除 production `feature_unavailable` 与 test-only unconfigured prompt 旁路；Accepted/Replayed/
