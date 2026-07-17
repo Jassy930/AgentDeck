@@ -1298,11 +1298,22 @@ mod migration_tests {
                 .await
                 .expect("load migrated recovery page");
             if let Some(record) = page.conversation {
-                accepted_seen |= record
-                    .accepted
-                    .iter()
-                    .any(|command| command.payload == b"legacy accepted payload");
+                for command in record.accepted {
+                    if command.payload == b"legacy accepted payload" {
+                        assert_eq!(
+                            command.configuration_revision, 0,
+                            "strict v1 Accepted 必须恢复为 frozen legacy revision 0"
+                        );
+                        accepted_seen = true;
+                    }
+                }
                 if let Some(started) = record.started {
+                    if started.command.payload == b"legacy started payload" {
+                        assert_eq!(
+                            started.command.configuration_revision, 0,
+                            "strict v1 Started 必须恢复为 frozen legacy revision 0"
+                        );
+                    }
                     started_seen = started.command.payload == b"legacy started payload"
                         && started.intent.payload == b"legacy intent payload"
                         && started.event.payload == b"legacy started event"
@@ -1340,6 +1351,22 @@ mod migration_tests {
         );
         assert_ready_catalog_baseline(&root.database());
         assert_migrated_conversation_states(&root.database());
+        let connection = Connection::open(root.database()).expect("inspect migrated v1 pin state");
+        let pin_counts: (i64, i64) = connection
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM command_configuration_pins),
+                     command_configuration_pin_count
+                 FROM runtime_meta WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read migrated v1 physical and ledger pin counts");
+        assert_eq!(
+            pin_counts,
+            (0, 0),
+            "strict v1 cutoff 内命令不得伪造 current revision pin"
+        );
     }
 
     #[tokio::test]
@@ -2282,7 +2309,7 @@ pub(crate) fn open(
     }
 
     let storage_path = normalize_storage_path(&config.storage_path)?;
-    let state = inspect_schema(&storage_path)?;
+    let state = inspect_schema(&storage_path, &storage_kek)?;
     match state {
         SchemaState::Fresh => open_fresh(config, storage_path, &storage_kek),
         SchemaState::LegacyV1(meta, identity) => open_legacy(
@@ -2790,7 +2817,7 @@ fn open_legacy(
     })
 }
 
-fn inspect_schema(path: &Path) -> Result<SchemaState, RuntimeStoreError> {
+fn inspect_schema(path: &Path, storage_kek: &StorageKek) -> Result<SchemaState, RuntimeStoreError> {
     match preflight_store_files(path)? {
         None => Ok(SchemaState::Fresh),
         Some(metadata) => {
@@ -2833,10 +2860,19 @@ fn inspect_schema(path: &Path) -> Result<SchemaState, RuntimeStoreError> {
                     read_and_validate_legacy_v4_schema(connection)?,
                     identity.clone(),
                 ),
-                RUNTIME_SCHEMA_VERSION if family == RUNTIME_SCHEMA_FAMILY => SchemaState::Current(
-                    read_and_validate_current_schema(connection)?,
-                    identity.clone(),
-                ),
+                RUNTIME_SCHEMA_VERSION if family == RUNTIME_SCHEMA_FAMILY => {
+                    let current = read_and_validate_current_schema(connection)?;
+                    // WAL recovery 的 schema inspection 已在私有 rescue 副本上看到完整
+                    // committed state。必须在碰原库 RW handle 前认证 configuration state/pin：
+                    // 否则 corrupt current v5 虽会 fail-close，RW connection drop 仍可能把
+                    // 原 WAL checkpoint 进 main，破坏“拒绝即零改写”的证据边界。
+                    validate_current_configuration_before_read_write_open(
+                        connection,
+                        storage_kek,
+                        &current,
+                    )?;
+                    SchemaState::Current(current, identity.clone())
+                }
                 _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
             };
             validate_store_files(path)?;
@@ -2844,6 +2880,26 @@ fn inspect_schema(path: &Path) -> Result<SchemaState, RuntimeStoreError> {
             Ok(state)
         }
     }
+}
+
+fn validate_current_configuration_before_read_write_open(
+    connection: &Connection,
+    storage_kek: &StorageKek,
+    current: &MetaRow,
+) -> Result<(), RuntimeStoreError> {
+    let key_context = KeyWrapAad {
+        schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
+        schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
+        database_id: &current.database_id,
+    };
+    let key_bundle =
+        RuntimeKeyBundle::unwrap(storage_kek, &key_context, &current.wrapped_key_bundle)?;
+    if key_bundle.generation() != current.key_generation {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    verify_runtime_ledger_token(&key_bundle, current)?;
+    super::command_configuration::validate_v5_integrity(connection, &key_bundle, &current.ledger)?;
+    Ok(())
 }
 
 fn read_schema_header(connection: &Connection) -> Result<(String, u32), RuntimeStoreError> {
