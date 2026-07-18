@@ -2101,6 +2101,224 @@ mod migration_tests {
         .expect_err("missing one-to-one conversation state must fail closed");
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn current_open_rejects_post_inspection_wal_tamper_without_rewriting_artifacts() {
+        let root = TestRoot::new("current-open-race");
+        let keys = MemoryKeyStore::new();
+        let database = root.database();
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(database.clone()),
+            load_or_create_storage_kek(&keys, &database).expect("create current-open race KEK"),
+        )
+        .await
+        .expect("open fresh current v5 store");
+        let created = store
+            .create_conversation(conversation(0x39, b"current open race descriptor"))
+            .await
+            .expect("create current-open race conversation");
+        configure_source_conversation(&store, created.conversation_id, 0x3a).await;
+        let accepted = match store
+            .accept_command(AcceptCommand {
+                conversation_id: created.conversation_id,
+                owner: owner(0x3b),
+                idempotency_key: "current-open-race-accepted".to_owned(),
+                expected_configuration_revision: 1,
+                payload: b"current open race payload".to_vec(),
+            })
+            .await
+            .expect("persist current-open race command and pin")
+        {
+            AcceptOutcome::Accepted { command, .. } => command,
+            AcceptOutcome::Replayed { .. } => panic!("fresh current-open command cannot replay"),
+        };
+        assert_eq!(accepted.configuration_revision, 1);
+        store
+            .shutdown()
+            .await
+            .expect("shutdown current-open race baseline");
+
+        // 先把 production state 完整 checkpoint 到 main，并移除空 sidecar。这样
+        // open_inner inspection 固定的 main identity 不会被攻击者的 SQLite handle
+        // 本身改变；hook 只移植 shadow writer 产出的有效 committed WAL。
+        let canonical_database =
+            normalize_storage_path(&database).expect("normalize current-open checkpoint path");
+        let checkpoint =
+            open_read_write(&canonical_database).expect("open current-open checkpoint handle");
+        let (busy, log_frames, checkpointed_frames): (i64, i64, i64) = checkpoint
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .expect("checkpoint current-open baseline");
+        assert_eq!(busy, 0, "current-open baseline checkpoint must not be busy");
+        assert_eq!(
+            log_frames, checkpointed_frames,
+            "current-open baseline checkpoint must copy every frame"
+        );
+        drop(checkpoint);
+        for sidecar_path in [
+            sidecar(&canonical_database, "-wal"),
+            sidecar(&canonical_database, "-shm"),
+        ] {
+            match fs::remove_file(&sidecar_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!(
+                    "remove checkpointed current-open sidecar {}: {error}",
+                    sidecar_path.display()
+                ),
+            }
+        }
+
+        let mut post_hook_path = None;
+        let mut post_hook_evidence = None;
+        let mut post_hook_identity = None;
+        let result = open_inner(
+            &RuntimeStoreConfig::new(database.clone()),
+            load_or_create_storage_kek(&keys, &database).expect("reload current-open race KEK"),
+            |path| {
+                let shadow_database = path.with_file_name("current-open-race-shadow.db");
+                fs::copy(path, &shadow_database).expect("clone current main for race writer");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(
+                        &shadow_database,
+                        fs::Permissions::from_mode(DATABASE_MODE),
+                    )
+                    .expect("secure current-open race shadow");
+                }
+                let mut writer =
+                    open_read_write(&shadow_database).expect("open independent race writer");
+                writer
+                    .pragma_update(None, "wal_autocheckpoint", 0_i64)
+                    .expect("disable race writer WAL autocheckpoint");
+                assert_eq!(
+                    writer
+                        .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get::<_, i64>(0))
+                        .expect("read back race writer WAL autocheckpoint"),
+                    0
+                );
+                configure_persistent_wal(&writer).expect("keep race writer WAL artifact");
+
+                let original_token: Vec<u8> = writer
+                    .query_row(
+                        "SELECT metadata_token FROM command_configuration_pins",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("read current command pin token");
+                assert_eq!(original_token.len(), 32);
+                let mut tampered_token = original_token.clone();
+                tampered_token[0] ^= 0xff;
+                let transaction = writer
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .expect("begin current-open WAL tamper");
+                assert_eq!(
+                    transaction
+                        .execute(
+                            "UPDATE command_configuration_pins
+                             SET metadata_token = ?1
+                             WHERE metadata_token = ?2",
+                            params![&tampered_token, &original_token],
+                        )
+                        .expect("tamper current command pin token"),
+                    1
+                );
+                transaction
+                    .commit()
+                    .expect("commit current-open WAL tamper");
+                assert_eq!(
+                    writer
+                        .query_row(
+                            "SELECT metadata_token FROM command_configuration_pins",
+                            [],
+                            |row| row.get::<_, Vec<u8>>(0),
+                        )
+                        .expect("read back current command pin tamper"),
+                    tampered_token
+                );
+                drop(writer);
+
+                let shadow_wal = sidecar(&shadow_database, "-wal");
+                let target_wal = sidecar(path, "-wal");
+                let copied = fs::copy(&shadow_wal, &target_wal)
+                    .expect("move committed shadow WAL into current-open race window");
+                assert!(copied > 0, "committed shadow WAL must be non-empty");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&target_wal, fs::Permissions::from_mode(DATABASE_MODE))
+                        .expect("secure current-open transplanted WAL");
+                }
+
+                let evidence = artifact_evidence(path);
+                assert!(
+                    evidence[1]
+                        .1
+                        .as_ref()
+                        .is_some_and(|bytes| !bytes.is_empty()),
+                    "committed race tamper must remain in a non-empty WAL"
+                );
+                post_hook_path = Some(path.to_path_buf());
+                post_hook_evidence = Some(evidence);
+                post_hook_identity = Some(
+                    capture_store_identity(path)
+                        .expect("capture current-open post-hook artifact identity"),
+                );
+                Ok(())
+            },
+        );
+        let error = match result {
+            Ok(_) => panic!("post-inspection current WAL tamper must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, RuntimeStoreError::SchemaInspectionRaced),
+            "post-inspection identity drift must win before RW open, got {error:?}"
+        );
+        let post_hook_evidence =
+            post_hook_evidence.expect("current hook fixed its post-attack artifact baseline");
+        let post_hook_identity =
+            post_hook_identity.expect("current hook fixed its post-attack identity baseline");
+        let post_hook_path = post_hook_path.expect("current hook exposed the canonical DB path");
+        // 该 byte-exact 契约只从攻击者 hook 已提交并关闭 writer 后开始；不把攻击写入
+        // 本身算作 store 写入。Unix identity 的 ctime/mtime/device/inode 边界仅在当前
+        // 支持的 macOS/Linux 门禁上锁定。
+        assert_eq!(
+            artifact_evidence(&post_hook_path),
+            post_hook_evidence,
+            "identity-raced open must not rewrite any post-hook runtime artifact"
+        );
+        assert_eq!(
+            capture_store_identity(&post_hook_path)
+                .expect("recapture rejected current-open artifact identity"),
+            post_hook_identity,
+            "identity-raced open must not touch post-hook runtime artifact metadata"
+        );
+
+        let error = match open(
+            &RuntimeStoreConfig::new(database.clone()),
+            load_or_create_storage_kek(&keys, &database)
+                .expect("reload corrupt current-open race KEK"),
+        ) {
+            Ok(_) => panic!("ordinary reopen must reject the tampered current pin"),
+            Err(error) => error,
+        };
+        assert_unknown_or_corrupt(error, "post-race ordinary reopen");
+        assert_eq!(
+            artifact_evidence(&post_hook_path),
+            post_hook_evidence,
+            "authenticated corruption rejection must preserve the post-hook baseline"
+        );
+        assert_eq!(
+            capture_store_identity(&post_hook_path)
+                .expect("recapture ordinary-reopen artifact identity"),
+            post_hook_identity,
+            "authenticated corruption rejection must preserve post-hook artifact metadata"
+        );
+    }
+
     #[tokio::test]
     async fn v4_capacity_rejection_is_zero_write_before_m5() {
         let root = TestRoot::new("v4-capacity");
@@ -2906,6 +3124,21 @@ pub(crate) fn open(
     config: &RuntimeStoreConfig,
     storage_kek: StorageKek,
 ) -> Result<RuntimeSqlite, RuntimeStoreError> {
+    open_inner(config, storage_kek, noop_current_open_hook)
+}
+
+fn noop_current_open_hook(_storage_path: &Path) -> Result<(), RuntimeStoreError> {
+    Ok(())
+}
+
+fn open_inner<F>(
+    config: &RuntimeStoreConfig,
+    storage_kek: StorageKek,
+    current_open_hook: F,
+) -> Result<RuntimeSqlite, RuntimeStoreError>
+where
+    F: FnOnce(&Path) -> Result<(), RuntimeStoreError>,
+{
     if config.command_capacity == 0 || config.command_capacity > MAX_RUNTIME_STORE_COMMAND_CAPACITY
     {
         return Err(RuntimeStoreError::InvalidConfig(
@@ -2959,9 +3192,14 @@ pub(crate) fn open(
             identity,
             LegacySchemaVersion::V4,
         ),
-        SchemaState::Current(meta, identity) => {
-            open_current(config, storage_path, &storage_kek, meta, identity)
-        }
+        SchemaState::Current(meta, identity) => open_current(
+            config,
+            storage_path,
+            &storage_kek,
+            meta,
+            identity,
+            current_open_hook,
+        ),
     }
 }
 
@@ -3082,13 +3320,17 @@ fn open_fresh(
     result
 }
 
-fn open_current(
+fn open_current<F>(
     config: &RuntimeStoreConfig,
     storage_path: PathBuf,
     storage_kek: &StorageKek,
     inspected: MetaRow,
     inspected_identity: StoreFileIdentity,
-) -> Result<RuntimeSqlite, RuntimeStoreError> {
+    current_open_hook: F,
+) -> Result<RuntimeSqlite, RuntimeStoreError>
+where
+    F: FnOnce(&Path) -> Result<(), RuntimeStoreError>,
+{
     ensure_store_identity(&storage_path, &inspected_identity)?;
     // 必须先用 immutable inspection 得到的 meta 完成 KEK authentication；错误
     // KEK 绝不能以 RW 模式碰原始 DB，也不能触发 crash WAL 的 SHM 重建。
@@ -3105,6 +3347,11 @@ fn open_current(
     verify_runtime_ledger_token(&key_bundle, &inspected)?;
 
     validate_database_file(&storage_path)?;
+    current_open_hook(&storage_path)?;
+    // Hook 代表 rescue validation 完成后同 UID writer 可用的最宽竞态窗口。
+    // 在原库 RW open 前最后一次比较完整 main/WAL/SHM identity；否则即使随后
+    // fail-close，sqlite3_open/drop 仍可能把攻击者 WAL checkpoint 进 main。
+    ensure_store_identity(&storage_path, &inspected_identity)?;
     let connection = open_read_write(&storage_path)?;
     let after_open = capture_store_identity(&storage_path)?;
     if after_open.database != inspected_identity.database {
