@@ -533,9 +533,10 @@ conversation/key，不能伪造身份连续性。
   最后同事务切换 schema/signature/ledger token。cutoff 逐字复制已认证 command HWM：NULL 保持
   BeforeFirst，真实 seq0 不得折叠成 NULL。fresh v5 conversation 则在 create transaction 内同时写入
   `conversation_state`。B2 已落地 authenticated configuration CAS writer、每次选择都认证完整
-  `1...head` 链的 frozen-cursor snapshot selector，以及 RuntimeCore Configure/DescribeAgents 路由；
-  `command_configuration_pins` / `metadata_mutation_ledger` 在 B3/B4 前仍必须为空。migration 与 B2 都不证明
-  command pin、metadata mutation 或整库历史回滚检测。
+  `1...head` 链的 frozen-cursor snapshot selector，以及 RuntimeCore Configure/DescribeAgents 路由；B3a
+  又接通 `command_configuration_pins` writer/reader 与 Core prompt admission。`metadata_mutation_ledger` 在
+  B4 前仍必须为空。migration/B2/B3a 都不证明 metadata mutation、exact execution configuration 加载或
+  整库历史回滚检测。
 - configuration 的幂等 namespace 固定为 conversation + canonical owner + raw key，sealed full request 同时
   绑定 expected revision 与 canonical configuration。Applied 只推进 configuration/event head 并产生唯一
   commandless `ConfigurationChanged`；exact replay、CAS conflict 与所有 reject 不写新 event，Catalog HWM
@@ -546,6 +547,16 @@ conversation/key，不能伪造身份连续性。
   recovery 拒绝、入队失败或 shutdown 丢弃未执行 command 时只释放 guard、不会 COMMIT；不允许用 detached
   task 延长授权。`DescribeAgents` 的 defaults 由各 adapter required method 提供，Router 以稳定顺序整批校验
   capability/default/vendor kind，任一畸形即 fail-close。
+- B3a 的 `SendPrompt` 以 caller 提供的 expected configuration revision 做准入；fresh v5 command 只能在
+  与 Accepted journal 同一个 `BEGIN IMMEDIATE` transaction 中写入同 conversation/commandSeq 的非零
+  authenticated pin。exact replay 先认证原 command/pin，再早于 current-head conflict 返回；配置 head 后续
+  推进不改变 command receipt/status/Started/terminal/recovery 的 pinned revision。未配置与 revision mismatch
+  分别稳定映射 `daemon.conversation.configuration_required` 与
+  `daemon.conversation.configuration_conflict`。Core 专用 Accept 把 authorization guard 移交 Store，guard
+  覆盖 durable outcome、通知、reply，并随成功结果返回 actor继续覆盖 queue registration；禁止 detached
+  task 延长授权。B3a 尚不把 exact configuration 注入 adapter prepare；该职责属于 B3b。
+  B3a 由 `48594e8` / `09a14b0` 提交，完整 Task gate 与独立 `spec/security`、`quality` 终审均已
+  通过；6 个 ignored 保持显式 gated/manual，其中 P3.1 signed Keychain 继续单列 BLOCKED。
 - 普通副作用准入同时检查 main/WAL/SHM、projected growth、文件系统
   `max(512 MiB, 5%)` reserve、`page_count/max_page_count`，并在每次 COMMIT 后重新观测。
   Accepted/Started 在普通准入时分别预留 expiry 与 fence/release/最大 terminal safety tail；

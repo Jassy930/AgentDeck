@@ -213,7 +213,7 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（C0-B 已推进至 B3a2-B，B3a2-C/B3a3 active）
+## Relay Companion MVP 实施状态（C0-B3a complete，B3b next）
 
 2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 只承诺缺 KEK 且无法通过当前
 KEK/database/domain 认证的离线篡改 fail-close，同 UID 在线攻击作为 residual risk 不再扩展。P3.1
@@ -426,12 +426,22 @@ authenticated readback 通知一次，后续 exact retry 不重复广播。calle
 `DescribeAgents` 对任意已认证 Runtime principal 返回按 `AgentKind` 稳定排序的 capabilities + adapter-owned
 default configuration；Codex 默认为 `OnRequest + WorkspaceWrite + Medium`，Claude Code 默认为
 `Default + null model/effort/outputStyle`，任一 adapter 错误或 kind/vendor 不匹配整批 fail-close。
-`command_configuration_pins` 与 `metadata_mutation_ledger` 在 B3/B4 writer 落地前仍必须为空，非空即
-fail-close。production `SendPrompt` 对所有 revision 仍返回 typed `feature_unavailable`；只有
-`#[cfg(test)]` legacy harness 可使用显式 revision 0，新增 metadata mutation 同样 fail-closed。prompt
-actor 以 journal `commandSeq` 为唯一 FIFO，同 conversation 只有一个 active，不同 conversation
+`command_configuration_pins` 已由 B3a writer 接通：fresh v5 `SendPrompt` 必须携带 nonzero expected
+revision，Accepted command 与 exact configuration pin 在同一 Store transaction 提交；exact replay 先认证
+原 command/pin，receipt/status/Started/terminal/recovery 始终返回原 pinned revision。未配置与 revision
+mismatch 分别返回 `daemon.conversation.configuration_required` 与
+`daemon.conversation.configuration_conflict`，不再误报 `daemon.runtime.feature_unavailable`。Core 将
+authorization guard 移交 Store command，覆盖 durable outcome、通知、reply 与成功后的 actor queue
+registration；caller 取消或 actor shutdown timeout 不能在 Store 完成前提前释放。`metadata_mutation_ledger`
+在 B4 writer 落地前仍必须为空，非空即 fail-close；metadata mutation 继续返回后续 phase 的 typed failure。
+prompt actor 以 journal `commandSeq` 为唯一 FIFO，同 conversation 只有一个 active，不同 conversation
 可由全局 semaphore 并行；control 使用有界优先批次，ReadPool 满时立即 overload，不排无界
 waiter。
+
+B3a2-C 已由 `48594e8` 提交，B3a3 已由 `09a14b0` 提交；完整 daemon/protocol/Swift/selfcheck/static
+门禁全绿，独立 `spec/security` 与 `quality` 终审 Approved，B3a complete。6 个 ignored 均保持显式
+gated/manual，其中 P3.1 provisioned signed Keychain 继续 BLOCKED、未计 PASS。queued/restart/recovery
+按 pin 加载 exact configuration，以及 Codex/Claude Code argv/control 映射仍属于 B3b。
 
 进入 Core 的 principal 是字段私有的认证 capability；同一完整身份共享强 authorization lease，
 Accepted→Started 前会重新取得 guard，revoke 与 start 由该 guard + SQLite transition 线性化。
@@ -500,7 +510,8 @@ authenticated audit，不承诺物理删除历史 audit row。独立 ReadPool �
 crypto context 仍保持 v1。v1/v2/v3/v4 migration 在 `BEGIN IMMEDIATE` 后、任何 DDL 前重新认证
 exact legacy meta/token/全部行，只为既有 conversation 物化 rev0、`entryRevision=0`、Managed origin 与
 nullable/BeforeFirst legacy cutoff，不重封旧 ciphertext、不重包 wrapped key。fresh conversation 与
-`conversation_state` 在同一事务写入；B2–B4 未落地的三类 sidecar writer 仍保持 fail-close。
+`conversation_state` 在同一事务写入；B2 configuration 与 B3a command pin writer 已落地，尚未接线的
+B4 `metadata_mutation_ledger` writer 继续保持 fail-close。
 
 P3.6-C 已由 `694f2d9` 提交 transport-neutral StoreCommitHub、Catalog/conversation 共用的
 SubscriptionBarrier、连续 backfill/snapshot-required、authenticated snapshot、paced JSON
@@ -593,7 +604,7 @@ P3.8-B production UDS/bootstrap 已由 `1e7f9ea` / `459f32a` 完成；P3.9-C0-A1
 cutover 与旧签名材料拒绝门禁已完成，A2a/A2b Swift v2 strict mirror 也已由 `bea4c13` / `3e019ed` /
 `0dd58de` 收口，A2c outer + JSON/UDS/compact/current codec 已由 `c2d2c28` / `e419d84` 收口；
 C0-B1a/B1b schema freeze 与真实 migration 已由 `e48248a` / `3d0002d` 收口；B2 configuration/Core 与
-B3a2-B pin hardening 已完成，current-open 最后一笔为 `974f9b1`。B3a2-C/B3a3、B3b–B5、C0-C、
+B3a admission pin 已完成，后者由 `48594e8` / `09a14b0` 提交并通过 Task 门禁与双路终审。B3b–B5、C0-C、
 App/CLI 默认 UDS cutover、P3.10 LaunchAgent 与 P4–P6 仍未完成。P3.1 provisioned signed Keychain
 roundtrip 继续是外部 BLOCKED 槽位；P5/P6 物理设备/公网/Linux 证据是 post-MVP，不冒充 PASS。
 具体命令与资源矩阵见 [docs/QUALITY.md](docs/QUALITY.md)。

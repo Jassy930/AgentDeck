@@ -10,7 +10,7 @@
 4. `docs/index.md`：文档记录系统导航。
 5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code（含 CC adapter failure codes）。
 6. `docs/QUALITY.md`：验证命令、质量门禁和文档结构检查（含 v0.2 手动 QA 清单）。
-7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以 `docs/plans/2026-07-10-relay-companion-mvp-design.md`、`docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 和上位增量 `docs/plans/2026-07-18-relay-companion-mvp-course-correction.md` 为事实源。Relay 主线恢复 Task 粒度门禁；P3.9-C0-B 已推进到 B3a2-B 完成（最后一笔 `974f9b1`），B3a2-C/B3a3 active。同 UID 在线攻击作为 residual risk 不再扩展；P3.1 provisioned signed Keychain 保留 ignored/BLOCKED 但不阻塞主线。P4 功能全保留；P5/P6 的物理设备、公网与干净 Linux 证据为 post-MVP BLOCKED 槽位，不得冒充 PASS。
+7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以 `docs/plans/2026-07-10-relay-companion-mvp-design.md`、`docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 和上位增量 `docs/plans/2026-07-18-relay-companion-mvp-course-correction.md` 为事实源。Relay 主线恢复 Task 粒度门禁；P3.9-C0-B3a 已由 `48594e8` / `09a14b0` 完成，Task 完整门禁与独立 `spec/security`、`quality` 终审均已通过，下一项为 B3b。同 UID 在线攻击作为 residual risk 不再扩展；P3.1 provisioned signed Keychain 保留 ignored/BLOCKED 但不阻塞主线。P4 功能全保留；P5/P6 的物理设备、公网与干净 Linux 证据为 post-MVP BLOCKED 槽位，不得冒充 PASS。
 8. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
 
 ## 项目边界
@@ -365,6 +365,36 @@ production parser 必须拒绝 `--socket` 和 socket path env override；stable 
 `RecoveryReadyPermit`、持有同一 Core 与 retained singleton dirfd；Darwin FD/path identity 分开验证，
 stale/inode replacement fail-closed，shutdown 停止 accept 后 graceful cancel/join 全部连接，再关闭 Core。
 该阶段不等于 P3.9 shared-daemon client cutover，也不替代 signed Keychain、真实 vendor 或远程实机门禁。
+
+### Relay Companion MVP P3.9-C0-B3a（configuration pin / prompt admission）
+
+```bash
+cargo test -p agentdeckd --test runtime_core -- --test-threads=1
+cargo test -p agentdeckd --test runtime_store_command_configuration -- --test-threads=1
+cargo test -p agentdeckd --test runtime_store_command_configuration_recovery -- --test-threads=1
+cargo test -p agentdeckd --test runtime_store_command_configuration_tamper -- --test-threads=1
+cargo test -p agentdeckd --test runtime_store_capacity -- --test-threads=1
+cargo test -p agentdeckd
+cargo test -p agentdeck-protocol -- --test-threads=1
+swift test
+swift run AgentDeck -- --selfcheck
+cargo fmt --all -- --check
+cargo clippy -p agentdeckd --all-targets -- -D warnings
+cargo clippy -p agentdeck-protocol --lib -- -D warnings
+bash scripts/check-daemon-network-boundary.sh
+bash scripts/check-daemon-no-net.sh
+scripts/verify-agent-docs.sh
+git diff --check
+```
+
+B3a code/test 已由 `48594e8`（quota/capacity）与 `09a14b0`（Core/actor admission）提交。Task 收口
+读回：daemon package `1138 passed / 6 ignored`，其中 lib `680 passed / 1 ignored`，包含 1,024 ×
+256 KiB 的 5-test boundary target `359.75s`；protocol `170/170`、Swift `333/333`、selfcheck、schema、
+Clippy/fmt/network/docs/diff 全绿，独立 `spec/security` 与 `quality` 终审 Approved。protocol test-target
+Clippy 受 2026-06-29 既有常量断言 warning 阻断，未计 PASS；本 Task 修改 production failure constants，
+实际以 protocol 全量测试和 `--lib` Clippy 收口。B3a 只保证 expected revision admission、同事务非零 pin
+与 pinned receipt/status/recovery；queued/restart/recovery 加载 exact configuration、Codex/CC argv/control
+映射与 recorded fixture 属于独立 Task B3b。
 
 ## 浏览与外部资料
 

@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P3.9-C0-B 已推进至 B3a2-B 完成、B3a2-C/B3a3 active；P3.1 签名 Keychain 仍有 1 项 ignored/BLOCKED 且不阻塞主线（2026-07-18） |
+| 状态 | Approved target；P3.9-C0-B3a 已由 `48594e8` / `09a14b0` 完成并通过 Task 完整门禁与双路终审，下一项为 B3b；P3.1 签名 Keychain 仍有 1 项 ignored/BLOCKED 且不阻塞主线（2026-07-18） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -620,6 +620,11 @@ history 时直接切到 UDS，会让用户选择静默回落默认值、历史�
 - SendPrompt 对 rev0/unconfigured 与 expected revision mismatch 分别稳定返回
   `daemon.conversation.configuration_required`、`daemon.conversation.configuration_conflict`；不得继续沿用
   C0-A 过渡期的 `feature_unavailable`。
+- B3a implementation 已由 `48594e8`（quota/capacity）与 `09a14b0`（Core/actor admission）提交。
+  fresh v5 Accepted command 与非零 exact pin 同事务写入，receipt/status/Started/terminal/recovery 保留原
+  pinned revision；Core/Store authorization guard 覆盖 durable outcome、通知、reply 与 actor queue
+  registration。B3a Task 完整门禁与独立 `spec/security`、`quality` 终审均已通过。queued/restart/recovery
+  加载 exact configuration、Codex/CC argv/control 映射与 recorded fixture 属于 B3b。
 - native-history import 不是 public Runtime request。daemon bootstrap/reconciliation 让 adapter 私域验证
   本机真实 entry，再按 namespace+opaque reference 稳定派生 conversation/adapter-state identity，并在单
   事务写 private binding、neutral descriptor 与 catalog delta。native transcript 不复制成第二份 Runtime

@@ -1971,7 +1971,7 @@ P3.9 固定以下迁移边界：
       1,024 × 256 MiB 边界 255.29 秒均 exit 0；Clippy/fmt/no-net/docs/App selfcheck/diff 全绿。两路独立
       spec/security/quality 终审 Approved、无 P0/P1/P2；未夹带 B3 SendPrompt/pin 或 B4 metadata mutation，
       P3.1 signed Keychain 外部门禁继续 BLOCKED。
-  - [ ] **B3a admission pin（implementation 2/4）：** SendPrompt expected
+  - [x] **B3a admission pin（complete；`48594e8` / `09a14b0`）：** SendPrompt expected
     revision、Accepted 同事务非零 pin、receipt/status/query 原 revision、并发 Configure/Prompt 线性化；新
     command 缺 pin fail-close。
     - **具体威胁场景：** 同 UID 已认证 caller 已把 fresh v5 conversation 配到 rev1，却可在当前 writer 中
@@ -2003,7 +2003,7 @@ P3.9 固定以下迁移边界：
       真实旧 writer non-empty-WAL fail-close/DB+WAL+SHM 零触碰门禁全绿。daemon lib 672 passed + 1 ignored、
       完整 package（含真实 1,024 × 256 MiB，278.29 秒）、stream 45/45、transfer 17/17、StorageKEK 14 passed
       + 1 ignored、Clippy/fmt/no-net/docs/App selfcheck/diff 全绿；两路独立终审 Approved、无 P0/P1/P2。
-    - [ ] **B3a2 hardening（internal 2/3 complete）：** 用单 Store worker 的可控 before-COMMIT barrier固定 Configure-first 与
+    - [x] **B3a2 hardening（internal 3/3 complete）：** 用单 Store worker 的可控 before-COMMIT barrier固定 Configure-first 与
       Prompt-first 两种线性化顺序；覆盖 stale/future、same-key conflict、restart/recovery、before/after-COMMIT
       unknown、pin metadata/revision swap/delete/orphan、ledger count、legacy cutoff 与 fresh seq0 missing-pin
       tamper。quota 以 exact-boundary 纯函数和真实 capacity zero-write 门禁证明
@@ -2057,18 +2057,32 @@ P3.9 固定以下迁移边界：
           integration suites 通过（含 298.38 秒容量门禁、stream 45/45、transfer 17/17）。最后一次
           stat→`sqlite3_open` 窗口不宣称 SHM 无条件零触碰；同 UID 在线攻击自此记为 residual risk，不再新增
           测试、hook 或取证。
-      - [ ] **B3a2-C quota/capacity：** 纯函数锁定 `MAX-1/MAX`，真实 DiskLow/StoreFull 对 Accept 与 exact replay
-        证明 command/pin/event/catalog 零漂移；不得制造 1,048,576 行一次性证明机。
-    - [ ] **B3a3 Core/actor/docs：** 把 expected revision 经 RuntimeCore → conversation admission worker → Store
-      完整传递，移除 production `feature_unavailable` 与 test-only unconfigured prompt 旁路；Accepted/Replayed/
-      QueryReceipt/Started/terminal status 都返回原 pinned revision，unconfigured 与 revision mismatch 分别映射
+      - [x] **B3a2-C quota/capacity（code/test commit `48594e8`；production `+8/-2`，其余
+        391 additions 为 tests）：** 纯函数以 mutation `>=`→`>` 固定 RED，再恢复并锁定
+        `MAX_COMMAND_CONFIGURATION_PINS-1` 可准入、`MAX` 返回 `CommandConfigurationPinLimit`，没有制造
+        1,048,576 行一次性证明机。DiskLow 覆盖 fresh Accept 九表 evidence 零漂移、同 handle 容量恢复后
+        Accepted 与低盘 exact replay；StoreFull 覆盖 SafetyOnly latch、同 handle 继续拒绝、shutdown/reopen
+        后恢复且只新增一组 command/pin。focused unit 1/1、command-configuration 14/14、capacity 9/9 与
+        scoped Clippy/fmt/diff 已作为子片提交前门禁；按 Task 粒度规则未在该子片重复完整慢门禁、双路终审
+        或 docs commit。
+    - [x] **B3a3 Core/actor/docs（code/test commit `09a14b0`；production additions `195`、tests
+      additions `551`）：** expected revision 已经 RuntimeCore → conversation admission worker → Store 完整
+      传递，production `feature_unavailable` 与 test-only unconfigured prompt 旁路已移除；Accepted/Replayed/
+      QueryReceipt/Started/terminal status 返回原 pinned revision，unconfigured 与 revision mismatch 分别映射
       `daemon.conversation.configuration_required` / `daemon.conversation.configuration_conflict`。Core 专用
-      authorized Accept 必须把 authorization guard 交给 Store `NormalCommand`，由 Store 持到 durable
-      outcome、通知与 reply 完成，再随成功 reply 返给 actor并继续覆盖 queue registration；禁止 detached
-      task。除 caller cancellation 外，必须用 actor shutdown timeout/prompt-worker abort + Store barrier 的
-      RED 证明 guard 不会在 COMMIT 前释放。同步 README、ARCHITECTURE、QUALITY、DIAGNOSTICS、本计划与
-      进度账本；不得在本片加载 exact configuration、改 adapter argv/control 或消费 recorded vendor fixture，
-      这些全部属于 B3b。
+      authorized Accept 把 authorization guard 交给 Store `NormalCommand`，由 Store 持到 durable outcome、
+      通知与 reply 完成，再随成功 reply 返回 actor继续覆盖 queue registration；production task 均由
+      abort-on-drop owner 持有，没有新增 detached task。caller cancellation 与 actor shutdown timeout/
+      prompt-worker abort + Store barrier 均锁定 guard 不会在 COMMIT 前释放。本片未加载 exact
+      configuration、未改 adapter argv/control、未消费 recorded vendor fixture；这些全部属于 B3b。
+    - [x] **B3a Task gate / 双路终审读回：** `cargo test -p agentdeckd` exit 0，聚合
+      `1138 passed / 6 ignored`，lib `680 passed / 1 ignored`，1,024 × 256 KiB 所在 5-test target
+      `5/5`（359.75 秒）；focused Core/configuration/recovery/tamper/capacity 分别为 `3/3`、`14/14`、
+      `1 passed + 1 ignored`、`2/2`、`9/9`。protocol `170/170`、Swift `333/333`、schema/selfcheck、
+      daemon all-target Clippy、protocol lib Clippy、fmt/network/docs/diff 全绿；独立 `spec/security` 与
+      `quality` 终审 Approved，无剩余 P0/P1/P2。protocol test-target Clippy 被 2026-06-29 既有常量断言
+      warning 阻断，未计 PASS、未夹带 baseline 修复；6 个 ignored 保持显式 gated/manual，其中 P3.1 signed
+      Keychain 继续 BLOCKED。
     - **真实 production preflight sample（只证明当前 RED 基线，不证明 B3a）：** preflight 前 worktree 在
       `HEAD=56aa25d` clean；第一份仓库外样本
       `/tmp/agentdeck-b3a-preflight-20260716-30103c1` 由 B2c production Store 调用
@@ -2094,20 +2108,71 @@ P3.9 固定以下迁移边界：
       样本目录与一次性 generator worktree 已精确删除并读回 absent；DB/WAL/SHM/KEK 均未进入仓库。
     - **Task 粒度刹车线（2026-07-18 纠偏）：** B3a0–B3a3 可以内部拆片，但只在 B3a 整体收口时做一次
       独立终审、完整 package/跨语言门禁与 docs commit。1,800/2,000 additions 只计 production 代码；测试和
-      文档不计。子片只跑 focused tests + scoped clippy + fmt。B3a2-C/B3a3 未闭环前 B3a 保持 active；
+      文档不计。子片只跑 focused tests + scoped clippy + fmt。B3a 已按该规则完成一次 Task gate、双路终审
+      与文档读回；
       P3.1 signed Keychain 外部门禁继续 ignored/BLOCKED，主线不等待也不再尝试绕过 AMFI。
-  - [ ] **B3b exact execution：** queued/restart/recovery 按 pin load exact configuration；只有
+  - [ ] **B3b exact execution（独立 Task）：** queued/restart/recovery 按 pin load exact configuration；只有
     `commandSeq <= legacyCommandHighWater` 的迁移前命令可在 startup recovery 消费 frozen P3.7 rev0 defaults。
     Codex/CC recorded argv/control/translator fixture 锁定实际字段映射，不冒充 live login。
-  - [ ] **B4 metadata：** durable mutation ledger、managed rename/archive、descriptor/lifecycle + entry/catalog
+
+    **Files:**
+    - Modify: `agentdeckd/src/runtime/store/{configuration,command_configuration,worker}.rs`
+    - Modify: `agentdeckd/src/runtime/{model,conversation,execution}.rs`
+    - Modify: `agentdeckd/src/agent.rs`
+    - Modify: `agentdeckd/src/codex/{adapter,driver}.rs`
+    - Modify: `agentdeckd/src/claude_code/{adapter,driver}.rs`
+    - Modify: `agentdeckd/src/runtime/runtime_execution_fixture_tests.rs`
+    - Modify: `agentdeckd/src/{codex,claude_code}/driver_tests.rs`
+    - Modify: `agentdeckd/tests/{runtime_store_command_configuration_recovery,production_execution_wiring,runtime_crash_recovery}.rs`
+    - Modify as required: `agentdeckd/tests/fixtures/{codex,claude_code}/` 与对应 fixture README/hash 记录
+
+    - [ ] **Step 1：写确定性 RED。** 创建 rev1 command 后推进 head 到 rev2，分别从 queued、同进程
+      recovery 与 shutdown/reopen recovery 进入 production prepare，断言 adapter 只能观察 rev1 exact
+      configuration；fresh v5 缺 pin/缺 exact row、pin/config agent kind mismatch 必须在 spawn 前 fail-close。
+      legacy rev0 只允许真实 migration cutoff 内 command 的 startup recovery，普通 queued 路径不得回退 defaults。
+    - [ ] **Step 2：实现 Store exact execution read。** 在同一认证 SQLite read transaction 内加载 command、
+      exact pin 与对应 `configuration_journal` 行，认证完整 `1...head` chain/AEAD/MAC/event body 并选择
+      pinned revision；返回
+      typed execution configuration，不查询 current head、不以 missing pin 解释为 rev0、不暴露通用 Store handle
+      给 adapter。
+    - [ ] **Step 3：绑定 daemon execution contract。** 把 exact configuration/revision 放入
+      `RuntimeExecutionContext` 与 crate-private `AgentTurnRequest`，在 Router/adapter prepare 前验证
+      conversation agent kind 与 `vendorControl` variant 一致。Codex 把 approval policy/sandbox 写入
+      thread start/resume、reasoning effort 写入 turn start；Claude Code 把 permission mode/model/effort/
+      output style 固定到 fresh/resume argv/control。不得顺带加入 mcp overrides、tools/path/plugin/hooks 或
+      client-visible vendor identity。
+    - [ ] **Step 4：锁定 recorded fixture 与 crash/replay。** 使用仓库内已筛选脱敏的 Codex/CC recorded
+      argv/control/translator fixture 证明非默认字段、head advance、exact replay、restart/recovery 与 action
+      request at-decision metadata 一致；fixture 只证明 builder/translator 字段映射，不冒充 live login、真实
+      vendor approval 或 P4 RemoteLink。
+    - [ ] **Step 5：运行 B3b focused gate。**
+      ```bash
+      cargo test -p agentdeckd --test runtime_store_command_configuration_recovery -- --test-threads=1
+      cargo test -p agentdeckd --lib runtime::runtime_execution_fixture_tests:: -- --test-threads=1
+      cargo test -p agentdeckd --test production_execution_wiring -- --test-threads=1
+      cargo test -p agentdeckd --test runtime_crash_recovery -- --test-threads=1
+      cargo test -p agentdeckd --lib codex::driver_tests:: -- --test-threads=1
+      cargo test -p agentdeckd --lib claude_code::driver_tests:: -- --test-threads=1
+      cargo clippy -p agentdeckd --lib --tests -- -D warnings
+      cargo fmt --all -- --check
+      ```
+    - [ ] **Step 6：B3b Task 收口。** 精确提交 code/test 后，按 Global Constraints 运行一次完整
+      package/跨语言门禁、独立 `spec/security` 与 `quality` 终审，修完 findings，再同步 README、
+      ARCHITECTURE、QUALITY、DIAGNOSTICS、本计划与 progress，并创建一个 Task 级 docs commit。不得把
+      B3b 的完整门禁或文档延迟到 B5 aggregate。
+  - [ ] **B4 metadata（独立 Task）：** durable mutation ledger、managed rename/archive、descriptor/lifecycle + entry/catalog
     revision + CatalogDelta 同事务，conversation event 恒为零；managed mutation 同事务直接写 terminal
     `applied`。native 合法转移固定为 `claimed→applying→applied|failed|outcomeUnknown`；`outcomeUnknown` 保持
     active，只能经 authenticated native readback 收敛为 applied/failed，绝不再次调用 vendor。active exact
     retry 零写/零副作用并返回稳定 `daemon.conversation.metadata_mutation_pending`，terminal same
     owner+key+request exact replay 原 outcome，same owner+key/different request conflict；B4 同步更新
     `failure.rs` 与 diagnostics failure table。native claim/apply/readback 执行留 C0-C。
-  - [ ] **B5 cross-layer closeout：** 并发 writer、重放/冲突、restart/recovery、receipt/event/snapshot 一致性，
-    完整 cargo/Swift/iOS/selfcheck/docs/diff gates、独立 spec/security/quality review 与 scoped commits。
+    B4 自身必须按 Global Constraints 完成 code/test commit、完整 package/跨语言门禁、双路独立终审、
+    文档同步与一个 docs commit；不得由 B5 代收。
+  - [ ] **B5 cross-layer closeout（独立 Task）：** 只收口 B5 自身新增的并发 writer、重放/冲突、restart/
+    recovery、receipt/event/snapshot 跨层一致性；运行完整 cargo/Swift/iOS/selfcheck/docs/diff gates、独立
+    `spec/security` 与 `quality` 终审，并完成 B5 自己的 code/test commit 与一个 docs commit。B5 不重复、
+    不替代 B3b/B4 已各自完成的 Task gate。
   任一 Task 的 production additions 预估达到 1,800 先内部细拆，实际超过 2,000 立即停下；测试、文档与
   删除旧代码均不参与新增行阈值计算。内部子片遵守 Global Constraints 的 focused-only 门禁。
 - [ ] v4→v5 migration 固定：existing conversation 在 `conversation_state` 中迁为 rev0/unconfigured、

@@ -1404,6 +1404,58 @@ Router 8/8、trait shape 1/1、runtime snapshot 23 passed / 1 ignored、daemon l
 14 passed / 1 ignored，全部 exit 0。两路独立终审均 Approved，无 P0/P1/P2。B2 只完成 configuration
 CAS/snapshot/Core/defaults；B3–B5、P4–P6 与 P3.1 signed Keychain 外部门禁仍未完成。
 
+## Relay Companion MVP P3.9-C0-B3a command pin / prompt admission 门禁
+
+**具体威胁场景：** fresh v5 command 若未与 Accepted journal 同事务持久化 exact configuration pin，或
+Core caller/actor shutdown 在 Store COMMIT 前释放 authorization guard，queued/restart/recovery 可能失去原
+revision 证据，或在 revocation 已完成后仍提交副作用准入。B3a 只关闭 admission 与 pinned receipt 边界；
+按 pin 加载 exact configuration 并映射 adapter argv/control 属于 B3b。
+
+```bash
+# B3a Store/Core focused matrix
+cargo test -p agentdeckd --test runtime_core -- --test-threads=1
+cargo test -p agentdeckd --test runtime_store_command_configuration -- --test-threads=1
+cargo test -p agentdeckd --test runtime_store_command_configuration_recovery -- --test-threads=1
+cargo test -p agentdeckd --test runtime_store_command_configuration_tamper -- --test-threads=1
+cargo test -p agentdeckd --test runtime_store_capacity -- --test-threads=1
+
+# Task 收口完整 package / 跨语言 / 自检
+cargo test -p agentdeckd
+cargo test -p agentdeck-protocol -- --test-threads=1
+swift test
+cargo run -q -p agentdeck-cli -- protocol schema \
+  | diff - protocol/agentdeck/agentdeck-protocol.schema.json
+swift run AgentDeck -- --selfcheck
+
+# 静态、network 与文档
+cargo clippy -p agentdeckd --all-targets -- -D warnings
+cargo clippy -p agentdeck-protocol --lib -- -D warnings
+cargo fmt --all -- --check
+bash scripts/check-daemon-network-boundary.sh
+bash scripts/check-daemon-no-net.sh
+scripts/verify-agent-docs.sh
+git diff --check
+git status --short --branch
+```
+
+实现证据：B3a2-C code/test commit 为 `48594e8`，production additions `+8/-2`；B3a3 code/test
+commit 为 `09a14b0`，production additions `195`、tests additions `551`。B3a3 移除了 production
+`feature_unavailable`/test-only unconfigured prompt bypass，并让 Store-owned authorization guard 覆盖
+durable outcome、通知、reply 与 actor queue registration。
+
+**Task gate 读回（2026-07-18）：** `cargo test -p agentdeckd` exit 0，聚合 `1138 passed / 6 ignored`，
+总墙钟约 691 秒；lib `680 passed / 1 ignored`（156.11 秒），包含 1,024 × 256 KiB 边界的 5-test
+target `5/5`（359.75 秒）。focused matrix 依次为 Core `3/3`、configuration `14/14`、recovery
+`1 passed / 1 ignored`、tamper `2/2`、capacity `9/9`。protocol `170/170`、schema snapshot 逐字一致、
+Swift XCTest `298/298` + Swift Testing `35/35`、App selfcheck、daemon all-target Clippy、protocol lib
+Clippy、fmt、network/no-net、docs 与 diff 均 exit 0。独立 `spec/security` 与 `quality` 终审最终 Approved，
+无剩余 P0/P1/P2。
+
+protocol test-target Clippy 在 Rust 1.96 上受 2026-06-29 既有 `protocol_version_is_positive` 常量断言
+`assertions_on_constants` warning 阻断，本轮未把该命令计为 PASS，也没有为 B3a 夹带 baseline 修复；
+production `failure.rs` 以 protocol 全量测试和 `cargo clippy ... --lib` 收口。6 个 ignored 均是现有显式
+gated/manual artifact fixture；其中 P3.1 provisioned signed Keychain 继续单列 BLOCKED，不计 PASS。
+
 ## AppKit 重写后的验证清单
 
 前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。
@@ -1533,6 +1585,7 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P3.8-B production UDS/bootstrap | 运行本页 secure listener/permit/supervisor、config/stdio exhaustive allowlist、真实 binary lifecycle、Rust/Swift compatibility、完整 daemon、fmt/clippy/network-boundary/schema/docs/diff；只证明 production 本地入口，不冒充 P3.9 shared-daemon client、LaunchAgent 或 remote E2E |
 | Relay Companion MVP P3.9-C0-A2 Swift Runtime v2 mirror | 运行本页 A2a/A2b/A2c1/A2c2 focused、public API 与 frozen v1 gate、完整 `swift test`、iOS XcodeGen + Simulator、App selfcheck、docs/diff；A2 完成只证明 current codec、compact/98-fixture 与真实 UDS Swift readback，不得宣称 App/CLI 默认 UDS cutover |
 | Relay Companion MVP P3.9-C0-B1b Runtime DB v5 migration | 运行本页 schema/migration/store/boundary/cipher、默认完整 daemon、Clippy/fmt/no-net/selfcheck/docs/diff 与真实 v4 writer byte-exact gate；只证明 schema v5、authenticated migration/materialization，不冒充 B2–B4 writer、P4 CounterGuard 或 Companion E2E |
+| Relay Companion MVP P3.9-C0-B3a command pin / prompt admission | 运行本页 B3a Store/Core focused matrix、完整 daemon package、protocol/Swift/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明 expected revision admission、同事务 nonzero pin、pinned receipt/status/recovery 与 Store-owned authorization lifetime，不冒充 B3b exact configuration execution、live vendor 或 Companion E2E |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试
