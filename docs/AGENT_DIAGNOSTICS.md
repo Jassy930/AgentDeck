@@ -512,7 +512,7 @@ provisioning profile，两个已通过 `codesign --verify` 的尝试均被 AMFI 
 | `daemon.diagnostics.path_unavailable` | diagnostics one-shot 无可用日志路径 | 提供合法 profile/absolute data-dir，或先创建一次诊断日志 |
 | `daemon.runtime.main_loop_failed` | security bootstrap 已完成，但 UDS listener 或显式 stdio compatibility 主循环失败 | 先按下方 `daemon.local.*` 子码检查入口/信号/I/O；guard/KEK 会随进程退出释放/清零 |
 
-## Runtime SQLite / journal / adapter 私表 / Core 诊断（Companion MVP P3.2–P3.9-C0-B4）
+## Runtime SQLite / journal / adapter 私表 / Core 诊断（Companion MVP P3.2–P3.9-C0-B5）
 
 P3.2/P3.3 error code 是 store 内部精确错误的稳定诊断归类；P3.4–P3.6 已把接入 RuntimeCore 的
 路径映射成 wire `RuntimeFailure`，并增加 Core/principal/connection/read overload、approval
@@ -522,6 +522,9 @@ nonzero command pin 与 pinned revision receipt；B3b 再把 command-pinned exac
 Store Start、Runtime execution context、两家 adapter argv/control 与 approval at-decision metadata；B4
 再接通 managed rename/archive/unarchive 的 durable mutation ledger、entry/catalog revision 与
 CatalogDelta 原子收敛。
+B5 再通过真实 UDS 双 principal 与 shutdown/reopen 锁定 configuration/event 和 metadata/catalog 两条
+revision 轴的独立收敛、owner-scoped idempotency、receipt/snapshot/backfill 一致性，以及 revoke、caller
+cancellation、after-COMMIT unknown 下 authorization guard 与单次通知语义；B5 没有新增 production writer。
 transfer reducer 仍只有 component-local typed
 error，没有 production wire owner。排查时保留 DB/WAL/SHM 原件，先运行 diagnostics/read-only
 inspection，
@@ -591,6 +594,19 @@ key 覆盖旧意图。RecoveryBlocked conversation 只允许 rename，archive/un
 入口：`nativeProjected` 返回 `daemon.runtime.feature_unavailable` 且零写。遇到 metadata corruption、
 CatalogDelta/revision 不一致或 totals 漂移时，保留 DB/WAL/SHM/KEK，禁止删除 ledger row、回退 revision、
 重封 request/outcome 或手工补 CatalogDelta。
+
+### B5 跨层一致性排障
+
+configuration revision 与 conversation event cursor 是一条轴；entry revision 与 catalog revision/
+`CatalogDelta` 是另一条轴。并发 Configure 与 Rename/SetArchived 后，如果 receipt 已 Applied，但 snapshot、
+backfill 或 Catalog 只看到其中一半，先按同一 installation owner + idempotency key 查询 exact durable outcome，
+再核对订阅 ACK/flush 与重连 frozen cursor；不得把两条 revision 强行对齐、手工补 delta，或换 owner/key 重放。
+after-COMMIT unknown 可能已经提交并广播一次，exact retry 应返回 Replayed 且不能产生第二次通知。
+
+若 revoke 或 caller cancellation 与 metadata COMMIT 同时发生，authorization guard 必须继续持有到 Store
+outcome、通知和 reply 收口；revoke 只能在此前置工作完成后返回。排障时不要用固定 sleep 判断先后，应读回
+principal Revoking 状态、Store completion 与最终 exact replay。该规则只覆盖 authenticated Runtime 操作，
+不把同 UID 在线进程竞态重新纳入威胁模型。
 
 worker 初始化或 migration 通过 ready channel 返回错误前，必须先释放 Runtime DB path lease；caller
 收到错误后可直接 exact reopen。若此时仍得到 `daemon.runtime.store_unavailable`/`StoreAlreadyOpen`，

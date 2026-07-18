@@ -26,8 +26,8 @@ Relay Companion 主线恢复 Task 粒度执行。B3a、B3b、B4、B5、C0-C、P3
 task 才是完整收口单位；内部子片只运行行为相关 focused tests、scoped clippy 与 fmt，并做执行者自查。
 约 255 秒的完整 package 慢门禁、跨语言全量回归、双路独立终审（spec/security 与 quality）、文档同步与
 docs commit 只在 Task 收口执行一次；Phase exit 再运行一次 phase 级双路终审、完整慢门禁与 phase
-verifier。1,800/2,000 additions 刹车线只统计
-production 代码新增行，测试和文档不计；RED→GREEN、精确 pathspec 不放宽，no-net/neutrality/sentinel
+verifier。1,800/2,000 additions 刹车线只统计单个 production 实现子片的代码新增行，Task aggregate、测试
+和文档不计；超过阈值只继续拆 production 子片，不把子片升格为收口 Task。RED→GREEN、精确 pathspec 不放宽，no-net/neutrality/sentinel
 等安全矩阵在相关 Task 收口与 Phase exit 按变更范围执行，不扩张为每个子片的重复门禁。
 
 Runtime store 的验证只承诺缺 KEK 且无法通过当前 KEK/database/domain 认证的离线磁盘篡改在
@@ -1577,6 +1577,67 @@ B4 只允许 managed mutation。`nativeProjected` 返回 typed feature-unavailab
 同 UID 在线攻击仍是 accepted residual risk，不为 B4 添加竞态测试或 hook；整库历史回滚仍由 P4
 CounterGuard 检测。
 
+## Relay Companion MVP P3.9-C0-B5 cross-layer closeout 门禁
+
+**具体威胁场景：** configuration 与 managed metadata 虽各自在 Store 内原子提交，但若真实 UDS/Core
+路径把 installation owner、authorization guard、after-COMMIT outcome、通知或 frozen cursor 接错，两个
+principal 并发写时仍可能出现错误 replay、revision 轴串线、重复 CatalogDelta，或重启后 receipt、Catalog、
+conversation snapshot 与 backfill 互相矛盾。B5 用纯测试增量验证既有 production 路径的跨层收敛，不新增
+writer，也不把 native projection 或同 UID 在线竞态纳入范围。
+
+```bash
+# B5 真实 UDS、authorization 与 after-COMMIT focused gate
+cargo test -p agentdeckd --test runtime_configuration_metadata_cross_layer -- --test-threads=1
+cargo test -p agentdeckd --lib \
+  runtime::core::tests::metadata_authorization_guard_covers_store_commit_and_reply \
+  -- --test-threads=1
+cargo test -p agentdeckd --lib \
+  runtime::core::tests::canceled_metadata_caller_keeps_authorization_until_store_completion \
+  -- --test-threads=1
+cargo test -p agentdeckd --lib \
+  runtime::core::tests::subscription_tests::metadata_after_commit_unknown_notifies_once_and_exact_retry_replays \
+  -- --test-threads=1
+
+# Task 收口完整 package / 跨语言 / Simulator / 自检
+cargo test -p agentdeckd -- --test-threads=1
+cargo test -p agentdeck-protocol -- --test-threads=1
+swift test
+cd ios && xcodegen generate && \
+  xcodebuild -project AgentDeckMobile.xcodeproj -scheme AgentDeckMobile \
+    -destination 'platform=iOS Simulator,name=iPhone 17' test
+cargo run -q -p agentdeck-cli -- protocol schema \
+  | diff - protocol/agentdeck/agentdeck-protocol.schema.json
+swift run AgentDeck -- --selfcheck
+
+# 静态、network 与文档
+cargo clippy -p agentdeckd --all-targets -- -D warnings
+cargo clippy -p agentdeck-protocol --lib -- -D warnings
+cargo fmt --all -- --check
+bash scripts/check-daemon-network-boundary.sh
+bash scripts/check-daemon-no-net.sh
+scripts/verify-agent-docs.sh
+git diff --check
+git status --short --branch
+```
+
+实现证据：`aebc8d0` 只增加 1,283 行测试，production additions 为 0。真实 UDS 使用两个稳定
+installation identity 建立两个 authenticated principal，覆盖并发 Configure/Rename、same-owner exact
+replay 与 cross-owner same-key 独立语义、conflict、receipt、configuration event、CatalogDelta、snapshot、
+backfill，以及 shutdown/reopen 后的相同读回。Core fault tests 使用显式进入/释放同步点，不以 50 ms sleep
+推断调度；revoke/caller cancellation 的 join 均有界。
+
+**Task gate 已确认读回（2026-07-18）：** 跨层主测试及 metadata authorization、caller cancellation、
+after-COMMIT unknown 三条专项分别稳定重复 `20/20`；完整 daemon package `1176 passed / 6 ignored`，lib
+`699 passed / 1 ignored`，1,024 × 256 KiB target `5/5`（280.10 秒）；protocol `170/170`；Swift
+XCTest `298/298` + Swift Testing `35/35`；iOS Simulator `20/20` 且 `TEST SUCCEEDED`；schema、
+selfcheck、daemon/protocol Clippy、fmt、network/no-net、docs 与 diff 全绿。独立 spec/security 与 quality
+终审均 Approved、无 P0/P1/P2。6 个 ignored 继续是显式 gated/manual 槽位，其中 provisioned signed
+Keychain 是 post-MVP BLOCKED，不计 PASS，也不阻塞自动主线。
+
+B5 证明 configuration/event 与 metadata/catalog 两条 revision 轴在现有 managed Runtime 路径上独立且
+最终一致；不证明 C0-C native importer/dynamic snapshot/native side effect、P4 CounterGuard/RemoteLink，
+也不证明真实 vendor login 或 Companion E2E。
+
 ## AppKit 重写后的验证清单
 
 前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。
@@ -1709,6 +1770,7 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P3.9-C0-B3a command pin / prompt admission | 运行本页 B3a Store/Core focused matrix、完整 daemon package、protocol/Swift/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明 expected revision admission、同事务 nonzero pin、pinned receipt/status/recovery 与 Store-owned authorization lifetime，不冒充 B3b exact configuration execution、live vendor 或 Companion E2E |
 | Relay Companion MVP P3.9-C0-B3b exact execution | 运行本页 B3b Store/Core/driver/translator/restart focused matrix、完整 daemon package、protocol/Swift/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明 command-pinned historical configuration、rev0 startup-only、Codex/CC argv/control/at-decision mapping 与 synthetic restart probe，不冒充 live vendor、P4 RemoteLink 或 Companion E2E |
 | Relay Companion MVP P3.9-C0-B4 managed metadata | 运行本页 B4 Store/Core/Catalog/integrity/capacity focused matrix、完整 daemon package、protocol/Swift/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明 managed rename/archive、durable replay/conflict、同事务 revision/CatalogDelta 与离线篡改审计，不冒充 native projector、P4 CounterGuard/RemoteLink 或 Companion E2E |
+| Relay Companion MVP P3.9-C0-B5 cross-layer closeout | 运行本页真实 UDS 双 principal、authorization/cancellation/after-COMMIT focused matrix、完整 daemon/protocol/Swift/iOS Simulator/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明 managed configuration/metadata 的 owner-scoped 幂等、双 revision 轴、receipt/event/snapshot/backfill/restart 收敛，不冒充 C0-C native projection、P4 RemoteLink 或真实 Companion E2E |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

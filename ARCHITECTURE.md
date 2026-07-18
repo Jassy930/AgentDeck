@@ -572,13 +572,20 @@ conversation/key，不能伪造身份连续性。
   charged bytes 与 `runtime_meta` totals 会在 open/recovery 全库重算；近 1 MiB descriptor 的准入投影同时
   覆盖新 descriptor 和 CatalogDelta。native 合法转移仍留 C0-C，B4 对 `nativeProjected` 零 claim 返回
   feature-unavailable。
+- B5 不增加 production 路径，而是把 B2/B3a/B3b/B4 的跨层不变量锁成真实 UDS 行为证据：configuration
+  revision 只随 `ConfigurationChanged`/conversation event 轴推进，entry revision 只随 metadata
+  `CatalogDelta`/catalog 轴推进，二者不得互相借用或覆盖；幂等 namespace 始终包含 authenticated
+  installation owner，同 owner/key 的 exact request 才能 replay，另一 owner 使用相同 raw key 是独立意图。
+  两个 principal 并发写、after-COMMIT unknown、revoke/caller cancellation 与 shutdown/reopen 后，receipt、
+  event、snapshot、backfill 和 catalog 必须从同一 authenticated Store outcome 收敛，通知最多一次。该证据不
+  扩张到 native projector 或同 UID 在线攻击者。
 - Codex 把冻结的 approval policy/sandbox 写入 fresh/resume thread request，把 reasoning effort 写入 turn
   request；Claude Code 把 permission mode/model/effort/output style 写入 fresh/resume argv。Runtime/UI 的
   `ClaudeCodePermissionMode::Default` 保持中立“常规人工确认”语义，当前 vendor CLI 显式映射为
   `--permission-mode manual`，不把 vendor 字符串反向污染公共协议。Codex approval 的 policy/sandbox 与
   Claude Code approval 的 permission mode at-decision metadata 都来自同一冻结配置。
 - B3a 由 `48594e8` / `09a14b0` 完成，B3b 由 `c0ed6cd` / `f4141f0` / `fb1629a` 完成，B4 由
-  `5f1ca1c` / `347a0f0` 完成；recorded
+  `5f1ca1c` / `347a0f0` 完成，B5 跨层收口由 `aebc8d0` 完成；recorded
   argv/control/translator fixture 只锁定字段映射，不是 live vendor login、真实 approval 或 P4 RemoteLink
   证据。P3.1 provisioned signed Keychain 继续单列 post-MVP ignored/BLOCKED，不计 PASS，也不阻塞
   MVP/P3 exit。

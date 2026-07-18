@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P3.9-C0-B3a/B3b/B4 已分别完成并通过 Task 完整门禁与双路终审，下一项为 B5 cross-layer closeout；P3.1 签名 Keychain 为 post-MVP ignored/BLOCKED 且不阻塞主线（2026-07-18） |
+| 状态 | Approved target；P3.9-C0-B3a/B3b/B4/B5 已分别完成并通过 Task 完整门禁与双路终审，下一项为 C0-C native history projection；P3.1 签名 Keychain 为 post-MVP ignored/BLOCKED 且不阻塞主线（2026-07-18） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -1160,8 +1160,8 @@ P3.6 的 `TransferStateMachine` 目前没有 production remote ingress owner；P
   状态机；P3.6-D 已由 `b668d8f` 完成独立文档收口。P3.7 exec-gate/recovery 边界已裁决，两个
   prepare finding 与 translator 阻断项已修复，完整自动门禁与独立终审均已通过，并由 `5568e93`
   完成主体 scoped commit、`c9d2146` / `5713be4` 补齐真实 release 前取消与 sentinel 退出窗口门禁；整个
-  P3 当时仍因 P3.8–P3.10 未完成而保持未完成。P3.1 外部门禁继续 BLOCKED 且不得记 PASS，但 2026-07-18
-  起不再单独阻塞主线，其最终归属等待用户在方案 a/b 中拍板。
+  P3 当时仍因 P3.8–P3.10 未完成而保持未完成。P3.1 外部门禁继续 BLOCKED 且不得记 PASS；2026-07-18
+  已采用方案 b，将其移入 post-MVP 槽位，不再阻塞自动主线。
 - 已读回的 scoped 证据是 `runtime_stream` 45/45、`runtime_transfer` 17/17、subscription 36/36、
   daemon lib 464/464（`runtime::` 366 项），默认并发 `cargo test -p agentdeckd` exit 0；Swift
   256 XCTest + 35 Swift Testing，protocol/schema、fmt、clippy、daemon no-net 与 diff gate 均通过。
@@ -1493,8 +1493,8 @@ P4 RemoteTransport 存在后执行。
 canonical adapter 穿透完整 RemoteLink/daemon receipt 链路；CLI restart 能读回
 DeviceSign/DeviceHPKE/grant/counter/replay state，旧 credential JSON 不含 secret，Linux 与
 unsigned/ad-hoc macOS persistent pairing typed unsupported。真实 vendor login evidence 保留为
-post-MVP BLOCKED 槽位；provisioned signed Keychain 单独维持 P3.1 未决 BLOCKED，不削减功能实现、
-不阻塞后续自动主线，也不在用户拍板前擅自移入 post-MVP。
+post-MVP BLOCKED 槽位；provisioned signed Keychain 已按方案 b 保留为 P3.1 post-MVP BLOCKED，不削减
+功能实现，也不阻塞后续自动主线。
 
 ### P5 iOS Companion
 

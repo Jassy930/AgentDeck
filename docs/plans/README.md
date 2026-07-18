@@ -58,11 +58,13 @@ current codec、98-fixture 与真实 UDS Swift readback，A2 complete；shared-d
 P3.9-C0-B3a 已由 `48594e8` / `09a14b0` 完成并通过 Task 完整门禁与双路终审：B3 current-open
 最后一笔仍为 `974f9b1`，同 UID 在线攻击自此作为 residual risk，不再扩展；B3b exact execution 已由
 `c0ed6cd` / `f4141f0` / `fb1629a` 收口，B4 managed metadata 已由 `5f1ca1c` / `347a0f0`
-完成，下一项为 B5 cross-layer closeout。P3.1 的
+完成，B5 cross-layer closeout 已由 `aebc8d0` 以 test-only 增量完成并通过完整门禁与双路终审；下一项为
+C0-C native history projection。P3.1 的
 provisioned signed Keychain 外部门禁仍有
 1 项 ignored/BLOCKED，但不阻塞主线。P3.9-C0-C 与后续 client cutover、P3.10、P4 E2EE/Relay Publish
-和 P5 真实 Companion 均未完成；transfer/publication 也尚无 production remote owner。不能因 fake
-publication、store tests 或 Simulator fixture 改写状态。
+和 P5 Simulator 自动 E2E/本机第二客户端均未完成；物理 iPhone/第二台 Mac 是 post-MVP BLOCKED 槽位。
+transfer/publication 也尚无 production remote owner；不能因 fake publication、store tests 或 Simulator
+fixture 改写尚未实现的自动链路状态。
 
 ```text
 docs/plans/
