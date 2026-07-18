@@ -1,20 +1,31 @@
-//! Native history projection 与 metadata effect fence 的 authenticated read/audit。
+//! Native history projection 的原子导入、authenticated read/audit 与 metadata effect fence。
 //!
-//! 本模块不提供 production writer。private adapter reference 只由 vault loader 解密认证，
-//! Runtime store 不解释其格式；effect spec 同样只作为有界 opaque bytes 参与认证。
+//! private adapter reference 只由 vault loader 解密认证，Runtime store 不解释其格式；
+//! effect spec 同样只作为有界 opaque bytes 参与认证。
 
 use std::collections::HashSet;
 
-use rusqlite::Connection;
+use agentdeck_protocol::runtime::ConversationConfiguration;
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use zeroize::Zeroizing;
 
-use super::RuntimeStoreError;
-use super::cipher::RuntimeKeyBundle;
-use super::identity::{RuntimeId, RuntimeIdKind};
-use super::sequence::{SequenceScope, decode_sequence};
-use super::sqlite::RuntimeLedger;
+use super::cipher::{ROW_BLOB_V1_OVERHEAD_LEN, RuntimeKeyBundle};
+use super::configuration::{ConfigurationRecord, PreparedNativeProjectionConfiguration};
+use super::identity::{
+    MAX_RUNTIME_ID_COLLISION_ATTEMPTS, RuntimeId, RuntimeIdError, RuntimeIdKind,
+};
+use super::sequence::{SequenceScope, decode_sequence, next_sequence};
+use super::sqlite::{RuntimeLedger, RuntimeSqlite, SafetyReserveProjection};
 use super::stream::{metadata_mac, open_v4_row, optional_field};
+use super::{ConversationDescriptor, ConversationRecord, RuntimeStoreError};
 use crate::runtime::adapter_state::AdapterStateNamespace;
+use crate::runtime::events::CommandStreamEffects;
+use crate::runtime::model::{
+    NativeProjectionLimitScope, NewConversation, RuntimeCommitOperation, RuntimeStoreConfig,
+    RuntimeStoreOperation,
+};
 use crate::runtime::process_identity::ProcessIdentity;
+use crate::security::SecretBytes;
 
 const PROJECTION_METADATA_DOMAIN: &[u8] = b"native.projection.metadata.v1";
 const EFFECT_FENCE_METADATA_DOMAIN: &[u8] = b"native.metadata-effect-fence.metadata.v1";
@@ -32,6 +43,512 @@ const MAX_NATIVE_PROJECTION_ROWS: u64 = 9_216;
 const MAX_METADATA_EFFECT_FENCE_ROWS: u64 = 65_536;
 const MAX_RUNTIME_LIVE_CONVERSATIONS: u64 = 1_024;
 const MAX_NATIVE_NONLIVE_IDENTITIES: u64 = 8_192;
+const MAX_NATIVE_REFERENCE_CHARGED_BYTES: u64 = 16 * 1024 * 1024;
+#[allow(dead_code)] // C-f projector lifecycle 接线后由 production capability 强制。
+pub(super) const MAX_NATIVE_PRIVATE_REFERENCE_BYTES: usize = 523;
+#[allow(dead_code)] // C-f projector lifecycle 接线后由 production capability 强制。
+pub(super) const MIN_NATIVE_PRIVATE_REFERENCE_BYTES: usize = 20;
+
+/// 已验证 native source 交给固定 namespace projector 的最小导入输入。
+///
+/// private reference 不实现可见 Debug；Store 只把它当作 versioned opaque bytes。
+#[allow(dead_code)] // C-f projector lifecycle 接线后由 verified native source 构造。
+pub(crate) struct ImportNativeProjection {
+    pub(crate) descriptor: ConversationDescriptor,
+    pub(crate) default_configuration: ConversationConfiguration,
+    pub(crate) private_reference: SecretBytes,
+    pub(crate) scan_generation: [u8; 16],
+}
+
+impl std::fmt::Debug for ImportNativeProjection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ImportNativeProjection")
+            .field("descriptor", &"[REDACTED]")
+            .field("default_configuration", &"[REDACTED]")
+            .field("private_reference", &"[REDACTED]")
+            .field("scan_generation", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ImportNativeProjectionOutcome {
+    Imported {
+        conversation: ConversationRecord,
+        configuration: ConfigurationRecord,
+    },
+    Replayed {
+        conversation: ConversationRecord,
+        configuration: ConfigurationRecord,
+    },
+    Reobserved {
+        conversation: ConversationRecord,
+        configuration: ConfigurationRecord,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct NativeProjectionIdentityCandidate {
+    pub(super) conversation_id: RuntimeId,
+    pub(super) adapter_state_key: RuntimeId,
+}
+
+pub(super) struct PreparedNativeProjectionImport {
+    pub(super) descriptor: ConversationDescriptor,
+    pub(super) descriptor_bytes: Zeroizing<Vec<u8>>,
+    pub(super) default_configuration: PreparedNativeProjectionConfiguration,
+    pub(super) private_reference: SecretBytes,
+    #[allow(dead_code)] // C-f production caller 接线前只由 focused test command 计费。
+    pub(super) private_reference_capacity: usize,
+    pub(super) scan_generation: [u8; 16],
+    pub(super) observation_token: [u8; 32],
+    pub(super) identity_candidates: Vec<NativeProjectionIdentityCandidate>,
+}
+
+impl PreparedNativeProjectionImport {
+    #[allow(dead_code)] // C-f projector lifecycle 接线后进入 normal lane admission。
+    pub(super) fn retained_capacity(&self) -> Result<usize, RuntimeStoreError> {
+        self.descriptor
+            .title
+            .as_ref()
+            .map_or(0, String::capacity)
+            .checked_add(self.descriptor.cwd.capacity())
+            .and_then(|value| value.checked_add(self.descriptor_bytes.capacity()))
+            .and_then(|value| {
+                value.checked_add(self.default_configuration.retained_capacity().ok()?)
+            })
+            .and_then(|value| value.checked_add(self.private_reference_capacity))
+            .and_then(|value| {
+                value.checked_add(
+                    self.identity_candidates
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<NativeProjectionIdentityCandidate>())?,
+                )
+            })
+            .ok_or(RuntimeStoreError::PayloadTooLarge)
+    }
+}
+
+pub(crate) fn import_native_projection(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    prepared: PreparedNativeProjectionImport,
+    effects: &mut CommandStreamEffects,
+) -> Result<ImportNativeProjectionOutcome, RuntimeStoreError> {
+    let namespace = prepared.default_configuration.namespace();
+    if namespace.agent_kind() != prepared.descriptor.agent_kind
+        || prepared.scan_generation == [0; 16]
+        || prepared.identity_candidates.is_empty()
+        || prepared.identity_candidates.len() > MAX_RUNTIME_ID_COLLISION_ATTEMPTS
+    {
+        return Err(RuntimeStoreError::InvalidConfig(
+            "native projection import preparation is invalid",
+        ));
+    }
+    let reference_token = super::journal::adapter_state_reference_token(
+        &state.key_bundle,
+        namespace,
+        &prepared.private_reference,
+    )?;
+    let existing = load_existing_native_projection(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        namespace,
+        &reference_token,
+        &prepared.private_reference,
+    )?;
+    if let Some(existing) = existing.as_ref()
+        && existing.projection.state != ProjectionState::Present
+    {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    if let Some(existing) = existing.as_ref()
+        && existing.projection.scan_generation == prepared.scan_generation
+    {
+        if existing.projection.observation_token != prepared.observation_token {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        return Ok(ImportNativeProjectionOutcome::Replayed {
+            conversation: existing.conversation.clone(),
+            configuration: existing.configuration.clone(),
+        });
+    }
+
+    let is_reobserve = existing.is_some();
+    if !is_reobserve {
+        let preflight_ledger = super::sqlite::load_runtime_ledger(
+            &state.connection,
+            &state.key_bundle,
+            state.database_id,
+        )?;
+        validate_fresh_import_capacity(
+            &preflight_ledger,
+            config,
+            projected_reference_sealed_bytes(&prepared.private_reference)?,
+        )?;
+    }
+    let projected_write_bytes = if is_reobserve {
+        super::journal::projected_write_bytes(&[4 * 1024])?
+    } else {
+        super::journal::projected_write_bytes(&[
+            prepared.descriptor_bytes.len(),
+            prepared.descriptor_bytes.len(),
+            prepared.private_reference.expose_secret().len(),
+            prepared.private_reference.expose_secret().len(),
+            prepared.default_configuration.configuration_bytes().len(),
+            prepared
+                .default_configuration
+                .configuration_bytes()
+                .len()
+                .checked_add(2 * 1024)
+                .ok_or(RuntimeStoreError::PayloadTooLarge)?,
+            4 * 1024,
+        ])?
+    };
+    super::sqlite::admit_ordinary_write(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        &state.storage_path,
+        &mut state.admission_state,
+        config.capacity_probe.as_ref(),
+        projected_write_bytes,
+        SafetyReserveProjection::Current,
+    )?;
+    let observed_at_ms = config.clock.now_ms()?;
+    let database_id = state.database_id;
+    let key_bundle = &state.key_bundle;
+    let transaction = state
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let existing = load_existing_native_projection(
+        &transaction,
+        key_bundle,
+        database_id,
+        namespace,
+        &reference_token,
+        &prepared.private_reference,
+    )?;
+    if let Some(existing) = existing {
+        if existing.projection.state != ProjectionState::Present {
+            return Err(RuntimeStoreError::InvalidStateTransition);
+        }
+        if existing.projection.scan_generation == prepared.scan_generation {
+            if existing.projection.observation_token != prepared.observation_token {
+                return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+            }
+            return Ok(ImportNativeProjectionOutcome::Replayed {
+                conversation: existing.conversation,
+                configuration: existing.configuration,
+            });
+        }
+        if observed_at_ms < existing.projection.reconciled_at_ms {
+            return Err(RuntimeStoreError::ClockRegressed {
+                persisted_ms: existing.projection.reconciled_at_ms,
+                observed_ms: observed_at_ms,
+            });
+        }
+        let catalog_revision =
+            super::sequence::encode_sequence(existing.projection.projection_catalog_revision);
+        let metadata_token = projection_metadata_token(
+            key_bundle,
+            existing.conversation.conversation_id,
+            namespace.origin_namespace(),
+            &reference_token,
+            ProjectionState::Present,
+            &prepared.scan_generation,
+            &prepared.observation_token,
+            &catalog_revision,
+            observed_at_ms,
+            existing.projection.state_changed_at_ms,
+            existing.projection.retain_until_ms,
+            existing.projection.charged_reference_bytes,
+        )?;
+        if transaction.execute(
+            "UPDATE native_projection_state
+             SET scan_generation = ?1, observation_token = ?2, reconciled_at_ms = ?3,
+                 metadata_token = ?4
+             WHERE conversation_id = ?5 AND metadata_token = ?6",
+            params![
+                &prepared.scan_generation[..],
+                &prepared.observation_token[..],
+                sqlite_time(observed_at_ms)?,
+                &metadata_token[..],
+                &existing.conversation.conversation_id.as_bytes()[..],
+                &existing.projection.metadata_token[..],
+            ],
+        )? != 1
+        {
+            return Err(RuntimeStoreError::SchemaInspectionRaced);
+        }
+        config
+            .fault_injector
+            .before_operation(RuntimeStoreOperation::ImportNativeProjectionBeforeCommit)?;
+        super::sqlite::commit_transaction(
+            transaction,
+            RuntimeCommitOperation::ImportNativeProjection,
+        )?;
+        super::sqlite::latch_post_commit_capacity(state, config);
+        native_projection_after_commit(config)?;
+        return Ok(ImportNativeProjectionOutcome::Reobserved {
+            conversation: existing.conversation,
+            configuration: existing.configuration,
+        });
+    }
+
+    let ledger = super::sqlite::load_runtime_ledger(&transaction, key_bundle, database_id)?;
+    let projected_reference_bytes = projected_reference_sealed_bytes(&prepared.private_reference)?;
+    validate_fresh_import_capacity(&ledger, config, projected_reference_bytes)?;
+    let identity = prepared
+        .identity_candidates
+        .iter()
+        .copied()
+        .find_map(|candidate| {
+            match super::journal::conversation_identity_pair_is_occupied(
+                &transaction,
+                key_bundle,
+                database_id,
+                candidate.conversation_id,
+                candidate.adapter_state_key,
+            ) {
+                Ok(false) => Some(Ok(candidate)),
+                Ok(true) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .transpose()?
+        .ok_or_else(|| {
+            RuntimeStoreError::IdGeneration(RuntimeIdError::CollisionExhausted {
+                kind: RuntimeIdKind::Conversation,
+                attempts: MAX_RUNTIME_ID_COLLISION_ATTEMPTS,
+            })
+        })?;
+    validate_catalog_clock(&transaction, key_bundle, database_id, observed_at_ms)?;
+    let catalog_revision = next_sequence(
+        SequenceScope::CatalogRevision,
+        ledger.catalog_high_water.as_deref(),
+    )?;
+    let conversation = super::journal::insert_conversation_row(
+        &transaction,
+        key_bundle,
+        database_id,
+        NewConversation {
+            conversation_id: identity.conversation_id,
+            adapter_state_key: identity.adapter_state_key,
+            descriptor: prepared.descriptor,
+        },
+        prepared.descriptor_bytes.as_ref(),
+        catalog_revision.value,
+        observed_at_ms,
+        observed_at_ms,
+    )?;
+    let binding = super::journal::insert_adapter_state_binding(
+        &transaction,
+        key_bundle,
+        database_id,
+        namespace,
+        &conversation,
+        &prepared.private_reference,
+    )?;
+    if binding.reference_token() != &reference_token
+        || binding.sealed_reference_bytes() != projected_reference_bytes
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let (configuration, mut next_ledger) =
+        super::configuration::append_initial_native_projection_configuration(
+            &transaction,
+            key_bundle,
+            database_id,
+            config,
+            &conversation,
+            &prepared.default_configuration,
+            &ledger,
+        )?;
+    let projection_token = projection_metadata_token(
+        key_bundle,
+        conversation.conversation_id,
+        namespace.origin_namespace(),
+        &reference_token,
+        ProjectionState::Present,
+        &prepared.scan_generation,
+        &prepared.observation_token,
+        &catalog_revision.encoded,
+        observed_at_ms,
+        observed_at_ms,
+        None,
+        projected_reference_bytes,
+    )?;
+    if transaction.execute(
+        "INSERT INTO native_projection_state (
+             conversation_id, origin_namespace, state_reference_token,
+             projection_state, scan_generation, observation_token,
+             projection_catalog_revision, reconciled_at_ms, state_changed_at_ms,
+             private_binding_retain_until_ms, charged_reference_bytes, metadata_token
+         ) VALUES (?1, ?2, ?3, 'present', ?4, ?5, ?6, ?7, ?7, NULL, ?8, ?9)",
+        params![
+            &conversation.conversation_id.as_bytes()[..],
+            namespace.origin_namespace(),
+            &reference_token[..],
+            &prepared.scan_generation[..],
+            &prepared.observation_token[..],
+            &catalog_revision.encoded,
+            sqlite_time(observed_at_ms)?,
+            sqlite_u64(projected_reference_bytes)?,
+            &projection_token[..],
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    next_ledger.catalog_high_water = Some(catalog_revision.encoded);
+    next_ledger.conversation_count = checked_add(next_ledger.conversation_count, 1)?;
+    match namespace {
+        AdapterStateNamespace::Codex => {
+            next_ledger.codex_adapter_state_count =
+                checked_add(next_ledger.codex_adapter_state_count, 1)?;
+        }
+        AdapterStateNamespace::ClaudeCode => {
+            next_ledger.claude_code_adapter_state_count =
+                checked_add(next_ledger.claude_code_adapter_state_count, 1)?;
+        }
+    }
+    next_ledger.native_projection_present_count =
+        checked_add(next_ledger.native_projection_present_count, 1)?;
+    next_ledger.native_projection_physical_count =
+        checked_add(next_ledger.native_projection_physical_count, 1)?;
+    next_ledger.native_projection_charged_bytes = checked_add(
+        next_ledger.native_projection_charged_bytes,
+        projected_reference_bytes,
+    )?;
+    let pending_targets = super::sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next_ledger,
+    )?;
+    config
+        .fault_injector
+        .before_operation(RuntimeStoreOperation::ImportNativeProjectionBeforeCommit)?;
+    let commit_result = super::sqlite::commit_transaction(
+        transaction,
+        RuntimeCommitOperation::ImportNativeProjection,
+    );
+    effects.record_commit_result(pending_targets, &commit_result);
+    commit_result?;
+    super::sqlite::latch_post_commit_capacity(state, config);
+    native_projection_after_commit(config)?;
+    let conversation = super::journal::load_conversation(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        conversation.conversation_id,
+    )?;
+    Ok(ImportNativeProjectionOutcome::Imported {
+        conversation,
+        configuration,
+    })
+}
+
+fn validate_fresh_import_capacity(
+    ledger: &RuntimeLedger,
+    config: &RuntimeStoreConfig,
+    projected_reference_bytes: u64,
+) -> Result<(), RuntimeStoreError> {
+    let nonlive = ledger
+        .native_projection_tombstone_count
+        .checked_add(ledger.native_projection_retired_count)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let live = ledger
+        .conversation_count
+        .checked_sub(nonlive)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if live >= config.conversation_capacity {
+        return Err(RuntimeStoreError::ConversationLimit);
+    }
+    if ledger.conversation_count >= MAX_NATIVE_PROJECTION_ROWS
+        || ledger.native_projection_physical_count >= MAX_NATIVE_PROJECTION_ROWS
+    {
+        return Err(RuntimeStoreError::NativeProjectionLimit {
+            scope: NativeProjectionLimitScope::PhysicalIdentities,
+        });
+    }
+    if ledger
+        .native_projection_charged_bytes
+        .checked_add(projected_reference_bytes)
+        .is_none_or(|bytes| bytes > MAX_NATIVE_REFERENCE_CHARGED_BYTES)
+    {
+        return Err(RuntimeStoreError::NativeProjectionLimit {
+            scope: NativeProjectionLimitScope::ChargedReferenceBytes,
+        });
+    }
+    Ok(())
+}
+
+fn projected_reference_sealed_bytes(
+    private_reference: &SecretBytes,
+) -> Result<u64, RuntimeStoreError> {
+    private_reference
+        .expose_secret()
+        .len()
+        .checked_add(ROW_BLOB_V1_OVERHEAD_LEN)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(RuntimeStoreError::PayloadTooLarge)
+}
+
+fn validate_catalog_clock(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    observed_at_ms: u64,
+) -> Result<(), RuntimeStoreError> {
+    let raw_conversation_id = connection
+        .query_row(
+            "SELECT conversation_id FROM conversations
+             ORDER BY updated_at_ms DESC, conversation_id DESC LIMIT 1",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?;
+    let Some(raw_conversation_id) = raw_conversation_id else {
+        return Ok(());
+    };
+    let conversation_id = runtime_id(RuntimeIdKind::Conversation, raw_conversation_id)?;
+    let latest =
+        super::journal::load_conversation(connection, key_bundle, database_id, conversation_id)?;
+    if observed_at_ms < latest.updated_at_ms {
+        return Err(RuntimeStoreError::ClockRegressed {
+            persisted_ms: latest.updated_at_ms,
+            observed_ms: observed_at_ms,
+        });
+    }
+    Ok(())
+}
+
+fn native_projection_after_commit(config: &RuntimeStoreConfig) -> Result<(), RuntimeStoreError> {
+    if config
+        .fault_injector
+        .before_operation(RuntimeStoreOperation::ImportNativeProjectionAfterCommit)
+        .is_err()
+    {
+        Err(RuntimeStoreError::CommitOutcomeUnknown {
+            operation: RuntimeCommitOperation::ImportNativeProjection,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn sqlite_time(value: u64) -> Result<i64, RuntimeStoreError> {
+    i64::try_from(value).map_err(|_| RuntimeStoreError::TimeOutOfRange)
+}
+
+fn sqlite_u64(value: u64) -> Result<i64, RuntimeStoreError> {
+    i64::try_from(value).map_err(|_| RuntimeStoreError::PayloadTooLarge)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProjectionState {
@@ -79,8 +596,14 @@ struct AuthenticatedProjectionRow {
     origin_namespace: String,
     state_reference_token: [u8; 32],
     state: ProjectionState,
+    scan_generation: [u8; 16],
+    observation_token: [u8; 32],
     projection_catalog_revision: u64,
+    reconciled_at_ms: u64,
+    state_changed_at_ms: u64,
+    retain_until_ms: Option<u64>,
     charged_reference_bytes: u64,
+    metadata_token: [u8; 32],
 }
 
 #[derive(Default)]
@@ -354,9 +877,173 @@ fn authenticate_projection_row(
         origin_namespace: raw.origin_namespace,
         state_reference_token,
         state,
+        scan_generation,
+        observation_token,
         projection_catalog_revision,
+        reconciled_at_ms,
+        state_changed_at_ms,
+        retain_until_ms,
         charged_reference_bytes,
+        metadata_token,
     })
+}
+
+fn load_projection_by_reference_token(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    namespace: AdapterStateNamespace,
+    reference_token: &[u8; 32],
+) -> Result<Option<AuthenticatedProjectionRow>, RuntimeStoreError> {
+    let raw = connection
+        .query_row(
+            "SELECT conversation_id, origin_namespace, state_reference_token,
+                    projection_state, scan_generation, observation_token,
+                    projection_catalog_revision, reconciled_at_ms, state_changed_at_ms,
+                    private_binding_retain_until_ms, charged_reference_bytes, metadata_token
+             FROM native_projection_state
+             WHERE origin_namespace = ?1 AND state_reference_token = ?2",
+            params![namespace.origin_namespace(), &reference_token[..]],
+            raw_projection_row,
+        )
+        .optional()?;
+    raw.map(|row| authenticate_projection_row(key_bundle, row))
+        .transpose()
+}
+
+struct ExistingNativeProjection {
+    projection: AuthenticatedProjectionRow,
+    conversation: ConversationRecord,
+    configuration: ConfigurationRecord,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NativeCatalogChange {
+    Upsert,
+    Removed,
+}
+
+pub(super) fn authenticated_native_catalog_change(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    conversation: &ConversationRecord,
+) -> Result<Option<NativeCatalogChange>, RuntimeStoreError> {
+    let raw = connection
+        .query_row(
+            "SELECT conversation_id, origin_namespace, state_reference_token,
+                    projection_state, scan_generation, observation_token,
+                    projection_catalog_revision, reconciled_at_ms, state_changed_at_ms,
+                    private_binding_retain_until_ms, charged_reference_bytes, metadata_token
+             FROM native_projection_state WHERE conversation_id = ?1",
+            [&conversation.conversation_id.as_bytes()[..]],
+            raw_projection_row,
+        )
+        .optional()?;
+    let state = super::configuration::load_conversation_state(
+        connection,
+        key_bundle,
+        conversation.conversation_id,
+    )?;
+    if state.is_managed() {
+        return if raw.is_none() {
+            Ok(None)
+        } else {
+            Err(RuntimeStoreError::UnknownOrCorruptSchema)
+        };
+    }
+    let projection = raw
+        .map(|row| authenticate_projection_row(key_bundle, row))
+        .transpose()?
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let namespace = state
+        .origin_namespace()
+        .and_then(AdapterStateNamespace::from_origin_namespace)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if !state.is_native_projected()
+        || projection.conversation_id != conversation.conversation_id
+        || projection.origin_namespace != namespace.origin_namespace()
+        || projection.projection_catalog_revision != conversation.catalog_revision
+        || conversation.descriptor.agent_kind != namespace.agent_kind()
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let binding = super::journal::load_adapter_state_binding_evidence_for_conversation(
+        connection,
+        key_bundle,
+        database_id,
+        namespace,
+        conversation,
+    )?;
+    match (projection.state, binding) {
+        (ProjectionState::Present, Some(binding)) | (ProjectionState::Tombstone, Some(binding)) => {
+            validate_projection_binding(&projection, &binding)?;
+        }
+        (ProjectionState::Retired, None) if projection.charged_reference_bytes == 0 => {}
+        _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
+    }
+    Ok(Some(match projection.state {
+        ProjectionState::Present => NativeCatalogChange::Upsert,
+        ProjectionState::Tombstone | ProjectionState::Retired => NativeCatalogChange::Removed,
+    }))
+}
+
+fn load_existing_native_projection(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    namespace: AdapterStateNamespace,
+    reference_token: &[u8; 32],
+    private_reference: &SecretBytes,
+) -> Result<Option<ExistingNativeProjection>, RuntimeStoreError> {
+    let projection =
+        load_projection_by_reference_token(connection, key_bundle, namespace, reference_token)?;
+    let owner = super::journal::load_authenticated_adapter_state_owner_by_reference_token(
+        connection,
+        key_bundle,
+        database_id,
+        namespace,
+        reference_token,
+    )?;
+    let (projection, (conversation, stored_reference)) = match (projection, owner) {
+        (None, None) => return Ok(None),
+        (Some(projection), Some(owner)) => (projection, owner),
+        _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
+    };
+    if stored_reference.expose_secret() != private_reference.expose_secret()
+        || projection.conversation_id != conversation.conversation_id
+        || projection.origin_namespace != namespace.origin_namespace()
+        || projection.state_reference_token != *reference_token
+        || projection.projection_catalog_revision != conversation.catalog_revision
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let state = super::configuration::load_conversation_state(
+        connection,
+        key_bundle,
+        conversation.conversation_id,
+    )?;
+    if !state.is_native_projected()
+        || state.origin_namespace() != Some(namespace.origin_namespace())
+        || conversation.descriptor.agent_kind != namespace.agent_kind()
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let current_revision = state.current_revision()?;
+    if current_revision == 0 {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let configuration = super::configuration::load_authenticated_configuration_at_revision(
+        connection,
+        key_bundle,
+        database_id,
+        conversation.conversation_id,
+        current_revision,
+    )?;
+    Ok(Some(ExistingNativeProjection {
+        projection,
+        conversation,
+        configuration,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]

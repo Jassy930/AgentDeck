@@ -11,6 +11,7 @@ use agentdeck_protocol::runtime::{
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use zeroize::Zeroizing;
 
+use crate::runtime::adapter_state::AdapterStateNamespace;
 use crate::runtime::events::CommandStreamEffects;
 use crate::runtime::model::{
     ConfigurationLimitScope, ConversationRecord, IdempotencyOwner, MAX_IDEMPOTENCY_KEY_BYTES,
@@ -31,6 +32,9 @@ const CONFIGURATION_REQUEST_DOMAIN: &[u8] = b"configuration.request.v1";
 const CONFIGURATION_METADATA_DOMAIN: &[u8] = b"configuration.journal.metadata.v1";
 const CONFIGURATION_REQUEST_MAGIC: &[u8; 4] = b"ADQ1";
 const CONFIGURATION_PRIMARY_KEY_MAGIC: &[u8; 4] = b"ADP1";
+const NATIVE_PROJECTOR_AUTHOR_MAGIC: &[u8; 4] = b"ADA1";
+const NATIVE_PROJECTOR_CONFIGURATION_IDEMPOTENCY_KEY: &str =
+    "native-projector-default-configuration-v1";
 const CONFIGURATION_TABLE: &[u8] = b"configuration_journal";
 const CONFIGURATION_COLUMN: &[u8] = b"sealed_request";
 pub const MAX_CONFIGURATION_CANONICAL_BYTES: usize = 16 * 1024;
@@ -102,6 +106,12 @@ pub enum ConfigureConversationOutcome {
     Conflict { current_configuration_revision: u64 },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ConfigurationAuthorV1 {
+    Principal(IdempotencyOwner),
+    NativeProjector(AdapterStateNamespace),
+}
+
 pub(crate) struct PreparedConfigurationRequest {
     conversation_id: RuntimeId,
     expected_configuration_revision: u64,
@@ -112,6 +122,98 @@ impl PreparedConfigurationRequest {
     pub(crate) fn retained_capacity(&self) -> Result<usize, RuntimeStoreError> {
         Ok(self.request_plaintext.capacity())
     }
+}
+
+pub(super) struct PreparedNativeProjectionConfiguration {
+    namespace: AdapterStateNamespace,
+    author_bytes: Zeroizing<Vec<u8>>,
+    idempotency_key_bytes: Zeroizing<Vec<u8>>,
+    configuration_bytes: Zeroizing<Vec<u8>>,
+}
+
+impl PreparedNativeProjectionConfiguration {
+    pub(super) const fn namespace(&self) -> AdapterStateNamespace {
+        self.namespace
+    }
+
+    pub(super) fn author_bytes(&self) -> &[u8] {
+        self.author_bytes.as_ref()
+    }
+
+    pub(super) fn idempotency_key_bytes(&self) -> &[u8] {
+        self.idempotency_key_bytes.as_ref()
+    }
+
+    pub(super) fn configuration_bytes(&self) -> &[u8] {
+        self.configuration_bytes.as_ref()
+    }
+
+    #[allow(dead_code)] // C-f projector lifecycle 接线后由 production capability 计费。
+    pub(super) fn retained_capacity(&self) -> Result<usize, RuntimeStoreError> {
+        self.author_bytes
+            .capacity()
+            .checked_add(self.idempotency_key_bytes.capacity())
+            .and_then(|capacity| capacity.checked_add(self.configuration_bytes.capacity()))
+            .ok_or(RuntimeStoreError::CapacityArithmeticOverflow {
+                field: "native projection configuration retained capacity",
+            })
+    }
+}
+
+fn canonical_configuration_author_v1(author: &ConfigurationAuthorV1) -> Vec<u8> {
+    match author {
+        ConfigurationAuthorV1::Principal(owner) => super::journal::canonical_owner_v1(owner),
+        ConfigurationAuthorV1::NativeProjector(namespace) => {
+            let namespace_tag = match namespace {
+                AdapterStateNamespace::Codex => 1,
+                AdapterStateNamespace::ClaudeCode => 2,
+            };
+            let mut encoded = Vec::with_capacity(5);
+            encoded.extend_from_slice(NATIVE_PROJECTOR_AUTHOR_MAGIC);
+            encoded.push(namespace_tag);
+            encoded
+        }
+    }
+}
+
+fn decode_canonical_configuration_author_v1(
+    encoded: &[u8],
+) -> Result<ConfigurationAuthorV1, RuntimeStoreError> {
+    let author = if encoded.get(..4) == Some(b"ADO1") {
+        ConfigurationAuthorV1::Principal(super::journal::decode_canonical_owner(encoded)?)
+    } else if encoded.get(..4) == Some(NATIVE_PROJECTOR_AUTHOR_MAGIC) {
+        match encoded {
+            [b'A', b'D', b'A', b'1', 1] => {
+                ConfigurationAuthorV1::NativeProjector(AdapterStateNamespace::Codex)
+            }
+            [b'A', b'D', b'A', b'1', 2] => {
+                ConfigurationAuthorV1::NativeProjector(AdapterStateNamespace::ClaudeCode)
+            }
+            _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
+        }
+    } else {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    };
+    if canonical_configuration_author_v1(&author) != encoded {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(author)
+}
+
+fn validate_configuration_author_v1(
+    author: &ConfigurationAuthorV1,
+    idempotency_key_bytes: &[u8],
+    expected_configuration_revision: u64,
+    configuration: &ConversationConfiguration,
+) -> Result<(), RuntimeStoreError> {
+    if let ConfigurationAuthorV1::NativeProjector(namespace) = author
+        && (namespace.agent_kind() != configuration.agent_kind()
+            || expected_configuration_revision != 0
+            || idempotency_key_bytes != NATIVE_PROJECTOR_CONFIGURATION_IDEMPOTENCY_KEY.as_bytes())
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(())
 }
 
 fn append_field(message: &mut Vec<u8>, value: &[u8]) {
@@ -146,6 +248,47 @@ pub(crate) fn prepare_configuration_request(
         expected_configuration_revision,
         configuration,
     } = input;
+    prepare_configuration_request_with_author(
+        conversation_id,
+        ConfigurationAuthorV1::Principal(owner),
+        &idempotency_key,
+        expected_configuration_revision,
+        configuration,
+    )
+}
+
+#[allow(dead_code)] // C-f projector lifecycle 接线后成为 production caller。
+pub(super) fn prepare_native_projector_configuration(
+    namespace: AdapterStateNamespace,
+    configuration: ConversationConfiguration,
+) -> Result<PreparedNativeProjectionConfiguration, RuntimeStoreError> {
+    if namespace.agent_kind() != configuration.agent_kind() {
+        return Err(RuntimeStoreError::AdapterStateNamespaceMismatch);
+    }
+    let author_bytes = Zeroizing::new(canonical_configuration_author_v1(
+        &ConfigurationAuthorV1::NativeProjector(namespace),
+    ));
+    let idempotency_key_bytes = Zeroizing::new(
+        NATIVE_PROJECTOR_CONFIGURATION_IDEMPOTENCY_KEY
+            .as_bytes()
+            .to_vec(),
+    );
+    let configuration_bytes = canonical_configuration_bytes(&configuration)?;
+    Ok(PreparedNativeProjectionConfiguration {
+        namespace,
+        author_bytes,
+        idempotency_key_bytes,
+        configuration_bytes,
+    })
+}
+
+fn prepare_configuration_request_with_author(
+    conversation_id: RuntimeId,
+    author: ConfigurationAuthorV1,
+    idempotency_key: &str,
+    expected_configuration_revision: u64,
+    configuration: ConversationConfiguration,
+) -> Result<PreparedConfigurationRequest, RuntimeStoreError> {
     if conversation_id.kind() != RuntimeIdKind::Conversation {
         return Err(RuntimeStoreError::IdKindMismatch {
             expected: RuntimeIdKind::Conversation,
@@ -157,7 +300,54 @@ pub(crate) fn prepare_configuration_request(
             "idempotency key must contain 1 to 1024 UTF-8 bytes",
         ));
     }
-    let configuration_bytes = Zeroizing::new(serde_json::to_vec(&configuration).map_err(|_| {
+    let configuration_bytes = canonical_configuration_bytes(&configuration)?;
+    let author_bytes = Zeroizing::new(canonical_configuration_author_v1(&author));
+    let request_plaintext = assemble_configuration_request(
+        conversation_id,
+        author_bytes.as_ref(),
+        idempotency_key.as_bytes(),
+        expected_configuration_revision,
+        configuration_bytes.as_ref(),
+    )?;
+    Ok(PreparedConfigurationRequest {
+        conversation_id,
+        expected_configuration_revision,
+        request_plaintext,
+    })
+}
+
+fn assemble_configuration_request(
+    conversation_id: RuntimeId,
+    author_bytes: &[u8],
+    idempotency_key_bytes: &[u8],
+    expected_configuration_revision: u64,
+    configuration_bytes: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, RuntimeStoreError> {
+    let expected_revision = encode_sequence(expected_configuration_revision);
+    let mut request_plaintext = Vec::with_capacity(
+        4 + 5 * 4
+            + conversation_id.as_bytes().len()
+            + author_bytes.len()
+            + idempotency_key_bytes.len()
+            + expected_revision.len()
+            + configuration_bytes.len(),
+    );
+    request_plaintext.extend_from_slice(CONFIGURATION_REQUEST_MAGIC);
+    append_request_field(&mut request_plaintext, conversation_id.as_bytes())?;
+    append_request_field(&mut request_plaintext, author_bytes)?;
+    append_request_field(&mut request_plaintext, idempotency_key_bytes)?;
+    append_request_field(&mut request_plaintext, expected_revision.as_bytes())?;
+    append_request_field(&mut request_plaintext, configuration_bytes)?;
+    if request_plaintext.len() > MAX_CONFIGURATION_REQUEST_BYTES {
+        return Err(RuntimeStoreError::PayloadTooLarge);
+    }
+    Ok(Zeroizing::new(request_plaintext))
+}
+
+fn canonical_configuration_bytes(
+    configuration: &ConversationConfiguration,
+) -> Result<Zeroizing<Vec<u8>>, RuntimeStoreError> {
+    let configuration_bytes = Zeroizing::new(serde_json::to_vec(configuration).map_err(|_| {
         RuntimeStoreError::InvalidConfig(
             "conversation configuration must serialize as canonical JSON",
         )
@@ -167,30 +357,7 @@ pub(crate) fn prepare_configuration_request(
     {
         return Err(RuntimeStoreError::PayloadTooLarge);
     }
-    let owner_bytes = Zeroizing::new(super::journal::canonical_owner_v1(&owner));
-    let expected_revision = encode_sequence(expected_configuration_revision);
-    let mut request_plaintext = Vec::with_capacity(
-        4 + 5 * 4
-            + conversation_id.as_bytes().len()
-            + owner_bytes.len()
-            + idempotency_key.len()
-            + expected_revision.len()
-            + configuration_bytes.len(),
-    );
-    request_plaintext.extend_from_slice(CONFIGURATION_REQUEST_MAGIC);
-    append_request_field(&mut request_plaintext, conversation_id.as_bytes())?;
-    append_request_field(&mut request_plaintext, owner_bytes.as_ref())?;
-    append_request_field(&mut request_plaintext, idempotency_key.as_bytes())?;
-    append_request_field(&mut request_plaintext, expected_revision.as_bytes())?;
-    append_request_field(&mut request_plaintext, configuration_bytes.as_ref())?;
-    if request_plaintext.len() > MAX_CONFIGURATION_REQUEST_BYTES {
-        return Err(RuntimeStoreError::PayloadTooLarge);
-    }
-    Ok(PreparedConfigurationRequest {
-        conversation_id,
-        expected_configuration_revision,
-        request_plaintext: Zeroizing::new(request_plaintext),
-    })
+    Ok(configuration_bytes)
 }
 
 fn decode_configuration_request(plaintext: &[u8]) -> Result<[&[u8]; 5], RuntimeStoreError> {
@@ -659,9 +826,21 @@ fn authenticate_configuration_row(
     if expected_revision != base_revision || std::str::from_utf8(fields[2]).is_err() {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
-    let owner = super::journal::decode_canonical_owner(fields[1])?;
+    let author = decode_canonical_configuration_author_v1(fields[1])?;
     let configuration: ConversationConfiguration =
         serde_json::from_slice(fields[4]).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    validate_configuration_author_v1(&author, fields[2], expected_revision, &configuration)?;
+    if let ConfigurationAuthorV1::NativeProjector(namespace) = &author {
+        let state = load_conversation_state(connection, key_bundle, conversation_id)?;
+        if !state.is_native_projected()
+            || state.origin_namespace() != Some(namespace.origin_namespace())
+            || revision != 1
+            || base_revision != 0
+            || event_seq != 0
+        {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+    }
     let canonical = Zeroizing::new(
         serde_json::to_vec(&configuration)
             .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
@@ -700,7 +879,7 @@ fn authenticate_configuration_row(
         || idempotency_token != expected_idempotency_token
         || request_token != *expected_request_token.as_bytes()
         || metadata_token != expected_metadata_token
-        || super::journal::canonical_owner_v1(&owner) != fields[1]
+        || canonical_configuration_author_v1(&author) != fields[1]
     {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
@@ -1187,6 +1366,324 @@ fn seal_configuration_event(
     )?)
 }
 
+fn insert_fresh_native_projected_state(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    conversation_id: RuntimeId,
+    namespace: AdapterStateNamespace,
+) -> Result<AuthenticatedConversationState, RuntimeStoreError> {
+    let entry_revision = encode_sequence(0);
+    let origin_namespace = namespace.origin_namespace();
+    let metadata_token = conversation_state_metadata_token(
+        key_bundle,
+        conversation_id.as_bytes(),
+        None,
+        &entry_revision,
+        "nativeProjected",
+        Some(origin_namespace),
+        None,
+    )?;
+    if transaction.execute(
+        "INSERT INTO conversation_state (
+             conversation_id, current_configuration_revision, entry_revision,
+             origin_kind, origin_namespace, legacy_command_high_water, metadata_token
+         ) VALUES (?1, NULL, ?2, 'nativeProjected', ?3, NULL, ?4)",
+        params![
+            &conversation_id.as_bytes()[..],
+            &entry_revision,
+            origin_namespace,
+            &metadata_token[..],
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    let state = load_conversation_state(transaction, key_bundle, conversation_id)?;
+    if state.current_revision()? != 0
+        || state.entry_revision()? != 0
+        || !state.is_native_projected()
+        || state.origin_namespace() != Some(origin_namespace)
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(state)
+}
+
+/// 在 native projector 已选定并复核 fresh conversation identity 的同一事务内，
+/// 写入唯一的 default configuration rev1/event seq0。
+///
+/// 本窄入口不拥有 transaction，也不更新 runtime ledger、不 commit、不执行容量 probe
+/// 或 fault hook；调用方必须把返回的 ledger 与 conversation/projection 增量合并后统一提交。
+#[allow(clippy::too_many_arguments)]
+pub(super) fn append_initial_native_projection_configuration(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    config: &RuntimeStoreConfig,
+    conversation: &ConversationRecord,
+    prepared: &PreparedNativeProjectionConfiguration,
+    ledger: &RuntimeLedger,
+) -> Result<(ConfigurationRecord, RuntimeLedger), RuntimeStoreError> {
+    if conversation.conversation_id.kind() != RuntimeIdKind::Conversation {
+        return Err(RuntimeStoreError::IdKindMismatch {
+            expected: RuntimeIdKind::Conversation,
+            actual: conversation.conversation_id.kind(),
+        });
+    }
+    let authenticated_conversation = super::journal::load_conversation(
+        transaction,
+        key_bundle,
+        database_id,
+        conversation.conversation_id,
+    )?;
+    if authenticated_conversation != *conversation {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    if conversation.event_high_water.is_some() {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+
+    let (event_count, configuration_count, state_count): (i64, i64, i64) = transaction.query_row(
+        "SELECT
+                 (SELECT COUNT(*) FROM event_journal WHERE conversation_id = ?1),
+                 (SELECT COUNT(*) FROM configuration_journal WHERE conversation_id = ?1),
+                 (SELECT COUNT(*) FROM conversation_state WHERE conversation_id = ?1)",
+        [&conversation.conversation_id.as_bytes()[..]],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if event_count != 0 || configuration_count != 0 || state_count != 0 {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+
+    let author = decode_canonical_configuration_author_v1(prepared.author_bytes())?;
+    if author != ConfigurationAuthorV1::NativeProjector(prepared.namespace()) {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let configuration: ConversationConfiguration =
+        serde_json::from_slice(prepared.configuration_bytes())
+            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let canonical_configuration = canonical_configuration_bytes(&configuration)
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if canonical_configuration.as_slice() != prepared.configuration_bytes() {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    validate_configuration_author_v1(&author, prepared.idempotency_key_bytes(), 0, &configuration)?;
+    if prepared.namespace().agent_kind() != conversation.descriptor.agent_kind
+        || configuration.agent_kind() != conversation.descriptor.agent_kind
+    {
+        return Err(RuntimeStoreError::AdapterStateNamespaceMismatch);
+    }
+
+    let request_plaintext = assemble_configuration_request(
+        conversation.conversation_id,
+        prepared.author_bytes(),
+        prepared.idempotency_key_bytes(),
+        0,
+        prepared.configuration_bytes(),
+    )?;
+    let request_fields = decode_configuration_request(request_plaintext.as_ref())?;
+    if request_fields[0] != conversation.conversation_id.as_bytes()
+        || request_fields[1] != prepared.author_bytes()
+        || request_fields[2] != prepared.idempotency_key_bytes()
+        || request_fields[3] != encode_sequence(0).as_bytes()
+        || request_fields[4] != prepared.configuration_bytes()
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let projected_sealed_bytes = request_plaintext
+        .len()
+        .checked_add(ROW_BLOB_V1_OVERHEAD_LEN)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or(RuntimeStoreError::CapacityArithmeticOverflow {
+            field: "native projection configuration sealed request bytes",
+        })?;
+    ensure_configuration_capacity(ledger, 0, projected_sealed_bytes)?;
+
+    let mut next_ledger = ledger.clone();
+    next_ledger.event_count = next_ledger
+        .event_count
+        .checked_add(1)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    next_ledger.configuration_count = next_ledger
+        .configuration_count
+        .checked_add(1)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    next_ledger.configuration_sealed_bytes = next_ledger
+        .configuration_sealed_bytes
+        .checked_add(projected_sealed_bytes)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+
+    let base_revision = 0_u64;
+    let revision = 1_u64;
+    let base_revision_encoded = encode_sequence(base_revision);
+    let revision_encoded = encode_sequence(revision);
+    let event_seq = next_sequence(SequenceScope::EventSeq, None)?;
+    if event_seq.value != 0 || event_seq.encoded != encode_sequence(0) {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let event_id = super::journal::allocate_id(transaction, config, RuntimeIdKind::Event)?;
+    let configuration_state =
+        ConversationConfigurationState::new(revision, Some(configuration.clone())).map_err(
+            |_| RuntimeStoreError::InvalidConfig("invalid conversation configuration state"),
+        )?;
+    let event = RuntimeEvent::new(
+        ConversationId::new(conversation.conversation_id.to_canonical_string()),
+        EventId::new(event_id.to_canonical_string()),
+        event_seq.value,
+        None,
+        None,
+        None,
+        RuntimeEventBody::ConfigurationChanged {
+            state: configuration_state,
+        },
+    )
+    .map_err(|_| RuntimeStoreError::InvalidConfig("invalid configuration event identity"))?;
+    let event_payload =
+        Zeroizing::new(serde_json::to_vec(&event).map_err(|_| {
+            RuntimeStoreError::InvalidConfig("configuration event is not canonical")
+        })?);
+    if event_payload.is_empty() || event_payload.len() > MAX_RUNTIME_EVENT_BYTES {
+        return Err(RuntimeStoreError::PayloadTooLarge);
+    }
+    let sealed_event =
+        seal_configuration_event(key_bundle, database_id, event_id, event_payload.as_ref())?;
+    let owner_token = key_bundle.blind_index(CONFIGURATION_OWNER_DOMAIN, request_fields[1])?;
+    let idempotency_token = configuration_idempotency_token(
+        key_bundle,
+        conversation.conversation_id,
+        request_fields[1],
+        request_fields[2],
+    )?;
+    let request_token =
+        key_bundle.blind_index(CONFIGURATION_REQUEST_DOMAIN, request_plaintext.as_ref())?;
+    let primary_key = configuration_primary_key(
+        conversation.conversation_id,
+        &revision_encoded,
+        &idempotency_token,
+    );
+    let sealed_request = seal_configuration_request(
+        key_bundle,
+        database_id,
+        &primary_key,
+        request_plaintext.as_ref(),
+    )?;
+    if u64::try_from(sealed_request.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?
+        != projected_sealed_bytes
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let created_at_ms = conversation.updated_at_ms;
+    let created_at = i64::try_from(created_at_ms).map_err(|_| RuntimeStoreError::TimeOutOfRange)?;
+    let logical_event_bytes =
+        u64::try_from(event_payload.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    let logical_configuration_bytes = u64::try_from(prepared.configuration_bytes().len())
+        .map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    let logical_request_bytes =
+        u64::try_from(request_plaintext.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    let event_metadata_token = super::journal::event_metadata_token(
+        key_bundle,
+        conversation.conversation_id,
+        event_id,
+        event_seq.value,
+        None,
+        logical_event_bytes,
+        created_at_ms,
+    )?;
+    let configuration_metadata_token = configuration_metadata_token(
+        key_bundle,
+        conversation.conversation_id,
+        &revision_encoded,
+        &base_revision_encoded,
+        &event_seq.encoded,
+        owner_token.as_bytes(),
+        &idempotency_token,
+        request_token.as_bytes(),
+        logical_configuration_bytes,
+        logical_request_bytes,
+        projected_sealed_bytes,
+        created_at_ms,
+    )?;
+
+    let conversation_state = insert_fresh_native_projected_state(
+        transaction,
+        key_bundle,
+        conversation.conversation_id,
+        prepared.namespace(),
+    )?;
+    if transaction.execute(
+        "INSERT INTO event_journal (
+             conversation_id, event_seq, event_id, command_id,
+             logical_event_bytes, created_at_ms, metadata_token, sealed_event
+         ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7)",
+        params![
+            &conversation.conversation_id.as_bytes()[..],
+            &event_seq.encoded,
+            &event_id.as_bytes()[..],
+            i64::try_from(logical_event_bytes).map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+            created_at,
+            &event_metadata_token[..],
+            sealed_event,
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    if transaction.execute(
+        "INSERT INTO configuration_journal (
+             conversation_id, configuration_revision, base_configuration_revision,
+             event_seq, owner_token, idempotency_token, request_token,
+             logical_configuration_bytes, logical_request_bytes, created_at_ms,
+             metadata_token, sealed_request
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            &conversation.conversation_id.as_bytes()[..],
+            &revision_encoded,
+            &base_revision_encoded,
+            &event_seq.encoded,
+            &owner_token.as_bytes()[..],
+            &idempotency_token[..],
+            &request_token.as_bytes()[..],
+            i64::try_from(logical_configuration_bytes)
+                .map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+            i64::try_from(logical_request_bytes).map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+            created_at,
+            &configuration_metadata_token[..],
+            sealed_request,
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    super::journal::update_conversation_event_high_water_preserving_activity(
+        transaction,
+        conversation.conversation_id,
+        &event_seq.encoded,
+        None,
+        key_bundle,
+        database_id,
+    )?;
+    update_configuration_head(
+        transaction,
+        key_bundle,
+        conversation.conversation_id,
+        &conversation_state,
+        &revision_encoded,
+    )?;
+
+    Ok((
+        ConfigurationRecord {
+            conversation_id: conversation.conversation_id,
+            configuration_revision: revision,
+            base_configuration_revision: base_revision,
+            event_id,
+            event_seq: event_seq.value,
+            created_at_ms,
+            configuration,
+        },
+        next_ledger,
+    ))
+}
+
 pub(crate) fn configure_conversation(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
@@ -1206,11 +1703,19 @@ pub(crate) fn configure_conversation(
     {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
+    let author = decode_canonical_configuration_author_v1(request_fields[1])?;
+    let configuration: ConversationConfiguration = serde_json::from_slice(request_fields[4])
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    validate_configuration_author_v1(
+        &author,
+        request_fields[2],
+        prepared.expected_configuration_revision,
+        &configuration,
+    )?;
     let input = DecodedConfigurationInput {
         conversation_id: prepared.conversation_id,
         expected_configuration_revision: prepared.expected_configuration_revision,
-        configuration: serde_json::from_slice(request_fields[4])
-            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+        configuration,
     };
     let owner_token = state
         .key_bundle
@@ -1799,12 +2304,434 @@ pub(super) fn validate_v5_integrity(
 
 #[cfg(test)]
 mod tests {
-    use agentdeck_protocol::ClaudeCodePermissionMode;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use agentdeck_protocol::runtime::{
-        ClaudeCodeConversationConfiguration, VendorConfigurationSnapshot,
+        ClaudeCodeConversationConfiguration, CodexConversationConfiguration,
+        VendorConfigurationSnapshot,
+    };
+    use agentdeck_protocol::{
+        AgentKind, ClaudeCodePermissionMode, CodexApprovalPolicy, CodexReasoningEffort,
+        CodexSandboxMode,
     };
 
     use super::*;
+    use crate::runtime::model::{ConversationDescriptor, NewConversation};
+    use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
+
+    static NEXT_NATIVE_CONFIGURATION_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    struct NativeConfigurationTestRoot(PathBuf);
+
+    impl NativeConfigurationTestRoot {
+        fn new() -> Self {
+            let sequence = NEXT_NATIVE_CONFIGURATION_ROOT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "agentdeck-native-configuration-{}-{sequence}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir(&path).expect("create native configuration test root");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                    .expect("secure native configuration test root");
+            }
+            Self(path)
+        }
+
+        fn database(&self) -> PathBuf {
+            self.0.join("runtime.db")
+        }
+    }
+
+    impl Drop for NativeConfigurationTestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn local_owner() -> IdempotencyOwner {
+        IdempotencyOwner::Local {
+            machine_trust_domain: [0x31; 32],
+            uid: 501,
+            client_installation_id: [0x32; 16],
+        }
+    }
+
+    fn conversation_id() -> RuntimeId {
+        RuntimeId::from_bytes(RuntimeIdKind::Conversation, [0x41; 16]).expect("conversation id")
+    }
+
+    fn codex_configuration() -> ConversationConfiguration {
+        ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
+            CodexConversationConfiguration::new(
+                CodexApprovalPolicy::OnRequest,
+                CodexSandboxMode::WorkspaceWrite,
+                CodexReasoningEffort::Medium,
+            ),
+        ))
+    }
+
+    fn claude_code_configuration() -> ConversationConfiguration {
+        ConversationConfiguration::new(VendorConfigurationSnapshot::ClaudeCode(
+            ClaudeCodeConversationConfiguration::new(
+                ClaudeCodePermissionMode::Default,
+                None,
+                None,
+                None,
+            )
+            .expect("valid Claude Code configuration"),
+        ))
+    }
+
+    #[test]
+    fn principal_configuration_author_preserves_legacy_owner_bytes_exactly() {
+        let owner = local_owner();
+        let author = ConfigurationAuthorV1::Principal(owner.clone());
+        let encoded = canonical_configuration_author_v1(&author);
+
+        assert_eq!(encoded, super::super::journal::canonical_owner_v1(&owner));
+        assert_eq!(
+            decode_canonical_configuration_author_v1(&encoded).expect("decode principal author"),
+            author
+        );
+    }
+
+    #[test]
+    fn native_projector_configuration_authors_roundtrip_by_namespace() {
+        for namespace in [
+            AdapterStateNamespace::Codex,
+            AdapterStateNamespace::ClaudeCode,
+        ] {
+            let author = ConfigurationAuthorV1::NativeProjector(namespace);
+            let encoded = canonical_configuration_author_v1(&author);
+            assert_eq!(encoded.len(), 5);
+            assert_eq!(
+                decode_canonical_configuration_author_v1(&encoded)
+                    .expect("decode native projector author"),
+                author
+            );
+        }
+    }
+
+    #[test]
+    fn native_projector_configuration_author_rejects_unknown_truncated_and_trailing_bytes() {
+        let codex = canonical_configuration_author_v1(&ConfigurationAuthorV1::NativeProjector(
+            AdapterStateNamespace::Codex,
+        ));
+        let mut unknown_tag = codex.clone();
+        unknown_tag[4] = 0xff;
+        let mut trailing = codex.clone();
+        trailing.push(0);
+
+        for malformed in [&codex[..4], unknown_tag.as_slice(), trailing.as_slice()] {
+            assert!(matches!(
+                decode_canonical_configuration_author_v1(malformed),
+                Err(RuntimeStoreError::UnknownOrCorruptSchema)
+            ));
+        }
+    }
+
+    #[test]
+    fn native_projector_preparation_keeps_only_fixed_private_identity_and_configuration() {
+        let conversation_id_sentinel = [0x41; 16];
+        let raw_reference_sentinel = b"raw-native-reference-must-not-cross-configuration-boundary";
+        let prepared = prepare_native_projector_configuration(
+            AdapterStateNamespace::Codex,
+            codex_configuration(),
+        )
+        .expect("prepare native projector configuration");
+
+        assert_eq!(prepared.namespace(), AdapterStateNamespace::Codex);
+        assert_eq!(
+            decode_canonical_configuration_author_v1(prepared.author_bytes())
+                .expect("decode native projector author"),
+            ConfigurationAuthorV1::NativeProjector(AdapterStateNamespace::Codex)
+        );
+        assert_eq!(
+            prepared.idempotency_key_bytes(),
+            NATIVE_PROJECTOR_CONFIGURATION_IDEMPOTENCY_KEY.as_bytes()
+        );
+        assert_eq!(
+            serde_json::from_slice::<ConversationConfiguration>(prepared.configuration_bytes())
+                .expect("decode canonical configuration"),
+            codex_configuration()
+        );
+        let retained_fields = [
+            prepared.author_bytes(),
+            prepared.idempotency_key_bytes(),
+            prepared.configuration_bytes(),
+        ];
+        for forbidden in [
+            conversation_id_sentinel.as_slice(),
+            raw_reference_sentinel.as_slice(),
+        ] {
+            assert!(
+                retained_fields.iter().all(|field| !field
+                    .windows(forbidden.len())
+                    .any(|window| window == forbidden)),
+                "async preparation must not retain transaction-local identity or raw native refs"
+            );
+        }
+        assert!(
+            prepared
+                .retained_capacity()
+                .expect("bounded retained capacity")
+                < MAX_CONFIGURATION_REQUEST_BYTES
+        );
+    }
+
+    #[test]
+    fn native_projector_request_rejects_namespace_configuration_mismatch() {
+        for (namespace, configuration) in [
+            (AdapterStateNamespace::Codex, claude_code_configuration()),
+            (AdapterStateNamespace::ClaudeCode, codex_configuration()),
+        ] {
+            assert!(matches!(
+                prepare_native_projector_configuration(namespace, configuration),
+                Err(RuntimeStoreError::AdapterStateNamespaceMismatch)
+            ));
+        }
+    }
+
+    #[test]
+    fn ordinary_configuration_request_still_uses_principal_author_bytes() {
+        let owner = local_owner();
+        let legacy_owner_bytes = super::super::journal::canonical_owner_v1(&owner);
+        let prepared = prepare_configuration_request(ConfigureConversation {
+            conversation_id: conversation_id(),
+            owner: owner.clone(),
+            idempotency_key: "principal-configuration".to_owned(),
+            expected_configuration_revision: 0,
+            configuration: codex_configuration(),
+        })
+        .expect("prepare principal request");
+        let fields = decode_configuration_request(prepared.request_plaintext.as_ref())
+            .expect("decode prepared request");
+
+        assert_eq!(fields[1], legacy_owner_bytes);
+        assert_eq!(
+            decode_canonical_configuration_author_v1(fields[1]).expect("decode principal author"),
+            ConfigurationAuthorV1::Principal(owner)
+        );
+    }
+
+    #[test]
+    fn native_projector_transaction_appends_only_initial_configuration_and_returns_ledger_delta() {
+        let root = NativeConfigurationTestRoot::new();
+        let database = root.database();
+        let config = RuntimeStoreConfig::new(database.clone());
+        let keys = MemoryKeyStore::new();
+        let storage_kek =
+            load_or_create_storage_kek(&keys, &database).expect("create test StorageKEK");
+        let mut state = super::super::sqlite::open(&config, storage_kek)
+            .expect("open native configuration store");
+        let key_bundle = state.key_bundle.clone();
+        let database_id = state.database_id;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin native configuration transaction");
+        let ledger =
+            super::super::sqlite::load_runtime_ledger(&transaction, &key_bundle, database_id)
+                .expect("load initial ledger");
+        let descriptor = ConversationDescriptor {
+            agent_kind: AgentKind::Codex,
+            title: Some("projected native conversation".to_owned()),
+            cwd: PathBuf::from("/tmp/projected-native-conversation"),
+        };
+        let descriptor_bytes =
+            super::super::journal::canonical_conversation_descriptor(&descriptor)
+                .expect("canonical descriptor");
+        let conversation = super::super::journal::insert_conversation_row(
+            &transaction,
+            &key_bundle,
+            database_id,
+            NewConversation {
+                conversation_id: conversation_id(),
+                adapter_state_key: RuntimeId::from_bytes(RuntimeIdKind::AdapterState, [0x42; 16])
+                    .expect("adapter state id"),
+                descriptor,
+            },
+            &descriptor_bytes,
+            0,
+            1_000,
+            1_000,
+        )
+        .expect("insert fresh conversation");
+        let prepared = prepare_native_projector_configuration(
+            AdapterStateNamespace::Codex,
+            codex_configuration(),
+        )
+        .expect("prepare native configuration");
+
+        let (configuration, next_ledger) = append_initial_native_projection_configuration(
+            &transaction,
+            &key_bundle,
+            database_id,
+            &config,
+            &conversation,
+            &prepared,
+            &ledger,
+        )
+        .expect("append initial native configuration");
+
+        assert_eq!(configuration.conversation_id, conversation.conversation_id);
+        assert_eq!(configuration.configuration_revision, 1);
+        assert_eq!(configuration.base_configuration_revision, 0);
+        assert_eq!(configuration.event_seq, 0);
+        assert_eq!(configuration.created_at_ms, conversation.updated_at_ms);
+        assert_eq!(configuration.configuration, codex_configuration());
+        let mut expected_ledger = ledger.clone();
+        expected_ledger.event_count += 1;
+        expected_ledger.configuration_count += 1;
+        expected_ledger.configuration_sealed_bytes = next_ledger.configuration_sealed_bytes;
+        assert!(expected_ledger.configuration_sealed_bytes > 0);
+        assert_eq!(next_ledger, expected_ledger);
+        assert_eq!(
+            super::super::sqlite::load_runtime_ledger(&transaction, &key_bundle, database_id,)
+                .expect("primitive must leave persisted ledger untouched"),
+            ledger
+        );
+
+        let stored_conversation = super::super::journal::load_conversation(
+            &transaction,
+            &key_bundle,
+            database_id,
+            conversation.conversation_id,
+        )
+        .expect("load conversation with event head");
+        assert_eq!(stored_conversation.event_high_water, Some(0));
+        assert_eq!(
+            stored_conversation.updated_at_ms,
+            conversation.updated_at_ms
+        );
+        let stored_state =
+            load_conversation_state(&transaction, &key_bundle, conversation.conversation_id)
+                .expect("load native projected state");
+        assert_eq!(
+            stored_state.current_revision().expect("current revision"),
+            1
+        );
+        assert_eq!(stored_state.entry_revision().expect("entry revision"), 0);
+        assert!(stored_state.is_native_projected());
+        assert_eq!(
+            stored_state.origin_namespace(),
+            Some(AdapterStateNamespace::Codex.origin_namespace())
+        );
+        assert_eq!(
+            load_authenticated_configuration_at_revision(
+                &transaction,
+                &key_bundle,
+                database_id,
+                conversation.conversation_id,
+                1,
+            )
+            .expect("authenticate appended native configuration"),
+            configuration
+        );
+        assert!(
+            append_initial_native_projection_configuration(
+                &transaction,
+                &key_bundle,
+                database_id,
+                &config,
+                &conversation,
+                &prepared,
+                &ledger,
+            )
+            .is_err()
+        );
+
+        transaction
+            .rollback()
+            .expect("caller still owns and can roll back transaction");
+    }
+
+    #[test]
+    fn native_projector_transaction_rejects_capacity_before_writing_state_or_journals() {
+        let root = NativeConfigurationTestRoot::new();
+        let database = root.database();
+        let config = RuntimeStoreConfig::new(database.clone());
+        let keys = MemoryKeyStore::new();
+        let storage_kek =
+            load_or_create_storage_kek(&keys, &database).expect("create test StorageKEK");
+        let mut state = super::super::sqlite::open(&config, storage_kek)
+            .expect("open native configuration store");
+        let key_bundle = state.key_bundle.clone();
+        let database_id = state.database_id;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin native configuration transaction");
+        let descriptor = ConversationDescriptor {
+            agent_kind: AgentKind::Codex,
+            title: None,
+            cwd: PathBuf::from("/tmp/projected-native-capacity"),
+        };
+        let descriptor_bytes =
+            super::super::journal::canonical_conversation_descriptor(&descriptor)
+                .expect("canonical descriptor");
+        let conversation = super::super::journal::insert_conversation_row(
+            &transaction,
+            &key_bundle,
+            database_id,
+            NewConversation {
+                conversation_id: conversation_id(),
+                adapter_state_key: RuntimeId::from_bytes(RuntimeIdKind::AdapterState, [0x43; 16])
+                    .expect("adapter state id"),
+                descriptor,
+            },
+            &descriptor_bytes,
+            0,
+            1_000,
+            1_000,
+        )
+        .expect("insert fresh conversation");
+        let prepared = prepare_native_projector_configuration(
+            AdapterStateNamespace::Codex,
+            codex_configuration(),
+        )
+        .expect("prepare native configuration");
+        let saturated = RuntimeLedger {
+            configuration_count: MAX_CONFIGURATIONS_GLOBAL,
+            ..RuntimeLedger::default()
+        };
+
+        assert!(matches!(
+            append_initial_native_projection_configuration(
+                &transaction,
+                &key_bundle,
+                database_id,
+                &config,
+                &conversation,
+                &prepared,
+                &saturated,
+            ),
+            Err(RuntimeStoreError::ConfigurationLimit {
+                scope: ConfigurationLimitScope::GlobalCount,
+            })
+        ));
+        let physical_counts: (i64, i64, i64) = transaction
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM event_journal WHERE conversation_id = ?1),
+                     (SELECT COUNT(*) FROM configuration_journal WHERE conversation_id = ?1),
+                     (SELECT COUNT(*) FROM conversation_state WHERE conversation_id = ?1)",
+                [&conversation.conversation_id.as_bytes()[..]],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read physical native configuration counts");
+        assert_eq!(physical_counts, (0, 0, 0));
+
+        transaction
+            .rollback()
+            .expect("caller still owns and can roll back transaction");
+    }
 
     #[test]
     fn configuration_capacity_accepts_exact_limits_and_rejects_one_past_each_scope() {

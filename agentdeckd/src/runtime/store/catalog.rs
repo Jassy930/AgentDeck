@@ -288,27 +288,51 @@ pub(super) fn reconcile_catalog_journal(
         }
         let delta_created_at_ms = mutation_now_ms.unwrap_or(conversation.updated_at_ms);
         trim_now_ms = trim_now_ms.max(delta_created_at_ms);
-        let entry_revision = super::configuration::load_conversation_state(
+        let native_change = super::native_projection::authenticated_native_catalog_change(
             transaction,
             key_bundle,
-            conversation_id,
-        )?
-        .entry_revision()?;
-        let delta = CatalogDelta {
-            catalog_revision: revision_value,
-            changes: vec![CatalogChange::Upserted {
-                entry: ConversationEntry {
+            database_id,
+            &conversation,
+        )?;
+        let (change, change_kind) = match native_change {
+            Some(super::native_projection::NativeCatalogChange::Removed) => (
+                CatalogChange::Removed {
                     conversation_id: ConversationId::new(
                         conversation.conversation_id.to_canonical_string(),
                     ),
-                    agent_kind: conversation.descriptor.agent_kind,
-                    title: conversation.descriptor.title.clone(),
-                    cwd: Some(conversation.descriptor.cwd.clone()),
-                    last_active_ms: conversation.updated_at_ms,
-                    archived: conversation.lifecycle == ConversationLifecycle::Archived,
-                    entry_revision,
                 },
-            }],
+                "removed",
+            ),
+            None | Some(super::native_projection::NativeCatalogChange::Upsert) => {
+                let entry_revision = super::configuration::load_conversation_state(
+                    transaction,
+                    key_bundle,
+                    conversation_id,
+                )?
+                .entry_revision()?;
+                (
+                    CatalogChange::Upserted {
+                        entry: ConversationEntry {
+                            conversation_id: ConversationId::new(
+                                conversation.conversation_id.to_canonical_string(),
+                            ),
+                            agent_kind: conversation.descriptor.agent_kind,
+                            title: conversation.descriptor.title.clone(),
+                            cwd: native_change
+                                .is_none()
+                                .then(|| conversation.descriptor.cwd.clone()),
+                            last_active_ms: conversation.updated_at_ms,
+                            archived: conversation.lifecycle == ConversationLifecycle::Archived,
+                            entry_revision,
+                        },
+                    },
+                    "upserted",
+                )
+            }
+        };
+        let delta = CatalogDelta {
+            catalog_revision: revision_value,
+            changes: vec![change],
         };
         let plaintext =
             serde_json::to_vec(&delta).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
@@ -330,7 +354,7 @@ pub(super) fn reconcile_catalog_journal(
             key_bundle,
             &revision,
             conversation_id.as_bytes(),
-            b"upserted",
+            change_kind.as_bytes(),
             logical_bytes,
             delta_created_at_ms,
         )?;
@@ -338,10 +362,11 @@ pub(super) fn reconcile_catalog_journal(
             "INSERT INTO catalog_journal (
                  catalog_revision, conversation_id, change_kind, logical_delta_bytes,
                  created_at_ms, metadata_token, sealed_delta
-             ) VALUES (?1, ?2, 'upserted', ?3, ?4, ?5, ?6)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 &revision,
                 &conversation_id.as_bytes()[..],
+                change_kind,
                 sqlite_u64(logical_bytes)?,
                 sqlite_u64(delta_created_at_ms)?,
                 &token[..],

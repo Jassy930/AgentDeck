@@ -72,7 +72,7 @@ use super::stream::{
 };
 use super::{
     AuthenticatedConversationSnapshotContext, PreparedConversationSnapshotWrite,
-    StoreConversationSnapshotError, approval, journal, sqlite, stream,
+    StoreConversationSnapshotError, approval, journal, native_projection, sqlite, stream,
 };
 
 mod stream_pipeline;
@@ -96,6 +96,15 @@ const IDENTITY_DERIVATION_ROOT_DOMAIN: &[u8] =
     b"agentdeck.runtime.storage-kek.identity-derivation.v1";
 const CONVERSATION_ID_DOMAIN: &[u8] = b"agentdeck.runtime.conversation-id.v1";
 const ADAPTER_STATE_KEY_DOMAIN: &[u8] = b"agentdeck.runtime.adapter-state-key.v1";
+#[allow(dead_code)] // C-f projector lifecycle 接线后由 production capability 使用。
+const NATIVE_PROJECTION_CONVERSATION_ID_DOMAIN: &[u8] =
+    b"agentdeck.runtime.native-projection.conversation-id.v1";
+#[allow(dead_code)] // C-f projector lifecycle 接线后由 production capability 使用。
+const NATIVE_PROJECTION_ADAPTER_STATE_KEY_DOMAIN: &[u8] =
+    b"agentdeck.runtime.native-projection.adapter-state-key.v1";
+#[allow(dead_code)] // C-f projector lifecycle 接线后由 production capability 使用。
+const NATIVE_PROJECTION_OBSERVATION_DOMAIN: &[u8] =
+    b"agentdeck.runtime.native-projection.observation.v1";
 const MACHINE_TRUST_DOMAIN: &[u8] = b"agentdeck.runtime.machine-trust-domain.v1";
 
 type HmacSha256 = Hmac<Sha256>;
@@ -164,6 +173,98 @@ impl RuntimeIdentityDerivationCapability {
             ));
         }
         Ok(domain)
+    }
+
+    #[allow(dead_code)] // C-f verified source 接线后成为 production derivation path。
+    fn derive_native_projection_material(
+        &self,
+        namespace: AdapterStateNamespace,
+        private_reference: &[u8],
+        scan_generation: &[u8; 16],
+    ) -> Result<
+        (
+            Vec<super::native_projection::NativeProjectionIdentityCandidate>,
+            [u8; 32],
+        ),
+        RuntimeStoreError,
+    > {
+        let mut candidates = Vec::with_capacity(MAX_RUNTIME_ID_COLLISION_ATTEMPTS);
+        for attempt in 0..MAX_RUNTIME_ID_COLLISION_ATTEMPTS {
+            let attempt = u8::try_from(attempt).map_err(|_| {
+                RuntimeStoreError::InvalidConfig("native projection identity attempt overflow")
+            })?;
+            let conversation_id = self.derive_native_projection_id(
+                RuntimeIdKind::Conversation,
+                NATIVE_PROJECTION_CONVERSATION_ID_DOMAIN,
+                namespace,
+                private_reference,
+                attempt,
+            )?;
+            let adapter_state_key = self.derive_native_projection_id(
+                RuntimeIdKind::AdapterState,
+                NATIVE_PROJECTION_ADAPTER_STATE_KEY_DOMAIN,
+                namespace,
+                private_reference,
+                attempt,
+            )?;
+            if let (Some(conversation_id), Some(adapter_state_key)) =
+                (conversation_id, adapter_state_key)
+            {
+                candidates.push(
+                    super::native_projection::NativeProjectionIdentityCandidate {
+                        conversation_id,
+                        adapter_state_key,
+                    },
+                );
+            }
+        }
+        if candidates.is_empty() {
+            return Err(RuntimeIdError::CollisionExhausted {
+                kind: RuntimeIdKind::Conversation,
+                attempts: MAX_RUNTIME_ID_COLLISION_ATTEMPTS,
+            }
+            .into());
+        }
+
+        let mut mac = HmacSha256::new_from_slice(&self.key).map_err(|_| {
+            RuntimeStoreError::InvalidConfig("native projection observation is unavailable")
+        })?;
+        update_length_prefixed(&mut mac, NATIVE_PROJECTION_OBSERVATION_DOMAIN)?;
+        update_length_prefixed(&mut mac, namespace.origin_namespace().as_bytes())?;
+        update_length_prefixed(&mut mac, private_reference)?;
+        update_length_prefixed(&mut mac, scan_generation)?;
+        let mut digest = mac.finalize().into_bytes();
+        let mut observation_token = [0_u8; 32];
+        observation_token.copy_from_slice(&digest);
+        digest.zeroize();
+        Ok((candidates, observation_token))
+    }
+
+    #[allow(dead_code)] // 仅由上面的 C-f bounded pair derivation 调用。
+    fn derive_native_projection_id(
+        &self,
+        kind: RuntimeIdKind,
+        domain: &[u8],
+        namespace: AdapterStateNamespace,
+        private_reference: &[u8],
+        attempt: u8,
+    ) -> Result<Option<RuntimeId>, RuntimeStoreError> {
+        let mut mac = HmacSha256::new_from_slice(&self.key).map_err(|_| {
+            RuntimeStoreError::InvalidConfig("native projection identity is unavailable")
+        })?;
+        update_length_prefixed(&mut mac, domain)?;
+        update_length_prefixed(&mut mac, namespace.origin_namespace().as_bytes())?;
+        update_length_prefixed(&mut mac, private_reference)?;
+        mac.update(&[attempt]);
+        let mut digest = mac.finalize().into_bytes();
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        digest.zeroize();
+        match RuntimeId::from_bytes(kind, bytes) {
+            Ok(id) => Ok(Some(id)),
+            Err(RuntimeIdError::Zero { .. }) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn derive_id(
@@ -300,6 +401,28 @@ pub(crate) struct ClaudeCodeAdapterStateVault {
     store: RuntimeStoreHandle,
 }
 
+/// 固定绑定到 Claude Code namespace 的 native history projection 能力。
+///
+/// 调用方不能选择 namespace，也不能取得通用明文 vault writer；所有导入都经单个
+/// Store worker command 与一个 SQLite transaction 收口。
+#[allow(dead_code)] // C-f Core projector lifecycle 接线后持有该 capability。
+#[derive(Clone, Debug)]
+pub(crate) struct ClaudeCodeNativeProjectionStore {
+    store: RuntimeStoreHandle,
+}
+
+#[allow(dead_code)] // C-f Core projector lifecycle 接线后成为 production API。
+impl ClaudeCodeNativeProjectionStore {
+    pub(crate) async fn import(
+        &self,
+        input: native_projection::ImportNativeProjection,
+    ) -> Result<native_projection::ImportNativeProjectionOutcome, RuntimeStoreError> {
+        self.store
+            .import_native_projection(AdapterStateNamespace::ClaudeCode, input)
+            .await
+    }
+}
+
 impl ClaudeCodeAdapterStateVault {
     pub(crate) async fn bind(
         &self,
@@ -431,6 +554,24 @@ impl RuntimeStoreHandle {
         self.identity_derivation.derive_machine_trust_domain()
     }
 
+    #[cfg(test)]
+    pub(super) fn native_projection_identity_candidates_for_test(
+        &self,
+        private_reference: &[u8],
+        scan_generation: [u8; 16],
+    ) -> Result<Vec<(RuntimeId, RuntimeId)>, RuntimeStoreError> {
+        let (candidates, _observation_token) =
+            self.identity_derivation.derive_native_projection_material(
+                AdapterStateNamespace::ClaudeCode,
+                private_reference,
+                &scan_generation,
+            )?;
+        Ok(candidates
+            .into_iter()
+            .map(|candidate| (candidate.conversation_id, candidate.adapter_state_key))
+            .collect())
+    }
+
     pub(in crate::runtime) fn derive_start_identity(
         &self,
         owner: &crate::runtime::model::IdempotencyOwner,
@@ -472,6 +613,84 @@ impl RuntimeStoreHandle {
         ClaudeCodeAdapterStateVault {
             store: self.clone(),
         }
+    }
+
+    #[allow(dead_code)] // C-f Core projector lifecycle 接线后签发 capability。
+    pub(in crate::runtime) fn claude_code_native_projection_store(
+        &self,
+    ) -> ClaudeCodeNativeProjectionStore {
+        ClaudeCodeNativeProjectionStore {
+            store: self.clone(),
+        }
+    }
+
+    #[allow(dead_code)] // C-f verified source 接线后提交 normal worker command。
+    async fn import_native_projection(
+        &self,
+        namespace: AdapterStateNamespace,
+        input: native_projection::ImportNativeProjection,
+    ) -> Result<native_projection::ImportNativeProjectionOutcome, RuntimeStoreError> {
+        let native_projection::ImportNativeProjection {
+            descriptor,
+            default_configuration,
+            private_reference,
+            scan_generation,
+        } = input;
+        if descriptor.agent_kind != namespace.agent_kind() {
+            return Err(RuntimeStoreError::AdapterStateNamespaceMismatch);
+        }
+        if scan_generation == [0; 16] {
+            return Err(RuntimeStoreError::InvalidConfig(
+                "native projection scan generation must not be zero",
+            ));
+        }
+        let reference_len = private_reference.expose_secret().len();
+        if !(native_projection::MIN_NATIVE_PRIVATE_REFERENCE_BYTES
+            ..=native_projection::MAX_NATIVE_PRIVATE_REFERENCE_BYTES)
+            .contains(&reference_len)
+        {
+            return Err(RuntimeStoreError::InvalidConfig(
+                "native projection reference must contain 20 to 523 bytes",
+            ));
+        }
+
+        let descriptor_bytes = journal::canonical_conversation_descriptor(&descriptor)?;
+        validate_maximum(descriptor_bytes.len(), MAX_CONVERSATION_DESCRIPTOR_BYTES)?;
+        let default_configuration = configuration::prepare_native_projector_configuration(
+            namespace,
+            default_configuration,
+        )?;
+
+        let mut canonical_reference = Vec::new();
+        canonical_reference
+            .try_reserve_exact(reference_len)
+            .map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+        canonical_reference.extend_from_slice(private_reference.expose_secret());
+        drop(private_reference);
+        let private_reference_capacity = canonical_reference.capacity();
+        let (identity_candidates, observation_token) = self
+            .identity_derivation
+            .derive_native_projection_material(namespace, &canonical_reference, &scan_generation)?;
+        let prepared = native_projection::PreparedNativeProjectionImport {
+            descriptor,
+            descriptor_bytes,
+            default_configuration,
+            private_reference: SecretBytes::new(canonical_reference),
+            private_reference_capacity,
+            scan_generation,
+            observation_token,
+            identity_candidates,
+        };
+        let charge = memory_charge(size_of::<NormalCommand>(), &[prepared.retained_capacity()?])?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::ImportNativeProjection { prepared, reply },
+        )
+        .await?
     }
 
     pub async fn record_machine_enrollment_receipt(
@@ -1340,6 +1559,13 @@ impl AcceptCommandReply {
 }
 
 enum NormalCommand {
+    #[allow(dead_code)] // C-f projector lifecycle 接线后由 production handle 构造。
+    ImportNativeProjection {
+        prepared: native_projection::PreparedNativeProjectionImport,
+        reply: oneshot::Sender<
+            Result<native_projection::ImportNativeProjectionOutcome, RuntimeStoreError>,
+        >,
+    },
     CreateConversation {
         input: NewConversation,
         descriptor_bytes: zeroize::Zeroizing<Vec<u8>>,
@@ -1801,6 +2027,9 @@ fn handle_normal(
     } = queued;
     if state.recovery_scan.is_some() {
         match command {
+            NormalCommand::ImportNativeProjection { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
             NormalCommand::CreateConversation { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
@@ -1880,6 +2109,13 @@ fn handle_normal(
         return;
     }
     match command {
+        NormalCommand::ImportNativeProjection { prepared, reply } => {
+            let mut effects = CommandStreamEffects::default();
+            let result =
+                native_projection::import_native_projection(state, config, prepared, &mut effects);
+            let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
+            let _ = reply.send(result);
+        }
         NormalCommand::CreateConversation {
             input,
             descriptor_bytes,

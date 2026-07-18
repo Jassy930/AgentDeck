@@ -98,6 +98,135 @@ struct AuthenticatedAdapterStateBinding {
     evidence: AuthenticatedAdapterStateBindingEvidence,
 }
 
+/// 以 adapter 私有 namespace 对 exact reference 做 blind-index 派生。
+///
+/// 调用方只能得到固定 32-byte token；明文 reference 仍由 `SecretBytes` 持有，
+/// 不进入 Debug、日志或 common Runtime 类型。native projection writer 可在自己
+/// 已持有的 SQLite transaction 中用该 token 做 exact lookup/CAS。
+pub(super) fn adapter_state_reference_token(
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    namespace: AdapterStateNamespace,
+    state_reference: &SecretBytes,
+) -> Result<[u8; 32], RuntimeStoreError> {
+    if state_reference.expose_secret().is_empty()
+        || state_reference.expose_secret().len() > MAX_ADAPTER_STATE_REFERENCE_BYTES
+    {
+        return Err(RuntimeStoreError::InvalidConfig(
+            "adapter state reference must contain 1 to 4096 bytes",
+        ));
+    }
+    Ok(*key_bundle
+        .blind_index(
+            namespace.reference_token_domain(),
+            state_reference.expose_secret(),
+        )?
+        .as_bytes())
+}
+
+/// 在调用方拥有的 transaction 中插入一条 exact adapter-private binding。
+///
+/// 本函数不创建/提交 transaction，也不更新 Runtime ledger。调用方必须在成功后
+/// 把对应 namespace count 与其它同事务状态一起提升。任何既有 binding（包括相同
+/// reference）都视为 insert conflict；exact replay 应先通过 authenticated evidence
+/// lookup 收敛，避免调用方无法区分“新插入”与“只读回”。
+pub(super) fn insert_adapter_state_binding(
+    transaction: &Transaction<'_>,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    namespace: AdapterStateNamespace,
+    conversation: &ConversationRecord,
+    state_reference: &SecretBytes,
+) -> Result<AuthenticatedAdapterStateBindingEvidence, RuntimeStoreError> {
+    ensure_kind(conversation.conversation_id, RuntimeIdKind::Conversation)?;
+    ensure_kind(conversation.adapter_state_key, RuntimeIdKind::AdapterState)?;
+    let authenticated = load_conversation_for_adapter_state(
+        transaction,
+        key_bundle,
+        database_id,
+        conversation.adapter_state_key,
+    )?;
+    if authenticated != *conversation {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    ensure_adapter_state_namespace(&authenticated, namespace)?;
+    if load_authenticated_adapter_state_binding_for_conversation(
+        transaction,
+        key_bundle,
+        database_id,
+        namespace,
+        &authenticated,
+    )?
+    .is_some()
+    {
+        return Err(RuntimeStoreError::AdapterStateConflict);
+    }
+    if load_authenticated_adapter_state_binding_for_conversation(
+        transaction,
+        key_bundle,
+        database_id,
+        namespace.other(),
+        &authenticated,
+    )?
+    .is_some()
+    {
+        return Err(RuntimeStoreError::AdapterStateNamespaceMismatch);
+    }
+
+    let state_key_token = key_bundle.blind_index(
+        namespace.key_token_domain(),
+        authenticated.adapter_state_key.as_bytes(),
+    )?;
+    let state_reference_token =
+        adapter_state_reference_token(key_bundle, namespace, state_reference)?;
+    if adapter_reference_token_exists(transaction, namespace, &state_reference_token)? {
+        return Err(RuntimeStoreError::AdapterStateConflict);
+    }
+    let primary_key = adapter_state_primary_key(
+        state_key_token.as_bytes(),
+        authenticated.conversation_id.as_bytes(),
+        &state_reference_token,
+    );
+    let sealed_state_reference = seal(
+        key_bundle,
+        database_id,
+        namespace.table_bytes(),
+        &primary_key,
+        b"sealed_state_reference",
+        state_reference.expose_secret(),
+        MAX_ADAPTER_STATE_REFERENCE_BYTES,
+    )?;
+    let sealed_reference_bytes = u64::try_from(sealed_state_reference.len())
+        .map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    let sql = match namespace {
+        AdapterStateNamespace::Codex => {
+            "INSERT INTO codex_adapter_state (
+                 state_key_token, conversation_id, state_reference_token, sealed_state_reference
+             ) VALUES (?1, ?2, ?3, ?4)"
+        }
+        AdapterStateNamespace::ClaudeCode => {
+            "INSERT INTO claude_code_adapter_state (
+                 state_key_token, conversation_id, state_reference_token, sealed_state_reference
+             ) VALUES (?1, ?2, ?3, ?4)"
+        }
+    };
+    if transaction.execute(
+        sql,
+        params![
+            &state_key_token.as_bytes()[..],
+            &authenticated.conversation_id.as_bytes()[..],
+            &state_reference_token[..],
+            sealed_state_reference,
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    Ok(AuthenticatedAdapterStateBindingEvidence {
+        reference_token: state_reference_token,
+        sealed_reference_bytes,
+    })
+}
+
 pub(super) fn bind_adapter_state(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
@@ -198,49 +327,13 @@ pub(super) fn bind_adapter_state(
         return Err(RuntimeStoreError::AdapterStateNamespaceMismatch);
     }
 
-    let state_key_token =
-        key_bundle.blind_index(namespace.key_token_domain(), adapter_state_key.as_bytes())?;
-    let state_reference_token = key_bundle.blind_index(
-        namespace.reference_token_domain(),
-        state_reference.expose_secret(),
-    )?;
-    if adapter_reference_token_exists(&transaction, namespace, state_reference_token.as_bytes())? {
-        return Err(RuntimeStoreError::AdapterStateConflict);
-    }
-    let primary_key = adapter_state_primary_key(
-        state_key_token.as_bytes(),
-        conversation.conversation_id.as_bytes(),
-        state_reference_token.as_bytes(),
-    );
-    let sealed_state_reference = seal(
+    let _binding = insert_adapter_state_binding(
+        &transaction,
         key_bundle,
         database_id,
-        namespace.table_bytes(),
-        &primary_key,
-        b"sealed_state_reference",
-        state_reference.expose_secret(),
-        MAX_ADAPTER_STATE_REFERENCE_BYTES,
-    )?;
-    let sql = match namespace {
-        AdapterStateNamespace::Codex => {
-            "INSERT INTO codex_adapter_state (
-                 state_key_token, conversation_id, state_reference_token, sealed_state_reference
-             ) VALUES (?1, ?2, ?3, ?4)"
-        }
-        AdapterStateNamespace::ClaudeCode => {
-            "INSERT INTO claude_code_adapter_state (
-                 state_key_token, conversation_id, state_reference_token, sealed_state_reference
-             ) VALUES (?1, ?2, ?3, ?4)"
-        }
-    };
-    transaction.execute(
-        sql,
-        params![
-            &state_key_token.as_bytes()[..],
-            &conversation.conversation_id.as_bytes()[..],
-            &state_reference_token.as_bytes()[..],
-            sealed_state_reference,
-        ],
+        namespace,
+        &conversation,
+        &state_reference,
     )?;
     let ledger = sqlite::load_runtime_ledger(&transaction, key_bundle, database_id)?;
     let mut next_ledger = ledger.clone();
@@ -323,12 +416,12 @@ fn ensure_adapter_state_namespace(
     Ok(())
 }
 
-fn load_conversation_for_adapter_state(
+fn load_optional_conversation_for_adapter_state(
     connection: &Connection,
     key_bundle: &super::cipher::RuntimeKeyBundle,
     database_id: [u8; 16],
     adapter_state_key: RuntimeId,
-) -> Result<ConversationRecord, RuntimeStoreError> {
+) -> Result<Option<ConversationRecord>, RuntimeStoreError> {
     let raw: Option<Vec<u8>> = connection
         .query_row(
             "SELECT conversation_id FROM conversations WHERE adapter_state_key = ?1",
@@ -336,15 +429,57 @@ fn load_conversation_for_adapter_state(
             |row| row.get(0),
         )
         .optional()?;
-    let conversation_id = raw
+    let Some(conversation_id) = raw
         .map(|value| runtime_id(RuntimeIdKind::Conversation, value))
         .transpose()?
-        .ok_or(RuntimeStoreError::ConversationNotFound)?;
+    else {
+        return Ok(None);
+    };
     let conversation = load_conversation(connection, key_bundle, database_id, conversation_id)?;
     if conversation.adapter_state_key != adapter_state_key {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
-    Ok(conversation)
+    Ok(Some(conversation))
+}
+
+fn load_conversation_for_adapter_state(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    adapter_state_key: RuntimeId,
+) -> Result<ConversationRecord, RuntimeStoreError> {
+    load_optional_conversation_for_adapter_state(
+        connection,
+        key_bundle,
+        database_id,
+        adapter_state_key,
+    )?
+    .ok_or(RuntimeStoreError::ConversationNotFound)
+}
+
+/// 在调用方 transaction 的同一 SQLite snapshot 内认证一对派生 identity 是否已占用。
+///
+/// 两条索引都只用于定位候选 owner；任一 raw row 命中后仍必须完整打开 conversation
+/// metadata MAC 与 descriptor AEAD。这样 16-attempt collision loop 不会把离线损坏行
+/// 当作普通碰撞静默跳过。
+pub(super) fn conversation_identity_pair_is_occupied(
+    transaction: &Transaction<'_>,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    conversation_id: RuntimeId,
+    adapter_state_key: RuntimeId,
+) -> Result<bool, RuntimeStoreError> {
+    ensure_kind(conversation_id, RuntimeIdKind::Conversation)?;
+    ensure_kind(adapter_state_key, RuntimeIdKind::AdapterState)?;
+    let conversation_owner =
+        load_optional_conversation(transaction, key_bundle, database_id, conversation_id)?;
+    let adapter_owner = load_optional_conversation_for_adapter_state(
+        transaction,
+        key_bundle,
+        database_id,
+        adapter_state_key,
+    )?;
+    Ok(conversation_owner.is_some() || adapter_owner.is_some())
 }
 
 fn load_authenticated_adapter_state_binding_for_conversation(
@@ -471,7 +606,62 @@ pub(super) fn load_adapter_state_binding_evidence_for_conversation(
     .map(|binding| binding.evidence))
 }
 
-fn adapter_reference_token_exists(
+/// 通过 namespace-private blind token 定位并认证 exact binding owner。
+///
+/// token 只用于索引候选行；命中后仍完整认证 conversation row、descriptor、state-key
+/// binding、reference AEAD 与由解封明文重算的 reference token。返回的 `SecretBytes`
+/// 让 projector 在同一 transaction snapshot 中做 exact byte comparison，避免把 HMAC
+/// token 相等本身当作 raw private reference 相等。
+pub(super) fn load_authenticated_adapter_state_owner_by_reference_token(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    namespace: AdapterStateNamespace,
+    reference_token: &[u8; 32],
+) -> Result<Option<(ConversationRecord, SecretBytes)>, RuntimeStoreError> {
+    let sql = match namespace {
+        AdapterStateNamespace::Codex => {
+            "SELECT conversation_id FROM codex_adapter_state WHERE state_reference_token = ?1"
+        }
+        AdapterStateNamespace::ClaudeCode => {
+            "SELECT conversation_id FROM claude_code_adapter_state WHERE state_reference_token = ?1"
+        }
+    };
+    let raw_conversation_id: Option<Vec<u8>> = connection
+        .query_row(sql, [&reference_token[..]], |row| row.get(0))
+        .optional()?;
+    let Some(raw_conversation_id) = raw_conversation_id else {
+        return Ok(None);
+    };
+    let conversation_id = runtime_id(RuntimeIdKind::Conversation, raw_conversation_id)?;
+    let conversation = load_conversation(connection, key_bundle, database_id, conversation_id)?;
+    ensure_adapter_state_namespace(&conversation, namespace)?;
+    let binding = load_authenticated_adapter_state_binding_for_conversation(
+        connection,
+        key_bundle,
+        database_id,
+        namespace,
+        &conversation,
+    )?
+    .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if binding.evidence.reference_token() != reference_token {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    if load_authenticated_adapter_state_binding_for_conversation(
+        connection,
+        key_bundle,
+        database_id,
+        namespace.other(),
+        &conversation,
+    )?
+    .is_some()
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(Some((conversation, binding.reference)))
+}
+
+pub(super) fn adapter_reference_token_exists(
     connection: &Connection,
     namespace: AdapterStateNamespace,
     token: &[u8; 32],
@@ -540,6 +730,91 @@ pub(crate) struct CommandLedgerSummary {
     started_count: u64,
 }
 
+/// 在调用方拥有的 transaction 中插入一条 fresh conversation row。
+///
+/// 本函数只负责 `conversations` 的 canonical descriptor seal、row MAC 与 INSERT；
+/// 不创建/提交 transaction，不写 `conversation_state`，也不推进 Runtime ledger。
+/// ID 碰撞、catalog revision 分配与容量准入仍由事务 owner 在调用前完成。
+#[allow(clippy::too_many_arguments)]
+pub(super) fn insert_conversation_row(
+    transaction: &Transaction<'_>,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    input: NewConversation,
+    descriptor_bytes: &[u8],
+    catalog_revision: u64,
+    created_at_ms: u64,
+    updated_at_ms: u64,
+) -> Result<ConversationRecord, RuntimeStoreError> {
+    ensure_kind(input.conversation_id, RuntimeIdKind::Conversation)?;
+    ensure_kind(input.adapter_state_key, RuntimeIdKind::AdapterState)?;
+    validate_payload_len(descriptor_bytes.len(), MAX_CONVERSATION_DESCRIPTOR_BYTES)?;
+    if updated_at_ms < created_at_ms {
+        return Err(RuntimeStoreError::InvalidConfig(
+            "conversation updated time must not precede its creation time",
+        ));
+    }
+    let canonical = canonical_conversation_descriptor(&input.descriptor)?;
+    if canonical.as_slice() != descriptor_bytes {
+        return Err(RuntimeStoreError::InvalidConfig(
+            "conversation descriptor bytes do not match the canonical descriptor",
+        ));
+    }
+    let metadata_token = conversation_metadata_token(
+        key_bundle,
+        input.conversation_id,
+        input.adapter_state_key,
+        catalog_revision,
+        None,
+        None,
+        0,
+        ConversationLifecycle::Active,
+        created_at_ms,
+        updated_at_ms,
+    )?;
+    let sealed_descriptor = seal(
+        key_bundle,
+        database_id,
+        b"conversations",
+        input.conversation_id.as_bytes(),
+        b"sealed_descriptor",
+        descriptor_bytes,
+        MAX_CONVERSATION_DESCRIPTOR_BYTES,
+    )?;
+    if transaction.execute(
+        "INSERT INTO conversations (
+             conversation_id, adapter_state_key, catalog_revision,
+             command_high_water, event_high_water, lifecycle,
+             created_at_ms, updated_at_ms, accepted_count, metadata_token,
+             sealed_descriptor
+         ) VALUES (?1, ?2, ?3, NULL, NULL, 'active', ?4, ?5, 0, ?6, ?7)",
+        params![
+            &input.conversation_id.as_bytes()[..],
+            &input.adapter_state_key.as_bytes()[..],
+            encode_sequence(catalog_revision),
+            sqlite_time(created_at_ms)?,
+            sqlite_time(updated_at_ms)?,
+            &metadata_token[..],
+            sealed_descriptor,
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    Ok(ConversationRecord {
+        conversation_id: input.conversation_id,
+        adapter_state_key: input.adapter_state_key,
+        catalog_revision,
+        command_high_water: None,
+        event_high_water: None,
+        accepted_command_count: 0,
+        lifecycle: ConversationLifecycle::Active,
+        created_at_ms,
+        updated_at_ms,
+        descriptor: input.descriptor,
+    })
+}
+
 pub(crate) fn create_conversation(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
@@ -590,7 +865,6 @@ pub(crate) fn create_conversation(
             observed_ms: created_at_ms,
         });
     }
-    let created_at = sqlite_time(created_at_ms)?;
     let projected_write_bytes =
         projected_write_bytes(&[descriptor_bytes.len(), descriptor_bytes.len(), 4 * 1024])?;
     sqlite::admit_ordinary_write(
@@ -639,47 +913,20 @@ pub(crate) fn create_conversation(
         SequenceScope::CatalogRevision,
         ledger.catalog_high_water.as_deref(),
     )?;
-    let metadata_token = conversation_metadata_token(
-        key_bundle,
-        input.conversation_id,
-        input.adapter_state_key,
-        revision.value,
-        None,
-        None,
-        0,
-        ConversationLifecycle::Active,
-        created_at_ms,
-        created_at_ms,
-    )?;
-    let sealed_descriptor = seal(
+    let conversation = insert_conversation_row(
+        &transaction,
         key_bundle,
         database_id,
-        b"conversations",
-        input.conversation_id.as_bytes(),
-        b"sealed_descriptor",
+        input,
         descriptor_bytes.as_ref(),
-        MAX_CONVERSATION_DESCRIPTOR_BYTES,
-    )?;
-    transaction.execute(
-        "INSERT INTO conversations (
-             conversation_id, adapter_state_key, catalog_revision,
-             command_high_water, event_high_water, lifecycle,
-             created_at_ms, updated_at_ms, accepted_count, metadata_token,
-             sealed_descriptor
-         ) VALUES (?1, ?2, ?3, NULL, NULL, 'active', ?4, ?4, 0, ?5, ?6)",
-        params![
-            &input.conversation_id.as_bytes()[..],
-            &input.adapter_state_key.as_bytes()[..],
-            revision.encoded,
-            created_at,
-            &metadata_token[..],
-            sealed_descriptor,
-        ],
+        revision.value,
+        created_at_ms,
+        created_at_ms,
     )?;
     super::configuration::insert_fresh_managed_state(
         &transaction,
         key_bundle,
-        input.conversation_id.as_bytes(),
+        conversation.conversation_id.as_bytes(),
     )?;
     let mut next_ledger = ledger.clone();
     next_ledger.catalog_high_water = Some(revision.encoded.clone());
@@ -709,20 +956,7 @@ pub(crate) fn create_conversation(
         RuntimeStoreOperation::CreateConversationAfterCommit,
         RuntimeCommitOperation::CreateConversation,
     )?;
-    Ok(CreateConversationOutcome::Created {
-        conversation: ConversationRecord {
-            conversation_id: input.conversation_id,
-            adapter_state_key: input.adapter_state_key,
-            catalog_revision: revision.value,
-            command_high_water: None,
-            event_high_water: None,
-            accepted_command_count: 0,
-            lifecycle: ConversationLifecycle::Active,
-            created_at_ms,
-            updated_at_ms: created_at_ms,
-            descriptor: input.descriptor,
-        },
-    })
+    Ok(CreateConversationOutcome::Created { conversation })
 }
 
 /// 威胁场景：daemon 已确认某个旧 execution 无法安全 fencing，却在仅内存阻断后再次

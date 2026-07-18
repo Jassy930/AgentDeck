@@ -12,6 +12,8 @@ pub mod identity;
 mod journal;
 mod metadata;
 mod native_projection;
+#[cfg(test)]
+mod native_projection_import_tests;
 mod persisted_event;
 mod publication;
 pub mod queue;
@@ -51,6 +53,8 @@ pub use identity::{RuntimeId, RuntimeIdKind, RuntimeIdSource};
 pub use metadata::{
     MetadataMutationRecord, UpdateConversationMetadataOutcome, UpdateManagedConversationMetadata,
 };
+#[cfg(test)]
+pub(crate) use native_projection::{ImportNativeProjection, ImportNativeProjectionOutcome};
 pub use publication::{
     FreezePublicationRequest, FrozenPublication, PublicationAcknowledgement, PublicationBarrierCut,
     PublicationPayloadKind, PublicationScope, PublicationStreamRecord, PublicationStreamState,

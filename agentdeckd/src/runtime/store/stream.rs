@@ -479,16 +479,8 @@ pub(super) fn reconcile_event_stream_with_trim_clock(
         }
     }
     drop(statement);
-    for (conversation_id, high_water) in missing_retention {
-        insert_or_replace_retention(
-            transaction,
-            key_bundle,
-            &conversation_id,
-            high_water.as_deref(),
-            None,
-            0,
-            0,
-        )?;
+    for (conversation_id, _high_water) in missing_retention {
+        insert_or_replace_retention(transaction, key_bundle, &conversation_id, None, None, 0, 0)?;
     }
 
     if event_delta == 0 {
