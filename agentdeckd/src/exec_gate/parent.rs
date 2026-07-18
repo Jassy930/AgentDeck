@@ -499,7 +499,11 @@ mod tests {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
 
-    use agentdeck_protocol::runtime::PromptPayload;
+    use agentdeck_protocol::runtime::{
+        CodexConversationConfiguration, ConversationConfiguration, PromptPayload,
+        VendorConfigurationSnapshot,
+    };
+    use agentdeck_protocol::{CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode};
 
     use crate::agent::{
         AdapterStateHandle, AgentTurnContractError, AgentTurnRequest, ExecSpec,
@@ -516,6 +520,16 @@ mod tests {
         std::path::PathBuf::from(OsString::from_vec(bytes))
     }
 
+    fn execution_configuration() -> ConversationConfiguration {
+        ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
+            CodexConversationConfiguration::new(
+                CodexApprovalPolicy::Never,
+                CodexSandboxMode::ReadOnly,
+                CodexReasoningEffort::High,
+            ),
+        ))
+    }
+
     #[tokio::test]
     async fn tokio_spawn_and_later_failures_never_claim_no_surviving_child() {
         // 威胁场景：缺失 gate binary 通常在 std spawn 阶段失败，但 Tokio 的公开 Err
@@ -528,6 +542,8 @@ mod tests {
             .unwrap(),
             "/tmp",
             PromptPayload::new("spawn disposition").unwrap(),
+            3,
+            execution_configuration(),
         )
         .unwrap();
         let spec = ExecSpec::new(
@@ -582,6 +598,8 @@ mod tests {
             execution_id,
             "/tmp",
             PromptPayload::new("exact parent encoder").unwrap(),
+            3,
+            execution_configuration(),
         )
         .unwrap();
         let adapter_state = AdapterStateHandle::new(

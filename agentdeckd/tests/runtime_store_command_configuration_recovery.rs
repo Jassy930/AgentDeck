@@ -14,6 +14,7 @@ use agentdeckd::runtime::store::{
     AcceptCommand, AcceptOutcome, CommandReceiptSelector, ConfigureConversation,
     ConfigureConversationOutcome, IdempotencyOwner, NewConversation, QueryCommandReceipt,
     RuntimeId, RuntimeIdKind, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreHandle,
+    StartCommand, StartOutcome,
 };
 use agentdeckd::security::{
     KeyStore, MemoryKeyStore, STORAGE_KEK_ACCOUNT, SecretBytes, load_or_create_storage_kek,
@@ -265,6 +266,143 @@ async fn production_writer_reopen_query_and_recovery_preserve_revision_one_pin()
         .shutdown()
         .await
         .expect("shutdown reopened recovery evidence store");
+}
+
+#[tokio::test]
+async fn started_and_replayed_command_load_exact_historical_configuration_after_head_advance() {
+    // B3b RED：command 在 rev1 接收后，head 即使推进到 rev2，Started、同进程
+    // replay 与 shutdown/reopen replay 都必须返回完整认证后的 rev1 配置，不能偷读 head。
+    let root = TestRoot::new("start-exact-historical-configuration");
+    let database = root.database();
+    let keys = MemoryKeyStore::new();
+    let config = RuntimeStoreConfig::new(database.clone());
+    let store = RuntimeStoreHandle::open(
+        config.clone(),
+        load_or_create_storage_kek(&keys, &database).expect("create exact execution KEK"),
+    )
+    .await
+    .expect("open exact execution store");
+    let conversation_id = runtime_id(RuntimeIdKind::Conversation, 0x51);
+    store
+        .create_conversation(NewConversation {
+            conversation_id,
+            adapter_state_key: runtime_id(RuntimeIdKind::AdapterState, 0x52),
+            descriptor: runtime_descriptor::descriptor(b"exact-execution-configuration"),
+        })
+        .await
+        .expect("create exact execution conversation");
+    assert_eq!(
+        configure(
+            &store,
+            conversation_id,
+            0x53,
+            "exact-execution-revision-one",
+            0,
+            CodexReasoningEffort::Low,
+        )
+        .await,
+        1
+    );
+    let command = match store
+        .accept_command(AcceptCommand {
+            conversation_id,
+            owner: owner(0x54),
+            idempotency_key: "exact-execution-command".to_owned(),
+            expected_configuration_revision: 1,
+            payload: b"execute-with-revision-one".to_vec(),
+        })
+        .await
+        .expect("accept exact execution command")
+    {
+        AcceptOutcome::Accepted { command, .. } => command,
+        other => panic!("fresh exact execution command must not replay: {other:?}"),
+    };
+    assert_eq!(
+        configure(
+            &store,
+            conversation_id,
+            0x55,
+            "exact-execution-revision-two",
+            1,
+            CodexReasoningEffort::High,
+        )
+        .await,
+        2
+    );
+
+    let start = StartCommand {
+        conversation_id,
+        command_id: command.command_id,
+        daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 0x56),
+        execution_nonce: b"exact-execution-nonce".to_vec(),
+    };
+    let assert_revision_one = |outcome: StartOutcome, expected_status: &str| match outcome {
+        StartOutcome::Started {
+            execution_configuration,
+            ..
+        } if expected_status == "started" => {
+            assert_eq!(execution_configuration.configuration_revision(), 1);
+            let configuration = execution_configuration
+                .configuration()
+                .expect("revision one must carry exact configuration");
+            let VendorConfigurationSnapshot::Codex(configuration) = configuration.vendor_control()
+            else {
+                panic!("Codex conversation must return Codex execution configuration");
+            };
+            assert_eq!(configuration.reasoning_effort(), CodexReasoningEffort::Low);
+        }
+        StartOutcome::Replayed {
+            execution_configuration,
+            ..
+        } if expected_status == "replayed" => {
+            assert_eq!(execution_configuration.configuration_revision(), 1);
+            let configuration = execution_configuration
+                .configuration()
+                .expect("revision one replay must carry exact configuration");
+            let VendorConfigurationSnapshot::Codex(configuration) = configuration.vendor_control()
+            else {
+                panic!("Codex replay must return Codex execution configuration");
+            };
+            assert_eq!(configuration.reasoning_effort(), CodexReasoningEffort::Low);
+        }
+        other => panic!("unexpected {expected_status} exact execution outcome: {other:?}"),
+    };
+    assert_revision_one(
+        store
+            .mark_started_with_event(start.clone())
+            .await
+            .expect("start exact historical configuration command"),
+        "started",
+    );
+    assert_revision_one(
+        store
+            .mark_started_with_event(start.clone())
+            .await
+            .expect("replay exact historical configuration command"),
+        "replayed",
+    );
+    store
+        .shutdown()
+        .await
+        .expect("shutdown exact execution store");
+
+    let reopened = RuntimeStoreHandle::open(
+        config,
+        load_or_create_storage_kek(&keys, &database).expect("reload exact execution KEK"),
+    )
+    .await
+    .expect("reopen exact execution store");
+    assert_revision_one(
+        reopened
+            .mark_started_with_event(start)
+            .await
+            .expect("replay exact historical configuration after reopen"),
+        "replayed",
+    );
+    reopened
+        .shutdown()
+        .await
+        .expect("shutdown reopened exact execution store");
 }
 
 #[tokio::test]

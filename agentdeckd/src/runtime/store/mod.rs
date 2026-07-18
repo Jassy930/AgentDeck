@@ -27,9 +27,9 @@ use crate::runtime::events::SnapshotBuildPinCleanup;
 
 pub use crate::runtime::model::{
     AcceptCommand, AcceptOutcome, AcceptedTerminationReason, AuthorizeExecutionRelease,
-    CommandReceiptRecord, CommandReceiptSelector, CommandRecord, CommandState, CommandTerminal,
-    CompleteCommand, CompleteOutcome, ConfigurationLimitScope, ConversationDescriptor,
-    ConversationLifecycle, ConversationRecord, ConversationRecoveryRecord,
+    CommandExecutionConfiguration, CommandReceiptRecord, CommandReceiptSelector, CommandRecord,
+    CommandState, CommandTerminal, CompleteCommand, CompleteOutcome, ConfigurationLimitScope,
+    ConversationDescriptor, ConversationLifecycle, ConversationRecord, ConversationRecoveryRecord,
     CreateConversationOutcome, EventRecord, ExecutionFence, ExecutionFenceRecord,
     ExecutionIntentRecord, IdempotencyOwner, MAX_CONVERSATION_DESCRIPTOR_BYTES,
     MAX_RECOVERY_PAGE_RETAINED_BYTES, MAX_RUNTIME_CONVERSATIONS, MachineEnrollmentReceiptRecord,

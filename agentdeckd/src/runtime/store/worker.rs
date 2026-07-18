@@ -48,6 +48,7 @@ use crate::runtime::snapshot::SharedSnapshotBuildPermit;
 use crate::security::{SecretBytes, StorageKek};
 
 use super::cipher::RuntimeReadCryptoCapability;
+use super::command_configuration::CommandStartProvenance;
 use super::command_event::StartEventSource;
 use super::configuration::{
     self, ConfigureConversation, ConfigureConversationOutcome, PreparedConfigurationRequest,
@@ -1313,6 +1314,7 @@ enum NormalCommand {
     StartCommand {
         input: StartCommand,
         event_source: StartEventSource,
+        start_provenance: CommandStartProvenance,
         reply: oneshot::Sender<Result<StartOutcome, RuntimeStoreError>>,
     },
     AppendExecutionEvent {
@@ -1854,11 +1856,18 @@ fn handle_normal(
         NormalCommand::StartCommand {
             input,
             event_source,
+            start_provenance,
             reply,
         } => {
             let mut effects = CommandStreamEffects::default();
-            let result =
-                journal::mark_started_with_event(state, config, input, event_source, &mut effects);
+            let result = journal::mark_started_with_event(
+                state,
+                config,
+                input,
+                event_source,
+                start_provenance,
+                &mut effects,
+            );
             let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
             let _ = reply.send(result);
         }

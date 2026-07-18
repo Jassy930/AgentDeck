@@ -1,6 +1,7 @@
 use agentdeck_protocol::{
-    ActionDecision, ActionDecisionKind, ActionRequest, AgentItem, ServerEvent, SessionId,
-    ShellStatus, ThreadId, TurnSummary,
+    ActionDecision, ActionDecisionKind, ActionRequest, ActionRequestVendor, AgentItem,
+    CodexApprovalPolicy, CodexSandboxMode, ServerEvent, SessionId, ShellStatus, ThreadId,
+    TurnSummary,
 };
 use serde_json::json;
 
@@ -10,6 +11,33 @@ use super::runtime_translate::{
 };
 use super::translate::CodexTranslator;
 use crate::agent::AdapterEvent;
+
+#[test]
+fn approval_metadata_uses_the_frozen_execution_configuration() {
+    let mut translator = CodexRuntimeTranslator::with_configuration(
+        CodexApprovalPolicy::Always,
+        CodexSandboxMode::ReadOnly,
+    );
+    let outputs = translator
+        .translate_value(&json!({
+            "id": "frozen-config-rpc",
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "approvalId": "frozen-config-approval",
+                "command": "pwd"
+            }
+        }))
+        .expect("modeled approval with frozen configuration");
+    let request = approval_output(&outputs[0]);
+    assert!(matches!(
+        request.vendor,
+        ActionRequestVendor::Codex {
+            approval_policy_at_decision: CodexApprovalPolicy::Always,
+            sandbox_at_decision: CodexSandboxMode::ReadOnly,
+            ..
+        }
+    ));
+}
 
 #[test]
 fn recorded_turn_uses_only_neutral_item_keys_and_typed_items() {

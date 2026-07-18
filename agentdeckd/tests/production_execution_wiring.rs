@@ -60,6 +60,7 @@ fn runtime_core_recovery_drives_current_binary_gate_typed_driver_and_durable_ter
     assert_eq!(evidence["durableItemCountAfterReopen"], 1);
     assert_eq!(evidence["durableTerminalCountAfterReopen"], 1);
     assert_eq!(evidence["vendorPromptMatched"], true);
+    assert_eq!(evidence["adapterObservedPinnedConfiguration"], true);
     assert_eq!(evidence["adapterObservedDurableAck"], true);
 }
 
@@ -86,5 +87,6 @@ fn runtime_core_cancel_reaps_current_binary_gate_before_release_without_vendor_s
     assert_eq!(evidence["durableItemCountAfterReopen"], 0);
     assert_eq!(evidence["durableTerminalCountAfterReopen"], 1);
     assert_eq!(evidence["vendorPromptMatched"], false);
+    assert_eq!(evidence["adapterObservedPinnedConfiguration"], true);
     assert_eq!(evidence["adapterObservedDurableAck"], false);
 }

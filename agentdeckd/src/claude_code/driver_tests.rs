@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use agentdeck_protocol::runtime::PromptPayload;
+use agentdeck_protocol::runtime::{
+    ClaudeCodeConversationConfiguration, ConversationConfiguration, PromptPayload,
+    VendorConfigurationSnapshot,
+};
 use agentdeck_protocol::{
     ActionDecision, ActionDecisionKind, ActionKind, ActionRequest, ActionRequestVendor, AgentKind,
     CapabilityId, ClaudeCodePermissionMode, ThreadId,
@@ -20,6 +23,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 use super::ClaudeCodeAdapter;
+use super::adapter::typed_execution_args;
 use super::driver::{
     ClaudeCodeBoundApprovalDelivery, ClaudeCodePreparedTurn, SharedClaudeCodeStdin,
 };
@@ -40,6 +44,80 @@ use crate::runtime::store::{
 use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
 
 static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
+
+#[test]
+fn frozen_configuration_maps_identically_to_fresh_and_resume_argv() {
+    let configuration = claude_code_configuration_snapshot();
+    let VendorConfigurationSnapshot::ClaudeCode(configuration) = configuration.vendor_control()
+    else {
+        panic!("fixture must be Claude Code configuration")
+    };
+    let session = ThreadId("frozen-native-session".to_owned());
+
+    let fresh = typed_execution_args(configuration, &session, false);
+    assert_eq!(
+        fresh,
+        [
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--permission-prompt-tool",
+            "stdio",
+            "--verbose",
+            "--permission-mode",
+            "plan",
+            "--model",
+            "opus",
+            "--effort",
+            "high",
+            "--output-style",
+            "concise",
+            "--session-id",
+            "frozen-native-session",
+        ]
+        .map(OsString::from)
+    );
+    assert_eq!(flag_value(&fresh, "--permission-mode"), "plan");
+    assert_eq!(flag_value(&fresh, "--model"), "opus");
+    assert_eq!(flag_value(&fresh, "--effort"), "high");
+    assert_eq!(flag_value(&fresh, "--output-style"), "concise");
+    assert_eq!(flag_value(&fresh, "--session-id"), "frozen-native-session");
+    assert!(!fresh.iter().any(|argument| argument == "--resume"));
+
+    let resume = typed_execution_args(configuration, &session, true);
+    assert_eq!(
+        resume,
+        [
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--permission-prompt-tool",
+            "stdio",
+            "--verbose",
+            "--permission-mode",
+            "plan",
+            "--model",
+            "opus",
+            "--effort",
+            "high",
+            "--output-style",
+            "concise",
+            "--resume",
+            "frozen-native-session",
+        ]
+        .map(OsString::from)
+    );
+    assert_eq!(flag_value(&resume, "--permission-mode"), "plan");
+    assert_eq!(flag_value(&resume, "--model"), "opus");
+    assert_eq!(flag_value(&resume, "--effort"), "high");
+    assert_eq!(flag_value(&resume, "--output-style"), "concise");
+    assert_eq!(flag_value(&resume, "--resume"), "frozen-native-session");
+    assert!(!resume.iter().any(|argument| argument == "--session-id"));
+}
 
 struct TestStore {
     root: PathBuf,
@@ -240,6 +318,10 @@ async fn typed_prepare_reuses_unmaterialized_session_id_without_spawning_preflig
         flag_value(&first_args, "--permission-prompt-tool"),
         OsString::from("stdio")
     );
+    assert_eq!(flag_value(&first_args, "--permission-mode"), "plan");
+    assert_eq!(flag_value(&first_args, "--model"), "opus");
+    assert_eq!(flag_value(&first_args, "--effort"), "high");
+    assert_eq!(flag_value(&first_args, "--output-style"), "concise");
     drop(first);
 
     let second = prepare_agent_turn(&adapter, request(15, "prompt-two"), state)
@@ -280,6 +362,13 @@ async fn recorded_control_request_waits_for_durable_registration_then_writes_exa
     let (request, delivery, registration_ack) = delivery.into_parts();
     assert_eq!(request.request_id, "cc-request-fixture-1");
     assert_eq!(request.kind, ActionKind::ExecuteCommand);
+    assert!(matches!(
+        request.vendor,
+        ActionRequestVendor::ClaudeCode {
+            permission_mode_at_decision: ClaudeCodePermissionMode::Plan,
+            ..
+        }
+    ));
     assert_eq!(
         request.summary,
         "Claude Code 请求执行命令：\"printf approval-action-visible\""
@@ -506,6 +595,8 @@ async fn prepared_turn(store: &RuntimeStoreHandle, prompt: &str) -> ClaudeCodePr
         ExecutionId::from_command_id(runtime_id(RuntimeIdKind::Command, 11)).unwrap(),
         cwd.clone(),
         PromptPayload::new(prompt).unwrap(),
+        52,
+        claude_code_configuration_snapshot(),
     )
     .unwrap();
     let state = AdapterStateHandle::new(adapter_state_key).unwrap();
@@ -523,6 +614,7 @@ async fn prepared_turn(store: &RuntimeStoreHandle, prompt: &str) -> ClaudeCodePr
         adapter_state_key,
         expected_native_session: native,
         prompt: prompt.to_owned(),
+        permission_mode: ClaudeCodePermissionMode::Plan,
     }
 }
 
@@ -531,8 +623,22 @@ fn request(seed: u8, prompt: &str) -> AgentTurnRequest {
         ExecutionId::from_command_id(runtime_id(RuntimeIdKind::Command, seed)).unwrap(),
         std::env::current_dir().expect("CC prepare cwd"),
         PromptPayload::new(prompt).unwrap(),
+        52,
+        claude_code_configuration_snapshot(),
     )
     .unwrap()
+}
+
+fn claude_code_configuration_snapshot() -> ConversationConfiguration {
+    ConversationConfiguration::new(VendorConfigurationSnapshot::ClaudeCode(
+        ClaudeCodeConversationConfiguration::new(
+            ClaudeCodePermissionMode::Plan,
+            Some("opus".to_owned()),
+            Some("high".to_owned()),
+            Some("concise".to_owned()),
+        )
+        .expect("bounded Claude Code configuration"),
+    ))
 }
 
 fn flag_value(args: &[OsString], flag: &str) -> OsString {

@@ -14,7 +14,7 @@ use std::time::Duration;
 use std::path::PathBuf;
 
 use agentdeck_protocol::ActionRequest;
-use agentdeck_protocol::runtime::PromptPayload;
+use agentdeck_protocol::runtime::{ConversationConfiguration, PromptPayload};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
@@ -86,6 +86,8 @@ pub(crate) fn closed_execution_events() -> RuntimeExecutionEventReceiver {
 pub(crate) struct RuntimeExecutionContext {
     pub(crate) conversation: ConversationRecord,
     pub(crate) command: CommandRecord,
+    pub(crate) configuration_revision: u64,
+    pub(crate) execution_configuration: ConversationConfiguration,
     pub(crate) turn_id: RuntimeId,
     pub(crate) daemon_boot_id: RuntimeId,
     pub(crate) execution_nonce: Vec<u8>,
@@ -281,6 +283,8 @@ impl RuntimeExecutionCoordinator for GatedExecutionCoordinator {
             execution_id,
             context.conversation.descriptor.cwd.clone(),
             PromptPayload::new(prompt).map_err(|_| RuntimeExecutionError::PrepareFailedClean)?,
+            context.configuration_revision,
+            context.execution_configuration,
         )
         .map_err(|_| RuntimeExecutionError::PrepareFailedClean)?;
         let state = AdapterStateHandle::new(context.conversation.adapter_state_key)

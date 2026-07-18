@@ -474,6 +474,7 @@ async fn start_fence_and_complete_are_atomic_idempotent_transitions() {
             command,
             intent,
             event,
+            ..
         } => (command, intent, event),
         StartOutcome::Replayed { .. } => panic!("first start cannot replay"),
     };

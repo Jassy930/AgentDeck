@@ -291,6 +291,7 @@ fn create_conversation_with_event(
             execution_nonce: vec![seed; 16],
         },
         super::super::command_event::StartEventSource::Canonical,
+        super::super::command_configuration::CommandStartProvenance::Regular,
         &mut effects,
     )
     .expect("append retention event")

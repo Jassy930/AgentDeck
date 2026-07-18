@@ -740,9 +740,116 @@ fn authenticate_configuration_row(
     })
 }
 
-/// 认证指定 conversation 的 exact configuration revision，并确认物理 journal
-/// 行数与该 append-only revision 一致。调用方必须在自己的 SQLite 事务内调用；
-/// 这样 admission 不会把“行存在”误当成 current head 已通过 AEAD/MAC/event 验证。
+/// 对单 conversation 的完整 `1...head` configuration chain 做唯一实现的有界认证。
+/// snapshot cursor 与 command exact-revision selector 必须共用本函数，避免其中一条
+/// 路径漏验 tail/intermediate row、event 单调性或 parent event HWM anchor。
+fn load_authenticated_configuration_chain<T>(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    conversation: &ConversationRecord,
+    current_revision: u64,
+    mut select: impl FnMut(&ConfigurationRecord) -> Option<T>,
+) -> Result<Option<T>, RuntimeStoreError> {
+    if current_revision > MAX_CONFIGURATIONS_PER_CONVERSATION {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let conversation_id = conversation.conversation_id;
+    let mut statement = connection.prepare(
+        "SELECT conversation_id, configuration_revision, base_configuration_revision,
+                event_seq, owner_token, idempotency_token, request_token,
+                logical_configuration_bytes, logical_request_bytes, created_at_ms,
+                metadata_token, sealed_request
+         FROM configuration_journal
+         WHERE conversation_id = ?1
+         ORDER BY configuration_revision",
+    )?;
+    let rows = statement.query_map([&conversation_id.as_bytes()[..]], raw_configuration_row)?;
+    let mut next_revision = 1_u64;
+    let mut last_event_seq = None;
+    let mut selected = None;
+    for row in rows {
+        if next_revision > MAX_CONFIGURATIONS_PER_CONVERSATION {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        let authenticated = authenticate_configuration_row(
+            connection,
+            key_bundle,
+            database_id,
+            conversation,
+            row?,
+        )?;
+        let record = authenticated.record;
+        if record.conversation_id != conversation_id
+            || record.configuration_revision != next_revision
+            || record.base_configuration_revision.checked_add(1) != Some(next_revision)
+            || last_event_seq.is_some_and(|previous| record.event_seq <= previous)
+        {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        last_event_seq = Some(record.event_seq);
+        if let Some(candidate) = select(&record) {
+            selected = Some(candidate);
+        }
+        next_revision = next_revision
+            .checked_add(1)
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    }
+    let authenticated_count = next_revision - 1;
+    let chain_is_anchored_to_parent = match (
+        current_revision,
+        last_event_seq,
+        conversation.event_high_water,
+    ) {
+        (0, None, _) => true,
+        (0, Some(_), _) | (_, None, _) | (_, Some(_), None) => false,
+        (_, Some(last_configuration_event), Some(parent_event_high_water)) => {
+            last_configuration_event <= parent_event_high_water
+        }
+    };
+    if authenticated_count != current_revision || !chain_is_anchored_to_parent {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(selected)
+}
+
+/// 在最多 4,096 行的固定上限内认证指定 conversation 的完整 `1...head`
+/// append-only chain，并从认证结果中选择 exact historical revision。
+///
+/// selector 绝不能只验证目标行：head 推进后，旧 command pin 仍必须证明目标行位于
+/// 一条连续、单调且锚定到 authenticated conversation event HWM 的完整链中。调用方
+/// 必须在自己的 SQLite transaction 内调用，保证 command、pin 与配置来自同一快照。
+pub(super) fn load_authenticated_configuration_at_revision(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    conversation_id: RuntimeId,
+    configuration_revision: u64,
+) -> Result<ConfigurationRecord, RuntimeStoreError> {
+    if configuration_revision == 0 {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let conversation =
+        super::journal::load_conversation(connection, key_bundle, database_id, conversation_id)?;
+    let current_revision =
+        load_conversation_state(connection, key_bundle, conversation_id)?.current_revision()?;
+    if configuration_revision > current_revision {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    load_authenticated_configuration_chain(
+        connection,
+        key_bundle,
+        database_id,
+        &conversation,
+        current_revision,
+        |record| (record.configuration_revision == configuration_revision).then(|| record.clone()),
+    )?
+    .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)
+}
+
+/// 认证指定 conversation 的 exact current configuration revision，并确认物理
+/// journal 行数与该 append-only revision 一致。调用方必须在自己的 SQLite
+/// transaction 内调用，避免 admission 把“行存在”误当成 current head 已认证。
 pub(super) fn load_authenticated_configuration_revision(
     connection: &Connection,
     key_bundle: &RuntimeKeyBundle,
@@ -859,64 +966,18 @@ pub(super) fn load_configuration_state_at_event_cursor(
         return Err(RuntimeStoreError::InvalidStateTransition);
     }
 
-    let mut statement = connection.prepare(
-        "SELECT conversation_id, configuration_revision, base_configuration_revision,
-                event_seq, owner_token, idempotency_token, request_token,
-                logical_configuration_bytes, logical_request_bytes, created_at_ms,
-                metadata_token, sealed_request
-         FROM configuration_journal
-         WHERE conversation_id = ?1
-         ORDER BY configuration_revision",
-    )?;
-    let rows = statement.query_map([&conversation_id.as_bytes()[..]], raw_configuration_row)?;
-    let mut next_revision = 1_u64;
-    let mut last_event_seq = None;
-    let mut selected = None;
-    for row in rows {
-        if next_revision > MAX_CONFIGURATIONS_PER_CONVERSATION {
-            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
-        }
-        let authenticated = authenticate_configuration_row(
-            connection,
-            key_bundle,
-            database_id,
-            &conversation,
-            row?,
-        )?;
-        let record = authenticated.record;
-        if record.conversation_id != conversation_id
-            || record.configuration_revision != next_revision
-            || record.base_configuration_revision.checked_add(1) != Some(next_revision)
-            || last_event_seq.is_some_and(|previous| record.event_seq <= previous)
-        {
-            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
-        }
-        last_event_seq = Some(record.event_seq);
-        if base_event_seq.is_some_and(|base| record.event_seq <= base) {
-            selected = Some((record.configuration_revision, record.configuration));
-        }
-        next_revision = next_revision
-            .checked_add(1)
-            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-    }
-    let authenticated_count = next_revision - 1;
-    let chain_is_anchored_to_parent = match (
+    let selected = load_authenticated_configuration_chain(
+        connection,
+        key_bundle,
+        database_id,
+        &conversation,
         current_revision,
-        last_event_seq,
-        conversation.event_high_water,
-    ) {
-        (0, None, _) => true,
-        (0, Some(_), _) | (_, None, _) | (_, Some(_), None) => false,
-        (_, Some(last_configuration_event), Some(parent_event_high_water)) => {
-            last_configuration_event <= parent_event_high_water
-        }
-    };
-    if authenticated_count != current_revision
-        || authenticated_count > MAX_CONFIGURATIONS_PER_CONVERSATION
-        || !chain_is_anchored_to_parent
-    {
-        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
-    }
+        |record| {
+            base_event_seq
+                .is_some_and(|base| record.event_seq <= base)
+                .then(|| (record.configuration_revision, record.configuration.clone()))
+        },
+    )?;
     let (revision, configuration) = selected
         .map(|(revision, configuration)| (revision, Some(configuration)))
         .unwrap_or((0, None));

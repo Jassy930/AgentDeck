@@ -54,16 +54,23 @@ pub(super) struct ClaudeCodeRuntimeTranslator {
     next_item_key: u64,
     retained_bytes: usize,
     retained_byte_limit: usize,
+    permission_mode: ClaudeCodePermissionMode,
 }
 
 impl ClaudeCodeRuntimeTranslator {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
+        Self::with_permission_mode(ClaudeCodePermissionMode::Default)
+    }
+
+    pub(super) fn with_permission_mode(permission_mode: ClaudeCodePermissionMode) -> Self {
         Self {
             in_flight_tools: HashMap::new(),
             completed_tool_ids: HashSet::new(),
             next_item_key: 1,
             retained_bytes: 0,
             retained_byte_limit: MAX_TRANSLATOR_RETAINED_BYTES,
+            permission_mode,
         }
     }
 
@@ -410,7 +417,7 @@ impl ClaudeCodeRuntimeTranslator {
             kind,
             summary,
             vendor: ActionRequestVendor::ClaudeCode {
-                permission_mode_at_decision: ClaudeCodePermissionMode::Default,
+                permission_mode_at_decision: self.permission_mode,
                 tool_name: tool_name.to_owned(),
             },
         };

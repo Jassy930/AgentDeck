@@ -56,6 +56,7 @@ pub struct ProductionExecutionProbeEvidence {
     pub durable_item_count_after_reopen: usize,
     pub durable_terminal_count_after_reopen: usize,
     pub vendor_prompt_matched: bool,
+    pub adapter_observed_pinned_configuration: bool,
     pub adapter_observed_durable_ack: bool,
     pub cancel_requested: bool,
     pub vendor_side_effect_absent: bool,
@@ -203,6 +204,7 @@ async fn run_production_execution_probe_mode(
     let database = root.join("runtime.db");
     let key_state = root.join("key-state.db");
     let vendor_prompt_path = root.join("vendor-prompt.txt");
+    let adapter_configuration_path = root.join("adapter-configuration.txt");
     let durable_ack_path = root.join("durable-ack.txt");
     let keys = MemoryKeyStore::new();
     let storage_kek = load_or_create_storage_kek(&keys, &key_state)
@@ -249,13 +251,7 @@ async fn run_production_execution_probe_mode(
             owner: owner.clone(),
             idempotency_key: "production-execution-probe-configuration".to_owned(),
             expected_configuration_revision: 0,
-            configuration: ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
-                CodexConversationConfiguration::new(
-                    CodexApprovalPolicy::OnRequest,
-                    CodexSandboxMode::WorkspaceWrite,
-                    CodexReasoningEffort::Medium,
-                ),
-            )),
+            configuration: pinned_probe_configuration(),
         })
         .await
         .map_err(|error| format!("configure probe conversation: {error}"))?;
@@ -294,10 +290,35 @@ async fn run_production_execution_probe_mode(
             command.configuration_revision
         ));
     }
+    let advanced = store
+        .configure_conversation(ConfigureConversation {
+            conversation_id,
+            owner: owner.clone(),
+            idempotency_key: "production-execution-probe-configuration-revision-two".to_owned(),
+            expected_configuration_revision: 1,
+            configuration: advanced_probe_configuration(),
+        })
+        .await
+        .map_err(|error| format!("advance probe configuration head: {error}"))?;
+    if !matches!(
+        advanced,
+        ConfigureConversationOutcome::Applied {
+            configuration: ConfigurationRecord {
+                configuration_revision: 2,
+                event_seq: 1,
+                ..
+            }
+        }
+    ) {
+        return Err(format!(
+            "probe conversation did not advance configuration head to revision two: {advanced:?}"
+        ));
+    }
 
     let mut router = crate::runtime::AgentRouter::new();
     router.register(Arc::new(ProbeAgent {
         vendor_prompt_path: vendor_prompt_path.clone(),
+        adapter_configuration_path: adapter_configuration_path.clone(),
         durable_ack_path: durable_ack_path.clone(),
     }));
     let core = RuntimeCore::new_production(store.clone(), Arc::new(router))
@@ -428,6 +449,8 @@ async fn run_production_execution_probe_mode(
         durable_item_count_after_reopen: item_count,
         durable_terminal_count_after_reopen: terminal_count,
         vendor_prompt_matched: vendor_prompt.as_deref() == Some(prompt),
+        adapter_observed_pinned_configuration: fs::read_to_string(&adapter_configuration_path)
+            .is_ok_and(|value| value == "revision-1-non-default"),
         adapter_observed_durable_ack: adapter_ack.as_deref() == Some("durable-event-ack"),
         cancel_requested,
         vendor_side_effect_absent,
@@ -586,16 +609,16 @@ async fn count_reopened_events(
     let RuntimeBackfillPlan::Pinned(pin) = store
         .acquire_backfill_pin(
             RuntimeBackfillTarget::Conversation(conversation_id),
-            // seq0=ConfigurationChanged，seq1=TurnStarted；本门禁只统计
+            // seq0/seq1=ConfigurationChanged rev1/rev2，seq2=TurnStarted；本门禁只统计
             // command output 与唯一 terminal suffix。
-            Some(1),
+            Some(2),
         )
         .await
         .map_err(|error| format!("pin reopened probe backfill: {error}"))?
     else {
         return Err("probe event suffix was unexpectedly empty".to_owned());
     };
-    let mut after = Some(1);
+    let mut after = Some(2);
     let mut item_count = 0_usize;
     let mut terminal_count = 0_usize;
     let command_id_text = command_id.to_canonical_string();
@@ -641,6 +664,7 @@ async fn count_reopened_events(
 
 struct ProbeAgent {
     vendor_prompt_path: PathBuf,
+    adapter_configuration_path: PathBuf,
     durable_ack_path: PathBuf,
 }
 
@@ -675,6 +699,16 @@ impl Agent for ProbeAgent {
         request: AgentTurnRequest,
         state: AdapterStateHandle,
     ) -> Result<Box<dyn PreparedAgentTurn>, ProtocolError> {
+        if request.configuration_revision() != 1
+            || request.execution_configuration() != &pinned_probe_configuration()
+        {
+            return Err(probe_error(
+                "probe-configuration",
+                "adapter did not observe the command-pinned revision one configuration",
+            ));
+        }
+        fs::write(&self.adapter_configuration_path, b"revision-1-non-default")
+            .map_err(|error| probe_error("probe-configuration-marker", &error.to_string()))?;
         let prompt = request.prompt().to_owned();
         let cwd = request.cwd().to_path_buf();
         let script = "IFS= read -r line || exit 31; printf '%s' \"$line\" > \"$1\"; printf '%s\\n' 'production-helper-response'";
@@ -750,6 +784,26 @@ impl Agent for ProbeAgent {
             "legacy cancel is disabled",
         ))
     }
+}
+
+fn pinned_probe_configuration() -> ConversationConfiguration {
+    ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
+        CodexConversationConfiguration::new(
+            CodexApprovalPolicy::Never,
+            CodexSandboxMode::ReadOnly,
+            CodexReasoningEffort::High,
+        ),
+    ))
+}
+
+fn advanced_probe_configuration() -> ConversationConfiguration {
+    ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
+        CodexConversationConfiguration::new(
+            CodexApprovalPolicy::Always,
+            CodexSandboxMode::FullAccess,
+            CodexReasoningEffort::Minimal,
+        ),
+    ))
 }
 
 struct ProbePreparedTurn {

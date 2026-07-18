@@ -41,6 +41,7 @@ pub(super) struct ClaudeCodePreparedTurn {
     pub(super) adapter_state_key: RuntimeId,
     pub(super) expected_native_session: ThreadId,
     pub(super) prompt: String,
+    pub(super) permission_mode: ClaudeCodePermissionMode,
 }
 
 impl PreparedAgentTurn for ClaudeCodePreparedTurn {
@@ -117,7 +118,8 @@ async fn run_claude_code_turn(
     .await
     .map_err(|_| fixed_error("cc-init-timeout"))??;
 
-    let mut translator = ClaudeCodeRuntimeTranslator::new();
+    let mut translator =
+        ClaudeCodeRuntimeTranslator::with_permission_mode(prepared.permission_mode);
     for frame in buffered {
         if let Some(summary) =
             handle_frame(frame, &stdin, &events, &approvals, &mut translator).await?
@@ -209,10 +211,7 @@ impl ClaudeCodeBoundApprovalDelivery {
         stdin: SharedClaudeCodeStdin,
     ) -> Result<Self, ProtocolError> {
         let request_tool_name = match &request.vendor {
-            ActionRequestVendor::ClaudeCode {
-                permission_mode_at_decision: ClaudeCodePermissionMode::Default,
-                tool_name,
-            } => tool_name,
+            ActionRequestVendor::ClaudeCode { tool_name, .. } => tool_name,
             _ => return Err(fixed_error("cc-approval-route-invalid")),
         };
         if request.request_id != route.request_id || request_tool_name != &route.tool_name {

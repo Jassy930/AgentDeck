@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use agentdeck_protocol::runtime::ConversationConfiguration;
 use agentdeck_protocol::runtime::failure::{
     DAEMON_CONVERSATION_CONFIGURATION_CONFLICT, DAEMON_CONVERSATION_CONFIGURATION_REQUIRED,
 };
@@ -678,6 +679,69 @@ pub struct StartCommand {
     pub execution_nonce: Vec<u8>,
 }
 
+/// Store 已认证并冻结到 command pin 的 execution configuration。
+///
+/// 非零 revision 总是携带 exact configuration；revision zero 只表示迁移前
+/// command，并且只能由 startup recovery 专用入口产生。该类型不进入 wire。
+#[derive(Clone, Eq, PartialEq)]
+pub enum CommandExecutionConfiguration {
+    Pinned {
+        configuration_revision: u64,
+        configuration: ConversationConfiguration,
+    },
+    LegacyRevisionZero {
+        agent_kind: AgentKind,
+    },
+}
+
+impl CommandExecutionConfiguration {
+    #[must_use]
+    pub const fn configuration_revision(&self) -> u64 {
+        match self {
+            Self::Pinned {
+                configuration_revision,
+                ..
+            } => *configuration_revision,
+            Self::LegacyRevisionZero { .. } => 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn configuration(&self) -> Option<&ConversationConfiguration> {
+        match self {
+            Self::Pinned { configuration, .. } => Some(configuration),
+            Self::LegacyRevisionZero { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn agent_kind(&self) -> AgentKind {
+        match self {
+            Self::Pinned { configuration, .. } => configuration.agent_kind(),
+            Self::LegacyRevisionZero { agent_kind } => *agent_kind,
+        }
+    }
+}
+
+impl std::fmt::Debug for CommandExecutionConfiguration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pinned {
+                configuration_revision,
+                configuration,
+            } => formatter
+                .debug_struct("PinnedExecutionConfiguration")
+                .field("configuration_revision", configuration_revision)
+                .field("agent_kind", &configuration.agent_kind())
+                .finish_non_exhaustive(),
+            Self::LegacyRevisionZero { agent_kind } => formatter
+                .debug_struct("LegacyRevisionZeroExecutionConfiguration")
+                .field("agent_kind", agent_kind)
+                .finish(),
+        }
+    }
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct ExecutionIntentRecord {
     pub command_id: RuntimeId,
@@ -730,11 +794,13 @@ impl std::fmt::Debug for EventRecord {
 pub enum StartOutcome {
     Started {
         command: CommandRecord,
+        execution_configuration: CommandExecutionConfiguration,
         intent: ExecutionIntentRecord,
         event: EventRecord,
     },
     Replayed {
         command: CommandRecord,
+        execution_configuration: CommandExecutionConfiguration,
         intent: ExecutionIntentRecord,
         event: EventRecord,
     },

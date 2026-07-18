@@ -7,7 +7,7 @@
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use zeroize::Zeroizing;
 
-use crate::runtime::model::RuntimeStoreError;
+use crate::runtime::model::{CommandExecutionConfiguration, CommandRecord, RuntimeStoreError};
 
 use super::cipher::RuntimeKeyBundle;
 use super::configuration::load_conversation_state;
@@ -20,6 +20,12 @@ const COMMAND_PIN_METADATA_DOMAIN: &[u8] = b"command.configuration.pin.metadata.
 const COMMAND_PAYLOAD_DOMAIN_V1: &[u8] = b"command.payload.prompt.v1";
 const COMMAND_PAYLOAD_DOMAIN_V2: &[u8] = b"command.payload.prompt.v2";
 const COMMAND_PAYLOAD_MAGIC_V2: &[u8; 4] = b"ADP2";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CommandStartProvenance {
+    Regular,
+    StartupRecovery,
+}
 
 fn append_u32_field(message: &mut Vec<u8>, value: &[u8]) -> Result<(), RuntimeStoreError> {
     let length = u32::try_from(value.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
@@ -232,6 +238,56 @@ pub(super) fn load_revision(
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
     Ok(revision)
+}
+
+/// 在调用方持有的 SQLite transaction 内，把 authenticated command pin 解析为
+/// adapter 可消费的 exact execution configuration。普通 queue start 永不把 rev0
+/// 解释成默认配置；只有明确的 startup recovery provenance 可以取得 legacy variant。
+pub(super) fn load_execution_configuration(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    command: &CommandRecord,
+    provenance: CommandStartProvenance,
+) -> Result<CommandExecutionConfiguration, RuntimeStoreError> {
+    let pinned_revision = load_revision(
+        connection,
+        key_bundle,
+        command.conversation_id,
+        command.command_seq,
+    )?;
+    if pinned_revision != command.configuration_revision {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    if pinned_revision == 0 {
+        if provenance != CommandStartProvenance::StartupRecovery {
+            return Err(RuntimeStoreError::InvalidStateTransition);
+        }
+        let conversation = super::journal::load_conversation(
+            connection,
+            key_bundle,
+            database_id,
+            command.conversation_id,
+        )?;
+        return Ok(CommandExecutionConfiguration::LegacyRevisionZero {
+            agent_kind: conversation.descriptor.agent_kind,
+        });
+    }
+
+    let record = super::configuration::load_authenticated_configuration_at_revision(
+        connection,
+        key_bundle,
+        database_id,
+        command.conversation_id,
+        pinned_revision,
+    )?;
+    if record.configuration_revision != pinned_revision {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(CommandExecutionConfiguration::Pinned {
+        configuration_revision: pinned_revision,
+        configuration: record.configuration,
+    })
 }
 
 pub(super) fn validate_v5_integrity(

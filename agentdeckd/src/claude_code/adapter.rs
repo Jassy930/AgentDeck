@@ -867,6 +867,12 @@ impl Agent for ClaudeCodeAdapter {
         request: AgentTurnRequest,
         state: AdapterStateHandle,
     ) -> Result<Box<dyn PreparedAgentTurn>, ProtocolError> {
+        let configuration = match request.execution_configuration().vendor_control() {
+            VendorConfigurationSnapshot::ClaudeCode(configuration) => configuration.clone(),
+            VendorConfigurationSnapshot::Codex(_) => {
+                return Err(typed_prepare_error("cc-configuration-mismatch"));
+            }
+        };
         let repository = self
             .state_repository
             .clone()
@@ -891,37 +897,18 @@ impl Agent for ClaudeCodeAdapter {
         // 使用同一信任根，且 vendor 首次执行仍由 current-binary exec gate 独占。
         let program = crate::exec_gate::resolve_trusted_program("claude")
             .ok_or_else(|| typed_prepare_error("cc-binary-not-found"))?;
-        let mut args = [
-            "--print",
-            "--output-format",
-            "stream-json",
-            "--input-format",
-            "stream-json",
-            "--permission-prompt-tool",
-            "stdio",
-            "--verbose",
-            "--permission-mode",
-            permission_mode_to_cli(ClaudeCodePermissionMode::Default),
-        ]
-        .into_iter()
-        .map(OsString::from)
-        .collect::<Vec<_>>();
-        args.push(OsString::from(if use_resume {
-            "--resume"
-        } else {
-            "--session-id"
-        }));
-        args.push(OsString::from(&native_session.0));
+        let args = typed_execution_args(&configuration, &native_session, use_resume);
         let cwd = request.cwd().to_path_buf();
         let exec_spec = ExecSpec::new(&request, state, program, args, cwd)
             .map_err(|_| typed_prepare_error("cc-exec-spec-invalid"))?;
-        let (_, _, prompt) = request.into_parts();
+        let (_, _, prompt, _, _) = request.into_parts();
         Ok(Box::new(ClaudeCodePreparedTurn {
             exec_spec,
             repository,
             adapter_state_key: state.key(),
             expected_native_session: native_session,
             prompt: prompt.into_string(),
+            permission_mode: configuration.permission_mode(),
         }))
     }
 
@@ -1366,6 +1353,47 @@ where
 }
 
 // ── CLI flag mapping ────────────────────────────────────────────────────────
+
+pub(super) fn typed_execution_args(
+    configuration: &ClaudeCodeConversationConfiguration,
+    native_session: &ThreadId,
+    use_resume: bool,
+) -> Vec<OsString> {
+    let mut args = [
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--input-format",
+        "stream-json",
+        "--permission-prompt-tool",
+        "stdio",
+        "--verbose",
+        "--permission-mode",
+        permission_mode_to_cli(configuration.permission_mode()),
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect::<Vec<_>>();
+    if let Some(model) = configuration.model() {
+        args.push(OsString::from("--model"));
+        args.push(OsString::from(model));
+    }
+    if let Some(effort) = configuration.effort() {
+        args.push(OsString::from("--effort"));
+        args.push(OsString::from(effort));
+    }
+    if let Some(output_style) = configuration.output_style() {
+        args.push(OsString::from("--output-style"));
+        args.push(OsString::from(output_style));
+    }
+    args.push(OsString::from(if use_resume {
+        "--resume"
+    } else {
+        "--session-id"
+    }));
+    args.push(OsString::from(&native_session.0));
+    args
+}
 
 fn permission_mode_to_cli(m: ClaudeCodePermissionMode) -> &'static str {
     match m {

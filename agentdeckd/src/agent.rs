@@ -114,13 +114,17 @@ impl fmt::Debug for ExecutionId {
     }
 }
 
-/// RuntimeCore 交给 adapter 的冷准备请求。只含 exact execution、绝对 cwd 与
-/// 已通过 Runtime v2 256 KiB gate 的 prompt；不携带 agent kind、session/thread
-/// 或 vendor identity。
+/// RuntimeCore 交给 adapter 的冷准备请求。只含 exact execution、绝对 cwd、
+/// 已通过 Runtime v2 256 KiB gate 的 prompt，以及 Store 按 command pin 认证并
+/// 冻结的 configuration revision/value；不携带 session/thread 或 vendor identity。
+/// revision 0 只表达上层已实体化的 migration-era frozen defaults，adapter 不自行
+/// 查询 current head，也不解释 missing configuration。
 pub struct AgentTurnRequest {
     execution_id: ExecutionId,
     cwd: PathBuf,
     prompt: PromptPayload,
+    configuration_revision: u64,
+    execution_configuration: ConversationConfiguration,
 }
 
 impl AgentTurnRequest {
@@ -132,6 +136,8 @@ impl AgentTurnRequest {
         execution_id: ExecutionId,
         cwd: impl Into<PathBuf>,
         prompt: PromptPayload,
+        configuration_revision: u64,
+        execution_configuration: ConversationConfiguration,
     ) -> Result<Self, AgentTurnContractError> {
         let cwd = cwd.into();
         if !cwd.is_absolute() {
@@ -142,6 +148,8 @@ impl AgentTurnRequest {
             execution_id,
             cwd,
             prompt,
+            configuration_revision,
+            execution_configuration,
         })
     }
 
@@ -170,9 +178,32 @@ impl AgentTurnRequest {
     }
 
     #[must_use]
-    #[allow(dead_code, reason = "P3.7 adapter migration consumes the cold request")]
-    pub(crate) fn into_parts(self) -> (ExecutionId, PathBuf, PromptPayload) {
-        (self.execution_id, self.cwd, self.prompt)
+    pub(crate) const fn configuration_revision(&self) -> u64 {
+        self.configuration_revision
+    }
+
+    #[must_use]
+    pub(crate) const fn execution_configuration(&self) -> &ConversationConfiguration {
+        &self.execution_configuration
+    }
+
+    #[must_use]
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ExecutionId,
+        PathBuf,
+        PromptPayload,
+        u64,
+        ConversationConfiguration,
+    ) {
+        (
+            self.execution_id,
+            self.cwd,
+            self.prompt,
+            self.configuration_revision,
+            self.execution_configuration,
+        )
     }
 }
 
@@ -181,6 +212,7 @@ impl fmt::Debug for AgentTurnRequest {
         formatter
             .debug_struct("AgentTurnRequest")
             .field("prompt_bytes", &self.prompt.as_str().len())
+            .field("configuration_revision", &self.configuration_revision)
             .finish_non_exhaustive()
     }
 }
@@ -403,6 +435,7 @@ impl PrepareAdapterTurnCapability {
 /// 完全一致；exec spawn 只能借用下方 checked capability，不能拆出或 clone 原始 spec。
 pub(crate) struct PreparedAgentTurnHandle {
     execution_id: ExecutionId,
+    configuration_revision: u64,
     adapter_state: AdapterStateHandle,
     inner: Box<dyn PreparedAgentTurn>,
 }
@@ -510,6 +543,7 @@ impl fmt::Debug for PreparedAgentTurnHandle {
         formatter
             .debug_struct("PreparedAgentTurnHandle")
             .field("execution_id", &"[REDACTED]")
+            .field("configuration_revision", &self.configuration_revision)
             .field("inner", &"[REDACTED]")
             .finish_non_exhaustive()
     }
@@ -526,7 +560,11 @@ pub(crate) async fn prepare_turn(
     request: AgentTurnRequest,
     state: AdapterStateHandle,
 ) -> Result<PreparedAgentTurnHandle, ProtocolError> {
+    if request.execution_configuration().agent_kind() != agent.kind() {
+        return Err(adapter_configuration_agent_mismatch());
+    }
     let execution_id = request.execution_id();
+    let configuration_revision = request.configuration_revision();
     let mut capability = PrepareAdapterTurnCapability::for_daemon();
     let inner = agent
         .prepare_adapter_turn(&mut capability, request, state)
@@ -536,9 +574,18 @@ pub(crate) async fn prepare_turn(
     }
     Ok(PreparedAgentTurnHandle {
         execution_id,
+        configuration_revision,
         adapter_state: state,
         inner,
     })
+}
+
+fn adapter_configuration_agent_mismatch() -> ProtocolError {
+    ProtocolError {
+        code: "adapter-configuration-agent-mismatch".to_owned(),
+        message: "adapter route does not match the frozen execution configuration".to_owned(),
+        diagnostic_ref: None,
+    }
 }
 
 fn adapter_prepare_binding_mismatch() -> ProtocolError {
@@ -1102,6 +1149,8 @@ mod typed_boundary_tests {
                     execution_id(0xE1),
                     std::env::current_dir().expect("current directory"),
                     PromptPayload::new("other execution").expect("bounded prompt"),
+                    9,
+                    codex_configuration(),
                 )
                 .expect("other request");
                 return Ok(Box::new(SwitchingPreparedTurn {
@@ -1208,8 +1257,32 @@ mod typed_boundary_tests {
             execution_id(seed),
             std::env::current_dir().expect("current directory"),
             PromptPayload::new(prompt).expect("bounded prompt"),
+            7,
+            codex_configuration(),
         )
         .expect("absolute request cwd")
+    }
+
+    fn codex_configuration() -> ConversationConfiguration {
+        ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
+            CodexConversationConfiguration::new(
+                CodexApprovalPolicy::Never,
+                CodexSandboxMode::ReadOnly,
+                CodexReasoningEffort::High,
+            ),
+        ))
+    }
+
+    fn claude_code_configuration() -> ConversationConfiguration {
+        ConversationConfiguration::new(VendorConfigurationSnapshot::ClaudeCode(
+            agentdeck_protocol::runtime::ClaudeCodeConversationConfiguration::new(
+                agentdeck_protocol::ClaudeCodePermissionMode::Plan,
+                None,
+                None,
+                None,
+            )
+            .expect("bounded Claude Code configuration"),
+        ))
     }
 
     fn adapter_state(seed: u8) -> AdapterStateHandle {
@@ -1265,6 +1338,8 @@ mod typed_boundary_tests {
         );
         assert!(request.cwd().is_absolute());
         assert_eq!(request.prompt(), prompt);
+        assert_eq!(request.configuration_revision(), 7);
+        assert_eq!(request.execution_configuration(), &codex_configuration());
 
         let debug = format!("{request:?}");
         assert!(!debug.contains(prompt));
@@ -1276,9 +1351,28 @@ mod typed_boundary_tests {
                 execution_id(6),
                 "relative",
                 PromptPayload::new("prompt").expect("bounded prompt"),
+                0,
+                codex_configuration(),
             ),
             Err(AgentTurnContractError::RelativeWorkingDirectory)
         ));
+    }
+
+    #[tokio::test]
+    async fn daemon_rejects_frozen_configuration_for_another_agent_before_prepare() {
+        let request = AgentTurnRequest::new(
+            execution_id(0xC1),
+            std::env::current_dir().expect("current directory"),
+            PromptPayload::new("must not reach adapter").expect("bounded prompt"),
+            4,
+            claude_code_configuration(),
+        )
+        .expect("absolute request cwd");
+        let error = prepare_turn(&PreparedOnlyAgent::new(), request, adapter_state(0xC2))
+            .await
+            .expect_err("route/configuration mismatch must fail before adapter prepare");
+        assert_eq!(error.code, "adapter-configuration-agent-mismatch");
+        assert!(error.diagnostic_ref.is_none());
     }
 
     #[test]
@@ -1456,11 +1550,22 @@ mod typed_boundary_tests {
             (&codex as &dyn Agent, "codex-state-vault-unavailable"),
             (&claude_code as &dyn Agent, "cc-state-vault-unavailable"),
         ] {
-            let prepare_error =
-                match prepare_turn(agent, request(7, "never spawn"), adapter_state(8)).await {
-                    Err(error) => error,
-                    Ok(_) => panic!("adapter without runtime vault must not prepare a typed turn"),
-                };
+            let configuration = match agent.kind() {
+                AgentKind::Codex => codex_configuration(),
+                AgentKind::ClaudeCode => claude_code_configuration(),
+            };
+            let request = AgentTurnRequest::new(
+                execution_id(7),
+                std::env::current_dir().expect("current directory"),
+                PromptPayload::new("never spawn").expect("bounded prompt"),
+                7,
+                configuration,
+            )
+            .expect("absolute request cwd");
+            let prepare_error = match prepare_turn(agent, request, adapter_state(8)).await {
+                Err(error) => error,
+                Ok(_) => panic!("adapter without runtime vault must not prepare a typed turn"),
+            };
             assert_eq!(prepare_error.code, expected);
         }
     }

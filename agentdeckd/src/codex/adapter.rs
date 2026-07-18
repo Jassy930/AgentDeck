@@ -780,6 +780,12 @@ impl Agent for CodexAdapter {
         request: AgentTurnRequest,
         state: AdapterStateHandle,
     ) -> Result<Box<dyn PreparedAgentTurn>, ProtocolError> {
+        let configuration = match request.execution_configuration().vendor_control() {
+            VendorConfigurationSnapshot::Codex(configuration) => configuration.clone(),
+            VendorConfigurationSnapshot::ClaudeCode(_) => {
+                return Err(typed_prepare_error("codex-configuration-mismatch"));
+            }
+        };
         let repository = self
             .state_repository
             .clone()
@@ -803,7 +809,7 @@ impl Agent for CodexAdapter {
             cwd.clone(),
         )
         .map_err(|_| typed_prepare_error("codex-exec-spec-invalid"))?;
-        let (_, _, prompt) = request.into_parts();
+        let (_, _, prompt, _, _) = request.into_parts();
         Ok(Box::new(CodexPreparedTurn {
             exec_spec,
             repository,
@@ -811,6 +817,9 @@ impl Agent for CodexAdapter {
             resume_thread_id,
             cwd,
             prompt: prompt.into_string(),
+            approval_policy: configuration.approval_policy(),
+            sandbox: configuration.sandbox(),
+            reasoning_effort: configuration.reasoning_effort(),
         }))
     }
 
@@ -1482,7 +1491,7 @@ fn invalid_approval_params(reason: &str) -> ProtocolError {
 
 // ── enum → wire string helpers ──────────────────────────────────────────────
 
-fn sandbox_mode_str(m: CodexSandboxMode) -> &'static str {
+pub(super) fn sandbox_mode_str(m: CodexSandboxMode) -> &'static str {
     match m {
         CodexSandboxMode::ReadOnly => "read-only",
         CodexSandboxMode::WorkspaceWrite => "workspace-write",
@@ -1493,7 +1502,7 @@ fn sandbox_mode_str(m: CodexSandboxMode) -> &'static str {
     }
 }
 
-fn approval_policy_str(p: CodexApprovalPolicy) -> &'static str {
+pub(super) fn approval_policy_str(p: CodexApprovalPolicy) -> &'static str {
     match p {
         // The AgentDeck neutral enum has three variants but Codex's
         // `AskForApproval` has four (`untrusted | on-failure |
@@ -1507,7 +1516,7 @@ fn approval_policy_str(p: CodexApprovalPolicy) -> &'static str {
     }
 }
 
-fn reasoning_effort_str(e: CodexReasoningEffort) -> &'static str {
+pub(super) fn reasoning_effort_str(e: CodexReasoningEffort) -> &'static str {
     match e {
         CodexReasoningEffort::Minimal => "minimal",
         CodexReasoningEffort::Low => "low",

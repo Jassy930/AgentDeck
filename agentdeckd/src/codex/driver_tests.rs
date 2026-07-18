@@ -10,10 +10,13 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use agentdeck_protocol::ThreadId;
-use agentdeck_protocol::runtime::PromptPayload;
+use agentdeck_protocol::runtime::{
+    CodexConversationConfiguration, ConversationConfiguration, PromptPayload,
+    VendorConfigurationSnapshot,
+};
 use agentdeck_protocol::{
     ActionDecision, ActionDecisionKind, ActionKind, ActionRequest, ActionRequestVendor, AgentKind,
-    CodexApprovalPolicy, CodexSandboxMode,
+    CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode,
 };
 use serde_json::{Value, json};
 use tokio::io::AsyncWrite;
@@ -169,6 +172,8 @@ async fn typed_prepare_uses_only_absolute_codex_and_app_server_argv() {
         execution_id,
         cwd.clone(),
         PromptPayload::new("prompt-sentinel-must-stay-private").unwrap(),
+        41,
+        codex_configuration(),
     )
     .expect("typed prepare request");
     let state = AdapterStateHandle::new(runtime_id(RuntimeIdKind::AdapterState, 2))
@@ -247,8 +252,11 @@ async fn durable_event_ack_blocks_completion_and_state_is_bound_before_prompt() 
                 .any(|method| method == "remoteControl/status/changed"))
     );
     assert_eq!(requests[1]["method"], "thread/start");
+    assert_eq!(requests[1]["params"]["sandbox"], "read-only");
+    assert_eq!(requests[1]["params"]["approvalPolicy"], "untrusted");
     assert_eq!(requests[2]["method"], "turn/start");
     assert_eq!(requests[2]["params"]["input"][0]["text"], "fixture prompt");
+    assert_eq!(requests[2]["params"]["effort"], "high");
     assert!(
         tokio::time::timeout(Duration::from_millis(100), &mut task)
             .await
@@ -302,8 +310,10 @@ async fn resume_reasserts_cwd_sandbox_and_approval_policy() {
     assert_eq!(requests.len(), 3);
     assert_eq!(requests[1]["method"], "thread/resume");
     assert_eq!(requests[1]["params"]["threadId"], "fixture-thread");
-    assert_eq!(requests[1]["params"]["sandbox"], "workspace-write");
-    assert_eq!(requests[1]["params"]["approvalPolicy"], "on-request");
+    assert_eq!(requests[1]["params"]["sandbox"], "read-only");
+    assert_eq!(requests[1]["params"]["approvalPolicy"], "untrusted");
+    assert_eq!(requests[2]["method"], "turn/start");
+    assert_eq!(requests[2]["params"]["effort"], "high");
     assert_eq!(
         requests[1]["params"]["cwd"],
         Value::String(
@@ -440,7 +450,15 @@ async fn dropping_registered_approval_route_does_not_complete_the_waiting_driver
         .await
         .expect("Codex route-drop approval arrives")
         .expect("Codex route-drop approval channel open");
-    let (_request, delivery, registration_ack) = registration.into_parts();
+    let (request, delivery, registration_ack) = registration.into_parts();
+    assert!(matches!(
+        request.vendor,
+        ActionRequestVendor::Codex {
+            approval_policy_at_decision: CodexApprovalPolicy::Always,
+            sandbox_at_decision: CodexSandboxMode::ReadOnly,
+            ..
+        }
+    ));
     registration_ack.acknowledge(Ok(()));
     drop(delivery);
 
@@ -559,6 +577,8 @@ fn prepared_turn(store: &RuntimeStoreHandle, prompt: &str) -> (CodexPreparedTurn
         execution_id,
         cwd.clone(),
         PromptPayload::new(prompt).expect("bounded prompt"),
+        41,
+        codex_configuration(),
     )
     .expect("valid typed turn request");
     let state = AdapterStateHandle::new(adapter_state_key).expect("typed adapter state");
@@ -578,9 +598,22 @@ fn prepared_turn(store: &RuntimeStoreHandle, prompt: &str) -> (CodexPreparedTurn
             resume_thread_id: None,
             cwd,
             prompt: prompt.to_owned(),
+            approval_policy: CodexApprovalPolicy::Always,
+            sandbox: CodexSandboxMode::ReadOnly,
+            reasoning_effort: CodexReasoningEffort::High,
         },
         adapter_state_key,
     )
+}
+
+fn codex_configuration() -> ConversationConfiguration {
+    ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
+        CodexConversationConfiguration::new(
+            CodexApprovalPolicy::Always,
+            CodexSandboxMode::ReadOnly,
+            CodexReasoningEffort::High,
+        ),
+    ))
 }
 
 fn spawn_scripted_peer(log: &Path, script: &str) -> (GatedChildIo, Child) {

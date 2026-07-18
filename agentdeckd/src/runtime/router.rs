@@ -486,7 +486,30 @@ mod typed_prepare_tests {
         RuntimeId::from_bytes(kind, [seed; 16]).expect("non-zero runtime id")
     }
 
-    fn request(seed: u8) -> AgentTurnRequest {
+    fn configuration(agent_kind: AgentKind) -> ConversationConfiguration {
+        match agent_kind {
+            AgentKind::Codex => ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
+                CodexConversationConfiguration::new(
+                    CodexApprovalPolicy::OnRequest,
+                    CodexSandboxMode::WorkspaceWrite,
+                    CodexReasoningEffort::Medium,
+                ),
+            )),
+            AgentKind::ClaudeCode => {
+                ConversationConfiguration::new(VendorConfigurationSnapshot::ClaudeCode(
+                    ClaudeCodeConversationConfiguration::new(
+                        ClaudeCodePermissionMode::Default,
+                        None,
+                        None,
+                        None,
+                    )
+                    .expect("bounded Claude Code configuration"),
+                ))
+            }
+        }
+    }
+
+    fn request(seed: u8, agent_kind: AgentKind) -> AgentTurnRequest {
         let execution_id = ExecutionId::from_command_id(runtime_id(
             crate::runtime::store::RuntimeIdKind::Command,
             seed,
@@ -496,6 +519,8 @@ mod typed_prepare_tests {
             execution_id,
             std::env::current_dir().expect("current directory"),
             PromptPayload::new("typed router probe").expect("bounded prompt"),
+            3,
+            configuration(agent_kind),
         )
         .expect("absolute request cwd")
     }
@@ -523,7 +548,11 @@ mod typed_prepare_tests {
         }));
 
         let prepared: PreparedAgentTurnHandle = router
-            .prepare_turn(AgentKind::ClaudeCode, request(0x41), adapter_state(0x42))
+            .prepare_turn(
+                AgentKind::ClaudeCode,
+                request(0x41, AgentKind::ClaudeCode),
+                adapter_state(0x42),
+            )
             .await
             .expect("selected adapter prepares the turn");
 
@@ -536,6 +565,29 @@ mod typed_prepare_tests {
                 .program(),
             Path::new("/usr/bin/true")
         );
+        assert_eq!(router.active_session_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn rejects_configuration_agent_mismatch_before_adapter_hook() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut router = AgentRouter::new();
+        router.register(Arc::new(PrepareProbeAgent {
+            kind: AgentKind::Codex,
+            calls: Arc::clone(&calls),
+        }));
+
+        let error = router
+            .prepare_turn(
+                AgentKind::Codex,
+                request(0x51, AgentKind::ClaudeCode),
+                adapter_state(0x52),
+            )
+            .await
+            .expect_err("configuration agent mismatch must fail before adapter prepare");
+
+        assert_eq!(error.code, "adapter-configuration-agent-mismatch");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(router.active_session_count().await, 0);
     }
 }

@@ -11,7 +11,14 @@ use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use agentdeck_protocol::runtime::identity::{ApprovalId, EntityId, ItemId};
-use agentdeck_protocol::runtime::{ApprovalDeliveryState, ApprovalReceipt};
+use agentdeck_protocol::runtime::{
+    ApprovalDeliveryState, ApprovalReceipt, ClaudeCodeConversationConfiguration,
+    CodexConversationConfiguration, ConversationConfiguration, VendorConfigurationSnapshot,
+};
+use agentdeck_protocol::{
+    AgentKind, ClaudeCodePermissionMode, CodexApprovalPolicy, CodexReasoningEffort,
+    CodexSandboxMode,
+};
 use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinError, JoinHandle};
 
@@ -37,12 +44,13 @@ use super::model::{
 use super::recovery::RecoveryReadyPermit;
 use super::store::{
     AcceptCommand, AcceptOutcome, AcceptedTerminationReason, AuthorizeExecutionRelease,
-    AuthorizedAcceptOutcome, CommandRecord, CommandState, CommandTerminal, CompleteCommand,
-    ConversationRecord, ExecutionFence, ExecutionFenceRecord, MarkConversationRecoveryBlocked,
-    RecoveryBlockedCommandBinding, RecoveryFenceBinding, RuntimeCommitOperation, RuntimeId,
-    RuntimeIdKind, RuntimeStoreError, RuntimeStoreHandle, StartCommand, StartOutcome,
-    StartedBeforeReleaseTermination, SystemRuntimeClock, TerminateAcceptedCommand,
-    TerminateAcceptedOutcome, TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
+    AuthorizedAcceptOutcome, CommandExecutionConfiguration, CommandRecord, CommandState,
+    CommandTerminal, CompleteCommand, ConversationRecord, ExecutionFence, ExecutionFenceRecord,
+    MarkConversationRecoveryBlocked, RecoveryBlockedCommandBinding, RecoveryFenceBinding,
+    RuntimeCommitOperation, RuntimeId, RuntimeIdKind, RuntimeStoreError, RuntimeStoreHandle,
+    StartCommand, StartOutcome, StartedBeforeReleaseTermination, SystemRuntimeClock,
+    TerminateAcceptedCommand, TerminateAcceptedOutcome, TerminateStartedBeforeRelease,
+    TerminateStartedBeforeReleaseOutcome,
 };
 use crate::agent::{AdapterEvent, AdapterItemKey};
 
@@ -369,6 +377,7 @@ impl ConversationRegistry {
                     command,
                     authorization_key: None,
                     principal: None,
+                    provenance: QueuedCommandProvenance::StartupRecovery,
                 })
                 .collect(),
             active: None,
@@ -692,6 +701,16 @@ struct QueuedCommand {
     command: CommandRecord,
     authorization_key: Option<PrincipalAuthorizationKey>,
     principal: Option<AuthenticatedPrincipal>,
+    provenance: QueuedCommandProvenance,
+}
+
+/// command 进入 actor queue 的可信来源。只有 authenticated 两遍 startup
+/// reconciliation 安装的 command 才能取得 `StartupRecovery`；live accept 与
+/// idempotent replay 永远保持 `Live`，不能借 revision zero 触发迁移默认值。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueuedCommandProvenance {
+    Live,
+    StartupRecovery,
 }
 
 struct ActiveCommand {
@@ -921,6 +940,7 @@ impl ConversationActor {
                             command: command.clone(),
                             authorization_key: Some(authorization_key),
                             principal: Some(principal),
+                            provenance: QueuedCommandProvenance::Live,
                         };
                         let position = self
                             .pending
@@ -949,6 +969,7 @@ impl ConversationActor {
                                 command: command.clone(),
                                 authorization_key: Some(authorization_key),
                                 principal: Some(principal),
+                                provenance: QueuedCommandProvenance::Live,
                             };
                             let position = self
                                 .pending
@@ -1152,11 +1173,13 @@ impl ConversationActor {
         };
         let command = queued.command;
         let principal = queued.principal;
+        let provenance = queued.provenance;
         let execution_gate = Arc::new(Mutex::new(ActiveExecutionGate::default()));
         let execution_task = AbortOnDropTask::new(tokio::spawn(execute_command(
             self.conversation.clone(),
             command.clone(),
             principal,
+            provenance,
             self.store.clone(),
             self.execution.clone(),
             self.daemon_boot_id,
@@ -2365,11 +2388,54 @@ async fn prompt_admission_worker(
     }
 }
 
+fn resolve_execution_configuration(
+    conversation: &ConversationRecord,
+    execution_configuration: CommandExecutionConfiguration,
+) -> Result<(u64, ConversationConfiguration), ()> {
+    if execution_configuration.agent_kind() != conversation.descriptor.agent_kind {
+        return Err(());
+    }
+    match execution_configuration {
+        CommandExecutionConfiguration::Pinned {
+            configuration_revision,
+            configuration,
+        } if configuration_revision != 0 => Ok((configuration_revision, configuration)),
+        CommandExecutionConfiguration::LegacyRevisionZero { agent_kind } => {
+            frozen_p37_legacy_configuration(agent_kind).map(|configuration| (0, configuration))
+        }
+        CommandExecutionConfiguration::Pinned { .. } => Err(()),
+    }
+}
+
+/// schema v4→v5 前已 Accepted command 的唯一解释。该值在 daemon 层显式冻结，
+/// 不调用 adapter 的 current default，避免未来默认值漂移改变旧 command 的执行语义。
+fn frozen_p37_legacy_configuration(agent_kind: AgentKind) -> Result<ConversationConfiguration, ()> {
+    match agent_kind {
+        AgentKind::Codex => Ok(ConversationConfiguration::new(
+            VendorConfigurationSnapshot::Codex(CodexConversationConfiguration::new(
+                CodexApprovalPolicy::OnRequest,
+                CodexSandboxMode::WorkspaceWrite,
+                CodexReasoningEffort::Medium,
+            )),
+        )),
+        AgentKind::ClaudeCode => ClaudeCodeConversationConfiguration::new(
+            ClaudeCodePermissionMode::Default,
+            None,
+            None,
+            None,
+        )
+        .map(VendorConfigurationSnapshot::ClaudeCode)
+        .map(ConversationConfiguration::new)
+        .map_err(|_| ()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_command(
     conversation: ConversationRecord,
     accepted: CommandRecord,
     principal: Option<AuthenticatedPrincipal>,
+    provenance: QueuedCommandProvenance,
     store: RuntimeStoreHandle,
     execution: Arc<dyn RuntimeExecutionCoordinator>,
     daemon_boot_id: RuntimeId,
@@ -2444,23 +2510,42 @@ async fn execute_command(
         daemon_boot_id,
         execution_nonce: execution_nonce.clone(),
     };
-    let started = match store.mark_started_with_event(start_input.clone()).await {
+    let started = match provenance {
+        QueuedCommandProvenance::Live => store.mark_started_with_event(start_input.clone()).await,
+        QueuedCommandProvenance::StartupRecovery => {
+            store
+                .mark_started_for_startup_recovery(start_input.clone())
+                .await
+        }
+    };
+    let started = match started {
         Err(RuntimeStoreError::CommitOutcomeUnknown {
             operation: super::store::RuntimeCommitOperation::StartCommand,
-        }) => store.mark_started_with_event(start_input).await,
+        }) => match provenance {
+            QueuedCommandProvenance::Live => store.mark_started_with_event(start_input).await,
+            QueuedCommandProvenance::StartupRecovery => {
+                store.mark_started_for_startup_recovery(start_input).await
+            }
+        },
         outcome => outcome,
     };
     drop(start_guard);
     // begin_revoke 只有在 Accepted→Started durable transition 完成后才可继续；
     // 若 revoke CAS 先赢，try_enter 已在上方 fail-closed。
     drop(authorization_guard);
-    let (command, turn_id) = match started {
+    let (command, execution_configuration, turn_id) = match started {
         Ok(StartOutcome::Started {
-            command, intent, ..
+            command,
+            execution_configuration,
+            intent,
+            ..
         })
         | Ok(StartOutcome::Replayed {
-            command, intent, ..
-        }) => (command, intent.turn_id),
+            command,
+            execution_configuration,
+            intent,
+            ..
+        }) => (command, execution_configuration, intent.turn_id),
         // queued cancel/revoke 可能先赢得同一 SQLite transition；这不是 recovery block。
         Err(RuntimeStoreError::InvalidStateTransition) | Err(RuntimeStoreError::CommandExpired) => {
             let _ = runner_tx
@@ -2479,6 +2564,18 @@ async fn execute_command(
             return;
         }
     };
+    let (configuration_revision, execution_configuration) =
+        match resolve_execution_configuration(&conversation, execution_configuration) {
+            Ok(configuration) => configuration,
+            Err(()) => {
+                let _ = runner_tx
+                    .send(RunnerEvent::RecoveryBlocked {
+                        command_id: command.command_id,
+                    })
+                    .await;
+                return;
+            }
+        };
 
     let (started_ack, started_ready) = oneshot::channel();
     if runner_tx
@@ -2500,6 +2597,8 @@ async fn execute_command(
         .prepare(RuntimeExecutionContext {
             conversation: conversation.clone(),
             command: command.clone(),
+            configuration_revision,
+            execution_configuration,
             turn_id,
             daemon_boot_id,
             execution_nonce: execution_nonce.clone(),
@@ -2975,6 +3074,117 @@ pub(crate) mod tests {
     use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    fn configuration_test_conversation(agent_kind: AgentKind) -> ConversationRecord {
+        ConversationRecord {
+            conversation_id: runtime_id(RuntimeIdKind::Conversation, 0xF1),
+            adapter_state_key: runtime_id(RuntimeIdKind::AdapterState, 0xF2),
+            catalog_revision: 1,
+            command_high_water: Some(0),
+            event_high_water: None,
+            accepted_command_count: 1,
+            lifecycle: crate::runtime::store::ConversationLifecycle::Active,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            descriptor: ConversationDescriptor {
+                agent_kind,
+                title: None,
+                cwd: PathBuf::from("/tmp"),
+            },
+        }
+    }
+
+    #[test]
+    fn pinned_execution_configuration_preserves_exact_revision_and_value() {
+        let conversation = configuration_test_conversation(AgentKind::Codex);
+        let configuration = ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
+            CodexConversationConfiguration::new(
+                CodexApprovalPolicy::Never,
+                CodexSandboxMode::ReadOnly,
+                CodexReasoningEffort::High,
+            ),
+        ));
+
+        assert_eq!(
+            resolve_execution_configuration(
+                &conversation,
+                CommandExecutionConfiguration::Pinned {
+                    configuration_revision: 7,
+                    configuration: configuration.clone(),
+                },
+            ),
+            Ok((7, configuration))
+        );
+    }
+
+    #[test]
+    fn execution_configuration_agent_mismatch_is_rejected() {
+        let conversation = configuration_test_conversation(AgentKind::Codex);
+        let configuration =
+            ConversationConfiguration::new(VendorConfigurationSnapshot::ClaudeCode(
+                ClaudeCodeConversationConfiguration::new(
+                    ClaudeCodePermissionMode::Plan,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("bounded Claude Code configuration"),
+            ));
+
+        assert_eq!(
+            resolve_execution_configuration(
+                &conversation,
+                CommandExecutionConfiguration::Pinned {
+                    configuration_revision: 2,
+                    configuration,
+                },
+            ),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn legacy_revision_zero_materializes_frozen_p37_defaults_for_both_agents() {
+        let codex = resolve_execution_configuration(
+            &configuration_test_conversation(AgentKind::Codex),
+            CommandExecutionConfiguration::LegacyRevisionZero {
+                agent_kind: AgentKind::Codex,
+            },
+        )
+        .expect("Codex legacy default");
+        assert_eq!(codex.0, 0);
+        assert_eq!(
+            codex.1,
+            ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
+                CodexConversationConfiguration::new(
+                    CodexApprovalPolicy::OnRequest,
+                    CodexSandboxMode::WorkspaceWrite,
+                    CodexReasoningEffort::Medium,
+                ),
+            ))
+        );
+
+        let claude_code = resolve_execution_configuration(
+            &configuration_test_conversation(AgentKind::ClaudeCode),
+            CommandExecutionConfiguration::LegacyRevisionZero {
+                agent_kind: AgentKind::ClaudeCode,
+            },
+        )
+        .expect("Claude Code legacy default");
+        assert_eq!(claude_code.0, 0);
+        assert_eq!(
+            claude_code.1,
+            ConversationConfiguration::new(VendorConfigurationSnapshot::ClaudeCode(
+                ClaudeCodeConversationConfiguration::new(
+                    ClaudeCodePermissionMode::Default,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("bounded Claude Code configuration"),
+            ))
+        );
+    }
 
     struct NoopApprovalDelivery {
         policy: ApprovalPolicySnapshot,

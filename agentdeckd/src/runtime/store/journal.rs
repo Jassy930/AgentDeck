@@ -1138,6 +1138,7 @@ pub(crate) fn mark_started_with_event(
     config: &RuntimeStoreConfig,
     input: StartCommand,
     event_source: StartEventSource,
+    start_provenance: super::command_configuration::CommandStartProvenance,
     effects: &mut CommandStreamEffects,
 ) -> Result<StartOutcome, RuntimeStoreError> {
     ensure_kind(input.conversation_id, RuntimeIdKind::Conversation)?;
@@ -1173,19 +1174,39 @@ pub(crate) fn mark_started_with_event(
         return Err(RuntimeStoreError::CommandNotFound);
     }
     if preflight_command.state == CommandState::Started {
-        let intent = load_intent(&state.connection, key_bundle, database_id, input.command_id)?;
+        // Replayed outcome 也必须从一个显式、单一 read transaction 取得 command、
+        // exact pin、完整 configuration chain、intent 与 event，不能用多条 autocommit
+        // read 拼出可能跨 snapshot 的 execution contract。
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let replayed_command =
+            load_command(&transaction, key_bundle, database_id, input.command_id)?;
+        if replayed_command.conversation_id != input.conversation_id
+            || replayed_command.state != CommandState::Started
+        {
+            return Err(RuntimeStoreError::InvalidStateTransition);
+        }
+        let execution_configuration = super::command_configuration::load_execution_configuration(
+            &transaction,
+            key_bundle,
+            database_id,
+            &replayed_command,
+            start_provenance,
+        )?;
+        let intent = load_intent(&transaction, key_bundle, database_id, input.command_id)?;
         let event = load_event(
-            &state.connection,
+            &transaction,
             key_bundle,
             database_id,
             intent.started_event_id,
         )?;
-        validate_started_linkage(&preflight_command, &intent, &event)?;
+        validate_started_linkage(&replayed_command, &intent, &event)?;
         let expected = command_event::start_records(
-            &preflight_command,
+            &replayed_command,
             CommandEventIdentity {
-                conversation_id: preflight_command.conversation_id,
-                command_id: preflight_command.command_id,
+                conversation_id: replayed_command.conversation_id,
+                command_id: replayed_command.command_id,
                 turn_id: intent.turn_id,
                 event_id: event.event_id,
                 event_seq: event.event_seq,
@@ -1200,10 +1221,23 @@ pub(crate) fn mark_started_with_event(
             return Err(RuntimeStoreError::StartConflict);
         }
         return Ok(StartOutcome::Replayed {
-            command: preflight_command,
+            command: replayed_command,
+            execution_configuration,
             intent,
             event,
         });
+    }
+    // rev0 provenance 在 ordinary capacity admission 前 fail-fast；非零 exact
+    // configuration 只在下方 BEGIN IMMEDIATE transaction 内完整认证一次，避免
+    // 4,096 版合法链在每次 Start 被重复解密两遍。
+    if preflight_command.configuration_revision == 0 {
+        super::command_configuration::load_execution_configuration(
+            &state.connection,
+            key_bundle,
+            database_id,
+            &preflight_command,
+            start_provenance,
+        )?;
     }
     if preflight_command.state == CommandState::Expired {
         return Err(RuntimeStoreError::CommandExpired);
@@ -1266,6 +1300,13 @@ pub(crate) fn mark_started_with_event(
     if command.conversation_id != input.conversation_id {
         return Err(RuntimeStoreError::CommandNotFound);
     }
+    let execution_configuration = super::command_configuration::load_execution_configuration(
+        &transaction,
+        key_bundle,
+        database_id,
+        &command,
+        start_provenance,
+    )?;
     if command.state == CommandState::Started {
         let intent = load_intent(&transaction, key_bundle, database_id, input.command_id)?;
         let event = load_event(
@@ -1295,6 +1336,7 @@ pub(crate) fn mark_started_with_event(
         }
         return Ok(StartOutcome::Replayed {
             command,
+            execution_configuration,
             intent,
             event,
         });
@@ -1520,6 +1562,7 @@ pub(crate) fn mark_started_with_event(
     };
     Ok(StartOutcome::Started {
         command,
+        execution_configuration,
         intent: ExecutionIntentRecord {
             command_id: input.command_id,
             turn_id,

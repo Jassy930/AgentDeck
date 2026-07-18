@@ -140,10 +140,23 @@ pub(super) struct CodexRuntimeTranslator {
     retained_bytes: usize,
     retained_byte_limit: usize,
     token_usage: Option<PendingTokenUsage>,
+    approval_policy: CodexApprovalPolicy,
+    sandbox: CodexSandboxMode,
 }
 
 impl CodexRuntimeTranslator {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
+        Self::with_configuration(
+            CodexApprovalPolicy::OnRequest,
+            CodexSandboxMode::WorkspaceWrite,
+        )
+    }
+
+    pub(super) fn with_configuration(
+        approval_policy: CodexApprovalPolicy,
+        sandbox: CodexSandboxMode,
+    ) -> Self {
         Self {
             in_flight: HashMap::new(),
             completed_ids: HashSet::new(),
@@ -152,6 +165,8 @@ impl CodexRuntimeTranslator {
             retained_bytes: 0,
             retained_byte_limit: MAX_TRANSLATOR_RETAINED_BYTES,
             token_usage: None,
+            approval_policy,
+            sandbox,
         }
     }
 
@@ -724,8 +739,8 @@ impl CodexRuntimeTranslator {
             kind,
             summary,
             vendor: ActionRequestVendor::Codex {
-                approval_policy_at_decision: CodexApprovalPolicy::OnRequest,
-                sandbox_at_decision: CodexSandboxMode::WorkspaceWrite,
+                approval_policy_at_decision: self.approval_policy,
+                sandbox_at_decision: self.sandbox,
                 can_persist: true,
             },
         })

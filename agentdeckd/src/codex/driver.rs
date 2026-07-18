@@ -7,14 +7,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentdeck_protocol::{
-    ActionDecision, ActionDecisionKind, ActionRequest, AgentKind, ProtocolError,
-    SessionCapabilities, ThreadId, TurnSummary,
+    ActionDecision, ActionDecisionKind, ActionRequest, AgentKind, CodexApprovalPolicy,
+    CodexReasoningEffort, CodexSandboxMode, ProtocolError, SessionCapabilities, ThreadId,
+    TurnSummary,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
-use super::adapter::{CANONICAL_CODEX_CLI_VERSION, approval_response_body};
+use super::adapter::{
+    CANONICAL_CODEX_CLI_VERSION, approval_policy_str, approval_response_body, reasoning_effort_str,
+    sandbox_mode_str,
+};
 use super::capabilities::build_codex_capabilities;
 use super::runtime_translate::{CodexApprovalRoute, CodexRuntimeOutput, CodexRuntimeTranslator};
 use super::state::CodexStateRepository;
@@ -69,6 +73,9 @@ pub(super) struct CodexPreparedTurn {
     pub(super) resume_thread_id: Option<ThreadId>,
     pub(super) cwd: std::path::PathBuf,
     pub(super) prompt: String,
+    pub(super) approval_policy: CodexApprovalPolicy,
+    pub(super) sandbox: CodexSandboxMode,
+    pub(super) reasoning_effort: CodexReasoningEffort,
 }
 
 impl PreparedAgentTurn for CodexPreparedTurn {
@@ -133,8 +140,8 @@ async fn run_codex_turn(
                 json!({
                     "threadId": expected.0,
                     "cwd": prepared.cwd,
-                    "sandbox": "workspace-write",
-                    "approvalPolicy": "on-request"
+                    "sandbox": sandbox_mode_str(prepared.sandbox),
+                    "approvalPolicy": approval_policy_str(prepared.approval_policy)
                 }),
                 &mut buffered,
                 &mut buffered_bytes,
@@ -166,8 +173,8 @@ async fn run_codex_turn(
                 "thread/start",
                 json!({
                     "cwd": prepared.cwd,
-                    "sandbox": "workspace-write",
-                    "approvalPolicy": "on-request"
+                    "sandbox": sandbox_mode_str(prepared.sandbox),
+                    "approvalPolicy": approval_policy_str(prepared.approval_policy)
                 }),
                 &mut buffered,
                 &mut buffered_bytes,
@@ -193,7 +200,7 @@ async fn run_codex_turn(
         json!({
             "threadId": thread_id.0,
             "input": [{"type": "text", "text": prepared.prompt}],
-            "effort": "medium"
+            "effort": reasoning_effort_str(prepared.reasoning_effort)
         }),
         &mut buffered,
         &mut buffered_bytes,
@@ -206,7 +213,8 @@ async fn run_codex_turn(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| fixed_error("codex-turn-identity-missing"))?
         .to_owned();
-    let mut translator = CodexRuntimeTranslator::new();
+    let mut translator =
+        CodexRuntimeTranslator::with_configuration(prepared.approval_policy, prepared.sandbox);
     for frame in buffered {
         handle_frame(
             frame,

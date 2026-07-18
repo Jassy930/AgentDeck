@@ -97,10 +97,11 @@ mod migration_tests {
 
     use super::*;
     use crate::runtime::model::{
-        AcceptCommand, AcceptOutcome, CommandReceiptSelector, CommandState, ConversationDescriptor,
-        ConversationLifecycle, ExecutionFence, IdempotencyOwner, MachineEnrollmentReceiptRecord,
-        NewConversation, QueryCommandReceipt, RuntimeCapacityObservation, RuntimeCapacityProbe,
-        RuntimeCapacityProbeError, RuntimeStoreFaultInjector, StartCommand, StartOutcome,
+        AcceptCommand, AcceptOutcome, CommandExecutionConfiguration, CommandReceiptSelector,
+        CommandState, ConversationDescriptor, ConversationLifecycle, ExecutionFence,
+        IdempotencyOwner, MachineEnrollmentReceiptRecord, NewConversation, QueryCommandReceipt,
+        RuntimeCapacityObservation, RuntimeCapacityProbe, RuntimeCapacityProbeError,
+        RuntimeStoreFaultInjector, StartCommand, StartOutcome,
     };
     use crate::runtime::store::cipher::RowAad;
     use crate::runtime::store::identity::{RuntimeId, RuntimeIdKind};
@@ -1860,6 +1861,73 @@ mod migration_tests {
             (0, 0),
             "strict v1 cutoff 内命令不得伪造 current revision pin"
         );
+    }
+
+    #[tokio::test]
+    async fn migrated_revision_zero_start_requires_explicit_startup_recovery_provenance() {
+        // B3b：合法 migration cutoff 内的 rev0 command 也不能从普通 live queue
+        // 偷用 defaults；只有 daemon startup recovery 的窄入口可以取得 legacy variant。
+        let mut fixture = MigratedStrictV1Fixture::create("rev0-startup-provenance").await;
+        let start = StartCommand {
+            conversation_id: fixture.legacy_accepted.conversation_id,
+            command_id: fixture.legacy_accepted.command_id,
+            daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 0xA1),
+            execution_nonce: b"legacy-startup-recovery-nonce".to_vec(),
+        };
+        let ordinary_error = fixture
+            .store()
+            .mark_started_with_event(start.clone())
+            .await
+            .expect_err("ordinary queue must reject migrated revision zero");
+        assert!(matches!(
+            ordinary_error,
+            RuntimeStoreError::InvalidStateTransition
+        ));
+
+        let assert_legacy = |outcome: StartOutcome, expected_started: bool| match outcome {
+            StartOutcome::Started {
+                command,
+                execution_configuration:
+                    CommandExecutionConfiguration::LegacyRevisionZero { agent_kind },
+                ..
+            } if expected_started => {
+                assert_eq!(command.configuration_revision, 0);
+                assert_eq!(agent_kind, agentdeck_protocol::AgentKind::Codex);
+            }
+            StartOutcome::Replayed {
+                command,
+                execution_configuration:
+                    CommandExecutionConfiguration::LegacyRevisionZero { agent_kind },
+                ..
+            } if !expected_started => {
+                assert_eq!(command.configuration_revision, 0);
+                assert_eq!(agent_kind, agentdeck_protocol::AgentKind::Codex);
+            }
+            other => panic!("unexpected legacy startup outcome: {other:?}"),
+        };
+        assert_legacy(
+            fixture
+                .store()
+                .mark_started_for_startup_recovery(start.clone())
+                .await
+                .expect("startup recovery may start migrated revision zero"),
+            true,
+        );
+        assert_legacy(
+            fixture
+                .store()
+                .mark_started_for_startup_recovery(start)
+                .await
+                .expect("startup recovery replay preserves legacy revision zero"),
+            false,
+        );
+        fixture
+            .store
+            .take()
+            .expect("take migrated revision zero store")
+            .shutdown()
+            .await
+            .expect("shutdown migrated revision zero store");
     }
 
     #[tokio::test]

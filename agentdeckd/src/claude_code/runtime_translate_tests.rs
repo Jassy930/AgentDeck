@@ -10,6 +10,34 @@ use super::translate::ClaudeCodeTranslator;
 use crate::agent::AdapterEvent;
 
 #[test]
+fn approval_metadata_uses_the_frozen_permission_mode() {
+    let mut translator =
+        ClaudeCodeRuntimeTranslator::with_permission_mode(ClaudeCodePermissionMode::Plan);
+    let outputs = translator
+        .translate_value(&json!({
+            "type": "control_request",
+            "request_id": "frozen-config-request",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "input": {"command": "pwd"},
+                "tool_use_id": "frozen-config-tool"
+            }
+        }))
+        .expect("modeled control request with frozen permission mode");
+    let [ClaudeCodeRuntimeOutput::Approval { request, .. }] = outputs.as_slice() else {
+        panic!("control request must yield one approval")
+    };
+    assert!(matches!(
+        request.vendor,
+        ActionRequestVendor::ClaudeCode {
+            permission_mode_at_decision: ClaudeCodePermissionMode::Plan,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn recorded_simple_turn_translates_without_vendor_identity() {
     let mut translator = ClaudeCodeRuntimeTranslator::new();
     let mut items = Vec::new();
