@@ -119,6 +119,28 @@ fn frozen_configuration_maps_identically_to_fresh_and_resume_argv() {
     assert!(!resume.iter().any(|argument| argument == "--session-id"));
 }
 
+#[test]
+fn default_permission_mode_uses_current_manual_cli_value_for_fresh_and_resume() {
+    let configuration = ClaudeCodeConversationConfiguration::new(
+        ClaudeCodePermissionMode::Default,
+        None,
+        None,
+        None,
+    )
+    .expect("bounded default Claude Code configuration");
+    let session = ThreadId("default-native-session".to_owned());
+
+    let fresh = typed_execution_args(&configuration, &session, false);
+    assert_eq!(flag_value(&fresh, "--permission-mode"), "manual");
+    assert_eq!(flag_value(&fresh, "--session-id"), "default-native-session");
+    assert!(!fresh.iter().any(|argument| argument == "default"));
+
+    let resume = typed_execution_args(&configuration, &session, true);
+    assert_eq!(flag_value(&resume, "--permission-mode"), "manual");
+    assert_eq!(flag_value(&resume, "--resume"), "default-native-session");
+    assert!(!resume.iter().any(|argument| argument == "default"));
+}
+
 struct TestStore {
     root: PathBuf,
     store: RuntimeStoreHandle,

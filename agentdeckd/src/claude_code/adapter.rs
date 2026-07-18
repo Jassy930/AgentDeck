@@ -1397,7 +1397,9 @@ pub(super) fn typed_execution_args(
 
 fn permission_mode_to_cli(m: ClaudeCodePermissionMode) -> &'static str {
     match m {
-        ClaudeCodePermissionMode::Default => "default",
+        // Protocol/UI 的 `Default` 表示 Claude Code 的常规人工确认语义；
+        // 当前 2.1.207 CLI 将该 argv 值命名为 `manual`，不接受旧值 `default`。
+        ClaudeCodePermissionMode::Default => "manual",
         ClaudeCodePermissionMode::AcceptEdits => "acceptEdits",
         ClaudeCodePermissionMode::Plan => "plan",
         ClaudeCodePermissionMode::Auto => "auto",
@@ -1647,7 +1649,7 @@ mod tests {
     #[test]
     fn permission_mode_cli_strings_cover_all_six_variants() {
         let modes = [
-            (ClaudeCodePermissionMode::Default, "default"),
+            (ClaudeCodePermissionMode::Default, "manual"),
             (ClaudeCodePermissionMode::AcceptEdits, "acceptEdits"),
             (ClaudeCodePermissionMode::Plan, "plan"),
             (ClaudeCodePermissionMode::Auto, "auto"),
