@@ -29,6 +29,16 @@ use crate::security::{MemoryKeyStore, StorageKek, load_or_create_storage_kek};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 
+async fn wait_until_principal_revoking(principal: &AuthenticatedPrincipal) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while principal.is_active() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("principal must enter Revoking before the test releases Store COMMIT");
+}
+
 struct SequenceIdSource(VecDeque<RuntimeId>);
 
 impl SequenceIdSource {
@@ -67,6 +77,12 @@ struct BlockConfigureConversationBeforeCommit {
     blocked: AtomicBool,
 }
 
+struct BlockUpdateConversationMetadataBeforeCommit {
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    blocked: AtomicBool,
+}
+
 struct BlockAcceptCommandBeforeCommit {
     entered: Arc<Barrier>,
     release: Arc<Barrier>,
@@ -99,6 +115,30 @@ impl super::super::store::RuntimeStoreFaultInjector for BlockConfigureConversati
         {
             self.entered.wait();
             self.release.wait();
+        }
+        Ok(())
+    }
+}
+
+impl super::super::store::RuntimeStoreFaultInjector
+    for BlockUpdateConversationMetadataBeforeCommit
+{
+    fn before_operation(
+        &self,
+        operation: super::super::store::RuntimeStoreOperation,
+    ) -> Result<(), RuntimeStoreError> {
+        if operation
+            == super::super::store::RuntimeStoreOperation::UpdateConversationMetadataBeforeCommit
+            && !self.blocked.swap(true, Ordering::SeqCst)
+        {
+            self.entered.send(()).map_err(|_| {
+                RuntimeStoreError::InvalidConfig("metadata test entry receiver dropped")
+            })?;
+            self.release
+                .lock()
+                .map_err(|_| RuntimeStoreError::InvalidConfig("metadata test release poisoned"))?
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|_| RuntimeStoreError::InvalidConfig("metadata test release timed out"))?;
         }
         Ok(())
     }
@@ -970,6 +1010,244 @@ async fn canceled_configure_caller_keeps_authorization_until_store_completion() 
     core.shutdown()
         .await
         .expect("shutdown canceled Configure core");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_authorization_guard_covers_store_commit_and_reply() {
+    // 威胁场景：若 metadata Update 在把请求交给 Store 后提前释放 guard，issuer
+    // revoke 可在 COMMIT 前完成；已经通过授权线性化点的请求随后会错误地失去稳定结果。
+    let root = TestRoot::new("metadata-authorization-commit");
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let store = RuntimeStoreHandle::open(
+        super::super::store::RuntimeStoreConfig::new(root.path.join("runtime.db"))
+            .with_command_capacity(1_024)
+            .with_fault_injector(Arc::new(BlockUpdateConversationMetadataBeforeCommit {
+                entered: entered_tx,
+                release: std::sync::Mutex::new(release_rx),
+                blocked: AtomicBool::new(false),
+            })),
+        root.kek(),
+    )
+    .await
+    .expect("open metadata authorization store");
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let core =
+        Arc::new(RuntimeCore::new(store, router, [0xA8; 32]).expect("construct metadata core"));
+    core.recover()
+        .await
+        .expect("recover metadata authorization core");
+    let principal = core
+        .issue_verified_local_principal(501, [0x79; 16])
+        .expect("issue metadata authorization principal");
+    let owner = principal.idempotency_owner();
+    let (sink, mut receiver) = mpsc::channel::<crate::runtime::ConnectionWrite>(8);
+    tokio::spawn(async move {
+        while let Some(write) = receiver.recv().await {
+            let _ = write.acknowledge();
+        }
+    });
+    let connection = core
+        .connect(principal.clone(), ConnectionSink::new(sink))
+        .expect("connect metadata authorization principal");
+    let conversation = start_receipt(
+        core.handle(connection, start_request("metadata-authorization-start"))
+            .await,
+    );
+    let internal_conversation = parse_conversation_id(&conversation.conversation_id)
+        .expect("parse metadata authorization conversation");
+    let idempotency_key = "metadata-authorization";
+    let mutation = ConversationMetadataMutation::SetArchived { archived: true };
+
+    let handling = tokio::spawn({
+        let core = core.clone();
+        let conversation_id = conversation.conversation_id.clone();
+        let mutation = mutation.clone();
+        async move {
+            core.handle(
+                connection,
+                RuntimeRequest::UpdateConversationMetadata(
+                    ConversationMetadataMutationRequest::new(
+                        conversation_id,
+                        IdempotencyKey::new(idempotency_key),
+                        0,
+                        mutation,
+                    )
+                    .expect("valid authorized metadata request"),
+                ),
+            )
+            .await
+        }
+    });
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(std::time::Duration::from_secs(5)))
+        .await
+        .expect("join metadata Update before-COMMIT observer")
+        .expect("observe metadata Update before COMMIT");
+    let revoking = tokio::spawn({
+        let principal = principal.clone();
+        async move { principal.begin_revoke().await }
+    });
+    wait_until_principal_revoking(&principal).await;
+    assert!(
+        !revoking.is_finished(),
+        "revoke must remain blocked after entering Revoking and before Store COMMIT"
+    );
+    release_tx
+        .send(())
+        .expect("release metadata Update before COMMIT");
+    let revoke_result = tokio::time::timeout(std::time::Duration::from_secs(5), revoking)
+        .await
+        .expect("metadata principal revoke must finish after Store COMMIT");
+    assert!(matches!(
+        handling.await.expect("join metadata Update request"),
+        RuntimeReply::ConversationMetadata(ConversationMetadataReceipt::Applied {
+            entry_revision: 1,
+            ..
+        })
+    ));
+    revoke_result
+        .expect("join metadata principal revoke")
+        .expect("revoke after metadata Store reply");
+    let replay = core
+        .store
+        .update_managed_conversation_metadata(UpdateManagedConversationMetadata {
+            conversation_id: internal_conversation,
+            owner,
+            idempotency_key: idempotency_key.to_owned(),
+            expected_entry_revision: 0,
+            mutation,
+        })
+        .await
+        .expect("replay committed metadata outcome");
+    assert!(matches!(
+        replay,
+        UpdateConversationMetadataOutcome::Replayed { mutation }
+            if mutation.conversation_id == internal_conversation && mutation.entry_revision == 1
+    ));
+    principal.finish_revoke();
+    core.shutdown()
+        .await
+        .expect("shutdown metadata authorization core");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canceled_metadata_caller_keeps_authorization_until_store_completion() {
+    // 威胁场景：caller future 被取消后，已入 Store 队列的 metadata Update 仍必须持有
+    // guard；否则 revoke 会越过 durable outcome/notify/reply，留下无法稳定重放的半完成观察。
+    let root = TestRoot::new("metadata-caller-canceled");
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let store = RuntimeStoreHandle::open(
+        super::super::store::RuntimeStoreConfig::new(root.path.join("runtime.db"))
+            .with_command_capacity(1_024)
+            .with_fault_injector(Arc::new(BlockUpdateConversationMetadataBeforeCommit {
+                entered: entered_tx,
+                release: std::sync::Mutex::new(release_rx),
+                blocked: AtomicBool::new(false),
+            })),
+        root.kek(),
+    )
+    .await
+    .expect("open canceled metadata store");
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let core =
+        Arc::new(RuntimeCore::new(store, router, [0xA9; 32]).expect("construct metadata core"));
+    core.recover()
+        .await
+        .expect("recover canceled metadata core");
+    let principal = core
+        .issue_verified_local_principal(501, [0x7A; 16])
+        .expect("issue canceled metadata principal");
+    let owner = principal.idempotency_owner();
+    let (sink, mut receiver) = mpsc::channel::<crate::runtime::ConnectionWrite>(8);
+    tokio::spawn(async move {
+        while let Some(write) = receiver.recv().await {
+            let _ = write.acknowledge();
+        }
+    });
+    let connection = core
+        .connect(principal.clone(), ConnectionSink::new(sink))
+        .expect("connect canceled metadata principal");
+    let conversation = start_receipt(
+        core.handle(connection, start_request("metadata-canceled-start"))
+            .await,
+    );
+    let internal_conversation = parse_conversation_id(&conversation.conversation_id)
+        .expect("parse canceled metadata conversation");
+    let idempotency_key = "metadata-canceled";
+    let mutation = ConversationMetadataMutation::rename(Some("committed after cancel".to_owned()))
+        .expect("bounded canceled metadata title");
+
+    let handling = tokio::spawn({
+        let core = core.clone();
+        let conversation_id = conversation.conversation_id.clone();
+        let mutation = mutation.clone();
+        async move {
+            core.handle(
+                connection,
+                RuntimeRequest::UpdateConversationMetadata(
+                    ConversationMetadataMutationRequest::new(
+                        conversation_id,
+                        IdempotencyKey::new(idempotency_key),
+                        0,
+                        mutation,
+                    )
+                    .expect("valid canceled metadata request"),
+                ),
+            )
+            .await
+        }
+    });
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(std::time::Duration::from_secs(5)))
+        .await
+        .expect("join canceled metadata Update before-COMMIT observer")
+        .expect("observe canceled metadata Update before COMMIT");
+    handling.abort();
+    assert!(
+        handling
+            .await
+            .expect_err("metadata caller must be canceled")
+            .is_cancelled(),
+        "aborted metadata caller reports cancellation"
+    );
+    let revoking = tokio::spawn({
+        let principal = principal.clone();
+        async move { principal.begin_revoke().await }
+    });
+    wait_until_principal_revoking(&principal).await;
+    assert!(
+        !revoking.is_finished(),
+        "revoke must remain blocked after caller cancellation and before Store COMMIT"
+    );
+    release_tx
+        .send(())
+        .expect("release canceled metadata Update before COMMIT");
+    let revoke_result = tokio::time::timeout(std::time::Duration::from_secs(5), revoking)
+        .await
+        .expect("canceled metadata revoke must finish after Store COMMIT");
+    revoke_result
+        .expect("join canceled metadata revoke")
+        .expect("revoke after detached metadata Store completion");
+    let replay = core
+        .store
+        .update_managed_conversation_metadata(UpdateManagedConversationMetadata {
+            conversation_id: internal_conversation,
+            owner,
+            idempotency_key: idempotency_key.to_owned(),
+            expected_entry_revision: 0,
+            mutation,
+        })
+        .await
+        .expect("replay metadata committed after caller cancellation");
+    assert!(matches!(
+        replay,
+        UpdateConversationMetadataOutcome::Replayed { mutation }
+            if mutation.conversation_id == internal_conversation && mutation.entry_revision == 1
+    ));
+    principal.finish_revoke();
+    core.shutdown()
+        .await
+        .expect("shutdown canceled metadata core");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

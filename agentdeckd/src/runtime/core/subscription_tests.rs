@@ -21,6 +21,10 @@ struct FailConfigureAfterCommitOnce {
     armed: AtomicBool,
 }
 
+struct FailMetadataAfterCommitOnce {
+    armed: AtomicBool,
+}
+
 impl RuntimeStoreFaultInjector for FailConfigureAfterCommitOnce {
     fn before_operation(&self, operation: RuntimeStoreOperation) -> Result<(), RuntimeStoreError> {
         if operation == RuntimeStoreOperation::ConfigureConversationAfterCommit
@@ -28,6 +32,19 @@ impl RuntimeStoreFaultInjector for FailConfigureAfterCommitOnce {
         {
             return Err(RuntimeStoreError::InvalidConfig(
                 "injected Configure after-COMMIT fault",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl RuntimeStoreFaultInjector for FailMetadataAfterCommitOnce {
+    fn before_operation(&self, operation: RuntimeStoreOperation) -> Result<(), RuntimeStoreError> {
+        if operation == RuntimeStoreOperation::UpdateConversationMetadataAfterCommit
+            && self.armed.swap(false, Ordering::SeqCst)
+        {
+            return Err(RuntimeStoreError::InvalidConfig(
+                "injected metadata Update after-COMMIT fault",
             ));
         }
         Ok(())
@@ -834,6 +851,140 @@ async fn metadata_applied_emits_one_exact_catalog_delta_and_no_conversation_even
     core.shutdown()
         .await
         .expect("shutdown metadata stream core");
+}
+
+#[tokio::test]
+async fn metadata_after_commit_unknown_notifies_once_and_exact_retry_replays() {
+    // 威胁场景：metadata COMMIT 已成功但调用方只看到 unknown 时，Catalog 通知必须
+    // 仍由 durable effects 发出一次；exact retry 只能读回账本，不能再广播或写 conversation event。
+    let root = TestRoot::new("metadata-after-commit-unknown-stream");
+    let store = RuntimeStoreHandle::open(
+        crate::runtime::store::RuntimeStoreConfig::new(root.path.join("runtime.db"))
+            .with_command_capacity(1_024)
+            .with_fault_injector(Arc::new(FailMetadataAfterCommitOnce {
+                armed: AtomicBool::new(true),
+            })),
+        root.kek(),
+    )
+    .await
+    .expect("open metadata after-COMMIT unknown store");
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let core = Arc::new(RuntimeCore::new(store, router, [0xAA; 32]).expect("construct core"));
+    core.recover()
+        .await
+        .expect("recover metadata after-COMMIT unknown core");
+
+    let (conversation_connection, mut conversation_receiver) = connect_recording(&core, 0x96).await;
+    let conversation = start_receipt(
+        core.handle(
+            conversation_connection,
+            start_request("metadata-unknown-start"),
+        )
+        .await,
+    );
+    let conversation_id = parse_conversation_id(&conversation.conversation_id)
+        .expect("parse metadata unknown-outcome conversation");
+    core.handle_envelope(
+        conversation_connection,
+        subscribe_conversation_envelope("metadata-unknown-conversation", conversation_id),
+    )
+    .await
+    .expect("subscribe conversation before unknown metadata Update");
+    for label in [
+        "metadata unknown conversation subscription receipt",
+        "metadata unknown conversation snapshot",
+        "metadata unknown conversation sync",
+    ] {
+        receive_envelope_and_ack(&mut conversation_receiver, label).await;
+    }
+
+    let (catalog_connection, mut catalog_receiver) = connect_recording(&core, 0x97).await;
+    core.handle_envelope(
+        catalog_connection,
+        subscribe_catalog_envelope("metadata-unknown-catalog"),
+    )
+    .await
+    .expect("subscribe catalog before unknown metadata Update");
+    for label in [
+        "metadata unknown catalog subscription receipt",
+        "metadata unknown catalog snapshot",
+        "metadata unknown catalog sync",
+    ] {
+        receive_envelope_and_ack(&mut catalog_receiver, label).await;
+    }
+
+    let request = ConversationMetadataMutationRequest::new(
+        conversation.conversation_id.clone(),
+        IdempotencyKey::new("metadata-unknown-exact"),
+        0,
+        ConversationMetadataMutation::SetArchived { archived: true },
+    )
+    .expect("valid metadata unknown-outcome request");
+    assert!(matches!(
+        core.handle(
+            conversation_connection,
+            RuntimeRequest::UpdateConversationMetadata(request.clone()),
+        )
+        .await,
+        RuntimeReply::ConversationMetadata(ConversationMetadataReceipt::Failed {
+            failure: RuntimeFailure { code, .. }
+        }) if code == "daemon.runtime.store_unavailable"
+    ));
+
+    let live =
+        receive_envelope_and_ack(&mut catalog_receiver, "metadata unknown catalog delta").await;
+    let RuntimeMessage::Stream(RuntimeStreamItem::CatalogDelta(delta)) = live.body else {
+        panic!("committed metadata unknown outcome must emit one CatalogDelta")
+    };
+    assert_eq!(delta.catalog_revision, 1);
+    let [CatalogChange::Upserted { entry }] = delta.changes.as_slice() else {
+        panic!("metadata unknown delta must contain exactly one upsert")
+    };
+    assert_eq!(entry.conversation_id, conversation.conversation_id);
+    assert_eq!(entry.entry_revision, 1);
+    assert!(entry.archived);
+    assert!(
+        timeout(Duration::from_millis(100), catalog_receiver.recv())
+            .await
+            .is_err(),
+        "metadata after-COMMIT unknown emitted duplicate CatalogDelta"
+    );
+    assert!(
+        timeout(Duration::from_millis(100), conversation_receiver.recv())
+            .await
+            .is_err(),
+        "metadata after-COMMIT unknown emitted a conversation event"
+    );
+
+    assert!(matches!(
+        core.handle(
+            conversation_connection,
+            RuntimeRequest::UpdateConversationMetadata(request),
+        )
+        .await,
+        RuntimeReply::ConversationMetadata(ConversationMetadataReceipt::Replayed {
+            entry_revision: 1,
+            ..
+        })
+    ));
+    assert!(
+        timeout(Duration::from_millis(100), catalog_receiver.recv())
+            .await
+            .is_err(),
+        "metadata exact retry emitted a second CatalogDelta"
+    );
+    assert!(
+        timeout(Duration::from_millis(100), conversation_receiver.recv())
+            .await
+            .is_err(),
+        "metadata exact retry emitted a conversation event"
+    );
+
+    core.disconnect(conversation_connection).await;
+    core.disconnect(catalog_connection).await;
+    core.shutdown()
+        .await
+        .expect("shutdown metadata after-COMMIT unknown core");
 }
 
 #[tokio::test]
