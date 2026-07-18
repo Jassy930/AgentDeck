@@ -57,6 +57,10 @@ use super::execution_event::PreparedExecutionEvent;
 use super::identity::{
     MAX_RUNTIME_ID_COLLISION_ATTEMPTS, RuntimeId, RuntimeIdError, RuntimeIdKind,
 };
+use super::metadata::{
+    self, PreparedMetadataMutationRequest, UpdateConversationMetadataOutcome,
+    UpdateManagedConversationMetadata,
+};
 use super::publication::{
     FreezePublicationRequest, FrozenPublication, PublicationAcknowledgement, PublicationBarrierCut,
     PublicationScope, PublicationStreamRecord, RotatePublicationStreamRequest,
@@ -556,6 +560,45 @@ impl RuntimeStoreHandle {
             RuntimeStoreLane::Normal,
             charge,
             |reply| NormalCommand::ConfigureConversation {
+                prepared,
+                authorization,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub async fn update_managed_conversation_metadata(
+        &self,
+        input: UpdateManagedConversationMetadata,
+    ) -> Result<UpdateConversationMetadataOutcome, RuntimeStoreError> {
+        self.update_managed_conversation_metadata_inner(input, None)
+            .await
+    }
+
+    pub(crate) async fn update_managed_conversation_metadata_authorized(
+        &self,
+        input: UpdateManagedConversationMetadata,
+        authorization: AuthorizationGuard,
+    ) -> Result<UpdateConversationMetadataOutcome, RuntimeStoreError> {
+        self.update_managed_conversation_metadata_inner(input, Some(authorization))
+            .await
+    }
+
+    async fn update_managed_conversation_metadata_inner(
+        &self,
+        input: UpdateManagedConversationMetadata,
+        authorization: Option<AuthorizationGuard>,
+    ) -> Result<UpdateConversationMetadataOutcome, RuntimeStoreError> {
+        let prepared = metadata::prepare_metadata_mutation_request(input)?;
+        let charge = memory_charge(size_of::<NormalCommand>(), &[prepared.retained_capacity()?])?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::UpdateConversationMetadata {
                 prepared,
                 authorization,
                 reply,
@@ -1307,6 +1350,11 @@ enum NormalCommand {
         authorization: Option<AuthorizationGuard>,
         reply: oneshot::Sender<Result<ConfigureConversationOutcome, RuntimeStoreError>>,
     },
+    UpdateConversationMetadata {
+        prepared: PreparedMetadataMutationRequest,
+        authorization: Option<AuthorizationGuard>,
+        reply: oneshot::Sender<Result<UpdateConversationMetadataOutcome, RuntimeStoreError>>,
+    },
     AcceptCommand {
         input: AcceptCommand,
         reply: AcceptCommandReply,
@@ -1764,6 +1812,14 @@ fn handle_normal(
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
                 drop(authorization);
             }
+            NormalCommand::UpdateConversationMetadata {
+                authorization,
+                reply,
+                ..
+            } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+                drop(authorization);
+            }
             NormalCommand::AcceptCommand { reply, .. } => {
                 reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
@@ -1843,6 +1899,22 @@ fn handle_normal(
             let mut effects = CommandStreamEffects::default();
             let result =
                 configuration::configure_conversation(state, config, prepared, &mut effects);
+            let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
+            let _ = reply.send(result);
+            drop(authorization);
+        }
+        NormalCommand::UpdateConversationMetadata {
+            prepared,
+            authorization,
+            reply,
+        } => {
+            let mut effects = CommandStreamEffects::default();
+            let result = metadata::update_managed_conversation_metadata(
+                state,
+                config,
+                prepared,
+                &mut effects,
+            );
             let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
             let _ = reply.send(result);
             drop(authorization);

@@ -79,6 +79,9 @@ pub(crate) enum SafetyReserveProjection {
     // Approval journal 在同一 P3.5 阶段接线；先把 reserve projection 固定为 store contract。
     #[allow(dead_code)]
     RegisterApproval,
+    // B4 先冻结 native claim 的物理 terminal reserve；真正 vendor claim 在 C0-C 接线。
+    #[allow(dead_code)]
+    ClaimMetadataMutation,
 }
 
 #[cfg(test)]
@@ -3828,7 +3831,12 @@ fn validate_current_configuration_before_read_write_open(
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
     verify_runtime_ledger_token(&key_bundle, current)?;
-    super::command_configuration::validate_v5_integrity(connection, &key_bundle, &current.ledger)?;
+    super::configuration::validate_v5_integrity(
+        connection,
+        &key_bundle,
+        current.database_id,
+        &current.ledger,
+    )?;
     Ok(())
 }
 
@@ -4279,6 +4287,7 @@ struct SafetyCounts {
     started_without_release: u64,
     started_released: u64,
     active_approvals: u64,
+    active_metadata_mutations: u64,
 }
 
 fn safety_reserve_bytes(
@@ -4301,6 +4310,7 @@ fn safety_reserve_bytes_for_ledger_projection(
         started_without_release: ledger.started_without_release_count,
         started_released: ledger.started_released_count,
         active_approvals: ledger.active_approval_count,
+        active_metadata_mutations: ledger.active_metadata_mutation_count,
     };
     match projection {
         SafetyReserveProjection::Current => {}
@@ -4328,6 +4338,14 @@ fn safety_reserve_bytes_for_ledger_projection(
                     field: "active_approval_safety_count",
                 },
             )?;
+        }
+        SafetyReserveProjection::ClaimMetadataMutation => {
+            counts.active_metadata_mutations = counts
+                .active_metadata_mutations
+                .checked_add(1)
+                .ok_or(RuntimeStoreError::CapacityArithmeticOverflow {
+                    field: "active_metadata_mutation_safety_count",
+                })?;
         }
     }
     safety_reserve_bytes_for_counts(counts)
@@ -4381,12 +4399,19 @@ fn safety_reserve_bytes_for_counts(counts: SafetyCounts) -> Result<u64, RuntimeS
         .ok_or(RuntimeStoreError::CapacityArithmeticOverflow {
             field: "active_approval_safety_reserve",
         })?;
+    let active_metadata_mutations = counts
+        .active_metadata_mutations
+        .checked_mul(super::metadata::MAX_METADATA_MUTATION_TERMINAL_RESERVE_BYTES)
+        .ok_or(RuntimeStoreError::CapacityArithmeticOverflow {
+            field: "active_metadata_mutation_safety_reserve",
+        })?;
     [
         accepted,
         without_fence,
         without_release,
         released,
         active_approvals,
+        active_metadata_mutations,
     ]
     .into_iter()
     .try_fold(FIXED_SAFETY_RESERVE_BYTES, |total, value| {
@@ -5340,6 +5365,7 @@ fn update_runtime_ledger_inner(
         database_id,
         previous,
         &reconciled_next,
+        trim_now_ms,
     )?;
     let next = &reconciled_next;
     if previous.catalog_high_water != next.catalog_high_water {
@@ -6399,5 +6425,29 @@ mod tests {
         assert_eq!(fs::read(&database.path).unwrap(), main_before);
         assert_eq!(fs::read(&wal_path).unwrap(), wal_before);
         assert_eq!(fs::read(&shm_path).unwrap(), shm_before);
+    }
+
+    #[test]
+    fn active_metadata_projection_reserves_the_complete_terminal_write_set() {
+        let ledger = RuntimeLedger::default();
+        let current =
+            safety_reserve_bytes_for_ledger_projection(&ledger, SafetyReserveProjection::Current)
+                .expect("calculate current safety reserve");
+        let claimed = safety_reserve_bytes_for_ledger_projection(
+            &ledger,
+            SafetyReserveProjection::ClaimMetadataMutation,
+        )
+        .expect("calculate claimed metadata safety reserve");
+        assert_eq!(
+            claimed - current,
+            crate::runtime::store::metadata::MAX_METADATA_MUTATION_TERMINAL_RESERVE_BYTES
+        );
+        assert!(
+            claimed - current
+                > u64::try_from(crate::runtime::model::MAX_CONVERSATION_DESCRIPTOR_BYTES)
+                    .expect("descriptor bound fits u64")
+                    * 2,
+            "terminal reserve must cover descriptor and CatalogDelta, not only sealed outcome"
+        );
     }
 }

@@ -55,6 +55,7 @@ use super::store::{
     CommandReceiptSelector, CommandState, ConfigureConversation, ConfigureConversationOutcome,
     ConversationDescriptor, CreateConversationOutcome, NewConversation, QueryCommandReceipt,
     RuntimeId, RuntimeIdKind, RuntimeStoreError, RuntimeStoreHandle,
+    UpdateConversationMetadataOutcome, UpdateManagedConversationMetadata,
 };
 use super::subscription::coordinator::SubscriptionCoordinator;
 
@@ -684,15 +685,72 @@ impl RuntimeCore {
                 };
                 Ok(RuntimeReply::Configuration(receipt))
             }
-            RuntimeRequest::UpdateConversationMetadata(_) => {
-                let failure = match principal.try_enter() {
-                    Ok(_authorization) => RuntimeCoreError::FeatureUnavailable,
-                    Err(error) => RuntimeCoreError::from(error),
+            RuntimeRequest::UpdateConversationMetadata(request) => {
+                let receipt = match async {
+                    validate_idempotency_key(&request.idempotency_key)?;
+                    let conversation_id = parse_conversation_id(&request.conversation_id)?;
+                    let authorization = principal.try_enter()?;
+                    let owner = principal.idempotency_owner();
+                    let outcome = self
+                        .store
+                        .update_managed_conversation_metadata_authorized(
+                            UpdateManagedConversationMetadata {
+                                conversation_id,
+                                owner,
+                                idempotency_key: request.idempotency_key.as_str().to_owned(),
+                                expected_entry_revision: request.expected_entry_revision,
+                                mutation: request.mutation,
+                            },
+                            authorization,
+                        )
+                        .await?;
+                    Ok::<_, RuntimeCoreError>((conversation_id, outcome))
                 }
-                .into_failure();
-                Ok(RuntimeReply::ConversationMetadata(
-                    ConversationMetadataReceipt::Failed { failure },
-                ))
+                .await
+                {
+                    Ok((
+                        conversation_id,
+                        UpdateConversationMetadataOutcome::Applied { mutation },
+                    )) if mutation.conversation_id == conversation_id
+                        && mutation.entry_revision > 0 =>
+                    {
+                        ConversationMetadataReceipt::Applied {
+                            conversation_id: wire_conversation_id(conversation_id),
+                            entry_revision: mutation.entry_revision,
+                        }
+                    }
+                    Ok((
+                        conversation_id,
+                        UpdateConversationMetadataOutcome::Replayed { mutation },
+                    )) if mutation.conversation_id == conversation_id
+                        && mutation.entry_revision > 0 =>
+                    {
+                        ConversationMetadataReceipt::Replayed {
+                            conversation_id: wire_conversation_id(conversation_id),
+                            entry_revision: mutation.entry_revision,
+                        }
+                    }
+                    Ok((
+                        conversation_id,
+                        UpdateConversationMetadataOutcome::Conflict {
+                            current_entry_revision,
+                        },
+                    )) => ConversationMetadataReceipt::Conflict {
+                        conversation_id: wire_conversation_id(conversation_id),
+                        current_entry_revision,
+                    },
+                    Ok((_, UpdateConversationMetadataOutcome::Failed { failure })) => {
+                        ConversationMetadataReceipt::Failed { failure }
+                    }
+                    Ok(_) => ConversationMetadataReceipt::Failed {
+                        failure: RuntimeCoreError::Store(RuntimeStoreError::UnknownOrCorruptSchema)
+                            .into_failure(),
+                    },
+                    Err(error) => ConversationMetadataReceipt::Failed {
+                        failure: metadata_failure(error),
+                    },
+                };
+                Ok(RuntimeReply::ConversationMetadata(receipt))
             }
             RuntimeRequest::SendPrompt(request) => {
                 // SendPrompt 的所有业务拒绝都属于 CommandReceipt family；否则
@@ -1363,6 +1421,16 @@ fn configuration_failure(error: RuntimeCoreError) -> RuntimeFailure {
                 "configuration agent kind does not match the conversation",
             )
         }
+        other => other.into_failure(),
+    }
+}
+
+fn metadata_failure(error: RuntimeCoreError) -> RuntimeFailure {
+    match error {
+        RuntimeCoreError::Store(RuntimeStoreError::ConversationNotFound) => RuntimeFailure::new(
+            DAEMON_CONVERSATION_NOT_FOUND,
+            "runtime conversation was not found",
+        ),
         other => other.into_failure(),
     }
 }

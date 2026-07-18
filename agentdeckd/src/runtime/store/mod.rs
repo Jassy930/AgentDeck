@@ -10,6 +10,7 @@ mod configuration;
 mod execution_event;
 pub mod identity;
 mod journal;
+mod metadata;
 mod persisted_event;
 mod publication;
 pub mod queue;
@@ -46,6 +47,9 @@ pub(crate) use configuration::MAX_CONFIGURATION_CANONICAL_BYTES;
 pub use configuration::{ConfigurationRecord, ConfigureConversation, ConfigureConversationOutcome};
 pub use execution_event::{AppendExecutionEvent, AppendExecutionEventOutcome};
 pub use identity::{RuntimeId, RuntimeIdKind, RuntimeIdSource};
+pub use metadata::{
+    MetadataMutationRecord, UpdateConversationMetadataOutcome, UpdateManagedConversationMetadata,
+};
 pub use publication::{
     FreezePublicationRequest, FrozenPublication, PublicationAcknowledgement, PublicationBarrierCut,
     PublicationPayloadKind, PublicationScope, PublicationStreamRecord, PublicationStreamState,

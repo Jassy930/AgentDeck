@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use agentdeck_protocol::runtime::ConversationConfiguration;
 use agentdeck_protocol::runtime::failure::{
     DAEMON_CONVERSATION_CONFIGURATION_CONFLICT, DAEMON_CONVERSATION_CONFIGURATION_REQUIRED,
+    DAEMON_CONVERSATION_METADATA_MUTATION_PENDING, DAEMON_RUNTIME_FEATURE_UNAVAILABLE,
 };
 use agentdeck_protocol::{ActionDecision, ActionRequest, AgentKind, TurnSummary};
 use serde::{Deserialize, Serialize};
@@ -78,6 +79,8 @@ pub enum RuntimeStoreOperation {
     CreateConversationAfterCommit,
     ConfigureConversationBeforeCommit,
     ConfigureConversationAfterCommit,
+    UpdateConversationMetadataBeforeCommit,
+    UpdateConversationMetadataAfterCommit,
     MarkConversationRecoveryBlockedBeforeCommit,
     MarkConversationRecoveryBlockedAfterCommit,
     AcceptCommandBeforeCommit,
@@ -335,11 +338,20 @@ pub enum ConfigurationLimitScope {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetadataMutationLimitScope {
+    Conversation,
+    GlobalCount,
+    GlobalChargedBytes,
+    Active,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeCommitOperation {
     MigrateSchema,
     RecordEnrollmentReceipt,
     CreateConversation,
     ConfigureConversation,
+    UpdateConversationMetadata,
     MarkConversationRecoveryBlocked,
     AcceptCommand,
     StartCommand,
@@ -1369,6 +1381,12 @@ pub enum RuntimeStoreError {
     ConfigurationLimit { scope: ConfigurationLimitScope },
     #[error("runtime command configuration pin journal reached its hard limit")]
     CommandConfigurationPinLimit,
+    #[error("runtime metadata mutation ledger is full for {scope:?}")]
+    MetadataMutationLimit { scope: MetadataMutationLimitScope },
+    #[error("runtime native metadata mutation is still pending authenticated readback")]
+    MetadataMutationPending,
+    #[error("runtime native metadata mutation execution belongs to a later phase")]
+    MetadataMutationUnsupported,
     #[error("runtime adapter state reference conflicts with the existing binding")]
     AdapterStateConflict,
     #[error("runtime adapter state key belongs to the other private namespace")]
@@ -1518,11 +1536,13 @@ impl RuntimeStoreError {
             | Self::IdGeneration(_)
             | Self::Sequence(_) => "daemon.runtime.invalid_state",
             Self::ConversationLimit => "daemon.runtime.actor_unavailable",
-            Self::ConfigurationLimit { .. } | Self::CommandConfigurationPinLimit => {
-                "daemon.runtime.store_full"
-            }
+            Self::ConfigurationLimit { .. }
+            | Self::CommandConfigurationPinLimit
+            | Self::MetadataMutationLimit { .. } => "daemon.runtime.store_full",
             Self::ConfigurationRequired => DAEMON_CONVERSATION_CONFIGURATION_REQUIRED,
             Self::ConfigurationConflict { .. } => DAEMON_CONVERSATION_CONFIGURATION_CONFLICT,
+            Self::MetadataMutationPending => DAEMON_CONVERSATION_METADATA_MUTATION_PENDING,
+            Self::MetadataMutationUnsupported => DAEMON_RUNTIME_FEATURE_UNAVAILABLE,
             Self::IdempotencyConflict => "daemon.command.idempotency_conflict",
             Self::QueueFull { .. } => "daemon.command.queue_full",
             Self::PayloadTooLarge => "daemon.payload.item_too_large",

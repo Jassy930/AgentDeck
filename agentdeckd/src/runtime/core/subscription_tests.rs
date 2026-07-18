@@ -5,7 +5,7 @@ use agentdeck_protocol::runtime::identity::{
     CatalogPageCursor, ConversationId as WireConversationId, EntityId, ItemId, MessageId,
 };
 use agentdeck_protocol::runtime::{
-    BackfillChunk, BackfillRequest, ConversationSnapshot, MAX_JSON_PART_BYTES,
+    BackfillChunk, BackfillRequest, CatalogChange, ConversationSnapshot, MAX_JSON_PART_BYTES,
     MAX_RUNTIME_JSON_FRAME_BYTES, RuntimeInnerCursor, RuntimeStreamItem, RuntimeSubscriptionTarget,
     SnapshotItem, StreamCursor,
 };
@@ -637,6 +637,203 @@ async fn configure_applied_replay_and_conflict_have_exact_stream_effects() {
     core.shutdown()
         .await
         .expect("shutdown Configure stream core");
+}
+
+#[tokio::test]
+async fn metadata_applied_emits_one_exact_catalog_delta_and_no_conversation_event() {
+    // 威胁场景：metadata mutation 若复用 conversation event 或重复广播，Companion
+    // 会把独立 entry/catalog revision 错当成 event_seq，并在 replay/conflict 时重复更新 UI。
+    let root = TestRoot::new("metadata-exact-stream-effects");
+    let core = core(&root).await;
+    core.recover().await.expect("recover metadata stream core");
+    let (conversation_connection, mut conversation_receiver) = connect_recording(&core, 0x94).await;
+    let conversation = start_receipt(
+        core.handle(
+            conversation_connection,
+            start_request("metadata-stream-start"),
+        )
+        .await,
+    );
+    let conversation_id =
+        parse_conversation_id(&conversation.conversation_id).expect("parse metadata conversation");
+
+    core.handle_envelope(
+        conversation_connection,
+        subscribe_conversation_envelope("metadata-conversation-live", conversation_id),
+    )
+    .await
+    .expect("subscribe metadata conversation");
+    assert!(matches!(
+        receive_envelope_and_ack(
+            &mut conversation_receiver,
+            "metadata conversation subscription receipt"
+        )
+        .await
+        .body,
+        RuntimeMessage::Reply(RuntimeReply::Subscription(
+            SubscriptionReceipt::Subscribed { .. }
+        ))
+    ));
+    assert!(matches!(
+        receive_envelope_and_ack(
+            &mut conversation_receiver,
+            "metadata conversation initial snapshot"
+        )
+        .await
+        .body,
+        RuntimeMessage::Reply(RuntimeReply::Snapshot(_))
+    ));
+    assert!(matches!(
+        receive_envelope_and_ack(
+            &mut conversation_receiver,
+            "metadata conversation initial sync"
+        )
+        .await
+        .body,
+        RuntimeMessage::Reply(RuntimeReply::SyncComplete(_))
+    ));
+
+    let (catalog_connection, mut catalog_receiver) = connect_recording(&core, 0x95).await;
+    core.handle_envelope(
+        catalog_connection,
+        subscribe_catalog_envelope("metadata-catalog-live"),
+    )
+    .await
+    .expect("subscribe metadata catalog");
+    assert!(matches!(
+        receive_envelope_and_ack(
+            &mut catalog_receiver,
+            "metadata catalog subscription receipt"
+        )
+        .await
+        .body,
+        RuntimeMessage::Reply(RuntimeReply::Subscription(
+            SubscriptionReceipt::Subscribed { .. }
+        ))
+    ));
+    let initial_catalog =
+        receive_envelope_and_ack(&mut catalog_receiver, "metadata catalog initial snapshot").await;
+    let RuntimeMessage::Reply(RuntimeReply::Catalog(initial_snapshot)) = initial_catalog.body
+    else {
+        panic!("metadata catalog must start with a snapshot")
+    };
+    assert_eq!(initial_snapshot.base_catalog_cursor, StreamCursor::At(0));
+    let [initial_entry] = initial_snapshot.entries() else {
+        panic!("metadata fixture must contain exactly one catalog entry")
+    };
+    assert_eq!(initial_entry.conversation_id, conversation.conversation_id);
+    assert_eq!(initial_entry.title.as_deref(), Some("core test"));
+    assert!(!initial_entry.archived);
+    assert_eq!(initial_entry.entry_revision, 0);
+    let initial_last_active_ms = initial_entry.last_active_ms;
+    assert!(matches!(
+        receive_envelope_and_ack(&mut catalog_receiver, "metadata catalog initial sync")
+            .await
+            .body,
+        RuntimeMessage::Reply(RuntimeReply::SyncComplete(sync))
+            if sync.inner_cursor == RuntimeInnerCursor::Catalog {
+                cursor: StreamCursor::At(0),
+            }
+    ));
+
+    let exact_request = ConversationMetadataMutationRequest::new(
+        conversation.conversation_id.clone(),
+        IdempotencyKey::new("metadata-stream-exact"),
+        0,
+        ConversationMetadataMutation::SetArchived { archived: true },
+    )
+    .expect("valid metadata stream request");
+    assert!(matches!(
+        core.handle(
+            conversation_connection,
+            RuntimeRequest::UpdateConversationMetadata(exact_request.clone()),
+        )
+        .await,
+        RuntimeReply::ConversationMetadata(ConversationMetadataReceipt::Applied {
+            ref conversation_id,
+            entry_revision: 1,
+        }) if conversation_id == &conversation.conversation_id
+    ));
+
+    let live = receive_envelope_and_ack(&mut catalog_receiver, "metadata catalog delta").await;
+    let RuntimeMessage::Stream(RuntimeStreamItem::CatalogDelta(delta)) = live.body else {
+        panic!("metadata Applied must emit one CatalogDelta")
+    };
+    assert_eq!(delta.catalog_revision, 1);
+    let [CatalogChange::Upserted { entry }] = delta.changes.as_slice() else {
+        panic!("metadata delta must contain exactly one upsert")
+    };
+    assert_eq!(entry.conversation_id, conversation.conversation_id);
+    assert_eq!(entry.agent_kind, AgentKind::Codex);
+    assert_eq!(entry.title.as_deref(), Some("core test"));
+    assert_eq!(
+        entry.cwd.as_deref(),
+        Some(Path::new("/tmp/agentdeck-core-test"))
+    );
+    assert_eq!(entry.last_active_ms, initial_last_active_ms);
+    assert!(entry.archived);
+    assert_eq!(entry.entry_revision, 1);
+    assert!(
+        timeout(Duration::from_millis(100), catalog_receiver.recv())
+            .await
+            .is_err(),
+        "metadata Applied emitted more than one CatalogDelta"
+    );
+    assert!(
+        timeout(Duration::from_millis(100), conversation_receiver.recv())
+            .await
+            .is_err(),
+        "metadata Applied emitted a conversation event"
+    );
+
+    assert!(matches!(
+        core.handle(
+            conversation_connection,
+            RuntimeRequest::UpdateConversationMetadata(exact_request),
+        )
+        .await,
+        RuntimeReply::ConversationMetadata(ConversationMetadataReceipt::Replayed {
+            ref conversation_id,
+            entry_revision: 1,
+        }) if conversation_id == &conversation.conversation_id
+    ));
+    assert!(matches!(
+        core.handle(
+            conversation_connection,
+            RuntimeRequest::UpdateConversationMetadata(
+                ConversationMetadataMutationRequest::new(
+                    conversation.conversation_id.clone(),
+                    IdempotencyKey::new("metadata-stream-conflict"),
+                    0,
+                    ConversationMetadataMutation::SetArchived { archived: false },
+                )
+                .expect("valid metadata conflict request"),
+            ),
+        )
+        .await,
+        RuntimeReply::ConversationMetadata(ConversationMetadataReceipt::Conflict {
+            ref conversation_id,
+            current_entry_revision: 1,
+        }) if conversation_id == &conversation.conversation_id
+    ));
+    assert!(
+        timeout(Duration::from_millis(100), catalog_receiver.recv())
+            .await
+            .is_err(),
+        "metadata replay or conflict emitted a CatalogDelta"
+    );
+    assert!(
+        timeout(Duration::from_millis(100), conversation_receiver.recv())
+            .await
+            .is_err(),
+        "metadata replay or conflict emitted a conversation event"
+    );
+
+    core.disconnect(conversation_connection).await;
+    core.disconnect(catalog_connection).await;
+    core.shutdown()
+        .await
+        .expect("shutdown metadata stream core");
 }
 
 #[tokio::test]

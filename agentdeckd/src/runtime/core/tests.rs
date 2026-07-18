@@ -352,7 +352,7 @@ async fn direct_hello_remains_available_while_core_is_cold() {
 }
 
 #[tokio::test]
-async fn runtime_v2_describe_and_configure_cut_over_without_enabling_later_families() {
+async fn runtime_v2_describe_configure_and_metadata_cut_over_without_enabling_upgrade() {
     let root = TestRoot::new("v2-transitional");
     let store = root.open_store().await;
     let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
@@ -415,9 +415,10 @@ async fn runtime_v2_describe_and_configure_cut_over_without_enabling_later_famil
         .await;
     assert!(matches!(
         metadata,
-        RuntimeReply::ConversationMetadata(ConversationMetadataReceipt::Failed {
-            failure: RuntimeFailure { code, .. }
-        }) if code == DAEMON_RUNTIME_FEATURE_UNAVAILABLE
+        RuntimeReply::ConversationMetadata(ConversationMetadataReceipt::Applied {
+            ref conversation_id,
+            entry_revision: 1,
+        }) if conversation_id == &conversation.conversation_id
     ));
     let prompt = core
         .handle(
@@ -586,6 +587,143 @@ async fn configure_conversation_returns_exact_replay_conflict_and_typed_failures
     core.shutdown()
         .await
         .expect("shutdown configure receipt core");
+}
+
+#[tokio::test]
+async fn metadata_update_returns_applied_replayed_conflict_and_typed_failures() {
+    // 威胁场景：若 metadata mutation 脱离 ConversationMetadataReceipt family，
+    // Companion 会丢失 CAS/idempotency 语义，并可能把业务拒绝误当成 envelope failure。
+    let root = TestRoot::new("metadata-receipts");
+    let store = root.open_store().await;
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let core = Arc::new(RuntimeCore::new(store, router, [0xA5; 32]).expect("construct core"));
+    core.recover().await.expect("recover metadata receipt core");
+    let connection = connect_local(&core, 0x76).await;
+    let conversation = start_receipt(
+        core.handle(connection, start_request("metadata-receipts-start"))
+            .await,
+    );
+
+    let exact_request = ConversationMetadataMutationRequest::new(
+        conversation.conversation_id.clone(),
+        IdempotencyKey::new("metadata-exact"),
+        0,
+        ConversationMetadataMutation::rename(Some("metadata renamed".to_owned()))
+            .expect("bounded metadata title"),
+    )
+    .expect("valid metadata request");
+    assert!(matches!(
+        core.handle(
+            connection,
+            RuntimeRequest::UpdateConversationMetadata(exact_request.clone())
+        )
+        .await,
+        RuntimeReply::ConversationMetadata(ConversationMetadataReceipt::Applied {
+            ref conversation_id,
+            entry_revision: 1,
+        }) if conversation_id == &conversation.conversation_id
+    ));
+    assert!(matches!(
+        core.handle(
+            connection,
+            RuntimeRequest::UpdateConversationMetadata(exact_request)
+        )
+        .await,
+        RuntimeReply::ConversationMetadata(ConversationMetadataReceipt::Replayed {
+            ref conversation_id,
+            entry_revision: 1,
+        }) if conversation_id == &conversation.conversation_id
+    ));
+
+    let same_key_different_request = core
+        .handle(
+            connection,
+            RuntimeRequest::UpdateConversationMetadata(
+                ConversationMetadataMutationRequest::new(
+                    conversation.conversation_id.clone(),
+                    IdempotencyKey::new("metadata-exact"),
+                    0,
+                    ConversationMetadataMutation::SetArchived { archived: true },
+                )
+                .expect("valid different metadata request"),
+            ),
+        )
+        .await;
+    assert!(matches!(
+        same_key_different_request,
+        RuntimeReply::ConversationMetadata(ConversationMetadataReceipt::Failed {
+            failure: RuntimeFailure { code, .. }
+        }) if code == "daemon.command.idempotency_conflict"
+    ));
+
+    let stale = core
+        .handle(
+            connection,
+            RuntimeRequest::UpdateConversationMetadata(
+                ConversationMetadataMutationRequest::new(
+                    conversation.conversation_id.clone(),
+                    IdempotencyKey::new("metadata-stale"),
+                    0,
+                    ConversationMetadataMutation::SetArchived { archived: true },
+                )
+                .expect("valid stale metadata request"),
+            ),
+        )
+        .await;
+    assert!(matches!(
+        stale,
+        RuntimeReply::ConversationMetadata(ConversationMetadataReceipt::Conflict {
+            ref conversation_id,
+            current_entry_revision: 1,
+        }) if conversation_id == &conversation.conversation_id
+    ));
+
+    let missing_id = ConversationId::new("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+    let missing = core
+        .handle(
+            connection,
+            RuntimeRequest::UpdateConversationMetadata(
+                ConversationMetadataMutationRequest::new(
+                    missing_id,
+                    IdempotencyKey::new("metadata-missing"),
+                    0,
+                    ConversationMetadataMutation::SetArchived { archived: true },
+                )
+                .expect("valid missing metadata request"),
+            ),
+        )
+        .await;
+    assert!(matches!(
+        missing,
+        RuntimeReply::ConversationMetadata(ConversationMetadataReceipt::Failed {
+            failure: RuntimeFailure { code, .. }
+        }) if code == agentdeck_protocol::runtime::failure::DAEMON_CONVERSATION_NOT_FOUND
+    ));
+
+    let malformed = core
+        .handle(
+            connection,
+            RuntimeRequest::UpdateConversationMetadata(
+                ConversationMetadataMutationRequest::new(
+                    ConversationId::new("not-a-canonical-runtime-id"),
+                    IdempotencyKey::new("metadata-malformed"),
+                    0,
+                    ConversationMetadataMutation::SetArchived { archived: true },
+                )
+                .expect("wire-valid malformed-id request"),
+            ),
+        )
+        .await;
+    assert!(matches!(
+        malformed,
+        RuntimeReply::ConversationMetadata(ConversationMetadataReceipt::Failed {
+            failure: RuntimeFailure { code, .. }
+        }) if code == DAEMON_RUNTIME_INVALID_REQUEST
+    ));
+
+    core.shutdown()
+        .await
+        .expect("shutdown metadata receipt core");
 }
 
 #[tokio::test]

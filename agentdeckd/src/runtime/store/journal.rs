@@ -41,7 +41,7 @@ use super::identity::{
 use super::persisted_event::{PersistedRuntimeEvent, decode_persisted_runtime_event};
 use super::queue::{QueueAdmission, evaluate_queue_admission};
 use super::schema::{RUNTIME_CRYPTO_CONTEXT_VERSION, RUNTIME_SCHEMA_FAMILY};
-use super::sequence::{SequenceScope, decode_sequence, next_sequence};
+use super::sequence::{SequenceScope, decode_sequence, encode_sequence, next_sequence};
 use super::sqlite::{
     self, RecoveryScanCounts, RecoveryScanState, RuntimeSqlite, SafetyReserveProjection,
 };
@@ -6442,6 +6442,89 @@ pub(super) fn update_conversation_event_high_water_preserving_activity(
         return Err(RuntimeStoreError::SchemaInspectionRaced);
     }
     Ok(())
+}
+
+/// Metadata mutation 只推进独立的 catalog revision，并可替换中立 descriptor/lifecycle；
+/// command/event high-water、queue count 与 catalog-visible last activity 必须逐字保留。
+pub(super) fn update_conversation_metadata(
+    transaction: &Transaction<'_>,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    current: &ConversationRecord,
+    next_descriptor: ConversationDescriptor,
+    next_lifecycle: ConversationLifecycle,
+    next_catalog_revision: u64,
+) -> Result<ConversationRecord, RuntimeStoreError> {
+    if next_catalog_revision <= current.catalog_revision
+        || (current.lifecycle == ConversationLifecycle::RecoveryBlocked
+            && next_lifecycle != ConversationLifecycle::RecoveryBlocked)
+    {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    let descriptor_bytes = canonical_conversation_descriptor(&next_descriptor)?;
+    let sealed_descriptor = seal(
+        key_bundle,
+        database_id,
+        b"conversations",
+        current.conversation_id.as_bytes(),
+        b"sealed_descriptor",
+        descriptor_bytes.as_ref(),
+        MAX_CONVERSATION_DESCRIPTOR_BYTES,
+    )?;
+    let old_token = conversation_metadata_token(
+        key_bundle,
+        current.conversation_id,
+        current.adapter_state_key,
+        current.catalog_revision,
+        current.command_high_water,
+        current.event_high_water,
+        current.accepted_command_count,
+        current.lifecycle,
+        current.created_at_ms,
+        current.updated_at_ms,
+    )?;
+    let next_token = conversation_metadata_token(
+        key_bundle,
+        current.conversation_id,
+        current.adapter_state_key,
+        next_catalog_revision,
+        current.command_high_water,
+        current.event_high_water,
+        current.accepted_command_count,
+        next_lifecycle,
+        current.created_at_ms,
+        current.updated_at_ms,
+    )?;
+    if transaction.execute(
+        "UPDATE conversations
+         SET catalog_revision = ?1, lifecycle = ?2, metadata_token = ?3,
+             sealed_descriptor = ?4
+         WHERE conversation_id = ?5 AND catalog_revision = ?6 AND metadata_token = ?7",
+        params![
+            encode_sequence(next_catalog_revision),
+            lifecycle_text(next_lifecycle),
+            &next_token[..],
+            sealed_descriptor,
+            &current.conversation_id.as_bytes()[..],
+            encode_sequence(current.catalog_revision),
+            &old_token[..],
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    Ok(ConversationRecord {
+        conversation_id: current.conversation_id,
+        adapter_state_key: current.adapter_state_key,
+        catalog_revision: next_catalog_revision,
+        command_high_water: current.command_high_water,
+        event_high_water: current.event_high_water,
+        accepted_command_count: current.accepted_command_count,
+        lifecycle: next_lifecycle,
+        created_at_ms: current.created_at_ms,
+        updated_at_ms: current.updated_at_ms,
+        descriptor: next_descriptor,
+    })
 }
 
 fn commit_transaction(

@@ -215,6 +215,7 @@ pub(super) fn reconcile_catalog_journal(
     database_id: [u8; 16],
     previous: &RuntimeLedger,
     requested: &RuntimeLedger,
+    mutation_now_ms: Option<u64>,
 ) -> Result<RuntimeLedger, RuntimeStoreError> {
     if requested.catalog_high_water == previous.catalog_high_water {
         return Ok(requested.clone());
@@ -285,7 +286,14 @@ pub(super) fn reconcile_catalog_journal(
         if conversation.catalog_revision != revision_value {
             return Err(RuntimeStoreError::UnknownOrCorruptSchema);
         }
-        trim_now_ms = trim_now_ms.max(conversation.updated_at_ms);
+        let delta_created_at_ms = mutation_now_ms.unwrap_or(conversation.updated_at_ms);
+        trim_now_ms = trim_now_ms.max(delta_created_at_ms);
+        let entry_revision = super::configuration::load_conversation_state(
+            transaction,
+            key_bundle,
+            conversation_id,
+        )?
+        .entry_revision()?;
         let delta = CatalogDelta {
             catalog_revision: revision_value,
             changes: vec![CatalogChange::Upserted {
@@ -298,8 +306,7 @@ pub(super) fn reconcile_catalog_journal(
                     cwd: Some(conversation.descriptor.cwd.clone()),
                     last_active_ms: conversation.updated_at_ms,
                     archived: conversation.lifecycle == ConversationLifecycle::Archived,
-                    // P3.9-C0-A1 只冻结 v2 wire；v5 metadata revision 在 C0-B 接线。
-                    entry_revision: 0,
+                    entry_revision,
                 },
             }],
         };
@@ -325,7 +332,7 @@ pub(super) fn reconcile_catalog_journal(
             conversation_id.as_bytes(),
             b"upserted",
             logical_bytes,
-            conversation.updated_at_ms,
+            delta_created_at_ms,
         )?;
         transaction.execute(
             "INSERT INTO catalog_journal (
@@ -336,7 +343,7 @@ pub(super) fn reconcile_catalog_journal(
                 &revision,
                 &conversation_id.as_bytes()[..],
                 sqlite_u64(logical_bytes)?,
-                sqlite_u64(conversation.updated_at_ms)?,
+                sqlite_u64(delta_created_at_ms)?,
                 &token[..],
                 sealed,
             ],
@@ -543,6 +550,16 @@ pub(super) fn load_delta(
     database_id: [u8; 16],
     revision: &str,
 ) -> Result<CatalogDelta, RuntimeStoreError> {
+    load_delta_with_created_at(connection, read_crypto, database_id, revision)
+        .map(|(delta, _)| delta)
+}
+
+pub(super) fn load_delta_with_created_at(
+    connection: &Connection,
+    read_crypto: &super::cipher::RuntimeReadCryptoCapability,
+    database_id: [u8; 16],
+    revision: &str,
+) -> Result<(CatalogDelta, u64), RuntimeStoreError> {
     let raw = connection
         .query_row(
             "SELECT conversation_id, change_kind, logical_delta_bytes, created_at_ms,
@@ -613,7 +630,7 @@ pub(super) fn load_delta(
     if !matches {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
-    Ok(delta)
+    Ok((delta, created_at_ms))
 }
 
 fn catalog_token(

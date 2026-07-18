@@ -341,7 +341,7 @@ fn open_configuration_request(
     )?)
 }
 
-fn conversation_state_metadata_token(
+pub(super) fn conversation_state_metadata_token(
     key_bundle: &RuntimeKeyBundle,
     conversation_id: &[u8; 16],
     current_configuration_revision: Option<&str>,
@@ -390,6 +390,15 @@ impl AuthenticatedConversationState {
             .map(|value| decode_sequence(SequenceScope::CommandSeq, value))
             .transpose()
             .map_err(RuntimeStoreError::from)
+    }
+
+    pub(super) fn entry_revision(&self) -> Result<u64, RuntimeStoreError> {
+        decode_sequence(SequenceScope::EntryRevision, &self.entry_revision)
+            .map_err(RuntimeStoreError::from)
+    }
+
+    pub(super) fn is_managed(&self) -> bool {
+        self.origin_kind == "managed" && self.origin_namespace.is_none()
     }
 }
 
@@ -1111,6 +1120,45 @@ fn update_configuration_head(
     Ok(())
 }
 
+pub(super) fn advance_entry_revision(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    conversation_id: RuntimeId,
+    state: &AuthenticatedConversationState,
+    next_revision: &str,
+) -> Result<(), RuntimeStoreError> {
+    let current_revision = state.entry_revision()?;
+    let next_revision_value = decode_sequence(SequenceScope::EntryRevision, next_revision)?;
+    if current_revision.checked_add(1) != Some(next_revision_value) {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    let next_token = conversation_state_metadata_token(
+        key_bundle,
+        conversation_id.as_bytes(),
+        state.current_configuration_revision.as_deref(),
+        next_revision,
+        &state.origin_kind,
+        state.origin_namespace.as_deref(),
+        state.legacy_command_high_water.as_deref(),
+    )?;
+    if transaction.execute(
+        "UPDATE conversation_state
+         SET entry_revision = ?1, metadata_token = ?2
+         WHERE conversation_id = ?3 AND entry_revision = ?4 AND metadata_token = ?5",
+        params![
+            next_revision,
+            &next_token[..],
+            &conversation_id.as_bytes()[..],
+            &state.entry_revision,
+            &state.metadata_token[..],
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    Ok(())
+}
+
 fn seal_configuration_event(
     key_bundle: &RuntimeKeyBundle,
     database_id: [u8; 16],
@@ -1568,11 +1616,7 @@ pub(super) fn validate_v5_integrity(
             Err(RuntimeStoreError::UnknownOrCorruptSchema)
         };
     }
-    if version != 5
-        || ledger.metadata_mutation_count != 0
-        || ledger.active_metadata_mutation_count != 0
-        || ledger.metadata_mutation_charged_bytes != 0
-    {
+    if version != 5 {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
 
@@ -1621,9 +1665,7 @@ pub(super) fn validate_v5_integrity(
         if current.is_some() && current_revision == 0 {
             return Err(RuntimeStoreError::UnknownOrCorruptSchema);
         }
-        if decode_sequence(SequenceScope::EntryRevision, &entry)? != 0 {
-            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
-        }
+        decode_sequence(SequenceScope::EntryRevision, &entry)?;
         let cutoff_value = cutoff
             .as_deref()
             .map(|value| decode_sequence(SequenceScope::CommandSeq, value))
@@ -1711,6 +1753,7 @@ pub(super) fn validate_v5_integrity(
     }
     let authenticated_pin_count =
         super::command_configuration::validate_v5_integrity(connection, key_bundle, ledger)?;
+    super::metadata::validate_v5_integrity(connection, key_bundle, database_id, ledger)?;
     let missing_states: i64 = connection.query_row(
         "SELECT COUNT(*) FROM conversations AS c
          LEFT JOIN conversation_state AS s USING (conversation_id)
@@ -1718,27 +1761,13 @@ pub(super) fn validate_v5_integrity(
         [],
         |row| row.get(0),
     )?;
-    let physical: (i64, i64, i64, i64, i64, i64) = connection.query_row(
+    let physical: (i64, i64, i64) = connection.query_row(
         "SELECT
              (SELECT COUNT(*) FROM configuration_journal),
              (SELECT COALESCE(SUM(length(sealed_request)), 0) FROM configuration_journal),
-             (SELECT COUNT(*) FROM command_configuration_pins),
-             (SELECT COUNT(*) FROM metadata_mutation_ledger),
-             (SELECT COUNT(*) FROM metadata_mutation_ledger
-                WHERE state IN ('claimed', 'applying', 'outcomeUnknown')),
-             (SELECT COALESCE(SUM(length(sealed_request) + charged_outcome_bytes), 0)
-                FROM metadata_mutation_ledger)",
+             (SELECT COUNT(*) FROM command_configuration_pins)",
         [],
-        |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-            ))
-        },
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     let physical_configuration_count =
         u64::try_from(physical.0).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
@@ -1750,9 +1779,6 @@ pub(super) fn validate_v5_integrity(
         || physical_configuration_count != authenticated_configuration_count
         || physical_configuration_bytes != authenticated_sealed_bytes
         || physical_pin_count != authenticated_pin_count
-        || physical.3 != 0
-        || physical.4 != 0
-        || physical.5 != 0
         || ledger.configuration_count != authenticated_configuration_count
         || ledger.configuration_sealed_bytes != authenticated_sealed_bytes
         || authenticated_configuration_count > MAX_CONFIGURATIONS_GLOBAL

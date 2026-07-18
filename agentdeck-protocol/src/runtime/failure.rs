@@ -43,6 +43,8 @@ pub const DAEMON_CONVERSATION_CONFIGURATION_REQUIRED: &str =
     "daemon.conversation.configuration_required";
 pub const DAEMON_CONVERSATION_CONFIGURATION_CONFLICT: &str =
     "daemon.conversation.configuration_conflict";
+pub const DAEMON_CONVERSATION_METADATA_MUTATION_PENDING: &str =
+    "daemon.conversation.metadata_mutation_pending";
 
 // —— remote.transfer.* （解密后分片重组失败）——
 pub const REMOTE_TRANSFER_TOO_LARGE: &str = "remote.transfer.too_large";
