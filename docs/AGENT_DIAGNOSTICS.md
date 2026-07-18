@@ -512,14 +512,16 @@ provisioning profile，两个已通过 `codesign --verify` 的尝试均被 AMFI 
 | `daemon.diagnostics.path_unavailable` | diagnostics one-shot 无可用日志路径 | 提供合法 profile/absolute data-dir，或先创建一次诊断日志 |
 | `daemon.runtime.main_loop_failed` | security bootstrap 已完成，但 UDS listener 或显式 stdio compatibility 主循环失败 | 先按下方 `daemon.local.*` 子码检查入口/信号/I/O；guard/KEK 会随进程退出释放/清零 |
 
-## Runtime SQLite / journal / adapter 私表 / Core 诊断（Companion MVP P3.2–P3.9-C0-B3b）
+## Runtime SQLite / journal / adapter 私表 / Core 诊断（Companion MVP P3.2–P3.9-C0-B4）
 
 P3.2/P3.3 error code 是 store 内部精确错误的稳定诊断归类；P3.4–P3.6 已把接入 RuntimeCore 的
 路径映射成 wire `RuntimeFailure`，并增加 Core/principal/connection/read overload、approval
 authorization、delivery 与 stream/snapshot 分类；P3.9-C0-B2 又接通 DescribeAgents、configuration CAS、
 cursor-consistent snapshot 与 Core typed receipt，B3a 再接通 configuration-aware SendPrompt admission、
 nonzero command pin 与 pinned revision receipt；B3b 再把 command-pinned exact configuration 送入
-Store Start、Runtime execution context、两家 adapter argv/control 与 approval at-decision metadata。
+Store Start、Runtime execution context、两家 adapter argv/control 与 approval at-decision metadata；B4
+再接通 managed rename/archive/unarchive 的 durable mutation ledger、entry/catalog revision 与
+CatalogDelta 原子收敛。
 transfer reducer 仍只有 component-local typed
 error，没有 production wire owner。排查时保留 DB/WAL/SHM 原件，先运行 diagnostics/read-only
 inspection，
@@ -576,6 +578,20 @@ production restart probe 使用 synthetic `ProbeAgent` 与无副作用 `/bin/sh`
 argv/control/translator fixture 只用于字段形状和映射回归。它们不是 live vendor login、真实 approval、
 RemoteLink 或 Companion E2E，排障报告不得把这些自动证据升级成真实链路结论。
 
+### Managed metadata mutation 语义
+
+managed rename/archive/unarchive 以 conversation + canonical owner + raw idempotency key 形成稳定 namespace。
+Applied 必须在同一 SQLite transaction 写 terminal ledger outcome、descriptor/lifecycle、conversation-local
+entry revision、全局 catalog revision 与唯一 `CatalogDelta`；conversation event high-water 和 last-active
+时间保持不变。完全相同的重试只读回 Replayed；同 namespace 不同 request 返回 durable Conflict，不得换
+key 覆盖旧意图。RecoveryBlocked conversation 只允许 rename，archive/unarchive 应零写失败。
+
+`daemon.conversation.metadata_mutation_pending` 表示 authenticated ledger 已存在 active native claim，
+调用方只能等待后续 C0-C 的 readback 收敛，不能再次调用 vendor。当前 B4 没有 production native claim
+入口：`nativeProjected` 返回 `daemon.runtime.feature_unavailable` 且零写。遇到 metadata corruption、
+CatalogDelta/revision 不一致或 totals 漂移时，保留 DB/WAL/SHM/KEK，禁止删除 ledger row、回退 revision、
+重封 request/outcome 或手工补 CatalogDelta。
+
 worker 初始化或 migration 通过 ready channel 返回错误前，必须先释放 Runtime DB path lease；caller
 收到错误后可直接 exact reopen。若此时仍得到 `daemon.runtime.store_unavailable`/`StoreAlreadyOpen`，
 保留进程与 path-owner 证据，不要用轮询掩盖 lease ownership 错误。
@@ -596,13 +612,14 @@ fixture 泄漏，或把 test-only admission 暴露为运行时配置。
 | `daemon.runtime.recovering` | 已冻结 paged recovery barrier，终页尚未核账并 finish | 继续使用上一页返回的 exact cursor；RuntimeCore 逐页消费，终页 finish 后再开放请求，不得并行 mutation |
 | `daemon.runtime.safety_only` | 非 disk capacity violation 已在本进程 latch，普通副作用关闭 | read/diagnostics 可继续；fence/release/terminal/rescue 仍会逐次校验预留尾，失败时不得绕过；释放空间并按 runbook 重启 |
 | `daemon.runtime.disk_low` | projected transaction 后无法保留 `max(512 MiB, filesystem 5%)` | 释放同一文件系统空间后以相同请求重试；该错误本身不永久 latch |
-| `daemon.runtime.store_full` | main+WAL+SHM projected footprint、SQLite page budget，或剩余 safety obligation 接近/超过 2 GiB | 停止普通写；仅在安全写自身复核通过时完成终态并导出诊断，不要手工删除 WAL |
+| `daemon.runtime.store_full` | main+WAL+SHM projected footprint、SQLite page budget、configuration/pin/metadata count/charged-bytes/active cap，或剩余 safety obligation 接近/超过 2 GiB | 停止普通写；exact replay 仍应保持只读；仅在安全写自身复核通过时完成终态并导出诊断，不要手工删除 WAL/ledger row |
 | `daemon.runtime.crypto_failed` | StorageKEK unwrap、row AEAD、blind token 或 generation 校验失败 | 视为 key/domain/tamper 故障；恢复原 Keychain item 和正确签名环境，禁止新建 KEK |
 | `daemon.runtime.invalid_state` | stable ID/kind、clock monotonicity、queue head、fence/release、terminal/sequence 状态冲突，或 adapterStateKey 已绑定另一 namespace/不同 resume ref | 读取 canonical command/recovery/private-state 状态；错误 turn/nonce/fence 或 vendor ref 不能强制覆盖；CC 映射只能从明确 native history entry 重建，不按 title/cwd 猜测 |
 | `daemon.runtime.execution_failed` | 已获 durable release 的 turn 在 adapter/vendor 执行期失败；event journal 只保存固定 `agent execution failed`，不持久化 vendor stderr、token、路径或 diagnostic reference | 以原 commandId/eventId 查询 durable Error 并按同 eventId exact replay；详细原因只查本机脱敏 diagnostic log，不把原始 vendor 错误补写进 Runtime event |
 | `daemon.conversation.not_found` | Configure 或其他 conversation-scoped 请求引用不存在的 canonical conversation | 先用 Catalog/Start receipt 核对 conversationId；不要创建同 ID 占位记录或把缺失降级为 rev0 |
 | `daemon.conversation.configuration_required` | production `SendPrompt` 指向 fresh/unconfigured conversation，当前 authenticated configuration revision 为 rev0/NULL；即使 caller 传 0 或非零 expected revision 也不能准入 | 先用 `DescribeAgents` 取得该 agent 的 default configuration，再对同一 conversation 执行 `ConfigureConversation(expectedRevision=0)`；收到 Applied/Replayed rev1 后用该 revision 重发 prompt，不能把 rev0 当可执行默认值 |
 | `daemon.conversation.configuration_conflict` | production `SendPrompt.expectedConfigurationRevision` 与当前 authenticated configuration head 不一致；常见于另一个 writer 已推进配置 | 读取最新 configuration state，确认新配置后以新的 idempotency key 发起新 prompt；若是在重试既有 Accepted command，应按原 key/commandId 查询 receipt，不能把 expected revision 改写后复用旧 key |
+| `daemon.conversation.metadata_mutation_pending` | authenticated native mutation 已处于 claimed/applying/outcomeUnknown，exact retry 不能安全判定 vendor outcome | 保持同一 owner/key/request 等待 C0-C authenticated readback；不得重调 vendor、改 key、删 ledger row 或把 pending 猜成 failed。B4 managed mutation 不应产生该状态 |
 | `daemon.command.idempotency_conflict` | 同 conversation + stable owner + key 被不同 command payload 或 configuration full request 重用 | 使用原完整请求查询/重试；新意图必须换新 key，不能覆盖既有 ledger row |
 | `daemon.command.queue_full` | conversation 32、全机 1,024 或 queued payload 256 MiB 任一先到 | 等待/取消已有 Accepted 后以同一请求重试；满载时 exact replay 仍应成功 |
 | `daemon.payload.item_too_large` | prompt、descriptor、intent/event/fence/result 超过各自硬上界，或已认证 Runtime v1 snapshot 加入 v2 必填字段后超过 64 MiB | 新输入须在进入 store 前缩小，不能切片成多个同 key 请求规避；旧 snapshot 保留原 ciphertext 证据并走显式恢复，禁止截断、重建或 reseal |
@@ -616,7 +633,7 @@ P3.4 RuntimeCore 的 transport-neutral failure：
 | `daemon.runtime.not_ready` | Core 尚未完成 paged recovery，或正在 draining/stopped | 等待 daemon readiness；若 recovery 无法完成，按上节保留 DB/Keychain 证据并 fail-close |
 | `daemon.runtime.protocol_mismatch` | Runtime protocol 版本不兼容 | 升级客户端/daemon 到同一 Runtime protocol；不能回退 Relay/IPC 业务字段 |
 | `daemon.runtime.invalid_request` | ID 非 canonical UUID、Start key/cwd、Configure key 或 configuration agent kind 与 conversation 不匹配等规范化输入非法 | 修正原请求；不得由 daemon 猜 ID/path/agent kind 或替客户端补目标 |
-| `daemon.runtime.feature_unavailable` | 请求属于尚未接线的后续 phase（例如 B4 metadata mutation、shared-daemon client、upgrade、pairing/revoke/trust reset） | 读取 capabilities/实施状态后等待对应 phase；production local transport 已进入 P3.8，DescribeAgents/Configure 已进入 P3.9-C0-B2，SendPrompt admission 已进入 B3a，Catalog/Subscribe/Backfill 已进入 P3.6，不应再用该 code 代替其真实错误；不得用 compatibility path 或 fake coordinator 假成功 |
+| `daemon.runtime.feature_unavailable` | 请求属于尚未接线的后续 phase（例如 native-projected metadata mutation、shared-daemon client、upgrade、pairing/revoke/trust reset） | 读取 capabilities/实施状态后等待对应 phase；managed rename/archive 已进入 B4，production local transport 已进入 P3.8，DescribeAgents/Configure 已进入 P3.9-C0-B2，SendPrompt admission 已进入 B3a，Catalog/Subscribe/Backfill 已进入 P3.6，不应再用该 code 代替其真实错误；不得用 compatibility path 或 fake coordinator 假成功 |
 | `daemon.authorization.revoked` | opaque principal lease 已 Revoking/Revoked 或 issuer registry 不可用 | 停止该 connection；remote 设备按 durable revocation/re-pair 流程处理，本地重新认证 peer credential |
 | `daemon.runtime.identity_unavailable` | machine trust/ID derivation domain 非法或 OS entropy 不可用 | 停止启动并检查 machine identity/系统熵；不得生成零 ID 或使用时间/PID 回退 |
 | `daemon.runtime.actor_unavailable` | conversation actor/execution control 已损坏或 recovery-blocked | 不自动重放 Started；保留 command/fence 证据，P3.7 按 orphan fencing 处理 |

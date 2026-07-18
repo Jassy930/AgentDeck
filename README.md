@@ -213,7 +213,7 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（C0-B3b complete，B4 next）
+## Relay Companion MVP 实施状态（C0-B4 complete，B5 next）
 
 2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 只承诺缺 KEK 且无法通过当前
 KEK/database/domain 认证的离线篡改 fail-close，同 UID 在线攻击作为 residual risk 不再扩展。P3.1
@@ -433,8 +433,13 @@ revision，Accepted command 与 exact configuration pin 在同一 Store transact
 mismatch 分别返回 `daemon.conversation.configuration_required` 与
 `daemon.conversation.configuration_conflict`，不再误报 `daemon.runtime.feature_unavailable`。Core 将
 authorization guard 移交 Store command，覆盖 durable outcome、通知、reply 与成功后的 actor queue
-registration；caller 取消或 actor shutdown timeout 不能在 Store 完成前提前释放。`metadata_mutation_ledger`
-在 B4 writer 落地前仍必须为空，非空即 fail-close；metadata mutation 继续返回后续 phase 的 typed failure。
+registration；caller 取消或 actor shutdown timeout 不能在 Store 完成前提前释放。
+B4 已接通 managed `Rename` / `SetArchived`：Store 在同一 transaction 写入 authenticated
+`metadata_mutation_ledger` terminal outcome、descriptor/lifecycle、conversation-local entry revision、全局
+catalog revision 与唯一 `CatalogDelta`，不写 conversation event，也不改变 last-active 时间。same
+owner/key/request 精确重试返回原 Replayed，same owner/key/different request 返回 durable Conflict；
+RecoveryBlocked conversation 只允许 rename，archive/unarchive 零写拒绝。`nativeProjected` 仍属于 C0-C，
+当前返回 typed feature-unavailable 且不 claim ledger row，不冒充 native side effect/readback 已完成。
 B3b 又让 Start 在同一 SQLite transaction 中认证 command、pin 与完整 `1...head` configuration chain，选择
 command 固定的历史 revision，而不是 current head；`StartOutcome → RuntimeExecutionContext →` crate-private
 `AgentTurnRequest` 始终携带同一 exact revision/value。rev0 只允许真实 v4→v5 migration cutoff 内的 command
@@ -458,6 +463,13 @@ additions 合计 658。已读回 daemon lib `691 passed / 1 ignored`、1,024 × 
 schema/selfcheck/Clippy/fmt/network/docs/diff 静态门禁全绿。6 个 ignored 均保持显式 gated/manual，其中 P3.1
 provisioned signed Keychain 继续作为 post-MVP 槽位 BLOCKED、未计 PASS，也不阻塞 MVP/P3 exit。仓库内 recorded argv/control/translator fixture 只证明
 builder/translator 字段映射，不是 live vendor login、真实 vendor approval 或 P4 RemoteLink 证据。
+
+B4 code/test 由 `5f1ca1c` 完成，`347a0f0` 对齐完整 open/recovery 审计的密文错误分类；production
+additions 为 1,983，低于 2,000 硬线。focused metadata/Core/Catalog/完整性/容量矩阵全绿；完整 daemon
+package 为 `1172 passed / 6 ignored`，其中 lib `696 passed / 1 ignored`，1,024 × 256 KiB 容量 target
+`5/5`（276.71 秒）。protocol `170/170`、Swift `298 XCTest + 35 Swift Testing`、schema/selfcheck/
+Clippy/fmt/network/docs/diff 均通过。两路独立终审无 P0/P1/P2 后，下一 Task 是 B5 cross-layer
+closeout；B4 不证明 native projector、P4 CounterGuard/RemoteLink 或 Companion E2E。
 
 进入 Core 的 principal 是字段私有的认证 capability；同一完整身份共享强 authorization lease，
 Accepted→Started 前会重新取得 guard，revoke 与 start 由该 guard + SQLite transition 线性化。
@@ -526,8 +538,9 @@ authenticated audit，不承诺物理删除历史 audit row。独立 ReadPool �
 crypto context 仍保持 v1。v1/v2/v3/v4 migration 在 `BEGIN IMMEDIATE` 后、任何 DDL 前重新认证
 exact legacy meta/token/全部行，只为既有 conversation 物化 rev0、`entryRevision=0`、Managed origin 与
 nullable/BeforeFirst legacy cutoff，不重封旧 ciphertext、不重包 wrapped key。fresh conversation 与
-`conversation_state` 在同一事务写入；B2 configuration 与 B3a command pin writer 已落地，尚未接线的
-B4 `metadata_mutation_ledger` writer 继续保持 fail-close。
+`conversation_state` 在同一事务写入；B2 configuration、B3a command pin 与 B4 managed metadata writer
+均已落地。native mutation 的 claim/apply/authenticated readback 状态机仍留 C0-C；在接线前
+`nativeProjected` 零 claim 返回 feature-unavailable。
 
 P3.6-C 已由 `694f2d9` 提交 transport-neutral StoreCommitHub、Catalog/conversation 共用的
 SubscriptionBarrier、连续 backfill/snapshot-required、authenticated snapshot、paced JSON
@@ -623,7 +636,8 @@ cutover 与旧签名材料拒绝门禁已完成，A2a/A2b Swift v2 strict mirror
 `0dd58de` 收口，A2c outer + JSON/UDS/compact/current codec 已由 `c2d2c28` / `e419d84` 收口；
 C0-B1a/B1b schema freeze 与真实 migration 已由 `e48248a` / `3d0002d` 收口；B2 configuration/Core 与
 B3a admission pin 已完成，后者由 `48594e8` / `09a14b0` 提交并通过 Task 门禁与双路终审；B3b exact
-execution 已由 `c0ed6cd` / `f4141f0` / `fb1629a` 完成。B4–B5、C0-C、
+execution 已由 `c0ed6cd` / `f4141f0` / `fb1629a` 完成，B4 managed metadata 已由
+`5f1ca1c` / `347a0f0` 完成。B5、C0-C、
 App/CLI 默认 UDS cutover、P3.10 LaunchAgent 与 P4–P6 仍未完成。P3.1 provisioned signed Keychain
 roundtrip 继续是 post-MVP BLOCKED 槽位，不阻塞 MVP/P3 exit；P5/P6 物理设备/公网/Linux 证据也是
 post-MVP，不冒充 PASS。

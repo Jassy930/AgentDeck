@@ -56,7 +56,9 @@ signed-material hard cutover 的 A1 complete；Swift A2 已由
 `bea4c13` / `3e019ed` / `0dd58de` / `c2d2c28` / `e419d84` 完成 strict mirror、outer、JSON/compact
 current codec、98-fixture 与真实 UDS Swift readback，A2 complete；shared-daemon client cutover 尚未完成。
 P3.9-C0-B3a 已由 `48594e8` / `09a14b0` 完成并通过 Task 完整门禁与双路终审：B3 current-open
-最后一笔仍为 `974f9b1`，同 UID 在线攻击自此作为 residual risk，不再扩展；下一项为 B3b。P3.1 的
+最后一笔仍为 `974f9b1`，同 UID 在线攻击自此作为 residual risk，不再扩展；B3b exact execution 已由
+`c0ed6cd` / `f4141f0` / `fb1629a` 收口，B4 managed metadata 已由 `5f1ca1c` / `347a0f0`
+完成，下一项为 B5 cross-layer closeout。P3.1 的
 provisioned signed Keychain 外部门禁仍有
 1 项 ignored/BLOCKED，但不阻塞主线。P3.9-C0-C 与后续 client cutover、P3.10、P4 E2EE/Relay Publish
 和 P5 真实 Companion 均未完成；transfer/publication 也尚无 production remote owner。不能因 fake

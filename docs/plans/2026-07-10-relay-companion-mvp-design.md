@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P3.9-C0-B3a 已由 `48594e8` / `09a14b0` 完成并通过 Task 完整门禁与双路终审，下一项为 B3b；P3.1 签名 Keychain 仍有 1 项 ignored/BLOCKED 且不阻塞主线（2026-07-18） |
+| 状态 | Approved target；P3.9-C0-B3a/B3b/B4 已分别完成并通过 Task 完整门禁与双路终审，下一项为 B5 cross-layer closeout；P3.1 签名 Keychain 为 post-MVP ignored/BLOCKED 且不阻塞主线（2026-07-18） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |

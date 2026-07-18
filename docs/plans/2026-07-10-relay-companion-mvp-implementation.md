@@ -2172,7 +2172,7 @@ P3.9 固定以下迁移边界：
       package/跨语言门禁、独立 `spec/security` 与 `quality` 终审，修完 findings，再同步 README、
       ARCHITECTURE、QUALITY、DIAGNOSTICS、本计划与 progress，并创建一个 Task 级 docs commit。不得把
       B3b 的完整门禁或文档延迟到 B5 aggregate。
-  - [ ] **B4 metadata（独立 Task）：** durable mutation ledger、managed rename/archive、descriptor/lifecycle + entry/catalog
+  - [x] **B4 metadata（独立 Task）：** durable mutation ledger、managed rename/archive、descriptor/lifecycle + entry/catalog
     revision + CatalogDelta 同事务，conversation event 恒为零；managed mutation 同事务直接写 terminal
     `applied`。native 合法转移固定为 `claimed→applying→applied|failed|outcomeUnknown`；`outcomeUnknown` 保持
     active，只能经 authenticated native readback 收敛为 applied/failed，绝不再次调用 vendor。active exact
@@ -2181,6 +2181,16 @@ P3.9 固定以下迁移边界：
     `failure.rs` 与 diagnostics failure table。native claim/apply/readback 执行留 C0-C。
     B4 自身必须按 Global Constraints 完成 code/test commit、完整 package/跨语言门禁、双路独立终审、
     文档同步与一个 docs commit；不得由 B5 代收。
+    - [x] **B4 code/test 与 Task gate（commits `5f1ca1c` / `347a0f0`）：** managed
+      rename/archive/unarchive、durable Conflict、exact replay、同事务 descriptor/lifecycle + entry/catalog
+      revision + CatalogDelta、authenticated request/outcome/row MAC/totals 与完整 open/recovery audit 已落地；
+      conversation event 恒为零，RecoveryBlocked 只允许 rename，nativeProjected 零 claim 返回
+      feature-unavailable。production additions 1,983，低于 2,000 硬线。focused metadata integration
+      `17/17`、metadata-related lib `18/18`；完整 daemon package `1172 passed / 6 ignored`，lib
+      `696 passed / 1 ignored`，1,024 × 256 KiB `5/5`（276.71 秒）；protocol `170/170`、Swift
+      `298 XCTest + 35 Swift Testing`，schema/selfcheck/Clippy/fmt/network/docs/diff 全绿。独立
+      `spec/security` 与 `quality` 终审均无 P0/P1/P2；同 UID 在线竞态保持 residual risk，整库历史回滚
+      留 P4 CounterGuard，native 状态机执行留 C0-C。B4 Task docs 由本收口 commit 同步。
   - [ ] **B5 cross-layer closeout（独立 Task）：** 只收口 B5 自身新增的并发 writer、重放/冲突、restart/
     recovery、receipt/event/snapshot 跨层一致性；运行完整 cargo/Swift/iOS/selfcheck/docs/diff gates、独立
     `spec/security` 与 `quality` 终审，并完成 B5 自己的 code/test commit 与一个 docs commit。B5 不重复、

@@ -1518,6 +1518,65 @@ shutdown/reopen + startup recovery 证明 synthetic `ProbeAgent` 仍只取得 re
 argv/control/translator fixture 只证明 builder/translator 字段映射；这些自动证据都不是 live Codex/Claude
 Code login、真实 vendor approval、P4 RemoteLink 或 Companion E2E。
 
+## Relay Companion MVP P3.9-C0-B4 managed metadata 门禁
+
+**具体威胁场景：** rename/archive 若分别更新 descriptor、lifecycle、entry revision、catalog revision 与
+CatalogDelta，崩溃或并发 writer 会暴露跨层撕裂；若 idempotency 只看 key、不认证完整 request/outcome，
+重试可能覆盖另一意图；若容量只估 ledger row，近上限 descriptor 与 CatalogDelta 可能在 COMMIT 后突破
+保留尾。B4 要求 managed mutation 在一个 authenticated transaction 内收敛，conversation event 恒为零，
+并在 open/recovery 对 ledger、row MAC、AEAD、totals、CatalogDelta 与 conversation state 做完整审计。
+
+```bash
+# B4 focused Store/Core/Catalog/integrity/capacity matrix
+cargo test -p agentdeckd --test runtime_metadata_mutation -- --test-threads=1
+cargo test -p agentdeckd --test runtime_metadata_integrity -- --test-threads=1
+cargo test -p agentdeckd --test runtime_metadata_capacity -- --test-threads=1
+cargo test -p agentdeckd --lib runtime::store::metadata::tests:: -- --test-threads=1
+cargo test -p agentdeckd --lib \
+  runtime::store::sqlite::tests::active_metadata_projection_reserves_the_complete_terminal_write_set \
+  -- --test-threads=1
+cargo test -p agentdeckd --lib \
+  runtime::core::tests::metadata_update_returns_applied_replayed_conflict_and_typed_failures \
+  -- --test-threads=1
+cargo test -p agentdeckd --lib \
+  runtime::core::tests::subscription_tests::metadata_applied_emits_one_exact_catalog_delta_and_no_conversation_event \
+  -- --test-threads=1
+
+# Task 收口完整 package / 跨语言 / 自检
+cargo test -p agentdeckd
+cargo test -p agentdeck-protocol -- --test-threads=1
+swift test
+cargo run -q -p agentdeck-cli -- protocol schema \
+  | diff - protocol/agentdeck/agentdeck-protocol.schema.json
+swift run AgentDeck -- --selfcheck
+
+# 静态、network 与文档
+cargo clippy -p agentdeckd --all-targets -- -D warnings
+cargo clippy -p agentdeck-protocol --lib -- -D warnings
+cargo fmt --all -- --check
+bash scripts/check-daemon-network-boundary.sh
+bash scripts/check-daemon-no-net.sh
+scripts/verify-agent-docs.sh
+git diff --check
+git status --short --branch
+```
+
+实现证据：`5f1ca1c` 落地 managed rename/archive/unarchive、durable Conflict、exact replay、同事务
+entry/catalog revision + CatalogDelta、authenticated ledger 与完整容量投影；`347a0f0` 只对齐完整
+pre-RW 审计更早返回的密文错误分类。production additions 合计 1,983，低于 2,000 硬线；测试和文档
+不计入刹车线。
+
+**Task gate 已确认读回（2026-07-18）：** metadata mutation `5/5`、离线篡改矩阵 `10/10`、capacity
+`2/2`、metadata unit `2/2`、terminal reserve `1/1`、Core receipt `1/1`、subscription/Catalog `1/1`；
+完整 daemon package `1172 passed / 6 ignored`，lib `696 passed / 1 ignored`，1,024 × 256 KiB target
+`5/5`（276.71 秒）；protocol `170/170`；Swift XCTest `298/298` + Swift Testing `35/35`；schema、
+selfcheck、Clippy、fmt、network/no-net、docs 与 diff 全绿。双路独立终审无 P0/P1/P2。
+
+B4 只允许 managed mutation。`nativeProjected` 返回 typed feature-unavailable 且零 claim；native
+`claimed→applying→applied|failed|outcomeUnknown` 的 side effect 与 authenticated readback 属 C0-C。
+同 UID 在线攻击仍是 accepted residual risk，不为 B4 添加竞态测试或 hook；整库历史回滚仍由 P4
+CounterGuard 检测。
+
 ## AppKit 重写后的验证清单
 
 前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。
@@ -1649,6 +1708,7 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P3.9-C0-B1b Runtime DB v5 migration | 运行本页 schema/migration/store/boundary/cipher、默认完整 daemon、Clippy/fmt/no-net/selfcheck/docs/diff 与真实 v4 writer byte-exact gate；只证明 schema v5、authenticated migration/materialization，不冒充 B2–B4 writer、P4 CounterGuard 或 Companion E2E |
 | Relay Companion MVP P3.9-C0-B3a command pin / prompt admission | 运行本页 B3a Store/Core focused matrix、完整 daemon package、protocol/Swift/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明 expected revision admission、同事务 nonzero pin、pinned receipt/status/recovery 与 Store-owned authorization lifetime，不冒充 B3b exact configuration execution、live vendor 或 Companion E2E |
 | Relay Companion MVP P3.9-C0-B3b exact execution | 运行本页 B3b Store/Core/driver/translator/restart focused matrix、完整 daemon package、protocol/Swift/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明 command-pinned historical configuration、rev0 startup-only、Codex/CC argv/control/at-decision mapping 与 synthetic restart probe，不冒充 live vendor、P4 RemoteLink 或 Companion E2E |
+| Relay Companion MVP P3.9-C0-B4 managed metadata | 运行本页 B4 Store/Core/Catalog/integrity/capacity focused matrix、完整 daemon package、protocol/Swift/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明 managed rename/archive、durable replay/conflict、同事务 revision/CatalogDelta 与离线篡改审计，不冒充 native projector、P4 CounterGuard/RemoteLink 或 Companion E2E |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

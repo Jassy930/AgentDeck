@@ -535,9 +535,9 @@ conversation/key，不能伪造身份连续性。
   BeforeFirst，真实 seq0 不得折叠成 NULL。fresh v5 conversation 则在 create transaction 内同时写入
   `conversation_state`。B2 已落地 authenticated configuration CAS writer、每次选择都认证完整
   `1...head` 链的 frozen-cursor snapshot selector，以及 RuntimeCore Configure/DescribeAgents 路由；B3a
-  又接通 `command_configuration_pins` writer/reader 与 Core prompt admission。`metadata_mutation_ledger` 在
-  B4 前仍必须为空。B3b 已接通 exact execution configuration 加载；migration/B2/B3a/B3b 都不证明
-  metadata mutation 或整库历史回滚检测。
+  又接通 `command_configuration_pins` writer/reader 与 Core prompt admission，B4 接通 managed
+  `metadata_mutation_ledger` writer 与完整 open/recovery audit。migration/B2/B3a/B3b/B4 都不证明
+  native projector side effect/readback 或整库历史回滚检测。
 - configuration 的幂等 namespace 固定为 conversation + canonical owner + raw key，sealed full request 同时
   绑定 expected revision 与 canonical configuration。Applied 只推进 configuration/event head 并产生唯一
   commandless `ConfigurationChanged`；exact replay、CAS conflict 与所有 reject 不写新 event，Catalog HWM
@@ -563,12 +563,22 @@ conversation/key，不能伪造身份连续性。
   vendor variant 在 spawn 前必须一致。rev0 只允许 authenticated 两遍 startup reconciliation 安装、且
   `commandSeq <= legacyCommandHighWater` 的迁移前 command 使用冻结 P3.7 defaults；live accept、exact replay、
   同进程 queue 与 cutoff 外 command 都不得回退 defaults。
+- B4 managed metadata mutation 使用 conversation + canonical owner + raw idempotency key 的 authenticated
+  namespace。Rename/archive/unarchive 在一个 transaction 内写 terminal ledger outcome、更新
+  descriptor/lifecycle 与 conversation-local entry revision、推进全局 catalog revision 并生成唯一
+  `CatalogDelta`；conversation event high-water 恒定，last-active 时间不因 metadata mutation 改变。
+  exact request replay 只读回原 outcome，same key/different request 返回 durable Conflict；
+  RecoveryBlocked 只允许 rename，archive/unarchive 零写拒绝。每行 request/outcome AEAD、row MAC、
+  charged bytes 与 `runtime_meta` totals 会在 open/recovery 全库重算；近 1 MiB descriptor 的准入投影同时
+  覆盖新 descriptor 和 CatalogDelta。native 合法转移仍留 C0-C，B4 对 `nativeProjected` 零 claim 返回
+  feature-unavailable。
 - Codex 把冻结的 approval policy/sandbox 写入 fresh/resume thread request，把 reasoning effort 写入 turn
   request；Claude Code 把 permission mode/model/effort/output style 写入 fresh/resume argv。Runtime/UI 的
   `ClaudeCodePermissionMode::Default` 保持中立“常规人工确认”语义，当前 vendor CLI 显式映射为
   `--permission-mode manual`，不把 vendor 字符串反向污染公共协议。Codex approval 的 policy/sandbox 与
   Claude Code approval 的 permission mode at-decision metadata 都来自同一冻结配置。
-- B3a 由 `48594e8` / `09a14b0` 完成，B3b 由 `c0ed6cd` / `f4141f0` / `fb1629a` 完成；recorded
+- B3a 由 `48594e8` / `09a14b0` 完成，B3b 由 `c0ed6cd` / `f4141f0` / `fb1629a` 完成，B4 由
+  `5f1ca1c` / `347a0f0` 完成；recorded
   argv/control/translator fixture 只锁定字段映射，不是 live vendor login、真实 approval 或 P4 RemoteLink
   证据。P3.1 provisioned signed Keychain 继续单列 post-MVP ignored/BLOCKED，不计 PASS，也不阻塞
   MVP/P3 exit。

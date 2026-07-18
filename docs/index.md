@@ -51,8 +51,8 @@
   Runtime store 离线篡改 fail-close / 同 UID 在线 residual risk，以及 P5/P6 自动 MVP 与 post-MVP
   BLOCKED 证据槽位边界。
 - `plans/2026-07-10-relay-companion-mvp-implementation.md`：P0–P6 的逐文件 TDD 执行清单。P0–P2、
-  P3.2–P3.8、P3.9-C0-A0/A1/A2 已完成；C0-B3a 已由 `48594e8` / `09a14b0` 完成并通过
-  Task 完整门禁与双路终审，下一项为 B3b。P3.1 production code 已完成，provisioned signed Keychain
+  P3.2–P3.8、P3.9-C0-A0/A1/A2 已完成；C0-B3a/B3b/B4 已分别完成并通过
+  Task 完整门禁与双路终审，下一项为 B5 cross-layer closeout。P3.1 production code 已完成，provisioned signed Keychain
   roundtrip 保留 1 项 ignored/BLOCKED 且不阻塞主线；后续 C0-C、shared-daemon client、P3.10、P4–P6
   尚未完成。
 
