@@ -45,6 +45,7 @@ use agentdeck_protocol::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::claude_code::state::{ClaudeCodeStateRepository, ResolvedClaudeCodeReference};
 #[cfg(test)]
@@ -343,7 +344,10 @@ fn verify_native_history_entry_at(
         }
         Err(error) => return Err(native_history_protocol_error(error)),
     };
-    let mut scanner = source.scanner().map_err(native_history_protocol_error)?;
+    let scan_generation = *Uuid::new_v4().as_bytes();
+    let mut scanner = source
+        .scanner(scan_generation)
+        .map_err(native_history_protocol_error)?;
     let mut budget = NativeIoBudget::new(
         2_000,
         64 * 1024 * 1024,
@@ -360,6 +364,9 @@ fn verify_native_history_entry_at(
                     candidate.reference().resume_thread_id().as_deref(),
                     Ok(found) if found == id
                 ) {
+                    scanner
+                        .acknowledge(candidate)
+                        .map_err(native_history_protocol_error)?;
                     continue;
                 }
                 match source
@@ -370,7 +377,12 @@ fn verify_native_history_entry_at(
                     )
                     .map_err(native_verification_read_error)?
                 {
-                    NativeReadOutcome::FilteredObserver => continue,
+                    NativeReadOutcome::FilteredObserver => {
+                        scanner
+                            .acknowledge(candidate)
+                            .map_err(native_history_protocol_error)?;
+                        continue;
+                    }
                     NativeReadOutcome::Document(document) if document.turns().is_empty() => {
                         return Err(invalid_native_history());
                     }
@@ -383,6 +395,9 @@ fn verify_native_history_entry_at(
                         diagnostic_ref: None,
                     });
                 }
+                scanner
+                    .acknowledge(candidate)
+                    .map_err(native_history_protocol_error)?;
             }
             NativeScanStep::Yielded(NativeScanStop::CandidateLimit | NativeScanStop::Deadline) => {
                 return Err(ProtocolError {
@@ -392,7 +407,13 @@ fn verify_native_history_entry_at(
                     diagnostic_ref: None,
                 });
             }
-            NativeScanStep::Complete => break,
+            NativeScanStep::Complete => {
+                let completed = scanner
+                    .into_completed_scan()
+                    .map_err(native_history_protocol_error)?;
+                debug_assert_eq!(completed.into_generation(), scan_generation);
+                break;
+            }
         }
     }
     matched

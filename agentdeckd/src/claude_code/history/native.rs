@@ -63,6 +63,14 @@ pub(in crate::claude_code) enum NativeHistoryError {
     DuplicateKey { line: u64 },
     #[error("Claude Code native history line {line} has no verified parent turn")]
     MissingParent { line: u64 },
+    #[error("Claude Code native history scan generation must be non-zero")]
+    InvalidScanGeneration,
+    #[error("Claude Code native history candidate acknowledgement is invalid")]
+    InvalidCandidateAcknowledgement,
+    #[error("Claude Code native history scan failed before completion")]
+    ScanFailed,
+    #[error("Claude Code native history scan is incomplete")]
+    ScanIncomplete,
 }
 
 impl NativeHistoryError {
@@ -80,6 +88,10 @@ impl NativeHistoryError {
             Self::Malformed { .. } => "cc-history-native-malformed",
             Self::InvalidKey { .. } | Self::MissingParent { .. } => "cc-history-native-key-invalid",
             Self::DuplicateKey { .. } => "cc-history-native-duplicate-key",
+            Self::InvalidScanGeneration => "cc-history-native-scan-generation-invalid",
+            Self::InvalidCandidateAcknowledgement => "cc-history-native-scan-ack-invalid",
+            Self::ScanFailed => "cc-history-native-scan-failed",
+            Self::ScanIncomplete => "cc-history-native-scan-incomplete",
         }
     }
 }
@@ -329,6 +341,7 @@ pub(super) enum NativeScanStep {
 pub(super) struct NativeHistoryCandidate {
     reference: NativeTranscriptRefV1,
     pub(super) size_bytes: u64,
+    acknowledgement: NativeCandidateAcknowledgement,
 }
 
 impl NativeHistoryCandidate {
@@ -343,6 +356,64 @@ impl std::fmt::Debug for NativeHistoryCandidate {
             .debug_struct("NativeHistoryCandidate")
             .field("reference", &"[REDACTED]")
             .field("size_bytes", &self.size_bytes)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct NativeCandidateAcknowledgement {
+    generation: [u8; 16],
+    token: [u8; 16],
+}
+
+struct PendingNativeCandidate {
+    reference: NativeTranscriptRefV1,
+    size_bytes: u64,
+    acknowledgement: NativeCandidateAcknowledgement,
+    charged: bool,
+}
+
+impl PendingNativeCandidate {
+    fn delivery(&self) -> NativeHistoryCandidate {
+        NativeHistoryCandidate {
+            reference: self.reference.clone(),
+            size_bytes: self.size_bytes,
+            acknowledgement: self.acknowledgement,
+        }
+    }
+}
+
+/// 只有完整遍历真实目录、逐个确认全部 candidate 后才能取得的 generation witness。
+///
+/// 字段与 production constructor 都留在本 scanner 模块；Runtime Store 只消费本
+/// opaque type，不能用裸 generation 伪造完成状态。
+pub(crate) struct CompletedNativeScan {
+    generation: [u8; 16],
+    acknowledged_candidates: u64,
+}
+
+impl CompletedNativeScan {
+    pub(crate) const fn into_generation(self) -> [u8; 16] {
+        self.generation
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn generation(&self) -> [u8; 16] {
+        self.generation
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn acknowledged_candidates(&self) -> u64 {
+        self.acknowledged_candidates
+    }
+}
+
+impl std::fmt::Debug for CompletedNativeScan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CompletedNativeScan")
+            .field("generation", &"[REDACTED]")
+            .field("acknowledged_candidates", &self.acknowledged_candidates)
             .finish()
     }
 }
@@ -473,7 +544,13 @@ impl NativeHistorySource {
         })
     }
 
-    pub(super) fn scanner(&self) -> Result<NativeHistoryScanner, NativeHistoryError> {
+    pub(super) fn scanner(
+        &self,
+        generation: [u8; 16],
+    ) -> Result<NativeHistoryScanner, NativeHistoryError> {
+        if generation == [0; 16] {
+            return Err(NativeHistoryError::InvalidScanGeneration);
+        }
         let projects = self
             .projects
             .try_clone()
@@ -486,6 +563,11 @@ impl NativeHistorySource {
             expected_uid: self.expected_uid,
             projects_entries: entries,
             current_project: None,
+            generation,
+            pending: None,
+            acknowledged_candidates: 0,
+            exhausted: false,
+            failed: false,
         })
     }
 
@@ -532,6 +614,11 @@ pub(super) struct NativeHistoryScanner {
     expected_uid: libc::uid_t,
     projects_entries: ReadDir,
     current_project: Option<CurrentProject>,
+    generation: [u8; 16],
+    pending: Option<PendingNativeCandidate>,
+    acknowledged_candidates: u64,
+    exhausted: bool,
+    failed: bool,
 }
 
 impl NativeHistoryScanner {
@@ -539,8 +626,45 @@ impl NativeHistoryScanner {
         &mut self,
         budget: &mut NativeIoBudget,
     ) -> Result<NativeScanStep, NativeHistoryError> {
-        if let Err(stop) = budget.charge_candidate() {
-            return Ok(NativeScanStep::Yielded(stop));
+        if self.failed {
+            return Err(NativeHistoryError::ScanFailed);
+        }
+        if self.exhausted {
+            return Ok(NativeScanStep::Complete);
+        }
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| !pending.charged)
+        {
+            if let Err(stop) = budget.charge_candidate() {
+                return Ok(NativeScanStep::Yielded(stop));
+            }
+            self.pending
+                .as_mut()
+                .expect("pending candidate remains present")
+                .charged = true;
+        }
+        if let Some(pending) = self.pending.as_ref() {
+            return Ok(NativeScanStep::Candidate(pending.delivery()));
+        }
+
+        let result = self.next_unpoisoned(budget);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    fn next_unpoisoned(
+        &mut self,
+        budget: &mut NativeIoBudget,
+    ) -> Result<NativeScanStep, NativeHistoryError> {
+        if budget.deadline_reached() {
+            return Ok(NativeScanStep::Yielded(NativeScanStop::Deadline));
+        }
+        if budget.candidates_remaining == 0 {
+            return Ok(NativeScanStep::Yielded(NativeScanStop::CandidateLimit));
         }
         loop {
             if budget.deadline_reached() {
@@ -576,10 +700,25 @@ impl NativeHistoryScanner {
                             project.component.clone(),
                             filename,
                         )?;
-                        return Ok(NativeScanStep::Candidate(NativeHistoryCandidate {
+                        let pending = PendingNativeCandidate {
                             reference,
                             size_bytes,
-                        }));
+                            acknowledgement: NativeCandidateAcknowledgement {
+                                generation: self.generation,
+                                token: *Uuid::new_v4().as_bytes(),
+                            },
+                            charged: false,
+                        };
+                        self.pending = Some(pending);
+                        if let Err(stop) = budget.charge_candidate() {
+                            return Ok(NativeScanStep::Yielded(stop));
+                        }
+                        let pending = self
+                            .pending
+                            .as_mut()
+                            .expect("new pending candidate remains present");
+                        pending.charged = true;
+                        return Ok(NativeScanStep::Candidate(pending.delivery()));
                     }
                     Some(Err(error)) => return Err(io_error("enumerate transcript entry", error)),
                     None => {
@@ -590,6 +729,7 @@ impl NativeHistoryScanner {
             }
 
             let Some(entry) = self.projects_entries.next() else {
+                self.exhausted = true;
                 return Ok(NativeScanStep::Complete);
             };
             let entry = entry.map_err(|error| io_error("enumerate project entry", error))?;
@@ -619,6 +759,36 @@ impl NativeHistoryScanner {
                 entries,
             });
         }
+    }
+
+    /// 只有当前 pending candidate 自身携带的 opaque token 才能推进扫描。
+    pub(super) fn acknowledge(
+        &mut self,
+        candidate: NativeHistoryCandidate,
+    ) -> Result<(), NativeHistoryError> {
+        let Some(pending) = self.pending.as_ref() else {
+            return Err(NativeHistoryError::InvalidCandidateAcknowledgement);
+        };
+        if candidate.acknowledgement != pending.acknowledgement {
+            return Err(NativeHistoryError::InvalidCandidateAcknowledgement);
+        }
+        self.pending = None;
+        self.acknowledged_candidates = self
+            .acknowledged_candidates
+            .checked_add(1)
+            .ok_or(NativeHistoryError::ScanFailed)?;
+        Ok(())
+    }
+
+    /// 消费 scanner，阻止 partial/yield/error/drop 路径伪造完整 generation witness。
+    pub(super) fn into_completed_scan(self) -> Result<CompletedNativeScan, NativeHistoryError> {
+        if self.failed || !self.exhausted || self.pending.is_some() {
+            return Err(NativeHistoryError::ScanIncomplete);
+        }
+        Ok(CompletedNativeScan {
+            generation: self.generation,
+            acknowledged_candidates: self.acknowledged_candidates,
+        })
     }
 }
 

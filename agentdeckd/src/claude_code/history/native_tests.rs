@@ -158,7 +158,7 @@ fn native_scanner_yields_before_zero_candidate_budget_and_expired_deadline() {
     let fixture = NativeFixture::new();
     fixture.write_transcript("-tmp-native-budget", USER_UUID, &one_user_line(USER_UUID));
     let source = fixture.source();
-    let mut scanner = source.scanner().unwrap();
+    let mut scanner = source.scanner(test_generation(1)).unwrap();
 
     let mut zero = NativeIoBudget::new(0, 1024, Instant::now() + Duration::from_secs(1));
     assert!(matches!(
@@ -184,7 +184,8 @@ fn native_scanner_resumes_without_collecting_all_candidates() {
         fixture.write_transcript(project, id, &one_user_line(id));
     }
     let source = fixture.source();
-    let mut scanner = source.scanner().unwrap();
+    let generation = test_generation(2);
+    let mut scanner = source.scanner(generation).unwrap();
     let mut references = HashSet::new();
     loop {
         let mut budget =
@@ -192,13 +193,194 @@ fn native_scanner_resumes_without_collecting_all_candidates() {
         match scanner.next(&mut budget).unwrap() {
             NativeScanStep::Candidate(candidate) => {
                 references.insert(candidate.reference().encoded_bytes_for_test());
+                scanner.acknowledge(candidate).unwrap();
             }
             NativeScanStep::Yielded(NativeScanStop::CandidateLimit) => continue,
-            NativeScanStep::Complete => break,
+            NativeScanStep::Complete => {
+                let completed = scanner.into_completed_scan().unwrap();
+                assert_eq!(completed.generation(), generation);
+                assert_eq!(completed.acknowledged_candidates(), 3);
+                break;
+            }
             other => panic!("unexpected scan step: {other:?}"),
         }
     }
     assert_eq!(references.len(), 3);
+}
+
+#[test]
+fn native_scanner_rejects_zero_generation() {
+    let fixture = NativeFixture::new();
+    assert_code(
+        fixture.source().scanner([0; 16]).unwrap_err(),
+        "cc-history-native-scan-generation-invalid",
+    );
+}
+
+#[test]
+fn native_scanner_replays_pending_candidate_without_recharging_budget() {
+    let fixture = NativeFixture::new();
+    fixture.write_transcript("-tmp-native-pending", USER_UUID, &one_user_line(USER_UUID));
+    let generation = test_generation(3);
+    let mut scanner = fixture.source().scanner(generation).unwrap();
+    let mut one_candidate =
+        NativeIoBudget::new(1, 1024 * 1024, Instant::now() + Duration::from_secs(1));
+
+    let first = match scanner.next(&mut one_candidate).unwrap() {
+        NativeScanStep::Candidate(candidate) => candidate,
+        other => panic!("expected first candidate, got {other:?}"),
+    };
+    let expected_reference = first.reference().encoded_bytes_for_test();
+    let retry = match scanner.next(&mut one_candidate).unwrap() {
+        NativeScanStep::Candidate(candidate) => candidate,
+        other => panic!("pending candidate must be replayed without budget, got {other:?}"),
+    };
+    assert_eq!(
+        retry.reference().encoded_bytes_for_test(),
+        expected_reference
+    );
+    scanner.acknowledge(retry).unwrap();
+
+    assert!(matches!(
+        scanner.next(&mut one_candidate).unwrap(),
+        NativeScanStep::Yielded(NativeScanStop::CandidateLimit)
+    ));
+    let mut resume = generous_budget();
+    assert!(matches!(
+        scanner.next(&mut resume).unwrap(),
+        NativeScanStep::Complete
+    ));
+    let completed = scanner.into_completed_scan().unwrap();
+    assert_eq!(completed.generation(), generation);
+    assert_eq!(completed.acknowledged_candidates(), 1);
+    let debug = format!("{completed:?}");
+    assert!(debug.contains("[REDACTED]"));
+    assert!(!debug.contains(&format!("{generation:?}")));
+}
+
+#[test]
+fn native_scanner_rejects_wrong_candidate_ack_and_keeps_pending() {
+    let expected_fixture = NativeFixture::new();
+    expected_fixture.write_transcript(
+        "-tmp-native-expected-ack",
+        USER_UUID,
+        &one_user_line(USER_UUID),
+    );
+    let wrong_fixture = NativeFixture::new();
+    wrong_fixture.write_transcript(
+        "-tmp-native-wrong-ack",
+        THINK_UUID,
+        &one_user_line(THINK_UUID),
+    );
+
+    let mut scanner = expected_fixture
+        .source()
+        .scanner(test_generation(4))
+        .unwrap();
+    let expected = match scanner.next(&mut generous_budget()).unwrap() {
+        NativeScanStep::Candidate(candidate) => candidate,
+        other => panic!("expected pending candidate, got {other:?}"),
+    };
+    let expected_reference = expected.reference().encoded_bytes_for_test();
+    let mut wrong_scanner = wrong_fixture.source().scanner(test_generation(5)).unwrap();
+    let wrong = match wrong_scanner.next(&mut generous_budget()).unwrap() {
+        NativeScanStep::Candidate(candidate) => candidate,
+        other => panic!("expected wrong candidate, got {other:?}"),
+    };
+
+    assert_code(
+        scanner.acknowledge(wrong).unwrap_err(),
+        "cc-history-native-scan-ack-invalid",
+    );
+    let retry = match scanner.next(&mut generous_budget()).unwrap() {
+        NativeScanStep::Candidate(candidate) => candidate,
+        other => panic!("wrong ACK must leave candidate pending, got {other:?}"),
+    };
+    assert_eq!(
+        retry.reference().encoded_bytes_for_test(),
+        expected_reference
+    );
+    scanner.acknowledge(retry).unwrap();
+    assert!(matches!(
+        scanner.next(&mut generous_budget()).unwrap(),
+        NativeScanStep::Complete
+    ));
+    assert_eq!(
+        scanner
+            .into_completed_scan()
+            .unwrap()
+            .acknowledged_candidates(),
+        1
+    );
+}
+
+#[test]
+fn native_scanner_partial_yield_unacked_and_drop_paths_have_no_completion() {
+    let fixture = NativeFixture::new();
+    fixture.write_transcript(
+        "-tmp-native-incomplete",
+        USER_UUID,
+        &one_user_line(USER_UUID),
+    );
+    let source = fixture.source();
+
+    let partial = source.scanner(test_generation(6)).unwrap();
+    assert_code(
+        partial.into_completed_scan().unwrap_err(),
+        "cc-history-native-scan-incomplete",
+    );
+
+    let mut yielded = source.scanner(test_generation(7)).unwrap();
+    let mut zero = NativeIoBudget::new(0, 1024, Instant::now() + Duration::from_secs(1));
+    assert!(matches!(
+        yielded.next(&mut zero).unwrap(),
+        NativeScanStep::Yielded(NativeScanStop::CandidateLimit)
+    ));
+    assert_code(
+        yielded.into_completed_scan().unwrap_err(),
+        "cc-history-native-scan-incomplete",
+    );
+
+    let mut unacknowledged = source.scanner(test_generation(8)).unwrap();
+    assert!(matches!(
+        unacknowledged.next(&mut generous_budget()).unwrap(),
+        NativeScanStep::Candidate(_)
+    ));
+    assert_code(
+        unacknowledged.into_completed_scan().unwrap_err(),
+        "cc-history-native-scan-incomplete",
+    );
+
+    let abandoned = source.scanner(test_generation(9)).unwrap();
+    let no_witness = {
+        drop(abandoned);
+        None::<super::native::CompletedNativeScan>
+    };
+    assert!(no_witness.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn native_scanner_error_poisoning_prevents_completion() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = NativeFixture::new();
+    let outside = NativeFixture::empty_dir("native-scan-error-target");
+    symlink(&outside, fixture.projects.join("-tmp-native-error-link")).unwrap();
+    let mut scanner = fixture.source().scanner(test_generation(10)).unwrap();
+    assert_code(
+        scanner.next(&mut generous_budget()).unwrap_err(),
+        "cc-history-native-source-unsafe",
+    );
+    assert_code(
+        scanner.next(&mut generous_budget()).unwrap_err(),
+        "cc-history-native-scan-failed",
+    );
+    assert_code(
+        scanner.into_completed_scan().unwrap_err(),
+        "cc-history-native-scan-incomplete",
+    );
+    let _ = std::fs::remove_dir_all(outside);
 }
 
 #[test]
@@ -521,7 +703,7 @@ fn generous_budget() -> NativeIoBudget {
 }
 
 fn first_candidate(source: &NativeHistorySource) -> super::native::NativeHistoryCandidate {
-    let mut scanner = source.scanner().unwrap();
+    let mut scanner = source.scanner(test_generation(250)).unwrap();
     match scanner.next(&mut generous_budget()).unwrap() {
         NativeScanStep::Candidate(candidate) => candidate,
         other => panic!("expected candidate, got {other:?}"),
@@ -529,8 +711,13 @@ fn first_candidate(source: &NativeHistorySource) -> super::native::NativeHistory
 }
 
 fn next_scan_error(source: &NativeHistorySource) -> NativeHistoryError {
-    let mut scanner = source.scanner().unwrap();
+    let mut scanner = source.scanner(test_generation(251)).unwrap();
     scanner.next(&mut generous_budget()).unwrap_err()
+}
+
+fn test_generation(byte: u8) -> [u8; 16] {
+    assert_ne!(byte, 0);
+    [byte; 16]
 }
 
 fn assert_code(error: NativeHistoryError, expected: &str) {
