@@ -226,10 +226,11 @@ async fn run_production_execution_probe_mode(
 
     let conversation_id = runtime_id(RuntimeIdKind::Conversation, 0x71)?;
     let adapter_state_key = runtime_id(RuntimeIdKind::AdapterState, 0x72)?;
+    let machine_trust_domain = store
+        .machine_trust_domain()
+        .map_err(|error| format!("read probe trust domain: {error}"))?;
     let owner = IdempotencyOwner::Local {
-        machine_trust_domain: store
-            .machine_trust_domain()
-            .map_err(|error| format!("read probe trust domain: {error}"))?,
+        machine_trust_domain,
         uid: 501,
         client_installation_id: [0x73; 16],
     };
@@ -313,6 +314,28 @@ async fn run_production_execution_probe_mode(
         return Err(format!(
             "probe conversation did not advance configuration head to revision two: {advanced:?}"
         ));
+    }
+
+    // restart recovery 必须跨越真实 Store worker/SQLite connection 生命周期；否则同一
+    // handle 上的 reconcile 只能证明 queue install，不能证明 reopen 后仍按 command pin
+    // 认证并选择 rev1，而不是误读 current head rev2。
+    store
+        .shutdown()
+        .await
+        .map_err(|error| format!("shutdown staged probe store: {error}"))?;
+    let store = RuntimeStoreHandle::open(
+        config.clone(),
+        load_or_create_storage_kek(&keys, &key_state)
+            .map_err(|error| format!("reload staged probe StorageKEK: {error}"))?,
+    )
+    .await
+    .map_err(|error| format!("reopen staged probe store: {error}"))?;
+    if store
+        .machine_trust_domain()
+        .map_err(|error| format!("read reopened probe trust domain: {error}"))?
+        != machine_trust_domain
+    {
+        return Err("reopened probe store changed machine trust domain".to_owned());
     }
 
     let mut router = crate::runtime::AgentRouter::new();

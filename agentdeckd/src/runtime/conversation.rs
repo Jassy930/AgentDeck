@@ -713,6 +713,12 @@ enum QueuedCommandProvenance {
     StartupRecovery,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartFailureDisposition {
+    Finished,
+    RecoveryBlocked,
+}
+
 struct ActiveCommand {
     command: CommandRecord,
     authorization_key: Option<PrincipalAuthorizationKey>,
@@ -2430,6 +2436,28 @@ fn frozen_p37_legacy_configuration(agent_kind: AgentKind) -> Result<Conversation
     }
 }
 
+fn classify_start_failure(
+    provenance: QueuedCommandProvenance,
+    configuration_revision: u64,
+    error: &RuntimeStoreError,
+) -> StartFailureDisposition {
+    match error {
+        // 普通 live/replay queue 没有资格解释 migration rev0；Store 的拒绝不是
+        // cancel/revoke race，不能把仍 durable Accepted 的 command 静默移出 actor。
+        RuntimeStoreError::InvalidStateTransition
+            if provenance == QueuedCommandProvenance::Live && configuration_revision == 0 =>
+        {
+            StartFailureDisposition::RecoveryBlocked
+        }
+        // 非零 revision 的 InvalidStateTransition 与 expiry 仍表示 queued
+        // cancel/revoke/expiry 抢先赢得 durable transition。
+        RuntimeStoreError::InvalidStateTransition | RuntimeStoreError::CommandExpired => {
+            StartFailureDisposition::Finished
+        }
+        _ => StartFailureDisposition::RecoveryBlocked,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_command(
     conversation: ConversationRecord,
@@ -2546,21 +2574,17 @@ async fn execute_command(
             intent,
             ..
         }) => (command, execution_configuration, intent.turn_id),
-        // queued cancel/revoke 可能先赢得同一 SQLite transition；这不是 recovery block。
-        Err(RuntimeStoreError::InvalidStateTransition) | Err(RuntimeStoreError::CommandExpired) => {
-            let _ = runner_tx
-                .send(RunnerEvent::Finished {
-                    command_id: accepted.command_id,
-                })
-                .await;
-            return;
-        }
-        Err(_) => {
-            let _ = runner_tx
-                .send(RunnerEvent::RecoveryBlocked {
-                    command_id: accepted.command_id,
-                })
-                .await;
+        Err(error) => {
+            let event =
+                match classify_start_failure(provenance, accepted.configuration_revision, &error) {
+                    StartFailureDisposition::Finished => RunnerEvent::Finished {
+                        command_id: accepted.command_id,
+                    },
+                    StartFailureDisposition::RecoveryBlocked => RunnerEvent::RecoveryBlocked {
+                        command_id: accepted.command_id,
+                    },
+                };
+            let _ = runner_tx.send(event).await;
             return;
         }
     };
@@ -3183,6 +3207,42 @@ pub(crate) mod tests {
                 )
                 .expect("bounded Claude Code configuration"),
             ))
+        );
+    }
+
+    #[test]
+    fn regular_revision_zero_start_rejection_blocks_without_reclassifying_cancel_races() {
+        assert_eq!(
+            classify_start_failure(
+                QueuedCommandProvenance::Live,
+                0,
+                &RuntimeStoreError::InvalidStateTransition,
+            ),
+            StartFailureDisposition::RecoveryBlocked
+        );
+        assert_eq!(
+            classify_start_failure(
+                QueuedCommandProvenance::Live,
+                1,
+                &RuntimeStoreError::InvalidStateTransition,
+            ),
+            StartFailureDisposition::Finished
+        );
+        assert_eq!(
+            classify_start_failure(
+                QueuedCommandProvenance::StartupRecovery,
+                0,
+                &RuntimeStoreError::InvalidStateTransition,
+            ),
+            StartFailureDisposition::Finished
+        );
+        assert_eq!(
+            classify_start_failure(
+                QueuedCommandProvenance::Live,
+                0,
+                &RuntimeStoreError::CommandExpired,
+            ),
+            StartFailureDisposition::Finished
         );
     }
 
