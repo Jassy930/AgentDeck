@@ -47,7 +47,14 @@
 ### Relay Companion MVP（2026-07-10）
 
 - `plans/2026-07-10-relay-companion-mvp-design.md`：已批准的目标架构；固定 singleton daemon、多读者/多写者串行裁决、按机器独立配对、Relay 严格最小可见与真实 iOS Companion 边界。
-- `plans/2026-07-10-relay-companion-mvp-implementation.md`：P0–P6 的逐文件 TDD 执行清单。P2.10、P3.5、P3.6-A/B/C/D 已完成；P3.7 在 `819aa5e` / `1acf8b8` / `3f22cf0` 前置分片之上已实现 current-binary exec-gate、typed driver/durable ACK、cooperative-descendant PGID recovery、production bootstrap、prepare 唯一 reaper 与 typed clean/unknown disposition，fresh 完整门禁和独立终审均已通过，并由 `5568e93` 完成主体 scoped commit、`c9d2146` / `5713be4` 补齐真实 release 前取消与 sentinel 退出窗口门禁。P3.8-A 已由 `eb97f7f` 完成 accepted-stream UDS 原语，P3.8-B1 已由 `1e7f9ea` 完成 recovery 后 secure listener/permit/supervisor，B2 已由 `459f32a` 完成 production config/main、stdio exhaustive allowlist、真实 binary lifecycle 与 Rust/Swift compatibility 参数切换。P3.9-C0-A0/A1 已由 `d4057f1` / `3b83391` / `c28a968` / `c36a4f9` / `ef830cd` 完成，Runtime v2 Rust contract 与 signed-material hard cutover 的 A1 complete；Swift A2 已由 `bea4c13` / `3e019ed` / `0dd58de` / `c2d2c28` / `e419d84` 完成 strict mirror、outer、JSON/compact current codec、98-fixture 与真实 UDS Swift readback，A2 complete。P3.1 的真实 provisioned signed Keychain roundtrip 仍因本机缺 provisioning profile / AMFI exit 137 而保留 1 项 ignored/gated BLOCKED；P3.9-C0-B/C 与后续 shared-daemon client、P3.10 LaunchAgent、transfer/publication production remote owner、真实 E2EE/Relay Publish 与远程 Companion 均未完成。
+- `plans/2026-07-18-relay-companion-mvp-course-correction.md`：上位纠偏决策；固定 Task 粒度执行、
+  Runtime store 离线篡改 fail-close / 同 UID 在线 residual risk，以及 P5/P6 自动 MVP 与 post-MVP
+  BLOCKED 证据槽位边界。
+- `plans/2026-07-10-relay-companion-mvp-implementation.md`：P0–P6 的逐文件 TDD 执行清单。P0–P2、
+  P3.2–P3.8、P3.9-C0-A0/A1/A2 已完成；C0-B 已推进到 B3a2-B 完成，current-open 最后一笔为
+  `974f9b1`，B3a2-C/B3a3 仍 active。P3.1 production code 已完成，provisioned signed Keychain
+  roundtrip 保留 1 项 ignored/BLOCKED 且不阻塞主线；后续 C0-C、shared-daemon client、P3.10、P4–P6
+  尚未完成。
 
 ## 协议资料
 

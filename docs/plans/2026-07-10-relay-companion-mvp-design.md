@@ -2,17 +2,17 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P2.10、P3.5、P3.6-A/B/C/D、P3.7 与 P3.8 已完成；P3.9-C0-A0/A1/A2 已由 `d4057f1` / `3b83391` / `c28a968` / `c36a4f9` / `ef830cd` / `bea4c13` / `3e019ed` / `0dd58de` / `c2d2c28` / `e419d84` 完成；C0-B 以后未开始；P3.1 签名 Keychain 仍有 1 项 ignored/BLOCKED（2026-07-16） |
+| 状态 | Approved target；P3.9-C0-B 已推进至 B3a2-B 完成、B3a2-C/B3a3 active；P3.1 签名 Keychain 仍有 1 项 ignored/BLOCKED 且不阻塞主线（2026-07-18） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
-| 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-01-agentdeck-mobile-relay-design.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
-| 后续 | 按 `2026-07-10-relay-companion-mvp-implementation.md` 逐 task 执行；本文继续作为目标架构事实源，不承载逐文件 TDD 步骤 |
+| 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
+| 后续 | 按 `2026-07-10-relay-companion-mvp-implementation.md` 逐 Task 执行；流程、Runtime store 威胁边界与 P5/P6 MVP 退出范围以 2026-07-18 纠偏决策为准 |
 
 ## 0. 摘要与文档权威性
 
 本设计把 AgentDeck Relay 从已经落地的 R0/R1a/R1b 骨架推进为一个可真实使用的 **Companion MVP**：一台被控机器只有一个由 `launchd` 管理的常驻 `agentdeckd`；本地 macOS App、CLI、远程 CLI、远程 macOS 和 iOS Companion 都连接到同一 RuntimeCore；多个读者共享 canonical event stream，多个写者由 daemon 按 conversation 串行裁决；Relay 只保存和路由随机 route、序号、时间、大小、在线状态、公钥材料与密文，不能读取机器名、session 元数据、prompt、输出或审批。
 
-本设计是 **Relay 下一阶段的目标架构事实源**。R0/R1a/R1b 文档继续保留，记录当时已经实现的事实、测试和决策过程；凡与本文冲突的目标状态，以本文为准。主要取代项包括：
+本设计是 **Relay 下一阶段的目标架构事实源**。R0/R1a/R1b 文档继续保留，记录当时已经实现的事实、测试和决策过程；凡与本文冲突的目标状态，以本文为准。2026-07-18 纠偏决策是本设计的上位增量：只收口流程、Runtime store 威胁模型和 MVP 外部验收面，不削减 P4 pairing/RemoteLink/远程 CLI 功能。主要取代项包括：
 
 - 取代 Relay 可读的 `MachineDescriptor` / `SessionDescriptor` / `MachineList` / `SessionList` / `AnnounceSession`。
 - 取代 bearer credential 与长期 bootstrap secret。
@@ -104,6 +104,10 @@ MVP 把 Relay 和路径网络都视为主动不可信，而不是只防止“管
 - 公网、反向代理和中间网络可以主动劫持连接；TLS 必须先建立服务端身份，E2EE 再保护业务内容。
 - 已配对但被攻陷的设备可以读取它在撤销前获准看到的内容，也可以在其 grant 权限内发命令；它不能伪造 daemon 的 canonical catalog/event，因为 daemon 下行另有 `MachineDataSign` 签名。
 - 被控机器 OS、daemon 进程、Apple Keychain/Secure Enclave 边界和用户确认配对时看到的本地 UI 被视为可信。若这些 endpoint 边界失守，MVP 不承诺继续保密。
+- Runtime store 只承诺防御缺 KEK 且无法通过当前 KEK/database/domain 认证的离线磁盘篡改、删除或
+  跨库移植：open/recovery 全库认证审计必须 fail-close，拒绝路径不改写 artifact。整套 main+WAL 回滚到
+  更早但内部自洽的有效快照仍由 P4 CounterGuard 检测。同 UID 在线攻击者可 ptrace daemon、替换二进制或读取进程内
+  密钥，属于 accepted residual risk；不再为该对手新增 SQLite 竞态测试、hook 或取证机制。
 - 完整 PairInvite 是 256-bit bearer authorization。二维码、SSH 复制或其他带外传递必须由用户保证真实性和机密性；截获者可以抢先尝试消费邀请，因此 UI 必须在本机显示待配对设备指纹并允许用户取消。
 
 “严格最小可见”仍会向 Relay 暴露以下传输元数据，MVP 明确接受且不做 padding：
@@ -1150,8 +1154,9 @@ P3.6 的 `TransferStateMachine` 目前没有 production remote ingress owner；P
   authenticated backfill/snapshot、bounded transfer reducer 与 publication freeze/COMMIT/ACK/restart
   状态机；P3.6-D 已由 `b668d8f` 完成独立文档收口。P3.7 exec-gate/recovery 边界已裁决，两个
   prepare finding 与 translator 阻断项已修复，完整自动门禁与独立终审均已通过，并由 `5568e93`
-  完成主体 scoped commit、`c9d2146` / `5713be4` 补齐真实 release 前取消与 sentinel 退出窗口门禁；整个 P3 也仍因 P3.1
-  外部门禁与 P3.8–P3.10 未完成而保持未完成。
+  完成主体 scoped commit、`c9d2146` / `5713be4` 补齐真实 release 前取消与 sentinel 退出窗口门禁；整个
+  P3 当时仍因 P3.8–P3.10 未完成而保持未完成。P3.1 外部门禁继续 BLOCKED 且不得记 PASS，但 2026-07-18
+  起不再单独阻塞主线，其最终归属等待用户在方案 a/b 中拍板。
 - 已读回的 scoped 证据是 `runtime_stream` 45/45、`runtime_transfer` 17/17、subscription 36/36、
   daemon lib 464/464（`runtime::` 366 项），默认并发 `cargo test -p agentdeckd` exit 0；Swift
   256 XCTest + 35 Swift Testing，protocol/schema、fmt、clippy、daemon no-net 与 diff gate 均通过。
@@ -1478,14 +1483,22 @@ P4 RemoteTransport 存在后执行。
 - daemon WSS/E2EE、MachineDataSign、Catalog/events/commands/replay、key/counter crash recovery。
 - macOS persistent 远程 CLI 使用 Keychain 中的真实 grant/private keys 和 daemon receipts；Linux synthetic client 只用 ephemeral keys。
 
-退出门禁：本地 App/CLI 必须确认待配对设备指纹，远端不能自批；远程 CLI 真配对并分别穿透真实 Codex/Claude Code；完整 `daemon uninstall --purge` 必须完成 trust reset、Relay purge/readback、LaunchAgent bootout 和本地删除；CLI 重启后能从 Keychain/CryptoStateStore读回 DeviceSign/DeviceHPKE/grant/counter/replay state；旧 credential JSON 不含 private key/grant/bearer；Linux及unsigned/ad-hoc macOS CLI persistent pairing 返回 typed unsupported，不能降级明文文件。
+退出门禁：P4 的 machine identity、pairing、RemoteLink、远程 CLI 与 trust-reset/uninstall-purge 功能全部
+保留。本地 App/CLI 必须确认待配对设备指纹，远端不能自批；自动 E2E 以合成 Codex/Claude Code
+canonical adapter 穿透完整 RemoteLink/daemon receipt 链路；CLI restart 能读回
+DeviceSign/DeviceHPKE/grant/counter/replay state，旧 credential JSON 不含 secret，Linux 与
+unsigned/ad-hoc macOS persistent pairing typed unsupported。真实 vendor login evidence 保留为
+post-MVP BLOCKED 槽位；provisioned signed Keychain 单独维持 P3.1 未决 BLOCKED，不削减功能实现、
+不阻塞后续自动主线，也不在用户拍板前擅自移入 post-MVP。
 
 ### P5 iOS Companion
 
 - `AgentDeckSessionSource` facade、`AgentDeckRelayClient`、iOS/远程 macOS RelaySessionSource、AppKit SessionSourceRegistry、Keychain、扫码/粘贴。
 - typed UI state/receipt、single subscription、前后台 resume。
 
-退出门禁：Simulator 自动 E2E；物理 iPhone 前台真链路通过；第二台 macOS 通过同一 shared client 完成远程 list/open/prompt/approval/reconnect，本机 macOS 仍走 UDS。
+退出门禁：Simulator 自动 E2E + 本机第二客户端通过同一 shared client 完成
+list/open/prompt/approval/reconnect，本机 macOS 仍走 UDS。物理 iPhone 与第二台 macOS 的真链路脚本和
+BLOCKED 语义保留为 post-MVP 证据槽位，不再阻塞 MVP 退出。
 
 ### P6 Cross-device hardening
 
@@ -1493,7 +1506,8 @@ P4 RemoteTransport 存在后执行。
 - Relay/daemon/device 故障注入、撤销、慢读者、gap/snapshot。
 - 文档、diagnostics、systemd/runbook 和验证证据收口。
 
-退出门禁：§17 全部满足。
+退出门禁：§17 的合成可自动化项全部通过；真实 vendor login、公网 WSS、物理设备矩阵与干净 Linux
+systemd host 槽位逐项可读并保持 BLOCKED 或绑定真实 evidence，不生成伪 summary。
 
 ## 16. 测试策略与验证入口
 
@@ -1507,7 +1521,7 @@ P4 RemoteTransport 存在后执行。
 - Transfer：Rust↔Swift 交叉验证 1/64/65 parts、3.5 MiB/64 MiB 边界、out-of-order、duplicate-same、duplicate-conflict、TTL、total hash 与 128 MiB reassembly cap；完整重组前 eventSeq/catalogRevision 不推进。
 - 合成全链路：不需要 vendor login 的 machine/device simulator。
 
-### 16.2 Gated E2E
+### 16.2 Post-MVP gated E2E
 
 - 真实 Codex start/continue/approval/history。
 - 真实 Claude Code start/continue/approval/history。
@@ -1600,21 +1614,34 @@ axum/server/TCP listener 栈，Codex/CC adapters 也不得接触 Relay 网络类
 
 ## 17. Companion MVP Definition of Done
 
-以下十三项必须全部有可读证据：
+以下十三项继续作为 verifier 的固定证据槽位。2026-07-18 起，MVP 完成要求每项的**合成可自动化部分**
+通过；真实 vendor login、公网 WSS、物理 iPhone、第二台 Mac 与干净 Linux host 部分是 post-MVP gated
+证据，允许明确 BLOCKED，但必须可读、不得缺省为 PASS，也不得生成伪 summary。
 
 1. **唯一常驻 daemon**：LaunchAgent 只运行一个 `agentdeckd`；macOS App 和 CLI 同时连接同一 UDS；关闭 App 不终止活跃 turn。
 2. **可安装可升级**：versioned daemon、`bin/current`、plist/bootstrap、idle upgrade、protocol mismatch 与 uninstall/preserve-data 流程在干净用户环境通过；dev ephemeral 实例不能读取 stable trust/data。
-3. **真实独立配对**：iPhone 用 5 分钟单次邀请发起配对，被控机器本地 App/CLI 必须显示并确认 DeviceSign fingerprint，远端与 Relay 管理员均不能自批；keys 落 ThisDeviceOnly Keychain；第二台机器必须单独配对；完全相同 PairRequest 丢响应后只取回同一 grant。
-4. **真实双 agent 控制**：iPhone 能查看、继续并审批真实 Codex 和 Claude Code 会话，收到完整 canonical stream。
-5. **多写者确定性**：本地 macOS App、远程 macOS、iPhone、远程 CLI 同时写同一 conversation；prompt FIFO；审批只有一个不可变赢家，所有端读到精确 delivery state。
+3. **独立配对**：Simulator/本机合成链路必须证明 5 分钟单次邀请、本地 fingerprint 确认、远端/Relay
+   不能自批、不同 installation 的独立 key/grant 与 byte-identical PairRequest retry；物理 iPhone、
+   ThisDeviceOnly 属性和第二台机器独立配对留 post-MVP 槽位。
+4. **双 agent 控制**：合成 Codex/Claude Code canonical adapter 必须经完整 RemoteLink/receipt/stream
+   链路通过；物理 iPhone 操作真实登录 vendor 留 post-MVP 槽位。
+5. **多写者确定性**：两个 local principal + 两个 remote synthetic device 同时写同一 conversation；
+   prompt FIFO、审批唯一赢家与 delivery state 必须一致。本地 App、第二 Mac、物理 iPhone、远程 CLI
+   四端实机对照留 post-MVP 槽位。
 6. **普通重启连续**：clean daemon restart 后恢复 grant/key directory、counter/replay guard、Accepted queue、catalog/event high-water 和 daemon backfill；iOS 前后台、网络切换、Relay restart 都不需重配、不复用 nonce、不重复副作用。Started command crash 明确为 `Interrupted`；故意让仍留在继承 PGID 的 cooperative vendor child 在父进程崩溃后存活时，新 daemon 必须先 fencing 成功或 RecoveryBlocked，不能并行启动下一 turn。显式自守护/逃逸不在此完成标准内，也不能据此声称已检测或收割。
 7. **撤销与 reset 闭环**：以 Relay 提交 revocation 事务为计时点，2 秒内发送/尝试发送 signed terminal state 并关闭连接；后续 challenge/frame 被拒，剩余设备完成 key rotation。另有两条演练：有 root 的 RetireMachine purge，以及 root 丢失的 admin purge；两者都证明旧 grant、route、retained ciphertext 已删除/不可访问，再重新配对。
 8. **daemon 来源可验证**：恶意 paired device 与主动恶意 Relay 都不能伪造 MachineDataSign 保护的 catalog/event/snapshot；link/grant/key revision 回退、nonce reuse 与 DB rollback 都 fail-closed。
 9. **Relay 严格最小可见**：sentinel machine/session/prompt/output/approval/vendor reference 在 Relay DB、日志、metrics 和外壳中均无明文；只出现 §2.3 明列的元数据。
-10. **真实跨网证据**：物理 iPhone 在不同网络经 WSS 完成 pair → list → open → prompt → approval → reconnect；保留截图、命令输出和 failure-free logs。
-11. **第二桌面远控**：另一台 macOS 用 shared Relay client 完成相同的 pair/list/open/prompt/approval/reconnect，控制端私钥只在 Keychain；被控机器本地 App 的流量仍走 UDS。
-12. **协议与质量门禁全绿**：Rust、Swift、iOS、IPC/Runtime/Relay schema、docs、TLS/revoke/replay/E2EE E2E 与真实 Codex/CC gated tests 全部通过；所有 snapshot/backfill 都证明 SessionCapabilities 先于 AgentItem。
-13. **运维文档可执行**：README、ARCHITECTURE、QUALITY、DIAGNOSTICS、Relay runbook、LaunchAgent、trust reset、证书、systemd 和配对流程同步，并按文档从空环境读回验证。
+10. **跨网证据槽位**：MVP verifier 必须证明无 gated 输入时输出 BLOCKED 且不生成 summary；物理 iPhone
+    在不同网络经 WSS 的 pair → list → open → prompt → approval → reconnect 证据留 post-MVP。
+11. **第二桌面远控槽位**：本机第二客户端的 shared Relay client 自动链路必须通过；另一台 macOS 的
+    Keychain、完整控制流和本机仍走 UDS 的实证留 post-MVP。
+12. **协议与质量门禁全绿**：Rust、Swift、iOS Simulator、IPC/Runtime/Relay schema、docs、
+    TLS/revoke/replay/E2EE 自动 E2E 全部通过；所有 snapshot/backfill 都证明 SessionCapabilities 先于
+    AgentItem。真实 Codex/CC 与 physical suites 保持独立 BLOCKED/evidence 状态。
+13. **运维文档可执行**：README、ARCHITECTURE、QUALITY、DIAGNOSTICS、Relay runbook、LaunchAgent、
+    trust reset、证书、systemd 和配对流程同步，packaging/selfcheck 可自动读回；干净 Linux host 从空环境
+    部署读回留 post-MVP 槽位。
 
 MVP 完成不扩展到 APNs、后台常驻、离线 transcript、附件、多租户/团队或托管 Relay。
 

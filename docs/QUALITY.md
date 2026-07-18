@@ -20,6 +20,21 @@ cargo test -p agentdeckd --test daemon_namespace --test storage_kek \
 cargo run -p agentdeckd -- --ephemeral --no-remote --profile dev --selfcheck
 ```
 
+## Relay Companion MVP Task 粒度门禁（2026-07-18）
+
+Relay Companion 主线恢复 Task 粒度执行。B3a、B3b、B4、B5、C0-C、P3.9-A/B/C3/D/E 及后续编号
+task 才是完整收口单位；内部子片只运行行为相关 focused tests、scoped clippy 与 fmt，并做执行者自查。
+约 255 秒的完整 package 慢门禁、跨语言全量回归、双路独立终审（spec/security 与 quality）、文档同步与
+docs commit 只在 Task 收口执行一次；Phase exit 再运行一次 phase 级双路终审、完整慢门禁与 phase
+verifier。1,800/2,000 additions 刹车线只统计
+production 代码新增行，测试和文档不计；RED→GREEN、精确 pathspec 不放宽，no-net/neutrality/sentinel
+等安全矩阵在相关 Task 收口与 Phase exit 按变更范围执行，不扩张为每个子片的重复门禁。
+
+Runtime store 的验证只承诺缺 KEK 且无法通过当前 KEK/database/domain 认证的离线磁盘篡改在
+open/recovery 全库认证中 fail-close 且拒绝零改写；内部自洽的整库历史回滚仍由 P4 CounterGuard 覆盖。
+同 UID 在线攻击者可读取 daemon 内存密钥或替换进程，属于 accepted residual risk；`974f9b1` 后不再新增
+此类 SQLite 竞态测试、hook 或取证门禁。
+
 ## Relay Companion MVP P0 门禁
 
 P0 的统一入口只编排批准设计 §16.5 已存在的门禁，不把合成测试冒充真实 vendor
@@ -520,7 +535,12 @@ adapter，测试 temp namespace 已清理。
 但必须在编译值、codesign entitlement 与 provisioning profile 三者完全一致的 helper 上去掉
 ignore 后运行。本机没有匹配 access group 的 provisioning profile；Apple Development 与
 本地 self-signed helper 都能通过 `codesign --verify`，启动却被 AMFI 以 exit 137 终止。
-取得该外部条件前不得勾选计划 P3.1 Step 4，不得宣称 P3.1/P3 完成。
+取得该外部条件前不得勾选计划 P3.1 Step 4，也不得把 signed roundtrip 记为 PASS；P3/P4 主线与 phase
+closeout 可以如实携带这一项 ignored/BLOCKED 继续。
+
+2026-07-18 裁决：该项继续 ignored/BLOCKED，但不再阻塞主线，也不再尝试通过代码或本地签名绕过
+AMFI。只在用户提供匹配 provisioning profile/Team ID，或明确把 signed roundtrip 移入 post-MVP 后更新
+状态；此前自动 Task/Phase 门禁必须如实携带这一项 BLOCKED。
 
 ## Relay Companion MVP P3.2/P3.3 Runtime store 与 adapter 私表门禁
 
@@ -1488,6 +1508,9 @@ cargo install cargo-llvm-cov
 的本地统一门禁，不代表已经接入 CI；覆盖率仍按本页记录的命令人工复核。
 
 ## 按变更范围选择验证
+
+下表适用于独立改动以及 Relay Companion 的 Task 收口/Phase exit；Relay 内部子片不据此扩张门禁，
+只运行该子片 focused tests + scoped clippy + fmt。Task/Phase 收口时再按表补齐完整矩阵。
 
 | 变更范围 | 最小验证 |
 | --- | --- |

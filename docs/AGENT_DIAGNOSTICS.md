@@ -463,7 +463,8 @@ StorageKEK 缺失时先检查 `runtime.db`、`runtime.db-wal`、`runtime.db-shm`
 把 key 写入文件。stable Keychain backend 不可用时只修复 signing/provisioning/entitlement，
 禁止切换到 memory store。P3.1 真实签名 roundtrip 当前仍 gated/BLOCKED：本机无匹配
 provisioning profile，两个已通过 `codesign --verify` 的尝试均被 AMFI 以 exit 137 终止；
-ignored 测试不是通过证据。
+ignored 测试不是通过证据。2026-07-18 起该槽位保持 BLOCKED 但不阻塞 P3/P4 主线或 phase closeout；
+在用户提供匹配 provisioning profile/Team ID 或明确移入 post-MVP 前，不再尝试本地绕过 AMFI。
 
 | P3.1 code | 含义 | 下一步 |
 | --- | --- | --- |

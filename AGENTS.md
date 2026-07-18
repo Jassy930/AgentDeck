@@ -10,7 +10,7 @@
 4. `docs/index.md`：文档记录系统导航。
 5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code（含 CC adapter failure codes）。
 6. `docs/QUALITY.md`：验证命令、质量门禁和文档结构检查（含 v0.2 手动 QA 清单）。
-7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单。P2.10、P3.5、P3.6-A/B/C/D 已完成；P3.7 已裁决采用 cooperative-descendant PGID 边界，主体实现、prepare 唯一 reaper、typed clean/unknown disposition、fresh 完整门禁与独立终审均已完成，并由 `5568e93` 完成主体 scoped commit、`c9d2146` / `5713be4` 补齐真实 release 前取消门禁、内部故障 gate bookkeeping 与 sentinel leader 退出窗口。P3.8-A 已接入 accepted-stream actor；P3.8-B 已形成 recovery 后 retained-dirfd secure bind、permit、signal/graceful supervisor 与显式 stdio allowlist 的实现候选，P3.9 App/CLI 默认 UDS 仍未开始。真实 provisioned signed Keychain roundtrip 仍有 1 项 ignored 且 gated BLOCKED，P3.10 LaunchAgent、P4 remote owner/E2EE、P5/P6 客户端与实机证据仍未完成，因此不得宣称 P3.1/P3、远程 Companion 或整个方案完成。
+7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以 `docs/plans/2026-07-10-relay-companion-mvp-design.md`、`docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 和上位增量 `docs/plans/2026-07-18-relay-companion-mvp-course-correction.md` 为事实源。Relay 主线恢复 Task 粒度门禁；P3.9-C0-B 已推进到 B3a2-B 完成（最后一笔 `974f9b1`），B3a2-C/B3a3 active。同 UID 在线攻击作为 residual risk 不再扩展；P3.1 provisioned signed Keychain 保留 ignored/BLOCKED 但不阻塞主线。P4 功能全保留；P5/P6 的物理设备、公网与干净 Linux 证据为 post-MVP BLOCKED 槽位，不得冒充 PASS。
 8. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
 
 ## 项目边界
@@ -46,7 +46,7 @@ swift run AgentDeck -- --diagnostics-report --json
 scripts/verify-agent-docs.sh
 ```
 
-涉及 daemon、IPC、记录、诊断、协议翻译时至少运行 `cargo test` 和自检。涉及 Swift UI、会话模型、历史回放、富文本渲染时至少运行 `swift test`。涉及诊断、日志或数据目录时同时运行 diagnostics report。
+独立改动以及 Relay Companion 的 Task 收口/Phase exit：涉及 daemon、IPC、记录、诊断、协议翻译时至少运行 `cargo test` 和自检；涉及 Swift UI、会话模型、历史回放、富文本渲染时至少运行 `swift test`；涉及诊断、日志或数据目录时同时运行 diagnostics report。Relay Companion 内部子片例外：只跑计划指定的 focused tests + scoped clippy + fmt，完整门禁留到 Task 收口与 Phase exit。
 
 ### iOS 前端验证
 
@@ -57,7 +57,7 @@ cd ios && xcodegen generate && \
     -destination 'platform=iOS Simulator,name=iPhone 17' test
 ```
 
-涉及 `Sources/AgentDeckCore/` 或 `ios/` 时至少运行 `swift test` 与上述 iOS 测试。
+独立改动以及 Relay Companion 的 Task 收口/Phase exit涉及 `Sources/AgentDeckCore/` 或 `ios/` 时，至少运行 `swift test` 与上述 iOS 测试；Relay 内部子片仍遵守 focused-only 例外。
 
 ### 统一接口层补充验证
 

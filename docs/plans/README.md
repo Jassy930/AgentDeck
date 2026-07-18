@@ -37,8 +37,10 @@
 
 现有计划暂时保留在 `docs/plans/` 根目录，避免为了归档制造大规模文件移动。后续当计划数量继续增长时，再引入：
 
-当前 active Relay 事实源是 `2026-07-10-relay-companion-mvp-design.md` 与
-`2026-07-10-relay-companion-mvp-implementation.md`。P3.6-A/P3.6-B/P3.6-C/P3.6-D 已分别提交为
+当前 active Relay 事实源是 `2026-07-10-relay-companion-mvp-design.md`、
+`2026-07-10-relay-companion-mvp-implementation.md` 与上位增量
+`2026-07-18-relay-companion-mvp-course-correction.md`；后者固定 Task 粒度门禁、Runtime store 离线
+篡改边界和 P5/P6 MVP 外部验收范围。P3.6-A/P3.6-B/P3.6-C/P3.6-D 已分别提交为
 `7731d1e`/`02cc640`/`694f2d9`/`b668d8f`，默认并发完整 daemon gate 已 exit 0。P3.7 已在
 `819aa5e` / `1acf8b8` / `3f22cf0` 前置分片之上实现 current-binary exec-gate、typed driver/durable
 ACK、cooperative-descendant PGID fencing、两遍 recovery 与 production bootstrap；边界已裁决排除显式
@@ -53,8 +55,9 @@ compatibility 参数已由 `459f32a` 完成。P3.9-C0-A0/A1 已由
 signed-material hard cutover 的 A1 complete；Swift A2 已由
 `bea4c13` / `3e019ed` / `0dd58de` / `c2d2c28` / `e419d84` 完成 strict mirror、outer、JSON/compact
 current codec、98-fixture 与真实 UDS Swift readback，A2 complete；shared-daemon client cutover 尚未完成。
-P3.1 的 provisioned signed Keychain 外部门禁仍有 1 项 ignored/BLOCKED，P3.9-C0-B/C 与后续 client
-cutover、P3.10、P4 E2EE/Relay Publish
+P3.9-C0-B 已推进到 B3a2-B 完成：B3 current-open 最后一笔为 `974f9b1`，同 UID 在线攻击自此作为
+residual risk，不再扩展；B3a2-C/B3a3 仍待完成。P3.1 的 provisioned signed Keychain 外部门禁仍有
+1 项 ignored/BLOCKED，但不阻塞主线。P3.9-C0-C 与后续 client cutover、P3.10、P4 E2EE/Relay Publish
 和 P5 真实 Companion 均未完成；transfer/publication 也尚无 production remote owner。不能因 fake
 publication、store tests 或 Simulator fixture 改写状态。
 

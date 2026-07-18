@@ -448,7 +448,8 @@ conversation/key，不能伪造身份连续性。
 - 已有 ignored、唯一 service/account、RAII 清理的真实 Keychain roundtrip，但 P3.1 的签名
   门禁尚未通过：当前机器无匹配 provisioning profile；Apple Development 与本地
   self-signed helper 虽通过 `codesign --verify`，均被 AMFI 以 exit 137 拒绝启动。因此本节
-  只描述实现边界，不构成 P3.1/P3 完成声明。
+  只描述实现边界，不能把 signed roundtrip 记为 PASS；2026-07-18 起 P3/P4 主线与 phase closeout 可
+  如实携带该 ignored/BLOCKED 槽位继续，不再尝试代码绕过 AMFI。
 
 ### Relay Companion MVP P3.2 Runtime persistence 不变量
 
@@ -509,6 +510,12 @@ conversation/key，不能伪造身份连续性。
   删整组 terminal audit 或
   密文/元数据不一致都映射为 corrupt state；P4 仍须用 Keychain CounterGuard 绑定整库
   generation/HWM，才能检测回滚到更早但内部自洽的完整 DB/WAL 快照。
+- Runtime store 的威胁边界固定为**离线篡改 fail-close**：缺 KEK 且无法通过当前
+  KEK/database/domain 认证的磁盘级篡改、删除或跨库移植必须在 open/recovery 全库审计中拒绝，且拒绝
+  路径不改写 main/WAL/SHM/journal artifact。整套 main+WAL 回滚到更早但内部自洽的有效快照仍须 P4
+  CounterGuard 检测。同 UID 在线攻击者可 ptrace daemon、替换二进制或读取进程内密钥，不是 SQLite
+  层能够建立的安全边界，作为
+  accepted residual risk 记录；`974f9b1` 之后不再新增面向该对手的竞态测试、hook 或取证机制。
 - Runtime DB 的物理 schema 按 phase 单调迁移：P3.2 的 v1 七表、P3.3 的 v2 两张 adapter 私表、
   P3.5 的 v3 `approval_ledger`、P3.6 的 v4 六张 stream 表，以及 P3.9-C0-B1b 的 v5 四张
   authenticated sidecar。v5 当前精确为 20 表；在 v4 的 `event_stream_index`、`event_retention`、

@@ -213,7 +213,13 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（P3.8、P3.9-C0-A0–A2 与 B1a/B1b 已完成，P3 整体未完成）
+## Relay Companion MVP 实施状态（C0-B 已推进至 B3a2-B，B3a2-C/B3a3 active）
+
+2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 只承诺缺 KEK 且无法通过当前
+KEK/database/domain 认证的离线篡改 fail-close，同 UID 在线攻击作为 residual risk 不再扩展。P3.1
+provisioned signed Keychain 保持 ignored/BLOCKED 但不阻塞主线；P4 功能全保留，P5/P6 的物理设备、
+公网与干净 Linux 证据改为 post-MVP BLOCKED 槽位。详见
+[`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`](docs/plans/2026-07-18-relay-companion-mvp-course-correction.md)。
 
 Relay production binary 已原子切换到 **Relay v2**。公开数据面只接受
 `/v2/connect`、`/v2/pair` 与 enrollment 所需的 `POST /v2/machine-enroll`；
@@ -302,8 +308,9 @@ StorageKEK；写入后必须立即读回并逐字节一致。既有 Runtime arti
 1 个真实签名 Keychain `set → load → delete` roundtrip 保持 ignored gate。该真实 gate
 **尚未通过**：本机没有匹配 access group 的 provisioning profile；Apple Development
 和本地 self-signed helper 虽然都通过 `codesign --verify`，启动仍被 AMFI 以 exit 137
-终止。因此 P3.1/P3 还不能声明完成，必须在具备匹配 provisioning/entitlement 的已签名
-helper 上补齐证据。
+终止。因此 signed roundtrip 与 P3.1 Step 4 不能记为 PASS；P3/P4 主线与 phase closeout 可如实携带该
+BLOCKED 槽位继续。最终采用匹配 provisioning/entitlement 的已签名 helper，还是把该证据移入
+post-MVP，等待用户在方案 a/b 中拍板。
 
 ### P3.2 Runtime journal 当前边界
 
@@ -388,6 +395,9 @@ fence、release、terminal
 行 MAC 能检测局部换列/删除/篡改，但“把 main+WAL 整体回滚到更早且内部自洽的有效快照”必须
 由 P4 的 Keychain `CounterGuard` / generation high-water 绑定后才能检测。该门禁属于 P4/P6，
 P3.2 不能宣称已防住整库历史回滚。
+缺 KEK 且无法通过当前 KEK/database/domain 认证的离线磁盘篡改、删除或跨库移植，会在
+open/recovery 全库认证审计中 fail-close，拒绝路径保持 artifact 零改写。同 UID 在线攻击者能够读取
+daemon 内存密钥或替换进程，不属于 SQLite 层安全边界；`974f9b1` 是该方向最后一笔。
 
 ### P3.4 RuntimeCore 当前边界
 
@@ -511,8 +521,9 @@ COMMIT-unknown 逐字节重试、ACK 和重启恢复算法；transfer 测试只�
 重组与 inner cursor 单次推进。`TransferStateMachine` 与 publication dispatcher 尚无 production
 remote owner。真实 MachineDataSign/E2EE seal、Keychain CounterGuard、Relay
 Publish 和远程设备解密属于 P4；iOS 仍是 fixture 驱动 Simulator 前端，不是当前链路证据。
-App/CLI 仍未迁到 singleton UDS，RemoteLink 也没有 production owner，因此 P3、Companion MVP
-和 P3.1 的 provisioned signed Keychain 外部门禁都不能声明完成。
+App/CLI 仍未迁到 singleton UDS，RemoteLink 也没有 production owner，因此该 P3.6 历史阶段不构成
+P3/Companion 完成。P3.1 provisioned signed Keychain 仍是不得记 PASS 的 BLOCKED 槽位，但 2026-07-18
+起不再单独阻塞 P3/P4 主线；其最终归属等待用户在方案 a/b 中拍板。
 
 当前 P3.6 组件门禁已确认 `runtime_stream` 45/45、`runtime_transfer` 17/17、subscription
 36/36、daemon lib 464/464（其中 `runtime::` 366 项）、默认并发 `cargo test -p agentdeckd` exit 0，
@@ -581,10 +592,10 @@ binary/root 注入，内部原子创建随机临时目录并 RAII 清理；它�
 P3.8-B production UDS/bootstrap 已由 `1e7f9ea` / `459f32a` 完成；P3.9-C0-A1 Runtime v2 Rust
 cutover 与旧签名材料拒绝门禁已完成，A2a/A2b Swift v2 strict mirror 也已由 `bea4c13` / `3e019ed` /
 `0dd58de` 收口，A2c outer + JSON/UDS/compact/current codec 已由 `c2d2c28` / `e419d84` 收口；
-C0-B1a/B1b schema freeze 与真实 migration 已由 `e48248a` / `3d0002d` 收口；但
-P3.9-C0-B2–B5/C、App/CLI 默认 UDS cutover、P3.10 LaunchAgent、
-P4 RemoteLink、P5/P6 客户端与实机证据仍未完成；
-P3.1 provisioned signed Keychain roundtrip 也仍是外部 BLOCKED gate。
+C0-B1a/B1b schema freeze 与真实 migration 已由 `e48248a` / `3d0002d` 收口；B2 configuration/Core 与
+B3a2-B pin hardening 已完成，current-open 最后一笔为 `974f9b1`。B3a2-C/B3a3、B3b–B5、C0-C、
+App/CLI 默认 UDS cutover、P3.10 LaunchAgent 与 P4–P6 仍未完成。P3.1 provisioned signed Keychain
+roundtrip 继续是外部 BLOCKED 槽位；P5/P6 物理设备/公网/Linux 证据是 post-MVP，不冒充 PASS。
 具体命令与资源矩阵见 [docs/QUALITY.md](docs/QUALITY.md)。
 
 ## agentdeck CLI（参考客户端 / E2E 驱动）
