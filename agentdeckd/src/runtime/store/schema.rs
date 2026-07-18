@@ -6,7 +6,8 @@ use sha2::{Digest, Sha256};
 
 pub const RUNTIME_SCHEMA_FAMILY: &str = "agentdeck-runtime";
 pub const RUNTIME_SCHEMA_VERSION_V5: u32 = 5;
-pub const RUNTIME_SCHEMA_VERSION: u32 = RUNTIME_SCHEMA_VERSION_V5;
+pub const RUNTIME_SCHEMA_VERSION_V6: u32 = 6;
+pub const RUNTIME_SCHEMA_VERSION: u32 = RUNTIME_SCHEMA_VERSION_V6;
 /// 行密文与 wrapped key bundle 的 AAD context 版本。
 ///
 /// physical schema migration 只增表/增认证计数，不得让既有行重新加密或重新包装。
@@ -40,6 +41,8 @@ pub const MAX_METADATA_MUTATION_CHARGED_BYTES_GLOBAL: u64 = 64 * 1024 * 1024;
 pub const RUNTIME_LEDGER_DOMAIN_V4: &[u8] = b"runtime.meta.ledger.v4";
 #[cfg_attr(not(test), allow(dead_code))]
 pub const RUNTIME_LEDGER_DOMAIN_V5: &[u8] = b"runtime.meta.ledger.v5";
+#[cfg_attr(not(test), allow(dead_code))]
+pub const RUNTIME_LEDGER_DOMAIN_V6: &[u8] = b"runtime.meta.ledger.v6";
 pub const EXPECTED_TABLES_V1: [&str; 7] = [
     "commands",
     "conversations",
@@ -112,10 +115,48 @@ pub const EXPECTED_TABLES_V5: [&str; 20] = [
     "runtime_meta",
     "snapshots",
 ];
-pub const EXPECTED_TABLES: [&str; 20] = EXPECTED_TABLES_V5;
+pub const EXPECTED_TABLES_V6: [&str; 22] = [
+    "approval_ledger",
+    "catalog_journal",
+    "claude_code_adapter_state",
+    "codex_adapter_state",
+    "command_configuration_pins",
+    "commands",
+    "configuration_journal",
+    "conversation_state",
+    "conversations",
+    "event_journal",
+    "event_retention",
+    "event_stream_index",
+    "execution_fences",
+    "execution_intents",
+    "machine_enrollment_receipts",
+    "metadata_mutation_ledger",
+    "native_metadata_effect_fences",
+    "native_projection_state",
+    "publication_outbox",
+    "publication_streams",
+    "runtime_meta",
+    "snapshots",
+];
+pub const EXPECTED_TABLES: [&str; 22] = EXPECTED_TABLES_V6;
 
 pub fn schema_signature() -> [u8; 32] {
-    schema_signature_v5()
+    schema_signature_v6()
+}
+
+pub fn schema_signature_v6() -> [u8; 32] {
+    static SIGNATURE: OnceLock<[u8; 32]> = OnceLock::new();
+    *SIGNATURE.get_or_init(|| {
+        let mut digest = Sha256::new();
+        digest.update(RUNTIME_DDL_V1.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V2.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V3.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V4.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V5.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V6.as_bytes());
+        digest.finalize().into()
+    })
 }
 
 pub fn schema_signature_v5() -> [u8; 32] {
@@ -1096,6 +1137,147 @@ CREATE UNIQUE INDEX idx_metadata_mutation_idempotency
     ON metadata_mutation_ledger(idempotency_token);
 "#;
 
+/// C-b1 additive v6 physical shape。
+///
+/// 只追加 authenticated totals 与两张空 sidecar；既有 v5 row、ciphertext、token、
+/// metadata MAC、wrapped key bundle 与 crypto context 均不得改写。projection/fence
+/// writer 与 streaming audit 属于后续 C-b2/C-c/C-e。
+pub const RUNTIME_MIGRATION_V6: &str = r#"
+ALTER TABLE runtime_meta ADD COLUMN native_projection_present_count INTEGER NOT NULL DEFAULT 0
+    CHECK(native_projection_present_count BETWEEN 0 AND 1024);
+ALTER TABLE runtime_meta ADD COLUMN native_projection_tombstone_count INTEGER NOT NULL DEFAULT 0
+    CHECK(native_projection_tombstone_count BETWEEN 0 AND 8192);
+ALTER TABLE runtime_meta ADD COLUMN native_projection_retired_count INTEGER NOT NULL DEFAULT 0
+    CHECK(native_projection_retired_count BETWEEN 0 AND 8192)
+    CHECK(native_projection_tombstone_count + native_projection_retired_count <= 8192);
+ALTER TABLE runtime_meta ADD COLUMN native_projection_physical_count INTEGER NOT NULL DEFAULT 0
+    CHECK(native_projection_physical_count BETWEEN 0 AND 9216)
+    CHECK(native_projection_physical_count = native_projection_present_count
+        + native_projection_tombstone_count + native_projection_retired_count)
+    CHECK(native_projection_physical_count <= conversation_count)
+    CHECK(conversation_count >= native_projection_tombstone_count + native_projection_retired_count)
+    CHECK(conversation_count - native_projection_tombstone_count
+        - native_projection_retired_count <= 1024);
+ALTER TABLE runtime_meta ADD COLUMN native_projection_charged_bytes INTEGER NOT NULL DEFAULT 0
+    CHECK(native_projection_charged_bytes BETWEEN 0 AND 16777216)
+    CHECK((native_projection_present_count + native_projection_tombstone_count = 0
+           AND native_projection_charged_bytes = 0)
+       OR (native_projection_present_count + native_projection_tombstone_count > 0
+           AND native_projection_charged_bytes > 0));
+ALTER TABLE runtime_meta ADD COLUMN native_metadata_effect_fence_count INTEGER NOT NULL DEFAULT 0
+    CHECK(native_metadata_effect_fence_count BETWEEN 0 AND 65536)
+    CHECK(native_metadata_effect_fence_count <= metadata_mutation_count);
+ALTER TABLE runtime_meta ADD COLUMN native_metadata_effect_unreleased_count INTEGER NOT NULL DEFAULT 0
+    CHECK(native_metadata_effect_unreleased_count BETWEEN 0 AND 1024)
+    CHECK(native_metadata_effect_unreleased_count <= native_metadata_effect_fence_count);
+ALTER TABLE runtime_meta ADD COLUMN native_metadata_effect_released_count INTEGER NOT NULL DEFAULT 0
+    CHECK(native_metadata_effect_released_count BETWEEN 0 AND 65536)
+    CHECK(native_metadata_effect_unreleased_count + native_metadata_effect_released_count
+        = native_metadata_effect_fence_count);
+
+CREATE TABLE native_projection_state (
+    conversation_id BLOB PRIMARY KEY
+        CHECK(typeof(conversation_id) = 'blob' AND length(conversation_id) = 16),
+    origin_namespace TEXT NOT NULL CHECK(
+        typeof(origin_namespace) = 'text'
+        AND length(CAST(origin_namespace AS BLOB)) BETWEEN 1 AND 64
+        AND instr(origin_namespace, char(0)) = 0
+    ),
+    state_reference_token BLOB NOT NULL
+        CHECK(typeof(state_reference_token) = 'blob' AND length(state_reference_token) = 32),
+    projection_state TEXT NOT NULL
+        CHECK(projection_state IN ('present', 'tombstone', 'retired')),
+    scan_generation BLOB NOT NULL CHECK(
+        typeof(scan_generation) = 'blob' AND length(scan_generation) = 16
+        AND scan_generation <> X'00000000000000000000000000000000'
+    ),
+    observation_token BLOB NOT NULL
+        CHECK(typeof(observation_token) = 'blob' AND length(observation_token) = 32),
+    projection_catalog_revision TEXT NOT NULL CHECK(
+        typeof(projection_catalog_revision) = 'text'
+        AND length(projection_catalog_revision) = 20
+        AND projection_catalog_revision NOT GLOB '*[^0-9]*'
+        AND projection_catalog_revision <= '18446744073709551615'
+    ),
+    reconciled_at_ms INTEGER NOT NULL CHECK(reconciled_at_ms >= 0),
+    state_changed_at_ms INTEGER NOT NULL CHECK(state_changed_at_ms >= 0),
+    private_binding_retain_until_ms INTEGER CHECK(
+        private_binding_retain_until_ms IS NULL OR private_binding_retain_until_ms >= 0
+    ),
+    charged_reference_bytes INTEGER NOT NULL
+        CHECK(charged_reference_bytes BETWEEN 0 AND 563),
+    metadata_token BLOB NOT NULL
+        CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
+    UNIQUE(origin_namespace, state_reference_token),
+    CHECK((projection_state = 'present'
+           AND state_changed_at_ms <= reconciled_at_ms
+           AND private_binding_retain_until_ms IS NULL
+           AND charged_reference_bytes BETWEEN 60 AND 563)
+       OR (projection_state = 'tombstone'
+           AND state_changed_at_ms <= reconciled_at_ms
+           AND state_changed_at_ms <= 9223372034262775807
+           AND private_binding_retain_until_ms = state_changed_at_ms + 2592000000
+           AND charged_reference_bytes BETWEEN 60 AND 563)
+       OR (projection_state = 'retired'
+           AND private_binding_retain_until_ms IS NOT NULL
+           AND state_changed_at_ms >= private_binding_retain_until_ms
+           AND charged_reference_bytes = 0)),
+    FOREIGN KEY(conversation_id) REFERENCES conversation_state(conversation_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+CREATE INDEX idx_native_projection_scan
+    ON native_projection_state(
+        origin_namespace, projection_state, scan_generation, conversation_id
+    );
+CREATE INDEX idx_native_projection_retention
+    ON native_projection_state(
+        private_binding_retain_until_ms, projection_state, conversation_id
+    ) WHERE projection_state IN ('tombstone', 'retired');
+
+CREATE TABLE native_metadata_effect_fences (
+    conversation_id BLOB NOT NULL
+        CHECK(typeof(conversation_id) = 'blob' AND length(conversation_id) = 16),
+    idempotency_token BLOB NOT NULL
+        CHECK(typeof(idempotency_token) = 'blob' AND length(idempotency_token) = 32),
+    daemon_boot_id BLOB NOT NULL
+        CHECK(typeof(daemon_boot_id) = 'blob' AND length(daemon_boot_id) = 16),
+    effect_nonce_token BLOB NOT NULL
+        CHECK(typeof(effect_nonce_token) = 'blob' AND length(effect_nonce_token) = 32),
+    effect_spec_token BLOB NOT NULL
+        CHECK(typeof(effect_spec_token) = 'blob' AND length(effect_spec_token) = 32),
+    process_group_id INTEGER NOT NULL CHECK(process_group_id > 0),
+    leader_pid INTEGER NOT NULL CHECK(leader_pid > 0),
+    leader_start_time TEXT NOT NULL CHECK(
+        typeof(leader_start_time) = 'text' AND length(leader_start_time) = 20
+        AND leader_start_time NOT GLOB '*[^0-9]*'
+        AND leader_start_time <= '18446744073709551615'
+    ),
+    release_authorized_at_ms INTEGER CHECK(
+        release_authorized_at_ms IS NULL OR release_authorized_at_ms >= 0
+    ),
+    release_token_commitment BLOB CHECK(
+        (release_authorized_at_ms IS NULL AND release_token_commitment IS NULL)
+        OR (release_authorized_at_ms IS NOT NULL
+            AND typeof(release_token_commitment) = 'blob'
+            AND length(release_token_commitment) = 32)
+    ),
+    logical_fence_bytes INTEGER NOT NULL CHECK(logical_fence_bytes BETWEEN 126 AND 17532),
+    metadata_token BLOB NOT NULL
+        CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
+    sealed_fence BLOB NOT NULL CHECK(
+        typeof(sealed_fence) = 'blob'
+        AND length(sealed_fence) BETWEEN 166 AND 17572
+        AND length(sealed_fence) = logical_fence_bytes + 40
+    ),
+    PRIMARY KEY(conversation_id, idempotency_token),
+    UNIQUE(daemon_boot_id, effect_nonce_token),
+    UNIQUE(daemon_boot_id, process_group_id, leader_start_time),
+    FOREIGN KEY(conversation_id, idempotency_token)
+        REFERENCES metadata_mutation_ledger(conversation_id, idempotency_token)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1105,6 +1287,11 @@ mod tests {
         0x79, 0x20, 0x35, 0x80, 0xf3, 0x37, 0x1f, 0x06, 0x01, 0xf6, 0xf5, 0x24, 0x1f, 0x63, 0x4e,
         0x05, 0xef, 0x12, 0xfa, 0x4f, 0x7d, 0x47, 0xa1, 0xd1, 0x45, 0x17, 0x87, 0x78, 0xe8, 0x8f,
         0xc7, 0x11,
+    ];
+    const V5_SCHEMA_SIGNATURE_GOLDEN: [u8; 32] = [
+        0x00, 0xa4, 0xd5, 0x3a, 0x7a, 0x2a, 0x0f, 0xf2, 0xbe, 0x36, 0x89, 0xdf, 0xc3, 0xdd, 0xcb,
+        0x5a, 0x8c, 0x47, 0x4f, 0x25, 0x55, 0x22, 0xae, 0xbe, 0xb6, 0x28, 0x72, 0x00, 0x04, 0xe2,
+        0x43, 0x68,
     ];
 
     #[derive(Debug, PartialEq, Eq)]
@@ -1278,7 +1465,7 @@ mod tests {
 
     #[test]
     fn stream_schema_advances_to_v4_with_six_bounded_store_tables() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V5);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V6);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         for table in [
             "event_stream_index",
@@ -1294,7 +1481,7 @@ mod tests {
 
     #[test]
     fn approval_physical_schema_remains_v3_compatible_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V5);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V6);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V3.len(), 10);
         assert!(EXPECTED_TABLES_V3.contains(&"approval_ledger"));
@@ -1330,16 +1517,123 @@ mod tests {
         connection
     }
 
+    fn v6_structural_connection() -> Connection {
+        let connection = v5_structural_connection();
+        connection
+            .execute_batch(RUNTIME_MIGRATION_V6)
+            .expect("apply v6 structural migration");
+        connection
+    }
+
     #[test]
-    fn v5_sidecar_freeze_becomes_current_without_changing_the_v4_surface() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, 5);
+    fn v6_adds_projection_and_effect_fence_sidecars_without_rotating_crypto_context() {
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V6);
+        assert_eq!(RUNTIME_SCHEMA_VERSION_V6, 6);
+        assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
+        assert_eq!(EXPECTED_TABLES_V5.len(), 20);
+        assert_eq!(EXPECTED_TABLES_V6.len(), 22);
+        assert_eq!(EXPECTED_TABLES, EXPECTED_TABLES_V6);
+        assert_eq!(schema_signature(), schema_signature_v6());
+        assert_eq!(RUNTIME_LEDGER_DOMAIN_V6, b"runtime.meta.ledger.v6");
+
+        let connection = v6_structural_connection();
+        assert_eq!(table_names(&connection), EXPECTED_TABLES_V6);
+        assert!(EXPECTED_TABLES_V6.contains(&"native_projection_state"));
+        assert!(EXPECTED_TABLES_V6.contains(&"native_metadata_effect_fences"));
+        assert_eq!(
+            &table_columns(&connection, "runtime_meta")
+                [table_columns(&connection, "runtime_meta").len() - 8..],
+            [
+                "native_projection_present_count",
+                "native_projection_tombstone_count",
+                "native_projection_retired_count",
+                "native_projection_physical_count",
+                "native_projection_charged_bytes",
+                "native_metadata_effect_fence_count",
+                "native_metadata_effect_unreleased_count",
+                "native_metadata_effect_released_count",
+            ]
+        );
+    }
+
+    #[test]
+    fn v6_sidecars_have_frozen_columns_indexes_and_foreign_keys() {
+        let connection = v6_structural_connection();
+        assert_eq!(
+            table_columns(&connection, "native_projection_state"),
+            [
+                "conversation_id",
+                "origin_namespace",
+                "state_reference_token",
+                "projection_state",
+                "scan_generation",
+                "observation_token",
+                "projection_catalog_revision",
+                "reconciled_at_ms",
+                "state_changed_at_ms",
+                "private_binding_retain_until_ms",
+                "charged_reference_bytes",
+                "metadata_token",
+            ]
+        );
+        assert_eq!(
+            table_columns(&connection, "native_metadata_effect_fences"),
+            [
+                "conversation_id",
+                "idempotency_token",
+                "daemon_boot_id",
+                "effect_nonce_token",
+                "effect_spec_token",
+                "process_group_id",
+                "leader_pid",
+                "leader_start_time",
+                "release_authorized_at_ms",
+                "release_token_commitment",
+                "logical_fence_bytes",
+                "metadata_token",
+                "sealed_fence",
+            ]
+        );
+        assert_eq!(
+            explicit_indexes(&connection, "native_projection_state"),
+            [
+                "idx_native_projection_retention",
+                "idx_native_projection_scan"
+            ]
+        );
+        assert!(
+            explicit_indexes(&connection, "native_metadata_effect_fences").is_empty(),
+            "effect-fence recovery joins by its composite primary key"
+        );
+
+        let projection_fks = foreign_key_columns(&connection, "native_projection_state");
+        assert_composite_foreign_key(
+            &projection_fks,
+            "conversation_state",
+            &[("conversation_id", "conversation_id")],
+        );
+        let fence_fks = foreign_key_columns(&connection, "native_metadata_effect_fences");
+        assert_composite_foreign_key(
+            &fence_fks,
+            "metadata_mutation_ledger",
+            &[
+                ("conversation_id", "conversation_id"),
+                ("idempotency_token", "idempotency_token"),
+            ],
+        );
+        for foreign_key in projection_fks.iter().chain(fence_fks.iter()) {
+            assert_eq!(foreign_key.on_update, "RESTRICT");
+            assert_eq!(foreign_key.on_delete, "RESTRICT");
+        }
+    }
+
+    #[test]
+    fn v5_sidecar_freeze_remains_stable_without_changing_the_v4_surface() {
         assert_eq!(RUNTIME_SCHEMA_VERSION_V5, 5);
         assert_eq!(EXPECTED_TABLES_V4.len(), 16);
-        assert_eq!(EXPECTED_TABLES.len(), 20);
         assert_eq!(EXPECTED_TABLES_V5.len(), 20);
-        assert_eq!(EXPECTED_TABLES, EXPECTED_TABLES_V5);
-        assert_eq!(schema_signature(), schema_signature_v5());
         assert_eq!(schema_signature_v4(), V4_SCHEMA_SIGNATURE_GOLDEN);
+        assert_eq!(schema_signature_v5(), V5_SCHEMA_SIGNATURE_GOLDEN);
         let mut expected_v5 = Sha256::new();
         for migration in [
             RUNTIME_DDL_V1,
