@@ -12,6 +12,9 @@ use agentdeck_protocol::runtime::{
     CodexConversationConfiguration, ConversationConfiguration, VendorConfigurationSnapshot,
 };
 use agentdeck_protocol::{CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode};
+use agentdeckd::runtime::model::{
+    RuntimeCapacityObservation, RuntimeCapacityProbe, RuntimeCapacityProbeError,
+};
 use agentdeckd::runtime::store::{
     AcceptCommand, AcceptOutcome, CommandReceiptSelector, CommandRecord, CommandState,
     ConfigureConversation, ConfigureConversationOutcome, IdempotencyOwner, NewConversation,
@@ -29,6 +32,59 @@ static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 const EVIDENCE_MAX_ROWS_PER_TABLE: usize = 64;
 const EVIDENCE_MAX_COLUMNS_PER_TABLE: usize = 64;
 const EVIDENCE_MAX_BYTES_PER_TABLE: usize = 8 * 1024 * 1024;
+const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
+const RUNTIME_DB_HARD_LIMIT_BYTES: u64 = 2 * GIB;
+
+#[derive(Clone)]
+struct MutableCapacityProbe(Arc<Mutex<RuntimeCapacityObservation>>);
+
+impl MutableCapacityProbe {
+    fn new(observation: RuntimeCapacityObservation) -> Self {
+        Self(Arc::new(Mutex::new(observation)))
+    }
+
+    fn set(&self, observation: RuntimeCapacityObservation) {
+        *self.0.lock().expect("capacity probe lock") = observation;
+    }
+}
+
+impl RuntimeCapacityProbe for MutableCapacityProbe {
+    fn observe(
+        &self,
+        _storage_path: &Path,
+    ) -> Result<RuntimeCapacityObservation, RuntimeCapacityProbeError> {
+        Ok(*self.0.lock().expect("capacity probe lock"))
+    }
+}
+
+fn healthy_capacity() -> RuntimeCapacityObservation {
+    RuntimeCapacityObservation {
+        main_bytes: 8 * MIB,
+        wal_bytes: 2 * MIB,
+        shm_bytes: 32 * 1024,
+        filesystem_total_bytes: 20 * GIB,
+        filesystem_available_bytes: 4 * GIB,
+    }
+}
+
+fn disk_low_capacity() -> RuntimeCapacityObservation {
+    RuntimeCapacityObservation {
+        filesystem_total_bytes: 4 * GIB,
+        filesystem_available_bytes: 512 * MIB - 1,
+        ..healthy_capacity()
+    }
+}
+
+fn over_limit_capacity() -> RuntimeCapacityObservation {
+    RuntimeCapacityObservation {
+        main_bytes: RUNTIME_DB_HARD_LIMIT_BYTES + 1,
+        wal_bytes: 0,
+        shm_bytes: 0,
+        filesystem_available_bytes: 8 * GIB,
+        ..healthy_capacity()
+    }
+}
 
 #[derive(Clone, Debug)]
 struct ArmableFailClock {
@@ -656,6 +712,93 @@ fn assert_accept_delta(
 ) {
     assert_zero_command_state(baseline);
     assert_one_accepted_command(accepted, payload_bytes);
+    assert_one_accept_increment(baseline, accepted, payload_bytes);
+}
+
+fn assert_one_accept_increment(
+    baseline: &CommandEvidence,
+    accepted: &CommandEvidence,
+    payload_bytes: usize,
+) {
+    let payload_bytes = i64::try_from(payload_bytes).expect("payload length fits i64");
+    for (before, after, label) in [
+        (
+            baseline.command_rows,
+            accepted.command_rows,
+            "conversation commands",
+        ),
+        (baseline.pin_rows, accepted.pin_rows, "conversation pins"),
+        (
+            baseline.global_command_rows,
+            accepted.global_command_rows,
+            "global commands",
+        ),
+        (
+            baseline.global_pin_rows,
+            accepted.global_pin_rows,
+            "global pins",
+        ),
+        (
+            baseline.global_accepted_rows,
+            accepted.global_accepted_rows,
+            "global accepted commands",
+        ),
+        (
+            baseline.conversation_accepted_rows,
+            accepted.conversation_accepted_rows,
+            "conversation accepted commands",
+        ),
+        (
+            baseline.ledger_command_count,
+            accepted.ledger_command_count,
+            "ledger commands",
+        ),
+        (
+            baseline.ledger_accepted_count,
+            accepted.ledger_accepted_count,
+            "ledger accepted commands",
+        ),
+        (
+            baseline.ledger_pin_count,
+            accepted.ledger_pin_count,
+            "ledger pins",
+        ),
+        (
+            baseline.conversation_accepted_count,
+            accepted.conversation_accepted_count,
+            "conversation accepted ledger",
+        ),
+    ] {
+        assert_eq!(after, before + 1, "Accept must add exactly one {label}");
+    }
+    assert_eq!(
+        accepted.global_accepted_payload_bytes,
+        baseline.global_accepted_payload_bytes + payload_bytes
+    );
+    assert_eq!(
+        accepted.conversation_accepted_payload_bytes,
+        baseline.conversation_accepted_payload_bytes + payload_bytes
+    );
+    assert_eq!(
+        accepted.ledger_accepted_payload_bytes,
+        baseline.ledger_accepted_payload_bytes + payload_bytes
+    );
+
+    for table in ["commands", "command_configuration_pins"] {
+        let before = evidence_table(baseline, table);
+        let after = evidence_table(accepted, table);
+        assert_eq!(after.columns, before.columns);
+        assert_eq!(
+            after.rows.len(),
+            before.rows.len() + 1,
+            "Accept must append exactly one {table} row"
+        );
+        assert_eq!(
+            &after.rows[..before.rows.len()],
+            before.rows.as_slice(),
+            "Accept must preserve existing {table} rows"
+        );
+    }
     for table in [
         "conversation_state",
         "configuration_journal",
@@ -672,6 +815,7 @@ fn assert_accept_delta(
     assert_eq!(accepted.catalog_high_water, baseline.catalog_high_water);
     assert_eq!(accepted.event_high_water, baseline.event_high_water);
     assert_eq!(accepted.configuration_head, baseline.configuration_head);
+    assert_physical_totals_match_ledger(accepted);
 }
 
 fn runtime_id(kind: RuntimeIdKind, seed: u8) -> RuntimeId {
@@ -2241,4 +2385,228 @@ async fn restart_and_recovery_preserve_revision_one_for_accepted_started_and_ter
         .shutdown()
         .await
         .expect("shutdown reopened command-state store");
+}
+
+#[tokio::test]
+async fn disk_low_fresh_accept_is_zero_write_and_same_handle_recovers() {
+    let root = TestRoot::new("disk-low-accept");
+    let keys = MemoryKeyStore::new();
+    let database = root.database();
+    let input = conversation(0x70);
+    let conversation_id = input.conversation_id;
+    let probe = MutableCapacityProbe::new(healthy_capacity());
+    let store = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(database.clone()).with_capacity_probe(probe.clone()),
+        root.storage_kek(&keys),
+    )
+    .await
+    .expect("open DiskLow command store");
+    store
+        .create_conversation(input)
+        .await
+        .expect("create DiskLow conversation");
+    assert_eq!(
+        configure(
+            &store,
+            conversation_id,
+            0x71,
+            "disk-low-revision-one",
+            0,
+            CodexReasoningEffort::Medium,
+        )
+        .await,
+        1
+    );
+
+    let baseline = command_evidence(&database, conversation_id);
+    assert_zero_command_state(&baseline);
+    assert_physical_totals_match_ledger(&baseline);
+    let command_owner = owner(0x72);
+    let request = accept_request(
+        conversation_id,
+        &command_owner,
+        "disk-low-command",
+        1,
+        b"persist only after capacity recovers",
+    );
+
+    probe.set(disk_low_capacity());
+    let error = store
+        .accept_command(request.clone())
+        .await
+        .expect_err("DiskLow must reject a fresh Accept before its first durable write");
+    assert!(matches!(error, RuntimeStoreError::DiskLow { .. }));
+    assert_eq!(error.code(), "daemon.runtime.disk_low");
+    assert_eq!(
+        command_evidence(&database, conversation_id),
+        baseline,
+        "DiskLow rejection must not drift command, pin, ledger, event or catalog evidence"
+    );
+
+    probe.set(healthy_capacity());
+    let command = accepted(
+        store
+            .accept_command(request.clone())
+            .await
+            .expect("the same handle must recover after DiskLow clears"),
+    );
+    assert_eq!(command.configuration_revision, 1);
+    let accepted_evidence = command_evidence(&database, conversation_id);
+    assert_accept_delta(&baseline, &accepted_evidence, request.payload.len());
+
+    probe.set(disk_low_capacity());
+    let replayed = match store
+        .accept_command(request)
+        .await
+        .expect("exact replay must remain read-only under DiskLow")
+    {
+        AcceptOutcome::Replayed { command } => command,
+        other => panic!("expected DiskLow exact replay, got {other:?}"),
+    };
+    assert_eq!(replayed.command_id, command.command_id);
+    assert_eq!(replayed.configuration_revision, 1);
+    assert_eq!(
+        command_evidence(&database, conversation_id),
+        accepted_evidence,
+        "DiskLow exact replay must not drift command, pin, ledger, event or catalog evidence"
+    );
+
+    probe.set(healthy_capacity());
+    store
+        .shutdown()
+        .await
+        .expect("shutdown recovered DiskLow command store");
+}
+
+#[tokio::test]
+async fn store_full_latches_until_reopen_while_exact_replay_is_zero_write() {
+    let root = TestRoot::new("store-full-accept");
+    let keys = MemoryKeyStore::new();
+    let database = root.database();
+    let input = conversation(0x73);
+    let conversation_id = input.conversation_id;
+    let probe = MutableCapacityProbe::new(healthy_capacity());
+    let config = RuntimeStoreConfig::new(database.clone()).with_capacity_probe(probe.clone());
+    let store = RuntimeStoreHandle::open(config.clone(), root.storage_kek(&keys))
+        .await
+        .expect("open StoreFull command store");
+    store
+        .create_conversation(input)
+        .await
+        .expect("create StoreFull conversation");
+    assert_eq!(
+        configure(
+            &store,
+            conversation_id,
+            0x74,
+            "store-full-revision-one",
+            0,
+            CodexReasoningEffort::Medium,
+        )
+        .await,
+        1
+    );
+
+    let command_owner = owner(0x75);
+    let seed_request = accept_request(
+        conversation_id,
+        &command_owner,
+        "store-full-seed",
+        1,
+        b"durable seed for exact replay",
+    );
+    let seed = accepted(
+        store
+            .accept_command(seed_request.clone())
+            .await
+            .expect("accept seed command before StoreFull"),
+    );
+    let baseline = command_evidence(&database, conversation_id);
+    assert_one_accepted_command(&baseline, seed_request.payload.len());
+    let blocked_request = accept_request(
+        conversation_id,
+        &command_owner,
+        "store-full-blocked",
+        1,
+        b"persist only after reopen",
+    );
+
+    probe.set(over_limit_capacity());
+    let error = store
+        .accept_command(blocked_request.clone())
+        .await
+        .expect_err("StoreFull must reject and latch a fresh Accept");
+    assert!(matches!(error, RuntimeStoreError::StoreFull { .. }));
+    assert_eq!(error.code(), "daemon.runtime.store_full");
+    assert_eq!(
+        command_evidence(&database, conversation_id),
+        baseline,
+        "StoreFull rejection must not drift command, pin, ledger, event or catalog evidence"
+    );
+
+    let replayed = match store
+        .accept_command(seed_request.clone())
+        .await
+        .expect("exact replay must bypass StoreFull and the SafetyOnly latch")
+    {
+        AcceptOutcome::Replayed { command } => command,
+        other => panic!("expected StoreFull exact replay, got {other:?}"),
+    };
+    assert_eq!(replayed.command_id, seed.command_id);
+    assert_eq!(replayed.configuration_revision, 1);
+    assert_eq!(
+        command_evidence(&database, conversation_id),
+        baseline,
+        "StoreFull exact replay must not drift durable evidence"
+    );
+
+    probe.set(healthy_capacity());
+    let latched = store
+        .accept_command(blocked_request.clone())
+        .await
+        .expect_err("healthy capacity must not clear SafetyOnly on the same handle");
+    assert!(matches!(latched, RuntimeStoreError::SafetyOnly));
+    assert_eq!(latched.code(), "daemon.runtime.safety_only");
+    assert_eq!(
+        command_evidence(&database, conversation_id),
+        baseline,
+        "SafetyOnly rejection must preserve the pre-latch durable evidence"
+    );
+
+    store
+        .shutdown()
+        .await
+        .expect("shutdown StoreFull-latched command store");
+    let reopened = RuntimeStoreHandle::open(config, root.storage_kek(&keys))
+        .await
+        .expect("reopen command store after capacity recovers");
+    let replayed_after_reopen = match reopened
+        .accept_command(seed_request)
+        .await
+        .expect("seed exact replay must remain read-only after reopen")
+    {
+        AcceptOutcome::Replayed { command } => command,
+        other => panic!("expected exact replay after reopen, got {other:?}"),
+    };
+    assert_eq!(replayed_after_reopen.command_id, seed.command_id);
+    assert_eq!(
+        command_evidence(&database, conversation_id),
+        baseline,
+        "reopen and exact replay must preserve pre-existing durable evidence"
+    );
+
+    let accepted_after_reopen = accepted(
+        reopened
+            .accept_command(blocked_request.clone())
+            .await
+            .expect("reopen must clear the handle-local SafetyOnly latch"),
+    );
+    assert_eq!(accepted_after_reopen.configuration_revision, 1);
+    let recovered = command_evidence(&database, conversation_id);
+    assert_one_accept_increment(&baseline, &recovered, blocked_request.payload.len());
+
+    reopened
+        .shutdown()
+        .await
+        .expect("shutdown recovered StoreFull command store");
 }

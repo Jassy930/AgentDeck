@@ -49,6 +49,9 @@ use super::sqlite::{
 /// 每次普通事务除显式 payload 外预留的 row/index/sequence 固定开销。
 const RUNTIME_WRITE_FIXED_OVERHEAD_BYTES: u64 = 64 * 1024;
 
+/// AcceptCommand 准入时 authenticated command/pin/ledger/index metadata 的保守估算。
+const ACCEPT_COMMAND_AUTHENTICATED_METADATA_ADMISSION_ESTIMATE_BYTES: usize = 1024;
+
 const COMMAND_MAGIC: &[u8; 4] = b"ADC1";
 const INTENT_MAGIC: &[u8; 4] = b"ADI1";
 const FENCE_MAGIC: &[u8; 4] = b"ADF2";
@@ -909,8 +912,11 @@ pub(crate) fn accept_command(
         .ok_or(RuntimeStoreError::TimeOutOfRange)?;
     let expires_at = sqlite_time(expires_at_ms)?;
     let retain_until = sqlite_time(retain_until_ms)?;
-    let projected_write_bytes =
-        projected_write_bytes(&[input.idempotency_key.len(), input.payload.len(), 1024])?;
+    let projected_write_bytes = projected_write_bytes(&[
+        input.idempotency_key.len(),
+        input.payload.len(),
+        ACCEPT_COMMAND_AUTHENTICATED_METADATA_ADMISSION_ESTIMATE_BYTES,
+    ])?;
     let (preflight_conversation, _, _) = load_new_command_queue_state(
         &state.connection,
         &state.key_bundle,

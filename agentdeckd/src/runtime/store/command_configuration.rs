@@ -320,3 +320,26 @@ pub(super) fn validate_v5_integrity(
     }
     Ok(authenticated_pin_count)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pin_capacity_accepts_max_minus_one_and_rejects_max() {
+        let below_limit = RuntimeLedger {
+            command_configuration_pin_count: MAX_COMMAND_CONFIGURATION_PINS - 1,
+            ..RuntimeLedger::default()
+        };
+        ensure_pin_capacity(&below_limit).expect("MAX - 1 pins must remain admissible");
+
+        let at_limit = RuntimeLedger {
+            command_configuration_pin_count: MAX_COMMAND_CONFIGURATION_PINS,
+            ..RuntimeLedger::default()
+        };
+        assert!(matches!(
+            ensure_pin_capacity(&at_limit),
+            Err(RuntimeStoreError::CommandConfigurationPinLimit)
+        ));
+    }
+}
