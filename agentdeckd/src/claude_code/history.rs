@@ -47,6 +47,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::agent::{
+    CanonicalNativeHistoryItem, CanonicalNativeHistoryRead, NativeItemKey, NativeTurnKey,
+};
 use crate::claude_code::state::{ClaudeCodeStateRepository, ResolvedClaudeCodeReference};
 #[cfg(test)]
 use crate::runtime::store::ConversationDescriptor;
@@ -97,6 +100,46 @@ pub(super) async fn read_managed_history(
     repository: &ClaudeCodeStateRepository,
     adapter_state_key: RuntimeId,
 ) -> Result<HistoryReadResponse, ProtocolError> {
+    let reference = resolve_managed_native_reference(repository, adapter_state_key).await?;
+    read_native_history(reference).await
+}
+
+/// Native-projected Runtime conversation 的 key-bearing read。返回值只包含
+/// vendor-neutral opaque key 与已建模 item，不携带 native reference/session/path。
+pub(super) async fn read_native_projection_history(
+    repository: &ClaudeCodeStateRepository,
+    adapter_state_key: RuntimeId,
+) -> Result<CanonicalNativeHistoryRead, ProtocolError> {
+    let reference = repository
+        .resolve_private(adapter_state_key)
+        .await
+        .map_err(adapter_state_protocol_error)?
+        .ok_or_else(|| ProtocolError {
+            code: "adapter-state-not-found".into(),
+            message: "Claude Code history mapping was not found".into(),
+            diagnostic_ref: None,
+        })?;
+    let reference = require_native_projection_reference(reference)?;
+    read_keyed_native_history(reference).await
+}
+
+fn require_native_projection_reference(
+    reference: ResolvedClaudeCodeReference,
+) -> Result<NativeTranscriptRefV1, ProtocolError> {
+    match reference {
+        ResolvedClaudeCodeReference::NativeV1(reference) => Ok(reference),
+        ResolvedClaudeCodeReference::LegacySessionId(_) => Err(ProtocolError {
+            code: "adapter-native-history-reference-invalid".into(),
+            message: "native-projected history requires a verified opaque reference".into(),
+            diagnostic_ref: None,
+        }),
+    }
+}
+
+async fn resolve_managed_native_reference(
+    repository: &ClaudeCodeStateRepository,
+    adapter_state_key: RuntimeId,
+) -> Result<NativeTranscriptRefV1, ProtocolError> {
     let reference = repository
         .resolve_private(adapter_state_key)
         .await
@@ -108,15 +151,15 @@ pub(super) async fn read_managed_history(
         })?;
     match reference {
         ResolvedClaudeCodeReference::LegacySessionId(thread_id) => {
-            read_legacy_managed_history(thread_id).await
+            verify_legacy_native_reference(thread_id).await
         }
-        ResolvedClaudeCodeReference::NativeV1(reference) => read_native_history(reference).await,
+        ResolvedClaudeCodeReference::NativeV1(reference) => Ok(reference),
     }
 }
 
-async fn read_legacy_managed_history(
+async fn verify_legacy_native_reference(
     thread_id: ThreadId,
-) -> Result<HistoryReadResponse, ProtocolError> {
+) -> Result<NativeTranscriptRefV1, ProtocolError> {
     let root = claude_projects_root().ok_or_else(|| ProtocolError {
         code: "cc-history-root-unavailable".into(),
         message: "cannot resolve the current user's Claude Code history root".into(),
@@ -142,7 +185,7 @@ async fn read_legacy_managed_history(
         message: format!("legacy native history lookup failed: {error}"),
         diagnostic_ref: None,
     })??;
-    read_native_history(verified.into_private_reference()).await
+    Ok(verified.into_private_reference())
 }
 
 async fn read_native_history(
@@ -156,12 +199,10 @@ async fn read_native_history(
     tokio::task::spawn_blocking(move || {
         let source =
             NativeHistorySource::for_current_account().map_err(native_history_protocol_error)?;
-        let mut budget =
-            NativeIoBudget::new(1, 64 * 1024 * 1024, Instant::now() + Duration::from_secs(2));
-        let document = match source
-            .read(&reference, &mut budget, NativeParseLimits::default())
-            .map_err(native_history_protocol_error)?
-        {
+        let projection = source
+            .read_projection(&reference)
+            .map_err(native_history_protocol_error)?;
+        let document = match projection.into_outcome() {
             NativeReadOutcome::Document(document) => document,
             NativeReadOutcome::FilteredObserver => return Err(native_history_not_found()),
         };
@@ -200,6 +241,54 @@ async fn read_native_history(
         message: format!("native history task failed: {error}"),
         diagnostic_ref: None,
     })?
+}
+
+async fn read_keyed_native_history(
+    reference: NativeTranscriptRefV1,
+) -> Result<CanonicalNativeHistoryRead, ProtocolError> {
+    tokio::task::spawn_blocking(move || {
+        let source =
+            NativeHistorySource::for_current_account().map_err(native_history_protocol_error)?;
+        let projection = source
+            .read_projection(&reference)
+            .map_err(native_history_protocol_error)?;
+        let source_bytes = projection.bytes_read();
+        let document = match projection.into_outcome() {
+            NativeReadOutcome::Document(document) => document,
+            NativeReadOutcome::FilteredObserver => return Err(native_history_not_found()),
+        };
+        if document.turns().is_empty() {
+            return Err(invalid_native_history());
+        }
+        canonicalize_native_projection(document, source_bytes)
+    })
+    .await
+    .map_err(|error| ProtocolError {
+        code: "cc-history-task-join".into(),
+        message: format!("key-bearing native history task failed: {error}"),
+        diagnostic_ref: None,
+    })?
+}
+
+fn canonicalize_native_projection(
+    document: native::NativeHistoryDocument,
+    source_bytes: u64,
+) -> Result<CanonicalNativeHistoryRead, ProtocolError> {
+    let mut items = Vec::new();
+    for turn in document.into_turns() {
+        let native_turn_key = turn.key();
+        let turn_key = NativeTurnKey::from_verified_bytes(*native_turn_key.as_bytes())?;
+        for item in turn.into_items() {
+            debug_assert_eq!(item.turn_key(), native_turn_key);
+            let native_item_key = item.key();
+            items.push(CanonicalNativeHistoryItem::new(
+                turn_key,
+                NativeItemKey::from_verified_bytes(*native_item_key.as_bytes())?,
+                item.into_item(),
+            )?);
+        }
+    }
+    CanonicalNativeHistoryRead::new(AgentKind::ClaudeCode, items, source_bytes)
 }
 
 /// 只从调用方明确选定的 native history entry 重建派生索引；不按

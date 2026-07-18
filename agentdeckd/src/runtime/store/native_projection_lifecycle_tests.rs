@@ -8,7 +8,7 @@ use agentdeck_protocol::runtime::{
     VendorConfigurationSnapshot,
 };
 use agentdeck_protocol::{AgentKind, ClaudeCodePermissionMode};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use tokio::sync::Semaphore;
 
 use super::admission::{
@@ -19,17 +19,25 @@ use super::native_projection::{
     RetireNativeProjectionOutcome,
 };
 use super::{
-    AcceptCommand, AcceptOutcome, ConversationDescriptor, IdempotencyOwner, ImportNativeProjection,
-    ImportNativeProjectionOutcome, RuntimeBackfillPlan, RuntimeBackfillTarget, RuntimeClock,
-    RuntimeClockError, RuntimeCommitOperation, RuntimeId, RuntimeStoreConfig, RuntimeStoreError,
-    RuntimeStoreFaultInjector, RuntimeStoreHandle, RuntimeStoreOperation,
+    AcceptCommand, AcceptOutcome, ConfigureConversation, ConversationDescriptor, IdempotencyOwner,
+    ImportNativeProjection, ImportNativeProjectionOutcome, NewConversation,
+    PreparedConversationSnapshotWrite, RuntimeBackfillPlan, RuntimeBackfillTarget, RuntimeClock,
+    RuntimeClockError, RuntimeCommitOperation, RuntimeId, RuntimeIdKind, RuntimeStoreConfig,
+    RuntimeStoreError, RuntimeStoreFaultInjector, RuntimeStoreHandle, RuntimeStoreOperation,
 };
 use crate::claude_code::history::CompletedNativeScan;
+use crate::runtime::AgentRouter;
 use crate::runtime::backfill::BarrierRequest;
 use crate::runtime::catalog_snapshot::CatalogSnapshotProvider;
 use crate::runtime::connection::{AuthenticatedPrincipal, PrincipalIssuer};
-use crate::runtime::events::{RegisterStreamBarrier, RuntimeStreamTarget, WatchGeneration};
-use crate::runtime::snapshot::SNAPSHOT_BUILD_MEMORY_BYTES;
+use crate::runtime::events::{
+    RegisterStreamBarrier, RuntimeStreamTarget, SnapshotBarrierSource,
+    SnapshotMaterializationSource, WatchGeneration,
+};
+use crate::runtime::snapshot::{
+    SNAPSHOT_BUILD_MEMORY_BYTES, SnapshotMaterialization, SnapshotMaterializationError,
+    SnapshotMaterializer,
+};
 use crate::security::{MemoryKeyStore, SecretBytes, StorageKek, load_or_create_storage_kek};
 
 const TOMBSTONE_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
@@ -275,6 +283,49 @@ fn durable_artifact_bytes(database: &Path) -> (Vec<u8>, Option<Vec<u8>>) {
     (main, wal)
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct SnapshotDurableEvidence {
+    snapshot_rows: i64,
+    event_rows: i64,
+    ledger_event_count: i64,
+    ledger_snapshot_count: i64,
+    ledger_snapshot_bytes: i64,
+    ledger_token: Vec<u8>,
+    artifacts: (Vec<u8>, Option<Vec<u8>>),
+}
+
+fn snapshot_durable_evidence(database: &Path) -> SnapshotDurableEvidence {
+    let connection = Connection::open(database).expect("open snapshot durable evidence database");
+    let scalar = |query: &str| {
+        connection
+            .query_row(query, [], |row| row.get(0))
+            .expect("read snapshot durable scalar evidence")
+    };
+    let (ledger_event_count, ledger_snapshot_count, ledger_snapshot_bytes, ledger_token) =
+        connection
+            .query_row(
+                "SELECT event_count, snapshot_count, snapshot_bytes, metadata_token
+             FROM runtime_meta WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read snapshot durable ledger evidence");
+    let evidence = SnapshotDurableEvidence {
+        snapshot_rows: scalar("SELECT COUNT(*) FROM snapshots"),
+        event_rows: scalar("SELECT COUNT(*) FROM event_journal"),
+        ledger_event_count,
+        ledger_snapshot_count,
+        ledger_snapshot_bytes,
+        ledger_token,
+        artifacts: (Vec::new(), None),
+    };
+    drop(connection);
+    SnapshotDurableEvidence {
+        artifacts: durable_artifact_bytes(database),
+        ..evidence
+    }
+}
+
 fn accepted_command_count(database: &Path, conversation_id: RuntimeId) -> i64 {
     Connection::open(database)
         .expect("open accepted command evidence")
@@ -285,6 +336,102 @@ fn accepted_command_count(database: &Path, conversation_id: RuntimeId) -> i64 {
             |row| row.get(0),
         )
         .expect("count accepted command evidence")
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CommandAdmissionEvidence {
+    command_rows: i64,
+    pin_rows: i64,
+    event_rows: i64,
+    command_high_water: Option<String>,
+    conversation_accepted_count: i64,
+    conversation_metadata_token: Vec<u8>,
+    ledger_command_count: i64,
+    ledger_pin_count: i64,
+    ledger_event_count: i64,
+    ledger_accepted_count: i64,
+    ledger_accepted_payload_bytes: i64,
+    ledger_metadata_token: Vec<u8>,
+    artifacts: (Vec<u8>, Option<Vec<u8>>),
+}
+
+fn command_admission_evidence(
+    database: &Path,
+    conversation_id: RuntimeId,
+) -> CommandAdmissionEvidence {
+    let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open read-only command admission evidence database");
+    let target = &conversation_id.as_bytes()[..];
+    let command_rows = connection
+        .query_row(
+            "SELECT COUNT(*) FROM commands WHERE conversation_id = ?1",
+            [target],
+            |row| row.get(0),
+        )
+        .expect("count command admission command rows");
+    let pin_rows = connection
+        .query_row(
+            "SELECT COUNT(*) FROM command_configuration_pins WHERE conversation_id = ?1",
+            [target],
+            |row| row.get(0),
+        )
+        .expect("count command admission configuration pins");
+    let event_rows = connection
+        .query_row(
+            "SELECT COUNT(*) FROM event_journal WHERE conversation_id = ?1",
+            [target],
+            |row| row.get(0),
+        )
+        .expect("count command admission event rows");
+    let (command_high_water, conversation_accepted_count, conversation_metadata_token) = connection
+        .query_row(
+            "SELECT command_high_water, accepted_count, metadata_token
+                 FROM conversations WHERE conversation_id = ?1",
+            [target],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read command admission conversation evidence");
+    let (
+        ledger_command_count,
+        ledger_pin_count,
+        ledger_event_count,
+        ledger_accepted_count,
+        ledger_accepted_payload_bytes,
+        ledger_metadata_token,
+    ) = connection
+        .query_row(
+            "SELECT command_count, command_configuration_pin_count, event_count,
+                    accepted_count, accepted_payload_bytes, metadata_token
+             FROM runtime_meta WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .expect("read command admission ledger evidence");
+    drop(connection);
+    CommandAdmissionEvidence {
+        command_rows,
+        pin_rows,
+        event_rows,
+        command_high_water,
+        conversation_accepted_count,
+        conversation_metadata_token,
+        ledger_command_count,
+        ledger_pin_count,
+        ledger_event_count,
+        ledger_accepted_count,
+        ledger_accepted_payload_bytes,
+        ledger_metadata_token,
+        artifacts: durable_artifact_bytes(database),
+    }
 }
 
 fn configuration() -> ConversationConfiguration {
@@ -820,6 +967,292 @@ async fn catalog_snapshot_reducer_removes_tombstone_and_restores_same_id_on_reap
         .shutdown()
         .await
         .expect("shutdown catalog snapshot lifecycle store");
+}
+
+#[tokio::test]
+async fn native_subscription_captures_dynamic_source_without_durable_snapshot_write() {
+    let root = TestRoot::new("native-dynamic-source");
+    let keys = MemoryKeyStore::new();
+    let clock = ManualClock::new(37_000);
+    let store = open_store(&root, &keys, clock).await;
+    let projector = store.claude_code_native_projection_store();
+    let imported = projector
+        .import(import_input(&reference(37), [0x76; 16]))
+        .await
+        .expect("import native dynamic source fixture");
+    let ImportNativeProjectionOutcome::Imported { conversation, .. } = imported else {
+        panic!("native dynamic source fixture must import");
+    };
+    let conversation_id = conversation.conversation_id;
+    assert!(
+        store
+            .load_conversation_snapshot(conversation_id)
+            .await
+            .expect("read absent native ready snapshot")
+            .is_none()
+    );
+    let durable_before = durable_artifact_bytes(&root.database());
+
+    let mut registration = store
+        .register_stream_barrier(RegisterStreamBarrier {
+            target: RuntimeStreamTarget::Conversation(conversation_id),
+            generation: WatchGeneration::new(37).expect("nonzero native dynamic generation"),
+            request: BarrierRequest::Subscribe {
+                cursor: StreamCursor::BeforeFirst,
+            },
+        })
+        .await
+        .expect("capture native dynamic barrier source");
+    assert!(registration.ready_snapshot_base.is_none());
+    let source = registration
+        .take_snapshot_source()
+        .expect("native subscribe must carry a dynamic source");
+    assert!(matches!(
+        source.source(),
+        SnapshotBarrierSource::Dynamic(pin)
+            if pin.conversation_id() == conversation_id
+                && pin.base_event_seq() == conversation.event_high_water
+    ));
+    assert_eq!(
+        store
+            .active_snapshot_build_pin_count_for_test()
+            .await
+            .expect("count active native dynamic TEMP pin"),
+        1
+    );
+    drop(source);
+    assert_eq!(
+        store
+            .active_snapshot_build_pin_count_for_test()
+            .await
+            .expect("count released native dynamic TEMP pin"),
+        0
+    );
+    assert!(
+        store
+            .load_conversation_snapshot(conversation_id)
+            .await
+            .expect("read native snapshot after dynamic source release")
+            .is_none()
+    );
+    assert_eq!(durable_artifact_bytes(&root.database()), durable_before);
+    store
+        .shutdown()
+        .await
+        .expect("shutdown native dynamic source fixture");
+}
+
+#[tokio::test]
+async fn native_direct_snapshot_capabilities_cannot_reach_durable_writer() {
+    let root = TestRoot::new("native-durable-snapshot-gate");
+    let keys = MemoryKeyStore::new();
+    let clock = ManualClock::new(38_000);
+    let store = open_store(&root, &keys, clock).await;
+    let imported = store
+        .claude_code_native_projection_store()
+        .import(import_input(&reference(38), [0x77; 16]))
+        .await
+        .expect("import native durable snapshot gate fixture");
+    let ImportNativeProjectionOutcome::Imported { conversation, .. } = imported else {
+        panic!("native durable snapshot gate fixture must import");
+    };
+    let conversation_id = conversation.conversation_id;
+    let durable_before = snapshot_durable_evidence(&root.database());
+    let materializer = SnapshotMaterializer::new(
+        store.clone(),
+        Arc::new(AgentRouter::with_runtime_store(store.clone())),
+    );
+
+    let source = store
+        .acquire_snapshot_build_source(conversation_id)
+        .await
+        .expect("acquire typed native snapshot source");
+    assert!(matches!(
+        source.source(),
+        SnapshotBarrierSource::Dynamic(pin)
+            if pin.conversation_id() == conversation_id
+                && pin.base_event_seq() == conversation.event_high_water
+    ));
+    let SnapshotMaterialization::Dynamic(dynamic) = materializer
+        .materialize(source)
+        .await
+        .expect("materialize native snapshot as ephemeral Dynamic input")
+    else {
+        panic!("native snapshot source must never materialize a durable Build input");
+    };
+    assert_eq!(dynamic.conversation_id(), conversation_id);
+    assert_eq!(
+        store
+            .active_snapshot_build_pin_count_for_test()
+            .await
+            .expect("count live Dynamic TEMP pin"),
+        1
+    );
+    assert_eq!(snapshot_durable_evidence(&root.database()), durable_before);
+    materializer
+        .release_dynamic_input(dynamic)
+        .await
+        .expect("release typed Dynamic TEMP pin");
+    assert_eq!(
+        store
+            .active_snapshot_build_pin_count_for_test()
+            .await
+            .expect("count released Dynamic TEMP pin"),
+        0
+    );
+
+    // 模拟 stale/cross-layer capability 把同一 authenticated native pin 错标成 Build；
+    // materializer 必须在产生可 bind 的 SnapshotBuildInput 前拒绝并回收 pin。
+    let source = store
+        .acquire_snapshot_build_source(conversation_id)
+        .await
+        .expect("acquire native source for forged Build test");
+    let (source, cleanup) = source.into_parts();
+    let SnapshotBarrierSource::Dynamic(pin) = source else {
+        panic!("direct native acquire must remain Dynamic");
+    };
+    let forged = SnapshotMaterializationSource::new(SnapshotBarrierSource::Build(pin), cleanup);
+    let error = materializer
+        .materialize(forged)
+        .await
+        .expect_err("native parent must reject a forged durable Build source");
+    assert!(matches!(error, SnapshotMaterializationError::InvalidState));
+    assert_eq!(
+        store
+            .active_snapshot_build_pin_count_for_test()
+            .await
+            .expect("count pin after forged Build rejection"),
+        0
+    );
+    assert_eq!(snapshot_durable_evidence(&root.database()), durable_before);
+
+    // 最终 writer 必须独立复核 origin；即使 crate 内旁路伪造 opaque write，也不能
+    // seal/DELETE/INSERT/consume durable state。
+    let source = store
+        .acquire_snapshot_build_source(conversation_id)
+        .await
+        .expect("acquire native source for forged writer test");
+    let (source, cleanup) = source.into_parts();
+    let SnapshotBarrierSource::Dynamic(pin) = source else {
+        panic!("writer bypass fixture must start from Dynamic");
+    };
+    let cleanup = cleanup.expect("direct native source owns exact cleanup");
+    let mut payload = br#"{"native":"must-not-persist"}"#.to_vec();
+    payload
+        .try_reserve_exact(super::cipher::ROW_BLOB_V1_OVERHEAD_LEN)
+        .expect("reserve forged writer payload capacity");
+    let failure = store
+        .store_conversation_snapshot(PreparedConversationSnapshotWrite::new(
+            pin, 1, payload, cleanup,
+        ))
+        .await
+        .expect_err("native parent must fail before durable snapshot write");
+    assert!(matches!(
+        failure.error(),
+        RuntimeStoreError::InvalidStateTransition
+    ));
+    drop(failure.into_retry_write());
+    assert_eq!(
+        store
+            .active_snapshot_build_pin_count_for_test()
+            .await
+            .expect("count pin after forged writer rejection"),
+        0
+    );
+    assert_eq!(snapshot_durable_evidence(&root.database()), durable_before);
+    assert!(
+        store
+            .load_conversation_snapshot(conversation_id)
+            .await
+            .expect("read native snapshot after all durable gate attempts")
+            .is_none()
+    );
+
+    store
+        .shutdown()
+        .await
+        .expect("shutdown native durable snapshot gate fixture");
+}
+
+#[tokio::test]
+async fn recovery_rejects_authenticated_native_snapshot_row_without_rewrite() {
+    let root = TestRoot::new("native-resealed-snapshot-recovery");
+    let keys = MemoryKeyStore::new();
+    let clock = ManualClock::new(39_000);
+    let store = open_store(&root, &keys, clock.clone()).await;
+    let imported = store
+        .claude_code_native_projection_store()
+        .import(import_input(&reference(39), [0x78; 16]))
+        .await
+        .expect("import native resealed snapshot recovery fixture");
+    let ImportNativeProjectionOutcome::Imported { conversation, .. } = imported else {
+        panic!("native resealed snapshot recovery fixture must import");
+    };
+    store
+        .shutdown()
+        .await
+        .expect("close native store before offline reseal fixture");
+
+    let config = RuntimeStoreConfig::new(root.database()).with_clock(clock.clone());
+    let mut raw = super::sqlite::open(&config, root.storage_kek(&keys))
+        .expect("open raw store before authenticated native snapshot injection");
+    super::snapshot::inject_authenticated_native_snapshot_row_for_test(
+        &mut raw,
+        conversation.conversation_id,
+        39_001,
+    )
+    .expect("inject authenticated-but-semantically-invalid native snapshot row");
+    let victim = conversation
+        .event_high_water
+        .expect("native import has an initial configuration event");
+    assert!(
+        !super::snapshot::authenticated_conversation_snapshot_covers(
+            &raw.connection,
+            &raw.key_bundle,
+            conversation.conversation_id,
+            victim,
+        )
+        .expect("authenticate native snapshot trim evidence"),
+        "NativeProjected durable row must never authorize event trim"
+    );
+    let trim_error = super::retention::authorize_trim(
+        &raw.connection,
+        &raw.key_bundle,
+        super::retention::RetentionTarget::Conversation(conversation.conversation_id.as_bytes()),
+        &super::sequence::encode_sequence(victim),
+        39_001,
+    )
+    .expect_err("NativeProjected durable row cannot serve as replacement evidence");
+    assert!(matches!(
+        trim_error,
+        RuntimeStoreError::PublicationNeedsSnapshot
+    ));
+    drop(raw);
+    let before_reopen = snapshot_durable_evidence(&root.database());
+    assert_eq!(before_reopen.snapshot_rows, 1);
+    assert_eq!(before_reopen.ledger_snapshot_count, 1);
+
+    let failure = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(root.database()).with_clock(clock),
+        root.storage_kek(&keys),
+    )
+    .await;
+    match failure {
+        Err(RuntimeStoreError::UnknownOrCorruptSchema) => {}
+        Err(other) => panic!("native snapshot recovery returned wrong error: {other:?}"),
+        Ok(store) => {
+            store
+                .shutdown()
+                .await
+                .expect("shutdown unexpectedly accepted native snapshot store");
+            panic!("recovery accepted authenticated NativeProjected snapshot row");
+        }
+    }
+    assert_eq!(
+        snapshot_durable_evidence(&root.database()),
+        before_reopen,
+        "rejected recovery must leave snapshots/events/ledger/main+WAL byte-exact"
+    );
 }
 
 #[tokio::test]
@@ -1707,6 +2140,31 @@ async fn reconciliation_clock_regression_is_zero_write_and_preserves_exact_evide
     let ImportNativeProjectionOutcome::Imported { conversation, .. } = imported else {
         panic!("clock-regression fixture must import");
     };
+    // 该测试需要在 plan 之后推进某个 authenticated conversation 的 updatedAt，
+    // 但 NativeProjected 已不允许用 SendPrompt 达成。先创建并配置独立 Managed
+    // conversation，之后只在它上面接受 command，保持 native origin 边界不被破坏。
+    let managed_conversation_id =
+        RuntimeId::from_bytes(RuntimeIdKind::Conversation, [0x6a; 16]).expect("managed id");
+    let managed_adapter_state_key =
+        RuntimeId::from_bytes(RuntimeIdKind::AdapterState, [0x6b; 16]).expect("managed state key");
+    store
+        .create_conversation(NewConversation {
+            conversation_id: managed_conversation_id,
+            adapter_state_key: managed_adapter_state_key,
+            descriptor: descriptor(),
+        })
+        .await
+        .expect("create managed clock-regression control");
+    store
+        .configure_conversation(ConfigureConversation {
+            conversation_id: managed_conversation_id,
+            owner: owner(0x6c),
+            idempotency_key: "managed-clock-regression-configuration".to_owned(),
+            expected_configuration_revision: 0,
+            configuration: configuration(),
+        })
+        .await
+        .expect("configure managed clock-regression control");
 
     clock.set(150);
     let completed = projector
@@ -1726,9 +2184,9 @@ async fn reconciliation_clock_regression_is_zero_write_and_preserves_exact_evide
     assert!(matches!(
         store
             .accept_command(AcceptCommand {
-                conversation_id: conversation.conversation_id,
+                conversation_id: managed_conversation_id,
                 owner: owner(0x49),
-                idempotency_key: "native-clock-regression-accepted".to_owned(),
+                idempotency_key: "managed-clock-regression-accepted".to_owned(),
                 expected_configuration_revision: 1,
                 payload: b"advance authenticated conversation time".to_vec(),
             })
@@ -1767,8 +2225,8 @@ async fn reconciliation_clock_regression_is_zero_write_and_preserves_exact_evide
 }
 
 #[tokio::test]
-async fn forged_quiescent_disposition_cannot_remove_a_durably_accepted_conversation() {
-    let root = TestRoot::new("accepted-quiescence-recheck");
+async fn native_present_command_admission_is_zero_write_across_reopen() {
+    let root = TestRoot::new("native-command-admission-gate");
     let keys = MemoryKeyStore::new();
     let clock = ManualClock::new(375_000);
     let store = open_store(&root, &keys, clock.clone()).await;
@@ -1776,65 +2234,65 @@ async fn forged_quiescent_disposition_cannot_remove_a_durably_accepted_conversat
     let imported = projector
         .import(import_input(&reference(11), [0x4A; 16]))
         .await
-        .expect("import accepted quiescence fixture");
+        .expect("import native command admission fixture");
     let ImportNativeProjectionOutcome::Imported { conversation, .. } = imported else {
-        panic!("accepted quiescence fixture must import");
+        panic!("native command admission fixture must import");
     };
-    let accepted = store
+    let before = command_admission_evidence(&root.database(), conversation.conversation_id);
+    let error = store
         .accept_command(AcceptCommand {
             conversation_id: conversation.conversation_id,
             owner: owner(0x4B),
-            idempotency_key: "native-lifecycle-accepted".to_owned(),
+            idempotency_key: "native-command-must-not-persist".to_owned(),
             expected_configuration_revision: 1,
-            payload: b"durably accepted native command".to_vec(),
+            payload: b"native command must remain history-only".to_vec(),
         })
         .await
-        .expect("persist Accepted command on native projection");
-    assert!(matches!(accepted, AcceptOutcome::Accepted { .. }));
+        .expect_err("present NativeProjected conversation must reject durable command");
     assert_eq!(
-        accepted_command_count(&root.database(), conversation.conversation_id),
-        1
+        error.code(),
+        agentdeck_protocol::runtime::failure::DAEMON_RUNTIME_FEATURE_UNAVAILABLE
     );
-
-    clock.set(375_001);
-    let completed = projector
-        .accept_completed_scan(completed_scan([0x4C; 16], 0))
-        .await
-        .expect("accept complete scan with durably busy candidate");
-    let plan = projector
-        .plan_completed_page(completed, None)
-        .await
-        .expect("plan durably busy absent projection");
+    assert!(matches!(
+        error,
+        RuntimeStoreError::CommandAdmissionUnsupported
+    ));
     assert_eq!(
-        plan.candidate_ids().collect::<Vec<_>>(),
-        [conversation.conversation_id]
-    );
-    let before_cardinality = lifecycle_evidence(&root.database());
-    let before_artifacts = durable_artifact_bytes(&root.database());
-    let error = projector
-        .apply_completed_page(
-            plan,
-            vec![NativeProjectionCandidateDisposition::Quiescent(
-                conversation.conversation_id,
-            )],
-        )
-        .await
-        .expect_err("Store-side durable recheck must reject forged Quiescent disposition");
-    assert!(matches!(error, RuntimeStoreError::InvalidStateTransition));
-    assert_eq!(durable_artifact_bytes(&root.database()), before_artifacts);
-    assert_eq!(lifecycle_evidence(&root.database()), before_cardinality);
-    assert_eq!(
-        projection_state(&root.database(), conversation.conversation_id),
-        "present"
-    );
-    assert_eq!(
-        accepted_command_count(&root.database(), conversation.conversation_id),
-        1
+        command_admission_evidence(&root.database(), conversation.conversation_id),
+        before,
+        "native rejection must not change command/pin/event/HWM/ledger/main+WAL"
     );
     store
         .shutdown()
         .await
-        .expect("shutdown accepted quiescence fixture");
+        .expect("shutdown native command admission fixture");
+
+    let reopened = open_store(&root, &keys, clock).await;
+    let reopened_before =
+        command_admission_evidence(&root.database(), conversation.conversation_id);
+    let reopened_error = reopened
+        .accept_command(AcceptCommand {
+            conversation_id: conversation.conversation_id,
+            owner: owner(0x4C),
+            idempotency_key: "native-command-must-not-persist-after-reopen".to_owned(),
+            expected_configuration_revision: 1,
+            payload: b"restart must preserve the origin admission gate".to_vec(),
+        })
+        .await
+        .expect_err("reopened NativeProjected conversation must reject durable command");
+    assert!(matches!(
+        reopened_error,
+        RuntimeStoreError::CommandAdmissionUnsupported
+    ));
+    assert_eq!(
+        command_admission_evidence(&root.database(), conversation.conversation_id),
+        reopened_before,
+        "reopened native rejection must remain byte-exact and side-effect-free"
+    );
+    reopened
+        .shutdown()
+        .await
+        .expect("shutdown reopened native command admission fixture");
 }
 
 #[tokio::test]

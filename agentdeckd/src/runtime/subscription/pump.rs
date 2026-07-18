@@ -18,6 +18,7 @@ use super::super::connection::{
     AuthenticatedPrincipal, ConnectionError, ConnectionId, ConnectionRegistry, EncodedRuntimeFrame,
 };
 use super::super::events::{PinnedBackfillSource, RuntimeStreamTarget, StreamBarrierRegistration};
+use super::super::history_receipt::{HistoryOnlyReceiptError, HistoryOnlyReceiptRegistry};
 use super::super::model::RuntimeStoreError;
 use super::super::store::{
     RuntimeBackfillPlan, RuntimeBackfillTarget, RuntimeId, RuntimeStoreHandle,
@@ -68,6 +69,7 @@ pub(super) struct PumpJob {
     pub(super) snapshot_build_budget: Arc<Semaphore>,
     pub(super) snapshot_build_gate: Arc<AsyncMutex<()>>,
     pub(super) catalog_snapshots: CatalogSnapshotProvider,
+    pub(super) history_receipts: HistoryOnlyReceiptRegistry,
     pub(super) principal: AuthenticatedPrincipal,
     pub(super) flushed_business_frame: bool,
     pub(super) emit_subscription_receipt: bool,
@@ -88,6 +90,8 @@ enum PumpError {
     Snapshot(#[from] super::reducer::SnapshotReducerError),
     #[error(transparent)]
     Catalog(#[from] CatalogSnapshotProviderError),
+    #[error(transparent)]
+    HistoryReceipt(#[from] HistoryOnlyReceiptError),
     #[error("subscription barrier has no exact source")]
     MissingSource,
     #[error("subscription DTO construction failed")]
@@ -205,7 +209,8 @@ impl PumpError {
 
     fn failure(&self) -> RuntimeFailure {
         use agentdeck_protocol::runtime::failure::{
-            DAEMON_RUNTIME_CONNECTION_UNAVAILABLE, DAEMON_RUNTIME_READ_UNAVAILABLE,
+            DAEMON_RUNTIME_CONNECTION_UNAVAILABLE, DAEMON_RUNTIME_IDENTITY_UNAVAILABLE,
+            DAEMON_RUNTIME_READ_UNAVAILABLE,
         };
         let code = match self {
             Self::Store(error) => error.code(),
@@ -218,6 +223,9 @@ impl PumpError {
             // 会把确定性的 payload 边界误判为可重试 read failure。
             Self::Snapshot(super::reducer::SnapshotReducerError::Materialize(error)) => {
                 error.code()
+            }
+            Self::Snapshot(super::reducer::SnapshotReducerError::Identity) => {
+                DAEMON_RUNTIME_IDENTITY_UNAVAILABLE
             }
             _ => DAEMON_RUNTIME_READ_UNAVAILABLE,
         };
@@ -368,7 +376,7 @@ async fn run_inner(
 
 async fn send_snapshot(job: &mut PumpJob) -> Result<StreamCursor, PumpError> {
     match job.target {
-        RuntimeStreamTarget::Conversation(_) => {
+        RuntimeStreamTarget::Conversation(conversation_id) => {
             let source = job
                 .registration
                 .as_mut()
@@ -387,24 +395,31 @@ async fn send_snapshot(job: &mut PumpJob) -> Result<StreamCursor, PumpError> {
                 ),
             )
             .await??;
-            let (snapshot, stored, wire_payload, memory_permit) = reduced.into_parts();
+            let (snapshot, payload, history_command_ids, memory_permit) = reduced.into_parts();
             let base = snapshot.base_event_cursor;
-            let canonical_payload = wire_payload.as_deref().unwrap_or(stored.payload.as_slice());
+            ensure_current(job)?;
+            if let Some(command_ids) = history_command_ids {
+                // 只有完整 adapter read、identity collision gate 与 canonical serialize
+                // 全部成功后才原子替换。它必须先于任何不可逆 egress，确保客户端一旦
+                // 看到 history commandId，其他连接的 QueryReceipt 已可稳定命中。
+                job.history_receipts.replace(conversation_id, command_ids)?;
+            }
             ensure_current(job)?;
             reply::reply(
                 &job.connections,
                 job.connection_id,
                 job.message_id.clone(),
                 RuntimeReply::Snapshot(snapshot),
-                Some(canonical_payload),
+                Some(payload.canonical_payload()),
                 &job.control,
             )
             .await?;
             job.flushed_business_frame = true;
-            // FlushReceipt 已完成后才允许另一连接重新 materialize；`stored`
-            // 的 exact plaintext 与共享 build permit 在此前始终共同存活。
-            drop(wire_payload);
-            drop(stored);
+            // FlushReceipt 前 durable/ephemeral payload owner、typed snapshot 与共享
+            // build permit 始终共同存活；Dynamic 成功后再显式释放 exact TEMP pin。
+            payload
+                .release_after_flush(&job.store, job.router.clone())
+                .await?;
             drop(memory_permit);
             Ok(base)
         }

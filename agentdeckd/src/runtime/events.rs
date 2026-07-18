@@ -340,12 +340,15 @@ pub struct RegisterStreamBarrier {
 
 /// SubscriptionBarrier 已认证并冻结的 snapshot 来源。
 ///
-/// `Ready` 绑定 exact durable row；`Build` 的 TEMP pin 绑定本次 barrier 捕获的
-/// conversation H。调用方不得在 capture 后重新按“当前 H”申请另一枚 pin。
+/// `Ready` 绑定 exact durable row；`Build` / `Dynamic` 的 TEMP pin 绑定本次 barrier
+/// 捕获的 conversation H。`Dynamic` 只能用于 authenticated NativeProjected origin，
+/// 且类型上不携带 snapshot store 写能力。调用方不得在 capture 后重新按“当前 H”
+/// 申请另一枚 pin。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SnapshotBarrierSource {
     Ready(ReadySnapshotReference),
     Build(RuntimeSnapshotBuildPin),
+    Dynamic(RuntimeSnapshotBuildPin),
 }
 
 /// Catalog barrier 冻结的 durable baseline（fresh DB 为 None）与 exact H。
@@ -400,7 +403,7 @@ impl SnapshotMaterializationSource {
     #[must_use]
     pub const fn build_pin(&self) -> Option<&RuntimeSnapshotBuildPin> {
         match &self.source {
-            SnapshotBarrierSource::Build(pin) => Some(pin),
+            SnapshotBarrierSource::Build(pin) | SnapshotBarrierSource::Dynamic(pin) => Some(pin),
             SnapshotBarrierSource::Ready(_) => None,
         }
     }
@@ -412,8 +415,9 @@ impl SnapshotMaterializationSource {
     pub(crate) fn into_build_pin_for_immediate_cleanup(
         mut self,
     ) -> Option<RuntimeSnapshotBuildPin> {
-        let SnapshotBarrierSource::Build(pin) = &self.source else {
-            return None;
+        let pin = match &self.source {
+            SnapshotBarrierSource::Build(pin) | SnapshotBarrierSource::Dynamic(pin) => pin,
+            SnapshotBarrierSource::Ready(_) => return None,
         };
         if let Some(cleanup) = &mut self.cleanup {
             cleanup.disarm();

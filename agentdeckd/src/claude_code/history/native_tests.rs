@@ -76,6 +76,110 @@ fn native_source_accepts_current_uid_0644_without_exact_mode_gate() {
     assert_eq!(document.turns().len(), 1);
 }
 
+#[test]
+fn native_projection_read_preserves_keys_and_applies_fixed_bounds() {
+    let fixture = NativeFixture::new();
+    let transcript = full_turn_jsonl();
+    fixture.write_transcript("-tmp-native-projection", USER_UUID, &transcript);
+    let source = fixture.source();
+    let candidate = first_candidate(&source);
+
+    let projection = source
+        .read_projection(candidate.reference())
+        .expect("bounded native projection read");
+    assert_eq!(projection.bytes_read(), transcript.len() as u64);
+    let NativeReadOutcome::Document(document) = projection.into_outcome() else {
+        panic!("normal transcript must not be filtered");
+    };
+    assert_eq!(document.turns().len(), 1);
+    assert_eq!(document.turns()[0].items().len(), 5);
+    assert!(
+        document.turns()[0]
+            .items()
+            .iter()
+            .all(|item| item.turn_key() == document.turns()[0].key())
+    );
+}
+
+#[test]
+fn native_projection_canonicalization_preserves_opaque_keys_and_redacts_debug() {
+    let transcript = full_turn_jsonl();
+    let document = parse_document(&transcript);
+    let expected_turn_key =
+        crate::agent::NativeTurnKey::from_verified_bytes(*document.turns()[0].key().as_bytes())
+            .expect("nonzero native turn key");
+    let expected_item_keys: Vec<_> = document.turns()[0]
+        .items()
+        .iter()
+        .map(|item| {
+            crate::agent::NativeItemKey::from_verified_bytes(*item.key().as_bytes())
+                .expect("nonzero native item key")
+        })
+        .collect();
+
+    let read = super::canonicalize_native_projection(document, transcript.len() as u64)
+        .expect("canonical key-bearing native projection");
+    assert_eq!(read.agent_kind(), agentdeck_protocol::AgentKind::ClaudeCode);
+    assert_eq!(read.source_bytes(), transcript.len() as u64);
+    assert_eq!(read.items().len(), expected_item_keys.len());
+    assert!(
+        read.items()
+            .iter()
+            .all(|item| item.turn_key() == expected_turn_key)
+    );
+    assert_eq!(
+        read.items()
+            .iter()
+            .map(|item| item.item_key())
+            .collect::<Vec<_>>(),
+        expected_item_keys
+    );
+    let debug = format!("{read:?}");
+    for sentinel in ["hello", "reason", "answer", USER_UUID, TOOL_ID] {
+        assert!(
+            !debug.contains(sentinel),
+            "Debug leaked {sentinel}: {debug}"
+        );
+    }
+}
+
+#[test]
+fn native_projection_rejects_legacy_session_reference_without_echoing_it() {
+    let private_session = "legacy-private-session-sentinel";
+    let error = super::require_native_projection_reference(
+        super::super::state::ResolvedClaudeCodeReference::LegacySessionId(
+            agentdeck_protocol::ThreadId(private_session.to_owned()),
+        ),
+    )
+    .expect_err("native projection cannot fall back to a legacy session id");
+    assert_eq!(error.code, "adapter-native-history-reference-invalid");
+    assert!(!error.message.contains(private_session));
+    assert!(!format!("{error:?}").contains(private_session));
+}
+
+#[cfg(unix)]
+#[test]
+fn native_projection_read_rejects_static_symlink_transcript_without_following_it() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = NativeFixture::new();
+    let project = fixture.project("-tmp-native-projection-link");
+    let outside = NativeFixture::empty_dir("native-projection-link-target");
+    let target = outside.join(format!("{USER_UUID}.jsonl"));
+    std::fs::write(&target, one_user_line(USER_UUID)).unwrap();
+    symlink(&target, project.join(format!("{USER_UUID}.jsonl"))).unwrap();
+    let reference = NativeTranscriptRefV1::from_components_for_test(
+        "-tmp-native-projection-link".into(),
+        format!("{USER_UUID}.jsonl").into(),
+    )
+    .unwrap();
+
+    assert_code(
+        fixture.source().read_projection(&reference).unwrap_err(),
+        "cc-history-native-source-unsafe",
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn native_source_rejects_symlink_at_each_verified_layer() {
@@ -399,6 +503,71 @@ fn native_reader_stops_at_byte_limit_plus_one() {
     .unwrap_err();
     assert_code(error, "cc-history-native-budget-bytes");
     assert!(budget.bytes_read() <= 129);
+}
+
+#[test]
+fn native_reader_rejects_small_source_with_high_decoded_dom_amplification() {
+    const RETAINED_LIMIT: usize = 512 * 1024;
+    const SINGLETON_OBJECTS: usize = 1_000;
+    let mut content = format!(
+        "{{\"type\":\"user\",\"uuid\":\"{USER_UUID}\",\"parentUuid\":null,\"message\":{{\"content\":\"hello\"}},\"ignored\":["
+    );
+    for index in 0..SINGLETON_OBJECTS {
+        if index != 0 {
+            content.push(',');
+        }
+        content.push_str(r#"{"a":null}"#);
+    }
+    content.push_str("]}\n");
+    assert!(
+        content.len() < RETAINED_LIMIT / 8,
+        "fixture must demonstrate decoded/container amplification over raw bytes"
+    );
+
+    let permissive = NativeParseLimits {
+        max_retained_bytes: 8 * 1024 * 1024,
+        ..NativeParseLimits::default()
+    };
+    parse_native_jsonl(
+        BufReader::new(Cursor::new(content.as_bytes())),
+        &mut generous_budget(),
+        permissive,
+        false,
+    )
+    .expect("fixture is valid native JSONL when retained capacity is available");
+
+    let bounded = NativeParseLimits {
+        max_retained_bytes: RETAINED_LIMIT,
+        ..NativeParseLimits::default()
+    };
+    let error = parse_native_jsonl(
+        BufReader::new(Cursor::new(content.as_bytes())),
+        &mut generous_budget(),
+        bounded,
+        false,
+    )
+    .expect_err("content-aware decoded retained gate must reject before Value allocation");
+    assert_code(error, "cc-history-native-too-large");
+}
+
+#[test]
+fn native_reader_does_not_treat_retained_cap_truncation_as_incomplete_eof_tail() {
+    let content = format!(
+        "{{\"type\":\"user\",\"uuid\":\"{USER_UUID}\",\"parentUuid\":null,\"message\":{{\"content\":\"{}\"}}}}\n",
+        "x".repeat(24 * 1024)
+    );
+    let limits = NativeParseLimits {
+        max_retained_bytes: 80 * 1024,
+        ..NativeParseLimits::default()
+    };
+    let error = parse_native_jsonl(
+        BufReader::new(Cursor::new(content.as_bytes())),
+        &mut generous_budget(),
+        limits,
+        false,
+    )
+    .expect_err("retained raw cap must fail closed while unread line bytes remain");
+    assert_code(error, "cc-history-native-too-large");
 }
 
 #[cfg(unix)]

@@ -15,6 +15,7 @@ use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize, Serializer};
 use tokio::sync::OwnedSemaphorePermit;
 
+use crate::agent::MAX_CANONICAL_NATIVE_HISTORY_ITEMS;
 use crate::runtime::AgentRouter;
 use crate::runtime::events::{
     RuntimeStreamTarget, SnapshotBarrierSource, SnapshotBuildPinCleanup,
@@ -25,7 +26,7 @@ use crate::runtime::store::cipher::CipherError;
 use crate::runtime::store::{
     AuthenticatedConversationSnapshotContext, MAX_CONFIGURATION_CANONICAL_BYTES,
     PreparedConversationSnapshotWrite, ReadySnapshotReference, RuntimeId, RuntimeSnapshotBuildPin,
-    RuntimeStoreHandle, StoredConversationSnapshot,
+    RuntimeStoreHandle, SnapshotOrigin, StoredConversationSnapshot,
 };
 
 const MAX_CONVERSATION_SNAPSHOT_ITEMS: usize = 10_000;
@@ -1725,6 +1726,85 @@ impl SnapshotBuildInput {
     }
 }
 
+/// NativeProjected conversation 的线性 dynamic handoff。它持有与 barrier H 绑定的
+/// TEMP pin 与 cleanup，但故意没有 `bind_assembled_snapshot`，因此调用链无法把 native
+/// transcript 正文写入 durable snapshot store。
+pub struct DynamicSnapshotInput {
+    pin: Option<RuntimeSnapshotBuildPin>,
+    cleanup: Option<SnapshotBuildPinCleanup>,
+    conversation_id: RuntimeId,
+    adapter_state_key: RuntimeId,
+    agent_kind: AgentKind,
+    catalog_revision: u64,
+    base_event_cursor: StreamCursor,
+    configuration_state: Option<ConversationConfigurationState>,
+    capabilities: Option<SessionCapabilities>,
+}
+
+impl std::fmt::Debug for DynamicSnapshotInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DynamicSnapshotInput")
+            .field("conversation_id", &self.conversation_id)
+            .field("agent_kind", &self.agent_kind)
+            .field("base_event_cursor", &self.base_event_cursor)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DynamicSnapshotInput {
+    #[must_use]
+    pub const fn conversation_id(&self) -> RuntimeId {
+        self.conversation_id
+    }
+
+    #[must_use]
+    pub const fn adapter_state_key(&self) -> RuntimeId {
+        self.adapter_state_key
+    }
+
+    #[must_use]
+    pub const fn agent_kind(&self) -> AgentKind {
+        self.agent_kind
+    }
+
+    #[must_use]
+    pub const fn base_event_cursor(&self) -> StreamCursor {
+        self.base_event_cursor
+    }
+
+    pub(crate) fn matches_revalidated_context(
+        &self,
+        context: &AuthenticatedConversationSnapshotContext,
+    ) -> bool {
+        context.origin == SnapshotOrigin::NativeProjected
+            && context.conversation_id == self.conversation_id
+            && context.adapter_state_key == self.adapter_state_key
+            && context.agent_kind == self.agent_kind
+            && context.catalog_revision == self.catalog_revision
+            && context.command_high_water.is_none()
+            && context.event_high_water == self.base_event_cursor.high_water()
+    }
+
+    #[must_use]
+    pub fn capabilities(&self) -> Option<&SessionCapabilities> {
+        self.capabilities.as_ref()
+    }
+
+    #[must_use]
+    pub fn configuration_state(&self) -> Option<&ConversationConfigurationState> {
+        self.configuration_state.as_ref()
+    }
+
+    pub(crate) fn replay_pin(
+        &self,
+    ) -> Result<RuntimeSnapshotBuildPin, SnapshotMaterializationError> {
+        self.pin
+            .clone()
+            .ok_or(SnapshotMaterializationError::InvalidState)
+    }
+}
+
 /// 组装 seam 只消费 capabilities 与 cursor-selected configuration，exact pin ownership 仍由 BuildInput 持有，
 /// 直到成功 bind 或显式 release。这样 raw 分配时不会与原 input 的 typed
 /// capabilities 同时驻留；item/entity/command identity 原样进入 DTO。
@@ -1756,6 +1836,70 @@ pub fn assemble_build_snapshot(
     )
 }
 
+pub(crate) struct AssembledDynamicSnapshot {
+    snapshot: ConversationSnapshot,
+    canonical_payload: Vec<u8>,
+}
+
+impl AssembledDynamicSnapshot {
+    pub(crate) fn into_parts(self) -> (ConversationSnapshot, Vec<u8>) {
+        (self.snapshot, self.canonical_payload)
+    }
+}
+
+/// NativeProjected 的 ephemeral assembly。10,000 限额只计算原生正文 item；
+/// mandatory Capabilities 另占一项，不改变 durable Ready/Build 的 10,000 total cap。
+pub(crate) fn assemble_dynamic_snapshot(
+    input: &mut DynamicSnapshotInput,
+    agent_items: Vec<SnapshotItem>,
+) -> Result<AssembledDynamicSnapshot, SnapshotMaterializationError> {
+    if agent_items.len() > MAX_CANONICAL_NATIVE_HISTORY_ITEMS
+        || input.capabilities.is_none()
+        || input.configuration_state.is_none()
+    {
+        return Err(if agent_items.len() > MAX_CANONICAL_NATIVE_HISTORY_ITEMS {
+            SnapshotMaterializationError::PayloadTooLarge
+        } else {
+            SnapshotMaterializationError::InvalidState
+        });
+    }
+    let pin = input.replay_pin()?;
+    if pin.conversation_id() != input.conversation_id
+        || pin.base_event_seq() != input.base_event_cursor.high_water()
+    {
+        return Err(SnapshotMaterializationError::InvalidState);
+    }
+    validate_unique_agent_item_ids(&agent_items)?;
+    let capabilities = input
+        .capabilities
+        .take()
+        .ok_or(SnapshotMaterializationError::InvalidState)?;
+    let configuration_state = input
+        .configuration_state
+        .take()
+        .ok_or(SnapshotMaterializationError::InvalidState)?;
+    let mut items = Vec::with_capacity(
+        agent_items
+            .len()
+            .checked_add(1)
+            .ok_or(SnapshotMaterializationError::PayloadTooLarge)?,
+    );
+    items.push(SnapshotItem::capabilities(capabilities));
+    items.extend(agent_items);
+    let snapshot = ConversationSnapshot::new(
+        ConversationId::new(input.conversation_id.to_canonical_string()),
+        input.base_event_cursor,
+        configuration_state,
+        items,
+    )
+    .map_err(|_| SnapshotMaterializationError::SchemaIncompatible)?;
+    let canonical_payload = serialize_build_snapshot(&snapshot, None)?;
+    Ok(AssembledDynamicSnapshot {
+        snapshot,
+        canonical_payload,
+    })
+}
+
 #[derive(Debug)]
 #[allow(
     clippy::large_enum_variant,
@@ -1764,6 +1908,7 @@ pub fn assemble_build_snapshot(
 pub enum SnapshotMaterialization {
     Ready(MaterializedConversationSnapshot),
     Build(SnapshotBuildInput),
+    Dynamic(DynamicSnapshotInput),
 }
 
 pub struct SnapshotMaterializer {
@@ -1791,7 +1936,13 @@ impl SnapshotMaterializer {
             (SnapshotBarrierSource::Build(pin), Some(cleanup)) => {
                 self.prepare_build(pin, cleanup).await
             }
+            (SnapshotBarrierSource::Dynamic(pin), Some(cleanup)) => {
+                self.prepare_dynamic(pin, cleanup).await
+            }
             (SnapshotBarrierSource::Build(pin), None) => Err(self
+                .release_pin_after_error(pin, None, SnapshotMaterializationError::InvalidState)
+                .await),
+            (SnapshotBarrierSource::Dynamic(pin), None) => Err(self
                 .release_pin_after_error(pin, None, SnapshotMaterializationError::InvalidState)
                 .await),
             (SnapshotBarrierSource::Ready(_), Some(_)) => {
@@ -1803,6 +1954,27 @@ impl SnapshotMaterializer {
     pub async fn release_build_input(
         &self,
         mut input: SnapshotBuildInput,
+    ) -> Result<(), SnapshotMaterializationError> {
+        let pin = input
+            .pin
+            .take()
+            .ok_or(SnapshotMaterializationError::InvalidState)?;
+        let mut cleanup = input
+            .cleanup
+            .take()
+            .ok_or(SnapshotMaterializationError::InvalidState)?;
+        match self.store.release_snapshot_build_pin(pin).await {
+            Ok(()) => {
+                cleanup.disarm();
+                Ok(())
+            }
+            Err(error) => Err(SnapshotMaterializationError::Store(error)),
+        }
+    }
+
+    pub async fn release_dynamic_input(
+        &self,
+        mut input: DynamicSnapshotInput,
     ) -> Result<(), SnapshotMaterializationError> {
         let pin = input
             .pin
@@ -1836,7 +2008,9 @@ impl SnapshotMaterializer {
             .load_authenticated_conversation_snapshot_context(conversation_id)
             .await
             .map_err(map_ready_store_error)?;
-        if reference.base.high_water() > context.event_high_water {
+        if context.origin != SnapshotOrigin::Managed
+            || reference.base.high_water() > context.event_high_water
+        {
             return Err(SnapshotMaterializationError::SchemaIncompatible);
         }
         // configuration selector 的错误来源必须保留：row AEAD/generation 故障继续
@@ -1904,6 +2078,15 @@ impl SnapshotMaterializer {
                     .await);
             }
         };
+        if context.origin != SnapshotOrigin::Managed {
+            return Err(self
+                .release_pin_after_error(
+                    pin,
+                    cleanup.take(),
+                    SnapshotMaterializationError::InvalidState,
+                )
+                .await);
+        }
         let configuration_state = match self
             .store
             .load_configuration_state_at_event_cursor(context.conversation_id, pin.base_event_seq())
@@ -1947,6 +2130,85 @@ impl SnapshotMaterializer {
             capabilities: Some(capabilities),
             pin: Some(pin),
             cleanup,
+        }))
+    }
+
+    async fn prepare_dynamic(
+        &self,
+        pin: RuntimeSnapshotBuildPin,
+        cleanup: SnapshotBuildPinCleanup,
+    ) -> Result<SnapshotMaterialization, SnapshotMaterializationError> {
+        let mut cleanup = Some(cleanup);
+        let context = match self
+            .store
+            .prepare_authenticated_snapshot_build_context(pin.clone())
+            .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                return Err(self
+                    .release_pin_after_error(
+                        pin,
+                        cleanup.take(),
+                        SnapshotMaterializationError::Store(error),
+                    )
+                    .await);
+            }
+        };
+        if context.origin != SnapshotOrigin::NativeProjected || context.command_high_water.is_some()
+        {
+            return Err(self
+                .release_pin_after_error(
+                    pin,
+                    cleanup.take(),
+                    SnapshotMaterializationError::InvalidState,
+                )
+                .await);
+        }
+        let configuration_state = match self
+            .store
+            .load_configuration_state_at_event_cursor(context.conversation_id, pin.base_event_seq())
+            .await
+        {
+            Ok(configuration_state) => configuration_state,
+            Err(error) => {
+                return Err(self
+                    .release_pin_after_error(
+                        pin,
+                        cleanup.take(),
+                        SnapshotMaterializationError::Store(error),
+                    )
+                    .await);
+            }
+        };
+        let Some(capabilities) = self.router.capabilities(context.agent_kind) else {
+            return Err(self
+                .release_pin_after_error(
+                    pin,
+                    cleanup.take(),
+                    SnapshotMaterializationError::FeatureUnavailable,
+                )
+                .await);
+        };
+        if capabilities.agent_kind != context.agent_kind {
+            return Err(self
+                .release_pin_after_error(
+                    pin,
+                    cleanup.take(),
+                    SnapshotMaterializationError::FeatureUnavailable,
+                )
+                .await);
+        }
+        Ok(SnapshotMaterialization::Dynamic(DynamicSnapshotInput {
+            pin: Some(pin.clone()),
+            cleanup,
+            conversation_id: context.conversation_id,
+            adapter_state_key: context.adapter_state_key,
+            agent_kind: context.agent_kind,
+            catalog_revision: context.catalog_revision,
+            base_event_cursor: StreamCursor::from_high_water(pin.base_event_seq()),
+            configuration_state: Some(configuration_state),
+            capabilities: Some(capabilities),
         }))
     }
 

@@ -695,6 +695,27 @@ pub(super) fn store_conversation_snapshot(
     }
 }
 
+/// Conversation snapshot 的最终 origin gate。调用方即使持有 stale/旁路构造的
+/// TEMP pin 或 opaque write，也必须重新认证完整 parent；只有 Managed 能进入 durable
+/// snapshot writer。NativeProjected 的 transcript 永远只走 Dynamic wire payload。
+fn load_managed_snapshot_parent(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    conversation_id: RuntimeId,
+) -> Result<super::AuthenticatedConversationSnapshotContext, RuntimeStoreError> {
+    let context = super::journal::load_authenticated_conversation_snapshot_context(
+        connection,
+        key_bundle,
+        database_id,
+        conversation_id,
+    )?;
+    if context.origin != super::SnapshotOrigin::Managed {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    Ok(context)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn store_conversation_snapshot_owned(
     state: &mut RuntimeSqlite,
@@ -724,6 +745,14 @@ fn store_conversation_snapshot_owned(
             RuntimeStoreError::PayloadTooLarge,
             payload,
         ));
+    }
+    if let Err(error) = load_managed_snapshot_parent(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        conversation_id,
+    ) {
+        return Err(SnapshotStoreAttemptError::retryable(error, payload));
     }
     let logical_bytes = match u64::try_from(payload.len()) {
         Ok(logical_bytes) => logical_bytes,
@@ -860,20 +889,11 @@ fn store_conversation_snapshot_in_place(
     let transaction = state
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let event_high_water: Option<String> = transaction
-        .query_row(
-            "SELECT event_high_water FROM conversations WHERE conversation_id = ?1",
-            [&conversation_id.as_bytes()[..]],
-            |row| row.get(0),
-        )
-        .map_err(|error| match error {
-            rusqlite::Error::QueryReturnedNoRows => RuntimeStoreError::ConversationNotFound,
-            other => RuntimeStoreError::Sqlite(other),
-        })?;
-    let current_high_water = event_high_water
-        .as_deref()
-        .map(|value| decode_sequence(SequenceScope::EventSeq, value))
-        .transpose()?;
+    // 必须位于 transaction 内，且先于 seal/DELETE/INSERT/consume；这是 stale
+    // capability 或内部旁路无法绕过的最终 authenticated origin 复核。
+    let context =
+        load_managed_snapshot_parent(&transaction, key_bundle, database_id, conversation_id)?;
+    let current_high_water = context.event_high_water;
     if base_event_seq > current_high_water {
         return Err(RuntimeStoreError::InvalidStateTransition.into());
     }
@@ -1082,6 +1102,12 @@ fn replay_exact_conversation_snapshot(
     let transaction = state
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    load_managed_snapshot_parent(
+        &transaction,
+        key_bundle,
+        state.database_id,
+        existing.conversation_id,
+    )?;
     validate_snapshot_build_pin_for_store(&transaction, pin, now_ms)?;
     let base = existing.base_event_seq.map(encode_sequence);
     let logical_bytes = u64::try_from(existing.payload.len())
@@ -1217,18 +1243,12 @@ pub(super) fn validate_integrity(
                 .as_deref()
                 .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?,
         )?;
+        let context =
+            load_managed_snapshot_parent(connection, key_bundle, database_id, conversation_id)
+                .map_err(authenticated::snapshot_parent_error)?;
         let snapshot = load_snapshot_row(connection, key_bundle, database_id, conversation_id)?
             .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-        let high_water: Option<String> = connection.query_row(
-            "SELECT event_high_water FROM conversations WHERE conversation_id = ?1",
-            [&conversation_id.as_bytes()[..]],
-            |row| row.get(0),
-        )?;
-        let high_water = high_water
-            .as_deref()
-            .map(|value| decode_sequence(SequenceScope::EventSeq, value))
-            .transpose()?;
-        if snapshot.base_event_seq > high_water {
+        if snapshot.base_event_seq > context.event_high_water {
             return Err(RuntimeStoreError::UnknownOrCorruptSchema);
         }
         count = count
@@ -1279,6 +1299,101 @@ fn load_snapshot_row(
         payload,
         memory_lease: None,
     }))
+}
+
+/// 构造一个密码学与 ledger 均有效、但语义上非法绑定到 NativeProjected parent 的
+/// conversation snapshot。只供 recovery fail-close fixture 使用；production writer
+/// 必须永远无法产生这种 row。
+#[cfg(test)]
+pub(super) fn inject_authenticated_native_snapshot_row_for_test(
+    state: &mut RuntimeSqlite,
+    conversation_id: RuntimeId,
+    created_at_ms: u64,
+) -> Result<(), RuntimeStoreError> {
+    let database_id = state.database_id;
+    let key_bundle = &state.key_bundle;
+    let transaction = state
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let context = super::journal::load_authenticated_conversation_snapshot_context(
+        &transaction,
+        key_bundle,
+        database_id,
+        conversation_id,
+    )?;
+    if context.origin != super::SnapshotOrigin::NativeProjected {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    let ledger = super::sqlite::load_runtime_ledger(&transaction, key_bundle, database_id)?;
+    let snapshot_id = allocate_snapshot_id(&transaction)?;
+    let source_build_pin_id = [0xd7; 16];
+    let base = context.event_high_water.map(encode_sequence);
+    let item_count = 1_u64;
+    let mut payload = br#"{"native":"legacy-resealed"}"#.to_vec();
+    payload
+        .try_reserve_exact(ROW_BLOB_V1_OVERHEAD_LEN)
+        .map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    let logical_bytes =
+        u64::try_from(payload.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    let content_sha256: [u8; 32] = Sha256::digest(payload.as_slice()).into();
+    seal_snapshot_payload_in_place(key_bundle, database_id, &snapshot_id, &mut payload)?;
+    let sealed_snapshot_sha256 = snapshot_ciphertext_sha256(payload.as_slice());
+    let token = snapshot_token(
+        key_bundle,
+        "conversation",
+        Some(conversation_id.as_bytes()),
+        &snapshot_id,
+        Some(&source_build_pin_id),
+        base.as_deref(),
+        item_count,
+        logical_bytes,
+        &content_sha256,
+        &sealed_snapshot_sha256,
+        created_at_ms,
+    )?;
+    if transaction.execute(
+        "INSERT INTO snapshots (
+             snapshot_id, target_scope, conversation_id, source_build_pin_id,
+             base_cursor, build_state, item_count, logical_snapshot_bytes,
+             content_sha256, sealed_snapshot_sha256, created_at_ms,
+             metadata_token, sealed_snapshot
+         ) VALUES (?1, 'conversation', ?2, ?3, ?4, 'ready',
+                   ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            &snapshot_id[..],
+            &conversation_id.as_bytes()[..],
+            &source_build_pin_id[..],
+            base.as_deref(),
+            sqlite_u64(item_count)?,
+            sqlite_u64(logical_bytes)?,
+            &content_sha256[..],
+            &sealed_snapshot_sha256[..],
+            sqlite_u64(created_at_ms)?,
+            &token[..],
+            payload,
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let mut next = ledger.clone();
+    next.snapshot_count = next
+        .snapshot_count
+        .checked_add(1)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    next.snapshot_bytes = next
+        .snapshot_bytes
+        .checked_add(logical_bytes)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let _pending_targets = super::sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next,
+    )?;
+    transaction.commit()?;
+    Ok(())
 }
 
 fn load_conversation_snapshot_payload(

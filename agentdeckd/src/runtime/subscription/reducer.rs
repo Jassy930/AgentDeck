@@ -3,25 +3,30 @@
 //! 这里只消费 canonical RuntimeEvent 的稳定 item/entity/command identity；vendor
 //! history 没有这些身份时 fail-close，不能用临时序号伪造可重放 snapshot。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use agentdeck_protocol::runtime::identity::{CommandId, EntityId, ItemId};
 use agentdeck_protocol::runtime::{
     ConversationSnapshot, RuntimeEventBody, SnapshotItem, StreamCursor,
 };
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 
+use crate::agent::{
+    CanonicalNativeHistoryRead, NativeHistoryReadError, NativeItemKey, NativeTurnKey,
+};
 use crate::runtime::AgentRouter;
 use crate::runtime::events::{SnapshotBarrierSource, SnapshotMaterializationSource};
 use crate::runtime::model::RuntimeStoreError;
-#[cfg(test)]
-use crate::runtime::snapshot::SNAPSHOT_BUILD_MEMORY_BYTES;
 use crate::runtime::snapshot::{
-    ConversationSnapshotBudgetEstimator, SharedSnapshotBuildPermit, SnapshotMaterialization,
-    SnapshotMaterializationError, SnapshotMaterializer, assemble_build_snapshot,
+    ConversationSnapshotBudgetEstimator, DynamicSnapshotInput, SNAPSHOT_BUILD_MEMORY_BYTES,
+    SharedSnapshotBuildPermit, SnapshotMaterialization, SnapshotMaterializationError,
+    SnapshotMaterializer, assemble_build_snapshot, assemble_dynamic_snapshot,
     conversation_snapshot_reference_peak_bound,
 };
-use crate::runtime::store::{RuntimeStoreHandle, StoredConversationSnapshot};
+use crate::runtime::store::{
+    NativeHistoryIdentityError, RuntimeId, RuntimeStoreHandle, StoredConversationSnapshot,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum SnapshotReducerError {
@@ -33,13 +38,55 @@ pub(super) enum SnapshotReducerError {
     Store(#[from] RuntimeStoreError),
     #[error("snapshot payload is not canonical Runtime DTO")]
     Decode,
+    #[error("native history read failed")]
+    NativeRead,
+    #[error("native history identity derivation failed")]
+    Identity,
 }
 
 pub(super) struct ReducedConversationSnapshot {
     snapshot: ConversationSnapshot,
-    stored: StoredConversationSnapshot,
-    wire_payload: Option<Vec<u8>>,
+    payload: ReducedSnapshotPayload,
+    history_command_ids: Option<Vec<RuntimeId>>,
     memory_permit: SharedSnapshotBuildPermit,
+}
+
+pub(super) enum ReducedSnapshotPayload {
+    Durable {
+        stored: StoredConversationSnapshot,
+        wire_payload: Option<Vec<u8>>,
+    },
+    Dynamic {
+        canonical_payload: Vec<u8>,
+        input: Box<DynamicSnapshotInput>,
+    },
+}
+
+impl ReducedSnapshotPayload {
+    pub(super) fn canonical_payload(&self) -> &[u8] {
+        match self {
+            Self::Durable {
+                stored,
+                wire_payload,
+            } => wire_payload.as_deref().unwrap_or(stored.payload.as_slice()),
+            Self::Dynamic {
+                canonical_payload, ..
+            } => canonical_payload,
+        }
+    }
+
+    pub(super) async fn release_after_flush(
+        self,
+        store: &RuntimeStoreHandle,
+        router: Arc<AgentRouter>,
+    ) -> Result<(), SnapshotReducerError> {
+        if let Self::Dynamic { input, .. } = self {
+            SnapshotMaterializer::new(store.clone(), router)
+                .release_dynamic_input(*input)
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 impl ReducedConversationSnapshot {
@@ -47,14 +94,14 @@ impl ReducedConversationSnapshot {
         self,
     ) -> (
         ConversationSnapshot,
-        StoredConversationSnapshot,
-        Option<Vec<u8>>,
+        ReducedSnapshotPayload,
+        Option<Vec<RuntimeId>>,
         SharedSnapshotBuildPermit,
     ) {
         (
             self.snapshot,
-            self.stored,
-            self.wire_payload,
+            self.payload,
+            self.history_command_ids,
             self.memory_permit,
         )
     }
@@ -67,7 +114,10 @@ pub(super) async fn materialize(
     build_budget: Arc<Semaphore>,
     build_gate: Arc<AsyncMutex<()>>,
 ) -> Result<ReducedConversationSnapshot, SnapshotReducerError> {
-    let build_source = matches!(source.source(), SnapshotBarrierSource::Build(_));
+    let build_source = matches!(
+        source.source(),
+        SnapshotBarrierSource::Build(_) | SnapshotBarrierSource::Dynamic(_)
+    );
     // 威胁场景：Build 已持 bootstrap permit 时，Ready 若先把整池申请排进公平
     // semaphore，Build 后续 upgrade 会永远排在无法满足的 Ready 后面。所有初始
     // reservation 因此都先过 gate；Ready 取得完整 permit 后立即释放，Build 则持有
@@ -77,12 +127,14 @@ pub(super) async fn materialize(
             reference.logical_bytes,
             reference.item_count,
         )?,
-        SnapshotBarrierSource::Build(_) => ConversationSnapshotBudgetEstimator::bootstrap_bound()?,
+        SnapshotBarrierSource::Build(_) | SnapshotBarrierSource::Dynamic(_) => {
+            ConversationSnapshotBudgetEstimator::bootstrap_bound()?
+        }
     };
     let (mut memory, _build_guard) =
         reserve_initial_snapshot_memory(build_budget, build_gate, initial_bytes, build_source)
             .await?;
-    let materializer = SnapshotMaterializer::new(store.clone(), router);
+    let materializer = SnapshotMaterializer::new(store.clone(), router.clone());
     match materializer.materialize(source).await? {
         SnapshotMaterialization::Ready(snapshot) => {
             let (stored, wire_payload) = snapshot.into_parts();
@@ -91,8 +143,11 @@ pub(super) async fn materialize(
                 .map_err(|_| SnapshotReducerError::Decode)?;
             Ok(ReducedConversationSnapshot {
                 snapshot: decoded,
-                stored,
-                wire_payload,
+                payload: ReducedSnapshotPayload::Durable {
+                    stored,
+                    wire_payload,
+                },
+                history_command_ids: None,
                 memory_permit: memory.into_permit()?,
             })
         }
@@ -119,12 +174,152 @@ pub(super) async fn materialize(
                 .map_err(|_| SnapshotReducerError::Decode)?;
             Ok(ReducedConversationSnapshot {
                 snapshot: decoded,
-                stored,
-                wire_payload: None,
+                payload: ReducedSnapshotPayload::Durable {
+                    stored,
+                    wire_payload: None,
+                },
+                history_command_ids: None,
+                memory_permit,
+            })
+        }
+        SnapshotMaterialization::Dynamic(mut input) => {
+            // Native reader 可继续运行到 spawn_blocking 完成，即使外层 subscription
+            // future 因 disconnect/TTL 被取消。先占满共享 128 MiB 池，再把一个共享
+            // permit clone 移入独立 owner task，取消时不会提前放开第二个大 build。
+            // 主 permit 还会随 reduced result 持有到 pump 的 receipt replace 与 wire
+            // flush 之后；所以后续 Dynamic 即使取得 build gate，也无法完成 bootstrap
+            // reservation、更不可能在前一份 receipt set 线性化之前进入 native reader。
+            memory.grow_to(SNAPSHOT_BUILD_MEMORY_BYTES).await?;
+            let memory_permit = memory.into_permit()?;
+            let reader_permit = memory_permit.clone();
+            let reader = router.clone();
+            let adapter_state_key = input.adapter_state_key();
+            let agent_kind = input.agent_kind();
+            let read_task = tokio::spawn(async move {
+                let _reader_permit = reader_permit;
+                reader
+                    .read_native_history(adapter_state_key, agent_kind)
+                    .await
+            });
+            let read = read_task
+                .await
+                .map_err(|_| SnapshotReducerError::NativeRead)?
+                .map_err(map_native_history_read_error)?;
+
+            // Filesystem read 在 SQLite transaction 外执行；返回后必须重新认证 exact
+            // projection-only witness。正常 tombstone/reappear/config/command 漂移都丢弃
+            // 本次 read，绝不发布 payload 或替换 history receipt set。
+            let revalidated = store
+                .load_authenticated_conversation_snapshot_context(input.conversation_id())
+                .await?;
+            if !input.matches_revalidated_context(&revalidated) {
+                return Err(SnapshotMaterializationError::InvalidState.into());
+            }
+
+            let (items, command_ids) =
+                project_native_history(store, input.conversation_id(), read)?;
+            let assembled = assemble_dynamic_snapshot(&mut input, items)?;
+            let (snapshot, canonical_payload) = assembled.into_parts();
+            Ok(ReducedConversationSnapshot {
+                snapshot,
+                payload: ReducedSnapshotPayload::Dynamic {
+                    canonical_payload,
+                    input: Box::new(input),
+                },
+                history_command_ids: Some(command_ids),
                 memory_permit,
             })
         }
     }
+}
+
+fn map_native_history_read_error(error: NativeHistoryReadError) -> SnapshotReducerError {
+    match error {
+        NativeHistoryReadError::Unavailable => {
+            SnapshotMaterializationError::FeatureUnavailable.into()
+        }
+        NativeHistoryReadError::PayloadTooLarge => {
+            SnapshotMaterializationError::PayloadTooLarge.into()
+        }
+        NativeHistoryReadError::InvalidSource => {
+            SnapshotMaterializationError::SchemaIncompatible.into()
+        }
+        NativeHistoryReadError::ReadUnavailable => SnapshotReducerError::NativeRead,
+    }
+}
+
+fn project_native_history(
+    store: &RuntimeStoreHandle,
+    conversation_id: RuntimeId,
+    read: CanonicalNativeHistoryRead,
+) -> Result<(Vec<SnapshotItem>, Vec<RuntimeId>), SnapshotReducerError> {
+    project_native_history_with(
+        read,
+        |turn_key| {
+            store
+                .derive_native_history_command_id(conversation_id, turn_key.derivation_material())
+                .map_err(map_native_identity_error)
+        },
+        |item_key| {
+            store
+                .derive_native_history_item_ids(conversation_id, item_key.derivation_material())
+                .map_err(map_native_identity_error)
+        },
+    )
+}
+
+fn map_native_identity_error(_error: NativeHistoryIdentityError) -> SnapshotReducerError {
+    SnapshotReducerError::Identity
+}
+
+fn project_native_history_with(
+    read: CanonicalNativeHistoryRead,
+    mut derive_command: impl FnMut(&NativeTurnKey) -> Result<RuntimeId, SnapshotReducerError>,
+    mut derive_item: impl FnMut(&NativeItemKey) -> Result<([u8; 16], [u8; 16]), SnapshotReducerError>,
+) -> Result<(Vec<SnapshotItem>, Vec<RuntimeId>), SnapshotReducerError> {
+    let (_agent_kind, native_items, _source_bytes) = read.into_parts();
+    let mut items = Vec::with_capacity(native_items.len());
+    let mut commands_by_turn = HashMap::<NativeTurnKey, RuntimeId>::new();
+    let mut command_ids = Vec::new();
+    let mut all_identity_bytes = HashSet::<[u8; 16]>::with_capacity(
+        native_items
+            .len()
+            .checked_mul(3)
+            .ok_or(SnapshotReducerError::Identity)?,
+    );
+
+    for native in native_items {
+        let (turn_key, item_key, item) = native.into_parts();
+        let command_id = if let Some(command_id) = commands_by_turn.get(&turn_key).copied() {
+            command_id
+        } else {
+            let command_id = derive_command(&turn_key)?;
+            if !all_identity_bytes.insert(*command_id.as_bytes()) {
+                return Err(SnapshotReducerError::Identity);
+            }
+            commands_by_turn.insert(turn_key, command_id);
+            command_ids.push(command_id);
+            command_id
+        };
+        let (item_id, entity_id) = derive_item(&item_key)?;
+        if item_id == entity_id
+            || !all_identity_bytes.insert(item_id)
+            || !all_identity_bytes.insert(entity_id)
+        {
+            return Err(SnapshotReducerError::Identity);
+        }
+        items.push(SnapshotItem::Item {
+            item_id: ItemId::new(uuid::Uuid::from_bytes(item_id).hyphenated().to_string()),
+            entity_id: EntityId::new(uuid::Uuid::from_bytes(entity_id).hyphenated().to_string()),
+            command_id: Some(CommandId::new(command_id.to_canonical_string())),
+            item,
+        });
+    }
+    if command_ids.len() > crate::runtime::history_receipt::MAX_HISTORY_COMMAND_IDS_PER_CONVERSATION
+    {
+        return Err(SnapshotMaterializationError::PayloadTooLarge.into());
+    }
+    Ok((items, command_ids))
 }
 
 async fn reserve_initial_snapshot_memory(
@@ -317,7 +512,7 @@ mod tests {
         CommandId, ConversationId, EntityId, EventId, ItemId,
     };
     use agentdeck_protocol::runtime::{RuntimeEvent, RuntimeEventBody};
-    use agentdeck_protocol::{AgentItem, AgentItemMeta};
+    use agentdeck_protocol::{AgentItem, AgentItemMeta, AgentKind};
 
     use super::*;
 
@@ -343,6 +538,47 @@ mod tests {
             },
         )
         .expect("valid item event")
+    }
+
+    fn native_item(
+        turn_seed: u8,
+        item_seed: u8,
+        text: &str,
+    ) -> crate::agent::CanonicalNativeHistoryItem {
+        crate::agent::CanonicalNativeHistoryItem::new(
+            crate::agent::NativeTurnKey::from_verified_bytes([turn_seed; 32])
+                .expect("nonzero native turn key"),
+            crate::agent::NativeItemKey::from_verified_bytes([item_seed; 32])
+                .expect("nonzero native item key"),
+            AgentItem::AssistantMessage {
+                text: text.to_owned(),
+                meta: AgentItemMeta::default(),
+            },
+        )
+        .expect("modeled native item")
+    }
+
+    fn native_read(
+        items: Vec<crate::agent::CanonicalNativeHistoryItem>,
+    ) -> CanonicalNativeHistoryRead {
+        CanonicalNativeHistoryRead::new(AgentKind::ClaudeCode, items, 1)
+            .expect("bounded native read")
+    }
+
+    fn deterministic_command(turn_key: &NativeTurnKey) -> Result<RuntimeId, SnapshotReducerError> {
+        let seed = turn_key.derivation_material()[0];
+        RuntimeId::from_bytes(
+            crate::runtime::store::RuntimeIdKind::Command,
+            [seed.wrapping_add(0x40); 16],
+        )
+        .map_err(|_| SnapshotReducerError::Identity)
+    }
+
+    fn deterministic_item(
+        item_key: &NativeItemKey,
+    ) -> Result<([u8; 16], [u8; 16]), SnapshotReducerError> {
+        let seed = item_key.derivation_material()[0];
+        Ok(([seed; 16], [seed.wrapping_add(0x20); 16]))
     }
 
     #[test]
@@ -378,6 +614,98 @@ mod tests {
                 item_event(1, "item-a", "entity-a", "command-b", "two"),
             ]),
             Err(SnapshotReducerError::Decode)
+        ));
+    }
+
+    #[test]
+    fn native_identity_is_turn_shared_append_stable_and_cross_domain_unique() {
+        let initial = native_read(vec![native_item(1, 11, "one"), native_item(1, 12, "two")]);
+        let (first_items, first_commands) =
+            project_native_history_with(initial, deterministic_command, deterministic_item)
+                .expect("project initial native history");
+        assert_eq!(first_commands.len(), 1);
+        let first_wire = first_items
+            .iter()
+            .map(|item| match item {
+                SnapshotItem::Item {
+                    item_id,
+                    entity_id,
+                    command_id,
+                    ..
+                } => (
+                    item_id.as_str().to_owned(),
+                    entity_id.as_str().to_owned(),
+                    command_id
+                        .as_ref()
+                        .expect("history command identity")
+                        .as_str()
+                        .to_owned(),
+                ),
+                SnapshotItem::Capabilities { .. } => panic!("native projection excludes caps"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(first_wire[0].2, first_wire[1].2);
+        assert_ne!(first_wire[0].0, first_wire[1].0);
+        assert_ne!(first_wire[0].1, first_wire[1].1);
+
+        let appended = native_read(vec![
+            native_item(1, 11, "one"),
+            native_item(1, 12, "two"),
+            native_item(2, 13, "three"),
+        ]);
+        let (appended_items, appended_commands) =
+            project_native_history_with(appended, deterministic_command, deterministic_item)
+                .expect("project appended native history");
+        assert_eq!(appended_commands.len(), 2);
+        for (before, after) in first_wire.iter().zip(appended_items.iter()) {
+            let SnapshotItem::Item {
+                item_id,
+                entity_id,
+                command_id,
+                ..
+            } = after
+            else {
+                panic!("appended native item")
+            };
+            assert_eq!(before.0, item_id.as_str());
+            assert_eq!(before.1, entity_id.as_str());
+            assert_eq!(
+                before.2,
+                command_id.as_ref().expect("history command").as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn native_identity_collision_or_cross_domain_alias_fails_the_whole_read() {
+        let cross_domain = project_native_history_with(
+            native_read(vec![native_item(1, 2, "alias")]),
+            |_| {
+                RuntimeId::from_bytes(crate::runtime::store::RuntimeIdKind::Command, [0x51; 16])
+                    .map_err(|_| SnapshotReducerError::Identity)
+            },
+            |_| Ok(([0x51; 16], [0x52; 16])),
+        );
+        assert!(matches!(cross_domain, Err(SnapshotReducerError::Identity)));
+
+        let item_alias = project_native_history_with(
+            native_read(vec![
+                native_item(1, 2, "first"),
+                native_item(1, 3, "second"),
+            ]),
+            deterministic_command,
+            |_| Ok(([0x61; 16], [0x62; 16])),
+        );
+        assert!(matches!(item_alias, Err(SnapshotReducerError::Identity)));
+
+        let intra_item_alias = project_native_history_with(
+            native_read(vec![native_item(1, 2, "same pair")]),
+            deterministic_command,
+            |_| Ok(([0x71; 16], [0x71; 16])),
+        );
+        assert!(matches!(
+            intra_item_alias,
+            Err(SnapshotReducerError::Identity)
         ));
     }
 

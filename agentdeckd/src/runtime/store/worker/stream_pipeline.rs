@@ -212,9 +212,10 @@ impl RuntimeStoreHandle {
         .await?
     }
 
-    /// 在单 worker 的短 operation 内冻结当前 conversation H，并建立 tagged TEMP
-    /// snapshot pin。snapshot build 期间 writer/retention 可继续推进；pin 只证明 reducer
-    /// 已在该 cut 开始 capture，绝不把慢 build 变成 writer/checkpoint 的长事务。
+    /// 在单 worker 的短 operation 内认证 origin、冻结当前 conversation H，并建立
+    /// tagged TEMP snapshot pin。Managed 返回可物化的 Build，NativeProjected 只返回
+    /// 无 durable bind 能力的 Dynamic。snapshot build 期间 writer/retention 可继续推进；
+    /// pin 只证明 reducer 已在该 cut 开始 capture，绝不把慢 build 变成长事务。
     pub async fn acquire_snapshot_build_source(
         &self,
         conversation_id: super::super::RuntimeId,
@@ -846,14 +847,18 @@ pub(super) fn send_backfill_pin_reply(
 
 pub(super) fn send_snapshot_build_pin_reply(
     reply: oneshot::Sender<Result<SnapshotMaterializationSource, RuntimeStoreError>>,
-    result: Result<RuntimeSnapshotBuildPin, RuntimeStoreError>,
+    result: Result<SnapshotBarrierSource, RuntimeStoreError>,
     state: &sqlite::RuntimeSqlite,
     commit_hub: &mut StoreCommitHub,
     cleanup_tx: &mpsc::UnboundedSender<StoreCleanup>,
 ) {
-    let managed = result.map(|pin| {
+    let managed = result.map(|source| {
+        let pin = match &source {
+            SnapshotBarrierSource::Build(pin) | SnapshotBarrierSource::Dynamic(pin) => pin.clone(),
+            SnapshotBarrierSource::Ready(_) => unreachable!("direct acquire cannot return Ready"),
+        };
         let cleanup = SnapshotBuildPinCleanup::new(pin.clone(), cleanup_tx.clone());
-        SnapshotMaterializationSource::new(SnapshotBarrierSource::Build(pin), Some(cleanup))
+        SnapshotMaterializationSource::new(source, Some(cleanup))
     });
     if let Err(Ok(source)) = reply.send(managed)
         && let Some(pin) = source.into_build_pin_for_immediate_cleanup()
@@ -869,6 +874,16 @@ pub(super) fn decision_requires_snapshot_source(
         decision,
         crate::runtime::backfill::BarrierDecision::Snapshot { .. }
     )
+}
+
+pub(super) fn validate_ready_snapshot_origin(
+    dynamic_native: bool,
+    ready: Option<&ReadySnapshotReference>,
+) -> Result<(), RuntimeStoreError> {
+    if dynamic_native && ready.is_some() {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(())
 }
 
 struct CapturedStreamBarrier {
@@ -948,18 +963,40 @@ pub(super) fn register_stream_barrier_on_worker(
                 }
             }
         };
-        let ready_snapshot_base = ready_snapshot_reference
-            .as_ref()
-            .map(|reference| reference.base);
+        let conversation_origin = match target {
+            RuntimeStreamTarget::Catalog => None,
+            RuntimeStreamTarget::Conversation(conversation_id) => Some(
+                journal::load_authenticated_conversation_snapshot_context(
+                    &transaction,
+                    &state.key_bundle,
+                    state.database_id,
+                    conversation_id,
+                )?
+                .origin,
+            ),
+        };
+        let dynamic_native = conversation_origin == Some(SnapshotOrigin::NativeProjected);
+        // directory row 已先完成全量认证；若 exact requested parent 又认证为 native，
+        // 该 Ready 仍是语义非法的 legacy/resealed durable row，必须在创建 TEMP pin
+        // 或规划 source 前 fail-close，不能只忽略 payload 后继续。
+        validate_ready_snapshot_origin(dynamic_native, ready_snapshot_reference.as_ref())?;
+        let ready_snapshot_base = (!dynamic_native)
+            .then(|| {
+                ready_snapshot_reference
+                    .as_ref()
+                    .map(|reference| reference.base)
+            })
+            .flatten();
         // CatalogSnapshotProvider 会从 exact durable baseline refresh 到本次冻结 H，
         // 因此它实际发送的 snapshot base 必须就是 H；若仍用旧 ready base 规划，
         // pump 会在 H snapshot 后再次 backfill 同一 delta。Conversation ready row
         // 则保持 exact old base，并由后续 pinned backfill 补到 H。
         let snapshot_base = match target {
             RuntimeStreamTarget::Catalog => target_cut.high_water,
-            RuntimeStreamTarget::Conversation(_) => {
+            RuntimeStreamTarget::Conversation(_) if !dynamic_native => {
                 ready_snapshot_base.unwrap_or(target_cut.high_water)
             }
+            RuntimeStreamTarget::Conversation(_) => target_cut.high_water,
         };
         let decision = plan_barrier(BarrierInput {
             target,
@@ -983,12 +1020,24 @@ pub(super) fn register_stream_barrier_on_worker(
             None
         };
         let snapshot_source = if decision_requires_snapshot_source(&decision) {
-            match ready_snapshot_reference {
-                Some(reference) if target != RuntimeStreamTarget::Catalog => {
+            match (dynamic_native, ready_snapshot_reference) {
+                (true, _) => match target {
+                    RuntimeStreamTarget::Catalog => None,
+                    RuntimeStreamTarget::Conversation(conversation_id) => {
+                        let pin = stream::acquire_snapshot_build_pin_at(
+                            &state.connection,
+                            conversation_id,
+                            target_cut.high_water.high_water(),
+                            now_ms,
+                        )?;
+                        Some(SnapshotBarrierSource::Dynamic(pin))
+                    }
+                },
+                (false, Some(reference)) if target != RuntimeStreamTarget::Catalog => {
                     Some(SnapshotBarrierSource::Ready(reference))
                 }
-                Some(_) => None,
-                None => match target {
+                (false, Some(_)) => None,
+                (false, None) => match target {
                     RuntimeStreamTarget::Catalog => None,
                     RuntimeStreamTarget::Conversation(conversation_id) => {
                         let pin = stream::acquire_snapshot_build_pin_at(
@@ -1025,13 +1074,19 @@ pub(super) fn register_stream_barrier_on_worker(
             match stream::acquire_backfill_pin_at(state, target, after, through, now_ms) {
                 Ok(RuntimeBackfillPlan::Pinned(pin)) => Some(pin),
                 Ok(RuntimeBackfillPlan::Current { .. }) => {
-                    if let Some(SnapshotBarrierSource::Build(pin)) = &snapshot_source {
+                    if let Some(
+                        SnapshotBarrierSource::Build(pin) | SnapshotBarrierSource::Dynamic(pin),
+                    ) = &snapshot_source
+                    {
                         let _ = stream::release_snapshot_build_pin(state, pin);
                     }
                     return Err(RuntimeStoreError::UnknownOrCorruptSchema);
                 }
                 Err(error) => {
-                    if let Some(SnapshotBarrierSource::Build(pin)) = &snapshot_source {
+                    if let Some(
+                        SnapshotBarrierSource::Build(pin) | SnapshotBarrierSource::Dynamic(pin),
+                    ) = &snapshot_source
+                    {
                         let _ = stream::release_snapshot_build_pin(state, pin);
                     }
                     return Err(error);
@@ -1058,7 +1113,7 @@ pub(super) fn register_stream_barrier_on_worker(
     match result {
         Ok((watch, captured)) => {
             let snapshot_cleanup = match &captured.snapshot_source {
-                Some(SnapshotBarrierSource::Build(pin)) => {
+                Some(SnapshotBarrierSource::Build(pin) | SnapshotBarrierSource::Dynamic(pin)) => {
                     Some(watch.snapshot_build_pin_cleanup(pin.clone()))
                 }
                 Some(SnapshotBarrierSource::Ready(_)) | None => None,

@@ -12,6 +12,8 @@ pub const DAEMON_COMMAND_IDEMPOTENCY_CONFLICT: &str = "daemon.command.idempotenc
 pub const DAEMON_COMMAND_QUEUE_FULL: &str = "daemon.command.queue_full";
 pub const DAEMON_COMMAND_QUEUE_EXPIRED: &str = "daemon.command.queue_expired";
 pub const DAEMON_COMMAND_INTERRUPTED: &str = "daemon.command.interrupted";
+pub const DAEMON_COMMAND_HISTORY_ONLY: &str = "daemon.command.history_only";
+pub const DAEMON_COMMAND_NOT_FOUND: &str = "daemon.command.not_found";
 
 // —— daemon.runtime.* ——
 pub const DAEMON_RUNTIME_RECOVERY_BLOCKED: &str = "daemon.runtime.recovery_blocked";

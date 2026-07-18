@@ -679,7 +679,9 @@ async fn released_build_pin_fails_preparation_without_reacquiring() {
     let source = capture_source(&store, conversation_id, 26).await;
     let probe = match source.source() {
         SnapshotBarrierSource::Build(pin) => pin.clone(),
-        SnapshotBarrierSource::Ready(_) => panic!("fresh conversation must build"),
+        SnapshotBarrierSource::Ready(_) | SnapshotBarrierSource::Dynamic(_) => {
+            panic!("fresh conversation must build")
+        }
     };
     store
         .release_snapshot_build_pin(probe.clone())

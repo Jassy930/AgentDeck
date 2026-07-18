@@ -11,10 +11,11 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use agentdeck_protocol::runtime::command::{HelloParams, QueryReceiptSelector};
 use agentdeck_protocol::runtime::failure::{
     DAEMON_AUTHORIZATION_PERMISSION_DENIED, DAEMON_AUTHORIZATION_REVOKED,
-    DAEMON_CONVERSATION_NOT_FOUND, DAEMON_RUNTIME_ACTOR_UNAVAILABLE,
-    DAEMON_RUNTIME_CONNECTION_UNAVAILABLE, DAEMON_RUNTIME_FEATURE_UNAVAILABLE,
-    DAEMON_RUNTIME_IDENTITY_UNAVAILABLE, DAEMON_RUNTIME_INVALID_REQUEST, DAEMON_RUNTIME_NOT_READY,
-    DAEMON_RUNTIME_PROTOCOL_MISMATCH, DAEMON_RUNTIME_READ_UNAVAILABLE,
+    DAEMON_COMMAND_HISTORY_ONLY, DAEMON_COMMAND_NOT_FOUND, DAEMON_CONVERSATION_NOT_FOUND,
+    DAEMON_RUNTIME_ACTOR_UNAVAILABLE, DAEMON_RUNTIME_CONNECTION_UNAVAILABLE,
+    DAEMON_RUNTIME_FEATURE_UNAVAILABLE, DAEMON_RUNTIME_IDENTITY_UNAVAILABLE,
+    DAEMON_RUNTIME_INVALID_REQUEST, DAEMON_RUNTIME_NOT_READY, DAEMON_RUNTIME_PROTOCOL_MISMATCH,
+    DAEMON_RUNTIME_READ_UNAVAILABLE,
 };
 use agentdeck_protocol::runtime::identity::{
     ApprovalId, CommandId, ConversationId, IdempotencyKey, TurnId,
@@ -43,6 +44,7 @@ use super::conversation::{
 use super::execution::{
     DisabledExecutionCoordinator, GatedExecutionCoordinator, RuntimeExecutionCoordinator,
 };
+use super::history_receipt::{HistoryOnlyReceiptError, HistoryOnlyReceiptRegistry};
 use super::process_identity::SystemProcessGroupController;
 use super::read_pool::{DEFAULT_RUNTIME_READ_CONCURRENCY, ReadPool, ReadPoolError};
 use super::recovery::{
@@ -54,7 +56,7 @@ use super::snapshot::SNAPSHOT_BUILD_MEMORY_BYTES;
 use super::store::{
     CommandReceiptSelector, CommandState, ConfigureConversation, ConfigureConversationOutcome,
     ConversationDescriptor, CreateConversationOutcome, NewConversation, QueryCommandReceipt,
-    RuntimeId, RuntimeIdKind, RuntimeStoreError, RuntimeStoreHandle,
+    RuntimeId, RuntimeIdKind, RuntimeStoreError, RuntimeStoreHandle, SnapshotOrigin,
     UpdateConversationMetadataOutcome, UpdateManagedConversationMetadata,
 };
 use super::subscription::coordinator::SubscriptionCoordinator;
@@ -88,6 +90,7 @@ pub struct RuntimeCore {
     router: Arc<AgentRouter>,
     connections: ConnectionRegistry,
     subscriptions: SubscriptionCoordinator,
+    history_receipts: HistoryOnlyReceiptRegistry,
     conversations: ConversationRegistry,
     recovery_identity: Arc<()>,
     recovery: RuntimeRecoveryCoordinator,
@@ -176,18 +179,21 @@ impl RuntimeCore {
         let snapshot_build_budget = Arc::new(Semaphore::new(SNAPSHOT_BUILD_MEMORY_BYTES));
         let catalog_snapshots =
             CatalogSnapshotProvider::new(store.clone(), snapshot_build_budget.clone())?;
+        let history_receipts = HistoryOnlyReceiptRegistry::default();
         let subscriptions = SubscriptionCoordinator::new(
             store.clone(),
             router.clone(),
             connections.clone(),
             snapshot_build_budget,
             catalog_snapshots,
+            history_receipts.clone(),
         );
         Ok(Self {
             store,
             router,
             connections,
             subscriptions,
+            history_receipts,
             conversations,
             recovery_identity,
             recovery,
@@ -759,6 +765,22 @@ impl RuntimeCore {
                     validate_idempotency_key(&request.idempotency_key)?;
                     let conversation_id = parse_conversation_id(&request.conversation_id)?;
                     let authorization = principal.try_enter()?;
+                    // NativeProjected conversation 是经认证的只读历史投影。必须在 actor
+                    // mailbox 前返回 typed failure；Store accept transaction 仍会独立
+                    // 复核，防止 crate 内旁路或正常状态漂移越过此早期门禁。
+                    let context = self
+                        .store
+                        .load_authenticated_conversation_snapshot_context(conversation_id)
+                        .await
+                        .map_err(|error| match error {
+                            RuntimeStoreError::ConversationNotFound => {
+                                RuntimeCoreError::Conversation(ConversationError::NotFound)
+                            }
+                            error => RuntimeCoreError::Store(error),
+                        })?;
+                    if context.origin != SnapshotOrigin::Managed {
+                        return Err(RuntimeCoreError::FeatureUnavailable);
+                    }
                     self.conversations
                         .submit_prompt(
                             conversation_id,
@@ -880,13 +902,14 @@ impl RuntimeCore {
             RuntimeRequest::QueryReceipt(selector) => {
                 let _authorization = principal.try_enter()?;
                 let owner = principal.idempotency_owner();
-                let (conversation_id, query) = match selector {
+                let (conversation_id, query, history_selector) = match selector {
                     QueryReceiptSelector::Command {
                         conversation_id,
                         command_id,
                     } => {
                         let internal_conversation = parse_conversation_id(&conversation_id)?;
                         let internal_command = parse_command_id(&command_id)?;
+                        let history_selector = Some((internal_conversation, internal_command));
                         (
                             conversation_id,
                             QueryCommandReceipt {
@@ -896,6 +919,7 @@ impl RuntimeCore {
                                     command_id: internal_command,
                                 },
                             },
+                            history_selector,
                         )
                     }
                     QueryReceiptSelector::Idempotency {
@@ -913,14 +937,29 @@ impl RuntimeCore {
                                     idempotency_key: idempotency_key.as_str().to_owned(),
                                 },
                             },
+                            None,
                         )
                     }
                 };
                 let store = self.store.clone();
-                let receipt = self
+                let durable = self
                     .read_pool
                     .run(async move { store.query_command_receipt(query).await })
-                    .await??;
+                    .await?;
+                let receipt = match durable {
+                    Ok(receipt) => receipt,
+                    Err(RuntimeStoreError::CommandNotFound) => {
+                        if let Some((conversation_id, command_id)) = history_selector
+                            && self
+                                .history_receipts
+                                .contains(conversation_id, command_id)?
+                        {
+                            return Err(RuntimeCoreError::HistoryOnlyCommand);
+                        }
+                        return Err(RuntimeCoreError::CommandNotFound);
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 Ok(RuntimeReply::CommandStatus(CommandStatusReceipt {
                     conversation_id,
                     command_id: wire_command_id(receipt.command_id),
@@ -1202,6 +1241,12 @@ pub(crate) enum RuntimeCoreError {
     EntropyUnavailable,
     #[error("runtime agent descriptions violate daemon invariants")]
     AgentDescriptionsInvalid,
+    #[error("runtime command identity belongs to verified native history only")]
+    HistoryOnlyCommand,
+    #[error("runtime command identity was not found")]
+    CommandNotFound,
+    #[error(transparent)]
+    HistoryReceipt(#[from] HistoryOnlyReceiptError),
     #[error(transparent)]
     Store(#[from] RuntimeStoreError),
     #[error(transparent)]
@@ -1252,6 +1297,18 @@ impl RuntimeCoreError {
             Self::AgentDescriptionsInvalid => RuntimeFailure::new(
                 "daemon.runtime.invalid_state",
                 "runtime agent descriptions violate daemon invariants",
+            ),
+            Self::HistoryOnlyCommand => RuntimeFailure::new(
+                DAEMON_COMMAND_HISTORY_ONLY,
+                "runtime command identity belongs to verified native history, not the command journal",
+            ),
+            Self::CommandNotFound => RuntimeFailure::new(
+                DAEMON_COMMAND_NOT_FOUND,
+                "runtime command identity was not found",
+            ),
+            Self::HistoryReceipt(_) => RuntimeFailure::new(
+                DAEMON_RUNTIME_READ_UNAVAILABLE,
+                "runtime history receipt index is unavailable",
             ),
             Self::Store(error) => {
                 RuntimeFailure::new(error.code(), "runtime durable store rejected the operation")

@@ -860,6 +860,7 @@ fn acquire_backfill_pin_through(
     ))
 }
 
+#[cfg(test)]
 pub(super) fn acquire_snapshot_build_pin(
     state: &super::sqlite::RuntimeSqlite,
     conversation_id: super::RuntimeId,

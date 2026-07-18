@@ -74,15 +74,40 @@ pub use stream::{
 pub use worker::RuntimeStoreHandle;
 pub(crate) use worker::{
     AuthorizedAcceptOutcome, ClaudeCodeAdapterStateVault, CodexAdapterStateVault,
+    NativeHistoryIdentityError,
 };
 
 /// 已经通过 conversation row metadata MAC、descriptor AEAD open 与 canonical
 /// re-encode 的 snapshot 上下文。该类型只在 daemon runtime 内流转，不进入 wire。
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SnapshotOrigin {
+    Managed,
+    NativeProjected,
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct AuthenticatedConversationSnapshotContext {
     pub(crate) conversation_id: RuntimeId,
+    pub(crate) adapter_state_key: RuntimeId,
     pub(crate) agent_kind: agentdeck_protocol::AgentKind,
+    pub(crate) catalog_revision: u64,
+    pub(crate) command_high_water: Option<u64>,
     pub(crate) event_high_water: Option<u64>,
+    pub(crate) origin: SnapshotOrigin,
+}
+
+impl std::fmt::Debug for AuthenticatedConversationSnapshotContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedConversationSnapshotContext")
+            .field("conversation_id", &self.conversation_id)
+            .field("agent_kind", &self.agent_kind)
+            .field("catalog_revision", &self.catalog_revision)
+            .field("command_high_water", &self.command_high_water)
+            .field("event_high_water", &self.event_high_water)
+            .field("origin", &self.origin)
+            .finish_non_exhaustive()
+    }
 }
 
 /// 已通过 SnapshotBuildInput exact binding 的唯一 production 写入能力。

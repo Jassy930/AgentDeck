@@ -1419,6 +1419,8 @@ pub enum RuntimeStoreError {
     AdapterStateNamespaceMismatch,
     #[error("runtime command was not found")]
     CommandNotFound,
+    #[error("runtime conversation does not support durable command admission")]
+    CommandAdmissionUnsupported,
     #[error("runtime command idempotency key was reused with a different payload")]
     IdempotencyConflict,
     #[error("runtime command belongs to a different idempotency owner")]
@@ -1569,7 +1571,9 @@ impl RuntimeStoreError {
             Self::ConfigurationRequired => DAEMON_CONVERSATION_CONFIGURATION_REQUIRED,
             Self::ConfigurationConflict { .. } => DAEMON_CONVERSATION_CONFIGURATION_CONFLICT,
             Self::MetadataMutationPending => DAEMON_CONVERSATION_METADATA_MUTATION_PENDING,
-            Self::MetadataMutationUnsupported => DAEMON_RUNTIME_FEATURE_UNAVAILABLE,
+            Self::MetadataMutationUnsupported | Self::CommandAdmissionUnsupported => {
+                DAEMON_RUNTIME_FEATURE_UNAVAILABLE
+            }
             Self::IdempotencyConflict => "daemon.command.idempotency_conflict",
             Self::QueueFull { .. } => "daemon.command.queue_full",
             Self::PayloadTooLarge => "daemon.payload.item_too_large",

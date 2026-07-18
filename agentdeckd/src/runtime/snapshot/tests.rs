@@ -28,7 +28,7 @@ use crate::runtime::store::{
     ConfigureConversation, ConfigureConversationOutcome, ConversationDescriptor, IdempotencyOwner,
     NewConversation, ReadySnapshotReference, RuntimeClock, RuntimeClockError, RuntimeId,
     RuntimeIdKind, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreFaultInjector,
-    RuntimeStoreHandle, RuntimeStoreLane, RuntimeStoreOperation,
+    RuntimeStoreHandle, RuntimeStoreLane, RuntimeStoreOperation, SnapshotOrigin,
 };
 use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
 
@@ -268,7 +268,9 @@ async fn materialize_snapshot_build(
         .expect("acquire managed snapshot test build source");
     let probe = match source.source() {
         SnapshotBarrierSource::Build(pin) => pin.clone(),
-        SnapshotBarrierSource::Ready(_) => panic!("direct acquire must return build source"),
+        SnapshotBarrierSource::Ready(_) | SnapshotBarrierSource::Dynamic(_) => {
+            panic!("direct acquire must return build source")
+        }
     };
     let materializer = SnapshotMaterializer::new(store.clone(), snapshot_test_router());
     let SnapshotMaterialization::Build(build) = materializer
@@ -279,6 +281,29 @@ async fn materialize_snapshot_build(
         panic!("fresh snapshot pin test source must build")
     };
     (materializer, probe, build)
+}
+
+fn build_as_dynamic_input(build: SnapshotBuildInput) -> DynamicSnapshotInput {
+    let SnapshotBuildInput {
+        pin,
+        cleanup,
+        conversation_id,
+        agent_kind,
+        base_event_cursor,
+        configuration_state,
+        capabilities,
+    } = build;
+    DynamicSnapshotInput {
+        pin,
+        cleanup,
+        conversation_id,
+        adapter_state_key: runtime_id(RuntimeIdKind::AdapterState, 0x6f),
+        agent_kind,
+        catalog_revision: 0,
+        base_event_cursor,
+        configuration_state,
+        capabilities,
+    }
 }
 
 #[tokio::test]
@@ -455,7 +480,9 @@ async fn dropping_taken_snapshot_source_releases_exact_temp_pin() {
         .expect("fresh conversation requires a build source");
     let probe = match source.source() {
         SnapshotBarrierSource::Build(pin) => pin.clone(),
-        SnapshotBarrierSource::Ready(_) => panic!("fresh conversation cannot be ready"),
+        SnapshotBarrierSource::Ready(_) | SnapshotBarrierSource::Dynamic(_) => {
+            panic!("fresh conversation cannot be ready")
+        }
     };
     assert_eq!(
         store
@@ -497,7 +524,9 @@ async fn dropping_directly_acquired_snapshot_pin_releases_exact_temp_pin() {
         .expect("directly acquire managed snapshot build source");
     let probe = match source.source() {
         SnapshotBarrierSource::Build(pin) => pin.clone(),
-        SnapshotBarrierSource::Ready(_) => panic!("direct acquire must return build source"),
+        SnapshotBarrierSource::Ready(_) | SnapshotBarrierSource::Dynamic(_) => {
+            panic!("direct acquire must return build source")
+        }
     };
     assert_eq!(
         store
@@ -761,8 +790,12 @@ async fn configure_snapshot_conversation(
 fn authenticated_context(seed: u8, kind: AgentKind) -> AuthenticatedConversationSnapshotContext {
     AuthenticatedConversationSnapshotContext {
         conversation_id: conversation_id(seed),
+        adapter_state_key: runtime_id(RuntimeIdKind::AdapterState, seed.wrapping_add(0x40)),
         agent_kind: kind,
+        catalog_revision: 0,
+        command_high_water: None,
         event_high_water: None,
+        origin: SnapshotOrigin::Managed,
     }
 }
 
@@ -1341,6 +1374,66 @@ fn snapshot_budget_counts_capabilities_and_allows_only_9999_agent_items() {
     let rejected = (0..10_000).map(item).collect();
     let error = assemble_snapshot(context, rejected).expect_err("10,000 agent items overflow");
     assert_eq!(error.code(), "daemon.payload.item_too_large");
+}
+
+#[tokio::test]
+async fn dynamic_snapshot_budget_allows_exactly_10000_history_items_plus_capabilities() {
+    let root = snapshot_pin_test_root("dynamic-exact-history-budget");
+    let config = RuntimeStoreConfig::new(root.join("runtime.db"));
+    let (store, conversation_id) = open_snapshot_pin_test_store(&root, config, 0x2f).await;
+
+    let (materializer, _probe, build) = materialize_snapshot_build(&store, conversation_id).await;
+    let mut dynamic = build_as_dynamic_input(build);
+    let allowed = (0..crate::agent::MAX_CANONICAL_NATIVE_HISTORY_ITEMS)
+        .map(item)
+        .collect();
+    let assembled = assemble_dynamic_snapshot(&mut dynamic, allowed)
+        .expect("10,000 native history items plus mandatory Capabilities");
+    let (snapshot, payload) = assembled.into_parts();
+    assert_eq!(snapshot.items().len(), 10_001);
+    assert!(matches!(
+        snapshot.items().first(),
+        Some(SnapshotItem::Capabilities { .. })
+    ));
+    assert_eq!(
+        serde_json::from_slice::<ConversationSnapshot>(&payload)
+            .expect("decode exact-limit Dynamic payload")
+            .items()
+            .len(),
+        10_001
+    );
+    materializer
+        .release_dynamic_input(dynamic)
+        .await
+        .expect("release exact-limit Dynamic input");
+
+    let (materializer, _probe, build) = materialize_snapshot_build(&store, conversation_id).await;
+    let mut dynamic = build_as_dynamic_input(build);
+    let rejected = (0..=crate::agent::MAX_CANONICAL_NATIVE_HISTORY_ITEMS)
+        .map(item)
+        .collect();
+    let error = match assemble_dynamic_snapshot(&mut dynamic, rejected) {
+        Ok(_) => panic!("10,001 native history items must overflow Dynamic"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "daemon.payload.item_too_large");
+    materializer
+        .release_dynamic_input(dynamic)
+        .await
+        .expect("release rejected Dynamic input");
+
+    assert_eq!(
+        store
+            .active_snapshot_build_pin_count_for_test()
+            .await
+            .expect("count Dynamic limit-test TEMP pins"),
+        0
+    );
+    store
+        .shutdown()
+        .await
+        .expect("shutdown Dynamic history budget store");
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

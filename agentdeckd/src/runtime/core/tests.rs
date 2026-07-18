@@ -5,27 +5,30 @@ use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use agentdeck_protocol::runtime::failure::{
+    DAEMON_COMMAND_HISTORY_ONLY, DAEMON_COMMAND_NOT_FOUND,
     DAEMON_CONVERSATION_CONFIGURATION_CONFLICT, DAEMON_CONVERSATION_CONFIGURATION_REQUIRED,
 };
 use agentdeck_protocol::runtime::identity::{
     ApprovalId, ConversationId, EventId, IdempotencyKey, MessageId,
 };
 use agentdeck_protocol::runtime::{
-    ArtifactSha256, CodexConversationConfiguration, ConfigurationReceipt,
-    ConfigureConversationRequest, ConversationConfiguration, ConversationMetadataMutation,
-    ConversationMetadataMutationRequest, ConversationMetadataReceipt, ConversationStart,
-    LocalOnlyAdministration, MAX_RUNTIME_JSON_FRAME_BYTES, PromptPayload, QueryReceiptSelector,
-    RuntimeEvent, RuntimeEventBody, RuntimeMessage, RuntimeStreamItem, SendPromptRequest,
-    StageUpgradeReceipt, StageUpgradeRequest, VendorConfigurationSnapshot,
+    ArtifactSha256, ClaudeCodeConversationConfiguration, CodexConversationConfiguration,
+    ConfigurationReceipt, ConfigureConversationRequest, ConversationConfiguration,
+    ConversationMetadataMutation, ConversationMetadataMutationRequest, ConversationMetadataReceipt,
+    ConversationStart, LocalOnlyAdministration, MAX_RUNTIME_JSON_FRAME_BYTES, PromptPayload,
+    QueryReceiptSelector, RuntimeEvent, RuntimeEventBody, RuntimeMessage, RuntimeStreamItem,
+    SendPromptRequest, StageUpgradeReceipt, StageUpgradeRequest, VendorConfigurationSnapshot,
 };
 use agentdeck_protocol::{
-    ActionDecision, ActionDecisionKind, AgentKind, CodexApprovalPolicy, CodexReasoningEffort,
-    CodexSandboxMode,
+    ActionDecision, ActionDecisionKind, AgentKind, ClaudeCodePermissionMode, CodexApprovalPolicy,
+    CodexReasoningEffort, CodexSandboxMode,
 };
+use rusqlite::{Connection, OpenFlags};
 use tokio::sync::mpsc;
 
 use super::*;
-use crate::security::{MemoryKeyStore, StorageKek, load_or_create_storage_kek};
+use crate::runtime::store::{ImportNativeProjection, ImportNativeProjectionOutcome};
+use crate::security::{MemoryKeyStore, SecretBytes, StorageKek, load_or_create_storage_kek};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 
@@ -190,6 +193,10 @@ impl TestRoot {
             .expect("core test StorageKEK")
     }
 
+    fn database(&self) -> PathBuf {
+        self.path.join("runtime.db")
+    }
+
     async fn open_store(&self) -> RuntimeStoreHandle {
         RuntimeStoreHandle::open(
             super::super::store::RuntimeStoreConfig::new(self.path.join("runtime.db"))
@@ -198,6 +205,105 @@ impl TestRoot {
         )
         .await
         .expect("open core test store")
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PromptAdmissionEvidence {
+    command_rows: i64,
+    pin_rows: i64,
+    event_rows: i64,
+    command_high_water: Option<String>,
+    conversation_accepted_count: i64,
+    conversation_metadata_token: Vec<u8>,
+    ledger_command_count: i64,
+    ledger_pin_count: i64,
+    ledger_event_count: i64,
+    ledger_accepted_count: i64,
+    ledger_accepted_payload_bytes: i64,
+    ledger_metadata_token: Vec<u8>,
+    artifacts: (Vec<u8>, Option<Vec<u8>>),
+}
+
+fn prompt_admission_evidence(
+    database: &Path,
+    conversation_id: RuntimeId,
+) -> PromptAdmissionEvidence {
+    let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open read-only prompt admission evidence database");
+    let target = &conversation_id.as_bytes()[..];
+    let command_rows = connection
+        .query_row(
+            "SELECT COUNT(*) FROM commands WHERE conversation_id = ?1",
+            [target],
+            |row| row.get(0),
+        )
+        .expect("count prompt admission commands");
+    let pin_rows = connection
+        .query_row(
+            "SELECT COUNT(*) FROM command_configuration_pins WHERE conversation_id = ?1",
+            [target],
+            |row| row.get(0),
+        )
+        .expect("count prompt admission configuration pins");
+    let event_rows = connection
+        .query_row(
+            "SELECT COUNT(*) FROM event_journal WHERE conversation_id = ?1",
+            [target],
+            |row| row.get(0),
+        )
+        .expect("count prompt admission events");
+    let (command_high_water, conversation_accepted_count, conversation_metadata_token) = connection
+        .query_row(
+            "SELECT command_high_water, accepted_count, metadata_token
+                 FROM conversations WHERE conversation_id = ?1",
+            [target],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read prompt admission conversation evidence");
+    let (
+        ledger_command_count,
+        ledger_pin_count,
+        ledger_event_count,
+        ledger_accepted_count,
+        ledger_accepted_payload_bytes,
+        ledger_metadata_token,
+    ) = connection
+        .query_row(
+            "SELECT command_count, command_configuration_pin_count, event_count,
+                    accepted_count, accepted_payload_bytes, metadata_token
+             FROM runtime_meta WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .expect("read prompt admission ledger evidence");
+    drop(connection);
+    let main = fs::read(database).expect("read prompt admission main bytes");
+    let wal_path = PathBuf::from(format!("{}-wal", database.display()));
+    let wal = fs::read(wal_path).ok();
+    PromptAdmissionEvidence {
+        command_rows,
+        pin_rows,
+        event_rows,
+        command_high_water,
+        conversation_accepted_count,
+        conversation_metadata_token,
+        ledger_command_count,
+        ledger_pin_count,
+        ledger_event_count,
+        ledger_accepted_count,
+        ledger_accepted_payload_bytes,
+        ledger_metadata_token,
+        artifacts: (main, wal),
     }
 }
 
@@ -231,6 +337,18 @@ fn codex_configuration(reasoning: CodexReasoningEffort) -> ConversationConfigura
             CodexSandboxMode::WorkspaceWrite,
             reasoning,
         ),
+    ))
+}
+
+fn claude_code_configuration() -> ConversationConfiguration {
+    ConversationConfiguration::new(VendorConfigurationSnapshot::ClaudeCode(
+        ClaudeCodeConversationConfiguration::new(
+            ClaudeCodePermissionMode::Default,
+            None,
+            None,
+            None,
+        )
+        .expect("valid Claude Code native projection configuration"),
     ))
 }
 
@@ -362,10 +480,12 @@ async fn runtime_core_issues_explicit_local_control_without_upgrading_read_only_
     core.shutdown().await.expect("shutdown cold core");
 }
 
+fn synthetic_runtime_id(kind: RuntimeIdKind, seed: u8) -> RuntimeId {
+    RuntimeId::from_bytes(kind, [seed; 16]).expect("synthetic runtime id")
+}
+
 fn synthetic_wire_id(kind: RuntimeIdKind, seed: u8) -> String {
-    RuntimeId::from_bytes(kind, [seed; 16])
-        .expect("synthetic runtime id")
-        .to_canonical_string()
+    synthetic_runtime_id(kind, seed).to_canonical_string()
 }
 
 #[tokio::test]
@@ -1472,6 +1592,187 @@ async fn public_send_prompt_maps_configuration_preconditions_to_command_receipt_
 }
 
 #[tokio::test]
+async fn native_projected_send_prompt_is_feature_unavailable_without_side_effects_across_restart() {
+    let root = TestRoot::new("native-send-prompt-admission");
+    let store = root.open_store().await;
+    let imported = store
+        .claude_code_native_projection_store()
+        .import(ImportNativeProjection {
+            descriptor: ConversationDescriptor {
+                agent_kind: AgentKind::ClaudeCode,
+                title: Some("native history fixture".to_owned()),
+                cwd: PathBuf::from("/tmp/agentdeck-native-send-prompt"),
+            },
+            default_configuration: claude_code_configuration(),
+            private_reference: SecretBytes::new(
+                b"native-send-prompt-private-reference-v1".to_vec(),
+            ),
+            scan_generation: [0x91; 16],
+        })
+        .await
+        .expect("import native SendPrompt admission fixture");
+    let ImportNativeProjectionOutcome::Imported { conversation, .. } = imported else {
+        panic!("native SendPrompt admission fixture must import exactly once");
+    };
+    let native_wire_id = ConversationId::new(conversation.conversation_id.to_canonical_string());
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let core = Arc::new(
+        RuntimeCore::new(store, router, [0x92; 32])
+            .expect("construct native SendPrompt admission core"),
+    );
+    core.recover()
+        .await
+        .expect("recover native SendPrompt admission core");
+    let connection = connect_local(&core, 0x92).await;
+    let actor_baseline = core.actor_count().await;
+    assert_eq!(
+        actor_baseline, 1,
+        "recovery must install the present native actor before testing Core admission"
+    );
+    let evidence_before = prompt_admission_evidence(&root.database(), conversation.conversation_id);
+
+    let reply = core
+        .handle(
+            connection,
+            RuntimeRequest::SendPrompt(SendPromptRequest {
+                conversation_id: native_wire_id.clone(),
+                idempotency_key: IdempotencyKey::new("native-send-prompt-must-fail"),
+                expected_configuration_revision: 1,
+                prompt: PromptPayload::new("native history cannot accept a durable prompt")
+                    .expect("valid native rejection prompt"),
+            }),
+        )
+        .await;
+    assert!(matches!(
+        reply,
+        RuntimeReply::Command(CommandReceipt::Failed {
+            failure: RuntimeFailure { code, .. }
+        }) if code == DAEMON_RUNTIME_FEATURE_UNAVAILABLE
+    ));
+    let exact_retry = core
+        .handle(
+            connection,
+            RuntimeRequest::SendPrompt(SendPromptRequest {
+                conversation_id: native_wire_id.clone(),
+                idempotency_key: IdempotencyKey::new("native-send-prompt-must-fail"),
+                expected_configuration_revision: 1,
+                prompt: PromptPayload::new("native history cannot accept a durable prompt")
+                    .expect("valid exact native rejection retry"),
+            }),
+        )
+        .await;
+    assert!(matches!(
+        exact_retry,
+        RuntimeReply::Command(CommandReceipt::Failed {
+            failure: RuntimeFailure { code, .. }
+        }) if code == DAEMON_RUNTIME_FEATURE_UNAVAILABLE
+    ));
+    let receipt_lookup = core
+        .handle(
+            connection,
+            RuntimeRequest::QueryReceipt(QueryReceiptSelector::Idempotency {
+                conversation_id: native_wire_id.clone(),
+                idempotency_key: IdempotencyKey::new("native-send-prompt-must-fail"),
+            }),
+        )
+        .await;
+    assert!(matches!(
+        receipt_lookup,
+        RuntimeReply::Failure(RuntimeFailure { code, .. })
+            if code == DAEMON_COMMAND_NOT_FOUND
+    ));
+    assert_eq!(core.actor_count().await, actor_baseline);
+    assert_eq!(
+        prompt_admission_evidence(&root.database(), conversation.conversation_id),
+        evidence_before,
+        "Core rejection must not change command/pin/event/HWM/ledger/main+WAL"
+    );
+    core.shutdown()
+        .await
+        .expect("shutdown first native SendPrompt admission core");
+
+    let reopened_store = root.open_store().await;
+    let reopened_router = Arc::new(AgentRouter::with_runtime_store(reopened_store.clone()));
+    let reopened_core = Arc::new(
+        RuntimeCore::new(reopened_store, reopened_router, [0x93; 32])
+            .expect("construct reopened native SendPrompt admission core"),
+    );
+    reopened_core
+        .recover()
+        .await
+        .expect("recover reopened native SendPrompt admission core");
+    let reopened_connection = connect_local(&reopened_core, 0x93).await;
+    let reopened_actor_baseline = reopened_core.actor_count().await;
+    assert_eq!(
+        reopened_actor_baseline, 1,
+        "restarted recovery must reinstall the present native actor"
+    );
+    let reopened_before = prompt_admission_evidence(&root.database(), conversation.conversation_id);
+    let reopened_reply = reopened_core
+        .handle(
+            reopened_connection,
+            RuntimeRequest::SendPrompt(SendPromptRequest {
+                conversation_id: native_wire_id,
+                idempotency_key: IdempotencyKey::new("native-send-prompt-must-fail-after-restart"),
+                expected_configuration_revision: 1,
+                prompt: PromptPayload::new("restart must preserve the native prompt gate")
+                    .expect("valid reopened native rejection prompt"),
+            }),
+        )
+        .await;
+    assert!(matches!(
+        reopened_reply,
+        RuntimeReply::Command(CommandReceipt::Failed {
+            failure: RuntimeFailure { code, .. }
+        }) if code == DAEMON_RUNTIME_FEATURE_UNAVAILABLE
+    ));
+    assert_eq!(reopened_core.actor_count().await, reopened_actor_baseline);
+    assert_eq!(
+        prompt_admission_evidence(&root.database(), conversation.conversation_id),
+        reopened_before,
+        "restarted Core rejection must remain byte-exact and side-effect-free"
+    );
+
+    // 同一个 Core 上的 Managed conversation 仍应走原有 durable acceptance，证明
+    // 门禁绑定 origin 而不是把整个 SendPrompt family 关闭。
+    let managed = start_receipt(
+        reopened_core
+            .handle(
+                reopened_connection,
+                start_request("managed-send-prompt-control"),
+            )
+            .await,
+    );
+    configure_codex_revision_one(
+        &reopened_core,
+        reopened_connection,
+        managed.conversation_id.clone(),
+        "managed-send-prompt-control-configuration",
+    )
+    .await;
+    let managed_reply = reopened_core
+        .handle(
+            reopened_connection,
+            RuntimeRequest::SendPrompt(SendPromptRequest {
+                conversation_id: managed.conversation_id,
+                idempotency_key: IdempotencyKey::new("managed-send-prompt-control-command"),
+                expected_configuration_revision: 1,
+                prompt: PromptPayload::new("managed prompt remains admissible")
+                    .expect("valid managed control prompt"),
+            }),
+        )
+        .await;
+    assert!(matches!(
+        managed_reply,
+        RuntimeReply::Command(CommandReceipt::Accepted { .. })
+    ));
+    reopened_core
+        .shutdown()
+        .await
+        .expect("shutdown reopened native SendPrompt admission core");
+}
+
+#[tokio::test]
 async fn principal_without_approval_permission_cannot_claim() {
     let root = TestRoot::new("approval-permission-denied");
     let core = core(&root).await;
@@ -1697,6 +1998,285 @@ async fn start_is_pure_durable_idempotent_then_prompt_and_query_are_separate() {
     }
 
     core.shutdown().await.expect("shutdown core");
+}
+
+#[tokio::test]
+async fn query_receipt_reports_history_only_without_synthesizing_command_status() {
+    let root = TestRoot::new("history-only-receipt");
+    let core = core(&root).await;
+    core.recover().await.expect("recover history-only core");
+    let connection = connect_local(&core, 0x81).await;
+    let conversation_id = synthetic_runtime_id(RuntimeIdKind::Conversation, 0x82);
+    let command_id = synthetic_runtime_id(RuntimeIdKind::Command, 0x83);
+    core.history_receipts
+        .replace(conversation_id, [command_id])
+        .expect("install verified history-only command set");
+
+    let reply = core
+        .handle(
+            connection,
+            RuntimeRequest::QueryReceipt(QueryReceiptSelector::Command {
+                conversation_id: wire_conversation_id(conversation_id),
+                command_id: wire_command_id(command_id),
+            }),
+        )
+        .await;
+
+    match reply {
+        RuntimeReply::Failure(RuntimeFailure { code, .. }) => {
+            assert_eq!(code, DAEMON_COMMAND_HISTORY_ONLY);
+        }
+        RuntimeReply::CommandStatus(receipt) => {
+            panic!("history-only identity must not synthesize CommandStatus: {receipt:?}");
+        }
+        other => panic!("expected history-only failure, got {other:?}"),
+    }
+    core.shutdown().await.expect("shutdown history-only core");
+}
+
+#[tokio::test]
+async fn query_receipt_reports_not_found_for_unread_and_idempotency_selectors() {
+    let root = TestRoot::new("history-receipt-not-found");
+    let core = core(&root).await;
+    core.recover().await.expect("recover receipt lookup core");
+    let connection = connect_local(&core, 0x84).await;
+    let conversation_id = synthetic_runtime_id(RuntimeIdKind::Conversation, 0x85);
+    let indexed_command = synthetic_runtime_id(RuntimeIdKind::Command, 0x86);
+    core.history_receipts
+        .replace(conversation_id, [indexed_command])
+        .expect("install one history-only command");
+
+    let requests = [
+        RuntimeRequest::QueryReceipt(QueryReceiptSelector::Command {
+            conversation_id: wire_conversation_id(conversation_id),
+            command_id: wire_command_id(synthetic_runtime_id(RuntimeIdKind::Command, 0x87)),
+        }),
+        RuntimeRequest::QueryReceipt(QueryReceiptSelector::Command {
+            conversation_id: wire_conversation_id(synthetic_runtime_id(
+                RuntimeIdKind::Conversation,
+                0x88,
+            )),
+            command_id: wire_command_id(indexed_command),
+        }),
+        RuntimeRequest::QueryReceipt(QueryReceiptSelector::Idempotency {
+            conversation_id: wire_conversation_id(conversation_id),
+            idempotency_key: IdempotencyKey::new("history-registry-must-not-serve-idempotency"),
+        }),
+    ];
+    for request in requests {
+        let reply = core.handle(connection, request).await;
+        assert!(
+            matches!(
+                &reply,
+                RuntimeReply::Failure(RuntimeFailure { code, .. })
+                    if code == DAEMON_COMMAND_NOT_FOUND
+            ),
+            "unread/random/idempotency lookup must stay not-found, got {reply:?}"
+        );
+    }
+
+    core.shutdown().await.expect("shutdown receipt lookup core");
+}
+
+#[tokio::test]
+async fn query_receipt_prefers_durable_command_over_history_only_registry() {
+    let root = TestRoot::new("durable-receipt-precedence");
+    let core = core(&root).await;
+    core.recover().await.expect("recover durable receipt core");
+    let connection = connect_local(&core, 0x89).await;
+    let conversation = start_receipt(
+        core.handle(
+            connection,
+            start_request("durable-receipt-precedence-start"),
+        )
+        .await,
+    );
+    configure_codex_revision_one(
+        &core,
+        connection,
+        conversation.conversation_id.clone(),
+        "durable-receipt-precedence-configure",
+    )
+    .await;
+    let accepted = core
+        .handle(
+            connection,
+            RuntimeRequest::SendPrompt(SendPromptRequest {
+                conversation_id: conversation.conversation_id.clone(),
+                idempotency_key: IdempotencyKey::new("durable-receipt-precedence-command"),
+                expected_configuration_revision: 1,
+                prompt: PromptPayload::new("durable receipt wins").expect("prompt"),
+            }),
+        )
+        .await;
+    let command_id = match accepted {
+        RuntimeReply::Command(CommandReceipt::Accepted { command_id, .. }) => command_id,
+        other => panic!("expected accepted durable command, got {other:?}"),
+    };
+    let internal_conversation =
+        parse_conversation_id(&conversation.conversation_id).expect("parse durable conversation");
+    let internal_command = parse_command_id(&command_id).expect("parse durable command");
+    core.history_receipts
+        .replace(internal_conversation, [internal_command])
+        .expect("also index durable command as history-only");
+
+    let reply = core
+        .handle(
+            connection,
+            RuntimeRequest::QueryReceipt(QueryReceiptSelector::Command {
+                conversation_id: conversation.conversation_id.clone(),
+                command_id: command_id.clone(),
+            }),
+        )
+        .await;
+    assert!(
+        matches!(
+            &reply,
+            RuntimeReply::CommandStatus(CommandStatusReceipt {
+                conversation_id,
+                command_id: returned_command,
+                configuration_revision: 1,
+                status: CommandStatus::Accepted,
+                turn_id: None,
+            }) if conversation_id == &conversation.conversation_id
+                && returned_command == &command_id
+        ),
+        "durable receipt must win over volatile registry, got {reply:?}"
+    );
+
+    core.shutdown()
+        .await
+        .expect("shutdown durable receipt core");
+}
+
+#[tokio::test]
+async fn query_receipt_never_falls_back_after_durable_owner_mismatch() {
+    let root = TestRoot::new("receipt-owner-mismatch");
+    let core = core(&root).await;
+    core.recover().await.expect("recover owner mismatch core");
+    let owner_connection = connect_local(&core, 0x8A).await;
+    let other_connection = connect_local(&core, 0x8B).await;
+    let conversation = start_receipt(
+        core.handle(
+            owner_connection,
+            start_request("receipt-owner-mismatch-start"),
+        )
+        .await,
+    );
+    configure_codex_revision_one(
+        &core,
+        owner_connection,
+        conversation.conversation_id.clone(),
+        "receipt-owner-mismatch-configure",
+    )
+    .await;
+    let command_id = match core
+        .handle(
+            owner_connection,
+            RuntimeRequest::SendPrompt(SendPromptRequest {
+                conversation_id: conversation.conversation_id.clone(),
+                idempotency_key: IdempotencyKey::new("receipt-owner-mismatch-command"),
+                expected_configuration_revision: 1,
+                prompt: PromptPayload::new("owner mismatch must not fall back").expect("prompt"),
+            }),
+        )
+        .await
+    {
+        RuntimeReply::Command(CommandReceipt::Accepted { command_id, .. }) => command_id,
+        other => panic!("expected accepted owner-scoped command, got {other:?}"),
+    };
+    core.history_receipts
+        .replace(
+            parse_conversation_id(&conversation.conversation_id)
+                .expect("parse owner-scoped conversation"),
+            [parse_command_id(&command_id).expect("parse owner-scoped command")],
+        )
+        .expect("index same command in volatile registry");
+
+    let reply = core
+        .handle(
+            other_connection,
+            RuntimeRequest::QueryReceipt(QueryReceiptSelector::Command {
+                conversation_id: conversation.conversation_id,
+                command_id,
+            }),
+        )
+        .await;
+    assert!(
+        matches!(
+            &reply,
+            RuntimeReply::Failure(RuntimeFailure { code, .. })
+                if code == RuntimeStoreError::CommandOwnerMismatch.code()
+        ),
+        "owner mismatch must surface its durable failure without registry fallback, got {reply:?}"
+    );
+
+    core.shutdown().await.expect("shutdown owner mismatch core");
+}
+
+#[tokio::test]
+async fn history_only_receipts_do_not_survive_runtime_core_restart() {
+    let root = TestRoot::new("history-receipt-restart");
+    let conversation_id = synthetic_runtime_id(RuntimeIdKind::Conversation, 0x8C);
+    let command_id = synthetic_runtime_id(RuntimeIdKind::Command, 0x8D);
+
+    let first_core = core(&root).await;
+    first_core
+        .recover()
+        .await
+        .expect("recover first history receipt core");
+    let first_connection = connect_local(&first_core, 0x8E).await;
+    first_core
+        .history_receipts
+        .replace(conversation_id, [command_id])
+        .expect("install first-process receipt");
+    assert!(matches!(
+        first_core
+            .handle(
+                first_connection,
+                RuntimeRequest::QueryReceipt(QueryReceiptSelector::Command {
+                    conversation_id: wire_conversation_id(conversation_id),
+                    command_id: wire_command_id(command_id),
+                }),
+            )
+            .await,
+        RuntimeReply::Failure(RuntimeFailure { code, .. })
+            if code == DAEMON_COMMAND_HISTORY_ONLY
+    ));
+    first_core.shutdown().await.expect("shutdown first core");
+    drop(first_core);
+
+    let second_core = core(&root).await;
+    second_core
+        .recover()
+        .await
+        .expect("recover replacement history receipt core");
+    assert!(
+        !second_core
+            .history_receipts
+            .contains(conversation_id, command_id)
+            .expect("inspect fresh registry"),
+        "a new RuntimeCore must start with an empty volatile registry"
+    );
+    let second_connection = connect_local(&second_core, 0x8E).await;
+    let reply = second_core
+        .handle(
+            second_connection,
+            RuntimeRequest::QueryReceipt(QueryReceiptSelector::Command {
+                conversation_id: wire_conversation_id(conversation_id),
+                command_id: wire_command_id(command_id),
+            }),
+        )
+        .await;
+    assert!(
+        matches!(
+            &reply,
+            RuntimeReply::Failure(RuntimeFailure { code, .. })
+                if code == DAEMON_COMMAND_NOT_FOUND
+        ),
+        "restarted Core must not restore history-only receipts, got {reply:?}"
+    );
+    second_core.shutdown().await.expect("shutdown second core");
 }
 
 #[tokio::test]

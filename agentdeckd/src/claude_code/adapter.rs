@@ -39,7 +39,8 @@
 use crate::agent::{
     AdapterStateHandle, Agent, AgentEventSender, AgentSessionHandle, AgentTurnRequest,
     CanonicalAgentEvent, CanonicalAgentEventSender, CanonicalAgentSessionHandle,
-    CanonicalHistoryRead, ExecSpec, PrepareAdapterTurnCapability, PreparedAgentTurn,
+    CanonicalHistoryRead, CanonicalNativeHistoryRead, ExecSpec, NativeHistoryReadError,
+    NativeHistoryReader, PrepareAdapterTurnCapability, PreparedAgentTurn,
 };
 use crate::claude_code::driver::ClaudeCodePreparedTurn;
 use crate::claude_code::state::ClaudeCodeStateRepository;
@@ -1285,6 +1286,53 @@ impl Agent for ClaudeCodeAdapter {
     }
 }
 
+#[async_trait::async_trait]
+impl NativeHistoryReader for ClaudeCodeAdapter {
+    async fn read_native_history(
+        &self,
+        adapter_state_key: RuntimeId,
+    ) -> Result<CanonicalNativeHistoryRead, NativeHistoryReadError> {
+        ensure_adapter_state_key(adapter_state_key)
+            .map_err(|_| NativeHistoryReadError::InvalidSource)?;
+        let repository = self
+            .state_repository
+            .as_ref()
+            .ok_or(NativeHistoryReadError::Unavailable)?;
+        crate::claude_code::history::read_native_projection_history(repository, adapter_state_key)
+            .await
+            .map_err(classify_native_history_read_error)
+    }
+}
+
+fn classify_native_history_read_error(error: ProtocolError) -> NativeHistoryReadError {
+    match error.code.as_str() {
+        "adapter-native-history-too-large"
+        | "cc-history-too-large"
+        | "cc-history-native-too-large"
+        | "cc-history-native-budget-bytes" => NativeHistoryReadError::PayloadTooLarge,
+        "adapter-state-not-configured" | "adapter-state-not-found" => {
+            NativeHistoryReadError::Unavailable
+        }
+        "adapter-native-history-reference-invalid"
+        | "adapter-native-history-invalid"
+        | "adapter-raw-history-blocked"
+        | "cc-history-parse-failed"
+        | "cc-history-invalid"
+        | "cc-history-native-ref-invalid"
+        | "cc-history-native-ref-version"
+        | "cc-history-native-source-unsafe"
+        | "cc-history-native-malformed"
+        | "cc-history-native-key-invalid"
+        | "cc-history-native-duplicate-key"
+        | "cc-history-native-entry-invalid" => NativeHistoryReadError::InvalidSource,
+        "cc-history-native-home-unavailable"
+        | "cc-history-native-source-unavailable"
+        | "cc-history-native-source-read"
+        | "cc-history-native-budget-time" => NativeHistoryReadError::ReadUnavailable,
+        _ => NativeHistoryReadError::ReadUnavailable,
+    }
+}
+
 async fn write_permission_response_line<W>(writer: &mut W, line: &str) -> Result<(), ProtocolError>
 where
     W: AsyncWrite + Unpin,
@@ -1785,6 +1833,57 @@ mod tests {
                 .code,
             "cc-session-identity-eof"
         );
+    }
+
+    #[test]
+    fn native_history_error_classifier_preserves_daemon_neutral_categories() {
+        let cases = [
+            (
+                "cc-history-native-too-large",
+                NativeHistoryReadError::PayloadTooLarge,
+            ),
+            (
+                "cc-history-native-budget-bytes",
+                NativeHistoryReadError::PayloadTooLarge,
+            ),
+            (
+                "cc-history-native-source-unsafe",
+                NativeHistoryReadError::InvalidSource,
+            ),
+            (
+                "cc-history-native-malformed",
+                NativeHistoryReadError::InvalidSource,
+            ),
+            (
+                "cc-history-native-key-invalid",
+                NativeHistoryReadError::InvalidSource,
+            ),
+            (
+                "cc-history-native-duplicate-key",
+                NativeHistoryReadError::InvalidSource,
+            ),
+            (
+                "cc-history-native-home-unavailable",
+                NativeHistoryReadError::ReadUnavailable,
+            ),
+            (
+                "cc-history-native-source-read",
+                NativeHistoryReadError::ReadUnavailable,
+            ),
+            (
+                "cc-history-native-budget-time",
+                NativeHistoryReadError::ReadUnavailable,
+            ),
+        ];
+        for (code, expected) in cases {
+            let actual = classify_native_history_read_error(ProtocolError {
+                code: code.to_owned(),
+                message: "private native error sentinel".to_owned(),
+                diagnostic_ref: Some("private native diagnostic sentinel".to_owned()),
+            });
+            assert_eq!(actual, expected, "unexpected category for {code}");
+            assert!(!format!("{actual:?}").contains("sentinel"));
+        }
     }
 
     #[test]

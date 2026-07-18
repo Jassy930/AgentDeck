@@ -10,6 +10,7 @@ mod conversation;
 mod core;
 pub mod events;
 pub(crate) mod execution;
+mod history_receipt;
 pub mod hub;
 pub mod model;
 pub mod namespace;

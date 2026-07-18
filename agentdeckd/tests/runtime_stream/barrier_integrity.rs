@@ -101,7 +101,7 @@ async fn snapshot_build_pin_is_bound_to_barrier_captured_h() {
         .expect("empty conversation must capture an exact-H build source");
     let pin = match source.source() {
         SnapshotBarrierSource::Build(pin) => pin.clone(),
-        SnapshotBarrierSource::Ready(_) => {
+        SnapshotBarrierSource::Ready(_) | SnapshotBarrierSource::Dynamic(_) => {
             panic!("empty conversation must capture an exact-H build source")
         }
     };
@@ -176,7 +176,9 @@ async fn ready_snapshot_reference_is_exact_and_replacement_safe() {
         .expect("ready snapshot must return an exact reference");
     let reference = match source.source() {
         SnapshotBarrierSource::Ready(reference) => reference.clone(),
-        SnapshotBarrierSource::Build(_) => panic!("ready snapshot must return an exact reference"),
+        SnapshotBarrierSource::Build(_) | SnapshotBarrierSource::Dynamic(_) => {
+            panic!("ready snapshot must return an exact reference")
+        }
     };
     assert_eq!(reference.snapshot_id, first.snapshot_id);
     assert_eq!(

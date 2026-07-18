@@ -10,6 +10,7 @@ use agentdeck_protocol::{
     HistoryTurn, ProtocolError, ServerEvent, SessionCapabilities, SessionId, SessionStart,
     ThreadId, TurnSummary, VendorControlPayload, VendorPanelPayload,
 };
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::future::Future;
@@ -859,6 +860,225 @@ pub struct CanonicalHistoryRead {
     pub turns: Vec<HistoryTurn>,
 }
 
+pub(crate) const MAX_CANONICAL_NATIVE_HISTORY_ITEMS: usize = 10_000;
+pub(crate) const MAX_CANONICAL_NATIVE_HISTORY_BYTES: u64 = 64 * 1024 * 1024;
+/// Native JSONL decode 与 canonical read document 共用的单次 retained-memory 上界。
+/// Dynamic snapshot 虽持有同尺寸共享 permit，adapter 仍必须在分配 `Value` DOM 前
+/// 内容感知地证明本次 read 不会越界；permit 本身只隔离并发，不是内存计量器。
+pub(crate) const MAX_CANONICAL_NATIVE_HISTORY_RETAINED_BYTES: usize = 128 * 1024 * 1024;
+
+/// Adapter 私域验证后交给 daemon Runtime 的中立原生 turn key。
+///
+/// 具体 vendor 的 UUID、path、session id 与 private reference 不跨越此边界；
+/// Runtime 只能消费固定 32-byte stable key，并按 conversation 再做域分离派生。
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub(crate) struct NativeTurnKey([u8; 32]);
+
+impl NativeTurnKey {
+    pub(crate) fn from_verified_bytes(bytes: [u8; 32]) -> Result<Self, ProtocolError> {
+        if bytes == [0; 32] {
+            return Err(invalid_native_history_key());
+        }
+        Ok(Self(bytes))
+    }
+
+    pub(crate) const fn derivation_material(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for NativeTurnKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("NativeTurnKey([REDACTED])")
+    }
+}
+
+/// 与 `NativeTurnKey` 分型的单项 key；类型系统禁止在 identity 域之间误接线。
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub(crate) struct NativeItemKey([u8; 32]);
+
+impl NativeItemKey {
+    pub(crate) fn from_verified_bytes(bytes: [u8; 32]) -> Result<Self, ProtocolError> {
+        if bytes == [0; 32] {
+            return Err(invalid_native_history_key());
+        }
+        Ok(Self(bytes))
+    }
+
+    pub(crate) const fn derivation_material(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for NativeItemKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("NativeItemKey([REDACTED])")
+    }
+}
+
+fn invalid_native_history_key() -> ProtocolError {
+    ProtocolError {
+        code: "adapter-native-history-invalid".into(),
+        message: "native history contains an invalid stable key".into(),
+        diagnostic_ref: None,
+    }
+}
+
+/// 已建模的单个原生历史 item；turn/item key 都是 daemon-private opaque key。
+pub(crate) struct CanonicalNativeHistoryItem {
+    turn_key: NativeTurnKey,
+    item_key: NativeItemKey,
+    item: AgentItem,
+}
+
+impl CanonicalNativeHistoryItem {
+    pub(crate) fn new(
+        turn_key: NativeTurnKey,
+        item_key: NativeItemKey,
+        item: AgentItem,
+    ) -> Result<Self, ProtocolError> {
+        if matches!(&item, AgentItem::Raw { .. }) {
+            return Err(ProtocolError {
+                code: "adapter-raw-history-blocked".into(),
+                message: "native history contains an unmodeled vendor frame".into(),
+                diagnostic_ref: None,
+            });
+        }
+        Ok(Self {
+            turn_key,
+            item_key,
+            item,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn turn_key(&self) -> NativeTurnKey {
+        self.turn_key
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn item_key(&self) -> NativeItemKey {
+        self.item_key
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn item(&self) -> &AgentItem {
+        &self.item
+    }
+
+    pub(crate) fn into_parts(self) -> (NativeTurnKey, NativeItemKey, AgentItem) {
+        (self.turn_key, self.item_key, self.item)
+    }
+}
+
+impl fmt::Debug for CanonicalNativeHistoryItem {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CanonicalNativeHistoryItem([REDACTED])")
+    }
+}
+
+/// 一次重新验证并读取出的完整原生 transcript 投影。
+///
+/// 构造器是 adapter→Runtime 的 fail-close 门：只接受建模 item、全局唯一 item
+/// key，并同时锁住 10,000 items 与 64 MiB source-read 上界。
+pub(crate) struct CanonicalNativeHistoryRead {
+    agent_kind: AgentKind,
+    items: Vec<CanonicalNativeHistoryItem>,
+    source_bytes: u64,
+}
+
+impl CanonicalNativeHistoryRead {
+    pub(crate) fn new(
+        agent_kind: AgentKind,
+        items: Vec<CanonicalNativeHistoryItem>,
+        source_bytes: u64,
+    ) -> Result<Self, ProtocolError> {
+        if items.len() > MAX_CANONICAL_NATIVE_HISTORY_ITEMS
+            || source_bytes > MAX_CANONICAL_NATIVE_HISTORY_BYTES
+        {
+            return Err(ProtocolError {
+                code: "adapter-native-history-too-large".into(),
+                message: "native history exceeds the daemon projection bound".into(),
+                diagnostic_ref: None,
+            });
+        }
+        if items.is_empty() {
+            return Err(ProtocolError {
+                code: "adapter-native-history-invalid".into(),
+                message: "native history contains no modeled items".into(),
+                diagnostic_ref: None,
+            });
+        }
+        let mut item_keys = HashSet::with_capacity(items.len());
+        if items.iter().any(|item| !item_keys.insert(item.item_key)) {
+            return Err(ProtocolError {
+                code: "adapter-native-history-invalid".into(),
+                message: "native history contains a duplicate item key".into(),
+                diagnostic_ref: None,
+            });
+        }
+        Ok(Self {
+            agent_kind,
+            items,
+            source_bytes,
+        })
+    }
+
+    pub(crate) const fn agent_kind(&self) -> AgentKind {
+        self.agent_kind
+    }
+
+    #[cfg(test)]
+    pub(crate) fn items(&self) -> &[CanonicalNativeHistoryItem] {
+        &self.items
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn source_bytes(&self) -> u64 {
+        self.source_bytes
+    }
+
+    pub(crate) fn into_parts(self) -> (AgentKind, Vec<CanonicalNativeHistoryItem>, u64) {
+        (self.agent_kind, self.items, self.source_bytes)
+    }
+}
+
+impl fmt::Debug for CanonicalNativeHistoryRead {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalNativeHistoryRead")
+            .field("agent_kind", &self.agent_kind)
+            .field("item_count", &self.items.len())
+            .field("source_bytes", &self.source_bytes)
+            .finish()
+    }
+}
+
+/// Adapter 私域错误在跨入 Runtime 前收敛到中立、无私有上下文的分类。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum NativeHistoryReadError {
+    #[error("native history capability is unavailable")]
+    Unavailable,
+    #[error("native history exceeds the bounded snapshot limit")]
+    PayloadTooLarge,
+    #[error("native history source failed canonical validation")]
+    InvalidSource,
+    #[error("native history source could not be read")]
+    ReadUnavailable,
+}
+
+/// Public `Agent` trait 之外的 daemon-private extension seam。只有真实原生
+/// backend 才注册实现；缺失实现由 Router 明确映射为 typed unavailable。
+#[async_trait::async_trait]
+pub(crate) trait NativeHistoryReader: Send + Sync + 'static {
+    async fn read_native_history(
+        &self,
+        adapter_state_key: RuntimeId,
+    ) -> Result<CanonicalNativeHistoryRead, NativeHistoryReadError>;
+}
+
+pub(crate) type DynNativeHistoryReader = Arc<dyn NativeHistoryReader>;
+
 /// Handle returned when a session is started. The hub uses it to send
 /// follow-up prompts / decisions / cancels to the same session.
 pub struct AgentSessionHandle {
@@ -1326,6 +1546,95 @@ mod typed_boundary_tests {
         assert_eq!(state.key().kind(), RuntimeIdKind::AdapterState);
         assert_eq!(format!("{execution:?}"), "ExecutionId([REDACTED])");
         assert_eq!(format!("{state:?}"), "AdapterStateHandle([REDACTED])");
+    }
+
+    #[test]
+    fn native_history_boundary_is_bounded_typed_and_redacted() {
+        let turn_key =
+            NativeTurnKey::from_verified_bytes([0x31; 32]).expect("nonzero native turn key");
+        let item_key =
+            NativeItemKey::from_verified_bytes([0x32; 32]).expect("nonzero native item key");
+        let item = CanonicalNativeHistoryItem::new(
+            turn_key,
+            item_key,
+            AgentItem::AssistantMessage {
+                text: "private native history sentinel".to_owned(),
+                meta: Default::default(),
+            },
+        )
+        .expect("modeled native item");
+        let read = CanonicalNativeHistoryRead::new(
+            AgentKind::ClaudeCode,
+            vec![item],
+            MAX_CANONICAL_NATIVE_HISTORY_BYTES,
+        )
+        .expect("exact native history byte bound");
+
+        assert_eq!(read.agent_kind(), AgentKind::ClaudeCode);
+        assert_eq!(read.source_bytes(), MAX_CANONICAL_NATIVE_HISTORY_BYTES);
+        assert_eq!(read.items().len(), 1);
+        assert_eq!(read.items()[0].turn_key(), turn_key);
+        assert_eq!(read.items()[0].item_key(), item_key);
+        assert!(matches!(
+            read.items()[0].item(),
+            AgentItem::AssistantMessage { .. }
+        ));
+        let debug = format!("{read:?}");
+        assert!(!debug.contains("private native history sentinel"));
+        assert!(!debug.contains("31"));
+        assert!(!debug.contains("32"));
+
+        let oversized = CanonicalNativeHistoryRead::new(
+            AgentKind::ClaudeCode,
+            Vec::new(),
+            MAX_CANONICAL_NATIVE_HISTORY_BYTES + 1,
+        )
+        .expect_err("native history byte bound is fail-closed");
+        assert_eq!(oversized.code, "adapter-native-history-too-large");
+
+        let too_many_items = (0..=MAX_CANONICAL_NATIVE_HISTORY_ITEMS)
+            .map(|index| {
+                let mut key = [0_u8; 32];
+                key[..8].copy_from_slice(&((index as u64) + 1).to_be_bytes());
+                CanonicalNativeHistoryItem::new(
+                    turn_key,
+                    NativeItemKey::from_verified_bytes(key).expect("nonzero bounded item key"),
+                    AgentItem::AssistantMessage {
+                        text: String::new(),
+                        meta: Default::default(),
+                    },
+                )
+                .expect("modeled bounded item fixture")
+            })
+            .collect();
+        let oversized = CanonicalNativeHistoryRead::new(AgentKind::ClaudeCode, too_many_items, 1)
+            .expect_err("native history item bound is fail-closed");
+        assert_eq!(oversized.code, "adapter-native-history-too-large");
+
+        let raw = CanonicalNativeHistoryItem::new(
+            turn_key,
+            item_key,
+            AgentItem::Raw {
+                raw_kind: "private-vendor-kind".to_owned(),
+                raw_payload: "private-vendor-payload".to_owned(),
+                meta: Default::default(),
+            },
+        )
+        .expect_err("raw vendor frames cannot cross the native history boundary");
+        assert_eq!(raw.code, "adapter-raw-history-blocked");
+
+        assert_eq!(
+            NativeTurnKey::from_verified_bytes([0; 32])
+                .expect_err("zero turn key must fail closed")
+                .code,
+            "adapter-native-history-invalid"
+        );
+        assert_eq!(
+            NativeItemKey::from_verified_bytes([0; 32])
+                .expect_err("zero item key must fail closed")
+                .code,
+            "adapter-native-history-invalid"
+        );
     }
 
     #[test]

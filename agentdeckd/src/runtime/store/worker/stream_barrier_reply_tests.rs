@@ -228,7 +228,13 @@ fn successful_snapshot_pin_send_then_unpolled_receiver_drop_releases_exact_pin()
         .expect("create direct snapshot build pin");
     let (reply, caller) = oneshot::channel();
 
-    send_snapshot_build_pin_reply(reply, Ok(pin.clone()), &state, &mut hub, &cleanup_tx);
+    send_snapshot_build_pin_reply(
+        reply,
+        Ok(SnapshotBarrierSource::Build(pin.clone())),
+        &state,
+        &mut hub,
+        &cleanup_tx,
+    );
     assert!(
         cleanup_rx.try_recv().is_err(),
         "receiver still owns managed pin"
@@ -244,6 +250,28 @@ fn successful_snapshot_pin_send_then_unpolled_receiver_drop_releases_exact_pin()
         stream::validate_snapshot_build_pin(&state.connection, &pin, 1),
         Err(RuntimeStoreError::InvalidStateTransition)
     ));
+}
+
+#[test]
+fn authenticated_native_origin_rejects_stale_ready_reference() {
+    let conversation_id =
+        RuntimeId::from_bytes(RuntimeIdKind::Conversation, [0x83; 16]).expect("conversation id");
+    let ready = super::super::snapshot::ReadySnapshotReference {
+        snapshot_id: [0x84; 16],
+        target: RuntimeStreamTarget::Conversation(conversation_id),
+        base: StreamCursor::BeforeFirst,
+        item_count: 1,
+        logical_bytes: 1,
+        content_sha256: [0x85; 32],
+    };
+    assert!(matches!(
+        stream_pipeline::validate_ready_snapshot_origin(true, Some(&ready)),
+        Err(RuntimeStoreError::UnknownOrCorruptSchema)
+    ));
+    stream_pipeline::validate_ready_snapshot_origin(true, None)
+        .expect("native Dynamic path without Ready remains valid");
+    stream_pipeline::validate_ready_snapshot_origin(false, Some(&ready))
+        .expect("managed parent may use authenticated Ready");
 }
 
 #[test]

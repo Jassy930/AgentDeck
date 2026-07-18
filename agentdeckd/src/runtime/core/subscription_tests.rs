@@ -420,6 +420,8 @@ async fn create_indexed_catalog_rows(core: &RuntimeCore, first: u16, count: u16)
 mod a1a2_legacy_readback;
 #[path = "subscription_tests/catalog.rs"]
 mod catalog;
+#[path = "subscription_tests/dynamic_native.rs"]
+mod dynamic_native;
 #[path = "subscription_tests/snapshot_store.rs"]
 mod snapshot_store;
 #[path = "subscription_tests/terminal_gate.rs"]

@@ -6,7 +6,8 @@
 
 use crate::agent::{
     AdapterStateHandle, AgentEventSender, AgentSessionHandle, AgentTurnRequest,
-    CanonicalAgentEventSender, CanonicalAgentSessionHandle, CanonicalHistoryRead, DynAgent,
+    CanonicalAgentEventSender, CanonicalAgentSessionHandle, CanonicalHistoryRead,
+    CanonicalNativeHistoryRead, DynAgent, DynNativeHistoryReader, NativeHistoryReadError,
     PreparedAgentTurnHandle, prepare_turn as prepare_agent_turn,
 };
 use agentdeck_protocol::runtime::{AgentDescription, AgentDescriptions, ConfigurationError};
@@ -26,6 +27,7 @@ use crate::{claude_code::ClaudeCodeAdapter, codex::CodexAdapter};
 /// transient `SessionId` ownership for their existing control surface.
 pub struct AgentRouter {
     agents: BTreeMap<AgentKind, DynAgent>,
+    native_history_readers: BTreeMap<AgentKind, DynNativeHistoryReader>,
     sessions: Arc<Mutex<HashMap<SessionId, AgentKind>>>,
 }
 
@@ -33,6 +35,7 @@ impl AgentRouter {
     pub fn new() -> Self {
         Self {
             agents: BTreeMap::new(),
+            native_history_readers: BTreeMap::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -46,15 +49,25 @@ impl AgentRouter {
         router.register(Arc::new(CodexAdapter::with_state_vault(
             store.codex_adapter_state_vault(),
         )));
-        router.register(Arc::new(ClaudeCodeAdapter::with_state_vault(
+        let claude_code = Arc::new(ClaudeCodeAdapter::with_state_vault(
             store.claude_code_adapter_state_vault(),
-        )));
+        ));
+        router.register(claude_code.clone());
+        router.register_native_history_reader(AgentKind::ClaudeCode, claude_code);
         router
     }
 
     pub fn register(&mut self, agent: DynAgent) {
         let kind = agent.kind();
         self.agents.insert(kind, agent);
+    }
+
+    pub(crate) fn register_native_history_reader(
+        &mut self,
+        agent_kind: AgentKind,
+        reader: DynNativeHistoryReader,
+    ) {
+        self.native_history_readers.insert(agent_kind, reader);
     }
 
     pub fn list_agents(&self) -> Vec<AgentKind> {
@@ -216,6 +229,28 @@ impl AgentRouter {
             diagnostic_ref: None,
         })?;
         agent.read_adapter_history(adapter_state_key).await
+    }
+
+    /// Key-bearing native history typed route。Router 只携带 neutral
+    /// adapterStateKey；private reference 的解析、no-follow 重验与 stable key
+    /// 提取全部留在具体 adapter 私域。当前 Codex/未注册扩展稳定 unavailable。
+    pub(crate) async fn read_native_history(
+        &self,
+        adapter_state_key: RuntimeId,
+        agent_kind: AgentKind,
+    ) -> Result<CanonicalNativeHistoryRead, NativeHistoryReadError> {
+        if !self.agents.contains_key(&agent_kind) {
+            return Err(NativeHistoryReadError::Unavailable);
+        }
+        let reader = self
+            .native_history_readers
+            .get(&agent_kind)
+            .ok_or(NativeHistoryReadError::Unavailable)?;
+        let read = reader.read_native_history(adapter_state_key).await?;
+        if read.agent_kind() != agent_kind {
+            return Err(NativeHistoryReadError::InvalidSource);
+        }
+        Ok(read)
     }
 
     pub async fn submit_decision(
@@ -589,5 +624,26 @@ mod typed_prepare_tests {
         assert_eq!(error.code, "adapter-configuration-agent-mismatch");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(router.active_session_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn codex_and_default_adapter_report_native_history_unavailable() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut router = AgentRouter::new();
+        router.register(Arc::new(PrepareProbeAgent {
+            kind: AgentKind::Codex,
+            calls: Arc::clone(&calls),
+        }));
+
+        let error = router
+            .read_native_history(
+                runtime_id(crate::runtime::store::RuntimeIdKind::AdapterState, 0x61),
+                AgentKind::Codex,
+            )
+            .await
+            .expect_err("Codex has no native history projection backend");
+
+        assert_eq!(error, NativeHistoryReadError::Unavailable);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

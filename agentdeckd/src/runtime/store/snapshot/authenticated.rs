@@ -788,6 +788,28 @@ pub(in crate::runtime::store) fn authenticated_conversation_snapshot_covers(
     if snapshot.base_event_seq.is_none_or(|base| base < victim) {
         return Ok(false);
     }
+    // Durable snapshot 只能替 Managed conversation 授权 replay trim/publication
+    // rotation。仅认证 snapshot row 本身不足以证明 parent origin；NativeProjected
+    // transcript 的权威正文仍在 adapter 私域，任何 legacy/resealed row 都不能成为
+    // 删除 event membership 的 replacement evidence。
+    let parent_state = super::super::configuration::load_conversation_state(
+        connection,
+        key_bundle,
+        conversation_id,
+    )?;
+    if !parent_state.is_managed() {
+        return Ok(false);
+    }
+    let projection_exists: i64 = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM native_projection_state WHERE conversation_id = ?1
+         )",
+        [&conversation_id.as_bytes()[..]],
+        |row| row.get(0),
+    )?;
+    if projection_exists != 0 {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
     verify_snapshot_ciphertext_identity(
         connection,
         &snapshot.snapshot_id,

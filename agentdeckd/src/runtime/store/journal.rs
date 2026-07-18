@@ -1249,6 +1249,32 @@ pub(crate) fn mark_conversation_recovery_blocked(
     })
 }
 
+/// Durable command journal 只属于 Managed conversation。该 gate 会完整认证
+/// conversation、origin sidecar 与任意 native projection/binding；不能只检查
+/// `conversation_state.origin_kind` 明文，也不能放在 idempotency replay 之后。
+fn ensure_managed_command_admission(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    conversation_id: RuntimeId,
+) -> Result<(), RuntimeStoreError> {
+    let conversation = load_conversation(connection, key_bundle, database_id, conversation_id)?;
+    match super::native_projection::authenticated_native_catalog_change(
+        connection,
+        key_bundle,
+        database_id,
+        &conversation,
+    )? {
+        None => Ok(()),
+        Some(super::native_projection::NativeCatalogChange::Upsert) => {
+            Err(RuntimeStoreError::CommandAdmissionUnsupported)
+        }
+        Some(super::native_projection::NativeCatalogChange::Removed) => {
+            Err(RuntimeStoreError::InvalidStateTransition)
+        }
+    }
+}
+
 pub(crate) fn accept_command(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
@@ -1262,6 +1288,14 @@ pub(crate) fn accept_command(
             "idempotency key must contain 1 to 1024 UTF-8 bytes",
         ));
     }
+    // 必须先于 owner/idempotency derivation、全局过期清理、容量探测和 replay
+    // fast path；NativeProjected 拒绝承诺整个 durable store 零副作用。
+    ensure_managed_command_admission(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        input.conversation_id,
+    )?;
     let owner_bytes = Zeroizing::new(canonical_owner_v1(&input.owner));
     let owner_token = state
         .key_bundle
@@ -1355,6 +1389,9 @@ pub(crate) fn accept_command(
     let transaction = state
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // 最终复核位于 BEGIN IMMEDIATE 内，且仍先于 replay 与任意 INSERT/UPDATE。
+    // Core early reject 或 crate 内 opaque AcceptCommand 都不能绕过此边界。
+    ensure_managed_command_admission(&transaction, key_bundle, database_id, input.conversation_id)?;
     if let Some((command_id, persisted_payload_token)) = transaction
         .query_row(
             "SELECT command_id, payload_token FROM commands WHERE idempotency_token = ?1",
@@ -4627,10 +4664,28 @@ pub(super) fn load_authenticated_conversation_snapshot_context(
     conversation_id: RuntimeId,
 ) -> Result<super::AuthenticatedConversationSnapshotContext, RuntimeStoreError> {
     let conversation = load_conversation(connection, key_bundle, database_id, conversation_id)?;
+    let origin = match super::native_projection::authenticated_native_catalog_change(
+        connection,
+        key_bundle,
+        database_id,
+        &conversation,
+    )? {
+        None => super::SnapshotOrigin::Managed,
+        Some(super::native_projection::NativeCatalogChange::Upsert) => {
+            super::SnapshotOrigin::NativeProjected
+        }
+        Some(super::native_projection::NativeCatalogChange::Removed) => {
+            return Err(RuntimeStoreError::InvalidStateTransition);
+        }
+    };
     Ok(super::AuthenticatedConversationSnapshotContext {
         conversation_id: conversation.conversation_id,
+        adapter_state_key: conversation.adapter_state_key,
         agent_kind: conversation.descriptor.agent_kind,
+        catalog_revision: conversation.catalog_revision,
+        command_high_water: conversation.command_high_water,
         event_high_water: conversation.event_high_water,
+        origin,
     })
 }
 

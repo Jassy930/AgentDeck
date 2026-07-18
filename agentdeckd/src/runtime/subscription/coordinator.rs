@@ -26,6 +26,7 @@ use super::super::connection::{
     AuthenticatedPrincipal, ConnectionError, ConnectionId, ConnectionRegistry,
 };
 use super::super::events::{RegisterStreamBarrier, RuntimeStreamTarget, WatchGeneration};
+use super::super::history_receipt::HistoryOnlyReceiptRegistry;
 use super::super::model::RuntimeStoreError;
 #[cfg(test)]
 use super::super::snapshot::SNAPSHOT_BUILD_MEMORY_BYTES;
@@ -101,6 +102,7 @@ struct CoordinatorInner {
     snapshot_build_budget: Arc<Semaphore>,
     snapshot_build_gate: Arc<AsyncMutex<()>>,
     catalog_snapshots: CatalogSnapshotProvider,
+    history_receipts: HistoryOnlyReceiptRegistry,
     jobs: Mutex<HashMap<(ConnectionId, RuntimeStreamTarget), JobEntry>>,
     catalog_jobs: Mutex<HashMap<(ConnectionId, u64), CatalogJobEntry>>,
     next_catalog_job_id: AtomicU64,
@@ -128,6 +130,7 @@ impl SubscriptionCoordinator {
         connections: ConnectionRegistry,
         snapshot_build_budget: Arc<Semaphore>,
         catalog_snapshots: CatalogSnapshotProvider,
+        history_receipts: HistoryOnlyReceiptRegistry,
     ) -> Self {
         Self {
             inner: Arc::new(CoordinatorInner {
@@ -138,6 +141,7 @@ impl SubscriptionCoordinator {
                 snapshot_build_budget,
                 snapshot_build_gate: Arc::new(AsyncMutex::new(())),
                 catalog_snapshots,
+                history_receipts,
                 jobs: Mutex::new(HashMap::new()),
                 catalog_jobs: Mutex::new(HashMap::new()),
                 next_catalog_job_id: AtomicU64::new(1),
@@ -813,6 +817,7 @@ impl PreparedSubscription {
                 snapshot_build_budget: pump_coordinator.inner.snapshot_build_budget.clone(),
                 snapshot_build_gate: pump_coordinator.inner.snapshot_build_gate.clone(),
                 catalog_snapshots: pump_coordinator.inner.catalog_snapshots.clone(),
+                history_receipts: pump_coordinator.inner.history_receipts.clone(),
                 principal: self.principal,
                 flushed_business_frame: false,
                 emit_subscription_receipt: self.emit_subscription_receipt,

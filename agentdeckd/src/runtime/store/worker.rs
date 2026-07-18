@@ -65,13 +65,13 @@ use super::publication::{
     FreezePublicationRequest, FrozenPublication, PublicationAcknowledgement, PublicationBarrierCut,
     PublicationScope, PublicationStreamRecord, RotatePublicationStreamRequest,
 };
-use super::snapshot::{StoredCatalogSnapshot, StoredConversationSnapshot};
+use super::snapshot::{ReadySnapshotReference, StoredCatalogSnapshot, StoredConversationSnapshot};
 use super::stream::{
     RuntimeBackfillPageCompletion, RuntimeBackfillPin, RuntimeBackfillPlan, RuntimeBackfillTarget,
     RuntimeCatalogBackfillPage, RuntimeEventBackfillPage, RuntimeSnapshotBuildPin,
 };
 use super::{
-    AuthenticatedConversationSnapshotContext, PreparedConversationSnapshotWrite,
+    AuthenticatedConversationSnapshotContext, PreparedConversationSnapshotWrite, SnapshotOrigin,
     StoreConversationSnapshotError, approval, journal, native_projection, sqlite, stream,
 };
 
@@ -105,6 +105,9 @@ const NATIVE_PROJECTION_ADAPTER_STATE_KEY_DOMAIN: &[u8] =
 #[allow(dead_code)] // C-f projector lifecycle 接线后由 production capability 使用。
 const NATIVE_PROJECTION_OBSERVATION_DOMAIN: &[u8] =
     b"agentdeck.runtime.native-projection.observation.v1";
+const NATIVE_HISTORY_COMMAND_ID_DOMAIN: &[u8] = b"agentdeck.runtime.native-history.command-id.v1";
+const NATIVE_HISTORY_ITEM_ID_DOMAIN: &[u8] = b"agentdeck.runtime.native-history.item-id.v1";
+const NATIVE_HISTORY_ENTITY_ID_DOMAIN: &[u8] = b"agentdeck.runtime.native-history.entity-id.v1";
 const MACHINE_TRUST_DOMAIN: &[u8] = b"agentdeck.runtime.machine-trust-domain.v1";
 
 type HmacSha256 = Hmac<Sha256>;
@@ -115,6 +118,16 @@ type HmacSha256 = Hmac<Sha256>;
 /// 裸密钥；最后一个 handle 销毁时固定 32-byte key 会清零。
 struct RuntimeIdentityDerivationCapability {
     key: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum NativeHistoryIdentityError {
+    #[error("native history identity input is invalid")]
+    InvalidInput,
+    #[error("native history identity derivation is unavailable")]
+    Unavailable,
+    #[error("native history identity derivation produced an invalid zero value")]
+    ZeroIdentity,
 }
 
 impl RuntimeIdentityDerivationCapability {
@@ -173,6 +186,64 @@ impl RuntimeIdentityDerivationCapability {
             ));
         }
         Ok(domain)
+    }
+
+    fn derive_native_history_command_id(
+        &self,
+        conversation_id: RuntimeId,
+        turn_key: &[u8; 32],
+    ) -> Result<RuntimeId, NativeHistoryIdentityError> {
+        let bytes = self.derive_native_history_id_bytes(
+            NATIVE_HISTORY_COMMAND_ID_DOMAIN,
+            conversation_id,
+            turn_key,
+        )?;
+        RuntimeId::from_bytes(RuntimeIdKind::Command, bytes)
+            .map_err(|_| NativeHistoryIdentityError::ZeroIdentity)
+    }
+
+    fn derive_native_history_item_ids(
+        &self,
+        conversation_id: RuntimeId,
+        item_key: &[u8; 32],
+    ) -> Result<([u8; 16], [u8; 16]), NativeHistoryIdentityError> {
+        let item_id = self.derive_native_history_id_bytes(
+            NATIVE_HISTORY_ITEM_ID_DOMAIN,
+            conversation_id,
+            item_key,
+        )?;
+        let entity_id = self.derive_native_history_id_bytes(
+            NATIVE_HISTORY_ENTITY_ID_DOMAIN,
+            conversation_id,
+            item_key,
+        )?;
+        Ok((item_id, entity_id))
+    }
+
+    fn derive_native_history_id_bytes(
+        &self,
+        domain: &[u8],
+        conversation_id: RuntimeId,
+        native_key: &[u8; 32],
+    ) -> Result<[u8; 16], NativeHistoryIdentityError> {
+        if conversation_id.kind() != RuntimeIdKind::Conversation || native_key == &[0; 32] {
+            return Err(NativeHistoryIdentityError::InvalidInput);
+        }
+        let mut mac = HmacSha256::new_from_slice(&self.key)
+            .map_err(|_| NativeHistoryIdentityError::Unavailable)?;
+        update_length_prefixed(&mut mac, domain)
+            .map_err(|_| NativeHistoryIdentityError::InvalidInput)?;
+        update_length_prefixed(&mut mac, conversation_id.as_bytes())
+            .map_err(|_| NativeHistoryIdentityError::InvalidInput)?;
+        update_length_prefixed(&mut mac, native_key)
+            .map_err(|_| NativeHistoryIdentityError::InvalidInput)?;
+        // 固定 attempt=0 是当前 byte-stable 格式的一部分。实际截断碰撞由完整
+        // read 的全域 alias 检查整批 fail-close，不能按集合顺序重试并改变旧 ID。
+        mac.update(&[0]);
+        let mut digest = mac.finalize().into_bytes();
+        let bytes = truncate_native_history_digest(&digest)?;
+        digest.zeroize();
+        Ok(bytes)
     }
 
     #[allow(dead_code)] // C-f verified source 接线后成为 production derivation path。
@@ -297,6 +368,71 @@ impl RuntimeIdentityDerivationCapability {
             attempts: MAX_RUNTIME_ID_COLLISION_ATTEMPTS,
         }
         .into())
+    }
+}
+
+fn truncate_native_history_digest(digest: &[u8]) -> Result<[u8; 16], NativeHistoryIdentityError> {
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(
+        digest
+            .get(..16)
+            .ok_or(NativeHistoryIdentityError::InvalidInput)?,
+    );
+    if bytes == [0; 16] {
+        Err(NativeHistoryIdentityError::ZeroIdentity)
+    } else {
+        Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod native_history_identity_tests {
+    use super::*;
+
+    fn conversation(seed: u8) -> RuntimeId {
+        RuntimeId::from_bytes(RuntimeIdKind::Conversation, [seed; 16])
+            .expect("nonzero conversation")
+    }
+
+    #[test]
+    fn storage_root_native_history_domains_are_stable_separate_and_conversation_bound() {
+        let capability = RuntimeIdentityDerivationCapability { key: [0xa7; 32] };
+        let first = capability
+            .derive_native_history_command_id(conversation(1), &[0x11; 32])
+            .expect("derive history command");
+        let repeated = capability
+            .derive_native_history_command_id(conversation(1), &[0x11; 32])
+            .expect("repeat history command");
+        let other_turn = capability
+            .derive_native_history_command_id(conversation(1), &[0x12; 32])
+            .expect("derive other turn");
+        let other_conversation = capability
+            .derive_native_history_command_id(conversation(2), &[0x11; 32])
+            .expect("derive other conversation");
+        let (item, entity) = capability
+            .derive_native_history_item_ids(conversation(1), &[0x11; 32])
+            .expect("derive item identities");
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, other_turn);
+        assert_ne!(first, other_conversation);
+        assert_ne!(*first.as_bytes(), item);
+        assert_ne!(*first.as_bytes(), entity);
+        assert_ne!(item, entity);
+    }
+
+    #[test]
+    fn native_history_zero_digest_and_invalid_input_fail_closed_without_debug_material() {
+        assert_eq!(
+            truncate_native_history_digest(&[0; 32]),
+            Err(NativeHistoryIdentityError::ZeroIdentity)
+        );
+        let capability = RuntimeIdentityDerivationCapability { key: [0xa8; 32] };
+        assert_eq!(
+            capability.derive_native_history_command_id(conversation(1), &[0; 32]),
+            Err(NativeHistoryIdentityError::InvalidInput)
+        );
+        assert!(!format!("{:?}", NativeHistoryIdentityError::ZeroIdentity).contains("a8"));
     }
 }
 
@@ -680,6 +816,24 @@ impl RuntimeStoreHandle {
 
     pub(in crate::runtime) fn machine_trust_domain(&self) -> Result<[u8; 32], RuntimeStoreError> {
         self.identity_derivation.derive_machine_trust_domain()
+    }
+
+    pub(in crate::runtime) fn derive_native_history_command_id(
+        &self,
+        conversation_id: RuntimeId,
+        turn_key: &[u8; 32],
+    ) -> Result<RuntimeId, NativeHistoryIdentityError> {
+        self.identity_derivation
+            .derive_native_history_command_id(conversation_id, turn_key)
+    }
+
+    pub(in crate::runtime) fn derive_native_history_item_ids(
+        &self,
+        conversation_id: RuntimeId,
+        item_key: &[u8; 32],
+    ) -> Result<([u8; 16], [u8; 16]), NativeHistoryIdentityError> {
+        self.identity_derivation
+            .derive_native_history_item_ids(conversation_id, item_key)
     }
 
     #[cfg(test)]
@@ -2869,7 +3023,24 @@ fn handle_read(
                 .clock
                 .now_ms()
                 .map_err(RuntimeStoreError::from)
-                .and_then(|now| stream::acquire_snapshot_build_pin(state, conversation_id, now));
+                .and_then(|now| {
+                    let context = journal::load_authenticated_conversation_snapshot_context(
+                        &state.connection,
+                        &state.key_bundle,
+                        state.database_id,
+                        conversation_id,
+                    )?;
+                    let pin = stream::acquire_snapshot_build_pin_at(
+                        &state.connection,
+                        conversation_id,
+                        context.event_high_water,
+                        now,
+                    )?;
+                    Ok(match context.origin {
+                        SnapshotOrigin::Managed => SnapshotBarrierSource::Build(pin),
+                        SnapshotOrigin::NativeProjected => SnapshotBarrierSource::Dynamic(pin),
+                    })
+                });
             send_snapshot_build_pin_reply(reply, result, state, commit_hub, cleanup_tx);
         }
         ReadCommand::ReleaseSnapshotBuildPin { pin, reply } => {
