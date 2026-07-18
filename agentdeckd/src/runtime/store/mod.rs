@@ -11,6 +11,7 @@ mod execution_event;
 pub mod identity;
 mod journal;
 mod metadata;
+mod native_projection;
 mod persisted_event;
 mod publication;
 pub mod queue;

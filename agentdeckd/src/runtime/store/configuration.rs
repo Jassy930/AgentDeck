@@ -400,6 +400,14 @@ impl AuthenticatedConversationState {
     pub(super) fn is_managed(&self) -> bool {
         self.origin_kind == "managed" && self.origin_namespace.is_none()
     }
+
+    pub(super) fn is_native_projected(&self) -> bool {
+        self.origin_kind == "nativeProjected" && self.origin_namespace.is_some()
+    }
+
+    pub(super) fn origin_namespace(&self) -> Option<&str> {
+        self.origin_namespace.as_deref()
+    }
 }
 
 fn fixed_token(value: Vec<u8>) -> Result<[u8; 32], RuntimeStoreError> {

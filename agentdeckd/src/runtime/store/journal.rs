@@ -78,6 +78,26 @@ struct RawAdapterStateBinding {
     sealed_state_reference: Vec<u8>,
 }
 
+pub(super) struct AuthenticatedAdapterStateBindingEvidence {
+    reference_token: [u8; 32],
+    sealed_reference_bytes: u64,
+}
+
+impl AuthenticatedAdapterStateBindingEvidence {
+    pub(super) const fn reference_token(&self) -> &[u8; 32] {
+        &self.reference_token
+    }
+
+    pub(super) const fn sealed_reference_bytes(&self) -> u64 {
+        self.sealed_reference_bytes
+    }
+}
+
+struct AuthenticatedAdapterStateBinding {
+    reference: SecretBytes,
+    evidence: AuthenticatedAdapterStateBindingEvidence,
+}
+
 pub(super) fn bind_adapter_state(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
@@ -327,13 +347,13 @@ fn load_conversation_for_adapter_state(
     Ok(conversation)
 }
 
-fn load_adapter_state_binding_for_conversation(
+fn load_authenticated_adapter_state_binding_for_conversation(
     connection: &Connection,
     key_bundle: &super::cipher::RuntimeKeyBundle,
     database_id: [u8; 16],
     namespace: AdapterStateNamespace,
     conversation: &ConversationRecord,
-) -> Result<Option<SecretBytes>, RuntimeStoreError> {
+) -> Result<Option<AuthenticatedAdapterStateBinding>, RuntimeStoreError> {
     let expected_key_token = key_bundle.blind_index(
         namespace.key_token_domain(),
         conversation.adapter_state_key.as_bytes(),
@@ -383,6 +403,8 @@ fn load_adapter_state_binding_for_conversation(
         conversation.conversation_id.as_bytes(),
         &raw.state_reference_token,
     );
+    let sealed_reference_bytes = u64::try_from(raw.sealed_state_reference.len())
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
     let reference = open(
         key_bundle,
         database_id,
@@ -402,7 +424,51 @@ fn load_adapter_state_binding_for_conversation(
     if raw.state_reference_token.as_slice() != expected_reference_token.as_bytes() {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
-    Ok(Some(reference))
+    let reference_token = raw
+        .state_reference_token
+        .try_into()
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    Ok(Some(AuthenticatedAdapterStateBinding {
+        reference,
+        evidence: AuthenticatedAdapterStateBindingEvidence {
+            reference_token,
+            sealed_reference_bytes,
+        },
+    }))
+}
+
+fn load_adapter_state_binding_for_conversation(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    namespace: AdapterStateNamespace,
+    conversation: &ConversationRecord,
+) -> Result<Option<SecretBytes>, RuntimeStoreError> {
+    Ok(load_authenticated_adapter_state_binding_for_conversation(
+        connection,
+        key_bundle,
+        database_id,
+        namespace,
+        conversation,
+    )?
+    .map(|binding| binding.reference))
+}
+
+pub(super) fn load_adapter_state_binding_evidence_for_conversation(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    namespace: AdapterStateNamespace,
+    conversation: &ConversationRecord,
+) -> Result<Option<AuthenticatedAdapterStateBindingEvidence>, RuntimeStoreError> {
+    Ok(load_authenticated_adapter_state_binding_for_conversation(
+        connection,
+        key_bundle,
+        database_id,
+        namespace,
+        conversation,
+    )?
+    .map(|binding| binding.evidence))
 }
 
 fn adapter_reference_token_exists(
@@ -5879,7 +5945,30 @@ pub(crate) fn validate_store_integrity(
     database_id: [u8; 16],
 ) -> Result<(), RuntimeStoreError> {
     let ledger = sqlite::load_runtime_ledger(connection, key_bundle, database_id)?;
-    validate_store_integrity_against_ledger(connection, key_bundle, database_id, &ledger, true)
+    validate_store_integrity_against_ledger(connection, key_bundle, database_id, &ledger, true)?;
+    match sqlite::runtime_schema_version(connection)? {
+        super::schema::RUNTIME_SCHEMA_VERSION_V6 => {
+            super::native_projection::validate_v6_integrity(
+                connection,
+                key_bundle,
+                database_id,
+                &ledger,
+            )
+        }
+        1..=super::schema::RUNTIME_SCHEMA_VERSION_V5
+            if ledger.native_projection_present_count == 0
+                && ledger.native_projection_tombstone_count == 0
+                && ledger.native_projection_retired_count == 0
+                && ledger.native_projection_physical_count == 0
+                && ledger.native_projection_charged_bytes == 0
+                && ledger.native_metadata_effect_fence_count == 0
+                && ledger.native_metadata_effect_unreleased_count == 0
+                && ledger.native_metadata_effect_released_count == 0 =>
+        {
+            Ok(())
+        }
+        _ => Err(RuntimeStoreError::UnknownOrCorruptSchema),
+    }
 }
 
 pub(crate) fn validate_store_integrity_v1(

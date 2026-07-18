@@ -179,15 +179,68 @@ struct RawMetadataMutationRow {
 
 struct AuthenticatedMetadataMutationRow {
     conversation_id: RuntimeId,
+    idempotency_token: [u8; 32],
     request_token: [u8; 32],
     expected_entry_revision: u64,
     applied_entry_revision: Option<u64>,
     applied_catalog_revision: Option<u64>,
     state: MetadataMutationState,
+    created_at_ms: u64,
     state_changed_at_ms: u64,
     charged_bytes: u64,
     request: DecodedMetadataRequest,
     outcome: Option<MetadataMutationTerminalOutcome>,
+}
+
+pub(super) struct AuthenticatedMetadataMutationParent {
+    conversation_id: RuntimeId,
+    idempotency_token: [u8; 32],
+    state: MetadataMutationState,
+    created_at_ms: u64,
+    state_changed_at_ms: u64,
+    is_rename: bool,
+}
+
+impl AuthenticatedMetadataMutationParent {
+    pub(super) const fn conversation_id(&self) -> RuntimeId {
+        self.conversation_id
+    }
+
+    pub(super) const fn idempotency_token(&self) -> &[u8; 32] {
+        &self.idempotency_token
+    }
+
+    pub(super) const fn created_at_ms(&self) -> u64 {
+        self.created_at_ms
+    }
+
+    pub(super) const fn state_changed_at_ms(&self) -> u64 {
+        self.state_changed_at_ms
+    }
+
+    pub(super) const fn is_rename(&self) -> bool {
+        self.is_rename
+    }
+
+    pub(super) const fn is_claimed(&self) -> bool {
+        matches!(self.state, MetadataMutationState::Claimed)
+    }
+
+    pub(super) const fn is_applying(&self) -> bool {
+        matches!(self.state, MetadataMutationState::Applying)
+    }
+
+    pub(super) const fn is_applied(&self) -> bool {
+        matches!(self.state, MetadataMutationState::Applied)
+    }
+
+    pub(super) const fn is_outcome_unknown(&self) -> bool {
+        matches!(self.state, MetadataMutationState::OutcomeUnknown)
+    }
+
+    pub(super) const fn is_failed(&self) -> bool {
+        matches!(self.state, MetadataMutationState::Failed)
+    }
 }
 
 #[derive(Clone)]
@@ -818,16 +871,47 @@ fn authenticate_metadata_row(
         .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
     Ok(AuthenticatedMetadataMutationRow {
         conversation_id,
+        idempotency_token,
         request_token,
         expected_entry_revision,
         applied_entry_revision,
         applied_catalog_revision,
         state,
+        created_at_ms,
         state_changed_at_ms,
         charged_bytes,
         request,
         outcome,
     })
+}
+
+pub(super) fn load_authenticated_metadata_mutation_parent(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    conversation_id: RuntimeId,
+    idempotency_token: &[u8; 32],
+) -> Result<Option<AuthenticatedMetadataMutationParent>, RuntimeStoreError> {
+    let Some(raw) = query_metadata_row_by_idempotency(connection, idempotency_token)? else {
+        return Ok(None);
+    };
+    let authenticated = authenticate_metadata_row(key_bundle, database_id, raw)?;
+    if authenticated.conversation_id != conversation_id
+        || authenticated.idempotency_token != *idempotency_token
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(Some(AuthenticatedMetadataMutationParent {
+        conversation_id: authenticated.conversation_id,
+        idempotency_token: authenticated.idempotency_token,
+        state: authenticated.state,
+        created_at_ms: authenticated.created_at_ms,
+        state_changed_at_ms: authenticated.state_changed_at_ms,
+        is_rename: matches!(
+            authenticated.request.mutation,
+            ConversationMetadataMutation::Rename { .. }
+        ),
+    }))
 }
 
 fn replay_outcome(
@@ -1586,6 +1670,290 @@ pub(super) fn validate_v5_integrity(
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "authenticated native metadata parent fixtures need every persisted time/state input"
+)]
+pub(super) fn insert_native_metadata_parent_fixture(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    conversation_id: RuntimeId,
+    idempotency_key: &str,
+    state: &str,
+    created_at_ms: u64,
+    state_changed_at_ms: u64,
+) -> Result<([u8; 32], u64), RuntimeStoreError> {
+    let state = MetadataMutationState::parse(state)?;
+    if !state.is_active() || state_changed_at_ms < created_at_ms {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    let prepared = prepare_metadata_mutation_request(UpdateManagedConversationMetadata {
+        conversation_id,
+        owner: IdempotencyOwner::Local {
+            machine_trust_domain: [0xB1; 32],
+            uid: 501,
+            client_installation_id: [0xB2; 16],
+        },
+        idempotency_key: idempotency_key.to_owned(),
+        expected_entry_revision: 0,
+        mutation: ConversationMetadataMutation::rename(Some("native fixture".to_owned()))
+            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+    })?;
+    let request = decode_metadata_request(prepared.request_plaintext.as_ref())?;
+    let owner_token = blind_token(
+        key_bundle,
+        METADATA_OWNER_DOMAIN,
+        request.owner_bytes.as_ref(),
+    )?;
+    let idempotency_token = metadata_idempotency_token(
+        key_bundle,
+        conversation_id,
+        request.owner_bytes.as_ref(),
+        request.idempotency_key.as_ref(),
+    )?;
+    let request_token = blind_token(
+        key_bundle,
+        METADATA_REQUEST_DOMAIN,
+        prepared.request_plaintext.as_ref(),
+    )?;
+    let primary_key = metadata_primary_key(conversation_id, &idempotency_token);
+    let sealed_request = seal_metadata_value(
+        key_bundle,
+        database_id,
+        &primary_key,
+        SEALED_REQUEST_COLUMN,
+        prepared.request_plaintext.as_ref(),
+        MAX_METADATA_MUTATION_REQUEST_BYTES,
+    )?;
+    let logical_request_bytes = u64::try_from(prepared.request_plaintext.len())
+        .map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    let sealed_request_bytes =
+        u64::try_from(sealed_request.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    let charged_outcome_bytes =
+        u64::try_from(MAX_METADATA_MUTATION_OUTCOME_BYTES + ROW_BLOB_V1_OVERHEAD_LEN)
+            .map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    let expected_entry_revision = encode_sequence(0);
+    let metadata_token = metadata_row_token(
+        key_bundle,
+        conversation_id,
+        &owner_token,
+        &idempotency_token,
+        &request_token,
+        &expected_entry_revision,
+        None,
+        None,
+        state,
+        logical_request_bytes,
+        0,
+        charged_outcome_bytes,
+        created_at_ms,
+        state_changed_at_ms,
+        sealed_request_bytes,
+        None,
+    )?;
+    connection.execute(
+        "INSERT INTO metadata_mutation_ledger (
+             conversation_id, owner_token, idempotency_token, request_token,
+             expected_entry_revision, applied_entry_revision, applied_catalog_revision,
+             state, logical_request_bytes, logical_outcome_bytes, charged_outcome_bytes,
+             created_at_ms, state_changed_at_ms, metadata_token, sealed_request, sealed_outcome
+         ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, NULL)",
+        params![
+            &conversation_id.as_bytes()[..],
+            &owner_token[..],
+            &idempotency_token[..],
+            &request_token[..],
+            expected_entry_revision,
+            state.as_str(),
+            i64::try_from(logical_request_bytes).map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+            i64::try_from(charged_outcome_bytes).map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+            i64::try_from(created_at_ms).map_err(|_| RuntimeStoreError::TimeOutOfRange)?,
+            i64::try_from(state_changed_at_ms).map_err(|_| RuntimeStoreError::TimeOutOfRange)?,
+            &metadata_token[..],
+            sealed_request,
+        ],
+    )?;
+    Ok((
+        idempotency_token,
+        sealed_request_bytes
+            .checked_add(charged_outcome_bytes)
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?,
+    ))
+}
+
+#[cfg(test)]
+pub(super) fn rewrite_native_metadata_parent_active_state_fixture(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    idempotency_token: &[u8; 32],
+    state: &str,
+    state_changed_at_ms: u64,
+) -> Result<(), RuntimeStoreError> {
+    let state = MetadataMutationState::parse(state)?;
+    if !state.is_active() {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    let raw = query_metadata_row_by_idempotency(connection, idempotency_token)?
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let authenticated = authenticate_metadata_row(key_bundle, database_id, raw)?;
+    if authenticated.idempotency_token != *idempotency_token
+        || state_changed_at_ms < authenticated.created_at_ms
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let raw = query_metadata_row_by_idempotency(connection, idempotency_token)?
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let conversation_id = RuntimeId::from_bytes(
+        RuntimeIdKind::Conversation,
+        raw.conversation_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+    )?;
+    let owner_token = fixed_token(raw.owner_token)?;
+    let persisted_idempotency_token = fixed_token(raw.idempotency_token)?;
+    let request_token = fixed_token(raw.request_token)?;
+    let logical_request_bytes = nonnegative(raw.logical_request_bytes)?;
+    let charged_outcome_bytes = nonnegative(raw.charged_outcome_bytes)?;
+    let created_at_ms = nonnegative(raw.created_at_ms)?;
+    let sealed_request_bytes = u64::try_from(raw.sealed_request.len())
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let token = metadata_row_token(
+        key_bundle,
+        conversation_id,
+        &owner_token,
+        &persisted_idempotency_token,
+        &request_token,
+        &raw.expected_entry_revision,
+        None,
+        None,
+        state,
+        logical_request_bytes,
+        0,
+        charged_outcome_bytes,
+        created_at_ms,
+        state_changed_at_ms,
+        sealed_request_bytes,
+        None,
+    )?;
+    if connection.execute(
+        "UPDATE metadata_mutation_ledger
+         SET state = ?1, state_changed_at_ms = ?2, metadata_token = ?3
+         WHERE idempotency_token = ?4",
+        params![
+            state.as_str(),
+            i64::try_from(state_changed_at_ms).map_err(|_| RuntimeStoreError::TimeOutOfRange)?,
+            &token[..],
+            &idempotency_token[..],
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn rewrite_native_metadata_parent_failed_fixture(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    idempotency_token: &[u8; 32],
+    state_changed_at_ms: u64,
+) -> Result<(u64, u64), RuntimeStoreError> {
+    let raw = query_metadata_row_by_idempotency(connection, idempotency_token)?
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let authenticated = authenticate_metadata_row(key_bundle, database_id, raw)?;
+    if authenticated.idempotency_token != *idempotency_token
+        || state_changed_at_ms < authenticated.created_at_ms
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let raw = query_metadata_row_by_idempotency(connection, idempotency_token)?
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let conversation_id = RuntimeId::from_bytes(
+        RuntimeIdKind::Conversation,
+        raw.conversation_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+    )?;
+    let owner_token = fixed_token(raw.owner_token)?;
+    let persisted_idempotency_token = fixed_token(raw.idempotency_token)?;
+    let request_token = fixed_token(raw.request_token)?;
+    let logical_request_bytes = nonnegative(raw.logical_request_bytes)?;
+    let old_charged_outcome_bytes = nonnegative(raw.charged_outcome_bytes)?;
+    let created_at_ms = nonnegative(raw.created_at_ms)?;
+    let sealed_request_bytes = u64::try_from(raw.sealed_request.len())
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let outcome = MetadataMutationTerminalOutcome::Failed {
+        failure: RuntimeFailure::new(
+            agentdeck_protocol::runtime::failure::DAEMON_RUNTIME_EXECUTION_FAILED,
+            "native metadata effect failed",
+        ),
+    };
+    let outcome_plaintext = encode_terminal_outcome(&outcome)?;
+    let primary_key = metadata_primary_key(conversation_id, idempotency_token);
+    let sealed_outcome = seal_metadata_value(
+        key_bundle,
+        database_id,
+        &primary_key,
+        SEALED_OUTCOME_COLUMN,
+        outcome_plaintext.as_ref(),
+        MAX_METADATA_MUTATION_OUTCOME_BYTES,
+    )?;
+    let logical_outcome_bytes = u64::try_from(outcome_plaintext.len())
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let charged_outcome_bytes = u64::try_from(sealed_outcome.len())
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let token = metadata_row_token(
+        key_bundle,
+        conversation_id,
+        &owner_token,
+        &persisted_idempotency_token,
+        &request_token,
+        &raw.expected_entry_revision,
+        None,
+        None,
+        MetadataMutationState::Failed,
+        logical_request_bytes,
+        logical_outcome_bytes,
+        charged_outcome_bytes,
+        created_at_ms,
+        state_changed_at_ms,
+        sealed_request_bytes,
+        Some(charged_outcome_bytes),
+    )?;
+    if connection.execute(
+        "UPDATE metadata_mutation_ledger
+         SET state = 'failed', logical_outcome_bytes = ?1, charged_outcome_bytes = ?2,
+             state_changed_at_ms = ?3, metadata_token = ?4, sealed_outcome = ?5
+         WHERE idempotency_token = ?6",
+        params![
+            i64::try_from(logical_outcome_bytes).map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+            i64::try_from(charged_outcome_bytes).map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+            i64::try_from(state_changed_at_ms).map_err(|_| RuntimeStoreError::TimeOutOfRange)?,
+            &token[..],
+            sealed_outcome,
+            &idempotency_token[..],
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok((
+        sealed_request_bytes
+            .checked_add(old_charged_outcome_bytes)
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?,
+        sealed_request_bytes
+            .checked_add(charged_outcome_bytes)
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?,
+    ))
 }
 
 #[cfg(test)]

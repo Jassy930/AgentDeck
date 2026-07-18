@@ -2680,25 +2680,57 @@ mod migration_tests {
     }
 
     #[tokio::test]
-    async fn current_v6_rejects_nonempty_unaudited_sidecars_without_rewriting_artifacts() {
+    async fn current_v6_rejects_offline_committed_wal_sidecar_tamper_without_rewriting_artifacts() {
         for table in ["native_projection_state", "native_metadata_effect_fences"] {
             let root = TestRoot::new(&format!("v6-nonempty-{table}"));
             let keys = MemoryKeyStore::new();
+            let database =
+                normalize_storage_path(&root.database()).expect("normalize current v6 path");
             let store = RuntimeStoreHandle::open(
-                RuntimeStoreConfig::new(root.database()),
-                load_or_create_storage_kek(&keys, &root.database()).expect("create v6 KEK"),
+                RuntimeStoreConfig::new(database.clone()),
+                load_or_create_storage_kek(&keys, &database).expect("create v6 KEK"),
             )
             .await
             .expect("create current v6 fixture");
             store.shutdown().await.expect("shutdown current v6 fixture");
 
-            let connection = Connection::open(root.database()).expect("open v6 sidecar fixture");
-            connection
+            let checkpoint = open_read_write(&database).expect("open current v6 checkpoint handle");
+            let (busy, log_frames, checkpointed_frames): (i64, i64, i64) = checkpoint
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .expect("checkpoint current v6 baseline");
+            assert_eq!(busy, 0, "current v6 baseline checkpoint must not be busy");
+            assert_eq!(log_frames, checkpointed_frames);
+            drop(checkpoint);
+            for suffix in ["-wal", "-shm"] {
+                let path = sidecar(&database, suffix);
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("remove current v6 sidecar {}: {error}", path.display()),
+                }
+            }
+
+            let shadow_database = database.with_file_name(format!("v6-{table}-shadow.db"));
+            fs::copy(&database, &shadow_database).expect("clone current v6 main for WAL tamper");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&shadow_database, fs::Permissions::from_mode(DATABASE_MODE))
+                    .expect("secure current v6 WAL shadow");
+            }
+            let writer = open_read_write(&shadow_database).expect("open current v6 shadow writer");
+            writer
+                .pragma_update(None, "wal_autocheckpoint", 0_i64)
+                .expect("disable current v6 shadow autocheckpoint");
+            configure_persistent_wal(&writer).expect("persist current v6 shadow WAL");
+            writer
                 .pragma_update(None, "foreign_keys", false)
-                .expect("disable FK only for unaudited sidecar fixture");
+                .expect("disable FK only for unaudited WAL fixture");
             match table {
                 "native_projection_state" => {
-                    connection
+                    writer
                         .execute(
                             "INSERT INTO native_projection_state (
                                  conversation_id, origin_namespace, state_reference_token,
@@ -2721,7 +2753,7 @@ mod migration_tests {
                         .expect("insert unaudited projection row");
                 }
                 "native_metadata_effect_fences" => {
-                    connection
+                    writer
                         .execute(
                             "INSERT INTO native_metadata_effect_fences (
                                  conversation_id, idempotency_token, daemon_boot_id,
@@ -2730,7 +2762,7 @@ mod migration_tests {
                                  release_token_commitment, logical_fence_bytes,
                                  metadata_token, sealed_fence
                              ) VALUES (
-                                 ?1, ?2, ?3, ?4, ?5, 71, 72,
+                                 ?1, ?2, ?3, ?4, ?5, 71, 71,
                                  '00000000000000000073', NULL, NULL, 126, ?6, zeroblob(166)
                              )",
                             params![
@@ -2746,19 +2778,40 @@ mod migration_tests {
                 }
                 _ => unreachable!("fixed sidecar fixture"),
             }
-            drop(connection);
-            let artifacts_before = artifact_evidence(&root.database());
+            drop(writer);
+
+            let shadow_wal = sidecar(&shadow_database, "-wal");
+            let target_wal = sidecar(&database, "-wal");
+            let copied = fs::copy(&shadow_wal, &target_wal)
+                .expect("install closed-writer committed current v6 tamper WAL");
+            assert!(copied > 0, "current v6 tamper WAL must be non-empty");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&target_wal, fs::Permissions::from_mode(DATABASE_MODE))
+                    .expect("secure installed current v6 tamper WAL");
+            }
+
+            let artifacts_before = artifact_evidence(&database);
+            let identity_before =
+                capture_store_identity(&database).expect("capture current v6 tamper identity");
             let error = RuntimeStoreHandle::open(
-                RuntimeStoreConfig::new(root.database()),
-                load_or_create_storage_kek(&keys, &root.database()).expect("reload v6 KEK"),
+                RuntimeStoreConfig::new(database.clone()),
+                load_or_create_storage_kek(&keys, &database).expect("reload v6 KEK"),
             )
             .await
             .expect_err("nonempty unaudited v6 sidecar must fail closed");
             assert!(matches!(error, RuntimeStoreError::UnknownOrCorruptSchema));
             assert_eq!(
-                artifact_evidence(&root.database()),
+                artifact_evidence(&database),
                 artifacts_before,
                 "rejected {table} row must not rewrite runtime artifacts"
+            );
+            assert_eq!(
+                capture_store_identity(&database)
+                    .expect("recapture rejected current v6 tamper identity"),
+                identity_before,
+                "rejected {table} row must preserve runtime artifact identity"
             );
         }
     }
@@ -4099,7 +4152,6 @@ fn open_fresh(
         configure_connection(&connection, config.busy_timeout_ms, true)?;
         validate_store_files(&storage_path)?;
         super::journal::validate_store_integrity(&connection, &key_bundle, database_id)?;
-        validate_v6_sidecars_empty(&connection)?;
         snapshot(&connection, config.busy_timeout_ms)?;
         sync_parent_directory(&storage_path)?;
         super::stream::initialize_ephemeral_state(&connection)?;
@@ -4166,7 +4218,6 @@ where
     configure_connection(&connection, config.busy_timeout_ms, true)?;
     validate_store_files(&storage_path)?;
     super::journal::validate_store_integrity(&connection, &key_bundle, current.database_id)?;
-    validate_v6_sidecars_empty(&connection)?;
     snapshot(&connection, config.busy_timeout_ms)?;
     super::stream::initialize_ephemeral_state(&connection)?;
     Ok(RuntimeSqlite {
@@ -4495,7 +4546,6 @@ fn open_legacy(
     }
     validate_store_files(&storage_path)?;
     super::journal::validate_store_integrity(&connection, &key_bundle, migrated.database_id)?;
-    validate_v6_sidecars_empty(&connection)?;
     snapshot(&connection, config.busy_timeout_ms)?;
     super::stream::initialize_ephemeral_state(&connection)?;
     Ok(RuntimeSqlite {
@@ -4563,11 +4613,7 @@ fn inspect_schema(path: &Path, storage_kek: &StorageKek) -> Result<SchemaState, 
                     // committed state。必须在碰原库 RW handle 前认证 configuration state/pin：
                     // 否则 corrupt current v6 虽会 fail-close，RW connection drop 仍可能把
                     // 原 WAL checkpoint 进 main，破坏“拒绝即零改写”的证据边界。
-                    validate_current_configuration_before_read_write_open(
-                        connection,
-                        storage_kek,
-                        &current,
-                    )?;
+                    validate_current_before_read_write_open(connection, storage_kek, &current)?;
                     SchemaState::Current(current, identity.clone())
                 }
                 _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
@@ -4616,7 +4662,7 @@ fn validate_legacy_v5_before_read_write_open(
     Ok(())
 }
 
-fn validate_current_configuration_before_read_write_open(
+fn validate_current_before_read_write_open(
     connection: &Connection,
     storage_kek: &StorageKek,
     current: &MetaRow,
@@ -4632,31 +4678,7 @@ fn validate_current_configuration_before_read_write_open(
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
     verify_runtime_ledger_token(&key_bundle, current)?;
-    validate_v6_sidecars_empty(connection)?;
-    super::configuration::validate_v5_integrity(
-        connection,
-        &key_bundle,
-        current.database_id,
-        &current.ledger,
-    )?;
-    Ok(())
-}
-
-/// C-b1→C-b2 的过渡 fail-close gate。
-///
-/// v6 schema 已公开两张 sidecar，但 authenticated streaming audit 尚未接入；在
-/// C-b2 替换本函数前，任何非空 sidecar 都必须在原库 RW open 前拒绝。
-fn validate_v6_sidecars_empty(connection: &Connection) -> Result<(), RuntimeStoreError> {
-    let (projection_present, effect_fence_present): (i64, i64) = connection.query_row(
-        "SELECT
-             EXISTS(SELECT 1 FROM native_projection_state),
-             EXISTS(SELECT 1 FROM native_metadata_effect_fences)",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    if projection_present != 0 || effect_fence_present != 0 {
-        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
-    }
+    super::journal::validate_store_integrity(connection, &key_bundle, current.database_id)?;
     Ok(())
 }
 
@@ -4670,6 +4692,14 @@ fn read_schema_header(connection: &Connection) -> Result<(String, u32), RuntimeS
         .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
     let version = u32::try_from(version).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
     Ok((family, version))
+}
+
+pub(crate) fn runtime_schema_version(connection: &Connection) -> Result<u32, RuntimeStoreError> {
+    let (family, version) = read_schema_header(connection)?;
+    if family != RUNTIME_SCHEMA_FAMILY {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(version)
 }
 
 fn read_and_validate_legacy_v1_schema(

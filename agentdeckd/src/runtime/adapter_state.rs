@@ -12,6 +12,21 @@ pub(super) enum AdapterStateNamespace {
 }
 
 impl AdapterStateNamespace {
+    pub(super) const fn origin_namespace(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::ClaudeCode => "claude-code",
+        }
+    }
+
+    pub(super) fn from_origin_namespace(value: &str) -> Option<Self> {
+        match value {
+            "codex" => Some(Self::Codex),
+            "claude-code" => Some(Self::ClaudeCode),
+            _ => None,
+        }
+    }
+
     pub(super) const fn table(self) -> &'static str {
         match self {
             Self::Codex => "codex_adapter_state",
