@@ -56,6 +56,7 @@ mod native;
 #[cfg(test)]
 mod native_tests;
 
+pub(crate) use native::CompletedNativeScan;
 pub(in crate::claude_code) use native::{NativeTranscriptRefV1, safe_legacy_session_id};
 
 use native::{

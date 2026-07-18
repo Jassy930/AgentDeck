@@ -14,6 +14,8 @@ mod metadata;
 mod native_projection;
 #[cfg(test)]
 mod native_projection_import_tests;
+#[cfg(test)]
+mod native_projection_lifecycle_tests;
 mod persisted_event;
 mod publication;
 pub mod queue;

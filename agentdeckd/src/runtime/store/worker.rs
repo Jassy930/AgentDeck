@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -313,6 +313,15 @@ fn update_length_prefixed(mac: &mut HmacSha256, value: &[u8]) -> Result<(), Runt
     Ok(())
 }
 
+fn advance_native_projection_scan_epoch(source: &AtomicU64) -> Result<u64, RuntimeStoreError> {
+    source
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1)
+        })
+        .map(|previous| previous + 1)
+        .map_err(|_| RuntimeStoreError::InvalidStateTransition)
+}
+
 pub(crate) struct StoreOpenLease;
 
 pub(crate) fn claim_store_path(path: &Path) -> Result<Arc<StoreOpenLease>, RuntimeStoreError> {
@@ -345,6 +354,7 @@ pub struct RuntimeStoreHandle {
     read_crypto: RuntimeReadCryptoCapability,
     database_id: [u8; 16],
     identity_derivation: Arc<RuntimeIdentityDerivationCapability>,
+    native_projection_scan_epoch: Arc<AtomicU64>,
     shutdown_timeout: Duration,
 }
 
@@ -420,6 +430,122 @@ impl ClaudeCodeNativeProjectionStore {
         self.store
             .import_native_projection(AdapterStateNamespace::ClaudeCode, input)
             .await
+    }
+
+    /// C-f 只能在消费 `CompletedNativeScan` witness 后调用本入口；裸 generation
+    /// 不进入 reconciliation plan/apply API。
+    pub(crate) async fn accept_completed_scan(
+        &self,
+        completed: crate::claude_code::history::CompletedNativeScan,
+    ) -> Result<Arc<native_projection::CompletedNativeProjectionGeneration>, RuntimeStoreError>
+    {
+        let scan_generation = completed.into_generation();
+        let epoch_source = self.store.native_projection_scan_epoch.clone();
+        dispatch(
+            &self.store.read_tx,
+            &self.store.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::AcceptCompletedNativeProjectionScan {
+                namespace: AdapterStateNamespace::ClaudeCode,
+                scan_generation,
+                epoch_source,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub(crate) async fn plan_completed_page(
+        &self,
+        completed: Arc<native_projection::CompletedNativeProjectionGeneration>,
+        cursor: Option<native_projection::NativeProjectionReconcileCursor>,
+    ) -> Result<native_projection::NativeProjectionReconcilePlan, RuntimeStoreError> {
+        completed.ensure_epoch_source(&self.store.native_projection_scan_epoch)?;
+        dispatch(
+            &self.store.read_tx,
+            &self.store.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::PlanNativeProjectionReconciliation {
+                completed,
+                cursor,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub(crate) async fn apply_completed_page(
+        &self,
+        plan: native_projection::NativeProjectionReconcilePlan,
+        dispositions: Vec<native_projection::NativeProjectionCandidateDisposition>,
+    ) -> Result<native_projection::ReconcileNativeProjectionOutcome, RuntimeStoreError> {
+        plan.ensure_epoch_owner(&self.store.native_projection_scan_epoch)?;
+        let disposition_capacity = dispositions
+            .capacity()
+            .checked_mul(size_of::<
+                native_projection::NativeProjectionCandidateDisposition,
+            >())
+            .ok_or(RuntimeStoreError::PayloadTooLarge)?;
+        let frozen_disposition_bytes = dispositions
+            .len()
+            .checked_mul(size_of::<
+                native_projection::NativeProjectionCandidateDisposition,
+            >())
+            .ok_or(RuntimeStoreError::PayloadTooLarge)?;
+        let charge = memory_charge(
+            size_of::<NormalCommand>(),
+            &[
+                plan.retained_capacity()?,
+                disposition_capacity,
+                frozen_disposition_bytes,
+            ],
+        )?;
+        dispatch_with_budget(
+            &self.store.normal_tx,
+            &self.store.normal_budget,
+            &self.store.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::ReconcileNativeProjection {
+                plan,
+                dispositions,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub(crate) async fn plan_retirement_page(
+        &self,
+        cursor: Option<native_projection::NativeProjectionRetirementCursor>,
+    ) -> Result<native_projection::NativeProjectionRetirementPlan, RuntimeStoreError> {
+        dispatch(
+            &self.store.read_tx,
+            &self.store.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::PlanNativeProjectionRetirement {
+                namespace: AdapterStateNamespace::ClaudeCode,
+                cursor,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub(crate) async fn apply_retirement_page(
+        &self,
+        plan: native_projection::NativeProjectionRetirementPlan,
+    ) -> Result<native_projection::RetireNativeProjectionOutcome, RuntimeStoreError> {
+        let charge = memory_charge(size_of::<NormalCommand>(), &[plan.retained_capacity()?])?;
+        dispatch_with_budget(
+            &self.store.normal_tx,
+            &self.store.normal_budget,
+            &self.store.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::RetireNativeProjection { plan, reply },
+        )
+        .await?
     }
 }
 
@@ -497,6 +623,7 @@ impl RuntimeStoreHandle {
         let identity_derivation = Arc::new(RuntimeIdentityDerivationCapability::from_storage_kek(
             &storage_kek,
         )?);
+        let native_projection_scan_epoch = Arc::new(AtomicU64::new(0));
         #[cfg(test)]
         let test_fd_permit = test_admission::acquire().await?;
         let (normal_tx, normal_rx) = mpsc::channel(config.command_capacity);
@@ -543,6 +670,7 @@ impl RuntimeStoreHandle {
                 read_crypto: ready.read_crypto,
                 database_id: ready.database_id,
                 identity_derivation,
+                native_projection_scan_epoch,
                 shutdown_timeout,
             }),
             Ok(Err(error)) => Err(error),
@@ -653,7 +781,6 @@ impl RuntimeStoreHandle {
                 "native projection reference must contain 20 to 523 bytes",
             ));
         }
-
         let descriptor_bytes = journal::canonical_conversation_descriptor(&descriptor)?;
         validate_maximum(descriptor_bytes.len(), MAX_CONVERSATION_DESCRIPTOR_BYTES)?;
         let default_configuration = configuration::prepare_native_projector_configuration(
@@ -688,7 +815,11 @@ impl RuntimeStoreHandle {
             &self.lifecycle,
             RuntimeStoreLane::Normal,
             charge,
-            |reply| NormalCommand::ImportNativeProjection { prepared, reply },
+            |reply| NormalCommand::ImportNativeProjection {
+                prepared,
+                epoch_source: self.native_projection_scan_epoch.clone(),
+                reply,
+            },
         )
         .await?
     }
@@ -1562,8 +1693,22 @@ enum NormalCommand {
     #[allow(dead_code)] // C-f projector lifecycle 接线后由 production handle 构造。
     ImportNativeProjection {
         prepared: native_projection::PreparedNativeProjectionImport,
+        epoch_source: Arc<AtomicU64>,
         reply: oneshot::Sender<
             Result<native_projection::ImportNativeProjectionOutcome, RuntimeStoreError>,
+        >,
+    },
+    ReconcileNativeProjection {
+        plan: native_projection::NativeProjectionReconcilePlan,
+        dispositions: Vec<native_projection::NativeProjectionCandidateDisposition>,
+        reply: oneshot::Sender<
+            Result<native_projection::ReconcileNativeProjectionOutcome, RuntimeStoreError>,
+        >,
+    },
+    RetireNativeProjection {
+        plan: native_projection::NativeProjectionRetirementPlan,
+        reply: oneshot::Sender<
+            Result<native_projection::RetireNativeProjectionOutcome, RuntimeStoreError>,
         >,
     },
     CreateConversation {
@@ -1716,6 +1861,28 @@ enum SafetyCommand {
 enum ReadCommand {
     Inspect {
         reply: oneshot::Sender<Result<RuntimeStoreSnapshot, RuntimeStoreError>>,
+    },
+    AcceptCompletedNativeProjectionScan {
+        namespace: AdapterStateNamespace,
+        scan_generation: [u8; 16],
+        epoch_source: Arc<AtomicU64>,
+        reply: oneshot::Sender<
+            Result<Arc<native_projection::CompletedNativeProjectionGeneration>, RuntimeStoreError>,
+        >,
+    },
+    PlanNativeProjectionReconciliation {
+        completed: Arc<native_projection::CompletedNativeProjectionGeneration>,
+        cursor: Option<native_projection::NativeProjectionReconcileCursor>,
+        reply: oneshot::Sender<
+            Result<native_projection::NativeProjectionReconcilePlan, RuntimeStoreError>,
+        >,
+    },
+    PlanNativeProjectionRetirement {
+        namespace: AdapterStateNamespace,
+        cursor: Option<native_projection::NativeProjectionRetirementCursor>,
+        reply: oneshot::Sender<
+            Result<native_projection::NativeProjectionRetirementPlan, RuntimeStoreError>,
+        >,
     },
     BeginRecoveryScan {
         reply: oneshot::Sender<Result<RecoveryCursor, RuntimeStoreError>>,
@@ -2030,6 +2197,12 @@ fn handle_normal(
             NormalCommand::ImportNativeProjection { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
+            NormalCommand::ReconcileNativeProjection { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::RetireNativeProjection { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
             NormalCommand::CreateConversation { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
@@ -2109,10 +2282,40 @@ fn handle_normal(
         return;
     }
     match command {
-        NormalCommand::ImportNativeProjection { prepared, reply } => {
+        NormalCommand::ImportNativeProjection {
+            prepared,
+            epoch_source,
+            reply,
+        } => {
+            let mut effects = CommandStreamEffects::default();
+            // 与 plan/apply 共享 dedicated worker 线性化顺序；先执行的 import 使旧
+            // completed generation 失效，先执行的 apply 则可安全先提交。
+            let result = advance_native_projection_scan_epoch(&epoch_source).and_then(|_| {
+                native_projection::import_native_projection(state, config, prepared, &mut effects)
+            });
+            let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
+            let _ = reply.send(result);
+        }
+        NormalCommand::ReconcileNativeProjection {
+            plan,
+            dispositions,
+            reply,
+        } => {
+            let mut effects = CommandStreamEffects::default();
+            let result = native_projection::reconcile_native_projection_page(
+                state,
+                config,
+                plan,
+                dispositions,
+                &mut effects,
+            );
+            let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
+            let _ = reply.send(result);
+        }
+        NormalCommand::RetireNativeProjection { plan, reply } => {
             let mut effects = CommandStreamEffects::default();
             let result =
-                native_projection::import_native_projection(state, config, prepared, &mut effects);
+                native_projection::retire_native_projection_page(state, config, plan, &mut effects);
             let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
             let _ = reply.send(result);
         }
@@ -2492,6 +2695,85 @@ fn handle_read(
                 .fault_injector
                 .before_operation(RuntimeStoreOperation::Inspect)
                 .and_then(|()| sqlite::snapshot(&state.connection, config.busy_timeout_ms));
+            let _ = reply.send(result);
+        }
+        ReadCommand::AcceptCompletedNativeProjectionScan {
+            namespace,
+            scan_generation,
+            epoch_source,
+            reply,
+        } => {
+            let result = if state.recovery_scan.is_some() {
+                Err(RuntimeStoreError::RecoveryInProgress)
+            } else {
+                advance_native_projection_scan_epoch(&epoch_source).and_then(|scan_epoch| {
+                    config
+                        .clock
+                        .now_ms()
+                        .map_err(RuntimeStoreError::from)
+                        .and_then(|completed_at_ms| {
+                            native_projection::completed_native_projection_generation(
+                                state.database_id,
+                                namespace,
+                                scan_generation,
+                                completed_at_ms,
+                                scan_epoch,
+                                epoch_source,
+                            )
+                            .map(Arc::new)
+                        })
+                })
+            };
+            let _ = reply.send(result);
+        }
+        ReadCommand::PlanNativeProjectionReconciliation {
+            completed,
+            cursor,
+            reply,
+        } => {
+            let result = if state.recovery_scan.is_some() {
+                Err(RuntimeStoreError::RecoveryInProgress)
+            } else {
+                config
+                    .clock
+                    .now_ms()
+                    .map_err(RuntimeStoreError::from)
+                    .and_then(|planned_at_ms| {
+                        native_projection::plan_native_projection_reconciliation_page(
+                            &state.connection,
+                            &state.key_bundle,
+                            state.database_id,
+                            completed.as_ref(),
+                            cursor,
+                            planned_at_ms,
+                        )
+                    })
+            };
+            let _ = reply.send(result);
+        }
+        ReadCommand::PlanNativeProjectionRetirement {
+            namespace,
+            cursor,
+            reply,
+        } => {
+            let result = if state.recovery_scan.is_some() {
+                Err(RuntimeStoreError::RecoveryInProgress)
+            } else {
+                let cutoff = cursor.map_or_else(
+                    || config.clock.now_ms().map_err(RuntimeStoreError::from),
+                    |value| Ok(value.cutoff_ms()),
+                );
+                cutoff.and_then(|cutoff_ms| {
+                    native_projection::plan_native_projection_retirement_page(
+                        &state.connection,
+                        &state.key_bundle,
+                        state.database_id,
+                        namespace,
+                        cutoff_ms,
+                        cursor,
+                    )
+                })
+            };
             let _ = reply.send(result);
         }
         ReadCommand::BeginRecoveryScan { reply } => {

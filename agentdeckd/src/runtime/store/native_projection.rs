@@ -4,6 +4,8 @@
 //! effect spec 同样只作为有界 opaque bytes 参与认证。
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use agentdeck_protocol::runtime::ConversationConfiguration;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -42,6 +44,8 @@ const MAX_EFFECT_SPEC_BYTES: usize = 16 * 1024;
 const MAX_EFFECT_FENCE_PLAINTEXT_BYTES: usize = 17_532;
 const MAX_METADATA_EFFECT_FENCE_ROWS: u64 = 65_536;
 const MAX_NATIVE_REFERENCE_CHARGED_BYTES: u64 = 16 * 1024 * 1024;
+const NATIVE_PROJECTION_TOMBSTONE_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+const MAX_NATIVE_LIFECYCLE_PAGE_ITEMS: usize = 500;
 #[allow(dead_code)] // C-f projector lifecycle 接线后由 production capability 强制。
 pub(super) const MAX_NATIVE_PRIVATE_REFERENCE_BYTES: usize = 523;
 #[allow(dead_code)] // C-f projector lifecycle 接线后由 production capability 强制。
@@ -130,6 +134,290 @@ impl PreparedNativeProjectionImport {
             })
             .ok_or(RuntimeStoreError::PayloadTooLarge)
     }
+}
+
+/// 只由完整耗尽且所有 candidate 都已 ACK 的 native scanner 换取。
+///
+/// 字段私有且不实现 Clone/Serialize；partial、yield、error、drop/restart 路径无法仅凭
+/// 裸 generation 调用删除型 reconciliation。
+pub(crate) struct CompletedNativeProjectionGeneration {
+    database_id: [u8; 16],
+    namespace: AdapterStateNamespace,
+    scan_generation: [u8; 16],
+    completed_at_ms: u64,
+    scan_epoch: u64,
+    epoch_source: Arc<AtomicU64>,
+    progress: Mutex<CompletedGenerationProgress>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CompletedGenerationProgress {
+    started: bool,
+    consumed: bool,
+    next_cursor: Option<NativeProjectionReconcileCursor>,
+}
+
+impl std::fmt::Debug for CompletedNativeProjectionGeneration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CompletedNativeProjectionGeneration")
+            .field("database_id", &"[REDACTED]")
+            .field("namespace", &self.namespace)
+            .field("scan_generation", &"[REDACTED]")
+            .field("completed_at_ms", &self.completed_at_ms)
+            .finish()
+    }
+}
+
+impl CompletedNativeProjectionGeneration {
+    pub(super) fn ensure_epoch_source(
+        &self,
+        current: &Arc<AtomicU64>,
+    ) -> Result<(), RuntimeStoreError> {
+        if Arc::ptr_eq(&self.epoch_source, current)
+            && current.load(Ordering::Acquire) == self.scan_epoch
+        {
+            Ok(())
+        } else {
+            Err(RuntimeStoreError::InvalidStateTransition)
+        }
+    }
+}
+
+pub(super) fn completed_native_projection_generation(
+    database_id: [u8; 16],
+    namespace: AdapterStateNamespace,
+    scan_generation: [u8; 16],
+    completed_at_ms: u64,
+    scan_epoch: u64,
+    epoch_source: Arc<AtomicU64>,
+) -> Result<CompletedNativeProjectionGeneration, RuntimeStoreError> {
+    if scan_generation == [0; 16]
+        || scan_epoch == 0
+        || epoch_source.load(Ordering::Acquire) != scan_epoch
+    {
+        return Err(RuntimeStoreError::InvalidConfig(
+            "completed native projection generation must not be zero",
+        ));
+    }
+    Ok(CompletedNativeProjectionGeneration {
+        database_id,
+        namespace,
+        scan_generation,
+        completed_at_ms,
+        scan_epoch,
+        epoch_source,
+        progress: Mutex::new(CompletedGenerationProgress::default()),
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeProjectionReconcileCursor {
+    database_id: [u8; 16],
+    namespace: AdapterStateNamespace,
+    scan_generation: [u8; 16],
+    completed_at_ms: u64,
+    scan_epoch: u64,
+    after_conversation_id: RuntimeId,
+}
+
+#[derive(Clone)]
+struct NativeProjectionReconcileCandidate {
+    projection: AuthenticatedProjectionRow,
+}
+
+/// 完整 generation 下一个 authenticated absent keyset page。
+///
+/// plan 保存 exact pre-state，因此 before-COMMIT 可零写重试，after-COMMIT response
+/// 丢失也只能读回同一批 post-state，不能静默选中下一批。
+#[derive(Clone)]
+pub(crate) struct NativeProjectionReconcilePlan {
+    database_id: [u8; 16],
+    namespace: AdapterStateNamespace,
+    scan_generation: [u8; 16],
+    completed_at_ms: u64,
+    scan_epoch: u64,
+    planned_at_ms: u64,
+    base_catalog_high_water: Option<String>,
+    candidates: Vec<NativeProjectionReconcileCandidate>,
+    next_cursor: Option<NativeProjectionReconcileCursor>,
+    epoch_source: Arc<AtomicU64>,
+    dispositions: Arc<Mutex<Option<Vec<NativeProjectionCandidateDisposition>>>>,
+}
+
+impl std::fmt::Debug for NativeProjectionReconcilePlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeProjectionReconcilePlan")
+            .field("database_id", &"[REDACTED]")
+            .field("namespace", &self.namespace)
+            .field("scan_generation", &"[REDACTED]")
+            .field("planned_at_ms", &self.planned_at_ms)
+            .field("candidate_count", &self.candidates.len())
+            .field("has_next", &self.next_cursor.is_some())
+            .finish()
+    }
+}
+
+impl NativeProjectionReconcilePlan {
+    #[allow(dead_code)] // C-f actor registry 用 authenticated IDs 获取 quiescent/busy disposition。
+    pub(crate) fn candidate_ids(&self) -> impl ExactSizeIterator<Item = RuntimeId> + '_ {
+        self.candidates
+            .iter()
+            .map(|candidate| candidate.projection.conversation_id)
+    }
+
+    #[allow(dead_code)] // C-f projector lifecycle 按 opaque keyset cursor 续跑完整 generation。
+    pub(crate) const fn next_cursor(&self) -> Option<NativeProjectionReconcileCursor> {
+        self.next_cursor
+    }
+
+    pub(super) fn retained_capacity(&self) -> Result<usize, RuntimeStoreError> {
+        self.candidates
+            .capacity()
+            .checked_mul(std::mem::size_of::<NativeProjectionReconcileCandidate>())
+            .ok_or(RuntimeStoreError::PayloadTooLarge)
+    }
+
+    pub(super) fn bind_dispositions(
+        &self,
+        dispositions: &[NativeProjectionCandidateDisposition],
+    ) -> Result<(), RuntimeStoreError> {
+        let mut frozen = self
+            .dispositions
+            .lock()
+            .map_err(|_| RuntimeStoreError::WorkerStopped)?;
+        match frozen.as_ref() {
+            Some(existing) if existing == dispositions => Ok(()),
+            Some(_) => Err(RuntimeStoreError::InvalidStateTransition),
+            None => {
+                *frozen = Some(dispositions.to_vec());
+                Ok(())
+            }
+        }
+    }
+
+    pub(super) fn ensure_epoch_owner(
+        &self,
+        current: &Arc<AtomicU64>,
+    ) -> Result<(), RuntimeStoreError> {
+        if Arc::ptr_eq(&self.epoch_source, current) {
+            Ok(())
+        } else {
+            Err(RuntimeStoreError::InvalidStateTransition)
+        }
+    }
+
+    fn ensure_current_epoch(&self) -> Result<(), RuntimeStoreError> {
+        if self.planned_at_ms >= self.completed_at_ms
+            && self.epoch_source.load(Ordering::Acquire) == self.scan_epoch
+        {
+            Ok(())
+        } else {
+            Err(RuntimeStoreError::InvalidStateTransition)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // C-f actor control lane 接线后构造 exact quiescent/busy proof。
+pub(crate) enum NativeProjectionCandidateDisposition {
+    Quiescent(RuntimeId),
+    Busy(RuntimeId),
+}
+
+impl NativeProjectionCandidateDisposition {
+    const fn conversation_id(self) -> RuntimeId {
+        match self {
+            Self::Quiescent(conversation_id) | Self::Busy(conversation_id) => conversation_id,
+        }
+    }
+
+    const fn is_quiescent(self) -> bool {
+        matches!(self, Self::Quiescent(_))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ReconcileNativeProjectionOutcome {
+    Applied {
+        removed: usize,
+        deferred_busy: usize,
+        next_cursor: Option<NativeProjectionReconcileCursor>,
+    },
+    Replayed {
+        removed: usize,
+        deferred_busy: usize,
+        next_cursor: Option<NativeProjectionReconcileCursor>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeProjectionRetirementCursor {
+    database_id: [u8; 16],
+    namespace: AdapterStateNamespace,
+    cutoff_ms: u64,
+    after_retain_until_ms: u64,
+    after_conversation_id: RuntimeId,
+}
+
+#[derive(Clone)]
+struct NativeProjectionRetirementCandidate {
+    projection: AuthenticatedProjectionRow,
+}
+
+#[derive(Clone)]
+pub(crate) struct NativeProjectionRetirementPlan {
+    database_id: [u8; 16],
+    namespace: AdapterStateNamespace,
+    cutoff_ms: u64,
+    candidates: Vec<NativeProjectionRetirementCandidate>,
+    next_cursor: Option<NativeProjectionRetirementCursor>,
+}
+
+impl std::fmt::Debug for NativeProjectionRetirementPlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeProjectionRetirementPlan")
+            .field("database_id", &"[REDACTED]")
+            .field("namespace", &self.namespace)
+            .field("cutoff_ms", &self.cutoff_ms)
+            .field("candidate_count", &self.candidates.len())
+            .field("has_next", &self.next_cursor.is_some())
+            .finish()
+    }
+}
+
+impl NativeProjectionRetirementPlan {
+    #[allow(dead_code)] // C-f bounded cleanup loop 按 opaque cursor 继续下一批。
+    pub(crate) const fn next_cursor(&self) -> Option<NativeProjectionRetirementCursor> {
+        self.next_cursor
+    }
+
+    pub(super) fn retained_capacity(&self) -> Result<usize, RuntimeStoreError> {
+        self.candidates
+            .capacity()
+            .checked_mul(std::mem::size_of::<NativeProjectionRetirementCandidate>())
+            .ok_or(RuntimeStoreError::PayloadTooLarge)
+    }
+}
+
+impl NativeProjectionRetirementCursor {
+    pub(super) const fn cutoff_ms(self) -> u64 {
+        self.cutoff_ms
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RetireNativeProjectionOutcome {
+    Applied {
+        retired: usize,
+        next_cursor: Option<NativeProjectionRetirementCursor>,
+    },
+    Replayed {
+        retired: usize,
+        next_cursor: Option<NativeProjectionRetirementCursor>,
+    },
 }
 
 pub(crate) fn import_native_projection(
@@ -1148,6 +1436,853 @@ fn load_projection_by_reference_token(
         .optional()?;
     raw.map(|row| authenticate_projection_row(key_bundle, row))
         .transpose()
+}
+
+fn load_projection_by_conversation_id(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    conversation_id: RuntimeId,
+) -> Result<Option<AuthenticatedProjectionRow>, RuntimeStoreError> {
+    let raw = connection
+        .query_row(
+            "SELECT conversation_id, origin_namespace, state_reference_token,
+                    projection_state, scan_generation, observation_token,
+                    projection_catalog_revision, reconciled_at_ms, state_changed_at_ms,
+                    private_binding_retain_until_ms, charged_reference_bytes, metadata_token
+             FROM native_projection_state WHERE conversation_id = ?1",
+            [&conversation_id.as_bytes()[..]],
+            raw_projection_row,
+        )
+        .optional()?;
+    raw.map(|row| authenticate_projection_row(key_bundle, row))
+        .transpose()
+}
+
+pub(super) fn plan_native_projection_reconciliation_page(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    completed: &CompletedNativeProjectionGeneration,
+    cursor: Option<NativeProjectionReconcileCursor>,
+    planned_at_ms: u64,
+) -> Result<NativeProjectionReconcilePlan, RuntimeStoreError> {
+    if completed.database_id != database_id
+        || planned_at_ms < completed.completed_at_ms
+        || completed.epoch_source.load(Ordering::Acquire) != completed.scan_epoch
+    {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    let mut progress = completed
+        .progress
+        .lock()
+        .map_err(|_| RuntimeStoreError::WorkerStopped)?;
+    if progress.consumed
+        || (!progress.started && cursor.is_some())
+        || (progress.started && progress.next_cursor != cursor)
+    {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    let after = match cursor {
+        Some(cursor)
+            if cursor.database_id == database_id
+                && cursor.namespace == completed.namespace
+                && cursor.scan_generation == completed.scan_generation
+                && cursor.completed_at_ms == completed.completed_at_ms
+                && cursor.scan_epoch == completed.scan_epoch =>
+        {
+            Some(cursor.after_conversation_id)
+        }
+        Some(_) => return Err(RuntimeStoreError::InvalidStateTransition),
+        None => None,
+    };
+    let ledger = super::sqlite::load_runtime_ledger(connection, key_bundle, database_id)?;
+    let mut statement = connection.prepare(
+        "SELECT conversation_id, origin_namespace, state_reference_token,
+                projection_state, scan_generation, observation_token,
+                projection_catalog_revision, reconciled_at_ms, state_changed_at_ms,
+                private_binding_retain_until_ms, charged_reference_bytes, metadata_token
+         FROM native_projection_state
+         WHERE origin_namespace = ?1 AND projection_state = 'present'
+           AND scan_generation <> ?2
+           AND reconciled_at_ms < ?3
+           AND (?4 IS NULL OR conversation_id > ?4)
+         ORDER BY conversation_id LIMIT ?5",
+    )?;
+    let rows = statement.query_map(
+        params![
+            completed.namespace.origin_namespace(),
+            &completed.scan_generation[..],
+            sqlite_time(completed.completed_at_ms)?,
+            after.map(|value| value.as_bytes().to_vec()),
+            i64::try_from(MAX_NATIVE_LIFECYCLE_PAGE_ITEMS)
+                .map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+        ],
+        raw_projection_row,
+    )?;
+    let mut candidates = Vec::with_capacity(MAX_NATIVE_LIFECYCLE_PAGE_ITEMS);
+    for row in rows {
+        let projection = authenticate_projection_row(key_bundle, row?)?;
+        if projection.origin_namespace != completed.namespace.origin_namespace()
+            || projection.state != ProjectionState::Present
+            || projection.scan_generation == completed.scan_generation
+            || projection.reconciled_at_ms >= completed.completed_at_ms
+        {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        let conversation = super::journal::load_conversation(
+            connection,
+            key_bundle,
+            database_id,
+            projection.conversation_id,
+        )?;
+        if authenticated_native_catalog_change(connection, key_bundle, database_id, &conversation)?
+            != Some(NativeCatalogChange::Upsert)
+        {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        candidates.push(NativeProjectionReconcileCandidate { projection });
+    }
+    let next_cursor = (candidates.len() == MAX_NATIVE_LIFECYCLE_PAGE_ITEMS).then(|| {
+        NativeProjectionReconcileCursor {
+            database_id,
+            namespace: completed.namespace,
+            scan_generation: completed.scan_generation,
+            completed_at_ms: completed.completed_at_ms,
+            scan_epoch: completed.scan_epoch,
+            after_conversation_id: candidates
+                .last()
+                .expect("full reconciliation page has a last candidate")
+                .projection
+                .conversation_id,
+        }
+    });
+    progress.started = true;
+    progress.next_cursor = next_cursor;
+    progress.consumed = next_cursor.is_none();
+    Ok(NativeProjectionReconcilePlan {
+        database_id,
+        namespace: completed.namespace,
+        scan_generation: completed.scan_generation,
+        completed_at_ms: completed.completed_at_ms,
+        scan_epoch: completed.scan_epoch,
+        planned_at_ms,
+        base_catalog_high_water: ledger.catalog_high_water,
+        candidates,
+        next_cursor,
+        epoch_source: completed.epoch_source.clone(),
+        dispositions: Arc::new(Mutex::new(None)),
+    })
+}
+
+pub(super) fn plan_native_projection_retirement_page(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    namespace: AdapterStateNamespace,
+    cutoff_ms: u64,
+    cursor: Option<NativeProjectionRetirementCursor>,
+) -> Result<NativeProjectionRetirementPlan, RuntimeStoreError> {
+    let after = match cursor {
+        Some(cursor)
+            if cursor.database_id == database_id
+                && cursor.namespace == namespace
+                && cursor.cutoff_ms == cutoff_ms =>
+        {
+            Some((cursor.after_retain_until_ms, cursor.after_conversation_id))
+        }
+        Some(_) => return Err(RuntimeStoreError::InvalidStateTransition),
+        None => None,
+    };
+    let after_retain = after.map(|(retain, _)| sqlite_time(retain)).transpose()?;
+    let after_conversation = after.map(|(_, conversation)| conversation.as_bytes().to_vec());
+    let mut statement = connection.prepare(
+        "SELECT conversation_id, origin_namespace, state_reference_token,
+                projection_state, scan_generation, observation_token,
+                projection_catalog_revision, reconciled_at_ms, state_changed_at_ms,
+                private_binding_retain_until_ms, charged_reference_bytes, metadata_token
+         FROM native_projection_state
+         WHERE origin_namespace = ?1 AND projection_state = 'tombstone'
+           AND private_binding_retain_until_ms <= ?2
+           AND (?3 IS NULL OR private_binding_retain_until_ms > ?3
+                OR (private_binding_retain_until_ms = ?3 AND conversation_id > ?4))
+         ORDER BY private_binding_retain_until_ms, conversation_id LIMIT ?5",
+    )?;
+    let rows = statement.query_map(
+        params![
+            namespace.origin_namespace(),
+            sqlite_time(cutoff_ms)?,
+            after_retain,
+            after_conversation,
+            i64::try_from(MAX_NATIVE_LIFECYCLE_PAGE_ITEMS)
+                .map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+        ],
+        raw_projection_row,
+    )?;
+    let mut candidates = Vec::with_capacity(MAX_NATIVE_LIFECYCLE_PAGE_ITEMS);
+    for row in rows {
+        let projection = authenticate_projection_row(key_bundle, row?)?;
+        let retain_until_ms = projection
+            .retain_until_ms
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        if projection.origin_namespace != namespace.origin_namespace()
+            || projection.state != ProjectionState::Tombstone
+            || retain_until_ms > cutoff_ms
+        {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        let conversation = super::journal::load_conversation(
+            connection,
+            key_bundle,
+            database_id,
+            projection.conversation_id,
+        )?;
+        if authenticated_native_catalog_change(connection, key_bundle, database_id, &conversation)?
+            != Some(NativeCatalogChange::Removed)
+        {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        candidates.push(NativeProjectionRetirementCandidate { projection });
+    }
+    let next_cursor = (candidates.len() == MAX_NATIVE_LIFECYCLE_PAGE_ITEMS).then(|| {
+        let last = candidates
+            .last()
+            .expect("full retirement page has a last candidate");
+        NativeProjectionRetirementCursor {
+            database_id,
+            namespace,
+            cutoff_ms,
+            after_retain_until_ms: last
+                .projection
+                .retain_until_ms
+                .expect("tombstone candidate has retention deadline"),
+            after_conversation_id: last.projection.conversation_id,
+        }
+    });
+    Ok(NativeProjectionRetirementPlan {
+        database_id,
+        namespace,
+        cutoff_ms,
+        candidates,
+        next_cursor,
+    })
+}
+
+pub(crate) fn reconcile_native_projection_page(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    plan: NativeProjectionReconcilePlan,
+    dispositions: Vec<NativeProjectionCandidateDisposition>,
+    effects: &mut CommandStreamEffects,
+) -> Result<ReconcileNativeProjectionOutcome, RuntimeStoreError> {
+    if plan.database_id != state.database_id
+        || dispositions.len() != plan.candidates.len()
+        || dispositions
+            .iter()
+            .zip(&plan.candidates)
+            .any(|(disposition, candidate)| {
+                disposition.conversation_id() != candidate.projection.conversation_id
+            })
+    {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    plan.bind_dispositions(&dispositions)?;
+    let quiescent_count = dispositions
+        .iter()
+        .filter(|disposition| disposition.is_quiescent())
+        .count();
+    let deferred_busy = dispositions.len().saturating_sub(quiescent_count);
+    let expected_revisions = reconcile_expected_revisions(&plan, &dispositions)?;
+    match classify_reconcile_plan(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        &plan,
+        &dispositions,
+        &expected_revisions,
+    )? {
+        ExactLifecyclePlanState::Post => {
+            return Ok(ReconcileNativeProjectionOutcome::Replayed {
+                removed: quiescent_count,
+                deferred_busy,
+                next_cursor: plan.next_cursor,
+            });
+        }
+        ExactLifecyclePlanState::Pre => {}
+    }
+    if quiescent_count == 0 {
+        return Ok(ReconcileNativeProjectionOutcome::Applied {
+            removed: 0,
+            deferred_busy,
+            next_cursor: plan.next_cursor,
+        });
+    }
+    plan.ensure_current_epoch()?;
+    let projected_write_bytes = super::journal::projected_write_bytes(&[quiescent_count
+        .checked_mul(16 * 1024)
+        .ok_or(RuntimeStoreError::PayloadTooLarge)?])?;
+    super::sqlite::admit_ordinary_write(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        &state.storage_path,
+        &mut state.admission_state,
+        config.capacity_probe.as_ref(),
+        projected_write_bytes,
+        SafetyReserveProjection::Current,
+    )?;
+    let database_id = state.database_id;
+    let key_bundle = &state.key_bundle;
+    let transaction = state
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let ledger = super::sqlite::load_runtime_ledger(&transaction, key_bundle, database_id)?;
+    if classify_reconcile_plan(
+        &transaction,
+        key_bundle,
+        database_id,
+        &plan,
+        &dispositions,
+        &expected_revisions,
+    )? != ExactLifecyclePlanState::Pre
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    if ledger.catalog_high_water != plan.base_catalog_high_water {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    validate_nonlive_reconciliation_capacity(&ledger, quiescent_count)?;
+    validate_catalog_clock(&transaction, key_bundle, database_id, plan.planned_at_ms)?;
+    let retain_until_ms = plan
+        .planned_at_ms
+        .checked_add(NATIVE_PROJECTION_TOMBSTONE_RETENTION_MS)
+        .ok_or(RuntimeStoreError::TimeOutOfRange)?;
+    let mut next_ledger = ledger.clone();
+    for ((candidate, disposition), expected_revision) in plan
+        .candidates
+        .iter()
+        .zip(&dispositions)
+        .zip(expected_revisions)
+    {
+        if !disposition.is_quiescent() {
+            continue;
+        }
+        if !super::journal::native_projection_conversation_is_durably_quiescent(
+            &transaction,
+            key_bundle,
+            database_id,
+            candidate.projection.conversation_id,
+        )? {
+            return Err(RuntimeStoreError::InvalidStateTransition);
+        }
+        let expected_revision =
+            expected_revision.ok_or(RuntimeStoreError::InvalidStateTransition)?;
+        let conversation = super::journal::load_conversation(
+            &transaction,
+            key_bundle,
+            database_id,
+            candidate.projection.conversation_id,
+        )?;
+        if conversation.catalog_revision != candidate.projection.projection_catalog_revision {
+            return Err(RuntimeStoreError::SchemaInspectionRaced);
+        }
+        let conversation = super::journal::advance_catalog_revision_preserving_descriptor(
+            &transaction,
+            key_bundle,
+            database_id,
+            &conversation,
+            expected_revision,
+        )?;
+        let revision = super::sequence::encode_sequence(expected_revision);
+        let token = projection_metadata_token(
+            key_bundle,
+            conversation.conversation_id,
+            plan.namespace.origin_namespace(),
+            &candidate.projection.state_reference_token,
+            ProjectionState::Tombstone,
+            &plan.scan_generation,
+            &candidate.projection.observation_token,
+            &revision,
+            plan.planned_at_ms,
+            plan.planned_at_ms,
+            Some(retain_until_ms),
+            candidate.projection.charged_reference_bytes,
+        )?;
+        if transaction.execute(
+            "UPDATE native_projection_state
+             SET projection_state = 'tombstone', scan_generation = ?1,
+                 projection_catalog_revision = ?2, reconciled_at_ms = ?3,
+                 state_changed_at_ms = ?3, private_binding_retain_until_ms = ?4,
+                 metadata_token = ?5
+             WHERE conversation_id = ?6 AND metadata_token = ?7",
+            params![
+                &plan.scan_generation[..],
+                &revision,
+                sqlite_time(plan.planned_at_ms)?,
+                sqlite_time(retain_until_ms)?,
+                &token[..],
+                &conversation.conversation_id.as_bytes()[..],
+                &candidate.projection.metadata_token[..],
+            ],
+        )? != 1
+        {
+            return Err(RuntimeStoreError::SchemaInspectionRaced);
+        }
+        next_ledger.catalog_high_water = Some(revision);
+        next_ledger.native_projection_present_count = next_ledger
+            .native_projection_present_count
+            .checked_sub(1)
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        next_ledger.native_projection_tombstone_count =
+            checked_add(next_ledger.native_projection_tombstone_count, 1)?;
+    }
+    let pending_targets = super::sqlite::update_runtime_ledger_with_trim_clock(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next_ledger,
+        plan.planned_at_ms,
+    )?;
+    config
+        .fault_injector
+        .before_operation(RuntimeStoreOperation::ReconcileNativeProjectionBeforeCommit)?;
+    let commit_result = super::sqlite::commit_transaction(
+        transaction,
+        RuntimeCommitOperation::ReconcileNativeProjection,
+    );
+    effects.record_commit_result(pending_targets, &commit_result);
+    commit_result?;
+    super::sqlite::latch_post_commit_capacity(state, config);
+    native_projection_lifecycle_after_commit(
+        config,
+        RuntimeStoreOperation::ReconcileNativeProjectionAfterCommit,
+        RuntimeCommitOperation::ReconcileNativeProjection,
+    )?;
+    Ok(ReconcileNativeProjectionOutcome::Applied {
+        removed: quiescent_count,
+        deferred_busy,
+        next_cursor: plan.next_cursor,
+    })
+}
+
+fn validate_nonlive_reconciliation_capacity(
+    ledger: &RuntimeLedger,
+    additions: usize,
+) -> Result<(), RuntimeStoreError> {
+    let nonlive = ledger
+        .native_projection_tombstone_count
+        .checked_add(ledger.native_projection_retired_count)
+        .and_then(|value| value.checked_add(u64::try_from(additions).ok()?))
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if nonlive > MAX_NATIVE_NONLIVE_IDENTITIES {
+        Err(RuntimeStoreError::NativeProjectionLimit {
+            scope: NativeProjectionLimitScope::NonliveIdentities,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExactLifecyclePlanState {
+    Pre,
+    Post,
+}
+
+fn classify_reconcile_plan(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    plan: &NativeProjectionReconcilePlan,
+    dispositions: &[NativeProjectionCandidateDisposition],
+    expected_revisions: &[Option<u64>],
+) -> Result<ExactLifecyclePlanState, RuntimeStoreError> {
+    let quiescent_count = dispositions
+        .iter()
+        .filter(|disposition| disposition.is_quiescent())
+        .count();
+    let mut pre_state_count = 0_usize;
+    let mut post_state_count = 0_usize;
+    for ((candidate, disposition), expected_revision) in plan
+        .candidates
+        .iter()
+        .zip(dispositions)
+        .zip(expected_revisions)
+    {
+        let current = load_projection_by_conversation_id(
+            connection,
+            key_bundle,
+            candidate.projection.conversation_id,
+        )?
+        .ok_or(RuntimeStoreError::SchemaInspectionRaced)?;
+        let conversation = super::journal::load_conversation(
+            connection,
+            key_bundle,
+            database_id,
+            candidate.projection.conversation_id,
+        )?;
+        if !disposition.is_quiescent() {
+            if current != candidate.projection
+                || authenticated_native_catalog_change(
+                    connection,
+                    key_bundle,
+                    database_id,
+                    &conversation,
+                )? != Some(NativeCatalogChange::Upsert)
+            {
+                return Err(RuntimeStoreError::SchemaInspectionRaced);
+            }
+            continue;
+        }
+        let expected_revision =
+            expected_revision.ok_or(RuntimeStoreError::InvalidStateTransition)?;
+        if current == candidate.projection {
+            if plan.planned_at_ms < candidate.projection.reconciled_at_ms {
+                return Err(RuntimeStoreError::ClockRegressed {
+                    persisted_ms: candidate.projection.reconciled_at_ms,
+                    observed_ms: plan.planned_at_ms,
+                });
+            }
+            if authenticated_native_catalog_change(
+                connection,
+                key_bundle,
+                database_id,
+                &conversation,
+            )? != Some(NativeCatalogChange::Upsert)
+            {
+                return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+            }
+            pre_state_count = pre_state_count
+                .checked_add(1)
+                .ok_or(RuntimeStoreError::PayloadTooLarge)?;
+        } else if projection_matches_reconcile_post_state(
+            &current,
+            &candidate.projection,
+            plan,
+            expected_revision,
+        )? {
+            if authenticated_native_catalog_change(
+                connection,
+                key_bundle,
+                database_id,
+                &conversation,
+            )? != Some(NativeCatalogChange::Removed)
+            {
+                return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+            }
+            post_state_count = post_state_count
+                .checked_add(1)
+                .ok_or(RuntimeStoreError::PayloadTooLarge)?;
+        } else {
+            return Err(RuntimeStoreError::SchemaInspectionRaced);
+        }
+    }
+    if quiescent_count == 0 {
+        Ok(ExactLifecyclePlanState::Pre)
+    } else if post_state_count == quiescent_count {
+        Ok(ExactLifecyclePlanState::Post)
+    } else if pre_state_count == quiescent_count && post_state_count == 0 {
+        Ok(ExactLifecyclePlanState::Pre)
+    } else {
+        Err(RuntimeStoreError::SchemaInspectionRaced)
+    }
+}
+
+fn reconcile_expected_revisions(
+    plan: &NativeProjectionReconcilePlan,
+    dispositions: &[NativeProjectionCandidateDisposition],
+) -> Result<Vec<Option<u64>>, RuntimeStoreError> {
+    let mut previous = plan.base_catalog_high_water.clone();
+    let mut revisions = Vec::with_capacity(dispositions.len());
+    for disposition in dispositions {
+        if disposition.is_quiescent() {
+            let next = next_sequence(SequenceScope::CatalogRevision, previous.as_deref())?;
+            previous = Some(next.encoded);
+            revisions.push(Some(next.value));
+        } else {
+            revisions.push(None);
+        }
+    }
+    Ok(revisions)
+}
+
+fn projection_matches_reconcile_post_state(
+    current: &AuthenticatedProjectionRow,
+    previous: &AuthenticatedProjectionRow,
+    plan: &NativeProjectionReconcilePlan,
+    expected_revision: u64,
+) -> Result<bool, RuntimeStoreError> {
+    let retain_until_ms = plan
+        .planned_at_ms
+        .checked_add(NATIVE_PROJECTION_TOMBSTONE_RETENTION_MS)
+        .ok_or(RuntimeStoreError::TimeOutOfRange)?;
+    Ok(current.conversation_id == previous.conversation_id
+        && current.origin_namespace == previous.origin_namespace
+        && current.state_reference_token == previous.state_reference_token
+        && current.state == ProjectionState::Tombstone
+        && current.scan_generation == plan.scan_generation
+        && current.observation_token == previous.observation_token
+        && current.projection_catalog_revision == expected_revision
+        && current.reconciled_at_ms == plan.planned_at_ms
+        && current.state_changed_at_ms == plan.planned_at_ms
+        && current.retain_until_ms == Some(retain_until_ms)
+        && current.charged_reference_bytes == previous.charged_reference_bytes)
+}
+
+pub(crate) fn retire_native_projection_page(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    plan: NativeProjectionRetirementPlan,
+    effects: &mut CommandStreamEffects,
+) -> Result<RetireNativeProjectionOutcome, RuntimeStoreError> {
+    if plan.database_id != state.database_id {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    if plan.candidates.is_empty() {
+        return Ok(RetireNativeProjectionOutcome::Applied {
+            retired: 0,
+            next_cursor: plan.next_cursor,
+        });
+    }
+    if classify_retirement_plan(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        &plan,
+    )? == ExactLifecyclePlanState::Post
+    {
+        return Ok(RetireNativeProjectionOutcome::Replayed {
+            retired: plan.candidates.len(),
+            next_cursor: plan.next_cursor,
+        });
+    }
+    let projected_write_bytes = super::journal::projected_write_bytes(&[plan
+        .candidates
+        .len()
+        .checked_mul(8 * 1024)
+        .ok_or(RuntimeStoreError::PayloadTooLarge)?])?;
+    super::sqlite::admit_ordinary_write(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        &state.storage_path,
+        &mut state.admission_state,
+        config.capacity_probe.as_ref(),
+        projected_write_bytes,
+        SafetyReserveProjection::Current,
+    )?;
+    let database_id = state.database_id;
+    let key_bundle = &state.key_bundle;
+    let transaction = state
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let ledger = super::sqlite::load_runtime_ledger(&transaction, key_bundle, database_id)?;
+    if classify_retirement_plan(&transaction, key_bundle, database_id, &plan)?
+        != ExactLifecyclePlanState::Pre
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    let mut next_ledger = ledger.clone();
+    for candidate in &plan.candidates {
+        let retain_until_ms = candidate
+            .projection
+            .retain_until_ms
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        if retain_until_ms > plan.cutoff_ms {
+            return Err(RuntimeStoreError::InvalidStateTransition);
+        }
+        let binding = super::journal::delete_adapter_state_binding(
+            &transaction,
+            key_bundle,
+            database_id,
+            plan.namespace,
+            candidate.projection.conversation_id,
+            &candidate.projection.state_reference_token,
+        )?;
+        if binding.sealed_reference_bytes() != candidate.projection.charged_reference_bytes {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        let revision =
+            super::sequence::encode_sequence(candidate.projection.projection_catalog_revision);
+        let token = projection_metadata_token(
+            key_bundle,
+            candidate.projection.conversation_id,
+            plan.namespace.origin_namespace(),
+            &candidate.projection.state_reference_token,
+            ProjectionState::Retired,
+            &candidate.projection.scan_generation,
+            &candidate.projection.observation_token,
+            &revision,
+            plan.cutoff_ms,
+            plan.cutoff_ms,
+            Some(retain_until_ms),
+            0,
+        )?;
+        if transaction.execute(
+            "UPDATE native_projection_state
+             SET projection_state = 'retired', reconciled_at_ms = ?1,
+                 state_changed_at_ms = ?1, charged_reference_bytes = 0, metadata_token = ?2
+             WHERE conversation_id = ?3 AND metadata_token = ?4",
+            params![
+                sqlite_time(plan.cutoff_ms)?,
+                &token[..],
+                &candidate.projection.conversation_id.as_bytes()[..],
+                &candidate.projection.metadata_token[..],
+            ],
+        )? != 1
+        {
+            return Err(RuntimeStoreError::SchemaInspectionRaced);
+        }
+        next_ledger.native_projection_tombstone_count = next_ledger
+            .native_projection_tombstone_count
+            .checked_sub(1)
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        next_ledger.native_projection_retired_count =
+            checked_add(next_ledger.native_projection_retired_count, 1)?;
+        next_ledger.native_projection_charged_bytes = next_ledger
+            .native_projection_charged_bytes
+            .checked_sub(binding.sealed_reference_bytes())
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        match plan.namespace {
+            AdapterStateNamespace::Codex => {
+                next_ledger.codex_adapter_state_count = next_ledger
+                    .codex_adapter_state_count
+                    .checked_sub(1)
+                    .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+            }
+            AdapterStateNamespace::ClaudeCode => {
+                next_ledger.claude_code_adapter_state_count = next_ledger
+                    .claude_code_adapter_state_count
+                    .checked_sub(1)
+                    .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+            }
+        }
+    }
+    let pending_targets = super::sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next_ledger,
+    )?;
+    config
+        .fault_injector
+        .before_operation(RuntimeStoreOperation::RetireNativeProjectionBeforeCommit)?;
+    let commit_result = super::sqlite::commit_transaction(
+        transaction,
+        RuntimeCommitOperation::RetireNativeProjection,
+    );
+    effects.record_commit_result(pending_targets, &commit_result);
+    commit_result?;
+    super::sqlite::latch_post_commit_capacity(state, config);
+    native_projection_lifecycle_after_commit(
+        config,
+        RuntimeStoreOperation::RetireNativeProjectionAfterCommit,
+        RuntimeCommitOperation::RetireNativeProjection,
+    )?;
+    Ok(RetireNativeProjectionOutcome::Applied {
+        retired: plan.candidates.len(),
+        next_cursor: plan.next_cursor,
+    })
+}
+
+fn classify_retirement_plan(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    plan: &NativeProjectionRetirementPlan,
+) -> Result<ExactLifecyclePlanState, RuntimeStoreError> {
+    let mut pre_state_count = 0_usize;
+    let mut post_state_count = 0_usize;
+    for candidate in &plan.candidates {
+        let current = load_projection_by_conversation_id(
+            connection,
+            key_bundle,
+            candidate.projection.conversation_id,
+        )?
+        .ok_or(RuntimeStoreError::SchemaInspectionRaced)?;
+        let conversation = super::journal::load_conversation(
+            connection,
+            key_bundle,
+            database_id,
+            current.conversation_id,
+        )?;
+        if authenticated_native_catalog_change(connection, key_bundle, database_id, &conversation)?
+            != Some(NativeCatalogChange::Removed)
+        {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        let binding = super::journal::load_adapter_state_binding_evidence_for_conversation(
+            connection,
+            key_bundle,
+            database_id,
+            plan.namespace,
+            &conversation,
+        )?;
+        if current == candidate.projection {
+            let binding = binding.ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+            if binding.reference_token() != &candidate.projection.state_reference_token
+                || binding.sealed_reference_bytes() != candidate.projection.charged_reference_bytes
+            {
+                return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+            }
+            pre_state_count = pre_state_count
+                .checked_add(1)
+                .ok_or(RuntimeStoreError::PayloadTooLarge)?;
+        } else if projection_matches_retirement_post_state(
+            &current,
+            &candidate.projection,
+            plan.cutoff_ms,
+        ) {
+            if binding.is_some() {
+                return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+            }
+            post_state_count = post_state_count
+                .checked_add(1)
+                .ok_or(RuntimeStoreError::PayloadTooLarge)?;
+        } else {
+            return Err(RuntimeStoreError::SchemaInspectionRaced);
+        }
+    }
+    if post_state_count == plan.candidates.len() {
+        Ok(ExactLifecyclePlanState::Post)
+    } else if pre_state_count == plan.candidates.len() && post_state_count == 0 {
+        Ok(ExactLifecyclePlanState::Pre)
+    } else {
+        Err(RuntimeStoreError::SchemaInspectionRaced)
+    }
+}
+
+fn projection_matches_retirement_post_state(
+    current: &AuthenticatedProjectionRow,
+    previous: &AuthenticatedProjectionRow,
+    retired_at_ms: u64,
+) -> bool {
+    current.conversation_id == previous.conversation_id
+        && current.origin_namespace == previous.origin_namespace
+        && current.state_reference_token == previous.state_reference_token
+        && current.state == ProjectionState::Retired
+        && current.scan_generation == previous.scan_generation
+        && current.observation_token == previous.observation_token
+        && current.projection_catalog_revision == previous.projection_catalog_revision
+        && current.reconciled_at_ms == retired_at_ms
+        && current.state_changed_at_ms == retired_at_ms
+        && current.retain_until_ms == previous.retain_until_ms
+        && current.charged_reference_bytes == 0
+}
+
+fn native_projection_lifecycle_after_commit(
+    config: &RuntimeStoreConfig,
+    operation: RuntimeStoreOperation,
+    commit_operation: RuntimeCommitOperation,
+) -> Result<(), RuntimeStoreError> {
+    if config.fault_injector.before_operation(operation).is_err() {
+        Err(RuntimeStoreError::CommitOutcomeUnknown {
+            operation: commit_operation,
+        })
+    } else {
+        Ok(())
+    }
 }
 
 struct ExistingNativeProjection {
@@ -3240,6 +4375,18 @@ mod tests {
             validate_fresh_import_capacity(&physical_full, &physical_config, 60),
             Err(RuntimeStoreError::NativeProjectionLimit {
                 scope: NativeProjectionLimitScope::PhysicalIdentities
+            })
+        ));
+
+        let nonlive_full = super::super::sqlite::RuntimeLedger {
+            native_projection_tombstone_count: MAX_NATIVE_NONLIVE_IDENTITIES,
+            ..super::super::sqlite::RuntimeLedger::default()
+        };
+        assert!(validate_nonlive_reconciliation_capacity(&nonlive_full, 0).is_ok());
+        assert!(matches!(
+            validate_nonlive_reconciliation_capacity(&nonlive_full, 1),
+            Err(RuntimeStoreError::NativeProjectionLimit {
+                scope: NativeProjectionLimitScope::NonliveIdentities
             })
         ));
 

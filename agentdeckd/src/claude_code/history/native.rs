@@ -403,6 +403,17 @@ impl CompletedNativeScan {
     }
 
     #[cfg(test)]
+    pub(crate) const fn from_exhausted_native_scanner(
+        generation: [u8; 16],
+        acknowledged_candidates: u64,
+    ) -> Self {
+        Self {
+            generation,
+            acknowledged_candidates,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) const fn acknowledged_candidates(&self) -> u64 {
         self.acknowledged_candidates
     }
