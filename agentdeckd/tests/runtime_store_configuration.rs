@@ -478,11 +478,12 @@ async fn assert_configuration_tamper_rejected(tamper: ConfigurationTamper) {
     .await
     .expect_err("configuration tamper must fail at reopen");
     let expected_error = match tamper {
-        ConfigurationTamper::SealedRequest | ConfigurationTamper::SwapRequests => {
+        ConfigurationTamper::SealedRequest
+        | ConfigurationTamper::EventPayload
+        | ConfigurationTamper::SwapRequests => {
             matches!(error, RuntimeStoreError::Cipher(_))
         }
         ConfigurationTamper::ConfigurationMetadata
-        | ConfigurationTamper::EventPayload
         | ConfigurationTamper::StateHead
         | ConfigurationTamper::RuntimeLedger
         | ConfigurationTamper::DeleteConfiguration
