@@ -91,7 +91,6 @@ pub struct RuntimeCore {
     recovery_identity: Arc<()>,
     recovery: RuntimeRecoveryCoordinator,
     read_pool: ReadPool,
-    allow_unconfigured_test_prompts: bool,
     #[allow(dead_code)] // P3.8 UDS peer credential adapter 才会成为 production caller。
     principal_issuer: PrincipalIssuer,
     lifecycle: AtomicU8,
@@ -115,26 +114,6 @@ impl RuntimeCore {
             machine_trust_domain,
             Arc::new(DisabledExecutionCoordinator),
             DEFAULT_ADAPTER_CONCURRENCY,
-            false,
-        )
-        .map_err(RuntimeCoreError::into_failure)
-    }
-
-    /// 只供 crate 内单元测试保留 P3.7 legacy rev0 admission；production build
-    /// 不包含这个构造入口。
-    #[cfg(test)]
-    fn new_with_unconfigured_prompts_for_test(
-        store: RuntimeStoreHandle,
-        router: Arc<AgentRouter>,
-        machine_trust_domain: [u8; 32],
-    ) -> Result<Self, RuntimeFailure> {
-        Self::with_execution_coordinator(
-            store,
-            router,
-            machine_trust_domain,
-            Arc::new(DisabledExecutionCoordinator),
-            DEFAULT_ADAPTER_CONCURRENCY,
-            true,
         )
         .map_err(RuntimeCoreError::into_failure)
     }
@@ -155,7 +134,6 @@ impl RuntimeCore {
             machine_trust_domain,
             execution,
             DEFAULT_ADAPTER_CONCURRENCY,
-            false,
         )
         .map_err(RuntimeCoreError::into_failure)
     }
@@ -166,7 +144,6 @@ impl RuntimeCore {
         machine_trust_domain: [u8; 32],
         execution: Arc<dyn RuntimeExecutionCoordinator>,
         adapter_concurrency: usize,
-        allow_unconfigured_test_prompts: bool,
     ) -> Result<Self, RuntimeCoreError> {
         if machine_trust_domain == [0; 32] {
             return Err(RuntimeCoreError::InvalidIdentityDomain);
@@ -214,7 +191,6 @@ impl RuntimeCore {
             recovery_identity,
             recovery,
             read_pool: ReadPool::new(DEFAULT_RUNTIME_READ_CONCURRENCY)?,
-            allow_unconfigured_test_prompts,
             principal_issuer: PrincipalIssuer::local_only(machine_trust_domain),
             lifecycle: AtomicU8::new(CORE_COLD),
             operation_inflight: AtomicUsize::new(0),
@@ -237,7 +213,6 @@ impl RuntimeCore {
             machine_trust_domain,
             execution,
             DEFAULT_ADAPTER_CONCURRENCY,
-            true,
         )
     }
 
@@ -723,12 +698,6 @@ impl RuntimeCore {
                 // SendPrompt 的所有业务拒绝都属于 CommandReceipt family；否则
                 // Companion 会把一次 command failure 误解成 envelope/control failure。
                 let receipt = match async {
-                    // B3a1 只让永久测试构造穿过 Store 的真实 configuration
-                    // admission；production 入口仍保持 feature-unavailable，直到
-                    // B3a3 完成 authorization ownership 与完整 failure 收口。
-                    if !self.allow_unconfigured_test_prompts {
-                        return Err(RuntimeCoreError::FeatureUnavailable);
-                    }
                     validate_idempotency_key(&request.idempotency_key)?;
                     let conversation_id = parse_conversation_id(&request.conversation_id)?;
                     let authorization = principal.try_enter()?;

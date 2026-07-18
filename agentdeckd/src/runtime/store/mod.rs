@@ -60,7 +60,9 @@ pub use stream::{
     RuntimeCatalogBackfillPage, RuntimeEventBackfillPage, RuntimeSnapshotBuildPin,
 };
 pub use worker::RuntimeStoreHandle;
-pub(crate) use worker::{ClaudeCodeAdapterStateVault, CodexAdapterStateVault};
+pub(crate) use worker::{
+    AuthorizedAcceptOutcome, ClaudeCodeAdapterStateVault, CodexAdapterStateVault,
+};
 
 /// 已经通过 conversation row metadata MAC、descriptor AEAD open 与 canonical
 /// re-encode 的 snapshot 上下文。该类型只在 daemon runtime 内流转，不进入 wire。

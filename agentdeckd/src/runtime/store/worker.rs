@@ -242,6 +242,19 @@ pub struct RuntimeStoreHandle {
     shutdown_timeout: Duration,
 }
 
+/// Core 专用的 Accept 成功回执；authorization 只能在 durable outcome、
+/// stream notification 与 Store reply 完成后交还 conversation actor。
+pub(crate) struct AuthorizedAcceptOutcome {
+    outcome: AcceptOutcome,
+    authorization: AuthorizationGuard,
+}
+
+impl AuthorizedAcceptOutcome {
+    pub(crate) fn into_parts(self) -> (AcceptOutcome, AuthorizationGuard) {
+        (self.outcome, self.authorization)
+    }
+}
+
 /// 固定绑定到 Codex 私有 namespace 的能力句柄。
 ///
 /// adapter 只能拿到与自身类型对应的 vault；namespace 枚举和通用明文入口不跨出
@@ -613,25 +626,42 @@ impl RuntimeStoreHandle {
         &self,
         input: AcceptCommand,
     ) -> Result<AcceptOutcome, RuntimeStoreError> {
-        if input.idempotency_key.is_empty()
-            || input.idempotency_key.len() > MAX_IDEMPOTENCY_KEY_BYTES
-        {
-            return Err(RuntimeStoreError::InvalidConfig(
-                "idempotency key must contain 1 to 1024 UTF-8 bytes",
-            ));
-        }
-        validate_maximum(input.payload.len(), MAX_COMMAND_PAYLOAD_BYTES)?;
-        let charge = memory_charge(
-            size_of::<NormalCommand>(),
-            &[input.idempotency_key.capacity(), input.payload.capacity()],
-        )?;
+        let charge = accept_command_memory_charge(&input)?;
         dispatch_with_budget(
             &self.normal_tx,
             &self.normal_budget,
             &self.lifecycle,
             RuntimeStoreLane::Normal,
             charge,
-            |reply| NormalCommand::AcceptCommand { input, reply },
+            |reply| NormalCommand::AcceptCommand {
+                input,
+                reply: AcceptCommandReply::Direct(reply),
+            },
+        )
+        .await?
+    }
+
+    /// Core transport caller 的 authorization 必须转移进 Store queue；即使 caller 或
+    /// prompt worker 在入队后被取消，guard 也会覆盖 durable mutation 与通知。
+    pub(crate) async fn accept_command_authorized(
+        &self,
+        input: AcceptCommand,
+        authorization: AuthorizationGuard,
+    ) -> Result<AuthorizedAcceptOutcome, RuntimeStoreError> {
+        let charge = accept_command_memory_charge(&input)?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::AcceptCommand {
+                input,
+                reply: AcceptCommandReply::Authorized {
+                    authorization,
+                    reply,
+                },
+            },
         )
         .await?
     }
@@ -1138,6 +1168,19 @@ async fn await_shutdown_quiescence(
     }
 }
 
+fn accept_command_memory_charge(input: &AcceptCommand) -> Result<u32, RuntimeStoreError> {
+    if input.idempotency_key.is_empty() || input.idempotency_key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
+        return Err(RuntimeStoreError::InvalidConfig(
+            "idempotency key must contain 1 to 1024 UTF-8 bytes",
+        ));
+    }
+    validate_maximum(input.payload.len(), MAX_COMMAND_PAYLOAD_BYTES)?;
+    memory_charge(
+        size_of::<NormalCommand>(),
+        &[input.idempotency_key.capacity(), input.payload.capacity()],
+    )
+}
+
 async fn dispatch<T, C>(
     sender: &mpsc::Sender<C>,
     lifecycle: &AtomicU8,
@@ -1219,6 +1262,39 @@ struct Queued<C> {
     memory_permit: OwnedSemaphorePermit,
 }
 
+enum AcceptCommandReply {
+    Direct(oneshot::Sender<Result<AcceptOutcome, RuntimeStoreError>>),
+    Authorized {
+        authorization: AuthorizationGuard,
+        reply: oneshot::Sender<Result<AuthorizedAcceptOutcome, RuntimeStoreError>>,
+    },
+}
+
+impl AcceptCommandReply {
+    fn send(self, result: Result<AcceptOutcome, RuntimeStoreError>) {
+        match self {
+            Self::Direct(reply) => {
+                let _ = reply.send(result);
+            }
+            Self::Authorized {
+                authorization,
+                reply,
+            } => match result {
+                Ok(outcome) => {
+                    let _ = reply.send(Ok(AuthorizedAcceptOutcome {
+                        outcome,
+                        authorization,
+                    }));
+                }
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    drop(authorization);
+                }
+            },
+        }
+    }
+}
+
 enum NormalCommand {
     CreateConversation {
         input: NewConversation,
@@ -1232,7 +1308,7 @@ enum NormalCommand {
     },
     AcceptCommand {
         input: AcceptCommand,
-        reply: oneshot::Sender<Result<AcceptOutcome, RuntimeStoreError>>,
+        reply: AcceptCommandReply,
     },
     StartCommand {
         input: StartCommand,
@@ -1687,7 +1763,7 @@ fn handle_normal(
                 drop(authorization);
             }
             NormalCommand::AcceptCommand { reply, .. } => {
-                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+                reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
             NormalCommand::StartCommand { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
@@ -1773,7 +1849,7 @@ fn handle_normal(
             let mut effects = CommandStreamEffects::default();
             let result = journal::accept_command(state, config, input, &mut effects);
             let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
-            let _ = reply.send(result);
+            reply.send(result);
         }
         NormalCommand::StartCommand {
             input,

@@ -7,6 +7,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use agentdeck_protocol::runtime::failure::{
+    DAEMON_CONVERSATION_CONFIGURATION_CONFLICT, DAEMON_CONVERSATION_CONFIGURATION_REQUIRED,
+};
 use agentdeck_protocol::{ActionDecision, ActionRequest, AgentKind, TurnSummary};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1452,8 +1455,8 @@ impl RuntimeStoreError {
             Self::ConfigurationLimit { .. } | Self::CommandConfigurationPinLimit => {
                 "daemon.runtime.store_full"
             }
-            Self::ConfigurationRequired => "daemon.conversation.configuration_required",
-            Self::ConfigurationConflict { .. } => "daemon.conversation.configuration_conflict",
+            Self::ConfigurationRequired => DAEMON_CONVERSATION_CONFIGURATION_REQUIRED,
+            Self::ConfigurationConflict { .. } => DAEMON_CONVERSATION_CONFIGURATION_CONFLICT,
             Self::IdempotencyConflict => "daemon.command.idempotency_conflict",
             Self::QueueFull { .. } => "daemon.command.queue_full",
             Self::PayloadTooLarge => "daemon.payload.item_too_large",

@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use agentdeck_protocol::runtime::failure::{
+    DAEMON_CONVERSATION_CONFIGURATION_CONFLICT, DAEMON_CONVERSATION_CONFIGURATION_REQUIRED,
+};
 use agentdeck_protocol::runtime::identity::{
     ApprovalId, ConversationId, EventId, IdempotencyKey, MessageId,
 };
@@ -62,6 +65,27 @@ struct BlockConfigureConversationBeforeCommit {
     entered: Arc<Barrier>,
     release: Arc<Barrier>,
     blocked: AtomicBool,
+}
+
+struct BlockAcceptCommandBeforeCommit {
+    entered: Arc<Barrier>,
+    release: Arc<Barrier>,
+    blocked: AtomicBool,
+}
+
+impl super::super::store::RuntimeStoreFaultInjector for BlockAcceptCommandBeforeCommit {
+    fn before_operation(
+        &self,
+        operation: super::super::store::RuntimeStoreOperation,
+    ) -> Result<(), RuntimeStoreError> {
+        if operation == super::super::store::RuntimeStoreOperation::AcceptCommandBeforeCommit
+            && !self.blocked.swap(true, Ordering::SeqCst)
+        {
+            self.entered.wait();
+            self.release.wait();
+        }
+        Ok(())
+    }
 }
 
 impl super::super::store::RuntimeStoreFaultInjector for BlockConfigureConversationBeforeCommit {
@@ -147,8 +171,7 @@ async fn core(root: &TestRoot) -> Arc<RuntimeCore> {
     let store = root.open_store().await;
     let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
     Arc::new(
-        RuntimeCore::new_with_unconfigured_prompts_for_test(store, router, [0xA1; 32])
-            .expect("construct RuntimeCore test fixture"),
+        RuntimeCore::new(store, router, [0xA1; 32]).expect("construct RuntimeCore test fixture"),
     )
 }
 
@@ -396,27 +419,26 @@ async fn runtime_v2_describe_and_configure_cut_over_without_enabling_later_famil
             failure: RuntimeFailure { code, .. }
         }) if code == DAEMON_RUNTIME_FEATURE_UNAVAILABLE
     ));
-    for expected_configuration_revision in [0, 1] {
-        let prompt = core
-            .handle(
-                connection,
-                RuntimeRequest::SendPrompt(SendPromptRequest {
-                    conversation_id: conversation.conversation_id.clone(),
-                    idempotency_key: IdempotencyKey::new(format!(
-                        "v2-prompt-{expected_configuration_revision}"
-                    )),
-                    expected_configuration_revision,
-                    prompt: PromptPayload::new("must not enter the legacy driver").unwrap(),
-                }),
-            )
-            .await;
-        assert!(matches!(
-            prompt,
+    let prompt = core
+        .handle(
+            connection,
+            RuntimeRequest::SendPrompt(SendPromptRequest {
+                conversation_id: conversation.conversation_id.clone(),
+                idempotency_key: IdempotencyKey::new("v2-prompt-stale-configuration"),
+                expected_configuration_revision: 0,
+                prompt: PromptPayload::new("must reject before entering the real gate").unwrap(),
+            }),
+        )
+        .await;
+    assert!(
+        matches!(
+            &prompt,
             RuntimeReply::Command(CommandReceipt::Failed {
                 failure: RuntimeFailure { code, .. }
-            }) if code == DAEMON_RUNTIME_FEATURE_UNAVAILABLE
-        ));
-    }
+        }) if code == DAEMON_CONVERSATION_CONFIGURATION_CONFLICT
+        ),
+        "stale configured prompt must stay in CommandReceipt and map to configuration_conflict, got {prompt:?}"
+    );
     let stage = core
         .handle(
             connection,
@@ -812,8 +834,152 @@ async fn canceled_configure_caller_keeps_authorization_until_store_completion() 
         .expect("shutdown canceled Configure core");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canceled_send_prompt_caller_keeps_authorization_until_store_completion() {
+    // 威胁场景：连接断开会取消 Core caller future；已经移交给 actor/Store 的
+    // SendPrompt 必须继续持有 authorization guard，直到 Accept COMMIT 与队列注册完成。
+    let root = TestRoot::new("send-prompt-caller-canceled");
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let blocker = Arc::new(BlockAcceptCommandBeforeCommit {
+        entered: entered.clone(),
+        release: release.clone(),
+        blocked: AtomicBool::new(false),
+    });
+    let store = RuntimeStoreHandle::open(
+        super::super::store::RuntimeStoreConfig::new(root.path.join("runtime.db"))
+            .with_command_capacity(1_024)
+            .with_fault_injector(blocker.clone()),
+        root.kek(),
+    )
+    .await
+    .expect("open canceled SendPrompt store");
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let core = Arc::new(RuntimeCore::new(store, router, [0xA7; 32]).expect("construct core"));
+    core.recover()
+        .await
+        .expect("recover canceled SendPrompt core");
+    let principal = core
+        .issue_verified_local_principal(501, [0x78; 16])
+        .expect("issue canceled SendPrompt principal");
+    let (sink, mut receiver) = mpsc::channel::<crate::runtime::ConnectionWrite>(8);
+    tokio::spawn(async move {
+        while let Some(write) = receiver.recv().await {
+            let _ = write.acknowledge();
+        }
+    });
+    let connection = core
+        .connect(principal.clone(), ConnectionSink::new(sink))
+        .expect("connect canceled SendPrompt principal");
+    let conversation = start_receipt(
+        core.handle(connection, start_request("send-prompt-canceled-start"))
+            .await,
+    );
+    configure_codex_revision_one(
+        &core,
+        connection,
+        conversation.conversation_id.clone(),
+        "send-prompt-canceled-configuration",
+    )
+    .await;
+    let internal_conversation =
+        parse_conversation_id(&conversation.conversation_id).expect("parse started conversation");
+    let idempotency_key = "send-prompt-canceled";
+
+    let handling = tokio::spawn({
+        let core = core.clone();
+        let conversation_id = conversation.conversation_id;
+        async move {
+            core.handle(
+                connection,
+                RuntimeRequest::SendPrompt(SendPromptRequest {
+                    conversation_id,
+                    idempotency_key: IdempotencyKey::new(idempotency_key),
+                    expected_configuration_revision: 1,
+                    prompt: PromptPayload::new("commit after Core caller cancellation").unwrap(),
+                }),
+            )
+            .await
+        }
+    });
+
+    let reached_accept_barrier = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if blocker.blocked.load(Ordering::SeqCst) {
+                break true;
+            }
+            if handling.is_finished() {
+                break false;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("SendPrompt must either reach Accept before COMMIT or return a typed failure");
+    if !reached_accept_barrier {
+        let reply = handling.await.expect("join early SendPrompt reply");
+        core.shutdown()
+            .await
+            .expect("shutdown early-return SendPrompt core");
+        panic!("SendPrompt must reach Accept before COMMIT, got {reply:?}");
+    }
+    tokio::task::spawn_blocking(move || entered.wait())
+        .await
+        .expect("observe canceled SendPrompt before COMMIT");
+
+    handling.abort();
+    let canceled_handling = handling.await;
+    let mut revoking = tokio::spawn({
+        let principal = principal.clone();
+        async move { principal.begin_revoke().await }
+    });
+    let revoked_before_release =
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut revoking).await;
+
+    // 从这里开始不做任何可能 panic 的断言，先无条件释放 Store worker。
+    tokio::task::spawn_blocking(move || release.wait())
+        .await
+        .expect("release canceled SendPrompt before COMMIT");
+    let revoked_early = revoked_before_release.is_ok();
+    let revoke_result = match revoked_before_release {
+        Ok(result) => result,
+        Err(_) => revoking.await,
+    };
+    let receipt = core
+        .store
+        .query_command_receipt(QueryCommandReceipt {
+            expected_owner: principal.idempotency_owner(),
+            selector: CommandReceiptSelector::Idempotency {
+                conversation_id: internal_conversation,
+                idempotency_key: idempotency_key.to_owned(),
+            },
+        })
+        .await;
+    principal.finish_revoke();
+    core.shutdown()
+        .await
+        .expect("shutdown canceled SendPrompt core");
+
+    assert!(
+        canceled_handling
+            .expect_err("SendPrompt caller must be canceled")
+            .is_cancelled(),
+        "aborted caller reports cancellation"
+    );
+    assert!(
+        !revoked_early,
+        "detached durable SendPrompt must retain authorization after caller cancellation"
+    );
+    revoke_result
+        .expect("join canceled SendPrompt revoke")
+        .expect("revoke after detached Store completion");
+    let receipt = receipt.expect("read committed SendPrompt receipt after caller cancellation");
+    assert_eq!(receipt.configuration_revision, 1);
+    assert_eq!(receipt.state, CommandState::Accepted);
+}
+
 #[tokio::test]
-async fn side_effect_free_public_constructor_rejects_unconfigured_prompt() {
+async fn public_send_prompt_maps_configuration_preconditions_to_command_receipt_failures() {
     let root = TestRoot::new("v2-public-constructor");
     let store = root.open_store().await;
     let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
@@ -828,23 +994,63 @@ async fn side_effect_free_public_constructor_rejects_unconfigured_prompt() {
             .await,
     );
 
-    let reply = core
-        .handle(
-            connection,
-            RuntimeRequest::SendPrompt(SendPromptRequest {
-                conversation_id: conversation.conversation_id,
-                idempotency_key: IdempotencyKey::new("v2-public-constructor-prompt"),
-                expected_configuration_revision: 0,
-                prompt: PromptPayload::new("must stay fail-closed").unwrap(),
-            }),
-        )
-        .await;
-    assert!(matches!(
-        reply,
-        RuntimeReply::Command(CommandReceipt::Failed {
-            failure: RuntimeFailure { code, .. }
-        }) if code == DAEMON_RUNTIME_FEATURE_UNAVAILABLE
-    ));
+    for expected_configuration_revision in [0, 1] {
+        let reply = core
+            .handle(
+                connection,
+                RuntimeRequest::SendPrompt(SendPromptRequest {
+                    conversation_id: conversation.conversation_id.clone(),
+                    idempotency_key: IdempotencyKey::new(format!(
+                        "v2-unconfigured-prompt-{expected_configuration_revision}"
+                    )),
+                    expected_configuration_revision,
+                    prompt: PromptPayload::new("configuration must be required").unwrap(),
+                }),
+            )
+            .await;
+        assert!(
+            matches!(
+                &reply,
+                RuntimeReply::Command(CommandReceipt::Failed {
+                    failure: RuntimeFailure { code, .. }
+            }) if code == DAEMON_CONVERSATION_CONFIGURATION_REQUIRED
+            ),
+            "unconfigured prompt revision {expected_configuration_revision} must stay in CommandReceipt and map to configuration_required, got {reply:?}"
+        );
+    }
+
+    configure_codex_revision_one(
+        &core,
+        connection,
+        conversation.conversation_id.clone(),
+        "v2-public-constructor-configuration",
+    )
+    .await;
+
+    for expected_configuration_revision in [0, 2] {
+        let reply = core
+            .handle(
+                connection,
+                RuntimeRequest::SendPrompt(SendPromptRequest {
+                    conversation_id: conversation.conversation_id.clone(),
+                    idempotency_key: IdempotencyKey::new(format!(
+                        "v2-conflicting-prompt-{expected_configuration_revision}"
+                    )),
+                    expected_configuration_revision,
+                    prompt: PromptPayload::new("configuration revision must conflict").unwrap(),
+                }),
+            )
+            .await;
+        assert!(
+            matches!(
+                &reply,
+                RuntimeReply::Command(CommandReceipt::Failed {
+                    failure: RuntimeFailure { code, .. }
+            }) if code == DAEMON_CONVERSATION_CONFIGURATION_CONFLICT
+            ),
+            "configured prompt revision {expected_configuration_revision} must stay in CommandReceipt and map to configuration_conflict, got {reply:?}"
+        );
+    }
 
     core.shutdown().await.expect("shutdown public core");
 }
@@ -1075,6 +1281,136 @@ async fn start_is_pure_durable_idempotent_then_prompt_and_query_are_separate() {
     }
 
     core.shutdown().await.expect("shutdown core");
+}
+
+#[tokio::test]
+async fn core_prompt_receipts_keep_original_pin_across_head_advance_and_lifecycle() {
+    let root = TestRoot::new("prompt-pin-lifecycle");
+    let store = root.open_store().await;
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let execution = super::super::conversation::tests::FakeCoordinator::held();
+    let core = Arc::new(
+        RuntimeCore::new_with_test_execution_coordinator(
+            store,
+            router,
+            [0xA7; 32],
+            Arc::new(execution.clone()),
+        )
+        .expect("construct pinned lifecycle core"),
+    );
+    core.recover().await.expect("recover pinned lifecycle core");
+    let connection = connect_local(&core, 0x78).await;
+    let conversation = start_receipt(
+        core.handle(connection, start_request("prompt-pin-lifecycle-start"))
+            .await,
+    );
+    configure_codex_revision_one(
+        &core,
+        connection,
+        conversation.conversation_id.clone(),
+        "prompt-pin-lifecycle-revision-one",
+    )
+    .await;
+
+    let prompt_key = IdempotencyKey::new("prompt-pin-lifecycle-command");
+    let prompt = PromptPayload::new("keep revision one through every status").expect("prompt");
+    let prompt_request = || {
+        RuntimeRequest::SendPrompt(SendPromptRequest {
+            conversation_id: conversation.conversation_id.clone(),
+            idempotency_key: prompt_key.clone(),
+            expected_configuration_revision: 1,
+            prompt: prompt.clone(),
+        })
+    };
+    let command_id = match core.handle(connection, prompt_request()).await {
+        RuntimeReply::Command(CommandReceipt::Accepted {
+            command_id,
+            configuration_revision: 1,
+            ..
+        }) => command_id,
+        other => panic!("expected revision-one Accepted receipt, got {other:?}"),
+    };
+    execution.wait_for_starts(1).await;
+
+    let query = || {
+        RuntimeRequest::QueryReceipt(QueryReceiptSelector::Command {
+            conversation_id: conversation.conversation_id.clone(),
+            command_id: command_id.clone(),
+        })
+    };
+    let started = match core.handle(connection, query()).await {
+        RuntimeReply::CommandStatus(receipt) => receipt,
+        other => panic!("expected Started command status, got {other:?}"),
+    };
+    assert_eq!(started.configuration_revision, 1);
+    assert_eq!(started.status, CommandStatus::Started);
+    assert!(started.turn_id.is_some());
+
+    let revision_two = core
+        .handle(
+            connection,
+            RuntimeRequest::ConfigureConversation(ConfigureConversationRequest::new(
+                conversation.conversation_id.clone(),
+                IdempotencyKey::new("prompt-pin-lifecycle-revision-two"),
+                1,
+                codex_configuration(CodexReasoningEffort::High),
+            )),
+        )
+        .await;
+    assert!(matches!(
+        revision_two,
+        RuntimeReply::Configuration(ConfigurationReceipt::Applied {
+            configuration_revision: 2,
+            ..
+        })
+    ));
+
+    assert!(matches!(
+        core.handle(connection, prompt_request()).await,
+        RuntimeReply::Command(CommandReceipt::Replayed {
+            ref command_id,
+            configuration_revision: 1,
+        }) if command_id == &started.command_id
+    ));
+    let after_head_advance = match core.handle(connection, query()).await {
+        RuntimeReply::CommandStatus(receipt) => receipt,
+        other => panic!("expected post-configure command status, got {other:?}"),
+    };
+    assert_eq!(after_head_advance.configuration_revision, 1);
+    assert_eq!(after_head_advance.status, CommandStatus::Started);
+    assert_eq!(after_head_advance.turn_id, started.turn_id);
+
+    execution.release(parse_command_id(&command_id).expect("parse pinned command id"));
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match core.handle(connection, query()).await {
+                RuntimeReply::CommandStatus(receipt)
+                    if receipt.status == CommandStatus::Completed =>
+                {
+                    break receipt;
+                }
+                RuntimeReply::CommandStatus(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                other => panic!("expected terminal command status, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("pinned command must reach terminal status");
+    assert_eq!(terminal.configuration_revision, 1);
+    assert_eq!(terminal.turn_id, started.turn_id);
+    assert!(matches!(
+        core.handle(connection, prompt_request()).await,
+        RuntimeReply::Command(CommandReceipt::Replayed {
+            command_id: replayed,
+            configuration_revision: 1,
+        }) if replayed == command_id
+    ));
+
+    core.shutdown()
+        .await
+        .expect("shutdown pinned lifecycle core");
 }
 
 #[tokio::test]

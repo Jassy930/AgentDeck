@@ -37,8 +37,8 @@ use super::model::{
 use super::recovery::RecoveryReadyPermit;
 use super::store::{
     AcceptCommand, AcceptOutcome, AcceptedTerminationReason, AuthorizeExecutionRelease,
-    CommandRecord, CommandState, CommandTerminal, CompleteCommand, ConversationRecord,
-    ExecutionFence, ExecutionFenceRecord, MarkConversationRecoveryBlocked,
+    AuthorizedAcceptOutcome, CommandRecord, CommandState, CommandTerminal, CompleteCommand,
+    ConversationRecord, ExecutionFence, ExecutionFenceRecord, MarkConversationRecoveryBlocked,
     RecoveryBlockedCommandBinding, RecoveryFenceBinding, RuntimeCommitOperation, RuntimeId,
     RuntimeIdKind, RuntimeStoreError, RuntimeStoreHandle, StartCommand, StartOutcome,
     StartedBeforeReleaseTermination, SystemRuntimeClock, TerminateAcceptedCommand,
@@ -407,7 +407,7 @@ impl ConversationRegistry {
             .prompt_ingress
             .try_send(PromptCommand {
                 principal,
-                _authorization_guard: authorization_guard,
+                authorization_guard,
                 idempotency_key,
                 expected_configuration_revision,
                 payload,
@@ -646,7 +646,7 @@ impl ConversationRegistry {
 
 struct PromptCommand {
     principal: AuthenticatedPrincipal,
-    _authorization_guard: AuthorizationGuard,
+    authorization_guard: AuthorizationGuard,
     idempotency_key: String,
     expected_configuration_revision: u64,
     payload: Vec<u8>,
@@ -656,8 +656,7 @@ struct PromptCommand {
 struct PromptAdmission {
     principal: AuthenticatedPrincipal,
     authorization_key: PrincipalAuthorizationKey,
-    _authorization_guard: AuthorizationGuard,
-    outcome: Result<AcceptOutcome, RuntimeStoreError>,
+    outcome: Result<AuthorizedAcceptOutcome, RuntimeStoreError>,
     reply: oneshot::Sender<Result<PromptAcceptResult, ConversationError>>,
 }
 
@@ -904,58 +903,74 @@ impl ConversationActor {
     }
 
     fn handle_admission(&mut self, admission: PromptAdmission) {
-        let reply = match admission.outcome {
-            Ok(AcceptOutcome::Accepted {
-                command,
-                queue_position,
-            }) => {
-                let queued = QueuedCommand {
-                    command: command.clone(),
-                    authorization_key: Some(admission.authorization_key),
-                    principal: Some(admission.principal),
-                };
-                let position = self
-                    .pending
-                    .iter()
-                    .position(|existing| existing.command.command_seq > queued.command.command_seq)
-                    .unwrap_or(self.pending.len());
-                self.pending.insert(position, queued);
-                Ok(PromptAcceptResult::Accepted {
-                    command,
-                    queue_position,
-                })
-            }
-            Ok(AcceptOutcome::Replayed { command }) => {
-                if command.state == CommandState::Accepted
-                    && !self.pending.iter().any(|queued| {
-                        queued.command.command_id == command.command_id
-                            || queued.command.command_seq == command.command_seq
-                    })
-                    && self
-                        .active
-                        .as_ref()
-                        .is_none_or(|active| active.command.command_id != command.command_id)
-                {
-                    let queued = QueuedCommand {
-                        command: command.clone(),
-                        authorization_key: Some(admission.authorization_key),
-                        principal: Some(admission.principal),
-                    };
-                    let position = self
-                        .pending
-                        .iter()
-                        .position(|existing| {
-                            existing.command.command_seq > queued.command.command_seq
+        let PromptAdmission {
+            principal,
+            authorization_key,
+            outcome,
+            reply,
+        } = admission;
+        match outcome {
+            Ok(authorized) => {
+                let (outcome, authorization_guard) = authorized.into_parts();
+                let reply_outcome = match outcome {
+                    AcceptOutcome::Accepted {
+                        command,
+                        queue_position,
+                    } => {
+                        let queued = QueuedCommand {
+                            command: command.clone(),
+                            authorization_key: Some(authorization_key),
+                            principal: Some(principal),
+                        };
+                        let position = self
+                            .pending
+                            .iter()
+                            .position(|existing| {
+                                existing.command.command_seq > queued.command.command_seq
+                            })
+                            .unwrap_or(self.pending.len());
+                        self.pending.insert(position, queued);
+                        Ok(PromptAcceptResult::Accepted {
+                            command,
+                            queue_position,
                         })
-                        .unwrap_or(self.pending.len());
-                    self.pending.insert(position, queued);
-                }
-                Ok(PromptAcceptResult::Replayed { command })
+                    }
+                    AcceptOutcome::Replayed { command } => {
+                        if command.state == CommandState::Accepted
+                            && !self.pending.iter().any(|queued| {
+                                queued.command.command_id == command.command_id
+                                    || queued.command.command_seq == command.command_seq
+                            })
+                            && self.active.as_ref().is_none_or(|active| {
+                                active.command.command_id != command.command_id
+                            })
+                        {
+                            let queued = QueuedCommand {
+                                command: command.clone(),
+                                authorization_key: Some(authorization_key),
+                                principal: Some(principal),
+                            };
+                            let position = self
+                                .pending
+                                .iter()
+                                .position(|existing| {
+                                    existing.command.command_seq > queued.command.command_seq
+                                })
+                                .unwrap_or(self.pending.len());
+                            self.pending.insert(position, queued);
+                        }
+                        Ok(PromptAcceptResult::Replayed { command })
+                    }
+                };
+                // Store 把 guard 随 durable success 返还；actor 完成 queue registration
+                // 与 caller reply 后才允许 revoke 观察到 quiesced。
+                let _ = reply.send(reply_outcome);
+                drop(authorization_guard);
             }
-            Err(error) => Err(ConversationError::Store(error)),
-        };
-        // `_authorization_guard` lives through journal commit and queue registration, then drops.
-        let _ = admission.reply.send(reply);
+            Err(error) => {
+                let _ = reply.send(Err(ConversationError::Store(error)));
+            }
+        }
     }
 
     async fn handle_control(&mut self, command: ControlCommand) {
@@ -2314,23 +2329,33 @@ async fn prompt_admission_worker(
         let Some(command) = command else {
             break;
         };
-        let authorization_key = command.principal.authorization_key();
+        let PromptCommand {
+            principal,
+            authorization_guard,
+            idempotency_key,
+            expected_configuration_revision,
+            payload,
+            reply,
+        } = command;
+        let authorization_key = principal.authorization_key();
         let outcome = store
-            .accept_command(AcceptCommand {
-                conversation_id,
-                owner: command.principal.idempotency_owner(),
-                idempotency_key: command.idempotency_key,
-                expected_configuration_revision: command.expected_configuration_revision,
-                payload: command.payload,
-            })
+            .accept_command_authorized(
+                AcceptCommand {
+                    conversation_id,
+                    owner: principal.idempotency_owner(),
+                    idempotency_key,
+                    expected_configuration_revision,
+                    payload,
+                },
+                authorization_guard,
+            )
             .await;
         if admission_tx
             .send(PromptAdmission {
-                principal: command.principal,
+                principal,
                 authorization_key,
-                _authorization_guard: command._authorization_guard,
                 outcome,
-                reply: command.reply,
+                reply,
             })
             .await
             .is_err()
@@ -4103,7 +4128,7 @@ pub(crate) mod tests {
                 .add_permits(1);
         }
 
-        fn release(&self, command_id: RuntimeId) {
+        pub(crate) fn release(&self, command_id: RuntimeId) {
             self.inner
                 .controls
                 .lock()
@@ -7014,6 +7039,158 @@ pub(crate) mod tests {
         assert_eq!(receipt.state, CommandState::Accepted);
 
         store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test]
+    async fn shutdown_timeout_aborts_prompt_worker_without_releasing_store_owned_authorization() {
+        let root = TestRoot::new("shutdown-admission-authorization");
+        let database = root.0.join("runtime.db");
+        let keys = MemoryKeyStore::new();
+        let blocker = Arc::new(BlockNextAcceptCommit::new());
+        let kek = load_or_create_storage_kek(&keys, &root.0.join("key-state.db"))
+            .expect("shutdown authorization StorageKEK");
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(database.clone()).with_fault_injector(blocker.clone()),
+            kek,
+        )
+        .await
+        .expect("open shutdown authorization store");
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 23).await;
+        let registry = Arc::new(
+            ConversationRegistry::with_limits(
+                store.clone(),
+                Arc::new(DisabledExecutionCoordinator),
+                runtime_id(RuntimeIdKind::DaemonBoot, 0xE3),
+                1,
+                1,
+                Duration::from_millis(75),
+            )
+            .expect("short-deadline registry"),
+        );
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+
+        let principal = local_principal(19);
+        let idempotency_key = "shutdown-authorization";
+        let payload = b"authorization must remain store-owned";
+        blocker.arm();
+        let submitting_registry = registry.clone();
+        let submitting_principal = principal.clone();
+        let mut submit = tokio::spawn(async move {
+            submitting_registry
+                .submit_prompt(
+                    conversation.conversation_id,
+                    submitting_principal.clone(),
+                    submitting_principal.try_enter().expect("prompt guard"),
+                    idempotency_key.to_owned(),
+                    1,
+                    payload.to_vec(),
+                )
+                .await
+        });
+        wait_until(|| blocker.entered.load(Ordering::SeqCst)).await;
+
+        let revoking = principal.clone();
+        let mut revoke = tokio::spawn(async move { revoking.begin_revoke().await });
+        wait_until(|| !principal.is_active()).await;
+        let revoke_was_pending_before_shutdown = !revoke.is_finished();
+
+        let shutting_registry = registry.clone();
+        let mut shutdown = tokio::spawn(async move { shutting_registry.shutdown().await });
+        let shutdown_before_release =
+            tokio::time::timeout(Duration::from_secs(1), &mut shutdown).await;
+        let revoke_finished_before_release =
+            tokio::time::timeout(Duration::from_millis(250), async {
+                while !revoke.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+
+        // 所有断言都放在 barrier 释放与任务回收之后，避免失败路径把 Store worker
+        // 永久留在 AcceptCommandBeforeCommit。
+        blocker.release();
+        let shutdown_result = match shutdown_before_release {
+            Ok(result) => result,
+            Err(_) => shutdown.await,
+        };
+        let submit_result = match tokio::time::timeout(Duration::from_secs(1), &mut submit).await {
+            Ok(result) => Some(result),
+            Err(_) => {
+                submit.abort();
+                let _ = submit.await;
+                None
+            }
+        };
+        let replay = store
+            .accept_command(AcceptCommand {
+                conversation_id: conversation.conversation_id,
+                owner: principal.idempotency_owner(),
+                idempotency_key: idempotency_key.to_owned(),
+                expected_configuration_revision: 1,
+                payload: payload.to_vec(),
+            })
+            .await;
+        let revoke_result = match tokio::time::timeout(Duration::from_secs(1), &mut revoke).await {
+            Ok(result) => Some(result),
+            Err(_) => {
+                revoke.abort();
+                let _ = revoke.await;
+                None
+            }
+        };
+        principal.finish_revoke();
+
+        let replayed_command = match &replay {
+            Ok(AcceptOutcome::Replayed { command }) => Some(command),
+            _ => None,
+        };
+        let pinned_rows: i64 = replayed_command
+            .map(|command| {
+                rusqlite::Connection::open_with_flags(
+                    &database,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .expect("open runtime DB read-only")
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM command_configuration_pins AS pin
+                     JOIN commands AS command
+                       ON command.conversation_id = pin.conversation_id
+                      AND command.command_seq = pin.command_seq
+                     WHERE command.command_id = ?1",
+                    [&command.command_id.as_bytes()[..]],
+                    |row| row.get(0),
+                )
+                .expect("count committed command configuration pin")
+            })
+            .unwrap_or_default();
+        store.shutdown().await.expect("shutdown store");
+
+        assert!(
+            revoke_was_pending_before_shutdown,
+            "revoke must initially wait for the in-flight prompt authorization"
+        );
+        assert!(
+            !revoke_finished_before_release,
+            "shutdown timeout must not release authorization while the Store owns the blocked accept"
+        );
+        shutdown_result
+            .expect("shutdown task")
+            .expect("shutdown actors");
+        assert!(submit_result.is_some(), "submit task must be reaped");
+        let command = replayed_command.expect("blocked accept must commit before exact replay");
+        assert_eq!(command.state, CommandState::Accepted);
+        assert_eq!(command.configuration_revision, 1);
+        assert_eq!(pinned_rows, 1, "accepted command must retain its exact pin");
+        revoke_result
+            .expect("revoke task must finish after barrier release")
+            .expect("join revoke")
+            .expect("revoke after Store commit");
     }
 
     #[tokio::test]

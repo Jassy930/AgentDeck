@@ -57,3 +57,26 @@ fn core_source_has_no_direct_socket_write_or_transport_priority_branch() {
     assert!(!conversation.contains("LocalPrincipal =>"));
     assert!(!conversation.contains("RemotePrincipal =>"));
 }
+
+#[test]
+fn conversation_production_tasks_are_abort_owned() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let conversation = fs::read_to_string(root.join("src/runtime/conversation.rs"))
+        .expect("read conversation actor");
+    let production = conversation
+        .split_once("#[cfg(test)]\npub(crate) mod tests")
+        .expect("conversation test module boundary")
+        .0;
+    let compact: String = production
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+
+    assert_eq!(
+        compact.matches("tokio::spawn(").count(),
+        compact
+            .matches("AbortOnDropTask::new(tokio::spawn(")
+            .count(),
+        "production conversation task must be owned by AbortOnDropTask"
+    );
+}

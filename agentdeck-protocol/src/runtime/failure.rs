@@ -39,6 +39,10 @@ pub const DAEMON_TURN_STALE: &str = "daemon.turn.stale";
 // —— daemon.payload.* / daemon.conversation.* ——
 pub const DAEMON_PAYLOAD_ITEM_TOO_LARGE: &str = "daemon.payload.item_too_large";
 pub const DAEMON_CONVERSATION_NOT_FOUND: &str = "daemon.conversation.not_found";
+pub const DAEMON_CONVERSATION_CONFIGURATION_REQUIRED: &str =
+    "daemon.conversation.configuration_required";
+pub const DAEMON_CONVERSATION_CONFIGURATION_CONFLICT: &str =
+    "daemon.conversation.configuration_conflict";
 
 // —— remote.transfer.* （解密后分片重组失败）——
 pub const REMOTE_TRANSFER_TOO_LARGE: &str = "remote.transfer.too_large";
