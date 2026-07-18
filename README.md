@@ -213,11 +213,12 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（C0-B3a complete，B3b next）
+## Relay Companion MVP 实施状态（C0-B3b complete，B4 next）
 
 2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 只承诺缺 KEK 且无法通过当前
 KEK/database/domain 认证的离线篡改 fail-close，同 UID 在线攻击作为 residual risk 不再扩展。P3.1
-provisioned signed Keychain 保持 ignored/BLOCKED 但不阻塞主线；P4 功能全保留，P5/P6 的物理设备、
+采用方案 b：MVP 接受 dev/ephemeral Keychain 路径，provisioned signed roundtrip 移入 post-MVP
+ignored/BLOCKED 槽位，不阻塞 MVP/P3 exit，也不表示 stable production signing 已完成。P4 功能全保留，P5/P6 的物理设备、
 公网与干净 Linux 证据改为 post-MVP BLOCKED 槽位。详见
 [`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`](docs/plans/2026-07-18-relay-companion-mvp-course-correction.md)。
 
@@ -308,9 +309,9 @@ StorageKEK；写入后必须立即读回并逐字节一致。既有 Runtime arti
 1 个真实签名 Keychain `set → load → delete` roundtrip 保持 ignored gate。该真实 gate
 **尚未通过**：本机没有匹配 access group 的 provisioning profile；Apple Development
 和本地 self-signed helper 虽然都通过 `codesign --verify`，启动仍被 AMFI 以 exit 137
-终止。因此 signed roundtrip 与 P3.1 Step 4 不能记为 PASS；P3/P4 主线与 phase closeout 可如实携带该
-BLOCKED 槽位继续。最终采用匹配 provisioning/entitlement 的已签名 helper，还是把该证据移入
-post-MVP，等待用户在方案 a/b 中拍板。
+终止。因此 signed roundtrip 与 P3.1 Step 4 不能记为 PASS。2026-07-18 已采用方案 b：MVP/P3 exit
+验收完整 dev/ephemeral 路径，该 signed roundtrip 移入 post-MVP BLOCKED 证据槽位，不再阻塞 P3/P4
+主线或 phase closeout，也不再尝试代码绕过 AMFI；stable production signing 仍未完成。
 
 ### P3.2 Runtime journal 当前边界
 
@@ -434,14 +435,29 @@ mismatch 分别返回 `daemon.conversation.configuration_required` 与
 authorization guard 移交 Store command，覆盖 durable outcome、通知、reply 与成功后的 actor queue
 registration；caller 取消或 actor shutdown timeout 不能在 Store 完成前提前释放。`metadata_mutation_ledger`
 在 B4 writer 落地前仍必须为空，非空即 fail-close；metadata mutation 继续返回后续 phase 的 typed failure。
+B3b 又让 Start 在同一 SQLite transaction 中认证 command、pin 与完整 `1...head` configuration chain，选择
+command 固定的历史 revision，而不是 current head；`StartOutcome → RuntimeExecutionContext →` crate-private
+`AgentTurnRequest` 始终携带同一 exact revision/value。rev0 只允许真实 v4→v5 migration cutoff 内的 command
+在 startup recovery 使用冻结的 P3.7 defaults，普通 live queue、exact replay 与同进程恢复都不得回退默认值；
+configuration 的 agent kind/vendor variant 也会在 spawn 前校验。
+
+Codex 将 approval policy、sandbox 写入 fresh/resume 的 `thread/start` / `thread/resume`，reasoning effort
+写入 `turn/start`；Claude Code 将 permission mode、model、effort、output style 固定到 fresh/resume argv。
+其中 Runtime/UI 的 `ClaudeCodePermissionMode::Default` 表达常规人工确认语义，当前 Claude Code CLI 的
+vendor argv 必须映射为 `--permission-mode manual`，不得发送已不接受的 `default`。Codex approval 的
+policy/sandbox 与 Claude Code approval 的 permission mode at-decision metadata 均来自同一冻结配置。
 prompt actor 以 journal `commandSeq` 为唯一 FIFO，同 conversation 只有一个 active，不同 conversation
 可由全局 semaphore 并行；control 使用有界优先批次，ReadPool 满时立即 overload，不排无界
 waiter。
 
-B3a2-C 已由 `48594e8` 提交，B3a3 已由 `09a14b0` 提交；完整 daemon/protocol/Swift/selfcheck/static
-门禁全绿，独立 `spec/security` 与 `quality` 终审 Approved，B3a complete。6 个 ignored 均保持显式
-gated/manual，其中 P3.1 provisioned signed Keychain 继续 BLOCKED、未计 PASS。queued/restart/recovery
-按 pin 加载 exact configuration，以及 Codex/Claude Code argv/control 映射仍属于 B3b。
+B3a2-C 已由 `48594e8` 提交，B3a3 已由 `09a14b0` 提交；B3b exact execution 与 restart probe 由
+`c0ed6cd` / `f4141f0` 完成，Claude Code `Default → manual` vendor 映射由 `fb1629a` 收紧。B3b production
+additions 合计 658。已读回 daemon lib `691 passed / 1 ignored`、1,024 × 256 KiB 容量 target `5/5`
+（278.46 秒）、4,096 行 configuration chain `1/1`（55.97 秒）、完整 daemon package exit 0 且
+`1150 passed / 6 ignored`（共 1,156 tests）、protocol `170/170`、Swift `333/333`，以及
+schema/selfcheck/Clippy/fmt/network/docs/diff 静态门禁全绿。6 个 ignored 均保持显式 gated/manual，其中 P3.1
+provisioned signed Keychain 继续作为 post-MVP 槽位 BLOCKED、未计 PASS，也不阻塞 MVP/P3 exit。仓库内 recorded argv/control/translator fixture 只证明
+builder/translator 字段映射，不是 live vendor login、真实 vendor approval 或 P4 RemoteLink 证据。
 
 进入 Core 的 principal 是字段私有的认证 capability；同一完整身份共享强 authorization lease，
 Accepted→Started 前会重新取得 guard，revoke 与 start 由该 guard + SQLite transition 线性化。
@@ -534,7 +550,7 @@ remote owner。真实 MachineDataSign/E2EE seal、Keychain CounterGuard、Relay
 Publish 和远程设备解密属于 P4；iOS 仍是 fixture 驱动 Simulator 前端，不是当前链路证据。
 App/CLI 仍未迁到 singleton UDS，RemoteLink 也没有 production owner，因此该 P3.6 历史阶段不构成
 P3/Companion 完成。P3.1 provisioned signed Keychain 仍是不得记 PASS 的 BLOCKED 槽位，但 2026-07-18
-起不再单独阻塞 P3/P4 主线；其最终归属等待用户在方案 a/b 中拍板。
+方案 b 已将其移入 post-MVP；它不再阻塞 MVP/P3/P4 主线，但也不表示 stable production signing 已完成。
 
 当前 P3.6 组件门禁已确认 `runtime_stream` 45/45、`runtime_transfer` 17/17、subscription
 36/36、daemon lib 464/464（其中 `runtime::` 366 项）、默认并发 `cargo test -p agentdeckd` exit 0，
@@ -599,14 +615,18 @@ all-target check/clippy、schema、Swift、自检、no-net/docs/fmt/diff 门禁�
 `RuntimeCore/actor → GatedExecutionCoordinator → AgentRouter → current-binary gate → typed driver →`
 durable event ACK → terminal，并在 reopen/backfill 后读回 canonical item 与唯一 terminal。probe 不接受
 binary/root 注入，内部原子创建随机临时目录并 RAII 清理；它使用
-`/bin/sh` 无副作用 helper，不替代真实 Codex/Claude Code 登录、真实 approval 或 P6 跨设备证据。
+`/bin/sh` 无副作用 helper。B3b probe 还用非默认 rev1 Accept command、随后把 configuration head 推进到
+rev2，跨越真实 Store shutdown/reopen 与 startup recovery 后断言 synthetic `ProbeAgent` 仍只观察 rev1；
+它证明 production wiring 的 exact pin，不替代真实 Codex/Claude Code 登录、真实 approval 或 P6 跨设备证据。
 P3.8-B production UDS/bootstrap 已由 `1e7f9ea` / `459f32a` 完成；P3.9-C0-A1 Runtime v2 Rust
 cutover 与旧签名材料拒绝门禁已完成，A2a/A2b Swift v2 strict mirror 也已由 `bea4c13` / `3e019ed` /
 `0dd58de` 收口，A2c outer + JSON/UDS/compact/current codec 已由 `c2d2c28` / `e419d84` 收口；
 C0-B1a/B1b schema freeze 与真实 migration 已由 `e48248a` / `3d0002d` 收口；B2 configuration/Core 与
-B3a admission pin 已完成，后者由 `48594e8` / `09a14b0` 提交并通过 Task 门禁与双路终审。B3b–B5、C0-C、
+B3a admission pin 已完成，后者由 `48594e8` / `09a14b0` 提交并通过 Task 门禁与双路终审；B3b exact
+execution 已由 `c0ed6cd` / `f4141f0` / `fb1629a` 完成。B4–B5、C0-C、
 App/CLI 默认 UDS cutover、P3.10 LaunchAgent 与 P4–P6 仍未完成。P3.1 provisioned signed Keychain
-roundtrip 继续是外部 BLOCKED 槽位；P5/P6 物理设备/公网/Linux 证据是 post-MVP，不冒充 PASS。
+roundtrip 继续是 post-MVP BLOCKED 槽位，不阻塞 MVP/P3 exit；P5/P6 物理设备/公网/Linux 证据也是
+post-MVP，不冒充 PASS。
 具体命令与资源矩阵见 [docs/QUALITY.md](docs/QUALITY.md)。
 
 ## agentdeck CLI（参考客户端 / E2E 驱动）

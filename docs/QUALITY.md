@@ -498,9 +498,10 @@ daemon network-boundary、四份 schema、文档门禁、依赖边界与 v1 生�
 ## Relay Companion MVP P3.1 namespace / singleton / StorageKEK 门禁
 
 P3.1 的聚焦门禁只证明 daemon startup ownership、文件系统边界和可注入 keystore
-contract；它不证明 P3 RuntimeCore、UDS、LaunchAgent 或远程链路完成。unsigned 开发构建
-必须使用完整 `--ephemeral --no-remote` pair；stable 需要真实 provisioned daemon-only
-Keychain entitlement，不能通过运行时环境变量模拟。
+contract；它不证明 P3 RuntimeCore、UDS、LaunchAgent 或远程链路完成。MVP 采用方案 b：开发构建
+接受完整 `--ephemeral --no-remote` pair 与 dev/ephemeral Keychain 路径，不把它冒充 stable namespace。
+stable production signing 仍需要真实 provisioned daemon-only Keychain entitlement，不能通过运行时
+环境变量模拟，相关 roundtrip 已移入 post-MVP 证据槽位。
 
 ```bash
 # namespace、binary startup、StorageKEK（真实签名 roundtrip 默认 gated ignored）
@@ -530,17 +531,15 @@ fmt/diff-check 通过。scoped clippy 在显式允许仓库既有 7 类 baseline
 `agentdeck-cli selfcheck` 返回 `ok`、`protocolVersion=2` 与 Codex/Claude Code 两个
 adapter，测试 temp namespace 已清理。
 
-真实 Keychain gate 仍是 **BLOCKED，不是 PASS**：
+provisioned signed Keychain 证据槽位仍是 **post-MVP BLOCKED，不是 PASS**：
 `macos_keychain_signed_set_load_delete_roundtrip` 已使用唯一 service/account 与 RAII cleanup，
 但必须在编译值、codesign entitlement 与 provisioning profile 三者完全一致的 helper 上去掉
 ignore 后运行。本机没有匹配 access group 的 provisioning profile；Apple Development 与
 本地 self-signed helper 都能通过 `codesign --verify`，启动却被 AMFI 以 exit 137 终止。
-取得该外部条件前不得勾选计划 P3.1 Step 4，也不得把 signed roundtrip 记为 PASS；P3/P4 主线与 phase
-closeout 可以如实携带这一项 ignored/BLOCKED 继续。
-
-2026-07-18 裁决：该项继续 ignored/BLOCKED，但不再阻塞主线，也不再尝试通过代码或本地签名绕过
-AMFI。只在用户提供匹配 provisioning profile/Team ID，或明确把 signed roundtrip 移入 post-MVP 后更新
-状态；此前自动 Task/Phase 门禁必须如实携带这一项 BLOCKED。
+2026-07-18 已采用方案 b：MVP/P3 phase exit 以已验证的 dev/ephemeral 路径验收，signed roundtrip
+移入 post-MVP，不再作为 MVP、P3 或 P4 主线阻塞项，也不再尝试通过代码或本地签名绕过 AMFI。
+自动 Task/Phase 门禁仍须逐项读回该 ignored test 为 `BLOCKED`，不得删槽位、记为 PASS，或宣称 stable
+production signing 已完成。
 
 ## Relay Companion MVP P3.2/P3.3 Runtime store 与 adapter 私表门禁
 
@@ -689,7 +688,8 @@ actor/writer/router ownership 归零。
 P3.4 的阶段门禁刻意使用 disabled coordinator，因此其中 fake process identity 只验证
 store/actor ordering，不能作为真实 vendor 运行证据。当前 production `agentdeckd --exec-gate` 必须
 另跑下方 P3.7 门禁；
-stable Keychain signed roundtrip 仍受 P3.1 provisioning 外部门禁阻塞。
+stable Keychain signed roundtrip 仍是 P3.1 post-MVP provisioning BLOCKED 槽位，不计 PASS，但不阻塞
+MVP/P3 exit。
 
 ## Relay Companion MVP P3.5 approval 门禁
 
@@ -874,7 +874,7 @@ ReadPool、配额与调度完全不变。
   不能计入本门禁。`TransferStateMachine` 与 publication dispatcher 目前没有 production remote
   owner，component test outcome 不能写成 WSS ingress/egress 证据。
 
-P3.1 provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate；P3.7 exec gate 边界、prepare findings、
+P3.1 provisioned signed Keychain roundtrip 仍是 post-MVP BLOCKED 槽位；P3.7 exec gate 边界、prepare findings、
 fresh 完整门禁与独立终审已收口，并由 `5568e93` 完成主体 scoped commit、`c9d2146` / `5713be4`
 补齐真实 current-binary release 前取消门禁与 sentinel leader 退出窗口；P3.8-B production UDS 已由
 `1e7f9ea` / `459f32a` 完成，P3.9 shared-daemon client 和 P4 remote 尚未完成。
@@ -1133,7 +1133,8 @@ git diff --check
 preface + Hello reply 后才算 ready；stdin 为 `/dev/null` 时 PID 继续存活，SIGTERM 后 exit 0 且
 exact socket 消失。`AGENTDECK_DAEMON_SOCKET` 不得改变 endpoint，`--socket` 必须 typed unknown。
 显式 stdio 三 flag 在 EOF 后退出且不创建 socket，Ping 可用而 SessionCancel 等 control 返回
-`daemon.runtime.stdio_command_forbidden`。P3.1 provisioned signed Keychain roundtrip 继续单列外部门禁。
+`daemon.runtime.stdio_command_forbidden`。P3.1 provisioned signed Keychain roundtrip 继续单列
+post-MVP BLOCKED 槽位，不阻塞 MVP/P3 exit。
 
 ## Relay Companion MVP P3.9-C0-A1a2 Runtime v2 cutover 门禁
 
@@ -1338,7 +1339,7 @@ git diff --check
 B1b scoped code commit 为 `3d0002d`，实际 `+1,399/-64`，低于 1,800 additions 预拆线。收口读回为
 migration 21/21、schema 12/12、`runtime_store` 29/29、`runtime_store_boundaries` 5/5、
 `runtime_store_cipher` 13/13；默认 `cargo test -p agentdeckd` 的 lib 为 659 passed / 1 ignored，后续
-integration/doc tests 也 exit 0。唯一既有 ignored 是 P3.1 provisioned signed Keychain 外部门禁；真实
+integration/doc tests 也 exit 0。唯一既有 ignored 是 P3.1 provisioned signed Keychain post-MVP 槽位；真实
 migration gate 另以显式 `--ignored` 实际执行 1/1。
 
 真实样本哈希固定为 main
@@ -1402,7 +1403,8 @@ B2c scoped code commit 为 `30103c1`，实际 `+1,333/-72`，低于 1,800 additi
 Router 8/8、trait shape 1/1、runtime snapshot 23 passed / 1 ignored、daemon lib 672 passed / 1 ignored；
 完整 package 含 1,024 × 256 MiB exact boundary 255.29 秒、stream 45/45、transfer 17/17、StorageKEK
 14 passed / 1 ignored，全部 exit 0。两路独立终审均 Approved，无 P0/P1/P2。B2 只完成 configuration
-CAS/snapshot/Core/defaults；B3–B5、P4–P6 与 P3.1 signed Keychain 外部门禁仍未完成。
+CAS/snapshot/Core/defaults；B3–B5、P4–P6 当时仍未完成，P3.1 signed Keychain 则保留为 post-MVP
+BLOCKED 槽位。
 
 ## Relay Companion MVP P3.9-C0-B3a command pin / prompt admission 门禁
 
@@ -1454,7 +1456,67 @@ Clippy、fmt、network/no-net、docs 与 diff 均 exit 0。独立 `spec/security
 protocol test-target Clippy 在 Rust 1.96 上受 2026-06-29 既有 `protocol_version_is_positive` 常量断言
 `assertions_on_constants` warning 阻断，本轮未把该命令计为 PASS，也没有为 B3a 夹带 baseline 修复；
 production `failure.rs` 以 protocol 全量测试和 `cargo clippy ... --lib` 收口。6 个 ignored 均是现有显式
-gated/manual artifact fixture；其中 P3.1 provisioned signed Keychain 继续单列 BLOCKED，不计 PASS。
+gated/manual artifact fixture；其中 P3.1 provisioned signed Keychain 作为 post-MVP 槽位继续单列
+BLOCKED、不计 PASS，也不阻塞 MVP/P3 exit。
+
+## Relay Companion MVP P3.9-C0-B3b exact execution 门禁
+
+**具体威胁场景：** Accepted command 虽有 authenticated configuration pin，但 Start 若只读取 current head、
+只认证目标 configuration row，或让普通 live/replay command 把 rev0 解释为当前 defaults，配置在排队期间推进
+后就可能改变原命令的 vendor argv/control 与 approval at-decision metadata。B3b 因此要求 Store 在同一
+transaction 认证 command、pin 与完整 `1...head` chain，按 pin 选择 historical revision，并只允许真实
+migration cutoff 内 command 的 startup recovery 使用冻结 P3.7 rev0 defaults。
+
+```bash
+# B3b Store/Core/adapter focused matrix
+cargo test -p agentdeckd --test runtime_store_command_configuration_recovery -- --test-threads=1
+cargo test -p agentdeckd --lib \
+  runtime::conversation::runtime_execution_fixture_tests:: -- --test-threads=1
+cargo test -p agentdeckd --test production_execution_wiring -- --test-threads=1
+cargo test -p agentdeckd --test runtime_crash_recovery -- --test-threads=1
+cargo test -p agentdeckd --lib codex::driver_tests:: -- --test-threads=1
+cargo test -p agentdeckd --lib claude_code::driver_tests:: -- --test-threads=1
+cargo test -p agentdeckd --lib codex::runtime_translate_tests:: -- --test-threads=1
+cargo test -p agentdeckd --lib claude_code::runtime_translate_tests:: -- --test-threads=1
+cargo clippy -p agentdeckd --lib --tests -- -D warnings
+cargo fmt --all -- --check
+
+# Task 收口完整 package / 跨语言 / 自检
+cargo test -p agentdeckd
+cargo test -p agentdeck-protocol -- --test-threads=1
+swift test
+cargo run -q -p agentdeck-cli -- protocol schema \
+  | diff - protocol/agentdeck/agentdeck-protocol.schema.json
+swift run AgentDeck -- --selfcheck
+
+# 静态、network 与文档
+cargo clippy -p agentdeckd --all-targets -- -D warnings
+cargo clippy -p agentdeck-protocol --lib -- -D warnings
+cargo fmt --all -- --check
+bash scripts/check-daemon-network-boundary.sh
+bash scripts/check-daemon-no-net.sh
+scripts/verify-agent-docs.sh
+git diff --check
+git status --short --branch
+```
+
+实现证据：`c0ed6cd` 接通 exact configuration execution 与两家 adapter 映射，`f4141f0` 收紧 rev0
+startup-only provenance 并让 production probe 跨真实 Store shutdown/reopen，`fb1629a` 把中立
+`ClaudeCodePermissionMode::Default` 映射到当前 vendor CLI 的 `--permission-mode manual`。B3b production
+additions 合计 658；测试和文档 additions 不计入 1,800/2,000 刹车线。
+
+**Task gate 已确认读回（2026-07-18）：** daemon lib `691 passed / 1 ignored`（126.04 秒）；完整 daemon
+package exit 0，经 test list 复核共 1,156 tests，即 `1150 passed / 6 ignored`；1,024 × 256 KiB 容量
+target `5/5`（278.46 秒）；4,096 行完整 configuration chain target `1/1`（55.97 秒）；protocol
+`170/170`；Swift XCTest `298/298` + Swift Testing `35/35`；schema snapshot、自检、daemon all-target
+Clippy、protocol lib Clippy、fmt、network/no-net、docs 与 diff 均全绿。6 个 ignored 继续
+作为显式 gated/manual 项，其中 P3.1 provisioned signed Keychain 保持 post-MVP BLOCKED、不计 PASS，
+也不阻塞 MVP/P3 exit。
+
+production wiring probe 使用 non-default rev1 Accept command，随后把 head 推进到 rev2，并跨 Store
+shutdown/reopen + startup recovery 证明 synthetic `ProbeAgent` 仍只取得 rev1。仓库内 recorded
+argv/control/translator fixture 只证明 builder/translator 字段映射；这些自动证据都不是 live Codex/Claude
+Code login、真实 vendor approval、P4 RemoteLink 或 Companion E2E。
 
 ## AppKit 重写后的验证清单
 
@@ -1575,7 +1637,7 @@ cargo install cargo-llvm-cov
 | agentdeck-protocol 类型变更 | `cargo test`（漂移测试自动运行）；若漂移测试失败须先重新生成快照（见下） |
 | 参考客户端 CLI（agentdeck-cli）、Transport、Client | `cargo test -p agentdeck-cli`；再跑完整 `cargo test` |
 | Relay Companion MVP P0 基线或 v1 reset | 迭代时跑 `bash scripts/tests/reset-relay-v1-dev-state.sh`；提交前跑一次 `bash scripts/verify-relay-companion-mvp.sh p0` |
-| Relay Companion MVP P3.1 daemon namespace / singleton / StorageKEK | 运行本页 P3.1 聚焦矩阵、`cargo test -p agentdeckd`、CLI/Swift transport tests、daemon network-boundary；stable Keychain 必须另有真实 provisioned signed helper 证据，ignored 不算通过 |
+| Relay Companion MVP P3.1 daemon namespace / singleton / StorageKEK | 运行本页 P3.1 聚焦矩阵、`cargo test -p agentdeckd`、CLI/Swift transport tests、daemon network-boundary；MVP 接受完整 dev/ephemeral 路径，provisioned signed helper 是 post-MVP BLOCKED 证据槽位，不计 PASS 但不阻塞 MVP/P3 exit |
 | Relay Companion MVP P3.2/P3.3 Runtime SQLite / journal / adapter 私表 | 运行本页十四组 store/boundary tests（含真实 256 MiB、paged recovery 与 v1→v2 migration）、canonical router/双 adapter tests、默认并发 `cargo test -p agentdeckd`、daemon network-boundary、fmt/clippy/diff/docs；只证明组件，不冒充 RuntimeCore/UDS/Companion E2E |
 | Relay Companion MVP P3.4 RuntimeCore / principal / actor | 运行本页 P3.4 Core+Store+Rust/Swift contract 矩阵、100 路 Start 竞态、daemon 全回归、network-boundary/fmt/clippy/diff/docs；该历史阶段用 disabled coordinator，只证明 Core contract，不能替代 P3.7 exec-gate 或 P3.8/P3.9 UDS E2E |
 | Relay Companion MVP P3.5 approval CAS / delivery | 运行本页 P3.5 固定 16 项聚合 gate，并以 private schema/sqlite/store/permission/worker/actor fault tests 作为行为证据；补跑 adapter shape、Rust/Swift contract、daemon 全回归与静态边界。P3.5/legacy CC Approval 隐藏；P3.7 canonical typed builder 的 recorded fixture 也不冒充 live vendor E2E |
@@ -1586,6 +1648,7 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P3.9-C0-A2 Swift Runtime v2 mirror | 运行本页 A2a/A2b/A2c1/A2c2 focused、public API 与 frozen v1 gate、完整 `swift test`、iOS XcodeGen + Simulator、App selfcheck、docs/diff；A2 完成只证明 current codec、compact/98-fixture 与真实 UDS Swift readback，不得宣称 App/CLI 默认 UDS cutover |
 | Relay Companion MVP P3.9-C0-B1b Runtime DB v5 migration | 运行本页 schema/migration/store/boundary/cipher、默认完整 daemon、Clippy/fmt/no-net/selfcheck/docs/diff 与真实 v4 writer byte-exact gate；只证明 schema v5、authenticated migration/materialization，不冒充 B2–B4 writer、P4 CounterGuard 或 Companion E2E |
 | Relay Companion MVP P3.9-C0-B3a command pin / prompt admission | 运行本页 B3a Store/Core focused matrix、完整 daemon package、protocol/Swift/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明 expected revision admission、同事务 nonzero pin、pinned receipt/status/recovery 与 Store-owned authorization lifetime，不冒充 B3b exact configuration execution、live vendor 或 Companion E2E |
+| Relay Companion MVP P3.9-C0-B3b exact execution | 运行本页 B3b Store/Core/driver/translator/restart focused matrix、完整 daemon package、protocol/Swift/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明 command-pinned historical configuration、rev0 startup-only、Codex/CC argv/control/at-decision mapping 与 synthetic restart probe，不冒充 live vendor、P4 RemoteLink 或 Companion E2E |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

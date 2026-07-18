@@ -63,8 +63,9 @@ P5/P6 MVP 退出范围的上位纠偏决策；冲突处以纠偏决策为准。�
   一次 phase 级双路终审、完整慢门禁与 phase verifier。RED→GREEN、精确 pathspec、
   neutrality/sentinel 与安全静态门禁不因节奏调整而放宽。
 - 每个commit前先用`git status --short`和`git diff --name-only`核对当前task的Files；文中的目录级`git add`必须在执行时展开为本task实际变更的精确pathspec，任何用户既有/并行无关改动保持unstaged；禁止`git add -A`。
-- Phase 状态分为“实现/自动门禁 candidate”与“外部证据槽位”两层。P3.1 provisioned signed Keychain
-  保持 ignored/BLOCKED 且不再消耗执行时间；P4 功能范围完整保留。P5 的 MVP 退出门禁收敛为 iOS
+- Phase 状态分为“实现/自动门禁 candidate”与“外部证据槽位”两层。P3.1 采用方案 b：MVP 接受完整
+  dev/ephemeral Keychain 路径，provisioned signed roundtrip 移入 post-MVP ignored/BLOCKED 槽位，不再
+  消耗执行时间或阻塞 MVP/P3 exit；这不表示 stable production signing 已完成。P4 功能范围完整保留。P5 的 MVP 退出门禁收敛为 iOS
   Simulator 自动 E2E + 本机第二客户端，物理 iPhone/第二台 Mac 移入 post-MVP；P6 只把合成链路可
   自动化的 DoD 项作为 MVP 门禁，真实 vendor/公网 WSS/物理设备/干净 Linux host 槽位保留 BLOCKED。
   不得把 synthetic/Simulator/loopback 改写成真实设备证据，也不得因 post-MVP 槽位 BLOCKED 阻塞主线。
@@ -76,7 +77,7 @@ P5/P6 MVP 退出范围的上位纠偏决策；冲突处以纠偏决策为准。�
 | P0 | 基线、显式 Relay v1 reset、统一验证入口 | 当前 Rust/Swift/iOS/docs 基线全绿；reset 脚本只删除显式指定的 v1 开发状态 |
 | P1 | Runtime/Relay v2/E2EE contract 与 Rust/Swift crypto | IPC/Runtime/Relay/E2EE 四套独立 schema、neutrality、Rust↔CryptoKit 互操作全绿 |
 | P2 | Relay v2 原子 cutover | restart/revoke/quota/TLS/forgery/replay/slow-client/sentinel 全绿，v1 生产代码删除 |
-| P3 | Singleton RuntimeCore、UDS、exec fence、LaunchAgent | 两个本地客户端共享真实会话；crash boundary、install/upgrade/uninstall 通过 |
+| P3 | Singleton RuntimeCore、UDS、exec fence、LaunchAgent | 两个本地客户端共享真实会话；crash boundary、install/upgrade/uninstall 与 dev/ephemeral Keychain 路径通过；provisioned signed roundtrip 为 post-MVP BLOCKED 槽位 |
 | P4 | Machine identity、pairing、RemoteLink、远程 CLI | 完整功能与合成 Codex/CC RemoteLink/receipt E2E、restart/trust reset 自动闭环；真实 vendor login 为 post-MVP BLOCKED 槽位 |
 | P5 | 共享 Swift client、iOS Companion、远程 macOS | Simulator 自动 E2E + 本机第二客户端通过；物理 iPhone/第二台 Mac 为 post-MVP BLOCKED 槽位 |
 | P6 | 四端竞态、故障注入、运维与 DoD | 十三项 DoD 的合成可自动化项通过；真实 vendor/公网/物理设备/Linux host 槽位可读且保持 BLOCKED |
@@ -536,10 +537,10 @@ impl RelayPairingClient {
 
 ### Task P3.1：建立 stable/ephemeral namespace、singleton lock 与 StorageKEK Keychain
 
-> **外部门禁裁决（2026-07-18）：** production 代码已完成；provisioned signed Keychain roundtrip 继续
-> ignored/BLOCKED，但不再阻塞主线，也不再尝试用代码绕过 AMFI。解锁只接受用户侧二选一：提供含
-> `keychain-access-groups` entitlement 的 provisioning profile/Team ID；或明确把 signed roundtrip 移入
-> post-MVP、MVP 接受 dev/ephemeral Keychain 路径。在用户拍板前维持现状。
+> **范围裁决（2026-07-18，方案 b）：** production 代码已完成；MVP 接受完整 dev/ephemeral
+> Keychain 路径。provisioned signed Keychain roundtrip 移入 post-MVP ignored/BLOCKED 证据槽位，不再
+> 阻塞 MVP、P3/P4 主线或 phase closeout，也不再尝试用代码绕过 AMFI；这不表示 stable production
+> signing 已完成。
 
 **Files:**
 - Create: `agentdeckd/src/{config,security/mod,security/key_store,security/macos_keychain}.rs`
@@ -566,9 +567,9 @@ pub trait KeyStore: Send + Sync { fn load(&self, account: &str) -> Result<Option
 - [x] Step 1: 已先写 namespace/lock/Keychain 与 binary startup tests。覆盖 stable 固定路径与 OS home、不完整 mode matrix、ephemeral 全资源隔离、第二进程锁拒绝、symlink/hardlink/宽权限拒绝、stable 旧目录仅精确 0755→0700 安全迁移（0775/0777/01755 拒绝）、fresh StorageKEK、DB/WAL/SHM 已存在时缺 key fail-close、持久化读回不一致和 secret Debug redaction。
 - [x] Step 2: 已保留 TDD RED（缺少 config/security/namespace API），再运行聚焦矩阵；当前 `daemon_namespace` 18/18、`daemon_startup` 4/4、`storage_kek` 14 PASS，另有 1 个真实签名 Keychain roundtrip 按预期 gated ignored。
 - [x] Step 3: 已实现 P3.1 当时的固定启动序列 `config → private namespace/singleton → keystore → StorageKEK → record namespace → selfcheck/stdio loop`。data root 以 0700 原子创建；只对当前 UID 拥有、权限精确为旧版 0755 的固定 stable 目录，在已 `O_NOFOLLOW` 打开的 directory fd 上收紧到 0700，其他宽权限拒绝；lock 只经该 dirfd 的 `openat` 建立，并在 `flock` 前后核对 owner/mode/nlink/dev/ino。stable Keychain 使用 protected、non-synchronizable、`AccessibleAfterFirstUnlockThisDeviceOnly`、空 access-control flags，缺 entitlement/backend 失败即关闭且无 memory/明文回退；ephemeral 才使用独立 memory store。P3.8 后过渡 stdio 调用方显式传 `--stdio-compat --ephemeral --no-remote --profile dev` 并移除继承的旧 namespace env；默认 shared-daemon client 切换仍属于 P3.9。
-- [ ] Step 4: **GATED / BLOCKED（不是 PASS）**。唯一 service/account、RAII 清理的 ignored roundtrip 已存在，但本机没有匹配 access group 的 provisioning profile；Apple Development 与本地 self-signed helper 均可通过 `codesign --verify`，实际启动都被 AMFI 以 exit 137 终止。因此尚无真实 `set → load → delete` Keychain 读回证据，不能勾选本步或把 signed roundtrip 记为 PASS；2026-07-18 起 P3/P4 主线与 phase closeout 可携该 BLOCKED 槽位继续，且不再尝试代码绕过。只有具备匹配 provisioning/entitlement 的已签名 helper，或用户明确把本项移入 post-MVP 后才更新状态。
+- [ ] Step 4: **post-MVP GATED / BLOCKED（不是 PASS）**。唯一 service/account、RAII 清理的 ignored roundtrip 已存在，但本机没有匹配 access group 的 provisioning profile；Apple Development 与本地 self-signed helper 均可通过 `codesign --verify`，实际启动都被 AMFI 以 exit 137 终止。因此尚无真实 `set → load → delete` Keychain 读回证据，不能勾选本步或把 signed roundtrip 记为 PASS。方案 b 已将本步移出 MVP/P3 exit；主线携该 BLOCKED 槽位继续，不再尝试代码绕过，未来只在具备匹配 provisioning/entitlement 的已签名 helper 后更新。
 - [x] Step 5: 已运行聚焦 Rust tests、CLI tests、Swift tests、daemon no-net、`cargo fmt --check`、`git diff --check` 与 scoped clippy；结果为 CLI 27/27、Swift 243 XCTest + 35 Swift Testing、no-net/diff-check 通过，scoped clippy 在显式允许仓库既有 7 类 baseline lint 后以 `-D warnings` 通过。真实 `cargo run -q -p agentdeck-cli -- selfcheck` 返回 `ok`、`protocolVersion=2` 与双 adapter，临时 namespace 已清理；主执行者提交前又重跑完整 `cargo test`，全 workspace 通过（只有本 task 明确记录的真实签名 Keychain gate ignored）。
-- [x] Step 6: 已核对 daemon、两个 stdio transport、测试与文档精确 pathspec，未使用 `git add -A`；提交为 `835a7b3 feat(daemon): 建立 singleton namespace 与 StorageKEK`。Step 4 仍是外部签名条件 gated，故该提交不构成 signed roundtrip PASS；P3/P4 phase closeout 可如实携带该 BLOCKED 槽位。
+- [x] Step 6: 已核对 daemon、两个 stdio transport、测试与文档精确 pathspec，未使用 `git add -A`；提交为 `835a7b3 feat(daemon): 建立 singleton namespace 与 StorageKEK`。Step 4 仍是 post-MVP 外部签名条件 gated，故该提交不构成 signed roundtrip PASS；MVP/P3/P4 phase closeout 按方案 b 验收 dev/ephemeral 路径并携带该 BLOCKED 槽位。
 
 ### Task P3.2：实现 Runtime SQLite journal、稳定身份与存储上界
 
@@ -2110,8 +2111,9 @@ P3.9 固定以下迁移边界：
       独立终审、完整 package/跨语言门禁与 docs commit。1,800/2,000 additions 只计 production 代码；测试和
       文档不计。子片只跑 focused tests + scoped clippy + fmt。B3a 已按该规则完成一次 Task gate、双路终审
       与文档读回；
-      P3.1 signed Keychain 外部门禁继续 ignored/BLOCKED，主线不等待也不再尝试绕过 AMFI。
-  - [ ] **B3b exact execution（独立 Task）：** queued/restart/recovery 按 pin load exact configuration；只有
+      P3.1 provisioned signed Keychain 已按方案 b 移入 post-MVP ignored/BLOCKED 槽位；MVP/P3 exit 验收
+      dev/ephemeral 路径，主线不等待也不再尝试绕过 AMFI。
+  - [x] **B3b exact execution（独立 Task；complete）：** queued/restart/recovery 按 pin load exact configuration；只有
     `commandSeq <= legacyCommandHighWater` 的迁移前命令可在 startup recovery 消费 frozen P3.7 rev0 defaults。
     Codex/CC recorded argv/control/translator fixture 锁定实际字段映射，不冒充 live login。
 
@@ -2126,37 +2128,47 @@ P3.9 固定以下迁移边界：
     - Modify: `agentdeckd/tests/{runtime_store_command_configuration_recovery,production_execution_wiring,runtime_crash_recovery}.rs`
     - Modify as required: `agentdeckd/tests/fixtures/{codex,claude_code}/` 与对应 fixture README/hash 记录
 
-    - [ ] **Step 1：写确定性 RED。** 创建 rev1 command 后推进 head 到 rev2，分别从 queued、同进程
+    - [x] **Step 1：写确定性 RED。** 创建 rev1 command 后推进 head 到 rev2，分别从 queued、同进程
       recovery 与 shutdown/reopen recovery 进入 production prepare，断言 adapter 只能观察 rev1 exact
       configuration；fresh v5 缺 pin/缺 exact row、pin/config agent kind mismatch 必须在 spawn 前 fail-close。
       legacy rev0 只允许真实 migration cutoff 内 command 的 startup recovery，普通 queued 路径不得回退 defaults。
-    - [ ] **Step 2：实现 Store exact execution read。** 在同一认证 SQLite read transaction 内加载 command、
+    - [x] **Step 2：实现 Store exact execution read。** 在同一认证 SQLite read transaction 内加载 command、
       exact pin 与对应 `configuration_journal` 行，认证完整 `1...head` chain/AEAD/MAC/event body 并选择
       pinned revision；返回
       typed execution configuration，不查询 current head、不以 missing pin 解释为 rev0、不暴露通用 Store handle
       给 adapter。
-    - [ ] **Step 3：绑定 daemon execution contract。** 把 exact configuration/revision 放入
+    - [x] **Step 3：绑定 daemon execution contract。** 把 exact configuration/revision 放入
       `RuntimeExecutionContext` 与 crate-private `AgentTurnRequest`，在 Router/adapter prepare 前验证
       conversation agent kind 与 `vendorControl` variant 一致。Codex 把 approval policy/sandbox 写入
       thread start/resume、reasoning effort 写入 turn start；Claude Code 把 permission mode/model/effort/
-      output style 固定到 fresh/resume argv/control。不得顺带加入 mcp overrides、tools/path/plugin/hooks 或
+      output style 固定到 fresh/resume argv/control；中立 `Default` 在当前 vendor CLI 映射为 `manual`，
+      不发送已不接受的 `default`。不得顺带加入 mcp overrides、tools/path/plugin/hooks 或
       client-visible vendor identity。
-    - [ ] **Step 4：锁定 recorded fixture 与 crash/replay。** 使用仓库内已筛选脱敏的 Codex/CC recorded
+    - [x] **Step 4：锁定 recorded fixture 与 crash/replay。** 使用仓库内已筛选脱敏的 Codex/CC recorded
       argv/control/translator fixture 证明非默认字段、head advance、exact replay、restart/recovery 与 action
       request at-decision metadata 一致；fixture 只证明 builder/translator 字段映射，不冒充 live login、真实
       vendor approval 或 P4 RemoteLink。
-    - [ ] **Step 5：运行 B3b focused gate。**
+    - [x] **Step 5：运行 B3b focused gate。**
       ```bash
       cargo test -p agentdeckd --test runtime_store_command_configuration_recovery -- --test-threads=1
-      cargo test -p agentdeckd --lib runtime::runtime_execution_fixture_tests:: -- --test-threads=1
+      cargo test -p agentdeckd --lib runtime::conversation::runtime_execution_fixture_tests:: -- --test-threads=1
       cargo test -p agentdeckd --test production_execution_wiring -- --test-threads=1
       cargo test -p agentdeckd --test runtime_crash_recovery -- --test-threads=1
       cargo test -p agentdeckd --lib codex::driver_tests:: -- --test-threads=1
       cargo test -p agentdeckd --lib claude_code::driver_tests:: -- --test-threads=1
+      cargo test -p agentdeckd --lib codex::runtime_translate_tests:: -- --test-threads=1
+      cargo test -p agentdeckd --lib claude_code::runtime_translate_tests:: -- --test-threads=1
       cargo clippy -p agentdeckd --lib --tests -- -D warnings
       cargo fmt --all -- --check
       ```
-    - [ ] **Step 6：B3b Task 收口。** 精确提交 code/test 后，按 Global Constraints 运行一次完整
+      code/test commits 为 `c0ed6cd`（exact execution）、`f4141f0`（rev0 startup-only + restart probe）与
+      `fb1629a`（Claude Code `Default → manual`）；production additions 合计 658，测试/文档不计入刹车线。
+      已读回 daemon lib `691 passed / 1 ignored`（126.04 秒）、完整 package exit 0 且经 test list 复核为
+      `1150 passed / 6 ignored`（共 1,156 tests）、1,024 × 256 KiB 容量 target `5/5`（278.46 秒）、
+      4,096 行 configuration chain `1/1`（55.97 秒）、protocol `170/170`、Swift `333/333` 与
+      schema/selfcheck/Clippy/fmt/network/docs/diff 全绿；P3.1 provisioned signed test 继续作为 post-MVP
+      BLOCKED 槽位。
+    - [x] **Step 6：B3b Task 收口。** 精确提交 code/test 后，已按 Global Constraints 运行一次完整
       package/跨语言门禁、独立 `spec/security` 与 `quality` 终审，修完 findings，再同步 README、
       ARCHITECTURE、QUALITY、DIAGNOSTICS、本计划与 progress，并创建一个 Task 级 docs commit。不得把
       B3b 的完整门禁或文档延迟到 B5 aggregate。
@@ -2396,8 +2408,9 @@ sealed frame -> Relay v2 outer validation -> DeviceSign/AAD/replay/AEAD verifica
   才运行 signed Keychain/CLI restart 与两个真实 vendor suites，并输出各自 conversation/command evidence
   reference；最后运行完整 trust-reset/uninstall-purge/readback/reinstall 子流程。P4 的 pairing/RemoteLink/
   远程 CLI 功能与 harness 全保留；2026-07-18 起，`p4-auto` 全绿即可进入后续 MVP 主线，真实 vendor/公网
-  部分作为 post-MVP 外部证据槽位保持 BLOCKED。provisioned signed Keychain roundtrip 仍是 P3.1 未决
-  BLOCKED，不得记 PASS，也不在用户拍板 a/b 前擅自归入 post-MVP；两者都不阻塞 P5/P6 自动实现。
+  部分作为 post-MVP 外部证据槽位保持 BLOCKED。方案 b 已把 provisioned signed Keychain roundtrip
+  同样归入 post-MVP BLOCKED；不得记 PASS 或宣称 stable production signing 已完成，但不阻塞 P4 automatic
+  candidate、P5/P6 自动实现或 MVP exit。
 - [ ] Step 5: `git status --short --branch`，清理临时Keychain accounts、DB、invite与logs。
 - [ ] Step 6: 提交 automatic candidate 与 gated harness。精确展开本 task pathspec 后执行
   `git commit -m "test(remote): 建立 P4 自动与真实验收门禁"`；若 real gate BLOCKED，文档必须保留该状态，

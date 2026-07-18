@@ -52,19 +52,18 @@ daemon、替换二进制或直接读取使用中的内存密钥，SQLite 层的�
 5. 原有安全底线不变：RED→GREEN、精确 pathspec、无 co-author、不 push、
    neutrality/sentinel 门禁照旧。
 
-## 决策 3：P3.1 signed Keychain 保持 gated，不阻塞主线
+## 决策 3：P3.1 采用方案 b，signed Keychain 移入 post-MVP
 
 该项是外部签名环境问题（缺匹配 keychain-access-groups 的 provisioning
 profile，self-signed helper 被 AMFI exit 137 终止），**代码不可解**。
 
-- 主线继续以 1 项 ignored/BLOCKED 推进；P3/P4 的 phase exit 允许携带此
-  gate，但必须在计划中如实标注（现状已如此，维持）。
-- 解锁需要用户侧动作（二选一，由用户决定）：
-  a. 在 Apple Developer 为 daemon helper 配置含 keychain-access-groups
-     entitlement 的 provisioning profile 并提供 Team ID；
-  b. 宣布 MVP 阶段接受 dev/ephemeral Keychain 路径，把 signed roundtrip
-     移入 post-MVP 清单。
-- 在此之前，不再花执行时间尝试绕过 AMFI。
+- 已拍板采用方案 b：MVP 阶段接受 dev/ephemeral Keychain 路径；这只证明开发与合成链路，
+  不宣称 stable production signing 已完成。
+- provisioned signed Keychain set/load/delete roundtrip 移入 post-MVP，继续以
+  ignored/BLOCKED 证据槽位保留，但不再阻塞 P3/P4 phase exit 或 MVP 完成。
+- 若 post-MVP 需要解锁该槽位，再在 Apple Developer 为 daemon helper 配置含
+  `keychain-access-groups` entitlement 的 provisioning profile 并提供 Team ID；在此之前不再花执行时间
+  尝试绕过 AMFI。
 
 ## 决策 4：P4–P6 范围收敛（MVP 验收面收窄）
 

@@ -461,10 +461,11 @@ dev/ino。不要先 `rm` lock：guard 锁的是保持打开的 fd，删除 pathn
 StorageKEK 缺失时先检查 `runtime.db`、`runtime.db-wal`、`runtime.db-shm` 是否存在或不是
 普通空文件。任一既有 state 都意味着不能生成替代 key；不要删除 DB 以绕过错误，也不要
 把 key 写入文件。stable Keychain backend 不可用时只修复 signing/provisioning/entitlement，
-禁止切换到 memory store。P3.1 真实签名 roundtrip 当前仍 gated/BLOCKED：本机无匹配
-provisioning profile，两个已通过 `codesign --verify` 的尝试均被 AMFI 以 exit 137 终止；
-ignored 测试不是通过证据。2026-07-18 起该槽位保持 BLOCKED 但不阻塞 P3/P4 主线或 phase closeout；
-在用户提供匹配 provisioning profile/Team ID 或明确移入 post-MVP 前，不再尝试本地绕过 AMFI。
+禁止把既有 stable state 偷换到 memory store。2026-07-18 已采用方案 b：MVP 接受完整
+`--ephemeral --no-remote --profile dev` 与 dev/ephemeral Keychain 路径；这不等于 stable production
+signing 已完成。P3.1 provisioned signed roundtrip 已移入 post-MVP BLOCKED 证据槽位：本机无匹配
+provisioning profile，两个已通过 `codesign --verify` 的尝试均被 AMFI 以 exit 137 终止，ignored 测试
+不是通过证据。该槽位不再阻塞 MVP、P3/P4 主线或 phase closeout，也不再尝试本地绕过 AMFI。
 
 | P3.1 code | 含义 | 下一步 |
 | --- | --- | --- |
@@ -511,13 +512,15 @@ ignored 测试不是通过证据。2026-07-18 起该槽位保持 BLOCKED 但不�
 | `daemon.diagnostics.path_unavailable` | diagnostics one-shot 无可用日志路径 | 提供合法 profile/absolute data-dir，或先创建一次诊断日志 |
 | `daemon.runtime.main_loop_failed` | security bootstrap 已完成，但 UDS listener 或显式 stdio compatibility 主循环失败 | 先按下方 `daemon.local.*` 子码检查入口/信号/I/O；guard/KEK 会随进程退出释放/清零 |
 
-## Runtime SQLite / journal / adapter 私表 / Core 诊断（Companion MVP P3.2–P3.9-C0-B3a）
+## Runtime SQLite / journal / adapter 私表 / Core 诊断（Companion MVP P3.2–P3.9-C0-B3b）
 
 P3.2/P3.3 error code 是 store 内部精确错误的稳定诊断归类；P3.4–P3.6 已把接入 RuntimeCore 的
 路径映射成 wire `RuntimeFailure`，并增加 Core/principal/connection/read overload、approval
 authorization、delivery 与 stream/snapshot 分类；P3.9-C0-B2 又接通 DescribeAgents、configuration CAS、
 cursor-consistent snapshot 与 Core typed receipt，B3a 再接通 configuration-aware SendPrompt admission、
-nonzero command pin 与 pinned revision receipt。transfer reducer 仍只有 component-local typed
+nonzero command pin 与 pinned revision receipt；B3b 再把 command-pinned exact configuration 送入
+Store Start、Runtime execution context、两家 adapter argv/control 与 approval at-decision metadata。
+transfer reducer 仍只有 component-local typed
 error，没有 production wire owner。排查时保留 DB/WAL/SHM 原件，先运行 diagnostics/read-only
 inspection，
 不要用删除 sidecar、生成新 KEK 或直接改 high-water 的方式“修复”。
@@ -550,6 +553,28 @@ scan active 时 inspect 与 shutdown 仍可用；create/accept/start、fence/rel
 全部返回 `daemon.runtime.recovering`。这不是“读永远可用”：业务 recovery read 也受 exact
 cursor/单 outstanding scan 限制。若 scan 无法结束，保留 DB/WAL/SHM 与 Keychain 原件后让
 daemon fail-closed 退出，不要跳页、伪造 cursor 或删除 sidecar。
+
+### Exact execution configuration 语义
+
+Started command 的执行配置以 Accepted 时的 authenticated pin 为准，不以排队、重启或 recovery 时的
+current configuration head 为准。Store 必须在同一 SQLite transaction 读取 command/pin，认证该
+conversation 完整 `1...head` configuration chain，再选择 pinned historical revision；目标行存在但链的
+中间行、tail、event anchor、agent kind 或 vendor variant 无法认证时，都要在 adapter spawn 前
+fail-close。排查“receipt 是 rev1、argv/control 却像 rev2”时，应保留 DB/WAL/SHM 与 StorageKEK 原件，
+核对 command、pin、configuration chain 和 startup provenance；禁止改 pin、回退 current head 或用当前
+defaults 重跑原 command。
+
+rev0 只解释真实 v4→v5 migration cutoff 内、由 authenticated startup reconciliation 安装的 Accepted
+command，并使用 daemon 冻结的 P3.7 defaults。普通 live queue、exact replay、同进程恢复或 cutoff 外
+command 都没有该资格；出现 rev0 时应保持 `RecoveryBlocked`，不能手工改成 nonzero pin。Codex 的
+approval policy/sandbox、reasoning effort 和 Claude Code 的 permission mode/model/effort/output style
+都来自同一冻结配置；Runtime/UI 的 Claude Code `Default` 在当前 vendor argv 上对应 `manual`，日志里出现
+`--permission-mode default` 是 mapping regression。Codex approval 的 policy/sandbox 与 CC approval 的
+permission mode at-decision metadata 也必须与执行配置一致。
+
+production restart probe 使用 synthetic `ProbeAgent` 与无副作用 `/bin/sh` helper；recorded
+argv/control/translator fixture 只用于字段形状和映射回归。它们不是 live vendor login、真实 approval、
+RemoteLink 或 Companion E2E，排障报告不得把这些自动证据升级成真实链路结论。
 
 worker 初始化或 migration 通过 ready channel 返回错误前，必须先释放 Runtime DB path lease；caller
 收到错误后可直接 exact reopen。若此时仍得到 `daemon.runtime.store_unavailable`/`StoreAlreadyOpen`，
@@ -597,7 +622,7 @@ P3.4 RuntimeCore 的 transport-neutral failure：
 | `daemon.runtime.actor_unavailable` | conversation actor/execution control 已损坏或 recovery-blocked | 不自动重放 Started；保留 command/fence 证据，P3.7 按 orphan fencing 处理 |
 | `daemon.runtime.connection_unavailable` | connection 不存在、writer lagged、transport 未 ACK flush 或编码失败 | 仅重连当前客户端，并按 commandId/idempotency 查询 durable receipt；不得假定未执行 |
 | `daemon.runtime.read_unavailable` | 独立 ReadPool 已满或关闭 | 有界退避后重试读取；不要创建更多等待 task，副作用请求仍以 durable receipt 为准 |
-| `daemon.runtime.recovery_blocked` | Started 的已知 PGID 内 cooperative descendants 无法在 TERM→KILL/reap 后证明退出，binding/fence readback 不一致，或 P4 前存在 remote Accepted | 只隔离对应 damaged conversation；保留 DB/fence/process 证据并人工清理。remote Accepted 属全局启动拒绝，P4 durable auth readback 前不得安装任何 actor。该 code 不表示 daemon 已检测到流程外自守护/逃逸进程 |
+| `daemon.runtime.recovery_blocked` | Started 的已知 PGID 内 cooperative descendants 无法在 TERM→KILL/reap 后证明退出，binding/fence readback 不一致，exact command pin/configuration chain 无法认证，live/replay command 出现 rev0，或 P4 前存在 remote Accepted | 只隔离对应 damaged conversation；保留 DB/WAL/SHM/KEK、pin/configuration、fence/process 证据，禁止补 pin或改 current head。remote Accepted 属全局启动拒绝，P4 durable auth readback 前不得安装任何 actor。该 code 不表示 daemon 已检测到流程外自守护/逃逸进程 |
 | `daemon.turn.stale` | CancelQueued 已输给 Started，或 CancelActive 的 turnId 不是当前 turn | 查询精确 CommandStatus；对 Started 只使用返回的当前 turnId 明确 cancel |
 | `daemon.runtime.stdio_command_forbidden` | 显式 compatibility stdio 收到 allowlist 外的 execution/control/history mutation 命令 | 改用 RuntimeEnvelope UDS；stdio 只保留 Ping/Selfcheck/schema/version、agent list/capabilities 与 history list/read |
 

@@ -448,8 +448,9 @@ conversation/key，不能伪造身份连续性。
 - 已有 ignored、唯一 service/account、RAII 清理的真实 Keychain roundtrip，但 P3.1 的签名
   门禁尚未通过：当前机器无匹配 provisioning profile；Apple Development 与本地
   self-signed helper 虽通过 `codesign --verify`，均被 AMFI 以 exit 137 拒绝启动。因此本节
-  只描述实现边界，不能把 signed roundtrip 记为 PASS；2026-07-18 起 P3/P4 主线与 phase closeout 可
-  如实携带该 ignored/BLOCKED 槽位继续，不再尝试代码绕过 AMFI。
+  只描述实现边界，不能把 signed roundtrip 记为 PASS。2026-07-18 已采用方案 b：MVP/P3 exit 接受
+  完整 dev/ephemeral Keychain 路径，provisioned signed roundtrip 移入 post-MVP ignored/BLOCKED 槽位，
+  不阻塞 P3/P4 主线或 phase closeout，也不再尝试代码绕过 AMFI；stable production signing 尚未完成。
 
 ### Relay Companion MVP P3.2 Runtime persistence 不变量
 
@@ -535,8 +536,8 @@ conversation/key，不能伪造身份连续性。
   `conversation_state`。B2 已落地 authenticated configuration CAS writer、每次选择都认证完整
   `1...head` 链的 frozen-cursor snapshot selector，以及 RuntimeCore Configure/DescribeAgents 路由；B3a
   又接通 `command_configuration_pins` writer/reader 与 Core prompt admission。`metadata_mutation_ledger` 在
-  B4 前仍必须为空。migration/B2/B3a 都不证明 metadata mutation、exact execution configuration 加载或
-  整库历史回滚检测。
+  B4 前仍必须为空。B3b 已接通 exact execution configuration 加载；migration/B2/B3a/B3b 都不证明
+  metadata mutation 或整库历史回滚检测。
 - configuration 的幂等 namespace 固定为 conversation + canonical owner + raw key，sealed full request 同时
   绑定 expected revision 与 canonical configuration。Applied 只推进 configuration/event head 并产生唯一
   commandless `ConfigurationChanged`；exact replay、CAS conflict 与所有 reject 不写新 event，Catalog HWM
@@ -554,9 +555,23 @@ conversation/key，不能伪造身份连续性。
   分别稳定映射 `daemon.conversation.configuration_required` 与
   `daemon.conversation.configuration_conflict`。Core 专用 Accept 把 authorization guard 移交 Store，guard
   覆盖 durable outcome、通知、reply，并随成功结果返回 actor继续覆盖 queue registration；禁止 detached
-  task 延长授权。B3a 尚不把 exact configuration 注入 adapter prepare；该职责属于 B3b。
-  B3a 由 `48594e8` / `09a14b0` 提交，完整 Task gate 与独立 `spec/security`、`quality` 终审均已
-  通过；6 个 ignored 保持显式 gated/manual，其中 P3.1 signed Keychain 继续单列 BLOCKED。
+  task 延长授权。
+- B3b 的 Start reader 在同一 SQLite transaction 中认证 command、pin 与完整 `1...head` configuration
+  chain，从认证链选择 command 固定的 historical revision，绝不读取 current head 代替 pin。
+  `StartOutcome` 携带 `CommandExecutionConfiguration`，再经 `RuntimeExecutionContext` 与 crate-private
+  `AgentTurnRequest` 把 exact revision/value 送到 adapter prepare；conversation agent kind 与 configuration
+  vendor variant 在 spawn 前必须一致。rev0 只允许 authenticated 两遍 startup reconciliation 安装、且
+  `commandSeq <= legacyCommandHighWater` 的迁移前 command 使用冻结 P3.7 defaults；live accept、exact replay、
+  同进程 queue 与 cutoff 外 command 都不得回退 defaults。
+- Codex 把冻结的 approval policy/sandbox 写入 fresh/resume thread request，把 reasoning effort 写入 turn
+  request；Claude Code 把 permission mode/model/effort/output style 写入 fresh/resume argv。Runtime/UI 的
+  `ClaudeCodePermissionMode::Default` 保持中立“常规人工确认”语义，当前 vendor CLI 显式映射为
+  `--permission-mode manual`，不把 vendor 字符串反向污染公共协议。Codex approval 的 policy/sandbox 与
+  Claude Code approval 的 permission mode at-decision metadata 都来自同一冻结配置。
+- B3a 由 `48594e8` / `09a14b0` 完成，B3b 由 `c0ed6cd` / `f4141f0` / `fb1629a` 完成；recorded
+  argv/control/translator fixture 只锁定字段映射，不是 live vendor login、真实 approval 或 P4 RemoteLink
+  证据。P3.1 provisioned signed Keychain 继续单列 post-MVP ignored/BLOCKED，不计 PASS，也不阻塞
+  MVP/P3 exit。
 - 普通副作用准入同时检查 main/WAL/SHM、projected growth、文件系统
   `max(512 MiB, 5%)` reserve、`page_count/max_page_count`，并在每次 COMMIT 后重新观测。
   Accepted/Started 在普通准入时分别预留 expiry 与 fence/release/最大 terminal safety tail；
