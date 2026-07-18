@@ -207,6 +207,62 @@ pub(super) fn summarize_authenticated_delta_range(
     })
 }
 
+/// 认证当前 catalog high-water delta 的持久化时间，供不改变 conversation activity
+/// timestamp 的 lifecycle writer 拒绝时钟回拨。只读裸 `MAX(created_at_ms)` 会让离线
+/// 篡改绕过 row MAC，因此必须按 exact high-water row 复算 metadata token。
+pub(super) fn authenticated_high_water_created_at(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    high_water: &str,
+) -> Result<u64, RuntimeStoreError> {
+    let (conversation_id, change_kind, logical_bytes, created_at_ms, token): (
+        Vec<u8>,
+        String,
+        i64,
+        i64,
+        Vec<u8>,
+    ) = connection
+        .query_row(
+            "SELECT conversation_id, change_kind, logical_delta_bytes, created_at_ms,
+                    metadata_token
+             FROM catalog_journal WHERE catalog_revision = ?1",
+            [high_water],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => RuntimeStoreError::UnknownOrCorruptSchema,
+            other => RuntimeStoreError::Sqlite(other),
+        })?;
+    runtime_conversation_id(&conversation_id)?;
+    if !matches!(change_kind.as_str(), "upserted" | "removed") {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let logical_bytes =
+        u64::try_from(logical_bytes).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let created_at_ms =
+        u64::try_from(created_at_ms).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let expected = catalog_token(
+        key_bundle,
+        high_water,
+        &conversation_id,
+        change_kind.as_bytes(),
+        logical_bytes,
+        created_at_ms,
+    )?;
+    if token.as_slice() != expected {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(created_at_ms)
+}
+
 /// `runtime_meta.catalog_high_water` 的推进与 delta 冻结共享同一 transaction。
 /// v1/v2/v3 migration 的 high-water 不推进，因此不会伪造历史 delta。
 pub(super) fn reconcile_catalog_journal(

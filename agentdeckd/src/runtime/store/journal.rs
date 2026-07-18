@@ -21,10 +21,10 @@ use crate::runtime::model::{
     MAX_COMMAND_PAYLOAD_BYTES, MAX_COMMAND_RESULT_BYTES, MAX_CONVERSATION_DESCRIPTOR_BYTES,
     MAX_EXECUTION_FENCE_BYTES, MAX_EXECUTION_INTENT_BYTES, MAX_EXECUTION_NONCE_BYTES,
     MAX_IDEMPOTENCY_KEY_BYTES, MAX_RECOVERY_PAGE_RETAINED_BYTES, MAX_RUNTIME_EVENT_BYTES,
-    MarkConversationRecoveryBlocked, NewConversation, QueryCommandReceipt, RecoverStartedCommand,
-    RecoveryBlockedCommandBinding, RecoveryCompletion, RecoveryCursor, RecoveryFenceBinding,
-    RecoveryPage, RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError,
-    RuntimeStoreOperation, SanitizedTerminalFailure, StartCommand, StartOutcome,
+    MAX_RUNTIME_PHYSICAL_CONVERSATIONS, MarkConversationRecoveryBlocked, NewConversation,
+    QueryCommandReceipt, RecoverStartedCommand, RecoveryBlockedCommandBinding, RecoveryCompletion,
+    RecoveryCursor, RecoveryFenceBinding, RecoveryPage, RuntimeCommitOperation, RuntimeStoreConfig,
+    RuntimeStoreError, RuntimeStoreOperation, SanitizedTerminalFailure, StartCommand, StartOutcome,
     StartedBeforeReleaseTermination, StartedRecoveryRecord, TerminalState,
     TerminateAcceptedCommand, TerminateAcceptedOutcome, TerminateStartedBeforeRelease,
     TerminateStartedBeforeReleaseOutcome,
@@ -274,6 +274,15 @@ pub(super) fn bind_adapter_state(
     {
         return Err(RuntimeStoreError::AdapterStateNamespaceMismatch);
     }
+    if !super::configuration::load_conversation_state(
+        &state.connection,
+        &state.key_bundle,
+        conversation.conversation_id,
+    )?
+    .is_managed()
+    {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
 
     let projected = projected_write_bytes(&[
         state_reference.expose_secret().len(),
@@ -325,6 +334,15 @@ pub(super) fn bind_adapter_state(
     .is_some()
     {
         return Err(RuntimeStoreError::AdapterStateNamespaceMismatch);
+    }
+    if !super::configuration::load_conversation_state(
+        &transaction,
+        key_bundle,
+        conversation.conversation_id,
+    )?
+    .is_managed()
+    {
+        return Err(RuntimeStoreError::InvalidStateTransition);
     }
 
     let _binding = insert_adapter_state_binding(
@@ -398,6 +416,14 @@ pub(super) fn resolve_adapter_state(
         namespace.other(),
         &conversation,
     )?;
+    if requested.is_some() {
+        super::native_projection::ensure_conversation_is_catalog_present(
+            &state.connection,
+            &state.key_bundle,
+            state.database_id,
+            &conversation,
+        )?;
+    }
     match (requested, other) {
         (Some(_), Some(_)) => Err(RuntimeStoreError::UnknownOrCorruptSchema),
         (Some(reference), None) => Ok(Some(reference)),
@@ -604,6 +630,73 @@ pub(super) fn load_adapter_state_binding_evidence_for_conversation(
         conversation,
     )?
     .map(|binding| binding.evidence))
+}
+
+/// 在调用方 transaction 内完整认证并以 expected reference token 删除 exact vault
+/// binding。本窄入口不更新 ledger、不提交 transaction；返回的 evidence 供 lifecycle
+/// writer 在同一事务中精确扣减 namespace count/charged bytes。
+#[allow(dead_code)] // C-c2 lifecycle writer 接线后由 native projection transaction 使用。
+pub(super) fn delete_adapter_state_binding(
+    transaction: &Transaction<'_>,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    namespace: AdapterStateNamespace,
+    conversation_id: RuntimeId,
+    expected_reference_token: &[u8; 32],
+) -> Result<AuthenticatedAdapterStateBindingEvidence, RuntimeStoreError> {
+    ensure_kind(conversation_id, RuntimeIdKind::Conversation)?;
+    let conversation = load_conversation(transaction, key_bundle, database_id, conversation_id)?;
+    ensure_adapter_state_namespace(&conversation, namespace)?;
+    let binding = load_authenticated_adapter_state_binding_for_conversation(
+        transaction,
+        key_bundle,
+        database_id,
+        namespace,
+        &conversation,
+    )?
+    .ok_or(RuntimeStoreError::SchemaInspectionRaced)?;
+    if binding.evidence.reference_token() != expected_reference_token {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    if load_authenticated_adapter_state_binding_for_conversation(
+        transaction,
+        key_bundle,
+        database_id,
+        namespace.other(),
+        &conversation,
+    )?
+    .is_some()
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let state_key_token = key_bundle.blind_index(
+        namespace.key_token_domain(),
+        conversation.adapter_state_key.as_bytes(),
+    )?;
+    let sql = match namespace {
+        AdapterStateNamespace::Codex => {
+            "DELETE FROM codex_adapter_state
+             WHERE state_key_token = ?1 AND conversation_id = ?2
+               AND state_reference_token = ?3"
+        }
+        AdapterStateNamespace::ClaudeCode => {
+            "DELETE FROM claude_code_adapter_state
+             WHERE state_key_token = ?1 AND conversation_id = ?2
+               AND state_reference_token = ?3"
+        }
+    };
+    if transaction.execute(
+        sql,
+        params![
+            &state_key_token.as_bytes()[..],
+            &conversation_id.as_bytes()[..],
+            &expected_reference_token[..],
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    Ok(binding.evidence)
 }
 
 /// 通过 namespace-private blind token 定位并认证 exact binding owner。
@@ -852,9 +945,7 @@ pub(crate) fn create_conversation(
     }
     let preflight_ledger =
         sqlite::load_runtime_ledger(&state.connection, &state.key_bundle, state.database_id)?;
-    if preflight_ledger.conversation_count >= config.conversation_capacity {
-        return Err(RuntimeStoreError::ConversationLimit);
-    }
+    validate_managed_conversation_capacity(&preflight_ledger, config)?;
     let created_at_ms = config.clock.now_ms()?;
     if preflight_catalog
         .latest_updated_at_ms
@@ -883,9 +974,7 @@ pub(crate) fn create_conversation(
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     let ledger = sqlite::load_runtime_ledger(&transaction, key_bundle, database_id)?;
-    if ledger.conversation_count >= config.conversation_capacity {
-        return Err(RuntimeStoreError::ConversationLimit);
-    }
+    validate_managed_conversation_capacity(&ledger, config)?;
     if load_optional_conversation(&transaction, key_bundle, database_id, input.conversation_id)?
         .is_some()
     {
@@ -957,6 +1046,28 @@ pub(crate) fn create_conversation(
         RuntimeCommitOperation::CreateConversation,
     )?;
     Ok(CreateConversationOutcome::Created { conversation })
+}
+
+/// managed create 的 capacity 只消耗 authenticated live 槽位；v6 为 native
+/// tombstone/retired 额外保留独立的 physical identity 空间。
+fn validate_managed_conversation_capacity(
+    ledger: &sqlite::RuntimeLedger,
+    config: &RuntimeStoreConfig,
+) -> Result<(), RuntimeStoreError> {
+    let nonlive = ledger
+        .native_projection_tombstone_count
+        .checked_add(ledger.native_projection_retired_count)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let live = ledger
+        .conversation_count
+        .checked_sub(nonlive)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if live >= config.conversation_capacity
+        || ledger.conversation_count >= MAX_RUNTIME_PHYSICAL_CONVERSATIONS
+    {
+        return Err(RuntimeStoreError::ConversationLimit);
+    }
+    Ok(())
 }
 
 /// 威胁场景：daemon 已确认某个旧 execution 无法安全 fencing，却在仅内存阻断后再次
@@ -3755,7 +3866,7 @@ pub(crate) fn load_recovery_page(
         replay_through,
         &cursor,
     )?;
-    let (conversation, next_cursor, completion) = match loaded {
+    let (conversation, next_cursor, completion, delta) = match loaded {
         None => {
             if replay_through.is_some() {
                 return Err(RuntimeStoreError::UnknownOrCorruptSchema);
@@ -3768,32 +3879,35 @@ pub(crate) fn load_recovery_page(
                     final_after_catalog_revision: None,
                     final_after_conversation_id: None,
                 }),
+                RecoveryScanCounts::default(),
             )
         }
-        Some((catalog_revision, conversation_id, record)) => {
+        Some(loaded) => {
             let replay_through = replay_through.ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-            if catalog_revision > replay_through {
+            if loaded.catalog_revision > replay_through {
                 return Err(RuntimeStoreError::UnknownOrCorruptSchema);
             }
-            if catalog_revision == replay_through {
+            if loaded.catalog_revision == replay_through {
                 (
-                    Some(record),
+                    loaded.record,
                     None,
                     Some(RecoveryCompletion {
                         scan_id: cursor.scan_id,
-                        final_after_catalog_revision: Some(catalog_revision),
-                        final_after_conversation_id: Some(conversation_id),
+                        final_after_catalog_revision: Some(loaded.catalog_revision),
+                        final_after_conversation_id: Some(loaded.conversation_id),
                     }),
+                    loaded.counts,
                 )
             } else {
                 (
-                    Some(record),
+                    loaded.record,
                     Some(RecoveryCursor {
                         scan_id: cursor.scan_id,
-                        after_catalog_revision: Some(catalog_revision),
-                        after_conversation_id: Some(conversation_id),
+                        after_catalog_revision: Some(loaded.catalog_revision),
+                        after_conversation_id: Some(loaded.conversation_id),
                     }),
                     None,
+                    loaded.counts,
                 )
             }
         }
@@ -3812,7 +3926,6 @@ pub(crate) fn load_recovery_page(
         return Ok(page);
     }
 
-    let delta = recovery_page_counts(&page)?;
     let scan = state
         .recovery_scan
         .as_mut()
@@ -3872,13 +3985,20 @@ fn new_recovery_scan_id() -> Result<[u8; 16], RuntimeStoreError> {
     ))
 }
 
+struct LoadedRecoveryConversation {
+    catalog_revision: u64,
+    conversation_id: RuntimeId,
+    record: Option<ConversationRecoveryRecord>,
+    counts: RecoveryScanCounts,
+}
+
 fn load_next_recovery_conversation(
     connection: &Connection,
     key_bundle: &super::cipher::RuntimeKeyBundle,
     database_id: [u8; 16],
     replay_through: Option<u64>,
     cursor: &RecoveryCursor,
-) -> Result<Option<(u64, RuntimeId, ConversationRecoveryRecord)>, RuntimeStoreError> {
+) -> Result<Option<LoadedRecoveryConversation>, RuntimeStoreError> {
     let Some(replay_through) = replay_through else {
         return Ok(None);
     };
@@ -3923,6 +4043,54 @@ fn load_next_recovery_conversation(
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
 
+    let catalog_change = super::native_projection::authenticated_native_catalog_change(
+        connection,
+        key_bundle,
+        database_id,
+        &conversation,
+    )?;
+    let (accepted, started) = load_authenticated_recovery_command_state(
+        connection,
+        key_bundle,
+        database_id,
+        &conversation,
+    )?;
+    if catalog_change == Some(super::native_projection::NativeCatalogChange::Removed) {
+        if !accepted.is_empty() || started.is_some() {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        return Ok(Some(LoadedRecoveryConversation {
+            catalog_revision,
+            conversation_id,
+            record: None,
+            counts: RecoveryScanCounts {
+                conversations: 1,
+                ..RecoveryScanCounts::default()
+            },
+        }));
+    }
+
+    let record = ConversationRecoveryRecord {
+        conversation,
+        accepted,
+        started,
+    };
+    let counts = recovery_record_counts(&record)?;
+    Ok(Some(LoadedRecoveryConversation {
+        catalog_revision,
+        conversation_id,
+        record: Some(record),
+        counts,
+    }))
+}
+
+fn load_authenticated_recovery_command_state(
+    connection: &Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    conversation: &ConversationRecord,
+) -> Result<(Vec<CommandRecord>, Option<StartedRecoveryRecord>), RuntimeStoreError> {
+    let conversation_id = conversation.conversation_id;
     let mut accepted_ids = Vec::new();
     let mut statement = connection.prepare(
         "SELECT command_id FROM commands
@@ -3986,21 +4154,41 @@ fn load_next_recovery_conversation(
         })
         .transpose()?;
 
-    Ok(Some((
-        catalog_revision,
-        conversation_id,
-        ConversationRecoveryRecord {
-            conversation,
-            accepted,
-            started,
-        },
-    )))
+    Ok((accepted, started))
 }
 
-fn recovery_page_counts(page: &RecoveryPage) -> Result<RecoveryScanCounts, RuntimeStoreError> {
-    let Some(record) = page.conversation.as_ref() else {
-        return Ok(RecoveryScanCounts::default());
-    };
+/// native lifecycle actor guard 之后的 Store-side transaction-local 二次复核。
+///
+/// conversation row MAC（含 accepted_count）、每条 Accepted command，以及可选 Started
+/// 的 command/intent/event/fence linkage 都会完整认证；不能用裸 COUNT/EXISTS 代替。
+#[allow(dead_code)] // C-c2 lifecycle writer 接线后执行 Store-side 二次复核。
+pub(super) fn native_projection_conversation_is_durably_quiescent(
+    transaction: &Transaction<'_>,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    conversation_id: RuntimeId,
+) -> Result<bool, RuntimeStoreError> {
+    ensure_kind(conversation_id, RuntimeIdKind::Conversation)?;
+    let conversation = load_conversation(transaction, key_bundle, database_id, conversation_id)?;
+    let (accepted, started) = load_authenticated_recovery_command_state(
+        transaction,
+        key_bundle,
+        database_id,
+        &conversation,
+    )?;
+    let has_active_metadata =
+        super::metadata::conversation_has_active_authenticated_metadata_mutation(
+            transaction,
+            key_bundle,
+            database_id,
+            conversation_id,
+        )?;
+    Ok(accepted.is_empty() && started.is_none() && !has_active_metadata)
+}
+
+fn recovery_record_counts(
+    record: &ConversationRecoveryRecord,
+) -> Result<RecoveryScanCounts, RuntimeStoreError> {
     let accepted_count = u64::try_from(record.accepted.len())
         .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
     let accepted_payload_bytes = record.accepted.iter().try_fold(0_u64, |total, command| {
@@ -6850,6 +7038,74 @@ pub(super) fn update_conversation_metadata(
     })
 }
 
+/// native lifecycle 只推进 catalog revision 的 transaction-local CAS。
+///
+/// current row 会先完整认证并逐字段复核；成功路径只改写 catalog_revision 与对应 row
+/// MAC，故意不重封 descriptor，也不改变 lifecycle/activity/high-water/count/timestamps。
+#[allow(dead_code)] // C-c2 lifecycle writer 接线后推进 tombstone/restore catalog revision。
+pub(super) fn advance_catalog_revision_preserving_descriptor(
+    transaction: &Transaction<'_>,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    current: &ConversationRecord,
+    next_catalog_revision: u64,
+) -> Result<ConversationRecord, RuntimeStoreError> {
+    if next_catalog_revision <= current.catalog_revision {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    let authenticated = load_conversation(
+        transaction,
+        key_bundle,
+        database_id,
+        current.conversation_id,
+    )?;
+    if authenticated != *current {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    let old_token = conversation_metadata_token(
+        key_bundle,
+        current.conversation_id,
+        current.adapter_state_key,
+        current.catalog_revision,
+        current.command_high_water,
+        current.event_high_water,
+        current.accepted_command_count,
+        current.lifecycle,
+        current.created_at_ms,
+        current.updated_at_ms,
+    )?;
+    let next_token = conversation_metadata_token(
+        key_bundle,
+        current.conversation_id,
+        current.adapter_state_key,
+        next_catalog_revision,
+        current.command_high_water,
+        current.event_high_water,
+        current.accepted_command_count,
+        current.lifecycle,
+        current.created_at_ms,
+        current.updated_at_ms,
+    )?;
+    if transaction.execute(
+        "UPDATE conversations
+         SET catalog_revision = ?1, metadata_token = ?2
+         WHERE conversation_id = ?3 AND catalog_revision = ?4 AND metadata_token = ?5",
+        params![
+            encode_sequence(next_catalog_revision),
+            &next_token[..],
+            &current.conversation_id.as_bytes()[..],
+            encode_sequence(current.catalog_revision),
+            &old_token[..],
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    let mut next = current.clone();
+    next.catalog_revision = next_catalog_revision;
+    Ok(next)
+}
+
 fn commit_transaction(
     transaction: Transaction<'_>,
     operation: RuntimeCommitOperation,
@@ -7591,7 +7847,607 @@ const fn terminal_to_command_state(state: TerminalState) -> CommandState {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use agentdeck_protocol::AgentKind;
+
     use super::*;
+    use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
+
+    static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_TEST_ROOT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "agentdeck-journal-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir(&path).expect("create journal test root");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                    .expect("secure journal test root");
+            }
+            Self(path)
+        }
+
+        fn database(&self) -> PathBuf {
+            self.0.join("runtime.db")
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn indexed_runtime_id(kind: RuntimeIdKind, domain: u8, index: u64) -> RuntimeId {
+        let mut bytes = [0_u8; 16];
+        bytes[0] = domain;
+        bytes[8..].copy_from_slice(&index.to_be_bytes());
+        RuntimeId::from_bytes(kind, bytes).expect("valid indexed RuntimeId")
+    }
+
+    fn managed_input(index: u64) -> NewConversation {
+        NewConversation {
+            conversation_id: indexed_runtime_id(RuntimeIdKind::Conversation, 0x41, index),
+            adapter_state_key: indexed_runtime_id(RuntimeIdKind::AdapterState, 0x42, index),
+            descriptor: ConversationDescriptor {
+                agent_kind: AgentKind::ClaudeCode,
+                title: Some(format!("fixture {index}")),
+                cwd: PathBuf::from(format!("/tmp/agentdeck-fixture-{index}")),
+            },
+        }
+    }
+
+    fn create_managed(
+        state: &mut RuntimeSqlite,
+        config: &RuntimeStoreConfig,
+        index: u64,
+    ) -> ConversationRecord {
+        let input = managed_input(index);
+        let descriptor_bytes = canonical_conversation_descriptor(&input.descriptor)
+            .expect("encode managed fixture descriptor");
+        let mut effects = CommandStreamEffects::default();
+        match create_conversation(state, config, input, descriptor_bytes, &mut effects)
+            .expect("create managed fixture")
+        {
+            CreateConversationOutcome::Created { conversation } => conversation,
+            CreateConversationOutcome::Replayed { .. } => panic!("fresh fixture replayed"),
+        }
+    }
+
+    fn projection_metadata_token_for_test(
+        key_bundle: &super::super::cipher::RuntimeKeyBundle,
+        conversation_id: RuntimeId,
+        reference_token: &[u8; 32],
+        scan_generation: &[u8; 16],
+        observation_token: &[u8; 32],
+        catalog_revision: &str,
+        charged_reference_bytes: u64,
+    ) -> [u8; 32] {
+        let retain_until_ms = 100_u64 + 2_592_000_000;
+        let retain_bytes = retain_until_ms.to_be_bytes();
+        let retain_field = super::super::stream::optional_field(Some(&retain_bytes));
+        super::super::stream::metadata_mac(
+            key_bundle,
+            b"native.projection.metadata.v1",
+            &[
+                conversation_id.as_bytes(),
+                b"claude-code",
+                reference_token,
+                b"tombstone",
+                scan_generation,
+                observation_token,
+                catalog_revision.as_bytes(),
+                &101_u64.to_be_bytes(),
+                &100_u64.to_be_bytes(),
+                &retain_field,
+                &charged_reference_bytes.to_be_bytes(),
+            ],
+        )
+        .expect("authenticate tombstone projection fixture")
+    }
+
+    fn insert_tombstone_projection_rows(
+        transaction: &Transaction<'_>,
+        key_bundle: &super::super::cipher::RuntimeKeyBundle,
+        database_id: [u8; 16],
+        conversation: &ConversationRecord,
+        reference: &SecretBytes,
+        scan_generation: [u8; 16],
+        observation_token: [u8; 32],
+    ) -> u64 {
+        let binding = insert_adapter_state_binding(
+            transaction,
+            key_bundle,
+            database_id,
+            AdapterStateNamespace::ClaudeCode,
+            conversation,
+            reference,
+        )
+        .expect("insert tombstone vault binding");
+        let entry_revision = encode_sequence(0);
+        let state_token = super::super::configuration::conversation_state_metadata_token(
+            key_bundle,
+            conversation.conversation_id.as_bytes(),
+            None,
+            &entry_revision,
+            "nativeProjected",
+            Some("claude-code"),
+            None,
+        )
+        .expect("authenticate native conversation state");
+        assert_eq!(
+            transaction
+                .execute(
+                    "UPDATE conversation_state
+                     SET origin_kind = 'nativeProjected', origin_namespace = 'claude-code',
+                         metadata_token = ?1
+                     WHERE conversation_id = ?2 AND origin_kind = 'managed'",
+                    params![
+                        &state_token[..],
+                        &conversation.conversation_id.as_bytes()[..]
+                    ],
+                )
+                .expect("publish native conversation state"),
+            1
+        );
+        let catalog_revision = encode_sequence(conversation.catalog_revision);
+        let projection_token = projection_metadata_token_for_test(
+            key_bundle,
+            conversation.conversation_id,
+            binding.reference_token(),
+            &scan_generation,
+            &observation_token,
+            &catalog_revision,
+            binding.sealed_reference_bytes(),
+        );
+        transaction
+            .execute(
+                "INSERT INTO native_projection_state (
+                     conversation_id, origin_namespace, state_reference_token,
+                     projection_state, scan_generation, observation_token,
+                     projection_catalog_revision, reconciled_at_ms, state_changed_at_ms,
+                     private_binding_retain_until_ms, charged_reference_bytes, metadata_token
+                 ) VALUES (?1, 'claude-code', ?2, 'tombstone', ?3, ?4, ?5,
+                           101, 100, 2592000100, ?6, ?7)",
+                params![
+                    &conversation.conversation_id.as_bytes()[..],
+                    &binding.reference_token()[..],
+                    &scan_generation[..],
+                    &observation_token[..],
+                    catalog_revision,
+                    i64::try_from(binding.sealed_reference_bytes())
+                        .expect("charged bytes fit SQLite"),
+                    &projection_token[..],
+                ],
+            )
+            .expect("insert tombstone projection row");
+        binding.sealed_reference_bytes()
+    }
+
+    fn convert_managed_to_tombstone(
+        state: &mut RuntimeSqlite,
+        conversation_id: RuntimeId,
+        index: u64,
+    ) {
+        let key_bundle = state.key_bundle.clone();
+        let database_id = state.database_id;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin tombstone fixture transaction");
+        let conversation =
+            load_conversation(&transaction, &key_bundle, database_id, conversation_id)
+                .expect("load tombstone fixture conversation");
+        let mut reference = vec![0_u8; 20];
+        reference[..8].copy_from_slice(&index.to_be_bytes());
+        reference[8] = 0x51;
+        let mut scan_generation = [0_u8; 16];
+        scan_generation[0] = 0x52;
+        scan_generation[8..].copy_from_slice(&index.to_be_bytes());
+        let mut observation_token = [0_u8; 32];
+        observation_token[0] = 0x53;
+        observation_token[24..].copy_from_slice(&index.to_be_bytes());
+        let charged = insert_tombstone_projection_rows(
+            &transaction,
+            &key_bundle,
+            database_id,
+            &conversation,
+            &SecretBytes::new(reference),
+            scan_generation,
+            observation_token,
+        );
+        let ledger = sqlite::load_runtime_ledger(&transaction, &key_bundle, database_id)
+            .expect("load tombstone fixture ledger");
+        let mut next = ledger.clone();
+        next.claude_code_adapter_state_count += 1;
+        next.native_projection_tombstone_count += 1;
+        next.native_projection_physical_count += 1;
+        next.native_projection_charged_bytes += charged;
+        let _pending =
+            sqlite::update_runtime_ledger(&transaction, &key_bundle, database_id, &ledger, &next)
+                .expect("publish tombstone fixture ledger");
+        transaction.commit().expect("commit tombstone fixture");
+    }
+
+    #[test]
+    fn managed_create_reuses_live_slot_held_only_by_native_tombstone() {
+        let root = TestRoot::new("managed-live-slot-reuse");
+        let keys = MemoryKeyStore::new();
+        let database = root.database();
+        let config = RuntimeStoreConfig::new(database.clone()).with_conversation_capacity(1);
+        let mut state = sqlite::open(
+            &config,
+            load_or_create_storage_kek(&keys, &database).expect("load fixture StorageKEK"),
+        )
+        .expect("open live-slot fixture");
+        let first = create_managed(&mut state, &config, 1);
+        convert_managed_to_tombstone(&mut state, first.conversation_id, 1);
+
+        let second = create_managed(&mut state, &config, 2);
+        assert_ne!(first.conversation_id, second.conversation_id);
+        let ledger =
+            sqlite::load_runtime_ledger(&state.connection, &state.key_bundle, state.database_id)
+                .expect("load reused live-slot ledger");
+        assert_eq!(ledger.conversation_count, 2);
+        assert_eq!(ledger.native_projection_tombstone_count, 1);
+        assert_eq!(
+            ledger.conversation_count - ledger.native_projection_tombstone_count,
+            1
+        );
+        validate_store_integrity(&state.connection, &state.key_bundle, state.database_id)
+            .expect("reused live slot preserves full-store integrity");
+    }
+
+    #[test]
+    fn recovery_counts_terminal_nonlive_row_but_does_not_yield_it() {
+        let root = TestRoot::new("recovery-skips-terminal-nonlive");
+        let keys = MemoryKeyStore::new();
+        let database = root.database();
+        let config = RuntimeStoreConfig::new(database.clone()).with_conversation_capacity(2);
+        let mut state = sqlite::open(
+            &config,
+            load_or_create_storage_kek(&keys, &database).expect("load fixture StorageKEK"),
+        )
+        .expect("open recovery fixture");
+        let managed = create_managed(&mut state, &config, 11);
+        let nonlive = create_managed(&mut state, &config, 12);
+        convert_managed_to_tombstone(&mut state, nonlive.conversation_id, 12);
+
+        let mut effects = CommandStreamEffects::default();
+        let cursor = begin_recovery_scan(&mut state, &config, &mut effects)
+            .expect("begin physical recovery scan");
+        let first = load_recovery_page(&mut state, cursor).expect("load managed recovery page");
+        assert_eq!(
+            first
+                .conversation
+                .as_ref()
+                .map(|record| record.conversation.conversation_id),
+            Some(managed.conversation_id)
+        );
+        let second = load_recovery_page(
+            &mut state,
+            first
+                .next_cursor
+                .expect("managed row has physical successor"),
+        )
+        .expect("load terminal non-live recovery page");
+        assert!(second.conversation.is_none());
+        assert!(second.next_cursor.is_none());
+        let completion = second
+            .completion
+            .expect("terminal non-live row signs completion");
+        assert_eq!(
+            completion.final_after_conversation_id,
+            Some(nonlive.conversation_id)
+        );
+        finish_recovery_scan(&mut state, completion)
+            .expect("physical HWM accounts for skipped non-live row");
+    }
+
+    #[test]
+    fn exact_vault_delete_is_authenticated_and_compare_and_swap() {
+        let root = TestRoot::new("exact-vault-delete");
+        let keys = MemoryKeyStore::new();
+        let database = root.database();
+        let config = RuntimeStoreConfig::new(database.clone());
+        let mut state = sqlite::open(
+            &config,
+            load_or_create_storage_kek(&keys, &database).expect("load fixture StorageKEK"),
+        )
+        .expect("open vault delete fixture");
+        let conversation = create_managed(&mut state, &config, 21);
+        bind_adapter_state(
+            &mut state,
+            &config,
+            AdapterStateNamespace::ClaudeCode,
+            conversation.adapter_state_key,
+            SecretBytes::new(vec![0x61; 20]),
+        )
+        .expect("bind exact vault fixture");
+
+        let key_bundle = state.key_bundle.clone();
+        let database_id = state.database_id;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin vault delete transaction");
+        let evidence = load_adapter_state_binding_evidence_for_conversation(
+            &transaction,
+            &key_bundle,
+            database_id,
+            AdapterStateNamespace::ClaudeCode,
+            &conversation,
+        )
+        .expect("authenticate exact vault fixture")
+        .expect("exact vault fixture exists");
+        assert!(matches!(
+            delete_adapter_state_binding(
+                &transaction,
+                &key_bundle,
+                database_id,
+                AdapterStateNamespace::ClaudeCode,
+                conversation.conversation_id,
+                &[0xFF; 32],
+            ),
+            Err(RuntimeStoreError::SchemaInspectionRaced)
+        ));
+        let count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM claude_code_adapter_state",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count retained vault binding");
+        assert_eq!(count, 1);
+
+        let deleted = delete_adapter_state_binding(
+            &transaction,
+            &key_bundle,
+            database_id,
+            AdapterStateNamespace::ClaudeCode,
+            conversation.conversation_id,
+            evidence.reference_token(),
+        )
+        .expect("delete exact authenticated vault binding");
+        assert_eq!(deleted.reference_token(), evidence.reference_token());
+        assert_eq!(
+            deleted.sealed_reference_bytes(),
+            evidence.sealed_reference_bytes()
+        );
+        let count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM claude_code_adapter_state",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count deleted vault binding");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn durable_quiescence_authenticates_active_native_metadata_parent() {
+        let root = TestRoot::new("quiescence-active-metadata");
+        let keys = MemoryKeyStore::new();
+        let database = root.database();
+        let config = RuntimeStoreConfig::new(database.clone());
+        let mut state = sqlite::open(
+            &config,
+            load_or_create_storage_kek(&keys, &database).expect("load fixture StorageKEK"),
+        )
+        .expect("open quiescence fixture");
+        let conversation = create_managed(&mut state, &config, 25);
+        let key_bundle = state.key_bundle.clone();
+        let database_id = state.database_id;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin quiescence transaction");
+        assert!(
+            native_projection_conversation_is_durably_quiescent(
+                &transaction,
+                &key_bundle,
+                database_id,
+                conversation.conversation_id,
+            )
+            .expect("authenticate empty quiescence")
+        );
+        super::super::metadata::insert_native_metadata_parent_fixture(
+            &transaction,
+            &key_bundle,
+            database_id,
+            conversation.conversation_id,
+            "quiescence-active-fixture",
+            "claimed",
+            100,
+            100,
+        )
+        .expect("insert authenticated active metadata parent");
+        assert!(
+            !native_projection_conversation_is_durably_quiescent(
+                &transaction,
+                &key_bundle,
+                database_id,
+                conversation.conversation_id,
+            )
+            .expect("authenticate active metadata quiescence")
+        );
+    }
+
+    #[test]
+    fn revision_only_catalog_advance_preserves_descriptor_ciphertext() {
+        let root = TestRoot::new("revision-only-catalog");
+        let keys = MemoryKeyStore::new();
+        let database = root.database();
+        let config = RuntimeStoreConfig::new(database.clone());
+        let mut state = sqlite::open(
+            &config,
+            load_or_create_storage_kek(&keys, &database).expect("load fixture StorageKEK"),
+        )
+        .expect("open catalog revision fixture");
+        let conversation = create_managed(&mut state, &config, 31);
+        let key_bundle = state.key_bundle.clone();
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin catalog revision transaction");
+        let before: Vec<u8> = transaction
+            .query_row(
+                "SELECT sealed_descriptor FROM conversations WHERE conversation_id = ?1",
+                [&conversation.conversation_id.as_bytes()[..]],
+                |row| row.get(0),
+            )
+            .expect("read descriptor ciphertext before revision advance");
+        let advanced = advance_catalog_revision_preserving_descriptor(
+            &transaction,
+            &key_bundle,
+            state.database_id,
+            &conversation,
+            conversation.catalog_revision + 7,
+        )
+        .expect("advance only catalog revision");
+        let after: Vec<u8> = transaction
+            .query_row(
+                "SELECT sealed_descriptor FROM conversations WHERE conversation_id = ?1",
+                [&conversation.conversation_id.as_bytes()[..]],
+                |row| row.get(0),
+            )
+            .expect("read descriptor ciphertext after revision advance");
+        assert_eq!(before, after);
+        assert_eq!(advanced.descriptor, conversation.descriptor);
+        assert_eq!(advanced.lifecycle, conversation.lifecycle);
+        assert_eq!(advanced.updated_at_ms, conversation.updated_at_ms);
+        assert_eq!(advanced.catalog_revision, conversation.catalog_revision + 7);
+    }
+
+    #[test]
+    fn v6_reopens_with_more_than_live_cap_physical_nonlive_rows() {
+        const PHYSICAL_ROWS: u64 = 1_025;
+
+        let root = TestRoot::new("v6-physical-over-live-cap");
+        let keys = MemoryKeyStore::new();
+        let database = root.database();
+        let config = RuntimeStoreConfig::new(database.clone());
+        let mut state = sqlite::open(
+            &config,
+            load_or_create_storage_kek(&keys, &database).expect("load fixture StorageKEK"),
+        )
+        .expect("open large physical fixture");
+        let key_bundle = state.key_bundle.clone();
+        let database_id = state.database_id;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin large physical fixture transaction");
+        let ledger = sqlite::load_runtime_ledger(&transaction, &key_bundle, database_id)
+            .expect("load empty large physical ledger");
+        let mut charged_bytes = 0_u64;
+        let mut charged_first_batch = 0_u64;
+        for index in 1..=PHYSICAL_ROWS {
+            let input = managed_input(1_000 + index);
+            let descriptor_bytes = canonical_conversation_descriptor(&input.descriptor)
+                .expect("encode large physical descriptor");
+            let conversation = insert_conversation_row(
+                &transaction,
+                &key_bundle,
+                database_id,
+                input,
+                descriptor_bytes.as_ref(),
+                index - 1,
+                100,
+                100,
+            )
+            .expect("insert large physical conversation");
+            super::super::configuration::insert_fresh_managed_state(
+                &transaction,
+                &key_bundle,
+                conversation.conversation_id.as_bytes(),
+            )
+            .expect("insert large physical state");
+            let mut reference = vec![0_u8; 20];
+            reference[..8].copy_from_slice(&index.to_be_bytes());
+            reference[8] = 0x71;
+            let mut scan_generation = [0_u8; 16];
+            scan_generation[0] = 0x72;
+            scan_generation[8..].copy_from_slice(&index.to_be_bytes());
+            let mut observation_token = [0_u8; 32];
+            observation_token[0] = 0x73;
+            observation_token[24..].copy_from_slice(&index.to_be_bytes());
+            charged_bytes += insert_tombstone_projection_rows(
+                &transaction,
+                &key_bundle,
+                database_id,
+                &conversation,
+                &SecretBytes::new(reference),
+                scan_generation,
+                observation_token,
+            );
+            if index == 1_024 {
+                charged_first_batch = charged_bytes;
+            }
+        }
+        let mut first_batch = ledger.clone();
+        first_batch.catalog_high_water = Some(encode_sequence(1_023));
+        first_batch.conversation_count = 1_024;
+        first_batch.claude_code_adapter_state_count = 1_024;
+        first_batch.native_projection_tombstone_count = 1_024;
+        first_batch.native_projection_physical_count = 1_024;
+        first_batch.native_projection_charged_bytes = charged_first_batch;
+        let _pending = sqlite::update_runtime_ledger(
+            &transaction,
+            &key_bundle,
+            database_id,
+            &ledger,
+            &first_batch,
+        )
+        .expect("publish first large physical ledger batch");
+        let intermediate = sqlite::load_runtime_ledger(&transaction, &key_bundle, database_id)
+            .expect("reload first large physical ledger batch");
+        let mut final_batch = intermediate.clone();
+        final_batch.catalog_high_water = Some(encode_sequence(PHYSICAL_ROWS - 1));
+        final_batch.conversation_count = PHYSICAL_ROWS;
+        final_batch.claude_code_adapter_state_count = PHYSICAL_ROWS;
+        final_batch.native_projection_tombstone_count = PHYSICAL_ROWS;
+        final_batch.native_projection_physical_count = PHYSICAL_ROWS;
+        final_batch.native_projection_charged_bytes = charged_bytes;
+        let _pending = sqlite::update_runtime_ledger(
+            &transaction,
+            &key_bundle,
+            database_id,
+            &intermediate,
+            &final_batch,
+        )
+        .expect("publish terminal large physical ledger batch");
+        transaction.commit().expect("commit large physical fixture");
+        drop(state);
+
+        let reopened = sqlite::open(
+            &config,
+            load_or_create_storage_kek(&keys, &database).expect("reload fixture StorageKEK"),
+        )
+        .expect("v6 physical rows above live cap must reopen");
+        let reopened_ledger = sqlite::load_runtime_ledger(
+            &reopened.connection,
+            &reopened.key_bundle,
+            reopened.database_id,
+        )
+        .expect("load reopened large physical ledger");
+        assert_eq!(reopened_ledger.conversation_count, PHYSICAL_ROWS);
+        assert_eq!(
+            reopened_ledger.native_projection_tombstone_count,
+            PHYSICAL_ROWS
+        );
+    }
 
     #[test]
     fn authenticated_event_high_water_query_is_metadata_only() {

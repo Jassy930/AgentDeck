@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::runtime::events::{PendingStreamTargets, RuntimeStreamTarget};
-use crate::runtime::model::{MAX_RUNTIME_CONVERSATIONS, RuntimeStoreError};
+use crate::runtime::model::{MAX_RUNTIME_PHYSICAL_CONVERSATIONS, RuntimeStoreError};
 
 use super::cipher::{RowAad, RuntimeKeyBundle};
 use super::persisted_event::{PersistedRuntimeEvent, decode_persisted_runtime_event};
@@ -460,7 +460,10 @@ pub(super) fn reconcile_event_stream_with_trim_clock(
         .checked_sub(previous.event_count)
         .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
 
-    // 新建 conversation 即建立零窗口 retention row；最多 1,024 个 compact ids。
+    // 新建 conversation 即建立零窗口 retention row；v6 的 compact ids 上界包含
+    // native tombstone/retired physical identities。
+    let conversation_candidate_limit = usize::try_from(MAX_RUNTIME_PHYSICAL_CONVERSATIONS)
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
     let mut missing_retention = Vec::new();
     let mut statement = transaction.prepare(
         "SELECT c.conversation_id, c.event_high_water
@@ -474,7 +477,7 @@ pub(super) fn reconcile_event_stream_with_trim_clock(
     })?;
     for row in rows {
         missing_retention.push(row?);
-        if missing_retention.len() > 1_024 {
+        if missing_retention.len() > conversation_candidate_limit {
             return Err(RuntimeStoreError::UnknownOrCorruptSchema);
         }
     }
@@ -506,7 +509,7 @@ pub(super) fn reconcile_event_stream_with_trim_clock(
     })?;
     for row in rows {
         changed.push(row?);
-        if changed.len() > 1_024 {
+        if changed.len() > conversation_candidate_limit {
             return Err(RuntimeStoreError::UnknownOrCorruptSchema);
         }
     }
@@ -1432,7 +1435,7 @@ fn trim_global_event_window_with_limits(
         // 最多每个 conversation 只看 oldest retained row，因此候选数量由生产
         // conversation cap 严格约束。不能让全局最老但被 pin/缺 replacement 的
         // conversation 阻塞其它已有 durable replacement 的 eligible target。
-        let candidate_limit = i64::try_from(MAX_RUNTIME_CONVERSATIONS)
+        let candidate_limit = i64::try_from(MAX_RUNTIME_PHYSICAL_CONVERSATIONS)
             .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
         let mut statement = transaction.prepare(
             "SELECT i.conversation_id, i.event_seq

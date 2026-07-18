@@ -94,10 +94,13 @@ mod migration_tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use agentdeck_protocol::runtime::{
-        CodexConversationConfiguration, ConversationConfiguration, ConversationMetadataMutation,
-        VendorConfigurationSnapshot,
+        ClaudeCodeConversationConfiguration, CodexConversationConfiguration,
+        ConversationConfiguration, ConversationMetadataMutation, VendorConfigurationSnapshot,
     };
-    use agentdeck_protocol::{CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode};
+    use agentdeck_protocol::{
+        AgentKind, ClaudeCodePermissionMode, CodexApprovalPolicy, CodexReasoningEffort,
+        CodexSandboxMode,
+    };
     use rusqlite::{Connection, params};
 
     use super::*;
@@ -113,7 +116,8 @@ mod migration_tests {
     use crate::runtime::store::sequence::{SequenceScope, decode_sequence, encode_sequence};
     use crate::runtime::store::worker::RuntimeStoreHandle;
     use crate::runtime::store::{
-        ConfigureConversation, ConfigureConversationOutcome, UpdateConversationMetadataOutcome,
+        ConfigureConversation, ConfigureConversationOutcome, ImportNativeProjection,
+        ImportNativeProjectionOutcome, UpdateConversationMetadataOutcome,
         UpdateManagedConversationMetadata,
     };
     use crate::security::{MemoryKeyStore, SecretBytes, StorageKek, load_or_create_storage_kek};
@@ -1618,6 +1622,14 @@ mod migration_tests {
         root: &TestRoot,
         keys: &MemoryKeyStore,
     ) -> (CipherEvidence, Vec<(String, Vec<Vec<u8>>)>, RuntimeId) {
+        build_populated_strict_v5_fixture_with_metadata_mutation(root, keys, true).await
+    }
+
+    async fn build_populated_strict_v5_fixture_with_metadata_mutation(
+        root: &TestRoot,
+        keys: &MemoryKeyStore,
+        apply_metadata_mutation: bool,
+    ) -> (CipherEvidence, Vec<(String, Vec<Vec<u8>>)>, RuntimeId) {
         let store = RuntimeStoreHandle::open(
             RuntimeStoreConfig::new(root.database()),
             load_or_create_storage_kek(keys, &root.database()).expect("create populated v6 KEK"),
@@ -1653,22 +1665,24 @@ mod migration_tests {
                 .expect("persist populated v5 command pin"),
             AcceptOutcome::Accepted { .. }
         ));
-        assert!(matches!(
-            store
-                .update_managed_conversation_metadata(UpdateManagedConversationMetadata {
-                    conversation_id,
-                    owner: owner(0xA8),
-                    idempotency_key: "populated-v5-metadata".to_owned(),
-                    expected_entry_revision: 0,
-                    mutation: ConversationMetadataMutation::rename(Some(
-                        "populated v5 renamed".to_owned()
-                    ))
-                    .expect("valid populated v5 title"),
-                })
-                .await
-                .expect("persist populated v5 metadata mutation"),
-            UpdateConversationMetadataOutcome::Applied { .. }
-        ));
+        if apply_metadata_mutation {
+            assert!(matches!(
+                store
+                    .update_managed_conversation_metadata(UpdateManagedConversationMetadata {
+                        conversation_id,
+                        owner: owner(0xA8),
+                        idempotency_key: "populated-v5-metadata".to_owned(),
+                        expected_entry_revision: 0,
+                        mutation: ConversationMetadataMutation::rename(Some(
+                            "populated v5 renamed".to_owned()
+                        ))
+                        .expect("valid populated v5 title"),
+                    })
+                    .await
+                    .expect("persist populated v5 metadata mutation"),
+                UpdateConversationMetadataOutcome::Applied { .. }
+            ));
+        }
         store
             .shutdown()
             .await
@@ -2530,6 +2544,97 @@ mod migration_tests {
             authenticated_after, authenticated_before,
             "v5 to v6 must preserve every old non-meta token/MAC/ciphertext"
         );
+    }
+
+    #[tokio::test]
+    async fn migrated_v5_pruned_catalog_baseline_allows_first_native_import() {
+        let root = TestRoot::new("v5-pruned-catalog-native-import");
+        let keys = MemoryKeyStore::new();
+        build_populated_strict_v5_fixture_with_metadata_mutation(&root, &keys, false).await;
+
+        let connection = Connection::open(root.database()).expect("open populated v5 fixture");
+        let mut meta = read_meta_v5(&connection)
+            .expect("read populated v5 meta")
+            .expect("populated v5 meta exists");
+        assert!(meta.ledger.catalog_high_water.is_some());
+        assert!(meta.ledger.catalog_delta_count > 0);
+        assert!(
+            connection
+                .execute("DELETE FROM catalog_journal", [])
+                .expect("prune the complete v5 catalog journal")
+                > 0
+        );
+        meta.ledger.catalog_delta_count = 0;
+        meta.ledger.catalog_delta_bytes = 0;
+        meta.ledger.catalog_retention_floor = None;
+        let storage_kek =
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload pruned v5 KEK");
+        let key_bundle = RuntimeKeyBundle::unwrap(
+            &storage_kek,
+            &KeyWrapAad {
+                schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
+                schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
+                database_id: &meta.database_id,
+            },
+            &meta.wrapped_key_bundle,
+        )
+        .expect("unwrap pruned v5 key bundle");
+        let token = runtime_ledger_token_v5(&key_bundle, meta.database_id, &meta.ledger)
+            .expect("authenticate pruned v5 ledger");
+        meta.metadata_token = token.to_vec();
+        connection
+            .execute(
+                "UPDATE runtime_meta
+                 SET catalog_delta_count = 0, catalog_delta_bytes = 0,
+                     catalog_retention_floor = NULL, metadata_token = ?1
+                 WHERE singleton = 1",
+                [&token[..]],
+            )
+            .expect("publish authenticated pruned v5 catalog baseline");
+        verify_runtime_ledger_token_v5(&key_bundle, &meta)
+            .expect("verify authenticated pruned v5 ledger");
+        super::super::journal::validate_store_integrity(&connection, &key_bundle, meta.database_id)
+            .expect("validate complete pruned v5 fixture");
+        drop(connection);
+
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload migrated v6 KEK"),
+        )
+        .await
+        .expect("migrate authenticated pruned v5 fixture");
+        let outcome = store
+            .claude_code_native_projection_store()
+            .import(ImportNativeProjection {
+                descriptor: ConversationDescriptor {
+                    agent_kind: AgentKind::ClaudeCode,
+                    title: None,
+                    cwd: PathBuf::new(),
+                },
+                default_configuration: ConversationConfiguration::new(
+                    VendorConfigurationSnapshot::ClaudeCode(
+                        ClaudeCodeConversationConfiguration::new(
+                            ClaudeCodePermissionMode::Default,
+                            None,
+                            None,
+                            None,
+                        )
+                        .expect("valid migrated native configuration"),
+                    ),
+                ),
+                private_reference: SecretBytes::new(b"migrated-v5-native-reference".to_vec()),
+                scan_generation: [0xC6; 16],
+            })
+            .await
+            .expect("first native import after v5 migration");
+        assert!(matches!(
+            outcome,
+            ImportNativeProjectionOutcome::Imported { .. }
+        ));
+        store
+            .shutdown()
+            .await
+            .expect("shutdown migrated native import store");
     }
 
     #[tokio::test]

@@ -15,8 +15,8 @@ use crate::runtime::adapter_state::AdapterStateNamespace;
 use crate::runtime::events::CommandStreamEffects;
 use crate::runtime::model::{
     ConfigurationLimitScope, ConversationRecord, IdempotencyOwner, MAX_IDEMPOTENCY_KEY_BYTES,
-    MAX_RUNTIME_CONVERSATIONS, MAX_RUNTIME_EVENT_BYTES, RuntimeCommitOperation, RuntimeStoreConfig,
-    RuntimeStoreError, RuntimeStoreOperation,
+    MAX_RUNTIME_CONVERSATIONS, MAX_RUNTIME_EVENT_BYTES, MAX_RUNTIME_PHYSICAL_CONVERSATIONS,
+    RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreOperation,
 };
 
 use super::cipher::{ROW_BLOB_V1_OVERHEAD_LEN, RowAad, RuntimeKeyBundle};
@@ -1228,6 +1228,12 @@ fn validate_configuration_preflight(
         database_id,
         input.conversation_id,
     )?;
+    super::native_projection::ensure_conversation_is_catalog_present(
+        connection,
+        key_bundle,
+        database_id,
+        &conversation,
+    )?;
     if conversation.descriptor.agent_kind != input.configuration.agent_kind() {
         return Err(RuntimeStoreError::ConfigurationAgentMismatch);
     }
@@ -2149,8 +2155,13 @@ pub(super) fn validate_v5_integrity(
             row.get::<_, Vec<u8>>(6)?,
         ))
     })?;
-    let state_limit = usize::try_from(MAX_RUNTIME_CONVERSATIONS)
-        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let physical_limit = if version == 6 {
+        MAX_RUNTIME_PHYSICAL_CONVERSATIONS
+    } else {
+        MAX_RUNTIME_CONVERSATIONS
+    };
+    let state_limit =
+        usize::try_from(physical_limit).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
     let mut rows = Vec::with_capacity(state_limit);
     for row in mapped {
         if rows.len() == state_limit {
@@ -2160,7 +2171,7 @@ pub(super) fn validate_v5_integrity(
     }
     if u64::try_from(rows.len()).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
         != ledger.conversation_count
-        || ledger.conversation_count > MAX_RUNTIME_CONVERSATIONS
+        || ledger.conversation_count > physical_limit
     {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }

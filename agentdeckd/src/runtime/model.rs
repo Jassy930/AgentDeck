@@ -38,8 +38,15 @@ pub const RUNTIME_STORE_SHUTDOWN_GRACE_MS: u64 = 5_000;
 pub const MAX_CONVERSATION_QUEUED_COMMANDS: u32 = 32;
 pub const MAX_GLOBAL_QUEUED_COMMANDS: u32 = 1_024;
 pub const MAX_GLOBAL_QUEUED_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
-/// Durable catalog 与恢复时 actor fan-out 的共同硬上界。
-pub const MAX_RUNTIME_CONVERSATIONS: u64 = 1_024;
+/// daemon 同时安装的 managed/native-present actor 与 live catalog entry 硬上界。
+pub const MAX_RUNTIME_LIVE_CONVERSATIONS: u64 = 1_024;
+/// native tombstone/retired identity 的额外物理保留上界。
+pub const MAX_NATIVE_NONLIVE_IDENTITIES: u64 = 8_192;
+/// v6 store 中 live 与 native non-live identity 合计的物理行硬上界。
+pub const MAX_RUNTIME_PHYSICAL_CONVERSATIONS: u64 =
+    MAX_RUNTIME_LIVE_CONVERSATIONS + MAX_NATIVE_NONLIVE_IDENTITIES;
+/// 兼容既有调用方：conversation capacity 始终表示 live actor/catalog 容量。
+pub const MAX_RUNTIME_CONVERSATIONS: u64 = MAX_RUNTIME_LIVE_CONVERSATIONS;
 pub const MAX_COMMAND_PAYLOAD_BYTES: usize = 256 * 1024;
 pub const MAX_CONVERSATION_DESCRIPTOR_BYTES: usize = 1024 * 1024;
 pub const MAX_ADAPTER_STATE_REFERENCE_BYTES: usize = 4 * 1024;
@@ -105,6 +112,10 @@ pub enum RuntimeStoreOperation {
     BindAdapterStateAfterCommit,
     ImportNativeProjectionBeforeCommit,
     ImportNativeProjectionAfterCommit,
+    ReconcileNativeProjectionBeforeCommit,
+    ReconcileNativeProjectionAfterCommit,
+    RetireNativeProjectionBeforeCommit,
+    RetireNativeProjectionAfterCommit,
     RegisterApprovalBeforeCommit,
     RegisterApprovalAfterCommit,
     ClaimApprovalBeforeCommit,
@@ -349,6 +360,7 @@ pub enum MetadataMutationLimitScope {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeProjectionLimitScope {
+    LiveConversations,
     PhysicalIdentities,
     NonliveIdentities,
     ChargedReferenceBytes,
@@ -373,6 +385,8 @@ pub enum RuntimeCommitOperation {
     CompleteCommand,
     BindAdapterState,
     ImportNativeProjection,
+    ReconcileNativeProjection,
+    RetireNativeProjection,
     RegisterApproval,
     ClaimApproval,
     BeginApprovalAttempt,

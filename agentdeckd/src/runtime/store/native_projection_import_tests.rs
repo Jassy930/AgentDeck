@@ -781,7 +781,13 @@ async fn live_cap_rejects_new_reference_but_not_exact_replay() {
         ))
         .await
         .expect_err("second reference must be rejected at live cap");
-    assert!(matches!(error, RuntimeStoreError::ConversationLimit));
+    assert_eq!(error.code(), "daemon.runtime.store_full");
+    assert!(matches!(
+        error,
+        RuntimeStoreError::NativeProjectionLimit {
+            scope: crate::runtime::model::NativeProjectionLimitScope::LiveConversations
+        }
+    ));
     assert_eq!(import_cardinality(&root.database()), baseline);
     store.shutdown().await.expect("shutdown live cap store");
 }

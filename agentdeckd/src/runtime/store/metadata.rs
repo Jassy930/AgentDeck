@@ -914,6 +914,43 @@ pub(super) fn load_authenticated_metadata_mutation_parent(
     }))
 }
 
+/// 完整认证指定 conversation 的 metadata mutation rows，并报告是否仍有 B4 active
+/// parent（claimed/applying/outcomeUnknown）。native lifecycle 的 quiescence CAS 不能只
+/// 依赖裸 state/COUNT 查询。
+pub(super) fn conversation_has_active_authenticated_metadata_mutation(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    conversation_id: RuntimeId,
+) -> Result<bool, RuntimeStoreError> {
+    let mut statement = connection.prepare(
+        "SELECT conversation_id, owner_token, idempotency_token, request_token,
+                expected_entry_revision, applied_entry_revision,
+                applied_catalog_revision, state, logical_request_bytes,
+                logical_outcome_bytes, charged_outcome_bytes, created_at_ms,
+                state_changed_at_ms, metadata_token, sealed_request, sealed_outcome
+         FROM metadata_mutation_ledger
+         WHERE conversation_id = ?1 ORDER BY idempotency_token",
+    )?;
+    let rows = statement.query_map([&conversation_id.as_bytes()[..]], raw_metadata_mutation_row)?;
+    let mut count = 0_u64;
+    let mut has_active = false;
+    for row in rows {
+        count = count
+            .checked_add(1)
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        if count > MAX_METADATA_MUTATIONS_PER_CONVERSATION {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        let authenticated = authenticate_metadata_row(key_bundle, database_id, row?)?;
+        if authenticated.conversation_id != conversation_id {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        has_active |= authenticated.state.is_active();
+    }
+    Ok(has_active)
+}
+
 fn replay_outcome(
     row: AuthenticatedMetadataMutationRow,
 ) -> Result<UpdateConversationMetadataOutcome, RuntimeStoreError> {

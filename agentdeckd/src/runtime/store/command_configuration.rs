@@ -89,7 +89,14 @@ pub(super) fn validate_fresh_admission(
 ) -> Result<u64, RuntimeStoreError> {
     // 先区分“conversation 不存在”和“已存在 conversation 的 authenticated
     // sidecar 缺失/损坏”。后者必须继续 fail-close，不能退化成 not-found。
-    super::journal::load_conversation(connection, key_bundle, database_id, conversation_id)?;
+    let conversation =
+        super::journal::load_conversation(connection, key_bundle, database_id, conversation_id)?;
+    super::native_projection::ensure_conversation_is_catalog_present(
+        connection,
+        key_bundle,
+        database_id,
+        &conversation,
+    )?;
     let state = load_conversation_state(connection, key_bundle, conversation_id)?;
     let current = state.current_revision()?;
     if current == 0 {
