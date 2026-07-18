@@ -5,13 +5,13 @@
 //! Relay”或“stable 信任域被当测试夹具”这两种半隔离状态。
 
 use std::env;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::ffi::CStr;
 use std::fmt;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::mem::MaybeUninit;
 use std::path::Path;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::path::PathBuf;
 
 use uuid::Uuid;
@@ -221,7 +221,7 @@ pub fn compiled_stable_keychain_access_group() -> Option<String> {
     option_env!("AGENTDECK_DAEMON_KEYCHAIN_ACCESS_GROUP").map(ToOwned::to_owned)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 pub(crate) fn current_user_home() -> Result<PathBuf, DaemonConfigError> {
     use std::os::unix::ffi::OsStringExt;
 

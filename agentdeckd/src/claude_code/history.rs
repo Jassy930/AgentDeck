@@ -34,9 +34,9 @@
 //! `HistoryListItem::title`. Verified live against `claude 2.1.191`.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use agentdeck_protocol::{
     AgentItem, AgentItemMeta, AgentKind, DiffFile, DiffStatus, HistoryListItem,
@@ -46,20 +46,40 @@ use agentdeck_protocol::{
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::claude_code::state::ClaudeCodeStateRepository;
+use crate::claude_code::state::{ClaudeCodeStateRepository, ResolvedClaudeCodeReference};
 #[cfg(test)]
 use crate::runtime::store::ConversationDescriptor;
 use crate::runtime::store::{RuntimeId, RuntimeStoreError};
 
+mod native;
+#[cfg(test)]
+mod native_tests;
+
+pub(in crate::claude_code) use native::{NativeTranscriptRefV1, safe_legacy_session_id};
+
+use native::{
+    NativeHistoryError, NativeHistorySource, NativeIoBudget, NativeParseLimits, NativeReadOutcome,
+    NativeScanStep, NativeScanStop,
+};
+
 /// 只由本模块在本机 CC projects root 中读回实体 JSONL 后签发的 opaque entry。
 /// Debug 不输出 native session id/path，客户端 wire 也无法构造。
 pub(super) struct VerifiedNativeHistoryEntry {
-    thread_id: ThreadId,
+    reference: NativeTranscriptRefV1,
 }
 
 impl VerifiedNativeHistoryEntry {
+    #[cfg(test)]
     pub(super) fn into_thread_id(self) -> ThreadId {
-        self.thread_id
+        ThreadId(
+            self.reference
+                .resume_thread_id()
+                .expect("verified native transcript filename has a safe session id"),
+        )
+    }
+
+    pub(super) fn into_private_reference(self) -> NativeTranscriptRefV1 {
+        self.reference
     }
 }
 
@@ -75,8 +95,8 @@ pub(super) async fn read_managed_history(
     repository: &ClaudeCodeStateRepository,
     adapter_state_key: RuntimeId,
 ) -> Result<HistoryReadResponse, ProtocolError> {
-    let thread_id = repository
-        .resolve(adapter_state_key)
+    let reference = repository
+        .resolve_private(adapter_state_key)
         .await
         .map_err(adapter_state_protocol_error)?
         .ok_or_else(|| ProtocolError {
@@ -84,13 +104,100 @@ pub(super) async fn read_managed_history(
             message: "Claude Code history mapping was not found".into(),
             diagnostic_ref: None,
         })?;
-    read_history(&thread_id)
-        .await
-        .map_err(|error| ProtocolError {
-            code: error.code,
-            message: "Claude Code private history read failed".into(),
-            diagnostic_ref: None,
+    match reference {
+        ResolvedClaudeCodeReference::LegacySessionId(thread_id) => {
+            read_legacy_managed_history(thread_id).await
+        }
+        ResolvedClaudeCodeReference::NativeV1(reference) => read_native_history(reference).await,
+    }
+}
+
+async fn read_legacy_managed_history(
+    thread_id: ThreadId,
+) -> Result<HistoryReadResponse, ProtocolError> {
+    let root = claude_projects_root().ok_or_else(|| ProtocolError {
+        code: "cc-history-root-unavailable".into(),
+        message: "cannot resolve the current user's Claude Code history root".into(),
+        diagnostic_ref: None,
+    })?;
+    let lookup_id = thread_id.clone();
+    let verified = tokio::task::spawn_blocking(move || {
+        verify_native_history_entry_at(
+            &root,
+            &HistoryListItem {
+                thread_id: lookup_id,
+                agent_kind: AgentKind::ClaudeCode,
+                title: None,
+                cwd: PathBuf::new(),
+                last_active_ms: 0,
+                archived: false,
+            },
+        )
+    })
+    .await
+    .map_err(|error| ProtocolError {
+        code: "cc-history-task-join".into(),
+        message: format!("legacy native history lookup failed: {error}"),
+        diagnostic_ref: None,
+    })??;
+    read_native_history(verified.into_private_reference()).await
+}
+
+async fn read_native_history(
+    reference: NativeTranscriptRefV1,
+) -> Result<HistoryReadResponse, ProtocolError> {
+    let thread_id = ThreadId(
+        reference
+            .resume_thread_id()
+            .map_err(native_history_protocol_error)?,
+    );
+    tokio::task::spawn_blocking(move || {
+        let source =
+            NativeHistorySource::for_current_account().map_err(native_history_protocol_error)?;
+        let mut budget =
+            NativeIoBudget::new(1, 64 * 1024 * 1024, Instant::now() + Duration::from_secs(2));
+        let document = match source
+            .read(&reference, &mut budget, NativeParseLimits::default())
+            .map_err(native_history_protocol_error)?
+        {
+            NativeReadOutcome::Document(document) => document,
+            NativeReadOutcome::FilteredObserver => return Err(native_history_not_found()),
+        };
+        if document.turns().is_empty() {
+            return Err(invalid_native_history());
+        }
+        let turns = document
+            .into_turns()
+            .into_iter()
+            .map(|turn| {
+                let turn_key = turn.key();
+                let _stable_turn_key = turn_key.as_bytes();
+                HistoryTurn {
+                    items: turn
+                        .into_items()
+                        .into_iter()
+                        .map(|item| {
+                            debug_assert_eq!(item.turn_key(), turn_key);
+                            let _stable_item_key = item.key();
+                            let _stable_item_key_bytes = _stable_item_key.as_bytes();
+                            item.into_item()
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
+        Ok(HistoryReadResponse {
+            thread_id,
+            agent_kind: AgentKind::ClaudeCode,
+            turns,
         })
+    })
+    .await
+    .map_err(|error| ProtocolError {
+        code: "cc-history-task-join".into(),
+        message: format!("native history task failed: {error}"),
+        diagnostic_ref: None,
+    })?
 }
 
 /// 只从调用方明确选定的 native history entry 重建派生索引；不按
@@ -194,11 +301,11 @@ pub fn decode_cwd(dirname: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// `~/.claude/projects/` resolved against `$HOME`. Returns `None` only
-/// when `$HOME` is unset (test-time isolation).
+/// `~/.claude/projects/` 只从 `getpwuid_r(geteuid())` 的 OS account home 派生。
 fn claude_projects_root() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".claude").join("projects"))
+    crate::config::current_user_home()
+        .ok()
+        .map(|home| home.join(".claude").join("projects"))
 }
 
 fn verify_native_history_entry_at(
@@ -213,88 +320,84 @@ fn verify_native_history_entry_at(
         });
     }
     let id = native.thread_id.0.as_str();
-    if id.len() < 8
-        || id.len() > 128
-        || !id.contains('-')
-        || !id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
+    if !native::safe_legacy_session_id(id) {
         return Err(ProtocolError {
             code: "cc-history-invalid-session-id".into(),
             message: "Claude Code native session id has an unsafe shape".into(),
             diagnostic_ref: None,
         });
     }
-    let filename = format!("{id}.jsonl");
-    let mut match_count = 0_u8;
-    let entries = match std::fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    let home = root
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(invalid_native_history)?;
+    if home.join(".claude").join("projects") != root {
+        return Err(invalid_native_history());
+    }
+    // SAFETY: geteuid has no preconditions and reads only process credentials.
+    let uid = unsafe { libc::geteuid() };
+    let source = match NativeHistorySource::from_home(home, uid) {
+        Ok(source) => source,
+        Err(NativeHistoryError::SourceUnavailable { .. }) => {
             return Err(native_history_not_found());
         }
-        Err(error) => {
-            return Err(ProtocolError {
-                code: "cc-history-read".into(),
-                message: format!("read native history root: {error}"),
-                diagnostic_ref: None,
-            });
-        }
+        Err(error) => return Err(native_history_protocol_error(error)),
     };
-    for entry in entries {
-        let entry = entry.map_err(|error| ProtocolError {
-            code: "cc-history-read".into(),
-            message: format!("read native history directory entry: {error}"),
-            diagnostic_ref: None,
-        })?;
-        let project = entry.path();
-        let project_meta = std::fs::symlink_metadata(&project).map_err(|error| ProtocolError {
-            code: "cc-history-read".into(),
-            message: format!("inspect native history project directory: {error}"),
-            diagnostic_ref: None,
-        })?;
-        if !project_meta.file_type().is_dir() || project_meta.file_type().is_symlink() {
-            continue;
-        }
-        let candidate = project.join(&filename);
-        let metadata = match std::fs::symlink_metadata(&candidate) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
+    let mut scanner = source.scanner().map_err(native_history_protocol_error)?;
+    let mut budget = NativeIoBudget::new(
+        2_000,
+        64 * 1024 * 1024,
+        Instant::now() + Duration::from_secs(2),
+    );
+    let mut matched = None;
+    loop {
+        match scanner
+            .next(&mut budget)
+            .map_err(native_history_protocol_error)?
+        {
+            NativeScanStep::Candidate(candidate) => {
+                if !matches!(
+                    candidate.reference().resume_thread_id().as_deref(),
+                    Ok(found) if found == id
+                ) {
+                    continue;
+                }
+                match source
+                    .read(
+                        candidate.reference(),
+                        &mut budget,
+                        NativeParseLimits::default(),
+                    )
+                    .map_err(native_verification_read_error)?
+                {
+                    NativeReadOutcome::FilteredObserver => continue,
+                    NativeReadOutcome::Document(document) if document.turns().is_empty() => {
+                        return Err(invalid_native_history());
+                    }
+                    NativeReadOutcome::Document(_) => {}
+                }
+                if matched.replace(candidate.reference().clone()).is_some() {
+                    return Err(ProtocolError {
+                        code: "cc-history-native-entry-ambiguous".into(),
+                        message: "Claude Code native history entry did not resolve to exactly one JSONL file".into(),
+                        diagnostic_ref: None,
+                    });
+                }
+            }
+            NativeScanStep::Yielded(NativeScanStop::CandidateLimit | NativeScanStop::Deadline) => {
                 return Err(ProtocolError {
-                    code: "cc-history-read".into(),
-                    message: format!("inspect native history entry: {error}"),
+                    code: "cc-history-native-scan-truncated".into(),
+                    message: "Claude Code native history verification exceeded its bounded scan"
+                        .into(),
                     diagnostic_ref: None,
                 });
             }
-        };
-        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-            continue;
+            NativeScanStep::Complete => break,
         }
-        if is_memory_agent_project_path(&candidate) {
-            continue;
-        }
-        if inspect_native_history_jsonl(&candidate, &metadata)? {
-            continue;
-        }
-        match_count = match_count.saturating_add(1);
     }
-    if match_count != 1 {
-        return if match_count == 0 {
-            Err(native_history_not_found())
-        } else {
-            Err(ProtocolError {
-                code: "cc-history-native-entry-ambiguous".into(),
-                message:
-                    "Claude Code native history entry did not resolve to exactly one JSONL file"
-                        .into(),
-                diagnostic_ref: None,
-            })
-        };
-    }
-    Ok(VerifiedNativeHistoryEntry {
-        thread_id: native.thread_id.clone(),
-    })
+    matched
+        .map(|reference| VerifiedNativeHistoryEntry { reference })
+        .ok_or_else(native_history_not_found)
 }
 
 fn native_history_not_found() -> ProtocolError {
@@ -304,96 +407,6 @@ fn native_history_not_found() -> ProtocolError {
             .into(),
         diagnostic_ref: None,
     }
-}
-
-/// 在签发 `VerifiedNativeHistoryEntry` 前，从已检查的 regular file descriptor
-/// 有界读回 JSONL。打开、读取、JSON 解析或 metadata identity 任一失败都
-/// fail-close；返回值只表示该实体是否属于 memory/observer session。
-fn inspect_native_history_jsonl(
-    candidate: &Path,
-    expected_metadata: &std::fs::Metadata,
-) -> Result<bool, ProtocolError> {
-    const MAX_VERIFY_BYTES: u64 = 256 * 1024;
-    const MAX_VERIFY_LINES: usize = 256;
-
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    }
-    let file = options.open(candidate).map_err(|error| ProtocolError {
-        code: "cc-history-read".into(),
-        message: format!("open native history entry: {error}"),
-        diagnostic_ref: None,
-    })?;
-    let opened_metadata = file.metadata().map_err(|error| ProtocolError {
-        code: "cc-history-read".into(),
-        message: format!("inspect opened native history entry: {error}"),
-        diagnostic_ref: None,
-    })?;
-    if !opened_metadata.file_type().is_file() {
-        return Err(invalid_native_history());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if expected_metadata.dev() != opened_metadata.dev()
-            || expected_metadata.ino() != opened_metadata.ino()
-        {
-            return Err(ProtocolError {
-                code: "cc-history-read".into(),
-                message: "native history entry changed while it was being verified".into(),
-                diagnostic_ref: None,
-            });
-        }
-    }
-
-    let mut reader = BufReader::new(file).take(MAX_VERIFY_BYTES + 1);
-    let mut line = String::new();
-    let mut total_bytes = 0_u64;
-    let mut line_count = 0_usize;
-    let mut saw_json_object = false;
-    loop {
-        if total_bytes == MAX_VERIFY_BYTES || line_count == MAX_VERIFY_LINES {
-            break;
-        }
-        line.clear();
-        let read = reader.read_line(&mut line).map_err(|error| ProtocolError {
-            code: "cc-history-read".into(),
-            message: format!("read native history entry: {error}"),
-            diagnostic_ref: None,
-        })?;
-        if read == 0 {
-            break;
-        }
-        total_bytes = total_bytes
-            .checked_add(u64::try_from(read).map_err(|_| invalid_native_history())?)
-            .ok_or_else(invalid_native_history)?;
-        line_count = line_count
-            .checked_add(1)
-            .ok_or_else(invalid_native_history)?;
-        if total_bytes > MAX_VERIFY_BYTES || line_count > MAX_VERIFY_LINES {
-            return Err(invalid_native_history());
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let value: Value = serde_json::from_str(trimmed).map_err(|_| invalid_native_history())?;
-        if !value.is_object() {
-            return Err(invalid_native_history());
-        }
-        saw_json_object = true;
-        if json_value_is_memory_agent(&value) {
-            return Ok(true);
-        }
-    }
-    if !saw_json_object {
-        return Err(invalid_native_history());
-    }
-    Ok(false)
 }
 
 fn json_value_is_memory_agent(value: &Value) -> bool {
@@ -419,6 +432,24 @@ fn invalid_native_history() -> ProtocolError {
         code: "cc-history-native-entry-invalid".into(),
         message: "Claude Code native history entry was not readable, bounded valid JSONL".into(),
         diagnostic_ref: None,
+    }
+}
+
+fn native_history_protocol_error(error: NativeHistoryError) -> ProtocolError {
+    ProtocolError {
+        code: error.code().into(),
+        message: "Claude Code native history verification failed".into(),
+        diagnostic_ref: None,
+    }
+}
+
+fn native_verification_read_error(error: NativeHistoryError) -> ProtocolError {
+    match error {
+        NativeHistoryError::SourceUnavailable { .. }
+        | NativeHistoryError::SourceUnsafe { .. }
+        | NativeHistoryError::Io { .. }
+        | NativeHistoryError::HomeUnavailable => native_history_protocol_error(error),
+        _ => invalid_native_history(),
     }
 }
 
@@ -1515,7 +1546,7 @@ mod tests {
         let session_id = "10000000-0000-0000-0000-000000000001";
         std::fs::write(
             project.join(format!("{session_id}.jsonl")),
-            r#"{"type":"user","message":{"role":"user","content":"real prompt"}}"#,
+            r#"{"type":"user","uuid":"11000000-0000-4000-8000-000000000011","parentUuid":null,"message":{"role":"user","content":"real prompt"}}"#,
         )
         .unwrap();
         let native = HistoryListItem {
@@ -1540,7 +1571,7 @@ mod tests {
         std::fs::create_dir_all(&duplicate_project).unwrap();
         std::fs::write(
             duplicate_project.join(format!("{session_id}.jsonl")),
-            r#"{"type":"user","message":{"role":"user","content":"duplicate"}}"#,
+            r#"{"type":"user","uuid":"12000000-0000-4000-8000-000000000012","parentUuid":null,"message":{"role":"user","content":"duplicate"}}"#,
         )
         .unwrap();
         let error = verify_native_history_entry_at(&root, &native)
@@ -1659,7 +1690,7 @@ mod tests {
         let native_id = "30000000-0000-0000-0000-000000000003";
         std::fs::write(
             project.join(format!("{native_id}.jsonl")),
-            r#"{"type":"user","message":{"role":"user","content":"native"}}"#,
+            r#"{"type":"user","uuid":"31000000-0000-4000-8000-000000000031","parentUuid":null,"message":{"role":"user","content":"native"}}"#,
         )
         .unwrap();
         let native = HistoryListItem {
@@ -1725,7 +1756,7 @@ mod tests {
         std::fs::create_dir_all(&duplicate).unwrap();
         std::fs::write(
             duplicate.join(format!("{native_id}.jsonl")),
-            r#"{"type":"user","message":{"role":"user","content":"duplicate"}}"#,
+            r#"{"type":"user","uuid":"32000000-0000-4000-8000-000000000032","parentUuid":null,"message":{"role":"user","content":"duplicate"}}"#,
         )
         .unwrap();
         assert_eq!(
