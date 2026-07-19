@@ -570,6 +570,35 @@ mod migration_tests {
         columns
     }
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct EnrollmentReceiptRawEvidence {
+        relay_server_id: Vec<u8>,
+        machine_route: Vec<u8>,
+        root_fingerprint: Vec<u8>,
+    }
+
+    fn enrollment_receipt_raw_evidence(
+        connection: &Connection,
+    ) -> Vec<EnrollmentReceiptRawEvidence> {
+        connection
+            .prepare(
+                "SELECT relay_server_id, machine_route, root_fingerprint
+                 FROM machine_enrollment_receipts
+                 ORDER BY relay_server_id, machine_route",
+            )
+            .expect("prepare raw enrollment receipt evidence")
+            .query_map([], |row| {
+                Ok(EnrollmentReceiptRawEvidence {
+                    relay_server_id: row.get(0)?,
+                    machine_route: row.get(1)?,
+                    root_fingerprint: row.get(2)?,
+                })
+            })
+            .expect("query raw enrollment receipt evidence")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect raw enrollment receipt evidence")
+    }
+
     fn cipher_evidence(path: &Path) -> CipherEvidence {
         let connection = Connection::open(path).expect("open ciphertext evidence database");
         let has_table = |table: &str| {
@@ -1772,7 +1801,11 @@ mod migration_tests {
     async fn build_populated_strict_v7_fixture(
         root: &TestRoot,
         keys: &MemoryKeyStore,
-    ) -> (CipherEvidence, Vec<(String, Vec<Vec<u8>>)>) {
+    ) -> (
+        CipherEvidence,
+        Vec<(String, Vec<Vec<u8>>)>,
+        Vec<EnrollmentReceiptRawEvidence>,
+    ) {
         let (before, authenticated_before) = build_populated_strict_v6_fixture(root, keys).await;
         let connection = Connection::open(root.database()).expect("open strict v6 fixture for v7");
         let meta = read_meta_v6(&connection)
@@ -1810,6 +1843,15 @@ mod migration_tests {
             schema_manifest(&connection).expect("read strict v7 manifest"),
             expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V7).expect("build exact v7 manifest")
         );
+        connection
+            .execute(
+                "INSERT INTO machine_enrollment_receipts (
+                     relay_server_id, machine_route, root_fingerprint
+                 ) VALUES (?1, ?2, ?3)",
+                params![&[0x91_u8; 16][..], &[0x92_u8; 16][..], &[0x93_u8; 32][..]],
+            )
+            .expect("insert strict v7 rescue receipt");
+        let receipt_before = enrollment_receipt_raw_evidence(&connection);
         drop(connection);
         assert_eq!(cipher_evidence(&root.database()), before);
         let authenticated_after = {
@@ -1818,7 +1860,7 @@ mod migration_tests {
             authenticated_blob_evidence(&connection)
         };
         assert_eq!(authenticated_after, authenticated_before);
-        (before, authenticated_before)
+        (before, authenticated_before, receipt_before)
     }
 
     async fn build_populated_strict_v5_fixture_with_metadata_mutation(
@@ -2688,11 +2730,17 @@ mod migration_tests {
     async fn populated_v7_migrates_to_v8_with_byte_exact_existing_authenticated_rows() {
         let root = TestRoot::new("v7-populated-to-v8");
         let keys = MemoryKeyStore::new();
-        let (before, authenticated_before) = build_populated_strict_v7_fixture(&root, &keys).await;
+        let (before, authenticated_before, receipt_before) =
+            build_populated_strict_v7_fixture(&root, &keys).await;
+        let expected_receipts = vec![MachineEnrollmentReceiptRecord {
+            relay_server_id: [0x91; 16],
+            machine_route: [0x92; 16],
+            root_fingerprint: [0x93; 32],
+        }];
         let rescue_before = artifact_evidence(&root.database());
         assert_eq!(
             read_rescue_index(&root.database()).expect("read strict v7 rescue index"),
-            Vec::<MachineEnrollmentReceiptRecord>::new()
+            expected_receipts
         );
         assert_eq!(
             artifact_evidence(&root.database()),
@@ -2723,6 +2771,11 @@ mod migration_tests {
             "v7 to v8 must preserve every existing non-meta token and ciphertext byte-exact"
         );
         assert_eq!(
+            enrollment_receipt_raw_evidence(&connection),
+            receipt_before,
+            "v7 to v8 must preserve every rescue receipt column byte-exact"
+        );
+        assert_eq!(
             schema_manifest(&connection).expect("read migrated v8 manifest"),
             expected_schema_manifest(RUNTIME_SCHEMA_VERSION).expect("build exact v8 manifest")
         );
@@ -2735,6 +2788,17 @@ mod migration_tests {
             )
             .expect("read migrated identity totals");
         assert_eq!(identity_totals, (0, 0));
+        drop(connection);
+        let rescue_after = artifact_evidence(&root.database());
+        assert_eq!(
+            read_rescue_index(&root.database()).expect("read migrated v8 rescue index"),
+            expected_receipts
+        );
+        assert_eq!(
+            artifact_evidence(&root.database()),
+            rescue_after,
+            "migrated v8 rescue read must not rewrite runtime artifacts"
+        );
     }
 
     #[tokio::test]

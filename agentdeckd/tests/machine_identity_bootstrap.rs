@@ -1,32 +1,48 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use agentdeck_crypto::sha256;
+use agentdeck_protocol::runtime::command::HelloParams;
+use agentdeck_protocol::runtime::identity::MessageId;
+use agentdeck_protocol::runtime::{
+    RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeMessage, RuntimeReply, RuntimeRequest,
+};
+use agentdeckd::config::{DaemonConfig, DaemonStartupOptions};
+use agentdeckd::local::listener::BoundLocalListener;
 use agentdeckd::remote::bootstrap::{RemoteBootstrapOutcome, reconcile_machine_identity};
 use agentdeckd::remote::identity::{
     KEY_DIRECTORY_GUARD_ACCOUNT, KeyDirectoryGuard, MACHINE_DATA_SIGN_ACCOUNT,
     MACHINE_HPKE_ACCOUNT, MACHINE_LINK_SIGN_ACCOUNT, MACHINE_ROOT_SIGN_ACCOUNT,
     install_key_directory_guard, load_key_directory_guard, load_machine_key_material,
 };
+use agentdeckd::runtime::singleton::SingletonGuard;
 use agentdeckd::runtime::store::{
     MachineIdentityBinding, MachineIdentityLifecycle, RuntimeStoreConfig, RuntimeStoreError,
     RuntimeStoreFaultInjector, RuntimeStoreHandle, RuntimeStoreOperation,
 };
+use agentdeckd::runtime::{AgentRouter, RuntimeCore};
 use agentdeckd::security::{
     KeyStore, KeyStoreError, MemoryKeyStore, SecretBytes, load_or_create_storage_kek,
 };
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+
+const LOCAL_IO_TIMEOUT: Duration = Duration::from_secs(5);
+static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 struct TestRoot(PathBuf);
 
 impl TestRoot {
-    fn new(label: &str) -> Self {
+    fn new(_label: &str) -> Self {
         let path = Path::new("/tmp").join(format!(
-            "agentdeck-remote-bootstrap-{label}-{}-{}",
+            "adb-{}-{}",
             std::process::id(),
-            uuid::Uuid::new_v4().simple()
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&path).expect("create bootstrap test root");
         #[cfg(unix)]
@@ -47,6 +63,41 @@ impl Drop for TestRoot {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+fn ephemeral_config(root: &TestRoot) -> DaemonConfig {
+    DaemonConfig::resolve_with_roots(
+        DaemonStartupOptions {
+            ephemeral: true,
+            no_remote: true,
+            stdio_compat: false,
+            profile: None,
+            stable_keychain_access_group: None,
+        },
+        &root.0,
+        &root.0,
+    )
+    .expect("resolve ephemeral bootstrap config")
+}
+
+fn stable_config(root: &TestRoot) -> DaemonConfig {
+    let home = root.0.join("home");
+    fs::create_dir_all(home.join("Library/Application Support"))
+        .expect("create stable bootstrap home");
+    DaemonConfig::resolve_with_roots(
+        DaemonStartupOptions {
+            ephemeral: false,
+            no_remote: false,
+            stdio_compat: false,
+            profile: None,
+            stable_keychain_access_group: Some(
+                "A1B2C3D4E5.com.agentdeck.agentdeckd.stable".to_owned(),
+            ),
+        },
+        &home,
+        &root.0,
+    )
+    .expect("resolve stable bootstrap config")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -83,6 +134,10 @@ impl RecordingKeyStore {
 
     fn value(&self, account: &str) -> Option<Vec<u8>> {
         self.values.lock().unwrap().get(account).cloned()
+    }
+
+    fn values_snapshot(&self) -> HashMap<String, Vec<u8>> {
+        self.values.lock().unwrap().clone()
     }
 
     fn insert_material(&self, seed: u8) {
@@ -140,6 +195,22 @@ impl KeyStore for RecordingKeyStore {
     }
 }
 
+struct PoisonKeyStore;
+
+impl KeyStore for PoisonKeyStore {
+    fn load(&self, account: &str) -> Result<Option<SecretBytes>, KeyStoreError> {
+        panic!("disabled bootstrap unexpectedly loaded {account}")
+    }
+
+    fn store(&self, account: &str, _value: &SecretBytes) -> Result<(), KeyStoreError> {
+        panic!("disabled bootstrap unexpectedly stored {account}")
+    }
+
+    fn delete(&self, account: &str) -> Result<(), KeyStoreError> {
+        panic!("disabled bootstrap unexpectedly deleted {account}")
+    }
+}
+
 async fn open_store(
     root: &TestRoot,
     faults: Option<Arc<dyn RuntimeStoreFaultInjector>>,
@@ -155,6 +226,15 @@ async fn open_store(
     )
     .await
     .expect("open bootstrap store")
+}
+
+async fn reconcile_stable(
+    root: &TestRoot,
+    store: &RuntimeStoreHandle,
+    key_store: &dyn KeyStore,
+) -> Result<RemoteBootstrapOutcome, RuntimeStoreError> {
+    let config = stable_config(root);
+    reconcile_machine_identity(&config, store, key_store).await
 }
 
 fn binding_for_material(keys: &dyn KeyStore, root_key_id: [u8; 16]) -> MachineIdentityBinding {
@@ -260,13 +340,12 @@ fn bootstrap_source_owns_no_p4_2_network_or_injection_surface() {
 async fn disabled_bootstrap_performs_zero_machine_account_io() {
     let root = TestRoot::new("disabled");
     let store = open_store(&root, None).await;
-    let keys = RecordingKeyStore::default();
+    let config = ephemeral_config(&root);
 
-    let outcome = reconcile_machine_identity(false, &store, &keys)
+    let outcome = reconcile_machine_identity(&config, &store, &PoisonKeyStore)
         .await
         .expect("disabled bootstrap");
     assert!(matches!(outcome, RemoteBootstrapOutcome::Disabled));
-    assert!(keys.operations().is_empty());
     assert_eq!(
         store.load_machine_identity_state().await.unwrap(),
         None,
@@ -281,7 +360,7 @@ async fn fresh_bootstrap_is_active_nonzero_and_restart_stable() {
     let store = open_store(&root, None).await;
     let keys = RecordingKeyStore::default();
 
-    let first = reconcile_machine_identity(true, &store, &keys)
+    let first = reconcile_stable(&root, &store, &keys)
         .await
         .expect("fresh bootstrap");
     let RemoteBootstrapOutcome::Active(first) = first else {
@@ -319,7 +398,7 @@ async fn fresh_bootstrap_is_active_nonzero_and_restart_stable() {
 
     drop(first);
     keys.clear_operations();
-    let second = reconcile_machine_identity(true, &store, &keys)
+    let second = reconcile_stable(&root, &store, &keys)
         .await
         .expect("restart bootstrap");
     let RemoteBootstrapOutcome::Active(second) = second else {
@@ -347,7 +426,7 @@ async fn partial_fresh_material_only_fills_missing_accounts() {
         .unwrap();
     keys.clear_operations();
 
-    let outcome = reconcile_machine_identity(true, &store, &keys)
+    let outcome = reconcile_stable(&root, &store, &keys)
         .await
         .expect("resume partial pre-Preparing material");
     assert!(matches!(outcome, RemoteBootstrapOutcome::Active(_)));
@@ -374,7 +453,7 @@ async fn guard_without_db_identity_is_rollback_blocked_and_zero_write() {
     install_key_directory_guard(&keys, guard).unwrap();
     keys.clear_operations();
 
-    let outcome = reconcile_machine_identity(true, &store, &keys)
+    let outcome = reconcile_stable(&root, &store, &keys)
         .await
         .expect("rollback is remote-only blocked");
     let RemoteBootstrapOutcome::Blocked(block) = outcome else {
@@ -405,7 +484,7 @@ async fn invalid_guard_without_db_identity_blocks_before_key_io() {
     .unwrap();
     keys.clear_operations();
 
-    let outcome = reconcile_machine_identity(true, &store, &keys)
+    let outcome = reconcile_stable(&root, &store, &keys)
         .await
         .expect("invalid guard is remote-only blocked");
     let RemoteBootstrapOutcome::Blocked(block) = outcome else {
@@ -431,7 +510,7 @@ async fn preparing_missing_material_blocks_without_repair() {
         .await
         .unwrap();
 
-    let outcome = reconcile_machine_identity(true, &store, &keys)
+    let outcome = reconcile_stable(&root, &store, &keys)
         .await
         .expect("missing material is remote-only blocked");
     let RemoteBootstrapOutcome::Blocked(block) = outcome else {
@@ -459,7 +538,7 @@ async fn preparing_exact_state_installs_guard_then_activates_without_rekey() {
         .unwrap();
     keys.clear_operations();
 
-    let outcome = reconcile_machine_identity(true, &store, &keys)
+    let outcome = reconcile_stable(&root, &store, &keys)
         .await
         .expect("resume Preparing");
     let RemoteBootstrapOutcome::Active(active) = outcome else {
@@ -499,7 +578,7 @@ async fn preparing_with_exact_guard_only_activates() {
     .unwrap();
     keys.clear_operations();
 
-    let outcome = reconcile_machine_identity(true, &store, &keys)
+    let outcome = reconcile_stable(&root, &store, &keys)
         .await
         .expect("resume exact Preparing guard");
     assert!(matches!(outcome, RemoteBootstrapOutcome::Active(_)));
@@ -515,6 +594,59 @@ async fn preparing_with_exact_guard_only_activates() {
     );
     drop(outcome);
     store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn preparing_guard_forks_block_without_mutating_any_identity_artifact() {
+    for axis in ["database", "root", "revision"] {
+        let root = TestRoot::new(&format!("preparing-guard-{axis}-fork"));
+        let store = open_store(&root, None).await;
+        let keys = RecordingKeyStore::default();
+        keys.insert_material(0x6A);
+        let expected = binding_for_material(&keys, [0x6B; 16]);
+        let prepared = match store
+            .prepare_machine_identity(expected.clone())
+            .await
+            .unwrap()
+        {
+            agentdeckd::runtime::store::PrepareMachineIdentityOutcome::Prepared { state }
+            | agentdeckd::runtime::store::PrepareMachineIdentityOutcome::Replayed { state } => {
+                state
+            }
+        };
+        let mut database_id = prepared.database_id;
+        let mut root_fingerprint = expected.root_fingerprint;
+        let mut revision = expected.key_directory_revision;
+        match axis {
+            "database" => database_id[0] ^= 0x80,
+            "root" => root_fingerprint[0] ^= 0x40,
+            "revision" => revision += 1,
+            _ => unreachable!(),
+        }
+        let guard = KeyDirectoryGuard::new(database_id, root_fingerprint, revision);
+        install_key_directory_guard(&keys, guard).unwrap();
+        let values_before = keys.values_snapshot();
+        keys.clear_operations();
+
+        let outcome = reconcile_stable(&root, &store, &keys)
+            .await
+            .expect("Preparing guard fork is remote-only blocked");
+        let RemoteBootstrapOutcome::Blocked(block) = outcome else {
+            panic!("Preparing guard fork must block");
+        };
+        assert_eq!(block.code(), "daemon.remote.identity.state_fork");
+        assert!(
+            keys.operations()
+                .iter()
+                .all(|operation| matches!(operation, KeyOperation::Load(_)))
+        );
+        assert_eq!(keys.values_snapshot(), values_before);
+        let state = store.load_machine_identity_state().await.unwrap().unwrap();
+        assert_eq!(state.lifecycle, MachineIdentityLifecycle::Preparing);
+        assert_eq!(state.binding, expected);
+        assert_eq!(load_key_directory_guard(&keys).unwrap(), Some(guard));
+        store.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -536,7 +668,7 @@ async fn active_missing_guard_and_public_fork_are_blocked_without_write() {
         store.activate_machine_identity(expected).await.unwrap();
         keys.clear_operations();
 
-        let outcome = reconcile_machine_identity(true, &store, &keys)
+        let outcome = reconcile_stable(&root, &store, &keys)
             .await
             .expect("Active inconsistency is remote-only blocked");
         let RemoteBootstrapOutcome::Blocked(block) = outcome else {
@@ -595,7 +727,7 @@ async fn active_missing_each_key_blocks_without_recreation() {
         keys.delete(missing_account).unwrap();
         keys.clear_operations();
 
-        let outcome = reconcile_machine_identity(true, &store, &keys)
+        let outcome = reconcile_stable(&root, &store, &keys)
             .await
             .expect("missing Active key is remote-only blocked");
         let RemoteBootstrapOutcome::Blocked(block) = outcome else {
@@ -651,7 +783,7 @@ async fn active_guard_revision_or_database_fork_is_blocked_without_overwrite() {
         install_key_directory_guard(&keys, guard).unwrap();
         keys.clear_operations();
 
-        let outcome = reconcile_machine_identity(true, &store, &keys)
+        let outcome = reconcile_stable(&root, &store, &keys)
             .await
             .expect("guard fork is remote-only blocked");
         let RemoteBootstrapOutcome::Blocked(block) = outcome else {
@@ -673,7 +805,7 @@ async fn commit_unknown_is_retried_exactly_through_active_readback() {
     let store = open_store(&root, Some(faults)).await;
     let keys = RecordingKeyStore::default();
 
-    let outcome = reconcile_machine_identity(true, &store, &keys)
+    let outcome = reconcile_stable(&root, &store, &keys)
         .await
         .expect("prepare COMMIT-unknown exact retry");
     assert!(matches!(outcome, RemoteBootstrapOutcome::Active(_)));
@@ -695,7 +827,7 @@ async fn commit_unknown_is_retried_exactly_through_active_readback() {
     ));
     let store = open_store(&root, Some(faults)).await;
     let keys = RecordingKeyStore::default();
-    let outcome = reconcile_machine_identity(true, &store, &keys)
+    let outcome = reconcile_stable(&root, &store, &keys)
         .await
         .expect("activate COMMIT-unknown exact retry");
     assert!(matches!(outcome, RemoteBootstrapOutcome::Active(_)));
@@ -715,7 +847,7 @@ async fn frozen_write_order_stops_before_guard_or_active_on_store_failure() {
     .await;
     let keys = RecordingKeyStore::default();
     assert!(matches!(
-        reconcile_machine_identity(true, &store, &keys).await,
+        reconcile_stable(&root, &store, &keys).await,
         Err(RuntimeStoreError::InvalidConfig(_))
     ));
     assert_eq!(
@@ -730,7 +862,7 @@ async fn frozen_write_order_stops_before_guard_or_active_on_store_failure() {
     assert_eq!(store.load_machine_identity_state().await.unwrap(), None);
     assert_eq!(load_key_directory_guard(&keys).unwrap(), None);
     keys.clear_operations();
-    let retry = reconcile_machine_identity(true, &store, &keys)
+    let retry = reconcile_stable(&root, &store, &keys)
         .await
         .expect("retry prepare before-COMMIT failure");
     assert!(matches!(retry, RemoteBootstrapOutcome::Active(_)));
@@ -748,14 +880,14 @@ async fn frozen_write_order_stops_before_guard_or_active_on_store_failure() {
     .await;
     let keys = RecordingKeyStore::default();
     assert!(matches!(
-        reconcile_machine_identity(true, &store, &keys).await,
+        reconcile_stable(&root, &store, &keys).await,
         Err(RuntimeStoreError::InvalidConfig(_))
     ));
     let state = store.load_machine_identity_state().await.unwrap().unwrap();
     assert_eq!(state.lifecycle, MachineIdentityLifecycle::Preparing);
     assert!(load_key_directory_guard(&keys).unwrap().is_some());
     keys.clear_operations();
-    let retry = reconcile_machine_identity(true, &store, &keys)
+    let retry = reconcile_stable(&root, &store, &keys)
         .await
         .expect("retry activate before-COMMIT failure");
     assert!(matches!(retry, RemoteBootstrapOutcome::Active(_)));
@@ -771,7 +903,7 @@ async fn authenticated_store_failures_remain_runtime_fatal() {
     let keys = RecordingKeyStore::default();
     store.clone().shutdown().await.unwrap();
 
-    let error = reconcile_machine_identity(true, &store, &keys)
+    let error = reconcile_stable(&root, &store, &keys)
         .await
         .expect_err("closed authenticated store must remain fatal");
     assert!(matches!(
@@ -779,4 +911,234 @@ async fn authenticated_store_failures_remain_runtime_fatal() {
         RuntimeStoreError::WorkerStopped | RuntimeStoreError::ShutdownInProgress
     ));
     assert!(keys.operations().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_stable_identity_still_recovers_and_serves_real_local_hello() {
+    let root = TestRoot::new("blocked-stable-local");
+    let config = stable_config(&root);
+    let singleton = SingletonGuard::acquire(config.paths()).expect("acquire stable singleton");
+    let keys = RecordingKeyStore::default();
+    let storage_kek = load_or_create_storage_kek(&keys, &config.paths().runtime_db)
+        .expect("create stable composition StorageKEK");
+    let store = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(config.paths().runtime_db.clone()),
+        storage_kek,
+    )
+    .await
+    .expect("open stable composition store");
+    keys.clear_operations();
+
+    let active = reconcile_machine_identity(&config, &store, &keys)
+        .await
+        .expect("create active stable identity");
+    assert!(matches!(active, RemoteBootstrapOutcome::Active(_)));
+    drop(active);
+    keys.delete(MACHINE_ROOT_SIGN_ACCOUNT).unwrap();
+    keys.delete(KEY_DIRECTORY_GUARD_ACCOUNT).unwrap();
+    keys.clear_operations();
+
+    let blocked = reconcile_machine_identity(&config, &store, &keys)
+        .await
+        .expect("missing active artifacts only block remote");
+    let RemoteBootstrapOutcome::Blocked(block) = &blocked else {
+        panic!("deleted active key/guard must block remote");
+    };
+    assert_eq!(block.code(), "daemon.remote.identity.key_missing");
+    assert!(keys.store_accounts().is_empty());
+
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let core = Arc::new(
+        RuntimeCore::new(store, router, [0x9A; 32])
+            .expect("construct blocked-identity RuntimeCore"),
+    );
+    let (_, recovery_ready) = core
+        .recover_for_startup()
+        .await
+        .expect("blocked remote identity must not block Runtime recovery");
+    let mut listener =
+        BoundLocalListener::bind_after_recovery(recovery_ready, &config, &singleton, core.clone())
+            .await
+            .expect("blocked remote identity must not block stable local bind");
+    let remote_permit = listener.take_remote_start_permit();
+    assert!(
+        remote_permit.is_some(),
+        "stable listener must mint its permit"
+    );
+    let armed_remote = match (blocked, remote_permit) {
+        (RemoteBootstrapOutcome::Active(identity), Some(permit)) => Some(identity.arm(permit)),
+        (RemoteBootstrapOutcome::Blocked(_), _discarded_permit) => None,
+        (RemoteBootstrapOutcome::Disabled, _discarded_permit) => None,
+        (RemoteBootstrapOutcome::Active(_), None) => None,
+    };
+    assert!(
+        armed_remote.is_none(),
+        "Blocked identity must discard the permit instead of arming remote"
+    );
+
+    let socket = config.paths().socket.clone();
+    let (shutdown, shutdown_receiver) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(listener.serve_until(async move {
+        let _ = shutdown_receiver.await;
+        Ok(())
+    }));
+    let mut stream = UnixStream::connect(&socket)
+        .await
+        .expect("connect blocked-identity local UDS");
+    let preface = serde_json::to_vec(&serde_json::json!({
+        "localProtocolVersion": 1,
+        "clientInstallationId": "123e4567-e89b-12d3-a456-426614174401",
+    }))
+    .expect("encode local preface");
+    stream
+        .write_all(&preface)
+        .await
+        .expect("write local preface");
+    stream.write_all(b"\n").await.expect("terminate preface");
+    let hello = RuntimeEnvelope {
+        version: RUNTIME_PROTOCOL_VERSION,
+        message_id: MessageId::new("blocked-identity-local-hello"),
+        body: RuntimeMessage::Request(RuntimeRequest::Hello(HelloParams {
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+        })),
+    };
+    stream
+        .write_all(&hello.to_json_bytes_checked().expect("encode local Hello"))
+        .await
+        .expect("write local Hello");
+    stream.write_all(b"\n").await.expect("terminate Hello");
+    stream.flush().await.expect("flush local Hello");
+    let mut reader = BufReader::new(stream);
+    let mut reply = Vec::new();
+    tokio::time::timeout(LOCAL_IO_TIMEOUT, reader.read_until(b'\n', &mut reply))
+        .await
+        .expect("local Hello reply timeout")
+        .expect("read local Hello reply");
+    assert_eq!(reply.pop(), Some(b'\n'));
+    let reply: RuntimeEnvelope = serde_json::from_slice(&reply).expect("decode local Hello reply");
+    assert_eq!(reply.message_id.as_str(), "blocked-identity-local-hello");
+    assert!(matches!(
+        reply.body,
+        RuntimeMessage::Reply(RuntimeReply::Hello(HelloParams {
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION
+        }))
+    ));
+    drop(reader);
+    shutdown.send(()).expect("request local listener shutdown");
+    tokio::time::timeout(LOCAL_IO_TIMEOUT, server)
+        .await
+        .expect("local listener shutdown timeout")
+        .expect("join local listener")
+        .expect("stop local listener");
+    drop(armed_remote);
+    core.shutdown()
+        .await
+        .expect("shutdown blocked-identity RuntimeCore");
+}
+
+#[tokio::test]
+async fn stable_private_material_never_enters_runtime_artifacts_or_identity_logs() {
+    let root = TestRoot::new("private-material-sentinel");
+    let config = stable_config(&root);
+    let _singleton =
+        SingletonGuard::acquire(config.paths()).expect("acquire sentinel stable singleton");
+    let identity_keys = RecordingKeyStore::default();
+    let private_values: [[u8; 32]; 4] = [
+        std::array::from_fn(|index| 0x10_u8.wrapping_add(index as u8)),
+        std::array::from_fn(|index| 0x40_u8.wrapping_add(index as u8)),
+        std::array::from_fn(|index| 0x70_u8.wrapping_add(index as u8)),
+        std::array::from_fn(|index| 0xA0_u8.wrapping_add(index as u8)),
+    ];
+    for (account, private_value) in [
+        MACHINE_ROOT_SIGN_ACCOUNT,
+        MACHINE_HPKE_ACCOUNT,
+        MACHINE_LINK_SIGN_ACCOUNT,
+        MACHINE_DATA_SIGN_ACCOUNT,
+    ]
+    .into_iter()
+    .zip(private_values)
+    {
+        identity_keys
+            .store(account, &SecretBytes::new(private_value.to_vec()))
+            .expect("store deterministic private sentinel");
+    }
+    let storage_keys = MemoryKeyStore::new();
+    let store = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(config.paths().runtime_db.clone()),
+        load_or_create_storage_kek(&storage_keys, &config.paths().runtime_db)
+            .expect("create sentinel StorageKEK"),
+    )
+    .await
+    .expect("open sentinel stable store");
+
+    let outcome = reconcile_machine_identity(&config, &store, &identity_keys)
+        .await
+        .expect("activate deterministic stable identity");
+    assert_eq!(
+        format!("{outcome:?}"),
+        "RemoteBootstrapOutcome::Active([REDACTED])"
+    );
+    let RemoteBootstrapOutcome::Active(active) = outcome else {
+        panic!("deterministic stable identity must become Active");
+    };
+    assert_eq!(format!("{active:?}"), "ActiveMachineIdentity([REDACTED])");
+    drop(active);
+    store.shutdown().await.expect("shutdown sentinel store");
+
+    for path in [
+        config.paths().runtime_db.clone(),
+        PathBuf::from(format!("{}-wal", config.paths().runtime_db.display())),
+        PathBuf::from(format!("{}-shm", config.paths().runtime_db.display())),
+        PathBuf::from(format!("{}-journal", config.paths().runtime_db.display())),
+    ] {
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("read raw runtime artifact {}: {error}", path.display()),
+        };
+        for private_value in private_values {
+            assert!(
+                !bytes
+                    .windows(private_value.len())
+                    .any(|window| window == private_value),
+                "private sentinel appeared in raw runtime artifact {}",
+                path.display()
+            );
+        }
+    }
+
+    let main_source = include_str!("../src/main.rs");
+    let start = main_source
+        .find("fn run_main_loop(")
+        .expect("find production main-loop composition");
+    let end = main_source[start..]
+        .find("\nfn main()")
+        .map(|offset| start + offset)
+        .expect("find production main-loop end");
+    let main_loop = &main_source[start..end];
+    assert_eq!(main_loop.matches("\"remote_identity\"").count(), 5);
+    for allowed in [
+        "status=disabled",
+        "status=active",
+        "status=blocked code={}",
+        "status=blocked code=daemon.remote.identity.start_permit_missing",
+    ] {
+        assert!(
+            main_loop.contains(allowed),
+            "remote identity log call graph must retain code-only fragment {allowed}"
+        );
+    }
+    for forbidden in [
+        "binding()",
+        "public_identity",
+        "root_fingerprint",
+        "MachineKeyMaterial",
+        "{remote_identity:?}",
+        "{identity:?}",
+    ] {
+        assert!(
+            !main_loop.contains(forbidden),
+            "remote identity log call graph must not format {forbidden}"
+        );
+    }
 }

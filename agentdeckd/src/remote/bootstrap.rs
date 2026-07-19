@@ -10,6 +10,7 @@ use std::fmt;
 
 use agentdeck_protocol::relay_v2::RootKeyId;
 
+use crate::config::DaemonConfig;
 use crate::local::listener::RemoteStartPermit;
 use crate::runtime::store::{
     ActivateMachineIdentityOutcome, MachineIdentityBinding, MachineIdentityLifecycle,
@@ -135,11 +136,11 @@ impl fmt::Debug for ArmedRemoteIdentity {
 /// `remote_enabled=false` 是最先执行的分支，不读取 DB identity 或任何 stable
 /// machine account。StorageKEK 与 store-open 失败由调用方在本函数外处理。
 pub async fn reconcile_machine_identity(
-    remote_enabled: bool,
+    config: &DaemonConfig,
     store: &RuntimeStoreHandle,
     key_store: &dyn KeyStore,
 ) -> Result<RemoteBootstrapOutcome, RuntimeStoreError> {
-    if !remote_enabled {
+    if !config.remote_enabled() {
         return Ok(RemoteBootstrapOutcome::Disabled);
     }
 
@@ -175,8 +176,10 @@ async fn reconcile_fresh(
         }
     };
     let root_key_id = match fresh_root_key_id() {
-        Some(root_key_id) => root_key_id,
-        None => {
+        Ok(root_key_id) => *root_key_id.as_bytes(),
+        Err(
+            RootKeyIdGenerationError::EntropyUnavailable | RootKeyIdGenerationError::ZeroExhausted,
+        ) => {
             return Ok(RemoteBootstrapOutcome::Blocked(
                 RemoteBootstrapBlock::ENTROPY_UNAVAILABLE,
             ));
@@ -328,11 +331,29 @@ fn binding_matches_material(
         && binding.data_sign_fingerprint == public.data().fingerprint()
 }
 
-fn fresh_root_key_id() -> Option<[u8; 16]> {
-    (0..ROOT_KEY_ID_ATTEMPTS).find_map(|_| {
-        let id = RootKeyId::random();
-        (*id.as_bytes() != [0; 16]).then_some(*id.as_bytes())
+#[derive(Debug, Eq, PartialEq)]
+enum RootKeyIdGenerationError {
+    EntropyUnavailable,
+    ZeroExhausted,
+}
+
+fn fresh_root_key_id() -> Result<RootKeyId, RootKeyIdGenerationError> {
+    fresh_root_key_id_with(|bytes| {
+        getrandom::fill(bytes).map_err(|_| RootKeyIdGenerationError::EntropyUnavailable)
     })
+}
+
+fn fresh_root_key_id_with(
+    mut fill: impl FnMut(&mut [u8; 16]) -> Result<(), RootKeyIdGenerationError>,
+) -> Result<RootKeyId, RootKeyIdGenerationError> {
+    for _ in 0..ROOT_KEY_ID_ATTEMPTS {
+        let mut bytes = [0_u8; 16];
+        fill(&mut bytes)?;
+        if bytes != [0; 16] {
+            return Ok(RootKeyId::from_bytes(bytes));
+        }
+    }
+    Err(RootKeyIdGenerationError::ZeroExhausted)
 }
 
 enum StoreStepError {
@@ -423,5 +444,30 @@ async fn settle_activate_unknown(
         Ok(Some(state)) if state.binding != *binding => Err(StoreStepError::StateFork),
         Ok(Some(_)) | Ok(None) => Err(StoreStepError::Fatal(unknown)),
         Err(error) => Err(StoreStepError::Fatal(error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_key_id_entropy_failure_is_typed() {
+        let error = fresh_root_key_id_with(|_| Err(RootKeyIdGenerationError::EntropyUnavailable))
+            .expect_err("entropy failure must not panic or mint an ID");
+        assert_eq!(error, RootKeyIdGenerationError::EntropyUnavailable);
+    }
+
+    #[test]
+    fn root_key_id_rejects_continuous_all_zero_entropy() {
+        let mut calls = 0;
+        let error = fresh_root_key_id_with(|bytes| {
+            calls += 1;
+            *bytes = [0; 16];
+            Ok(())
+        })
+        .expect_err("all-zero draws must be exhausted without minting an ID");
+        assert_eq!(error, RootKeyIdGenerationError::ZeroExhausted);
+        assert_eq!(calls, ROOT_KEY_ID_ATTEMPTS);
     }
 }

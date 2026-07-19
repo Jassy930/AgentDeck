@@ -299,6 +299,7 @@ async fn fresh_store_is_ready_only_after_exact_schema_and_pragmas_read_back() {
             "execution_fences",
             "execution_intents",
             "machine_enrollment_receipts",
+            "machine_identity_state",
             "metadata_mutation_ledger",
             "native_metadata_effect_fences",
             "native_projection_state",

@@ -478,23 +478,22 @@ fn run_main_loop(
         let store = RuntimeStoreHandle::open(RuntimeStoreConfig::new(runtime_db), storage_kek)
             .await
             .map_err(MainLoopFailure::store)?;
-        let remote_identity =
-            match reconcile_machine_identity(config.remote_enabled(), &store, key_store).await {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    let failure = MainLoopFailure::store(error);
-                    let shutdown = store.shutdown().await;
-                    diag::log(
-                        "daemon_stop",
-                        &format!(
-                            "agentdeckd machine identity bootstrap failed: \
+        let remote_identity = match reconcile_machine_identity(config, &store, key_store).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let failure = MainLoopFailure::store(error);
+                let shutdown = store.shutdown().await;
+                diag::log(
+                    "daemon_stop",
+                    &format!(
+                        "agentdeckd machine identity bootstrap failed: \
                          code={} storeShutdown={shutdown:?}",
-                            failure.code
-                        ),
-                    );
-                    return Err(failure);
-                }
-            };
+                        failure.code
+                    ),
+                );
+                return Err(failure);
+            }
+        };
         match &remote_identity {
             RemoteBootstrapOutcome::Disabled => {
                 diag::log("remote_identity", "status=disabled");
