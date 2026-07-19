@@ -13,7 +13,7 @@
 
 - `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、Relay v2 failure code、v1 marker
   显式 reset 和排查流程。
-- `QUALITY.md`：按变更范围选择验证命令，以及 Companion MVP P2、P3.1–P3.8 production UDS/bootstrap 与文档结构检查入口。
+- `QUALITY.md`：按变更范围选择验证命令，以及 Companion MVP P2、P3.1–P3.9-D production UDS/client/smoke 与文档结构检查入口。
 - `RELAY_RUNBOOK.md`：production Relay v2 Direct TLS、本机 admin UDS、machine
   enrollment、fingerprint-bound readback/purge 与 root-lost 重新配对操作手册。
 
@@ -54,10 +54,11 @@
   P3.2–P3.8、P3.9-C0-A0/A1/A2 已完成；C0-B3a/B3b/B4/B5 已分别完成并通过
   Task 完整门禁与双路终审；C0-C native history projection 已完成并通过 Task 完整门禁与双路终审，真实当前
   账号 JSONL smoke、Swift 与 iOS Simulator 门禁已通过，production native metadata 仍在 claim 前 post-MVP
-  typed gated。P3.9-A Rust 与 P3.9-B Swift shared-daemon client component 已完成并通过各自 Task 门禁与
-  双路终审，下一项为 P3.9-C3 App model cutover；Rust CLI/Swift App 默认入口切换仍属 P3.9-D。P3.1
+  typed gated。P3.9-A Rust、P3.9-B Swift shared-daemon client、P3.9-C3 App model cutover 与 P3.9-D
+  Rust CLI/Swift selfcheck 默认入口和真实双客户端 smoke 均已完成并通过各自 Task 门禁与双路终审；
+  D code/test 提交为 `b818f81`，下一项为 P3.9-E scope/phase 收口。P3.1
   production code 已完成，provisioned signed
-  Keychain roundtrip 保留 1 项 ignored/BLOCKED 且不阻塞主线；P3.9 后续、P3.10、P4–P6 尚未完成。
+  Keychain roundtrip 保留 1 项 ignored/BLOCKED 且不阻塞主线；P3.9-E、P3.10、P4–P6 尚未完成。
 
 ## 协议资料
 

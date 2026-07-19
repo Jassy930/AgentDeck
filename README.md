@@ -72,7 +72,7 @@ v0.2 在 macOS AppKit 上端到端验证「统一壳」架构：
 codex app-server                       claude CLI (--print --stream-json)
 
 agentdeck-cli  (参考客户端 / 门控 E2E 驱动，不在 GUI 实时通路上)
-      │  stdio compatibility 仅 admin/read/selfcheck；不执行真实会话
+      │  RuntimeEnvelope v2 canonical UDS（无 spawn/fallback）
       ▼
 agentdeckd
 ```
@@ -89,9 +89,10 @@ Layer B Vendor 控件命名空间允许 vendor 前缀但类型化（禁 `serde_j
 默认 ephemeral/no-remote 也从私有 `TMPDIR/ad-*/s` 派生 UDS，stdin EOF 不再结束 daemon。P3.9-C3
 已由 `b4e9565` 把普通非 preview GUI 的 `SessionModel` / App composition 切到惰性的
 `OSAccountRuntimeWireSession → LocalRuntimeWireSession.forOSAccount()`：第一次使用时从当前 OS account
-installation 派生 canonical singleton UDS，且没有 daemon spawn、stdio 或 fallback。Rust CLI binary main
-与 Swift `main.swift --selfcheck` 仍走显式隔离的 legacy stdio compatibility；两者的 canonical Runtime v2
-切换和双客户端组合 smoke 属 P3.9-D，因此不能宣称所有默认入口已经全面切换。
+installation 派生 canonical singleton UDS，且没有 daemon spawn、stdio 或 fallback。P3.9-D 又由
+`b818f81` 把 Rust CLI 默认 dispatcher 与 Swift `main.swift --selfcheck` 切到同一 shared daemon：普通
+`ping/selfcheck/agent/session/history/metadata` 全部使用 canonical Runtime v2，socket 失败 typed 返回且零
+fallback；显式 diagnostics one-shot 与 compatibility stdio 只保留为隔离运维入口。
 
 流式性能边界：Swift 端的 `SessionModel` 按约 30fps 合并待渲染 delta，并把
 message / reasoning / shell / diff 长文本交给 AppKit `NSTextView` +
@@ -100,55 +101,38 @@ message / reasoning / shell / diff 长文本交给 AppKit `NSTextView` +
 
 ## 历史会话（跨 agent）
 
-v0.2 起历史侧栏聚合 **Codex + Claude Code** 两家历史 thread，左侧不区分
-agent 来源、不提供 agent 切换或过滤入口，默认按项目和更新时间合并展示。
-`agentKind` 仍保留在数据模型中，用于读取、继续、归档和重命名时路由到正确
-adapter。
+v0.2 的历史侧栏与 CLI 都消费 Runtime `Catalog`。公开身份只有 daemon 签发的
+`conversationId`；`agentKind` 保留在 descriptor/capabilities 中供 daemon 路由和 UI 展示，不要求
+`history read` 或 `session continue` 重新传 agent，也不向客户端暴露 vendor thread/session ID。
+`history list` 可在客户端按 agent/cwd 筛选 Catalog，`history read <conversationId>` 通过
+`Subscribe(BeforeFirst) → Snapshot?/Backfill* → SyncComplete` 回放，continue 只接受
+`conversationId + prompt + stable idempotency key`。
 
-**Codex 历史**：v0.2 仍是显式 stub，`history list --agent codex` 返回空列表，
-`history read --agent codex` 返回 `codex-history-read-not-implemented`。Codex
-app-server 的 `thread/list` / `thread/read(includeTurns: true)` 接入留到 v0.3；
-文档和 UI 不应把 Codex 历史回放说成已接通。
+Runtime 管理的新 Codex/Claude Code conversation 都能进入 canonical Catalog/list/read。**既有 Codex
+app-server 原生历史导入**尚未接通；这只表示升级前的 Codex thread 不会被扫描导入，不表示 Runtime 管理的
+Codex conversation 恒为空。daemon 仅在 adapter 私域把 conversation 绑定到已验证的 Codex thread 或
+Claude Code session；后续 adapter 可内部调用 `thread/resume` / `--resume`，但 raw vendor identity 永不进入
+common wire、日志、Relay 或 CLI 参数。
 
-**Claude Code 历史**：事实唯一来源仍是当前 OS account 的
-`~/.claude/projects/<encoded_cwd>/<id>.jsonl`。C0-C 的 production projector 逐层执行
-no-follow/current-UID/regular-file 与有界 JSONL 验证，再把 neutral descriptor 和稳定 identity
-原子投影到 Runtime Catalog；正文不复制进 Runtime DB。每次 Snapshot 都重新读取已验证原生
-历史，并从 canonical turn/item key 派生稳定 command/item/entity identity；`QueryReceipt` 对本次
-已验证的历史 command 返回 `daemon.command.history_only`，不冒充 command journal Accepted。
-Runtime DB 的 adapter 私表只保存 StorageKEK 保护的可重建 private binding，不把 raw session ID、
-transcript path 或正文带入 common catalog、日志、Relay 或客户端 wire，也不创建 `cc-meta/`。
+**既有 Claude Code 历史**的事实源仍是当前 OS account 的
+`~/.claude/projects/<encoded_cwd>/<id>.jsonl`。C0-C production projector 逐层执行
+no-follow/current-UID/regular-file 与有界 JSONL 验证，再把 neutral descriptor 和稳定 identity 原子投影到
+Runtime Catalog；正文不复制进 Runtime DB。每次 Snapshot 都重新读取已验证原生历史，并从 canonical
+turn/item key 派生稳定 command/item/entity identity；`QueryReceipt` 对本次已验证的历史 command 返回
+`daemon.command.history_only`，不冒充 command journal Accepted。Runtime DB 的 adapter 私表只保存
+StorageKEK 保护、可重建的 private binding，也不创建 `cc-meta/`。
 
-旧 history compatibility 的 Rename/Archive/Unarchive 不再直接调用 vendor 或返回 no-op Ack，统一返回
-`cc-history-mutation-requires-runtime-gate`；native metadata 必须经过 Runtime authorization、幂等 ledger
-与 gate。MVP production 对 native Rename 仍在 claim 前返回
-`daemon.conversation.metadata_unsupported`，因此不会产生 ledger/fence/vendor 副作用；完整
+native metadata 必须经过 Runtime authorization、幂等 ledger 与 gate。MVP production 对 native Rename
+仍在 claim 前返回 `daemon.conversation.metadata_unsupported`，因此不会产生 ledger/fence/vendor 副作用；
 current-binary synthetic roundtrip 只证明安全 substrate，真实 Claude binary mutation 留在 post-MVP。
-历史列表默认返回最新 500 条；daemon 先按 `.jsonl` mtime 排序并截断，再只为最终返回条目扫描标题，
-避免大型 `~/.claude/projects` 历史库拖慢左侧侧栏刷新。`claude-mem` observer 会话属于
-后台记忆工具噪声：project dir 匹配 `.claude-mem/observer-sessions`，或开头为
-`Hello memory agent` / `You are a Claude-Mem` 的会话，会在 history list 阶段过滤，
-不进入 CLI 输出或左侧侧栏。
+`claude-mem` observer 会话会在 native scan 阶段过滤，不进入 Catalog、CLI 或侧栏。
 
-继续历史会话时，Codex 走 `thread/resume(threadId)`；CC 走
-`claude --resume <id>`。历史读取操作必须带 `agent_kind`（两家持久化结构不同）。
-
-历史详情读取在后台完成，点击后先标记正在打开，详情返回后再回放到右侧。大段
-shell output 和 diff 展开时才填充 TextKit buffer，避免大历史 thread 阻塞主界面。
-
-历史详情回放会进入 Swift 端 `WorkbenchModel` 中独立的 `ThreadRuntimeModel`。
-打开历史 thread 只切换当前选中的 runtime 和右侧视图，不会把其他正在运行的
-runtime 标记为 ready 或停止其后台事件处理。runtime 自身按约 30fps 刷新
-streaming delta，避免视图切到 runtime 后出现长时间不刷新的流式文本。
-普通新会话也会先创建 live runtime，并立即合并进左侧历史侧栏，避免当前会话
-只能在右侧可见。daemon 返回真实 `sessionId` / `threadId` 后写回该 runtime，
-后续 prompt 继续走同一个 thread，而不是在 UI 上伪装成连续对话。
-提交 prompt 时，正在运行、启动中或等待 approval 的 runtime 只会排入自己的
-队列；对应 runtime 收到 `turnComplete` 后才 drain 自己的下一条 prompt，不会
-把队列发送到当前选中的其他 history/runtime。
-当 runtime 进入 `waitingApproval` 时，会话流里显示最小 approve / deny 控件。
-第一版支持命令执行、文件变更和额外权限三类请求；不暴露持久化策略按钮，
-也不让 Swift 解析 Codex 原始 JSON。
+历史详情读取在后台完成，完整 synchronization barrier 验证后才原子发布到右侧。大段 shell output 和 diff
+展开时才填充 TextKit buffer，避免大历史 conversation 阻塞主界面。每个 conversation 在 Swift
+`WorkbenchModel` 中拥有独立 `ThreadRuntimeModel`；切换选中项不会停止其他后台 runtime。新会话在
+`ConversationStart` 返回前只保存 draft context，取得 canonical `conversationId` 后才进入 Catalog，后续
+prompt 继续使用同一 conversation。正在运行、启动中或等待 approval 的 runtime 只 drain 自己的 FIFO；
+approval 控件使用完整 conversation/turn/command/approval/request binding，不解析 Codex 原始 JSON。
 左侧 History 面板不再单独显示 runtime selector。已在当前窗口缓存的历史
 thread 会在对应历史行内显示小状态点：普通缓存态保持低调，运行中或启动中显示
 系统 accent，等待审批显示橙色，失败显示红色；如果后台 runtime 有未读事件，
@@ -220,7 +204,7 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（C0-C / P3.9-A/B/C3 complete，P3.9-D next）
+## Relay Companion MVP 实施状态（P3.9-D complete，P3.9-E next）
 
 2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 只承诺缺 KEK 且无法通过当前
 KEK/database/domain 认证的离线篡改 fail-close，同 UID 在线攻击作为 residual risk 不再扩展。P3.1
@@ -418,8 +402,8 @@ catalog/strict vendor-panel/canonical event 与 snapshot/backfill 的 v2 strict 
 request/reply/message/stream/envelope 与 JSON/UDS 94-part transfer model，并对 97 条 JSON fixture 做 typed
 readback；`e419d84` 再完成 `ADRT1` version 2 compact carrier、current facade、98-fixture 全量、严格
 `<1 MiB` JSON 与 `<4 MiB` compact frame gate。A2-0 的 0600/128-byte 真实 UDS Hello 样本也已由
-current Swift codec 以 1 test / 0 skipped 读回并删除。A2 当时只冻结共享 wire/API；普通 GUI 后续已由
-P3.9-C3 切到 UDS，Rust CLI 与 Swift `main.swift --selfcheck` 仍待 P3.9-D。
+current Swift codec 以 1 test / 0 skipped 读回并删除。A2 当时只冻结共享 wire/API；普通 GUI 后续由
+P3.9-C3 切到 UDS，Rust CLI 与 Swift `main.swift --selfcheck` 又由 P3.9-D 完成 canonical cutover。
 已落地的纯幂等 Start、显式
 CancelQueued/CancelActive 与精确 QueryReceipt 接到 Runtime journal。Start 不再携带首 prompt；
 相同 owner+start key 由 StorageKEK 域分离 capability 稳定派生，跨重启返回同一
@@ -500,8 +484,11 @@ P3.9-C3 随后由 `b4e9565` 完成 App model/composition 的 Runtime v2 cutover�
 shared-daemon canonical UDS，且不 spawn daemon、不回退 stdio。收口修复覆盖 snapshot→backfill 原子归并、
 replayed receipt 必须由 exact canonical terminal 收口、preview 独立 Runtime stream，以及同步 terminal 与 live
 cursor 交接竞态。完整 Swift `435 XCTest + 35 Swift Testing`、iOS Simulator `20/20`、warnings-as-errors build
-均通过，两路独立终审无 P0/P1/P2。下一 Task 为 P3.9-D Rust CLI / Swift `--selfcheck` canonical cutover 与
-双客户端组合 smoke；P4 CounterGuard/RemoteLink 与真实 vendor metadata mutation 仍未完成。
+均通过，两路独立终审无 P0/P1/P2。P3.9-D 由 `b818f81` 完成 Rust CLI / Swift `--selfcheck` canonical
+cutover、30 秒 reply-sequence absolute deadline、typed usage error 与真实双客户端 smoke；两个稳定且不同的
+installation 在同一 conversation 各自提交/重放并只查询自己的 receipt，共同 backfill 收敛，daemon PID
+保持不变且 endpoint 缺失零 fallback。双路终审无 P0/P1/P2；下一 Task 为 P3.9-E scope/phase 收口。
+P4 CounterGuard/RemoteLink 与真实 vendor metadata mutation 仍未完成。
 
 进入 Core 的 principal 是字段私有的认证 capability；同一完整身份共享强 authorization lease，
 Accepted→Started 前会重新取得 guard，revoke 与 start 由该 guard + SQLite transition 线性化。
@@ -520,9 +507,9 @@ P3.4 的 side-effect-free fake 仍只用于 contract tests；production 构造�
 authorization 都 durable COMMIT 后才 exec vendor。permit 精确绑定 command、daemon boot、nonce、
 PID/start-time、token commitment；completion 成功还必须证明整个进程组已经 reap/fence。关停会先用
 内部 Closing 拒绝新请求并封住 actor start lease，再公开 Draining，因而 Draining 后不会新增 durable
-Started。显式 stdio `RuntimeHub` 只保留 admin/read compatibility 面；默认 daemon 与普通 GUI 已走
-OS-account singleton UDS，但 Rust CLI 与 Swift `main.swift --selfcheck` 尚未迁移。因此 production exec-gate
-与普通 GUI cutover 通过，仍不等于双客户端组合 smoke、远程 Companion 或全部默认入口已端到端完成。
+Started。显式 stdio `RuntimeHub` 只保留 admin/read compatibility 面；普通 GUI、Rust CLI 与 Swift
+`main.swift --selfcheck` 均已走 OS-account singleton UDS。P3.9-D 的真实双客户端 smoke 通过仍不等于
+RemoteLink、远程 Companion 或真实 vendor login 已完成。
 
 ### P3.5 approval、P3.6 canonical stream 与 P3.7 exec-gate 当前边界
 
@@ -596,8 +583,9 @@ COMMIT-unknown 逐字节重试、ACK 和重启恢复算法；transfer 测试只�
 重组与 inner cursor 单次推进。`TransferStateMachine` 与 publication dispatcher 尚无 production
 remote owner。真实 MachineDataSign/E2EE seal、Keychain CounterGuard、Relay
 Publish 和远程设备解密属于 P4；iOS 仍是 fixture 驱动 Simulator 前端，不是当前链路证据。
-P3.6 收口时 App/CLI 均未迁到 singleton UDS；当前普通 GUI 已由 P3.9-C3 迁移，但 Rust CLI、Swift
-`main.swift --selfcheck` 与 RemoteLink 仍未完成，因此该 P3.6 历史阶段不构成 P3/Companion 完成。
+P3.6 收口时 App/CLI 均未迁到 singleton UDS；普通 GUI 后续由 P3.9-C3 迁移，Rust CLI 与 Swift
+`main.swift --selfcheck` 又由 P3.9-D 迁移。RemoteLink 仍未完成，因此该 P3.6 历史阶段不构成
+P3/Companion 完成。
 P3.1 provisioned signed Keychain 仍是不得记 PASS 的 BLOCKED 槽位，但 2026-07-18
 方案 b 已将其移入 post-MVP；它不再阻塞 MVP/P3/P4 主线，但也不表示 stable production signing 已完成。
 
@@ -674,9 +662,9 @@ C0-B1a/B1b schema freeze 与真实 migration 已由 `e48248a` / `3d0002d` 收口
 B3a admission pin 已完成，后者由 `48594e8` / `09a14b0` 提交并通过 Task 门禁与双路终审；B3b exact
 execution 已由 `c0ed6cd` / `f4141f0` / `fb1629a` 完成，B4 managed metadata 已由
 `5f1ca1c` / `347a0f0` 完成，B5 cross-layer closeout 已由 `aebc8d0` 完成。C0-C 自动实现与跨语言/
-Simulator 门禁已通过；C0-C、P3.9-A/B 与 P3.9-C3 Task 已完成，C3 提交为 `b4e9565`。普通 GUI 已默认走
-OS-account shared-daemon UDS；下一项 P3.9-D 仍须切换 Rust CLI 与 Swift `main.swift --selfcheck`，并完成
-双客户端组合 smoke。P3.10 LaunchAgent 与 P4–P6 仍未完成。P3.1 provisioned signed Keychain
+Simulator 门禁已通过；C0-C、P3.9-A/B/C3 与 P3.9-D Task 已完成，D code/test 提交为 `b818f81`。
+普通 GUI、Rust CLI 与 Swift `--selfcheck` 已默认走 OS-account shared-daemon UDS；下一项是 P3.9-E
+scope/phase 收口。P3.10 LaunchAgent 与 P4–P6 仍未完成。P3.1 provisioned signed Keychain
 roundtrip 继续是 post-MVP BLOCKED 槽位，不阻塞 MVP/P3 exit；P5/P6 物理设备/公网/Linux 证据也是
 post-MVP，不冒充 PASS。
 具体命令与资源矩阵见 [docs/QUALITY.md](docs/QUALITY.md)。
@@ -688,16 +676,16 @@ post-MVP，不冒充 PASS。
 canonical singleton UDS，且没有 spawn/fallback；reply/stream/transfer 都是有界 typed pump。P3.9-B 也已
 提供 Swift `LocalClientInstallation`、`UnixSocketDaemonTransport` 与 actor-owned
 `RuntimeEnvelopeClient`。P3.9-C3 已让普通 GUI 的 App model/composition 默认使用
-`OSAccountRuntimeWireSession` 连接 shared-daemon UDS，且没有 spawn/fallback；当前 Rust binary main 仍显式
-选择 `LegacyStdioProcessTransport`，Swift `main.swift --selfcheck` 仍使用旧 `DaemonClient`。这两个入口的
-原子切换与双客户端 smoke 属 P3.9-D，不能把普通 GUI PASS 写成全部默认入口已完成。
+`OSAccountRuntimeWireSession` 连接 shared-daemon UDS；P3.9-D 又把 Rust binary main 与 Swift
+`main.swift --selfcheck` 切到相同 canonical UDS。三者连接失败都 typed 返回，不 spawn daemon、也不回退
+legacy stdio；diagnostics one-shot 仍是用户显式选择的隔离运维路径。
 
 P3.9-D 的 canonical CLI 映射固定如下：`ping` 只做 `Hello` 并输出 `{"ok":true}`；`selfcheck` 做
 `Hello → DescribeAgents`；`agent list/capabilities` 读取 `DescribeAgents`；`session run` 固定执行
 `DescribeAgents → Start → Configure(rev0) → Subscribe → SendPrompt(rev1)`；`session continue` 只接受
 canonical `conversationId` 并执行 `Subscribe/SendPrompt`，不得使用 vendor `threadId`；`history list` 分页
 读取 `Catalog` 并在客户端筛选，`history read` 固定执行
-`Subscribe(BeforeFirst) → Snapshot/SyncComplete → Unsubscribe`；rename/archive/unarchive 统一使用
+`Subscribe(BeforeFirst) → Snapshot/Backfill* → SyncComplete → Unsubscribe`；rename/archive/unarchive 统一使用
 `UpdateConversationMetadata`，并携带 expected entry revision 与稳定 idempotency key。输出身份只允许
 `conversationId`、`commandId`、`turnId`、`eventId`、`itemId`、`entityId`，不得合成 legacy session/thread
 identity；`protocol` / `remote` 不连接 Runtime，diagnostics one-shot 也不得成为 UDS 失败 fallback。
@@ -707,15 +695,15 @@ identity；`protocol` / `remote` 不连接 Runtime，diagnostics one-shot 也不
 
 | 标志 | 说明 |
 | --- | --- |
-| `--profile stable\|dev` | 保留给 CLI/diagnostics 的 profile 选择；P3.1 stdio 子进程固定显式 ephemeral dev，不据此进入 stable namespace |
-| `--data-dir <path>` | diagnostics one-shot 的旧数据目录读取；不能覆盖 daemon namespace |
+| `--profile stable\|dev` | Runtime 命令只接受 `stable` canonical namespace；`dev` 仅用于 diagnostics/显式隔离运维，不覆盖 Runtime endpoint |
+| `--data-dir <path>` | diagnostics/Relay 数据目录；Runtime 命令在连接前 typed reject，不能覆盖 daemon namespace |
 | `--pretty` | 人读格式输出（E2E 不依赖此标志） |
 
 ### 子命令目录
 
 ```bash
-agentdeck ping                          # 往返自检（ping → pong）
-agentdeck selfcheck                     # IPC 生命周期 + logging 自检
+agentdeck ping                          # UDS preface + Hello
+agentdeck selfcheck                     # Hello + DescribeAgents
 agentdeck diagnostics report            # 输出机器可读诊断报告（JSON）
 agentdeck protocol schema               # 打印 IPC 协议 JSON Schema
 agentdeck protocol version              # 打印协议版本号
@@ -724,29 +712,32 @@ agentdeck protocol version              # 打印协议版本号
 agentdeck agent list                           # 列出可用 adapter
 agentdeck agent capabilities --agent <kind>    # 列某 adapter capabilities（JSON）
 
-# session 子命令（v0.2 起须带 --agent）
+# canonical session 子命令
 agentdeck session run --agent codex \
-  --cwd <path> --prompt "..."           # Codex 新会话（--cwd 必填）
+  --cwd <path> --prompt "..." \
+  --idempotency-key <stable-key>        # Codex 新 conversation
 agentdeck session run --agent claude-code \
-  --cwd <path> --prompt "..."           # Claude Code 新会话
+  --cwd <path> --prompt "..." \
+  --idempotency-key <stable-key>        # Claude Code 新 conversation
 agentdeck session continue \
-  --agent <kind> --cwd <path> \
-  --thread-id <id> --prompt "..."       # 继续历史 thread
+  --conversation-id <id> --prompt "..." \
+  --idempotency-key <stable-key>        # 继续 canonical conversation
 
-# history 子命令（v0.2 起跨 agent；--agent 可选过滤）
-agentdeck history list                         # 跨 agent 列出历史 threads（默认限流）
+# history 子命令（Catalog list 可按 agent 过滤）
+agentdeck history list                         # 列出 canonical conversations
 agentdeck history list --agent claude-code --limit 200  # 仅 CC 历史
-agentdeck history read <id> --agent <kind>     # 读取历史 thread（必须带 --agent）
-agentdeck history archive <id> --agent <kind>  # 归档 thread
-agentdeck history unarchive <id> --agent <kind># 取消归档
-agentdeck history rename <id> --agent <kind> <title>  # 重命名 thread
+agentdeck history read <conversation-id>       # Snapshot/Backfill 读回
+agentdeck history archive <conversation-id> \
+  --expected-entry-revision <n> --idempotency-key <key>
+agentdeck history rename <conversation-id> <title> \
+  --expected-entry-revision <n> --idempotency-key <key>
 ```
 
 `session run` 的 Codex 选项使用 `--approval on-request|never|always`、`--sandbox read-only|workspace-write|full-access`、`--reasoning-effort minimal|low|medium|high`；Claude Code 选项使用 `--permission default|accept-edits|plan|auto|dont-ask|bypass-permissions`。`--agent` 取值 `codex` 或 `claude-code`（wire 值为 `claude_code`）。
 
 ### 输出与退出码契约
 
-所有输出为稳定 JSON / JSONL，机器可解析。退出码：
+除 `--help` 的人读文本外，业务与错误输出为稳定 JSON / JSONL，机器可解析。退出码：
 
 | 码 | 含义 |
 | --- | --- |
@@ -771,14 +762,15 @@ cargo run -q -p agentdeck-cli -- protocol schema \
 agentdeck protocol version
 ```
 
-运行（普通 GUI 默认连接 OS-account shared-daemon canonical UDS，且没有 daemon spawn/fallback；Swift
-`--selfcheck` 当前仍自动 spawn ephemeral stdio compatibility daemon，Rust CLI 同样待 P3.9-D 切换）：
+运行（普通 GUI、Swift `--selfcheck` 与 Rust CLI 默认连接 OS-account shared-daemon canonical UDS，均没有
+daemon spawn/fallback；使用前须已有 canonical stable daemon。P3.10 尚未提供正式 install/start 命令，当前
+自动开发链路使用 `scripts/run-local-runtime-smoke.sh` 的私有 ephemeral harness）：
 
 ```bash
 ./script/build_and_run.sh        # 构建 SwiftPM 产物，临时打包 dist/AgentDeck.app 并启动
 ./script/build_and_run.sh --verify  # 启动后确认 AgentDeck 进程存在
 swift run AgentDeck               # 本地 debug 构建默认使用 dev profile
-swift run AgentDeck -- --selfcheck  # 无窗口自检: IPC lifecycle + logging/redaction probe
+swift run AgentDeck -- --selfcheck  # 无窗口自检: Hello + DescribeAgents，失败不 fallback
 swift run AgentDeck -- --diagnostics-report --json  # 输出机器可读诊断报告
 swift run AgentDeck -- --preview  # 前端 mock 预览，不连真实 daemon
 
@@ -791,23 +783,20 @@ macOS 前端使用纯 AppKit。当前主窗口外壳对齐 Codex Desktop：透�
 会话态悬浮 composer 和右侧环境信息面板。外观层仍保持 v0.2 统一壳边界：
 vendor 控件由 `CapabilityRouter` 装配，daemon / IPC / history 模型不因视觉同步而改动。
 
-Profile（P3.1 过渡行为）：
+Profile：
 
 ```bash
 swift run AgentDeck -- --profile stable
 swift run AgentDeck -- --profile dev
-swift run AgentDeck -- --selfcheck --profile dev
 swift run AgentDeck -- --diagnostics-report --json --profile dev
 ```
 
 - App 的 profile 仍可控制窗口标题和 diagnostics 读取；它不隔离 vendor 登录状态或
   vendor 原生历史。
-- 在 P3.9-D 收口前，只有 Swift `main.swift --selfcheck` 的 `ProcessDaemonTransport` 与 Rust CLI 的
-  sync/async legacy stdio transport 仍忽略旧 profile/data-dir spawn 参数，移除继承的
-  `AGENTDECK_PROFILE` / `AGENTDECK_DATA_DIR`，固定传
-  `--stdio-compat --ephemeral --no-remote --profile dev`。因此这些子进程不会读取或创建 stable Runtime
-  信任域，也不能让这两个入口共享同一 daemon；production `RuntimeHub::admin_only` 会拒绝
-  `SessionStart/SessionContinue`，这条 compatibility path 不能用于真实会话执行。
+- Rust CLI Runtime 命令与 Swift `--selfcheck` 只发现 canonical stable UDS；缺失或不安全 endpoint 直接返回
+  `daemon.client.*` typed failure。两者不会读取任意 socket env override，也不会转入 diagnostics/stdio spawn。
+- `ProcessDaemonTransport` / legacy stdio 只保留 preview/test 与用户显式 diagnostics/bootstrap compatibility；
+  production `RuntimeHub::admin_only` 继续拒绝 `SessionStart/SessionContinue`，不能用于真实会话执行。
 - stable 模式只面向带 daemon-only entitlement、编译进真实 access group 的 release-signed
   helper；普通 unsigned SwiftPM/Cargo 构建直接启动 stable 必须返回
   `daemon.keystore.access_group_unconfigured`，不能靠运行时环境变量绕过。

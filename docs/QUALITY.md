@@ -10,7 +10,6 @@ swift test
 ./script/build_and_run.sh --verify
 swift run AgentDeck -- --selfcheck
 swift run AgentDeck -- --diagnostics-report --json
-swift run AgentDeck -- --selfcheck --profile dev
 swift run AgentDeck -- --diagnostics-report --json --profile dev
 scripts/verify-agent-docs.sh
 bash scripts/verify-relay-companion-mvp.sh p0
@@ -877,7 +876,8 @@ ReadPool、配额与调度完全不变。
 P3.1 provisioned signed Keychain roundtrip 仍是 post-MVP BLOCKED 槽位；P3.7 exec gate 边界、prepare findings、
 fresh 完整门禁与独立终审已收口，并由 `5568e93` 完成主体 scoped commit、`c9d2146` / `5713be4`
 补齐真实 current-binary release 前取消门禁与 sentinel leader 退出窗口；P3.8-B production UDS 已由
-`1e7f9ea` / `459f32a` 完成，P3.9 shared-daemon client 和 P4 remote 尚未完成。
+`1e7f9ea` / `459f32a` 完成。本 P3.6 Task 收口当时 P3.9 shared-daemon client 尚未完成；现已由
+P3.9-A/B/C3/D 完成，P4 remote 仍未完成。
 因此即使本节全绿，也只能收口 P3.6 component，不得宣称 P3、Companion MVP 或真实跨网链路完成。
 
 ## Relay Companion MVP P3.7 exec-gate 与 production execution 门禁
@@ -1766,7 +1766,8 @@ canonical conversation/event/item/entity/command identity，并由惰性的 OS-a
 production App。构造 model/view 不打开 installation、不连接 socket、也不 spawn daemon；首次 Runtime 操作
 才解析 current-EUID installation 与 canonical socket。socket 缺失、不安全、连接或协议失败必须保留
 `daemon.client.*` typed failure，**不得 fallback** `ProcessDaemonTransport`、legacy stdio 或新 daemon 子进程。
-Rust CLI binary 默认入口与 `Sources/AgentDeck/main.swift --selfcheck` 仍属于 P3.9-D，不计入本 Task。
+Rust CLI binary 默认入口与 `Sources/AgentDeck/main.swift --selfcheck` 当时属于 P3.9-D，不计入本 Task；
+后续已由 `b818f81` 完成。
 
 ```bash
 swift test --filter 'AgentDeckTests\.(AppRuntimeCoordinatorTests|ThreadRuntimeModelCanonicalTests|WorkbenchRuntimeV2Tests|SessionModelRuntimeReliabilityTests|PreviewBootstrapTests)'
@@ -1797,23 +1798,96 @@ production source purge、changed-source strict format、docs 与 diff check 均
 - `SyncComplete` 后 live stream 可在 `completeConversationStart` 返回前推进 cursor；收口接受
   runtime cursor 等于或晚于 terminal，仍拒绝落后 cursor，并依赖 canonical reducer 保证 exact-next。
 
-### P3.9-D canonical CLI 与组合 smoke 验收边界（尚未完成）
+### P3.9-D canonical CLI 与组合 smoke Task 门禁
 
-P3.9-D 必须先冻结 canonical CLI 参数与输出：用户可见主身份统一为 `conversationId`；旧
-`threadId/sessionId`、无法无损映射的 cwd/agent/vendor option 必须 typed reject，不能静默忽略或合成身份。
-Rust binary 默认 dispatcher 与 App `main.swift --selfcheck` 都要切到 stable shared UDS；diagnostics one-shot
-可以保留显式 spawn，但绝不能成为 UDS 失败后的 fallback。
+P3.9-D 由 `b818f81` 完成。Rust binary 默认 dispatcher 与 App `main.swift --selfcheck` 都连接 stable
+shared UDS；用户可见主身份统一为 `conversationId`，旧 `threadId/sessionId` 和无法无损映射的 vendor option
+在连接前 typed reject。`session run` 固定执行
+`DescribeAgents → Start → Configure(rev0) → Subscribe → SendPrompt(rev1)`；prompt retry 始终重发 exact
+`SendPrompt`，让 daemon 返回 `Replayed` 或 payload conflict，不能用 `QueryReceipt` preflight 绕过哈希裁决。
+完整 reply sequence 使用单一 30 秒 absolute deadline，中间帧不续期。
 
-`QueryReceipt` 由 daemon 按 installation owner 授权，因此 Rust CLI 不能查询 Swift installation 的 receipt，
-Swift 也不能查询 Rust receipt。双客户端 smoke 的正确 PASS 是：两个真实客户端各自以稳定 installation
-提交并重启查询自己的 receipt，同时通过共同 catalog/conversation/event/command queue 证明观察的是同一
-canonical conversation；cross-owner 查询应拒绝，不能为测试放宽 owner。
+```bash
+cargo test -p agentdeck-cli --locked
+cargo test -p agentdeckd -- --test-threads=1
+swift test
+swift build
+swift build -Xswiftc -warnings-as-errors
+swift format lint --strict \
+  Sources/AgentDeck/main.swift \
+  Sources/AgentDeck/RuntimeSelfcheckRunner.swift \
+  Sources/AgentDeck/RuntimeSmokeRunner.swift \
+  Tests/AgentDeckTests/RuntimeSelfcheckRunnerTests.swift \
+  Tests/AgentDeckTests/RuntimeSmokeRunnerTests.swift
+cd ios && xcodegen generate && \
+  xcodebuild -project AgentDeckMobile.xcodeproj -scheme AgentDeckMobile \
+    -destination 'platform=iOS Simulator,name=iPhone 17' test
+cd ..
+bash scripts/run-local-runtime-smoke.sh
+cargo test -p agentdeckd --lib \
+  local::listener::tests::production_backpressure_and_bad_clients_preserve_sibling_active_turn \
+  -- --exact --test-threads=1
+cargo test -p agentdeckd --test local_uds \
+  real_uds_two_connections_handshake_and_disconnect_isolation -- --exact --test-threads=1
+cargo test -p agentdeck-cli --test shared_daemon \
+  close_only_does_not_send_daemon_shutdown_or_prevent_a_second_client -- --exact
+cargo clippy -p agentdeck-cli --lib --bin agentdeck \
+  --test shared_daemon --test runtime_cli_binary --no-deps -- -D warnings
+cargo run -q -p agentdeck-cli -- protocol schema \
+  | diff - protocol/agentdeck/agentdeck-protocol.schema.json
+cargo run -q -p agentdeck-cli -- protocol runtime-schema \
+  | diff - protocol/agentdeck/runtime-protocol.schema.json
+cargo run -q -p agentdeck-cli -- protocol relay-schema \
+  | diff - protocol/agentdeck/relay-v2.schema.json
+cargo run -q -p agentdeck-cli -- protocol e2ee-schema \
+  | diff - protocol/agentdeck/e2ee-v1.schema.json
+cargo fmt --all --check
+bash scripts/check-daemon-network-boundary.sh
+scripts/verify-agent-docs.sh
+git diff --check
+```
 
-组合 smoke 使用一个真实 `agentdeckd --ephemeral --no-remote` binary 和 private TMPDIR 中发现并验证的唯一
-`ad-*/s`，串起 Rust CLI 与 Swift client，证明 daemon PID 不变、无 fallback spawn、关闭任一客户端不关闭
-daemon。真实 vendor login 继续 gated：共享 conversation/PID/installation/receipt 用真实 binary 自动验证，
-“关闭 sibling 不取消 active turn”可复用 production listener/actor 自动测试作为组合证据；不得为 smoke
-新增 debug-only synthetic coordinator，也不得把两段证据冒充真实 vendor E2E。P3.9-D 当前仍未完成。
+Release binary 还必须证明 DEBUG endpoint/smoke seam 不可达，且完整隐藏 flag 字面量没有进入产物：
+
+```bash
+set -euo pipefail
+cargo build -p agentdeck-cli --release --locked
+swift build -c release --product AgentDeck
+rust_release=target/release/agentdeck
+swift_release="$(swift build -c release --show-bin-path)/AgentDeck"
+
+assert_rust_release_rejects() {
+  if output="$("$rust_release" "$@" 2>&1)"; then return 1; else result=$?; fi
+  test "$result" -eq 2 && printf '%s' "$output" | rg -q 'unexpected argument|unrecognized subcommand'
+}
+assert_swift_release_rejects() {
+  if output="$("$swift_release" "$@" 2>&1)"; then return 1; else result=$?; fi
+  test "$result" -eq 2 && printf '%s' "$output" | rg -q 'daemon.client.test_only_argument_rejected'
+}
+assert_rust_release_rejects --runtime-temp-root-for-test /tmp ping
+assert_rust_release_rejects --runtime-temp-root-for-test=/tmp ping
+assert_rust_release_rejects runtime-smoke-for-test installation
+assert_swift_release_rejects --selfcheck --runtime-temp-root-for-test /tmp
+assert_swift_release_rejects --selfcheck --runtime-temp-root-for-test=/tmp
+assert_swift_release_rejects --runtime-smoke-for-test installation --runtime-temp-root-for-test /tmp
+assert_swift_release_rejects --runtime-smoke-for-test=installation --runtime-temp-root-for-test=/tmp
+for binary in "$rust_release" "$swift_release"; do
+  ! strings "$binary" | rg -F -- '--runtime-temp-root-for-test'
+  ! strings "$binary" | rg -F -- 'runtime-smoke-for-test'
+done
+```
+
+**Task 完成证据（2026-07-19，`b818f81`）：** Runtime CLI binary `12/12`、shared-daemon `27/27`、
+CLI package exit 0；daemon lib `885 passed / 3 ignored`、完整 package exit 0，1,024 × 256 KiB 容量 target
+`5/5`（285.43 秒）；Swift `458 XCTest + 35 Swift Testing`、普通与 warnings-as-errors build、iOS Simulator
+`20/20` 全绿。真实 smoke 证明 Rust/Swift 两个稳定且不同的 installation 各自提交、查询、exact replay，
+cross-owner commandId 查询拒绝、共同 Backfill 收敛、daemon PID 不变与 endpoint 缺失零 fallback；active-turn、
+双 UDS connection 与 close-only 三项组合证据各 `1/1`。Rust/Swift release 隐藏测试入口动态拒绝及 strings
+扫描、四份 schema、network/docs/fmt/diff 均通过；spec/security 与 quality 双路终审无 P0/P1/P2。
+
+首次与 Swift/iOS 重负载并行的 daemon 全包中，exec-gate handshake-abort 用例单次失败；隔离重复 `10/10`
+通过，无并行重负载的完整 daemon package 随后最终 exit 0，只有后者计为 Task PASS。P3.1 provisioned signed
+Keychain 继续是 post-MVP ignored/BLOCKED；真实 vendor login 不在 D 的 synthetic transport 证据内。
 
 ## AppKit 重写后的验证清单
 
@@ -1928,7 +2002,7 @@ cargo install cargo-llvm-cov
 | Rust daemon、IPC、Codex adapter、history list 性能、run record、diagnostics | `cargo test`；涉及运行态再跑 `swift run AgentDeck -- --selfcheck` |
 | Swift UI、会话模型、历史回放、live session 侧栏可见性、富文本渲染、选择/滚动行为 | `swift test` |
 | approval / action request / action decision | `cargo test approval`；`swift test --filter approval`；再跑完整 `cargo test`、`swift test`、`swift run AgentDeck -- --selfcheck` |
-| 诊断日志、自检、数据目录、profile、密钥脱敏 | `cargo test`；`swift run AgentDeck -- --selfcheck`；`swift run AgentDeck -- --diagnostics-report --json`；涉及 profile 时加跑 `swift run AgentDeck -- --selfcheck --profile dev` 和 `swift run AgentDeck -- --diagnostics-report --json --profile dev` |
+| 诊断日志、自检、数据目录、profile、密钥脱敏 | `cargo test`；stable Runtime 用 `swift run AgentDeck -- --selfcheck`；`swift run AgentDeck -- --diagnostics-report --json`；涉及旧 profile 日志时只加跑 `swift run AgentDeck -- --diagnostics-report --json --profile dev`，不得把 Runtime selfcheck 切回 dev namespace |
 | 文档结构、AGENTS 入口、计划规则 | `scripts/verify-agent-docs.sh` |
 | 协议 schema 或 app-server 方法 | `cargo test`；核对 `protocol/SPIKE_FINDINGS.md` 和 `protocol/CODEX_VERSION.txt` |
 | agentdeck-protocol 类型变更 | `cargo test`（漂移测试自动运行）；若漂移测试失败须先重新生成快照（见下） |
@@ -1950,8 +2024,8 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P3.9-C0-B5 cross-layer closeout | 运行本页真实 UDS 双 principal、authorization/cancellation/after-COMMIT focused matrix、完整 daemon/protocol/Swift/iOS Simulator/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明 managed configuration/metadata 的 owner-scoped 幂等、双 revision 轴、receipt/event/snapshot/backfill/restart 收敛，不冒充 C0-C native projection、P4 RemoteLink 或真实 Companion E2E |
 | Relay Companion MVP P3.9-C0-C native projection | 运行本页 secure source/projection/dynamic snapshot/history-only/native metadata focused matrix、真实当前账号 JSONL ignored smoke、完整 daemon/protocol/Swift/iOS Simulator/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明原生历史投影与安全 side-effect substrate，production native mutation 仍是 post-MVP typed gate，不冒充真实 Claude binary、P4 RemoteLink 或 Companion E2E |
 | Relay Companion MVP P3.9-B Swift shared-daemon client | 运行本页 installation/UDS/client/current-codec focused `53/53`、完整 `swift test`、普通 build、changed-file strict format、docs/diff 与双路独立终审；warnings-as-errors 的既有 Preview warning 单列未通过。只证明 Swift component，不冒充 P3.9-C3 App model cutover、P3.9-D 默认入口或双客户端 smoke |
-| Relay Companion MVP P3.9-C3 App model cutover | 运行本页 App coordinator/canonical model/reliability/Preview focused `46/46`、完整 Swift、普通与 warnings-as-errors build、iOS Simulator、production source purge、strict format/diff 与双路独立终审；普通 GUI 已默认 shared UDS 且 socket failure 零 fallback，但 Rust CLI、`main.swift --selfcheck` 与双客户端组合 smoke 仍属于 P3.9-D |
-| Relay Companion MVP P3.9-D 默认入口与组合 smoke | 冻结 conversationId canonical CLI 与 typed reject，切 Rust binary/App selfcheck 到 stable UDS；用真实 ephemeral daemon + Rust/Swift 两个 owner-scoped installation 验证各自 receipt、共同 conversation/event/queue、PID 不变、close-only 与零 fallback。真实 vendor login 可 gated，active-turn sibling-close 用 listener/actor 自动证据组合，不得引入 debug synthetic coordinator；当前未完成，不得计 PASS |
+| Relay Companion MVP P3.9-C3 App model cutover | 运行本页 App coordinator/canonical model/reliability/Preview focused `46/46`、完整 Swift、普通与 warnings-as-errors build、iOS Simulator、production source purge、strict format/diff 与双路独立终审；普通 GUI 已默认 shared UDS 且 socket failure 零 fallback；Rust CLI、`main.swift --selfcheck` 与双客户端组合 smoke 当时不计入 C3，后由 P3.9-D 完成 |
+| Relay Companion MVP P3.9-D 默认入口与组合 smoke | 运行本页 CLI/daemon/Swift/iOS 全量、真实双客户端 smoke、active-turn/双连接/close-only 组合证据、release hidden-surface、四 schema、scoped Clippy/network/docs/fmt/diff 与双路终审。`b818f81` 已完成且全部自动门禁 PASS；真实 vendor login 与 P3.1 provisioned Keychain 仍按 post-MVP BLOCKED 记录，不冒充本 Task 证据 |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

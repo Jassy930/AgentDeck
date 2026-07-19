@@ -1590,7 +1590,7 @@ P3.9 固定以下迁移边界：
    双栈，v1 client 收到 typed protocol mismatch。同步 Runtime schema、Rust fixture、Swift mirror，重生成
    所有绑定 Runtime version 的 Relay cert/TBS、revocation 与 wire vectors；历史 P1–P3.8 记录仍保留为
    v1 事实，P3.9 之后的目标统一称 Runtime v2。
-2. 新会话固定走 `Start → ConfigureConversation(expectedRevision=0) → Subscribe →
+2. 新会话固定走 `DescribeAgents → Start → ConfigureConversation(expectedRevision=0) → Subscribe →
    SendPrompt(expectedConfigurationRevision=1)`。configuration 是 append-only revision；Configure 用 CAS+
    idempotency，Accepted command 在同一事务 pin exact revision，之后的配置更新不得改变已 Accepted/
    queued/recovery command。crash recovery 只能按 command 引用的 revision 构造 driver，不能读取“最新值”。
@@ -2356,7 +2356,7 @@ P3.9 固定以下迁移边界：
   `Sources/AgentDeck/Preview/MockDaemonTransport.swift:93` 既有 Sendable warning 阻断，未计 PASS，也未在
   B 中扩 scope 修 Preview；该 baseline 后续已由 C3 的不可变 handler snapshot 收口并通过
   warnings-as-errors build。B 自身仍只完成 component；production App model/composition 与默认入口/双客户端
-  smoke 分别属于 P3.9-C3/D。该 Task 当时的下一项为 P3.9-C3；C3 当前已完成，下一项为 D。
+  smoke 分别属于 P3.9-C3/D。该 Task 完成时排期先做 C3；C3/D 当前均已完成，下一项为 E。
 - [x] **P3.9-C3 App model cutover：** 迁移 `SessionModel`/`WorkbenchModel`/`ThreadRuntimeModel` 到
   conversationId/eventId/itemId/entityId/commandId；删除 synthetic agentItem 序号和 legacy identity adoption，
   prompt/approval/vendor control/history 都走 `RuntimeEnvelopeClient` receipt/stream。preview/mock 可显式保留
@@ -2378,9 +2378,9 @@ P3.9 固定以下迁移边界：
   terminal command exact binding 的 replayed receipt 恢复 ready 并继续排队、真实 accepted 仍等待 active-turn
   event；Preview 只在显式 fixture 发出完整 synthetic turn；`completeConversationStart` 接受 SyncComplete 后
   exact-next live event 导致的 at-or-after cursor，但拒绝任何落后 cursor。此前 start/close lifecycle 复核、
-  teardown 停用 inbound bridge 与晚到异步结果零回写也保持覆盖。下一 Task 为 P3.9-D；本 Task 不包含 Rust
-  CLI binary、Swift `--selfcheck` 或真实双客户端 smoke。
-- [ ] **P3.9-D 默认入口与真实 smoke：** 把 Rust CLI binary 与 App composition 的默认入口分别切到 A/B
+  teardown 停用 inbound bridge 与晚到异步结果零回写也保持覆盖。本 Task 不包含 Rust CLI binary、Swift
+  `--selfcheck` 或真实双客户端 smoke；这些后续已由 P3.9-D 完成。
+- [x] **P3.9-D 默认入口与真实 smoke：** 把 Rust CLI binary 与 Swift `main.swift --selfcheck` 分别切到 A/B
   提供的 shared-daemon client；Rust CLI与Swift client连接同一 private-TMPDIR daemon，看到
   同一 conversation/queue/receipt；关闭任一客户端后 daemon PID/active turn 不变。脚本只以
   `agentdeckd --ephemeral --no-remote` 启动并发现/验证恰好一个 `TMPDIR/ad-*/s`，不向 daemon 注入 path；
@@ -2395,7 +2395,7 @@ P3.9 固定以下迁移边界：
   | `ping` | 只执行 UDS preface + `Hello` 并验证 exact reply；不 spawn、不转 diagnostics |
   | `selfcheck` | `Hello → DescribeAgents`；任一步失败 typed exit，绝不 fallback one-shot/stdio |
   | `agent` | 只调用 `DescribeAgents` 并输出 canonical agent description/default configuration |
-  | `session run` | `Start → Configure(rev0) → Subscribe → SendPrompt`；空 prompt 省略最后一步，所有回执逐步绑定同一 canonical conversation |
+  | `session run` | `DescribeAgents → Start → Configure(rev0) → Subscribe → SendPrompt`；空 prompt 省略最后一步，所有回执逐步绑定同一 canonical conversation |
   | `continue` | 只接受 `conversationId` 与 prompt；拒绝 thread/session/vendor resume identity，不做 identity adoption |
   | `history` | list 走 `Catalog`，read/open 走 conversation `Subscribe` 的 `Snapshot/Backfill/SyncComplete`；不调用 legacy history IPC |
   | `metadata` | rename/archive 必须携 `expectedEntryRevision + stable idempotency key`，只接受同 conversation typed receipt |
@@ -2417,6 +2417,21 @@ P3.9 固定以下迁移边界：
   既有 listener/RuntimeCore 自动测试提供同一不变量的确定性证据。两部分合并构成 D 的自动验收，不要求
   Swift 查询 Rust receipt，不新增 synthetic execution coordinator，也不放宽 Core。真实 vendor login 缺失时
   继续按既定 gated/BLOCKED 记录，不能把组合证据冒充 live Codex/CC。
+
+  **Task 收口（2026-07-19，code/test `b818f81`）：** Rust CLI 默认入口与 Swift `main.swift --selfcheck`
+  已切到 shared-daemon UDS，普通连接失败不 spawn、不转 diagnostics/stdio。canonical run 首步固定
+  `DescribeAgents`；run/continue 始终重发 exact `SendPrompt`，同 key 同 payload 由 daemon 返回 Replayed，
+  异 payload 返回 `daemon.command.idempotency_conflict`，不再用 QueryReceipt preflight 绕过。完整 reply
+  sequence 共用 30 秒 absolute deadline，中间帧不续期；clap usage error 输出稳定 JSON envelope，`--help`
+  仍成功；Bash signal cleanup 后以 129/130/143 退出，fake listener accept 也有绝对上界。
+
+  双客户端真实 smoke 已证明 Rust/Swift 两个稳定且不同的 installation 分别提交、查询、exact replay，
+  cross-owner commandId 查询拒绝、共同 Backfill 收敛、daemon PID 不变与 endpoint 缺失零 fallback；active-turn、
+  双连接和 close-only 由三条既有 production 组合测试补证。最终 CLI package、daemon package、Swift/iOS、
+  release hidden-surface、四 schema、Clippy/fmt/network/docs/diff 全绿；daemon lib `885 passed / 3 ignored`，
+  1,024 × 256 KiB boundary `5/5`（285.43 秒），Swift `458 XCTest + 35 Swift Testing`，iOS Simulator
+  `20/20`。spec/security 与 quality 双路终审无 P0/P1/P2。P3.1 provisioned signed Keychain 与真实 vendor
+  login 继续保持 post-MVP gated/BLOCKED，不计为 D PASS。
 - [ ] **P3.9-E 收口：** 独立 spec/security/quality review，修完 P0/P1/P2；同步 README、
   ARCHITECTURE、QUALITY、DIAGNOSTICS、AGENTS、本计划与 progress。依赖真实 Codex/CC login 的 initial
   config/control smoke 单独 gate；缺登录时保留 post-MVP BLOCKED，不影响 transport synthetic 事实或 P3

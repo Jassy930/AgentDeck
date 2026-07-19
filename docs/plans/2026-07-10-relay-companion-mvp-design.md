@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P3.9-C0-C、P3.9-A/B 与 P3.9-C3 App model cutover 已完成并通过各自 Task 门禁与双路终审，下一项为 P3.9-D 默认入口与真实双客户端 smoke；Rust CLI canonical 命令、Swift `--selfcheck` 与组合证据仍未完成，production native metadata 与 P3.1 签名 Keychain 均为 post-MVP gated/BLOCKED 且不阻塞自动主线（2026-07-19） |
+| 状态 | Approved target；P3.9-C0-C、P3.9-A/B/C3/D 已完成并通过各自 Task 门禁与双路终审，Rust CLI canonical 命令、Swift `--selfcheck` 与真实双客户端组合证据由 `b818f81` 收口，下一项为 P3.9-E scope/phase closeout；production native metadata 与 P3.1 签名 Keychain 均为 post-MVP gated/BLOCKED 且不阻塞自动主线（2026-07-19） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -37,7 +37,8 @@ shared-daemon client component 已由 `c29faa4` 完成，P3.9-B Swift installati
 component 已由 `397ef9d` / `94adf92` / `913a156` / `deb0e1b` 完成；P3.9-C3 又由
 `a1aeb26` / `86327e2` / `48cd1b2` / `b4e9565` 完成 Runtime catalog/conversation projection、App
 coordinator 与 production GUI model cutover。普通 App 现已惰性连接 OS-account canonical UDS，不 spawn、
-不 fallback；Rust CLI canonical 命令、Swift `--selfcheck`、真实 binary 双客户端组合 smoke 仍属于 P3.9-D。
+不 fallback；P3.9-D 又由 `b818f81` 完成 Rust CLI canonical 命令、Swift `--selfcheck` 与真实 binary
+双客户端组合 smoke，普通 Runtime 入口全部连接同一 shared daemon 且零 fallback。
 LaunchAgent、P4 Machine identity/E2EE/Relay Publish 和真实 Companion 仍未完成，iOS 仍只有 fixture 驱动骨架。
 P3.1 provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate。完整实施仍必须满足 §17 的
 Definition of Done。
@@ -573,20 +574,20 @@ history 时直接切到 UDS，会让用户选择静默回落默认值、历史�
   `runtimeProtocolVersionCurrent = runtimeProtocolVersionV2` 与
   `typealias RuntimeWireCodec = RuntimeV2WireCodec`，current ingress/egress 拒绝 v1，且 production source
   不引用 v1 outer/codec/transfer。真实 `RuntimeEnvelopeClient` 与 UDS component 已由 P3.9-B 完成，P3.9-C3
-  已把 production GUI model/default composition 切到该 client；Rust CLI binary、Swift `--selfcheck` 与真实
-  双客户端 smoke 仍属于 P3.9-D。A2 自身不得被倒写成已经完成这些后续 Task。
+  已把 production GUI model/default composition 切到该 client，P3.9-D 又完成 Rust CLI binary、Swift
+  `--selfcheck` 与真实双客户端 smoke。A2 自身不得被倒写成已经完成这些后续 Task。
 - P3.9-C3 的 App model 只消费 daemon 签发的 conversation/event/item/entity/command identity；新会话在
   canonical conversation ID 到达前只保留 draft context，不创建 provisional runtime。snapshot/backfill/live
   共用 canonical reducer，完整 `SyncComplete` 前零发布；prompt 在 command receipt 成功前不出队，approval
   使用 conversation/turn/command/approval/request 完整绑定且不乐观删除。Preview 的 synthetic stream 只在
   显式 fixture composition 中存在，production App 连接失败 typed close，不转入 preview/stdio/spawn。
-- P3.9-D 不通过扩大 RuntimeCore 或增加 debug-only synthetic coordinator 来制造单条“大而全”证据。CLI 与
+- P3.9-D 没有扩大 RuntimeCore 或增加 debug-only synthetic coordinator 来制造单条“大而全”证据。CLI 与
   App 使用各自 installation owner；`QueryReceipt` 继续 owner-scoped，Swift 不得查询 Rust CLI receipt，反之
   亦然。验收分别读回双方自己的 receipt，再核对共同 conversation/event/command/queue；真实 daemon binary、
   单一 PID、稳定 installation 与无 fallback 由 private-TMPDIR 双进程 smoke 证明，active turn 不因 sibling
-  client 关闭则复用既有 listener/RuntimeCore 自动测试形成组合证据。真实 vendor login 仍按既定 gated 边界，
-  不得用 fixture 冒充，也不得为补这项证据放宽 Core。
-- 新会话固定 `Start → ConfigureConversation(rev0) → Subscribe → SendPrompt(expected rev1)`。
+  client 关闭则复用既有 listener/RuntimeCore 自动测试形成组合证据。该 smoke 已由 `b818f81` 落地并通过；
+  真实 vendor login 仍按既定 gated 边界，不得用 fixture 冒充，也不得为补这项证据放宽 Core。
+- 新会话固定 `DescribeAgents → Start → ConfigureConversation(rev0) → Subscribe → SendPrompt(expected rev1)`。
   configuration append-only；Configure 以 expected revision + idempotency 做 CAS，Accepted command 同事务 pin
   exact revision，重启恢复按该 revision 构造 driver。之后的 Configure 只影响之后 Accepted 的 prompt。
 - configuration 位于 `vendorControl` namespace：Codex 固定 approval policy/sandbox/reasoning effort，CC
