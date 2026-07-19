@@ -58,7 +58,33 @@ final class EndToEndWindowAssemblyTests: XCTestCase {
         XCTAssertFalse(planVisible, "Plan badge should be hidden when planMode=false")
     }
 
-    // MARK: - SessionModel + HistoryThreadSummary agentKind field
+  func testInputBarPromptStatusDistinguishesSendingFromQueued() {
+    XCTAssertEqual(
+      InputBarView.promptStatusText(sendingCount: 1, queuedCount: 0),
+      "1 sending")
+    XCTAssertEqual(
+      InputBarView.promptStatusText(sendingCount: 0, queuedCount: 2),
+      "2 queued")
+    XCTAssertEqual(
+      InputBarView.promptStatusText(
+        sendingCount: 1,
+        queuedCount: 2,
+        retryRequired: true),
+      "1 sending",
+      "本地 admission in-flight 时必须优先显示 sending，不能冒充 daemon queued")
+    XCTAssertEqual(
+      InputBarView.promptStatusText(
+        sendingCount: 0,
+        queuedCount: 2,
+        retryRequired: true),
+      "retry required",
+      "失败 draft 必须优先于较早的 daemon queued 状态显示")
+    XCTAssertEqual(
+      InputBarView.promptStatusText(sendingCount: 0, queuedCount: 0),
+      "")
+  }
+
+  // MARK: - SessionModel + HistoryThreadSummary agentKind field
 
     func testHistoryThreadSummaryCarriesAgentKind() {
         let thread = HistoryThreadSummary(

@@ -254,6 +254,32 @@ public struct RuntimeConversationDraft: Sendable {
     )
   }
 
+  func replacingIdempotencyKeys(
+    _ idempotencyKeys: RuntimeConversationIdempotencyKeys
+  ) throws -> Self {
+    try Self(
+      agentKind: agentKind,
+      cwd: cwd,
+      prompt: prompt?.rawValue,
+      configuration: configuration,
+      idempotencyKeys: idempotencyKeys
+    )
+  }
+
+  func replacingIntent(
+    cwd: String,
+    prompt: String?,
+    idempotencyKeys: RuntimeConversationIdempotencyKeys
+  ) throws -> Self {
+    try Self(
+      agentKind: agentKind,
+      cwd: cwd,
+      prompt: prompt,
+      configuration: configuration,
+      idempotencyKeys: idempotencyKeys
+    )
+  }
+
   /// 空 prompt 返回 nil；非空 prompt 只接受同 conversation 的成功 Configure 回执。
   public func sendPromptRequest(
     conversationID: RuntimeConversationID,

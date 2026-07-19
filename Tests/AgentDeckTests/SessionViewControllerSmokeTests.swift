@@ -76,6 +76,45 @@ final class SessionViewControllerSmokeTests: XCTestCase {
     )
   }
 
+  // MARK: - New conversation admission
+
+  func testRejectedNewConversationDraftDoesNotMutateCurrentCwd() throws {
+    let model = makeModel()
+    defer { model.teardown() }
+    let originalCwd = URL(fileURLWithPath: NSTemporaryDirectory())
+    model.cwd = originalCwd
+    let vc = SessionViewController(model: model)
+
+    let inFlight = try makeSessionViewConversationDraft(
+      cwd: originalCwd,
+      prompt: "first in flight"
+    )
+    XCTAssertTrue(model.startConversation(inFlight))
+
+    let rejected = try makeSessionViewConversationDraft(
+      cwd: URL(fileURLWithPath: NSHomeDirectory()),
+      prompt: "must remain in dialog"
+    )
+    XCTAssertFalse(vc.handleNewConversationDraft(rejected))
+    XCTAssertEqual(model.cwd, originalCwd)
+  }
+
+  func testAcceptedNewConversationDraftUpdatesCwdFromAcceptedDraft() throws {
+    let model = makeModel()
+    defer { model.teardown() }
+    let originalCwd = URL(fileURLWithPath: NSHomeDirectory())
+    let acceptedCwd = URL(fileURLWithPath: NSTemporaryDirectory())
+    model.cwd = originalCwd
+    let vc = SessionViewController(model: model)
+    let draft = try makeSessionViewConversationDraft(
+      cwd: acceptedCwd,
+      prompt: "accepted"
+    )
+
+    XCTAssertTrue(vc.handleNewConversationDraft(draft))
+    XCTAssertEqual(model.cwd, URL(fileURLWithPath: draft.cwd))
+  }
+
   // MARK: - Window must not resize when a session opens
 
   /// Regression: the content pane is hosted in a window created via
@@ -149,6 +188,22 @@ final class SessionViewControllerSmokeTests: XCTestCase {
     // as children (addChild was called for both).
     XCTAssertFalse(vc.children.isEmpty, "SessionViewController must embed child VCs")
   }
+}
+
+@MainActor
+private func makeSessionViewConversationDraft(
+  cwd: URL,
+  prompt: String
+) throws -> RuntimeConversationDraft {
+  let form = CodexSessionOptionsForm()
+  form.loadViewIfNeeded()
+  form.setPersistApproval(false)
+  return try NewSessionDialog.buildConversationDraft(
+    agentKind: .codex,
+    vendorForm: form,
+    cwd: cwd,
+    prompt: prompt
+  )
 }
 
 private enum SessionViewDormantRuntimeWireError: Error {

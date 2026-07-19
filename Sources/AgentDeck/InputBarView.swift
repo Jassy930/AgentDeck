@@ -1,14 +1,33 @@
 import AppKit
 import AgentDeckCore
 
+struct InputBarDraftCacheLimits: Equatable, Sendable {
+  static let production = Self(
+    maximumOwners: 32,
+    maximumDraftBytes: RuntimePromptPayloadV1.maxUTF8Bytes,
+    maximumTotalDraftBytes: 4 * RuntimePromptPayloadV1.maxUTF8Bytes)
+
+  let maximumOwners: Int
+  let maximumDraftBytes: Int
+  let maximumTotalDraftBytes: Int
+
+  init(maximumOwners: Int, maximumDraftBytes: Int, maximumTotalDraftBytes: Int) {
+    precondition(maximumOwners > 0)
+    precondition(maximumDraftBytes > 0)
+    precondition(maximumTotalDraftBytes > 0)
+    self.maximumOwners = maximumOwners
+    self.maximumDraftBytes = maximumDraftBytes
+    self.maximumTotalDraftBytes = maximumTotalDraftBytes
+  }
+}
+
 // MARK: - InputBarView (Task 8)
 //
 // Ports the SwiftUI `inputBar` (SessionView.swift ~940): a 1–4 line
-// auto-growing text input, a trailing "queued" count shown while a turn is in
-// flight (Eng I1), and a send button.
+// auto-growing text input, a truthful daemon-admission/queued status, and a send button.
 //
 //   ┌──────────────────────────────────────────────────────────┐
-//   │ Ask Codex to…                          [2 queued]   [ ↩ ] │
+//   │ Ask Codex to…                         [1 sending]   [ ↩ ] │
 //   └──────────────────────────────────────────────────────────┘
 //
 // Enter submits → `SessionModel.submit(text)`; Shift+Enter inserts a newline
@@ -63,8 +82,14 @@ final class InputBarView: NSView {
         border: DesignTokens.border)
     private let microphoneButton = NSButton()
     private let sendButton = NSButton()
+  private let retryStartButton = NSButton(title: "Retry start", target: nil, action: nil)
+  private let draftCacheLimits: InputBarDraftCacheLimits
+  private var composerOwner: PromptComposerOwner?
+  private var draftsByOwner: [PromptComposerOwner: String] = [:]
+  private var draftOwnerRecency: [PromptComposerOwner] = []
+  private var cachedDraftBytes = 0
 
-    private var scrollHeightConstraint: NSLayoutConstraint!
+  private var scrollHeightConstraint: NSLayoutConstraint!
 
     /// Single line height of the editing font, used to clamp growth 1…4 lines.
     private let lineHeight = ceil(ConversationRowMetrics.calloutFont.boundingRectForFont.height)
@@ -72,17 +97,22 @@ final class InputBarView: NSView {
     private var minHeight: CGFloat { lineHeight + verticalTextInset * 2 }
     private var maxHeight: CGFloat { lineHeight * 4 + verticalTextInset * 2 }
 
-    init(model: SessionModel) {
-        self.model = model
-        super.init(frame: .zero)
+  init(
+    model: SessionModel,
+    draftCacheLimits: InputBarDraftCacheLimits = .production
+  ) {
+    self.model = model
+    self.draftCacheLimits = draftCacheLimits
+    super.init(frame: .zero)
         build()
-        refreshQueuedCount()
-    }
+    refreshPromptStatus()
+  }
 
     /// No-arg init for unit tests or standalone usage (no model binding).
     init() {
         self.model = nil
-        super.init(frame: .zero)
+    self.draftCacheLimits = .production
+    super.init(frame: .zero)
         build()
     }
 
@@ -193,10 +223,33 @@ final class InputBarView: NSView {
         sendButton.layer?.backgroundColor = DesignTokens.text.cgColor
         sendButton.layer?.cornerRadius = 15
 
-        // 设计系统：左侧徽章成组（权限 / Plan Mode / 队列 / effort）。
+    retryStartButton.setAccessibilityIdentifier("composer-retry-start")
+    retryStartButton.toolTip = "Retry the exact conversation start"
+    retryStartButton.bezelStyle = .inline
+    retryStartButton.font = ConversationRowMetrics.captionFont
+    retryStartButton.contentTintColor = DesignTokens.info
+    retryStartButton.target = self
+    retryStartButton.action = #selector(retryStartAction)
+    retryStartButton.translatesAutoresizingMaskIntoConstraints = false
+    retryStartButton.isHidden = true
+    retryStartButton.setContentHuggingPriority(.required, for: .horizontal)
+    retryStartButton.setContentCompressionResistancePriority(
+      .required,
+      for: .horizontal
+    )
+
+    // 设计系统：左侧徽章成组（权限 / Plan Mode / 队列 / effort）。
         // 用 NSStackView 让隐藏项自动折叠，避免占位造成的空隙。
-        let badgeStack = NSStackView(views: [approvalBadge, planModeBadge, queuedLabel, effortBadge])
-        badgeStack.orientation = .horizontal
+    let badgeStack = NSStackView(
+      views: [
+        approvalBadge,
+        planModeBadge,
+        queuedLabel,
+        retryStartButton,
+        effortBadge,
+      ]
+    )
+    badgeStack.orientation = .horizontal
         badgeStack.alignment = .centerY
         badgeStack.spacing = 8
         badgeStack.translatesAutoresizingMaskIntoConstraints = false
@@ -249,18 +302,48 @@ final class InputBarView: NSView {
         ])
     }
 
-    /// Recompute queued count + send button enabled state (called by the
-    /// controller whenever the model changes). Also refreshes the T6B Plan
+  /// Recompute admission/queued status + send button enabled state (called by the
+  /// controller whenever the model changes). Also refreshes the T6B Plan
     /// Mode badge from the currently selected runtime.
-    func refreshQueuedCount() {
-        let count = model?.queuedPrompts.count ?? 0
-        queuedLabel.stringValue = count > 0 ? "\(count) queued" : ""
-        queuedLabel.isHidden = count == 0
-        refreshPlanModeBadge()
+  func refreshPromptStatus() {
+    let nextOwner = model?.promptComposerOwner
+    switchComposerOwner(to: nextOwner)
+    let retryDraft = model?.retryRequiredPromptDraft
+    if let retryDraft,
+      retryDraft.owner == composerOwner,
+      textView.string.isEmpty
+    {
+      textView.string = retryDraft.prompt
+      textDidChange()
+    }
+    let status = Self.promptStatusText(
+      sendingCount: model?.sendingPrompts.count ?? 0,
+      queuedCount: model?.queuedPrompts.count ?? 0,
+      retryRequired: retryDraft?.owner == composerOwner
+        || model?.canRetryPromptlessConversationStart == true,
+      bootstrapInFlight: model?.isConversationBootstrapAdmissionInFlight == true)
+    queuedLabel.stringValue = status
+    queuedLabel.isHidden = status.isEmpty
+    retryStartButton.isHidden = model?.canRetryConversationStart != true
+    retryStartButton.isEnabled = model?.canRetryConversationStart == true
+    refreshPlanModeBadge()
         updateSendEnabled()
     }
 
-    /// T6C: programmatically set the plan-mode badge state (for testing or
+  static func promptStatusText(
+    sendingCount: Int,
+    queuedCount: Int,
+    retryRequired: Bool = false,
+    bootstrapInFlight: Bool = false
+  ) -> String {
+    if sendingCount > 0 { return "\(sendingCount) sending" }
+    if bootstrapInFlight { return "starting conversation" }
+    if retryRequired { return "retry required" }
+    if queuedCount > 0 { return "\(queuedCount) queued" }
+    return ""
+  }
+
+  /// T6C: programmatically set the plan-mode badge state (for testing or
     /// external binding). Pass `true` to show the badge, `false` to hide it.
     func applyState(planMode: Bool) {
         planModeBadge.isHidden = !planMode
@@ -294,8 +377,11 @@ final class InputBarView: NSView {
 
     private func updateSendEnabled() {
         let trimmed = textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
-        sendButton.isEnabled = !trimmed.isEmpty
-    }
+    let admissionAvailable = model?.isComposerAdmissionInFlight != true
+    let requiresSeparateStartRetry = requiresSeparateConversationStartRetry()
+    sendButton.isEnabled =
+      !trimmed.isEmpty && admissionAvailable && !requiresSeparateStartRetry
+  }
 
     /// Grow the scroll view to fit the text, clamped between 1 and 4 lines.
     private func adjustHeight() {
@@ -311,14 +397,105 @@ final class InputBarView: NSView {
 
     @objc private func sendAction() { send() }
 
-    private func send() {
-        let text = textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-        model?.submit(text)
-        textView.string = ""
-        textDidChange()
-        refreshQueuedCount()
+  @objc private func retryStartAction() {
+    let clearsExactRetryDraft: Bool = {
+      guard let retryDraft = model?.retryRequiredPromptDraft,
+        retryDraft.owner == composerOwner
+      else { return false }
+      return textView.string.utf8.elementsEqual(retryDraft.prompt.utf8)
+    }()
+    model?.retryConversationStart()
+    if clearsExactRetryDraft {
+      textView.string = ""
+      textDidChange()
     }
+    refreshPromptStatus()
+  }
+
+  private func send() {
+    let text = textView.string
+    guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+    guard model?.submit(text, expectedComposerOwner: composerOwner) == true else {
+      refreshPromptStatus()
+      return
+    }
+    textView.string = ""
+        textDidChange()
+    refreshPromptStatus()
+  }
+
+  private func switchComposerOwner(to nextOwner: PromptComposerOwner?) {
+    guard composerOwner != nextOwner else { return }
+    let previousOwner = composerOwner
+    let previousText = textView.string
+    let carriedBootstrapDraft: String? = {
+      guard case .bootstrap = previousOwner,
+        case .conversation? = nextOwner,
+        !previousText.isEmpty
+      else { return nil }
+      return previousText
+    }()
+    if let previousOwner {
+      if carriedBootstrapDraft != nil {
+        removeCachedDraft(for: previousOwner)
+      } else {
+        cacheInactiveDraft(previousText, for: previousOwner)
+      }
+    }
+    composerOwner = nextOwner
+    textView.string =
+      carriedBootstrapDraft
+      ?? nextOwner.flatMap { takeCachedDraft(for: $0) }
+      ?? ""
+    textDidChange()
+  }
+
+  private func cacheInactiveDraft(_ text: String, for owner: PromptComposerOwner) {
+    removeCachedDraft(for: owner)
+    if text.isEmpty {
+      return
+    }
+    let bytes = text.utf8.count
+    guard bytes <= draftCacheLimits.maximumDraftBytes else {
+      model?.recordComposerDraftCacheDrop(
+        "A composer draft exceeded the 256 KiB cache limit and was not retained after switching targets"
+      )
+      return
+    }
+    draftsByOwner[owner] = text
+    cachedDraftBytes += bytes
+    draftOwnerRecency.append(owner)
+    while draftOwnerRecency.count > draftCacheLimits.maximumOwners
+      || cachedDraftBytes > draftCacheLimits.maximumTotalDraftBytes
+    {
+      let evicted = draftOwnerRecency.removeFirst()
+      removeCachedDraft(for: evicted)
+      model?.recordComposerDraftCacheDrop(
+        "An older composer draft was evicted from the bounded local cache"
+      )
+    }
+  }
+
+  private func takeCachedDraft(for owner: PromptComposerOwner) -> String? {
+    let value = draftsByOwner[owner]
+    removeCachedDraft(for: owner)
+    return value
+  }
+
+  private func removeCachedDraft(for owner: PromptComposerOwner) {
+    if let removed = draftsByOwner.removeValue(forKey: owner) {
+      cachedDraftBytes -= removed.utf8.count
+    }
+    draftOwnerRecency.removeAll { $0 == owner }
+  }
+
+  private func requiresSeparateConversationStartRetry() -> Bool {
+    guard model?.canRetryConversationStart == true else { return false }
+    guard let retryDraft = model?.retryRequiredPromptDraft,
+      retryDraft.owner == composerOwner
+    else { return true }
+    return !textView.string.utf8.elementsEqual(retryDraft.prompt.utf8)
+  }
 }
 
 // MARK: - InputTextView

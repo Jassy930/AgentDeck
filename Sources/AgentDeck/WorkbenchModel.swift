@@ -169,6 +169,11 @@ final class WorkbenchModel {
     inFlightDraftContext = nil
   }
 
+  /// 连接换代时丢弃旧 wire 尚未到达 SyncComplete 的纯 staging；canonical model 未被修改。
+  func cancelPendingSynchronization() {
+    pendingSynchronization = nil
+  }
+
   /// Coordinator 的唯一 MainActor handler。返回的 drain action 仍携 exact conversation ID，
   /// 上层不得在 selection 变化后重新推断目标。
   @discardableResult

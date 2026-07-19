@@ -228,11 +228,12 @@ final class WorkbenchRuntimeV2Tests: XCTestCase {
     )
     XCTAssertEqual(workbench.runtime(conversationID: firstID)?.phase, .running)
     let queuedKey = RuntimeIdempotencyKey(rawValue: "prompt:live-queue")
-    XCTAssertNil(
+    XCTAssertEqual(
       workbench.runtime(conversationID: firstID)?.enqueuePrompt(
         "next prompt",
         idempotencyKey: queuedKey
-      )
+      ),
+      .drainNextPrompt(prompt: "next prompt", idempotencyKey: queuedKey)
     )
     let action = try workbench.ingest(
       .stream(
@@ -250,16 +251,9 @@ final class WorkbenchRuntimeV2Tests: XCTestCase {
         )
       )
     )
+    XCTAssertNil(action)
     XCTAssertEqual(
-      action,
-      .drainNextPrompt(
-        conversationID: firstID,
-        prompt: "next prompt",
-        idempotencyKey: queuedKey
-      )
-    )
-    XCTAssertEqual(
-      workbench.runtime(conversationID: firstID)?.queuedPrompts,
+      workbench.runtime(conversationID: firstID)?.pendingPromptAdmissions,
       ["next prompt"]
     )
     XCTAssertEqual(workbench.runtime(conversationID: firstID)?.phase, .ready)
@@ -351,11 +345,12 @@ final class WorkbenchRuntimeV2Tests: XCTestCase {
       )
     )
     let queuedKey = RuntimeIdempotencyKey(rawValue: "prompt:reconnect-queue")
-    XCTAssertNil(
+    XCTAssertEqual(
       workbench.runtime(conversationID: id)?.enqueuePrompt(
         "queued after reconnect",
         idempotencyKey: queuedKey
-      )
+      ),
+      .drainNextPrompt(prompt: "queued after reconnect", idempotencyKey: queuedKey)
     )
 
     let completed = try event(
@@ -379,17 +374,10 @@ final class WorkbenchRuntimeV2Tests: XCTestCase {
         .syncComplete(try syncComplete(conversationID: id, cursor: .at(1)))
       )
     )
-    XCTAssertEqual(
-      action,
-      .drainNextPrompt(
-        conversationID: id,
-        prompt: "queued after reconnect",
-        idempotencyKey: queuedKey
-      )
-    )
+    XCTAssertNil(action)
     XCTAssertEqual(workbench.runtime(conversationID: id)?.phase, .ready)
     XCTAssertEqual(
-      workbench.runtime(conversationID: id)?.queuedPrompts,
+      workbench.runtime(conversationID: id)?.pendingPromptAdmissions,
       ["queued after reconnect"]
     )
 

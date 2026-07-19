@@ -6,9 +6,22 @@ enum RuntimeAction: Equatable, Sendable {
   case drainNextPrompt(prompt: String, idempotencyKey: RuntimeIdempotencyKey)
 }
 
-private struct QueuedRuntimePrompt: Sendable {
+private struct PendingRuntimePromptAdmission: Sendable {
   let prompt: String
   let idempotencyKey: RuntimeIdempotencyKey
+  let expectedConfigurationRevision: UInt64
+}
+
+private struct RetryRequiredRuntimePrompt: Sendable {
+  let prompt: String
+  let reusableIdempotencyKey: RuntimeIdempotencyKey?
+  let reusableExpectedConfigurationRevision: UInt64?
+}
+
+private struct AcceptedRuntimePrompt: Sendable {
+  let prompt: String
+  let commandID: RuntimeCommandID
+  let queuePosition: UInt32?
 }
 
 enum ThreadRuntimeModelError: Error, Equatable, Sendable {
@@ -155,6 +168,13 @@ enum RuntimeConversationSynchronizationPayload: Sendable {
 @Observable
 final class ThreadRuntimeModel {
   private static let largeDeferredContentThreshold = 16 * 1_024
+  private static let maxPendingPromptAdmissionCount = 1
+  private static let maxPendingPromptAdmissionBytes =
+    maxPendingPromptAdmissionCount * RuntimePromptPayloadV1.maxUTF8Bytes
+  private static let promptPayloadLimitWarning =
+    "prompt was not sent: payload exceeds the runtime protocol limit"
+  private static let promptAdmissionInFlightWarning =
+    "prompt was not sent: another daemon admission is still in flight"
 
   let conversationID: RuntimeConversationID
   let agentKind: AgentKind
@@ -164,9 +184,15 @@ final class ThreadRuntimeModel {
   private(set) var entryRevision: UInt64?
   var phase: SessionModel.Phase
   private(set) var items: [UIItem] = []
-  private var queuedPromptEntries: [QueuedRuntimePrompt] = []
+  private var pendingPromptAdmissionEntries: [PendingRuntimePromptAdmission] = []
+  var pendingPromptAdmissions: [String] {
+    pendingPromptAdmissionEntries.map(\.prompt)
+  }
+  private var retryRequiredPromptAdmission: RetryRequiredRuntimePrompt?
+  var retryRequiredPrompt: String? { retryRequiredPromptAdmission?.prompt }
+  private var acceptedPromptEntries: [AcceptedRuntimePrompt] = []
   var queuedPrompts: [String] {
-    queuedPromptEntries.map(\.prompt)
+    acceptedPromptEntries.map(\.prompt)
   }
   private(set) var errorMessage: String?
   var warningMessage: String?
@@ -178,6 +204,7 @@ final class ThreadRuntimeModel {
   private var itemIndexByID: [String: Int] = [:]
   private var lastCatalogEntry: RuntimeConversationEntryV2?
   private var queuedPromptDispatchInFlight: RuntimeIdempotencyKey?
+  private var pendingPromptAdmissionBytes = 0
   private var canonicalErrorMessage: String?
   private var operationErrorMessage: String?
 
@@ -253,7 +280,10 @@ final class ThreadRuntimeModel {
 
   var statusLabel: String {
     if !queuedPrompts.isEmpty {
-      return "\(phase.rawValue) +\(queuedPrompts.count)"
+      return "\(phase.rawValue) +\(queuedPrompts.count) queued"
+    }
+    if !pendingPromptAdmissions.isEmpty {
+      return "\(phase.rawValue) \(pendingPromptAdmissions.count) sending"
     }
     return phase.rawValue
   }
@@ -311,6 +341,7 @@ final class ThreadRuntimeModel {
     items = nextItems
     itemIndexByID = Self.indexByItemID(nextItems)
     setCanonicalError(nextState.failure?.value.message)
+    reconcileAcceptedPrompts(with: nextState)
     refreshPhase(preservingStarting: true)
     markUpdated()
   }
@@ -326,6 +357,7 @@ final class ThreadRuntimeModel {
     items = nextItems
     itemIndexByID = Self.indexByItemID(nextItems)
     setCanonicalError(nextState.failure?.value.message)
+    reconcileAcceptedPrompts(with: nextState)
     refreshPhase(preservingStarting: true)
     markUpdated()
   }
@@ -362,6 +394,7 @@ final class ThreadRuntimeModel {
     items = nextItems
     itemIndexByID = Self.indexByItemID(nextItems)
     setCanonicalError(nextState.failure?.value.message)
+    reconcileAcceptedPrompts(with: nextState)
     refreshPhase(preservingStarting: true)
     markUpdated()
     return prepareQueueDispatchIfPossible()
@@ -407,6 +440,7 @@ final class ThreadRuntimeModel {
     itemIndexByID = nextIndex
     unreadEventCount += 1
     setCanonicalError(nextState.failure?.value.message)
+    reconcileAcceptedPrompts(with: nextState)
     refreshPhase(preservingStarting: true)
     markUpdated()
 
@@ -424,51 +458,193 @@ final class ThreadRuntimeModel {
     conversationState.identity(for: itemID)
   }
 
-  /// Composer 文本先进入 model-owned queue，再尝试派发队首。队首在 daemon command
-  /// receipt 成功前始终留在队列中；同一 conversation 同时最多派发一个 queued prompt。
+  /// Composer 文本只在等待 daemon admission receipt 期间留在有界本地 FIFO；它不是 daemon
+  /// 已接受的 canonical queue。首条立即派发，后续 admission 串行化，避免并发 request 反转
+  /// daemon commandSeq。count/bytes 任一满载时明确拒绝新文本，不做无界非持久排队。
   func enqueuePrompt(
     _ prompt: String,
-    idempotencyKey: RuntimeIdempotencyKey
+    idempotencyKey: RuntimeIdempotencyKey,
+    expectedConfigurationRevision: UInt64? = nil
   ) -> RuntimeAction? {
-    queuedPromptEntries.append(
-      QueuedRuntimePrompt(prompt: prompt, idempotencyKey: idempotencyKey)
+    let promptBytes = prompt.utf8.count
+    guard promptBytes <= RuntimePromptPayloadV1.maxUTF8Bytes else {
+      warningMessage = Self.promptPayloadLimitWarning
+      return nil
+    }
+    guard pendingPromptAdmissionEntries.count < Self.maxPendingPromptAdmissionCount,
+      pendingPromptAdmissionBytes <= Self.maxPendingPromptAdmissionBytes - promptBytes
+    else {
+      warningMessage = Self.promptAdmissionInFlightWarning
+      return nil
+    }
+    let entry: PendingRuntimePromptAdmission
+    if let retryRequiredPromptAdmission,
+      Self.promptBytesEqual(retryRequiredPromptAdmission.prompt, prompt),
+      let reusableIdempotencyKey = retryRequiredPromptAdmission.reusableIdempotencyKey,
+      let reusableExpectedConfigurationRevision =
+        retryRequiredPromptAdmission.reusableExpectedConfigurationRevision
+    {
+      entry = PendingRuntimePromptAdmission(
+        prompt: retryRequiredPromptAdmission.prompt,
+        idempotencyKey: reusableIdempotencyKey,
+        expectedConfigurationRevision: reusableExpectedConfigurationRevision
+      )
+    } else {
+      entry = PendingRuntimePromptAdmission(
+        prompt: prompt,
+        idempotencyKey: idempotencyKey,
+        expectedConfigurationRevision: expectedConfigurationRevision
+          ?? configurationState?.configurationRevision
+          ?? 0
+      )
+    }
+    retryRequiredPromptAdmission = nil
+    pendingPromptAdmissionEntries.append(
+      entry
     )
+    pendingPromptAdmissionBytes += promptBytes
+    if warningMessage == Self.promptPayloadLimitWarning
+      || warningMessage == Self.promptAdmissionInFlightWarning
+    {
+      warningMessage = nil
+    }
     return prepareQueueDispatchIfPossible()
   }
 
   /// 只有 command receipt 成功后才永久移除 exact in-flight 队首。
   func acknowledgeQueuedPrompt(
     _ prompt: String,
-    idempotencyKey: RuntimeIdempotencyKey
+    idempotencyKey: RuntimeIdempotencyKey,
+    receipt: CommandReceiptV2
   ) -> RuntimeAction? {
     guard queuedPromptDispatchInFlight == idempotencyKey,
-      let first = queuedPromptEntries.first,
+      let first = pendingPromptAdmissionEntries.first,
       first.prompt == prompt,
       first.idempotencyKey == idempotencyKey
     else {
       return nil
     }
-    queuedPromptEntries.removeFirst()
+    let accepted: AcceptedRuntimePrompt?
+    switch receipt {
+    case .accepted(let commandID, let queuePosition, _):
+      accepted = AcceptedRuntimePrompt(
+        prompt: prompt,
+        commandID: commandID,
+        queuePosition: queuePosition
+      )
+    case .replayed(let commandID, _):
+      accepted = AcceptedRuntimePrompt(
+        prompt: prompt,
+        commandID: commandID,
+        queuePosition: nil
+      )
+    case .failed:
+      return nil
+    }
+    pendingPromptAdmissionEntries.removeFirst()
+    pendingPromptAdmissionBytes -= first.prompt.utf8.count
     queuedPromptDispatchInFlight = nil
+    let hasCanonicalEvidence =
+      accepted.map {
+        self.hasCanonicalEvidence(for: $0.commandID, in: conversationState)
+      } ?? false
+    if let accepted, !hasCanonicalEvidence {
+      acceptedPromptEntries.removeAll { $0.commandID == accepted.commandID }
+      acceptedPromptEntries.append(accepted)
+    }
+    if case .replayed = receipt, hasCanonicalEvidence, phase == .starting {
+      refreshPhase(preservingStarting: false)
+    }
     markUpdated()
     return prepareQueueDispatchIfPossible()
   }
 
-  /// operation/transport/daemon receipt 失败只释放 dispatch slot，不移除队首。
+  /// operation/transport/daemon receipt 失败会退出 sending，并只保留一个显式 retry draft。
+  /// 后续相同文本 submit 才复用原 key；不同文本是新意图并替换旧 retry draft。
   @discardableResult
   func failQueuedPromptDispatch(
     _ prompt: String,
-    idempotencyKey: RuntimeIdempotencyKey
+    idempotencyKey: RuntimeIdempotencyKey,
+    reuseIdempotencyKey: Bool = true
   ) -> Bool {
     guard queuedPromptDispatchInFlight == idempotencyKey,
-      queuedPromptEntries.first?.prompt == prompt,
-      queuedPromptEntries.first?.idempotencyKey == idempotencyKey
+      pendingPromptAdmissionEntries.first?.prompt == prompt,
+      pendingPromptAdmissionEntries.first?.idempotencyKey == idempotencyKey
     else {
       return false
     }
+    let failed = pendingPromptAdmissionEntries.removeFirst()
+    pendingPromptAdmissionBytes -= failed.prompt.utf8.count
     queuedPromptDispatchInFlight = nil
+    retryRequiredPromptAdmission = RetryRequiredRuntimePrompt(
+      prompt: failed.prompt,
+      reusableIdempotencyKey: reuseIdempotencyKey ? failed.idempotencyKey : nil,
+      reusableExpectedConfigurationRevision: reuseIdempotencyKey
+        ? failed.expectedConfigurationRevision
+        : nil
+    )
     markUpdated()
     return true
+  }
+
+  /// 新 conversation 的 Start/Configure/Subscribe 由 coordinator 组合执行，因此没有本地 pending
+  /// entry 可供 `acknowledgeQueuedPrompt` 消费。最终 prompt receipt 到达后仍必须投影成与已有
+  /// conversation 相同的 queued/canonical replacement 语义。
+  func projectBootstrapPromptReceipt(
+    _ prompt: String,
+    receipt: CommandReceiptV2
+  ) {
+    let accepted: AcceptedRuntimePrompt
+    switch receipt {
+    case .accepted(let commandID, let queuePosition, _):
+      accepted = AcceptedRuntimePrompt(
+        prompt: prompt,
+        commandID: commandID,
+        queuePosition: queuePosition
+      )
+    case .replayed(let commandID, _):
+      accepted = AcceptedRuntimePrompt(
+        prompt: prompt,
+        commandID: commandID,
+        queuePosition: nil
+      )
+    case .failed:
+      return
+    }
+    let hasCanonicalEvidence = hasCanonicalEvidence(
+      for: accepted.commandID,
+      in: conversationState
+    )
+    if hasCanonicalEvidence {
+      if case .replayed = receipt, phase == .starting {
+        refreshPhase(preservingStarting: false)
+      }
+    } else {
+      acceptedPromptEntries.removeAll { $0.commandID == accepted.commandID }
+      acceptedPromptEntries.append(accepted)
+    }
+    markUpdated()
+  }
+
+  func retainBootstrapPromptForRetry(
+    _ prompt: String,
+    reusableIdempotencyKey: RuntimeIdempotencyKey?,
+    reusableExpectedConfigurationRevision: UInt64?
+  ) {
+    retryRequiredPromptAdmission = RetryRequiredRuntimePrompt(
+      prompt: prompt,
+      reusableIdempotencyKey: reusableIdempotencyKey,
+      reusableExpectedConfigurationRevision: reusableExpectedConfigurationRevision
+    )
+    markUpdated()
+  }
+
+  func expectedConfigurationRevision(
+    for idempotencyKey: RuntimeIdempotencyKey
+  ) -> UInt64? {
+    pendingPromptAdmissionEntries.first {
+      $0.idempotencyKey == idempotencyKey
+    }?.expectedConfigurationRevision
   }
 
   func recordOperationError(_ message: String) {
@@ -560,8 +736,7 @@ final class ThreadRuntimeModel {
 
   private func prepareQueueDispatchIfPossible() -> RuntimeAction? {
     guard queuedPromptDispatchInFlight == nil,
-      let entry = queuedPromptEntries.first,
-      phase == .ready
+      let entry = pendingPromptAdmissionEntries.first
     else {
       return nil
     }
@@ -572,6 +747,33 @@ final class ThreadRuntimeModel {
       prompt: entry.prompt,
       idempotencyKey: entry.idempotencyKey
     )
+  }
+
+  private func reconcileAcceptedPrompts(with state: RuntimeConversationState) {
+    acceptedPromptEntries.removeAll { hasCanonicalEvidence(for: $0.commandID, in: state) }
+  }
+
+  private func hasCanonicalEvidence(
+    for commandID: RuntimeCommandID,
+    in state: RuntimeConversationState
+  ) -> Bool {
+    if state.canonicalItemIdentities.contains(where: { $0.commandID == commandID }) {
+      return true
+    }
+    if state.activeTurn?.commandID == commandID || state.failure?.commandID == commandID {
+      return true
+    }
+    switch state.turnTerminal {
+    case .completed(_, let terminalCommandID, _),
+      .interrupted(_, let terminalCommandID):
+      return terminalCommandID == commandID
+    case nil:
+      return false
+    }
+  }
+
+  private static func promptBytesEqual(_ lhs: String, _ rhs: String) -> Bool {
+    lhs.utf8.elementsEqual(rhs.utf8)
   }
 
   private func markUpdated() {

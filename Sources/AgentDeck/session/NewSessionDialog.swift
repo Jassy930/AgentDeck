@@ -12,7 +12,8 @@ import AppKit
 @MainActor
 public final class NewSessionDialog: NSWindowController {
 
-  public var onSubmit: ((RuntimeConversationDraft) -> Void)?
+  /// 只有上层真正接纳 draft 时返回 `true`；拒绝会保留 sheet 与全部表单内容。
+  public var onSubmit: ((RuntimeConversationDraft) -> Bool)?
 
   // MARK: - State
 
@@ -181,7 +182,14 @@ public final class NewSessionDialog: NSWindowController {
   }
 
   @objc private func submit() {
-    guard let form = vendorForm else { return }
+    _ = submitDraftIfAccepted()
+  }
+
+  /// 把当前表单组装为一个完整 draft，并以 admission 结果决定是否关闭。
+  /// internal 可见性只用于锁定 callback/close 契约；production 仍由 Start 按钮调用。
+  @discardableResult
+  func submitDraftIfAccepted() -> Bool {
+    guard let form = vendorForm else { return false }
     let cwd = cwdPathControl.url ?? URL(fileURLWithPath: NSHomeDirectory())
     let prompt = promptTextView.string.isEmpty ? nil : promptTextView.string
     do {
@@ -191,10 +199,12 @@ public final class NewSessionDialog: NSWindowController {
         cwd: cwd,
         prompt: prompt
       )
-      onSubmit?(draft)
+      guard onSubmit?(draft) == true else { return false }
       window?.close()
+      return true
     } catch {
       window?.presentError(error)
+      return false
     }
   }
 

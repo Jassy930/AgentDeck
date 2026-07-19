@@ -268,8 +268,15 @@ final class ConversationViewController: NSViewController {
             _ = self.model.selectedActionRequest
             _ = self.model.selectedErrorMessage
             _ = self.model.selectedWarningMessage
-            _ = self.model.queuedPrompts
-        }, onChange: { [weak self] in
+        _ = self.model.promptComposerOwner
+        _ = self.model.sendingPrompts
+        _ = self.model.isComposerAdmissionInFlight
+        _ = self.model.isConversationBootstrapAdmissionInFlight
+        _ = self.model.canRetryConversationStart
+        _ = self.model.canRetryPromptlessConversationStart
+        _ = self.model.queuedPrompts
+        _ = self.model.retryRequiredPromptDraft
+      }, onChange: { [weak self] in
             self?.modelDidChange()
         })
     }
@@ -288,9 +295,9 @@ final class ConversationViewController: NSViewController {
         applyRowUpdate(previousSignatures: previousSignatures, reasoningFlipped: reasoningFlipped)
 
         refreshFooter()
-        inputBar.refreshQueuedCount()
+    inputBar.refreshPromptStatus()
 
-        if model.scrollToLatestRequest != lastScrollToLatestRequest {
+    if model.scrollToLatestRequest != lastScrollToLatestRequest {
             lastScrollToLatestRequest = model.scrollToLatestRequest
             scrollToLatestRow()
         }

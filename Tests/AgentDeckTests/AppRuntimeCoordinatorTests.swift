@@ -115,6 +115,96 @@ final class AppRuntimeCoordinatorTests: XCTestCase {
     await coordinator.close()
   }
 
+  func testLongSynchronizationAllowsApprovalAndOtherConversationControl() async throws {
+    let synchronizedConversationID = RuntimeConversationID(rawValue: "conversation-sync")
+    let otherConversationID = RuntimeConversationID(rawValue: "conversation-other")
+    let approvalID = RuntimeApprovalID(rawValue: "approval-during-sync")
+    let sequence = try AppRuntimeBlockingReplySequence(
+      conversationID: synchronizedConversationID
+    )
+    let wire = AppRuntimeConcurrentControlWire(sequence: sequence)
+    let coordinator = AppRuntimeCoordinator(wire: wire) { _ in }
+
+    try await coordinator.start()
+    let synchronization = Task {
+      try await coordinator.synchronizeConversation(
+        conversationID: synchronizedConversationID,
+        cursor: .beforeFirst
+      )
+    }
+    try await sequence.waitUntilTerminalBlocked()
+
+    let approval: ApprovalReceiptV1?
+    let approvalError: (any Error)?
+    do {
+      approval = try await coordinator.resolveApproval(
+        conversationID: synchronizedConversationID,
+        turnID: RuntimeTurnID(rawValue: "turn-during-sync"),
+        approvalID: approvalID,
+        decision: RuntimeActionDecisionV1(
+          requestID: "request-during-sync",
+          decision: .approve,
+          persist: false
+        )
+      )
+      approvalError = nil
+    } catch {
+      approval = nil
+      approvalError = error
+    }
+
+    let configuration: RuntimeConfigurationReceiptV2?
+    let configurationError: (any Error)?
+    do {
+      configuration = try await coordinator.configureConversation(
+        RuntimeConfigureConversationRequestV2(
+          conversationID: otherConversationID,
+          idempotencyKey: RuntimeIdempotencyKey(rawValue: "configure-during-sync"),
+          expectedConfigurationRevision: 0,
+          configuration: try codexConfiguration()
+        )
+      )
+      configurationError = nil
+    } catch {
+      configuration = nil
+      configurationError = error
+    }
+
+    do {
+      _ = try await coordinator.synchronizeConversation(
+        conversationID: otherConversationID,
+        cursor: .beforeFirst
+      )
+      XCTFail("a second synchronization unexpectedly overlapped the active stream barrier")
+    } catch let error as AppRuntimeCoordinatorError {
+      XCTAssertEqual(error, .operationInProgress)
+    }
+
+    await sequence.releaseTerminal()
+    _ = try await synchronization.value
+
+    if let approvalError {
+      XCTFail("approval was blocked by an unrelated synchronization: \(approvalError)")
+    }
+    if case .applied(let actualApprovalID) = approval {
+      XCTAssertEqual(actualApprovalID, approvalID)
+    } else {
+      XCTFail("approval did not return its exact applied receipt")
+    }
+    if let configurationError {
+      XCTFail("other-conversation control was blocked by synchronization: \(configurationError)")
+    }
+    if case .applied(let actualConversationID, let revision) = configuration {
+      XCTAssertEqual(actualConversationID, otherConversationID)
+      XCTAssertEqual(revision, 1)
+    } else {
+      XCTFail("configuration did not return its exact applied receipt")
+    }
+    let requestKinds = await wire.controlRequestKinds()
+    XCTAssertEqual(requestKinds, ["resolveApproval", "configureConversation"])
+    await coordinator.close()
+  }
+
   func testReceiptConversationMismatchFailsTypedAndSkipsSubscribe() async throws {
     let expected = RuntimeConversationID(rawValue: "conversation-expected")
     let actual = RuntimeConversationID(rawValue: "conversation-other")
@@ -141,7 +231,14 @@ final class AppRuntimeCoordinatorTests: XCTestCase {
     do {
       _ = try await coordinator.startConversation(draft)
       XCTFail("mismatched Configure receipt unexpectedly succeeded")
-    } catch let error as AppRuntimeCoordinatorError {
+    } catch let failure as AppRuntimeConversationStartFailure {
+      guard case .configure = failure.stage else {
+        return XCTFail("mismatched Configure receipt failed at unexpected stage")
+      }
+      XCTAssertNil(failure.partialResult)
+      guard let error = failure.underlying as? AppRuntimeCoordinatorError else {
+        return XCTFail("mismatched Configure receipt lost its typed underlying error")
+      }
       XCTAssertEqual(
         error,
         .receiptConversationMismatch(
@@ -372,6 +469,135 @@ final class AppRuntimeCoordinatorTests: XCTestCase {
     XCTAssertEqual(requestCount, 0)
   }
 
+  func testCloseWhileSendPromptReplyIsBlockedRejectsReplyAndCannotRevive() async throws {
+    let conversationID = RuntimeConversationID(rawValue: "conversation-prompt-close")
+    let idempotencyKey = RuntimeIdempotencyKey(rawValue: "prompt-close-key")
+    let prompt = try RuntimePromptPayloadV1(rawValue: "reply after close")
+    let wire = AppRuntimeFakeWire(
+      unaryReplies: [
+        .command(
+          .accepted(
+            commandID: RuntimeCommandID(rawValue: "command-after-close"),
+            queuePosition: 0,
+            configurationRevision: 7
+          )
+        )
+      ],
+      blockUnaryReply: true
+    )
+    let coordinator = AppRuntimeCoordinator(wire: wire) { _ in }
+    try await coordinator.start()
+
+    let sendTask = Task {
+      try await coordinator.sendPrompt(
+        conversationID: conversationID,
+        idempotencyKey: idempotencyKey,
+        expectedConfigurationRevision: 7,
+        prompt: prompt
+      )
+    }
+    try await wire.waitUntilUnaryRequestBlocked()
+
+    await coordinator.close()
+    await wire.releaseUnaryReply()
+
+    do {
+      _ = try await sendTask.value
+      XCTFail("SendPrompt published a daemon reply after coordinator close")
+    } catch let error as AppRuntimeCoordinatorError {
+      XCTAssertEqual(error, .closed)
+    }
+    do {
+      _ = try await coordinator.describeAgents()
+      XCTFail("closed coordinator was revived by a late SendPrompt reply")
+    } catch let error as AppRuntimeCoordinatorError {
+      XCTAssertEqual(error, .closed)
+    }
+
+    let requestKinds = await wire.controlRequestKinds()
+    let closeCount = await wire.closeCount()
+    XCTAssertEqual(requestKinds, ["sendPrompt"])
+    XCTAssertEqual(closeCount, 1)
+  }
+
+  func testConcurrentCloseWaitsForStreamFaultWireCloseBarrier() async throws {
+    let wire = AppRuntimeFakeWire(blockClose: true)
+    let completion = AppRuntimeCloseCompletionProbe()
+    let coordinator = AppRuntimeCoordinator(wire: wire) { _ in }
+    try await coordinator.start()
+    try await wire.waitForStreamReads(1)
+
+    await wire.failStream()
+    try await wire.waitUntilCloseBlocked()
+    let externalClose = Task {
+      await coordinator.close()
+      await completion.markCompleted()
+    }
+    for _ in 0..<100 { await Task.yield() }
+    let completedBeforeRelease = await completion.isCompleted()
+    XCTAssertFalse(completedBeforeRelease)
+
+    await wire.releaseClose()
+    await externalClose.value
+    await coordinator.close()
+    let completedAfterRelease = await completion.isCompleted()
+    let closeCount = await wire.closeCount()
+    XCTAssertTrue(completedAfterRelease)
+    XCTAssertEqual(closeCount, 1)
+    do {
+      _ = try await coordinator.describeAgents()
+      XCTFail("coordinator accepted work after completed close barrier")
+    } catch let error as AppRuntimeCoordinatorError {
+      XCTAssertEqual(error, .closed)
+    }
+  }
+
+  func testUnexpectedStreamTerminationNotifiesExactlyOnceAfterCloseBarrier() async throws {
+    let wire = AppRuntimeFakeWire(blockClose: true)
+    let probe = await MainActor.run { AppRuntimeTerminationProbe() }
+    let coordinator = AppRuntimeCoordinator(
+      wire: wire,
+      inboundHandler: { _ in },
+      terminationHandler: { probe.record() }
+    )
+
+    try await coordinator.start()
+    try await wire.waitForStreamReads(1)
+    await wire.failStream()
+    try await wire.waitUntilCloseBlocked()
+    let beforeRelease = await MainActor.run { probe.count }
+    XCTAssertEqual(beforeRelease, 0)
+
+    await wire.releaseClose()
+    for _ in 0..<1_000 {
+      if await MainActor.run(body: { probe.count == 1 }) { break }
+      await Task.yield()
+    }
+    let afterRelease = await MainActor.run { probe.count }
+    XCTAssertEqual(afterRelease, 1)
+
+    await coordinator.close()
+    let afterExplicitClose = await MainActor.run { probe.count }
+    let closeCount = await wire.closeCount()
+    XCTAssertEqual(afterExplicitClose, 1)
+    XCTAssertEqual(closeCount, 1)
+  }
+
+  func testUnsubscribeConversationRequiresExactDaemonAck() async throws {
+    let conversationID = RuntimeConversationID(rawValue: "conversation-unsubscribe")
+    let wire = AppRuntimeFakeWire(
+      unaryReplies: [.subscription(.unsubscribed)]
+    )
+    let coordinator = AppRuntimeCoordinator(wire: wire) { _ in }
+
+    try await coordinator.start()
+    try await coordinator.unsubscribeConversation(conversationID)
+
+    let requestKinds = await wire.controlRequestKinds()
+    XCTAssertEqual(requestKinds, ["unsubscribe"])
+    await coordinator.close()
+  }
+
   func testOSAccountWireCloseDuringCandidateStartNeverPublishesCandidate() async throws {
     let candidate = AppRuntimeStartBarrierWire()
     let wire = OSAccountRuntimeWireSession(sessionFactory: { candidate })
@@ -423,6 +649,8 @@ private actor AppRuntimeFakeWire: AppRuntimeWireSession {
   private var unaryReplies: [RuntimeReplyV2]
   private var synchronizedReplies: [[RuntimeReplyV2]]
   private let timeline: AppRuntimeTestTimeline?
+  private let blockUnaryReply: Bool
+  private let blockClose: Bool
   private var requestKinds: [String] = []
   private var synchronizedRequests = 0
   private var closes = 0
@@ -430,16 +658,26 @@ private actor AppRuntimeFakeWire: AppRuntimeWireSession {
   private var concurrentStreamReads = 0
   private var maximumStreamReads = 0
   private var streamWaiter: CheckedContinuation<LocalRuntimeStreamFrame, Error>?
+  private var unaryRequestBlocked = false
+  private var unaryReplyReleased = false
+  private var unaryReplyContinuation: CheckedContinuation<Void, Never>?
+  private var closeBlocked = false
+  private var closeReleased = false
+  private var closeContinuation: CheckedContinuation<Void, Never>?
   private var closed = false
 
   init(
     unaryReplies: [RuntimeReplyV2] = [],
     synchronizedReplies: [[RuntimeReplyV2]] = [],
-    timeline: AppRuntimeTestTimeline? = nil
+    timeline: AppRuntimeTestTimeline? = nil,
+    blockUnaryReply: Bool = false,
+    blockClose: Bool = false
   ) {
     self.unaryReplies = unaryReplies
     self.synchronizedReplies = synchronizedReplies
     self.timeline = timeline
+    self.blockUnaryReply = blockUnaryReply
+    self.blockClose = blockClose
   }
 
   func start() async throws {
@@ -456,7 +694,16 @@ private actor AppRuntimeFakeWire: AppRuntimeWireSession {
         message: "fake unary reply missing"
       )
     }
-    return unaryReplies.removeFirst()
+    let reply = unaryReplies.removeFirst()
+    if blockUnaryReply {
+      unaryRequestBlocked = true
+      if !unaryReplyReleased {
+        await withCheckedContinuation { continuation in
+          unaryReplyContinuation = continuation
+        }
+      }
+    }
+    return reply
   }
 
   func beginAppSynchronizedRequest(
@@ -501,6 +748,16 @@ private actor AppRuntimeFakeWire: AppRuntimeWireSession {
       )
     )
     streamWaiter = nil
+    if blockClose, !closeReleased {
+      closeBlocked = true
+      await withCheckedContinuation { continuation in
+        if closeReleased {
+          continuation.resume()
+        } else {
+          closeContinuation = continuation
+        }
+      }
+    }
   }
 
   func emitStream(messageID: String) {
@@ -513,12 +770,50 @@ private actor AppRuntimeFakeWire: AppRuntimeWireSession {
     streamWaiter = nil
   }
 
+  func failStream() {
+    streamWaiter?.resume(
+      throwing: RuntimeEnvelopeClientFailure(
+        code: "test.stream.failed",
+        message: "fake stream failed"
+      )
+    )
+    streamWaiter = nil
+  }
+
   func waitForStreamReads(_ expected: Int) async throws {
     for _ in 0..<1_000 {
       if streamReads >= expected { return }
       await Task.yield()
     }
     throw AppRuntimeTestError.timeout
+  }
+
+  func waitUntilUnaryRequestBlocked() async throws {
+    for _ in 0..<1_000 {
+      if unaryRequestBlocked { return }
+      await Task.yield()
+    }
+    throw AppRuntimeTestError.timeout
+  }
+
+  func waitUntilCloseBlocked() async throws {
+    for _ in 0..<1_000 {
+      if closeBlocked { return }
+      await Task.yield()
+    }
+    throw AppRuntimeTestError.timeout
+  }
+
+  func releaseUnaryReply() {
+    unaryReplyReleased = true
+    unaryReplyContinuation?.resume()
+    unaryReplyContinuation = nil
+  }
+
+  func releaseClose() {
+    closeReleased = true
+    closeContinuation?.resume()
+    closeContinuation = nil
   }
 
   func synchronizedRequestCount() -> Int { synchronizedRequests }
@@ -540,6 +835,110 @@ private actor AppRuntimeFakeReplySequence: AppRuntimeWireReplySequence {
   }
 
   func cancel() async {}
+}
+
+private actor AppRuntimeBlockingReplySequence: AppRuntimeWireReplySequence {
+  private let terminal: RuntimeSyncCompleteV1
+  private var nextIndex = 0
+  private var terminalBlocked = false
+  private var terminalReleased = false
+  private var terminalContinuation: CheckedContinuation<Void, Never>?
+
+  init(conversationID: RuntimeConversationID) throws {
+    terminal = try syncComplete(conversationID: conversationID)
+  }
+
+  func next() async throws -> RuntimeReplyV2? {
+    switch nextIndex {
+    case 0:
+      nextIndex = 1
+      return .subscription(
+        .subscribed(streamGeneration: RuntimeStreamGeneration(rawValue: "generation-1"))
+      )
+    case 1:
+      nextIndex = 2
+      terminalBlocked = true
+      if !terminalReleased {
+        await withCheckedContinuation { continuation in
+          terminalContinuation = continuation
+        }
+      }
+      return .syncComplete(terminal)
+    default:
+      return nil
+    }
+  }
+
+  func cancel() {
+    releaseTerminal()
+  }
+
+  func waitUntilTerminalBlocked() async throws {
+    for _ in 0..<1_000 {
+      if terminalBlocked { return }
+      await Task.yield()
+    }
+    throw AppRuntimeTestError.timeout
+  }
+
+  func releaseTerminal() {
+    terminalReleased = true
+    terminalContinuation?.resume()
+    terminalContinuation = nil
+  }
+}
+
+private actor AppRuntimeConcurrentControlWire: AppRuntimeWireSession {
+  private let sequence: AppRuntimeBlockingReplySequence
+  private var requestKinds: [String] = []
+  private var streamContinuation: CheckedContinuation<LocalRuntimeStreamFrame, Error>?
+  private var closed = false
+
+  init(sequence: AppRuntimeBlockingReplySequence) {
+    self.sequence = sequence
+  }
+
+  func start() async throws {}
+
+  func request(_ request: RuntimeRequestV2) async throws -> RuntimeReplyV2 {
+    requestKinds.append(request.testKind)
+    switch request {
+    case .resolveApproval(_, _, let approvalID, _):
+      return .approval(.applied(approvalID))
+    case .configureConversation(let configuration):
+      return .configuration(
+        .applied(
+          conversationID: configuration.conversationID,
+          configurationRevision: 1
+        )
+      )
+    default:
+      throw AppRuntimeTestError.unexpectedRequest
+    }
+  }
+
+  func beginAppSynchronizedRequest(
+    _ request: RuntimeRequestV2
+  ) async throws -> any AppRuntimeWireReplySequence {
+    guard case .subscribe = request else { throw AppRuntimeTestError.unexpectedRequest }
+    return sequence
+  }
+
+  func nextStream() async throws -> LocalRuntimeStreamFrame {
+    guard !closed else { throw AppRuntimeTestError.closed }
+    return try await withCheckedThrowingContinuation { continuation in
+      streamContinuation = continuation
+    }
+  }
+
+  func close() {
+    guard !closed else { return }
+    closed = true
+    streamContinuation?.resume(throwing: AppRuntimeTestError.closed)
+    streamContinuation = nil
+  }
+
+  func controlRequestKinds() -> [String] { requestKinds }
 }
 
 private actor AppRuntimeStartBarrierWire: AppRuntimeWireSession {
@@ -608,6 +1007,18 @@ private actor AppRuntimeTestTimeline {
   func values() -> [String] { entries }
 }
 
+private actor AppRuntimeCloseCompletionProbe {
+  private var completed = false
+
+  func markCompleted() {
+    completed = true
+  }
+
+  func isCompleted() -> Bool {
+    completed
+  }
+}
+
 private actor AppRuntimePublishedReplyProbe {
   private var publishedCount = 0
 
@@ -659,9 +1070,20 @@ private final class AppRuntimeMainActorHandlerProbe {
   }
 }
 
+@MainActor
+private final class AppRuntimeTerminationProbe {
+  private(set) var count = 0
+
+  func record() {
+    count += 1
+  }
+}
+
 private enum AppRuntimeTestError: Error {
+  case closed
   case handlerFailure
   case timeout
+  case unexpectedRequest
 }
 
 extension RuntimeRequestV2 {
@@ -670,6 +1092,7 @@ extension RuntimeRequestV2 {
     case .describeAgents: "describeAgents"
     case .catalog(let cursor): "catalog.\(cursor?.rawValue ?? "nil")"
     case .subscribe: "subscribe"
+    case .unsubscribe: "unsubscribe"
     case .backfill: "backfill"
     case .start: "start"
     case .configureConversation: "configureConversation"

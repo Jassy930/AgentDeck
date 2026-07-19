@@ -294,6 +294,172 @@ final class LocalRuntimeWireSessionTests: XCTestCase {
     await harness.session.close()
     XCTAssertNil(try harness.peer.readLine(from: connection))
   }
+
+  @MainActor
+  func testSessionModelUsesFreshLocalWireForFirstActionAfterUDSEOF() async throws {
+    let first = try LocalRuntimeWireHarness(
+      messageIDs: [
+        "91111111-1111-4111-8111-111111111111",
+        "92222222-2222-4222-8222-222222222222",
+        "93333333-3333-4333-8333-333333333333",
+        "94444444-4444-4444-8444-444444444444",
+      ]
+    )
+    let second = try LocalRuntimeWireHarness(
+      messageIDs: [
+        "a1111111-1111-4111-8111-111111111111",
+        "a2222222-2222-4222-8222-222222222222",
+        "a3333333-3333-4333-8333-333333333333",
+        "a4444444-4444-4444-8444-444444444444",
+      ]
+    )
+    let firstEOFGate = LocalRuntimeWireGate()
+    let secondCompletionGate = LocalRuntimeWireGate()
+    let sessions: [any AppRuntimeWireSession] = [first.session, second.session]
+    var factoryConstructionCount = 0
+    let model = SessionModel(runtimeWireFactory: {
+      precondition(factoryConstructionCount < sessions.count)
+      defer { factoryConstructionCount += 1 }
+      return sessions[factoryConstructionCount]
+    })
+    defer {
+      model.teardown()
+      Task {
+        await firstEOFGate.release()
+        await secondCompletionGate.release()
+      }
+    }
+
+    let firstPeer = first.peer
+    let firstServer = Task.detached {
+      try await localRuntimeServeInitialCatalogSession(
+        peer: firstPeer,
+        closeGate: firstEOFGate
+      )
+    }
+    model.loadHistory()
+    try await localRuntimeWaitUntilGateEntered(firstEOFGate)
+    try await localRuntimeWaitUntil { !model.isLoadingHistory }
+    XCTAssertNil(model.historyErrorMessage)
+    XCTAssertEqual(factoryConstructionCount, 1)
+
+    await firstEOFGate.release()
+    try await firstServer.value
+    try await localRuntimeWaitUntil {
+      model.warningMessage == "Local daemon connection closed; the next action will reconnect"
+    }
+    let firstFault = await first.session.fault()
+    XCTAssertEqual(firstFault?.code, "daemon.client.connection_closed")
+    XCTAssertEqual(factoryConstructionCount, 1, "idle EOF must not hot-loop a replacement")
+
+    let secondPeer = second.peer
+    let secondServer = Task.detached {
+      try await localRuntimeServeReconnectCatalogSession(
+        peer: secondPeer,
+        closeGate: secondCompletionGate
+      )
+    }
+    model.loadHistory()
+    try await localRuntimeWaitUntilGateEntered(secondCompletionGate)
+    try await localRuntimeWaitUntil { !model.isLoadingHistory }
+
+    XCTAssertNil(model.historyErrorMessage)
+    XCTAssertEqual(factoryConstructionCount, 2)
+    model.teardown()
+    await secondCompletionGate.release()
+    try await secondServer.value
+  }
+}
+
+private func localRuntimeServeInitialCatalogSession(
+  peer: LocalRuntimeWirePeer,
+  closeGate: LocalRuntimeWireGate
+) async throws {
+  let connection = try peer.acceptRuntimeConnection()
+  defer { Darwin.close(connection) }
+
+  let describe = try peer.readRequest(from: connection)
+  guard case .describeAgents = describe.request else {
+    throw localRuntimeUnexpectedRequest("DescribeAgents")
+  }
+  try peer.writeReply(
+    .agents(try RuntimeAgentDescriptionsV2(agents: [])),
+    to: describe.envelope,
+    on: connection
+  )
+
+  let catalog = try peer.readRequest(from: connection)
+  guard case .catalog = catalog.request else {
+    throw localRuntimeUnexpectedRequest("Catalog")
+  }
+  try peer.writeReply(
+    .catalog(
+      try RuntimeCatalogSnapshotV2(
+        baseCatalogCursor: .beforeFirst,
+        entries: [],
+        nextPageCursor: nil
+      )
+    ),
+    to: catalog.envelope,
+    on: connection
+  )
+
+  try peer.replyToCatalogSynchronization(from: connection, expectsBackfill: false)
+  await closeGate.enterAndWait()
+}
+
+private func localRuntimeServeReconnectCatalogSession(
+  peer: LocalRuntimeWirePeer,
+  closeGate: LocalRuntimeWireGate
+) async throws {
+  let connection = try peer.acceptRuntimeConnection()
+  defer { Darwin.close(connection) }
+
+  let describe = try peer.readRequest(from: connection)
+  guard case .describeAgents = describe.request else {
+    throw localRuntimeUnexpectedRequest("DescribeAgents after reconnect")
+  }
+  try peer.writeReply(
+    .agents(try RuntimeAgentDescriptionsV2(agents: [])),
+    to: describe.envelope,
+    on: connection
+  )
+
+  try peer.replyToCatalogSynchronization(from: connection, expectsBackfill: false)
+  try peer.replyToCatalogSynchronization(from: connection, expectsBackfill: true)
+  await closeGate.enterAndWait()
+}
+
+@MainActor
+private func localRuntimeWaitUntil(
+  _ predicate: @escaping @MainActor () -> Bool
+) async throws {
+  for _ in 0..<400 {
+    if predicate() { return }
+    try await Task.sleep(for: .milliseconds(5))
+  }
+  throw RuntimeEnvelopeClientFailure(
+    code: "test.timeout",
+    message: "SessionModel did not reach the expected UDS state"
+  )
+}
+
+private func localRuntimeWaitUntilGateEntered(_ gate: LocalRuntimeWireGate) async throws {
+  for _ in 0..<400 {
+    if await gate.hasEntered() { return }
+    try await Task.sleep(for: .milliseconds(5))
+  }
+  throw RuntimeEnvelopeClientFailure(
+    code: "test.timeout",
+    message: "scripted UDS peer did not reach its completion gate"
+  )
+}
+
+private func localRuntimeUnexpectedRequest(_ expected: String) -> RuntimeEnvelopeClientFailure {
+  RuntimeEnvelopeClientFailure(
+    code: "test.unexpected_request",
+    message: "expected \(expected) Runtime request"
+  )
 }
 
 private struct LocalRuntimeWireHarness {
@@ -380,6 +546,8 @@ private actor LocalRuntimeWireGate {
     await withCheckedContinuation { enterWaiters.append($0) }
   }
 
+  func hasEntered() -> Bool { entered }
+
   func release() {
     let waiters = releaseWaiters
     releaseWaiters.removeAll(keepingCapacity: false)
@@ -415,6 +583,91 @@ private final class LocalRuntimeWirePeer: @unchecked Sendable {
     let connection = accept(listener, nil, nil)
     guard connection >= 0 else { throw Self.posixError() }
     return connection
+  }
+
+  func acceptRuntimeConnection() throws -> Int32 {
+    let connection = try acceptConnection()
+    do {
+      _ = try readLine(from: connection)
+      let hello = try readEnvelope(from: connection)
+      guard case .request(.hello(let version)) = hello.body,
+        version == runtimeProtocolVersionCurrent
+      else {
+        throw localRuntimeUnexpectedRequest("Hello")
+      }
+      try writeEnvelope(
+        RuntimeEnvelopeV2(
+          version: runtimeProtocolVersionCurrent,
+          messageID: hello.messageID,
+          body: .reply(.hello(runtimeProtocolVersion: runtimeProtocolVersionCurrent))
+        ),
+        to: connection
+      )
+      return connection
+    } catch {
+      Darwin.close(connection)
+      throw error
+    }
+  }
+
+  func readRequest(
+    from descriptor: Int32
+  ) throws -> (envelope: RuntimeEnvelopeV2, request: RuntimeRequestV2) {
+    let envelope = try readEnvelope(from: descriptor)
+    guard case .request(let request) = envelope.body else {
+      throw localRuntimeUnexpectedRequest("request envelope")
+    }
+    return (envelope, request)
+  }
+
+  func writeReply(
+    _ reply: RuntimeReplyV2,
+    to request: RuntimeEnvelopeV2,
+    on descriptor: Int32
+  ) throws {
+    try writeEnvelope(
+      RuntimeEnvelopeV2(
+        version: runtimeProtocolVersionCurrent,
+        messageID: request.messageID,
+        body: .reply(reply)
+      ),
+      to: descriptor
+    )
+  }
+
+  func replyToCatalogSynchronization(
+    from descriptor: Int32,
+    expectsBackfill: Bool
+  ) throws {
+    let synchronization = try readRequest(from: descriptor)
+    let cursor: RuntimeStreamCursorV1
+    if expectsBackfill {
+      guard case .backfill(.catalog(let backfillCursor)) = synchronization.request else {
+        throw localRuntimeUnexpectedRequest("Catalog Backfill")
+      }
+      cursor = backfillCursor
+    } else {
+      guard case .subscribe(let innerCursor) = synchronization.request,
+        case .catalog(let catalogCursor) = innerCursor
+      else {
+        throw localRuntimeUnexpectedRequest("Catalog Subscribe")
+      }
+      cursor = catalogCursor
+      try writeReply(
+        .subscription(
+          .subscribed(
+            streamGeneration: RuntimeStreamGeneration(rawValue: "generation-uds-eof")
+          )
+        ),
+        to: synchronization.envelope,
+        on: descriptor
+      )
+    }
+    try writeReply(
+      .syncComplete(try localRuntimeCatalogSyncComplete(cursor: cursor)),
+      to: synchronization.envelope,
+      on: descriptor
+    )
   }
 
   func readLine(from descriptor: Int32) throws -> String? {
@@ -569,4 +822,26 @@ private final class LocalRuntimeWirePeer: @unchecked Sendable {
 
 private func localRuntimeJSONData(_ object: Any) throws -> Data {
   try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+}
+
+private func localRuntimeCatalogSyncComplete(
+  cursor: RuntimeStreamCursorV1
+) throws -> RuntimeSyncCompleteV1 {
+  let cursorObject: Any =
+    switch cursor {
+    case .beforeFirst: "beforeFirst"
+    case .at(let sequence): ["at": sequence]
+    }
+  return try JSONDecoder().decode(
+    RuntimeSyncCompleteV1.self,
+    from: try localRuntimeJSONData([
+      "streamGeneration": "generation-uds-eof",
+      "streamCursor": cursorObject,
+      "innerCursor": [
+        "scope": "catalog",
+        "cursor": cursorObject,
+      ],
+      "keyDirectoryRevision": 0,
+    ])
+  )
 }

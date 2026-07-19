@@ -342,7 +342,10 @@ final class ThreadRuntimeModelCanonicalTests: XCTestCase {
     )
     XCTAssertEqual(model.phase, .running)
     let queuedKey = RuntimeIdempotencyKey(rawValue: "prompt:approval-queue")
-    XCTAssertNil(model.enqueuePrompt("queued", idempotencyKey: queuedKey))
+    XCTAssertEqual(
+      model.enqueuePrompt("queued", idempotencyKey: queuedKey),
+      .drainNextPrompt(prompt: "queued", idempotencyKey: queuedKey)
+    )
     let action = try model.apply(
       event(
         conversationID: id,
@@ -352,14 +355,34 @@ final class ThreadRuntimeModelCanonicalTests: XCTestCase {
         body: .turnCompleted(turnID: turn, summary: try turnSummary())
       )
     )
-    XCTAssertEqual(
-      action,
-      .drainNextPrompt(prompt: "queued", idempotencyKey: queuedKey)
+    XCTAssertNil(action)
+    XCTAssertEqual(model.pendingPromptAdmissions, ["queued"])
+    let queuedCommand = commandID("command-queued-next")
+    XCTAssertNil(
+      model.acknowledgeQueuedPrompt(
+        "queued",
+        idempotencyKey: queuedKey,
+        receipt: .accepted(
+          commandID: queuedCommand,
+          queuePosition: 1,
+          configurationRevision: 1
+        )
+      )
     )
+    XCTAssertTrue(model.pendingPromptAdmissions.isEmpty)
     XCTAssertEqual(model.queuedPrompts, ["queued"])
-    XCTAssertNil(model.acknowledgeQueuedPrompt("queued", idempotencyKey: queuedKey))
-    XCTAssertTrue(model.queuedPrompts.isEmpty)
     XCTAssertEqual(model.phase, .ready)
+
+    try model.apply(
+      event(
+        conversationID: id,
+        sequence: 6,
+        eventID: "event-queued-start",
+        commandID: queuedCommand,
+        body: .turnStarted(turnID: turnID("turn-queued-next"))
+      )
+    )
+    XCTAssertTrue(model.queuedPrompts.isEmpty)
   }
 
   func testClaudeConfigurationDrivesUIBridgeAndAgentMismatchIsAtomic() throws {
@@ -742,7 +765,10 @@ final class ThreadRuntimeModelCanonicalTests: XCTestCase {
       )
     )
     let queuedKey = RuntimeIdempotencyKey(rawValue: "prompt:sync-queue")
-    XCTAssertNil(model.enqueuePrompt("queued", idempotencyKey: queuedKey))
+    XCTAssertEqual(
+      model.enqueuePrompt("queued", idempotencyKey: queuedKey),
+      .drainNextPrompt(prompt: "queued", idempotencyKey: queuedKey)
+    )
     let terminal = try event(
       conversationID: id,
       sequence: 1,
@@ -762,16 +788,258 @@ final class ThreadRuntimeModelCanonicalTests: XCTestCase {
       terminalCursor: .at(1)
     )
 
-    XCTAssertEqual(
-      action,
-      .drainNextPrompt(prompt: "queued", idempotencyKey: queuedKey)
+    XCTAssertNil(action)
+    XCTAssertEqual(model.pendingPromptAdmissions, ["queued"])
+    XCTAssertNil(
+      model.acknowledgeQueuedPrompt(
+        "queued",
+        idempotencyKey: queuedKey,
+        receipt: .accepted(
+          commandID: commandID("command-sync-queued"),
+          queuePosition: 1,
+          configurationRevision: 1
+        )
+      )
     )
+    XCTAssertTrue(model.pendingPromptAdmissions.isEmpty)
     XCTAssertEqual(model.queuedPrompts, ["queued"])
-    XCTAssertNil(model.acknowledgeQueuedPrompt("queued", idempotencyKey: queuedKey))
-    XCTAssertTrue(model.queuedPrompts.isEmpty)
     XCTAssertEqual(model.phase, .ready)
     XCTAssertEqual(model.cursor, .at(1))
     XCTAssertEqual(model.unreadEventCount, 1)
+  }
+
+  func testRunningPromptAdmissionIsImmediateAndLocallyBounded() throws {
+    let model = try ThreadRuntimeModel(
+      conversationID: conversationID("conversation-prompt-admission"),
+      agentKind: .codex,
+      cwd: nil,
+      initialPhase: .running
+    )
+
+    let firstAction = model.enqueuePrompt(
+      "first",
+      idempotencyKey: RuntimeIdempotencyKey(rawValue: "prompt:bounded:0")
+    )
+    XCTAssertEqual(
+      firstAction,
+      .drainNextPrompt(
+        prompt: "first",
+        idempotencyKey: RuntimeIdempotencyKey(rawValue: "prompt:bounded:0")
+      ),
+      "running prompt 必须立即进入 daemon admission，不能等待 turn terminal"
+    )
+
+    XCTAssertNil(
+      model.enqueuePrompt(
+        "must-be-rejected",
+        idempotencyKey: RuntimeIdempotencyKey(rawValue: "prompt:bounded:overflow")
+      )
+    )
+    XCTAssertEqual(model.pendingPromptAdmissions, ["first"])
+    XCTAssertNotNil(model.warningMessage)
+  }
+
+  func testReplayedAdmissionProjectsQueuedUntilCanonicalEvidenceArrives() throws {
+    let model = try ThreadRuntimeModel(
+      conversationID: conversationID("conversation-replayed-admission"),
+      agentKind: .codex,
+      cwd: nil,
+      initialPhase: .ready
+    )
+    let key = RuntimeIdempotencyKey(rawValue: "prompt:replayed-admission")
+    let command = commandID("command-replayed-admission")
+    try model.apply(
+      snapshot(
+        conversationID: model.conversationID,
+        baseCursor: .beforeFirst,
+        items: []
+      )
+    )
+    XCTAssertEqual(
+      model.enqueuePrompt("replayed prompt", idempotencyKey: key),
+      .drainNextPrompt(prompt: "replayed prompt", idempotencyKey: key)
+    )
+
+    XCTAssertNil(
+      model.acknowledgeQueuedPrompt(
+        "replayed prompt",
+        idempotencyKey: key,
+        receipt: .replayed(commandID: command, configurationRevision: 1)
+      )
+    )
+
+    XCTAssertTrue(model.pendingPromptAdmissions.isEmpty)
+    XCTAssertEqual(model.queuedPrompts, ["replayed prompt"])
+
+    try model.apply(
+      event(
+        conversationID: model.conversationID,
+        sequence: 0,
+        eventID: "event-replayed-start",
+        commandID: command,
+        body: .turnStarted(turnID: turnID("turn-replayed-admission"))
+      )
+    )
+    XCTAssertTrue(model.queuedPrompts.isEmpty)
+  }
+
+  func testReplayedReceiptUsesCanonicalSnapshotEvidenceAfterTerminalMarkerChanges() throws {
+    let model = try ThreadRuntimeModel(
+      conversationID: conversationID("conversation-replayed-snapshot"),
+      agentKind: .codex,
+      cwd: nil,
+      initialPhase: .ready
+    )
+    let command = commandID("command-old-canonical")
+    let key = RuntimeIdempotencyKey(rawValue: "prompt:replayed-snapshot")
+    try model.apply(
+      ConversationSnapshotV2(
+        conversationID: model.conversationID,
+        baseEventCursor: .at(4),
+        configurationState: try unconfiguredState(),
+        items: [
+          .capabilities(try capabilities(agentKind: .codex)),
+          .item(
+            itemID: itemID("item-old-canonical"),
+            entityID: entityID("entity-old-canonical"),
+            commandID: command,
+            item: .userMessage(text: "already canonical", meta: RuntimeAgentItemMetaV1())
+          ),
+        ]
+      )
+    )
+    XCTAssertEqual(
+      model.enqueuePrompt("already canonical", idempotencyKey: key),
+      .drainNextPrompt(prompt: "already canonical", idempotencyKey: key)
+    )
+    model.phase = .starting
+
+    XCTAssertNil(
+      model.acknowledgeQueuedPrompt(
+        "already canonical",
+        idempotencyKey: key,
+        receipt: .replayed(commandID: command, configurationRevision: 1)
+      )
+    )
+
+    XCTAssertEqual(model.phase, .ready)
+    XCTAssertTrue(model.pendingPromptAdmissions.isEmpty)
+    XCTAssertTrue(model.queuedPrompts.isEmpty)
+  }
+
+  func testFailedAdmissionStopsSendingAndRequiresExplicitIntent() throws {
+    let model = try ThreadRuntimeModel(
+      conversationID: conversationID("conversation-failed-admission"),
+      agentKind: .codex,
+      cwd: nil,
+      initialPhase: .ready
+    )
+    let originalKey = RuntimeIdempotencyKey(rawValue: "prompt:failed:original")
+    XCTAssertEqual(
+      model.enqueuePrompt("retry me", idempotencyKey: originalKey),
+      .drainNextPrompt(prompt: "retry me", idempotencyKey: originalKey)
+    )
+
+    XCTAssertTrue(
+      model.failQueuedPromptDispatch("retry me", idempotencyKey: originalKey)
+    )
+
+    XCTAssertTrue(
+      model.pendingPromptAdmissions.isEmpty,
+      "失败 admission 必须退出 sending，不得继续留在 pending FIFO"
+    )
+    XCTAssertEqual(model.retryRequiredPrompt, "retry me")
+
+    let ignoredFreshKey = RuntimeIdempotencyKey(rawValue: "prompt:failed:fresh-same")
+    XCTAssertEqual(
+      model.enqueuePrompt("retry me", idempotencyKey: ignoredFreshKey),
+      .drainNextPrompt(prompt: "retry me", idempotencyKey: originalKey),
+      "明确重提相同文本必须复用原 idempotency key"
+    )
+    XCTAssertNil(model.retryRequiredPrompt)
+    XCTAssertTrue(
+      model.failQueuedPromptDispatch("retry me", idempotencyKey: originalKey)
+    )
+
+    let newIntentKey = RuntimeIdempotencyKey(rawValue: "prompt:failed:new-intent")
+    XCTAssertEqual(
+      model.enqueuePrompt("new intent", idempotencyKey: newIntentKey),
+      .drainNextPrompt(prompt: "new intent", idempotencyKey: newIntentKey)
+    )
+    XCTAssertNil(model.retryRequiredPrompt)
+    XCTAssertEqual(model.pendingPromptAdmissions, ["new intent"])
+  }
+
+  func testDefinitiveFailureRetainsDraftButUsesFreshRetryKey() throws {
+    let model = try ThreadRuntimeModel(
+      conversationID: conversationID("conversation-definitive-failure"),
+      agentKind: .codex,
+      cwd: nil,
+      initialPhase: .ready
+    )
+    let originalKey = RuntimeIdempotencyKey(rawValue: "prompt:definitive:original")
+    let freshKey = RuntimeIdempotencyKey(rawValue: "prompt:definitive:fresh")
+    XCTAssertEqual(
+      model.enqueuePrompt("retry with fresh key", idempotencyKey: originalKey),
+      .drainNextPrompt(prompt: "retry with fresh key", idempotencyKey: originalKey)
+    )
+    XCTAssertTrue(
+      model.failQueuedPromptDispatch(
+        "retry with fresh key",
+        idempotencyKey: originalKey,
+        reuseIdempotencyKey: false
+      )
+    )
+    XCTAssertEqual(model.retryRequiredPrompt, "retry with fresh key")
+
+    XCTAssertEqual(
+      model.enqueuePrompt("retry with fresh key", idempotencyKey: freshKey),
+      .drainNextPrompt(prompt: "retry with fresh key", idempotencyKey: freshKey)
+    )
+  }
+
+  func testPromptAdmissionProtocolAndCombinedCountByteLimits() throws {
+    let model = try ThreadRuntimeModel(
+      conversationID: conversationID("conversation-prompt-bytes"),
+      agentKind: .codex,
+      cwd: nil,
+      initialPhase: .running
+    )
+    let maxPrompt = String(
+      repeating: "x",
+      count: RuntimePromptPayloadV1.maxUTF8Bytes
+    )
+    let oversizedPrompt = maxPrompt + "x"
+
+    XCTAssertNil(
+      model.enqueuePrompt(
+        oversizedPrompt,
+        idempotencyKey: RuntimeIdempotencyKey(rawValue: "prompt:bytes:oversized")
+      )
+    )
+    XCTAssertTrue(model.pendingPromptAdmissions.isEmpty)
+    XCTAssertNotNil(model.warningMessage)
+
+    XCTAssertEqual(
+      model.enqueuePrompt(
+        maxPrompt,
+        idempotencyKey: RuntimeIdempotencyKey(rawValue: "prompt:bytes:0")
+      ),
+      .drainNextPrompt(
+        prompt: maxPrompt,
+        idempotencyKey: RuntimeIdempotencyKey(rawValue: "prompt:bytes:0")
+      )
+    )
+    XCTAssertEqual(model.pendingPromptAdmissions.count, 1)
+
+    XCTAssertNil(
+      model.enqueuePrompt(
+        "one-byte-over-local-budget",
+        idempotencyKey: RuntimeIdempotencyKey(rawValue: "prompt:bytes:overflow")
+      )
+    )
+    XCTAssertEqual(model.pendingPromptAdmissions.count, 1)
+    XCTAssertNotNil(model.warningMessage)
   }
 
   private func snapshot(

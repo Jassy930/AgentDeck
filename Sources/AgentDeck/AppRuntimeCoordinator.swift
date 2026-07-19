@@ -37,11 +37,14 @@ enum AppRuntimeInbound: Sendable {
 typealias AppRuntimeInboundHandler =
   @MainActor @Sendable (AppRuntimeInbound) async throws -> Void
 
+typealias AppRuntimeTerminationHandler = @MainActor @Sendable () async -> Void
+
 enum AppRuntimeOperation: String, Equatable, Sendable {
   case describeAgents
   case catalog
   case startConversation
   case configureConversation
+  case unsubscribe
   case subscribe
   case backfill
   case sendPrompt
@@ -123,10 +126,23 @@ struct AppRuntimeConversationStartResult: Sendable {
   let promptReceipt: CommandReceiptV2?
 }
 
+enum AppRuntimeConversationStartStage: Equatable, Sendable {
+  case start
+  case configure
+  case synchronize
+  case prompt
+}
+
+struct AppRuntimeConversationStartFailure: Error, @unchecked Sendable {
+  let stage: AppRuntimeConversationStartStage
+  let underlying: any Error
+  let partialResult: AppRuntimeConversationStartResult?
+}
+
 /// Runtime v2 的 App-level sequencing owner。
 ///
 /// - 只有这个 actor 调用 `nextStream()`；
-/// - control operation 在 actor reentrancy 期间仍保持单飞；
+/// - Subscribe/Backfill 在 actor reentrancy 期间保持单飞，messageId 相关的 unary control 可并行；
 /// - Subscribe/Backfill 的 snapshot/backfill/terminal 全部消费后才开放 stream gate；
 /// - close 只关闭当前 wire，不发送 daemon shutdown 或隐式 unsubscribe。
 actor AppRuntimeCoordinator {
@@ -148,24 +164,31 @@ actor AppRuntimeCoordinator {
 
   private let wire: any AppRuntimeWireSession
   private let inboundHandler: AppRuntimeInboundHandler
+  private let terminationHandler: AppRuntimeTerminationHandler
   private var state = State.idle
-  private var controlOperationActive = false
+  private var lifecycleGeneration: UInt64 = 0
+  private var synchronizationOperationActive = false
   private var synchronizationActive = false
   private var streamGateWaiter: CheckedContinuation<Void, Never>?
   private var streamPump: Task<Void, Never>?
+  private var wireCloseTask: Task<Void, Never>?
   private var firstStreamFailure: (any Error)?
+  private var didNotifyUnexpectedTermination = false
 
   init(
     wire: any AppRuntimeWireSession,
-    inboundHandler: @escaping AppRuntimeInboundHandler
+    inboundHandler: @escaping AppRuntimeInboundHandler,
+    terminationHandler: @escaping AppRuntimeTerminationHandler = {}
   ) {
     self.wire = wire
     self.inboundHandler = inboundHandler
+    self.terminationHandler = terminationHandler
   }
 
   func start() async throws {
     switch state {
     case .idle:
+      lifecycleGeneration &+= 1
       state = .starting
     case .starting, .running:
       throw AppRuntimeCoordinatorError.alreadyStarted
@@ -180,11 +203,11 @@ actor AppRuntimeCoordinator {
         state = .idle
         throw error
       }
-      await wire.close()
+      await finishClosing()
       throw AppRuntimeCoordinatorError.closed
     }
     guard state == .starting else {
-      await wire.close()
+      await finishClosing()
       throw AppRuntimeCoordinatorError.closed
     }
     state = .running
@@ -194,8 +217,7 @@ actor AppRuntimeCoordinator {
   }
 
   func describeAgents() async throws -> RuntimeAgentDescriptionsV2 {
-    try beginControlOperation()
-    defer { endControlOperation() }
+    try requireRunning()
     let reply = try await request(.describeAgents)
     guard case .agents(let agents) = reply else {
       throw unexpected(
@@ -210,8 +232,7 @@ actor AppRuntimeCoordinator {
   /// 读取一个固定 barrier 的完整 Catalog pagination。页数与每页大小都有硬上界，
   /// repeated cursor 在发起重复请求前 fail-close。
   func loadCatalog() async throws -> [RuntimeCatalogSnapshotV2] {
-    try beginControlOperation()
-    defer { endControlOperation() }
+    try requireRunning()
 
     var pages: [RuntimeCatalogSnapshotV2] = []
     pages.reserveCapacity(4)
@@ -238,48 +259,99 @@ actor AppRuntimeCoordinator {
   func startConversation(
     _ draft: RuntimeConversationDraft
   ) async throws -> AppRuntimeConversationStartResult {
-    try beginControlOperation()
-    defer { endControlOperation() }
+    do {
+      try beginSynchronizationOperation()
+    } catch {
+      throw AppRuntimeConversationStartFailure(
+        stage: .start,
+        underlying: error,
+        partialResult: nil
+      )
+    }
+    defer { endSynchronizationOperation() }
 
-    let startReply = try await request(draft.startRequest)
+    let startReply: RuntimeReplyV2
+    do {
+      startReply = try await request(draft.startRequest)
+    } catch {
+      throw AppRuntimeConversationStartFailure(
+        stage: .start,
+        underlying: error,
+        partialResult: nil
+      )
+    }
     guard case .conversationStart(let startReceipt) = startReply else {
-      throw unexpected(
-        operation: .startConversation,
-        expected: .conversationStart,
-        actual: startReply
+      throw AppRuntimeConversationStartFailure(
+        stage: .start,
+        underlying: unexpected(
+          operation: .startConversation,
+          expected: .conversationStart,
+          actual: startReply
+        ),
+        partialResult: nil
       )
     }
     let conversationID = startReceipt.conversationID
-    let configurationReceipt = try await configureUnchecked(
-      draft.configureRequest(conversationID: conversationID)
-    )
-    switch configurationReceipt {
-    case .applied, .replayed:
-      break
-    case .conflict(let conflictID, let currentRevision):
-      throw AppRuntimeCoordinatorError.configurationConflict(
-        conversationID: conflictID,
-        currentRevision: currentRevision
+    let configurationReceipt: RuntimeConfigurationReceiptV2
+    do {
+      configurationReceipt = try await configureUnchecked(
+        draft.configureRequest(conversationID: conversationID)
       )
+    } catch {
+      throw AppRuntimeConversationStartFailure(
+        stage: .configure,
+        underlying: error,
+        partialResult: nil
+      )
+    }
+    switch configurationReceipt {
+    case .applied, .replayed, .conflict:
+      break
     case .failed:
       preconditionFailure("configureUnchecked must unwrap daemon Failure")
     }
 
-    let synchronization = try await synchronizeUnchecked(
-      draft.subscribeRequest(conversationID: conversationID),
-      operation: .subscribe,
-      target: .conversation(conversationID),
-      requiresSubscription: true
-    )
+    let synchronization: AppRuntimeSynchronizationResult
+    do {
+      synchronization = try await synchronizeUnchecked(
+        draft.subscribeRequest(conversationID: conversationID),
+        operation: .subscribe,
+        target: .conversation(conversationID),
+        requiresSubscription: true
+      )
+    } catch {
+      throw AppRuntimeConversationStartFailure(
+        stage: .synchronize,
+        underlying: error,
+        partialResult: nil
+      )
+    }
 
     let promptReceipt: CommandReceiptV2?
-    if let promptRequest = try draft.sendPromptRequest(
-      conversationID: conversationID,
-      configurationReceipt: configurationReceipt
-    ) {
-      promptReceipt = try await sendPromptUnchecked(promptRequest)
-    } else {
+    if case .conflict = configurationReceipt {
       promptReceipt = nil
+    } else {
+      do {
+        if let promptRequest = try draft.sendPromptRequest(
+          conversationID: conversationID,
+          configurationReceipt: configurationReceipt
+        ) {
+          promptReceipt = try await sendPromptUnchecked(promptRequest)
+        } else {
+          promptReceipt = nil
+        }
+      } catch {
+        throw AppRuntimeConversationStartFailure(
+          stage: .prompt,
+          underlying: error,
+          partialResult: AppRuntimeConversationStartResult(
+            conversationID: conversationID,
+            configurationReceipt: configurationReceipt,
+            synchronization: synchronization,
+            promptReceipt: nil
+          )
+        )
+      }
     }
     return AppRuntimeConversationStartResult(
       conversationID: conversationID,
@@ -295,8 +367,8 @@ actor AppRuntimeCoordinator {
     conversationID: RuntimeConversationID,
     cursor: RuntimeStreamCursorV1
   ) async throws -> AppRuntimeSynchronizationResult {
-    try beginControlOperation()
-    defer { endControlOperation() }
+    try beginSynchronizationOperation()
+    defer { endSynchronizationOperation() }
     return try await synchronizeUnchecked(
       .subscribe(
         innerCursor: .conversation(
@@ -314,8 +386,8 @@ actor AppRuntimeCoordinator {
     conversationID: RuntimeConversationID,
     after cursor: RuntimeStreamCursorV1
   ) async throws -> AppRuntimeSynchronizationResult {
-    try beginControlOperation()
-    defer { endControlOperation() }
+    try beginSynchronizationOperation()
+    defer { endSynchronizationOperation() }
     return try await synchronizeUnchecked(
       .backfill(.conversation(conversationID: conversationID, after: cursor)),
       operation: .backfill,
@@ -327,8 +399,8 @@ actor AppRuntimeCoordinator {
   func synchronizeCatalog(
     cursor: RuntimeStreamCursorV1
   ) async throws -> AppRuntimeSynchronizationResult {
-    try beginControlOperation()
-    defer { endControlOperation() }
+    try beginSynchronizationOperation()
+    defer { endSynchronizationOperation() }
     return try await synchronizeUnchecked(
       .subscribe(innerCursor: .catalog(cursor: cursor)),
       operation: .subscribe,
@@ -340,8 +412,8 @@ actor AppRuntimeCoordinator {
   func backfillCatalog(
     after cursor: RuntimeStreamCursorV1
   ) async throws -> AppRuntimeSynchronizationResult {
-    try beginControlOperation()
-    defer { endControlOperation() }
+    try beginSynchronizationOperation()
+    defer { endSynchronizationOperation() }
     return try await synchronizeUnchecked(
       .backfill(.catalog(after: cursor)),
       operation: .backfill,
@@ -353,9 +425,26 @@ actor AppRuntimeCoordinator {
   func configureConversation(
     _ configuration: RuntimeConfigureConversationRequestV2
   ) async throws -> RuntimeConfigurationReceiptV2 {
-    try beginControlOperation()
-    defer { endControlOperation() }
+    try requireRunning()
     return try await configureUnchecked(.configureConversation(configuration))
+  }
+
+  /// 释放当前 connection 上一个 conversation live subscription。只有 daemon 的
+  /// 精确 `Unsubscribed` ACK 到达后，调用方才可以从本地 live-slot 账本移除目标。
+  func unsubscribeConversation(
+    _ conversationID: RuntimeConversationID
+  ) async throws {
+    try requireRunning()
+    let reply = try await request(
+      .unsubscribe(target: .conversation(conversationID: conversationID))
+    )
+    guard case .subscription(.unsubscribed) = reply else {
+      throw unexpected(
+        operation: .unsubscribe,
+        expected: .subscription,
+        actual: reply
+      )
+    }
   }
 
   func sendPrompt(
@@ -364,8 +453,7 @@ actor AppRuntimeCoordinator {
     expectedConfigurationRevision: UInt64,
     prompt: RuntimePromptPayloadV1
   ) async throws -> CommandReceiptV2 {
-    try beginControlOperation()
-    defer { endControlOperation() }
+    try requireRunning()
     return try await sendPromptUnchecked(
       .sendPrompt(
         conversationID: conversationID,
@@ -382,8 +470,7 @@ actor AppRuntimeCoordinator {
     approvalID: RuntimeApprovalID,
     decision: RuntimeActionDecisionV1
   ) async throws -> ApprovalReceiptV1 {
-    try beginControlOperation()
-    defer { endControlOperation() }
+    try requireRunning()
     let reply = try await request(
       .resolveApproval(
         conversationID: conversationID,
@@ -408,8 +495,7 @@ actor AppRuntimeCoordinator {
   func updateConversationMetadata(
     _ mutation: RuntimeConversationMetadataMutationRequestV2
   ) async throws -> RuntimeConversationMetadataReceiptV2 {
-    try beginControlOperation()
-    defer { endControlOperation() }
+    try requireRunning()
     let reply = try await request(.updateConversationMetadata(mutation))
     guard case .conversationMetadata(let receipt) = reply else {
       throw unexpected(
@@ -426,11 +512,19 @@ actor AppRuntimeCoordinator {
     firstStreamFailure
   }
 
+  func requiresFreshConnection() -> Bool {
+    state == .closing || state == .closed
+  }
+
   func close() async {
     switch state {
-    case .closed, .closing:
+    case .closed:
+      return
+    case .closing:
+      await finishClosing()
       return
     case .idle, .starting, .running:
+      lifecycleGeneration &+= 1
       state = .closing
     }
     synchronizationActive = false
@@ -438,12 +532,15 @@ actor AppRuntimeCoordinator {
     streamGateWaiter = nil
     streamPump?.cancel()
     streamPump = nil
-    await wire.close()
-    state = .closed
+    await finishClosing()
   }
 
   private func request(_ request: RuntimeRequestV2) async throws -> RuntimeReplyV2 {
+    let generation = try runningGeneration()
+    try Task.checkCancellation()
     let reply = try await wire.request(request)
+    try requireRunning(generation: generation)
+    try Task.checkCancellation()
     if case .failure(let failure) = reply {
       throw Self.daemonFailure(failure)
     }
@@ -500,13 +597,19 @@ actor AppRuntimeCoordinator {
     target: SynchronizationTarget,
     requiresSubscription: Bool
   ) async throws -> AppRuntimeSynchronizationResult {
-    precondition(!synchronizationActive)
+    let generation = try runningGeneration()
+    try Task.checkCancellation()
+    guard synchronizationOperationActive, !synchronizationActive else {
+      throw AppRuntimeCoordinatorError.operationInProgress
+    }
     synchronizationActive = true
     defer { finishSynchronization() }
 
     var activeSequence: (any AppRuntimeWireReplySequence)?
     do {
       let sequence = try await wire.beginAppSynchronizedRequest(request)
+      try requireRunning(generation: generation)
+      try Task.checkCancellation()
       activeSequence = sequence
       var replies: [RuntimeReplyV2] = []
       replies.reserveCapacity(4)
@@ -514,6 +617,8 @@ actor AppRuntimeCoordinator {
       var terminal: RuntimeSyncCompleteV1?
 
       while let reply = try await sequence.next() {
+        try requireRunning(generation: generation)
+        try Task.checkCancellation()
         guard terminal == nil else {
           throw AppRuntimeCoordinatorError.replyAfterSynchronizationTerminal
         }
@@ -566,6 +671,8 @@ actor AppRuntimeCoordinator {
         }
         replies.append(reply)
       }
+      try requireRunning(generation: generation)
+      try Task.checkCancellation()
 
       if requiresSubscription, subscriptionGeneration == nil {
         throw AppRuntimeCoordinatorError.missingSubscriptionReceipt
@@ -578,6 +685,8 @@ actor AppRuntimeCoordinator {
       // 期间 synchronizationActive 仍为 true，因此 live stream 最多在 pump 内持有一帧。
       for reply in replies {
         try await inboundHandler(.synchronizedReply(reply))
+        try requireRunning(generation: generation)
+        try Task.checkCancellation()
       }
       return AppRuntimeSynchronizationResult(replies: replies, terminal: terminal)
     } catch {
@@ -631,16 +740,16 @@ actor AppRuntimeCoordinator {
     }
   }
 
-  private func beginControlOperation() throws {
+  private func beginSynchronizationOperation() throws {
     try requireRunning()
-    guard !controlOperationActive else {
+    guard !synchronizationOperationActive else {
       throw AppRuntimeCoordinatorError.operationInProgress
     }
-    controlOperationActive = true
+    synchronizationOperationActive = true
   }
 
-  private func endControlOperation() {
-    controlOperationActive = false
+  private func endSynchronizationOperation() {
+    synchronizationOperationActive = false
   }
 
   private func requireRunning() throws {
@@ -654,15 +763,32 @@ actor AppRuntimeCoordinator {
     }
   }
 
+  private func runningGeneration() throws -> UInt64 {
+    try requireRunning()
+    return lifecycleGeneration
+  }
+
+  private func requireRunning(generation: UInt64) throws {
+    guard state == .running, lifecycleGeneration == generation else {
+      throw AppRuntimeCoordinatorError.closed
+    }
+  }
+
   /// 同步序列或 MainActor publish 失败后不能继续把 live stream 叠加到不完整投影。
   /// 这里只 close 当前 client wire；不发送 daemon shutdown/unsubscribe。
   private func failSynchronizationClosed() async {
-    guard state == .running else { return }
-    state = .closing
-    streamPump?.cancel()
-    streamPump = nil
-    await wire.close()
-    state = .closed
+    switch state {
+    case .running:
+      lifecycleGeneration &+= 1
+      state = .closing
+      streamPump?.cancel()
+      streamPump = nil
+    case .closing:
+      break
+    case .idle, .starting, .closed:
+      return
+    }
+    await finishClosing()
   }
 
   private func finishSynchronization() {
@@ -695,11 +821,30 @@ actor AppRuntimeCoordinator {
         synchronizationActive = false
         streamGateWaiter?.resume()
         streamGateWaiter = nil
-        await wire.close()
-        state = .closed
+        await finishClosing()
+        await notifyUnexpectedTerminationIfNeeded()
         return
       }
     }
+  }
+
+  private func notifyUnexpectedTerminationIfNeeded() async {
+    guard !didNotifyUnexpectedTermination else { return }
+    didNotifyUnexpectedTermination = true
+    await terminationHandler()
+  }
+
+  private func finishClosing() async {
+    let task: Task<Void, Never>
+    if let wireCloseTask {
+      task = wireCloseTask
+    } else {
+      let wire = wire
+      task = Task { await wire.close() }
+      wireCloseTask = task
+    }
+    await task.value
+    state = .closed
   }
 
   private func unexpected(

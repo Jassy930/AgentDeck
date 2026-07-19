@@ -47,7 +47,7 @@ final class PreviewBootstrapTests: XCTestCase {
     XCTAssertFalse(model.workbench.runtimeList.isEmpty)
     let runtime = try XCTUnwrap(model.workbench.selectedRuntime)
     XCTAssertEqual(runtime.phase, .ready)
-    XCTAssertTrue(runtime.queuedPrompts.isEmpty)
+    XCTAssertTrue(runtime.pendingPromptAdmissions.isEmpty)
     XCTAssertTrue(runtime.items.contains(where: { $0.text == "preview prompt" }))
     XCTAssertTrue(
       runtime.items.contains(where: {

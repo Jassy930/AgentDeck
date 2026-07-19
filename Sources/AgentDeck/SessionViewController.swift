@@ -324,8 +324,8 @@ final class SessionViewController: NSViewController {
     func presentNewSessionDialog() {
         let dlg = NewSessionDialog()
         dlg.onSubmit = { [weak self] draft in
-            self?.handleNewConversationDraft(draft)
-        }
+      self?.handleNewConversationDraft(draft) ?? false
+    }
         newSessionDialog = dlg
         if let win = dlg.window {
             view.window?.beginSheet(win) { [weak self] _ in
@@ -334,13 +334,36 @@ final class SessionViewController: NSViewController {
         }
     }
 
-    private func handleNewConversationDraft(_ draft: RuntimeConversationDraft) {
-        if let cwdMsg = model.chooseCwd(URL(fileURLWithPath: draft.cwd)) {
-            model.workbench.selectedRuntime?.warningMessage = cwdMsg
-            return
-        }
-        model.startConversation(draft)
+  /// 先做无副作用 cwd 预检，再把完整 draft 交给 model admission。只有 admission
+  /// 成功后才从同一个 draft 更新 presentation cwd，拒绝不会污染当前项目上下文。
+  @discardableResult
+  func handleNewConversationDraft(_ draft: RuntimeConversationDraft) -> Bool {
+    let draftCwd = URL(fileURLWithPath: draft.cwd)
+    if let cwdMessage = Self.validateConversationCwd(draftCwd) {
+      if let runtime = model.workbench.selectedRuntime {
+        runtime.warningMessage = cwdMessage
+      } else {
+        model.warningMessage = cwdMessage
+      }
+      return false
     }
+    guard model.startConversation(draft) else { return false }
+    model.cwd = draftCwd
+    return true
+  }
+
+  private static func validateConversationCwd(_ url: URL) -> String? {
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+      isDirectory.boolValue
+    else {
+      return "Not a directory: \(url.path)"
+    }
+    guard FileManager.default.isReadableFile(atPath: url.path) else {
+      return "Directory is not readable: \(url.path)"
+    }
+    return nil
+  }
 
     /// Swap EmptyStateView ↔ conversationComposite inside `contentContainer`.
     private func updateContentPane(hasCwd: Bool) {
