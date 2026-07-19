@@ -541,6 +541,86 @@ final class RuntimeEnvelopeClientTests: XCTestCase {
     XCTAssertEqual(failure.code, "daemon.client.stream_backpressure")
   }
 
+  func testOrdinaryStreamFramesChargeTheirEncodedBytes() async throws {
+    let conversationID = RuntimeConversationID(rawValue: "ordinary-stream-conversation")
+    let firstEventID = RuntimeEventID(rawValue: "ordinary-stream-event-1")
+    let secondEventID = RuntimeEventID(rawValue: "ordinary-stream-event-2")
+    let first = RuntimeEnvelopeV2(
+      version: runtimeProtocolVersionCurrent,
+      messageID: RuntimeMessageID(rawValue: "ordinary-stream-message-1"),
+      body: .stream(
+        .event(
+          try RuntimeEventV2(
+            conversationID: conversationID,
+            eventID: firstEventID,
+            eventSeq: 0,
+            commandID: nil,
+            itemID: nil,
+            entityID: nil,
+            body: .error(
+              RuntimeFailureV1(
+                code: "test.ordinary.stream.1",
+                message: String(repeating: "a", count: 128),
+                diagnosticRef: nil
+              )
+            )
+          )
+        )
+      )
+    )
+    let second = RuntimeEnvelopeV2(
+      version: runtimeProtocolVersionCurrent,
+      messageID: RuntimeMessageID(rawValue: "ordinary-stream-message-2"),
+      body: .stream(
+        .event(
+          try RuntimeEventV2(
+            conversationID: conversationID,
+            eventID: secondEventID,
+            eventSeq: 1,
+            commandID: nil,
+            itemID: nil,
+            entityID: nil,
+            body: .error(
+              RuntimeFailureV1(
+                code: "test.ordinary.stream.2",
+                message: String(repeating: "b", count: 128),
+                diagnosticRef: nil
+              )
+            )
+          )
+        )
+      )
+    )
+    let encoder = JSONEncoder()
+    let retainedLimit = try encoder.encode(first).count + encoder.encode(second).count - 1
+    let harness = try RuntimeClientHarness(
+      limits: RuntimeEnvelopeClientLimits(
+        streamFrames: 64,
+        queuedStreamBytes: retainedLimit
+      ),
+      messageIDs: ["5a222222-2222-4222-8222-222222222222"]
+    )
+    let connection = try await harness.startAndAccept()
+    defer { Darwin.close(connection) }
+
+    try harness.peer.writeEnvelope(first, to: connection)
+    try harness.peer.writeEnvelope(second, to: connection)
+    let failure = try await harness.waitForFault()
+    XCTAssertEqual(failure.code, "daemon.client.stream_backpressure")
+
+    let retained = try await harness.client.nextStream()
+    guard case .message(.event(let event)) = retained.item else {
+      return XCTFail("first ordinary stream frame must remain consumable before the fault")
+    }
+    XCTAssertEqual(event.eventID, firstEventID)
+    do {
+      _ = try await harness.client.nextStream()
+      XCTFail("the over-budget second frame must not enter the stream queue")
+    } catch let failure as RuntimeEnvelopeClientFailure {
+      XCTAssertEqual(failure.code, "daemon.client.stream_backpressure")
+    }
+  }
+
   func testServerRequestUncorrelatedReplyAndSecondTerminalFailClosed() async throws {
     try await assertProtocolFault(expected: "daemon.client.server_request_forbidden") {
       messageID in

@@ -846,7 +846,11 @@ actor RuntimeEnvelopeClient {
         frameBytes: frameBytes
       )
     case .stream(let stream):
-      try acceptStream(messageID: envelope.messageID, stream: stream)
+      try acceptStream(
+        messageID: envelope.messageID,
+        stream: stream,
+        frameBytes: frameBytes
+      )
     }
   }
 
@@ -981,7 +985,8 @@ actor RuntimeEnvelopeClient {
 
   private func acceptStream(
     messageID: RuntimeMessageID,
-    stream: RuntimeStreamItemV2
+    stream: RuntimeStreamItemV2,
+    frameBytes: Int
   ) throws {
     let frame: RuntimeEnvelopeStreamFrame
     let charge: Int
@@ -1010,7 +1015,7 @@ actor RuntimeEnvelopeClient {
         )
       }
       frame = RuntimeEnvelopeStreamFrame(messageID: messageID, item: .message(stream))
-      charge = 1
+      charge = max(frameBytes, 1)
     }
     try faultLatch.withUnfaulted {
       guard streamQueue.count < limits.streamFrames else {
