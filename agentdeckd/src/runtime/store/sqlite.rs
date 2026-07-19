@@ -1522,6 +1522,95 @@ mod migration_tests {
         cipher_evidence(&destination)
     }
 
+    async fn build_populated_strict_v4_fixture(
+        root: &TestRoot,
+        keys: &MemoryKeyStore,
+    ) -> CipherEvidence {
+        let before = build_strict_v3_fixture(root, keys).await;
+        let destination = root.database();
+        let mut connection = Connection::open(&destination).expect("open strict v3 fixture for v4");
+        let meta = read_meta_v3(&connection)
+            .expect("read strict v3 fixture meta for v4")
+            .expect("strict v3 fixture meta exists for v4");
+        let storage_kek =
+            load_or_create_storage_kek(keys, &destination).expect("reload strict v4 KEK");
+        let key_bundle = RuntimeKeyBundle::unwrap(
+            &storage_kek,
+            &KeyWrapAad {
+                schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
+                schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
+                database_id: &meta.database_id,
+            },
+            &meta.wrapped_key_bundle,
+        )
+        .expect("unwrap strict v4 key bundle");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin strict v4 fixture migration");
+        transaction
+            .execute_batch(RUNTIME_MIGRATION_V4)
+            .expect("apply exact v4 migration");
+        let migrated_ledger = super::super::stream::migrate_v4_rows(
+            &transaction,
+            &key_bundle,
+            meta.database_id,
+            &meta.ledger,
+        )
+        .expect("materialize strict v4 stream rows");
+        let metadata_token =
+            runtime_ledger_token_v4(&key_bundle, meta.database_id, &migrated_ledger)
+                .expect("authenticate strict v4 ledger");
+        assert_eq!(
+            transaction
+                .execute(
+                    "UPDATE runtime_meta
+                     SET schema_version = 4, schema_signature = ?1,
+                         codex_adapter_state_count = ?2, claude_code_adapter_state_count = ?3,
+                         approval_count = ?4, active_approval_count = ?5,
+                         audit_event_logical_bytes = ?6,
+                         event_stream_count = ?7, event_stream_bytes = ?8,
+                         catalog_delta_count = ?9, catalog_delta_bytes = ?10,
+                         catalog_retention_floor = ?11,
+                         snapshot_count = ?12, snapshot_bytes = ?13,
+                         publication_stream_count = ?14,
+                         publication_outbox_count = ?15, publication_outbox_bytes = ?16,
+                         metadata_token = ?17
+                     WHERE singleton = 1 AND schema_version = 3",
+                    params![
+                        &schema_signature_v4()[..],
+                        i64::try_from(meta.ledger.codex_adapter_state_count).unwrap(),
+                        i64::try_from(meta.ledger.claude_code_adapter_state_count).unwrap(),
+                        i64::try_from(migrated_ledger.approval_count).unwrap(),
+                        i64::try_from(migrated_ledger.active_approval_count).unwrap(),
+                        i64::try_from(migrated_ledger.audit_event_logical_bytes).unwrap(),
+                        i64::try_from(migrated_ledger.event_stream_count).unwrap(),
+                        i64::try_from(migrated_ledger.event_stream_bytes).unwrap(),
+                        i64::try_from(migrated_ledger.catalog_delta_count).unwrap(),
+                        i64::try_from(migrated_ledger.catalog_delta_bytes).unwrap(),
+                        migrated_ledger.catalog_retention_floor.as_deref(),
+                        i64::try_from(migrated_ledger.snapshot_count).unwrap(),
+                        i64::try_from(migrated_ledger.snapshot_bytes).unwrap(),
+                        i64::try_from(migrated_ledger.publication_stream_count).unwrap(),
+                        i64::try_from(migrated_ledger.publication_outbox_count).unwrap(),
+                        i64::try_from(migrated_ledger.publication_outbox_bytes).unwrap(),
+                        &metadata_token[..],
+                    ],
+                )
+                .expect("publish authenticated strict v4 meta"),
+            1
+        );
+        transaction
+            .commit()
+            .expect("commit populated strict v4 fixture");
+        assert_eq!(
+            schema_manifest(&connection).expect("read populated strict v4 manifest"),
+            expected_schema_manifest(4).expect("build exact v4 manifest")
+        );
+        drop(connection);
+        assert_eq!(cipher_evidence(&destination), before);
+        before
+    }
+
     fn build_empty_strict_v4_fixture(root: &TestRoot, keys: &MemoryKeyStore) -> CipherEvidence {
         let destination = root.database();
         let storage_kek =
@@ -2598,6 +2687,141 @@ mod migration_tests {
             Vec::<MachineEnrollmentReceiptRecord>::new()
         );
         assert_eq!(artifact_evidence(&root.database()), artifacts_before);
+    }
+
+    #[tokio::test]
+    async fn legacy_v1_to_v4_offline_authenticated_wal_tamper_is_rejected_without_artifact_rewrite()
+    {
+        for legacy_version in [
+            LegacySchemaVersion::V1,
+            LegacySchemaVersion::V2,
+            LegacySchemaVersion::V3,
+            LegacySchemaVersion::V4,
+        ] {
+            let label = match legacy_version {
+                LegacySchemaVersion::V1 => "v1",
+                LegacySchemaVersion::V2 => "v2",
+                LegacySchemaVersion::V3 => "v3",
+                LegacySchemaVersion::V4 => "v4",
+                LegacySchemaVersion::V5 | LegacySchemaVersion::V6 => {
+                    unreachable!("table only covers legacy v1-v4")
+                }
+            };
+            let root = TestRoot::new(&format!("{label}-offline-authenticated-wal-tamper"));
+            let keys = MemoryKeyStore::new();
+            match legacy_version {
+                LegacySchemaVersion::V1 => {
+                    build_strict_v1_fixture(&root, &keys).await;
+                }
+                LegacySchemaVersion::V2 => {
+                    build_strict_v2_fixture(&root, &keys).await;
+                }
+                LegacySchemaVersion::V3 => {
+                    build_strict_v3_fixture(&root, &keys).await;
+                }
+                LegacySchemaVersion::V4 => {
+                    build_populated_strict_v4_fixture(&root, &keys).await;
+                }
+                LegacySchemaVersion::V5 | LegacySchemaVersion::V6 => {
+                    unreachable!("table only covers legacy v1-v4")
+                }
+            }
+            let database = normalize_storage_path(&root.database())
+                .expect("normalize legacy offline tamper path");
+
+            // 在冻结 oracle 前把 legacy main 正常切到 WAL header；此后不再用 SQLite
+            // 打开目标库，tamper 只从 shadow writer 移植 committed WAL。
+            let baseline = open_read_write(&database).expect("open legacy WAL baseline handle");
+            let mode: String = baseline
+                .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+                .expect("enable legacy WAL baseline");
+            assert!(mode.eq_ignore_ascii_case("wal"));
+            configure_persistent_wal(&baseline).expect("persist legacy WAL baseline");
+            let (busy, log_frames, checkpointed_frames): (i64, i64, i64) = baseline
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .expect("checkpoint legacy WAL baseline");
+            assert_eq!(busy, 0, "{label} baseline checkpoint must not be busy");
+            assert_eq!(log_frames, checkpointed_frames);
+            drop(baseline);
+            for suffix in ["-wal", "-shm"] {
+                let path = sidecar(&database, suffix);
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        panic!(
+                            "remove {label} baseline sidecar {}: {error}",
+                            path.display()
+                        )
+                    }
+                }
+            }
+
+            let shadow_database = database.with_file_name(format!("{label}-tamper-shadow.db"));
+            fs::copy(&database, &shadow_database).expect("clone legacy main for offline tamper");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&shadow_database, fs::Permissions::from_mode(DATABASE_MODE))
+                    .expect("secure legacy offline tamper shadow");
+            }
+            let writer = open_read_write(&shadow_database).expect("open legacy tamper writer");
+            writer
+                .pragma_update(None, "wal_autocheckpoint", 0_i64)
+                .expect("disable legacy tamper autocheckpoint");
+            configure_persistent_wal(&writer).expect("persist legacy tamper WAL after close");
+            assert_eq!(
+                writer
+                    .execute(
+                        "UPDATE conversations SET metadata_token = zeroblob(32)
+                         WHERE conversation_id = (
+                             SELECT conversation_id FROM conversations
+                             ORDER BY conversation_id LIMIT 1
+                         )",
+                        [],
+                    )
+                    .expect("commit invalid authenticated legacy conversation row"),
+                1,
+                "{label} fixture must contain an authenticated conversation row"
+            );
+            drop(writer);
+
+            let shadow_wal = sidecar(&shadow_database, "-wal");
+            let target_wal = sidecar(&database, "-wal");
+            let copied = fs::copy(&shadow_wal, &target_wal)
+                .expect("install closed-writer committed legacy tamper WAL");
+            assert!(copied > 0, "{label} tamper WAL must be non-empty");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&target_wal, fs::Permissions::from_mode(DATABASE_MODE))
+                    .expect("secure installed legacy tamper WAL");
+            }
+
+            let artifacts_before = artifact_evidence(&database);
+            let identity_before =
+                capture_store_identity(&database).expect("capture legacy offline tamper identity");
+            let error = RuntimeStoreHandle::open(
+                RuntimeStoreConfig::new(database.clone()),
+                load_or_create_storage_kek(&keys, &database).expect("reload legacy tamper KEK"),
+            )
+            .await
+            .expect_err("legacy offline authenticated WAL tamper must fail closed");
+            assert_unknown_or_corrupt(error, &format!("offline-{label}-authenticated-row"));
+            assert_eq!(
+                artifact_evidence(&database),
+                artifacts_before,
+                "rejected offline {label} tamper must not rewrite any runtime artifact"
+            );
+            assert_eq!(
+                capture_store_identity(&database)
+                    .expect("recapture rejected legacy offline tamper identity"),
+                identity_before,
+                "rejected offline {label} tamper must preserve artifact identity"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4925,30 +5149,64 @@ fn inspect_schema(path: &Path, storage_kek: &StorageKek) -> Result<SchemaState, 
                 });
             }
             let state = match version {
-                1 if family == RUNTIME_SCHEMA_FAMILY => SchemaState::LegacyV1(
-                    read_and_validate_legacy_v1_schema(connection)?,
-                    identity.clone(),
-                ),
-                2 if family == RUNTIME_SCHEMA_FAMILY => SchemaState::LegacyV2(
-                    read_and_validate_legacy_v2_schema(connection)?,
-                    identity.clone(),
-                ),
-                3 if family == RUNTIME_SCHEMA_FAMILY => SchemaState::LegacyV3(
-                    read_and_validate_legacy_v3_schema(connection)?,
-                    identity.clone(),
-                ),
-                4 if family == RUNTIME_SCHEMA_FAMILY => SchemaState::LegacyV4(
-                    read_and_validate_legacy_v4_schema(connection)?,
-                    identity.clone(),
-                ),
+                1 if family == RUNTIME_SCHEMA_FAMILY => {
+                    let legacy = read_and_validate_legacy_v1_schema(connection)?;
+                    validate_legacy_before_read_write_open(
+                        connection,
+                        storage_kek,
+                        &legacy,
+                        LegacySchemaVersion::V1,
+                    )?;
+                    SchemaState::LegacyV1(legacy, identity.clone())
+                }
+                2 if family == RUNTIME_SCHEMA_FAMILY => {
+                    let legacy = read_and_validate_legacy_v2_schema(connection)?;
+                    validate_legacy_before_read_write_open(
+                        connection,
+                        storage_kek,
+                        &legacy,
+                        LegacySchemaVersion::V2,
+                    )?;
+                    SchemaState::LegacyV2(legacy, identity.clone())
+                }
+                3 if family == RUNTIME_SCHEMA_FAMILY => {
+                    let legacy = read_and_validate_legacy_v3_schema(connection)?;
+                    validate_legacy_before_read_write_open(
+                        connection,
+                        storage_kek,
+                        &legacy,
+                        LegacySchemaVersion::V3,
+                    )?;
+                    SchemaState::LegacyV3(legacy, identity.clone())
+                }
+                4 if family == RUNTIME_SCHEMA_FAMILY => {
+                    let legacy = read_and_validate_legacy_v4_schema(connection)?;
+                    validate_legacy_before_read_write_open(
+                        connection,
+                        storage_kek,
+                        &legacy,
+                        LegacySchemaVersion::V4,
+                    )?;
+                    SchemaState::LegacyV4(legacy, identity.clone())
+                }
                 RUNTIME_SCHEMA_VERSION_V5 if family == RUNTIME_SCHEMA_FAMILY => {
                     let legacy = read_and_validate_legacy_v5_schema(connection)?;
-                    validate_legacy_v5_before_read_write_open(connection, storage_kek, &legacy)?;
+                    validate_legacy_before_read_write_open(
+                        connection,
+                        storage_kek,
+                        &legacy,
+                        LegacySchemaVersion::V5,
+                    )?;
                     SchemaState::LegacyV5(legacy, identity.clone())
                 }
                 RUNTIME_SCHEMA_VERSION_V6 if family == RUNTIME_SCHEMA_FAMILY => {
                     let legacy = read_and_validate_legacy_v6_schema(connection)?;
-                    validate_legacy_v6_before_read_write_open(connection, storage_kek, &legacy)?;
+                    validate_legacy_before_read_write_open(
+                        connection,
+                        storage_kek,
+                        &legacy,
+                        LegacySchemaVersion::V6,
+                    )?;
                     SchemaState::LegacyV6(legacy, identity.clone())
                 }
                 RUNTIME_SCHEMA_VERSION if family == RUNTIME_SCHEMA_FAMILY => {
@@ -4983,10 +5241,11 @@ fn reject_legacy_v5_native_projection(connection: &Connection) -> Result<(), Run
     Ok(())
 }
 
-fn validate_legacy_v5_before_read_write_open(
+fn validate_legacy_before_read_write_open(
     connection: &Connection,
     storage_kek: &StorageKek,
     legacy: &MetaRow,
+    legacy_version: LegacySchemaVersion,
 ) -> Result<(), RuntimeStoreError> {
     let key_context = KeyWrapAad {
         schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
@@ -4998,11 +5257,35 @@ fn validate_legacy_v5_before_read_write_open(
     if key_bundle.generation() != legacy.key_generation {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
-    verify_runtime_ledger_token_v5(&key_bundle, legacy)?;
-    reject_legacy_v5_native_projection(connection)?;
-    // v5 在 schema bump 前是 current。迁移入口必须继续在 rescue 副本上完成
-    // journal + configuration/pin/metadata 的全量认证，离线损坏不得先碰原库 RW。
-    super::journal::validate_store_integrity(connection, &key_bundle, legacy.database_id)?;
+    match legacy_version {
+        LegacySchemaVersion::V1 => verify_runtime_ledger_token_v1(&key_bundle, legacy)?,
+        LegacySchemaVersion::V2 => verify_runtime_ledger_token_v2(&key_bundle, legacy)?,
+        LegacySchemaVersion::V3 => verify_runtime_ledger_token_v3(&key_bundle, legacy)?,
+        LegacySchemaVersion::V4 => verify_runtime_ledger_token_v4(&key_bundle, legacy)?,
+        LegacySchemaVersion::V5 => verify_runtime_ledger_token_v5(&key_bundle, legacy)?,
+        LegacySchemaVersion::V6 => verify_runtime_ledger_token_v6(&key_bundle, legacy)?,
+    }
+    if legacy_version == LegacySchemaVersion::V5 {
+        reject_legacy_v5_native_projection(connection)?;
+    }
+    // WAL recovery 已在私有 rescue 副本上得到完整 committed state；所有 legacy
+    // 版本都必须先认证 metadata ledger 与既有行，再触碰原库 RW。v1 保持冻结的
+    // strict-v1 ledger 语义，其余版本复用当前版本化 ledger validator。
+    match legacy_version {
+        LegacySchemaVersion::V1 => super::journal::validate_store_integrity_v1(
+            connection,
+            &key_bundle,
+            legacy.database_id,
+            &legacy.ledger,
+        )?,
+        LegacySchemaVersion::V2
+        | LegacySchemaVersion::V3
+        | LegacySchemaVersion::V4
+        | LegacySchemaVersion::V5
+        | LegacySchemaVersion::V6 => {
+            super::journal::validate_store_integrity(connection, &key_bundle, legacy.database_id)?;
+        }
+    }
     Ok(())
 }
 
@@ -5023,26 +5306,6 @@ fn validate_current_before_read_write_open(
     }
     verify_runtime_ledger_token(&key_bundle, current)?;
     super::journal::validate_store_integrity(connection, &key_bundle, current.database_id)?;
-    Ok(())
-}
-
-fn validate_legacy_v6_before_read_write_open(
-    connection: &Connection,
-    storage_kek: &StorageKek,
-    legacy: &MetaRow,
-) -> Result<(), RuntimeStoreError> {
-    let key_context = KeyWrapAad {
-        schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
-        schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
-        database_id: &legacy.database_id,
-    };
-    let key_bundle =
-        RuntimeKeyBundle::unwrap(storage_kek, &key_context, &legacy.wrapped_key_bundle)?;
-    if key_bundle.generation() != legacy.key_generation {
-        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
-    }
-    verify_runtime_ledger_token_v6(&key_bundle, legacy)?;
-    super::journal::validate_store_integrity(connection, &key_bundle, legacy.database_id)?;
     Ok(())
 }
 
