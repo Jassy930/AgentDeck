@@ -10,7 +10,14 @@ use clap::{Parser, Subcommand, error::ErrorKind};
 use main_types::{AgentKindArg, ApprovalArg, EffortArg, PermissionArg, SandboxArg, SessionRunArgs};
 use output::{CliError, render};
 use std::ffi::OsString;
+use std::future::Future;
 use std::path::PathBuf;
+use std::time::Duration;
+
+use agentdeck_protocol::runtime::{
+    ArtifactSha256, IdempotencyKey, LocalOnlyAdministration, RuntimeReply, RuntimeRequest,
+    StageUpgradeReceipt, StageUpgradeRequest,
+};
 
 #[derive(Parser)]
 #[command(name = "agentdeck", about = "AgentDeck unified interface CLI (v2)")]
@@ -38,6 +45,11 @@ enum Cmd {
     Ping,
     /// Runtime Hello + DescribeAgents self-check
     Selfcheck,
+    /// Install, inspect, or uninstall the stable per-user daemon LaunchAgent
+    Daemon {
+        #[command(subcommand)]
+        op: DaemonOp,
+    },
     /// Diagnostics one-shot operations
     Diagnostics {
         #[command(subcommand)]
@@ -74,6 +86,17 @@ enum Cmd {
     RuntimeSmokeForTest {
         #[command(subcommand)]
         op: RuntimeSmokeOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonOp {
+    Install,
+    Status,
+    Uninstall {
+        /// P4 trust-reset gate; currently typed fail-close with zero deletion
+        #[arg(long)]
+        purge: bool,
     },
 }
 
@@ -221,6 +244,15 @@ enum RuntimeSmokeOp {
         #[arg(long)]
         conversation_id: String,
     },
+    /// 向真实 ephemeral Runtime UDS 发送 local-only StageUpgrade。
+    StageUpgrade {
+        #[arg(long)]
+        target_version: String,
+        #[arg(long)]
+        candidate_sha256: String,
+        #[arg(long)]
+        candidate_path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -331,6 +363,7 @@ async fn run_non_remote(cli: &Cli) -> Result<(), CliError> {
             let client = connect_runtime(cli).await?;
             runtime_cli::handle_selfcheck(&client, pretty).await
         }
+        Cmd::Daemon { op } => handle_daemon(cli, op).await,
         Cmd::Agent { op } => {
             let client = connect_runtime(cli).await?;
             match op {
@@ -498,8 +531,270 @@ async fn run_non_remote(cli: &Cli) -> Result<(), CliError> {
                 let client = connect_runtime_smoke(cli).await?;
                 runtime_cli::handle_smoke_subscribe(&client, conversation_id.clone(), pretty).await
             }
+            RuntimeSmokeOp::StageUpgrade {
+                target_version,
+                candidate_sha256,
+                candidate_path,
+            } => {
+                let client = connect_runtime_smoke(cli).await?;
+                let artifact = agentdeck_cli::daemon::artifact::InstalledArtifact {
+                    path: candidate_path.clone(),
+                    version: target_version.clone(),
+                    protocol_version: agentdeck_protocol::PROTOCOL_VERSION,
+                    sha256: parse_sha256_hex(candidate_sha256)?,
+                    team_identifier: "AUTOMATICHARNESS".to_owned(),
+                    keychain_access_group: "AUTOMATICHARNESS.com.agentdeck.agentdeckd.stable"
+                        .to_owned(),
+                };
+                let value = finish_daemon_install_with_client(
+                    agentdeck_cli::daemon::launchd::DaemonInstallOutcome::Staged { artifact },
+                    Some(&client),
+                )
+                .await?;
+                println!("{}", render(&value, pretty));
+                Ok(())
+            }
         },
         Cmd::Remote { .. } => unreachable!("remote dispatch exits before Runtime dispatch"),
+    }
+}
+
+async fn handle_daemon(cli: &Cli, op: &DaemonOp) -> Result<(), CliError> {
+    runtime_cli::validate_runtime_globals(&cli.profile, cli.data_dir.as_deref())?;
+    #[cfg(debug_assertions)]
+    if cli.runtime_temp_root_for_test.is_some() {
+        return Err(CliError::Usage(
+            "daemon production commands reject the ephemeral Runtime test root".to_owned(),
+        ));
+    }
+    if matches!(op, DaemonOp::Uninstall { purge: true }) {
+        return Err(daemon_cli_error(
+            agentdeck_cli::daemon::launchd::LifecycleError::PurgeRemoteNotReady,
+        ));
+    }
+    let lifecycle =
+        agentdeck_cli::daemon::launchd::DaemonLifecycle::production().map_err(daemon_cli_error)?;
+    let value = match op {
+        DaemonOp::Install => {
+            let installer =
+                agentdeck_cli::daemon::launchd::DaemonLifecycle::production_installer(None)
+                    .map_err(daemon_cli_error)?;
+            let outcome = lifecycle
+                .install_bundled(&installer)
+                .map_err(daemon_cli_error)?;
+            finish_daemon_install(cli, outcome).await?
+        }
+        DaemonOp::Status => {
+            let status = lifecycle.status().map_err(daemon_cli_error)?;
+            serde_json::json!({"daemon":{"plistInstalled":status.plist_installed,"currentVersion":status.current_version,"launchdLoaded":status.launchd_loaded,"pid":status.pid,"runningProgram":status.running_program}})
+        }
+        DaemonOp::Uninstall { purge } => {
+            lifecycle.uninstall(*purge).map_err(daemon_cli_error)?;
+            serde_json::json!({"daemon":{"state":"uninstalled","dataPreserved":true}})
+        }
+    };
+    println!("{}", render(&value, cli.pretty));
+    Ok(())
+}
+
+async fn finish_daemon_install(
+    cli: &Cli,
+    outcome: agentdeck_cli::daemon::launchd::DaemonInstallOutcome,
+) -> Result<serde_json::Value, CliError> {
+    match &outcome {
+        agentdeck_cli::daemon::launchd::DaemonInstallOutcome::Activated { .. } => {
+            finish_daemon_install_with_client(outcome, None).await
+        }
+        agentdeck_cli::daemon::launchd::DaemonInstallOutcome::Staged { .. } => {
+            let client = retry_daemon_upgrade_connect(
+                || connect_runtime(cli),
+                301,
+                Duration::from_millis(50),
+            )
+            .await?;
+            finish_daemon_install_with_client(outcome, Some(&client)).await
+        }
+    }
+}
+
+async fn retry_daemon_upgrade_connect<T, Connect, ConnectFuture>(
+    mut connect: Connect,
+    max_attempts: usize,
+    retry_delay: Duration,
+) -> Result<T, CliError>
+where
+    Connect: FnMut() -> ConnectFuture,
+    ConnectFuture: Future<Output = Result<T, CliError>>,
+{
+    assert!(max_attempts > 0, "daemon upgrade connect needs one attempt");
+    for attempt in 0..max_attempts {
+        match connect().await {
+            Ok(client) => return Ok(client),
+            Err(error) if daemon_startup_transport_gap(&error) && attempt + 1 < max_attempts => {
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("positive bounded attempt loop always returns")
+}
+
+fn daemon_startup_transport_gap(error: &CliError) -> bool {
+    matches!(
+        error,
+        CliError::Transport { code: Some(code), .. }
+            if matches!(
+                code.as_str(),
+                "daemon.client.socket_missing" | "daemon.client.connect_failed"
+            )
+    )
+}
+
+async fn finish_daemon_install_with_client(
+    outcome: agentdeck_cli::daemon::launchd::DaemonInstallOutcome,
+    client: Option<&agentdeck_cli::unix_transport::RuntimeUnixClient>,
+) -> Result<serde_json::Value, CliError> {
+    let staged_receipt = match &outcome {
+        agentdeck_cli::daemon::launchd::DaemonInstallOutcome::Activated { .. } => None,
+        agentdeck_cli::daemon::launchd::DaemonInstallOutcome::Staged { artifact } => {
+            let client = client.ok_or_else(|| CliError::Session {
+                code: Some("daemon.upgrade.runtime_ack_required".to_owned()),
+                message: "staged daemon is not successful before Runtime flush ACK".to_owned(),
+            })?;
+            Some(request_stage_upgrade(client, stage_upgrade_request(artifact)?).await?)
+        }
+    };
+    daemon_install_output(outcome, staged_receipt)
+}
+
+async fn request_stage_upgrade(
+    client: &agentdeck_cli::unix_transport::RuntimeUnixClient,
+    request: RuntimeRequest,
+) -> Result<StageUpgradeReceipt, CliError> {
+    let item = client
+        .request(request)
+        .await
+        .map_err(client::map_unix_error)?;
+    decode_stage_upgrade_item(item)
+}
+
+fn decode_stage_upgrade_item(
+    item: agentdeck_cli::unix_transport::ReplySequenceItem,
+) -> Result<StageUpgradeReceipt, CliError> {
+    match item {
+        agentdeck_cli::unix_transport::ReplySequenceItem::Reply(reply) => match *reply {
+            RuntimeReply::StageUpgrade(receipt) => Ok(receipt),
+            RuntimeReply::Failure(failure) => Err(CliError::Session {
+                code: Some(failure.code),
+                message: failure.message,
+            }),
+            _ => Err(CliError::Session {
+                code: Some("daemon.upgrade.reply_invalid".to_owned()),
+                message: "daemon returned a non-upgrade reply".to_owned(),
+            }),
+        },
+        agentdeck_cli::unix_transport::ReplySequenceItem::TransferComplete(_) => {
+            Err(CliError::Session {
+                code: Some("daemon.upgrade.reply_invalid".to_owned()),
+                message: "daemon returned a transfer for StageUpgrade".to_owned(),
+            })
+        }
+    }
+}
+
+fn stage_upgrade_request(
+    artifact: &agentdeck_cli::daemon::artifact::InstalledArtifact,
+) -> Result<RuntimeRequest, CliError> {
+    use std::fmt::Write as _;
+
+    let mut hash = String::with_capacity(64);
+    for byte in artifact.sha256 {
+        write!(&mut hash, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    let candidate_sha256 = ArtifactSha256::new(hash.clone()).map_err(|error| {
+        CliError::Usage(format!("installed daemon hash is not canonical: {error}"))
+    })?;
+    let idempotency_key =
+        IdempotencyKey::new(format!("daemon-upgrade-v1:{}:{hash}", artifact.version));
+    let request = StageUpgradeRequest::new(
+        artifact.version.clone(),
+        candidate_sha256,
+        idempotency_key,
+        LocalOnlyAdministration::LocalOnly,
+    )
+    .map_err(|error| CliError::Usage(format!("installed daemon version is invalid: {error}")))?;
+    Ok(RuntimeRequest::StageUpgrade(request))
+}
+
+fn parse_sha256_hex(value: &str) -> Result<[u8; 32], CliError> {
+    ArtifactSha256::new(value.to_owned()).map_err(|error| {
+        CliError::Usage(format!("installed daemon hash is not canonical: {error}"))
+    })?;
+    let mut decoded = [0_u8; 32];
+    for (index, byte) in decoded.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).map_err(|_| {
+            CliError::Usage("installed daemon hash is not canonical lowercase hex".to_owned())
+        })?;
+    }
+    Ok(decoded)
+}
+
+fn daemon_install_output(
+    outcome: agentdeck_cli::daemon::launchd::DaemonInstallOutcome,
+    staged_receipt: Option<StageUpgradeReceipt>,
+) -> Result<serde_json::Value, CliError> {
+    match outcome {
+        agentdeck_cli::daemon::launchd::DaemonInstallOutcome::Activated { artifact } => Ok(
+            serde_json::json!({"daemon":{"state":"activated","version":artifact.version,"path":artifact.path}}),
+        ),
+        agentdeck_cli::daemon::launchd::DaemonInstallOutcome::Staged { artifact } => {
+            let Some(receipt) = staged_receipt else {
+                return Err(CliError::Session {
+                    code: Some("daemon.upgrade.runtime_ack_required".to_owned()),
+                    message: "staged daemon is not successful before Runtime flush ACK".to_owned(),
+                });
+            };
+            match receipt {
+                StageUpgradeReceipt::Staged { target_version }
+                | StageUpgradeReceipt::Replayed { target_version } => {
+                    ensure_upgrade_target(&artifact.version, &target_version)?;
+                    Ok(
+                        serde_json::json!({"daemon":{"state":"staged","version":artifact.version,"path":artifact.path,"runtimeAcked":true}}),
+                    )
+                }
+                StageUpgradeReceipt::AwaitingIdle {
+                    target_version,
+                    active_turns,
+                } => {
+                    ensure_upgrade_target(&artifact.version, &target_version)?;
+                    Ok(
+                        serde_json::json!({"daemon":{"state":"awaitingIdle","version":artifact.version,"path":artifact.path,"activeTurns":active_turns,"runtimeAcked":true}}),
+                    )
+                }
+                StageUpgradeReceipt::Failed { failure } => Err(CliError::Session {
+                    code: Some(failure.code),
+                    message: failure.message,
+                }),
+            }
+        }
+    }
+}
+
+fn ensure_upgrade_target(expected: &str, observed: &str) -> Result<(), CliError> {
+    if expected == observed {
+        Ok(())
+    } else {
+        Err(CliError::Session {
+            code: Some("daemon.upgrade.reply_mismatch".to_owned()),
+            message: "daemon upgrade reply target does not match staged artifact".to_owned(),
+        })
+    }
+}
+
+fn daemon_cli_error(error: agentdeck_cli::daemon::launchd::LifecycleError) -> CliError {
+    CliError::Session {
+        code: Some(error.code().to_owned()),
+        message: error.to_string(),
     }
 }
 
@@ -553,5 +848,266 @@ async fn main() {
         eprintln!("agentdeck: {}", error.message());
         println!("{}", render(&output::error_envelope(&error), cli.pretty));
         std::process::exit(error.exit_code());
+    }
+}
+
+#[cfg(test)]
+mod daemon_cli_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::*;
+
+    fn artifact() -> agentdeck_cli::daemon::artifact::InstalledArtifact {
+        agentdeck_cli::daemon::artifact::InstalledArtifact {
+            path: PathBuf::from("/private/tmp/bin/2.0.0/agentdeckd"),
+            version: "2.0.0".to_owned(),
+            protocol_version: 2,
+            sha256: [7; 32],
+            team_identifier: "REALTEAM42".to_owned(),
+            keychain_access_group: "REALTEAM42.com.agentdeck.agentdeckd.stable".to_owned(),
+        }
+    }
+
+    #[test]
+    fn daemon_subcommands_and_purge_are_explicitly_parsed() {
+        assert!(matches!(
+            Cli::try_parse_from(["agentdeck", "daemon", "install"])
+                .expect("install")
+                .command,
+            Cmd::Daemon {
+                op: DaemonOp::Install
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["agentdeck", "daemon", "uninstall", "--purge"])
+                .expect("purge")
+                .command,
+            Cmd::Daemon {
+                op: DaemonOp::Uninstall { purge: true }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "agentdeck",
+                "--runtime-temp-root-for-test",
+                "/tmp/private-runtime",
+                "runtime-smoke-for-test",
+                "stage-upgrade",
+                "--target-version",
+                "2.0.0",
+                "--candidate-sha256",
+                "0707070707070707070707070707070707070707070707070707070707070707",
+                "--candidate-path",
+                "/tmp/private-runtime/bin/2.0.0/agentdeckd",
+            ])
+            .expect("hidden StageUpgrade harness")
+            .command,
+            Cmd::RuntimeSmokeForTest {
+                op: RuntimeSmokeOp::StageUpgrade { .. }
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn daemon_commands_reject_ephemeral_runtime_harness_flag() {
+        let cli = Cli::try_parse_from([
+            "agentdeck",
+            "--runtime-temp-root-for-test",
+            "/tmp/private-runtime",
+            "daemon",
+            "status",
+        ])
+        .expect("parse");
+        let Cmd::Daemon { op } = &cli.command else {
+            panic!("daemon command")
+        };
+        assert!(matches!(
+            handle_daemon(&cli, op).await,
+            Err(CliError::Usage(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn purge_rejects_before_constructing_any_production_lifecycle() {
+        let cli = Cli::try_parse_from(["agentdeck", "daemon", "uninstall", "--purge"])
+            .expect("parse purge");
+        let Cmd::Daemon { op } = &cli.command else {
+            panic!("daemon command")
+        };
+        assert!(matches!(
+            handle_daemon(&cli, op).await,
+            Err(CliError::Session { code: Some(code), .. })
+                if code == "daemon.purge.remote_not_ready"
+        ));
+    }
+
+    #[tokio::test]
+    async fn staged_install_retries_only_bounded_daemon_startup_transport_gaps() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        let value = retry_daemon_upgrade_connect(
+            move || {
+                let attempt = observed.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt < 2 {
+                        Err(CliError::Transport {
+                            code: Some("daemon.client.socket_missing".to_owned()),
+                            message: "daemon is starting".to_owned(),
+                        })
+                    } else {
+                        Ok(42_u8)
+                    }
+                }
+            },
+            3,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("third bounded attempt connects");
+        assert_eq!(value, 42);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        let error = retry_daemon_upgrade_connect(
+            move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err::<u8, _>(CliError::Transport {
+                        code: Some("daemon.client.socket_unsafe".to_owned()),
+                        message: "unsafe endpoint".to_owned(),
+                    })
+                }
+            },
+            3,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect_err("security failures are never retried");
+        assert!(matches!(
+            error,
+            CliError::Transport { code: Some(code), .. }
+                if code == "daemon.client.socket_unsafe"
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn staged_artifact_is_not_reported_as_upgrade_success_before_runtime_ack() {
+        let error = daemon_install_output(
+            agentdeck_cli::daemon::launchd::DaemonInstallOutcome::Staged {
+                artifact: artifact(),
+            },
+            None,
+        )
+        .expect_err("staged is not final success");
+        assert!(matches!(
+            error,
+            CliError::Session {
+                code: Some(code),
+                ..
+            } if code == "daemon.upgrade.runtime_ack_required"
+        ));
+    }
+
+    #[test]
+    fn staged_artifact_maps_only_exact_runtime_receipts_to_success() {
+        let staged_artifact = artifact();
+        let value = daemon_install_output(
+            agentdeck_cli::daemon::launchd::DaemonInstallOutcome::Staged {
+                artifact: staged_artifact.clone(),
+            },
+            Some(StageUpgradeReceipt::AwaitingIdle {
+                target_version: staged_artifact.version.clone(),
+                active_turns: 2,
+            }),
+        )
+        .expect("exact Runtime ACK");
+        assert_eq!(value["daemon"]["state"], "awaitingIdle");
+        assert_eq!(value["daemon"]["activeTurns"], 2);
+
+        assert!(matches!(
+            daemon_install_output(
+                agentdeck_cli::daemon::launchd::DaemonInstallOutcome::Staged {
+                    artifact: staged_artifact,
+                },
+                Some(StageUpgradeReceipt::Staged {
+                    target_version: "other".to_owned(),
+                }),
+            ),
+            Err(CliError::Session { code: Some(code), .. })
+                if code == "daemon.upgrade.reply_mismatch"
+        ));
+
+        let error = daemon_install_output(
+            agentdeck_cli::daemon::launchd::DaemonInstallOutcome::Staged {
+                artifact: artifact(),
+            },
+            Some(StageUpgradeReceipt::Failed {
+                failure: agentdeck_protocol::runtime::RuntimeFailure::new(
+                    "daemon.upgrade.failed_fixture",
+                    "fixture failure",
+                ),
+            }),
+        )
+        .expect_err("failed Runtime receipt must remain failed");
+        assert!(matches!(
+            error,
+            CliError::Session { code: Some(code), .. }
+                if code == "daemon.upgrade.failed_fixture"
+        ));
+    }
+
+    #[test]
+    fn stage_upgrade_harness_rejects_noncanonical_hash_before_connecting() {
+        assert!(matches!(
+            parse_sha256_hex("NOT-A-SHA256"),
+            Err(CliError::Usage(message)) if message.contains("canonical")
+        ));
+    }
+
+    #[test]
+    fn stage_upgrade_reply_decoder_rejects_outer_failure_wrong_reply_and_transfer() {
+        let outer = decode_stage_upgrade_item(
+            agentdeck_cli::unix_transport::ReplySequenceItem::Reply(Box::new(
+                RuntimeReply::Failure(agentdeck_protocol::runtime::RuntimeFailure::new(
+                    "daemon.upgrade.outer_fixture",
+                    "outer failure",
+                )),
+            )),
+        )
+        .expect_err("outer Runtime failure");
+        assert!(matches!(
+            outer,
+            CliError::Session { code: Some(code), .. }
+                if code == "daemon.upgrade.outer_fixture"
+        ));
+
+        let wrong = decode_stage_upgrade_item(
+            agentdeck_cli::unix_transport::ReplySequenceItem::Reply(Box::new(RuntimeReply::Hello(
+                agentdeck_protocol::runtime::command::HelloParams {
+                    runtime_protocol_version: agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION,
+                },
+            ))),
+        )
+        .expect_err("wrong Runtime reply");
+        assert!(matches!(
+            wrong,
+            CliError::Session { code: Some(code), .. }
+                if code == "daemon.upgrade.reply_invalid"
+        ));
+
+        let transfer = decode_stage_upgrade_item(
+            agentdeck_cli::unix_transport::ReplySequenceItem::TransferComplete(vec![1, 2, 3]),
+        )
+        .expect_err("StageUpgrade transfer is invalid");
+        assert!(matches!(
+            transfer,
+            CliError::Session { code: Some(code), .. }
+                if code == "daemon.upgrade.reply_invalid"
+        ));
     }
 }

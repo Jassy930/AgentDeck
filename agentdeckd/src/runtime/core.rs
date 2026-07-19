@@ -5,6 +5,7 @@
 //! transport 排序。所有 mutation 先过 recovery/lifecycle 与 authorization capability，
 //! 再进入 durable store/per-conversation actor。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
@@ -28,8 +29,7 @@ use agentdeck_protocol::runtime::{
     RuntimeReply, RuntimeRequest, RuntimeSubscriptionTarget, StageUpgradeReceipt,
     SubscriptionReceipt,
 };
-use tokio::sync::Semaphore;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
 
 use super::approval::ApprovalPrincipalCapability;
 use super::catalog_snapshot::{CatalogSnapshotProvider, CatalogSnapshotProviderError};
@@ -65,6 +65,9 @@ use super::store::{
     UpdateConversationMetadataOutcome, UpdateManagedConversationMetadata,
 };
 use super::subscription::coordinator::SubscriptionCoordinator;
+use super::upgrade::{
+    DisabledUpgradeService, DurableUpgradeService, PreparedUpgrade, UpgradeService,
+};
 
 const CORE_COLD: u8 = 0;
 const CORE_RECOVERING: u8 = 1;
@@ -100,6 +103,7 @@ pub struct RuntimeCore {
     native_projector: NativeProjector,
     native_projector_enabled: bool,
     native_mutations: NativeMutationCoordinator,
+    upgrade: Arc<dyn UpgradeService>,
     recovery_identity: Arc<()>,
     recovery: RuntimeRecoveryCoordinator,
     read_pool: ReadPool,
@@ -149,6 +153,25 @@ impl RuntimeCore {
             true,
         )
         .map_err(RuntimeCoreError::into_failure)
+    }
+
+    /// daemon binary 在 main-loop exit receiver 建立后接入的 P3.10 production service。
+    /// 构造只验证固定 bin root，不触碰 current、候选 artifact 或 Store。
+    #[doc(hidden)]
+    pub fn with_versioned_daemon_upgrade(
+        mut self,
+        bin_root: PathBuf,
+        exit: mpsc::UnboundedSender<()>,
+    ) -> Result<Self, RuntimeFailure> {
+        let service = DurableUpgradeService::new(
+            self.store.clone(),
+            self.conversations.clone(),
+            bin_root,
+            exit,
+        )
+        .map_err(|error| RuntimeFailure::new(error.code(), "daemon upgrade path is invalid"))?;
+        self.upgrade = Arc::new(service);
+        Ok(self)
     }
 
     fn with_execution_coordinator(
@@ -216,6 +239,7 @@ impl RuntimeCore {
             native_projector,
             native_projector_enabled: enable_native_projector,
             native_mutations,
+            upgrade: Arc::new(DisabledUpgradeService),
             recovery_identity,
             recovery,
             read_pool: ReadPool::new(DEFAULT_RUNTIME_READ_CONCURRENCY)?,
@@ -242,6 +266,12 @@ impl RuntimeCore {
             DEFAULT_ADAPTER_CONCURRENCY,
             false,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_upgrade_service(mut self, upgrade: Arc<dyn UpgradeService>) -> Self {
+        self.upgrade = upgrade;
+        self
     }
 
     /// 只允许 transport 用本 Core 完成 recovery 时签发的 capability
@@ -356,6 +386,17 @@ impl RuntimeCore {
             ))
         } else {
             match body {
+                RuntimeMessage::Request(RuntimeRequest::StageUpgrade(request)) => {
+                    return self
+                        .handle_stage_upgrade_envelope(
+                            operation,
+                            connection_id,
+                            principal,
+                            message_id,
+                            request,
+                        )
+                        .await;
+                }
                 RuntimeMessage::Request(request) => {
                     if let Some(result) = self
                         .handle_stream_envelope(
@@ -388,6 +429,52 @@ impl RuntimeCore {
                 body: RuntimeMessage::Reply(reply),
             },
         )
+    }
+
+    /// StageUpgrade 是唯一把 transport flush ACK 作为副作用许可的 Runtime request。
+    /// durable prepare 仍由 admitted operation 覆盖；进入 paced writer 前显式释放该
+    /// guard，等待 flush 时不占用 shutdown quiescence。ACK 后同步 arm daemon-owned
+    /// task，随后 connection close 不再拥有或取消 action。
+    async fn handle_stage_upgrade_envelope(
+        &self,
+        operation: RuntimeOperationGuard,
+        connection_id: ConnectionId,
+        principal: AuthenticatedPrincipal,
+        message_id: agentdeck_protocol::runtime::identity::MessageId,
+        request: agentdeck_protocol::runtime::StageUpgradeRequest,
+    ) -> Result<(), RuntimeFailure> {
+        let (prepared, authorization) = match principal.try_enter_local_administration() {
+            Ok(authorization) => {
+                let prepared = self
+                    .upgrade
+                    .prepare(request)
+                    .await
+                    .unwrap_or_else(PreparedUpgrade::failed);
+                (prepared, Some(authorization))
+            }
+            Err(error) => (
+                PreparedUpgrade::failed(RuntimeCoreError::from(error).into_failure()),
+                None,
+            ),
+        };
+        let (receipt, deferred) = prepared.into_parts();
+        let envelope = RuntimeEnvelope {
+            version: RUNTIME_PROTOCOL_VERSION,
+            message_id,
+            body: RuntimeMessage::Reply(RuntimeReply::StageUpgrade(receipt)),
+        };
+        drop(authorization);
+        drop(operation);
+
+        let flushed = self.enqueue_paced(connection_id, &envelope).await?;
+        flushed
+            .wait()
+            .await
+            .map_err(|error| RuntimeCoreError::Connection(error).into_failure())?;
+        if let Some(deferred) = deferred {
+            deferred.arm();
+        }
+        Ok(())
     }
 
     async fn handle_stream_envelope(
@@ -1049,15 +1136,11 @@ impl RuntimeCore {
             | RuntimeRequest::Revoke(_)
             | RuntimeRequest::TrustReset { .. } => Err(RuntimeCoreError::FeatureUnavailable),
             RuntimeRequest::StageUpgrade(_) => {
-                let failure = if !principal.is_local() {
-                    RuntimeCoreError::AuthorizationDenied.into_failure()
-                } else {
-                    match principal.try_enter() {
-                        Ok(_authorization) => RuntimeCoreError::FeatureUnavailable,
-                        Err(error) => RuntimeCoreError::from(error),
-                    }
-                    .into_failure()
-                };
+                let failure = match principal.try_enter_local_administration() {
+                    Ok(_authorization) => RuntimeCoreError::FeatureUnavailable,
+                    Err(error) => RuntimeCoreError::from(error),
+                }
+                .into_failure();
                 Ok(RuntimeReply::StageUpgrade(StageUpgradeReceipt::Failed {
                     failure,
                 }))

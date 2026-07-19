@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::fs;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -24,6 +25,7 @@ use agentdeck_protocol::{
     CodexReasoningEffort, CodexSandboxMode,
 };
 use rusqlite::{Connection, OpenFlags};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use super::*;
@@ -90,6 +92,29 @@ struct BlockAcceptCommandBeforeCommit {
     entered: Arc<Barrier>,
     release: Arc<Barrier>,
     blocked: AtomicBool,
+}
+
+struct RecordingUpgradeService {
+    prepares: AtomicUsize,
+    arms: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl crate::runtime::upgrade::UpgradeService for RecordingUpgradeService {
+    async fn prepare(
+        &self,
+        request: StageUpgradeRequest,
+    ) -> Result<crate::runtime::upgrade::PreparedUpgrade, RuntimeFailure> {
+        self.prepares.fetch_add(1, Ordering::SeqCst);
+        let target_version = request.target_version().to_owned();
+        let arms = self.arms.clone();
+        Ok(crate::runtime::upgrade::PreparedUpgrade::with_deferred(
+            StageUpgradeReceipt::Staged { target_version },
+            crate::runtime::upgrade::DeferredUpgrade::new(move || {
+                arms.fetch_add(1, Ordering::SeqCst);
+            }),
+        ))
+    }
 }
 
 impl super::super::store::RuntimeStoreFaultInjector for BlockAcceptCommandBeforeCommit {
@@ -399,6 +424,161 @@ async fn connect_local(core: &RuntimeCore, seed: u8) -> ConnectionId {
         .expect("connect local")
 }
 
+fn connect_local_control_with_sink(
+    core: &RuntimeCore,
+    seed: u8,
+) -> (
+    ConnectionId,
+    mpsc::Receiver<crate::runtime::ConnectionWrite>,
+) {
+    let principal = core
+        .issue_verified_local_control_principal(501, [seed; 16])
+        .expect("issue local control principal");
+    let (sink, receiver) = mpsc::channel::<crate::runtime::ConnectionWrite>(2);
+    let connection = core
+        .connect(principal, ConnectionSink::new(sink))
+        .expect("connect local control");
+    (connection, receiver)
+}
+
+fn stage_upgrade_envelope(key: &str, message: &str) -> RuntimeEnvelope {
+    RuntimeEnvelope {
+        version: RUNTIME_PROTOCOL_VERSION,
+        message_id: MessageId::new(message),
+        body: RuntimeMessage::Request(RuntimeRequest::StageUpgrade(
+            StageUpgradeRequest::new(
+                "1.2.3".to_owned(),
+                ArtifactSha256::new("ab".repeat(32)).expect("artifact hash"),
+                IdempotencyKey::new(key),
+                LocalOnlyAdministration::LocalOnly,
+            )
+            .expect("stage request"),
+        )),
+    }
+}
+
+fn artifact_hash(bytes: &[u8]) -> ArtifactSha256 {
+    ArtifactSha256::new(
+        <[u8; 32]>::from(Sha256::digest(bytes))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+    )
+    .expect("canonical artifact hash")
+}
+
+fn versioned_upgrade_fixture(
+    root: &TestRoot,
+    version: &str,
+    key: &str,
+) -> (PathBuf, StageUpgradeRequest) {
+    let bin_root = root.path.join("bin");
+    let version_root = bin_root.join(version);
+    fs::create_dir_all(&version_root).expect("create versioned upgrade fixture");
+    fs::set_permissions(&bin_root, fs::Permissions::from_mode(0o700))
+        .expect("secure upgrade bin root");
+    fs::set_permissions(&version_root, fs::Permissions::from_mode(0o700))
+        .expect("secure upgrade version root");
+    let candidate = b"crash-recoverable daemon candidate";
+    let daemon = version_root.join("agentdeckd");
+    fs::write(&daemon, candidate).expect("write upgrade candidate");
+    fs::set_permissions(&daemon, fs::Permissions::from_mode(0o500))
+        .expect("secure upgrade candidate");
+    let current = bin_root.join("current");
+    if fs::symlink_metadata(&current).is_err() {
+        symlink("old", current).expect("seed old current link");
+    }
+    let request = StageUpgradeRequest::new(
+        version.to_owned(),
+        artifact_hash(candidate),
+        IdempotencyKey::new(key),
+        LocalOnlyAdministration::LocalOnly,
+    )
+    .expect("valid crash recovery upgrade request");
+    (bin_root, request)
+}
+
+async fn versioned_upgrade_core(
+    root: &TestRoot,
+    bin_root: &Path,
+    trust_seed: u8,
+) -> (Arc<RuntimeCore>, mpsc::UnboundedReceiver<()>) {
+    let store = root.open_store().await;
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let (exit, receiver) = mpsc::unbounded_channel();
+    let core = Arc::new(
+        RuntimeCore::new(store, router, [trust_seed; 32])
+            .expect("construct crash recovery upgrade Core")
+            .with_versioned_daemon_upgrade(bin_root.to_path_buf(), exit)
+            .expect("install crash recovery upgrade service"),
+    );
+    core.recover()
+        .await
+        .expect("recover crash recovery upgrade Core");
+    (core, receiver)
+}
+
+async fn begin_stage_upgrade(
+    core: &Arc<RuntimeCore>,
+    request: StageUpgradeRequest,
+    principal_seed: u8,
+    message_id: &str,
+) -> (
+    crate::runtime::ConnectionWrite,
+    tokio::task::JoinHandle<Result<(), RuntimeFailure>>,
+) {
+    let (connection, mut writes) = connect_local_control_with_sink(core, principal_seed);
+    let message_id = MessageId::new(message_id.to_owned());
+    let handling = {
+        let core = core.clone();
+        tokio::spawn(async move {
+            core.handle_envelope(
+                connection,
+                RuntimeEnvelope {
+                    version: RUNTIME_PROTOCOL_VERSION,
+                    message_id,
+                    body: RuntimeMessage::Request(RuntimeRequest::StageUpgrade(request)),
+                },
+            )
+            .await
+        })
+    };
+    let write = tokio::time::timeout(std::time::Duration::from_secs(2), writes.recv())
+        .await
+        .expect("StageUpgrade reply deadline")
+        .expect("StageUpgrade reply write");
+    (write, handling)
+}
+
+async fn assert_upgrade_conflict(
+    core: &Arc<RuntimeCore>,
+    request: &StageUpgradeRequest,
+    principal_seed: u8,
+    message_id: &str,
+) {
+    let conflict = StageUpgradeRequest::new(
+        "9.9.9-conflict".to_owned(),
+        ArtifactSha256::new("cd".repeat(32)).expect("conflicting hash"),
+        request.idempotency_key().clone(),
+        LocalOnlyAdministration::LocalOnly,
+    )
+    .expect("valid conflicting upgrade request");
+    let (write, handling) = begin_stage_upgrade(core, conflict, principal_seed, message_id).await;
+    let reply: RuntimeEnvelope =
+        serde_json::from_slice(write.bytes()).expect("decode conflict reply");
+    assert!(matches!(
+        reply.body,
+        RuntimeMessage::Reply(RuntimeReply::StageUpgrade(StageUpgradeReceipt::Failed {
+            failure: RuntimeFailure { ref code, .. },
+        })) if code == "daemon.command.idempotency_conflict"
+    ));
+    write.acknowledge().expect("ACK conflict reply");
+    handling
+        .await
+        .expect("join conflict handler")
+        .expect("flush conflict reply");
+}
+
 async fn saturate_paced_writer(
     core: &RuntimeCore,
     connection: ConnectionId,
@@ -459,6 +639,11 @@ async fn runtime_core_issues_explicit_local_control_without_upgrading_read_only_
         .require_retry()
         .expect("local-control retry permission");
     drop(approval);
+    drop(
+        control
+            .try_enter_local_administration()
+            .expect("local-control administration capability"),
+    );
     assert!(
         core.issue_verified_local_principal(501, [0x21; 16])
             .is_err(),
@@ -470,6 +655,10 @@ async fn runtime_core_issues_explicit_local_control_without_upgrading_read_only_
         .expect("issue read-only local principal");
     assert!(matches!(
         read_only.try_enter_approval(),
+        Err(crate::runtime::connection::PrincipalAccessError::PermissionDenied)
+    ));
+    assert!(matches!(
+        read_only.try_enter_local_administration(),
         Err(crate::runtime::connection::PrincipalAccessError::PermissionDenied)
     ));
     assert!(
@@ -616,6 +805,27 @@ async fn runtime_v2_describe_configure_and_metadata_cut_over_without_enabling_up
         .await;
     assert!(matches!(
         stage,
+        RuntimeReply::StageUpgrade(StageUpgradeReceipt::Failed {
+            failure: RuntimeFailure { code, .. }
+        }) if code == DAEMON_AUTHORIZATION_PERMISSION_DENIED
+    ));
+    let (control_connection, _control_writes) = connect_local_control_with_sink(&core, 0x73);
+    let direct_control_stage = core
+        .handle(
+            control_connection,
+            RuntimeRequest::StageUpgrade(
+                StageUpgradeRequest::new(
+                    "1.2.3".into(),
+                    ArtifactSha256::new("ab".repeat(32)).unwrap(),
+                    IdempotencyKey::new("v2-direct-control-stage"),
+                    LocalOnlyAdministration::LocalOnly,
+                )
+                .unwrap(),
+            ),
+        )
+        .await;
+    assert!(matches!(
+        direct_control_stage,
         RuntimeReply::StageUpgrade(StageUpgradeReceipt::Failed {
             failure: RuntimeFailure { code, .. }
         }) if code == DAEMON_RUNTIME_FEATURE_UNAVAILABLE
@@ -3022,6 +3232,584 @@ async fn envelope_request_reply_reuses_the_exact_request_message_id() {
     ));
     write.acknowledge().expect("ACK directed reply flush");
     core.shutdown().await.expect("shutdown core");
+}
+
+#[tokio::test]
+async fn stage_upgrade_arms_only_after_exact_flush_ack_and_survives_later_disconnect() {
+    let root = TestRoot::new("upgrade-flush-ack");
+    let store = root.open_store().await;
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let arms = Arc::new(AtomicUsize::new(0));
+    let service = Arc::new(RecordingUpgradeService {
+        prepares: AtomicUsize::new(0),
+        arms: arms.clone(),
+    });
+    let core = Arc::new(
+        RuntimeCore::new(store, router, [0xA1; 32])
+            .expect("construct upgrade Core")
+            .with_test_upgrade_service(service.clone()),
+    );
+    core.recover().await.expect("recover upgrade Core");
+
+    let read_only = core
+        .issue_verified_local_principal(501, [0x80; 16])
+        .expect("issue read-only local principal");
+    let (read_only_sink, mut read_only_writes) =
+        mpsc::channel::<crate::runtime::ConnectionWrite>(1);
+    let read_only_connection = core
+        .connect(read_only, ConnectionSink::new(read_only_sink))
+        .expect("connect read-only principal");
+    let denied = {
+        let core = core.clone();
+        tokio::spawn(async move {
+            core.handle_envelope(
+                read_only_connection,
+                stage_upgrade_envelope("read-only-denied", "upgrade-read-only-denied"),
+            )
+            .await
+        })
+    };
+    let denied_write = read_only_writes.recv().await.expect("denied reply write");
+    let denied_reply: RuntimeEnvelope =
+        serde_json::from_slice(denied_write.bytes()).expect("decode denied reply");
+    assert!(matches!(
+        denied_reply.body,
+        RuntimeMessage::Reply(RuntimeReply::StageUpgrade(StageUpgradeReceipt::Failed {
+            failure: RuntimeFailure { ref code, .. },
+        })) if code == DAEMON_AUTHORIZATION_PERMISSION_DENIED
+    ));
+    denied_write
+        .acknowledge()
+        .expect("ACK authorization denial");
+    denied
+        .await
+        .expect("denied handler task")
+        .expect("denied handler result");
+    assert_eq!(service.prepares.load(Ordering::SeqCst), 0);
+    assert_eq!(arms.load(Ordering::SeqCst), 0);
+
+    // Transport 丢弃未 ACK write：durable prepare 可以存在，但 action 必须保持未 arm。
+    let (failed_connection, mut failed_writes) = connect_local_control_with_sink(&core, 0x81);
+    let failed = {
+        let core = core.clone();
+        tokio::spawn(async move {
+            core.handle_envelope(
+                failed_connection,
+                stage_upgrade_envelope("flush-failed", "upgrade-flush-failed"),
+            )
+            .await
+        })
+    };
+    let failed_write = failed_writes.recv().await.expect("failed flush write");
+    assert_eq!(arms.load(Ordering::SeqCst), 0);
+    drop(failed_write);
+    assert!(failed.await.expect("failed handler task").is_err());
+    assert_eq!(arms.load(Ordering::SeqCst), 0);
+
+    // Caller future 在 transport ACK 前取消，即使 writer 随后完成也没有 action owner。
+    let (cancelled_connection, mut cancelled_writes) = connect_local_control_with_sink(&core, 0x82);
+    let cancelled = {
+        let core = core.clone();
+        tokio::spawn(async move {
+            core.handle_envelope(
+                cancelled_connection,
+                stage_upgrade_envelope("caller-cancelled", "upgrade-caller-cancelled"),
+            )
+            .await
+        })
+    };
+    let cancelled_write = cancelled_writes.recv().await.expect("cancelled write");
+    cancelled.abort();
+    let _ = cancelled.await;
+    let _ = cancelled_write.acknowledge();
+    tokio::task::yield_now().await;
+    assert_eq!(arms.load(Ordering::SeqCst), 0);
+
+    // 完整 write/newline/flush 的 ConnectionWrite ACK 是唯一 arm 边界；ACK 后断开
+    // 当前 connection 不得撤销已移交给 daemon 的 action。
+    let (acked_connection, mut acked_writes) = connect_local_control_with_sink(&core, 0x83);
+    let acked = {
+        let core = core.clone();
+        tokio::spawn(async move {
+            core.handle_envelope(
+                acked_connection,
+                stage_upgrade_envelope("flush-acked", "upgrade-flush-acked"),
+            )
+            .await
+        })
+    };
+    let acked_write = acked_writes.recv().await.expect("ACK write");
+    let reply: RuntimeEnvelope =
+        serde_json::from_slice(acked_write.bytes()).expect("decode StageUpgrade reply");
+    assert!(matches!(
+        reply.body,
+        RuntimeMessage::Reply(RuntimeReply::StageUpgrade(StageUpgradeReceipt::Staged {
+            ref target_version,
+        })) if target_version == "1.2.3"
+    ));
+    assert_eq!(arms.load(Ordering::SeqCst), 0);
+    acked_write
+        .acknowledge()
+        .expect("ACK exact transport flush");
+    acked
+        .await
+        .expect("ACK handler task")
+        .expect("ACK handler result");
+    assert_eq!(arms.load(Ordering::SeqCst), 1);
+    core.disconnect(acked_connection).await;
+    assert_eq!(arms.load(Ordering::SeqCst), 1);
+    assert_eq!(service.prepares.load(Ordering::SeqCst), 3);
+
+    core.shutdown().await.expect("shutdown upgrade Core");
+}
+
+#[tokio::test]
+async fn durable_stage_waits_for_active_turn_then_switches_current_and_requests_main_exit() {
+    let root = TestRoot::new("upgrade-active-idle");
+    let store = root.open_store().await;
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let execution = super::super::conversation::tests::FakeCoordinator::held();
+    let bin_root = root.path.join("bin");
+    let version_root = bin_root.join("2.3.4");
+    fs::create_dir_all(&version_root).expect("version root");
+    fs::set_permissions(&bin_root, fs::Permissions::from_mode(0o700)).expect("bin root mode");
+    fs::set_permissions(&version_root, fs::Permissions::from_mode(0o700))
+        .expect("version root mode");
+    let candidate = b"versioned daemon candidate";
+    let daemon = version_root.join("agentdeckd");
+    fs::write(&daemon, candidate).expect("candidate daemon");
+    fs::set_permissions(&daemon, fs::Permissions::from_mode(0o500)).expect("candidate mode");
+    symlink("old", bin_root.join("current")).expect("old current");
+    let (upgrade_exit, mut upgrade_exit_receiver) = mpsc::unbounded_channel();
+    let core = Arc::new(
+        RuntimeCore::new_with_test_execution_coordinator(
+            store,
+            router,
+            [0xA8; 32],
+            Arc::new(execution.clone()),
+        )
+        .expect("construct active upgrade Core")
+        .with_versioned_daemon_upgrade(bin_root.clone(), upgrade_exit)
+        .expect("install durable upgrade service"),
+    );
+    core.recover().await.expect("recover active upgrade Core");
+
+    let user_connection = connect_local(&core, 0x84).await;
+    let conversation = start_receipt(
+        core.handle(user_connection, start_request("upgrade-active-start"))
+            .await,
+    );
+    configure_codex_revision_one(
+        &core,
+        user_connection,
+        conversation.conversation_id.clone(),
+        "upgrade-active-configure",
+    )
+    .await;
+    let command_id = match core
+        .handle(
+            user_connection,
+            RuntimeRequest::SendPrompt(SendPromptRequest {
+                conversation_id: conversation.conversation_id.clone(),
+                idempotency_key: IdempotencyKey::new("upgrade-active-prompt"),
+                expected_configuration_revision: 1,
+                prompt: PromptPayload::new("hold one active turn").expect("prompt"),
+            }),
+        )
+        .await
+    {
+        RuntimeReply::Command(CommandReceipt::Accepted { command_id, .. }) => command_id,
+        other => panic!("expected Accepted command, got {other:?}"),
+    };
+    execution.wait_for_starts(1).await;
+    assert_eq!(execution.active(), 1);
+
+    let request = StageUpgradeRequest::new(
+        "2.3.4".to_owned(),
+        artifact_hash(candidate),
+        IdempotencyKey::new("upgrade-active-admin"),
+        LocalOnlyAdministration::LocalOnly,
+    )
+    .expect("upgrade request");
+    let (admin_connection, mut admin_writes) = connect_local_control_with_sink(&core, 0x85);
+    let handling = {
+        let core = core.clone();
+        let request = request.clone();
+        tokio::spawn(async move {
+            core.handle_envelope(
+                admin_connection,
+                RuntimeEnvelope {
+                    version: RUNTIME_PROTOCOL_VERSION,
+                    message_id: MessageId::new("upgrade-active-envelope"),
+                    body: RuntimeMessage::Request(RuntimeRequest::StageUpgrade(request)),
+                },
+            )
+            .await
+        })
+    };
+    let write = admin_writes.recv().await.expect("AwaitingIdle write");
+    let reply: RuntimeEnvelope =
+        serde_json::from_slice(write.bytes()).expect("decode AwaitingIdle reply");
+    assert!(matches!(
+        reply.body,
+        RuntimeMessage::Reply(RuntimeReply::StageUpgrade(
+            StageUpgradeReceipt::AwaitingIdle {
+                ref target_version,
+                active_turns: 1,
+            }
+        )) if target_version == "2.3.4"
+    ));
+    assert_eq!(
+        fs::read_link(bin_root.join("current")).expect("current before ACK"),
+        Path::new("old")
+    );
+    write.acknowledge().expect("ACK AwaitingIdle reply");
+    handling
+        .await
+        .expect("upgrade handler task")
+        .expect("upgrade handler result");
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            upgrade_exit_receiver.recv()
+        )
+        .await
+        .is_err(),
+        "active turn must keep current and exit unchanged"
+    );
+    assert_eq!(
+        fs::read_link(bin_root.join("current")).expect("current while active"),
+        Path::new("old")
+    );
+
+    execution.release(parse_command_id(&command_id).expect("internal command id"));
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        upgrade_exit_receiver.recv(),
+    )
+    .await
+    .expect("idle upgrade exit deadline")
+    .expect("main-loop exit signal");
+    assert_eq!(
+        fs::read_link(bin_root.join("current")).expect("switched current"),
+        Path::new("2.3.4")
+    );
+    let durable = core
+        .store
+        .query_admin_upgrade(request)
+        .await
+        .expect("query durable upgrade")
+        .expect("durable upgrade row");
+    assert_eq!(
+        durable.status(),
+        crate::runtime::store::AdminUpgradeStatus::Completed
+    );
+
+    core.shutdown().await.expect("shutdown active upgrade Core");
+}
+
+#[tokio::test]
+async fn pending_upgrade_restart_requires_a_new_exact_flush_ack_before_switch() {
+    let root = TestRoot::new("upgrade-pending-retry");
+    let (bin_root, request) =
+        versioned_upgrade_fixture(&root, "3.1.0", "upgrade-pending-retry-key");
+    let (first, mut first_exit) = versioned_upgrade_core(&root, &bin_root, 0xB1).await;
+    let (unacked, handling) =
+        begin_stage_upgrade(&first, request.clone(), 0xB1, "upgrade-before-ack").await;
+    let reply: RuntimeEnvelope =
+        serde_json::from_slice(unacked.bytes()).expect("decode pre-ACK StageUpgrade reply");
+    assert!(matches!(
+        reply.body,
+        RuntimeMessage::Reply(RuntimeReply::StageUpgrade(StageUpgradeReceipt::Staged {
+            ref target_version,
+        })) if target_version == "3.1.0"
+    ));
+    assert_eq!(
+        fs::read_link(bin_root.join("current")).expect("current before first ACK"),
+        Path::new("old")
+    );
+    drop(unacked);
+    assert!(
+        handling.await.expect("join pre-ACK handler").is_err(),
+        "dropped transport ACK must cancel the deferred action"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), first_exit.recv())
+            .await
+            .is_err(),
+        "pre-ACK failure must not request daemon exit"
+    );
+    let pending = first
+        .store
+        .query_admin_upgrade(request.clone())
+        .await
+        .expect("query pre-ACK durable row")
+        .expect("pre-ACK durable row");
+    assert_eq!(
+        pending.status(),
+        crate::runtime::store::AdminUpgradeStatus::Pending
+    );
+    first.shutdown().await.expect("shutdown pre-ACK Core");
+
+    // ACK 前崩溃与 ACK 后、deferred task 真正开始前崩溃在 durable Store 中故意同态：
+    // 两者都只保留 Pending。为避免无 ACK switch，restart 绝不自动 arm；调用方必须
+    // 以 deterministic exact request 重试，并再次取得完整 flush ACK。
+    let (restarted, mut restarted_exit) = versioned_upgrade_core(&root, &bin_root, 0xB2).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), restarted_exit.recv())
+            .await
+            .is_err(),
+        "Pending restart must not auto-arm an indistinguishable request"
+    );
+    assert_eq!(
+        fs::read_link(bin_root.join("current")).expect("current after Pending restart"),
+        Path::new("old")
+    );
+    assert_upgrade_conflict(&restarted, &request, 0xB2, "upgrade-pending-conflict").await;
+
+    let (retry, retry_handling) = begin_stage_upgrade(
+        &restarted,
+        request.clone(),
+        0xB3,
+        "upgrade-pending-exact-retry",
+    )
+    .await;
+    let retry_reply: RuntimeEnvelope =
+        serde_json::from_slice(retry.bytes()).expect("decode exact retry reply");
+    assert!(matches!(
+        retry_reply.body,
+        RuntimeMessage::Reply(RuntimeReply::StageUpgrade(StageUpgradeReceipt::Replayed {
+            ref target_version,
+        })) if target_version == "3.1.0"
+    ));
+    assert_eq!(
+        fs::read_link(bin_root.join("current")).expect("current before retry ACK"),
+        Path::new("old")
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), restarted_exit.recv())
+            .await
+            .is_err(),
+        "exact replay without ACK must still leave exit unchanged"
+    );
+    retry.acknowledge().expect("ACK exact retry");
+    retry_handling
+        .await
+        .expect("join exact retry handler")
+        .expect("flush exact retry");
+    tokio::time::timeout(std::time::Duration::from_secs(3), restarted_exit.recv())
+        .await
+        .expect("retry-triggered upgrade exit deadline")
+        .expect("retry-triggered upgrade exit");
+    assert_eq!(
+        fs::read_link(bin_root.join("current")).expect("current after retry ACK"),
+        Path::new("3.1.0")
+    );
+    let completed = restarted
+        .store
+        .query_admin_upgrade(request)
+        .await
+        .expect("query completed retry")
+        .expect("completed retry row");
+    assert_eq!(
+        completed.status(),
+        crate::runtime::store::AdminUpgradeStatus::Completed
+    );
+    restarted
+        .shutdown()
+        .await
+        .expect("shutdown exact-retry Core");
+}
+
+#[tokio::test]
+async fn switched_pending_retry_finalizes_idempotently_and_completed_replay_is_inert() {
+    let root = TestRoot::new("upgrade-switched-retry");
+    let (bin_root, request) =
+        versioned_upgrade_fixture(&root, "3.2.0", "upgrade-switched-retry-key");
+    let store = root.open_store().await;
+    store
+        .accept_admin_upgrade(request.clone())
+        .await
+        .expect("persist pending upgrade before simulated crash");
+    crate::runtime::upgrade::VersionedDaemonSwitcher::new(bin_root.clone())
+        .expect("construct simulated crash switcher")
+        .switch("3.2.0", request.candidate_sha256())
+        .expect("switch current before simulated finalize crash");
+    store
+        .shutdown()
+        .await
+        .expect("close Store at post-switch/pre-finalize boundary");
+
+    let (restarted, mut restarted_exit) = versioned_upgrade_core(&root, &bin_root, 0xB4).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), restarted_exit.recv())
+            .await
+            .is_err(),
+        "post-switch Pending restart must still require exact replay"
+    );
+    assert_eq!(
+        fs::read_link(bin_root.join("current")).expect("already-switched current"),
+        Path::new("3.2.0")
+    );
+    assert_upgrade_conflict(&restarted, &request, 0xB4, "upgrade-switched-conflict").await;
+    let (retry, retry_handling) = begin_stage_upgrade(
+        &restarted,
+        request.clone(),
+        0xB5,
+        "upgrade-switched-exact-retry",
+    )
+    .await;
+    let retry_reply: RuntimeEnvelope =
+        serde_json::from_slice(retry.bytes()).expect("decode switched exact retry");
+    assert!(matches!(
+        retry_reply.body,
+        RuntimeMessage::Reply(RuntimeReply::StageUpgrade(StageUpgradeReceipt::Replayed {
+            ref target_version,
+        })) if target_version == "3.2.0"
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), restarted_exit.recv())
+            .await
+            .is_err(),
+        "already-current retry must not exit before its new ACK"
+    );
+    retry.acknowledge().expect("ACK switched exact retry");
+    retry_handling
+        .await
+        .expect("join switched retry handler")
+        .expect("flush switched retry");
+    tokio::time::timeout(std::time::Duration::from_secs(3), restarted_exit.recv())
+        .await
+        .expect("switched retry exit deadline")
+        .expect("switched retry exit");
+    assert_eq!(
+        fs::read_link(bin_root.join("current")).expect("current after idempotent reswitch"),
+        Path::new("3.2.0")
+    );
+    let completed = restarted
+        .store
+        .query_admin_upgrade(request.clone())
+        .await
+        .expect("query idempotently completed row")
+        .expect("idempotently completed row");
+    assert_eq!(
+        completed.status(),
+        crate::runtime::store::AdminUpgradeStatus::Completed
+    );
+    restarted
+        .shutdown()
+        .await
+        .expect("shutdown post-switch retry Core");
+
+    // Completed/current 已切但 main 尚未真正退出时崩溃：新进程从 current 启动后，
+    // exact install replay 只读回 terminal Replayed，不重新 arm、switch 或发 exit。
+    let (completed_core, mut completed_exit) = versioned_upgrade_core(&root, &bin_root, 0xB6).await;
+    assert_upgrade_conflict(
+        &completed_core,
+        &request,
+        0xB6,
+        "upgrade-completed-conflict",
+    )
+    .await;
+    let (replayed, replay_handling) = begin_stage_upgrade(
+        &completed_core,
+        request,
+        0xB7,
+        "upgrade-completed-exact-replay",
+    )
+    .await;
+    let replay_reply: RuntimeEnvelope =
+        serde_json::from_slice(replayed.bytes()).expect("decode Completed replay");
+    assert!(matches!(
+        replay_reply.body,
+        RuntimeMessage::Reply(RuntimeReply::StageUpgrade(StageUpgradeReceipt::Replayed {
+            ref target_version,
+        })) if target_version == "3.2.0"
+    ));
+    replayed.acknowledge().expect("ACK Completed replay");
+    replay_handling
+        .await
+        .expect("join Completed replay handler")
+        .expect("flush Completed replay");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(250), completed_exit.recv())
+            .await
+            .is_err(),
+        "Completed replay must not arm a second switch or exit"
+    );
+    assert_eq!(
+        fs::read_link(bin_root.join("current")).expect("current after Completed replay"),
+        Path::new("3.2.0")
+    );
+    completed_core
+        .shutdown()
+        .await
+        .expect("shutdown Completed replay Core");
+}
+
+#[tokio::test]
+async fn concurrent_acked_upgrades_switch_only_one_version_before_main_exit() {
+    let root = TestRoot::new("upgrade-single-exit-winner");
+    let (bin_root, first_request) =
+        versioned_upgrade_fixture(&root, "4.0.0", "upgrade-first-winner-key");
+    let (_, second_request) =
+        versioned_upgrade_fixture(&root, "4.1.0", "upgrade-second-winner-key");
+    let (core, mut exit) = versioned_upgrade_core(&root, &bin_root, 0xB8).await;
+
+    let (first_write, first_handler) =
+        begin_stage_upgrade(&core, first_request.clone(), 0xB8, "upgrade-first-winner").await;
+    let (second_write, second_handler) =
+        begin_stage_upgrade(&core, second_request.clone(), 0xB9, "upgrade-second-winner").await;
+    first_write.acknowledge().expect("ACK first upgrade");
+    second_write.acknowledge().expect("ACK second upgrade");
+    first_handler
+        .await
+        .expect("join first upgrade handler")
+        .expect("flush first upgrade");
+    second_handler
+        .await
+        .expect("join second upgrade handler")
+        .expect("flush second upgrade");
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), exit.recv())
+        .await
+        .expect("winning upgrade exit deadline")
+        .expect("winning upgrade exit");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(250), exit.recv())
+            .await
+            .is_err(),
+        "one process lifetime must publish exactly one upgrade exit"
+    );
+    let current = fs::read_link(bin_root.join("current")).expect("winning current link");
+    assert!(matches!(current.to_str(), Some("4.0.0" | "4.1.0")));
+    let first = core
+        .store
+        .query_admin_upgrade(first_request)
+        .await
+        .expect("query first concurrent upgrade")
+        .expect("first concurrent upgrade row");
+    let second = core
+        .store
+        .query_admin_upgrade(second_request)
+        .await
+        .expect("query second concurrent upgrade")
+        .expect("second concurrent upgrade row");
+    assert_eq!(
+        usize::from(first.status() == crate::runtime::store::AdminUpgradeStatus::Completed)
+            + usize::from(second.status() == crate::runtime::store::AdminUpgradeStatus::Completed),
+        1,
+        "exactly one ACKed upgrade may complete before main exit"
+    );
+    assert_eq!(
+        usize::from(first.status() == crate::runtime::store::AdminUpgradeStatus::Pending)
+            + usize::from(second.status() == crate::runtime::store::AdminUpgradeStatus::Pending),
+        1,
+        "the non-winning request must remain retryable Pending"
+    );
+    core.shutdown()
+        .await
+        .expect("shutdown concurrent upgrade Core");
 }
 
 #[tokio::test]

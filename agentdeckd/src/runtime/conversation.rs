@@ -50,14 +50,14 @@ use super::native_metadata::{
 use super::recovery::RecoveryReadyPermit;
 use super::store::{
     AcceptCommand, AcceptOutcome, AcceptedTerminationReason, AuthorizeExecutionRelease,
-    AuthorizedAcceptOutcome, CommandExecutionConfiguration, CommandRecord, CommandState,
-    CommandTerminal, CompleteCommand, ConversationRecord, ExecutionFence, ExecutionFenceRecord,
-    MarkConversationRecoveryBlocked, NativeProjectionCandidateDisposition,
-    RecoveryBlockedCommandBinding, RecoveryFenceBinding, RuntimeCommitOperation, RuntimeId,
-    RuntimeIdKind, RuntimeStoreError, RuntimeStoreHandle, StartCommand, StartOutcome,
-    StartedBeforeReleaseTermination, SystemRuntimeClock, TerminateAcceptedCommand,
-    TerminateAcceptedOutcome, TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
-    UpdateManagedConversationMetadata,
+    AuthorizedAcceptOutcome, CommandExecutionConfiguration, CommandReceiptSelector, CommandRecord,
+    CommandState, CommandTerminal, CompleteCommand, ConversationRecord, ExecutionFence,
+    ExecutionFenceRecord, MarkConversationRecoveryBlocked, NativeProjectionCandidateDisposition,
+    QueryCommandReceipt, RecoveryBlockedCommandBinding, RecoveryFenceBinding,
+    RuntimeCommitOperation, RuntimeId, RuntimeIdKind, RuntimeStoreError, RuntimeStoreHandle,
+    StartCommand, StartOutcome, StartedBeforeReleaseTermination, SystemRuntimeClock,
+    TerminateAcceptedCommand, TerminateAcceptedOutcome, TerminateStartedBeforeRelease,
+    TerminateStartedBeforeReleaseOutcome, UpdateManagedConversationMetadata,
 };
 use crate::agent::{AdapterEvent, AdapterItemKey};
 
@@ -140,6 +140,7 @@ pub(crate) struct ConversationRegistry {
     adapter_permits: Arc<Semaphore>,
     scheduling_gate: watch::Sender<bool>,
     start_transition: Arc<RwLock<()>>,
+    upgrade_transition: Arc<Mutex<()>>,
     approval_clock: Arc<dyn super::store::RuntimeClock>,
     approval_sleeper: Arc<dyn ApprovalSleeper>,
     approval_backoff: Arc<dyn ApprovalBackoff>,
@@ -331,6 +332,7 @@ impl ConversationRegistry {
             adapter_permits: Arc::new(Semaphore::new(adapter_concurrency)),
             scheduling_gate,
             start_transition: Arc::new(RwLock::new(())),
+            upgrade_transition: Arc::new(Mutex::new(())),
             approval_clock: Arc::new(SystemRuntimeClock),
             approval_sleeper: Arc::new(TokioApprovalSleeper),
             approval_backoff: Arc::new(FixedApprovalBackoff),
@@ -423,6 +425,7 @@ impl ConversationRegistry {
             control_rx,
             runner_tx,
             runner_rx,
+            next_start_attempt_id: 1,
             pending: recovered
                 .into_iter()
                 .map(|command| QueuedCommand {
@@ -824,6 +827,34 @@ impl ConversationRegistry {
         drop(start_fence);
     }
 
+    /// 暂停新的 Accepted→Started 转换，并等待已经取得 start read lease 的事务退出。
+    ///
+    /// 该暂停是可逆的：upgrade action 失败或 future 被取消时，guard drop 会重新开放
+    /// scheduling；只有成功切换并即将请求 daemon 退出时才显式 `commit_for_exit`。
+    /// `upgrade_transition` 把多个本机 admin 请求串行化，避免一个失败 guard 在另一个
+    /// upgrade 仍等待 idle 时错误恢复 scheduling。
+    pub(crate) async fn pause_starts_for_upgrade(
+        &self,
+    ) -> Result<UpgradeStartPause, ConversationError> {
+        let serial = self.upgrade_transition.clone().lock_owned().await;
+        if self.adapter_permits.is_closed() {
+            return Err(ConversationError::ActorUnavailable);
+        }
+        self.scheduling_gate.send_replace(false);
+        let fence = self.start_transition.clone().write_owned().await;
+        if self.adapter_permits.is_closed() {
+            return Err(ConversationError::ActorUnavailable);
+        }
+        Ok(UpgradeStartPause {
+            scheduling_gate: self.scheduling_gate.clone(),
+            start_transition: self.start_transition.clone(),
+            adapter_permits: self.adapter_permits.clone(),
+            _serial: serial,
+            fence: Some(fence),
+            restore_scheduling: true,
+        })
+    }
+
     /// 必须在 RuntimeCore 发布 Draining 前调用；返回时所有已取得 start lease 的
     /// Accepted→Started COMMIT 已退出，之后也无法再取得新 lease。
     pub(crate) async fn begin_draining(&self) {
@@ -942,6 +973,51 @@ impl ConversationRegistry {
     }
 }
 
+/// P3.10 deferred upgrade 独占的可逆 start-transition fence。
+///
+/// guard 不持有 RuntimeOperationGuard，也不拥有 RuntimeCore；因此等待 active turn、
+/// 执行文件切换或请求 main-loop exit 时不会形成 shutdown quiescence 自等待。
+pub(crate) struct UpgradeStartPause {
+    scheduling_gate: watch::Sender<bool>,
+    start_transition: Arc<RwLock<()>>,
+    adapter_permits: Arc<Semaphore>,
+    _serial: tokio::sync::OwnedMutexGuard<()>,
+    fence: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+    restore_scheduling: bool,
+}
+
+impl UpgradeStartPause {
+    /// Store 完成一次 authenticated active-Started 快照后释放 transition write fence，
+    /// 但继续保持 scheduling 关闭，使现有 active turn 可以收尾而 queued command 不会启动。
+    pub(crate) fn release_fence_while_waiting(&mut self) {
+        self.fence.take();
+    }
+
+    /// active turn 状态变化后重新取得 fence；返回时再次保证没有 Started COMMIT 在途。
+    pub(crate) async fn refence(&mut self) -> Result<(), ConversationError> {
+        if self.fence.is_none() {
+            self.fence = Some(self.start_transition.clone().write_owned().await);
+        }
+        if self.adapter_permits.is_closed() {
+            return Err(ConversationError::ActorUnavailable);
+        }
+        Ok(())
+    }
+
+    /// 成功切换后保持 scheduling 关闭，随后只允许 main loop 驱动正常 shutdown。
+    pub(crate) fn commit_for_exit(mut self) {
+        self.restore_scheduling = false;
+    }
+}
+
+impl Drop for UpgradeStartPause {
+    fn drop(&mut self) {
+        if self.restore_scheduling && !self.adapter_permits.is_closed() {
+            self.scheduling_gate.send_replace(true);
+        }
+    }
+}
+
 struct PromptCommand {
     principal: AuthenticatedPrincipal,
     authorization_guard: AuthorizationGuard,
@@ -1018,7 +1094,10 @@ enum StartFailureDisposition {
 
 struct ActiveCommand {
     command: CommandRecord,
+    start_attempt_id: u64,
     authorization_key: Option<PrincipalAuthorizationKey>,
+    principal: Option<AuthenticatedPrincipal>,
+    provenance: QueuedCommandProvenance,
     turn_id: Option<RuntimeId>,
     recovery_binding: RecoveryBlockedCommandBinding,
     control: Option<Arc<dyn RuntimeExecutionControl>>,
@@ -1083,6 +1162,10 @@ enum RunnerEvent {
         control: Arc<dyn RuntimeExecutionControl>,
         acknowledged: oneshot::Sender<Result<PreparedDecision, RuntimeExecutionError>>,
     },
+    StartPaused {
+        command_id: RuntimeId,
+        start_attempt_id: u64,
+    },
     Finished {
         command_id: RuntimeId,
     },
@@ -1091,6 +1174,7 @@ enum RunnerEvent {
     },
     RunnerExited {
         command_id: RuntimeId,
+        start_attempt_id: u64,
     },
 }
 
@@ -1135,6 +1219,7 @@ struct ConversationActor {
     control_rx: mpsc::Receiver<ControlCommand>,
     runner_tx: mpsc::Sender<RunnerEvent>,
     runner_rx: mpsc::Receiver<RunnerEvent>,
+    next_start_attempt_id: u64,
     pending: VecDeque<QueuedCommand>,
     active: Option<ActiveCommand>,
     approval_deliveries: HashMap<RuntimeId, ApprovalRoute>,
@@ -1247,14 +1332,7 @@ impl ConversationActor {
                             principal: Some(principal),
                             provenance: QueuedCommandProvenance::Live,
                         };
-                        let position = self
-                            .pending
-                            .iter()
-                            .position(|existing| {
-                                existing.command.command_seq > queued.command.command_seq
-                            })
-                            .unwrap_or(self.pending.len());
-                        self.pending.insert(position, queued);
+                        self.insert_pending_by_command_seq(queued);
                         Ok(PromptAcceptResult::Accepted {
                             command,
                             queue_position,
@@ -1276,14 +1354,7 @@ impl ConversationActor {
                                 principal: Some(principal),
                                 provenance: QueuedCommandProvenance::Live,
                             };
-                            let position = self
-                                .pending
-                                .iter()
-                                .position(|existing| {
-                                    existing.command.command_seq > queued.command.command_seq
-                                })
-                                .unwrap_or(self.pending.len());
-                            self.pending.insert(position, queued);
+                            self.insert_pending_by_command_seq(queued);
                         }
                         Ok(PromptAcceptResult::Replayed { command })
                     }
@@ -1504,10 +1575,21 @@ impl ConversationActor {
             .retain(|queued| queued.command.command_id != command_id);
     }
 
+    fn insert_pending_by_command_seq(&mut self, queued: QueuedCommand) {
+        let position = self
+            .pending
+            .iter()
+            .position(|existing| existing.command.command_seq > queued.command.command_seq)
+            .unwrap_or(self.pending.len());
+        self.pending.insert(position, queued);
+    }
+
     fn start_next(&mut self) {
         let Some(queued) = self.pending.pop_front() else {
             return;
         };
+        let start_attempt_id = self.next_start_attempt_id;
+        self.next_start_attempt_id = self.next_start_attempt_id.wrapping_add(1).max(1);
         let command = queued.command;
         let principal = queued.principal;
         let provenance = queued.provenance;
@@ -1515,7 +1597,7 @@ impl ConversationActor {
         let execution_task = AbortOnDropTask::new(tokio::spawn(execute_command(
             self.conversation.clone(),
             command.clone(),
-            principal,
+            principal.clone(),
             provenance,
             self.store.clone(),
             self.execution.clone(),
@@ -1524,12 +1606,14 @@ impl ConversationActor {
             self.scheduling_gate.clone(),
             self.start_transition.clone(),
             execution_gate.clone(),
+            start_attempt_id,
             self.runner_tx.clone(),
         )));
         let command_id = command.command_id;
         let runner_tx = self.runner_tx.clone();
         let task = AbortOnDropTask::new(tokio::spawn(supervise_execution_task(
             command_id,
+            start_attempt_id,
             execution_task,
             runner_tx,
         )));
@@ -1538,7 +1622,10 @@ impl ConversationActor {
                 command_id: command.command_id,
             },
             command,
+            start_attempt_id,
             authorization_key: queued.authorization_key,
+            principal,
+            provenance,
             turn_id: None,
             control: None,
             execution_gate,
@@ -1676,6 +1763,76 @@ impl ConversationActor {
                 };
                 let _ = acknowledged.send(result);
             }
+            RunnerEvent::StartPaused {
+                command_id,
+                start_attempt_id,
+            } => {
+                let Some(mut active) = self.active.take().filter(|active| {
+                    active.command.command_id == command_id
+                        && active.start_attempt_id == start_attempt_id
+                        && active.turn_id.is_none()
+                }) else {
+                    return;
+                };
+                stop_approval_expiry_watchdog(&mut active).await;
+                let joined = active.task.join().await;
+                if joined.is_err() {
+                    self.active = Some(active);
+                    self.enter_recovery_blocked_and_stop_approvals().await;
+                    self.active.take();
+                    return;
+                }
+
+                let receipt = self
+                    .store
+                    .query_command_receipt(QueryCommandReceipt {
+                        expected_owner: active.command.owner.clone(),
+                        selector: CommandReceiptSelector::Command {
+                            conversation_id: self.conversation.conversation_id,
+                            command_id,
+                        },
+                    })
+                    .await;
+                match receipt {
+                    Ok(receipt)
+                        if receipt.command_id == command_id
+                            && receipt.configuration_revision
+                                == active.command.configuration_revision
+                            && receipt.state == CommandState::Accepted
+                            && receipt.turn_id.is_none() =>
+                    {
+                        let duplicate = self.pending.iter().find(|queued| {
+                            queued.command.command_id == command_id
+                                || queued.command.command_seq == active.command.command_seq
+                        });
+                        if duplicate.is_some_and(|queued| queued.command != active.command) {
+                            self.active = Some(active);
+                            self.enter_recovery_blocked_and_stop_approvals().await;
+                            self.active.take();
+                            return;
+                        }
+                        if duplicate.is_none() {
+                            self.insert_pending_by_command_seq(QueuedCommand {
+                                command: active.command,
+                                authorization_key: active.authorization_key,
+                                principal: active.principal,
+                                provenance: active.provenance,
+                            });
+                        }
+                    }
+                    Ok(receipt)
+                        if receipt.command_id == command_id
+                            && receipt.configuration_revision
+                                == active.command.configuration_revision
+                            && receipt.state.is_terminal()
+                            && receipt.turn_id.is_none() => {}
+                    Ok(_) | Err(_) => {
+                        self.active = Some(active);
+                        self.enter_recovery_blocked_and_stop_approvals().await;
+                        self.active.take();
+                    }
+                }
+            }
             RunnerEvent::Finished { command_id } => {
                 if self
                     .active
@@ -1710,12 +1867,14 @@ impl ConversationActor {
                     }
                 }
             }
-            RunnerEvent::RunnerExited { command_id } => {
-                if self
-                    .active
-                    .as_ref()
-                    .is_some_and(|active| active.command.command_id == command_id)
-                {
+            RunnerEvent::RunnerExited {
+                command_id,
+                start_attempt_id,
+            } => {
+                if self.active.as_ref().is_some_and(|active| {
+                    active.command.command_id == command_id
+                        && active.start_attempt_id == start_attempt_id
+                }) {
                     let turn_id = self.active.as_ref().and_then(|active| active.turn_id);
                     self.enter_recovery_blocked().await;
                     if let Some(turn_id) = turn_id {
@@ -2476,12 +2635,16 @@ fn wire_approval_id(value: RuntimeId) -> ApprovalId {
 
 async fn supervise_execution_task(
     command_id: RuntimeId,
+    start_attempt_id: u64,
     mut execution_task: AbortOnDropTask<()>,
     runner_tx: mpsc::Sender<RunnerEvent>,
 ) {
     let _ = execution_task.join().await;
     let _ = runner_tx
-        .send(RunnerEvent::RunnerExited { command_id })
+        .send(RunnerEvent::RunnerExited {
+            command_id,
+            start_attempt_id,
+        })
         .await;
 }
 
@@ -2802,14 +2965,24 @@ async fn execute_command(
     scheduling_gate: watch::Receiver<bool>,
     start_transition: Arc<RwLock<()>>,
     execution_gate: Arc<Mutex<ActiveExecutionGate>>,
+    start_attempt_id: u64,
     runner_tx: mpsc::Sender<RunnerEvent>,
 ) {
     let Ok(_adapter_permit) = adapter_permits.acquire_owned().await else {
-        let _ = runner_tx
-            .send(RunnerEvent::RecoveryBlocked {
+        let event = if !*scheduling_gate.borrow() {
+            // Normal shutdown/committed upgrade closes scheduling before the shared
+            // semaphore. A pre-start command is still durable Accepted and must be
+            // left recoverable, not poison the conversation as RecoveryBlocked.
+            RunnerEvent::StartPaused {
                 command_id: accepted.command_id,
-            })
-            .await;
+                start_attempt_id,
+            }
+        } else {
+            RunnerEvent::RecoveryBlocked {
+                command_id: accepted.command_id,
+            }
+        };
+        let _ = runner_tx.send(event).await;
         return;
     };
     let authorization_guard = match principal {
@@ -2856,9 +3029,11 @@ async fn execute_command(
     let start_guard = start_transition.read().await;
     if !*scheduling_gate.borrow() {
         drop(start_guard);
+        drop(authorization_guard);
         let _ = runner_tx
-            .send(RunnerEvent::Finished {
+            .send(RunnerEvent::StartPaused {
                 command_id: accepted.command_id,
+                start_attempt_id,
             })
             .await;
         return;
@@ -4287,6 +4462,442 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[tokio::test]
+    async fn upgrade_start_pause_waits_for_inflight_transition_and_is_reversible() {
+        let root = TestRoot::new("upgrade-start-pause");
+        let store = root.open().await;
+        let registry = Arc::new(
+            ConversationRegistry::new(
+                store.clone(),
+                Arc::new(DisabledExecutionCoordinator),
+                runtime_id(RuntimeIdKind::DaemonBoot, 0xE1),
+                1,
+            )
+            .expect("registry"),
+        );
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+
+        let inflight_start = registry.start_transition.clone().read_owned().await;
+        let pausing = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.pause_starts_for_upgrade().await })
+        };
+        for _ in 0..100 {
+            if !*registry.scheduling_gate.borrow() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !*registry.scheduling_gate.borrow(),
+            "upgrade closes scheduling before waiting for an in-flight Started COMMIT"
+        );
+        assert!(
+            !pausing.is_finished(),
+            "upgrade fence cannot pass an existing start transition"
+        );
+
+        drop(inflight_start);
+        let mut pause = pausing
+            .await
+            .expect("pause task")
+            .expect("pause starts for upgrade");
+        assert!(!*registry.scheduling_gate.borrow());
+        pause.release_fence_while_waiting();
+
+        let second_pause = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.pause_starts_for_upgrade().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !second_pause.is_finished(),
+            "only one deferred upgrade may own the reversible pause"
+        );
+        pause.refence().await.expect("restore upgrade fence");
+        drop(pause);
+        assert!(
+            *registry.scheduling_gate.borrow(),
+            "a failed or cancelled upgrade restores scheduling"
+        );
+
+        let committed = second_pause
+            .await
+            .expect("second pause task")
+            .expect("second pause");
+        committed.commit_for_exit();
+        assert!(
+            !*registry.scheduling_gate.borrow(),
+            "a switched upgrade keeps starts closed for main-loop shutdown"
+        );
+
+        store
+            .shutdown()
+            .await
+            .expect("shutdown upgrade fence store");
+    }
+
+    #[tokio::test]
+    async fn upgrade_pause_requeues_prestart_accepted_before_later_command() {
+        let root = TestRoot::new("upgrade-pause-requeue-order");
+        let store = root.open().await;
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 0xE2).await;
+        let fake = FakeCoordinator::held();
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xE2),
+            1,
+        )
+        .expect("registry");
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        let principal = local_principal(0xE2);
+        let warmup = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "upgrade-warmup",
+                "leave a normal supervised exit in the runner mailbox",
+            )
+            .await,
+        );
+        fake.wait_for_starts(1).await;
+        fake.release(warmup.command_id);
+        fake.wait_for_completions(1).await;
+
+        // 精确冻结窗口：actor 可以 pop 最小 seq，但 runner 在 adapter permit 和
+        // start fence 之后才能观察 upgrade scheduling gate。
+        let adapter_permit = registry
+            .adapter_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("hold adapter permit");
+        let start_fence = registry.start_transition.clone().write_owned().await;
+        let first = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "upgrade-first",
+                "must survive a reversible upgrade pause",
+            )
+            .await,
+        );
+        let second = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "upgrade-second",
+                "must not overtake the first command",
+            )
+            .await,
+        );
+        assert!(first.command_seq < second.command_seq);
+
+        drop(adapter_permit);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while registry.adapter_permits.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pre-start runner acquires adapter permit");
+        registry.scheduling_gate.send_replace(false);
+        drop(start_fence);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while registry.adapter_permits.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("paused pre-start runner returns its adapter permit");
+
+        registry.scheduling_gate.send_replace(true);
+        fake.wait_for_starts(2).await;
+        assert_eq!(
+            fake.starts()[1].command_id,
+            first.command_id,
+            "reversible upgrade pause must not drop the smaller durable command_seq"
+        );
+        fake.release(first.command_id);
+        fake.wait_for_starts(3).await;
+        assert_eq!(fake.starts()[2].command_id, second.command_id);
+        fake.release(second.command_id);
+        fake.wait_for_completions(3).await;
+
+        registry.shutdown().await.expect("shutdown actors");
+        store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test]
+    async fn upgrade_pause_never_requeues_a_prestart_cancel_winner() {
+        let root = TestRoot::new("upgrade-pause-cancel-winner");
+        let store = root.open().await;
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 0xE3).await;
+        let fake = FakeCoordinator::held();
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xE3),
+            1,
+        )
+        .expect("registry");
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+
+        let adapter_permit = registry
+            .adapter_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("hold adapter permit");
+        let start_fence = registry.start_transition.clone().write_owned().await;
+        let principal = local_principal(0xE3);
+        let canceled = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "upgrade-cancel-winner",
+                "cancel wins while the paused start is returning",
+            )
+            .await,
+        );
+        let successor = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "upgrade-cancel-successor",
+                "only this command may execute",
+            )
+            .await,
+        );
+
+        drop(adapter_permit);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while registry.adapter_permits.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pre-start runner acquires adapter permit");
+        registry.scheduling_gate.send_replace(false);
+        drop(start_fence);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while registry.adapter_permits.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("paused pre-start runner returns its adapter permit");
+
+        assert!(matches!(
+            registry
+                .cancel_queued(
+                    conversation.conversation_id,
+                    canceled.command_id,
+                    principal.clone(),
+                    principal.try_enter().expect("cancel guard"),
+                )
+                .await
+                .expect("cancel paused command"),
+            QueuedCancelResult::Canceled { .. } | QueuedCancelResult::Replayed { .. }
+        ));
+        registry.scheduling_gate.send_replace(true);
+        fake.wait_for_starts(1).await;
+        assert_eq!(fake.starts()[0].command_id, successor.command_id);
+        fake.release(successor.command_id);
+        fake.wait_for_completions(1).await;
+        let receipt = store
+            .query_command_receipt(QueryCommandReceipt {
+                expected_owner: principal.idempotency_owner(),
+                selector: CommandReceiptSelector::Command {
+                    conversation_id: conversation.conversation_id,
+                    command_id: canceled.command_id,
+                },
+            })
+            .await
+            .expect("query canceled paused command");
+        assert_eq!(receipt.state, CommandState::Canceled);
+
+        registry.shutdown().await.expect("shutdown actors");
+        store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test]
+    async fn committed_upgrade_exit_preserves_permit_waiter_for_ready_fifo_recovery() {
+        let root = TestRoot::new("upgrade-exit-permit-waiter");
+        let keys = MemoryKeyStore::new();
+        let database = root.0.join("runtime.db");
+        let key_state = root.0.join("key-state.db");
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(database.clone()),
+            load_or_create_storage_kek(&keys, &key_state).expect("create upgrade exit KEK"),
+        )
+        .await
+        .expect("open upgrade exit store");
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 0xE4).await;
+        let pre_exit_fake = FakeCoordinator::held();
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(pre_exit_fake),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xE4),
+            1,
+        )
+        .expect("registry");
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+
+        let held_permit = registry
+            .adapter_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("hold sole adapter permit");
+        let principal = local_principal(0xE4);
+        let first = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "upgrade-exit-first",
+                "pre-start waiter must remain Accepted",
+            )
+            .await,
+        );
+        let second = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "upgrade-exit-second",
+                "successor must recover behind the waiter",
+            )
+            .await,
+        );
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+
+        registry
+            .pause_starts_for_upgrade()
+            .await
+            .expect("pause starts for committed upgrade")
+            .commit_for_exit();
+        registry.close_admission();
+        registry.shutdown().await.expect("shutdown upgrade actors");
+        drop(held_permit);
+        store.shutdown().await.expect("shutdown upgrade store");
+
+        let reopened = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(database),
+            load_or_create_storage_kek(&keys, &key_state).expect("reopen upgrade exit KEK"),
+        )
+        .await
+        .expect("reopen upgrade exit store");
+        let mut cursor = reopened
+            .begin_recovery_scan()
+            .await
+            .expect("begin upgrade exit recovery");
+        let recovered = loop {
+            let page = reopened
+                .load_recovery_page(cursor)
+                .await
+                .expect("load upgrade exit recovery page");
+            if let Some(recovery) = page.conversation {
+                let completion = page.completion;
+                if let Some(next) = page.next_cursor {
+                    cursor = next;
+                } else {
+                    reopened
+                        .finish_recovery_scan(completion.expect("terminal recovery completion"))
+                        .await
+                        .expect("finish upgrade exit recovery");
+                    break recovery;
+                }
+            } else if let Some(next) = page.next_cursor {
+                cursor = next;
+            } else {
+                panic!("upgrade exit recovery omitted the conversation");
+            }
+        };
+        assert_eq!(
+            recovered.conversation.lifecycle,
+            crate::runtime::store::ConversationLifecycle::Active,
+            "normal committed exit must not poison a never-started Accepted conversation"
+        );
+        assert_eq!(
+            recovered
+                .accepted
+                .iter()
+                .map(|command| command.command_id)
+                .collect::<Vec<_>>(),
+            [first.command_id, second.command_id]
+        );
+
+        let fake = FakeCoordinator::held();
+        let restarted = ConversationRegistry::new(
+            reopened.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xE5),
+            1,
+        )
+        .expect("restarted registry");
+        restarted
+            .install(recovered.conversation, recovered.accepted)
+            .await
+            .expect("install recovered actor");
+        restarted
+            .enable_scheduling()
+            .await
+            .expect("enable recovered scheduling");
+        fake.wait_for_starts(1).await;
+        assert_eq!(fake.starts()[0].command_id, first.command_id);
+        fake.release(first.command_id);
+        fake.wait_for_starts(2).await;
+        assert_eq!(fake.starts()[1].command_id, second.command_id);
+        fake.release(second.command_id);
+        fake.wait_for_completions(2).await;
+
+        restarted
+            .shutdown()
+            .await
+            .expect("shutdown restarted actors");
+        reopened
+            .shutdown()
+            .await
+            .expect("shutdown reopened upgrade store");
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8555,10 +9166,13 @@ pub(crate) mod tests {
         let command_id = runtime_id(RuntimeIdKind::Command, 0xEE);
         let (runner_tx, mut runner_rx) = mpsc::channel(1);
         let execution_task = AbortOnDropTask::new(tokio::spawn(async {}));
-        supervise_execution_task(command_id, execution_task, runner_tx).await;
+        supervise_execution_task(command_id, 7, execution_task, runner_tx).await;
         assert!(matches!(
             runner_rx.recv().await,
-            Some(RunnerEvent::RunnerExited { command_id: observed }) if observed == command_id
+            Some(RunnerEvent::RunnerExited {
+                command_id: observed,
+                start_attempt_id: 7,
+            }) if observed == command_id
         ));
     }
 

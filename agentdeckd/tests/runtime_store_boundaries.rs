@@ -468,6 +468,15 @@ fn runtime_ledger_token(
             },
         )
         .expect("read Runtime native projection ledger fixture");
+    let admin_ledger: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT admin_command_count, admin_command_pending_count,
+                    admin_command_charged_bytes
+             FROM runtime_meta WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read Runtime admin command ledger fixture");
     let mut message = Vec::with_capacity(384);
     message.extend_from_slice(&database_id);
     match catalog_high_water {
@@ -547,6 +556,9 @@ fn runtime_ledger_token(
         native_ledger.5,
         native_ledger.6,
         native_ledger.7,
+        admin_ledger.0,
+        admin_ledger.1,
+        admin_ledger.2,
     ] {
         message.extend_from_slice(
             &u64::try_from(value)
@@ -555,7 +567,7 @@ fn runtime_ledger_token(
         );
     }
     *key_bundle
-        .blind_index(b"runtime.meta.ledger.v6", &message)
+        .blind_index(b"runtime.meta.ledger.v7", &message)
         .expect("authenticate Runtime boundary ledger")
         .as_bytes()
 }

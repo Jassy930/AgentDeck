@@ -86,6 +86,10 @@ pub enum RuntimeStoreOperation {
     CreateConversationAfterCommit,
     ConfigureConversationBeforeCommit,
     ConfigureConversationAfterCommit,
+    AcceptAdminUpgradeBeforeCommit,
+    AcceptAdminUpgradeAfterCommit,
+    FinalizeAdminUpgradeBeforeCommit,
+    FinalizeAdminUpgradeAfterCommit,
     UpdateConversationMetadataBeforeCommit,
     UpdateConversationMetadataAfterCommit,
     MarkConversationRecoveryBlockedBeforeCommit,
@@ -381,11 +385,20 @@ pub enum NativeProjectionLimitScope {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdminCommandLimitScope {
+    GlobalCount,
+    Pending,
+    ChargedBytes,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeCommitOperation {
     MigrateSchema,
     RecordEnrollmentReceipt,
     CreateConversation,
     ConfigureConversation,
+    AcceptAdminUpgrade,
+    FinalizeAdminUpgrade,
     UpdateConversationMetadata,
     MarkConversationRecoveryBlocked,
     AcceptCommand,
@@ -1434,6 +1447,8 @@ pub enum RuntimeStoreError {
     MetadataMutationUnsupported,
     #[error("runtime native projection store is full for {scope:?}")]
     NativeProjectionLimit { scope: NativeProjectionLimitScope },
+    #[error("runtime admin command ledger is full for {scope:?}")]
+    AdminCommandLimit { scope: AdminCommandLimitScope },
     #[error("runtime adapter state reference conflicts with the existing binding")]
     AdapterStateConflict,
     #[error("runtime adapter state key belongs to the other private namespace")]
@@ -1588,7 +1603,8 @@ impl RuntimeStoreError {
             Self::ConfigurationLimit { .. }
             | Self::CommandConfigurationPinLimit
             | Self::MetadataMutationLimit { .. }
-            | Self::NativeProjectionLimit { .. } => "daemon.runtime.store_full",
+            | Self::NativeProjectionLimit { .. }
+            | Self::AdminCommandLimit { .. } => "daemon.runtime.store_full",
             Self::ConfigurationRequired => DAEMON_CONVERSATION_CONFIGURATION_REQUIRED,
             Self::ConfigurationConflict { .. } => DAEMON_CONVERSATION_CONFIGURATION_CONFLICT,
             Self::MetadataMutationPending => DAEMON_CONVERSATION_METADATA_MUTATION_PENDING,

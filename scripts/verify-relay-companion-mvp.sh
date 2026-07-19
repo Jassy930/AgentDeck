@@ -5,15 +5,15 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd -P)"
 cd "$repo_root"
 
 if [[ $# -ne 1 ]]; then
-  printf 'usage: scripts/verify-relay-companion-mvp.sh <p0|p2>\n' >&2
+  printf 'usage: scripts/verify-relay-companion-mvp.sh <p0|p2|p3>\n' >&2
   exit 2
 fi
 
 phase="$1"
 case "$phase" in
-  p0|p2) ;;
+  p0|p2|p3) ;;
   *)
-    printf 'usage: scripts/verify-relay-companion-mvp.sh <p0|p2>\n' >&2
+    printf 'usage: scripts/verify-relay-companion-mvp.sh <p0|p2|p3>\n' >&2
     exit 2
     ;;
 esac
@@ -35,6 +35,30 @@ verify_ios() (
     -destination 'platform=iOS Simulator,name=iPhone 17' \
     test
 )
+
+verify_production_signed_slot() {
+  local record
+  record="$(scripts/verify-daemon-install.sh production-signed-slot)"
+  [[ "$(printf '%s\n' "$record" | wc -l | tr -d ' ')" == 1 ]]
+  printf '%s\n' "$record" | jq -e '
+    .schemaVersion == 1
+    and .gate == "production-signed-launchagent-roundtrip"
+    and .phase == "post-MVP"
+    and .status == "BLOCKED"
+    and .reasonCode == "missing_external_signing_prerequisites"
+    and .missingInputs == [
+      "matching-provisioning-profile",
+      "disposable-signed-test-account"
+    ]
+    and .mutations == 0
+    and .evidence == []
+    and .summaryGenerated == false
+    and (keys | sort) == ([
+      "evidence", "gate", "missingInputs", "mutations", "phase",
+      "reasonCode", "schemaVersion", "status", "summaryGenerated"
+    ] | sort)
+  ' >/dev/null
+}
 
 verify_schema_snapshots() {
   cargo run -q -p agentdeck-cli -- protocol schema \
@@ -143,10 +167,25 @@ run_p2() {
     verify_v1_production_symbols_absent
 }
 
+run_p3() {
+  run_common_rust_gates
+  run_gate 'real local-runtime smoke' scripts/run-local-runtime-smoke.sh
+  run_gate 'daemon install hermetic harness + signed BLOCKED contract' \
+    scripts/verify-daemon-install.sh automatic
+  run_gate 'production-signed post-MVP BLOCKED contract' \
+    verify_production_signed_slot
+  run_gate 'daemon package tests' cargo test -p agentdeckd --locked
+  run_gate 'Swift shared-daemon tests' swift test
+  run_gate 'AgentDeck diagnostics report' swift run AgentDeck -- --diagnostics-report --json
+  run_gate 'iOS Simulator tests' verify_ios
+}
+
 if [[ "$phase" == 'p0' ]]; then
   run_p0
-else
+elif [[ "$phase" == 'p2' ]]; then
   run_p2
+else
+  run_p3
 fi
 
 printf 'verify-relay-companion-mvp %s: PASS\n' "$phase"

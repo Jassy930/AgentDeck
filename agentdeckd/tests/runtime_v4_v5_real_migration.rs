@@ -161,10 +161,10 @@ fn copy_sample(source: &Path, target: &TestRoot) {
 
 #[tokio::test]
 #[ignore = "B1b manual real-writer gate; requires AGENTDECK_B1B_V4_FIXTURE_DIR"]
-async fn real_v4_writer_sample_migrates_to_current_v6_with_byte_exact_immutable_rows() {
+async fn real_v4_writer_sample_migrates_to_current_v7_with_byte_exact_immutable_rows() {
     // 威胁场景：合成 fixture 可能漏掉真实 v4 writer 的 WAL、sealed row、blind token
     // 与 wrapped key 组合；迁移即使单测全绿，仍可能静默 reseal 或丢失已提交行。
-    assert_eq!(RUNTIME_SCHEMA_VERSION, 6);
+    assert_eq!(RUNTIME_SCHEMA_VERSION, 7);
     let source = PathBuf::from(
         std::env::var_os("AGENTDECK_B1B_V4_FIXTURE_DIR")
             .expect("AGENTDECK_B1B_V4_FIXTURE_DIR is required"),
@@ -266,9 +266,9 @@ async fn real_v4_writer_sample_migrates_to_current_v6_with_byte_exact_immutable_
     let after = immutable_manifest(&target.database());
     assert_eq!(
         after, before,
-        "v4→current v6 must preserve every selected byte"
+        "v4→current v7 must preserve every selected byte"
     );
-    let connection = Connection::open(target.database()).expect("inspect current v6 sidecars");
+    let connection = Connection::open(target.database()).expect("inspect current v7 sidecars");
     let state: (
         Option<String>,
         String,

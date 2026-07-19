@@ -128,6 +128,47 @@ impl CliInstallationStore {
         Ok(Self::for_os_account()?.record_path())
     }
 
+    /// stable daemon install layout 与 CLI identity 共用同一 passwd-derived home。
+    /// 不读取 `HOME`，也不提供 production runtime override。
+    #[doc(hidden)]
+    pub fn os_account_home_path() -> Result<PathBuf, InstallationError> {
+        Ok(Self::for_os_account()?.home)
+    }
+
+    /// 以 retained dirfd + `O_NOFOLLOW` 创建/验证 daemon version dir 与 LaunchAgents。
+    /// `version` 必须已由调用方验证为单一安全 path component。
+    #[doc(hidden)]
+    pub fn prepare_daemon_install_directories(
+        &self,
+        version: &str,
+    ) -> Result<(), InstallationError> {
+        let home = open_directory(&self.home, self.uid, false)?;
+        let library_path = self.home.join("Library");
+        let library =
+            open_or_create_directory_at(&home, "Library", &library_path, self.uid, false)?;
+        let support_path = library_path.join("Application Support");
+        let support = open_or_create_directory_at(
+            &library,
+            "Application Support",
+            &support_path,
+            self.uid,
+            false,
+        )?;
+        let data_path = support_path.join("AgentDeck");
+        let data = open_or_create_directory_at(&support, "AgentDeck", &data_path, self.uid, false)?;
+        let bin_path = data_path.join("bin");
+        let bin = open_or_create_directory_at(&data, "bin", &bin_path, self.uid, true)?;
+        open_or_create_directory_at(&bin, version, &bin_path.join(version), self.uid, true)?;
+        open_or_create_directory_at(
+            &library,
+            "LaunchAgents",
+            &library_path.join("LaunchAgents"),
+            self.uid,
+            true,
+        )?;
+        Ok(())
+    }
+
     #[must_use]
     pub fn daemon_socket_path(&self) -> PathBuf {
         self.home

@@ -435,7 +435,9 @@ fn run_production_execution_probe(cancel_before_release: bool) -> ExitCode {
     }
 }
 
-async fn wait_for_shutdown_signal() -> Result<(), LocalListenerError> {
+async fn wait_for_shutdown_signal(
+    upgrade_exit: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+) -> Result<(), LocalListenerError> {
     #[cfg(unix)]
     {
         let mut terminate =
@@ -444,13 +446,15 @@ async fn wait_for_shutdown_signal() -> Result<(), LocalListenerError> {
         tokio::select! {
             result = tokio::signal::ctrl_c() => result.map_err(LocalListenerError::Signal),
             _ = terminate.recv() => Ok(()),
+            _ = upgrade_exit.recv() => Ok(()),
         }
     }
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c()
-            .await
-            .map_err(LocalListenerError::Signal)
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.map_err(LocalListenerError::Signal),
+            _ = upgrade_exit.recv() => Ok(()),
+        }
     }
 }
 
@@ -471,21 +475,28 @@ fn run_main_loop(
             .await
             .map_err(MainLoopFailure::store)?;
         let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
-        let core = match RuntimeCore::new_production(store.clone(), router.clone()) {
-            Ok(core) => Arc::new(core),
-            Err(error) => {
-                drop(router);
-                let shutdown = store.shutdown().await;
-                diag::log(
-                    "daemon_stop",
-                    &format!(
-                        "agentdeckd bootstrap failed before RuntimeCore ownership: \
+        let (upgrade_exit, mut upgrade_exit_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let core =
+            match RuntimeCore::new_production(store.clone(), router.clone()).and_then(|core| {
+                core.with_versioned_daemon_upgrade(
+                    config.paths().data_dir.join("bin"),
+                    upgrade_exit,
+                )
+            }) {
+                Ok(core) => Arc::new(core),
+                Err(error) => {
+                    drop(router);
+                    let shutdown = store.shutdown().await;
+                    diag::log(
+                        "daemon_stop",
+                        &format!(
+                            "agentdeckd bootstrap failed before RuntimeCore ownership: \
                          error={error:?} storeShutdown={shutdown:?}"
-                    ),
-                );
-                return Err(MainLoopFailure::runtime(error));
-            }
-        };
+                        ),
+                    );
+                    return Err(MainLoopFailure::runtime(error));
+                }
+            };
         drop(router);
         drop(store);
 
@@ -525,19 +536,23 @@ fn run_main_loop(
                         ),
                     );
                     listener
-                        .serve_until(wait_for_shutdown_signal())
+                        .serve_until(wait_for_shutdown_signal(&mut upgrade_exit_receiver))
                         .await
                         .map_err(MainLoopFailure::local)
                 }
-                LocalIngressMode::StdioCompat => stdio_compat::run_after_recovery(
-                    config,
-                    recovery_ready_permit,
-                    &core,
-                    tokio::io::stdin(),
-                    tokio::io::stdout(),
-                )
-                .await
-                .map_err(MainLoopFailure::stdio),
+                LocalIngressMode::StdioCompat => {
+                    let compatibility = stdio_compat::run_after_recovery(
+                        config,
+                        recovery_ready_permit,
+                        &core,
+                        tokio::io::stdin(),
+                        tokio::io::stdout(),
+                    );
+                    tokio::select! {
+                        result = compatibility => result.map_err(MainLoopFailure::stdio),
+                        _ = upgrade_exit_receiver.recv() => Ok(()),
+                    }
+                }
             }
         }
         .await;

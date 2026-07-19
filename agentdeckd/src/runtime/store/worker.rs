@@ -74,7 +74,7 @@ use super::stream::{
 };
 use super::{
     AuthenticatedConversationSnapshotContext, PreparedConversationSnapshotWrite, SnapshotOrigin,
-    StoreConversationSnapshotError, approval, journal, native_projection, sqlite, stream,
+    StoreConversationSnapshotError, admin, approval, journal, native_projection, sqlite, stream,
 };
 
 mod stream_pipeline;
@@ -1061,6 +1061,96 @@ impl RuntimeStoreHandle {
                 authorization,
                 reply,
             },
+        )
+        .await?
+    }
+
+    pub async fn accept_admin_upgrade(
+        &self,
+        request: agentdeck_protocol::runtime::StageUpgradeRequest,
+    ) -> Result<admin::AcceptAdminUpgradeOutcome, RuntimeStoreError> {
+        let prepared = admin::prepare_admin_upgrade_request(request)?;
+        let charge = memory_charge(size_of::<NormalCommand>(), &[prepared.retained_capacity()])?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::AcceptAdminUpgrade { prepared, reply },
+        )
+        .await?
+    }
+
+    pub async fn query_admin_upgrade(
+        &self,
+        request: agentdeck_protocol::runtime::StageUpgradeRequest,
+    ) -> Result<Option<admin::AdminUpgradeCommand>, RuntimeStoreError> {
+        let prepared = admin::prepare_admin_upgrade_request(request)?;
+        let charge = memory_charge(size_of::<NormalCommand>(), &[prepared.retained_capacity()])?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::QueryAdminUpgrade { prepared, reply },
+        )
+        .await?
+    }
+
+    pub async fn active_started_command_count(&self) -> Result<u32, RuntimeStoreError> {
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            memory_charge(size_of::<NormalCommand>(), &[])?,
+            |reply| NormalCommand::ActiveStartedCommandCount { reply },
+        )
+        .await?
+    }
+
+    pub async fn finalize_admin_upgrade(
+        &self,
+        command: admin::AdminUpgradeCommand,
+        terminal: admin::AdminUpgradeTerminalOutcome,
+    ) -> Result<admin::FinalizeAdminUpgradeOutcome, RuntimeStoreError> {
+        let retained = match &terminal {
+            admin::AdminUpgradeTerminalOutcome::Completed => 0,
+            admin::AdminUpgradeTerminalOutcome::Failed { failure } => failure
+                .code
+                .capacity()
+                .checked_add(failure.message.capacity())
+                .and_then(|value| {
+                    value.checked_add(failure.diagnostic_ref.as_ref().map_or(0, String::capacity))
+                })
+                .ok_or(RuntimeStoreError::PayloadTooLarge)?,
+        };
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[retained])?,
+            |reply| SafetyCommand::FinalizeAdminUpgrade {
+                command,
+                terminal,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub async fn load_pending_admin_upgrades(
+        &self,
+        cursor: Option<admin::AdminUpgradeRecoveryCursor>,
+    ) -> Result<admin::AdminUpgradeRecoveryPage, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::LoadPendingAdminUpgrades { cursor, reply },
         )
         .await?
     }
@@ -2130,6 +2220,17 @@ enum NormalCommand {
         authorization: Option<AuthorizationGuard>,
         reply: oneshot::Sender<Result<ConfigureConversationOutcome, RuntimeStoreError>>,
     },
+    AcceptAdminUpgrade {
+        prepared: admin::PreparedAdminUpgradeRequest,
+        reply: oneshot::Sender<Result<admin::AcceptAdminUpgradeOutcome, RuntimeStoreError>>,
+    },
+    QueryAdminUpgrade {
+        prepared: admin::PreparedAdminUpgradeRequest,
+        reply: oneshot::Sender<Result<Option<admin::AdminUpgradeCommand>, RuntimeStoreError>>,
+    },
+    ActiveStartedCommandCount {
+        reply: oneshot::Sender<Result<u32, RuntimeStoreError>>,
+    },
     UpdateConversationMetadata {
         prepared: PreparedMetadataMutationRequest,
         authorization: Option<AuthorizationGuard>,
@@ -2214,6 +2315,11 @@ enum SafetyCommand {
     RecordEnrollmentReceipt {
         receipt: MachineEnrollmentReceiptRecord,
         reply: oneshot::Sender<Result<MachineEnrollmentReceiptRecord, RuntimeStoreError>>,
+    },
+    FinalizeAdminUpgrade {
+        command: admin::AdminUpgradeCommand,
+        terminal: admin::AdminUpgradeTerminalOutcome,
+        reply: oneshot::Sender<Result<admin::FinalizeAdminUpgradeOutcome, RuntimeStoreError>>,
     },
     PersistFence {
         input: ExecutionFence,
@@ -2307,6 +2413,10 @@ enum SafetyCommand {
 enum ReadCommand {
     Inspect {
         reply: oneshot::Sender<Result<RuntimeStoreSnapshot, RuntimeStoreError>>,
+    },
+    LoadPendingAdminUpgrades {
+        cursor: Option<admin::AdminUpgradeRecoveryCursor>,
+        reply: oneshot::Sender<Result<admin::AdminUpgradeRecoveryPage, RuntimeStoreError>>,
     },
     AcceptCompletedNativeProjectionScan {
         namespace: AdapterStateNamespace,
@@ -2670,6 +2780,15 @@ fn handle_normal(
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
                 drop(authorization);
             }
+            NormalCommand::AcceptAdminUpgrade { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::QueryAdminUpgrade { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::ActiveStartedCommandCount { reply } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
             NormalCommand::UpdateConversationMetadata {
                 authorization,
                 reply,
@@ -2800,6 +2919,15 @@ fn handle_normal(
             let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
             let _ = reply.send(result);
             drop(authorization);
+        }
+        NormalCommand::AcceptAdminUpgrade { prepared, reply } => {
+            let _ = reply.send(admin::accept_admin_upgrade(state, config, prepared));
+        }
+        NormalCommand::QueryAdminUpgrade { prepared, reply } => {
+            let _ = reply.send(admin::query_admin_upgrade(state, &prepared));
+        }
+        NormalCommand::ActiveStartedCommandCount { reply } => {
+            let _ = reply.send(admin::active_started_command_count(state));
         }
         NormalCommand::UpdateConversationMetadata {
             prepared,
@@ -2994,6 +3122,9 @@ fn handle_safety(
             SafetyCommand::RecordEnrollmentReceipt { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
+            SafetyCommand::FinalizeAdminUpgrade { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
             SafetyCommand::PersistFence { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
@@ -3056,6 +3187,15 @@ fn handle_safety(
         SafetyCommand::RecordEnrollmentReceipt { receipt, reply } => {
             let _ = reply.send(sqlite::record_machine_enrollment_receipt(
                 state, config, receipt,
+            ));
+        }
+        SafetyCommand::FinalizeAdminUpgrade {
+            command,
+            terminal,
+            reply,
+        } => {
+            let _ = reply.send(admin::finalize_admin_upgrade(
+                state, config, command, terminal,
             ));
         }
         SafetyCommand::PersistFence { input, reply } => {
@@ -3238,6 +3378,14 @@ fn handle_read(
                 .before_operation(RuntimeStoreOperation::Inspect)
                 .and_then(|()| sqlite::snapshot(&state.connection, config.busy_timeout_ms));
             let _ = reply.send(result);
+        }
+        ReadCommand::LoadPendingAdminUpgrades { cursor, reply } => {
+            let _ = reply.send(admin::load_pending_admin_upgrades(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+                cursor,
+            ));
         }
         ReadCommand::AcceptCompletedNativeProjectionScan {
             namespace,

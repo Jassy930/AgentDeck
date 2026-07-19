@@ -59,6 +59,7 @@ struct AuthorizationLease {
     inflight: std::sync::atomic::AtomicUsize,
     quiesced: tokio::sync::Notify,
     approval_permissions: ApprovalPermissionGrant,
+    local_administration: bool,
 }
 
 #[allow(dead_code)] // P3.5 Core resolve/retry 接线后构造非 None grants。
@@ -156,6 +157,17 @@ impl AuthenticatedPrincipal {
         self.authorization.try_enter()
     }
 
+    /// 只有 same-EUID control issuer 能签发本能力；普通本地 read principal 与
+    /// remote principal 即使持有 approval permission 也不能执行 machine-wide admin。
+    pub(crate) fn try_enter_local_administration(
+        &self,
+    ) -> Result<AuthorizationGuard, PrincipalAccessError> {
+        if !self.is_local() || !self.authorization.local_administration {
+            return Err(PrincipalAccessError::PermissionDenied);
+        }
+        self.authorization.try_enter()
+    }
+
     #[allow(dead_code)] // P4 durable revoke transaction 调用。
     pub(crate) async fn begin_revoke(&self) -> Result<(), PrincipalAccessError> {
         self.authorization.begin_revoke().await
@@ -213,12 +225,13 @@ impl fmt::Debug for PrincipalAuthorizationKey {
 }
 
 impl AuthorizationLease {
-    fn new(approval_permissions: ApprovalPermissionGrant) -> Self {
+    fn new(approval_permissions: ApprovalPermissionGrant, local_administration: bool) -> Self {
         Self {
             state: std::sync::atomic::AtomicU8::new(PRINCIPAL_ACTIVE),
             inflight: std::sync::atomic::AtomicUsize::new(0),
             quiesced: tokio::sync::Notify::new(),
             approval_permissions,
+            local_administration,
         }
     }
 
@@ -448,6 +461,7 @@ impl PrincipalIssuer {
                 client_installation_id,
             },
             ApprovalPermissionGrant::None,
+            false,
         )
     }
 
@@ -465,6 +479,7 @@ impl PrincipalIssuer {
                 client_installation_id,
             },
             ApprovalPermissionGrant::ResolveAndRetry,
+            true,
         )
     }
 
@@ -482,6 +497,7 @@ impl PrincipalIssuer {
                 client_installation_id,
             },
             permissions,
+            false,
         )
     }
 
@@ -502,6 +518,7 @@ impl PrincipalIssuer {
                 device_sign_fingerprint,
             },
             ApprovalPermissionGrant::None,
+            false,
         )
     }
 
@@ -523,6 +540,7 @@ impl PrincipalIssuer {
                 device_sign_fingerprint,
             },
             permissions,
+            false,
         )
     }
 
@@ -530,6 +548,7 @@ impl PrincipalIssuer {
         &self,
         identity: PrincipalIdentity,
         approval_permissions: ApprovalPermissionGrant,
+        local_administration: bool,
     ) -> Result<AuthenticatedPrincipal, PrincipalAccessError> {
         let mut leases = self
             .leases
@@ -537,7 +556,9 @@ impl PrincipalIssuer {
             .map_err(|_| PrincipalAccessError::RegistryUnavailable)?;
         let authorization = match leases.get(&identity).cloned() {
             Some(lease) => {
-                if lease.approval_permissions != approval_permissions {
+                if lease.approval_permissions != approval_permissions
+                    || lease.local_administration != local_administration
+                {
                     return Err(PrincipalAccessError::PermissionConflict);
                 }
                 lease
@@ -546,7 +567,10 @@ impl PrincipalIssuer {
                 if leases.len() >= self.lease_capacity {
                     return Err(PrincipalAccessError::RegistryFull);
                 }
-                let lease = Arc::new(AuthorizationLease::new(approval_permissions));
+                let lease = Arc::new(AuthorizationLease::new(
+                    approval_permissions,
+                    local_administration,
+                ));
                 leases.insert(identity.clone(), lease.clone());
                 lease
             }

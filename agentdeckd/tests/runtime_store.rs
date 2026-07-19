@@ -283,6 +283,7 @@ async fn fresh_store_is_ready_only_after_exact_schema_and_pragmas_read_back() {
     assert_eq!(
         snapshot.table_names,
         [
+            "admin_commands",
             "approval_ledger",
             "catalog_journal",
             "claude_code_adapter_state",

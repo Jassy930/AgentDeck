@@ -7,7 +7,8 @@ use sha2::{Digest, Sha256};
 pub const RUNTIME_SCHEMA_FAMILY: &str = "agentdeck-runtime";
 pub const RUNTIME_SCHEMA_VERSION_V5: u32 = 5;
 pub const RUNTIME_SCHEMA_VERSION_V6: u32 = 6;
-pub const RUNTIME_SCHEMA_VERSION: u32 = RUNTIME_SCHEMA_VERSION_V6;
+pub const RUNTIME_SCHEMA_VERSION_V7: u32 = 7;
+pub const RUNTIME_SCHEMA_VERSION: u32 = RUNTIME_SCHEMA_VERSION_V7;
 /// 行密文与 wrapped key bundle 的 AAD context 版本。
 ///
 /// physical schema migration 只增表/增认证计数，不得让既有行重新加密或重新包装。
@@ -37,12 +38,20 @@ pub const MAX_METADATA_MUTATIONS_GLOBAL: u64 = 65_536;
 pub const MAX_ACTIVE_METADATA_MUTATIONS: u64 = 1_024;
 #[cfg_attr(not(test), allow(dead_code))]
 pub const MAX_METADATA_MUTATION_CHARGED_BYTES_GLOBAL: u64 = 64 * 1024 * 1024;
+pub const MAX_ADMIN_COMMAND_REQUEST_BYTES: usize = 16 * 1024;
+pub const MAX_ADMIN_COMMAND_OUTCOME_BYTES: usize = 16 * 1024;
+pub const MAX_ADMIN_COMMANDS: u64 = 65_536;
+pub const MAX_PENDING_ADMIN_COMMANDS: u64 = 1_024;
+pub const MAX_ADMIN_COMMAND_CHARGED_BYTES: u64 = 64 * 1024 * 1024;
+pub const ADMIN_COMMAND_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 #[cfg_attr(not(test), allow(dead_code))]
 pub const RUNTIME_LEDGER_DOMAIN_V4: &[u8] = b"runtime.meta.ledger.v4";
 #[cfg_attr(not(test), allow(dead_code))]
 pub const RUNTIME_LEDGER_DOMAIN_V5: &[u8] = b"runtime.meta.ledger.v5";
 #[cfg_attr(not(test), allow(dead_code))]
 pub const RUNTIME_LEDGER_DOMAIN_V6: &[u8] = b"runtime.meta.ledger.v6";
+#[cfg_attr(not(test), allow(dead_code))]
+pub const RUNTIME_LEDGER_DOMAIN_V7: &[u8] = b"runtime.meta.ledger.v7";
 pub const EXPECTED_TABLES_V1: [&str; 7] = [
     "commands",
     "conversations",
@@ -139,10 +148,50 @@ pub const EXPECTED_TABLES_V6: [&str; 22] = [
     "runtime_meta",
     "snapshots",
 ];
-pub const EXPECTED_TABLES: [&str; 22] = EXPECTED_TABLES_V6;
+pub const EXPECTED_TABLES_V7: [&str; 23] = [
+    "admin_commands",
+    "approval_ledger",
+    "catalog_journal",
+    "claude_code_adapter_state",
+    "codex_adapter_state",
+    "command_configuration_pins",
+    "commands",
+    "configuration_journal",
+    "conversation_state",
+    "conversations",
+    "event_journal",
+    "event_retention",
+    "event_stream_index",
+    "execution_fences",
+    "execution_intents",
+    "machine_enrollment_receipts",
+    "metadata_mutation_ledger",
+    "native_metadata_effect_fences",
+    "native_projection_state",
+    "publication_outbox",
+    "publication_streams",
+    "runtime_meta",
+    "snapshots",
+];
+pub const EXPECTED_TABLES: [&str; 23] = EXPECTED_TABLES_V7;
 
 pub fn schema_signature() -> [u8; 32] {
-    schema_signature_v6()
+    schema_signature_v7()
+}
+
+pub fn schema_signature_v7() -> [u8; 32] {
+    static SIGNATURE: OnceLock<[u8; 32]> = OnceLock::new();
+    *SIGNATURE.get_or_init(|| {
+        let mut digest = Sha256::new();
+        digest.update(RUNTIME_DDL_V1.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V2.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V3.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V4.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V5.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V6.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V7.as_bytes());
+        digest.finalize().into()
+    })
 }
 
 pub fn schema_signature_v6() -> [u8; 32] {
@@ -1278,6 +1327,56 @@ CREATE TABLE native_metadata_effect_fences (
 );
 "#;
 
+/// P3.10-A1 additive v7 physical shape。
+///
+/// machine-wide admin idempotency 使用独立 ledger，不复用 conversation-scoped
+/// `commands`。迁移只追加三项 authenticated totals 与一张空表；既有 row
+/// ciphertext、metadata token、wrapped key bundle 与 crypto context 不得改写。
+/// admin row 的 AEAD、token、准入、retention 与 streaming audit 属于 A2。
+pub const RUNTIME_MIGRATION_V7: &str = r#"
+ALTER TABLE runtime_meta ADD COLUMN admin_command_count INTEGER NOT NULL DEFAULT 0
+    CHECK(admin_command_count BETWEEN 0 AND 65536);
+ALTER TABLE runtime_meta ADD COLUMN admin_command_pending_count INTEGER NOT NULL DEFAULT 0
+    CHECK(admin_command_pending_count BETWEEN 0 AND 1024)
+    CHECK(admin_command_pending_count <= admin_command_count);
+ALTER TABLE runtime_meta ADD COLUMN admin_command_charged_bytes INTEGER NOT NULL DEFAULT 0
+    CHECK(admin_command_charged_bytes BETWEEN 0 AND 67108864)
+    CHECK((admin_command_count = 0 AND admin_command_charged_bytes = 0)
+       OR (admin_command_count > 0 AND admin_command_charged_bytes > 0));
+
+CREATE TABLE admin_commands (
+    idempotency_token BLOB PRIMARY KEY
+        CHECK(typeof(idempotency_token) = 'blob' AND length(idempotency_token) = 32),
+    command_kind TEXT NOT NULL CHECK(command_kind = 'stageUpgrade'),
+    request_token BLOB NOT NULL
+        CHECK(typeof(request_token) = 'blob' AND length(request_token) = 32),
+    state TEXT NOT NULL CHECK(state IN ('pending', 'completed', 'failed')),
+    sealed_request BLOB NOT NULL CHECK(
+        typeof(sealed_request) = 'blob'
+        AND length(sealed_request) BETWEEN 40 AND 16424
+    ),
+    sealed_outcome BLOB NOT NULL CHECK(
+        typeof(sealed_outcome) = 'blob'
+        AND length(sealed_outcome) BETWEEN 40 AND 16424
+    ),
+    created_at_ms INTEGER NOT NULL
+        CHECK(created_at_ms BETWEEN 0 AND 9223372034262775807),
+    state_changed_at_ms INTEGER NOT NULL CHECK(state_changed_at_ms >= created_at_ms),
+    retain_until_ms INTEGER NOT NULL
+        CHECK(retain_until_ms >= created_at_ms + 2592000000),
+    charged_bytes INTEGER NOT NULL CHECK(
+        charged_bytes BETWEEN 80 AND 32848
+        AND charged_bytes = length(sealed_request) + length(sealed_outcome)
+    ),
+    metadata_token BLOB NOT NULL
+        CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32)
+);
+CREATE INDEX idx_admin_commands_retention
+    ON admin_commands(retain_until_ms, idempotency_token);
+CREATE INDEX idx_admin_commands_pending
+    ON admin_commands(state_changed_at_ms, idempotency_token) WHERE state = 'pending';
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1465,7 +1564,7 @@ mod tests {
 
     #[test]
     fn stream_schema_advances_to_v4_with_six_bounded_store_tables() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V6);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V7);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         for table in [
             "event_stream_index",
@@ -1481,7 +1580,7 @@ mod tests {
 
     #[test]
     fn approval_physical_schema_remains_v3_compatible_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V6);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V7);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V3.len(), 10);
         assert!(EXPECTED_TABLES_V3.contains(&"approval_ledger"));
@@ -1525,15 +1624,23 @@ mod tests {
         connection
     }
 
+    fn v7_structural_connection() -> Connection {
+        let connection = v6_structural_connection();
+        connection
+            .execute_batch(RUNTIME_MIGRATION_V7)
+            .expect("apply v7 structural migration");
+        connection
+    }
+
     #[test]
     fn v6_adds_projection_and_effect_fence_sidecars_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V6);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V7);
         assert_eq!(RUNTIME_SCHEMA_VERSION_V6, 6);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V5.len(), 20);
         assert_eq!(EXPECTED_TABLES_V6.len(), 22);
-        assert_eq!(EXPECTED_TABLES, EXPECTED_TABLES_V6);
-        assert_eq!(schema_signature(), schema_signature_v6());
+        assert_ne!(EXPECTED_TABLES.as_slice(), EXPECTED_TABLES_V6.as_slice());
+        assert_ne!(schema_signature(), schema_signature_v6());
         assert_eq!(RUNTIME_LEDGER_DOMAIN_V6, b"runtime.meta.ledger.v6");
 
         let connection = v6_structural_connection();
@@ -1554,6 +1661,71 @@ mod tests {
                 "native_metadata_effect_released_count",
             ]
         );
+    }
+
+    #[test]
+    fn v7_adds_machine_wide_admin_command_ledger_without_rotating_crypto_context() {
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V7);
+        assert_eq!(RUNTIME_SCHEMA_VERSION_V7, 7);
+        assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
+        assert_eq!(EXPECTED_TABLES_V7.len(), 23);
+        assert_eq!(EXPECTED_TABLES, EXPECTED_TABLES_V7);
+        assert_eq!(schema_signature(), schema_signature_v7());
+        assert_ne!(schema_signature_v6(), schema_signature_v7());
+        assert_eq!(RUNTIME_LEDGER_DOMAIN_V7, b"runtime.meta.ledger.v7");
+
+        let connection = v7_structural_connection();
+        assert_eq!(table_names(&connection), EXPECTED_TABLES_V7);
+        assert_eq!(
+            &table_columns(&connection, "runtime_meta")
+                [table_columns(&connection, "runtime_meta").len() - 3..],
+            [
+                "admin_command_count",
+                "admin_command_pending_count",
+                "admin_command_charged_bytes",
+            ]
+        );
+        assert_eq!(
+            table_columns(&connection, "admin_commands"),
+            [
+                "idempotency_token",
+                "command_kind",
+                "request_token",
+                "state",
+                "sealed_request",
+                "sealed_outcome",
+                "created_at_ms",
+                "state_changed_at_ms",
+                "retain_until_ms",
+                "charged_bytes",
+                "metadata_token",
+            ]
+        );
+        assert_eq!(
+            explicit_indexes(&connection, "admin_commands"),
+            ["idx_admin_commands_pending", "idx_admin_commands_retention"]
+        );
+        assert_eq!(
+            index_shape(
+                &connection,
+                "admin_commands",
+                "idx_admin_commands_retention"
+            ),
+            IndexShape {
+                unique: false,
+                partial: false,
+                columns: vec!["retain_until_ms".to_owned(), "idempotency_token".to_owned()],
+                sql: "CREATE INDEX idx_admin_commands_retention\n    ON admin_commands(retain_until_ms, idempotency_token)".to_owned(),
+            }
+        );
+        let pending = index_shape(&connection, "admin_commands", "idx_admin_commands_pending");
+        assert!(!pending.unique);
+        assert!(pending.partial);
+        assert_eq!(
+            pending.columns,
+            ["state_changed_at_ms", "idempotency_token"]
+        );
+        assert!(pending.sql.ends_with("WHERE state = 'pending'"));
     }
 
     #[test]

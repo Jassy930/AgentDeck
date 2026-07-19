@@ -1,5 +1,6 @@
 //! Runtime SQLite journal：单 worker、严格 schema 与行级加密。
 
+mod admin;
 pub(crate) mod admission;
 mod approval;
 mod catalog;
@@ -34,22 +35,28 @@ mod worker;
 use crate::runtime::events::SnapshotBuildPinCleanup;
 
 pub use crate::runtime::model::{
-    AcceptCommand, AcceptOutcome, AcceptedTerminationReason, AuthorizeExecutionRelease,
-    CommandExecutionConfiguration, CommandReceiptRecord, CommandReceiptSelector, CommandRecord,
-    CommandState, CommandTerminal, CompleteCommand, CompleteOutcome, ConfigurationLimitScope,
-    ConversationDescriptor, ConversationLifecycle, ConversationRecord, ConversationRecoveryRecord,
-    CreateConversationOutcome, EventRecord, ExecutionFence, ExecutionFenceRecord,
-    ExecutionIntentRecord, IdempotencyOwner, MAX_CONVERSATION_DESCRIPTOR_BYTES,
-    MAX_NATIVE_NONLIVE_IDENTITIES, MAX_RECOVERY_PAGE_RETAINED_BYTES, MAX_RUNTIME_CONVERSATIONS,
-    MAX_RUNTIME_LIVE_CONVERSATIONS, MAX_RUNTIME_PHYSICAL_CONVERSATIONS,
-    MachineEnrollmentReceiptRecord, MarkConversationRecoveryBlocked, NewConversation,
-    QueryCommandReceipt, QueueScope, RecoverStartedCommand, RecoveryBlockedCommandBinding,
-    RecoveryCompletion, RecoveryCursor, RecoveryFenceBinding, RecoveryPage, RecoveryState,
-    RuntimeClock, RuntimeClockError, RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError,
-    RuntimeStoreFaultInjector, RuntimeStoreLane, RuntimeStoreOperation, RuntimeStoreSnapshot,
-    SanitizedTerminalFailure, StartCommand, StartOutcome, StartedBeforeReleaseTermination,
-    StartedRecoveryRecord, SystemRuntimeClock, TerminalState, TerminateAcceptedCommand,
-    TerminateAcceptedOutcome, TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
+    AcceptCommand, AcceptOutcome, AcceptedTerminationReason, AdminCommandLimitScope,
+    AuthorizeExecutionRelease, CommandExecutionConfiguration, CommandReceiptRecord,
+    CommandReceiptSelector, CommandRecord, CommandState, CommandTerminal, CompleteCommand,
+    CompleteOutcome, ConfigurationLimitScope, ConversationDescriptor, ConversationLifecycle,
+    ConversationRecord, ConversationRecoveryRecord, CreateConversationOutcome, EventRecord,
+    ExecutionFence, ExecutionFenceRecord, ExecutionIntentRecord, IdempotencyOwner,
+    MAX_CONVERSATION_DESCRIPTOR_BYTES, MAX_NATIVE_NONLIVE_IDENTITIES,
+    MAX_RECOVERY_PAGE_RETAINED_BYTES, MAX_RUNTIME_CONVERSATIONS, MAX_RUNTIME_LIVE_CONVERSATIONS,
+    MAX_RUNTIME_PHYSICAL_CONVERSATIONS, MachineEnrollmentReceiptRecord,
+    MarkConversationRecoveryBlocked, NewConversation, QueryCommandReceipt, QueueScope,
+    RecoverStartedCommand, RecoveryBlockedCommandBinding, RecoveryCompletion, RecoveryCursor,
+    RecoveryFenceBinding, RecoveryPage, RecoveryState, RuntimeClock, RuntimeClockError,
+    RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreFaultInjector,
+    RuntimeStoreLane, RuntimeStoreOperation, RuntimeStoreSnapshot, SanitizedTerminalFailure,
+    StartCommand, StartOutcome, StartedBeforeReleaseTermination, StartedRecoveryRecord,
+    SystemRuntimeClock, TerminalState, TerminateAcceptedCommand, TerminateAcceptedOutcome,
+    TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
+};
+pub use admin::{
+    AcceptAdminUpgradeOutcome, AdminUpgradeCommand, AdminUpgradeRecoveryCursor,
+    AdminUpgradeRecoveryPage, AdminUpgradeStatus, AdminUpgradeTerminalOutcome,
+    FinalizeAdminUpgradeOutcome,
 };
 pub(crate) use configuration::MAX_CONFIGURATION_CANONICAL_BYTES;
 pub use configuration::{ConfigurationRecord, ConfigureConversation, ConfigureConversationOutcome};

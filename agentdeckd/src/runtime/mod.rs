@@ -29,6 +29,7 @@ pub mod snapshot;
 pub mod store;
 pub(crate) mod subscription;
 pub mod transfer;
+pub(crate) mod upgrade;
 
 pub use connection::{
     AuthenticatedPrincipal, ConnectionId, ConnectionSink, ConnectionWrite, FlushReceipt,
