@@ -314,6 +314,12 @@ public struct RuntimeActionDecisionV1: Codable, Sendable {
         case decision, persist
     }
 
+    public init(requestID: String, decision: ActionDecisionKind, persist: Bool) {
+        self.requestID = requestID
+        self.decision = decision
+        self.persist = persist
+    }
+
     public init(from decoder: Decoder) throws {
         try rejectUnknownKeys(decoder, allowed: CodingKeys.all)
         let container = try decoder.container(keyedBy: CodingKeys.self)
