@@ -137,6 +137,7 @@ dependencies = [
 name = "agentdeckd"
 version = "0.1.0"
 dependencies = [
+ "agentdeck-crypto",
  "agentdeck-protocol",
  "async-trait",
  "chacha20poly1305",
