@@ -56,9 +56,10 @@
   账号 JSONL smoke、Swift 与 iOS Simulator 门禁已通过，production native metadata 仍在 claim 前 post-MVP
   typed gated。P3.9-A Rust、P3.9-B Swift shared-daemon client、P3.9-C3 App model cutover、P3.9-D
   Rust CLI/Swift selfcheck 默认入口和真实双客户端 smoke，以及 P3.9-E App 会话可靠性均已完成并通过各自
-  Task 门禁与双路终审；D/E code/test 提交分别为 `b818f81` / `d68cc02`，下一项为 P3.10。P3.1
-  production code 已完成，provisioned signed
-  Keychain roundtrip 保留 1 项 ignored/BLOCKED 且不阻塞主线；P3.10、P4–P6 尚未完成。P5 MVP 只以
+  Task 门禁与双路终审；D/E code/test 提交分别为 `b818f81` / `d68cc02`。P3.10 已由 `19622ab` 完成
+  schema v7/admin ledger、flush-ACK-gated upgrade 与 LaunchAgent lifecycle，完整 `p3` Task verifier exit 0
+  且双路 Task review Approved；独立 P3 Phase Exit 尚未收口。P3.1 production code 已完成，provisioned signed Keychain
+  roundtrip 保留 1 项 ignored/BLOCKED 且不阻塞主线；P4–P6 尚未开始。P5 MVP 只以
   iOS Simulator 自动 E2E 退出，本机第二客户端归 P6 synthetic DoD。
 
 ## 协议资料

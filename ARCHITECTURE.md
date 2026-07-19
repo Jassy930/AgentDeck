@@ -489,12 +489,19 @@ conversation/key，不能伪造身份连续性。
   64-slot LRU，Unsubscribe 必须收到 exact ACK 后才移除本地账，“腾槽→Subscribe→记账”由 FIFO admission
   串行。composer draft 绑定 logical owner，最多 32 owners、单 draft 256 KiB、总计 1 MiB，不能跨新意图
   复用或无界保留。
-- P3.10 的 `StageUpgrade` 边界已冻结但尚未实现：Runtime/Core 成功只产生 deferred action；local writer
-  必须完成整条 reply write 并取得 flush ACK 后，才能原子切换 `bin/current` 或触发 daemon 优雅退出。
-  ACK 前的 encode/write/flush/cancel/disconnect 任一失败都必须丢弃 action并保持 symlink/PID 不变；ACK
-  已授予许可后，随后 client close 不得撤销已提交动作。自动 MVP 证据使用
-  dev/ephemeral 隔离 harness 与注入 verifier；provisioned production-signed LaunchAgent roundtrip 是
-  post-MVP BLOCKED，不得由 injected/ad-hoc 证据替代。
+- P3.10 已由 code/test commit `19622ab` 把 current Runtime schema 推进到 v7，并新增 authenticated
+  machine-wide `admin_commands` ledger；请求、outcome、idempotency/request token、状态、30 天 retention
+  与容量账都进入 open/recovery 全库审计，exact replay/conflict 和 COMMIT-unknown 收敛不得绕过该账本。
+  `StageUpgrade` 的 Runtime/Core 成功只产生 deferred action；local writer 必须完成整条 exact reply write
+  并取得 flush ACK 后才 arm，随后经 active→idle fence、候选 artifact/hash/owner/mode/nlink 复核才能原子
+  切换 `bin/current` 并退出。ACK 前的 encode/write/flush/cancel/disconnect 任一失败都必须丢弃 action并保持
+  symlink/PID 不变；ACK 已授予许可后，随后 client close 不得撤销已提交动作。LaunchAgent lifecycle
+  覆盖 install/status/uninstall、stopped `loaded=true,pid=null` job 和 P4 前 `--purge` typed fail-close/零删除；
+  stopped job 先 kickstart 并二次读回 live PID，CLI 只对 `socket_missing` / `connect_failed` 做有界 15 秒
+  retry。完整 `p3` Task verifier exit 0，两路 Task review Approved、无 P0/P1/P2；独立 P3 Phase Exit 仍
+  pending，因此不得进入 P4。自动 MVP 证据使用 dev/ephemeral 隔离 harness 与注入 verifier；
+  provisioned production-signed LaunchAgent/Keychain roundtrip 是 post-MVP BLOCKED，不得由
+  injected/ad-hoc 证据替代。
 - 已有 ignored、唯一 service/account、RAII 清理的真实 Keychain roundtrip，但 P3.1 的签名
   门禁尚未通过：当前机器无匹配 provisioning profile；Apple Development 与本地
   self-signed helper 虽通过 `codesign --verify`，均被 AMFI 以 exit 137 拒绝启动。因此本节
@@ -566,16 +573,19 @@ conversation/key，不能伪造身份连续性。
   路径不改写 main/WAL/SHM/journal artifact。整套 main+WAL 回滚到更早但内部自洽的有效快照仍须 P4
   CounterGuard 检测。同 UID 在线攻击者可 ptrace daemon、替换二进制或读取进程内密钥，不是 SQLite
   层能够建立的安全边界，作为
-  accepted residual risk 记录；`974f9b1` 之后不再新增面向该对手的竞态测试、hook 或取证机制。
+  accepted residual risk 记录；`974f9b1` 之后不再新增面向该对手的竞态测试、hook 或取证机制，P3.10
+  Task 收口也已删除同 UID 在线换路径测试。
 - Runtime DB 的物理 schema 按 phase 单调迁移：P3.2 的 v1 七表、P3.3 的 v2 两张 adapter 私表、
   P3.5 的 v3 `approval_ledger`、P3.6 的 v4 六张 stream 表、P3.9-C0-B1b 的 v5 四张
-  authenticated sidecar，以及 C0-C 的 v6 两张 native sidecar。v6 当前精确为 22 表；在 v4 的
+  authenticated sidecar，以及 C0-C 的 v6 两张 native sidecar，再由 P3.10 v7 增加 machine-wide
+  `admin_commands`。current v7 精确为 23 表；在 v4 的
   `event_stream_index`、`event_retention`、
   `catalog_journal`、`snapshots`、`publication_streams`、`publication_outbox` 上增加
   `conversation_state`、`configuration_journal`、`command_configuration_pins` 与
   `metadata_mutation_ledger` 后，再增加 `native_projection_state` 与
   `native_metadata_effect_fences`，并给 authenticated Runtime ledger 增加 projection
-  present/tombstone/retired/physical/charged-bytes 与 effect fence total/unreleased/released 八项 totals。
+  present/tombstone/retired/physical/charged-bytes 与 effect fence total/unreleased/released 八项 totals，
+  v7 再加入 admin command count/pending/charged-bytes 与 authenticated request/outcome/token/state/retention。
   物理 schema 升级不旋转 `RUNTIME_CRYPTO_CONTEXT_VERSION=1`；旧非-meta ciphertext、row token 与
   wrapped key 不重写。`event_journal` 仍是 append-only authenticated audit；
   `machine_enrollment_receipts` 继续只是 root-lost rescue 所需的非秘密 index，其余敏感 payload 使用
@@ -587,7 +597,9 @@ conversation/key，不能伪造身份连续性。
   meta/signature/token/全部行并做容量预检，取得 `BEGIN IMMEDIATE` 后在任何 DDL 前二次全量认证；只有
   第二次认证通过才创建 native sidecar、切换 schema/signature/v6 ledger token。既有非-meta 密文与 token
   byte-exact；authenticated v5 若已含 `NativeProjected` origin 必须 fail-close，不能猜测 projection 行。
-  fresh v6 conversation 在 create transaction 内同时写入 `conversation_state`。B2 已落地 authenticated
+  fresh v6 conversation 在 create transaction 内同时写入 `conversation_state`。P3.10 的 v6→v7 继续先
+  认证完整 v6 meta/signature/token/全部物理行与容量，再原子增加 `admin_commands`、切换 v7
+  schema/signature/ledger token；既有非-meta ciphertext/token/wrapped key 仍 byte-exact。B2 已落地 authenticated
   configuration CAS writer、每次选择都认证完整
   `1...head` 链的 frozen-cursor snapshot selector，以及 RuntimeCore Configure/DescribeAgents 路由；B3a
   又接通 `command_configuration_pins` writer/reader 与 Core prompt admission，B4 接通 managed

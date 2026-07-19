@@ -10,7 +10,7 @@
 4. `docs/index.md`：文档记录系统导航。
 5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code（含 CC adapter failure codes）。
 6. `docs/QUALITY.md`：验证命令、质量门禁和文档结构检查（含 v0.2 手动 QA 清单）。
-7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以 `docs/plans/2026-07-10-relay-companion-mvp-design.md`、`docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 和上位增量 `docs/plans/2026-07-18-relay-companion-mvp-course-correction.md` 为事实源。Relay 主线恢复 Task 粒度门禁；P3.9-C0-B3a/B3b/B4/B5/C0-C、P3.9-A/B/C3/D/E 已完成 Task 门禁和独立 `spec/security`、`quality` 终审。D code/test `b818f81` 完成普通 GUI、Rust CLI 与 Swift `main.swift --selfcheck` 的 OS-account shared-daemon UDS cutover；E code/test `d68cc02` 收口 exact/fresh retry、composer owner/LRU、history latest-intent、close barrier、有界 reconnect 与 64-slot subscription admission。下一项是 P3.10，P3 Phase exit 在其后执行。同 UID 在线攻击作为 residual risk 不再扩展；P3.1 provisioned signed Keychain 按方案 b 保留 post-MVP ignored/BLOCKED，但不阻塞主线。P4 功能全保留；P5 MVP 仅 iOS Simulator 自动 E2E，本机第二客户端归 P6 synthetic DoD；物理设备、公网与干净 Linux 证据为 post-MVP BLOCKED 槽位，不得冒充 PASS。
+7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以 `docs/plans/2026-07-10-relay-companion-mvp-design.md`、`docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 和上位增量 `docs/plans/2026-07-18-relay-companion-mvp-course-correction.md` 为事实源。Relay 主线恢复 Task 粒度门禁；P3.9-C0-B3a/B3b/B4/B5/C0-C、P3.9-A/B/C3/D/E 已完成 Task 门禁和独立 `spec/security`、`quality` 终审。D code/test `b818f81` 完成普通 GUI、Rust CLI 与 Swift `main.swift --selfcheck` 的 OS-account shared-daemon UDS cutover；E code/test `d68cc02` 收口 exact/fresh retry、composer owner/LRU、history latest-intent、close barrier、有界 reconnect 与 64-slot subscription admission。P3.10 已由 `19622ab` 完成 schema v7/admin ledger、flush-ACK-gated `StageUpgrade` 与 LaunchAgent lifecycle，完整 `p3` Task verifier exit 0且双路 Task review Approved；独立 P3 Phase Exit 尚未执行，在此之前不得进入 P4 共享实现。同 UID 在线攻击作为 residual risk 不再扩展，P3.10 已删除在线换路径测试且不得再新增；P3.1 provisioned signed Keychain 按方案 b 保留 post-MVP ignored/BLOCKED，但不阻塞主线。P4 功能全保留且当前 0/7 Task 完成；P5 MVP 仅 iOS Simulator 自动 E2E，本机第二客户端归 P6 synthetic DoD；物理设备、公网与干净 Linux 证据为 post-MVP BLOCKED 槽位，不得冒充 PASS。
 8. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
 
 ## 项目边界
@@ -266,7 +266,8 @@ P3.6 不执行真实 E2EE seal、MachineDataSign、Keychain CounterGuard 或 Rel
 transfer/publication 也尚无 production remote owner；Simulator fixture 不是远程链路。P3.7 exec gate
 已完成 fresh 完整门禁、独立终审、`5568e93` 主体提交与 `c9d2146` / `5713be4` 取消边界补充；
 P3.8-A 只接入 accepted-stream primitives；P3.8-B secure bind/permit、P3.9-C3 普通 GUI cutover 与 P3.9-D
-Rust CLI / Swift `--selfcheck` cutover 已完成；P3.10 LaunchAgent 与 P4 remote 仍是后续任务。
+Rust CLI / Swift `--selfcheck` cutover 已完成；P3.10 LaunchAgent 已由 `19622ab` 完成 Task verifier 与双路
+Task review，独立 P3 Phase Exit 与 P4 remote 仍未完成。
 
 ### Relay Companion MVP P3.7（exec-gate + typed production execution）
 
@@ -416,9 +417,10 @@ conversation 共用 64 slots，Unsubscribe ACK
 barrier，下一次用户操作才建新 wire；重连不恢复全部历史 conversation。composer draft 按 logical owner
 隔离并受 32-owner、单 draft 256 KiB、总 1 MiB LRU 上界约束。4 个 legacy Swift 文件只要求相对 frozen
 baseline 不新增 strict diagnostics；本 Task 实际诊断总数均下降，不能把全文件既有格式债务伪报为 clean。
-下一 Task P3.10 必须新增 durable machine-wide admin ledger，并在 exact StageUpgrade reply flush ACK 后才允许
-switch/exit；默认自动门禁仅用隔离 dev/ephemeral + injected verifier，provisioned production-signed roundtrip
-保持 post-MVP BLOCKED，不能写成 PASS。
+P3.10 已由 `19622ab` 新增 durable machine-wide admin ledger，并把 switch/exit 许可绑定到
+exact `StageUpgrade` reply flush ACK；默认自动门禁仅用隔离 dev/ephemeral + injected verifier，
+provisioned production-signed roundtrip 保持 post-MVP BLOCKED，不能写成 PASS。P3.10 Task verifier 与双路
+review 已通过；独立 P3 Phase Exit 未收口前不得进入 P4 共享实现。
 
 ### Relay Companion MVP P3.9-C0-B3a（configuration pin / prompt admission）
 

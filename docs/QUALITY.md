@@ -1043,8 +1043,9 @@ P3.7 主体代码与 translator 终审修复已由 `5568e93` 提交，真实 rel
 补充由 `c9d2146` / `5713be4` 提交；fresh 完整门禁与独立终审已通过。P3.1
 provisioned signed Keychain 仍外部 BLOCKED；
 P3.8-A 增加 accepted-stream UDS transport primitives，P3.8-B production secure bind/permit、默认 UDS
-lifecycle 与 stdio compatibility 收窄已由 `1e7f9ea` / `459f32a` 完成；App/CLI 默认连接 shared daemon 属于 P3.9。P3.10
-LaunchAgent、P4 RemoteLink/E2EE 与 P5/P6 实机证据也必须继续保持未完成。
+lifecycle 与 stdio compatibility 收窄已由 `1e7f9ea` / `459f32a` 完成；App/CLI 默认连接 shared daemon 属于 P3.9。
+P3.10 LaunchAgent 已由 `19622ab` 完成完整 `p3` Task verifier 与双路 Task 终审；独立 P3 Phase Exit
+仍未收口。P4 RemoteLink/E2EE 与 P5/P6 自动实现也必须继续保持未完成。
 
 ## Relay Companion MVP P3.8-A local Runtime UDS transport primitives 门禁
 
@@ -1302,7 +1303,7 @@ Hello reply 的一次性 focused gate实际执行 1 test、0 skipped、0 failure
 ## Relay Companion MVP P3.9-C0-B1b legacy v4 real-writer migration 门禁
 
 **具体威胁场景：** 同 UID writer 在 migration 首轮 preflight 与 DDL 之间替换 legacy meta/token/行，或
-合成 fixture 漏掉真实 WAL、sealed row 与 wrapped key 的组合，可能让损坏输入被发布为 current v6，或让迁移
+合成 fixture 漏掉真实 WAL、sealed row 与 wrapped key 的组合，可能让损坏输入被发布为 current v7，或让迁移
 静默重封/重包旧数据。
 
 本门禁的信任根是仓库外、由提交 `28619a8` 的 production v4 writer 生成并在流程外锁定的 main DB、WAL
@@ -1325,10 +1326,10 @@ cargo fmt --all -- --check
 bash scripts/check-daemon-no-net.sh
 swift run AgentDeck -- --selfcheck
 
-# 真实 v4 writer 样本经 v5 中间迁移到 current v6；必须实际执行 1 test / 0 ignored
+# 真实 v4 writer 样本经 v5/v6 中间迁移到 current v7；必须实际执行 1 test / 0 ignored
 AGENTDECK_B1B_V4_FIXTURE_DIR=/tmp/agentdeck-v4-migration.GQXkAh \
 cargo test -p agentdeckd --test runtime_v4_v5_real_migration \
-  real_v4_writer_sample_migrates_to_current_v6_with_byte_exact_immutable_rows \
+  real_v4_writer_sample_migrates_to_current_v7_with_byte_exact_immutable_rows \
   -- --ignored --exact --nocapture --test-threads=1
 
 # 文档与补丁卫生
@@ -1952,16 +1953,54 @@ baseline-clean 文件保持 `0→0`；4 个 legacy 文件 diagnostics 分别从 
 `317→308`、`83→82`，按“零新增且总债务下降”的 baseline parity 记 PASS，不把 legacy 全文件表述为
 strict clean。spec/security 与 quality 双路终审在冻结 diff SHA-256
 `66c4151af524caae6373571fcc0dd72b1d2c8789b5d7ffe64d05def416edbf6a` 上 Approved，无 P0/P1/P2。
-P3.1 provisioned signed Keychain 与真实 vendor login 继续 post-MVP BLOCKED；P3.9 complete，下一 Task P3.10。
+P3.1 provisioned signed Keychain 与真实 vendor login 继续 post-MVP BLOCKED；P3.9 complete，P3.10 已由
+`19622ab` 完成 Task 门禁与双路终审，独立 P3 Phase Exit 尚未收口。
 
-### P3.10 planned gate（尚未 PASS）
+### P3.10 Task gate（PASS；P3 Phase Exit pending）
 
-P3.10 实现必须新增 durable machine-wide admin ledger，并把 `StageUpgrade` 的 switch/exit 许可绑定到 local
-writer 的 exact reply flush ACK。partial write、flush failure、cancel 或 ACK 前 disconnect 都必须保持
-`bin/current`、PID 与 launchd state 不变；ACK 后 client close 不得撤销已提交动作。默认自动证据只允许
-dev/ephemeral 隔离 root + injected launchctl/signature verifier；production constructor 仍从 `getpwuid_r`
-home 派生路径并拒绝 ad-hoc。provisioned production-signed LaunchAgent/Keychain roundtrip 是 post-MVP
-BLOCKED 槽位。此段是下一 Task 门禁，不是当前 PASS 声明。
+`19622ab` 已新增 current schema v7 authenticated machine-wide `admin_commands` ledger，覆盖 30 天
+retention、容量准入、exact replay/conflict、COMMIT-unknown 与 open/recovery 审计；`StageUpgrade` 的
+switch/exit 许可绑定到 local writer 的 exact reply flush ACK。partial write、flush failure、cancel 或 ACK 前
+disconnect 都必须保持 `bin/current`、PID 与 launchd state 不变；ACK 后 client close 不得撤销已提交动作。
+active→idle fence、候选 artifact/hash/owner/mode/nlink、原子 current 切换与 install/status/uninstall lifecycle
+均有 focused/ephemeral smoke 证据；stopped `loaded=true,pid=null` job 会 kickstart 并二次读回 live PID，CLI
+只对 `socket_missing` / `connect_failed` 做有界 15 秒 retry。P4 前 `--purge` typed fail-close 且零删除；同
+UID 在线换路径测试已删除，后续不得为 accepted residual risk 新增测试。
+
+子片/focused 检查可使用：
+
+```bash
+cargo test -p agentdeckd --locked --test runtime_store_admin_upgrade -- --test-threads=1
+cargo test -p agentdeckd --locked --test upgrade_idle -- --test-threads=1
+cargo test -p agentdeckd --locked --lib runtime::upgrade::tests -- --test-threads=1
+cargo test -p agentdeck-cli --locked daemon:: --lib
+cargo test -p agentdeck-cli --locked --bin agentdeck daemon_cli_tests
+cargo test -p agentdeck-cli --locked --test daemon_install -- --test-threads=1
+bash scripts/verify-daemon-install.sh automatic
+cargo clippy -p agentdeckd -p agentdeck-cli --all-targets -- -D warnings
+cargo fmt --all -- --check
+```
+
+**Task 收口证据（2026-07-20，code/test `19622ab`）：** 冻结 candidate 的完整聚合门禁已 exit 0：
+两轮 1,024 × 256 KiB capacity 为 286.88s / 286.64s，daemon lib 两轮均
+`904 passed / 3 ignored`；Swift `527 XCTest + 35 Swift Testing`，iOS Simulator `20/20`。CLI focused 为
+lib/bin/integration `13/13 + 8/8 + 2/2`；local-runtime/install harness、exact signed BLOCKED contract、
+四 schema、network/docs/diff 全绿，temp root/残留进程均为 0。`spec/security` 与 `quality` 两路 Task review
+均 Approved、无 P0/P1/P2。
+
+独立 P3 Phase Exit 仍须在 Task 文档状态冻结后重新运行：
+
+```bash
+bash scripts/verify-relay-companion-mvp.sh p3
+```
+
+其中 `scripts/run-local-runtime-smoke.sh` 的 ephemeral UDS 链路承担 Swift Runtime selfcheck；独立 Swift
+静态门禁固定为 `swift run AgentDeck -- --diagnostics-report --json`，不得依赖或修改当前用户 home 下的
+production-signed stable daemon。默认自动证据只允许 dev/ephemeral 隔离 root + injected
+launchctl/signature verifier；production constructor 仍从 `getpwuid_r` home 派生路径并拒绝 ad-hoc。
+provisioned production-signed LaunchAgent/Keychain roundtrip 是 post-MVP `BLOCKED` 槽位，缺输入时必须
+`mutations=0`、零 evidence、不得生成 summary。P3.10 Task 已 PASS；P3 Phase Exit 的独立 verifier 与
+双路 phase review 完成前不得进入 P4 共享文件实现。
 
 ## AppKit 重写后的验证清单
 
@@ -2091,7 +2130,7 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P3.8-A local Runtime UDS primitives | 运行本页 framing/peer、local-control/cancellation、真实双连接 `local_uds`、完整 daemon、fmt/clippy/network-boundary/docs/diff；只证明 accepted stream actor，不冒充 P3.8-B secure bind/permit、P3.9 App/CLI cutover 或 remote E2E |
 | Relay Companion MVP P3.8-B production UDS/bootstrap | 运行本页 secure listener/permit/supervisor、config/stdio exhaustive allowlist、真实 binary lifecycle、Rust/Swift compatibility、完整 daemon、fmt/clippy/network-boundary/schema/docs/diff；只证明 production 本地入口，不冒充 P3.9 shared-daemon client、LaunchAgent 或 remote E2E |
 | Relay Companion MVP P3.9-C0-A2 Swift Runtime v2 mirror | 运行本页 A2a/A2b/A2c1/A2c2 focused、public API 与 frozen v1 gate、完整 `swift test`、iOS XcodeGen + Simulator、App selfcheck、docs/diff；A2 完成只证明 current codec、compact/98-fixture 与真实 UDS Swift readback，不得宣称 App/CLI 默认 UDS cutover |
-| Relay Companion MVP P3.9-C0-B1b legacy v4 real-writer migration | 运行本页 schema/migration/store/boundary/cipher、默认完整 daemon、Clippy/fmt/no-net/selfcheck/docs/diff 与真实 v4 writer byte-exact gate；当前入口证明 v4 经 v5 中间迁移到 current v6 时的 authenticated migration/materialization，不冒充 P4 CounterGuard 或 Companion E2E |
+| Relay Companion MVP P3.9-C0-B1b legacy v4 real-writer migration | 运行本页 schema/migration/store/boundary/cipher、默认完整 daemon、Clippy/fmt/no-net/selfcheck/docs/diff 与真实 v4 writer byte-exact gate；当前入口证明 v4 经 v5/v6 中间迁移到 current v7 时的 authenticated migration/materialization，不冒充 P4 CounterGuard 或 Companion E2E |
 | Relay Companion MVP P3.9-C0-B3a command pin / prompt admission | 运行本页 B3a Store/Core focused matrix、完整 daemon package、protocol/Swift/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明 expected revision admission、同事务 nonzero pin、pinned receipt/status/recovery 与 Store-owned authorization lifetime，不冒充 B3b exact configuration execution、live vendor 或 Companion E2E |
 | Relay Companion MVP P3.9-C0-B3b exact execution | 运行本页 B3b Store/Core/driver/translator/restart focused matrix、完整 daemon package、protocol/Swift/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明 command-pinned historical configuration、rev0 startup-only、Codex/CC argv/control/at-decision mapping 与 synthetic restart probe，不冒充 live vendor、P4 RemoteLink 或 Companion E2E |
 | Relay Companion MVP P3.9-C0-B4 managed metadata | 运行本页 B4 Store/Core/Catalog/integrity/capacity focused matrix、完整 daemon package、protocol/Swift/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明 managed rename/archive、durable replay/conflict、同事务 revision/CatalogDelta 与离线篡改审计，不冒充 native projector、P4 CounterGuard/RemoteLink 或 Companion E2E |
@@ -2101,6 +2140,7 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P3.9-C3 App model cutover | 运行本页 App coordinator/canonical model/reliability/Preview focused `46/46`、完整 Swift、普通与 warnings-as-errors build、iOS Simulator、production source purge、strict format/diff 与双路独立终审；普通 GUI 已默认 shared UDS 且 socket failure 零 fallback；Rust CLI、`main.swift --selfcheck` 与双客户端组合 smoke 当时不计入 C3，后由 P3.9-D 完成 |
 | Relay Companion MVP P3.9-D 默认入口与组合 smoke | 运行本页 CLI/daemon/Swift/iOS 全量、真实双客户端 smoke、active-turn/双连接/close-only 组合证据、release hidden-surface、四 schema、scoped Clippy/network/docs/fmt/diff 与双路终审。`b818f81` 已完成且全部自动门禁 PASS；真实 vendor login 与 P3.1 provisioned Keychain 仍按 post-MVP BLOCKED 记录，不冒充本 Task 证据 |
 | Relay Companion MVP P3.9-E App 会话可靠性 | 运行本页 retry/reconnect/history/subscription/composer focused、完整 Swift/iOS、真实 local-runtime smoke、四 schema、network/docs/diff、changed-source baseline parity 与双路终审。`d68cc02` 已完成且自动门禁 PASS；4 个 legacy 文件只证明诊断数下降，不冒充全文件 strict clean，也不冒充真实 vendor/remote/signed 证据 |
+| Relay Companion MVP P3.10 LaunchAgent lifecycle / upgrade | `19622ab` 已完成 admin ledger、upgrade/fence、CLI lifecycle focused tests、完整 `bash scripts/verify-relay-companion-mvp.sh p3` 与双路 Task review；ephemeral smoke 覆盖 Swift Runtime selfcheck，独立门禁使用 diagnostics report。P3.10 Task PASS，但独立 P3 Phase Exit pending；production-signed 槽位只能输出 post-MVP `BLOCKED/mutations=0/零 evidence`，不得冒充 PASS |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

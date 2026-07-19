@@ -552,7 +552,8 @@ cursor，每页读取一个 conversation；单页 retained 上限 80 MiB。Runti
 Accepted command。begin/page/finish 回执丢失都只重试原 token。
 finish 会在开放 mutation 前重新执行完整 integrity readback；若 begin 后 artifact 已无法通过当前
 KEK/database/domain 认证，finish 必须失败并保持 Recovering。该检查属于离线篡改 fail-close，不扩张为
-对可 ptrace、替换二进制或读取进程内密钥的同 UID 在线攻击者的安全承诺。
+对可 ptrace、替换二进制或读取进程内密钥的同 UID 在线攻击者的安全承诺。P3.10 Task 收口已删除同 UID
+在线换路径测试；后续不要为该 residual risk 新增测试或诊断分支。
 
 scan active 时 inspect 与 shutdown 仍可用；create/accept/start、fence/release/terminal/rescue
 全部返回 `daemon.runtime.recovering`。这不是“读永远可用”：业务 recovery read 也受 exact
@@ -640,7 +641,7 @@ fixture 泄漏，或把 test-only admission 暴露为运行时配置。
 | P3.2/P3.3 code | 常见内部原因 | 下一步 |
 | --- | --- | --- |
 | `daemon.runtime.store_invalid` | path/type/owner/mode/nlink、busy/count/byte config 或 operation input 不合法 | 核对 0700 namespace、0600 artifacts 和固定 config；拒绝 symlink/hardlink，不自动放宽 |
-| `daemon.runtime.schema_incompatible` | schema family/version/signature/live manifest、typed canonical descriptor/row linkage、逐 conversation HWM、authenticated metadata、command/execution/event/approval/stream/snapshot/publication/configuration/projection/effect-fence totals 或两类 adapter-state total 不一致 | 停止写入并保留 main/WAL/SHM/journal；v1/v2/v3/v4/v5→v6 只能走内置原子 migration，不能原地猜测/手改 schema |
+| `daemon.runtime.schema_incompatible` | schema family/version/signature/live manifest、typed canonical descriptor/row linkage、逐 conversation HWM、authenticated metadata、command/execution/event/approval/stream/snapshot/publication/configuration/projection/effect-fence/admin-command totals 或两类 adapter-state total 不一致 | 停止写入并保留 main/WAL/SHM/journal；v1/v2/v3/v4→v5→v6→current v7 只能走内置原子 migration，不能原地猜测/手改 schema |
 | `daemon.runtime.store_unavailable` | worker/shutdown/commit outcome、clock/capacity probe、SQLite/I/O、sequence coordination，或 bounded checkpoint 被 reader pin 住 | 对 unknown outcome 用完全相同 stable ID/idempotency/full request 重试；Configure after-COMMIT unknown 可能已产生唯一 `ConfigurationChanged`，exact retry 应读回 Replayed 而不是换 key；checkpoint blocked 时停止新副作用、释放 reader 并保留 WAL，其他错误保留 evidence 后重启/修复底层 I/O |
 | `daemon.runtime.store_busy` | normal/safety/read lane 的 count 或 retained-allocation byte permit 已满 | 客户端退避并保持同一 idempotency key；不要并发重发新 key |
 | `daemon.runtime.recovering` | 已冻结 paged recovery barrier，终页尚未核账并 finish | 继续使用上一页返回的 exact cursor；RuntimeCore 逐页消费，终页 finish 后再开放请求，不得并行 mutation |
@@ -671,7 +672,7 @@ P3.4 RuntimeCore 的 transport-neutral failure：
 | `daemon.runtime.not_ready` | Core 尚未完成 paged recovery，或正在 draining/stopped | 等待 daemon readiness；若 recovery 无法完成，按上节保留 DB/Keychain 证据并 fail-close |
 | `daemon.runtime.protocol_mismatch` | Runtime protocol 版本不兼容 | 升级客户端/daemon 到同一 Runtime protocol；不能回退 Relay/IPC 业务字段 |
 | `daemon.runtime.invalid_request` | ID 非 canonical UUID、Start key/cwd、Configure key 或 configuration agent kind 与 conversation 不匹配等规范化输入非法 | 修正原请求；不得由 daemon 猜 ID/path/agent kind 或替客户端补目标 |
-| `daemon.runtime.feature_unavailable` | 请求属于尚未接线的后续 phase（例如 upgrade、pairing/revoke/trust reset） | 读取 capabilities/实施状态后等待对应 phase；`StageUpgrade` 当前仍是 dormant DTO，P3.10 未完成前不要按“已安装但升级失败”排障。P3.10 实现后也只有 exact reply flush ACK 才允许期待 PID/symlink 变化；ACK 前 disconnect 必须零切换。native metadata 现使用更精确的 `daemon.conversation.metadata_unsupported`，managed rename/archive 已进入 B4，production local transport 已进入 P3.8，shared-daemon 默认客户端已进入 P3.9-D，DescribeAgents/Configure 已进入 P3.9-C0-B2，SendPrompt admission 已进入 B3a，Catalog/Subscribe/Backfill 已进入 P3.6，不应再用该 code 代替真实错误；不得用 compatibility path 或 fake coordinator 假成功 |
+| `daemon.runtime.feature_unavailable` | 请求属于尚未接线的后续 phase（例如 pairing/revoke/trust reset），或当前 capability/构建不支持该请求 | 读取 capabilities/实施状态后等待对应 phase；`StageUpgrade` 已由 P3.10 `19622ab` 接入 durable/flush-ACK-gated 执行，不再是 dormant DTO，正常失败必须读回 `daemon.upgrade.*` / `daemon.install.*` typed code。只有 exact reply flush ACK 后才允许期待 PID/symlink 变化；ACK 前 disconnect 必须零切换。stopped `loaded=true,pid=null` job 会 kickstart 并二次读回 live PID；CLI 只对 `socket_missing` / `connect_failed` 做有界 15 秒 retry。P3.10 Task verifier/review 已 PASS，但独立 P3 Phase Exit pending，尚不得进入 P4。native metadata 现使用更精确的 `daemon.conversation.metadata_unsupported`，managed rename/archive 已进入 B4，production local transport 已进入 P3.8，shared-daemon 默认客户端已进入 P3.9-D，DescribeAgents/Configure 已进入 P3.9-C0-B2，SendPrompt admission 已进入 B3a，Catalog/Subscribe/Backfill 已进入 P3.6，不应再用该 code 代替真实错误；不得用 compatibility path 或 fake coordinator 假成功 |
 | `daemon.authorization.revoked` | opaque principal lease 已 Revoking/Revoked 或 issuer registry 不可用 | 停止该 connection；remote 设备按 durable revocation/re-pair 流程处理，本地重新认证 peer credential |
 | `daemon.runtime.identity_unavailable` | machine trust/ID derivation domain 非法或 OS entropy 不可用 | 停止启动并检查 machine identity/系统熵；不得生成零 ID 或使用时间/PID 回退 |
 | `daemon.runtime.actor_unavailable` | conversation actor/execution control 已损坏或 recovery-blocked | 不自动重放 Started；保留 command/fence 证据，P3.7 按 orphan fencing 处理 |

@@ -90,10 +90,12 @@ profile，self-signed helper 被 AMFI exit 137 终止），**代码不可解**�
    closeout，按新刹车线执行。
 4. **已完成（2026-07-19）**：C0-C native history projection、P3.9-A/B/C3/D/E
    App/CLI cutover与会话可靠性收口。
-5. **已完成（2026-07-19）**：按决策 4 重估 P4–P6 剩余步骤并更新计划清单；P5 仅保留 Simulator
-   MVP 门禁，本机第二客户端迁入 P6 synthetic DoD。
-6. **下一项**：P3.10 LaunchAgent install/upgrade/uninstall；自动 dev/ephemeral 门禁完成后执行 P3 Phase exit，
-   provisioned production-signed roundtrip 保持 post-MVP BLOCKED。
+5. **已完成（2026-07-20）**：按决策 4 的范围重估与 P4–P6 Task checklist 执行前审计已逐项同步；
+   P4/P5/P6 完成度固定为 0/7、0/9、0/4，P5 MVP 只保留 Simulator 自动 E2E，本机第二客户端迁入 P6
+   synthetic DoD，物理设备/公网/vendor/Linux 保持 versioned post-MVP BLOCKED 槽位。
+6. **Task 已完成，Phase Exit pending（2026-07-20）**：P3.10 LaunchAgent install/upgrade/uninstall 已由
+   `19622ab` 提交，完整 `p3` Task verifier exit 0，两路 Task review Approved、无 P0/P1/P2。独立 P3
+   Phase Exit 尚未执行；provisioned production-signed LaunchAgent/Keychain roundtrip 保持 post-MVP BLOCKED。
 
 ## 不变项
 

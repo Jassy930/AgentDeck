@@ -207,7 +207,7 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（P3.9 complete，P3.10 next）
+## Relay Companion MVP 实施状态（P3.10 Task complete，P3 Phase Exit pending）
 
 2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 只承诺缺 KEK 且无法通过当前
 KEK/database/domain 认证的离线篡改 fail-close，同 UID 在线攻击作为 residual risk 不再扩展。P3.1
@@ -216,10 +216,19 @@ ignored/BLOCKED 槽位，不阻塞 MVP/P3 exit，也不表示 stable production 
 P5 MVP 仅以 iOS Simulator 自动 E2E 退出，本机第二客户端归入 P6 synthetic DoD；物理设备、公网与干净
 Linux 证据为 post-MVP BLOCKED 槽位。详见
 [`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`](docs/plans/2026-07-18-relay-companion-mvp-course-correction.md)。
-P3.10 的自动验收使用注入 temp root/launchctl/signature verifier 的 dev/ephemeral harness；production
-constructor 仍从 `getpwuid_r` home 派生稳定路径并拒绝 ad-hoc。provisioned production-signed LaunchAgent
-roundtrip 保持 post-MVP BLOCKED。`StageUpgrade` 只有在 reply 完整 flush ACK 后才能 switch/exit，ACK 前
-disconnect 必须零切换；这些约束尚待 P3.10 实现，不能从 P3.9 的本地 smoke 推导为已完成。
+P3.10 已由 code/test commit `19622ab` 完成 Task 收口：current Runtime schema v7 新增 authenticated machine-wide
+`admin_commands` ledger，并实现 30 天 retention、容量准入、exact replay/conflict 与 COMMIT-unknown
+收敛；`StageUpgrade` 只有在 exact reply 完整 flush ACK 后才 arm，随后经 active→idle fence、候选
+artifact/hash/owner/mode/nlink 校验和原子 `bin/current` 切换后退出。CLI 已提供
+`agentdeck daemon install|status|uninstall [--purge]`；`--purge` 在 P4 前 typed fail-close 且零删除，
+stopped LaunchAgent（`loaded=true,pid=null`）会先 kickstart 并二次读回 live PID；CLI 只对
+`socket_missing` / `connect_failed` 做有界 15 秒 retry。隔离 ephemeral UDS 已完成
+install→stage→ACK→idle→手动 current restart→Hello smoke，完整 `p3` verifier exit 0；两轮 capacity 为
+286.88s / 286.64s，daemon lib 均 `904 passed / 3 ignored`，Swift `527 XCTest + 35 Swift Testing`，iOS
+Simulator `20/20`，两路 Task review Approved、无 P0/P1/P2，temp root/残留进程均为 0。同 UID 在线换路径
+测试已删除且不得再新增。P3.10 Task 已完成，但独立 P3 Phase Exit 尚未执行，因此不得进入 P4。自动验收使用注入 temp root/launchctl/signature
+verifier 的 dev/ephemeral harness；production constructor 仍从 `getpwuid_r` home 派生稳定路径并拒绝
+ad-hoc，provisioned production-signed LaunchAgent/Keychain roundtrip 保持 post-MVP `BLOCKED`。
 
 Relay production binary 已原子切换到 **Relay v2**。公开数据面只接受
 `/v2/connect`、`/v2/pair` 与 enrollment 所需的 `POST /v2/machine-enroll`；
@@ -498,8 +507,9 @@ installation 在同一 conversation 各自提交/重放并只查询自己的 rec
 保持不变且 endpoint 缺失零 fallback。P3.9-E 的 `d68cc02` 再收口 exact/fresh retry、composer owner/LRU、
 history latest-intent、close barrier、重连有界恢复和 64-slot subscription admission；Swift
 `527 XCTest + 35 Swift Testing`、iOS Simulator `20/20`、真实 local-runtime smoke 与双路终审全绿。
-P3.9 至此完成，下一 Task 为 P3.10；P3 Phase exit 在 P3.10 后执行。
-P4 CounterGuard/RemoteLink 与真实 vendor metadata mutation 仍未完成。
+P3.9 至此完成。P3.10 已由 `19622ab` 完成 current schema v7、durable admin ledger、flush-ACK-gated
+`StageUpgrade`、LaunchAgent lifecycle CLI 与隔离 ephemeral smoke，完整 `p3` verifier 和 Task 双路终审
+均通过。独立 P3 Phase Exit 尚未收口；P4 CounterGuard/RemoteLink 与真实 vendor metadata mutation 仍未完成。
 
 进入 Core 的 principal 是字段私有的认证 capability；同一完整身份共享强 authorization lease，
 Accepted→Started 前会重新取得 guard，revoke 与 start 由该 guard + SQLite transition 线性化。
@@ -674,8 +684,9 @@ B3a admission pin 已完成，后者由 `48594e8` / `09a14b0` 提交并通过 Ta
 execution 已由 `c0ed6cd` / `f4141f0` / `fb1629a` 完成，B4 managed metadata 已由
 `5f1ca1c` / `347a0f0` 完成，B5 cross-layer closeout 已由 `aebc8d0` 完成。C0-C 自动实现与跨语言/
 Simulator 门禁已通过；C0-C、P3.9-A/B/C3/D/E Task 已完成，D/E code/test 提交分别为 `b818f81` / `d68cc02`。
-普通 GUI、Rust CLI 与 Swift `--selfcheck` 已默认走 OS-account shared-daemon UDS；下一项是 P3.10
-LaunchAgent 安装/升级/保留数据卸载。P3.10 与 P4–P6 仍未完成。P3.1 provisioned signed Keychain
+普通 GUI、Rust CLI 与 Swift `--selfcheck` 已默认走 OS-account shared-daemon UDS。P3.10 LaunchAgent
+安装/升级/保留数据卸载已由 `19622ab` 完成 Task 门禁与双路终审；独立 P3 Phase Exit 尚未完成，P4–P6
+尚未开始。P3.1 provisioned signed Keychain
 roundtrip 继续是 post-MVP BLOCKED 槽位，不阻塞 MVP/P3 exit；P5/P6 物理设备/公网/Linux 证据也是
 post-MVP，不冒充 PASS。
 具体命令与资源矩阵见 [docs/QUALITY.md](docs/QUALITY.md)。
@@ -774,8 +785,9 @@ agentdeck protocol version
 ```
 
 运行（普通 GUI、Swift `--selfcheck` 与 Rust CLI 默认连接 OS-account shared-daemon canonical UDS，均没有
-daemon spawn/fallback；使用前须已有 canonical stable daemon。P3.10 尚未提供正式 install/start 命令，当前
-自动开发链路使用 `scripts/run-local-runtime-smoke.sh` 的私有 ephemeral harness）：
+daemon spawn/fallback；使用前须已有 canonical stable daemon。P3.10 已提供
+`agentdeck daemon install|status|uninstall [--purge]` 并完成 Task 门禁；独立 P3 Phase Exit 尚未收口；
+自动开发链路继续使用 `scripts/run-local-runtime-smoke.sh` 的私有 ephemeral harness）：
 
 ```bash
 ./script/build_and_run.sh        # 构建 SwiftPM 产物，临时打包 dist/AgentDeck.app 并启动
