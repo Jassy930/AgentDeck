@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P3.10 已由 `19622ab` 完成 current schema v7/admin ledger、flush-ACK-gated `StageUpgrade` 与 LaunchAgent lifecycle，完整 `p3` Task verifier exit 0且双路 Task review Approved；独立 P3 Phase Exit 尚未收口。P4/P5/P6 分别为 0/7、0/9、0/4 Task 完成；production native metadata 与 provisioned signed Keychain/LaunchAgent 均为 post-MVP gated/BLOCKED（2026-07-20） |
+| 状态 | Approved target；P3 automatic scope 已从 code baseline `9efb28d` 完成 6/6 Phase Exit，完整 `p3` verifier exit 0且双路 phase code review P0/P1/P2=0。P4/P5/P6 分别为 0/7、0/9、0/4 Task 完成，下一项是严格零 cert/零 enrollment/零 RemoteLink 的 P4.1；production native metadata 与 provisioned signed Keychain/LaunchAgent 均为 post-MVP gated/BLOCKED（2026-07-20） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -39,13 +39,19 @@ component 已由 `397ef9d` / `94adf92` / `913a156` / `deb0e1b` 完成；P3.9-C3 
 coordinator 与 production GUI model cutover。普通 App 现已惰性连接 OS-account canonical UDS，不 spawn、
 不 fallback；P3.9-D 又由 `b818f81` 完成 Rust CLI canonical 命令、Swift `--selfcheck` 与真实 binary
 双客户端组合 smoke，普通 Runtime 入口全部连接同一 shared daemon 且零 fallback。
-P3.10 已由 `19622ab` 完成 schema v7 authenticated `admin_commands` ledger、30 天 retention/容量准入/exact replay/
-conflict/COMMIT-unknown、exact reply flush ACK 后 arm、active→idle fence、安全 artifact/current 切换与
-`agentdeck daemon install|status|uninstall [--purge]`。完整 `p3` Task verifier exit 0，两路 Task review
-Approved、无 P0/P1/P2；独立 P3 Phase Exit 尚未执行。P4 Machine
-identity/E2EE/Relay Publish 与真实 Companion 仍未开始，iOS 仍只有 fixture 驱动骨架。P3.1 provisioned
-signed Keychain/LaunchAgent roundtrip 仍是 post-MVP BLOCKED gate。完整实施仍必须满足 §17 的 Definition
-of Done。
+P3.10 主体由 `19622ab` 完成 schema v7 authenticated `admin_commands` ledger、30 天 retention/容量准入/
+exact replay/conflict/COMMIT-unknown、exact reply flush ACK 后 arm、active→idle fence、安全 artifact/current
+切换与 `agentdeck daemon install|status|uninstall [--purge]`。P3 Phase review 又由 `773a2b3` 收口安装
+verifier 的 deadline、聚合输出/pipe 与进程组资源边界，由 `0057824` 把 legacy v1-v6 认证前移到原库
+RW open/migration 之前，并由 `81cc314` / `9efb28d` 稳定回收 verifier leader 与同 PGID descendants。
+以 `9efb28d` 为 code baseline 的完整 `p3` Phase verifier exit 0：daemon lib 两轮均
+`905 passed / 3 ignored`（218.23s / 154.45s），1,024 × 256 KiB capacity 两轮均 `5/5`
+（284.97s / 286.07s），Swift `527 XCTest + 35 Swift Testing`、iOS Simulator `20/20`；signed exact
+BLOCKED contract、四 schema、network、docs、local smoke 与 diagnostics 全绿，两路 phase code review
+均为 P0/P1/P2=0。P3 automatic scope 6/6 complete。P4 Machine identity/E2EE/Relay Publish 与真实
+Companion 仍未开始，iOS 仍只有 fixture 驱动骨架；P4 保持 0/7，下一项是 P4.1。P3.1 provisioned
+signed Keychain/LaunchAgent roundtrip 仍按方案 b 保持 post-MVP BLOCKED gate。完整实施仍必须满足 §17
+的 Definition of Done。
 
 ## 1. 背景与当前问题
 
@@ -112,10 +118,17 @@ MVP 把 Relay 和路径网络都视为主动不可信，而不是只防止“管
 - 公网、反向代理和中间网络可以主动劫持连接；TLS 必须先建立服务端身份，E2EE 再保护业务内容。
 - 已配对但被攻陷的设备可以读取它在撤销前获准看到的内容，也可以在其 grant 权限内发命令；它不能伪造 daemon 的 canonical catalog/event，因为 daemon 下行另有 `MachineDataSign` 签名。
 - 被控机器 OS、daemon 进程、Apple Keychain/Secure Enclave 边界和用户确认配对时看到的本地 UI 被视为可信。若这些 endpoint 边界失守，MVP 不承诺继续保密。
-- Runtime store 只承诺防御缺 KEK 且无法通过当前 KEK/database/domain 认证的离线磁盘篡改、删除或
-  跨库移植：open/recovery 全库认证审计必须 fail-close，拒绝路径不改写 artifact。整套 main+WAL 回滚到
-  更早但内部自洽的有效快照仍由 P4 CounterGuard 检测。同 UID 在线攻击者可 ptrace daemon、替换二进制或读取进程内
+- Runtime store 的 P3 承诺只覆盖已有 committed artifact 中，缺 KEK 或无法通过当前
+  KEK/database/domain 认证的离线行/页改删及跨库移植：open/recovery 全库认证审计必须 fail-close，
+  拒绝路径不改写 artifact。整套 DB/main/WAL/SHM 消失，或整套 main+WAL 回滚到更早但内部自洽的有效
+  快照，均留给 P4 CounterGuard 检测。同 UID 在线攻击者可 ptrace daemon、替换二进制或读取进程内
   密钥，属于 accepted residual risk；不再为该对手新增 SQLite 竞态测试、hook 或取证机制。
+- P3 Phase Exit 对 Runtime store 采用**方案 A**：不下调上述离线 fail-close 承诺。所有受支持 legacy
+  schema 均须在触碰原库 RW open/migration 前完成 ledger 与既有行认证；`0057824` 已统一 v1-v6 的
+  pre-RW validation，显式 committed-WAL 篡改矩阵覆盖 v1-v4。该修复不重新扩张到同 UID 在线 TOCTOU。
+- 安装 verifier 只承诺同 PGID 资源与清理边界：每个外部命令具有绝对 deadline、聚合输出与双向 pipe
+  上界；leader 由父进程直接 reap，同 PGID descendant 在返回前必须进入 non-executable/zombie 状态。
+  主动 `setsid`/`setpgid` 或 launch service 逃离 PGID 不在该边界内；这不是同 UID 恶意代码 sandbox。
 - 完整 PairInvite 是 256-bit bearer authorization。二维码、SSH 复制或其他带外传递必须由用户保证真实性和机密性；截获者可以抢先尝试消费邀请，因此 UI 必须在本机显示待配对设备指纹并允许用户取消。
 
 “严格最小可见”仍会向 Relay 暴露以下传输元数据，MVP 明确接受且不做 padding：
@@ -224,7 +237,7 @@ flowchart LR
    已以 durable machine-wide admin ledger 实现执行语义。只有 local writer 完成 exact reply write 并取得
    flush ACK 后才 arm deferred action，随后经 active→idle fence 与候选 hash/owner/mode/nlink 复核原子切换
    `bin/current` 并退出；ACK 前失败保持 current/PID/launchd state 不变。remote principal/Relay 路径不能构造
-   或执行它。P3.10 Task verifier/review 已 PASS，独立 P3 Phase Exit 未收口前仍不得进入 P4；客户端与
+   或执行它。P3.10 Task verifier/review 与后续 6/6 P3 Phase Exit 均已 PASS；客户端与
    daemon 协议不兼容时显示 typed mismatch，不静默 spawn 私有旧 daemon。
 4. `agentdeck-cli daemon uninstall` 卸载 LaunchAgent 并删除已安装 binary/plist，但默认保留 Runtime DB 与 Keychain；只有显式 `--purge` 才进入 trust-reset/purge 流程，不能边卸载边遗留可连接的旧 machine route。
 
@@ -809,8 +822,8 @@ enum StageUpgradeReceipt {
 schema 推进到 v7，并以 authenticated `admin_commands` durable ledger 绑定 request/outcome/token/state、
 30 天 retention、容量账、exact replay/conflict 与 COMMIT-unknown；相同 key 只有
 targetVersion+candidateSha256 byte-identical 才 Replayed，异 payload 必须 conflict。P3.9 的
-feature-unavailable 只是历史基线，当前已接入 local-only 执行并通过 Task verifier/review；独立 P3 Phase
-Exit 仍 pending。
+feature-unavailable 只是历史基线，当前已接入 local-only 执行，并已通过 Task verifier/review 与后续
+6/6 P3 Phase Exit。
 
 `RuntimeReply` 对应新增 `Agents`、`Configuration`、`ConversationMetadata`、`StageUpgrade`；metadata receipt 同样使用
 Applied/Replayed/Conflict/Failed。`ConversationEntry` 增加 `entryRevision`，metadata mutation 必须在同一
@@ -1529,9 +1542,16 @@ readback 属 post-MVP BLOCKED 槽位，不阻塞 P3 自动 exit，也不能由 i
 `uninstall --purge` 只验证 typed `daemon.purge.remote_not_ready` 且零删除；完整 trust-reset/purge 门禁留到
 P4 RemoteTransport 存在后执行。
 
+本门禁已在 code baseline `9efb28d` 上完成 6/6 P3 Phase Exit；完整 verifier、Rust/Swift/iOS、四 schema、
+network/docs、local smoke、diagnostics、signed exact BLOCKED contract 与双路 phase review 均通过。
+provisioned production-signed LaunchAgent/Keychain 仍按方案 b 保持 post-MVP BLOCKED，不属于该 PASS。
+
 ### P4 Machine RemoteLink
 
-- MachineRoot/Keychain、Relay machine enrollment、PairInvite。
+- P4.1 只建立 MachineRoot/MachineHPKE/LinkSign/DataSign key material、Keychain guard 与 CounterGuard；
+  严格零 cert、零 enrollment、零 RemoteLink，不读写 `machine_enrollment_receipts`。
+- P4.2 才首次签发 root-signed link/data cert、读写 enrollment receipt、执行 Relay machine enrollment，
+  并建立第一条 RemoteLink；PairInvite 继续由 P4.3 拥有。
 - daemon WSS/E2EE、MachineDataSign、Catalog/events/commands/replay、key/counter crash recovery。
 - macOS persistent 远程 CLI 使用 Keychain 中的真实 grant/private keys 和 daemon receipts；Linux synthetic client 只用 ephemeral keys。
 
@@ -1661,7 +1681,8 @@ P3/P5 创建 shared source/client targets 后增加：
 ```bash
 swift test --filter AgentDeckSessionSourceTests
 swift test --filter AgentDeckRelayClientTests
-bash scripts/verify-relay-companion-mvp.sh
+bash scripts/verify-relay-companion-mvp.sh p3
+# P5 实现时先为脚本增加并验证 p5 分支，再在 P5 Task/Phase gate 调用 `... p5`；禁止裸调用。
 ```
 
 `scripts/verify-relay-companion-mvp.sh` 是实施期统一编排入口。真实 vendor 和物理设备测试保持 gated，不能把合成/Simulator 通过冒充真机闭环。

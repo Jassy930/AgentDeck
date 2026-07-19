@@ -11,9 +11,10 @@
 
 ## 运行与诊断
 
-- `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、Relay v2 failure code、v1 marker
-  显式 reset 和排查流程。
-- `QUALITY.md`：按变更范围选择验证命令，以及 Companion MVP P2、P3.1–P3.9-D production UDS/client/smoke 与文档结构检查入口。
+- `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、Relay v2 与 daemon install/upgrade failure code、
+  v1 marker 显式 reset 和排查流程。
+- `QUALITY.md`：按变更范围选择验证命令，以及 Companion MVP P2、P3.1–P3.10、P3 Phase
+  production UDS/client/install/smoke 与文档结构检查入口。
 - `RELAY_RUNBOOK.md`：production Relay v2 Direct TLS、本机 admin UDS、machine
   enrollment、fingerprint-bound readback/purge 与 root-lost 重新配对操作手册。
 
@@ -57,10 +58,15 @@
   typed gated。P3.9-A Rust、P3.9-B Swift shared-daemon client、P3.9-C3 App model cutover、P3.9-D
   Rust CLI/Swift selfcheck 默认入口和真实双客户端 smoke，以及 P3.9-E App 会话可靠性均已完成并通过各自
   Task 门禁与双路终审；D/E code/test 提交分别为 `b818f81` / `d68cc02`。P3.10 已由 `19622ab` 完成
-  schema v7/admin ledger、flush-ACK-gated upgrade 与 LaunchAgent lifecycle，完整 `p3` Task verifier exit 0
-  且双路 Task review Approved；独立 P3 Phase Exit 尚未收口。P3.1 production code 已完成，provisioned signed Keychain
-  roundtrip 保留 1 项 ignored/BLOCKED 且不阻塞主线；P4–P6 尚未开始。P5 MVP 只以
-  iOS Simulator 自动 E2E 退出，本机第二客户端归 P6 synthetic DoD。
+  schema v7/admin ledger、flush-ACK-gated upgrade 与 LaunchAgent lifecycle；`773a2b3`、`0057824`、
+  `81cc314`、`9efb28d` 又完成 verifier 资源/进程组 hardening 与 legacy v1–v6 pre-RW 认证（新增显式
+  v1–v4 committed-WAL 矩阵）。基于 code
+  baseline `9efb28d` 的独立 `p3` Phase verifier exit 0，四 schema/network/docs/smoke/diagnostics 全绿，
+  双路 code review P0/P1/P2 = 0，P3 Phase complete（MVP automatic scope）。P3.1 继续采用方案 b：
+  provisioned signed Keychain roundtrip 保留 1 项 post-MVP ignored/BLOCKED，不阻塞主线，也不表示
+  production signing PASS。P4–P6 仍为 0/7、0/9、0/4；下一项按方案 A 执行 P4.1，只建立 Machine
+  identity 与 CounterGuard/key-directory guard，且零 cert、零 enrollment、零 receipt 读写、零 RemoteLink；
+  certificate/enrollment/receipt 首次归 P4.2。P5 MVP 只以 iOS Simulator 自动 E2E 退出，本机第二客户端归 P6 synthetic DoD。
 
 ## 协议资料
 

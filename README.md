@@ -207,10 +207,11 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（P3.10 Task complete，P3 Phase Exit pending）
+## Relay Companion MVP 实施状态（P3 Phase complete，下一项 P4.1）
 
-2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 只承诺缺 KEK 且无法通过当前
-KEK/database/domain 认证的离线篡改 fail-close，同 UID 在线攻击作为 residual risk 不再扩展。P3.1
+2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 的 P3 边界只承诺已有 committed artifact
+中缺 KEK 或无法通过当前 KEK/database/domain 认证的行/页改删及跨库移植 fail-close；整套 artifact
+消失或自洽旧快照留给 P4 CounterGuard。同 UID 在线攻击作为 residual risk 不再扩展。P3.1
 采用方案 b：MVP 接受 dev/ephemeral Keychain 路径，provisioned signed roundtrip 移入 post-MVP
 ignored/BLOCKED 槽位，不阻塞 MVP/P3 exit，也不表示 stable production signing 已完成。P4 功能全保留；
 P5 MVP 仅以 iOS Simulator 自动 E2E 退出，本机第二客户端归入 P6 synthetic DoD；物理设备、公网与干净
@@ -222,13 +223,26 @@ P3.10 已由 code/test commit `19622ab` 完成 Task 收口：current Runtime sch
 artifact/hash/owner/mode/nlink 校验和原子 `bin/current` 切换后退出。CLI 已提供
 `agentdeck daemon install|status|uninstall [--purge]`；`--purge` 在 P4 前 typed fail-close 且零删除，
 stopped LaunchAgent（`loaded=true,pid=null`）会先 kickstart 并二次读回 live PID；CLI 只对
-`socket_missing` / `connect_failed` 做有界 15 秒 retry。隔离 ephemeral UDS 已完成
-install→stage→ACK→idle→手动 current restart→Hello smoke，完整 `p3` verifier exit 0；两轮 capacity 为
-286.88s / 286.64s，daemon lib 均 `904 passed / 3 ignored`，Swift `527 XCTest + 35 Swift Testing`，iOS
-Simulator `20/20`，两路 Task review Approved、无 P0/P1/P2，temp root/残留进程均为 0。同 UID 在线换路径
-测试已删除且不得再新增。P3.10 Task 已完成，但独立 P3 Phase Exit 尚未执行，因此不得进入 P4。自动验收使用注入 temp root/launchctl/signature
-verifier 的 dev/ephemeral harness；production constructor 仍从 `getpwuid_r` home 派生稳定路径并拒绝
-ad-hoc，provisioned production-signed LaunchAgent/Keychain roundtrip 保持 post-MVP `BLOCKED`。
+`socket_missing` / `connect_failed` 做有界 15 秒 retry。P3 Phase review 又由 `773a2b3`、`0057824`、
+`81cc314`、`9efb28d` 依次补齐安装 verifier 资源上界、legacy v1–v6 在原库 RW 前的全量认证
+（新增显式 v1–v4 committed-WAL 矩阵）、
+verifier 进程组回收与 leader/同组静默收口；超时和聚合输出超限分别返回
+`daemon.install.verifier_timeout` 与 `daemon.install.verifier_output_too_large`，失败不得发布候选或切换
+`bin/current`。
+
+P3 Phase Exit 已在 code baseline `9efb28d` 上独立完成：
+`bash scripts/verify-relay-companion-mvp.sh p3` exit 0；daemon lib 两轮均为
+`905 passed / 3 ignored`（218.23s / 154.45s），1,024 × 256 KiB capacity boundary 两轮均为
+`5/5`（284.97s / 286.07s），Swift 为 `527 XCTest + 35 Swift Testing`，iOS Simulator 为
+`20/20`；四份 schema、network boundary、docs、local-runtime/install smoke 与 diagnostics 全绿，
+`spec/security`、`quality` 双路 code review 均为 P0/P1/P2 = 0。production-signed slot 仍精确读回
+post-MVP `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`；verifier exit 0 证明该 BLOCKED contract
+正确，不表示 production signing PASS。P3.1 继续采用方案 b：automatic scope 接受 dev/ephemeral 路径，
+provisioned signed LaunchAgent/Keychain roundtrip 不阻塞 P3 complete，但 stable production signing 仍未完成。
+
+P4 当前仍为 0/7，下一项按方案 A 执行 P4.1：只建立 Machine identity 与 CounterGuard/key-directory
+guard，且零 Link/Data cert、零 enrollment、零 receipt 读写、零 RemoteLink；certificate 签发、enrollment
+与 receipt 首次归 P4.2。
 
 Relay production binary 已原子切换到 **Relay v2**。公开数据面只接受
 `/v2/connect`、`/v2/pair` 与 enrollment 所需的 `POST /v2/machine-enroll`；
@@ -317,9 +331,10 @@ StorageKEK；写入后必须立即读回并逐字节一致。既有 Runtime arti
 1 个真实签名 Keychain `set → load → delete` roundtrip 保持 ignored gate。该真实 gate
 **尚未通过**：本机没有匹配 access group 的 provisioning profile；Apple Development
 和本地 self-signed helper 虽然都通过 `codesign --verify`，启动仍被 AMFI 以 exit 137
-终止。因此 signed roundtrip 与 P3.1 Step 4 不能记为 PASS。2026-07-18 已采用方案 b：MVP/P3 exit
-验收完整 dev/ephemeral 路径，该 signed roundtrip 移入 post-MVP BLOCKED 证据槽位，不再阻塞 P3/P4
-主线或 phase closeout，也不再尝试代码绕过 AMFI；stable production signing 仍未完成。
+终止。因此 signed roundtrip 与 P3.1 Step 4 不能记为 PASS。2026-07-18 已采用方案 b：P3 Phase
+automatic scope 以完整 dev/ephemeral 路径验收，该 signed roundtrip 移入 post-MVP BLOCKED 证据槽位，
+不阻塞已完成的 P3 closeout 或后续 P4 主线，也不再尝试代码绕过 AMFI；stable production signing
+仍未完成。
 
 ### P3.2 Runtime journal 当前边界
 
@@ -404,8 +419,9 @@ fence、release、terminal
 行 MAC 能检测局部换列/删除/篡改，但“把 main+WAL 整体回滚到更早且内部自洽的有效快照”必须
 由 P4 的 Keychain `CounterGuard` / generation high-water 绑定后才能检测。该门禁属于 P4/P6，
 P3.2 不能宣称已防住整库历史回滚。
-缺 KEK 且无法通过当前 KEK/database/domain 认证的离线磁盘篡改、删除或跨库移植，会在
-open/recovery 全库认证审计中 fail-close，拒绝路径保持 artifact 零改写。同 UID 在线攻击者能够读取
+已有 committed artifact 中，缺 KEK 或无法通过当前 KEK/database/domain 认证的离线行/页改删及跨库
+移植，会在 open/recovery 全库认证审计中 fail-close，拒绝路径保持 artifact 零改写。整套
+DB/main/WAL/SHM 消失与自洽旧快照均留给 P4 CounterGuard。同 UID 在线攻击者能够读取
 daemon 内存密钥或替换进程，不属于 SQLite 层安全边界；`974f9b1` 是该方向最后一笔。
 
 ### P3.4 RuntimeCore 当前边界
@@ -509,7 +525,10 @@ history latest-intent、close barrier、重连有界恢复和 64-slot subscripti
 `527 XCTest + 35 Swift Testing`、iOS Simulator `20/20`、真实 local-runtime smoke 与双路终审全绿。
 P3.9 至此完成。P3.10 已由 `19622ab` 完成 current schema v7、durable admin ledger、flush-ACK-gated
 `StageUpgrade`、LaunchAgent lifecycle CLI 与隔离 ephemeral smoke，完整 `p3` verifier 和 Task 双路终审
-均通过。独立 P3 Phase Exit 尚未收口；P4 CounterGuard/RemoteLink 与真实 vendor metadata mutation 仍未完成。
+均通过；Phase review hardening 已收口到 `9efb28d`，独立 P3 Phase Exit 也已通过。P4
+CounterGuard/RemoteLink 与真实 vendor metadata mutation 仍未完成；下一项 P4.1 按方案 A 只建立
+identity/guard，且零 cert、零 enrollment、零 receipt 读写、零 RemoteLink；certificate/enrollment/receipt
+首次归 P4.2。
 
 进入 Core 的 principal 是字段私有的认证 capability；同一完整身份共享强 authorization lease，
 Accepted→Started 前会重新取得 guard，revoke 与 start 由该 guard + SQLite transition 线性化。
@@ -685,10 +704,10 @@ execution 已由 `c0ed6cd` / `f4141f0` / `fb1629a` 完成，B4 managed metadata 
 `5f1ca1c` / `347a0f0` 完成，B5 cross-layer closeout 已由 `aebc8d0` 完成。C0-C 自动实现与跨语言/
 Simulator 门禁已通过；C0-C、P3.9-A/B/C3/D/E Task 已完成，D/E code/test 提交分别为 `b818f81` / `d68cc02`。
 普通 GUI、Rust CLI 与 Swift `--selfcheck` 已默认走 OS-account shared-daemon UDS。P3.10 LaunchAgent
-安装/升级/保留数据卸载已由 `19622ab` 完成 Task 门禁与双路终审；独立 P3 Phase Exit 尚未完成，P4–P6
-尚未开始。P3.1 provisioned signed Keychain
-roundtrip 继续是 post-MVP BLOCKED 槽位，不阻塞 MVP/P3 exit；P5/P6 物理设备/公网/Linux 证据也是
-post-MVP，不冒充 PASS。
+安装/升级/保留数据卸载已由 `19622ab` 完成 Task 门禁与双路终审；基于 `9efb28d` 的独立 P3 Phase
+Exit 已完成，P4–P6 仍为 0/7、0/9、0/4。P3.1 provisioned signed Keychain roundtrip 继续是 post-MVP
+BLOCKED 槽位，不阻塞 P3 automatic closeout；P5/P6 物理设备/公网/Linux 证据也是 post-MVP，不冒充
+PASS。下一项 P4.1 按方案 A 不生成 cert，certificate/enrollment 归 P4.2。
 具体命令与资源矩阵见 [docs/QUALITY.md](docs/QUALITY.md)。
 
 ## agentdeck CLI（参考客户端 / E2E 驱动）
@@ -786,7 +805,7 @@ agentdeck protocol version
 
 运行（普通 GUI、Swift `--selfcheck` 与 Rust CLI 默认连接 OS-account shared-daemon canonical UDS，均没有
 daemon spawn/fallback；使用前须已有 canonical stable daemon。P3.10 已提供
-`agentdeck daemon install|status|uninstall [--purge]` 并完成 Task 门禁；独立 P3 Phase Exit 尚未收口；
+`agentdeck daemon install|status|uninstall [--purge]`，P3 Task 与独立 Phase Exit 均已收口；
 自动开发链路继续使用 `scripts/run-local-runtime-smoke.sh` 的私有 ephemeral harness）：
 
 ```bash

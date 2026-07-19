@@ -14,6 +14,7 @@ swift run AgentDeck -- --diagnostics-report --json --profile dev
 scripts/verify-agent-docs.sh
 bash scripts/verify-relay-companion-mvp.sh p0
 bash scripts/verify-relay-companion-mvp.sh p2
+bash scripts/verify-relay-companion-mvp.sh p3
 cargo test -p agentdeckd --test daemon_namespace --test storage_kek \
   --test daemon_startup -- --test-threads=1
 cargo run -p agentdeckd -- --ephemeral --no-remote --profile dev --selfcheck
@@ -29,8 +30,9 @@ verifier。1,800/2,000 additions 刹车线只统计单个 production 实现子�
 和文档不计；超过阈值只继续拆 production 子片，不把子片升格为收口 Task。RED→GREEN、精确 pathspec 不放宽，no-net/neutrality/sentinel
 等安全矩阵在相关 Task 收口与 Phase exit 按变更范围执行，不扩张为每个子片的重复门禁。
 
-Runtime store 的验证只承诺缺 KEK 且无法通过当前 KEK/database/domain 认证的离线磁盘篡改在
-open/recovery 全库认证中 fail-close 且拒绝零改写；内部自洽的整库历史回滚仍由 P4 CounterGuard 覆盖。
+Runtime store 的 P3 验证只承诺已有 committed artifact 中，缺 KEK 或无法通过当前
+KEK/database/domain 认证的行/页改删及跨库移植在 open/recovery 全库认证中 fail-close 且拒绝零改写；
+整套 DB/main/WAL/SHM 消失与内部自洽的整库历史回滚均由 P4 CounterGuard 覆盖。
 同 UID 在线攻击者可读取 daemon 内存密钥或替换进程，属于 accepted residual risk；`974f9b1` 后不再新增
 此类 SQLite 竞态测试、hook 或取证门禁。
 
@@ -1044,8 +1046,10 @@ P3.7 主体代码与 translator 终审修复已由 `5568e93` 提交，真实 rel
 provisioned signed Keychain 仍外部 BLOCKED；
 P3.8-A 增加 accepted-stream UDS transport primitives，P3.8-B production secure bind/permit、默认 UDS
 lifecycle 与 stdio compatibility 收窄已由 `1e7f9ea` / `459f32a` 完成；App/CLI 默认连接 shared daemon 属于 P3.9。
-P3.10 LaunchAgent 已由 `19622ab` 完成完整 `p3` Task verifier 与双路 Task 终审；独立 P3 Phase Exit
-仍未收口。P4 RemoteLink/E2EE 与 P5/P6 自动实现也必须继续保持未完成。
+P3.10 LaunchAgent 已由 `19622ab` 完成完整 `p3` Task verifier 与双路 Task 终审；Phase hardening 已由
+`773a2b3`、`0057824`、`81cc314`、`9efb28d` 收口，基于 `9efb28d` 的独立 P3 Phase Exit 也已
+exit 0。P4 RemoteLink/E2EE 与 P5/P6 自动实现仍未完成；下一项 P4.1 按方案 A 不生成 cert，
+certificate/enrollment 归 P4.2。
 
 ## Relay Companion MVP P3.8-A local Runtime UDS transport primitives 门禁
 
@@ -1402,7 +1406,7 @@ git diff --check
 
 B2c scoped code commit 为 `30103c1`，实际 `+1,333/-72`，低于 1,800 additions 预拆线。收口读回为
 Router 8/8、trait shape 1/1、runtime snapshot 23 passed / 1 ignored、daemon lib 672 passed / 1 ignored；
-完整 package 含 1,024 × 256 MiB exact boundary 255.29 秒、stream 45/45、transfer 17/17、StorageKEK
+完整 package 含 1,024 × 256 KiB exact boundary（总量 256 MiB）255.29 秒、stream 45/45、transfer 17/17、StorageKEK
 14 passed / 1 ignored，全部 exit 0。两路独立终审均 Approved，无 P0/P1/P2。B2 只完成 configuration
 CAS/snapshot/Core/defaults；B3–B5、P4–P6 当时仍未完成，P3.1 signed Keychain 则保留为 post-MVP
 BLOCKED 槽位。
@@ -1758,7 +1762,9 @@ production additions 424 / 810 / 1,583，均低于 1,800 预拆线。
 
 字面 `swift build -Xswiftc -warnings-as-errors` **未通过、不得记为 PASS**：唯一阻断是未修改的
 `Sources/AgentDeck/Preview/MockDaemonTransport.swift:93` 非 Sendable capture 既有 warning；P3.9-B 三个
-production 文件没有新增 warning。该 baseline 不扩入 B 的 component scope，但必须在 P3 Phase exit 前收口。
+production 文件没有新增 warning。该 baseline 不扩入 B 的 component scope；后续已由 P3.9-C3 的不可变
+handler snapshot 收口，并在 P3.9-C3 及后续相关 Task 门禁读回 warnings-as-errors build。独立 P3 Phase
+verifier 运行 `swift test`，没有重复执行这条字面 build 命令。
 
 ## Relay Companion MVP P3.9-C3 App model cutover Task 门禁
 
@@ -1954,9 +1960,9 @@ baseline-clean 文件保持 `0→0`；4 个 legacy 文件 diagnostics 分别从 
 strict clean。spec/security 与 quality 双路终审在冻结 diff SHA-256
 `66c4151af524caae6373571fcc0dd72b1d2c8789b5d7ffe64d05def416edbf6a` 上 Approved，无 P0/P1/P2。
 P3.1 provisioned signed Keychain 与真实 vendor login 继续 post-MVP BLOCKED；P3.9 complete，P3.10 已由
-`19622ab` 完成 Task 门禁与双路终审，独立 P3 Phase Exit 尚未收口。
+`19622ab` 完成 Task 门禁与双路终审，独立 P3 Phase Exit 也已在 `9efb28d` 上收口。
 
-### P3.10 Task gate（PASS；P3 Phase Exit pending）
+### P3.10 Task gate 与 P3 Phase Exit（PASS）
 
 `19622ab` 已新增 current schema v7 authenticated machine-wide `admin_commands` ledger，覆盖 30 天
 retention、容量准入、exact replay/conflict、COMMIT-unknown 与 open/recovery 审计；`StageUpgrade` 的
@@ -1988,19 +1994,32 @@ lib/bin/integration `13/13 + 8/8 + 2/2`；local-runtime/install harness、exact 
 四 schema、network/docs/diff 全绿，temp root/残留进程均为 0。`spec/security` 与 `quality` 两路 Task review
 均 Approved、无 P0/P1/P2。
 
-独立 P3 Phase Exit 仍须在 Task 文档状态冻结后重新运行：
+**Phase review hardening（code baseline `9efb28d`）：** `773a2b3` 为安装 verifier 增加资源上界，
+`0057824` 统一 v1–v6 legacy store 在原库 RW 前的 ledger/既有行全量认证，并新增显式 v1–v4
+committed-WAL 篡改矩阵；`81cc314` 回收
+verifier 同 PGID 子孙，`9efb28d` 通过保留 leader wait identity 与连续静默扫描稳定收口进程组。
+verifier 使用 10 秒绝对 deadline、stdout+stderr 合计 256 KiB 上限；超时/同组无法按期静默与输出超限
+分别映射为 `daemon.install.verifier_timeout`、`daemon.install.verifier_output_too_large`，两类失败都不得
+发布候选或切换 `bin/current`。
+
+**P3 Phase Exit 证据（2026-07-20，code baseline `9efb28d`）：** 在 Task 文档状态冻结后独立运行：
 
 ```bash
 bash scripts/verify-relay-companion-mvp.sh p3
 ```
 
-其中 `scripts/run-local-runtime-smoke.sh` 的 ephemeral UDS 链路承担 Swift Runtime selfcheck；独立 Swift
-静态门禁固定为 `swift run AgentDeck -- --diagnostics-report --json`，不得依赖或修改当前用户 home 下的
-production-signed stable daemon。默认自动证据只允许 dev/ephemeral 隔离 root + injected
-launchctl/signature verifier；production constructor 仍从 `getpwuid_r` home 派生路径并拒绝 ad-hoc。
-provisioned production-signed LaunchAgent/Keychain roundtrip 是 post-MVP `BLOCKED` 槽位，缺输入时必须
-`mutations=0`、零 evidence、不得生成 summary。P3.10 Task 已 PASS；P3 Phase Exit 的独立 verifier 与
-双路 phase review 完成前不得进入 P4 共享文件实现。
+最终 exit 0。daemon lib 两轮均为 `905 passed / 3 ignored`，耗时 218.23s / 154.45s；1,024 ×
+256 KiB capacity boundary 两轮均为 `5/5`，耗时 284.97s / 286.07s；Swift 为
+`527 XCTest + 35 Swift Testing`，iOS Simulator 为 `20/20`。四份 schema、network boundary、docs、
+`scripts/run-local-runtime-smoke.sh`、daemon install hermetic harness 与 diagnostics report 全绿；
+`spec/security`、`quality` 双路 code review 均为 P0/P1/P2 = 0。
+
+production-signed LaunchAgent/Keychain roundtrip 继续精确输出 post-MVP
+`BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`。该 exact BLOCKED contract 是 verifier 的必过
+自动项；整体 exit 0 只表示契约与 automatic scope 通过，不表示 production signing PASS。P3.1 继续采用
+方案 b，stable production signing 仍未完成。P3 Phase 至此 complete（MVP automatic scope）。P4 当前仍为
+0/7，下一项按方案 A 执行 P4.1：只建立 Machine identity 与 CounterGuard/key-directory guard，且零
+cert、零 enrollment、零 receipt 读写、零 RemoteLink；certificate 签发、enrollment 与 receipt 首次归 P4.2。
 
 ## AppKit 重写后的验证清单
 
@@ -2140,7 +2159,7 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P3.9-C3 App model cutover | 运行本页 App coordinator/canonical model/reliability/Preview focused `46/46`、完整 Swift、普通与 warnings-as-errors build、iOS Simulator、production source purge、strict format/diff 与双路独立终审；普通 GUI 已默认 shared UDS 且 socket failure 零 fallback；Rust CLI、`main.swift --selfcheck` 与双客户端组合 smoke 当时不计入 C3，后由 P3.9-D 完成 |
 | Relay Companion MVP P3.9-D 默认入口与组合 smoke | 运行本页 CLI/daemon/Swift/iOS 全量、真实双客户端 smoke、active-turn/双连接/close-only 组合证据、release hidden-surface、四 schema、scoped Clippy/network/docs/fmt/diff 与双路终审。`b818f81` 已完成且全部自动门禁 PASS；真实 vendor login 与 P3.1 provisioned Keychain 仍按 post-MVP BLOCKED 记录，不冒充本 Task 证据 |
 | Relay Companion MVP P3.9-E App 会话可靠性 | 运行本页 retry/reconnect/history/subscription/composer focused、完整 Swift/iOS、真实 local-runtime smoke、四 schema、network/docs/diff、changed-source baseline parity 与双路终审。`d68cc02` 已完成且自动门禁 PASS；4 个 legacy 文件只证明诊断数下降，不冒充全文件 strict clean，也不冒充真实 vendor/remote/signed 证据 |
-| Relay Companion MVP P3.10 LaunchAgent lifecycle / upgrade | `19622ab` 已完成 admin ledger、upgrade/fence、CLI lifecycle focused tests、完整 `bash scripts/verify-relay-companion-mvp.sh p3` 与双路 Task review；ephemeral smoke 覆盖 Swift Runtime selfcheck，独立门禁使用 diagnostics report。P3.10 Task PASS，但独立 P3 Phase Exit pending；production-signed 槽位只能输出 post-MVP `BLOCKED/mutations=0/零 evidence`，不得冒充 PASS |
+| Relay Companion MVP P3.10 LaunchAgent lifecycle / upgrade 与 P3 Phase Exit | `19622ab` 已完成 admin ledger、upgrade/fence、CLI lifecycle Task；`773a2b3`、`0057824`、`81cc314`、`9efb28d` 完成 verifier 资源/进程组 hardening 与 legacy pre-RW 认证。基于 `9efb28d` 的独立 `bash scripts/verify-relay-companion-mvp.sh p3` exit 0，双路 code review P0/P1/P2 = 0，P3 automatic scope complete；production-signed 槽位仍只能输出 post-MVP `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`，不得冒充 PASS。下一项 P4.1 按方案 A 只建立 identity/guard，且零 cert、零 enrollment、零 receipt 读写、零 RemoteLink；certificate/enrollment/receipt 首次归 P4.2 |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

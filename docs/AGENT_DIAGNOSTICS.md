@@ -465,7 +465,9 @@ StorageKEK 缺失时先检查 `runtime.db`、`runtime.db-wal`、`runtime.db-shm`
 `--ephemeral --no-remote --profile dev` 与 dev/ephemeral Keychain 路径；这不等于 stable production
 signing 已完成。P3.1 provisioned signed roundtrip 已移入 post-MVP BLOCKED 证据槽位：本机无匹配
 provisioning profile，两个已通过 `codesign --verify` 的尝试均被 AMFI 以 exit 137 终止，ignored 测试
-不是通过证据。该槽位不再阻塞 MVP、P3/P4 主线或 phase closeout，也不再尝试本地绕过 AMFI。
+不是通过证据。P3 Phase automatic scope 已在该槽位精确保持
+`BLOCKED/mutations=0/evidence=[]/summaryGenerated=false` 时完成；该槽位不阻塞后续 P4 主线，也不再尝试
+本地绕过 AMFI，但不得因此把 stable production signing 记为 PASS。
 
 | P3.1 code | 含义 | 下一步 |
 | --- | --- | --- |
@@ -641,7 +643,7 @@ fixture 泄漏，或把 test-only admission 暴露为运行时配置。
 | P3.2/P3.3 code | 常见内部原因 | 下一步 |
 | --- | --- | --- |
 | `daemon.runtime.store_invalid` | path/type/owner/mode/nlink、busy/count/byte config 或 operation input 不合法 | 核对 0700 namespace、0600 artifacts 和固定 config；拒绝 symlink/hardlink，不自动放宽 |
-| `daemon.runtime.schema_incompatible` | schema family/version/signature/live manifest、typed canonical descriptor/row linkage、逐 conversation HWM、authenticated metadata、command/execution/event/approval/stream/snapshot/publication/configuration/projection/effect-fence/admin-command totals 或两类 adapter-state total 不一致 | 停止写入并保留 main/WAL/SHM/journal；v1/v2/v3/v4→v5→v6→current v7 只能走内置原子 migration，不能原地猜测/手改 schema |
+| `daemon.runtime.schema_incompatible` | schema family/version/signature/live manifest、typed canonical descriptor/row linkage、逐 conversation HWM、authenticated metadata、command/execution/event/approval/stream/snapshot/publication/configuration/projection/effect-fence/admin-command totals 或两类 adapter-state total 不一致 | 停止写入并保留 main/WAL/SHM/journal；v1–v6 必须先在 rescue committed-state 上完成对应 ledger token 与既有行全量认证，再打开原库 RW 并走内置原子 migration 到 current v7，不能原地猜测/手改 schema |
 | `daemon.runtime.store_unavailable` | worker/shutdown/commit outcome、clock/capacity probe、SQLite/I/O、sequence coordination，或 bounded checkpoint 被 reader pin 住 | 对 unknown outcome 用完全相同 stable ID/idempotency/full request 重试；Configure after-COMMIT unknown 可能已产生唯一 `ConfigurationChanged`，exact retry 应读回 Replayed 而不是换 key；checkpoint blocked 时停止新副作用、释放 reader 并保留 WAL，其他错误保留 evidence 后重启/修复底层 I/O |
 | `daemon.runtime.store_busy` | normal/safety/read lane 的 count 或 retained-allocation byte permit 已满 | 客户端退避并保持同一 idempotency key；不要并发重发新 key |
 | `daemon.runtime.recovering` | 已冻结 paged recovery barrier，终页尚未核账并 finish | 继续使用上一页返回的 exact cursor；RuntimeCore 逐页消费，终页 finish 后再开放请求，不得并行 mutation |
@@ -672,7 +674,7 @@ P3.4 RuntimeCore 的 transport-neutral failure：
 | `daemon.runtime.not_ready` | Core 尚未完成 paged recovery，或正在 draining/stopped | 等待 daemon readiness；若 recovery 无法完成，按上节保留 DB/Keychain 证据并 fail-close |
 | `daemon.runtime.protocol_mismatch` | Runtime protocol 版本不兼容 | 升级客户端/daemon 到同一 Runtime protocol；不能回退 Relay/IPC 业务字段 |
 | `daemon.runtime.invalid_request` | ID 非 canonical UUID、Start key/cwd、Configure key 或 configuration agent kind 与 conversation 不匹配等规范化输入非法 | 修正原请求；不得由 daemon 猜 ID/path/agent kind 或替客户端补目标 |
-| `daemon.runtime.feature_unavailable` | 请求属于尚未接线的后续 phase（例如 pairing/revoke/trust reset），或当前 capability/构建不支持该请求 | 读取 capabilities/实施状态后等待对应 phase；`StageUpgrade` 已由 P3.10 `19622ab` 接入 durable/flush-ACK-gated 执行，不再是 dormant DTO，正常失败必须读回 `daemon.upgrade.*` / `daemon.install.*` typed code。只有 exact reply flush ACK 后才允许期待 PID/symlink 变化；ACK 前 disconnect 必须零切换。stopped `loaded=true,pid=null` job 会 kickstart 并二次读回 live PID；CLI 只对 `socket_missing` / `connect_failed` 做有界 15 秒 retry。P3.10 Task verifier/review 已 PASS，但独立 P3 Phase Exit pending，尚不得进入 P4。native metadata 现使用更精确的 `daemon.conversation.metadata_unsupported`，managed rename/archive 已进入 B4，production local transport 已进入 P3.8，shared-daemon 默认客户端已进入 P3.9-D，DescribeAgents/Configure 已进入 P3.9-C0-B2，SendPrompt admission 已进入 B3a，Catalog/Subscribe/Backfill 已进入 P3.6，不应再用该 code 代替真实错误；不得用 compatibility path 或 fake coordinator 假成功 |
+| `daemon.runtime.feature_unavailable` | 请求属于尚未接线的后续 phase（例如 pairing/revoke/trust reset），或当前 capability/构建不支持该请求 | 读取 capabilities/实施状态后等待对应 phase；`StageUpgrade` 已由 P3.10 `19622ab` 接入 durable/flush-ACK-gated 执行，正常失败必须读回 `daemon.upgrade.*` / `daemon.install.*` typed code。P3 Phase automatic scope 已完成；下一项 P4.1 按方案 A 只建立 identity/CounterGuard/key-directory guard，且零 cert、零 enrollment、零 receipt 读写、零 RemoteLink，因此 certificate/enrollment 在 P4.2 前仍应 feature-unavailable。native metadata 使用更精确的 `daemon.conversation.metadata_unsupported`；不得用 compatibility path 或 fake coordinator 假成功 |
 | `daemon.authorization.revoked` | opaque principal lease 已 Revoking/Revoked 或 issuer registry 不可用 | 停止该 connection；remote 设备按 durable revocation/re-pair 流程处理，本地重新认证 peer credential |
 | `daemon.runtime.identity_unavailable` | machine trust/ID derivation domain 非法或 OS entropy 不可用 | 停止启动并检查 machine identity/系统熵；不得生成零 ID 或使用时间/PID 回退 |
 | `daemon.runtime.actor_unavailable` | conversation actor/execution control 已损坏或 recovery-blocked | 不自动重放 Started；保留 command/fence 证据，P3.7 按 orphan fencing 处理 |
@@ -780,6 +782,25 @@ P3.9-E code/test 提交为 `d68cc02`。GUI 状态栏中的 `sending` 只表示�
 
 Task 门禁中真实 AF_UNIX EOF、新 wire 首操作、subscription admission 各有确定性覆盖；真实 vendor login、
 RemoteLink、provisioned signed Keychain 仍是 post-MVP/后续阶段证据，不能由本节的本地 synthetic 结果替代。
+
+### P3.10 install/upgrade 与 P3 Phase 排障
+
+P3.10 code/test commit 为 `19622ab`；Phase review hardening 依次为 `773a2b3`、`0057824`、
+`81cc314`、`9efb28d`。基于 `9efb28d` 的独立 `p3` verifier 已 exit 0，P3 Phase complete（MVP
+automatic scope）。安装 verifier 的所有外部命令都在独立 PGID 中运行，使用 10 秒绝对 deadline、
+stdout+stderr 合计 256 KiB 上限；leader 在同组清理前保持 wait identity，避免 PGID 在 SIGKILL 前被无关
+进程复用。该收口只覆盖同 PGID 成员，不声称发现或清理主动 `setsid`/`setpgid` 的逃逸进程。
+
+| code | 含义 | 下一步 |
+| --- | --- | --- |
+| `daemon.install.verifier_timeout` | `codesign`、`plutil` 或候选 `agentdeckd --version` 超过 10 秒绝对 deadline，或 leader 退出后同 PGID 仍不能在 deadline 内连续读回静默 | 停止安装并保留当前 artifact/current；检查签名环境、候选 `--version` 与同 PGID 后代，不扩大 deadline、不降级 verifier，也不把该错误改写为 `signature_invalid` |
+| `daemon.install.verifier_output_too_large` | verifier stdout+stderr 聚合超过固定 256 KiB | 拒绝候选并清理未发布 temp；检查异常输出或错误 packaging，禁止截断后继续发布或切换 `bin/current` |
+
+production-signed LaunchAgent/Keychain slot 继续精确返回 post-MVP
+`BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`；`p3` verifier exit 0 表示该 BLOCKED contract 与
+automatic gate 正确，不表示 production signing PASS。P3.1 继续采用方案 b。下一项按方案 A 执行 P4.1：
+只建立 Machine identity 与 CounterGuard/key-directory guard，且零 Link/Data cert、零 enrollment、零
+receipt 读写、零 RemoteLink；certificate 签发、enrollment 与 receipt 首次归 P4.2。
 
 P3.7 exec-gate 的以下 code 是内部 typed 分类码。`--exec-gate` one-shot 自身失败时会把 code 写到
 stderr，私有 ADGX abort frame 也可携带 code；但当前 parent/runtime 不保证把每个子码写入

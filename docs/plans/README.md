@@ -61,10 +61,14 @@ P3.9-C0-B3a 已由 `48594e8` / `09a14b0` 完成并通过 Task 完整门禁与双
 完成，B5 cross-layer closeout 已由 `aebc8d0` 以 test-only 增量完成并通过完整门禁与双路终审；C0-C native
 history projection、P3.9-A/B Rust/Swift shared-daemon client component、P3.9-C3 App model cutover、
 P3.9-D 默认入口/真实双客户端 smoke 与 P3.9-E App 会话可靠性也已分别完成 Task 门禁与双路终审；
-D/E code/test 提交分别为 `b818f81` / `d68cc02`。P3.10 已由 `19622ab` 完成 schema v7/admin ledger、
-flush-ACK-gated upgrade 与 LaunchAgent lifecycle，完整 `p3` Task verifier exit 0 且双路 Task review
-Approved；独立 P3 Phase Exit 尚未收口。P3.1 的 provisioned signed Keychain 外部门禁仍有
-1 项 ignored/BLOCKED，但不阻塞主线。P4 E2EE/Relay Publish、P5 Simulator 自动 E2E 与
+D/E code/test 提交分别为 `b818f81` / `d68cc02`。P3.10 主体由 `19622ab` 完成 schema v7/admin ledger、
+flush-ACK-gated upgrade 与 LaunchAgent lifecycle；P3 Phase review 又由 `773a2b3` 收口安装 verifier
+资源上界、`0057824` 收口 legacy pre-migration authentication，并由 `81cc314` / `9efb28d` 稳定回收
+verifier 进程组。以 `9efb28d` 为 code baseline 的完整 `p3` Phase verifier exit 0，双路 phase code
+review 均为 P0/P1/P2=0，P3 automatic scope 6/6 complete。P3.1 继续采用方案 b：provisioned signed
+Keychain/LaunchAgent roundtrip 保持 post-MVP ignored/BLOCKED，不阻塞主线，也不表示 stable production
+signing 已完成。P4 仍为 0/7，下一项是严格零 cert、零 enrollment、零 RemoteLink 的 P4.1 machine
+identity/CounterGuard automatic slice；link/data cert、enrollment 与首条 RemoteLink 归 P4.2。P4 E2EE/Relay Publish、P5 Simulator 自动 E2E 与
 P6 本机第二客户端 synthetic DoD 均未完成；物理 iPhone/第二台 Mac 是 post-MVP BLOCKED 槽位。
 transfer/publication 也尚无 production remote owner；不能因 fake publication、store tests 或 Simulator
 fixture 改写尚未实现的自动链路状态。

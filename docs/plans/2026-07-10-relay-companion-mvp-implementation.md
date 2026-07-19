@@ -32,11 +32,19 @@ P5/P6 MVP 退出范围的上位纠偏决策；冲突处以纠偏决策为准。�
 - `conversationId` 必须在 adapter 启动前由 daemon 生成；vendor resume reference 只能存在于各 adapter 私有 namespace，不能进入 common catalog、Relay 或客户端 wire。继续遵守 N1/N2/N3/N7/N8/K9。
 - MachineDataSign 必须签 daemon→device catalog/event/snapshot/key update；DeviceSign 必须签 device→daemon RuntimeRequest。共享 AEAD key 不能替代发送方身份签名。
 - Keychain/DB counter 顺序固定为“先提升 CounterGuard high-water，再提交可消费 block”；检测 DB rollback、nonce reuse、key revision rollback 时 remote fail-closed。
-- Runtime store 的安全承诺收口为**离线篡改 fail-close**：缺 KEK 且无法通过当前
-  KEK/database/domain 认证的磁盘级篡改、删除或跨库移植必须在 open/recovery 全库审计中被拒绝，且拒绝
-  路径不改写 artifact；整套 main+WAL 回滚到更早但内部自洽的有效快照仍须 P4 CounterGuard 检测。同 UID 在线攻击者能够 ptrace daemon、
+- Runtime store 的 P3 安全承诺收口为**离线篡改 fail-close**：已有 committed artifact 中，缺 KEK 或
+  无法通过当前 KEK/database/domain 认证的行/页改删及跨库移植必须在 open/recovery 全库审计中被拒绝，
+  且拒绝路径不改写 artifact；整套 DB/main/WAL/SHM 消失，或整套 main+WAL 回滚到更早但内部自洽的有效
+  快照，均须 P4 CounterGuard 检测。同 UID 在线攻击者能够 ptrace daemon、
   替换二进制或读取进程内密钥，明确作为 accepted residual risk；`974f9b1` 是该方向最后一笔，后续不得
   再为同 UID 在线竞态新增测试、hook 或取证机制，review 中同类 finding 以 out-of-scope 关闭。
+- P3 Phase Exit 对该离线边界采用**方案 A**：不缩窄为 current-only。`0057824` 把 legacy v1-v6
+  ledger/既有行认证统一前移到原库 RW open/migration 之前，显式 committed-WAL 篡改矩阵覆盖 v1-v4；
+  migration focused suite `40/40`。这不是新的同 UID 在线竞态 hook，不撤销 `974f9b1` 的停止线。
+- 安装 verifier 只承诺同 PGID 资源与清理边界：`773a2b3` 固定绝对 deadline、聚合输出与双向 pipe
+  上界，`81cc314` / `9efb28d` 保证 leader 直接 reap，并在返回前把同 PGID descendants 收口到
+  non-executable/zombie。主动 `setsid`/`setpgid` 或 launch service 逃离 PGID 不在该边界内；不得把它
+  描述成针对恶意同 UID 代码的 sandbox。
 - 资源硬上界：Relay frame 4 MiB；compact remote raw part 3.5 MiB；JSON/UDS raw part 固定
   700 KiB，并以 worst-case 实际编码证明完整 `RuntimeEnvelope` 严格小于 JSONL/UDS 1 MiB hard
   cap；compact transfer 最多 64 parts，JSON/UDS 最多 94 parts，两者共同受 64 MiB/5 分钟
@@ -91,7 +99,7 @@ P5/P6 MVP 退出范围的上位纠偏决策；冲突处以纠偏决策为准。�
 | P5 | 共享 Swift client、iOS Companion、远程 macOS | iOS Simulator 自动 E2E 通过；物理 iPhone/第二台 Mac 为 post-MVP BLOCKED 槽位 |
 | P6 | 四端竞态、故障注入、运维与 DoD | 本机第二客户端与十三项 DoD 的合成可自动化项通过；真实 vendor/公网/物理设备/Linux host 槽位可读且保持 BLOCKED |
 
-**设计覆盖索引:** §6 enrollment/pair/revoke/reset→P1.2、P2.2/P2.4/P2.7/P2.8、P4.1–P4.3、P5.6；§7 crypto/key/counter→P1.4–P1.7、P4.1/P4.5、P5.2/P5.4；§8 RuntimeCore→P3.1–P3.7；§9 stream/snapshot/transfer→P1.1、P2.3、P3.6、P4.5、P5.3/P5.4；§10–§12 Relay/TLS/ops→P2.1–P2.10、P6.2；§13 Companion→P5.1–P5.9；§14 failures→各phase contract/store/UI tests与DIAGNOSTICS同步；§17 DoD→P6.1–P6.4证据矩阵。
+**设计覆盖索引:** §6 enrollment/pair/revoke/reset→P1.2、P2.2/P2.4/P2.7/P2.8、P4.2–P4.3、P5.6；§7 crypto/key/counter→P1.4–P1.7、P4.1/P4.5、P5.2/P5.4；§8 RuntimeCore→P3.1–P3.7；§9 stream/snapshot/transfer→P1.1、P2.3、P3.6、P4.5、P5.3/P5.4；§10–§12 Relay/TLS/ops→P2.1–P2.10、P6.2；§13 Companion→P5.1–P5.9；§14 failures→各phase contract/store/UI tests与DIAGNOSTICS同步；§17 DoD→P6.1–P6.4证据矩阵。
 
 ---
 
@@ -1065,8 +1073,9 @@ clippy、daemon no-net 与 diff gate 全通过。P3.1 provisioned signed Keychai
 ignored/BLOCKED；P3.7 exec gate 主体、边界裁决、两个 prepare finding 与 translator 阻断项已收口并通过
 聚焦门禁，最终完整自动门禁与独立终审均已通过，并由 `5568e93` 完成主体 scoped commit、
 `c9d2146` / `5713be4` 补齐真实 release 前取消与 sentinel 退出窗口门禁；P3.8 production UDS 与后续
-P3.9 shared-daemon client 与 P3.10 LaunchAgent Task 已完成；P3.10 code/test commit 为 `19622ab`，P3
-Phase Exit 仍 pending，P4 E2EE/Relay Publish 未开始。
+P3.9 shared-daemon client 与 P3.10 LaunchAgent Task 已完成；P3.10 code/test commit 为 `19622ab`，
+后续 Phase hardening code baseline 为 `9efb28d`，P3 automatic scope 已完成 6/6 Phase Exit；P4
+E2EE/Relay Publish 仍为 0/7，下一项是 P4.1。
 
 ### Task P3.6-A：先冻结 Runtime/E2EE contract 与跨语言 wire
 
@@ -1573,7 +1582,7 @@ provisioned signed Keychain 外部门禁继续 BLOCKED。
   namespace 24/24、binary startup 8/8、listener 7/7、ownership 7/7、Rust transport 4/4、Swift
   256 XCTest + 35 Swift Testing、App selfcheck、schema、Clippy/fmt/network/docs/diff 均通过。首次完整
   回归因 49 GiB incremental cache 把可用空间压到准入线而触发 `DiskLow`；仅删除可再生缓存后，
-  同一默认并发与真实 1,024 × 256 MiB 数据规模在 253.52 秒内通过，未改产品准入或测试 fixture。
+  同一默认并发与真实 1,024 × 256 KiB 数据规模（总量 256 MiB）在 253.52 秒内通过，未改产品准入或测试 fixture。
 - [x] Step 5: 独立 spec/security/quality review，修完 P0/P1/P2 后同步 README/ARCHITECTURE/QUALITY/
   DIAGNOSTICS/AGENTS 与本计划；代码终审无 P0/P1/P2，文档旧参数、状态矩阵与文件账本 findings 已
   修复并复跑 docs gate。P3.1 signed Keychain 仍保持外部 BLOCKED。
@@ -1947,7 +1956,7 @@ P3.9 固定以下迁移边界：
         production writer 的真实非空 DB 通过。pin/metadata 表继续 zero fail-close；`createdAt` 固定复用已认证
         `updatedAt`，新时钟仅供 replay-window trim 判定 TEMP pin 过期，不写入 event/activity。两轮独立
         security/quality 终审 Approved；daemon lib 659 passed + 1 ignored、完整 package（含 254.83 秒
-        1,024 × 256 MiB 边界）、stream 45/45、transfer 17/17、Clippy/fmt/no-net/docs/App selfcheck 全绿。
+        1,024 × 256 KiB 边界，总量 256 MiB）、stream 45/45、transfer 17/17、Clippy/fmt/no-net/docs/App selfcheck 全绿。
       - [x] **B2a2 hardening matrix（commit `fa24782`，实际 965 additions / 17 deletions）：** 并发
         writer、stale/future revision、same-key conflict、owner namespace、agent/input reject、before/after-
         COMMIT、8 类 tamper/orphan/head/ledger/AAD、recovery frozen cut 与 quota exact boundary 已闭环；所有
@@ -1955,7 +1964,7 @@ P3.9 固定以下迁移边界：
         零写。真实 production writer 4,096 版 exact limit→one-past typed reject→reopen 慢门禁 1/1（58.10 秒），
         默认 matrix 7 passed + 1 ignored，quota/retained-memory 私有用例 2/2；configuration 密文/AAD 错误继续
         保留稳定 `daemon.runtime.crypto_failed`，event tamper 服从既有全库完整性边界。daemon lib 661 passed +
-        1 ignored、完整 package 与真实 1,024 × 256 MiB 边界（255.81 秒）、Clippy/fmt/no-net/docs/App
+        1 ignored、完整 package 与真实 1,024 × 256 KiB 边界（总量 256 MiB，255.81 秒）、Clippy/fmt/no-net/docs/App
         selfcheck/diff 全绿，两轮独立复审 Approved、无剩余 P0/P1/P2。P3.1 signed Keychain 外部门禁继续
         BLOCKED。
     - [x] **B2b cursor snapshot（code commit `c54ddc8`，实际 1,169 additions / 39 deletions）：** 按 frozen
@@ -1966,7 +1975,7 @@ P3.9 固定以下迁移边界：
       HWM；旧 cursor 下 intermediate ciphertext、gap + valid orphan 与 parent HWM rollback 均已 RED→GREEN。
       current/legacy Ready 保持 crypto/schema provenance，legacy 只生成临时 v2 wire、不改写 DB。真实 production
       4,096 版完整 selector 慢门禁 1/1（56.80 秒）；默认 runtime snapshot 23 passed + 1 ignored、私有 35/35、
-      configuration 7 passed + 1 ignored、daemon lib 665 passed + 1 ignored，完整 package 含 1,024 × 256 MiB
+      configuration 7 passed + 1 ignored、daemon lib 665 passed + 1 ignored，完整 package 含 1,024 × 256 KiB
       边界（255.14 秒）、stream 45/45、transfer 17/17、StorageKEK 14 passed + 1 ignored；Clippy/fmt/no-net/
       docs/App selfcheck/diff 全绿。两轮独立终审 Approved、无剩余 P0/P1/P2；P3.1 signed Keychain 外部门禁
       继续 BLOCKED。
@@ -1981,7 +1990,7 @@ P3.9 固定以下迁移边界：
       `ConfigurationChanged`，replay/conflict 与 Catalog 均零新事件；旧 rev0 Ready snapshot 经 rev1 backfill
       收敛，after-COMMIT unknown 仍只通知一次且 exact retry Replayed。focused Core/订阅 8/8、Router 8/8、
       trait 1/1、runtime snapshot 23 passed + 1 ignored、daemon lib 672 passed + 1 ignored、完整 package含真实
-      1,024 × 256 MiB 边界 255.29 秒均 exit 0；Clippy/fmt/no-net/docs/App selfcheck/diff 全绿。两路独立
+      1,024 × 256 KiB 边界（总量 256 MiB）255.29 秒均 exit 0；Clippy/fmt/no-net/docs/App selfcheck/diff 全绿。两路独立
       spec/security/quality 终审 Approved、无 P0/P1/P2；未夹带 B3 SendPrompt/pin 或 B4 metadata mutation，
       P3.1 signed Keychain 外部门禁继续 BLOCKED。
   - [x] **B3a admission pin（complete；`48594e8` / `09a14b0`）：** SendPrompt expected
@@ -2000,7 +2009,7 @@ P3.9 固定以下迁移边界：
       才做该处最小调整。本片不写 pin、不放开 production SendPrompt，也不宣称 B3a 已实现。先只加 DTO
       字段得到 18 个编译 RED，再把 56 个 initializer 全部显式补为 rev0 placeholder；全仓 62 个词法命中
       扣除 model/worker enum-pattern/函数签名后无漏项，新增行没有读取、分支、token 或 persistence 行为。
-      daemon lib 672 passed + 1 ignored、完整 `cargo test -p agentdeckd` exit 0，真实 1,024 × 256 MiB
+      daemon lib 672 passed + 1 ignored、完整 `cargo test -p agentdeckd` exit 0，真实 1,024 × 256 KiB
       门禁 259.29 秒、stream 45/45、transfer 17/17、StorageKEK 14 passed + 1 个既有 signed gate ignored；
       全目标 Clippy、fmt、no-net、docs、App selfcheck 与 diff 全绿，独立复审 Approved、无 P0/P1/P2。
     - [x] **B3a1 Store writer/reader（code commits `494d9d7`、`e78054f`、`944e257`、`b3bc521`）：**
@@ -2014,7 +2023,7 @@ P3.9 固定以下迁移边界：
       exact configuration，也未改 adapter prepare。四个小片实际 additions 分别为 664、1,257、964、429，均
       低于 1,800 行预拆线；focused evidence 8/8，strict-v1、production writer→rev2→reopen→query/recovery 与
       真实旧 writer non-empty-WAL fail-close/DB+WAL+SHM 零触碰门禁全绿。daemon lib 672 passed + 1 ignored、
-      完整 package（含真实 1,024 × 256 MiB，278.29 秒）、stream 45/45、transfer 17/17、StorageKEK 14 passed
+      完整 package（含真实 1,024 × 256 KiB，总量 256 MiB，278.29 秒）、stream 45/45、transfer 17/17、StorageKEK 14 passed
       + 1 ignored、Clippy/fmt/no-net/docs/App selfcheck/diff 全绿；两路独立终审 Approved、无 P0/P1/P2。
     - [x] **B3a2 hardening（internal 3/3 complete）：** 用单 Store worker 的可控 before-COMMIT barrier固定 Configure-first 与
       Prompt-first 两种线性化顺序；覆盖 stale/future、same-key conflict、restart/recovery、before/after-COMMIT
@@ -2031,7 +2040,7 @@ P3.9 固定以下迁移边界：
         `WorkerBusy(Normal)` 固定 Configure-first/Prompt-first 两种 FIFO；stale/future、same-key、Accept
         before/after-COMMIT、Accepted/Started/terminal 跨 head advance 均以完整 evidence 证明 rollback、exact
         replay、shutdown/reopen、receipt 与 recovery 零漂移，原 pinned revision 保持不变。focused 12/12、
-        两条线性化重复 20/20、daemon lib 672 passed + 1 ignored、完整 package（含真实 1,024 × 256 MiB，
+        两条线性化重复 20/20、daemon lib 672 passed + 1 ignored、完整 package（含真实 1,024 × 256 KiB，总量 256 MiB，
         287.80 秒）、stream 45/45、transfer 17/17、StorageKEK 14 passed + 1 ignored、Clippy/fmt/no-net/docs/
         App selfcheck/diff 全绿；spec/quality 双路终审 Approved、无 P0/P1/P2。
       - [x] **B3a2-B tamper/legacy/race（internal 3/3）：** 参数化 pin metadata token、revision swap、
@@ -2454,18 +2463,19 @@ P3.9 固定以下迁移边界：
   production additions Task aggregate 为 2,175（aggregate 不计硬线）；最大职责子片
   `SessionModel.swift` 为 1,448，其他 production 文件单个最多 220，均低于 1,800 预拆线。
   真实 Codex/CC login 与 provisioned signed Keychain 继续是 post-MVP BLOCKED 槽位，不冒充本 Task 证据。
-  P3.9 至此完成；P3.10 已由 `19622ab` 完成 Task 收口并通过完整 verifier 与双路 Task 终审，下一道门禁
-  是独立 P3 Phase Exit。P3 Phase Exit 未完成前不得进入 P4 共享实现。
+  P3.9 至此完成；P3.10 已由 `19622ab` 完成 Task 收口并通过完整 verifier 与双路 Task 终审；后续
+  Phase review hardening 已由 `773a2b3` / `0057824` / `81cc314` / `9efb28d` 收口，P3 automatic scope
+  已完成 6/6 Phase Exit。P4 保持 0/7，下一项是 P4.1。
 
 ### Task P3.10：实现 LaunchAgent 安装、versioned upgrade 与保留数据的 uninstall
 
-> **状态（2026-07-20）：Task complete，P3 Phase Exit pending。** schema v7 authenticated
+> **状态（2026-07-20）：Task complete；P3 automatic scope 6/6 complete。** schema v7 authenticated
 > `admin_commands` ledger、30 天 retention/容量准入/exact replay/conflict/COMMIT-unknown、flush-ACK-gated
 > `StageUpgrade`、active→idle fence、候选 artifact 安全校验与 LaunchAgent install/status/uninstall CLI 已形成
 > code/test，并由 `19622ab` scoped commit。冻结 candidate 的完整
 > `bash scripts/verify-relay-companion-mvp.sh p3` 已 exit 0，两路 Task review 均 Approved、无 P0/P1/P2；
-> 隔离 ephemeral UDS 已完成 install→stage→ACK→idle→手动 current restart→Hello。独立 P3 Phase Exit
-> 尚未执行，因此仍不得进入 P4。
+> 隔离 ephemeral UDS 已完成 install→stage→ACK→idle→手动 current restart→Hello；后续 Phase review
+> hardening 与独立 P3 Phase Exit 证据见本 Task 后的 6/6 checklist。P4 当前仍为 0/7。
 
 **前置冻结：** local-only typed `StageUpgrade` request/reply、授权与错误语义已纳入 P3.9-C0-A 的 Runtime
 v2 contract；P3.9 的历史基线固定返回 typed feature-unavailable，P3.10 implementation 已用 durable/flush-ACK
@@ -2519,36 +2529,69 @@ focused tests + scoped Clippy/fmt，不做子片级双路终审、全量慢门�
 - [x] Step 5: 冻结 candidate 的完整 `bash scripts/verify-relay-companion-mvp.sh p3` 已 exit 0。两轮 1,024 × 256 KiB capacity 分别为 286.88s / 286.64s；daemon lib 两轮均 `904 passed / 3 ignored`；Swift `527 XCTest + 35 Swift Testing`，iOS Simulator `20/20`。local-runtime/install harness、exact signed BLOCKED contract、四 schema、network boundary、docs/diff 全绿，结束后 temp root/残留进程均为 0。
 - [x] Step 6: code/test 已用精确 scope 提交为 `19622ab feat(daemon): 完成 LaunchAgent 安装与空闲升级`；冻结 diff 上的 `spec/security` 与 `quality` Task review 均 Approved、无 P0/P1/P2。P3.10 Task complete；当前文档收口不改代码/脚本，也不等同 P3 Phase Exit。
 
-### P3 Phase Exit（独立 checklist，未完成）
+### P3 Phase Exit（独立 checklist，6/6 complete；automatic scope）
 
-> P3.10 Task verifier/review 的 PASS 不自动勾选本节；Phase Exit 必须在 Task 文档状态冻结后独立重跑并
-> 独立复审。以下项目全部保持 pending。
+> **Phase review hardening candidate（2026-07-20，code baseline `9efb28d`）：** `773a2b3` 收口
+> verifier deadline、聚合输出/双向 pipe 与资源失败零发布；`0057824` 收口 legacy v1-v6 原库 RW/
+> migration 前认证；`81cc314` / `9efb28d` 收口成功、失败与 timeout 路径的进程组清理。focused
+> migration suite `40/40`、artifact suite `11/11`，其中 verifier-focused `7/7`。修复前 4 路/8 路
+> 并发 package 各复现 1 个失败，修复后同规格 8/8 通过；测试不再用裸 PID kill 制造结论，仍明确
+> 读回 leader 被直接 reap 且同 PGID descendant 无可执行残留。
 
-- [ ] 从已提交且工作树 scope 已冻结的 P3.10 Task commit `19622ab` + 文档状态重跑 `bash scripts/verify-relay-companion-mvp.sh p3`，记录完整命令、最终 exit 0 与清理读回；不得复用 Task gate 的运行。
-- [ ] 确认 `scripts/run-local-runtime-smoke.sh` 的隔离 ephemeral UDS 覆盖 Swift Runtime selfcheck；独立 Swift 门禁使用 `swift run AgentDeck -- --diagnostics-report --json`，不得依赖或修改当前用户 production-signed stable daemon/home 权限。
-- [ ] 逐项读回 current schema v7、authenticated `admin_commands` ledger、install/status/uninstall、exact reply flush ACK、active→idle、stopped `loaded=true,pid=null` job 与 P3 `--purge` typed block/零删除。
-- [ ] 运行 production-signed slot preflight；缺 provisioning/entitlement/disposable profile 时只能得到 versioned post-MVP `BLOCKED`，且 `mutations=0`、`evidence=[]`、`summaryGenerated=false`，不能生成伪 production evidence。
-- [ ] 在冻结 diff/hash 上分别完成独立 `spec/security` 与 `quality` phase review，清零 P0/P1/P2，并读回 docs gate、schema diff、network boundary、git diff/status。
-- [ ] 上述全部完成前，不标记 P3 Phase complete，也不进入 P4 共享文件实现；P3.10 Task complete 状态保持不变。
+- [x] 已从以 `9efb28d` 为 code baseline 的冻结 scope 独立运行
+  `bash scripts/verify-relay-companion-mvp.sh p3`，最终 exit 0；结束后临时 root、残留进程、diff/status
+  清理读回通过，未复用 P3.10 Task gate。
+- [x] `scripts/run-local-runtime-smoke.sh` 的隔离 ephemeral UDS 已覆盖 Swift Runtime selfcheck；
+  `swift run AgentDeck -- --diagnostics-report --json` 通过，未依赖或修改当前用户 production-signed
+  stable daemon/home。Swift 为 `527 XCTest + 35 Swift Testing`，iOS Simulator `20/20`。
+- [x] current schema v7、authenticated `admin_commands` ledger、install/status/uninstall、exact reply flush
+  ACK、active→idle、stopped `loaded=true,pid=null` job 与 P3 `--purge` typed block/零删除均已读回；daemon
+  lib 两轮均为 `905 passed / 3 ignored`（218.23s / 154.45s），1,024 × 256 KiB capacity 两轮均
+  `5/5`（284.97s / 286.07s）。
+- [x] production-signed slot preflight 精确返回 versioned post-MVP `BLOCKED`，并读回
+  `mutations=0`、`evidence=[]`、`summaryGenerated=false`；未生成证书、未触发 production mutation，
+  也未生成伪 production evidence。P3.1 方案 b 保持不变。
+- [x] 四 schema、daemon network boundary、agent docs、local smoke、diagnostics 与 scoped diff/status 全绿；
+  冻结 candidate 的两路 phase code review 均为 P0/P1/P2=0。
+- [x] P3 标记为 `complete (automatic scope)`；provisioned production-signed LaunchAgent/Keychain
+  roundtrip 继续作为 post-MVP BLOCKED 槽位，不属于 PASS。P4 仍为 0/7，下一项是 P4.1。
 
 ---
 
 ## Phase P4：Machine identity、Pairing 与 RemoteLink
 
 > **执行前审计（2026-07-20）：0/7 Task 完成。** P4.1–P4.7 的 production source、automatic E2E 与
-> real-slot contract 均未实现；P3.10 Task complete 不构成 P4 进度。以下 checkbox 全部保持未勾。
+> real-slot contract 均未实现；P3 automatic scope complete 不构成 P4 进度。下一项是 P4.1，以下
+> checkbox 全部保持未勾。
 
-### Task P4.1：扩展 macOS Keychain 为 Machine identity、CounterGuard 与 enrollment receipt
+### Task P4.1：扩展 macOS Keychain 为 Machine identity 与 CounterGuard（零 cert/enrollment/RemoteLink）
 
 **Files:**
 - Create: `agentdeckd/src/remote/{mod,identity}.rs`
+- Create: `agentdeckd/src/runtime/store/machine_identity.rs`
 - Create: `agentdeckd/tests/machine_identity.rs`
 - Modify: `agentdeckd/src/security/{key_store,macos_keychain}.rs`
 - Modify: `agentdeckd/src/runtime/store/{schema,sqlite,journal,worker,mod}.rs`
+- Modify: `agentdeckd/src/runtime/store/approval.rs`
+- Modify: `agentdeckd/src/runtime/model.rs`
 - Modify: `agentdeckd/src/{lib,main}.rs`
-- Modify: `agentdeckd/Cargo.toml`
+- Modify: `agentdeckd/Cargo.toml`、`Cargo.lock`
 
-**Key accounts:** `machine-root-sign.v1`、`machine-hpke.v1`、`machine-link-sign.v1`、`machine-data-sign.v1`、既有`storage-kek.v1`、`key-directory-guard.v1`、每个active key的`counter-guard/{keyId}`；Runtime DB的`machine_enrollment_receipts`是唯一故意不经StorageKEK包装的非秘密rescue index。
+**Key accounts:** `machine-root-sign.v1`、`machine-hpke.v1`、`machine-link-sign.v1`、
+`machine-data-sign.v1`、既有 `storage-kek.v1`、`key-directory-guard.v1`、每个 active key 的
+`counter-guard/{keyId}`。
+
+**严格 ownership：** P4.1 只生成并持久化本机 key material/fingerprint、Keychain guard 与
+CounterGuard；不得构造或签发任何 link/data cert，不生成/消费 enrollment code，不读写既有非秘密 rescue
+index `machine_enrollment_receipts`，不创建 Relay client、WSS 或 RemoteLink。link/data cert、enrollment
+receipt 与第一条 RemoteLink 全部由 P4.2 首次拥有。automatic RED/GREEN 只能使用 library/test
+construction 注入的 dev/ephemeral keystore；本 Task 不生成 Apple signing certificate 或 provisioning
+profile，也不触碰真实 production-signed stable Keychain。
+
+`machine_enrollment_receipts` 自 Runtime schema v1 起已存在，P4.1 的 v7→v8 migration 必须逐字节保留该表、
+既有行与 P3 rescue API，不能删除或改写；“零 receipt IO”专指新增 `remote/identity.rs` 与 bootstrap 调用图
+不得调用这些 API。静态门禁只扫描新增 remote/bootstrap ownership，不能因 schema/store 中保留历史表名而
+误报。P4.2 才让新的 remote enrollment workflow 首次调用 receipt API。
 
 **Keystore 分层：** production composition 仍只接受发行签名 daemon 的 Data Protection Keychain：
 `kSecUseDataProtectionKeychain=true`、ThisDeviceOnly、non-sync、non-interactive、daemon-only access group；
@@ -2557,18 +2600,78 @@ MVP tests/E2E 只在 library/harness construction 层注入 dev/ephemeral keysto
 新增 production CLI flag、env 或文件 keystore 入口。versioned signed helper 跨版本读回保留为 post-MVP
 BLOCKED 槽位，不消耗 P4 automatic 主线。
 
-- [ ] Step 1: 写 identity tests。首启生成一次、普通重启指纹不变；root 只签固定对象 family；link/data cert 由 root 签；private key 不进 DB/日志；ephemeral 不读 stable；删除全部 Keychain items 后仍先读出 old route/root fingerprint 并进入 `BlockedRootMissing`，绝不生成新 root/KEK 覆盖旧状态；DB key-directory revision 低于 guard、guard 缺失/回退均 fail-close。自动测试用显式 constructor 注入 dev/ephemeral keystore/signature verifier，并加入 compile/static gate，证明 production CLI/env 无 file-keystore 开关。
-- [ ] Step 2: 运行 machine_identity test。 Expected: FAIL，remote identity不存在。
-- [ ] Step 3: 实现 typed `MachineIdentityStore`、generation/trustEpoch 上界、counter 与 key-directory guard IO。production 复用 P3.1 的 protected/non-synchronizable/AfterFirstUnlockThisDeviceOnly 与 daemon-only stable access group，失败不降级；自动 harness 只通过非 production constructor 注入 dev/ephemeral 实现。删除操作必须传 expected fingerprint 防错删。
-- [ ] Step 4: 重跑 automatic tests 并扫描 temp DB/log。Expected: 注入 dev/ephemeral keystore 下只有 public fingerprint/cert/receipt，无 secret bytes；production composition 仍拒绝 unsigned/ad-hoc/entitlement mismatch。versioned 同 TeamIdentifier signed helper 的旧 item readback 只运行 post-MVP slot preflight；缺 provisioning 时输出 Global Constraints 规定的 BLOCKED NDJSON，不在主线尝试签名或读真实 Keychain。
-- [ ] Step 5: fmt/clippy。
-- [ ] Step 6: 提交。 `git add agentdeckd && git commit -m "feat(remote): 建立机器根身份与 Keychain guard"`
+**冻结的 v8 store contract：** P4.1 把 Runtime physical schema 从 v7 单调升级到 v8，新增 authenticated
+singleton `machine_identity_state` 与 `runtime_meta.machine_identity_count`，后者只能是 `0/1` 并进入 v8
+`RuntimeLedger`/metadata token。新表只保存 `Preparing|Active` 状态、database/root/trust/generation/
+key-directory revision 绑定及四组 public key/fingerprint；不得保存 Ed25519 seed、HPKE IKM、StorageKEK、
+CounterGuard secret 或 certificate。v7→v8 migration 只追加空表、零 count 与 v8 ledger token，不重包
+wrapped key bundle、不重加密既有行、不改 crypto context；fresh v8 精确为 24 表。所有 v1–v7 open/
+migration、current/rescue manifest、full-audit 与 rollback-safe dispatch 都必须识别 v8；任何 transaction 的
+ledger copy（包括 `approval::copy_ledger`）都必须保留 `machine_identity_count`。
 
-### Task P4.2：先建立 RemoteTransport，再实现 machine enrollment 与两条 trust-reset 路径
+Store API 固定为 `load_machine_identity_state`、`prepare_machine_identity`、
+`activate_machine_identity`：load 走 `ReadCommand`，prepare/activate 走 `SafetyCommand`。prepare 只允许
+`0→Preparing(count=1)`，activate 只允许同一行 `Preparing→Active(count=1)`；exact request 在
+before/after-COMMIT unknown 后必须幂等读回，异 payload/state 必须 typed conflict，任一失败不得改写其他
+artifact。row canonical MAC、load/prepare/activate 与 v8 full-audit validator 放在独立
+`runtime/store/machine_identity.rs`，不继续膨胀 `journal.rs`。
+
+**冻结的 bootstrap 顺序：** `写入并逐项读回四组私钥 → DB authenticated Preparing → 写入并读回
+key-directory-guard → DB authenticated Active`。MachineRoot、MachineLinkSign、MachineDataSign 均保存
+32-byte Ed25519 seed，MachineHPKE 保存 32-byte IKM；已有 item 先 load/校验且绝不 overwrite，首次 store
+后必须 exact readback。guard 固定绑定 databaseId、root fingerprint 与 keyDirectoryRevision；CounterGuard
+IO 固定绑定 key purpose/epoch 与单调 high-water，P4.1 只建立通用 IO，不创建对称 active key 或 DB counter
+reservation。DB 无 identity row 但 guard 已存在视为 DB rollback：不得写 `machine_identity_state`，不得
+覆盖/删除 guard 或任一 identity item，只把 remote 标为 typed blocked；这里的“零写”只约束
+machine-identity/Keychain guard 域，不额外承诺在 RuntimeStore pre-open 前阻止既有 fresh-store 行为。
+Preparing 只按 exact state 续做；Active 后任一 identity item/guard 缺失或不匹配、DB/guard revision 任一方向
+分叉也只阻断 remote，绝不重建 root 或覆盖 guard，本地 RuntimeCore/recovery/UDS 仍可用。StorageKEK 缺失
+或 DB 本身打不开仍是整个 Runtime 的 fatal，不得伪装成 remote-only block。ephemeral `--no-remote` 必须
+完全跳过 stable machine identity accounts。
+
+**三个内部 production 子片（仍属于一个 P4.1 Task）：** A 为 v8 schema/authenticated singleton/typed
+Store commands；B 为四组 key material、key-directory guard 与通用 CounterGuard IO；C 为
+Preparing→Active bootstrap/composition 与 remote-only blocking。每片只跑行为相关 focused tests、scoped
+Clippy/fmt 与执行者自查，不跑全量慢门禁、不做双路终审、不改文档、不创建子片 docs commit；production
+additions 到 1,800 前继续职责内聚拆分，2,000 时硬停。P4.1 Task 末只做一次完整门禁、双路独立终审与
+一个 docs 收口 commit。
+
+- [ ] Step 1: 先写 A/B/C 的 identity/store/guard/bootstrap RED tests。覆盖 v8 fresh/migration/manifest、
+  `machine_identity_count`/row token tamper 零改写、prepare/activate exact replay/conflict/COMMIT-unknown；首启
+  只生成一次 MachineRoot/MachineHPKE/LinkSign/DataSign key material；仅当 DB identity row 与 guard 均仍
+  不存在时，Preparing 前的部分 material 写入在重启后可只补缺项且不覆盖既有项。普通重启各 fingerprint
+  不变且彼此分域；private key 不进 DB/日志，ephemeral 不读 stable；
+  Active identity 的任一必需 Keychain item/guard 缺失或 revision 分叉只阻断 remote，绝不生成新 root/KEK
+  覆盖旧状态，本地 Runtime recovery/UDS 仍通过。自动测试用显式
+  constructor 注入 dev/ephemeral keystore/signature verifier，并加入 compile/static gate，证明 P4.1 production
+  source 不构造 `SignedCertificate`/enrollment DTO、不读写 `machine_enrollment_receipts`、不引用
+  `RelayEnrollmentClient`/RemoteLink，且 production CLI/env 无 file-keystore 开关。
+- [ ] Step 2: 运行 machine_identity test。 Expected: FAIL，remote identity不存在。
+- [ ] Step 3: 按 A→B→C 实现冻结 contract。production 复用 P3.1 的 protected/non-synchronizable/
+  AfterFirstUnlockThisDeviceOnly 与 daemon-only stable access group，失败不降级；自动 harness 只通过
+  non-production constructor 注入 dev/ephemeral 实现。删除操作必须传 expected fingerprint 防错删。本步
+  不实现 cert signer、enrollment 或网络 composition。
+- [ ] Step 4: 每个内部子片重跑自己的 focused automatic tests、scoped Clippy/fmt 并扫描 temp DB/log。
+  Expected: 注入 dev/ephemeral keystore 下只有
+  public fingerprint/guard metadata，无 secret、cert、enrollment receipt 或 RemoteLink artifact；production
+  composition 仍拒绝 unsigned/ad-hoc/entitlement mismatch。versioned 同 TeamIdentifier signed helper 的旧
+  item readback 只运行 post-MVP slot preflight；缺 provisioning 时输出 Global Constraints 规定的 BLOCKED
+  NDJSON，不在主线尝试签名、生成证书或读真实 Keychain。
+- [ ] Step 5: A/B/C 各自仅精确提交 production+test code，不包含文档；提交前核对 production additions、
+  focused tests、scoped Clippy/fmt 与 pathspec，禁止 `git add -A`。
+- [ ] Step 6: 冻结 P4.1 code/test candidate 后只执行一次 Task 级完整门禁：完整 daemon package（含容量慢项）、
+  dev/ephemeral selfcheck、diagnostics、network boundary、schema/manifest、secret/log/static sentinel、fmt/diff/status；
+  分别完成独立 `spec/security` 与 `quality` review 并清零 P0/P1/P2。任一修复后重跑受影响门禁并复审。
+- [ ] Step 7: 一次性同步 README/ARCHITECTURE/QUALITY/DIAGNOSTICS/AGENTS、设计与本计划，运行 docs gate
+  与最终工作区读回，再创建唯一 P4.1 docs 收口 commit；不得补做子片 docs commit。code/test 提交主题为
+  `feat(remote): 建立机器根身份与 Keychain guard`，docs 提交主题为
+  `docs(relay): 收口 P4.1 machine identity`。
+
+### Task P4.2：签发 link/data cert、建立 RemoteTransport，再实现 enrollment 与两条 trust-reset 路径
 
 **Files:**
-- Create: `agentdeckd/src/remote/{config,transport,enrollment,trust_reset}.rs`
-- Create: `agentdeckd/tests/{machine_transport,machine_enrollment}.rs`
+- Create: `agentdeckd/src/remote/{certificate,config,transport,enrollment,trust_reset}.rs`
+- Create: `agentdeckd/tests/{machine_certificates,machine_transport,machine_enrollment}.rs`
 - Modify: `agentdeckd/src/runtime/store/{schema,sqlite,journal,worker,mod}.rs`
 - Modify: `agentdeck-cli/src/{main,remote,daemon}.rs`
 - Modify: `agentdeckd/Cargo.toml`
@@ -2576,12 +2679,40 @@ BLOCKED 槽位，不消耗 P4 automatic 主线。
 
 **Local commands:** `agentdeck remote machine enroll --bundle-file FILE`、`agentdeck remote machine status`、`agentdeck remote trust-reset`；本task把`agentdeck daemon uninstall --purge`接到同一trust-reset状态机，不能直接删除本地目录。root丢失时输出必须包含old route/root fingerprint与Relay admin purge命令，但不含恢复选项。
 
-- [ ] Step 1: 写transport/enrollment/reset tests。 RemoteTransport必须等待P3的RemoteStartPermit，再以RelayEnrollmentClient消费code，成功后只建立一条authenticated MachineLink WSS；CA/SPKI验证必须发生在发送code/root pub前；redirect/host/scheme拒绝；code race只有一次成功；普通重启不重配。有root reset固定`Active→RetirePending(frozenSignedBytes)→RelayCommitted→PurgeReadbackAbsent→LocalDeleted`；无root保持blocked，admin purge/readback后才删receipt。覆盖recovery阻塞、Relay离线、每个COMMIT前后crash、daemon restart与错误fingerprint；P3的`daemon uninstall --purge`在本task接入同一状态机，并强制`trust reset/readback absent → launchctl bootout且确认进程/UDS消失 → 删除版本目录/plist → 删除Runtime DB/Keychain/receipt`，任何前置失败零删除。
+**首次 ownership：** P4.2 是首个允许从 P4.1 key material 生成 root-signed MachineLinkSign/
+MachineDataSign cert、构造 enrollment request、读写 `machine_enrollment_receipts` 并启动 RemoteLink 的 Task。
+P4.1 不得提前留下 cert、receipt、code 或网络 artifact。
+
+- [ ] Step 1: 写certificate/transport/enrollment/reset tests。MachineRoot 只为匹配的 LinkSign/DataSign
+  public key、generation/trustEpoch 与固定 TBS 签发 cert；错 key/domain/epoch 拒绝。RemoteTransport 必须等待
+  P3 的 RemoteStartPermit，再以 RelayEnrollmentClient 消费 code，成功事务性写入非秘密 enrollment receipt，
+  随后只建立一条 authenticated MachineLink WSS；CA/SPKI 验证必须发生在发送 code/root public material 前；
+  redirect/host/scheme 拒绝，code race 只有一次成功，普通重启复用 cert/receipt 且不重配。有 root reset 固定
+  `Active→RetirePending(frozenSignedBytes)→RelayCommitted→PurgeReadbackAbsent→LocalDeleted`；无 root 时从
+  receipt 读 old route/root fingerprint 并保持 blocked，admin purge/readback 后才删 receipt。覆盖 recovery
+  阻塞、Relay 离线、每个 COMMIT 前后 crash、daemon restart 与错误 fingerprint；P3 的
+  `daemon uninstall --purge` 在本 Task 接入同一状态机，并强制
+  `trust reset/readback absent → launchctl bootout且确认进程/UDS消失 → 删除版本目录/plist → 删除Runtime DB/Keychain/receipt`，
+  任何前置失败零删除。
 - [ ] Step 2: 运行machine_transport/machine_enrollment tests。 Expected: FAIL，daemon没有outbound transport/config/command。
-- [ ] Step 3: 依赖纯`agentdeck-relay-client`实现一次性TLS enrollment与persistent MachineLink transport；实现machine lifecycle/retirement durable outbox和本地RuntimeRequest入口，并把CLI `daemon uninstall --purge`替换为完整两阶段卸载：先由运行中daemon完成/读回trust reset，再bootout并读回PID/UDS消失，最后删除签名binary/plist与本地DB/Keychain/receipt。RemoteTransport此时只处理enrollment/auth/control，不向RuntimeCore派发业务frame；任何失败都保留旧root/receipt/frozen signed bytes，禁止启动时自动删除或注册新route。
-- [ ] Step 4: 重跑tests和network guard。 Expected: 只允许`agentdeckd/src/remote/`及client crate outbound WSS/HTTPS；reset跨重启续做同一RetireMachine，读回active route/data absent前绝不删本地key/data。
-- [ ] Step 5: 更新 Relay runbook的两条reset流程与diagnostic codes；运行docs gate。
-- [ ] Step 6: 提交。 `git add agentdeckd agentdeck-cli scripts docs Cargo.lock && git commit -m "feat(remote): 建立 RemoteTransport 与 machine trust reset"`
+- [ ] Step 3: 先用 P4.1 的 LinkSign/DataSign public key 构造并持久化 root-signed cert，再依赖纯
+  `agentdeck-relay-client` 实现一次性 TLS enrollment 与 persistent MachineLink transport；enrollment 成功
+  后事务性读回并写入 receipt。实现 machine lifecycle/retirement durable outbox 和本地 RuntimeRequest
+  入口，并把 CLI `daemon uninstall --purge` 替换为完整两阶段卸载：先由运行中 daemon 完成/读回 trust
+  reset，再 bootout 并读回 PID/UDS 消失，最后删除签名 binary/plist 与本地 DB/Keychain/receipt。
+  RemoteTransport 此时只处理 enrollment/auth/control，不向 RuntimeCore 派发业务 frame；任何失败都保留
+  旧 root/cert/receipt/frozen signed bytes，禁止启动时自动删除或注册新 route。
+- [ ] Step 4: 内部子片只重跑各自 focused tests、scoped Clippy/fmt 与 network guard。Expected: 只允许
+  `agentdeckd/src/remote/` 及 client crate outbound WSS/HTTPS；reset 跨重启续做同一 RetireMachine，读回
+  active route/data absent 前绝不删本地 key/data。
+- [ ] Step 5: 精确提交 P4.2 production+test code，不包含文档；禁止目录级盲 stage。内部子片不得运行完整
+  慢门禁、双路终审或创建 docs commit。
+- [ ] Step 6: 冻结 P4.2 code/test candidate 后只执行一次完整 Task 门禁与 `spec/security`、`quality` 双路
+  独立终审，清零 P0/P1/P2；覆盖完整 daemon/CLI/Relay client package、TLS/enrollment/reset crash matrix、
+  network/schema/selfcheck/diagnostics/fmt/diff/status。
+- [ ] Step 7: 一次性更新 Relay runbook、diagnostic codes、入口文档与本计划，运行 docs gate，再创建唯一
+  P4.2 docs 收口 commit。code/test 提交主题为
+  `feat(remote): 建立 RemoteTransport 与 machine trust reset`，不得把 docs 混入该代码提交。
 
 ### Task P4.3：实现 PairInvite、本机指纹确认、byte-stable PairRequest、DeviceGrant 与本机 auth ledger
 

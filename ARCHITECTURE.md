@@ -498,16 +498,28 @@ conversation/key，不能伪造身份连续性。
   symlink/PID 不变；ACK 已授予许可后，随后 client close 不得撤销已提交动作。LaunchAgent lifecycle
   覆盖 install/status/uninstall、stopped `loaded=true,pid=null` job 和 P4 前 `--purge` typed fail-close/零删除；
   stopped job 先 kickstart 并二次读回 live PID，CLI 只对 `socket_missing` / `connect_failed` 做有界 15 秒
-  retry。完整 `p3` Task verifier exit 0，两路 Task review Approved、无 P0/P1/P2；独立 P3 Phase Exit 仍
-  pending，因此不得进入 P4。自动 MVP 证据使用 dev/ephemeral 隔离 harness 与注入 verifier；
-  provisioned production-signed LaunchAgent/Keychain roundtrip 是 post-MVP BLOCKED，不得由
-  injected/ad-hoc 证据替代。
+  retry。P3 Phase review 的 `773a2b3` / `81cc314` / `9efb28d` 又把 `codesign`、`plutil` 与候选
+  `agentdeckd --version` verifier 固定在独立 PGID 中，以非阻塞管道执行，使用 10 秒绝对 deadline、
+  stdout+stderr 合计 256 KiB 上限与 256 个同组成员上限。leader 在同组清理前保持可 wait，成功或失败都
+  必须对同 PGID 可执行成员执行 SIGKILL/reap 并取得连续静默读回；只证明同 PGID 子孙，不声称处理主动
+  `setsid`/`setpgid` 的逃逸进程。超时或同组无法按期静默返回 `daemon.install.verifier_timeout`，输出超限
+  返回 `daemon.install.verifier_output_too_large`；两类失败均不得发布候选或切换 `bin/current`。
+- P3 Phase Exit 已在 code baseline `9efb28d` 上独立完成。完整
+  `bash scripts/verify-relay-companion-mvp.sh p3` exit 0；四份 schema、network boundary、docs、
+  local-runtime/install smoke 与 diagnostics 全绿，`spec/security`、`quality` 双路 code review 均为
+  P0/P1/P2 = 0。自动 MVP 证据仍只使用 dev/ephemeral 隔离 harness 与注入 verifier；provisioned
+  production-signed LaunchAgent/Keychain roundtrip 精确保持 post-MVP
+  `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`，不得由 injected/ad-hoc 证据替代，也不得把
+  phase verifier exit 0 描述为 production signing PASS。
 - 已有 ignored、唯一 service/account、RAII 清理的真实 Keychain roundtrip，但 P3.1 的签名
   门禁尚未通过：当前机器无匹配 provisioning profile；Apple Development 与本地
   self-signed helper 虽通过 `codesign --verify`，均被 AMFI 以 exit 137 拒绝启动。因此本节
   只描述实现边界，不能把 signed roundtrip 记为 PASS。2026-07-18 已采用方案 b：MVP/P3 exit 接受
   完整 dev/ephemeral Keychain 路径，provisioned signed roundtrip 移入 post-MVP ignored/BLOCKED 槽位，
   不阻塞 P3/P4 主线或 phase closeout，也不再尝试代码绕过 AMFI；stable production signing 尚未完成。
+- P3 complete 只指 MVP automatic scope。下一项按方案 A 执行 P4.1：只建立 Machine identity 与
+  CounterGuard/key-directory guard，且零 Link/Data cert、零 enrollment、零 receipt 读写、零 RemoteLink；
+  certificate 签发、enrollment 与 receipt 首次归 P4.2。
 
 ### Relay Companion MVP P3.2 Runtime persistence 不变量
 
@@ -527,6 +539,10 @@ conversation/key，不能伪造身份连续性。
   `ConversationDescriptor(agentKind,title,cwd)`，store 只接受其固定字段顺序 canonical JSON。
   open/recovery/v1→v2 migration 都会解密、解析并逐字节重编码核对；即使攻击者用正确 BIK/AEAD
   写入 `threadId`/`sessionId`/resume 扩展字段，也必须在任何 migration 写入前 fail-close。
+- 所有 legacy v1–v6 都必须在原库 RW handle 前，先从 rescue committed-state 解包相同 StorageKEK
+  domain、验证对应版本的 authenticated ledger token 与既有行完整性，再复核 main/WAL/SHM identity。
+  `0057824` 把既有 v5/v6/current 边界补齐到 v1–v4；离线 committed-WAL 篡改必须在任何原库 RW/持久化
+  PRAGMA/DDL 前 fail-close，且拒绝路径不得改写 main/WAL/SHM/journal bytes 或 identity。
 - v1→v2 migration 的 KEK、全库 integrity 与容量门禁全部先于持久化 PRAGMA；DDL 在 legacy
   journal mode 内执行。before-COMMIT error 只有显式 `ROLLBACK` 且确认 autocommit 后才返回原
   error，main/WAL/SHM/rollback-journal 必须逐字节恢复；完整 COMMIT 后才切换并读回
@@ -568,10 +584,10 @@ conversation/key，不能伪造身份连续性。
   删整组 terminal audit 或
   密文/元数据不一致都映射为 corrupt state；P4 仍须用 Keychain CounterGuard 绑定整库
   generation/HWM，才能检测回滚到更早但内部自洽的完整 DB/WAL 快照。
-- Runtime store 的威胁边界固定为**离线篡改 fail-close**：缺 KEK 且无法通过当前
-  KEK/database/domain 认证的磁盘级篡改、删除或跨库移植必须在 open/recovery 全库审计中拒绝，且拒绝
-  路径不改写 main/WAL/SHM/journal artifact。整套 main+WAL 回滚到更早但内部自洽的有效快照仍须 P4
-  CounterGuard 检测。同 UID 在线攻击者可 ptrace daemon、替换二进制或读取进程内密钥，不是 SQLite
+- Runtime store 的 P3 威胁边界固定为**离线篡改 fail-close**：已有 committed artifact 中，缺 KEK 或
+  无法通过当前 KEK/database/domain 认证的行/页改删及跨库移植必须在 open/recovery 全库审计中拒绝，
+  且拒绝路径不改写 main/WAL/SHM/journal artifact。整套 DB/main/WAL/SHM 消失，或整套 main+WAL 回滚到
+  更早但内部自洽的有效快照，均须 P4 CounterGuard 检测。同 UID 在线攻击者可 ptrace daemon、替换二进制或读取进程内密钥，不是 SQLite
   层能够建立的安全边界，作为
   accepted residual risk 记录；`974f9b1` 之后不再新增面向该对手的竞态测试、hook 或取证机制，P3.10
   Task 收口也已删除同 UID 在线换路径测试。

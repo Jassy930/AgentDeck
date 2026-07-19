@@ -18,10 +18,10 @@ P3.1 外部签名门禁被误当作可代码解决的阻塞。
 ## 决策 1：威胁模型收口——停止同 UID 在线竞态加固
 
 **边界定义（写入 ARCHITECTURE.md 的 Runtime store 不变量）：**
-Runtime store 的防御承诺是「**离线篡改 fail-close**：缺 KEK 且无法通过当前
-KEK/database/domain 认证的磁盘级篡改、删除或跨库移植，在 open/recovery 的全库
-认证审计中被拒绝，且拒绝路径不改写 artifact」。整套 main+WAL 回滚到更早但
-内部自洽的有效快照仍须 P4 CounterGuard 检测。**同 UID 在线竞态攻击者明确不在
+Runtime store 的 P3 防御承诺是「**离线篡改 fail-close**：已有 committed artifact 中，缺 KEK 或
+无法通过当前 KEK/database/domain 认证的行/页改删及跨库移植，在 open/recovery 的全库认证审计中
+被拒绝，且拒绝路径不改写 artifact」。整套 DB/main/WAL/SHM 消失，或整套 main+WAL 回滚到更早但
+内部自洽的有效快照，均不属于 P3 承诺，须由 P4 CounterGuard 检测。**同 UID 在线竞态攻击者明确不在
 防御范围**：该攻击者可 ptrace
 daemon、替换二进制或直接读取使用中的内存密钥，SQLite 层的任何竞态防御都不
 构成真实安全边界。此为已接受的 residual risk，记录一次即可。
@@ -32,6 +32,14 @@ daemon、替换二进制或直接读取使用中的内存密钥，SQLite 层的�
   已由 `974f9b1` 提交，作为该方向**最后一笔**。
 - 此后任何切片不得再为同 UID 竞态场景新增测试、hook 或取证机制；
   review 中此类 finding 一律标记 out-of-scope 关闭。
+- **P3 Phase Exit 采用方案 A（2026-07-20）**：不下调既有离线 fail-close 承诺。`0057824`
+  已把 legacy v1-v6 ledger/既有行认证统一前移到原库 RW open/migration 之前，显式 committed-WAL
+  篡改矩阵覆盖 v1-v4，migration focused suite `40/40`。这属于离线认证补洞，不撤销
+  `974f9b1` 之后停止同 UID 在线竞态加固的裁决。
+- 安装 verifier 只承诺同 PGID 资源与清理边界：`773a2b3` 固定绝对 deadline、聚合输出与双向 pipe
+  上界，`81cc314` / `9efb28d` 保证 leader 直接 reap，并在返回前把同 PGID descendants 收口到
+  non-executable/zombie。主动 `setsid`/`setpgid` 或 launch service 逃离 PGID 不在该边界内；这不是
+  针对恶意同 UID 代码的 sandbox 承诺。
 - B3a2-C 按原计划的"纯函数锁 MAX-1/MAX + 真实 DiskLow/StoreFull 零漂移"
   最小化执行，不造百万行证明机（原计划本有此禁令，照办即可）。
 
@@ -93,9 +101,18 @@ profile，self-signed helper 被 AMFI exit 137 终止），**代码不可解**�
 5. **已完成（2026-07-20）**：按决策 4 的范围重估与 P4–P6 Task checklist 执行前审计已逐项同步；
    P4/P5/P6 完成度固定为 0/7、0/9、0/4，P5 MVP 只保留 Simulator 自动 E2E，本机第二客户端迁入 P6
    synthetic DoD，物理设备/公网/vendor/Linux 保持 versioned post-MVP BLOCKED 槽位。
-6. **Task 已完成，Phase Exit pending（2026-07-20）**：P3.10 LaunchAgent install/upgrade/uninstall 已由
-   `19622ab` 提交，完整 `p3` Task verifier exit 0，两路 Task review Approved、无 P0/P1/P2。独立 P3
-   Phase Exit 尚未执行；provisioned production-signed LaunchAgent/Keychain roundtrip 保持 post-MVP BLOCKED。
+6. **P3 automatic scope complete（2026-07-20，6/6）**：P3.10 主体由 `19622ab` 提交；Phase review
+   hardening 又由 `773a2b3` / `0057824` / `81cc314` / `9efb28d` 收口。以 `9efb28d` 为 code baseline
+   的 `bash scripts/verify-relay-companion-mvp.sh p3` exit 0：daemon lib 两轮均为 `905 passed / 3 ignored`
+   （218.23s / 154.45s），1,024 × 256 KiB capacity 两轮均 `5/5`（284.97s / 286.07s），Swift
+   `527 XCTest + 35 Swift Testing`、iOS Simulator `20/20`；signed exact BLOCKED contract、四 schema、
+   network、docs、local smoke 与 diagnostics 全绿。两路 phase code review 均为 P0/P1/P2=0。
+   provisioned production-signed LaunchAgent/Keychain roundtrip 仍按方案 b 保持 post-MVP BLOCKED，
+   不是 PASS。
+7. **下一项 P4.1（0/7 基线）**：只建立 machine key material、Keychain guard 与 CounterGuard automatic
+   slice；严格零 cert、零 enrollment、零 RemoteLink，不生成或签发 link/data cert，也不读写
+   `machine_enrollment_receipts`。link/data cert、enrollment receipt 与第一条 RemoteLink 全部由 P4.2
+   首次拥有。
 
 ## 不变项
 
