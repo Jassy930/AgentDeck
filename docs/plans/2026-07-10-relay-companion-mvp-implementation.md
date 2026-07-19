@@ -2336,11 +2336,26 @@ P3.9 固定以下迁移边界：
   shutdown。fresh CLI 全包 `103/103`、lib `12/12`、shared-daemon `27/27`，scoped `-D warnings` Clippy、
   fmt/diff 全绿；字面 all-targets Clippy 仅记录未修改 Relay 与旧 CLI E2E/doc lint 基线阻断，未计 PASS。
   spec/security 与 quality 双路终审 Approved、无 P0/P1/P2。下一 Task 为 P3.9-B Swift client。
-- [ ] **P3.9-B Swift client：** 先写 installation/Unix socket/partial write/oversize/EOF/protocol mismatch/
+- [x] **P3.9-B Swift client：** 先写 installation/Unix socket/partial write/oversize/EOF/protocol mismatch/
   out-of-order reply/stream/backpressure tests，再实现 `LocalClientInstallation`、
   `UnixSocketDaemonTransport` 和 actor-owned `RuntimeEnvelopeClient`。所有 request 由 client 生成 canonical
   messageId，reply 精确相关，stream 独立有界；析构/窗口关闭只 close fd，不终止 daemon。focused 与完整
   `swift test` 通过后独立提交。
+
+  **Task 收口（2026-07-19）：** `397ef9d` / `94adf92` / `913a156` 分别完成 App installation、UDS
+  transport 与 actor-owned RuntimeEnvelope client，`deb0e1b` 关闭 quality 终审发现的普通
+  event/catalogDelta stream frame retained-byte 预算旁路。三个 production 子片最终新增 424 / 810 / 1,583
+  行，均低于 1,800 预拆线；测试/文档不计拆片线。installation 固定 current-EUID passwd home、0700/0600、
+  no-follow/single-link、fsync+no-replace 与并发 winner readback；transport 固定 preface-first、`<1 MiB`、
+  partial/EINTR/EAGAIN、FD close 线性化和 close-only；client 固定 Hello-first、exact correlation、显式同步
+  terminal、count+byte+TTL 上界、transfer hash/binding/tombstone、first-fault-wins 与 queue-before-EOF。
+  quality P2 先以 ordinary stream byte-budget test 得到 RED exit 1，再修复并复审 Approved。最终 focused
+  `53/53`、完整 Swift `344 XCTest + 35 Swift Testing`、普通 `swift build`、changed-file strict format、
+  docs/diff 均通过；spec/security 与 quality 双路终审 Approved，无剩余 P0/P1/P2/P3。字面
+  `swift build -Xswiftc -warnings-as-errors` 仍被未修改的
+  `Sources/AgentDeck/Preview/MockDaemonTransport.swift:93` 既有 Sendable warning 阻断，未计 PASS，也未在
+  B 中扩 scope 修 Preview；该 baseline 必须在 P3 Phase exit 前收口。B 仍只完成 component，production
+  App model/composition 与默认入口/双客户端 smoke 分别属于 P3.9-C3/D。下一 Task 为 P3.9-C3。
 - [ ] **P3.9-C3 App model cutover：** 迁移 `SessionModel`/`WorkbenchModel`/`ThreadRuntimeModel` 到
   conversationId/eventId/itemId/entityId/commandId；删除 synthetic agentItem 序号和 legacy identity adoption，
   prompt/approval/vendor control/history 都走 `RuntimeEnvelopeClient` receipt/stream。preview/mock 可显式保留

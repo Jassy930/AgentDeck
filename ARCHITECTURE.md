@@ -440,16 +440,21 @@ conversation/key，不能伪造身份连续性。
 - daemon main 固定按 `config → namespace/singleton → keystore → StorageKEK → record namespace →
   RuntimeCore → recovery permit → local ingress` 启动，record/diagnostics 一次性绑定已验证 data root。
   默认 ingress 是 canonical UDS；只有完整显式 stdio 三 flag 才进入 admin/read compatibility。
-  P3.9-A 已提供 Rust production `RuntimeUnixClient` component。CLI installation record 固定在 OS account
-  home 下的 `Library/Application Support/AgentDeck/clients/cli/installation-id.v1`，只用 `getpwuid_r`、retained
+  P3.9-A 已提供 Rust production `RuntimeUnixClient` component；P3.9-B 已提供 Swift
+  `LocalClientInstallation`、`UnixSocketDaemonTransport` 与 actor-owned `RuntimeEnvelopeClient` component。
+  CLI installation record 固定在 OS account home 下的
+  `Library/Application Support/AgentDeck/clients/cli/installation-id.v1`，只用 `getpwuid_r`、retained
   dirfd/no-follow、current EUID、0700 parent、0600 single-link file 与同目录 fsync + no-replace publication；
   已存在异常 entry 不自动轮换。stable UDS 只能由该 store 派生，client 在 connect 前要求 current-EUID
   exact-0700 parent 与 exact-0600 single-link socket。preface/Hello、messageId reply sequence、stream 与
-  transfer pump 均有 count/byte/TTL 上界；关闭 client 只关闭自身 fd。
+  transfer pump 均有 count/byte/TTL 上界；Swift 普通 event/catalog stream 同样按实收 frame bytes 计入
+  retained-byte budget，不能只靠 frame count；关闭任一 client 只关闭自身 fd。App installation record 固定在
+  `clients/macos-app/installation-id.v1`，使用与 CLI 对称的 passwd-home/no-follow/no-replace 边界。
 - P3.9-D 默认入口 cutover 完成前，Rust binary main 与 Swift app 的 stdio transport 仍是显式隔离的兼容路径：
   固定传 `--stdio-compat --ephemeral --no-remote --profile dev` 并清除旧 namespace env。Rust binary 已把相关
   类型显式命名为 `Legacy*Stdio*`，shared-daemon component 本身不 spawn/fallback，但 binary main 尚未调用它；
-  Swift client 仍待 P3.9-B。当前仍不提供两个真实客户端共享 singleton RuntimeCore，production main 明确
+  Swift client component 已完成，App model/composition 仍待 P3.9-C3/D 接线。当前仍不提供两个真实客户端
+  共享 singleton RuntimeCore，production main 明确
   拒绝旧 `SessionStart/SessionContinue`，真实本地会话必须等待 P3.9-D 原子切换与 smoke。
 - 已有 ignored、唯一 service/account、RAII 清理的真实 Keychain roundtrip，但 P3.1 的签名
   门禁尚未通过：当前机器无匹配 provisioning profile；Apple Development 与本地
@@ -954,7 +959,7 @@ daemon main
   -> RuntimeCore → StoreCommitHub / subscription / snapshot
   -> C0-C native projector → verified CC JSONL / atomic projection / dynamic snapshot
   -> C0-C native metadata coordinator → authenticated fence substrate（live vendor post-MVP gated）
-  -> P3.7 exec-gate / typed driver（RuntimeEnvelope ingress 原语已接通，App/CLI cutover 待 P3.9）
+  -> P3.7 exec-gate / typed driver（RuntimeEnvelope client components 已接通，App/CLI cutover 待 P3.9-C3/D）
   -> transport-neutral P3.6 component → transfer / publication（production owner 待 P4）
   -> AgentRouter → CodexAdapter / ClaudeCodeAdapter
   -> record / diag

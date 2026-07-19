@@ -1725,6 +1725,40 @@ shared-daemon `27/27`，全部 0 failure；上述 scoped Clippy、fmt 与 diff c
 均未计 PASS，也未扩 scope 顺手改动。installation 与 Unix transport production 子片分别少于 570 / 1,402
 additions，低于 1,800 预拆线；spec/security 与 quality 双路终审 Approved、无 P0/P1/P2。
 
+## Relay Companion MVP P3.9-B Swift shared-daemon client Task 门禁
+
+P3.9-B 只交付 Swift client component，不把 production App model/composition 切到该 client；model cutover
+与默认入口/双客户端真实 smoke 分别属于 P3.9-C3/D。installation 必须只从 current EUID 的 passwd home
+派生，UDS 必须 strict preface + `<1 MiB` framing，actor client 的 reply/stream/transfer 必须同时受 count、
+retained bytes 与 TTL 约束；close/deinit 只能关闭当前 fd，不能停止 daemon。
+
+```bash
+swift test --filter 'AgentDeckTests\.(LocalClientInstallationTests|UnixSocketDaemonTransportTests|RuntimeEnvelopeClientTests|RuntimeV2WireCodecTests)'
+swift test
+swift build
+swift format lint --strict \
+  Sources/AgentDeck/LocalClientInstallation.swift \
+  Sources/AgentDeck/UnixSocketDaemonTransport.swift \
+  Sources/AgentDeck/RuntimeEnvelopeClient.swift \
+  Tests/AgentDeckTests/LocalClientInstallationTests.swift \
+  Tests/AgentDeckTests/UnixSocketDaemonTransportTests.swift \
+  Tests/AgentDeckTests/RuntimeEnvelopeClientTests.swift
+swift build -Xswiftc -warnings-as-errors
+scripts/verify-agent-docs.sh
+git diff --check
+```
+
+**Task 完成证据（2026-07-19，`397ef9d` / `94adf92` / `913a156` / `deb0e1b`）：** focused
+installation `7/7`、transport `15/15`、client `24/24`、current codec `7/7`，合计 `53/53`；完整
+Swift `344 XCTest + 35 Swift Testing`、普通 build、strict format 与 diff check 均 PASS。quality 首轮终审
+发现普通 event/catalogDelta 固定按 1 byte 计费的 P2；新增两帧编码总字节减 1 的 RED test 后，修复为按
+transport 实收 frame bytes 计费，复审 Approved。spec/security 与 quality 最终均无剩余 P0/P1/P2/P3。
+production additions 424 / 810 / 1,583，均低于 1,800 预拆线。
+
+字面 `swift build -Xswiftc -warnings-as-errors` **未通过、不得记为 PASS**：唯一阻断是未修改的
+`Sources/AgentDeck/Preview/MockDaemonTransport.swift:93` 非 Sendable capture 既有 warning；P3.9-B 三个
+production 文件没有新增 warning。该 baseline 不扩入 B 的 component scope，但必须在 P3 Phase exit 前收口。
+
 ## AppKit 重写后的验证清单
 
 前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。
@@ -1859,6 +1893,7 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P3.9-C0-B4 managed metadata | 运行本页 B4 Store/Core/Catalog/integrity/capacity focused matrix、完整 daemon package、protocol/Swift/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明 managed rename/archive、durable replay/conflict、同事务 revision/CatalogDelta 与离线篡改审计，不冒充 native projector、P4 CounterGuard/RemoteLink 或 Companion E2E |
 | Relay Companion MVP P3.9-C0-B5 cross-layer closeout | 运行本页真实 UDS 双 principal、authorization/cancellation/after-COMMIT focused matrix、完整 daemon/protocol/Swift/iOS Simulator/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明 managed configuration/metadata 的 owner-scoped 幂等、双 revision 轴、receipt/event/snapshot/backfill/restart 收敛，不冒充 C0-C native projection、P4 RemoteLink 或真实 Companion E2E |
 | Relay Companion MVP P3.9-C0-C native projection | 运行本页 secure source/projection/dynamic snapshot/history-only/native metadata focused matrix、真实当前账号 JSONL ignored smoke、完整 daemon/protocol/Swift/iOS Simulator/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明原生历史投影与安全 side-effect substrate，production native mutation 仍是 post-MVP typed gate，不冒充真实 Claude binary、P4 RemoteLink 或 Companion E2E |
+| Relay Companion MVP P3.9-B Swift shared-daemon client | 运行本页 installation/UDS/client/current-codec focused `53/53`、完整 `swift test`、普通 build、changed-file strict format、docs/diff 与双路独立终审；warnings-as-errors 的既有 Preview warning 单列未通过。只证明 Swift component，不冒充 P3.9-C3 App model cutover、P3.9-D 默认入口或双客户端 smoke |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

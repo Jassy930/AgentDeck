@@ -700,17 +700,18 @@ readback，或 recovery permit 不属于同一 `RuntimeCore`，不得通过改�
 | `daemon.local.write_failed` / `daemon.local.writer_failed` / `daemon.local.writer_cancelled` / `daemon.local.hello_not_flushed` | 当前连接写/flush/ACK 或 cancellation 失败 | 只关闭当前连接；用原 messageId/commandId 查询 durable receipt，不假定未执行 |
 | `daemon.local.stdio_io_failed` | 显式 compatibility stdio read/write 失败 | 仅重启隔离的 compatibility 子进程；不得影响 stable singleton daemon |
 
-P3.9-A Rust shared-daemon client component 还定义以下本地 client failure families。当前 `agentdeck`
-binary 默认入口仍留在 `legacy_stdio`，只有直接使用 `RuntimeUnixClient` 或 P3.9-D cutover 后才会看到这些
-code；不要据此宣称 binary 已默认连接 stable UDS：
+P3.9-A Rust 与 P3.9-B Swift shared-daemon client component 还定义以下本地 client failure families。当前
+`agentdeck` binary 默认入口仍留在 `legacy_stdio`，Swift App model/composition 也仍走旧 `DaemonClient`；
+只有直接使用 `RuntimeUnixClient` / `RuntimeEnvelopeClient`，或完成 P3.9-C3/D cutover 后才会看到这些
+code。不要据此宣称 App/CLI 已默认连接 stable UDS：
 
 | code family | 含义 | 下一步 |
 | --- | --- | --- |
 | `daemon.client.installation_home_failed` / `installation_parent_unsafe` / `installation_record_unsafe` / `installation_record_corrupt` / `installation_publish_unsupported` / `installation_io_failed` | passwd home 不可用，installation parent/record 的 type、owner、mode、nlink 不安全，record 非 canonical，或 no-replace/fsync I/O 失败 | 保留原 record 与目录；修复 OS account home/权限/文件系统，不删除或自动轮换 identity，不改用 `HOME` 覆盖 |
-| `daemon.client.socket_missing` / `socket_unsafe` / `connect_failed` | canonical UDS 不存在，parent/socket 的 type、owner、mode、nlink 不满足，或 connect 失败 | 核对 stable daemon/LaunchAgent 与 canonical path；P3.9-A 不会 fallback spawn，P3.9-D 前 binary 入口状态需单独确认 |
+| `daemon.client.socket_path_invalid` / `socket_missing` / `socket_parent_unsafe` / `socket_unsafe` / `connect_failed` / `socket_option_failed` | canonical UDS 路径非法或不存在，parent/socket 的 type、owner、mode、nlink 不满足，connect 或 socket option 失败 | 核对 stable daemon/LaunchAgent 与 canonical path；P3.9-A/B component 不会 fallback spawn，P3.9-C3/D 前 App/binary 入口状态需单独确认 |
 | `daemon.client.preface_failed` / `encode_failed` / `hello_invalid` / `hello_order_invalid` / `sequence_required` / `message_id_duplicate` / `server_request_forbidden` / `reply_uncorrelated` | preface/Hello/首帧/messageId/reply sequence 编码或协议被破坏 | 关闭当前 fd，升级为同一 Runtime v2 candidate；若 daemon 返回 `daemon.runtime.protocol_mismatch`，client 会保留该精确 code，不包成通用错误 |
 | `daemon.client.connection_closed` / `read_failed` / `frame_invalid` / `frame_unterminated` / `frame_too_large` / `write_failed` / `write_timeout` / `write_handoff_incomplete` / `close_failed` | EOF、JSONL/1 MiB framing、read/write/flush/cancellation 或 close 失败 | 未见 terminal 的 sender close 必须按 failure 处理；用原 messageId/commandId 查询 durable receipt，不能把 EOF 当正常完成 |
-| `daemon.client.reply_backpressure` / `reply_sequence_backpressure` / `reply_timeout` / `reply_drain_expired` / `stream_backpressure` | pending/reply/stream 的 frame、byte budget、deadline 或 TTL 到界 | 关闭当前连接并有界重连；先消费或取消旧 sequence，不扩大 channel 或并发生成新 messageId |
+| `daemon.client.reply_backpressure` / `reply_sequence_backpressure` / `reply_timeout` / `reply_drain_expired` / `stream_backpressure` | pending/reply/stream 的 frame、retained-byte budget、deadline 或 TTL 到界；Swift 普通 event/catalogDelta 与 transfer complete 都计入 stream byte budget | 关闭当前连接并有界重连；先消费或取消旧 sequence，不扩大 channel 或并发生成新 messageId。若普通 stream 长期触发，检查 consumer 是否单一且持续 drain，不要把非 transfer frame 按常量字节计费 |
 | `daemon.client.transfer_backpressure` / `transfer_binding_mismatch` / `transfer_expired` / `transfer_incomplete` / `transfer_invalid` / `transfer_tombstone_desync` | transfer part 数量、byte/hash/binding/TTL/completed tombstone 不一致 | 丢弃当前重组状态并关闭连接；从 daemon cursor 重新同步，不接受 partial payload 或复用 transferId |
 
 P3.7 exec-gate 的以下 code 是内部 typed 分类码。`--exec-gate` one-shot 自身失败时会把 code 写到
