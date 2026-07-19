@@ -42,6 +42,10 @@ const VERIFIER_DEADLINE: Duration = Duration::from_secs(10);
 const VERIFIER_PIPE_CHUNK_BYTES: usize = 8 * 1024;
 #[cfg(target_os = "macos")]
 const VERIFIER_POLL_SLICE: Duration = Duration::from_millis(25);
+#[cfg(target_os = "macos")]
+const MAX_VERIFIER_PROCESS_GROUP_MEMBERS: usize = 256;
+#[cfg(target_os = "macos")]
+const DARWIN_PROC_PGRP_ONLY: u32 = 2;
 
 /// verifier 对一个具体路径中 artifact 的完整 attestation。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1104,10 +1108,10 @@ fn run_bounded_command(
         let stderr_closed = stderr.is_none();
         if leader_exited && stdout_closed && stderr_closed {
             let process_group_id = child.process_group_id;
-            let status = child
-                .terminate_group_and_wait()
+            child
+                .terminate_group()
                 .map_err(|source| io(operation, path, source))?;
-            if !wait_for_process_group_exit(process_group_id, started, deadline)
+            if !wait_for_process_group_quiescence(process_group_id, started, deadline)
                 .map_err(|source| io(operation, path, source))?
             {
                 return Err(InstallError::VerifierTimedOut {
@@ -1115,6 +1119,9 @@ fn run_bounded_command(
                     path: path.to_path_buf(),
                 });
             }
+            let status = child
+                .wait_and_disarm()
+                .map_err(|source| io(operation, path, source))?;
             return Ok(Output {
                 status,
                 stdout: stdout_bytes,
@@ -1220,7 +1227,7 @@ impl VerifierChild {
         }
     }
 
-    fn terminate_group_and_wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+    fn terminate_group(&self) -> std::io::Result<()> {
         // The leader is intentionally still waitable here, so its PID/PGID cannot be reused by an
         // unrelated process before this exact isolated group receives SIGKILL.
         let result = unsafe { libc::kill(-self.process_group_id, libc::SIGKILL) };
@@ -1230,6 +1237,10 @@ impl VerifierChild {
                 return Err(source);
             }
         }
+        Ok(())
+    }
+
+    fn wait_and_disarm(&mut self) -> std::io::Result<std::process::ExitStatus> {
         let status = self.child.wait()?;
         self.armed = false;
         Ok(status)
@@ -1244,22 +1255,23 @@ impl Drop for VerifierChild {
 }
 
 #[cfg(target_os = "macos")]
-fn wait_for_process_group_exit(
+fn wait_for_process_group_quiescence(
     process_group_id: libc::pid_t,
     started: Instant,
     deadline: Duration,
 ) -> std::io::Result<bool> {
+    let mut consecutive_quiescent_scans = 0_u8;
     loop {
         if started.elapsed() >= deadline {
             return Ok(false);
         }
-        // SAFETY: signal 0 is a read-only presence probe for the exact positive verifier PGID.
-        if unsafe { libc::kill(-process_group_id, 0) } == -1 {
-            let source = std::io::Error::last_os_error();
-            if source.raw_os_error() == Some(libc::ESRCH) {
+        if process_group_has_live_member(process_group_id)? {
+            consecutive_quiescent_scans = 0;
+        } else {
+            consecutive_quiescent_scans += 1;
+            if consecutive_quiescent_scans == 2 {
                 return Ok(true);
             }
-            return Err(source);
         }
         std::thread::sleep(
             deadline
@@ -1267,6 +1279,101 @@ fn wait_for_process_group_exit(
                 .min(VERIFIER_POLL_SLICE),
         );
     }
+}
+
+#[cfg(target_os = "macos")]
+fn process_group_has_live_member(process_group_id: libc::pid_t) -> std::io::Result<bool> {
+    let group = u32::try_from(process_group_id)
+        .map_err(|_| std::io::Error::other("verifier process group id is invalid"))?;
+    let mut pids = [0 as libc::pid_t; MAX_VERIFIER_PROCESS_GROUP_MEMBERS + 1];
+    let buffer_bytes = i32::try_from(std::mem::size_of_val(&pids))
+        .map_err(|_| std::io::Error::other("verifier process list buffer is too large"))?;
+    // SAFETY: pids is a writable pid_t array and buffer_bytes is its exact byte length. The
+    // leader remains waitable, so this numeric PGID still identifies the verifier group.
+    let returned_bytes = unsafe {
+        libc::proc_listpids(
+            DARWIN_PROC_PGRP_ONLY,
+            group,
+            pids.as_mut_ptr().cast(),
+            buffer_bytes,
+        )
+    };
+    if returned_bytes < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let returned_bytes = usize::try_from(returned_bytes)
+        .map_err(|_| std::io::Error::other("verifier process list size is invalid"))?;
+    let pid_bytes = std::mem::size_of::<libc::pid_t>();
+    if returned_bytes % pid_bytes != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "verifier process list is not pid-aligned",
+        ));
+    }
+    let count = returned_bytes / pid_bytes;
+    if count > MAX_VERIFIER_PROCESS_GROUP_MEMBERS {
+        return Err(std::io::Error::other(
+            "verifier process group exceeded its fixed member bound",
+        ));
+    }
+
+    for pid in pids[..count].iter().copied().filter(|pid| *pid > 1) {
+        let Some(status) = process_status_in_group(pid, process_group_id)? else {
+            continue;
+        };
+        // Only zombies are irreversibly non-executable. Sleeping, stopped and in-creation
+        // members remain live and keep the verifier cleanup pending.
+        if status != libc::SZOMB {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn process_status_in_group(
+    pid: libc::pid_t,
+    process_group_id: libc::pid_t,
+) -> std::io::Result<Option<u32>> {
+    // SAFETY: zeroed is a valid proc_bsdinfo output buffer, read only after a full write.
+    let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+    let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+        .map_err(|_| std::io::Error::other("proc_bsdinfo size overflow"))?;
+    // SAFETY: pid is positive and info is a writable, correctly sized output buffer.
+    let read =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    if read == 0 {
+        // The listed PID may disappear or be reused between the list and detail snapshots.
+        // SAFETY: getpgid is a read-only identity probe for the listed positive PID.
+        let observed_group = unsafe { libc::getpgid(pid) };
+        if observed_group == -1 {
+            let source = std::io::Error::last_os_error();
+            if source.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(None);
+            }
+            return Err(source);
+        }
+        if observed_group != process_group_id {
+            return Ok(None);
+        }
+        return Err(std::io::Error::other(
+            "verifier process status is unavailable",
+        ));
+    }
+    if read != size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "proc_pidinfo returned a partial verifier process record",
+        ));
+    }
+    let expected_pid =
+        u32::try_from(pid).map_err(|_| std::io::Error::other("verifier process id is invalid"))?;
+    let expected_group = u32::try_from(process_group_id)
+        .map_err(|_| std::io::Error::other("verifier process group id is invalid"))?;
+    if info.pbi_pid != expected_pid || info.pbi_pgid != expected_group {
+        return Ok(None);
+    }
+    Ok(Some(info.pbi_status))
 }
 
 #[cfg(target_os = "macos")]
@@ -1494,27 +1601,37 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    fn process_is_gone(pid: libc::pid_t) -> bool {
-        // SAFETY: signal 0 only probes whether this test-owned pid still exists.
-        let result = unsafe { libc::kill(pid, 0) };
-        result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn assert_processes_reaped(pid_file: &Path) {
+    fn assert_processes_non_executable(pid_file: &Path) {
         let pids = fs::read_to_string(pid_file)
             .expect("verifier fixture records its process group")
             .lines()
             .map(|line| line.parse::<libc::pid_t>().expect("fixture pid"))
             .collect::<Vec<_>>();
         assert_eq!(pids.len(), 2, "fixture must record leader and child");
+        let process_group_id = pids[0];
         let deadline = Instant::now() + Duration::from_secs(2);
-        while pids.iter().any(|pid| !process_is_gone(*pid)) && Instant::now() < deadline {
+        while pids.iter().any(|pid| {
+            !matches!(
+                super::process_status_in_group(*pid, process_group_id),
+                Ok(None) | Ok(Some(libc::SZOMB))
+            )
+        }) && Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(10));
         }
+        let states = pids
+            .into_iter()
+            .map(|pid| super::process_status_in_group(pid, process_group_id))
+            .collect::<Vec<_>>();
         assert!(
-            pids.into_iter().all(process_is_gone),
-            "timed-out/overflowed verifier process group was not fully killed and reaped"
+            matches!(states.first(), Some(Ok(None))),
+            "verifier leader was not directly reaped: {states:?}"
+        );
+        assert!(
+            states
+                .iter()
+                .all(|state| matches!(state, Ok(None) | Ok(Some(libc::SZOMB)))),
+            "verifier process group retained an executable member: {states:?}"
         );
     }
 
@@ -1546,7 +1663,7 @@ mod tests {
         assert!(matches!(error, InstallError::VerifierTimedOut { .. }));
         assert_eq!(error.code(), "daemon.install.verifier_timeout");
         assert!(started.elapsed() < Duration::from_secs(2));
-        assert_processes_reaped(&pid_file);
+        assert_processes_non_executable(&pid_file);
     }
 
     #[cfg(target_os = "macos")]
@@ -1578,12 +1695,12 @@ mod tests {
         assert!(matches!(error, InstallError::VerifierOutputTooLarge { .. }));
         assert_eq!(error.code(), "daemon.install.verifier_output_too_large");
         assert!(started.elapsed() < Duration::from_secs(2));
-        assert_processes_reaped(&pid_file);
+        assert_processes_non_executable(&pid_file);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn verifier_success_reaps_silent_process_group_descendant() {
+    fn verifier_success_leaves_no_executable_silent_process_group_descendant() {
         let root = TempDir::new().expect("tempdir");
         let candidate = root.path().join("agentdeckd-candidate");
         let pid_file = root.path().join("agentdeckd-candidate.pids");
@@ -1592,7 +1709,7 @@ mod tests {
             br#"#!/bin/sh
 test "$1" = "--version" || exit 64
 printf '%s\n' "$$" > "${0}.pids"
-/bin/sleep 30 </dev/null >/dev/null 2>&1 &
+/bin/sleep 5 </dev/null >/dev/null 2>&1 &
 printf '%s\n' "$!" >> "${0}.pids"
 printf 'agentdeckd 0.1.0\nprotocol 2\n'
 "#,
@@ -1618,23 +1735,47 @@ printf 'agentdeckd 0.1.0\nprotocol 2\n'
             .map(|line| line.parse::<libc::pid_t>().expect("fixture pid"))
             .collect::<Vec<_>>();
         assert_eq!(pids.len(), 2, "fixture must record leader and child");
-        assert!(process_is_gone(pids[0]), "successful leader must be reaped");
-
-        let descendant = pids[1];
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !process_is_gone(descendant) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let descendant_was_reaped = process_is_gone(descendant);
-        if !descendant_was_reaped {
-            // SAFETY: this PID belongs to the test-owned 30-second sleep recorded immediately
-            // before the successful verifier leader exited. Cleanup keeps the RED test hermetic.
-            unsafe { libc::kill(descendant, libc::SIGKILL) };
-        }
+        let leader = super::process_status_in_group(pids[0], pids[0]);
         assert!(
-            descendant_was_reaped,
-            "successful verifier left a silent same-group descendant running"
+            matches!(leader, Ok(None)),
+            "successful verifier leader was not directly reaped: {leader:?}"
         );
+        let descendant = super::process_status_in_group(pids[1], pids[0]);
+        assert!(
+            matches!(descendant, Ok(None) | Ok(Some(libc::SZOMB))),
+            "successful verifier left a silent same-group descendant executable: {descendant:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn verifier_leader_exit_with_descendant_holding_pipes_times_out_and_cleans_group() {
+        let root = TempDir::new().expect("tempdir");
+        let pid_file = root.path().join("pipe-holder-pids");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "echo $$ > \"$1\"; /bin/sleep 5 & echo $! >> \"$1\"; printf done",
+                "artifact-verifier-pipe-holder",
+            ])
+            .arg(&pid_file);
+
+        let started = Instant::now();
+        let error = super::run_bounded_command(
+            &mut command,
+            root.path(),
+            "test verifier inherited pipe timeout",
+            None,
+            Duration::from_millis(250),
+            4 * 1024,
+        )
+        .expect_err("descendant-held verifier pipes must not bypass the deadline");
+
+        assert!(matches!(error, InstallError::VerifierTimedOut { .. }));
+        assert_eq!(error.code(), "daemon.install.verifier_timeout");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_processes_non_executable(&pid_file);
     }
 
     #[cfg(target_os = "macos")]
