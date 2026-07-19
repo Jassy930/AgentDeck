@@ -1013,7 +1013,7 @@ fn run_bounded_command(
     }
     let mut stdout_bytes = Vec::new();
     let mut stderr_bytes = Vec::new();
-    let mut status = None;
+    let mut leader_exited = false;
 
     loop {
         if started.elapsed() >= deadline {
@@ -1087,12 +1087,11 @@ fn run_bounded_command(
             }
         }
 
-        if status.is_none() {
-            status = child
-                .child
-                .try_wait()
+        if !leader_exited {
+            leader_exited = child
+                .has_exited_without_reaping()
                 .map_err(|source| io(operation, path, source))?;
-            if status.is_some() {
+            if leader_exited {
                 if input_offset != input.len() {
                     return Err(InstallError::InvalidVerifierOutput {
                         reason: "verifier exited before consuming its bounded input",
@@ -1103,10 +1102,19 @@ fn run_bounded_command(
         }
         let stdout_closed = stdout.is_none();
         let stderr_closed = stderr.is_none();
-        if status.is_some() && stdout_closed && stderr_closed {
+        if leader_exited && stdout_closed && stderr_closed {
+            let process_group_id = child.process_group_id;
             let status = child
-                .wait_and_disarm()
+                .terminate_group_and_wait()
                 .map_err(|source| io(operation, path, source))?;
+            if !wait_for_process_group_exit(process_group_id, started, deadline)
+                .map_err(|source| io(operation, path, source))?
+            {
+                return Err(InstallError::VerifierTimedOut {
+                    operation,
+                    path: path.to_path_buf(),
+                });
+            }
             return Ok(Output {
                 status,
                 stdout: stdout_bytes,
@@ -1187,7 +1195,41 @@ impl VerifierChild {
         self.armed = false;
     }
 
-    fn wait_and_disarm(&mut self) -> std::io::Result<std::process::ExitStatus> {
+    fn has_exited_without_reaping(&self) -> std::io::Result<bool> {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        loop {
+            // SAFETY: info points to writable siginfo storage. WNOWAIT observes only this owned
+            // child and deliberately retains its zombie identity until group cleanup is signaled.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.process_group_id as libc::id_t,
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                // SAFETY: successful waitid initialized the zeroed siginfo storage. With WNOHANG,
+                // si_pid == 0 means the child has not exited; P_PID cannot report another child.
+                return Ok(unsafe { info.assume_init().si_pid() } != 0);
+            }
+            let source = std::io::Error::last_os_error();
+            if source.kind() != std::io::ErrorKind::Interrupted {
+                return Err(source);
+            }
+        }
+    }
+
+    fn terminate_group_and_wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        // The leader is intentionally still waitable here, so its PID/PGID cannot be reused by an
+        // unrelated process before this exact isolated group receives SIGKILL.
+        let result = unsafe { libc::kill(-self.process_group_id, libc::SIGKILL) };
+        if result == -1 {
+            let source = std::io::Error::last_os_error();
+            if !matches!(source.raw_os_error(), Some(libc::ESRCH) | Some(libc::EPERM)) {
+                return Err(source);
+            }
+        }
         let status = self.child.wait()?;
         self.armed = false;
         Ok(status)
@@ -1198,6 +1240,32 @@ impl VerifierChild {
 impl Drop for VerifierChild {
     fn drop(&mut self) {
         self.terminate_and_reap();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_process_group_exit(
+    process_group_id: libc::pid_t,
+    started: Instant,
+    deadline: Duration,
+) -> std::io::Result<bool> {
+    loop {
+        if started.elapsed() >= deadline {
+            return Ok(false);
+        }
+        // SAFETY: signal 0 is a read-only presence probe for the exact positive verifier PGID.
+        if unsafe { libc::kill(-process_group_id, 0) } == -1 {
+            let source = std::io::Error::last_os_error();
+            if source.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(true);
+            }
+            return Err(source);
+        }
+        std::thread::sleep(
+            deadline
+                .saturating_sub(started.elapsed())
+                .min(VERIFIER_POLL_SLICE),
+        );
     }
 }
 
@@ -1511,6 +1579,62 @@ mod tests {
         assert_eq!(error.code(), "daemon.install.verifier_output_too_large");
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_processes_reaped(&pid_file);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn verifier_success_reaps_silent_process_group_descendant() {
+        let root = TempDir::new().expect("tempdir");
+        let candidate = root.path().join("agentdeckd-candidate");
+        let pid_file = root.path().join("agentdeckd-candidate.pids");
+        write_executable(
+            &candidate,
+            br#"#!/bin/sh
+test "$1" = "--version" || exit 64
+printf '%s\n' "$$" > "${0}.pids"
+/bin/sleep 30 </dev/null >/dev/null 2>&1 &
+printf '%s\n' "$!" >> "${0}.pids"
+printf 'agentdeckd 0.1.0\nprotocol 2\n'
+"#,
+        );
+        let mut command = Command::new(&candidate);
+        command.arg("--version").env_clear();
+
+        let output = super::run_bounded_command(
+            &mut command,
+            &candidate,
+            "test successful verifier cleanup",
+            None,
+            Duration::from_secs(2),
+            4 * 1024,
+        )
+        .expect("successful candidate version probe must complete");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"agentdeckd 0.1.0\nprotocol 2\n");
+        let pids = fs::read_to_string(&pid_file)
+            .expect("candidate records its process group")
+            .lines()
+            .map(|line| line.parse::<libc::pid_t>().expect("fixture pid"))
+            .collect::<Vec<_>>();
+        assert_eq!(pids.len(), 2, "fixture must record leader and child");
+        assert!(process_is_gone(pids[0]), "successful leader must be reaped");
+
+        let descendant = pids[1];
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !process_is_gone(descendant) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let descendant_was_reaped = process_is_gone(descendant);
+        if !descendant_was_reaped {
+            // SAFETY: this PID belongs to the test-owned 30-second sleep recorded immediately
+            // before the successful verifier leader exited. Cleanup keeps the RED test hermetic.
+            unsafe { libc::kill(descendant, libc::SIGKILL) };
+        }
+        assert!(
+            descendant_was_reaped,
+            "successful verifier left a silent same-group descendant running"
+        );
     }
 
     #[cfg(target_os = "macos")]
