@@ -3074,7 +3074,7 @@ pub(super) fn validate_v5_integrity(
             Err(RuntimeStoreError::UnknownOrCorruptSchema)
         };
     }
-    if !matches!(version, 5..=7) {
+    if !matches!(version, 5..=8) {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
     let mut statement = connection.prepare(

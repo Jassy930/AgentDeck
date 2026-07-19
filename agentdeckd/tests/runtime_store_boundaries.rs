@@ -477,7 +477,14 @@ fn runtime_ledger_token(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("read Runtime admin command ledger fixture");
-    let mut message = Vec::with_capacity(384);
+    let machine_identity_count: i64 = connection
+        .query_row(
+            "SELECT machine_identity_count FROM runtime_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read Runtime machine identity ledger fixture");
+    let mut message = Vec::with_capacity(392);
     message.extend_from_slice(&database_id);
     match catalog_high_water {
         None => message.push(0),
@@ -566,8 +573,13 @@ fn runtime_ledger_token(
                 .to_be_bytes(),
         );
     }
+    message.extend_from_slice(
+        &u64::try_from(machine_identity_count)
+            .expect("fixture machine identity count is non-negative")
+            .to_be_bytes(),
+    );
     *key_bundle
-        .blind_index(b"runtime.meta.ledger.v7", &message)
+        .blind_index(b"runtime.meta.ledger.v8", &message)
         .expect("authenticate Runtime boundary ledger")
         .as_bytes()
 }
@@ -990,11 +1002,11 @@ async fn catalog_hwm_u64_max_returns_typed_exhaustion_and_inserts_no_additional_
                 [],
                 |row| row.get(0),
             )
-            .expect("read baseline v6 ledger token");
+            .expect("read baseline v8 ledger token");
         assert_eq!(
             runtime_ledger_token(&transaction, &key_bundle, database_id).as_slice(),
             stored_token,
-            "fixture v6 ledger encoder must match the store"
+            "fixture v8 ledger encoder must match the store"
         );
         assert_eq!(
             transaction

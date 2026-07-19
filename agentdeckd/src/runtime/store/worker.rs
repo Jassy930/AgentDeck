@@ -24,16 +24,17 @@ use crate::runtime::events::{
     StoreWatchToken, StreamBarrierRegistration,
 };
 use crate::runtime::model::{
-    AcceptCommand, AcceptOutcome, ApprovalMutationOutcome, AuthorizeExecutionRelease,
-    BeginApprovalAttempt, BeginApprovalAttemptOutcome, ClaimApproval, CommandReceiptRecord,
-    CommandReceiptSelector, CompleteCommand, CompleteOutcome, ConversationRecord,
-    CreateConversationOutcome, ExecutionFence, ExecutionFenceRecord, ExpireApproval,
-    MAX_ADAPTER_STATE_REFERENCE_BYTES, MAX_APPROVAL_STATUS_DETAIL_BYTES, MAX_COMMAND_PAYLOAD_BYTES,
-    MAX_CONVERSATION_DESCRIPTOR_BYTES, MAX_CRITICAL_COMMAND_RECORD_BYTES,
-    MAX_EXECUTION_FENCE_BYTES, MAX_EXECUTION_NONCE_BYTES, MAX_IDEMPOTENCY_KEY_BYTES,
-    MAX_RUNTIME_BUSY_TIMEOUT_MS, MAX_RUNTIME_STORE_COMMAND_CAPACITY,
-    MAX_RUNTIME_STORE_LANE_BYTE_CAPACITY, MachineEnrollmentReceiptRecord, MarkApprovalApplied,
-    MarkApprovalDeliveryFailed, MarkConversationRecoveryBlocked, NewConversation,
+    AcceptCommand, AcceptOutcome, ActivateMachineIdentityOutcome, ApprovalMutationOutcome,
+    AuthorizeExecutionRelease, BeginApprovalAttempt, BeginApprovalAttemptOutcome, ClaimApproval,
+    CommandReceiptRecord, CommandReceiptSelector, CompleteCommand, CompleteOutcome,
+    ConversationRecord, CreateConversationOutcome, ExecutionFence, ExecutionFenceRecord,
+    ExpireApproval, MAX_ADAPTER_STATE_REFERENCE_BYTES, MAX_APPROVAL_STATUS_DETAIL_BYTES,
+    MAX_COMMAND_PAYLOAD_BYTES, MAX_CONVERSATION_DESCRIPTOR_BYTES,
+    MAX_CRITICAL_COMMAND_RECORD_BYTES, MAX_EXECUTION_FENCE_BYTES, MAX_EXECUTION_NONCE_BYTES,
+    MAX_IDEMPOTENCY_KEY_BYTES, MAX_RUNTIME_BUSY_TIMEOUT_MS, MAX_RUNTIME_STORE_COMMAND_CAPACITY,
+    MAX_RUNTIME_STORE_LANE_BYTE_CAPACITY, MachineEnrollmentReceiptRecord, MachineIdentityBinding,
+    MachineIdentityStateRecord, MarkApprovalApplied, MarkApprovalDeliveryFailed,
+    MarkConversationRecoveryBlocked, NewConversation, PrepareMachineIdentityOutcome,
     QueryCommandReceipt, RUNTIME_STORE_SHUTDOWN_GRACE_MS, RecoveryCompletion, RecoveryCursor,
     RecoveryPage, RegisterApproval, RegisterApprovalOutcome, RetryApprovalDelivery,
     RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreLane, RuntimeStoreOperation,
@@ -74,7 +75,8 @@ use super::stream::{
 };
 use super::{
     AuthenticatedConversationSnapshotContext, PreparedConversationSnapshotWrite, SnapshotOrigin,
-    StoreConversationSnapshotError, admin, approval, journal, native_projection, sqlite, stream,
+    StoreConversationSnapshotError, admin, approval, journal, machine_identity, native_projection,
+    sqlite, stream,
 };
 
 mod stream_pipeline;
@@ -869,6 +871,48 @@ impl RuntimeStoreHandle {
             &self.lifecycle,
             RuntimeStoreLane::Read,
             |reply| ReadCommand::Inspect { reply },
+        )
+        .await?
+    }
+
+    pub async fn load_machine_identity_state(
+        &self,
+    ) -> Result<Option<MachineIdentityStateRecord>, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::LoadMachineIdentityState { reply },
+        )
+        .await?
+    }
+
+    pub async fn prepare_machine_identity(
+        &self,
+        binding: MachineIdentityBinding,
+    ) -> Result<PrepareMachineIdentityOutcome, RuntimeStoreError> {
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::PrepareMachineIdentity { binding, reply },
+        )
+        .await?
+    }
+
+    pub async fn activate_machine_identity(
+        &self,
+        binding: MachineIdentityBinding,
+    ) -> Result<ActivateMachineIdentityOutcome, RuntimeStoreError> {
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::ActivateMachineIdentity { binding, reply },
         )
         .await?
     }
@@ -2312,6 +2356,14 @@ enum NormalCommand {
 }
 
 enum SafetyCommand {
+    PrepareMachineIdentity {
+        binding: MachineIdentityBinding,
+        reply: oneshot::Sender<Result<PrepareMachineIdentityOutcome, RuntimeStoreError>>,
+    },
+    ActivateMachineIdentity {
+        binding: MachineIdentityBinding,
+        reply: oneshot::Sender<Result<ActivateMachineIdentityOutcome, RuntimeStoreError>>,
+    },
     RecordEnrollmentReceipt {
         receipt: MachineEnrollmentReceiptRecord,
         reply: oneshot::Sender<Result<MachineEnrollmentReceiptRecord, RuntimeStoreError>>,
@@ -2413,6 +2465,9 @@ enum SafetyCommand {
 enum ReadCommand {
     Inspect {
         reply: oneshot::Sender<Result<RuntimeStoreSnapshot, RuntimeStoreError>>,
+    },
+    LoadMachineIdentityState {
+        reply: oneshot::Sender<Result<Option<MachineIdentityStateRecord>, RuntimeStoreError>>,
     },
     LoadPendingAdminUpgrades {
         cursor: Option<admin::AdminUpgradeRecoveryCursor>,
@@ -3119,6 +3174,12 @@ fn handle_safety(
     } = queued;
     if state.recovery_scan.is_some() {
         match command {
+            SafetyCommand::PrepareMachineIdentity { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::ActivateMachineIdentity { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
             SafetyCommand::RecordEnrollmentReceipt { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
@@ -3184,6 +3245,16 @@ fn handle_safety(
         return;
     }
     match command {
+        SafetyCommand::PrepareMachineIdentity { binding, reply } => {
+            let _ = reply.send(machine_identity::prepare_machine_identity(
+                state, config, binding,
+            ));
+        }
+        SafetyCommand::ActivateMachineIdentity { binding, reply } => {
+            let _ = reply.send(machine_identity::activate_machine_identity(
+                state, config, binding,
+            ));
+        }
         SafetyCommand::RecordEnrollmentReceipt { receipt, reply } => {
             let _ = reply.send(sqlite::record_machine_enrollment_receipt(
                 state, config, receipt,
@@ -3378,6 +3449,13 @@ fn handle_read(
                 .before_operation(RuntimeStoreOperation::Inspect)
                 .and_then(|()| sqlite::snapshot(&state.connection, config.busy_timeout_ms));
             let _ = reply.send(result);
+        }
+        ReadCommand::LoadMachineIdentityState { reply } => {
+            let _ = reply.send(machine_identity::load_machine_identity_state(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+            ));
         }
         ReadCommand::LoadPendingAdminUpgrades { cursor, reply } => {
             let _ = reply.send(admin::load_pending_admin_upgrades(

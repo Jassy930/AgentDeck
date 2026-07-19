@@ -1,4 +1,4 @@
-//! Command configuration pin 的 current-v7 篡改测试支撑。
+//! Command configuration pin 的 current-v8 篡改测试支撑。
 //!
 //! 所有 SQLite 读取都发生在 tamper 前：先用 production `RuntimeKeyBundle`
 //! 解包密钥并自证现有 pin/runtime ledger token，随后只执行一次定向写入。
@@ -18,7 +18,7 @@ use agentdeckd::security::StorageKek;
 use rusqlite::{Connection, params};
 
 const COMMAND_PIN_METADATA_DOMAIN: &[u8] = b"command.configuration.pin.metadata.v1";
-const RUNTIME_LEDGER_DOMAIN_V7: &[u8] = b"runtime.meta.ledger.v7";
+const RUNTIME_LEDGER_DOMAIN_V8: &[u8] = b"runtime.meta.ledger.v8";
 const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -136,6 +136,7 @@ struct Ledger {
     admin_command_count: u64,
     admin_command_pending_count: u64,
     admin_command_charged_bytes: u64,
+    machine_identity_count: u64,
     accepted_count: u64,
     accepted_payload_bytes: u64,
     started_without_fence_count: u64,
@@ -194,7 +195,7 @@ impl VerifiedTamperContext {
         assert_eq!(
             ledger_token,
             ledger_metadata_token(&key_bundle, database_id, &ledger),
-            "test helper must reproduce the existing production v7 ledger token"
+            "test helper must reproduce the existing production v8 ledger token"
         );
 
         let mut statement = connection
@@ -452,7 +453,8 @@ fn read_ledger(connection: &Connection) -> (Ledger, Vec<u8>) {
                     native_projection_charged_bytes, native_metadata_effect_fence_count,
                     native_metadata_effect_unreleased_count,
                     native_metadata_effect_released_count, admin_command_count,
-                    admin_command_pending_count, admin_command_charged_bytes, metadata_token
+                    admin_command_pending_count, admin_command_charged_bytes,
+                    machine_identity_count, metadata_token
              FROM runtime_meta WHERE singleton = 1",
             [],
             |row| {
@@ -501,12 +503,13 @@ fn read_ledger(connection: &Connection) -> (Ledger, Vec<u8>) {
                         admin_command_count: nonnegative(row.get(40)?, 40)?,
                         admin_command_pending_count: nonnegative(row.get(41)?, 41)?,
                         admin_command_charged_bytes: nonnegative(row.get(42)?, 42)?,
+                        machine_identity_count: nonnegative(row.get(43)?, 43)?,
                     },
-                    row.get(43)?,
+                    row.get(44)?,
                 ))
             },
         )
-        .expect("read current-v7 authenticated runtime ledger")
+        .expect("read current-v8 authenticated runtime ledger")
 }
 
 fn nonnegative(value: i64, column: usize) -> rusqlite::Result<u64> {
@@ -518,7 +521,7 @@ fn ledger_metadata_token(
     database_id: [u8; 16],
     ledger: &Ledger,
 ) -> Vec<u8> {
-    let mut message = Vec::with_capacity(392);
+    let mut message = Vec::with_capacity(400);
     message.extend_from_slice(&database_id);
     encode_optional_sequence(&mut message, ledger.catalog_high_water.as_deref());
     for value in [
@@ -579,9 +582,10 @@ fn ledger_metadata_token(
     ] {
         message.extend_from_slice(&value.to_be_bytes());
     }
+    message.extend_from_slice(&ledger.machine_identity_count.to_be_bytes());
     key_bundle
-        .blind_index(RUNTIME_LEDGER_DOMAIN_V7, &message)
-        .expect("compute current-v7 runtime ledger token")
+        .blind_index(RUNTIME_LEDGER_DOMAIN_V8, &message)
+        .expect("compute current-v8 runtime ledger token")
         .as_bytes()
         .to_vec()
 }

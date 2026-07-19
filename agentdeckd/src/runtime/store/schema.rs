@@ -8,7 +8,8 @@ pub const RUNTIME_SCHEMA_FAMILY: &str = "agentdeck-runtime";
 pub const RUNTIME_SCHEMA_VERSION_V5: u32 = 5;
 pub const RUNTIME_SCHEMA_VERSION_V6: u32 = 6;
 pub const RUNTIME_SCHEMA_VERSION_V7: u32 = 7;
-pub const RUNTIME_SCHEMA_VERSION: u32 = RUNTIME_SCHEMA_VERSION_V7;
+pub const RUNTIME_SCHEMA_VERSION_V8: u32 = 8;
+pub const RUNTIME_SCHEMA_VERSION: u32 = RUNTIME_SCHEMA_VERSION_V8;
 /// 行密文与 wrapped key bundle 的 AAD context 版本。
 ///
 /// physical schema migration 只增表/增认证计数，不得让既有行重新加密或重新包装。
@@ -52,6 +53,8 @@ pub const RUNTIME_LEDGER_DOMAIN_V5: &[u8] = b"runtime.meta.ledger.v5";
 pub const RUNTIME_LEDGER_DOMAIN_V6: &[u8] = b"runtime.meta.ledger.v6";
 #[cfg_attr(not(test), allow(dead_code))]
 pub const RUNTIME_LEDGER_DOMAIN_V7: &[u8] = b"runtime.meta.ledger.v7";
+#[cfg_attr(not(test), allow(dead_code))]
+pub const RUNTIME_LEDGER_DOMAIN_V8: &[u8] = b"runtime.meta.ledger.v8";
 pub const EXPECTED_TABLES_V1: [&str; 7] = [
     "commands",
     "conversations",
@@ -173,10 +176,52 @@ pub const EXPECTED_TABLES_V7: [&str; 23] = [
     "runtime_meta",
     "snapshots",
 ];
-pub const EXPECTED_TABLES: [&str; 23] = EXPECTED_TABLES_V7;
+pub const EXPECTED_TABLES_V8: [&str; 24] = [
+    "admin_commands",
+    "approval_ledger",
+    "catalog_journal",
+    "claude_code_adapter_state",
+    "codex_adapter_state",
+    "command_configuration_pins",
+    "commands",
+    "configuration_journal",
+    "conversation_state",
+    "conversations",
+    "event_journal",
+    "event_retention",
+    "event_stream_index",
+    "execution_fences",
+    "execution_intents",
+    "machine_enrollment_receipts",
+    "machine_identity_state",
+    "metadata_mutation_ledger",
+    "native_metadata_effect_fences",
+    "native_projection_state",
+    "publication_outbox",
+    "publication_streams",
+    "runtime_meta",
+    "snapshots",
+];
+pub const EXPECTED_TABLES: [&str; 24] = EXPECTED_TABLES_V8;
 
 pub fn schema_signature() -> [u8; 32] {
-    schema_signature_v7()
+    schema_signature_v8()
+}
+
+pub fn schema_signature_v8() -> [u8; 32] {
+    static SIGNATURE: OnceLock<[u8; 32]> = OnceLock::new();
+    *SIGNATURE.get_or_init(|| {
+        let mut digest = Sha256::new();
+        digest.update(RUNTIME_DDL_V1.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V2.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V3.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V4.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V5.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V6.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V7.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V8.as_bytes());
+        digest.finalize().into()
+    })
 }
 
 pub fn schema_signature_v7() -> [u8; 32] {
@@ -1377,6 +1422,70 @@ CREATE INDEX idx_admin_commands_pending
     ON admin_commands(state_changed_at_ms, idempotency_token) WHERE state = 'pending';
 "#;
 
+/// P4.1-A additive v8 physical shape。
+///
+/// 只追加 authenticated singleton identity public binding 与 0/1 ledger count；
+/// 既有 row、ciphertext、metadata token、wrapped key bundle 与 crypto context 均不改写。
+pub const RUNTIME_MIGRATION_V8: &str = r#"
+ALTER TABLE runtime_meta ADD COLUMN machine_identity_count INTEGER NOT NULL DEFAULT 0
+    CHECK(machine_identity_count BETWEEN 0 AND 1);
+
+CREATE TABLE machine_identity_state (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    identity_state TEXT NOT NULL CHECK(identity_state IN ('preparing', 'active')),
+    database_id BLOB NOT NULL CHECK(typeof(database_id) = 'blob' AND length(database_id) = 16),
+    root_key_id BLOB NOT NULL CHECK(
+        typeof(root_key_id) = 'blob' AND length(root_key_id) = 16
+        AND root_key_id <> X'00000000000000000000000000000000'
+    ),
+    trust_epoch TEXT NOT NULL CHECK(
+        typeof(trust_epoch) = 'text' AND length(trust_epoch) = 20
+        AND trust_epoch NOT GLOB '*[^0-9]*'
+        AND trust_epoch > '00000000000000000000'
+        AND trust_epoch <= '18446744073709551615'
+    ),
+    link_generation TEXT NOT NULL CHECK(
+        typeof(link_generation) = 'text' AND length(link_generation) = 20
+        AND link_generation NOT GLOB '*[^0-9]*'
+        AND link_generation > '00000000000000000000'
+        AND link_generation <= '18446744073709551615'
+    ),
+    data_generation TEXT NOT NULL CHECK(
+        typeof(data_generation) = 'text' AND length(data_generation) = 20
+        AND data_generation NOT GLOB '*[^0-9]*'
+        AND data_generation > '00000000000000000000'
+        AND data_generation <= '18446744073709551615'
+    ),
+    key_directory_revision TEXT NOT NULL CHECK(
+        typeof(key_directory_revision) = 'text' AND length(key_directory_revision) = 20
+        AND key_directory_revision NOT GLOB '*[^0-9]*'
+        AND key_directory_revision <= '18446744073709551615'
+    ),
+    root_public_key BLOB NOT NULL
+        CHECK(typeof(root_public_key) = 'blob' AND length(root_public_key) = 32
+              AND root_public_key <> X'0000000000000000000000000000000000000000000000000000000000000000'),
+    root_fingerprint BLOB NOT NULL
+        CHECK(typeof(root_fingerprint) = 'blob' AND length(root_fingerprint) = 32),
+    machine_hpke_public_key BLOB NOT NULL
+        CHECK(typeof(machine_hpke_public_key) = 'blob' AND length(machine_hpke_public_key) = 32
+              AND machine_hpke_public_key <> X'0000000000000000000000000000000000000000000000000000000000000000'),
+    machine_hpke_fingerprint BLOB NOT NULL
+        CHECK(typeof(machine_hpke_fingerprint) = 'blob' AND length(machine_hpke_fingerprint) = 32),
+    link_sign_public_key BLOB NOT NULL
+        CHECK(typeof(link_sign_public_key) = 'blob' AND length(link_sign_public_key) = 32
+              AND link_sign_public_key <> X'0000000000000000000000000000000000000000000000000000000000000000'),
+    link_sign_fingerprint BLOB NOT NULL
+        CHECK(typeof(link_sign_fingerprint) = 'blob' AND length(link_sign_fingerprint) = 32),
+    data_sign_public_key BLOB NOT NULL
+        CHECK(typeof(data_sign_public_key) = 'blob' AND length(data_sign_public_key) = 32
+              AND data_sign_public_key <> X'0000000000000000000000000000000000000000000000000000000000000000'),
+    data_sign_fingerprint BLOB NOT NULL
+        CHECK(typeof(data_sign_fingerprint) = 'blob' AND length(data_sign_fingerprint) = 32),
+    metadata_token BLOB NOT NULL
+        CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32)
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1564,7 +1673,7 @@ mod tests {
 
     #[test]
     fn stream_schema_advances_to_v4_with_six_bounded_store_tables() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V7);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V8);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         for table in [
             "event_stream_index",
@@ -1580,7 +1689,7 @@ mod tests {
 
     #[test]
     fn approval_physical_schema_remains_v3_compatible_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V7);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V8);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V3.len(), 10);
         assert!(EXPECTED_TABLES_V3.contains(&"approval_ledger"));
@@ -1632,9 +1741,17 @@ mod tests {
         connection
     }
 
+    fn v8_structural_connection() -> Connection {
+        let connection = v7_structural_connection();
+        connection
+            .execute_batch(RUNTIME_MIGRATION_V8)
+            .expect("apply v8 structural migration");
+        connection
+    }
+
     #[test]
     fn v6_adds_projection_and_effect_fence_sidecars_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V7);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V8);
         assert_eq!(RUNTIME_SCHEMA_VERSION_V6, 6);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V5.len(), 20);
@@ -1665,12 +1782,12 @@ mod tests {
 
     #[test]
     fn v7_adds_machine_wide_admin_command_ledger_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V7);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V8);
         assert_eq!(RUNTIME_SCHEMA_VERSION_V7, 7);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V7.len(), 23);
-        assert_eq!(EXPECTED_TABLES, EXPECTED_TABLES_V7);
-        assert_eq!(schema_signature(), schema_signature_v7());
+        assert_ne!(EXPECTED_TABLES.as_slice(), EXPECTED_TABLES_V7.as_slice());
+        assert_ne!(schema_signature(), schema_signature_v7());
         assert_ne!(schema_signature_v6(), schema_signature_v7());
         assert_eq!(RUNTIME_LEDGER_DOMAIN_V7, b"runtime.meta.ledger.v7");
 
@@ -1726,6 +1843,71 @@ mod tests {
             ["state_changed_at_ms", "idempotency_token"]
         );
         assert!(pending.sql.ends_with("WHERE state = 'pending'"));
+    }
+
+    #[test]
+    fn v8_adds_authenticated_machine_identity_singleton_without_rotating_crypto_context() {
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V8);
+        assert_eq!(RUNTIME_SCHEMA_VERSION_V8, 8);
+        assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
+        assert_eq!(EXPECTED_TABLES_V8.len(), 24);
+        assert_eq!(EXPECTED_TABLES, EXPECTED_TABLES_V8);
+        assert_eq!(schema_signature(), schema_signature_v8());
+        assert_ne!(schema_signature_v7(), schema_signature_v8());
+        assert_eq!(RUNTIME_LEDGER_DOMAIN_V8, b"runtime.meta.ledger.v8");
+
+        let connection = v8_structural_connection();
+        assert_eq!(table_names(&connection), EXPECTED_TABLES_V8);
+        assert_eq!(
+            table_columns(&connection, "runtime_meta")
+                .last()
+                .map(String::as_str),
+            Some("machine_identity_count")
+        );
+        assert_eq!(
+            table_columns(&connection, "machine_identity_state"),
+            [
+                "singleton",
+                "identity_state",
+                "database_id",
+                "root_key_id",
+                "trust_epoch",
+                "link_generation",
+                "data_generation",
+                "key_directory_revision",
+                "root_public_key",
+                "root_fingerprint",
+                "machine_hpke_public_key",
+                "machine_hpke_fingerprint",
+                "link_sign_public_key",
+                "link_sign_fingerprint",
+                "data_sign_public_key",
+                "data_sign_fingerprint",
+                "metadata_token",
+            ]
+        );
+        assert!(
+            explicit_indexes(&connection, "machine_identity_state").is_empty(),
+            "singleton identity row needs no secondary index"
+        );
+        assert!(
+            foreign_key_columns(&connection, "machine_identity_state").is_empty(),
+            "database binding is authenticated and checked by the v8 full audit"
+        );
+        let sql = table_sql(&connection, "machine_identity_state");
+        for forbidden in [
+            "private",
+            "seed",
+            "ikm",
+            "storage_kek",
+            "counter_guard",
+            "certificate",
+        ] {
+            assert!(
+                !sql.to_ascii_lowercase().contains(forbidden),
+                "v8 identity row must not contain {forbidden} material"
+            );
+        }
     }
 
     #[test]

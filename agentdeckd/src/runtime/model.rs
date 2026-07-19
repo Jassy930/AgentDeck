@@ -79,6 +79,10 @@ pub enum RuntimeStoreOperation {
     MigrateSchemaBeforeCommit,
     MigrateSchemaAfterCommit,
     Inspect,
+    PrepareMachineIdentityBeforeCommit,
+    PrepareMachineIdentityAfterCommit,
+    ActivateMachineIdentityBeforeCommit,
+    ActivateMachineIdentityAfterCommit,
     StreamNotificationReadback,
     RecordEnrollmentReceiptBeforeCommit,
     RecordEnrollmentReceiptAfterCommit,
@@ -313,6 +317,52 @@ pub struct RuntimeStoreSnapshot {
     pub max_page_count: u64,
 }
 
+/// Runtime DB 中允许持久化的 machine identity 公共绑定。
+///
+/// 私钥 seed、HPKE IKM、StorageKEK、CounterGuard material 与 certificate
+/// 都不属于该类型，也不得进入 `machine_identity_state`。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MachineIdentityBinding {
+    pub root_key_id: [u8; 16],
+    pub trust_epoch: u64,
+    pub link_generation: u64,
+    pub data_generation: u64,
+    pub key_directory_revision: u64,
+    pub root_public_key: [u8; 32],
+    pub root_fingerprint: [u8; 32],
+    pub machine_hpke_public_key: [u8; 32],
+    pub machine_hpke_fingerprint: [u8; 32],
+    pub link_sign_public_key: [u8; 32],
+    pub link_sign_fingerprint: [u8; 32],
+    pub data_sign_public_key: [u8; 32],
+    pub data_sign_fingerprint: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MachineIdentityLifecycle {
+    Preparing,
+    Active,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MachineIdentityStateRecord {
+    pub database_id: [u8; 16],
+    pub lifecycle: MachineIdentityLifecycle,
+    pub binding: MachineIdentityBinding,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PrepareMachineIdentityOutcome {
+    Prepared { state: MachineIdentityStateRecord },
+    Replayed { state: MachineIdentityStateRecord },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActivateMachineIdentityOutcome {
+    Activated { state: MachineIdentityStateRecord },
+    Replayed { state: MachineIdentityStateRecord },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MachineEnrollmentReceiptRecord {
     pub relay_server_id: [u8; 16],
@@ -394,6 +444,8 @@ pub enum AdminCommandLimitScope {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeCommitOperation {
     MigrateSchema,
+    PrepareMachineIdentity,
+    ActivateMachineIdentity,
     RecordEnrollmentReceipt,
     CreateConversation,
     ConfigureConversation,
@@ -1370,6 +1422,10 @@ pub enum RuntimeStoreError {
     StoreAlreadyOpen,
     #[error("runtime enrollment rescue receipt conflicts with the existing root fingerprint")]
     RescueReceiptConflict,
+    #[error("runtime machine identity state is missing")]
+    MachineIdentityMissing,
+    #[error("runtime machine identity binding conflicts with the authenticated singleton")]
+    MachineIdentityConflict,
     #[error("runtime store {lane:?} lane is full")]
     WorkerBusy { lane: RuntimeStoreLane },
     #[error("runtime store worker stopped before replying")]
@@ -1574,6 +1630,8 @@ impl RuntimeStoreError {
             Self::RecoveryInProgress => "daemon.runtime.recovering",
             Self::Cipher(_) => "daemon.runtime.crypto_failed",
             Self::IdKindMismatch { .. }
+            | Self::MachineIdentityMissing
+            | Self::MachineIdentityConflict
             | Self::ConversationNotFound
             | Self::ConversationConflict
             | Self::ConfigurationAgentMismatch

@@ -3583,6 +3583,7 @@ fn copy_ledger(ledger: &RuntimeLedger) -> RuntimeLedger {
         admin_command_count: ledger.admin_command_count,
         admin_command_pending_count: ledger.admin_command_pending_count,
         admin_command_charged_bytes: ledger.admin_command_charged_bytes,
+        machine_identity_count: ledger.machine_identity_count,
         accepted_count: ledger.accepted_count,
         accepted_payload_bytes: ledger.accepted_payload_bytes,
         started_without_fence_count: ledger.started_without_fence_count,
@@ -3595,7 +3596,7 @@ fn copy_ledger(ledger: &RuntimeLedger) -> RuntimeLedger {
 mod tests {
     use super::{
         ApprovalEventChainAccumulator, ApprovalEventKind, ApprovalIntegrityRecord,
-        MAX_APPROVAL_INTEGRITY_PROJECTION_BYTES, fold_approval_event_chain,
+        MAX_APPROVAL_INTEGRITY_PROJECTION_BYTES, copy_ledger, fold_approval_event_chain,
         validate_approval_record_linkage,
     };
     use std::collections::VecDeque;
@@ -3643,6 +3644,15 @@ mod tests {
     use crate::security::{MemoryKeyStore, StorageKek, load_or_create_storage_kek};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn approval_ledger_copy_preserves_machine_identity_count() {
+        let ledger = crate::runtime::store::sqlite::RuntimeLedger {
+            machine_identity_count: 1,
+            ..crate::runtime::store::sqlite::RuntimeLedger::default()
+        };
+        assert_eq!(copy_ledger(&ledger).machine_identity_count, 1);
+    }
 
     struct TestRoot(PathBuf);
 

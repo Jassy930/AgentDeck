@@ -2135,7 +2135,7 @@ pub(super) fn validate_v5_integrity(
             Err(RuntimeStoreError::UnknownOrCorruptSchema)
         };
     }
-    if !matches!(version, 5..=7) {
+    if !matches!(version, 5..=8) {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
 
@@ -2155,7 +2155,7 @@ pub(super) fn validate_v5_integrity(
             row.get::<_, Vec<u8>>(6)?,
         ))
     })?;
-    let physical_limit = if matches!(version, 6 | 7) {
+    let physical_limit = if matches!(version, 6..=8) {
         MAX_RUNTIME_PHYSICAL_CONVERSATIONS
     } else {
         MAX_RUNTIME_CONVERSATIONS

@@ -6441,6 +6441,21 @@ pub(crate) fn validate_store_integrity(
                 &ledger,
             )
         }
+        super::schema::RUNTIME_SCHEMA_VERSION_V8 => {
+            super::machine_identity::validate_v8_integrity(
+                connection,
+                key_bundle,
+                database_id,
+                &ledger,
+            )?;
+            super::admin::validate_v7_integrity(connection, key_bundle, database_id, &ledger)?;
+            super::native_projection::validate_v6_integrity(
+                connection,
+                key_bundle,
+                database_id,
+                &ledger,
+            )
+        }
         1..=super::schema::RUNTIME_SCHEMA_VERSION_V5
             if ledger.native_projection_present_count == 0
                 && ledger.native_projection_tombstone_count == 0
