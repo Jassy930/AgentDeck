@@ -176,8 +176,16 @@ actor AppRuntimeCoordinator {
     do {
       try await wire.start()
     } catch {
-      state = .idle
-      throw error
+      if state == .starting {
+        state = .idle
+        throw error
+      }
+      await wire.close()
+      throw AppRuntimeCoordinatorError.closed
+    }
+    guard state == .starting else {
+      await wire.close()
+      throw AppRuntimeCoordinatorError.closed
     }
     state = .running
     streamPump = Task { [weak self] in

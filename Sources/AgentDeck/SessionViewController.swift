@@ -286,7 +286,7 @@ final class SessionViewController: NSViewController {
     private func observeCapabilities() {
         capabilitiesBinder.bind({ [weak self] in
             guard let self else { return }
-            _ = self.model.workbench.selectedSessionId
+            _ = self.model.workbench.selectedConversationID
             _ = self.model.workbench.selectedRuntime?.capabilities?.agentKind
             _ = self.model.cwd
         }, onChange: { [weak self] in
@@ -296,17 +296,15 @@ final class SessionViewController: NSViewController {
 
     private func refreshControlBar() {
         if let caps = model.workbench.selectedRuntime?.capabilities,
-           let sid = model.workbench.selectedSessionId {
-            // C2 fix (v0.2 final review): wire vendor-control callbacks
-            // so popup changes round-trip through DaemonClient.
-            // SessionModel.submitVendorControl swallows errors after
-            // logging; daemon-side rejections still surface via the
-            // normal events stream as `ServerEvent.error`.
+           let conversationID = model.workbench.selectedConversationID {
             controlBar.bind(
                 capabilities: caps,
-                sessionId: sid,
-                onVendorControl: { [weak self] sessionId, payload in
-                    self?.model.submitVendorControl(sessionId: sessionId, payload: payload)
+                conversationID: conversationID,
+                onConfigurationChange: { [weak self] id, mutation in
+                    self?.model.updateConversationConfiguration(
+                        conversationID: id,
+                        mutation: mutation
+                    )
                 }
             )
             controlBarHeight?.constant = 0
@@ -322,12 +320,11 @@ final class SessionViewController: NSViewController {
         contentHeaderView.isHidden = !hasCwd
     }
 
-    /// T6B: present the new-session dialog and dispatch the resulting
-    /// `SessionStart` to the workbench → daemon path.
+    /// Present the new-session dialog and dispatch its Runtime v2 draft.
     func presentNewSessionDialog() {
         let dlg = NewSessionDialog()
-        dlg.onSubmit = { [weak self] start in
-            self?.handleNewSessionStart(start)
+        dlg.onSubmit = { [weak self] draft in
+            self?.handleNewConversationDraft(draft)
         }
         newSessionDialog = dlg
         if let win = dlg.window {
@@ -337,20 +334,12 @@ final class SessionViewController: NSViewController {
         }
     }
 
-    private func handleNewSessionStart(_ start: SessionStart) {
-        // C1 fix (v0.2 final review): forward the dialog's full
-        // `SessionStart` (including vendor_options: sandbox / approval /
-        // permission_mode / reasoning_effort / etc.) into the workbench
-        // so the daemon sees the user's choices on the first turn.
-        // Previously only `prompt` + `agentKind` propagated and the
-        // user's vendor options were silently replaced by synthesized
-        // defaults inside `DaemonClient.startTurn`.
-        if let cwdMsg = model.chooseCwd(URL(fileURLWithPath: start.cwd)) {
+    private func handleNewConversationDraft(_ draft: RuntimeConversationDraft) {
+        if let cwdMsg = model.chooseCwd(URL(fileURLWithPath: draft.cwd)) {
             model.workbench.selectedRuntime?.warningMessage = cwdMsg
             return
         }
-        let prompt = start.prompt ?? ""
-        model.submit(prompt, agentKind: start.agentKind, sessionStart: start)
+        model.startConversation(draft)
     }
 
     /// Swap EmptyStateView ↔ conversationComposite inside `contentContainer`.

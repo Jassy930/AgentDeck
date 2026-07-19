@@ -1,124 +1,153 @@
-import XCTest
 import AgentDeckCore
+import Foundation
+import XCTest
+
 @testable import AgentDeck
 
 @MainActor
 final class RuntimeAgentKindTests: XCTestCase {
-    func testRuntimeCarriesAgentKindAndCapabilities() throws {
-        let model = ThreadRuntimeModel(id: "s1", agentKind: .codex, cwd: URL(fileURLWithPath: "/tmp"))
-        XCTAssertEqual(model.agentKind, .codex)
-        XCTAssertNil(model.capabilities)
+  func testCodexSnapshotBridgesRuntimeCapabilitiesIntoAgentPresentation() throws {
+    let id = conversationID("conversation-codex")
+    let runtime = try ThreadRuntimeModel(
+      conversationID: id,
+      agentKind: .codex,
+      cwd: URL(fileURLWithPath: "/tmp/project"),
+      initialPhase: .ready
+    )
+    try runtime.apply(
+      try ConversationSnapshotV2(
+        conversationID: id,
+        baseEventCursor: .beforeFirst,
+        configurationState: unconfiguredState(),
+        items: [
+          .capabilities(
+            try capabilities(
+              agentKind: .codex,
+              agentVersion: "codex-test",
+              features: ["shell", "codexSandboxMode"]
+            )
+          )
+        ]
+      )
+    )
 
-        let caps = SessionCapabilities(
-            agentKind: .codex,
-            agentVersion: "x",
-            features: [.shell],
-            vendor: .codex(CodexCapabilities(
-                sandboxModes: [.readOnly],
-                persistenceSupported: true,
-                reasoningEffortLevels: [.medium]
-            ))
-        )
-        model.applyCapabilities(caps)
-        XCTAssertEqual(model.capabilities?.features, [.shell])
-        XCTAssertEqual(model.capabilities?.agentKind, .codex)
+    XCTAssertEqual(runtime.conversationID, id)
+    XCTAssertEqual(runtime.agentKind, .codex)
+    XCTAssertEqual(runtime.runtimeCapabilities?.agentVersion, "codex-test")
+    XCTAssertEqual(runtime.capabilities?.features, [.shell, .codexSandboxMode])
+    guard case .codex(let vendor)? = runtime.capabilities?.vendor else {
+      return XCTFail("expected Codex presentation capabilities")
     }
+    XCTAssertEqual(vendor.sandboxModes, [.readOnly, .workspaceWrite])
+    XCTAssertTrue(vendor.persistenceSupported)
+    XCTAssertEqual(vendor.reasoningEffortLevels, [.medium, .high])
+  }
 
-    func testIngestSessionCapabilitiesEventStoresCaps() {
-        let runtime = ThreadRuntimeModel(id: "s1", agentKind: .claudeCode, cwd: URL(fileURLWithPath: "/tmp"))
-        let caps = SessionCapabilities(
-            agentKind: .claudeCode,
-            agentVersion: "1.0",
-            features: [.claudeCodePermissionMode],
-            vendor: .claudeCode(ClaudeCodeCapabilities(
-                permissionModes: [.default],
-                outputStyles: [],
-                hooksSupported: [],
-                cliVersion: "1.0"
-            ))
-        )
-        _ = runtime.ingest(.sessionCapabilities(sessionId: "s1", agentKind: .claudeCode, capabilities: caps))
-        XCTAssertNotNil(runtime.capabilities)
-        XCTAssertTrue(runtime.capabilities?.features.contains(.claudeCodePermissionMode) ?? false)
+  func testClaudeCapabilityEventRefreshesPresentationWithoutReplacingIdentity() throws {
+    let id = conversationID("conversation-claude")
+    let runtime = try ThreadRuntimeModel(
+      conversationID: id,
+      agentKind: .claudeCode,
+      cwd: nil,
+      initialPhase: .ready
+    )
+    try runtime.apply(
+      try ConversationSnapshotV2(
+        conversationID: id,
+        baseEventCursor: .beforeFirst,
+        configurationState: unconfiguredState(),
+        items: [
+          .capabilities(
+            try capabilities(
+              agentKind: .claudeCode,
+              agentVersion: "1.0",
+              features: ["claudeCodePermissionMode"]
+            )
+          )
+        ]
+      )
+    )
+    let refreshed = try capabilities(
+      agentKind: .claudeCode,
+      agentVersion: "1.1",
+      features: ["claudeCodePermissionMode", "claudeCodePlanMode"]
+    )
+
+    try runtime.apply(
+      RuntimeEventV2(
+        conversationID: id,
+        eventID: RuntimeEventID(rawValue: "event-capabilities"),
+        eventSeq: 0,
+        commandID: nil,
+        itemID: nil,
+        entityID: nil,
+        body: .capabilities(refreshed)
+      )
+    )
+
+    XCTAssertEqual(runtime.conversationID, id)
+    XCTAssertEqual(runtime.cursor, .at(0))
+    XCTAssertEqual(runtime.runtimeCapabilities?.agentVersion, "1.1")
+    XCTAssertEqual(
+      runtime.capabilities?.features,
+      [.claudeCodePermissionMode, .claudeCodePlanMode]
+    )
+    guard case .claudeCode(let vendor)? = runtime.capabilities?.vendor else {
+      return XCTFail("expected Claude Code presentation capabilities")
     }
+    XCTAssertEqual(vendor.permissionModes, [.default, .plan])
+    XCTAssertEqual(vendor.outputStyles, ["concise"])
+    XCTAssertEqual(vendor.hooksSupported, ["PreToolUse"])
+    XCTAssertEqual(vendor.cliVersion, "1.1")
+  }
 
-    func testIngestAgentItemAppendsToItems() {
-        let runtime = ThreadRuntimeModel(id: "s1", agentKind: .codex, cwd: URL(fileURLWithPath: "/tmp"))
-        _ = runtime.ingest(.agentItem(
-            sessionId: "s1", threadId: "t1", agentKind: .codex,
-            item: .assistantMessage(text: "hello", meta: AgentItemMeta())
-        ))
-        XCTAssertEqual(runtime.items.count, 1)
-        XCTAssertEqual(runtime.items.first?.text, "hello")
-        XCTAssertEqual(runtime.items.first?.kind, "message")
+  private func capabilities(
+    agentKind: AgentKind,
+    agentVersion: String,
+    features: [String]
+  ) throws -> RuntimeSessionCapabilitiesV1 {
+    let vendor: [String: Any]
+    switch agentKind {
+    case .codex:
+      vendor = [
+        "agentKind": "codex",
+        "sandboxModes": ["read-only", "workspace-write"],
+        "persistenceSupported": true,
+        "reasoningEffortLevels": ["medium", "high"],
+      ]
+    case .claudeCode:
+      vendor = [
+        "agentKind": "claude_code",
+        "permissionModes": ["default", "plan"],
+        "outputStyles": ["concise"],
+        "hooksSupported": ["PreToolUse"],
+        "cliVersion": agentVersion,
+      ]
     }
+    return try decode(
+      RuntimeSessionCapabilitiesV1.self,
+      [
+        "agentKind": agentKind == .codex ? "codex" : "claude_code",
+        "agentVersion": agentVersion,
+        "features": features,
+        "vendor": vendor,
+      ]
+    )
+  }
 
-    func testIngestTurnCompleteTransitionsToReady() {
-        let runtime = ThreadRuntimeModel(id: "s1", agentKind: .codex, cwd: URL(fileURLWithPath: "/tmp"))
-        runtime.phase = .running
-        _ = runtime.ingest(.turnComplete(
-            sessionId: "s1", threadId: "t1", agentKind: .codex,
-            summary: TurnSummary(totalInputTokens: nil, totalOutputTokens: nil, elapsedMs: 0)
-        ))
-        XCTAssertEqual(runtime.phase, .ready)
-    }
+  private func unconfiguredState() throws -> RuntimeConversationConfigurationStateV2 {
+    try RuntimeConversationConfigurationStateV2(
+      configurationRevision: 0,
+      configuration: nil
+    )
+  }
 
-    func testIngestActionRequestSetsWaitingApproval() {
-        let runtime = ThreadRuntimeModel(id: "s1", agentKind: .codex, cwd: URL(fileURLWithPath: "/tmp"))
-        let req = ActionRequest(
-            requestId: "r1",
-            kind: .executeCommand,
-            summary: "run ls",
-            vendor: .codex(approvalPolicyAtDecision: .onRequest, sandboxAtDecision: .workspaceWrite, canPersist: true)
-        )
-        _ = runtime.ingest(.actionRequest(
-            sessionId: "s1", threadId: "t1", agentKind: .codex, request: req
-        ))
-        XCTAssertEqual(runtime.phase, .waitingApproval)
-        XCTAssertEqual(runtime.pendingActionRequest?.requestId, "r1")
-        XCTAssertEqual(runtime.pendingActionRequest?.actionKind, .executeCommand)
-    }
+  private func decode<Value: Decodable>(_ type: Value.Type, _ object: Any) throws -> Value {
+    let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    return try JSONDecoder().decode(type, from: data)
+  }
 
-    func testWorkbenchEnsureRuntimeAndIngest() {
-        let workbench = WorkbenchModel(turnStarter: NoopRuntimeTurnStarter())
-        workbench.ensureRuntime(
-            sessionId: "s1", agentKind: .codex, threadId: "t1",
-            cwd: URL(fileURLWithPath: "/tmp")
-        )
-        XCTAssertNotNil(workbench.runtime(sessionId: "s1"))
-        workbench.ingestServerEvent(.agentItem(
-            sessionId: "s1", threadId: "t1", agentKind: .codex,
-            item: .assistantMessage(text: "x", meta: AgentItemMeta())
-        ))
-        XCTAssertEqual(workbench.runtime(sessionId: "s1")?.items.count, 1)
-    }
-
-    func testWorkbenchAdoptsDaemonSessionIdForNewRuntime() {
-        let workbench = WorkbenchModel(turnStarter: NoopRuntimeTurnStarter())
-        workbench.ensureRuntime(
-            sessionId: "live-provisional",
-            agentKind: .codex,
-            threadId: nil,
-            cwd: URL(fileURLWithPath: "/tmp/project")
-        )
-        workbench.selectRuntime(sessionId: "live-provisional")
-
-        workbench.ingestServerEvent(.sessionStarted(
-            sessionId: "daemon-session",
-            threadId: nil,
-            agentKind: .codex
-        ))
-        workbench.ingestServerEvent(.agentItem(
-            sessionId: "daemon-session",
-            threadId: "thread-1",
-            agentKind: .codex,
-            item: .assistantMessage(text: "hello", meta: AgentItemMeta())
-        ))
-
-        XCTAssertNil(workbench.runtime(sessionId: "live-provisional"))
-        XCTAssertEqual(workbench.selectedSessionId, "daemon-session")
-        XCTAssertEqual(workbench.runtime(sessionId: "daemon-session")?.id, "daemon-session")
-        XCTAssertEqual(workbench.runtime(sessionId: "daemon-session")?.threadId, "thread-1")
-        XCTAssertEqual(workbench.runtime(sessionId: "daemon-session")?.items.first?.text, "hello")
-    }
+  private func conversationID(_ value: String) -> RuntimeConversationID {
+    RuntimeConversationID(rawValue: value)
+  }
 }

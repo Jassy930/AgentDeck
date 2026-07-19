@@ -57,8 +57,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // preview：直接开进主 mock 会话（对齐设计稿的会话视图，而非空态）。
         if preview {
-            DispatchQueue.main.async { [model] in
+            Task { @MainActor [model] in
                 model.loadHistory()
+                while model.isLoadingHistory {
+                    await Task.yield()
+                }
                 if let primary = model.historyThreads.first(where: {
                     $0.id == MockDaemonScript.primaryThreadId
                 }) {

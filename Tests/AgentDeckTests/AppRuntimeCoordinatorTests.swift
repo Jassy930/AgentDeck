@@ -345,6 +345,60 @@ final class AppRuntimeCoordinatorTests: XCTestCase {
     )
   }
 
+  func testCloseDuringCoordinatorStartCannotPublishRunningState() async throws {
+    let wire = AppRuntimeStartBarrierWire()
+    let coordinator = AppRuntimeCoordinator(wire: wire) { _ in }
+    let startTask = Task { try await coordinator.start() }
+    try await wire.waitUntilStartBlocked()
+
+    await coordinator.close()
+    await wire.releaseStart()
+
+    do {
+      try await startTask.value
+      XCTFail("start completed after coordinator close")
+    } catch let error as AppRuntimeCoordinatorError {
+      XCTAssertEqual(error, .closed)
+    }
+    do {
+      _ = try await coordinator.describeAgents()
+      XCTFail("closed coordinator was revived to running")
+    } catch let error as AppRuntimeCoordinatorError {
+      XCTAssertEqual(error, .closed)
+    }
+    let closeCount = await wire.closeCount()
+    let requestCount = await wire.requestCount()
+    XCTAssertEqual(closeCount, 1)
+    XCTAssertEqual(requestCount, 0)
+  }
+
+  func testOSAccountWireCloseDuringCandidateStartNeverPublishesCandidate() async throws {
+    let candidate = AppRuntimeStartBarrierWire()
+    let wire = OSAccountRuntimeWireSession(sessionFactory: { candidate })
+    let startTask = Task { try await wire.start() }
+    try await candidate.waitUntilStartBlocked()
+
+    await wire.close()
+    await candidate.releaseStart()
+
+    do {
+      try await startTask.value
+      XCTFail("candidate published after OS-account wire close")
+    } catch let failure as RuntimeEnvelopeClientFailure {
+      XCTAssertEqual(failure.code, "daemon.client.connection_closed")
+    }
+    do {
+      _ = try await wire.request(.describeAgents)
+      XCTFail("closed OS-account wire retained a published candidate")
+    } catch let failure as RuntimeEnvelopeClientFailure {
+      XCTAssertEqual(failure.code, "daemon.client.not_started")
+    }
+    let closeCount = await candidate.closeCount()
+    let requestCount = await candidate.requestCount()
+    XCTAssertEqual(closeCount, 1)
+    XCTAssertEqual(requestCount, 0)
+  }
+
   private func assertDaemonFailure(
     code: String,
     diagnosticRef: String?,
@@ -486,6 +540,62 @@ private actor AppRuntimeFakeReplySequence: AppRuntimeWireReplySequence {
   }
 
   func cancel() async {}
+}
+
+private actor AppRuntimeStartBarrierWire: AppRuntimeWireSession {
+  private var startBlocked = false
+  private var startReleased = false
+  private var startContinuation: CheckedContinuation<Void, Never>?
+  private var closes = 0
+  private var requests = 0
+  private var closed = false
+
+  func start() async throws {
+    startBlocked = true
+    guard !startReleased else { return }
+    await withCheckedContinuation { continuation in
+      startContinuation = continuation
+    }
+  }
+
+  func request(_ request: RuntimeRequestV2) async throws -> RuntimeReplyV2 {
+    requests += 1
+    return .agents(try RuntimeAgentDescriptionsV2(agents: []))
+  }
+
+  func beginAppSynchronizedRequest(
+    _ request: RuntimeRequestV2
+  ) async throws -> any AppRuntimeWireReplySequence {
+    AppRuntimeFakeReplySequence(replies: [])
+  }
+
+  func nextStream() async throws -> LocalRuntimeStreamFrame {
+    try await Task.sleep(for: .seconds(60))
+    throw AppRuntimeTestError.timeout
+  }
+
+  func close() async {
+    guard !closed else { return }
+    closed = true
+    closes += 1
+  }
+
+  func waitUntilStartBlocked() async throws {
+    for _ in 0..<1_000 {
+      if startBlocked { return }
+      await Task.yield()
+    }
+    throw AppRuntimeTestError.timeout
+  }
+
+  func releaseStart() {
+    startReleased = true
+    startContinuation?.resume()
+    startContinuation = nil
+  }
+
+  func closeCount() -> Int { closes }
+  func requestCount() -> Int { requests }
 }
 
 private actor AppRuntimeTestTimeline {

@@ -191,7 +191,7 @@ final class StatusBarView: NSView {
             _ = model.selectedPhase
             _ = model.statusText
             _ = model.cwd
-            _ = model.selectedHistoryThreadId
+            _ = model.selectedHistoryConversationID
             _ = model.historyTimingSummary
         } onChange: { [weak self] in
             self?.refresh()
@@ -209,7 +209,7 @@ final class StatusBarView: NSView {
         statusLabel.stringValue = model.statusText
 
         // History section
-        let isHistory = model.selectedHistoryThreadId != nil
+        let isHistory = model.selectedHistoryConversationID != nil
         historyBadge.isHidden = !isHistory
         newSessionButton.isHidden = !isHistory
 

@@ -362,8 +362,8 @@ final class HistorySidebarViewController: NSViewController {
             _ = self.model.historyGroups
             _ = self.model.isLoadingHistory
             _ = self.model.historyErrorMessage
-            _ = self.model.openingHistoryThreadId
-            _ = self.model.selectedSidebarThreadId
+            _ = self.model.openingHistoryConversationID
+            _ = self.model.selectedSidebarConversationID
             // Also track runtime phases + unread counts
             for (_, runtime) in self.model.workbench.runtimes {
                 _ = runtime.phase
@@ -517,11 +517,13 @@ extension HistorySidebarViewController: NSOutlineViewDelegate {
 
     private func makeThreadView(_ ov: NSOutlineView, thread: HistoryThreadSummary) -> NSView {
         let id = NSUserInterfaceItemIdentifier("thread-cell")
-        let runtime = model.workbench.runtime(sessionId: thread.id)
+        let runtime = model.workbench.runtimeList.first {
+            $0.conversationID.rawValue == thread.id
+        }
         let presentation = HistoryThreadRowPresentation(
             threadId: thread.id,
-            selectedThreadId: model.selectedSidebarThreadId,
-            openingThreadId: model.openingHistoryThreadId,
+            selectedThreadId: model.selectedSidebarConversationID,
+            openingThreadId: model.openingHistoryConversationID?.rawValue,
             hoveredThreadId: nil,   // hover tracking is NSOutlineView's built-in highlight
             runtimePhase: runtime?.phase,
             unreadEventCount: runtime?.unreadEventCount ?? 0

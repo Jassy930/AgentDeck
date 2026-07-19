@@ -65,7 +65,7 @@ enum GalleryBootstrap {
 
     @MainActor
     private static func fixtureModel() -> SessionModel {
-        SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        SessionModel()
     }
 
     @MainActor

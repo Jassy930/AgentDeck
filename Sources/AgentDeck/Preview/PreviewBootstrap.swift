@@ -1,12 +1,11 @@
 import Foundation
 
-/// preview 模式引导：构造一个由进程内 mock daemon 驱动、前端完全真实的 SessionModel。
+/// preview 模式引导：显式注入 Runtime v2 fixture wire；production composition 不引用它。
 enum PreviewBootstrap {
-    @MainActor
-    static func makeSessionModel() -> SessionModel {
-        let client = DaemonClient(profile: .dev, transport: MockDaemonTransport())
-        let model = SessionModel(client: client)
-        model.environmentInfo = MockDaemonScript.environmentInfo
-        return model
-    }
+  @MainActor
+  static func makeSessionModel() -> SessionModel {
+    let model = SessionModel(runtimeWire: PreviewRuntimeWireSession())
+    model.environmentInfo = MockDaemonScript.environmentInfo
+    return model
+  }
 }

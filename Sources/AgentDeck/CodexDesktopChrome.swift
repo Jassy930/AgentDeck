@@ -131,7 +131,7 @@ final class CodexContentHeaderView: NSView {
         binder.bind({ [weak self] in
             guard let self, let model = self.model else { return }
             _ = model.cwd
-            _ = model.workbench.selectedSessionId
+            _ = model.workbench.selectedConversationID
             _ = model.workbench.selectedRuntime?.displayTitle
             _ = model.workbench.selectedRuntime?.capabilities?.agentKind
         }, onChange: { [weak self] in

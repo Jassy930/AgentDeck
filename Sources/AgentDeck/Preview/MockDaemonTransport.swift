@@ -89,8 +89,9 @@ final class MockDaemonTransport: DaemonTransport {
     // MARK: - Frame emission
 
     private func emit(_ line: String) {
-        queue.asyncAfter(deadline: .now() + 0.03) { [weak self] in
-            self?.incoming?(line)
+        let delivery = MockDaemonUncheckedSendable(value: incoming)
+        queue.asyncAfter(deadline: .now() + 0.03) {
+            delivery.value?(line)
         }
     }
 
@@ -108,4 +109,10 @@ final class MockDaemonTransport: DaemonTransport {
         guard let s = try? String(data: encoder.encode(event), encoding: .utf8) else { return "" }
         return s
     }
+}
+
+/// Preview-only transport 在安装 handler 后只读该闭包；异步投递捕获不可变快照，
+/// 不把整个可变 transport 声明为 `@unchecked Sendable`。
+private struct MockDaemonUncheckedSendable<Value>: @unchecked Sendable {
+    let value: Value
 }
