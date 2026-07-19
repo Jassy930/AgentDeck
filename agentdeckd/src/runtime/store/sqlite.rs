@@ -2716,7 +2716,8 @@ mod migration_tests {
     async fn v5_native_projected_origin_is_rejected_before_v6_migration() {
         let root = TestRoot::new("v5-native-projected-reject");
         let keys = MemoryKeyStore::new();
-        let (_, _, conversation_id) = build_populated_strict_v5_fixture(&root, &keys).await;
+        let (_, _, conversation_id) =
+            build_populated_strict_v5_fixture_with_metadata_mutation(&root, &keys, false).await;
         let connection = Connection::open(root.database()).expect("open strict v5 native fixture");
         let meta = read_meta_v5(&connection)
             .expect("read strict v5 native meta")
@@ -2733,16 +2734,14 @@ mod migration_tests {
             &meta.wrapped_key_bundle,
         )
         .expect("unwrap strict v5 native keys");
-        let (current_revision, entry_revision, cutoff): (Option<String>, String, Option<String>) =
-            connection
-                .query_row(
-                    "SELECT current_configuration_revision, entry_revision,
-                            legacy_command_high_water
+        let (current_revision, entry_revision): (Option<String>, String) = connection
+            .query_row(
+                "SELECT current_configuration_revision, entry_revision
                      FROM conversation_state WHERE conversation_id = ?1",
-                    [&conversation_id.as_bytes()[..]],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .expect("read populated v5 conversation state");
+                [&conversation_id.as_bytes()[..]],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read populated v5 conversation state");
         let token = super::super::configuration::conversation_state_metadata_token(
             &key_bundle,
             conversation_id.as_bytes(),
@@ -2750,7 +2749,7 @@ mod migration_tests {
             &entry_revision,
             "nativeProjected",
             Some("codex"),
-            cutoff.as_deref(),
+            None,
         )
         .expect("authenticate legacy native origin row");
         assert_eq!(
@@ -2758,6 +2757,7 @@ mod migration_tests {
                 .execute(
                     "UPDATE conversation_state
                  SET origin_kind = 'nativeProjected', origin_namespace = 'codex',
+                     legacy_command_high_water = NULL,
                      metadata_token = ?1
                  WHERE conversation_id = ?2",
                     params![&token[..], &conversation_id.as_bytes()[..]],
@@ -5205,12 +5205,36 @@ pub(crate) fn admit_safety_write(
     storage_path: &Path,
     capacity_probe: &dyn RuntimeCapacityProbe,
 ) -> Result<(), RuntimeStoreError> {
+    admit_safety_write_with_credit(
+        connection,
+        key_bundle,
+        database_id,
+        storage_path,
+        capacity_probe,
+        0,
+    )
+}
+
+/// 单个 authenticated native metadata mutation 已经消费的 pre-terminal obligation
+/// 可作为 safety margin credit。普通写仍按完整 claimed write set 保留；只有该 mutation
+/// 的下一笔 safety transition 才能使用精确 credit，避免 fence 已提交后仍要求重复保留
+/// 同一 persist 空间而阻断 release/terminal。
+pub(crate) fn admit_safety_write_with_credit(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    storage_path: &Path,
+    capacity_probe: &dyn RuntimeCapacityProbe,
+    consumed_metadata_reserve_bytes: u64,
+) -> Result<(), RuntimeStoreError> {
     let safety_reserve_bytes = safety_reserve_bytes(
         connection,
         key_bundle,
         database_id,
         SafetyReserveProjection::Current,
-    )?;
+    )?
+    .checked_sub(consumed_metadata_reserve_bytes)
+    .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
     let observed = capacity_probe.observe(storage_path)?;
     let (page_size_bytes, page_count, max_page_count) = read_page_budget(connection)?;
     evaluate_runtime_safety_admission(RuntimeAdmissionInput {
@@ -5378,7 +5402,7 @@ fn safety_reserve_bytes_for_counts(counts: SafetyCounts) -> Result<u64, RuntimeS
         })?;
     let active_metadata_mutations = counts
         .active_metadata_mutations
-        .checked_mul(super::metadata::MAX_METADATA_MUTATION_TERMINAL_RESERVE_BYTES)
+        .checked_mul(super::metadata::MAX_NATIVE_METADATA_MUTATION_SAFETY_RESERVE_BYTES)
         .ok_or(RuntimeStoreError::CapacityArithmeticOverflow {
             field: "active_metadata_mutation_safety_reserve",
         })?;
@@ -7570,7 +7594,13 @@ mod tests {
         .expect("calculate claimed metadata safety reserve");
         assert_eq!(
             claimed - current,
-            crate::runtime::store::metadata::MAX_METADATA_MUTATION_TERMINAL_RESERVE_BYTES
+            crate::runtime::store::metadata::MAX_NATIVE_METADATA_MUTATION_SAFETY_RESERVE_BYTES
+        );
+        assert_eq!(
+            crate::runtime::store::metadata::MAX_NATIVE_METADATA_MUTATION_SAFETY_RESERVE_BYTES
+                - crate::runtime::store::metadata::MAX_METADATA_MUTATION_TERMINAL_RESERVE_BYTES,
+            crate::runtime::store::metadata::MAX_NATIVE_METADATA_PRE_TERMINAL_RESERVE_BYTES,
+            "native effect/release/outcomeUnknown reserve must stay independent from terminal"
         );
         assert!(
             claimed - current
@@ -7579,5 +7609,61 @@ mod tests {
                     * 2,
             "terminal reserve must cover descriptor and CatalogDelta, not only sealed outcome"
         );
+    }
+
+    #[test]
+    fn native_metadata_transition_credits_preserve_each_remaining_safety_obligation() {
+        let ledger = RuntimeLedger {
+            active_metadata_mutation_count: 1,
+            ..RuntimeLedger::default()
+        };
+        let claimed =
+            safety_reserve_bytes_for_ledger_projection(&ledger, SafetyReserveProjection::Current)
+                .expect("calculate claimed native metadata reserve");
+        let persist =
+            crate::runtime::store::metadata::MAX_NATIVE_METADATA_EFFECT_PERSIST_RESERVE_BYTES;
+        let release =
+            crate::runtime::store::metadata::MAX_NATIVE_METADATA_EFFECT_RELEASE_RESERVE_BYTES;
+        let unknown =
+            crate::runtime::store::metadata::MAX_NATIVE_METADATA_OUTCOME_UNKNOWN_RESERVE_BYTES;
+        let terminal =
+            crate::runtime::store::metadata::MAX_METADATA_MUTATION_TERMINAL_RESERVE_BYTES;
+        let fixed = claimed
+            .checked_sub(
+                crate::runtime::store::metadata::MAX_NATIVE_METADATA_MUTATION_SAFETY_RESERVE_BYTES,
+            )
+            .expect("claimed reserve contains one native obligation");
+        let common = RuntimeAdmissionInput {
+            main_bytes: 0,
+            wal_bytes: 0,
+            shm_bytes: 0,
+            projected_write_bytes: 0,
+            safety_margin_bytes: claimed,
+            filesystem_total_bytes: 4 * 1024 * 1024 * 1024,
+            filesystem_available_bytes: claimed,
+            page_size_bytes: 4096,
+            page_count: 0,
+            max_page_count: RUNTIME_DB_HARD_LIMIT_BYTES / 4096,
+        };
+        evaluate_runtime_safety_admission(common)
+            .expect("claimed reserve admits the maximum persist write");
+        evaluate_runtime_safety_admission(RuntimeAdmissionInput {
+            safety_margin_bytes: fixed + release + unknown + terminal,
+            filesystem_available_bytes: claimed - persist,
+            ..common
+        })
+        .expect("persist credit leaves release, unknown, and terminal admissible");
+        evaluate_runtime_safety_admission(RuntimeAdmissionInput {
+            safety_margin_bytes: fixed + unknown + terminal,
+            filesystem_available_bytes: claimed - persist - release,
+            ..common
+        })
+        .expect("persist+release credit leaves unknown and terminal admissible");
+        evaluate_runtime_safety_admission(RuntimeAdmissionInput {
+            safety_margin_bytes: fixed + terminal,
+            filesystem_available_bytes: claimed - persist - release - unknown,
+            ..common
+        })
+        .expect("full pre-terminal credit leaves the terminal write admissible");
     }
 }

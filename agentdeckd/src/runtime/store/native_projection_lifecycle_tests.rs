@@ -25,7 +25,7 @@ use super::{
     RuntimeClockError, RuntimeCommitOperation, RuntimeId, RuntimeIdKind, RuntimeStoreConfig,
     RuntimeStoreError, RuntimeStoreFaultInjector, RuntimeStoreHandle, RuntimeStoreOperation,
 };
-use crate::claude_code::history::CompletedNativeScan;
+use crate::agent::{CompletedNativeProjectionScan, native_projection_scan_issuer_for_test};
 use crate::runtime::AgentRouter;
 use crate::runtime::backfill::BarrierRequest;
 use crate::runtime::catalog_snapshot::CatalogSnapshotProvider;
@@ -475,8 +475,14 @@ fn import_input(reference: &[u8], scan_generation: [u8; 16]) -> ImportNativeProj
     }
 }
 
-fn completed_scan(generation: [u8; 16], acknowledged_candidates: u64) -> CompletedNativeScan {
-    CompletedNativeScan::from_exhausted_native_scanner(generation, acknowledged_candidates)
+fn completed_scan(
+    generation: [u8; 16],
+    acknowledged_candidates: u64,
+) -> CompletedNativeProjectionScan {
+    native_projection_scan_issuer_for_test(generation)
+        .expect("valid neutral projection generation")
+        .complete(generation, acknowledged_candidates, acknowledged_candidates)
+        .expect("completed neutral projection witness")
 }
 
 async fn open_store(

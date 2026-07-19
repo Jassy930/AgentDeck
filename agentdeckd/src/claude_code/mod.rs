@@ -19,8 +19,8 @@
 //!   - `capabilities.rs` — real `claude --version` probe + typed
 //!     `SessionCapabilities` builder (N5 对称约束).
 //!   - `auth.rs` — `claude auth status` probe → tri+1 `AuthState`.
-//!   - `history.rs` — `.jsonl` enumeration + read + native rename /
-//!     archive (no `cc-meta/` layer; N8 守护).
+//!   - `history.rs` — `.jsonl` enumeration + read；native mutation 只能由
+//!     Runtime-owned metadata exec gate 执行（no `cc-meta/` layer; N8 守护）。
 //!   - `state.rs` — typed private resume index；不成为 CC history 事实源。
 
 pub mod adapter;

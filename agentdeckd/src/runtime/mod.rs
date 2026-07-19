@@ -14,6 +14,8 @@ mod history_receipt;
 pub mod hub;
 pub mod model;
 pub mod namespace;
+pub(crate) mod native_metadata;
+mod native_projector;
 pub mod process_identity;
 #[cfg(debug_assertions)]
 #[doc(hidden)]

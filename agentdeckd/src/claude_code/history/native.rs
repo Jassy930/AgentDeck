@@ -69,6 +69,12 @@ pub(in crate::claude_code) enum NativeHistoryError {
     InvalidKey { line: u64 },
     #[error("Claude Code native history line {line} duplicates a stable key")]
     DuplicateKey { line: u64 },
+    #[error("Claude Code native history line {line} has invalid canonical metadata")]
+    #[allow(dead_code, reason = "C-e2 invokes metadata readback")]
+    MetadataInvalid { line: u64 },
+    #[error("Claude Code native history line {line} conflicts with canonical metadata")]
+    #[allow(dead_code, reason = "C-e2 invokes metadata readback")]
+    MetadataAmbiguous { line: u64 },
     #[error("Claude Code native history line {line} has no verified parent turn")]
     MissingParent { line: u64 },
     #[error("Claude Code native history scan generation must be non-zero")]
@@ -98,6 +104,8 @@ impl NativeHistoryError {
             Self::Malformed { .. } => "cc-history-native-malformed",
             Self::InvalidKey { .. } | Self::MissingParent { .. } => "cc-history-native-key-invalid",
             Self::DuplicateKey { .. } => "cc-history-native-duplicate-key",
+            Self::MetadataInvalid { .. } => "cc-history-native-metadata-invalid",
+            Self::MetadataAmbiguous { .. } => "cc-history-native-metadata-ambiguous",
             Self::InvalidScanGeneration => "cc-history-native-scan-generation-invalid",
             Self::InvalidCandidateAcknowledgement => "cc-history-native-scan-ack-invalid",
             Self::ScanFailed => "cc-history-native-scan-failed",
@@ -302,6 +310,12 @@ pub(super) enum NativeTailState {
 pub(super) struct NativeHistoryDocument {
     turns: Vec<NativeHistoryTurn>,
     tail: NativeTailState,
+    #[allow(dead_code, reason = "C-e2 invokes metadata readback")]
+    metadata_cwd: Option<PathBuf>,
+    #[allow(dead_code, reason = "C-e2 invokes metadata readback")]
+    metadata_title: Option<String>,
+    #[allow(dead_code, reason = "C-e2 invokes metadata readback")]
+    metadata_issue: Option<(bool, u64)>,
 }
 
 impl NativeHistoryDocument {
@@ -316,6 +330,45 @@ impl NativeHistoryDocument {
 
     pub(super) fn into_turns(self) -> Vec<NativeHistoryTurn> {
         self.turns
+    }
+
+    #[allow(
+        dead_code,
+        reason = "C-f projector source bridge validates importable JSONL"
+    )]
+    pub(super) fn modeled_item_count(&self) -> usize {
+        self.turns.iter().map(|turn| turn.items.len()).sum()
+    }
+
+    #[cfg(test)]
+    pub(super) fn metadata(&self) -> Result<(&Path, Option<&str>), NativeHistoryError> {
+        self.metadata_error()?;
+        self.metadata_cwd
+            .as_deref()
+            .map(|cwd| (cwd, self.metadata_title.as_deref()))
+            .ok_or(NativeHistoryError::MetadataInvalid { line: 0 })
+    }
+
+    #[allow(dead_code, reason = "C-e2 invokes metadata readback")]
+    pub(super) fn into_metadata(self) -> Result<(PathBuf, Option<String>), NativeHistoryError> {
+        self.metadata_error()?;
+        self.metadata_cwd
+            .map(|cwd| (cwd, self.metadata_title))
+            .ok_or(NativeHistoryError::MetadataInvalid { line: 0 })
+    }
+
+    fn metadata_error(&self) -> Result<(), NativeHistoryError> {
+        if self.tail != NativeTailState::Complete {
+            return Err(NativeHistoryError::MetadataAmbiguous { line: 0 });
+        }
+        if let Some((ambiguous, line)) = self.metadata_issue {
+            return Err(if ambiguous {
+                NativeHistoryError::MetadataAmbiguous { line }
+            } else {
+                NativeHistoryError::MetadataInvalid { line }
+            });
+        }
+        Ok(())
     }
 }
 
@@ -403,24 +456,13 @@ pub(crate) struct CompletedNativeScan {
 }
 
 impl CompletedNativeScan {
-    pub(crate) const fn into_generation(self) -> [u8; 16] {
-        self.generation
+    pub(in crate::claude_code) const fn into_parts(self) -> ([u8; 16], u64) {
+        (self.generation, self.acknowledged_candidates)
     }
 
     #[cfg(test)]
     pub(crate) const fn generation(&self) -> [u8; 16] {
         self.generation
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn from_exhausted_native_scanner(
-        generation: [u8; 16],
-        acknowledged_candidates: u64,
-    ) -> Self {
-        Self {
-            generation,
-            acknowledged_candidates,
-        }
     }
 
     #[cfg(test)]
@@ -1179,10 +1221,7 @@ pub(super) fn parse_native_jsonl<R: BufRead>(
         retained_budget.commit(line_budget)?;
     }
 
-    Ok(NativeReadOutcome::Document(NativeHistoryDocument {
-        turns: state.turns,
-        tail,
-    }))
+    Ok(NativeReadOutcome::Document(state.into_document(tail)))
 }
 
 struct NativeParserState {
@@ -1193,6 +1232,9 @@ struct NativeParserState {
     seen_items: HashSet<NativeItemKey>,
     seen_tool_ids: HashSet<String>,
     in_flight: HashMap<String, (String, Value)>,
+    canonical_cwd: Option<PathBuf>,
+    latest_custom_title: Option<String>,
+    metadata_issue: Option<(bool, u64)>,
     record_count: u64,
     item_limit: usize,
 }
@@ -1207,6 +1249,9 @@ impl NativeParserState {
             seen_items: HashSet::new(),
             seen_tool_ids: HashSet::new(),
             in_flight: HashMap::new(),
+            canonical_cwd: None,
+            latest_custom_title: None,
+            metadata_issue: None,
             record_count: 0,
             item_limit,
         }
@@ -1219,6 +1264,7 @@ impl NativeParserState {
         budget: &mut NativeLineRetainedBudget,
     ) -> Result<(), NativeHistoryError> {
         let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+        self.consume_metadata(&value, kind, line, budget)?;
         let content = value
             .get("message")
             .and_then(|message| message.get("content"));
@@ -1287,6 +1333,78 @@ impl NativeParserState {
             self.record_turns.insert(record_uuid, turn_key);
         }
         Ok(())
+    }
+
+    fn consume_metadata(
+        &mut self,
+        value: &Value,
+        kind: &str,
+        line: u64,
+        budget: &mut NativeLineRetainedBudget,
+    ) -> Result<(), NativeHistoryError> {
+        if let Some(raw_cwd) = value.get("cwd") {
+            let Some(cwd) = raw_cwd.as_str() else {
+                self.record_metadata_issue(false, line);
+                return Ok(());
+            };
+            let path = Path::new(cwd);
+            if !path.is_absolute()
+                || cwd.as_bytes().contains(&0)
+                || cwd.len() > crate::agent::MAX_EXEC_PATH_BYTES
+            {
+                self.record_metadata_issue(false, line);
+                return Ok(());
+            }
+            match &self.canonical_cwd {
+                Some(expected) if expected != path => {
+                    self.record_metadata_issue(true, line);
+                }
+                Some(_) => {}
+                None => {
+                    budget.reserve_persistent(cwd.len())?;
+                    self.canonical_cwd = Some(path.to_path_buf());
+                }
+            }
+        }
+
+        if kind == "custom-title" {
+            if value.get("custom_title").is_some() {
+                self.record_metadata_issue(false, line);
+                return Ok(());
+            }
+            let Some(title) = value.get("customTitle").and_then(Value::as_str) else {
+                self.record_metadata_issue(false, line);
+                return Ok(());
+            };
+            budget.ensure_temporary(title.len())?;
+            if agentdeck_protocol::runtime::ConversationMetadataMutation::rename(Some(
+                title.to_owned(),
+            ))
+            .is_err()
+            {
+                self.record_metadata_issue(false, line);
+                return Ok(());
+            }
+            budget.reserve_persistent(title.len())?;
+            self.latest_custom_title = Some(title.to_owned());
+        }
+        Ok(())
+    }
+
+    fn record_metadata_issue(&mut self, ambiguous: bool, line: u64) {
+        if self.metadata_issue.is_none() {
+            self.metadata_issue = Some((ambiguous, line));
+        }
+    }
+
+    fn into_document(self, tail: NativeTailState) -> NativeHistoryDocument {
+        NativeHistoryDocument {
+            turns: self.turns,
+            tail,
+            metadata_cwd: self.canonical_cwd,
+            metadata_title: self.latest_custom_title,
+            metadata_issue: self.metadata_issue,
+        }
     }
 
     fn consume_user(

@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Barrier;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use agentdeck_protocol::runtime::failure::{
     DAEMON_COMMAND_HISTORY_ONLY, DAEMON_COMMAND_NOT_FOUND,
@@ -1368,6 +1368,273 @@ async fn canceled_metadata_caller_keeps_authorization_until_store_completion() {
     core.shutdown()
         .await
         .expect("shutdown canceled metadata core");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canceled_native_metadata_caller_keeps_actor_owned_operation_until_terminal_reply() {
+    // 威胁场景：native mutation 已在 actor control lane 取得 durable-claim/release
+    // 等价 barrier 后，transport task 被取消。若 coordinator future、authorization
+    // 或 Core operation lease 仍归 caller 所有，revoke/shutdown 会越过尚未完成的
+    // vendor/readback/Store terminal。这里用可控 operation 锁定 ownership，不 spawn vendor。
+    let root = TestRoot::new("native-metadata-actor-owned-cancel");
+    let store = root.open_store().await;
+    let imported = store
+        .claude_code_native_projection_store()
+        .import(ImportNativeProjection {
+            descriptor: ConversationDescriptor {
+                agent_kind: AgentKind::ClaudeCode,
+                title: Some("native actor-owned metadata".to_owned()),
+                cwd: PathBuf::new(),
+            },
+            default_configuration: claude_code_configuration(),
+            private_reference: SecretBytes::new(
+                b"native-metadata-actor-owned-reference-v1".to_vec(),
+            ),
+            scan_generation: [0x7B; 16],
+        })
+        .await
+        .expect("import actor-owned native metadata fixture");
+    let conversation = match imported {
+        ImportNativeProjectionOutcome::Imported { conversation, .. } => conversation,
+        other => panic!("fresh native metadata fixture must import once, got {other:?}"),
+    };
+    let conversation_id = conversation.conversation_id;
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let core = Arc::new(
+        RuntimeCore::new(store, router, [0xAA; 32])
+            .expect("construct actor-owned native metadata core"),
+    );
+    core.recover()
+        .await
+        .expect("recover actor-owned native metadata core");
+    assert!(
+        core.conversations.contains(conversation_id).await,
+        "recovery installs native projection actor"
+    );
+    let principal = core
+        .issue_verified_local_principal(501, [0x7B; 16])
+        .expect("issue native metadata principal");
+    let authorization = principal
+        .try_enter()
+        .expect("enter native metadata authorization");
+    let operation_guard = core
+        .try_enter_operation()
+        .expect("retain admitted native metadata operation");
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+    let operation = async move {
+        let _ = entered_tx.send(());
+        let _ = release_rx.await;
+        let _ = terminal_tx.send(());
+        Ok(NativeMutationOutcome::Rejected(RuntimeFailure::new(
+            "daemon.test.native_metadata_terminal",
+            "test-only actor-owned terminal",
+        )))
+    };
+    let caller = tokio::spawn({
+        let conversations = core.conversations.clone();
+        async move {
+            conversations
+                .update_native_metadata_operation_for_test(
+                    conversation_id,
+                    operation,
+                    authorization,
+                    operation_guard,
+                )
+                .await
+        }
+    });
+    entered_rx
+        .await
+        .expect("actor reached native metadata claim/release barrier");
+    caller.abort();
+    assert!(
+        caller
+            .await
+            .expect_err("transport caller must be canceled")
+            .is_cancelled(),
+        "caller cancellation occurs after actor owns the operation"
+    );
+
+    let revoking = tokio::spawn({
+        let principal = principal.clone();
+        async move { principal.begin_revoke().await }
+    });
+    wait_until_principal_revoking(&principal).await;
+    assert!(
+        !revoking.is_finished(),
+        "actor-owned authorization blocks revoke after caller cancellation"
+    );
+    let shutdown = tokio::spawn({
+        let core = core.clone();
+        async move { core.shutdown().await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while core.lifecycle.load(Ordering::Acquire) != CORE_CLOSING {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown reaches operation-quiescence fence");
+    assert!(
+        !shutdown.is_finished(),
+        "retained Core operation lease blocks shutdown before terminal reply"
+    );
+
+    release_tx
+        .send(())
+        .expect("release actor-owned native metadata barrier");
+    terminal_rx
+        .await
+        .expect("actor-owned native metadata operation reaches terminal");
+    revoking
+        .await
+        .expect("join native metadata revoke")
+        .expect("revoke completes after terminal reply");
+    principal.finish_revoke();
+    shutdown
+        .await
+        .expect("join native metadata shutdown")
+        .expect("shutdown waits for actor-owned terminal reply");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_closes_saturated_native_permit_waiter_before_operation_quiescence() {
+    // 威胁场景：native metadata caller 已持有 Core operation/auth/会话 guard，
+    // 但全局 adapter permit 被长 turn 占满。若 shutdown 先等 operation、后 close
+    // semaphore，两者会永久互等。CLOSING 必须先拒绝这个尚未 claim 的 waiter；
+    // 已经取得的 permit 本身仍保持有效，也不能被 shutdown 强制撤销。
+    let root = TestRoot::new("native-metadata-saturated-shutdown");
+    let store = root.open_store().await;
+    let imported = store
+        .claude_code_native_projection_store()
+        .import(ImportNativeProjection {
+            descriptor: ConversationDescriptor {
+                agent_kind: AgentKind::ClaudeCode,
+                title: Some("native saturated shutdown".to_owned()),
+                cwd: PathBuf::new(),
+            },
+            default_configuration: claude_code_configuration(),
+            private_reference: SecretBytes::new(
+                b"native-metadata-saturated-shutdown-reference-v1".to_vec(),
+            ),
+            scan_generation: [0x7C; 16],
+        })
+        .await
+        .expect("import saturated native metadata fixture");
+    let conversation = match imported {
+        ImportNativeProjectionOutcome::Imported { conversation, .. } => conversation,
+        other => panic!("fresh saturated metadata fixture must import once, got {other:?}"),
+    };
+    let conversation_id = conversation.conversation_id;
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let core = Arc::new(
+        RuntimeCore::with_execution_coordinator(
+            store,
+            router,
+            [0xAB; 32],
+            Arc::new(DisabledExecutionCoordinator),
+            1,
+            false,
+        )
+        .expect("construct saturated native metadata core"),
+    );
+    core.recover()
+        .await
+        .expect("recover saturated native metadata core");
+    let held_permit = core
+        .conversations
+        .acquire_native_adapter_permit()
+        .await
+        .expect("saturate the only adapter permit");
+    let principal = core
+        .issue_verified_local_principal(501, [0x7C; 16])
+        .expect("issue saturated native metadata principal");
+    let authorization = principal
+        .try_enter()
+        .expect("enter saturated native metadata authorization");
+    let operation_guard = core
+        .try_enter_operation()
+        .expect("retain saturated native metadata operation");
+    let operation_polls = Arc::new(AtomicUsize::new(0));
+    let waiter = tokio::spawn({
+        let conversations = core.conversations.clone();
+        let operation_polls = operation_polls.clone();
+        async move {
+            conversations
+                .update_native_metadata_operation_for_test(
+                    conversation_id,
+                    async move {
+                        operation_polls.fetch_add(1, Ordering::AcqRel);
+                        Ok(NativeMutationOutcome::Rejected(RuntimeFailure::new(
+                            "daemon.test.unexpected_native_operation",
+                            "saturated native operation must not be polled",
+                        )))
+                    },
+                    authorization,
+                    operation_guard,
+                )
+                .await
+        }
+    });
+
+    // 反复探测同一 serialization guard，直到 waiter 已取得它并确实停在 permit。
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                core.conversations
+                    .acquire_native_mutation_guard(conversation_id),
+            )
+            .await
+            {
+                Err(_) => break,
+                Ok(Ok(guard)) => drop(guard),
+                Ok(Err(error)) => panic!("probe native mutation guard failed: {error}"),
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("native metadata waiter must reach the saturated permit");
+    assert!(!waiter.is_finished());
+    assert_eq!(operation_polls.load(Ordering::Acquire), 0);
+
+    let shutdown = tokio::spawn({
+        let core = core.clone();
+        async move { core.shutdown().await }
+    });
+    let waiter_error = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+        .await
+        .expect("CLOSING must wake the native permit waiter")
+        .expect("join saturated native permit waiter")
+        .expect_err("closed admission must reject the unclaimed native operation");
+    assert!(matches!(waiter_error, ConversationError::ActorUnavailable));
+    tokio::time::timeout(std::time::Duration::from_secs(2), shutdown)
+        .await
+        .expect("shutdown must not wait for a closed permit waiter")
+        .expect("join saturated native shutdown")
+        .expect("shutdown saturated native metadata core");
+
+    assert_eq!(
+        operation_polls.load(Ordering::Acquire),
+        0,
+        "permit rejection must happen before claim/coordinator/vendor work"
+    );
+    assert_eq!(
+        Connection::open(root.database())
+            .expect("open saturated shutdown evidence")
+            .query_row(
+                "SELECT COUNT(*) FROM metadata_mutation_ledger WHERE conversation_id = ?1",
+                [&conversation_id.as_bytes()[..]],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count saturated native metadata claims"),
+        0,
+        "unclaimed permit waiter must leave zero durable metadata rows"
+    );
+    drop(held_permit);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3104,7 +3371,7 @@ async fn paced_reservation_wait_does_not_hold_core_shutdown_quiescence() {
         .is_none(),
         "paced reservation unexpectedly bypassed the held writer budget"
     );
-    let inflight_while_waiting = core.operation_inflight.load(Ordering::Acquire);
+    let inflight_while_waiting = core.operation_tracker.inflight.load(Ordering::Acquire);
 
     let shutdown = tokio::spawn({
         let core = core.clone();

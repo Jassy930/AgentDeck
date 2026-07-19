@@ -7,8 +7,13 @@
 use crate::agent::{
     AdapterStateHandle, AgentEventSender, AgentSessionHandle, AgentTurnRequest,
     CanonicalAgentEventSender, CanonicalAgentSessionHandle, CanonicalHistoryRead,
-    CanonicalNativeHistoryRead, DynAgent, DynNativeHistoryReader, NativeHistoryReadError,
-    PreparedAgentTurnHandle, prepare_turn as prepare_agent_turn,
+    CanonicalNativeHistoryRead, DynAgent, DynNativeHistoryReader, DynNativeMetadataEffectAdapter,
+    DynNativeProjectionScan, DynNativeProjectionSource, NativeHistoryReadError,
+    NativeMetadataEffectAdapter, NativeMetadataEffectError, NativeMetadataEffectRequest,
+    NativeMetadataEffectSpec, NativeMetadataReadback, NativeProjectionSource,
+    NativeProjectionSourceError, PreparedAgentTurnHandle,
+    begin_native_projection_scan as begin_adapter_native_projection_scan,
+    prepare_turn as prepare_agent_turn,
 };
 use agentdeck_protocol::runtime::{AgentDescription, AgentDescriptions, ConfigurationError};
 use agentdeck_protocol::{
@@ -28,6 +33,8 @@ use crate::{claude_code::ClaudeCodeAdapter, codex::CodexAdapter};
 pub struct AgentRouter {
     agents: BTreeMap<AgentKind, DynAgent>,
     native_history_readers: BTreeMap<AgentKind, DynNativeHistoryReader>,
+    native_projection_sources: BTreeMap<AgentKind, DynNativeProjectionSource>,
+    native_metadata_effect_adapters: BTreeMap<AgentKind, DynNativeMetadataEffectAdapter>,
     sessions: Arc<Mutex<HashMap<SessionId, AgentKind>>>,
 }
 
@@ -36,6 +43,8 @@ impl AgentRouter {
         Self {
             agents: BTreeMap::new(),
             native_history_readers: BTreeMap::new(),
+            native_projection_sources: BTreeMap::new(),
+            native_metadata_effect_adapters: BTreeMap::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -53,7 +62,9 @@ impl AgentRouter {
             store.claude_code_adapter_state_vault(),
         ));
         router.register(claude_code.clone());
-        router.register_native_history_reader(AgentKind::ClaudeCode, claude_code);
+        router.register_native_history_reader(AgentKind::ClaudeCode, claude_code.clone());
+        router.register_native_projection_source(claude_code.clone());
+        router.register_native_metadata_effect_adapter(claude_code);
         router
     }
 
@@ -68,6 +79,22 @@ impl AgentRouter {
         reader: DynNativeHistoryReader,
     ) {
         self.native_history_readers.insert(agent_kind, reader);
+    }
+
+    pub(crate) fn register_native_projection_source(
+        &mut self,
+        source: Arc<dyn NativeProjectionSource>,
+    ) {
+        self.native_projection_sources
+            .insert(source.agent_kind(), source);
+    }
+
+    pub(crate) fn register_native_metadata_effect_adapter(
+        &mut self,
+        adapter: Arc<dyn NativeMetadataEffectAdapter>,
+    ) {
+        self.native_metadata_effect_adapters
+            .insert(adapter.agent_kind(), adapter);
     }
 
     pub fn list_agents(&self) -> Vec<AgentKind> {
@@ -253,6 +280,56 @@ impl AgentRouter {
         Ok(read)
     }
 
+    /// 启动 daemon-private native projector scan。Router 只按中立 AgentKind
+    /// 选择 source，不接触 project component、transcript path 或 native session id。
+    /// Codex、未注册 adapter 与未实现 source 都稳定返回 typed unavailable。
+    pub(crate) fn begin_native_projection_scan(
+        &self,
+        agent_kind: AgentKind,
+        generation: [u8; 16],
+    ) -> Result<DynNativeProjectionScan, NativeProjectionSourceError> {
+        if !self.agents.contains_key(&agent_kind) {
+            return Err(NativeProjectionSourceError::Unavailable);
+        }
+        let source = self
+            .native_projection_sources
+            .get(&agent_kind)
+            .ok_or(NativeProjectionSourceError::Unavailable)?;
+        begin_adapter_native_projection_scan(source.as_ref(), generation)
+    }
+
+    /// Cold-prepare only；Codex/未注册 adapter 返回 unavailable。
+    pub(crate) async fn prepare_native_metadata_effect(
+        &self,
+        agent_kind: AgentKind,
+        request: &NativeMetadataEffectRequest,
+    ) -> Result<NativeMetadataEffectSpec, NativeMetadataEffectError> {
+        if !self.agents.contains_key(&agent_kind) {
+            return Err(NativeMetadataEffectError::Unavailable);
+        }
+        self.native_metadata_effect_adapters
+            .get(&agent_kind)
+            .ok_or(NativeMetadataEffectError::Unavailable)?
+            .prepare_native_metadata_effect(request)
+            .await
+    }
+
+    /// Exact readback；无法证明为 `Unknown`，缺 capability 为 `Unavailable`。
+    pub(crate) async fn readback_native_metadata_effect(
+        &self,
+        agent_kind: AgentKind,
+        request: &NativeMetadataEffectRequest,
+    ) -> Result<NativeMetadataReadback, NativeMetadataEffectError> {
+        if !self.agents.contains_key(&agent_kind) {
+            return Err(NativeMetadataEffectError::Unavailable);
+        }
+        self.native_metadata_effect_adapters
+            .get(&agent_kind)
+            .ok_or(NativeMetadataEffectError::Unavailable)?
+            .readback_native_metadata_effect(request)
+            .await
+    }
+
     pub async fn submit_decision(
         &self,
         session_id: &SessionId,
@@ -401,11 +478,14 @@ impl std::fmt::Debug for AgentRouter {
 mod typed_prepare_tests {
     use super::*;
     use crate::agent::{
-        AdapterStateHandle, Agent, AgentTurnRequest, ExecSpec, ExecutionId, PreparedAgentTurn,
+        AdapterStateHandle, Agent, AgentTurnRequest, CompletedNativeProjectionScan, ExecSpec,
+        ExecutionId, NativeProjectionAcknowledgement, NativeProjectionScan,
+        NativeProjectionScanIssuer, NativeProjectionStep, PreparedAgentTurn,
     };
     use agentdeck_protocol::runtime::{
         ClaudeCodeConversationConfiguration, CodexConversationConfiguration,
-        ConversationConfiguration, PromptPayload, VendorConfigurationSnapshot,
+        ConversationConfiguration, ConversationMetadataMutation, PromptPayload,
+        VendorConfigurationSnapshot,
     };
     use agentdeck_protocol::{
         ClaudeCodePermissionMode, CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode,
@@ -427,6 +507,87 @@ mod typed_prepare_tests {
     struct PrepareProbeAgent {
         kind: AgentKind,
         calls: Arc<AtomicUsize>,
+    }
+
+    struct NativeMetadataProbe {
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct NativeProjectionProbe {
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct EmptyNativeProjectionScan {
+        issuer: NativeProjectionScanIssuer,
+        observed_complete: bool,
+    }
+
+    impl NativeProjectionScan for EmptyNativeProjectionScan {
+        fn next(&mut self) -> Result<NativeProjectionStep, NativeProjectionSourceError> {
+            self.observed_complete = true;
+            Ok(NativeProjectionStep::Complete)
+        }
+
+        fn acknowledge(
+            &mut self,
+            _acknowledgement: NativeProjectionAcknowledgement,
+        ) -> Result<(), NativeProjectionSourceError> {
+            Err(NativeProjectionSourceError::InvalidAcknowledgement)
+        }
+
+        fn resume_after_yield(&mut self) -> Result<(), NativeProjectionSourceError> {
+            Err(NativeProjectionSourceError::InvalidState)
+        }
+
+        fn into_completed(
+            self: Box<Self>,
+        ) -> Result<CompletedNativeProjectionScan, NativeProjectionSourceError> {
+            if !self.observed_complete {
+                return Err(NativeProjectionSourceError::ScanIncomplete);
+            }
+            let generation = self.issuer.generation();
+            self.issuer.complete(generation, 0, 0)
+        }
+    }
+
+    impl NativeProjectionSource for NativeProjectionProbe {
+        fn agent_kind(&self) -> AgentKind {
+            AgentKind::ClaudeCode
+        }
+
+        fn begin_native_projection_scan(
+            &self,
+            issuer: NativeProjectionScanIssuer,
+        ) -> Result<DynNativeProjectionScan, NativeProjectionSourceError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(EmptyNativeProjectionScan {
+                issuer,
+                observed_complete: false,
+            }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl NativeMetadataEffectAdapter for NativeMetadataProbe {
+        fn agent_kind(&self) -> AgentKind {
+            AgentKind::ClaudeCode
+        }
+
+        async fn prepare_native_metadata_effect(
+            &self,
+            _request: &NativeMetadataEffectRequest,
+        ) -> Result<NativeMetadataEffectSpec, NativeMetadataEffectError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            NativeMetadataEffectSpec::new("/usr/bin/true", Vec::<OsString>::new(), "/tmp")
+        }
+
+        async fn readback_native_metadata_effect(
+            &self,
+            _request: &NativeMetadataEffectRequest,
+        ) -> Result<NativeMetadataReadback, NativeMetadataEffectError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(NativeMetadataReadback::Applied)
+        }
     }
 
     #[async_trait::async_trait]
@@ -645,5 +806,119 @@ mod typed_prepare_tests {
 
         assert_eq!(error, NativeHistoryReadError::Unavailable);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn native_projection_registry_routes_only_registered_source_without_session_state() {
+        let source_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = AgentRouter::new();
+        router.register(Arc::new(PrepareProbeAgent {
+            kind: AgentKind::ClaudeCode,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        router.register_native_projection_source(Arc::new(NativeProjectionProbe {
+            calls: Arc::clone(&source_calls),
+        }));
+        let generation = [0x63; 16];
+        let mut scan = router
+            .begin_native_projection_scan(AgentKind::ClaudeCode, generation)
+            .expect("registered CC projector source starts");
+        assert!(matches!(
+            scan.next().expect("empty source reaches EOF"),
+            NativeProjectionStep::Complete
+        ));
+        assert_eq!(
+            scan.into_completed()
+                .expect("observed EOF creates witness")
+                .into_parts(),
+            (generation, 0, 0)
+        );
+        assert_eq!(source_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(router.active_session_count().await, 0);
+
+        assert_eq!(
+            router
+                .begin_native_projection_scan(AgentKind::ClaudeCode, [0; 16])
+                .err()
+                .expect("zero generation fails before source"),
+            NativeProjectionSourceError::InvalidGeneration
+        );
+        assert_eq!(source_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn codex_and_unregistered_agent_have_typed_unavailable_projection_source() {
+        let mut codex = AgentRouter::new();
+        codex.register(Arc::new(PrepareProbeAgent {
+            kind: AgentKind::Codex,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        assert_eq!(
+            codex
+                .begin_native_projection_scan(AgentKind::Codex, [0x64; 16])
+                .err()
+                .expect("registered Codex has no native projector backend"),
+            NativeProjectionSourceError::Unavailable
+        );
+        assert_eq!(
+            AgentRouter::new()
+                .begin_native_projection_scan(AgentKind::ClaudeCode, [0x65; 16])
+                .err()
+                .expect("unregistered adapter has no native projector backend"),
+            NativeProjectionSourceError::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn native_metadata_registry_routes_and_keeps_no_session_state() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = AgentRouter::new();
+        router.register(Arc::new(PrepareProbeAgent {
+            kind: AgentKind::ClaudeCode,
+            calls: agent_calls,
+        }));
+        router.register_native_metadata_effect_adapter(Arc::new(NativeMetadataProbe {
+            calls: Arc::clone(&calls),
+        }));
+        let request = NativeMetadataEffectRequest::new(
+            adapter_state(0x71),
+            ConversationMetadataMutation::rename(Some("renamed".into())).unwrap(),
+        );
+
+        let spec = router
+            .prepare_native_metadata_effect(AgentKind::ClaudeCode, &request)
+            .await
+            .expect("registered CC metadata adapter prepares");
+        assert_eq!(spec.parts().0, Path::new("/usr/bin/true"));
+        assert_eq!(
+            router
+                .readback_native_metadata_effect(AgentKind::ClaudeCode, &request)
+                .await,
+            Ok(NativeMetadataReadback::Applied)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(router.active_session_count().await, 0);
+
+        let unregistered = AgentRouter::new();
+        assert_eq!(
+            unregistered
+                .prepare_native_metadata_effect(AgentKind::Codex, &request)
+                .await
+                .expect_err("unregistered agent is unavailable"),
+            NativeMetadataEffectError::Unavailable
+        );
+        let mut codex = AgentRouter::new();
+        codex.register(Arc::new(PrepareProbeAgent {
+            kind: AgentKind::Codex,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        assert_eq!(
+            codex
+                .readback_native_metadata_effect(AgentKind::Codex, &request)
+                .await
+                .expect_err("registered Codex has no native metadata seam"),
+            NativeMetadataEffectError::Unavailable
+        );
     }
 }

@@ -39,8 +39,11 @@
 use crate::agent::{
     AdapterStateHandle, Agent, AgentEventSender, AgentSessionHandle, AgentTurnRequest,
     CanonicalAgentEvent, CanonicalAgentEventSender, CanonicalAgentSessionHandle,
-    CanonicalHistoryRead, CanonicalNativeHistoryRead, ExecSpec, NativeHistoryReadError,
-    NativeHistoryReader, PrepareAdapterTurnCapability, PreparedAgentTurn,
+    CanonicalHistoryRead, CanonicalNativeHistoryRead, DynNativeProjectionScan, ExecSpec,
+    NativeHistoryReadError, NativeHistoryReader, NativeMetadataEffectAdapter,
+    NativeMetadataEffectError, NativeMetadataEffectRequest, NativeMetadataEffectSpec,
+    NativeMetadataReadback, NativeProjectionScanIssuer, NativeProjectionSource,
+    NativeProjectionSourceError, PrepareAdapterTurnCapability, PreparedAgentTurn,
 };
 use crate::claude_code::driver::ClaudeCodePreparedTurn;
 use crate::claude_code::state::ClaudeCodeStateRepository;
@@ -1244,23 +1247,15 @@ impl Agent for ClaudeCodeAdapter {
                 let resp = history::read_history(&thread_id).await?;
                 Ok(HistoryResponse::Read(resp))
             }
-            HistoryRequest::Archive { thread_id, .. } => {
-                history::archive(&thread_id).await?;
-                Ok(HistoryResponse::Ack)
-            }
-            HistoryRequest::Unarchive { .. } => {
-                // CC: `claude rm` is soft; --resume always finds the
-                // jsonl back. Unarchive is therefore a guaranteed
-                // no-op — return Ack so the UI can fold the action
-                // away without surfacing an error.
-                Ok(HistoryResponse::Ack)
-            }
-            HistoryRequest::Rename {
-                thread_id, title, ..
-            } => {
-                history::rename(&thread_id, &title).await?;
-                Ok(HistoryResponse::Ack)
-            }
+            HistoryRequest::Archive { .. }
+            | HistoryRequest::Unarchive { .. }
+            | HistoryRequest::Rename { .. } => Err(ProtocolError {
+                code: "cc-history-mutation-requires-runtime-gate".into(),
+                message:
+                    "native history mutation is only available through the Runtime metadata gate"
+                        .into(),
+                diagnostic_ref: None,
+            }),
         }
     }
 
@@ -1283,6 +1278,128 @@ impl Agent for ClaudeCodeAdapter {
             }
         }
         Ok(())
+    }
+}
+
+impl NativeProjectionSource for ClaudeCodeAdapter {
+    fn agent_kind(&self) -> AgentKind {
+        AgentKind::ClaudeCode
+    }
+
+    fn begin_native_projection_scan(
+        &self,
+        issuer: NativeProjectionScanIssuer,
+    ) -> Result<DynNativeProjectionScan, NativeProjectionSourceError> {
+        let default_configuration = self
+            .default_configuration()
+            .map_err(|_| NativeProjectionSourceError::InvalidSource)?;
+        crate::claude_code::history::begin_native_projection_scan(default_configuration, issuer)
+    }
+}
+
+#[async_trait::async_trait]
+impl NativeMetadataEffectAdapter for ClaudeCodeAdapter {
+    fn agent_kind(&self) -> AgentKind {
+        AgentKind::ClaudeCode
+    }
+
+    async fn prepare_native_metadata_effect(
+        &self,
+        request: &NativeMetadataEffectRequest,
+    ) -> Result<NativeMetadataEffectSpec, NativeMetadataEffectError> {
+        let title = required_native_rename_title(request)?;
+        let repository = self
+            .state_repository
+            .as_ref()
+            .ok_or(NativeMetadataEffectError::Unavailable)?;
+        let verified = crate::claude_code::history::read_native_projection_metadata(
+            repository,
+            request.parts().0.key(),
+        )
+        .await
+        .map_err(classify_native_metadata_prepare_error)?;
+        let (resume_thread_id, cwd, _current_title) = verified.into_parts();
+        let program = crate::exec_gate::resolve_trusted_program("claude")
+            .ok_or(NativeMetadataEffectError::ProgramUnavailable)?;
+        prepare_cc_native_metadata_spec(program, resume_thread_id, cwd, title)
+    }
+
+    async fn readback_native_metadata_effect(
+        &self,
+        request: &NativeMetadataEffectRequest,
+    ) -> Result<NativeMetadataReadback, NativeMetadataEffectError> {
+        let expected_title = required_native_rename_title(request)?;
+        let repository = self
+            .state_repository
+            .as_ref()
+            .ok_or(NativeMetadataEffectError::Unavailable)?;
+        let verified = crate::claude_code::history::read_native_projection_metadata(
+            repository,
+            request.parts().0.key(),
+        )
+        .await
+        .map(|verified| verified.into_parts().2);
+        Ok(classify_cc_native_metadata_readback(
+            expected_title,
+            verified,
+        ))
+    }
+}
+
+fn required_native_rename_title(
+    request: &NativeMetadataEffectRequest,
+) -> Result<&str, NativeMetadataEffectError> {
+    match request.parts().1 {
+        agentdeck_protocol::runtime::ConversationMetadataMutation::Rename {
+            title: Some(title),
+        } => Ok(title),
+        _ => Err(NativeMetadataEffectError::Unsupported),
+    }
+}
+
+#[allow(dead_code, reason = "C-e2 coordinator invokes the adapter seam")]
+fn prepare_cc_native_metadata_spec(
+    program: impl Into<std::path::PathBuf>,
+    resume_thread_id: ThreadId,
+    cwd: impl Into<std::path::PathBuf>,
+    title: &str,
+) -> Result<NativeMetadataEffectSpec, NativeMetadataEffectError> {
+    NativeMetadataEffectSpec::new(
+        program,
+        [
+            OsString::from("--print"),
+            OsString::from("--resume"),
+            OsString::from(resume_thread_id.0),
+            OsString::from("-n"),
+            OsString::from(title),
+            OsString::from("--output-format"),
+            OsString::from("stream-json"),
+            OsString::from("--input-format"),
+            OsString::from("stream-json"),
+            OsString::from("--verbose"),
+        ],
+        cwd,
+    )
+}
+
+#[allow(dead_code, reason = "C-e2 coordinator invokes the adapter seam")]
+fn classify_cc_native_metadata_readback(
+    expected_title: &str,
+    source: Result<Option<String>, ProtocolError>,
+) -> NativeMetadataReadback {
+    match source {
+        Ok(Some(actual)) if actual == expected_title => NativeMetadataReadback::Applied,
+        Ok(_) | Err(_) => NativeMetadataReadback::Unknown,
+    }
+}
+
+#[allow(dead_code, reason = "C-e2 coordinator invokes the adapter seam")]
+fn classify_native_metadata_prepare_error(error: ProtocolError) -> NativeMetadataEffectError {
+    match classify_native_history_read_error(error) {
+        NativeHistoryReadError::Unavailable => NativeMetadataEffectError::Unavailable,
+        NativeHistoryReadError::PayloadTooLarge
+        | NativeHistoryReadError::InvalidSource
+        | NativeHistoryReadError::ReadUnavailable => NativeMetadataEffectError::InvalidSource,
     }
 }
 
@@ -1324,6 +1441,8 @@ fn classify_native_history_read_error(error: ProtocolError) -> NativeHistoryRead
         | "cc-history-native-malformed"
         | "cc-history-native-key-invalid"
         | "cc-history-native-duplicate-key"
+        | "cc-history-native-metadata-invalid"
+        | "cc-history-native-metadata-ambiguous"
         | "cc-history-native-entry-invalid" => NativeHistoryReadError::InvalidSource,
         "cc-history-native-home-unavailable"
         | "cc-history-native-source-unavailable"
@@ -1480,6 +1599,99 @@ mod tests {
     use std::task::{Context, Poll};
     use tokio::io::AsyncWriteExt;
     use tokio::io::{AsyncReadExt, AsyncWrite};
+
+    fn metadata_request(
+        seed: u8,
+        mutation: agentdeck_protocol::runtime::ConversationMetadataMutation,
+    ) -> NativeMetadataEffectRequest {
+        let key = RuntimeId::from_bytes(RuntimeIdKind::AdapterState, [seed; 16]).unwrap();
+        NativeMetadataEffectRequest::new(AdapterStateHandle::new(key).unwrap(), mutation)
+    }
+
+    #[tokio::test]
+    async fn native_metadata_rejects_clear_title_archive_and_unarchive_before_vault_or_effect() {
+        let adapter = ClaudeCodeAdapter::new_for_test();
+        for mutation in [
+            agentdeck_protocol::runtime::ConversationMetadataMutation::rename(None).unwrap(),
+            agentdeck_protocol::runtime::ConversationMetadataMutation::SetArchived {
+                archived: true,
+            },
+            agentdeck_protocol::runtime::ConversationMetadataMutation::SetArchived {
+                archived: false,
+            },
+        ] {
+            let request = metadata_request(0xB1, mutation);
+            assert_eq!(
+                adapter
+                    .prepare_native_metadata_effect(&request)
+                    .await
+                    .expect_err("unsupported mutation must fail before vault read"),
+                NativeMetadataEffectError::Unsupported
+            );
+            assert_eq!(
+                adapter
+                    .readback_native_metadata_effect(&request)
+                    .await
+                    .expect_err("unsupported readback must fail before source read"),
+                NativeMetadataEffectError::Unsupported
+            );
+        }
+    }
+
+    #[test]
+    fn native_metadata_rename_argv_is_exact_and_debug_is_redacted() {
+        let private_session = "10000000-0000-4000-8000-private-session";
+        let private_title = "private title sentinel";
+        let spec = prepare_cc_native_metadata_spec(
+            "/private/bin/claude",
+            ThreadId(private_session.into()),
+            "/private/native/cwd",
+            private_title,
+        )
+        .expect("bounded metadata spec");
+        assert_eq!(
+            spec.parts().1,
+            [
+                "--print",
+                "--resume",
+                private_session,
+                "-n",
+                private_title,
+                "--output-format",
+                "stream-json",
+                "--input-format",
+                "stream-json",
+                "--verbose",
+            ]
+            .map(OsString::from)
+        );
+        let debug = format!("{spec:?}");
+        for sentinel in [private_session, private_title, "/private/native/cwd"] {
+            assert!(!debug.contains(sentinel));
+        }
+    }
+
+    #[test]
+    fn native_metadata_readback_only_proves_exact_title_and_never_guesses_failed() {
+        assert_eq!(
+            classify_cc_native_metadata_readback("target", Ok(Some("target".into()))),
+            NativeMetadataReadback::Applied
+        );
+        for source in [
+            Ok(None),
+            Ok(Some("different".into())),
+            Err(ProtocolError {
+                code: "cc-history-native-too-large".into(),
+                message: "private source sentinel".into(),
+                diagnostic_ref: None,
+            }),
+        ] {
+            assert_eq!(
+                classify_cc_native_metadata_readback("target", source),
+                NativeMetadataReadback::Unknown
+            );
+        }
+    }
 
     #[derive(Clone, Copy)]
     enum WriteFault {

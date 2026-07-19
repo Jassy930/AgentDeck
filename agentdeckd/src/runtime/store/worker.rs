@@ -58,8 +58,10 @@ use super::identity::{
     MAX_RUNTIME_ID_COLLISION_ATTEMPTS, RuntimeId, RuntimeIdError, RuntimeIdKind,
 };
 use super::metadata::{
-    self, PreparedMetadataMutationRequest, UpdateConversationMetadataOutcome,
-    UpdateManagedConversationMetadata,
+    self, ClaimNativeMetadataMutationOutcome, NativeMetadataMutationClaim,
+    NativeMetadataMutationReadback, NativeMetadataMutationRecoveryCursor,
+    NativeMetadataMutationRecoveryPage, PreparedMetadataMutationRequest,
+    UpdateConversationMetadataOutcome, UpdateManagedConversationMetadata,
 };
 use super::publication::{
     FreezePublicationRequest, FrozenPublication, PublicationAcknowledgement, PublicationBarrierCut,
@@ -96,13 +98,10 @@ const IDENTITY_DERIVATION_ROOT_DOMAIN: &[u8] =
     b"agentdeck.runtime.storage-kek.identity-derivation.v1";
 const CONVERSATION_ID_DOMAIN: &[u8] = b"agentdeck.runtime.conversation-id.v1";
 const ADAPTER_STATE_KEY_DOMAIN: &[u8] = b"agentdeck.runtime.adapter-state-key.v1";
-#[allow(dead_code)] // C-f projector lifecycle 接线后由 production capability 使用。
 const NATIVE_PROJECTION_CONVERSATION_ID_DOMAIN: &[u8] =
     b"agentdeck.runtime.native-projection.conversation-id.v1";
-#[allow(dead_code)] // C-f projector lifecycle 接线后由 production capability 使用。
 const NATIVE_PROJECTION_ADAPTER_STATE_KEY_DOMAIN: &[u8] =
     b"agentdeck.runtime.native-projection.adapter-state-key.v1";
-#[allow(dead_code)] // C-f projector lifecycle 接线后由 production capability 使用。
 const NATIVE_PROJECTION_OBSERVATION_DOMAIN: &[u8] =
     b"agentdeck.runtime.native-projection.observation.v1";
 const NATIVE_HISTORY_COMMAND_ID_DOMAIN: &[u8] = b"agentdeck.runtime.native-history.command-id.v1";
@@ -246,7 +245,6 @@ impl RuntimeIdentityDerivationCapability {
         Ok(bytes)
     }
 
-    #[allow(dead_code)] // C-f verified source 接线后成为 production derivation path。
     fn derive_native_projection_material(
         &self,
         namespace: AdapterStateNamespace,
@@ -311,7 +309,6 @@ impl RuntimeIdentityDerivationCapability {
         Ok((candidates, observation_token))
     }
 
-    #[allow(dead_code)] // 仅由上面的 C-f bounded pair derivation 调用。
     fn derive_native_projection_id(
         &self,
         kind: RuntimeIdKind,
@@ -551,13 +548,11 @@ pub(crate) struct ClaudeCodeAdapterStateVault {
 ///
 /// 调用方不能选择 namespace，也不能取得通用明文 vault writer；所有导入都经单个
 /// Store worker command 与一个 SQLite transaction 收口。
-#[allow(dead_code)] // C-f Core projector lifecycle 接线后持有该 capability。
 #[derive(Clone, Debug)]
 pub(crate) struct ClaudeCodeNativeProjectionStore {
     store: RuntimeStoreHandle,
 }
 
-#[allow(dead_code)] // C-f Core projector lifecycle 接线后成为 production API。
 impl ClaudeCodeNativeProjectionStore {
     pub(crate) async fn import(
         &self,
@@ -568,14 +563,14 @@ impl ClaudeCodeNativeProjectionStore {
             .await
     }
 
-    /// C-f 只能在消费 `CompletedNativeScan` witness 后调用本入口；裸 generation
+    /// C-f 只能在消费 neutral `CompletedNativeProjectionScan` witness 后调用本入口；裸 generation
     /// 不进入 reconciliation plan/apply API。
     pub(crate) async fn accept_completed_scan(
         &self,
-        completed: crate::claude_code::history::CompletedNativeScan,
+        completed: crate::agent::CompletedNativeProjectionScan,
     ) -> Result<Arc<native_projection::CompletedNativeProjectionGeneration>, RuntimeStoreError>
     {
-        let scan_generation = completed.into_generation();
+        let (scan_generation, _inspected_candidates, _imported_candidates) = completed.into_parts();
         let epoch_source = self.store.native_projection_scan_epoch.clone();
         dispatch(
             &self.store.read_tx,
@@ -897,7 +892,6 @@ impl RuntimeStoreHandle {
         }
     }
 
-    #[allow(dead_code)] // C-f Core projector lifecycle 接线后签发 capability。
     pub(in crate::runtime) fn claude_code_native_projection_store(
         &self,
     ) -> ClaudeCodeNativeProjectionStore {
@@ -906,7 +900,6 @@ impl RuntimeStoreHandle {
         }
     }
 
-    #[allow(dead_code)] // C-f verified source 接线后提交 normal worker command。
     async fn import_native_projection(
         &self,
         namespace: AdapterStateNamespace,
@@ -1107,6 +1100,255 @@ impl RuntimeStoreHandle {
                 authorization,
                 reply,
             },
+        )
+        .await?
+    }
+
+    pub(in crate::runtime) async fn claim_native_conversation_metadata(
+        &self,
+        input: UpdateManagedConversationMetadata,
+    ) -> Result<ClaimNativeMetadataMutationOutcome, RuntimeStoreError> {
+        let prepared = metadata::prepare_metadata_mutation_request(input)?;
+        let charge = memory_charge(size_of::<NormalCommand>(), &[prepared.retained_capacity()?])?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::ClaimNativeMetadataMutation { prepared, reply },
+        )
+        .await?
+    }
+
+    pub(in crate::runtime) async fn fail_claimed_native_metadata_mutation(
+        &self,
+        mutation: NativeMetadataMutationClaim,
+        failure: agentdeck_protocol::runtime::RuntimeFailure,
+    ) -> Result<UpdateConversationMetadataOutcome, RuntimeStoreError> {
+        let charge = memory_charge(
+            size_of::<SafetyCommand>(),
+            &[
+                failure.code.capacity(),
+                failure.message.capacity(),
+                failure.diagnostic_ref.as_ref().map_or(0, String::capacity),
+            ],
+        )?;
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            charge,
+            |reply| SafetyCommand::FailClaimedNativeMetadataMutation {
+                mutation,
+                failure,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub(in crate::runtime) async fn mark_native_metadata_mutation_outcome_unknown(
+        &self,
+        mutation: NativeMetadataMutationClaim,
+    ) -> Result<NativeMetadataMutationClaim, RuntimeStoreError> {
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::MarkNativeMetadataMutationOutcomeUnknown { mutation, reply },
+        )
+        .await?
+    }
+
+    pub(in crate::runtime) async fn finalize_native_metadata_mutation_readback(
+        &self,
+        mutation: NativeMetadataMutationClaim,
+        readback: NativeMetadataMutationReadback,
+    ) -> Result<UpdateConversationMetadataOutcome, RuntimeStoreError> {
+        let retained = match &readback {
+            NativeMetadataMutationReadback::Applied { observed_title } => {
+                observed_title.as_ref().map_or(0, String::capacity)
+            }
+            NativeMetadataMutationReadback::Failed { failure } => failure
+                .code
+                .capacity()
+                .checked_add(failure.message.capacity())
+                .and_then(|value| {
+                    value.checked_add(failure.diagnostic_ref.as_ref().map_or(0, String::capacity))
+                })
+                .ok_or(RuntimeStoreError::PayloadTooLarge)?,
+            NativeMetadataMutationReadback::Inconclusive => 0,
+        };
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[retained])?,
+            |reply| SafetyCommand::FinalizeNativeMetadataMutationReadback {
+                mutation,
+                readback,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub(in crate::runtime) async fn load_active_native_metadata_mutations(
+        &self,
+        cursor: Option<NativeMetadataMutationRecoveryCursor>,
+    ) -> Result<NativeMetadataMutationRecoveryPage, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::LoadActiveNativeMetadataMutations { cursor, reply },
+        )
+        .await?
+    }
+
+    pub(in crate::runtime) async fn load_native_metadata_effect_recovery_record(
+        &self,
+        mutation: NativeMetadataMutationClaim,
+    ) -> Result<native_projection::NativeMetadataEffectRecoveryRecord, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::LoadNativeMetadataEffectRecoveryRecord { mutation, reply },
+        )
+        .await?
+    }
+
+    pub(in crate::runtime) async fn persist_native_metadata_effect_fence(
+        &self,
+        input: native_projection::PersistNativeMetadataEffectFence,
+    ) -> Result<native_projection::PersistNativeMetadataEffectFenceOutcome, RuntimeStoreError> {
+        let native_projection::PersistNativeMetadataEffectFence {
+            mutation,
+            daemon_boot_id,
+            effect_nonce,
+            effect_spec,
+            process,
+        } = input;
+        let effect_nonce =
+            exact_bounded_secret_vec(effect_nonce, native_projection::MAX_EFFECT_NONCE_BYTES)?;
+        let effect_spec =
+            exact_bounded_secret_vec(effect_spec, native_projection::MAX_EFFECT_SPEC_BYTES)?;
+        let charge = memory_charge(
+            size_of::<SafetyCommand>(),
+            &[
+                mutation.retained_capacity(),
+                effect_nonce.capacity(),
+                effect_spec.capacity(),
+            ],
+        )?;
+        let input = native_projection::PersistNativeMetadataEffectFence {
+            mutation,
+            daemon_boot_id,
+            effect_nonce,
+            effect_spec,
+            process,
+        };
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            charge,
+            |reply| SafetyCommand::PersistNativeMetadataEffectFence { input, reply },
+        )
+        .await?
+    }
+
+    pub(in crate::runtime) async fn authorize_native_metadata_effect_release(
+        &self,
+        input: native_projection::AuthorizeNativeMetadataEffectRelease,
+    ) -> Result<native_projection::AuthorizeNativeMetadataEffectReleaseOutcome, RuntimeStoreError>
+    {
+        let native_projection::AuthorizeNativeMetadataEffectRelease {
+            mutation,
+            daemon_boot_id,
+            effect_nonce,
+            release_token_commitment,
+        } = input;
+        let effect_nonce =
+            exact_bounded_secret_vec(effect_nonce, native_projection::MAX_EFFECT_NONCE_BYTES)?;
+        let charge = memory_charge(
+            size_of::<SafetyCommand>(),
+            &[mutation.retained_capacity(), effect_nonce.capacity()],
+        )?;
+        let input = native_projection::AuthorizeNativeMetadataEffectRelease {
+            mutation,
+            daemon_boot_id,
+            effect_nonce,
+            release_token_commitment,
+        };
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            charge,
+            |reply| SafetyCommand::AuthorizeNativeMetadataEffectRelease { input, reply },
+        )
+        .await?
+    }
+
+    pub(in crate::runtime) async fn fail_unreleased_native_metadata_effect(
+        &self,
+        input: native_projection::FailUnreleasedNativeMetadataEffect,
+    ) -> Result<UpdateConversationMetadataOutcome, RuntimeStoreError> {
+        let native_projection::FailUnreleasedNativeMetadataEffect {
+            cleanup_authority,
+            mutation,
+            daemon_boot_id,
+            effect_nonce,
+            effect_spec,
+            process,
+            failure,
+        } = input;
+        let effect_nonce =
+            exact_bounded_secret_vec(effect_nonce, native_projection::MAX_EFFECT_NONCE_BYTES)?;
+        let effect_spec =
+            exact_bounded_secret_vec(effect_spec, native_projection::MAX_EFFECT_SPEC_BYTES)?;
+        let retained_failure = failure
+            .code
+            .capacity()
+            .checked_add(failure.message.capacity())
+            .and_then(|value| {
+                value.checked_add(failure.diagnostic_ref.as_ref().map_or(0, String::capacity))
+            })
+            .ok_or(RuntimeStoreError::PayloadTooLarge)?;
+        let charge = memory_charge(
+            size_of::<SafetyCommand>(),
+            &[
+                mutation.retained_capacity(),
+                effect_nonce.capacity(),
+                effect_spec.capacity(),
+                retained_failure,
+            ],
+        )?;
+        let input = native_projection::FailUnreleasedNativeMetadataEffect {
+            cleanup_authority,
+            mutation,
+            daemon_boot_id,
+            effect_nonce,
+            effect_spec,
+            process,
+            failure,
+        };
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            charge,
+            |reply| SafetyCommand::FailUnreleasedNativeMetadataEffect { input, reply },
         )
         .await?
     }
@@ -1805,6 +2047,20 @@ fn map_try_send<T>(
     }
 }
 
+fn exact_bounded_secret_vec(
+    mut value: Vec<u8>,
+    maximum: usize,
+) -> Result<Vec<u8>, RuntimeStoreError> {
+    validate_nonempty_maximum(&value, maximum)?;
+    let mut exact = Vec::new();
+    exact
+        .try_reserve_exact(value.len())
+        .map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    exact.extend_from_slice(&value);
+    value.zeroize();
+    Ok(exact)
+}
+
 struct Queued<C> {
     command: C,
     memory_permit: OwnedSemaphorePermit,
@@ -1844,7 +2100,6 @@ impl AcceptCommandReply {
 }
 
 enum NormalCommand {
-    #[allow(dead_code)] // C-f projector lifecycle 接线后由 production handle 构造。
     ImportNativeProjection {
         prepared: native_projection::PreparedNativeProjectionImport,
         epoch_source: Arc<AtomicU64>,
@@ -1879,6 +2134,10 @@ enum NormalCommand {
         prepared: PreparedMetadataMutationRequest,
         authorization: Option<AuthorizationGuard>,
         reply: oneshot::Sender<Result<UpdateConversationMetadataOutcome, RuntimeStoreError>>,
+    },
+    ClaimNativeMetadataMutation {
+        prepared: PreparedMetadataMutationRequest,
+        reply: oneshot::Sender<Result<ClaimNativeMetadataMutationOutcome, RuntimeStoreError>>,
     },
     AcceptCommand {
         input: AcceptCommand,
@@ -1964,6 +2223,25 @@ enum SafetyCommand {
         input: AuthorizeExecutionRelease,
         reply: oneshot::Sender<Result<ExecutionFenceRecord, RuntimeStoreError>>,
     },
+    PersistNativeMetadataEffectFence {
+        input: native_projection::PersistNativeMetadataEffectFence,
+        reply: oneshot::Sender<
+            Result<native_projection::PersistNativeMetadataEffectFenceOutcome, RuntimeStoreError>,
+        >,
+    },
+    AuthorizeNativeMetadataEffectRelease {
+        input: native_projection::AuthorizeNativeMetadataEffectRelease,
+        reply: oneshot::Sender<
+            Result<
+                native_projection::AuthorizeNativeMetadataEffectReleaseOutcome,
+                RuntimeStoreError,
+            >,
+        >,
+    },
+    FailUnreleasedNativeMetadataEffect {
+        input: native_projection::FailUnreleasedNativeMetadataEffect,
+        reply: oneshot::Sender<Result<UpdateConversationMetadataOutcome, RuntimeStoreError>>,
+    },
     CompleteCommand {
         input: CompleteCommand,
         reply: oneshot::Sender<Result<CompleteOutcome, RuntimeStoreError>>,
@@ -1975,6 +2253,20 @@ enum SafetyCommand {
     MarkConversationRecoveryBlocked {
         input: MarkConversationRecoveryBlocked,
         reply: oneshot::Sender<Result<ConversationRecord, RuntimeStoreError>>,
+    },
+    FailClaimedNativeMetadataMutation {
+        mutation: NativeMetadataMutationClaim,
+        failure: agentdeck_protocol::runtime::RuntimeFailure,
+        reply: oneshot::Sender<Result<UpdateConversationMetadataOutcome, RuntimeStoreError>>,
+    },
+    MarkNativeMetadataMutationOutcomeUnknown {
+        mutation: NativeMetadataMutationClaim,
+        reply: oneshot::Sender<Result<NativeMetadataMutationClaim, RuntimeStoreError>>,
+    },
+    FinalizeNativeMetadataMutationReadback {
+        mutation: NativeMetadataMutationClaim,
+        readback: NativeMetadataMutationReadback,
+        reply: oneshot::Sender<Result<UpdateConversationMetadataOutcome, RuntimeStoreError>>,
     },
     TerminateAccepted {
         input: TerminateAcceptedCommand,
@@ -2056,6 +2348,16 @@ enum ReadCommand {
         namespace: AdapterStateNamespace,
         adapter_state_key: super::RuntimeId,
         reply: oneshot::Sender<Result<Option<SecretBytes>, RuntimeStoreError>>,
+    },
+    LoadActiveNativeMetadataMutations {
+        cursor: Option<NativeMetadataMutationRecoveryCursor>,
+        reply: oneshot::Sender<Result<NativeMetadataMutationRecoveryPage, RuntimeStoreError>>,
+    },
+    LoadNativeMetadataEffectRecoveryRecord {
+        mutation: NativeMetadataMutationClaim,
+        reply: oneshot::Sender<
+            Result<native_projection::NativeMetadataEffectRecoveryRecord, RuntimeStoreError>,
+        >,
     },
     QueryCommandReceipt {
         input: QueryCommandReceipt,
@@ -2376,6 +2678,9 @@ fn handle_normal(
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
                 drop(authorization);
             }
+            NormalCommand::ClaimNativeMetadataMutation { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
             NormalCommand::AcceptCommand { reply, .. } => {
                 reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
@@ -2511,6 +2816,13 @@ fn handle_normal(
             let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
             let _ = reply.send(result);
             drop(authorization);
+        }
+        NormalCommand::ClaimNativeMetadataMutation { prepared, reply } => {
+            let mut effects = CommandStreamEffects::default();
+            let result =
+                metadata::claim_native_conversation_metadata(state, config, prepared, &mut effects);
+            let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
+            let _ = reply.send(result);
         }
         NormalCommand::AcceptCommand { input, reply } => {
             let mut effects = CommandStreamEffects::default();
@@ -2688,6 +3000,15 @@ fn handle_safety(
             SafetyCommand::AuthorizeRelease { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
+            SafetyCommand::PersistNativeMetadataEffectFence { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::AuthorizeNativeMetadataEffectRelease { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::FailUnreleasedNativeMetadataEffect { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
             SafetyCommand::CompleteCommand { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
@@ -2695,6 +3016,15 @@ fn handle_safety(
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
             SafetyCommand::MarkConversationRecoveryBlocked { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::FailClaimedNativeMetadataMutation { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::MarkNativeMetadataMutationOutcomeUnknown { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::FinalizeNativeMetadataMutationReadback { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
             SafetyCommand::TerminateAccepted { reply, .. } => {
@@ -2734,6 +3064,27 @@ fn handle_safety(
         SafetyCommand::AuthorizeRelease { input, reply } => {
             let _ = reply.send(journal::authorize_execution_release(state, config, input));
         }
+        SafetyCommand::PersistNativeMetadataEffectFence { input, reply } => {
+            let _ = reply.send(native_projection::persist_native_metadata_effect_fence(
+                state, config, input,
+            ));
+        }
+        SafetyCommand::AuthorizeNativeMetadataEffectRelease { input, reply } => {
+            let _ = reply.send(native_projection::authorize_native_metadata_effect_release(
+                state, config, input,
+            ));
+        }
+        SafetyCommand::FailUnreleasedNativeMetadataEffect { input, reply } => {
+            let mut effects = CommandStreamEffects::default();
+            let result = native_projection::fail_unreleased_native_metadata_effect(
+                state,
+                config,
+                input,
+                &mut effects,
+            );
+            let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
+            let _ = reply.send(result);
+        }
         SafetyCommand::CompleteCommand { input, reply } => {
             let mut effects = CommandStreamEffects::default();
             let result = journal::complete_command_with_event(state, config, input, &mut effects);
@@ -2751,6 +3102,43 @@ fn handle_safety(
             let _ = reply.send(journal::mark_conversation_recovery_blocked(
                 state, config, input,
             ));
+        }
+        SafetyCommand::FailClaimedNativeMetadataMutation {
+            mutation,
+            failure,
+            reply,
+        } => {
+            let mut effects = CommandStreamEffects::default();
+            let result = metadata::fail_claimed_native_metadata_mutation(
+                state,
+                config,
+                mutation,
+                failure,
+                &mut effects,
+            );
+            let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
+            let _ = reply.send(result);
+        }
+        SafetyCommand::MarkNativeMetadataMutationOutcomeUnknown { mutation, reply } => {
+            let _ = reply.send(metadata::mark_native_metadata_mutation_outcome_unknown(
+                state, config, mutation,
+            ));
+        }
+        SafetyCommand::FinalizeNativeMetadataMutationReadback {
+            mutation,
+            readback,
+            reply,
+        } => {
+            let mut effects = CommandStreamEffects::default();
+            let result = metadata::finalize_native_metadata_mutation_readback(
+                state,
+                config,
+                mutation,
+                readback,
+                &mut effects,
+            );
+            let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
+            let _ = reply.send(result);
         }
         SafetyCommand::TerminateAccepted { input, reply } => {
             let mut effects = CommandStreamEffects::default();
@@ -2958,6 +3346,24 @@ fn handle_read(
                 namespace,
                 adapter_state_key,
             ));
+        }
+        ReadCommand::LoadActiveNativeMetadataMutations { cursor, reply } => {
+            let _ = reply.send(metadata::load_active_native_metadata_mutations(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+                cursor,
+            ));
+        }
+        ReadCommand::LoadNativeMetadataEffectRecoveryRecord { mutation, reply } => {
+            let _ = reply.send(
+                native_projection::load_native_metadata_effect_recovery_record(
+                    &state.connection,
+                    &state.key_bundle,
+                    state.database_id,
+                    &mutation,
+                ),
+            );
         }
         ReadCommand::QueryCommandReceipt { input, reply } => {
             let _ = reply.send(journal::query_command_receipt(state, input));

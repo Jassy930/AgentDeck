@@ -8,18 +8,22 @@ use agentdeck_protocol::runtime::failure::{
 };
 use agentdeck_protocol::runtime::{
     ClaudeCodeConversationConfiguration, ConversationConfiguration, QueryReceiptSelector,
-    RuntimeFailure, VendorConfigurationSnapshot,
+    RuntimeFailure, RuntimeTransferChannel, TransferProgress, TransferReassembler,
+    VendorConfigurationSnapshot,
 };
 use agentdeck_protocol::{AgentItem, AgentItemMeta, AgentKind, ClaudeCodePermissionMode};
 use rusqlite::{Connection, OpenFlags};
 use tokio::sync::{Notify, Semaphore};
+use tokio::time::Instant;
 
 use crate::agent::{
     CanonicalNativeHistoryItem, CanonicalNativeHistoryRead, NativeHistoryReadError,
-    NativeHistoryReader, NativeItemKey, NativeTurnKey,
+    NativeHistoryReader, NativeItemKey, NativeProjectionStep, NativeTurnKey,
+    native_projection_scan_issuer_for_test,
 };
 use crate::runtime::store::{
     ConversationDescriptor, ImportNativeProjection, ImportNativeProjectionOutcome, RuntimeId,
+    SnapshotOrigin,
 };
 use crate::security::SecretBytes;
 
@@ -474,6 +478,240 @@ fn projected_identities(snapshot: &ConversationSnapshot) -> Vec<ProjectedIdentit
         .collect()
 }
 
+enum RealDynamicAttempt {
+    Snapshot {
+        snapshot: ConversationSnapshot,
+        reassembled_transfer: bool,
+    },
+    TypedFailure,
+}
+
+async fn receive_real_dynamic_envelope(
+    receiver: &mut mpsc::Receiver<crate::runtime::ConnectionWrite>,
+    global_deadline: Instant,
+) -> Result<RuntimeEnvelope, &'static str> {
+    let frame_deadline = std::cmp::min(global_deadline, Instant::now() + Duration::from_secs(2));
+    let write = tokio::time::timeout_at(frame_deadline, receiver.recv())
+        .await
+        .map_err(|_| "real Dynamic candidate reply timed out")?
+        .ok_or("real Dynamic candidate writer closed")?;
+    let decoded = serde_json::from_slice(write.bytes());
+    write
+        .acknowledge()
+        .map_err(|_| "real Dynamic candidate reply ACK failed")?;
+    decoded.map_err(|_| "real Dynamic candidate reply was not a Runtime envelope")
+}
+
+async fn wait_for_zero_dynamic_pins_result(core: &RuntimeCore) -> Result<(), &'static str> {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let count = core
+                .store
+                .active_snapshot_build_pin_count_for_test()
+                .await
+                .map_err(|_| "count real Dynamic TEMP pins failed")?;
+            if count == 0 {
+                return Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| "real Dynamic TEMP pin cleanup timed out")?
+}
+
+async fn try_real_dynamic_snapshot(
+    core: &RuntimeCore,
+    conversation_id: RuntimeId,
+    owner_seed: u8,
+    message: &str,
+    global_deadline: Instant,
+) -> Result<RealDynamicAttempt, &'static str> {
+    let (connection, mut receiver) = connect_recording(core, owner_seed).await;
+    let attempt = async {
+        tokio::time::timeout_at(
+            global_deadline,
+            core.handle_envelope(
+                connection,
+                subscribe_conversation_envelope(message, conversation_id),
+            ),
+        )
+        .await
+        .map_err(|_| "start real Dynamic candidate subscription timed out")?
+        .map_err(|_| "start real Dynamic candidate subscription failed")?;
+        if !matches!(
+            receive_real_dynamic_envelope(&mut receiver, global_deadline)
+                .await?
+                .body,
+            RuntimeMessage::Reply(RuntimeReply::Subscription(
+                SubscriptionReceipt::Subscribed { .. }
+            ))
+        ) {
+            return Err("real Dynamic candidate did not return a subscription receipt");
+        }
+
+        match receive_real_dynamic_envelope(&mut receiver, global_deadline)
+            .await?
+            .body
+        {
+            RuntimeMessage::Reply(RuntimeReply::Snapshot(snapshot)) => {
+                match receive_real_dynamic_envelope(&mut receiver, global_deadline)
+                    .await?
+                    .body
+                {
+                    RuntimeMessage::Reply(RuntimeReply::SyncComplete(_)) => {
+                        Ok(RealDynamicAttempt::Snapshot {
+                            snapshot,
+                            reassembled_transfer: false,
+                        })
+                    }
+                    RuntimeMessage::Reply(RuntimeReply::Failure(_)) => {
+                        Ok(RealDynamicAttempt::TypedFailure)
+                    }
+                    _ => Err("real Dynamic snapshot did not terminate with SyncComplete"),
+                }
+            }
+            RuntimeMessage::Reply(RuntimeReply::Failure(_)) => Ok(RealDynamicAttempt::TypedFailure),
+            RuntimeMessage::Reply(RuntimeReply::TransferPart(first_part)) => {
+                let transfer_started = Instant::now();
+                let mut reassembler = TransferReassembler::new();
+                let mut next_part = Some(first_part);
+                let payload = loop {
+                    let part = if let Some(first) = next_part.take() {
+                        first
+                    } else {
+                        match receive_real_dynamic_envelope(&mut receiver, global_deadline)
+                            .await?
+                            .body
+                        {
+                            RuntimeMessage::Reply(RuntimeReply::TransferPart(part)) => part,
+                            RuntimeMessage::Reply(RuntimeReply::Failure(_)) => {
+                                return Ok(RealDynamicAttempt::TypedFailure);
+                            }
+                            _ => return Err("real Dynamic transfer ended before completion"),
+                        }
+                    };
+                    let now_ms =
+                        u64::try_from(transfer_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    match reassembler
+                        .accept_json(RuntimeTransferChannel::Reply, part, now_ms)
+                        .map_err(|_| "real Dynamic transfer failed integrity validation")?
+                    {
+                        TransferProgress::InProgress { .. } => {}
+                        TransferProgress::Complete(payload) => break payload,
+                        TransferProgress::AlreadyComplete => {
+                            return Err("real Dynamic transfer completed more than once");
+                        }
+                    }
+                };
+                let snapshot: ConversationSnapshot = serde_json::from_slice(&payload)
+                    .map_err(|_| "real Dynamic transfer was not a ConversationSnapshot")?;
+                match receive_real_dynamic_envelope(&mut receiver, global_deadline)
+                    .await?
+                    .body
+                {
+                    RuntimeMessage::Reply(RuntimeReply::SyncComplete(_)) => {
+                        Ok(RealDynamicAttempt::Snapshot {
+                            snapshot,
+                            reassembled_transfer: true,
+                        })
+                    }
+                    RuntimeMessage::Reply(RuntimeReply::Failure(_)) => {
+                        Ok(RealDynamicAttempt::TypedFailure)
+                    }
+                    _ => Err("real Dynamic transfer did not terminate with SyncComplete"),
+                }
+            }
+            _ => Err("real Dynamic candidate returned an unexpected reply family"),
+        }
+    }
+    .await;
+
+    // Candidate-specific failure paths deliberately stop the remaining writer job. Every frame
+    // observed above is ACKed; disconnect owns all remaining cleanup.
+    core.disconnect(connection).await;
+    wait_for_zero_dynamic_pins_result(core).await?;
+    attempt
+}
+
+#[tokio::test]
+async fn real_dynamic_attempt_reassembles_large_snapshot_and_releases_all_pins() {
+    let root = TestRoot::new("native-dynamic-real-helper-transfer");
+    let (core, reader, conversation_id) = native_dynamic_core(&root).await;
+    reader.append(native_item(
+        0x13,
+        0x24,
+        AgentItem::AssistantMessage {
+            text: "x".repeat(MAX_JSON_PART_BYTES + 4096),
+            meta: AgentItemMeta::default(),
+        },
+    ));
+
+    let attempt = try_real_dynamic_snapshot(
+        &core,
+        conversation_id,
+        0xDA,
+        "native-dynamic-real-helper-transfer",
+        Instant::now() + Duration::from_secs(10),
+    )
+    .await
+    .expect("large Dynamic helper attempt");
+    let RealDynamicAttempt::Snapshot {
+        snapshot,
+        reassembled_transfer,
+    } = attempt
+    else {
+        panic!("large valid Dynamic snapshot must not be classified as a typed failure")
+    };
+    assert!(
+        reassembled_transfer,
+        "large Dynamic snapshot must exercise the JSON transfer reassembler"
+    );
+    assert_eq!(projected_identities(&snapshot).len(), 4);
+    assert_eq!(
+        core.store
+            .active_snapshot_build_pin_count_for_test()
+            .await
+            .expect("count pins after reassembled Dynamic helper"),
+        0
+    );
+
+    core.shutdown()
+        .await
+        .expect("shutdown reassembled Dynamic helper core");
+}
+
+#[tokio::test]
+async fn real_dynamic_attempt_deadline_disconnects_and_releases_all_pins() {
+    let root = TestRoot::new("native-dynamic-real-helper-deadline");
+    let (core, reader, conversation_id) =
+        controlled_native_dynamic_core(&root, vec![initial_native_items()]).await;
+    let result = try_real_dynamic_snapshot(
+        &core,
+        conversation_id,
+        0xDB,
+        "native-dynamic-real-helper-deadline",
+        Instant::now() + Duration::from_millis(500),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(reason) if reason.contains("timed out")),
+        "blocked Dynamic helper must return its typed test timeout"
+    );
+    assert_eq!(reader.entered(), 1);
+    assert_eq!(
+        core.store
+            .active_snapshot_build_pin_count_for_test()
+            .await
+            .expect("count pins after Dynamic helper deadline"),
+        0
+    );
+
+    core.shutdown()
+        .await
+        .expect("shutdown timed-out Dynamic helper core");
+}
+
 async fn subscribe_and_flush_dynamic(
     core: &RuntimeCore,
     conversation_id: RuntimeId,
@@ -517,22 +755,9 @@ async fn subscribe_and_flush_dynamic(
 }
 
 async fn wait_for_zero_dynamic_pins(core: &RuntimeCore) {
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if core
-                .store
-                .active_snapshot_build_pin_count_for_test()
-                .await
-                .expect("count Dynamic TEMP pins")
-                == 0
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("Dynamic TEMP pin cleanup must complete");
+    wait_for_zero_dynamic_pins_result(core)
+        .await
+        .expect("Dynamic TEMP pin cleanup must complete");
 }
 
 #[tokio::test]
@@ -768,6 +993,401 @@ async fn native_reader_failure_preserves_last_successful_history_receipts() {
     core.shutdown()
         .await
         .expect("shutdown failed Dynamic reader core");
+}
+
+#[tokio::test]
+async fn removed_then_reappeared_dynamic_snapshot_rebuilds_history_receipt_set() {
+    let root = TestRoot::new("native-dynamic-reappeared-receipts");
+    let (core, _reader, conversation_id) = native_dynamic_core(&root).await;
+    let first = subscribe_and_flush_dynamic(
+        &core,
+        conversation_id,
+        0xD9,
+        "native-dynamic-before-removed",
+    )
+    .await;
+    let first_identities = projected_identities(&first);
+    let first_command = parse_command_id(&agentdeck_protocol::runtime::identity::CommandId::new(
+        first_identities[0].command_id.clone(),
+    ))
+    .expect("parse pre-Removed history command");
+    assert!(
+        core.history_receipts
+            .contains(conversation_id, first_command)
+            .expect("inspect pre-Removed history receipt")
+    );
+
+    // 用真实 Store plan + actor lease 执行一页完整 Removed lifecycle。projector
+    // focused tests 另行锁定 apply failure/unknown 的 exact 顺序；这里验证 Core 内
+    // 与 dynamic snapshot 共享的同一个 volatile registry 会先失效、后重建。
+    let removed_generation = [0x64; 16];
+    let completed = native_projection_scan_issuer_for_test(removed_generation)
+        .expect("issue completed Removed generation")
+        .complete(removed_generation, 0, 0)
+        .expect("complete empty Removed generation");
+    let projector_store = core.store.claude_code_native_projection_store();
+    let completed = projector_store
+        .accept_completed_scan(completed)
+        .await
+        .expect("accept Removed generation");
+    let plan = projector_store
+        .plan_completed_page(completed, None)
+        .await
+        .expect("plan Removed generation");
+    let lease = core
+        .conversations
+        .prepare_projection_reconciliation(plan.candidate_ids().collect::<Vec<_>>())
+        .await;
+    let dispositions = lease.dispositions();
+    let removed_ids = lease.removed_conversation_ids().collect::<Vec<_>>();
+    projector_store
+        .apply_completed_page(plan, dispositions)
+        .await
+        .expect("durably apply Removed generation");
+    for removed_id in removed_ids {
+        core.history_receipts
+            .clear(removed_id)
+            .expect("clear exact durable Removed receipt set");
+    }
+    core.conversations
+        .uninstall_reconciled(lease)
+        .await
+        .expect("uninstall durable Removed actor");
+    assert!(
+        !core
+            .history_receipts
+            .contains(conversation_id, first_command)
+            .expect("inspect receipt after Removed")
+    );
+
+    let reappeared = projector_store
+        .import(ImportNativeProjection {
+            descriptor: ConversationDescriptor {
+                agent_kind: AgentKind::ClaudeCode,
+                title: None,
+                cwd: PathBuf::new(),
+            },
+            default_configuration: native_configuration(),
+            private_reference: SecretBytes::new(PRIVATE_REFERENCE_SENTINEL.to_vec()),
+            scan_generation: [0x65; 16],
+        })
+        .await
+        .expect("reimport the same verified native source");
+    let ImportNativeProjectionOutcome::Reappeared { conversation, .. } = reappeared else {
+        panic!("tombstoned native source must reappear with its stable identity")
+    };
+    assert_eq!(conversation.conversation_id, conversation_id);
+    core.conversations
+        .install(conversation, Vec::new())
+        .await
+        .expect("reinstall reappeared native actor");
+    assert!(
+        !core
+            .history_receipts
+            .contains(conversation_id, first_command)
+            .expect("reappearance alone must not synthesize receipts"),
+        "only a successful verified dynamic read may rebuild the receipt set"
+    );
+
+    let reread = subscribe_and_flush_dynamic(
+        &core,
+        conversation_id,
+        0xDA,
+        "native-dynamic-after-reappeared",
+    )
+    .await;
+    assert_eq!(projected_identities(&reread), first_identities);
+    assert!(
+        core.history_receipts
+            .contains(conversation_id, first_command)
+            .expect("inspect rebuilt reappeared receipt"),
+        "successful reappeared Dynamic snapshot must atomically replace the receipt set"
+    );
+
+    core.shutdown()
+        .await
+        .expect("shutdown reappeared Dynamic receipt core");
+}
+
+/// Opt-in real current-account smoke。它不需要或执行 `claude` binary，只经 production
+/// native source 只读扫描当前 EUID 的 verified JSONL，再走 Runtime Catalog 与 dynamic
+/// Snapshot。输出严格限制为计数和 neutral Runtime ID kind。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires AGENTDECK_E2E=1 and at least one current-account Claude Code JSONL"]
+async fn real_current_account_jsonl_projects_through_catalog_and_dynamic_snapshot() {
+    if std::env::var("AGENTDECK_E2E").as_deref() != Ok("1") {
+        eprintln!(
+            "BLOCKED real_current_account_jsonl_projects_through_catalog_and_dynamic_snapshot: set AGENTDECK_E2E=1"
+        );
+        return;
+    }
+
+    let root = TestRoot::new("real-current-account-native-projector");
+    let store = root.open_store().await;
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    // 先独立证明 production source 的 list/read/parser seam 至少能交付一条候选；
+    // 错误只报告中立 failure enum，绝不输出 path/session/body。
+    let mut probe = router
+        .begin_native_projection_scan(AgentKind::ClaudeCode, [0xDE; 16])
+        .expect("open current-account Claude Code native source");
+    let mut probe_found_candidate = false;
+    for _ in 0..8 {
+        match probe.next() {
+            Ok(NativeProjectionStep::Candidate(_)) => {
+                probe_found_candidate = true;
+                break;
+            }
+            Ok(NativeProjectionStep::Yielded(_)) => probe
+                .resume_after_yield()
+                .expect("resume bounded current-account source probe"),
+            Ok(NativeProjectionStep::Complete) => break,
+            Err(error) => panic!("current-account native source probe failed: {error:?}"),
+        }
+    }
+    assert!(
+        probe_found_candidate,
+        "current-account native source completed bounded probe without an importable JSONL"
+    );
+    drop(probe);
+    let core = Arc::new(
+        RuntimeCore::with_execution_coordinator(
+            store,
+            router,
+            [0xDB; 32],
+            Arc::new(DisabledExecutionCoordinator),
+            DEFAULT_ADAPTER_CONCURRENCY,
+            true,
+        )
+        .expect("construct real current-account native projector Core"),
+    );
+    let smoke_core = core.clone();
+    let database = root.database();
+    let smoke = tokio::spawn(async move {
+        const MAX_REAL_CATALOG_PAGES: usize = 32;
+        const MAX_REAL_NATIVE_CANDIDATES: usize = 500;
+        const MAX_REAL_NATIVE_ATTEMPTS: usize = 64;
+
+        smoke_core
+            .recover()
+            .await
+            .map_err(|_| "recover real current-account native projector Core failed")?;
+        let (catalog_connection, mut catalog_receiver) = connect_recording(&smoke_core, 0xDB).await;
+        let mut request_index = 0_u64;
+        let catalog_ready = timeout(Duration::from_secs(10), async {
+            loop {
+                let snapshot = request_catalog_page(
+                    &smoke_core,
+                    catalog_connection,
+                    &mut catalog_receiver,
+                    &format!("real-native-catalog-ready-{request_index}"),
+                    None,
+                )
+                .await;
+                if snapshot
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.agent_kind == AgentKind::ClaudeCode)
+                {
+                    break;
+                }
+                request_index = request_index.saturating_add(1);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .is_ok();
+        if !catalog_ready {
+            smoke_core.disconnect(catalog_connection).await;
+            return Err("bounded production scan imported no current-account Claude Code JSONL");
+        }
+
+        // Freeze only projector-owned source work. A fresh frozen catalog read below then
+        // enumerates exact authenticated NativeProjected entries without racing continuation.
+        smoke_core.native_projector.shutdown().await;
+        let candidates = match timeout(Duration::from_secs(20), async {
+            let mut candidates = Vec::new();
+            let mut page_cursor = None;
+            let mut exhausted = false;
+            for page_index in 0..MAX_REAL_CATALOG_PAGES {
+                let snapshot = request_catalog_page(
+                    &smoke_core,
+                    catalog_connection,
+                    &mut catalog_receiver,
+                    &format!("real-native-catalog-frozen-{page_index}"),
+                    page_cursor,
+                )
+                .await;
+                for entry in snapshot
+                    .entries()
+                    .iter()
+                    .filter(|entry| entry.agent_kind == AgentKind::ClaudeCode)
+                {
+                    let conversation_id = parse_conversation_id(&entry.conversation_id)
+                        .map_err(|_| "parse neutral Runtime catalog conversation ID failed")?;
+                    let context = smoke_core
+                        .store
+                        .load_authenticated_conversation_snapshot_context(conversation_id)
+                        .await
+                        .map_err(|_| "authenticate real native catalog candidate failed")?;
+                    if context.origin == SnapshotOrigin::NativeProjected {
+                        candidates.push(conversation_id);
+                        if candidates.len() == MAX_REAL_NATIVE_CANDIDATES {
+                            break;
+                        }
+                    }
+                }
+                if candidates.len() == MAX_REAL_NATIVE_CANDIDATES {
+                    break;
+                }
+                page_cursor = snapshot.next_page_cursor().cloned();
+                if page_cursor.is_none() {
+                    exhausted = true;
+                    break;
+                }
+            }
+            if !exhausted && candidates.len() < MAX_REAL_NATIVE_CANDIDATES {
+                return Err("real native catalog traversal exceeded its page bound");
+            }
+            if candidates.is_empty() {
+                return Err("frozen catalog contained no authenticated NativeProjected candidate");
+            }
+            Ok::<_, &'static str>(candidates)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err("real native catalog traversal timed out"),
+        };
+        smoke_core.disconnect(catalog_connection).await;
+        let candidates = candidates?;
+        let durable_before = durable_evidence(&database);
+
+        let mut attempted = 0_usize;
+        let mut typed_failures = 0_usize;
+        let mut reassembled_transfers = 0_usize;
+        let mut changed_between_reads = 0_usize;
+        let mut empty_snapshots = 0_usize;
+        let dynamic_deadline = Instant::now() + Duration::from_secs(30);
+        let mut success = None;
+        for (candidate_index, conversation_id) in candidates
+            .iter()
+            .copied()
+            .take(MAX_REAL_NATIVE_ATTEMPTS)
+            .enumerate()
+        {
+            if Instant::now() >= dynamic_deadline {
+                break;
+            }
+            attempted += 1;
+            let first = match try_real_dynamic_snapshot(
+                &smoke_core,
+                conversation_id,
+                0xDC,
+                &format!("real-native-dynamic-{candidate_index}-first"),
+                dynamic_deadline,
+            )
+            .await?
+            {
+                RealDynamicAttempt::Snapshot {
+                    snapshot,
+                    reassembled_transfer,
+                } => {
+                    reassembled_transfers += usize::from(reassembled_transfer);
+                    snapshot
+                }
+                RealDynamicAttempt::TypedFailure => {
+                    typed_failures += 1;
+                    continue;
+                }
+            };
+            let first_identities = projected_identities(&first);
+            if first_identities.is_empty() {
+                empty_snapshots += 1;
+                continue;
+            }
+            let second = match try_real_dynamic_snapshot(
+                &smoke_core,
+                conversation_id,
+                0xDD,
+                &format!("real-native-dynamic-{candidate_index}-second"),
+                dynamic_deadline,
+            )
+            .await?
+            {
+                RealDynamicAttempt::Snapshot {
+                    snapshot,
+                    reassembled_transfer,
+                } => {
+                    reassembled_transfers += usize::from(reassembled_transfer);
+                    snapshot
+                }
+                RealDynamicAttempt::TypedFailure => {
+                    typed_failures += 1;
+                    continue;
+                }
+            };
+            let second_identities = projected_identities(&second);
+            if second_identities.len() < first_identities.len()
+                || second_identities[..first_identities.len()] != first_identities
+            {
+                changed_between_reads += 1;
+                continue;
+            }
+            success = Some((conversation_id, first.items().len()));
+            break;
+        }
+
+        if durable_evidence(&database) != durable_before {
+            return Err("real dynamic transcript reads changed durable Runtime artifacts");
+        }
+        let (conversation_id, snapshot_items) = success
+            .ok_or("no bounded NativeProjected candidate produced two stable Dynamic snapshots")?;
+        Ok::<_, &'static str>((
+            snapshot_items,
+            conversation_id.kind(),
+            candidates.len(),
+            attempted,
+            typed_failures,
+            reassembled_transfers,
+            changed_between_reads,
+            empty_snapshots,
+        ))
+    })
+    .await;
+
+    // The child isolates every assertion/panic from ownership cleanup. Core shutdown is always
+    // awaited before a failure is propagated back into the test harness.
+    let shutdown = core.shutdown().await;
+    let summary = match smoke {
+        Ok(Ok(summary)) => summary,
+        Ok(Err(reason)) => {
+            if let Err(failure) = shutdown {
+                panic!(
+                    "real current-account smoke failed and shutdown failed: {}",
+                    failure.code
+                );
+            }
+            panic!("{reason}");
+        }
+        Err(join) if join.is_panic() => {
+            let _ = shutdown;
+            std::panic::resume_unwind(join.into_panic());
+        }
+        Err(_) => {
+            let _ = shutdown;
+            panic!("real current-account smoke task was cancelled");
+        }
+    };
+    if let Err(failure) = shutdown {
+        panic!(
+            "shutdown real current-account native projector Core: {}",
+            failure.code
+        );
+    }
+    eprintln!(
+        "PASS real_current_account_jsonl_projects_through_catalog_and_dynamic_snapshot: snapshot_items={} conversation_id_kind={:?} native_candidates={} attempted={} typed_failures={} reassembled_transfers={} changed_between_reads={} empty_snapshots={}",
+        summary.0, summary.1, summary.2, summary.3, summary.4, summary.5, summary.6, summary.7,
+    );
 }
 
 #[tokio::test]

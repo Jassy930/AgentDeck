@@ -4,6 +4,17 @@ use std::io::{BufReader, Cursor};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use crate::agent::{
+    NATIVE_PROJECTION_ROUND_BYTE_LIMIT, NATIVE_PROJECTION_ROUND_CANDIDATE_LIMIT,
+    NATIVE_PROJECTION_ROUND_IMPORT_LIMIT, NATIVE_PROJECTION_ROUND_TIME_LIMIT,
+    NativeProjectionSourceError, NativeProjectionStep, NativeProjectionYieldReason,
+};
+use agentdeck_protocol::ClaudeCodePermissionMode;
+use agentdeck_protocol::runtime::{
+    ClaudeCodeConversationConfiguration, ConversationConfiguration, VendorConfigurationSnapshot,
+};
+
+use super::classify_native_projection_source_error;
 use super::native::{
     NativeHistoryError, NativeHistorySource, NativeIoBudget, NativeParseLimits, NativeReadOutcome,
     NativeScanStep, NativeScanStop, NativeTailState, NativeTranscriptRefV1, parse_native_jsonl,
@@ -16,6 +27,375 @@ const TOOL_UUID: &str = "40000000-0000-4000-8000-000000000004";
 const RESULT_UUID: &str = "50000000-0000-4000-8000-000000000005";
 const SECOND_UUID: &str = "60000000-0000-4000-8000-000000000006";
 const TOOL_ID: &str = "toolu_native_history_fixture";
+
+#[test]
+fn native_projector_production_round_limits_are_frozen() {
+    assert_eq!(NATIVE_PROJECTION_ROUND_CANDIDATE_LIMIT, 2_000);
+    assert_eq!(NATIVE_PROJECTION_ROUND_IMPORT_LIMIT, 500);
+    assert_eq!(NATIVE_PROJECTION_ROUND_BYTE_LIMIT, 64 * 1024 * 1024);
+    assert_eq!(NATIVE_PROJECTION_ROUND_TIME_LIMIT, Duration::from_secs(2));
+}
+
+#[test]
+fn missing_projects_root_is_an_unavailable_capability_not_a_fast_retry_failure() {
+    let fixture = NativeFixture::new_without_projects();
+    let error = match NativeHistorySource::from_home_for_test(&fixture.home, effective_uid()) {
+        Ok(_) => panic!("missing projects root must not create a native source"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        NativeHistoryError::SourceUnavailable { .. }
+    ));
+    assert_eq!(
+        classify_native_projection_source_error(error),
+        NativeProjectionSourceError::Unavailable
+    );
+}
+
+#[test]
+fn native_projector_bridge_delivers_only_verified_neutral_redacted_candidate() {
+    let fixture = NativeFixture::new();
+    let project_sentinel = "-private-projector-path-sentinel";
+    let cwd_sentinel = "/private/projector/cwd-sentinel";
+    let title_sentinel = "private projector title sentinel";
+    let session_field_sentinel = "private-session-field-sentinel";
+    let transcript = format!(
+        "{{\"type\":\"user\",\"uuid\":\"{USER_UUID}\",\"parentUuid\":null,\"cwd\":\"{cwd_sentinel}\",\"sessionId\":\"{session_field_sentinel}\",\"message\":{{\"content\":\"hello\"}}}}\n{{\"type\":\"custom-title\",\"customTitle\":\"{title_sentinel}\"}}\n"
+    );
+    fixture.write_transcript(project_sentinel, USER_UUID, &transcript);
+    let generation = test_generation(21);
+    let mut scan = projector_scan(&fixture, generation, 2_000, 500, 64 * 1024 * 1024);
+
+    let first_step = scan.next().expect("verified scanner step");
+    let step_debug = format!("{first_step:?}");
+    let candidate = match first_step {
+        NativeProjectionStep::Candidate(candidate) => candidate,
+        other => panic!("expected verified candidate, got {other:?}"),
+    };
+    let candidate_debug = format!("{candidate:?}");
+    for surface in [candidate_debug.as_str(), step_debug.as_str()] {
+        for sentinel in [
+            project_sentinel,
+            cwd_sentinel,
+            title_sentinel,
+            session_field_sentinel,
+            USER_UUID,
+            ".jsonl",
+        ] {
+            assert!(
+                !surface.contains(sentinel),
+                "Debug leaked {sentinel}: {surface}"
+            );
+        }
+    }
+
+    let (descriptor, configuration, private_reference, acknowledgement) = candidate.into_parts();
+    assert_eq!(
+        descriptor.agent_kind,
+        agentdeck_protocol::AgentKind::ClaudeCode
+    );
+    assert_eq!(descriptor.cwd, PathBuf::from(cwd_sentinel));
+    assert_eq!(descriptor.title.as_deref(), Some(title_sentinel));
+    assert_eq!(
+        configuration.agent_kind(),
+        agentdeck_protocol::AgentKind::ClaudeCode
+    );
+    assert!(
+        private_reference
+            .expose_secret()
+            .windows(project_sentinel.len())
+            .any(|window| window == project_sentinel.as_bytes())
+    );
+    assert!(
+        private_reference
+            .expose_secret()
+            .windows(USER_UUID.len())
+            .any(|window| window == USER_UUID.as_bytes())
+    );
+    let acknowledgement_debug = format!("{acknowledgement:?}");
+    assert!(!acknowledgement_debug.contains(USER_UUID));
+    assert!(!format!("{private_reference:?}").contains(project_sentinel));
+    scan.acknowledge(acknowledgement)
+        .expect("Store-success ACK advances exact pending candidate");
+    assert!(matches!(
+        scan.next().expect("scan reaches real EOF"),
+        NativeProjectionStep::Complete
+    ));
+    let completed = scan
+        .into_completed()
+        .expect("exhausted acknowledged scan creates witness");
+    let completed_debug = format!("{completed:?}");
+    for sentinel in [project_sentinel, cwd_sentinel, title_sentinel, USER_UUID] {
+        assert!(!completed_debug.contains(sentinel));
+    }
+    assert_eq!(completed.into_parts(), (generation, 1, 1));
+}
+
+#[test]
+fn native_projector_bridge_yields_at_import_limit_and_resumes_exact_continuation() {
+    let fixture = NativeFixture::new();
+    fixture.write_transcript("-projector-import-a", USER_UUID, &one_user_line(USER_UUID));
+    fixture.write_transcript(
+        "-projector-import-b",
+        THINK_UUID,
+        &one_user_line(THINK_UUID),
+    );
+    let generation = test_generation(23);
+    let mut scan = projector_scan(&fixture, generation, 10, 1, 64 * 1024 * 1024);
+    let mut imported = 0_u64;
+    let mut yields = 0_u64;
+    loop {
+        match scan.next().expect("bounded projector scan") {
+            NativeProjectionStep::Candidate(candidate) => {
+                let (_, _, _, acknowledgement) = candidate.into_parts();
+                scan.acknowledge(acknowledgement).expect("exact ACK");
+                imported += 1;
+            }
+            NativeProjectionStep::Yielded(NativeProjectionYieldReason::ImportLimit) => {
+                yields += 1;
+                scan.resume_after_yield().expect("resume next fixed round");
+            }
+            NativeProjectionStep::Complete => break,
+            other => panic!("unexpected projector step: {other:?}"),
+        }
+    }
+    assert_eq!(imported, 2);
+    assert_eq!(
+        yields, 2,
+        "each one-import round must yield before more work"
+    );
+    assert_eq!(
+        scan.into_completed().unwrap().into_parts(),
+        (generation, 2, 2)
+    );
+}
+
+#[test]
+fn native_projector_bridge_rejects_cross_scan_ack_and_replays_exact_pending_candidate() {
+    let fixture = NativeFixture::new();
+    fixture.write_transcript("-projector-exact-ack", USER_UUID, &one_user_line(USER_UUID));
+    let generation = test_generation(30);
+    let mut expected = projector_scan(&fixture, generation, 10, 10, 1024 * 1024);
+    let mut other = projector_scan(&fixture, generation, 10, 10, 1024 * 1024);
+
+    let expected_candidate = match expected.next().unwrap() {
+        NativeProjectionStep::Candidate(candidate) => candidate,
+        other => panic!("expected first pending candidate, got {other:?}"),
+    };
+    let (_, _, _, expected_acknowledgement) = expected_candidate.into_parts();
+    let other_candidate = match other.next().unwrap() {
+        NativeProjectionStep::Candidate(candidate) => candidate,
+        other => panic!("expected second scanner candidate, got {other:?}"),
+    };
+    let (_, _, _, other_acknowledgement) = other_candidate.into_parts();
+    assert_eq!(
+        expected
+            .acknowledge(other_acknowledgement)
+            .expect_err("same generation from another issuer cannot ACK"),
+        NativeProjectionSourceError::InvalidAcknowledgement
+    );
+    assert!(matches!(
+        expected
+            .next()
+            .expect("wrong ACK keeps exact candidate pending"),
+        NativeProjectionStep::Candidate(_)
+    ));
+    expected
+        .acknowledge(expected_acknowledgement)
+        .expect("original exact ACK remains valid");
+    assert!(matches!(
+        expected.next().unwrap(),
+        NativeProjectionStep::Complete
+    ));
+    assert_eq!(
+        expected.into_completed().unwrap().into_parts(),
+        (generation, 1, 1)
+    );
+}
+
+#[test]
+fn native_projector_bridge_filters_observer_and_keeps_invalid_generation_incomplete() {
+    let observer = NativeFixture::new();
+    observer.write_transcript(
+        "-projector-observer-content",
+        USER_UUID,
+        &format!(
+            "{{\"type\":\"user\",\"uuid\":\"{USER_UUID}\",\"parentUuid\":null,\"message\":{{\"content\":\"Hello memory agent, continue observing\"}}}}\n"
+        ),
+    );
+    let generation = test_generation(24);
+    let mut scan = projector_scan(&observer, generation, 10, 10, 1024 * 1024);
+    assert!(matches!(
+        scan.next().unwrap(),
+        NativeProjectionStep::Complete
+    ));
+    assert_eq!(
+        scan.into_completed().unwrap().into_parts(),
+        (generation, 1, 0)
+    );
+
+    let mixed = NativeFixture::new();
+    mixed.write_transcript(
+        "-projector-invalid-metadata",
+        USER_UUID,
+        &one_user_line(USER_UUID).replace("/tmp/native", "relative/native"),
+    );
+    mixed.write_transcript(
+        "-projector-valid-after-invalid",
+        THINK_UUID,
+        &one_user_line(THINK_UUID),
+    );
+    let mut scan = projector_scan(&mixed, test_generation(25), 10, 10, 1024 * 1024);
+    let mut imported = 0;
+    loop {
+        match scan
+            .next()
+            .expect("invalid candidate must not poison later valid import")
+        {
+            NativeProjectionStep::Candidate(candidate) => {
+                let (descriptor, _, _, acknowledgement) = candidate.into_parts();
+                assert_eq!(descriptor.cwd, PathBuf::from("/tmp/native"));
+                scan.acknowledge(acknowledgement)
+                    .expect("ACK the one valid candidate without drift");
+                imported += 1;
+            }
+            NativeProjectionStep::Complete => break,
+            NativeProjectionStep::Yielded(_) => {
+                scan.resume_after_yield().expect("resume mixed source scan");
+            }
+        }
+    }
+    assert_eq!(imported, 1, "invalid transcript must never cross the seam");
+    assert_eq!(
+        scan.into_completed()
+            .expect_err("invalid candidate keeps the whole generation incomplete"),
+        NativeProjectionSourceError::ScanIncomplete
+    );
+}
+
+#[test]
+fn native_projector_bridge_skips_oversized_candidate_but_refuses_generation_witness() {
+    let mixed = NativeFixture::new();
+    mixed.write_transcript(
+        "-projector-oversized-candidate",
+        USER_UUID,
+        &"x".repeat(512),
+    );
+    mixed.write_transcript(
+        "-projector-valid-after-oversized",
+        THINK_UUID,
+        &one_user_line(THINK_UUID),
+    );
+    let mut scan = projector_scan(&mixed, test_generation(26), 10, 10, 256);
+    let mut imported = 0;
+    loop {
+        match scan
+            .next()
+            .expect("oversized candidate must not poison later valid import")
+        {
+            NativeProjectionStep::Candidate(candidate) => {
+                let (descriptor, _, _, acknowledgement) = candidate.into_parts();
+                assert_eq!(descriptor.cwd, PathBuf::from("/tmp/native"));
+                scan.acknowledge(acknowledgement)
+                    .expect("ACK valid candidate after oversized source");
+                imported += 1;
+            }
+            NativeProjectionStep::Yielded(_) => {
+                scan.resume_after_yield()
+                    .expect("resume byte-limited mixed source scan");
+            }
+            NativeProjectionStep::Complete => break,
+        }
+    }
+    assert_eq!(
+        imported, 1,
+        "oversized transcript must never cross the seam"
+    );
+    assert_eq!(
+        scan.into_completed()
+            .expect_err("oversized candidate keeps the whole generation incomplete"),
+        NativeProjectionSourceError::ScanIncomplete
+    );
+}
+
+#[test]
+fn native_projector_bridge_filters_zero_modeled_observer_record_without_import() {
+    let fixture = NativeFixture::new();
+    fixture.write_transcript(
+        "-projector-zero-modeled-observer",
+        USER_UUID,
+        "{\"type\":\"summary\",\"cwd\":\"/tmp/native\",\"summary\":\"observer bookkeeping\"}\n",
+    );
+    let generation = test_generation(31);
+    let mut scan = projector_scan(&fixture, generation, 10, 10, 1024 * 1024);
+    assert!(matches!(
+        scan.next().expect("zero-modeled observer is filtered"),
+        NativeProjectionStep::Complete
+    ));
+    assert_eq!(
+        scan.into_completed().unwrap().into_parts(),
+        (generation, 1, 0),
+        "filtered record is inspected and ACKed but never imported"
+    );
+}
+
+#[test]
+fn native_projector_partial_yield_unacked_and_drop_paths_have_no_witness() {
+    let fixture = NativeFixture::new();
+    let first_transcript = one_user_line(USER_UUID);
+    fixture.write_transcript("-projector-incomplete-a", USER_UUID, &first_transcript);
+    fixture.write_transcript(
+        "-projector-incomplete-b",
+        THINK_UUID,
+        &one_user_line(THINK_UUID),
+    );
+
+    let partial = projector_scan(&fixture, test_generation(26), 10, 10, 1024 * 1024);
+    assert_eq!(
+        partial.into_completed().unwrap_err(),
+        NativeProjectionSourceError::ScanIncomplete
+    );
+
+    let mut yielded = projector_scan(
+        &fixture,
+        test_generation(27),
+        10,
+        10,
+        first_transcript.len() as u64 + 8,
+    );
+    let first = match yielded.next().expect("first candidate fits byte round") {
+        NativeProjectionStep::Candidate(candidate) => candidate,
+        other => panic!("expected first byte-budget candidate, got {other:?}"),
+    };
+    let (_, _, _, acknowledgement) = first.into_parts();
+    yielded.acknowledge(acknowledgement).unwrap();
+    assert!(matches!(
+        yielded.next().unwrap(),
+        NativeProjectionStep::Yielded(NativeProjectionYieldReason::ByteLimit)
+    ));
+    assert_eq!(
+        yielded.into_completed().unwrap_err(),
+        NativeProjectionSourceError::ScanIncomplete
+    );
+
+    let mut unacknowledged = projector_scan(&fixture, test_generation(28), 10, 10, 1024 * 1024);
+    assert!(matches!(
+        unacknowledged.next().unwrap(),
+        NativeProjectionStep::Candidate(_)
+    ));
+    assert_eq!(
+        unacknowledged.into_completed().unwrap_err(),
+        NativeProjectionSourceError::ScanIncomplete
+    );
+
+    let abandoned = projector_scan(&fixture, test_generation(29), 10, 10, 1024 * 1024);
+    let no_witness = {
+        drop(abandoned);
+        None::<crate::agent::CompletedNativeProjectionScan>
+    };
+    assert!(no_witness.is_none());
+}
 
 #[cfg(unix)]
 #[test]
@@ -99,6 +479,52 @@ fn native_projection_read_preserves_keys_and_applies_fixed_bounds() {
             .iter()
             .all(|item| item.turn_key() == document.turns()[0].key())
     );
+}
+
+#[test]
+fn native_metadata_uses_consistent_absolute_cwd_and_latest_canonical_custom_title() {
+    let transcript = format!(
+        "{}{{\"type\":\"custom-title\",\"customTitle\":\"old title\"}}\n{{\"type\":\"custom-title\",\"customTitle\":\"latest private title\"}}\n",
+        one_user_line(USER_UUID)
+    );
+    let document = parse_document(&transcript);
+    let (cwd, title) = document.metadata().expect("canonical native metadata");
+    assert_eq!(cwd, std::path::Path::new("/tmp/native"));
+    assert_eq!(title, Some("latest private title"));
+}
+
+#[test]
+fn native_metadata_rejects_relative_or_ambiguous_cwd_and_noncanonical_title() {
+    for (content, expected) in [
+        (
+            one_user_line(USER_UUID).replace("/tmp/native", "relative/native"),
+            "cc-history-native-metadata-invalid",
+        ),
+        (
+            format!(
+                "{}{{\"type\":\"assistant\",\"uuid\":\"{TEXT_UUID}\",\"parentUuid\":\"{USER_UUID}\",\"cwd\":\"/other\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"answer\"}}]}}}}\n",
+                one_user_line(USER_UUID)
+            ),
+            "cc-history-native-metadata-ambiguous",
+        ),
+        (
+            format!(
+                "{}{{\"type\":\"custom-title\",\"custom_title\":\"legacy alias\"}}\n",
+                one_user_line(USER_UUID)
+            ),
+            "cc-history-native-metadata-invalid",
+        ),
+        (
+            format!(
+                "{}{{\"type\":\"custom-title\",\"customTitle\":\"old\"}}\n{{\"type\":\"custom-title\"",
+                one_user_line(USER_UUID)
+            ),
+            "cc-history-native-metadata-ambiguous",
+        ),
+    ] {
+        let document = parse_document(&content);
+        assert_code(document.metadata().unwrap_err(), expected);
+    }
 }
 
 #[test]
@@ -861,6 +1287,37 @@ fn one_user_line(uuid: &str) -> String {
     format!(
         "{{\"type\":\"user\",\"uuid\":\"{uuid}\",\"parentUuid\":null,\"cwd\":\"/tmp/native\",\"message\":{{\"content\":\"hello\"}}}}\n"
     )
+}
+
+fn default_projection_configuration() -> ConversationConfiguration {
+    ConversationConfiguration::new(VendorConfigurationSnapshot::ClaudeCode(
+        ClaudeCodeConversationConfiguration::new(
+            ClaudeCodePermissionMode::Default,
+            None,
+            None,
+            None,
+        )
+        .expect("bounded default Claude Code configuration"),
+    ))
+}
+
+fn projector_scan(
+    fixture: &NativeFixture,
+    generation: [u8; 16],
+    candidate_limit: u32,
+    import_limit: u32,
+    byte_limit: u64,
+) -> crate::agent::DynNativeProjectionScan {
+    super::begin_native_projection_scan_for_test(
+        fixture.source(),
+        default_projection_configuration(),
+        generation,
+        candidate_limit,
+        import_limit,
+        byte_limit,
+        Duration::from_secs(2),
+    )
+    .expect("bounded native projector scan")
 }
 
 fn generous_budget() -> NativeIoBudget {

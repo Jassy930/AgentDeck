@@ -11,6 +11,8 @@ mod execution_event;
 pub mod identity;
 mod journal;
 mod metadata;
+#[cfg(test)]
+mod native_metadata_effect_tests;
 mod native_projection;
 #[cfg(test)]
 mod native_projection_import_tests;
@@ -53,11 +55,26 @@ pub(crate) use configuration::MAX_CONFIGURATION_CANONICAL_BYTES;
 pub use configuration::{ConfigurationRecord, ConfigureConversation, ConfigureConversationOutcome};
 pub use execution_event::{AppendExecutionEvent, AppendExecutionEventOutcome};
 pub use identity::{RuntimeId, RuntimeIdKind, RuntimeIdSource};
+pub(crate) use metadata::{
+    ClaimNativeMetadataMutationOutcome, NativeMetadataMutationClaim,
+    NativeMetadataMutationReadback, NativeMetadataMutationStatus,
+};
 pub use metadata::{
     MetadataMutationRecord, UpdateConversationMetadataOutcome, UpdateManagedConversationMetadata,
 };
 #[cfg(test)]
-pub(crate) use native_projection::{ImportNativeProjection, ImportNativeProjectionOutcome};
+pub(crate) use native_projection::PersistNativeMetadataEffectFenceOutcome;
+pub(crate) use native_projection::{
+    AuthorizeNativeMetadataEffectRelease, FailUnreleasedNativeMetadataEffect,
+    NativeMetadataEffectFenceRecord, NativeMetadataEffectReleasePermit,
+    NativeMetadataEffectUnreleasedCleanupAuthority, PersistNativeMetadataEffectFence,
+};
+pub(crate) use native_projection::{
+    CompletedNativeProjectionGeneration, ImportNativeProjection, ImportNativeProjectionOutcome,
+    NativeProjectionCandidateDisposition, NativeProjectionReconcileCursor,
+    NativeProjectionReconcilePlan, NativeProjectionRetirementCursor,
+    NativeProjectionRetirementPlan,
+};
 pub use publication::{
     FreezePublicationRequest, FrozenPublication, PublicationAcknowledgement, PublicationBarrierCut,
     PublicationPayloadKind, PublicationScope, PublicationStreamRecord, PublicationStreamState,
@@ -73,8 +90,8 @@ pub use stream::{
 };
 pub use worker::RuntimeStoreHandle;
 pub(crate) use worker::{
-    AuthorizedAcceptOutcome, ClaudeCodeAdapterStateVault, CodexAdapterStateVault,
-    NativeHistoryIdentityError,
+    AuthorizedAcceptOutcome, ClaudeCodeAdapterStateVault, ClaudeCodeNativeProjectionStore,
+    CodexAdapterStateVault, NativeHistoryIdentityError,
 };
 
 /// 已经通过 conversation row metadata MAC、descriptor AEAD open 与 canonical
@@ -88,7 +105,7 @@ pub(crate) enum SnapshotOrigin {
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct AuthenticatedConversationSnapshotContext {
     pub(crate) conversation_id: RuntimeId,
-    pub(crate) adapter_state_key: RuntimeId,
+    pub(super) adapter_state_key: RuntimeId,
     pub(crate) agent_kind: agentdeck_protocol::AgentKind,
     pub(crate) catalog_revision: u64,
     pub(crate) command_high_water: Option<u64>,

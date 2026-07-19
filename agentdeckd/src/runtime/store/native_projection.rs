@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agentdeck_protocol::runtime::ConversationConfiguration;
+use agentdeck_protocol::runtime::{ConversationConfiguration, RuntimeFailure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use zeroize::Zeroizing;
 
@@ -16,7 +16,10 @@ use super::configuration::{ConfigurationRecord, PreparedNativeProjectionConfigur
 use super::identity::{
     MAX_RUNTIME_ID_COLLISION_ATTEMPTS, RuntimeId, RuntimeIdError, RuntimeIdKind,
 };
-use super::sequence::{SequenceScope, decode_sequence, next_sequence};
+use super::metadata::{
+    NativeMetadataMutationClaim, NativeMetadataMutationStatus, UpdateConversationMetadataOutcome,
+};
+use super::sequence::{SequenceScope, decode_sequence, encode_sequence, next_sequence};
 use super::sqlite::{RuntimeLedger, RuntimeSqlite, SafetyReserveProjection};
 use super::stream::{metadata_mac, open_v4_row, optional_field};
 use super::{ConversationDescriptor, ConversationRecord, RuntimeStoreError};
@@ -24,8 +27,8 @@ use crate::runtime::adapter_state::AdapterStateNamespace;
 use crate::runtime::events::CommandStreamEffects;
 use crate::runtime::model::{
     MAX_NATIVE_NONLIVE_IDENTITIES, MAX_RUNTIME_LIVE_CONVERSATIONS,
-    MAX_RUNTIME_PHYSICAL_CONVERSATIONS, NativeProjectionLimitScope, NewConversation,
-    RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreOperation,
+    MAX_RUNTIME_PHYSICAL_CONVERSATIONS, MetadataMutationLimitScope, NativeProjectionLimitScope,
+    NewConversation, RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreOperation,
 };
 use crate::runtime::process_identity::ProcessIdentity;
 use crate::security::SecretBytes;
@@ -34,27 +37,25 @@ const PROJECTION_METADATA_DOMAIN: &[u8] = b"native.projection.metadata.v1";
 const EFFECT_FENCE_METADATA_DOMAIN: &[u8] = b"native.metadata-effect-fence.metadata.v1";
 const EFFECT_NONCE_DOMAIN: &[u8] = b"native.metadata-effect-fence.nonce.v1";
 const EFFECT_SPEC_DOMAIN: &[u8] = b"native.metadata-effect-fence.spec.v1";
-const EFFECT_RELEASE_DOMAIN: &[u8] = b"native.metadata-effect-fence.release.v1";
+const UNRELEASED_CLEANUP_AUTHORITY_DOMAIN: &[u8] =
+    b"native.metadata.unreleased-cleanup-authority.v1";
 const EFFECT_FENCE_TABLE: &[u8] = b"native_metadata_effect_fences";
 const EFFECT_FENCE_COLUMN: &[u8] = b"sealed_fence";
 const EFFECT_FENCE_PAYLOAD_MAGIC: &[u8; 4] = b"ADN1";
 const EFFECT_FENCE_PRIMARY_KEY_MAGIC: &[u8; 4] = b"ADNF";
-const MAX_EFFECT_NONCE_BYTES: usize = 1024;
-const MAX_EFFECT_SPEC_BYTES: usize = 16 * 1024;
+pub(super) const MAX_EFFECT_NONCE_BYTES: usize = 1024;
+pub(super) const MAX_EFFECT_SPEC_BYTES: usize = 16 * 1024;
 const MAX_EFFECT_FENCE_PLAINTEXT_BYTES: usize = 17_532;
 const MAX_METADATA_EFFECT_FENCE_ROWS: u64 = 65_536;
 const MAX_NATIVE_REFERENCE_CHARGED_BYTES: u64 = 16 * 1024 * 1024;
 const NATIVE_PROJECTION_TOMBSTONE_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 const MAX_NATIVE_LIFECYCLE_PAGE_ITEMS: usize = 500;
-#[allow(dead_code)] // C-f projector lifecycle 接线后由 production capability 强制。
 pub(super) const MAX_NATIVE_PRIVATE_REFERENCE_BYTES: usize = 523;
-#[allow(dead_code)] // C-f projector lifecycle 接线后由 production capability 强制。
 pub(super) const MIN_NATIVE_PRIVATE_REFERENCE_BYTES: usize = 20;
 
 /// 已验证 native source 交给固定 namespace projector 的最小导入输入。
 ///
 /// private reference 不实现可见 Debug；Store 只把它当作 versioned opaque bytes。
-#[allow(dead_code)] // C-f projector lifecycle 接线后由 verified native source 构造。
 pub(crate) struct ImportNativeProjection {
     pub(crate) descriptor: ConversationDescriptor,
     pub(crate) default_configuration: ConversationConfiguration,
@@ -94,6 +95,235 @@ pub(crate) enum ImportNativeProjectionOutcome {
     },
 }
 
+/// `claimed -> applying` 与 durable native effect fence 的单次 Store 请求。
+/// effect spec 是 adapter 已验证、可持久化但不进入日志/Debug 的 canonical opaque bytes；
+/// 真正 vendor spawn 仍只能由 Runtime-owned exec gate 完成。
+pub(crate) struct PersistNativeMetadataEffectFence {
+    pub(crate) mutation: NativeMetadataMutationClaim,
+    pub(crate) daemon_boot_id: RuntimeId,
+    pub(crate) effect_nonce: Vec<u8>,
+    pub(crate) effect_spec: Vec<u8>,
+    pub(crate) process: ProcessIdentity,
+}
+
+impl std::fmt::Debug for PersistNativeMetadataEffectFence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PersistNativeMetadataEffectFence")
+            .field("conversation_id", &self.mutation.conversation_id())
+            .field("daemon_boot_id", &self.daemon_boot_id)
+            .field("effect_nonce", &"[REDACTED]")
+            .field("effect_spec", &"[REDACTED]")
+            .field("process", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Store 认证后的 native metadata effect fence。原始 nonce/spec 只在 daemon 内
+/// 按需借用；本类型不实现 Clone，避免复制 pre-release capability。
+pub(crate) struct NativeMetadataEffectFenceRecord {
+    conversation_id: RuntimeId,
+    idempotency_token: [u8; 32],
+    daemon_boot_id: RuntimeId,
+    effect_nonce: Zeroizing<Vec<u8>>,
+    effect_spec: Zeroizing<Vec<u8>>,
+    process: ProcessIdentity,
+    release_authorized_at_ms: Option<u64>,
+    release_token_commitment: Option<[u8; 32]>,
+}
+
+impl NativeMetadataEffectFenceRecord {
+    pub(crate) const fn conversation_id(&self) -> RuntimeId {
+        self.conversation_id
+    }
+
+    pub(crate) const fn idempotency_token(&self) -> &[u8; 32] {
+        &self.idempotency_token
+    }
+
+    pub(crate) const fn daemon_boot_id(&self) -> RuntimeId {
+        self.daemon_boot_id
+    }
+
+    pub(crate) fn effect_nonce(&self) -> &[u8] {
+        self.effect_nonce.as_ref()
+    }
+
+    pub(crate) fn effect_spec(&self) -> &[u8] {
+        self.effect_spec.as_ref()
+    }
+
+    pub(crate) const fn process(&self) -> ProcessIdentity {
+        self.process
+    }
+
+    pub(crate) const fn release_authorized_at_ms(&self) -> Option<u64> {
+        self.release_authorized_at_ms
+    }
+
+    pub(crate) const fn release_token_commitment(&self) -> Option<&[u8; 32]> {
+        self.release_token_commitment.as_ref()
+    }
+}
+
+impl std::fmt::Debug for NativeMetadataEffectFenceRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeMetadataEffectFenceRecord")
+            .field("conversation_id", &self.conversation_id)
+            .field("idempotency_token", &"[REDACTED]")
+            .field("daemon_boot_id", &self.daemon_boot_id)
+            .field("effect_nonce", &"[REDACTED]")
+            .field("effect_spec", &"[REDACTED]")
+            .field("process", &"[REDACTED]")
+            .field("release_authorized_at_ms", &self.release_authorized_at_ms)
+            .field("release_token_commitment", &"[REDACTED]")
+            .finish()
+    }
+}
+
+pub(crate) struct PersistNativeMetadataEffectFenceOutcome {
+    pub(crate) mutation: NativeMetadataMutationClaim,
+    pub(crate) fence: NativeMetadataEffectFenceRecord,
+    pub(crate) unreleased_cleanup_authority: NativeMetadataEffectUnreleasedCleanupAuthority,
+}
+
+/// authenticated `Applying + unreleased fence` persist/readback 签发的 cleanup authority。
+/// 它只证明 Store binding，不证明 TERM→KILL/reap 或 group absence 已完成；C-e4 必须让
+/// exact exec-gate cleanup helper 消费本 authority 并证明 group absence 后，才能调用
+/// `fail_unreleased_native_metadata_effect`。字段私有且不实现 Clone/Serialize。
+pub(crate) struct NativeMetadataEffectUnreleasedCleanupAuthority {
+    commitment: [u8; 32],
+}
+
+impl std::fmt::Debug for NativeMetadataEffectUnreleasedCleanupAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeMetadataEffectUnreleasedCleanupAuthority")
+            .field("commitment", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// clean prepare failure 的唯一 Store 输入。capability 按值消费；其余字段显式
+/// 重复 exact binding，让 Store 能拒绝 claim/boot/nonce/spec/process 任一漂移。
+pub(crate) struct FailUnreleasedNativeMetadataEffect {
+    pub(crate) cleanup_authority: NativeMetadataEffectUnreleasedCleanupAuthority,
+    pub(crate) mutation: NativeMetadataMutationClaim,
+    pub(crate) daemon_boot_id: RuntimeId,
+    pub(crate) effect_nonce: Vec<u8>,
+    pub(crate) effect_spec: Vec<u8>,
+    pub(crate) process: ProcessIdentity,
+    pub(crate) failure: RuntimeFailure,
+}
+
+impl std::fmt::Debug for FailUnreleasedNativeMetadataEffect {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FailUnreleasedNativeMetadataEffect")
+            .field("conversation_id", &self.mutation.conversation_id())
+            .field("daemon_boot_id", &self.daemon_boot_id)
+            .field("effect_nonce", &"[REDACTED]")
+            .field("effect_spec", &"[REDACTED]")
+            .field("process", &"[REDACTED]")
+            .field("failure_code", &self.failure.code)
+            .finish()
+    }
+}
+
+/// durable release authorization 的唯一输入。commitment 必须是 blocked exec gate
+/// 回报的 SHA-256 commitment，Store 只认证并持久化它，绝不从 StorageKEK 派生替代值。
+pub(crate) struct AuthorizeNativeMetadataEffectRelease {
+    pub(crate) mutation: NativeMetadataMutationClaim,
+    pub(crate) daemon_boot_id: RuntimeId,
+    pub(crate) effect_nonce: Vec<u8>,
+    pub(crate) release_token_commitment: [u8; 32],
+}
+
+impl std::fmt::Debug for AuthorizeNativeMetadataEffectRelease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorizeNativeMetadataEffectRelease")
+            .field("conversation_id", &self.mutation.conversation_id())
+            .field("daemon_boot_id", &self.daemon_boot_id)
+            .field("effect_nonce", &"[REDACTED]")
+            .field("release_token_commitment", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// 只有 `AuthorizeNativeMetadataEffectRelease` COMMIT/readback 后才能获得的一次性
+/// daemon-private capability。它不实现 Clone，C-e4 必须按值消费后才能写 gate Release。
+pub(crate) struct NativeMetadataEffectReleasePermit {
+    conversation_id: RuntimeId,
+    idempotency_token: [u8; 32],
+    daemon_boot_id: RuntimeId,
+    effect_nonce: Zeroizing<Vec<u8>>,
+    process: ProcessIdentity,
+    release_token_commitment: [u8; 32],
+    release_authorized_at_ms: u64,
+}
+
+impl NativeMetadataEffectReleasePermit {
+    pub(crate) const fn conversation_id(&self) -> RuntimeId {
+        self.conversation_id
+    }
+
+    pub(crate) const fn idempotency_token(&self) -> &[u8; 32] {
+        &self.idempotency_token
+    }
+
+    pub(crate) const fn daemon_boot_id(&self) -> RuntimeId {
+        self.daemon_boot_id
+    }
+
+    pub(crate) fn effect_nonce(&self) -> &[u8] {
+        self.effect_nonce.as_ref()
+    }
+
+    pub(crate) const fn process(&self) -> ProcessIdentity {
+        self.process
+    }
+
+    pub(crate) const fn release_token_commitment(&self) -> &[u8; 32] {
+        &self.release_token_commitment
+    }
+
+    pub(crate) const fn release_authorized_at_ms(&self) -> u64 {
+        self.release_authorized_at_ms
+    }
+}
+
+impl std::fmt::Debug for NativeMetadataEffectReleasePermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeMetadataEffectReleasePermit")
+            .field("conversation_id", &self.conversation_id)
+            .field("idempotency_token", &"[REDACTED]")
+            .field("daemon_boot_id", &self.daemon_boot_id)
+            .field("effect_nonce", &"[REDACTED]")
+            .field("process", &"[REDACTED]")
+            .field("release_token_commitment", &"[REDACTED]")
+            .field("release_authorized_at_ms", &self.release_authorized_at_ms)
+            .finish()
+    }
+}
+
+pub(crate) struct AuthorizeNativeMetadataEffectReleaseOutcome {
+    pub(crate) mutation: NativeMetadataMutationClaim,
+    pub(crate) permit: NativeMetadataEffectReleasePermit,
+}
+
+/// startup recovery 对单个 authenticated active parent 的 bounded readback。Claimed
+/// 合法地没有 fence；Applying/OutcomeUnknown 必须携带与 parent key 精确匹配的 fence。
+pub(crate) struct NativeMetadataEffectRecoveryRecord {
+    pub(crate) mutation: NativeMetadataMutationClaim,
+    pub(crate) fence: Option<NativeMetadataEffectFenceRecord>,
+    /// 仅 `Applying + unreleased fence` 的 authenticated restart readback 才携带。
+    /// 与 live persist 一样，它只是 Store binding authority，不是 reap proof。
+    pub(crate) unreleased_cleanup_authority: Option<NativeMetadataEffectUnreleasedCleanupAuthority>,
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct NativeProjectionIdentityCandidate {
     pub(super) conversation_id: RuntimeId,
@@ -105,7 +335,6 @@ pub(super) struct PreparedNativeProjectionImport {
     pub(super) descriptor_bytes: Zeroizing<Vec<u8>>,
     pub(super) default_configuration: PreparedNativeProjectionConfiguration,
     pub(super) private_reference: SecretBytes,
-    #[allow(dead_code)] // C-f production caller 接线前只由 focused test command 计费。
     pub(super) private_reference_capacity: usize,
     pub(super) scan_generation: [u8; 16],
     pub(super) observation_token: [u8; 32],
@@ -113,7 +342,6 @@ pub(super) struct PreparedNativeProjectionImport {
 }
 
 impl PreparedNativeProjectionImport {
-    #[allow(dead_code)] // C-f projector lifecycle 接线后进入 normal lane admission。
     pub(super) fn retained_capacity(&self) -> Result<usize, RuntimeStoreError> {
         self.descriptor
             .title
@@ -260,14 +488,12 @@ impl std::fmt::Debug for NativeProjectionReconcilePlan {
 }
 
 impl NativeProjectionReconcilePlan {
-    #[allow(dead_code)] // C-f actor registry 用 authenticated IDs 获取 quiescent/busy disposition。
     pub(crate) fn candidate_ids(&self) -> impl ExactSizeIterator<Item = RuntimeId> + '_ {
         self.candidates
             .iter()
             .map(|candidate| candidate.projection.conversation_id)
     }
 
-    #[allow(dead_code)] // C-f projector lifecycle 按 opaque keyset cursor 续跑完整 generation。
     pub(crate) const fn next_cursor(&self) -> Option<NativeProjectionReconcileCursor> {
         self.next_cursor
     }
@@ -320,7 +546,6 @@ impl NativeProjectionReconcilePlan {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // C-f actor control lane 接线后构造 exact quiescent/busy proof。
 pub(crate) enum NativeProjectionCandidateDisposition {
     Quiescent(RuntimeId),
     Busy(RuntimeId),
@@ -389,7 +614,6 @@ impl std::fmt::Debug for NativeProjectionRetirementPlan {
 }
 
 impl NativeProjectionRetirementPlan {
-    #[allow(dead_code)] // C-f bounded cleanup loop 按 opaque cursor 继续下一批。
     pub(crate) const fn next_cursor(&self) -> Option<NativeProjectionRetirementCursor> {
         self.next_cursor
     }
@@ -531,6 +755,20 @@ pub(crate) fn import_native_projection(
         &reference_token,
         &prepared.private_reference,
     )?;
+    if let Some(existing) = existing.as_ref()
+        && existing.projection.scan_generation != prepared.scan_generation
+        && super::metadata::conversation_has_active_authenticated_metadata_mutation(
+            &transaction,
+            key_bundle,
+            database_id,
+            existing.conversation.conversation_id,
+        )?
+    {
+        // BEGIN IMMEDIATE 内的 authenticated CAS：metadata claim 先提交时，
+        // projector 保留 pending candidate 且零写/零 ACK；projector 先提交时，
+        // 后续 claim 会在新 revision/generation 上串行开始。
+        return Err(RuntimeStoreError::MetadataMutationPending);
+    }
     if let Some(existing) = existing {
         if existing.projection.scan_generation == prepared.scan_generation {
             if existing.projection.state == ProjectionState::Present
@@ -1162,7 +1400,13 @@ struct RawEffectFenceRow {
 struct AuthenticatedEffectFenceRow {
     conversation_id: RuntimeId,
     idempotency_token: [u8; 32],
+    daemon_boot_id: RuntimeId,
+    effect_nonce: Zeroizing<Vec<u8>>,
+    effect_spec: Zeroizing<Vec<u8>>,
+    process: ProcessIdentity,
     release_authorized_at_ms: Option<u64>,
+    release_token_commitment: Option<[u8; 32]>,
+    metadata_token: [u8; 32],
 }
 
 #[derive(Default)]
@@ -1170,6 +1414,1099 @@ struct EffectFenceTotals {
     total: u64,
     unreleased: u64,
     released: u64,
+}
+
+pub(crate) fn persist_native_metadata_effect_fence(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    input: PersistNativeMetadataEffectFence,
+) -> Result<PersistNativeMetadataEffectFenceOutcome, RuntimeStoreError> {
+    validate_effect_fence_input(
+        state.database_id,
+        &input.mutation,
+        input.daemon_boot_id,
+        &input.effect_nonce,
+        Some(&input.effect_spec),
+    )?;
+    if !matches!(
+        input.mutation.status(),
+        NativeMetadataMutationStatus::Claimed | NativeMetadataMutationStatus::Applying
+    ) {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    // exact replay 必须在 clock/capacity admission 前只读返回。after-COMMIT unknown
+    // 重试不能因为新一轮时钟回退、磁盘低水位或 safety reserve probe 失败而拿不到
+    // 已提交的 Applying+fence readback。
+    let current = super::metadata::authenticate_native_metadata_claim(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        &input.mutation,
+    )?;
+    let existing = load_authenticated_effect_fence(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        current.conversation_id(),
+        current.idempotency_token(),
+    )?;
+    if let Some(existing) = existing {
+        if current.status() == NativeMetadataMutationStatus::Applying
+            && effect_fence_matches_prepare(&existing, &input)
+        {
+            return persist_effect_fence_outcome(
+                &state.key_bundle,
+                state.database_id,
+                current,
+                effect_fence_record(existing),
+            );
+        }
+        return Err(RuntimeStoreError::FenceConflict);
+    }
+    if current.status() != NativeMetadataMutationStatus::Claimed {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let observed_at_ms = config.clock.now_ms()?;
+    super::sqlite::admit_safety_write(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        &state.storage_path,
+        config.capacity_probe.as_ref(),
+    )?;
+    let database_id = state.database_id;
+    let key_bundle = &state.key_bundle;
+    let transaction = state
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mutation = super::metadata::transition_native_metadata_claim_to_applying(
+        &transaction,
+        key_bundle,
+        database_id,
+        &input.mutation,
+        observed_at_ms,
+    )?;
+    if let Some(existing) = load_optional_effect_fence(
+        &transaction,
+        key_bundle,
+        database_id,
+        mutation.conversation_id(),
+        mutation.idempotency_token(),
+    )? {
+        if effect_fence_matches_prepare(&existing, &input) {
+            return persist_effect_fence_outcome(
+                key_bundle,
+                database_id,
+                mutation,
+                effect_fence_record(existing),
+            );
+        }
+        return Err(RuntimeStoreError::FenceConflict);
+    }
+
+    let ledger = super::sqlite::load_runtime_ledger(&transaction, key_bundle, database_id)?;
+    if ledger.native_metadata_effect_fence_count >= MAX_METADATA_EFFECT_FENCE_ROWS {
+        return Err(RuntimeStoreError::MetadataMutationLimit {
+            scope: MetadataMutationLimitScope::GlobalCount,
+        });
+    }
+    let payload = encode_effect_fence_payload(
+        mutation.conversation_id(),
+        mutation.idempotency_token(),
+        input.daemon_boot_id,
+        &input.effect_nonce,
+        &input.effect_spec,
+        input.process,
+    )?;
+    let primary_key =
+        effect_fence_primary_key(mutation.conversation_id(), mutation.idempotency_token());
+    let sealed_fence = super::stream::seal_v4_row(
+        key_bundle,
+        database_id,
+        EFFECT_FENCE_TABLE,
+        &primary_key,
+        EFFECT_FENCE_COLUMN,
+        payload.as_ref(),
+        MAX_EFFECT_FENCE_PLAINTEXT_BYTES,
+    )?;
+    let logical_fence_bytes =
+        u64::try_from(payload.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    let sealed_fence_bytes =
+        u64::try_from(sealed_fence.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    let effect_nonce_token = effect_nonce_token(
+        key_bundle,
+        mutation.conversation_id(),
+        mutation.idempotency_token(),
+        input.daemon_boot_id,
+        &input.effect_nonce,
+    )?;
+    let effect_spec_token = effect_spec_token(
+        key_bundle,
+        mutation.conversation_id(),
+        mutation.idempotency_token(),
+        &input.effect_spec,
+    )?;
+    let metadata_token = effect_fence_metadata_token(
+        key_bundle,
+        mutation.conversation_id(),
+        mutation.idempotency_token(),
+        input.daemon_boot_id,
+        &effect_nonce_token,
+        &effect_spec_token,
+        input.process,
+        None,
+        None,
+        logical_fence_bytes,
+        sealed_fence_bytes,
+    )?;
+    let leader_start_time = encode_sequence(input.process.leader_start_time());
+    if transaction.execute(
+        "INSERT INTO native_metadata_effect_fences (
+             conversation_id, idempotency_token, daemon_boot_id,
+             effect_nonce_token, effect_spec_token, process_group_id, leader_pid,
+             leader_start_time, release_authorized_at_ms, release_token_commitment,
+             logical_fence_bytes, metadata_token, sealed_fence
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, ?9, ?10, ?11)",
+        params![
+            &mutation.conversation_id().as_bytes()[..],
+            &mutation.idempotency_token()[..],
+            &input.daemon_boot_id.as_bytes()[..],
+            &effect_nonce_token[..],
+            &effect_spec_token[..],
+            input.process.process_group_id(),
+            input.process.leader_pid(),
+            leader_start_time,
+            sqlite_u64(logical_fence_bytes)?,
+            &metadata_token[..],
+            sealed_fence,
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    let mut next = ledger.clone();
+    next.native_metadata_effect_fence_count =
+        checked_add(next.native_metadata_effect_fence_count, 1)?;
+    next.native_metadata_effect_unreleased_count =
+        checked_add(next.native_metadata_effect_unreleased_count, 1)?;
+    let _pending_targets = super::sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next,
+    )?;
+    // 在 COMMIT 前把所有不可失败的返回能力构造完；COMMIT 后不得再依赖一次
+    // StorageKEK/HMAC 或 SQLite readback 才能交付已持久化的 Applying+fence。
+    let fence = NativeMetadataEffectFenceRecord {
+        conversation_id: mutation.conversation_id(),
+        idempotency_token: *mutation.idempotency_token(),
+        daemon_boot_id: input.daemon_boot_id,
+        effect_nonce: Zeroizing::new(input.effect_nonce),
+        effect_spec: Zeroizing::new(input.effect_spec),
+        process: input.process,
+        release_authorized_at_ms: None,
+        release_token_commitment: None,
+    };
+    let outcome = persist_effect_fence_outcome(key_bundle, database_id, mutation, fence)?;
+    config
+        .fault_injector
+        .before_operation(RuntimeStoreOperation::PersistNativeMetadataEffectFenceBeforeCommit)?;
+    super::sqlite::commit_transaction(
+        transaction,
+        RuntimeCommitOperation::PersistNativeMetadataEffectFence,
+    )?;
+    super::sqlite::latch_post_commit_capacity(state, config);
+    native_projection_lifecycle_after_commit(
+        config,
+        RuntimeStoreOperation::PersistNativeMetadataEffectFenceAfterCommit,
+        RuntimeCommitOperation::PersistNativeMetadataEffectFence,
+    )?;
+    Ok(outcome)
+}
+
+pub(crate) fn authorize_native_metadata_effect_release(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    input: AuthorizeNativeMetadataEffectRelease,
+) -> Result<AuthorizeNativeMetadataEffectReleaseOutcome, RuntimeStoreError> {
+    validate_effect_fence_input(
+        state.database_id,
+        &input.mutation,
+        input.daemon_boot_id,
+        &input.effect_nonce,
+        None,
+    )?;
+    if input.mutation.status() != NativeMetadataMutationStatus::Applying
+        || input.release_token_commitment == [0; 32]
+    {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    // released exact replay 同样先只读返回 durable permit；不能再次依赖 clock 或
+    // write admission。transaction 内仍会对 fresh authorization 做第二次认证。
+    let current = super::metadata::authenticate_native_metadata_claim(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        &input.mutation,
+    )?;
+    let existing = load_authenticated_effect_fence(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        current.conversation_id(),
+        current.idempotency_token(),
+    )?
+    .ok_or(RuntimeStoreError::ExecutionFenceMissing)?;
+    if existing.daemon_boot_id != input.daemon_boot_id
+        || existing.effect_nonce.as_ref() != input.effect_nonce
+    {
+        return Err(RuntimeStoreError::FenceConflict);
+    }
+    if let Some(released_at) = existing.release_authorized_at_ms {
+        if existing.release_token_commitment != Some(input.release_token_commitment)
+            || current.status() != NativeMetadataMutationStatus::Applying
+        {
+            return Err(RuntimeStoreError::FenceConflict);
+        }
+        return Ok(AuthorizeNativeMetadataEffectReleaseOutcome {
+            mutation: current,
+            permit: effect_release_permit(existing, released_at)?,
+        });
+    }
+    if existing.release_token_commitment.is_some()
+        || current.status() != NativeMetadataMutationStatus::Applying
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let observed_at_ms = config.clock.now_ms()?;
+    if observed_at_ms == 0 {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    super::sqlite::admit_safety_write_with_credit(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        &state.storage_path,
+        config.capacity_probe.as_ref(),
+        super::metadata::MAX_NATIVE_METADATA_EFFECT_PERSIST_RESERVE_BYTES,
+    )?;
+    let database_id = state.database_id;
+    let key_bundle = &state.key_bundle;
+    let transaction = state
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mutation = super::metadata::transition_native_metadata_claim_to_applying(
+        &transaction,
+        key_bundle,
+        database_id,
+        &input.mutation,
+        observed_at_ms,
+    )?;
+    let existing = load_optional_effect_fence(
+        &transaction,
+        key_bundle,
+        database_id,
+        mutation.conversation_id(),
+        mutation.idempotency_token(),
+    )?
+    .ok_or(RuntimeStoreError::ExecutionFenceMissing)?;
+    if existing.daemon_boot_id != input.daemon_boot_id
+        || existing.effect_nonce.as_ref() != input.effect_nonce
+    {
+        return Err(RuntimeStoreError::FenceConflict);
+    }
+    if let Some(released_at) = existing.release_authorized_at_ms {
+        if existing.release_token_commitment != Some(input.release_token_commitment) {
+            return Err(RuntimeStoreError::FenceConflict);
+        }
+        return Ok(AuthorizeNativeMetadataEffectReleaseOutcome {
+            mutation,
+            permit: effect_release_permit(existing, released_at)?,
+        });
+    }
+    if existing.release_token_commitment.is_some() {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    if observed_at_ms < mutation.state_changed_at_ms() {
+        return Err(RuntimeStoreError::ClockRegressed {
+            persisted_ms: mutation.state_changed_at_ms(),
+            observed_ms: observed_at_ms,
+        });
+    }
+    let ledger = super::sqlite::load_runtime_ledger(&transaction, key_bundle, database_id)?;
+    let raw: (Vec<u8>, Vec<u8>, String, i64, i64) = transaction.query_row(
+        "SELECT effect_nonce_token, effect_spec_token, leader_start_time,
+                logical_fence_bytes, length(sealed_fence)
+         FROM native_metadata_effect_fences
+         WHERE conversation_id = ?1 AND idempotency_token = ?2",
+        params![
+            &mutation.conversation_id().as_bytes()[..],
+            &mutation.idempotency_token()[..],
+        ],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    let effect_nonce_token: [u8; 32] = fixed(raw.0)?;
+    let effect_spec_token: [u8; 32] = fixed(raw.1)?;
+    let logical_fence_bytes = nonnegative(raw.3)?;
+    let sealed_fence_bytes = nonnegative(raw.4)?;
+    let metadata_token = effect_fence_metadata_token(
+        key_bundle,
+        mutation.conversation_id(),
+        mutation.idempotency_token(),
+        input.daemon_boot_id,
+        &effect_nonce_token,
+        &effect_spec_token,
+        existing.process,
+        Some(observed_at_ms),
+        Some(&input.release_token_commitment),
+        logical_fence_bytes,
+        sealed_fence_bytes,
+    )?;
+    if transaction.execute(
+        "UPDATE native_metadata_effect_fences
+         SET release_authorized_at_ms = ?1, release_token_commitment = ?2,
+             metadata_token = ?3
+         WHERE conversation_id = ?4 AND idempotency_token = ?5
+           AND release_authorized_at_ms IS NULL AND release_token_commitment IS NULL",
+        params![
+            sqlite_time(observed_at_ms)?,
+            &input.release_token_commitment[..],
+            &metadata_token[..],
+            &mutation.conversation_id().as_bytes()[..],
+            &mutation.idempotency_token()[..],
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    let mut next = ledger.clone();
+    next.native_metadata_effect_unreleased_count = next
+        .native_metadata_effect_unreleased_count
+        .checked_sub(1)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    next.native_metadata_effect_released_count =
+        checked_add(next.native_metadata_effect_released_count, 1)?;
+    let _pending_targets = super::sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next,
+    )?;
+    config.fault_injector.before_operation(
+        RuntimeStoreOperation::AuthorizeNativeMetadataEffectReleaseBeforeCommit,
+    )?;
+    super::sqlite::commit_transaction(
+        transaction,
+        RuntimeCommitOperation::AuthorizeNativeMetadataEffectRelease,
+    )?;
+    super::sqlite::latch_post_commit_capacity(state, config);
+    native_projection_lifecycle_after_commit(
+        config,
+        RuntimeStoreOperation::AuthorizeNativeMetadataEffectReleaseAfterCommit,
+        RuntimeCommitOperation::AuthorizeNativeMetadataEffectRelease,
+    )?;
+    // 与 persist 一样，COMMIT 后不再做第二次 SQLite 查询。permit 只由 transaction 内
+    // 完整认证的 existing fence 与刚提交的 opaque gate commitment 构造。
+    let permit = NativeMetadataEffectReleasePermit {
+        conversation_id: existing.conversation_id,
+        idempotency_token: existing.idempotency_token,
+        daemon_boot_id: existing.daemon_boot_id,
+        effect_nonce: existing.effect_nonce,
+        process: existing.process,
+        release_token_commitment: input.release_token_commitment,
+        release_authorized_at_ms: observed_at_ms,
+    };
+    Ok(AuthorizeNativeMetadataEffectReleaseOutcome { mutation, permit })
+}
+
+pub(crate) fn fail_unreleased_native_metadata_effect(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    input: FailUnreleasedNativeMetadataEffect,
+    effects: &mut CommandStreamEffects,
+) -> Result<UpdateConversationMetadataOutcome, RuntimeStoreError> {
+    validate_effect_fence_input(
+        state.database_id,
+        &input.mutation,
+        input.daemon_boot_id,
+        &input.effect_nonce,
+        Some(&input.effect_spec),
+    )?;
+    if input.mutation.status() != NativeMetadataMutationStatus::Applying {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    let expected_commitment = unreleased_cleanup_authority_commitment(
+        &state.key_bundle,
+        state.database_id,
+        &input.mutation,
+        input.daemon_boot_id,
+        &input.effect_nonce,
+        &input.effect_spec,
+        input.process,
+    )?;
+    if !constant_time_capability_eq(&input.cleanup_authority.commitment, &expected_commitment) {
+        return Err(RuntimeStoreError::FenceConflict);
+    }
+
+    // exact terminal replay 先于 clock/capacity，确保 after-COMMIT unknown 即使后续
+    // 时钟或磁盘探针失败，仍只能读回同一 sealed clean-reap terminal。
+    if let Some(outcome) = super::metadata::preflight_fail_unreleased_native_metadata_effect(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        &input.mutation,
+        &input.failure,
+        &expected_commitment,
+    )? {
+        return Ok(outcome);
+    }
+    let existing = load_authenticated_effect_fence(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        input.mutation.conversation_id(),
+        input.mutation.idempotency_token(),
+    )?
+    .ok_or(RuntimeStoreError::ExecutionFenceMissing)?;
+    if !effect_fence_matches_clean_reap(&existing, &input) {
+        return Err(RuntimeStoreError::FenceConflict);
+    }
+    if existing.release_authorized_at_ms.is_some() || existing.release_token_commitment.is_some() {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+
+    super::sqlite::admit_safety_write_with_credit(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        &state.storage_path,
+        config.capacity_probe.as_ref(),
+        super::metadata::MAX_NATIVE_METADATA_PRE_TERMINAL_RESERVE_BYTES,
+    )?;
+    let changed_at_ms = config.clock.now_ms().map_err(RuntimeStoreError::from)?;
+    let database_id = state.database_id;
+    let key_bundle = &state.key_bundle;
+    let transaction = state
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let ledger = super::sqlite::load_runtime_ledger(&transaction, key_bundle, database_id)?;
+    let existing = load_authenticated_effect_fence(
+        &transaction,
+        key_bundle,
+        database_id,
+        input.mutation.conversation_id(),
+        input.mutation.idempotency_token(),
+    )?
+    .ok_or(RuntimeStoreError::ExecutionFenceMissing)?;
+    if !effect_fence_matches_clean_reap(&existing, &input)
+        || existing.release_authorized_at_ms.is_some()
+        || existing.release_token_commitment.is_some()
+    {
+        return Err(RuntimeStoreError::FenceConflict);
+    }
+    let mut next = super::metadata::fail_unreleased_native_metadata_effect_parent(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &input.mutation,
+        &input.failure,
+        expected_commitment,
+        changed_at_ms,
+    )?;
+    if transaction.execute(
+        "DELETE FROM native_metadata_effect_fences
+         WHERE conversation_id = ?1 AND idempotency_token = ?2 AND metadata_token = ?3",
+        params![
+            &existing.conversation_id.as_bytes()[..],
+            &existing.idempotency_token[..],
+            &existing.metadata_token[..],
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    next.native_metadata_effect_fence_count = next
+        .native_metadata_effect_fence_count
+        .checked_sub(1)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    next.native_metadata_effect_unreleased_count = next
+        .native_metadata_effect_unreleased_count
+        .checked_sub(1)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    // released count 必须保持 byte-for-byte 不变；同时用 transaction 内 physical
+    // evidence 对位，避免只改 authenticated totals 却漏删/多删 fence。
+    let physical_fence_count = nonnegative(transaction.query_row(
+        "SELECT COUNT(*) FROM native_metadata_effect_fences",
+        [],
+        |row| row.get(0),
+    )?)?;
+    let physical_unreleased_count = nonnegative(transaction.query_row(
+        "SELECT COUNT(*) FROM native_metadata_effect_fences
+         WHERE release_authorized_at_ms IS NULL AND release_token_commitment IS NULL",
+        [],
+        |row| row.get(0),
+    )?)?;
+    let physical_released_count = nonnegative(transaction.query_row(
+        "SELECT COUNT(*) FROM native_metadata_effect_fences
+         WHERE release_authorized_at_ms IS NOT NULL AND release_token_commitment IS NOT NULL",
+        [],
+        |row| row.get(0),
+    )?)?;
+    if physical_fence_count != next.native_metadata_effect_fence_count
+        || physical_unreleased_count != next.native_metadata_effect_unreleased_count
+        || physical_released_count != next.native_metadata_effect_released_count
+        || next.native_metadata_effect_released_count
+            != ledger.native_metadata_effect_released_count
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    let pending_targets = super::sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next,
+    )?;
+    config
+        .fault_injector
+        .before_operation(RuntimeStoreOperation::FailUnreleasedNativeMetadataEffectBeforeCommit)?;
+    let commit_result = super::sqlite::commit_transaction(
+        transaction,
+        RuntimeCommitOperation::FailUnreleasedNativeMetadataEffect,
+    );
+    effects.record_commit_result(pending_targets, &commit_result);
+    commit_result?;
+    super::sqlite::latch_post_commit_capacity(state, config);
+    native_projection_lifecycle_after_commit(
+        config,
+        RuntimeStoreOperation::FailUnreleasedNativeMetadataEffectAfterCommit,
+        RuntimeCommitOperation::FailUnreleasedNativeMetadataEffect,
+    )?;
+    Ok(UpdateConversationMetadataOutcome::Failed {
+        failure: input.failure,
+    })
+}
+
+fn validate_effect_fence_input(
+    database_id: [u8; 16],
+    mutation: &NativeMetadataMutationClaim,
+    daemon_boot_id: RuntimeId,
+    effect_nonce: &[u8],
+    effect_spec: Option<&[u8]>,
+) -> Result<(), RuntimeStoreError> {
+    if mutation.database_id() != &database_id {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    if daemon_boot_id.kind() != RuntimeIdKind::DaemonBoot {
+        return Err(RuntimeStoreError::IdKindMismatch {
+            expected: RuntimeIdKind::DaemonBoot,
+            actual: daemon_boot_id.kind(),
+        });
+    }
+    if effect_nonce.is_empty()
+        || effect_nonce.len() > MAX_EFFECT_NONCE_BYTES
+        || effect_spec.is_some_and(|spec| spec.is_empty() || spec.len() > MAX_EFFECT_SPEC_BYTES)
+    {
+        return Err(RuntimeStoreError::PayloadTooLarge);
+    }
+    Ok(())
+}
+
+fn effect_fence_matches_clean_reap(
+    existing: &AuthenticatedEffectFenceRow,
+    input: &FailUnreleasedNativeMetadataEffect,
+) -> bool {
+    existing.conversation_id == input.mutation.conversation_id()
+        && existing.idempotency_token == *input.mutation.idempotency_token()
+        && existing.daemon_boot_id == input.daemon_boot_id
+        && constant_time_bytes_eq(existing.effect_nonce.as_ref(), &input.effect_nonce)
+        && constant_time_bytes_eq(existing.effect_spec.as_ref(), &input.effect_spec)
+        && existing.process == input.process
+}
+
+fn constant_time_bytes_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+fn effect_fence_matches_prepare(
+    existing: &AuthenticatedEffectFenceRow,
+    input: &PersistNativeMetadataEffectFence,
+) -> bool {
+    existing.conversation_id == input.mutation.conversation_id()
+        && existing.idempotency_token == *input.mutation.idempotency_token()
+        && existing.daemon_boot_id == input.daemon_boot_id
+        && existing.effect_nonce.as_ref() == input.effect_nonce
+        && existing.effect_spec.as_ref() == input.effect_spec
+        && existing.process == input.process
+        && existing.release_authorized_at_ms.is_none()
+        && existing.release_token_commitment.is_none()
+}
+
+fn constant_time_capability_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn unreleased_cleanup_authority_commitment(
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    mutation: &NativeMetadataMutationClaim,
+    daemon_boot_id: RuntimeId,
+    effect_nonce: &[u8],
+    effect_spec: &[u8],
+    process: ProcessIdentity,
+) -> Result<[u8; 32], RuntimeStoreError> {
+    if mutation.database_id() != &database_id
+        || mutation.status() != NativeMetadataMutationStatus::Applying
+        || daemon_boot_id.kind() != RuntimeIdKind::DaemonBoot
+        || effect_nonce.is_empty()
+        || effect_nonce.len() > MAX_EFFECT_NONCE_BYTES
+        || effect_spec.is_empty()
+        || effect_spec.len() > MAX_EFFECT_SPEC_BYTES
+    {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    let process_group_id = u64::try_from(process.process_group_id())
+        .map_err(|_| RuntimeStoreError::InvalidStateTransition)?;
+    let leader_pid = u64::try_from(process.leader_pid())
+        .map_err(|_| RuntimeStoreError::InvalidStateTransition)?;
+    let title = optional_field(mutation.requested_title().map(str::as_bytes));
+    metadata_mac(
+        key_bundle,
+        UNRELEASED_CLEANUP_AUTHORITY_DOMAIN,
+        &[
+            &database_id,
+            mutation.conversation_id().as_bytes(),
+            mutation.idempotency_token(),
+            mutation.request_token(),
+            &mutation.expected_entry_revision().to_be_bytes(),
+            &title,
+            &mutation.created_at_ms().to_be_bytes(),
+            &mutation.state_changed_at_ms().to_be_bytes(),
+            daemon_boot_id.as_bytes(),
+            effect_nonce,
+            effect_spec,
+            &process_group_id.to_be_bytes(),
+            &leader_pid.to_be_bytes(),
+            &process.leader_start_time().to_be_bytes(),
+        ],
+    )
+}
+
+fn persist_effect_fence_outcome(
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    mutation: NativeMetadataMutationClaim,
+    fence: NativeMetadataEffectFenceRecord,
+) -> Result<PersistNativeMetadataEffectFenceOutcome, RuntimeStoreError> {
+    if fence.release_authorized_at_ms.is_some() || fence.release_token_commitment.is_some() {
+        return Err(RuntimeStoreError::ExecutionReleaseMissing);
+    }
+    let commitment = unreleased_cleanup_authority_commitment(
+        key_bundle,
+        database_id,
+        &mutation,
+        fence.daemon_boot_id,
+        fence.effect_nonce.as_ref(),
+        fence.effect_spec.as_ref(),
+        fence.process,
+    )?;
+    Ok(PersistNativeMetadataEffectFenceOutcome {
+        mutation,
+        fence,
+        unreleased_cleanup_authority: NativeMetadataEffectUnreleasedCleanupAuthority { commitment },
+    })
+}
+
+fn load_optional_effect_fence(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    conversation_id: RuntimeId,
+    idempotency_token: &[u8; 32],
+) -> Result<Option<AuthenticatedEffectFenceRow>, RuntimeStoreError> {
+    load_authenticated_effect_fence(
+        connection,
+        key_bundle,
+        database_id,
+        conversation_id,
+        idempotency_token,
+    )
+}
+
+fn load_authenticated_effect_fence(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    conversation_id: RuntimeId,
+    idempotency_token: &[u8; 32],
+) -> Result<Option<AuthenticatedEffectFenceRow>, RuntimeStoreError> {
+    let raw = connection
+        .query_row(
+            "SELECT conversation_id, idempotency_token, daemon_boot_id,
+                    effect_nonce_token, effect_spec_token, process_group_id,
+                    leader_pid, leader_start_time, release_authorized_at_ms,
+                    release_token_commitment, logical_fence_bytes, metadata_token,
+                    sealed_fence
+             FROM native_metadata_effect_fences
+             WHERE conversation_id = ?1 AND idempotency_token = ?2",
+            params![&conversation_id.as_bytes()[..], &idempotency_token[..]],
+            raw_effect_fence_row,
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let authenticated = authenticate_effect_fence_row(key_bundle, database_id, raw)?;
+    if authenticated.conversation_id != conversation_id
+        || authenticated.idempotency_token != *idempotency_token
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(Some(authenticated))
+}
+
+pub(crate) fn load_native_metadata_effect_recovery_record(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    mutation: &NativeMetadataMutationClaim,
+) -> Result<NativeMetadataEffectRecoveryRecord, RuntimeStoreError> {
+    let mutation = super::metadata::authenticate_native_metadata_claim(
+        connection,
+        key_bundle,
+        database_id,
+        mutation,
+    )?;
+    let fence = load_authenticated_effect_fence(
+        connection,
+        key_bundle,
+        database_id,
+        mutation.conversation_id(),
+        mutation.idempotency_token(),
+    )?;
+    match (mutation.status(), fence.as_ref()) {
+        (NativeMetadataMutationStatus::Claimed, None) => {}
+        (NativeMetadataMutationStatus::Applying, Some(_)) => {}
+        (NativeMetadataMutationStatus::OutcomeUnknown, Some(fence))
+            if fence.release_authorized_at_ms.is_some()
+                && fence.release_token_commitment.is_some() => {}
+        _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
+    }
+    let unreleased_cleanup_authority = match (mutation.status(), fence.as_ref()) {
+        (NativeMetadataMutationStatus::Applying, Some(fence))
+            if fence.release_authorized_at_ms.is_none()
+                && fence.release_token_commitment.is_none() =>
+        {
+            Some(NativeMetadataEffectUnreleasedCleanupAuthority {
+                commitment: unreleased_cleanup_authority_commitment(
+                    key_bundle,
+                    database_id,
+                    &mutation,
+                    fence.daemon_boot_id,
+                    fence.effect_nonce.as_ref(),
+                    fence.effect_spec.as_ref(),
+                    fence.process,
+                )?,
+            })
+        }
+        _ => None,
+    };
+    Ok(NativeMetadataEffectRecoveryRecord {
+        mutation,
+        fence: fence.map(effect_fence_record),
+        unreleased_cleanup_authority,
+    })
+}
+
+/// metadata terminal transition 的 transaction-local prerequisite。调用方已经持有
+/// authenticated claim；这里仍完整 open/MAC/authenticate fence，并要求 release evidence
+/// 与同一 parent key 精确绑定，禁止只按裸 COUNT/nullable 字段推进 terminal。
+pub(super) fn ensure_released_native_metadata_effect_fence(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    mutation: &NativeMetadataMutationClaim,
+) -> Result<(), RuntimeStoreError> {
+    if mutation.database_id() != &database_id
+        || !matches!(
+            mutation.status(),
+            NativeMetadataMutationStatus::Applying | NativeMetadataMutationStatus::OutcomeUnknown
+        )
+    {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    let fence = load_authenticated_effect_fence(
+        connection,
+        key_bundle,
+        database_id,
+        mutation.conversation_id(),
+        mutation.idempotency_token(),
+    )?
+    .ok_or(RuntimeStoreError::ExecutionFenceMissing)?;
+    if fence.release_authorized_at_ms.is_none() || fence.release_token_commitment.is_none() {
+        return Err(RuntimeStoreError::ExecutionReleaseMissing);
+    }
+    Ok(())
+}
+
+/// native metadata Applied transaction 在 conversation/catalog revision 已推进后调用，
+/// 同步更新 present projection 的 authenticated catalog binding。除 revision 与对应 MAC
+/// 外不改变 generation、observation、reference 或 lifecycle 时间。
+pub(super) fn advance_present_native_projection_catalog_revision(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    conversation_id: RuntimeId,
+    expected_old_revision: u64,
+    next_revision: u64,
+) -> Result<(), RuntimeStoreError> {
+    if next_revision <= expected_old_revision {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    let projection = load_projection_by_conversation_id(connection, key_bundle, conversation_id)?
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if projection.state != ProjectionState::Present
+        || projection.projection_catalog_revision != expected_old_revision
+        || projection.origin_namespace != AdapterStateNamespace::ClaudeCode.origin_namespace()
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let conversation =
+        super::journal::load_conversation(connection, key_bundle, database_id, conversation_id)?;
+    let state =
+        super::configuration::load_conversation_state(connection, key_bundle, conversation_id)?;
+    if conversation.catalog_revision != next_revision
+        || conversation.descriptor.agent_kind != AdapterStateNamespace::ClaudeCode.agent_kind()
+        || !state.is_native_projected()
+        || state.origin_namespace() != Some(AdapterStateNamespace::ClaudeCode.origin_namespace())
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let binding = super::journal::load_adapter_state_binding_evidence_for_conversation(
+        connection,
+        key_bundle,
+        database_id,
+        AdapterStateNamespace::ClaudeCode,
+        &conversation,
+    )?
+    .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    validate_projection_binding(&projection, &binding)?;
+    let next_revision_text = encode_sequence(next_revision);
+    let next_token = projection_metadata_token(
+        key_bundle,
+        conversation_id,
+        &projection.origin_namespace,
+        &projection.state_reference_token,
+        projection.state,
+        &projection.scan_generation,
+        &projection.observation_token,
+        &next_revision_text,
+        projection.reconciled_at_ms,
+        projection.state_changed_at_ms,
+        projection.retain_until_ms,
+        projection.charged_reference_bytes,
+    )?;
+    if connection.execute(
+        "UPDATE native_projection_state
+         SET projection_catalog_revision = ?1, metadata_token = ?2
+         WHERE conversation_id = ?3 AND projection_state = 'present'
+           AND projection_catalog_revision = ?4 AND metadata_token = ?5",
+        params![
+            next_revision_text,
+            &next_token[..],
+            &conversation_id.as_bytes()[..],
+            encode_sequence(expected_old_revision),
+            &projection.metadata_token[..],
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    Ok(())
+}
+
+fn effect_fence_record(row: AuthenticatedEffectFenceRow) -> NativeMetadataEffectFenceRecord {
+    NativeMetadataEffectFenceRecord {
+        conversation_id: row.conversation_id,
+        idempotency_token: row.idempotency_token,
+        daemon_boot_id: row.daemon_boot_id,
+        effect_nonce: row.effect_nonce,
+        effect_spec: row.effect_spec,
+        process: row.process,
+        release_authorized_at_ms: row.release_authorized_at_ms,
+        release_token_commitment: row.release_token_commitment,
+    }
+}
+
+fn effect_release_permit(
+    row: AuthenticatedEffectFenceRow,
+    released_at_ms: u64,
+) -> Result<NativeMetadataEffectReleasePermit, RuntimeStoreError> {
+    let release_token_commitment = row
+        .release_token_commitment
+        .ok_or(RuntimeStoreError::ExecutionReleaseMissing)?;
+    Ok(NativeMetadataEffectReleasePermit {
+        conversation_id: row.conversation_id,
+        idempotency_token: row.idempotency_token,
+        daemon_boot_id: row.daemon_boot_id,
+        effect_nonce: row.effect_nonce,
+        process: row.process,
+        release_token_commitment,
+        release_authorized_at_ms: released_at_ms,
+    })
+}
+
+fn encode_effect_fence_payload(
+    conversation_id: RuntimeId,
+    idempotency_token: &[u8; 32],
+    daemon_boot_id: RuntimeId,
+    effect_nonce: &[u8],
+    effect_spec: &[u8],
+    process: ProcessIdentity,
+) -> Result<Zeroizing<Vec<u8>>, RuntimeStoreError> {
+    let process_group_id = u64::try_from(process.process_group_id())
+        .map_err(|_| RuntimeStoreError::InvalidStateTransition)?;
+    let leader_pid = u64::try_from(process.leader_pid())
+        .map_err(|_| RuntimeStoreError::InvalidStateTransition)?;
+    let process_group_bytes = process_group_id.to_be_bytes();
+    let leader_pid_bytes = leader_pid.to_be_bytes();
+    let leader_start_time_bytes = process.leader_start_time().to_be_bytes();
+    let fields: [&[u8]; 8] = [
+        conversation_id.as_bytes(),
+        idempotency_token,
+        daemon_boot_id.as_bytes(),
+        effect_nonce,
+        effect_spec,
+        &process_group_bytes,
+        &leader_pid_bytes,
+        &leader_start_time_bytes,
+    ];
+    let encoded_len =
+        fields
+            .iter()
+            .try_fold(EFFECT_FENCE_PAYLOAD_MAGIC.len(), |total, field| {
+                u32::try_from(field.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+                total
+                    .checked_add(4)
+                    .and_then(|value| value.checked_add(field.len()))
+                    .ok_or(RuntimeStoreError::PayloadTooLarge)
+            })?;
+    if encoded_len > MAX_EFFECT_FENCE_PLAINTEXT_BYTES {
+        return Err(RuntimeStoreError::PayloadTooLarge);
+    }
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(encoded_len)
+        .map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    encoded.extend_from_slice(EFFECT_FENCE_PAYLOAD_MAGIC);
+    for field in fields {
+        encoded.extend_from_slice(
+            &u32::try_from(field.len())
+                .map_err(|_| RuntimeStoreError::PayloadTooLarge)?
+                .to_be_bytes(),
+        );
+        encoded.extend_from_slice(field);
+    }
+    Ok(Zeroizing::new(encoded))
+}
+
+fn effect_nonce_token(
+    key_bundle: &RuntimeKeyBundle,
+    conversation_id: RuntimeId,
+    idempotency_token: &[u8; 32],
+    daemon_boot_id: RuntimeId,
+    effect_nonce: &[u8],
+) -> Result<[u8; 32], RuntimeStoreError> {
+    metadata_mac(
+        key_bundle,
+        EFFECT_NONCE_DOMAIN,
+        &[
+            conversation_id.as_bytes(),
+            idempotency_token,
+            daemon_boot_id.as_bytes(),
+            effect_nonce,
+        ],
+    )
+}
+
+fn effect_spec_token(
+    key_bundle: &RuntimeKeyBundle,
+    conversation_id: RuntimeId,
+    idempotency_token: &[u8; 32],
+    effect_spec: &[u8],
+) -> Result<[u8; 32], RuntimeStoreError> {
+    metadata_mac(
+        key_bundle,
+        EFFECT_SPEC_DOMAIN,
+        &[conversation_id.as_bytes(), idempotency_token, effect_spec],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn effect_fence_metadata_token(
+    key_bundle: &RuntimeKeyBundle,
+    conversation_id: RuntimeId,
+    idempotency_token: &[u8; 32],
+    daemon_boot_id: RuntimeId,
+    effect_nonce_token: &[u8; 32],
+    effect_spec_token: &[u8; 32],
+    process: ProcessIdentity,
+    release_authorized_at_ms: Option<u64>,
+    release_token_commitment: Option<&[u8; 32]>,
+    logical_fence_bytes: u64,
+    sealed_fence_bytes: u64,
+) -> Result<[u8; 32], RuntimeStoreError> {
+    let process_group_id = u64::try_from(process.process_group_id())
+        .map_err(|_| RuntimeStoreError::InvalidStateTransition)?;
+    let leader_pid = u64::try_from(process.leader_pid())
+        .map_err(|_| RuntimeStoreError::InvalidStateTransition)?;
+    let leader_start_time = encode_sequence(process.leader_start_time());
+    let release_time_bytes = release_authorized_at_ms.map(u64::to_be_bytes);
+    let release_time_field = optional_field(release_time_bytes.as_ref().map(|value| &value[..]));
+    let release_commitment_field = optional_field(release_token_commitment.map(|value| &value[..]));
+    metadata_mac(
+        key_bundle,
+        EFFECT_FENCE_METADATA_DOMAIN,
+        &[
+            conversation_id.as_bytes(),
+            idempotency_token,
+            daemon_boot_id.as_bytes(),
+            effect_nonce_token,
+            effect_spec_token,
+            &process_group_id.to_be_bytes(),
+            &leader_pid.to_be_bytes(),
+            leader_start_time.as_bytes(),
+            &release_time_field,
+            &release_commitment_field,
+            &logical_fence_bytes.to_be_bytes(),
+            &sealed_fence_bytes.to_be_bytes(),
+        ],
+    )
 }
 
 pub(super) fn validate_v6_integrity(
@@ -2646,7 +3983,10 @@ fn authenticate_effect_fence_row(
         .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
     let release_authorized_at_ms = raw.release_authorized_at_ms.map(nonnegative).transpose()?;
     let release_token_commitment = raw.release_token_commitment.map(fixed::<32>).transpose()?;
-    if release_authorized_at_ms.is_some() != release_token_commitment.is_some() {
+    if release_authorized_at_ms == Some(0)
+        || release_authorized_at_ms.is_some() != release_token_commitment.is_some()
+        || release_token_commitment.is_some_and(|commitment| commitment == [0; 32])
+    {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
     let logical_fence_bytes = nonnegative(raw.logical_fence_bytes)?;
@@ -2674,7 +4014,8 @@ fn authenticate_effect_fence_row(
             &sealed_fence_bytes.to_be_bytes(),
         ],
     )?;
-    if fixed::<32>(raw.metadata_token)? != expected_metadata_token {
+    let metadata_token = fixed::<32>(raw.metadata_token)?;
+    if metadata_token != expected_metadata_token {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
     let primary_key = effect_fence_primary_key(conversation_id, &idempotency_token);
@@ -2722,31 +4063,19 @@ fn authenticate_effect_fence_row(
         EFFECT_SPEC_DOMAIN,
         &[conversation_id.as_bytes(), &idempotency_token, fields[4]],
     )?;
-    let expected_release_commitment = release_authorized_at_ms
-        .map(|released_at| {
-            metadata_mac(
-                key_bundle,
-                EFFECT_RELEASE_DOMAIN,
-                &[
-                    conversation_id.as_bytes(),
-                    &idempotency_token,
-                    daemon_boot_id.as_bytes(),
-                    fields[3],
-                    &released_at.to_be_bytes(),
-                ],
-            )
-        })
-        .transpose()?;
-    if effect_nonce_token != expected_nonce_token
-        || effect_spec_token != expected_spec_token
-        || release_token_commitment != expected_release_commitment
-    {
+    if effect_nonce_token != expected_nonce_token || effect_spec_token != expected_spec_token {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
     Ok(AuthenticatedEffectFenceRow {
         conversation_id,
         idempotency_token,
+        daemon_boot_id,
+        effect_nonce: Zeroizing::new(fields[3].to_vec()),
+        effect_spec: Zeroizing::new(fields[4].to_vec()),
+        process: process_identity,
         release_authorized_at_ms,
+        release_token_commitment,
+        metadata_token,
     })
 }
 
@@ -3071,18 +4400,9 @@ mod tests {
             &[conversation_id.as_bytes(), &idempotency_token, effect_spec],
         )
         .expect("authenticate effect spec");
-        let release_commitment = metadata_mac(
-            &key_bundle,
-            EFFECT_RELEASE_DOMAIN,
-            &[
-                conversation_id.as_bytes(),
-                &idempotency_token,
-                daemon_boot_id.as_bytes(),
-                effect_nonce,
-                &release_authorized_at_ms.to_be_bytes(),
-            ],
-        )
-        .expect("authenticate effect release");
+        // 这是 blocked exec-gate 回报的 opaque SHA-256 commitment；StorageKEK 只用来
+        // 认证持久化行，不能自行派生一个替代 commitment。
+        let release_commitment = [0x37; 32];
         let primary_key = effect_fence_primary_key(conversation_id, &idempotency_token);
         let sealed_fence = super::super::stream::seal_v4_row(
             &key_bundle,
@@ -3198,20 +4518,7 @@ mod tests {
             &[conversation_id.as_bytes(), idempotency_token, effect_spec],
         )
         .expect("recompute fixture spec token");
-        let release_commitment = release_authorized_at_ms.map(|released_at| {
-            metadata_mac(
-                key_bundle,
-                EFFECT_RELEASE_DOMAIN,
-                &[
-                    conversation_id.as_bytes(),
-                    idempotency_token,
-                    daemon_boot_id.as_bytes(),
-                    effect_nonce,
-                    &released_at.to_be_bytes(),
-                ],
-            )
-            .expect("recompute fixture release commitment")
-        });
+        let release_commitment = release_authorized_at_ms.map(|_| [0x37; 32]);
         let (logical_fence_bytes, sealed_fence_bytes): (i64, i64) = connection
             .query_row(
                 "SELECT logical_fence_bytes, length(sealed_fence)
@@ -3265,6 +4572,92 @@ mod tests {
                 ],
             )
             .expect("rewrite fixture release state");
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn rewrite_effect_fence_with_external_gate_commitment(
+        connection: &Connection,
+        key_bundle: &RuntimeKeyBundle,
+        conversation_id: RuntimeId,
+        idempotency_token: &[u8; 32],
+        gate_commitment: &[u8; 32],
+    ) {
+        let (
+            daemon_boot_id,
+            effect_nonce_token,
+            effect_spec_token,
+            process_group_id,
+            leader_pid,
+            leader_start_time,
+            release_authorized_at_ms,
+            logical_fence_bytes,
+            sealed_fence_bytes,
+        ): (Vec<u8>, Vec<u8>, Vec<u8>, i64, i64, String, i64, i64, i64) = connection
+            .query_row(
+                "SELECT daemon_boot_id, effect_nonce_token, effect_spec_token,
+                        process_group_id, leader_pid, leader_start_time,
+                        release_authorized_at_ms, logical_fence_bytes,
+                        length(sealed_fence)
+                 FROM native_metadata_effect_fences
+                 WHERE conversation_id = ?1 AND idempotency_token = ?2",
+                params![&conversation_id.as_bytes()[..], &idempotency_token[..]],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                },
+            )
+            .expect("read released fence for external commitment rewrite");
+        let process_group_id = u64::try_from(process_group_id).expect("fixture PGID fits u64");
+        let leader_pid = u64::try_from(leader_pid).expect("fixture PID fits u64");
+        let release_authorized_at_ms =
+            u64::try_from(release_authorized_at_ms).expect("fixture release time fits u64");
+        let logical_fence_bytes =
+            u64::try_from(logical_fence_bytes).expect("fixture logical bytes fit u64");
+        let sealed_fence_bytes =
+            u64::try_from(sealed_fence_bytes).expect("fixture sealed bytes fit u64");
+        let release_time_field = optional_field(Some(&release_authorized_at_ms.to_be_bytes()));
+        let release_commitment_field = optional_field(Some(gate_commitment));
+        let metadata_token = metadata_mac(
+            key_bundle,
+            EFFECT_FENCE_METADATA_DOMAIN,
+            &[
+                conversation_id.as_bytes(),
+                idempotency_token,
+                &daemon_boot_id,
+                &effect_nonce_token,
+                &effect_spec_token,
+                &process_group_id.to_be_bytes(),
+                &leader_pid.to_be_bytes(),
+                leader_start_time.as_bytes(),
+                &release_time_field,
+                &release_commitment_field,
+                &logical_fence_bytes.to_be_bytes(),
+                &sealed_fence_bytes.to_be_bytes(),
+            ],
+        )
+        .expect("authenticate external gate commitment fixture");
+        connection
+            .execute(
+                "UPDATE native_metadata_effect_fences
+                 SET release_token_commitment = ?1, metadata_token = ?2
+                 WHERE conversation_id = ?3 AND idempotency_token = ?4",
+                params![
+                    &gate_commitment[..],
+                    &metadata_token[..],
+                    &conversation_id.as_bytes()[..],
+                    &idempotency_token[..],
+                ],
+            )
+            .expect("rewrite external gate commitment fixture");
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3457,6 +4850,44 @@ mod tests {
     }
 
     #[test]
+    fn released_effect_fence_accepts_the_exec_gate_commitment_as_opaque_evidence() {
+        // 威胁场景：v6 的早期 fixture 用 StorageKEK 派生一个 release commitment；若
+        // production 沿用该算法，Store 记录的就不是 blocked exec-gate 实际回报的
+        // token commitment，durable release permit 无法证明放行的是同一个 gate。
+        let root = TestRoot::new("external-gate-commitment");
+        let database = root.database();
+        let keys = MemoryKeyStore::new();
+        let config = RuntimeStoreConfig::new(database.clone());
+        let mut state = super::super::sqlite::open(
+            &config,
+            load_or_create_storage_kek(&keys, &database)
+                .expect("create external commitment StorageKEK"),
+        )
+        .expect("open external commitment fixture store");
+        let (conversation_id, idempotency_token) =
+            install_valid_projection_and_released_fence(&mut state, &config);
+        let transaction = state
+            .connection
+            .transaction()
+            .expect("start external commitment rewrite");
+        rewrite_effect_fence_with_external_gate_commitment(
+            &transaction,
+            &state.key_bundle,
+            conversation_id,
+            &idempotency_token,
+            &[0xE7; 32],
+        );
+        transaction.commit().expect("commit external gate evidence");
+
+        super::super::journal::validate_store_integrity(
+            &state.connection,
+            &state.key_bundle,
+            state.database_id,
+        )
+        .expect("opaque exec-gate commitment must remain authenticated");
+    }
+
+    #[test]
     fn projection_and_effect_fence_authenticated_fields_and_presence_are_fail_closed() {
         for (label, tamper_sql) in [
             (
@@ -3609,6 +5040,7 @@ mod tests {
     fn native_metadata_effect_parent_lifecycle_matrix_is_enforced() {
         for (case, expected_valid) in [
             ("applying-unreleased", true),
+            ("applying-released-zero", false),
             ("claimed-none", true),
             ("claimed-fence", false),
             ("outcome-unknown-released", true),
@@ -3649,6 +5081,15 @@ mod tests {
                     );
                     next.native_metadata_effect_released_count = 0;
                     next.native_metadata_effect_unreleased_count = 1;
+                }
+                "applying-released-zero" => {
+                    rewrite_effect_fence_release(
+                        &transaction,
+                        &key_bundle,
+                        conversation_id,
+                        &idempotency_token,
+                        Some(0),
+                    );
                 }
                 "claimed-none" | "claimed-fence" => {
                     super::super::metadata::rewrite_native_metadata_parent_active_state_fixture(
@@ -4042,6 +5483,10 @@ mod tests {
 
     #[test]
     fn effect_fence_aad_and_decrypted_inner_anchors_are_enforced() {
+        // release token commitment 是 exec-gate 产生的 opaque evidence，只由外层
+        // StorageKEK MAC 认证；对应正向语义由
+        // `released_effect_fence_accepts_the_exec_gate_commitment_as_opaque_evidence` 锁定。
+        // 持 KEK 重签任意 commitment 不属于离线无 KEK 篡改边界。
         for case in [
             "aad-primary-key",
             "sealed-boot",
@@ -4049,7 +5494,6 @@ mod tests {
             "sealed-spec",
             "sealed-process",
             "sealed-start-time",
-            "resigned-release-commitment",
         ] {
             let root = TestRoot::new(case);
             let database = root.database();
@@ -4081,106 +5525,38 @@ mod tests {
             } else if case == "sealed-start-time" {
                 leader_start_time = 74;
             }
-            if case == "resigned-release-commitment" {
-                let arbitrary_commitment = [0xA7; 32];
-                let (logical_fence_bytes, sealed_fence_bytes): (i64, i64) = state
-                    .connection
-                    .query_row(
-                        "SELECT logical_fence_bytes, length(sealed_fence)
-                         FROM native_metadata_effect_fences",
-                        [],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .expect("read release commitment fixture lengths");
-                let release_at = 120_u64;
-                let effect_nonce_token = metadata_mac(
-                    &state.key_bundle,
-                    EFFECT_NONCE_DOMAIN,
-                    &[
-                        conversation_id.as_bytes(),
-                        &idempotency_token,
-                        daemon_boot_id.as_bytes(),
-                        b"opaque-effect-nonce",
-                    ],
-                )
-                .expect("recompute nonce token for release tamper");
-                let effect_spec_token = metadata_mac(
-                    &state.key_bundle,
-                    EFFECT_SPEC_DOMAIN,
-                    &[
-                        conversation_id.as_bytes(),
-                        &idempotency_token,
-                        br#"{"kind":"rename"}"#,
-                    ],
-                )
-                .expect("recompute spec token for release tamper");
-                let release_time_field = optional_field(Some(&release_at.to_be_bytes()));
-                let release_commitment_field = optional_field(Some(&arbitrary_commitment));
-                let metadata_token = metadata_mac(
-                    &state.key_bundle,
-                    EFFECT_FENCE_METADATA_DOMAIN,
-                    &[
-                        conversation_id.as_bytes(),
-                        &idempotency_token,
-                        daemon_boot_id.as_bytes(),
-                        &effect_nonce_token,
-                        &effect_spec_token,
-                        &71_u64.to_be_bytes(),
-                        &71_u64.to_be_bytes(),
-                        encode_sequence(73).as_bytes(),
-                        &release_time_field,
-                        &release_commitment_field,
-                        &u64::try_from(logical_fence_bytes)
-                            .expect("logical bytes fit u64")
-                            .to_be_bytes(),
-                        &u64::try_from(sealed_fence_bytes)
-                            .expect("sealed bytes fit u64")
-                            .to_be_bytes(),
-                    ],
-                )
-                .expect("resign arbitrary release commitment");
-                state
-                    .connection
-                    .execute(
-                        "UPDATE native_metadata_effect_fences
-                         SET release_token_commitment = ?1, metadata_token = ?2",
-                        params![&arbitrary_commitment[..], &metadata_token[..]],
-                    )
-                    .expect("publish resigned arbitrary release commitment");
+            let payload = encode_effect_fence_payload(&[
+                conversation_id.as_bytes(),
+                &idempotency_token,
+                sealed_boot_id.as_bytes(),
+                &effect_nonce,
+                &effect_spec,
+                &process_group_id.to_be_bytes(),
+                &leader_pid.to_be_bytes(),
+                &leader_start_time.to_be_bytes(),
+            ]);
+            let primary_key = if case == "aad-primary-key" {
+                effect_fence_primary_key(conversation_id, &[0xA8; 32])
             } else {
-                let payload = encode_effect_fence_payload(&[
-                    conversation_id.as_bytes(),
-                    &idempotency_token,
-                    sealed_boot_id.as_bytes(),
-                    &effect_nonce,
-                    &effect_spec,
-                    &process_group_id.to_be_bytes(),
-                    &leader_pid.to_be_bytes(),
-                    &leader_start_time.to_be_bytes(),
-                ]);
-                let primary_key = if case == "aad-primary-key" {
-                    effect_fence_primary_key(conversation_id, &[0xA8; 32])
-                } else {
-                    effect_fence_primary_key(conversation_id, &idempotency_token)
-                };
-                let transplanted = super::super::stream::seal_v4_row(
-                    &state.key_bundle,
-                    state.database_id,
-                    EFFECT_FENCE_TABLE,
-                    &primary_key,
-                    EFFECT_FENCE_COLUMN,
-                    &payload,
-                    MAX_EFFECT_FENCE_PLAINTEXT_BYTES,
+                effect_fence_primary_key(conversation_id, &idempotency_token)
+            };
+            let transplanted = super::super::stream::seal_v4_row(
+                &state.key_bundle,
+                state.database_id,
+                EFFECT_FENCE_TABLE,
+                &primary_key,
+                EFFECT_FENCE_COLUMN,
+                &payload,
+                MAX_EFFECT_FENCE_PLAINTEXT_BYTES,
+            )
+            .expect("seal inner-anchor transplant");
+            state
+                .connection
+                .execute(
+                    "UPDATE native_metadata_effect_fences SET sealed_fence = ?1",
+                    [transplanted],
                 )
-                .expect("seal inner-anchor transplant");
-                state
-                    .connection
-                    .execute(
-                        "UPDATE native_metadata_effect_fences SET sealed_fence = ?1",
-                        [transplanted],
-                    )
-                    .expect("publish inner-anchor transplant");
-            }
+                .expect("publish inner-anchor transplant");
             assert!(
                 super::super::journal::validate_store_integrity(
                     &state.connection,

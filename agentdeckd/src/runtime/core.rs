@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use agentdeck_protocol::runtime::command::{HelloParams, QueryReceiptSelector};
 use agentdeck_protocol::runtime::failure::{
     DAEMON_AUTHORIZATION_PERMISSION_DENIED, DAEMON_AUTHORIZATION_REVOKED,
-    DAEMON_COMMAND_HISTORY_ONLY, DAEMON_COMMAND_NOT_FOUND, DAEMON_CONVERSATION_NOT_FOUND,
+    DAEMON_COMMAND_HISTORY_ONLY, DAEMON_COMMAND_NOT_FOUND,
+    DAEMON_CONVERSATION_METADATA_MUTATION_PENDING, DAEMON_CONVERSATION_NOT_FOUND,
     DAEMON_RUNTIME_ACTOR_UNAVAILABLE, DAEMON_RUNTIME_CONNECTION_UNAVAILABLE,
     DAEMON_RUNTIME_FEATURE_UNAVAILABLE, DAEMON_RUNTIME_IDENTITY_UNAVAILABLE,
     DAEMON_RUNTIME_INVALID_REQUEST, DAEMON_RUNTIME_NOT_READY, DAEMON_RUNTIME_PROTOCOL_MISMATCH,
@@ -45,6 +46,10 @@ use super::execution::{
     DisabledExecutionCoordinator, GatedExecutionCoordinator, RuntimeExecutionCoordinator,
 };
 use super::history_receipt::{HistoryOnlyReceiptError, HistoryOnlyReceiptRegistry};
+use super::native_metadata::{
+    NativeMutationCoordinator, NativeMutationCoordinatorError, NativeMutationOutcome,
+};
+use super::native_projector::NativeProjector;
 use super::process_identity::SystemProcessGroupController;
 use super::read_pool::{DEFAULT_RUNTIME_READ_CONCURRENCY, ReadPool, ReadPoolError};
 use super::recovery::{
@@ -91,15 +96,17 @@ pub struct RuntimeCore {
     connections: ConnectionRegistry,
     subscriptions: SubscriptionCoordinator,
     history_receipts: HistoryOnlyReceiptRegistry,
-    conversations: ConversationRegistry,
+    conversations: Arc<ConversationRegistry>,
+    native_projector: NativeProjector,
+    native_projector_enabled: bool,
+    native_mutations: NativeMutationCoordinator,
     recovery_identity: Arc<()>,
     recovery: RuntimeRecoveryCoordinator,
     read_pool: ReadPool,
     #[allow(dead_code)] // P3.8 UDS peer credential adapter 才会成为 production caller。
     principal_issuer: PrincipalIssuer,
     lifecycle: AtomicU8,
-    operation_inflight: AtomicUsize,
-    operation_quiesced: Notify,
+    operation_tracker: Arc<RuntimeOperationTracker>,
     recovery_lock: Mutex<()>,
     shutdown_lock: Mutex<()>,
 }
@@ -118,6 +125,7 @@ impl RuntimeCore {
             machine_trust_domain,
             Arc::new(DisabledExecutionCoordinator),
             DEFAULT_ADAPTER_CONCURRENCY,
+            false,
         )
         .map_err(RuntimeCoreError::into_failure)
     }
@@ -138,6 +146,7 @@ impl RuntimeCore {
             machine_trust_domain,
             execution,
             DEFAULT_ADAPTER_CONCURRENCY,
+            true,
         )
         .map_err(RuntimeCoreError::into_failure)
     }
@@ -148,17 +157,18 @@ impl RuntimeCore {
         machine_trust_domain: [u8; 32],
         execution: Arc<dyn RuntimeExecutionCoordinator>,
         adapter_concurrency: usize,
+        enable_native_projector: bool,
     ) -> Result<Self, RuntimeCoreError> {
         if machine_trust_domain == [0; 32] {
             return Err(RuntimeCoreError::InvalidIdentityDomain);
         }
         let daemon_boot_id = random_runtime_id(RuntimeIdKind::DaemonBoot)?;
-        let conversations = ConversationRegistry::new(
+        let conversations = Arc::new(ConversationRegistry::new(
             store.clone(),
             execution,
             daemon_boot_id,
             adapter_concurrency,
-        )?;
+        )?);
         let recovery_identity = Arc::new(());
         let recovery = RuntimeRecoveryCoordinator::new_with_core_identity(
             store.clone(),
@@ -188,6 +198,14 @@ impl RuntimeCore {
             catalog_snapshots,
             history_receipts.clone(),
         );
+        let native_projector = NativeProjector::new(
+            router.clone(),
+            store.clone(),
+            conversations.clone(),
+            history_receipts.clone(),
+        );
+        let native_mutations =
+            NativeMutationCoordinator::new(store.clone(), router.clone(), daemon_boot_id)?;
         Ok(Self {
             store,
             router,
@@ -195,13 +213,15 @@ impl RuntimeCore {
             subscriptions,
             history_receipts,
             conversations,
+            native_projector,
+            native_projector_enabled: enable_native_projector,
+            native_mutations,
             recovery_identity,
             recovery,
             read_pool: ReadPool::new(DEFAULT_RUNTIME_READ_CONCURRENCY)?,
             principal_issuer: PrincipalIssuer::local_only(machine_trust_domain),
             lifecycle: AtomicU8::new(CORE_COLD),
-            operation_inflight: AtomicUsize::new(0),
-            operation_quiesced: Notify::new(),
+            operation_tracker: Arc::new(RuntimeOperationTracker::default()),
             recovery_lock: Mutex::new(()),
             shutdown_lock: Mutex::new(()),
         })
@@ -220,6 +240,7 @@ impl RuntimeCore {
             machine_trust_domain,
             execution,
             DEFAULT_ADAPTER_CONCURRENCY,
+            false,
         )
     }
 
@@ -290,7 +311,7 @@ impl RuntimeCore {
 
     async fn handle_admitted(
         &self,
-        _operation: &RuntimeOperationGuard<'_>,
+        _operation: &RuntimeOperationGuard,
         connection_id: ConnectionId,
         request: RuntimeRequest,
     ) -> RuntimeReply {
@@ -303,7 +324,7 @@ impl RuntimeCore {
                 return RuntimeReply::Failure(RuntimeCoreError::Connection(error).into_failure());
             }
         };
-        match self.handle_ready(principal, request).await {
+        match self.handle_ready(_operation, principal, request).await {
             Ok(reply) => reply,
             Err(error) => RuntimeReply::Failure(error.into_failure()),
         }
@@ -371,7 +392,7 @@ impl RuntimeCore {
 
     async fn handle_stream_envelope(
         &self,
-        operation: &RuntimeOperationGuard<'_>,
+        operation: &RuntimeOperationGuard,
         connection_id: ConnectionId,
         principal: AuthenticatedPrincipal,
         message_id: agentdeck_protocol::runtime::identity::MessageId,
@@ -538,7 +559,7 @@ impl RuntimeCore {
 
     fn enqueue_stream_failure(
         &self,
-        operation: &RuntimeOperationGuard<'_>,
+        operation: &RuntimeOperationGuard,
         connection_id: ConnectionId,
         message_id: agentdeck_protocol::runtime::identity::MessageId,
         failure: RuntimeFailure,
@@ -569,6 +590,7 @@ impl RuntimeCore {
 
     async fn handle_ready(
         &self,
+        operation: &RuntimeOperationGuard,
         principal: AuthenticatedPrincipal,
         request: RuntimeRequest,
     ) -> Result<RuntimeReply, RuntimeCoreError> {
@@ -697,19 +719,65 @@ impl RuntimeCore {
                     let conversation_id = parse_conversation_id(&request.conversation_id)?;
                     let authorization = principal.try_enter()?;
                     let owner = principal.idempotency_owner();
-                    let outcome = self
+                    let context = self
                         .store
-                        .update_managed_conversation_metadata_authorized(
-                            UpdateManagedConversationMetadata {
-                                conversation_id,
-                                owner,
-                                idempotency_key: request.idempotency_key.as_str().to_owned(),
-                                expected_entry_revision: request.expected_entry_revision,
-                                mutation: request.mutation,
-                            },
-                            authorization,
-                        )
+                        .load_authenticated_conversation_snapshot_context(conversation_id)
                         .await?;
+                    let input = UpdateManagedConversationMetadata {
+                        conversation_id,
+                        owner,
+                        idempotency_key: request.idempotency_key.as_str().to_owned(),
+                        expected_entry_revision: request.expected_entry_revision,
+                        mutation: request.mutation,
+                    };
+                    let outcome = match context.origin {
+                        SnapshotOrigin::Managed => {
+                            self.store
+                                .update_managed_conversation_metadata_authorized(
+                                    input,
+                                    authorization,
+                                )
+                                .await?
+                        }
+                        SnapshotOrigin::NativeProjected => {
+                            // transport request 只等待 actor-owned reply；authorization、
+                            // per-conversation serialization、adapter permit 与 retained Core
+                            // operation lease 全部按值转入 actor control command。caller/
+                            // connection cancellation 不能取消已准入的 vendor/readback/Store
+                            // 收口，也不能让 shutdown 越过仍在执行的副作用。
+                            match self
+                                .conversations
+                                .update_native_metadata(
+                                    conversation_id,
+                                    self.native_mutations.clone(),
+                                    input,
+                                    authorization,
+                                    operation.retain(),
+                                )
+                                .await?
+                            {
+                                NativeMutationOutcome::Store(outcome) => outcome,
+                                NativeMutationOutcome::Rejected(failure) => {
+                                    UpdateConversationMetadataOutcome::Failed { failure }
+                                }
+                                NativeMutationOutcome::OutcomeUnknown {
+                                    conversation_id: unknown,
+                                } if unknown == conversation_id => {
+                                    UpdateConversationMetadataOutcome::Failed {
+                                        failure: RuntimeFailure::new(
+                                            DAEMON_CONVERSATION_METADATA_MUTATION_PENDING,
+                                            "native metadata outcome requires authenticated readback",
+                                        ),
+                                    }
+                                }
+                                NativeMutationOutcome::OutcomeUnknown { .. } => {
+                                    return Err(RuntimeCoreError::Store(
+                                        RuntimeStoreError::UnknownOrCorruptSchema,
+                                    ));
+                                }
+                            }
+                        }
+                    };
                     Ok::<_, RuntimeCoreError>((conversation_id, outcome))
                 }
                 .await
@@ -1045,11 +1113,22 @@ impl RuntimeCore {
             accepted_commands: u64::try_from(recovered.ready_accepted_count())
                 .map_err(|_| RuntimeCoreError::RecoveryBlocked)?,
         };
+        // Native metadata claim/fence 必须在 projector 可以刷新同一 conversation
+        // 之前完成 authenticated recovery；startup recovery 绝不重调 vendor。
+        self.native_mutations.recover().await?;
+        if self.native_projector_enabled {
+            // 启动慢路径只执行一个最多 2s 的固定 source round；
+            // completion reconciliation 与余下 continuation 必须留到 Core Ready 后。
+            self.native_projector.run_initial_round().await;
+        }
         self.conversations
             .publish_ready_and_enable_scheduling(&permit, || {
                 self.lifecycle.store(CORE_READY, Ordering::Release);
             })
             .await?;
+        if self.native_projector_enabled {
+            self.native_projector.start_background();
+        }
         Ok((report, permit))
     }
 
@@ -1075,7 +1154,7 @@ impl RuntimeCore {
 
     fn enqueue_admitted(
         &self,
-        _operation: &RuntimeOperationGuard<'_>,
+        _operation: &RuntimeOperationGuard,
         connection_id: ConnectionId,
         envelope: &RuntimeEnvelope,
     ) -> Result<(), RuntimeFailure> {
@@ -1122,11 +1201,22 @@ impl RuntimeCore {
         }
         if state != CORE_DRAINING {
             self.lifecycle.store(CORE_CLOSING, Ordering::Release);
+            // CLOSING 必须先同步关闭新的 adapter/start admission。native metadata
+            // caller 已持有 retained operation/auth/serialization guard、但仍在等待
+            // 全局 permit 时，close 会让它以零 claim/零 vendor 退出；已取得 permit
+            // 并移交 actor 的 operation 不受影响，仍由下方 quiescence 等到 terminal。
+            self.conversations.close_admission();
             self.wait_for_operation_quiescence().await;
+            // Projector 可能正在持有 per-conversation quiescence lease 或等待
+            // Store exact convergence；必须先 cancel/join，再关 actor scheduling/store。
+            self.native_projector.shutdown().await;
             // Background conversation runners 不计入 operation_inflight；必须在公开
-            // Draining 前另行撤销 retained scheduling gate 并等待所有 start lease。
-            self.conversations.begin_draining().await;
+            // Draining 前另行等待 close_admission 之前已取得的 start lease。不能把
+            // 这个 await 提到 operation quiescence 前，否则会恢复反向等待环。
+            self.conversations.wait_for_start_fence().await;
             self.lifecycle.store(CORE_DRAINING, Ordering::Release);
+        } else {
+            self.native_projector.shutdown().await;
         }
 
         // 任一子层报错也继续拆掉其他资源，避免一次 actor/writer join failure 让
@@ -1164,28 +1254,28 @@ impl RuntimeCore {
         }
     }
 
-    fn try_enter_operation(&self) -> Result<RuntimeOperationGuard<'_>, RuntimeCoreError> {
+    fn try_enter_operation(&self) -> Result<RuntimeOperationGuard, RuntimeCoreError> {
         if self.lifecycle.load(Ordering::Acquire) != CORE_READY {
             return Err(RuntimeCoreError::NotReady);
         }
-        self.operation_inflight.fetch_add(1, Ordering::AcqRel);
+        self.operation_tracker.enter();
         if self.lifecycle.load(Ordering::Acquire) != CORE_READY {
-            if self.operation_inflight.fetch_sub(1, Ordering::AcqRel) == 1 {
-                self.operation_quiesced.notify_waiters();
-            }
+            self.operation_tracker.leave();
             return Err(RuntimeCoreError::NotReady);
         }
-        Ok(RuntimeOperationGuard { core: self })
+        Ok(RuntimeOperationGuard {
+            tracker: self.operation_tracker.clone(),
+        })
     }
 
     async fn wait_for_operation_quiescence(&self) {
         loop {
             // Notify 不保留 notify_waiters permit；先 enable waiter 再复查计数，避免
             // 最后一个 operation 在 load 与 await 之间 drop 造成 lost wakeup。
-            let notified = self.operation_quiesced.notified();
+            let notified = self.operation_tracker.quiesced.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self.operation_inflight.load(Ordering::Acquire) == 0 {
+            if self.operation_tracker.inflight.load(Ordering::Acquire) == 0 {
                 return;
             }
             notified.await;
@@ -1198,15 +1288,43 @@ impl RuntimeCore {
     }
 }
 
-struct RuntimeOperationGuard<'a> {
-    core: &'a RuntimeCore,
+#[derive(Default)]
+struct RuntimeOperationTracker {
+    inflight: AtomicUsize,
+    quiesced: Notify,
 }
 
-impl Drop for RuntimeOperationGuard<'_> {
-    fn drop(&mut self) {
-        if self.core.operation_inflight.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.core.operation_quiesced.notify_waiters();
+impl RuntimeOperationTracker {
+    fn enter(&self) {
+        self.inflight.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn leave(&self) {
+        if self.inflight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.quiesced.notify_waiters();
         }
+    }
+}
+
+pub(crate) struct RuntimeOperationGuard {
+    tracker: Arc<RuntimeOperationTracker>,
+}
+
+impl RuntimeOperationGuard {
+    /// 已准入 operation 的 daemon-owned retained lease。它不重新检查 lifecycle：
+    /// caller 已在 READY 时通过双读 admission，actor 只延长同一 operation 的
+    /// shutdown quiescence 边界，不能借此准入新请求。
+    pub(crate) fn retain(&self) -> Self {
+        self.tracker.enter();
+        Self {
+            tracker: self.tracker.clone(),
+        }
+    }
+}
+
+impl Drop for RuntimeOperationGuard {
+    fn drop(&mut self) {
+        self.tracker.leave();
     }
 }
 
@@ -1257,6 +1375,8 @@ pub(crate) enum RuntimeCoreError {
     ReadPool(#[from] ReadPoolError),
     #[error(transparent)]
     Catalog(#[from] CatalogSnapshotProviderError),
+    #[error(transparent)]
+    NativeMetadata(#[from] NativeMutationCoordinatorError),
 }
 
 impl RuntimeCoreError {
@@ -1330,6 +1450,9 @@ impl RuntimeCoreError {
                     agentdeck_protocol::runtime::failure::DAEMON_COMMAND_QUEUE_FULL,
                     "runtime conversation queue is full",
                 ),
+                ConversationError::NativeMetadata(error) => {
+                    RuntimeCoreError::NativeMetadata(error).into_failure()
+                }
                 ConversationError::ActorUnavailable | ConversationError::Execution(_) => {
                     RuntimeFailure::new(
                         DAEMON_RUNTIME_ACTOR_UNAVAILABLE,
@@ -1370,6 +1493,13 @@ impl RuntimeCoreError {
                     "runtime catalog snapshot request is invalid or unavailable",
                 ),
             },
+            Self::NativeMetadata(NativeMutationCoordinatorError::Store(error)) => {
+                RuntimeFailure::new(error.code(), "native metadata Store operation failed")
+            }
+            Self::NativeMetadata(_) => RuntimeFailure::new(
+                DAEMON_RUNTIME_ACTOR_UNAVAILABLE,
+                "native metadata side effect could not be fenced or reconciled",
+            ),
         }
     }
 }

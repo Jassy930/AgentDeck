@@ -4,7 +4,9 @@
 //! N3 守护：Adapter 实现彼此不可见。共享逻辑只能下沉到此 trait 的 default
 //! 方法，或 daemon 层。
 
-use agentdeck_protocol::runtime::{ConfigurationError, ConversationConfiguration, PromptPayload};
+use agentdeck_protocol::runtime::{
+    ConfigurationError, ConversationConfiguration, ConversationMetadataMutation, PromptPayload,
+};
 use agentdeck_protocol::{
     ActionDecision, ActionRequest, AgentItem, AgentKind, HistoryRequest, HistoryResponse,
     HistoryTurn, ProtocolError, ServerEvent, SessionCapabilities, SessionId, SessionStart,
@@ -17,11 +19,13 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::exec_gate::{GatedChild, GatedChildIo};
 use crate::runtime::approval::SharedApprovalDelivery;
-use crate::runtime::store::{RuntimeId, RuntimeIdKind};
+use crate::runtime::store::{ConversationDescriptor, RuntimeId, RuntimeIdKind};
+use crate::security::SecretBytes;
 
 /// exec-gate control frame 内的 program/cwd 单路径原始平台编码字节上界。
 pub const MAX_EXEC_PATH_BYTES: usize = 16 * 1024;
@@ -1079,6 +1083,453 @@ pub(crate) trait NativeHistoryReader: Send + Sync + 'static {
 
 pub(crate) type DynNativeHistoryReader = Arc<dyn NativeHistoryReader>;
 
+/// 单轮 native projector 的硬上界。opaque continuation 只能跨轮保存在 daemon
+/// 内存中；adapter 不接受调用方放宽这些 production 值。
+pub(crate) const NATIVE_PROJECTION_ROUND_CANDIDATE_LIMIT: u32 = 2_000;
+pub(crate) const NATIVE_PROJECTION_ROUND_IMPORT_LIMIT: u32 = 500;
+pub(crate) const NATIVE_PROJECTION_ROUND_BYTE_LIMIT: u64 = 64 * 1024 * 1024;
+pub(crate) const NATIVE_PROJECTION_ROUND_TIME_LIMIT: Duration = Duration::from_secs(2);
+const MIN_NATIVE_PROJECTION_PRIVATE_REFERENCE_BYTES: usize = 20;
+const MAX_NATIVE_PROJECTION_PRIVATE_REFERENCE_BYTES: usize = 523;
+
+/// Adapter 私域 native source 在进入 Runtime 前收敛出的中立失败分类。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum NativeProjectionSourceError {
+    #[error("native projection capability is unavailable")]
+    Unavailable,
+    #[error("native projection scan generation is invalid")]
+    InvalidGeneration,
+    #[error("native projection source failed canonical validation")]
+    InvalidSource,
+    #[error("native projection source exceeds a fixed resource bound")]
+    PayloadTooLarge,
+    #[error("native projection source could not be read")]
+    ReadUnavailable,
+    #[error("native projection candidate acknowledgement is invalid")]
+    InvalidAcknowledgement,
+    #[error("native projection scan is not ready for that transition")]
+    InvalidState,
+    #[error("native projection scan did not reach authenticated completion")]
+    ScanIncomplete,
+}
+
+/// 单轮达到硬预算后的中立暂停原因。暂停本身绝不是 completed generation。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeProjectionYieldReason {
+    CandidateLimit,
+    ImportLimit,
+    ByteLimit,
+    Deadline,
+}
+
+/// 只有 source 当前 pending candidate 才能签发的 ACK capability。
+///
+/// 本类型不可 Clone/Serialize，Debug 也不显示 generation/token；Runtime 必须先把
+/// candidate 交给 Store，再按值把 ACK 归还原 scanner，失败重试则不 ACK。
+pub(crate) struct NativeProjectionAcknowledgement {
+    generation: [u8; 16],
+    issuer_token: [u8; 16],
+    token: [u8; 16],
+}
+
+impl NativeProjectionAcknowledgement {
+    fn new(
+        generation: [u8; 16],
+        issuer_token: [u8; 16],
+        token: [u8; 16],
+    ) -> Result<Self, NativeProjectionSourceError> {
+        if generation == [0; 16] || issuer_token == [0; 16] || token == [0; 16] {
+            return Err(NativeProjectionSourceError::InvalidAcknowledgement);
+        }
+        Ok(Self {
+            generation,
+            issuer_token,
+            token,
+        })
+    }
+}
+
+impl fmt::Debug for NativeProjectionAcknowledgement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("NativeProjectionAcknowledgement([REDACTED])")
+    }
+}
+
+/// 真实 native JSONL 已经 no-follow、有界读取并完成 canonical metadata 校验后，
+/// adapter 才能交给 Runtime 的中立 candidate。原始 project component、transcript
+/// filename 与 session id 只存在于会清零且 Debug-redacted 的 private reference。
+pub(crate) struct NativeProjectionCandidate {
+    descriptor: ConversationDescriptor,
+    default_configuration: ConversationConfiguration,
+    private_reference: SecretBytes,
+    acknowledgement: NativeProjectionAcknowledgement,
+}
+
+impl NativeProjectionCandidate {
+    fn from_verified_source(
+        descriptor: ConversationDescriptor,
+        default_configuration: ConversationConfiguration,
+        private_reference: SecretBytes,
+        acknowledgement: NativeProjectionAcknowledgement,
+    ) -> Result<Self, NativeProjectionSourceError> {
+        let reference_bytes = private_reference.expose_secret().len();
+        let descriptor_path_is_valid = encoded_bytes(descriptor.cwd.as_os_str())
+            .is_ok_and(|bytes| bytes <= MAX_EXEC_PATH_BYTES);
+        let descriptor_title_is_valid = descriptor
+            .title
+            .as_ref()
+            .is_none_or(|title| ConversationMetadataMutation::rename(Some(title.clone())).is_ok());
+        if descriptor.agent_kind != default_configuration.agent_kind()
+            || !descriptor.cwd.is_absolute()
+            || !descriptor_path_is_valid
+            || !descriptor_title_is_valid
+            || !(MIN_NATIVE_PROJECTION_PRIVATE_REFERENCE_BYTES
+                ..=MAX_NATIVE_PROJECTION_PRIVATE_REFERENCE_BYTES)
+                .contains(&reference_bytes)
+        {
+            return Err(NativeProjectionSourceError::InvalidSource);
+        }
+        Ok(Self {
+            descriptor,
+            default_configuration,
+            private_reference,
+            acknowledgement,
+        })
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ConversationDescriptor,
+        ConversationConfiguration,
+        SecretBytes,
+        NativeProjectionAcknowledgement,
+    ) {
+        (
+            self.descriptor,
+            self.default_configuration,
+            self.private_reference,
+            self.acknowledgement,
+        )
+    }
+}
+
+impl fmt::Debug for NativeProjectionCandidate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeProjectionCandidate")
+            .field("descriptor", &"[REDACTED]")
+            .field("default_configuration", &"[REDACTED]")
+            .field("private_reference", &"[REDACTED]")
+            .field("acknowledgement", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// `Complete` 只表示 scanner 已观察到目录 EOF；删除型 reconciliation 还必须消费
+/// `into_completed` 返回的 witness。yield/error/drop 路径拿不到该 witness。
+pub(crate) enum NativeProjectionStep {
+    Candidate(Box<NativeProjectionCandidate>),
+    Yielded(NativeProjectionYieldReason),
+    Complete,
+}
+
+impl fmt::Debug for NativeProjectionStep {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let variant = match self {
+            Self::Candidate(_) => "Candidate",
+            Self::Yielded(_) => "Yielded",
+            Self::Complete => "Complete",
+        };
+        formatter
+            .debug_struct("NativeProjectionStep")
+            .field("variant", &variant)
+            .field("payload", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// 完整耗尽真实 source 且全部交付 candidate 已 ACK 后才能取得的中立 witness。
+/// 字段私有、不可 Clone/Serialize；Core 后续只能按值把它交给固定 namespace Store。
+pub(crate) struct CompletedNativeProjectionScan {
+    generation: [u8; 16],
+    inspected_candidates: u64,
+    imported_candidates: u64,
+}
+
+impl CompletedNativeProjectionScan {
+    pub(crate) const fn into_parts(self) -> ([u8; 16], u64, u64) {
+        (
+            self.generation,
+            self.inspected_candidates,
+            self.imported_candidates,
+        )
+    }
+}
+
+/// Router 经 daemon helper 为一次 scan 私下签发的 issuer。constructor 留在
+/// `agent` 模块，Runtime/adapter 都不能自行创建；concrete scanner 必须一直按值
+/// 持有它，只有真实 EOF + 全部 ACK 后才能消费为 completed witness。
+pub(crate) struct NativeProjectionScanIssuer {
+    generation: [u8; 16],
+    issuer_token: [u8; 16],
+}
+
+impl NativeProjectionScanIssuer {
+    fn new(generation: [u8; 16]) -> Result<Self, NativeProjectionSourceError> {
+        if generation == [0; 16] {
+            return Err(NativeProjectionSourceError::InvalidGeneration);
+        }
+        let mut issuer_token = *uuid::Uuid::new_v4().as_bytes();
+        if issuer_token == [0; 16] {
+            issuer_token[0] = 1;
+        }
+        Ok(Self {
+            generation,
+            issuer_token,
+        })
+    }
+
+    pub(crate) const fn generation(&self) -> [u8; 16] {
+        self.generation
+    }
+
+    pub(crate) fn issue_candidate(
+        &self,
+        descriptor: ConversationDescriptor,
+        default_configuration: ConversationConfiguration,
+        private_reference: SecretBytes,
+        acknowledgement_token: [u8; 16],
+    ) -> Result<NativeProjectionCandidate, NativeProjectionSourceError> {
+        let acknowledgement = NativeProjectionAcknowledgement::new(
+            self.generation,
+            self.issuer_token,
+            acknowledgement_token,
+        )?;
+        NativeProjectionCandidate::from_verified_source(
+            descriptor,
+            default_configuration,
+            private_reference,
+            acknowledgement,
+        )
+    }
+
+    pub(crate) fn matches_acknowledgement(
+        &self,
+        acknowledgement: &NativeProjectionAcknowledgement,
+        pending_token: &[u8; 16],
+    ) -> bool {
+        acknowledgement.generation == self.generation
+            && acknowledgement.issuer_token == self.issuer_token
+            && acknowledgement.token == *pending_token
+    }
+
+    pub(crate) fn complete(
+        self,
+        generation: [u8; 16],
+        inspected_candidates: u64,
+        imported_candidates: u64,
+    ) -> Result<CompletedNativeProjectionScan, NativeProjectionSourceError> {
+        if generation != self.generation || imported_candidates > inspected_candidates {
+            return Err(NativeProjectionSourceError::ScanIncomplete);
+        }
+        Ok(CompletedNativeProjectionScan {
+            generation,
+            inspected_candidates,
+            imported_candidates,
+        })
+    }
+}
+
+impl fmt::Debug for NativeProjectionScanIssuer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("NativeProjectionScanIssuer([REDACTED])")
+    }
+}
+
+impl fmt::Debug for CompletedNativeProjectionScan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompletedNativeProjectionScan")
+            .field("generation", &"[REDACTED]")
+            .field("inspected_candidates", &self.inspected_candidates)
+            .field("imported_candidates", &self.imported_candidates)
+            .finish()
+    }
+}
+
+/// 一次 scan 的 opaque continuation。方法是同步的，C-f Core 必须把它放在
+/// daemon-owned blocking worker 上；不得在 conversation actor 内直接做文件 IO。
+pub(crate) trait NativeProjectionScan: Send + 'static {
+    fn next(&mut self) -> Result<NativeProjectionStep, NativeProjectionSourceError>;
+
+    fn acknowledge(
+        &mut self,
+        acknowledgement: NativeProjectionAcknowledgement,
+    ) -> Result<(), NativeProjectionSourceError>;
+
+    fn resume_after_yield(&mut self) -> Result<(), NativeProjectionSourceError>;
+
+    fn into_completed(
+        self: Box<Self>,
+    ) -> Result<CompletedNativeProjectionScan, NativeProjectionSourceError>;
+}
+
+pub(crate) type DynNativeProjectionScan = Box<dyn NativeProjectionScan>;
+
+/// Public `Agent` trait 之外的 daemon-private projector source seam。
+/// Codex/未注册 backend 不实现，Router 稳定返回 typed unavailable。
+pub(crate) trait NativeProjectionSource: Send + Sync + 'static {
+    fn agent_kind(&self) -> AgentKind;
+
+    fn begin_native_projection_scan(
+        &self,
+        issuer: NativeProjectionScanIssuer,
+    ) -> Result<DynNativeProjectionScan, NativeProjectionSourceError>;
+}
+
+pub(crate) type DynNativeProjectionSource = Arc<dyn NativeProjectionSource>;
+
+/// 唯一 production issuer 入口：Router 只给出 non-zero generation 与已注册 source，
+/// issuer 在本函数内创建后立即按值移交 concrete scanner，不向 Runtime 返回。
+pub(crate) fn begin_native_projection_scan(
+    source: &dyn NativeProjectionSource,
+    generation: [u8; 16],
+) -> Result<DynNativeProjectionScan, NativeProjectionSourceError> {
+    source.begin_native_projection_scan(NativeProjectionScanIssuer::new(generation)?)
+}
+
+#[cfg(test)]
+pub(crate) fn native_projection_scan_issuer_for_test(
+    generation: [u8; 16],
+) -> Result<NativeProjectionScanIssuer, NativeProjectionSourceError> {
+    NativeProjectionScanIssuer::new(generation)
+}
+
+#[derive(Clone)]
+pub(crate) struct NativeMetadataEffectRequest {
+    adapter_state: AdapterStateHandle,
+    mutation: ConversationMetadataMutation,
+}
+
+impl NativeMetadataEffectRequest {
+    pub(crate) const fn new(
+        adapter_state: AdapterStateHandle,
+        mutation: ConversationMetadataMutation,
+    ) -> Self {
+        Self {
+            adapter_state,
+            mutation,
+        }
+    }
+
+    pub(crate) const fn parts(&self) -> (AdapterStateHandle, &ConversationMetadataMutation) {
+        (self.adapter_state, &self.mutation)
+    }
+}
+
+impl fmt::Debug for NativeMetadataEffectRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("NativeMetadataEffectRequest([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum NativeMetadataEffectError {
+    #[error("native metadata capability is unavailable")]
+    Unavailable,
+    #[error("native metadata mutation is unsupported")]
+    Unsupported,
+    #[error("native metadata source failed canonical validation")]
+    InvalidSource,
+    #[error("native metadata vendor program is unavailable")]
+    ProgramUnavailable,
+    #[error("native metadata effect spec is invalid")]
+    InvalidSpec,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeMetadataReadback {
+    Applied,
+    Unknown,
+}
+
+/// 只含 absolute program/cwd 与有界 argv；不含 env/spawn/release 能力。
+pub(crate) struct NativeMetadataEffectSpec {
+    program: PathBuf,
+    args: Vec<OsString>,
+    cwd: PathBuf,
+}
+
+impl NativeMetadataEffectSpec {
+    pub(crate) fn new(
+        program: impl Into<PathBuf>,
+        args: impl IntoIterator<Item = impl Into<OsString>>,
+        cwd: impl Into<PathBuf>,
+    ) -> Result<Self, NativeMetadataEffectError> {
+        let program = program.into();
+        let cwd = cwd.into();
+        if !program.is_absolute() || !cwd.is_absolute() {
+            return Err(NativeMetadataEffectError::InvalidSpec);
+        }
+        let encoded = |value: &OsStr| {
+            encoded_bytes(value).map_err(|_| NativeMetadataEffectError::InvalidSpec)
+        };
+        let program_bytes = encoded(program.as_os_str())?;
+        let cwd_bytes = encoded(cwd.as_os_str())?;
+        if program_bytes > MAX_EXEC_PATH_BYTES || cwd_bytes > MAX_EXEC_PATH_BYTES {
+            return Err(NativeMetadataEffectError::InvalidSpec);
+        }
+        let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+        if args.len() > MAX_EXEC_ARGUMENTS {
+            return Err(NativeMetadataEffectError::InvalidSpec);
+        }
+        let argument_bytes = args.iter().try_fold(0_usize, |total, argument| {
+            let bytes = encoded(argument.as_os_str())?;
+            total
+                .checked_add(bytes)
+                .filter(|sum| {
+                    bytes <= MAX_EXEC_SINGLE_ARGUMENT_BYTES && *sum <= MAX_EXEC_ARGUMENT_BYTES
+                })
+                .ok_or(NativeMetadataEffectError::InvalidSpec)
+        })?;
+        if exec_spec_control_frame_bytes(program_bytes, cwd_bytes, args.len(), argument_bytes)
+            .is_none_or(|bytes| bytes > MAX_EXEC_CONTROL_FRAME_BYTES)
+        {
+            return Err(NativeMetadataEffectError::InvalidSpec);
+        }
+        Ok(Self { program, args, cwd })
+    }
+
+    pub(crate) fn parts(&self) -> (&Path, &[OsString], &Path) {
+        (&self.program, &self.args, &self.cwd)
+    }
+}
+
+impl fmt::Debug for NativeMetadataEffectSpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("NativeMetadataEffectSpec([REDACTED])")
+    }
+}
+
+/// Adapter 只能冷准备 spec/readback；spawn、release、fence 归 Runtime。
+#[async_trait::async_trait]
+pub(crate) trait NativeMetadataEffectAdapter: Send + Sync + 'static {
+    fn agent_kind(&self) -> AgentKind;
+
+    async fn prepare_native_metadata_effect(
+        &self,
+        request: &NativeMetadataEffectRequest,
+    ) -> Result<NativeMetadataEffectSpec, NativeMetadataEffectError>;
+
+    async fn readback_native_metadata_effect(
+        &self,
+        request: &NativeMetadataEffectRequest,
+    ) -> Result<NativeMetadataReadback, NativeMetadataEffectError>;
+}
+
+pub(crate) type DynNativeMetadataEffectAdapter = Arc<dyn NativeMetadataEffectAdapter>;
+
 /// Handle returned when a session is started. The hub uses it to send
 /// follow-up prompts / decisions / cancels to the same session.
 pub struct AgentSessionHandle {
@@ -1274,7 +1725,7 @@ mod typed_boundary_tests {
     use crate::claude_code::ClaudeCodeAdapter;
     use crate::codex::CodexAdapter;
     use agentdeck_protocol::runtime::{
-        CodexConversationConfiguration, VendorConfigurationSnapshot,
+        CodexConversationConfiguration, ConversationMetadataMutation, VendorConfigurationSnapshot,
     };
     use agentdeck_protocol::{CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode};
     use std::sync::Mutex;
@@ -1638,6 +2089,140 @@ mod typed_boundary_tests {
     }
 
     #[test]
+    fn native_projection_candidate_ack_issuer_and_completion_are_typed_and_redacted() {
+        let private_title = "private projector title sentinel";
+        let private_cwd = "/private/projector/cwd-sentinel";
+        let private_reference = b"private-project/session-sentinel.jsonl";
+        let generation = [0xA4; 16];
+        let issuer = NativeProjectionScanIssuer::new(generation).expect("nonzero scan issuer");
+        let issuer_debug = format!("{issuer:?}");
+        let candidate = issuer
+            .issue_candidate(
+                ConversationDescriptor {
+                    agent_kind: AgentKind::ClaudeCode,
+                    title: Some(private_title.to_owned()),
+                    cwd: PathBuf::from(private_cwd),
+                },
+                claude_code_configuration(),
+                SecretBytes::new(private_reference.to_vec()),
+                [0xA5; 16],
+            )
+            .expect("verified neutral candidate");
+        let candidate_debug = format!("{candidate:?}");
+        let (_, _, private_reference, acknowledgement) = candidate.into_parts();
+        assert_eq!(
+            private_reference.expose_secret(),
+            b"private-project/session-sentinel.jsonl"
+        );
+        assert!(issuer.matches_acknowledgement(&acknowledgement, &[0xA5; 16]));
+        let acknowledgement_debug = format!("{acknowledgement:?}");
+        let completed = issuer
+            .complete(generation, 1, 1)
+            .expect("issuer is consumed into completion");
+        let completed_debug = format!("{completed:?}");
+        assert_eq!(completed.into_parts(), (generation, 1, 1));
+
+        for surface in [
+            issuer_debug,
+            candidate_debug,
+            acknowledgement_debug,
+            completed_debug,
+            format!("{private_reference:?}"),
+        ] {
+            for sentinel in [
+                private_title,
+                private_cwd,
+                "private-project",
+                "session-sentinel",
+                ".jsonl",
+            ] {
+                assert!(
+                    !surface.contains(sentinel),
+                    "Debug leaked {sentinel}: {surface}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_projection_issuer_and_candidate_constructors_have_static_ownership() {
+        let agent = include_str!("agent.rs");
+        let production_agent = agent
+            .split("#[cfg(test)]\npub(crate) fn native_projection_scan_issuer_for_test")
+            .next()
+            .expect("production agent seam precedes test issuer");
+        assert_eq!(
+            production_agent
+                .matches("NativeProjectionScanIssuer::new(generation)?")
+                .count(),
+            1,
+            "only the daemon begin helper may mint a production issuer"
+        );
+        assert_eq!(
+            production_agent
+                .matches("NativeProjectionCandidate::from_verified_source(")
+                .count(),
+            1,
+            "only the issuer may construct a neutral candidate"
+        );
+        assert_eq!(
+            production_agent
+                .matches("NativeProjectionAcknowledgement::new(")
+                .count(),
+            1,
+            "only the issuer may sign a candidate ACK"
+        );
+
+        let router = include_str!("runtime/router.rs");
+        let production_router = router
+            .split("#[cfg(test)]\nmod typed_prepare_tests")
+            .next()
+            .expect("production router precedes tests");
+        for (name, source) in [
+            ("router", production_router),
+            ("core", include_str!("runtime/core.rs") as &str),
+            (
+                "conversation",
+                include_str!("runtime/conversation.rs") as &str,
+            ),
+            ("execution", include_str!("runtime/execution.rs") as &str),
+            (
+                "store worker",
+                include_str!("runtime/store/worker.rs") as &str,
+            ),
+        ] {
+            assert!(
+                !source.contains("NativeProjectionScanIssuer"),
+                "{name} must never receive or mint the source completion issuer"
+            );
+            if name != "router" {
+                assert!(
+                    !source.contains("register_native_projection_source("),
+                    "{name} must not install an alternate production projector source"
+                );
+            }
+        }
+        assert_eq!(
+            production_router
+                .matches("register_native_projection_source(")
+                .count(),
+            2,
+            "production router has one registration call and one private registry method"
+        );
+        let history = include_str!("claude_code/history.rs");
+        assert_eq!(history.matches("self.issuer.complete(").count(), 1);
+        assert_eq!(history.matches("issuer.issue_candidate(").count(), 1);
+        let adapter = include_str!("claude_code/adapter.rs");
+        let source_impl = adapter
+            .split("impl NativeProjectionSource for ClaudeCodeAdapter")
+            .nth(1)
+            .and_then(|tail| tail.split("impl NativeMetadataEffectAdapter").next())
+            .expect("isolated Claude Code projector source impl");
+        assert!(source_impl.contains("history::begin_native_projection_scan"));
+        assert!(!source_impl.contains(".complete("));
+    }
+
+    #[test]
     fn turn_request_keeps_prompt_and_runtime_ids_out_of_debug() {
         let prompt = "private prompt sentinel";
         let request = request(5, prompt);
@@ -1768,6 +2353,59 @@ mod typed_boundary_tests {
             ),
             Err(AgentTurnContractError::ControlFrameTooLarge)
         ));
+    }
+
+    #[test]
+    fn native_metadata_request_and_effect_spec_are_typed_bounded_and_redacted() {
+        let private_title = "private native title sentinel";
+        let private_program = "/private/native/bin/claude";
+        let private_cwd = "/private/native/worktree";
+        let private_session = "private-native-session-sentinel";
+        let request = NativeMetadataEffectRequest::new(
+            adapter_state(0xA1),
+            ConversationMetadataMutation::rename(Some(private_title.to_owned()))
+                .expect("bounded title"),
+        );
+        let spec = NativeMetadataEffectSpec::new(
+            private_program,
+            [
+                OsString::from("--resume"),
+                OsString::from(private_session),
+                OsString::from("-n"),
+                OsString::from(private_title),
+            ],
+            private_cwd,
+        )
+        .expect("absolute bounded native effect spec");
+
+        assert_eq!(request.parts().0.key().kind(), RuntimeIdKind::AdapterState);
+        let (program, args, cwd) = spec.parts();
+        assert_eq!(program, Path::new(private_program));
+        assert_eq!(cwd, Path::new(private_cwd));
+        assert_eq!(args.len(), 4);
+        for debug in [format!("{request:?}"), format!("{spec:?}")] {
+            for sentinel in [private_title, private_program, private_cwd, private_session] {
+                assert!(
+                    !debug.contains(sentinel),
+                    "Debug leaked {sentinel}: {debug}"
+                );
+            }
+        }
+
+        assert_eq!(
+            NativeMetadataEffectSpec::new("relative/claude", Vec::<OsString>::new(), private_cwd,)
+                .expect_err("relative program must fail closed"),
+            NativeMetadataEffectError::InvalidSpec,
+        );
+        assert_eq!(
+            NativeMetadataEffectSpec::new(
+                private_program,
+                [OsString::from("contains\0nul")],
+                private_cwd,
+            )
+            .expect_err("NUL argv must fail closed"),
+            NativeMetadataEffectError::InvalidSpec,
+        );
     }
 
     #[test]

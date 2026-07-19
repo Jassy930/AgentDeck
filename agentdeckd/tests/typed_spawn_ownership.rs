@@ -41,6 +41,72 @@ fn typed_adapter_prepare_cannot_call_legacy_spawn_or_preflight() {
 }
 
 #[test]
+fn native_metadata_adapter_only_prepares_a_redacted_spec_and_readback() {
+    let source = include_str!("../src/claude_code/adapter.rs");
+    let body = between(
+        source,
+        "impl NativeMetadataEffectAdapter for ClaudeCodeAdapter",
+        "impl NativeHistoryReader for ClaudeCodeAdapter",
+    );
+    assert!(body.contains("resolve_trusted_program"));
+    assert!(body.contains("read_native_projection_metadata"));
+    for forbidden in [
+        "Command::new",
+        ".spawn(",
+        "decode_cwd",
+        "find_session_cwd",
+        "std::env::var",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "native metadata adapter contains forbidden path {forbidden}"
+        );
+    }
+
+    let agent = include_str!("../src/agent.rs");
+    let seam = between(
+        agent,
+        "pub(crate) struct NativeMetadataEffectRequest",
+        "pub(crate) type DynNativeMetadataEffectAdapter",
+    );
+    for forbidden in ["Serialize", "Deserialize", "JsonSchema"] {
+        assert!(
+            !seam.contains(forbidden),
+            "daemon-private native metadata seam became wire-visible via {forbidden}"
+        );
+    }
+    let schema = include_str!("../../protocol/agentdeck/agentdeck-protocol.schema.json");
+    for private_type in [
+        "NativeMetadataEffectRequest",
+        "NativeMetadataEffectSpec",
+        "NativeMetadataReadback",
+    ] {
+        assert!(
+            !schema.contains(private_type),
+            "{private_type} leaked to wire schema"
+        );
+    }
+}
+
+#[test]
+fn legacy_cc_history_router_cannot_bypass_native_metadata_gate() {
+    let source = include_str!("../src/claude_code/adapter.rs");
+    let body = between(source, "async fn handle_history(", "async fn cancel(");
+    assert!(body.contains("cc-history-mutation-requires-runtime-gate"));
+    for bypass in [
+        "history::archive",
+        "history::rename",
+        "Command::new",
+        ".spawn(",
+    ] {
+        assert!(
+            !body.contains(bypass),
+            "legacy CC history router retained native mutation bypass {bypass}"
+        );
+    }
+}
+
+#[test]
 fn typed_drivers_only_consume_gate_stdio() {
     for (name, source) in [
         ("Codex", include_str!("../src/codex/driver.rs") as &str),

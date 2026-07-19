@@ -38,6 +38,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
+use agentdeck_protocol::runtime::ConversationConfiguration;
 use agentdeck_protocol::{
     AgentItem, AgentItemMeta, AgentKind, DiffFile, DiffStatus, HistoryListItem,
     HistoryReadResponse, HistoryTurn, ProtocolError, ShellStatus, ThreadId,
@@ -48,29 +49,499 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::agent::{
-    CanonicalNativeHistoryItem, CanonicalNativeHistoryRead, NativeItemKey, NativeTurnKey,
+    CanonicalNativeHistoryItem, CanonicalNativeHistoryRead, CompletedNativeProjectionScan,
+    DynNativeProjectionScan, NATIVE_PROJECTION_ROUND_BYTE_LIMIT,
+    NATIVE_PROJECTION_ROUND_CANDIDATE_LIMIT, NATIVE_PROJECTION_ROUND_IMPORT_LIMIT,
+    NATIVE_PROJECTION_ROUND_TIME_LIMIT, NativeItemKey, NativeProjectionAcknowledgement,
+    NativeProjectionCandidate, NativeProjectionScan, NativeProjectionScanIssuer,
+    NativeProjectionSourceError, NativeProjectionStep, NativeProjectionYieldReason, NativeTurnKey,
 };
 use crate::claude_code::state::{ClaudeCodeStateRepository, ResolvedClaudeCodeReference};
-#[cfg(test)]
-use crate::runtime::store::ConversationDescriptor;
-use crate::runtime::store::{RuntimeId, RuntimeStoreError};
+use crate::runtime::store::{ConversationDescriptor, RuntimeId, RuntimeStoreError};
+use crate::security::SecretBytes;
 
 mod native;
 #[cfg(test)]
 mod native_tests;
 
-pub(crate) use native::CompletedNativeScan;
 pub(in crate::claude_code) use native::{NativeTranscriptRefV1, safe_legacy_session_id};
 
 use native::{
-    NativeHistoryError, NativeHistorySource, NativeIoBudget, NativeParseLimits, NativeReadOutcome,
-    NativeScanStep, NativeScanStop,
+    NativeHistoryCandidate, NativeHistoryError, NativeHistoryScanner, NativeHistorySource,
+    NativeIoBudget, NativeParseLimits, NativeReadOutcome, NativeScanStep, NativeScanStop,
 };
 
 /// 只由本模块在本机 CC projects root 中读回实体 JSONL 后签发的 opaque entry。
 /// Debug 不输出 native session id/path，客户端 wire 也无法构造。
 pub(super) struct VerifiedNativeHistoryEntry {
     reference: NativeTranscriptRefV1,
+}
+
+/// Bounded/no-follow read 证明的 private metadata target。
+#[allow(dead_code, reason = "后续 coordinator 接线")]
+pub(super) struct VerifiedNativeMetadata {
+    resume_thread_id: ThreadId,
+    cwd: PathBuf,
+    custom_title: Option<String>,
+}
+
+#[allow(dead_code, reason = "后续 coordinator 接线")]
+impl VerifiedNativeMetadata {
+    pub(super) fn into_parts(self) -> (ThreadId, PathBuf, Option<String>) {
+        (self.resume_thread_id, self.cwd, self.custom_title)
+    }
+}
+
+impl std::fmt::Debug for VerifiedNativeMetadata {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("VerifiedNativeMetadata([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NativeProjectionRoundLimits {
+    candidate_limit: u32,
+    import_limit: u32,
+    byte_limit: u64,
+    time_limit: Duration,
+}
+
+impl NativeProjectionRoundLimits {
+    const PRODUCTION: Self = Self {
+        candidate_limit: NATIVE_PROJECTION_ROUND_CANDIDATE_LIMIT,
+        import_limit: NATIVE_PROJECTION_ROUND_IMPORT_LIMIT,
+        byte_limit: NATIVE_PROJECTION_ROUND_BYTE_LIMIT,
+        time_limit: NATIVE_PROJECTION_ROUND_TIME_LIMIT,
+    };
+
+    fn budget(self) -> NativeIoBudget {
+        NativeIoBudget::new(
+            self.candidate_limit,
+            self.byte_limit,
+            Instant::now() + self.time_limit,
+        )
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "C-f Core projector lifecycle drives the registered source"
+)]
+struct PendingNativeProjectionCandidate {
+    native: NativeHistoryCandidate,
+    descriptor: ConversationDescriptor,
+    acknowledgement_token: [u8; 16],
+}
+
+#[allow(
+    dead_code,
+    reason = "C-f Core projector lifecycle drives the registered source"
+)]
+impl PendingNativeProjectionCandidate {
+    fn delivery(
+        &self,
+        issuer: &NativeProjectionScanIssuer,
+        default_configuration: &ConversationConfiguration,
+    ) -> Result<NativeProjectionCandidate, NativeProjectionSourceError> {
+        issuer.issue_candidate(
+            self.descriptor.clone(),
+            default_configuration.clone(),
+            SecretBytes::new(self.native.reference().encode()),
+            self.acknowledgement_token,
+        )
+    }
+}
+
+/// Claude Code 私域 scanner 到 vendor-neutral projector seam 的有界 bridge。
+///
+/// 每个 filesystem candidate 先在同一 round budget 内重新 open/read/parse 并完成
+/// canonical cwd/title 校验；只有随后构造的 neutral candidate 能跨入 Runtime。
+/// pending candidate 会 exact replay，直到 Runtime 按值归还 ACK。
+#[allow(
+    dead_code,
+    reason = "C-f Core projector lifecycle drives the registered source"
+)]
+struct ClaudeCodeNativeProjectionScan {
+    source: NativeHistorySource,
+    scanner: NativeHistoryScanner,
+    issuer: NativeProjectionScanIssuer,
+    default_configuration: ConversationConfiguration,
+    limits: NativeProjectionRoundLimits,
+    budget: NativeIoBudget,
+    pending: Option<PendingNativeProjectionCandidate>,
+    imports_in_round: u32,
+    inspected_candidates: u64,
+    imported_candidates: u64,
+    incomplete_generation: bool,
+    paused: Option<NativeProjectionYieldReason>,
+    exhausted: bool,
+    failed: bool,
+}
+
+#[allow(
+    dead_code,
+    reason = "C-f Core projector lifecycle drives the registered source"
+)]
+impl ClaudeCodeNativeProjectionScan {
+    fn new(
+        source: NativeHistorySource,
+        issuer: NativeProjectionScanIssuer,
+        default_configuration: ConversationConfiguration,
+        limits: NativeProjectionRoundLimits,
+    ) -> Result<Self, NativeProjectionSourceError> {
+        if limits.candidate_limit == 0
+            || limits.import_limit == 0
+            || limits.byte_limit == 0
+            || limits.time_limit.is_zero()
+        {
+            return Err(NativeProjectionSourceError::InvalidSource);
+        }
+        let scanner = source
+            .scanner(issuer.generation())
+            .map_err(classify_native_projection_source_error)?;
+        Ok(Self {
+            source,
+            scanner,
+            issuer,
+            default_configuration,
+            limits,
+            budget: limits.budget(),
+            pending: None,
+            imports_in_round: 0,
+            inspected_candidates: 0,
+            imported_candidates: 0,
+            incomplete_generation: false,
+            paused: None,
+            exhausted: false,
+            failed: false,
+        })
+    }
+
+    fn pause(&mut self, reason: NativeProjectionYieldReason) -> NativeProjectionStep {
+        self.paused = Some(reason);
+        NativeProjectionStep::Yielded(reason)
+    }
+
+    fn fail(
+        &mut self,
+        error: NativeProjectionSourceError,
+    ) -> Result<NativeProjectionStep, NativeProjectionSourceError> {
+        self.failed = true;
+        Err(error)
+    }
+
+    fn acknowledge_filtered(
+        &mut self,
+        native: NativeHistoryCandidate,
+    ) -> Result<(), NativeProjectionSourceError> {
+        if let Err(error) = self.scanner.acknowledge(native) {
+            self.failed = true;
+            return Err(classify_native_projection_source_error(error));
+        }
+        let Some(inspected_candidates) = self.inspected_candidates.checked_add(1) else {
+            self.failed = true;
+            return Err(NativeProjectionSourceError::PayloadTooLarge);
+        };
+        self.inspected_candidates = inspected_candidates;
+        Ok(())
+    }
+
+    /// 单个 transcript 内容无效时仍推进 opaque scanner continuation，让同一轮后续
+    /// valid candidate 可以 import；但整代永久标成 incomplete，EOF 不能签发
+    /// completed witness，因此 invalid 绝不会被静默解释成 absent/Removed。
+    fn reject_invalid_candidate(
+        &mut self,
+        native: NativeHistoryCandidate,
+    ) -> Result<(), NativeProjectionSourceError> {
+        self.acknowledge_filtered(native)?;
+        self.incomplete_generation = true;
+        Ok(())
+    }
+
+    fn next_unfailed(&mut self) -> Result<NativeProjectionStep, NativeProjectionSourceError> {
+        if let Some(reason) = self.paused {
+            return Ok(NativeProjectionStep::Yielded(reason));
+        }
+        if self.exhausted {
+            return Ok(NativeProjectionStep::Complete);
+        }
+        if let Some(pending) = self.pending.as_ref() {
+            return pending
+                .delivery(&self.issuer, &self.default_configuration)
+                .map(Box::new)
+                .map(NativeProjectionStep::Candidate);
+        }
+        if self.imports_in_round >= self.limits.import_limit {
+            return Ok(self.pause(NativeProjectionYieldReason::ImportLimit));
+        }
+
+        loop {
+            let native = match self.scanner.next(&mut self.budget) {
+                Ok(NativeScanStep::Candidate(candidate)) => candidate,
+                Ok(NativeScanStep::Yielded(NativeScanStop::CandidateLimit)) => {
+                    return Ok(self.pause(NativeProjectionYieldReason::CandidateLimit));
+                }
+                Ok(NativeScanStep::Yielded(NativeScanStop::Deadline)) => {
+                    return Ok(self.pause(NativeProjectionYieldReason::Deadline));
+                }
+                Ok(NativeScanStep::Complete) => {
+                    self.exhausted = true;
+                    return Ok(NativeProjectionStep::Complete);
+                }
+                Err(error) => {
+                    let error = classify_native_projection_source_error(error);
+                    return self.fail(error);
+                }
+            };
+
+            if native.size_bytes > self.limits.byte_limit {
+                self.reject_invalid_candidate(native)?;
+                continue;
+            }
+            let document = match self.source.read(
+                native.reference(),
+                &mut self.budget,
+                NativeParseLimits::default(),
+            ) {
+                Ok(NativeReadOutcome::FilteredObserver) => {
+                    self.acknowledge_filtered(native)?;
+                    continue;
+                }
+                Ok(NativeReadOutcome::Document(document)) => document,
+                Err(NativeHistoryError::ByteBudget) => {
+                    return Ok(self.pause(NativeProjectionYieldReason::ByteLimit));
+                }
+                Err(NativeHistoryError::TimeBudget) => {
+                    return Ok(self.pause(NativeProjectionYieldReason::Deadline));
+                }
+                Err(error) if invalid_native_candidate(&error) => {
+                    self.reject_invalid_candidate(native)?;
+                    continue;
+                }
+                Err(error) => {
+                    let error = classify_native_projection_source_error(error);
+                    return self.fail(error);
+                }
+            };
+            if document.modeled_item_count() == 0 {
+                self.acknowledge_filtered(native)?;
+                continue;
+            }
+            let (cwd, title) = match document.into_metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if invalid_native_candidate(&error) => {
+                    self.reject_invalid_candidate(native)?;
+                    continue;
+                }
+                Err(error) => {
+                    let error = classify_native_projection_source_error(error);
+                    return self.fail(error);
+                }
+            };
+            let mut acknowledgement_token = *Uuid::new_v4().as_bytes();
+            if acknowledgement_token == [0; 16] {
+                acknowledgement_token[0] = 1;
+            }
+            self.pending = Some(PendingNativeProjectionCandidate {
+                native,
+                descriptor: ConversationDescriptor {
+                    agent_kind: AgentKind::ClaudeCode,
+                    title,
+                    cwd,
+                },
+                acknowledgement_token,
+            });
+            return self
+                .pending
+                .as_ref()
+                .expect("verified native candidate remains pending")
+                .delivery(&self.issuer, &self.default_configuration)
+                .map(Box::new)
+                .map(NativeProjectionStep::Candidate);
+        }
+    }
+
+    fn acknowledge_pending(
+        &mut self,
+        acknowledgement: NativeProjectionAcknowledgement,
+    ) -> Result<(), NativeProjectionSourceError> {
+        if self.failed || self.paused.is_some() || self.exhausted {
+            return Err(NativeProjectionSourceError::InvalidState);
+        }
+        let Some(pending) = self.pending.take() else {
+            return Err(NativeProjectionSourceError::InvalidAcknowledgement);
+        };
+        if !self
+            .issuer
+            .matches_acknowledgement(&acknowledgement, &pending.acknowledgement_token)
+        {
+            self.pending = Some(pending);
+            return Err(NativeProjectionSourceError::InvalidAcknowledgement);
+        }
+        if let Err(error) = self.scanner.acknowledge(pending.native) {
+            self.failed = true;
+            return Err(classify_native_projection_source_error(error));
+        }
+        let next_counts = self
+            .imports_in_round
+            .checked_add(1)
+            .zip(self.inspected_candidates.checked_add(1))
+            .zip(self.imported_candidates.checked_add(1));
+        let Some(((imports_in_round, inspected_candidates), imported_candidates)) = next_counts
+        else {
+            self.failed = true;
+            return Err(NativeProjectionSourceError::PayloadTooLarge);
+        };
+        self.imports_in_round = imports_in_round;
+        self.inspected_candidates = inspected_candidates;
+        self.imported_candidates = imported_candidates;
+        Ok(())
+    }
+}
+
+impl NativeProjectionScan for ClaudeCodeNativeProjectionScan {
+    fn next(&mut self) -> Result<NativeProjectionStep, NativeProjectionSourceError> {
+        if self.failed {
+            return Err(NativeProjectionSourceError::InvalidState);
+        }
+        self.next_unfailed()
+    }
+
+    fn acknowledge(
+        &mut self,
+        acknowledgement: NativeProjectionAcknowledgement,
+    ) -> Result<(), NativeProjectionSourceError> {
+        self.acknowledge_pending(acknowledgement)
+    }
+
+    fn resume_after_yield(&mut self) -> Result<(), NativeProjectionSourceError> {
+        if self.failed || self.exhausted || self.pending.is_some() || self.paused.take().is_none() {
+            return Err(NativeProjectionSourceError::InvalidState);
+        }
+        self.budget = self.limits.budget();
+        self.imports_in_round = 0;
+        Ok(())
+    }
+
+    fn into_completed(
+        self: Box<Self>,
+    ) -> Result<CompletedNativeProjectionScan, NativeProjectionSourceError> {
+        if self.failed
+            || !self.exhausted
+            || self.incomplete_generation
+            || self.paused.is_some()
+            || self.pending.is_some()
+        {
+            return Err(NativeProjectionSourceError::ScanIncomplete);
+        }
+        let native = self
+            .scanner
+            .into_completed_scan()
+            .map_err(|_| NativeProjectionSourceError::ScanIncomplete)?;
+        let generation = self.issuer.generation();
+        let (native_generation, native_acknowledged_candidates) = native.into_parts();
+        if native_generation != generation
+            || native_acknowledged_candidates != self.inspected_candidates
+        {
+            return Err(NativeProjectionSourceError::ScanIncomplete);
+        }
+        self.issuer.complete(
+            generation,
+            self.inspected_candidates,
+            self.imported_candidates,
+        )
+    }
+}
+
+fn invalid_native_candidate(error: &NativeHistoryError) -> bool {
+    matches!(
+        error,
+        NativeHistoryError::LineTooLarge { .. }
+            | NativeHistoryError::RecordLimit
+            | NativeHistoryError::RetainedBudget
+            | NativeHistoryError::Malformed { .. }
+            | NativeHistoryError::InvalidKey { .. }
+            | NativeHistoryError::DuplicateKey { .. }
+            | NativeHistoryError::MetadataInvalid { .. }
+            | NativeHistoryError::MetadataAmbiguous { .. }
+            | NativeHistoryError::MissingParent { .. }
+    )
+}
+
+impl std::fmt::Debug for ClaudeCodeNativeProjectionScan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ClaudeCodeNativeProjectionScan([REDACTED])")
+    }
+}
+
+pub(super) fn begin_native_projection_scan(
+    default_configuration: ConversationConfiguration,
+    issuer: NativeProjectionScanIssuer,
+) -> Result<DynNativeProjectionScan, NativeProjectionSourceError> {
+    let source = NativeHistorySource::for_current_account()
+        .map_err(classify_native_projection_source_error)?;
+    ClaudeCodeNativeProjectionScan::new(
+        source,
+        issuer,
+        default_configuration,
+        NativeProjectionRoundLimits::PRODUCTION,
+    )
+    .map(|scan| Box::new(scan) as DynNativeProjectionScan)
+}
+
+#[cfg(test)]
+fn begin_native_projection_scan_for_test(
+    source: NativeHistorySource,
+    default_configuration: ConversationConfiguration,
+    generation: [u8; 16],
+    candidate_limit: u32,
+    import_limit: u32,
+    byte_limit: u64,
+    time_limit: Duration,
+) -> Result<DynNativeProjectionScan, NativeProjectionSourceError> {
+    let issuer = crate::agent::native_projection_scan_issuer_for_test(generation)?;
+    ClaudeCodeNativeProjectionScan::new(
+        source,
+        issuer,
+        default_configuration,
+        NativeProjectionRoundLimits {
+            candidate_limit,
+            import_limit,
+            byte_limit,
+            time_limit,
+        },
+    )
+    .map(|scan| Box::new(scan) as DynNativeProjectionScan)
+}
+
+fn classify_native_projection_source_error(
+    error: NativeHistoryError,
+) -> NativeProjectionSourceError {
+    match error {
+        NativeHistoryError::InvalidScanGeneration => NativeProjectionSourceError::InvalidGeneration,
+        NativeHistoryError::LineTooLarge { .. }
+        | NativeHistoryError::RecordLimit
+        | NativeHistoryError::RetainedBudget
+        | NativeHistoryError::ByteBudget => NativeProjectionSourceError::PayloadTooLarge,
+        NativeHistoryError::SourceUnavailable { .. } => NativeProjectionSourceError::Unavailable,
+        NativeHistoryError::HomeUnavailable
+        | NativeHistoryError::Io { .. }
+        | NativeHistoryError::TimeBudget => NativeProjectionSourceError::ReadUnavailable,
+        NativeHistoryError::InvalidCandidateAcknowledgement => {
+            NativeProjectionSourceError::InvalidAcknowledgement
+        }
+        NativeHistoryError::ScanIncomplete => NativeProjectionSourceError::ScanIncomplete,
+        NativeHistoryError::ScanFailed => NativeProjectionSourceError::InvalidState,
+        NativeHistoryError::SourceUnsafe { .. }
+        | NativeHistoryError::InvalidReference
+        | NativeHistoryError::UnsupportedReferenceVersion
+        | NativeHistoryError::Malformed { .. }
+        | NativeHistoryError::InvalidKey { .. }
+        | NativeHistoryError::DuplicateKey { .. }
+        | NativeHistoryError::MetadataInvalid { .. }
+        | NativeHistoryError::MetadataAmbiguous { .. }
+        | NativeHistoryError::MissingParent { .. } => NativeProjectionSourceError::InvalidSource,
+    }
 }
 
 impl VerifiedNativeHistoryEntry {
@@ -110,6 +581,24 @@ pub(super) async fn read_native_projection_history(
     repository: &ClaudeCodeStateRepository,
     adapter_state_key: RuntimeId,
 ) -> Result<CanonicalNativeHistoryRead, ProtocolError> {
+    let reference = resolve_native_projection_reference(repository, adapter_state_key).await?;
+    read_keyed_native_history(reference).await
+}
+
+/// 每次从 vault exact v1 ref 重新认证并有界读取，不 decode/猜测 cwd/path。
+#[allow(dead_code, reason = "后续 coordinator 接线")]
+pub(super) async fn read_native_projection_metadata(
+    repository: &ClaudeCodeStateRepository,
+    adapter_state_key: RuntimeId,
+) -> Result<VerifiedNativeMetadata, ProtocolError> {
+    let reference = resolve_native_projection_reference(repository, adapter_state_key).await?;
+    read_native_metadata(reference).await
+}
+
+async fn resolve_native_projection_reference(
+    repository: &ClaudeCodeStateRepository,
+    adapter_state_key: RuntimeId,
+) -> Result<NativeTranscriptRefV1, ProtocolError> {
     let reference = repository
         .resolve_private(adapter_state_key)
         .await
@@ -119,8 +608,7 @@ pub(super) async fn read_native_projection_history(
             message: "Claude Code history mapping was not found".into(),
             diagnostic_ref: None,
         })?;
-    let reference = require_native_projection_reference(reference)?;
-    read_keyed_native_history(reference).await
+    require_native_projection_reference(reference)
 }
 
 fn require_native_projection_reference(
@@ -266,6 +754,45 @@ async fn read_keyed_native_history(
     .map_err(|error| ProtocolError {
         code: "cc-history-task-join".into(),
         message: format!("key-bearing native history task failed: {error}"),
+        diagnostic_ref: None,
+    })?
+}
+
+#[allow(dead_code, reason = "后续 coordinator 接线")]
+async fn read_native_metadata(
+    reference: NativeTranscriptRefV1,
+) -> Result<VerifiedNativeMetadata, ProtocolError> {
+    let resume_thread_id = ThreadId(
+        reference
+            .resume_thread_id()
+            .map_err(native_history_protocol_error)?,
+    );
+    tokio::task::spawn_blocking(move || {
+        let source =
+            NativeHistorySource::for_current_account().map_err(native_history_protocol_error)?;
+        let projection = source
+            .read_projection(&reference)
+            .map_err(native_history_protocol_error)?;
+        let document = match projection.into_outcome() {
+            NativeReadOutcome::Document(document) => document,
+            NativeReadOutcome::FilteredObserver => return Err(native_history_not_found()),
+        };
+        if document.turns().is_empty() {
+            return Err(invalid_native_history());
+        }
+        let (cwd, custom_title) = document
+            .into_metadata()
+            .map_err(native_history_protocol_error)?;
+        Ok(VerifiedNativeMetadata {
+            resume_thread_id,
+            cwd,
+            custom_title,
+        })
+    })
+    .await
+    .map_err(|error| ProtocolError {
+        code: "cc-history-task-join".into(),
+        message: format!("native metadata task failed: {error}"),
         diagnostic_ref: None,
     })?
 }
@@ -501,7 +1028,8 @@ fn verify_native_history_entry_at(
                 let completed = scanner
                     .into_completed_scan()
                     .map_err(native_history_protocol_error)?;
-                debug_assert_eq!(completed.into_generation(), scan_generation);
+                let (completed_generation, _acknowledged_candidates) = completed.into_parts();
+                debug_assert_eq!(completed_generation, scan_generation);
                 break;
             }
         }
@@ -1236,129 +1764,26 @@ pub async fn read_history(thread_id: &ThreadId) -> Result<HistoryReadResponse, P
     })?
 }
 
-/// Archive a session. CC's `claude rm <id>` only handles background
-/// agents — for regular `--print` sessions there is no native archive,
-/// so we **invoke `claude rm` best-effort** and propagate its exit
-/// status as a structured error if it fails. The hub layer decides
-/// whether to fall back to a UI-side "hidden" flag (out of N8 scope —
-/// not allowed).
-pub async fn archive(thread_id: &ThreadId) -> Result<(), ProtocolError> {
-    // CC's `claude rm` looks up the session by ID within the current cwd.
-    // We must run it from the session's ORIGINAL cwd, discovered via list_history.
-    let cwd = find_session_cwd(thread_id).await?;
-    run_claude_in(&["rm", &thread_id.0], "cc-archive", &cwd).await
-}
-
-/// Look up the original cwd for a session by scanning history. Returns
-/// error if not found.
-async fn find_session_cwd(thread_id: &ThreadId) -> Result<PathBuf, ProtocolError> {
-    let items = list_history(None, Some(agentdeck_protocol::MAX_HISTORY_LIST_LIMIT)).await?;
-    items
-        .into_iter()
-        .find(|i| i.thread_id == *thread_id)
-        .map(|i| i.cwd)
-        .ok_or_else(|| ProtocolError {
-            code: "cc-session-not-found".into(),
-            message: format!("session {} not found in history", thread_id.0),
-            diagnostic_ref: None,
-        })
-}
-
-/// Rename a session via `claude --print --resume <id> -n <name>
-/// --output-format stream-json --input-format stream-json` with stdin
-/// closed (empty input). Verified live (CC 2.1.191): exits cleanly,
-/// writes `{"type":"custom-title","customTitle":"<name>"}` to the
-/// jsonl tail. Subsequent `list_history` scans pick the title up.
-pub async fn rename(thread_id: &ThreadId, title: &str) -> Result<(), ProtocolError> {
-    use tokio::io::AsyncWriteExt;
-    use tokio::process::Command;
-    // CC `--resume` looks up the session by ID within the current cwd. We
-    // must run rename from the session's original cwd, discovered via
-    // list_history. Without this the CC binary reports
-    // "No conversation found with session ID: <id>".
-    let session_cwd = find_session_cwd(thread_id).await?;
-    let mut cmd = Command::new("claude");
-    cmd.current_dir(&session_cwd)
-        .arg("--print")
-        .arg("--resume")
-        .arg(&thread_id.0)
-        .arg("-n")
-        .arg(title)
-        .arg("--output-format")
-        .arg("stream-json")
-        .arg("--input-format")
-        .arg("stream-json")
-        .arg("--verbose")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| ProtocolError {
-        code: "cc-rename-spawn".into(),
-        message: format!("spawn claude --resume --name: {e}"),
-        diagnostic_ref: None,
-    })?;
-    // Close stdin so CC exits immediately after applying the name
-    // (verified: an open stdin keeps the session interactive).
-    if let Some(stdin) = child.stdin.take() {
-        let mut s = stdin;
-        let _ = s.shutdown().await;
-    }
-    let out = child.wait_with_output().await.map_err(|e| ProtocolError {
-        code: "cc-rename-wait".into(),
-        message: format!("wait claude --resume --name: {e}"),
-        diagnostic_ref: None,
-    })?;
-    if !out.status.success() {
-        return Err(ProtocolError {
-            code: "cc-rename-status".into(),
-            message: format!(
-                "claude --resume --name (cwd={}) exited with {}: {}",
-                session_cwd.display(),
-                out.status,
-                String::from_utf8_lossy(&out.stderr)
-            ),
-            diagnostic_ref: None,
-        });
-    }
-    Ok(())
-}
-
-/// Generic wrapper for fire-and-forget `claude <args>` invocations
-/// (used by `archive`). Captures stderr into structured errors.
-async fn run_claude_in(
-    args: &[&str],
-    code_prefix: &str,
-    cwd: &std::path::Path,
-) -> Result<(), ProtocolError> {
-    use tokio::process::Command;
-    let mut cmd = Command::new("claude");
-    cmd.current_dir(cwd);
-    for a in args {
-        cmd.arg(a);
-    }
-    let out = cmd.output().await.map_err(|e| ProtocolError {
-        code: format!("{code_prefix}-spawn"),
-        message: format!("spawn claude {}: {e}", args.join(" ")),
-        diagnostic_ref: None,
-    })?;
-    if !out.status.success() {
-        return Err(ProtocolError {
-            code: format!("{code_prefix}-status"),
-            message: format!(
-                "claude {} exited with {}: {}",
-                args.join(" "),
-                out.status,
-                String::from_utf8_lossy(&out.stderr)
-            ),
-            diagnostic_ref: None,
-        });
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verified_native_metadata_debug_hides_session_cwd_and_title() {
+        let metadata = VerifiedNativeMetadata {
+            resume_thread_id: ThreadId("private-session-sentinel".into()),
+            cwd: PathBuf::from("/private/cwd/sentinel"),
+            custom_title: Some("private title sentinel".into()),
+        };
+        let debug = format!("{metadata:?}");
+        for sentinel in [
+            "private-session-sentinel",
+            "/private/cwd/sentinel",
+            "private title sentinel",
+        ] {
+            assert!(!debug.contains(sentinel));
+        }
+    }
 
     #[test]
     fn encode_cwd_round_trip_unix_path() {
@@ -1847,6 +2272,11 @@ mod tests {
                 .expect("resolve rebuilt mapping"),
             Some(native.thread_id.clone())
         );
+        let exact = resolve_native_projection_reference(&repository, adapter_state_key)
+            .await
+            .expect("metadata/history seam resolves exact NativeTranscriptRefV1 from vault");
+        assert_eq!(exact.resume_thread_id().unwrap(), native_id);
+        assert!(!format!("{exact:?}").contains(native_id));
         store.shutdown().await.expect("shutdown rebuild store");
 
         let storage_kek =

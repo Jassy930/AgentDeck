@@ -478,11 +478,16 @@ async fn assert_configuration_tamper_rejected(tamper: ConfigurationTamper) {
     .await
     .expect_err("configuration tamper must fail at reopen");
     let expected_error = match tamper {
-        ConfigurationTamper::SealedRequest
-        | ConfigurationTamper::EventPayload
-        | ConfigurationTamper::SwapRequests => {
+        ConfigurationTamper::SealedRequest | ConfigurationTamper::SwapRequests => {
             matches!(error, RuntimeStoreError::Cipher(_))
         }
+        // current-v6 open 会执行完整的 authenticated integrity audit；sealed_event
+        // bit flip 可能由 AEAD gate 直接报 Cipher，也可能先由跨表审计统一收敛为
+        // UnknownOrCorruptSchema。两条路径都必须 fail-close，且不能放宽其他 case。
+        ConfigurationTamper::EventPayload => matches!(
+            error,
+            RuntimeStoreError::Cipher(_) | RuntimeStoreError::UnknownOrCorruptSchema
+        ),
         ConfigurationTamper::ConfigurationMetadata
         | ConfigurationTamper::StateHead
         | ConfigurationTamper::RuntimeLedger

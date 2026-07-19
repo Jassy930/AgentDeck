@@ -1759,7 +1759,7 @@ impl DynamicSnapshotInput {
     }
 
     #[must_use]
-    pub const fn adapter_state_key(&self) -> RuntimeId {
+    pub(crate) const fn adapter_state_key(&self) -> RuntimeId {
         self.adapter_state_key
     }
 

@@ -29,6 +29,16 @@ use crate::runtime::store::{RuntimeId, RuntimeIdKind};
 mod parent;
 
 pub use parent::GatedChildIo;
+#[allow(
+    unused_imports,
+    reason = "C-e4 coordinator owns the native gate reaper"
+)]
+pub(crate) use parent::NativeGatedChildOwner;
+#[allow(
+    unused_imports,
+    reason = "C-e4 coordinator consumes the typed native gated child"
+)]
+pub(crate) use parent::NativeMetadataGatedChild;
 pub(crate) use parent::{GatedChild, GatedChildOwner, GatedChildRelease};
 
 pub(super) const CONTROL_FD: RawFd = 3;
@@ -45,8 +55,11 @@ const PREPARE_TAG: u8 = 1;
 const RELEASE_TAG: u8 = 2;
 const READY_TAG: u8 = 3;
 const ABORTED_TAG: u8 = 4;
+const NATIVE_METADATA_PREPARE_TAG: u8 = 5;
+const NATIVE_METADATA_RELEASE_TAG: u8 = 6;
 const RUNTIME_ID_TEXT_BYTES: usize = 36;
 const MAX_ERROR_CODE_BYTES: usize = 128;
+const IDEMPOTENCY_TOKEN_BYTES: usize = 32;
 
 /// 构造 exec gate parent、vendor resolver 与最终 vendor 共同使用的固定目录集合。
 ///
@@ -154,10 +167,32 @@ pub(super) enum ParentFrame {
         arguments: Vec<Vec<u8>>,
         cwd: Vec<u8>,
     },
+    PrepareNativeMetadata {
+        protocol_version: u16,
+        conversation_id: String,
+        idempotency_token: Vec<u8>,
+        daemon_boot_id: String,
+        effect_nonce: Vec<u8>,
+        program: Vec<u8>,
+        arguments: Vec<Vec<u8>>,
+        cwd: Vec<u8>,
+    },
     Release {
         command_id: String,
         daemon_boot_id: String,
         execution_nonce: Vec<u8>,
+        process_group_id: i64,
+        leader_pid: i64,
+        leader_start_time: u64,
+        release_token: Vec<u8>,
+        token_commitment: Vec<u8>,
+        release_authorized_at_ms: u64,
+    },
+    ReleaseNativeMetadata {
+        conversation_id: String,
+        idempotency_token: Vec<u8>,
+        daemon_boot_id: String,
+        effect_nonce: Vec<u8>,
         process_group_id: i64,
         leader_pid: i64,
         leader_start_time: u64,
@@ -199,7 +234,7 @@ pub(super) enum ChildReply {
 }
 
 struct PreparedSpec {
-    command_id: RuntimeId,
+    binding: GateBinding,
     daemon_boot_id: RuntimeId,
     execution_nonce: Vec<u8>,
     program: PathBuf,
@@ -207,8 +242,58 @@ struct PreparedSpec {
     cwd: PathBuf,
 }
 
-struct GateBinding {
-    command_id: RuntimeId,
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum GateBinding {
+    Command {
+        command_id: RuntimeId,
+    },
+    NativeMetadata {
+        conversation_id: RuntimeId,
+        idempotency_token: [u8; IDEMPOTENCY_TOKEN_BYTES],
+    },
+}
+
+impl GateBinding {
+    fn exact_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Command { command_id: left }, Self::Command { command_id: right }) => {
+                left == right
+            }
+            (
+                Self::NativeMetadata {
+                    conversation_id: left_conversation,
+                    idempotency_token: left_token,
+                },
+                Self::NativeMetadata {
+                    conversation_id: right_conversation,
+                    idempotency_token: right_token,
+                },
+            ) => {
+                left_conversation == right_conversation && constant_time_eq(left_token, right_token)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Debug for GateBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Command { .. } => formatter
+                .debug_struct("GateBinding::Command")
+                .field("command_id", &"[REDACTED]")
+                .finish(),
+            Self::NativeMetadata { .. } => formatter
+                .debug_struct("GateBinding::NativeMetadata")
+                .field("conversation_id", &"[REDACTED]")
+                .field("idempotency_token", &"[REDACTED]")
+                .finish(),
+        }
+    }
+}
+
+struct EstablishedGateBinding {
+    binding: GateBinding,
     daemon_boot_id: RuntimeId,
     execution_nonce: Vec<u8>,
     process: ProcessIdentity,
@@ -231,14 +316,37 @@ pub fn run_from_private_fd() -> Result<(), ExecGateError> {
             cwd,
         } => validate_prepare(
             protocol_version,
-            command_id,
+            GateBinding::Command {
+                command_id: RuntimeId::parse_canonical(RuntimeIdKind::Command, &command_id)
+                    .map_err(|_| ExecGateError::InvalidBinding)?,
+            },
             daemon_boot_id,
             execution_nonce,
             program,
             arguments,
             cwd,
         )?,
-        ParentFrame::Release { .. } => return abort(&mut control, ExecGateError::InvalidFrame),
+        ParentFrame::PrepareNativeMetadata {
+            protocol_version,
+            conversation_id,
+            idempotency_token,
+            daemon_boot_id,
+            effect_nonce,
+            program,
+            arguments,
+            cwd,
+        } => validate_prepare(
+            protocol_version,
+            native_metadata_binding(conversation_id, idempotency_token)?,
+            daemon_boot_id,
+            effect_nonce,
+            program,
+            arguments,
+            cwd,
+        )?,
+        ParentFrame::Release { .. } | ParentFrame::ReleaseNativeMetadata { .. } => {
+            return abort(&mut control, ExecGateError::InvalidFrame);
+        }
     };
     let binding = establish_binding(&prepare)?;
     write_frame(
@@ -334,9 +442,24 @@ fn close_sentinel_stdio() {
     }
 }
 
+fn native_metadata_binding(
+    conversation_id: String,
+    idempotency_token: Vec<u8>,
+) -> Result<GateBinding, ExecGateError> {
+    let conversation_id = RuntimeId::parse_canonical(RuntimeIdKind::Conversation, &conversation_id)
+        .map_err(|_| ExecGateError::InvalidBinding)?;
+    let idempotency_token: [u8; IDEMPOTENCY_TOKEN_BYTES] = idempotency_token
+        .try_into()
+        .map_err(|_| ExecGateError::InvalidBinding)?;
+    Ok(GateBinding::NativeMetadata {
+        conversation_id,
+        idempotency_token,
+    })
+}
+
 fn validate_prepare(
     protocol_version: u16,
-    command_id: String,
+    binding: GateBinding,
     daemon_boot_id: String,
     execution_nonce: Vec<u8>,
     program: Vec<u8>,
@@ -346,8 +469,6 @@ fn validate_prepare(
     if protocol_version != GATE_PROTOCOL_VERSION {
         return Err(ExecGateError::Version);
     }
-    let command_id = RuntimeId::parse_canonical(RuntimeIdKind::Command, &command_id)
-        .map_err(|_| ExecGateError::InvalidBinding)?;
     let daemon_boot_id = RuntimeId::parse_canonical(RuntimeIdKind::DaemonBoot, &daemon_boot_id)
         .map_err(|_| ExecGateError::InvalidBinding)?;
     if execution_nonce.is_empty() || execution_nonce.len() > MAX_EXECUTION_NONCE_BYTES {
@@ -387,7 +508,7 @@ fn validate_prepare(
         return Err(ExecGateError::InvalidBinding);
     }
     Ok(PreparedSpec {
-        command_id,
+        binding,
         daemon_boot_id,
         execution_nonce,
         program,
@@ -403,7 +524,7 @@ fn decode_path(value: Vec<u8>) -> Result<PathBuf, ExecGateError> {
     Ok(PathBuf::from(OsString::from_vec(value)))
 }
 
-fn establish_binding(spec: &PreparedSpec) -> Result<GateBinding, ExecGateError> {
+fn establish_binding(spec: &PreparedSpec) -> Result<EstablishedGateBinding, ExecGateError> {
     // SAFETY: pid=0/pgid=0 requests a new group led by this exact gate process.
     if unsafe { libc::setpgid(0, 0) } != 0 {
         return Err(ExecGateError::ProcessGroup(io::Error::last_os_error()));
@@ -421,8 +542,8 @@ fn establish_binding(spec: &PreparedSpec) -> Result<GateBinding, ExecGateError> 
         return Err(ExecGateError::Entropy);
     }
     let token_commitment = token_commitment(spec, process, &release_token);
-    Ok(GateBinding {
-        command_id: spec.command_id,
+    Ok(EstablishedGateBinding {
+        binding: spec.binding,
         daemon_boot_id: spec.daemon_boot_id,
         execution_nonce: spec.execution_nonce.clone(),
         process,
@@ -436,22 +557,155 @@ fn token_commitment(
     process: ProcessIdentity,
     token: &[u8; RELEASE_TOKEN_BYTES],
 ) -> [u8; TOKEN_COMMITMENT_BYTES] {
+    let arguments = spec
+        .arguments
+        .iter()
+        .map(|argument| argument.as_encoded_bytes())
+        .collect::<Vec<_>>();
+    let input = GateCommitmentSpec {
+        binding: spec.binding,
+        daemon_boot_id: spec.daemon_boot_id,
+        execution_nonce: &spec.execution_nonce,
+        program: spec.program.as_os_str().as_encoded_bytes(),
+        arguments: &arguments,
+        cwd: spec.cwd.as_os_str().as_encoded_bytes(),
+    };
+    token_commitment_for_parts(&input, process, token)
+}
+
+struct GateCommitmentSpec<'a> {
+    binding: GateBinding,
+    daemon_boot_id: RuntimeId,
+    execution_nonce: &'a [u8],
+    program: &'a [u8],
+    arguments: &'a [&'a [u8]],
+    cwd: &'a [u8],
+}
+
+fn token_commitment_for_parts(
+    spec: &GateCommitmentSpec<'_>,
+    process: ProcessIdentity,
+    token: &[u8; RELEASE_TOKEN_BYTES],
+) -> [u8; TOKEN_COMMITMENT_BYTES] {
     let mut hash = Sha256::new();
-    hash.update(b"agentdeck.exec-gate.release.v1\0");
-    hash.update(spec.command_id.to_canonical_string().as_bytes());
-    hash.update(spec.daemon_boot_id.to_canonical_string().as_bytes());
-    hash.update((spec.execution_nonce.len() as u64).to_be_bytes());
-    hash.update(&spec.execution_nonce);
+    hash.update(b"agentdeck.exec-gate.release.v2\0");
+    hash_gate_binding(&mut hash, spec.binding);
+    hash_len_prefixed(
+        &mut hash,
+        spec.daemon_boot_id.to_canonical_string().as_bytes(),
+    );
+    hash_len_prefixed(&mut hash, spec.execution_nonce);
     hash.update(process.process_group_id().to_be_bytes());
     hash.update(process.leader_pid().to_be_bytes());
     hash.update(process.leader_start_time().to_be_bytes());
+    hash_len_prefixed(&mut hash, spec.program);
+    hash.update((spec.arguments.len() as u64).to_be_bytes());
+    for argument in spec.arguments {
+        hash_len_prefixed(&mut hash, argument);
+    }
+    hash_len_prefixed(&mut hash, spec.cwd);
     hash.update(token);
     hash.finalize().into()
 }
 
-fn release_matches(binding: &GateBinding, frame: ParentFrame) -> bool {
-    let ParentFrame::Release {
-        command_id,
+pub(super) fn parent_prepare_token_commitment(
+    frame: &ParentFrame,
+    process: ProcessIdentity,
+    token: &[u8; RELEASE_TOKEN_BYTES],
+) -> Result<[u8; TOKEN_COMMITMENT_BYTES], ExecGateError> {
+    let (binding, daemon_boot_id, execution_nonce, program, arguments, cwd) = match frame {
+        ParentFrame::Prepare {
+            protocol_version,
+            command_id,
+            daemon_boot_id,
+            execution_nonce,
+            program,
+            arguments,
+            cwd,
+        } => {
+            if *protocol_version != GATE_PROTOCOL_VERSION {
+                return Err(ExecGateError::Version);
+            }
+            let command_id = RuntimeId::parse_canonical(RuntimeIdKind::Command, command_id)
+                .map_err(|_| ExecGateError::InvalidBinding)?;
+            (
+                GateBinding::Command { command_id },
+                daemon_boot_id,
+                execution_nonce,
+                program,
+                arguments,
+                cwd,
+            )
+        }
+        ParentFrame::PrepareNativeMetadata {
+            protocol_version,
+            conversation_id,
+            idempotency_token,
+            daemon_boot_id,
+            effect_nonce,
+            program,
+            arguments,
+            cwd,
+        } => {
+            if *protocol_version != GATE_PROTOCOL_VERSION {
+                return Err(ExecGateError::Version);
+            }
+            (
+                native_metadata_binding(conversation_id.clone(), idempotency_token.clone())?,
+                daemon_boot_id,
+                effect_nonce,
+                program,
+                arguments,
+                cwd,
+            )
+        }
+        ParentFrame::Release { .. } | ParentFrame::ReleaseNativeMetadata { .. } => {
+            return Err(ExecGateError::InvalidFrame);
+        }
+    };
+    let daemon_boot_id = RuntimeId::parse_canonical(RuntimeIdKind::DaemonBoot, daemon_boot_id)
+        .map_err(|_| ExecGateError::InvalidBinding)?;
+    if execution_nonce.is_empty() || execution_nonce.len() > MAX_EXECUTION_NONCE_BYTES {
+        return Err(ExecGateError::InvalidBinding);
+    }
+    validate_encoded_exec_spec(program, arguments, cwd)?;
+    let arguments = arguments.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let input = GateCommitmentSpec {
+        binding,
+        daemon_boot_id,
+        execution_nonce,
+        program,
+        arguments: &arguments,
+        cwd,
+    };
+    Ok(token_commitment_for_parts(&input, process, token))
+}
+
+fn hash_gate_binding(hash: &mut Sha256, binding: GateBinding) {
+    match binding {
+        GateBinding::Command { command_id } => {
+            hash.update([1]);
+            hash_len_prefixed(hash, command_id.to_canonical_string().as_bytes());
+        }
+        GateBinding::NativeMetadata {
+            conversation_id,
+            idempotency_token,
+        } => {
+            hash.update([2]);
+            hash_len_prefixed(hash, conversation_id.to_canonical_string().as_bytes());
+            hash_len_prefixed(hash, &idempotency_token);
+        }
+    }
+}
+
+fn hash_len_prefixed(hash: &mut Sha256, value: &[u8]) {
+    hash.update((value.len() as u64).to_be_bytes());
+    hash.update(value);
+}
+
+fn release_matches(binding: &EstablishedGateBinding, frame: ParentFrame) -> bool {
+    let (
+        observed_binding,
         daemon_boot_id,
         execution_nonce,
         process_group_id,
@@ -460,11 +714,65 @@ fn release_matches(binding: &GateBinding, frame: ParentFrame) -> bool {
         release_token,
         token_commitment,
         release_authorized_at_ms,
-    } = frame
-    else {
-        return false;
+    ) = match frame {
+        ParentFrame::Release {
+            command_id,
+            daemon_boot_id,
+            execution_nonce,
+            process_group_id,
+            leader_pid,
+            leader_start_time,
+            release_token,
+            token_commitment,
+            release_authorized_at_ms,
+        } => {
+            let Ok(command_id) = RuntimeId::parse_canonical(RuntimeIdKind::Command, &command_id)
+            else {
+                return false;
+            };
+            (
+                GateBinding::Command { command_id },
+                daemon_boot_id,
+                execution_nonce,
+                process_group_id,
+                leader_pid,
+                leader_start_time,
+                release_token,
+                token_commitment,
+                release_authorized_at_ms,
+            )
+        }
+        ParentFrame::ReleaseNativeMetadata {
+            conversation_id,
+            idempotency_token,
+            daemon_boot_id,
+            effect_nonce,
+            process_group_id,
+            leader_pid,
+            leader_start_time,
+            release_token,
+            token_commitment,
+            release_authorized_at_ms,
+        } => {
+            let Ok(observed_binding) = native_metadata_binding(conversation_id, idempotency_token)
+            else {
+                return false;
+            };
+            (
+                observed_binding,
+                daemon_boot_id,
+                effect_nonce,
+                process_group_id,
+                leader_pid,
+                leader_start_time,
+                release_token,
+                token_commitment,
+                release_authorized_at_ms,
+            )
+        }
+        ParentFrame::Prepare { .. } | ParentFrame::PrepareNativeMetadata { .. } => return false,
     };
-    command_id == binding.command_id.to_canonical_string()
+    binding.binding.exact_eq(&observed_binding)
         && daemon_boot_id == binding.daemon_boot_id.to_canonical_string()
         && constant_time_eq(&execution_nonce, &binding.execution_nonce)
         && process_group_id == binding.process.process_group_id()
@@ -536,6 +844,8 @@ fn encode_parent_frame(frame: &ParentFrame) -> Result<Vec<u8>, ExecGateError> {
     let mut encoder = match frame {
         ParentFrame::Prepare { .. } => FrameEncoder::new(PREPARE_TAG),
         ParentFrame::Release { .. } => FrameEncoder::new(RELEASE_TAG),
+        ParentFrame::PrepareNativeMetadata { .. } => FrameEncoder::new(NATIVE_METADATA_PREPARE_TAG),
+        ParentFrame::ReleaseNativeMetadata { .. } => FrameEncoder::new(NATIVE_METADATA_RELEASE_TAG),
     };
     match frame {
         ParentFrame::Prepare {
@@ -581,6 +891,30 @@ fn encode_parent_frame(frame: &ParentFrame) -> Result<Vec<u8>, ExecGateError> {
             }
             encoder.push_bytes(cwd, MAX_EXEC_PATH_BYTES)?;
         }
+        ParentFrame::PrepareNativeMetadata {
+            protocol_version,
+            conversation_id,
+            idempotency_token,
+            daemon_boot_id,
+            effect_nonce,
+            program,
+            arguments,
+            cwd,
+        } => {
+            validate_encoded_exec_spec(program, arguments, cwd)?;
+            encoder.push_u16(*protocol_version);
+            encoder.push_text(conversation_id, RUNTIME_ID_TEXT_BYTES)?;
+            encoder.push_exact_bytes(idempotency_token, IDEMPOTENCY_TOKEN_BYTES)?;
+            encoder.push_text(daemon_boot_id, RUNTIME_ID_TEXT_BYTES)?;
+            encoder.push_bytes(effect_nonce, MAX_EXECUTION_NONCE_BYTES)?;
+            encoder.push_bytes(program, MAX_EXEC_PATH_BYTES)?;
+            encoder
+                .push_u16(u16::try_from(arguments.len()).map_err(|_| ExecGateError::InvalidFrame)?);
+            for argument in arguments {
+                encoder.push_bytes(argument, MAX_EXEC_SINGLE_ARGUMENT_BYTES)?;
+            }
+            encoder.push_bytes(cwd, MAX_EXEC_PATH_BYTES)?;
+        }
         ParentFrame::Release {
             command_id,
             daemon_boot_id,
@@ -602,8 +936,56 @@ fn encode_parent_frame(frame: &ParentFrame) -> Result<Vec<u8>, ExecGateError> {
             encoder.push_exact_bytes(token_commitment, TOKEN_COMMITMENT_BYTES)?;
             encoder.push_u64(*release_authorized_at_ms);
         }
+        ParentFrame::ReleaseNativeMetadata {
+            conversation_id,
+            idempotency_token,
+            daemon_boot_id,
+            effect_nonce,
+            process_group_id,
+            leader_pid,
+            leader_start_time,
+            release_token,
+            token_commitment,
+            release_authorized_at_ms,
+        } => {
+            encoder.push_text(conversation_id, RUNTIME_ID_TEXT_BYTES)?;
+            encoder.push_exact_bytes(idempotency_token, IDEMPOTENCY_TOKEN_BYTES)?;
+            encoder.push_text(daemon_boot_id, RUNTIME_ID_TEXT_BYTES)?;
+            encoder.push_bytes(effect_nonce, MAX_EXECUTION_NONCE_BYTES)?;
+            encoder.push_i64(*process_group_id);
+            encoder.push_i64(*leader_pid);
+            encoder.push_u64(*leader_start_time);
+            encoder.push_exact_bytes(release_token, RELEASE_TOKEN_BYTES)?;
+            encoder.push_exact_bytes(token_commitment, TOKEN_COMMITMENT_BYTES)?;
+            encoder.push_u64(*release_authorized_at_ms);
+        }
     }
     encoder.finish()
+}
+
+fn validate_encoded_exec_spec(
+    program: &[u8],
+    arguments: &[Vec<u8>],
+    cwd: &[u8],
+) -> Result<(), ExecGateError> {
+    let argument_bytes = arguments.iter().try_fold(0_usize, |total, argument| {
+        if argument.len() > MAX_EXEC_SINGLE_ARGUMENT_BYTES {
+            return Err(ExecGateError::InvalidFrame);
+        }
+        total
+            .checked_add(argument.len())
+            .ok_or(ExecGateError::InvalidFrame)
+    })?;
+    if arguments.len() > MAX_EXEC_ARGUMENTS
+        || argument_bytes > MAX_EXEC_ARGUMENT_BYTES
+        || program.len() > MAX_EXEC_PATH_BYTES
+        || cwd.len() > MAX_EXEC_PATH_BYTES
+        || exec_spec_control_frame_bytes(program.len(), cwd.len(), arguments.len(), argument_bytes)
+            .is_none_or(|bytes| bytes > MAX_EXEC_CONTROL_FRAME_BYTES)
+    {
+        return Err(ExecGateError::InvalidFrame);
+    }
+    Ok(())
 }
 
 fn decode_parent_payload(payload: &[u8]) -> Result<ParentFrame, ExecGateError> {
@@ -652,10 +1034,50 @@ fn decode_parent_payload(payload: &[u8]) -> Result<ParentFrame, ExecGateError> {
                 cwd,
             }
         }
+        NATIVE_METADATA_PREPARE_TAG => {
+            let protocol_version = decoder.read_u16()?;
+            let conversation_id = decoder.read_text(RUNTIME_ID_TEXT_BYTES)?;
+            let idempotency_token = decoder.read_exact_bytes(IDEMPOTENCY_TOKEN_BYTES)?;
+            let daemon_boot_id = decoder.read_text(RUNTIME_ID_TEXT_BYTES)?;
+            let effect_nonce = decoder.read_bytes(MAX_EXECUTION_NONCE_BYTES)?;
+            let program = decoder.read_bytes(MAX_EXEC_PATH_BYTES)?;
+            let argument_count = usize::from(decoder.read_u16()?);
+            if argument_count > MAX_EXEC_ARGUMENTS {
+                return Err(ExecGateError::InvalidFrame);
+            }
+            let mut arguments = Vec::with_capacity(argument_count);
+            for _ in 0..argument_count {
+                arguments.push(decoder.read_bytes(MAX_EXEC_SINGLE_ARGUMENT_BYTES)?);
+            }
+            let cwd = decoder.read_bytes(MAX_EXEC_PATH_BYTES)?;
+            validate_encoded_exec_spec(&program, &arguments, &cwd)?;
+            ParentFrame::PrepareNativeMetadata {
+                protocol_version,
+                conversation_id,
+                idempotency_token,
+                daemon_boot_id,
+                effect_nonce,
+                program,
+                arguments,
+                cwd,
+            }
+        }
         RELEASE_TAG => ParentFrame::Release {
             command_id: decoder.read_text(RUNTIME_ID_TEXT_BYTES)?,
             daemon_boot_id: decoder.read_text(RUNTIME_ID_TEXT_BYTES)?,
             execution_nonce: decoder.read_bytes(MAX_EXECUTION_NONCE_BYTES)?,
+            process_group_id: decoder.read_i64()?,
+            leader_pid: decoder.read_i64()?,
+            leader_start_time: decoder.read_u64()?,
+            release_token: decoder.read_exact_bytes(RELEASE_TOKEN_BYTES)?,
+            token_commitment: decoder.read_exact_bytes(TOKEN_COMMITMENT_BYTES)?,
+            release_authorized_at_ms: decoder.read_u64()?,
+        },
+        NATIVE_METADATA_RELEASE_TAG => ParentFrame::ReleaseNativeMetadata {
+            conversation_id: decoder.read_text(RUNTIME_ID_TEXT_BYTES)?,
+            idempotency_token: decoder.read_exact_bytes(IDEMPOTENCY_TOKEN_BYTES)?,
+            daemon_boot_id: decoder.read_text(RUNTIME_ID_TEXT_BYTES)?,
+            effect_nonce: decoder.read_bytes(MAX_EXECUTION_NONCE_BYTES)?,
             process_group_id: decoder.read_i64()?,
             leader_pid: decoder.read_i64()?,
             leader_start_time: decoder.read_u64()?,
@@ -910,6 +1332,33 @@ impl<'a> FrameDecoder<'a> {
 mod tests {
     use super::*;
 
+    fn runtime_id(kind: RuntimeIdKind, seed: u8) -> RuntimeId {
+        RuntimeId::from_bytes(kind, [seed; 16]).expect("non-zero runtime id")
+    }
+
+    fn process(seed: i64) -> ProcessIdentity {
+        ProcessIdentity::new(seed, seed, u64::try_from(seed).unwrap() + 1)
+            .expect("valid synthetic process identity")
+    }
+
+    fn prepared_spec(binding: GateBinding) -> PreparedSpec {
+        PreparedSpec {
+            binding,
+            daemon_boot_id: runtime_id(RuntimeIdKind::DaemonBoot, 0x31),
+            execution_nonce: b"exact-effect-nonce".to_vec(),
+            program: PathBuf::from("/usr/bin/true"),
+            arguments: vec![OsString::from("--exact"), OsString::from("value")],
+            cwd: PathBuf::from("/tmp"),
+        }
+    }
+
+    fn native_binding() -> GateBinding {
+        GateBinding::NativeMetadata {
+            conversation_id: runtime_id(RuntimeIdKind::Conversation, 0x32),
+            idempotency_token: [0x33; IDEMPOTENCY_TOKEN_BYTES],
+        }
+    }
+
     #[test]
     fn trusted_program_resolution_ignores_arbitrary_paths_and_stays_in_safe_path() {
         assert!(resolve_trusted_program("").is_none());
@@ -922,6 +1371,240 @@ mod tests {
             "resolved program escaped the fixed safe path: {}",
             resolved.display()
         );
+    }
+
+    #[test]
+    fn native_metadata_wire_roundtrip_preserves_explicit_binding_and_exact_spec() {
+        let conversation_id = runtime_id(RuntimeIdKind::Conversation, 0x41);
+        let daemon_boot_id = runtime_id(RuntimeIdKind::DaemonBoot, 0x42);
+        let frame = ParentFrame::PrepareNativeMetadata {
+            protocol_version: GATE_PROTOCOL_VERSION,
+            conversation_id: conversation_id.to_canonical_string(),
+            idempotency_token: vec![0x43; IDEMPOTENCY_TOKEN_BYTES],
+            daemon_boot_id: daemon_boot_id.to_canonical_string(),
+            effect_nonce: b"native-wire-nonce".to_vec(),
+            program: b"/usr/bin/true".to_vec(),
+            arguments: vec![b"--name".to_vec(), b"exact title".to_vec()],
+            cwd: b"/tmp".to_vec(),
+        };
+        let payload = encode_parent_frame(&frame).expect("encode native metadata prepare");
+        assert_eq!(payload[WIRE_MAGIC.len() + 2], NATIVE_METADATA_PREPARE_TAG);
+        let decoded = decode_parent_payload(&payload).expect("decode native metadata prepare");
+        let ParentFrame::PrepareNativeMetadata {
+            protocol_version,
+            conversation_id: decoded_conversation,
+            idempotency_token,
+            daemon_boot_id: decoded_boot,
+            effect_nonce,
+            program,
+            arguments,
+            cwd,
+        } = decoded
+        else {
+            panic!("native metadata prepare changed binding kind");
+        };
+        assert_eq!(protocol_version, GATE_PROTOCOL_VERSION);
+        assert_eq!(decoded_conversation, conversation_id.to_canonical_string());
+        assert_eq!(idempotency_token, vec![0x43; IDEMPOTENCY_TOKEN_BYTES]);
+        assert_eq!(decoded_boot, daemon_boot_id.to_canonical_string());
+        assert_eq!(effect_nonce, b"native-wire-nonce");
+        assert_eq!(program, b"/usr/bin/true");
+        assert_eq!(arguments, vec![b"--name".to_vec(), b"exact title".to_vec()]);
+        assert_eq!(cwd, b"/tmp");
+
+        let command = ParentFrame::Prepare {
+            protocol_version: GATE_PROTOCOL_VERSION,
+            command_id: runtime_id(RuntimeIdKind::Command, 0x44).to_canonical_string(),
+            daemon_boot_id: daemon_boot_id.to_canonical_string(),
+            execution_nonce: b"command-wire-nonce".to_vec(),
+            program: b"/usr/bin/true".to_vec(),
+            arguments: Vec::new(),
+            cwd: b"/tmp".to_vec(),
+        };
+        let command_payload = encode_parent_frame(&command).expect("encode command prepare");
+        assert_eq!(command_payload[WIRE_MAGIC.len() + 2], PREPARE_TAG);
+    }
+
+    #[test]
+    fn release_commitment_binds_kind_boot_nonce_process_and_exact_spec() {
+        let command_binding = GateBinding::Command {
+            command_id: runtime_id(RuntimeIdKind::Command, 0x51),
+        };
+        let base = prepared_spec(command_binding);
+        let base_process = process(551);
+        let token = [0x52; RELEASE_TOKEN_BYTES];
+        let commitment = token_commitment(&base, base_process, &token);
+        assert_ne!(commitment, [0; TOKEN_COMMITMENT_BYTES]);
+
+        let native = prepared_spec(native_binding());
+        assert_ne!(commitment, token_commitment(&native, base_process, &token));
+
+        let mut changed = prepared_spec(command_binding);
+        changed.daemon_boot_id = runtime_id(RuntimeIdKind::DaemonBoot, 0x53);
+        assert_ne!(commitment, token_commitment(&changed, base_process, &token));
+
+        let mut changed = prepared_spec(command_binding);
+        changed.execution_nonce.push(0x54);
+        assert_ne!(commitment, token_commitment(&changed, base_process, &token));
+        assert_ne!(commitment, token_commitment(&base, process(552), &token));
+
+        let mut changed = prepared_spec(command_binding);
+        changed.program = PathBuf::from("/usr/bin/false");
+        assert_ne!(commitment, token_commitment(&changed, base_process, &token));
+
+        let mut changed = prepared_spec(command_binding);
+        changed.arguments.swap(0, 1);
+        assert_ne!(commitment, token_commitment(&changed, base_process, &token));
+
+        let mut changed = prepared_spec(command_binding);
+        changed.cwd = PathBuf::from("/private/tmp");
+        assert_ne!(commitment, token_commitment(&changed, base_process, &token));
+
+        let changed_token = [0x55; RELEASE_TOKEN_BYTES];
+        assert_ne!(
+            commitment,
+            token_commitment(&base, base_process, &changed_token)
+        );
+    }
+
+    #[test]
+    fn native_release_requires_exact_kind_and_all_committed_fields() {
+        let spec = prepared_spec(native_binding());
+        let process = process(661);
+        let release_token = [0x61; RELEASE_TOKEN_BYTES];
+        let token_commitment = token_commitment(&spec, process, &release_token);
+        let established = EstablishedGateBinding {
+            binding: spec.binding,
+            daemon_boot_id: spec.daemon_boot_id,
+            execution_nonce: spec.execution_nonce.clone(),
+            process,
+            release_token,
+            token_commitment,
+        };
+        let GateBinding::NativeMetadata {
+            conversation_id,
+            idempotency_token,
+        } = spec.binding
+        else {
+            unreachable!();
+        };
+        let native_release = |binding: GateBinding,
+                              nonce: Vec<u8>,
+                              token: Vec<u8>,
+                              commitment: Vec<u8>,
+                              release_authorized_at_ms: u64| {
+            match binding {
+                GateBinding::NativeMetadata {
+                    conversation_id,
+                    idempotency_token,
+                } => ParentFrame::ReleaseNativeMetadata {
+                    conversation_id: conversation_id.to_canonical_string(),
+                    idempotency_token: idempotency_token.to_vec(),
+                    daemon_boot_id: spec.daemon_boot_id.to_canonical_string(),
+                    effect_nonce: nonce,
+                    process_group_id: process.process_group_id(),
+                    leader_pid: process.leader_pid(),
+                    leader_start_time: process.leader_start_time(),
+                    release_token: token,
+                    token_commitment: commitment,
+                    release_authorized_at_ms,
+                },
+                GateBinding::Command { command_id } => ParentFrame::Release {
+                    command_id: command_id.to_canonical_string(),
+                    daemon_boot_id: spec.daemon_boot_id.to_canonical_string(),
+                    execution_nonce: nonce,
+                    process_group_id: process.process_group_id(),
+                    leader_pid: process.leader_pid(),
+                    leader_start_time: process.leader_start_time(),
+                    release_token: token,
+                    token_commitment: commitment,
+                    release_authorized_at_ms,
+                },
+            }
+        };
+        assert!(release_matches(
+            &established,
+            native_release(
+                spec.binding,
+                spec.execution_nonce.clone(),
+                release_token.to_vec(),
+                token_commitment.to_vec(),
+                1,
+            )
+        ));
+        assert!(!release_matches(
+            &established,
+            native_release(
+                GateBinding::Command {
+                    command_id: runtime_id(RuntimeIdKind::Command, 0x62),
+                },
+                spec.execution_nonce.clone(),
+                release_token.to_vec(),
+                token_commitment.to_vec(),
+                1,
+            )
+        ));
+        let mut wrong_idempotency = idempotency_token;
+        wrong_idempotency[31] ^= 1;
+        assert!(!release_matches(
+            &established,
+            native_release(
+                GateBinding::NativeMetadata {
+                    conversation_id,
+                    idempotency_token: wrong_idempotency,
+                },
+                spec.execution_nonce.clone(),
+                release_token.to_vec(),
+                token_commitment.to_vec(),
+                1,
+            )
+        ));
+        let mut wrong_nonce = spec.execution_nonce.clone();
+        wrong_nonce[0] ^= 1;
+        assert!(!release_matches(
+            &established,
+            native_release(
+                spec.binding,
+                wrong_nonce,
+                release_token.to_vec(),
+                token_commitment.to_vec(),
+                1,
+            )
+        ));
+        let mut wrong_token = release_token;
+        wrong_token[0] ^= 1;
+        assert!(!release_matches(
+            &established,
+            native_release(
+                spec.binding,
+                spec.execution_nonce.clone(),
+                wrong_token.to_vec(),
+                token_commitment.to_vec(),
+                1,
+            )
+        ));
+        let mut wrong_commitment = token_commitment;
+        wrong_commitment[0] ^= 1;
+        assert!(!release_matches(
+            &established,
+            native_release(
+                spec.binding,
+                spec.execution_nonce.clone(),
+                release_token.to_vec(),
+                wrong_commitment.to_vec(),
+                1,
+            )
+        ));
+        assert!(!release_matches(
+            &established,
+            native_release(
+                spec.binding,
+                spec.execution_nonce,
+                release_token.to_vec(),
+                token_commitment.to_vec(),
+                0,
+            )
+        ));
     }
 
     #[cfg(target_os = "macos")]

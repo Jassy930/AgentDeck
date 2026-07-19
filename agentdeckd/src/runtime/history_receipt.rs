@@ -90,7 +90,6 @@ impl HistoryOnlyReceiptRegistry {
     }
 
     /// 清除一个 conversation 的 volatile receipt set。返回值表示清除前是否存在。
-    #[allow(dead_code)] // C-f projector unload/tombstone lifecycle 使用该清理入口。
     pub(crate) fn clear(
         &self,
         conversation_id: RuntimeId,

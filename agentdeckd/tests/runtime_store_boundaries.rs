@@ -442,7 +442,33 @@ fn runtime_ledger_token(
             },
         )
         .expect("read Runtime authenticated ledger fixture");
-    let mut message = Vec::with_capacity(149);
+    let native_ledger: (i64, i64, i64, i64, i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT native_projection_present_count,
+                    native_projection_tombstone_count,
+                    native_projection_retired_count,
+                    native_projection_physical_count,
+                    native_projection_charged_bytes,
+                    native_metadata_effect_fence_count,
+                    native_metadata_effect_unreleased_count,
+                    native_metadata_effect_released_count
+             FROM runtime_meta WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .expect("read Runtime native projection ledger fixture");
+    let mut message = Vec::with_capacity(384);
     message.extend_from_slice(&database_id);
     match catalog_high_water {
         None => message.push(0),
@@ -508,12 +534,28 @@ fn runtime_ledger_token(
     ] {
         message.extend_from_slice(
             &u64::try_from(value)
-                .expect("fixture v5 ledger counter is non-negative")
+                .expect("fixture ledger counter is non-negative")
+                .to_be_bytes(),
+        );
+    }
+    for value in [
+        native_ledger.0,
+        native_ledger.1,
+        native_ledger.2,
+        native_ledger.3,
+        native_ledger.4,
+        native_ledger.5,
+        native_ledger.6,
+        native_ledger.7,
+    ] {
+        message.extend_from_slice(
+            &u64::try_from(value)
+                .expect("fixture native ledger counter is non-negative")
                 .to_be_bytes(),
         );
     }
     *key_bundle
-        .blind_index(b"runtime.meta.ledger.v5", &message)
+        .blind_index(b"runtime.meta.ledger.v6", &message)
         .expect("authenticate Runtime boundary ledger")
         .as_bytes()
 }
@@ -936,11 +978,11 @@ async fn catalog_hwm_u64_max_returns_typed_exhaustion_and_inserts_no_additional_
                 [],
                 |row| row.get(0),
             )
-            .expect("read baseline v4 ledger token");
+            .expect("read baseline v6 ledger token");
         assert_eq!(
             runtime_ledger_token(&transaction, &key_bundle, database_id).as_slice(),
             stored_token,
-            "fixture v5 ledger encoder must match the store"
+            "fixture v6 ledger encoder must match the store"
         );
         assert_eq!(
             transaction

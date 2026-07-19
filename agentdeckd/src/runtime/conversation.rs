@@ -6,8 +6,10 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use agentdeck_protocol::runtime::identity::{ApprovalId, EntityId, ItemId};
@@ -31,6 +33,7 @@ use super::connection::{
     ApprovalAuthorizationGuard, AuthenticatedPrincipal, AuthorizationGuard, PrincipalAccessError,
     PrincipalAuthorizationKey,
 };
+use super::core::RuntimeOperationGuard;
 use super::execution::{
     EXECUTION_CANCEL_FENCE_BUDGET, ExecutionReleasePermit, RuntimeCancelDisposition,
     RuntimeCompletionFuture, RuntimeExecutionCompletion, RuntimeExecutionContext,
@@ -41,16 +44,20 @@ use super::model::{
     ApprovalMutationOutcome, ApprovalRecord, ApprovalState, ClaimApproval, ExpireApproval,
     RegisterApproval, RegisterApprovalOutcome, RetryApprovalDelivery,
 };
+use super::native_metadata::{
+    NativeMutationCoordinator, NativeMutationCoordinatorError, NativeMutationOutcome,
+};
 use super::recovery::RecoveryReadyPermit;
 use super::store::{
     AcceptCommand, AcceptOutcome, AcceptedTerminationReason, AuthorizeExecutionRelease,
     AuthorizedAcceptOutcome, CommandExecutionConfiguration, CommandRecord, CommandState,
     CommandTerminal, CompleteCommand, ConversationRecord, ExecutionFence, ExecutionFenceRecord,
-    MarkConversationRecoveryBlocked, RecoveryBlockedCommandBinding, RecoveryFenceBinding,
-    RuntimeCommitOperation, RuntimeId, RuntimeIdKind, RuntimeStoreError, RuntimeStoreHandle,
-    StartCommand, StartOutcome, StartedBeforeReleaseTermination, SystemRuntimeClock,
-    TerminateAcceptedCommand, TerminateAcceptedOutcome, TerminateStartedBeforeRelease,
-    TerminateStartedBeforeReleaseOutcome,
+    MarkConversationRecoveryBlocked, NativeProjectionCandidateDisposition,
+    RecoveryBlockedCommandBinding, RecoveryFenceBinding, RuntimeCommitOperation, RuntimeId,
+    RuntimeIdKind, RuntimeStoreError, RuntimeStoreHandle, StartCommand, StartOutcome,
+    StartedBeforeReleaseTermination, SystemRuntimeClock, TerminateAcceptedCommand,
+    TerminateAcceptedOutcome, TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
+    UpdateManagedConversationMetadata,
 };
 use crate::agent::{AdapterEvent, AdapterItemKey};
 
@@ -72,6 +79,14 @@ const _: () = assert!(APPROVAL_EXPIRY_TERMINAL_GRACE.as_secs() > CONTROL_CANCEL_
 const CONTROL_PRIORITY_BURST: usize = 8;
 const MAX_RUNTIME_CONVERSATION_ACTORS: usize = 1024;
 const MAX_ADAPTER_ITEM_KEYS_PER_TURN: usize = 10_000;
+
+type NativeMetadataOperation = Pin<
+    Box<
+        dyn Future<Output = Result<NativeMutationOutcome, NativeMutationCoordinatorError>>
+            + Send
+            + 'static,
+    >,
+>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PromptAcceptResult {
@@ -113,6 +128,8 @@ pub(crate) enum ConversationError {
     Execution(#[from] RuntimeExecutionError),
     #[error(transparent)]
     Principal(#[from] PrincipalAccessError),
+    #[error(transparent)]
+    NativeMetadata(#[from] NativeMutationCoordinatorError),
 }
 
 pub(crate) struct ConversationRegistry {
@@ -141,6 +158,33 @@ struct ConversationHandle {
     prompt_ingress: Arc<PromptIngress>,
     control_tx: mpsc::Sender<ControlCommand>,
     shutdown: watch::Sender<bool>,
+    projector_mutation_guard: Arc<Mutex<()>>,
+    quiescent: Arc<AtomicBool>,
+}
+
+/// 一页 Removed reconciliation 的 actor-side capability。只有在持有每会话
+/// projector/mutation guard 且 actor 已发布 quiescent 时才会签发。
+pub(crate) struct ProjectionReconciliationLease {
+    dispositions: Vec<NativeProjectionCandidateDisposition>,
+    quiescent: Vec<QuiescentActorLease>,
+}
+
+struct QuiescentActorLease {
+    conversation_id: RuntimeId,
+    guard_owner: Arc<Mutex<()>>,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl ProjectionReconciliationLease {
+    pub(crate) fn dispositions(&self) -> Vec<NativeProjectionCandidateDisposition> {
+        self.dispositions.clone()
+    }
+
+    pub(crate) fn removed_conversation_ids(&self) -> impl Iterator<Item = RuntimeId> + '_ {
+        self.quiescent
+            .iter()
+            .map(|candidate| candidate.conversation_id)
+    }
 }
 
 struct PromptIngress {
@@ -201,6 +245,10 @@ impl<T> AbortOnDropTask<T> {
         if let Some(task) = &self.task {
             task.abort();
         }
+    }
+
+    fn is_owned(&self) -> bool {
+        self.task.is_some()
     }
 
     async fn join(&mut self) -> Result<T, JoinError> {
@@ -337,10 +385,14 @@ impl ConversationRegistry {
         let (admission_tx, admission_rx) = mpsc::channel(PROMPT_MAILBOX_CAPACITY);
         let (prompt_ingress, prompt_open) = PromptIngress::new(prompt_tx);
         let (shutdown, shutdown_rx) = watch::channel(false);
+        let projector_mutation_guard = Arc::new(Mutex::new(()));
+        let quiescent = Arc::new(AtomicBool::new(recovered.is_empty()));
         let handle = ConversationHandle {
             prompt_ingress: prompt_ingress.clone(),
             control_tx,
             shutdown,
+            projector_mutation_guard,
+            quiescent: quiescent.clone(),
         };
         let prompt_worker = AbortOnDropTask::new(tokio::spawn(prompt_admission_worker(
             conversation_id,
@@ -383,6 +435,7 @@ impl ConversationRegistry {
             active: None,
             approval_deliveries: HashMap::new(),
             recovery_blocked: false,
+            quiescent,
         };
         let task = AbortOnDropTask::new(tokio::spawn(actor.run()));
         actors.insert(conversation_id, ActorRegistration { handle, task });
@@ -411,6 +464,9 @@ impl ConversationRegistry {
         payload: Vec<u8>,
     ) -> Result<PromptAcceptResult, ConversationError> {
         let handle = self.handle(conversation_id).await?;
+        // 与 projector reconciliation/native metadata mutation 共用单一会话 guard。
+        // guard 持有到 actor 已完成 durable admission + queue registration 并回复。
+        let _serialization = handle.projector_mutation_guard.clone().lock_owned().await;
         let (reply, result) = oneshot::channel();
         handle
             .prompt_ingress
@@ -426,6 +482,116 @@ impl ConversationRegistry {
         result
             .await
             .map_err(|_| ConversationError::ActorUnavailable)?
+    }
+
+    /// 按 Store 认证计划的 exact ID 顺序冻结一页 disposition。竞争中的
+    /// prompt/native mutation 持有同一 guard 时只能得到 Busy；缺 actor 也 fail-close
+    /// 为 Busy。Quiescent guard 一直持有到 Store exact convergence 与 actor 卸载。
+    pub(crate) async fn prepare_projection_reconciliation(
+        &self,
+        conversation_ids: impl IntoIterator<Item = RuntimeId>,
+    ) -> ProjectionReconciliationLease {
+        let ids: Vec<_> = conversation_ids.into_iter().collect();
+        let handles = {
+            let actors = self.actors.lock().await;
+            ids.iter()
+                .map(|conversation_id| {
+                    actors
+                        .get(conversation_id)
+                        .map(|registration| registration.handle.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut dispositions = Vec::with_capacity(ids.len());
+        let mut quiescent = Vec::with_capacity(ids.len());
+        for (conversation_id, handle) in ids.into_iter().zip(handles) {
+            let Some(handle) = handle else {
+                dispositions.push(NativeProjectionCandidateDisposition::Busy(conversation_id));
+                continue;
+            };
+            let guard_owner = handle.projector_mutation_guard.clone();
+            let Ok(guard) = guard_owner.clone().try_lock_owned() else {
+                dispositions.push(NativeProjectionCandidateDisposition::Busy(conversation_id));
+                continue;
+            };
+            if !handle.quiescent.load(Ordering::Acquire) {
+                dispositions.push(NativeProjectionCandidateDisposition::Busy(conversation_id));
+                continue;
+            }
+            dispositions.push(NativeProjectionCandidateDisposition::Quiescent(
+                conversation_id,
+            ));
+            quiescent.push(QuiescentActorLease {
+                conversation_id,
+                guard_owner,
+                _guard: guard,
+            });
+        }
+        ProjectionReconciliationLease {
+            dispositions,
+            quiescent,
+        }
+    }
+
+    /// Store 已证明该页 Applied/Replayed 后按值消费 quiescent leases，先从
+    /// registry 移除再有界 join。未提交或 Busy 路径拿不到本能力。
+    pub(crate) async fn uninstall_reconciled(
+        &self,
+        lease: ProjectionReconciliationLease,
+    ) -> Result<(), ConversationError> {
+        let ProjectionReconciliationLease {
+            dispositions: _,
+            quiescent,
+        } = lease;
+        let mut registrations = {
+            let mut actors = self.actors.lock().await;
+            // 先验证整页，再做任何 registry mutation；页中一个 identity 漂移
+            // 不能留下半页已卸载、半页仍安装的进程内状态。
+            for candidate in &quiescent {
+                match actors.get(&candidate.conversation_id) {
+                    Some(registration)
+                        if Arc::ptr_eq(
+                            &registration.handle.projector_mutation_guard,
+                            &candidate.guard_owner,
+                        ) => {}
+                    Some(_) => return Err(ConversationError::ActorUnavailable),
+                    None => continue,
+                }
+            }
+            let mut removed = Vec::with_capacity(quiescent.len());
+            for candidate in &quiescent {
+                if let Some(registration) = actors.remove(&candidate.conversation_id) {
+                    removed.push(registration);
+                }
+            }
+            removed
+        };
+
+        // guards 仍由 `quiescent` 整页持有；先让所有 actor 同时进入 shutdown，
+        // 再共用一个 deadline。500 个候选不能各自获得完整 shutdown_grace。
+        for registration in &registrations {
+            registration.handle.prompt_ingress.close();
+            registration.handle.shutdown.send_replace(true);
+        }
+        let joined = tokio::time::timeout(self.shutdown_grace, async {
+            for registration in &mut registrations {
+                if registration.task.is_owned() {
+                    let _ = registration.task.join().await;
+                }
+            }
+        })
+        .await;
+        if joined.is_err() {
+            for registration in &registrations {
+                registration.task.abort();
+            }
+            for registration in &mut registrations {
+                if registration.task.is_owned() {
+                    let _ = registration.task.join().await;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn cancel_queued(
@@ -623,7 +789,9 @@ impl ConversationRegistry {
 
         let joined = tokio::time::timeout(self.shutdown_grace, async {
             for registration in actors.values_mut() {
-                let _ = registration.task.join().await;
+                if registration.task.is_owned() {
+                    let _ = registration.task.join().await;
+                }
             }
         })
         .await;
@@ -632,24 +800,145 @@ impl ConversationRegistry {
                 registration.task.abort();
             }
             for registration in actors.values_mut() {
-                let _ = registration.task.join().await;
+                if registration.task.is_owned() {
+                    let _ = registration.task.join().await;
+                }
             }
         }
         Ok(())
     }
 
+    /// 关闭新的 adapter/start admission，并立即唤醒尚未取得 adapter permit 的
+    /// waiter。该步骤故意不 await `start_transition`：RuntimeCore 必须先让仍持有
+    /// retained operation lease、但卡在 permit 上的 native control caller 退出，
+    /// 否则先等 start fence 会与 operation quiescence 形成反向等待。
+    pub(crate) fn close_admission(&self) {
+        self.scheduling_gate.send_replace(false);
+        self.adapter_permits.close();
+    }
+
+    /// 等待所有已经取得 start lease 的 Accepted→Started COMMIT 退出。调用方必须先
+    /// `close_admission`，确保 fence 返回后不能再取得新 lease。
+    pub(crate) async fn wait_for_start_fence(&self) {
+        let start_fence = self.start_transition.write().await;
+        drop(start_fence);
+    }
+
     /// 必须在 RuntimeCore 发布 Draining 前调用；返回时所有已取得 start lease 的
     /// Accepted→Started COMMIT 已退出，之后也无法再取得新 lease。
     pub(crate) async fn begin_draining(&self) {
-        self.scheduling_gate.send_replace(false);
-        self.adapter_permits.close();
-        let start_fence = self.start_transition.write().await;
-        drop(start_fence);
+        self.close_admission();
+        self.wait_for_start_fence().await;
     }
 
     #[cfg(test)]
     pub(crate) async fn len(&self) -> usize {
         self.actors.lock().await.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn contains(&self, conversation_id: RuntimeId) -> bool {
+        self.actors.lock().await.contains_key(&conversation_id)
+    }
+
+    /// 把 native metadata 副作用按值移交给 conversation actor 的 control lane。
+    /// 在 command 成功入队前 caller cancellation 只会释放尚未产生副作用的 guards；
+    /// 入队后 actor 独占 authorization、projector serialization、全局 adapter permit
+    /// 与 retained Core operation lease，直到 vendor/readback/Store reply 全部收口。
+    pub(crate) async fn update_native_metadata(
+        &self,
+        conversation_id: RuntimeId,
+        coordinator: NativeMutationCoordinator,
+        input: UpdateManagedConversationMetadata,
+        authorization_guard: AuthorizationGuard,
+        operation_guard: RuntimeOperationGuard,
+    ) -> Result<NativeMutationOutcome, ConversationError> {
+        let operation: NativeMetadataOperation =
+            Box::pin(async move { coordinator.execute(input).await });
+        self.update_native_metadata_operation(
+            conversation_id,
+            operation,
+            authorization_guard,
+            operation_guard,
+        )
+        .await
+    }
+
+    async fn update_native_metadata_operation(
+        &self,
+        conversation_id: RuntimeId,
+        operation: NativeMetadataOperation,
+        authorization_guard: AuthorizationGuard,
+        operation_guard: RuntimeOperationGuard,
+    ) -> Result<NativeMutationOutcome, ConversationError> {
+        let handle = self.handle(conversation_id).await?;
+        let mutation_guard = handle.projector_mutation_guard.clone().lock_owned().await;
+        let adapter_permit = self
+            .adapter_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ConversationError::ActorUnavailable)?;
+        let (reply, result) = oneshot::channel();
+        handle
+            .control_tx
+            .try_send(ControlCommand::UpdateNativeMetadata {
+                operation,
+                _authorization_guard: authorization_guard,
+                _operation_guard: operation_guard,
+                _mutation_guard: mutation_guard,
+                _adapter_permit: adapter_permit,
+                reply,
+            })
+            .map_err(map_mailbox_error)?;
+        result
+            .await
+            .map_err(|_| ConversationError::ActorUnavailable)?
+            .map_err(ConversationError::NativeMetadata)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn update_native_metadata_operation_for_test<F>(
+        &self,
+        conversation_id: RuntimeId,
+        operation: F,
+        authorization_guard: AuthorizationGuard,
+        operation_guard: RuntimeOperationGuard,
+    ) -> Result<NativeMutationOutcome, ConversationError>
+    where
+        F: Future<Output = Result<NativeMutationOutcome, NativeMutationCoordinatorError>>
+            + Send
+            + 'static,
+    {
+        self.update_native_metadata_operation(
+            conversation_id,
+            Box::pin(operation),
+            authorization_guard,
+            operation_guard,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn acquire_native_mutation_guard(
+        &self,
+        conversation_id: RuntimeId,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, ConversationError> {
+        let handle = self.handle(conversation_id).await?;
+        Ok(handle.projector_mutation_guard.clone().lock_owned().await)
+    }
+
+    /// Native metadata effect 与普通 turn 共用同一全局 adapter 进程配额，
+    /// 防止跨 conversation 请求绕过 actor runner 放大 vendor process。
+    #[cfg(test)]
+    pub(crate) async fn acquire_native_adapter_permit(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, ConversationError> {
+        self.adapter_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ConversationError::ActorUnavailable)
     }
 }
 
@@ -670,6 +959,14 @@ struct PromptAdmission {
 }
 
 enum ControlCommand {
+    UpdateNativeMetadata {
+        operation: NativeMetadataOperation,
+        _authorization_guard: AuthorizationGuard,
+        _operation_guard: RuntimeOperationGuard,
+        _mutation_guard: tokio::sync::OwnedMutexGuard<()>,
+        _adapter_permit: tokio::sync::OwnedSemaphorePermit,
+        reply: oneshot::Sender<Result<NativeMutationOutcome, NativeMutationCoordinatorError>>,
+    },
     ResolveApproval {
         input: ClaimApproval,
         _authorization_guard: ApprovalAuthorizationGuard,
@@ -842,12 +1139,14 @@ struct ConversationActor {
     active: Option<ActiveCommand>,
     approval_deliveries: HashMap<RuntimeId, ApprovalRoute>,
     recovery_blocked: bool,
+    quiescent: Arc<AtomicBool>,
 }
 
 impl ConversationActor {
     async fn run(mut self) {
         let mut control_burst = 0_usize;
         loop {
+            self.publish_quiescence();
             if self.shutdown_requested && self.active.is_none() && !self.admission_open {
                 break;
             }
@@ -989,6 +1288,9 @@ impl ConversationActor {
                         Ok(PromptAcceptResult::Replayed { command })
                     }
                 };
+                // 必须在客户端收到 admission reply 并释放 serialization guard
+                // 之前发布 busy，否则 projector 可能读到陈旧 quiescent。
+                self.publish_quiescence();
                 // Store 把 guard 随 durable success 返还；actor 完成 queue registration
                 // 与 caller reply 后才允许 revoke 观察到 quiesced。
                 let _ = reply.send(reply_outcome);
@@ -1000,8 +1302,37 @@ impl ConversationActor {
         }
     }
 
+    fn publish_quiescence(&self) {
+        let quiescent = !self.shutdown_requested
+            && !self.recovery_blocked
+            && self.active.is_none()
+            && self.pending.is_empty()
+            && self.admission_rx.is_empty()
+            && self.approval_deliveries.is_empty();
+        self.quiescent.store(quiescent, Ordering::Release);
+    }
+
     async fn handle_control(&mut self, command: ControlCommand) {
         match command {
+            ControlCommand::UpdateNativeMetadata {
+                operation,
+                _authorization_guard,
+                _operation_guard,
+                _mutation_guard,
+                _adapter_permit,
+                reply,
+            } => {
+                // NativeProjected conversation 不接受 prompt/turn；在 actor control lane
+                // 内直接等待可保持 per-conversation 串行，且 caller/connection future
+                // 已不再拥有此 operation。所有 retained capabilities 覆盖到 Store
+                // terminal reply 构造并发送后才依次释放。
+                let outcome = operation.await;
+                let _ = reply.send(outcome);
+                drop(_adapter_permit);
+                drop(_mutation_guard);
+                drop(_operation_guard);
+                drop(_authorization_guard);
+            }
             ControlCommand::ResolveApproval {
                 input,
                 _authorization_guard,
@@ -8460,6 +8791,114 @@ pub(crate) mod tests {
         }
 
         store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconciled_actor_page_uses_one_deadline_then_aborts_and_joins_every_owner() {
+        // 威胁场景：一页最多 500 个 Removed actor。若逐 actor 各给完整 grace，
+        // shutdown 可被放大成 N * grace；若 timeout 后只 abort 不 join，owner
+        // future 又会游离到 registry 之外。一个先正常 join、三个永久阻塞的
+        // owner 必须共用一个 deadline；fallback 跳过已消费的 handle，再把其余
+        // 全部 abort + join 并释放 owned drop witness。
+        struct DropWitness(Arc<AtomicUsize>);
+        impl Drop for DropWitness {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let root = TestRoot::new("reconciled-page-deadline");
+        let store = root.open().await;
+        let registry = ConversationRegistry::with_limits(
+            store.clone(),
+            Arc::new(DisabledExecutionCoordinator),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xE1),
+            1,
+            8,
+            Duration::from_millis(40),
+        )
+        .expect("short reconciled-page registry");
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut lease_owners = Vec::new();
+
+        for marker in 0xE2..=0xE5 {
+            let conversation_id = runtime_id(RuntimeIdKind::Conversation, marker);
+            let (prompt_tx, _prompt_rx) = mpsc::channel(PROMPT_MAILBOX_CAPACITY);
+            let (prompt_ingress, _prompt_open) = PromptIngress::new(prompt_tx);
+            let (control_tx, _control_rx) = mpsc::channel(CONTROL_MAILBOX_CAPACITY);
+            let (shutdown, mut shutdown_rx) = watch::channel(false);
+            let guard_owner = Arc::new(Mutex::new(()));
+            let handle = ConversationHandle {
+                prompt_ingress,
+                control_tx,
+                shutdown,
+                projector_mutation_guard: guard_owner.clone(),
+                quiescent: Arc::new(AtomicBool::new(true)),
+            };
+            let dropped_owner = dropped.clone();
+            let started_owner = started.clone();
+            let blocks_after_shutdown = marker != 0xE2;
+            let task = AbortOnDropTask::new(tokio::spawn(async move {
+                let _witness = DropWitness(dropped_owner);
+                started_owner.fetch_add(1, Ordering::SeqCst);
+                if !*shutdown_rx.borrow() {
+                    let _ = shutdown_rx.changed().await;
+                }
+                if blocks_after_shutdown {
+                    std::future::pending::<()>().await;
+                }
+            }));
+            registry
+                .actors
+                .lock()
+                .await
+                .insert(conversation_id, ActorRegistration { handle, task });
+            lease_owners.push((conversation_id, guard_owner));
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while started.load(Ordering::SeqCst) != lease_owners.len() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all fake actor owners started");
+
+        let mut dispositions = Vec::new();
+        let mut quiescent = Vec::new();
+        for (conversation_id, guard_owner) in lease_owners {
+            let guard = guard_owner.clone().lock_owned().await;
+            dispositions.push(NativeProjectionCandidateDisposition::Quiescent(
+                conversation_id,
+            ));
+            quiescent.push(QuiescentActorLease {
+                conversation_id,
+                guard_owner,
+                _guard: guard,
+            });
+        }
+        let started_at = std::time::Instant::now();
+        registry
+            .uninstall_reconciled(ProjectionReconciliationLease {
+                dispositions,
+                quiescent,
+            })
+            .await
+            .expect("uninstall one reconciled actor page");
+        assert!(
+            started_at.elapsed() < Duration::from_millis(120),
+            "four owners must share one 40ms deadline rather than consume four deadlines"
+        );
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            4,
+            "timeout path aborts and joins every actor owner before returning"
+        );
+        assert_eq!(registry.len().await, 0);
+        store
+            .shutdown()
+            .await
+            .expect("shutdown reconciled-page store");
     }
 
     #[test]

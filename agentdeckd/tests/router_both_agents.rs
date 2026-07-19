@@ -127,21 +127,21 @@ async fn router_codex_read_surfaces_not_implemented_error() {
     assert_eq!(err.code, "codex-history-read-not-implemented");
 }
 
-/// CC-specific Unarchive is a NO-OP per the Task 4C design (CC's
-/// `claude rm` is soft; `--resume` always finds it back). Must return
-/// `Ack`, never an error.
+/// CC has no distinct native Unarchive operation, and the legacy history
+/// compatibility surface must not acknowledge metadata mutations outside the
+/// Runtime-owned authorization/idempotency gate.
 #[tokio::test]
-async fn router_cc_unarchive_is_noop_ack() {
+async fn router_cc_unarchive_requires_runtime_gate() {
     let r = router_with_both();
     let req = HistoryRequest::Unarchive {
         thread_id: ThreadId("anything".into()),
         agent_kind: AgentKind::ClaudeCode,
     };
-    let result = r
+    let error = r
         .handle_history_stdio_compat(req)
         .await
-        .expect("cc unarchive must Ack");
-    assert!(matches!(result, HistoryResponse::Ack));
+        .expect_err("legacy CC unarchive must enter through the Runtime metadata gate");
+    assert_eq!(error.code, "cc-history-mutation-requires-runtime-gate");
 }
 
 /// Requesting an unregistered agent kind through the router yields a
