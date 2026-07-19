@@ -700,19 +700,55 @@ readback，或 recovery permit 不属于同一 `RuntimeCore`，不得通过改�
 | `daemon.local.write_failed` / `daemon.local.writer_failed` / `daemon.local.writer_cancelled` / `daemon.local.hello_not_flushed` | 当前连接写/flush/ACK 或 cancellation 失败 | 只关闭当前连接；用原 messageId/commandId 查询 durable receipt，不假定未执行 |
 | `daemon.local.stdio_io_failed` | 显式 compatibility stdio read/write 失败 | 仅重启隔离的 compatibility 子进程；不得影响 stable singleton daemon |
 
-P3.9-A Rust 与 P3.9-B Swift shared-daemon client component 还定义以下本地 client failure families。当前
-`agentdeck` binary 默认入口仍留在 `legacy_stdio`，Swift App model/composition 也仍走旧 `DaemonClient`；
-只有直接使用 `RuntimeUnixClient` / `RuntimeEnvelopeClient`，或完成 P3.9-C3/D cutover 后才会看到这些
-code。不要据此宣称 App/CLI 已默认连接 stable UDS：
+P3.9-A Rust 与 P3.9-B Swift shared-daemon client component 定义以下本地 client failure families；
+P3.9-C3（`b4e9565`）已把**普通 GUI** 的 SessionModel/composition 切到惰性 OS-account shared UDS。
+`agentdeck` Rust binary 默认入口与 `Sources/AgentDeck/main.swift --selfcheck` 仍留在 legacy 路径，等待
+P3.9-D；不要把 GUI cutover 写成 CLI/selfcheck 或双客户端 smoke 已完成。GUI 遇到 socket/Hello/stream
+failure 时只返回 typed code 并关闭当前 fd，不 spawn daemon，也不 fallback stdio/`ProcessDaemonTransport`：
 
 | code family | 含义 | 下一步 |
 | --- | --- | --- |
 | `daemon.client.installation_home_failed` / `installation_parent_unsafe` / `installation_record_unsafe` / `installation_record_corrupt` / `installation_publish_unsupported` / `installation_io_failed` | passwd home 不可用，installation parent/record 的 type、owner、mode、nlink 不安全，record 非 canonical，或 no-replace/fsync I/O 失败 | 保留原 record 与目录；修复 OS account home/权限/文件系统，不删除或自动轮换 identity，不改用 `HOME` 覆盖 |
-| `daemon.client.socket_path_invalid` / `socket_missing` / `socket_parent_unsafe` / `socket_unsafe` / `connect_failed` / `socket_option_failed` | canonical UDS 路径非法或不存在，parent/socket 的 type、owner、mode、nlink 不满足，connect 或 socket option 失败 | 核对 stable daemon/LaunchAgent 与 canonical path；P3.9-A/B component 不会 fallback spawn，P3.9-C3/D 前 App/binary 入口状态需单独确认 |
+| `daemon.client.socket_path_invalid` / `socket_missing` / `socket_parent_unsafe` / `socket_unsafe` / `connect_failed` / `socket_option_failed` | canonical UDS 路径非法或不存在，parent/socket 的 type、owner、mode、nlink 不满足，connect 或 socket option 失败 | 普通 GUI 已在 P3.9-C3 直接暴露该失败且零 fallback；核对 stable daemon/LaunchAgent、current-EUID installation 与 canonical path。Rust CLI/main.swift selfcheck 仍等待 D，不能用其 legacy 成功覆盖 GUI socket failure |
 | `daemon.client.preface_failed` / `encode_failed` / `hello_invalid` / `hello_order_invalid` / `sequence_required` / `message_id_duplicate` / `server_request_forbidden` / `reply_uncorrelated` | preface/Hello/首帧/messageId/reply sequence 编码或协议被破坏 | 关闭当前 fd，升级为同一 Runtime v2 candidate；若 daemon 返回 `daemon.runtime.protocol_mismatch`，client 会保留该精确 code，不包成通用错误 |
 | `daemon.client.connection_closed` / `read_failed` / `frame_invalid` / `frame_unterminated` / `frame_too_large` / `write_failed` / `write_timeout` / `write_handoff_incomplete` / `close_failed` | EOF、JSONL/1 MiB framing、read/write/flush/cancellation 或 close 失败 | 未见 terminal 的 sender close 必须按 failure 处理；用原 messageId/commandId 查询 durable receipt，不能把 EOF 当正常完成 |
 | `daemon.client.reply_backpressure` / `reply_sequence_backpressure` / `reply_timeout` / `reply_drain_expired` / `stream_backpressure` | pending/reply/stream 的 frame、retained-byte budget、deadline 或 TTL 到界；Swift 普通 event/catalogDelta 与 transfer complete 都计入 stream byte budget | 关闭当前连接并有界重连；先消费或取消旧 sequence，不扩大 channel 或并发生成新 messageId。若普通 stream 长期触发，检查 consumer 是否单一且持续 drain，不要把非 transfer frame 按常量字节计费 |
 | `daemon.client.transfer_backpressure` / `transfer_binding_mismatch` / `transfer_expired` / `transfer_incomplete` / `transfer_invalid` / `transfer_tombstone_desync` | transfer part 数量、byte/hash/binding/TTL/completed tombstone 不一致 | 丢弃当前重组状态并关闭连接；从 daemon cursor 重新同步，不接受 partial payload 或复用 transferId |
+
+### P3.9-C3 GUI canonical projection 诊断
+
+C3 focused `46/46`、完整 Swift `435 XCTest + 35 Swift Testing`、普通与 warnings-as-errors build、iOS
+Simulator `20/20`、production source purge/format/diff 均通过，两路终审无 P0/P1/P2。排查 GUI 时以以下
+canonical 行为为准：
+
+- Subscribe 可合法返回 `Snapshot → Backfill* → SyncComplete`；projection 只在 terminal 完整验证后原子
+  提交。`Backfill → Snapshot`、重复 Snapshot、target/generation/cursor gap 必须 fail-close 当前 client，
+  不能部分展示或改 cursor；
+- SendPrompt 的 `Replayed` 不是 terminal 证明。只有 App 已归约的同 conversation、exact command terminal
+  identity 匹配时才把 outcome-unknown 队首恢复为 `ready`；`Accepted`、不同 command 或 active turn 继续
+  等 canonical event。若未来 D 引入 snapshot-only reconnect，应以 owner-scoped `QueryReceipt` 的精确
+  CommandStatus 补证，不能仅凭 replay 标签；
+- `--preview` 使用独立 synthetic stream，按同 command/turn 和连续 sequence 发出 started/user/assistant/
+  completed；普通 GUI composition 不引用 Preview wire。Preview PASS 不能证明 UDS、daemon 或 vendor login；
+- `SyncComplete` 之后 live event 可先到达。`completeConversationStart` 接受 runtime cursor 等于或晚于
+  terminal；若落后则 `draftConversationNotSynchronized`，不得倒退或覆盖已经归约的 running/terminal phase。
+
+GUI 的 `daemon.client.socket_missing` 或 `connect_failed` 应直接提示 shared daemon/LaunchAgent 状态；现场
+若出现新的 `agentdeckd` child、legacy stdio 成功遮蔽该错误，属于 composition 回归而不是恢复策略。
+
+### P3.9-D 诊断与组合 smoke 边界（尚未完成）
+
+D 的 canonical CLI 只接受/输出 `conversationId`；旧 `threadId/sessionId` 及无法无损映射的 agent/cwd/vendor
+参数必须 typed reject。Rust CLI 默认 dispatcher 与 `main.swift --selfcheck` 都要改走 stable UDS；显式
+diagnostics one-shot 可保留 spawn，但 UDS 任一失败后不得调用它作为 fallback。
+
+`QueryReceipt` 绑定 installation owner。Rust installation 只能查询 Rust 自己的 command/idempotency receipt，
+Swift installation 只能查询 Swift 自己的 receipt；cross-owner 拒绝是 PASS 条件。组合 smoke 应以一个真实
+`agentdeckd --ephemeral --no-remote`、private TMPDIR 中验证过的唯一 `ad-*/s`，证明两个客户端各自稳定
+installation、各自 receipt、共同 catalog/conversation/event/command queue、daemon PID 不变、任一客户端
+close-only 且零 fallback。真实 vendor login 缺失时保持 gated；共享 binary/receipt 证据可与现有
+listener/actor 的 active-turn sibling-close 自动测试组合，但不得新增 debug-only synthetic coordinator，
+也不得把组合证据写成真实 vendor E2E。P3.9-D 当前未完成。
 
 P3.7 exec-gate 的以下 code 是内部 typed 分类码。`--exec-gate` one-shot 自身失败时会把 code 写到
 stderr，私有 ADGX abort frame 也可携带 code；但当前 parent/runtime 不保证把每个子码写入

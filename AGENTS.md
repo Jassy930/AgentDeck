@@ -10,7 +10,7 @@
 4. `docs/index.md`：文档记录系统导航。
 5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code（含 CC adapter failure codes）。
 6. `docs/QUALITY.md`：验证命令、质量门禁和文档结构检查（含 v0.2 手动 QA 清单）。
-7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以 `docs/plans/2026-07-10-relay-companion-mvp-design.md`、`docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 和上位增量 `docs/plans/2026-07-18-relay-companion-mvp-course-correction.md` 为事实源。Relay 主线恢复 Task 粒度门禁；P3.9-C0-B3a/B3b/B4/B5/C0-C 与 P3.9-A/B 已分别完成 Task 门禁和独立 `spec/security`、`quality` 终审，下一项为 P3.9-C3 App model cutover。同 UID 在线攻击作为 residual risk 不再扩展；P3.1 provisioned signed Keychain 按方案 b 保留 post-MVP ignored/BLOCKED，但不阻塞主线。P4 功能全保留；P5/P6 的物理设备、公网与干净 Linux 证据为 post-MVP BLOCKED 槽位，不得冒充 PASS。
+7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以 `docs/plans/2026-07-10-relay-companion-mvp-design.md`、`docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 和上位增量 `docs/plans/2026-07-18-relay-companion-mvp-course-correction.md` 为事实源。Relay 主线恢复 Task 粒度门禁；P3.9-C0-B3a/B3b/B4/B5/C0-C、P3.9-A/B 与 P3.9-C3 已完成 Task 门禁和独立 `spec/security`、`quality` 终审。C3 由 `b4e9565` 收口，完整 Swift `435 XCTest + 35 Swift Testing`、iOS Simulator `20/20`、warnings-as-errors build 均通过，两路终审无 P0/P1/P2；普通 GUI 已默认使用 OS-account shared-daemon UDS 且无 spawn/fallback。下一项 P3.9-D 仍须切换 Rust CLI 与 Swift `main.swift --selfcheck`，按 canonical Runtime v2 身份/命令输出，保持 owner-scoped receipt，并完成真实 daemon active-turn 双客户端组合 smoke，不得把 C3 写成全部默认入口已切换。同 UID 在线攻击作为 residual risk 不再扩展；P3.1 provisioned signed Keychain 按方案 b 保留 post-MVP ignored/BLOCKED，但不阻塞主线。P4 功能全保留；P5/P6 的物理设备、公网与干净 Linux 证据为 post-MVP BLOCKED 槽位，不得冒充 PASS。
 8. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
 
 ## 项目边界
@@ -168,8 +168,8 @@ P3.2 必须保持 caller-owned stable conversation/adapter IDs、全部事务精
 fence/release、32/1,024/256MiB、2GiB admission、safety tail/bounded checkpoint、真实 COMMIT
 unknown、认证 metadata/ledger、三业务 lane count/byte bound、paged recovery（单页一个
 conversation、80MiB、exact cursor/finish、恢复期 mutation fence）和 shutdown
-优先级。P3.4 RuntimeCore 已接入该组件，但 compatibility RuntimeHub/App/CLI 尚未迁到 singleton
-UDS；不得把 store/Core 测试表述为 UDS、
+优先级。P3.4 RuntimeCore 已接入该组件；普通 GUI 后续已由 P3.9-C3 迁到 singleton UDS，但 compatibility
+RuntimeHub、Rust CLI 与 Swift `main.swift --selfcheck` 仍待 P3.9-D；不得把 store/Core 测试表述为 UDS、
 远程或 Companion E2E。标准 SQLite 无 custom quota VFS，不能声称 active WAL 瞬时零超冲。
 
 ### Relay Companion MVP P3.3（typed catalog + adapter 私域门禁）
@@ -264,8 +264,8 @@ per-connection gate 到 flush ACK/cancel；同 target 被新 generation 取代�
 P3.6 不执行真实 E2EE seal、MachineDataSign、Keychain CounterGuard 或 Relay Publish，
 transfer/publication 也尚无 production remote owner；Simulator fixture 不是远程链路。P3.7 exec gate
 已完成 fresh 完整门禁、独立终审、`5568e93` 主体提交与 `c9d2146` / `5713be4` 取消边界补充；
-P3.8-A 只接入 accepted-stream primitives，P3.8-B secure bind/permit、P3.9 App/CLI cutover、
-P3.10 LaunchAgent 与 P4 remote 仍是后续任务。
+P3.8-A 只接入 accepted-stream primitives；P3.8-B secure bind/permit 与 P3.9-C3 普通 GUI cutover 已完成，
+P3.9-D Rust CLI / Swift `--selfcheck`、P3.10 LaunchAgent 与 P4 remote 仍是后续任务。
 
 ### Relay Companion MVP P3.7（exec-gate + typed production execution）
 

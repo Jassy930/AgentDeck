@@ -2354,18 +2354,69 @@ P3.9 固定以下迁移边界：
   docs/diff 均通过；spec/security 与 quality 双路终审 Approved，无剩余 P0/P1/P2/P3。字面
   `swift build -Xswiftc -warnings-as-errors` 仍被未修改的
   `Sources/AgentDeck/Preview/MockDaemonTransport.swift:93` 既有 Sendable warning 阻断，未计 PASS，也未在
-  B 中扩 scope 修 Preview；该 baseline 必须在 P3 Phase exit 前收口。B 仍只完成 component，production
-  App model/composition 与默认入口/双客户端 smoke 分别属于 P3.9-C3/D。下一 Task 为 P3.9-C3。
-- [ ] **P3.9-C3 App model cutover：** 迁移 `SessionModel`/`WorkbenchModel`/`ThreadRuntimeModel` 到
+  B 中扩 scope 修 Preview；该 baseline 后续已由 C3 的不可变 handler snapshot 收口并通过
+  warnings-as-errors build。B 自身仍只完成 component；production App model/composition 与默认入口/双客户端
+  smoke 分别属于 P3.9-C3/D。该 Task 当时的下一项为 P3.9-C3；C3 当前已完成，下一项为 D。
+- [x] **P3.9-C3 App model cutover：** 迁移 `SessionModel`/`WorkbenchModel`/`ThreadRuntimeModel` 到
   conversationId/eventId/itemId/entityId/commandId；删除 synthetic agentItem 序号和 legacy identity adoption，
   prompt/approval/vendor control/history 都走 `RuntimeEnvelopeClient` receipt/stream。preview/mock 可显式保留
   compatibility fixture，production App 不得构造 `ProcessDaemonTransport`。完整 Swift tests 后独立提交。
+
+  **Task 收口（2026-07-19）：** `a1aeb26` / `86327e2` / `48cd1b2` 分别建立 Runtime catalog projection、
+  conversation projection 与 App coordinator，`b4e9565` 完成 production GUI model/composition cutover 及
+  reliability closeout。`SessionModel`/`WorkbenchModel`/`ThreadRuntimeModel` 只持 canonical Runtime v2
+  identity；新会话在 daemon conversation ID 到达前不创建 provisional runtime，snapshot/backfill/live 共用
+  reducer 并在完整 `SyncComplete` 前零发布；prompt 以稳定 idempotency key 先入 model queue、receipt 成功才
+  出队，approval 保留 conversation/turn/command/approval/request 完整绑定且不乐观删除。默认 GUI 惰性使用
+  OS-account shared-daemon UDS，构造 view/model 不读写 installation、不 spawn 且无 legacy fallback；preview
+  只通过显式 fixture wire。
+
+  最终门禁为 `435 XCTest + 35 Swift Testing`、iOS Simulator `20/20`、普通 Swift build、
+  `swift build -Xswiftc -warnings-as-errors`、changed-file strict format、`git diff --check` 与 production
+  legacy identity/source purge 全绿；spec/security 与 quality 两路独立终审均无 P0/P1/P2。终审发现并关闭
+  四项竞态/可靠性 finding：只允许 `Snapshot → Backfill*`/纯 `Backfill*` 且继续拒绝逆序或重复 Snapshot；
+  terminal command exact binding 的 replayed receipt 恢复 ready 并继续排队、真实 accepted 仍等待 active-turn
+  event；Preview 只在显式 fixture 发出完整 synthetic turn；`completeConversationStart` 接受 SyncComplete 后
+  exact-next live event 导致的 at-or-after cursor，但拒绝任何落后 cursor。此前 start/close lifecycle 复核、
+  teardown 停用 inbound bridge 与晚到异步结果零回写也保持覆盖。下一 Task 为 P3.9-D；本 Task 不包含 Rust
+  CLI binary、Swift `--selfcheck` 或真实双客户端 smoke。
 - [ ] **P3.9-D 默认入口与真实 smoke：** 把 Rust CLI binary 与 App composition 的默认入口分别切到 A/B
   提供的 shared-daemon client；Rust CLI与Swift client连接同一 private-TMPDIR daemon，看到
   同一 conversation/queue/receipt；关闭任一客户端后 daemon PID/active turn 不变。脚本只以
   `agentdeckd --ephemeral --no-remote` 启动并发现/验证恰好一个 `TMPDIR/ad-*/s`，不向 daemon 注入 path；
   两个真实 client 进程重启读回各自稳定 installation ID。再验证 stable endpoint 缺失时 typed fail、无
   fallback spawn。运行完整 cargo/swift/selfcheck/network/schema/docs/diff gates并独立提交。
+
+  **实现前冻结的 canonical CLI 表：** 旧 stdio `SessionStart/SessionContinue` 形状不得经改名继续进入
+  Runtime；所有有副作用路径都使用当前 Runtime v2 request、stable idempotency key 与 typed receipt。
+
+  | CLI 面 | canonical Runtime 行为 |
+  |---|---|
+  | `ping` | 只执行 UDS preface + `Hello` 并验证 exact reply；不 spawn、不转 diagnostics |
+  | `selfcheck` | `Hello → DescribeAgents`；任一步失败 typed exit，绝不 fallback one-shot/stdio |
+  | `agent` | 只调用 `DescribeAgents` 并输出 canonical agent description/default configuration |
+  | `session run` | `Start → Configure(rev0) → Subscribe → SendPrompt`；空 prompt 省略最后一步，所有回执逐步绑定同一 canonical conversation |
+  | `continue` | 只接受 `conversationId` 与 prompt；拒绝 thread/session/vendor resume identity，不做 identity adoption |
+  | `history` | list 走 `Catalog`，read/open 走 conversation `Subscribe` 的 `Snapshot/Backfill/SyncComplete`；不调用 legacy history IPC |
+  | `metadata` | rename/archive 必须携 `expectedEntryRevision + stable idempotency key`，只接受同 conversation typed receipt |
+  | `protocol` / `remote` | schema/Relay 命令保持各自既有边界，不连接 Runtime UDS，也不触发 daemon bootstrap |
+  | diagnostics one-shot | 只在用户显式请求 diagnostics 时执行现有隔离 one-shot；普通 UDS connect/selfcheck 失败绝不转入该路径 |
+
+  旧 `persistApproval`、`worktree`、`sessionName` 以及无法无损映射的 SessionStart/Continue 参数在构造任何
+  Runtime request 前 typed reject；不得静默丢弃、降级为默认配置或藏入 vendor/private identity 字段。
+
+  **Owner-scoped receipt 验收：** Rust CLI 与 Swift App 使用各自稳定 installation ID/principal，daemon
+  `QueryReceipt` 继续按 owner 授权；因此 Swift 不直接查询 Rust receipt，Rust 也不查询 Swift receipt。
+  smoke 必须分别验证双方各自 request 的 receipt/idempotent replay，再通过共同 canonical
+  conversation/event/command/queue 读回证明两端共享同一 RuntimeCore。不得为跨 owner 断言放宽授权、增加
+  debug-only Core API 或把 connection ID 纳入稳定 owner。
+
+  **真实 daemon + active turn 组合证据：** private-TMPDIR harness 使用真实 `agentdeckd` binary、真实 Rust
+  CLI 进程与真实 Swift client 进程证明唯一 UDS/PID、双方稳定 installation、共同 conversation/queue、任一
+  client 关闭后 daemon PID 不变及 endpoint 缺失时无 fallback；active turn 不因 sibling client 关闭则由
+  既有 listener/RuntimeCore 自动测试提供同一不变量的确定性证据。两部分合并构成 D 的自动验收，不要求
+  Swift 查询 Rust receipt，不新增 synthetic execution coordinator，也不放宽 Core。真实 vendor login 缺失时
+  继续按既定 gated/BLOCKED 记录，不能把组合证据冒充 live Codex/CC。
 - [ ] **P3.9-E 收口：** 独立 spec/security/quality review，修完 P0/P1/P2；同步 README、
   ARCHITECTURE、QUALITY、DIAGNOSTICS、AGENTS、本计划与 progress。依赖真实 Codex/CC login 的 initial
   config/control smoke 单独 gate；缺登录时保留 post-MVP BLOCKED，不影响 transport synthetic 事实或 P3

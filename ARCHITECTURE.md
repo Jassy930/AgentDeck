@@ -27,7 +27,7 @@ AgentDeck 不做 IDE，不做通用多 agent 聊天界面，不是 Codex Desktop
 └──────────────────────────┬──────────────────────────────────────┘
                            │ Layer A 中立事件主干（AgentItem）
                            │ Layer B Vendor 控件命名空间
-                           │ Layer C 旧 SessionStart 模型（production stdio 拒绝）
+                           │ RuntimeEnvelope v2（OS-account canonical UDS）
                            ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  agentdeckd (Rust daemon)                                       │
@@ -450,12 +450,33 @@ conversation/key，不能伪造身份连续性。
   transfer pump 均有 count/byte/TTL 上界；Swift 普通 event/catalog stream 同样按实收 frame bytes 计入
   retained-byte budget，不能只靠 frame count；关闭任一 client 只关闭自身 fd。App installation record 固定在
   `clients/macos-app/installation-id.v1`，使用与 CLI 对称的 passwd-home/no-follow/no-replace 边界。
-- P3.9-D 默认入口 cutover 完成前，Rust binary main 与 Swift app 的 stdio transport 仍是显式隔离的兼容路径：
-  固定传 `--stdio-compat --ephemeral --no-remote --profile dev` 并清除旧 namespace env。Rust binary 已把相关
-  类型显式命名为 `Legacy*Stdio*`，shared-daemon component 本身不 spawn/fallback，但 binary main 尚未调用它；
-  Swift client component 已完成，App model/composition 仍待 P3.9-C3/D 接线。当前仍不提供两个真实客户端
-  共享 singleton RuntimeCore，production main 明确
-  拒绝旧 `SessionStart/SessionContinue`，真实本地会话必须等待 P3.9-D 原子切换与 smoke。
+- P3.9-C3 已由 `b4e9565` 把普通非 preview GUI 的 `SessionModel` / App composition 切到
+  `OSAccountRuntimeWireSession`：构造 UI 没有文件系统或进程副作用，第一次使用才通过
+  `LocalRuntimeWireSession.forOSAccount()` 读取 App installation、派生 canonical singleton UDS 并连接；路径中
+  没有 daemon spawn、stdio 或 fallback。Runtime reducer 按 snapshot→backfill 顺序原子发布同步状态，replayed
+  receipt 只有匹配 exact canonical terminal 才能恢复 ready，preview 使用独立 Runtime stream，并在
+  SyncComplete terminal 与 live stream cursor 之间建立无缝交接。C3 的完整 Swift
+  `435 XCTest + 35 Swift Testing`、iOS Simulator `20/20`、warnings-as-errors build 均通过，两路独立终审无
+  P0/P1/P2。
+- P3.9-D 完成前，Rust binary main 与 Swift `main.swift --selfcheck` 仍是显式隔离的 legacy stdio compatibility：
+  固定传 `--stdio-compat --ephemeral --no-remote --profile dev` 并清除旧 namespace env。Rust 类型已显式命名为
+  `Legacy*Stdio*`，Swift 普通 GUI 已不走该路径，但 `--selfcheck` 仍使用旧 `DaemonClient`。P3.9-D 必须原子切换
+  这两个入口；普通 GUI 的 C3 PASS 不能写成全部默认入口完成。
+- P3.9-D canonical CLI 不得重建 legacy identity：`ping` 映射 `Hello`，`selfcheck` 映射
+  `Hello → DescribeAgents`，agent list/capabilities 映射 `DescribeAgents`；session run 固定为
+  `DescribeAgents → Start → Configure(rev0) → Subscribe → SendPrompt(rev1)`，continue 只以 canonical
+  `conversationId` 执行 `Subscribe/SendPrompt`；history list 分页读取 `Catalog`，history read 固定为
+  `Subscribe(BeforeFirst) → Snapshot/SyncComplete → Unsubscribe`；metadata mutation 使用 expected entry
+  revision + stable idempotency key。机器输出只暴露 canonical conversation/command/turn/event/item/entity ID；
+  `protocol` / `remote` 不连接 Runtime，diagnostics one-shot 不得作为 UDS 失败 fallback；无 v2 映射的
+  `persistApproval`、CC `worktree/sessionName` 必须删除或 typed reject。
+- P3.9-D receipt/smoke 验收保持 Core 的 owner 边界：Swift 与 Rust installation 必须在同一 conversation FIFO
+  分别提交 prompt、只查询自己的 queue receipt，跨 owner 查询必须拒绝；两端重启后复用各自 installation ID
+  并读回各自 receipt，不得让 Swift 代查 Rust receipt。组合 smoke 只启动真实
+  `agentdeckd --ephemeral --no-remote`，从 private `TMPDIR` 发现并校验唯一 `ad-*/s`，不得向 daemon 注入
+  socket path；确定性 hold-open fake Codex 必须让首 command 保持同一 `turnId` 的 Started、第二 command 留在
+  同 conversation FIFO。关闭任一真实客户端后 daemon PID 必须不变且仍存活，Started 与另一 owner 的 queued
+  receipt 不变；两个客户端重启后再验证稳定 installation ID 与各自 receipt。
 - 已有 ignored、唯一 service/account、RAII 清理的真实 Keychain roundtrip，但 P3.1 的签名
   门禁尚未通过：当前机器无匹配 provisioning profile；Apple Development 与本地
   self-signed helper 虽通过 `codesign --verify`，均被 AMFI 以 exit 137 拒绝启动。因此本节
@@ -654,10 +675,10 @@ conversation/key，不能伪造身份连续性。
   catalog/vendor-panel/event/snapshot/backfill mirror；A2c1 又由 `c2d2c28` 建立 outer 与 JSON/UDS
   94-part transfer model，并对 97 条 JSON fixture 做 typed readback；`e419d84` 完成 current facade、
   `ADRT1` version 2 compact codec 与 98-fixture 全量，并让同一 0600/128-byte 真实 UDS Hello 样本经
-  Swift current codec 非跳过读回后删除。A2 的共享 mirror/current API 不等于 App/UDS client cutover；
-  P3.8 已完成 accepted-stream actor 与 recovery 后
-  production secure bind/bootstrap；App/CLI 默认连接仍待 P3.9，因此本节仍不是 shared local client
-  或远程端到端可用声明。
+  Swift current codec 非跳过读回后删除。A2 的共享 mirror/current API 当时不等于 App/UDS client cutover；
+  P3.8 已完成 accepted-stream actor 与 recovery 后 production secure bind/bootstrap，普通 GUI 后续由
+  P3.9-C3 切到 shared-daemon UDS。Rust CLI 与 Swift `main.swift --selfcheck` 仍待 P3.9-D，因此本节仍不是
+  双客户端组合 smoke 或远程端到端可用声明。
 
 ### Relay Companion MVP P3.4 RuntimeCore 不变量
 
@@ -672,7 +693,8 @@ conversation/key，不能伪造身份连续性。
   对 owner+start key 生成稳定
   conversation/adapter IDs；Store 直接返回 Created/Replayed，禁止进程内猜 replay。首 prompt
   必须另发。SendPrompt 去重域是 `(conversationId, owner, key)`；QueryReceipt 的 command 与
-  idempotency selector 都绑定 conversation，并再次校验 owner。
+  idempotency selector 都绑定 conversation，并再次校验 owner。客户端只能查询自身 owner 的 receipt；
+  跨 installation/owner 查询必须 typed reject，不能为 smoke 放宽 Core。
 - 每 conversation 一个 admission worker + actor。SQLite `commandSeq` 是 prompt FIFO 的唯一
   顺序；一个 active turn；control 最多连续优先 8 个后进入公平点；ReadPool 使用 try-acquire，
   满载立即返回 overload。恢复页在 store finish 前只安装不调度；P4 前遇到 remote Accepted 会全局
@@ -850,7 +872,8 @@ conversation/key，不能伪造身份连续性。
   seal、MachineDataSign、Keychain CounterGuard 或 Relay Publish；这些仍属于 P4，不能从本节推出
   远程 Companion 已接通。
 - P3.6 仍是 transport-neutral component layer。`TransferStateMachine` 与 publication dispatcher
-  尚无 production remote owner；App/CLI 尚未通过 P3.9 shared-daemon client 连接该 Core，P3.1
+  尚无 production remote owner；普通 GUI 已经通过 P3.9-C3 shared-daemon client 连接该 Core，Rust CLI 与
+  Swift `main.swift --selfcheck` 仍待 P3.9-D，P3.1
   provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate；
   Simulator fixture、fake publication 与本地 store tests 都不是 P4/P5/P6 证据。
 - Store worker 初始化/migration 的 ready error 必须在 path lease 已释放后才对 caller 可见；同进程
@@ -950,7 +973,8 @@ Swift UI
   -> CapabilityRouter（按 SessionCapabilities 派发）
   -> WorkbenchModel / ThreadRuntimeModel / SessionModel / HistoryModel
   -> AgentDeck IPC models（来自 agentdeck-protocol v2）
-  -> daemon stdio compatibility（admin/read；SessionStart/Continue 被拒绝）
+  -> AppRuntimeCoordinator / RuntimeEnvelope v2
+  -> OSAccountRuntimeWireSession（canonical singleton UDS；无 spawn/fallback）
 
 daemon main
   -> config → namespace / singleton → KeyStore / StorageKEK
@@ -959,7 +983,7 @@ daemon main
   -> RuntimeCore → StoreCommitHub / subscription / snapshot
   -> C0-C native projector → verified CC JSONL / atomic projection / dynamic snapshot
   -> C0-C native metadata coordinator → authenticated fence substrate（live vendor post-MVP gated）
-  -> P3.7 exec-gate / typed driver（RuntimeEnvelope client components 已接通，App/CLI cutover 待 P3.9-C3/D）
+  -> P3.7 exec-gate / typed driver（普通 GUI 已由 P3.9-C3 接通；CLI/selfcheck cutover 待 P3.9-D）
   -> transport-neutral P3.6 component → transfer / publication（production owner 待 P4）
   -> AgentRouter → CodexAdapter / ClaudeCodeAdapter
   -> record / diag
@@ -967,8 +991,8 @@ daemon main
 
 agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
   -> agentdeck-protocol（共享类型）
-  -> Transport trait（显式 stdio-compat + ephemeral/no-remote，仅 admin/read）
-  -> isolated daemon child process；默认 singleton UDS client 与真实会话入口待 P3.9
+  -> Legacy stdio Transport（显式 stdio-compat + ephemeral/no-remote，仅 admin/read）
+  -> isolated daemon child process；canonical singleton UDS 与真实会话入口待 P3.9-D
 ```
 
 允许的跨层访问应沿上图向下：
