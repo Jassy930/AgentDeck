@@ -218,7 +218,7 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（C0-C complete，P3.9-A next）
+## Relay Companion MVP 实施状态（C0-C / P3.9-A complete，P3.9-B next）
 
 2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 只承诺缺 KEK 且无法通过当前
 KEK/database/domain 认证的离线篡改 fail-close，同 UID 在线攻击作为 residual risk 不再扩展。P3.1
@@ -490,7 +490,8 @@ source、原子 import/reconcile/retire、Core projector lifecycle、dynamic sna
 projector 遇到 Store hard cap 会保留 candidate pending、零 ACK，并以 typed diagnostic 进入固定 30 秒
 refresh；source unavailable、坏或不完整 generation、read failure 同样避免热循环。真实当前账号 JSONL
 只读 list→import→Catalog→Snapshot smoke 已 PASS；Swift `298 XCTest + 35 Swift Testing` 与 iOS Simulator
-`20/20` 已 PASS。下一 Task 为 P3.9-A；P4 CounterGuard/RemoteLink 与真实 vendor metadata mutation仍未完成。
+`20/20` 已 PASS。P3.9-A Rust shared-daemon client component 已由 `c29faa4` 完成并通过 Task 门禁与双路
+终审；下一 Task 为 P3.9-B。P4 CounterGuard/RemoteLink 与真实 vendor metadata mutation仍未完成。
 
 进入 Core 的 principal 是字段私有的认证 capability；同一完整身份共享强 authorization lease，
 Accepted→Started 前会重新取得 guard，revoke 与 start 由该 guard + SQLite transition 线性化。
@@ -662,19 +663,20 @@ C0-B1a/B1b schema freeze 与真实 migration 已由 `e48248a` / `3d0002d` 收口
 B3a admission pin 已完成，后者由 `48594e8` / `09a14b0` 提交并通过 Task 门禁与双路终审；B3b exact
 execution 已由 `c0ed6cd` / `f4141f0` / `fb1629a` 完成，B4 managed metadata 已由
 `5f1ca1c` / `347a0f0` 完成，B5 cross-layer closeout 已由 `aebc8d0` 完成。C0-C 自动实现与跨语言/
-Simulator 门禁已通过，C0-C Task 已完成；下一项为 P3.9-A Rust shared-daemon client。App/CLI 默认 UDS
-cutover、P3.10 LaunchAgent 与 P4–P6 仍未完成。P3.1 provisioned signed Keychain
+Simulator 门禁已通过，C0-C 与 P3.9-A Task 已完成；下一项为 P3.9-B Swift client。App/CLI 默认 UDS
+入口切换、P3.10 LaunchAgent 与 P4–P6 仍未完成。P3.1 provisioned signed Keychain
 roundtrip 继续是 post-MVP BLOCKED 槽位，不阻塞 MVP/P3 exit；P5/P6 物理设备/公网/Linux 证据也是
 post-MVP，不冒充 PASS。
 具体命令与资源矩阵见 [docs/QUALITY.md](docs/QUALITY.md)。
 
 ## agentdeck CLI（参考客户端 / E2E 驱动）
 
-`agentdeck` 是一个 Rust 二进制参考客户端，**不在 Swift GUI 的实时通路上**。在 P3.9 shared-daemon
-client cutover 完成前，Swift app 与 CLI
-仍由过渡 `ProcessDaemonTransport` 显式启动 stdio compatibility daemon；该入口拒绝全部
-execution/control 命令，不能执行真实会话。`agentdeck` 现阶段用于 admin/read 脚本、本地验证和门控
-E2E 驱动；默认连接 stable singleton UDS 与真实本地会话属于 P3.9 后续 client cutover。
+`agentdeck` 是一个 Rust 二进制参考客户端，**不在 Swift GUI 的实时通路上**。P3.9-A 已提供 production
+`RuntimeUnixClient` component：stable constructor 从 OS account home 读回 CLI installation identity，连接
+canonical singleton UDS，且没有 spawn/fallback；reply/stream/transfer 都是有界 typed pump。当前 binary
+main 仍显式选择 `LegacyStdioProcessTransport`，Swift app 也尚未完成 P3.9-B client；因此 production 默认
+入口仍不能执行真实 shared-daemon 会话。Rust/Swift binary composition 的原子切换与双客户端 smoke 属
+P3.9-D，不能把 component PASS 写成默认 cutover。
 
 ### 全局标志
 

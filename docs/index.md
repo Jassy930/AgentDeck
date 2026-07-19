@@ -54,7 +54,8 @@
   P3.2–P3.8、P3.9-C0-A0/A1/A2 已完成；C0-B3a/B3b/B4/B5 已分别完成并通过
   Task 完整门禁与双路终审；C0-C native history projection 已完成并通过 Task 完整门禁与双路终审，真实当前
   账号 JSONL smoke、Swift 与 iOS Simulator 门禁已通过，production native metadata 仍在 claim 前 post-MVP
-  typed gated。下一项为 P3.9-A Rust shared-daemon client。P3.1 production code 已完成，provisioned signed
+  typed gated。P3.9-A Rust shared-daemon client component 已完成并通过 Task 门禁与双路终审，下一项为
+  P3.9-B Swift client；Rust CLI binary 默认入口切换仍属 P3.9-D。P3.1 production code 已完成，provisioned signed
   Keychain roundtrip 保留 1 项 ignored/BLOCKED 且不阻塞主线；P3.9 后续、P3.10、P4–P6 尚未完成。
 
 ## 协议资料

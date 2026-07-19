@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P3.9-C0-C native history projection 已完成并通过 Task 全量门禁与双路终审，下一项为 P3.9-A Rust shared-daemon client；production native metadata 与 P3.1 签名 Keychain 均为 post-MVP gated/BLOCKED 且不阻塞自动主线（2026-07-19） |
+| 状态 | Approved target；P3.9-C0-C 与 P3.9-A Rust shared-daemon client component 已完成并通过各自 Task 门禁与双路终审，下一项为 P3.9-B Swift client；Rust CLI binary 默认入口切换仍属 P3.9-D，production native metadata 与 P3.1 签名 Keychain 均为 post-MVP gated/BLOCKED 且不阻塞自动主线（2026-07-19） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -32,9 +32,10 @@ fixture/typed adapter/typed journal 前置分片为 `819aa5e` / `1acf8b8` /
 outer/callsite/schema/vector 与真实 v1/schema v4 readback 又分别由 `c28a968` / `c36a4f9` 完成；
 `ef830cd` 以 persisted cert/grant、control grant/revoke/retire 与真实 TLS enrollment 关闭 signed-material
 hard cutover，A1 complete。Swift A2 又由 `bea4c13` / `3e019ed` / `0dd58de` / `c2d2c28` / `e419d84`
-完成 strict Runtime v2 mirror、current/compact codec、98-fixture 与真实 UDS Swift readback；shared-daemon
-client 仍未完成。
-App/CLI shared-daemon cutover、LaunchAgent、P4 Machine identity/E2EE/Relay Publish 和真实 Companion 仍未完成，
+完成 strict Runtime v2 mirror、current/compact codec、98-fixture 与真实 UDS Swift readback；P3.9-A Rust
+shared-daemon client component 已由 `c29faa4` 完成，但 Swift client 与 Rust CLI binary 默认入口切换仍分别
+属于 P3.9-B/P3.9-D。
+App/CLI shared-daemon 默认入口 cutover、LaunchAgent、P4 Machine identity/E2EE/Relay Publish 和真实 Companion 仍未完成，
 iOS 仍只有 fixture 驱动骨架。
 P3.1 provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate。完整实施仍必须满足 §17 的
 Definition of Done。

@@ -2322,10 +2322,20 @@ P3.9 固定以下迁移边界：
   Clippy/fmt/network/no-net/docs/diff 全绿；spec/security 与 quality 双路终审 Approved、无 P0/P1/P2。
   production native metadata 继续在 claim 前 `PostMvpGated`，synthetic current-binary roundtrip 不冒充
   真实 Claude binary mutation。下一 Task 为 P3.9-A Rust shared-daemon client。
-- [ ] **P3.9-A Rust client：** 写 installation record 的 symlink/hardlink/mode/owner/corrupt/concurrent
+- [x] **P3.9-A Rust client：** 写 installation record 的 symlink/hardlink/mode/owner/corrupt/concurrent
   tests，再实现 CLI 独立 installation store、Unix transport、preface+Hello、messageId correlation、bounded
-  reply/stream pumps 与 close-only shutdown。CLI 默认 stable UDS，显式 test endpoint 只能经注入；默认路径
-  静态/动态证明不 spawn。focused tests 与 clippy/fmt 通过后独立提交。
+  reply/stream pumps 与 close-only shutdown。A 本身提供 production stable-UDS client API；Rust CLI binary
+  默认入口仍显式使用 `legacy_stdio` compatibility，真正入口切换属于 P3.9-D。显式 test endpoint 只能经
+  注入；stable API 静态/动态证明不 spawn。focused tests 与 clippy/fmt 通过后独立提交。
+
+  **Task 收口（2026-07-19）：** `c29faa4` 新增 `CliInstallationStore` 与 `RuntimeUnixClient`。installation
+  identity 只从当前 EUID 的 `getpwuid_r` home 派生，0700/0600、owner、no-follow、single-link、同目录
+  fsync + no-replace publication、并发 winner readback 与 corrupt 零轮换均 fail-close；UDS 校验 current-EUID
+  parent/socket 的 type/mode/nlink。preface/Hello、exact messageId、乱序 reply、sync terminal、typed EOF、
+  transfer binding/hash/TTL、reply/stream/bytes 背压和 write cancellation 均有界；close-only 不发 daemon
+  shutdown。fresh CLI 全包 `103/103`、lib `12/12`、shared-daemon `27/27`，scoped `-D warnings` Clippy、
+  fmt/diff 全绿；字面 all-targets Clippy 仅记录未修改 Relay 与旧 CLI E2E/doc lint 基线阻断，未计 PASS。
+  spec/security 与 quality 双路终审 Approved、无 P0/P1/P2。下一 Task 为 P3.9-B Swift client。
 - [ ] **P3.9-B Swift client：** 先写 installation/Unix socket/partial write/oversize/EOF/protocol mismatch/
   out-of-order reply/stream/backpressure tests，再实现 `LocalClientInstallation`、
   `UnixSocketDaemonTransport` 和 actor-owned `RuntimeEnvelopeClient`。所有 request 由 client 生成 canonical
@@ -2335,7 +2345,8 @@ P3.9 固定以下迁移边界：
   conversationId/eventId/itemId/entityId/commandId；删除 synthetic agentItem 序号和 legacy identity adoption，
   prompt/approval/vendor control/history 都走 `RuntimeEnvelopeClient` receipt/stream。preview/mock 可显式保留
   compatibility fixture，production App 不得构造 `ProcessDaemonTransport`。完整 Swift tests 后独立提交。
-- [ ] **P3.9-D 默认入口与真实 smoke：** Rust CLI与Swift client连接同一 private-TMPDIR daemon，看到
+- [ ] **P3.9-D 默认入口与真实 smoke：** 把 Rust CLI binary 与 App composition 的默认入口分别切到 A/B
+  提供的 shared-daemon client；Rust CLI与Swift client连接同一 private-TMPDIR daemon，看到
   同一 conversation/queue/receipt；关闭任一客户端后 daemon PID/active turn 不变。脚本只以
   `agentdeckd --ephemeral --no-remote` 启动并发现/验证恰好一个 `TMPDIR/ad-*/s`，不向 daemon 注入 path；
   两个真实 client 进程重启读回各自稳定 installation ID。再验证 stable endpoint 缺失时 typed fail、无

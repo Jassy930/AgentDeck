@@ -440,11 +440,17 @@ conversation/key，不能伪造身份连续性。
 - daemon main 固定按 `config → namespace/singleton → keystore → StorageKEK → record namespace →
   RuntimeCore → recovery permit → local ingress` 启动，record/diagnostics 一次性绑定已验证 data root。
   默认 ingress 是 canonical UDS；只有完整显式 stdio 三 flag 才进入 admin/read compatibility。
-  P3.9 shared-daemon client cutover 完成前，Swift/Rust stdio transport 是显式隔离的兼容路径：固定传
-  `--stdio-compat --ephemeral --no-remote --profile dev` 并清除旧 namespace env。它不触碰 stable 信任域，
-  也尚不提供多个客户端共享 singleton RuntimeCore；production main 明确拒绝旧
-  `SessionStart/SessionContinue`，真实本地会话必须等待 P3.9 后续 shared-daemon RuntimeEnvelope
-  client cutover。
+  P3.9-A 已提供 Rust production `RuntimeUnixClient` component。CLI installation record 固定在 OS account
+  home 下的 `Library/Application Support/AgentDeck/clients/cli/installation-id.v1`，只用 `getpwuid_r`、retained
+  dirfd/no-follow、current EUID、0700 parent、0600 single-link file 与同目录 fsync + no-replace publication；
+  已存在异常 entry 不自动轮换。stable UDS 只能由该 store 派生，client 在 connect 前要求 current-EUID
+  exact-0700 parent 与 exact-0600 single-link socket。preface/Hello、messageId reply sequence、stream 与
+  transfer pump 均有 count/byte/TTL 上界；关闭 client 只关闭自身 fd。
+- P3.9-D 默认入口 cutover 完成前，Rust binary main 与 Swift app 的 stdio transport 仍是显式隔离的兼容路径：
+  固定传 `--stdio-compat --ephemeral --no-remote --profile dev` 并清除旧 namespace env。Rust binary 已把相关
+  类型显式命名为 `Legacy*Stdio*`，shared-daemon component 本身不 spawn/fallback，但 binary main 尚未调用它；
+  Swift client 仍待 P3.9-B。当前仍不提供两个真实客户端共享 singleton RuntimeCore，production main 明确
+  拒绝旧 `SessionStart/SessionContinue`，真实本地会话必须等待 P3.9-D 原子切换与 smoke。
 - 已有 ignored、唯一 service/account、RAII 清理的真实 Keychain roundtrip，但 P3.1 的签名
   门禁尚未通过：当前机器无匹配 provisioning profile；Apple Development 与本地
   self-signed helper 虽通过 `codesign --verify`，均被 AMFI 以 exit 137 拒绝启动。因此本节

@@ -1703,6 +1703,28 @@ source unavailable、坏或 incomplete generation、read failure 都走相同 re
 effect fence 保持零；synthetic current-binary gate 只证明 claim→fence→release→reap→readback substrate，
 不得写成真实 Claude binary mutation PASS。legacy CC Rename/Archive/Unarchive 统一要求 Runtime gate。
 
+## Relay Companion MVP P3.9-A Rust shared-daemon client Task 门禁
+
+P3.9-A 只交付 Rust client component，不切换 `agentdeck` binary 默认入口；该切换和双客户端真实 smoke
+属于 P3.9-D。production component 必须从当前 EUID 的 passwd home 派生 installation record 与 canonical
+socket，拒绝 symlink/hardlink/owner/mode/corrupt，不读 `HOME`，也不包含 daemon spawn/fallback。Hello、
+exact messageId、reply/stream/transfer 与 close-only 都必须有界且 typed fail-close。
+
+```bash
+export CARGO_TARGET_DIR="$(mktemp -d /tmp/agentdeck-p39a-target.XXXXXX)"
+env -u AGENTDECK_E2E cargo test -p agentdeck-cli -- --test-threads=1
+cargo clippy -p agentdeck-cli --lib --bin agentdeck --test shared_daemon --no-deps -- -D warnings
+cargo fmt --all -- --check
+git diff --check -- Cargo.lock agentdeck-cli
+```
+
+**Task 完成证据（2026-07-19，`c29faa4`）：** fresh target CLI 全包 `103/103`、lib `12/12`、
+shared-daemon `27/27`，全部 0 failure；上述 scoped Clippy、fmt 与 diff check 通过。字面
+`cargo clippy -p agentdeck-cli --all-targets -- -D warnings` 被未修改的 Relay 三项 lint 阻断，添加
+`--no-deps` 后仍会命中既有 `protocol_schema_exports` / `e2e_*` doc/collapsible-if lint，因此两条字面命令
+均未计 PASS，也未扩 scope 顺手改动。installation 与 Unix transport production 子片分别少于 570 / 1,402
+additions，低于 1,800 预拆线；spec/security 与 quality 双路终审 Approved、无 P0/P1/P2。
+
 ## AppKit 重写后的验证清单
 
 前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。
