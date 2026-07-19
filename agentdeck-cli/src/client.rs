@@ -1,451 +1,166 @@
-//! v2 client API — sends `ClientCommand` JSONL, reads `ServerEvent` JSONL
-//! and admin reply side-channel.
+//! CLI binary 的 shared-daemon Runtime v2 connector。
 //!
-//! ## Admin reply parsing
-//!
-//! The daemon writes two kinds of lines to stdout (via a single writer task):
-//!
-//!   1. `ServerEvent` lines — always have a `"type"` JSON key
-//!      (e.g. `{"type":"sessionStarted", ...}`)
-//!
-//!   2. Admin reply lines — always have a `"reply"` JSON key
-//!      (e.g. `{"reply":"ping","ok":true}`)
-//!
-//! The two shapes are disjoint: no valid `ServerEvent` has `"reply"` and
-//! no admin reply has `"type"`. Therefore the CLI can parse any stdout line
-//! by peeking at which key is present, with zero ambiguity.
-//!
-//! Admin replies for `History` commands wrap the typed `HistoryResponse`
-//! envelope under `"response"` within `{"reply":"history","response":{...}}`.
+//! Production 只调用 `RuntimeUnixClient::connect_stable()`；没有 daemon spawn、stdio
+//! 或 diagnostics fallback。Debug smoke 只有一个 hidden private-TMPDIR root seam：它
+//! 自行发现并验证唯一 `ad-<UUID>/s`，不接受 socket 参数或环境覆盖。
 
 use crate::output::CliError;
-use crate::transport::{
-    LegacyAsyncStdioProcessTransport, LegacyStdioProcessTransport, SyncTransport,
-    split_legacy_async_stdio,
-};
-use agentdeck_protocol::{
-    ActionDecision, AgentKind, ClientCommand, HistoryRequest, HistoryResponse, ServerEvent,
-    SessionCapabilities, SessionId, SessionStart, ThreadId, VendorControlPayload,
-};
-use tokio::sync::mpsc;
+use agentdeck_cli::unix_transport::{RuntimeUnixClient, UnixClientError};
 
-// ── Envelope discriminant ─────────────────────────────────────────────────────
-
-/// What kind of line did the daemon write?
-enum DaemonLine {
-    Event(ServerEvent),
-    AdminReply(serde_json::Value),
-    /// Unparseable — skip silently.
-    Unknown,
+#[derive(Debug, Default)]
+pub struct RuntimeConnectOptions {
+    #[cfg(debug_assertions)]
+    pub temp_root_for_test: Option<std::path::PathBuf>,
 }
 
-fn parse_daemon_line(raw: &str) -> DaemonLine {
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return DaemonLine::Unknown;
-    };
-    if val.get("type").is_some() {
-        // Try ServerEvent
-        if let Ok(ev) = serde_json::from_value::<ServerEvent>(val) {
-            return DaemonLine::Event(ev);
-        }
-        return DaemonLine::Unknown;
+pub async fn connect(options: &RuntimeConnectOptions) -> Result<RuntimeUnixClient, CliError> {
+    #[cfg(debug_assertions)]
+    if let Some(root) = options.temp_root_for_test.as_deref() {
+        return connect_debug_temp_root(root).await;
     }
-    if val.get("reply").is_some() {
-        return DaemonLine::AdminReply(val);
-    }
-    DaemonLine::Unknown
+    #[cfg(not(debug_assertions))]
+    let _ = options;
+    RuntimeUnixClient::connect_stable()
+        .await
+        .map_err(map_unix_error)
 }
 
-// ── Sync round-trip helper (admin commands only) ──────────────────────────────
+pub fn map_unix_error(error: UnixClientError) -> CliError {
+    CliError::Transport {
+        code: Some(error.code().to_owned()),
+        message: error.to_string(),
+    }
+}
 
-/// Send a `ClientCommand` and wait for the admin reply JSON whose `"reply"`
-/// field matches `expected_reply`. Skips `ServerEvent` lines encountered
-/// while waiting (they belong to concurrent sessions).
-fn admin_round_trip(
-    transport: &mut LegacyStdioProcessTransport,
-    cmd: &ClientCommand,
-    expected_reply: &str,
-) -> Result<serde_json::Value, CliError> {
-    let line = serde_json::to_string(cmd)?;
-    transport.send_line(&line)?;
-    loop {
-        let raw = transport.recv_line()?;
-        let Some(raw) = raw else {
-            return Err(CliError::NoResponse);
+#[cfg(debug_assertions)]
+async fn connect_debug_temp_root(root: &std::path::Path) -> Result<RuntimeUnixClient, CliError> {
+    use agentdeck_cli::installation::CliInstallationStore;
+    use agentdeck_cli::unix_transport::InjectedEndpoint;
+
+    validate_private_directory(root, "Runtime smoke TMPDIR root")?;
+    let socket = discover_single_runtime_socket(root)?;
+    let installation_home = root.join("clients").join("cli");
+    ensure_private_directory(&root.join("clients"), "Runtime smoke clients directory")?;
+    ensure_private_directory(&installation_home, "Runtime smoke CLI installation home")?;
+    let store = CliInstallationStore::injected_for_test(installation_home);
+    let installation_id = store
+        .load_or_create()
+        .map_err(UnixClientError::from)
+        .map_err(map_unix_error)?;
+    RuntimeUnixClient::connect_injected_with_installation(
+        InjectedEndpoint::for_test(socket),
+        installation_id,
+    )
+    .await
+    .map_err(map_unix_error)
+}
+
+#[cfg(debug_assertions)]
+fn discover_single_runtime_socket(root: &std::path::Path) -> Result<std::path::PathBuf, CliError> {
+    let mut candidates = Vec::new();
+    let entries =
+        std::fs::read_dir(root).map_err(|error| unsafe_temp_root(root, error.to_string()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| unsafe_temp_root(root, error.to_string()))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
         };
-        match parse_daemon_line(&raw) {
-            DaemonLine::AdminReply(v) => {
-                let got = v.get("reply").and_then(|r| r.as_str()).unwrap_or("");
-                if got == expected_reply {
-                    return Ok(v);
-                }
-                // Different admin reply: might be from a concurrent command;
-                // keep reading.
-            }
-            DaemonLine::Event(ServerEvent::Error { error, .. }) => {
-                // C5 fix: thread the daemon's structured `error.code`
-                // (e.g. `agent-not-registered`) through to the CLI
-                // envelope instead of collapsing it to "protocol".
-                return Err(CliError::Protocol {
-                    code: Some(error.code),
-                    message: error.message,
-                });
-            }
-            DaemonLine::Event(_) => continue,
-            DaemonLine::Unknown => continue,
+        let Some(suffix) = name.strip_prefix("ad-") else {
+            continue;
+        };
+        let parsed = uuid::Uuid::parse_str(suffix).map_err(|_| {
+            unsafe_temp_root(root, format!("invalid Runtime namespace name {name}"))
+        })?;
+        if parsed.hyphenated().to_string() != suffix {
+            return Err(unsafe_temp_root(
+                root,
+                format!("non-canonical Runtime namespace name {name}"),
+            ));
+        }
+        candidates.push(root.join(name).join("s"));
+    }
+    match candidates.as_slice() {
+        [socket] => Ok(socket.clone()),
+        [] => Err(CliError::Transport {
+            code: Some("daemon.client.socket_missing".to_owned()),
+            message: format!(
+                "private Runtime smoke root {} contains no ad-<UUID>/s endpoint",
+                root.display()
+            ),
+        }),
+        _ => Err(unsafe_temp_root(
+            root,
+            "private Runtime smoke root contains multiple ad-<UUID>/s endpoints",
+        )),
+    }
+}
+
+#[cfg(debug_assertions)]
+fn ensure_private_directory(path: &std::path::Path, label: &'static str) -> Result<(), CliError> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(unsafe_temp_root(
+                path,
+                format!("cannot create {label}: {error}"),
+            ));
         }
     }
+    validate_private_directory(path, label)
 }
 
-// ── Sync Client (admin commands: ping/selfcheck/agent-list/capabilities/history) ──
+#[cfg(debug_assertions)]
+fn validate_private_directory(path: &std::path::Path, label: &'static str) -> Result<(), CliError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
 
-pub struct Client {
-    transport: LegacyStdioProcessTransport,
-}
-
-impl Client {
-    /// 显式选择隔离的 legacy/test stdio compatibility child。
-    pub fn connect_legacy_stdio(profile: &str, data_dir: Option<&str>) -> Result<Self, CliError> {
-        let transport = LegacyStdioProcessTransport::spawn(profile, data_dir)
-            .map_err(|e| CliError::Transport(e.to_string()))?;
-        Ok(Self { transport })
+    if !path.is_absolute() {
+        return Err(unsafe_temp_root(path, format!("{label} is not absolute")));
     }
-
-    pub fn ping(&mut self) -> Result<(), CliError> {
-        let v = admin_round_trip(&mut self.transport, &ClientCommand::Ping, "ping")?;
-        if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
-            Ok(())
-        } else {
-            Err(CliError::Protocol {
-                code: None,
-                message: "ping returned ok=false".into(),
-            })
-        }
-    }
-
-    pub fn selfcheck(&mut self) -> Result<serde_json::Value, CliError> {
-        let v = admin_round_trip(&mut self.transport, &ClientCommand::Selfcheck, "selfcheck")?;
-        if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
-            Ok(v)
-        } else {
-            Err(CliError::Session {
-                code: None,
-                message: "selfcheck returned ok=false".into(),
-            })
-        }
-    }
-
-    pub fn agent_list(&mut self) -> Result<Vec<String>, CliError> {
-        let v = admin_round_trip(&mut self.transport, &ClientCommand::AgentList, "agentList")?;
-        let arr = v
-            .get("agents")
-            .and_then(|a| a.as_array())
-            .ok_or_else(|| CliError::Protocol {
-                code: None,
-                message: "missing agents array".into(),
-            })?;
-        Ok(arr
-            .iter()
-            .filter_map(|x| x.as_str().map(|s| s.to_string()))
-            .collect())
-    }
-
-    pub fn agent_capabilities(&mut self, kind: AgentKind) -> Result<SessionCapabilities, CliError> {
-        let v = admin_round_trip(
-            &mut self.transport,
-            &ClientCommand::AgentCapabilities { agent_kind: kind },
-            "agentCapabilities",
-        )?;
-        let caps_val = v
-            .get("capabilities")
-            .cloned()
-            .ok_or_else(|| CliError::Protocol {
-                code: None,
-                message: "missing capabilities field".into(),
-            })?;
-        serde_json::from_value::<SessionCapabilities>(caps_val).map_err(CliError::Json)
-    }
-
-    pub fn history(&mut self, req: HistoryRequest) -> Result<HistoryResponse, CliError> {
-        let v = admin_round_trip(&mut self.transport, &ClientCommand::History(req), "history")?;
-        let resp_val = v
-            .get("response")
-            .cloned()
-            .ok_or_else(|| CliError::Protocol {
-                code: None,
-                message: "missing response field in history reply".into(),
-            })?;
-        serde_json::from_value::<HistoryResponse>(resp_val).map_err(CliError::Json)
-    }
-}
-
-// ── Async streaming session (session run / continue) ──────────────────────────
-
-/// Run a streaming session (start or continue) via an async daemon transport.
-/// Sends the given `cmd` (must be `SessionStart` or `SessionContinue`), then
-/// reads `ServerEvent` lines from stdout and forwards them to the returned
-/// mpsc receiver until `TurnComplete` or `Error` is received.
-///
-/// Admin reply lines encountered on the shared stdout are skipped (they
-/// belong to a different logical channel).
-pub async fn stream_session_legacy_stdio(
-    cmd: ClientCommand,
-    profile: &str,
-    data_dir: Option<&str>,
-) -> Result<mpsc::Receiver<ServerEvent>, CliError> {
-    let mut transport = LegacyAsyncStdioProcessTransport::spawn(profile, data_dir)
-        .await
-        .map_err(|e| CliError::Transport(e.to_string()))?;
-
-    let line = serde_json::to_string(&cmd)?;
-    transport
-        .send_line(&line)
-        .await
-        .map_err(|e| CliError::Transport(e.to_string()))?;
-
-    // Split into writer (keeps child alive) + line receiver channel.
-    let (writer, mut line_rx) = split_legacy_async_stdio(transport);
-
-    let (tx, rx) = mpsc::channel::<ServerEvent>(64);
-
-    tokio::spawn(async move {
-        // Keep writer (and child process) alive for the duration of streaming.
-        let _writer = writer;
-        loop {
-            let Some(raw) = line_rx.recv().await else {
-                break;
-            };
-            match parse_daemon_line(&raw) {
-                DaemonLine::Event(ev) => {
-                    let is_terminal = matches!(&ev, ServerEvent::TurnComplete { .. })
-                        || matches!(&ev, ServerEvent::Error { .. });
-                    let _ = tx.send(ev).await;
-                    if is_terminal {
-                        break;
-                    }
-                }
-                DaemonLine::AdminReply(_) => continue,
-                DaemonLine::Unknown => continue,
-            }
-        }
-    });
-
-    Ok(rx)
-}
-
-// ── Convenience constructors for session commands ─────────────────────────────
-
-pub fn session_start_cmd(start: SessionStart) -> ClientCommand {
-    ClientCommand::SessionStart(start)
-}
-
-pub fn session_continue_cmd(
-    thread_id: String,
-    agent_kind: AgentKind,
-    cwd: std::path::PathBuf,
-    prompt: String,
-) -> ClientCommand {
-    ClientCommand::SessionContinue {
-        thread_id: ThreadId(thread_id),
-        agent_kind,
-        cwd,
-        prompt,
-    }
-}
-
-#[allow(dead_code)]
-pub fn session_cancel_cmd(session_id: String) -> ClientCommand {
-    ClientCommand::SessionCancel {
-        session_id: SessionId(session_id),
-    }
-}
-
-#[allow(dead_code)]
-pub fn action_decision_cmd(session_id: String, decision: ActionDecision) -> ClientCommand {
-    ClientCommand::ActionDecision {
-        session_id: SessionId(session_id),
-        decision,
-    }
-}
-
-#[allow(dead_code)]
-pub fn vendor_control_cmd(session_id: String, payload: VendorControlPayload) -> ClientCommand {
-    ClientCommand::VendorControl {
-        session_id: SessionId(session_id),
-        payload,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::transport::FakeTransport;
-
-    fn ping_reply() -> String {
-        r#"{"reply":"ping","ok":true}"#.to_string()
-    }
-
-    fn selfcheck_reply() -> String {
-        r#"{"reply":"selfcheck","ok":true,"protocolVersion":2,"agents":["codex","claude_code"]}"#
-            .to_string()
-    }
-
-    fn error_event(msg: &str) -> String {
-        serde_json::json!({
-            "type": "error",
-            "error": { "code": "test", "message": msg, "diagnosticRef": null }
-        })
-        .to_string()
-    }
-
-    fn admin_round_trip_fake(
-        fake: &mut FakeTransport,
-        cmd: &ClientCommand,
-        expected: &str,
-    ) -> Result<serde_json::Value, CliError> {
-        let line = serde_json::to_string(cmd).unwrap();
-        fake.send_line(&line).unwrap();
-        loop {
-            let raw = fake.recv_line().unwrap();
-            let Some(raw) = raw else {
-                return Err(CliError::NoResponse);
-            };
-            match parse_daemon_line(&raw) {
-                DaemonLine::AdminReply(v) => {
-                    let got = v.get("reply").and_then(|r| r.as_str()).unwrap_or("");
-                    if got == expected {
-                        return Ok(v);
-                    }
-                }
-                DaemonLine::Event(ServerEvent::Error { error, .. }) => {
-                    return Err(CliError::Protocol {
-                        code: Some(error.code),
-                        message: error.message,
-                    });
-                }
-                DaemonLine::Event(_) => continue,
-                DaemonLine::Unknown => continue,
-            }
-        }
-    }
-
-    #[test]
-    fn parse_daemon_line_discriminates_event_vs_admin() {
-        // ServerEvent has "type"
-        let ev_line = r#"{"type":"error","error":{"code":"x","message":"y","diagnosticRef":null}}"#;
-        assert!(matches!(parse_daemon_line(ev_line), DaemonLine::Event(_)));
-
-        // Admin reply has "reply"
-        let admin_line = r#"{"reply":"ping","ok":true}"#;
-        assert!(matches!(
-            parse_daemon_line(admin_line),
-            DaemonLine::AdminReply(_)
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| {
+            unsafe_temp_root(path, format!("cannot open {label} no-follow: {error}"))
+        })?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: directory is a retained descriptor and stat is writable storage.
+    if unsafe { libc::fstat(directory.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(unsafe_temp_root(
+            path,
+            format!("cannot stat {label}: {}", std::io::Error::last_os_error()),
         ));
-
-        // Unknown
-        let unknown = r#"{"foo":"bar"}"#;
-        assert!(matches!(parse_daemon_line(unknown), DaemonLine::Unknown));
     }
-
-    #[test]
-    fn admin_round_trip_fake_skips_event_lines_and_matches_reply() {
-        // Use a non-error ServerEvent (agentItem etc.) — those should be
-        // skipped while waiting for the matching admin reply.
-        // We can't construct a full AgentItem without all fields, so we
-        // use a stray admin reply with a different key first.
-        let different_reply = r#"{"reply":"protocolVersion","protocolVersion":2}"#.to_string();
-        let mut fake = FakeTransport::new(vec![
-            // stray admin reply with different key — skip and keep looking
-            different_reply,
-            ping_reply(),
-        ]);
-        let v = admin_round_trip_fake(&mut fake, &ClientCommand::Ping, "ping").unwrap();
-        assert_eq!(v["reply"], "ping");
-        assert_eq!(v["ok"], true);
+    // SAFETY: successful fstat initialized stat.
+    let stat = unsafe { stat.assume_init() };
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    if (stat.st_mode & libc::S_IFMT) != libc::S_IFDIR
+        || stat.st_uid != uid
+        || (stat.st_mode & 0o7777) != 0o700
+    {
+        return Err(unsafe_temp_root(
+            path,
+            format!("{label} must be a current-EUID exact-0700 directory"),
+        ));
     }
+    Ok(())
+}
 
-    #[test]
-    fn admin_round_trip_fake_returns_no_response_on_eof() {
-        let mut fake = FakeTransport::new(vec![]);
-        let err = admin_round_trip_fake(&mut fake, &ClientCommand::Ping, "ping").unwrap_err();
-        assert_eq!(err.exit_code(), 3);
-    }
-
-    #[test]
-    fn admin_round_trip_fake_propagates_error_event() {
-        let mut fake = FakeTransport::new(vec![error_event("daemon failed")]);
-        let err = admin_round_trip_fake(&mut fake, &ClientCommand::Ping, "ping").unwrap_err();
-        assert_eq!(err.exit_code(), 3);
-        assert!(err.message().contains("daemon failed"));
-    }
-
-    #[test]
-    fn selfcheck_ok_true_returns_value() {
-        let mut fake = FakeTransport::new(vec![selfcheck_reply()]);
-        let v = admin_round_trip_fake(&mut fake, &ClientCommand::Selfcheck, "selfcheck").unwrap();
-        assert_eq!(v["ok"], true);
-        assert_eq!(v["protocolVersion"], 2);
-    }
-
-    #[test]
-    fn agent_list_parses_from_admin_reply() {
-        let raw = r#"{"reply":"agentList","agents":["codex","claude_code"]}"#;
-        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
-        let arr = v["agents"].as_array().unwrap();
-        let kinds: Vec<&str> = arr.iter().filter_map(|x| x.as_str()).collect();
-        assert!(kinds.contains(&"codex"));
-        assert!(kinds.contains(&"claude_code"));
-    }
-
-    #[test]
-    fn history_parses_empty_list_response() {
-        let raw = r#"{"reply":"history","response":{"kind":"list","value":[]}}"#;
-        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
-        let resp: HistoryResponse = serde_json::from_value(v["response"].clone()).unwrap();
-        assert!(matches!(resp, HistoryResponse::List(ref items) if items.is_empty()));
-    }
-
-    #[test]
-    fn session_continue_cmd_builds_correct_variant() {
-        let cmd = session_continue_cmd(
-            "tid-1".into(),
-            AgentKind::ClaudeCode,
-            std::path::PathBuf::from("/tmp/work"),
-            "continue this".into(),
-        );
-        let json = serde_json::to_string(&cmd).unwrap();
-        assert!(json.contains("sessionContinue"));
-        assert!(json.contains("claude_code"));
-        // C3 fix: cwd is now part of the on-wire SessionContinue payload
-        // so adapter `continue_thread` no longer falls back to
-        // `std::env::current_dir()` (which broke CC `--resume` and
-        // tool_use cwd).
-        assert!(json.contains("/tmp/work"));
-    }
-
-    /// C5 fix: when the daemon emits a `ServerEvent::Error` with a
-    /// structured `error.code` (e.g. `cc-not-installed`), the CLI
-    /// surfaces that code in the envelope instead of the literal
-    /// `"protocol"` discriminator.
-    #[test]
-    fn admin_round_trip_propagates_daemon_error_code() {
-        let raw = serde_json::json!({
-            "type": "error",
-            "error": {
-                "code": "cc-not-installed",
-                "message": "no claude binary",
-                "diagnosticRef": null,
-            }
-        })
-        .to_string();
-        let mut fake = FakeTransport::new(vec![raw]);
-        let err = admin_round_trip_fake(&mut fake, &ClientCommand::Ping, "ping").unwrap_err();
-        match err {
-            CliError::Protocol { code, message } => {
-                assert_eq!(code.as_deref(), Some("cc-not-installed"));
-                assert_eq!(message, "no claude binary");
-            }
-            other => panic!("expected CliError::Protocol, got {other:?}"),
-        }
+#[cfg(debug_assertions)]
+fn unsafe_temp_root(path: &std::path::Path, reason: impl Into<String>) -> CliError {
+    CliError::Transport {
+        code: Some("daemon.client.socket_unsafe".to_owned()),
+        message: format!(
+            "unsafe Runtime smoke path {}: {}",
+            path.display(),
+            reason.into()
+        ),
     }
 }

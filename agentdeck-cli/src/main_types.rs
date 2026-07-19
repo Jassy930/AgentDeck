@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 // ── AgentKind clap arg ────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
 pub enum AgentKindArg {
     #[value(name = "codex")]
     Codex,
@@ -16,7 +16,7 @@ pub enum AgentKindArg {
 
 // ── Codex-specific args ───────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
 pub enum SandboxArg {
     #[value(name = "read-only")]
     ReadOnly,
@@ -26,7 +26,7 @@ pub enum SandboxArg {
     FullAccess,
 }
 
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
 pub enum ApprovalArg {
     #[value(name = "on-request")]
     OnRequest,
@@ -36,7 +36,7 @@ pub enum ApprovalArg {
     Always,
 }
 
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
 pub enum EffortArg {
     #[value(name = "minimal")]
     Minimal,
@@ -50,7 +50,7 @@ pub enum EffortArg {
 
 // ── CC-specific args ──────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
 pub enum PermissionArg {
     #[value(name = "default")]
     Default,
@@ -74,16 +74,14 @@ pub struct SessionRunArgs {
     pub agent: AgentKindArg,
     pub cwd: PathBuf,
     pub prompt: String,
+    pub idempotency_key: String,
     // Codex-only
     pub sandbox: Option<SandboxArg>,
     pub approval: Option<ApprovalArg>,
-    pub persist_approval: bool,
     pub reasoning_effort: Option<EffortArg>,
     // CC-only
     pub permission: Option<PermissionArg>,
     pub output_style: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
-    pub worktree: Option<String>,
-    pub session_name: Option<String>,
 }

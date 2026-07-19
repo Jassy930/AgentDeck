@@ -24,21 +24,23 @@ pub enum CliError {
         code: Option<String>,
         message: String,
     },
-    Transport(String),
+    Transport {
+        code: Option<String>,
+        message: String,
+    },
     Session {
         code: Option<String>,
         message: String,
     },
     Json(serde_json::Error),
-    NoResponse,
 }
 
 impl CliError {
     pub fn exit_code(&self) -> i32 {
         match self {
             CliError::Usage(_) => 2,
-            CliError::Protocol { .. } | CliError::Json(_) | CliError::NoResponse => 3,
-            CliError::Transport(_) => 4,
+            CliError::Protocol { .. } | CliError::Json(_) => 3,
+            CliError::Transport { .. } => 4,
             CliError::Session { .. } => 5,
         }
     }
@@ -48,19 +50,18 @@ impl CliError {
     pub fn code_str(&self) -> &'static str {
         match self {
             CliError::Usage(_) => "usage",
-            CliError::Protocol { .. } | CliError::Json(_) | CliError::NoResponse => "protocol",
-            CliError::Transport(_) => "transport",
+            CliError::Protocol { .. } | CliError::Json(_) => "protocol",
+            CliError::Transport { .. } => "transport",
             CliError::Session { .. } => "session",
         }
     }
     pub fn message(&self) -> String {
         match self {
-            CliError::Usage(m) | CliError::Transport(m) => m.clone(),
-            CliError::Protocol { message, .. } | CliError::Session { message, .. } => {
-                message.clone()
-            }
+            CliError::Usage(m) => m.clone(),
+            CliError::Protocol { message, .. }
+            | CliError::Transport { message, .. }
+            | CliError::Session { message, .. } => message.clone(),
             CliError::Json(e) => format!("JSON error: {e}"),
-            CliError::NoResponse => "daemon closed without response".to_string(),
         }
     }
 }
@@ -73,7 +74,10 @@ impl From<serde_json::Error> for CliError {
 
 impl From<std::io::Error> for CliError {
     fn from(e: std::io::Error) -> Self {
-        CliError::Transport(e.to_string())
+        CliError::Transport {
+            code: None,
+            message: e.to_string(),
+        }
     }
 }
 
@@ -87,9 +91,9 @@ pub fn render(value: &serde_json::Value, pretty: bool) -> String {
 
 pub fn error_envelope(err: &CliError) -> serde_json::Value {
     let code = match err {
-        CliError::Protocol { code: Some(c), .. } | CliError::Session { code: Some(c), .. } => {
-            c.clone()
-        }
+        CliError::Protocol { code: Some(c), .. }
+        | CliError::Transport { code: Some(c), .. }
+        | CliError::Session { code: Some(c), .. } => c.clone(),
         _ => err.code_str().to_string(),
     };
     serde_json::json!({ "error": { "code": code, "message": err.message() } })
@@ -110,7 +114,14 @@ mod tests {
             .exit_code(),
             3
         );
-        assert_eq!(CliError::Transport("x".into()).exit_code(), 4);
+        assert_eq!(
+            CliError::Transport {
+                code: None,
+                message: "x".into()
+            }
+            .exit_code(),
+            4
+        );
         assert_eq!(
             CliError::Session {
                 code: None,
@@ -119,7 +130,6 @@ mod tests {
             .exit_code(),
             5
         );
-        assert_eq!(CliError::NoResponse.exit_code(), 3);
     }
 
     #[test]
@@ -143,6 +153,16 @@ mod tests {
         });
         assert_eq!(v["error"]["code"], "cc-not-installed");
         assert_eq!(v["error"]["message"], "no claude binary");
+    }
+
+    #[test]
+    fn error_envelope_propagates_unix_client_code() {
+        let v = error_envelope(&CliError::Transport {
+            code: Some("daemon.client.socket_missing".into()),
+            message: "canonical socket is absent".into(),
+        });
+        assert_eq!(v["error"]["code"], "daemon.client.socket_missing");
+        assert_eq!(v["error"]["message"], "canonical socket is absent");
     }
 
     #[test]

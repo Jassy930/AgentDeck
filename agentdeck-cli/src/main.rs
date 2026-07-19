@@ -3,101 +3,108 @@ mod commands;
 mod main_types;
 mod output;
 mod remote;
+mod runtime_cli;
 mod transport;
 
-use agentdeck_protocol::{HistoryRequest, ThreadId};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, error::ErrorKind};
 use main_types::{AgentKindArg, ApprovalArg, EffortArg, PermissionArg, SandboxArg, SessionRunArgs};
 use output::{CliError, render};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-// ── Top-level CLI ─────────────────────────────────────────────────────────────
-
 #[derive(Parser)]
 #[command(name = "agentdeck", about = "AgentDeck unified interface CLI (v2)")]
 struct Cli {
-    /// AgentDeck profile (stable|dev)
+    /// AgentDeck profile (Runtime commands require stable)
     #[arg(long, global = true, default_value = "stable")]
     profile: String,
-    /// Override data directory (takes precedence over profile)
+    /// Diagnostics/Relay data directory; rejected by Runtime commands
     #[arg(long, global = true)]
     data_dir: Option<String>,
     /// Human-readable pretty output
     #[arg(long, global = true)]
     pretty: bool,
+    /// Debug smoke only: discover one ad-<UUID>/s below this private root.
+    #[cfg(debug_assertions)]
+    #[arg(long, global = true, hide = true, value_name = "PRIVATE_TMPDIR")]
+    runtime_temp_root_for_test: Option<PathBuf>,
     #[command(subcommand)]
     command: Cmd,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Round-trip liveness check
+    /// Connect to the shared daemon and complete the Runtime Hello handshake
     Ping,
-    /// Daemon plumbing self-check
+    /// Runtime Hello + DescribeAgents self-check
     Selfcheck,
-    /// Diagnostics
+    /// Diagnostics one-shot operations
     Diagnostics {
         #[command(subcommand)]
         op: DiagOp,
     },
-    /// Protocol introspection
+    /// Pure local protocol introspection
     Protocol {
         #[command(subcommand)]
         op: ProtocolOp,
     },
-    /// Agent adapter operations (list, capabilities)
+    /// Agent adapter operations
     Agent {
         #[command(subcommand)]
         op: AgentOp,
     },
-    /// Session operations (run, continue)
+    /// Canonical conversation operations
     Session {
         #[command(subcommand)]
         op: SessionOp,
     },
-    /// Cross-agent history operations
+    /// Canonical catalog/conversation history operations
     History {
         #[command(subcommand)]
         op: HistoryOp,
     },
-    /// Remote Relay v2 诊断与 Companion 管理入口
+    /// Remote Relay v2 diagnostics and Companion management
     Remote {
         #[command(subcommand)]
         op: RemoteOp,
     },
+    /// 仅 DEBUG 构建可用的跨进程 Runtime smoke 操作。
+    #[cfg(debug_assertions)]
+    #[command(name = "runtime-smoke-for-test", hide = true)]
+    RuntimeSmokeForTest {
+        #[command(subcommand)]
+        op: RuntimeSmokeOp,
+    },
 }
-
-// ── Subcommand enums ──────────────────────────────────────────────────────────
 
 #[derive(Subcommand)]
 enum DiagOp {
-    /// Print a diagnostics report
+    /// Print a diagnostics report using an explicit one-shot daemon
     Report,
 }
 
 #[derive(Subcommand)]
 enum ProtocolOp {
-    /// Print the local IPC v2 aggregate JSON Schema (PROTOCOL_VERSION)
+    /// Print the local IPC v2 aggregate JSON Schema
     Schema,
-    /// Print the local IPC protocol version number (PROTOCOL_VERSION)
+    /// Print the local IPC protocol version
     Version,
-    /// Print the Runtime v2 aggregate JSON Schema (RUNTIME_PROTOCOL_VERSION)
+    /// Print the Runtime v2 aggregate JSON Schema
     #[command(name = "runtime-schema")]
     RuntimeSchema,
-    /// Print the Relay v2 aggregate JSON Schema (RELAY_PROTOCOL_VERSION=2)
+    /// Print the Relay v2 aggregate JSON Schema
     #[command(name = "relay-schema")]
     RelaySchema,
-    /// Print the E2EE v1 aggregate JSON Schema (E2EE_FORMAT_VERSION)
+    /// Print the E2EE v1 aggregate JSON Schema
     #[command(name = "e2ee-schema")]
     E2eeSchema,
 }
 
 #[derive(Subcommand)]
 enum AgentOp {
-    /// List registered agent adapters
+    /// List canonical agent descriptions and defaults
     List,
-    /// Show capabilities for a specific agent
+    /// Show one canonical agent description and default configuration
     Capabilities {
         #[arg(long)]
         agent: AgentKindArg,
@@ -106,7 +113,7 @@ enum AgentOp {
 
 #[derive(Subcommand)]
 enum SessionOp {
-    /// Start a new agent session
+    /// DescribeAgents → Start → Configure(rev0) → Subscribe → optional SendPrompt
     Run {
         #[arg(long)]
         agent: AgentKindArg,
@@ -114,16 +121,15 @@ enum SessionOp {
         cwd: PathBuf,
         #[arg(long)]
         prompt: String,
-        // Codex-only flags
+        /// Stable caller operation key; derives start/configure/prompt keys.
+        #[arg(long)]
+        idempotency_key: String,
         #[arg(long)]
         sandbox: Option<SandboxArg>,
         #[arg(long)]
         approval: Option<ApprovalArg>,
         #[arg(long)]
-        persist_approval: bool,
-        #[arg(long)]
         reasoning_effort: Option<EffortArg>,
-        // CC-only flags
         #[arg(long)]
         permission: Option<PermissionArg>,
         #[arg(long)]
@@ -132,80 +138,101 @@ enum SessionOp {
         model: Option<String>,
         #[arg(long)]
         effort: Option<String>,
-        #[arg(long)]
-        worktree: Option<String>,
-        #[arg(long)]
-        session_name: Option<String>,
     },
-    /// Continue an existing thread
+    /// Subscribe and send a prompt to a canonical conversationId
     Continue {
         #[arg(long)]
-        thread_id: String,
-        #[arg(long)]
-        agent: AgentKindArg,
-        /// Working directory associated with the thread. Required so
-        /// `claude --resume` finds the right session file under
-        /// `~/.claude/projects/<encoded_cwd>/<id>.jsonl` and tool_use
-        /// runs in the same directory as the original session
-        /// (C3 fix, final v0.2 review).
-        #[arg(long)]
-        cwd: std::path::PathBuf,
+        conversation_id: String,
         #[arg(long)]
         prompt: String,
+        /// Stable SendPrompt idempotency key for replay/outcome recovery.
+        #[arg(long)]
+        idempotency_key: String,
     },
 }
 
 #[derive(Subcommand)]
 enum HistoryOp {
-    /// List threads (default: all agents)
+    /// Page through the canonical Catalog and filter locally
     List {
         #[arg(long)]
         agent: Option<AgentKindArg>,
         #[arg(long)]
         cwd_filter: Option<PathBuf>,
-        /// Maximum number of items to return. Defaults to the daemon's
-        /// bounded history limit; values above the daemon maximum are clamped.
         #[arg(long)]
         limit: Option<usize>,
     },
-    /// Read thread turns
-    Read {
-        thread_id: String,
-        #[arg(long)]
-        agent: AgentKindArg,
-    },
-    /// Archive a thread
+    /// Subscribe(BeforeFirst) and read a canonical conversation snapshot/backfill
+    Read { conversation_id: String },
+    /// Archive a canonical conversation using entry-revision CAS
     Archive {
-        thread_id: String,
+        conversation_id: String,
         #[arg(long)]
-        agent: AgentKindArg,
+        expected_entry_revision: u64,
+        #[arg(long)]
+        idempotency_key: String,
     },
-    /// Unarchive a thread
+    /// Unarchive a canonical conversation using entry-revision CAS
     Unarchive {
-        thread_id: String,
+        conversation_id: String,
         #[arg(long)]
-        agent: AgentKindArg,
+        expected_entry_revision: u64,
+        #[arg(long)]
+        idempotency_key: String,
     },
-    /// Rename a thread
+    /// Rename a canonical conversation using entry-revision CAS
     Rename {
-        thread_id: String,
+        conversation_id: String,
         title: String,
         #[arg(long)]
-        agent: AgentKindArg,
+        expected_entry_revision: u64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+}
+
+#[cfg(debug_assertions)]
+#[derive(Subcommand)]
+enum RuntimeSmokeOp {
+    /// 输出当前连接使用的持久化 CLI installation identity。
+    Installation,
+    /// 不做 identity adoption，发送一条 canonical prompt。
+    SendPrompt {
+        #[arg(long)]
+        conversation_id: String,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        expected_configuration_revision: u64,
+        #[arg(long)]
+        prompt: String,
+    },
+    /// 使用且仅使用一种 owner-scoped selector 查询 receipt。
+    QueryReceipt {
+        #[arg(long)]
+        conversation_id: String,
+        #[arg(long)]
+        command_id: Option<String>,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// 消费完整 canonical synchronization barrier 并汇总 identity。
+    Subscribe {
+        #[arg(long)]
+        conversation_id: String,
     },
 }
 
 #[derive(Subcommand)]
 enum RemoteOp {
-    /// 真实 WSS/SPKI + ephemeral machine/device 的 Relay v2 端到端自检
+    /// Real WSS/SPKI + ephemeral machine/device Relay v2 self-check
     Synthetic {
-        /// Relay 本机 admin 生成的一次性 enrollment bundle JSON
         #[arg(long)]
         bundle: PathBuf,
     },
-    /// 已移除的 Relay v1 单进程冒烟（仅保留迁移错误码）
+    /// Removed Relay v1 smoke command (migration error only)
     Smoke,
-    /// 持久配对将在 P4 开放；旧 v1 参数只返回 reset-required
+    /// Persistent pairing is P4; legacy v1 inputs return reset-required
     Pair {
         #[arg(long)]
         relay: Option<String>,
@@ -214,45 +241,38 @@ enum RemoteOp {
         #[arg(long, value_enum)]
         role: Option<RoleArg>,
     },
-    /// 列出机器
     Machines {
         #[arg(long)]
         relay: String,
     },
-    /// 列出某机器的会话
     Sessions {
         #[arg(long)]
         relay: String,
         machine_id: String,
     },
-    /// 流式查看某 conversation
     Watch {
         #[arg(long)]
         relay: String,
         conversation_id: String,
     },
-    /// 向 conversation 发 prompt
     Send {
         #[arg(long)]
         relay: String,
         conversation_id: String,
         text: String,
     },
-    /// 批准某 turn 的审批
     Approve {
         #[arg(long)]
         relay: String,
         turn_session_id: String,
         request_id: String,
     },
-    /// 拒绝某 turn 的审批
     Deny {
         #[arg(long)]
         relay: String,
         turn_session_id: String,
         request_id: String,
     },
-    /// 机器级 admin 往返
     Ping {
         #[arg(long)]
         relay: String,
@@ -266,102 +286,243 @@ enum RoleArg {
     Device,
 }
 
-// ── Main dispatcher ───────────────────────────────────────────────────────────
+async fn connect_runtime(
+    cli: &Cli,
+) -> Result<agentdeck_cli::unix_transport::RuntimeUnixClient, CliError> {
+    runtime_cli::validate_runtime_globals(&cli.profile, cli.data_dir.as_deref())?;
+    let options = client::RuntimeConnectOptions {
+        #[cfg(debug_assertions)]
+        temp_root_for_test: cli.runtime_temp_root_for_test.clone(),
+    };
+    client::connect(&options).await
+}
 
-fn run_sync(cli: &Cli) -> Result<(), CliError> {
-    let profile = &cli.profile;
-    let data_dir = cli.data_dir.as_deref();
+#[cfg(debug_assertions)]
+async fn connect_runtime_smoke(
+    cli: &Cli,
+) -> Result<agentdeck_cli::unix_transport::RuntimeUnixClient, CliError> {
+    if cli.runtime_temp_root_for_test.is_none() {
+        return Err(CliError::Usage(
+            "runtime-smoke-for-test requires --runtime-temp-root-for-test".to_owned(),
+        ));
+    }
+    connect_runtime(cli).await
+}
+
+async fn run_non_remote(cli: &Cli) -> Result<(), CliError> {
     let pretty = cli.pretty;
-
     match &cli.command {
-        // Protocol schema/version introspection is pure local data (the four
-        // version axes each expose their own aggregate schema function in
-        // `agentdeck-protocol`) — dispatch happens before any legacy stdio connection
-        // so these subcommands never spawn or talk to the daemon.
         Cmd::Protocol { op } => match op {
-            ProtocolOp::Schema => commands::handle_protocol_schema(pretty),
+            ProtocolOp::Schema => commands::handle_protocol_schema(),
             ProtocolOp::Version => commands::handle_protocol_version(pretty),
-            ProtocolOp::RuntimeSchema => commands::handle_protocol_runtime_schema(pretty),
-            ProtocolOp::RelaySchema => commands::handle_protocol_relay_schema(pretty),
-            ProtocolOp::E2eeSchema => commands::handle_protocol_e2ee_schema(pretty),
+            ProtocolOp::RuntimeSchema => commands::handle_protocol_runtime_schema(),
+            ProtocolOp::RelaySchema => commands::handle_protocol_relay_schema(),
+            ProtocolOp::E2eeSchema => commands::handle_protocol_e2ee_schema(),
         },
+        Cmd::Diagnostics { op: DiagOp::Report } => {
+            commands::handle_diagnostics_report(&cli.profile, cli.data_dir.as_deref(), pretty)
+        }
         Cmd::Ping => {
-            let mut c = client::Client::connect_legacy_stdio(profile, data_dir)?;
-            commands::handle_ping(&mut c, pretty)
+            let _client = connect_runtime(cli).await?;
+            runtime_cli::handle_ping(pretty);
+            Ok(())
         }
         Cmd::Selfcheck => {
-            let mut c = client::Client::connect_legacy_stdio(profile, data_dir)?;
-            commands::handle_selfcheck(&mut c, pretty)
+            let client = connect_runtime(cli).await?;
+            runtime_cli::handle_selfcheck(&client, pretty).await
         }
-        Cmd::Diagnostics { op } => match op {
-            DiagOp::Report => commands::handle_diagnostics_report(profile, data_dir, pretty),
-        },
         Cmd::Agent { op } => {
-            let mut c = client::Client::connect_legacy_stdio(profile, data_dir)?;
+            let client = connect_runtime(cli).await?;
             match op {
-                AgentOp::List => commands::handle_agent_list(&mut c, pretty),
+                AgentOp::List => runtime_cli::handle_agent_list(&client, pretty).await,
                 AgentOp::Capabilities { agent } => {
-                    commands::handle_agent_capabilities(&mut c, *agent, pretty)
+                    runtime_cli::handle_agent_capabilities(&client, *agent, pretty).await
                 }
             }
         }
-        Cmd::History { op } => {
-            let mut c = client::Client::connect_legacy_stdio(profile, data_dir)?;
-            let req = match op {
-                HistoryOp::List {
-                    agent,
-                    cwd_filter,
-                    limit,
-                } => HistoryRequest::List {
-                    agent_kind: agent.map(|a| a.into()),
-                    cwd_filter: cwd_filter.clone(),
-                    limit: *limit,
-                },
-                HistoryOp::Read { thread_id, agent } => HistoryRequest::Read {
-                    thread_id: ThreadId(thread_id.clone()),
-                    agent_kind: (*agent).into(),
-                },
-                HistoryOp::Archive { thread_id, agent } => HistoryRequest::Archive {
-                    thread_id: ThreadId(thread_id.clone()),
-                    agent_kind: (*agent).into(),
-                },
-                HistoryOp::Unarchive { thread_id, agent } => HistoryRequest::Unarchive {
-                    thread_id: ThreadId(thread_id.clone()),
-                    agent_kind: (*agent).into(),
-                },
-                HistoryOp::Rename {
-                    thread_id,
-                    title,
-                    agent,
-                } => HistoryRequest::Rename {
-                    thread_id: ThreadId(thread_id.clone()),
-                    agent_kind: (*agent).into(),
-                    title: title.clone(),
-                },
-            };
-            commands::handle_history(&mut c, req, pretty)
-        }
-        // Session commands need async — handled below in main()
-        Cmd::Session { .. } => {
-            // Should not reach here in sync path
-            unreachable!("session commands handled in async path")
-        }
-        // Remote commands need async — handled below in main()
-        Cmd::Remote { .. } => {
-            unreachable!("remote commands handled in async path")
-        }
+        Cmd::Session { op } => match op {
+            SessionOp::Run {
+                agent,
+                cwd,
+                prompt,
+                idempotency_key,
+                sandbox,
+                approval,
+                reasoning_effort,
+                permission,
+                output_style,
+                model,
+                effort,
+            } => {
+                let plan = runtime_cli::SessionRunPlan::new(SessionRunArgs {
+                    agent: *agent,
+                    cwd: cwd.clone(),
+                    prompt: prompt.clone(),
+                    idempotency_key: idempotency_key.clone(),
+                    sandbox: *sandbox,
+                    approval: *approval,
+                    reasoning_effort: *reasoning_effort,
+                    permission: *permission,
+                    output_style: output_style.clone(),
+                    model: model.clone(),
+                    effort: effort.clone(),
+                })?;
+                let client = connect_runtime(cli).await?;
+                runtime_cli::handle_session_run(&client, plan, pretty).await
+            }
+            SessionOp::Continue {
+                conversation_id,
+                prompt,
+                idempotency_key,
+            } => {
+                let plan = runtime_cli::SessionContinuePlan::new(
+                    conversation_id.clone(),
+                    prompt.clone(),
+                    idempotency_key.clone(),
+                )?;
+                let client = connect_runtime(cli).await?;
+                runtime_cli::handle_session_continue(&client, plan, pretty).await
+            }
+        },
+        Cmd::History { op } => match op {
+            HistoryOp::List {
+                agent,
+                cwd_filter,
+                limit,
+            } => {
+                let client = connect_runtime(cli).await?;
+                runtime_cli::handle_history_list(
+                    &client,
+                    *agent,
+                    cwd_filter.as_deref(),
+                    *limit,
+                    pretty,
+                )
+                .await
+            }
+            HistoryOp::Read { conversation_id } => {
+                runtime_cli::validate_conversation_id(conversation_id)?;
+                let client = connect_runtime(cli).await?;
+                runtime_cli::handle_history_read(&client, conversation_id.clone(), pretty).await
+            }
+            HistoryOp::Archive {
+                conversation_id,
+                expected_entry_revision,
+                idempotency_key,
+            } => {
+                let plan = runtime_cli::MetadataPlan::archived(
+                    conversation_id.clone(),
+                    true,
+                    *expected_entry_revision,
+                    idempotency_key.clone(),
+                )?;
+                let client = connect_runtime(cli).await?;
+                runtime_cli::handle_metadata(&client, plan, pretty).await
+            }
+            HistoryOp::Unarchive {
+                conversation_id,
+                expected_entry_revision,
+                idempotency_key,
+            } => {
+                let plan = runtime_cli::MetadataPlan::archived(
+                    conversation_id.clone(),
+                    false,
+                    *expected_entry_revision,
+                    idempotency_key.clone(),
+                )?;
+                let client = connect_runtime(cli).await?;
+                runtime_cli::handle_metadata(&client, plan, pretty).await
+            }
+            HistoryOp::Rename {
+                conversation_id,
+                title,
+                expected_entry_revision,
+                idempotency_key,
+            } => {
+                let plan = runtime_cli::MetadataPlan::rename(
+                    conversation_id.clone(),
+                    title.clone(),
+                    *expected_entry_revision,
+                    idempotency_key.clone(),
+                )?;
+                let client = connect_runtime(cli).await?;
+                runtime_cli::handle_metadata(&client, plan, pretty).await
+            }
+        },
+        #[cfg(debug_assertions)]
+        Cmd::RuntimeSmokeForTest { op } => match op {
+            RuntimeSmokeOp::Installation => {
+                let client = connect_runtime_smoke(cli).await?;
+                runtime_cli::handle_smoke_installation(&client, pretty);
+                Ok(())
+            }
+            RuntimeSmokeOp::SendPrompt {
+                conversation_id,
+                idempotency_key,
+                expected_configuration_revision,
+                prompt,
+            } => {
+                runtime_cli::validate_conversation_id(conversation_id)?;
+                let client = connect_runtime_smoke(cli).await?;
+                runtime_cli::handle_smoke_send_prompt(
+                    &client,
+                    conversation_id.clone(),
+                    idempotency_key.clone(),
+                    *expected_configuration_revision,
+                    prompt.clone(),
+                    pretty,
+                )
+                .await
+            }
+            RuntimeSmokeOp::QueryReceipt {
+                conversation_id,
+                command_id,
+                idempotency_key,
+            } => {
+                runtime_cli::validate_conversation_id(conversation_id)?;
+                let selector = runtime_cli::SmokeReceiptSelector::new(
+                    command_id.clone(),
+                    idempotency_key.clone(),
+                )?;
+                let client = connect_runtime_smoke(cli).await?;
+                runtime_cli::handle_smoke_query_receipt(
+                    &client,
+                    conversation_id.clone(),
+                    selector,
+                    pretty,
+                )
+                .await
+            }
+            RuntimeSmokeOp::Subscribe { conversation_id } => {
+                runtime_cli::validate_conversation_id(conversation_id)?;
+                let client = connect_runtime_smoke(cli).await?;
+                runtime_cli::handle_smoke_subscribe(&client, conversation_id.clone(), pretty).await
+            }
+        },
+        Cmd::Remote { .. } => unreachable!("remote dispatch exits before Runtime dispatch"),
     }
 }
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
-    let pretty = cli.pretty;
-    let profile = cli.profile.clone();
-    let data_dir = cli.data_dir.clone();
-
-    // Remote commands have their own (non-CliError) exit contract — dispatch and
-    // exit here rather than folding into the `Result<(), CliError>` path below.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
+            print!("{error}");
+            return;
+        }
+        Err(error) => {
+            let error = CliError::Usage(error.to_string());
+            eprintln!("agentdeck: {}", error.message());
+            println!("{}", render(&output::error_envelope(&error), false));
+            std::process::exit(error.exit_code());
+        }
+    };
     if let Cmd::Remote { op } = &cli.command {
         let arg = match op {
             RemoteOp::Synthetic { bundle } => remote::RemoteOpArg::Synthetic {
@@ -381,71 +542,16 @@ async fn main() {
             | RemoteOp::Deny { .. }
             | RemoteOp::Ping { .. } => remote::RemoteOpArg::PersistentUnsupported,
         };
-        let code = remote::run(arg, &profile, data_dir.as_deref()).await;
+        let code = remote::run(arg, &cli.profile, cli.data_dir.as_deref()).await;
         if code == std::process::ExitCode::SUCCESS {
             return;
         }
         std::process::exit(1);
     }
 
-    let result: Result<(), CliError> = match &cli.command {
-        Cmd::Session { op } => match op {
-            SessionOp::Run {
-                agent,
-                cwd,
-                prompt,
-                sandbox,
-                approval,
-                persist_approval,
-                reasoning_effort,
-                permission,
-                output_style,
-                model,
-                effort,
-                worktree,
-                session_name,
-            } => {
-                let args = SessionRunArgs {
-                    agent: *agent,
-                    cwd: cwd.clone(),
-                    prompt: prompt.clone(),
-                    sandbox: *sandbox,
-                    approval: *approval,
-                    persist_approval: *persist_approval,
-                    reasoning_effort: *reasoning_effort,
-                    permission: *permission,
-                    output_style: output_style.clone(),
-                    model: model.clone(),
-                    effort: effort.clone(),
-                    worktree: worktree.clone(),
-                    session_name: session_name.clone(),
-                };
-                commands::handle_session_run(args, &profile, data_dir.as_deref(), pretty).await
-            }
-            SessionOp::Continue {
-                thread_id,
-                agent,
-                cwd,
-                prompt,
-            } => {
-                commands::handle_session_continue(
-                    thread_id.clone(),
-                    *agent,
-                    cwd.clone(),
-                    prompt.clone(),
-                    &profile,
-                    data_dir.as_deref(),
-                    pretty,
-                )
-                .await
-            }
-        },
-        _ => run_sync(&cli),
-    };
-
-    if let Err(err) = result {
-        eprintln!("agentdeck: {}", err.message());
-        println!("{}", render(&output::error_envelope(&err), pretty));
-        std::process::exit(err.exit_code());
+    if let Err(error) = run_non_remote(&cli).await {
+        eprintln!("agentdeck: {}", error.message());
+        println!("{}", render(&output::error_envelope(&error), cli.pretty));
+        std::process::exit(error.exit_code());
     }
 }

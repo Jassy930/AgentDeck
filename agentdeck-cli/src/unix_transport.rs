@@ -189,6 +189,7 @@ pub struct RuntimeReplySequence {
     _registration: PendingRegistration,
     shared: Arc<SharedConnection>,
     mode: ReplyMode,
+    deadline: tokio::time::Instant,
     terminal_seen: bool,
     #[cfg(test)]
     drop_before_draining: Option<DropBeforeDrainingHook>,
@@ -204,8 +205,8 @@ impl RuntimeReplySequence {
         if self.terminal_seen {
             return Ok(None);
         }
-        match self.receiver.recv().await {
-            Some(queued) => {
+        match tokio::time::timeout_at(self.deadline, self.receiver.recv()).await {
+            Ok(Some(queued)) => {
                 self.terminal_seen = self.mode == ReplyMode::Unary
                     || matches!(
                             &queued.item,
@@ -214,12 +215,22 @@ impl RuntimeReplySequence {
                     );
                 Ok(Some(queued.item))
             }
-            None => Err(UnixClientError::Connection(self.shared.fault().unwrap_or(
+            Ok(None) => Err(UnixClientError::Connection(self.shared.fault().unwrap_or(
                 ClientFault {
                     code: "daemon.client.connection_closed",
                     message: "local Runtime connection closed before terminal reply".to_owned(),
                 },
             ))),
+            Err(_) => {
+                set_fault(
+                    &self.shared,
+                    ClientFault {
+                        code: "daemon.client.reply_timeout",
+                        message: "correlated Runtime reply sequence timed out".to_owned(),
+                    },
+                );
+                Err(UnixClientError::ReplyTimeout)
+            }
         }
     }
 }
@@ -438,26 +449,18 @@ impl RuntimeUnixClient {
                 message: "Subscribe/Backfill must use the reply-sequence API".to_owned(),
             });
         }
-        let mut sequence = self.begin_with_message_id(request, message_id).await?;
-        match tokio::time::timeout(timeout, sequence.next()).await {
-            Ok(Ok(Some(item))) => Ok(item),
-            Ok(Ok(None)) => Err(UnixClientError::Connection(self.fault().unwrap_or(
+        let mut sequence = self
+            .begin_with_message_id(request, message_id, timeout)
+            .await?;
+        match sequence.next().await {
+            Ok(Some(item)) => Ok(item),
+            Ok(None) => Err(UnixClientError::Connection(self.fault().unwrap_or(
                 ClientFault {
                     code: "daemon.client.connection_closed",
                     message: "local Runtime connection closed before reply".to_owned(),
                 },
             ))),
-            Ok(Err(error)) => Err(error),
-            Err(_) => {
-                set_fault(
-                    &self.shared,
-                    ClientFault {
-                        code: "daemon.client.reply_timeout",
-                        message: "correlated Runtime reply timed out".to_owned(),
-                    },
-                );
-                Err(UnixClientError::ReplyTimeout)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -469,6 +472,7 @@ impl RuntimeUnixClient {
         self.begin_with_message_id(
             request,
             MessageId::new(uuid::Uuid::new_v4().hyphenated().to_string()),
+            REPLY_TIMEOUT,
         )
         .await
     }
@@ -477,11 +481,13 @@ impl RuntimeUnixClient {
         &self,
         request: RuntimeRequest,
         message_id: MessageId,
+        timeout: Duration,
     ) -> Result<RuntimeReplySequence, UnixClientError> {
         if let Some(fault) = self.fault() {
             return Err(UnixClientError::Connection(fault));
         }
         let mode = ReplyMode::for_request(&request);
+        let deadline = tokio::time::Instant::now() + timeout;
         let (sender, receiver) = mpsc::channel(SEQUENCE_QUEUE_CAPACITY);
         let mut registration = PendingRegistration::insert(
             Arc::clone(&self.shared.pending),
@@ -528,6 +534,7 @@ impl RuntimeUnixClient {
             _registration: registration,
             shared: Arc::clone(&self.shared),
             mode,
+            deadline,
             terminal_seen: false,
             #[cfg(test)]
             drop_before_draining: None,
@@ -1517,6 +1524,61 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reply_sequence_deadline_is_not_extended_by_nonterminal_frames() {
+        let shared = shared();
+        let message_id = MessageId::new("absolute-sequence-deadline");
+        let (sender, receiver) = mpsc::channel(SEQUENCE_QUEUE_CAPACITY);
+        let mut registration = PendingRegistration::insert(
+            Arc::clone(&shared.pending),
+            message_id.as_str(),
+            PendingReply {
+                mode: ReplyMode::Sync,
+                sender: Some(sender),
+                draining_since_ms: None,
+            },
+            RuntimeUnixClient::REPLY_CAPACITY,
+        )
+        .unwrap();
+        registration.mark_sent();
+        let mut sequence = RuntimeReplySequence {
+            message_id: message_id.clone(),
+            receiver,
+            _registration: registration,
+            shared: Arc::clone(&shared),
+            mode: ReplyMode::Sync,
+            deadline: tokio::time::Instant::now() + Duration::from_millis(100),
+            terminal_seen: false,
+            drop_before_draining: None,
+        };
+
+        ReplyPumpState::new()
+            .dispatch(
+                &shared,
+                message_id,
+                RuntimeReply::Subscription(
+                    agentdeck_protocol::runtime::SubscriptionReceipt::Subscribed {
+                        stream_generation:
+                            agentdeck_protocol::runtime::identity::StreamGeneration::new(
+                                "absolute-deadline-generation",
+                            ),
+                    },
+                ),
+                1,
+            )
+            .unwrap();
+        assert!(matches!(
+            sequence.next().await.unwrap(),
+            Some(ReplySequenceItem::Reply(_))
+        ));
+        tokio::time::sleep(Duration::from_millis(125)).await;
+        assert!(matches!(
+            sequence.next().await,
+            Err(UnixClientError::ReplyTimeout)
+        ));
+        assert_eq!(shared.fault().unwrap().code, "daemon.client.reply_timeout");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sequence_drop_and_terminal_enqueue_are_linearized_under_pending_lock() {
         let shared = shared();
         let message_id = MessageId::new("drop-race");
@@ -1541,6 +1603,7 @@ mod tests {
             _registration: registration,
             shared: Arc::clone(&shared),
             mode: ReplyMode::Unary,
+            deadline: tokio::time::Instant::now() + REPLY_TIMEOUT,
             terminal_seen: false,
             drop_before_draining: Some(Box::new(move |pending| {
                 assert!(pending.try_lock().is_err());
