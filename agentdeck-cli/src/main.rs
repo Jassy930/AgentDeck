@@ -276,7 +276,7 @@ fn run_sync(cli: &Cli) -> Result<(), CliError> {
     match &cli.command {
         // Protocol schema/version introspection is pure local data (the four
         // version axes each expose their own aggregate schema function in
-        // `agentdeck-protocol`) — dispatch happens before any `Client::connect`
+        // `agentdeck-protocol`) — dispatch happens before any legacy stdio connection
         // so these subcommands never spawn or talk to the daemon.
         Cmd::Protocol { op } => match op {
             ProtocolOp::Schema => commands::handle_protocol_schema(pretty),
@@ -286,18 +286,18 @@ fn run_sync(cli: &Cli) -> Result<(), CliError> {
             ProtocolOp::E2eeSchema => commands::handle_protocol_e2ee_schema(pretty),
         },
         Cmd::Ping => {
-            let mut c = client::Client::connect(profile, data_dir)?;
+            let mut c = client::Client::connect_legacy_stdio(profile, data_dir)?;
             commands::handle_ping(&mut c, pretty)
         }
         Cmd::Selfcheck => {
-            let mut c = client::Client::connect(profile, data_dir)?;
+            let mut c = client::Client::connect_legacy_stdio(profile, data_dir)?;
             commands::handle_selfcheck(&mut c, pretty)
         }
         Cmd::Diagnostics { op } => match op {
             DiagOp::Report => commands::handle_diagnostics_report(profile, data_dir, pretty),
         },
         Cmd::Agent { op } => {
-            let mut c = client::Client::connect(profile, data_dir)?;
+            let mut c = client::Client::connect_legacy_stdio(profile, data_dir)?;
             match op {
                 AgentOp::List => commands::handle_agent_list(&mut c, pretty),
                 AgentOp::Capabilities { agent } => {
@@ -306,7 +306,7 @@ fn run_sync(cli: &Cli) -> Result<(), CliError> {
             }
         }
         Cmd::History { op } => {
-            let mut c = client::Client::connect(profile, data_dir)?;
+            let mut c = client::Client::connect_legacy_stdio(profile, data_dir)?;
             let req = match op {
                 HistoryOp::List {
                     agent,

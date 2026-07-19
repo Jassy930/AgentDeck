@@ -19,7 +19,10 @@
 //! envelope under `"response"` within `{"reply":"history","response":{...}}`.
 
 use crate::output::CliError;
-use crate::transport::{AsyncProcessTransport, ProcessTransport, SyncTransport, split_async};
+use crate::transport::{
+    LegacyAsyncStdioProcessTransport, LegacyStdioProcessTransport, SyncTransport,
+    split_legacy_async_stdio,
+};
 use agentdeck_protocol::{
     ActionDecision, AgentKind, ClientCommand, HistoryRequest, HistoryResponse, ServerEvent,
     SessionCapabilities, SessionId, SessionStart, ThreadId, VendorControlPayload,
@@ -59,7 +62,7 @@ fn parse_daemon_line(raw: &str) -> DaemonLine {
 /// field matches `expected_reply`. Skips `ServerEvent` lines encountered
 /// while waiting (they belong to concurrent sessions).
 fn admin_round_trip(
-    transport: &mut ProcessTransport,
+    transport: &mut LegacyStdioProcessTransport,
     cmd: &ClientCommand,
     expected_reply: &str,
 ) -> Result<serde_json::Value, CliError> {
@@ -97,13 +100,13 @@ fn admin_round_trip(
 // ── Sync Client (admin commands: ping/selfcheck/agent-list/capabilities/history) ──
 
 pub struct Client {
-    transport: ProcessTransport,
+    transport: LegacyStdioProcessTransport,
 }
 
 impl Client {
-    /// Spawn the daemon and return a ready client.
-    pub fn connect(profile: &str, data_dir: Option<&str>) -> Result<Self, CliError> {
-        let transport = ProcessTransport::spawn(profile, data_dir)
+    /// 显式选择隔离的 legacy/test stdio compatibility child。
+    pub fn connect_legacy_stdio(profile: &str, data_dir: Option<&str>) -> Result<Self, CliError> {
+        let transport = LegacyStdioProcessTransport::spawn(profile, data_dir)
             .map_err(|e| CliError::Transport(e.to_string()))?;
         Ok(Self { transport })
     }
@@ -185,12 +188,12 @@ impl Client {
 ///
 /// Admin reply lines encountered on the shared stdout are skipped (they
 /// belong to a different logical channel).
-pub async fn stream_session(
+pub async fn stream_session_legacy_stdio(
     cmd: ClientCommand,
     profile: &str,
     data_dir: Option<&str>,
 ) -> Result<mpsc::Receiver<ServerEvent>, CliError> {
-    let mut transport = AsyncProcessTransport::spawn(profile, data_dir)
+    let mut transport = LegacyAsyncStdioProcessTransport::spawn(profile, data_dir)
         .await
         .map_err(|e| CliError::Transport(e.to_string()))?;
 
@@ -201,7 +204,7 @@ pub async fn stream_session(
         .map_err(|e| CliError::Transport(e.to_string()))?;
 
     // Split into writer (keeps child alive) + line receiver channel.
-    let (writer, mut line_rx) = split_async(transport);
+    let (writer, mut line_rx) = split_legacy_async_stdio(transport);
 
     let (tx, rx) = mpsc::channel::<ServerEvent>(64);
 

@@ -1,10 +1,8 @@
-//! CLI-internal synchronous transport over a spawned `agentdeckd` subprocess.
+//! 显式 legacy/test 的 stdio compatibility transport。
 //!
 //! The protocol crate defines an *async* `Transport` trait for remote impls
-//! (v0.5+). For v0.2 the CLI always speaks to a local daemon child process;
-//! we keep a **synchronous** internal trait here to avoid pulling tokio into
-//! the sync read loop in `client.rs`. The async `ProcessTransport` wrapper is
-//! provided for callers that prefer async (session streaming).
+//! (v0.5+). P3.9-A 的 production shared-daemon client 在 `unix_transport.rs`；本文件
+//! 只保留需要明确选择的 IPC v2/stdin compatibility 与 one-shot diagnostics。
 
 use agentdeck_protocol::AuthContext;
 use std::io::{BufRead, BufReader, Write};
@@ -61,12 +59,12 @@ fn is_exec(p: &std::path::Path) -> bool {
 /// 定位 agentdeckd：优先当前可执行文件同目录（同一 target dir），再回退
 /// cwd 相对 dev 路径与常见安装位置（与 Swift DaemonClient.locateDaemon 同策略）。
 pub fn locate_daemon() -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let sib = dir.join("agentdeckd");
-            if is_exec(&sib) {
-                return Some(sib);
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let sib = dir.join("agentdeckd");
+        if is_exec(&sib) {
+            return Some(sib);
         }
     }
     for c in [
@@ -131,18 +129,18 @@ fn configure_async_stdio_daemon(command: &mut TokioCommand) {
     command.env_remove("AGENTDECK_PROFILE");
 }
 
-// ── Synchronous ProcessTransport (blocking I/O, used for admin commands) ─────
+// ── Explicit legacy synchronous stdio compatibility ───────────────────────────
 
 /// 过渡传输：spawn 隔离、无远程能力的 dev agentdeckd，走 stdin/stdout JSONL。
 /// `profile` / `data_dir` 仅为兼容旧调用签名保留，不会进入 stable namespace。
 /// A1：Drop 时杀子进程，daemon 自身 Drop 级联杀 codex 进程组。
-pub struct ProcessTransport {
+pub struct LegacyStdioProcessTransport {
     child: Child,
     reader: BufReader<ChildStdout>,
     stdin: ChildStdin,
 }
 
-impl ProcessTransport {
+impl LegacyStdioProcessTransport {
     pub fn spawn(_profile: &str, _data_dir: Option<&str>) -> std::io::Result<Self> {
         let path = locate_daemon().ok_or_else(|| {
             std::io::Error::new(
@@ -164,7 +162,7 @@ impl ProcessTransport {
     }
 }
 
-impl SyncTransport for ProcessTransport {
+impl SyncTransport for LegacyStdioProcessTransport {
     fn send_line(&mut self, line: &str) -> std::io::Result<()> {
         self.stdin.write_all(line.as_bytes())?;
         self.stdin.write_all(b"\n")?;
@@ -186,7 +184,7 @@ impl SyncTransport for ProcessTransport {
     }
 }
 
-impl Drop for ProcessTransport {
+impl Drop for LegacyStdioProcessTransport {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -201,19 +199,19 @@ impl Drop for ProcessTransport {
 ///
 /// Call `into_parts()` to split into a writer (keeps child alive) and
 /// a line receiver channel.
-pub struct AsyncProcessTransport {
-    inner: Option<AsyncTransportInner>,
+pub struct LegacyAsyncStdioProcessTransport {
+    inner: Option<LegacyAsyncTransportInner>,
     line_rx: Option<mpsc::Receiver<String>>,
 }
 
-struct AsyncTransportInner {
+struct LegacyAsyncTransportInner {
     child: tokio::process::Child,
     writer: tokio::process::ChildStdin,
     reader_task: tokio::task::JoinHandle<()>,
     auth: AuthContext,
 }
 
-impl AsyncProcessTransport {
+impl LegacyAsyncStdioProcessTransport {
     pub async fn spawn(_profile: &str, _data_dir: Option<&str>) -> std::io::Result<Self> {
         let path = locate_daemon().ok_or_else(|| {
             std::io::Error::new(
@@ -235,16 +233,14 @@ impl AsyncProcessTransport {
             let mut reader = TokioBufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
                 let t = line.trim().to_string();
-                if !t.is_empty() {
-                    if tx.send(t).await.is_err() {
-                        break;
-                    }
+                if !t.is_empty() && tx.send(t).await.is_err() {
+                    break;
                 }
             }
         });
 
         Ok(Self {
-            inner: Some(AsyncTransportInner {
+            inner: Some(LegacyAsyncTransportInner {
                 child,
                 writer,
                 reader_task,
@@ -262,11 +258,11 @@ impl AsyncProcessTransport {
     }
 
     /// Split into (writer-half that keeps child alive, line receiver channel).
-    pub fn into_parts(mut self) -> (AsyncTransportWriter, mpsc::Receiver<String>) {
+    pub fn into_parts(mut self) -> (LegacyAsyncTransportWriter, mpsc::Receiver<String>) {
         let inner = self.inner.take().expect("only call into_parts once");
         let rx = self.line_rx.take().expect("only call into_parts once");
         (
-            AsyncTransportWriter {
+            LegacyAsyncTransportWriter {
                 child: inner.child,
                 _writer: inner.writer,
                 reader_task: inner.reader_task,
@@ -278,13 +274,13 @@ impl AsyncProcessTransport {
 }
 
 /// Split the async transport into (writer half, line receiver channel).
-pub fn split_async(
-    transport: AsyncProcessTransport,
-) -> (AsyncTransportWriter, mpsc::Receiver<String>) {
+pub fn split_legacy_async_stdio(
+    transport: LegacyAsyncStdioProcessTransport,
+) -> (LegacyAsyncTransportWriter, mpsc::Receiver<String>) {
     transport.into_parts()
 }
 
-impl Drop for AsyncProcessTransport {
+impl Drop for LegacyAsyncStdioProcessTransport {
     fn drop(&mut self) {
         if let Some(ref mut inner) = self.inner {
             inner.reader_task.abort();
@@ -293,9 +289,9 @@ impl Drop for AsyncProcessTransport {
     }
 }
 
-/// Writer half after splitting an `AsyncProcessTransport`.
+/// Writer half after splitting an explicit legacy async stdio transport.
 /// Keeps the daemon child alive until dropped.
-pub struct AsyncTransportWriter {
+pub struct LegacyAsyncTransportWriter {
     child: tokio::process::Child,
     /// Stdin kept open so daemon doesn't get EOF until we drop.
     _writer: tokio::process::ChildStdin,
@@ -304,14 +300,14 @@ pub struct AsyncTransportWriter {
     auth: AuthContext,
 }
 
-impl AsyncTransportWriter {
+impl LegacyAsyncTransportWriter {
     #[allow(dead_code)]
     pub fn auth_context(&self) -> &AuthContext {
         &self.auth
     }
 }
 
-impl Drop for AsyncTransportWriter {
+impl Drop for LegacyAsyncTransportWriter {
     fn drop(&mut self) {
         self.reader_task.abort();
         let _ = self.child.start_kill();

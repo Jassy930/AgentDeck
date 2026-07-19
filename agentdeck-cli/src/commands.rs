@@ -60,7 +60,7 @@ pub fn handle_diagnostics_report(
 // (IPC/Runtime/Relay v2/E2EE) owns an aggregate schema function in
 // `agentdeck-protocol` that these handlers call directly. None of them touch
 // `Client`/the daemon (see `main.rs::run_sync`, which dispatches `Cmd::Protocol`
-// before any `Client::connect`).
+// before any legacy stdio connection).
 
 /// Print a schema JSON value pretty-printed with a trailing newline — schema
 /// output is always pretty (it's a documentation artifact), independent of
@@ -140,7 +140,7 @@ pub async fn handle_session_run(
         runtime_options: Default::default(),
     };
     let cmd = session_start_cmd(start);
-    let mut events = client::stream_session(cmd, profile, data_dir).await?;
+    let mut events = client::stream_session_legacy_stdio(cmd, profile, data_dir).await?;
     drain_events(&mut events, pretty).await
 }
 
@@ -157,7 +157,7 @@ pub async fn handle_session_continue(
     // so CC `--resume` and tool_use run in the original session's
     // directory rather than the daemon's `std::env::current_dir()`.
     let cmd = session_continue_cmd(thread_id, agent.into(), cwd, prompt);
-    let mut events = client::stream_session(cmd, profile, data_dir).await?;
+    let mut events = client::stream_session_legacy_stdio(cmd, profile, data_dir).await?;
     drain_events(&mut events, pretty).await
 }
 
