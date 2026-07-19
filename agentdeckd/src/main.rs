@@ -20,10 +20,13 @@ use agentdeckd::diag;
 use agentdeckd::local::listener::{BoundLocalListener, LocalListenerError};
 use agentdeckd::local::stdio_compat::{self, StdioCompatError};
 use agentdeckd::record;
+use agentdeckd::remote::bootstrap::{RemoteBootstrapOutcome, reconcile_machine_identity};
 use agentdeckd::runtime::singleton::SingletonGuard;
 use agentdeckd::runtime::store::{RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreHandle};
 use agentdeckd::runtime::{AgentRouter, RuntimeCore};
-use agentdeckd::security::{StorageKek, key_store_for_config, load_or_create_storage_kek};
+use agentdeckd::security::{
+    KeyStore, StorageKek, key_store_for_config, load_or_create_storage_kek,
+};
 
 #[derive(Debug, Default)]
 struct CliArgs {
@@ -461,6 +464,7 @@ async fn wait_for_shutdown_signal(
 fn run_main_loop(
     config: &DaemonConfig,
     singleton: &SingletonGuard,
+    key_store: &dyn KeyStore,
     storage_kek: StorageKek,
 ) -> Result<(), MainLoopFailure> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -474,6 +478,37 @@ fn run_main_loop(
         let store = RuntimeStoreHandle::open(RuntimeStoreConfig::new(runtime_db), storage_kek)
             .await
             .map_err(MainLoopFailure::store)?;
+        let remote_identity =
+            match reconcile_machine_identity(config.remote_enabled(), &store, key_store).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let failure = MainLoopFailure::store(error);
+                    let shutdown = store.shutdown().await;
+                    diag::log(
+                        "daemon_stop",
+                        &format!(
+                            "agentdeckd machine identity bootstrap failed: \
+                         code={} storeShutdown={shutdown:?}",
+                            failure.code
+                        ),
+                    );
+                    return Err(failure);
+                }
+            };
+        match &remote_identity {
+            RemoteBootstrapOutcome::Disabled => {
+                diag::log("remote_identity", "status=disabled");
+            }
+            RemoteBootstrapOutcome::Active(_) => {
+                diag::log("remote_identity", "status=active");
+            }
+            RemoteBootstrapOutcome::Blocked(block) => {
+                diag::log(
+                    "remote_identity",
+                    &format!("status=blocked code={}", block.code()),
+                );
+            }
+        }
         let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
         let (upgrade_exit, mut upgrade_exit_receiver) = tokio::sync::mpsc::unbounded_channel();
         let core =
@@ -527,20 +562,46 @@ fn run_main_loop(
                     // P4 将按值消费该 capability 启动唯一 RemoteTransport；P3.8 先把
                     // stable-only mint 边界接入真实 bootstrap，并保持到 local stop 后。
                     let remote_start_permit = listener.take_remote_start_permit();
+                    let armed_remote = match (remote_identity, remote_start_permit) {
+                        (RemoteBootstrapOutcome::Active(identity), Some(permit)) => {
+                            Some(identity.arm(permit))
+                        }
+                        (RemoteBootstrapOutcome::Active(identity), None) => {
+                            drop(identity);
+                            diag::log(
+                                "remote_identity",
+                                "status=blocked code=daemon.remote.identity.start_permit_missing",
+                            );
+                            None
+                        }
+                        (RemoteBootstrapOutcome::Disabled, _permit) => None,
+                        (RemoteBootstrapOutcome::Blocked(block), _permit) => {
+                            diag::log(
+                                "remote_identity",
+                                &format!("status=blocked code={}", block.code()),
+                            );
+                            None
+                        }
+                    };
                     diag::log(
                         "runtime_local_ready",
                         &format!(
                             "socket={} remotePermit={}",
                             socket.display(),
-                            remote_start_permit.is_some()
+                            armed_remote.is_some()
                         ),
                     );
-                    listener
+                    let serve_result = listener
                         .serve_until(wait_for_shutdown_signal(&mut upgrade_exit_receiver))
                         .await
-                        .map_err(MainLoopFailure::local)
+                        .map_err(MainLoopFailure::local);
+                    // P4.1 明确证明 active key owner 覆盖 RemoteStartPermit 与完整
+                    // local serve 生命周期；P4.2 将在同一 owner 内加入 transport。
+                    drop(armed_remote);
+                    serve_result
                 }
                 LocalIngressMode::StdioCompat => {
+                    drop(remote_identity);
                     let compatibility = stdio_compat::run_after_recovery(
                         config,
                         recovery_ready_permit,
@@ -660,7 +721,7 @@ fn main() -> ExitCode {
         drop(storage_kek);
         run_selfcheck(&config)
     } else {
-        match run_main_loop(&config, &singleton_guard, storage_kek) {
+        match run_main_loop(&config, &singleton_guard, &*key_store, storage_kek) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 print_typed_error(&error.code, &error);

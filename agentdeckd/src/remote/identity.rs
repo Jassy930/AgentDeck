@@ -280,8 +280,7 @@ pub fn load_machine_key_material(
 
 /// 仅供同一模块内 bootstrap 在确认 DB identity row 与 key-directory guard **均不存在**
 /// 后调用。它先验证全部既有 item，再只补 missing account，绝不覆盖已有 material。
-#[allow(dead_code)] // P4.1-C bootstrap 会在同一模块内成为唯一 production caller。
-fn load_or_create_preparing_machine_key_material(
+pub(super) fn load_or_create_preparing_machine_key_material(
     key_store: &dyn KeyStore,
 ) -> Result<MachineKeyMaterial, MachineIdentityError> {
     let _guard = lock_keystore_io()?;
