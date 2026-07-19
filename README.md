@@ -92,7 +92,10 @@ Layer B Vendor 控件命名空间允许 vendor 前缀但类型化（禁 `serde_j
 installation 派生 canonical singleton UDS，且没有 daemon spawn、stdio 或 fallback。P3.9-D 又由
 `b818f81` 把 Rust CLI 默认 dispatcher 与 Swift `main.swift --selfcheck` 切到同一 shared daemon：普通
 `ping/selfcheck/agent/session/history/metadata` 全部使用 canonical Runtime v2，socket 失败 typed 返回且零
-fallback；显式 diagnostics one-shot 与 compatibility stdio 只保留为隔离运维入口。
+fallback；显式 diagnostics one-shot 与 compatibility stdio 只保留为隔离运维入口。P3.9-E 又由
+`d68cc02` 收口 GUI 会话可靠性：prompt admission 明确区分 sending/daemon queued，失败只允许 exact 或
+fresh 显式重试；history 采用 latest-intent drain，stream fault 等待 close barrier 后才允许下一操作换线；
+catalog 与 conversation 共用 64-slot LRU/FIFO admission，composer draft 按 logical owner 隔离并有字节上界。
 
 流式性能边界：Swift 端的 `SessionModel` 按约 30fps 合并待渲染 delta，并把
 message / reasoning / shell / diff 长文本交给 AppKit `NSTextView` +
@@ -204,14 +207,19 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（P3.9-D complete，P3.9-E next）
+## Relay Companion MVP 实施状态（P3.9 complete，P3.10 next）
 
 2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 只承诺缺 KEK 且无法通过当前
 KEK/database/domain 认证的离线篡改 fail-close，同 UID 在线攻击作为 residual risk 不再扩展。P3.1
 采用方案 b：MVP 接受 dev/ephemeral Keychain 路径，provisioned signed roundtrip 移入 post-MVP
-ignored/BLOCKED 槽位，不阻塞 MVP/P3 exit，也不表示 stable production signing 已完成。P4 功能全保留，P5/P6 的物理设备、
-公网与干净 Linux 证据改为 post-MVP BLOCKED 槽位。详见
+ignored/BLOCKED 槽位，不阻塞 MVP/P3 exit，也不表示 stable production signing 已完成。P4 功能全保留；
+P5 MVP 仅以 iOS Simulator 自动 E2E 退出，本机第二客户端归入 P6 synthetic DoD；物理设备、公网与干净
+Linux 证据为 post-MVP BLOCKED 槽位。详见
 [`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`](docs/plans/2026-07-18-relay-companion-mvp-course-correction.md)。
+P3.10 的自动验收使用注入 temp root/launchctl/signature verifier 的 dev/ephemeral harness；production
+constructor 仍从 `getpwuid_r` home 派生稳定路径并拒绝 ad-hoc。provisioned production-signed LaunchAgent
+roundtrip 保持 post-MVP BLOCKED。`StageUpgrade` 只有在 reply 完整 flush ACK 后才能 switch/exit，ACK 前
+disconnect 必须零切换；这些约束尚待 P3.10 实现，不能从 P3.9 的本地 smoke 推导为已完成。
 
 Relay production binary 已原子切换到 **Relay v2**。公开数据面只接受
 `/v2/connect`、`/v2/pair` 与 enrollment 所需的 `POST /v2/machine-enroll`；
@@ -487,7 +495,10 @@ cursor 交接竞态。完整 Swift `435 XCTest + 35 Swift Testing`、iOS Simulat
 均通过，两路独立终审无 P0/P1/P2。P3.9-D 由 `b818f81` 完成 Rust CLI / Swift `--selfcheck` canonical
 cutover、30 秒 reply-sequence absolute deadline、typed usage error 与真实双客户端 smoke；两个稳定且不同的
 installation 在同一 conversation 各自提交/重放并只查询自己的 receipt，共同 backfill 收敛，daemon PID
-保持不变且 endpoint 缺失零 fallback。双路终审无 P0/P1/P2；下一 Task 为 P3.9-E scope/phase 收口。
+保持不变且 endpoint 缺失零 fallback。P3.9-E 的 `d68cc02` 再收口 exact/fresh retry、composer owner/LRU、
+history latest-intent、close barrier、重连有界恢复和 64-slot subscription admission；Swift
+`527 XCTest + 35 Swift Testing`、iOS Simulator `20/20`、真实 local-runtime smoke 与双路终审全绿。
+P3.9 至此完成，下一 Task 为 P3.10；P3 Phase exit 在 P3.10 后执行。
 P4 CounterGuard/RemoteLink 与真实 vendor metadata mutation 仍未完成。
 
 进入 Core 的 principal 是字段私有的认证 capability；同一完整身份共享强 authorization lease，
@@ -662,9 +673,9 @@ C0-B1a/B1b schema freeze 与真实 migration 已由 `e48248a` / `3d0002d` 收口
 B3a admission pin 已完成，后者由 `48594e8` / `09a14b0` 提交并通过 Task 门禁与双路终审；B3b exact
 execution 已由 `c0ed6cd` / `f4141f0` / `fb1629a` 完成，B4 managed metadata 已由
 `5f1ca1c` / `347a0f0` 完成，B5 cross-layer closeout 已由 `aebc8d0` 完成。C0-C 自动实现与跨语言/
-Simulator 门禁已通过；C0-C、P3.9-A/B/C3 与 P3.9-D Task 已完成，D code/test 提交为 `b818f81`。
-普通 GUI、Rust CLI 与 Swift `--selfcheck` 已默认走 OS-account shared-daemon UDS；下一项是 P3.9-E
-scope/phase 收口。P3.10 LaunchAgent 与 P4–P6 仍未完成。P3.1 provisioned signed Keychain
+Simulator 门禁已通过；C0-C、P3.9-A/B/C3/D/E Task 已完成，D/E code/test 提交分别为 `b818f81` / `d68cc02`。
+普通 GUI、Rust CLI 与 Swift `--selfcheck` 已默认走 OS-account shared-daemon UDS；下一项是 P3.10
+LaunchAgent 安装/升级/保留数据卸载。P3.10 与 P4–P6 仍未完成。P3.1 provisioned signed Keychain
 roundtrip 继续是 post-MVP BLOCKED 槽位，不阻塞 MVP/P3 exit；P5/P6 物理设备/公网/Linux 证据也是
 post-MVP，不冒充 PASS。
 具体命令与资源矩阵见 [docs/QUALITY.md](docs/QUALITY.md)。

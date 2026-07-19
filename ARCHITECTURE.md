@@ -481,6 +481,20 @@ conversation/key，不能伪造身份连续性。
   `agentdeckd --ephemeral --no-remote`，从 private `TMPDIR` 发现并校验唯一 `ad-*/s`，不向 daemon 注入
   socket path；关闭任一客户端后 daemon PID 不变，endpoint 缺失零 fallback。active turn 不因 sibling client
   关闭由既有 listener/RuntimeCore 测试提供同一不变量的确定性组合证据，不再要求 hold-open fake vendor。
+- P3.9-E 由 `d68cc02` 固定 App 端交互可靠性。Start/Configure/Prompt 只有在 allowlist 明确证明 durable
+  outcome 已知的 definitive reject 时，才按失败 stage 使用 fresh key；transport/closed/unknown/
+  `daemon.runtime.store_unavailable` 保守 exact replay。history open
+  是 latest-intent 单 drain；stream fault 先完成共享 wire close barrier，stale generation 在 wire/inbound
+  两侧都不能发布。重连只恢复 catalog、selected 与 required conversation；catalog + conversation 共用
+  64-slot LRU，Unsubscribe 必须收到 exact ACK 后才移除本地账，“腾槽→Subscribe→记账”由 FIFO admission
+  串行。composer draft 绑定 logical owner，最多 32 owners、单 draft 256 KiB、总计 1 MiB，不能跨新意图
+  复用或无界保留。
+- P3.10 的 `StageUpgrade` 边界已冻结但尚未实现：Runtime/Core 成功只产生 deferred action；local writer
+  必须完成整条 reply write 并取得 flush ACK 后，才能原子切换 `bin/current` 或触发 daemon 优雅退出。
+  ACK 前的 encode/write/flush/cancel/disconnect 任一失败都必须丢弃 action并保持 symlink/PID 不变；ACK
+  已授予许可后，随后 client close 不得撤销已提交动作。自动 MVP 证据使用
+  dev/ephemeral 隔离 harness 与注入 verifier；provisioned production-signed LaunchAgent roundtrip 是
+  post-MVP BLOCKED，不得由 injected/ad-hoc 证据替代。
 - 已有 ignored、唯一 service/account、RAII 清理的真实 Keychain roundtrip，但 P3.1 的签名
   门禁尚未通过：当前机器无匹配 provisioning profile；Apple Development 与本地
   self-signed helper 虽通过 `codesign --verify`，均被 AMFI 以 exit 137 拒绝启动。因此本节
@@ -682,7 +696,8 @@ conversation/key，不能伪造身份连续性。
   Swift current codec 非跳过读回后删除。A2 的共享 mirror/current API 当时不等于 App/UDS client cutover；
   P3.8 已完成 accepted-stream actor 与 recovery 后 production secure bind/bootstrap，普通 GUI 后续由
   P3.9-C3 切到 shared-daemon UDS，Rust CLI 与 Swift `main.swift --selfcheck` 又由 P3.9-D 切换并完成真实
-  双客户端 smoke。本节自身仍不是远程端到端可用声明。
+  双客户端 smoke；P3.9-E 随后固定 GUI retry/reconnect/history/subscription/composer 的有界状态机。本节
+  自身仍不是远程端到端可用声明。
 
 ### Relay Companion MVP P3.4 RuntimeCore 不变量
 
@@ -876,7 +891,7 @@ conversation/key，不能伪造身份连续性。
   seal、MachineDataSign、Keychain CounterGuard 或 Relay Publish；这些仍属于 P4，不能从本节推出
   远程 Companion 已接通。
 - P3.6 仍是 transport-neutral component layer。`TransferStateMachine` 与 publication dispatcher
-  尚无 production remote owner；普通 GUI 已经通过 P3.9-C3、Rust CLI 与 Swift `main.swift --selfcheck`
+  尚无 production remote owner；普通 GUI 已经通过 P3.9-C3/E、Rust CLI 与 Swift `main.swift --selfcheck`
   已经通过 P3.9-D shared-daemon client 连接该 Core。P3.1
   provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate；
   Simulator fixture、fake publication 与本地 store tests 都不是 P4/P5/P6 证据。

@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P3.9-C0-C、P3.9-A/B/C3/D 已完成并通过各自 Task 门禁与双路终审，Rust CLI canonical 命令、Swift `--selfcheck` 与真实双客户端组合证据由 `b818f81` 收口，下一项为 P3.9-E scope/phase closeout；production native metadata 与 P3.1 签名 Keychain 均为 post-MVP gated/BLOCKED 且不阻塞自动主线（2026-07-19） |
+| 状态 | Approved target；P3.9-C0-C、P3.9-A/B/C3/D/E 已完成并通过各自 Task 门禁与双路终审，Rust CLI canonical 命令、Swift `--selfcheck` 与真实双客户端组合证据由 `b818f81` 收口，App 会话可靠性由 `d68cc02` 收口，下一项为 P3.10；production native metadata 与 P3.1 签名 Keychain 均为 post-MVP gated/BLOCKED 且不阻塞自动主线（2026-07-19） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -211,7 +211,9 @@ flowchart LR
 
 安装与升级固定为：
 
-1. macOS App bundle 携带经过同一发布签名的 daemon helper，并通过 `agentdeck-cli daemon install`（或等价 App 安装入口）复制到 `~/Library/Application Support/AgentDeck/bin/<version>/agentdeckd`。
+1. macOS App bundle 携带经过同一发布签名的 CLI 与 daemon helper；production CLI 固定从自身
+   `AgentDeck.app/Contents/Helpers/agentdeck` 位置取得同目录 sibling `agentdeckd`，不接受任意 helper path，
+   再复制到 `~/Library/Application Support/AgentDeck/bin/<version>/agentdeckd`。
 2. 安装器完整校验签名/版本后原子更新 `bin/current`，生成 `~/Library/LaunchAgents/com.agentdeck.agentdeckd.plist`，再对当前 GUI user 执行 `launchctl bootstrap/kickstart`。
 3. active turn 存在时只 stage 新版本；daemon 空闲或下一次明确重启才切换。local-only typed
    `StageUpgrade` request/reply 已在 P3.9-C0-A 的 Runtime v2 contract 冻结，P3.10 只补执行语义；remote
@@ -1504,8 +1506,11 @@ Relay 外层错误只描述通用路由/传输失败；daemon 业务错误必须
 - macOS App/CLI 切到同一 daemon；保留能力降级的 local IPC v2/stdin compatibility adapter 给旧测试。
 
 退出门禁：两个本地 Runtime v2 客户端共享一个真实会话且 configuration/prompt/approval 竞态符合本文；
-同时在干净用户环境验证 install + `launchctl print`、active-turn stage/idle switch、protocol mismatch、
-uninstall 保留数据，以及 `--ephemeral --no-remote` 无法读取 stable DB/Keychain/socket。P3 的
+自动 MVP 层使用真实 temp 安装事务、fake launchctl/signature verifier、真实 ephemeral Runtime
+UDS/reply-flush/idle，并由 harness 按 `bin/current` 手动重启，验证 active-turn stage/idle switch、protocol
+mismatch、uninstall 保留数据，以及 `--ephemeral --no-remote` 无法读取 stable DB/Keychain/socket。
+干净用户环境的真实 install + `launchctl print`、stable PID/UDS、跨版本 Keychain 与 production-signed helper
+readback 属 post-MVP BLOCKED 槽位，不阻塞 P3 自动 exit，也不能由 injected harness 冒充。P3 的
 `uninstall --purge` 只验证 typed `daemon.purge.remote_not_ready` 且零删除；完整 trust-reset/purge 门禁留到
 P4 RemoteTransport 存在后执行。
 
@@ -1528,13 +1533,14 @@ post-MVP BLOCKED 槽位；provisioned signed Keychain 已按方案 b 保留为 P
 - `AgentDeckSessionSource` facade、`AgentDeckRelayClient`、iOS/远程 macOS RelaySessionSource、AppKit SessionSourceRegistry、Keychain、扫码/粘贴。
 - typed UI state/receipt、single subscription、前后台 resume。
 
-退出门禁：Simulator 自动 E2E + 本机第二客户端通过同一 shared client 完成
-list/open/prompt/approval/reconnect，本机 macOS 仍走 UDS。物理 iPhone 与第二台 macOS 的真链路脚本和
-BLOCKED 语义保留为 post-MVP 证据槽位，不再阻塞 MVP 退出。
+退出门禁：只要求 iOS Simulator 自动 E2E 通过同一 shared client 完成
+list/open/prompt/approval/reconnect。物理 iPhone 与第二台 macOS 的真链路脚本和 BLOCKED 语义保留为
+post-MVP 证据槽位，不再阻塞 MVP 退出；本机第二客户端迁入 P6 synthetic DoD。
 
 ### P6 Cross-device hardening
 
 - 本地 macOS App + 远程 macOS + iPhone + remote CLI 四端竞态。
+- 本机第二客户端以独立 installation/key/grant 进入 synthetic DoD，并证明本机 App 仍走 UDS。
 - Relay/daemon/device 故障注入、撤销、慢读者、gap/snapshot。
 - 文档、diagnostics、systemd/runbook 和验证证据收口。
 

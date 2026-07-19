@@ -61,6 +61,9 @@ profile，self-signed helper 被 AMFI exit 137 终止），**代码不可解**�
   不宣称 stable production signing 已完成。
 - provisioned signed Keychain set/load/delete roundtrip 移入 post-MVP，继续以
   ignored/BLOCKED 证据槽位保留，但不再阻塞 P3/P4 phase exit 或 MVP 完成。
+- 同一分层适用于 P3.10：自动 MVP 门禁使用 dev/ephemeral 隔离 harness 与注入的 launchctl/signature
+  verifier；production constructor 和签名校验不降级，但 provisioned production-signed LaunchAgent
+  roundtrip 保留为 post-MVP BLOCKED，不用 ad-hoc/injected 证据冒充 production PASS。
 - 若 post-MVP 需要解锁该槽位，再在 Apple Developer 为 daemon helper 配置含
   `keychain-access-groups` entitlement 的 provisioning profile 并提供 Team ID；在此之前不再花执行时间
   尝试绕过 AMFI。
@@ -70,10 +73,10 @@ profile，self-signed helper 被 AMFI exit 137 终止），**代码不可解**�
 - **P4 全保留**：machine identity、pairing、RemoteLink、远程 CLI 与 Codex/CC
   canonical adapter 穿透能力全部实现；MVP 以合成链路验证，真实 vendor login
   evidence 按 P6 规则进入 post-MVP 槽位。这是 MVP 的核心价值，不删功能或 harness。
-- **P5 收敛**：MVP 验收 = iOS Simulator 自动 E2E + 本机第二客户端；
+- **P5 收敛**：MVP 验收只包含 iOS Simulator 自动 E2E；本机第二客户端迁入 P6 synthetic DoD。
   物理 iPhone 与第二台 Mac 的 gated E2E 移为 post-MVP 项，保留脚本与
   BLOCKED 语义，不作为 MVP 完成条件。
-- **P6 收敛**：DoD 十三项中，合成链路可自动化项保留为 MVP 门禁；
+- **P6 收敛**：本机第二客户端与 DoD 十三项中的合成链路可自动化项保留为 MVP 门禁；
   真实双 vendor login + 物理设备矩阵 + 公网 systemd host 移为 post-MVP
   证据槽位（verifier 保留槽位输出 BLOCKED，不生成伪 summary）。
 
@@ -81,13 +84,16 @@ profile，self-signed helper 被 AMFI exit 137 终止），**代码不可解**�
 
 1. **已完成**：B3 最后一笔由 `974f9b1` 提交；本决策已同步到原计划 Global Constraints/B3a
    刹车线与 ARCHITECTURE/QUALITY，B3a2-B 收口。
-2. **1 天**：B3a2-C（quota 纯函数）+ B3a3（Core/actor 传递 expected
+2. **已完成**：B3a2-C（quota 纯函数）+ B3a3（Core/actor 传递 expected
    revision、两个稳定 failure code、docs 同步），B3a Task 级终审一次。
-3. **2–3 天**：B3b exact execution → B4 metadata → B5 cross-layer
+3. **已完成**：B3b exact execution → B4 metadata → B5 cross-layer
    closeout，按新刹车线执行。
-4. **2–3 天**：C0-C native history projection、P3.9-A/B/C3/D/E
-   App/CLI cutover。
-5. **P4 开始前**：按决策 4 重估 P4–P6 剩余步骤，更新计划勾选清单。
+4. **已完成（2026-07-19）**：C0-C native history projection、P3.9-A/B/C3/D/E
+   App/CLI cutover与会话可靠性收口。
+5. **已完成（2026-07-19）**：按决策 4 重估 P4–P6 剩余步骤并更新计划清单；P5 仅保留 Simulator
+   MVP 门禁，本机第二客户端迁入 P6 synthetic DoD。
+6. **下一项**：P3.10 LaunchAgent install/upgrade/uninstall；自动 dev/ephemeral 门禁完成后执行 P3 Phase exit，
+   provisioned production-signed roundtrip 保持 post-MVP BLOCKED。
 
 ## 不变项
 

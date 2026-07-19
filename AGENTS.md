@@ -10,7 +10,7 @@
 4. `docs/index.md`：文档记录系统导航。
 5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code（含 CC adapter failure codes）。
 6. `docs/QUALITY.md`：验证命令、质量门禁和文档结构检查（含 v0.2 手动 QA 清单）。
-7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以 `docs/plans/2026-07-10-relay-companion-mvp-design.md`、`docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 和上位增量 `docs/plans/2026-07-18-relay-companion-mvp-course-correction.md` 为事实源。Relay 主线恢复 Task 粒度门禁；P3.9-C0-B3a/B3b/B4/B5/C0-C、P3.9-A/B/C3/D 已完成 Task 门禁和独立 `spec/security`、`quality` 终审。D code/test 由 `b818f81` 收口：普通 GUI、Rust CLI 与 Swift `main.swift --selfcheck` 均默认使用 OS-account shared-daemon UDS 且无 spawn/fallback；真实双客户端 smoke、owner-scoped receipt、active-turn 组合证据及完整 Rust/Swift/iOS 门禁通过。下一项是 P3.9-E scope/phase 收口。同 UID 在线攻击作为 residual risk 不再扩展；P3.1 provisioned signed Keychain 按方案 b 保留 post-MVP ignored/BLOCKED，但不阻塞主线。P4 功能全保留；P5/P6 的物理设备、公网与干净 Linux 证据为 post-MVP BLOCKED 槽位，不得冒充 PASS。
+7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以 `docs/plans/2026-07-10-relay-companion-mvp-design.md`、`docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 和上位增量 `docs/plans/2026-07-18-relay-companion-mvp-course-correction.md` 为事实源。Relay 主线恢复 Task 粒度门禁；P3.9-C0-B3a/B3b/B4/B5/C0-C、P3.9-A/B/C3/D/E 已完成 Task 门禁和独立 `spec/security`、`quality` 终审。D code/test `b818f81` 完成普通 GUI、Rust CLI 与 Swift `main.swift --selfcheck` 的 OS-account shared-daemon UDS cutover；E code/test `d68cc02` 收口 exact/fresh retry、composer owner/LRU、history latest-intent、close barrier、有界 reconnect 与 64-slot subscription admission。下一项是 P3.10，P3 Phase exit 在其后执行。同 UID 在线攻击作为 residual risk 不再扩展；P3.1 provisioned signed Keychain 按方案 b 保留 post-MVP ignored/BLOCKED，但不阻塞主线。P4 功能全保留；P5 MVP 仅 iOS Simulator 自动 E2E，本机第二客户端归 P6 synthetic DoD；物理设备、公网与干净 Linux 证据为 post-MVP BLOCKED 槽位，不得冒充 PASS。
 8. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
 
 ## 项目边界
@@ -393,6 +393,32 @@ canonical `session run` 顺序固定为
 中间帧不续期。Rust/Swift 两个 installation 的 receipt 保持 owner-scoped；真实 smoke 必须证明各自查询与
 exact replay、cross-owner 拒绝、共同 Backfill、唯一 daemon PID、close-only 和 endpoint 缺失零 fallback。
 active-turn sibling-close 复用 listener/RuntimeCore 自动证据，不新增 synthetic execution coordinator。
+
+### Relay Companion MVP P3.9-E（App 会话可靠性收口）
+
+```bash
+swift test
+swift build -Xswiftc -warnings-as-errors
+cd ios && xcodegen generate && \
+  xcodebuild -project AgentDeckMobile.xcodeproj -scheme AgentDeckMobile \
+    -destination 'platform=iOS Simulator,name=iPhone 17' test
+cd ..
+bash scripts/run-local-runtime-smoke.sh
+bash scripts/check-daemon-network-boundary.sh
+scripts/verify-agent-docs.sh
+git diff --check
+```
+
+P3.9-E 的 retry 分类必须保守：只有 allowlist 明确证明 durable outcome 已知的 definitive reject 可以按失败
+stage fresh；transport/closed/unknown 与 `daemon.runtime.store_unavailable` 复用 exact input。catalog +
+conversation 共用 64 slots，Unsubscribe ACK
+后才改账，Start/History 的腾槽与 Subscribe 也必须经过同一 FIFO admission。stream fault 先完成 close
+barrier，下一次用户操作才建新 wire；重连不恢复全部历史 conversation。composer draft 按 logical owner
+隔离并受 32-owner、单 draft 256 KiB、总 1 MiB LRU 上界约束。4 个 legacy Swift 文件只要求相对 frozen
+baseline 不新增 strict diagnostics；本 Task 实际诊断总数均下降，不能把全文件既有格式债务伪报为 clean。
+下一 Task P3.10 必须新增 durable machine-wide admin ledger，并在 exact StageUpgrade reply flush ACK 后才允许
+switch/exit；默认自动门禁仅用隔离 dev/ephemeral + injected verifier，provisioned production-signed roundtrip
+保持 post-MVP BLOCKED，不能写成 PASS。
 
 ### Relay Companion MVP P3.9-C0-B3a（configuration pin / prompt admission）
 

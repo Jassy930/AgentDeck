@@ -1889,6 +1889,80 @@ cross-owner commandId 查询拒绝、共同 Backfill 收敛、daemon PID 不变�
 通过，无并行重负载的完整 daemon package 随后最终 exit 0，只有后者计为 Task PASS。P3.1 provisioned signed
 Keychain 继续是 post-MVP ignored/BLOCKED；真实 vendor login 不在 D 的 synthetic transport 证据内。
 
+### P3.9-E App retry/reconnect/subscription Task 门禁
+
+P3.9-E 由 `d68cc02` 完成。门禁覆盖 Start/Configure/Prompt 的 exact/fresh retry 分类、logical composer
+owner 与有界 draft LRU、history latest-intent 单 drain、stream close barrier、重连有界恢复，以及 catalog +
+conversation 共用 64-slot LRU/FIFO admission。真实 AF_UNIX EOF 用两个独立 peer 证明旧 wire 收到 EOF 后
+不会热重连，下一次用户操作才使用新 wire。
+
+```bash
+swift test --filter AppRuntimeCoordinatorTests
+swift test --filter ComposerInteractionTests
+swift test --filter LocalRuntimeWireSessionTests
+swift test --filter SessionModelRuntimeReliabilityTests
+swift test --filter SessionViewControllerSmokeTests
+swift test --filter ThreadRuntimeModelCanonicalTests
+swift test --filter EndToEndWindowAssemblyTests
+swift test --filter NewSessionDialogEncodingTests
+swift test --filter PreviewBootstrapTests
+swift test --filter WorkbenchRuntimeV2Tests
+swift test
+swift build
+swift build -Xswiftc -warnings-as-errors
+cd ios && xcodegen generate && \
+  xcodebuild -project AgentDeckMobile.xcodeproj -scheme AgentDeckMobile \
+    -destination 'platform=iOS Simulator,name=iPhone 17' test
+cd ..
+bash scripts/run-local-runtime-smoke.sh
+cargo run -q -p agentdeck-cli -- protocol schema \
+  | diff - protocol/agentdeck/agentdeck-protocol.schema.json
+cargo run -q -p agentdeck-cli -- protocol runtime-schema \
+  | diff - protocol/agentdeck/runtime-protocol.schema.json
+cargo run -q -p agentdeck-cli -- protocol relay-schema \
+  | diff - protocol/agentdeck/relay-v2.schema.json
+cargo run -q -p agentdeck-cli -- protocol e2ee-schema \
+  | diff - protocol/agentdeck/e2ee-v1.schema.json
+bash scripts/check-daemon-network-boundary.sh
+scripts/verify-agent-docs.sh
+git diff --check
+```
+
+冻结提交的 changed-source strict/baseline-parity 可机械复算；candidate 不得比 base 增加 diagnostics：
+
+```bash
+base=d68cc02^
+candidate=d68cc02
+for file in $(git diff --name-only --diff-filter=ACMR "$base" "$candidate" -- '*.swift'); do
+  before=$(git show "$base:$file" \
+    | swift format lint --strict --assume-filename "$file" - 2>&1 \
+    | awk '/: error:/{n++} END{print n+0}')
+  after=$(git show "$candidate:$file" \
+    | swift format lint --strict --assume-filename "$file" - 2>&1 \
+    | awk '/: error:/{n++} END{print n+0}')
+  test "$after" -le "$before" || exit 1
+done
+```
+
+**Task 完成证据（2026-07-19，`d68cc02`）：** focused 主组合 `108/108`，其余 touched suites
+`40/40`；subscription admission 与真实 UDS EOF 各重复 `10/10`。完整 Swift
+`527 XCTest + 35 Swift Testing`、普通/warnings-as-errors build、iOS Simulator `20/20`、真实
+local-runtime smoke、四 schema、network/docs/diff 全绿。changed-source strict gate 中 15 个
+baseline-clean 文件保持 `0→0`；4 个 legacy 文件 diagnostics 分别从 `596→592`、`295→268`、
+`317→308`、`83→82`，按“零新增且总债务下降”的 baseline parity 记 PASS，不把 legacy 全文件表述为
+strict clean。spec/security 与 quality 双路终审在冻结 diff SHA-256
+`66c4151af524caae6373571fcc0dd72b1d2c8789b5d7ffe64d05def416edbf6a` 上 Approved，无 P0/P1/P2。
+P3.1 provisioned signed Keychain 与真实 vendor login 继续 post-MVP BLOCKED；P3.9 complete，下一 Task P3.10。
+
+### P3.10 planned gate（尚未 PASS）
+
+P3.10 实现必须新增 durable machine-wide admin ledger，并把 `StageUpgrade` 的 switch/exit 许可绑定到 local
+writer 的 exact reply flush ACK。partial write、flush failure、cancel 或 ACK 前 disconnect 都必须保持
+`bin/current`、PID 与 launchd state 不变；ACK 后 client close 不得撤销已提交动作。默认自动证据只允许
+dev/ephemeral 隔离 root + injected launchctl/signature verifier；production constructor 仍从 `getpwuid_r`
+home 派生路径并拒绝 ad-hoc。provisioned production-signed LaunchAgent/Keychain roundtrip 是 post-MVP
+BLOCKED 槽位。此段是下一 Task 门禁，不是当前 PASS 声明。
+
 ## AppKit 重写后的验证清单
 
 前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。
@@ -2026,6 +2100,7 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P3.9-B Swift shared-daemon client | 运行本页 installation/UDS/client/current-codec focused `53/53`、完整 `swift test`、普通 build、changed-file strict format、docs/diff 与双路独立终审；warnings-as-errors 的既有 Preview warning 单列未通过。只证明 Swift component，不冒充 P3.9-C3 App model cutover、P3.9-D 默认入口或双客户端 smoke |
 | Relay Companion MVP P3.9-C3 App model cutover | 运行本页 App coordinator/canonical model/reliability/Preview focused `46/46`、完整 Swift、普通与 warnings-as-errors build、iOS Simulator、production source purge、strict format/diff 与双路独立终审；普通 GUI 已默认 shared UDS 且 socket failure 零 fallback；Rust CLI、`main.swift --selfcheck` 与双客户端组合 smoke 当时不计入 C3，后由 P3.9-D 完成 |
 | Relay Companion MVP P3.9-D 默认入口与组合 smoke | 运行本页 CLI/daemon/Swift/iOS 全量、真实双客户端 smoke、active-turn/双连接/close-only 组合证据、release hidden-surface、四 schema、scoped Clippy/network/docs/fmt/diff 与双路终审。`b818f81` 已完成且全部自动门禁 PASS；真实 vendor login 与 P3.1 provisioned Keychain 仍按 post-MVP BLOCKED 记录，不冒充本 Task 证据 |
+| Relay Companion MVP P3.9-E App 会话可靠性 | 运行本页 retry/reconnect/history/subscription/composer focused、完整 Swift/iOS、真实 local-runtime smoke、四 schema、network/docs/diff、changed-source baseline parity 与双路终审。`d68cc02` 已完成且自动门禁 PASS；4 个 legacy 文件只证明诊断数下降，不冒充全文件 strict clean，也不冒充真实 vendor/remote/signed 证据 |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

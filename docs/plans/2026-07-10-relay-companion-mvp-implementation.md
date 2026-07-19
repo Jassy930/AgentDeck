@@ -68,8 +68,9 @@ P5/P6 MVP 退出范围的上位纠偏决策；冲突处以纠偏决策为准。�
 - Phase 状态分为“实现/自动门禁 candidate”与“外部证据槽位”两层。P3.1 采用方案 b：MVP 接受完整
   dev/ephemeral Keychain 路径，provisioned signed roundtrip 移入 post-MVP ignored/BLOCKED 槽位，不再
   消耗执行时间或阻塞 MVP/P3 exit；这不表示 stable production signing 已完成。P4 功能范围完整保留。P5 的 MVP 退出门禁收敛为 iOS
-  Simulator 自动 E2E + 本机第二客户端，物理 iPhone/第二台 Mac 移入 post-MVP；P6 只把合成链路可
-  自动化的 DoD 项作为 MVP 门禁，真实 vendor/公网 WSS/物理设备/干净 Linux host 槽位保留 BLOCKED。
+  Simulator 自动 E2E；本机第二客户端迁入 P6 synthetic DoD，物理 iPhone/第二台 Mac 移入
+  post-MVP；P6 只把合成链路可自动化的 DoD 项作为 MVP 门禁，真实 vendor/公网 WSS/物理设备/干净
+  Linux host 槽位保留 BLOCKED。
   不得把 synthetic/Simulator/loopback 改写成真实设备证据，也不得因 post-MVP 槽位 BLOCKED 阻塞主线。
 
 ## Phase 依赖与交付
@@ -81,8 +82,8 @@ P5/P6 MVP 退出范围的上位纠偏决策；冲突处以纠偏决策为准。�
 | P2 | Relay v2 原子 cutover | restart/revoke/quota/TLS/forgery/replay/slow-client/sentinel 全绿，v1 生产代码删除 |
 | P3 | Singleton RuntimeCore、UDS、exec fence、LaunchAgent | 两个本地客户端共享真实会话；crash boundary、install/upgrade/uninstall 与 dev/ephemeral Keychain 路径通过；provisioned signed roundtrip 为 post-MVP BLOCKED 槽位 |
 | P4 | Machine identity、pairing、RemoteLink、远程 CLI | 完整功能与合成 Codex/CC RemoteLink/receipt E2E、restart/trust reset 自动闭环；真实 vendor login 为 post-MVP BLOCKED 槽位 |
-| P5 | 共享 Swift client、iOS Companion、远程 macOS | Simulator 自动 E2E + 本机第二客户端通过；物理 iPhone/第二台 Mac 为 post-MVP BLOCKED 槽位 |
-| P6 | 四端竞态、故障注入、运维与 DoD | 十三项 DoD 的合成可自动化项通过；真实 vendor/公网/物理设备/Linux host 槽位可读且保持 BLOCKED |
+| P5 | 共享 Swift client、iOS Companion、远程 macOS | iOS Simulator 自动 E2E 通过；物理 iPhone/第二台 Mac 为 post-MVP BLOCKED 槽位 |
+| P6 | 四端竞态、故障注入、运维与 DoD | 本机第二客户端与十三项 DoD 的合成可自动化项通过；真实 vendor/公网/物理设备/Linux host 槽位可读且保持 BLOCKED |
 
 **设计覆盖索引:** §6 enrollment/pair/revoke/reset→P1.2、P2.2/P2.4/P2.7/P2.8、P4.1–P4.3、P5.6；§7 crypto/key/counter→P1.4–P1.7、P4.1/P4.5、P5.2/P5.4；§8 RuntimeCore→P3.1–P3.7；§9 stream/snapshot/transfer→P1.1、P2.3、P3.6、P4.5、P5.3/P5.4；§10–§12 Relay/TLS/ops→P2.1–P2.10、P6.2；§13 Companion→P5.1–P5.9；§14 failures→各phase contract/store/UI tests与DIAGNOSTICS同步；§17 DoD→P6.1–P6.4证据矩阵。
 
@@ -2432,33 +2433,72 @@ P3.9 固定以下迁移边界：
   1,024 × 256 KiB boundary `5/5`（285.43 秒），Swift `458 XCTest + 35 Swift Testing`，iOS Simulator
   `20/20`。spec/security 与 quality 双路终审无 P0/P1/P2。P3.1 provisioned signed Keychain 与真实 vendor
   login 继续保持 post-MVP gated/BLOCKED，不计为 D PASS。
-- [ ] **P3.9-E 收口：** 独立 spec/security/quality review，修完 P0/P1/P2；同步 README、
-  ARCHITECTURE、QUALITY、DIAGNOSTICS、AGENTS、本计划与 progress。依赖真实 Codex/CC login 的 initial
-  config/control smoke 单独 gate；缺登录时保留 post-MVP BLOCKED，不影响 transport synthetic 事实或 P3
-  自动 scope closeout，但不得冒充真实 vendor 证据。最终核对精确 pathspec 和 clean git status。
+- [x] **P3.9-E 收口：** code/test commit `d68cc02` 完成 App 会话可靠性收口：Start/Configure/Prompt
+  按 daemon failure 精确区分 exact/fresh retry，`store_unavailable` 保守复用 exact input；history 使用
+  latest-intent 单 drain；stream fault 先等待共享 close barrier，下一次用户操作才建立新 wire；重连只恢复
+  catalog、selected 与 required subscription。catalog + conversation 共用 64-slot LRU，Unsubscribe ACK 后才
+  改本地账，且腾槽→Subscribe→记账由 FIFO admission 单飞；composer 以 logical owner 隔离 draft，并受
+  32-owner、单 draft 256 KiB、总 1 MiB LRU 上界约束。focused 主组合 `108/108`、其余 touched suites
+  `40/40`，subscription admission 与真实 AF_UNIX EOF 各重复 `10/10`；完整 Swift
+  `527 XCTest + 35 Swift Testing`、warnings-as-errors build、iOS Simulator `20/20`、真实 local-runtime
+  smoke、四 schema、network/docs/diff 全绿。15 个 baseline-clean Swift 文件 strict `0→0`；4 个 legacy
+  文件 diagnostics 均下降，baseline parity 通过。最终 spec/security 与 quality 双路终审在冻结 hash
+  `66c4151af524caae6373571fcc0dd72b1d2c8789b5d7ffe64d05def416edbf6a` 上 Approved、无 P0/P1/P2。
+  production additions Task aggregate 为 2,175（aggregate 不计硬线）；最大职责子片
+  `SessionModel.swift` 为 1,448，其他 production 文件单个最多 220，均低于 1,800 预拆线。
+  真实 Codex/CC login 与 provisioned signed Keychain 继续是 post-MVP BLOCKED 槽位，不冒充本 Task 证据。
+  P3.9 至此完成；下一 Task 为 P3.10，P3 Phase exit 在 P3.10 收口后执行。
 
 ### Task P3.10：实现 LaunchAgent 安装、versioned upgrade 与保留数据的 uninstall
 
 **前置冻结：** local-only typed `StageUpgrade` request/reply、授权与错误语义已纳入 P3.9-C0-A 的 Runtime
 v2 contract；P3.9 Core 对它固定返回 typed feature-unavailable，remote principal/Relay 路径 typed reject。
 P3.10 只补执行语义，不再改变 wire 或升级 Runtime v3，也不得临时复用 generic command/vendor control。
+连接层必须先把 `StageUpgrade` reply 完整写入并取得 writer flush ACK，才能切换 `bin/current` 或触发 daemon
+优雅退出；request handler/Core 返回成功、入队成功或只写入部分 frame 都不是 switch/exit 许可。自动 MVP
+门禁使用 dev/ephemeral 隔离 harness、注入的 launchctl/signature verifier 与真实文件系统 crash/readback；
+provisioned production-signed LaunchAgent roundtrip 保留为 post-MVP BLOCKED 槽位，不消耗主线执行时间，也
+不得把 injected/ad-hoc 证据描述为 stable production signing PASS。
 
 **Files:**
-- Create: `agentdeck-cli/src/daemon.rs`
+- Create: `agentdeck-cli/src/daemon/{mod,artifact,launchd}.rs`
 - Create: `agentdeckd/src/runtime/upgrade.rs`
-- Create: `packaging/com.agentdeck.agentdeckd.plist`
+- Create: `agentdeckd/src/runtime/store/admin.rs`
+- Create: `packaging/com.agentdeck.agentdeckd.plist.in`
 - Create: `agentdeck-cli/tests/daemon_install.rs`
+- Create: `agentdeckd/tests/runtime_store_admin_upgrade.rs`
 - Create: `agentdeckd/tests/upgrade_idle.rs`
 - Create: `scripts/verify-daemon-install.sh`
+- Modify: `agentdeck-cli/src/lib.rs`
 - Modify: `agentdeck-cli/src/main.rs`
+- Modify: `agentdeck-cli/src/installation.rs`
+- Modify: `agentdeck-cli/Cargo.toml`
+- Modify: `agentdeck-protocol/src/runtime/failure.rs`
 - Modify: `agentdeckd/src/runtime/core.rs`
+- Modify: `agentdeckd/src/runtime/conversation.rs`
+- Modify: `agentdeckd/src/runtime/mod.rs`
+- Modify: `agentdeckd/src/runtime/model.rs`
+- Modify: `agentdeckd/src/runtime/store/{schema,sqlite,journal,worker,retention,mod}.rs`
+- Modify: `agentdeckd/src/main.rs`
+- Create: `packaging/agentdeckd.entitlements.in`
+- Modify: `Cargo.lock`
 - Modify: `script/build_and_run.sh`
+- Modify: `scripts/verify-relay-companion-mvp.sh`
 - Modify: `README.md`, `docs/QUALITY.md`, `docs/AGENT_DIAGNOSTICS.md`, `docs/index.md`, `AGENTS.md`
 
-- [ ] Step 1: 写installer/upgrade tests。 固定`~/Library/Application Support/AgentDeck/bin/$VERSION/agentdeckd`、原子`bin/current`、plist label、首次bootstrap、active turn只stage、idle切symlink+优雅exit、launchd restart、mismatch、不卸载运行中错误版本、uninstall保留全部DB/Keychain；P3的`uninstall --purge`必须返回`daemon.purge.remote_not_ready`且不删除任何数据，完整purge到P4.2；ephemeral拒安装。
+**内部 production 子片（仍属于一个 P3.10 Task）：** A1 增加 schema v7 `admin_commands` physical migration；
+A2 增加 authenticated ledger totals/streaming audit、30 天 retention、容量准入、exact replay/conflict 与
+COMMIT-unknown Store API。B1 实现 upgrade coordinator，并复用现有 `enqueue_paced` / `FlushReceipt` 把 reply
+flush ACK 绑定到 deferred action；B2 实现 start-transition idle fence 与 main-loop exit，action 不得在持有
+`RuntimeOperationGuard` 时同步 shutdown 造成 quiescence 自等待。C1 实现安全 artifact installer/signature
+verifier；C2 实现 launchd/status/uninstall/CLI routing；C3 实现 packaging 与隔离 harness。每个子片只跑
+focused tests + scoped Clippy/fmt，不做子片级双路终审、全量慢门禁或 docs commit；P3.10 Task 收口一次性
+执行完整门禁与双路终审。任一子片 production additions 到 1,800 前继续职责内聚拆分，2,000 时硬停。
+
+- [ ] Step 1: 写installer/upgrade tests。 固定`~/Library/Application Support/AgentDeck/bin/$VERSION/agentdeckd`、原子`bin/current`、plist label、首次bootstrap、active turn只stage、idle切symlink+优雅exit、launchd restart、mismatch、不卸载运行中错误版本、uninstall保留全部DB/Keychain；先以 schema v7 `admin_commands` 锁定 machine-wide key 的 30 天 retention、authenticated totals/streaming audit、same key+exact target/hash replay、异 payload conflict、before/after-COMMIT 与 v6→v7 migration。增加 partial write、flush failure、client cancel 与 disconnect RED tests，证明 reply flush ACK 前 `bin/current`、PID 和 launchd state 零变化；P3的`uninstall --purge`必须返回`daemon.purge.remote_not_ready`且不删除任何数据，完整purge到P4.2；ephemeral拒绝 production install，但允许显式隔离的自动 harness。plist template 必须对每用户绝对 ProgramArguments 做 XML escaping 与 golden readback，不能提交含假绝对路径的静态 production plist。
 - [ ] Step 2: 运行 unit tests。 Expected: FAIL，daemon subcommand与upgrade coordinator不存在。
-- [ ] Step 3: 实现`agentdeck daemon install|status|uninstall`并解析但拒绝P3的`--purge`。 App bundle helper固定`AgentDeck.app/Contents/Helpers/agentdeckd`；生产SignatureVerifier固定designated requirement、TeamIdentifier和daemon-only Keychain access-group entitlement，source使用O_NOFOLLOW读取，copy到同目录temp后fsync、对temp做第二次签名/version/hash/entitlement校验再atomic rename，覆盖TOCTOU；active daemon通过UDS接收StageUpgrade。 ad-hoc只存在test-only injected verifier，生产路径明确拒绝。
-- [ ] Step 4: 运行unit tests与 `AGENTDECK_INSTALL_E2E=1 bash scripts/verify-daemon-install.sh`。 Expected: unit tests使用注入的launchctl/signature verifier；gated脚本只在明确指定的可丢弃macOS测试用户profile中验证`launchctl print`、PID、UDS、stage/idle switch与uninstall readback，并始终清理test label。
+- [ ] Step 3: 实现`agentdeck daemon install|status|uninstall`并解析但拒绝P3的`--purge`。production CLI 只接受自身位于 `AgentDeck.app/Contents/Helpers/agentdeck`，并从同目录取得 sibling `agentdeckd`；`script/build_and_run.sh` 必须同时内嵌两 helper，standalone CLI 不接受任意 source path。生产SignatureVerifier固定designated requirement、TeamIdentifier和daemon-only Keychain access-group entitlement，source使用O_NOFOLLOW读取，copy到同目录temp后fsync、对temp做第二次签名/version/hash/entitlement校验再atomic rename，覆盖TOCTOU。installer 从 `.plist.in` 安全渲染每用户绝对 ProgramArguments。active daemon通过UDS接收StageUpgrade；该请求特殊化为 durable ledger/receipt → paced enqueue → wait exact FlushReceipt → arm deferred idle action，不能沿普通 `try_enqueue` 后直接 switch/exit，也不能在持有 `RuntimeOperationGuard` 时同步 shutdown 造成 quiescence 自等待。ACK 之前的 encode/write/flush/cancel/disconnect 任一失败都取消 action；ACK 已授予 switch/exit 许可后，随后 client close 不得反向撤销已提交动作。ad-hoc只存在test-only injected verifier，生产路径明确拒绝。
+- [ ] Step 4: 运行 unit tests 与默认 `bash scripts/verify-daemon-install.sh`。 Expected: unit tests/默认脚本使用注入的 launchctl/signature verifier、注入的 temp install/data root 与 private TMPDIR（必要时在可丢弃测试 account 运行），执行真实 temp 文件事务与真实 ephemeral Runtime UDS/flush/idle，再由 harness 按 `bin/current` 手动重启，验证 install→stage→flush-ACK→idle switch→restart→uninstall、逐写点 crash recovery与 cleanup；production constructor 继续从 `getpwuid_r` home 派生稳定路径并忽略 `HOME`，默认 harness 不得改真实 `~/Library/LaunchAgents`，也不得把 fake launchctl 写成真实 LaunchAgent restart。另运行 production-signed slot contract：缺 provisioning profile 时结构化输出 BLOCKED 且零 install/evidence；只有 post-MVP 显式 gated 输入齐全时才允许在可丢弃 macOS 测试用户 profile 读回真实 `launchctl bootstrap/print`、stable PID/UDS、跨版本 Keychain、TeamIdentifier/entitlement 与 uninstall。
 - [ ] Step 5: 扩展 `verify-relay-companion-mvp.sh p3`，运行 cargo/swift/network/docs gates并清理临时LaunchAgent。
 - [ ] Step 6: 提交。 `git add agentdeck-cli agentdeckd packaging script scripts README.md docs AGENTS.md && git commit -m "feat(daemon): 完成 LaunchAgent 安装与空闲升级"`
 
@@ -2823,7 +2863,7 @@ public actor RelaySessionSource: SessionSource { /* one MachineConnection per pa
 - Modify: `docs/plans/2026-07-03-ios-uikit-frontend-design.md`
 
 **Orchestrator inputs:** Simulator脚本只需本机工具链并自建temp TLS Relay/DB/synthetic machine/invite，
-是 P5 MVP 退出门禁；本机第二客户端必须经同一 shared client/daemon 自动链路验证。物理 iPhone 脚本要求
+是 P5 唯一 MVP 退出门禁。本机第二客户端迁入 P6 synthetic DoD，不在 P5 重复编排。物理 iPhone 脚本要求
 `AGENTDECK_IOS_DEVICE_E2E=1`、`AGENTDECK_IOS_DEVICE_UDID`、`AGENTDECK_DEVELOPMENT_TEAM`、
 `AGENTDECK_PUBLIC_RELAY_CONFIG`、`AGENTDECK_IOS_PAIR_INVITE_FILE`；第二 Mac 脚本要求
 `AGENTDECK_MACOS_REMOTE_E2E=1`、`AGENTDECK_REMOTE_MAC_SSH`、`AGENTDECK_REMOTE_MAC_APP_PATH`、
@@ -2833,13 +2873,12 @@ post-MVP gated 槽位；两个 invite 仍必须 fresh/unused/unexpired，preflig
 
 - [ ] Step 1: 写 MVP UI/E2E tests 与 host harness。Simulator 走 temp TLS Relay +
   `cargo run -p agentdeck-cli --example synthetic_machine` 完成 PairRequest→requester waiting→被控机本地
-  pending fingerprint 读回/approve→pair/list/open/prompt/approval/reconnect/revoke；本机第二客户端用独立
-  installation/key/grant 经同一 shared client 完成 list/open/prompt/approval/reconnect，并证明本机 App 仍走
-  UDS。物理 iPhone/第二 Mac 脚本本期只测试 deterministic preflight、逐槽位 BLOCKED、无 summary 与 trap
+  pending fingerprint 读回/approve→pair/list/open/prompt/approval/reconnect/revoke。物理 iPhone/第二 Mac
+  脚本本期只测试 deterministic preflight、逐槽位 BLOCKED、无 summary 与 trap
   cleanup；signed runner 的 Keychain/FileProtection/锁屏证据和 SSH 第二 Mac 完整运行体留 P6.3 post-MVP。
 - [ ] Step 2: 运行 `bash scripts/run-relay-companion-simulator-e2e.sh`。 Expected: FAIL，host orchestrator/UI test target尚不存在。
-- [ ] Step 3: 配置 XcodeGen UI test target，实现 Simulator 与本机第二客户端 orchestrator：负责启动/等待
-  Relay/synthetic machine、生成独立 invite、把路径与 pin 注入测试、运行后读回并清理。iPhone/Mac 脚本只
+- [ ] Step 3: 配置 XcodeGen UI test target，实现 Simulator orchestrator：负责启动/等待 Relay/synthetic
+  machine、生成 invite、把路径与 pin 注入测试、运行后读回并清理。iPhone/Mac 脚本只
   实现严格 env/路径/invite preflight、`BLOCKED` 结构化输出和零 evidence 断言；完整 signed device/SSH
   runner 留在 P6.3 post-MVP。verifier 仍拒绝相同 invite/route/requestHash，并把旧 fixture 标为
   preview/test-only 历史事实。
@@ -2852,7 +2891,7 @@ post-MVP gated 槽位；两个 invite 仍必须 fresh/unused/unexpired，preflig
   bash scripts/verify-relay-companion-mvp.sh p5
   scripts/verify-agent-docs.sh
   ```
-  Expected: 默认/Simulator 与本机第二客户端全部 exit 0，即满足 P5 MVP 退出门禁；另由脚本 contract tests
+  Expected: 默认/Simulator exit 0，即满足 P5 MVP 退出门禁；另由脚本 contract tests
   在缺 gated 输入时读回物理 iPhone/第二 Mac 的逐槽位 BLOCKED、零 summary 与 cleanup。只有 post-MVP
   P6.3 才传真实 gated env 并要求 Keychain/FileProtection/locked-access/第二 Mac evidence IDs。
 - [ ] Step 5: `git status --short --branch`，删除生成的xcodeproj/Info.plist变更、Keychain测试项、screenshots临时目录。
@@ -2873,7 +2912,7 @@ post-MVP gated 槽位；两个 invite 仍必须 fresh/unused/unexpired，preflig
 - Create: `ios/AgentDeckMobileTests/MultiWriterPresentationTests.swift`
 - Modify: `scripts/verify-relay-companion-mvp.sh`
 
-- [ ] Step 1: 写自动化矩阵。 用两个local UDS principal+两个remote device同时写同conversation，验证prompt严格commandSeq FIFO、不同conversation并行、approval恰好一赢家且四端state一致；注入Relay COMMIT前后、daemon五个exec boundary、Store full/busy/migration、slow reader、oversize/rate flood、revoke与prompt/approval竞态、counter rollback、gap/snapshot和key sync exhaustion。
+- [ ] Step 1: 写自动化矩阵。 用两个 local UDS principal + 两个 remote device 同时写同 conversation；两个 remote device 中一个由独立的本机第二客户端进程承载，使用独立 installation/key/grant 经同一 shared client/daemon 完成 list/open/prompt/approval/reconnect，并证明本机 App 仍走 UDS。验证prompt严格commandSeq FIFO、不同conversation并行、approval恰好一赢家且四端state一致；注入Relay COMMIT前后、daemon五个exec boundary、Store full/busy/migration、slow reader、oversize/rate flood、revoke与prompt/approval竞态、counter rollback、gap/snapshot和key sync exhaustion。
 - [ ] Step 2: 运行 `bash scripts/verify-relay-companion-mvp.sh p6-auto`。 Expected: FAIL，新suite尚未加入。
 - [ ] Step 3: 完成fault harness、deterministic clock/failpoint和Swift presentation assertions；verifier默认运行所有不依赖vendor login/物理设备的测试。
 - [ ] Step 4: 连续运行自动矩阵10次。 Expected: 每次相同canonical commandSeq/approval winner；无flaky sleep、无task leak、无明文sentinel。
@@ -2983,8 +3022,8 @@ host 均为 post-MVP gated inputs。缺失时 verifier 必须输出逐槽位 BLO
 
 | 设计 §17 条目 | MVP 自动门禁 | post-MVP 真实证据槽位 |
 |---|---|---|
-| 1. 唯一常驻 daemon | `daemon_namespace`、`shared_daemon`、`verify-daemon-install.sh` | `launchctl print`、同一PID、关闭App后turn继续 |
-| 2. 可安装可升级 | `daemon_install`、`upgrade_idle` | 干净用户profile install/stage/idle-switch/uninstall/purge读回 |
+| 1. 唯一常驻 daemon | `daemon_namespace`、`shared_daemon`、隔离 verifier harness | `launchctl print`、同一PID、关闭App后turn继续 |
+| 2. 可安装可升级 | `daemon_install`、`upgrade_idle` 的真实 temp 文件事务 + fake launchctl/signature + 手动 current restart | 干净用户profile production-signed install/stage/idle-switch/uninstall/purge读回 |
 | 3. 独立配对 | `pairing_state_machine`、Simulator iOS Pairing tests、不同 installation/key/grant | 物理 iPhone 对两台机器分别 pair，Keychain 与 byte-identical retry 证据 |
 | 4. 双 agent 控制 | synthetic Codex/CC canonical adapter + remote receipt E2E | 物理 iPhone 的真实 Codex/CC open/prompt/approval/history |
 | 5. 多写者确定性 | `multiwriter_e2e`、`remote_multiwriter_e2e`、本机第二客户端 | 本地 App、第二 Mac、iPhone、CLI 同 conversation 结果对照 |
