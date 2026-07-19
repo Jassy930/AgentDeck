@@ -12,9 +12,13 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+#[cfg(target_os = "macos")]
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 #[cfg(target_os = "macos")]
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant};
 
 use rand::{RngCore, rngs::OsRng};
 use sha2::{Digest, Sha256};
@@ -32,6 +36,12 @@ const TEMP_BASENAME_PREFIX: &str = ".agentdeckd.install-";
 const TEMP_NONCE_HEX_BYTES: usize = 32;
 #[cfg(target_os = "macos")]
 const MAX_VERIFIER_OUTPUT_BYTES: usize = 256 * 1024;
+#[cfg(target_os = "macos")]
+const VERIFIER_DEADLINE: Duration = Duration::from_secs(10);
+#[cfg(target_os = "macos")]
+const VERIFIER_PIPE_CHUNK_BYTES: usize = 8 * 1024;
+#[cfg(target_os = "macos")]
+const VERIFIER_POLL_SLICE: Duration = Duration::from_millis(25);
 
 /// verifier 对一个具体路径中 artifact 的完整 attestation。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -222,6 +232,16 @@ pub enum InstallError {
     SourceTempMismatch,
     #[error("invalid verifier output: {reason}")]
     InvalidVerifierOutput { reason: &'static str },
+    #[error("{operation} timed out for {path}")]
+    VerifierTimedOut {
+        operation: &'static str,
+        path: PathBuf,
+    },
+    #[error("{operation} output exceeded the fixed bound for {path}")]
+    VerifierOutputTooLarge {
+        operation: &'static str,
+        path: PathBuf,
+    },
     #[error("{operation} {path}: {source}")]
     Io {
         operation: &'static str,
@@ -252,6 +272,8 @@ impl InstallError {
             Self::AccessGroupMismatch => "daemon.install.access_group_mismatch",
             Self::SourceTempMismatch => "daemon.install.attestation_changed",
             Self::InvalidVerifierOutput { .. } => "daemon.install.verifier_output_invalid",
+            Self::VerifierTimedOut { .. } => "daemon.install.verifier_timeout",
+            Self::VerifierOutputTooLarge { .. } => "daemon.install.verifier_output_too_large",
             Self::Io { .. } => "daemon.install.io_failed",
         }
     }
@@ -837,16 +859,14 @@ fn verify_macos_artifact(
     verifier: &ProductionSignatureVerifier,
 ) -> Result<ArtifactAttestation, InstallError> {
     let requirement = format!("-R={}", verifier.designated_requirement);
-    let verified = Command::new("/usr/bin/codesign")
-        .args(["--verify", "--strict=all"])
-        .arg(requirement)
-        .arg(path)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|source| io("run codesign verification", path, source))?;
-    if !verified.status.success() {
-        return Err(InstallError::SignatureRejected);
-    }
+    bounded_command_output(
+        Command::new("/usr/bin/codesign")
+            .args(["--verify", "--strict=all"])
+            .arg(requirement)
+            .arg(path),
+        path,
+        "run codesign verification",
+    )?;
 
     let display = bounded_command_output(
         Command::new("/usr/bin/codesign")
@@ -915,20 +935,325 @@ fn bounded_command_output(
     command: &mut Command,
     path: &Path,
     operation: &'static str,
-) -> Result<std::process::Output, InstallError> {
-    let output = command
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|source| io(operation, path, source))?;
+) -> Result<Output, InstallError> {
+    let output = run_bounded_command(
+        command,
+        path,
+        operation,
+        None,
+        VERIFIER_DEADLINE,
+        MAX_VERIFIER_OUTPUT_BYTES,
+    )?;
     if !output.status.success() {
         return Err(InstallError::SignatureRejected);
     }
-    if output.stdout.len().saturating_add(output.stderr.len()) > MAX_VERIFIER_OUTPUT_BYTES {
-        return Err(InstallError::InvalidVerifierOutput {
-            reason: "verifier output exceeds the fixed bound",
-        });
-    }
     Ok(output)
+}
+
+#[cfg(target_os = "macos")]
+fn run_bounded_command(
+    command: &mut Command,
+    path: &Path,
+    operation: &'static str,
+    input: Option<&[u8]>,
+    deadline: Duration,
+    max_output_bytes: usize,
+) -> Result<Output, InstallError> {
+    command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut spawned = command
+        .spawn()
+        .map_err(|source| io(operation, path, source))?;
+    let process_group_id = match libc::pid_t::try_from(spawned.id()) {
+        Ok(process_group_id) if process_group_id > 1 => process_group_id,
+        _ => {
+            let _ = spawned.kill();
+            let _ = spawned.wait();
+            return Err(InstallError::InvalidVerifierOutput {
+                reason: "verifier process group id is invalid",
+            });
+        }
+    };
+    let mut child = VerifierChild::new(spawned, process_group_id);
+    let mut stdin = child.child.stdin.take();
+    let stdout_pipe = child
+        .child
+        .stdout
+        .take()
+        .ok_or(InstallError::InvalidVerifierOutput {
+            reason: "verifier stdout pipe is unavailable",
+        })?;
+    let stderr_pipe = child
+        .child
+        .stderr
+        .take()
+        .ok_or(InstallError::InvalidVerifierOutput {
+            reason: "verifier stderr pipe is unavailable",
+        })?;
+    set_nonblocking(stdout_pipe.as_raw_fd()).map_err(|source| io(operation, path, source))?;
+    set_nonblocking(stderr_pipe.as_raw_fd()).map_err(|source| io(operation, path, source))?;
+    let mut stdout = Some(stdout_pipe);
+    let mut stderr = Some(stderr_pipe);
+    if let Some(pipe) = stdin.as_ref() {
+        set_nonblocking(pipe.as_raw_fd()).map_err(|source| io(operation, path, source))?;
+    }
+
+    let started = Instant::now();
+    let input = input.unwrap_or_default();
+    let mut input_offset = 0_usize;
+    if input.is_empty() {
+        stdin = None;
+    }
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let mut status = None;
+
+    loop {
+        if started.elapsed() >= deadline {
+            child.terminate_and_reap();
+            return Err(InstallError::VerifierTimedOut {
+                operation,
+                path: path.to_path_buf(),
+            });
+        }
+
+        let mut made_progress = false;
+        if let Some(pipe) = stdout.as_mut() {
+            match read_pipe_once(pipe, &mut stdout_bytes, &stderr_bytes, max_output_bytes) {
+                Ok(PipeRead::Bytes) => made_progress = true,
+                Ok(PipeRead::WouldBlock) => {}
+                Ok(PipeRead::Eof) => stdout = None,
+                Err(PipeReadError::OutputTooLarge) => {
+                    child.terminate_and_reap();
+                    return Err(InstallError::VerifierOutputTooLarge {
+                        operation,
+                        path: path.to_path_buf(),
+                    });
+                }
+                Err(PipeReadError::Io(source)) => return Err(io(operation, path, source)),
+            }
+        }
+        if let Some(pipe) = stderr.as_mut() {
+            match read_pipe_once(pipe, &mut stderr_bytes, &stdout_bytes, max_output_bytes) {
+                Ok(PipeRead::Bytes) => made_progress = true,
+                Ok(PipeRead::WouldBlock) => {}
+                Ok(PipeRead::Eof) => stderr = None,
+                Err(PipeReadError::OutputTooLarge) => {
+                    child.terminate_and_reap();
+                    return Err(InstallError::VerifierOutputTooLarge {
+                        operation,
+                        path: path.to_path_buf(),
+                    });
+                }
+                Err(PipeReadError::Io(source)) => return Err(io(operation, path, source)),
+            }
+        }
+
+        if let Some(pipe) = stdin.as_mut() {
+            let end = input_offset
+                .saturating_add(VERIFIER_PIPE_CHUNK_BYTES)
+                .min(input.len());
+            match pipe.write(&input[input_offset..end]) {
+                Ok(0) => {
+                    return Err(io(
+                        operation,
+                        path,
+                        std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "verifier stdin closed before input completed",
+                        ),
+                    ));
+                }
+                Ok(written) => {
+                    input_offset = input_offset.saturating_add(written);
+                    made_progress = true;
+                    if input_offset == input.len() {
+                        stdin = None;
+                    }
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(source) if source.kind() == std::io::ErrorKind::BrokenPipe => {
+                    return Err(io(operation, path, source));
+                }
+                Err(source) => return Err(io(operation, path, source)),
+            }
+        }
+
+        if status.is_none() {
+            status = child
+                .child
+                .try_wait()
+                .map_err(|source| io(operation, path, source))?;
+            if status.is_some() {
+                if input_offset != input.len() {
+                    return Err(InstallError::InvalidVerifierOutput {
+                        reason: "verifier exited before consuming its bounded input",
+                    });
+                }
+                stdin = None;
+            }
+        }
+        let stdout_closed = stdout.is_none();
+        let stderr_closed = stderr.is_none();
+        if status.is_some() && stdout_closed && stderr_closed {
+            let status = child
+                .wait_and_disarm()
+                .map_err(|source| io(operation, path, source))?;
+            return Ok(Output {
+                status,
+                stdout: stdout_bytes,
+                stderr: stderr_bytes,
+            });
+        }
+        if made_progress {
+            continue;
+        }
+
+        let mut poll_fds = Vec::with_capacity(3);
+        if let Some(pipe) = stdout.as_ref() {
+            poll_fds.push(libc::pollfd {
+                fd: pipe.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
+        if let Some(pipe) = stderr.as_ref() {
+            poll_fds.push(libc::pollfd {
+                fd: pipe.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
+        if let Some(pipe) = stdin.as_ref() {
+            poll_fds.push(libc::pollfd {
+                fd: pipe.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            });
+        }
+        let remaining = deadline.saturating_sub(started.elapsed());
+        let poll_for = remaining.min(VERIFIER_POLL_SLICE);
+        let timeout_ms = i32::try_from(poll_for.as_millis().max(1)).unwrap_or(i32::MAX);
+        // SAFETY: poll_fds points to initialized pollfd values for the duration of this call.
+        let result = unsafe {
+            libc::poll(
+                poll_fds.as_mut_ptr(),
+                poll_fds.len() as libc::nfds_t,
+                timeout_ms,
+            )
+        };
+        if result == -1 {
+            let source = std::io::Error::last_os_error();
+            if source.kind() != std::io::ErrorKind::Interrupted {
+                return Err(io(operation, path, source));
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct VerifierChild {
+    child: Child,
+    process_group_id: libc::pid_t,
+    armed: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl VerifierChild {
+    fn new(child: Child, process_group_id: libc::pid_t) -> Self {
+        Self {
+            process_group_id,
+            child,
+            armed: true,
+        }
+    }
+
+    fn terminate_and_reap(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // SAFETY: the child was spawned into its own positive PGID; negation targets only that
+        // verifier process group. SIGKILL is required because verifier output is untrusted.
+        unsafe { libc::kill(-self.process_group_id, libc::SIGKILL) };
+        let _ = self.child.wait();
+        self.armed = false;
+    }
+
+    fn wait_and_disarm(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait()?;
+        self.armed = false;
+        Ok(status)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for VerifierChild {
+    fn drop(&mut self) {
+        self.terminate_and_reap();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    // SAFETY: fd is an owned live child pipe and fcntl does not retain pointers.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: same live pipe fd; flags preserves existing status flags and adds O_NONBLOCK.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+enum PipeRead {
+    Bytes,
+    WouldBlock,
+    Eof,
+}
+
+#[cfg(target_os = "macos")]
+enum PipeReadError {
+    OutputTooLarge,
+    Io(std::io::Error),
+}
+
+#[cfg(target_os = "macos")]
+fn read_pipe_once(
+    pipe: &mut impl Read,
+    destination: &mut Vec<u8>,
+    other: &[u8],
+    max_output_bytes: usize,
+) -> Result<PipeRead, PipeReadError> {
+    let mut buffer = [0_u8; VERIFIER_PIPE_CHUNK_BYTES];
+    match pipe.read(&mut buffer) {
+        Ok(0) => Ok(PipeRead::Eof),
+        Ok(read) => {
+            if destination
+                .len()
+                .saturating_add(other.len())
+                .saturating_add(read)
+                > max_output_bytes
+            {
+                return Err(PipeReadError::OutputTooLarge);
+            }
+            destination.extend_from_slice(&buffer[..read]);
+            Ok(PipeRead::Bytes)
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => Ok(PipeRead::WouldBlock),
+        Err(source) if source.kind() == std::io::ErrorKind::Interrupted => Ok(PipeRead::WouldBlock),
+        Err(source) => Err(PipeReadError::Io(source)),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -952,29 +1277,17 @@ fn plutil_json(path: &Path, xml: &[u8]) -> Result<serde_json::Value, InstallErro
             reason: "entitlement plist exceeds the fixed bound",
         });
     }
-    let mut child = Command::new("/usr/bin/plutil")
-        .args(["-convert", "json", "-o", "-", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|source| io("start entitlement parser", path, source))?;
-    child
-        .stdin
-        .take()
-        .ok_or(InstallError::InvalidVerifierOutput {
-            reason: "entitlement parser stdin is unavailable",
-        })?
-        .write_all(xml)
-        .map_err(|source| io("write entitlement parser input", path, source))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|source| io("wait for entitlement parser", path, source))?;
-    if !output.status.success()
-        || output.stdout.len().saturating_add(output.stderr.len()) > MAX_VERIFIER_OUTPUT_BYTES
-    {
+    let output = run_bounded_command(
+        Command::new("/usr/bin/plutil").args(["-convert", "json", "-o", "-", "-"]),
+        path,
+        "parse entitlement plist",
+        Some(xml),
+        VERIFIER_DEADLINE,
+        MAX_VERIFIER_OUTPUT_BYTES,
+    )?;
+    if !output.status.success() {
         return Err(InstallError::InvalidVerifierOutput {
-            reason: "entitlement plist is invalid or oversized",
+            reason: "entitlement plist is invalid",
         });
     }
     serde_json::from_slice(&output.stdout).map_err(|_| InstallError::InvalidVerifierOutput {
@@ -1034,7 +1347,11 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
+    #[cfg(target_os = "macos")]
+    use std::process::Command;
     use std::sync::{Arc, Mutex};
+    #[cfg(target_os = "macos")]
+    use std::time::{Duration, Instant};
 
     use agentdeck_crypto::sha256;
     use tempfile::TempDir;
@@ -1106,6 +1423,185 @@ mod tests {
     fn write_executable(path: &Path, bytes: &[u8]) {
         fs::write(path, bytes).expect("write fixture");
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("chmod fixture");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn process_is_gone(pid: libc::pid_t) -> bool {
+        // SAFETY: signal 0 only probes whether this test-owned pid still exists.
+        let result = unsafe { libc::kill(pid, 0) };
+        result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_processes_reaped(pid_file: &Path) {
+        let pids = fs::read_to_string(pid_file)
+            .expect("verifier fixture records its process group")
+            .lines()
+            .map(|line| line.parse::<libc::pid_t>().expect("fixture pid"))
+            .collect::<Vec<_>>();
+        assert_eq!(pids.len(), 2, "fixture must record leader and child");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pids.iter().any(|pid| !process_is_gone(*pid)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            pids.into_iter().all(process_is_gone),
+            "timed-out/overflowed verifier process group was not fully killed and reaped"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn verifier_timeout_is_typed_and_reaps_the_process_group() {
+        let root = TempDir::new().expect("tempdir");
+        let pid_file = root.path().join("timeout-pids");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "echo $$ > \"$1\"; sleep 30 & echo $! >> \"$1\"; wait",
+                "artifact-verifier-timeout",
+            ])
+            .arg(&pid_file);
+
+        let started = Instant::now();
+        let error = super::run_bounded_command(
+            &mut command,
+            root.path(),
+            "test verifier timeout",
+            None,
+            Duration::from_millis(250),
+            4 * 1024,
+        )
+        .expect_err("hung verifier must time out");
+
+        assert!(matches!(error, InstallError::VerifierTimedOut { .. }));
+        assert_eq!(error.code(), "daemon.install.verifier_timeout");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_processes_reaped(&pid_file);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn verifier_aggregate_output_cap_is_enforced_while_child_is_running() {
+        let root = TempDir::new().expect("tempdir");
+        let pid_file = root.path().join("overflow-pids");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "echo $$ > \"$1\"; sleep 30 & echo $! >> \"$1\"; \
+                 while :; do printf 1234567890; printf 1234567890 >&2; done",
+                "artifact-verifier-overflow",
+            ])
+            .arg(&pid_file);
+
+        let started = Instant::now();
+        let error = super::run_bounded_command(
+            &mut command,
+            root.path(),
+            "test verifier overflow",
+            None,
+            Duration::from_secs(2),
+            4 * 1024,
+        )
+        .expect_err("streaming verifier output must be bounded");
+
+        assert!(matches!(error, InstallError::VerifierOutputTooLarge { .. }));
+        assert_eq!(error.code(), "daemon.install.verifier_output_too_large");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_processes_reaped(&pid_file);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn verifier_pumps_bounded_stdin_and_output_without_pipe_deadlock() {
+        let root = TempDir::new().expect("tempdir");
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "/bin/dd if=/dev/zero bs=65536 count=1 2>/dev/null; /bin/cat >/dev/null; printf done >&2",
+            "artifact-verifier-pipes",
+        ]);
+        let input = vec![b'x'; 128 * 1024];
+
+        let output = super::run_bounded_command(
+            &mut command,
+            root.path(),
+            "test verifier pipe pump",
+            Some(&input),
+            Duration::from_secs(2),
+            128 * 1024,
+        )
+        .expect("bounded bidirectional pipe pump must complete");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 65_536);
+        assert_eq!(output.stderr, b"done");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn verifier_cannot_succeed_after_closing_unconsumed_input() {
+        let root = TempDir::new().expect("tempdir");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 0", "artifact-verifier-input"]);
+        let input = vec![b'x'; 1024 * 1024];
+
+        assert!(
+            super::run_bounded_command(
+                &mut command,
+                root.path(),
+                "test verifier incomplete input",
+                Some(&input),
+                Duration::from_secs(2),
+                4 * 1024,
+            )
+            .is_err(),
+            "successful exit must not hide unconsumed bounded input"
+        );
+    }
+
+    #[test]
+    fn verifier_resource_failure_never_publishes_the_temp_artifact() {
+        for timeout in [true, false] {
+            let root = TempDir::new().expect("tempdir");
+            let source = root.path().join("agentdeckd");
+            let destination = root.path().join("version");
+            write_executable(&source, b"daemon");
+            fs::create_dir(&destination).expect("destination");
+            let verifier = FakeVerifier::new(move |path, index| {
+                if index == 0 {
+                    return Ok(attestation(&fs::read(path).expect("source fixture")));
+                }
+                if timeout {
+                    Err(InstallError::VerifierTimedOut {
+                        operation: "test verifier",
+                        path: path.to_path_buf(),
+                    })
+                } else {
+                    Err(InstallError::VerifierOutputTooLarge {
+                        operation: "test verifier",
+                        path: path.to_path_buf(),
+                    })
+                }
+            });
+            let installer = ArtifactInstaller::new(verifier, expectation(None));
+
+            assert!(
+                installer
+                    .install_from_source_for_test(&source, &destination)
+                    .is_err()
+            );
+            assert!(!destination.join("agentdeckd").exists());
+            assert!(
+                fs::read_dir(&destination)
+                    .expect("read destination")
+                    .next()
+                    .is_none(),
+                "resource failure must remove the unverified temp artifact"
+            );
+        }
     }
 
     #[test]
