@@ -870,6 +870,13 @@ mod tests {
         let error = load_or_create_preparing_machine_key_material(&store).unwrap_err();
         assert_eq!(error.code(), "daemon.remote.identity.key_invalid");
         assert!(store.stores.lock().unwrap().is_empty());
+
+        // 缺失的前序 account 不能在后序既有 item 完成校验前被补写。
+        let later_invalid = TestKeyStore::default();
+        later_invalid.insert(MACHINE_DATA_SIGN_ACCOUNT, &[0x62; 31]);
+        let error = load_or_create_preparing_machine_key_material(&later_invalid).unwrap_err();
+        assert_eq!(error.code(), "daemon.remote.identity.key_invalid");
+        assert!(later_invalid.stores.lock().unwrap().is_empty());
     }
 
     #[test]

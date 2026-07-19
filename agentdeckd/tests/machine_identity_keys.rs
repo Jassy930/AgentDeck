@@ -26,6 +26,7 @@ struct RecordingState {
     missing_readback_for: Option<String>,
     corrupt_after_store_for: Option<String>,
     missing_after_store_for: Option<String>,
+    stale_after_delete_for: Option<String>,
 }
 
 impl RecordingKeyStore {
@@ -89,6 +90,13 @@ impl RecordingKeyStore {
             .expect("recording keystore lock")
             .missing_after_store_for = Some(account.to_owned());
     }
+
+    fn retain_after_next_delete_for(&self, account: &str) {
+        self.state
+            .lock()
+            .expect("recording keystore lock")
+            .stale_after_delete_for = Some(account.to_owned());
+    }
 }
 
 impl KeyStore for RecordingKeyStore {
@@ -130,6 +138,10 @@ impl KeyStore for RecordingKeyStore {
     fn delete(&self, account: &str) -> Result<(), KeyStoreError> {
         let mut state = self.state.lock().map_err(|_| KeyStoreError::Poisoned)?;
         state.deletes.push(account.to_owned());
+        if state.stale_after_delete_for.as_deref() == Some(account) {
+            state.stale_after_delete_for = None;
+            return Ok(());
+        }
         state.values.remove(account);
         Ok(())
     }
@@ -356,6 +368,36 @@ fn counter_guard_requires_exact_store_readback() {
 }
 
 #[test]
+fn counter_guard_rejects_canonical_value_transplanted_to_another_scope_without_writing() {
+    let store = RecordingKeyStore::default();
+    let catalog_7 = KeyId {
+        purpose: KeyPurpose::Catalog,
+        epoch: 7,
+    };
+    let reply_7 = KeyId {
+        purpose: KeyPurpose::DeviceReplyTx,
+        epoch: 7,
+    };
+    let catalog_8 = KeyId {
+        purpose: KeyPurpose::Catalog,
+        epoch: 8,
+    };
+    advance_counter_guard(&store, catalog_7, 1_024).unwrap();
+    let encoded = store
+        .value(&counter_guard_account(catalog_7))
+        .expect("source counter guard");
+    let stores_before_transplant = store.stores();
+
+    for target in [reply_7, catalog_8] {
+        store.insert(&counter_guard_account(target), &encoded);
+        let error = load_counter_guard(&store, target)
+            .expect_err("purpose/epoch transplant must fail canonical decoding");
+        assert_eq!(error.code(), "daemon.remote.identity.guard_invalid");
+        assert_eq!(store.stores(), stores_before_transplant);
+    }
+}
+
+#[test]
 fn expected_root_fingerprint_prevents_wrong_identity_or_guard_deletion() {
     let store = RecordingKeyStore::default();
     fixed_material(&store);
@@ -394,6 +436,48 @@ fn expected_root_fingerprint_prevents_wrong_identity_or_guard_deletion() {
     ] {
         assert!(store.value(account).is_none(), "{account} must be absent");
     }
+}
+
+#[test]
+fn delete_operations_require_absent_exact_readback() {
+    let material_store = RecordingKeyStore::default();
+    fixed_material(&material_store);
+    let root_fingerprint = load_machine_key_material(&material_store)
+        .unwrap()
+        .public_identity()
+        .root()
+        .fingerprint();
+    material_store.retain_after_next_delete_for(MACHINE_DATA_SIGN_ACCOUNT);
+    let error = delete_machine_key_material(&material_store, root_fingerprint)
+        .expect_err("stale machine key readback must fail deletion");
+    assert_eq!(error.code(), "daemon.remote.identity.delete_failed");
+    assert_eq!(material_store.deletes(), vec![MACHINE_DATA_SIGN_ACCOUNT]);
+    assert!(material_store.value(MACHINE_DATA_SIGN_ACCOUNT).is_some());
+
+    let directory_store = RecordingKeyStore::default();
+    let directory_guard = KeyDirectoryGuard::new([0xa1; 16], root_fingerprint, 1);
+    install_key_directory_guard(&directory_store, directory_guard).unwrap();
+    directory_store.retain_after_next_delete_for(KEY_DIRECTORY_GUARD_ACCOUNT);
+    let error = delete_key_directory_guard(&directory_store, root_fingerprint)
+        .expect_err("stale directory guard readback must fail deletion");
+    assert_eq!(error.code(), "daemon.remote.identity.delete_failed");
+    assert_eq!(directory_store.deletes(), vec![KEY_DIRECTORY_GUARD_ACCOUNT]);
+    assert!(directory_store.value(KEY_DIRECTORY_GUARD_ACCOUNT).is_some());
+
+    let counter_store = RecordingKeyStore::default();
+    install_key_directory_guard(&counter_store, directory_guard).unwrap();
+    let scope = KeyId {
+        purpose: KeyPurpose::ConversationDek,
+        epoch: 9,
+    };
+    advance_counter_guard(&counter_store, scope, 1_024).unwrap();
+    let counter_account = counter_guard_account(scope);
+    counter_store.retain_after_next_delete_for(&counter_account);
+    let error = delete_counter_guard(&counter_store, scope, root_fingerprint)
+        .expect_err("stale counter guard readback must fail deletion");
+    assert_eq!(error.code(), "daemon.remote.identity.delete_failed");
+    assert_eq!(counter_store.deletes(), vec![counter_account.clone()]);
+    assert!(counter_store.value(&counter_account).is_some());
 }
 
 #[test]
