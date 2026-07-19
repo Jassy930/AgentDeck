@@ -106,7 +106,7 @@ agentdeckd
 | **N5** | **一等公民对称约束**：`CodexAdapter` 实现的每个非独有 capability，`ClaudeCodeAdapter` 必须有等价实现或文档化"不适用"原因 | capability 矩阵文档 + cargo test |
 | **N6** | **Transport trait 远程预留**：v0.2 实现 `Transport` trait（仅 stdio），但 trait 必须能支持 remote（异步、可重连、可携带 auth context） | 编译期 trait 定义 |
 | **N7** | **`SessionCapabilities` 必须先于该 session 任何 `AgentItem`** | 集成测试断言序 |
-| **N8** | **CC 原生历史是唯一权威事实源**：只允许 Runtime DB 的 `claude_code_adapter_state` 保存 StorageKEK 保护、可重建的 `adapterStateKey → native session id` 派生索引；不得保存 title/archive/status/transcript，不创建 `cc-meta/`，不得进入 common catalog、日志、Relay 或客户端 wire | typed namespace + 密文/目录边界测试 |
+| **N8** | **CC 原生历史是唯一权威事实源**：Runtime DB 只保存 StorageKEK 保护、可重建的 private binding 和 neutral catalog projection；raw native session ID、transcript path/正文及 vendor 私有元数据不得进入 common catalog、日志、Relay 或客户端 wire，也不创建 `cc-meta/`。Snapshot 每次从已验证原生历史动态生成 | typed namespace + 密文/目录边界 + dynamic snapshot 零持久化测试 |
 
 “可重建”不表示按 title/cwd/mtime 猜回一个既有随机 `adapterStateKey`。只有本机 native
 projects root 中恰好一个 regular、非 memory-agent JSONL 被读回，并由本地流程明确选定 neutral
@@ -518,22 +518,27 @@ conversation/key，不能伪造身份连续性。
   层能够建立的安全边界，作为
   accepted residual risk 记录；`974f9b1` 之后不再新增面向该对手的竞态测试、hook 或取证机制。
 - Runtime DB 的物理 schema 按 phase 单调迁移：P3.2 的 v1 七表、P3.3 的 v2 两张 adapter 私表、
-  P3.5 的 v3 `approval_ledger`、P3.6 的 v4 六张 stream 表，以及 P3.9-C0-B1b 的 v5 四张
-  authenticated sidecar。v5 当前精确为 20 表；在 v4 的 `event_stream_index`、`event_retention`、
+  P3.5 的 v3 `approval_ledger`、P3.6 的 v4 六张 stream 表、P3.9-C0-B1b 的 v5 四张
+  authenticated sidecar，以及 C0-C 的 v6 两张 native sidecar。v6 当前精确为 22 表；在 v4 的
+  `event_stream_index`、`event_retention`、
   `catalog_journal`、`snapshots`、`publication_streams`、`publication_outbox` 上增加
   `conversation_state`、`configuration_journal`、`command_configuration_pins` 与
-  `metadata_mutation_ledger`，并给 authenticated Runtime ledger 增加 configuration/pin/metadata 六项
-  totals。物理 schema 升级不旋转 `RUNTIME_CRYPTO_CONTEXT_VERSION=1`；旧 ciphertext、row token 与
+  `metadata_mutation_ledger` 后，再增加 `native_projection_state` 与
+  `native_metadata_effect_fences`，并给 authenticated Runtime ledger 增加 projection
+  present/tombstone/retired/physical/charged-bytes 与 effect fence total/unreleased/released 八项 totals。
+  物理 schema 升级不旋转 `RUNTIME_CRYPTO_CONTEXT_VERSION=1`；旧非-meta ciphertext、row token 与
   wrapped key 不重写。`event_journal` 仍是 append-only authenticated audit；
   `machine_enrollment_receipts` 继续只是 root-lost rescue 所需的非秘密 index，其余敏感 payload 使用
   StorageKEK 包装的 DEK/BIK。后续 phase 仍须用独立 migration 增表，不能预建 nullable 通用表，也不能
   把 logical retention 误写成物理 audit row 回收。
-- v1/v2/v3/v4→v5 migration 先以只读连接认证 exact legacy meta/signature/token/全部行并做容量预检，
-  再取得 `BEGIN IMMEDIATE`，在任何 DDL 前对同一输入重新做全量认证；只有第二次认证通过才创建 sidecar、
-  物化每个既有 conversation 的 rev0/unconfigured、`entryRevision=0`、Managed origin 与 legacy cutoff，
-  最后同事务切换 schema/signature/ledger token。cutoff 逐字复制已认证 command HWM：NULL 保持
-  BeforeFirst，真实 seq0 不得折叠成 NULL。fresh v5 conversation 则在 create transaction 内同时写入
-  `conversation_state`。B2 已落地 authenticated configuration CAS writer、每次选择都认证完整
+- v1/v2/v3/v4 输入先按 v5 migration 物化每个既有 conversation 的 rev0/unconfigured、
+  `entryRevision=0`、Managed origin 与 legacy cutoff；cutoff 逐字复制已认证 command HWM，NULL 保持
+  BeforeFirst，真实 seq0 不得折叠成 NULL。进入 v5 后，v5→v6 再以只读连接认证 exact
+  meta/signature/token/全部行并做容量预检，取得 `BEGIN IMMEDIATE` 后在任何 DDL 前二次全量认证；只有
+  第二次认证通过才创建 native sidecar、切换 schema/signature/v6 ledger token。既有非-meta 密文与 token
+  byte-exact；authenticated v5 若已含 `NativeProjected` origin 必须 fail-close，不能猜测 projection 行。
+  fresh v6 conversation 在 create transaction 内同时写入 `conversation_state`。B2 已落地 authenticated
+  configuration CAS writer、每次选择都认证完整
   `1...head` 链的 frozen-cursor snapshot selector，以及 RuntimeCore Configure/DescribeAgents 路由；B3a
   又接通 `command_configuration_pins` writer/reader 与 Core prompt admission，B4 接通 managed
   `metadata_mutation_ledger` writer 与完整 open/recovery audit。migration/B2/B3a/B3b/B4 都不证明
@@ -579,6 +584,23 @@ conversation/key，不能伪造身份连续性。
   两个 principal 并发写、after-COMMIT unknown、revoke/caller cancellation 与 shutdown/reopen 后，receipt、
   event、snapshot、backfill 和 catalog 必须从同一 authenticated Store outcome 收敛，通知最多一次。该证据不
   扩张到 native projector 或同 UID 在线攻击者。
+- C0-C 的 daemon-private projector 在 Store recovery 后、Core Ready 前最多执行一个 2 秒 bounded round，
+  Ready 后续跑 opaque continuation；shutdown 必须先 cancel/join projector，再停止 actors/store。只有真实
+  EOF、全部 candidate ACK 与 completed witness 才能进入 reconciliation；partial、crash、busy actor 均不能
+  Removed。Store hard cap 保留当前 candidate pending 且零 ACK，并写 typed diagnostic 后固定 30 秒 refresh；
+  source unavailable、坏或不完整 generation 与 read failure 同样不得形成热循环。
+- native projection 把 verified private reference、neutral descriptor、default configuration、Catalog Upsert
+  与 projection state 原子提交；消失条目先 tombstone，30 天后只转 compact Retired audit，不删除 append-only
+  Runtime 证据。managed + native present 共用 live 1,024 上限，nonlive 8,192、physical 9,216，
+  present+tombstone raw private reference 共用 16 MiB。
+- NativeProjected Snapshot 在 SQLite transaction 外重新验证原生 JSONL，并动态派生稳定 turn/command/item/
+  entity identity；正文不写 `snapshots` 或 event journal。最近一次成功读回的 bounded command set 才能返回
+  `daemon.command.history_only`；读失败保留上次成功 receipt，Removed 会清除，重现后必须成功重读才能恢复。
+- native metadata 的 authenticated claim/fence/release/readback 与 current-binary gate substrate 已闭环，且
+  与 projector 共用 conversation serialization guard 和全局 adapter process permit。MVP production
+  coordinator 对 Rename 在 claim 前返回 `daemon.conversation.metadata_unsupported`，因此 ledger、fence、
+  spawn 都为零；synthetic current-binary roundtrip 只证明安全 substrate，不是 live Claude 证据。legacy CC
+  Rename/Archive/Unarchive 也必须进入 Runtime gate，不能从 history compatibility 绕过。
 - Codex 把冻结的 approval policy/sandbox 写入 fresh/resume thread request，把 reasoning effort 写入 turn
   request；Claude Code 把 permission mode/model/effort/output style 写入 fresh/resume argv。Runtime/UI 的
   `ClaudeCodePermissionMode::Default` 保持中立“常规人工确认”语义，当前 vendor CLI 显式映射为
@@ -924,6 +946,8 @@ daemon main
   -> ipc（re-export agentdeck-protocol）
   -> P3.8-B local listener（recovery permit → canonical UDS → graceful join）
   -> RuntimeCore → StoreCommitHub / subscription / snapshot
+  -> C0-C native projector → verified CC JSONL / atomic projection / dynamic snapshot
+  -> C0-C native metadata coordinator → authenticated fence substrate（live vendor post-MVP gated）
   -> P3.7 exec-gate / typed driver（RuntimeEnvelope ingress 原语已接通，App/CLI cutover 待 P3.9）
   -> transport-neutral P3.6 component → transfer / publication（production owner 待 P4）
   -> AgentRouter → CodexAdapter / ClaudeCodeAdapter

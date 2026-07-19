@@ -1299,10 +1299,10 @@ A2-0 的仓库外样本在 Swift gate 前再次核对为 0600、128 bytes、SHA-
 Hello reply 的一次性 focused gate实际执行 1 test、0 skipped、0 failures，完成 version/message ID/Hello
 语义与 JSON 等价重编码；随后外部样本已删除并确认不存在，一次性测试方法也已退役，不进入长期测试集。
 
-## Relay Companion MVP P3.9-C0-B1b Runtime DB v5 migration 门禁
+## Relay Companion MVP P3.9-C0-B1b legacy v4 real-writer migration 门禁
 
 **具体威胁场景：** 同 UID writer 在 migration 首轮 preflight 与 DDL 之间替换 legacy meta/token/行，或
-合成 fixture 漏掉真实 WAL、sealed row 与 wrapped key 的组合，可能让损坏输入被发布为 v5，或让迁移
+合成 fixture 漏掉真实 WAL、sealed row 与 wrapped key 的组合，可能让损坏输入被发布为 current v6，或让迁移
 静默重封/重包旧数据。
 
 本门禁的信任根是仓库外、由提交 `28619a8` 的 production v4 writer 生成并在流程外锁定的 main DB、WAL
@@ -1325,10 +1325,10 @@ cargo fmt --all -- --check
 bash scripts/check-daemon-no-net.sh
 swift run AgentDeck -- --selfcheck
 
-# 真实 v4 writer 样本；必须实际执行 1 test / 0 ignored
+# 真实 v4 writer 样本经 v5 中间迁移到 current v6；必须实际执行 1 test / 0 ignored
 AGENTDECK_B1B_V4_FIXTURE_DIR=/tmp/agentdeck-v4-migration.GQXkAh \
 cargo test -p agentdeckd --test runtime_v4_v5_real_migration \
-  real_v4_writer_sample_migrates_to_v5_with_byte_exact_immutable_rows \
+  real_v4_writer_sample_migrates_to_current_v6_with_byte_exact_immutable_rows \
   -- --ignored --exact --nocapture --test-threads=1
 
 # 文档与补丁卫生
@@ -1572,8 +1572,9 @@ pre-RW 审计更早返回的密文错误分类。production additions 合计 1,9
 `5/5`（276.71 秒）；protocol `170/170`；Swift XCTest `298/298` + Swift Testing `35/35`；schema、
 selfcheck、Clippy、fmt、network/no-net、docs 与 diff 全绿。双路独立终审无 P0/P1/P2。
 
-B4 只允许 managed mutation。`nativeProjected` 返回 typed feature-unavailable 且零 claim；native
-`claimed→applying→applied|failed|outcomeUnknown` 的 side effect 与 authenticated readback 属 C0-C。
+B4 收口时只允许 managed mutation，`nativeProjected` 当时返回 typed feature-unavailable 且零 claim；
+后续 C0-C 的当前边界见本页 C0-C Task 门禁：安全 substrate 已实现，production 请求改为更精确的
+`daemon.conversation.metadata_unsupported` pre-claim gate。
 同 UID 在线攻击仍是 accepted residual risk，不为 B4 添加竞态测试或 hook；整库历史回滚仍由 P4
 CounterGuard 检测。
 
@@ -1637,6 +1638,70 @@ Keychain 是 post-MVP BLOCKED，不计 PASS，也不阻塞自动主线。
 B5 证明 configuration/event 与 metadata/catalog 两条 revision 轴在现有 managed Runtime 路径上独立且
 最终一致；不证明 C0-C native importer/dynamic snapshot/native side effect、P4 CounterGuard/RemoteLink，
 也不证明真实 vendor login 或 Companion E2E。
+
+## Relay Companion MVP P3.9-C0-C native projection Task 门禁
+
+**具体威胁场景：** 原生 JSONL 若按路径字符串或内部 session ID 猜 identity，会暴露 raw vendor handle、
+重复导入或错误续接；若 incomplete generation、Store hard cap 或 busy actor 也 ACK candidate/执行 Removed，
+会永久丢失投影；若 Snapshot 复制正文进 SQLite，会产生第二权威源。native metadata 若绕过 Runtime claim、
+effect fence 或 current-binary gate，还可能在未持久化授权时调用 vendor。C0-C 要求 secure source、原子
+projection、completed witness、dynamic-only Snapshot 与 authenticated side-effect substrate 分层闭环。
+
+```bash
+# secure source、projection lifecycle、dynamic snapshot/history-only
+cargo test -p agentdeckd --lib claude_code::history::native_tests:: -- --test-threads=1
+cargo test -p agentdeckd --lib runtime::store::native_projection_lifecycle_tests:: -- --test-threads=1
+cargo test -p agentdeckd --lib runtime::core::tests::subscription_tests::dynamic_native:: -- --test-threads=1
+cargo test -p agentdeckd --lib runtime::native_projector::tests:: -- --test-threads=1
+
+# native metadata Store/fence/coordinator 与 typed spawn boundary
+cargo test -p agentdeckd --lib \
+  runtime::store::metadata::runtime_native_metadata_mutation_tests:: -- --test-threads=1
+cargo test -p agentdeckd --lib runtime::store::native_metadata_effect_tests:: -- --test-threads=1
+cargo test -p agentdeckd --lib runtime::native_metadata::tests:: -- --test-threads=1
+cargo test -p agentdeckd --test typed_spawn_ownership -- --test-threads=1
+cargo test -p agentdeckd --test adapter_state_boundary -- --test-threads=1
+cargo test -p agentdeckd --test router_both_agents -- --test-threads=1
+
+# 真实当前 OS account JSONL 只读 smoke；标准全包因 #[ignore] 不会执行本项
+AGENTDECK_E2E=1 cargo test -p agentdeckd --lib \
+  'runtime::core::tests::subscription_tests::dynamic_native::real_current_account_jsonl_projects_through_catalog_and_dynamic_snapshot' \
+  -- --exact --ignored --nocapture --test-threads=1
+
+# Task 收口完整 package / 跨语言 / Simulator / 自检
+cargo test -p agentdeckd
+cargo test -p agentdeck-protocol -- --test-threads=1
+swift test
+(cd ios && xcodegen generate && \
+  xcodebuild -project AgentDeckMobile.xcodeproj -scheme AgentDeckMobile \
+    -destination 'platform=iOS Simulator,name=iPhone 17' test)
+cargo run -q -p agentdeck-cli -- selfcheck
+
+# 静态、network 与文档
+cargo clippy -p agentdeckd --all-targets -- -D warnings
+cargo fmt --all -- --check
+bash scripts/check-daemon-network-boundary.sh
+bash scripts/check-daemon-no-net.sh
+scripts/verify-agent-docs.sh
+git diff --check
+git status --short --branch
+```
+
+**Task 完成证据（2026-07-19，code/test `5355497`）：** CC native history `42/42`、projector `13/13`、
+native projection Store `11/11`、native metadata Store `6/6`、typed spawn ownership `9/9`、
+adapter-state boundary `3/3`；production post-MVP gate 与 harmless current-binary synthetic coordinator
+roundtrip 均有独立行为测试。真实当前账号 JSONL 的只读 list→import→Catalog→dynamic Snapshot smoke 已
+PASS 且重复 `10/10`；dynamic focused `6 passed / 1 ignored`。final-tree daemon 全包 exit 0，lib
+`885 passed / 3 ignored`（635.39 秒）、256 MiB boundary `5/5`（285.59 秒），全部 integration/doc tests
+通过；protocol 全包、Swift `298 XCTest + 35 Swift Testing`、iOS Simulator `20/20`、schema sync、App
+selfcheck、diagnostics、Clippy/fmt/network/no-net/docs/diff 均 PASS。spec/security 与 quality 双路终审
+Approved、无 P0/P1/P2。
+
+Store hard cap 必须返回 typed diagnostic、保留当前 candidate pending 且零 ACK，并进入固定 30 秒 refresh；
+source unavailable、坏或 incomplete generation、read failure 都走相同 refresh 级退避，不能形成 250 ms 热
+循环。MVP production native Rename 在 claim 前返回 `daemon.conversation.metadata_unsupported`，ledger 与
+effect fence 保持零；synthetic current-binary gate 只证明 claim→fence→release→reap→readback substrate，
+不得写成真实 Claude binary mutation PASS。legacy CC Rename/Archive/Unarchive 统一要求 Runtime gate。
 
 ## AppKit 重写后的验证清单
 
@@ -1766,11 +1831,12 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P3.8-A local Runtime UDS primitives | 运行本页 framing/peer、local-control/cancellation、真实双连接 `local_uds`、完整 daemon、fmt/clippy/network-boundary/docs/diff；只证明 accepted stream actor，不冒充 P3.8-B secure bind/permit、P3.9 App/CLI cutover 或 remote E2E |
 | Relay Companion MVP P3.8-B production UDS/bootstrap | 运行本页 secure listener/permit/supervisor、config/stdio exhaustive allowlist、真实 binary lifecycle、Rust/Swift compatibility、完整 daemon、fmt/clippy/network-boundary/schema/docs/diff；只证明 production 本地入口，不冒充 P3.9 shared-daemon client、LaunchAgent 或 remote E2E |
 | Relay Companion MVP P3.9-C0-A2 Swift Runtime v2 mirror | 运行本页 A2a/A2b/A2c1/A2c2 focused、public API 与 frozen v1 gate、完整 `swift test`、iOS XcodeGen + Simulator、App selfcheck、docs/diff；A2 完成只证明 current codec、compact/98-fixture 与真实 UDS Swift readback，不得宣称 App/CLI 默认 UDS cutover |
-| Relay Companion MVP P3.9-C0-B1b Runtime DB v5 migration | 运行本页 schema/migration/store/boundary/cipher、默认完整 daemon、Clippy/fmt/no-net/selfcheck/docs/diff 与真实 v4 writer byte-exact gate；只证明 schema v5、authenticated migration/materialization，不冒充 B2–B4 writer、P4 CounterGuard 或 Companion E2E |
+| Relay Companion MVP P3.9-C0-B1b legacy v4 real-writer migration | 运行本页 schema/migration/store/boundary/cipher、默认完整 daemon、Clippy/fmt/no-net/selfcheck/docs/diff 与真实 v4 writer byte-exact gate；当前入口证明 v4 经 v5 中间迁移到 current v6 时的 authenticated migration/materialization，不冒充 P4 CounterGuard 或 Companion E2E |
 | Relay Companion MVP P3.9-C0-B3a command pin / prompt admission | 运行本页 B3a Store/Core focused matrix、完整 daemon package、protocol/Swift/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明 expected revision admission、同事务 nonzero pin、pinned receipt/status/recovery 与 Store-owned authorization lifetime，不冒充 B3b exact configuration execution、live vendor 或 Companion E2E |
 | Relay Companion MVP P3.9-C0-B3b exact execution | 运行本页 B3b Store/Core/driver/translator/restart focused matrix、完整 daemon package、protocol/Swift/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明 command-pinned historical configuration、rev0 startup-only、Codex/CC argv/control/at-decision mapping 与 synthetic restart probe，不冒充 live vendor、P4 RemoteLink 或 Companion E2E |
 | Relay Companion MVP P3.9-C0-B4 managed metadata | 运行本页 B4 Store/Core/Catalog/integrity/capacity focused matrix、完整 daemon package、protocol/Swift/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明 managed rename/archive、durable replay/conflict、同事务 revision/CatalogDelta 与离线篡改审计，不冒充 native projector、P4 CounterGuard/RemoteLink 或 Companion E2E |
 | Relay Companion MVP P3.9-C0-B5 cross-layer closeout | 运行本页真实 UDS 双 principal、authorization/cancellation/after-COMMIT focused matrix、完整 daemon/protocol/Swift/iOS Simulator/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明 managed configuration/metadata 的 owner-scoped 幂等、双 revision 轴、receipt/event/snapshot/backfill/restart 收敛，不冒充 C0-C native projection、P4 RemoteLink 或真实 Companion E2E |
+| Relay Companion MVP P3.9-C0-C native projection | 运行本页 secure source/projection/dynamic snapshot/history-only/native metadata focused matrix、真实当前账号 JSONL ignored smoke、完整 daemon/protocol/Swift/iOS Simulator/selfcheck、Clippy/fmt/network/docs/diff 与双路独立终审；只证明原生历史投影与安全 side-effect substrate，production native mutation 仍是 post-MVP typed gate，不冒充真实 Claude binary、P4 RemoteLink 或 Companion E2E |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试
@@ -1843,8 +1909,10 @@ AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_cross_agent_history -- --
 - [ ] Codex tool use 触发 approval 时显示卡片，底部 vendor 区显示 sandbox + policy + persist
 - [ ] CC 历史 thread 在侧栏与 Codex 历史共存，左侧默认合并显示且不提供 agent 切换
 - [ ] CC 历史 thread 点开可回放 + 继续
-- [ ] CC archive（`claude rm` 调用）后侧栏不可见，且不影响 Codex 历史显示
-- [ ] CC rename 后侧栏标题更新；终端 `claude --resume <id>` 看到同名
+- [ ] MVP：CC Rename/Archive/Unarchive 均进入 Runtime gate；production 在 claim 前返回 typed
+  `daemon.conversation.metadata_unsupported`，并验证零 ledger/fence/spawn
+- [ ] post-MVP gated：CC archive（真实 vendor 调用）后侧栏不可见，且不影响 Codex 历史显示
+- [ ] post-MVP gated：CC rename 后侧栏标题更新；终端 `claude --resume <id>` 看到同名
 - [ ] CC 未登录 → 明确诊断错误，不静默
 - [ ] CC 二进制不存在 → 明确诊断错误，附 `npm install` 提示
 - [ ] Token usage 在 mini 面板显示

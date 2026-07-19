@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P3.9-C0-B3a/B3b/B4/B5 已分别完成并通过 Task 完整门禁与双路终审，下一项为 C0-C native history projection；P3.1 签名 Keychain 为 post-MVP ignored/BLOCKED 且不阻塞主线（2026-07-18） |
+| 状态 | Approved target；P3.9-C0-C native history projection 已完成并通过 Task 全量门禁与双路终审，下一项为 P3.9-A Rust shared-daemon client；production native metadata 与 P3.1 签名 Keychain 均为 post-MVP gated/BLOCKED 且不阻塞自动主线（2026-07-19） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -649,6 +649,13 @@ history 时直接切到 UDS，会让用户选择静默回落默认值、历史�
   `ConversationOrigin::Managed | NativeProjected(namespace)`；v4 migration 固定 Managed，projector import
   固定 NativeProjected。禁止用“是否已有 adapter binding”猜 origin，因为 managed conversation 首次执行后
   同样会有 binding。
+- C0-C 以内部 schema v6 增加 `native_projection_state` 与 `native_metadata_effect_fences`，Runtime wire 仍为
+  v2、crypto context 仍为 1。v5→v6 只允许重算 `runtime_meta` 的 v6 ledger token；既有非-meta ciphertext、
+  blind token、row MAC 与 wrapped key byte-exact。由于 v5 没有 projector/ref/generation writer，migration
+  遇到 authenticated `NativeProjected` origin 必须 fail-close，不能猜测物化。effect fence 独立绑定 native
+  metadata ledger，不借用 command FK；Runtime-owned current-binary gate 是安全 substrate 的唯一 spawn 面，
+  MVP 只由 synthetic test driver 驱动。production coordinator 在 claim 前 `PostMvpGated`，真实 Claude
+  Rename/login 留 post-MVP；legacy `claude --resume --name` direct spawn 不是可复用 production 路径。
 
 Runtime v2 的新增公共形状固定为：
 
@@ -796,10 +803,14 @@ identity；任一 configuration 的 agent kind 与 conversation descriptor 不�
   同一 turn 的 user/assistant/tool 共享由 turn key 派生的 history commandId；item/entity identity 由 item key
   派生。该 commandId 不代表 command journal Accepted；`QueryReceipt` 对已由当次 native read 验证的历史
   command 返回 typed `daemon.command.history_only`，随机/未知 ID 仍返回 not-found。
-- projector 用 scan generation 管理消失：只有完整走完一个 generation 后仍未出现的 native entry 才发布
-  `CatalogChange::Removed`；部分 page 未看到不能删除。private binding 与 identity tombstone 保留 30 天，
-  期间 entry 重现复用同一 conversationId；tombstone 不计 active 1,024 conversation cap，过期后按受限批次
-  清理。单次 import 遇到 active cap 时停止并报告 typed truncated，不绕过资源上限。
+- projector 用 scan generation 管理消失：只有完整走完一个 generation 后仍未出现、且 actor 已 quiescent 的
+  native entry 才发布 `CatalogChange::Removed`；部分 page、crash 或 busy actor 都不能删除。private binding
+  与 identity tombstone 保留 30 天，期间 entry 重现复用同一 conversationId；到期后每批最多 500 条删除
+  adapter vault 中 expected private binding并转成 compact `Retired` audit，保留 blind ref token、conversationId/
+  namespace/Removed revision，不删除 append-only Runtime audit。retired 重现时重算 token、重新绑定 exact ref
+  并复用 identity。managed + native present 共用 live 1,024 上限；tombstone+retired 共用 8,192 nonlive 上限，
+  physical conversation 最多 9,216，present+tombstone raw private ref 共用 16 MiB。任一上限到达时停止并报告
+  typed truncated/store-full，不驱逐、不绕过资源上限。
 - App 与 CLI 分别持久化 installation UUID；它只划分审计、配额与 idempotency owner，不是认证 secret。
   信任根仍是 UDS 内核 peer credential。record parent/file 的 0700/0600、owner、no-follow、single-link、
   atomic create/readback 任一失败都 fail-close，损坏时不自动轮换。首次创建必须用同目录 temp+fsync 后

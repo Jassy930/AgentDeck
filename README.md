@@ -108,17 +108,22 @@ adapter。
 app-server 的 `thread/list` / `thread/read(includeTurns: true)` 接入留到 v0.3；
 文档和 UI 不应把 Codex 历史回放说成已接通。
 
-**Claude Code 历史**：通过 `claude agents --json` 及直读
-`~/.claude/projects/<encoded_cwd>/<id>.jsonl` 获取，事实唯一来源仍在 CC 原生
-接口。Runtime DB 只允许在 `claude_code_adapter_state` 私有 namespace 保存 StorageKEK
-保护的 `adapterStateKey → session id` 派生索引；它不保存 title/archive/status/transcript，
-不进入 common catalog、日志、Relay 或客户端 wire，也不创建 `cc-meta/`。重建只接受本机
-projects root 中恰好一个 regular、非 memory-agent JSONL；不会按 title/cwd/mtime 猜回旧随机
-key。无法确认旧映射时 fail-close 或导入为新 conversation。Archive 走 `claude rm`
-（软删，`--resume` 仍能找回）；Rename 走 `claude --resume <id> --name`；
-Unarchive 等同 no-op（CC 不区分 unarchive）。历史列表默认返回最新 500 条；
-daemon 先按 `.jsonl` mtime 排序并截断，再只为最终返回条目扫描标题，避免大型
-`~/.claude/projects` 历史库拖慢左侧侧栏刷新。`claude-mem` observer 会话属于
+**Claude Code 历史**：事实唯一来源仍是当前 OS account 的
+`~/.claude/projects/<encoded_cwd>/<id>.jsonl`。C0-C 的 production projector 逐层执行
+no-follow/current-UID/regular-file 与有界 JSONL 验证，再把 neutral descriptor 和稳定 identity
+原子投影到 Runtime Catalog；正文不复制进 Runtime DB。每次 Snapshot 都重新读取已验证原生
+历史，并从 canonical turn/item key 派生稳定 command/item/entity identity；`QueryReceipt` 对本次
+已验证的历史 command 返回 `daemon.command.history_only`，不冒充 command journal Accepted。
+Runtime DB 的 adapter 私表只保存 StorageKEK 保护的可重建 private binding，不把 raw session ID、
+transcript path 或正文带入 common catalog、日志、Relay 或客户端 wire，也不创建 `cc-meta/`。
+
+旧 history compatibility 的 Rename/Archive/Unarchive 不再直接调用 vendor 或返回 no-op Ack，统一返回
+`cc-history-mutation-requires-runtime-gate`；native metadata 必须经过 Runtime authorization、幂等 ledger
+与 gate。MVP production 对 native Rename 仍在 claim 前返回
+`daemon.conversation.metadata_unsupported`，因此不会产生 ledger/fence/vendor 副作用；完整
+current-binary synthetic roundtrip 只证明安全 substrate，真实 Claude binary mutation 留在 post-MVP。
+历史列表默认返回最新 500 条；daemon 先按 `.jsonl` mtime 排序并截断，再只为最终返回条目扫描标题，
+避免大型 `~/.claude/projects` 历史库拖慢左侧侧栏刷新。`claude-mem` observer 会话属于
 后台记忆工具噪声：project dir 匹配 `.claude-mem/observer-sessions`，或开头为
 `Hello memory agent` / `You are a Claude-Mem` 的会话，会在 history list 阶段过滤，
 不进入 CLI 输出或左侧侧栏。
@@ -213,7 +218,7 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（C0-B5 complete，C0-C next）
+## Relay Companion MVP 实施状态（C0-C complete，P3.9-A next）
 
 2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 只承诺缺 KEK 且无法通过当前
 KEK/database/domain 认证的离线篡改 fail-close，同 UID 在线攻击作为 residual risk 不再扩展。P3.1
@@ -438,8 +443,9 @@ B4 已接通 managed `Rename` / `SetArchived`：Store 在同一 transaction 写�
 `metadata_mutation_ledger` terminal outcome、descriptor/lifecycle、conversation-local entry revision、全局
 catalog revision 与唯一 `CatalogDelta`，不写 conversation event，也不改变 last-active 时间。same
 owner/key/request 精确重试返回原 Replayed，same owner/key/different request 返回 durable Conflict；
-RecoveryBlocked conversation 只允许 rename，archive/unarchive 零写拒绝。`nativeProjected` 仍属于 C0-C，
-当前返回 typed feature-unavailable 且不 claim ledger row，不冒充 native side effect/readback 已完成。
+RecoveryBlocked conversation 只允许 rename，archive/unarchive 零写拒绝。C0-C 已补齐 native claim/fence/
+readback 状态机与 Runtime-owned current-binary exec-gate substrate，但 MVP production native Rename 明确在
+claim 前返回 `daemon.conversation.metadata_unsupported`；synthetic gate 不冒充真实 Claude side effect。
 B3b 又让 Start 在同一 SQLite transaction 中认证 command、pin 与完整 `1...head` configuration chain，选择
 command 固定的历史 revision，而不是 current head；`StartOutcome → RuntimeExecutionContext →` crate-private
 `AgentTurnRequest` 始终携带同一 exact revision/value。rev0 只允许真实 v4→v5 migration cutoff 内的 command
@@ -479,8 +485,12 @@ metadata authorization guard 还覆盖 revoke、caller cancellation 与 after-CO
 `1176 passed / 6 ignored`，其中 lib `699 passed / 1 ignored`，1,024 × 256 KiB 容量 target `5/5`
 （280.10 秒）；protocol `170/170`、Swift `298 XCTest + 35 Swift Testing`、iOS Simulator `20/20`，
 schema/selfcheck/Clippy/fmt/network/docs/diff 全绿。独立 spec/security 与 quality 终审无 P0/P1/P2。
-C0-B configuration store/execution 至此完成；下一 Task 是 C0-C native history projection，尚未实现
-projector、native dynamic snapshot、native metadata side effect 或 P4 CounterGuard/RemoteLink。
+C0-B configuration store/execution 至此完成。C0-C 已完成 schema v6、secure native
+source、原子 import/reconcile/retire、Core projector lifecycle、dynamic snapshot 与 history-only receipt。
+projector 遇到 Store hard cap 会保留 candidate pending、零 ACK，并以 typed diagnostic 进入固定 30 秒
+refresh；source unavailable、坏或不完整 generation、read failure 同样避免热循环。真实当前账号 JSONL
+只读 list→import→Catalog→Snapshot smoke 已 PASS；Swift `298 XCTest + 35 Swift Testing` 与 iOS Simulator
+`20/20` 已 PASS。下一 Task 为 P3.9-A；P4 CounterGuard/RemoteLink 与真实 vendor metadata mutation仍未完成。
 
 进入 Core 的 principal 是字段私有的认证 capability；同一完整身份共享强 authorization lease，
 Accepted→Started 前会重新取得 guard，revoke 与 start 由该 guard + SQLite transition 线性化。
@@ -543,15 +553,18 @@ authenticated audit，不承诺物理删除历史 audit row。独立 ReadPool �
 `mode=ro/query_only=ON` WAL connection，整个池保留页内存 128 MiB，单页 64 rows/8 MiB；
 短事务复制完成后才把页交给 reply pump。
 
-当前 production physical schema 已由 P3.9-C0-B1b 的 `3d0002d` 单调推进到 v5/20 表。v5 新增
+当前 production physical schema 已由 C0-C 单调推进到 v6/22 表。v5 先新增
 `conversation_state`、`configuration_journal`、`command_configuration_pins` 与
-`metadata_mutation_ledger` 四张 authenticated sidecar，并在 Runtime ledger 增加 6 项 totals；
-crypto context 仍保持 v1。v1/v2/v3/v4 migration 在 `BEGIN IMMEDIATE` 后、任何 DDL 前重新认证
+`metadata_mutation_ledger` 四张 authenticated sidecar；v6 再新增 authenticated
+`native_projection_state` 与 `native_metadata_effect_fences`，并增加 projection present/tombstone/retired/
+physical/charged-bytes 及 fence total/unreleased/released 共 8 项 totals。crypto context 仍保持 v1。
+v1/v2/v3/v4/v5 migration 在 `BEGIN IMMEDIATE` 后、任何 DDL 前重新认证
 exact legacy meta/token/全部行，只为既有 conversation 物化 rev0、`entryRevision=0`、Managed origin 与
 nullable/BeforeFirst legacy cutoff，不重封旧 ciphertext、不重包 wrapped key。fresh conversation 与
 `conversation_state` 在同一事务写入；B2 configuration、B3a command pin 与 B4 managed metadata writer
-均已落地。native mutation 的 claim/apply/authenticated readback 状态机仍留 C0-C；在接线前
-`nativeProjected` 零 claim 返回 feature-unavailable。
+均已落地。v6 open/recovery 会认证 projection/fence、private binding、generation、effect identity 与全部
+totals；production native mutation 虽已有完整 claim/apply/readback substrate，仍按 MVP 边界在 claim 前
+typed gated。
 
 P3.6-C 已由 `694f2d9` 提交 transport-neutral StoreCommitHub、Catalog/conversation 共用的
 SubscriptionBarrier、连续 backfill/snapshot-required、authenticated snapshot、paced JSON
@@ -648,7 +661,8 @@ cutover 与旧签名材料拒绝门禁已完成，A2a/A2b Swift v2 strict mirror
 C0-B1a/B1b schema freeze 与真实 migration 已由 `e48248a` / `3d0002d` 收口；B2 configuration/Core 与
 B3a admission pin 已完成，后者由 `48594e8` / `09a14b0` 提交并通过 Task 门禁与双路终审；B3b exact
 execution 已由 `c0ed6cd` / `f4141f0` / `fb1629a` 完成，B4 managed metadata 已由
-`5f1ca1c` / `347a0f0` 完成，B5 cross-layer closeout 已由 `aebc8d0` 完成。C0-C、App/CLI 默认 UDS
+`5f1ca1c` / `347a0f0` 完成，B5 cross-layer closeout 已由 `aebc8d0` 完成。C0-C 自动实现与跨语言/
+Simulator 门禁已通过，C0-C Task 已完成；下一项为 P3.9-A Rust shared-daemon client。App/CLI 默认 UDS
 cutover、P3.10 LaunchAgent 与 P4–P6 仍未完成。P3.1 provisioned signed Keychain
 roundtrip 继续是 post-MVP BLOCKED 槽位，不阻塞 MVP/P3 exit；P5/P6 物理设备/公网/Linux 证据也是
 post-MVP，不冒充 PASS。

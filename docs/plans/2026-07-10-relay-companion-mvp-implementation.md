@@ -1609,15 +1609,17 @@ P3.9 固定以下迁移边界：
    在一个事务提交 private binding、neutral descriptor 与 catalog delta。native transcript 不复制进 Runtime
    DB；adapter read 返回 stable native item key，Runtime 域分离派生稳定 item/entity/command identity，重复
    read/restart 必须 byte-stable。list/read 统一走 Catalog + Subscribe/Snapshot。managed conversation 的
-   rename/archive 走 canonical metadata CAS；native-projected conversation 继续调用原生 mutation并读回投影，
-   原生不支持时保留现有 typed unsupported，不静默改成 AgentDeck-only 行为。
+   rename/archive 走 canonical metadata CAS；native-projected conversation 必须进入 Runtime metadata gate，
+   禁止 history compatibility 直接调用原生 mutation。MVP production 在 claim 前 typed `PostMvpGated`，
+   真实 vendor mutation/readback 留 post-MVP；不得静默改成 AgentDeck-only 行为。
    扫描/解析在 SQLite transaction 外完成；每轮最多检查 2,000 candidates、导入 500 conversations、累计
    读取 64 MiB、wall-clock 2 秒，达到任一上限保存 continuation 并让出。单 transcript snapshot 受
    64 MiB/10,000 items 上界，超限 typed fail，不阻塞 UDS readiness。
    Runtime store 明确持久化 authenticated `ConversationOrigin::Managed | NativeProjected(namespace)`：v4
-   migration=Managed，projector import=NativeProjected，不以 adapter binding 猜 origin。native mutation 先用
-   expected entry revision + idempotency key CAS claim，再由 conversation actor 串行执行 vendor/readback，并
-   durable 记录 `Claimed/Applying/Applied/OutcomeUnknown/Failed`；未 claim writer 零 vendor 副作用。
+   migration=Managed，projector import=NativeProjected，不以 adapter binding 猜 origin。native mutation
+   substrate 先用 expected entry revision + idempotency key CAS claim，再由 conversation actor 串行执行
+   gated effect/readback，并 durable 记录 `Claimed/Applying/Applied/OutcomeUnknown/Failed`；MVP production
+   在 claim 前拒绝，只有 synthetic driver 覆盖该 substrate，未 claim writer 零 vendor 副作用。
    `NativeTurnKey` 派生 history commandId，`NativeItemKey` 派生 item/entity ID；同一 turn 共享 commandId，
    QueryReceipt 对已验证历史 ID返回 `daemon.command.history_only`，绝不冒充 Accepted。
    只有完整 scan generation 后确认 absent 才发布 Catalog Removed；partial page 不删除。binding/identity
@@ -2211,7 +2213,7 @@ P3.9 固定以下迁移边界：
   所有 v5 新 command 必须存在指向同 conversation 非零 configuration 的 pin；用户继续既有 v4
   conversation 前必须先 Configure。native importer 原子种入 DescribeAgents 对应 default rev1 的未完要求
   已单列到下方 C0-C/C-c，不由本条迁移完成状态冒充。
-- [ ] **P3.9-C0-C native history projection（一个 Task，六个内部 production 子片）：** daemon
+- [x] **P3.9-C0-C native history projection（一个 Task，六个内部 production 子片）：** daemon
   bootstrap/reconciliation 调 adapter-private projector；CC 使用 OS account home、no-follow/current-UID/
   regular-file/有界 JSONL 读取，单事务 import private reference + canonical descriptor/catalog；adapter read
   返回 stable native turn/item key，Runtime 不复制 transcript 而生成 byte-stable snapshot identity。真实 CC
@@ -2221,16 +2223,26 @@ P3.9 固定以下迁移边界：
 
   **开工前冻结边界：** Runtime wire 继续为 v2；内部 Runtime DB 从 v5 原子迁移到 v6，不能原地修改 v5
   manifest/signature。v6 新增 authenticated `native_projection_state` 与
-  `native_metadata_effect_fences` sidecar，并给 `runtime_meta` 增加 projection present/tombstone/charged-bytes
-  及 effect-fence totals；既有 v5 ciphertext、token、row MAC 与 wrapped key 必须 byte-exact，不旋转
-  `RUNTIME_CRYPTO_CONTEXT_VERSION=1`。private reference 继续只存在于 adapter vault，wire/schema/log/Debug
-  不得出现 project component、transcript filename、native session ID 或 resume reference。
+  `native_metadata_effect_fences` sidecar，并给 `runtime_meta` 增加 projection
+  present/tombstone/retired/physical/charged-bytes 和 effect-fence total/unreleased/released 共 8 项 totals。
+  既有 v5 非 `runtime_meta` ciphertext、blind token、row MAC 与 wrapped key 必须 byte-exact，不旋转
+  `RUNTIME_CRYPTO_CONTEXT_VERSION=1`；`runtime_meta.metadata_token` 必须因 v6 domain 与新 totals 重新认证，
+  不能冒充 byte-exact。private reference 继续只存在于 adapter vault，wire/schema/log/Debug 不得出现 project
+  component、transcript filename、native session ID 或 resume reference。authenticated v5 若已经含
+  `NativeProjected` origin 必须 migration fail-close，因为 v5 没有可认证的 projector/ref/generation writer，
+  不得猜测补行。
 
-  projector 的 active conversation 上限仍为 1,024；identity tombstone 固定保留 30 天，最多 8,192 rows /
-  16 MiB charged private references，过期清理每批最多 500。达到 active/tombstone/byte 上限时返回 typed
-  truncated/store-full，不驱逐活跃 identity、不无界增长。只有完整走完同一 scan generation 后仍未出现，且
-  对应 actor 已 quiescent 的 entry 才写 `CatalogChange::Removed` 与 tombstone；partial generation、crash 或
-  busy actor 均不得删除，后者延迟到下一完整 generation。tombstone 期间重现必须复用原 conversationId。
+  conversation 计数从 v5 的单一 1,024 拆成 `MAX_RUNTIME_LIVE_CONVERSATIONS=1,024`、
+  `MAX_NATIVE_NONLIVE_IDENTITIES=8,192` 与 `MAX_RUNTIME_PHYSICAL_CONVERSATIONS=9,216`。managed + native
+  present 共用 live 上限；tombstone/retired 不建立 actor，但 `tombstone + retired <= 8,192`，并满足
+  `conversation_count - tombstone - retired <= 1,024`。identity tombstone 固定保留 30 天，present+tombstone
+  raw private references 共用 16 MiB charged 上限，过期清理每批最多 500：删除 adapter vault 中 expected
+  private binding、释放 charged bytes，再转成 compact `retired` audit；保留 blind reference token、
+  conversationId/namespace/Removed revision，不删除 append-only Runtime audit。retired entry 重现时重算 token、
+  重新绑定 exact ref、恢复 present 并复用原 conversationId。达到 live/nonlive/physical/byte 上限时返回 typed
+  truncated/store-full，不驱逐 identity、不无界增长。只有完整走完同一 scan generation 后仍未出现，且对应
+  actor 已 quiescent 的 entry 才写 `CatalogChange::Removed` 与 tombstone；partial generation、crash 或 busy
+  actor 均不得删除，后者延迟到下一完整 generation。
 
   每轮最多检查 2,000 个候选、导入 500 个 conversation、累计读取 64 MiB，并在 2 秒 wall-clock budget
   到达时让出。opaque continuation 与当前 generation 由 daemon Core 内存持有；crash 后放弃未完成
@@ -2238,7 +2250,7 @@ P3.9 固定以下迁移边界：
   Ready 前最多执行一个 2 秒 budget，随后开放 UDS；余下 reconciliation 在后台有界续跑，shutdown 先停
   projector 再停 actors/store。
 
-  - [ ] **C-a secure native source + stable keys（目标 ≤1,800 production additions）：** 使用
+  - [x] **C-a secure native source + stable keys（目标 ≤1,800 production additions）：** 使用
     `getpwuid_r(geteuid())` 的 OS account home，逐层 dirfd/no-follow/current-UID 验证 projects root、project
     component 与 transcript regular file；允许真实 vendor 的 current-UID 0644 文件，不把 exact mode 当
     Runtime Store 安全边界。扫描必须边遍历边应用 candidate/bytes/time limit，不能先收集/排序全部文件。
@@ -2248,23 +2260,28 @@ P3.9 固定以下迁移边界：
     incomplete trailing line 边界；memory-agent/observer entry 继续过滤。focused 只跑 history/parser/
     filesystem fixture、scoped Clippy 与 fmt，不写同 UID 在线 race hook/test。
 
-  - [ ] **C-b schema v6 + authenticated projection/fence state（目标 ≤1,800 production additions）：**
-    先写 v5→v6 real migration 与 manifest/signature RED，再创建两张 sidecar、row MAC/AEAD/AAD、复合 FK、
-    ledger totals、present/tombstone/charged bytes 与 fence lifecycle。open/recovery streaming audit 覆盖
-    delete/swap/generation/observation token/totals/fence identity tamper；migration 在 `BEGIN IMMEDIATE` DDL 前
-    二次认证 v5，任一 fault exact reopen 收敛且旧 ciphertext 零 reseal。focused 只跑 schema/migration/
-    native projection integrity、scoped Clippy 与 fmt。
+  - [x] **C-b schema v6 + authenticated projection/fence state（预拆 C-b1/C-b2，各自目标
+    ≤1,800 production additions）：** C-b1 先写 v5→v6 real migration 与 manifest/signature RED，再创建两张
+    sidecar、精确 CHECK/FK/index、8 项 ledger totals 与 v6 ledger token；DDL 前在 `BEGIN IMMEDIATE` 内二次
+    认证 v5，任一 before/after-COMMIT fault exact reopen 收敛，旧非-meta ciphertext/token/MAC/wrapped key
+    零 reseal。C-b2 再接 row MAC/AEAD/AAD、present/tombstone/retired/physical 计数、vault binding、effect
+    fence lifecycle 与完整 open/recovery streaming audit，覆盖 delete/swap/generation/observation/ref token/
+    catalog revision/totals、PGID/PID/start-time/nonce/spec/release commitment/parent state tamper。effect fence
+    以 `(conversationId,idempotencyToken)` 复合 FK 指向 native metadata ledger，不带 command FK；claimed
+    不得有 fence，unreleased 只配 applying，outcomeUnknown 必须有 released fence，managed mutation 永远零
+    fence。focused 只跑 schema/migration/native projection/effect-fence integrity、scoped Clippy 与 fmt。
 
-  - [ ] **C-c atomic import + generation reconciliation（目标 ≤1,800 production additions）：**
+  - [x] **C-c atomic import + generation reconciliation（目标 ≤1,800 production additions）：**
     StorageKEK HMAC 以 namespace + versioned private ref 域分离派生 conversationId/adapterStateKey，碰撞按
     固定最多 16 次 attempt 且事务内复核 exact ref。单个 `BEGIN IMMEDIATE` 同时提交 private binding、
     `NativeProjected(namespace)` origin、projection present state、DescribeAgents 对应 default configuration
     rev1 + 唯一 `ConfigurationChanged`、neutral descriptor、Catalog Upsert 与全部 ledger totals；before-COMMIT
     fault 必须零写，after-COMMIT unknown exact rescan 只读回。完整 generation 才分批 Removed/tombstone；
-    partial/restart/busy actor 不删，重现 Upsert 且复用 identity。focused 覆盖 import/replay/collision/cap/
-    generation/tombstone/expiry 与 Catalog snapshot/backfill。
+    partial/restart/busy actor 不删，tombstone/retired 重现都按 blind token 复用 identity 并重新写 exact private
+    binding；30 天 cleanup 只转 retired、不删除 audit。focused 覆盖 import/replay/collision/cap/generation/
+    tombstone/retired/expiry 与 Catalog snapshot/backfill。
 
-  - [ ] **C-d dynamic native snapshot + history-only receipt（目标 ≤1,800 production additions）：**
+  - [x] **C-d dynamic native snapshot + history-only receipt（目标 ≤1,800 production additions）：**
     native transcript 在 SQLite transaction 外经 adapter 每次重新验证并读取，最多 10,000 items/64 MiB；
     `NativeProjected` snapshot 使用 ephemeral/dynamic 分支发送，不向 `snapshots` 或 event journal 复制正文，
     也不能复用陈旧 Ready payload。Runtime 以 conversation + turn/item key 分域派生稳定 command/item/entity
@@ -2273,17 +2290,20 @@ P3.9 固定以下迁移边界：
     返回 not-found，不伪造 command journal status。focused 覆盖 append/duplicate/collision、10k/64 MiB、
     dynamic snapshot 零持久化、stale-ready 禁止、history-only 与 raw sentinel scan。
 
-  - [ ] **C-e native metadata claim + gated side effect（目标 ≤1,800 production additions）：** 先扩 B4
+  - [x] **C-e native metadata claim + gated side effect（目标 ≤1,800 production additions）：** 先扩 B4
     Store API 为 `claim → applying → applied|failed|outcomeUnknown`、active recovery 与 authenticated readback；
     claim 按最大 terminal write set 预留容量，terminal finalize 才同事务推进 descriptor/lifecycle、entry/catalog
     revision 与唯一 CatalogDelta。canonical adapter 只准备 redacted metadata effect spec 和 readback，禁止直接
-    `Command::new/.spawn` 或继承 PATH；Runtime-owned `NativeMutationCoordinator` 复用 current-binary exec-gate
-    substrate，并以 v6 `native_metadata_effect_fences` 持久化独立于 command FK 的 PGID/start-time/nonce/release
-    证据。Applying/fence/release 持久化后才放行 vendor；crash/restart 先 fence 已知 cooperative group，再只做
-    readback，absence 不猜 Failed，无法证明时保持 OutcomeUnknown 且绝不重调 vendor。CC Rename 接线；
-    archive/unarchive 在副作用前 typed unsupported、零 claim/零 spawn。扩 `typed_spawn_ownership` 静态门禁。
+    `Command::new/.spawn` 或继承 PATH；Runtime-owned `NativeMutationCoordinator` 建立 current-binary exec-gate
+    substrate（MVP 只由 synthetic test driver 驱动），并以 v6 `native_metadata_effect_fences` 持久化独立于
+    command FK 的 PGID/start-time/nonce/release 证据。Applying/fence/release 持久化后才允许 synthetic driver
+    放行；crash/restart 先 fence 已知 cooperative group，再只做 readback，absence 不猜 Failed，无法证明时
+    保持 OutcomeUnknown 且绝不重调 effect。MVP production coordinator 在 claim 前固定返回
+    `daemon.conversation.metadata_unsupported` / `PostMvpGated`，因此真实 Claude Rename/login 留 post-MVP，
+    零 ledger/fence/spawn；archive/unarchive 同样在副作用前 typed unsupported、零 claim/零 spawn。扩
+    `typed_spawn_ownership` 静态门禁。
 
-  - [ ] **C-f Core projector lifecycle + Task closeout（目标 ≤1,800 production additions）：** conversation
+  - [x] **C-f Core projector lifecycle + Task closeout（目标 ≤1,800 production additions）：** conversation
     actor control lane 串行 native metadata，authorization guard 从 claim 持有到 vendor/readback/Store reply；
     projector refresh 与 metadata mutation 不能并发覆盖同一 conversation。首轮/continuation/shutdown、actor
     install/uninstall、Codex typed unavailable、2,000/500/64 MiB/2 秒预算及真实本机 CC JSONL 只读
@@ -2292,6 +2312,16 @@ P3.9 固定以下迁移边界：
     selfcheck/Clippy/fmt/network/docs/diff、独立 spec/security 与 quality 终审，修完 P0/P1/P2 后只创建一个
     C0-C code/test 提交序列与一个 Task docs 收口 commit，并更新 progress/status。若任一 production 子片预估
     达 1,800 或实际达 2,000，继续在该子片内部按职责拆分，但不增加子片级终审/慢门禁/docs commit。
+
+  **Task 收口（2026-07-19）：** C-a/C-b/C-c/C-d 分别由 `d4ccd87`、`a43a2b2` / `aae0f82`、
+  `af5f879` / `2376880` / `d40d6d3` / `00ce6e2`、`a3d502a` 落地，C-e/C-f 与最终测试漂移由
+  `5355497` 统一收口。final-tree daemon 全包 exit 0：lib `885 passed / 3 ignored`（635.39 秒），
+  256 MiB boundary `5/5`（285.59 秒），全部 integration/doc tests 通过；dynamic focused
+  `6 passed / 1 ignored`，真实当前账号 JSONL smoke `1/1` 且重复 `10/10`。protocol 全包、Swift
+  `298 XCTest + 35 Swift Testing`、iOS Simulator `20/20`、schema sync、App selfcheck、diagnostics、
+  Clippy/fmt/network/no-net/docs/diff 全绿；spec/security 与 quality 双路终审 Approved、无 P0/P1/P2。
+  production native metadata 继续在 claim 前 `PostMvpGated`，synthetic current-binary roundtrip 不冒充
+  真实 Claude binary mutation。下一 Task 为 P3.9-A Rust shared-daemon client。
 - [ ] **P3.9-A Rust client：** 写 installation record 的 symlink/hardlink/mode/owner/corrupt/concurrent
   tests，再实现 CLI 独立 installation store、Unix transport、preface+Hello、messageId correlation、bounded
   reply/stream pumps 与 close-only shutdown。CLI 默认 stable UDS，显式 test endpoint 只能经注入；默认路径
