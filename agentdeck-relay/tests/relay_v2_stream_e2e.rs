@@ -8,7 +8,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use agentdeck_crypto::{SigningKey, sha256, sign_authentication_transcript, sign_tbs};
+use agentdeck_crypto::{
+    SigningKey, ValidatedRelayReceiptSignerIdentityV1, sha256, sign_authentication_transcript,
+    sign_tbs,
+};
 use agentdeck_protocol::relay_v2::auth::{
     AuthenticationRole, AuthenticationTranscriptV1, CertRole,
 };
@@ -42,6 +45,14 @@ use agentdeck_relay::v2::store::{
 use tempfile::TempDir;
 
 const NOW_MS: u64 = 1_726_000_000_000;
+
+fn test_store_config(path: PathBuf) -> RelayV2StoreConfig {
+    let identity = ValidatedRelayReceiptSignerIdentityV1::from_signing_key(&SigningKey::from_seed(
+        &[0x71; 32],
+    ))
+    .expect("valid test receipt signer");
+    RelayV2StoreConfig::new(path, identity)
+}
 
 #[derive(Default)]
 struct ManualMonotonicClock(AtomicU64);
@@ -409,8 +420,6 @@ impl RealmFixture {
             .register_machine(RegisterMachine {
                 code_hash,
                 request_hash: [seed.wrapping_add(6); 32],
-                response_blob: vec![seed],
-                receipt_hash: [seed.wrapping_add(7); 32],
                 machine_route,
                 root_pubkey: PublicKeyBytes(root.verifying_key().to_bytes()),
                 link_cert: link_cert.clone(),
@@ -577,7 +586,7 @@ impl Fixture {
         core_config: CoreConfig,
     ) -> Self {
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut config = RelayV2StoreConfig::new(store_path(&temp))
+        let mut config = test_store_config(store_path(&temp))
             .with_clock(Arc::new(FixedStoreClock))
             .with_disk_space_probe(Arc::new(PlentyOfDisk))
             .with_retention(retention);

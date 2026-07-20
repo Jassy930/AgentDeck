@@ -10,19 +10,29 @@ use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read};
 use std::path::{Component, Path, PathBuf};
 
-use agentdeck_crypto::{SigningKey, ValidatedRelayReceiptSignerIdentityV1};
+use agentdeck_crypto::{
+    CryptoError, SigningKey, ValidatedRelayReceiptSignerIdentityV1, sign_relay_admin_purge_receipt,
+};
+use agentdeck_protocol::relay_v2::{RelayAdminPurgeReceiptTbsV1, RelayAdminPurgeReceiptV1};
 use zeroize::Zeroizing;
 
-#[allow(dead_code)] // P4.2 下一内部子片接入 required server composition。
 pub(crate) struct LoadedRelayReceiptSigner {
     signing_key: SigningKey,
     identity: ValidatedRelayReceiptSignerIdentityV1,
 }
 
 impl LoadedRelayReceiptSigner {
-    #[allow(dead_code)] // P4.2 下一内部子片把公开身份交给 Store config。
     pub(crate) const fn identity(&self) -> ValidatedRelayReceiptSignerIdentityV1 {
         self.identity
+    }
+
+    /// 只接受 Store 冻结的 typed TBS，避免把 Relay 私钥暴露成 raw signing oracle。
+    pub(crate) fn sign(
+        &self,
+        tbs: RelayAdminPurgeReceiptTbsV1,
+    ) -> Result<RelayAdminPurgeReceiptV1, CryptoError> {
+        let verify_key = self.identity.bind_to_relay(tbs.relay_server_id)?;
+        sign_relay_admin_purge_receipt(&self.signing_key, &verify_key, tbs)
     }
 }
 
@@ -37,7 +47,7 @@ impl std::fmt::Debug for LoadedRelayReceiptSigner {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum RelayReceiptSignerLoadError {
+pub enum RelayReceiptSignerLoadError {
     #[error("Relay receipt signer seed path is invalid")]
     InvalidPath,
     #[error("Relay receipt signer path inspection failed")]
@@ -74,7 +84,6 @@ pub(crate) enum RelayReceiptSignerLoadError {
 }
 
 impl RelayReceiptSignerLoadError {
-    #[allow(dead_code)] // P4.2 下一内部子片接入 RelayV2ServerError 诊断映射。
     pub(crate) const fn code(&self) -> &'static str {
         match self {
             Self::InvalidPath => "relay.receipt.signer_path_invalid",
@@ -93,7 +102,6 @@ impl RelayReceiptSignerLoadError {
     }
 }
 
-#[allow(dead_code)] // P4.2 下一内部子片在任何 Store/listener side effect 前调用。
 pub(crate) fn load_relay_receipt_signer(
     path: &Path,
 ) -> Result<LoadedRelayReceiptSigner, RelayReceiptSignerLoadError> {
@@ -110,6 +118,17 @@ pub(crate) fn load_relay_receipt_signer(
         signing_key,
         identity,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn test_relay_receipt_signer() -> LoadedRelayReceiptSigner {
+    let signing_key = SigningKey::from_seed(&[0x71; 32]);
+    let identity = ValidatedRelayReceiptSignerIdentityV1::from_signing_key(&signing_key)
+        .expect("fixed test receipt signer is valid");
+    LoadedRelayReceiptSigner {
+        signing_key,
+        identity,
+    }
 }
 
 fn validate_lexical_path(path: &Path) -> Result<(), RelayReceiptSignerLoadError> {

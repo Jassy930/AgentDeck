@@ -1,5 +1,7 @@
 #![cfg(all(feature = "server", feature = "tls"))]
 
+mod support;
+
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -53,6 +55,8 @@ use tokio_tungstenite::{
 };
 use tracing_subscriber::fmt::MakeWriter;
 use x509_parser::prelude::{FromDer, X509Certificate};
+
+use support::{test_receipt_identity, write_test_receipt_signing_key};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
 const TEST_CERT_PEM: &[u8] = include_bytes!("fixtures/test_cert.pem");
@@ -387,6 +391,7 @@ fn server_config(temp: &TempDir) -> (RelayV2ServerConfig, PathBuf) {
                 key: fixture("test_key.pem"),
             }),
             admin: None,
+            receipt_signing_key: write_test_receipt_signing_key(temp.path()),
             log_level: "info".to_owned(),
         },
         storage_path,
@@ -491,7 +496,7 @@ async fn seed_realm(config: &RelayV2ServerConfig, revoked: bool) -> SeededRealm 
         config
             .store
             .clone()
-            .into_store_config()
+            .into_store_config(test_receipt_identity())
             .expect("seed Store config"),
     )
     .await
@@ -535,8 +540,6 @@ async fn seed_realm(config: &RelayV2ServerConfig, revoked: bool) -> SeededRealm 
         .register_machine(RegisterMachine {
             code_hash,
             request_hash: [0x52; 32],
-            response_blob: vec![0x53],
-            receipt_hash: [0x54; 32],
             machine_route,
             root_pubkey: PublicKeyBytes(root.verifying_key().to_bytes()),
             link_cert: link_cert.clone(),
@@ -1062,7 +1065,7 @@ async fn drain_sends_server_restarting_and_releases_the_store_for_reopen() {
     reopened_settings.disk_reserve_percent = 0;
     let reopened = RelayStoreHandle::open(
         reopened_settings
-            .into_store_config()
+            .into_store_config(test_receipt_identity())
             .expect("reopen config"),
     )
     .await
@@ -1082,7 +1085,12 @@ async fn dropping_server_handle_cancels_and_reaps_the_service_instead_of_detachi
             let mut settings = RelayV2StoreSettings::new(storage_path.clone());
             settings.disk_reserve_bytes = 0;
             settings.disk_reserve_percent = 0;
-            match RelayStoreHandle::open(settings.into_store_config().expect("reopen config")).await
+            match RelayStoreHandle::open(
+                settings
+                    .into_store_config(test_receipt_identity())
+                    .expect("reopen config"),
+            )
+            .await
             {
                 Ok(store) => break store,
                 Err(StoreError::StoreAlreadyOpen) => {
@@ -1102,6 +1110,7 @@ async fn dropping_server_handle_cancels_and_reaps_the_service_instead_of_detachi
 async fn library_selfcheck_loads_fixture_migrates_and_reopens_a_file_store() {
     let temp = TempDir::new().expect("tempdir");
     let storage_path = temp.path().join("selfcheck").join("relay.db");
+    let receipt_signing_key = write_test_receipt_signing_key(temp.path());
     let config_fixture = fixture("relay-selfcheck.toml");
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
     let arguments = vec![
@@ -1110,6 +1119,8 @@ async fn library_selfcheck_loads_fixture_migrates_and_reopens_a_file_store() {
         config_fixture.display().to_string(),
         "--storage".to_owned(),
         storage_path.display().to_string(),
+        "--receipt-signing-key".to_owned(),
+        receipt_signing_key.as_path().display().to_string(),
     ];
     let mut config = RelayV2ServerConfig::load_from(arguments, &BTreeMap::new(), cwd)
         .expect("load selfcheck fixture");
@@ -1126,7 +1137,7 @@ async fn library_selfcheck_loads_fixture_migrates_and_reopens_a_file_store() {
     reopened_settings.disk_reserve_percent = 0;
     let reopened = RelayStoreHandle::open(
         reopened_settings
-            .into_store_config()
+            .into_store_config(test_receipt_identity())
             .expect("selfcheck readback config"),
     )
     .await

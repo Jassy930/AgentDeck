@@ -8,6 +8,8 @@
 
 #![cfg(all(feature = "server", feature = "tls"))]
 
+mod support;
+
 use std::fs;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -56,6 +58,8 @@ use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
 };
 use tracing_subscriber::fmt::MakeWriter;
+
+use support::{test_receipt_identity, write_test_receipt_signing_key};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
 const TEST_CERT_PEM: &[u8] = include_bytes!("fixtures/test_cert.pem");
@@ -329,6 +333,7 @@ fn server_config(temp: &TempDir) -> (RelayV2ServerConfig, PathBuf) {
                 key: fixture("test_key.pem"),
             }),
             admin: None,
+            receipt_signing_key: write_test_receipt_signing_key(temp.path()),
             log_level: "info".to_owned(),
         },
         storage_path,
@@ -402,8 +407,6 @@ async fn seed_machine(
         .register_machine(RegisterMachine {
             code_hash,
             request_hash: sha256(&[seed, 0x01]),
-            response_blob: vec![seed, 0x02, 0x03],
-            receipt_hash: sha256(&[seed, 0x04]),
             machine_route,
             root_pubkey: PublicKeyBytes(root.verifying_key().to_bytes()),
             link_cert_hash: link_cert.canonical_sha256(),
@@ -497,7 +500,7 @@ async fn production_wss_keeps_endpoint_plaintext_out_of_relay_observable_surface
     let seed_store = RelayStoreHandle::open(
         store_settings
             .clone()
-            .into_store_config()
+            .into_store_config(test_receipt_identity())
             .expect("seed Store config"),
     )
     .await
@@ -698,7 +701,7 @@ async fn production_wss_keeps_endpoint_plaintext_out_of_relay_observable_surface
     // 关闭网络服务后重开同一真实 Store，以 byte-exact replay 证明 durability。
     let reopened = RelayStoreHandle::open(
         store_settings
-            .into_store_config()
+            .into_store_config(test_receipt_identity())
             .expect("reopen Store config"),
     )
     .await

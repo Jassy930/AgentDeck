@@ -2,7 +2,10 @@
 
 use std::fmt;
 
-use agentdeck_protocol::relay_v2::{EnrollmentCode, MachineRouteId, RelayServerId};
+use agentdeck_protocol::relay_v2::{
+    EnrollmentCode, MachineRouteId, RelayAdminPurgeReceiptV1, RelayReceiptVerifyKeyV1,
+    RelayServerId,
+};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -11,8 +14,22 @@ use crate::v2::store::{
     MachineInventoryEntry, MachineInventoryPage, MachineReadback, PurgeReadback,
 };
 
-pub const ADMIN_PROTOCOL_VERSION: u16 = 1;
+pub const ADMIN_PROTOCOL_VERSION: u16 = 2;
 pub const MAX_ADMIN_LINE_BYTES: usize = 64 * 1024;
+
+fn deserialize_admin_protocol_version<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let version = u16::deserialize(deserializer)?;
+    if version == ADMIN_PROTOCOL_VERSION {
+        Ok(version)
+    } else {
+        Err(serde::de::Error::custom(
+            "unsupported admin protocol version",
+        ))
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Digest32(pub [u8; 32]);
@@ -84,7 +101,7 @@ impl fmt::Debug for AdminRequest {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdminResponse {
-    Ok { result: AdminResult },
+    Ok { result: Box<AdminResult> },
     Error { error: AdminFailure },
 }
 
@@ -108,10 +125,19 @@ impl fmt::Debug for AdminResponse {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdminResult {
-    EnrollmentBundle { bundle: EnrollmentBundleV1 },
-    MachineInventory { page: MachineInventoryResult },
-    MachineReadback { readback: MachineReadbackResult },
-    MachinePurged { readback: PurgeReadbackResult },
+    EnrollmentBundle {
+        bundle: EnrollmentBundleV2,
+    },
+    MachineInventory {
+        page: MachineInventoryResult,
+    },
+    MachineReadback {
+        readback: MachineReadbackResult,
+    },
+    MachinePurged {
+        readback: PurgeReadbackResult,
+        receipt: Box<RelayAdminPurgeReceiptV1>,
+    },
 }
 
 impl fmt::Debug for AdminResult {
@@ -137,19 +163,21 @@ pub struct AdminFailure {
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct EnrollmentBundleV1 {
+pub struct EnrollmentBundleV2 {
+    #[serde(deserialize_with = "deserialize_admin_protocol_version")]
     pub version: u16,
     pub public_wss_url: String,
     pub relay_server_id: RelayServerId,
+    pub receipt_verify_key: RelayReceiptVerifyKeyV1,
     pub code: EnrollmentCode,
     pub spki_pins: Vec<Digest32>,
     pub expires_at_ms: u64,
 }
 
-impl fmt::Debug for EnrollmentBundleV1 {
+impl fmt::Debug for EnrollmentBundleV2 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("EnrollmentBundleV1")
+            .debug_struct("EnrollmentBundleV2")
             .field("version", &self.version)
             .field("relay_server_id", &self.relay_server_id.redacted())
             .field("secret_material", &"<redacted>")
@@ -210,6 +238,7 @@ pub struct MachineReadbackResult {
 pub struct PurgeReadbackResult {
     pub active_machine_routes: u64,
     pub retired_tombstones: u64,
+    pub consumed_enrollment_records: u64,
     pub device_grants: u64,
     pub revocations: u64,
     pub streams: u64,
@@ -245,6 +274,7 @@ impl From<PurgeReadback> for PurgeReadbackResult {
         Self {
             active_machine_routes: value.active_machine_routes,
             retired_tombstones: value.retired_tombstones,
+            consumed_enrollment_records: value.consumed_enrollment_records,
             device_grants: value.device_grants,
             revocations: value.revocations,
             streams: value.streams,
@@ -267,6 +297,11 @@ impl From<MachineReadback> for MachineReadbackResult {
 
 #[cfg(test)]
 mod tests {
+    use agentdeck_protocol::relay_v2::{
+        PublicKeyBytes, RELAY_RECEIPT_FORMAT_VERSION, RELAY_RECEIPT_KEY_GENERATION_MVP,
+        RelayReceiptKeyId,
+    };
+
     use super::*;
 
     #[test]
@@ -314,5 +349,43 @@ mod tests {
         let debug = format!("{entry:?}");
         assert!(!debug.contains(route_wire.trim_matches('"')));
         assert!(!debug.contains(fingerprint_wire.trim_matches('"')));
+    }
+
+    #[test]
+    fn enrollment_bundle_v2_rejects_v1_and_missing_receipt_anchor() {
+        let relay_server_id = RelayServerId::from_bytes([0x22; 16]);
+        let public_key = PublicKeyBytes([0x33; 32]);
+        let response = AdminResponse::Ok {
+            result: Box::new(AdminResult::EnrollmentBundle {
+                bundle: EnrollmentBundleV2 {
+                    version: ADMIN_PROTOCOL_VERSION,
+                    public_wss_url: "wss://relay.example.test/".to_owned(),
+                    relay_server_id,
+                    receipt_verify_key: RelayReceiptVerifyKeyV1 {
+                        receipt_format_version: RELAY_RECEIPT_FORMAT_VERSION,
+                        relay_server_id,
+                        key_generation: RELAY_RECEIPT_KEY_GENERATION_MVP,
+                        key_id: RelayReceiptKeyId::from_public_key(&public_key),
+                        public_key,
+                    },
+                    code: EnrollmentCode([0x44; 32]),
+                    spki_pins: vec![Digest32([0x55; 32])],
+                    expires_at_ms: 1,
+                },
+            }),
+        };
+        let wire = serde_json::to_value(response).expect("encode enrollment bundle v2");
+        assert_eq!(wire["result"]["bundle"]["version"], ADMIN_PROTOCOL_VERSION);
+
+        let mut old_version = wire.clone();
+        old_version["result"]["bundle"]["version"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<AdminResponse>(old_version).is_err());
+
+        let mut missing_anchor = wire;
+        missing_anchor["result"]["bundle"]
+            .as_object_mut()
+            .expect("bundle object")
+            .remove("receiptVerifyKey");
+        assert!(serde_json::from_value::<AdminResponse>(missing_anchor).is_err());
     }
 }

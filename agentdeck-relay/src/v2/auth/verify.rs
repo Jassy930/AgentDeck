@@ -22,9 +22,9 @@ use agentdeck_protocol::relay_v2::{
 use super::access::{AccessContext, Activation, DeviceAccess, MachineAccess};
 use super::challenge::{ChallengeRoute, ConsumedChallenge};
 use crate::v2::store::{
-    AuthorizationOwner, CommitMachineLinkAuth, ConfirmDeviceAuth, DeviceTrustView,
-    EnrollmentCodeSeed, GrantCommit, InstallGrantRecord, MachineRecord, MachineTrustView,
-    PersistRetirement, PersistRevocation, PurgeMachine, PurgeReadback, RegisterMachine,
+    AdminPurgeCommit, AdminPurgeCommitRequest, AuthorizationOwner, CommitMachineLinkAuth,
+    ConfirmDeviceAuth, DeviceTrustView, EnrollmentCodeSeed, GrantCommit, InstallGrantRecord,
+    MachineRecord, MachineTrustView, PersistRetirement, PersistRevocation, RegisterMachine,
     RelayStoreHandle, RetirementCommit, RevocationCommit, StoreError,
 };
 
@@ -525,19 +525,19 @@ impl AuthenticationService {
         self.store.seed_enrollment_code(request).await
     }
 
-    pub(super) async fn purge_machine_admin(
+    pub(super) async fn commit_admin_purge(
         &self,
-        request: PurgeMachine,
-    ) -> Result<PurgeReadback, StoreError> {
+        request: AdminPurgeCommitRequest,
+    ) -> Result<AdminPurgeCommit, StoreError> {
         let retry = request.clone();
         match self
             .store
-            .purge_machine_authorized(&self.owner, request)
+            .commit_admin_purge_authorized(&self.owner, request)
             .await
         {
             Err(unknown @ StoreError::CommitOutcomeUnknown { .. }) => self
                 .store
-                .purge_machine_authorized(&self.owner, retry)
+                .commit_admin_purge_authorized(&self.owner, retry)
                 .await
                 .map_err(|_| unknown),
             result => result,

@@ -11,6 +11,6 @@ pub mod server;
 pub use client::{AdminClient, AdminClientError};
 pub use command::{AdminCommandExecutor, AdminRuntimeConfig};
 pub use protocol::{
-    AdminFailure, AdminRequest, AdminResponse, AdminResult, Digest32, EnrollmentBundleV1,
+    AdminFailure, AdminRequest, AdminResponse, AdminResult, Digest32, EnrollmentBundleV2,
 };
 pub use server::{AdminServer, AdminServerError};

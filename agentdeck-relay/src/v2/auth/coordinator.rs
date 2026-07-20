@@ -26,9 +26,8 @@ use super::verify::{
     AuthenticationService, PreparedTerminal,
 };
 use crate::v2::store::{
-    EnrollmentCodeSeed, GrantCommit, MAX_CONTROL_BLOB_BYTES, MachineRecord, PurgeMachine,
-    PurgeReadback, RegisterMachine, RelayStoreHandle, RetirementCommit, RevocationCommit,
-    StoreError,
+    AdminPurgeCommit, AdminPurgeCommitRequest, EnrollmentCodeSeed, GrantCommit, MachineRecord,
+    RegisterMachine, RelayStoreHandle, RetirementCommit, RevocationCommit, StoreError,
 };
 
 const AUTHORIZATION_COMMAND_CAPACITY: usize = 256;
@@ -279,12 +278,6 @@ impl AuthorizationCoordinator {
         &self,
         request: RegisterMachine,
     ) -> Result<AuthorizationMutation<MachineRecord>, StoreError> {
-        if request.response_blob.len() > MAX_CONTROL_BLOB_BYTES {
-            return Err(StoreError::InvalidValue {
-                field: "register_machine.response_blob",
-                reason: "control blob exceeds 64 KiB",
-            });
-        }
         self.dispatch_store(|reply| AuthorizationCommand::RegisterMachine { request, reply })
             .await
     }
@@ -299,8 +292,8 @@ impl AuthorizationCoordinator {
 
     pub async fn purge_machine_admin(
         &self,
-        request: PurgeMachine,
-    ) -> Result<AuthorizationMutation<PurgeReadback>, StoreError> {
+        request: AdminPurgeCommitRequest,
+    ) -> Result<AuthorizationMutation<AdminPurgeCommit>, StoreError> {
         self.dispatch_store(|reply| AuthorizationCommand::PurgeMachineAdmin { request, reply })
             .await
     }
@@ -479,8 +472,8 @@ enum AuthorizationCommand {
         reply: oneshot::Sender<Result<(), StoreError>>,
     },
     PurgeMachineAdmin {
-        request: PurgeMachine,
-        reply: oneshot::Sender<Result<AuthorizationMutation<PurgeReadback>, StoreError>>,
+        request: AdminPurgeCommitRequest,
+        reply: oneshot::Sender<Result<AuthorizationMutation<AdminPurgeCommit>, StoreError>>,
     },
     InstallGrantFrom {
         origin: AccessContext,
@@ -712,12 +705,12 @@ async fn purge_machine_admin(
     service: &AuthenticationService,
     active: &ActiveConnectionRegistry,
     lifecycle: &LifecycleSink,
-    request: PurgeMachine,
-) -> Result<AuthorizationMutation<PurgeReadback>, StoreError> {
+    request: AdminPurgeCommitRequest,
+) -> Result<AuthorizationMutation<AdminPurgeCommit>, StoreError> {
     let transitions = active
-        .begin_machine_transition(request.machine_route)
+        .begin_machine_transition(request.purge.machine_route)
         .map_err(|_| StoreError::WorkerUnavailable)?;
-    match service.purge_machine_admin(request).await {
+    match service.commit_admin_purge(request).await {
         Ok(commit) => {
             let connections = active
                 .complete_machine_invalidation(&transitions)

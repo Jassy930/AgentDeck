@@ -11,6 +11,8 @@ use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use agentdeck_crypto::ValidatedRelayReceiptSignerIdentityV1;
+
 use crate::v2::store::{
     MAX_ENROLLMENT_CODES, RelayV2StoreConfig, RetentionLimits, StoreError, validate_store_path,
 };
@@ -78,20 +80,17 @@ impl RelayV2StoreSettings {
         Ok(())
     }
 
-    pub fn into_store_config(self) -> Result<RelayV2StoreConfig, StoreError> {
-        RelayV2StoreConfig::try_from(self)
-    }
-}
-
-impl TryFrom<RelayV2StoreSettings> for RelayV2StoreConfig {
-    type Error = StoreError;
-
-    fn try_from(settings: RelayV2StoreSettings) -> Result<Self, Self::Error> {
-        settings.validate()?;
-        let retention = settings.retention_limits();
-        Ok(RelayV2StoreConfig::new(settings.storage_path)
-            .with_retention(retention)
-            .with_max_enrollment_codes(settings.max_enrollment_codes))
+    pub fn into_store_config(
+        self,
+        receipt_signer_identity: ValidatedRelayReceiptSignerIdentityV1,
+    ) -> Result<RelayV2StoreConfig, StoreError> {
+        self.validate()?;
+        let retention = self.retention_limits();
+        Ok(
+            RelayV2StoreConfig::new(self.storage_path, receipt_signer_identity)
+                .with_retention(retention)
+                .with_max_enrollment_codes(self.max_enrollment_codes),
+        )
     }
 }
 
@@ -122,7 +121,27 @@ pub struct RelayV2ServerConfig {
     pub store: RelayV2StoreSettings,
     pub transport: RelayV2TransportMode,
     pub admin: Option<RelayV2AdminConfig>,
+    pub receipt_signing_key: RelayReceiptSigningKeyPath,
     pub log_level: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RelayReceiptSigningKeyPath(PathBuf);
+
+impl RelayReceiptSigningKeyPath {
+    pub fn new(path: PathBuf) -> Self {
+        Self(path)
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for RelayReceiptSigningKeyPath {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RelayReceiptSigningKeyPath(<redacted>)")
+    }
 }
 
 /// 仅供 Relay host 本机 UDS 与公开 enrollment bundle 使用的配置。
@@ -210,6 +229,8 @@ struct RelayV2RawArgs {
     #[arg(long)]
     tls_key: Option<PathBuf>,
     #[arg(long)]
+    receipt_signing_key: Option<PathBuf>,
+    #[arg(long)]
     allow_insecure_loopback: bool,
     #[arg(long)]
     proxy_mode: bool,
@@ -241,6 +262,7 @@ struct RelayV2FileConfig {
     max_enrollment_codes: Option<u64>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
+    receipt_signing_key: Option<PathBuf>,
     allow_insecure_loopback: Option<bool>,
     proxy_mode: Option<bool>,
     log_level: Option<String>,
@@ -270,6 +292,8 @@ pub enum RelayV2ConfigError {
     },
     #[error("Relay v2 config value is invalid: {field}")]
     InvalidValue { field: &'static str },
+    #[error("Relay receipt signing key is required")]
+    ReceiptSignerRequired,
     #[error("Relay v2 storage configuration is invalid: {0}")]
     StorageInvalid(#[source] StoreError),
     #[error("TLS certificate and key must be configured together")]
@@ -303,6 +327,7 @@ impl RelayV2ConfigError {
             Self::ConfigFileRead { .. } => "relay.config.file_read",
             Self::ConfigFileParse { .. } => "relay.config.file_parse",
             Self::InvalidValue { .. } => "relay.config.invalid_value",
+            Self::ReceiptSignerRequired => "relay.receipt.signer_required",
             Self::StorageInvalid(_) => "relay.config.storage_invalid",
             Self::TlsPartial => "relay.config.tls_partial",
             Self::TlsFeatureMissing => "relay.transport.tls_feature_missing",
@@ -406,6 +431,25 @@ impl RelayV2ServerConfig {
                 .transpose()?,
         };
         let file = load_v2_file_config(config_path.as_deref())?;
+
+        let receipt_signing_key = match raw.receipt_signing_key {
+            Some(path) => RelayReceiptSigningKeyPath::new(resolve_from_cwd(path, cwd)),
+            None => match environment.get("AGENTDECK_RELAY_RECEIPT_SIGNING_KEY") {
+                Some(value) if value.trim().is_empty() => {
+                    return Err(RelayV2ConfigError::InvalidEnvironment {
+                        key: "AGENTDECK_RELAY_RECEIPT_SIGNING_KEY",
+                    });
+                }
+                Some(value) => {
+                    RelayReceiptSigningKeyPath::new(resolve_from_cwd(PathBuf::from(value), cwd))
+                }
+                None => RelayReceiptSigningKeyPath::new(
+                    file.receipt_signing_key
+                        .clone()
+                        .ok_or(RelayV2ConfigError::ReceiptSignerRequired)?,
+                ),
+            },
+        };
 
         let bind = parse_socket_addr(
             raw.bind
@@ -572,6 +616,7 @@ impl RelayV2ServerConfig {
             store,
             transport,
             admin,
+            receipt_signing_key,
             log_level,
         };
         config.validate()?;
@@ -606,6 +651,9 @@ fn load_v2_file_config(path: Option<&Path>) -> Result<RelayV2FileConfig, RelayV2
     })?;
     config.tls_cert = config.tls_cert.map(|value| resolve_from_cwd(value, parent));
     config.tls_key = config.tls_key.map(|value| resolve_from_cwd(value, parent));
+    config.receipt_signing_key = config
+        .receipt_signing_key
+        .map(|value| resolve_from_cwd(value, parent));
     config.admin_socket = config
         .admin_socket
         .map(|value| resolve_from_cwd(value, parent));
@@ -762,10 +810,17 @@ fn select_v2_transport(
 
 #[cfg(test)]
 mod tests {
+    use agentdeck_crypto::{SigningKey, ValidatedRelayReceiptSignerIdentityV1};
+
     use super::*;
-    use crate::v2::store::{RelayV2StoreConfig, StoreError};
+    use crate::v2::store::StoreError;
     #[allow(unused_imports)]
     use std::net::SocketAddr;
+
+    fn signer_identity() -> ValidatedRelayReceiptSignerIdentityV1 {
+        ValidatedRelayReceiptSignerIdentityV1::from_signing_key(&SigningKey::from_seed(&[0x71; 32]))
+            .expect("valid test receipt signer")
+    }
     #[test]
     fn v2_store_settings_preserve_every_runtime_limit_during_conversion() {
         let mut settings =
@@ -781,7 +836,7 @@ mod tests {
         settings.disk_reserve_percent = 8;
         settings.max_enrollment_codes = 999;
 
-        let store_config = RelayV2StoreConfig::try_from(settings).unwrap();
+        let store_config = settings.into_store_config(signer_identity()).unwrap();
 
         assert_eq!(
             store_config.storage_path,
@@ -821,16 +876,17 @@ mod tests {
 
     #[test]
     fn v2_store_settings_reject_relative_storage_before_store_start() {
-        let error = RelayV2StoreConfig::try_from(RelayV2StoreSettings::new(PathBuf::from(
-            "relative/relay.db",
-        )))
-        .unwrap_err();
+        let error = RelayV2StoreSettings::new(PathBuf::from("relative/relay.db"))
+            .into_store_config(signer_identity())
+            .unwrap_err();
 
         assert!(matches!(error, StoreError::PathNotAbsolute));
 
         let noncanonical =
             RelayV2StoreSettings::new(PathBuf::from("/var/lib/agentdeck-relay/../relay.db"));
-        let error = RelayV2StoreConfig::try_from(noncanonical).unwrap_err();
+        let error = noncanonical
+            .into_store_config(signer_identity())
+            .unwrap_err();
         assert!(matches!(error, StoreError::PathNotCanonical));
 
         for alias in [
@@ -838,9 +894,9 @@ mod tests {
             "/var//lib/agentdeck-relay/relay.db",
             "/var/lib/agentdeck-relay/relay.db/",
         ] {
-            let error =
-                RelayV2StoreConfig::try_from(RelayV2StoreSettings::new(PathBuf::from(alias)))
-                    .unwrap_err();
+            let error = RelayV2StoreSettings::new(PathBuf::from(alias))
+                .into_store_config(signer_identity())
+                .unwrap_err();
             assert!(
                 matches!(error, StoreError::PathNotCanonical),
                 "lexical alias must be rejected: {alias}"
@@ -854,7 +910,7 @@ mod tests {
             RelayV2StoreSettings::new(PathBuf::from("/var/lib/agentdeck-relay/relay.db"));
         settings.replay_page_max_frames = 65;
 
-        let error = RelayV2StoreConfig::try_from(settings).unwrap_err();
+        let error = settings.into_store_config(signer_identity()).unwrap_err();
 
         assert!(matches!(
             error,
@@ -867,7 +923,7 @@ mod tests {
         let mut enrollment =
             RelayV2StoreSettings::new(PathBuf::from("/var/lib/agentdeck-relay/relay.db"));
         enrollment.max_enrollment_codes = 4_097;
-        let error = RelayV2StoreConfig::try_from(enrollment).unwrap_err();
+        let error = enrollment.into_store_config(signer_identity()).unwrap_err();
         assert!(matches!(
             error,
             StoreError::InvalidValue {

@@ -17,6 +17,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 
+use agentdeck_crypto::{
+    SigningKey, ValidatedRelayReceiptSignerIdentityV1, sign_relay_admin_purge_receipt,
+};
 use agentdeck_protocol::relay_v2::frame::{Publish, SealedBlob};
 use agentdeck_protocol::relay_v2::{
     CertRole, DeviceRevocation, DeviceRouteId, Ed25519Signature, GrantSerial, LinkGeneration,
@@ -24,12 +27,12 @@ use agentdeck_protocol::relay_v2::{
     StreamCursor, StreamGenerationId, StreamRouteId, TrustEpoch,
 };
 use agentdeck_relay::v2::store::{
-    Clock, DiskSpace, DiskSpaceProbe, EnrollmentCodeSeed, FaultInjector, FaultPoint,
-    InstallGrantRecord, MAX_MACHINE_INVENTORY_PAGE, MachineInventoryQuery, MachineReadbackQuery,
-    MetadataLimits, PersistAck, PersistPublish, PersistRevocation, PersistSubscription,
-    PersistUnsubscribe, PublishDisposition, PurgeMachine, RegisterMachine, RelayStoreHandle,
-    RelayV2StoreConfig, ReplayPageRequest, ReplayPosition, RetentionLimits, StoreError,
-    StoreSnapshot, StreamRegistration,
+    AdminPurgeCommitRequest, AdminPurgePreparation, Clock, DiskSpace, DiskSpaceProbe,
+    EnrollmentCodeSeed, FaultInjector, FaultPoint, InstallGrantRecord, MAX_MACHINE_INVENTORY_PAGE,
+    MachineInventoryQuery, MachineReadbackQuery, MetadataLimits, PersistAck, PersistPublish,
+    PersistRevocation, PersistSubscription, PersistUnsubscribe, PublishDisposition, PurgeMachine,
+    PurgeReadback, RegisterMachine, RelayStoreHandle, RelayV2StoreConfig, ReplayPageRequest,
+    ReplayPosition, RetentionLimits, StoreError, StoreSnapshot, StreamRegistration,
 };
 #[cfg(unix)]
 use fs2::FileExt;
@@ -38,7 +41,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 const SCHEMA_FAMILY: &str = "agentdeck-relay-v2";
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const EXPECTED_TABLES: [&str; 8] = [
     "device_grants",
     "enrollment_codes",
@@ -49,6 +52,43 @@ const EXPECTED_TABLES: [&str; 8] = [
     "streams",
     "subscriptions",
 ];
+
+fn test_store_config(path: PathBuf) -> RelayV2StoreConfig {
+    let identity =
+        ValidatedRelayReceiptSignerIdentityV1::from_signing_key(&test_receipt_signing_key())
+            .expect("valid test receipt signer");
+    RelayV2StoreConfig::new(path, identity)
+}
+
+fn test_receipt_signing_key() -> SigningKey {
+    SigningKey::from_seed(&[0x71; 32])
+}
+
+async fn signed_admin_purge(
+    store: &RelayStoreHandle,
+    purge: PurgeMachine,
+) -> Result<PurgeReadback, StoreError> {
+    let tbs = match store.prepare_admin_purge(purge.clone()).await? {
+        AdminPurgePreparation::Sign { tbs } => tbs,
+        AdminPurgePreparation::Committed { receipt } => {
+            return store
+                .commit_admin_purge(AdminPurgeCommitRequest { purge, receipt })
+                .await
+                .map(|commit| commit.readback);
+        }
+    };
+    let signing_key = test_receipt_signing_key();
+    let verify_key = ValidatedRelayReceiptSignerIdentityV1::from_signing_key(&signing_key)
+        .expect("valid test receipt signer")
+        .bind_to_relay(tbs.relay_server_id)
+        .expect("bind test receipt signer");
+    let receipt = sign_relay_admin_purge_receipt(&signing_key, &verify_key, tbs)
+        .expect("sign test admin purge receipt");
+    store
+        .commit_admin_purge(AdminPurgeCommitRequest { purge, receipt })
+        .await
+        .map(|commit| commit.readback)
+}
 
 fn store_path(temp: &TempDir) -> PathBuf {
     temp.path().join("relay-private").join("relay.db")
@@ -320,7 +360,7 @@ impl FaultInjector for OneShotFaultInjector {
 }
 
 fn fixed_config(path: &Path) -> RelayV2StoreConfig {
-    RelayV2StoreConfig::new(path.to_path_buf()).with_clock(Arc::new(FixedClock(NOW_MS)))
+    test_store_config(path.to_path_buf()).with_clock(Arc::new(FixedClock(NOW_MS)))
 }
 
 fn limits_without_disk_gate() -> RetentionLimits {
@@ -387,8 +427,6 @@ fn register_machine_request(seed: u8) -> RegisterMachine {
     RegisterMachine {
         code_hash: [seed; 32],
         request_hash: [seed.wrapping_add(1); 32],
-        response_blob: vec![seed, 0xad, 0x02],
-        receipt_hash: [seed.wrapping_add(2); 32],
         machine_route: machine_route(seed),
         root_pubkey: PublicKeyBytes([seed.wrapping_add(3); 32]),
         link_cert: certificate(CertRole::Link, seed, 3),
@@ -585,7 +623,7 @@ async fn register_fixture_stream(
 }
 
 async fn open_production(path: &Path) -> RelayStoreHandle {
-    RelayStoreHandle::open(RelayV2StoreConfig::new(path.to_path_buf()))
+    RelayStoreHandle::open(test_store_config(path.to_path_buf()))
         .await
         .expect("production v2 store should open")
 }
@@ -691,8 +729,9 @@ fn create_higher_schema_only_in_wal(path: &Path) -> Connection {
     writer
         .pragma_update(None, "wal_autocheckpoint", 0)
         .expect("disable schema-only WAL autocheckpoint");
+    let higher_version = SCHEMA_VERSION + 1;
     writer
-        .execute_batch(
+        .execute_batch(&format!(
             "CREATE TABLE relay_meta (
                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                 schema_family TEXT NOT NULL,
@@ -703,12 +742,12 @@ fn create_higher_schema_only_in_wal(path: &Path) -> Connection {
              INSERT INTO relay_meta(
                 singleton, schema_family, schema_version, schema_signature, relay_server_id
              ) VALUES (
-                1, 'agentdeck-relay-v2', 2,
+                1, 'agentdeck-relay-v2', {higher_version},
                 x'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1',
                 x'5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a'
              );
-             PRAGMA user_version = 2;",
-        )
+             PRAGMA user_version = {higher_version};"
+        ))
         .expect("write higher schema only into WAL");
     secure_fixture_database(path);
     writer
@@ -1018,7 +1057,7 @@ async fn higher_schema_is_typed_reject_and_zero_write() {
     create_relay_meta_fixture(&path, SCHEMA_VERSION + 1, [0xa1; 32]);
     let before = file_state(&path);
 
-    let error = RelayStoreHandle::open(RelayV2StoreConfig::new(path.clone()))
+    let error = RelayStoreHandle::open(test_store_config(path.clone()))
         .await
         .expect_err("higher schema must be rejected");
 
@@ -1039,7 +1078,7 @@ async fn exact_legacy_v1_schema_requires_explicit_reset_and_is_zero_write() {
     create_exact_legacy_v1_fixture(&path);
     let before = file_state(&path);
 
-    let error = RelayStoreHandle::open(RelayV2StoreConfig::new(path.clone()))
+    let error = RelayStoreHandle::open(test_store_config(path.clone()))
         .await
         .expect_err("legacy v1 schema must not be migrated in place");
 
@@ -1065,7 +1104,7 @@ async fn unknown_nonempty_schema_is_typed_reject_and_zero_write() {
     secure_fixture_database(&path);
     let before = file_state(&path);
 
-    let error = RelayStoreHandle::open(RelayV2StoreConfig::new(path.clone()))
+    let error = RelayStoreHandle::open(test_store_config(path.clone()))
         .await
         .expect_err("unknown schema must be rejected");
 
@@ -1080,7 +1119,7 @@ async fn corrupt_v2_signature_is_typed_reject_and_zero_write() {
     create_relay_meta_fixture(&path, SCHEMA_VERSION, [0xff; 32]);
     let before = file_state(&path);
 
-    let error = RelayStoreHandle::open(RelayV2StoreConfig::new(path.clone()))
+    let error = RelayStoreHandle::open(test_store_config(path.clone()))
         .await
         .expect_err("signature mismatch must be rejected");
 
@@ -1112,7 +1151,7 @@ async fn malformed_schema_marker_type_is_typed_reject_and_zero_write() {
     secure_fixture_database(&path);
     let before = file_state(&path);
 
-    let error = RelayStoreHandle::open(RelayV2StoreConfig::new(path.clone()))
+    let error = RelayStoreHandle::open(test_store_config(path.clone()))
         .await
         .expect_err("malformed marker type must be rejected");
 
@@ -1145,7 +1184,7 @@ async fn non_database_and_truncated_database_are_typed_corrupt_and_zero_write() 
 
     for path in [random_path, valid_path] {
         let before = file_state(&path);
-        let error = RelayStoreHandle::open(RelayV2StoreConfig::new(path.clone()))
+        let error = RelayStoreHandle::open(test_store_config(path.clone()))
             .await
             .expect_err("invalid SQLite bytes must be typed corrupt");
         assert!(
@@ -1189,7 +1228,7 @@ async fn schema_literal_case_change_is_not_normalized_into_false_compatibility()
     drop(conn);
     let before = file_state(&path);
 
-    let error = RelayStoreHandle::open(RelayV2StoreConfig::new(path.clone()))
+    let error = RelayStoreHandle::open(test_store_config(path.clone()))
         .await
         .expect_err("semantic DDL difference must not normalize as compatible");
     assert!(matches!(error, StoreError::UnknownOrCorruptSchema));
@@ -1202,7 +1241,7 @@ async fn relative_production_storage_path_is_rejected_before_creation() {
     assert!(!relative.is_absolute());
     assert!(!relative.exists(), "fixture path unexpectedly exists");
 
-    let error = RelayStoreHandle::open(RelayV2StoreConfig::new(relative.clone()))
+    let error = RelayStoreHandle::open(test_store_config(relative.clone()))
         .await
         .expect_err("relative production path must be rejected");
 
@@ -1218,7 +1257,7 @@ async fn noncanonical_absolute_storage_path_is_rejected_before_filesystem_change
         .join("never-created")
         .join("..")
         .join("relay.db");
-    let error = RelayStoreHandle::open(RelayV2StoreConfig::new(noncanonical))
+    let error = RelayStoreHandle::open(test_store_config(noncanonical))
         .await
         .expect_err("parent-dir alias must be rejected before path traversal");
     assert!(matches!(error, StoreError::PathNotCanonical));
@@ -1238,17 +1277,16 @@ async fn symlink_file_and_symlink_parent_are_both_rejected() {
 
     let linked_file = temp.path().join("linked-file.db");
     symlink(&real_db, &linked_file).expect("create file symlink");
-    let file_error = RelayStoreHandle::open(RelayV2StoreConfig::new(linked_file))
+    let file_error = RelayStoreHandle::open(test_store_config(linked_file))
         .await
         .expect_err("symlink DB must be rejected");
     assert!(matches!(file_error, StoreError::SymlinkRejected { .. }));
 
     let linked_parent = temp.path().join("linked-parent");
     symlink(&real_dir, &linked_parent).expect("create parent symlink");
-    let parent_error =
-        RelayStoreHandle::open(RelayV2StoreConfig::new(linked_parent.join("another.db")))
-            .await
-            .expect_err("symlink parent must be rejected");
+    let parent_error = RelayStoreHandle::open(test_store_config(linked_parent.join("another.db")))
+        .await
+        .expect_err("symlink parent must be rejected");
     assert!(matches!(parent_error, StoreError::SymlinkRejected { .. }));
 }
 
@@ -1296,7 +1334,7 @@ async fn existing_overbroad_directory_or_database_permissions_are_rejected() {
         .expect("set insecure parent mode");
     let path = parent.join("relay.db");
 
-    let directory_error = RelayStoreHandle::open(RelayV2StoreConfig::new(path.clone()))
+    let directory_error = RelayStoreHandle::open(test_store_config(path.clone()))
         .await
         .expect_err("overbroad parent mode must be rejected");
     assert!(matches!(
@@ -1309,7 +1347,7 @@ async fn existing_overbroad_directory_or_database_permissions_are_rejected() {
     fs::write(&path, []).expect("create DB fixture");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("set insecure DB mode");
 
-    let database_error = RelayStoreHandle::open(RelayV2StoreConfig::new(path))
+    let database_error = RelayStoreHandle::open(test_store_config(path))
         .await
         .expect_err("overbroad DB mode must be rejected");
     assert!(matches!(
@@ -1364,8 +1402,6 @@ async fn enrollment_consumption_and_machine_insert_are_atomic_and_exact_retry_is
     assert_eq!(retry.machine_route, first.machine_route);
     assert_eq!(retry.response_blob, first.response_blob);
     assert_eq!(retry.receipt_hash, first.receipt_hash);
-    assert_eq!(retry.response_blob, request.response_blob);
-    assert_eq!(retry.receipt_hash, request.receipt_hash);
 
     let mut conflicting = request;
     conflicting.request_hash = [0xee; 32];
@@ -1433,7 +1469,7 @@ async fn consumed_enrollment_code_replays_and_conflicts_after_code_ttl() {
     let temp = TempDir::new().expect("tempdir");
     let path = store_path(&temp);
     let clock = Arc::new(MutableClock::new(NOW_MS));
-    let store = RelayStoreHandle::open(RelayV2StoreConfig::new(path).with_clock(clock.clone()))
+    let store = RelayStoreHandle::open(test_store_config(path).with_clock(clock.clone()))
         .await
         .expect("open store");
     store
@@ -1494,7 +1530,7 @@ async fn enrollment_accepts_independent_link_and_data_certificate_generations() 
 }
 
 #[tokio::test]
-async fn enrollment_and_revocation_control_blobs_have_hard_bounds() {
+async fn generated_enrollment_response_and_revocation_control_blob_are_bounded() {
     const CONTROL_LIMIT: usize = 64 * 1024;
 
     let temp = TempDir::new().expect("tempdir");
@@ -1506,18 +1542,11 @@ async fn enrollment_and_revocation_control_blobs_have_hard_bounds() {
         .seed_enrollment_code(enrollment_seed(0x17))
         .await
         .expect("seed enrollment code");
-    let mut oversized_enrollment = register_machine_request(0x17);
-    oversized_enrollment.response_blob = vec![0xaa; CONTROL_LIMIT + 1];
-    let enrollment_error = store
-        .register_machine(oversized_enrollment)
-        .await
-        .expect_err("oversized frozen response must fail before consuming code");
-    assert!(matches!(enrollment_error, StoreError::InvalidValue { .. }));
-
-    store
+    let enrollment = store
         .register_machine(register_machine_request(0x17))
         .await
-        .expect("valid retry proves code remained unconsumed");
+        .expect("Store generates canonical bounded enrollment response");
+    assert!(enrollment.response_blob.len() <= CONTROL_LIMIT);
     install_fixture_grant(&store, 0x17, 0x27, 1).await;
     let mut oversized_revocation = revocation_request(0x17, 0x27, 1);
     oversized_revocation.signed_revocation_blob = vec![0xbb; CONTROL_LIMIT + 1];
@@ -1603,7 +1632,7 @@ async fn register_machine_after_commit_response_loss_recovers_after_ttl_maintena
     let path = store_path(&temp);
     let clock = Arc::new(MutableClock::new(NOW_MS));
     let store = RelayStoreHandle::open(
-        RelayV2StoreConfig::new(path.clone())
+        test_store_config(path.clone())
             .with_clock(clock.clone())
             .with_fault_injector(Arc::new(OneShotFaultInjector::new(
                 FaultPoint::RegisterMachineAfterCommit,
@@ -1640,7 +1669,7 @@ async fn register_machine_after_commit_response_loss_recovers_after_ttl_maintena
     store.shutdown().await.expect("shutdown first worker");
 
     let reopened =
-        RelayStoreHandle::open(RelayV2StoreConfig::new(path.clone()).with_clock(clock.clone()))
+        RelayStoreHandle::open(test_store_config(path.clone()).with_clock(clock.clone()))
             .await
             .expect("reopen committed store");
     let recovered = reopened
@@ -1648,8 +1677,8 @@ async fn register_machine_after_commit_response_loss_recovers_after_ttl_maintena
         .await
         .expect("same request must recover frozen response");
     assert!(recovered.duplicate);
-    assert_eq!(recovered.response_blob, request.response_blob);
-    assert_eq!(recovered.receipt_hash, request.receipt_hash);
+    assert!(!recovered.response_blob.is_empty());
+    assert_ne!(recovered.receipt_hash, [0; 32]);
 
     let mut conflicting = request;
     conflicting.request_hash = [0xee; 32];
@@ -3229,13 +3258,15 @@ async fn purge_machine_retires_route_and_reads_back_all_active_data_empty() {
         .await
         .expect("revoke purge fixture");
 
-    let readback = store
-        .purge_machine(PurgeMachine {
+    let readback = signed_admin_purge(
+        &store,
+        PurgeMachine {
             machine_route: machine_route(0x2b),
             expected_root_fingerprint: machine_root_fingerprint(0x2b),
-        })
-        .await
-        .expect("purge machine");
+        },
+    )
+    .await
+    .expect("purge machine");
     assert_eq!(readback.active_machine_routes, 0);
     assert_eq!(readback.retired_tombstones, 1);
     assert_eq!(readback.device_grants, 0);
@@ -3348,13 +3379,15 @@ async fn purge_compares_root_fingerprint_inside_the_transaction_before_any_write
         StoreError::RootFingerprintMismatch
     ));
 
-    let wrong = store
-        .purge_machine(PurgeMachine {
+    let wrong = signed_admin_purge(
+        &store,
+        PurgeMachine {
             machine_route: machine_route(0x34),
             expected_root_fingerprint: [0xff; 32],
-        })
-        .await
-        .expect_err("wrong root fingerprint must reject purge");
+        },
+    )
+    .await
+    .expect_err("wrong root fingerprint must reject purge");
     assert!(matches!(wrong, StoreError::RootFingerprintMismatch));
     assert_eq!(
         store
@@ -3367,13 +3400,15 @@ async fn purge_compares_root_fingerprint_inside_the_transaction_before_any_write
         before
     );
 
-    let purged = store
-        .purge_machine(PurgeMachine {
+    let purged = signed_admin_purge(
+        &store,
+        PurgeMachine {
             machine_route: machine_route(0x34),
             expected_root_fingerprint: machine_root_fingerprint(0x34),
-        })
-        .await
-        .expect("matching root fingerprint purges");
+        },
+    )
+    .await
+    .expect("matching root fingerprint purges");
     assert_eq!(purged.active_machine_routes, 0);
     assert_eq!(purged.retired_tombstones, 1);
     assert_eq!(purged.frames, 0);
@@ -3553,7 +3588,7 @@ async fn age_limit_is_applied_by_later_publish_and_exposes_gap() {
         .expect("publish old frame");
     first.shutdown().await.expect("shutdown first worker");
 
-    let aged_config = RelayV2StoreConfig::new(path.clone())
+    let aged_config = test_store_config(path.clone())
         .with_retention(limits)
         .with_clock(Arc::new(FixedClock(NOW_MS + DAY_MS + 1)))
         .with_disk_space_probe(Arc::new(FixedDiskProbe(DiskSpace {
@@ -3596,7 +3631,7 @@ async fn per_machine_byte_limit_evicts_oldest_across_streams() {
         ..limits_without_disk_gate()
     };
     let clock = Arc::new(MutableClock::new(NOW_MS));
-    let config = RelayV2StoreConfig::new(path.clone())
+    let config = test_store_config(path.clone())
         .with_retention(limits)
         .with_clock(clock.clone())
         .with_disk_space_probe(Arc::new(FixedDiskProbe(DiskSpace {
@@ -3721,7 +3756,7 @@ async fn global_byte_limit_evicts_oldest_across_machines() {
         ..limits_without_disk_gate()
     };
     let clock = Arc::new(MutableClock::new(NOW_MS));
-    let config = RelayV2StoreConfig::new(path.clone())
+    let config = test_store_config(path.clone())
         .with_retention(limits)
         .with_clock(clock.clone())
         .with_disk_space_probe(Arc::new(FixedDiskProbe(DiskSpace {
@@ -3850,7 +3885,7 @@ async fn projected_disk_reserve_uses_max_of_absolute_and_percent_but_control_wri
     assert_eq!(limits.disk_reserve_for(GIB), 512 * 1024 * 1024);
     assert_eq!(limits.disk_reserve_for(20 * GIB), GIB);
     let disk = Arc::new(MutableDiskProbe::new(u64::MAX, 20 * GIB));
-    let config = RelayV2StoreConfig::new(path.clone())
+    let config = test_store_config(path.clone())
         .with_clock(Arc::new(FixedClock(NOW_MS)))
         .with_disk_space_probe(disk.clone());
     let store = RelayStoreHandle::open(config)
@@ -3879,13 +3914,15 @@ async fn projected_disk_reserve_uses_max_of_absolute_and_percent_but_control_wri
         .revoke(revocation_request(0x58, 0x39, 1))
         .await
         .expect("revocation control write remains available under disk-low");
-    let purged = store
-        .purge_machine(PurgeMachine {
+    let purged = signed_admin_purge(
+        &store,
+        PurgeMachine {
             machine_route: machine_route(0x58),
             expected_root_fingerprint: machine_root_fingerprint(0x58),
-        })
-        .await
-        .expect("purge remains available under disk-low");
+        },
+    )
+    .await
+    .expect("purge remains available under disk-low");
     assert_eq!(purged.active_machine_routes, 0);
     assert_eq!(purged.retired_tombstones, 1);
 
@@ -4247,7 +4284,7 @@ async fn hot_wal_higher_schema_inspection_is_typed_and_byte_immutable() {
     assert!(before.wal.is_some(), "fixture must have a WAL sidecar");
     assert!(before.shm.is_some(), "fixture must have a SHM sidecar");
 
-    let error = RelayStoreHandle::open(RelayV2StoreConfig::new(path.clone()))
+    let error = RelayStoreHandle::open(test_store_config(path.clone()))
         .await
         .expect_err("hot-WAL higher schema must be rejected");
     assert!(matches!(
@@ -4293,16 +4330,14 @@ async fn schema_and_user_version_only_in_hot_wal_are_detected_without_source_wri
     assert_eq!(main_tables, 0, "schema objects must exist only in WAL");
     drop(immutable);
 
-    let error = RelayStoreHandle::open(RelayV2StoreConfig::new(path.clone()))
+    let error = RelayStoreHandle::open(test_store_config(path.clone()))
         .await
         .expect_err("schema-only higher WAL must be rejected before source RW open");
     assert!(
         matches!(
             &error,
-            StoreError::SchemaTooNew {
-                found: 2,
-                supported: SCHEMA_VERSION
-            }
+            StoreError::SchemaTooNew { found, supported }
+                if *found == SCHEMA_VERSION + 1 && *supported == SCHEMA_VERSION
         ),
         "unexpected schema-only WAL error: {error:?}"
     );
@@ -4319,12 +4354,12 @@ async fn hot_wal_snapshot_copy_preflight_fails_closed_without_source_write_or_re
     assert!(before.wal.is_some(), "fixture must have a WAL sidecar");
     assert!(before.shm.is_some(), "fixture must have a SHM sidecar");
 
-    let config = RelayV2StoreConfig::new(path.clone()).with_disk_space_probe(Arc::new(
-        FixedDiskProbe(DiskSpace {
+    let config = test_store_config(path.clone()).with_disk_space_probe(Arc::new(FixedDiskProbe(
+        DiskSpace {
             available_bytes: 0,
             total_bytes: 1,
-        }),
-    ));
+        },
+    )));
     let error = RelayStoreHandle::open(config)
         .await
         .expect_err("snapshot copy must honor disk reserve before creating temp files");
@@ -4376,7 +4411,7 @@ async fn hot_wal_restart_cleans_only_unlocked_exactly_marked_snapshot_artifacts(
     let snapshot_symlink = root.join(".agentdeck-relay-schema-inspect-symlink");
     symlink(&symlink_target, &snapshot_symlink).expect("create snapshot-like symlink");
 
-    let error = RelayStoreHandle::open(RelayV2StoreConfig::new(path.clone()))
+    let error = RelayStoreHandle::open(test_store_config(path.clone()))
         .await
         .expect_err("higher schema remains rejected after stale cleanup");
     assert!(
@@ -4416,7 +4451,7 @@ async fn restart_cleans_trusted_crash_snapshot_even_after_source_wal_disappears(
     let stale =
         create_crash_snapshot_fixture(&root, "no-wal-stale", &snapshot_marker_bytes(&path), false);
 
-    let error = RelayStoreHandle::open(RelayV2StoreConfig::new(path))
+    let error = RelayStoreHandle::open(test_store_config(path))
         .await
         .expect_err("higher schema remains rejected after no-WAL cleanup");
     assert!(matches!(error, StoreError::SchemaTooNew { .. }));
@@ -4444,7 +4479,7 @@ async fn fresh_store_start_also_cleans_trusted_crash_snapshot_for_same_path() {
         false,
     );
 
-    let store = RelayStoreHandle::open(RelayV2StoreConfig::new(path))
+    let store = RelayStoreHandle::open(test_store_config(path))
         .await
         .expect("fresh store starts after reclaiming its trusted artifact");
     assert!(!stale.exists());
@@ -4465,7 +4500,7 @@ async fn insecure_parent_is_rejected_before_any_crash_snapshot_cleanup() {
     fs::set_permissions(&root, fs::Permissions::from_mode(0o770))
         .expect("make parent group-writable");
 
-    let error = RelayStoreHandle::open(RelayV2StoreConfig::new(path))
+    let error = RelayStoreHandle::open(test_store_config(path))
         .await
         .expect_err("unsafe parent must fail before cleanup");
     assert!(matches!(error, StoreError::InsecurePermissions { .. }));
@@ -4498,7 +4533,7 @@ async fn hot_wal_legacy_schema_inspection_requires_reset_and_is_byte_immutable()
     assert!(before.wal.is_some(), "fixture must have a WAL sidecar");
     assert!(before.shm.is_some(), "fixture must have a SHM sidecar");
 
-    let error = RelayStoreHandle::open(RelayV2StoreConfig::new(path.clone()))
+    let error = RelayStoreHandle::open(test_store_config(path.clone()))
         .await
         .expect_err("hot-WAL legacy schema must be rejected");
     assert!(matches!(error, StoreError::LegacyV1ResetRequired));
@@ -4509,9 +4544,9 @@ async fn hot_wal_legacy_schema_inspection_requires_reset_and_is_byte_immutable()
 #[tokio::test]
 async fn schema_signature_matches_independent_canonical_ddl_digest_fixture() {
     const EXPECTED_CANONICAL_DDL_SHA256: [u8; 32] = [
-        0x0a, 0x66, 0x67, 0x20, 0x39, 0x4a, 0xfd, 0x28, 0xd4, 0x7d, 0x43, 0x43, 0x90, 0x60, 0xa2,
-        0x08, 0x9c, 0x2d, 0x3f, 0xdc, 0x6b, 0x63, 0x42, 0x27, 0x86, 0x14, 0x44, 0x5c, 0x55, 0xaf,
-        0x54, 0x23,
+        0xdc, 0x01, 0xdb, 0xdf, 0x24, 0x1d, 0x88, 0x3e, 0x18, 0x7f, 0xc0, 0x12, 0x17, 0x91, 0xfb,
+        0xfb, 0x0f, 0x65, 0x44, 0xce, 0xe7, 0x5f, 0x2b, 0x6c, 0xed, 0x18, 0x88, 0x4d, 0xcb, 0x7b,
+        0x7f, 0x74,
     ];
 
     let temp = TempDir::new().expect("tempdir");
@@ -4851,8 +4886,7 @@ async fn purge_before_commit_fault_preserves_machine_then_retry_removes_everythi
         expected_root_fingerprint: machine_root_fingerprint(0x86),
     };
 
-    let error = store
-        .purge_machine(request.clone())
+    let error = signed_admin_purge(&store, request.clone())
         .await
         .expect_err("fault before purge COMMIT must surface");
     assert!(matches!(
@@ -4869,8 +4903,7 @@ async fn purge_before_commit_fault_preserves_machine_then_retry_removes_everythi
         .expect("rolled-back purge leaves data readable");
     assert_eq!(retained.frames.len(), 1);
 
-    let readback = store
-        .purge_machine(request)
+    let readback = signed_admin_purge(&store, request)
         .await
         .expect("retry purge commits");
     assert_eq!(readback.active_machine_routes, 0);
@@ -4889,7 +4922,7 @@ async fn maintenance_enforces_logical_age_expiry_without_a_later_publish() {
         max_age_ms: 100,
         ..limits_without_disk_gate()
     };
-    let config = RelayV2StoreConfig::new(path.clone())
+    let config = test_store_config(path.clone())
         .with_retention(limits)
         .with_clock(clock.clone())
         .with_disk_space_probe(Arc::new(FixedDiskProbe(DiskSpace {
@@ -4951,7 +4984,7 @@ async fn foreign_replay_cannot_trigger_target_stream_age_maintenance() {
         max_age_ms: 100,
         ..limits_without_disk_gate()
     };
-    let config = RelayV2StoreConfig::new(path.clone())
+    let config = test_store_config(path.clone())
         .with_retention(limits)
         .with_clock(clock.clone())
         .with_disk_space_probe(Arc::new(FixedDiskProbe(DiskSpace {
@@ -5040,7 +5073,7 @@ async fn maintenance_gc_deletes_only_expired_unconsumed_enrollment_rows() {
     let temp = TempDir::new().expect("tempdir");
     let path = store_path(&temp);
     let clock = Arc::new(MutableClock::new(NOW_MS));
-    let config = RelayV2StoreConfig::new(path.clone()).with_clock(clock.clone());
+    let config = test_store_config(path.clone()).with_clock(clock.clone());
     let store = RelayStoreHandle::open(config)
         .await
         .expect("open enrollment GC store");
@@ -5063,7 +5096,7 @@ async fn maintenance_gc_deletes_only_expired_unconsumed_enrollment_rows() {
             .expect("seed enrollment GC fixture");
     }
     let consumed_request = register_machine_request(0x89);
-    store
+    let consumed_first = store
         .register_machine(consumed_request.clone())
         .await
         .expect("consume enrollment fixture");
@@ -5079,7 +5112,7 @@ async fn maintenance_gc_deletes_only_expired_unconsumed_enrollment_rows() {
         .await
         .expect("exact expiry still permits frozen response retry");
     assert!(exact_retry.duplicate);
-    assert_eq!(exact_retry.response_blob, consumed_request.response_blob);
+    assert_eq!(exact_retry.response_blob, consumed_first.response_blob);
 
     clock.set(NOW_MS + 101);
     let expired_report = store
@@ -5114,7 +5147,7 @@ async fn enrollment_code_quota_counts_only_pending_rows_and_expiry_releases_capa
     let temp = TempDir::new().expect("tempdir");
     let path = store_path(&temp);
     let clock = Arc::new(MutableClock::new(NOW_MS));
-    let config = RelayV2StoreConfig::new(path.clone())
+    let config = test_store_config(path.clone())
         .with_clock(clock.clone())
         .with_max_enrollment_codes(1);
     let store = RelayStoreHandle::open(config)
@@ -5173,7 +5206,7 @@ async fn maintenance_before_commit_fault_rolls_back_frames_codes_and_stream_stat
         max_age_ms: 100,
         ..limits_without_disk_gate()
     };
-    let config = RelayV2StoreConfig::new(path.clone())
+    let config = test_store_config(path.clone())
         .with_retention(limits)
         .with_clock(clock.clone())
         .with_disk_space_probe(Arc::new(FixedDiskProbe(DiskSpace {

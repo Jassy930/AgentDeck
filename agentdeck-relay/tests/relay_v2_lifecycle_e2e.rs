@@ -1,5 +1,7 @@
 #![cfg(feature = "server")]
 
+mod support;
+
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::{Command, Stdio};
@@ -23,12 +25,18 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
+use support::{test_receipt_identity, write_test_receipt_signing_key};
+
 #[cfg(unix)]
 const SIGNAL_CHILD_ENV: &str = "AGENTDECK_RELAY_V2_SIGNAL_CHILD";
 #[cfg(unix)]
 const SIGNAL_STORAGE_ENV: &str = "AGENTDECK_RELAY_V2_SIGNAL_STORAGE";
 
 fn signal_child_config(storage_path: PathBuf) -> RelayV2ServerConfig {
+    let signer_parent = storage_path
+        .parent()
+        .expect("signal Store path has a private parent");
+    let receipt_signing_key = write_test_receipt_signing_key(signer_parent);
     let mut store = RelayV2StoreSettings::new(storage_path);
     store.disk_reserve_bytes = 0;
     store.disk_reserve_percent = 0;
@@ -38,6 +46,7 @@ fn signal_child_config(storage_path: PathBuf) -> RelayV2ServerConfig {
         store,
         transport: RelayV2TransportMode::InsecureLoopback,
         admin: None,
+        receipt_signing_key,
         log_level: "info".to_owned(),
     }
 }
@@ -143,7 +152,7 @@ fn production_signal_adapter_drains_on_sigterm_and_releases_the_store() {
         let reopened = RelayStoreHandle::open(
             signal_child_config(storage_path)
                 .store
-                .into_store_config()
+                .into_store_config(test_receipt_identity())
                 .expect("reopen Store config"),
         )
         .await
@@ -165,6 +174,11 @@ async fn proxy_loopback_slow_http_cannot_extend_network_drain_past_five_seconds(
         store,
         transport: RelayV2TransportMode::ProxyLoopback,
         admin: None,
+        receipt_signing_key: write_test_receipt_signing_key(
+            storage_path
+                .parent()
+                .expect("proxy Store path has a private parent"),
+        ),
         log_level: "info".to_owned(),
     })
     .await
@@ -194,9 +208,13 @@ async fn proxy_loopback_slow_http_cannot_extend_network_drain_past_five_seconds(
     let mut reopened = RelayV2StoreSettings::new(storage_path);
     reopened.disk_reserve_bytes = 0;
     reopened.disk_reserve_percent = 0;
-    let reopened = RelayStoreHandle::open(reopened.into_store_config().expect("reopen config"))
-        .await
-        .expect("handle wait must quiesce Core/Auth/Store and release DB lock");
+    let reopened = RelayStoreHandle::open(
+        reopened
+            .into_store_config(test_receipt_identity())
+            .expect("reopen config"),
+    )
+    .await
+    .expect("handle wait must quiesce Core/Auth/Store and release DB lock");
     reopened.shutdown().await.expect("shutdown reopened Store");
 }
 

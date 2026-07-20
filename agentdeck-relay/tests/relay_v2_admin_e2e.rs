@@ -1,25 +1,31 @@
 #![cfg(all(feature = "server", feature = "tls", unix))]
 
+mod support;
+
 use std::net::SocketAddr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agentdeck_crypto::{SignatureBytes, SigningKey, VerifyingKey, sha256, sign_tbs, verify_tbs};
+use agentdeck_crypto::{
+    SignatureBytes, SigningKey, VerifyingKey, sha256, sign_tbs, verify_relay_admin_purge_receipt,
+    verify_tbs,
+};
 use agentdeck_protocol::relay_v2::{
     CertRole, Ed25519Signature, EnrollmentCode, LinkGeneration, MachineEnrollmentRequestV1,
-    MachineEnrollmentResponseV1, MachineRouteId, PublicKeyBytes, RelayServerId, RootKeyId,
-    SignedCertificate, TrustEpoch,
+    MachineEnrollmentResponseV1, MachineRouteId, PublicKeyBytes,
+    RelayAdminPurgeReceiptExpectationV1, RelayServerId, RootKeyId, SignedCertificate, TrustEpoch,
+    purge_request_hash,
 };
 use agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION;
 use agentdeck_relay::config::{
-    RelayV2AdminConfig, RelayV2ServerConfig, RelayV2StoreSettings, RelayV2TlsPaths,
-    RelayV2TransportMode,
+    RelayReceiptSigningKeyPath, RelayV2AdminConfig, RelayV2ServerConfig, RelayV2StoreSettings,
+    RelayV2TlsPaths, RelayV2TransportMode,
 };
 use agentdeck_relay::v2::admin::AdminClient;
 use agentdeck_relay::v2::admin::protocol::{
-    AdminRequest, AdminResponse, AdminResult, Digest32, EnrollmentBundleV1, MAX_ADMIN_LINE_BYTES,
+    AdminRequest, AdminResponse, AdminResult, Digest32, EnrollmentBundleV2, MAX_ADMIN_LINE_BYTES,
 };
 use agentdeck_relay::v2::server::tls::{TlsIdentityPaths, load_tls_identity};
 use agentdeck_relay::v2::server::{RelayV2ServerError, RelayV2ServerHandle};
@@ -32,6 +38,8 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
 use tokio_rustls::TlsConnector;
+
+use support::{test_receipt_identity, write_test_receipt_signing_key};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const TEST_CERT_PEM: &[u8] = include_bytes!("fixtures/test_cert.pem");
@@ -252,16 +260,21 @@ fn enrollment_request(
     )
 }
 
-async fn create_bundle(client: &AdminClient) -> EnrollmentBundleV1 {
-    match client
+async fn create_bundle(client: &AdminClient) -> EnrollmentBundleV2 {
+    let response = client
         .request(&AdminRequest::MachineEnrollCreate {})
         .await
-        .expect("admin create request")
-    {
-        AdminResponse::Ok {
-            result: AdminResult::EnrollmentBundle { bundle },
-        } => bundle,
+        .expect("admin create request");
+    match ok_result(response) {
+        AdminResult::EnrollmentBundle { bundle } => bundle,
         other => panic!("unexpected admin response: {other:?}"),
+    }
+}
+
+fn ok_result(response: AdminResponse) -> AdminResult {
+    match response {
+        AdminResponse::Ok { result } => *result,
+        other => panic!("expected successful admin response: {other:?}"),
     }
 }
 
@@ -291,6 +304,7 @@ async fn start_server(temp: &TempDir) -> (RelayV2ServerHandle, PathBuf, PathBuf,
             public_wss_url: "wss://relay.example.test/".to_owned(),
             spki_pins: vec![pin],
         }),
+        receipt_signing_key: write_test_receipt_signing_key(temp.path()),
         log_level: "info".to_owned(),
     };
     let handle = RelayV2ServerHandle::start(config)
@@ -320,6 +334,54 @@ async fn admin_uds_and_tls_enrollment_are_one_shot_exact_and_fingerprint_bound()
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .expect("open read-only Relay DB");
+    let stored_anchor: (i64, Vec<u8>, i64, Vec<u8>, Vec<u8>) = readonly
+        .query_row(
+            "SELECT receipt_format_version, relay_server_id, receipt_key_generation,
+                    receipt_key_id, receipt_public_key FROM relay_meta WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .expect("read persisted receipt verify key");
+    assert_eq!(
+        i64::from(bundle.receipt_verify_key.receipt_format_version),
+        stored_anchor.0
+    );
+    assert_eq!(
+        bundle
+            .receipt_verify_key
+            .relay_server_id
+            .as_bytes()
+            .as_slice(),
+        stored_anchor.1.as_slice()
+    );
+    assert_eq!(
+        i64::try_from(bundle.receipt_verify_key.key_generation).expect("generation fits i64"),
+        stored_anchor.2
+    );
+    assert_eq!(
+        bundle.receipt_verify_key.key_id.as_bytes().as_slice(),
+        stored_anchor.3.as_slice()
+    );
+    assert_eq!(
+        bundle.receipt_verify_key.public_key.0.as_slice(),
+        stored_anchor.4.as_slice()
+    );
+    assert_eq!(
+        bundle.receipt_verify_key.relay_server_id,
+        bundle.relay_server_id
+    );
+    bundle
+        .receipt_verify_key
+        .validate()
+        .expect("bundle carries a complete validated receipt anchor");
     let stored_hash: Vec<u8> = readonly
         .query_row(
             "SELECT code_hash FROM enrollment_codes WHERE code_hash = ?1",
@@ -366,10 +428,8 @@ async fn admin_uds_and_tls_enrollment_are_one_shot_exact_and_fingerprint_bound()
         .request(&AdminRequest::MachineInventory { after: None })
         .await
         .expect("inventory request");
-    match inventory {
-        AdminResponse::Ok {
-            result: AdminResult::MachineInventory { page },
-        } => {
+    match ok_result(inventory) {
+        AdminResult::MachineInventory { page } => {
             assert_eq!(page.entries.len(), 1);
             assert_eq!(page.entries[0].machine_route, request.machine_route);
             assert_eq!(page.entries[0].root_fingerprint, Digest32(root_fingerprint));
@@ -389,11 +449,11 @@ async fn admin_uds_and_tls_enrollment_are_one_shot_exact_and_fingerprint_bound()
     assert!(cli.status.success(), "admin CLI stderr: {:?}", cli.stderr);
     assert!(cli.stderr.is_empty());
     assert!(matches!(
-        serde_json::from_slice::<AdminResponse>(&cli.stdout)
-            .expect("CLI stdout is one JSON object"),
-        AdminResponse::Ok {
-            result: AdminResult::MachineInventory { .. }
-        }
+        ok_result(
+            serde_json::from_slice::<AdminResponse>(&cli.stdout)
+                .expect("CLI stdout is one JSON object")
+        ),
+        AdminResult::MachineInventory { .. }
     ));
     let route_wire = serde_json::to_string(&request.machine_route).expect("route wire");
     let fingerprint_wire =
@@ -417,11 +477,11 @@ async fn admin_uds_and_tls_enrollment_are_one_shot_exact_and_fingerprint_bound()
         readback_cli.stderr
     );
     assert!(matches!(
-        serde_json::from_slice::<AdminResponse>(&readback_cli.stdout)
-            .expect("readback CLI stdout JSON"),
-        AdminResponse::Ok {
-            result: AdminResult::MachineReadback { .. }
-        }
+        ok_result(
+            serde_json::from_slice::<AdminResponse>(&readback_cli.stdout)
+                .expect("readback CLI stdout JSON")
+        ),
+        AdminResult::MachineReadback { .. }
     ));
     let invalid_cli = tokio::process::Command::new(env!("CARGO_BIN_EXE_agentdeck-relay"))
         .args([
@@ -467,18 +527,58 @@ async fn admin_uds_and_tls_enrollment_are_one_shot_exact_and_fingerprint_bound()
         })
         .await
         .expect("confirmed purge");
-    match purged {
-        AdminResponse::Ok {
-            result: AdminResult::MachinePurged { readback },
-        } => {
+    let purged_wire = serde_json::to_vec(&purged).expect("encode first purge response");
+    let first_receipt = match ok_result(purged) {
+        AdminResult::MachinePurged { readback, receipt } => {
             assert_eq!(readback.active_machine_routes, 0);
             assert_eq!(readback.retired_tombstones, 1);
+            assert_eq!(readback.consumed_enrollment_records, 0);
             assert_eq!(readback.device_grants, 0);
             assert_eq!(readback.streams, 0);
             assert_eq!(readback.frames, 0);
+            assert_eq!(receipt.relay_server_id, bundle.relay_server_id);
+            assert_eq!(receipt.machine_route, request.machine_route);
+            assert_eq!(receipt.root_key_id, request.link_cert.root_key_id);
+            assert_eq!(receipt.root_fingerprint, root_fingerprint);
+            assert_eq!(receipt.trust_epoch, request.link_cert.trust_epoch);
+            assert_eq!(receipt.enrollment_receipt_hash, response.receipt_hash);
+            assert_eq!(receipt.readback.active_machine_routes, 0);
+            assert_eq!(receipt.readback.retired_tombstones, 1);
+            let expectation = RelayAdminPurgeReceiptExpectationV1 {
+                relay_server_id: bundle.relay_server_id,
+                machine_route: request.machine_route,
+                root_key_id: request.link_cert.root_key_id,
+                root_fingerprint,
+                trust_epoch: request.link_cert.trust_epoch,
+                enrollment_receipt_hash: response.receipt_hash,
+                purge_request_hash: purge_request_hash(request.machine_route, root_fingerprint)
+                    .expect("canonical purge request hash"),
+            };
+            let verify_key = test_receipt_identity()
+                .bind_to_relay(bundle.relay_server_id)
+                .expect("test receipt verify key");
+            verify_relay_admin_purge_receipt(&verify_key, &expectation, &receipt)
+                .expect("UDS returns a valid signed purge receipt");
+            receipt
         }
         other => panic!("unexpected purge response: {other:?}"),
-    }
+    };
+    let duplicate_purge = client
+        .request(&AdminRequest::MachinePurge {
+            machine_route: request.machine_route,
+            confirm_root_fingerprint: Digest32(root_fingerprint),
+        })
+        .await
+        .expect("duplicate confirmed purge");
+    assert_eq!(
+        serde_json::to_vec(&duplicate_purge).expect("encode duplicate purge response"),
+        purged_wire,
+        "duplicate UDS purge must return the exact frozen receipt and readback"
+    );
+    assert!(matches!(
+        ok_result(duplicate_purge),
+        AdminResult::MachinePurged { receipt, .. } if receipt == first_receipt
+    ));
     let readback = client
         .request(&AdminRequest::MachineReadback {
             machine_route: request.machine_route,
@@ -487,10 +587,8 @@ async fn admin_uds_and_tls_enrollment_are_one_shot_exact_and_fingerprint_bound()
         .await
         .expect("confirmed readback");
     assert!(matches!(
-        readback,
-        AdminResponse::Ok {
-            result: AdminResult::MachineReadback { .. }
-        }
+        ok_result(readback),
+        AdminResult::MachineReadback { .. }
     ));
 
     // 合法 MachineRoot 签入不可解析 endpoint key 时必须在消费 code 前拒绝；修复请求
@@ -702,6 +800,9 @@ async fn direct_tls_admin_pin_mismatch_fails_before_db_or_socket_side_effects() 
             public_wss_url: "wss://relay.example.test/".to_owned(),
             spki_pins: vec![[0xff; 32]],
         }),
+        receipt_signing_key: RelayReceiptSigningKeyPath::new(
+            temp.path().join("must-not-be-read.seed"),
+        ),
         log_level: "info".to_owned(),
     };
     let error = match RelayV2ServerHandle::start(config).await {

@@ -9,7 +9,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use agentdeck_crypto::{SigningKey, sha256, sign_authentication_transcript, sign_tbs};
+use agentdeck_crypto::{
+    SigningKey, ValidatedRelayReceiptSignerIdentityV1, sha256, sign_authentication_transcript,
+    sign_tbs,
+};
 use agentdeck_protocol::relay_v2::auth::{
     AuthenticationRole, AuthenticationTranscriptV1, CertRole,
 };
@@ -46,6 +49,14 @@ use tempfile::TempDir;
 
 const NOW_MS: u64 = 1_726_000_000_000;
 const TERMINAL_DEADLINE: Duration = Duration::from_secs(2);
+
+fn test_store_config(path: PathBuf) -> RelayV2StoreConfig {
+    let identity = ValidatedRelayReceiptSignerIdentityV1::from_signing_key(&SigningKey::from_seed(
+        &[0x71; 32],
+    ))
+    .expect("valid test receipt signer");
+    RelayV2StoreConfig::new(path, identity)
+}
 
 #[derive(Default)]
 struct ManualMonotonicClock(AtomicU64);
@@ -124,7 +135,7 @@ fn store_config(path: &Path, fault: Arc<ArmedFault>) -> RelayV2StoreConfig {
         disk_reserve_percent: 0,
         ..RetentionLimits::default()
     };
-    RelayV2StoreConfig::new(path.to_path_buf())
+    test_store_config(path.to_path_buf())
         .with_clock(Arc::new(FixedStoreClock))
         .with_disk_space_probe(Arc::new(PlentyOfDisk))
         .with_retention(retention)
@@ -276,8 +287,6 @@ impl RealmFixture {
             .register_machine(RegisterMachine {
                 code_hash,
                 request_hash: [seed.wrapping_add(6); 32],
-                response_blob: vec![seed],
-                receipt_hash: [seed.wrapping_add(7); 32],
                 machine_route,
                 root_pubkey: PublicKeyBytes(root.verifying_key().to_bytes()),
                 link_cert: link_cert.clone(),

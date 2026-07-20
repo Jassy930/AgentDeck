@@ -5,12 +5,14 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use agentdeck_crypto::ValidatedRelayReceiptSignerIdentityV1;
 use agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION;
-use agentdeck_protocol::relay_v2::frame::{Publish, RetireMachine};
+use agentdeck_protocol::relay_v2::frame::{Publish, RetireMachine, RetirementCommitted};
 use agentdeck_protocol::relay_v2::{
     DeviceRevocation, DeviceRouteId, GrantSerial, LinkGeneration, MAX_FRAME_BYTES, MachineRouteId,
-    OpaqueRouteFrame, PublicKeyBytes, RelayFrameBody, RelayGrant, RelayServerId, RootKeyId,
-    SignedCertificate, StreamCursor, StreamGenerationId, StreamRouteId, TrustEpoch, encode,
+    OpaqueRouteFrame, PublicKeyBytes, RelayAdminPurgeReceiptTbsV1, RelayAdminPurgeReceiptV1,
+    RelayFrameBody, RelayGrant, RelayReceiptVerifyKeyV1, RelayServerId, RootKeyId,
+    SignedCertificate, StreamCursor, StreamGenerationId, StreamRouteId, TrustEpoch, decode, encode,
 };
 use thiserror::Error;
 
@@ -26,6 +28,28 @@ pub const MAX_SUBSCRIPTIONS_GLOBAL: u64 = 262_144;
 pub const MAX_DEVICE_ROUTES_PER_MACHINE: u64 = 256;
 pub const MAX_DEVICE_ROUTES_GLOBAL: u64 = 65_536;
 pub const MAX_TERMINAL_BLOB_BYTES: usize = 4 * 1024;
+
+pub(crate) fn retirement_terminal_is_canonical_and_bound(
+    machine_route: MachineRouteId,
+    trust_epoch: TrustEpoch,
+    retirement_hash: [u8; 32],
+    terminal_blob: &[u8],
+) -> bool {
+    let Ok(frame) = decode(terminal_blob) else {
+        return false;
+    };
+    encode(&frame) == terminal_blob
+        && matches!(
+            frame.body,
+            RelayFrameBody::RetirementCommitted(RetirementCommitted {
+                machine_route: bound_route,
+                trust_epoch: bound_epoch,
+                retire_hash,
+            }) if bound_route == machine_route
+                && bound_epoch == trust_epoch
+                && retire_hash == retirement_hash
+        )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetadataLimits {
@@ -80,6 +104,7 @@ impl MetadataLimits {
 #[derive(Clone)]
 pub struct RelayV2StoreConfig {
     pub storage_path: PathBuf,
+    pub receipt_signer_identity: ValidatedRelayReceiptSignerIdentityV1,
     pub retention: RetentionLimits,
     pub max_enrollment_codes: u64,
     pub metadata_limits: MetadataLimits,
@@ -89,9 +114,13 @@ pub struct RelayV2StoreConfig {
 }
 
 impl RelayV2StoreConfig {
-    pub fn new(storage_path: PathBuf) -> Self {
+    pub fn new(
+        storage_path: PathBuf,
+        receipt_signer_identity: ValidatedRelayReceiptSignerIdentityV1,
+    ) -> Self {
         Self {
             storage_path,
+            receipt_signer_identity,
             retention: RetentionLimits::default(),
             max_enrollment_codes: MAX_ENROLLMENT_CODES,
             metadata_limits: MetadataLimits::default(),
@@ -137,6 +166,7 @@ impl fmt::Debug for RelayV2StoreConfig {
         formatter
             .debug_struct("RelayV2StoreConfig")
             .field("storage_path", &self.storage_path)
+            .field("receipt_signer_identity", &self.receipt_signer_identity)
             .field("retention", &self.retention)
             .field("max_enrollment_codes", &self.max_enrollment_codes)
             .field("metadata_limits", &self.metadata_limits)
@@ -150,6 +180,7 @@ pub struct StoreSnapshot {
     pub schema_version: u32,
     pub schema_signature: [u8; 32],
     pub relay_server_id: RelayServerId,
+    pub receipt_verify_key: RelayReceiptVerifyKeyV1,
     pub table_names: Vec<String>,
     pub journal_mode: String,
     pub synchronous: i64,
@@ -185,6 +216,8 @@ pub enum StoreError {
     LegacyV1ResetRequired,
     #[error("unknown or corrupt relay schema")]
     UnknownOrCorruptSchema,
+    #[error("configured Relay receipt signer does not match the persisted trust anchor")]
+    ReceiptSignerMismatch,
     #[error("Relay store changed while its schema was being inspected")]
     SchemaInspectionRaced,
     #[error("SQLite pragma {name} read back {actual}, expected {expected}")]
@@ -271,6 +304,7 @@ impl StoreError {
             Self::SchemaTooNew { .. } => "relay.store.schema_too_new",
             Self::LegacyV1ResetRequired => "relay.store.legacy_reset_required",
             Self::UnknownOrCorruptSchema => "relay.store.schema_corrupt",
+            Self::ReceiptSignerMismatch => "relay.store.receipt_signer_mismatch",
             Self::PragmaMismatch { .. } => "relay.store.pragma_mismatch",
             Self::Io(_)
             | Self::Sqlite(_)
@@ -501,8 +535,6 @@ impl fmt::Debug for EnrollmentCodeSeed {
 pub struct RegisterMachine {
     pub code_hash: [u8; 32],
     pub request_hash: [u8; 32],
-    pub response_blob: Vec<u8>,
-    pub receipt_hash: [u8; 32],
     pub machine_route: MachineRouteId,
     pub root_pubkey: PublicKeyBytes,
     pub link_cert: SignedCertificate,
@@ -927,6 +959,44 @@ impl fmt::Debug for PurgeMachine {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub enum AdminPurgePreparation {
+    Sign { tbs: RelayAdminPurgeReceiptTbsV1 },
+    Committed { receipt: RelayAdminPurgeReceiptV1 },
+}
+
+impl fmt::Debug for AdminPurgePreparation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AdminPurgePreparation")
+            .field(
+                "state",
+                &match self {
+                    Self::Sign { .. } => "sign",
+                    Self::Committed { .. } => "committed",
+                },
+            )
+            .field("proof_material", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AdminPurgeCommitRequest {
+    pub purge: PurgeMachine,
+    pub receipt: RelayAdminPurgeReceiptV1,
+}
+
+impl fmt::Debug for AdminPurgeCommitRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AdminPurgeCommitRequest")
+            .field("purge", &self.purge)
+            .field("receipt", &"<redacted>")
+            .finish()
+    }
+}
+
 pub const MAX_MACHINE_INVENTORY_PAGE: usize = 128;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1045,6 +1115,7 @@ pub struct RetirementCommit {
 pub struct PurgeReadback {
     pub active_machine_routes: u64,
     pub retired_tombstones: u64,
+    pub consumed_enrollment_records: u64,
     pub device_grants: u64,
     pub revocations: u64,
     pub streams: u64,
@@ -1060,6 +1131,10 @@ impl fmt::Debug for PurgeReadback {
             .debug_struct("PurgeReadback")
             .field("active_machine_routes", &self.active_machine_routes)
             .field("retired_tombstones", &self.retired_tombstones)
+            .field(
+                "consumed_enrollment_records",
+                &self.consumed_enrollment_records,
+            )
             .field("device_grants", &self.device_grants)
             .field("revocations", &self.revocations)
             .field("streams", &self.streams)
@@ -1070,6 +1145,24 @@ impl fmt::Debug for PurgeReadback {
                 "has_retirement_terminal",
                 &self.retirement_terminal_blob.is_some(),
             )
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AdminPurgeCommit {
+    pub readback: PurgeReadback,
+    pub receipt: RelayAdminPurgeReceiptV1,
+    pub duplicate: bool,
+}
+
+impl fmt::Debug for AdminPurgeCommit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AdminPurgeCommit")
+            .field("readback", &self.readback)
+            .field("receipt", &"<redacted>")
+            .field("duplicate", &self.duplicate)
             .finish()
     }
 }

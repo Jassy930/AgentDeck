@@ -50,6 +50,7 @@ use connection::{
 use enrollment::{EnrollmentError, EnrollmentService, MAX_ENROLLMENT_BODY_BYTES};
 use health::{HealthState, ReadinessCache};
 use preupgrade::{BoundedTcpListener, PublicConnectInfo};
+use receipt_signer::{RelayReceiptSignerLoadError, load_relay_receipt_signer};
 use tls::{LoadedTlsIdentity, TlsIdentityError, TlsIdentityPaths, load_tls_identity};
 
 pub use preupgrade::{MAX_PUBLIC_CONNECTIONS, MAX_PUBLIC_HEADER_BYTES, PUBLIC_UPGRADE_DEADLINE};
@@ -64,6 +65,8 @@ pub enum RelayV2ServerError {
     Config(#[from] RelayV2ConfigError),
     #[error("Relay v2 TLS identity is invalid: {0}")]
     Tls(#[from] TlsIdentityError),
+    #[error("Relay receipt signer is invalid: {0}")]
+    ReceiptSigner(#[from] RelayReceiptSignerLoadError),
     #[error("Relay v2 admin service failed: {0}")]
     Admin(#[from] AdminServerError),
     #[error("Relay v2 store failed: {0}")]
@@ -86,6 +89,7 @@ impl RelayV2ServerError {
         match self {
             Self::Config(error) => error.code(),
             Self::Tls(error) => error.code(),
+            Self::ReceiptSigner(error) => error.code(),
             Self::Admin(error) => error.code(),
             Self::Store(error) => error.diagnostic_code(),
             Self::Core { code } => code,
@@ -547,7 +551,12 @@ pub async fn selfcheck(config: RelayV2ServerConfig) -> Result<(), RelayV2ServerE
     config.validate()?;
     let identity = preflight_tls(&config.transport).await?;
     validate_admin_tls_pin(config.admin.as_ref(), identity.as_ref())?;
-    let store_config = config.store.clone().into_store_config()?;
+    let receipt_signer = load_relay_receipt_signer(config.receipt_signing_key.as_path())?;
+    let store_config = config
+        .store
+        .clone()
+        .into_store_config(receipt_signer.identity())?;
+    drop(receipt_signer);
     let reopen_config = store_config.clone();
     let service = RelayV2Service::open(store_config).await?;
     service.store.inspect().await?;
@@ -636,13 +645,18 @@ impl RelayV2ServerHandle {
         config.validate()?;
         let identity = preflight_tls(&config.transport).await?;
         validate_admin_tls_pin(config.admin.as_ref(), identity.as_ref())?;
+        let receipt_signer = load_relay_receipt_signer(config.receipt_signing_key.as_path())?;
         let source_policy = match config.transport {
             RelayV2TransportMode::ProxyLoopback => SourcePolicy::TrustedLoopbackProxy,
             RelayV2TransportMode::DirectTls(_) | RelayV2TransportMode::InsecureLoopback => {
                 SourcePolicy::DirectPeer
             }
         };
-        let store_config = config.store.clone().into_store_config()?;
+        let store_config = config
+            .store
+            .clone()
+            .into_store_config(receipt_signer.identity())?;
+        let receipt_signer = config.admin.as_ref().map(|_| Arc::new(receipt_signer));
         let service = RelayV2Service::open(store_config).await?;
         let enrollment = config.admin.as_ref().map(|_| {
             EnrollmentService::new(
@@ -655,6 +669,7 @@ impl RelayV2ServerHandle {
                 service.store.clone(),
                 service.authorization.clone(),
                 service.core.clone(),
+                receipt_signer.expect("admin config retains the loaded receipt signer"),
                 AdminRuntimeConfig {
                     public_wss_url: admin.public_wss_url,
                     spki_pins: admin.spki_pins,
@@ -1005,6 +1020,7 @@ mod tests {
     use super::{RelayV2ServerError, RelayV2Service, SourcePolicy, resolve_source};
     use crate::config::RelayV2StoreSettings;
     use crate::v2::auth::{ChallengeLimits, ChallengeRegistry, MonotonicClock, TokenBucketLimits};
+    use crate::v2::server::receipt_signer::test_relay_receipt_signer;
     use crate::v2::store::{FaultInjector, FaultPoint, RelayStoreHandle, StoreError};
 
     #[derive(Debug)]
@@ -1128,9 +1144,10 @@ mod tests {
         let mut settings = RelayV2StoreSettings::new(storage_path.clone());
         settings.disk_reserve_bytes = 0;
         settings.disk_reserve_percent = 0;
+        let receipt_signer = Arc::new(test_relay_receipt_signer());
         let store_config = settings
             .clone()
-            .into_store_config()
+            .into_store_config(receipt_signer.identity())
             .expect("service Store config")
             .with_fault_injector(barrier);
         let service = RelayV2Service::open(store_config)
@@ -1155,7 +1172,7 @@ mod tests {
         reopen_settings.disk_reserve_percent = 0;
         let reopened = RelayStoreHandle::open(
             reopen_settings
-                .into_store_config()
+                .into_store_config(receipt_signer.identity())
                 .expect("reopen Store config"),
         )
         .await;

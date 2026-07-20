@@ -4,11 +4,15 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
-use agentdeck_protocol::relay_v2::frame::RetirementCommitted;
+use agentdeck_crypto::verify_relay_admin_purge_receipt;
 use agentdeck_protocol::relay_v2::{
-    CertRole, DeviceRouteId, GrantSerial, LinkGeneration, MachineRouteId, PublicKeyBytes,
-    RelayFrameBody, RelayServerId, RootKeyId, StreamCursor, StreamGenerationId, StreamRouteId,
-    TrustEpoch, decode,
+    CertRole, DeviceRouteId, GrantSerial, LinkGeneration, MachineEnrollmentResponseV1,
+    MachineRouteId, PublicKeyBytes, RELAY_PROTOCOL_VERSION, RELAY_RECEIPT_FORMAT_VERSION,
+    RELAY_RECEIPT_KEY_GENERATION_MVP, RelayAdminPurgeReadbackV1,
+    RelayAdminPurgeReceiptExpectationV1, RelayAdminPurgeReceiptTbsV1, RelayAdminPurgeReceiptV1,
+    RelayAdminPurgeTombstoneV1, RelayFrameBody, RelayMachineTombstoneKindV1, RelayServerId,
+    RootKeyId, StreamCursor, StreamGenerationId, StreamRouteId, TrustEpoch,
+    admin_purge_tombstone_hash, enrollment_receipt_hash, purge_request_hash,
 };
 use fs2::FileExt;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -16,19 +20,21 @@ use sha2::{Digest, Sha256};
 
 use super::migrations::{self, SCHEMA_VERSION, SchemaError, SchemaState};
 use super::model::{
-    CommitMachineLinkAuth, ConfirmDeviceAuth, DeviceTrustView, EMPTY_HIGH_WATER_TEXT,
-    EnrollmentCodeSeed, FaultPoint, GrantCommit, InstallGrantRecord, MAX_CONTROL_BLOB_BYTES,
-    MAX_ENROLLMENT_CODES, MAX_MACHINE_INVENTORY_PAGE, MAX_TERMINAL_BLOB_BYTES,
-    MachineInventoryEntry, MachineInventoryPage, MachineInventoryQuery, MachineLinkAuthCommit,
-    MachineReadback, MachineReadbackQuery, MachineRecord, MachineTrustView, MaintenanceReport,
-    PersistAck, PersistPublish, PersistRetirement, PersistRevocation, PersistSubscription,
-    PersistUnsubscribe, PublishCommit, PublishDisposition, PurgeMachine, PurgeReadback,
-    REPLAY_PAGE_HARD_MAX_BYTES, REPLAY_PAGE_HARD_MAX_FRAMES, RegisterMachine, RelayV2StoreConfig,
-    ReplayCursor, ReplayFrame, ReplayPage, ReplayPageRequest, ReplayPosition, RetirementCommit,
-    RetirementTerminalView, RevocationCommit, RevocationTerminalView, StoreError, StoreSnapshot,
-    StreamRecord, StreamRegistration, SubscriptionLease, UnsubscribeCommit, high_water_from_text,
-    high_water_text, monotonic_blob, monotonic_from_blob, normalize_platform_root_alias, sql_i64,
-    stream_seq_from_text, stream_seq_text, validate_store_path,
+    AdminPurgeCommit, AdminPurgeCommitRequest, AdminPurgePreparation, CommitMachineLinkAuth,
+    ConfirmDeviceAuth, DeviceTrustView, EMPTY_HIGH_WATER_TEXT, EnrollmentCodeSeed, FaultPoint,
+    GrantCommit, InstallGrantRecord, MAX_CONTROL_BLOB_BYTES, MAX_ENROLLMENT_CODES,
+    MAX_MACHINE_INVENTORY_PAGE, MAX_TERMINAL_BLOB_BYTES, MachineInventoryEntry,
+    MachineInventoryPage, MachineInventoryQuery, MachineLinkAuthCommit, MachineReadback,
+    MachineReadbackQuery, MachineRecord, MachineTrustView, MaintenanceReport, PersistAck,
+    PersistPublish, PersistRetirement, PersistRevocation, PersistSubscription, PersistUnsubscribe,
+    PublishCommit, PublishDisposition, PurgeMachine, PurgeReadback, REPLAY_PAGE_HARD_MAX_BYTES,
+    REPLAY_PAGE_HARD_MAX_FRAMES, RegisterMachine, RelayV2StoreConfig, ReplayCursor, ReplayFrame,
+    ReplayPage, ReplayPageRequest, ReplayPosition, RetirementCommit, RetirementTerminalView,
+    RevocationCommit, RevocationTerminalView, StoreError, StoreSnapshot, StreamRecord,
+    StreamRegistration, SubscriptionLease, UnsubscribeCommit, high_water_from_text,
+    high_water_text, monotonic_blob, monotonic_from_blob, normalize_platform_root_alias,
+    retirement_terminal_is_canonical_and_bound, sql_i64, stream_seq_from_text, stream_seq_text,
+    validate_store_path,
 };
 
 const DIRECTORY_MODE: u32 = 0o700;
@@ -83,7 +89,7 @@ pub(crate) fn open(config: &RelayV2StoreConfig) -> Result<(Connection, File), St
         Some(_) => inspect_read_only(path, config)?,
         None => SchemaState::Fresh,
     };
-    require_supported_schema(schema_state)?;
+    require_supported_schema(&schema_state, config.receipt_signer_identity)?;
 
     prepare_secure_path(path)?;
     reject_symlink_components(path)?;
@@ -98,7 +104,11 @@ pub(crate) fn open(config: &RelayV2StoreConfig) -> Result<(Connection, File), St
     let mut conn = Connection::open_with_flags(path, flags)?;
 
     let generated_server_id = nonzero_relay_server_id();
-    migrations::migrate_or_validate(&mut conn, generated_server_id)?;
+    migrations::migrate_or_validate(
+        &mut conn,
+        generated_server_id,
+        config.receipt_signer_identity,
+    )?;
     migrations::configure_connection(&conn)?;
 
     // `open` 只在 marker、精确 schema 和全部 PRAGMA 都能从 worker 所持连接
@@ -232,8 +242,11 @@ fn validate_existing_metadata_limits(
 }
 
 pub(crate) fn snapshot(conn: &Connection) -> Result<StoreSnapshot, StoreError> {
-    let expected_server_id = match migrations::inspect(conn)? {
-        SchemaState::Current { relay_server_id } => relay_server_id,
+    let (expected_server_id, receipt_verify_key) = match migrations::inspect(conn)? {
+        SchemaState::Current {
+            relay_server_id,
+            receipt_verify_key,
+        } => (relay_server_id, receipt_verify_key),
         state => return Err(schema_state_error(state)),
     };
 
@@ -301,6 +314,7 @@ pub(crate) fn snapshot(conn: &Connection) -> Result<StoreSnapshot, StoreError> {
         schema_version,
         schema_signature,
         relay_server_id,
+        receipt_verify_key,
         table_names,
         journal_mode,
         synchronous,
@@ -442,7 +456,8 @@ pub(crate) fn register_machine(
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let code = tx
         .query_row(
-            "SELECT expires_at, consumed_at, request_hash, response_blob, receipt_hash
+            "SELECT expires_at, consumed_at, request_hash, response_blob, receipt_hash,
+                    machine_route
              FROM enrollment_codes WHERE code_hash = ?1",
             params![request.code_hash.as_slice()],
             |row| {
@@ -452,6 +467,7 @@ pub(crate) fn register_machine(
                     row.get::<_, Option<Vec<u8>>>(2)?,
                     row.get::<_, Option<Vec<u8>>>(3)?,
                     row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
                 ))
             },
         )
@@ -465,13 +481,22 @@ pub(crate) fn register_machine(
         }
         let response_blob = code.3.ok_or(StoreError::UnknownOrCorruptSchema)?;
         let receipt_hash = required_array::<32>(code.4, "enrollment_codes.receipt_hash")?;
-        let record = load_machine_record(
-            &tx,
-            request.machine_route,
-            response_blob,
+        let stored_route = MachineRouteId::from_bytes(required_array::<16>(
+            code.5,
+            "enrollment_codes.machine_route",
+        )?);
+        if stored_route != request.machine_route {
+            return Err(StoreError::EnrollmentCodeConflict);
+        }
+        validate_enrollment_response(
+            &response_blob,
+            load_relay_server_id(&tx)?,
+            stored_route,
+            request.link_cert.trust_epoch,
+            stored_request,
             receipt_hash,
-            true,
         )?;
+        let record = load_machine_record(&tx, stored_route, response_blob, receipt_hash, true)?;
         tx.commit()?;
         return Ok(record);
     }
@@ -509,11 +534,28 @@ pub(crate) fn register_machine(
     }
 
     let relay_server_id = load_relay_server_id(&tx)?;
+    let receipt_hash = enrollment_receipt_hash(
+        relay_server_id,
+        request.machine_route,
+        request.link_cert.trust_epoch.value(),
+        request.request_hash,
+    );
+    let response_blob = serde_json::to_vec(&MachineEnrollmentResponseV1 {
+        relay_server_id,
+        machine_route: request.machine_route,
+        trust_epoch: request.link_cert.trust_epoch.value(),
+        receipt_hash,
+    })
+    .map_err(|_| StoreError::UnknownOrCorruptSchema)?;
+    if response_blob.is_empty() || response_blob.len() > MAX_CONTROL_BLOB_BYTES {
+        return Err(StoreError::UnknownOrCorruptSchema);
+    }
     tx.execute(
         "INSERT INTO machine_routes(
             machine_route, relay_server_id, root_key_id, root_pubkey, trust_epoch,
-            highest_link_generation, link_cert_hash, data_cert_hash, status
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active')",
+            highest_link_generation, link_cert_hash, data_cert_hash,
+            enrollment_binding_state, enrollment_receipt_hash, status
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'bound', ?9, 'active')",
         params![
             request.machine_route.as_bytes().as_slice(),
             relay_server_id.as_bytes().as_slice(),
@@ -523,18 +565,21 @@ pub(crate) fn register_machine(
             monotonic_blob(request.link_cert.generation.value()).as_slice(),
             request.link_cert_hash.as_slice(),
             request.data_cert_hash.as_slice(),
+            receipt_hash.as_slice(),
         ],
     )?;
     tx.execute(
         "UPDATE enrollment_codes
-         SET consumed_at = ?2, request_hash = ?3, response_blob = ?4, receipt_hash = ?5
+         SET consumed_at = ?2, request_hash = ?3, response_blob = ?4, receipt_hash = ?5,
+             machine_route = ?6
          WHERE code_hash = ?1 AND consumed_at IS NULL",
         params![
             request.code_hash.as_slice(),
             now,
             request.request_hash.as_slice(),
-            request.response_blob.as_slice(),
-            request.receipt_hash.as_slice(),
+            response_blob.as_slice(),
+            receipt_hash.as_slice(),
+            request.machine_route.as_bytes().as_slice(),
         ],
     )?;
     config
@@ -556,8 +601,8 @@ pub(crate) fn register_machine(
         root_key_id: request.link_cert.root_key_id,
         trust_epoch: request.link_cert.trust_epoch,
         highest_link_generation: request.link_cert.generation,
-        response_blob: request.response_blob,
-        receipt_hash: request.receipt_hash,
+        response_blob,
+        receipt_hash,
         duplicate: false,
     })
 }
@@ -2461,19 +2506,424 @@ fn run_replay_maintenance(
     Ok(())
 }
 
-pub(crate) fn purge_machine(
-    conn: &mut Connection,
+#[derive(Debug)]
+struct AdminPurgeRow {
+    relay_server_id: RelayServerId,
+    root_key_id: RootKeyId,
+    root_pubkey: [u8; 32],
+    trust_epoch: TrustEpoch,
+    enrollment_binding_state: String,
+    enrollment_receipt_hash: Option<[u8; 32]>,
+    status: String,
+    terminal_kind: Option<String>,
+    admin_purge_request_hash: Option<[u8; 32]>,
+    admin_purge_tombstone_hash: Option<[u8; 32]>,
+    admin_purge_receipt_hash: Option<[u8; 32]>,
+    admin_purge_receipt_blob: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct FrozenAdminPurgeReceipt {
+    receipt: RelayAdminPurgeReceiptV1,
+    blob: Vec<u8>,
+    receipt_hash: [u8; 32],
+}
+
+pub(crate) fn prepare_admin_purge(
+    conn: &Connection,
     config: &RelayV2StoreConfig,
     request: PurgeMachine,
-) -> Result<PurgeReadback, StoreError> {
-    let (readback, _) = purge_machine_inner(
-        conn,
+) -> Result<AdminPurgePreparation, StoreError> {
+    let row = load_admin_purge_row(conn, request.machine_route)?;
+    validate_admin_purge_locator(&row, &request)?;
+    match (row.status.as_str(), row.terminal_kind.as_deref()) {
+        ("active", None) => Ok(AdminPurgePreparation::Sign {
+            tbs: build_admin_purge_tbs(config, &row, &request)?,
+        }),
+        ("retired", Some("root_lost_admin_purge")) => {
+            let (frozen, _) = load_persisted_admin_purge_receipt(conn, config, &row, &request)?;
+            Ok(AdminPurgePreparation::Committed {
+                receipt: frozen.receipt,
+            })
+        }
+        ("retired", _) => Err(StoreError::IdempotencyConflict {
+            field: "admin_purge.terminal_kind",
+        }),
+        _ => Err(StoreError::UnknownOrCorruptSchema),
+    }
+}
+
+pub(crate) fn commit_admin_purge(
+    conn: &mut Connection,
+    config: &RelayV2StoreConfig,
+    request: AdminPurgeCommitRequest,
+) -> Result<AdminPurgeCommit, StoreError> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let row = load_admin_purge_row(&tx, request.purge.machine_route)?;
+    validate_admin_purge_locator(&row, &request.purge)?;
+
+    if row.status == "retired" {
+        if row.terminal_kind.as_deref() != Some("root_lost_admin_purge") {
+            return Err(StoreError::IdempotencyConflict {
+                field: "admin_purge.terminal_kind",
+            });
+        }
+        let (persisted, readback) =
+            load_persisted_admin_purge_receipt(&tx, config, &row, &request.purge)?;
+        if persisted.receipt != request.receipt {
+            return Err(StoreError::IdempotencyConflict {
+                field: "admin_purge.receipt",
+            });
+        }
+        tx.commit().map_err(|_| StoreError::CommitOutcomeUnknown {
+            operation: "admin_purge_machine",
+        })?;
+        config
+            .fault_injector
+            .check(FaultPoint::PurgeAfterCommit)
+            .map_err(|_| StoreError::CommitOutcomeUnknown {
+                operation: "admin_purge_machine",
+            })?;
+        return Ok(AdminPurgeCommit {
+            readback,
+            receipt: persisted.receipt,
+            duplicate: true,
+        });
+    }
+    if row.status != "active" || row.terminal_kind.is_some() {
+        return Err(StoreError::UnknownOrCorruptSchema);
+    }
+
+    let expected_readback = root_lost_admin_purge_readback();
+    let frozen = validate_admin_purge_receipt(
         config,
-        request.machine_route,
-        Some(request.expected_root_fingerprint),
-        None,
+        &row,
+        &request.purge,
+        &request.receipt,
+        &expected_readback,
     )?;
-    Ok(readback)
+    let target_streams = machine_stream_keys(&tx, request.purge.machine_route)?;
+    tx.execute(
+        "DELETE FROM enrollment_codes WHERE machine_route = ?1 AND consumed_at IS NOT NULL",
+        params![request.purge.machine_route.as_bytes().as_slice()],
+    )?;
+    tx.execute(
+        "DELETE FROM subscriptions WHERE machine_route = ?1",
+        params![request.purge.machine_route.as_bytes().as_slice()],
+    )?;
+    tx.execute(
+        "DELETE FROM revocations WHERE machine_route = ?1",
+        params![request.purge.machine_route.as_bytes().as_slice()],
+    )?;
+    tx.execute(
+        "DELETE FROM device_grants WHERE machine_route = ?1",
+        params![request.purge.machine_route.as_bytes().as_slice()],
+    )?;
+    tx.execute(
+        "DELETE FROM streams WHERE machine_route = ?1",
+        params![request.purge.machine_route.as_bytes().as_slice()],
+    )?;
+    let changed = tx.execute(
+        "UPDATE machine_routes SET
+            data_cert_hash = zeroblob(32), retirement_hash = NULL,
+            retirement_terminal_blob = NULL, terminal_kind = 'root_lost_admin_purge',
+            admin_purge_request_hash = ?2, admin_purge_tombstone_hash = ?3,
+            admin_purge_receipt_hash = ?4, admin_purge_receipt_blob = ?5,
+            status = 'retired'
+         WHERE machine_route = ?1 AND status = 'active' AND terminal_kind IS NULL",
+        params![
+            request.purge.machine_route.as_bytes().as_slice(),
+            request.receipt.purge_request_hash.as_slice(),
+            request.receipt.tombstone_hash.as_slice(),
+            frozen.receipt_hash.as_slice(),
+            frozen.blob.as_slice(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::IdempotencyConflict {
+            field: "admin_purge.machine_route",
+        });
+    }
+    config.fault_injector.check(FaultPoint::PurgeBeforeCommit)?;
+    let actual = purge_readback(&tx, request.purge.machine_route, &target_streams, true)?;
+    if relay_admin_purge_readback(&actual) != expected_readback {
+        return Err(StoreError::UnknownOrCorruptSchema);
+    }
+    let persisted_row = load_admin_purge_row(&tx, request.purge.machine_route)?;
+    let (persisted, persisted_readback) =
+        load_persisted_admin_purge_receipt(&tx, config, &persisted_row, &request.purge)?;
+    if persisted.receipt != request.receipt || persisted_readback != actual {
+        return Err(StoreError::UnknownOrCorruptSchema);
+    }
+    tx.commit().map_err(|_| StoreError::CommitOutcomeUnknown {
+        operation: "admin_purge_machine",
+    })?;
+    config
+        .fault_injector
+        .check(FaultPoint::PurgeAfterCommit)
+        .map_err(|_| StoreError::CommitOutcomeUnknown {
+            operation: "admin_purge_machine",
+        })?;
+    Ok(AdminPurgeCommit {
+        readback: actual,
+        receipt: persisted.receipt,
+        duplicate: false,
+    })
+}
+
+fn load_admin_purge_row(
+    conn: &Connection,
+    machine_route: MachineRouteId,
+) -> Result<AdminPurgeRow, StoreError> {
+    let row = conn
+        .query_row(
+            "SELECT relay_server_id, root_key_id, root_pubkey, trust_epoch,
+                    enrollment_binding_state, enrollment_receipt_hash, status, terminal_kind,
+                    admin_purge_request_hash, admin_purge_tombstone_hash,
+                    admin_purge_receipt_hash, admin_purge_receipt_blob
+             FROM machine_routes WHERE machine_route = ?1",
+            params![machine_route.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<Vec<u8>>>(8)?,
+                    row.get::<_, Option<Vec<u8>>>(9)?,
+                    row.get::<_, Option<Vec<u8>>>(10)?,
+                    row.get::<_, Option<Vec<u8>>>(11)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(StoreError::MachineNotFound)?;
+    Ok(AdminPurgeRow {
+        relay_server_id: RelayServerId::from_bytes(array_from_blob::<16>(
+            row.0,
+            "machine_routes.relay_server_id",
+        )?),
+        root_key_id: RootKeyId::from_bytes(array_from_blob::<16>(
+            row.1,
+            "machine_routes.root_key_id",
+        )?),
+        root_pubkey: array_from_blob::<32>(row.2, "machine_routes.root_pubkey")?,
+        trust_epoch: TrustEpoch::new(monotonic_from_blob(row.3, "machine_routes.trust_epoch")?),
+        enrollment_binding_state: row.4,
+        enrollment_receipt_hash: row
+            .5
+            .map(|value| array_from_blob::<32>(value, "machine_routes.enrollment_receipt_hash"))
+            .transpose()?,
+        status: row.6,
+        terminal_kind: row.7,
+        admin_purge_request_hash: row
+            .8
+            .map(|value| array_from_blob::<32>(value, "machine_routes.admin_purge_request_hash"))
+            .transpose()?,
+        admin_purge_tombstone_hash: row
+            .9
+            .map(|value| array_from_blob::<32>(value, "machine_routes.admin_purge_tombstone_hash"))
+            .transpose()?,
+        admin_purge_receipt_hash: row
+            .10
+            .map(|value| array_from_blob::<32>(value, "machine_routes.admin_purge_receipt_hash"))
+            .transpose()?,
+        admin_purge_receipt_blob: row.11,
+    })
+}
+
+fn validate_admin_purge_locator(
+    row: &AdminPurgeRow,
+    request: &PurgeMachine,
+) -> Result<(), StoreError> {
+    let actual_root_fingerprint: [u8; 32] = Sha256::digest(row.root_pubkey).into();
+    if request.expected_root_fingerprint != actual_root_fingerprint {
+        return Err(StoreError::RootFingerprintMismatch);
+    }
+    if row.enrollment_binding_state != "bound" || row.enrollment_receipt_hash.is_none() {
+        return Err(StoreError::AuthenticationMismatch {
+            field: "admin_purge.enrollment_binding",
+        });
+    }
+    Ok(())
+}
+
+fn build_admin_purge_tbs(
+    config: &RelayV2StoreConfig,
+    row: &AdminPurgeRow,
+    request: &PurgeMachine,
+) -> Result<RelayAdminPurgeReceiptTbsV1, StoreError> {
+    let root_fingerprint: [u8; 32] = Sha256::digest(row.root_pubkey).into();
+    let enrollment_receipt_hash =
+        row.enrollment_receipt_hash
+            .ok_or(StoreError::AuthenticationMismatch {
+                field: "admin_purge.enrollment_binding",
+            })?;
+    let purge_request_hash = purge_request_hash(request.machine_route, root_fingerprint)
+        .map_err(|_| invalid_admin_purge_receipt())?;
+    let readback = root_lost_admin_purge_readback();
+    let tombstone = RelayAdminPurgeTombstoneV1 {
+        relay_server_id: row.relay_server_id,
+        machine_route: request.machine_route,
+        root_key_id: row.root_key_id,
+        root_fingerprint,
+        trust_epoch: row.trust_epoch,
+        enrollment_receipt_hash,
+        purge_request_hash,
+        tombstone_kind: RelayMachineTombstoneKindV1::RootLostAdminPurge,
+        readback: readback.clone(),
+    };
+    let tombstone_hash =
+        admin_purge_tombstone_hash(&tombstone).map_err(|_| invalid_admin_purge_receipt())?;
+    let verify_key = config
+        .receipt_signer_identity
+        .bind_to_relay(row.relay_server_id)
+        .map_err(|_| invalid_admin_purge_receipt())?;
+    let anchor = verify_key.wire_anchor();
+    let tbs = RelayAdminPurgeReceiptTbsV1 {
+        receipt_format_version: RELAY_RECEIPT_FORMAT_VERSION,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        relay_server_id: row.relay_server_id,
+        receipt_key_generation: RELAY_RECEIPT_KEY_GENERATION_MVP,
+        receipt_key_id: anchor.key_id,
+        machine_route: request.machine_route,
+        root_key_id: row.root_key_id,
+        root_fingerprint,
+        trust_epoch: row.trust_epoch,
+        enrollment_receipt_hash,
+        purge_request_hash,
+        tombstone_kind: RelayMachineTombstoneKindV1::RootLostAdminPurge,
+        readback,
+        tombstone_hash,
+    };
+    tbs.validate().map_err(|_| invalid_admin_purge_receipt())?;
+    Ok(tbs)
+}
+
+fn validate_admin_purge_receipt(
+    config: &RelayV2StoreConfig,
+    row: &AdminPurgeRow,
+    request: &PurgeMachine,
+    receipt: &RelayAdminPurgeReceiptV1,
+    readback: &RelayAdminPurgeReadbackV1,
+) -> Result<FrozenAdminPurgeReceipt, StoreError> {
+    let root_fingerprint: [u8; 32] = Sha256::digest(row.root_pubkey).into();
+    let enrollment_receipt_hash =
+        row.enrollment_receipt_hash
+            .ok_or(StoreError::AuthenticationMismatch {
+                field: "admin_purge.enrollment_binding",
+            })?;
+    let request_hash = purge_request_hash(request.machine_route, root_fingerprint)
+        .map_err(|_| invalid_admin_purge_receipt())?;
+    let expectation = RelayAdminPurgeReceiptExpectationV1 {
+        relay_server_id: row.relay_server_id,
+        machine_route: request.machine_route,
+        root_key_id: row.root_key_id,
+        root_fingerprint,
+        trust_epoch: row.trust_epoch,
+        enrollment_receipt_hash,
+        purge_request_hash: request_hash,
+    };
+    let verify_key = config
+        .receipt_signer_identity
+        .bind_to_relay(row.relay_server_id)
+        .map_err(|_| invalid_admin_purge_receipt())?;
+    verify_relay_admin_purge_receipt(&verify_key, &expectation, receipt)
+        .map_err(|_| invalid_admin_purge_receipt())?;
+    if &receipt.readback != readback {
+        return Err(invalid_admin_purge_receipt());
+    }
+    let blob = serde_json::to_vec(receipt).map_err(|_| invalid_admin_purge_receipt())?;
+    if blob.is_empty() || blob.len() > MAX_CONTROL_BLOB_BYTES {
+        return Err(invalid_admin_purge_receipt());
+    }
+    let receipt_hash = receipt
+        .canonical_sha256()
+        .map_err(|_| invalid_admin_purge_receipt())?;
+    Ok(FrozenAdminPurgeReceipt {
+        receipt: receipt.clone(),
+        blob,
+        receipt_hash,
+    })
+}
+
+fn load_persisted_admin_purge_receipt(
+    conn: &Connection,
+    config: &RelayV2StoreConfig,
+    row: &AdminPurgeRow,
+    request: &PurgeMachine,
+) -> Result<(FrozenAdminPurgeReceipt, PurgeReadback), StoreError> {
+    if row.status != "retired" || row.terminal_kind.as_deref() != Some("root_lost_admin_purge") {
+        return Err(StoreError::IdempotencyConflict {
+            field: "admin_purge.terminal_kind",
+        });
+    }
+    let blob = row
+        .admin_purge_receipt_blob
+        .as_ref()
+        .ok_or(StoreError::UnknownOrCorruptSchema)?;
+    let receipt: RelayAdminPurgeReceiptV1 =
+        serde_json::from_slice(blob).map_err(|_| StoreError::UnknownOrCorruptSchema)?;
+    if serde_json::to_vec(&receipt).map_err(|_| StoreError::UnknownOrCorruptSchema)? != *blob {
+        return Err(StoreError::UnknownOrCorruptSchema);
+    }
+    let target_streams = machine_stream_keys(conn, request.machine_route)?;
+    let readback = purge_readback(conn, request.machine_route, &target_streams, true)?;
+    let frozen = validate_admin_purge_receipt(
+        config,
+        row,
+        request,
+        &receipt,
+        &relay_admin_purge_readback(&readback),
+    )?;
+    if row.admin_purge_request_hash != Some(receipt.purge_request_hash)
+        || row.admin_purge_tombstone_hash != Some(receipt.tombstone_hash)
+        || row.admin_purge_receipt_hash != Some(frozen.receipt_hash)
+        || frozen.blob != *blob
+    {
+        return Err(StoreError::UnknownOrCorruptSchema);
+    }
+    Ok((frozen, readback))
+}
+
+fn root_lost_admin_purge_readback() -> RelayAdminPurgeReadbackV1 {
+    RelayAdminPurgeReadbackV1 {
+        active_machine_routes: 0,
+        retired_tombstones: 1,
+        consumed_enrollment_records: 0,
+        device_grants: 0,
+        revocations: 0,
+        streams: 0,
+        frames: 0,
+        subscriptions: 0,
+        retirement_hash: None,
+        retirement_terminal_present: false,
+    }
+}
+
+fn relay_admin_purge_readback(readback: &PurgeReadback) -> RelayAdminPurgeReadbackV1 {
+    RelayAdminPurgeReadbackV1 {
+        active_machine_routes: readback.active_machine_routes,
+        retired_tombstones: readback.retired_tombstones,
+        consumed_enrollment_records: readback.consumed_enrollment_records,
+        device_grants: readback.device_grants,
+        revocations: readback.revocations,
+        streams: readback.streams,
+        frames: readback.frames,
+        subscriptions: readback.subscriptions,
+        retirement_hash: readback.retirement_hash,
+        retirement_terminal_present: readback.retirement_terminal_blob.is_some(),
+    }
+}
+
+fn invalid_admin_purge_receipt() -> StoreError {
+    StoreError::AuthenticationMismatch {
+        field: "admin_purge.receipt",
+    }
 }
 
 pub(crate) fn retire_machine(
@@ -2486,8 +2936,7 @@ pub(crate) fn retire_machine(
     let trust_epoch = request.retirement.trust_epoch;
     let retirement_hash = request.retirement_hash;
     let retirement_terminal_blob = request.retirement_terminal_blob.clone();
-    let (readback, duplicate) =
-        purge_machine_inner(conn, config, machine_route, None, Some(&request))?;
+    let (readback, duplicate) = retire_machine_inner(conn, config, machine_route, &request)?;
     Ok(RetirementCommit {
         machine_route,
         trust_epoch,
@@ -2512,50 +2961,39 @@ fn validate_retirement_record(request: &PersistRetirement) -> Result<(), StoreEr
             reason: "retirement terminal must contain 1...4096 bytes",
         });
     }
-    let decoded =
-        decode(&request.retirement_terminal_blob).map_err(|_| StoreError::InvalidValue {
-            field: "retirement.terminal_blob",
-            reason: "retirement terminal is not a canonical Relay v2 frame",
-        })?;
-    match decoded.body {
-        RelayFrameBody::RetirementCommitted(RetirementCommitted {
-            machine_route,
-            trust_epoch,
-            retire_hash,
-        }) if machine_route == request.retirement.machine_route
-            && trust_epoch == request.retirement.trust_epoch
-            && retire_hash == request.retirement_hash =>
-        {
-            Ok(())
-        }
-        _ => Err(StoreError::AuthenticationMismatch {
+    if retirement_terminal_is_canonical_and_bound(
+        request.retirement.machine_route,
+        request.retirement.trust_epoch,
+        request.retirement_hash,
+        &request.retirement_terminal_blob,
+    ) {
+        Ok(())
+    } else {
+        Err(StoreError::AuthenticationMismatch {
             field: "retirement_terminal",
-        }),
+        })
     }
 }
 
-fn purge_machine_inner(
+fn retire_machine_inner(
     conn: &mut Connection,
     config: &RelayV2StoreConfig,
     machine_route: MachineRouteId,
-    expected_root_fingerprint: Option<[u8; 32]>,
-    retirement: Option<&PersistRetirement>,
+    retirement: &PersistRetirement,
 ) -> Result<(PurgeReadback, bool), StoreError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let row = tx
         .query_row(
-            "SELECT root_key_id, trust_epoch, root_pubkey, status, retirement_hash,
-                    retirement_terminal_blob
+            "SELECT root_key_id, trust_epoch, status, retirement_hash, retirement_terminal_blob
              FROM machine_routes WHERE machine_route = ?1",
             params![machine_route.as_bytes().as_slice()],
             |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
                     row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
                     row.get::<_, Option<Vec<u8>>>(4)?,
-                    row.get::<_, Option<Vec<u8>>>(5)?,
                 ))
             },
         )
@@ -2564,27 +3002,24 @@ fn purge_machine_inner(
     let root_key_id =
         RootKeyId::from_bytes(array_from_blob::<16>(row.0, "machine_routes.root_key_id")?);
     let trust_epoch = TrustEpoch::new(monotonic_from_blob(row.1, "machine_routes.trust_epoch")?);
-    let root_pubkey = array_from_blob::<32>(row.2, "machine_routes.root_pubkey")?;
-    let actual_root_fingerprint: [u8; 32] = Sha256::digest(root_pubkey).into();
-    if expected_root_fingerprint.is_some_and(|expected| expected != actual_root_fingerprint) {
-        return Err(StoreError::RootFingerprintMismatch);
-    }
     let target_streams = machine_stream_keys(&tx, machine_route)?;
 
-    if row.3 == "retired" {
-        if let Some(retirement) = retirement {
-            let existing_hash = row
-                .4
-                .map(|value| array_from_blob::<32>(value, "machine_routes.retirement_hash"))
-                .transpose()?;
-            if existing_hash != Some(retirement.retirement_hash)
-                || row.5.as_deref() != Some(retirement.retirement_terminal_blob.as_slice())
-            {
-                return Err(StoreError::IdempotencyConflict {
-                    field: "retirement_hash",
-                });
-            }
+    if row.2 == "retired" {
+        let existing_hash = row
+            .3
+            .map(|value| array_from_blob::<32>(value, "machine_routes.retirement_hash"))
+            .transpose()?;
+        if existing_hash != Some(retirement.retirement_hash)
+            || row.4.as_deref() != Some(retirement.retirement_terminal_blob.as_slice())
+        {
+            return Err(StoreError::IdempotencyConflict {
+                field: "retirement_hash",
+            });
         }
+        tx.execute(
+            "DELETE FROM enrollment_codes WHERE machine_route = ?1 AND consumed_at IS NOT NULL",
+            params![machine_route.as_bytes().as_slice()],
+        )?;
         let committed = purge_readback(&tx, machine_route, &target_streams, true)?;
         ensure_purge_complete(&committed, retirement)?;
         tx.commit().map_err(|_| StoreError::CommitOutcomeUnknown {
@@ -2598,19 +3033,21 @@ fn purge_machine_inner(
             })?;
         return Ok((committed, true));
     }
-    if row.3 != "active" {
+    if row.2 != "active" {
         return Err(StoreError::UnknownOrCorruptSchema);
     }
-    if let Some(retirement) = retirement {
-        if retirement.retirement.root_key_id != root_key_id
-            || retirement.retirement.trust_epoch != trust_epoch
-        {
-            return Err(StoreError::MonotonicRollback {
-                field: "retirement_trust",
-            });
-        }
+    if retirement.retirement.root_key_id != root_key_id
+        || retirement.retirement.trust_epoch != trust_epoch
+    {
+        return Err(StoreError::MonotonicRollback {
+            field: "retirement_trust",
+        });
     }
 
+    tx.execute(
+        "DELETE FROM enrollment_codes WHERE machine_route = ?1 AND consumed_at IS NOT NULL",
+        params![machine_route.as_bytes().as_slice()],
+    )?;
     tx.execute(
         "DELETE FROM subscriptions WHERE machine_route = ?1",
         params![machine_route.as_bytes().as_slice()],
@@ -2627,17 +3064,16 @@ fn purge_machine_inner(
         "DELETE FROM streams WHERE machine_route = ?1",
         params![machine_route.as_bytes().as_slice()],
     )?;
-    let retirement_hash = retirement.map(|value| value.retirement_hash.as_slice());
-    let retirement_blob = retirement.map(|value| value.retirement_terminal_blob.as_slice());
     tx.execute(
         "UPDATE machine_routes SET
             data_cert_hash = zeroblob(32), retirement_hash = ?2,
-            retirement_terminal_blob = ?3, status = 'retired'
+            retirement_terminal_blob = ?3,
+            terminal_kind = 'root_present_retirement', status = 'retired'
          WHERE machine_route = ?1",
         params![
             machine_route.as_bytes().as_slice(),
-            retirement_hash,
-            retirement_blob,
+            retirement.retirement_hash.as_slice(),
+            retirement.retirement_terminal_blob.as_slice(),
         ],
     )?;
     config.fault_injector.check(FaultPoint::PurgeBeforeCommit)?;
@@ -2672,6 +3108,13 @@ fn purge_readback(
         "SELECT COUNT(*) FROM machine_routes WHERE machine_route = ?1 AND status = 'retired'",
         machine_route,
         "purge.retired_tombstones",
+    )?;
+    let consumed_enrollment_records = scoped_count(
+        conn,
+        "SELECT COUNT(*) FROM enrollment_codes
+         WHERE machine_route = ?1 AND consumed_at IS NOT NULL",
+        machine_route,
+        "purge.consumed_enrollment_records",
     )?;
     let device_grants = scoped_count(
         conn,
@@ -2742,6 +3185,7 @@ fn purge_readback(
     Ok(PurgeReadback {
         active_machine_routes,
         retired_tombstones,
+        consumed_enrollment_records,
         device_grants,
         revocations,
         streams,
@@ -2754,23 +3198,19 @@ fn purge_readback(
 
 fn ensure_purge_complete(
     readback: &PurgeReadback,
-    retirement: Option<&PersistRetirement>,
+    retirement: &PersistRetirement,
 ) -> Result<(), StoreError> {
     let counts_complete = readback.active_machine_routes == 0
         && readback.retired_tombstones == 1
+        && readback.consumed_enrollment_records == 0
         && readback.device_grants == 0
         && readback.revocations == 0
         && readback.streams == 0
         && readback.frames == 0
         && readback.subscriptions == 0;
-    let terminal_complete = match retirement {
-        Some(retirement) => {
-            readback.retirement_hash == Some(retirement.retirement_hash)
-                && readback.retirement_terminal_blob.as_deref()
-                    == Some(retirement.retirement_terminal_blob.as_slice())
-        }
-        None => readback.retirement_hash.is_some() == readback.retirement_terminal_blob.is_some(),
-    };
+    let terminal_complete = readback.retirement_hash == Some(retirement.retirement_hash)
+        && readback.retirement_terminal_blob.as_deref()
+            == Some(retirement.retirement_terminal_blob.as_slice());
     if !counts_complete || !terminal_complete {
         Err(StoreError::UnknownOrCorruptSchema)
     } else {
@@ -2835,10 +3275,40 @@ fn validate_machine_request(request: &RegisterMachine) -> Result<(), StoreError>
             reason: "link/data certificates must bind the same root and trust epoch",
         });
     }
-    if request.response_blob.is_empty() || request.response_blob.len() > MAX_CONTROL_BLOB_BYTES {
-        return Err(StoreError::InvalidValue {
+    Ok(())
+}
+
+fn validate_enrollment_response(
+    response_blob: &[u8],
+    relay_server_id: RelayServerId,
+    machine_route: MachineRouteId,
+    trust_epoch: TrustEpoch,
+    request_hash: [u8; 32],
+    receipt_hash: [u8; 32],
+) -> Result<(), StoreError> {
+    let response: MachineEnrollmentResponseV1 =
+        serde_json::from_slice(response_blob).map_err(|_| StoreError::AuthenticationMismatch {
             field: "register_machine.response_blob",
-            reason: "frozen enrollment response must contain 1...65536 bytes",
+        })?;
+    let canonical =
+        serde_json::to_vec(&response).map_err(|_| StoreError::AuthenticationMismatch {
+            field: "register_machine.response_blob",
+        })?;
+    let expected_receipt = enrollment_receipt_hash(
+        relay_server_id,
+        machine_route,
+        trust_epoch.value(),
+        request_hash,
+    );
+    if canonical != response_blob
+        || response.relay_server_id != relay_server_id
+        || response.machine_route != machine_route
+        || response.trust_epoch != trust_epoch.value()
+        || response.receipt_hash != receipt_hash
+        || receipt_hash != expected_receipt
+    {
+        return Err(StoreError::AuthenticationMismatch {
+            field: "register_machine.response_blob",
         });
     }
     Ok(())
@@ -3392,10 +3862,26 @@ fn try_clone_regular_file(source: &Path, _destination: &Path) -> Result<bool, St
     Ok(false)
 }
 
-fn require_supported_schema(state: SchemaState) -> Result<(), StoreError> {
+fn require_supported_schema(
+    state: &SchemaState,
+    expected_identity: agentdeck_crypto::ValidatedRelayReceiptSignerIdentityV1,
+) -> Result<(), StoreError> {
     match state {
-        SchemaState::Fresh | SchemaState::Current { .. } => Ok(()),
-        state => Err(schema_state_error(state)),
+        SchemaState::Fresh | SchemaState::UpgradeableV1 { .. } => Ok(()),
+        SchemaState::Current {
+            relay_server_id,
+            receipt_verify_key,
+        } => {
+            let expected = expected_identity
+                .bind_to_relay(*relay_server_id)
+                .map_err(|_| StoreError::ReceiptSignerMismatch)?;
+            if expected.wire_anchor() == receipt_verify_key {
+                Ok(())
+            } else {
+                Err(StoreError::ReceiptSignerMismatch)
+            }
+        }
+        state => Err(schema_state_error(state.clone())),
     }
 }
 
@@ -3406,9 +3892,10 @@ fn schema_state_error(state: SchemaState) -> StoreError {
             supported: SCHEMA_VERSION,
         },
         SchemaState::LegacyV1 => StoreError::LegacyV1ResetRequired,
-        SchemaState::Fresh | SchemaState::Current { .. } | SchemaState::UnknownOrCorrupt => {
-            StoreError::UnknownOrCorruptSchema
-        }
+        SchemaState::Fresh
+        | SchemaState::UpgradeableV1 { .. }
+        | SchemaState::Current { .. }
+        | SchemaState::UnknownOrCorrupt => StoreError::UnknownOrCorruptSchema,
     }
 }
 

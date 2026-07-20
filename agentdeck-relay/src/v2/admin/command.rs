@@ -2,6 +2,7 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentdeck_crypto::sha256;
@@ -13,14 +14,15 @@ use rand::RngCore;
 
 use crate::v2::auth::AuthorizationCoordinator;
 use crate::v2::core::RelayCore;
+use crate::v2::server::receipt_signer::LoadedRelayReceiptSigner;
 use crate::v2::store::{
-    EnrollmentCodeSeed, MAX_MACHINE_INVENTORY_PAGE, MachineInventoryQuery, MachineReadbackQuery,
-    PurgeMachine, RelayStoreHandle, StoreError,
+    AdminPurgeCommitRequest, AdminPurgePreparation, EnrollmentCodeSeed, MAX_MACHINE_INVENTORY_PAGE,
+    MachineInventoryQuery, MachineReadbackQuery, PurgeMachine, RelayStoreHandle, StoreError,
 };
 
 use super::protocol::{
     ADMIN_PROTOCOL_VERSION, AdminFailure, AdminRequest, AdminResponse, AdminResult, Digest32,
-    EnrollmentBundleV1,
+    EnrollmentBundleV2,
 };
 use super::{AdminClient, AdminClientError};
 
@@ -37,6 +39,7 @@ pub struct AdminCommandExecutor {
     store: RelayStoreHandle,
     authorization: AuthorizationCoordinator,
     core: RelayCore,
+    receipt_signer: Arc<LoadedRelayReceiptSigner>,
     runtime: AdminRuntimeConfig,
 }
 
@@ -49,23 +52,27 @@ impl std::fmt::Debug for AdminCommandExecutor {
 }
 
 impl AdminCommandExecutor {
-    pub fn new(
+    pub(crate) fn new(
         store: RelayStoreHandle,
         authorization: AuthorizationCoordinator,
         core: RelayCore,
+        receipt_signer: Arc<LoadedRelayReceiptSigner>,
         runtime: AdminRuntimeConfig,
     ) -> Self {
         Self {
             store,
             authorization,
             core,
+            receipt_signer,
             runtime,
         }
     }
 
     pub async fn execute(&self, request: AdminRequest) -> AdminResponse {
         match self.try_execute(request).await {
-            Ok(result) => AdminResponse::Ok { result },
+            Ok(result) => AdminResponse::Ok {
+                result: Box::new(result),
+            },
             Err(code) => AdminResponse::Error {
                 error: AdminFailure {
                     code: code.to_owned(),
@@ -108,22 +115,37 @@ impl AdminCommandExecutor {
                 machine_route,
                 confirm_root_fingerprint,
             } => {
-                let readback = self
+                let purge = PurgeMachine {
+                    machine_route,
+                    expected_root_fingerprint: confirm_root_fingerprint.0,
+                };
+                let receipt = match self
+                    .store
+                    .prepare_admin_purge(purge.clone())
+                    .await
+                    .map_err(store_code)?
+                {
+                    AdminPurgePreparation::Sign { tbs } => self
+                        .receipt_signer
+                        .sign(tbs)
+                        .map_err(|_| "relay.admin.receipt_signing")?,
+                    AdminPurgePreparation::Committed { receipt } => receipt,
+                };
+                let commit = self
                     .core
-                    .purge_machine_admin(PurgeMachine {
-                        machine_route,
-                        expected_root_fingerprint: confirm_root_fingerprint.0,
-                    })
+                    .purge_machine_admin(AdminPurgeCommitRequest { purge, receipt })
                     .await
                     .map_err(store_code)?;
                 Ok(AdminResult::MachinePurged {
-                    readback: readback.into(),
+                    readback: commit.readback.into(),
+                    receipt: Box::new(commit.receipt),
                 })
             }
         }
     }
 
     async fn create_enrollment_bundle(&self) -> Result<AdminResult, &'static str> {
+        let store = self.store.inspect().await.map_err(store_code)?;
         let mut code = EnrollmentCode([0_u8; 32]);
         rand::rngs::OsRng
             .try_fill_bytes(&mut code.0)
@@ -137,10 +159,11 @@ impl AdminCommandExecutor {
             .await
             .map_err(store_code)?;
         Ok(AdminResult::EnrollmentBundle {
-            bundle: EnrollmentBundleV1 {
+            bundle: EnrollmentBundleV2 {
                 version: ADMIN_PROTOCOL_VERSION,
                 public_wss_url: self.runtime.public_wss_url.clone(),
-                relay_server_id: self.store.relay_server_id(),
+                relay_server_id: store.relay_server_id,
+                receipt_verify_key: store.receipt_verify_key,
                 code,
                 spki_pins: self
                     .runtime

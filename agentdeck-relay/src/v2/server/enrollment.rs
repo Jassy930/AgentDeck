@@ -1,10 +1,7 @@
 //! 首次 machine enrollment 的唯一公网 HTTP endpoint。
 
 use agentdeck_crypto::{SignatureBytes, VerifyingKey, sha256, verify_tbs};
-use agentdeck_protocol::relay_v2::{
-    CertRole, MachineEnrollmentRequestV1, MachineEnrollmentResponseV1, RelayServerId,
-    enrollment_receipt_hash,
-};
+use agentdeck_protocol::relay_v2::{CertRole, MachineEnrollmentRequestV1, RelayServerId};
 
 use crate::v2::auth::AuthorizationCoordinator;
 use crate::v2::store::{RegisterMachine, StoreError};
@@ -59,28 +56,12 @@ impl EnrollmentService {
     ) -> Result<Vec<u8>, EnrollmentError> {
         validate_request(&request, self.relay_server_id)?;
         let request_hash = request.canonical_sha256();
-        let receipt_hash = enrollment_receipt_hash(
-            self.relay_server_id,
-            request.machine_route,
-            request.link_cert.trust_epoch.value(),
-            request_hash,
-        );
-        let response = MachineEnrollmentResponseV1 {
-            relay_server_id: self.relay_server_id,
-            machine_route: request.machine_route,
-            trust_epoch: request.link_cert.trust_epoch.value(),
-            receipt_hash,
-        };
-        let response_blob =
-            serde_json::to_vec(&response).map_err(|_| EnrollmentError::Unavailable)?;
         let code_hash = sha256(&request.code.0);
         let mutation = self
             .authorization
             .register_machine(RegisterMachine {
                 code_hash,
                 request_hash,
-                response_blob,
-                receipt_hash,
                 machine_route: request.machine_route,
                 root_pubkey: request.root_pubkey,
                 link_cert_hash: request.link_cert.canonical_sha256(),
@@ -155,6 +136,8 @@ fn map_store_error(error: StoreError) -> EnrollmentError {
 
 #[cfg(test)]
 mod tests {
+    use agentdeck_protocol::relay_v2::enrollment_receipt_hash;
+
     use super::*;
 
     #[test]

@@ -9,7 +9,8 @@ use std::task::Poll;
 use std::time::Duration;
 
 use agentdeck_crypto::{
-    SigningKey, VerifyingKey, sha256, sign_authentication_transcript, sign_tbs, verify_tbs,
+    SigningKey, ValidatedRelayReceiptSignerIdentityV1, VerifyingKey, sha256,
+    sign_authentication_transcript, sign_tbs, verify_tbs,
 };
 use agentdeck_protocol::e2ee::ToBeSignedV1;
 use agentdeck_protocol::relay_v2::auth::{
@@ -39,14 +40,22 @@ use agentdeck_relay::v2::auth::{
 };
 use agentdeck_relay::v2::store::{
     Clock, CommitMachineLinkAuth, ConfirmDeviceAuth, EnrollmentCodeSeed, FaultInjector, FaultPoint,
-    InstallGrantRecord, MAX_CONTROL_BLOB_BYTES, PersistRevocation, PurgeMachine, RegisterMachine,
-    RelayStoreHandle, RelayV2StoreConfig, StoreError,
+    InstallGrantRecord, PersistRevocation, RegisterMachine, RelayStoreHandle, RelayV2StoreConfig,
+    StoreError,
 };
 use rusqlite::{Connection, OpenFlags};
 use tempfile::TempDir;
 
 const NOW_MS: u64 = 1_726_000_000_000;
 const LEGACY_RUNTIME_PROTOCOL_VERSION: u16 = 1;
+
+fn test_store_config(path: PathBuf) -> RelayV2StoreConfig {
+    let identity = ValidatedRelayReceiptSignerIdentityV1::from_signing_key(&SigningKey::from_seed(
+        &[0x71; 32],
+    ))
+    .expect("valid test receipt signer");
+    RelayV2StoreConfig::new(path, identity)
+}
 
 #[derive(Default)]
 struct ManualMonotonicClock(AtomicU64);
@@ -266,7 +275,7 @@ fn store_path(temp: &TempDir) -> PathBuf {
 }
 
 fn store_config(path: &Path) -> RelayV2StoreConfig {
-    RelayV2StoreConfig::new(path.to_path_buf()).with_clock(Arc::new(FixedStoreClock))
+    test_store_config(path.to_path_buf()).with_clock(Arc::new(FixedStoreClock))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -640,8 +649,6 @@ impl Fixture {
             .register_machine(RegisterMachine {
                 code_hash,
                 request_hash: [0x52; 32],
-                response_blob: vec![0x53],
-                receipt_hash: [0x54; 32],
                 machine_route,
                 root_pubkey: PublicKeyBytes(root.verifying_key().to_bytes()),
                 link_cert: link_cert.clone(),
@@ -783,8 +790,6 @@ impl RuntimeV1Credentials {
             .register_machine(RegisterMachine {
                 code_hash,
                 request_hash: [0xa9; 32],
-                response_blob: vec![0xaa],
-                receipt_hash: [0xab; 32],
                 machine_route,
                 root_pubkey: PublicKeyBytes(root.verifying_key().to_bytes()),
                 link_cert_hash: link_cert.canonical_sha256(),
@@ -1937,22 +1942,10 @@ async fn authorization_owner_is_singleton_and_blocks_raw_trust_mutators() {
         Err(StoreError::AuthorizationOwned)
     ));
     assert!(matches!(
-        fixture
-            .store
-            .purge_machine(PurgeMachine {
-                machine_route: fixture.machine_route,
-                expected_root_fingerprint: sha256(&fixture.root.verifying_key().to_bytes()),
-            })
-            .await,
-        Err(StoreError::AuthorizationOwned)
-    ));
-    assert!(matches!(
         coordinator
             .register_machine(RegisterMachine {
                 code_hash: [0x93; 32],
                 request_hash: [0x94; 32],
-                response_blob: vec![0_u8; MAX_CONTROL_BLOB_BYTES + 1],
-                receipt_hash: [0x95; 32],
                 machine_route: machine(0x96),
                 root_pubkey: PublicKeyBytes(fixture.root.verifying_key().to_bytes()),
                 link_cert: fixture.link_cert.clone(),
@@ -1962,7 +1955,7 @@ async fn authorization_owner_is_singleton_and_blocks_raw_trust_mutators() {
             })
             .await,
         Err(StoreError::InvalidValue {
-            field: "register_machine.response_blob",
+            field: "register_machine.certificates",
             ..
         })
     ));
@@ -2469,8 +2462,6 @@ async fn begin_drain_fences_all_authorization_mutations_without_state_change() {
     let registration = RegisterMachine {
         code_hash: registered_code_hash,
         request_hash: [0x9c; 32],
-        response_blob: vec![0x9d],
-        receipt_hash: [0x9e; 32],
         machine_route: registered_machine,
         root_pubkey: PublicKeyBytes(registered_root.verifying_key().to_bytes()),
         link_cert_hash: registered_link_cert.canonical_sha256(),

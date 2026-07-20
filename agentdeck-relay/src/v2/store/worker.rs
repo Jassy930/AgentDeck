@@ -8,14 +8,15 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::sync::{mpsc, oneshot};
 
 use super::model::{
-    CommitMachineLinkAuth, ConfirmDeviceAuth, DeviceTrustView, EnrollmentCodeSeed, FaultPoint,
-    GrantCommit, InstallGrantRecord, MAX_CONTROL_BLOB_BYTES, MachineInventoryPage,
-    MachineInventoryQuery, MachineLinkAuthCommit, MachineReadback, MachineReadbackQuery,
-    MachineRecord, MachineTrustView, MaintenanceReport, PersistAck, PersistPublish,
-    PersistRetirement, PersistRevocation, PersistSubscription, PersistUnsubscribe, PublishCommit,
-    PurgeMachine, PurgeReadback, RegisterMachine, RelayV2StoreConfig, ReplayPage,
-    ReplayPageRequest, RetirementCommit, RevocationCommit, StoreError, StoreSnapshot, StreamRecord,
-    StreamRegistration, SubscriptionLease, UnsubscribeCommit, normalize_platform_root_alias,
+    AdminPurgeCommit, AdminPurgeCommitRequest, AdminPurgePreparation, CommitMachineLinkAuth,
+    ConfirmDeviceAuth, DeviceTrustView, EnrollmentCodeSeed, FaultPoint, GrantCommit,
+    InstallGrantRecord, MAX_CONTROL_BLOB_BYTES, MachineInventoryPage, MachineInventoryQuery,
+    MachineLinkAuthCommit, MachineReadback, MachineReadbackQuery, MachineRecord, MachineTrustView,
+    MaintenanceReport, PersistAck, PersistPublish, PersistRetirement, PersistRevocation,
+    PersistSubscription, PersistUnsubscribe, PublishCommit, PurgeMachine, RegisterMachine,
+    RelayV2StoreConfig, ReplayPage, ReplayPageRequest, RetirementCommit, RevocationCommit,
+    StoreError, StoreSnapshot, StreamRecord, StreamRegistration, SubscriptionLease,
+    UnsubscribeCommit, normalize_platform_root_alias,
 };
 use super::sqlite;
 use agentdeck_protocol::relay_v2::{DeviceRouteId, MachineRouteId, RelayServerId};
@@ -232,12 +233,6 @@ impl RelayStoreHandle {
         owner: Option<&AuthorizationOwner>,
         request: RegisterMachine,
     ) -> Result<MachineRecord, StoreError> {
-        if request.response_blob.len() > MAX_CONTROL_BLOB_BYTES {
-            return Err(StoreError::InvalidValue {
-                field: "register_machine.response_blob",
-                reason: "control blob exceeds 64 KiB",
-            });
-        }
         self.dispatch_trust(owner, |reply| StoreCommand::RegisterMachine {
             request: Box::new(request),
             reply,
@@ -354,25 +349,39 @@ impl RelayStoreHandle {
         .await
     }
 
-    pub async fn purge_machine(&self, request: PurgeMachine) -> Result<PurgeReadback, StoreError> {
-        self.purge_machine_inner(None, request).await
+    pub async fn prepare_admin_purge(
+        &self,
+        request: PurgeMachine,
+    ) -> Result<AdminPurgePreparation, StoreError> {
+        self.dispatch(|reply| StoreCommand::PrepareAdminPurge { request, reply })
+            .await
     }
 
-    pub(crate) async fn purge_machine_authorized(
+    pub async fn commit_admin_purge(
+        &self,
+        request: AdminPurgeCommitRequest,
+    ) -> Result<AdminPurgeCommit, StoreError> {
+        self.commit_admin_purge_inner(None, request).await
+    }
+
+    pub(crate) async fn commit_admin_purge_authorized(
         &self,
         owner: &AuthorizationOwner,
-        request: PurgeMachine,
-    ) -> Result<PurgeReadback, StoreError> {
-        self.purge_machine_inner(Some(owner), request).await
+        request: AdminPurgeCommitRequest,
+    ) -> Result<AdminPurgeCommit, StoreError> {
+        self.commit_admin_purge_inner(Some(owner), request).await
     }
 
-    async fn purge_machine_inner(
+    async fn commit_admin_purge_inner(
         &self,
         owner: Option<&AuthorizationOwner>,
-        request: PurgeMachine,
-    ) -> Result<PurgeReadback, StoreError> {
-        self.dispatch_trust(owner, |reply| StoreCommand::PurgeMachine { request, reply })
-            .await
+        request: AdminPurgeCommitRequest,
+    ) -> Result<AdminPurgeCommit, StoreError> {
+        self.dispatch_trust(owner, |reply| StoreCommand::CommitAdminPurge {
+            request,
+            reply,
+        })
+        .await
     }
 
     /// 执行一次确定性的物理清理事务。P2.6 的 server sweeper 负责周期调度；
@@ -528,9 +537,13 @@ enum StoreCommand {
         request: PersistRetirement,
         reply: oneshot::Sender<Result<RetirementCommit, StoreError>>,
     },
-    PurgeMachine {
+    PrepareAdminPurge {
         request: PurgeMachine,
-        reply: oneshot::Sender<Result<PurgeReadback, StoreError>>,
+        reply: oneshot::Sender<Result<AdminPurgePreparation, StoreError>>,
+    },
+    CommitAdminPurge {
+        request: AdminPurgeCommitRequest,
+        reply: oneshot::Sender<Result<AdminPurgeCommit, StoreError>>,
     },
     Maintenance {
         reply: oneshot::Sender<Result<MaintenanceReport, StoreError>>,
@@ -633,8 +646,11 @@ fn run(
             StoreCommand::RetireMachine { request, reply } => {
                 let _ = reply.send(sqlite::retire_machine(&mut conn, &config, request));
             }
-            StoreCommand::PurgeMachine { request, reply } => {
-                let _ = reply.send(sqlite::purge_machine(&mut conn, &config, request));
+            StoreCommand::PrepareAdminPurge { request, reply } => {
+                let _ = reply.send(sqlite::prepare_admin_purge(&conn, &config, request));
+            }
+            StoreCommand::CommitAdminPurge { request, reply } => {
+                let _ = reply.send(sqlite::commit_admin_purge(&mut conn, &config, request));
             }
             StoreCommand::Maintenance { reply } => {
                 let _ = reply.send(sqlite::run_maintenance(&mut conn, &config));

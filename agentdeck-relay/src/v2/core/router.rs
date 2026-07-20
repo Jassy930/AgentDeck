@@ -31,8 +31,8 @@ use crate::v2::auth::{
     AuthorizationLifecycleEvent, PairRouteView, PrincipalRoute,
 };
 use crate::v2::store::{
-    PersistAck, PersistPublish, PersistSubscription, PersistUnsubscribe, PurgeMachine,
-    PurgeReadback, RelayStoreHandle, StoreError, StreamRegistration, SubscriptionLease,
+    AdminPurgeCommit, AdminPurgeCommitRequest, PersistAck, PersistPublish, PersistSubscription,
+    PersistUnsubscribe, RelayStoreHandle, StoreError, StreamRegistration, SubscriptionLease,
 };
 
 use super::connection::{
@@ -276,8 +276,8 @@ enum CoreCommand {
         token: TerminalToken,
     },
     AdminPurgeMachine {
-        request: PurgeMachine,
-        reply: oneshot::Sender<Result<PurgeReadback, StoreError>>,
+        request: AdminPurgeCommitRequest,
+        reply: oneshot::Sender<Result<AdminPurgeCommit, StoreError>>,
     },
     BeginDrain {
         reply: oneshot::Sender<Result<(), RelayFailure>>,
@@ -454,8 +454,8 @@ impl RelayCore {
     /// actor FIFO 中线性化，且 caller cancellation 不取消已经接纳的 purge。
     pub async fn purge_machine_admin(
         &self,
-        request: PurgeMachine,
-    ) -> Result<PurgeReadback, StoreError> {
+        request: AdminPurgeCommitRequest,
+    ) -> Result<AdminPurgeCommit, StoreError> {
         let (reply, response) = oneshot::channel();
         match self
             .tx
@@ -964,9 +964,9 @@ impl RelayCoreActor {
 
     async fn admin_purge_machine(
         &mut self,
-        request: PurgeMachine,
-    ) -> Result<PurgeReadback, StoreError> {
-        let machine = request.machine_route;
+        request: AdminPurgeCommitRequest,
+    ) -> Result<AdminPurgeCommit, StoreError> {
+        let machine = request.purge.machine_route;
         let mutation = self.authorization.purge_machine_admin(request).await?;
         let (commit, invalidated) = mutation.into_parts();
 
@@ -2647,13 +2647,20 @@ fn failure(code: &'static str, message: &'static str) -> RelayFailure {
 
 #[cfg(test)]
 mod tests {
+    use agentdeck_crypto::{SigningKey, ValidatedRelayReceiptSignerIdentityV1};
+
     use super::*;
 
     #[tokio::test]
     async fn fail_closed_all_overrides_terminal_grace_and_reaps_core_state() {
         let temp = tempfile::tempdir().expect("tempdir");
+        let receipt_identity = ValidatedRelayReceiptSignerIdentityV1::from_signing_key(
+            &SigningKey::from_seed(&[0x71; 32]),
+        )
+        .expect("valid test receipt signer");
         let store = RelayStoreHandle::open(crate::v2::store::RelayV2StoreConfig::new(
             temp.path().join("relay-private").join("relay.db"),
+            receipt_identity,
         ))
         .await
         .expect("open store");

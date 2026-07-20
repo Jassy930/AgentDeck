@@ -9,7 +9,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use agentdeck_crypto::{SigningKey, sha256, sign_authentication_transcript, sign_tbs};
+use agentdeck_crypto::{
+    SigningKey, ValidatedRelayReceiptSignerIdentityV1, sha256, sign_authentication_transcript,
+    sign_relay_admin_purge_receipt, sign_tbs,
+};
 use agentdeck_protocol::relay_v2::auth::{
     AuthenticationRole, AuthenticationTranscriptV1, CertRole,
 };
@@ -37,15 +40,50 @@ use agentdeck_relay::v2::core::writer::{
 };
 use agentdeck_relay::v2::core::{CoreConfig, RelayCore, RouteOutcome};
 use agentdeck_relay::v2::store::{
-    Clock, DiskSpace, DiskSpaceProbe, EnrollmentCodeSeed, FaultInjector, FaultPoint,
-    InstallGrantRecord, MachineInventoryQuery, MachineReadbackQuery, NoFaults, PurgeMachine,
-    RegisterMachine, RelayStoreHandle, RelayV2StoreConfig, RetentionLimits, StoreError,
+    AdminPurgeCommitRequest, AdminPurgePreparation, Clock, DiskSpace, DiskSpaceProbe,
+    EnrollmentCodeSeed, FaultInjector, FaultPoint, InstallGrantRecord, MachineInventoryQuery,
+    MachineReadbackQuery, NoFaults, PurgeMachine, RegisterMachine, RelayStoreHandle,
+    RelayV2StoreConfig, RetentionLimits, StoreError,
 };
 use rusqlite::{Connection, OpenFlags};
 use tempfile::TempDir;
 
 const NOW_MS: u64 = 1_726_000_000_000;
 const PAIR_TTL_MS: u64 = 300_000;
+
+fn test_store_config(path: PathBuf) -> RelayV2StoreConfig {
+    let identity =
+        ValidatedRelayReceiptSignerIdentityV1::from_signing_key(&test_receipt_signing_key())
+            .expect("valid test receipt signer");
+    RelayV2StoreConfig::new(path, identity)
+}
+
+fn test_receipt_signing_key() -> SigningKey {
+    SigningKey::from_seed(&[0x71; 32])
+}
+
+async fn signed_admin_purge(
+    store: &RelayStoreHandle,
+    purge: PurgeMachine,
+) -> AdminPurgeCommitRequest {
+    let receipt = match store
+        .prepare_admin_purge(purge.clone())
+        .await
+        .expect("prepare authoritative purge receipt")
+    {
+        AdminPurgePreparation::Sign { tbs } => {
+            let signing_key = test_receipt_signing_key();
+            let verify_key = ValidatedRelayReceiptSignerIdentityV1::from_signing_key(&signing_key)
+                .expect("test receipt identity")
+                .bind_to_relay(tbs.relay_server_id)
+                .expect("test receipt verify key");
+            sign_relay_admin_purge_receipt(&signing_key, &verify_key, tbs)
+                .expect("sign authoritative purge receipt")
+        }
+        AdminPurgePreparation::Committed { receipt } => receipt,
+    };
+    AdminPurgeCommitRequest { purge, receipt }
+}
 
 #[derive(Default)]
 struct ManualMonotonicClock(AtomicU64);
@@ -284,8 +322,6 @@ impl RealmFixture {
             .register_machine(RegisterMachine {
                 code_hash,
                 request_hash: [seed.wrapping_add(6); 32],
-                response_blob: vec![seed],
-                receipt_hash: [seed.wrapping_add(7); 32],
                 machine_route,
                 root_pubkey: PublicKeyBytes(root.verifying_key().to_bytes()),
                 link_cert: link_cert.clone(),
@@ -416,12 +452,18 @@ async fn admin_purge_is_fenced_by_core_and_detaches_only_the_confirmed_machine_r
         .connect_pairing(route, OutboundWriterConfig::default())
         .await;
 
+    let mut wrong_request = signed_admin_purge(
+        &fixture.store,
+        PurgeMachine {
+            machine_route,
+            expected_root_fingerprint: root_fingerprint,
+        },
+    )
+    .await;
+    wrong_request.purge.expected_root_fingerprint = [0xff; 32];
     let wrong = fixture
         .core
-        .purge_machine_admin(PurgeMachine {
-            machine_route,
-            expected_root_fingerprint: [0xff; 32],
-        })
+        .purge_machine_admin(wrong_request)
         .await
         .expect_err("wrong fingerprint cannot purge");
     assert!(matches!(wrong, StoreError::RootFingerprintMismatch));
@@ -439,14 +481,22 @@ async fn admin_purge_is_fenced_by_core_and_detaches_only_the_confirmed_machine_r
             .is_some()
     );
 
-    let readback = fixture
-        .core
-        .purge_machine_admin(PurgeMachine {
+    let request = signed_admin_purge(
+        &fixture.store,
+        PurgeMachine {
             machine_route,
             expected_root_fingerprint: root_fingerprint,
-        })
+        },
+    )
+    .await;
+    let commit = fixture
+        .core
+        .purge_machine_admin(request.clone())
         .await
         .expect("confirmed purge");
+    assert_eq!(commit.receipt, request.receipt);
+    assert!(!commit.duplicate);
+    let readback = commit.readback;
     assert_eq!(readback.active_machine_routes, 0);
     assert_eq!(readback.retired_tombstones, 1);
     assert_eq!(readback.device_grants, 0);
@@ -535,12 +585,17 @@ async fn uncertain_admin_purge_never_restores_old_generations_and_fails_the_whol
         .connect_pairing(route, OutboundWriterConfig::default())
         .await;
 
-    let error = fixture
-        .core
-        .purge_machine_admin(PurgeMachine {
+    let request = signed_admin_purge(
+        &fixture.store,
+        PurgeMachine {
             machine_route,
             expected_root_fingerprint: root_fingerprint,
-        })
+        },
+    )
+    .await;
+    let error = fixture
+        .core
+        .purge_machine_admin(request)
         .await
         .expect_err("both exact recovery attempts report outcome unknown");
     assert!(matches!(error, StoreError::CommitOutcomeUnknown { .. }));
@@ -618,7 +673,7 @@ impl Fixture {
         let mut retention = RetentionLimits::default();
         retention.disk_reserve_bytes = 0;
         retention.disk_reserve_percent = 0;
-        let config = RelayV2StoreConfig::new(db_path.clone())
+        let config = test_store_config(db_path.clone())
             .with_clock(Arc::new(FixedStoreClock))
             .with_disk_space_probe(Arc::new(PlentyOfDisk))
             .with_fault_injector(fault_injector)

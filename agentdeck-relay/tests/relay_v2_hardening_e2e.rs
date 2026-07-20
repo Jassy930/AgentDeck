@@ -7,6 +7,8 @@
 
 #![cfg(all(feature = "server", feature = "tls"))]
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -29,9 +31,15 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use support::{test_receipt_identity, write_test_receipt_signing_key};
+
 const NOW_MS: u64 = 1_800_000_000_000;
 const MACHINE_SEED: u8 = 0x41;
 const STREAM_SEED: u8 = 0x51;
+
+fn test_store_config(path: PathBuf) -> RelayV2StoreConfig {
+    RelayV2StoreConfig::new(path, test_receipt_identity())
+}
 
 #[derive(Debug)]
 struct FixedClock;
@@ -113,7 +121,7 @@ fn store_config(
     disk: Arc<MutableDiskProbe>,
     max_frames_per_stream: u64,
 ) -> RelayV2StoreConfig {
-    RelayV2StoreConfig::new(path.to_path_buf())
+    test_store_config(path.to_path_buf())
         .with_clock(Arc::new(FixedClock))
         .with_disk_space_probe(disk)
         .with_retention(retention(max_frames_per_stream))
@@ -156,8 +164,6 @@ async fn seed_machine_and_stream(store: &RelayStoreHandle) {
         .register_machine(RegisterMachine {
             code_hash: [MACHINE_SEED; 32],
             request_hash: [MACHINE_SEED.wrapping_add(1); 32],
-            response_blob: vec![MACHINE_SEED, 0xad, 0x02],
-            receipt_hash: [MACHINE_SEED.wrapping_add(2); 32],
             machine_route: machine_route(),
             root_pubkey,
             link_cert: certificate(CertRole::Link),
@@ -362,6 +368,9 @@ fn server_config(path: &Path) -> RelayV2ServerConfig {
             key: fixture("test_key.pem"),
         }),
         admin: None,
+        receipt_signing_key: write_test_receipt_signing_key(
+            path.parent().expect("Store path has a private parent"),
+        ),
         log_level: "info".to_owned(),
     }
 }
@@ -407,7 +416,7 @@ async fn direct_tls_server_shutdown_releases_store_and_same_database_reopens() {
         config
             .store
             .clone()
-            .into_store_config()
+            .into_store_config(test_receipt_identity())
             .expect("convert server Store config"),
     )
     .await
@@ -427,7 +436,7 @@ async fn direct_tls_server_shutdown_releases_store_and_same_database_reopens() {
     let final_store = RelayStoreHandle::open(
         config
             .store
-            .into_store_config()
+            .into_store_config(test_receipt_identity())
             .expect("convert final Store config"),
     )
     .await

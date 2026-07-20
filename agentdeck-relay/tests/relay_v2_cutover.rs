@@ -1,5 +1,7 @@
 #![cfg(all(feature = "server", feature = "tls"))]
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
@@ -8,6 +10,8 @@ use agentdeck_relay::config::{RelayV2ServerConfig, RelayV2StoreSettings, RelayV2
 use agentdeck_relay::v2::server::RelayV2ServerHandle;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use support::write_test_receipt_signing_key;
 
 const RESET_CODE: &str = "relay.v1.reset_required";
 const VERSION_UNSUPPORTED_CODE: &str = "relay.version.unsupported";
@@ -40,6 +44,7 @@ fn loopback_config(temp: &TempDir) -> RelayV2ServerConfig {
         store,
         transport: RelayV2TransportMode::InsecureLoopback,
         admin: None,
+        receipt_signing_key: write_test_receipt_signing_key(temp.path()),
         log_level: "info".to_owned(),
     }
 }
@@ -173,17 +178,18 @@ fn legacy_v1_environment_preempts_admin_dispatch() {
 fn v2_binary_selfcheck_accepts_a_temporary_direct_tls_configuration() {
     let temp = TempDir::new().expect("tempdir");
     secure_temp_directory(&temp);
-    std::fs::copy(fixture("test_cert.pem"), temp.path().join("cert.pem"))
+    let root = std::fs::canonicalize(temp.path()).expect("canonical temporary directory");
+    write_test_receipt_signing_key(&root);
+    std::fs::copy(fixture("test_cert.pem"), root.join("cert.pem"))
         .expect("copy TLS certificate fixture");
-    std::fs::copy(fixture("test_key.pem"), temp.path().join("key.pem"))
-        .expect("copy TLS key fixture");
-    let storage = temp.path().join("relay-v2.db");
-    let config = temp.path().join("relay-v2.toml");
+    std::fs::copy(fixture("test_key.pem"), root.join("key.pem")).expect("copy TLS key fixture");
+    let storage = root.join("relay-v2.db");
+    let config = root.join("relay-v2.toml");
     let storage = storage.to_str().expect("UTF-8 temporary storage path");
     std::fs::write(
         &config,
         format!(
-            "bind = \"127.0.0.1:0\"\nhealth_bind = \"127.0.0.1:0\"\nstorage = {storage:?}\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\ndisk_reserve_bytes = 0\ndisk_reserve_percent = 0\n"
+            "bind = \"127.0.0.1:0\"\nhealth_bind = \"127.0.0.1:0\"\nstorage = {storage:?}\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\nreceipt_signing_key = \"receipt-signing-key.seed\"\ndisk_reserve_bytes = 0\ndisk_reserve_percent = 0\n"
         ),
     )
     .expect("write temporary v2 TLS config");

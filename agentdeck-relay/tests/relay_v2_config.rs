@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "tls")]
 use agentdeck_relay::config::RelayV2TlsPaths;
 use agentdeck_relay::config::{
-    RelayV2ConfigError, RelayV2ServerConfig, RelayV2StoreSettings, RelayV2TransportMode,
+    RelayReceiptSigningKeyPath, RelayV2ConfigError, RelayV2ServerConfig, RelayV2StoreSettings,
+    RelayV2TransportMode,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -22,11 +23,106 @@ fn load(
     environment: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<RelayV2ServerConfig, RelayV2ConfigError> {
+    let mut environment = environment.clone();
+    environment
+        .entry("AGENTDECK_RELAY_RECEIPT_SIGNING_KEY".to_owned())
+        .or_insert_with(|| {
+            cwd.join("test-receipt-signing-key.seed")
+                .to_string_lossy()
+                .into_owned()
+        });
+    load_unmodified(args, &environment, cwd)
+}
+
+fn load_unmodified(
+    args: &[&str],
+    environment: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<RelayV2ServerConfig, RelayV2ConfigError> {
     RelayV2ServerConfig::load_from(args.iter().copied(), environment, cwd)
 }
 
 fn insecure_args() -> Vec<&'static str> {
     vec!["agentdeck-relay", "--allow-insecure-loopback"]
+}
+
+#[test]
+fn receipt_signing_key_is_required_without_default_or_empty_environment_fallback() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let missing = load_unmodified(&insecure_args(), &BTreeMap::new(), temp.path())
+        .expect_err("receipt signer must never receive a default key");
+    assert!(matches!(missing, RelayV2ConfigError::ReceiptSignerRequired));
+    assert_eq!(missing.code(), "relay.receipt.signer_required");
+
+    let empty = load_unmodified(
+        &insecure_args(),
+        &env(&[("AGENTDECK_RELAY_RECEIPT_SIGNING_KEY", "")]),
+        temp.path(),
+    )
+    .expect_err("empty signer environment must fail instead of falling back");
+    assert!(matches!(
+        empty,
+        RelayV2ConfigError::InvalidEnvironment {
+            key: "AGENTDECK_RELAY_RECEIPT_SIGNING_KEY"
+        }
+    ));
+}
+
+#[test]
+fn receipt_signing_key_uses_cli_over_env_over_toml_and_resolves_by_source() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config_dir = temp.path().join("config");
+    std::fs::create_dir(&config_dir).expect("create config directory");
+    let config_path = config_dir.join("relay.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "storage = {:?}\nallow_insecure_loopback = true\nreceipt_signing_key = \"file.seed\"\n",
+            temp.path().join("relay.db")
+        ),
+    )
+    .expect("write signer config");
+    let config_arg = config_path.to_str().expect("UTF-8 config path");
+    let environment = env(&[("AGENTDECK_RELAY_RECEIPT_SIGNING_KEY", "env.seed")]);
+
+    let cli = load_unmodified(
+        &[
+            "agentdeck-relay",
+            "--config",
+            config_arg,
+            "--receipt-signing-key",
+            "cli.seed",
+        ],
+        &environment,
+        temp.path(),
+    )
+    .expect("CLI signer path wins");
+    assert_eq!(
+        cli.receipt_signing_key.as_path(),
+        temp.path().join("cli.seed")
+    );
+
+    let from_env = load_unmodified(
+        &["agentdeck-relay", "--config", config_arg],
+        &environment,
+        temp.path(),
+    )
+    .expect("environment signer path wins over TOML");
+    assert_eq!(
+        from_env.receipt_signing_key.as_path(),
+        temp.path().join("env.seed")
+    );
+
+    let from_file = load_unmodified(
+        &["agentdeck-relay", "--config", config_arg],
+        &BTreeMap::new(),
+        temp.path(),
+    )
+    .expect("TOML signer path is accepted");
+    assert_eq!(
+        from_file.receipt_signing_key.as_path(),
+        config_dir.join("file.seed")
+    );
 }
 
 #[test]
@@ -278,6 +374,9 @@ fn manually_constructed_server_config_cannot_bypass_transport_or_health_gates() 
         store: RelayV2StoreSettings::new(temp.path().join("relay.db")),
         transport: RelayV2TransportMode::InsecureLoopback,
         admin: None,
+        receipt_signing_key: RelayReceiptSigningKeyPath::new(
+            temp.path().join("receipt-signing-key.seed"),
+        ),
         log_level: "info".to_owned(),
     };
     base.validate().expect("valid manual loopback config");
@@ -325,6 +424,9 @@ fn manually_constructed_direct_tls_requires_tls_feature() {
             key: PathBuf::from("/tmp/key.pem"),
         }),
         admin: None,
+        receipt_signing_key: RelayReceiptSigningKeyPath::new(
+            temp.path().join("receipt-signing-key.seed"),
+        ),
         log_level: "info".to_owned(),
     };
     let error = config
