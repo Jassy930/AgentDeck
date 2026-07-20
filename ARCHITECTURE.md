@@ -27,14 +27,14 @@ AgentDeck 不做 IDE，不做通用多 agent 聊天界面，不是 Codex Desktop
 └──────────────────────────┬──────────────────────────────────────┘
                            │ Layer A 中立事件主干（AgentItem）
                            │ Layer B Vendor 控件命名空间
-                           │ RuntimeEnvelope v2（OS-account canonical UDS）
+                           │ RuntimeEnvelope v3（OS-account canonical UDS）
                            ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  agentdeckd (Rust daemon)                                       │
 │  RuntimeHub（admin/read stdio compatibility）                   │
 │       └─ production 拒绝 SessionStart / SessionContinue          │
 │  local::listener（retained-dirfd canonical UDS + supervisor）    │
-│       └─ same-EUID → preface → RuntimeEnvelope v2               │
+│       └─ same-EUID → preface → RuntimeEnvelope v3               │
 │  RuntimeCore（exec-gate + local connection actor 已就绪）        │
 │       └─→ AgentRouter（按 conversation.agentKind 路由）           │
 │            ├─ CodexAdapter      (capabilities = {...})          │
@@ -46,7 +46,7 @@ AgentDeck 不做 IDE，不做通用多 agent 聊天界面，不是 Codex Desktop
 codex app-server                       claude CLI (--print --stream-json)
 
 agentdeck-cli  (参考客户端 / 门控 E2E 驱动，不在 GUI 实时通路上)
-      │  RuntimeEnvelope v2 canonical UDS（无 spawn/fallback）
+      │  RuntimeEnvelope v3 canonical UDS（无 spawn/fallback）
       ▼
 agentdeckd
 ```
@@ -56,8 +56,9 @@ agentdeckd
 - `Sources/AgentDeck/`：macOS 原生 UI、会话模型、历史回放和本地交互。UI 只能通过 `CapabilityRouter` 消费 `SessionCapabilities` 决定渲染路径，禁止直接读 vendor 字段或硬编码 `if agentKind == .codex` 分支。
 - `agentdeck-protocol/`：IPC 协议事实源 crate。分 trunk / capabilities / vendor / transport 四个模块，`PROTOCOL_VERSION` = 2，`protocol_schema()` 聚合所有 v2 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
-- `agentdeckd/src/local/`：当前为本地 Runtime v2 framing；A1a main cutover / real-data reader 分别由
-  `c28a968` / `c36a4f9` 收口，A1b signed-material hard cutover 由 `ef830cd` 收口。
+- `agentdeckd/src/local/`：当前为本地 Runtime v3 framing；它在 P3.9 Runtime v2 中立契约上 additive 增加
+  P4.2 local-only machine administration，不提供 production v2/v3 双栈。A1a main cutover / real-data reader
+  分别由 `c28a968` / `c36a4f9` 收口，A1b signed-material hard cutover 由 `ef830cd` 收口。
   same-EUID peer gate、每连接 Unix actor、retained-dirfd
   secure listener 与显式 stdio compatibility wrapper。listener 在 bind 时持有完成 recovery 的 Core，
   supervisor 停止 accept 后 graceful cancel/join 全部连接。
@@ -468,7 +469,9 @@ conversation/key，不能伪造身份连续性。
   `conversationId` 执行 `Subscribe/SendPrompt`；history list 分页读取 `Catalog`，history read 固定为
   `Subscribe(BeforeFirst) → Snapshot/Backfill* → SyncComplete → Unsubscribe`；metadata mutation 使用 expected entry
   revision + stable idempotency key。机器输出只暴露 canonical conversation/command/turn/event/item/entity ID；
-  `protocol` / `remote` 不连接 Runtime，diagnostics one-shot 不得作为 UDS 失败 fallback；无 v2 映射的
+  `protocol` 与 synthetic/legacy remote 不连接 Runtime；P4.2 的 `remote machine enroll|status` 与
+  `remote trust-reset` 只连接 canonical Runtime v3 UDS。diagnostics one-shot 不得作为 UDS 失败 fallback；无
+  current Runtime 映射的
   `persistApproval`、CC `worktree/sessionName` 在 clap/plan 构造阶段 typed reject。所有 usage error 都输出稳定
   JSON envelope；`--help` 仍保留成功的人读输出。
 - prompt retry 始终重发 exact `SendPrompt`，由 daemon 的 payload hash 裁决 `Replayed` 或
@@ -496,7 +499,8 @@ conversation/key，不能伪造身份连续性。
   并取得 flush ACK 后才 arm，随后经 active→idle fence、候选 artifact/hash/owner/mode/nlink 复核才能原子
   切换 `bin/current` 并退出。ACK 前的 encode/write/flush/cancel/disconnect 任一失败都必须丢弃 action并保持
   symlink/PID 不变；ACK 已授予许可后，随后 client close 不得撤销已提交动作。LaunchAgent lifecycle
-  覆盖 install/status/uninstall、stopped `loaded=true,pid=null` job 和 P4.2 trust-reset 前 `--purge` typed fail-close/零删除；
+  覆盖 install/status/uninstall、stopped `loaded=true,pid=null` job；P3.10 当时的 `--purge` 在 P4.2 前 typed
+  fail-close/零删除，当前已由下节 authenticated trust-reset/finalizer 替换；
   stopped job 先 kickstart 并二次读回 live PID，CLI 只对 `socket_missing` / `connect_failed` 做有界 15 秒
   retry。P3 Phase review 的 `773a2b3` / `81cc314` / `9efb28d` 又把 `codesign`、`plutil` 与候选
   `agentdeckd --version` verifier 固定在独立 PGID 中，以非阻塞管道执行，使用 10 秒绝对 deadline、
@@ -518,17 +522,55 @@ conversation/key，不能伪造身份连续性。
   完整 dev/ephemeral Keychain 路径，provisioned signed roundtrip 移入 post-MVP ignored/BLOCKED 槽位，
   不阻塞 P3/P4 主线或 phase closeout，也不再尝试代码绕过 AMFI；stable production signing 尚未完成。
 - P3 complete 只指 MVP automatic scope。P4.1 已由 `3cd76d2`、`644712c`、`95090c1`、`85df3d2`、
-  `f137112`、`46c6bb8` 完成 Machine identity、key-directory guard 与通用 CounterGuard IO，P4 当前
-  为 1/7，下一项是 P4.2。两路独立终审均 Approved、P0/P1/P2 = 0；完整 `agentdeckd` package exit 0，
-  lib `916 passed / 3 ignored`、容量项 284.28 秒，selfcheck/diagnostics/network/schema/static/fmt/
-  scoped Clippy/diff/status 全绿。
+  `f137112`、`46c6bb8` 完成 Machine identity、key-directory guard 与通用 CounterGuard IO。两路独立终审
+  均 Approved、P0/P1/P2 = 0；完整 `agentdeckd` package exit 0，lib `916 passed / 3 ignored`、容量项
+  284.28 秒，selfcheck/diagnostics/network/schema/static/fmt/scoped Clippy/diff/status 全绿。
 - P4.1 bootstrap 顺序固定为“四组 key material 写入并逐项读回 → authenticated Preparing →
   key-directory guard 写入并读回 → authenticated Active”。Active identity 缺 key/guard 或 binding 分叉
   只阻断 remote，本地 Runtime recovery 与 UDS 继续可用；`--ephemeral --no-remote` 对 stable machine
   accounts 零 IO。P4.1 严格保持零 Link/Data cert、零 enrollment workflow、零 enrollment receipt IO、
   零 RemoteLink；通用 CounterGuard IO 不等于 active key/DB counter reservation，也尚未闭环整库 artifact
-  消失或自洽历史回滚。certificate、enrollment、receipt 与 RemoteTransport 首次归 P4.2；P3.1
+  消失或自洽历史回滚。certificate、enrollment、receipt 与 RemoteTransport 后续已由 P4.2 接管；P3.1
   provisioned signed Keychain roundtrip 继续保持 post-MVP BLOCKED。
+
+### Relay Companion MVP P4.2 machine administration / RemoteTransport / trust reset 不变量
+
+- P4.2 code/test 由 `a6842bc` 收口，P4 当前为 2/7，下一项 P4.3 PairInvite/DeviceGrant。
+  Runtime protocol additive 升为 v3；local IPC v2、Relay v2、E2EE v1 是独立版本轴，不联动升级。
+- Runtime physical schema 从 v8/24 表 additive 升为 v9/25 表。新增 authenticated singleton
+  `machine_remote_state` 与 `runtime_meta.machine_remote_state_count`；sealed state 由 StorageKEK 保护，独立 row
+  MAC 同时绑定 lifecycle、database/Relay/route/root/trust epoch、request/response/receipt/anchor hash、sealed
+  bytes 长度与 reset kind。v8 既有 ciphertext/token/wrapped key 与 crypto context byte-exact 不变。
+- durable lifecycle 固定为
+  `EnrollmentPrepared → EnrollmentResponseValidated → Active → RetirePending → RelayCommitted →
+  PurgeReadbackAbsent → LocalDeleted`。每个 mutation 都是 expected-state + exact-input CAS；before-COMMIT
+  完整回滚，after-COMMIT unknown 只能以相同 frozen bytes/hash 重试。`machine_enrollment_receipts` 仍只是
+  三字段 root-lost locator；Active 及后续 open/recovery 与 authenticated state 交叉审计，locator 不能提供
+  purge/delete authority或反向修复可信 state。
+- `RemoteManager` 只有在 recovery 完成、canonical same-UID UDS 已安全 bind 且消费同一
+  `RemoteStartPermit` 后，才允许经纯 `agentdeck-relay-client` 发起 enrollment/auth/control outbound。CA、hostname
+  与 SPKI pin 必须先于 code/root/public material；root-signed Link/Data cert 绑定同一
+  Relay/route/root/epoch/generation。`RemoteTransport` 不持有 `RuntimeCore`，只交付 retirement、安全 failure 与
+  server-restarting control；收到任一业务 frame立即关闭，production business dispatch 恒为零。
+- 本机 `MachineEnroll`、`MachineRemoteStatus`、`TrustReset` 只允许 same-UID local principal 经 Runtime v3
+  canonical UDS 调用；RuntimeCore 只依赖 daemon-private neutral `RemoteAdministration` capability，不 import
+  Relay wire。bundle/portable receipt 必须是 current-UID、single-link、no-follow 私有 regular file且最多 64 KiB。
+- root-present reset 必须经当前 authenticated transport 提交 frozen root-signed retirement。Relay 的
+  `RetirementCommitted` 只有在 purge COMMIT 与 active/data absent readback 完成后产生；daemon 持久 exact
+  terminal 后独立 CAS 到 `PurgeReadbackAbsent`。terminal control wait 固定 10 秒绝对 deadline；manager
+  shutdown/upgrade 在等待 mutex 前广播取消，任何 timeout/cancel 都保留同一 `RetirePending` frozen bytes 供
+  exact retry。root-lost 不建立网络，只允许 authenticated `Active` 接受 enrollment 时 authenticated anchor
+  所验证的 portable signed admin purge receipt；Prepared/Validated/RetirePending root-lost 在 marker 前返回
+  state conflict且不展示 purge 模板。route/root/epoch/readback/signature 任一不匹配零删除。两条路径都在
+  authenticated `LocalDeleted` tombstone 后才允许显式 re-enroll。
+- `daemon uninstall --purge` 先验证安装 helper 的签名/entitlement/version/hash/TeamIdentifier/access group，
+  再 reserve 并 exact-readback 一次性 authenticated marker；marker 存在即 durable purge intent并 fence enroll。
+  顺序固定为 `trust reset/readback → bootout + PID/UDS absent → retained helper → install files/plist → Runtime
+  DB artifacts → machine keys/guards → StorageKEK last`。每步按 frozen plan/namespace/helper identity 读回并可
+  crash-retry；DB/marker 缺失本身不是删除 Keychain 的授权。
+- automatic gate 使用 injected dev/ephemeral keystore、signature verifier 与 hermetic install namespace。它不
+  证明 PairInvite/DeviceGrant、业务 RemoteLink、E2EE publication、持久远程 CLI、iOS 真实链路或
+  production-signed LaunchAgent/Keychain；provisioned signed 槽位继续 post-MVP BLOCKED。
 
 ### Relay Companion MVP P3.2 Runtime persistence 不变量
 
@@ -723,9 +765,10 @@ conversation/key，不能伪造身份连续性。
   才返回原 SQLite error；已进入 autocommit 或 rollback 无法确认时统一返回
   `CommitOutcomeUnknown`，由 stable input 的 exact retry 收敛。shutdown deadline 只限制调用方
   等待，worker/SQLite/row keys/path lease 只在真正静默退出后释放。
-- `machine_enrollment_receipts` 只是 MachineRoot 丢失后仍可读的非秘密 locator，不带 MAC、
-  也不是 purge authorization。P4 trust-reset 必须用 Relay/admin-signed receipt 独立验证 old
-  route/root fingerprint；不得仅凭该表执行远端删除。
+- `machine_enrollment_receipts` 只是 MachineRoot 丢失后仍可读的非秘密三字段 locator，自身不带 MAC、
+  也不是 purge authorization。P4.2 已用 authenticated `machine_remote_state` 交叉审计 locator，并要求
+  enrollment 时锚定的 Relay receipt verify key 独立验证 portable admin-signed purge receipt及 old
+  route/root/epoch/readback；不得仅凭该表执行远端或本地删除。
 - P3.2/P3.3 只建立并验证 store + adapter private boundary；P3.4 当时由 RuntimeCore actor 把
   Runtime v1 的 Start/SendPrompt/cancel/query 接入；P3.9-C0-A1a1 已提交 additive DTO，A1a2 又由
   `c28a968` / `c36a4f9` 完成 public Runtime v2 wire、真实 v1/schema v4 样本读回与独立终审；`ef830cd`
@@ -932,9 +975,10 @@ conversation/key，不能伪造身份连续性。
   range、COMMIT-unknown byte-identical retry、ACK 与 restart state machine。它没有执行真实 E2EE
   seal、MachineDataSign、Keychain CounterGuard 或 Relay Publish；这些仍属于 P4，不能从本节推出
   远程 Companion 已接通。
-- P3.6 仍是 transport-neutral component layer。`TransferStateMachine` 与 publication dispatcher
-  尚无 production remote owner；普通 GUI 已经通过 P3.9-C3/E、Rust CLI 与 Swift `main.swift --selfcheck`
-  已经通过 P3.9-D shared-daemon client 连接该 Core。P3.1
+- P3.6 仍是 transport-neutral component layer。P4.2 已有 enrollment/auth/retirement control-only
+  `RemoteTransport`，但 `TransferStateMachine`、publication dispatcher 与业务 Runtime frame 尚无 production
+  remote owner；普通 GUI 已经通过 P3.9-C3/E、Rust CLI 与 Swift `main.swift --selfcheck` 已经通过 P3.9-D
+  shared-daemon client 连接该 Core。P3.1
   provisioned signed Keychain roundtrip 仍是外部 BLOCKED gate；
   Simulator fixture、fake publication 与本地 store tests 都不是 P4/P5/P6 证据。
 - Store worker 初始化/migration 的 ready error 必须在 path lease 已释放后才对 caller 可见；同进程
@@ -1034,7 +1078,7 @@ Swift UI
   -> CapabilityRouter（按 SessionCapabilities 派发）
   -> WorkbenchModel / ThreadRuntimeModel / SessionModel / HistoryModel
   -> AgentDeck IPC models（来自 agentdeck-protocol v2）
-  -> AppRuntimeCoordinator / RuntimeEnvelope v2
+  -> AppRuntimeCoordinator / RuntimeEnvelope v3
   -> OSAccountRuntimeWireSession（canonical singleton UDS；无 spawn/fallback）
 
 daemon main
@@ -1045,14 +1089,15 @@ daemon main
   -> C0-C native projector → verified CC JSONL / atomic projection / dynamic snapshot
   -> C0-C native metadata coordinator → authenticated fence substrate（live vendor post-MVP gated）
   -> P3.7 exec-gate / typed driver（普通 GUI、CLI/selfcheck 已由 P3.9-C3/D 接通）
-  -> transport-neutral P3.6 component → transfer / publication（production owner 待 P4）
+  -> P4.2 RemoteManager → enrollment / control-only RemoteTransport → agentdeck-relay-client
+  -> transport-neutral P3.6 component → transfer / publication（业务 production owner 待 P4.4/P4.5）
   -> AgentRouter → CodexAdapter / ClaudeCodeAdapter
   -> record / diag
   -> codex app-server child process / claude CLI child process
 
 agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
   -> agentdeck-protocol（共享类型）
-  -> RuntimeUnixClient / RuntimeEnvelope v2（canonical singleton UDS）
+  -> RuntimeUnixClient / RuntimeEnvelope v3（canonical singleton UDS）
   -> 同一 RuntimeCore；无 spawn/fallback，显式 diagnostics one-shot 与 compatibility stdio 在主路径外
 ```
 

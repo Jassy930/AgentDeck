@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P3 automatic scope 已从 code baseline `9efb28d` 完成 6/6 Phase Exit。P4.1 machine identity/guard 已由 `3cd76d2`、`644712c`、`95090c1`、`85df3d2`、`f137112`、`46c6bb8` 完成 Task 门禁与双路 Approved，P4/P5/P6 当前分别为 1/7、0/9、0/4 Task 完成，下一项是 P4.2 certificate/enrollment/RemoteTransport/trust reset；production native metadata 与 provisioned signed Keychain/LaunchAgent 均为 post-MVP gated/BLOCKED（2026-07-20） |
+| 状态 | Approved target；P3 automatic scope 已从 code baseline `9efb28d` 完成 6/6 Phase Exit。P4.1 machine identity/guard 已由 `3cd76d2`、`644712c`、`95090c1`、`85df3d2`、`f137112`、`46c6bb8` 完成；P4.2 Runtime v3/schema v9、certificate/enrollment/control-only RemoteTransport/trust reset 由 `a6842bc` 完成 Task 门禁与双路 Approved。P4/P5/P6 当前分别为 2/7、0/9、0/4 Task 完成，下一项是 P4.3 PairInvite/DeviceGrant；production native metadata 与 provisioned signed Keychain/LaunchAgent 均为 post-MVP gated/BLOCKED（2026-07-20） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -53,11 +53,14 @@ BLOCKED contract、四 schema、network、docs、local smoke 与 diagnostics 全
 完成四组 machine key、authenticated schema v8/24 表、key-directory guard、通用 CounterGuard IO 与
 `Preparing → Active` bootstrap。focused bootstrap `18/18`、identity keys `11/11`、store identity
 `11/11`、RootKeyId `2/2`、v7→v8 migration `1/1` 均通过；完整 daemon package exit 0（lib
-`916 passed / 3 ignored`，capacity 慢项 284.28s），两路独立终审均 Approved。P4 当前为 1/7，
-下一项是 P4.2。P4.1 仍严格零 cert、零 enrollment workflow、零 receipt IO、零 RemoteLink；其
-CounterGuard 只是通用 IO，不代表 active symmetric key reservation、DB high-water 绑定或整库回滚闭环
-已经完成。iOS 仍只有 fixture 驱动骨架。P3.1 provisioned signed Keychain/LaunchAgent roundtrip 继续按
-方案 b 保持 post-MVP BLOCKED gate。完整实施仍必须满足 §17 的 Definition of Done。
+`916 passed / 3 ignored`，capacity 慢项 284.28s），两路独立终审均 Approved。P4.2 又由
+`a6842bc` 把 Runtime protocol additive 升至 v3、physical schema 升至 v9/25 表，并完成
+root-signed Link/Data cert、durable enrollment/receipt、control-only authenticated MachineLink、
+root-present/root-lost trust reset 与安全 uninstall purge；Task 门禁与双路终审 Approved。P4 当前为 2/7，
+下一项是 P4.3。P4.2 不拥有 PairInvite/DeviceGrant、业务 Runtime dispatch、E2EE publication、持久远程
+CLI 或 iOS 真实链路。CounterGuard 仍只是通用 IO，不代表 active symmetric key reservation、DB high-water
+绑定或整库回滚闭环已经完成。iOS 仍只有 fixture 驱动骨架。P3.1 provisioned signed Keychain/LaunchAgent
+roundtrip 继续按方案 b 保持 post-MVP BLOCKED gate。完整实施仍必须满足 §17 的 Definition of Done。
 
 ## 1. 背景与当前问题
 
@@ -329,10 +332,30 @@ PairInvite 一旦进入 preparing 就不恢复为 unused。完整状态机是 `r
 - 对 `revokeSelf`，Relay COMMIT 后先丢普通 queue，再从保留的 control slot 向该连接发送包含 MachineRoot-signed `DeviceRevocation` 的 `RevocationCommitted` terminal frame；flush 成功或最多 2 秒后关闭连接。若 terminal frame 丢失，设备再次鉴权会收到同一份 signed revoked terminal state，而不是模糊的网络错误。
 - iOS 只允许 revoke self；管理其他设备由被控机器本地 App/CLI 完成。
 - 普通 daemon/Relay 重启不需要重新配对。
-- 显式 trust reset 且 MachineRoot 尚在时：先签包含 `rootKeyId` 的 `RetireMachine`，等 Relay 返回严格最小的 `RetirementCommitted(machineRoute, trustEpoch, retireHash)` 并读回旧 route 不存在，再删除本机 root/runtime crypto state，最后登记新 route。ACK 丢失时，旧 exact MachineLink challenge proof只重放同一 terminal，不重新激活 route。
-- daemon 在 Runtime DB 保存不含私钥的 `MachineEnrollmentReceipt(relayServerId, oldRoute, rootFingerprint)`，用于 Keychain 丢失后的定位；它不是恢复凭据。
-- MachineRoot 意外丢失时 daemon remote mode 必须保持 blocked；Relay 操作者通过本地 0600 admin Unix socket 执行 `machine purge <oldRoute> --confirm <rootFingerprint>` 并读回确认后，机器才能建立新 route。若连本机 receipt 也丢失，Relay admin 只能从本地 inventory 列出 route/root fingerprints 由操作者人工确认；无法访问 Relay 管理面时不能安全重新登记。
-- purge 事务删除该 machine 的 grants、subscriptions、frames 与 active route material，只保留不可重新激活的最小 retired tombstone；读回必须证明 active route/data 已不存在，再允许 daemon 删除本地 keys/state 并重新 enroll。
+- 显式 trust reset 且 MachineRoot 尚在时：先签包含 `rootKeyId` 的 frozen `RetireMachine`。Relay 只有在
+  purge COMMIT、terminal tombstone 与 active/data absent readback 已完成后，才返回严格最小的
+  `RetirementCommitted(machineRoute, trustEpoch, retireHash)`；该 exact terminal 本身就是 Relay 侧 absent
+  证明，不再发明第二个网络 readback API。daemon 先持久 `RelayCommitted`，再独立 CAS 到
+  `PurgeReadbackAbsent`，最后删除本机 root/runtime crypto state并保留 `LocalDeleted` tombstone。ACK 丢失时，
+  旧 exact MachineLink challenge proof 只重放同一 terminal，不重新激活 route。
+- daemon 等待 `RetirementCommitted` 使用 10 秒绝对 deadline；shutdown/upgrade 必须先在 manager mutex 外
+  广播取消，再取得唯一 transport owner并 join。timeout、取消或 Relay failure 均只保留同一 authenticated
+  `RetirePending` frozen bytes/hash，后续只能 exact retry，不能产生第二份 retirement。
+- daemon 在 authenticated `machine_remote_state` 保存完整 lifecycle/binding/hash/sealed state；另保留不含私钥的
+  三字段 `machine_enrollment_receipts(relayServerId, oldRoute, rootFingerprint)`，仅用于 MachineRoot 丢失后的
+  定位。locator 没有授权力，Active 及后续 open/recovery 必须与 authenticated state 交叉审计，缺失或篡改
+  fail-close且不得自动修复。
+- MachineRoot 意外丢失时 daemon remote mode 必须保持 blocked；Relay 操作者通过本地 0600 admin Unix socket
+  执行 `machine purge <oldRoute> --confirm <rootFingerprint>`。purge 返回由 enrollment 时锚定的专用 Relay
+  receipt verify key 所签名、绑定 server/route/root/epoch/readback 的 portable receipt；daemon 只有验证该
+  proof 后才能进入 `PurgeReadbackAbsent` 并删除本地 trust state。若连本机 locator 也丢失，Relay admin 只能
+  从本地 inventory 列出 route/root fingerprints 由操作者人工确认；无法访问 Relay 管理面时不能安全重新登记。
+- portable root-lost authority 只允许从 authenticated `Active` 产生。`EnrollmentPrepared`、
+  `EnrollmentResponseValidated` 或 `RetirePending` 丢 root 时，manager 必须在预留 purge marker 前返回 state
+  conflict，CLI 不展示 Relay admin purge 模板；这些状态不能用一个 Store 无法消费的 receipt 误清理。
+- purge 事务删除该 machine 的 grants、subscriptions、frames 与 active route material，只保留不可重新激活的
+  最小 retired tombstone；signed receipt 的 readback 必须证明 active route/data 已不存在，再允许 daemon
+  删除本地 keys/state 并显式重新 enroll。
 - 不提供云端恢复、escrow 或旧 ciphertext 解密恢复。
 
 ### 6.6 签名对象与单调版本
@@ -477,6 +500,9 @@ Relay 不返回包含密文内部细节的错误。TLS pin 不匹配没有绕过
   `RuntimeEnvelope v2`，不提供 production v1/v2 双栈。现有 local IPC `PROTOCOL_VERSION=2` 只由
   `StdioCompatibilityAdapter`/旧测试使用；禁止让 UDS 继续携带 vendor threadId/sessionId trunk 作为
   canonical identity。
+- P4.2 在该中立 v2 基础上 additive 增加 local-only machine enrollment/status/trust-reset 与
+  `UninstallPurgePlanV1`，把 current wire 升为 Runtime v3；不提供 production v2/v3 双栈。local IPC v2、
+  Relay v2 与 E2EE v1 是独立版本轴，不随 Runtime v3 联动升级。
 
 进入 RuntimeCore 的不是可由 transport 拼字段构造的 public enum，而是字段私有、只能由 daemon
 内部认证 issuer 签发的 `AuthenticatedPrincipal` capability。相同完整授权身份共享同一个
@@ -1402,7 +1428,7 @@ Challenge、PairRoute、connection registry、writer queues、heartbeat timers �
 
 UIKit ViewModel 保持 `@MainActor`，只消费 source 状态。
 
-macOS executable 侧增加 `LocalDaemonSessionSource`（RuntimeEnvelope v2 over UDS）与
+macOS executable 侧增加 `LocalDaemonSessionSource`（current RuntimeEnvelope v3 over UDS）与
 `SessionSourceRegistry`。registry 把“本机”绑定到唯一 UDS source，把每台 paired remote machine 绑定到
 独立 RelaySessionSource；`WorkbenchModel`/AppKit controller 只按选中的 machine scope 消费统一
 `SessionSource`，不在 UI 层写 `if agentKind` 或直接处理 Relay crypto。iOS 发行版只注册 Relay source，
@@ -1545,8 +1571,8 @@ UDS/reply-flush/idle，并由 harness 按 `bin/current` 手动重启，验证 ac
 mismatch、uninstall 保留数据，以及 `--ephemeral --no-remote` 无法读取 stable DB/Keychain/socket。
 干净用户环境的真实 install + `launchctl print`、stable PID/UDS、跨版本 Keychain 与 production-signed helper
 readback 属 post-MVP BLOCKED 槽位，不阻塞 P3 自动 exit，也不能由 injected harness 冒充。P3 的
-`uninstall --purge` 只验证 typed `daemon.purge.remote_not_ready` 且零删除；完整 trust-reset/purge 门禁留到
-P4 RemoteTransport 存在后执行。
+`uninstall --purge` 只验证 typed `daemon.purge.remote_not_ready` 且零删除；该句是 P3 的历史退出边界，
+后续 P4.2 已在 control-only RemoteTransport 上闭合完整 trust-reset/purge automatic 门禁。
 
 本门禁已在 code baseline `9efb28d` 上完成 6/6 P3 Phase Exit；完整 verifier、Rust/Swift/iOS、四 schema、
 network/docs、local smoke、diagnostics、signed exact BLOCKED contract 与双路 phase review 均通过。
@@ -1558,8 +1584,9 @@ provisioned production-signed LaunchAgent/Keychain 仍按方案 b 保持 post-MV
   CounterGuard IO；严格零 cert、零 enrollment workflow、零 RemoteLink，不读写
   `machine_enrollment_receipts`。通用 CounterGuard IO 不等于 active key reservation、DB high-water 绑定或
   整库回滚闭环，这些仍属于后续 P4 Task。
-- P4.2 才首次签发 root-signed link/data cert、读写 enrollment receipt、执行 Relay machine enrollment，
-  并建立第一条 RemoteLink；PairInvite 继续由 P4.3 拥有。
+- P4.2 已首次签发 root-signed link/data cert、读写 enrollment receipt、执行 Relay machine enrollment，
+  并建立第一条 control-only authenticated MachineLink/RemoteTransport；它拒绝业务 frame且不向
+  RuntimeCore dispatch。PairInvite/DeviceGrant 继续由 P4.3 拥有，业务 RemoteLink 属后续 Task。
 - daemon WSS/E2EE、MachineDataSign、Catalog/events/commands/replay、key/counter crash recovery。
 - macOS persistent 远程 CLI 使用 Keychain 中的真实 grant/private keys 和 daemon receipts；Linux synthetic client 只用 ephemeral keys。
 

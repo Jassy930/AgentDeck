@@ -8,14 +8,15 @@
 | 版本轴 | 版本常量 | 快照文件 | 聚合 schema 函数 | CLI 导出命令 | 重生成命令 |
 | --- | --- | --- | --- | --- | --- |
 | 本地 IPC（CLI/Swift ⇄ daemon） | `agentdeck_protocol::PROTOCOL_VERSION` = 2 | `agentdeck-protocol.schema.json` | `agentdeck_protocol::protocol_schema()` | `agentdeck protocol schema` | `UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot` |
-| Runtime（daemon ⇄ 远端 Runtime 端点） | `agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION` = 2 | `runtime-protocol.schema.json` | `agentdeck_protocol::runtime::runtime_schema()` | `agentdeck protocol runtime-schema` | `UPDATE_RUNTIME_SCHEMA=1 cargo test -p agentdeck-protocol runtime_schema_matches_committed_snapshot` |
+| Runtime（本机 UDS 与 RemoteLink 解密后的共同业务 wire） | `agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION` = 3 | `runtime-protocol.schema.json` | `agentdeck_protocol::runtime::runtime_schema()` | `agentdeck protocol runtime-schema` | `UPDATE_RUNTIME_SCHEMA=1 cargo test -p agentdeck-protocol runtime_schema_matches_committed_snapshot` |
 | Relay v2（endpoint ⇄ relay 外层可见字段） | `agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION` = 2 | `relay-v2.schema.json` | `agentdeck_protocol::relay_v2::relay_v2_schema()` | `agentdeck protocol relay-schema` | `UPDATE_RELAY_SCHEMA=1 cargo test -p agentdeck-protocol relay_v2_schema_matches_committed_snapshot` |
 | E2EE（endpoint 侧密文/签名契约） | `agentdeck_protocol::e2ee::E2EE_FORMAT_VERSION` = 1 | `e2ee-v1.schema.json` | `agentdeck_protocol::e2ee::e2ee_schema()` | `agentdeck protocol e2ee-schema` | `UPDATE_E2EE_SCHEMA=1 cargo test -p agentdeck-protocol e2ee_schema_matches_committed_snapshot` |
 
-Runtime v2 Rust contract、schema 与 current fixture 已由 P3.9-C0-A1a2 的 `c28a968` 完成，真实
-Runtime v1/schema v4 persisted readback 由 `c36a4f9` 收口。Swift production mirror/cutover 仍属于
-P3.9-C0-A2；冻结的 `runtime-v1-wire.jsonl` 仅供 A2 前的 Swift compatibility 回归读取，不是当前
-Runtime contract gate。
+Runtime v3 在已完成的 v2 中立契约上增加 P4.2 本机 machine enrollment/status/trust-reset 管理面，
+包括严格的 `EnrollmentBundleV2`、`MachineRemoteStatus`、portable admin purge receipt 与
+`UninstallPurgePlanV1`；current Rust/Swift fixture 是 `runtime-v3-wire.jsonl`。冻结的
+`runtime-v1-wire.jsonl` 与 `runtime-v2-wire.jsonl` 只作 compatibility 证据，不是 current Runtime
+contract gate。Runtime 版本提升不联动 local IPC v2、Relay v2 或 E2EE v1。
 
 四个 `agentdeck protocol <op>` 子命令（连同 `protocol version`）都是纯本地
 计算：它们直接调用上表对应的聚合 schema 函数并原样打印，**不 spawn
@@ -58,7 +59,7 @@ vendor 字段只能出现在 `capabilities.*` / `vendorControl.*` / `vendorPanel
 
 ### 四道守护测试
 
-`agentdeck-protocol` 共有 30 个测试守护协议正确性，其中四道核心守护：
+`agentdeck-protocol` 的协议测试守护以下四道核心边界；总测试数随契约演进，不作为稳定文档事实：
 
 1. `schema_matches_committed_snapshot` — 协议类型变更必须重生成 schema 快照（K10）
 2. `protocol_neutrality_main_trunk` — 主干类型不出现 vendor 字样（N1）

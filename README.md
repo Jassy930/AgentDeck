@@ -54,7 +54,7 @@ v0.2 在 macOS AppKit 上端到端验证「统一壳」架构：
 └──────────────────────────┬──────────────────────────────────────┘
                            │ Layer A 中立事件主干（AgentItem）
                            │ Layer B Vendor 控件命名空间
-                           │ RuntimeEnvelope v2（OS-account canonical UDS）
+                           │ RuntimeEnvelope v3（OS-account canonical UDS）
                            ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  agentdeckd (Rust daemon)                                       │
@@ -72,7 +72,7 @@ v0.2 在 macOS AppKit 上端到端验证「统一壳」架构：
 codex app-server                       claude CLI (--print --stream-json)
 
 agentdeck-cli  (参考客户端 / 门控 E2E 驱动，不在 GUI 实时通路上)
-      │  RuntimeEnvelope v2 canonical UDS（无 spawn/fallback）
+      │  RuntimeEnvelope v3 canonical UDS（无 spawn/fallback）
       ▼
 agentdeckd
 ```
@@ -91,7 +91,7 @@ Layer B Vendor 控件命名空间允许 vendor 前缀但类型化（禁 `serde_j
 `OSAccountRuntimeWireSession → LocalRuntimeWireSession.forOSAccount()`：第一次使用时从当前 OS account
 installation 派生 canonical singleton UDS，且没有 daemon spawn、stdio 或 fallback。P3.9-D 又由
 `b818f81` 把 Rust CLI 默认 dispatcher 与 Swift `main.swift --selfcheck` 切到同一 shared daemon：普通
-`ping/selfcheck/agent/session/history/metadata` 全部使用 canonical Runtime v2，socket 失败 typed 返回且零
+`ping/selfcheck/agent/session/history/metadata` 全部使用 canonical Runtime v3，socket 失败 typed 返回且零
 fallback；显式 diagnostics one-shot 与 compatibility stdio 只保留为隔离运维入口。P3.9-E 又由
 `d68cc02` 收口 GUI 会话可靠性：prompt admission 明确区分 sending/daemon queued，失败只允许 exact 或
 fresh 显式重试；history 采用 latest-intent drain，stream fault 等待 close barrier 后才允许下一操作换线；
@@ -207,7 +207,7 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（P4 已完成 1/7，下一项 P4.2）
+## Relay Companion MVP 实施状态（P4 已完成 2/7，下一项 P4.3）
 
 2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 的 P3 边界只承诺已有 committed artifact
 中缺 KEK 或无法通过当前 KEK/database/domain 认证的行/页改删及跨库移植 fail-close；整套 artifact
@@ -221,8 +221,9 @@ P3.10 已由 code/test commit `19622ab` 完成 Task 收口：当时把 Runtime s
 `admin_commands` ledger，并实现 30 天 retention、容量准入、exact replay/conflict 与 COMMIT-unknown
 收敛；`StageUpgrade` 只有在 exact reply 完整 flush ACK 后才 arm，随后经 active→idle fence、候选
 artifact/hash/owner/mode/nlink 校验和原子 `bin/current` 切换后退出。CLI 已提供
-`agentdeck daemon install|status|uninstall [--purge]`；`--purge` 在 P4.2 trust-reset 完成前 typed fail-close 且零删除，
-stopped LaunchAgent（`loaded=true,pid=null`）会先 kickstart 并二次读回 live PID；CLI 只对
+`agentdeck daemon install|status|uninstall [--purge]`；P3.10 当时的 `--purge` 在 P4.2 前 typed fail-close，
+当前 P4.2 已把它接到 authenticated trust-reset/purge finalizer 状态机。stopped LaunchAgent
+（`loaded=true,pid=null`）会先 kickstart 并二次读回 live PID；CLI 只对
 `socket_missing` / `connect_failed` 做有界 15 秒 retry。P3 Phase review 又由 `773a2b3`、`0057824`、
 `81cc314`、`9efb28d` 依次补齐安装 verifier 资源上界、legacy v1–v6 在原库 RW 前的全量认证
 （新增显式 v1–v4 committed-WAL 矩阵）、
@@ -254,8 +255,24 @@ P4.1 两路独立终审均为 Approved、P0/P1/P2 = 0；完整 `agentdeckd` pack
 static sentinel、fmt、scoped Clippy、diff 与最终 status 均通过。P4.1 严格保持零 Link/Data cert、零
 enrollment workflow、零 enrollment receipt IO、零 RemoteLink；通用 CounterGuard IO 不等于 active
 key/DB counter reservation，也尚未闭环整库 artifact 消失或自洽历史回滚。P3.1 provisioned signed
-Keychain roundtrip 继续是 post-MVP BLOCKED，不计 PASS。下一项 P4.2 首次拥有 certificate、enrollment、
-receipt 与 RemoteTransport。
+Keychain roundtrip 继续是 post-MVP BLOCKED，不计 PASS。
+
+P4.2 code/test 由 `a6842bc` 收口。current Runtime protocol 从 v2 additive 升为 v3，Runtime
+physical schema 从 v8/24 表 additive 升为 v9/25 表；新增 authenticated singleton
+`machine_remote_state`、root-signed MachineLinkSign/MachineDataSign cert、durable enrollment/receipt、
+same-UID local-only machine administration 与一条 **control-only** authenticated MachineLink transport。
+本机命令现为 `agentdeck remote machine enroll --bundle-file FILE`、`agentdeck remote machine status` 和
+`agentdeck remote trust-reset [--admin-purge-receipt-file FILE]`。root-present reset 通过同一 transport
+提交 frozen retirement，等待 terminal 的绝对上限为 10 秒；shutdown/upgrade 会在等待 manager mutex 前取消
+该等待，失败后只允许从同一 `RetirePending` exact retry。root-lost reset 只允许 authenticated `Active` 状态接受
+enrollment 时锚定 verify key 所验证的 portable Relay admin purge receipt；其他 durable lifecycle 不展示 purge
+模板，也不预留 marker。`agentdeck daemon uninstall --purge` 先冻结并读回一次性 purge plan，再完成 trust reset、
+bootout/PID+UDS absent 与 retained finalizer 删除，StorageKEK 最后删除；普通 uninstall 仍保留数据。
+
+P4 当前完成 2/7，下一项 P4.3 PairInvite/DeviceGrant。P4.2 transport 收到业务 frame 必须关闭且
+RuntimeCore business dispatch 恒为零，因此本节不表示 pairing、业务 RemoteLink、E2EE publication、持久
+远程 CLI、iOS 真实链路或 production-signed LaunchAgent/Keychain 已通过。通用 CounterGuard 仍未建立
+active symmetric key/DB counter reservation 或整库历史回滚闭环。
 
 Relay production binary 已原子切换到 **Relay v2**。公开数据面只接受
 `/v2/connect`、`/v2/pair` 与 enrollment 所需的 `POST /v2/machine-enroll`；
@@ -283,10 +300,12 @@ Relay host 的 machine 管理面只存在于同 UID、0600 的本机 JSONL admin
 Relay，严格校验 CA/hostname/SPKI，并以临时 machine/device key 完成 enrollment、fresh
 challenge 鉴权、InstallGrant、register/publish/subscribe replay、Send/Reply、signed revoke
 以及终态重连验证。测试同时扫描 SQLite/outer wire，证明应用 sentinel 只以真实 AEAD 密文
-存在。这个命令不会建立持久配对；P4 完成前，`remote pair/machines/sessions/watch/send/...`
-统一返回 typed `remote.persistent.unsupported`。`agentdeckd` 当前只放行 same-UID local UDS，
-network-boundary guard 仍禁止 TCP/UDP/HTTP/WSS stack，因此 P2.10 不能被描述为 daemon/iOS
-Companion 已经接通。
+存在。这个命令不会建立持久配对；除 P4.2 已完成的 local-only
+`remote machine enroll|status` 与 `remote trust-reset` 外，`remote pair/machines/sessions/watch/send/...`
+仍返回 typed `remote.persistent.unsupported`。`agentdeckd` 的 network-boundary guard 只允许
+`agentdeckd/src/remote/` 通过纯 `agentdeck-relay-client` 发起经 CA/SPKI 验证的 enrollment/auth/control
+outbound；其他 daemon 模块仍禁止 TCP/UDP/HTTP/WSS。该 control-only transport 不是 daemon/iOS 业务
+Companion 已接通。
 
 P2.10 的完整安全/故障门禁覆盖真实 Direct TLS/SPKI 链路、跨重启逐字节 replay、gap、
 quota、disk-low、fault injection、shutdown、撤销/退役和多 sentinel 持久化扫描。统一验证入口：
@@ -440,8 +459,9 @@ daemon 内存密钥或替换进程，不属于 SQLite 层安全边界；`974f9b1
 
 ### P3.4 RuntimeCore 当前边界
 
-transport-neutral `RuntimeCore` 与 production UDS framing 当前使用 Runtime v2：A1a1 由 `3b83391`
-冻结 additive configuration/metadata/upgrade DTO，A1a2 main cutover 与真实 v1/schema v4 reader
+transport-neutral `RuntimeCore` 与 production UDS framing 当前使用 Runtime v3：它在 P3.9 的 v2 中立
+契约上 additive 增加 P4.2 local-only machine administration，不保留 production v2/v3 双栈。A1a1 由
+`3b83391` 冻结 additive configuration/metadata/upgrade DTO，A1a2 main cutover 与真实 v1/schema v4 reader
 分别由 `c28a968` / `c36a4f9` 收口；`ef830cd` 又证明 Runtime v1 TBS 签发的 persisted cert/grant、
 control grant/revocation/retirement 与 enrollment Link/Data cert 均在 v2 verifier 写 Store 前拒绝。
 Swift 共享层已由 `bea4c13` / `3e019ed` / `0dd58de` 完成 configuration/metadata/upgrade/receipt、
@@ -539,10 +559,11 @@ history latest-intent、close barrier、重连有界恢复和 64-slot subscripti
 `527 XCTest + 35 Swift Testing`、iOS Simulator `20/20`、真实 local-runtime smoke 与双路终审全绿。
 P3.9 至此完成。P3.10 已由 `19622ab` 完成当时的 schema v7、durable admin ledger、flush-ACK-gated
 `StageUpgrade`、LaunchAgent lifecycle CLI 与隔离 ephemeral smoke，完整 `p3` verifier 和 Task 双路终审
-均通过；Phase review hardening 已收口到 `9efb28d`，独立 P3 Phase Exit 也已通过。P4.1 随后把 current
-schema 推进到 v8/24 表并建立 machine identity、key-directory guard 与通用 CounterGuard IO；active
-key/DB counter reservation、RemoteLink 与真实 vendor metadata mutation 仍未完成。下一项 P4.2 首次拥有
-certificate、enrollment、receipt 与 RemoteTransport。
+均通过；Phase review hardening 已收口到 `9efb28d`，独立 P3 Phase Exit 也已通过。P4.1 随后把当时的
+schema 推进到 v8/24 表并建立 machine identity、key-directory guard 与通用 CounterGuard IO；P4.2 又以
+`a6842bc` 推进到 v9/25 表并建立 certificate、enrollment、receipt、control-only
+RemoteTransport 与 trust reset。active key/DB counter reservation、业务 RemoteLink 与真实 vendor metadata
+mutation 仍未完成，下一项是 P4.3 pairing。
 
 进入 Core 的 principal 是字段私有的认证 capability；同一完整身份共享强 authorization lease，
 Accepted→Started 前会重新取得 guard，revoke 与 start 由该 guard + SQLite transition 线性化。
@@ -638,7 +659,8 @@ COMMIT-unknown 逐字节重试、ACK 和重启恢复算法；transfer 测试只�
 remote owner。真实 MachineDataSign/E2EE seal、Keychain CounterGuard、Relay
 Publish 和远程设备解密属于 P4；iOS 仍是 fixture 驱动 Simulator 前端，不是当前链路证据。
 P3.6 收口时 App/CLI 均未迁到 singleton UDS；普通 GUI 后续由 P3.9-C3 迁移，Rust CLI 与 Swift
-`main.swift --selfcheck` 又由 P3.9-D 迁移。RemoteLink 仍未完成，因此该 P3.6 历史阶段不构成
+`main.swift --selfcheck` 又由 P3.9-D 迁移。P4.2 后只有 control-only MachineLink transport，业务
+RemoteLink 仍未完成，因此该 P3.6 历史阶段不构成
 P3/Companion 完成。
 P3.1 provisioned signed Keychain 仍是不得记 PASS 的 BLOCKED 槽位，但 2026-07-18
 方案 b 已将其移入 post-MVP；它不再阻塞 MVP/P3/P4 主线，但也不表示 stable production signing 已完成。
@@ -719,9 +741,10 @@ execution 已由 `c0ed6cd` / `f4141f0` / `fb1629a` 完成，B4 managed metadata 
 Simulator 门禁已通过；C0-C、P3.9-A/B/C3/D/E Task 已完成，D/E code/test 提交分别为 `b818f81` / `d68cc02`。
 普通 GUI、Rust CLI 与 Swift `--selfcheck` 已默认走 OS-account shared-daemon UDS。P3.10 LaunchAgent
 安装/升级/保留数据卸载已由 `19622ab` 完成 Task 门禁与双路终审；基于 `9efb28d` 的独立 P3 Phase
-Exit 已完成；P4.1 code/test、Task 门禁与文档已收口，P4–P6 当前为 1/7、0/9、0/4。P3.1 provisioned signed Keychain roundtrip 继续是 post-MVP
+Exit 已完成；P4.1 与 P4.2 code/test、Task 门禁与文档已收口，P4–P6 当前为 2/7、0/9、0/4。P3.1 provisioned signed Keychain roundtrip 继续是 post-MVP
 BLOCKED 槽位，不阻塞 P3 automatic closeout；P5/P6 物理设备/公网/Linux 证据也是 post-MVP，不冒充
-PASS。下一项 P4.2 首次签发 certificate，并实现 enrollment、receipt 与 RemoteTransport。
+PASS。下一项 P4.3 实现 PairInvite、DeviceGrant 与本机 auth ledger；P4.2 的 control-only transport 不冒充
+该 pairing/业务链路。
 具体命令与资源矩阵见 [docs/QUALITY.md](docs/QUALITY.md)。
 
 ## agentdeck CLI（参考客户端 / E2E 驱动）
@@ -743,7 +766,8 @@ canonical `conversationId` 并执行 `Subscribe/SendPrompt`，不得使用 vendo
 `Subscribe(BeforeFirst) → Snapshot/Backfill* → SyncComplete → Unsubscribe`；rename/archive/unarchive 统一使用
 `UpdateConversationMetadata`，并携带 expected entry revision 与稳定 idempotency key。输出身份只允许
 `conversationId`、`commandId`、`turnId`、`eventId`、`itemId`、`entityId`，不得合成 legacy session/thread
-identity；`protocol` / `remote` 不连接 Runtime，diagnostics one-shot 也不得成为 UDS 失败 fallback。
+identity；`protocol` 与 synthetic/legacy remote 不连接 Runtime，P4.2 的 `remote machine enroll|status`、
+`remote trust-reset` 则只连接 canonical Runtime v3 UDS。diagnostics one-shot 仍不得成为 UDS 失败 fallback。
 `persistApproval` 不再是启动配置；没有 Runtime v2 映射的 CC `worktree/sessionName` 必须删除或 typed reject。
 
 ### 全局标志
@@ -762,6 +786,20 @@ agentdeck selfcheck                     # Hello + DescribeAgents
 agentdeck diagnostics report            # 输出机器可读诊断报告（JSON）
 agentdeck protocol schema               # 打印 IPC 协议 JSON Schema
 agentdeck protocol version              # 打印协议版本号
+agentdeck protocol runtime-schema       # 打印 current Runtime v3 JSON Schema
+agentdeck protocol relay-schema         # 打印 Relay v2 JSON Schema
+agentdeck protocol e2ee-schema          # 打印 E2EE v1 JSON Schema
+
+# P4.2 本机 machine administration（只走 same-UID canonical Runtime v3 UDS）
+agentdeck remote machine enroll --bundle-file /secure/path/machine-enrollment-bundle.json
+agentdeck remote machine status
+agentdeck remote trust-reset
+agentdeck remote trust-reset --admin-purge-receipt-file /secure/path/admin-purge-receipt.json
+
+# LaunchAgent lifecycle；普通卸载保留数据，--purge 是 destructive 两阶段清除
+agentdeck daemon status
+agentdeck daemon uninstall
+agentdeck daemon uninstall --purge
 
 # v0.2 新增：agent 子命令组
 agentdeck agent list                           # 列出可用 adapter
@@ -819,7 +857,9 @@ agentdeck protocol version
 
 运行（普通 GUI、Swift `--selfcheck` 与 Rust CLI 默认连接 OS-account shared-daemon canonical UDS，均没有
 daemon spawn/fallback；使用前须已有 canonical stable daemon。P3.10 已提供
-`agentdeck daemon install|status|uninstall [--purge]`，P3 Task 与独立 Phase Exit 均已收口；
+`agentdeck daemon install|status|uninstall`，P4.2 已接通 authenticated `--purge` 与本机 machine admin；
+automatic gate 使用隔离 dev/ephemeral/injected harness，production-signed LaunchAgent/Keychain 仍是
+post-MVP BLOCKED 槽位；
 自动开发链路继续使用 `scripts/run-local-runtime-smoke.sh` 的私有 ephemeral harness）：
 
 ```bash
@@ -867,6 +907,14 @@ swift test        # app: 中立协议 + 分行成帧 + headless 请求编码
 cargo test -p agentdeckd --test daemon_namespace --test storage_kek \
   --test daemon_startup -- --test-threads=1
 bash scripts/check-daemon-network-boundary.sh
+
+# P4.2 Task 级主要门禁；完整资源矩阵见 docs/QUALITY.md
+cargo test -p agentdeckd --locked -- --test-threads=1
+cargo test -p agentdeck-cli --locked
+cargo test -p agentdeck-relay-client --locked
+cargo test -p agentdeck-protocol --locked
+cargo test -p agentdeck-relay --features server,tls --locked
+cargo test -p agentdeck-crypto --locked
 ```
 
 ### 门控 E2E 测试
