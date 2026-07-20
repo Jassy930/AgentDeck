@@ -12,6 +12,7 @@
 //! - u64 单调值到 MAX 拒绝 wrap，要求 reset/rekey（`id::MonotonicError`）。
 //! - 生产 WS outer frame 是固定 `ADRV2` 二进制 codec（`codec`），`sealedBlob` 直接 bytes。
 
+pub mod admin_receipt;
 pub mod auth;
 pub mod codec;
 pub mod cursor;
@@ -25,6 +26,12 @@ pub mod schema;
 /// `runtime::RUNTIME_PROTOCOL_VERSION` 与 `e2ee::E2EE_FORMAT_VERSION`。
 pub const RELAY_PROTOCOL_VERSION: u16 = 2;
 
+pub use admin_receipt::{
+    RELAY_RECEIPT_FORMAT_VERSION, RELAY_RECEIPT_KEY_GENERATION_MVP, RelayAdminPurgeReadbackV1,
+    RelayAdminPurgeReceiptError, RelayAdminPurgeReceiptExpectationV1, RelayAdminPurgeReceiptTbsV1,
+    RelayAdminPurgeReceiptV1, RelayAdminPurgeTombstoneV1, RelayMachineTombstoneKindV1,
+    RelayReceiptKeyId, RelayReceiptVerifyKeyV1, admin_purge_tombstone_hash, purge_request_hash,
+};
 pub use auth::{
     AUTH_SIGNATURE_FORMAT_VERSION, AuthenticationRole, AuthenticationTranscriptV1, CertRole,
     DeviceRevocation, Ed25519Signature, PublicKeyBytes, RelayGrant, SignedCertificate,

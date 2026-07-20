@@ -6,7 +6,7 @@
 //!
 //! 该 schema 是严格最小可见外层——业务字段由 `relay_v2_neutrality` 扫描禁止。
 
-use crate::relay_v2::{auth, cursor, enrollment, failure, frame};
+use crate::relay_v2::{admin_receipt, auth, cursor, enrollment, failure, frame};
 use schemars::schema_for;
 use serde_json::json;
 
@@ -26,6 +26,9 @@ pub fn relay_v2_schema() -> serde_json::Value {
             "DeviceRevocation": serde_json::to_value(schema_for!(auth::DeviceRevocation)).unwrap(),
             "MachineEnrollmentRequestV1": serde_json::to_value(schema_for!(enrollment::MachineEnrollmentRequestV1)).unwrap(),
             "MachineEnrollmentResponseV1": serde_json::to_value(schema_for!(enrollment::MachineEnrollmentResponseV1)).unwrap(),
+            "RelayReceiptVerifyKeyV1": serde_json::to_value(schema_for!(admin_receipt::RelayReceiptVerifyKeyV1)).unwrap(),
+            "RelayAdminPurgeReadbackV1": serde_json::to_value(schema_for!(admin_receipt::RelayAdminPurgeReadbackV1)).unwrap(),
+            "RelayAdminPurgeReceiptV1": serde_json::to_value(schema_for!(admin_receipt::RelayAdminPurgeReceiptV1)).unwrap(),
             "RelayFailure": serde_json::to_value(schema_for!(failure::RelayFailure)).unwrap(),
         }
     })

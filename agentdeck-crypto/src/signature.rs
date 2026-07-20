@@ -4,6 +4,10 @@
 
 use agentdeck_protocol::e2ee::tbs::ToBeSignedV1;
 use agentdeck_protocol::relay_v2::auth::{AuthenticationTranscriptV1, Ed25519Signature};
+use agentdeck_protocol::relay_v2::{
+    RelayAdminPurgeReceiptError, RelayAdminPurgeReceiptExpectationV1, RelayAdminPurgeReceiptTbsV1,
+    RelayAdminPurgeReceiptV1, RelayReceiptVerifyKeyV1,
+};
 use ed25519_dalek::{Signature, Signer};
 
 use crate::error::CryptoError;
@@ -76,6 +80,43 @@ impl VerifyingKey {
     }
 }
 
+/// 已完成 protocol shape/key-id 与 Ed25519 compressed-point preflight 的 Relay receipt key。
+///
+/// Store 只能在成功构造该 wrapper 后持久化 [`Self::wire_anchor`]；sign/verify API 不再
+/// 接受未经 crypto 校验的 wire DTO。
+pub struct ValidatedRelayReceiptVerifyKey {
+    wire_anchor: RelayReceiptVerifyKeyV1,
+    verifying_key: VerifyingKey,
+}
+
+impl std::fmt::Debug for ValidatedRelayReceiptVerifyKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ValidatedRelayReceiptVerifyKey")
+            .field("wire_anchor", &self.wire_anchor)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ValidatedRelayReceiptVerifyKey {
+    pub fn new(wire_anchor: RelayReceiptVerifyKeyV1) -> Result<Self, CryptoError> {
+        wire_anchor.validate()?;
+        let verifying_key = VerifyingKey::from_bytes(&wire_anchor.public_key.0)?;
+        if verifying_key.0.is_weak() {
+            return Err(CryptoError::InvalidKey("weak ed25519 verifying key"));
+        }
+        Ok(Self {
+            wire_anchor,
+            verifying_key,
+        })
+    }
+
+    /// 可持久化的只读 wire trust anchor；调用方不能经该引用改写已验证字段。
+    pub const fn wire_anchor(&self) -> &RelayReceiptVerifyKeyV1 {
+        &self.wire_anchor
+    }
+}
+
 /// 对 canonical `ToBeSignedV1` 确定性签名（Ed25519 RFC 8032）。
 pub fn sign_tbs(key: &SigningKey, tbs: &ToBeSignedV1) -> SignatureBytes {
     let message = tbs.encode();
@@ -116,6 +157,62 @@ pub fn verify_authentication_transcript(
     key.0
         .verify_strict(&transcript.encode(), &signature)
         .map_err(|_| CryptoError::BadSignature)
+}
+
+/// 使用 Relay 专用 Ed25519 receipt key 签发 portable root-lost admin purge proof。
+///
+/// 本接口只接受 typed purge TBS，并要求 signing key 与 enrollment pin 的 verify key
+/// 逐字节相同；它不复用 TLS key，也不是任意 raw bytes signing oracle。
+pub fn sign_relay_admin_purge_receipt(
+    key: &SigningKey,
+    verify_key: &ValidatedRelayReceiptVerifyKey,
+    tbs: RelayAdminPurgeReceiptTbsV1,
+) -> Result<RelayAdminPurgeReceiptV1, CryptoError> {
+    let wire_anchor = verify_key.wire_anchor();
+    tbs.validate()?;
+    validate_relay_receipt_key_binding(wire_anchor, &tbs)?;
+    if key.verifying_key().to_bytes() != wire_anchor.public_key.0 {
+        return Err(CryptoError::InvalidKey(
+            "Relay receipt signing key does not match provisioned verify key",
+        ));
+    }
+    let signature = Ed25519Signature(key.0.sign(&tbs.encode()?).to_bytes());
+    RelayAdminPurgeReceiptV1::from_tbs(tbs, signature).map_err(Into::into)
+}
+
+/// 以 enrollment 持久化的专用 Relay receipt verify key 验证 portable purge proof。
+pub fn verify_relay_admin_purge_receipt(
+    verify_key: &ValidatedRelayReceiptVerifyKey,
+    expectation: &RelayAdminPurgeReceiptExpectationV1,
+    receipt: &RelayAdminPurgeReceiptV1,
+) -> Result<(), CryptoError> {
+    expectation.validate()?;
+    receipt.validate()?;
+    let tbs = receipt.to_be_signed();
+    let signature = Signature::from_bytes(&receipt.signature.0);
+    verify_key
+        .verifying_key
+        .0
+        .verify_strict(&tbs.encode()?, &signature)
+        .map_err(|_| CryptoError::BadSignature)?;
+    validate_relay_receipt_key_binding(verify_key.wire_anchor(), &tbs)?;
+    if !expectation.matches(receipt) {
+        return Err(RelayAdminPurgeReceiptError::ExpectedBindingMismatch.into());
+    }
+    Ok(())
+}
+
+fn validate_relay_receipt_key_binding(
+    verify_key: &RelayReceiptVerifyKeyV1,
+    tbs: &RelayAdminPurgeReceiptTbsV1,
+) -> Result<(), CryptoError> {
+    if verify_key.relay_server_id != tbs.relay_server_id
+        || verify_key.key_generation != tbs.receipt_key_generation
+        || verify_key.key_id != tbs.receipt_key_id
+    {
+        return Err(RelayAdminPurgeReceiptError::ReceiptVerifyKeyBindingMismatch.into());
+    }
+    Ok(())
 }
 
 /// 对任意 canonical bytes 验签（供 sealed-blob verifier-hook 复用）。

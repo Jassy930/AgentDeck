@@ -35,6 +35,7 @@ pub use error::CryptoError;
 pub use hpke::{HpkeEnvelopeV1, HpkePrivateKey, HpkePublicKey, hpke_open_base, hpke_seal_base};
 pub use sealed_blob::{sign_sealed, verify_sealed};
 pub use signature::{
-    SignatureBytes, SigningKey, VerifyingKey, sign_authentication_transcript, sign_tbs,
-    verify_authentication_transcript, verify_tbs,
+    SignatureBytes, SigningKey, ValidatedRelayReceiptVerifyKey, VerifyingKey,
+    sign_authentication_transcript, sign_relay_admin_purge_receipt, sign_tbs,
+    verify_authentication_transcript, verify_relay_admin_purge_receipt, verify_tbs,
 };

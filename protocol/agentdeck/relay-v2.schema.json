@@ -1587,6 +1587,230 @@
       "title": "OpaqueRouteFrame",
       "type": "object"
     },
+    "RelayAdminPurgeReadbackV1": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "description": "Relay purge transaction 后的精确 root-lost readback。\n\n唯一有效形状为 active machine routes 0、retired tombstones 1、其余 durable route/data counts 0，且没有 MachineRoot retirement hash/terminal。",
+      "properties": {
+        "activeMachineRoutes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "consumedEnrollmentRecords": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "deviceGrants": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "frames": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "retiredTombstones": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "retirementHash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retirementTerminalPresent": {
+          "type": "boolean"
+        },
+        "revocations": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "streams": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "subscriptions": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "activeMachineRoutes",
+        "consumedEnrollmentRecords",
+        "deviceGrants",
+        "frames",
+        "retiredTombstones",
+        "retirementTerminalPresent",
+        "revocations",
+        "streams",
+        "subscriptions"
+      ],
+      "title": "RelayAdminPurgeReadbackV1",
+      "type": "object"
+    },
+    "RelayAdminPurgeReceiptV1": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "RelayAdminPurgeReadbackV1": {
+          "additionalProperties": false,
+          "description": "Relay purge transaction 后的精确 root-lost readback。\n\n唯一有效形状为 active machine routes 0、retired tombstones 1、其余 durable route/data counts 0，且没有 MachineRoot retirement hash/terminal。",
+          "properties": {
+            "activeMachineRoutes": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "consumedEnrollmentRecords": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "deviceGrants": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "frames": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "retiredTombstones": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "retirementHash": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "retirementTerminalPresent": {
+              "type": "boolean"
+            },
+            "revocations": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "streams": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "subscriptions": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "activeMachineRoutes",
+            "consumedEnrollmentRecords",
+            "deviceGrants",
+            "frames",
+            "retiredTombstones",
+            "retirementTerminalPresent",
+            "revocations",
+            "streams",
+            "subscriptions"
+          ],
+          "type": "object"
+        },
+        "RelayMachineTombstoneKindV1": {
+          "description": "portable proof 中可签名的 tombstone 类型。MVP 只有 root-lost admin purge； root-present retirement 继续使用 MachineRoot-signed `RetireMachine` terminal。",
+          "enum": [
+            "rootLostAdminPurge"
+          ],
+          "type": "string"
+        }
+      },
+      "description": "Relay receipt signer 输出的 portable root-lost purge proof。",
+      "properties": {
+        "enrollmentReceiptHash": {
+          "type": "string"
+        },
+        "machineRoute": {
+          "type": "string"
+        },
+        "purgeRequestHash": {
+          "type": "string"
+        },
+        "readback": {
+          "$ref": "#/definitions/RelayAdminPurgeReadbackV1"
+        },
+        "receiptFormatVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "receiptKeyGeneration": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "receiptKeyId": {
+          "type": "string"
+        },
+        "relayProtocolVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "relayServerId": {
+          "type": "string"
+        },
+        "rootFingerprint": {
+          "type": "string"
+        },
+        "rootKeyId": {
+          "type": "string"
+        },
+        "signature": {
+          "type": "string"
+        },
+        "tombstoneHash": {
+          "type": "string"
+        },
+        "tombstoneKind": {
+          "$ref": "#/definitions/RelayMachineTombstoneKindV1"
+        },
+        "trustEpoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "enrollmentReceiptHash",
+        "machineRoute",
+        "purgeRequestHash",
+        "readback",
+        "receiptFormatVersion",
+        "receiptKeyGeneration",
+        "receiptKeyId",
+        "relayProtocolVersion",
+        "relayServerId",
+        "rootFingerprint",
+        "rootKeyId",
+        "signature",
+        "tombstoneHash",
+        "tombstoneKind",
+        "trustEpoch"
+      ],
+      "title": "RelayAdminPurgeReceiptV1",
+      "type": "object"
+    },
     "RelayFailure": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "additionalProperties": false,
@@ -3061,6 +3285,41 @@
         "trustEpoch"
       ],
       "title": "RelayGrant",
+      "type": "object"
+    },
+    "RelayReceiptVerifyKeyV1": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "description": "Enrollment 必须在 TLS CA/SPKI 校验完成后持久化的 Relay receipt trust anchor。\n\n`key_id` 与 public key 一起 pin；后续 receipt 必须同时匹配 RelayServerId、generation 和 key ID。MVP 固定 generation 1，若需要轮换必须更换 RelayServerId/重新 enrollment。",
+      "properties": {
+        "keyGeneration": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "keyId": {
+          "type": "string"
+        },
+        "publicKey": {
+          "type": "string"
+        },
+        "receiptFormatVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "relayServerId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "keyGeneration",
+        "keyId",
+        "publicKey",
+        "receiptFormatVersion",
+        "relayServerId"
+      ],
+      "title": "RelayReceiptVerifyKeyV1",
       "type": "object"
     },
     "SealedBlob": {

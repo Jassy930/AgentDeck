@@ -2,6 +2,7 @@
 //! 可观察 typed error，绝不静默）。
 
 use agentdeck_protocol::e2ee::E2eeError;
+use agentdeck_protocol::relay_v2::RelayAdminPurgeReceiptError;
 
 /// Relay E2EE 密码学操作的 typed 错误。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -15,6 +16,9 @@ pub enum CryptoError {
     /// 密钥材料非法（长度错误或不可用点）。
     #[error("invalid key material: {0}")]
     InvalidKey(&'static str),
+    /// Portable Relay admin receipt 的 shape / trust-anchor binding 非法。
+    #[error("invalid Relay admin purge receipt: {0}")]
+    InvalidRelayAdminPurgeReceipt(#[from] RelayAdminPurgeReceiptError),
     /// HPKE seal/open 失败（封装/解封装错误）。
     #[error("HPKE operation failed: {0}")]
     Hpke(&'static str),
