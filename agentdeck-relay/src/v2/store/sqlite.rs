@@ -392,7 +392,7 @@ pub(crate) fn seed_enrollment_code(
     let now = sql_i64(config.clock.now_ms()?, "enrollment_codes.expires_at")?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute(
-        "DELETE FROM enrollment_codes WHERE expires_at < ?1",
+        "DELETE FROM enrollment_codes WHERE expires_at < ?1 AND consumed_at IS NULL",
         params![now],
     )?;
     let existing = tx
@@ -412,7 +412,7 @@ pub(crate) fn seed_enrollment_code(
         None => {
             if query_u64(
                 &tx,
-                "SELECT COUNT(*) FROM enrollment_codes",
+                "SELECT COUNT(*) FROM enrollment_codes WHERE consumed_at IS NULL",
                 [],
                 "enrollment_codes.count",
             )? >= config.max_enrollment_codes
@@ -458,10 +458,6 @@ pub(crate) fn register_machine(
         .optional()?
         .ok_or(StoreError::EnrollmentCodeNotFound)?;
 
-    if now > code.0 {
-        return Err(StoreError::EnrollmentCodeExpired);
-    }
-
     if code.1.is_some() {
         let stored_request = required_array::<32>(code.2, "enrollment_codes.request_hash")?;
         if stored_request != request.request_hash {
@@ -478,6 +474,10 @@ pub(crate) fn register_machine(
         )?;
         tx.commit()?;
         return Ok(record);
+    }
+
+    if now > code.0 {
+        return Err(StoreError::EnrollmentCodeExpired);
     }
 
     if request
@@ -2396,7 +2396,7 @@ pub(crate) fn run_maintenance(
                 reason: "deleted frame count does not fit u64",
             })?;
     let expired_enrollment_codes = u64::try_from(tx.execute(
-        "DELETE FROM enrollment_codes WHERE expires_at < ?1",
+        "DELETE FROM enrollment_codes WHERE expires_at < ?1 AND consumed_at IS NULL",
         params![now],
     )?)
     .map_err(|_| StoreError::InvalidValue {

@@ -1429,6 +1429,48 @@ async fn expired_certificate_rejects_first_consumption_but_does_not_break_frozen
 }
 
 #[tokio::test]
+async fn consumed_enrollment_code_replays_and_conflicts_after_code_ttl() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = store_path(&temp);
+    let clock = Arc::new(MutableClock::new(NOW_MS));
+    let store = RelayStoreHandle::open(RelayV2StoreConfig::new(path).with_clock(clock.clone()))
+        .await
+        .expect("open store");
+    store
+        .seed_enrollment_code(EnrollmentCodeSeed {
+            code_hash: [0x1a; 32],
+            expires_at_ms: NOW_MS + 1,
+        })
+        .await
+        .expect("seed short-lived enrollment code");
+    let request = register_machine_request(0x1a);
+    let first = store
+        .register_machine(request.clone())
+        .await
+        .expect("consume enrollment code before TTL");
+
+    clock.set(NOW_MS + 2);
+    let retry = store
+        .register_machine(request.clone())
+        .await
+        .expect("consumed exact request replays after code TTL");
+    assert!(retry.duplicate);
+    assert_eq!(retry.machine_route, first.machine_route);
+    assert_eq!(retry.response_blob, first.response_blob);
+    assert_eq!(retry.receipt_hash, first.receipt_hash);
+
+    let mut conflicting = request;
+    conflicting.request_hash = [0xee; 32];
+    let error = store
+        .register_machine(conflicting)
+        .await
+        .expect_err("consumed code keeps permanent different-request conflict after TTL");
+    assert!(matches!(error, StoreError::EnrollmentCodeConflict));
+
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
 async fn enrollment_accepts_independent_link_and_data_certificate_generations() {
     let temp = TempDir::new().expect("tempdir");
     let path = store_path(&temp);
@@ -1556,18 +1598,25 @@ async fn register_machine_before_commit_fault_rolls_back_code_and_machine_row() 
 }
 
 #[tokio::test]
-async fn register_machine_after_commit_response_loss_recovers_frozen_response_after_restart() {
+async fn register_machine_after_commit_response_loss_recovers_after_ttl_maintenance_and_restart() {
     let temp = TempDir::new().expect("tempdir");
     let path = store_path(&temp);
-    let store = RelayStoreHandle::open(config_with_fault(
-        &path,
-        FaultPoint::RegisterMachineAfterCommit,
-    ))
+    let clock = Arc::new(MutableClock::new(NOW_MS));
+    let store = RelayStoreHandle::open(
+        RelayV2StoreConfig::new(path.clone())
+            .with_clock(clock.clone())
+            .with_fault_injector(Arc::new(OneShotFaultInjector::new(
+                FaultPoint::RegisterMachineAfterCommit,
+            ))),
+    )
     .await
     .expect("open fault-injected store");
     let request = register_machine_request(0x15);
     store
-        .seed_enrollment_code(enrollment_seed(0x15))
+        .seed_enrollment_code(EnrollmentCodeSeed {
+            code_hash: [0x15; 32],
+            expires_at_ms: NOW_MS + 100,
+        })
         .await
         .expect("seed enrollment code");
 
@@ -1581,11 +1630,19 @@ async fn register_machine_after_commit_response_loss_recovers_frozen_response_af
             operation: "register_machine"
         }
     ));
+
+    clock.set(NOW_MS + 101);
+    let report = store
+        .run_maintenance()
+        .await
+        .expect("maintenance preserves consumed frozen response after TTL");
+    assert_eq!(report.expired_enrollment_codes, 0);
     store.shutdown().await.expect("shutdown first worker");
 
-    let reopened = RelayStoreHandle::open(fixed_config(&path))
-        .await
-        .expect("reopen committed store");
+    let reopened =
+        RelayStoreHandle::open(RelayV2StoreConfig::new(path.clone()).with_clock(clock.clone()))
+            .await
+            .expect("reopen committed store");
     let recovered = reopened
         .register_machine(request.clone())
         .await
@@ -1593,7 +1650,21 @@ async fn register_machine_after_commit_response_loss_recovers_frozen_response_af
     assert!(recovered.duplicate);
     assert_eq!(recovered.response_blob, request.response_blob);
     assert_eq!(recovered.receipt_hash, request.receipt_hash);
+
+    let mut conflicting = request;
+    conflicting.request_hash = [0xee; 32];
+    let error = reopened
+        .register_machine(conflicting)
+        .await
+        .expect_err("different request remains a permanent conflict after restart");
+    assert!(matches!(error, StoreError::EnrollmentCodeConflict));
     reopened.shutdown().await.expect("shutdown reopened store");
+
+    let conn = Connection::open(&path).expect("open enrollment recovery readback");
+    let machine_routes: i64 = conn
+        .query_row("SELECT COUNT(*) FROM machine_routes", [], |row| row.get(0))
+        .expect("count recovered machine routes");
+    assert_eq!(machine_routes, 1, "retry must not create a second route");
 }
 
 #[tokio::test]
@@ -4965,8 +5036,7 @@ async fn startup_maintenance_expires_frames_before_worker_reports_ready() {
 }
 
 #[tokio::test]
-async fn maintenance_gc_keeps_enrollment_retry_through_exact_expiry_then_deletes_all_expired_rows()
-{
+async fn maintenance_gc_deletes_only_expired_unconsumed_enrollment_rows() {
     let temp = TempDir::new().expect("tempdir");
     let path = store_path(&temp);
     let clock = Arc::new(MutableClock::new(NOW_MS));
@@ -5016,12 +5086,12 @@ async fn maintenance_gc_keeps_enrollment_retry_through_exact_expiry_then_deletes
         .run_maintenance()
         .await
         .expect("run post-expiry maintenance");
-    assert_eq!(expired_report.expired_enrollment_codes, 2);
-    let missing = store
+    assert_eq!(expired_report.expired_enrollment_codes, 1);
+    let retry = store
         .register_machine(consumed_request)
         .await
-        .expect_err("expired frozen response is physically removed");
-    assert!(matches!(missing, StoreError::EnrollmentCodeNotFound));
+        .expect("expired consumed row keeps its frozen response");
+    assert!(retry.duplicate);
 
     store
         .shutdown()
@@ -5033,36 +5103,48 @@ async fn maintenance_gc_keeps_enrollment_retry_through_exact_expiry_then_deletes
             row.get(0)
         })
         .expect("count enrollment rows");
-    assert_eq!(remaining, 1, "only the still-live code remains");
+    assert_eq!(
+        remaining, 2,
+        "consumed frozen response and still-live pending code remain"
+    );
 }
 
 #[tokio::test]
-async fn enrollment_code_count_is_bounded_and_expired_rows_release_capacity() {
+async fn enrollment_code_quota_counts_only_pending_rows_and_expiry_releases_capacity() {
     let temp = TempDir::new().expect("tempdir");
     let path = store_path(&temp);
     let clock = Arc::new(MutableClock::new(NOW_MS));
     let config = RelayV2StoreConfig::new(path.clone())
         .with_clock(clock.clone())
-        .with_max_enrollment_codes(2);
+        .with_max_enrollment_codes(1);
     let store = RelayStoreHandle::open(config)
         .await
         .expect("open bounded enrollment store");
-    for seed in [0x8c, 0x8d] {
-        store
-            .seed_enrollment_code(EnrollmentCodeSeed {
-                code_hash: [seed; 32],
-                expires_at_ms: NOW_MS + 100,
-            })
-            .await
-            .expect("fill enrollment capacity");
-    }
+    store
+        .seed_enrollment_code(EnrollmentCodeSeed {
+            code_hash: [0x8c; 32],
+            expires_at_ms: NOW_MS + 100,
+        })
+        .await
+        .expect("seed first pending enrollment code");
+    store
+        .register_machine(register_machine_request(0x8c))
+        .await
+        .expect("consume first enrollment code");
+    store
+        .seed_enrollment_code(EnrollmentCodeSeed {
+            code_hash: [0x8d; 32],
+            expires_at_ms: NOW_MS + 100,
+        })
+        .await
+        .expect("consumed row must not occupy pending-code quota");
     let full = store
         .seed_enrollment_code(EnrollmentCodeSeed {
             code_hash: [0x8e; 32],
             expires_at_ms: NOW_MS + 1_000,
         })
         .await
-        .expect_err("active enrollment rows have a hard count bound");
+        .expect_err("pending enrollment rows have a hard count bound");
     assert!(matches!(
         full,
         StoreError::QuotaExceeded {
