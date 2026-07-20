@@ -181,12 +181,8 @@ impl ActiveConnection {
 
     async fn shutdown(&mut self) {
         self.cancel.cancel();
-        if let Some(task) = self.reader_task.take() {
-            join_or_abort(task).await;
-        }
-        if let Some(task) = self.writer_task.take() {
-            join_or_abort(task).await;
-        }
+        join_or_abort_owned(&mut self.reader_task).await;
+        join_or_abort_owned(&mut self.writer_task).await;
     }
 }
 
@@ -208,8 +204,12 @@ async fn await_flush(
     }
 }
 
-async fn join_or_abort(mut task: JoinHandle<()>) {
-    join_or_abort_with_timeout(&mut task, IO_TIMEOUT).await;
+async fn join_or_abort_owned(task: &mut Option<JoinHandle<()>>) {
+    let Some(task_handle) = task.as_mut() else {
+        return;
+    };
+    join_or_abort_with_timeout(task_handle, IO_TIMEOUT).await;
+    *task = None;
 }
 
 async fn join_or_abort_with_timeout(task: &mut JoinHandle<()>, timeout: std::time::Duration) {
@@ -548,12 +548,20 @@ impl RelayClient {
     }
 
     pub async fn reconnect_and_authenticate(&mut self) -> Result<(), RelayClientError> {
-        if let Some(mut old) = self.connection.take() {
-            old.shutdown().await;
-        }
+        self.shutdown().await;
         let connection = principal_connection(&self.config, &self.authenticator).await?;
         self.connection = Some(connection);
         Ok(())
+    }
+
+    /// 正常关闭当前 generation，并在清空 owner 前等待 reader/writer task 收口。
+    ///
+    /// 重复调用是零副作用的 no-op；`Drop` 只保留取消/abort 的最后兜底语义。
+    pub async fn shutdown(&mut self) {
+        if let Some(connection) = self.connection.as_mut() {
+            connection.shutdown().await;
+        }
+        self.connection = None;
     }
 }
 
@@ -714,6 +722,7 @@ fn handshake_markers(
 mod tests {
     use super::*;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
 
     struct PendingSink {
@@ -852,6 +861,65 @@ mod tests {
             .expect("aborted task drop timeout")
             .expect("drop signal");
         assert!(task.is_finished());
+    }
+
+    struct ActiveTaskCounter(Arc<AtomicUsize>);
+
+    impl Drop for ActiveTaskCounter {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_preserves_join_ownership_for_retry_shutdown() {
+        let (data_tx, _data_rx) = mpsc::channel(1);
+        let (_inbound_tx, inbound_rx) = mpsc::channel(1);
+        let (_urgent_tx, urgent_rx) = mpsc::channel(1);
+        let (status_tx, status_rx) = watch::channel(None);
+        let active_tasks = Arc::new(AtomicUsize::new(2));
+        let cancel = CancellationToken::new();
+        let (release, released) = oneshot::channel::<()>();
+        let child_counter = Arc::clone(&active_tasks);
+        let reader_task = tokio::spawn(async move {
+            let _guard = ActiveTaskCounter(child_counter);
+            let _ = released.await;
+        });
+        let child_counter = Arc::clone(&active_tasks);
+        let writer_cancel = cancel.clone();
+        let writer_task = tokio::spawn(async move {
+            let _guard = ActiveTaskCounter(child_counter);
+            writer_cancel.cancelled().await;
+        });
+        let mut connection = ActiveConnection {
+            data_tx,
+            outbound_budget: Arc::new(Semaphore::new(1)),
+            inbound_rx,
+            urgent_rx,
+            status_tx,
+            status_rx,
+            cancel,
+            reader_task: Some(reader_task),
+            writer_task: Some(writer_task),
+        };
+
+        let mut first_shutdown = Box::pin(connection.shutdown());
+        tokio::select! {
+            result = &mut first_shutdown => panic!("blocked child unexpectedly joined: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
+        drop(first_shutdown);
+
+        assert!(
+            connection.reader_task.is_some(),
+            "caller cancellation must not detach the in-flight reader JoinHandle"
+        );
+        assert!(connection.writer_task.is_some());
+        release.send(()).expect("release blocked reader");
+        connection.shutdown().await;
+        assert!(connection.reader_task.is_none());
+        assert!(connection.writer_task.is_none());
+        assert_eq!(active_tasks.load(Ordering::SeqCst), 0);
     }
 
     #[test]

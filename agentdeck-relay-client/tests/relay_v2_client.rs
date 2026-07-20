@@ -176,6 +176,60 @@ async fn accept_tls_ws(
     accept_async(tls).await.expect("accept mock WSS")
 }
 
+async fn authenticate_principal<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    connection_instance: u8,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    assert!(matches!(
+        recv_wire(socket).await.body,
+        RelayFrameBody::Hello(Hello {
+            protocol_version: RELAY_PROTOCOL_VERSION
+        })
+    ));
+    send_wire(
+        socket,
+        &wire(RelayFrameBody::Challenge(Challenge {
+            relay_server_id: server_id(),
+            connection_instance: ConnectionInstanceId::from_bytes([connection_instance; 16]),
+            challenge_nonce: [connection_instance.wrapping_add(0x51); 32],
+        })),
+    )
+    .await;
+    assert!(matches!(
+        recv_wire(socket).await.body,
+        RelayFrameBody::Authenticate(_)
+    ));
+    send_wire(
+        socket,
+        &wire(RelayFrameBody::Authenticated(Authenticated {
+            heartbeat_interval_secs: 20,
+        })),
+    )
+    .await;
+}
+
+async fn observe_client_close<S>(socket: &mut tokio_tungstenite::WebSocketStream<S>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        match tokio::time::timeout(TEST_TIMEOUT, socket.next())
+            .await
+            .expect("client normal-close timeout")
+        {
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+            Some(Ok(Message::Ping(bytes))) => socket
+                .send(Message::Pong(bytes))
+                .await
+                .expect("normal-close mock pong"),
+            Some(Ok(Message::Pong(_))) => {}
+            other => panic!("unexpected frame before client close: {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn config_freezes_a_strict_wss_origin_and_rejects_ambiguous_urls() {
     let policy = RelayTlsPolicy::pinned_spki(vec![[0x11; 32]]).expect("one pin");
@@ -327,6 +381,113 @@ async fn pinned_wss_is_binary_only_auto_pongs_and_reconnects_with_a_fresh_challe
     let challenges = authenticator.challenges();
     assert_eq!(challenges.len(), 2);
     assert_ne!(challenges[0], challenges[1]);
+}
+
+#[tokio::test]
+async fn shutdown_joins_connection_tasks_closes_the_socket_and_is_idempotent() {
+    let identity = test_identity();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind shutdown mock");
+    let port = listener.local_addr().expect("shutdown address").port();
+    let acceptor = TlsAcceptor::from(Arc::clone(&identity.server_config));
+    let active_connections = Arc::new(AtomicUsize::new(0));
+    let observed_connections = Arc::new(AtomicUsize::new(0));
+    let server_active = Arc::clone(&active_connections);
+    let server_observed = Arc::clone(&observed_connections);
+    let server = tokio::spawn(async move {
+        let mut socket = accept_tls_ws(&listener, &acceptor).await;
+        server_observed.fetch_add(1, Ordering::SeqCst);
+        server_active.fetch_add(1, Ordering::SeqCst);
+        authenticate_principal(&mut socket, 0x71).await;
+        observe_client_close(&mut socket).await;
+        server_active.fetch_sub(1, Ordering::SeqCst);
+    });
+
+    let policy = RelayTlsPolicy::pinned_spki(vec![identity.spki_pin]).expect("shutdown pin");
+    let authenticator = Arc::new(TestAuthenticator::default());
+    let mut client = RelayClient::connect(client_config(port, policy), authenticator)
+        .await
+        .expect("connect shutdown principal");
+
+    client.shutdown().await;
+    tokio::time::timeout(TEST_TIMEOUT, server)
+        .await
+        .expect("shutdown server completion")
+        .expect("shutdown server task");
+    assert_eq!(active_connections.load(Ordering::SeqCst), 0);
+    assert_eq!(observed_connections.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        client
+            .send(wire(RelayFrameBody::Ping(Ping { nonce: 1 })))
+            .await
+            .expect_err("shutdown client must clear its connection")
+            .code(),
+        "relay.client.not_connected"
+    );
+
+    tokio::time::timeout(TEST_TIMEOUT, client.shutdown())
+        .await
+        .expect("second shutdown is a prompt no-op");
+    assert_eq!(active_connections.load(Ordering::SeqCst), 0);
+    assert_eq!(observed_connections.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn reconnect_joins_and_closes_the_old_generation_before_accepting_the_new_one() {
+    let identity = test_identity();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind replacement-order mock");
+    let port = listener
+        .local_addr()
+        .expect("replacement-order address")
+        .port();
+    let acceptor = TlsAcceptor::from(Arc::clone(&identity.server_config));
+    let server = tokio::spawn(async move {
+        let mut old_socket = accept_tls_ws(&listener, &acceptor).await;
+        authenticate_principal(&mut old_socket, 0x72).await;
+
+        let replacement_accept = listener.accept();
+        tokio::pin!(replacement_accept);
+        tokio::select! {
+            biased;
+            message = old_socket.next() => match message {
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {}
+                other => panic!("old generation was not normally closed: {other:?}"),
+            },
+            accepted = &mut replacement_accept => {
+                let _ = accepted.expect("premature replacement accept");
+                panic!("replacement connected before the old generation closed");
+            }
+        }
+
+        let (tcp, _) = replacement_accept
+            .await
+            .expect("accept replacement after old close");
+        let tls = acceptor.accept(tcp).await.expect("replacement TLS");
+        let mut replacement = accept_async(tls).await.expect("replacement WSS");
+        authenticate_principal(&mut replacement, 0x73).await;
+        observe_client_close(&mut replacement).await;
+    });
+
+    let policy = RelayTlsPolicy::pinned_spki(vec![identity.spki_pin]).expect("replacement pin");
+    let authenticator = Arc::new(TestAuthenticator::default());
+    let auth: Arc<dyn LinkAuthenticator> = authenticator.clone();
+    let mut client = RelayClient::connect(client_config(port, policy), auth)
+        .await
+        .expect("connect first generation");
+    client
+        .reconnect_and_authenticate()
+        .await
+        .expect("replace after old join");
+    client.shutdown().await;
+
+    tokio::time::timeout(TEST_TIMEOUT, server)
+        .await
+        .expect("replacement-order server completion")
+        .expect("replacement-order server task");
+    assert_eq!(authenticator.calls(), 2);
 }
 
 #[tokio::test]
