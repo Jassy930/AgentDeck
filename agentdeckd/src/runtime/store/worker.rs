@@ -1170,6 +1170,21 @@ impl RuntimeStoreHandle {
         .await?
     }
 
+    /// 只读返回已认证的 first-valid pairing winner 与当前 durable state。
+    #[allow(dead_code)] // P4 pairing coordinator consumes the authenticated replay projection.
+    pub(crate) async fn load_pairing_winner(
+        &self,
+        pairing_id: RuntimeId,
+    ) -> Result<Option<pairing_terminal::PairingWinnerProjection>, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::LoadPairingWinner { pairing_id, reply },
+        )
+        .await?
+    }
+
     #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
     pub(crate) async fn replay_pair_request(
         &self,
@@ -3246,6 +3261,13 @@ enum ReadCommand {
         pairing_id: RuntimeId,
         reply: oneshot::Sender<Result<Option<pairing::PairingInviteRecord>, RuntimeStoreError>>,
     },
+    #[allow(dead_code)] // P4 pairing coordinator consumes the authenticated replay projection.
+    LoadPairingWinner {
+        pairing_id: RuntimeId,
+        reply: oneshot::Sender<
+            Result<Option<pairing_terminal::PairingWinnerProjection>, RuntimeStoreError>,
+        >,
+    },
     #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
     ReplayPairRequest {
         pairing_id: RuntimeId,
@@ -4585,6 +4607,14 @@ fn handle_read(
         }
         ReadCommand::LoadPairingInvite { pairing_id, reply } => {
             let _ = reply.send(pairing::load_pairing_invite(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+                pairing_id,
+            ));
+        }
+        ReadCommand::LoadPairingWinner { pairing_id, reply } => {
+            let _ = reply.send(pairing_terminal::load_pairing_winner(
                 &state.connection,
                 &state.key_bundle,
                 state.database_id,

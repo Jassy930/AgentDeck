@@ -9,6 +9,7 @@ use agentdeck_protocol::relay_v2::frame::{
     GrantCommitted, OpaqueRouteFrame, PairRouteCloseOutcome, PairRouteClosed, RelayFrameBody,
 };
 use agentdeck_protocol::relay_v2::{Ed25519Signature, RELAY_PROTOCOL_VERSION, encode};
+use agentdeck_protocol::runtime::{PairingReceipt, PairingState};
 
 use crate::remote::access::{PairResponseAccessBinding, VerifiedPairResponseReceipt};
 use crate::runtime::model::{
@@ -25,6 +26,7 @@ use super::pairing_grant::PairingGrantPreparation;
 use super::pairing_grant_commit::{AcknowledgeGrantCommitted, GrantCommittedRecovery};
 use super::pairing_grant_tests::{awaiting_pairing, grant_input};
 use super::pairing_grant_tx::ConfirmPairingGrantOutcome;
+use super::pairing_terminal::RECEIPT_RETENTION_MS;
 use super::pairing_tests::{
     GenerousCapacity, NOW_MS, OneShotFault, TestClock, TestRoot, artifact_bytes, make_active,
 };
@@ -150,6 +152,21 @@ async fn valid_receipt_atomically_delivers_replays_and_scrubs_only_after_close_a
     .expect("open delivery store");
     let (preparation, committed) = prepare_committed(&store, &clock).await;
     let proof = verified_receipt(&committed);
+    let before_committed_projection = artifact_bytes(&root.database());
+    let committed_winner = store
+        .load_pairing_winner(preparation.pairing_id())
+        .await
+        .expect("load authenticated GrantCommitted winner")
+        .expect("confirmed receipt must exist");
+    assert!(matches!(
+        committed_winner.receipt(),
+        PairingReceipt::Confirmed { .. }
+    ));
+    assert_eq!(committed_winner.state(), PairingState::GrantCommitted);
+    assert_eq!(
+        artifact_bytes(&root.database()),
+        before_committed_projection
+    );
 
     clock.store(NOW_MS + 2, Ordering::SeqCst);
     let delivered = store
@@ -166,6 +183,21 @@ async fn valid_receipt_atomically_delivers_replays_and_scrubs_only_after_close_a
     assert_eq!(close.pairing_id(), preparation.pairing_id());
     assert_eq!(close.pair_route(), committed.invite().pair_route);
     assert_eq!(delivery_counts(&root.database()), (1, 1, 1, 1));
+    let before_delivered_projection = artifact_bytes(&root.database());
+    let delivered_winner = store
+        .load_pairing_winner(preparation.pairing_id())
+        .await
+        .expect("load authenticated Delivered winner")
+        .expect("delivered confirmed receipt must exist");
+    assert!(matches!(
+        delivered_winner.receipt(),
+        PairingReceipt::Confirmed { .. }
+    ));
+    assert_eq!(delivered_winner.state(), PairingState::Delivered);
+    assert_eq!(
+        artifact_bytes(&root.database()),
+        before_delivered_projection
+    );
     assert_eq!(
         store
             .load_pairing_invite(preparation.pairing_id())
@@ -213,12 +245,28 @@ async fn valid_receipt_atomically_delivers_replays_and_scrubs_only_after_close_a
     );
     store.shutdown().await.expect("shutdown delivery store");
 
+    clock.store(NOW_MS + RECEIPT_RETENTION_MS, Ordering::SeqCst);
     let reopened = RuntimeStoreHandle::open(
         config(),
         load_or_create_storage_kek(&keys, &root.database()).expect("reload StorageKEK"),
     )
     .await
     .expect("reopen scrubbed delivery store");
+    let before_tombstone_projection = artifact_bytes(&root.database());
+    let tombstone_winner = reopened
+        .load_pairing_winner(preparation.pairing_id())
+        .await
+        .expect("load authenticated retained tombstone winner")
+        .expect("30-day confirmed tombstone must remain readable");
+    assert!(matches!(
+        tombstone_winner.receipt(),
+        PairingReceipt::Confirmed { .. }
+    ));
+    assert_eq!(tombstone_winner.state(), PairingState::ClosedTombstone);
+    assert_eq!(
+        artifact_bytes(&root.database()),
+        before_tombstone_projection
+    );
     assert!(matches!(
         reopened
             .acknowledge_pair_response_received(AcknowledgePairResponseReceived::new(

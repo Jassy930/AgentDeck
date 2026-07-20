@@ -278,6 +278,57 @@ impl PairingCoordinatorHandle {
         });
         Self { command_tx }
     }
+
+    #[cfg(test)]
+    pub(super) fn pending_drain_test_double(
+        entered: mpsc::UnboundedSender<()>,
+        mut release: watch::Receiver<bool>,
+        resumed: mpsc::UnboundedSender<()>,
+    ) -> Self {
+        let (command_tx, mut command_rx) = mpsc::channel(PAIRING_COMMAND_CAPACITY);
+        tokio::spawn(async move {
+            let mut complete = *release.borrow();
+            let mut waiters: Vec<oneshot::Sender<Result<(), PairingAdministrationError>>> =
+                Vec::new();
+            loop {
+                tokio::select! {
+                    changed = release.changed(), if !complete => {
+                        if changed.is_err() {
+                            for waiter in waiters.drain(..) {
+                                let _ = waiter.send(Err(pairing_error(PAIRING_STOPPED)));
+                            }
+                            return;
+                        }
+                        if *release.borrow_and_update() {
+                            complete = true;
+                            for waiter in waiters.drain(..) {
+                                let _ = waiter.send(Ok(()));
+                            }
+                        }
+                    }
+                    command = command_rx.recv() => match command {
+                        Some(PairingCommand::BeginDrain { reply }) => {
+                            let _ = entered.send(());
+                            waiters.retain(|waiter| !waiter.is_closed());
+                            waiters.push(reply);
+                            if complete || *release.borrow() {
+                                complete = true;
+                                for waiter in waiters.drain(..) {
+                                    let _ = waiter.send(Ok(()));
+                                }
+                            }
+                        }
+                        Some(PairingCommand::ResumeAfterFailedDrain { reply }) => {
+                            let _ = resumed.send(());
+                            let _ = reply.send(Ok(()));
+                        }
+                        Some(_) | None => return,
+                    },
+                }
+            }
+        });
+        Self { command_tx }
+    }
 }
 
 /// manager 持有的唯一 actor owner。shutdown 明确 cancel + join，不遗留 detached task。
@@ -1074,30 +1125,25 @@ fn already_handled_confirm_receipt(
     })
 }
 
-fn confirm_loser_receipt(
+fn confirm_retry_receipt(
     receipt: &PairingReceipt,
+    state: PairingState,
 ) -> Result<PairingReceipt, PairingAdministrationError> {
-    match receipt {
+    let (pairing_id, winner) = terminal_receipt_identity(receipt)?;
+    let pairing_id = PairingId::new(pairing_id.to_canonical_string());
+    Ok(if winner == PairingDecision::Confirm {
         PairingReceipt::Replayed {
             pairing_id,
-            decision,
+            decision: winner,
             state,
-        } => Ok(PairingReceipt::AlreadyHandled {
-            pairing_id: pairing_id.clone(),
-            winner: *decision,
-            state: *state,
-        }),
+        }
+    } else {
         PairingReceipt::AlreadyHandled {
             pairing_id,
             winner,
             state,
-        } => Ok(PairingReceipt::AlreadyHandled {
-            pairing_id: pairing_id.clone(),
-            winner: *winner,
-            state: *state,
-        }),
-        _ => Err(pairing_error(PAIRING_TERMINAL_INVALID)),
-    }
+        }
+    })
 }
 
 fn grant_outcome_from_store(
@@ -1364,6 +1410,11 @@ trait PairingStore: Send + Sync {
         canonical_request: SecretBytes,
     ) -> Result<DurableInvite, PairingAdministrationError>;
 
+    async fn load_winner(
+        &self,
+        pairing_id: RuntimeId,
+    ) -> Result<Option<(PairingReceipt, PairingState)>, PairingAdministrationError>;
+
     async fn commit_pending(
         &self,
         pairing_id: RuntimeId,
@@ -1555,6 +1606,17 @@ impl PairingStore for ProductionPairingStore {
             .await
             .map_err(store_error)?;
         DurableInvite::from_store(record)
+    }
+
+    async fn load_winner(
+        &self,
+        pairing_id: RuntimeId,
+    ) -> Result<Option<(PairingReceipt, PairingState)>, PairingAdministrationError> {
+        self.0
+            .load_pairing_winner(pairing_id)
+            .await
+            .map(|winner| winner.map(|winner| (winner.receipt().clone(), winner.state())))
+            .map_err(store_error)
     }
 
     async fn commit_pending(
@@ -2646,20 +2708,19 @@ impl PairingCoordinator {
 
         let durable = self.store.load(pairing_id).await?;
         let Some(durable) = durable else {
-            return self.confirm_terminal_winner(pairing_id).await;
+            return self.confirm_existing_winner(pairing_id).await;
         };
         match durable.lifecycle {
             PairingInviteLifecycle::AwaitingLocalConfirmation => {}
-            PairingInviteLifecycle::Canceled | PairingInviteLifecycle::Expired => {
-                return self.confirm_terminal_winner(pairing_id).await;
-            }
             PairingInviteLifecycle::GrantPreparing => {
                 return Err(pairing_error(PAIRING_GRANT_RECOVERY_UNAVAILABLE));
             }
             PairingInviteLifecycle::GrantCommitted
             | PairingInviteLifecycle::Delivered
-            | PairingInviteLifecycle::OrphanRevoking => {
-                return Err(pairing_error(PAIRING_ALREADY_COMPLETED));
+            | PairingInviteLifecycle::OrphanRevoking
+            | PairingInviteLifecycle::Canceled
+            | PairingInviteLifecycle::Expired => {
+                return self.confirm_existing_winner(pairing_id).await;
             }
             PairingInviteLifecycle::RouteOpening
             | PairingInviteLifecycle::Unused
@@ -2933,23 +2994,16 @@ impl PairingCoordinator {
         self.drive_next_revocation().await
     }
 
-    async fn confirm_terminal_winner(
+    async fn confirm_existing_winner(
         &mut self,
         pairing_id: RuntimeId,
     ) -> Result<PairingReceipt, PairingAdministrationError> {
-        let terminal = self
+        let (receipt, state) = self
             .store
-            .terminalize(pairing_id, PairingTerminalAction::Cancel)
-            .await?;
-        let reply = confirm_loser_receipt(&terminal.reply)?;
-        if let Err(error) = self.apply_terminal(terminal).await {
-            if is_transport_failure(&error) {
-                self.transport_failed = true;
-            } else {
-                return Err(error);
-            }
-        }
-        Ok(reply)
+            .load_winner(pairing_id)
+            .await?
+            .ok_or_else(|| pairing_error(PAIRING_TERMINAL_INVALID))?;
+        confirm_retry_receipt(&receipt, state)
     }
 
     async fn recovered_grant(
@@ -3150,6 +3204,14 @@ impl PairingCoordinator {
             }
             Err(error) => self.fail_waiters(error),
         }
+        if let Err(error) = self.replay_pending_grants().await {
+            if is_transport_failure(&error) {
+                self.transport_failed = true;
+            } else {
+                self.fail_waiters(error);
+            }
+            return;
+        }
         if let Err(error) = self.drive_next_revocation().await {
             if is_transport_failure(&error) {
                 self.transport_failed = true;
@@ -3157,6 +3219,17 @@ impl PairingCoordinator {
                 self.fail_waiters(error);
             }
         }
+    }
+
+    async fn replay_pending_grants(&mut self) -> Result<(), PairingAdministrationError> {
+        let grants = self.store.recover_grants().await?;
+        if grants.len() > PAIRING_COMMAND_CAPACITY {
+            return Err(pairing_error(PAIRING_GRANT_RECOVERY_UNAVAILABLE));
+        }
+        for grant in grants {
+            self.send_committed_grant(grant).await?;
+        }
+        Ok(())
     }
 
     async fn apply_terminal(

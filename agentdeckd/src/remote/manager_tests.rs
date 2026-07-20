@@ -853,6 +853,217 @@ async fn trust_reset_drain_waits_for_actor_without_holding_manager_mutex_and_res
     finish_fixture(manager, fixture).await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn trust_reset_pending_drain_is_bounded_without_resuming_and_retry_joins_running_drain() {
+    let mut fixture = active_fixture("pending-drain-deadline").await;
+    let manager = Arc::new(RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    ));
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+    let (resumed_tx, mut resumed_rx) = tokio::sync::mpsc::unbounded_channel();
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        state.pairing_handle_for_test = Some(
+            crate::remote::pairing::PairingCoordinatorHandle::pending_drain_test_double(
+                entered_tx, release_rx, resumed_tx,
+            ),
+        );
+    }
+
+    let first_manager = Arc::clone(&manager);
+    let mut first = tokio::spawn(async move {
+        first_manager
+            .trust_reset(
+                TrustResetRequest::new(LocalOnlyAdministration::LocalOnly, None)
+                    .expect("ordinary root-present reset"),
+            )
+            .await
+    });
+    entered_rx
+        .recv()
+        .await
+        .expect("first trust-reset attaches a drain waiter");
+    assert!(
+        manager.state.try_lock().is_ok(),
+        "manager mutex remains available while pairing drain is pending"
+    );
+
+    tokio::time::advance(Duration::from_secs(10)).await;
+    let first_result = match tokio::time::timeout(Duration::from_secs(1), &mut first).await {
+        Ok(result) => result.expect("join first trust-reset"),
+        Err(_) => {
+            first.abort();
+            let _ = first.await;
+            panic!("pending pairing drain must return at its deadline");
+        }
+    };
+    assert_eq!(
+        first_result
+            .expect_err("pending drain must fail closed")
+            .code(),
+        "daemon.pairing.drain_pending"
+    );
+    assert!(matches!(
+        resumed_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert_eq!(
+        manager
+            .status()
+            .await
+            .expect("status remains available after drain deadline")
+            .lifecycle,
+        WireLifecycle::Active
+    );
+    assert!(matches!(
+        fixture.store.load_machine_enrollment_state().await.unwrap(),
+        Some(MachineEnrollmentState::Active(_))
+    ));
+    assert!(
+        fixture
+            .keys
+            .load(MACHINE_ROOT_SIGN_ACCOUNT)
+            .unwrap()
+            .is_some(),
+        "deadline must not clean up machine keys"
+    );
+    assert!(manager.state.lock().await.pairing_handle_for_test.is_some());
+
+    // Store reply 跨独立 worker thread；retry watchdog 前恢复墙钟，避免 Tokio
+    // paused-time 自动推进先于外部线程回复。
+    tokio::time::resume();
+    let retry_manager = Arc::clone(&manager);
+    let mut retry = tokio::spawn(async move {
+        retry_manager
+            .trust_reset(
+                TrustResetRequest::new(LocalOnlyAdministration::LocalOnly, None)
+                    .expect("ordinary root-present retry"),
+            )
+            .await
+    });
+    entered_rx
+        .recv()
+        .await
+        .expect("retry attaches to the same running drain");
+    assert!(matches!(
+        resumed_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    release_tx
+        .send(true)
+        .expect("complete all waiters on the running drain");
+    let retry_result = match tokio::time::timeout(Duration::from_secs(1), &mut retry).await {
+        Ok(result) => result.expect("join trust-reset retry"),
+        Err(_) => {
+            retry.abort();
+            let _ = retry.await;
+            panic!("completed pairing drain must unblock retry");
+        }
+    };
+    assert_eq!(
+        retry_result
+            .expect_err("fixture has no start permit after drain completes")
+            .code(),
+        "daemon.remote.start_not_armed"
+    );
+    resumed_rx
+        .recv()
+        .await
+        .expect("post-drain workflow failure may resume pairing");
+
+    tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+        .await
+        .expect("shutdown remains bounded after pending drain timeout");
+    let manager = match Arc::try_unwrap(manager) {
+        Ok(manager) => manager,
+        Err(_) => panic!("all pending-drain test owners must be joined"),
+    };
+    finish_fixture(manager, fixture).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_cancels_pending_pairing_drain_without_resuming_it() {
+    let mut fixture = active_fixture("shutdown-pending-drain").await;
+    let manager = Arc::new(RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    ));
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_release_tx, release_rx) = tokio::sync::watch::channel(false);
+    let (resumed_tx, mut resumed_rx) = tokio::sync::mpsc::unbounded_channel();
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        state.pairing_handle_for_test = Some(
+            crate::remote::pairing::PairingCoordinatorHandle::pending_drain_test_double(
+                entered_tx, release_rx, resumed_tx,
+            ),
+        );
+    }
+
+    let operation_manager = Arc::clone(&manager);
+    let mut operation = tokio::spawn(async move {
+        operation_manager
+            .trust_reset(
+                TrustResetRequest::new(LocalOnlyAdministration::LocalOnly, None)
+                    .expect("ordinary root-present reset"),
+            )
+            .await
+    });
+    entered_rx
+        .recv()
+        .await
+        .expect("trust-reset enters pending pairing drain");
+
+    tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+        .await
+        .expect("shutdown must cancel pairing drain before taking manager mutex");
+    let operation_result = match tokio::time::timeout(Duration::from_secs(1), &mut operation).await
+    {
+        Ok(result) => result.expect("join shutdown-canceled trust-reset"),
+        Err(_) => {
+            operation.abort();
+            let _ = operation.await;
+            panic!("shutdown-canceled pairing drain must return");
+        }
+    };
+    assert_eq!(
+        operation_result
+            .expect_err("shutdown must fail the pending trust-reset")
+            .code(),
+        REMOTE_SHUTTING_DOWN
+    );
+    assert!(matches!(
+        resumed_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(manager.state.lock().await.stopped);
+    assert!(matches!(
+        fixture.store.load_machine_enrollment_state().await.unwrap(),
+        Some(MachineEnrollmentState::Active(_))
+    ));
+    assert!(
+        fixture
+            .keys
+            .load(MACHINE_ROOT_SIGN_ACCOUNT)
+            .unwrap()
+            .is_some()
+    );
+
+    let manager = match Arc::try_unwrap(manager) {
+        Ok(manager) => manager,
+        Err(_) => panic!("all shutdown drain test owners must be joined"),
+    };
+    finish_fixture(manager, fixture).await;
+}
+
 #[tokio::test]
 async fn manual_enroll_resume_requires_complete_identity_and_permit_before_endpoint() {
     for stage in [

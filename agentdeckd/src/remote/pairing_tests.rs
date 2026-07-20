@@ -565,6 +565,34 @@ impl PairingStore for FakeStore {
             .map(FakeStoredInvite::durable))
     }
 
+    async fn load_winner(
+        &self,
+        pairing_id: RuntimeId,
+    ) -> Result<Option<(PairingReceipt, PairingState)>, PairingAdministrationError> {
+        let state = self.state.lock().unwrap();
+        let Some(terminal) = state.terminals.get(&pairing_id) else {
+            return Ok(None);
+        };
+        let lifecycle = state.by_id.get(&pairing_id).map_or(
+            PairingState::ClosedTombstone,
+            |stored| match stored.lifecycle {
+                PairingInviteLifecycle::RouteOpening => PairingState::RouteOpening,
+                PairingInviteLifecycle::Unused => PairingState::Unused,
+                PairingInviteLifecycle::Preparing => PairingState::Preparing,
+                PairingInviteLifecycle::AwaitingLocalConfirmation => {
+                    PairingState::AwaitingLocalConfirmation
+                }
+                PairingInviteLifecycle::GrantPreparing => PairingState::GrantPreparing,
+                PairingInviteLifecycle::GrantCommitted => PairingState::GrantCommitted,
+                PairingInviteLifecycle::Delivered => PairingState::Delivered,
+                PairingInviteLifecycle::OrphanRevoking => PairingState::OrphanRevoking,
+                PairingInviteLifecycle::Canceled => PairingState::Canceled,
+                PairingInviteLifecycle::Expired => PairingState::Expired,
+            },
+        );
+        Ok(Some((terminal.receipt.clone(), lifecycle)))
+    }
+
     async fn accept_request(
         &self,
         pairing_id: RuntimeId,
@@ -3580,6 +3608,56 @@ async fn grant_ack_before_commit_failure_is_zero_network_and_after_commit_unknow
     actor.stop().await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn grant_ack_before_commit_failure_replays_exact_install_on_reconcile_tick() {
+    let order = Arc::new(StdMutex::new(Vec::new()));
+    let store = Arc::new(FakeStore::with_order(Arc::clone(&order)));
+    let mut actor = spawn_actor(Arc::clone(&store)).await;
+    let (_, pairing_id) = create_pending_pairing(&mut actor, "grant-ack-tick", 0x85).await;
+    actor.handle.confirm(pairing_id).await.unwrap();
+    let install = actor.sent_grant_rx.recv().await.unwrap();
+
+    store.fail_grant_ack_before_commit(true);
+    actor
+        .event_tx
+        .send(Ok(PairingTransportEvent::GrantCommitted(grant_committed(
+            &install,
+        ))))
+        .unwrap();
+    for _ in 0..16 {
+        if order.lock().unwrap().contains(&"grant-ack-before-fault") {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(order.lock().unwrap().contains(&"grant-ack-before-fault"));
+    assert_eq!(
+        store.lifecycle(pairing_id),
+        PairingInviteLifecycle::GrantPreparing
+    );
+    assert!(actor.sent_data_rx.try_recv().is_err());
+
+    store.fail_grant_ack_before_commit(false);
+    tokio::time::advance(EXPIRY_RECONCILE_INTERVAL).await;
+    let replayed = actor.sent_grant_rx.recv().await.unwrap();
+    assert_eq!(replayed, install);
+    actor
+        .event_tx
+        .send(Ok(PairingTransportEvent::GrantCommitted(grant_committed(
+            &replayed,
+        ))))
+        .unwrap();
+    assert_eq!(
+        actor.sent_data_rx.recv().await.unwrap(),
+        store.committed_response(pairing_id)
+    );
+    assert_eq!(
+        store.lifecycle(pairing_id),
+        PairingInviteLifecycle::GrantCommitted
+    );
+    actor.stop().await;
+}
+
 #[tokio::test]
 async fn committed_restart_and_reconnect_wait_for_current_open_ack_then_replay_exact_response() {
     let store = Arc::new(FakeStore::default());
@@ -4102,6 +4180,74 @@ async fn confirm_cancel_and_expiry_preserve_first_valid_winner() {
 }
 
 #[tokio::test]
+async fn confirm_retry_replays_confirm_winner_after_grant_commit_delivery_and_close_restart() {
+    let store = Arc::new(FakeStore::default());
+    let mut first = spawn_actor(Arc::clone(&store)).await;
+    let (_, pairing_id, _) =
+        create_committed_pairing(&mut first, &store, "confirm-replay-lifecycle", 0x7f).await;
+
+    assert!(matches!(
+        first.handle.confirm(pairing_id).await.unwrap(),
+        PairingReceipt::Replayed {
+            decision: PairingDecision::Confirm,
+            state: PairingState::GrantCommitted,
+            ..
+        }
+    ));
+    assert!(first.sent_grant_rx.try_recv().is_err());
+    assert!(first.sent_data_rx.try_recv().is_err());
+    assert!(first.sent_close_rx.try_recv().is_err());
+
+    first
+        .event_tx
+        .send(Ok(PairingTransportEvent::PairData(pair_response_receipt(
+            &store, pairing_id, 0x7f, None,
+        ))))
+        .unwrap();
+    let close = first.sent_close_rx.recv().await.unwrap();
+    assert_eq!(
+        store.lifecycle(pairing_id),
+        PairingInviteLifecycle::Delivered
+    );
+    assert!(matches!(
+        first.handle.confirm(pairing_id).await.unwrap(),
+        PairingReceipt::Replayed {
+            decision: PairingDecision::Confirm,
+            state: PairingState::Delivered,
+            ..
+        }
+    ));
+    assert!(first.sent_grant_rx.try_recv().is_err());
+    assert!(first.sent_data_rx.try_recv().is_err());
+    assert!(first.sent_close_rx.try_recv().is_err());
+
+    first.event_tx.send(Ok(closed(&close))).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while store.count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Close ACK must scrub the secret row before restart");
+    first.stop().await;
+
+    let mut second = spawn_actor(Arc::clone(&store)).await;
+    assert!(matches!(
+        second.handle.confirm(pairing_id).await.unwrap(),
+        PairingReceipt::Replayed {
+            decision: PairingDecision::Confirm,
+            state: PairingState::ClosedTombstone,
+            ..
+        }
+    ));
+    assert!(second.sent_rx.try_recv().is_err());
+    assert!(second.sent_grant_rx.try_recv().is_err());
+    assert!(second.sent_data_rx.try_recv().is_err());
+    assert!(second.sent_close_rx.try_recv().is_err());
+    second.stop().await;
+}
+
+#[tokio::test]
 async fn post_commit_send_failure_restart_and_reconnect_replay_exact_install_after_open_ack() {
     let store = Arc::new(FakeStore::default());
     store.commit_unknown_readback(true);
@@ -4259,6 +4405,8 @@ async fn due_grant_preparing_revokes_in_strict_install_ack_revoke_ack_close_orde
         .expect("expiry tick must drive orphan install")
         .unwrap();
     assert_eq!(replayed_install, install);
+    tokio::task::yield_now().await;
+    assert!(actor.sent_grant_rx.try_recv().is_err());
     assert_eq!(
         store.lifecycle(pairing_id),
         PairingInviteLifecycle::OrphanRevoking

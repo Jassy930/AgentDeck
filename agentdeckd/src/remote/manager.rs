@@ -6,7 +6,7 @@
 
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentdeck_protocol::relay_v2::{
     ENROLLMENT_BUNDLE_VERSION, EnrollmentBundleV2, MachineEnrollmentRequestV1, MachineRouteId,
@@ -48,7 +48,8 @@ use super::config::{
 };
 use super::enrollment::{FrozenMachineEnrollment, MachineEnrollmentError};
 use super::pairing::{
-    PairingCoordinatorOwner, PairingInviteContext, unavailable as pairing_unavailable,
+    PairingCoordinatorHandle, PairingCoordinatorOwner, PairingInviteContext,
+    unavailable as pairing_unavailable,
 };
 use super::transport::{PairingRuntimeParts, RemoteTransport, RemoteTransportConnectError};
 use super::trust_reset::{MachineTrustResetWorkflow, MachineTrustResetWorkflowError};
@@ -58,11 +59,19 @@ const REMOTE_DISABLED: &str = "daemon.remote.administration.unavailable";
 const REMOTE_NOT_ARMED: &str = "daemon.remote.start_not_armed";
 const REMOTE_SHUTTING_DOWN: &str = "daemon.remote.shutting_down";
 const REMOTE_STATE_CONFLICT: &str = "daemon.remote.enrollment.state_conflict";
+const PAIRING_DRAIN_WAIT_DEADLINE: Duration = Duration::from_secs(10);
+const PAIRING_DRAIN_PENDING: &str = "daemon.pairing.drain_pending";
 const ROOT_PRESENT_RECEIPT_FORBIDDEN: &str =
     "daemon.remote.trust_reset.root_present_receipt_forbidden";
 const ROOT_LOST_RECEIPT_REQUIRED: &str = "daemon.remote.trust_reset.admin_receipt_required";
 const PURGE_FINALIZER_UNAVAILABLE: &str = "daemon.purge.finalizer_unavailable";
 const PURGE_RECOVERY_REQUIRED: &str = "daemon.purge.recovery_required";
+
+enum PairingDrainWaitError {
+    Actor(PairingAdministrationError),
+    Pending,
+    ShuttingDown,
+}
 
 /// `uninstall --purge` 的 existing-only finalization marker 窄边界。
 /// reserve 必须先于 trust-reset；authorize 只接受当前 Store 的 authenticated
@@ -719,6 +728,33 @@ impl RemoteManager {
         }
     }
 
+    async fn await_pairing_drain(
+        &self,
+        handle: &PairingCoordinatorHandle,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), PairingDrainWaitError> {
+        // deadline 只终止本次 administration 等待；被丢弃的 reply receiver 会由
+        // actor 清理，durable Running drain 保持不变，后续 retry 可挂接新 waiter。
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        if *shutdown_rx.borrow() {
+            return Err(PairingDrainWaitError::ShuttingDown);
+        }
+        tokio::select! {
+            biased;
+            changed = shutdown_rx.changed() => {
+                let _ = changed;
+                Err(PairingDrainWaitError::ShuttingDown)
+            }
+            result = tokio::time::timeout_at(deadline, handle.begin_drain()) => {
+                match result {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(PairingDrainWaitError::Actor(error)),
+                    Err(_) => Err(PairingDrainWaitError::Pending),
+                }
+            }
+        }
+    }
+
     async fn finish_purge_authorization(
         &self,
         state: &mut RemoteManagerState,
@@ -1082,9 +1118,19 @@ impl RemoteAdministration for RemoteManager {
             (portable_root_lost, pairing)
         };
         if let Some(handle) = pairing.as_ref() {
-            if let Err(error) = handle.begin_drain().await {
-                let _ = handle.resume_after_failed_drain().await;
-                return Err(admin_error(error.code()));
+            let deadline = tokio::time::Instant::now() + PAIRING_DRAIN_WAIT_DEADLINE;
+            match self.await_pairing_drain(handle, deadline).await {
+                Ok(()) => {}
+                Err(PairingDrainWaitError::Actor(error)) => {
+                    let _ = handle.resume_after_failed_drain().await;
+                    return Err(admin_error(error.code()));
+                }
+                Err(PairingDrainWaitError::Pending) => {
+                    return Err(admin_error(PAIRING_DRAIN_PENDING));
+                }
+                Err(PairingDrainWaitError::ShuttingDown) => {
+                    return Err(admin_error(REMOTE_SHUTTING_DOWN));
+                }
             }
         } else if !portable_root_lost && !self.store.list_pairing_recovery().await?.is_empty() {
             // 无 portable absent proof 时不能跳过 PairRoute close/revoke cleanup。

@@ -195,6 +195,27 @@ impl AcknowledgePairRouteCloseOutcome {
     }
 }
 
+/// 已通过完整 pairing directory 认证的 first-valid winner 与当前 durable state。
+///
+/// 该投影只读，不触发 terminal CAS、Close 重发或 receipt retention 变更。
+#[derive(Debug)]
+pub(crate) struct PairingWinnerProjection {
+    receipt: PairingReceipt,
+    state: PairingState,
+}
+
+impl PairingWinnerProjection {
+    #[must_use]
+    pub(crate) const fn receipt(&self) -> &PairingReceipt {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub(crate) const fn state(&self) -> PairingState {
+        self.state
+    }
+}
+
 struct AuthenticatedReceipt {
     pairing_id: RuntimeId,
     relay_server_id: [u8; 16],
@@ -856,6 +877,35 @@ fn pairing_state(lifecycle: PairingInviteLifecycle) -> PairingState {
         PairingInviteLifecycle::Canceled => PairingState::Canceled,
         PairingInviteLifecycle::Expired => PairingState::Expired,
     }
+}
+
+pub(crate) fn load_pairing_winner(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    pairing_id: RuntimeId,
+) -> Result<Option<PairingWinnerProjection>, RuntimeStoreError> {
+    if pairing_id.kind() != RuntimeIdKind::Pairing {
+        return Err(RuntimeStoreError::IdKindMismatch {
+            expected: RuntimeIdKind::Pairing,
+            actual: pairing_id.kind(),
+        });
+    }
+    let directory = super::pairing::load_directory(connection, key_bundle, database_id)?;
+    let Some(receipt) = directory.terminal.receipt(pairing_id) else {
+        return Ok(None);
+    };
+    let state = directory
+        .pairings
+        .iter()
+        .find(|pairing| pairing.record.pairing_id == pairing_id)
+        .map_or(PairingState::ClosedTombstone, |pairing| {
+            pairing_state(pairing.record.lifecycle)
+        });
+    Ok(Some(PairingWinnerProjection {
+        receipt: receipt.receipt.clone(),
+        state,
+    }))
 }
 
 fn classify_existing(
