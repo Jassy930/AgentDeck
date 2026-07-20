@@ -2,7 +2,8 @@
 
 本页只记录已经由自动化测试真实跑通的 Relay v2 管理命令与安全边界。production
 binary 已在 P2.9 原子切换为仅 Relay v2；P2.10 又以真实 Direct TLS/SPKI synthetic、
-安全扫描与故障注入门禁收口。daemon/iOS 的持久远程链路仍属于 P3–P5，因此本页
+安全扫描与故障注入门禁收口。P4.1 已完成 daemon machine identity/guard，但 certificate、enrollment
+workflow、receipt IO 与持久 RemoteLink 仍从 P4.2 开始；iOS 自动链路属于 P5。因此本页
 不是“公网 Companion 已上线”的证明。
 
 ## 部署不变量
@@ -74,7 +75,7 @@ agentdeck remote synthetic --bundle machine-enrollment-bundle.json
 
 该命令使用临时 machine/device key，真实完成 enrollment、fresh challenge 鉴权、
 InstallGrant、register/publish/subscribe replay、Send/Reply、signed revoke 与终态重连。
-P4 前持久 `remote pair/machines/sessions/watch/send/...` 会返回
+P4.1 完成后、P4.2–P4.7 尚未落地期间，持久 `remote pair/machines/sessions/watch/send/...` 仍会返回
 `remote.persistent.unsupported`；不得把 synthetic 临时结果当作已保存设备配对。
 
 ## 本机 inventory 与 readback

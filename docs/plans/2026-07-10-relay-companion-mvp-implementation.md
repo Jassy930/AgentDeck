@@ -1075,7 +1075,7 @@ ignored/BLOCKED；P3.7 exec gate 主体、边界裁决、两个 prepare finding 
 `c9d2146` / `5713be4` 补齐真实 release 前取消与 sentinel 退出窗口门禁；P3.8 production UDS 与后续
 P3.9 shared-daemon client 与 P3.10 LaunchAgent Task 已完成；P3.10 code/test commit 为 `19622ab`，
 后续 Phase hardening code baseline 为 `9efb28d`，P3 automatic scope 已完成 6/6 Phase Exit；P4
-E2EE/Relay Publish 仍为 0/7，下一项是 P4.1。
+已由 P4.1 推进到 1/7，下一项是 P4.2；E2EE/Relay Publish 仍未完成。
 
 ### Task P3.6-A：先冻结 Runtime/E2EE contract 与跨语言 wire
 
@@ -2465,7 +2465,7 @@ P3.9 固定以下迁移边界：
   真实 Codex/CC login 与 provisioned signed Keychain 继续是 post-MVP BLOCKED 槽位，不冒充本 Task 证据。
   P3.9 至此完成；P3.10 已由 `19622ab` 完成 Task 收口并通过完整 verifier 与双路 Task 终审；后续
   Phase review hardening 已由 `773a2b3` / `0057824` / `81cc314` / `9efb28d` 收口，P3 automatic scope
-  已完成 6/6 Phase Exit。P4 保持 0/7，下一项是 P4.1。
+  已完成 6/6 Phase Exit。后续 P4.1 已完成，P4 当前为 1/7，下一项是 P4.2。
 
 ### Task P3.10：实现 LaunchAgent 安装、versioned upgrade 与保留数据的 uninstall
 
@@ -2475,7 +2475,8 @@ P3.9 固定以下迁移边界：
 > code/test，并由 `19622ab` scoped commit。冻结 candidate 的完整
 > `bash scripts/verify-relay-companion-mvp.sh p3` 已 exit 0，两路 Task review 均 Approved、无 P0/P1/P2；
 > 隔离 ephemeral UDS 已完成 install→stage→ACK→idle→手动 current restart→Hello；后续 Phase review
-> hardening 与独立 P3 Phase Exit 证据见本 Task 后的 6/6 checklist。P4 当前仍为 0/7。
+> hardening 与独立 P3 Phase Exit 证据见本 Task 后的 6/6 checklist。后续 P4.1 已完成，P4 当前为
+> 1/7，下一项是 P4.2。
 
 **前置冻结：** local-only typed `StageUpgrade` request/reply、授权与错误语义已纳入 P3.9-C0-A 的 Runtime
 v2 contract；P3.9 的历史基线固定返回 typed feature-unavailable，P3.10 implementation 已用 durable/flush-ACK
@@ -2544,7 +2545,7 @@ focused tests + scoped Clippy/fmt，不做子片级双路终审、全量慢门�
 - [x] `scripts/run-local-runtime-smoke.sh` 的隔离 ephemeral UDS 已覆盖 Swift Runtime selfcheck；
   `swift run AgentDeck -- --diagnostics-report --json` 通过，未依赖或修改当前用户 production-signed
   stable daemon/home。Swift 为 `527 XCTest + 35 Swift Testing`，iOS Simulator `20/20`。
-- [x] current schema v7、authenticated `admin_commands` ledger、install/status/uninstall、exact reply flush
+- [x] P3 Phase Exit 基线的 current schema v7、authenticated `admin_commands` ledger、install/status/uninstall、exact reply flush
   ACK、active→idle、stopped `loaded=true,pid=null` job 与 P3 `--purge` typed block/零删除均已读回；daemon
   lib 两轮均为 `905 passed / 3 ignored`（218.23s / 154.45s），1,024 × 256 KiB capacity 两轮均
   `5/5`（284.97s / 286.07s）。
@@ -2554,27 +2555,34 @@ focused tests + scoped Clippy/fmt，不做子片级双路终审、全量慢门�
 - [x] 四 schema、daemon network boundary、agent docs、local smoke、diagnostics 与 scoped diff/status 全绿；
   冻结 candidate 的两路 phase code review 均为 P0/P1/P2=0。
 - [x] P3 标记为 `complete (automatic scope)`；provisioned production-signed LaunchAgent/Keychain
-  roundtrip 继续作为 post-MVP BLOCKED 槽位，不属于 PASS。P4 仍为 0/7，下一项是 P4.1。
+  roundtrip 继续作为 post-MVP BLOCKED 槽位，不属于 PASS。后续 P4.1 已完成，P4 当前为 1/7，
+  下一项是 P4.2。
 
 ---
 
 ## Phase P4：Machine identity、Pairing 与 RemoteLink
 
-> **执行前审计（2026-07-20）：0/7 Task 完成。** P4.1–P4.7 的 production source、automatic E2E 与
-> real-slot contract 均未实现；P3 automatic scope complete 不构成 P4 进度。下一项是 P4.1，以下
-> checkbox 全部保持未勾。
+> **当前状态（2026-07-20）：1/7 Task 完成。** P4.1 machine identity/guard automatic scope 已完成
+> Task 级完整门禁与双路 Approved；下一项是 P4.2 certificate/enrollment/RemoteTransport/trust reset。
+> P4.2–P4.7 与 P4 Phase Exit 仍未完成，其 checkbox 保持未勾。此前 0/7 是 P4.1 开始前的历史基线。
 
 ### Task P4.1：扩展 macOS Keychain 为 Machine identity 与 CounterGuard（零 cert/enrollment/RemoteLink）
 
+> **状态：Task complete。** code/test commits 为 `3cd76d2`、`644712c`、`95090c1`、`85df3d2`、
+> `f137112`、`46c6bb8`。本 Task 只完成 machine identity、key-directory guard 与通用 CounterGuard IO；
+> 严格零 cert、零 enrollment workflow、零 receipt IO、零 RemoteLink。active symmetric key reservation、
+> DB counter high-water 绑定和整库回滚闭环仍未完成。
+
 **Files:**
-- Create: `agentdeckd/src/remote/{mod,identity}.rs`
+- Create: `agentdeckd/src/remote/{mod,identity,bootstrap}.rs`
 - Create: `agentdeckd/src/runtime/store/machine_identity.rs`
-- Create: `agentdeckd/tests/machine_identity.rs`
-- Modify: `agentdeckd/src/security/{key_store,macos_keychain}.rs`
-- Modify: `agentdeckd/src/runtime/store/{schema,sqlite,journal,worker,mod}.rs`
-- Modify: `agentdeckd/src/runtime/store/approval.rs`
+- Create: `agentdeckd/tests/{machine_identity_keys,machine_identity_bootstrap,runtime_store_machine_identity}.rs`
+- Modify: `agentdeckd/src/runtime/store/{approval,command_configuration,configuration,journal,metadata,mod,schema,sqlite,worker}.rs`
 - Modify: `agentdeckd/src/runtime/model.rs`
 - Modify: `agentdeckd/src/{lib,main}.rs`
+- Modify: `agentdeckd/src/runtime/core/subscription_tests/a1a2_legacy_readback.rs`
+- Modify: `agentdeckd/tests/{daemon_startup,runtime_store,runtime_store_boundaries,runtime_store_cipher,runtime_v4_v5_real_migration}.rs`
+- Modify: `agentdeckd/tests/support/runtime_command_configuration_tamper.rs`
 - Modify: `agentdeckd/Cargo.toml`、`Cargo.lock`
 
 **Key accounts:** `machine-root-sign.v1`、`machine-hpke.v1`、`machine-link-sign.v1`、
@@ -2636,7 +2644,7 @@ Clippy/fmt 与执行者自查，不跑全量慢门禁、不做双路终审、不
 additions 到 1,800 前继续职责内聚拆分，2,000 时硬停。P4.1 Task 末只做一次完整门禁、双路独立终审与
 一个 docs 收口 commit。
 
-- [ ] Step 1: 先写 A/B/C 的 identity/store/guard/bootstrap RED tests。覆盖 v8 fresh/migration/manifest、
+- [x] Step 1: 已落地 A/B/C 的 identity/store/guard/bootstrap tests。覆盖 v8 fresh/migration/manifest、
   `machine_identity_count`/row token tamper 零改写、prepare/activate exact replay/conflict/COMMIT-unknown；首启
   只生成一次 MachineRoot/MachineHPKE/LinkSign/DataSign key material；仅当 DB identity row 与 guard 均仍
   不存在时，Preparing 前的部分 material 写入在重启后可只补缺项且不覆盖既有项。普通重启各 fingerprint
@@ -2645,27 +2653,35 @@ additions 到 1,800 前继续职责内聚拆分，2,000 时硬停。P4.1 Task �
   覆盖旧状态，本地 Runtime recovery/UDS 仍通过。自动测试用显式
   constructor 注入 dev/ephemeral keystore/signature verifier，并加入 compile/static gate，证明 P4.1 production
   source 不构造 `SignedCertificate`/enrollment DTO、不读写 `machine_enrollment_receipts`、不引用
-  `RelayEnrollmentClient`/RemoteLink，且 production CLI/env 无 file-keystore 开关。
-- [ ] Step 2: 运行 machine_identity test。 Expected: FAIL，remote identity不存在。
-- [ ] Step 3: 按 A→B→C 实现冻结 contract。production 复用 P3.1 的 protected/non-synchronizable/
+  `RelayEnrollmentClient`/RemoteLink，且 production CLI/env 无 file-keystore 开关。对应 code/test 由
+  `3cd76d2`、`644712c`、`95090c1`、`85df3d2`、`f137112`、`46c6bb8` 收口。
+- [ ] Step 2: 历史 RED 的独立命令输出未保留，不能在实现已经存在后补跑并冒充原始 FAIL 证据；本项不追记
+  checkbox。最终 GREEN、完整 package 与独立终审均已有真实证据，不为补齐文字记录回滚 production。
+- [x] Step 3: 已按 A→B→C 实现冻结 contract。production 复用 P3.1 的 protected/non-synchronizable/
   AfterFirstUnlockThisDeviceOnly 与 daemon-only stable access group，失败不降级；自动 harness 只通过
   non-production constructor 注入 dev/ephemeral 实现。删除操作必须传 expected fingerprint 防错删。本步
-  不实现 cert signer、enrollment 或网络 composition。
-- [ ] Step 4: 每个内部子片重跑自己的 focused automatic tests、scoped Clippy/fmt 并扫描 temp DB/log。
-  Expected: 注入 dev/ephemeral keystore 下只有
+  未实现 cert signer、enrollment 或网络 composition。Runtime schema 已从 v7 单调升级到 v8，fresh schema
+  精确为 24 表。
+- [x] Step 4: 内部子片已运行 focused automatic tests、scoped Clippy/fmt 与 temp DB/log/static sentinel。
+  注入 dev/ephemeral keystore 下只有
   public fingerprint/guard metadata，无 secret、cert、enrollment receipt 或 RemoteLink artifact；production
   composition 仍拒绝 unsigned/ad-hoc/entitlement mismatch。versioned 同 TeamIdentifier signed helper 的旧
   item readback 只运行 post-MVP slot preflight；缺 provisioning 时输出 Global Constraints 规定的 BLOCKED
-  NDJSON，不在主线尝试签名、生成证书或读真实 Keychain。
-- [ ] Step 5: A/B/C 各自仅精确提交 production+test code，不包含文档；提交前核对 production additions、
-  focused tests、scoped Clippy/fmt 与 pathspec，禁止 `git add -A`。
-- [ ] Step 6: 冻结 P4.1 code/test candidate 后只执行一次 Task 级完整门禁：完整 daemon package（含容量慢项）、
+  NDJSON，不在主线尝试签名、生成证书或读真实 Keychain。最终 focused 证据为 bootstrap `18/18`、
+  identity keys `11/11`、store identity `11/11`、RootKeyId `2/2`、v7→v8 migration `1/1`；快速
+  network/static/secret、scoped Clippy、fmt 与 diff 门禁均绿。
+- [x] Step 5: A/B/C 已精确提交 production+test code且不包含文档：`3cd76d2`（identity keys/guard）、
+  `644712c`（authenticated store/schema v8）、`95090c1`（key security tests）、`85df3d2`（bootstrap/
+  composition）、`f137112`（final hardening）、`46c6bb8`（daemon lifecycle oracle）。
+- [x] Step 6: 冻结 P4.1 code/test candidate 后已执行 Task 级完整门禁：完整 daemon package（含容量慢项）、
   dev/ephemeral selfcheck、diagnostics、network boundary、schema/manifest、secret/log/static sentinel、fmt/diff/status；
-  分别完成独立 `spec/security` 与 `quality` review 并清零 P0/P1/P2。任一修复后重跑受影响门禁并复审。
-- [ ] Step 7: 一次性同步 README/ARCHITECTURE/QUALITY/DIAGNOSTICS/AGENTS、设计与本计划，运行 docs gate
-  与最终工作区读回，再创建唯一 P4.1 docs 收口 commit；不得补做子片 docs commit。code/test 提交主题为
-  `feat(remote): 建立机器根身份与 Keychain guard`，docs 提交主题为
-  `docs(relay): 收口 P4.1 machine identity`。
+  `cargo test -p agentdeckd --locked -- --test-threads=1` exit 0，lib 为
+  `916 passed / 3 ignored`，capacity 慢项为 284.28s。两路独立 `spec/security` 与 `quality` 终审均为
+  Approved，P0/P1/P2=0。
+- [x] Step 7: 已一次性形成 README/ARCHITECTURE/QUALITY/DIAGNOSTICS/AGENTS、设计、计划、索引与
+  Relay runbook 的 P4.1 文档 candidate；没有子片级 docs commit。最终 docs gate、工作区读回与唯一
+  `docs(relay): 收口 P4.1 machine identity` commit 由 controller 在同一 candidate 上执行；本 checkbox 只有
+  随该 docs commit 落地后才构成持久完成证据。
 
 ### Task P4.2：签发 link/data cert、建立 RemoteTransport，再实现 enrollment 与两条 trust-reset 路径
 

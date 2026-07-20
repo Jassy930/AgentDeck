@@ -67,9 +67,13 @@ flush-ACK-gated upgrade 与 LaunchAgent lifecycle；P3 Phase review 又由 `773a
 verifier 进程组。以 `9efb28d` 为 code baseline 的完整 `p3` Phase verifier exit 0，双路 phase code
 review 均为 P0/P1/P2=0，P3 automatic scope 6/6 complete。P3.1 继续采用方案 b：provisioned signed
 Keychain/LaunchAgent roundtrip 保持 post-MVP ignored/BLOCKED，不阻塞主线，也不表示 stable production
-signing 已完成。P4 仍为 0/7，下一项是严格零 cert、零 enrollment、零 RemoteLink 的 P4.1 machine
-identity/CounterGuard automatic slice；link/data cert、enrollment 与首条 RemoteLink 归 P4.2。P4 E2EE/Relay Publish、P5 Simulator 自动 E2E 与
-P6 本机第二客户端 synthetic DoD 均未完成；物理 iPhone/第二台 Mac 是 post-MVP BLOCKED 槽位。
+signing 已完成。P4.1 已由 `3cd76d2`、`644712c`、`95090c1`、`85df3d2`、`f137112`、`46c6bb8`
+完成 machine identity、schema v8/24 表、key-directory guard、通用 CounterGuard IO 与 bootstrap；完整
+daemon package exit 0、两路终审 Approved。P4 当前为 1/7，下一项是 P4.2；P4.1 严格零 cert、零
+enrollment workflow、零 receipt IO、零 RemoteLink，link/data cert、enrollment 与首条 RemoteLink 首次归
+P4.2。通用 CounterGuard IO 不代表 active symmetric key reservation、DB high-water 绑定或整库回滚闭环
+已完成。P4 E2EE/Relay Publish、P5 Simulator 自动 E2E 与 P6 本机第二客户端 synthetic DoD 均未完成；
+物理 iPhone/第二台 Mac 是 post-MVP BLOCKED 槽位。
 transfer/publication 也尚无 production remote owner；不能因 fake publication、store tests 或 Simulator
 fixture 改写尚未实现的自动链路状态。
 

@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P3 automatic scope 已从 code baseline `9efb28d` 完成 6/6 Phase Exit，完整 `p3` verifier exit 0且双路 phase code review P0/P1/P2=0。P4/P5/P6 分别为 0/7、0/9、0/4 Task 完成，下一项是严格零 cert/零 enrollment/零 RemoteLink 的 P4.1；production native metadata 与 provisioned signed Keychain/LaunchAgent 均为 post-MVP gated/BLOCKED（2026-07-20） |
+| 状态 | Approved target；P3 automatic scope 已从 code baseline `9efb28d` 完成 6/6 Phase Exit。P4.1 machine identity/guard 已由 `3cd76d2`、`644712c`、`95090c1`、`85df3d2`、`f137112`、`46c6bb8` 完成 Task 门禁与双路 Approved，P4/P5/P6 当前分别为 1/7、0/9、0/4 Task 完成，下一项是 P4.2 certificate/enrollment/RemoteTransport/trust reset；production native metadata 与 provisioned signed Keychain/LaunchAgent 均为 post-MVP gated/BLOCKED（2026-07-20） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -48,10 +48,16 @@ RW open/migration 之前，并由 `81cc314` / `9efb28d` 稳定回收 verifier le
 `905 passed / 3 ignored`（218.23s / 154.45s），1,024 × 256 KiB capacity 两轮均 `5/5`
 （284.97s / 286.07s），Swift `527 XCTest + 35 Swift Testing`、iOS Simulator `20/20`；signed exact
 BLOCKED contract、四 schema、network、docs、local smoke 与 diagnostics 全绿，两路 phase code review
-均为 P0/P1/P2=0。P3 automatic scope 6/6 complete。P4 Machine identity/E2EE/Relay Publish 与真实
-Companion 仍未开始，iOS 仍只有 fixture 驱动骨架；P4 保持 0/7，下一项是 P4.1。P3.1 provisioned
-signed Keychain/LaunchAgent roundtrip 仍按方案 b 保持 post-MVP BLOCKED gate。完整实施仍必须满足 §17
-的 Definition of Done。
+均为 P0/P1/P2=0。P3 automatic scope 6/6 complete；这也是 P4 当时的 0/7 历史基线。
+随后 P4.1 由 `3cd76d2` / `644712c` / `95090c1` / `85df3d2` / `f137112` / `46c6bb8`
+完成四组 machine key、authenticated schema v8/24 表、key-directory guard、通用 CounterGuard IO 与
+`Preparing → Active` bootstrap。focused bootstrap `18/18`、identity keys `11/11`、store identity
+`11/11`、RootKeyId `2/2`、v7→v8 migration `1/1` 均通过；完整 daemon package exit 0（lib
+`916 passed / 3 ignored`，capacity 慢项 284.28s），两路独立终审均 Approved。P4 当前为 1/7，
+下一项是 P4.2。P4.1 仍严格零 cert、零 enrollment workflow、零 receipt IO、零 RemoteLink；其
+CounterGuard 只是通用 IO，不代表 active symmetric key reservation、DB high-water 绑定或整库回滚闭环
+已经完成。iOS 仍只有 fixture 驱动骨架。P3.1 provisioned signed Keychain/LaunchAgent roundtrip 继续按
+方案 b 保持 post-MVP BLOCKED gate。完整实施仍必须满足 §17 的 Definition of Done。
 
 ## 1. 背景与当前问题
 
@@ -1548,8 +1554,10 @@ provisioned production-signed LaunchAgent/Keychain 仍按方案 b 保持 post-MV
 
 ### P4 Machine RemoteLink
 
-- P4.1 只建立 MachineRoot/MachineHPKE/LinkSign/DataSign key material、Keychain guard 与 CounterGuard；
-  严格零 cert、零 enrollment、零 RemoteLink，不读写 `machine_enrollment_receipts`。
+- P4.1 已建立 MachineRoot/MachineHPKE/LinkSign/DataSign key material、Keychain guard 与通用
+  CounterGuard IO；严格零 cert、零 enrollment workflow、零 RemoteLink，不读写
+  `machine_enrollment_receipts`。通用 CounterGuard IO 不等于 active key reservation、DB high-water 绑定或
+  整库回滚闭环，这些仍属于后续 P4 Task。
 - P4.2 才首次签发 root-signed link/data cert、读写 enrollment receipt、执行 Relay machine enrollment，
   并建立第一条 RemoteLink；PairInvite 继续由 P4.3 拥有。
 - daemon WSS/E2EE、MachineDataSign、Catalog/events/commands/replay、key/counter crash recovery。

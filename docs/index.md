@@ -13,8 +13,8 @@
 
 - `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、Relay v2 与 daemon install/upgrade failure code、
   v1 marker 显式 reset 和排查流程。
-- `QUALITY.md`：按变更范围选择验证命令，以及 Companion MVP P2、P3.1–P3.10、P3 Phase
-  production UDS/client/install/smoke 与文档结构检查入口。
+- `QUALITY.md`：按变更范围选择验证命令，以及 Companion MVP P2、P3.1–P3.10、P3 Phase、P4.1
+  machine identity/guard、production UDS/client/install/smoke 与文档结构检查入口。
 - `RELAY_RUNBOOK.md`：production Relay v2 Direct TLS、本机 admin UDS、machine
   enrollment、fingerprint-bound readback/purge 与 root-lost 重新配对操作手册。
 
@@ -64,9 +64,12 @@
   baseline `9efb28d` 的独立 `p3` Phase verifier exit 0，四 schema/network/docs/smoke/diagnostics 全绿，
   双路 code review P0/P1/P2 = 0，P3 Phase complete（MVP automatic scope）。P3.1 继续采用方案 b：
   provisioned signed Keychain roundtrip 保留 1 项 post-MVP ignored/BLOCKED，不阻塞主线，也不表示
-  production signing PASS。P4–P6 仍为 0/7、0/9、0/4；下一项按方案 A 执行 P4.1，只建立 Machine
-  identity 与 CounterGuard/key-directory guard，且零 cert、零 enrollment、零 receipt 读写、零 RemoteLink；
-  certificate/enrollment/receipt 首次归 P4.2。P5 MVP 只以 iOS Simulator 自动 E2E 退出，本机第二客户端归 P6 synthetic DoD。
+  production signing PASS。P4.1 已由 `3cd76d2`、`644712c`、`95090c1`、`85df3d2`、`f137112`、
+  `46c6bb8` 完成 machine identity、schema v8/24 表、key-directory guard、通用 CounterGuard IO 与
+  bootstrap；完整 daemon package exit 0、两路终审 Approved。P4–P6 当前为 1/7、0/9、0/4，下一项
+  P4.2；P4.1 严格零 cert、零 enrollment workflow、零 receipt IO、零 RemoteLink，certificate/enrollment/
+  receipt 首次归 P4.2。通用 CounterGuard IO 不代表 active reservation 或整库回滚闭环已完成。P5 MVP
+  只以 iOS Simulator 自动 E2E 退出，本机第二客户端归 P6 synthetic DoD。
 
 ## 协议资料
 

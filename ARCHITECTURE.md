@@ -489,14 +489,14 @@ conversation/key，不能伪造身份连续性。
   64-slot LRU，Unsubscribe 必须收到 exact ACK 后才移除本地账，“腾槽→Subscribe→记账”由 FIFO admission
   串行。composer draft 绑定 logical owner，最多 32 owners、单 draft 256 KiB、总计 1 MiB，不能跨新意图
   复用或无界保留。
-- P3.10 已由 code/test commit `19622ab` 把 current Runtime schema 推进到 v7，并新增 authenticated
+- P3.10 已由 code/test commit `19622ab` 把当时的 Runtime schema 推进到 v7，并新增 authenticated
   machine-wide `admin_commands` ledger；请求、outcome、idempotency/request token、状态、30 天 retention
   与容量账都进入 open/recovery 全库审计，exact replay/conflict 和 COMMIT-unknown 收敛不得绕过该账本。
   `StageUpgrade` 的 Runtime/Core 成功只产生 deferred action；local writer 必须完成整条 exact reply write
   并取得 flush ACK 后才 arm，随后经 active→idle fence、候选 artifact/hash/owner/mode/nlink 复核才能原子
   切换 `bin/current` 并退出。ACK 前的 encode/write/flush/cancel/disconnect 任一失败都必须丢弃 action并保持
   symlink/PID 不变；ACK 已授予许可后，随后 client close 不得撤销已提交动作。LaunchAgent lifecycle
-  覆盖 install/status/uninstall、stopped `loaded=true,pid=null` job 和 P4 前 `--purge` typed fail-close/零删除；
+  覆盖 install/status/uninstall、stopped `loaded=true,pid=null` job 和 P4.2 trust-reset 前 `--purge` typed fail-close/零删除；
   stopped job 先 kickstart 并二次读回 live PID，CLI 只对 `socket_missing` / `connect_failed` 做有界 15 秒
   retry。P3 Phase review 的 `773a2b3` / `81cc314` / `9efb28d` 又把 `codesign`、`plutil` 与候选
   `agentdeckd --version` verifier 固定在独立 PGID 中，以非阻塞管道执行，使用 10 秒绝对 deadline、
@@ -517,9 +517,18 @@ conversation/key，不能伪造身份连续性。
   只描述实现边界，不能把 signed roundtrip 记为 PASS。2026-07-18 已采用方案 b：MVP/P3 exit 接受
   完整 dev/ephemeral Keychain 路径，provisioned signed roundtrip 移入 post-MVP ignored/BLOCKED 槽位，
   不阻塞 P3/P4 主线或 phase closeout，也不再尝试代码绕过 AMFI；stable production signing 尚未完成。
-- P3 complete 只指 MVP automatic scope。下一项按方案 A 执行 P4.1：只建立 Machine identity 与
-  CounterGuard/key-directory guard，且零 Link/Data cert、零 enrollment、零 receipt 读写、零 RemoteLink；
-  certificate 签发、enrollment 与 receipt 首次归 P4.2。
+- P3 complete 只指 MVP automatic scope。P4.1 已由 `3cd76d2`、`644712c`、`95090c1`、`85df3d2`、
+  `f137112`、`46c6bb8` 完成 Machine identity、key-directory guard 与通用 CounterGuard IO，P4 当前
+  为 1/7，下一项是 P4.2。两路独立终审均 Approved、P0/P1/P2 = 0；完整 `agentdeckd` package exit 0，
+  lib `916 passed / 3 ignored`、容量项 284.28 秒，selfcheck/diagnostics/network/schema/static/fmt/
+  scoped Clippy/diff/status 全绿。
+- P4.1 bootstrap 顺序固定为“四组 key material 写入并逐项读回 → authenticated Preparing →
+  key-directory guard 写入并读回 → authenticated Active”。Active identity 缺 key/guard 或 binding 分叉
+  只阻断 remote，本地 Runtime recovery 与 UDS 继续可用；`--ephemeral --no-remote` 对 stable machine
+  accounts 零 IO。P4.1 严格保持零 Link/Data cert、零 enrollment workflow、零 enrollment receipt IO、
+  零 RemoteLink；通用 CounterGuard IO 不等于 active key/DB counter reservation，也尚未闭环整库 artifact
+  消失或自洽历史回滚。certificate、enrollment、receipt 与 RemoteTransport 首次归 P4.2；P3.1
+  provisioned signed Keychain roundtrip 继续保持 post-MVP BLOCKED。
 
 ### Relay Companion MVP P3.2 Runtime persistence 不变量
 
@@ -582,8 +591,9 @@ conversation/key，不能伪造身份连续性。
   command/event HWM、终态审计 linkage，以及 conversation/command/event/intent/fence 总数；
   finish 在开放 mutation 前再次做完整 readback。任何换列、换 owner、换 turn、删空 catalog row、
   删整组 terminal audit 或
-  密文/元数据不一致都映射为 corrupt state；P4 仍须用 Keychain CounterGuard 绑定整库
-  generation/HWM，才能检测回滚到更早但内部自洽的完整 DB/WAL 快照。
+  密文/元数据不一致都映射为 corrupt state；P4.1 已建立通用 Keychain CounterGuard IO，但仍须由后续
+  active key/DB counter reservation 把整库 generation/HWM 完整绑定，才能检测回滚到更早但内部自洽的
+  完整 DB/WAL 快照。
 - Runtime store 的 P3 威胁边界固定为**离线篡改 fail-close**：已有 committed artifact 中，缺 KEK 或
   无法通过当前 KEK/database/domain 认证的行/页改删及跨库移植必须在 open/recovery 全库审计中拒绝，
   且拒绝路径不改写 main/WAL/SHM/journal artifact。整套 DB/main/WAL/SHM 消失，或整套 main+WAL 回滚到
@@ -594,14 +604,18 @@ conversation/key，不能伪造身份连续性。
 - Runtime DB 的物理 schema 按 phase 单调迁移：P3.2 的 v1 七表、P3.3 的 v2 两张 adapter 私表、
   P3.5 的 v3 `approval_ledger`、P3.6 的 v4 六张 stream 表、P3.9-C0-B1b 的 v5 四张
   authenticated sidecar，以及 C0-C 的 v6 两张 native sidecar，再由 P3.10 v7 增加 machine-wide
-  `admin_commands`。current v7 精确为 23 表；在 v4 的
+  `admin_commands`，P4.1 v8 增加 authenticated singleton `machine_identity_state`。current v8 精确为
+  24 表；在 v4 的
   `event_stream_index`、`event_retention`、
   `catalog_journal`、`snapshots`、`publication_streams`、`publication_outbox` 上增加
   `conversation_state`、`configuration_journal`、`command_configuration_pins` 与
   `metadata_mutation_ledger` 后，再增加 `native_projection_state` 与
   `native_metadata_effect_fences`，并给 authenticated Runtime ledger 增加 projection
   present/tombstone/retired/physical/charged-bytes 与 effect fence total/unreleased/released 八项 totals，
-  v7 再加入 admin command count/pending/charged-bytes 与 authenticated request/outcome/token/state/retention。
+  v7 再加入 admin command count/pending/charged-bytes 与 authenticated request/outcome/token/state/retention；
+  v8 又把只能为 0/1 的 `runtime_meta.machine_identity_count` 纳入 Runtime ledger，并认证
+  `machine_identity_state` 的 database/root/trust/generation/key-directory revision、四组 public key 与
+  fingerprint。v7→v8 只追加空表、零 count 与 v8 ledger token，不重包 wrapped key、不重加密既有行。
   物理 schema 升级不旋转 `RUNTIME_CRYPTO_CONTEXT_VERSION=1`；旧非-meta ciphertext、row token 与
   wrapped key 不重写。`event_journal` 仍是 append-only authenticated audit；
   `machine_enrollment_receipts` 继续只是 root-lost rescue 所需的非秘密 index，其余敏感 payload 使用

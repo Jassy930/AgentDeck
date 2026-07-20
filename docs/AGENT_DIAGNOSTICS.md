@@ -643,7 +643,7 @@ fixture 泄漏，或把 test-only admission 暴露为运行时配置。
 | P3.2/P3.3 code | 常见内部原因 | 下一步 |
 | --- | --- | --- |
 | `daemon.runtime.store_invalid` | path/type/owner/mode/nlink、busy/count/byte config 或 operation input 不合法 | 核对 0700 namespace、0600 artifacts 和固定 config；拒绝 symlink/hardlink，不自动放宽 |
-| `daemon.runtime.schema_incompatible` | schema family/version/signature/live manifest、typed canonical descriptor/row linkage、逐 conversation HWM、authenticated metadata、command/execution/event/approval/stream/snapshot/publication/configuration/projection/effect-fence/admin-command totals 或两类 adapter-state total 不一致 | 停止写入并保留 main/WAL/SHM/journal；v1–v6 必须先在 rescue committed-state 上完成对应 ledger token 与既有行全量认证，再打开原库 RW 并走内置原子 migration 到 current v7，不能原地猜测/手改 schema |
+| `daemon.runtime.schema_incompatible` | schema family/version/signature/live manifest、typed canonical descriptor/row linkage、逐 conversation HWM、authenticated metadata、command/execution/event/approval/stream/snapshot/publication/configuration/projection/effect-fence/admin-command/machine-identity totals 或两类 adapter-state total 不一致 | 停止写入并保留 main/WAL/SHM/journal；v1–v7 必须先在 rescue committed-state 上完成对应 ledger token 与既有行全量认证，再打开原库 RW 并走内置原子 migration 到 current v8（24 张表），不能原地猜测/手改 schema |
 | `daemon.runtime.store_unavailable` | worker/shutdown/commit outcome、clock/capacity probe、SQLite/I/O、sequence coordination，或 bounded checkpoint 被 reader pin 住 | 对 unknown outcome 用完全相同 stable ID/idempotency/full request 重试；Configure after-COMMIT unknown 可能已产生唯一 `ConfigurationChanged`，exact retry 应读回 Replayed 而不是换 key；checkpoint blocked 时停止新副作用、释放 reader 并保留 WAL，其他错误保留 evidence 后重启/修复底层 I/O |
 | `daemon.runtime.store_busy` | normal/safety/read lane 的 count 或 retained-allocation byte permit 已满 | 客户端退避并保持同一 idempotency key；不要并发重发新 key |
 | `daemon.runtime.recovering` | 已冻结 paged recovery barrier，终页尚未核账并 finish | 继续使用上一页返回的 exact cursor；RuntimeCore 逐页消费，终页 finish 后再开放请求，不得并行 mutation |
@@ -674,7 +674,7 @@ P3.4 RuntimeCore 的 transport-neutral failure：
 | `daemon.runtime.not_ready` | Core 尚未完成 paged recovery，或正在 draining/stopped | 等待 daemon readiness；若 recovery 无法完成，按上节保留 DB/Keychain 证据并 fail-close |
 | `daemon.runtime.protocol_mismatch` | Runtime protocol 版本不兼容 | 升级客户端/daemon 到同一 Runtime protocol；不能回退 Relay/IPC 业务字段 |
 | `daemon.runtime.invalid_request` | ID 非 canonical UUID、Start key/cwd、Configure key 或 configuration agent kind 与 conversation 不匹配等规范化输入非法 | 修正原请求；不得由 daemon 猜 ID/path/agent kind 或替客户端补目标 |
-| `daemon.runtime.feature_unavailable` | 请求属于尚未接线的后续 phase（例如 pairing/revoke/trust reset），或当前 capability/构建不支持该请求 | 读取 capabilities/实施状态后等待对应 phase；`StageUpgrade` 已由 P3.10 `19622ab` 接入 durable/flush-ACK-gated 执行，正常失败必须读回 `daemon.upgrade.*` / `daemon.install.*` typed code。P3 Phase automatic scope 已完成；下一项 P4.1 按方案 A 只建立 identity/CounterGuard/key-directory guard，且零 cert、零 enrollment、零 receipt 读写、零 RemoteLink，因此 certificate/enrollment 在 P4.2 前仍应 feature-unavailable。native metadata 使用更精确的 `daemon.conversation.metadata_unsupported`；不得用 compatibility path 或 fake coordinator 假成功 |
+| `daemon.runtime.feature_unavailable` | 请求属于尚未接线的后续 phase（例如 pairing/revoke/trust reset），或当前 capability/构建不支持该请求 | 读取 capabilities/实施状态后等待对应 phase；`StageUpgrade` 已由 P3.10 `19622ab` 接入 durable/flush-ACK-gated 执行，正常失败必须读回 `daemon.upgrade.*` / `daemon.install.*` typed code。P3 Phase automatic scope 与 P4.1 identity/guard Task 已完成；certificate/enrollment/receipt IO/RemoteLink 首次归下一项 P4.2，在其接线前仍应 feature-unavailable。native metadata 使用更精确的 `daemon.conversation.metadata_unsupported`；不得用 compatibility path 或 fake coordinator 假成功 |
 | `daemon.authorization.revoked` | opaque principal lease 已 Revoking/Revoked 或 issuer registry 不可用 | 停止该 connection；remote 设备按 durable revocation/re-pair 流程处理，本地重新认证 peer credential |
 | `daemon.runtime.identity_unavailable` | machine trust/ID derivation domain 非法或 OS entropy 不可用 | 停止启动并检查 machine identity/系统熵；不得生成零 ID 或使用时间/PID 回退 |
 | `daemon.runtime.actor_unavailable` | conversation actor/execution control 已损坏或 recovery-blocked | 不自动重放 Started；保留 command/fence 证据，P3.7 按 orphan fencing 处理 |
@@ -798,9 +798,43 @@ stdout+stderr 合计 256 KiB 上限；leader 在同组清理前保持 wait ident
 
 production-signed LaunchAgent/Keychain slot 继续精确返回 post-MVP
 `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`；`p3` verifier exit 0 表示该 BLOCKED contract 与
-automatic gate 正确，不表示 production signing PASS。P3.1 继续采用方案 b。下一项按方案 A 执行 P4.1：
-只建立 Machine identity 与 CounterGuard/key-directory guard，且零 Link/Data cert、零 enrollment、零
-receipt 读写、零 RemoteLink；certificate 签发、enrollment 与 receipt 首次归 P4.2。
+automatic gate 正确，不表示 production signing PASS。P3.1 继续采用方案 b。P4.1 已由
+`3cd76d2`、`644712c`、`95090c1`、`85df3d2`、`f137112`、`46c6bb8` 完成 automatic Task 收口，
+P4 当前为 1/7；下一项 P4.2 首次拥有 Link/Data cert、enrollment workflow、receipt IO 与 RemoteLink。
+
+### P4.1 machine identity / Keychain guard 排障
+
+P4.1 current Runtime schema 是 **v8 / 24 张表**：在历史 v7 的 23 张表上新增
+`machine_identity_state`，并用 `runtime_meta.machine_identity_count` 与 v8 ledger token 认证 singleton
+count。v7→v8 migration 不轮换 crypto context/key generation，不重封既有 ciphertext/wrapped key，也不改写
+`machine_enrollment_receipts`。P4.1 bootstrap 固定顺序为“四组 key exact load/create/readback → DB
+Preparing → key-directory guard exact install/readback → DB Active”；普通重启只 exact load，不生成第二 root。
+
+诊断时先区分 failure stage：identity/guard/key reconcile 产生的
+`RemoteBootstrapOutcome::Blocked` 只关闭 remote，本地 Runtime recovery 与 canonical UDS 继续；
+`RuntimeStoreHandle::open`、identity Store command/worker/SQLite 或 StorageKEK 的失败仍是全局 fatal，不能改写成
+remote-only warning。日志只记录 `status=disabled|active|blocked` 与稳定 code，不得打印原始 key、完整 public
+key/fingerprint 或 guard bytes。
+
+| P4.1 code / 状态 | 含义 | 下一步 |
+| --- | --- | --- |
+| `status=disabled` | 显式 ephemeral/no-remote 模式在任何 stable machine account IO 前退出 | 仅用于隔离开发 harness；不得把它当 stable identity 通过证据 |
+| `daemon.remote.identity.database_rollback` | DB 没有 identity row，但 Keychain key-directory guard 已存在 | remote 保持 blocked；保留 DB/WAL/SHM 与 guard，禁止补行、删 guard、重建 root 或生成新 KEK |
+| `daemon.remote.identity.state_fork` | DB binding、四组 public material、guard database/root/revision 或 Preparing/Active lifecycle 不精确一致 | remote 保持 blocked并核对同一 authenticated DB/Keychain domain；禁止选择一侧覆盖另一侧 |
+| `daemon.remote.identity.key_missing` / `daemon.remote.identity.key_invalid` | Preparing/Active 的四组既有 key 任一缺失，或长度/public derivation 非法 | 不补 key、不重建 root；保留其余 item 与 DB state，按 trust-reset 的后续实现处理 |
+| `daemon.remote.identity.key_persistence_failed` | fresh item store 后缺失或 exact readback bytes 改变 | 停止 remote bootstrap；检查 Keychain backend/entitlement，不得假定写入成功或继续 Preparing |
+| `daemon.remote.identity.guard_missing` / `daemon.remote.identity.guard_invalid` / `daemon.remote.identity.guard_conflict` | Active guard 缺失、canonical encoding 非法，或 existing guard 与 authenticated identity 冲突 | remote fail-close；不得删除、覆盖或按 DB 猜测重建 guard |
+| `daemon.remote.identity.entropy_unavailable` | 生成 fresh key material 或非零 RootKeyId 的 OS CSPRNG 不可用/连续全零 | 停止 remote bootstrap并修复系统熵；禁止时间、PID、常量或弱随机回退 |
+| `daemon.remote.identity.counter_regression` | 通用 CounterGuard high-water 请求低于既有值 | 拒绝回退并保留原 guard；核对 key purpose/epoch。P4.1 尚无 active reservation/full rollback 检测，不能据此宣称整库回滚已闭环 |
+| `daemon.remote.identity.fingerprint_mismatch` / `daemon.remote.identity.delete_failed` | 删除请求的 expected root fingerprint 不匹配，或 delete 后 item 仍可读 | 零容忍停止 destructive flow；保留 identity/guard并复核目标，禁止无 expected fingerprint 的批量删除 |
+| `daemon.remote.identity.start_permit_missing` | Active identity 未与 recovery 后 canonical stable UDS 产生的一次性 `RemoteStartPermit` 配对 | 只阻断 remote，检查 startup ownership/order；不得在 recovery/UDS readiness 前直接启动网络 |
+
+`daemon.keystore.*` 继续按 P3.1 表排障：同一 code 若发生在 StorageKEK/bootstrap 前属于全局 fatal；Store 已
+安全打开后的 machine identity Keychain reconcile failure 才映射为 remote-only blocked。P4.1 的 CounterGuard
+只是按 key purpose/epoch 的通用单调 IO，没有创建 active symmetric key、DB counter reservation 或完整
+whole-database rollback 检测。production source 仍是零 Link/Data cert、零 enrollment/code、零
+`machine_enrollment_receipts` IO、零 RemoteLink；这些问题在 P4.2 前不要通过手改 DB/Keychain 或 synthetic
+Relay 路径“修复”。P3.1 provisioned signed roundtrip 仍是 post-MVP BLOCKED，不是 P4.1 PASS 证据。
 
 P3.7 exec-gate 的以下 code 是内部 typed 分类码。`--exec-gate` one-shot 自身失败时会把 code 写到
 stderr，私有 ADGX abort frame 也可携带 code；但当前 parent/runtime 不保证把每个子码写入
@@ -965,8 +999,9 @@ P3.3 canonical adapter 边界的错误不会携带 raw resume reference：
 `machine_enrollment_receipts` 仅用于 root-lost 时定位 old route/root fingerprint；它是刻意保持
 非秘密、未加 MAC 的 rescue locator，不是授权凭据。P4 trust-reset/purge 必须另验
 Relay/admin-signed receipt；该表被改写时不得据此直接删除远端状态。行 MAC/ledger 能检测局部
-篡改，但整套 main+WAL 回滚到更早且内部自洽的快照，要等 P4 Keychain CounterGuard 绑定后才
-能检测；P3.2/P3.3 诊断不能声称覆盖该攻击。
+篡改；P4.1 虽已提供通用 Keychain CounterGuard IO，但尚未建立 active reservation 或把它接入整库
+rollback readback，因此整套 main+WAL 回滚到更早且内部自洽的快照仍未闭环。P3.2/P3.3/P4.1 诊断都
+不能声称覆盖该攻击。
 
 ## Failure Codes
 

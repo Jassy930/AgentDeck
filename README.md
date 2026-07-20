@@ -207,7 +207,7 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（P3 Phase complete，下一项 P4.1）
+## Relay Companion MVP 实施状态（P4 已完成 1/7，下一项 P4.2）
 
 2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 的 P3 边界只承诺已有 committed artifact
 中缺 KEK 或无法通过当前 KEK/database/domain 认证的行/页改删及跨库移植 fail-close；整套 artifact
@@ -217,11 +217,11 @@ ignored/BLOCKED 槽位，不阻塞 MVP/P3 exit，也不表示 stable production 
 P5 MVP 仅以 iOS Simulator 自动 E2E 退出，本机第二客户端归入 P6 synthetic DoD；物理设备、公网与干净
 Linux 证据为 post-MVP BLOCKED 槽位。详见
 [`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`](docs/plans/2026-07-18-relay-companion-mvp-course-correction.md)。
-P3.10 已由 code/test commit `19622ab` 完成 Task 收口：current Runtime schema v7 新增 authenticated machine-wide
+P3.10 已由 code/test commit `19622ab` 完成 Task 收口：当时把 Runtime schema 推进到 v7，并新增 authenticated machine-wide
 `admin_commands` ledger，并实现 30 天 retention、容量准入、exact replay/conflict 与 COMMIT-unknown
 收敛；`StageUpgrade` 只有在 exact reply 完整 flush ACK 后才 arm，随后经 active→idle fence、候选
 artifact/hash/owner/mode/nlink 校验和原子 `bin/current` 切换后退出。CLI 已提供
-`agentdeck daemon install|status|uninstall [--purge]`；`--purge` 在 P4 前 typed fail-close 且零删除，
+`agentdeck daemon install|status|uninstall [--purge]`；`--purge` 在 P4.2 trust-reset 完成前 typed fail-close 且零删除，
 stopped LaunchAgent（`loaded=true,pid=null`）会先 kickstart 并二次读回 live PID；CLI 只对
 `socket_missing` / `connect_failed` 做有界 15 秒 retry。P3 Phase review 又由 `773a2b3`、`0057824`、
 `81cc314`、`9efb28d` 依次补齐安装 verifier 资源上界、legacy v1–v6 在原库 RW 前的全量认证
@@ -240,9 +240,22 @@ post-MVP `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`；verifier exi
 正确，不表示 production signing PASS。P3.1 继续采用方案 b：automatic scope 接受 dev/ephemeral 路径，
 provisioned signed LaunchAgent/Keychain roundtrip 不阻塞 P3 complete，但 stable production signing 仍未完成。
 
-P4 当前仍为 0/7，下一项按方案 A 执行 P4.1：只建立 Machine identity 与 CounterGuard/key-directory
-guard，且零 Link/Data cert、零 enrollment、零 receipt 读写、零 RemoteLink；certificate 签发、enrollment
-与 receipt 首次归 P4.2。
+P4 当前完成 1/7。P4.1 由 `3cd76d2`、`644712c`、`95090c1`、`85df3d2`、`f137112`、`46c6bb8`
+完成 code/test 收口：current Runtime physical schema 从 v7 单调升级到 v8，fresh v8 精确为 24 表；新增
+authenticated singleton `machine_identity_state` 与进入 Runtime ledger 的
+`runtime_meta.machine_identity_count`。daemon 持久化并逐项读回 MachineRoot、MachineHPKE、
+MachineLinkSign、MachineDataSign 四组 key material，按
+`私钥 → Preparing → key-directory guard → Active` 收敛；通用 CounterGuard IO 已绑定 key purpose/epoch
+与单调 high-water。Active identity 缺 key/guard 或 binding 分叉只把 remote 标为 typed Blocked，本地
+Runtime recovery 与 UDS 继续可用；`--ephemeral --no-remote` 对 stable machine accounts 保持零 IO。
+
+P4.1 两路独立终审均为 Approved、P0/P1/P2 = 0；完整 `agentdeckd` package exit 0，其中 lib 为
+`916 passed / 3 ignored`，容量项为 284.28 秒，selfcheck、diagnostics、network boundary、schema、
+static sentinel、fmt、scoped Clippy、diff 与最终 status 均通过。P4.1 严格保持零 Link/Data cert、零
+enrollment workflow、零 enrollment receipt IO、零 RemoteLink；通用 CounterGuard IO 不等于 active
+key/DB counter reservation，也尚未闭环整库 artifact 消失或自洽历史回滚。P3.1 provisioned signed
+Keychain roundtrip 继续是 post-MVP BLOCKED，不计 PASS。下一项 P4.2 首次拥有 certificate、enrollment、
+receipt 与 RemoteTransport。
 
 Relay production binary 已原子切换到 **Relay v2**。公开数据面只接受
 `/v2/connect`、`/v2/pair` 与 enrollment 所需的 `POST /v2/machine-enroll`；
@@ -417,8 +430,9 @@ fence、release、terminal
 逐次 safety 校验与写后读回是当前 MVP 的 fail-closed 边界。
 
 行 MAC 能检测局部换列/删除/篡改，但“把 main+WAL 整体回滚到更早且内部自洽的有效快照”必须
-由 P4 的 Keychain `CounterGuard` / generation high-water 绑定后才能检测。该门禁属于 P4/P6，
-P3.2 不能宣称已防住整库历史回滚。
+由 Keychain `CounterGuard` / generation high-water 与 DB counter reservation 完整绑定后才能检测。
+P4.1 只建立通用 CounterGuard IO，尚未创建 active key 或 DB counter reservation；该门禁仍属于后续
+P4/P6，P3.2 与 P4.1 都不能宣称已防住整库历史回滚。
 已有 committed artifact 中，缺 KEK 或无法通过当前 KEK/database/domain 认证的离线行/页改删及跨库
 移植，会在 open/recovery 全库认证审计中 fail-close，拒绝路径保持 artifact 零改写。整套
 DB/main/WAL/SHM 消失与自洽旧快照均留给 P4 CounterGuard。同 UID 在线攻击者能够读取
@@ -523,12 +537,12 @@ installation 在同一 conversation 各自提交/重放并只查询自己的 rec
 保持不变且 endpoint 缺失零 fallback。P3.9-E 的 `d68cc02` 再收口 exact/fresh retry、composer owner/LRU、
 history latest-intent、close barrier、重连有界恢复和 64-slot subscription admission；Swift
 `527 XCTest + 35 Swift Testing`、iOS Simulator `20/20`、真实 local-runtime smoke 与双路终审全绿。
-P3.9 至此完成。P3.10 已由 `19622ab` 完成 current schema v7、durable admin ledger、flush-ACK-gated
+P3.9 至此完成。P3.10 已由 `19622ab` 完成当时的 schema v7、durable admin ledger、flush-ACK-gated
 `StageUpgrade`、LaunchAgent lifecycle CLI 与隔离 ephemeral smoke，完整 `p3` verifier 和 Task 双路终审
-均通过；Phase review hardening 已收口到 `9efb28d`，独立 P3 Phase Exit 也已通过。P4
-CounterGuard/RemoteLink 与真实 vendor metadata mutation 仍未完成；下一项 P4.1 按方案 A 只建立
-identity/guard，且零 cert、零 enrollment、零 receipt 读写、零 RemoteLink；certificate/enrollment/receipt
-首次归 P4.2。
+均通过；Phase review hardening 已收口到 `9efb28d`，独立 P3 Phase Exit 也已通过。P4.1 随后把 current
+schema 推进到 v8/24 表并建立 machine identity、key-directory guard 与通用 CounterGuard IO；active
+key/DB counter reservation、RemoteLink 与真实 vendor metadata mutation 仍未完成。下一项 P4.2 首次拥有
+certificate、enrollment、receipt 与 RemoteTransport。
 
 进入 Core 的 principal 是字段私有的认证 capability；同一完整身份共享强 authorization lease，
 Accepted→Started 前会重新取得 guard，revoke 与 start 由该 guard + SQLite transition 线性化。
@@ -705,9 +719,9 @@ execution 已由 `c0ed6cd` / `f4141f0` / `fb1629a` 完成，B4 managed metadata 
 Simulator 门禁已通过；C0-C、P3.9-A/B/C3/D/E Task 已完成，D/E code/test 提交分别为 `b818f81` / `d68cc02`。
 普通 GUI、Rust CLI 与 Swift `--selfcheck` 已默认走 OS-account shared-daemon UDS。P3.10 LaunchAgent
 安装/升级/保留数据卸载已由 `19622ab` 完成 Task 门禁与双路终审；基于 `9efb28d` 的独立 P3 Phase
-Exit 已完成，P4–P6 仍为 0/7、0/9、0/4。P3.1 provisioned signed Keychain roundtrip 继续是 post-MVP
+Exit 已完成；P4.1 code/test、Task 门禁与文档已收口，P4–P6 当前为 1/7、0/9、0/4。P3.1 provisioned signed Keychain roundtrip 继续是 post-MVP
 BLOCKED 槽位，不阻塞 P3 automatic closeout；P5/P6 物理设备/公网/Linux 证据也是 post-MVP，不冒充
-PASS。下一项 P4.1 按方案 A 不生成 cert，certificate/enrollment 归 P4.2。
+PASS。下一项 P4.2 首次签发 certificate，并实现 enrollment、receipt 与 RemoteTransport。
 具体命令与资源矩阵见 [docs/QUALITY.md](docs/QUALITY.md)。
 
 ## agentdeck CLI（参考客户端 / E2E 驱动）

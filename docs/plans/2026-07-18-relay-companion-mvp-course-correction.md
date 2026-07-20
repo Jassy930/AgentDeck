@@ -99,8 +99,8 @@ profile，self-signed helper 被 AMFI exit 137 终止），**代码不可解**�
 4. **已完成（2026-07-19）**：C0-C native history projection、P3.9-A/B/C3/D/E
    App/CLI cutover与会话可靠性收口。
 5. **已完成（2026-07-20）**：按决策 4 的范围重估与 P4–P6 Task checklist 执行前审计已逐项同步；
-   P4/P5/P6 完成度固定为 0/7、0/9、0/4，P5 MVP 只保留 Simulator 自动 E2E，本机第二客户端迁入 P6
-   synthetic DoD，物理设备/公网/vendor/Linux 保持 versioned post-MVP BLOCKED 槽位。
+   当时 P4/P5/P6 的执行前基线固定为 0/7、0/9、0/4；P5 MVP 只保留 Simulator 自动 E2E，本机第二
+   客户端迁入 P6 synthetic DoD，物理设备/公网/vendor/Linux 保持 versioned post-MVP BLOCKED 槽位。
 6. **P3 automatic scope complete（2026-07-20，6/6）**：P3.10 主体由 `19622ab` 提交；Phase review
    hardening 又由 `773a2b3` / `0057824` / `81cc314` / `9efb28d` 收口。以 `9efb28d` 为 code baseline
    的 `bash scripts/verify-relay-companion-mvp.sh p3` exit 0：daemon lib 两轮均为 `905 passed / 3 ignored`
@@ -109,10 +109,15 @@ profile，self-signed helper 被 AMFI exit 137 终止），**代码不可解**�
    network、docs、local smoke 与 diagnostics 全绿。两路 phase code review 均为 P0/P1/P2=0。
    provisioned production-signed LaunchAgent/Keychain roundtrip 仍按方案 b 保持 post-MVP BLOCKED，
    不是 PASS。
-7. **下一项 P4.1（0/7 基线）**：只建立 machine key material、Keychain guard 与 CounterGuard automatic
-   slice；严格零 cert、零 enrollment、零 RemoteLink，不生成或签发 link/data cert，也不读写
-   `machine_enrollment_receipts`。link/data cert、enrollment receipt 与第一条 RemoteLink 全部由 P4.2
-   首次拥有。
+7. **P4.1 已完成；下一项 P4.2（当前 P4 1/7）**：`3cd76d2`、`644712c`、`95090c1`、`85df3d2`、
+   `f137112`、`46c6bb8` 已建立四组 machine key、authenticated schema v8/24 表、key-directory guard、
+   通用 CounterGuard IO 与 `Preparing → Active` bootstrap。focused bootstrap `18/18`、identity keys
+   `11/11`、store identity `11/11`、RootKeyId `2/2`、v7→v8 migration `1/1` 通过；完整 daemon package
+   exit 0（lib `916 passed / 3 ignored`，capacity 慢项 284.28s），两路独立终审均 Approved。P4.1
+   严格零 cert、零 enrollment workflow、零 receipt IO、零 RemoteLink；通用 CounterGuard IO 不代表
+   active symmetric key reservation、DB high-water 绑定或整库回滚闭环已完成。link/data cert、enrollment
+   receipt、RemoteTransport 与两条 trust-reset 路径从 P4.2 开始；P3.1 signed gate 继续按方案 b 保持
+   post-MVP BLOCKED。
 
 ## 不变项
 
